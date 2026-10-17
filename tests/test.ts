@@ -36198,6 +36198,26 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental search kommune union: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a+S4b):
+  //    dental /mcp instructions, serverInfo and tool descriptions; one clinic
+  //    card for MCP and A2A (services/dental-clinic-card.ts) ──
+  console.log("\n── dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort: MCP-instrukser og felles klinikkort (finn-tannlege) ──");
+  for (const [label, load] of [
+    ["dental mcp instructions", () => (require("../src/routes/dental-mcp-instructions.test") as typeof import("../src/routes/dental-mcp-instructions.test")).runDentalMcpInstructionsTests({ log: false })],
+    ["dental clinic card", () => (require("../src/services/dental-clinic-card.test") as typeof import("../src/services/dental-clinic-card.test")).runDentalClinicCardTests({ log: false })],
+  ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
+    try {
+      const r = await load();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ${f}`);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+
   console.log("\n── dev-request 2026-10-06-dental-profil-url-og-sitemap-uten-orgnr (skive A): clinicProfileUrl ──");
   try {
     const { runDentalProfileUrlTests } = require("../src/routes/dental-profile-url.test") as

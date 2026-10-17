@@ -31,13 +31,12 @@ import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch } from "../services/dental-query-parser";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
 
-import { clinicProfileUrl } from "./dental-seo";
-import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
-import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { companyFooterLineHtml } from "../services/company-legal";
+import { BRAND_ENTITIES } from "../config/brand-entities";
 
 const router = Router();
 
@@ -47,6 +46,44 @@ const router = Router();
 // consumer key, else per IP). Not dentalLimiter, which /api/tannlege and
 // dental /a2a keep. See middleware/mcp-rate-limit.ts.
 router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSession: hasDentalMcpSession }).chain);
+
+// ─── Server instructions and serverInfo ──────────────────────
+// A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a), after
+// OPPLEVAGENT_MCP_INSTRUCTIONS (experiences-mcp.ts). Facts about what the
+// server covers and returns; nothing about other servers or their tools, and no
+// figures (the catalog count lives in honest-count). The server card in
+// dental-seo.ts reads the title and description below, so there is no copy to
+// keep in step. Locked by dental-mcp-instructions.test.ts.
+
+/** Server-wide guidance returned from `initialize`, read by clients alongside the tool descriptions. */
+export const DENTAL_MCP_INSTRUCTIONS =
+  "Finn-tannlege is a read-only directory of dental clinics in Norway only: general dentists, orthodontists and " +
+  "other specialists. When the user asks about a place outside Norway, say that Finn-tannlege only covers Norway; " +
+  "do not present Norwegian clinics as an answer unless the user asks for Norway. " +
+  "Pass the user's request, with any place they named, in tannlege_search's `query`. Set `fylke`, `spesialitet`, " +
+  "`helfo` or `akutt` only when the user states that filter explicitly. " +
+  "The response's `tolkning` shows how the request was read (place, specialty, filters, or a fallback to a plain " +
+  "text search). `count` is the number of matching clinics; `klinikker` lists the first of them. " +
+  "Helfo (`helfo_agreement`) means the clinic has a direct-settlement agreement (direkteoppgjør) with Helfo: " +
+  "Helfo's share of a treatment that qualifies for support is settled with the clinic, and the patient pays the " +
+  "rest. It does not mean the treatment is free. " +
+  "«Akuttvakt» (`akutt`: \"vakt\") is an emergency duty backed by a recorded source; «Tar imot akuttpasienter» " +
+  "(`akutt`: \"accepts\") only says that the clinic takes emergency patients. " +
+  "For acute toothache or a dental injury, give the clinic's phone number and the advice on the municipal " +
+  "out-of-hours dental service (kommunal tannlegevakt) from tannlege_akutt. Finn-tannlege gives no medical or " +
+  "dental advice. " +
+  "Finn-tannlege takes no bookings and no payments: the user books through the clinic's `online_booking_url` " +
+  "when it has one, or by phone. `prisniva` is set only when the price level has a source, and the answers carry " +
+  "no ratings or reviews.";
+
+/** serverInfo title; also the server card's title. */
+export const DENTAL_MCP_SERVER_TITLE = `${BRAND_ENTITIES.dental.name} — Norwegian dental clinic search`;
+
+/** serverInfo description; the server card puts the catalog count in front of it. */
+export const DENTAL_MCP_SERVER_DESCRIPTION =
+  "Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by " +
+  "place, county (fylke), specialty, Helfo direct-billing agreement or emergency care. Supports natural-language " +
+  "queries in Norwegian and English. Read-only: no booking, no payment and no dental advice.";
 
 // ─── Zod input schemas (exported for testing — pr114-01) ─────
 
@@ -90,45 +127,14 @@ export const TannlegeAkuttInputSchema = {
 
 export interface SearchResult {
   count: number;
-  klinikker: Array<{
-    navn: string;
-    org_nr: string | null | undefined;
-    poststed: string | null | undefined;
-    fylke: string | null | undefined;
-    telefon: string | null | undefined;
-    hjemmeside: string | null | undefined;
-    helfo_agreement: string | undefined;
-    badges: string[];
-    profil_url: string;
-  }>;
+  klinikker: DentalSearchCard[];
 }
 
+/** The search card per clinic (services/dental-clinic-card.ts, shared with A2A). */
 export function buildSearchResults(
   agents: ReturnType<typeof listPublicDentalAgents>
 ): SearchResult["klinikker"] {
-  return agents.map((a) => {
-    const badges: string[] = [];
-    if (a.helfo_agreement === "true") badges.push("Helfo-avtale");
-    {
-      const acute = resolveAcuteClaim(a);
-      if (acute === "vakt") badges.push("Akuttvakt");
-      else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);
-    }
-    if (a.verification_status === "verified") badges.push("Verifisert");
-    if (a.available_specialties?.length) badges.push("Spesialist");
-
-    return {
-      navn: a.navn,
-      org_nr: a.org_nr,
-      poststed: a.poststed,
-      fylke: a.fylke,
-      telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
-      hjemmeside: a.hjemmeside,
-      helfo_agreement: a.helfo_agreement,
-      badges,
-      profil_url: clinicProfileUrl(a),
-    };
-  });
+  return agents.map((a) => toDentalClinicCard(a, "search"));
 }
 
 // ─── Tool registrations ──────────────────────────────────────
@@ -156,11 +162,13 @@ export function registerDentalTools(server: McpServer): void {
     {
       title: "Search Norwegian dental clinics",
       description:
-        "Search the finn-tannlege.com directory of Norwegian dental clinics. " +
-        "Supports free-text search, county (fylke) filter, specialty filter, " +
-        "Helfo direct-billing filter, and emergency-duty (akuttvakt) filter. " +
-        "Returns clinic name, address, contact info, Helfo status, and profile URL. " +
-        "Example: 'finn kjeveortoped i Bergen med Helfo-avtale'.",
+        "Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway " +
+        "by place, county (fylke), specialty, Helfo direct billing or emergency care. " +
+        "The request can go in `query` as written, such as 'kjeveortoped i Bergen med Helfo-avtale'; the response's " +
+        "`tolkning` shows how it was read, and `count` is the number of matching clinics. " +
+        "Each clinic has its name, address, postcode, place, county, phone, website, Helfo status, emergency status " +
+        "(`akutt`) and profile URL, and when known its online booking link, opening hours, specialties, chain and a " +
+        "price level that has a source.",
       inputSchema: TannlegeSearchInputSchema,
       annotations: {
         title: "Search Norwegian dental clinics",
@@ -195,8 +203,9 @@ export function registerDentalTools(server: McpServer): void {
         // `tolkning` (only when a query was parsed) says what the search used.
         const result = { count: plan.count, klinikker, ...(plan.tolkning ? { tolkning: plan.tolkning } : {}) };
         deliver("tannlege_search", { query, fylke, spesialitet, helfo, akutt, limit }, extra, agents.map((a) => a.id));
+        // Compact JSON: indentation was a third of a 25-card answer (S4b keeps it near 12 KB).
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
         return {
@@ -213,11 +222,11 @@ export function registerDentalTools(server: McpServer): void {
     {
       title: "Get full details for a dental clinic",
       description:
-        "Fetch complete profile for a single Norwegian dental clinic by organisation number (org_nr) " +
-        "or internal UUID. Returns name, address, phone, website, Helfo status, emergency duty, " +
-        "specialities, chain affiliation, specialists list, treatments, opening hours, " +
-        "payment options, and profile URL. " +
-        "Example: org_nr '912345678' or id 'uuid-here'.",
+        "Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, " +
+        "by organisation number (org_nr) or id. " +
+        "Returns name, address, phone, mobile, e-mail, website, online booking link, Helfo status, emergency duty " +
+        "when it has a recorded source, specialties, chain, specialists, treatments, opening hours, payment options, " +
+        "the clinic's own description and profile URL.",
       inputSchema: TannlegeInfoInputSchema,
       annotations: {
         title: "Get dental clinic details",
@@ -250,47 +259,10 @@ export function registerDentalTools(server: McpServer): void {
           };
         }
 
-        const specialists = listSpecialistsForClinic(agent.id);
-        const profil_url = clinicProfileUrl(agent);
-
-        const badges: string[] = [];
-        if (agent.helfo_agreement === "true") badges.push("Helfo-avtale");
-        const acute = resolveAcuteClaim(agent);
-        if (acute === "vakt") badges.push("Akuttvakt");
-        else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);
-        if (agent.verification_status === "verified") badges.push("Verifisert");
-
-        const result = {
-          id: agent.id,
-          org_nr: agent.org_nr,
-          navn: agent.navn,
-          adresse: agent.adresse,
-          postnummer: agent.postnummer,
-          poststed: agent.poststed,
-          fylke: agent.fylke,
-          telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
-          mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
-          epost: agent.epost,
-          hjemmeside: agent.hjemmeside,
-          helfo_agreement: agent.helfo_agreement,
-          // Skive B: raw flag only exposed when backed by provenance.
-          acute_vakt: agent.acute_vakt === 1 && hasAcuteVaktProvenance(agent.field_provenance) ? 1 : null,
-          chain_brand: agent.chain_brand,
-          is_chain_member: agent.is_chain_member,
-          available_specialties: agent.available_specialties,
-          treatments: agent.treatments,
-          opening_hours: agent.opening_hours,
-          payment_options: agent.payment_options,
-          om_oss: agent.om_oss,
-          online_booking_url: agent.online_booking_url,
-          specialists: specialists.map((s) => ({
-            navn: s.navn,
-            primary_specialty: s.primary_specialty,
-            specialty_used_here: s.specialty_used_here,
-          })),
-          badges,
-          profil_url,
-        };
+        // The detail card: the keys this tool has always returned, with the
+        // phone, acute_vakt (Skive B: only with provenance) and profile-link
+        // rules of the search card.
+        const result = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
 
         deliver("tannlege_info", { org_nr, id }, extra, [agent.id]);
         return {
@@ -311,10 +283,8 @@ export function registerDentalTools(server: McpServer): void {
     {
       title: "Norwegian dental market statistics",
       description:
-        "Fetch aggregated statistics for the Norwegian dental market from finn-tannlege.com. " +
-        "Returns total clinic count, per-county breakdown (per fylke), Helfo count, " +
-        "chain-member count, emergency-duty (akuttvakt) count, and specialist-clinic count. " +
-        "Example question: 'how many dental clinics are there in Norway?'.",
+        "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many " +
+        "have Helfo direct billing, belong to a chain, are flagged for emergency duty (akuttvakt) or list a specialist.",
       inputSchema: {},
       annotations: {
         title: "Norwegian dental market statistics",
@@ -356,10 +326,13 @@ export function registerDentalTools(server: McpServer): void {
     {
       title: "Find emergency-duty dental clinics in Norway",
       description:
-        "Find Norwegian dental clinics that offer emergency-duty (akuttvakt) — i.e. treatment " +
-        "outside normal working hours. Optionally filter by county (fylke). " +
-        "Also returns advice about the municipal dental emergency service (kommunal tannlegevakt). " +
-        "Example: 'finn akutt tannlege i Oslo'.",
+        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics flagged for emergency care " +
+        "(akuttvakt), optionally in one county (fylke). " +
+        "Each clinic's `akutt` is \"vakt\" when the emergency duty has a recorded source (badge «Akuttvakt»), " +
+        "\"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»), and null when " +
+        "neither is backed. `count` is the number of flagged clinics. " +
+        "Each clinic has its address, phone and profile URL, and when known its opening hours and online booking " +
+        "link. The response also has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
       inputSchema: TannlegeAkuttInputSchema,
       annotations: {
         title: "Find emergency-duty dental clinics",
@@ -389,8 +362,9 @@ export function registerDentalTools(server: McpServer): void {
           rad_om_kommunal_tannlegevakt: advice,
         };
 
+        // Compact JSON, as tannlege_search: up to 25 cards.
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
         return {
@@ -407,10 +381,8 @@ export function registerDentalTools(server: McpServer): void {
     {
       title: "List Norwegian dental chains",
       description:
-        "List all Norwegian dental chains (kjeder) registered on finn-tannlege.com, " +
-        "including the number of clinic locations per chain. " +
-        "Examples of chains: 'Tannhelse Øst', 'Colosseum Tannlege', 'Nordic Dental'. " +
-        "Example question: 'hvilke tannlegekjeder finnes i Norge?'.",
+        "List dentist chains (tannlegekjeder) in Norway that are registered in the directory, " +
+        "each with its number of clinic locations.",
       inputSchema: {},
       annotations: {
         title: "List Norwegian dental chains",
@@ -514,12 +486,11 @@ async function getOrCreateDentalSession(
   const server = new McpServer({
     name: "finn-tannlege",
     version: "0.1.0",
-    // Title and description for MCP registry / client display
-  });
+    title: DENTAL_MCP_SERVER_TITLE,
+    description: DENTAL_MCP_SERVER_DESCRIPTION,
+    websiteUrl: BRAND_ENTITIES.dental.url,
+  }, { instructions: DENTAL_MCP_INSTRUCTIONS });
 
-  // McpServer metadata via registerTool title convention
-  // Title/description visible to clients at the server level:
-  // "Finn-tannlege MCP — Norwegian dental clinic directory"
   registerDentalTools(server);
 
   const transport = new StreamableHTTPServerTransport({

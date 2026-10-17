@@ -44,6 +44,7 @@ import { buildRequestMeta, isInternalTraffic } from "../services/conversation-se
 import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
+import { toDentalA2aClinic } from "../services/dental-clinic-card";
 
 const router = Router();
 
@@ -328,7 +329,8 @@ export function handleDentalMessageSend(
           {
             artifactId: "clinic",
             name: "dental-clinic",
-            parts: [{ kind: "data", data: clinic }],
+            // Same clean-up and card fields as the search list (dental-clinic-card.ts).
+            parts: [{ kind: "data", data: toDentalA2aClinic(clinic) }],
           },
         ],
         metadata: { skill: "tannlege_info", org_nr: orgMatch[1] },
@@ -374,7 +376,11 @@ export function handleDentalMessageSend(
         {
           artifactId: "search-results",
           name: "dental-search-results",
-          parts: [{ kind: "data", data: { count: results.length, clinics: results } }],
+          // dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4b):
+          // the stored row with untrue values made honest (displayable phones,
+          // acute_vakt only with provenance), no rating fields or
+          // field_provenance, plus the search card shared with MCP.
+          parts: [{ kind: "data", data: { count: results.length, clinics: results.map(toDentalA2aClinic) } }],
         },
       ],
       metadata: {
