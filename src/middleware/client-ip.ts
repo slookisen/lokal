@@ -414,7 +414,9 @@ export interface ClientIpStatsLine extends ClientIpCounters {
  *            /ut and /reise (index.ts), /sok (seo.ts, experiences-seo.ts,
  *            dental-seo.ts), /reise, /for-tilbydere/finn and the gårdssalg
  *            booking form post (experiences-seo.ts; I-T of
- *            2026-10-17-integrasjonstest-oppfolging).
+ *            2026-10-17-integrasjonstest-oppfolging), every gårdssalg claim
+ *            route, /kategori/gardssalg/eier/* and
+ *            /api/opplevelser/gardssalg-claim/* (gardssalg-claim.ts; I-U).
  *   search   searchLimiter 150: /api/marketplace/search and /discover,
  *            which generalLimiter counts as well.
  *   a2a      jsonRpcLimiter 200: /a2a on rettfrabonden.com and opplevagent.no.
@@ -448,9 +450,11 @@ const under = (path: string, mount: string): boolean => path === mount || path.s
  * slash), with generalLimiter's own case-sensitive /api/tannlege skip.
  * The host gates are not mirrored (this runs before them), so a path that
  * reaches a limiter on some host counts against it on every host: /ut,
- * /reise, /sok, /for-tilbydere/finn and /kategori/gardssalg/book/<slug> as
- * general (the last for any method, though only its POST is limited — the
- * path is all this sees), /a2a against both jsonRpcLimiter and
+ * /reise, /sok, /for-tilbydere/finn, /kategori/gardssalg/book/<slug> and
+ * everything under /kategori/gardssalg/eier as general (the booking path for
+ * any method, though only its POST is limited, and the claim paths on every
+ * host, though only opplevagent.no serves them — the path is all this sees),
+ * /a2a against both jsonRpcLimiter and
  * dentalLimiter, /mcp summed over the verticals' own chains. Each count is
  * thus at least the key's count in that limiter, never below it: the
  * criterion may fail early, but never passes a key at 80 % of a rated limiter.
@@ -468,7 +472,8 @@ export function ac2LimitersFor(path: string): Ac2FanInLimiter[] {
     lower === "/sok/" ||
     lower === "/for-tilbydere/finn" ||
     lower === "/for-tilbydere/finn/" ||
-    /^\/kategori\/gardssalg\/book\/[^/]+\/?$/.test(lower)
+    /^\/kategori\/gardssalg\/book\/[^/]+\/?$/.test(lower) ||
+    under(lower, "/kategori/gardssalg/eier")
   ) {
     out.push("general");
   }

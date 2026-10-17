@@ -42925,6 +42925,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-U: gardssalgClaimRoutes
+// was mounted on every host ahead of every limiter, so rettfrabonden.com
+// served the OA claim pages, and the entry page and link request (both
+// harvest the producer's site; the request sends an e-mail) had no IP limiter.
+// Now gardssalgClaimHostGate keeps the claim paths on opplevagent.no (301 for
+// GET/HEAD, 404 otherwise, elsewhere) and every claim route runs the shared
+// generalLimiter first. Wiring by reference + index.ts order + real HTTP on
+// four hosts up to the 429, on its own TEST-NET-2 client keys (reset before
+// and after) and an in-memory experiences DB — see
+// gardssalg-claim-host-gate.test.ts's header.
+runSerial(async () => {
+  console.log("\n── I-U: gårdssalg claim routes on opplevagent.no only, behind generalLimiter ──");
+  try {
+    const { runGardssalgClaimHostGateTests } = require("../src/routes/gardssalg-claim-host-gate.test") as
+      typeof import("../src/routes/gardssalg-claim-host-gate.test");
+    const gch = await runGardssalgClaimHostGateTests({ log: false });
+    passed += gch.passed;
+    failed += gch.failed;
+    for (const f of gch.failures) failures.push("gardssalg-claim-host-gate: " + f);
+    console.log(`  gardssalg-claim-host-gate: ${gch.passed} passed, ${gch.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-host-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a +
 // 1c — the RFB coordinate foundation. 948 of 1 499 active producers had
 // seed-time coordinates of unrecorded provenance and 551 had NONE at all

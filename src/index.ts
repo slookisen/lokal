@@ -89,7 +89,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
-import gardssalgClaimRoutes from "./routes/gardssalg-claim";
+import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
@@ -333,6 +333,21 @@ app.use("/", resendWebhookRoutes);
 // nothing unless PAYMENTS_ENABLED=1 (routes/payments.ts).
 mountPaymentWebhook(app);
 
+// ─── Gårdssalg owner-claim host gate (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, I-U) ───────────────────────────────────────
+// gardssalgClaimRoutes (mounted below, between the two host gates) used to
+// answer on every host, ahead of every limiter: rettfrabonden.com served the
+// claim pages. This gate runs first on the claim paths. They are served on
+// opplevagent.no only; on any other host GET/HEAD get a 301 to the same path
+// and query on https://opplevagent.no, every other method a 404, and the
+// router is not reached. Mounted above the finn-tannlege.com gate, which hands
+// /kategori/* to dental-seo and passes /api/* through, so that host answers
+// like the others; agentplatform.no's own gate runs earlier and keeps its 404.
+// Rate limiting is on the claim routes themselves (generalLimiter first on
+// each, see routes/gardssalg-claim.ts), so a served claim request is counted
+// once and never reaches the "/api" generalLimiter mount further down.
+app.use(GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate);
+
 // ─── PR-109: finn-tannlege.com host routing ───────────────────────────
 // Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
 // express.static so dental-host requests never hit rfb portal pages
@@ -411,9 +426,11 @@ if (process.env.ENABLE_DENTAL === "1") {
 // (2026-07-25) via curl against the deployed claim-entry page. Its path
 // prefixes are unique to the experiences vertical and never collide with
 // any RFB/dental route (same reasoning as before — see
-// src/routes/gardssalg-claim.ts's module doc), so mounting it earlier, on
-// every host, is still correct: it simply calls next() for every non-
-// matching path, same as any other router.
+// src/routes/gardssalg-claim.ts's module doc), so mounting it earlier is
+// still correct: it simply calls next() for every non-matching path, same as
+// any other router. It still sees every host's requests, but on the claim
+// paths only opplevagent.no's get past gardssalgClaimHostGate (above the
+// finn-tannlege.com gate, I-U).
 app.use("/", gardssalgClaimRoutes);
 
 // ─── orchestrator-pr-19: opplevagent.no host routing (experiences) ─────
