@@ -36194,6 +36194,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental /sted stavemåter (D3b): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3d, point 4): the A2A
+  //    agent card's skill texts say what message/send does ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 4): A2A-agentkortets skilltekster ──");
+  try {
+    const { runDentalAgentCardTests } = require("../src/services/dental-agent-card.test") as
+      typeof import("../src/services/dental-agent-card.test");
+    const dac = await runDentalAgentCardTests({ log: false });
+    passed += dac.passed;
+    failed += dac.failed;
+    for (const f of dac.failures) failures.push("dental agent card (D3d): " + f);
+    console.log(`  dental agent card (D3d): ${dac.passed} passed, ${dac.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental agent card (D3d): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
