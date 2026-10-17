@@ -46969,7 +46969,10 @@ runSerial(async () => {
 // (parity), the frozen MCP contract (OpenAI review), the interpreter + MCP
 // acceptance criteria and the submission replay. Own in-memory DBs (restored
 // in finally) — runSerial, next to the ChatGPT review block. S4: REST
-// /discover?q= reads it the same way (incl. parity with MCP).
+// /discover?q= reads it the same way (incl. parity with MCP). Follow-up
+// 2026-10-17-integrasjonstest-oppfolging I-C (opplevagent-sok-oppfolging):
+// regions as real kommuner, drink words in discover_gardssalg's query, and
+// discover's data-completeness tie-break.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-16-opplevagent-mcp-fritekst-query: free-text query, contract freeze, replay ──");
   type Summary = { passed: number; failed: number; failures: string[] };
@@ -46979,6 +46982,7 @@ runSerial(async () => {
     ["opplevagent-mcp-query-intent", () => (require("../src/routes/opplevagent-mcp-query-intent.test") as typeof import("../src/routes/opplevagent-mcp-query-intent.test")).runOpplevagentMcpQueryIntentTests({ log: false })],
     ["opplevagent-submission-replay", () => (require("../src/routes/opplevagent-submission-replay.test") as typeof import("../src/routes/opplevagent-submission-replay.test")).runOpplevagentSubmissionReplayTests({ log: false })],
     ["opplevelser-discover-query", () => (require("../src/routes/opplevelser-discover-query.test") as typeof import("../src/routes/opplevelser-discover-query.test")).runOpplevelserDiscoverQueryTests({ log: false })],
+    ["opplevagent-sok-oppfolging", () => (require("../src/routes/opplevagent-sok-oppfolging.test") as typeof import("../src/routes/opplevagent-sok-oppfolging.test")).runOpplevagentSokOppfolgingTests({ log: false })],
   ];
   for (const [name, run] of suites) {
     try {

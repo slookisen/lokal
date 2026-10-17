@@ -40,11 +40,12 @@ type ExpStore = typeof import("../services/experience-store");
  * A small catalogue shaped like the live one for the submission's test
  * cases: Tromsø winter rows incl. Arctic Explorer, whale rows (title,
  * title_no and description-only hits), summer-only rows in Troms, wildlife in
- * several counties, the Lofoten region, Geiranger filed under Stranda, a
- * published kommune named Time, a Rauma row whose title has "Romsdal" in it,
- * kommuner the gazetteer lacks (Lyngen, Sirdal, Rauma) — four of them named
- * like everyday words (Gran, Strand, Øyer, Fjord) — and an unpublished row
- * in Finnsnes. No row in Finnmark, Storslett or Alta. Every row has a price,
+ * several counties, the Lofoten region (in its kommuner Vågan and
+ * Vestvågøy), Geiranger filed under Stranda, a published kommune named Time,
+ * a Rauma row whose title has "Romsdal" in it, kommuner the gazetteer lacks
+ * (Lyngen, Sirdal, Rauma, Vågan, Vestvågøy) — four of them named like
+ * everyday words (Gran, Strand, Øyer, Fjord) — and an unpublished row in
+ * Finnsnes. No row in Finnmark, Storslett or Alta. Every row has a price,
  * so a max_price filter can find nothing.
  */
 export function seedOpplevagentQueryFixture(expStore: ExpStore, db: { prepare(sql: string): { run(...a: unknown[]): unknown } }): Record<string, string> {
@@ -73,8 +74,8 @@ export function seedOpplevagentQueryFixture(expStore: ExpStore, db: { prepare(sq
   add("dogSenja", { kommune: "Senja", fylke: "Troms", title: "Dog sledding on Senja", category: "vinter_sno", season: ["winter"], price_from: 1900 });
   add("dogLyngen", { kommune: "Lyngen", fylke: "Troms", title: "Dog sledding in Lyngen", category: "vinter_sno", season: ["winter"], price_from: 2000 });
   add("andenes", { kommune: "Andøy", fylke: "Nordland", title: "Andenes Whale Safari", category: "dyreliv_safari", season: ["all_year"], price_from: 1300 });
-  add("lofotenWalk", { kommune: "Svolvær", fylke: "Nordland", title: "Lofoten Fishing Village Walk", category: "kultur_historie", season: ["all_year"], price_from: 300 });
-  add("eagle", { kommune: "Leknes", fylke: "Nordland", title: "Ørnesafari i Lofoten", category: "dyreliv_safari", season: ["summer"], price_from: 850 });
+  add("lofotenWalk", { kommune: "Vågan", fylke: "Nordland", title: "Lofoten Fishing Village Walk", category: "kultur_historie", season: ["all_year"], price_from: 300 });
+  add("eagle", { kommune: "Vestvågøy", fylke: "Nordland", title: "Ørnesafari i Lofoten", category: "dyreliv_safari", season: ["summer"], price_from: 850 });
   add("orca", { kommune: "Nærøysund", fylke: "Trøndelag", title: "Orca safari with Northern Explorers", category: "dyreliv_safari", season: ["winter"], price_from: 1400 });
   add("aquarium", { kommune: "Ålesund", fylke: "Møre og Romsdal", title: "Atlanterhavsparken aquarium", category: "dyreliv_safari", season: ["all_year"], price_from: 300 });
   add("romsdalseggen", { kommune: "Rauma", fylke: "Møre og Romsdal", title: "Romsdalseggen ridge hike", category: "natur_friluft", season: ["summer"], price_from: 450 });
