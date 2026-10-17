@@ -42552,6 +42552,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-O (integration
+// test round 2: SD2-01, SD2-03/AI2-07, MCP2-03): an entry with a season note
+// counts for no JSON-LD, "open now" or "today", and lokal_info and the
+// auto-reply show the note with its times; text in the day-and-time form
+// ("Man-Fre 07-22, Lor 08-22") is read into day rows on every surface; the A2A
+// card gets /info's additive `openingHoursDisplay`. The pure part is in the
+// opening-hours suite above (section i); this route suite has its own
+// in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-O (opening hours: season notes, text form, A2A card) ──");
+  try {
+    const { runRfbApningstiderSesongTekstformTests } = require("../src/routes/rfb-apningstider-sesong-tekstform.test") as
+      typeof import("../src/routes/rfb-apningstider-sesong-tekstform.test");
+    const r = await runRfbApningstiderSesongTekstformTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-apningstider-sesong-tekstform: " + f);
+    console.log(`  rfb-apningstider-sesong-tekstform: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-apningstider-sesong-tekstform: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-I (FUNN
 // rfb-app-modal-apningstider-og-escaping): GET /agents/:id/info gets an
 // additive `openingHoursDisplay` (rows from the shared normalizer, the same

@@ -401,8 +401,9 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
       assertEq(seo.isOpenNow(kringler, new Date("2026-10-18T10:00:00Z")), { isOpen: false }, "b isOpenNow: Kringler on Sunday is closed");
       assertEq(seo.isOpenNow([{ day: "mon", open: "10:00", close: "17:00" }], new Date("2026-10-12T09:00:00Z")), { isOpen: true, todayLabel: "10:00–17:00" },
         "b isOpenNow: the declared form as before (Monday 11:00)");
-      assertEq([seo.isOpenNow("Man–fre 10–17"), seo.isOpenNow(null), seo.isOpenNow([])], [null, null, null],
-        "b isOpenNow: free text, nothing and an empty list give no line, as before");
+      // I-O reads free text in the day-and-time form ("Man–fre 10–17") as day rows: see rfb-apningstider-sesong-tekstform.test.ts.
+      assertEq([seo.isOpenNow("Man–fre 10–17 (sommer)"), seo.isOpenNow(null), seo.isOpenNow([])], [null, null, null],
+        "b isOpenNow: free text not in the day-and-time form, nothing and an empty list give no line, as before");
       // Hours past midnight (live 2026-10-17): the review's cases.
       const tromso = ["mon", "tue", "wed", "thu"].map((day) => ({ day, open: "12:00", close: "01:30" }))
         .concat([{ day: "fri", open: "12:00", close: "03:00" }, { day: "sat", open: "12:00", close: "03:00" }, { day: "sun", open: "18:00", close: "01:30" }]);
@@ -435,10 +436,10 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
         "per-periode": "Tor–Fre 12:00–16:00 (April), Man–Fre 08:00–18:00",
         "rita-rekkevidde": "Man–Søn 00:00–24:00",
         "stine-stengt": "Søn: Stengt, Tir 12.00–18.00, Lør 10–17, Fre 9:00–17:30, Tor 18:00–01:30",
-        // I-J (main: no hours line for either).
-        "hovdneset-gard-rena": "Fre 12:00–17:00 (1.7.–31.10.2026)",
+        // I-J (main: no hours line for either). I-O: a season note ("sesongutsalg", "Vintertid") is shown with its times.
+        "hovdneset-gard-rena": "Fre 12:00–17:00 (1.7.–31.10.2026; Grønnsakstor på Rena torg – sesongutsalg, juli–oktober)",
         "sma-vesen": "Etter avtale; Utsalet i bryggeriet er ope på førespurnad – ring 476 82 708. Elles når det er annonsert på Facebook. Sjølvbetening frå kjøleskåp utanfor døra (alkoholfri drikke og ølglas), betal med Vipps.",
-        "siri-skjema": "Lør–Søn 10:00–15:00, Man 9–14.30 (1.11.2026–31.3.2027), Ons 10:00–14:00 (fra 1.7.2026), PublicHolidays 12:00–15:00, Tor 10:00–17:00",
+        "siri-skjema": "Lør–Søn 10:00–15:00, Man 9–14.30 (1.11.2026–31.3.2027; Vintertid), Ons 10:00–14:00 (fra 1.7.2026), PublicHolidays 12:00–15:00, Tor 10:00–17:00",
       };
       for (const p of Object.values(P)) {
         console.log = () => {};

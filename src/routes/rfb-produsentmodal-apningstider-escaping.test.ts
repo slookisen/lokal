@@ -231,8 +231,9 @@ export async function runRfbProdusentmodalApningstiderEscapingTests(opts: { log?
         { day: "by-appointment", note: "Åpent etter avtale" }, { day: "sun", open: "closed", close: "closed" },
         { note: "Selvbetjent <bod> & kjøleskap" },
       ] },
-      // Free text for the whole field.
-      text: { id: "ii-text", name: "Tore Tekst", slug: "tore-tekst", hours: "Man–fre 10–17, lør 10–14" },
+      // Free text for the whole field, not all in the day-and-time form (slice
+      // I-O reads that form into day rows; see rfb-apningstider-sesong-tekstform.test.ts).
+      text: { id: "ii-text", name: "Tore Tekst", slug: "tore-tekst", hours: "Man–fre 10–17, lør etter avtale" },
       // No opening hours.
       none: { id: "ii-none", name: "Nils Ingen", slug: "nils-ingen", hours: null },
     };
@@ -320,9 +321,9 @@ export async function runRfbProdusentmodalApningstiderEscapingTests(opts: { log?
       { days: "Søndag", hours: "", note: "Stengt" },
       { days: "", hours: "", note: "Selvbetjent <bod> & kjøleskap" },
     ], "a mixed forms: from/to, a period, a marker day, \"closed\" and {note}, as text (escaping is the page's job)");
-    assertEq(info(S.text.id).body.data.openingHoursDisplay, [{ days: "", hours: "", note: "Man–fre 10–17, lør 10–14" }],
+    assertEq(info(S.text.id).body.data.openingHoursDisplay, [{ days: "", hours: "", note: "Man–fre 10–17, lør etter avtale" }],
       "a free text: one text row");
-    assertEq(info(S.text.id).body.data.knowledge.openingHours, "Man–fre 10–17, lør 10–14",
+    assertEq(info(S.text.id).body.data.knowledge.openingHours, "Man–fre 10–17, lør etter avtale",
       "a free text: knowledge.openingHours stays as stored (selger.html edits it)");
     assertEq(info("ii-missing").status, 404, "a unknown id: still 404");
     for (const value of [undefined, null, 7, {}, { day: "mon", open: "10:00", close: "17:00" }, "", "   "]) {
@@ -390,11 +391,11 @@ export async function runRfbProdusentmodalApningstiderEscapingTests(opts: { log?
         "<div class=\"modal-contact-item\">Nett: <a href=\"https://example.no\" target=\"_blank\" rel=\"noopener\">https://example.no</a></div>"),
         `b declared form ${name}: the contact HTML is byte-identical to the modal before I-I`);
       const text = await modal(script, listAgent(S.text.id));
-      assertEq(modalHourRows(text.body), [["", "Man–fre 10–17, lør 10–14"]],
+      assertEq(modalHourRows(text.body), [["", "Man–fre 10–17, lør etter avtale"]],
         `b free text ${name}: the text is shown (main: .forEach on text threw, and the basic modal replaced the rich one)`);
       assertTrue(text.body.includes("Produkter"), `b free text ${name}: the rich modal is rendered`);
     }
-    assertEq(agentPageHourRows(await agentPage(S.text.id)), [["", "Man–fre 10–17, lør 10–14"]], "b free text agent.html: the text is shown");
+    assertEq(agentPageHourRows(await agentPage(S.text.id)), [["", "Man–fre 10–17, lør etter avtale"]], "b free text agent.html: the text is shown");
     {
       // Well-formed values: the whole modal is the HTML main (19e4d2e2) gave
       // for the same producer, header badges included (main read the hours

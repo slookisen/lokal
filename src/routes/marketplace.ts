@@ -1214,6 +1214,16 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     // to summarize.
     const provenance = getAgentProvenanceSummary(agentId);
     if (provenance) card.provenance = provenance;
+
+    // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-O (MCP2-03):
+    // the additive `openingHoursDisplay` rows of GET /agents/:id/info
+    // (openingHoursDisplayRows), so an agent reading the card gets the hours
+    // in one shape whatever form they are stored in (a list, text such as
+    // "Man-Fre 07-22, Lor 08-22", schema.org's form), with the same text as
+    // the producer page. `openingHours` above is unchanged, the stored value.
+    // After every existing field and omitted when there are none, as in /info.
+    const openingHoursDisplay = openingHoursDisplayRows(k.openingHours);
+    if (openingHoursDisplay.length) card.openingHoursDisplay = openingHoursDisplay;
   }
 
   res.json(card);
