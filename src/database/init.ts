@@ -5470,6 +5470,17 @@ function initSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration client_ip_shadow_windows failed:", err);
   }
+  // Trinn 1d: how much of each window was measured (a process's first window
+  // only from its first request), so hours_covered does not count a restart's
+  // partial window as 5 min. Additive; rows from before keep the default, a
+  // full window, as they were counted. Idempotent on "duplicate column name".
+  try {
+    db.exec(`ALTER TABLE client_ip_shadow_windows ADD COLUMN covered_ms INTEGER NOT NULL DEFAULT 300000`);
+  } catch (err: any) {
+    if (!String(err?.message || "").includes("duplicate column name")) {
+      console.error("Migration client_ip_shadow_windows.covered_ms failed:", err);
+    }
+  }
 
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
   // columns (services/agents-city-backfill.ts). `agents.city` itself already
