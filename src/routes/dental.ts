@@ -1256,12 +1256,15 @@ router.post(
         placesCallsThisRun++;
         // measure 2 (dental slice, lokal#130): log the SKU tier actually
         // requested, not always "enterprise" — needsEnterprise/fieldMask
-        // above already decide which mask this specific call uses.
+        // above already decide which mask this specific call uses. The mask
+        // goes along so the log can show it asked for no Google rating
+        // (S4-A2, places-usage-tracker.ts).
         logPlacesCall(
           db,
           "dental",
           "google-places-batch",
-          needsEnterprise ? "text_search_enterprise" : "text_search_pro"
+          needsEnterprise ? "text_search_enterprise" : "text_search_pro",
+          fieldMask
         );
         const resp = await fetch(
           "https://places.googleapis.com/v1/places:searchText",

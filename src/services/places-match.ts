@@ -30,6 +30,8 @@
 //                                          rating fields while
 //                                          GOOGLE_RATING_FETCH_ENABLED is off
 //                                          (S4-A2); RFB and dental
+//   fieldMaskRequestsRating(mask)        — does a sent mask ask for one?
+//                                          (the Places call log, S4-A2)
 //
 // PURE: no DB, no network. The routes do the I/O.
 
@@ -375,7 +377,8 @@ export function formatPlacesMatchGuardLog(
 // rating routes no longer ask Google for them and write no rating. The values
 // already stored stay untouched: deleting them needs Daniel's own yes.
 // Rollback without a revert: a one-line PR setting this to true, which
-// restores the pre-S4-A2 masks and rating writes on RFB.
+// restores the pre-S4-A2 behaviour of both RFB routes (the rating masks, the
+// batch's Enterprise-tier first-time call, rating writes).
 export const GOOGLE_RATING_FETCH_ENABLED = false;
 
 /** The Places (New) FieldMask entries that carry Google's rating. */
@@ -405,4 +408,17 @@ export function placesFieldMask(
   ratingFetch: boolean = googleRatingFetchEnabled()
 ): string {
   return fields.filter((f) => ratingFetch || !PLACES_RATING_FIELDS.includes(f)).join(",");
+}
+
+/**
+ * True when the comma-separated FieldMask `mask` (as sent in X-Goog-FieldMask)
+ * asks Google for a PLACES_RATING_FIELDS entry, for the Places call log
+ * (services/places-usage-tracker.ts). A Place Details mask names the fields
+ * without the "places." prefix, so both spellings count.
+ */
+export function fieldMaskRequestsRating(mask: string): boolean {
+  return mask
+    .split(",")
+    .map((f) => f.trim())
+    .some((f) => PLACES_RATING_FIELDS.includes(f) || PLACES_RATING_FIELDS.includes(`places.${f}`));
 }

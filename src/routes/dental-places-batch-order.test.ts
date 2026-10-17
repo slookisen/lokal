@@ -18,6 +18,7 @@
  * ones verbatim and carry no Google rating field (dental builds them with
  * placesFieldMask(…, false), whatever RFB's lever says; the lever itself is
  * not flipped here, because this block does not run in the runSerial chain).
+ * Every one of them is in the Places call log, none marked as a rating call.
  */
 
 export interface TestSummary {
@@ -146,6 +147,9 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       const ratingField = (m: string) => m.split(",").some((f) => pm.PLACES_RATING_FIELDS.includes(f));
       assertEq([...new Set(masks)].sort(), PRE_A2_MASKS, "c1: dental sends its pre-S4-A2 Enterprise and Pro masks, byte for byte");
       assertEq(masks.filter(ratingField), [], "c2: no dental Places call asks for a Google rating field");
+      const logged = db.prepare(`SELECT endpoint FROM places_api_call_log`).all() as Array<{ endpoint: string }>;
+      assertEq([logged.length, [...new Set(logged.map((r) => r.endpoint))]], [masks.length, ["google-places-batch"]],
+        "c3: every dental Places call is logged with its mask, none marked as a rating call (+rating)");
     } catch (err: any) {
       failed++;
       failures.push("dental-places-batch-order: unexpected error: " + String(err?.stack || err));

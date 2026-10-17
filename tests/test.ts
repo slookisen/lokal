@@ -48577,9 +48577,12 @@ runSerial(async () => {
 // RFB rating routes write address/phone (and rating, with the S4-A2 lever set
 // back on) only from a candidate whose name and postal code / town match;
 // dental's isConfidentPlaceMatch is pinned to its pre-S3 behaviour. S4-A2:
-// by default neither route asks Google for a rating field or writes a rating.
-// Swaps the getDb() singleton, the global fetch, console.warn and the S4-A2
-// rating-fetch lever (restored in finally) — runSerial, tail position.
+// by default neither route asks Google for a rating field or writes a rating,
+// the batch makes no Enterprise-tier call, and the Places call log marks a
+// rating call (GET /admin/places-usage counts them). Swaps the getDb()
+// singleton, the global fetch, console.warn, the S4-A2 rating-fetch lever and,
+// around each places-usage call, ENABLE_DENTAL (restored in finally) —
+// runSerial, tail position.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-16 S3 + S4-A2: shared Places match guard, no Google rating fetched ──");
   try {

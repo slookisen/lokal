@@ -25,7 +25,7 @@ import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
-import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
+import { logPlacesCall, getPlacesUsageThisMonth, getPlacesRatingFieldCallsThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { checkBrregNameHitAddress } from "../services/brreg-address-guard";
@@ -2717,13 +2717,13 @@ router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
   }
 });
 
-// ─── POST /admin/google-rating/:id — Fetch Google Places rating ──
-// Uses the server-side GOOGLE_PLACES_API_KEY to look up a producer's
-// Google rating and review count, then persists it to knowledge.
-// This lets enrichment agents (running in sandbox without the key)
-// trigger Google rating lookups via our own API.
+// ─── POST /admin/google-rating/:id — Google Places rating (off since S4-A2) ──
 // Since S4-A2 (rating fetch off, services/places-match.ts) it answers
 // status "rating_fetch_disabled" without calling Google, and writes nothing.
+// With the lever set back on, it uses the server-side Places key to look up
+// a producer's Google rating and review count and persists it to knowledge,
+// so enrichment agents (running in sandbox without the key) can trigger the
+// lookup via our own API.
 
 router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
@@ -2764,11 +2764,11 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
   // places-treffvakt (S4-A2, Daniel's decision 2=A): Google's rating is no
   // longer fetched (services/places-match.ts, GOOGLE_RATING_FETCH_ENABLED).
   // A rating is all this route fetches and writes, so it answers without a
-  // Places call. A rating already on file stays untouched.
+  // Places call. A rating already on file stays untouched. No `found`: no
+  // lookup was made, so the answer says nothing about Google.
   if (!googleRatingFetchEnabled()) {
     res.json({
       success: true,
-      found: false,
       status: "rating_fetch_disabled",
       message: "Google-ratinger hentes ikke lenger (vilkårene for Google Places tillater ikke lagring). Ingenting er skrevet.",
     });
@@ -2779,17 +2779,23 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
   const city = (agent as any).city || "";
   const searchQuery = rfbPlacesTextQuery(agent.name, city);
 
+  // places.addressComponents (Pro tier; the call is Enterprise already
+  // through rating) feeds the places-match guard below. placesFieldMask
+  // (S4-A2) keeps the rating fields out whenever rating fetch is off.
+  const fieldMask = placesFieldMask(["places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.addressComponents"]);
+
   try {
+    // Durable Places call log (S4-A2 review): this route made unlogged calls
+    // before. Enterprise through the rating fields; the mask marks the row
+    // as a rating call (places-usage-tracker.ts).
+    logPlacesCall(getDb(), "rfb", "google-rating", "text_search_enterprise", fieldMask);
     // Google Places Text Search (New API)
     const placesResp = await fetch("https://places.googleapis.com/v1/places:searchText", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": placesKey,
-        // places.addressComponents (Pro tier; the call is Enterprise already
-        // through rating) feeds the places-match guard below. placesFieldMask
-        // (S4-A2) keeps the rating fields out whenever rating fetch is off.
-        "X-Goog-FieldMask": placesFieldMask(["places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.addressComponents"]),
+        "X-Goog-FieldMask": fieldMask,
       },
       body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
     });
@@ -2905,11 +2911,12 @@ router.post("/admin/agents/:id/geocode-reset", (req: Request, res: Response) => 
   res.json({ success: true, data: { agent_id: agentId, before } });
 });
 
-// ─── POST /admin/google-rating-batch — Batch fetch ratings ──
-// Accepts { agentIds: string[] }, fetches Google rating for each.
-// Max 50 per request to respect API limits.
+// ─── POST /admin/google-rating-batch — Places batch (no rating since S4-A2) ──
+// Accepts { agentIds: string[] }, max 50 per request to respect API limits.
 // Since S4-A2 (rating fetch off, services/places-match.ts) no rating is
-// fetched or written: only the include_address_phone pass (PR-82) runs.
+// fetched or written: only the include_address_phone pass (PR-82) runs, on
+// the Pro mask. With the lever set back on it fetches Google's rating for
+// each agent as before.
 
 router.post("/admin/google-rating-batch", async (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
@@ -2968,13 +2975,22 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   //
   // Same dev-request, S4-A2 (Daniel's decision 2=A): Google's rating is no
   // longer fetched or written (services/places-match.ts,
-  // GOOGLE_RATING_FETCH_ENABLED), and placesFieldMask drops places.rating and
-  // places.userRatingCount from these masks while that is off. What is left is
-  // the PR-82 address/phone pass, unchanged: with include_address_phone the
-  // first-time mask is still Enterprise-tier through internationalPhoneNumber,
-  // once per agent per ENTERPRISE_REFRESH_DAYS as before. Without the flag
-  // nothing is left to fetch, so no agent is sent to Google. Rows then report
-  // no rating at all, fetched or on file, and the stored values stay untouched.
+  // GOOGLE_RATING_FETCH_ENABLED). While that is off, no agent gets the
+  // Enterprise-tier first-time call at all (requestEnterprise below), and
+  // placesFieldMask keeps places.rating and places.userRatingCount out of
+  // these masks as a second guard. On main that call's PR-82 address/phone
+  // pass ran only for a place WITH a rating (no rating → no_rating, nothing
+  // written), so keeping the call without the rating would write Places
+  // address and phone for agents main never wrote them for, and A2 leaves
+  // that logic alone (S4-A non-goal; Places address/phone is Daniel's own
+  // open question, Confirm point 6(b)). Every call is the repeat-run Pro mask
+  // instead, as main already sends from an agent's second run on: address via
+  // formattedAddress, phone only through the PR-29 Details fallback the
+  // caller caps (max_details_calls). The cost: a place with a rating no
+  // longer gets its phone from the first Text Search. Without
+  // include_address_phone nothing is left to fetch, so no agent is sent to
+  // Google. Rows report no rating at all, fetched or on file, and the stored
+  // values stay untouched.
   const fetchRating = googleRatingFetchEnabled();
   const enterpriseFieldMask = placesFieldMask(
     wantAddrPhone
@@ -2996,13 +3012,15 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // `lokal-agent-enrichment` calls this in PHASE 2F with
   // include_address_phone:true, which writes address/phone (+ their
   // field_provenance) onto agent_knowledge. The gate covers the WHOLE handler,
-  // not just that branch, because the flag-less path still writes
-  // google_rating/google_review_count through upsertKnowledge and stamps
-  // google_enterprise_fetched_at — all agent_knowledge mutations, all covered
-  // by the same pause. Gated per-REQUEST on the whole batch (any paused
-  // vertical among the ids blocks everything), identical policy and identical
-  // 423 body to every other gated surface — and placed before the first
-  // Google Places call, so a paused run also spends no API quota.
+  // not just that branch, because with rating fetch on (the S4-A2 lever set
+  // back) the flag-less path writes google_rating/google_review_count through
+  // upsertKnowledge and stamps google_enterprise_fetched_at — all
+  // agent_knowledge mutations, all covered by the same pause (with the lever
+  // off, the default, that path makes no call and writes nothing). Gated
+  // per-REQUEST on the whole batch (any paused vertical among the ids blocks
+  // everything), identical policy and identical 423 body to every other gated
+  // surface — and placed before the first Google Places call, so a paused run
+  // also spends no API quota.
   {
     const pauseBlock = enrichmentWritePauseBlockForAgents(
       getDb,
@@ -3018,7 +3036,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   let enriched = 0;
   let enterpriseCalls = 0; // Text Search calls made with the Enterprise-tier mask
   let proCalls = 0;        // Text Search calls made with the Essentials/Pro-only mask
-  let ratingCalls = 0;     // Text Search calls whose mask asked for the rating (0 since S4-A2)
+  let ratingCalls = 0;     // Text Search calls whose mask asked for the rating (0 while rating fetch is off, S4-A2)
 
   // Look up existing Enterprise-tier state for the whole batch in one query
   // (rather than per-agent) so we know, before making any call, which agents
@@ -3097,7 +3115,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
     const state = enterpriseState.get(agentId);
     const hasEnterpriseData = state?.hasEnterpriseData === true;
-    const requestEnterprise = !hasEnterpriseData;
+    // S4-A2: never with rating fetch off — every call then uses the Pro mask
+    // (see the masks above), and no Enterprise attempt is recorded.
+    const requestEnterprise = !hasEnterpriseData && fetchRating;
     // The rating a result row reports: the one this call fetched, else the
     // one on file. None while rating fetch is off (S4-A2).
     const ratingOnRow = (fetched?: { rating?: number; userRatingCount?: number } | null): Record<string, unknown> => {
@@ -3110,7 +3130,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
     // is still fresh (within ENTERPRISE_REFRESH_DAYS), or no rating is
     // fetched at all (S4-A2), and the caller isn't asking for address/phone
     // backfill either — skip the Google call entirely.
-    if ((!requestEnterprise || !fetchRating) && !wantAddrPhone) {
+    if (!requestEnterprise && !wantAddrPhone) {
       results.push({
         agentId,
         name: info.agent.name,
@@ -3127,15 +3147,17 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
     try {
       if (requestEnterprise) enterpriseCalls++; else proCalls++;
-      if (requestEnterprise && fetchRating) ratingCalls++;
+      if (requestEnterprise) ratingCalls++; // the Enterprise mask carries the rating fields
       // Durable cross-run log (places_api_call_log) for the monthly-projection
       // guardrail — complements the per-run enterpriseCalls/proCalls counters
-      // above, which only live for the duration of this response.
+      // above, which only live for the duration of this response. The mask
+      // marks a rating call in the log (S4-A2, places-usage-tracker.ts).
       logPlacesCall(
         getDb(),
         "rfb",
         "google-rating-batch",
-        requestEnterprise ? "text_search_enterprise" : "text_search_pro"
+        requestEnterprise ? "text_search_enterprise" : "text_search_pro",
+        fieldMask
       );
       const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
         method: "POST",
@@ -3180,10 +3202,11 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         continue;
       }
       // null only when Google returned no candidates at all (handled below
-      // exactly as before: no_rating / skipped_has_rating; no_place since S4-A2).
+      // exactly as before: no_rating / skipped_has_rating; no_place with
+      // rating fetch off, S4-A2).
       const place = pick.place;
 
-      if (requestEnterprise && fetchRating) {
+      if (requestEnterprise) {
         if (!place?.rating) {
           // Include any prior rating this agent already held — a refresh
           // attempt that finds no rating this time must not read as "this
@@ -3218,15 +3241,11 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         // Record the Enterprise-tier fetch for this refresh window (best-effort, non-blocking).
         markEnterpriseFetched(agentId);
       } else {
-        // No rating fields were requested, so `place.rating`/
-        // `place.userRatingCount` are never read here: a repeat run (the
-        // agent already has Enterprise-tier data; only address, Pro-tier via
-        // formattedAddress, may have come back for the PR-82 backfill below),
-        // or, since S4-A2, any run. A first-time call with rating fetch off
-        // still spent the Enterprise tier on internationalPhoneNumber, so it
-        // is recorded like any other; the PR-82 address/phone pass below
-        // runs for every confident candidate, not only for one with a rating.
-        if (requestEnterprise) markEnterpriseFetched(agentId);
+        // Pro mask: no rating fields were requested, so `place.rating`/
+        // `place.userRatingCount` are never read here. Only address (Pro-tier,
+        // via formattedAddress) may have come back for the PR-82 backfill
+        // below. A repeat run (the agent already has Enterprise-tier data),
+        // or, with rating fetch off (S4-A2), any run.
         if (!place) {
           results.push({
             agentId,
@@ -3299,12 +3318,12 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         const needPhone = typeof place.internationalPhoneNumber !== "string" || place.internationalPhoneNumber.trim() === "";
         if ((needAddr || needPhone) && detailsCalls < effectiveCap) {
           detailsCalls++;
-          logPlacesCall(getDb(), "rfb", "google-rating-batch-details", "place_details");
+          const { url: detailsUrl, fieldMask: detailsMask } = buildPlaceDetailsRequest(
+            place.id,
+            { addr: needAddr, phone: needPhone },
+          );
+          logPlacesCall(getDb(), "rfb", "google-rating-batch-details", "place_details", detailsMask);
           try {
-            const { url: detailsUrl, fieldMask: detailsMask } = buildPlaceDetailsRequest(
-              place.id,
-              { addr: needAddr, phone: needPhone },
-            );
             const detResp = await fetch(detailsUrl, {
               headers: {
                 "X-Goog-FieldMask": detailsMask,
@@ -3528,6 +3547,12 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                 sets.push("data_enriched_at = ?"); params.push(nowIso);
               }
               if (sets.length > 0) {
+                // S4-A2: with rating fetch off a first-time agent reaches this
+                // pass without an agent_knowledge row (no rating upsert, no
+                // Enterprise marker created one), and an UPDATE alone would
+                // write nothing while the row reports addressWritten. A
+                // minimal row, as markEnterpriseFetched inserts one.
+                if (!row) db.prepare("INSERT INTO agent_knowledge (agent_id) VALUES (?) ON CONFLICT(agent_id) DO NOTHING").run(agentId);
                 params.push(agentId);
                 db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
               }
@@ -3559,7 +3584,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       results.push({
         agentId,
         name: info.agent.name,
-        status: requestEnterprise && fetchRating ? "enriched" : "enriched_addr_phone_only",
+        status: requestEnterprise ? "enriched" : "enriched_addr_phone_only",
         ...ratingOnRow(requestEnterprise ? place : null),
         ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
         // W40 write guards: present only when they fired.
@@ -3591,9 +3616,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       enterprise_calls: enterpriseCalls,
       pro_calls: proCalls,
       details_calls: detailsCalls,
-      // S4-A2: Text Search calls that asked Google for the rating — 0 while
-      // rating fetch is off. enterprise_calls still counts the
-      // internationalPhoneNumber calls of include_address_phone.
+      // S4-A2: Text Search calls that asked Google for the rating. 0 while
+      // rating fetch is off, and enterprise_calls with it (Pro mask only);
+      // with the lever on, every Enterprise-tier call asks for the rating.
       rating_calls: ratingCalls,
     },
   });
@@ -3605,7 +3630,11 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 // aggregated here at read-time) and returns this-calendar-month call counts
 // per SKU, so the daily orchestrator brief can flag when the Enterprise-SKU
 // free-tier cap (1,000 calls/month) is at risk. Observability only — never
-// touches enrichment state.
+// touches enrichment state. rating_field_calls_this_month (dev-request
+// 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
+// S4-A2) counts the calls whose FieldMask asked Google for its rating: 0
+// while rating fetch is off (S4-A's acceptance); rows logged before S4-A2
+// carry no mark and are not counted.
 router.get("/admin/places-usage", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = getAdminKey();
@@ -3616,6 +3645,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
 
   const byVerticalSku: Array<{ vertical: string; sku: string; calls_this_month: number }> = [];
   byVerticalSku.push(...getPlacesUsageThisMonth(getDb(), "rfb"));
+  let ratingFieldCallsThisMonth = getPlacesRatingFieldCallsThisMonth(getDb());
   // Only reach into the dental vertical DB when it's explicitly enabled —
   // db-factory.ts's getDb("dental") lazily CREATES /app/data/dental.db (and
   // runs the full dental schema-init) on first call, so an unconditional
@@ -3625,6 +3655,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
   if (process.env.ENABLE_DENTAL === "1") {
     try {
       byVerticalSku.push(...getPlacesUsageThisMonth(getVerticalDb("dental"), "dental"));
+      ratingFieldCallsThisMonth += getPlacesRatingFieldCallsThisMonth(getVerticalDb("dental"));
     } catch {
       // dental vertical enabled but unavailable for some other reason — rfb-only summary
     }
@@ -3644,6 +3675,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
       enterprise_free_cap: ENTERPRISE_FREE_CAP,
       soft_guardrail_threshold: SOFT_GUARDRAIL_THRESHOLD,
       over_soft_guardrail: enterpriseCallsThisMonth > SOFT_GUARDRAIL_THRESHOLD,
+      rating_field_calls_this_month: ratingFieldCallsThisMonth,
     },
   });
 });
