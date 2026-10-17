@@ -124,7 +124,7 @@ async function startProbe(cfg: ClientIpConfig, opts: ClientIpMiddlewareOptions =
   const lines: string[] = [];
   const errors: string[] = [];
   const app = express();
-  const mw = installClientIp(app, cfg, { now: () => T0, log: (l) => lines.push(l), logError: (l) => errors.push(l), ...opts });
+  const mw = installClientIp(app, cfg, { now: () => T0, log: (l) => lines.push(l), logError: (l) => errors.push(l), store: null, ...opts });
   const limiter = rateLimit({
     windowMs: 60_000,
     max: 50,
@@ -679,7 +679,7 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
   // ── T15: trust proxy stays true ──
   for (const cfg of [LEGACY, SHADOW, ENFORCE]) {
     const app = express();
-    installClientIp(app, cfg, { log: () => {}, logError: () => {} });
+    installClientIp(app, cfg, { log: () => {}, logError: () => {}, store: null });
     assertTrue(app.get("trust proxy") === true, `T15: ${cfg.mode} — app.get("trust proxy") === true after installClientIp`);
   }
 
@@ -897,7 +897,8 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
       typeof a === "number" ? a + b : Object.fromEntries(Object.keys(a).map((k) => [k, sum(a[k], b?.[k])]));
     const leaves = (o: any): number[] => (typeof o === "number" ? [o] : Object.values(o ?? {}).flatMap(leaves));
     const iso = (t: number) => new Date(t).toISOString();
-    const quiet = { log: () => {}, logError: () => {} };
+    // store: null — installClientIp's default store (on Fly) is the main DB; these tests run without one.
+    const quiet = { log: () => {}, logError: () => {}, store: null };
     const snapshot = () => getInstalledClientIpSnapshot() as ClientIpOpsSnapshot;
 
     __resetInstalledClientIpForTesting();
@@ -924,7 +925,7 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
     {
       let clock = T0;
       const lines: string[] = [];
-      const mw = installClientIp(express(), SHADOW, { now: () => clock, log: (l) => lines.push(l), logError: () => {} });
+      const mw = installClientIp(express(), SHADOW, { now: () => clock, log: (l) => lines.push(l), logError: () => {}, store: null });
       lines.length = 0; // the boot line
       const send = (o: Parameters<typeof fakeReq>[0]) => mw(fakeReq(o), {} as any, () => {});
       const sendXff = (fci: string, xff: string) => send({ fci, xff, ip: xff.split(",")[0].trim() });

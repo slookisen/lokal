@@ -35,6 +35,11 @@
  * Read-out for AC2 (trinn 1b): the `client_ip_stats` log line, and the same
  * counters plus mode, breaker state and since-boot sums as `clientIp` in the
  * existing GET /admin/analytics/ops/event-loop (getInstalledClientIpSnapshot).
+ * Trinn 1c: on Fly every closed window is also stored per machine
+ * (services/client-ip-shadow-store.ts, written by a timer, never by the
+ * request path), so `clientIp.cumulative` sums every deploy and
+ * `clientIp.ac2` is the server's own verdict on each AC2 criterion
+ * (evaluateClientIpAc2).
  *
  * The failure mode guarded hardest is "every client in one bucket" (a 429
  * wave on all three sites):
@@ -66,6 +71,12 @@ import crypto from "crypto";
 import type { Application, NextFunction, Request, Response } from "express";
 import { ipKeyGenerator } from "express-rate-limit";
 import { aiAssistantVendor, classifyUA } from "../services/traffic-classifier";
+import {
+  createClientIpShadowStore,
+  type ClientIpShadowStore,
+  type ClientIpShadowWriterStats,
+  type ClientIpStoredTotals,
+} from "../services/client-ip-shadow-store";
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -387,9 +398,128 @@ export interface ClientIpStatsLine extends ClientIpCounters {
   top15m: ClientIpTopKey[];
 }
 
+// ─── AC2, the shadow gate before trinn 2 (trinn 1c) ─────────────────────
+
+/**
+ * AC2's "smallest limit" per path class for the fanIn criterion, per 15 min
+ * (the top list's span), all anonymous ceilings: /api generalLimiter 300 and
+ * /a2a jsonRpcLimiter 200 (security.ts), MCP the primary limiter's 200
+ * (mcp-rate-limit.ts). /mcp counts every /mcp request, an upper bound of the
+ * `initialize` calls that 200 keys on the IP. Class `other` is not rated, as
+ * in AC2. Pinned against the limiter sources by client-ip-shadow-store.test.ts.
+ */
+export const AC2_FANIN_LIMITS = { api: 300, a2a: 200, mcp: 200 } as const;
+
+/** AC2 in the dev-request's `## Acceptance criteria`. */
+export const AC2_THRESHOLDS = {
+  minHours: 48,
+  minRequests: 5000,
+  /** (missing + invalid + non_public − fallback_hc) / n: "fallback ≤ health-check volume + 1 %". */
+  maxFallbackBeyondHc: 0.01,
+  minAgreeFciEdge: 0.995,
+  minAgreeLegacyEqFci: 0.999,
+  /** No top key with fanIn > 1 at ≥ 80 % of its smallest limit. */
+  maxFanInRatio: 0.8,
+} as const;
+
+/** A closed window's largest fanIn ratio: of the 15-min top keys with fanIn > 1, the one closest to a limit. */
+export interface ClientIpWindowFanIn {
+  /** The key's requests in `class` over the 15-min top list / AC2_FANIN_LIMITS[class]. */
+  ratio: number;
+  class: keyof typeof AC2_FANIN_LIMITS;
+  /** Distinct legacy keys behind it, capped at 8. */
+  fanIn: number;
+  /** Its traffic-classifier family, as ClientIpTopKey.ua: tells a known AI egress apart. */
+  ua: string;
+}
+
+/** `clientIp.cumulative`: every window stored in the main DB, across deploys (14-day retention). */
+export interface ClientIpCumulative {
+  /** Start of the oldest stored window; null while none is stored. */
+  since: string | null;
+  /** End of the newest stored window. */
+  until: string | null;
+  /** Stored rows: one per machine per 5-min window. */
+  windows: number;
+  machines: number;
+  /** Distinct stored windows × 5 min, in hours: gaps (a restart's unstored window, idle time) do not count. */
+  hours_covered: number;
+  /** The stats line's additive counters summed over every stored row; n = requests. */
+  counters: ClientIpCounters;
+  /** The largest stored per-window fanIn ratio, with its window; null when no top key ever had fanIn > 1. */
+  fanin_max: (ClientIpWindowFanIn & { window_start: string }) | null;
+  /** This process's writer: tells "nothing stored yet" from "writes failing". */
+  writer: ClientIpShadowWriterStats;
+}
+
+export interface ClientIpAc2Criterion {
+  /** null = nothing measured yet, which never passes. */
+  value: number | null;
+  threshold: number;
+  op: ">=" | "<=" | "<" | "==";
+  pass: boolean;
+}
+
+/** `clientIp.ac2`: every AC2 criterion over `cumulative`; ready only when each one passes. */
+export interface ClientIpAc2 {
+  ready: boolean;
+  criteria: {
+    hours_covered: ClientIpAc2Criterion;
+    requests: ClientIpAc2Criterion;
+    fallback_beyond_health_checks: ClientIpAc2Criterion;
+    /** "= 0 or explained": explaining is a human call, so the server passes only 0. */
+    invalid_non_public: ClientIpAc2Criterion;
+    /** Text comparison: an IPv6 written two ways can only lower it (review S5 of PR #1102), never pass it falsely. */
+    agree_fci_edge: ClientIpAc2Criterion;
+    agree_legacy_eq_fci: ClientIpAc2Criterion;
+    would_trip: ClientIpAc2Criterion;
+    fanin_limit_ratio: ClientIpAc2Criterion;
+    /** fanin_limit_ratio only sees keys that got a top-list entry (review S4 of PR #1102): it holds only with no overflow. */
+    top_overflow: ClientIpAc2Criterion;
+  };
+}
+
+const ratioOf = (part: number, whole: number): number | null => (whole > 0 ? part / whole : null);
+const atLeast = (value: number | null, threshold: number): ClientIpAc2Criterion => ({ value, threshold, op: ">=", pass: value !== null && value >= threshold });
+const atMost = (value: number | null, threshold: number): ClientIpAc2Criterion => ({ value, threshold, op: "<=", pass: value !== null && value <= threshold });
+const below = (value: number, threshold: number): ClientIpAc2Criterion => ({ value, threshold, op: "<", pass: value < threshold });
+const zero = (value: number): ClientIpAc2Criterion => ({ value, threshold: 0, op: "==", pass: value === 0 });
+
+/** The server's AC2 verdict: each criterion with value, threshold and pass; ready when all pass. */
+export function evaluateClientIpAc2(c: ClientIpCumulative): ClientIpAc2 {
+  const k = c.counters;
+  const fallbacks = k.fallback.missing + k.fallback.invalid + k.fallback.non_public;
+  const criteria: ClientIpAc2["criteria"] = {
+    hours_covered: atLeast(c.hours_covered, AC2_THRESHOLDS.minHours),
+    requests: atLeast(k.n, AC2_THRESHOLDS.minRequests),
+    fallback_beyond_health_checks: atMost(ratioOf(fallbacks - k.fallback_hc, k.n), AC2_THRESHOLDS.maxFallbackBeyondHc),
+    invalid_non_public: zero(k.fallback.invalid + k.fallback.non_public),
+    agree_fci_edge: atLeast(ratioOf(k.agree_fci_edge.agree, k.agree_fci_edge.n), AC2_THRESHOLDS.minAgreeFciEdge),
+    agree_legacy_eq_fci: atLeast(ratioOf(k.agree_legacy_eq_fci.agree, k.agree_legacy_eq_fci.n), AC2_THRESHOLDS.minAgreeLegacyEqFci),
+    would_trip: zero(k.would_trip),
+    fanin_limit_ratio: below(c.fanin_max?.ratio ?? 0, AC2_THRESHOLDS.maxFanInRatio),
+    top_overflow: zero(k.top_overflow),
+  };
+  return { ready: Object.values(criteria).every((x) => x.pass), criteria };
+}
+
+function cumulativeFrom(t: ClientIpStoredTotals, writer: ClientIpShadowWriterStats): ClientIpCumulative {
+  return {
+    since: t.first,
+    until: t.last === null ? null : new Date(Date.parse(t.last) + STATS_WINDOW_MS).toISOString(),
+    windows: t.rows,
+    machines: t.machines,
+    hours_covered: (t.windows * STATS_WINDOW_MS) / 3_600_000,
+    counters: t.counters,
+    fanin_max: t.fanInMax,
+    writer,
+  };
+}
+
 /**
  * `clientIp` in GET /admin/analytics/ops/event-loop: the AC2 read-out for the
- * fleet, for one process (one Fly machine; a restart starts it over).
+ * fleet. Everything but cumulative/ac2 is for one process (one Fly machine;
+ * a restart starts it over).
  * Counters, the breaker state, and the open window with its top list keyed
  * by the same 12-hex hashes as the log line: never a raw IP.
  */
@@ -409,6 +539,14 @@ export interface ClientIpOpsSnapshot {
    * of now); null when there is none yet.
    */
   window: ClientIpStatsLine | null;
+  /**
+   * Trinn 1c: every window stored in the main DB, so AC2 survives deploys.
+   * null without a store (off Fly, or a test that passes none); { error } when
+   * the DB read failed (the rest of the snapshot still answers).
+   */
+  cumulative: ClientIpCumulative | { error: "read_failed" } | null;
+  /** The server's own AC2 verdict over cumulative; null when cumulative is not available. */
+  ac2: ClientIpAc2 | null;
 }
 
 function newCounters(): StatsCounters {
@@ -494,6 +632,24 @@ function stripMapped(ip: string): string {
   return mapped ? mapped[1] : ip;
 }
 
+/** A top entry's most frequent UA family. */
+function mainUa(e: TopEntry): string {
+  return [...e.ua.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "none";
+}
+
+/** Of the merged 15-min top keys with fanIn > 1, the one closest to its AC2_FANIN_LIMITS limit (first wins a tie); null if none. */
+function fanInMax(merged: Map<string, TopEntry>): ClientIpWindowFanIn | null {
+  let best: ClientIpWindowFanIn | null = null;
+  for (const e of merged.values()) {
+    if (e.legacy.size <= 1) continue;
+    for (const cls of ["api", "a2a", "mcp"] as const) {
+      const ratio = e.paths[cls] / AC2_FANIN_LIMITS[cls];
+      if (ratio > 0 && (best === null || ratio > best.ratio)) best = { ratio, class: cls, fanIn: e.legacy.size, ua: mainUa(e) };
+    }
+  }
+  return best;
+}
+
 // ─── Middleware ─────────────────────────────────────────────────────────
 
 export interface ClientIpMiddlewareOptions {
@@ -503,6 +659,12 @@ export interface ClientIpMiddlewareOptions {
   log?: (line: string) => void;
   /** Sink for breaker events. Default console.error. */
   logError?: (line: string) => void;
+  /**
+   * Trinn 1c: where closed windows go (enqueue only, from the request path)
+   * and cumulative is read from. createClientIpMiddleware: default none.
+   * installClientIp: default the main-DB store on Fly, none off Fly.
+   */
+  store?: ClientIpShadowStore | null;
 }
 
 export type ClientIpMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
@@ -528,6 +690,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   const log = opts.log ?? console.log;
   const logError = opts.logError ?? console.error;
   const mode = cfg.mode;
+  const store = opts.store ?? null;
   const statsKey = createStatsKey(crypto.randomBytes(16));
   const breaker = new CollapseBreaker();
   let current: StatsWindow | null = null;
@@ -538,7 +701,8 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   let firstIndex: number | null = null;
   let lastT = 0;
 
-  function topList(w: StatsWindow): ClientIpTopKey[] {
+  /** The top maps of w and the windows before it within TOP_WINDOWS (15 min), merged per key. */
+  function mergedTop(w: StatsWindow): Map<string, TopEntry> {
     const merged = new Map<string, TopEntry>();
     for (const win of [...history.filter((h) => w.index - h.index < TOP_WINDOWS && h.index < w.index), w]) {
       for (const [key, e] of win.top) {
@@ -553,6 +717,10 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
         for (const [u, c] of e.ua) m.ua.set(u, (m.ua.get(u) ?? 0) + c);
       }
     }
+    return merged;
+  }
+
+  function topList(merged: Map<string, TopEntry>): ClientIpTopKey[] {
     return [...merged.entries()]
       .sort((a, b) => b[1].n - a[1].n)
       .slice(0, TOP_N)
@@ -564,11 +732,11 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
         mcp: e.paths.mcp,
         other: e.paths.other,
         fanIn: e.legacy.size,
-        ua: [...e.ua.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "none",
+        ua: mainUa(e),
       }));
   }
 
-  function line(w: StatsWindow, t: number): ClientIpStatsLine {
+  function line(w: StatsWindow, t: number, merged: Map<string, TopEntry> = mergedTop(w)): ClientIpStatsLine {
     return {
       evt: "client_ip_stats",
       mode,
@@ -581,7 +749,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
       distinct_capped: w.distinctCapped,
       breaker_open: breaker.isOpen(t),
       breaker_trips_total: breaker.tripsTotal,
-      top15m: topList(w),
+      top15m: topList(merged),
     };
   }
 
@@ -591,6 +759,17 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     addCounters(total, closed);
     if (current) addCounters(total, current);
     const openUntil = breaker.openUntilAt(t);
+    let cumulative: ClientIpOpsSnapshot["cumulative"] = null;
+    let ac2: ClientIpAc2 | null = null;
+    if (store) {
+      try {
+        const c = cumulativeFrom(store.totals(), store.writerStats());
+        cumulative = c;
+        ac2 = evaluateClientIpAc2(c);
+      } catch {
+        cumulative = { error: "read_failed" };
+      }
+    }
     return {
       mode,
       on_fly: cfg.onFly,
@@ -603,7 +782,19 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
       },
       since_boot: countersOut(total),
       window: current ? line(current, t) : null,
+      cumulative,
+      ac2,
     };
+  }
+
+  /** Hands a closed window to the store: O(1), never throws, no DB here (the store's timer writes). */
+  function persist(w: StatsWindow, merged: Map<string, TopEntry>): void {
+    if (!store) return;
+    try {
+      store.enqueue({ windowStart: w.index * STATS_WINDOW_MS, mode, counters: countersOut(w), fanIn: fanInMax(merged) });
+    } catch {
+      /* persistence must never fail a request or stop the rotation */
+    }
   }
 
   /**
@@ -614,13 +805,18 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
    * keeps tests alive. So the window still open at SIGTERM/restart is never
    * logged, a window without requests produces no line, and an idle window
    * is logged late. Fly's health check every 30 s (fly.toml) keeps the
-   * 5-min cadence in practice.
+   * 5-min cadence in practice. A logged window is also handed to the store
+   * (trinn 1c), under the same rule, so the same windows are stored.
    */
   function windowAt(t: number): StatsWindow {
     const index = Math.floor(t / STATS_WINDOW_MS);
     if (current && current.index === index) return current;
     if (current) {
-      if (current.n > 0 || current.errors > 0) log(JSON.stringify(line(current, t)));
+      if (current.n > 0 || current.errors > 0) {
+        const merged = mergedTop(current);
+        log(JSON.stringify(line(current, t, merged)));
+        persist(current, merged);
+      }
       addCounters(closed, current);
       history = [...history, { index: current.index, top: current.top }].filter(
         (h) => index - h.index < TOP_WINDOWS && h.index < index
@@ -773,10 +969,14 @@ export function __resetInstalledClientIpForTesting(): void {
  * req.ip the app's own IP for every client (one bucket), and `2` rests on
  * an X-Forwarded-For layout Fly has not documented.
  * The mounted instance is what getInstalledClientIpSnapshot reads.
+ * Trinn 1c: on Fly its closed windows go to the main-DB store unless
+ * opts.store says otherwise; off Fly (local dev, CI, `npm test`) nothing
+ * touches the DB.
  */
 export function installClientIp(app: Application, cfg: ClientIpConfig, opts: ClientIpMiddlewareOptions = {}): ClientIpMiddleware {
   app.set("trust proxy", true);
-  const middleware = createClientIpMiddleware(cfg, opts);
+  const store = opts.store !== undefined ? opts.store : cfg.onFly ? createClientIpShadowStore() : null;
+  const middleware = createClientIpMiddleware(cfg, { ...opts, store });
   app.use(middleware);
   installed = middleware;
   (opts.log ?? console.log)(`[boot] client-ip mode=${cfg.mode} onFly=${cfg.onFly} reason=${cfg.reason}`);
