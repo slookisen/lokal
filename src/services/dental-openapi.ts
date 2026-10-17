@@ -6,6 +6,8 @@
  * loading from disk.  Served at GET /openapi.json on the dental host.
  */
 
+import { BRAND_ENTITIES } from "../config/brand-entities";
+
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
@@ -20,9 +22,13 @@ export function getDentalOpenapi(): object {
       // count (raw Brreg-sweep rows, not honestly-filtered clinics) is
       // dropped rather than wired to a live DB count from this DB-free spec
       // module; GET /api/tannlege/stats gives the real number.
-      description:
+      // A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8):
+      // the sentence that sets Finn-tannlege.com apart from FINN.no, from brand-entities.ts.
+      description: (
         "REST API for Norwegian dental clinic discovery, sourced from Brreg, HPR, and direct enrichment. " +
-        "All read endpoints are public; no authentication required.",
+        "All read endpoints are public; no authentication required. " +
+        (BRAND_ENTITIES.dental.disambiguation?.en ?? "")
+      ).trim(),
       version: "0.1.0",
       contact: { url: `${url}/kontakt` },
       license: { name: "CC0 (Brreg data)", url: "https://creativecommons.org/publicdomain/zero/1.0/" },

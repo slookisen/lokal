@@ -65,6 +65,12 @@ import {
   parentOrganizationJsonLd,
   toSiteLang,
 } from "../services/company-legal";
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8,
+// Daniel's decision 4=A): the sentence that sets Finn-tannlege.com apart from
+// FINN.no is written once, in brand-entities.ts. Footer, /om, llms.txt,
+// ai-plugin.json and the Organization JSON-LD print it; nowhere else names
+// FINN.no (dental-finn-disambiguation.test.ts).
+import { BRAND_ENTITIES } from "../config/brand-entities";
 
 const router = Router();
 
@@ -73,6 +79,9 @@ const DENTAL_AI_EXPLAIN = "AI-søk: sider en AI-assistent (ChatGPT, Claude, Perp
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
+
+const FINN_DISAMBIGUATION_NB = BRAND_ENTITIES.dental.disambiguation?.nb ?? "";
+const FINN_DISAMBIGUATION_EN = BRAND_ENTITIES.dental.disambiguation?.en ?? "";
 
 // PR-111: Canonical Norwegian fylker (15, post-2024 reform). The dental DB
 // contains a few non-canonical fylke values ("Ukjent", "TEST", legacy names)
@@ -678,6 +687,7 @@ a:hover{text-decoration:underline}
 .footer-bottom{max-width:1100px;margin:24px auto 0;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);font-size:.78rem;color:rgba(255,255,255,.4)}
 .footer-company{margin-top:6px}
 .footer-company a{color:rgba(255,255,255,.65);text-decoration:underline}
+.footer-disambiguation{margin-top:4px}
 
 /* SPECIALTY CHIPS */
 .spec-chip{display:inline-block;padding:7px 18px;border-radius:20px;background:var(--section-bg);border:1px solid var(--g200);color:var(--navy);font-size:.83rem;font-weight:500;text-decoration:none;transition:all .15s}
@@ -740,6 +750,7 @@ function dentalFooter(): string {
     &copy; ${new Date().getFullYear()} Finn-tannlege.com &mdash; AI-agenter: <a href="/llms.txt">llms.txt</a> &middot; API: <a href="/api/tannlege/agents">/api/tannlege</a><br>
     En del av A2A-nettverket: <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot; <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a> &mdash; Bygget for både mennesker og AI-agenter
     <div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
+    <div class="footer-disambiguation">${escapeHtml(FINN_DISAMBIGUATION_NB)}</div>
   </div>
 </footer>`;
 }
@@ -1042,6 +1053,8 @@ router.get("/", (_req: Request, res: Response) => {
       name: "Finn-tannlege",
       url: DENTAL_BASE_URL,
       logo: DENTAL_BASE_URL + "/favicon.svg",
+      // G3-S8; G3-S1-dental moves it into organizationJsonLd("dental").
+      ...(FINN_DISAMBIGUATION_NB ? { disambiguatingDescription: FINN_DISAMBIGUATION_NB } : {}),
       // T2: the company that owns and operates finn-tannlege.com.
       parentOrganization: parentOrganizationJsonLd(),
     },
@@ -1909,7 +1922,7 @@ router.get("/om", (_req: Request, res: Response) => {
 <main>
   <div class="content-page">
     <h1>Om Finn-tannlege.com</h1>
-    <p>Finn-tannlege.com er en uavhengig oversikt over tannlegeklinikker i Norge. Vi er ikke tilknyttet noen klinikkjede, forsikringsselskap eller bestillingsportal.</p>
+    <p>Finn-tannlege.com er en uavhengig oversikt over tannlegeklinikker i Norge. Vi er ikke tilknyttet noen klinikkjede, forsikringsselskap eller bestillingsportal. ${escapeHtml(FINN_DISAMBIGUATION_NB)}</p>
 
     <h2>Hva vi tilbyr</h2>
     <p>Vi samler informasjon om tannlegeklinikker fra offentlig tilgjengelige kilder og gjør den søkbar og lettleselig for alle. Du kan søke på by, fylke, spesialitet, Helfo-avtale og akuttilbud.</p>
@@ -2119,6 +2132,9 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
 Finn-tannlege.com er en uavhengig søketjeneste for tannlegeklinikker i Norge.
 Databasen inneholder omtrent ${stats.total.toLocaleString("nb")} klinikker hentet fra
 Brønnøysundregistrene, HPR og klinikkenes egne nettsider.
+
+${FINN_DISAMBIGUATION_NB}
+${FINN_DISAMBIGUATION_EN}
 
 ## A2A AI-discovery
 
@@ -2767,7 +2783,7 @@ MCP-endpoint: ${DENTAL_BASE_URL}/mcp
 MCP-server-card: ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 A2A-endpoint: ${DENTAL_BASE_URL}/a2a
 API-base: ${DENTAL_BASE_URL}/api/tannlege
-Name: Finn Tannlege
+Name: Finn-tannlege
 Description: Norwegian dental practice directory — find and compare dental clinics (read-only; no online booking, contact the clinic directly)
 Languages: no, en
 Categories: dental, healthcare, directory, norway
@@ -2812,12 +2828,12 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
     name_for_human: "Finn-tannlege",
     name_for_model: "finn_tannlege",
     description_for_human:
-      "Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akuttvakt.",
+      `Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akuttvakt. ${FINN_DISAMBIGUATION_NB}`.trim(),
     description_for_model:
       "Plugin for searching and comparing Norwegian dental clinics. " +
       (total ? `Provides access to ${total.toLocaleString("nb")} clinics ` : "Provides access to clinics ") +
       "with filters for county (fylke), specialty, Helfo direct-billing agreement and emergency-duty " +
-      "(akuttvakt). Read-only: it does not book appointments — users contact the clinic directly.",
+      `(akuttvakt). Read-only: it does not book appointments — users contact the clinic directly. ${FINN_DISAMBIGUATION_EN}`.trim(),
     auth: { type: "none" },
     api: {
       type: "openapi",

@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: no (4 open, 1 waiting). See the prerequisites in ../README.md.
+Before you start: Ready to submit: no (4 open). See the prerequisites in ../README.md.
 
 ## 1. Connection
 
