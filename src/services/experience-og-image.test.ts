@@ -255,8 +255,10 @@ export function runExperienceOgImageTests(opts: { log?: boolean } = {}): Promise
       assertEq(faviconOgImageCount, 0,
         "i1: no favicon.svg og:image fallback remains — opplevelse-detail/browse/gardssalg-produsent were migrated here, the homepage in E2-S3 (2026-10-16)");
       const newRouteOgImageUsages = (expSeoSrc.match(/ogImageUrl\(url,/g) || []).length;
-      assertEq(newRouteOgImageUsages, 3,
-        "i2: ogImageUrl() is wired into exactly the three in-scope templates (opplevelse-detail, browse, gardssalg-produsent)");
+      // The gårdssalg catalog (/kategori/gardssalg and its type pages) is the
+      // fourth since dev-request 2026-10-17-integrasjonstest-oppfolging, SD-11.
+      assertEq(newRouteOgImageUsages, 4,
+        "i2: ogImageUrl() is wired into exactly the four in-scope templates (opplevelse-detail, browse, gardssalg-produsent, gardssalg catalog)");
     } catch (err: any) {
       failed++;
       failures.push("experience-og-image: unexpected error: " + String(err?.stack || err?.message || err));

@@ -142,6 +142,7 @@ export {
   type DedupCandidateRow,
   type DedupPassResult,
 } from "./experience-dedup";
+import { shouldNoindexExperience, type ProduktByCellStats } from "./experience-indexability";
 
 const VERTICAL = "experiences";
 
@@ -1284,6 +1285,59 @@ export function getPlaceFaqStats(place: PlaceFilter): PlaceFaqStats {
   };
 }
 
+// Indexable counts for the aggregate pages (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, IDX-1/IDX-2): a combo, kommune or provider
+// page counts the experiences it lists that are indexable, i.e. that
+// shouldNoindexExperience() (experience-indexability.ts) lets through — the
+// same verdict the detail page and its sitemap entry use. The rule runs in
+// memory over the rows' descriptions: isJunkDescription() has no SQL form,
+// and a second copy of it in SQL could drift. Same browseWhere() filter as
+// the listing, so the count covers exactly the rows the page lists. The kill
+// switch is read per call, like the detail page's.
+
+/** How many published experiences matching `filter` are indexable. An empty
+ *  filter, or one with a blank value, counts 0, as in getPlaceFaqStats():
+ *  browseWhere() would drop the blank value and count more than the page
+ *  lists. */
+export function countIndexablePublishedExperiences(filter: BrowseFilter): number {
+  const values = Object.values(filter);
+  if (values.length === 0 || values.some((v) => !v)) return 0;
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere(filter);
+  const rows = db
+    .prepare(
+      `SELECT e.description AS description FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .all(params) as Array<{ description: string | null }>;
+  return rows.filter((r) => !shouldNoindexExperience(r)).length;
+}
+
+/** Indexable published experiences per kommune and per provider id, in one
+ *  query — what the sitemap reads to leave out a /kommune or /tilbyder page
+ *  with none (IDX-2). A key with no indexable row is absent (count 0). */
+export function listIndexableCountsByPlace(): { byKommune: Map<string, number>; byProvider: Map<string, number> } {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere({});
+  const rows = db
+    .prepare(
+      `SELECT e.kommune AS kommune, e.provider_id AS provider_id, e.description AS description
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .all(params) as Array<{ kommune: string | null; provider_id: string | null; description: string | null }>;
+  const byKommune = new Map<string, number>();
+  const byProvider = new Map<string, number>();
+  for (const r of rows) {
+    if (shouldNoindexExperience(r)) continue;
+    if (r.kommune) byKommune.set(r.kommune, (byKommune.get(r.kommune) ?? 0) + 1);
+    if (r.provider_id) byProvider.set(r.provider_id, (byProvider.get(r.provider_id) ?? 0) + 1);
+  }
+  return { byKommune, byProvider };
+}
+
 // GEO: category×kommune cross-tab aggregate + candidate list for the
 // "query landing pages" slice (dev-request 2026-06-30-geo-content-structured-data,
 // final remaining slice — programmatic `/kategori/:category/:kommune` pages
@@ -1294,15 +1348,12 @@ export function getPlaceFaqStats(place: PlaceFilter): PlaceFaqStats {
 
 /** Aggregate stats for one category×kommune combo's FAQPage JSON-LD +
  *  quality gate: how many published experiences of this category exist in
- *  this kommune, how many distinct providers offer them, and the lowest
- *  listed starting price (null if none stated — never guessed). Mirrors
- *  getCategoryFaqStats()/getKommuneFaqStats() but for the intersection of
- *  both dimensions. */
-export function getProduktByStats(category: string, kommune: string): {
-  total: number;
-  providerCount: number;
-  minPriceFrom: number | null;
-} {
+ *  this kommune, how many of them are indexable (IDX-1, see
+ *  countIndexablePublishedExperiences()), how many distinct providers offer
+ *  them, and the lowest listed starting price (null if none stated — never
+ *  guessed). Mirrors getCategoryFaqStats()/getKommuneFaqStats() but for the
+ *  intersection of both dimensions. */
+export function getProduktByStats(category: string, kommune: string): ProduktByCellStats {
   const db = getDb(VERTICAL);
   const { sql, params } = browseWhere({ category, kommune });
   const row = db
@@ -1317,35 +1368,38 @@ export function getProduktByStats(category: string, kommune: string): {
     .get(params) as { total: number; providerCount: number; minPriceFrom: number | null } | undefined;
   return {
     total: row?.total || 0,
+    indexableTotal: countIndexablePublishedExperiences({ category, kommune }),
     providerCount: row?.providerCount || 0,
     minPriceFrom: row?.minPriceFrom ?? null,
   };
 }
 
 /** Every (category, kommune) combo that has ≥1 PUBLISHED experience, with
- *  the same three facts getProduktByStats() returns — the DB-driven
+ *  the same stats getProduktByStats() returns — the DB-driven
  *  candidate list for the query-landing-pages sitemap loop. Deliberately NOT
  *  a full category × kommune cross-product (most cells of that grid are
  *  empty): one GROUP BY query returns exactly the combos that exist in the
- *  catalog, with the quality-gate facts already attached, so the sitemap
- *  builder can apply the ≥2-real-facts gate in-memory over this one result
- *  set instead of issuing a query per candidate combo. Rows without a slug
+ *  catalog, with the quality-gate facts already attached (indexableTotal
+ *  from one more query over the same rows), so the sitemap builder can apply
+ *  the gate in-memory over this one result set instead of issuing a query
+ *  per candidate combo. Rows without a slug
  *  are left out, as browseWhere() leaves them out of getProduktByStats() and
  *  the listing (E4-S2), so a listed or linked cell has the facts the route
  *  sees. */
-export type ProduktByComboRow = {
+export type ProduktByComboRow = ProduktByCellStats & {
   category: string;
   kommune: string;
-  total: number;
-  providerCount: number;
-  minPriceFrom: number | null;
   // MAX(updated_at) of the underlying published rows in this combo — real
   // per-aggregate freshness for the sitemap (see listPublishedCategories() doc).
   lastmod: string | null;
 };
 export function listProduktByCombos(): ProduktByComboRow[] {
   const db = getDb(VERTICAL);
-  return db
+  const cellWhere = `e.slug IS NOT NULL
+         AND e.category IS NOT NULL AND e.category != ''
+         AND e.kommune IS NOT NULL AND e.kommune != ''
+         AND ${PUBLISH_GATE_SQL}`;
+  const rows = db
     .prepare(
       `SELECT e.category AS category, e.kommune AS kommune,
               COUNT(*) AS total,
@@ -1354,14 +1408,28 @@ export function listProduktByCombos(): ProduktByComboRow[] {
               MAX(e.updated_at) AS lastmod
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
-       WHERE e.slug IS NOT NULL
-         AND e.category IS NOT NULL AND e.category != ''
-         AND e.kommune IS NOT NULL AND e.kommune != ''
-         AND ${PUBLISH_GATE_SQL}
+       WHERE ${cellWhere}
        GROUP BY e.category, e.kommune
        ORDER BY total DESC, e.category ASC, e.kommune ASC`
     )
-    .all() as ProduktByComboRow[];
+    .all() as Array<Omit<ProduktByComboRow, "indexableTotal">>;
+  // indexableTotal per cell (IDX-1): the same rows, judged in memory like
+  // countIndexablePublishedExperiences() does for one cell.
+  const descriptions = db
+    .prepare(
+      `SELECT e.category AS category, e.kommune AS kommune, e.description AS description
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${cellWhere}`
+    )
+    .all() as Array<{ category: string; kommune: string; description: string | null }>;
+  const indexable = new Map<string, number>();
+  for (const d of descriptions) {
+    if (shouldNoindexExperience(d)) continue;
+    const key = `${d.category}\u0000${d.kommune}`;
+    indexable.set(key, (indexable.get(key) ?? 0) + 1);
+  }
+  return rows.map((r) => ({ ...r, indexableTotal: indexable.get(`${r.category}\u0000${r.kommune}`) ?? 0 }));
 }
 
 /** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts).

@@ -48,15 +48,22 @@ import { isJunkDescription, looksTruncatedMidWord } from "../services/descriptio
 // X-Robots-Tag header and its sitemap.xml entry — see the module's header.
 // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S1: one combo
 // gate for /kategori/:category/:kommune, its sitemap entries and the
-// /kommune category chips.
+// /kommune category chips. dev-request 2026-10-17-integrasjonstest-
+// oppfolging, IDX-1/IDX-2: the gate counts indexable experiences only, and a
+// /kommune or /tilbyder page with none is noindex and not in the sitemap.
 import {
   NOINDEX_FOLLOW,
   renderableExperienceDescription,
   shouldNoindexExperience,
+  shouldNoindexAggregatePage,
   isProduktByCellIndexable,
   produktByMinExperiences,
   countProduktByRealFacts,
+  type ProduktByCellStats,
 } from "../services/experience-indexability";
+// dev-request 2026-10-17-integrasjonstest-oppfolging, SD-13: «på Svalbard»,
+// «i Bergen» in place-page copy.
+import { inPlace } from "../services/place-preposition";
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E2-S1:
 // one fact list for the «Kort fortalt» box, the facts table and the fallback
 // meta/JSON-LD description of a page without a description.
@@ -97,6 +104,9 @@ import {
   getProduktByStats,
   listProduktByCombos,
   type ProduktByComboRow,
+  countIndexablePublishedExperiences,
+  listIndexableCountsByPlace,
+  type BrowseFilter,
   countGardssalgProviders,
   // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2: the
   // homepage drikkested feature section's per-type chips — same WHERE gate as
@@ -1554,12 +1564,19 @@ function isGardssalgCategorySlug(category: string | null | undefined): boolean {
 // buildCategoryAnswerFirstOpening() below): a live count is stated upfront,
 // so it's a function of the REAL count at request time, never a canned
 // number.
+//
+// `metaDescPaused`/`ledePaused` (dev-request 2026-10-17-integrasjonstest-
+// oppfolging, SD-11): the copy while booking is not live for the vertical
+// (gardssalgBookingLive() false). The cards then say «Meld interesse», so
+// the page invites an interest request instead of promising a booking.
 export type GardssalgTypePageDef = {
   label: string;          // chip/breadcrumb label — same canonical labels as DRINK_TYPE_META
   producerTypes: string[]; // raw producer_type spellings aggregated by this page
   title: string;          // <title> (also the h1, minus the " | Opplevagent" suffix)
   metaDesc: string;
+  metaDescPaused: string;
   lede: (count: number) => string; // answer-first opening with the live count woven in
+  ledePaused: (count: number) => string;
 };
 
 export const GARDSSALG_TYPE_PAGES: Record<string, GardssalgTypePageDef> = {
@@ -1568,42 +1585,54 @@ export const GARDSSALG_TYPE_PAGES: Record<string, GardssalgTypePageDef> = {
     producerTypes: ["bryggeri"],
     title: "Bryggerier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale bryggerier — book ølsmaking eller omvisning rett hos bryggeriet. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Besøk lokale bryggerier — meld interesse for ølsmaking eller omvisning hos bryggeriet. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "bryggeri" : "bryggerier"} på Opplevagent — book en ølsmaking eller omvisning rett hos bryggeriet.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "bryggeri" : "bryggerier"} på Opplevagent — meld interesse for en ølsmaking eller omvisning hos bryggeriet.`,
   },
   destilleri: {
     label: "Destillat",
     producerTypes: ["destilleri"],
     title: "Destillerier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale destillerier — book smaking av destillater eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Besøk lokale destillerier — meld interesse for smaking av destillater eller omvisning hos produsenten. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "destilleri" : "destillerier"} på Opplevagent — book en smaking eller omvisning rett hos destilleriet.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "destilleri" : "destillerier"} på Opplevagent — meld interesse for en smaking eller omvisning hos destilleriet.`,
   },
   sider: {
     label: "Sider",
     producerTypes: ["cideri", "sideri"],
     title: "Siderier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale siderprodusenter — book sidersmaking eller omvisning i frukthagen rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Besøk lokale siderprodusenter — meld interesse for sidersmaking eller omvisning i frukthagen hos produsenten. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "siderprodusent" : "siderprodusenter"} på Opplevagent — book en sidersmaking rett hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "siderprodusent" : "siderprodusenter"} på Opplevagent — meld interesse for en sidersmaking hos produsenten.`,
   },
   fruktvin: {
     label: "Fruktvin",
     producerTypes: ["vingård", "vingard", "vingaard"],
     title: "Fruktvin — vingårder med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale fruktvinprodusenter — book smaking av fruktvin og en tur i vingården rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Besøk lokale fruktvinprodusenter — meld interesse for smaking av fruktvin og en tur i vingården hos produsenten. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "fruktvinprodusent" : "fruktvinprodusenter"} på Opplevagent — book en smaking rett hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "fruktvinprodusent" : "fruktvinprodusenter"} på Opplevagent — meld interesse for en smaking hos produsenten.`,
   },
   mjod: {
     label: "Mjød",
     producerTypes: ["mjøderi", "mjoderi", "mjoederi"],
     title: "Mjøderier med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale mjøderier — book mjødsmaking eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Besøk lokale mjøderier — meld interesse for mjødsmaking eller omvisning hos produsenten. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "mjøderi" : "mjøderier"} på Opplevagent — book en mjødsmaking rett hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "mjøderi" : "mjøderier"} på Opplevagent — meld interesse for en mjødsmaking hos produsenten.`,
   },
   kombucha: {
     label: "Kombucha",
     producerTypes: ["seltzeri"],
     title: "Kombucha-produsenter med gårdssalg og smaking | Opplevagent",
     metaDesc: "Besøk lokale kombucha-produsenter — book smaking eller omvisning rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    metaDescPaused: "Besøk lokale kombucha-produsenter — meld interesse for smaking eller omvisning hos produsenten. Verifisert mot Brønnøysundregistrene.",
     lede: (n) => `Det finnes ${n} ${n === 1 ? "kombucha-produsent" : "kombucha-produsenter"} på Opplevagent — book en smaking rett hos produsenten.`,
+    ledePaused: (n) => `Det finnes ${n} ${n === 1 ? "kombucha-produsent" : "kombucha-produsenter"} på Opplevagent — meld interesse for en smaking hos produsenten.`,
   },
 };
 
@@ -1835,6 +1864,23 @@ const DRINK_TYPE_UNACCENTED_ALIASES: Record<string, string> = {
   mjoederi: "mjøderi",
 };
 
+// Is booking meaningfully live for the gårdssalg vertical as a whole right
+// now? At least one REAL (non-hidden) gårdssalg provider has booking_live=1
+// AND the global dispatch master switch is on (dev-request 2026-07-19-
+// opplevagent-forside-seksjoner-design, arbeidspunkt 1, slice 6). Read
+// defensively: any DB error degrades to false (dark-launch copy), never a
+// throw. A COLLECTIVE flag, distinct from the per-provider isBookingPaused()
+// on each booking CTA. Read by the homepage's #drikkested section and, since
+// dev-request 2026-10-17-integrasjonstest-oppfolging SD-11, by the
+// gårdssalg catalog's meta description and hero.
+function gardssalgBookingLive(): boolean {
+  try {
+    return countGardssalgProvidersBookable() > 0 && bookingDispatchEnabled();
+  } catch {
+    return false;
+  }
+}
+
 export function renderDrikkestedFeatureSection(
   lang: Lang,
   typeCounts: Array<{ producer_type: string | null; count: number }>,
@@ -1967,13 +2013,8 @@ router.get("/", (req: Request, res: Response) => {
     let drinkTypeCounts: Array<{ producer_type: string | null; count: number }> = [];
     try { drinkTypeCounts = countGardssalgProvidersByType(); } catch { drinkTypeCounts = []; }
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
-    // 1 (slice 6): section-level "live" = at least one REAL (non-hidden)
-    // gårdssalg provider has booking_live=1 AND the global dispatch master
-    // switch is on. Read defensively, same pattern as drinkTypeCounts above —
-    // degrade to dark-launch (false) on any DB error, never throw.
-    let drikkeBookable = false;
-    try { drikkeBookable = countGardssalgProvidersBookable() > 0 && bookingDispatchEnabled(); } catch { drikkeBookable = false; }
-    drikkestedSectionHtml = renderDrikkestedFeatureSection(lang, drinkTypeCounts, drikkeBookable);
+    // 1 (slice 6): section-level "live" — see gardssalgBookingLive().
+    drikkestedSectionHtml = renderDrikkestedFeatureSection(lang, drinkTypeCounts, gardssalgBookingLive());
   }
 
   // categories (DB not open / no data yet). When empty we show a tasteful set
@@ -2722,12 +2763,26 @@ function buildExperiencesSitemapXml(): string {
       xml += `\n  <url><loc>${url}/fylke/${encodeURIComponent(row.fylke)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${lastmod}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
+  // dev-request 2026-10-17-integrasjonstest-oppfolging, IDX-2: a /kommune or
+  // /tilbyder page whose experiences are all placeholders is noindex, so it
+  // is not listed — the same shouldNoindexAggregatePage() verdict the page
+  // and its X-Robots-Tag header use. One query for both loops below. If it
+  // fails (logged), both loops list every page as before IDX-2.
+  let placeIndexable: ReturnType<typeof listIndexableCountsByPlace> | null = null;
   try {
+    placeIndexable = listIndexableCountsByPlace();
+  } catch (e) {
+    console.error("[experiences-sitemap] indexable counts per kommune/provider failed:", e);
+  }
+  try {
+    let kommuneNoindexSkipped = 0;
     for (const row of listPublishedKommuner()) {
       if (!row.kommune) continue;
+      if (placeIndexable && shouldNoindexAggregatePage(placeIndexable.byKommune.get(row.kommune) ?? 0)) { kommuneNoindexSkipped++; continue; }
       const lastmod = (row.lastmod || today).slice(0, 10);
       xml += `\n  <url><loc>${url}/kommune/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
     }
+    console.log(`[experiences-sitemap] kommune noindex_skipped=${kommuneNoindexSkipped}`);
   } catch { /* experiences DB not open */ }
   try {
     // GEO query-landing pages (dev-request 2026-06-30-geo-content-structured-data):
@@ -2753,12 +2808,15 @@ function buildExperiencesSitemapXml(): string {
   try {
     // Slug backfill already ran near the top of this handler (before the
     // gårdssalg provider fetch, which needs it too) — not repeated here.
+    let providerNoindexSkipped = 0;
     for (const row of listPublishedProviders()) {
       if (!row.id) continue;
+      if (placeIndexable && shouldNoindexAggregatePage(placeIndexable.byProvider.get(row.id) ?? 0)) { providerNoindexSkipped++; continue; }
       const tilbyderSeg = row.slug ? encodeURIComponent(row.slug) : encodeURIComponent(row.id);
       const lastmod = (row.lastmod || today).slice(0, 10);
       xml += `\n  <url><loc>${url}/tilbyder/${tilbyderSeg}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
     }
+    console.log(`[experiences-sitemap] tilbyder noindex_skipped=${providerNoindexSkipped}`);
   } catch { /* experiences DB not open */ }
   try {
     // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
@@ -3586,7 +3644,7 @@ function renderOpplevelseDetail(
   // approximate-precision labelling above.
   const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
     ? (presentation === "no-point"
-        ? renderApproxPlacementCard(exp.kommune, exp.fylke, osmLinkHtml)
+        ? renderApproxPlacementCard(exp.kommune, exp.fylke, osmLinkHtml, "tilbyderen")
         : renderMiniMapSection({ lat, lon, approx: presentation === "approx-point", label: place || "Posisjon" }, osmLinkHtml))
     : `<div class="map-card map-fallback">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
@@ -4348,9 +4406,9 @@ function renderFylkeMapSection(fylke: string, points: ExperienceMapPoint[], lang
   const osmSearchUrl = `https://www.openstreetmap.org/search?query=${encodeURIComponent(`${fylke}, Norge`)}`;
 
   return `<section class="map-section" aria-labelledby="fylke-map-h">
-    <h2 id="fylke-map-h">Kart over opplevelser i ${escapeHtml(fylke)}</h2>
+    <h2 id="fylke-map-h">Kart over opplevelser ${escapeHtml(inPlace(fylke))}</h2>
     <p class="map-legend">${addressCount > 0 ? `<span><span class="dot dot-address" aria-hidden="true"></span>Nøyaktig posisjon</span>` : ""}${kommuneCount > 0 ? `<span><span class="dot dot-kommune" aria-hidden="true"></span>Ca. posisjon (kommune)</span>` : ""}</p>
-    <div id="fylke-map" class="fylke-map" role="group" aria-label="Kart over ${markers.length} ${markers.length === 1 ? "opplevelse" : "opplevelser"} i ${escapeHtml(fylke)}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
+    <div id="fylke-map" class="fylke-map" role="group" aria-label="Kart over ${markers.length} ${markers.length === 1 ? "opplevelse" : "opplevelser"} ${escapeHtml(inPlace(fylke))}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
     <p class="map-attribution-note">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
     <noscript><p class="map-noscript"><a href="${escapeHtml(osmSearchUrl)}" target="_blank" rel="noopener">Åpne kart over ${escapeHtml(fylke)} i OpenStreetMap →</a></p></noscript>
     <script type="application/json" id="fylke-map-data">${serializeJsonForScript(markers)}</script>
@@ -4380,6 +4438,17 @@ function placeOf(row: { kommune?: string | null; fylke?: string | null }): strin
 const PIN_SVG =
   '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>';
 
+// The title a card shows for a row. dev-request 2026-07-04-opplevagent-dedup-
+// og-norske-titler, item 2: /no prefers the LLM-generated Norwegian display
+// title, falling back to the original `title` when title_no hasn't been
+// backfilled yet (never a broken/empty title). /en always renders the
+// original title, unchanged. dev-request 2026-10-17-integrasjonstest-
+// oppfolging, SD-09: the browse pages' ItemList JSON-LD names its items with
+// this too, so the structured data and the cards say the same thing.
+function cardDisplayTitle(row: { title: string; title_no?: string | null }, lang: Lang): string {
+  return lang === "no" ? (row.title_no || row.title) : row.title;
+}
+
 // Render one experience card. Title links to the guaranteed-live detail page.
 // `distance` is optional and ONLY ever passed by /sok's «Nær meg» path (dev-
 // request 2026-07-04-opplevagent-naer-meg-geosok, item 3) — every other
@@ -4392,11 +4461,7 @@ function renderCard(
   distance?: { distance_km: number | null; geo_precision: "address" | "kommune" | null }
 ): string {
   const place = placeOf(row);
-  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2: /no
-  // prefers the LLM-generated Norwegian display title, falling back to the
-  // original `title` when title_no hasn't been backfilled yet (never a
-  // broken/empty title). /en always renders the original title, unchanged.
-  const displayTitle = lang === "no" ? (row.title_no || row.title) : row.title;
+  const displayTitle = cardDisplayTitle(row, lang);
   let cardDescription = row.description || "";
   if (cardDescription && isJunkDescription(cardDescription)) {
     console.log(`[description-guard] suppressed junk description (opplevelse card) for ${row.slug} (${row.title})`);
@@ -4551,6 +4616,11 @@ function renderBrowsePage(opts: {
   // /kategori/:category/:kommune. No section (and no FAQ CSS) when the
   // quality gate left no FAQPage; callers that omit it render as before.
   faqVisible?: boolean;
+  // dev-request 2026-10-17-integrasjonstest-oppfolging, IDX-2: robots meta
+  // `noindex, follow` instead of the index default. Passed by /kommune and
+  // /tilbyder when shouldNoindexAggregatePage() says so; the caller sets the
+  // matching X-Robots-Tag header.
+  noindex?: boolean;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -4562,7 +4632,7 @@ function renderBrowsePage(opts: {
     "@type": "ListItem",
     position: (page - 1) * opts.pageSize + i + 1,
     url: `${url}/opplevelse/${encodeURIComponent(r.slug)}`,
-    name: r.title,
+    name: cardDisplayTitle(r, opts.lang),
   }));
   const collectionLd = {
     "@context": "https://schema.org",
@@ -4652,7 +4722,7 @@ function renderBrowsePage(opts: {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(opts.metaDesc)}">
-<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="robots" content="${opts.noindex ? NOINDEX_FOLLOW : "index, follow, max-snippet:-1, max-image-preview:large"}">
 <meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
@@ -4734,7 +4804,7 @@ function kommuneChips(fylke: string): string {
   const chips = komm
     .map((k) => `<a class="chip" href="/kommune/${encodeURIComponent(k.kommune)}">${escapeHtml(k.kommune)} <span class="n">${k.count}</span></a>`)
     .join("");
-  return `<div class="chips" role="list" aria-label="Kommuner i ${escapeHtml(fylke)}">${chips}</div>`;
+  return `<div class="chips" role="list" aria-label="Kommuner ${escapeHtml(inPlace(fylke))}">${chips}</div>`;
 }
 
 // The combo list behind the /kommune category chips, cached in memory for
@@ -4742,7 +4812,9 @@ function kommuneChips(fylke: string): string {
 // instead of a full-table GROUP BY on every /kommune request (#1101 review
 // S1). The rows are raw facts: produktByChips() applies the gate per
 // request, so a threshold change still takes effect at once, while a newly
-// published or unpublished cell reaches the chips on the sitemap's cadence.
+// published or unpublished cell — or a cell whose indexable count changed
+// (IDX-1: a description landing, the placeholder-noindex kill switch) —
+// reaches the chips on the sitemap's cadence.
 // The entry belongs to the experiences DB handle it was read from, so a
 // reopened DB never serves the old one's rows. Exported for tests.
 let produktByCombosCache: { db: unknown; rows: ProduktByComboRow[]; builtAt: number } | null = null;
@@ -4778,7 +4850,7 @@ function produktByChips(kommune: string): string {
   const chips = combos
     .map((c) => `<a class="chip" href="/kategori/${encodeURIComponent(c.category)}/${encodeURIComponent(kommune)}"><span class="chip-dot" aria-hidden="true" style="background:${categoryColor(c.category)}"></span>${escapeHtml(catLabel(c.category))} <span class="n">${c.total}</span></a>`)
     .join("");
-  return `<div class="chips" role="list" aria-label="Kategorier i ${escapeHtml(kommune)}">${chips}</div>`;
+  return `<div class="chips" role="list" aria-label="Kategorier ${escapeHtml(inPlace(kommune))}">${chips}</div>`;
 }
 
 // Facet chips (categories + fylker) for the index page top.
@@ -4875,7 +4947,7 @@ function renderBoostedResultsHtml(
 ): string {
   const boostLabel = boost.category
     ? `Treff i ${catLabel(boost.category)}`
-    : `Treff i ${boost.fylke}`;
+    : `Treff ${inPlace(boost.fylke ?? "")}`;
   const boostedSection =
     boosted.length > 0
       ? `<section class="search-group" aria-label="${escapeHtml(boostLabel)}">
@@ -5356,11 +5428,19 @@ const MINI_MAP_INIT_JS = `(function () {
 // must not silently lose their only way to open the (real, if coarse)
 // coordinate in OpenStreetMap just because this slice stopped auto-drawing
 // a marker for it.
-function renderApproxPlacementCard(kommune: string | null | undefined, fylke: string | null | undefined, osmLinkHtml: string): string {
+// `who` names the business the page is about (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, SD-12): «tilbyderen» on /opplevelse/:slug,
+// «produsenten» on the gårdssalg producer profile.
+function renderApproxPlacementCard(
+  kommune: string | null | undefined,
+  fylke: string | null | undefined,
+  osmLinkHtml: string,
+  who: "tilbyderen" | "produsenten",
+): string {
   const sted = (kommune || fylke || "").trim();
   return `<div class="map-card map-approx">
          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2"/></svg>
-         <span><strong>${sted ? "Omtrentlig plassering: " + escapeHtml(sted) : "Omtrentlig plassering"}</strong><span class="map-sub">Nøyaktig posisjon er ikke bekreftet ennå — punktet er ikke tegnet inn, siden vi bare vet hvilken kommune produsenten ligger i.</span></span>
+         <span><strong>${sted ? "Omtrentlig plassering: " + escapeHtml(sted) : "Omtrentlig plassering"}</strong><span class="map-sub">Nøyaktig posisjon er ikke bekreftet ennå — punktet er ikke tegnet inn, siden vi bare vet hvilken kommune ${who} ligger i.</span></span>
        </div>
        <noscript>${osmLinkHtml}</noscript>`;
 }
@@ -5659,9 +5739,17 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
   const url = "https://opplevagent.no";
   const canonical = `${url}${pagePath}`;
   const pageTitle = typeDef ? typeDef.title : "Gårdssalg og smaking | Opplevagent";
+  // SD-11 (dev-request 2026-10-17-integrasjonstest-oppfolging): the meta
+  // description and the hero only promise booking while booking is live for
+  // the vertical — the same collective flag as the homepage's #drikkested
+  // section. Otherwise they invite an interest request, like the cards'
+  // «Meld interesse» button.
+  const bookingLive = gardssalgBookingLive();
   const metaDesc = typeDef
-    ? typeDef.metaDesc
-    : "Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Book en smaking eller omvisning rett hos produsenten.";
+    ? (bookingLive ? typeDef.metaDesc : typeDef.metaDescPaused)
+    : bookingLive
+      ? "Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Book en smaking eller omvisning rett hos produsenten."
+      : "Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Meld interesse for en smaking eller omvisning hos produsenten.";
   // Type-page h1 = the <title> minus the brand suffix; base keeps its
   // pre-S3 hero copy byte-identically.
   const heroH1 = typeDef ? typeDef.title.replace(/ \| Opplevagent$/, "") : "Lokale drikkeprodusenter";
@@ -5670,8 +5758,14 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
   // LIVE count upfront — total here is the real filtered count (>0, gated
   // above), never a canned number.
   const heroSub = typeDef
-    ? typeDef.lede(total)
-    : "Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten.";
+    ? (bookingLive ? typeDef.lede(total) : typeDef.ledePaused(total))
+    : bookingLive
+      ? "Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten."
+      : "Besøk bryggeri, sideri, mjøderi og mer — meld interesse for en smaking eller omvisning hos produsenten.";
+  // Share card (SD-11, reviewer-FUNN from #1099): the gårdssalg PNG card,
+  // the same one the producer profiles use; the page's own title is in
+  // og:title and the alt text.
+  const ogImage = ogImageUrl(url, "gardssalg");
   // JSON-LD: the base page keeps its pre-S3 single CollectionPage blob
   // byte-identically (the same keys in the same order, now serialized by
   // jsonLdScriptTag() instead of written out by hand); type pages get their
@@ -5719,6 +5813,17 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <link rel="canonical" href="${canonical}">
 ${pwaHeadTags()}
+<meta property="og:title" content="${escapeHtml(pageTitle)}">
+<meta property="og:description" content="${escapeHtml(metaDesc)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="nb_NO">
+<meta property="og:site_name" content="Opplevagent">
+<meta property="og:image" content="${escapeHtml(ogImage)}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="${escapeHtml(pageTitle)}">
+<meta name="twitter:card" content="summary_large_image">
 ${jsonLd}
 <style>
 ${BROWSE_CSS}
@@ -6120,7 +6225,7 @@ router.get(
     // its comment (Daniel 2026-08-24, punkt 5).
     const mapBlock = (lat !== null && lon !== null && isPlausibleNorwayCoord(lat, lon))
       ? (presentation === "no-point"
-          ? renderApproxPlacementCard(provider.kommune, provider.fylke, osmLinkHtml)
+          ? renderApproxPlacementCard(provider.kommune, provider.fylke, osmLinkHtml, "produsenten")
           : renderMiniMapSection({ lat, lon, approx: presentation === "approx-point", label: sted || "Posisjon" }, osmLinkHtml))
       : `<div class="map-card map-fallback">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
@@ -7440,6 +7545,22 @@ router.get(
   },
 );
 
+// Price wording for the FAQ and answer-first builders below (FUNN
+// sted-lede-fra-0-kr; dev-request 2026-10-17-integrasjonstest-oppfolging):
+// a cheapest stated price of 0 means a free experience (deriveExperienceTags()
+// tags it «gratis»), and «fra 0 kr» reads oddly, so the FAQ answer says
+// «Noen opplevelser … er gratis» and the opening says «noen er gratis». Only
+// the wording changes: 0 is still a real price fact for every gate, and
+// JSON-LD Offer prices stay numeric.
+function faqPriceSentence(minPriceFrom: number, priceScope: string, freeScope: string = priceScope): string {
+  return minPriceFrom === 0
+    ? `Noen opplevelser ${freeScope} er gratis`
+    : `Prisene ${priceScope} starter fra ${minPriceFrom} kr`;
+}
+function openingPricePhrase(minPriceFrom: number): string {
+  return minPriceFrom === 0 ? ", noen er gratis" : `, fra ${minPriceFrom} kr`;
+}
+
 // GEO: FAQPage JSON-LD for category pages (dev-request
 // 2026-06-30-geo-content-structured-data, category/city slice). The
 // producer-vertical city page already has this (buildCityFaqJsonLd,
@@ -7481,7 +7602,7 @@ export function buildCategoryFaqJsonLd(params: {
   if (params.minPriceFrom !== null && params.minPriceFrom >= 0) {
     qas.push({
       q: `Hva koster opplevelser i kategorien ${params.label}?`,
-      a: `Prisene i kategorien ${params.label} starter fra ${params.minPriceFrom} kr — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
+      a: `${faqPriceSentence(params.minPriceFrom, `i kategorien ${params.label}`)} — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
     });
   }
 
@@ -7547,36 +7668,37 @@ function placeCountSuffix(p: PlaceFacts): { parent: string; spread: string } {
 export function buildPlaceFaqJsonLd(params: PlaceFacts & { url: string }): any | null {
   const has = placeRealFacts(params);
   if (has.count < 2) return null;
-  const name = params.name;
+  // «i Bergen», «på Svalbard» (SD-13, place-preposition.ts).
+  const inName = inPlace(params.name);
   const { parent, spread } = placeCountSuffix(params);
   const qas: Array<{ q: string; a: string }> = [];
 
   if (has.total) {
     qas.push({
-      q: `Hvor mange opplevelser finnes i ${name}?`,
-      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} i ${name}${parent} på Opplevagent${spread ? `, fordelt på ${spread}` : ""}.`,
+      q: `Hvor mange opplevelser finnes ${inName}?`,
+      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} ${inName}${parent} på Opplevagent${spread ? `, fordelt på ${spread}` : ""}.`,
     });
   }
 
   if (has.categories) {
     qas.push({
-      q: `Hva slags opplevelser kan jeg finne i ${name}?`,
-      a: `Opplevelsene i ${name} spenner over ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"} på Opplevagent.`,
+      q: `Hva slags opplevelser kan jeg finne ${inName}?`,
+      a: `Opplevelsene ${inName} spenner over ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"} på Opplevagent.`,
     });
   }
 
   if (has.providers) {
     const n = params.providerCount ?? 0;
     qas.push({
-      q: `Hvor mange tilbydere har opplevelser i ${name}?`,
-      a: `Opplevelsene i ${name} kommer fra ${n} ${n === 1 ? "tilbyder" : "tilbydere"} på Opplevagent.`,
+      q: `Hvor mange tilbydere har opplevelser ${inName}?`,
+      a: `Opplevelsene ${inName} kommer fra ${n} ${n === 1 ? "tilbyder" : "tilbydere"} på Opplevagent.`,
     });
   }
 
   if (has.price) {
     qas.push({
-      q: `Hva koster en opplevelse i ${name}?`,
-      a: `Prisene i ${name} starter fra ${params.minPriceFrom} kr — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
+      q: `Hva koster en opplevelse ${inName}?`,
+      a: `${faqPriceSentence(params.minPriceFrom as number, inName)} — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
     });
   }
 
@@ -7637,7 +7759,7 @@ export function buildCategoryAnswerFirstOpening(params: {
   const spreadPhrase = hasFylke
     ? ` i ${params.fylkeCount} ${params.fylkeCount === 1 ? "fylke" : "fylker"}${params.kommuneCount > 0 ? ` (${params.kommuneCount} ${params.kommuneCount === 1 ? "kommune" : "kommuner"})` : ""}`
     : "";
-  const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
+  const pricePhrase = hasPrice ? openingPricePhrase(params.minPriceFrom as number) : "";
 
   return `${params.label} på Opplevagent: ${countPhrase}${spreadPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
@@ -7662,9 +7784,9 @@ export function buildPlaceAnswerFirstOpening(params: PlaceFacts): string | null 
     : "";
   const n = params.providerCount ?? 0;
   const providerPhrase = has.providers ? ` hos ${n} ${n === 1 ? "tilbyder" : "tilbydere"}` : "";
-  const pricePhrase = has.price ? `, fra ${params.minPriceFrom} kr` : "";
+  const pricePhrase = has.price ? openingPricePhrase(params.minPriceFrom as number) : "";
 
-  return `Opplevelser i ${params.name}${parent}: ${countPhrase}${spreadPhrase}${categoryPhrase}${providerPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
+  return `Opplevelser ${inPlace(params.name)}${parent}: ${countPhrase}${spreadPhrase}${categoryPhrase}${providerPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
 
 // Answer-first opening for a kommune page — thin wrapper over
@@ -7710,6 +7832,20 @@ function placeFaqAndLede(p: {
   }
 }
 
+// Whether a /kommune or /tilbyder page is noindex (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, IDX-2): shouldNoindexAggregatePage() over the
+// indexable experiences matching the same filter the page lists with. A
+// failed count is logged and keeps the page indexable, as before IDX-2, so a
+// query hiccup never drops a real page from the index.
+function aggregatePageNoindex(routePath: string, filter: BrowseFilter): boolean {
+  try {
+    return shouldNoindexAggregatePage(countIndexablePublishedExperiences(filter));
+  } catch (e) {
+    console.error(`[experiences-seo] ${routePath} indexable count failed:`, e);
+    return false;
+  }
+}
+
 // GEO: FAQPage JSON-LD for the produkt×by "query landing pages" — the final
 // remaining slice of dev-request 2026-06-30-geo-content-structured-data.
 // Programmatic `/kategori/:category/:kommune` pages targeting the exact
@@ -7737,25 +7873,26 @@ export function buildProduktByFaqJsonLd(params: {
   if (countProduktByRealFacts(params) < 2) return null;
   const qas: Array<{ q: string; a: string }> = [];
   const labelLc = params.categoryLabel.toLowerCase();
+  const inKommune = inPlace(params.kommune);
 
   if (params.total > 0) {
     qas.push({
-      q: `Hvor får jeg ${labelLc} i ${params.kommune}?`,
-      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} innen ${labelLc} i ${params.kommune}${params.fylke ? ` (${params.fylke})` : ""} på Opplevagent.`,
+      q: `Hvor får jeg ${labelLc} ${inKommune}?`,
+      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} innen ${labelLc} ${inKommune}${params.fylke ? ` (${params.fylke})` : ""} på Opplevagent.`,
     });
   }
 
   if (params.providerCount > 0) {
     qas.push({
-      q: `Hvor mange tilbydere av ${labelLc} finnes i ${params.kommune}?`,
-      a: `${params.providerCount} ${params.providerCount === 1 ? "verifisert tilbyder" : "verifiserte tilbydere"} av ${labelLc} i ${params.kommune} er listet på Opplevagent — alle sjekket mot Brønnøysundregistrene.`,
+      q: `Hvor mange tilbydere av ${labelLc} finnes ${inKommune}?`,
+      a: `${params.providerCount} ${params.providerCount === 1 ? "verifisert tilbyder" : "verifiserte tilbydere"} av ${labelLc} ${inKommune} er listet på Opplevagent — alle sjekket mot Brønnøysundregistrene.`,
     });
   }
 
   if (params.minPriceFrom !== null && params.minPriceFrom >= 0) {
     qas.push({
-      q: `Hva koster ${labelLc} i ${params.kommune}?`,
-      a: `Prisene for ${labelLc} i ${params.kommune} starter fra ${params.minPriceFrom} kr.`,
+      q: `Hva koster ${labelLc} ${inKommune}?`,
+      a: `${faqPriceSentence(params.minPriceFrom, `for ${labelLc} ${inKommune}`, `innen ${labelLc} ${inKommune}`)}.`,
     });
   }
 
@@ -7797,10 +7934,10 @@ export function buildProduktByAnswerFirstOpening(params: {
   const providerPhrase = hasProviders
     ? ` fra ${params.providerCount} ${params.providerCount === 1 ? "tilbyder" : "tilbydere"}`
     : "";
-  const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
+  const pricePhrase = hasPrice ? openingPricePhrase(params.minPriceFrom as number) : "";
   const fylkePart = params.fylke ? ` (${params.fylke})` : "";
 
-  return `${params.categoryLabel} i ${params.kommune}${fylkePart}: ${countPhrase}${providerPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
+  return `${params.categoryLabel} ${inPlace(params.kommune)}${fylkePart}: ${countPhrase}${providerPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
 
 // Category slug -> still-sketch motif (dev-request 2026-08-08-opplevagent-
@@ -8063,7 +8200,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     name: fylke,
     fylke: null,
     canonicalPath: fylkeCanonicalPath,
-    genericLede: `Hva kan du finne på i ${fylke}? Håndplukket oversikt over opplevelser i fylket.`,
+    genericLede: `Hva kan du finne på ${inPlace(fylke)}? Håndplukket oversikt over opplevelser i fylket.`,
   });
   const geoSort = resolvePlaceGeoSort(req, { fylke });
   const effectiveRows = geoSort.geoActive && geoSort.rows ? geoSort.rows : rows;
@@ -8077,14 +8214,14 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     ? `<p class="sort-toggle">Sorter etter: <a class="${!geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, false, fylkeCanonicalPath)}" aria-current="${!geoSort.geoActive ? "true" : "false"}">Standard</a> · <a class="${geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, true, fylkeCanonicalPath)}" aria-current="${geoSort.geoActive ? "true" : "false"}">Nærmest deg</a></p>`
     : "";
   const geoNoteHtml = geoSort.geoActive
-    ? `<p class="geo-note">Viser opplevelser i ${escapeHtml(fylke)} innenfor ${geoSort.radiusKm} km fra deg, sortert etter avstand.</p>`
+    ? `<p class="geo-note">Viser opplevelser ${escapeHtml(inPlace(fylke))} innenfor ${geoSort.radiusKm} km fra deg, sortert etter avstand.</p>`
     : "";
 
   const html = renderBrowsePage({
     lang: req.lang,
-    title: `Opplevelser i ${fylke} | Opplevagent`,
-    h1: `Opplevelser i ${fylke}`,
-    metaDesc: `Håndplukkede opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    title: `Opplevelser ${inPlace(fylke)} | Opplevagent`,
+    h1: `Opplevelser ${inPlace(fylke)}`,
+    metaDesc: `Håndplukkede opplevelser og aktiviteter ${inPlace(fylke)} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede: fylkeLede,
     canonicalPath: fylkeCanonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: fylke }],
@@ -8157,8 +8294,10 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     name: kommune,
     fylke,
     canonicalPath: kommuneCanonicalPath,
-    genericLede: `Hva kan du finne på i ${kommune}? Håndplukket oversikt over opplevelser i kommunen.`,
+    genericLede: `Hva kan du finne på ${inPlace(kommune)}? Håndplukket oversikt over opplevelser i kommunen.`,
   });
+  // IDX-2: a kommune whose experiences are all placeholders is noindex.
+  const kommuneNoindex = aggregatePageNoindex(`/kommune/${kommune}`, { kommune });
 
   // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: "nærmest deg
   // først" sort — PROGRESSIVE ENHANCEMENT ONLY, mirrors /fylke/:fylke above
@@ -8178,14 +8317,14 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     ? `<p class="sort-toggle">Sorter etter: <a class="${!geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, false, kommuneCanonicalPath)}" aria-current="${!geoSort.geoActive ? "true" : "false"}">Standard</a> · <a class="${geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, true, kommuneCanonicalPath)}" aria-current="${geoSort.geoActive ? "true" : "false"}">Nærmest deg</a></p>`
     : "";
   const geoNoteHtml = geoSort.geoActive
-    ? `<p class="geo-note">Viser opplevelser i ${escapeHtml(kommune)} innenfor ${geoSort.radiusKm} km fra deg, sortert etter avstand.</p>`
+    ? `<p class="geo-note">Viser opplevelser ${escapeHtml(inPlace(kommune))} innenfor ${geoSort.radiusKm} km fra deg, sortert etter avstand.</p>`
     : "";
 
   const html = renderBrowsePage({
     lang: req.lang,
-    title: `Opplevelser i ${kommune} | Opplevagent`,
-    h1: `Opplevelser i ${kommune}`,
-    metaDesc: `Håndplukkede opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    title: `Opplevelser ${inPlace(kommune)} | Opplevagent`,
+    h1: `Opplevelser ${inPlace(kommune)}`,
+    metaDesc: `Håndplukkede opplevelser og aktiviteter ${inPlace(kommune)}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede: kommuneLede,
     canonicalPath: kommuneCanonicalPath,
     crumbs,
@@ -8206,9 +8345,11 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     // /kategori/:category — there's no per-kommune active state in that nav).
     useSharedChrome: true,
     navActive: "kategorier",
+    noindex: kommuneNoindex,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  if (kommuneNoindex) res.setHeader("X-Robots-Tag", NOINDEX_FOLLOW);
   recordAiPageDelivery(req, res, "ai_page_list", effectiveRows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
@@ -8229,8 +8370,8 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
 // /kommune/:kommune, where an insufficient-facts result only suppresses the
 // FAQ block while the page still renders -- this route only SERVES a cell
 // that clears isProduktByCellIndexable() (experience-indexability.ts:
-// ≥ produktByMinExperiences() experiences, default 2, AND the ≥2-real-facts
-// bar of buildProduktByFaqJsonLd/buildProduktByAnswerFirstOpening).
+// ≥ produktByMinExperiences() INDEXABLE experiences, default 2, AND the
+// ≥2-real-facts bar of buildProduktByFaqJsonLd/buildProduktByAnswerFirstOpening).
 // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S1: a cell with
 // experiences that is below the gate answers 301 to /kommune/<kommune>,
 // which lists the same experiences (an indexed thin URL hands its signal on
@@ -8259,7 +8400,7 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
   // through rows so a thin combo never renders any HTML, not even a
   // near-empty grid. Any error here fails safe to 404 (no orphan/broken
   // page), logged (not a silent catch) per the PR-149 incident lesson.
-  let stats: { total: number; providerCount: number; minPriceFrom: number | null };
+  let stats: ProduktByCellStats;
   try {
     stats = getProduktByStats(category, kommune);
   } catch (e) {
@@ -8268,7 +8409,7 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
   }
   if (!isProduktByCellIndexable(stats)) {
     const minExperiences = produktByMinExperiences();
-    console.log(`[experiences-seo] /kategori/${category}/${kommune}: below combo gate (${stats.total} experience${stats.total === 1 ? "" : "s"}, min ${minExperiences}; ${countProduktByRealFacts(stats)} real facts) -- 301 to /kommune, not sitemapped`);
+    console.log(`[experiences-seo] /kategori/${category}/${kommune}: below combo gate (${stats.indexableTotal} of ${stats.total} experience${stats.total === 1 ? "" : "s"} indexable, min ${minExperiences}; ${countProduktByRealFacts(stats)} real facts) -- 301 to /kommune, not sitemapped`);
     // The threshold is an env setting (rollback = "1"), so the redirect is
     // permanent for crawlers but not pinned forever in browser caches. The
     // target keeps the request's language prefix (#1101 review S2).
@@ -8314,13 +8455,13 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     // swallowed, per the PR-149 incident lesson.
     console.log(`[experiences-seo] /kategori/${category}/${kommune}: answer-first opening unexpectedly null despite passing the combo gate -- falling back to generic lede`);
   }
-  const lede = answerFirst || `${label} i ${kommune}.`;
+  const lede = answerFirst || `${label} ${inPlace(kommune)}.`;
 
   const html = renderBrowsePage({
     lang: req.lang,
-    title: `${label} i ${kommune} | Opplevagent`,
-    h1: `${label} i ${kommune}`,
-    metaDesc: `${label} i ${kommune} — håndplukkede opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    title: `${label} ${inPlace(kommune)} | Opplevagent`,
+    h1: `${label} ${inPlace(kommune)}`,
+    metaDesc: `${label} ${inPlace(kommune)} — håndplukkede opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede,
     canonicalPath,
     crumbs,
@@ -8444,6 +8585,8 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
 
   const providerCanonicalPath = `/tilbyder/${encodeURIComponent(String(provider.slug || providerId))}`;
   const contact = buildProviderContact(provider, `${baseUrl()}${providerCanonicalPath}`);
+  // IDX-2: a provider whose experiences are all placeholders is noindex.
+  const providerNoindex = aggregatePageNoindex(providerCanonicalPath, { providerId });
 
   const html = renderBrowsePage({
     lang: req.lang,
@@ -8467,9 +8610,11 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     // (/for-tilbydere), not this browse-by-provider list, and highlighting it
     // here would misleadingly imply the visitor is on that marketing page.
     useSharedChrome: true,
+    noindex: providerNoindex,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
+  if (providerNoindex) res.setHeader("X-Robots-Tag", NOINDEX_FOLLOW);
   recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
   res.send(html);
 });
@@ -9377,8 +9522,14 @@ router.get("/logo.svg", (_req: Request, res: Response) => {
 
 // ── Legal pages (privacy / terms) — Claude Connectors prerequisite. Bilingual NO/EN. ──
 const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}.legal-company{margin-top:.35rem}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}table{border-collapse:collapse;width:100%;margin:.5rem 0}th,td{border:1px solid #e4ded0;padding:.35rem .55rem;text-align:left;vertical-align:top;font-size:.92rem}`;
-function legalPage(title: string, bodyHtml: string): string {
-  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg">${pwaHeadTags()}<style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a><div class="legal-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div></footer></body></html>`;
+// `seo` (dev-request 2026-10-17-integrasjonstest-oppfolging, IDX-4): a
+// self-referencing canonical and a meta description, for a page that is in
+// the sitemap. Passed by /proveniens; the other callers render as before.
+function legalPage(title: string, bodyHtml: string, seo?: { canonicalPath: string; metaDesc: string }): string {
+  const seoTags = seo
+    ? `<meta name="description" content="${escapeHtml(seo.metaDesc)}"><link rel="canonical" href="${escapeHtml(`${baseUrl()}${seo.canonicalPath}`)}">`
+    : "";
+  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow">${seoTags}<link rel="icon" type="image/svg+xml" href="/favicon.svg">${pwaHeadTags()}<style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a><div class="legal-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div></footer></body></html>`;
 }
 
 router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: Response) => {
@@ -9550,7 +9701,10 @@ router.get("/proveniens", (_req: Request, res: Response) => {
 <h2>What if a provider isn't verified yet?</h2><p>Experiences from a provider we haven't yet confirmed against Brønnøysundregistrene are not published on the site &mdash; neither the experiences nor the provider's own profile page &mdash; until that confirmation lands. Once the provider is confirmed as an active, registered company, its experiences become visible with the Brreg badge.</p>
 <h2>What we don't do</h2><p>We don't guess facts about a provider and present the guess as confirmed. Content pulled from a provider's own page is shown as a factual summary with source attribution, not as a legal confirmation &mdash; the only field that carries a legal confirmation is the one cross-checked against Brønnøysundregistrene.</p>
 <p style="background:#f0f7f4;border-left:4px solid #12a594;border-radius:0 10px 10px 0;padding:16px 20px;margin:24px 0">As expectations around AI transparency and data provenance keep growing in Europe, we think showing our actual verification work is good practice. This page describes what we genuinely do today; it is not a claim that we meet any particular law or regulatory standard.</p>
-<h2>Contact</h2><p>Questions about a listing? <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>`));
+<h2>Contact</h2><p>Questions about a listing? <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>`, {
+    canonicalPath: "/proveniens",
+    metaDesc: "Slik verifiserer Opplevagent dataene: håndplukkede tilbydere, kontroll mot Brønnøysundregistrene og detaljer med kildehenvisning fra tilbyderens egen nettside.",
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════

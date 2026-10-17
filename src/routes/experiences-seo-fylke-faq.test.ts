@@ -251,8 +251,11 @@ export function runExperiencesSeoFylkeFaqTests(opts: { log?: boolean } = {}): Pr
           "pf-b4: a negative price is not a fact (count + price -5 → no FAQ)");
         {
           const faq = seo.buildPlaceFaqJsonLd({ ...base, kind: "fylke", url: "u", total: 9, minPriceFrom: 0 });
-          assertTrue(!!faq && faq.mainEntity.length === 2 && faq.mainEntity[1].acceptedAnswer.text.includes("fra 0 kr"),
-            "pf-b5: a stated price of 0 kr is a real fact and is stated");
+          // Worded «gratis», not «fra 0 kr», since dev-request
+          // 2026-10-17-integrasjonstest-oppfolging (FUNN sted-lede-fra-0-kr).
+          assertTrue(!!faq && faq.mainEntity.length === 2
+            && faq.mainEntity[1].acceptedAnswer.text === "Noen opplevelser i Vestland er gratis — alle tilbydere er verifisert mot Brønnøysundregistrene.",
+            "pf-b5: a stated price of 0 kr is a real fact and is stated (as «noen … er gratis»)");
         }
 
         const vestland = { kind: "fylke" as const, name: "Vestland", fylke: "IGNORED", total: 7, categoryCount: 4, kommuneCount: 2, providerCount: 4, minPriceFrom: 300 };
@@ -290,7 +293,12 @@ export function runExperiencesSeoFylkeFaqTests(opts: { log?: boolean } = {}): Pr
             "pf-b12: kommune count answer names its fylke, no spread clause");
         }
 
-        // The kommune wrappers return exactly what the pre-E4-S2 builders did.
+        // The kommune wrappers return exactly what the pre-E4-S2 builders did,
+        // except that a 0 kr price is worded «gratis» since dev-request
+        // 2026-10-17-integrasjonstest-oppfolging (FUNN sted-lede-fra-0-kr).
+        const freeWording = <T>(legacy: T): T => JSON.parse(JSON.stringify(legacy)
+          .replace("Prisene i Ålesund starter fra 0 kr", "Noen opplevelser i Ålesund er gratis")
+          .replace(", fra 0 kr — ", ", noen er gratis — "));
         let wrapperChecked = 0;
         let wrapperDrift = 0;
         for (const fylke of [null, "Møre og Romsdal"]) {
@@ -300,14 +308,14 @@ export function runExperiencesSeoFylkeFaqTests(opts: { log?: boolean } = {}): Pr
                 const p = { kommune: "Ålesund", fylke, total, categoryCount, minPriceFrom };
                 const url = "https://opplevagent.no/kommune/%C3%85lesund";
                 wrapperChecked++;
-                if (!same(seo.buildKommuneFaqJsonLd({ ...p, url }), legacyKommuneFaqJsonLd({ ...p, url }))) wrapperDrift++;
-                if (seo.buildKommuneAnswerFirstOpening(p) !== legacyKommuneAnswerFirstOpening(p)) wrapperDrift++;
+                if (!same(seo.buildKommuneFaqJsonLd({ ...p, url }), freeWording(legacyKommuneFaqJsonLd({ ...p, url })))) wrapperDrift++;
+                if (seo.buildKommuneAnswerFirstOpening(p) !== freeWording(legacyKommuneAnswerFirstOpening(p))) wrapperDrift++;
               }
             }
           }
         }
         assertTrue(wrapperChecked === 72 && wrapperDrift === 0,
-          `pf-b13: buildKommuneFaqJsonLd/buildKommuneAnswerFirstOpening are thin wrappers with the pre-E4-S2 output (${wrapperChecked} inputs, drift in ${wrapperDrift})`);
+          `pf-b13: buildKommuneFaqJsonLd/buildKommuneAnswerFirstOpening are thin wrappers with the pre-E4-S2 output, 0 kr worded «gratis» (${wrapperChecked} inputs, drift in ${wrapperDrift})`);
       }
 
       // ── (d) renderFaqSectionHtml(), pure ───────────────────────────────────

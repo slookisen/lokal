@@ -28709,9 +28709,13 @@ withFreshModules([
     fylke: "Oslo", kommune: "Oslo", hjemmeside: "https://example-brim.no",
     brreg_verified: 1, brreg_active: 1, verification_status: "verified",
   });
+  // A real description: a provider whose experiences are all placeholders is
+  // noindex and not in the sitemap (2026-10-17-integrasjonstest-oppfolging,
+  // IDX-2), and sq-slug-04 checks the sitemap entry.
   const expIdSL = expStSL.createExperience({
     title: "Fjordkryss med el-katamaran", provider_id: provIdSL, provider_match_status: "matched",
     category: "sightseeing_transport", fylke: "Oslo", kommune: "Oslo",
+    description: "Stille fjordcruise med el-katamaran fra Aker brygge, med guide om bord.",
     indoor_outdoor: "outdoor", season: ["summer"], confidence: "high", verification_status: "verified",
   });
 
@@ -28821,10 +28825,12 @@ withFreshModules([
     fylke: "Vestland", kommune: "Ulvik", hjemmeside: "https://example-hf.no",
     brreg_verified: 1, brreg_active: 1, verification_status: "verified",
   });
+  // A real description, so the provider page is indexable and listed (IDX-2).
   expStCS.createExperience({
     title: "Fjordsafari på Hardangerfjorden", provider_id: provIdCS,
     provider_match_status: "matched", category: "natur_friluft",
     fylke: "Vestland", kommune: "Ulvik", indoor_outdoor: "outdoor",
+    description: "Fjordsafari i RIB-båt på Hardangerfjorden, med stopp ved fossen og guide om bord.",
     season: ["summer"], confidence: "high", verification_status: "verified",
   });
 
@@ -38077,7 +38083,9 @@ withFreshModules([
 
     // Real combo: 2 experiences, 2 distinct verified providers, one with a
     // stated price -> total=2, providerCount=2, minPriceFrom set = 3 real
-    // facts, clears the >=2-fact gate.
+    // facts, clears the >=2-fact gate. Both have a real description: the
+    // gate counts indexable experiences only (2026-10-17-integrasjonstest-
+    // oppfolging, IDX-1).
     const provReal1 = expStPBH.createProvider({
       navn: "Asker Gårdsmat AS", org_nr: "911000111",
       fylke: "Akershus", kommune: "Asker",
@@ -38091,11 +38099,13 @@ withFreshModules([
     expStPBH.createExperience({
       title: "Smaksrunde hos Asker Gårdsmat", provider_id: provReal1, provider_match_status: "matched",
       category: "mat_drikke", fylke: "Akershus", kommune: "Asker", price_from: 350,
+      description: "Smaksrunde med lokale oster, spekemat og saft fra gården, med omvisning.",
       confidence: "high", verification_status: "verified",
     });
     expStPBH.createExperience({
       title: "Gårdsbutikk Bondens Bord", provider_id: provReal2, provider_match_status: "matched",
       category: "mat_drikke", fylke: "Akershus", kommune: "Asker",
+      description: "Gårdsbutikk med smaking av egne produkter og en kort tur rundt på gården.",
       confidence: "high", verification_status: "verified",
     });
 
@@ -42095,6 +42105,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("safe-script-json-pages: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-B: the combo gate and
+// the /kommune and /tilbyder pages count indexable experiences only (IDX-1,
+// IDX-2); /proveniens canonical + description (IDX-4); ItemList names =
+// card titles (SD-09); gårdssalg share tags and paused-booking copy (SD-11);
+// «tilbyderen» on the place card (SD-12); «på Svalbard» (SD-13); «noen er
+// gratis» instead of «fra 0 kr».
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging I-B: indexable-only gates and copy fixes ──");
+  try {
+    const { runExperiencesSeoIndeksTekstTests } = require("../src/routes/experiences-seo-indeks-tekst.test") as
+      typeof import("../src/routes/experiences-seo-indeks-tekst.test");
+    const eit = await runExperiencesSeoIndeksTekstTests({ log: false });
+    passed += eit.passed;
+    failed += eit.failed;
+    for (const f of eit.failures) failures.push("experiences-seo-indeks-tekst: " + f);
+    console.log(`  experiences-seo-indeks-tekst: ${eit.passed} passed, ${eit.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-indeks-tekst: unexpected error: " + String(err?.message || err));
   }
 });
 
