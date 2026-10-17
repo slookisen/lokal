@@ -285,7 +285,7 @@ export function registerDentalTools(server: McpServer): void {
       title: "Norwegian dental market statistics",
       description:
         "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many " +
-        "have Helfo direct billing, belong to a chain, show an emergency claim or list a specialist. " +
+        "have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. " +
         "An emergency claim is an emergency duty with a recorded source (akuttvakt), or that the clinic says it " +
         "takes emergency patients.",
       inputSchema: {},
