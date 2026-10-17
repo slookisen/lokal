@@ -487,7 +487,8 @@ function initSchema(db: Database.Database): void {
       expires_at TEXT,                            -- Code expiry: 24 h (rows from before 2026-10-17: 7 days)
       code_sent_to TEXT,                          -- The farm's own address the code went to (NULL: no code sent)
       failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
-      review_reason TEXT                          -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
+      review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
+      claimant_email_typed TEXT                   -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1395,13 +1396,14 @@ function initSchema(db: Database.Database): void {
   }
 
   // ─── agent_claims: the claim rule of decision 11=A ──────────────────────
-  // dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt. Three
+  // dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt. Four
   // additive columns (the farm address the code went to, wrong-code count,
-  // admin-queue reason) and two new statuses: 'pending_review' (the admin
-  // queue) and 'superseded' (a code replaced by a newer one; such rows used to
-  // be DELETEd). Existing rows are not changed: the columns start NULL/0 and
-  // the status rebuild below copies every row as it is.
-  for (const col of ["code_sent_to TEXT", "failed_attempts INTEGER DEFAULT 0", "review_reason TEXT"]) {
+  // admin-queue reason, the typed address kept for audit once the claim is
+  // bound to the owner's address) and two new statuses: 'pending_review'
+  // (the admin queue) and 'superseded' (a code replaced by a newer one; such
+  // rows used to be DELETEd). Existing rows are not changed: the columns
+  // start NULL/0 and the status rebuild below copies every row as it is.
+  for (const col of ["code_sent_to TEXT", "failed_attempts INTEGER DEFAULT 0", "review_reason TEXT", "claimant_email_typed TEXT"]) {
     try {
       db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
     } catch {

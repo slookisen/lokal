@@ -42,6 +42,12 @@
  *         fed by the real handler: the "listed address is wrong" box, the
  *         queued message, the masked recipient.
  *   (mig) the status-CHECK rebuild keeps every existing row as it was.
+ *   (rev) review round 1 of PR #1141: the address check is linear (a 1 MB
+ *         adversarial address → 400 at once), field caps, the admin queue's
+ *         non-IP caps (per profile, platform per hour) and capped listing,
+ *         approval defaults to the proven farm address, the per-profile 429
+ *         points to the queue, env-set limits, the admin notice, a generic
+ *         500, the wrong-code count raised in SQL.
  *
  * Exported runRfbClaimKjentKontaktTests({log}) -> TestSummary; wired into
  * tests/test.ts. Standalone: npx tsx src/routes/rfb-claim-kjent-kontakt.test.ts
@@ -94,16 +100,22 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
   const db = new Database(":memory:");
   db.pragma("journal_mode = DELETE");
 
-  const savedEnv = {
+  // The claim limits' env vars (claimLimits) are cleared so every section
+  // runs on the defaults; (rev) sets them itself.
+  const LIMIT_ENV = ["CLAIM_CODE_MAX_FAILED_ATTEMPTS", "CLAIM_CODE_PROFILE_WINDOW_HOURS", "CLAIM_CODE_SENDS_PER_HOUR_MAX",
+    "CLAIM_REVIEW_OPEN_PER_PROFILE_MAX", "CLAIM_REVIEW_INSERTS_PER_HOUR_MAX"] as const;
+  const savedEnv: Record<string, string | undefined> = {
     ADMIN_KEY: process.env.ADMIN_KEY,
     ADMIN_NOTIFICATION_EMAIL: process.env.ADMIN_NOTIFICATION_EMAIL,
     NODE_ENV: process.env.NODE_ENV,
     FLY_APP_NAME: process.env.FLY_APP_NAME,
   };
+  for (const k of LIMIT_ENV) { savedEnv[k] = process.env[k]; delete process.env[k]; }
   const ADMIN = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "rfb-claim-kjent-kontakt-standalone-key";
   if (!process.env.ADMIN_KEY && !process.env.ANALYTICS_ADMIN_KEY) process.env.ADMIN_KEY = ADMIN;
-  // The verify route mails ADMIN_NOTIFICATION_EMAIL fire-and-forget; off here
-  // so every captured mail below is one the claim flow itself sent.
+  // The routes mail ADMIN_NOTIFICATION_EMAIL fire-and-forget; off here so
+  // every captured mail below is one the claim flow itself sent ((rev) turns
+  // it on for the admin notice).
   delete process.env.ADMIN_NOTIFICATION_EMAIL;
 
   // ── outgoing mail: a stub transporter, restored in finally ─────────────
@@ -234,6 +246,7 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       eq(v.status, 200, "ac1: the right code → 200");
       ok(typeof v.body?.data?.claimToken === "string" && v.body.data.claimToken.startsWith("claim_"), "ac1: claim token issued");
       eq(claimRow(r.body.data.claimId).claimant_email, "post@gard-ac1.example.test", "ac1: claimant_email becomes the farm's address the code went to");
+      eq(claimRow(r.body.data.claimId).claimant_email_typed, "angriper@evil.example.test", "ac1: the typed address is kept for audit (claimant_email_typed)");
       eq([agentRow("ac1").is_verified, agentRow("ac1").claimed_via], [1, "claim"], "ac1: badge set (discovery origin), claimed_via 'claim'");
       ok(!!agentRow("ac1").claimed_at, "ac1: claimed_at stamped");
       const ml = knowledgeService.createMagicLink("post@gard-ac1.example.test");
@@ -473,6 +486,8 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const ov = await invoke(approveH, makeReq({ headers: admin, body: { claimId: hasOwnerEntry.id, email: "Bekreftet@AC3.example.test" } }));
       eq([ov.status, mails[mails.length - 1]?.to, claimRow(hasOwnerEntry.id).claimant_email], [200, "bekreftet@ac3.example.test", "bekreftet@ac3.example.test"],
         "ac6: approve with an explicit address binds and mails that address");
+      ok(["annen@ac3.example.test", "kopi@ac3.example.test"].includes(hasOwnerEntry.claimant_email) && claimRow(hasOwnerEntry.id).claimant_email_typed === hasOwnerEntry.claimant_email,
+        "ac6: … the address the claimant typed is kept for audit");
       eq(knowledgeService.getClaimByToken(ownerToken)?.agentId, "ac3", "ac6: the existing owner's token still works after a second owner is approved");
       ok(!mails.some((m) => m.to === "post@ac3.example.test" && m.subject.startsWith("Gratulerer")), "ac6: the existing owner gets no mail");
       eq((await invoke(approveH, makeReq({ headers: admin, body: { claimId: claimsOf("ac3").find((c) => c.status === "pending_review").id, email: "ikke en adresse" } }))).status, 400,
@@ -541,6 +556,214 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const vm = knowledgeService.verifyMagicLink(ml.token as string);
       ok(vm.success && !!vm.claimToken && knowledgeService.getClaimByToken(vm.claimToken)?.agentId === "ac8", "ac8: … and gets a working token");
       eq((await invoke(loginH, makeReq({ body: { token: vm.claimToken } }))).body?.data?.agentId, "ac8", "ac8: token login works");
+    }
+
+    // ══ (rev) review round 1 of PR #1141 ══════════════════════════════════
+    {
+      const { isSingleEmailAddress, EMAIL_ADDRESS_MAX_LENGTH, claimLimits } = ks;
+      const msSince = (t0: bigint): number => Number(process.hrtime.bigint() - t0) / 1e6;
+
+      // ── B1: the address check is linear on any input ──────────────────
+      eq(EMAIL_ADDRESS_MAX_LENGTH, 254, "B1: the address cap is RFC 5321's 254 characters");
+      const shapes: Array<[string, boolean]> = [
+        ["a@b.no", true], ["post@gard-ac1.example.test", true], ["ø@gård.no", true],
+        ["a@b", false], ["a@.b.no", false], ["a@b..no", false], ["a@b.no.", false], ["a b@c.no", false],
+        ["a@b.no, c@d.no", false], ["a@b@c.no", false], ["", false],
+      ];
+      eq(shapes.map(([s]) => isSingleEmailAddress(s)), shapes.map(([, v]) => v),
+        "B1: one-address shapes pass; lists, spaces, missing or empty domain labels do not");
+      const at254 = `${"a".repeat(EMAIL_ADDRESS_MAX_LENGTH - "@gard.no".length)}@gard.no`;
+      eq([at254.length, isSingleEmailAddress(at254), isSingleEmailAddress(`a${at254}`)], [254, true, false], "B1: 254 characters pass, 255 do not");
+      for (const s of ["a@" + ".".repeat(1_000_000) + ",", "a@" + "b.".repeat(500_000) + ",", "a@" + ".".repeat(250) + ","]) {
+        const t0 = process.hrtime.bigint();
+        const shapeOk = isSingleEmailAddress(s);
+        const ms = msSince(t0);
+        ok(!shapeOk && ms < 100, `B1: a ${s.length}-character adversarial string is refused in < 100 ms (${ms.toFixed(1)} ms)`);
+      }
+      agent("rev-redos", { listed: "post@rev-redos.example.test" });
+      const big = "a@" + ".".repeat(1_000_000) + ",";
+      const t1 = process.hrtime.bigint();
+      const rBig = await claim("rev-redos", { name: "X", email: big });
+      const msBig = msSince(t1);
+      eq(rBig.status, 400, "B1: POST claim with a 1 MB adversarial address → 400");
+      ok(msBig < 100, `B1: … answered in < 100 ms (${msBig.toFixed(1)} ms)`);
+      eq(claimsOf("rev-redos").length, 0, "B1: … and nothing is written");
+      agent("rev-redos-listed", { listed: "a@" + ".".repeat(100_000) + "," });
+      const t2 = process.hrtime.bigint();
+      const listedLong = knowledgeService.resolveFarmContactEmail("rev-redos-listed");
+      eq(listedLong, null, "B1: a long junk listed address is not a farm address");
+      ok(msSince(t2) < 100, "B1: … and is refused in < 100 ms");
+
+      // ── B2: field caps ────────────────────────────────────────────────
+      agent("rev-caps", { listed: null });
+      const capMail = (len: number) => `${"a".repeat(len - "@rev-caps.example.test".length)}@rev-caps.example.test`;
+      const capCases: Array<[string, Record<string, unknown>]> = [
+        ["a name of 201 characters", { name: "n".repeat(201), email: "a@rev-caps.example.test" }],
+        ["an address of 255 characters", { name: "N", email: capMail(255) }],
+        ["a phone of 41 characters", { name: "N", email: "a@rev-caps.example.test", phone: "9".repeat(41) }],
+        ["a phone that is not a string", { name: "N", email: "a@rev-caps.example.test", phone: { n: 1 } }],
+        ["a source of 65 characters", { name: "N", email: "a@rev-caps.example.test", source: "s".repeat(65) }],
+        ["a source that is not a string", { name: "N", email: "a@rev-caps.example.test", source: ["x"] }],
+      ];
+      for (const [label, body] of capCases) eq((await claim("rev-caps", body)).status, 400, `B2: ${label} → 400`);
+      eq(claimsOf("rev-caps").length, 0, "B2: … and none of them writes a row");
+      const atCaps = await claim("rev-caps", { name: "n".repeat(200), email: capMail(254), phone: "9".repeat(40), source: "s".repeat(64) });
+      eq(atCaps.status, 202, "B2: every field exactly at its cap is accepted");
+
+      // ── B2: the admin queue's caps, not keyed on IP ───────────────────
+      const lim = claimLimits();
+      eq([lim.reviewOpenPerProfileMax, lim.reviewInsertsPerHourMax], [3, 20], "B2: defaults — 3 open queue entries per profile, 20 new entries per hour");
+      for (let i = 2; i <= lim.reviewOpenPerProfileMax; i++) {
+        eq((await claim("rev-caps", { name: `K${i}`, email: `k${i}@x.example.test` })).status, 202, `B2: open queue entry ${i} on one profile → 202`);
+      }
+      const rowsAtCap = claimsOf("rev-caps").length;
+      const overProfile = await claim("rev-caps", { name: "K9", email: "k9@x.example.test" });
+      eq([overProfile.status, claimsOf("rev-caps").length], [429, rowsAtCap], "B2: one more open entry on the profile → 429, no row");
+      ok(String(overProfile.body?.error).includes("manuell godkjenning"), "B2: … saying the profile already has claims waiting");
+      eq((await claim("rev-caps", { name: "K2", email: "k2@x.example.test" })).status, 202, "B2: a claimant with an open entry still gets it back at the cap");
+      await invoke(rejectH, makeReq({ headers: admin, body: { claimId: claimsOf("rev-caps")[0].id } }));
+      eq((await claim("rev-caps", { name: "K9", email: "k9@x.example.test" })).status, 202, "B2: a decided entry frees its place");
+
+      const queuedLastHour = (): number => (db.prepare(
+        "SELECT COUNT(*) AS n FROM agent_claims WHERE review_reason IS NOT NULL AND datetime(created_at) >= datetime('now', '-1 hours')",
+      ).get() as { n: number }).n;
+      const startQueued = queuedLastHour();
+      ok(startQueued < lim.reviewInsertsPerHourMax - 1, `B2: setup — ${startQueued} queue entries so far this hour`);
+      agent("rev-qcap-src", { listed: null });
+      const insQueued = db.prepare(
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, review_reason, source, created_at)
+         VALUES (?, 'rev-qcap-src', 'Q', ?, 'rejected', 'no_known_email', 'organic', ?)`,
+      );
+      // Entries from 2 h ago do not count; decided ones from this hour do.
+      for (let i = 0; i < 3; i++) insQueued.run(`qcap-old-${i}`, `old${i}@q.example.test`, new Date(Date.now() - 2 * 3_600_000).toISOString());
+      for (let i = 0; i < lim.reviewInsertsPerHourMax - startQueued - 1; i++) insQueued.run(`qcap-${i}`, `q${i}@q.example.test`, new Date().toISOString());
+      agent("rev-qcap", { listed: null });
+      agent("rev-qcap2", { listed: null });
+      eq((await claim("rev-qcap", { name: "Q", email: "q@rev-qcap.example.test" })).status, 202, "B2: the last new queue entry under the hourly cap → 202");
+      const overPlatform = await claim("rev-qcap2", { name: "Q", email: "q@rev-qcap2.example.test" });
+      eq([overPlatform.status, claimsOf("rev-qcap2").length], [429, 0], `B2: new queue entry nr ${lim.reviewInsertsPerHourMax + 1} in an hour → 429, no row`);
+      agent("rev-qcap-code", { listed: "post@rev-qcap-code.example.test" });
+      eq((await claim("rev-qcap-code", { name: "C", email: "c@x.example.test" })).status, 200, "B2: the queue cap does not block a code send");
+      // Free the hourly queue cap for the sections below.
+      db.prepare("UPDATE agent_claims SET created_at = ? WHERE review_reason IS NOT NULL AND datetime(created_at) >= datetime('now', '-1 hours')")
+        .run(new Date(Date.now() - 2 * 3_600_000).toISOString());
+
+      const all = knowledgeService.listClaimReviewQueue();
+      const two = knowledgeService.listClaimReviewQueue(2);
+      eq([two.total, two.entries.map((e) => e.claim_id)], [all.total, all.entries.slice(0, 2).map((e) => e.claim_id)],
+        "B2: the queue list is capped, oldest first, and still counts every waiting entry");
+      eq([ks.CLAIM_REVIEW_QUEUE_LIST_MAX, all.entries.length <= ks.CLAIM_REVIEW_QUEUE_LIST_MAX], [200, true], "B2: GET lists at most 200 entries");
+      const qList = await invoke(queueH, makeReq({ headers: admin }));
+      eq([qList.body?.count, qList.body?.entries?.length], [all.total, all.entries.length], "B2: GET claim-review-queue: count = every waiting entry");
+
+      // ── S2: the per-profile 429 points to the queue, not to the code ───
+      agent("rev-s2", { listed: "post@rev-s2.example.test" });
+      eq((await claim("rev-s2", { name: "A", email: "a@x.example.test" })).status, 200, "S2: setup — a code went to the farm");
+      const again = await claim("rev-s2", { name: "B", email: "b@x.example.test" });
+      const boxLabel = "E-postadressen som står på profilen er feil eller utdatert";
+      eq(again.status, 429, "S2: a second code within the window → 429");
+      ok(String(again.body?.error).includes(boxLabel) && !String(again.body?.error).includes("Bruk den"),
+        "S2: … pointing to the 'listed address is wrong' box, not to 'use the code'");
+      ok((require("fs").readFileSync(require("path").join(__dirname, "../public/selger.html"), "utf8") as string).includes(boxLabel),
+        "S2: … whose label is the one selger.html shows");
+      const viaBox = await claim("rev-s2", { name: "B", email: "b@x.example.test", listedEmailWrong: true });
+      eq([viaBox.status, viaBox.body?.data?.reason], [202, "listed_email_wrong"], "S2: … and that box does take the claim to the queue within the window");
+
+      // ── S3: env-set limits ────────────────────────────────────────────
+      eq(claimLimits({} as NodeJS.ProcessEnv),
+        { maxFailedAttempts: 5, profileWindowHours: 24, codeSendsPerHourMax: 10, reviewOpenPerProfileMax: 3, reviewInsertsPerHourMax: 20 },
+        "S3: unset → today's values");
+      eq(claimLimits({ CLAIM_CODE_MAX_FAILED_ATTEMPTS: "3", CLAIM_CODE_PROFILE_WINDOW_HOURS: "48", CLAIM_CODE_SENDS_PER_HOUR_MAX: "4",
+        CLAIM_REVIEW_OPEN_PER_PROFILE_MAX: "2", CLAIM_REVIEW_INSERTS_PER_HOUR_MAX: "5" } as NodeJS.ProcessEnv),
+        { maxFailedAttempts: 3, profileWindowHours: 48, codeSendsPerHourMax: 4, reviewOpenPerProfileMax: 2, reviewInsertsPerHourMax: 5 },
+        "S3: each limit is set by the env var of its name");
+      const loose = claimLimits({ CLAIM_CODE_MAX_FAILED_ATTEMPTS: "50", CLAIM_CODE_PROFILE_WINDOW_HOURS: "1" } as NodeJS.ProcessEnv);
+      eq([loose.maxFailedAttempts, loose.profileWindowHours], [5, 24], "S3: env cannot loosen decision 11=A (more than 5 wrong codes, a window under 24 h)");
+      const junk = claimLimits({ CLAIM_CODE_MAX_FAILED_ATTEMPTS: "0", CLAIM_CODE_SENDS_PER_HOUR_MAX: "abc", CLAIM_REVIEW_INSERTS_PER_HOUR_MAX: "-3" } as NodeJS.ProcessEnv);
+      eq([junk.maxFailedAttempts, junk.codeSendsPerHourMax, junk.reviewInsertsPerHourMax], [1, 10, 20], "S3: 0 is raised to 1; junk or a sign gives the default");
+      agent("rev-s3", { listed: "post@rev-s3.example.test" });
+      const r3 = await claim("rev-s3", { name: "A", email: "a@x.example.test" });
+      const code3 = codeIn(mails[mails.length - 1]);
+      const wrong3 = code3 === "999999" ? "999998" : "999999";
+      process.env.CLAIM_CODE_MAX_FAILED_ATTEMPTS = "2";
+      try {
+        await verify("rev-s3", r3.body.data.claimId, wrong3);
+        const second = await verify("rev-s3", r3.body.data.claimId, wrong3);
+        ok(String(second.body?.error).includes("For mange feil koder") && claimRow(r3.body.data.claimId).status === "expired",
+          "S3: with CLAIM_CODE_MAX_FAILED_ATTEMPTS=2 the 2nd wrong code expires the claim");
+      } finally {
+        delete process.env.CLAIM_CODE_MAX_FAILED_ATTEMPTS;
+      }
+
+      // ── S8: the wrong-code count is raised in SQL (NULL → 1) ──────────
+      agent("rev-s8", { listed: "post@rev-s8.example.test" });
+      db.prepare(
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, verification_code, status, source, expires_at, created_at, code_sent_to, failed_attempts)
+         VALUES ('s8-null', 'rev-s8', 'N', 'n@x.example.test', '123456', 'code_sent', 'organic', ?, ?, 'post@rev-s8.example.test', NULL)`,
+      ).run(new Date(Date.now() + 3_600_000).toISOString(), new Date(Date.now() - 30 * 3_600_000).toISOString());
+      await verify("rev-s8", "s8-null", "654321");
+      eq([claimRow("s8-null").failed_attempts, claimRow("s8-null").status], [1, "code_sent"], "S8: a NULL count becomes 1 on the first wrong code");
+
+      // ── S6: an unexpected error → generic 500; the owner's own address is a result ──
+      const ownRequestClaim = Object.prototype.hasOwnProperty.call(knowledgeService, "requestClaim");
+      (knowledgeService as any).requestClaim = () => { throw new Error("CHECK constraint failed: status IN ('pending')"); };
+      let crash: HandlerResult;
+      try {
+        crash = await claim("ac1", { name: "X", email: "x@x.example.test" });
+      } finally {
+        if (!ownRequestClaim) delete (knowledgeService as any).requestClaim;
+      }
+      eq(crash.status, 500, "S6: an unexpected error in the claim request → 500");
+      ok(!JSON.stringify(crash.body).includes("CHECK") && String(crash.body?.error).includes("Noe gikk galt"), "S6: … with a generic message, never the SQLite text");
+      eq(knowledgeService.requestClaim("ac3", { claimantName: "Eier", claimantEmail: "post@ac3.example.test" }).kind, "already_owner",
+        "S6: the owner's own address is a result (already_owner), not a thrown error");
+
+      // ── S5 + S1: the admin notice; approval defaults to the proven farm address ──
+      process.env.ADMIN_NOTIFICATION_EMAIL = "admin@plattform.example.test";
+      const adminMails = () => mails.filter((m) => m.to === "admin@plattform.example.test");
+      const flush = () => new Promise<void>((r) => setTimeout(r, 20));
+      try {
+        agent("rev-s5", { listed: null });
+        const n0 = adminMails().length;
+        await claim("rev-s5", { name: "Kari", email: "kari@rev-s5.example.test" });
+        await flush();
+        eq(adminMails().length, n0 + 1, "S5: a new queue entry notifies the admin once");
+        const notice = adminMails()[adminMails().length - 1];
+        ok(notice?.subject === "Eierkrav venter på godkjenning: Gård rev-s5" && notice.text.includes("kari@rev-s5.example.test")
+          && notice.text.includes("profilen har ingen kjent e-postadresse") && notice.text.includes("/admin/agents/claim-review-queue"),
+          "S5: … naming the profile, the claimant, the reason and the queue");
+        await claim("rev-s5", { name: "Kari", email: "kari@rev-s5.example.test" });
+        await flush();
+        eq(adminMails().length, n0 + 1, "S5: a repeat of the same claimant does not notify again");
+        agent("rev-s5-code", { listed: "post@rev-s5-code.example.test" });
+        await claim("rev-s5-code", { name: "C", email: "c@x.example.test" });
+        await flush();
+        eq(adminMails().length, n0 + 1, "S5: a code send does not notify the admin");
+
+        agent("rev-s1", { listed: "post@rev-s1.example.test" });
+        const rc = await claim("rev-s1", { name: "Ola", email: "ola.typed@x.example.test" });
+        const code1 = codeIn(mails.filter((m) => m.to === "post@rev-s1.example.test").pop());
+        db.prepare("UPDATE agents SET claimed_at = ?, claimed_via = 'admin' WHERE id = 'rev-s1'").run(new Date().toISOString());
+        const n1 = adminMails().length;
+        const vq = await verify("rev-s1", rc.body.data.claimId, code1);
+        await flush();
+        eq([vq.status, vq.body?.data?.status], [409, "pending_review"], "S1: the right code on a profile that got an owner meanwhile → queued (409)");
+        eq(adminMails().length, n1 + 1, "S5: the claim queued at verify time notifies the admin");
+        const entry = knowledgeService.listClaimReviewQueue().entries.find((e) => e.claim_id === rc.body.data.claimId);
+        eq([entry?.reason, entry?.proven_email, entry?.claimant_email], ["has_owner", "post@rev-s1.example.test", "ola.typed@x.example.test"],
+          "S1: the queue shows the proven farm address next to the typed one");
+        const ap = await invoke(approveH, makeReq({ headers: admin, body: { claimId: rc.body.data.claimId } }));
+        const approvedRow = claimRow(rc.body.data.claimId);
+        eq([ap.status, approvedRow.claimant_email, approvedRow.claimant_email_typed], [200, "post@rev-s1.example.test", "ola.typed@x.example.test"],
+          "S1: approval without an address binds the claim to the proven farm address (S12: the typed one is kept)");
+        eq(mails[mails.length - 1]?.to, "post@rev-s1.example.test", "S1: … and the login link goes to the farm address");
+      } finally {
+        delete process.env.ADMIN_NOTIFICATION_EMAIL;
+      }
+
+      // Free the hourly code cap for the sections below.
+      db.prepare("UPDATE agent_claims SET created_at = ? WHERE code_sent_to IS NOT NULL AND datetime(created_at) >= datetime('now', '-1 hours')")
+        .run(new Date(Date.now() - 2 * 3_600_000).toISOString());
     }
 
     // ══ (hard) crypto code, send failure, per-IP limiter ═════════════════
@@ -709,8 +932,9 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const sql = (old.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'").get() as { sql: string }).sql;
       ok(sql.includes("'pending_review'") && sql.includes("'superseded'"), "mig: the status CHECK now allows 'pending_review' and 'superseded'");
       eq(JSON.stringify(old.prepare(`SELECT ${cols} FROM agent_claims ORDER BY id`).all()), before, "mig: every existing row (incl. one whose agent is gone) is copied unchanged");
-      eq(old.prepare("SELECT code_sent_to, failed_attempts, review_reason FROM agent_claims ORDER BY id").all(),
-        [{ code_sent_to: null, failed_attempts: 0, review_reason: null }, { code_sent_to: null, failed_attempts: 0, review_reason: null }, { code_sent_to: null, failed_attempts: 0, review_reason: null }],
+      const emptyCols = { code_sent_to: null, failed_attempts: 0, review_reason: null, claimant_email_typed: null };
+      eq(old.prepare("SELECT code_sent_to, failed_attempts, review_reason, claimant_email_typed FROM agent_claims ORDER BY id").all(),
+        [emptyCols, emptyCols, emptyCols],
         "mig: the new columns start empty on existing rows");
       const idx = (old.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='agent_claims' AND sql IS NOT NULL ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name);
       eq(idx, ["idx_agent_claims_agent", "idx_agent_claims_email", "idx_agent_claims_status"], "mig: the indexes are recreated");

@@ -1253,7 +1253,9 @@
     var claimAgentId = null;
     var claimId = null;
     var devVerificationCode = null;
-    var claimSource = (new URLSearchParams(window.location.search)).get('ref') || 'organic';
+    // Clipped to the server's 64-character cap on `source`, so a long ?ref=
+    // in a link never makes the claim itself fail.
+    var claimSource = ((new URLSearchParams(window.location.search)).get('ref') || 'organic').slice(0, 64);
 
     function startClaim(agent) {
       claimAgentId = agent.id;

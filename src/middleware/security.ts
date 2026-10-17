@@ -323,10 +323,11 @@ export const consumerKeyIssuanceLimiter = rateLimit({
 // POST /api/marketplace/agents/:id/claim, mounted on that route
 // (routes/marketplace.ts). Every request counts — a code send and an
 // admin-queue entry alike — so one IP can neither mail many producers nor
-// flood the queue. The per-profile limit (1 code per 24 h) and the
-// platform-wide hourly cap on code sends live in knowledge-service.ts
-// requestClaim, so they hold also while this IP key can be chosen by the
-// client (see sharedValidate above).
+// flood the queue. The limits that must hold also while this IP key can be
+// chosen by the client (see sharedValidate above) live in knowledge-service.ts
+// requestClaim: 1 code per profile per 24 h, a platform-wide hourly cap on
+// code sends, a few open admin-queue entries per profile and a platform-wide
+// hourly cap on new queue entries (claimLimits).
 export const rfbClaimRequestLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 10,

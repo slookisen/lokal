@@ -114,6 +114,10 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
   const prevDb = (() => {
     try { return getDb(); } catch { return undefined; }
   })();
+  // A standalone run has no ADMIN_KEY (tests/test.ts sets one); the admin
+  // handlers read it per request, so the suite sets its own below and puts
+  // the previous value back in finally.
+  const prevAdminKeyEnv = process.env.ADMIN_KEY;
 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -274,6 +278,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const adminAgentsRegisterHandler = findRouteHandler(adminAgentsRouter, "/register", "post");
 
     const SUITE_ADMIN_KEY_LOCAL = process.env.ADMIN_KEY || "suite-canonical-admin-key-20260730";
+    if (!process.env.ADMIN_KEY) process.env.ADMIN_KEY = SUITE_ADMIN_KEY_LOCAL;
 
     // ── Source-inspection regression guard (Gate 3, belt-and-suspenders) ──
     // Independent of the pingIndexNow spy below: confirms the /register
@@ -1015,6 +1020,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     } else {
       delete require.cache[indexNowPath];
     }
+    if (prevAdminKeyEnv === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKeyEnv;
     if (prevDb) __setDbForTesting(prevDb);
     try { delete require.cache[require.resolve("./seo")]; } catch { /* ignore */ }
     try { delete require.cache[require.resolve("./marketplace")]; } catch { /* ignore */ }

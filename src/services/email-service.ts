@@ -1048,6 +1048,61 @@ ${this.brand} | ${getConfig().domain}`;
     }
   }
 
+  /**
+   * Tells the admin that a claim waits in the admin queue (decision 11=A,
+   * dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt): no
+   * code was sent and nothing happens until it is approved or rejected.
+   * Same recipient and skip rule as sendAdminClaimNotification above.
+   */
+  async sendAdminClaimReviewNotification(
+    agentName: string,
+    agentId: string,
+    claimantName: string,
+    claimantEmail: string,
+    reason: string
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping claim-review notification');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const queuePath = '/admin/agents/claim-review-queue';
+      const subject = `Eierkrav venter på godkjenning: ${agentName}`;
+      const row = (label: string, value: string) =>
+        `<tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">${label}:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(value)}</td></tr>`;
+      const htmlContent = `
+        <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #2d5016;">Eierkrav venter på godkjenning på ${this.brand}</h2>
+          <p>Ingen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.</p>
+          <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+            ${row('Produsent', `${agentName} (${agentId})`)}
+            ${row('Navn', claimantName)}
+            ${row('E-post', claimantEmail)}
+            ${row('Grunn', reason)}
+            ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
+          </table>
+          <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
+        </div>`;
+      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\nTidspunkt: ${new Date().toISOString()}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
+
+      return await this.sendEmail({
+        to: adminEmail,
+        subject,
+        htmlContent,
+        textContent,
+      });
+    } catch (error) {
+      logger.error('Error sending admin claim-review notification', {
+        agentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   private escapeHtml(text: string): string {
     const map: { [key: string]: string } = {
       '&': '&amp;',

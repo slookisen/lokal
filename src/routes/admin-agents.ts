@@ -2202,15 +2202,17 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
 // no farm e-mail, the claimant says the listed one is wrong, or the profile
 // already has an owner. Until approved it has no code, no token, no badge
 // and no write access. GET lists oldest first: profile, the claimant's name
-// and address, the reason and the time.
+// and address, the reason and the time — at most CLAIM_REVIEW_QUEUE_LIST_MAX
+// entries (knowledge-service.ts); `count` is how many wait in all.
 router.get("/claim-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
-  const entries = knowledgeService.listClaimReviewQueue();
-  res.json({ count: entries.length, entries });
+  const { total, entries } = knowledgeService.listClaimReviewQueue();
+  res.json({ count: total, entries });
 });
 
 // Approve: the claim becomes an owner bound to the approved address (body
-// `email`, else the address the claimant gave), the badge follows the
+// `email`; else the farm address the claimant proved with the right code,
+// proven_email; else the address the claimant gave), the badge follows the
 // quarantine gate (self_registered rows still get none), claimed_at/
 // claimed_via are stamped 'admin_approval' (fill-only), and the owner gets
 // "X er nå ditt" with a one-time login link to that address — the claim token
