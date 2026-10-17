@@ -19,7 +19,9 @@
  *   is the enrichment's category label «Honning» like a beekeeper listing
  *   «Løvetannhonning». A producer whose matched product names are only
  *   generic category labels (productsAreGenericCategoryNames) is now a
- *   category match; the order of the results is unchanged. Fix round 1: the
+ *   category match; the order of the results was unchanged (slice I-N has
+ *   since put explicit matches first, and lists labels as categories in
+ *   lokal_info — mcp-product-labels-and-order.test.ts). Fix round 1: the
  *   names come from discover() (DiscoverMeta.productMatches), not from the
  *   «Produkter: …» reason, which names at most three.
  *
@@ -254,8 +256,10 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
     assertEq(formatOpeningHoursForMcp([{ day: "mon", open: "10:00", close: "17:00" }, { day: "sat", open: "10:00", close: "14:00" }]),
       "\n## Åpningstider\nMan 10:00–17:00, Lør 10:00–14:00",
       "AI-1 formatOpeningHoursForMcp: today's array format renders exactly as before");
-    assertEq(formatOpeningHoursForMcp("  Man–fre 10–17  "), "\n## Åpningstider\nMan–fre 10–17",
+    assertEq(formatOpeningHoursForMcp("  Man–fre 10–17 (sommer)  "), "\n## Åpningstider\nMan–fre 10–17 (sommer)",
       "AI-1 formatOpeningHoursForMcp: a string is shown as text");
+    assertEq(formatOpeningHoursForMcp("  Man–fre 10–17  "), "\n## Åpningstider\nMan–Fre 10:00–17:00",
+      "AI-1 formatOpeningHoursForMcp: a string in the day-and-time form is read as days and times (slice I-O)");
     assertEq([formatOpeningHoursForMcp({ mon: "10-17" }), formatOpeningHoursForMcp(42), formatOpeningHoursForMcp(null),
       formatOpeningHoursForMcp(""), formatOpeningHoursForMcp([]), formatOpeningHoursForMcp([null, 3, {}, "  "])],
       ["", "", "", "", "", ""],
@@ -305,8 +309,11 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
       const t = textOf(r);
       assertTrue(r?.isError !== true && t.startsWith("# Hevd Bakeri Fixture"),
         `AI-1 repro: lokal_info returns the profile of a producer with openingHours stored as text (got: ${t.slice(0, 120)})`);
-      assertTrue(t.includes("\n## Åpningstider\nMan–fre 10–17, lør 10–15"), "AI-1 repro: the text opening hours are shown as text");
-      assertTrue(/## Produkter \(2 stk\)/.test(t) && t.includes("- Honning [honey]"), "AI-1 repro: the product list is still there");
+      assertTrue(t.includes("\n## Åpningstider\nMan–Fre 10:00–17:00, Lør 10:00–15:00"), "AI-1 repro: the text opening hours are shown (slice I-O: as days and times)");
+      // Slice I-N (AI2-02): both of the bakery's products are category labels,
+      // so lokal_info lists them as categories (mcp-product-labels-and-order.test.ts).
+      assertTrue(t.includes("\n**Kategorier:** Bakervarer, Honning\n") && !t.includes("## Produkter"),
+        "AI-1 repro: the product list is still there (as categories since I-N)");
       assertTrue(t.includes("\n## Spesialiteter\n- Surdeigsbrød") && t.includes("💳 **Betaling:** Vipps"),
         "AI-1 audit: specialties and paymentMethods stored as text are shown as one entry");
       assertTrue(!t.includes("Levering"), "AI-1 audit: deliveryOptions stored as an object is left out");
@@ -358,7 +365,7 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
         assertTrue(bad?.isError === true && textOf(bad) === MCP_INTERNAL_ERROR_TEXT && bad.content.length === 1,
           `AI-1 (MCP client): tools/call lokal_info answers an internal error with only the generic message (got: ${JSON.stringify(bad).slice(0, 200)})`);
         const good: any = await client.callTool({ name: "lokal_info", arguments: { agentId: BAKERY } });
-        assertTrue(good?.isError !== true && textOf(good).includes("Man–fre 10–17, lør 10–15"),
+        assertTrue(good?.isError !== true && textOf(good).includes("Man–Fre 10:00–17:00, Lør 10:00–15:00"),
           "AI-1 (MCP client): tools/call lokal_info returns the profile with text opening hours");
       } finally {
         await client.close();
@@ -430,18 +437,21 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
         "Strinda Honning Fixture — Kategoritreff / category-only: «honning» ikke oppført / not listed",
         "AI-1 audit: products stored as text no longer take lokal_search down; the producer is a category match");
 
-      // Order unchanged: the headings follow discover() exactly.
+      // Slice I-N (AI-3b): the explicit match comes first; discover()'s order
+      // is kept within each group (mcp-product-labels-and-order.test.ts).
       const parsed = marketplaceRegistry.parseNaturalQuery(query);
       await enrichParsedWithGeo(parsed, query);
       const meta: import("../services/marketplace-registry").DiscoverMeta = {};
       const expected = marketplaceRegistry.discover({ ...parsed, limit: 10, offset: 0 }, meta).map((x) => x.agent.name);
-      assertEq(headings.map((h) => h.heading.split(" — ")[0]), expected, "AI-3: the order of the results is discover()'s order");
+      assertEq(headings.map((h) => h.heading.split(" — ")[0]),
+        ["Tirslaug Bigård Fixture", ...expected.filter((n) => n !== "Tirslaug Bigård Fixture")],
+        "AI-3: the explicit match comes first, the category matches follow in discover()'s order (I-N)");
       assertEq([BAKERY, BEEKEEPER, MEAT_FARM, PRODUCTS_TEXT].map((id) => meta.productMatches?.get(id) ?? null),
         [["Honning"], ["Løvetannhonning", "Lynghonning"], null, null],
         "AI-3: DiscoverMeta.productMatches holds the matched names of each producer with a product match");
       assertEq(headings.map((h) => h.n), [1, 2, 3, 4], "AI-3: the results stay numbered 1..n");
       assertTrue(headingOf("Hevd Bakeri Fixture") !== "" && expected.indexOf("Hevd Bakeri Fixture") < expected.indexOf("Tirslaug Bigård Fixture"),
-        "AI-3: the nearer bakery still comes before the beekeeper (labelling only, no re-ranking)");
+        "AI-3: discover() still ranks the nearer bakery before the beekeeper (lokal_search reorders, discover() is unchanged)");
     }
 
     // Fix round 1 (S2): the «Produkter: …» reason names at most three

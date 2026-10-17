@@ -36064,6 +36064,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
+  //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
+  //    every 404, agents.txt API-base /api/tannlege ──
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): dental lastmod, klinikkantall, 404 noindex, agents.txt ──");
+  try {
+    const { runDentalSeoLastmodAntall404AgentsTxtTests } = require("../src/routes/dental-seo-lastmod-antall-404-agents-txt.test") as
+      typeof import("../src/routes/dental-seo-lastmod-antall-404-agents-txt.test");
+    const diq = await runDentalSeoLastmodAntall404AgentsTxtTests({ log: false });
+    passed += diq.passed;
+    failed += diq.failed;
+    for (const f of diq.failures) failures.push("dental seo I-Q: " + f);
+    console.log(`  dental seo I-Q: ${diq.passed} passed, ${diq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental seo I-Q: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
@@ -36129,6 +36146,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
       failed++;
       failures.push(`${label}: unexpected error: ` + String(err?.message || err));
     }
+  }
+
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3b): a poststed
+  //    that is also a kommune («Bergen») covers the whole kommune ──
+  console.log("\n── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3b): poststed + kommune (finn-tannlege) ──");
+  try {
+    const { runDentalSearchKommuneUnionTests } = require("../src/routes/dental-search-kommune-union.test") as
+      typeof import("../src/routes/dental-search-kommune-union.test");
+    const dku = await runDentalSearchKommuneUnionTests({ log: false });
+    passed += dku.passed;
+    failed += dku.failed;
+    for (const f of dku.failures) failures.push("dental search kommune union: " + f);
+    console.log(`  dental search kommune union: ${dku.passed} passed, ${dku.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental search kommune union: unexpected error: " + String(err?.message || err));
   }
 
   // ── dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a+S4b):
@@ -42452,6 +42485,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-N (round 2:
+// AI2-02, AI-3a, AI-3b, AI2-08): lokal_info lists generic category labels as
+// «Kategorier:» without cart id or availability; lokal_search labels a match
+// resting on a label also for category words («egg i Bergen»), shows the
+// product that made a listed match, and puts explicit matches first
+// (discover()'s order within each group); HTML tags in descriptions are
+// removed or become line breaks. Well-formed data is byte-like main
+// (tests/fixtures/rfb-mcp-product-labels-main.json). Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-N (category labels, category words, explicit first, HTML in descriptions) ──");
+  try {
+    const { runMcpProductLabelsAndOrderTests } = require("../src/routes/mcp-product-labels-and-order.test") as
+      typeof import("../src/routes/mcp-product-labels-and-order.test");
+    const r = await runMcpProductLabelsAndOrderTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("mcp-product-labels-and-order: " + f);
+    console.log(`  mcp-product-labels-and-order: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-product-labels-and-order: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no
@@ -42552,6 +42610,30 @@ runSerial(async () => {
       failed++;
       failures.push(`${name}: unexpected error: ` + String(err?.message || err));
     }
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-O (integration
+// test round 2: SD2-01, SD2-03/AI2-07, MCP2-03): an entry with a season note
+// counts for no JSON-LD, "open now" or "today", and lokal_info and the
+// auto-reply show the note with its times; text in the day-and-time form
+// ("Man-Fre 07-22, Lor 08-22") is read into day rows on every surface; the A2A
+// card gets /info's additive `openingHoursDisplay`. The pure part is in the
+// opening-hours suite above (section i); this route suite has its own
+// in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-O (opening hours: season notes, text form, A2A card) ──");
+  try {
+    const { runRfbApningstiderSesongTekstformTests } = require("../src/routes/rfb-apningstider-sesong-tekstform.test") as
+      typeof import("../src/routes/rfb-apningstider-sesong-tekstform.test");
+    const r = await runRfbApningstiderSesongTekstformTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-apningstider-sesong-tekstform: " + f);
+    console.log(`  rfb-apningstider-sesong-tekstform: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-apningstider-sesong-tekstform: unexpected error: " + String(err?.message || err));
   }
 });
 

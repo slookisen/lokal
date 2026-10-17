@@ -25,8 +25,10 @@ import { DENTAL_SEARCH_VOCABULARY, type SearchVocabulary } from "../config/denta
 import {
   detectPlaces,
   fylkerForPoststed,
+  kommunerForPoststed,
   matchesAsWordPrefix,
   mergedFylkeParts,
+  placeKey,
   tokenize,
   type PlaceGazetteer,
   type PlaceMatch,
@@ -49,6 +51,8 @@ export const MAX_POSTNUMMER_IN = 400;
 export interface DentalQueryFilter {
   poststed_in?: string[];
   postnummer_in?: string[];
+  /** A poststed in the kommune of the same name («Bergen»): its spellings OR the kommune's postnumre (S3b). */
+  poststed_or_postnummer?: { poststed_in: string[]; postnummer_in: string[] };
   fylke?: string;
   /** A re-split 2020 fylke ("Viken"): its own name plus today's fylker. */
   fylke_in?: string[];
@@ -135,7 +139,7 @@ export function parseDentalQuery(
       notes.push(`flere steder nevnt; «${shown}» brukes ikke`);
       continue;
     }
-    const reading = readPlace(place, shown);
+    const reading = readPlace(place, shown, gazetteer);
     if (!("fields" in reading)) {
       notes.push(reading.note);
       continue;
@@ -232,12 +236,36 @@ interface PlaceReading {
 // The filter fields for one place, or a note when the place cannot be used
 // as a filter (ambiguous kommune with no fylke); its words then stay in the
 // text and are matched as name words.
-function readPlace(place: PlaceMatch, shown: string): PlaceReading | { note: string } {
+function readPlace(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer): PlaceReading | { note: string } {
   switch (place.kind) {
     case "poststed": {
       const values = place.values.filter((v) => v.length <= MAX_TERM_CHARS).slice(0, MAX_POSTSTED_IN);
       if (values.length === 0) return { note: `«${shown}» brukes som navnesøk` };
-      return { fields: { poststed_in: values }, fylker: fylkerForPoststed(place.values[0]), line: `sted: ${shown} (poststed)` };
+      const fylker = fylkerForPoststed(place.values[0]);
+      // S3b: a poststed that lies in the one kommune of the same name
+      // («Bergen», «Tromsø») covers the whole kommune: its stored spellings
+      // OR the kommune's postnumre, so Nesttun and Fyllingsdalen count as
+      // Bergen. The poststed alone, as before, when several kommuner share
+      // the name (Herøy), when the poststed lies in another kommune (KVAM is
+      // in Nord-Fron, not Kvam kommune), or when the kommune has more
+      // postnumre than the store takes (Oslo, where the poststed and the
+      // kommune are nearly the same). The fylker stay those of the poststed,
+      // so an explicit fylke keeps or drops the place as before, and the
+      // filter only widens: no query finds fewer clinics than before.
+      const kommune = kommuneNamed(gazetteer.kommuner.get(placeKey(place.phrase)));
+      if (
+        kommune &&
+        kommunerForPoststed(place.values[0]).includes(kommune.kommunenummer) &&
+        kommune.postnumre.length > 0 &&
+        kommune.postnumre.length <= MAX_POSTNUMMER_IN
+      ) {
+        return {
+          fields: { poststed_or_postnummer: { poststed_in: values, postnummer_in: kommune.postnumre } },
+          fylker,
+          line: `sted: ${shown} (poststed + kommune)`,
+        };
+      }
+      return { fields: { poststed_in: values }, fylker, line: `sted: ${shown} (poststed)` };
     }
     case "fylke": {
       const parts = mergedFylkeParts(place.name);
@@ -256,20 +284,18 @@ function readPlace(place: PlaceMatch, shown: string): PlaceReading | { note: str
       return { fields: { fylke }, fylker: [fylke], line: `sted: ${fylke} (fylke; regionen ${place.name})` };
     }
     case "kommune": {
-      const resolved = resolveKommunenummerForName(place.name);
-      if ("kommunenummer" in resolved) {
-        const own = resolveFylke2024({ kommunenummer: resolved.kommunenummer });
-        const fylker = "fylke" in own ? [own.fylke] : [];
-        const postnumre = postnumreForKommune(resolved.kommunenummer);
-        if (postnumre.length > 0 && postnumre.length <= MAX_POSTNUMMER_IN) {
-          return { fields: { postnummer_in: postnumre }, fylker, line: `sted: ${place.name} kommune (etter postnummer)` };
+      const kommune = kommuneNamed(place.name);
+      if (kommune) {
+        const fylker = kommune.fylke ? [kommune.fylke] : [];
+        if (kommune.postnumre.length > 0 && kommune.postnumre.length <= MAX_POSTNUMMER_IN) {
+          return { fields: { postnummer_in: kommune.postnumre }, fylker, line: `sted: ${place.name} kommune (etter postnummer)` };
         }
-        if ("fylke" in own) {
+        if (kommune.fylke) {
           return {
-            fields: { fylke: own.fylke },
+            fields: { fylke: kommune.fylke },
             fylker,
-            line: `sted: ${own.fylke} (fylke)`,
-            note: `${place.name} kommune har ${postnumre.length} postnumre; søker i hele ${own.fylke}`,
+            line: `sted: ${kommune.fylke} (fylke)`,
+            note: `${place.name} kommune har ${kommune.postnumre.length} postnumre; søker i hele ${kommune.fylke}`,
           };
         }
       }
@@ -281,6 +307,17 @@ function readPlace(place: PlaceMatch, shown: string): PlaceReading | { note: str
       return { note: `«${shown}» er navnet på flere kommuner; ordet brukes som navnesøk` };
     }
   }
+}
+
+// The one kommune with this name: its number, fylke and postnumre. null for
+// no name, a name several kommuner share (Herøy, Våler) or an unknown one.
+function kommuneNamed(name: string | undefined): { kommunenummer: string; fylke?: string; postnumre: string[] } | null {
+  if (!name) return null;
+  const resolved = resolveKommunenummerForName(name);
+  if (!("kommunenummer" in resolved)) return null;
+  const { kommunenummer } = resolved;
+  const own = resolveFylke2024({ kommunenummer });
+  return { kommunenummer, fylke: "fylke" in own ? own.fylke : undefined, postnumre: postnumreForKommune(kommunenummer) };
 }
 
 // ─── Shared plan for MCP tannlege_search, /sok and A2A message/send ─────────

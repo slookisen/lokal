@@ -346,14 +346,16 @@ export function isValidLocality(s: string | null | undefined): boolean {
  * fields so no two clinics with different data produce the same output.
  * Cap: ~155 chars for the short (meta) variant; uncapped for the full variant.
  *
- * @param agent       The DentalAgent record.
- * @param nearbyCount Optional count of other clinics in the same poststed
- *                    (used to add a differentiating locality clause).
- * @param short       If true, produce a meta-description-length string (≤160 chars).
+ * @param agent         The DentalAgent record.
+ * @param localityCount Optional number of clinics in the agent's poststed, as
+ *                      /sted/<poststed> shows it (see findStedRow). Adds a
+ *                      differentiating locality clause to the short variant
+ *                      when it is at least 2.
+ * @param short         If true, produce a meta-description-length string (≤160 chars).
  */
 export function buildClinicDescription(
   agent: DentalAgent,
-  nearbyCount?: number,
+  localityCount?: number,
   short?: boolean
 ): string {
   const parts: string[] = [];
@@ -420,9 +422,13 @@ export function buildClinicDescription(
     parts.push(`Åpent ${ohDays} dag${ohDays === 1 ? "" : "er"} i uken.`);
   }
 
-  // Nearby clinics (only in short/meta to add differentiation)
-  if (short && nearbyCount && nearbyCount > 0 && validPoststed) {
-    parts.push(`Det finnes ${nearbyCount + 1} klinikker i ${validPoststed}.`);
+  // Nearby clinics (only in short/meta to add differentiation). The number is
+  // the /sted count itself (integrasjonstest IDX2-02, dev-request
+  // 2026-10-17-integrasjonstest-oppfolging I-Q); it used to be the length of
+  // a related-clinics list capped at 20, plus one, so every place with more
+  // than 20 clinics read «Det finnes 21 klinikker».
+  if (short && localityCount && localityCount > 1 && validPoststed) {
+    parts.push(`Det finnes ${localityCount} klinikker i ${validPoststed}.`);
   }
 
   // Chain
@@ -786,6 +792,16 @@ ${content}
 ${dentalFooter()}
 </body>
 </html>`;
+}
+
+// Every HTML 404 on finn-tannlege.com goes through here, so none of them asks
+// to be indexed: "noindex, follow", like the Opplevagent and RFB 404 pages,
+// instead of the shell's default "index, follow" (integrasjonstest RYS-1,
+// dev-request 2026-10-17-integrasjonstest-oppfolging I-Q).
+const NOT_FOUND_ROBOTS = "noindex, follow";
+
+function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOptions, "robots">): void {
+  res.status(404).send(dentalShell(content, { ...opts, robots: NOT_FOUND_ROBOTS }));
 }
 
 // ─── Clinic card (used in /sok and /fylke) ───────────────────
@@ -1276,10 +1292,10 @@ function renderClinicProfile(
   // synthetic schema-probe row 404s exactly like a rejected clinic, on both
   // /klinikk/id/:id and /klinikk/:slug (both render through here).
   if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
 
@@ -1455,12 +1471,17 @@ function renderClinicProfile(
   // ── JSON-LD Dentist
   // orch-PR-20260613: guard placeholder/empty om_oss; fall back to structured summary.
   const richDesc = !isPlaceholderDescription(agent.om_oss) ? agent.om_oss! : null;
-  let nearbyCount = 0;
-  try {
-    const related = listRelatedClinics(agent, 20);
-    nearbyCount = related.length;
-  } catch { /* db not ready */ }
-  const clinicJsonLdDesc = richDesc ?? buildClinicDescription(agent, nearbyCount, false);
+  // «Det finnes N klinikker i X» (structured meta only): N is what
+  // /sted/<poststed> shows — same slug lookup, same count — so a place with
+  // 978 clinics no longer reads «21» (integrasjonstest IDX2-02, dev-request
+  // 2026-10-17-integrasjonstest-oppfolging I-Q). No /sted page, or no DB, = 0
+  // and the sentence is left out.
+  let localityCount = 0;
+  const stedRow = !richDesc && isValidLocality(agent.poststed) ? findStedRow(slugifyText(agent.poststed!)) : undefined;
+  if (stedRow) {
+    try { localityCount = countPublicDentalAgents({ poststed: stedRow.poststed }); } catch { /* db not ready */ }
+  }
+  const clinicJsonLdDesc = richDesc ?? buildClinicDescription(agent, localityCount, false);
   const jsonLd: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "Dentist",
@@ -1571,7 +1592,7 @@ function renderClinicProfile(
     if (nonClinic) {
       return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring.`;
     }
-    return buildClinicDescription(agent, nearbyCount, true);
+    return buildClinicDescription(agent, localityCount, true);
   })();
 
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): a
@@ -1649,10 +1670,10 @@ function renderClinicProfile(
 router.get("/klinikk/id/:id", (req: Request, res: Response) => {
   const agent = getDentalAgentById(String(req.params.id));
   if (!agent) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
   renderClinicProfile(agent, req, res);
@@ -1661,18 +1682,18 @@ router.get("/klinikk/id/:id", (req: Request, res: Response) => {
 router.get("/klinikk/:slug", (req: Request, res: Response) => {
   const parsed = parseClinicSlug(String(req.params.slug));
   if (!parsed) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
   const agent = getDentalAgentByOrgnr(parsed.orgNr);
   if (!agent) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
   renderClinicProfile(agent, req, res);
@@ -1694,10 +1715,10 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     (f) => f.fylke.toLowerCase() === fylkeParam.toLowerCase()
   );
   if (!matchedFylke) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Ukjent fylke</h3><p>Vi fant ikke «${escapeHtml(fylkeParam)}» i registeret.</p><a href="/#fylker" class="btn-secondary" style="margin-top:16px">Se alle fylker</a></div></div>`,
       { title: `${escapeHtml(fylkeParam)} — Fylke ikke funnet | Finn-tannlege.com` }
-    ));
+    );
     return;
   }
 
@@ -1868,8 +1889,14 @@ function buildDentalSitemapXml(): string {
     if (clinicRows.length > 0) {
       for (const a of clinicRows) {
         const slug = slugifyClinic(a.navn, a.org_nr);
-        const lastmod = a.updated_at ? (a.updated_at.split("T")[0] || a.updated_at) : today;
-        xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${escapeHtml(lastmod)}</lastmod></url>`;
+        // W3C date (YYYY-MM-DD) like the Opplevagent and RFB sitemaps. updated_at
+        // is SQLite datetime('now'), "2026-07-21 11:39:18" (space, no time zone),
+        // which split("T") left whole on every /klinikk URL (integrasjonstest
+        // IDX2-01, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q). A
+        // value that is not a date falls back to today, as a missing one does.
+        const day = (a.updated_at || "").slice(0, 10);
+        const lastmod = /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : today;
+        xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${lastmod}</lastmod></url>`;
       }
     } else {
       // Fallback: batch from listPublicDentalAgents
@@ -2403,10 +2430,10 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   const slugParam = String(req.params.slug).toLowerCase();
   const sp = findSpecialtyBySlug(slugParam);
   if (!sp) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Spesialitet ikke funnet</h3><p>Vi kjenner ikke til spesialiteten «${escapeHtml(slugParam)}». <a href="/">Gå til forsiden</a>.</p></div></div></main>`,
       { title: "Spesialitet ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
 
@@ -2488,24 +2515,37 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
 // GET /sted/:stedSlug  (PR-116 — bysider)
 // ═══════════════════════════════════════════════════════════
 
+// The poststed row behind /sted/<slug>, from the cached poststed list. The
+// first row wins when two spellings slug alike; the list is ordered by count,
+// so that is the highest-count spelling. The clinic page's «Det finnes N
+// klinikker i X» uses the same lookup, so it names the same place and count.
+// The slug map is rebuilt only when the cache hands out a new list (once per
+// TTL), not on every /sted and /klinikk request.
+let _stedSlugMap: { rows: PoststedRow[]; bySlug: Map<string, PoststedRow> } | null = null;
+
+function findStedRow(stedSlug: string): PoststedRow | undefined {
+  const rows = getCachedPoststeder();
+  if (!_stedSlugMap || _stedSlugMap.rows !== rows) {
+    const bySlug = new Map<string, PoststedRow>();
+    for (const p of rows) {
+      const slug = slugifyText(p.poststed);
+      if (!bySlug.has(slug)) bySlug.set(slug, p);
+    }
+    _stedSlugMap = { rows, bySlug };
+  }
+  return _stedSlugMap.bySlug.get(stedSlug);
+}
+
 router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   const PAGE_SIZE = 50;
   const stedSlugParam = String(req.params.stedSlug).toLowerCase().trim();
 
-  // Build poststed lookup map from cache (slug → PoststedRow)
-  const poststeder = getCachedPoststeder();
-  const stedMap = new Map<string, PoststedRow>();
-  for (const p of poststeder) {
-    // first-write-wins: keeps the highest-count row when two poststeder slug to the same value
-    if (!stedMap.has(slugifyText(p.poststed))) stedMap.set(slugifyText(p.poststed), p);
-  }
-
-  const stedRow = stedMap.get(stedSlugParam);
+  const stedRow = findStedRow(stedSlugParam);
   if (!stedRow) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Sted ikke funnet</h3><p>Vi fant ikke tannleger for «${escapeHtml(stedSlugParam)}».</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div></main>`,
       { title: "Sted ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
 
@@ -2610,6 +2650,9 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
 // item 1). There is NO booking capability on finn-tannlege.com: none of the five
 // MCP tools books anything (clinics are contacted directly), so the file must not
 // claim it — the description/categories used to say "book"/"booking".
+// API-base is the REST mount in index.ts (/api/tannlege, the prefix of every
+// REST path in openapi.json); it said /api/tannleger, which is a 404
+// (integrasjonstest MCP-02, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q).
 function serveDentalAgentsTxt(_req: Request, res: Response): void {
   res.header("Content-Type", "text/plain; charset=utf-8");
   res.header("Cache-Control", "public, max-age=3600");
@@ -2623,7 +2666,7 @@ Agent-card: ${DENTAL_BASE_URL}/.well-known/agent-card.json
 MCP-endpoint: ${DENTAL_BASE_URL}/mcp
 MCP-server-card: ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 A2A-endpoint: ${DENTAL_BASE_URL}/a2a
-API-base: ${DENTAL_BASE_URL}/api/tannleger
+API-base: ${DENTAL_BASE_URL}/api/tannlege
 Name: Finn Tannlege
 Description: Norwegian dental practice directory — find and compare dental clinics (read-only; no online booking, contact the clinic directly)
 Languages: no, en
@@ -2930,7 +2973,7 @@ router.get("/kontakt", (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.use((_req: Request, res: Response) => {
-  res.status(404).send(dentalShell(
+  sendDentalNotFound(res,
     `<main><div class="container"><div class="empty-state" style="padding:80px 0">
       <h3>Siden finnes ikke</h3>
       <p>Vi fant ikke siden du leter etter. Prøv å søke etter tannlege, eller gå til forsiden.</p>
@@ -2940,7 +2983,7 @@ router.use((_req: Request, res: Response) => {
       </div>
     </div></div></main>`,
     { title: "Side ikke funnet (404) — Finn-tannlege.com" }
-  ));
+  );
 });
 
 export default router;

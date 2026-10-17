@@ -15,7 +15,7 @@ import {
   NON_KOMMUNE_REGION_LABELS,
   REGION_TO_KOMMUNER,
 } from "../norway-fylke";
-import { kommuner2024, officialPoststedFylker } from "../norway-postnummer";
+import { kommuner2024, officialPoststedFylker, officialPoststedKommuner } from "../norway-postnummer";
 
 /** NFC + Unicode-aware lower case (folds Æ/Ø/Å, unlike SQLite's LOWER()). */
 export function normalize(text: string): string {
@@ -163,20 +163,24 @@ export function buildPlaceGazetteer(input: {
   };
 }
 
-// placeKey(official poststed) -> the fylker its postnumre lie in.
+// placeKey(official poststed) -> the fylker / kommunenumre its postnumre lie in.
 let _officialFylker: Map<string, readonly string[]> | null = null;
+let _officialKommuner: Map<string, readonly string[]> | null = null;
 
 function officialFylkerByKey(): Map<string, readonly string[]> {
-  if (_officialFylker) return _officialFylker;
+  return (_officialFylker ??= byPlaceKey(officialPoststedFylker()));
+}
+
+// One list per placeKey: the lists of every official name with that key, merged.
+function byPlaceKey(byName: ReadonlyMap<string, readonly string[]>): Map<string, readonly string[]> {
   const byKey = new Map<string, Set<string>>();
-  for (const [name, fylker] of officialPoststedFylker()) {
+  for (const [name, values] of byName) {
     const k = placeKey(name);
     const set = byKey.get(k) ?? new Set<string>();
-    for (const f of fylker) set.add(f);
+    for (const v of values) set.add(v);
     byKey.set(k, set);
   }
-  _officialFylker = new Map([...byKey].map(([k, set]) => [k, [...set]]));
-  return _officialFylker;
+  return new Map([...byKey].map(([k, set]) => [k, [...set]]));
 }
 
 /**
@@ -186,6 +190,11 @@ function officialFylkerByKey(): Map<string, readonly string[]> {
  */
 export function fylkerForPoststed(spelling: string): readonly string[] {
   return officialFylkerByKey().get(placeKey(spelling)) ?? [];
+}
+
+/** Likewise the kommunenumre it lies in ("Bergen" -> ["4601"]). */
+export function kommunerForPoststed(spelling: string): readonly string[] {
+  return (_officialKommuner ??= byPlaceKey(officialPoststedKommuner())).get(placeKey(spelling)) ?? [];
 }
 
 /**
