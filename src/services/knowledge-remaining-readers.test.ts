@@ -309,7 +309,8 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
         "",
         "Spesialiteter: Lam, Honning",
         "",
-        "🕐 Åpningstider: Man 10:00–17:00, Lør 10:00–14:00, Lørdag i sesong 11:00–15:00",
+        // Slice I-O: the season note «Kun i sesong» is shown with its times (main left it out).
+        "🕐 Åpningstider: Man 10:00–17:00, Lør 10:00–14:00 (Kun i sesong), Lørdag i sesong 11:00–15:00",
         "",
         "Kontakt oss:",
         "📍 Bynesvegen 1, 7070 Trondheim",
@@ -323,7 +324,7 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
         "🔗 Se profilen vår: https://rettfrabonden.com/produsent/byneset-gard-fixture",
         "",
         "Ta gjerne kontakt for spørsmål eller bestilling!",
-      ].join("\n"), "auto-reply: well-formed data gives the same text as before (golden from main)");
+      ].join("\n"), "auto-reply: well-formed data gives the same text as before (golden from main; I-O: the season note)");
       assertEq(reply?.type, "offer", "auto-reply: well-formed products make an offer, as before");
 
       const matched = noThrow(() => conversationService.generateSellerResponse(WELL_FORMED, "honning og lam"),
@@ -342,8 +343,8 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
       // Repro: «k.openingHours.slice(...).map is not a function».
       const reply = noThrow(() => conversationService.generateSellerResponse(HOURS_TEXT),
         "auto-reply: openingHours stored as text no longer throws (repro of the FUNN)");
-      assertTrue(!!reply?.text.includes("\n🕐 Åpningstider: Man–fre 07–17, lør 08–15\n"),
-        "auto-reply: openingHours stored as text is shown as text");
+      assertTrue(!!reply?.text.includes("\n🕐 Åpningstider: Man–Fre 07:00–17:00, Lør 08:00–15:00\n"),
+        "auto-reply: openingHours stored as text is shown (slice I-O: text in the day-and-time form as days and times)");
       // Repro (I-F review S2): «(p.category || "").toLowerCase is not a function».
       const matched = noThrow(() => conversationService.generateSellerResponse(HOURS_TEXT, "surdeigsbrød og honning"),
         "auto-reply: a query over products with an object or number category no longer throws (I-F review S2)");
@@ -381,7 +382,8 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
       assertEq(t([{ day: "Lørdag", open: "10:00", close: "14:00" }, { open: "09:00", close: "15:00" }, { day: "Lørdag i sesong", open: "11:00", close: "15:00" }]),
         "Lør 10:00–14:00, 09:00–15:00, Lørdag i sesong 11:00–15:00",
         "openingHoursReplyText: a Norwegian day name is a day (I-H); an unknown label is shown as written; no day gives just the times");
-      assertEq(t("  Man–fre 10–17  "), "Man–fre 10–17", "openingHoursReplyText: text is shown trimmed");
+      assertEq(t("  Man–fre 10–17 (sommer)  "), "Man–fre 10–17 (sommer)", "openingHoursReplyText: text is shown trimmed");
+      assertEq(t("  Man–fre 10–17  "), "Man–Fre 10:00–17:00", "openingHoursReplyText: text in the day-and-time form is days and times (slice I-O)");
       assertEq([t(""), t("   "), t([]), t(null), t(undefined), t(42), t({ mon: "10-17" }), t([null, 3, {}, "  ", { day: "mon" }])],
         ["", "", "", "", "", "", "", ""], "openingHoursReplyText: nothing usable gives no text");
       assertEq(t([{ day: "constructor", open: "10:00", close: "12:00" }]), "constructor 10:00–12:00",
@@ -395,7 +397,7 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
         "startConversation: the seller auto-reply no longer aborts the conversation");
       const sellerMsg = conv && db.prepare("SELECT content FROM messages WHERE conversation_id = ? AND sender_role = 'seller'").get(conv.id) as
         { content: string } | undefined;
-      assertTrue(!!sellerMsg?.content.includes("Man–fre 07–17"), "startConversation: the seller's auto-reply is stored");
+      assertTrue(!!sellerMsg?.content.includes("Man–Fre 07:00–17:00"), "startConversation: the seller's auto-reply is stored");
     });
 
     // ══════════════════════════════════════════════════════════════

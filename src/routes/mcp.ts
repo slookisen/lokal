@@ -327,9 +327,11 @@ export { textEntries };
  * the same hours on all three: {day, open, close} renders as before ("Man
  * 10:00–17:00"), {day, hours}, {day, from, to}, {days, …}, a period, a note
  * without times and day names such as "monday", "Lørdag" or "Man-fre" are
- * shown, a text entry or free text for the whole field ("Man–fre 10–17") is
- * shown as it is, and anything else is left out (I-A: it used to render as
- * "undefined").
+ * shown, a text entry or free text for the whole field is shown as it is,
+ * and anything else is left out (I-A: it used to render as "undefined").
+ * Slice I-O: text in the day-and-time form ("Man-Fre 07-22, Lor 08-22") is
+ * read as its days and times ("Man–Fre 07:00–22:00, Lør 08:00–22:00"), and a
+ * season note is shown with the times it limits.
  */
 export function formatOpeningHoursForMcp(openingHours: unknown): string {
   const text = openingHoursText(openingHours);

@@ -70,11 +70,13 @@ import {
 import { addUtmParams } from "../utils/url-utm";
 import {
   normalizeOpeningHours,
+  parseOpeningHoursText,
   parseDayLabel,
   weekdaysLabel,
   entryDaysLabel,
   osloWeekdayAndMinutes,
   openingStatusAt,
+  isSeasonalEntry,
   clockTime,
   WEEKDAY_NAMES,
   type OpeningHoursEntry,
@@ -901,8 +903,10 @@ function productNameText(p: unknown): string {
  * in the page language ("Lørdag" is "Saturday" on /en); a label that names no
  * weekday ("Varierer", "Påske") is shown as written. `today` (Monday = 0, in
  * Norway) highlights every entry that covers it, ranges too, except an entry
- * that holds only in a period ("Mai–September"): it may not hold today. For
- * the declared form ({day, open, close, note}) the rows are the ones I-G gave.
+ * that holds only in part of the year: a period ("Mai–September") or, slice
+ * I-O, a season note ("Sesongåpent til ca. 20. september"; isSeasonalEntry).
+ * It may not hold today. For the declared form ({day, open, close, note}) the
+ * rows are the ones I-G gave.
  */
 export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang: Lang, today: number): string {
   return entries.map((h) => {
@@ -912,7 +916,7 @@ export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang
       ? `${escapeHtml(h.open)} \u2013 ${escapeHtml(h.close)}${qualifier ? ` (${escapeHtml(qualifier)})` : ""}`
       : escapeHtml(qualifier);
     if (!label) return `<div class="hrs-day"></div><div class="hrs-time">${time}</div>`;
-    const isToday = !h.period && h.days.includes(today as OpeningHoursEntry["days"][number]);
+    const isToday = !isSeasonalEntry(h) && h.days.includes(today as OpeningHoursEntry["days"][number]);
     const cls = isToday ? " hrs-today" : "";
     const todayBadge = isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : "";
     return `<div class="hrs-day${cls}">${escapeHtml(label)}${todayBadge}</div><div class="hrs-time${cls}">${time}</div>`;
@@ -928,9 +932,12 @@ export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang
  * never matched before, and the card said "Stengt" in opening hours), and
  * hours past midnight ("12:00–01:30") are open until the closing time on the
  * next day. null (no line) when no entry says which days and times it is open.
+ * Slice I-O: free text for the whole field in the day-and-time form ("Man-Fre
+ * 07-22, Lor 08-22") counts as its day rows, as on the producer page; other
+ * text still says nothing. An entry with a season note counts for nothing,
+ * as one with a period.
  */
 export function isOpenNow(openingHours: unknown, at: Date = new Date()): { isOpen: boolean; todayLabel?: string } | null {
-  if (!Array.isArray(openingHours)) return null;
   const status = openingStatusAt(normalizeOpeningHours(openingHours), at);
   if (!status) return null;
   const today = status.today;
@@ -5734,7 +5741,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // I-H: one reading of every stored form (utils/opening-hours.ts), shared
     // with lokal_info and the A2A auto-reply; "today" is the day in Norway
     // (it was the server's day, UTC on Fly) and covers ranges too.
-    const hoursList = Array.isArray(k.openingHours) ? normalizeOpeningHours(k.openingHours) : [];
+    // I-O: free text in the day-and-time form ("Man-Fre 07-22, Lor 08-22,
+    // Son 09-18", Hevd) is its day rows, card and JSON-LD; other free text
+    // keeps its own row (hoursText), byte for byte as before.
+    const hoursList = Array.isArray(k.openingHours)
+      ? normalizeOpeningHours(k.openingHours)
+      : typeof k.openingHours === "string" ? parseOpeningHoursText(k.openingHours) ?? [] : [];
     const hoursText = !Array.isArray(k.openingHours) && typeof k.openingHours === "string" && k.openingHours ? k.openingHours : "";
     const hoursHtml = hoursList.length
       ? openingHoursCardHtml(hoursList, lang, osloWeekdayAndMinutes(new Date()).day)
@@ -5935,9 +5947,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // them: schema.org's way to give seasonal hours, and the source's own
     // values. Any other period (text, one end, or dates that are not ISO
     // dates or out of order) is still left out, as I-H decided.
+    // I-O (SD2-01): so is an entry with a season note ("Sesongåpent til ca.
+    // 20. september", Bjørke Gård; "Åkerbutikk i sommarsesongen", Hima Grønt;
+    // isSeasonalEntry): it gave year-round hours after the season had ended.
+    // With validity dates it is stated with them, as above (Hovdneset Gård).
     const specHours = hoursList.flatMap((h) => {
       const validity = h.validFrom && h.validThrough ? { validFrom: h.validFrom, validThrough: h.validThrough } : null;
-      if (!h.days.length || (h.period && !validity) || h.open === undefined || h.close === undefined) return [];
+      if (!h.days.length || (isSeasonalEntry(h) && !validity) || h.open === undefined || h.close === undefined) return [];
       const opens = clockTime(h.open);
       const closes = clockTime(h.close);
       return opens && closes ? [{ days: h.days, opens, closes, validity }] : [];

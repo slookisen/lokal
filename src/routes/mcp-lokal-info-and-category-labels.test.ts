@@ -256,8 +256,10 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
     assertEq(formatOpeningHoursForMcp([{ day: "mon", open: "10:00", close: "17:00" }, { day: "sat", open: "10:00", close: "14:00" }]),
       "\n## Åpningstider\nMan 10:00–17:00, Lør 10:00–14:00",
       "AI-1 formatOpeningHoursForMcp: today's array format renders exactly as before");
-    assertEq(formatOpeningHoursForMcp("  Man–fre 10–17  "), "\n## Åpningstider\nMan–fre 10–17",
+    assertEq(formatOpeningHoursForMcp("  Man–fre 10–17 (sommer)  "), "\n## Åpningstider\nMan–fre 10–17 (sommer)",
       "AI-1 formatOpeningHoursForMcp: a string is shown as text");
+    assertEq(formatOpeningHoursForMcp("  Man–fre 10–17  "), "\n## Åpningstider\nMan–Fre 10:00–17:00",
+      "AI-1 formatOpeningHoursForMcp: a string in the day-and-time form is read as days and times (slice I-O)");
     assertEq([formatOpeningHoursForMcp({ mon: "10-17" }), formatOpeningHoursForMcp(42), formatOpeningHoursForMcp(null),
       formatOpeningHoursForMcp(""), formatOpeningHoursForMcp([]), formatOpeningHoursForMcp([null, 3, {}, "  "])],
       ["", "", "", "", "", ""],
@@ -307,7 +309,7 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
       const t = textOf(r);
       assertTrue(r?.isError !== true && t.startsWith("# Hevd Bakeri Fixture"),
         `AI-1 repro: lokal_info returns the profile of a producer with openingHours stored as text (got: ${t.slice(0, 120)})`);
-      assertTrue(t.includes("\n## Åpningstider\nMan–fre 10–17, lør 10–15"), "AI-1 repro: the text opening hours are shown as text");
+      assertTrue(t.includes("\n## Åpningstider\nMan–Fre 10:00–17:00, Lør 10:00–15:00"), "AI-1 repro: the text opening hours are shown (slice I-O: as days and times)");
       // Slice I-N (AI2-02): both of the bakery's products are category labels,
       // so lokal_info lists them as categories (mcp-product-labels-and-order.test.ts).
       assertTrue(t.includes("\n**Kategorier:** Bakervarer, Honning\n") && !t.includes("## Produkter"),
@@ -363,7 +365,7 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
         assertTrue(bad?.isError === true && textOf(bad) === MCP_INTERNAL_ERROR_TEXT && bad.content.length === 1,
           `AI-1 (MCP client): tools/call lokal_info answers an internal error with only the generic message (got: ${JSON.stringify(bad).slice(0, 200)})`);
         const good: any = await client.callTool({ name: "lokal_info", arguments: { agentId: BAKERY } });
-        assertTrue(good?.isError !== true && textOf(good).includes("Man–fre 10–17, lør 10–15"),
+        assertTrue(good?.isError !== true && textOf(good).includes("Man–Fre 10:00–17:00, Lør 10:00–15:00"),
           "AI-1 (MCP client): tools/call lokal_info returns the profile with text opening hours");
       } finally {
         await client.close();

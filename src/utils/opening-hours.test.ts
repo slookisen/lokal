@@ -38,6 +38,14 @@
  *       only when both are dates in order; "Etter avtale" not said twice;
  *       neither gives an "open now" claim. Their keys are read only in their
  *       form: outside it an entry reads as before I-J.
+ *   (i) slice I-O (integration test round 2: SD2-01, SD2-03/AI2-07): text in
+ *       the day-and-time form ("Man-Fre 07-22, Lor 08-22, Son 09-18", Hevd;
+ *       ["Fredag 14:00-18:00", "Lørdag 11:00-15:00"], Alm Østre) is read
+ *       into day rows with "HH:MM" times, a closed day too ("Søn stengt");
+ *       any part outside the form keeps the whole text as text. A season
+ *       note (SEASON_NOTE_WORDS: Bjørke Gård, Hima Grønt and the other live
+ *       notes) makes an entry seasonal like a period: no "open now" claim,
+ *       and the note is in the compact text; other notes are not.
  *
  * Exported runOpeningHoursTests({log}) -> TestSummary; wired into
  * tests/test.ts. Standalone: npx tsx src/utils/opening-hours.test.ts
@@ -45,6 +53,7 @@
 
 import {
   normalizeOpeningHours,
+  parseOpeningHoursText,
   parseDayLabel,
   weekdaysLabel,
   entryDaysLabel,
@@ -52,6 +61,9 @@ import {
   openingHoursText,
   osloWeekdayAndMinutes,
   openingStatusAt,
+  isSeasonNote,
+  isSeasonalEntry,
+  SEASON_NOTE_WORDS,
   timeMinutes,
   clockTime,
   WEEKDAY_NAMES,
@@ -188,8 +200,11 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
       { days: [0, 1, 2, 3, 4], label: "mon-fri", open: "10", close: "17" },
       { days: [6], label: "sun", open: "0", close: "24" },
     ], "c number times are their digits");
-    assertEq(n(["  Lørdag 10–14 ", "", "  "]), [{ days: [], label: "", note: "Lørdag 10–14" }], "c a text entry is trimmed; blank ones are left out");
-    assertEq(n("  Man–fre 10–17  "), [{ days: [], label: "", note: "Man–fre 10–17" }], "c free text for the whole field is one text entry, not parsed");
+    assertEq(n(["  Lørdag etter avtale ", "", "  "]), [{ days: [], label: "", note: "Lørdag etter avtale" }], "c a text entry is trimmed; blank ones are left out");
+    // I-O: text in the day-and-time form is read into day rows (section i);
+    // other text is still one text entry.
+    assertEq(n("  Man–fre 10–17, lør etter avtale  "), [{ days: [], label: "", note: "Man–fre 10–17, lør etter avtale" }],
+      "c free text for the whole field that is not all in the day-and-time form is one text entry, not parsed");
     assertEq(n([
       { day: "sat", open: "10:00" }, { day: "sat", close: "14:00" }, { day: "sat", open: 10 },
       { day: "wed", open: { h: 10 }, close: "17:00" }, { day: "thu", open: "10:00", close: [17] },
@@ -214,9 +229,12 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
   // ══ (d) compact text: lokal_info and the auto-reply ══════════════════
   {
     const text = (v: unknown) => openingHoursText(v);
-    assertEq(text([{ day: "mon", open: "10:00", close: "17:00" }, { day: "saturday", open: "10:00", close: "14:00", note: "Kun i sesong" }, { day: "Lørdag i sesong", open: "11:00", close: "15:00" }]),
+    assertEq(text([{ day: "mon", open: "10:00", close: "17:00" }, { day: "saturday", open: "10:00", close: "14:00", note: "Kun selvbetjening" }, { day: "Lørdag i sesong", open: "11:00", close: "15:00" }]),
       "Man 10:00–17:00, Lør 10:00–14:00, Lørdag i sesong 11:00–15:00",
       "d declared form as before: short day, the note left out, an unknown label as written");
+    assertEq(text([{ day: "mon", open: "10:00", close: "17:00" }, { day: "saturday", open: "10:00", close: "14:00", note: "Kun i sesong" }]),
+      "Man 10:00–17:00, Lør 10:00–14:00 (Kun i sesong)",
+      "d I-O: a season note is shown with the times it limits (main: \"Lør 10:00–14:00\", as if all year)");
     assertEq(text([{ day: "Mandag-Fredag", hours: "10:00-19:00" }, { day: "Lørdag", hours: "11:00-18:00" }, { day: "Mandag", hours: "Stengt" }]),
       "Man–Fre 10:00–19:00, Lør 11:00–18:00, Man: Stengt", "d {day, hours}: a range of days, a day, a closed day");
     assertEq(text([{ period: "April", days: "Torsdag–Fredag", open: "12:00", close: "16:00" }]), "Tor–Fre 12:00–16:00 (April)",
@@ -227,13 +245,14 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
       "Hele året: Åpent ved bestilling, Ring først, Etter avtale, Lør etter avtale", "d notes and text entries");
     assertEq(text([{ days: "Torsdag", period: "Sommer", note: "Kun bestilling" }]), "Tor: Sommer; Kun bestilling", "d a period and a note without times");
     assertEq(text([{ open: "09:00", close: "12:00" }, { day: 1, open: 10, close: 17 }]), "09:00–12:00, 10–17", "d no day: just the times");
-    assertEq(text("  Man–fre 10–17  "), "Man–fre 10–17", "d free text for the whole field, trimmed");
+    assertEq(text("  Man–fre 10–17 (sommer)  "), "Man–fre 10–17 (sommer)", "d free text for the whole field that is not in the day-and-time form, trimmed");
+    assertEq(text("  Man–fre 10–17  "), "Man–Fre 10:00–17:00", "d I-O: free text in the day-and-time form is its days and times (main: \"Man–fre 10–17\")");
     assertEq(text([{ day: "sun", open: "closed", close: "closed" }, { day: "mon", open: "10:00", close: "17:00" }]), "Søn: Stengt, Man 10:00–17:00",
       "d a closed day is \"Stengt\" (main: \"Søn closed–closed\")");
     // Ål Markedshage (live 2026-10-17): its notes have commas of their own.
     assertEq(text([{ note: "Boden (selvbetjent): uke 20-41, døgnåpen" }, { day: "Lørdag", open: "11:00", close: "15:00", note: "Stabbursbutikken i sesong" }, { note: "Julebutikk: fra uke 42, lør 11-15, tor 17-20" }]),
-      "Boden (selvbetjent): uke 20-41, døgnåpen; Lør 11:00–15:00; Julebutikk: fra uke 42, lør 11-15, tor 17-20",
-      "d an entry with a comma of its own: \"; \" between the entries, so each one's end is clear");
+      "Boden (selvbetjent): uke 20-41, døgnåpen; Lør 11:00–15:00 (Stabbursbutikken i sesong); Julebutikk: fra uke 42, lør 11-15, tor 17-20",
+      "d an entry with a comma of its own: \"; \" between the entries, so each one's end is clear (I-O: the season note with its times)");
     assertEq(text([{ day: "Lørdag", hours: "10:00-12:00, 14:00-16:00" }, { day: "sun", open: "12:00", close: "15:00" }]), "Lør: 10:00-12:00, 14:00-16:00; Søn 12:00–15:00",
       "d two ranges kept as text in one entry: \"; \" between the entries");
     assertEq([text(null), text([]), text({}), text(7), text([null, {}, "  "])], ["", "", "", "", ""], "d nothing usable gives no text");
@@ -296,10 +315,10 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
     for (const [why, hours] of [
       ["only a label that is no weekday", [{ day: "Varierer", open: "16:00", close: "17:00" }]],
       ["only a period", [{ period: "Mai–September", days: "Måndag–Laurdag", open: "00:00", close: "24:00" }]],
-      ["only text", ["Lørdag 10–14", { note: "Etter avtale" }]],
+      ["only text", ["Lørdag etter avtale", { note: "Etter avtale" }]],
       ["only a number as day", [{ day: 5, open: "00:00", close: "24:00" }]],
       ["only times that are not clock times", [{ day: "sat", open: "<b>10</b>", close: "17:00" }]],
-      ["free text for the whole field", "Man–søn 00–24"],
+      ["free text for the whole field", "Man–søn 00–24 (sommer)"],
       ["no hours", []],
     ] as Array<[string, unknown]>) {
       assertEq(status(hours, "2026-10-17T10:00:00Z"), null, `f no claim: ${why}`);
@@ -396,7 +415,9 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
       days: [4], label: "Friday", open: "12:00", close: "17:00", period: "1.7.–31.10.2026",
       validFrom: "2026-07-01", validThrough: "2026-10-31", note: "Grønnsakstor på Rena torg – sesongutsalg, juli–oktober",
     }], "h Hovdneset Gård: Friday 12:00–17:00, the description as note, the validity as period and ISO dates (main: no entry)");
-    assertEq(openingHoursText(hovdneset), "Fre 12:00–17:00 (1.7.–31.10.2026)", "h Hovdneset Gård as text: the period with the times, the note left out as for every timed entry");
+    // I-O: its note is about a season ("sesongutsalg"), so it is shown with the period (FUNN rfb-apningstider-sted-i-beskrivelse).
+    assertEq(openingHoursText(hovdneset), "Fre 12:00–17:00 (1.7.–31.10.2026; Grønnsakstor på Rena torg – sesongutsalg, juli–oktober)",
+      "h Hovdneset Gård as text: the period and the season note with the times (I-J: the note was left out)");
     const hovEntry = n(hovdneset)[0];
     assertEq(hovEntry && [entryDaysLabel(hovEntry, "no"), entryDaysLabel(hovEntry, "en")], ["Fredag", "Friday"],
       "h Hovdneset Gård: the day column is \"Fredag\", \"Friday\" on /en");
@@ -485,12 +506,136 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
       "h open now: schema.org's form without validity counts as any timed entry (Friday 13:00 is open)");
   }
 
+  // ══ (i) I-O: text in the day-and-time form, and season notes ═════════
+  {
+    const n = normalizeOpeningHours;
+    const p = parseOpeningHoursText;
+    const MF = [0, 1, 2, 3, 4];
+    // Stored values from GET /api/marketplace/agents/:id/card, 2026-10-17.
+    const hevd = "Man-Fre 07-22, Lor 08-22, Son 09-18";
+    const almOstre = ["Fredag 14:00-18:00", "Lørdag 11:00-15:00"];
+    assertEq(n(hevd), [
+      { days: MF, label: "Man-Fre", open: "07:00", close: "22:00" },
+      { days: [5], label: "Lor", open: "08:00", close: "22:00" },
+      { days: [6], label: "Son", open: "09:00", close: "18:00" },
+    ], "i Hevd: the whole field as text is three day rows, \"Lor\"/\"Son\" are Saturday/Sunday, times \"HH:MM\" (main: one text entry)");
+    assertEq(n(almOstre), [
+      { days: [4], label: "Fredag", open: "14:00", close: "18:00" },
+      { days: [5], label: "Lørdag", open: "11:00", close: "15:00" },
+    ], "i Alm Østre: each text entry of the list is a day row (main: two text entries)");
+    assertEq(openingHoursText(hevd), "Man–Fre 07:00–22:00, Lør 08:00–22:00, Søn 09:00–18:00", "i Hevd as text: days and times (main: \"Man-Fre 07-22, Lor 08-22, Son 09-18\")");
+    assertEq(openingHoursText(almOstre), "Fre 14:00–18:00, Lør 11:00–15:00", "i Alm Østre as text");
+
+    // The form: any dash, spaces around it, dotted times, English and nynorsk days, every day, ø as "oe".
+    const rows = (v: string) => (p(v) ?? []).map((e) => [e.days, e.label, e.open ?? null, e.close ?? null, e.note ?? null]);
+    assertEq(rows("Mandag–fredag 10:00–20:00"), [[MF, "Mandag–fredag", "10:00", "20:00", null]], "i form: en dash in the days and the times (Tomtermais)");
+    assertEq(rows("onsdag - søndag 11:00 — 17:00"), [[[2, 3, 4, 5, 6], "onsdag - søndag", "11:00", "17:00", null]], "i form: spaces around the dashes, an em dash");
+    assertEq(rows("Lør 9.30-15"), [[[5], "Lør", "09:30", "15:00", null]], "i form: a dotted time and a bare hour are \"HH:MM\"");
+    assertEq(rows("Mon-Thu 17:00-19:00"), [[[0, 1, 2, 3], "Mon-Thu", "17:00", "19:00", null]], "i form: English day names (Stanger Gård)");
+    assertEq(rows("Daglig 06:00-22:00"), [[[0, 1, 2, 3, 4, 5, 6], "Daglig", "06:00", "22:00", null]], "i form: every day");
+    assertEq(rows("Hver dag 10-17"), [[[0, 1, 2, 3, 4, 5, 6], "Hver dag", "10:00", "17:00", null]], "i form: a two-word day label");
+    assertEq(rows("Man-Ons 11:00-15:00, Tor-Soen 12:00-21:00"), [[[0, 1, 2], "Man-Ons", "11:00", "15:00", null], [[3, 4, 5, 6], "Tor-Soen", "12:00", "21:00", null]],
+      "i form: ø written as \"oe\" (\"Soen\", Kvarstad Sjokolade)");
+    assertEq([parseDayLabel("Loer"), parseDayLabel("soendag"), parseDayLabel("Loerdag")], [[5], [6], [5]], "i day tables: \"loer\", \"soen\", \"loerdag\", \"soendag\"");
+    assertEq(rows("Man-Søn 07:30-00:00"), [[[0, 1, 2, 3, 4, 5, 6], "Man-Søn", "07:30", "00:00", null]], "i form: closing at midnight is \"00:00\" (past midnight, as for every form)");
+    assertEq(rows("Søn 00-24"), [[[6], "Søn", "00:00", "24:00", null]], "i form: 00–24");
+    // A closed day ("Søn stengt", five producers in live data 2026-10-17).
+    assertEq(rows("Man-Tor 09:00-15:30, Fre-Søn stengt"), [[[0, 1, 2, 3], "Man-Tor", "09:00", "15:30", null], [[4, 5, 6], "Fre-Søn", null, null, "Stengt"]],
+      "i form: \"<days> stengt\" is a closed day, the note \"Stengt\" (Fagernes Kjøtt)");
+    assertEq([rows("Søndag Stengt"), rows("Man closed"), rows("Lør stengd")], [[[[6], "Søndag", null, null, "Stengt"]], [[[0], "Man", null, null, "Stengt"]], [[[5], "Lør", null, null, "Stengt"]]],
+      "i form: \"stengt\", \"closed\" and \"stengd\" in any case");
+    assertEq(rows("  Man-Fre 09-17 ,  Lør 10-14  "), [[MF, "Man-Fre", "09:00", "17:00", null], [[5], "Lør", "10:00", "14:00", null]], "i form: spaces around the parts are trimmed");
+
+    // Not the form: the whole text stays text, no part is guessed.
+    for (const text of [
+      "Man-Lør 12-17 (sommer)", "Fredag 15:00–18:00, lørdag 13:00–15:00 eller etter avtale", "Restaurant: Man-Lør 11-00. Marked: Man-Fre 10-17",
+      "Gårdsbutikk: daglig 11-17", "Lørdager 10:00-14:00", "Tirsdag og Torsdag 15:00-18:00", "Juli-august: man-lør 12:00-16:00",
+      "April: Torsdag-Fredag 10:00-16:00, Lørdag 10:00-15:00", "Man-Fre 09-17.", "Man-Fre 09-17,", "Man-Fre 09-17,, Lør 10-14", "Man 25-30",
+      "Man 10:60-12", "Man-Fre 10-12-14", "Man-Fre 10-12, 14-16", "Påske 12-18", "constructor 10-12", "Varierer 16:00-17:00",
+      "Man-Fre 10-17 og Lør 10-14", "Man stengt nå", "Stengt", "Man", "10-17", "Etter avtale", "Dognopent (00:00-23:59)",
+      "Sommerkafé: søndager juni-september 11:00-17:00", "Lørdag 10–14 stengt", "", "   ", ",",
+    ]) {
+      assertEq(p(text), null, `i not the form: ${JSON.stringify(text)} is not read`);
+    }
+    assertEq(n("Man-Lør 12-17 (sommer)"), [{ days: [], label: "", note: "Man-Lør 12-17 (sommer)" }], "i not the form: the whole field stays one text entry, as before");
+    // A part longer than 64 characters is not read (the longest in the form in live data has 26), and long text costs no time.
+    assertEq([p(`Man-Fre${" ".repeat(52)}10-17`) !== null, p(`Man-Fre${" ".repeat(53)}10-17`)], [true, null], "i length: a part of 64 characters is read, one of 65 is not");
+    {
+      const t0 = Date.now();
+      for (const v of [`a${" ".repeat(200_000)}x`, `a${" ".repeat(200_000)}1-`, `Man ${"1-".repeat(100_000)}`, `${"Man 10-17, ".repeat(20_000)}x`]) { p(v); n(v); }
+      assertTrue(Date.now() - t0 < 1000, `i length: 200 000 characters of text are rejected fast (${Date.now() - t0} ms; without the limit a run of spaces backtracks in quadratic time)`);
+    }
+    assertEq(n(["Mandag–fredag 10:00–20:00", "Lørdag–søndag 10:00–17:00 (heile året)", "  ", { day: "sun", open: "12:00", close: "15:00" }]), [
+      { days: MF, label: "Mandag–fredag", open: "10:00", close: "20:00" },
+      { days: [], label: "", note: "Lørdag–søndag 10:00–17:00 (heile året)" },
+      { days: [6], label: "sun", open: "12:00", close: "15:00" },
+    ], "i a list: each text entry is read on its own (Tomtermais: the one with a qualifier stays text), in order with the other forms");
+    assertEq(n(["Man-Fre 10-17, Lør 10-14"]), [
+      { days: MF, label: "Man-Fre", open: "10:00", close: "17:00" }, { days: [5], label: "Lør", open: "10:00", close: "14:00" },
+    ], "i a list: a text entry with commas gives a row per part");
+    // "Open now" from text, at fixed clocks (2026-10-17 is a Saturday; Oslo is UTC+2).
+    const status = (v: unknown, iso: string) => {
+      const s = openingStatusAt(n(v), new Date(iso));
+      return s && { isOpen: s.isOpen, today: s.today ? `${s.today.open}–${s.today.close}` : null };
+    };
+    assertEq(status(hevd, "2026-10-17T10:00:00Z"), { isOpen: true, today: "08:00–22:00" }, "i open now: Hevd on Saturday 12:00 is open (main: no claim)");
+    assertEq(status(hevd, "2026-10-18T06:30:00Z"), { isOpen: false, today: "09:00–18:00" }, "i open now: Hevd on Sunday 08:30 is closed until 09:00");
+    assertEq(status(almOstre, "2026-10-16T13:00:00Z"), { isOpen: true, today: "14:00–18:00" }, "i open now: Alm Østre on Friday 15:00 is open");
+    assertEq(status("Man-Tor 09:00-15:30, Fre-Søn stengt", "2026-10-17T10:00:00Z"), { isOpen: false, today: null }, "i open now: a closed day from text is closed");
+
+    // Season notes: the spec's examples and every season note in live data 2026-10-17 …
+    for (const note of [
+      "Sesongåpent til ca. 20. september", "Åkerbutikk i sommarsesongen", "Kun i sesong", "Stabbursbutikken i sesong",
+      "Høgsesong juni til midten av august", "Sommersesong juni-august", "Sesongbasert — vanligvis mai til oktober. Sjekk lokale oppdateringer.",
+      "Gårdsutsalg i sesong 16. september–22. desember", "Grønnsakstor på Rena torg – sesongutsalg, juli–oktober", "Vinteråpningstid. Ring for besøk utenom.",
+      "Sommer. Jan-mars etter avtale", "Vintertid", "SESONG", "In season only", "Summer hours", "Winter hours", "Høstsalg", "Haustope", "Autumn only",
+    ]) {
+      assertTrue(isSeasonNote(note), `i season note: ${JSON.stringify(note)}`);
+    }
+    // … and none of the other notes there.
+    for (const note of [
+      "Selvbetjent 24/7", "Åpent året rundt og døgnet rundt", "Søndag stengt", "Annankvar torsdag (partalsveker)", "Kun selvbetjening",
+      "Døgnåpen selvbetjent", "Utlevering skjer på avtalt tid og sted. Bestill via Facebook-gruppen.", "Ølutsalg i Bøgrend", "Selvbetjent Ostebua",
+      "Lørdag og søndag stengt – men ring, så kommer vi hvis vi kan", "Døgnåpen nettbutikk — bestill når som helst", "Stengt", "Etter avtale",
+      "Velkommen til vår gårdsbutikk", "Stengt 24.–26. desember", "Closed in July", "", "   ",
+    ]) {
+      assertTrue(!isSeasonNote(note), `i not a season note: ${JSON.stringify(note)}`);
+    }
+    assertTrue(!isSeasonNote(undefined), "i not a season note: none");
+    assertTrue(SEASON_NOTE_WORDS.length > 0 && SEASON_NOTE_WORDS.every((w) => w === w.toLowerCase() && w.trim() === w && w.length >= 4),
+      "i SEASON_NOTE_WORDS: lower case, trimmed, no short word that would match inside other words");
+    assertTrue(!SEASON_NOTE_WORDS.includes("vår"), "i SEASON_NOTE_WORDS: not \"vår\" (also \"our\")");
+
+    const bjorke = [{ days: "onsdag - søndag", hours: "11:00-17:00", note: "Sesongåpent til ca. 20. september" }];
+    const hima = [{ day: "sat", open: "10:00", close: "14:00", note: "Åkerbutikk i sommarsesongen" }];
+    const e = (v: unknown) => n(v)[0]!;
+    assertEq([isSeasonalEntry(e(bjorke)), isSeasonalEntry(e(hima)), isSeasonalEntry(e([{ period: "April", day: "fri", open: "10:00", close: "12:00" }]))], [true, true, true],
+      "i seasonal: a season note (Bjørke Gård, Hima Grønt) or a period");
+    assertEq([isSeasonalEntry(e([{ day: "sat", open: "10:00", close: "14:00" }])), isSeasonalEntry(e([{ day: "sat", open: "10:00", close: "14:00", note: "Selvbetjent 24/7" }]))], [false, false],
+      "i seasonal: not without a period or a season note");
+    assertEq(n(bjorke), [{ days: [2, 3, 4, 5, 6], label: "onsdag - søndag", open: "11:00", close: "17:00", note: "Sesongåpent til ca. 20. september" }],
+      "i seasonal: the entry itself is as before (no new field)");
+    assertEq(openingHoursText(bjorke), "Ons–Søn 11:00–17:00 (Sesongåpent til ca. 20. september)", "i Bjørke Gård as text: the season note with the times (main: \"Ons–Søn 11:00–17:00\")");
+    assertEq(openingHoursText(hima), "Lør 10:00–14:00 (Åkerbutikk i sommarsesongen)", "i Hima Grønt as text: the season note with the times (main: \"Lør 10:00–14:00\")");
+    assertEq(openingHoursText([{ day: "sat", open: "10:00", close: "14:00", note: "Selvbetjent 24/7" }]), "Lør 10:00–14:00", "i text: another note on a timed entry is still left out, as before");
+    assertEq(openingHoursText([{ days: "Torsdag", period: "Sommer", note: "Sesongvarer" }]), "Tor: Sommer; Sesongvarer", "i text: an entry without times shows its period and note, as before");
+    assertEq(openingHoursText([{ period: "Mai–September", day: "sat", open: "10:00", close: "14:00", note: "Sommersalg" }]), "Lør 10:00–14:00 (Mai–September; Sommersalg)",
+      "i text: a period and a season note, in that order");
+    // No "open now" claim from a seasonal entry, also within the stated season (Wednesday 2026-09-16 13:00 in Oslo).
+    assertEq(status(bjorke, "2026-09-16T11:00:00Z"), null, "i open now: Bjørke Gård gives no claim (main: \"Åpent nå\" on a Wednesday in October too)");
+    assertEq(status(hima, "2026-10-17T10:00:00Z"), null, "i open now: Hima Grønt gives no claim on a Saturday (main: \"Åpent nå\")");
+    assertEq(status([...hima, { day: "fri", open: "10:00", close: "17:00" }], "2026-10-17T10:00:00Z"), { isOpen: false, today: null },
+      "i open now: beside a year-round entry only that one counts (Saturday: no entry, closed)");
+    assertEq(status([{ day: "sat", open: "10:00", close: "14:00", note: "Selvbetjent" }], "2026-10-17T10:00:00Z"), { isOpen: true, today: "10:00–14:00" },
+      "i open now: an entry with another note counts, as before");
+  }
+
   return { passed, failed, failures };
 }
 
 // Standalone runner: `npx tsx src/utils/opening-hours.test.ts`
 if (require.main === module) {
-  console.log("── opening-hours (I-H, I-J: one reading of opening hours) ──");
+  console.log("── opening-hours (I-H, I-J, I-O: one reading of opening hours) ──");
   const r = runOpeningHoursTests({ log: true });
   console.log(`\nopening-hours: ${r.passed} passed, ${r.failed} failed`);
   if (r.failed > 0) {
