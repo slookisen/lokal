@@ -184,7 +184,8 @@ export function registerDentalTools(server: McpServer): void {
         // goes through the shared parser; the explicit arguments win over
         // what it found (helfo/akutt false removes a parsed one). The store
         // also reads a slug or synonym in `spesialitet` («kjeveortoped»,
-        // «orthodontist») as the stored specialty name.
+        // «orthodontist») as the stored specialty name, and acute_vakt 1 (from
+        // `akutt` or the parser) as the akutt claim the card shows (S2b).
         const explicit: Record<string, unknown> = {};
         if (fylke) explicit.fylke = fylke;
         if (spesialitet) explicit.specialty = spesialitet;
@@ -344,6 +345,9 @@ export function registerDentalTools(server: McpServer): void {
     },
     async ({ fylke }) => {
       try {
+        // S2b: the public store reads acute_vakt 1 as the akutt claim
+        // (DENTAL_ACUTE_CLAIM_SQL), so `count` and every card here are clinics
+        // whose `akutt` is "vakt" or "accepts", never a bare flag.
         const filter: Record<string, unknown> = { acute_vakt: 1 };
         if (fylke) filter.fylke = fylke;
 
@@ -394,21 +398,15 @@ export function registerDentalTools(server: McpServer): void {
     },
     async () => {
       try {
-        const chains = listChains();
+        // S6: the chains come from the clinics' chain_brand (dental_chains is
+        // empty), each with its antall_lokasjoner_i_db from one GROUP BY in
+        // listChains() instead of a count query per chain.
+        const kjeder = listChains();
+        const result = { count: kjeder.length, kjeder };
 
-        // Enrich each chain with a count of clinics in the DB
-        const enriched = chains.map((c) => {
-          const count = countPublicDentalAgents({ chain_brand: c.chain_brand } as any);
-          return { ...c, antall_lokasjoner_i_db: count };
-        });
-
-        const result = {
-          count: enriched.length,
-          kjeder: enriched,
-        };
-
+        // Compact JSON, as tannlege_search.
         return {
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
         return {

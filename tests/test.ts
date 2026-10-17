@@ -27206,21 +27206,24 @@ console.log("\n── PR-114: dental MCP server ──");
   assertTrue("/a2a" in spec.paths, "pr114-03e: /a2a er fremdeles i paths");
 }
 
-// pr114-04: buildSearchResults-hjelper testes mot :memory:-DB (2 seeds, filter på akutt gir 1)
-{
+// pr114-04: buildSearchResults-hjelper testes mot :memory:-DB (3 seeds, filter på akutt gir 1).
+// dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): blokken lastet før en
+// dental-db-init-modul som ikke finnes, og catch-grenen hoppet over hele blokken
+// (også på main). Nå egen DB via db-factory, som de andre dental-blokkene, og
+// akutt-klinikken har kilde for acute_vakt: et offentlig akutt-filter gir bare
+// klinikker med akutt-påstand, ikke et flagg uten kilde.
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
+  const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory.__resetDbFactoryForTesting();
 
   try {
-    // Initialiser dental DB
-    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
-    initDentalDb();
+    const { createDentalAgent, listPublicDentalAgents } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+    const { buildSearchResults } = require("../src/routes/dental-mcp") as typeof import("../src/routes/dental-mcp");
+    const db = dbFactory.getDb("dental");
 
-    const { createDentalAgent } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
-    const { buildSearchResults, listPublicDentalAgents: _list } = require("../src/routes/dental-mcp") as typeof import("../src/routes/dental-mcp");
-    const { listPublicDentalAgents } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
-
-    // Seed 2 klinikker — kun én med acute_vakt=1
+    // Seed 3 klinikker — to med acute_vakt=1, bare den ene med kilde
     createDentalAgent({
       navn: "Oslo Tannklinikk AS",
       org_nr: "910000001",
@@ -27230,9 +27233,20 @@ console.log("\n── PR-114: dental MCP server ──");
       helfo_agreement: "true",
       verification_status: "verified",
     });
-    createDentalAgent({
+    const akuttId = createDentalAgent({
       navn: "Bergen Akuttvakt Tannlege AS",
       org_nr: "910000002",
+      poststed: "Bergen",
+      fylke: "Vestland",
+      acute_vakt: 1,
+      helfo_agreement: "false",
+      verification_status: "pending_verify",
+    });
+    db.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?")
+      .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage", value: 1 }] }), akuttId);
+    createDentalAgent({
+      navn: "Bergen Uten Kilde Tannlege AS",
+      org_nr: "910000003",
       poststed: "Bergen",
       fylke: "Vestland",
       acute_vakt: 1,
@@ -27242,19 +27256,19 @@ console.log("\n── PR-114: dental MCP server ──");
 
     // Filter på akutt: skal gi 1 resultat
     const akuttAgents = listPublicDentalAgents({ acute_vakt: 1 } as any, 10);
-    assertEq(akuttAgents.length, 1, "pr114-04a: filter på acute_vakt=1 gir 1 resultat");
-    assertEq(akuttAgents[0].navn, "Bergen Akuttvakt Tannlege AS", "pr114-04b: riktig klinikk returneres for akutt-filter");
+    assertEq(akuttAgents.length, 1, "pr114-04a: filter på acute_vakt=1 gir 1 resultat (klinikken med kilde)");
+    assertEq(akuttAgents[0]?.navn, "Bergen Akuttvakt Tannlege AS", "pr114-04b: riktig klinikk returneres for akutt-filter");
 
     // buildSearchResults produserer riktig output
     const results = buildSearchResults(akuttAgents);
     assertEq(results.length, 1, "pr114-04c: buildSearchResults returnerer 1 element");
-    assertTrue(results[0].badges.includes("Akuttvakt"), "pr114-04d: Akuttvakt-badge settes korrekt");
+    assertTrue(results[0]?.badges.includes("Akuttvakt") === true, "pr114-04d: Akuttvakt-badge settes korrekt");
     assertTrue(
-      typeof results[0].profil_url === "string" && results[0].profil_url.includes("/klinikk/"),
+      typeof results[0]?.profil_url === "string" && results[0].profil_url.includes("/klinikk/"),
       "pr114-04e: profil_url inneholder /klinikk/"
     );
     assertTrue(
-      results[0].profil_url.includes("910000002"),
+      results[0]?.profil_url.includes("910000002") === true,
       "pr114-04f: profil_url inkluderer org_nr i slug"
     );
 
@@ -27262,22 +27276,19 @@ console.log("\n── PR-114: dental MCP server ──");
     const helfoAgents = listPublicDentalAgents({ helfo_agreement: "true" } as any, 10);
     assertTrue(helfoAgents.length >= 1, "pr114-04g: minst 1 Helfo-klinikk funnet");
     const helfoResults = buildSearchResults(helfoAgents);
-    assertTrue(helfoResults[0].badges.includes("Helfo-avtale"), "pr114-04h: Helfo-avtale-badge settes korrekt");
-
+    assertTrue(helfoResults[0]?.badges.includes("Helfo-avtale") === true, "pr114-04h: Helfo-avtale-badge settes korrekt");
+    assertTrue(
+      !akuttAgents.some((a) => a.navn === "Bergen Uten Kilde Tannlege AS"),
+      "pr114-04i: akutt-filteret utelater klinikken med acute_vakt=1 uten kilde"
+    );
   } catch (err) {
-    // DB ikke tilgjengelig i dette miljøet — same fallback as pr109/pr113
-    const msg = err instanceof Error ? err.message : String(err);
-    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
-    if (isDbErr) {
-      console.log("  [pr114-04] dental DB ikke tilgjengelig — skipping (expected in some CI configs)");
-    } else {
-      assertTrue(false, `pr114-04: uventet feil: ${msg}`);
-    }
+    assertTrue(false, `pr114-04: uventet feil: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
     else delete process.env.DENTAL_DB_PATH;
+    dbFactory.__resetDbFactoryForTesting();
   }
-}
+});
 
 
 // ─── pr116: SEO-pakke (slugifyText, titleCase, listPoststeder, listRelatedClinics, poststed-filter)
@@ -36205,6 +36216,27 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   for (const [label, load] of [
     ["dental mcp instructions", () => (require("../src/routes/dental-mcp-instructions.test") as typeof import("../src/routes/dental-mcp-instructions.test")).runDentalMcpInstructionsTests({ log: false })],
     ["dental clinic card", () => (require("../src/services/dental-clinic-card.test") as typeof import("../src/services/dental-clinic-card.test")).runDentalClinicCardTests({ log: false })],
+  ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
+    try {
+      const r = await load();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ${f}`);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b) and
+  //    2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S6): the public akutt
+  //    filter is the claim on the card; tannlege_kjeder and /api/tannlege/chains
+  //    list the chains from chain_brand ──
+  console.log("\n── dev-request 2026-10-16 (S2b+S6): akutt med proveniens og kjeder fra chain_brand (finn-tannlege) ──");
+  for (const [label, load] of [
+    ["dental acute filter", () => (require("../src/routes/dental-acute-filter.test") as typeof import("../src/routes/dental-acute-filter.test")).runDentalAcuteFilterTests({ log: false })],
+    ["dental chains", () => (require("../src/routes/dental-chains.test") as typeof import("../src/routes/dental-chains.test")).runDentalChainsTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();

@@ -1237,7 +1237,7 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   if (fylke) explicit.fylke = fylke;
   if (spesialitet) explicit.specialty = spesialitet;
   if (helfo) explicit.helfo_agreement = "true";
-  if (akutt) explicit.acute_vakt = 1;
+  if (akutt) explicit.acute_vakt = 1; // the public store reads this as the akutt claim on the card (S2b)
   if (kjede) explicit.chain_brand = kjede;
 
   let agents: Array<DentalAgent & { id: string }> = [];
