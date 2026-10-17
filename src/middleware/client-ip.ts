@@ -32,6 +32,10 @@
  *   enforce  rewrites X-Forwarded-For as above. Trinn 2 flips the default,
  *            only once the shadow gate (AC2 in the dev-request) is met.
  *
+ * Read-out for AC2 (trinn 1b): the `client_ip_stats` log line, and the same
+ * counters plus mode, breaker state and since-boot sums as `clientIp` in the
+ * existing GET /admin/analytics/ops/event-loop (getInstalledClientIpSnapshot).
+ *
  * The failure mode guarded hardest is "every client in one bucket" (a 429
  * wave on all three sites):
  *   G1  no branch sets X-Forwarded-For to a constant or deletes it. Every
@@ -254,6 +258,16 @@ class CollapseBreaker {
     return t < this.openUntil;
   }
 
+  /** While open at t: when it closes again; otherwise null. */
+  openUntilAt(t: number): number | null {
+    return this.isOpen(t) ? this.openUntil : null;
+  }
+
+  /** Every key the ring holds (client-ip.test.ts, B1 pin). */
+  retainedKeys(): string[] {
+    return this.ring.flatMap((b) => (b ? [...b.fci, ...b.edge] : []));
+  }
+
   /** At most every 10 s, and not while open. Returns the trip when this evaluation opened the breaker. */
   evaluate(t: number): BreakerTrip | null {
     if (this.isOpen(t) || t - this.lastEvalAt < BREAKER_EVAL_EVERY_MS) return null;
@@ -297,8 +311,8 @@ interface TopEntry {
   ua: Map<string, number>;
 }
 
-interface StatsWindow {
-  index: number;
+/** A window's additive counters: what sums across windows into since-boot totals. */
+interface StatsCounters {
   n: number;
   fciValid: number;
   fallback: Record<FlyClientIpFallback, number>;
@@ -307,13 +321,17 @@ interface StatsWindow {
   xffClientSupplied: number;
   agreeFciEdge: { n: number; agree: number };
   agreeLegacyEqFci: { n: number; agree: number };
+  wouldTrip: number;
+  topOverflow: number;
+}
+
+interface StatsWindow extends StatsCounters {
+  index: number;
   dFci: Set<string>;
   dEdge: Set<string>;
   dLegacy: Set<string>;
   distinctCapped: boolean;
-  wouldTrip: number;
   top: Map<string, TopEntry>;
-  topOverflow: number;
 }
 
 export interface ClientIpTopKey {
@@ -330,11 +348,8 @@ export interface ClientIpTopKey {
   ua: string;
 }
 
-export interface ClientIpStatsLine {
-  evt: "client_ip_stats";
-  mode: ClientIpMode;
-  window_start: string;
-  window_s: number;
+/** The additive counters of a stats line; since_boot (ClientIpOpsSnapshot) sums the same fields. */
+export interface ClientIpCounters {
   n: number;
   fci_valid: number;
   fallback: Record<FlyClientIpFallback, number>;
@@ -351,22 +366,53 @@ export interface ClientIpStatsLine {
   agree_fci_edge: { n: number; agree: number };
   /** Legacy req.ip byte-equal to Fly-Client-IP, among valid ones with exactly 2 entries (= hashIP continuity). */
   agree_legacy_eq_fci: { n: number; agree: number };
+  /** Breaker trips (in shadow: would have tripped). */
+  would_trip: number;
+  /** Requests whose Fly-Client-IP got no top-list entry (TOP_CAP reached): > 0 means the top list is incomplete. */
+  top_overflow: number;
+}
+
+export interface ClientIpStatsLine extends ClientIpCounters {
+  evt: "client_ip_stats";
+  mode: ClientIpMode;
+  window_start: string;
+  window_s: number;
   D_fci: number;
   D_edge: number;
   D_legacy: number;
   distinct_capped: boolean;
-  /** Breaker trips in this window (in shadow: would have tripped). */
-  would_trip: number;
   /** In shadow: the simulated state enforce would be in. */
   breaker_open: boolean;
   breaker_trips_total: number;
   top15m: ClientIpTopKey[];
-  top_overflow: number;
 }
 
-function newWindow(index: number): StatsWindow {
+/**
+ * `clientIp` in GET /admin/analytics/ops/event-loop: the AC2 read-out for the
+ * fleet, for one process (one Fly machine; a restart starts it over).
+ * Counters, the breaker state, and the open window with its top list keyed
+ * by the same 12-hex hashes as the log line: never a raw IP.
+ */
+export interface ClientIpOpsSnapshot {
+  mode: ClientIpMode;
+  on_fly: boolean;
+  reason: ClientIpConfig["reason"];
+  /** window_start of the first window in since_boot; null before the first observed request (always in legacy). */
+  since: string | null;
+  /** Now, not at the last request; in shadow the simulated state enforce would be in. */
+  breaker: { open: boolean; open_until: string | null; trips_total: number };
+  /** Every window since `since`, the open one included. */
+  since_boot: ClientIpCounters;
+  /**
+   * The open window, as the next client_ip_stats line will be built from it
+   * (lines are written lazily: window_start tells its age; breaker_open is as
+   * of now); null when there is none yet.
+   */
+  window: ClientIpStatsLine | null;
+}
+
+function newCounters(): StatsCounters {
   return {
-    index,
     n: 0,
     fciValid: 0,
     fallback: { missing: 0, invalid: 0, non_public: 0 },
@@ -375,13 +421,51 @@ function newWindow(index: number): StatsWindow {
     xffClientSupplied: 0,
     agreeFciEdge: { n: 0, agree: 0 },
     agreeLegacyEqFci: { n: 0, agree: 0 },
+    wouldTrip: 0,
+    topOverflow: 0,
+  };
+}
+
+function addCounters(into: StatsCounters, from: StatsCounters): void {
+  into.n += from.n;
+  into.fciValid += from.fciValid;
+  for (const f of ["missing", "invalid", "non_public"] as const) into.fallback[f] += from.fallback[f];
+  into.fallbackHc += from.fallbackHc;
+  into.errors += from.errors;
+  into.xffClientSupplied += from.xffClientSupplied;
+  into.agreeFciEdge.n += from.agreeFciEdge.n;
+  into.agreeFciEdge.agree += from.agreeFciEdge.agree;
+  into.agreeLegacyEqFci.n += from.agreeLegacyEqFci.n;
+  into.agreeLegacyEqFci.agree += from.agreeLegacyEqFci.agree;
+  into.wouldTrip += from.wouldTrip;
+  into.topOverflow += from.topOverflow;
+}
+
+/** The one mapping to the logged names, so since_boot and the log line can never drift apart. */
+function countersOut(c: StatsCounters): ClientIpCounters {
+  return {
+    n: c.n,
+    fci_valid: c.fciValid,
+    fallback: { ...c.fallback },
+    fallback_hc: c.fallbackHc,
+    errors: c.errors,
+    xff_client_supplied: c.xffClientSupplied,
+    agree_fci_edge: { ...c.agreeFciEdge },
+    agree_legacy_eq_fci: { ...c.agreeLegacyEqFci },
+    would_trip: c.wouldTrip,
+    top_overflow: c.topOverflow,
+  };
+}
+
+function newWindow(index: number): StatsWindow {
+  return {
+    index,
+    ...newCounters(),
     dFci: new Set(),
     dEdge: new Set(),
     dLegacy: new Set(),
     distinctCapped: false,
-    wouldTrip: 0,
     top: new Map(),
-    topOverflow: 0,
   };
 }
 
@@ -423,12 +507,16 @@ export interface ClientIpMiddlewareOptions {
 
 export type ClientIpMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
   readonly mode: ClientIpMode;
-  /**
-   * The current, still-open stats window (what the next log line will be
-   * built from). For the tests, and for a possible later field in an existing
-   * ops response; no production code reads it today.
-   */
+  /** The current, still-open stats window (what the next log line will be built from). For the tests. */
   snapshot(): ClientIpStatsLine;
+  /** The AC2 read-out (see ClientIpOpsSnapshot); served through getInstalledClientIpSnapshot. */
+  opsSnapshot(): ClientIpOpsSnapshot;
+  /**
+   * Tests only (B1 regression pin, review of PR #1102): every address key the
+   * stats and the breaker hold past the request. Each must be a
+   * createStatsKey key, never a client-controlled string.
+   */
+  __retainedKeysForTesting(): string[];
 };
 
 /**
@@ -445,6 +533,9 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   let current: StatsWindow | null = null;
   // Only the top maps of the previous TOP_WINDOWS - 1 windows are kept, for top15m.
   let history: Array<Pick<StatsWindow, "index" | "top">> = [];
+  // Since-boot totals of every closed window (plain numbers), folded in by windowAt.
+  const closed = newCounters();
+  let firstIndex: number | null = null;
   let lastT = 0;
 
   function topList(w: StatsWindow): ClientIpTopKey[] {
@@ -483,23 +574,35 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
       mode,
       window_start: new Date(w.index * STATS_WINDOW_MS).toISOString(),
       window_s: STATS_WINDOW_MS / 1000,
-      n: w.n,
-      fci_valid: w.fciValid,
-      fallback: { ...w.fallback },
-      fallback_hc: w.fallbackHc,
-      errors: w.errors,
-      xff_client_supplied: w.xffClientSupplied,
-      agree_fci_edge: { ...w.agreeFciEdge },
-      agree_legacy_eq_fci: { ...w.agreeLegacyEqFci },
+      ...countersOut(w),
       D_fci: w.dFci.size,
       D_edge: w.dEdge.size,
       D_legacy: w.dLegacy.size,
       distinct_capped: w.distinctCapped,
-      would_trip: w.wouldTrip,
       breaker_open: breaker.isOpen(t),
       breaker_trips_total: breaker.tripsTotal,
       top15m: topList(w),
-      top_overflow: w.topOverflow,
+    };
+  }
+
+  function opsSnapshot(): ClientIpOpsSnapshot {
+    const t = now();
+    const total = newCounters();
+    addCounters(total, closed);
+    if (current) addCounters(total, current);
+    const openUntil = breaker.openUntilAt(t);
+    return {
+      mode,
+      on_fly: cfg.onFly,
+      reason: cfg.reason,
+      since: firstIndex === null ? null : new Date(firstIndex * STATS_WINDOW_MS).toISOString(),
+      breaker: {
+        open: openUntil !== null,
+        open_until: openUntil === null ? null : new Date(openUntil).toISOString(),
+        trips_total: breaker.tripsTotal,
+      },
+      since_boot: countersOut(total),
+      window: current ? line(current, t) : null,
     };
   }
 
@@ -518,10 +621,12 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     if (current && current.index === index) return current;
     if (current) {
       if (current.n > 0 || current.errors > 0) log(JSON.stringify(line(current, t)));
+      addCounters(closed, current);
       history = [...history, { index: current.index, top: current.top }].filter(
         (h) => index - h.index < TOP_WINDOWS && h.index < index
       );
     }
+    if (firstIndex === null) firstIndex = index;
     current = newWindow(index);
     return current;
   }
@@ -616,7 +721,47 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   return Object.assign(middleware, {
     mode,
     snapshot: (): ClientIpStatsLine => line(current ?? newWindow(Math.floor(lastT / STATS_WINDOW_MS)), lastT),
+    opsSnapshot,
+    __retainedKeysForTesting: (): string[] => {
+      const keys: string[] = [];
+      const topKeys = (top: Map<string, TopEntry>) => {
+        for (const [key, e] of top) keys.push(key, ...e.legacy);
+      };
+      if (current) {
+        keys.push(...current.dFci, ...current.dEdge, ...current.dLegacy);
+        topKeys(current.top);
+      }
+      for (const h of history) topKeys(h.top);
+      keys.push(...breaker.retainedKeys());
+      return keys;
+    },
   });
+}
+
+// ─── Installed instance (AC2 read-out) ──────────────────────────────────
+
+let installed: ClientIpMiddleware | null = null;
+
+/**
+ * `clientIp` in GET /admin/analytics/ops/event-loop: the snapshot of the
+ * middleware installClientIp mounted in this process (in legacy too, so a
+ * rollback or a typo in CLIENT_IP_MODE shows as mode/reason), or null when
+ * installClientIp has not run (e.g. a test that mounts the analytics router
+ * alone). Never throws: a failing snapshot must not take that ops response
+ * down with it.
+ */
+export function getInstalledClientIpSnapshot(): ClientIpOpsSnapshot | { error: "snapshot_failed" } | null {
+  if (!installed) return null;
+  try {
+    return installed.opsSnapshot();
+  } catch {
+    return { error: "snapshot_failed" };
+  }
+}
+
+/** Tests only: forget the installed instance. */
+export function __resetInstalledClientIpForTesting(): void {
+  installed = null;
 }
 
 /**
@@ -627,11 +772,13 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
  * with Fly's layout (`…, <client IP>, <app IP>`) `1` and every subnet make
  * req.ip the app's own IP for every client (one bucket), and `2` rests on
  * an X-Forwarded-For layout Fly has not documented.
+ * The mounted instance is what getInstalledClientIpSnapshot reads.
  */
 export function installClientIp(app: Application, cfg: ClientIpConfig, opts: ClientIpMiddlewareOptions = {}): ClientIpMiddleware {
   app.set("trust proxy", true);
   const middleware = createClientIpMiddleware(cfg, opts);
   app.use(middleware);
+  installed = middleware;
   (opts.log ?? console.log)(`[boot] client-ip mode=${cfg.mode} onFly=${cfg.onFly} reason=${cfg.reason}`);
   return middleware;
 }

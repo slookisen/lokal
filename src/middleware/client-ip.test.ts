@@ -28,11 +28,16 @@
  * 5-min cadence, the 15-min top list and fallback_hc; and the stats keys
  * (createStatsKey): fixed size whatever the input, one per limiter bucket,
  * so a client's padded X-Forwarded-For is never what the stats hold.
+ * Trinn 1b (review of PR #1102, S1–S3): the B1 pin (only createStatsKey keys
+ * outlive a request), DISTINCT_CAP / TOP_CAP and the 5-bucket breaker ring
+ * at their exact bounds; and the AC2 read-out — getInstalledClientIpSnapshot,
+ * served as `clientIp` by the existing GET /admin/analytics/ops/event-loop.
  *
  * Real Express apps + a fresh express-rate-limit instance per scenario, over
  * Node's own http module (not global fetch — see mcp-rate-limit.test.ts for
  * why), injected clock and log sinks (no console swapping, no timers). No
- * DB, no env mutation.
+ * DB, no env mutation; the installed-instance slot that installClientIp
+ * fills is reset at the end.
  *
  * Standalone: npx tsx src/middleware/client-ip.test.ts
  */
@@ -51,9 +56,12 @@ import {
   createStatsKey,
   createClientIpMiddleware,
   installClientIp,
+  getInstalledClientIpSnapshot,
+  __resetInstalledClientIpForTesting,
   type ClientIpConfig,
   type ClientIpMiddleware,
   type ClientIpMiddlewareOptions,
+  type ClientIpOpsSnapshot,
 } from "./client-ip";
 
 export interface TestSummary {
@@ -536,6 +544,18 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
       assertEq(r.send("198.51.100.7", flyXff("203.0.113.1"), T0 + 9_999), true, "T11k: no re-evaluation within 10 s of the last one");
       assertEq(r.send("198.51.100.7", flyXff("203.0.113.1"), T0 + 10_000), false, "T11k: evaluated (and tripped) at 10 s");
     }
+    // Ring size at its exact bound (review of PR #1102, S3): 5 one-minute
+    // buckets, so a 4- or 6-bucket ring fails one of these two.
+    {
+      const r = rig();
+      r.collapse(80, T0);
+      assertEq(r.send("198.51.100.7", flyXff("203.0.113.1"), T0 + 5 * MIN - 1), false, "T11n: collapse traffic 4 min 59.999 s old is still in the ring → trips");
+    }
+    {
+      const r = rig();
+      r.collapse(80, T0);
+      assertEq(r.send("198.51.100.7", flyXff("203.0.113.1"), T0 + 5 * MIN), true, "T11n: at exactly 5 min it has left the 5-bucket ring → closed");
+    }
     // Only requests that went via Fly-Client-IP count: a collapse onto Fly's
     // own internal address is already a fallback (G2) and never enforced.
     {
@@ -778,6 +798,74 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
     );
   }
 
+  // ── B1 pin (review of PR #1102, S1): only createStatsKey keys outlive the request ──
+  {
+    const pad = "x".repeat(14 * 1024);
+    for (const cfg of [SHADOW, ENFORCE]) {
+      let clock = T0 + 4 * MIN;
+      const mw = createClientIpMiddleware(cfg, { now: () => clock, log: () => {}, logError: () => {} });
+      // Legacy (XFF[0]) and edge (XFF[len-2]) both differ from Fly-Client-IP, so neither reuses fciKey.
+      const send = (fci: string, legacy: string, edge: string) =>
+        mw(fakeReq({ fci, xff: [legacy, edge, APP_IP].join(", "), ip: legacy }), {} as any, () => {});
+      for (let i = 1; i <= 10; i++) {
+        send(`198.51.100.${i}`, `${pad}L${i}`, `${pad}E${i}`);
+        send(`198.51.100.${i}`, `203.0.113.${i}`, `192.0.2.${i}`);
+      }
+      // Next stats window (the first one moves to history) and next breaker bucket (the first one stays in the ring).
+      clock = T0 + 5 * MIN;
+      for (let i = 1; i <= 10; i++) {
+        send(`2001:db8:${i}::1`, `${pad}L2${i}`, `${pad}E2${i}`);
+        send(`2001:db8:${i}::1`, `2001:db8:${100 + i}::9`, `192.0.2.${100 + i}`);
+      }
+      // 170 = open window (D_fci 10 + D_edge 20 + D_legacy 20 + 10 top keys × (1 + 2 legacy))
+      //     + history (10 top keys × 3) + breaker ring (2 buckets × (10 fci + 20 edge)).
+      const keys = mw.__retainedKeysForTesting();
+      const raw = keys.filter((k) => !/^[A-Za-z0-9_-]{16}$/.test(k));
+      assertTrue(
+        keys.length === 170 && raw.length === 0,
+        `B1 pin: ${cfg.mode} — all ${keys.length} keys held by the windows, top lists, history and breaker ring are 16-char stats keys${raw.length ? ` (raw: ${raw.length}, e.g. ${raw[0].slice(0, 40)}…)` : ""}`
+      );
+    }
+    // ipKeyGenerator is called in exactly one place — inside createStatsKey —
+    // so no new set or map can be keyed by its raw (client-controlled) output.
+    const code = fs
+      .readFileSync(path.join(__dirname, "client-ip.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+    assertEq(
+      [(code.match(/\bipKeyGenerator\(/g) ?? []).length, /\.update\(ipKeyGenerator\(ip\), "utf8"\)/.test(code)],
+      [1, true],
+      "B1 pin: client-ip.ts calls ipKeyGenerator( once, in createStatsKey's salted hash"
+    );
+  }
+
+  // ── Caps (review of PR #1102, S2): DISTINCT_CAP = 4096 per distinct set, TOP_CAP = 1024 top keys per window ──
+  {
+    const mw = createClientIpMiddleware(SHADOW, { now: () => T0, log: () => {}, logError: () => {} });
+    const ipAt = (i: number) => `198.51.${i >> 8}.${i & 255}`; // public IPv4, one limiter bucket each
+    const send = (i: number) => mw(fakeReq({ fci: ipAt(i), xff: flyXff(ipAt(i)), ip: ipAt(i) }), {} as any, () => {});
+    for (let i = 0; i < 1024; i++) send(i);
+    assertEq(mw.snapshot().top_overflow, 0, "caps: 1024 distinct clients all get a top-list entry");
+    send(1024);
+    send(0); // an entry made before the cap keeps counting
+    let s = mw.snapshot();
+    assertEq(
+      [s.top_overflow, s.top15m[0]?.n, s.top15m.length],
+      [1, 2, 5],
+      "caps: the 1025th distinct client overflows TOP_CAP, an existing entry still counts, top15m stays 5 long"
+    );
+    for (let i = 1025; i < 4096; i++) send(i);
+    s = mw.snapshot();
+    assertEq([s.D_fci, s.D_edge, s.D_legacy, s.distinct_capped], [4096, 4096, 4096, false], "caps: exactly 4096 distinct clients are all counted, not capped");
+    send(4096);
+    s = mw.snapshot();
+    assertEq(
+      [s.n, s.D_fci, s.D_edge, s.D_legacy, s.distinct_capped, s.top_overflow],
+      [4098, 4096, 4096, 4096, true, 4097 - 1024],
+      "caps: the 4097th distinct client is not added (D_* stay 4096) and sets distinct_capped; top_overflow counts every request without an entry"
+    );
+  }
+
   // ── T16: no raw IP in any logged line or snapshot ──
   {
     const ips = ["198.51.100.77", "203.0.113.88", "192.0.2.99", "2001:db8:beef:4200::7", "2001:db8:beef:4200::/56"];
@@ -798,6 +886,166 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
     assertTrue(out.some((l) => l.includes("client_ip_breaker")) && out.some((l) => l.includes("client_ip_stats")), "T16: the probe produced breaker, stats and snapshot output");
     const leaks = ips.filter((ip) => out.some((l) => l.includes(ip)));
     assertEq(leaks, [], "T16: no test IP (or its ipKeyGenerator form) appears in any logged line or snapshot");
+  }
+
+  // ── AC2 read-out (trinn 1b): getInstalledClientIpSnapshot → `clientIp` in GET /admin/analytics/ops/event-loop ──
+  {
+    // The stats line's additive counters, under their logged names.
+    const COUNTERS = ["n", "fci_valid", "fallback", "fallback_hc", "errors", "xff_client_supplied", "agree_fci_edge", "agree_legacy_eq_fci", "would_trip", "top_overflow"];
+    const pick = (o: any) => Object.fromEntries(COUNTERS.map((k) => [k, o?.[k]]));
+    const sum = (a: any, b: any): any =>
+      typeof a === "number" ? a + b : Object.fromEntries(Object.keys(a).map((k) => [k, sum(a[k], b?.[k])]));
+    const leaves = (o: any): number[] => (typeof o === "number" ? [o] : Object.values(o ?? {}).flatMap(leaves));
+    const iso = (t: number) => new Date(t).toISOString();
+    const quiet = { log: () => {}, logError: () => {} };
+    const snapshot = () => getInstalledClientIpSnapshot() as ClientIpOpsSnapshot;
+
+    __resetInstalledClientIpForTesting();
+    assertEq(getInstalledClientIpSnapshot(), null, "AC2 read-out: null while installClientIp has not run");
+
+    // Legacy is installed too, so off Fly, a rollback and a typo show as mode/reason, with nothing counted.
+    const legacies: Array<[string, ClientIpConfig]> = [
+      ["off Fly", LEGACY],
+      ["rollback CLIENT_IP_MODE=legacy", resolveClientIpConfig({ FLY_APP_NAME: "lokal", CLIENT_IP_MODE: "legacy" }, () => {})],
+      ["typo in CLIENT_IP_MODE", resolveClientIpConfig({ FLY_APP_NAME: "lokal", CLIENT_IP_MODE: "enforec" }, () => {})],
+    ];
+    for (const [label, cfg] of legacies) {
+      const mw = installClientIp(express(), cfg, { now: () => T0, ...quiet });
+      mw(fakeReq({ fci: "198.51.100.1", xff: flyXff("198.51.100.1"), ip: "198.51.100.1" }), {} as any, () => {});
+      const snap = snapshot();
+      assertEq(
+        [snap?.mode, snap?.on_fly, snap?.reason, snap?.since, snap?.breaker, snap?.window, Object.keys(snap?.since_boot ?? {}), leaves(snap?.since_boot).every((v) => v === 0)],
+        ["legacy", cfg.onFly, cfg.reason, null, { open: false, open_until: null, trips_total: 0 }, null, COUNTERS, true],
+        `AC2 read-out: legacy (${label}) → mode/reason shown, all counters 0, no window`
+      );
+    }
+
+    // Shadow: since_boot sums every counter of every window since the first one.
+    {
+      let clock = T0;
+      const lines: string[] = [];
+      const mw = installClientIp(express(), SHADOW, { now: () => clock, log: (l) => lines.push(l), logError: () => {} });
+      lines.length = 0; // the boot line
+      const send = (o: Parameters<typeof fakeReq>[0]) => mw(fakeReq(o), {} as any, () => {});
+      const sendXff = (fci: string, xff: string) => send({ fci, xff, ip: xff.split(",")[0].trim() });
+      // Window A (T0): every counter gets a non-zero value.
+      for (let i = 0; i < 80; i++) sendXff("198.51.100.7", flyXff(`203.0.113.${1 + (i % 20)}`)); // collapse shape
+      clock = T0 + 10_000;
+      sendXff("198.51.100.7", flyXff("203.0.113.1")); // the breaker evaluates → would_trip
+      for (let i = 0; i < 3; i++) sendXff("198.51.100.1", flyXff("198.51.100.1"));
+      sendXff("198.51.100.1", flyXff("198.51.100.1", "203.0.113.9")); // client-sent XFF
+      sendXff("198.51.100.2", flyXff("198.51.100.99")); // Fly-Client-IP ≠ Fly's own XFF entry
+      send({ path: "/health" }); // missing, health check
+      send({ xff: flyXff("198.51.100.3"), ip: "198.51.100.3" }); // missing
+      send({ fci: "garbage", xff: flyXff("198.51.100.4"), ip: "198.51.100.4" }); // invalid
+      send({ fci: "10.1.2.3", xff: flyXff("198.51.100.5"), ip: "198.51.100.5" }); // non_public
+      const throwingIp: any = fakeReq({ fci: "198.51.100.6", xff: flyXff("198.51.100.6") });
+      Object.defineProperty(throwingIp, "ip", { get() { throw new Error("boom"); } });
+      mw(throwingIp, {} as any, () => {}); // errors
+      for (let i = 0; i < 1030; i++) sendXff(`198.51.${10 + (i >> 8)}.${i & 255}`, flyXff(`198.51.${10 + (i >> 8)}.${i & 255}`)); // past TOP_CAP
+      // Window B (T0 + 5 min): its first request logs A.
+      clock = T0 + 5 * MIN;
+      sendXff("198.51.100.1", flyXff("198.51.100.1"));
+      send({ path: "/.well-known/agent-card.json" });
+      const lineA = JSON.parse(lines[0] ?? "{}");
+      const b = snapshot();
+      assertTrue(lines.length === 1 && leaves(pick(lineA)).every((v) => v > 0), "AC2 read-out: (setup) window A is logged with every counter non-zero");
+      assertEq(Object.keys(b?.since_boot ?? {}), COUNTERS, "AC2 read-out: since_boot holds exactly the stats line's additive counters, under the logged names");
+      assertEq(b?.since_boot, sum(pick(lineA), pick(b?.window)), "AC2 read-out: since_boot = logged window A + open window B, field by field");
+      assertEq(
+        [b?.mode, b?.on_fly, b?.reason, b?.since, b?.window?.window_start, b?.window?.n],
+        ["shadow", true, "default", iso(T0), iso(T0 + 5 * MIN), 2],
+        "AC2 read-out: mode/reason, since = the first window's start, window = the open one"
+      );
+      assertEq(b?.window, mw.snapshot(), "AC2 read-out: window is the open window exactly as the next client_ip_stats line is built from it");
+      assertEq(b?.breaker, { open: true, open_until: iso(T0 + 10_000 + BREAKER_OPEN_MS), trips_total: 1 }, "AC2 read-out: shadow — the simulated breaker, open until trip + 15 min");
+      // Window C (T0 + 10 min): A and B both folded in.
+      clock = T0 + 10 * MIN;
+      sendXff("198.51.100.8", flyXff("198.51.100.8", "192.0.2.8"));
+      const lineB = JSON.parse(lines[1] ?? "{}");
+      const c = snapshot();
+      assertEq(c?.since_boot, sum(sum(pick(lineA), pick(lineB)), pick(c?.window)), "AC2 read-out: since_boot keeps summing every closed window (A + B + open C)");
+      assertEq([c?.since, c?.since_boot.would_trip, c?.breaker.trips_total], [iso(T0), 1, 1], "AC2 read-out: since stays at the first window; would_trip since boot = trips_total");
+      const json = JSON.stringify(c);
+      assertTrue(!/198\.51\.|203\.0\.113\.|192\.0\.2\.|10\.1\.2\.3/.test(json), "AC2 read-out: no raw IP anywhere in the snapshot");
+      assertTrue(
+        c?.window?.top15m.length === 5 && c.window.top15m.every((t) => /^[0-9a-f]{12}$/.test(t.key)) && c.since_boot.top_overflow > 0,
+        "AC2 read-out: the top list is the bounded top-5 of 12-hex keys, with top_overflow"
+      );
+      assertTrue(json.length < 4096, `AC2 read-out: bounded size after 1100+ distinct clients (${json.length} B)`);
+      // No request since: the breaker state is as of now, not as of the last request.
+      clock = T0 + 10_000 + BREAKER_OPEN_MS;
+      const d = snapshot();
+      assertEq(
+        [d?.breaker, d?.window?.breaker_open, d?.since_boot.n],
+        [{ open: false, open_until: null, trips_total: 1 }, false, c?.since_boot.n],
+        "AC2 read-out: 15 min after the trip the breaker reads closed again without a request; nothing recounted"
+      );
+    }
+
+    // Enforce, over real HTTP: the accessor reads the instance installClientIp mounted (the last one).
+    {
+      const s = await startProbe(ENFORCE);
+      try {
+        for (let i = 0; i < 3; i++) {
+          await get(s.port, "/api/probe", { "Fly-Client-IP": "198.51.100.7", "X-Forwarded-For": flyXff("198.51.100.7", `203.0.113.${i}`) });
+        }
+        const snap = snapshot();
+        assertEq(
+          [snap?.mode, snap?.reason, snap?.since_boot.n, snap?.since_boot.xff_client_supplied, snap?.window?.D_fci, snap?.window?.D_legacy],
+          ["enforce", "env", 3, 3, 1, 3],
+          "AC2 read-out: over real HTTP, counts what the installed middleware saw"
+        );
+        assertEq(snap, s.mw.opsSnapshot(), "AC2 read-out: … and is that instance's own opsSnapshot");
+      } finally {
+        await s.close();
+      }
+    }
+
+    // The route: the existing handler gains exactly the clientIp field.
+    {
+      const analytics = require("../routes/analytics");
+      const router: any = analytics.default || analytics;
+      const stack: any[] = router.stack || [];
+      const layer = stack.find((l) => l.route && l.route.path === "/ops/event-loop" && l.route.methods.get);
+      assertTrue(!!layer, "AC2 route: GET /ops/event-loop is on the analytics router");
+      const call = (): { code: number; body: any } => {
+        let body: any = null;
+        let code = 200;
+        const res: any = { json(b: any) { body = b; return this; }, status(c: number) { code = c; return this; } };
+        layer.route.stack[0].handle({ query: {} }, res, () => {});
+        return { code, body };
+      };
+      if (layer) {
+        installClientIp(express(), SHADOW, { now: () => T0, ...quiet })(
+          fakeReq({ fci: "198.51.100.7", xff: flyXff("198.51.100.7", "203.0.113.5"), ip: "203.0.113.5" }), {} as any, () => {}
+        );
+        const ok = call();
+        assertEq([ok.code, ok.body?.clientIp], [200, getInstalledClientIpSnapshot()], "AC2 route: the response carries the installed snapshot as clientIp");
+        assertTrue(
+          ["timestamp", "summary", "stalls", "offThreadStats"].every((k) => k in (ok.body ?? {})) && !("persisted" in (ok.body ?? {})),
+          "AC2 route: the existing fields are all still there (no since_hours → no persisted)"
+        );
+        // A snapshot that fails (here: its clock throws) must not take the rest of the response down.
+        installClientIp(express(), SHADOW, { now: () => { throw new Error("clock"); }, ...quiet });
+        assertEq(getInstalledClientIpSnapshot(), { error: "snapshot_failed" }, "AC2 read-out: a failing snapshot gives { error }, never a throw");
+        const failing = call();
+        assertEq(
+          [failing.code, failing.body?.clientIp, typeof failing.body?.summary],
+          [200, { error: "snapshot_failed" }, "object"],
+          "AC2 route: a failing snapshot still gives 200 with the event-loop report"
+        );
+        __resetInstalledClientIpForTesting();
+        const none = call();
+        assertTrue(none.code === 200 && "clientIp" in (none.body ?? {}) && none.body.clientIp === null, "AC2 route: clientIp is null when the middleware is not installed");
+      }
+      assertEq(
+        stack.filter((l) => l.route && /client-?ip/i.test(String(l.route.path))).map((l) => l.route.path),
+        [],
+        "AC2 route: no client-ip route of its own (the read-out rides the existing handler, no new auth lines)"
+      );
+    }
+    __resetInstalledClientIpForTesting();
   }
 
   return { passed, failed, failures };

@@ -28,6 +28,7 @@ import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
 import { getOffThreadStatsState } from "../services/offthread-stats";
+import { getInstalledClientIpSnapshot } from "../middleware/client-ip";
 import { MEMORY_LIMIT_MB } from "../services/memory-thresholds";
 import {
   isRollupTableName,
@@ -1428,6 +1429,9 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
  * the slowest requests/jobs, and what is in flight right now.
  * The ring buffers are in-memory (reset on restart); add ?since_hours=N to also get
  * the persisted rows (14-day retention). Source: src/services/event-loop-monitor.ts.
+ * Also `clientIp`: the client-IP choke point's AC2 read-out (mode, breaker,
+ * since-boot counters, the open stats window; hashed keys only), null when
+ * the middleware is not installed. Source: src/middleware/client-ip.ts.
  */
 router.get("/ops/event-loop", (req: Request, res: Response) => {
   // ?since_hours=N (1..336): ALSO return the persisted rows (event_loop_events)
@@ -1454,6 +1458,9 @@ router.get("/ops/event-loop", (req: Request, res: Response) => {
     // Off-thread stats worker (traffic strips + /health counts): broken=true
     // means it fell back to the synchronous path (src/services/offthread-stats.ts).
     offThreadStats: getOffThreadStatsState(),
+    // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1b: what the
+    // shadow gate (AC2) is read from, beside the client_ip_stats log line.
+    clientIp: getInstalledClientIpSnapshot(),
   });
 });
 
