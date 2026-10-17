@@ -71,6 +71,10 @@ import {
   type ExperienceFact,
   type ExperienceFactWords,
 } from "../services/experience-page-facts";
+// dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: every
+// JSON-LD block, map data island and JSON value in an inline script on this
+// site goes through one serializer that escapes < > & U+2028 U+2029.
+import { serializeJsonForScript, jsonLdScriptTag } from "../services/safe-script-json";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang } from "../i18n/t";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
@@ -2114,12 +2118,7 @@ router.get("/", (req: Request, res: Response) => {
       parentOrganization: parentOrganizationJsonLd(),
     },
   ];
-  const ldScripts = jsonLd
-    .map(
-      (ld) =>
-        `<script type="application/ld+json">${JSON.stringify(ld).replace(/<\//g, "<\\/")}</script>`
-    )
-    .join("\n");
+  const ldScripts = jsonLd.map((ld) => jsonLdScriptTag(ld)).join("\n");
 
   const desc = S.metaDesc;
   // E2-S3: the default PNG card (it was the square app icon, favicon.svg).
@@ -3682,7 +3681,7 @@ function renderOpplevelseDetail(
     ],
   };
   const ldScripts = [ld, ...(service ? [service] : []), breadcrumb]
-    .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+    .map((o) => jsonLdScriptTag(o))
     .join("\n");
 
   // Build SEO title ≤70 chars: cascade full (with place) → without place → truncated
@@ -4340,7 +4339,6 @@ function renderFylkeMapSection(fylke: string, points: ExperienceMapPoint[], lang
     lon: p.loc_lon,
     precision: p.geo_precision,
   }));
-  const dataJson = JSON.stringify(markers).replace(/<\//g, "<\\/");
   const addressCount = markers.filter((m) => m.precision === "address").length;
   const kommuneCount = markers.length - addressCount;
   // Simple fylke-name-based OSM search link (spec explicitly allows this over
@@ -4355,7 +4353,7 @@ function renderFylkeMapSection(fylke: string, points: ExperienceMapPoint[], lang
     <div id="fylke-map" class="fylke-map" role="group" aria-label="Kart over ${markers.length} ${markers.length === 1 ? "opplevelse" : "opplevelser"} i ${escapeHtml(fylke)}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
     <p class="map-attribution-note">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
     <noscript><p class="map-noscript"><a href="${escapeHtml(osmSearchUrl)}" target="_blank" rel="noopener">Åpne kart over ${escapeHtml(fylke)} i OpenStreetMap →</a></p></noscript>
-    <script type="application/json" id="fylke-map-data">${dataJson}</script>
+    <script type="application/json" id="fylke-map-data">${serializeJsonForScript(markers)}</script>
     <script>${FYLKE_MAP_INIT_JS}</script>
   </section>`;
 }
@@ -4591,7 +4589,7 @@ function renderBrowsePage(opts: {
     })),
   };
   const ldScripts = [collectionLd, breadcrumbLd, ...(opts.extraJsonLd || [])]
-    .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+    .map((o) => jsonLdScriptTag(o))
     .join("\n");
   const faqHtml = opts.faqVisible
     ? renderFaqSectionHtml((opts.extraJsonLd || []).find((o) => o && o["@type"] === "FAQPage"))
@@ -5194,7 +5192,6 @@ function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string 
     lon: p.lon,
     approx: isApproxGardssalgConfidence(p.geocode_confidence),
   }));
-  const dataJson = JSON.stringify(markers).replace(/<\//g, "<\\/");
   const exactCount = markers.filter((m) => !m.approx).length;
   const approxCount = markers.length - exactCount;
   // Simple name-based OSM search link (same honesty rationale as the fylke
@@ -5209,7 +5206,7 @@ function renderGardssalgMapSection(points: GardssalgProviderMapPoint[]): string 
     <div id="gardssalg-map" class="fylke-map" role="group" aria-label="Kart over ${markers.length} ${markers.length === 1 ? "produsent" : "produsenter"}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
     <p class="map-attribution-note">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
     <noscript><p class="map-noscript"><a href="${escapeHtml(osmSearchUrl)}" target="_blank" rel="noopener">Åpne kart over gårdssalgprodusenter i OpenStreetMap →</a></p></noscript>
-    <script type="application/json" id="gardssalg-map-data">${dataJson}</script>
+    <script type="application/json" id="gardssalg-map-data">${serializeJsonForScript(markers)}</script>
     <script>${GARDSSALG_MAP_INIT_JS}</script>
   </section>`;
 }
@@ -5383,13 +5380,12 @@ function renderApproxPlacementCard(kommune: string | null | undefined, fylke: st
 // approx-legend branch is left in place rather than deleted: it is still
 // correct code, and removing it is unrelated surface area for this slice.
 function renderMiniMapSection(point: MiniMapPoint, osmLinkHtml: string): string {
-  const dataJson = JSON.stringify(point).replace(/<\//g, "<\\/");
   return `<div class="mini-map-wrap">
     ${point.approx ? `<p class="mini-map-legend"><span class="dot" aria-hidden="true"></span>Ca. posisjon (kommune)</p>` : ""}
     <div id="mini-map" class="mini-map" role="group" aria-label="Kart over ${escapeHtml(point.label)}"><p class="map-loading">Kartet lastes når du scroller hit …</p></div>
     <p class="mini-map-attribution">Kartdata © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>-bidragsytere</p>
     <noscript>${osmLinkHtml}</noscript>
-    <script type="application/json" id="mini-map-data">${dataJson}</script>
+    <script type="application/json" id="mini-map-data">${serializeJsonForScript(point)}</script>
     <script>${MINI_MAP_INIT_JS}</script>
   </div>`;
 }
@@ -5677,26 +5673,40 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     ? typeDef.lede(total)
     : "Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten.";
   // JSON-LD: the base page keeps its pre-S3 single CollectionPage blob
-  // byte-identically; type pages get their own CollectionPage + a
-  // BreadcrumbList mirroring the visible breadcrumb.
-  const jsonLd = typeDef
-    ? `<script type="application/ld+json">${JSON.stringify({
-        "@context": "https://schema.org",
-        "@type": "CollectionPage",
-        name: heroH1,
-        description: metaDesc,
-        url: canonical,
-      })}</script>
-<script type="application/ld+json">${JSON.stringify({
-        "@context": "https://schema.org",
-        "@type": "BreadcrumbList",
-        itemListElement: [
-          { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
-          { "@type": "ListItem", position: 2, name: "Gårdssalg og smaking", item: `${url}/kategori/gardssalg` },
-          { "@type": "ListItem", position: 3, name: typeDef.label, item: canonical },
-        ],
-      })}</script>`
-    : `<script type="application/ld+json">{"@context":"https://schema.org","@type":"CollectionPage","name":"Gårdssalg og smaking","description":"Lokale drikkeprodusenter med gårdsbesøk og smaking","url":"${url}/kategori/gardssalg"}</script>`;
+  // byte-identically (the same keys in the same order, now serialized by
+  // jsonLdScriptTag() instead of written out by hand); type pages get their
+  // own CollectionPage + a BreadcrumbList mirroring the visible breadcrumb.
+  const jsonLd = (typeDef
+    ? [
+        {
+          "@context": "https://schema.org",
+          "@type": "CollectionPage",
+          name: heroH1,
+          description: metaDesc,
+          url: canonical,
+        },
+        {
+          "@context": "https://schema.org",
+          "@type": "BreadcrumbList",
+          itemListElement: [
+            { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+            { "@type": "ListItem", position: 2, name: "Gårdssalg og smaking", item: `${url}/kategori/gardssalg` },
+            { "@type": "ListItem", position: 3, name: typeDef.label, item: canonical },
+          ],
+        },
+      ]
+    : [
+        {
+          "@context": "https://schema.org",
+          "@type": "CollectionPage",
+          name: "Gårdssalg og smaking",
+          description: "Lokale drikkeprodusenter med gårdsbesøk og smaking",
+          url: `${url}/kategori/gardssalg`,
+        },
+      ]
+  )
+    .map((o) => jsonLdScriptTag(o))
+    .join("\n");
   const breadcrumb = typeDef
     ? `<a href="/">Forsiden</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a> · ${escapeHtml(typeDef.label)}`
     : `<a href="/">Forsiden</a> · <a href="/opplevelser">Alle opplevelser</a> · Gårdssalg og smaking`;
@@ -6185,7 +6195,7 @@ router.get(
       ],
     };
     const ldScripts = [ld, breadcrumb]
-      .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+      .map((o) => jsonLdScriptTag(o))
       .join("\n");
 
     // Share image: the gårdssalg PNG card (E2-S3). The producer's name is in
@@ -6328,9 +6338,9 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
   var cta = document.getElementById("reserve-cta");
   if (!cta || !window.fetch) return;
   var decideOwnerCtaSwap = ${decideOwnerCtaSwap.toString()};
-  var providerId = ${JSON.stringify(provider.id)};
-  var portalHref = ${JSON.stringify(`/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`)};
-  var previewHref = ${JSON.stringify(bookHref)};
+  var providerId = ${serializeJsonForScript(provider.id)};
+  var portalHref = ${serializeJsonForScript(`/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`)};
+  var previewHref = ${serializeJsonForScript(bookHref)};
   fetch("/api/opplevelser/gardssalg-claim/" + encodeURIComponent(providerId) + "/session-status", { credentials: "same-origin" })
     .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
     .then(function (out) {
@@ -6577,12 +6587,12 @@ ${BROWSE_CSS}
       })
       .then(function (res) {
         if (res.ok && res.data && res.data.success && res.data.booking_ref) {
-          window.location.href = ${JSON.stringify(canonical)} + "/confirm/" + encodeURIComponent(res.data.booking_ref);
+          window.location.href = ${serializeJsonForScript(canonical)} + "/confirm/" + encodeURIComponent(res.data.booking_ref);
           return;
         }
         if (btn) btn.disabled = false;
         if (res.data && res.data.paused) {
-          if (status) status.textContent = res.data.message || ${JSON.stringify(BOOKING_NOT_ACTIVATED_MSG)};
+          if (status) status.textContent = res.data.message || ${serializeJsonForScript(BOOKING_NOT_ACTIVATED_MSG)};
           return;
         }
         if (status) status.textContent = "Noe gikk galt. Sjekk feltene og prøv igjen, eller last siden på nytt uten javascript.";
@@ -9028,7 +9038,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       { "@type": "ListItem", position: 2, name: "Søk", item: canonical },
     ],
   };
-  const ldScript = `<script type="application/ld+json">${JSON.stringify(breadcrumbLd).replace(/<\//g, "<\\/")}</script>`;
+  const ldScript = jsonLdScriptTag(breadcrumbLd);
 
   // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt
   // 3 (delt header/footer), /sok sub-slice: this page adopts the shared S1
@@ -9661,21 +9671,25 @@ ${oaSiteFooter({})}
 router.get("/for-tilbydere", (_req: Request, res: Response) => {
   const url = baseUrl();
   const canonical = `${url}/for-tilbydere`;
-  const jsonLd = `<script type="application/ld+json">${JSON.stringify({
-    "@context": "https://schema.org",
-    "@type": "WebPage",
-    name: "For tilbydere — ta eierskap til profilen din",
-    description: "Slik tar du eierskap til bedriftsprofilen din på Opplevagent: finn profilen, be om tilgangslenke og rediger selv.",
-    url: canonical,
-  })}</script>
-<script type="application/ld+json">${JSON.stringify({
-    "@context": "https://schema.org",
-    "@type": "BreadcrumbList",
-    itemListElement: [
-      { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
-      { "@type": "ListItem", position: 2, name: "For tilbydere", item: canonical },
-    ],
-  })}</script>`;
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      name: "For tilbydere — ta eierskap til profilen din",
+      description: "Slik tar du eierskap til bedriftsprofilen din på Opplevagent: finn profilen, be om tilgangslenke og rediger selv.",
+      url: canonical,
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+        { "@type": "ListItem", position: 2, name: "For tilbydere", item: canonical },
+      ],
+    },
+  ]
+    .map((o) => jsonLdScriptTag(o))
+    .join("\n");
   const main = `
   <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · For tilbydere</nav>
   <header class="head ft-hero">
@@ -9772,22 +9786,26 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
 router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
   const url = baseUrl();
   const canonical = `${url}/slik-fungerer-det`;
-  const jsonLd = `<script type="application/ld+json">${JSON.stringify({
-    "@context": "https://schema.org",
-    "@type": "WebPage",
-    name: "Slik fungerer Opplevagent",
-    description:
-      "Hvordan AI-assistenter henter informasjon om norske drikkeprodusenter fra Opplevagent, hva du får ved å overta profilen din, og hvordan booking av besøk fungerer.",
-    url: canonical,
-  })}</script>
-<script type="application/ld+json">${JSON.stringify({
-    "@context": "https://schema.org",
-    "@type": "BreadcrumbList",
-    itemListElement: [
-      { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
-      { "@type": "ListItem", position: 2, name: "Slik fungerer det", item: canonical },
-    ],
-  })}</script>`;
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      name: "Slik fungerer Opplevagent",
+      description:
+        "Hvordan AI-assistenter henter informasjon om norske drikkeprodusenter fra Opplevagent, hva du får ved å overta profilen din, og hvordan booking av besøk fungerer.",
+      url: canonical,
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+        { "@type": "ListItem", position: 2, name: "Slik fungerer det", item: canonical },
+      ],
+    },
+  ]
+    .map((o) => jsonLdScriptTag(o))
+    .join("\n");
   const main = `
   <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · Slik fungerer det</nav>
   <header class="head ft-hero">
@@ -10294,7 +10312,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
     ? "How to use Claude, ChatGPT, and other AI assistants with the opplevagent MCP server to find Norwegian experiences — every tool explained."
     : "Slik bruker du Claude, ChatGPT og andre AI-assistenter med opplevagent MCP-serveren for å finne norske opplevelser — alle verktøyene forklart.";
   const jsonLdScripts = [faqJsonLd]
-    .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+    .map((o) => jsonLdScriptTag(o))
     .join("\n");
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
