@@ -48304,6 +48304,28 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8, Daniel's decision 4=A):
+// Finn-tannlege.com says it is not affiliated with FINN.no — the one sentence from
+// brand-entities.ts in the footer of every dental page, on /om, in the Organization JSON-LD,
+// llms.txt, openapi.json, ai-plugin.json and the directory listing; FINN.no nowhere else and
+// no forbidden spelling of the name. Swaps DENTAL_DB_PATH (:memory:) and the dental modules
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dental-finn-disambiguation: Finn-tannlege set apart from FINN.no (G3-S8) ──");
+  try {
+    const { runDentalFinnDisambiguationTests } = require("../src/routes/dental-finn-disambiguation.test") as
+      typeof import("../src/routes/dental-finn-disambiguation.test");
+    const fd = await runDentalFinnDisambiguationTests({ log: false });
+    passed += fd.passed;
+    failed += fd.failed;
+    for (const f of fd.failures) failures.push("dental-finn-disambiguation: " + f);
+    console.log(`  dental-finn-disambiguation: ${fd.passed} passed, ${fd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-finn-disambiguation: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical (skive A):
 // sitemap role-gate (one batch query), two 404 umbrella slugs excluded, and the
 // shared BM event time-offset helper. Own in-memory DB; runSerial, tail position.

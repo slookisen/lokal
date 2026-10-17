@@ -10,8 +10,11 @@
 // same entries instead of keeping their own copies.
 //
 // Rules for editing:
-//   - Names are the ones the sites already print. A rename is Daniel's call
-//     (the Finn-tannlege name is still open), never a side effect of this file.
+//   - Names are the ones the sites already print. A rename is Daniel's call,
+//     never a side effect of this file. Finn-tannlege keeps its name (Daniel's
+//     decision 4=A, 2026-10-17) and every text sets it apart from FINN.no with
+//     the one `disambiguation` sentence below (G3-S8). «FINN» or «finn.no» is
+//     never an alternateName, a keyword or a sameAs.
 //   - Every URL is https and answered 200 to a GET on 2026-10-17 (logos as
 //     image/png). A page that does not exist yet is null, not a guess.
 //   - sameAs lists only profiles that exist. The brands have none yet; the
@@ -52,6 +55,13 @@ export interface BrandEntity {
   termsUrl: string | null;
   /** Prompts for an AI assistant with the connector; the guide (G3-S4) and the packs (G3-S6) show them. */
   exampleQueries: readonly string[];
+  /**
+   * G3-S8: the sentence that tells the brand apart from a better-known name it
+   * could be confused with, in Norwegian and English. Printed in the footer,
+   * on /om, in the machine-readable surfaces and in the directory listing,
+   * never in a heading or a main field. Only brands that need one have it.
+   */
+  disambiguation?: Readonly<{ nb: string; en: string }>;
 }
 
 export const WIKIDATA_ITEM_BASE = "https://www.wikidata.org/wiki/";
@@ -70,6 +80,7 @@ function entity(e: BrandEntity): Readonly<BrandEntity> {
   Object.freeze(e.alternateName);
   Object.freeze(e.sameAs);
   Object.freeze(e.exampleQueries);
+  if (e.disambiguation) Object.freeze(e.disambiguation);
   return Object.freeze(e);
 }
 
@@ -115,9 +126,10 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland",
     ],
   }),
-  // Not read by dental-seo.ts yet: that file is reserved for lokal#1086, and
-  // the dental wiring follows it. Logo, terms and docs are null until F2-S4
-  // (PNG), F2-S5 (/vilkar) and G3-S4 (/guide-tannlege-ai) ship.
+  // dental-seo.ts reads only `disambiguation` from here so far (G3-S8); its
+  // Organization moves to organizationJsonLd() in G3-S1-dental. Logo, terms
+  // and docs are null until F2-S4 (PNG), F2-S5 (/vilkar) and G3-S4
+  // (/guide-tannlege-ai) ship.
   dental: entity({
     name: "Finn-tannlege",
     alternateName: ["finn-tannlege.com"],
@@ -135,6 +147,13 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
       "Which dental clinics in Oslo have a Helfo agreement?",
       "I need emergency dental care in Rogaland tonight",
     ],
+    // Daniel's decision 4=A (A2A daniel-responses/2026-10-17-live-del-a-gjort-og-beslutninger-1-11.md).
+    // The name check (G3-J) also allows «har ingen tilknytning til FINN.no»; a
+    // lawyer's wording is changed here, and only here.
+    disambiguation: {
+      nb: `Finn-tannlege.com er en uavhengig tjeneste fra ${C.displayName} og er ikke tilknyttet FINN.no.`,
+      en: `Finn-tannlege.com is an independent service from ${C.displayName} and is not affiliated with FINN.no.`,
+    },
   }),
   company: entity({
     name: C.displayName,
