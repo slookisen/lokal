@@ -439,6 +439,106 @@ export function findRfbMarketingRecentBounces(db: Db, now: Date, ackMaxId: numbe
   return hits;
 }
 
+/**
+ * marketing-comms-agent charter guardrails `hard_bounce_rate` (max 0.05) and
+ * `opt_out_honored_pct` (min 1.0), measured from real events over the same
+ * RFB_MARKETING_BOUNCE_LOOKBACK_HOURS window G3 uses (bounces arrive after the
+ * send, so a per-run-only window would nearly always read 0). Measurement
+ * only: nothing here blocks, pauses or sends.
+ *
+ *   contacted        = distinct recipients RFB outreach mailed in the window
+ *                      (outreach_sent_log vertical 'rfb' + this job's ledger),
+ *                      each with the time of their FIRST contact in the window.
+ *   hard_bounce_rate = contacted recipients with an email_bounces row of
+ *                      bounce_type 'hard' and bounced_at in the window,
+ *                      divided by contacted. No sends → 0 (defined, nothing
+ *                      bounced).
+ *   opt_out_honored_pct = 1 - violations / contacted, where a violation is a
+ *                      contacted recipient whose opt-out was ALREADY on file
+ *                      when we mailed them: an agent_blocklist 'email' row
+ *                      created strictly before that first contact, or an
+ *                      email_bounces 'complaint' row bounced_at strictly
+ *                      before it. Opt-outs arriving after the send do not
+ *                      count against us. No sends → 1 (nothing violated).
+ */
+export interface RfbMarketingGuardrailMetrics {
+  window_hours: number;
+  window_since: string;
+  contacted: number;
+  hard_bounced: number;
+  hard_bounce_rate: number;
+  opt_out_violations: number;
+  opt_out_honored_pct: number;
+  hard_bounced_emails: string[];
+  opt_out_violation_emails: string[];
+}
+
+export function computeRfbMarketingGuardrailMetrics(db: Db, now: Date): RfbMarketingGuardrailMetrics {
+  const since = new Date(now.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);
+  const sinceSql = sqliteTimestamp(since);
+  const firstContact = new Map<string, string>();
+  const note = (email: string, ts: string) => {
+    if (!email) return;
+    const prev = firstContact.get(email);
+    if (prev === undefined || ts < prev) firstContact.set(email, ts);
+  };
+  const oslRows = db
+    .prepare(
+      `SELECT LOWER(TRIM(recipient_email)) AS email, replace(substr(sent_at, 1, 19), 'T', ' ') AS ts
+         FROM outreach_sent_log
+        WHERE vertical_id = 'rfb'
+          AND recipient_email IS NOT NULL AND TRIM(recipient_email) != ''
+          AND replace(substr(sent_at, 1, 19), 'T', ' ') >= ?`,
+    )
+    .all(sinceSql) as Array<{ email: string; ts: string }>;
+  for (const r of oslRows) note(r.email, r.ts);
+  const ledgerRows = db
+    .prepare(
+      `SELECT LOWER(TRIM(recipient_email)) AS email, replace(substr(reserved_at, 1, 19), 'T', ' ') AS ts
+         FROM rfb_marketing_send_ledger
+        WHERE status IN ${CONTACTED_LEDGER_STATUSES_SQL} AND reserved_at >= ?`,
+    )
+    .all(since.toISOString()) as Array<{ email: string; ts: string }>;
+  for (const r of ledgerRows) note(r.email, r.ts);
+
+  const hardStmt = db.prepare(
+    `SELECT 1 FROM email_bounces
+      WHERE LOWER(email) = ? AND bounce_type = 'hard'
+        AND replace(substr(bounced_at, 1, 19), 'T', ' ') >= ?
+      LIMIT 1`,
+  );
+  const blockStmt = db.prepare(
+    `SELECT 1 FROM agent_blocklist
+      WHERE identifier_type = 'email' AND LOWER(identifier_value) = ?
+        AND created_at IS NOT NULL AND replace(substr(created_at, 1, 19), 'T', ' ') < ?
+      LIMIT 1`,
+  );
+  const complaintStmt = db.prepare(
+    `SELECT 1 FROM email_bounces
+      WHERE LOWER(email) = ? AND bounce_type = 'complaint'
+        AND replace(substr(bounced_at, 1, 19), 'T', ' ') < ?
+      LIMIT 1`,
+  );
+  const hardBounced: string[] = [];
+  const violations: string[] = [];
+  for (const [email, firstTs] of [...firstContact.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    if (hardStmt.get(email, sinceSql)) hardBounced.push(email);
+    if (blockStmt.get(email, firstTs) || complaintStmt.get(email, firstTs)) violations.push(email);
+  }
+  const contacted = firstContact.size;
+  return {
+    window_hours: RFB_MARKETING_BOUNCE_LOOKBACK_HOURS,
+    window_since: since.toISOString(),
+    contacted,
+    hard_bounced: hardBounced.length,
+    hard_bounce_rate: contacted > 0 ? hardBounced.length / contacted : 0,
+    opt_out_violations: violations.length,
+    opt_out_honored_pct: contacted > 0 ? 1 - violations.length / contacted : 1,
+    hard_bounced_emails: hardBounced.slice(0, 50),
+    opt_out_violation_emails: violations.slice(0, 50),
+  };
+}
+
 export interface RfbMarketingHealthSignal {
   red: boolean;
   reasons: string[];
@@ -1553,6 +1653,31 @@ async function runRfbMarketingDailyGuarded(opts: {
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
         (report.health?.red ? ` health: ${report.health.reasons.join("; ")}` : "")
       ).slice(0, 490);
+      // Charter guardrails hard_bounce_rate / opt_out_honored_pct as numeric
+      // claims. Additive measurement: a failure here never affects the run.
+      const guardrailClaims: Array<{ type: "custom"; value: number; meta: Record<string, unknown> }> = [];
+      try {
+        const g = computeRfbMarketingGuardrailMetrics(db, new Date(report.finished_at));
+        const common = {
+          window_hours: g.window_hours,
+          window_since: g.window_since,
+          contacted: g.contacted,
+        };
+        guardrailClaims.push(
+          {
+            type: "custom",
+            value: g.hard_bounce_rate,
+            meta: { kind: "hard_bounce_rate", ...common, hard_bounced: g.hard_bounced, emails: g.hard_bounced_emails },
+          },
+          {
+            type: "custom",
+            value: g.opt_out_honored_pct,
+            meta: { kind: "opt_out_honored_pct", ...common, violations: g.opt_out_violations, emails: g.opt_out_violation_emails },
+          },
+        );
+      } catch (err) {
+        console.error("[rfb-marketing-daily] guardrail metrics not computed (non-fatal):", err);
+      }
       try {
         recordRun({
           run_id: report.run_id,
@@ -1634,6 +1759,7 @@ async function runRfbMarketingDailyGuarded(opts: {
               value: report.gate?.first?.count ?? 0,
               meta: { kind: "rfb_marketing_gate_summary", gate: report.gate },
             },
+            ...guardrailClaims,
           ],
           evidence: [
             {
