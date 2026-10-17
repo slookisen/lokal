@@ -16,13 +16,17 @@
  *   W   /sok: «tannlege i Bergen» shows clinics + «Tolket som», raw q is
  *       still what logWebSearch gets, form fields win, rollback switch.
  *   A   A2A message/send: the four agent-card examples find clinics;
- *       metadata.filter/tolkning; parseIntent still exported (pr113-03).
+ *       metadata.filter/tolkning; parseIntent still exported (pr113-03);
+ *       total (D3c): every clinic found, as MCP counts it, next to count
+ *       (the clinics in the answer); parseIntent typed as the store filter.
  *   G   the gazetteer cache runs listPoststeder(1) once per TTL for all three.
  *   T   /sok answers well under the 1 s stall limit on a 3,000-row fixture.
  *
  * Standalone: npx tsx src/routes/dental-natural-search.test.ts
  * Wired into tests/test.ts via runDentalNaturalSearchTests().
  */
+
+import type { DentalSearchParams } from "./dental-a2a";
 
 export interface TestSummary {
   passed: number;
@@ -365,11 +369,63 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
     assertEq(a2a.parseIntent("tannlege i Tromsø").fylke, undefined, "A10: «Tromsø» no longer becomes fylke Troms");
     process.env.DENTAL_QUERY_PARSER_DISABLED = "1";
     {
-      assertEq(a2a.parseIntent("kjeveortoped Bergen"), { q: "kjeveortoped bergen" }, "A11: switched off -> the old keyword parser");
+      assertEq(a2a.parseIntent("kjeveortoped Bergen"), { q: "kjeveortoped bergen" }, "A10b: switched off -> the old keyword parser");
       const resp = a2a.handleDentalMessageSend({ message: { text: "kjeveortoped Bergen" } }, "a2a-off") as any;
-      assertTrue(resp.result.metadata.tolkning === undefined, "A12: switched off -> no tolkning");
+      assertTrue(resp.result.metadata.tolkning === undefined, "A10c: switched off -> no tolkning");
     }
     delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+    {
+      // D3c: count is the clinics in the answer (at most 20), total every
+      // clinic that matches; the text names the total when it is the larger.
+      const answer = (message: Record<string, unknown>) => {
+        const resp = a2a.handleDentalMessageSend({ message }, "a2a-total") as any;
+        const data = resp.result.artifacts[1].parts[0].data;
+        return { resp, count: data.count, total: data.total, clinics: data.clinics.length, text: resp.result.artifacts[0].parts[0].text };
+      };
+      const all = answer({ text: "tannlege" });
+      assertEq(
+        [all.count, all.total, all.clinics, all.text],
+        [20, total, 20, `Fant ${total} tannlegeklinikk(er), viser de 20 første. / Found ${total} dental clinic(s), showing the first 20.`],
+        `A11: filter {} -> count 20, total ${total} and «Fant ${total} …, viser de 20 første»`
+      );
+      const bergen = answer({ text: "tannlege i Bergen" });
+      assertEq(
+        [bergen.count, bergen.total, bergen.text],
+        [bergenKommune, bergenKommune, `Fant ${bergenKommune} tannlegeklinikk(er). / Found ${bergenKommune} dental clinic(s).`],
+        "A12: all found on one page (Bergen) -> count = total and the old text"
+      );
+      const structured = answer({ data: {} });
+      assertEq([structured.count, structured.total, structured.text], [all.count, all.total, all.text], "A13: structured message.data {} counts its total too");
+      const vestland = answer({ data: { fylke: "Vestland" } });
+      assertEq([vestland.count, vestland.total], [bergenKommune, (await search({ fylke: "Vestland" })).count], "A13b: structured message.data {fylke} -> total = MCP tannlege_search count for the same fylke");
+      for (const ex of examples) {
+        assertEq(answer({ text: ex }).total, (await search({ query: ex })).count, `A14: agent-card example «${ex}»: A2A total = MCP tannlege_search count`);
+      }
+      const none = answer({ text: "tannlege i Hamar" });
+      const { a2aResultHasData } = require("../services/a2a-traffic-classifier") as typeof import("../services/a2a-traffic-classifier");
+      assertEq(
+        [none.count, none.total, none.text, a2aResultHasData(none.resp)],
+        [0, 0, "Ingen tannlegeklinikker funnet med de angitte filtrene. / No dental clinics found matching the given filters.", false],
+        "A15: no hits -> count 0, total 0, the old text, and the answer has no data (a2aResultHasData false)"
+      );
+    }
+    {
+      // DentalSearchParams is the store's ListFilter: the fields the parser
+      // sets are read here without a cast.
+      const bergen: DentalSearchParams["poststed_or_postnummer"] = a2a.parseIntent("tannlege i Bergen").poststed_or_postnummer;
+      const viken: DentalSearchParams["fylke_in"] = a2a.parseIntent("tannlege i Viken").fylke_in;
+      const tromso: DentalSearchParams = a2a.parseIntent("tannlege i Tromsø");
+      assertEq([bergen?.poststed_in, bergen?.postnummer_in.length], [["BERGEN", "Bergen"], 144], "A16: parseIntent «Bergen» has poststed_or_postnummer (both spellings, Bergen kommune's 144 postnumre)");
+      assertEq(viken, ["Viken", "Akershus", "Buskerud", "Østfold"], "A16b: parseIntent «Viken» has fylke_in");
+      assertTrue(tromso.fylke_in === undefined && tromso.fylke === undefined && tromso.poststed_or_postnummer !== undefined, "A16c: parseIntent «Tromsø» has no fylke_in (nor fylke), but the poststed + kommune");
+      process.env.DENTAL_QUERY_PARSER_DISABLED = "1";
+      try {
+        const off = ["tannlege i Bergen", "tannlege i Viken"].map((t) => a2a.parseIntent(t));
+        assertTrue(off.every((f) => f.poststed_or_postnummer === undefined && f.fylke_in === undefined), "A16d: switched off -> neither field (the old keyword parser)");
+      } finally {
+        delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+      }
+    }
 
     // ── G: one listPoststeder(1) per TTL ──────────────────────────────────
     {

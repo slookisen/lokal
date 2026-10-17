@@ -28,6 +28,7 @@ import {
   getDentalAgentByOrgnr,
   getDentalStats,
   listPoststeder,
+  type ListFilter,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import {
@@ -111,17 +112,10 @@ const SPECIALTIES = [
   "endodonti", "pedodonti", "oral protetikk", "kjeve- og ansiktsradiologi",
 ];
 
-export interface DentalSearchParams {
-  q?: string;
-  fylke?: string;
-  specialty?: string;
-  helfo_agreement?: "true" | "false";
-  acute_vakt?: 0 | 1;
-  // Set by the shared parser (see dental-store ListFilter).
-  poststed_in?: string[];
-  postnummer_in?: string[];
-  name_terms?: string[];
-}
+// The store's own list filter: what parseIntent, the planned text and
+// message.data give the search, so every field the parser sets
+// (poststed_or_postnummer, fylke_in, natural …) is typed as the store reads it.
+export type DentalSearchParams = ListFilter;
 
 export function parseIntent(text: string): DentalSearchParams {
   if (isDentalQueryParserDisabled()) return legacyParseIntent(text);
@@ -344,25 +338,31 @@ export function handleDentalMessageSend(
   // Default: list/search
   try {
     let tolkning: DentalSearchTolkning | null = null;
+    let total: number | null = null;
     if (messageText) {
       const plan = planDentalSearch({
         query: messageText,
         explicit: {},
         gazetteer: () => getDentalSearchGazetteer(listPoststeder),
-        count: (f) => countPublicDentalAgents(f as any),
+        count: (f) => countPublicDentalAgents(f as DentalSearchParams),
         legacy: (text) => ({ ...legacyParseIntent(text) }),
       });
       searchParams = plan.filter as DentalSearchParams;
       tolkning = plan.tolkning;
+      total = plan.count;
     }
 
-    // DentalSearchParams uses the store's own filter field names.
-    const results = listPublicDentalAgents(searchParams as any, 20, 0);
+    const results = listPublicDentalAgents(searchParams, 20, 0);
+    // D3c: total is every clinic that matches, not this page. Free text was
+    // counted by its plan; structured message.data is counted here.
+    total ??= countPublicDentalAgents(searchParams);
 
     const summaryText =
       results.length === 0
         ? "Ingen tannlegeklinikker funnet med de angitte filtrene. / No dental clinics found matching the given filters."
-        : `Fant ${results.length} tannlegeklinikk(er). / Found ${results.length} dental clinic(s).`;
+        : total > results.length
+          ? `Fant ${total} tannlegeklinikk(er), viser de ${results.length} første. / Found ${total} dental clinic(s), showing the first ${results.length}.`
+          : `Fant ${results.length} tannlegeklinikk(er). / Found ${results.length} dental clinic(s).`;
 
     return rpcOk(id, {
       taskId: `dental-search-${Date.now()}`,
@@ -379,8 +379,9 @@ export function handleDentalMessageSend(
           // dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4b):
           // the stored row with untrue values made honest (displayable phones,
           // acute_vakt only with provenance), no rating fields or
-          // field_provenance, plus the search card shared with MCP.
-          parts: [{ kind: "data", data: { count: results.length, clinics: results.map(toDentalA2aClinic) } }],
+          // field_provenance, plus the search card shared with MCP. count is
+          // the clinics in this answer; total (D3c) every clinic that matches.
+          parts: [{ kind: "data", data: { count: results.length, total, clinics: results.map(toDentalA2aClinic) } }],
         },
       ],
       metadata: {
