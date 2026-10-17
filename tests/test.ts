@@ -48573,12 +48573,17 @@ runSerial(async () => {
 
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (S3): shared Places match guard (services/places-match.ts). The
-// RFB rating routes write rating/address/phone only from a candidate whose
-// name and postal code / town match; dental's isConfidentPlaceMatch is pinned
-// to its pre-S3 behaviour. Swaps the getDb() singleton, the global fetch and
-// console.warn (restored in finally) — runSerial, tail position.
+// RFB rating routes write address/phone (and rating, with the S4-A2 lever set
+// back on) only from a candidate whose name and postal code / town match;
+// dental's isConfidentPlaceMatch is pinned to its pre-S3 behaviour. S4-A2:
+// by default neither route asks Google for a rating field or writes a rating,
+// the batch makes no Enterprise-tier call, and the Places call log marks a
+// rating call (GET /admin/places-usage counts them). Swaps the getDb()
+// singleton, the global fetch, console.warn, the S4-A2 rating-fetch lever and,
+// around each places-usage call, ENABLE_DENTAL (restored in finally) —
+// runSerial, tail position.
 runSerial(async () => {
-  console.log("\n── dev-request 2026-10-16 S3: shared Places match guard ──");
+  console.log("\n── dev-request 2026-10-16 S3 + S4-A2: shared Places match guard, no Google rating fetched ──");
   try {
     const { runRfbPlacesMatchGuardTests } = require("../src/routes/rfb-places-match-guard.test") as
       typeof import("../src/routes/rfb-places-match-guard.test");

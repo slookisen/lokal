@@ -12,6 +12,13 @@
  * router.handle()). global.fetch is mocked (no network); write:false so no DB
  * writes. adresse/telefon are filled on every row so the Brreg-first lookup
  * is skipped; opening_hours is NULL so rows stay in the auto-select pool.
+ *
+ * c) dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+ * places-treffvakt, S4-A2: the FieldMasks the batch sends are the pre-S4-A2
+ * ones verbatim and carry no Google rating field (dental builds them with
+ * placesFieldMask(…, false), whatever RFB's lever says; the lever itself is
+ * not flipped here, because this block does not run in the runSerial chain).
+ * Every one of them is in the Places call log, none marked as a rating call.
  */
 
 export interface TestSummary {
@@ -81,14 +88,19 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
     const dentalPath = require.resolve("./dental");
     const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([dbFactoryPath, dentalPath]);
 
+    const pm = require("../services/places-match") as typeof import("../services/places-match");
+    const masks: string[] = [];
     try {
       // No network: Google answers "no places" for every query.
-      (globalThis as any).fetch = async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({ places: [] }),
-        text: async () => "{}",
-      });
+      (globalThis as any).fetch = async (url: unknown, init?: any) => {
+        if (String(url).includes("places.googleapis.com")) masks.push(String(init?.headers?.["X-Goog-FieldMask"] ?? ""));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ places: [] }),
+          text: async () => "{}",
+        };
+      };
 
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
@@ -125,6 +137,19 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       db.prepare(`DELETE FROM dental_agents WHERE id IN ('n-zeta-nohp','n-bergen')`).run();
       const one = await callBatch(router, headers, { limit: 1, write: false });
       assertEq(idsOf(one), ["n-aasane"], "b1: limit=1 selects never-attempted 'Åsane' before 90+d-old 'Aa' retry");
+
+      // c) S4-A2: the masks sent above (Enterprise for the rows missing a
+      //    homepage, Pro for the rest).
+      const PRE_A2_MASKS = [
+        "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.regularOpeningHours,places.businessStatus,places.addressComponents",
+        "places.displayName,places.formattedAddress,places.regularOpeningHours,places.businessStatus,places.addressComponents",
+      ].sort();
+      const ratingField = (m: string) => m.split(",").some((f) => pm.PLACES_RATING_FIELDS.includes(f));
+      assertEq([...new Set(masks)].sort(), PRE_A2_MASKS, "c1: dental sends its pre-S4-A2 Enterprise and Pro masks, byte for byte");
+      assertEq(masks.filter(ratingField), [], "c2: no dental Places call asks for a Google rating field");
+      const logged = db.prepare(`SELECT endpoint FROM places_api_call_log`).all() as Array<{ endpoint: string }>;
+      assertEq([logged.length, [...new Set(logged.map((r) => r.endpoint))]], [masks.length, ["google-places-batch"]],
+        "c3: every dental Places call is logged with its mask, none marked as a rating call (+rating)");
     } catch (err: any) {
       failed++;
       failures.push("dental-places-batch-order: unexpected error: " + String(err?.stack || err));

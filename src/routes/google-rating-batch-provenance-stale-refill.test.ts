@@ -62,8 +62,10 @@
  *      worked before the fix (dedupKey differs by source_type) — kept as
  *      a regression guard so the fix doesn't accidentally change it.
  *   D. AC3 sanity: a genuine first-ever fill (no prior provenance at all)
- *      still reports *Written:true / correct googleRating/reviewCount
- *      fields exactly as before — the fix doesn't alter that shape.
+ *      still reports *Written:true exactly as before — the fix doesn't alter
+ *      that shape. Since S4-A2 of dev-request 2026-10-16-rfb-strukturerte-
+ *      data-tredjepartsrating-og-places-treffvakt the route fetches no Google
+ *      rating, so the row carries none and none is stored.
  *
  * Exercises the real POST /admin/google-rating-batch handler AND the real
  * GET /admin/pool-blocker-explain handler via router.handle directly (no
@@ -377,11 +379,14 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
 
     // ════════════════════════════════════════════════════════════════════
     // D. AC3 sanity — a genuine first-ever fill (no prior provenance at
-    // all) still reports *Written:true / correct rating fields exactly as
-    // before; the fix doesn't alter this shape (only the PHONE/ADDRESS
-    // written flags feed the GOOGLE_RATINGS_ADDED envelope counter, per
-    // the enrichment SKILL PHASE 6 — unaffected by this fix, which only
-    // touches what gets merged into field_provenance).
+    // all) still reports *Written:true exactly as before; the fix doesn't
+    // alter this shape (only the PHONE/ADDRESS written flags feed the
+    // GOOGLE_RATINGS_ADDED envelope counter, per the enrichment SKILL
+    // PHASE 6 — unaffected by this fix, which only touches what gets merged
+    // into field_provenance). S4-A2 (dev-request 2026-10-16-rfb-
+    // strukturerte-data-tredjepartsrating-og-places-treffvakt): Google's
+    // rating is no longer fetched, so the row carries none and none is
+    // stored, although the stubbed answer above still has 4.5/10.
     // ════════════════════════════════════════════════════════════════════
     {
       const id = "d-ac3-fresh-fill-sanity";
@@ -394,8 +399,10 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
       const result = batchResult.body?.data?.results?.[0];
       assertEq(result?.addressWritten, true, "Da: fresh fill still reports addressWritten:true");
       assertEq(result?.phoneWritten, true, "Db: fresh fill still reports phoneWritten:true");
-      assertEq(result?.googleRating, 4.5, "Dc: googleRating unaffected by the fix");
-      assertEq(result?.googleReviewCount, 10, "Dd: googleReviewCount unaffected by the fix");
+      assertTrue(!!result && !("googleRating" in result) && !("googleReviewCount" in result),
+        "Dc: no Google rating on the row (S4-A2: the rating is no longer fetched)");
+      const ratingRow = db.prepare(`SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?`).get(id) as any;
+      assertEq([ratingRow.google_rating, ratingRow.google_review_count], [null, null], "Dd: …and none stored");
 
       const after = await explain(id);
       assertEq(fieldSourceCount(after, "address"), 1, "De: a genuine first-ever fill correctly yields exactly 1 source (not fabricated to 2)");
