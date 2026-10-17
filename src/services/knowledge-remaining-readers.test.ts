@@ -375,8 +375,12 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
       const t = cs.openingHoursReplyText;
       assertEq(t([{ day: "mon", open: "10:00", close: "17:00" }, { day: "sunday", open: "12:00", close: "16:00" }]),
         "Man 10:00–17:00, Søn 12:00–16:00", "openingHoursReplyText: short and long day keys, as before");
-      assertEq(t([{ day: "Lørdag", open: "10:00", close: "14:00" }, { open: "09:00", close: "15:00" }]),
-        "Lørdag 10:00–14:00, 09:00–15:00", "openingHoursReplyText: an unknown day is shown as written; no day gives just the times");
+      // Slice I-H: "Lørdag" is a Norwegian day name (utils/opening-hours.ts), so
+      // it gets the short label like "saturday" does; a label that names no
+      // weekday is still shown as written.
+      assertEq(t([{ day: "Lørdag", open: "10:00", close: "14:00" }, { open: "09:00", close: "15:00" }, { day: "Lørdag i sesong", open: "11:00", close: "15:00" }]),
+        "Lør 10:00–14:00, 09:00–15:00, Lørdag i sesong 11:00–15:00",
+        "openingHoursReplyText: a Norwegian day name is a day (I-H); an unknown label is shown as written; no day gives just the times");
       assertEq(t("  Man–fre 10–17  "), "Man–fre 10–17", "openingHoursReplyText: text is shown trimmed");
       assertEq([t(""), t("   "), t([]), t(null), t(undefined), t(42), t({ mon: "10-17" }), t([null, 3, {}, "  ", { day: "mon" }])],
         ["", "", "", "", "", "", "", ""], "openingHoursReplyText: nothing usable gives no text");

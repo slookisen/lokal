@@ -5,6 +5,7 @@ import { marketplaceRegistry } from "./marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { formatAddressLine } from "../utils/address-format";
+import { openingHoursText } from "../utils/opening-hours";
 import { trustScoreService } from "./trust-score-service";
 import {
   COUNTABLE_CONV_SQL,
@@ -171,36 +172,19 @@ export interface ConversationMessage {
 }
 
 // ─── Integration test 2026-10-17 (I-G): opening hours of the auto-reply ────
-const REPLY_DAY_NAMES: ReadonlyMap<string, string> = new Map([
-  ["mon", "Man"], ["tue", "Tir"], ["wed", "Ons"], ["thu", "Tor"], ["fri", "Fre"], ["sat", "Lør"], ["sun", "Søn"],
-  ["monday", "Man"], ["tuesday", "Tir"], ["wednesday", "Ons"], ["thursday", "Tor"], ["friday", "Fre"],
-  ["saturday", "Lør"], ["sunday", "Søn"],
-]);
-
-/** One entry of an openingHours array as text: "" when it says nothing usable. */
-function openingHourReplyEntry(h: unknown): string {
-  if (typeof h === "string") return h.trim();
-  if (!h || typeof h !== "object") return "";
-  const { day, open, close } = h as Record<string, unknown>;
-  if (typeof open !== "string" || !open.trim() || typeof close !== "string" || !close.trim()) return "";
-  const dayLabel = typeof day === "string" ? REPLY_DAY_NAMES.get(day) || day : "";
-  return dayLabel ? `${dayLabel} ${open}–${close}` : `${open}–${close}`;
-}
-
 /**
  * The «Åpningstider» text of the seller's auto-reply, "" when there is none.
- * getAgentInfo hands openingHours over as an array of {day, open, close}
- * entries (today's format) or as free text such as "Man–fre 10–17"; a string
- * reached `.slice(0, 7).map` and threw the whole reply away. Same rule as
- * lokal_info (formatOpeningHoursForMcp in routes/mcp.ts): an entry with text
- * open and close renders as before, a text entry or a string is shown as it
- * is, and anything else is skipped (it rendered as "undefined"). At most 7
- * entries, as before.
+ * I-G: a string reached `.slice(0, 7).map` and threw the whole reply away.
+ * I-H: the entries and their text come from utils/opening-hours.ts
+ * (openingHoursText), the reading lokal_info (formatOpeningHoursForMcp in
+ * routes/mcp.ts) and the producer page use too, so the reply shows the same
+ * hours as they do: {day, open, close} renders as before ("Man
+ * 10:00–17:00"), the other stored forms and day names ("Lørdag", "Man-fre")
+ * are read, text is shown as it is, and anything unusable is skipped. At
+ * most 7 entries, as before.
  */
 export function openingHoursReplyText(openingHours: unknown): string {
-  if (typeof openingHours === "string") return openingHours.trim();
-  if (!Array.isArray(openingHours)) return "";
-  return openingHours.map(openingHourReplyEntry).filter(Boolean).slice(0, 7).join(", ");
+  return openingHoursText(openingHours, 7);
 }
 
 class ConversationService {

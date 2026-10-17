@@ -273,8 +273,10 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
         { open: "09:00", close: "12:00" },
         { day: "constructor", open: "08:00", close: "09:00" },
       ]);
-      assertEq(mixed, "\n## Åpningstider\nMan 10:00–17:00, Lør etter avtale, 09:00–12:00, constructor 08:00–09:00",
-        "AI-1 formatOpeningHoursForMcp: entries without text open/close are skipped, a text entry is shown, a missing day has no label");
+      // Slice I-H: number times count, as on the producer page ("10 – 17"),
+      // since all three readers share utils/opening-hours.ts.
+      assertEq(mixed, "\n## Åpningstider\nMan 10:00–17:00, Lør etter avtale, Tor 10–17, 09:00–12:00, constructor 08:00–09:00",
+        "AI-1 formatOpeningHoursForMcp: entries without both times are skipped, number times are their digits (I-H), a text entry is shown, a missing day has no label");
       assertTrue(!mixed.includes("undefined") && !mixed.includes("function"),
         "AI-1 formatOpeningHoursForMcp: no 'undefined' and no inherited object property in the text");
     }
