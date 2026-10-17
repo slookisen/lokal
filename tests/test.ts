@@ -42449,6 +42449,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-N (round 2:
+// AI2-02, AI-3a, AI-3b, AI2-08): lokal_info lists generic category labels as
+// «Kategorier:» without cart id or availability; lokal_search labels a match
+// resting on a label also for category words («egg i Bergen»), shows the
+// product that made a listed match, and puts explicit matches first
+// (discover()'s order within each group); HTML tags in descriptions are
+// removed or become line breaks. Well-formed data is byte-like main
+// (tests/fixtures/rfb-mcp-product-labels-main.json). Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-N (category labels, category words, explicit first, HTML in descriptions) ──");
+  try {
+    const { runMcpProductLabelsAndOrderTests } = require("../src/routes/mcp-product-labels-and-order.test") as
+      typeof import("../src/routes/mcp-product-labels-and-order.test");
+    const r = await runMcpProductLabelsAndOrderTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("mcp-product-labels-and-order: " + f);
+    console.log(`  mcp-product-labels-and-order: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-product-labels-and-order: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

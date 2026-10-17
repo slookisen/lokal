@@ -55,6 +55,7 @@ import { publicListableSql } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
+import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
 
 const router = Router();
 
@@ -142,6 +143,20 @@ function productNameOf(p: unknown): string {
   return typeof name === "string" ? name.trim() : "";
 }
 
+/** The note under lokal_info's «Kategorier:» line (I-N). */
+export const MCP_CATEGORY_LABELS_NOTE =
+  "_Dette er kategorinavn, ikke oppførte produkter — spør produsenten hva som selges. / " +
+  "These are category names, not listed products; ask the producer what they sell._";
+
+/**
+ * The product list of lokal_info (and of lokal_search's detailed view).
+ * Integration test 2026-10-17, slice I-N (AI2-02): an entry that is only a
+ * generic category label (isCategoryLabelProduct, e.g. «Honning» or «Kjøtt»
+ * written by the enrichment's category inference) is listed under
+ * «Kategorier:» instead, without a catalog id or availability: it is no
+ * product a cart could take or a stock status could be claimed for. Every
+ * other entry is rendered exactly as before.
+ */
 export function formatProductsForMcp(
   products: unknown,
   productIdByNorm?: Map<string, string>,
@@ -151,6 +166,8 @@ export function formatProductsForMcp(
 
   const lines: string[] = [];
   let productCount = 0;
+  // I-N: the category labels, once each (case-insensitive), as first written.
+  const categoryLabels = new Map<string, string>();
 
   for (const p of products) {
     const name = productNameOf(p);
@@ -169,6 +186,12 @@ export function formatProductsForMcp(
 
     // Skip noise
     if (isProductNoise(name)) continue;
+
+    if (isCategoryLabelProduct(p)) {
+      const key = cleanName.toLowerCase();
+      if (!categoryLabels.has(key)) categoryLabels.set(key, cleanName);
+      continue;
+    }
 
     // Product line
     const cat = typeof p.category === "string" && p.category && p.category !== "other" ? ` [${p.category}]` : "";
@@ -193,7 +216,12 @@ export function formatProductsForMcp(
     productCount++;
   }
 
-  return productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
+  const productSection = productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
+  const categorySection = categoryLabels.size
+    ? `\n**Kategorier:** ${[...categoryLabels.values()].join(", ")}\n${MCP_CATEGORY_LABELS_NOTE}`
+    : "";
+  // A blank line between the two, so the line is not read as part of the last list item.
+  return [productSection, categorySection].filter(Boolean).join("\n");
 }
 
 /**
@@ -226,13 +254,37 @@ function errorKindAndSite(err: unknown): string {
   return site ? `${err.name} ${site}` : err.name;
 }
 
+/**
+ * Contact + product summary of one search result. `products` is the
+ * producer's product list without section headers and noise (I-N reads it
+ * to tell a listed product from a category label); it is absent when the
+ * summary could not be built (no such agent, or a knowledge row that fails).
+ */
+interface AgentKnowledgeSummary {
+  contact?: any;
+  productSummary?: string;
+  productsCount: number;
+  products?: readonly unknown[];
+}
+
 // Build contact + product summary for a given agent ID, used by search results.
 // I-F: one row's error leaves its summary out (knowledgeRowOrSkip).
-function getAgentKnowledgeSummary(tool: string, agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
+function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledgeSummary {
   return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId));
 }
 
-function buildAgentKnowledgeSummary(agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
+/** The «🛒 …» line of a search result: the first five products with prices, and how many more there are. */
+function productSummaryText(realProducts: readonly unknown[]): string | undefined {
+  const topItems = realProducts.slice(0, 5).map((p: any) => {
+    const { cleanName, price } = parseProductPrice(p);
+    return price ? `${cleanName} (${price})` : cleanName;
+  });
+  return topItems.length
+    ? `🛒 ${topItems.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
+    : undefined;
+}
+
+function buildAgentKnowledgeSummary(agentId: string): AgentKnowledgeSummary {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return { productsCount: 0 };
 
@@ -249,20 +301,12 @@ function buildAgentKnowledgeSummary(agentId: string): { contact?: any; productSu
     return n && !isProductHeader(n) && !isProductNoise(n);
   });
 
-  // Compact view: top 5 product names with prices
-  const topItems = realProducts.slice(0, 5).map((p: any) => {
-    const { cleanName, price } = parseProductPrice(p);
-    return price ? `${cleanName} (${price})` : cleanName;
-  });
-
-  const productSummary = topItems.length
-    ? `🛒 ${topItems.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
-    : undefined;
-
   return {
     contact: Object.keys(contact).length ? contact : undefined,
-    productSummary,
+    // Compact view: top 5 product names with prices
+    productSummary: productSummaryText(realProducts),
     productsCount: realProducts.length,
+    products: realProducts,
   };
 }
 
@@ -349,6 +393,24 @@ function productsAreGenericCategoryNames(productsJson: string): boolean {
     .productsAreGenericCategoryNames(productsJson);
 }
 
+/** True when a product name is only a platform category name («Honning», «egg », «Bakervarer»). */
+export function isGenericCategoryName(name: string): boolean {
+  return productsAreGenericCategoryNames(JSON.stringify([name]));
+}
+
+/**
+ * Slice I-N (AI2-02): a product entry that is only a generic category label,
+ * the kind the enrichment's category inference writes as product names
+ * («Honning», «Kjøtt», «Egg»). The name rule is I-A's
+ * (productsAreGenericCategoryNames, per name). A category name with a price
+ * («Egg» at «60 kr/brett») is something the producer listed, and stays a
+ * product; category inference never writes a price.
+ */
+export function isCategoryLabelProduct(p: unknown): boolean {
+  const name = productNameOf(p);
+  return !!name && isGenericCategoryName(name) && !parseProductPrice(p as any).price;
+}
+
 /**
  * True when the product names a producer matched a search with
  * (DiscoverMeta.productMatches) include a real product. The registry's
@@ -358,6 +420,150 @@ function productsAreGenericCategoryNames(productsJson: string): boolean {
  */
 export function documentsListedProduct(matchedNames: readonly string[]): boolean {
   return matchedNames.length > 0 && !productsAreGenericCategoryNames(JSON.stringify(matchedNames));
+}
+
+/**
+ * documentsListedProduct, plus slice I-N: a matched category name that has a
+ * price in the producer's product list is a listed product too
+ * (isCategoryLabelProduct), as lokal_info lists it.
+ */
+function matchedListedProduct(matchedNames: readonly string[], products: readonly unknown[] | undefined): boolean {
+  if (documentsListedProduct(matchedNames)) return true;
+  if (!matchedNames.length || !products) return false;
+  const matched = new Set(matchedNames.map((n) => n.trim().toLowerCase()));
+  return products.some((p) => matched.has(productNameOf(p).toLowerCase()) && !isCategoryLabelProduct(p));
+}
+
+/**
+ * Slice I-N (AI-3a): the category words of a search that a match is labelled
+ * against. parseNaturalQuery turns each of them into a category but never
+ * into a product term (PRODUCT_TERM_EXCLUSIONS in marketplace-registry.ts,
+ * unchanged), so for «egg i Bergen» discover() has no product match that
+ * tells «Ferske egg fra Fana» from a bakery's label «Egg». This list only
+ * drives the labelling; the matching is untouched. Each word maps to the
+ * product categories whose products count for it; the first is the category
+ * parseNaturalQuery gives the word ("brød" also counts the enrichment's
+ * `bakery`). The words are Norwegian, as the product names are: an English
+ * query is read with the parser's own glossary («meat» → «kjøtt»). Drink
+ * words are not here: drink venues are found by category (Fase 5), and
+ * «Drikke» is no product word.
+ */
+const CATEGORY_LABEL_WORDS: Readonly<Record<string, readonly string[]>> = {
+  "grønnsaker": ["vegetables"], "grønt": ["vegetables"],
+  "frukt": ["fruit"],
+  "bær": ["berries"],
+  "meieri": ["dairy"],
+  "kjøtt": ["meat"],
+  "fisk": ["fish"], "sjømat": ["fish"],
+  "brød": ["bread", "bakery"], "bakervarer": ["bread", "bakery"],
+  "urter": ["herbs"],
+  "egg": ["eggs"],
+};
+
+/**
+ * The category words (CATEGORY_LABEL_WORDS) of `query`, and of the Norwegian
+ * terms parseNaturalQuery adds for its English food words
+ * (norwegianTermsForEnglishQuery), whose category the parser detected; in
+ * that order, once each. Words are whole tokens of the lower-cased text, with
+ * the letter class of the registry's norwegianWordBoundary, so «egg» is found
+ * in «egg i Bergen» and not in «eggerøre».
+ */
+export function categoryLabelWordsOf(query: string, categories: readonly string[] | undefined): string[] {
+  if (!categories?.length) return [];
+  const words: string[] = [];
+  const text = [query, ...norwegianTermsForEnglishQuery(query)].join(" ").toLowerCase();
+  for (const token of text.split(/[^0-9a-zà-öø-ÿ_]+/)) {
+    const productCategories = Object.prototype.hasOwnProperty.call(CATEGORY_LABEL_WORDS, token) ? CATEGORY_LABEL_WORDS[token] : undefined;
+    if (productCategories && categories.includes(productCategories[0]) && !words.includes(token)) words.push(token);
+  }
+  return words;
+}
+
+/** True when a product entry belongs to a category word: its name contains the word, or its category is one of the word's. */
+function productBelongsToWord(p: unknown, word: string): boolean {
+  if (productNameOf(p).toLowerCase().includes(word)) return true;
+  const category = (p as { category?: unknown }).category;
+  return typeof category === "string" && CATEGORY_LABEL_WORDS[word].includes(category.trim().toLowerCase());
+}
+
+/** A product without a category of its own (none, not text, or `other`), which could belong to any word. */
+function hasNoOwnCategory(p: unknown): boolean {
+  const category = (p as { category?: unknown }).category;
+  return typeof category !== "string" || !category.trim() || category.trim().toLowerCase() === "other";
+}
+
+/**
+ * How a producer's product list answers the category words of a search
+ * (slice I-N, AI-3a):
+ * - "listed": a product that is not a category label belongs to a word;
+ * - "label": only category labels do («Egg»);
+ * - "none": no product does, and every product that is not a label has a
+ *   category of its own, so none of them is a word's product unseen;
+ * - null: unknown — the list could not be read, or a product without a
+ *   category of its own («Poteter» for «grønnsaker») could be one.
+ */
+export function categoryWordEvidence(
+  products: readonly unknown[] | undefined,
+  words: readonly string[],
+): "listed" | "label" | "none" | null {
+  if (!products) return null;
+  let label = false;
+  let unknown = false;
+  for (const p of products) {
+    if (!productNameOf(p)) continue;
+    const isLabel = isCategoryLabelProduct(p);
+    if (words.some((w) => productBelongsToWord(p, w))) {
+      if (!isLabel) return "listed";
+      label = true;
+    } else if (!isLabel && hasNoOwnCategory(p)) {
+      unknown = true;
+    }
+  }
+  return label ? "label" : unknown ? null : "none";
+}
+
+/**
+ * The products a search matched, among the producer's products (slice I-N):
+ * a product term match is a name discover() matched (DiscoverMeta.productMatches),
+ * a category word match is productBelongsToWord. Category labels never count.
+ */
+function isListedMatch(p: unknown, matchedNames: ReadonlySet<string>, words: readonly string[]): boolean {
+  if (isCategoryLabelProduct(p)) return false;
+  return matchedNames.has(productNameOf(p).toLowerCase()) || words.some((w) => productBelongsToWord(p, w));
+}
+
+/**
+ * The products in the order their «🛒 …» summary shows them (slice I-N, AI-3a):
+ * unchanged when every listed match is among the first five; otherwise the
+ * listed matches come first, so the product that made the match is shown
+ * (Bønes Gårdsmat's «Ferske egg fra Fana» was its 7th product).
+ */
+function productsWithMatchesShown(products: readonly unknown[], isMatch: (p: unknown) => boolean): readonly unknown[] {
+  if (!products.slice(5).some(isMatch)) return products;
+  return [...products.filter(isMatch), ...products.filter((p) => !isMatch(p))];
+}
+
+/**
+ * Slice I-N (AI2-08): stored prose for MCP text. normalizeProse (entities
+ * decoded, internal notes dropped), then the HTML tags scraped text can carry
+ * («Liamyrane 6<br />5132 Nyborg»): a line break tag and the end of a block
+ * (</p>, </div>, </li>, </h1>…) become `lineBreak`, other tags are removed,
+ * and the lines are trimmed, with empty ones dropped. Only tag-shaped text
+ * counts as a tag («<b>», «</p>», «<a href=…>»), so «a < b» and «<3» stay;
+ * each pattern is linear in the text. Text without a tag is returned exactly
+ * as normalizeProse gives it.
+ */
+export function mcpProse(text: string | null | undefined, lineBreak = "\n"): string {
+  const prose = normalizeProse(text);
+  const withBreaks = prose
+    .replace(/<br\s*\/?>|<\/(?:p|div|li|h[1-6]|tr)\s*>/gi, "\n")
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*)?\/?>/g, "");
+  if (withBreaks === prose) return prose;
+  return withBreaks
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(lineBreak);
 }
 
 // ─── Tool definitions (shared logic) ────────────────────────
@@ -546,7 +752,53 @@ export function registerTools(
       // so AI can answer product/price questions directly without a second tool call
       const isSpecificQuery = results.length <= 3 && (parsed as any)._nameQuery;
 
-      const lines = results.map((r: any, i: number) => {
+      // Compact view for broader searches. ChatGPT app re-review 2026-10-03:
+      // a producer kept only for its broad category (`meat` for "lamb") says
+      // so, instead of reading like a documented match.
+      const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
+      // Slice I-N (AI-3a): a search with no product term, only category words
+      // («egg i Bergen», «meat»), is labelled against those words. A product
+      // term («honning», «reinsdyr») is the more specific evidence and keeps
+      // I-A's rule alone.
+      const labelWords = isSpecificQuery || productTerms.length ? [] : categoryLabelWordsOf(q, parsed.categories);
+      const terms = [...productTerms, ...labelWords].join("/");
+      const compactMatch = (r: any, summary: AgentKnowledgeSummary) => {
+        const reasons = (r.matchReasons as string[] | undefined) ?? [];
+        // Integration test 2026-10-17 (AI-3): a producer whose matched
+        // product names are only generic category labels («Honning», «Egg»)
+        // has no listed product. discover() hands over every matched name;
+        // its «Produkter: …» reason names at most three.
+        const matchedNames = discoverMeta.productMatches?.get(r.agent.id) ?? [];
+        const wordEvidence = labelWords.length ? categoryWordEvidence(summary.products, labelWords) : null;
+        const documented = matchedListedProduct(matchedNames, summary.products) || wordEvidence === "listed";
+        // Name matches bypass product scoring; absent product evidence in
+        // that branch must not turn a named lookup into a category match.
+        const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
+        // I-N: unknown evidence for category words (a product without a
+        // category of its own, such as «Poteter» for «grønnsaker») is no
+        // ground for a label.
+        const categoryOnly = (productTerms.length > 0 || wordEvidence !== null) && !documented && !nameMatch;
+        const categoryLabelOnly = matchedNames.length > 0 || wordEvidence === "label";
+        // I-N: the summary shows the product that made a listed match.
+        let productSummary = summary.productSummary;
+        if (documented && summary.products) {
+          const names = new Set(matchedNames.map((n) => n.trim().toLowerCase()));
+          const shown = productsWithMatchesShown(summary.products, (p) => isListedMatch(p, names, labelWords));
+          if (shown !== summary.products) productSummary = productSummaryText(shown);
+        }
+        return { categoryOnly, categoryLabelOnly, productSummary };
+      };
+
+      // Slice I-N (AI-3b): explicit matches come before category matches, as
+      // the server instructions ask; discover()'s order (relevance, distance)
+      // is kept within each group, and the numbering follows the new order.
+      const rows = results.map((r: any) => {
+        const summary = getAgentKnowledgeSummary("lokal_search", r.agent.id);
+        return { r, summary, match: isSpecificQuery ? undefined : compactMatch(r, summary) };
+      });
+      const ordered = [...rows.filter((row) => !row.match?.categoryOnly), ...rows.filter((row) => row.match?.categoryOnly)];
+
+      const lines = ordered.map(({ r, summary, match }, i: number) => {
         const agent = r.agent;
         // dev-request 2026-07-25 Fase 1c (honesty rule): distanceKm is only
         // present for address-precision producers. A centroid-precision row
@@ -557,9 +809,8 @@ export function registerTools(
           : agent.location?.distanceLabel
             ? ` — ${agent.location.distanceLabel} (omtrentlig posisjon)`
             : "";
-        const summary = getAgentKnowledgeSummary("lokal_search", agent.id);
 
-        if (isSpecificQuery) {
+        if (!match) {
           // Detailed view: include full product list with prices
           const sections = [formatAgentCompact(agent, i + 1, summary.contact, undefined, getClientIdentity?.()) + dist];
 
@@ -592,29 +843,13 @@ export function registerTools(
 
           return sections.join("\n");
         } else {
-          // Compact view for broader searches. ChatGPT app re-review
-          // 2026-10-03: a producer kept only for its broad category (`meat`
-          // for "lamb") says so, instead of reading like a documented match.
-          const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
-          const reasons = (r.matchReasons as string[] | undefined) ?? [];
-          // Integration test 2026-10-17 (AI-3): a producer whose matched
-          // product names are only generic category labels («Honning», «Egg»)
-          // has no listed product. discover() hands over every matched name;
-          // its «Produkter: …» reason names at most three. The order of the
-          // results stays as discover() gave it.
-          const matchedNames = discoverMeta.productMatches?.get(agent.id) ?? [];
-          const documented = documentsListedProduct(matchedNames);
-          const categoryLabelOnly = matchedNames.length > 0 && !documented;
-          // Name matches bypass product scoring; absent product evidence in
-          // that branch must not turn a named lookup into a category match.
-          const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
-          const categoryOnly = productTerms.length > 0 && !documented && !nameMatch;
-          const terms = productTerms.join("/");
+          // Compact view (compactMatch above).
+          const { categoryOnly, categoryLabelOnly, productSummary } = match;
           const categoryOnlyNote = !categoryOnly ? ""
             : categoryLabelOnly
               ? `\n   ⚠️ Kategoritreff: produktlista har «${terms}» bare som kategorinavn, ikke som et bestemt produkt — spør produsenten. / Category match only: the product list has «${terms}» only as a category name, not as a specific product; ask the producer.`
               : `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${terms}» — spør produsenten. / Category match only: the listed products don't mention «${terms}»; ask the producer.`;
-          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.(), categoryOnly ? {
+          return formatAgentCompact(agent, i + 1, summary.contact, productSummary, getClientIdentity?.(), categoryOnly ? {
             headingSuffix: categoryLabelOnly
               ? ` — Kategoritreff / category-only: «${terms}» bare som kategorinavn / category name only`
               : ` — Kategoritreff / category-only: «${terms}» ikke oppført / not listed`,
@@ -765,7 +1000,8 @@ export function registerTools(
         } else {
           // Strip an appended internal pipeline note (Daniel 2026-09-03) —
           // an AI agent must not relay the fleet's own working notes either.
-          sections.push(`\n${normalizeProse(k.about)}`);
+          // I-N (AI2-08): scraped HTML tags («<br />») are no text either.
+          sections.push(`\n${mcpProse(k.about)}`);
         }
       }
 
@@ -1509,7 +1745,8 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
     if (isJunkDescription(agent.description)) {
       console.log(`[description-guard] suppressed junk description (lokal_search) for ${agent.id} (${agent.name})`);
     } else {
-      lines.push(`   ${normalizeProse(agent.description)}`);
+      // I-N (AI2-08): a line break in scraped HTML keeps the result's indent.
+      lines.push(`   ${mcpProse(agent.description, "\n   ")}`);
     }
   }
 
