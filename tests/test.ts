@@ -36126,6 +36126,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3e): two clinics with the
+  //    same name in the same place get different titles and meta («i 0190
+  //    Oslo» or «(org.nr N)»); a page without a namesake is unchanged ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3e): dental namesake-titler ──");
+  try {
+    const { runDentalNamesakeTitlerTests } = require("../src/routes/dental-namesake-titler.test") as
+      typeof import("../src/routes/dental-namesake-titler.test");
+    const dnt = await runDentalNamesakeTitlerTests({ log: false });
+    passed += dnt.passed;
+    failed += dnt.failed;
+    for (const f of dnt.failures) failures.push("dental namesake-titler (D3e): " + f);
+    console.log(`  dental namesake-titler (D3e): ${dnt.passed} passed, ${dnt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental namesake-titler (D3e): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
   //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
   //    every 404, agents.txt API-base /api/tannlege ──

@@ -10,11 +10,12 @@ import {
   getDentalAgentById,
   listPoststeder,
   listRelatedClinics,
+  listDentalNamesakes,
   getDentalAgentsForSitemap,
   getDentalAggregateLastmods,
   isThinDentalProfile,
 } from "../services/dental-store";
-import type { DentalAgent, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
+import type { DentalAgent, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
@@ -364,6 +365,39 @@ export function isValidLocality(s: string | null | undefined): boolean {
   return true;
 }
 
+// ─── dev-request 2026-10-17-dental-d3-rettelser (D3e): namesakes ──────────
+/**
+ * What tells a clinic's page apart from the page of another clinic with the
+ * same name in the same place (listDentalNamesakes). Without it the two have
+ * the same <title> and meta description.
+ *   { place }  "<postnummer> <Poststed>", when the clinic's own postnummer is
+ *              a real one (not empty, not the placeholder 0000) that none of
+ *              the namesakes has;
+ *   { orgnr }  otherwise the org.nr, which no other row has;
+ *   null       no namesake, or no org.nr either: the page is as before.
+ * The street address is never used, because it can hold a c/o address.
+ */
+export type NamesakeDisambiguator = { place: string } | { orgnr: string };
+
+/** A stored postnummer that may be shown and is four digits, trimmed; else null. */
+function realPostnummer(pnr: string | null | undefined): string | null {
+  const value = shownPostnummer(pnr)?.trim();
+  return value && /^\d{4}$/.test(value) ? value : null;
+}
+
+export function namesakeDisambiguator(
+  agent: Pick<DentalAgent, "org_nr" | "postnummer" | "poststed">,
+  namesakes: ReadonlyArray<Pick<DentalNamesake, "postnummer">>
+): NamesakeDisambiguator | null {
+  if (namesakes.length === 0) return null;
+  const own = realPostnummer(agent.postnummer);
+  if (own && isValidLocality(agent.poststed) && namesakes.every((n) => realPostnummer(n.postnummer) !== own)) {
+    return { place: `${own} ${titleCasePoststed(agent.poststed!)}` };
+  }
+  const orgnr = agent.org_nr?.trim();
+  return orgnr ? { orgnr } : null;
+}
+
 /**
  * Build a unique, natural-Norwegian clinic description from structured fields.
  * Only states facts that are present in the data; omits clauses when the field
@@ -377,31 +411,39 @@ export function isValidLocality(s: string | null | undefined): boolean {
  *                      differentiating locality clause to the short variant
  *                      when it is at least 2.
  * @param short         If true, produce a meta-description-length string (≤160 chars).
+ * @param namesake      Optional (D3e): what tells the page apart from a
+ *                      namesake's (namesakeDisambiguator). The opening sentence
+ *                      then names the place with its postnummer, or ends with
+ *                      «Org.nr N.», and the short variant never cuts it.
  */
 export function buildClinicDescription(
   agent: DentalAgent,
   localityCount?: number,
-  short?: boolean
+  short?: boolean,
+  namesake?: NamesakeDisambiguator | null
 ): string {
   const parts: string[] = [];
 
   // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values
   const validPoststed = isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : null;
   const validFylke = isValidLocality(agent.fylke) ? agent.fylke! : null;
+  // "i 0190 Oslo" on a namesake's page (D3e); { place } implies a valid poststed.
+  const localityLabel = namesake && "place" in namesake ? namesake.place : validPoststed;
 
   const locPart = validPoststed
     ? validFylke && validFylke.toLowerCase() !== validPoststed.toLowerCase()
-      ? `i ${validPoststed}, ${validFylke}`
-      : `i ${validPoststed}`
+      ? `i ${localityLabel}, ${validFylke}`
+      : `i ${localityLabel}`
     : validFylke
     ? `i ${validFylke}`
     : null;
 
   // Opening sentence
+  const orgnrLabel = namesake && "orgnr" in namesake ? ` Org.nr ${namesake.orgnr}.` : "";
   if (locPart) {
-    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.`);
+    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.${orgnrLabel}`);
   } else {
-    parts.push(`${agent.navn} er en tannlegeklinikk.`);
+    parts.push(`${agent.navn} er en tannlegeklinikk.${orgnrLabel}`);
   }
 
   // Address
@@ -467,6 +509,10 @@ export function buildClinicDescription(
   if (short) {
     // Trim to ≤ 160 chars at sentence boundary
     if (full.length <= 160) return full;
+    // D3e: on a namesake's page the opening sentence tells the two pages
+    // apart, so it is kept whole. Only a very long name makes it longer than
+    // the cut, which would leave the two descriptions alike or end on «Org.».
+    if (namesake && parts[0]!.length > 157) return parts[0]!;
     let truncated = full.slice(0, 157);
     const lastDot = truncated.lastIndexOf(".");
     if (lastDot > 60) truncated = truncated.slice(0, lastDot + 1);
@@ -1723,6 +1769,18 @@ function renderClinicProfile(
     ? [breadcrumbJsonLd(profileBreadcrumbItems)]
     : [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3e): another clinic with
+  // the same name in the same place (any spelling of it) would share this
+  // page's title and meta description. The title then reads «i 0190 Oslo» or
+  // ends «(org.nr N)», and the meta's opening sentence says the same. H1 and
+  // the JSON-LD name stay the registered name. No namesake = no change.
+  let namesakes: DentalNamesake[] = [];
+  try {
+    const spellings = agent.poststed ? findStedGroup(slugifyText(agent.poststed))?.spellings : undefined;
+    namesakes = listDentalNamesakes(agent, spellings);
+  } catch { /* db not ready */ }
+  const namesake = namesakeDisambiguator(agent, namesakes);
+
   // ── orch-PR-20260613: unique meta description
   // Use rich om_oss (when not a placeholder) or a structured-field summary.
   // This replaces the old generic template that caused near-duplicate thin content
@@ -1738,7 +1796,7 @@ function renderClinicProfile(
     if (nonClinic) {
       return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring.`;
     }
-    return buildClinicDescription(agent, localityCount, true);
+    return buildClinicDescription(agent, localityCount, true, namesake);
   })();
 
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): a
@@ -1769,11 +1827,15 @@ function renderClinicProfile(
   // byte-identical to before this dev-request.
   // skive C: lab/holding get a neutral title; person_enk keeps the
   // sole-proprietor wording (display-name decision for ENK is a separate item).
+  // D3e: a namesake's page names its place with the postnummer or adds the
+  // org.nr, in all three templates; otherwise the place reads as before.
+  const titlePlace = namesake && "place" in namesake ? namesake.place : agent.poststed ? titleCasePoststed(agent.poststed) : null;
+  const titleLocality = `${titlePlace ? ` i ${titlePlace}` : ""}${namesake && "orgnr" in namesake ? ` (org.nr ${namesake.orgnr})` : ""}`;
   const profileTitleCore = nonClinic && agent.catalog_class !== "person_enk"
-    ? `${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
+    ? `${agent.navn}${titleLocality}`
     : isSoleProprietorProfile(agent)
-    ? `Tannlege ${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
-    : `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`;
+    ? `Tannlege ${agent.navn}${titleLocality}`
+    : `${agent.navn} — Tannlegeklinikk${titleLocality}`;
 
   const html = `
 <main>
