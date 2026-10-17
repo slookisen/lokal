@@ -14,7 +14,7 @@ import {
   getDentalAggregateLastmods,
   isThinDentalProfile,
 } from "../services/dental-store";
-import type { DentalAgent, PoststedRow, DentalAggregateLastmods } from "../services/dental-store";
+import type { DentalAgent, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
@@ -49,7 +49,7 @@ import { generalLimiter } from "../middleware/security";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
-import { planDentalSearch, type DentalSearchTolkning } from "../services/dental-query-parser";
+import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
@@ -367,7 +367,7 @@ export function isValidLocality(s: string | null | undefined): boolean {
  *
  * @param agent         The DentalAgent record.
  * @param localityCount Optional number of clinics in the agent's poststed, as
- *                      /sted/<poststed> shows it (see findStedRow). Adds a
+ *                      /sted/<poststed> shows it (see findStedGroup). Adds a
  *                      differentiating locality clause to the short variant
  *                      when it is at least 2.
  * @param short         If true, produce a meta-description-length string (≤160 chars).
@@ -758,6 +758,8 @@ function dentalFooter(): string {
 // ─── Shell layout ─────────────────────────────────────────────
 
 interface ShellOptions {
+  // Plain text: dentalShell escapes it, once, for <title>, og:title and
+  // twitter:title. An escaped title came out as «A&amp;amp;B» (D3b).
   title: string;
   description?: string;
   // Left out = the homepage. null = no canonical link and no og:url at all,
@@ -940,9 +942,11 @@ export function resolveListPage(
  * page). The gap mark between non-adjacent numbers is decoration and stands
  * for no page: every page is reachable through links, and the last page is
  * linked from every page. It used to link pages 1–10 only, with «... N» as
- * plain text, so page 11 and on could not be crawled. A currentPage past the
- * last page (/sok parses ?side= with no upper bound) gets the window at the
- * end and «Forrige» to the last page, never to a page that does not exist.
+ * plain text, so page 11 and on could not be crawled. Every list route,
+ * /sok included (D3b), resolves ?side= with resolveListPage, so it never
+ * asks for a page past the last one; if a caller does, the window sits at
+ * the end and «Forrige» goes to the last page, never to a page that does not
+ * exist.
  */
 export function paginationHtml(
   currentPage: number,
@@ -1155,10 +1159,11 @@ router.get("/", (_req: Request, res: Response) => {
   </section>
 
   ${(() => {
-    const topSteder = getCachedPoststeder().slice(0, 20);
+    // The 20 largest /sted groups, one chip per slug (D3b).
+    const topSteder = stedGroups().bySize.slice(0, 20);
     if (topSteder.length === 0) return "";
-    const chips = topSteder.map((p) =>
-      `<a href="/sted/${escapeHtml(slugifyText(p.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(p.poststed))}</a>`
+    const chips = topSteder.map((g) =>
+      `<a href="/sted/${escapeHtml(slugifyText(g.row.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(g.row.poststed))}</a>`
     ).join("");
     return `<section class="section">
     <div class="container">
@@ -1238,16 +1243,12 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
 // /api/tannlege quota for the enrichment workers.
 router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   const searchStarted = Date.now();
-  const PAGE_SIZE = 50;
   const q = String(req.query.q || "").trim();
   const fylke = String(req.query.fylke || "").trim();
   const spesialitet = String(req.query.spesialitet || "").trim();
   const helfo = req.query.helfo === "1";
   const akutt = req.query.akutt === "1";
   const kjede = String(req.query.kjede || "").trim();
-  const sideRaw = parseInt(String(req.query.side || "1"), 10);
-  const page = Number.isFinite(sideRaw) && sideRaw > 0 ? sideRaw : 1;
-  const offset = (page - 1) * PAGE_SIZE;
 
   // The form's own fields win over what the parser reads out of `q`
   // (dev-request 2026-10-16-tannlege-sok-naturlig-sprak, S3).
@@ -1261,6 +1262,7 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   let agents: Array<DentalAgent & { id: string }> = [];
   let total = 0;
   let tolkning: DentalSearchTolkning | null = null;
+  let filter: DentalSearchPlan["filter"] | null = null;
   try {
     const plan = planDentalSearch({
       query: q,
@@ -1270,8 +1272,17 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
     });
     tolkning = plan.tolkning;
     total = plan.count;
-    agents = listPublicDentalAgents(plan.filter as any, PAGE_SIZE, offset);
+    filter = plan.filter;
   } catch { /* db not ready */ }
+  // Count first, then the page, as on /fylke, /sted and /spesialitet: a
+  // ?side= past the last page is page 1 (D3b). It used to have no upper
+  // bound, so ?side=999 rendered «Ingen klinikker funnet — side 999 av 22».
+  const { page, offset, totalPages } = resolveListPage(req.query.side, total);
+  if (filter) {
+    try {
+      agents = listPublicDentalAgents(filter as any, DENTAL_LANDING_CONFIG.listPageSize, offset);
+    } catch { /* db not ready */ }
+  }
 
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: a search is
   // the first result page of a query or filter set (paging is not a new one).
@@ -1281,8 +1292,6 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
       resultCount: total,
     });
   }
-
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   // Build query string for pagination (preserve all filters)
   const filterParams = new URLSearchParams();
@@ -1382,7 +1391,7 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: q ? `${escapeHtml(q)} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
+    title: q ? `${q} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
     description: `Søk blant ${total} tannlegeklinikker i Norge. Filtrer på Helfo-avtale, spesialitet og fylke.`,
     canonical: `${DENTAL_BASE_URL}/sok`,
     // noindex on every /sok variant, with or without q (dev-request
@@ -1602,14 +1611,14 @@ function renderClinicProfile(
   // orch-PR-20260613: guard placeholder/empty om_oss; fall back to structured summary.
   const richDesc = !isPlaceholderDescription(agent.om_oss) ? agent.om_oss! : null;
   // «Det finnes N klinikker i X» (structured meta only): N is what
-  // /sted/<poststed> shows — same slug lookup, same count — so a place with
-  // 978 clinics no longer reads «21» (integrasjonstest IDX2-02, dev-request
-  // 2026-10-17-integrasjonstest-oppfolging I-Q). No /sted page, or no DB, = 0
-  // and the sentence is left out.
+  // /sted/<poststed> shows — same slug group, same filter, every spelling
+  // (D3b) — so a place with 978 clinics no longer reads «21» (integrasjonstest
+  // IDX2-02, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q). No /sted
+  // page, or no DB, = 0 and the sentence is left out.
   let localityCount = 0;
-  const stedRow = !richDesc && isValidLocality(agent.poststed) ? findStedRow(slugifyText(agent.poststed!)) : undefined;
-  if (stedRow) {
-    try { localityCount = countPublicDentalAgents({ poststed: stedRow.poststed }); } catch { /* db not ready */ }
+  const stedGroup = !richDesc && isValidLocality(agent.poststed) ? findStedGroup(slugifyText(agent.poststed!)) : undefined;
+  if (stedGroup) {
+    try { localityCount = countPublicDentalAgents(stedFilter(stedGroup)); } catch { /* db not ready */ }
   }
   const clinicJsonLdDesc = richDesc ?? buildClinicDescription(agent, localityCount, false);
   const jsonLd: Record<string, unknown> = {
@@ -1846,7 +1855,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   if (!matchedFylke) {
     sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Ukjent fylke</h3><p>Vi fant ikke «${escapeHtml(fylkeParam)}» i registeret.</p><a href="/#fylker" class="btn-secondary" style="margin-top:16px">Se alle fylker</a></div></div>`,
-      { title: `${escapeHtml(fylkeParam)} — Fylke ikke funnet | Finn-tannlege.com` }
+      { title: `${fylkeParam} — Fylke ikke funnet | Finn-tannlege.com` }
     );
     return;
   }
@@ -1866,15 +1875,16 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const pageMeta = listPageMeta(page, totalPages);
   const itemList = dentalItemListJsonLd(`Tannleger i ${matchedFylke.fylke}`, pageUrl, agents, offset);
 
-  // PR-116: Poststed chips for this fylke (≥2 clinics, max 30)
-  const fylkePoststeder = getCachedPoststeder()
-    .filter((p) => p.fylke && p.fylke.toLowerCase() === matchedFylke.fylke.toLowerCase() && p.count >= 2)
+  // PR-116: Poststed chips for this fylke (≥2 clinics, max 30). One chip per
+  // /sted group, with the group's count, in the fylke of its main row (D3b).
+  const fylkePoststeder = stedGroups().bySize
+    .filter((g) => g.row.fylke && g.row.fylke.toLowerCase() === matchedFylke.fylke.toLowerCase() && g.count >= 2)
     .slice(0, 30);
   const poststedChips = fylkePoststeder.length > 0
     ? `<div style="margin-top:40px">
   <div class="section-title" style="font-size:1rem;margin-bottom:10px">Steder i ${escapeHtml(matchedFylke.fylke)}</div>
   <div style="display:flex;flex-wrap:wrap;gap:8px">
-    ${fylkePoststeder.map((p) => `<a href="/sted/${escapeHtml(slugifyText(p.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(p.poststed))} <span style="font-size:.75em;opacity:.7">(${p.count})</span></a>`).join("")}
+    ${fylkePoststeder.map((g) => `<a href="/sted/${escapeHtml(slugifyText(g.row.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(g.row.poststed))} <span style="font-size:.75em;opacity:.7">(${g.count})</span></a>`).join("")}
   </div>
 </div>` : "";
 
@@ -1906,7 +1916,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `Tannleger i ${escapeHtml(matchedFylke.fylke)}${pageMeta.title} — Finn-tannlege.com`,
+    title: `Tannleger i ${matchedFylke.fylke}${pageMeta.title} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
     canonical: pageUrl,
     jsonLd: [itemList, fylkeBreadcrumb],
@@ -1961,7 +1971,6 @@ router.get("/om", (_req: Request, res: Response) => {
 
 function buildDentalSitemapXml(): string {
   {
-    const today = new Date().toISOString().split("T")[0];
     let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
     try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
@@ -1979,6 +1988,12 @@ function buildDentalSitemapXml(): string {
     let lastmods: DentalAggregateLastmods | null = null;
     try { lastmods = getDentalAggregateLastmods({ specialties: SPECIALTY_PAGES.map((sp) => sp.navn) }); } catch { /* db not ready */ }
     const lastmodTag = (d: string | null | undefined): string => (d ? `<lastmod>${d}</lastmod>` : "");
+    // One <url> in the order the sitemaps.org 0.9 XSD requires: loc, lastmod
+    // (optional), changefreq, priority (dev-request
+    // 2026-10-17-dental-d3-rettelser, D3b). <lastmod> used to come last,
+    // which made every <url> in the file fail the schema.
+    const urlTag = (loc: string, freq: string, pri: string, day?: string | null): string =>
+      `<url><loc>${loc}</loc>${lastmodTag(day)}<changefreq>${freq}</changefreq><priority>${pri}</priority></url>`;
 
     // Static pages. /sok is left out: it is noindex (F1-S1).
     const statics: Array<[string, string, string]> = [
@@ -1990,29 +2005,25 @@ function buildDentalSitemapXml(): string {
     ];
     for (const [p, freq, pri] of statics) {
       const day = p === "/" ? lastmods?.all : DENTAL_STATIC_PAGE_DATES[p];
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority>${lastmodTag(day)}</url>`;
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}${p === "/" ? "" : p}`, freq, pri, day)}`;
     }
 
     // Specialty pages (PR-112)
     for (const sp of SPECIALTY_PAGES) {
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}/spesialitet/${sp.slug}</loc><changefreq>weekly</changefreq><priority>0.8</priority>${lastmodTag(lastmods?.forSpecialty(sp.navn))}</url>`;
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/spesialitet/${sp.slug}`, "weekly", "0.8", lastmods?.forSpecialty(sp.navn))}`;
     }
 
     // Fylke pages (canonical only — PR-111)
     for (const f of canonicalFylker(stats.per_fylke)) {
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}/fylke/${encodeURIComponent(f.fylke)}</loc><changefreq>weekly</changefreq><priority>0.8</priority>${lastmodTag(lastmods?.forFylke(f.fylke))}</url>`;
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/fylke/${encodeURIComponent(f.fylke)}`, "weekly", "0.8", lastmods?.forFylke(f.fylke))}`;
     }
 
     // Sted pages (PR-116) — all poststeder with ≥1 clinic. One URL per slug:
     // two spellings of one place ("BERGEN", "Bergen") slug alike and used to
-    // be listed twice (integrasjonstest IDX-3). The first row wins, the one
-    // /sted/<slug> itself serves (findStedRow), so the lastmod is that page's.
-    const stedSlugs = new Set<string>();
-    for (const p of getCachedPoststeder()) {
-      const slug = slugifyText(p.poststed);
-      if (stedSlugs.has(slug)) continue;
-      stedSlugs.add(slug);
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}/sted/${slug}</loc><changefreq>weekly</changefreq><priority>0.75</priority>${lastmodTag(lastmods?.forPoststed(p.poststed))}</url>`;
+    // be listed twice (integrasjonstest IDX-3). The /sted groups keep the
+    // list's order, and the lastmod covers every spelling the page lists (D3b).
+    for (const [slug, group] of stedGroups().bySlug) {
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/sted/${slug}`, "weekly", "0.75", lastmods?.forPoststed(stedSpellings(group)))}`;
     }
 
     // Clinic pages — getDentalAgentsForSitemap for lastmod support (PR-116)
@@ -2025,11 +2036,11 @@ function buildDentalSitemapXml(): string {
         // W3C date (YYYY-MM-DD) like the Opplevagent and RFB sitemaps. updated_at
         // is SQLite datetime('now'), "2026-07-21 11:39:18" (space, no time zone),
         // which split("T") left whole on every /klinikk URL (integrasjonstest
-        // IDX2-01, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q). A
-        // value that is not a date falls back to today, as a missing one does.
+        // IDX2-01, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q).
+        // A missing value, or one that is not a date, gives no <lastmod>
+        // rather than the build day (F1-S2, D3b).
         const day = (a.updated_at || "").slice(0, 10);
-        const lastmod = /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : today;
-        xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${lastmod}</lastmod></url>`;
+        xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/klinikk/${slug}`, "monthly", "0.7", /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null)}`;
       }
     } else {
       // Fallback: batch from listPublicDentalAgents
@@ -2043,7 +2054,7 @@ function buildDentalSitemapXml(): string {
           if (!a.org_nr) continue;
           const slug = slugifyClinic(a.navn, a.org_nr);
           // No <lastmod> here rather than the build day (F1-S2).
-          xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>`;
+          xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/klinikk/${slug}`, "monthly", "0.7")}`;
         }
         batchOffset += BATCH;
         if (batch.length < BATCH) break;
@@ -2645,32 +2656,78 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
 // GET /sted/:stedSlug  (PR-116 — bysider)
 // ═══════════════════════════════════════════════════════════
 
-// The poststed row behind /sted/<slug>, from the cached poststed list. The
-// first row wins when two spellings slug alike; the list is ordered by count,
-// so that is the highest-count spelling. The clinic page's «Det finnes N
-// klinikker i X» uses the same lookup, so it names the same place and count.
-// The slug map is rebuilt only when the cache hands out a new list (once per
-// TTL), not on every /sted and /klinikk request.
-let _stedSlugMap: { rows: PoststedRow[]; bySlug: Map<string, PoststedRow> } | null = null;
+// The place behind /sted/<slug>, from the cached poststed list. Every stored
+// spelling of a place slugs alike ("BERGEN" and "Bergen" are both
+// /sted/bergen), so a slug is a group (dev-request
+// 2026-10-17-dental-d3-rettelser, D3b / IDX-3):
+//   row        the first row with the slug. The list is ordered by count, so
+//              that is the highest-count spelling; the page's title,
+//              breadcrumb and fylke come from it, as before.
+//   spellings  every stored spelling with the slug, most clinics first.
+//   count      the clinics of all the spellings together.
+// The /sted page, its sitemap lastmod, the clinic page's «Det finnes N
+// klinikker i X» and the place chips on / and /fylke all read the group, so
+// they name the same place and count. They used to read the row alone, so
+// /sted/bergen listed 164 of Bergen's 207 clinics and /fylke/Vestland had a
+// chip per spelling. Different slugs are never merged (OS is not OSLO). The
+// groups are rebuilt only when the cache hands out a new list (once per TTL),
+// not on every /, /fylke, /sted and /klinikk request.
+export interface StedGroup {
+  row: PoststedRow;
+  spellings: string[];
+  count: number;
+}
+let _stedGroups: { rows: PoststedRow[]; bySlug: Map<string, StedGroup>; bySize: StedGroup[] } | null = null;
 
-function findStedRow(stedSlug: string): PoststedRow | undefined {
+function stedGroups(): { bySlug: Map<string, StedGroup>; bySize: StedGroup[] } {
   const rows = getCachedPoststeder();
-  if (!_stedSlugMap || _stedSlugMap.rows !== rows) {
-    const bySlug = new Map<string, PoststedRow>();
+  if (!_stedGroups || _stedGroups.rows !== rows) {
+    const bySlug = new Map<string, StedGroup>();
     for (const p of rows) {
       const slug = slugifyText(p.poststed);
-      if (!bySlug.has(slug)) bySlug.set(slug, p);
+      const group = bySlug.get(slug);
+      if (group) {
+        group.spellings.push(p.poststed);
+        group.count += p.count;
+      } else {
+        bySlug.set(slug, { row: p, spellings: [p.poststed], count: p.count });
+      }
     }
-    _stedSlugMap = { rows, bySlug };
+    // Largest group first, for the chips; a tie keeps the list's order (sort is stable).
+    const bySize = [...bySlug.values()].sort((a, b) => b.count - a.count);
+    _stedGroups = { rows, bySlug, bySize };
   }
-  return _stedSlugMap.bySlug.get(stedSlug);
+  return _stedGroups;
+}
+
+export function findStedGroup(stedSlug: string): StedGroup | undefined {
+  return stedGroups().bySlug.get(stedSlug);
+}
+
+function findStedRow(stedSlug: string): PoststedRow | undefined {
+  return findStedGroup(stedSlug)?.row;
+}
+
+// The spellings a /sted page lists: as many as the store's poststed_in takes,
+// each within its length limit, the way the search parser builds poststed_in.
+// A place with one spelling (or one usable spelling) keeps its row's.
+function stedSpellings(group: StedGroup): string[] {
+  const values = group.spellings.filter((v) => v.length <= MAX_TERM_CHARS).slice(0, MAX_POSTSTED_IN);
+  return values.length > 1 ? values : [group.row.poststed];
+}
+
+// The store filter for a /sted page's clinics. One spelling gives the same
+// { poststed } filter as before, so the SQL for such a place is unchanged.
+export function stedFilter(group: StedGroup): ListFilter {
+  const spellings = stedSpellings(group);
+  return spellings.length > 1 ? { poststed_in: spellings } : { poststed: spellings[0]! };
 }
 
 router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   const stedSlugParam = String(req.params.stedSlug).toLowerCase().trim();
 
-  const stedRow = findStedRow(stedSlugParam);
-  if (!stedRow) {
+  const stedGroup = findStedGroup(stedSlugParam);
+  if (!stedGroup) {
     sendDentalNotFound(res,
       `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Sted ikke funnet</h3><p>Vi fant ikke tannleger for «${escapeHtml(stedSlugParam)}».</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div></main>`,
       { title: "Sted ikke funnet — Finn-tannlege.com" }
@@ -2678,14 +2735,17 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     return;
   }
 
+  const stedRow = stedGroup.row;
   const titledSted = titleCasePoststed(stedRow.poststed);
-  // Count first, so a ?side= past the last page falls back to page 1 (F1-S1).
+  // Every spelling of the place (D3b). Count first, so a ?side= past the
+  // last page falls back to page 1 (F1-S1).
+  const filter = stedFilter(stedGroup);
   let total = 0;
-  try { total = countPublicDentalAgents({ poststed: stedRow.poststed } as any); } catch { /* db not ready */ }
+  try { total = countPublicDentalAgents(filter); } catch { /* db not ready */ }
   const { page, offset, totalPages } = resolveListPage(req.query.side, total);
   let agents: Array<DentalAgent & { id: string }> = [];
   try {
-    agents = listPublicDentalAgents({ poststed: stedRow.poststed } as any, DENTAL_LANDING_CONFIG.listPageSize, offset);
+    agents = listPublicDentalAgents(filter, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* db not ready */ }
 
   const canonicalUrl = `${DENTAL_BASE_URL}/sted/${stedSlugParam}`;
@@ -2732,7 +2792,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `Tannlege i ${escapeHtml(titledSted)}${pageMeta.title} — Finn-tannlege.com`,
+    title: `Tannlege i ${titledSted}${pageMeta.title} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
     canonical: pageUrl,
     // skive A: a /sted page with 0 active clinics must never be indexable.

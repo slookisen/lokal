@@ -3,9 +3,12 @@
  * 2026-10-17-integrasjonstest-oppfolging, skive I-Q (integrasjonstest runde 2).
  *
  *   IDX2-01  sitemap <lastmod> for /klinikk is a W3C date (YYYY-MM-DD); it was
- *            SQLite datetime ("2026-07-21 11:39:18") on every clinic URL.
+ *            SQLite datetime ("2026-07-21 11:39:18") on every clinic URL. A
+ *            missing or junk updated_at gives no <lastmod>, never the build
+ *            day (dev-request 2026-10-17-dental-d3-rettelser, D3b).
  *   IDX2-02  the clinic meta «Det finnes N klinikker i X» gives the count
  *            /sted/<x> shows; it was a related-clinics list capped at 20, + 1.
+ *            /sted/<x> counts every spelling of the place (D3b).
  *   RYS-1    every HTML 404 (catch-all and the seven route branches) sends
  *            robots "noindex, follow"; it inherited "index, follow".
  *   MCP-02   agents.txt API-base is /api/tannlege (the REST mount), not the
@@ -166,14 +169,20 @@ export async function runDentalSeoLastmodAntall404AgentsTxtTests(
       dentalSeo.__resetDentalSitemapCacheForTesting();
       const sm = await callRoute(router, "/sitemap.xml");
       assertEq(sm.status, 200, "A1: GET /sitemap.xml -> 200");
-      const lastmodFor = (slug: string): string | null => {
-        const m = sm.text.match(new RegExp(`<loc>${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/klinikk/${slug}</loc>.*?<lastmod>([^<]*)</lastmod>`));
-        return m ? m[1]! : null;
-      };
+      // /klinikk/<slug> -> its <lastmod> (null when the URL has none), from each <url>.
+      const klinikkLastmod = new Map<string, string | null>();
+      for (const m of sm.text.matchAll(/<url>(.*?)<\/url>/g)) {
+        const loc = (m[1]!.match(/<loc>([^<]*)<\/loc>/) || [])[1] ?? "";
+        if (loc.startsWith(`${base}/klinikk/`)) {
+          klinikkLastmod.set(loc.slice(`${base}/klinikk/`.length), (m[1]!.match(/<lastmod>([^<]*)<\/lastmod>/) || [])[1] ?? null);
+        }
+      }
+      const lastmodFor = (slug: string): string | null | undefined => klinikkLastmod.get(slug);
       assertEq(lastmodFor(oslo[0]!.slug), "2026-07-21", "A2: SQLite datetime updated_at -> date only (regression: was «2026-07-21 11:39:18»)");
       assertEq(lastmodFor(oslo[1]!.slug), "2026-08-02", "A3: ISO updated_at -> date only");
-      assertEq(lastmodFor(oslo[2]!.slug), today, "A4: missing updated_at -> today (unchanged fallback)");
-      assertEq(lastmodFor(oslo[3]!.slug), today, "A5: updated_at that is not a date -> today, never echoed");
+      assertEq(lastmodFor(oslo[2]!.slug), null, "A4: missing updated_at -> listed with no <lastmod> (D3b; regression: the build day)");
+      assertEq(lastmodFor(oslo[3]!.slug), null, "A5: updated_at that is not a date -> listed with no <lastmod> (D3b; regression: the build day)");
+      assertTrue(!sm.text.includes("ukjent"), "A5b: the junk value is echoed nowhere in the sitemap");
       // createDentalAgent stamps datetime('now') — the shape of every prod row.
       assertEq(lastmodFor(oslo[4]!.slug), today, "A6: default datetime('now') updated_at -> today's date");
       const all = Array.from(sm.text.matchAll(/<lastmod>([^<]*)<\/lastmod>/g), (m) => m[1]!);
@@ -181,6 +190,13 @@ export async function runDentalSeoLastmodAntall404AgentsTxtTests(
       assertTrue(klinikkCount >= 30, `A7: fixture sanity — sitemap lists the clinics (${klinikkCount})`);
       assertTrue(all.length > klinikkCount, "A8: fixture sanity — sitemap has non-clinic URLs too");
       assertEq(all.filter((v) => !/^\d{4}-\d{2}-\d{2}$/.test(v)), [], "A9: every <lastmod> in the sitemap is YYYY-MM-DD");
+
+      // D3b: a /klinikk URL carries the build day only when its own row
+      // changed that day; no row falls back to it.
+      const updatedAtBySlug = new Map(store.getDentalAgentsForSitemap().map((r) => [dentalSeo.slugifyClinic(r.navn, r.org_nr), r.updated_at]));
+      const todays = [...klinikkLastmod].filter(([, d]) => d === today);
+      assertTrue(todays.length > 0, "A10a: fixture sanity — rows created today carry today");
+      assertEq(todays.filter(([slug]) => !String(updatedAtBySlug.get(slug) ?? "").startsWith(today)).map(([slug]) => slug), [], "A10: no /klinikk lastmod is the build day without an updated_at from that day");
     }
 
     // ── B. IDX2-02: «Det finnes N klinikker i X» = the /sted count ───────
@@ -213,10 +229,10 @@ export async function runDentalSeoLastmodAntall404AgentsTxtTests(
       assertEq(soloPage.status, 200, "B13: single-clinic place page -> 200");
       assertEq(finnesSentence(soloPage.text), null, "B14: one clinic in the place -> no count sentence (never «1 klinikker»)");
 
-      // Two spellings, one slug: the clinic page names the same row /sted does.
+      // Two spellings, one slug: /sted and the clinic page count both (D3b).
       const stedBergen = await callRoute(router, "/sted/bergen");
       const nBergen = stedCount(stedBergen.text);
-      assertEq(nBergen, 3, "B15: /sted/bergen uses the highest-count spelling (BERGEN, 3)");
+      assertEq(nBergen, 4, "B15: /sted/bergen counts both spellings, BERGEN 3 + Bergen 1 (D3b; regression: 3, BERGEN only)");
       for (const c of [bergenUpper[0]!, bergenLower]) {
         const p = await callRoute(router, `/klinikk/${c.slug}`);
         assertEq(finnesSentence(p.text), `Det finnes ${nBergen} klinikker i Bergen.`, `B16: ${c.slug} gives the /sted/bergen count`);

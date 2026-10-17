@@ -7,15 +7,19 @@
  *      fylke and specialty, and over all rows, from public rows only (a
  *      closed, rejected, non-clinic or probe row, or a junk date, changes
  *      nothing); the lookups match the same rows the list filters do.
+ *      forPoststed takes every spelling a /sted page lists (dev-request
+ *      2026-10-17-dental-d3-rettelser, D3b).
  *   B  the sitemap: /sted, /fylke, /spesialitet and / carry those days;
  *      static pages carry their text date from DENTAL_STATIC_PAGE_DATES,
  *      never the build day; no known day = no <lastmod>; one /sted URL per
- *      slug (IDX-3).
+ *      slug (IDX-3), dated by all its spellings (D3b); every <url> has its
+ *      children in the order the sitemaps.org 0.9 XSD requires (D3b).
  *   C  parity: every aggregate lastmod in the sitemap = the newest updated_at
  *      among the clinics listPublicDentalAgents() returns for that page.
  *   D  the number of today's dates = the entities that changed today.
  *   E  cost: the aggregate on 6,900 rows stays far below the sitemap slow-log.
- *   F  the fallback branch (no sitemap rows) leaves /klinikk <lastmod> out.
+ *   F  the fallback branch (no sitemap rows) leaves /klinikk <lastmod> out,
+ *      in the same XSD order (D3b).
  *
  * Same harness as routes/dental-seo-lastmod-antall-404-agents-txt.test.ts.
  *
@@ -46,6 +50,12 @@ function callRoute(router: any, urlPath: string): Promise<{ status: number; text
     router.handle(req, res, (err?: any) => resolve({ status: err ? 500 : 404, text: String(err ?? "unhandled") }));
   });
 }
+
+// One <url> as the sitemaps.org 0.9 XSD has it: loc, then lastmod (optional),
+// changefreq and priority, in that order and nothing else (D3b).
+const XSD_URL = /^<loc>[^<]+<\/loc>(<lastmod>\d{4}-\d{2}-\d{2}<\/lastmod>)?<changefreq>(always|hourly|daily|weekly|monthly|yearly|never)<\/changefreq><priority>(0(\.\d+)?|1(\.0+)?)<\/priority>$/;
+/** The inner XML of every <url> in the sitemap. */
+const urlBlocks = (xml: string): string[] => Array.from(xml.matchAll(/<url>(.*?)<\/url>/g), (m) => m[1]!);
 
 /** <loc> -> <lastmod> (null when the URL has none), for every URL in the sitemap. */
 function sitemapEntries(xml: string): Map<string, string | null> {
@@ -155,11 +165,14 @@ export async function runDentalAggregateLastmodTests(
     {
       const lm = store.getDentalAggregateLastmods({ specialties: specialtyNames });
       assertEq(lm.all, "2026-06-15", "A1: all = newest public row (hidden rows dated later are left out)");
-      assertEq(lm.forPoststed("OSLO"), "2026-05-02", "A2: OSLO = newest public OSLO row (closed, rejected, non-clinic, probe left out)");
-      assertEq(lm.forPoststed("BERGEN"), "2026-04-10", "A3: BERGEN = the BERGEN spelling only, as the BERGEN filter lists");
-      assertEq(lm.forPoststed("Bergen"), "2026-06-15", "A4: Bergen = both spellings, as the Bergen filter lists (BERGEN + Bergen)");
-      assertEq(lm.forPoststed("VOSS"), "2026-01-05", "A5: VOSS");
-      assertEq(lm.forPoststed("ATLANTIS"), null, "A6: unknown poststed -> null");
+      assertEq(lm.forPoststed(["OSLO"]), "2026-05-02", "A2: OSLO = newest public OSLO row (closed, rejected, non-clinic, probe left out)");
+      assertEq(lm.forPoststed(["BERGEN"]), "2026-04-10", "A3: ['BERGEN'] = the BERGEN spelling only, as the BERGEN filter lists");
+      assertEq(lm.forPoststed(["BERGEN", "Bergen"]), "2026-06-15", "A4: ['BERGEN','Bergen'] = both spellings, as /sted/bergen lists them (D3b)");
+      assertEq(lm.forPoststed(["Bergen"]), "2026-06-15", "A4b: ['Bergen'] also reads its upper-case form BERGEN, as the Bergen filter does");
+      assertEq(lm.forPoststed(["VOSS"]), "2026-01-05", "A5: VOSS");
+      assertEq(lm.forPoststed(["ATLANTIS"]), null, "A6: unknown poststed -> null");
+      assertEq(lm.forPoststed(["ATLANTIS", "VOSS"]), "2026-01-05", "A6b: an unknown spelling next to a known one changes nothing");
+      assertEq(lm.forPoststed([]), null, "A6c: no spellings -> null");
       assertEq(lm.forFylke("Oslo"), "2026-05-02", "A7: fylke Oslo");
       assertEq(lm.forFylke("Vestland"), "2026-06-15", "A8: fylke Vestland (all three places)");
       assertEq(lm.forFylke("Hordaland"), "2026-06-15", "A9: an old fylke name folds to Vestland, as the fylke filter does");
@@ -168,8 +181,8 @@ export async function runDentalAggregateLastmodTests(
       assertEq(["endodonti", "periodonti", "pedodonti"].map((s) => lm.forSpecialty(s)), [null, null, null], "A12: a specialty only hidden rows have -> null");
       assertEq(lm.forSpecialty("ikke-bedt-om"), null, "A13: a name not asked for -> null");
       assertTrue(/^\d{4}-\d{2}-\d{2}$/.test(lm.all ?? ""), "A14: days are YYYY-MM-DD (time and zone cut off)");
-      assertEq(lm.forPoststed("Tromsø"), "2026-05-20", "A16: Tromsø = both spellings, the newer upper-case TROMSØ row included (nb-NO upper case of ø)");
-      assertEq(lm.forPoststed("TROMSØ"), "2026-05-20", "A17: TROMSØ = the TROMSØ spelling only");
+      assertEq(lm.forPoststed(["Tromsø"]), "2026-05-20", "A16: ['Tromsø'] = both spellings, the newer upper-case TROMSØ row included (nb-NO upper case of ø)");
+      assertEq(lm.forPoststed(["TROMSØ"]), "2026-05-20", "A17: ['TROMSØ'] = the TROMSØ spelling only");
       assertEq(lm.forFylke("Troms"), "2026-05-20", "A18: fylke Troms");
       const none = store.getDentalAggregateLastmods({ specialties: [] });
       assertEq([none.all, none.forSpecialty("kjeveortopedi")], ["2026-06-15", null], "A15: no specialties asked -> no specialty days, the rest unchanged");
@@ -181,7 +194,7 @@ export async function runDentalAggregateLastmodTests(
     {
       const today = new Date().toISOString().slice(0, 10);
       assertEq(entries.get(`${base}/sted/oslo`), "2026-05-02", "B1: /sted/oslo lastmod = newest public OSLO clinic (regression: was today)");
-      assertEq(entries.get(`${base}/sted/bergen`), "2026-04-10", "B2: /sted/bergen lastmod = the clinics that page lists");
+      assertEq(entries.get(`${base}/sted/bergen`), "2026-06-15", "B2: /sted/bergen lastmod = the newest of both spellings the page lists (D3b; regression: 2026-04-10, BERGEN only)");
       assertEq(entries.get(`${base}/sted/voss`), "2026-01-05", "B3: /sted/voss");
       assertEq(store.listPoststeder(1).find((p) => dentalSeo.slugifyText(p.poststed) === "tromsoe")?.poststed, "Tromsø", "B3b: fixture sanity — /sted/tromsoe uses the mixed-case row");
       assertEq(entries.get(`${base}/sted/tromsoe`), "2026-05-20", "B3c: /sted/tromsoe lastmod = the newer TROMSØ row the page also lists");
@@ -213,6 +226,14 @@ export async function runDentalAggregateLastmodTests(
       assertEq((xml.match(new RegExp(`<loc>${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/sted/bergen</loc>`, "g")) || []).length, 1, "B17: /sted/bergen listed once (regression: once per spelling)");
       const locs = Array.from(xml.matchAll(/<loc>([^<]*)<\/loc>/g), (m) => m[1]!);
       assertEq(locs.length, new Set(locs).size, "B18: no URL is listed twice");
+
+      // D3b: the XSD order loc, lastmod?, changefreq, priority in every <url>.
+      const blocks = urlBlocks(xml);
+      assertTrue(blocks.some((b) => b.includes("<lastmod>")) && blocks.some((b) => !b.includes("<lastmod>")), "B19a: fixture sanity — URLs with and without <lastmod>");
+      assertEq(blocks.filter((b) => !XSD_URL.test(b)), [], "B19: every <url> is loc, lastmod?, changefreq, priority (regression: lastmod last)");
+      assertTrue(!xml.includes("</priority><lastmod>"), "B20: no <lastmod> after <priority>");
+      assertEq(blocks[0], `<loc>${base}</loc><lastmod>2026-06-15</lastmod><changefreq>daily</changefreq><priority>1.0</priority>`, "B20b: the first entry is the homepage in XSD order");
+      assertEq(blocks.length, locs.length, "B20c: one <loc> per <url>");
     }
 
     // ── C. parity with the lists the pages render ────────────────────────
@@ -221,13 +242,17 @@ export async function runDentalAggregateLastmodTests(
         const days = rows.map((r) => String(r.updated_at ?? "").slice(0, 10)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
         return days.length ? days[days.length - 1]! : null;
       };
-      const firstRowPerSlug = new Map<string, string>();
+      // Every stored spelling per slug, worked out here from the poststed list
+      // rather than read from dental-seo: the page lists all of them (D3b).
+      const spellingsPerSlug = new Map<string, string[]>();
       for (const p of store.listPoststeder(1)) {
         const slug = dentalSeo.slugifyText(p.poststed);
-        if (!firstRowPerSlug.has(slug)) firstRowPerSlug.set(slug, p.poststed);
+        spellingsPerSlug.set(slug, [...(spellingsPerSlug.get(slug) ?? []), p.poststed]);
       }
-      for (const [slug, poststed] of firstRowPerSlug) {
-        assertEq(entries.get(`${base}/sted/${slug}`), newestOf(store.listPublicDentalAgents({ poststed }, 500)), `C1: /sted/${slug} lastmod = newest clinic /sted/${slug} lists`);
+      assertEq([spellingsPerSlug.get("bergen"), spellingsPerSlug.get("tromsoe")], [["BERGEN", "Bergen"], ["Tromsø", "TROMSØ"]], "C0: fixture sanity — two slugs with two spellings");
+      for (const [slug, spellings] of spellingsPerSlug) {
+        const filter = spellings.length > 1 ? { poststed_in: spellings } : { poststed: spellings[0]! };
+        assertEq(entries.get(`${base}/sted/${slug}`), newestOf(store.listPublicDentalAgents(filter, 500)), `C1: /sted/${slug} lastmod = newest clinic of every spelling /sted/${slug} lists (${JSON.stringify(filter)})`);
       }
       for (const f of ["Oslo", "Vestland"]) {
         assertEq(entries.get(`${base}/fylke/${f}`), newestOf(store.listPublicDentalAgents({ fylke: f }, 500)), `C2: /fylke/${f} lastmod = newest clinic it lists`);
@@ -279,7 +304,7 @@ export async function runDentalAggregateLastmodTests(
       if (log) console.log(`    getDentalAggregateLastmods on ~6,900 rows: ${best.toFixed(1)} ms (best of 3)`);
       assertTrue(best < 300, `E1: aggregate on ~6,900 rows in < 300 ms (${best.toFixed(1)} ms; sitemap slow-log is 3,000 ms)`);
       const lm = store.getDentalAggregateLastmods({ specialties: specialtyNames });
-      assertEq(lm.forPoststed("STED 7"), "2026-08-17", "E2: bench rows aggregate correctly too");
+      assertEq(lm.forPoststed(["STED 7"]), "2026-08-17", "E2: bench rows aggregate correctly too");
     }
 
     // ── F. fallback branch: no sitemap rows -> /klinikk without <lastmod> ─
@@ -294,6 +319,8 @@ export async function runDentalAggregateLastmodTests(
       const klinikk = [...fb].filter(([k]) => k.includes("/klinikk/"));
       assertTrue(klinikk.length > 0, "F2: fallback still lists the clinics with an org.nr");
       assertEq(klinikk.filter(([, v]) => v !== null), [], "F3: fallback /klinikk URLs carry no <lastmod> (regression: today)");
+      const fbXml = (await callRoute(router, "/sitemap.xml")).text;
+      assertEq(urlBlocks(fbXml).filter((b) => !XSD_URL.test(b)), [], "B21: the fallback branch writes every <url> in XSD order too");
     }
   } catch (err: any) {
     failed++;

@@ -2490,8 +2490,10 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
  * a lastmod nor hide the newest real one (a string MAX ranks "ukjent" above
  * every date).
  *   all           every public row (the homepage).
- *   forPoststed   /sted/<slug> for the poststed row the page uses: the same
- *                 two spellings the poststed filter matches (pushFieldClauses).
+ *   forPoststed   /sted/<slug> for the spellings of the place the page lists
+ *                 ("BERGEN", "Bergen"; dev-request 2026-10-17-dental-d3-
+ *                 rettelser, D3b): each one and its upper-case form, as the
+ *                 poststed filter matches them (pushFieldClauses).
  *   forFylke      /fylke/<fylke>: the same values the fylke filter matches.
  *   forSpecialty  /spesialitet/<slug> for one of `specialties`: the very
  *                 predicate the page's list and count use (specialtyMatch).
@@ -2501,7 +2503,7 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
  */
 export interface DentalAggregateLastmods {
   all: string | null;
-  forPoststed(poststed: string): string | null;
+  forPoststed(spellings: readonly string[]): string | null;
   forFylke(fylke: string): string | null;
   forSpecialty(name: string): string | null;
 }
@@ -2547,7 +2549,8 @@ export function getDentalAggregateLastmods(opts: { specialties: readonly string[
 
   return {
     all,
-    forPoststed: (poststed) => newest([byPoststed.get(poststed.toLocaleUpperCase("nb-NO")), byPoststed.get(poststed)]),
+    forPoststed: (spellings) =>
+      newest(spellings.flatMap((s) => [byPoststed.get(s.toLocaleUpperCase("nb-NO")), byPoststed.get(s)])),
     forFylke: (fylke) => newest([byFylke.get(normaliseFylke(fylke) ?? fylke), byFylke.get(fylke)]),
     forSpecialty: (name) => bySpecialty.get(name) ?? null,
   };
