@@ -779,12 +779,13 @@ ${this.brand} bygger nettverk hvor norske ${this.entityPluralLong} møter mennes
   <div class="container">
     <div class="logo">🌾 ${this.brand}</div>
     <h1>Din bekreftelseskode</h1>
-    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på ${this.brand}.</p>
+    <p>Noen har bedt om å bekrefte eierskap til <strong>${this.escapeHtml(agentName)}</strong> på ${this.brand}. Koden sendes bare til gårdens egen e-postadresse.</p>
     <p>Din bekreftelseskode er:</p>
     <div class="code-box">
       <div class="code">${code}</div>
     </div>
     <p>Koden er gyldig i 24 timer.</p>
+    <p>Del aldri koden med andre. Vi spør aldri etter den på telefon eller e-post.</p>
     <p>Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.</p>
   </div>
 </body>
@@ -796,13 +797,15 @@ ${this.brand} bygger nettverk hvor norske ${this.entityPluralLong} møter mennes
     return `
 Din bekreftelseskode
 
-Du ba om å bekrefte at du eier ${agentName} på ${this.brand}.
+Noen har bedt om å bekrefte eierskap til ${agentName} på ${this.brand}. Koden sendes bare til gårdens egen e-postadresse.
 
 Din bekreftelseskode er:
 
 ${code}
 
 Koden er gyldig i 24 timer.
+
+Del aldri koden med andre. Vi spør aldri etter den på telefon eller e-post.
 
 Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     `;

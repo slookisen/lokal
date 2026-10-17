@@ -248,6 +248,7 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
     const registerHandler = findRouteHandler(marketplaceRouter, "/register", "post");
     const claimHandler = findRouteHandler(marketplaceRouter, "/agents/:id/claim", "post");
     const claimVerifyHandler = findRouteHandler(marketplaceRouter, "/agents/:id/claim/verify", "post");
+    const claimReviewApproveHandler = findRouteHandler(adminAgentsRouter, "/claim-review-approve", "post");
     const produsentHandler = findRouteHandler(seoRouter, "/produsent/:slug", "get");
     const reviewQueueHandler = findRouteHandler(adminAgentsRouter, "/self-registered-review-queue", "get");
     const reviewApproveHandler = findRouteHandler(adminAgentsRouter, "/self-registered-review-approve", "post");
@@ -345,31 +346,34 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
       assertTrue(String(rPage.body).includes("Produsent ikke funnet"), "gate1-page: gets the SAME not-found page an unknown slug gets");
       assertTrue(!String(rPage.body).includes("Mikhailo T"), "gate1-page: the agent's own name never reaches the response body (no exists-but-hidden leak)");
 
-      // Claim flow: request + verify — succeeds, but is_verified stays 0.
+      // Claim flow (decision 11=A, dev-request 2026-10-17-rfb-claim-
+      // verifisering-mot-kjent-kontakt): a self_registered profile has no
+      // farm e-mail (agent_knowledge.email) — its contactEmail is the
+      // registrant's own typed address — so the claim waits in the admin
+      // queue with no code. Approval issues the token, but is_verified stays 0.
       const rClaim = await invokeHandler(claimHandler, makeReq({
         params: { id: mikhailoId },
         body: { name: "Mikhailo T", email: "mikhailo@example-spam.test" },
       }));
-      assertEq(rClaim.status, 200, "a5: claim request succeeds for a self_registered agent (no new friction on the claim REQUEST step)");
+      assertEq(rClaim.status, 202, "a5: claim request for a self_registered agent with no farm e-mail goes to the admin queue (decision 11=A)");
       const claimId = rClaim.body?.data?.claimId;
-      const code = rClaim.body?.data?.verificationCode;
       assertTrue(!!claimId, "a6: claimId issued");
-      assertTrue(!!code, "a7: dry-run verification code returned (no SMTP configured in test env)");
+      assertTrue(!rClaim.body?.data?.verificationCode, "a7: no verification code — nothing is sent to the address the claimant typed");
 
-      const rVerify = await invokeHandler(claimVerifyHandler, makeReq({
-        params: { id: mikhailoId },
-        body: { claimId, code },
+      const rApprove = await invokeHandler(claimReviewApproveHandler, makeReq({
+        headers: { "x-admin-key": SUITE_ADMIN_KEY_LOCAL },
+        body: { claimId },
       }));
-      assertEq(rVerify.status, 200, "a8: claim VERIFY succeeds (same code-based flow, same step count as a real producer)");
-      assertTrue(!!rVerify.body?.data?.claimToken, "a9: claimToken issued — claimant CAN still manage the listing");
+      assertEq(rApprove.status, 200, "a8: admin approval of the queued claim succeeds");
 
-      const claimRow = testDb.prepare("SELECT status FROM agent_claims WHERE id = ?").get(claimId) as any;
+      const claimRow = testDb.prepare("SELECT status, claim_token FROM agent_claims WHERE id = ?").get(claimId) as any;
+      assertTrue(!!claimRow?.claim_token, "a9: claimToken issued on approval — claimant CAN still manage the listing");
       assertEq(claimRow?.status, "verified", "a10: agent_claims.status becomes 'verified' (claim itself is real)");
 
       const afterClaim = testDb.prepare("SELECT is_verified FROM agents WHERE id = ?").get(mikhailoId) as any;
       assertEq(
         afterClaim?.is_verified, 0,
-        "gate2: is_verified STAYS 0 for a self_registered agent even after a fully successful claim (would flip to 1 if the origin check were dropped from verifyClaim())",
+        "gate2: is_verified STAYS 0 for a self_registered agent even after an approved claim (would flip to 1 if the origin check were dropped from grantClaimOwnership())",
       );
     }
 
@@ -414,6 +418,10 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
       assertEq(rPage.status, 200, "b4: discovery-origin agent's profile page renders 200 (unaffected by Gate 1)");
       assertTrue(String(rPage.body).includes("Ekte Gårdsbutikk"), "b5: profile page includes the agent's real name");
 
+      // Decision 11=A: the code goes to the farm's listed e-mail, not to the
+      // claimant's address (the dry-run code is still returned off production).
+      testDb.prepare("INSERT INTO agent_knowledge (agent_id, email) VALUES (?, ?) ON CONFLICT(agent_id) DO UPDATE SET email = excluded.email")
+        .run(discoveryAgentId, "post@ekte-gaardsbutikk.example.test");
       const rClaim = await invokeHandler(claimHandler, makeReq({
         params: { id: discoveryAgentId },
         body: { name: "Ekte Eier", email: "eier@ekte-gaardsbutikk.example.test" },
@@ -713,6 +721,10 @@ export async function runMarketplaceQuarantineGatesTests(opts: { log?: boolean }
       // ── d8: claim-email bookkeeping opt-out still works (marketplace.ts
       // ~1294, "explicitly not required to fix" per the reviewer, but the
       // includeUnvetted opt-out added there must not itself have broken) ──
+      // Decision 11=A: the name lookup is on the code path, which needs a
+      // farm e-mail — the profile lists its own registration address here
+      // (the same address d10 below blocklists).
+      testDb.prepare("UPDATE agent_knowledge SET email = ? WHERE agent_id = ?").run("spammer@example-spam.test", quarantinedId);
       const rClaimD = await invokeHandler(claimHandler, makeReq({
         params: { id: quarantinedId },
         body: { name: "Spammer", email: "spammer@example-spam.test" },

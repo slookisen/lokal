@@ -464,7 +464,10 @@ function initSchema(db: Database.Database): void {
 
     -- ════════════════════════════════════════════════════════════
     -- AGENT_CLAIMS: Seller ownership of their agent
-    -- Flow: request → verify (email/phone) → approved → owner
+    -- Flow: request → code to the farm's own e-mail → verified → owner,
+    --       or request → pending_review (admin queue) → verified/rejected
+    --       (decision 11=A, dev-request 2026-10-17-rfb-claim-verifisering-
+    --       mot-kjent-kontakt; see knowledge-service.ts requestClaim)
     -- ════════════════════════════════════════════════════════════
     CREATE TABLE IF NOT EXISTS agent_claims (
       id TEXT PRIMARY KEY,
@@ -474,14 +477,17 @@ function initSchema(db: Database.Database): void {
       claimant_phone TEXT,
       verification_method TEXT DEFAULT 'email',  -- 'email' | 'phone' | 'manual'
       verification_code TEXT,                     -- 6-digit code sent to verify
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded')),
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
       source TEXT DEFAULT 'organic',              -- 'organic' | 'email-apr26' | 'test' | campaign tag
       created_at TEXT DEFAULT (datetime('now')),
       verified_at TEXT,
-      expires_at TEXT                             -- Claims expire after 7 days if unverified
+      expires_at TEXT,                            -- Code expiry: 24 h (rows from before 2026-10-17: 7 days)
+      code_sent_to TEXT,                          -- The farm's own address the code went to (NULL: no code sent)
+      failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
+      review_reason TEXT                          -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1386,6 +1392,65 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agent_claims ADD COLUMN source TEXT DEFAULT 'organic'`);
   } catch {
     // Column already exists — expected after first migration
+  }
+
+  // ─── agent_claims: the claim rule of decision 11=A ──────────────────────
+  // dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt. Three
+  // additive columns (the farm address the code went to, wrong-code count,
+  // admin-queue reason) and two new statuses: 'pending_review' (the admin
+  // queue) and 'superseded' (a code replaced by a newer one; such rows used to
+  // be DELETEd). Existing rows are not changed: the columns start NULL/0 and
+  // the status rebuild below copies every row as it is.
+  for (const col of ["code_sent_to TEXT", "failed_attempts INTEGER DEFAULT 0", "review_reason TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // SQLite cannot ALTER a CHECK, so widening the status list rebuilds the
+  // table (same pattern as crm_threads above). The new table is the stored
+  // CREATE text with only the CHECK clause swapped, so every column — also
+  // ones added later by ALTER, such as vertical_id — keeps its definition and
+  // order, and INSERT … SELECT * copies the rows unchanged. Its indexes are
+  // read from sqlite_master and recreated. Nothing references agent_claims by
+  // FK, trigger or view. If the stored text does not hold the exact old CHECK,
+  // nothing is rebuilt: the new statuses then fail at write time (the claim is
+  // refused), never silently.
+  try {
+    const OLD_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired'))";
+    const NEW_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded'))";
+    const claimsRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'"
+    ).get() as { sql: string } | undefined;
+    if (claimsRow && !/'pending_review'/.test(claimsRow.sql)) {
+      const createNew = claimsRow.sql.replace(/^CREATE TABLE\s+"?agent_claims"?/, "CREATE TABLE agent_claims__claim11a_new");
+      if (createNew === claimsRow.sql || !createNew.includes(OLD_CLAIM_STATUS_CHECK)) {
+        console.warn("[init][agent-claims-11a] status CHECK not in the expected form — rebuild skipped");
+      } else {
+        const indexSql = (db.prepare(
+          "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='agent_claims' AND sql IS NOT NULL"
+        ).all() as Array<{ sql: string }>).map((r) => r.sql);
+        // OFF so a row whose agent is gone is copied too, not refused; set
+        // outside the transaction (a no-op inside one) and restored as it was.
+        const fkWasOn = db.pragma("foreign_keys", { simple: true }) === 1;
+        db.pragma("foreign_keys = OFF");
+        try {
+          db.transaction(() => {
+            db.exec(createNew.replace(OLD_CLAIM_STATUS_CHECK, NEW_CLAIM_STATUS_CHECK));
+            db.exec(`INSERT INTO agent_claims__claim11a_new SELECT * FROM agent_claims`);
+            db.exec(`DROP TABLE agent_claims`);
+            db.exec(`ALTER TABLE agent_claims__claim11a_new RENAME TO agent_claims`);
+            for (const sql of indexSql) db.exec(sql);
+          })();
+          console.log("[init][agent-claims-11a] agent_claims.status CHECK widened to include 'pending_review'/'superseded'");
+        } finally {
+          if (fkWasOn) db.pragma("foreign_keys = ON");
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[init][agent-claims-11a] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──

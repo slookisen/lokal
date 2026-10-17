@@ -318,6 +318,24 @@ export const consumerKeyIssuanceLimiter = rateLimit({
   message: { success: false, error: "For mange nøkkel-utstedelser. Maks 50 per time." },
 });
 
+// RFB claim-request limiter — decision 11=A (dev-request
+// 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt): per IP on
+// POST /api/marketplace/agents/:id/claim, mounted on that route
+// (routes/marketplace.ts). Every request counts — a code send and an
+// admin-queue entry alike — so one IP can neither mail many producers nor
+// flood the queue. The per-profile limit (1 code per 24 h) and the
+// platform-wide hourly cap on code sends live in knowledge-service.ts
+// requestClaim, so they hold also while this IP key can be chosen by the
+// client (see sharedValidate above).
+export const rfbClaimRequestLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: sharedValidate,
+  message: { success: false, error: "For mange eierkrav fra denne adressen. Prøv igjen om en time." },
+});
+
 // Search limiter
 export const searchLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
