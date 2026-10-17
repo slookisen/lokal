@@ -18,6 +18,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents, normaliseFylke } from "./norway-fylke";
+import { drinkWordProducerTypes } from "./drink-taxonomy";
 // dev-request 2026-08-18-gardssalg-set-contact-phone: reuse the SAME write-time
 // phone guard the rfb `agent_knowledge` write path already uses (dev-request
 // 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) instead of inventing a
@@ -955,8 +956,9 @@ function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
   };
 }
 
-// Confidence-then-title ordering, identical to /discover, so listings rank the
-// same way the agent surface does.
+// Confidence-then-title ordering, as /discover, so listings rank the way the
+// agent surface does — except /discover's data-completeness tie-break between
+// the two (DISCOVER_DATA_COMPLETE_ORDER), which the listings do not use.
 const CARD_ORDER =
   "ORDER BY CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC";
 
@@ -1991,6 +1993,15 @@ export function discoverExperiences(
   return queryDiscoverExperiences(filter, limit).results;
 }
 
+// Discover's tie-break within the same text rank and confidence (dev-request
+// 2026-10-17-integrasjonstest-oppfolging, AI-7): rows a guest can act on come
+// first — a price and a booking link, then one of the two, then neither — and
+// the title only after that. «hvalsafari i Tromsø» used to open with a row
+// that has neither, only because its title sorts first. A price of 0 (free)
+// is a price.
+const DISCOVER_DATA_COMPLETE_ORDER =
+  "((e.price_from IS NOT NULL) + (NULLIF(TRIM(e.booking_url), '') IS NOT NULL)) DESC";
+
 /**
  * discoverExperiences(), plus the text_terms step of
  * discoverExperiencesRelaxed() with `textTermsAny`: the rows with the most
@@ -2019,7 +2030,7 @@ function queryDiscoverExperiences(
     SELECT e.*${textMatchedSql ? `, ${textMatchedSql} AS text_terms_matched` : ""} FROM experiences e
     LEFT JOIN experience_providers p ON p.id = e.provider_id
     WHERE ${where.join(" AND ")}
-    ORDER BY ${textOrderSql}CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC
+    ORDER BY ${textOrderSql}CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, ${DISCOVER_DATA_COMPLETE_ORDER}, e.title ASC
     LIMIT @limit
   `;
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
@@ -4183,8 +4194,10 @@ export type GardssalgSearchFilter = {
   // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-text
   // name/place query («Fjordgard», «Egge gård», «bryggeri Bergen»). Every
   // whitespace-separated term (max 8) must match navn, slug, poststed or
-  // kommune (case-insensitive LIKE). Results are ranked exact-name match →
-  // name-prefix match → everything else (then navn), so a one-shot booking
+  // kommune (case-insensitive LIKE) — or, with searchGardssalgProviders'
+  // expandDrinkWords, a drink word may match the producer's own kind.
+  // Results are ranked exact-name match → name-prefix match → everything
+  // else (then navn), so a one-shot booking
   // request that names a producer resolves to the obvious row first. This is
   // what lets an AI assistant go from «book et møte hos X» straight to X
   // without paging through a fylke — before this, discover_gardssalg had no
@@ -4228,16 +4241,22 @@ export function gardssalgLikePattern(term: string): string {
 // Precision match + rank for the q filter (JS side, Unicode-aware). Returns
 // null when the row does not actually contain every term; otherwise a rank
 // (0 = exact whole-name match, 1 = name starts with the query, 2 = other).
+// `termProducerTypes[i]`, when set, are producer_type values that also meet
+// qTerms[i] (searchGardssalgProviders' expandDrinkWords); the rank stays the
+// name rank either way.
 export function gardssalgQueryRank(
-  row: { navn: string; slug: string | null; poststed: string | null; kommune: string | null },
+  row: { navn: string; slug: string | null; poststed: string | null; kommune: string | null; producer_type?: string | null },
   qTerms: string[],
+  termProducerTypes: ReadonlyArray<readonly string[] | null> = [],
 ): number | null {
   if (qTerms.length === 0) return 2;
   const navn = (row.navn ?? "").toLocaleLowerCase("nb-NO");
   const hay = [navn, row.slug ?? "", row.poststed ?? "", row.kommune ?? ""]
     .map((v) => String(v).toLocaleLowerCase("nb-NO"));
-  for (const t of qTerms) {
-    if (!hay.some((h) => h.includes(t))) return null;
+  for (const [i, t] of qTerms.entries()) {
+    if (hay.some((h) => h.includes(t))) continue;
+    if (row.producer_type && termProducerTypes[i]?.includes(row.producer_type)) continue;
+    return null;
   }
   const whole = qTerms.join(" ");
   if (navn === whole) return 0;
@@ -4245,9 +4264,21 @@ export function gardssalgQueryRank(
   return 2;
 }
 
+/**
+ * `opts.expandDrinkWords` (discover_gardssalg only — dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, AI-5): a q word that names a drink
+ * kind ("cider", "sider", "øl") is also met by a producer of that kind, i.e.
+ * producer_type in drinkWordProducerTypes(word) — the same spellings
+ * `producer_type: "cideri"` expands to — not only by the word in the name or
+ * place. That only adds rows, and the rank is still the name rank, so a
+ * producer named in the query still comes first. The booking resolver
+ * (gardssalg-booking-resolve.ts) leaves it off: it resolves one NAME and
+ * must never be widened into a guess.
+ */
 export function searchGardssalgProviders(
   filter: GardssalgSearchFilter = {},
-  limit = 20
+  limit = 20,
+  opts: { expandDrinkWords?: boolean } = {},
 ): Array<GardssalgProviderRow & { distance_km?: number }> {
   const db = getDb(VERTICAL);
 
@@ -4307,14 +4338,22 @@ export function searchGardssalgProviders(
   //      includes() on the same four fields removes the rare wildcard over-
   //      match, then ranks exact whole-name match → name-prefix → rest.
   // A whitespace-only q is a no-op (no filter), exactly like an omitted one.
+  // With opts.expandDrinkWords, a drink word's term also accepts the
+  // producer_type spellings of its kind (see this function's doc comment).
   const qTerms = gardssalgQueryTerms(filter.q);
+  const termProducerTypes = opts.expandDrinkWords ? qTerms.map((t) => drinkWordProducerTypes(t)) : [];
   if (qTerms.length > 0) {
     qTerms.forEach((t, i) => {
       const key = `q${i}`;
       params[key] = `%${gardssalgLikePattern(t)}%`;
+      const typeKeys = (termProducerTypes[i] ?? []).map((v, j) => {
+        params[`${key}_type${j}`] = v;
+        return `@${key}_type${j}`;
+      });
       where.push(
         `(lower(navn) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(slug,'')) LIKE @${key} ESCAPE '\\'` +
-        ` OR lower(COALESCE(poststed,'')) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(kommune,'')) LIKE @${key} ESCAPE '\\')`,
+        ` OR lower(COALESCE(poststed,'')) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(kommune,'')) LIKE @${key} ESCAPE '\\'` +
+        (typeKeys.length > 0 ? ` OR producer_type IN (${typeKeys.join(", ")})` : "") + ")",
       );
     });
   }
@@ -4367,7 +4406,7 @@ export function searchGardssalgProviders(
   if (qTerms.length > 0) {
     // Precision pass + rank (stable: ties keep the SQL navn order).
     const ranked = rows
-      .map((r, i) => ({ r, i, rank: gardssalgQueryRank(r, qTerms) }))
+      .map((r, i) => ({ r, i, rank: gardssalgQueryRank(r, qTerms, termProducerTypes) }))
       .filter((x): x is { r: GardssalgProviderRow; i: number; rank: number } => x.rank !== null)
       .sort((a, b) => a.rank - b.rank || a.i - b.i);
     rows = ranked.map((x) => x.r);

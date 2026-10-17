@@ -1213,7 +1213,10 @@ export function registerExperienceTools(
         if (typeof radius_km === "number") filter.radius_km = radius_km;
         const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
 
-        const results = searchGardssalgProviders(filter, limit ?? 20);
+        // expandDrinkWords: a drink word in `query` («cider», «sider», «øl»)
+        // also finds producers of that kind, as producer_type does (dev-request
+        // 2026-10-17-integrasjonstest-oppfolging, AI-5).
+        const results = searchGardssalgProviders(filter, limit ?? 20, { expandDrinkWords: true });
 
         const summary =
           results.length === 0

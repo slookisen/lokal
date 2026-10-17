@@ -305,9 +305,13 @@ export function runExperiencesA2aGardssalgTests(opts: { log?: boolean } = {}): P
       //     surfaces a non-zero, real hit for a natural-language region
       //     query for each — the actual acceptance criteria (AC1/AC2), not
       //     just the parser's filter shape.
+      //     The Lofoten and Hardanger rows sit in the real kommuner the
+      //     catalogue uses (Vågan, Ullensvang), not the towns the table held
+      //     until 2026-10-17 (dev-request 2026-10-17-integrasjonstest-
+      //     oppfolging, AI-2: Odda has not been a kommune since 2020).
       const regionFixtures: Array<{ region: string; kommune: string; fylke: string; title: string }> = [
-        { region: "Lofoten", kommune: "Svolvær", fylke: "Nordland", title: "Havørnsafari i Lofoten" },
-        { region: "Hardanger", kommune: "Odda", fylke: "Vestland", title: "Fjordvandring i Hardanger" },
+        { region: "Lofoten", kommune: "Vågan", fylke: "Nordland", title: "Havørnsafari i Lofoten" },
+        { region: "Hardanger", kommune: "Ullensvang", fylke: "Vestland", title: "Fjordvandring i Hardanger" },
         // kommune "Senja" (not "Finnsnes") deliberately — the real,
         // post-2020-reform DB kommune value (2026-09-22 fix-up to PR #907,
         // dev-request 2026-09-21-...-fylke AC2: live probe found 20 real

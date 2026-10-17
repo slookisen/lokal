@@ -222,3 +222,22 @@ export function allDrinkProducerTypes(): string[] {
 export function resolveGardssalgProducerTypeFilter(input: string): string | string[] {
   return isDrinkSubcategory(input) ? [...DRINK_SUBCATEGORY_META[input].producerTypes] : input;
 }
+
+/**
+ * The gårdssalg `producer_type` spellings one free-text query word names, or
+ * null when it names no drink subcategory: "cider", "sider" and "sideri" all
+ * give ["cideri", "sideri"], the same list `producer_type: "cideri"` gives via
+ * resolveGardssalgProducerTypeFilter(). A generic drink word ("drikke",
+ * "most") names no subcategory and gives null, as in
+ * classifyDrinkSubcategoryFromText().
+ *
+ * dev-request 2026-10-17-integrasjonstest-oppfolging, AI-5: discover_gardssalg's
+ * query «gårdssalg cider Hardanger» matched only producers with "cider" in
+ * their name (2), while `producer_type: "cideri"` with «Hardanger» found 5.
+ */
+export function drinkWordProducerTypes(word: string): string[] | null {
+  const sub = classifyDrinkSubcategoryFromText(word);
+  if (!sub) return null;
+  const types = resolveGardssalgProducerTypeFilter(sub);
+  return Array.isArray(types) ? types : [types];
+}

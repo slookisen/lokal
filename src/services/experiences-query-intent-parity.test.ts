@@ -8,7 +8,10 @@
  *   p3     parseExperiencesIntent() gives the same output as before the move,
  *          for a fixed set of queries (expected values recorded on lokal
  *          a6edc5cb, before the move — the substring quirks included, see the
- *          dev-request's FUNN a2a-parse-experiences-intent-delstrengtreff);
+ *          dev-request's FUNN a2a-parse-experiences-intent-delstrengtreff).
+ *          The region lists are REGION_TO_KOMMUNER's data, re-recorded when
+ *          that table moved from towns to real kommuner (dev-request
+ *          2026-10-17-integrasjonstest-oppfolging, AI-2); the parser is the same;
  *   p4     normalizeExperienceCategory() likewise;
  *   p5     the module imports only norway-fylke and experience-store, never a
  *          route, so it cannot form an import cycle.
@@ -29,12 +32,12 @@ const INTENTS_BEFORE_MOVE: Array<[string, Record<string, unknown>]> = [
   ["hva kan vi finne på i Tromsø om vinteren?", { kommune: "Tromsø", season: "winter" }],
   ["opplevelser i Finnmark", { fylke: "Finnmark" }],
   ["kajakkpadling i Vesterålen", {}],
-  ["hvilke opplevelser finnes i Lofoten?", { kommuner: ["Svolvær", "Leknes", "Reine", "Henningsvær"] }],
-  ["opplevelser i Hardanger", { kommuner: ["Odda", "Ulvik", "Jondal", "Eidfjord", "Kvinnherad"] }],
+  ["hvilke opplevelser finnes i Lofoten?", { kommuner: ["Vågan", "Vestvågøy", "Flakstad", "Moskenes", "Værøy", "Røst", "Svolvær"] }],
+  ["opplevelser i Hardanger", { kommuner: ["Ullensvang", "Ulvik", "Eidfjord", "Kvam", "Kvinnherad"] }],
   ["Det regner i Oslo, hva gjør vi innendørs?", { kommune: "Oslo", weather: "rain", indoor_outdoor: "indoor" }],
   ["friluft i Bergen om sommeren", { kommune: "Bergen", indoor_outdoor: "outdoor", season: "summer" }],
   ["Møre og Romsdal", { fylke: "Møre og romsdal" }],
-  ["Sunnmøre", { kommuner: ["Ålesund", "Volda", "Ørsta", "Stranda", "Sykkylven"] }],
+  ["Sunnmøre", { kommuner: ["Ålesund", "Volda", "Ørsta", "Stranda", "Sykkylven", "Haram", "Giske", "Sula", "Hareid", "Ulstein", "Sande", "Vanylven", "Fjord"] }],
   ["Hallingdal", {}],
   ["Molde", { kommune: "Molde" }],
   ["Tromsø", { kommune: "Tromsø" }],
@@ -45,9 +48,9 @@ const INTENTS_BEFORE_MOVE: Array<[string, Record<string, unknown>]> = [
   ["regnbue i Bø", { kommune: "Bø", weather: "rain" }],
   ["outdoor in Os", { kommune: "Os", indoor_outdoor: "outdoor" }],
   ["en time i Ålesund", { kommune: "Ålesund" }],
-  ["Senja vinter", { kommuner: ["Senja", "Finnsnes"], season: "winter" }],
-  ["Nordmøre høst", { kommuner: ["Kristiansund", "Surnadal"], season: "autumn" }],
-  ["Valdres", { kommuner: ["Fagernes", "Beitostølen"] }],
+  ["Senja vinter", { kommuner: ["Senja"], season: "winter" }],
+  ["Nordmøre høst", { kommuner: ["Kristiansund", "Surnadal", "Averøy", "Gjemnes", "Tingvoll", "Sunndal", "Smøla", "Aure"], season: "autumn" }],
+  ["Valdres", { kommuner: ["Nord-Aurdal", "Øystre Slidre", "Vestre Slidre", "Vang", "Sør-Aurdal", "Etnedal"] }],
   ["hvalsafari i Tromsø", { kommune: "Tromsø" }],
   ["zzzqqq ingen treff xyzzy", {}],
   ["Finn noe å gjøre i Mo i Rana", { kommune: "Mo i Rana" }],
