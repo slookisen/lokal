@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: no (1 waiting). See the prerequisites in ../README.md.
+Before you start: Ready to submit: no (1 open, 1 waiting). See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -89,7 +89,11 @@ Paste if the portal asks what data the connector handles:
 ```
 The tools receive only what a question needs: a search text, a place, filters or coordinates. A visit request (book_gardssalg) passes the guest's name and e-mail, and an optional phone number and note, to the producer so the producer can answer.
 
-There are no accounts, no login credentials and no payment data. The server logs which tool was called and by which client, with a hashed IP address, for usage statistics.
+Every call is logged with the tool name, the protocol, the response time, the client's name and version, the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address (never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.
+
+Tool calls are also logged as agent requests: the tool, the filters and search terms sent, and the AI client's name, with no IP address; this log is not deleted automatically. A visit request stores the guest's name, e-mail, optional phone number, requested time, party size and note, and the guest gets a receipt with a status link. Visit requests are not deleted automatically; they are deleted on request, as the privacy policy describes.
+
+There are no accounts, no login credentials and no payment data.
 
 Privacy policy: https://opplevagent.no/personvern
 ```
@@ -123,4 +127,3 @@ Check the summary, then submit. Status and reviewer feedback appear in the porta
 ## Known caveats, to state if asked
 
 - book_gardssalg is a real write: a request e-mails the producer. Keep it out of demos with real producers.
-- The carousel screenshots were rendered on 2026-08-24 from the card templates. If `src/routes/opplevagent-widgets.ts` has changed since, render them again with `node opplevagent-connectors-prep/assets/generate-screenshots.js` before uploading.

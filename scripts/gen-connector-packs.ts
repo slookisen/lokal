@@ -15,10 +15,17 @@
  *     honest count (honestCatalogCount()) rounded down to the hundred. Listing
  *     text is only changed by hand in the portal, so the packs quote the floor,
  *     never a live figure;
- *   - icons and screenshots: the files themselves (size and md5).
+ *   - protocol versions: the MCP SDK's SUPPORTED_PROTOCOL_VERSIONS;
+ *   - icons and screenshots: the files themselves (size and md5), and for the
+ *     screenshots the md5 of the card templates they show, against the md5
+ *     they were rendered from;
+ *   - server instructions and serverInfo (dental): the `new McpServer(...)`
+ *     call in the route file, read with the TypeScript parser, not run.
  * The prose and the prerequisite rows that code cannot tell are in PACKS below.
  * No clock is read: the same inputs give byte-identical files, which is what
- * src/routes/connector-packs-fresh.test.ts compares against.
+ * src/routes/connector-packs-fresh.test.ts compares against. The packs describe
+ * production, where PAYMENTS_ENABLED is unset: the tools are read with it
+ * unset, whatever the caller's environment (productionToolDefinitions()).
  *
  *   npx tsx scripts/gen-connector-packs.ts                  write the packs
  *   npx tsx scripts/gen-connector-packs.ts --check          exit 1 if a pack on disk is stale
@@ -30,6 +37,7 @@ import { createHash } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
+import * as ts from "typescript";
 
 import { BRAND_ENTITIES, type BrandEntity } from "../src/config/brand-entities";
 import type { CatalogVertical } from "../src/services/honest-count";
@@ -75,8 +83,21 @@ export const DIRECTIVE_PATTERNS: readonly RegExp[] = [
   /\b(prefer|instead of) (other|any other) tools?\b/i,
 ];
 
-// distribution/catalog-claims.json keys its floors by noun group, not vertical id.
-const FLOOR_KEY: Record<CatalogVertical, string> = { rfb: "rfb", dental: "dental", experiences: "opplevelser" };
+/** distribution/catalog-claims.json keys its floors (and parseClaims() its claims) by noun group, not vertical id. */
+export const FLOOR_KEY: Readonly<Record<CatalogVertical, string>> = { rfb: "rfb", dental: "dental", experiences: "opplevelser" };
+
+/** serverInfo fields a client can show besides name and version (MCP Implementation). */
+export const SERVER_INFO_FIELDS = ["title", "description", "websiteUrl"] as const;
+
+/**
+ * What every MCP call leaves behind, in all three verticals: the row
+ * src/services/mcp-usage-logger.ts writes, pruned with the other analytics
+ * after RFB_AUTO_PRUNE_DAYS (default 60, src/index.ts). As the privacy pages say.
+ */
+const CALL_LOG =
+  "Every call is logged with the tool name, the protocol, the response time, the client's name and version, " +
+  "the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address " +
+  "(never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.";
 
 export type PrereqStatus = "done" | "open" | "waiting";
 
@@ -100,14 +121,22 @@ export interface PackSpec {
   categories: readonly string[];
   /** Repo-relative path of the square PNG to upload; null while none exists. */
   icon: string | null;
-  /** MCP App carousel screenshots (repo-relative PNGs) and the file pairing each with its prompt. */
-  screenshots: { files: readonly string[]; prompts: string } | null;
+  /** MCP App carousel screenshots: the PNGs, the file pairing each with its prompt, and what they show. */
+  screenshots: ScreenshotSpec | null;
+  /**
+   * The route file whose `new McpServer(...)` must send instructions and a
+   * title, description and websiteUrl before submission (a derived row), and
+   * who adds them; null when the pack has no such row.
+   */
+  serverSetup: { routeFile: string; owner: string } | null;
   useCases: readonly string[];
   /** One sentence on where the data comes from (Data handling and first-party API answers). */
   ownApi: string;
   authRationale: string;
   /** What the tools receive and pass on (first paragraph of the Data handling paste block). */
   dataHandling: string;
+  /** What the tools store beyond the call log (CALL_LOG), as the privacy page says; null when nothing. */
+  dataStored: string | null;
   healthData: string;
   financial: string;
   /** Every brand example prompt → the tool it usually exercises; extra prompts for tool coverage. */
@@ -116,7 +145,7 @@ export interface PackSpec {
   /** What each write tool really does. Every write tool must have one. */
   writeToolNotes: Readonly<Record<string, string>>;
   /** Who fixes a failing derived row. */
-  owners: { descriptions: string; terms: string; docs: string; icon: string };
+  owners: { descriptions: string; terms: string; docs: string; icon: string; screenshots: string };
   /** Why a description fix waits, or null when nothing gates it. */
   descriptionsGate: string | null;
   recordedPrerequisites: ReadonlyArray<Omit<Prerequisite, "source">>;
@@ -125,6 +154,19 @@ export interface PackSpec {
   otherContents: ReadonlyArray<readonly [string, string]>;
   /** README lines on paths that are not the directory. */
   notADirectoryPath: readonly string[];
+}
+
+export interface ScreenshotSpec {
+  /** Repo-relative PNGs, in carousel order. */
+  files: readonly string[];
+  /** The file pairing each PNG with its prompt. */
+  prompts: string;
+  /** The card templates the PNGs show: a module and the exports holding the HTML. */
+  templates: { module: string; exports: readonly string[] };
+  /** When the PNGs were last rendered, and the md5 of the templates then (cardTemplatesMd5()). */
+  rendered: { date: string; commit: string; templatesMd5: string };
+  /** How to render them again. */
+  renderCommand: string;
 }
 
 /** Table placeholder: no value, or nobody to act. */
@@ -144,6 +186,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     categories: ["Shopping", "Food & drink", "Travel"],
     icon: "rfb-connectors-prep/assets/rfb-square-512.png",
     screenshots: null,
+    serverSetup: null,
     useCases: [
       "Find local food near where you are in Norway, with opening hours and contact details.",
       "Look for a specific product (lamb, organic cheese, honey) in a region.",
@@ -155,6 +198,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ownApi: "Our own: the server reads Rett fra Bonden's own producer catalogue on the same domain. Place-name lookups can fall back to Kartverket's public place-name service.",
     authRationale: "The server serves public directory data about Norwegian food producers. There are no user accounts, so there is nothing to sign in to. The write tools build an anonymous cart and send pickup orders; they take no credentials and no payment details.",
     dataHandling: "The tools receive only what a question needs: a search term, a place, a category or coordinates, and for a pickup order the products chosen. Contact details the user gives are passed to an ordering producer only when the user consents to it (contact_consent).",
+    dataStored: "A cart stores the products and producers chosen and a buyer_ref token, and is valid for 7 days. Contact details sent with an order (name, e-mail, phone, note) are stored with the cart and each order; the privacy policy says how long they are kept.",
     healthData: "No. The connector serves food-producer directory data and asks for no health information.",
     financial: "No money moves through the connector. A pickup order is a request to collect goods; the user pays the producer at pickup, outside Claude and outside this platform. No card or bank details are asked for.",
     reviewerTools: {
@@ -175,12 +219,13 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       terms: DASH,
       docs: DASH,
       icon: DASH,
+      screenshots: DASH,
     },
     descriptionsGate: "The fix waits for OpenAI's decision on the RFB ChatGPT app: tool metadata stays frozen while OpenAI reviews it (Daniel reports the decision).",
     recordedPrerequisites: [],
     caveats: [
       "Prices: most producers list products without a price, and the tools say so. Do not describe the connector as a price comparison.",
-      "Prepayment: production runs with PAYMENTS_ENABLED unset. If it is switched on (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect), lokal_cart_submit's description and the financial-transactions answer change: regenerate this pack and answer again before submitting.",
+      "Prepayment: production runs with PAYMENTS_ENABLED unset, and the generator reads the tools that way. If it is switched on (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect), lokal_cart_submit's description and the financial-transactions answer change: update `productionToolDefinitions()` and `PACKS` in the generator, regenerate this pack and answer again before submitting.",
     ],
     otherContents: [
       ["assets/rfb-square-512.png", "The icon to upload: square, full-bleed, no rounded corners (clients crop it themselves)."],
@@ -211,7 +256,12 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
         "opplevagent-connectors-prep/assets/04-experiences-list-national-mix.png",
       ],
       prompts: "opplevagent-connectors-prep/assets/prompts.txt",
+      templates: { module: "src/routes/opplevagent-widgets.ts", exports: ["EXPERIENCES_LIST_HTML", "EXPERIENCE_DETAIL_HTML"] },
+      // The PNGs were last rendered in e8a68a45, from that commit's templates.
+      rendered: { date: "2026-09-24", commit: "e8a68a45", templatesMd5: "dd5d60567b45ad773981299969680d8b" },
+      renderCommand: "node opplevagent-connectors-prep/assets/generate-screenshots.js",
     },
+    serverSetup: null,
     useCases: [
       "Plan what to do on a trip in Norway by place, season and weather.",
       "Find family-friendly or group activities within a budget.",
@@ -221,6 +271,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ownApi: "Our own: the server reads Opplevagent's own experience and gårdssalg catalogue on the same domain.",
     authRationale: "The server serves public data about experiences and farm-sale producers in Norway. There are no user accounts, so there is nothing to sign in to. The one write tool sends a visit request with the guest's own name and e-mail so the producer can answer; it takes no credentials and no payment details.",
     dataHandling: "The tools receive only what a question needs: a search text, a place, filters or coordinates. A visit request (book_gardssalg) passes the guest's name and e-mail, and an optional phone number and note, to the producer so the producer can answer.",
+    dataStored: "Tool calls are also logged as agent requests: the tool, the filters and search terms sent, and the AI client's name, with no IP address; this log is not deleted automatically. A visit request stores the guest's name, e-mail, optional phone number, requested time, party size and note, and the guest gets a receipt with a status link. Visit requests are not deleted automatically; they are deleted on request, as the privacy policy describes.",
     healthData: "No. The connector serves experience and producer data and asks for no health information.",
     financial: "No money moves through the connector. Experiences are booked and paid with the provider; a gårdssalg visit is paid on arrival. No card or bank details are asked for.",
     reviewerTools: {
@@ -239,6 +290,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       terms: DASH,
       docs: DASH,
       icon: DASH,
+      screenshots: "Before submission, after OpenAI's decision (the cards can change in review)",
     },
     descriptionsGate: "A fix waits for OpenAI's decision on the Opplevagent ChatGPT app: tool metadata stays frozen while OpenAI reviews it.",
     recordedPrerequisites: [
@@ -257,7 +309,6 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ],
     caveats: [
       "book_gardssalg is a real write: a request e-mails the producer. Keep it out of demos with real producers.",
-      "The carousel screenshots were rendered on 2026-08-24 from the card templates. If `src/routes/opplevagent-widgets.ts` has changed since, render them again with `node opplevagent-connectors-prep/assets/generate-screenshots.js` before uploading.",
     ],
     otherContents: [
       ["assets/opplevagent-brand-512.png", "The icon to upload: Opplevagent's own mark, square, no rounded corners."],
@@ -284,6 +335,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     categories: ["Health", "Reference"],
     icon: null,
     screenshots: null,
+    serverSetup: { routeFile: "src/routes/dental-mcp.ts", owner: "2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a)" },
     useCases: [
       "Find a dentist in a town or county.",
       "Find emergency dental care (akuttvakt) outside normal hours.",
@@ -294,6 +346,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ownApi: "Our own: the server reads Finn-tannlege's own clinic directory on the same domain.",
     authRationale: "The server is a public, read-only directory of Norwegian dental clinics. There are no user accounts and no write operations, so there is nothing to sign in to.",
     dataHandling: "The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.",
+    dataStored: null,
     healthData: "No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency duty) and asks for no health information about the user.",
     financial: "No money moves through the connector. Helfo agreement status is reported as a fact about a clinic, nothing more. No card or bank details are asked for.",
     reviewerTools: {
@@ -310,15 +363,10 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       terms: "2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S5; Daniel approves the text)",
       docs: "G3-S4 of this dev-request (`/guide-tannlege-ai`)",
       icon: "2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4)",
+      screenshots: DASH,
     },
     descriptionsGate: null,
     recordedPrerequisites: [
-      {
-        item: "MCP server instructions and serverInfo title, description and websiteUrl",
-        status: "open",
-        detail: "The dental server sends no instructions and only name and version today.",
-        owner: "2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a)",
-      },
       {
         item: "Natural-language search in tannlege_search (town, municipality, specialty, Helfo)",
         status: "open",
@@ -363,7 +411,19 @@ export interface PackInput {
   floor: number;
   icon: IconInfo | null;
   screenshots: readonly IconInfo[];
+  /** md5 of the card templates the screenshots show, as they are now; null without screenshots. */
+  screenshotTemplatesMd5: string | null;
+  /** The spec's serverSetup route file, as read by readServerConstruction(); null without one. */
+  server: ServerConstruction | null;
   protocolVersions: readonly string[];
+}
+
+/** What a `new McpServer(serverInfo, options)` call sets. */
+export interface ServerConstruction {
+  /** Property names of the serverInfo object (first argument). */
+  info: string[];
+  /** Whether the options (second argument) set `instructions`. */
+  instructions: boolean;
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -394,16 +454,73 @@ export function readCatalogFloors(): Record<CatalogVertical, number> {
   return out;
 }
 
+/** md5 over the named string exports of a repo-relative module: the HTML of the card templates. */
+export function cardTemplatesMd5(templates: ScreenshotSpec["templates"]): string {
+  const mod = require(path.join(ROOT, templates.module)) as Record<string, unknown>;
+  const h = createHash("md5");
+  for (const name of templates.exports) {
+    const html = mod[name];
+    if (typeof html !== "string") throw new Error(`${templates.module} has no string export ${name}`);
+    h.update(`${name}\0${html}\0`);
+  }
+  return h.digest("hex");
+}
+
+/**
+ * Reads the one `new McpServer(...)` call in a route file with the TypeScript
+ * parser, without running it: which serverInfo fields it sets and whether it
+ * passes instructions. Throws when the file does not have exactly one such
+ * call, or when an argument is not a plain object literal: then this function
+ * cannot tell, and must be extended rather than guess.
+ */
+export function readServerConstruction(rel: string, source = fs.readFileSync(path.join(ROOT, rel), "utf8")): ServerConstruction {
+  const sf = ts.createSourceFile(rel, source, ts.ScriptTarget.Latest, true);
+  const calls: ts.NewExpression[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "McpServer") calls.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  if (calls.length !== 1) throw new Error(`${rel}: expected one new McpServer(...), found ${calls.length}`);
+  const keys = (arg: ts.Expression | undefined, what: string): string[] => {
+    if (!arg) return [];
+    if (!ts.isObjectLiteralExpression(arg)) throw new Error(`${rel}: the McpServer ${what} is not an object literal; extend readServerConstruction()`);
+    return arg.properties.map((p) => {
+      if (p.name && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) return p.name.text;
+      throw new Error(`${rel}: the McpServer ${what} has a spread or computed property; extend readServerConstruction()`);
+    });
+  };
+  const [info, options] = calls[0].arguments ?? [];
+  return { info: keys(info, "serverInfo"), instructions: keys(options, "options").includes("instructions") };
+}
+
+/**
+ * The tools as production registers them: with PAYMENTS_ENABLED unset (it
+ * picks lokal_cart_submit's description), whatever the caller's environment,
+ * which is restored afterwards. The CLI and the test read the same tools.
+ */
+export function productionToolDefinitions(vertical: CatalogVertical): McpToolDefinition[] {
+  const prevPayments = process.env.PAYMENTS_ENABLED;
+  delete process.env.PAYMENTS_ENABLED;
+  try {
+    return registeredMcpToolDefinitions(vertical);
+  } finally {
+    if (prevPayments !== undefined) process.env.PAYMENTS_ENABLED = prevPayments;
+  }
+}
+
 export function gatherPackInput(vertical: CatalogVertical, floors = readCatalogFloors()): PackInput {
   const spec = PACKS[vertical];
   return {
     vertical,
-    tools: registeredMcpToolDefinitions(vertical),
+    tools: productionToolDefinitions(vertical),
     brand: BRAND_ENTITIES[vertical],
     company: BRAND_ENTITIES.company,
     floor: floors[vertical],
     icon: spec.icon ? pngInfo(spec.icon) : null,
     screenshots: (spec.screenshots?.files ?? []).map(pngInfo),
+    screenshotTemplatesMd5: spec.screenshots ? cardTemplatesMd5(spec.screenshots.templates) : null,
+    server: spec.serverSetup ? readServerConstruction(spec.serverSetup.routeFile) : null,
     protocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
   };
 }
@@ -481,13 +598,37 @@ export function prerequisites(spec: PackSpec, input: PackInput): Prerequisite[] 
     }),
   ];
   if (spec.screenshots) {
+    const { prompts, templates, rendered, renderCommand } = spec.screenshots;
     const shots = input.screenshots;
-    const ok = shots.length >= 3 && shots.length <= 5 && shots.every((s) => s.width >= 1000);
+    const shaped = shots.length >= 3 && shots.length <= 5 && shots.every((s) => s.width >= 1000);
+    // The PNGs show the templates as they were when rendered; a later template
+    // change means they no longer show the live cards.
+    const current = input.screenshotTemplatesMd5 === rendered.templatesMd5;
+    const ok = shaped && current;
     rows.push(derived({
-      item: "MCP App carousel screenshots (3–5 PNG, at least 1000 px wide)",
+      item: "MCP App carousel screenshots (3–5 PNG, at least 1000 px wide, showing the live cards)",
       status: ok ? "done" : "open",
-      detail: `${shots.length} PNG in \`${spec.dir}/assets/\`, widths ${shots.map((s) => s.width).join(", ")} px; prompts in \`${spec.screenshots.prompts}\`.`,
-      owner: DASH,
+      detail: `${shots.length} PNG in \`${spec.dir}/assets/\`, widths ${shots.map((s) => s.width).join(", ")} px; prompts in \`${prompts}\`. ` +
+        (current
+          ? `Rendered ${rendered.date} (${rendered.commit}) from the card templates as they are now (\`${templates.module}\`, md5 \`${rendered.templatesMd5}\`).`
+          // Only the pinned md5 is printed: a further template change while the
+          // row is open leaves the pack as it is.
+          : `Rendered ${rendered.date} (${rendered.commit}), but the card templates in \`${templates.module}\` have changed since ` +
+            `(md5 \`${rendered.templatesMd5}\` when rendered), so the screenshots do not show the live cards. ` +
+            `Render them again with \`${renderCommand}\`, check its mock data against the live tool output, then set \`rendered\` in \`PACKS\` to the new date, commit and md5 (\`cardTemplatesMd5()\`).`),
+      owner: ok ? DASH : spec.owners.screenshots,
+    }));
+  }
+  if (spec.serverSetup) {
+    const server = input.server;
+    if (!server) throw new Error(`pack ${input.vertical}: serverSetup is set but the input has no server construction`);
+    const missing = [...(server.instructions ? [] : ["instructions"]), ...SERVER_INFO_FIELDS.filter((f) => !server.info.includes(f))];
+    rows.push(derived({
+      item: `MCP server instructions and serverInfo ${SERVER_INFO_FIELDS.slice(0, -1).join(", ")} and ${SERVER_INFO_FIELDS[SERVER_INFO_FIELDS.length - 1]}`,
+      status: missing.length ? "open" : "done",
+      detail: `\`new McpServer(...)\` in \`${spec.serverSetup.routeFile}\` sets serverInfo ${server.info.map(code).join(", ") || "nothing"} ` +
+        `and ${server.instructions ? "instructions" : "no instructions"}${missing.length ? `. Missing: ${missing.map(code).join(", ")}.` : "."}`,
+      owner: missing.length ? spec.serverSetup.owner : DASH,
     }));
   }
   for (const p of spec.recordedPrerequisites) rows.push({ ...p, source: "recorded" });
@@ -593,7 +734,9 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
   ];
   const lintRow = rows.find((r) => r.item.startsWith("Tool descriptions"))!;
   const docsRow = rows.find((r) => r.item === "Public documentation page")!;
+  const shotsRow = rows.find((r) => r.item.startsWith("MCP App carousel screenshots"));
   const titleDiffs = tools.filter((t) => t.annotations.title && t.title && t.annotations.title !== t.title);
+  const recordedPrs = [...new Set(spec.recordedPrerequisites.flatMap((p) => `${p.item} ${p.detail}`.match(/\blokal#\d+/g) ?? []))];
 
   // ── README ──
   const readme = [
@@ -619,7 +762,11 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     `Rows with source "code" are computed when the pack is generated.` +
       (spec.recordedPrerequisites.length
-        ? ` Rows with source "recorded" are kept by hand in ${code(GENERATOR)} (\`PACKS\`); update the row there and regenerate when its status changes.`
+        ? ` Rows with source "recorded" are kept by hand in ${code(GENERATOR)} (\`PACKS\`), and no test checks them against the code or GitHub` +
+          (recordedPrs.length
+            ? `: the pull requests they cite (${recordedPrs.slice(0, -1).join(", ")}${recordedPrs.length > 1 ? " and " : ""}${recordedPrs[recordedPrs.length - 1]}) can be merged or closed while the row stays as it is.`
+            : ".") +
+          " Update the row there and regenerate when its status changes."
         : ""),
     "",
     "## Contents",
@@ -635,12 +782,20 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     `This README and every file in \`claude-directory/\` are generated by ${code(GENERATOR)} from:`,
     "",
-    "- the tools the live /mcp server registers (`registeredMcpToolDefinitions()` in src/services/mcp-tool-manifest.ts): names, titles, annotations and descriptions;",
+    "- the tools the live /mcp server registers (`registeredMcpToolDefinitions()` in src/services/mcp-tool-manifest.ts, with PAYMENTS_ENABLED unset as in production): names, titles, annotations and descriptions;",
     `- the brand entry in src/config/brand-entities.ts (\`BRAND_ENTITIES.${input.vertical}\`): name, URLs, support e-mail and example prompts;`,
     "- the catalog floor in distribution/catalog-claims.json: the honest catalog count (`honestCatalogCount()`) rounded down to the hundred;",
-    "- the icon and screenshot files themselves (size and md5).",
+    "- the protocol versions the MCP SDK supports (`SUPPORTED_PROTOCOL_VERSIONS` in @modelcontextprotocol/sdk), for the Connection step: an SDK upgrade can change them;",
+    "- the icon and screenshot files themselves (size and md5);",
+    ...(spec.screenshots
+      ? [`- the card templates the screenshots show (${spec.screenshots.templates.exports.map(code).join(", ")} in ${spec.screenshots.templates.module}), by md5, against the md5 they were rendered from;`]
+      : []),
+    ...(spec.serverSetup
+      ? [`- the \`new McpServer(...)\` call in ${spec.serverSetup.routeFile}, read with the TypeScript parser and not run: its serverInfo fields and whether it sends instructions;`]
+      : []),
+    "- the hand-kept prose and recorded rows in `PACKS`.",
     "",
-    `src/routes/connector-packs-fresh.test.ts fails when a file here differs from what the generator writes. After a change to the tools, the brand entry or the floors, run \`npx tsx ${GENERATOR}\` and commit the result. \`--verify-floors\` compares the floors with the live honest counts.`,
+    `src/routes/connector-packs-fresh.test.ts fails when a file here differs from what the generator writes. After a change to any of these, run \`npx tsx ${GENERATOR}\` and commit the result. \`--verify-floors\` compares the floors with the live honest counts.`,
     "",
     "## Not a directory path",
     "",
@@ -702,10 +857,13 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
           "",
           `This server serves interactive cards (MCP Apps), so the listing takes 3–5 PNG screenshots at least 1000 px wide, cropped to the app response, each with its prompt (${SUBMIT_DOC}).`,
           "",
-          table(["File", "Size"], input.screenshots.map((s) => [code(s.path), `${s.width}×${s.height}`])),
+          table(["File", "Size", "md5"], input.screenshots.map((s) => [code(s.path), `${s.width}×${s.height}`, code(s.md5)])),
           "",
           `Prompts: ${code(spec.screenshots.prompts)}.`,
           "",
+          ...(shotsRow?.status === "done"
+            ? []
+            : ["**Not yet.** These PNGs are not ready to upload; see the screenshots row in the prerequisites in ../README.md.", ""]),
         ]
       : []),
     "## Slug — permanent once published",
@@ -818,7 +976,9 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     fence([
       spec.dataHandling,
-      "There are no accounts, no login credentials and no payment data. The server logs which tool was called and by which client, with a hashed IP address, for usage statistics.",
+      CALL_LOG,
+      ...(spec.dataStored ? [spec.dataStored] : []),
+      "There are no accounts, no login credentials and no payment data.",
       `Privacy policy: ${brand.privacyUrl}`,
     ].join("\n\n")),
     "",
@@ -913,12 +1073,16 @@ export function renderConnectorPacks(): Map<string, string> {
   return out;
 }
 
-/** Repo-relative paths whose content on disk differs from `rendered` (or is missing). */
-export function stalePackFiles(rendered: Map<string, string>): string[] {
+/**
+ * Repo-relative paths whose content under `root` differs from `rendered` (or
+ * is missing). Line endings are compared as LF, so a Windows checkout with
+ * CRLF files is not reported stale.
+ */
+export function stalePackFiles(rendered: Map<string, string>, root = ROOT): string[] {
   const stale: string[] = [];
   for (const [rel, content] of rendered) {
-    const p = path.join(ROOT, rel);
-    if (!fs.existsSync(p) || fs.readFileSync(p, "utf8") !== content) stale.push(rel);
+    const p = path.join(root, rel);
+    if (!fs.existsSync(p) || fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n") !== content) stale.push(rel);
   }
   return stale;
 }

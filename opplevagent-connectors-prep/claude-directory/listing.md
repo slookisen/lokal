@@ -58,14 +58,16 @@ Upload `opplevagent-connectors-prep/assets/opplevagent-brand-512.png`: 512×512 
 
 This server serves interactive cards (MCP Apps), so the listing takes 3–5 PNG screenshots at least 1000 px wide, cropped to the app response, each with its prompt (https://claude.com/docs/connectors/building/submission).
 
-| File | Size |
-|---|---|
-| `opplevagent-connectors-prep/assets/01-experiences-list-troms.png` | 1260×2124 |
-| `opplevagent-connectors-prep/assets/02-experience-detail-arctic-explorer.png` | 1260×663 |
-| `opplevagent-connectors-prep/assets/03-experience-detail-aurora-safari.png` | 1260×663 |
-| `opplevagent-connectors-prep/assets/04-experiences-list-national-mix.png` | 1260×1809 |
+| File | Size | md5 |
+|---|---|---|
+| `opplevagent-connectors-prep/assets/01-experiences-list-troms.png` | 1260×2124 | `0c1c72332285504766df60507751f8ac` |
+| `opplevagent-connectors-prep/assets/02-experience-detail-arctic-explorer.png` | 1260×663 | `3e287b5a43f667bfe9fbb636a53a4f46` |
+| `opplevagent-connectors-prep/assets/03-experience-detail-aurora-safari.png` | 1260×663 | `7a4b94182c40d46bf7e91156b7b2a8da` |
+| `opplevagent-connectors-prep/assets/04-experiences-list-national-mix.png` | 1260×1809 | `cc4433fbf510ccf20b27f87496bee7ab` |
 
 Prompts: `opplevagent-connectors-prep/assets/prompts.txt`.
+
+**Not yet.** These PNGs are not ready to upload; see the screenshots row in the prerequisites in ../README.md.
 
 ## Slug — permanent once published
 

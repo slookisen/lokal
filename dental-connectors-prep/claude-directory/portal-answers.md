@@ -85,7 +85,9 @@ Paste if the portal asks what data the connector handles:
 ```
 The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.
 
-There are no accounts, no login credentials and no payment data. The server logs which tool was called and by which client, with a hashed IP address, for usage statistics.
+Every call is logged with the tool name, the protocol, the response time, the client's name and version, the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address (never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.
+
+There are no accounts, no login credentials and no payment data.
 
 Privacy policy: https://finn-tannlege.com/personvern
 ```

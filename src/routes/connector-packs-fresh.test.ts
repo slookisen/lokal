@@ -12,7 +12,10 @@
  * Covers:
  *   (a) freshness: the generator's output equals every pack file on disk, the
  *       set is exactly four files per vertical, and rendering is deterministic
- *       (twice → identical, no timestamps).
+ *       (twice → identical, no timestamps); with PAYMENTS_ENABLED=1 in the
+ *       caller's environment the tools are still read as production registers
+ *       them and the variable is restored; a CRLF copy of a pack is not
+ *       stale, a changed or missing one is.
  *   (b) tools, parsed back out of portal-answers.md: names and count equal
  *       registeredMcpToolDefinitions() (and the discovery manifest), and each
  *       row's title, annotations.title, readOnlyHint, destructiveHint and
@@ -40,9 +43,19 @@
  *       note, an example prompt without a mapping or an over-long
  *       description throws, a new floor shows up in the listing, and all
  *       rows done reads "Ready to submit: yes".
+ *       Screenshots: the row is DONE only while the card templates hash to the
+ *       md5 the PNGs were rendered from; changed templates open it and keep
+ *       "Ready to submit" at no even when every other row is done.
+ *       Dental server setup: the row follows the `new McpServer(...)` call in
+ *       dental-mcp.ts (instructions, title, description, websiteUrl), read by
+ *       a parser that finds RFB's and Opplevagent's instructions, reads the
+ *       S4a shape as done, and throws on a shape it cannot read.
+ *       Recorded rows: the README says no test checks them and names the
+ *       pull requests they cite.
  *   (g) icons: the file each pack names has the md5 pinned per brand and is
  *       a 512×512 PNG; the listing prints that md5; no two brands share an
- *       icon and no brand's assets/ holds another brand's icon; dental has
+ *       icon and no brand's assets/ holds another brand's icon or a known
+ *       foreign one (the RFB sprout in blue, removed in G3-S6); dental has
  *       none yet and says so.
  *   (h) listing and test instructions: printed character counts equal the
  *       text and stay within the portal limits; every brand example prompt is
@@ -51,6 +64,11 @@
  *   (i) MCPB: opplevagent-connectors-prep/claude-desktop/ is marked as a
  *       deprecated path (manifest.json `_deprecated`, README banner), and
  *       every README says MCPB is not a directory path.
+ *   (j) Connection and Data handling: the protocol versions are the MCP SDK's
+ *       SUPPORTED_PROTOCOL_VERSIONS and the README names that source; the
+ *       data-handling paste block says the User-Agent is stored unhashed, the
+ *       IP only as a hash and the call log goes after 60 days, and names what
+ *       the write tools store (RFB orders, Opplevagent visit requests).
  *
  * Run standalone: npx tsx src/routes/connector-packs-fresh.test.ts
  * Wired into `npm test` via tests/test.ts.
@@ -58,7 +76,9 @@
 
 import { createHash } from "crypto";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
+import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
 import type { CatalogVertical } from "../services/honest-count";
@@ -70,15 +90,19 @@ import {
 import { parseClaims } from "./distribution-metadata.test";
 import {
   DIRECTIVE_PATTERNS,
+  FLOOR_KEY,
   LIMITS,
   PACKS,
   PACK_FILES,
   PACK_VERTICALS,
   PORTAL_URL,
+  SERVER_INFO_FIELDS,
+  cardTemplatesMd5,
   directivePhrases,
   formatInt,
   gatherPackInput,
   readCatalogFloors,
+  readServerConstruction,
   renderConnectorPacks,
   renderPack,
   stalePackFiles,
@@ -108,6 +132,14 @@ const PINNED_ICON_MD5: Record<CatalogVertical, string | null> = {
   dental: null,
 };
 
+/**
+ * Icons that belong to no brand's pack. A recoloured copy has its own md5, so
+ * the byte-identical check against PINNED_ICON_MD5 cannot catch it.
+ */
+const FOREIGN_ICON_MD5: Record<string, string> = {
+  a819cd4185cc077e0164e5cc8b6329f0: "the RFB sprout in blue (opplevagent-square-blue-512.png, removed in G3-S6)",
+};
+
 /** Figures and premises the old packs carried. */
 const STALE_TEXT: readonly RegExp[] = [
   /\b1,600\b/, /\b6,900\b/, /\b6,961\b/, /\b6 961\b/, /\b14 tools\b/i,
@@ -119,6 +151,7 @@ const REQUIRED_ROWS: Record<CatalogVertical, readonly string[]> = {
   rfb: ["Tool descriptions describe and never instruct Claude"],
   experiences: [
     "Tool descriptions describe and never instruct Claude",
+    "MCP App carousel screenshots",
     "Free-text search in discover_experiences",
     "OpenAI's decision on the Opplevagent ChatGPT app",
   ],
@@ -133,12 +166,15 @@ const REQUIRED_ROWS: Record<CatalogVertical, readonly string[]> = {
   ],
 };
 
-// distribution/catalog-claims.json noun groups → vertical ids
-const CLAIM_VERTICAL: Record<string, CatalogVertical> = { rfb: "rfb", dental: "dental", opplevelser: "experiences" };
+// distribution/catalog-claims.json noun groups → vertical ids (the generator's FLOOR_KEY, inverted)
+const CLAIM_VERTICAL: Record<string, CatalogVertical> = Object.fromEntries(
+  Object.entries(FLOOR_KEY).map(([v, key]) => [key, v as CatalogVertical]),
+);
 
 const md5 = (buf: Buffer): string => createHash("md5").update(buf).digest("hex");
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
+/** PNG width and height, read here rather than through the generator's pngInfo() so g2 is an independent check. */
 function pngSize(buf: Buffer): { w: number; h: number } | null {
   if (buf.length < 24 || !buf.subarray(0, 8).equals(PNG_SIGNATURE) || buf.toString("ascii", 12, 16) !== "IHDR") return null;
   return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
@@ -185,6 +221,11 @@ function toolTableRows(portal: string): Map<string, string[]> {
     if (m) out.set(m[1], m[2].split(" | "));
   }
   return out;
+}
+
+/** The fenced block after "Paste if the portal asks what data the connector handles:" in portal-answers.md. */
+function dataHandlingBlock(portal: string): string {
+  return portal.split("Paste if the portal asks what data the connector handles:")[1]?.split("```")[1] ?? "";
 }
 
 /** The fenced block right after a "## <heading>" line, and the "N characters" line after it. */
@@ -249,6 +290,38 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
     assertTrue([...rendered].every(([k, c]) => again.get(k) === c), "a4: rendering twice gives identical files (deterministic)");
     const stamped = [...rendered].filter(([, c]) => /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(c)).map(([k]) => k);
     assertEq(stamped, [], "a5: no pack file carries a timestamp");
+
+    // The CLI runs in the caller's environment; PAYMENTS_ENABLED=1 there must
+    // not reach the tools the packs are made from, and must be left as it was.
+    {
+      const submitText = (tools: readonly McpToolDefinition[]): string | undefined => tools.find((t) => t.name === "lokal_cart_submit")?.description;
+      const off = submitText(registeredMcpToolDefinitions("rfb"));
+      process.env.PAYMENTS_ENABLED = "1";
+      try {
+        assertTrue(submitText(registeredMcpToolDefinitions("rfb")) !== off, "a6 control: PAYMENTS_ENABLED=1 changes lokal_cart_submit's registered description (a7 is not vacuous)");
+        assertEq(submitText(gatherPackInput("rfb", floors).tools), off, "a7: with PAYMENTS_ENABLED=1 in the environment the packs still read the production tools");
+        const withPayments = renderConnectorPacks();
+        assertTrue([...rendered].every(([k, c]) => withPayments.get(k) === c), "a8: and write the same packs");
+        assertEq(process.env.PAYMENTS_ENABLED, "1", "a9: reading the tools restores the caller's PAYMENTS_ENABLED");
+      } finally {
+        delete process.env.PAYMENTS_ENABLED;
+      }
+    }
+
+    // Line endings: a Windows checkout (CRLF) is fresh; a changed or missing file is stale.
+    {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "connector-packs-fresh-"));
+      try {
+        const sample = new Map([...rendered].slice(0, 3));
+        const [crlf, changed, missing] = [...sample.keys()];
+        for (const rel of [crlf, changed]) fs.mkdirSync(path.dirname(path.join(tmp, rel)), { recursive: true });
+        fs.writeFileSync(path.join(tmp, crlf), sample.get(crlf)!.replace(/\n/g, "\r\n"));
+        fs.writeFileSync(path.join(tmp, changed), sample.get(changed)! + "edited by hand\n");
+        assertEq(stalePackFiles(sample, tmp), [changed, missing], "a10: a CRLF copy is not stale; a changed or missing file is");
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    }
 
     const pack = (v: CatalogVertical, f: (typeof PACK_FILES)[number]): string => rendered.get(`${PACKS[v].dir}/${f}`) ?? "";
     const whole = (v: CatalogVertical): string => PACK_FILES.map((f) => pack(v, f)).join("\n");
@@ -326,6 +399,27 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
         assertTrue(readme.includes(`\`${t.name}\``) && /\| Prompt injection \| \*\*Not yet\.\*\*/.test(portal),
           `f8 ${v}/${t.name}: an instructing description is named in the README and blocks the prompt-injection acknowledgment`);
       }
+      const shots = PACKS[v].screenshots;
+      if (shots) {
+        const current = cardTemplatesMd5(shots.templates) === shots.rendered.templatesMd5;
+        const shaped = shots.files.length >= 3 && shots.files.length <= 5 &&
+          shots.files.every((f) => (pngSize(fs.readFileSync(path.join(ROOT, f)))?.w ?? 0) >= 1000);
+        assertEq(rowStatus(rows, "MCP App carousel screenshots"), current && shaped ? "DONE" : "OPEN",
+          `f25 ${v}: the screenshot row is DONE only while ${shots.templates.module} hashes to the md5 the PNGs were rendered from (${current ? "unchanged" : "changed since"} ${shots.rendered.date})`);
+        assertTrue(current && shaped ? !listing.includes("These PNGs are not ready") : listing.includes("**Not yet.** These PNGs are not ready to upload"),
+          `f26 ${v}: the listing's screenshot section agrees with the row`);
+      }
+      const setup = PACKS[v].serverSetup;
+      if (setup) {
+        const server = readServerConstruction(setup.routeFile);
+        const complete = server.instructions && SERVER_INFO_FIELDS.every((f) => server.info.includes(f));
+        assertEq(rowStatus(rows, "MCP server instructions"), complete ? "DONE" : "OPEN",
+          `f27 ${v}: the server-setup row follows new McpServer(...) in ${setup.routeFile} (instructions ${server.instructions}, serverInfo ${server.info.join(", ")})`);
+      }
+      const cited = [...new Set(PACKS[v].recordedPrerequisites.flatMap((p) => `${p.item} ${p.detail}`.match(/\blokal#\d+/g) ?? []))];
+      const recordedNote = readme.split("\n").find((l) => l.includes('Rows with source "recorded"')) ?? "";
+      assertTrue(PACKS[v].recordedPrerequisites.length === 0 || (recordedNote.includes("no test checks them") && cited.every((pr) => recordedNote.includes(pr))),
+        `f28 ${v}: the README says no test checks the recorded rows and names the pull requests they cite (${cited.join(", ") || "none"})`);
 
       // ── (g) icons ──────────────────────────────────────────────────────────
       const iconRel = PACKS[v].icon;
@@ -356,7 +450,22 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
 
       // ── (i) MCPB ───────────────────────────────────────────────────────────
       assertTrue(/## Not a directory path[\s\S]*MCPB/.test(readme), `i1 ${v}: the README says MCPB is not a directory path`);
+
+      // ── (j) Connection and Data handling ─────────────────────────────────
+      assertTrue(portal.includes(`| Protocol versions (MCP SDK) | ${SUPPORTED_PROTOCOL_VERSIONS.map((p) => `\`${p}\``).join(", ")} |`),
+        `j1 ${v}: the Connection step lists exactly the SDK's SUPPORTED_PROTOCOL_VERSIONS`);
+      assertTrue(readme.includes("`SUPPORTED_PROTOCOL_VERSIONS`"), `j2 ${v}: the README names the SDK's protocol versions as a source`);
+      const data = dataHandlingBlock(portal);
+      assertTrue(/full User-Agent string \(stored as sent, not hashed\)/.test(data) && /hash of the IP address/.test(data) && /deleted automatically after 60 days/.test(data),
+        `j3 ${v}: the data-handling block says the User-Agent is stored unhashed, the IP only as a hash, and the call log goes after 60 days`);
+      assertTrue(!/The server logs which tool was called and by which client/.test(data), `j4 ${v}: the old, incomplete logging sentence is gone`);
+      assertTrue(data.includes(BRAND_ENTITIES[v].privacyUrl), `j5 ${v}: the data-handling block links the privacy policy`);
     }
+    assertTrue(/Contact details sent with an order \(name, e-mail, phone, note\) are stored/.test(dataHandlingBlock(pack("rfb", "claude-directory/portal-answers.md"))),
+      "j6: the RFB block says order contact details are stored");
+    assertTrue(/A visit request stores the guest's name, e-mail/.test(dataHandlingBlock(pack("experiences", "claude-directory/portal-answers.md"))) &&
+      /agent requests: the tool, the filters and search terms sent/.test(dataHandlingBlock(pack("experiences", "claude-directory/portal-answers.md"))),
+      "j7: the Opplevagent block says visit requests are stored with contact data, and names the agent-request log");
 
     // ── (c, e) old figures and premises, across the three folders ──────────
     {
@@ -431,7 +540,44 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
         brand: { ...base.brand, termsUrl: `${base.brand.url}/vilkar`, docsUrl: `${base.brand.url}/guide-tannlege-ai` },
         icon: { path: "dental-connectors-prep/assets/x.png", width: 512, height: 512, md5: "0".repeat(32) },
       };
-      assertTrue(renderPack(allDone, doneInput)["README.md"].includes("**Ready to submit: yes.**"), "f24: all rows done reads «Ready to submit: yes»");
+      const doneServer = { info: ["name", "version", ...SERVER_INFO_FIELDS], instructions: true };
+      assertTrue(renderPack(allDone, { ...doneInput, server: doneServer })["README.md"].includes("**Ready to submit: yes.**"), "f24: all rows done reads «Ready to submit: yes»");
+
+      // Screenshots (review finding B1): every other Opplevagent row done, the
+      // card templates changed since the PNGs were rendered → not ready.
+      const oaSpec = PACKS.experiences;
+      const oaShots = oaSpec.screenshots!;
+      const oaBase = gatherPackInput("experiences", floors);
+      const oaDone: PackSpec = { ...oaSpec, recordedPrerequisites: oaSpec.recordedPrerequisites.map((p) => ({ ...p, status: "done" as const })) };
+      const oaClean: PackInput = { ...oaBase, tools: oaBase.tools.map((t) => ({ ...t, description: "Plain." })) };
+      const staleCards = renderPack(oaDone, { ...oaClean, screenshotTemplatesMd5: "f".repeat(32) })["README.md"];
+      assertEq(rowStatus(prerequisiteRows(staleCards), "MCP App carousel screenshots"), "OPEN", "f29: changed card templates open the screenshot row");
+      assertTrue(staleCards.includes("**Ready to submit: no** (1 open).") && staleCards.includes("do not show the live cards") && staleCards.includes(oaShots.renderCommand),
+        "f30: with every other row done, changed card templates still keep «Ready to submit» at no, and the row says how to render again");
+      assertTrue(renderPack(oaDone, { ...oaClean, screenshotTemplatesMd5: oaShots.rendered.templatesMd5 })["README.md"].includes("**Ready to submit: yes.**"),
+        "f31: card templates that hash to the rendered md5 close the row");
+      assertEq(renderPack(oaDone, { ...oaClean, screenshotTemplatesMd5: "e".repeat(32) })["README.md"], staleCards,
+        "f31b: a further template change while the row is open leaves the pack unchanged (no churn per widget edit)");
+      assertTrue(/^[0-9a-f]{32}$/.test(cardTemplatesMd5(oaShots.templates)), "f32: the card templates hash (control)");
+      throwsWith(() => cardTemplatesMd5({ module: oaShots.templates.module, exports: ["NO_SUCH_TEMPLATE"] }), /has no string export NO_SUCH_TEMPLATE/,
+        "f33: a template export that does not exist throws instead of hashing nothing");
+
+      // Dental server setup, read from new McpServer(...) without running it.
+      assertTrue(readServerConstruction("src/routes/mcp.ts").instructions && readServerConstruction("src/routes/experiences-mcp.ts").instructions,
+        "f34 control: the parser finds the instructions RFB and Opplevagent send (f27 is not vacuous)");
+      const s4a = readServerConstruction("x.ts",
+        `const s = new McpServer({ name: "finn-tannlege", version: "0.2.0", title: "Finn-tannlege", description: "Dental clinics", websiteUrl: "https://finn-tannlege.com" }, { instructions });`);
+      assertEq(s4a, { info: ["name", "version", "title", "description", "websiteUrl"], instructions: true }, "f35: the S4a shape (shorthand instructions) is read");
+      assertEq(rowStatus(readmeOf(dentalSpec, { ...base, server: s4a }), "MCP server instructions"), "DONE", "f36: the S4a shape closes the dental server-setup row");
+      assertEq(readServerConstruction("x.ts", `new McpServer({ name: "a", version: "1" });`), { info: ["name", "version"], instructions: false },
+        "f37: no options argument reads as no instructions");
+      throwsWith(() => readServerConstruction("x.ts", "const x = 1;"), /expected one new McpServer\(\.\.\.\), found 0/, "f38: a file without new McpServer(...) throws");
+      throwsWith(() => readServerConstruction("x.ts", `new McpServer({ name: "a", version: "1" }); new McpServer({ name: "b", version: "1" });`),
+        /found 2/, "f39: two constructions throw instead of picking one");
+      throwsWith(() => readServerConstruction("x.ts", `new McpServer(INFO, { instructions: X });`), /serverInfo is not an object literal/,
+        "f40: an argument the parser cannot read throws instead of guessing");
+      throwsWith(() => readServerConstruction("x.ts", `new McpServer({ name: "a", version: "1" }, { ...OPTS });`), /spread or computed property/,
+        "f41: a spread in the options throws instead of guessing");
     }
 
     // ── (g) icons across brands ─────────────────────────────────────────────
@@ -443,10 +589,12 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
         const files = fs.existsSync(assets) ? fs.readdirSync(assets).filter((f) => f.endsWith(".png")) : [];
         const foreign = files.filter((f) => {
           const m = md5(fs.readFileSync(path.join(assets, f)));
-          return PACK_VERTICALS.some((o) => o !== v && PINNED_ICON_MD5[o] === m);
+          return PACK_VERTICALS.some((o) => o !== v && PINNED_ICON_MD5[o] === m) || m in FOREIGN_ICON_MD5;
         });
-        assertEq(foreign, [], `g5 ${v}: no file in ${PACKS[v].dir}/assets/ is another brand's icon`);
+        assertEq(foreign, [], `g5 ${v}: no file in ${PACKS[v].dir}/assets/ is another brand's icon or a known foreign one`);
       }
+      assertTrue(!fs.existsSync(path.join(ROOT, "opplevagent-connectors-prep", "assets", "opplevagent-square-blue-512.png")),
+        "g6: opplevagent-square-blue-512.png (the RFB sprout in blue, referenced by nothing) is gone");
     }
 
     // ── (i) the MCPB path is marked deprecated ──────────────────────────────

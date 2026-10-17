@@ -103,7 +103,11 @@ Paste if the portal asks what data the connector handles:
 ```
 The tools receive only what a question needs: a search term, a place, a category or coordinates, and for a pickup order the products chosen. Contact details the user gives are passed to an ordering producer only when the user consents to it (contact_consent).
 
-There are no accounts, no login credentials and no payment data. The server logs which tool was called and by which client, with a hashed IP address, for usage statistics.
+Every call is logged with the tool name, the protocol, the response time, the client's name and version, the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address (never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.
+
+A cart stores the products and producers chosen and a buyer_ref token, and is valid for 7 days. Contact details sent with an order (name, e-mail, phone, note) are stored with the cart and each order; the privacy policy says how long they are kept.
+
+There are no accounts, no login credentials and no payment data.
 
 Privacy policy: https://rettfrabonden.com/personvern
 ```
@@ -137,4 +141,4 @@ Check the summary, then submit. Status and reviewer feedback appear in the porta
 ## Known caveats, to state if asked
 
 - Prices: most producers list products without a price, and the tools say so. Do not describe the connector as a price comparison.
-- Prepayment: production runs with PAYMENTS_ENABLED unset. If it is switched on (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect), lokal_cart_submit's description and the financial-transactions answer change: regenerate this pack and answer again before submitting.
+- Prepayment: production runs with PAYMENTS_ENABLED unset, and the generator reads the tools that way. If it is switched on (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect), lokal_cart_submit's description and the financial-transactions answer change: update `productionToolDefinitions()` and `PACKS` in the generator, regenerate this pack and answer again before submitting.
