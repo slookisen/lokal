@@ -7,6 +7,7 @@ import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
+import { getSearchConsolesHealth, startSearchConsoleScheduler } from "./services/search-console-fetch";
 import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
   securityHeaders,
@@ -66,6 +67,7 @@ import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
+import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
@@ -769,6 +771,9 @@ app.get("/health", (_req, res) => {
       // Numbers only here (public endpoint); per-stall request/job detail is
       // admin-only at GET /admin/analytics/ops/event-loop.
       eventLoop: getEventLoopSummary(),
+      // GSC / Bing connection (A2A 2026-10-16-gsc-bing-ai-rapporter): status codes,
+      // counts and check time only, read from memory — never a network call here.
+      searchConsoles: getSearchConsolesHealth(),
       responseMs,
     });
   } catch (err) {
@@ -781,6 +786,10 @@ app.get("/health", (_req, res) => {
   }
 });
 
+// GET /admin/analytics/search-consoles — weekly GSC/Bing numbers per domain
+// (A2A 2026-10-16-gsc-bing-ai-rapporter, S6c). Own router, mounted before the
+// analytics router below.
+app.use("/admin/analytics/search-consoles", adminLimiter, adminSearchConsolesRoutes);
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
@@ -1476,6 +1485,14 @@ app.listen(Number(PORT), HOST, async () => {
   // boot prewarm and trust recalc), then hourly; the nightly prune below also
   // awaits one run before deleting. Disable with TRAFFIC_HISTORY_DISABLED=1.
   startTrafficHistoryScheduler({ getDb: () => getDb(), bootDelayMs: 6 * 60_000 });
+
+  // ─── GSC and Bing Webmaster (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c)
+  // Read-only connectivity check 2 min after boot (inside the boot-job gate),
+  // then every 24 h; the same run fetches the latest complete week into
+  // search_console_weekly. Runs when GSC_SERVICE_ACCOUNT_JSON and/or
+  // BING_WEBMASTER_API_KEY is set; SEARCH_CONSOLE_FETCH_ENABLED=0 turns it off.
+  // Status in /health (searchConsoles), numbers at /admin/analytics/search-consoles.
+  startSearchConsoleScheduler({ getDb: () => getDb() });
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // in-memory delivery counts are written as daily sums every minute and on

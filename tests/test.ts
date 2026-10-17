@@ -43240,6 +43240,35 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c: GSC and Bing Webmaster
+  // connectivity check, weekly fetch into search_console_weekly, /health status,
+  // GET /admin/analytics/search-consoles. Fetch stubs only (no network). Pins the
+  // main getDb() for the admin-route step and sets ADMIN_KEY (both restored), so serial.
+  console.log("\n── søkekonsoller S6c: GSC + Bing Webmaster ──");
+  try {
+    const { runBingWebmasterFetchTests } = require("../src/services/bing-webmaster-fetch.test") as
+      typeof import("../src/services/bing-webmaster-fetch.test");
+    const bw = await runBingWebmasterFetchTests({ log: false });
+    passed += bw.passed;
+    failed += bw.failed;
+    for (const f of bw.failures) failures.push("bing-webmaster-fetch: " + f);
+    console.log(`  bing-webmaster-fetch: ${bw.passed} passed, ${bw.failed} failed`);
+
+    const { runSearchConsoleFetchTests } = require("../src/services/search-console-fetch.test") as
+      typeof import("../src/services/search-console-fetch.test");
+    const scf = await runSearchConsoleFetchTests({ log: false });
+    passed += scf.passed;
+    failed += scf.failed;
+    for (const f of scf.failures) failures.push("search-console-fetch: " + f);
+    console.log(`  search-console-fetch: ${scf.passed} passed, ${scf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("search-consoles: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ search-consoles: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── orchestrator-pr-1: /api/stats host-scoped registry stats (dental/experiences hosts no longer see RFB's numbers) ──");
   try {
     const { runA2aStatsVerticalTests } = require("../src/routes/a2a-stats-vertical.test") as

@@ -5505,6 +5505,30 @@ function initSchema(db: Database.Database): void {
     console.error("Migration profile_ai_deliveries failed:", err);
   }
 
+  // ─── search_console_weekly (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c) ───
+  // Weekly numbers from Google Search Console and Bing Webmaster Tools per
+  // domain (source gsc | bing; week = Monday YYYY-MM-DD; metric e.g. clicks,
+  // impressions, sitemaps; dimension e.g. total, country:nor), upserted by
+  // services/search-console-fetch.ts. Aggregates only, no secrets. Same DDL as
+  // SEARCH_CONSOLE_WEEKLY_DDL there (a test compares them). Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS search_console_weekly (
+        domain TEXT NOT NULL,
+        source TEXT NOT NULL,
+        week TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        dimension TEXT NOT NULL,
+        value REAL NOT NULL,
+        fetched_at TEXT NOT NULL,
+        UNIQUE (domain, source, week, metric, dimension)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_console_weekly_week ON search_console_weekly(week)`);
+  } catch (err) {
+    console.error("Migration search_console_weekly failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

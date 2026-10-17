@@ -38,6 +38,9 @@ export const TRAFFIC_PREWARM_BOOT_DELAY_MS = 60 * 1000;
 // owns its +9 min constant (AGENTS_GEOCODE_BOOT_DELAY_MS). */
 export const DENTAL_GEOCODE_BOOT_DELAY_MS = 3 * 60 * 1000;
 export const EXPERIENCES_GEOCODE_BOOT_DELAY_MS = 6 * 60 * 1000;
+/** First GSC/Bing connectivity check (services/search-console-fetch.ts, A2A 2026-10-16-gsc-bing-ai-rapporter):
+ *  a few small HTTPS calls, run inside runExclusiveBootJob in the free slot before the 3 min geocode. */
+export const SEARCH_CONSOLE_BOOT_DELAY_MS = 2 * 60 * 1000;
 
 /** Resolve on the next macrotask so queued I/O and timers can run. */
 export function yieldToEventLoop(): Promise<void> {
