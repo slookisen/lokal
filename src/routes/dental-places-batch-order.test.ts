@@ -105,6 +105,7 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       ins.run({ id: "r-zz-old", navn: "Zz Retry Gammel", hjemmeside: HP, places_attempted_at: daysAgoIso(200) });
       ins.run({ id: "r-aa-new", navn: "Aa Retry Nyere", hjemmeside: HP, places_attempted_at: daysAgoIso(100) });
       ins.run({ id: "r-in-window", navn: "Aaa Innen Vindu", hjemmeside: "", places_attempted_at: daysAgoIso(10) });
+      ins.run({ id: "r-nohp-old", navn: "Aaaa Retry Uten Hjemmeside", hjemmeside: "", places_attempted_at: daysAgoIso(150) });
 
       const router = (require("./dental") as typeof import("./dental")).default as any;
       const headers = { "x-admin-key": testKey };
@@ -116,7 +117,7 @@ export function runDentalPlacesBatchOrderTests(opts: { log?: boolean } = {}): Pr
       assertEq(all.status, 200, "a1: auto-select dry-run -> 200");
       assertEq(
         idsOf(all),
-        ["n-zeta-nohp", "n-bergen", "n-aasane", "r-zz-old", "r-aa-new"],
+        ["n-zeta-nohp", "n-bergen", "n-aasane", "r-nohp-old", "r-zz-old", "r-aa-new"],
         "a2: never-attempted (missing-homepage, then navn) before retries (oldest first); in-window row excluded",
       );
 
