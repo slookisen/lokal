@@ -1670,7 +1670,7 @@ export function homeStrings(lang: Lang) {
     // box, «Alle opplevelser» and the hint link. `en` and `sv` deliberately
     // keep their old copy (decision 6=A) — not out of sync by accident.
     metaTitle: "Opplevagent — gårdssalg, smaking og lokale drikkeprodusenter",
-    metaDesc: "Besøk norske bryggerier, siderier, vingårder, destillerier og gårdskafeer — smaking, omvisning og gårdssalg rett hos produsenten. Alle tilbydere er verifisert mot Brønnøysundregistrene.",
+    metaDesc: "Besøk norske bryggerier, siderier, vingårder, destillerier og gårdskafeer — smaking og gårdssalg rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
     ogTitle: "Opplevagent — gårdssalg, smaking og drikke i Norge",
     ogImageAlt: "Opplevagent — gårdssalg og smaking hos norske produsenter",
     skip: "Hopp til hovedinnhold",
@@ -1685,7 +1685,7 @@ export function homeStrings(lang: Lang) {
     navProviders: "For tilbydere",
     heroPill: "Håndplukket og Brreg-verifisert",
     heroH1: "Gårdssalg og smaking ", heroAccent: "rett hos produsenten",
-    heroSub: "Besøk bryggerier, siderier, vingårder, destillerier og gårdskafeer over hele Norge, samlet ett sted.",
+    heroSub: "Besøk bryggerier, siderier, vingårder, destillerier og gårdskafeer over hele Norge, samlet på ett sted.",
     searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: sideri, bryggeri, Hardanger …", searchBtn: "Finn opplevelser",
     hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ".",
     // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
