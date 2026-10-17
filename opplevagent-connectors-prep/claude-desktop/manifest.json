@@ -1,5 +1,6 @@
 {
   "manifest_version": "0.3",
+  "_deprecated": "Not a Claude directory path: the directory no longer accepts local MCP servers packaged as MCPB (https://claude.com/docs/directory/publish, read 2026-10-17). Submit the remote server https://opplevagent.no/mcp at https://claude.ai/directory/manage with the pack in ../claude-directory/. Kept as history; not maintained.",
   "name": "opplevagent-mcp",
   "display_name": "Opplevagent — Norske opplevelser og aktiviteter",
   "version": "0.2.0",

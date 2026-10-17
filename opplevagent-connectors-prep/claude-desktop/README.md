@@ -1,5 +1,12 @@
 # Opplevagent — Claude Desktop connector submission checklist
 
+> **Deprecated path (2026-10-17).** "Desktop extension listings in the directory are deprecated"
+> (https://claude.com/docs/directory/publish): do not submit `manifest.json` from this folder.
+> Opplevagent goes in as the remote MCP connector `https://opplevagent.no/mcp`, from
+> https://claude.ai/directory/manage with Daniel's own Pro or Max account, using the generated
+> pack in `../claude-directory/` and the prerequisites in `../README.md`. Kept as history only, not
+> maintained (A2A dev-request `2026-10-16-merkevare-entitet-og-connector-pakker`, G3-S6).
+
 > **Re-verified 2026-08-24:** the REMOTE endpoint (`https://opplevagent.no/mcp`) now
 > exposes **5 tools** — the 3 below plus `discover_gardssalg` and `book_gardssalg` —
 > all with `title` + `readOnlyHint`/`destructiveHint` annotations (the Claude
@@ -8,9 +15,9 @@
 > dev-request `2026-08-24-opplevagent-npm-stdio-paritet`. A **directory submission
 > describes the remote server**, so use the 5-tool list there; this DXT manifest
 > describes the local stdio package and stays at 3 tools until the npm fix ships.
-> Note also: remote-server directory submissions go through the claude.ai submission
-> portal (requires a Team/Enterprise org); the DXT/.mcpb desktop-extension form is
-> separate and does NOT require an org.
+> Superseded 2026-10-17: remote servers are submitted at claude.ai/directory/manage, which
+> any paid plan can use (Pro and Max submit from their own account), and the
+> DXT/.mcpb desktop-extension form is no longer a directory path (see the note above).
 
 ## What's ready
 
@@ -55,9 +62,8 @@ and the `MIT` license are all directly verified against `mcp-server-opplevagent/
      ```json
      {"mcpServers":{"opplevagent":{"command":"npx","args":["opplevagent-mcp"]}}}
      ```
-3. If submitting to the public Claude Desktop connector directory rather than adding a personal
-   connector, follow the directory's submission form using `manifest.json` / `server.json` in this
-   directory as the source data (name, description, icon, tools, policy URLs, contact).
+3. *(Superseded 2026-10-17.)* The public directory no longer takes this folder's `manifest.json`;
+   submit the remote server with the pack in `../claude-directory/` instead.
 4. Upload the icon (`https://opplevagent.no/favicon.svg`) and confirm the privacy/terms links
    resolve before submitting.
 
