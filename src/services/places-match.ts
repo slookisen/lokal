@@ -26,6 +26,10 @@
 //                                          routes send
 //   formatPlacesMatchGuardLog(...)       — the "[places-match-guard]" line,
 //                                          same shape as the Brreg guard's
+//   placesFieldMask(fields)              — a FieldMask without Google's
+//                                          rating fields while
+//                                          GOOGLE_RATING_FETCH_ENABLED is off
+//                                          (S4-A2); RFB and dental
 //
 // PURE: no DB, no network. The routes do the I/O.
 
@@ -361,4 +365,44 @@ export function formatPlacesMatchGuardLog(
     `(place "${pick.placeName}", nameSim ${pick.nameSim.toFixed(2)}${why}, ${candidates} candidate(s); ` +
     `producer ${entity.postalCode ?? "-"} ${entity.postalTown ?? "-"})`
   );
+}
+
+// ─── Google rating fields (S4-A2) ───────────────────────────────────────
+// Same dev-request, slice S4-A2: Daniel's decision 2=A (2026-10-17) phases the
+// stored Google ratings out. Google's Places terms allow caching place_id (and
+// lat/lng for 30 days), not rating or userRatingCount (A2A
+// protocols/juridisk-sjekk-google-ratinger-2026-10-17.md §4.1), so the RFB
+// rating routes no longer ask Google for them and write no rating. The values
+// already stored stay untouched: deleting them needs Daniel's own yes.
+// Rollback without a revert: a one-line PR setting this to true, which
+// restores the pre-S4-A2 masks and rating writes on RFB.
+export const GOOGLE_RATING_FETCH_ENABLED = false;
+
+/** The Places (New) FieldMask entries that carry Google's rating. */
+export const PLACES_RATING_FIELDS: readonly string[] = ["places.rating", "places.userRatingCount"];
+
+let googleRatingFetchForTesting: boolean | null = null;
+
+/** Test-only: act as if GOOGLE_RATING_FETCH_ENABLED were `on`; null restores it. */
+export function __setGoogleRatingFetchForTesting(on: boolean | null): void {
+  googleRatingFetchForTesting = on;
+}
+
+/** GOOGLE_RATING_FETCH_ENABLED, or the test override. The RFB routes read it per request. */
+export function googleRatingFetchEnabled(): boolean {
+  return googleRatingFetchForTesting ?? GOOGLE_RATING_FETCH_ENABLED;
+}
+
+/**
+ * The comma-joined FieldMask for `fields`, without PLACES_RATING_FIELDS unless
+ * `ratingFetch` (default: googleRatingFetchEnabled()). The RFB masks that
+ * listed a rating field are built with it, so none reaches Google while
+ * fetching is off. Dental builds its masks with it and false: finn-tannlege
+ * has never requested a rating, and decision 2 covers it too.
+ */
+export function placesFieldMask(
+  fields: readonly string[],
+  ratingFetch: boolean = googleRatingFetchEnabled()
+): string {
+  return fields.filter((f) => ratingFetch || !PLACES_RATING_FIELDS.includes(f)).join(",");
 }

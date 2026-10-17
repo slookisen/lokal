@@ -53,6 +53,7 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
+import { placesFieldMask } from "../services/places-match";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -980,10 +981,21 @@ const OpeningHoursArraySchema = z.array(
 // needed: fill-only semantics mean "already filled" IS the durable marker,
 // unlike the RFB rating-batch (measure 2, RFB slice) where a rating can
 // legitimately not exist yet at all.
-const PLACES_ENTERPRISE_FIELD_MASK =
-  "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.regularOpeningHours,places.businessStatus,places.addressComponents";
-const PLACES_PRO_FIELD_MASK =
-  "places.displayName,places.formattedAddress,places.regularOpeningHours,places.businessStatus,places.addressComponents";
+//
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (S4-A2): built through the shared placesFieldMask with rating
+// fetch off, so a Google rating field is never requested for a clinic, also
+// not if RFB's GOOGLE_RATING_FETCH_ENABLED is set back. Daniel's decision 2
+// covers finn-tannlege too. The masks are the same as before: dental has
+// never requested one.
+const PLACES_ENTERPRISE_FIELD_MASK = placesFieldMask(
+  ["places.displayName", "places.formattedAddress", "places.internationalPhoneNumber", "places.websiteUri", "places.regularOpeningHours", "places.businessStatus", "places.addressComponents"],
+  false
+);
+const PLACES_PRO_FIELD_MASK = placesFieldMask(
+  ["places.displayName", "places.formattedAddress", "places.regularOpeningHours", "places.businessStatus", "places.addressComponents"],
+  false
+);
 
 interface PlacesAgentRow {
   id: string;
