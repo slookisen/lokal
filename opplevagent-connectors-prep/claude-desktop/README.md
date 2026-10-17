@@ -1,15 +1,11 @@
 # Opplevagent — Claude Desktop connector submission checklist
 
-> **Deprecated path (2026-10-17).** The Claude directory no longer accepts local MCP
-> servers packaged as desktop extensions (MCPB): "Desktop extension listings in the
-> directory are deprecated" (https://claude.com/docs/directory/publish). Do not submit
-> `manifest.json` from this folder. Opplevagent goes into the directory as the remote
-> MCP connector `https://opplevagent.no/mcp`, from https://claude.ai/directory/manage
-> with Daniel's own Pro or Max account, using the generated pack in
-> `../claude-directory/` and its prerequisites in `../README.md`. This folder is kept as
-> history only: its tool list, icon and `server.json` are not maintained (the registry
-> entry lives in `mcp-server-opplevagent/server.json`). A2A dev-request
-> `2026-10-16-merkevare-entitet-og-connector-pakker`, G3-S6.
+> **Deprecated path (2026-10-17).** "Desktop extension listings in the directory are deprecated"
+> (https://claude.com/docs/directory/publish): do not submit `manifest.json` from this folder.
+> Opplevagent goes in as the remote MCP connector `https://opplevagent.no/mcp`, from
+> https://claude.ai/directory/manage with Daniel's own Pro or Max account, using the generated
+> pack in `../claude-directory/` and the prerequisites in `../README.md`. Kept as history only, not
+> maintained (A2A dev-request `2026-10-16-merkevare-entitet-og-connector-pakker`, G3-S6).
 
 > **Re-verified 2026-08-24:** the REMOTE endpoint (`https://opplevagent.no/mcp`) now
 > exposes **5 tools** — the 3 below plus `discover_gardssalg` and `book_gardssalg` —

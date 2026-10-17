@@ -91,7 +91,7 @@ The tools receive only what a question needs: a search text, a place, filters or
 
 Every call is logged with the tool name, the protocol, the response time, the client's name and version, the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address (never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.
 
-Tool calls are also logged as agent requests: the tool, the filters and search terms sent, and the AI client's name, with no IP address; this log is not deleted automatically. A visit request stores the guest's name, e-mail, optional phone number, requested time, party size and note, and the guest gets a receipt with a status link. Visit requests are not deleted automatically; they are deleted on request, as the privacy policy describes.
+Tool calls are also logged as agent requests: the tool, the filters and search terms sent (for a visit request, its booking reference), the AI client's name and its full User-Agent string, with no IP address; this log is not deleted automatically. A visit request stores the guest's name, e-mail, optional phone number, requested time, party size and note, and the guest gets a receipt with a status link. Visit requests are not deleted automatically; they are deleted on request, as the privacy policy describes.
 
 There are no accounts, no login credentials and no payment data.
 

@@ -47659,14 +47659,9 @@ runSerial(async () => {
   }
 });
 
-// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S6): the
-// Claude directory packs in {rfb,opplevagent,dental}-connectors-prep/ equal what
-// scripts/gen-connector-packs.ts generates from the registered MCP tools,
-// brand-entities and the catalog floors — tool names/count/annotations, URLs,
-// floors (no stale figures), portal + Pro/Max premise, prerequisites, pinned
-// icon md5 per brand, MCPB marked deprecated. Builds throwaway MCP servers and
-// reads files; unsets PAYMENTS_ENABLED while rendering (restored in finally) —
-// runSerial, tail position.
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S6): the Claude directory
+// packs equal what scripts/gen-connector-packs.ts generates from the code. Throwaway MCP servers,
+// file reads, PAYMENTS_ENABLED unset while rendering (restored) — runSerial, tail position.
 runSerial(async () => {
   console.log("\n── connector-packs-fresh: Claude directory packs generated from the code ──");
   try {

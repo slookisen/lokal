@@ -2,35 +2,18 @@
  * gen-connector-packs.ts — the Claude directory packs, generated from the code.
  * A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S6.
  *
- * Writes, for Rett fra Bonden, Opplevagent and Finn-tannlege:
- *   <vertical>-connectors-prep/README.md
- *   <vertical>-connectors-prep/claude-directory/{listing,portal-answers,test-instructions}.md
- *
- * Every fact in them is read, not typed:
- *   - tools: registeredMcpToolDefinitions() — names, titles, annotations and
- *     descriptions exactly as the live /mcp server registers them;
- *   - brand: BRAND_ENTITIES (src/config/brand-entities.ts) — name, URLs,
- *     support e-mail, example prompts;
- *   - catalog size: the floor in distribution/catalog-claims.json, which is the
- *     honest count (honestCatalogCount()) rounded down to the hundred. Listing
- *     text is only changed by hand in the portal, so the packs quote the floor,
- *     never a live figure;
- *   - protocol versions: the MCP SDK's SUPPORTED_PROTOCOL_VERSIONS;
- *   - icons and screenshots: the files themselves (size and md5), and for the
- *     screenshots the md5 of the card templates they show, against the md5
- *     they were rendered from;
- *   - server instructions and serverInfo (dental): the `new McpServer(...)`
- *     call in the route file, read with the TypeScript parser, not run.
- * The prose and the prerequisite rows that code cannot tell are in PACKS below.
- * No clock is read: the same inputs give byte-identical files, which is what
- * src/routes/connector-packs-fresh.test.ts compares against. The packs describe
- * production, where PAYMENTS_ENABLED is unset: the tools are read with it
- * unset, whatever the caller's environment (productionToolDefinitions()).
+ * Writes <vertical>-connectors-prep/README.md and claude-directory/{listing,
+ * portal-answers,test-instructions}.md for RFB, Opplevagent and Finn-tannlege.
+ * Every fact is read, not typed (the sources are listed under "How this pack
+ * is made" in renderPack()); the prose and the rows code cannot tell are in
+ * PACKS. The catalog size is the floor in distribution/catalog-claims.json,
+ * never a live figure, since listing text only changes by hand in the portal.
+ * No clock is read: the same inputs give byte-identical files, which
+ * src/routes/connector-packs-fresh.test.ts compares against.
  *
  *   npx tsx scripts/gen-connector-packs.ts                  write the packs
  *   npx tsx scripts/gen-connector-packs.ts --check          exit 1 if a pack on disk is stale
- *   npx tsx scripts/gen-connector-packs.ts --verify-floors  compare the floors with the live
- *                                                           honest counts (/health "catalog")
+ *   npx tsx scripts/gen-connector-packs.ts --verify-floors  compare the floors with /health "catalog"
  */
 
 import { createHash } from "crypto";
@@ -61,12 +44,7 @@ const RECORDED = "2026-10-17";
 export const PACK_VERTICALS: readonly CatalogVertical[] = ["rfb", "experiences", "dental"];
 
 /** The pack files, relative to the vertical's folder. */
-export const PACK_FILES = [
-  "README.md",
-  "claude-directory/listing.md",
-  "claude-directory/portal-answers.md",
-  "claude-directory/test-instructions.md",
-] as const;
+export const PACK_FILES = ["README.md", "claude-directory/listing.md", "claude-directory/portal-answers.md", "claude-directory/test-instructions.md"] as const;
 
 /** Portal Listing-step limits (submission docs). */
 export const LIMITS = { name: 100, oneLiner: 200, description: 2000 } as const;
@@ -111,9 +89,8 @@ export interface Prerequisite {
 }
 
 export interface PackSpec {
-  /** Folder under the repo root. */
+  /** Folder under the repo root, and the permanent listing slug. */
   dir: string;
-  /** Listing URL slug: permanent once published. */
   slug: string;
   oneLiner: string;
   /** Description paragraphs; `floor` is the formatted catalog floor ("1,500"). */
@@ -121,21 +98,15 @@ export interface PackSpec {
   categories: readonly string[];
   /** Repo-relative path of the square PNG to upload; null while none exists. */
   icon: string | null;
-  /** MCP App carousel screenshots: the PNGs, the file pairing each with its prompt, and what they show. */
   screenshots: ScreenshotSpec | null;
-  /**
-   * The route file whose `new McpServer(...)` must send instructions and a
-   * title, description and websiteUrl before submission (a derived row), and
-   * who adds them; null when the pack has no such row.
-   */
+  /** The route file whose `new McpServer(...)` must send instructions and SERVER_INFO_FIELDS, and who adds them. */
   serverSetup: { routeFile: string; owner: string } | null;
   useCases: readonly string[];
-  /** One sentence on where the data comes from (Data handling and first-party API answers). */
+  /** Where the data comes from (Data handling and first-party API answers). */
   ownApi: string;
   authRationale: string;
-  /** What the tools receive and pass on (first paragraph of the Data handling paste block). */
+  /** What the tools receive and pass on, and what they store beyond CALL_LOG (null: nothing). */
   dataHandling: string;
-  /** What the tools store beyond the call log (CALL_LOG), as the privacy page says; null when nothing. */
   dataStored: string | null;
   healthData: string;
   financial: string;
@@ -144,28 +115,25 @@ export interface PackSpec {
   extraPrompts: ReadonlyArray<{ prompt: string; tool: string }>;
   /** What each write tool really does. Every write tool must have one. */
   writeToolNotes: Readonly<Record<string, string>>;
-  /** Who fixes a failing derived row. */
+  /** Who fixes a failing derived row, and why a description fix waits (null: nothing gates it). */
   owners: { descriptions: string; terms: string; docs: string; icon: string; screenshots: string };
-  /** Why a description fix waits, or null when nothing gates it. */
   descriptionsGate: string | null;
   recordedPrerequisites: ReadonlyArray<Omit<Prerequisite, "source">>;
   caveats: readonly string[];
-  /** README rows for the folder's other contents: [path, what it is]. */
+  /** README rows for the folder's other contents ([path, what it is]), and lines on paths that are not the directory. */
   otherContents: ReadonlyArray<readonly [string, string]>;
-  /** README lines on paths that are not the directory. */
   notADirectoryPath: readonly string[];
 }
 
+/** MCP App carousel screenshots: the PNGs in carousel order, their prompts file, and the card templates they show. */
 export interface ScreenshotSpec {
-  /** Repo-relative PNGs, in carousel order. */
   files: readonly string[];
-  /** The file pairing each PNG with its prompt. */
   prompts: string;
-  /** The card templates the PNGs show: a module and the exports holding the HTML. */
   templates: { module: string; exports: readonly string[] };
   /** When the PNGs were last rendered, and the md5 of the templates then (cardTemplatesMd5()). */
   rendered: { date: string; commit: string; templatesMd5: string };
-  /** How to render them again. */
+  /** When and how to render them again. */
+  renderAfter: string;
   renderCommand: string;
 }
 
@@ -206,30 +174,20 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "What organic cheese producers are there in Norway?": "lokal_search",
       "Where can I buy reindeer meat in Finnmark?": "lokal_search",
     },
-    extraPrompts: [
-      { prompt: "When is the next Bondens marked in Oslo?", tool: "lokal_bm_next_markets" },
-    ],
+    extraPrompts: [{ prompt: "When is the next Bondens marked in Oslo?", tool: "lokal_bm_next_markets" }],
     writeToolNotes: {
       lokal_cart_create: "Creates an empty anonymous cart and returns its id and a buyer_ref token. Nothing leaves the platform.",
       lokal_cart_add_item: "Adds a product to that cart or changes its quantity (the overwrite is why it is marked destructive). Nothing leaves the platform.",
       lokal_cart_submit: "Sends a real pickup order by e-mail to each producer in the cart who has opted in to orders through the platform; for the others it returns contact details. No payment.",
     },
-    owners: {
-      descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6)",
-      terms: DASH,
-      docs: DASH,
-      icon: DASH,
-      screenshots: DASH,
-    },
+    owners: { descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6)", terms: DASH, docs: DASH, icon: DASH, screenshots: DASH },
     descriptionsGate: "The fix waits for OpenAI's decision on the RFB ChatGPT app: tool metadata stays frozen while OpenAI reviews it (Daniel reports the decision).",
     recordedPrerequisites: [],
     caveats: [
       "Prices: most producers list products without a price, and the tools say so. Do not describe the connector as a price comparison.",
       "Prepayment: production runs with PAYMENTS_ENABLED unset, and the generator reads the tools that way. If it is switched on (A2A dev-request 2026-10-09-rfb-forhandsbetaling-stripe-connect), lokal_cart_submit's description and the financial-transactions answer change: update `productionToolDefinitions()` and `PACKS` in the generator, regenerate this pack and answer again before submitting.",
     ],
-    otherContents: [
-      ["assets/rfb-square-512.png", "The icon to upload: square, full-bleed, no rounded corners (clients crop it themselves)."],
-    ],
+    otherContents: [["assets/rfb-square-512.png", "The icon to upload: square, full-bleed, no rounded corners (clients crop it themselves)."]],
     notADirectoryPath: [
       "Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. `mcp-server/lokal-mcp.mcpb` and the npm package `lokal-mcp` still work for manual install, but they are not a directory submission.",
       "ChatGPT app: a separate submission to OpenAI (repo root `chatgpt-app-submission.json`), not covered here.",
@@ -257,8 +215,8 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       ],
       prompts: "opplevagent-connectors-prep/assets/prompts.txt",
       templates: { module: "src/routes/opplevagent-widgets.ts", exports: ["EXPERIENCES_LIST_HTML", "EXPERIENCE_DETAIL_HTML"] },
-      // The PNGs were last rendered in e8a68a45, from that commit's templates.
       rendered: { date: "2026-09-24", commit: "e8a68a45", templatesMd5: "dd5d60567b45ad773981299969680d8b" },
+      renderAfter: "After OpenAI's decision on the ChatGPT app (the cards can change in review)",
       renderCommand: "node opplevagent-connectors-prep/assets/generate-screenshots.js",
     },
     serverSetup: null,
@@ -271,7 +229,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ownApi: "Our own: the server reads Opplevagent's own experience and gårdssalg catalogue on the same domain.",
     authRationale: "The server serves public data about experiences and farm-sale producers in Norway. There are no user accounts, so there is nothing to sign in to. The one write tool sends a visit request with the guest's own name and e-mail so the producer can answer; it takes no credentials and no payment details.",
     dataHandling: "The tools receive only what a question needs: a search text, a place, filters or coordinates. A visit request (book_gardssalg) passes the guest's name and e-mail, and an optional phone number and note, to the producer so the producer can answer.",
-    dataStored: "Tool calls are also logged as agent requests: the tool, the filters and search terms sent, and the AI client's name, with no IP address; this log is not deleted automatically. A visit request stores the guest's name, e-mail, optional phone number, requested time, party size and note, and the guest gets a receipt with a status link. Visit requests are not deleted automatically; they are deleted on request, as the privacy policy describes.",
+    dataStored: "Tool calls are also logged as agent requests: the tool, the filters and search terms sent (for a visit request, its booking reference), the AI client's name and its full User-Agent string, with no IP address; this log is not deleted automatically. A visit request stores the guest's name, e-mail, optional phone number, requested time, party size and note, and the guest gets a receipt with a status link. Visit requests are not deleted automatically; they are deleted on request, as the privacy policy describes.",
     healthData: "No. The connector serves experience and producer data and asks for no health information.",
     financial: "No money moves through the connector. Experiences are booked and paid with the provider; a gårdssalg visit is paid on arrival. No card or bank details are asked for.",
     reviewerTools: {
@@ -279,37 +237,17 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "Find wildlife and animal experiences in Norway": "discover_experiences",
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland": "discover_gardssalg",
     },
-    extraPrompts: [
-      { prompt: "Hvilke kategorier med opplevelser finnes?", tool: "list_experience_categories" },
-    ],
-    writeToolNotes: {
-      book_gardssalg: "Sends a real visit request by e-mail to the producer, and a status link to the guest. It never confirms a booking: the producer answers. Only producers with live booking can be booked. No payment.",
-    },
-    owners: {
-      descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S7)",
-      terms: DASH,
-      docs: DASH,
-      icon: DASH,
-      screenshots: "Before submission, after OpenAI's decision (the cards can change in review)",
-    },
+    extraPrompts: [{ prompt: "Hvilke kategorier med opplevelser finnes?", tool: "list_experience_categories" }],
+    writeToolNotes: { book_gardssalg: "Sends a real visit request by e-mail to the producer, and a status link to the guest. It never confirms a booking: the producer answers. Only producers with live booking can be booked. No payment." },
+    owners: { descriptions: "2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S7)", terms: DASH, docs: DASH, icon: DASH, screenshots: "G3-S6 of this dev-request (follow-up)" },
     descriptionsGate: "A fix waits for OpenAI's decision on the Opplevagent ChatGPT app: tool metadata stays frozen while OpenAI reviews it.",
     recordedPrerequisites: [
-      {
-        item: "Free-text search in discover_experiences (`query`)",
-        status: "done",
-        detail: "lokal#1089: the user's request goes in `query`, and a place search never returns an unfiltered all-Norway list.",
-        owner: "2026-10-16-opplevagent-mcp-fritekst-query",
-      },
-      {
-        item: "OpenAI's decision on the Opplevagent ChatGPT app",
-        status: "waiting",
-        detail: "Submit after it. Tool titles and first sentences (lint S7) and serverInfo title, websiteUrl and icons (G3-S5) change once OpenAI has decided, and the directory should review the final metadata. Daniel reports the decision.",
-        owner: "Daniel (OpenAI review)",
-      },
+      { item: "Free-text search in discover_experiences (`query`)", status: "done", owner: "2026-10-16-opplevagent-mcp-fritekst-query",
+        detail: "lokal#1089: the user's request goes in `query`, and a place search never returns an unfiltered all-Norway list." },
+      { item: "OpenAI's decision on the Opplevagent ChatGPT app", status: "waiting", owner: "Daniel (OpenAI review)",
+        detail: "Submit after it. Tool titles and first sentences (lint S7) and serverInfo title, websiteUrl and icons (G3-S5) change once OpenAI has decided, and the directory should review the final metadata. Daniel reports the decision." },
     ],
-    caveats: [
-      "book_gardssalg is a real write: a request e-mails the producer. Keep it out of demos with real producers.",
-    ],
+    caveats: ["book_gardssalg is a real write: a request e-mails the producer. Keep it out of demos with real producers."],
     otherContents: [
       ["assets/opplevagent-brand-512.png", "The icon to upload: Opplevagent's own mark, square, no rounded corners."],
       ["assets/0?-*.png", "MCP App carousel screenshots; the prompt for each is in `assets/prompts.txt` (see `assets/README.md`)."],
@@ -354,37 +292,21 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "Which dental clinics in Oslo have a Helfo agreement?": "tannlege_search",
       "I need emergency dental care in Rogaland tonight": "tannlege_akutt",
     },
-    extraPrompts: [
-      { prompt: "How many dental clinics are there in Norway, by county?", tool: "tannlege_stats" },
-    ],
+    extraPrompts: [{ prompt: "How many dental clinics are there in Norway, by county?", tool: "tannlege_stats" }],
     writeToolNotes: {},
     owners: {
       descriptions: "2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a)",
       terms: "2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S5; Daniel approves the text)",
-      docs: "G3-S4 of this dev-request (`/guide-tannlege-ai`)",
-      icon: "2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4)",
-      screenshots: DASH,
+      docs: "G3-S4 of this dev-request (`/guide-tannlege-ai`)", icon: "2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4)", screenshots: DASH,
     },
     descriptionsGate: null,
     recordedPrerequisites: [
-      {
-        item: "Natural-language search in tannlege_search (town, municipality, specialty, Helfo)",
-        status: "open",
-        detail: "lokal#1086 (draft). The example prompts must return clinics against production (G3-S4).",
-        owner: "2026-10-16-tannlege-sok-naturlig-sprak",
-      },
-      {
-        item: "Per-session rate limit on /mcp",
-        status: "done",
-        detail: "lokal#1098: one quota per MCP session, so users behind one shared AI-platform IP do not share a bucket.",
-        owner: "2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt",
-      },
-      {
-        item: "Name decision for Finn-tannlege",
-        status: "waiting",
-        detail: "The listing slug is permanent once published. Submit after Daniel has settled the name.",
-        owner: "Daniel",
-      },
+      { item: "Natural-language search in tannlege_search (town, municipality, specialty, Helfo)", status: "open", owner: "2026-10-16-tannlege-sok-naturlig-sprak",
+        detail: "lokal#1086 (draft). The example prompts must return clinics against production (G3-S4)." },
+      { item: "Per-session rate limit on /mcp", status: "done", owner: "2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt",
+        detail: "lokal#1098: one quota per MCP session, so users behind one shared AI-platform IP do not share a bucket." },
+      { item: "Name decision for Finn-tannlege", status: "waiting", owner: "Daniel",
+        detail: "The listing slug is permanent once published. Submit after Daniel has settled the name." },
     ],
     caveats: [
       "tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.",
@@ -392,9 +314,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.",
     ],
     otherContents: [],
-    notADirectoryPath: [
-      "Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. The npm package `finn-tannlege-mcp` still works for manual install, but it is not a directory submission.",
-    ],
+    notADirectoryPath: ["Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. The npm package `finn-tannlege-mcp` still works for manual install, but it is not a directory submission."],
   },
 };
 
@@ -411,20 +331,14 @@ export interface PackInput {
   floor: number;
   icon: IconInfo | null;
   screenshots: readonly IconInfo[];
-  /** md5 of the card templates the screenshots show, as they are now; null without screenshots. */
+  /** md5 of the screenshots' card templates as they are now, and the serverSetup route file as read; null without. */
   screenshotTemplatesMd5: string | null;
-  /** The spec's serverSetup route file, as read by readServerConstruction(); null without one. */
   server: ServerConstruction | null;
   protocolVersions: readonly string[];
 }
 
-/** What a `new McpServer(serverInfo, options)` call sets. */
-export interface ServerConstruction {
-  /** Property names of the serverInfo object (first argument). */
-  info: string[];
-  /** Whether the options (second argument) set `instructions`. */
-  instructions: boolean;
-}
+/** What a `new McpServer(serverInfo, options)` call sets: the serverInfo keys, and whether options set `instructions`. */
+export interface ServerConstruction { info: string[]; instructions: boolean }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -469,9 +383,10 @@ export function cardTemplatesMd5(templates: ScreenshotSpec["templates"]): string
 /**
  * Reads the one `new McpServer(...)` call in a route file with the TypeScript
  * parser, without running it: which serverInfo fields it sets and whether it
- * passes instructions. Throws when the file does not have exactly one such
- * call, or when an argument is not a plain object literal: then this function
- * cannot tell, and must be extended rather than guess.
+ * passes instructions. A property set to "", null or undefined counts as not
+ * set. Throws when the file does not have exactly one such call, or when an
+ * argument is not a plain object literal (G3-S5's config lookups may make it
+ * one): then this function cannot tell, and must be extended rather than guess.
  */
 export function readServerConstruction(rel: string, source = fs.readFileSync(path.join(ROOT, rel), "utf8")): ServerConstruction {
   const sf = ts.createSourceFile(rel, source, ts.ScriptTarget.Latest, true);
@@ -482,12 +397,16 @@ export function readServerConstruction(rel: string, source = fs.readFileSync(pat
   };
   visit(sf);
   if (calls.length !== 1) throw new Error(`${rel}: expected one new McpServer(...), found ${calls.length}`);
+  const empty = (e: ts.Expression): boolean =>
+    (ts.isStringLiteralLike(e) && e.text === "") || e.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(e) && e.text === "undefined");
   const keys = (arg: ts.Expression | undefined, what: string): string[] => {
     if (!arg) return [];
     if (!ts.isObjectLiteralExpression(arg)) throw new Error(`${rel}: the McpServer ${what} is not an object literal; extend readServerConstruction()`);
-    return arg.properties.map((p) => {
-      if (p.name && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) return p.name.text;
-      throw new Error(`${rel}: the McpServer ${what} has a spread or computed property; extend readServerConstruction()`);
+    return arg.properties.flatMap((p) => {
+      if (!p.name || !(ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) {
+        throw new Error(`${rel}: the McpServer ${what} has a spread or computed property; extend readServerConstruction()`);
+      }
+      return ts.isPropertyAssignment(p) && empty(p.initializer) ? [] : [p.name.text];
     });
   };
   const [info, options] = calls[0].arguments ?? [];
@@ -556,16 +475,10 @@ export function prerequisites(spec: PackSpec, input: PackInput): Prerequisite[] 
   const { brand, tools } = input;
   const derived = (p: Omit<Prerequisite, "source">): Prerequisite => ({ ...p, source: "code" });
   const gaps = annotationGaps(tools);
-  const directives = tools
-    .map((t) => ({ name: t.name, phrases: directivePhrases(t.description) }))
-    .filter((d) => d.phrases.length > 0);
+  const directives = tools.map((t) => ({ name: t.name, phrases: directivePhrases(t.description) })).filter((d) => d.phrases.length > 0);
   const rows: Prerequisite[] = [
-    derived({
-      item: "Every tool has a title and readOnlyHint/destructiveHint",
-      status: gaps.length ? "open" : "done",
-      detail: gaps.length ? `Missing: ${gaps.join("; ")}.` : `All ${tools.length} tools.`,
-      owner: DASH,
-    }),
+    derived({ item: "Every tool has a title and readOnlyHint/destructiveHint", status: gaps.length ? "open" : "done",
+      detail: gaps.length ? `Missing: ${gaps.join("; ")}.` : `All ${tools.length} tools.`, owner: DASH }),
     derived({
       item: "Tool descriptions describe and never instruct Claude",
       status: directives.length ? (spec.descriptionsGate ? "waiting" : "open") : "done",
@@ -576,18 +489,10 @@ export function prerequisites(spec: PackSpec, input: PackInput): Prerequisite[] 
       owner: directives.length ? spec.owners.descriptions : DASH,
     }),
     derived({ item: "Privacy policy page", status: "done", detail: brand.privacyUrl, owner: DASH }),
-    derived({
-      item: "Terms page",
-      status: brand.termsUrl ? "done" : "open",
-      detail: brand.termsUrl ?? "None yet (`termsUrl` is null in src/config/brand-entities.ts). The portal asks only for a privacy URL; a public terms page is still required before submission.",
-      owner: brand.termsUrl ? DASH : spec.owners.terms,
-    }),
-    derived({
-      item: "Public documentation page",
-      status: brand.docsUrl ? "done" : "open",
-      detail: brand.docsUrl ?? "None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date.",
-      owner: brand.docsUrl ? DASH : spec.owners.docs,
-    }),
+    derived({ item: "Terms page", status: brand.termsUrl ? "done" : "open", owner: brand.termsUrl ? DASH : spec.owners.terms,
+      detail: brand.termsUrl ?? "None yet (`termsUrl` is null in src/config/brand-entities.ts). The portal asks only for a privacy URL; a public terms page is still required before submission." }),
+    derived({ item: "Public documentation page", status: brand.docsUrl ? "done" : "open", owner: brand.docsUrl ? DASH : spec.owners.docs,
+      detail: brand.docsUrl ?? "None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date." }),
     derived({
       item: "Square 512×512 PNG icon to upload",
       status: input.icon && input.icon.width === 512 && input.icon.height === 512 ? "done" : "open",
@@ -598,11 +503,11 @@ export function prerequisites(spec: PackSpec, input: PackInput): Prerequisite[] 
     }),
   ];
   if (spec.screenshots) {
-    const { prompts, templates, rendered, renderCommand } = spec.screenshots;
+    const { prompts, templates, rendered, renderAfter, renderCommand } = spec.screenshots;
     const shots = input.screenshots;
     const shaped = shots.length >= 3 && shots.length <= 5 && shots.every((s) => s.width >= 1000);
-    // The PNGs show the templates as they were when rendered; a later template
-    // change means they no longer show the live cards.
+    // A template change since the render means the PNGs no longer show the
+    // live cards. Only the pinned md5 is printed, so further changes leave the pack as it is.
     const current = input.screenshotTemplatesMd5 === rendered.templatesMd5;
     const ok = shaped && current;
     rows.push(derived({
@@ -611,11 +516,9 @@ export function prerequisites(spec: PackSpec, input: PackInput): Prerequisite[] 
       detail: `${shots.length} PNG in \`${spec.dir}/assets/\`, widths ${shots.map((s) => s.width).join(", ")} px; prompts in \`${prompts}\`. ` +
         (current
           ? `Rendered ${rendered.date} (${rendered.commit}) from the card templates as they are now (\`${templates.module}\`, md5 \`${rendered.templatesMd5}\`).`
-          // Only the pinned md5 is printed: a further template change while the
-          // row is open leaves the pack as it is.
           : `Rendered ${rendered.date} (${rendered.commit}), but the card templates in \`${templates.module}\` have changed since ` +
-            `(md5 \`${rendered.templatesMd5}\` when rendered), so the screenshots do not show the live cards. ` +
-            `Render them again with \`${renderCommand}\`, check its mock data against the live tool output, then set \`rendered\` in \`PACKS\` to the new date, commit and md5 (\`cardTemplatesMd5()\`).`),
+            `(md5 \`${rendered.templatesMd5}\` when rendered), so the screenshots do not show the live cards. ${renderAfter}, ` +
+            `render them again with \`${renderCommand}\`, check its mock data against the live tool output, then set \`rendered\` in \`PACKS\` to the new date, commit and md5 (\`cardTemplatesMd5()\`).`),
       owner: ok ? DASH : spec.owners.screenshots,
     }));
   }
@@ -624,7 +527,7 @@ export function prerequisites(spec: PackSpec, input: PackInput): Prerequisite[] 
     if (!server) throw new Error(`pack ${input.vertical}: serverSetup is set but the input has no server construction`);
     const missing = [...(server.instructions ? [] : ["instructions"]), ...SERVER_INFO_FIELDS.filter((f) => !server.info.includes(f))];
     rows.push(derived({
-      item: `MCP server instructions and serverInfo ${SERVER_INFO_FIELDS.slice(0, -1).join(", ")} and ${SERVER_INFO_FIELDS[SERVER_INFO_FIELDS.length - 1]}`,
+      item: `MCP server instructions and serverInfo ${andList(SERVER_INFO_FIELDS)}`,
       status: missing.length ? "open" : "done",
       detail: `\`new McpServer(...)\` in \`${spec.serverSetup.routeFile}\` sets serverInfo ${server.info.map(code).join(", ") || "nothing"} ` +
         `and ${server.instructions ? "instructions" : "no instructions"}${missing.length ? `. Missing: ${missing.map(code).join(", ")}.` : "."}`,
@@ -650,12 +553,11 @@ export function toolSummary(description: string, max = 220): string {
 }
 
 function table(headers: readonly string[], rows: ReadonlyArray<readonly string[]>): string {
-  return [
-    `| ${headers.join(" | ")} |`,
-    `|${headers.map(() => "---").join("|")}|`,
-    ...rows.map((r) => `| ${r.map(cell).join(" | ")} |`),
-  ].join("\n");
+  return [`| ${headers.join(" | ")} |`, `|${headers.map(() => "---").join("|")}|`, ...rows.map((r) => `| ${r.map(cell).join(" | ")} |`)].join("\n");
 }
+
+/** "a", "a and b", "a, b and c". */
+const andList = (xs: readonly string[]): string => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}` : xs.join(""));
 
 const STATUS_LABEL: Record<PrereqStatus, string> = { done: "DONE", open: "OPEN", waiting: "WAITING" };
 
@@ -695,20 +597,14 @@ function validate(spec: PackSpec, input: PackInput, name: string, description: s
   if (spec.categories.length < 1 || spec.categories.length > 5) throw new Error(`${where}: 1–5 categories`);
   const names = new Set(input.tools.map((t) => t.name));
   const queries = input.brand.exampleQueries;
-  for (const q of queries) {
-    if (!spec.reviewerTools[q]) throw new Error(`${where}: example prompt "${q}" has no reviewerTools entry`);
-  }
+  for (const q of queries) if (!spec.reviewerTools[q]) throw new Error(`${where}: example prompt "${q}" has no reviewerTools entry`);
   for (const [q, tool] of Object.entries(spec.reviewerTools)) {
     if (!queries.includes(q)) throw new Error(`${where}: reviewerTools prompt "${q}" is not in BRAND_ENTITIES.${input.vertical}.exampleQueries`);
     if (!names.has(tool)) throw new Error(`${where}: reviewerTools names unregistered tool ${tool}`);
   }
-  for (const { tool } of spec.extraPrompts) {
-    if (!names.has(tool)) throw new Error(`${where}: extraPrompts names unregistered tool ${tool}`);
-  }
+  for (const { tool } of spec.extraPrompts) if (!names.has(tool)) throw new Error(`${where}: extraPrompts names unregistered tool ${tool}`);
   const writeTools = input.tools.filter((t) => !isReadOnly(t)).map((t) => t.name);
-  for (const t of writeTools) {
-    if (!spec.writeToolNotes[t]) throw new Error(`${where}: write tool ${t} has no writeToolNotes entry`);
-  }
+  for (const t of writeTools) if (!spec.writeToolNotes[t]) throw new Error(`${where}: write tool ${t} has no writeToolNotes entry`);
   for (const t of Object.keys(spec.writeToolNotes)) {
     if (!writeTools.includes(t)) throw new Error(`${where}: writeToolNotes names ${t}, which is not a registered write tool`);
   }
@@ -728,10 +624,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
   const rows = prerequisites(spec, input);
   const writeTools = tools.filter((t) => !isReadOnly(t));
   const readTools = tools.filter(isReadOnly);
-  const prompts = [
-    ...brand.exampleQueries.map((q) => ({ prompt: q, tool: spec.reviewerTools[q] })),
-    ...spec.extraPrompts,
-  ];
+  const prompts = [...brand.exampleQueries.map((q) => ({ prompt: q, tool: spec.reviewerTools[q] })), ...spec.extraPrompts];
   const lintRow = rows.find((r) => r.item.startsWith("Tool descriptions"))!;
   const docsRow = rows.find((r) => r.item === "Public documentation page")!;
   const shotsRow = rows.find((r) => r.item.startsWith("MCP App carousel screenshots"));
@@ -760,14 +653,11 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     `The directory reviews against its connector checklist: ${CHECKLIST_DOC}.`,
     "",
-    `Rows with source "code" are computed when the pack is generated.` +
-      (spec.recordedPrerequisites.length
-        ? ` Rows with source "recorded" are kept by hand in ${code(GENERATOR)} (\`PACKS\`), and no test checks them against the code or GitHub` +
-          (recordedPrs.length
-            ? `: the pull requests they cite (${recordedPrs.slice(0, -1).join(", ")}${recordedPrs.length > 1 ? " and " : ""}${recordedPrs[recordedPrs.length - 1]}) can be merged or closed while the row stays as it is.`
-            : ".") +
-          " Update the row there and regenerate when its status changes."
-        : ""),
+    `Rows with source "code" are computed when the pack is generated.` + (spec.recordedPrerequisites.length
+      ? ` Rows with source "recorded" are kept by hand in ${code(GENERATOR)} (\`PACKS\`), and no test checks them against the code or GitHub` +
+        (recordedPrs.length ? `: the pull requests they cite (${andList(recordedPrs)}) can be merged or closed while the row stays as it is.` : ".") +
+        " Update the row there and regenerate when its status changes."
+      : ""),
     "",
     "## Contents",
     "",
@@ -787,12 +677,8 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "- the catalog floor in distribution/catalog-claims.json: the honest catalog count (`honestCatalogCount()`) rounded down to the hundred;",
     "- the protocol versions the MCP SDK supports (`SUPPORTED_PROTOCOL_VERSIONS` in @modelcontextprotocol/sdk), for the Connection step: an SDK upgrade can change them;",
     "- the icon and screenshot files themselves (size and md5);",
-    ...(spec.screenshots
-      ? [`- the card templates the screenshots show (${spec.screenshots.templates.exports.map(code).join(", ")} in ${spec.screenshots.templates.module}), by md5, against the md5 they were rendered from;`]
-      : []),
-    ...(spec.serverSetup
-      ? [`- the \`new McpServer(...)\` call in ${spec.serverSetup.routeFile}, read with the TypeScript parser and not run: its serverInfo fields and whether it sends instructions;`]
-      : []),
+    ...(spec.screenshots ? [`- the card templates the screenshots show (${spec.screenshots.templates.exports.map(code).join(", ")} in ${spec.screenshots.templates.module}), by md5, against the md5 they were rendered from;`] : []),
+    ...(spec.serverSetup ? [`- the \`new McpServer(...)\` call in ${spec.serverSetup.routeFile}, read with the TypeScript parser and not run: its serverInfo fields and whether it sends instructions;`] : []),
     "- the hand-kept prose and recorded rows in `PACKS`.",
     "",
     `src/routes/connector-packs-fresh.test.ts fails when a file here differs from what the generator writes. After a change to any of these, run \`npx tsx ${GENERATOR}\` and commit the result. \`--verify-floors\` compares the floors with the live honest counts.`,
@@ -861,9 +747,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
           "",
           `Prompts: ${code(spec.screenshots.prompts)}.`,
           "",
-          ...(shotsRow?.status === "done"
-            ? []
-            : ["**Not yet.** These PNGs are not ready to upload; see the screenshots row in the prerequisites in ../README.md.", ""]),
+          ...(shotsRow?.status === "done" ? [] : ["**Not yet.** These PNGs are not ready to upload; see the screenshots row in the prerequisites in ../README.md.", ""]),
         ]
       : []),
     "## Slug — permanent once published",
@@ -921,19 +805,9 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     writeTools.length ? table(toolHeaders, writeTools.map(toolRow)) : "None: no tool creates, changes or sends anything.",
     "",
-    ...(writeTools.length
-      ? [
-          "What each write tool really does:",
-          "",
-          ...writeTools.map((t) => `- ${code(t.name)}: ${spec.writeToolNotes[t.name]}`),
-          "",
-        ]
-      : []),
+    ...(writeTools.length ? ["What each write tool really does:", "", ...writeTools.map((t) => `- ${code(t.name)}: ${spec.writeToolNotes[t.name]}`), ""] : []),
     ...(titleDiffs.length
-      ? [
-          `**Two title fields.** ${titleDiffs.length} of ${tools.length} tools have an \`annotations.title\` that differs from the top-level \`title\` (${titleDiffs.map((t) => code(t.name)).join(", ")}). Both are shown above; which one a client displays depends on the client.`,
-          "",
-        ]
+      ? [`**Two title fields.** ${titleDiffs.length} of ${tools.length} tools have an \`annotations.title\` that differs from the top-level \`title\` (${titleDiffs.map((t) => code(t.name)).join(", ")}). Both are shown above; which one a client displays depends on the client.`, ""]
       : []),
     "## 3. Listing",
     "",
@@ -974,13 +848,8 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     "Paste if the portal asks what data the connector handles:",
     "",
-    fence([
-      spec.dataHandling,
-      CALL_LOG,
-      ...(spec.dataStored ? [spec.dataStored] : []),
-      "There are no accounts, no login credentials and no payment data.",
-      `Privacy policy: ${brand.privacyUrl}`,
-    ].join("\n\n")),
+    fence([spec.dataHandling, CALL_LOG, ...(spec.dataStored ? [spec.dataStored] : []),
+      "There are no accounts, no login credentials and no payment data.", `Privacy policy: ${brand.privacyUrl}`].join("\n\n")),
     "",
     "## 8. Test & launch",
     "",
@@ -1027,12 +896,8 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     ...prompts.map((p, i) => `${i + 1}. "${p.prompt}" (usually ${p.tool})`),
     "",
     ...(writeTools.length
-      ? [
-          ...openWorldWrites.map((t) => `Please do not run ${t.name} to completion. What it does: ${spec.writeToolNotes[t.name]}`),
-          ...(localWrites.length
-            ? [`${localWrites.map((t) => t.name).join(" and ")} only change data inside this service and are safe to try.`]
-            : []),
-        ]
+      ? [...openWorldWrites.map((t) => `Please do not run ${t.name} to completion. What it does: ${spec.writeToolNotes[t.name]}`),
+          ...(localWrites.length ? [`${localWrites.map((t) => t.name).join(" and ")} only change data inside this service and are safe to try.`] : [])]
       : ["Every tool is read-only: nothing you try can create, change or send anything."]),
   ].join("\n");
   const testInstructions = [
@@ -1048,9 +913,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     `- The prompts are \`BRAND_ENTITIES.${input.vertical}.exampleQueries\` (src/config/brand-entities.ts) plus ${spec.extraPrompts.length} extra for tool coverage. Change them there or in \`PACKS\`, then regenerate.`,
     `- They exercise ${exercised.size} of ${tools.length} tools (${[...exercised].map(code).join(", ")}). Claude picks the tool; "usually" is what it normally calls.`,
-    ...(openWorldWrites.length
-      ? [`- ${openWorldWrites.map((t) => code(t.name)).join(", ")} ${openWorldWrites.length === 1 ? "reaches" : "reach"} a real third party (openWorldHint true), so the block asks the reviewer not to complete ${openWorldWrites.length === 1 ? "it" : "them"}.`]
-      : []),
+    ...(openWorldWrites.length ? [`- ${openWorldWrites.map((t) => code(t.name)).join(", ")} ${openWorldWrites.length === 1 ? "reaches" : "reach"} a real third party (openWorldHint true), so the block asks the reviewer not to complete ${openWorldWrites.length === 1 ? "it" : "them"}.`] : []),
   ].join("\n");
 
   return {
@@ -1073,11 +936,7 @@ export function renderConnectorPacks(): Map<string, string> {
   return out;
 }
 
-/**
- * Repo-relative paths whose content under `root` differs from `rendered` (or
- * is missing). Line endings are compared as LF, so a Windows checkout with
- * CRLF files is not reported stale.
- */
+/** Repo-relative paths whose content under `root` differs from `rendered` or is missing; CRLF reads as LF (Windows checkouts). */
 export function stalePackFiles(rendered: Map<string, string>, root = ROOT): string[] {
   const stale: string[] = [];
   for (const [rel, content] of rendered) {
@@ -1136,11 +995,8 @@ async function main(): Promise<number> {
 
 if (require.main === module) {
   // Route modules start timers on import; exit explicitly when done.
-  main().then(
-    (code) => process.exit(code),
-    (err) => {
-      console.error(err instanceof Error ? err.message : err);
-      process.exit(1);
-    },
-  );
+  main().then((code) => process.exit(code), (err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
 }
