@@ -30,6 +30,13 @@ import type { Lang } from "../i18n/t";
  * OpeningHoursSpecification ({dayOfWeek, opens, closes, description,
  * validFrom, validThrough}; Hovdneset Gård had no hours card) and
  * {byAppointment: true, description} (Små Vesen). See storedFormFields().
+ *
+ * Slice I-O (integration test round 2: SD2-01, SD2-03/AI2-07) adds two rules.
+ * An entry with a season note ("Sesongåpent til ca. 20. september", "Åkerbutikk
+ * i sommarsesongen") holds only in part of the year, as an entry with a period
+ * does: see isSeasonalEntry(). And text in the day-and-time form ("Man-Fre
+ * 07-22, Lor 08-22, Son 09-18"; "Fredag 14:00-18:00" as a list entry) is read
+ * into day rows: see parseOpeningHoursText().
  */
 
 /** A weekday as an index: Monday = 0 … Sunday = 6 (the Norwegian week). */
@@ -45,7 +52,7 @@ export interface OpeningHoursEntry {
   days: Weekday[];
   /** The day label as stored, trimmed; "" when there is none. Shown as written when `days` is empty. */
   label: string;
-  /** Opening and closing time as text ("10:00", or "10" for a number); both are set, or neither. */
+  /** Opening and closing time as text ("10:00", or "10" for a number; "HH:MM" when read from text in the day-and-time form); both are set, or neither. */
   open?: string;
   close?: string;
   /** The season the entry is limited to ("Mai–September"), as stored; for schema.org's form, its validity in Norwegian dates ("1.7.–31.10.2026"). */
@@ -81,15 +88,16 @@ const WEEKDAY_SHORT_NO: readonly string[] = ["Man", "Tir", "Ons", "Tor", "Fre", 
  * English short and long keys (the declared form and the enrichment's long
  * form), the Norwegian abbreviations and names that were NO_DAY_ALIASES in
  * seo.ts (with the ASCII spellings "lor"/"son"), "tors" ("Man–tors") and the
- * nynorsk names in live data ("Måndag", "Tysdag", "Laurdag").
+ * nynorsk names in live data ("Måndag", "Tysdag", "Laurdag"). Slice I-O: ø
+ * written as "oe" too ("Tor-Soen 12:00-21:00", live 2026-10-17).
  */
 const WEEKDAY_ALIASES: ReadonlyMap<string, Weekday> = new Map<string, Weekday>([
   ["mon", 0], ["tue", 1], ["wed", 2], ["thu", 3], ["fri", 4], ["sat", 5], ["sun", 6],
   ["monday", 0], ["tuesday", 1], ["wednesday", 2], ["thursday", 3], ["friday", 4], ["saturday", 5], ["sunday", 6],
   ["man", 0], ["tir", 1], ["ons", 2], ["tor", 3], ["tors", 3], ["fre", 4],
-  ["lør", 5], ["lor", 5], ["søn", 6], ["son", 6],
+  ["lør", 5], ["lor", 5], ["loer", 5], ["søn", 6], ["son", 6], ["soen", 6],
   ["mandag", 0], ["tirsdag", 1], ["onsdag", 2], ["torsdag", 3], ["fredag", 4],
-  ["lørdag", 5], ["lordag", 5], ["søndag", 6], ["sondag", 6],
+  ["lørdag", 5], ["lordag", 5], ["loerdag", 5], ["søndag", 6], ["sondag", 6], ["soendag", 6],
   ["måndag", 0], ["tysdag", 1], ["laurdag", 5],
 ]);
 
@@ -324,12 +332,8 @@ function storedFormFields(h: Record<string, unknown>): { fields: Record<string, 
   return { fields, validFrom: validity.validFrom, validThrough: validity.validThrough };
 }
 
-/** One entry in the fixed shape, or null when it says nothing usable. */
+/** One entry (not text) in the fixed shape, or null when it says nothing usable. */
 function normalizeEntry(item: unknown): OpeningHoursEntry | null {
-  if (typeof item === "string") {
-    const text = item.trim();
-    return text ? { days: [], label: "", note: text } : null;
-  }
   if (!item || typeof item !== "object" || Array.isArray(item)) return null;
   const { fields: h, validFrom, validThrough } = storedFormFields(item as Record<string, unknown>);
   const { days, label } = entryDays(field(h, "day", "days"));
@@ -371,26 +375,130 @@ function normalizeEntry(item: unknown): OpeningHoursEntry | null {
   return entry;
 }
 
+// ─── Text in the day-and-time form (slice I-O) ─────────────────────────
+
+/** "Man-Fre 07-22", "Lørdag 11:00-15:00", "onsdag - søndag 11:00–17:00": a day label, a space, one time range. */
+const TEXT_DAYS_HOURS = /^(.+?)\s+(\d{1,2}(?:[:.]\d{2})?)\s*[-–—]\s*(\d{1,2}(?:[:.]\d{2})?)$/;
+/** "Søn stengt", "Fre-Søn stengt": a day label, a space, one word (a word for closed, see CLOSED_WORDS). */
+const TEXT_DAYS_ONE_WORD = /^(.+?)\s+(\S+)$/;
+/**
+ * A part longer than this is not read: the longest part in the form in live
+ * data 2026-10-17 has 26 characters ("Torsdag-Fredag 12:00-19:00"). It also
+ * bounds the work of the two patterns above, which backtrack in quadratic
+ * time on a long run of spaces (20 000 spaces took 0.4 s without it).
+ */
+const TEXT_PART_MAX = 64;
+
+/**
+ * Text in the day-and-time form as day rows, or null when it is not in that
+ * form. Integration test round 2, SD2-03/AI2-07: Hevd Håndverksbakeri stores
+ * the field as "Man-Fre 07-22, Lor 08-22, Son 09-18", Alm Østre Gård as the
+ * list ["Fredag 14:00-18:00", "Lørdag 11:00-15:00"]; as text they had no day
+ * rows, no "today" and no JSON-LD. The form is one or more parts separated
+ * by commas, each a day label the day tables read (a day, a range or "every
+ * day"; "Lor"/"Son" are Saturday/Sunday) and then either a time range
+ * ("07-22", "11:00 – 15:00", "9.30-17") or a word for a closed day ("Søn
+ * stengt", five producers in live data 2026-10-17). A time range is the
+ * declared form's {day, open, close} with clock times as "HH:MM" ("07" is
+ * "07:00"); a closed day is the note "Stengt", as {day, hours: "Stengt"} is.
+ * Every part must be in the form, or the text is not read at all: it is
+ * shown as text, as before, so a qualifier ("Man-Lør 12-17 (sommer)",
+ * "lørdag 13:00–15:00 eller etter avtale", "Restaurant: Man-Lør 11-00") is
+ * never lost, and no part is guessed.
+ */
+export function parseOpeningHoursText(value: string): OpeningHoursEntry[] | null {
+  const entries: OpeningHoursEntry[] = [];
+  for (const part of value.split(",").map((p) => p.trim())) {
+    if (part.length > TEXT_PART_MAX) return null;
+    const timed = TEXT_DAYS_HOURS.exec(part);
+    if (timed) {
+      const days = parseDayLabel(timed[1]!);
+      const open = clockTime(timed[2]!);
+      const close = clockTime(timed[3]!);
+      if (!days || open === null || close === null) return null;
+      entries.push({ days, label: timed[1]!, open, close });
+      continue;
+    }
+    const closed = TEXT_DAYS_ONE_WORD.exec(part);
+    const days = closed && isClosedWord(closed[2]!) ? parseDayLabel(closed[1]!) : null;
+    if (!closed || !days) return null;
+    entries.push({ days, label: closed[1]!, note: CLOSED_NOTE });
+  }
+  return entries;
+}
+
+/** A text (an entry, or the whole field) as entries: its day rows when it is in the day-and-time form, else one text entry; none when blank. */
+function textEntriesOf(value: string): OpeningHoursEntry[] {
+  const text = value.trim();
+  if (!text) return [];
+  return parseOpeningHoursText(text) ?? [{ days: [], label: "", note: text }];
+}
+
 /**
  * The opening hours in one shape, in stored order. A list gives one entry per
  * item that says something: both times (text, or numbers as their digits),
  * or a note or text. An item with only one time, or nothing usable, is left
- * out (it showed as "undefined" before I-G). Free text for the whole field
- * ("Man–fre 10–17") is one text entry; it is not parsed into days. Anything
- * else has no entries.
+ * out (it showed as "undefined" before I-G). Text, as a list item or as the
+ * whole field, gives its day rows when it is in the day-and-time form ("Man–fre
+ * 10–17, lør 10–14"; slice I-O, parseOpeningHoursText), else one text entry
+ * ("Etter avtale"). Anything else has no entries.
  */
 export function normalizeOpeningHours(value: unknown): OpeningHoursEntry[] {
-  if (typeof value === "string") {
-    const text = value.trim();
-    return text ? [{ days: [], label: "", note: text }] : [];
-  }
+  if (typeof value === "string") return textEntriesOf(value);
   if (!Array.isArray(value)) return [];
   const entries: OpeningHoursEntry[] = [];
   for (const item of value) {
+    if (typeof item === "string") {
+      entries.push(...textEntriesOf(item));
+      continue;
+    }
     const entry = normalizeEntry(item);
     if (entry) entries.push(entry);
   }
   return entries;
+}
+
+// ─── Seasons (slice I-O) ───────────────────────────────────────────────
+
+/**
+ * The words that make a note a season note: the configuration of
+ * isSeasonNote(), lower case, matched anywhere in the note in any case, so
+ * Norwegian compounds count ("Sesongåpent", "sommarsesongen", "Høgsesong",
+ * "Vinteråpningstid"). Integration test round 2, SD2-01: Bjørke Gård
+ * ({days: "onsdag - søndag", hours: "11:00-17:00", note: "Sesongåpent til ca.
+ * 20. september"}) and Hima Grønt ({day: "sat", …, note: "Åkerbutikk i
+ * sommarsesongen"}) had year-round OpeningHoursSpecification in October, and
+ * lokal_info left the note out. Of the 29 different notes on timed entries
+ * in live data 2026-10-17 the list finds the 11 about a season (10
+ * producers) and none of the others ("Selvbetjent 24/7", "Åpent året rundt
+ * og døgnet rundt", "Søndag stengt", "Annankvar torsdag (partalsveker)",
+ * "Utlevering skjer på avtalt tid og sted. …"). The words are the seasons
+ * in bokmål, nynorsk and English, except spring: "vår" is also "our" ("vår
+ * gårdsbutikk"). Months are not on the list: a month in a note can be a
+ * closure ("Stengt 24.–26. desember"), not a season. Add a word here, with
+ * a test, to read more notes as seasons.
+ */
+export const SEASON_NOTE_WORDS: readonly string[] = [
+  "sesong", "season",
+  "sommer", "sommar", "summer",
+  "høst", "haust", "autumn",
+  "vinter", "winter",
+];
+
+/** Whether a note is about a season (SEASON_NOTE_WORDS). */
+export function isSeasonNote(note: string | undefined): boolean {
+  const text = (note ?? "").toLowerCase();
+  return !!text && SEASON_NOTE_WORDS.some((word) => text.includes(word));
+}
+
+/**
+ * Whether an entry holds only in part of the year: it has a period ("Mai–
+ * September", I-H), or a season note (slice I-O). Such an entry cannot say
+ * whether it holds today: it counts for no "open now" claim and no "today"
+ * highlight, and goes into JSON-LD only with validity dates (seo.ts).
+ */
+export function isSeasonalEntry(entry: OpeningHoursEntry): boolean {
+  return !!entry.period || isSeasonNote(entry.note);
 }
 
 // ─── Compact text (lokal_info and the auto-reply) ──────────────────────
@@ -400,12 +508,15 @@ export function normalizeOpeningHours(value: unknown): OpeningHoursEntry[] {
  * 12:00–16:00 (April)", "Man: Stengt", "Hele året: Åpent ved bestilling" or
  * the text itself. A day label that names no weekday is shown as written. A
  * note on an entry with times is left out, as lokal_info and the auto-reply
- * did before; the period is not, since the times hold only in it.
+ * did before; the period is not, since the times hold only in it, and
+ * neither is a season note (slice I-O: "Ons–Søn 11:00–17:00 (Sesongåpent til
+ * ca. 20. september)"; it said "Ons–Søn 11:00–17:00", as if all year).
  */
 export function openingHoursEntryText(entry: OpeningHoursEntry): string {
   const day = entry.days.length ? weekdaysLabel(entry.days, WEEKDAY_SHORT_NO, "/") : entry.label;
   if (entry.open !== undefined && entry.close !== undefined) {
-    const period = entry.period ? ` (${entry.period})` : "";
+    const qualifier = [entry.period, isSeasonNote(entry.note) ? entry.note : ""].filter(Boolean).join("; ");
+    const period = qualifier ? ` (${qualifier})` : "";
     return `${day} ${entry.open}–${entry.close}${period}`.trim();
   }
   const text = [entry.period, entry.note].filter(Boolean).join("; ");
@@ -442,8 +553,9 @@ export function osloWeekdayAndMinutes(at: Date): { day: Weekday; minutes: number
 /**
  * Whether the producer is open at `at` in Norway, and the entry that says so
  * (the one open now, else the first for today). Only entries with weekdays,
- * two different clock times and no period count: an entry for "Påske",
- * "Varierer" or "Mai–September", or a text entry, cannot say whether it is
+ * two different clock times and no period or season note (isSeasonalEntry)
+ * count: an entry for "Påske", "Varierer", "Mai–September" or "Sesongåpent
+ * til ca. 20. september", or a text entry, cannot say whether it is
  * open on a given day, and neither can equal times ("00:00–00:00" is closed
  * all day to schema.org and open all day elsewhere). null when no entry
  * counts: nothing is claimed then (the front page used to say "Stengt"). A day
@@ -457,7 +569,7 @@ export function openingStatusAt(
   at: Date,
 ): { isOpen: boolean; today?: OpeningHoursEntry } | null {
   const timed = entries.flatMap((entry) => {
-    if (!entry.days.length || entry.period || entry.open === undefined || entry.close === undefined) return [];
+    if (!entry.days.length || isSeasonalEntry(entry) || entry.open === undefined || entry.close === undefined) return [];
     const open = timeMinutes(entry.open);
     const close = timeMinutes(entry.close);
     return open !== null && close !== null && open !== close ? [{ entry, open, close }] : [];

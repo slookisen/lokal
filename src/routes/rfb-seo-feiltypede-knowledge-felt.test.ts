@@ -150,7 +150,7 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
     assertEq(normalizeOpeningHours([{ day: "mon-fri", open: 10, close: 17 }]),
       [{ days: [0, 1, 2, 3, 4], label: "mon-fri", open: "10", close: "17" }],
       "a rows: a number time is its digits (main showed \"10 – 17\")");
-    assertEq(normalizeOpeningHours(["  Lørdag 10–14 ", "", "   "]), [{ days: [], label: "", note: "Lørdag 10–14" }],
+    assertEq(normalizeOpeningHours(["  Lørdag etter avtale ", "", "   "]), [{ days: [], label: "", note: "Lørdag etter avtale" }],
       "a rows: a text entry is shown trimmed; an empty one is left out");
     assertEq(normalizeOpeningHours([
       { day: "tue", closed: true },
@@ -170,7 +170,8 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
     }
     // Free text for the whole field is one text entry for lokal_info and the
     // auto-reply; the producer page keeps showing it in its own row (hoursText).
-    assertEq(normalizeOpeningHours("Man–fre 10–17"), [{ days: [], label: "", note: "Man–fre 10–17" }],
+    // (Slice I-O reads text in the day-and-time form, "Man–fre 10–17", into day rows.)
+    assertEq(normalizeOpeningHours("Man–fre 10–17 (sommer)"), [{ days: [], label: "", note: "Man–fre 10–17 (sommer)" }],
       "a rows: free text for the whole field is one text entry");
 
     {
@@ -273,7 +274,7 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
     } });
     seedProducer({ id: "m-hours", name: "Mona Aapningstider", city: "M3town", geo: [69.65, 18.96], knowledge: {
       opening_hours: [
-        "Lørdag 10–14",
+        "Lørdag etter avtale",
         { day: "tue", closed: true },
         { day: "wed", open: { h: 10 }, close: "17:00" },
         { day: "thu", open: "<b>10</b>", close: "17:00" },
@@ -374,14 +375,15 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
       // Slice I-H: dayOfWeek is a schema.org DayOfWeek for every weekday
       // spelling. Main (and I-G) wrote the stored key after the prefix, so a
       // range or a long name gave an invalid value ("https://schema.org/mon-fri",
-      // ".../saturday"); the "mon" entry is as on main.
+      // ".../saturday"); the "mon" entry is as on main. Slice I-O: the
+      // "sat-sun" entry has a season note ("Kun i sesong & ferie"), so it holds
+      // only in part of the year and is left out, as an entry with a period.
       const sd = (d: string) => `https://schema.org/${d}`;
       assertEq(lb?.openingHoursSpecification, [
         { "@type": "OpeningHoursSpecification", dayOfWeek: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].map(sd), opens: "10:00", closes: "17:00" },
-        { "@type": "OpeningHoursSpecification", dayOfWeek: ["Saturday", "Sunday"].map(sd), opens: "11:00", closes: "15:00" },
         { "@type": "OpeningHoursSpecification", dayOfWeek: sd("Monday"), opens: "09:00", closes: "16:00" },
         { "@type": "OpeningHoursSpecification", dayOfWeek: sd("Saturday"), opens: "10:00", closes: "14:00" },
-      ], "b W no: LocalBusiness openingHoursSpecification has valid days for ranges and long names (I-H); a short key as on main");
+      ], "b W no: LocalBusiness openingHoursSpecification has valid days for ranges and long names (I-H); a short key as on main; no entry with a season note (I-O)");
       assertEq(JSON.stringify({ o: lb?.makesOffer, c: lb?.hasOfferCatalog, p: lb?.paymentAccepted, k: lb?.keywords }),
         "{\"o\":[{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Honning\",\"description\":\"Honning fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Lammelår\",\"description\":\"Lammelår fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Egg\",\"description\":\"Egg fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Syltetøy & gelé <hjemmelaget>\",\"description\":\"Syltetøy & gelé <hjemmelaget> fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"  Smør  \",\"description\":\"  Smør   fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"}],\"c\":{\"@type\":\"OfferCatalog\",\"name\":\"Produkter\",\"itemListElement\":[{\"@type\":\"Thing\",\"name\":\"Ost\"},{\"@type\":\"Thing\",\"name\":\"Rabarbra\"},{\"@type\":\"Thing\",\"name\":\"🐑 LAM\"}]},\"p\":\"Vipps, Kontant\",\"k\":\"Nyt Norge, Spesialitet\"}", "b W no: LocalBusiness offers, catalog, paymentAccepted and keywords byte-identical to main");
       assertEq(JSON.stringify(faqPage(no.body)), "{\"@context\":\"https://schema.org\",\"@type\":\"FAQPage\",\"@id\":\"https://rettfrabonden.com/produsent/wenche-gard#faq\",\"mainEntity\":[{\"@type\":\"Question\",\"name\":\"Hva selger Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Wenche Gard tilbyr Honning, Lammelår – kr 275/kg, Egg, Syltetøy & gelé <hjemmelaget>, Ost,   Smør  , Rabarbra, 🐑 LAM.\"}},{\"@type\":\"Question\",\"name\":\"Hvor ligger Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Wenche Gard holder til i Wtown.\"}},{\"@type\":\"Question\",\"name\":\"Kan jeg besøke eller bestille fra Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Ja — Wenche Gard har åpningstider oppført på profilen.\"}}]}", "b W no: FAQPage byte-identical to main");
@@ -437,7 +439,7 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
       const r = producer("mona-aapningstider");
       assertEq(r.status, 200, "c hours: 200");
       assertEq(withoutToday(cardGrid(r.body, "hrs-grid") ?? ""),
-        "<div class=\"hrs-day\"></div><div class=\"hrs-time\">Lørdag 10–14</div>" +
+        "<div class=\"hrs-day\"></div><div class=\"hrs-time\">Lørdag etter avtale</div>" +
         "<div class=\"hrs-day\">Torsdag</div><div class=\"hrs-time\">&lt;b&gt;10&lt;/b&gt; – 17:00</div>" +
         "<div class=\"hrs-day\">Fredag</div><div class=\"hrs-time\">10:00 – 17:00</div>",
         "c hours: a text entry is shown as text; entries without both times are left out (main: \"undefined – undefined\", \"[object Object] – 17:00\", \"10:00 – undefined\"); times are escaped; an object note is left out");
