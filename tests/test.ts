@@ -42561,6 +42561,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-M (FUNN
+// rfb-html-innsettinger-rest-etter-i-k): selger.html's stats tab, trust
+// breakdown and showAlert messages escape the values they put in (the
+// e-mail the user typed, server errors, err.message); admin.html's login
+// alert is set as text; the producer modal on /app and /dashboard reads
+// only its own months, so "constructor" is text. The pages' inline scripts
+// run in a vm with the fake DOM, fed by the real owner-stats and trust
+// handlers; plus a source scan of every showAlert message; own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-M (escaping: seller stats, trust, alerts, admin login, modal months) ──");
+  try {
+    const { runRfbEscapingRestSelgerAdminModalTests } = require("../src/routes/rfb-escaping-rest-selger-admin-modal.test") as
+      typeof import("../src/routes/rfb-escaping-rest-selger-admin-modal.test");
+    const r = await runRfbEscapingRestSelgerAdminModalTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-escaping-rest-selger-admin-modal: " + f);
+    console.log(`  rfb-escaping-rest-selger-admin-modal: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-escaping-rest-selger-admin-modal: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)

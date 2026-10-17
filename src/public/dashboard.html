@@ -1575,6 +1575,14 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       return Object.prototype.hasOwnProperty.call(categoryNames, cat) ? categoryNames[cat] : cat;
     }
 
+    // The short name of month 1–12 (stored as 6 or "6"), any other value as
+    // it is, like `monthNames[m] || m` before. Only the table's own months
+    // count, so "constructor" or "length" stays text (I-M).
+    function formatMonth(m) {
+      var name = Object.prototype.hasOwnProperty.call(monthNames, m) ? monthNames[m] : '';
+      return typeof name === 'string' && name ? name : m;
+    }
+
     // ── Initialize ──
     document.addEventListener('DOMContentLoaded', function() {
       // Show "Min butikk" link if user has a saved session
@@ -2066,7 +2074,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
             : [];
           var metaInfo = '';
           if (p && p.seasonal && months.length > 0) {
-            metaInfo += esc(months.map(function(m) { return monthNames[m] || m; }).join('-'));
+            metaInfo += esc(months.map(formatMonth).join('-'));
           }
           if (p && p.organic) metaInfo += ' <span class="organic-badge">Økologisk</span>';
           html += '<div class="modal-product">' +

@@ -168,7 +168,9 @@
           renderAll();
         }
       } catch (err) {
-        document.getElementById('loginAlert').innerHTML = '<div class="alert alert-error">Feil: ' + err.message + '</div>';
+        var loginAlert = document.getElementById('loginAlert');
+        loginAlert.innerHTML = '';
+        loginAlert.appendChild(alertBox('Feil: ' + err.message, 'error'));
       }
     }
 
@@ -201,17 +203,22 @@
       this.textContent = 'Oppdater';
     });
 
-    // Every caller passes plain text (an agent name, a count, an error
-    // message), so the message is set as text and never parsed as HTML: an
+    // An alert box with `msg` set as text, never parsed as HTML. Every caller
+    // passes plain text (an agent name, a count, an error message), so an
     // agent name with markup in it stays text (dev-request
-    // 2026-10-17-integrasjonstest-oppfolging, I-K).
-    function showAdminAlert(msg, type) {
-      var el = document.getElementById('adminAlert');
+    // 2026-10-17-integrasjonstest-oppfolging, I-K). The login alert uses it
+    // too (I-M).
+    function alertBox(msg, type) {
       var box = document.createElement('div');
       box.className = 'alert alert-' + type;
       box.textContent = msg;
+      return box;
+    }
+
+    function showAdminAlert(msg, type) {
+      var el = document.getElementById('adminAlert');
       el.innerHTML = '';
-      el.appendChild(box);
+      el.appendChild(alertBox(msg, type));
       setTimeout(function() { el.innerHTML = ''; }, 5000);
     }
 
