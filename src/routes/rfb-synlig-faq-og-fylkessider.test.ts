@@ -15,23 +15,34 @@
  *   (a) pure: fylkeForPlaceSlug() for every current fylke, Oslo, old names,
  *       merged 2020-2023 names, cities and non-slug spellings;
  *       producerPlaceFylke() for kommuner, towns, the Bø/Os name clashes,
- *       fylke names and unknown places; placeSlugsForCity().
+ *       fylke names, unknown places, a trailing " kommune", the producer's
+ *       own coordinate (veto outside the fylke's box, no veto from a missing
+ *       or 0/0 coordinate, a border case) and the shared names (Nes, Sande,
+ *       Hemnes, Osen, Åmot need a coordinate in the kommune's own box);
+ *       placeSlugsForCity() with and without a coordinate.
  *   (b) pure: buildCityFaqJsonLd({isFylke}) says how the fylke count is made;
  *       the city wording is unchanged.
  *   (c) SD-01 on five pages: /bergen, /vestland, /en/vestland,
  *       /produsent/<slug>, /en/produsent/<slug>: the visible FAQ pairs equal
  *       the FAQPage pairs, the section id is the FAQPage @id anchor, /en marks
  *       the Norwegian section lang="nb"; a producer whose FAQ is gated out
- *       gets no section and no FAQ CSS.
+ *       gets no section and no FAQ CSS; a producer name with & ' and < is
+ *       escaped in the visible FAQ.
  *   (d) SD-02 regression (repro: /vestland showed 1 producer, in
  *       Fredrikstad): /vestland lists the Bergen and Voss producers only;
  *       hero, FAQ, meta description and LocalBusiness count all equal the
  *       cards; addressLocality is the producer's own place; the fylke-named
  *       Fredrikstad producer, an unknown place (Norheimsund) and the
- *       ambiguous Os are not listed; /akershus (only a city "Akershus"
- *       producer) and /rogaland (none) answer 404; /oslo, /bergen, /bo stay
- *       city pages with their old wording.
- *   (e) sitemap: fylke pages exactly when they have producers, lastmod is
+ *       ambiguous Os are not listed; /rogaland (none) answers 404; /oslo,
+ *       /bergen, /bo stay city pages with their old wording.
+ *   (e) review B1 on lokal#1109, live repro with live coordinates: the three
+ *       Sande i Vestfold producers are not on /more-og-romsdal (which lists
+ *       only its Rauma producer, FAQ count 1); Mølstad Gård (Nes på Hedmark)
+ *       and Furuset Tunet (Nes i Ådal) are not on /akershus, Rånås Gård
+ *       (Auli) is, and the FAQ says 1; Åmot in Modum is not on /innlandet; a
+ *       "Hamar" producer whose coordinate is in Rana is on neither /innlandet
+ *       nor /nordland; "Lier kommune" with a 0/0 coordinate is on /buskerud.
+ *   (f) sitemap: fylke pages exactly when they have producers, lastmod is
  *       the newest of them, no duplicate <loc>, and every place <loc> answers
  *       200 with at least one producer card.
  *
@@ -163,6 +174,41 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
     assertEq(producerPlaceFylke(null), null, "a: null places no producer");
     assertEq(producerPlaceFylke(undefined), null, "a: undefined places no producer");
 
+    // A trailing " kommune" is not part of the place name (S1).
+    assertEq(producerPlaceFylke("Lier kommune"), "Buskerud", "a: \"Lier kommune\" -> Buskerud");
+    assertEq(producerPlaceFylke("Rauma kommune"), "Møre og Romsdal", "a: \"Rauma kommune\" -> Møre og Romsdal");
+    assertEq(producerPlaceFylke("Austevoll KOMMUNE "), "Vestland", "a: suffix in any case, trimmed -> Vestland");
+    assertEq(producerPlaceFylke("Rennesøy kommune"), null, "a: a merged-away kommune is still not placed");
+    assertEq(producerPlaceFylke("Kommune"), null, "a: \"Kommune\" alone places no producer");
+
+    // The producer's own coordinate (review B1 on lokal#1109): live coordinates.
+    const hamarGeo = { lat: 60.795, lng: 11.068 };
+    const ranaGeo = { lat: 66.3173418944786, lng: 14.145752939955319 };
+    const raanaasGeo = { lat: 60.04679965585512, lng: 11.33372745180509 };
+    const moelstadGeo = { lat: 60.92741454507553, lng: 10.709622024825517 };
+    const furusetGeo = { lat: 60.56348, lng: 9.98776 };
+    const sandeVestfoldGeo = { lat: 59.5934, lng: 10.2026 };
+    const bakkeModumGeo = { lat: 59.9478998491016, lng: 9.800437734468055 };
+    assertEq(producerPlaceFylke("Hamar", hamarGeo), "Innlandet", "a: coordinate in the fylke -> placed");
+    assertEq(producerPlaceFylke("Hamar", ranaGeo), null, "a: \"Hamar\" with its coordinate in Rana -> not placed (coordinate vetoes)");
+    assertEq(producerPlaceFylke("Hamar"), "Innlandet", "a: no coordinate -> the name decides");
+    assertEq(producerPlaceFylke("Hamar", null), "Innlandet", "a: null coordinate -> the name decides");
+    assertEq(producerPlaceFylke("Hamar", { lat: 0, lng: 0 }), "Innlandet", "a: a 0/0 coordinate is no evidence -> the name decides");
+    assertEq(producerPlaceFylke("Hamar", { lat: null, lng: 11.068 }), "Innlandet", "a: half a coordinate is no evidence");
+    assertEq(producerPlaceFylke("Nittedal", { lat: 59.97, lng: 10.875 }), "Akershus", "a: a coordinate just over the Oslo border keeps Nittedal in Akershus (the box is coarse)");
+    assertEq(producerPlaceFylke("Nes", raanaasGeo), "Akershus", "a: Nes + Rånås Gård's coordinate (Auli) -> Akershus");
+    assertEq(producerPlaceFylke("Nes", moelstadGeo), null, "a: Nes + Mølstad Gård's coordinate (Nes på Hedmark) -> not placed");
+    assertEq(producerPlaceFylke("Nes", furusetGeo), null, "a: Nes + Furuset Tunet's coordinate (Nes i Ådal) -> not placed");
+    assertEq(producerPlaceFylke("Nes"), null, "a: Nes without a coordinate -> not placed (a shared name needs one)");
+    assertEq(producerPlaceFylke("Nes", { lat: 0, lng: 0 }), null, "a: Nes with a 0/0 coordinate -> not placed");
+    assertEq(producerPlaceFylke("Nes kommune", raanaasGeo), "Akershus", "a: \"Nes kommune\" is the shared name Nes");
+    assertEq(producerPlaceFylke("Sande", sandeVestfoldGeo), null, "a: Sande + a Sande i Vestfold coordinate -> not placed (not Møre og Romsdal)");
+    assertEq(producerPlaceFylke("Sande", { lat: 62.25, lng: 5.45 }), "Møre og Romsdal", "a: Sande + a coordinate in Sande kommune -> Møre og Romsdal");
+    assertEq(producerPlaceFylke("Hemnes", { lat: 59.72085, lng: 11.45524 }), null, "a: Hemnes + Hemnes i Høland's coordinate -> not placed");
+    assertEq(producerPlaceFylke("Hemnes", { lat: 65.8833, lng: 14.0333 }), "Nordland", "a: Hemnes + a coordinate in Hemnes kommune -> Nordland");
+    assertEq(producerPlaceFylke("Osen", { lat: 61.250179274314576, lng: 11.74469682120022 }), null, "a: Osen + Osen in Åmot's coordinate -> not placed");
+    assertEq(producerPlaceFylke("Åmot", bakkeModumGeo), null, "a: Åmot + Åmot in Modum's coordinate -> not placed (inside Innlandet's box, outside Åmot's)");
+
     assertEq(placeSlugsForCity("Bergen"), ["bergen", "vestland"], "a: Bergen -> its city page and /vestland");
     assertEq(placeSlugsForCity("Oslo"), ["oslo"], "a: Oslo -> /oslo only");
     assertEq(placeSlugsForCity("Lofoten"), ["lofoten", "nordland"], "a: Lofoten -> /lofoten and /nordland");
@@ -172,6 +218,13 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
     assertEq(placeSlugsForCity("Hordaland"), ["hordaland"], "a: Hordaland -> its city page as before");
     assertEq(placeSlugsForCity("Kristiansand S"), ["kristiansand-s"], "a: unknown place -> its city page as before");
     assertEq(placeSlugsForCity(""), [], "a: empty city -> nothing");
+    assertEq(placeSlugsForCity("Bergen", { lat: 60.391, lng: 5.322 }), ["bergen", "vestland"], "a: Bergen with a Bergen coordinate -> both pages");
+    assertEq(placeSlugsForCity("Bergen", { lat: 59.68178377851215, lng: 10.526837486003666 }), ["bergen"], "a: Bergen with an Asker coordinate -> its city page only");
+    assertEq(placeSlugsForCity("Sande", sandeVestfoldGeo), ["sande"], "a: Sande i Vestfold -> /sande only, not /more-og-romsdal");
+    assertEq(placeSlugsForCity("Nes", raanaasGeo), ["nes", "akershus"], "a: Rånås Gård -> /nes and /akershus");
+    assertEq(placeSlugsForCity("Nes", moelstadGeo), ["nes"], "a: Mølstad Gård -> /nes only");
+    assertEq(placeSlugsForCity("Lier kommune"), ["lier-kommune", "buskerud"], "a: \"Lier kommune\" keeps its own page slug and is on /buskerud");
+    assertEq(placeSlugsForCity("Oslo", { lat: 59.913, lng: 10.739 }), ["oslo"], "a: Oslo with a coordinate -> /oslo only");
 
     // ══ (b) buildCityFaqJsonLd wording ═══════════════════════════════════
     {
@@ -179,13 +232,13 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
       const fylkeFaq = buildCityFaqJsonLd({ ...base, cityName: "Vestland", producerCount: 2, isFylke: true });
       assertEq(
         fylkeFaq?.mainEntity?.[0]?.acceptedAnswer?.text,
-        "Rett fra Bonden har 2 lokale produsenter med registrert kommune i Vestland.",
+        "Rett fra Bonden har 2 lokale produsenter med registrert sted i Vestland.",
         "b: fylke count answer says how the count is made",
       );
       const one = buildCityFaqJsonLd({ ...base, cityName: "Vestland", producerCount: 1, isFylke: true });
       assertEq(
         one?.mainEntity?.[0]?.acceptedAnswer?.text,
-        "Rett fra Bonden har 1 lokal produsent med registrert kommune i Vestland.",
+        "Rett fra Bonden har 1 lokal produsent med registrert sted i Vestland.",
         "b: fylke count answer is singular for 1",
       );
       const city = buildCityFaqJsonLd({ ...base, url: `${BASE_URL}/bergen`, cityName: "Bergen", producerCount: 12 });
@@ -229,7 +282,7 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
     // The live repro: the one producer on /vestland, city "Vestland", address in Fredrikstad.
     seedAgent({ id: "aarvik", name: "Aarvik Gård — Vestland", city: "Vestland", categories: ["bakery"], address: "Th.Thomassens vei 19, 1613 FREDRIKSTAD", geo: [59.21, 10.93] });
     seedAgent({ id: "bergen-honning", name: "Berg & Sønn's Honning", city: "Bergen", categories: ["honey"], verified: true, address: "Bryggen 1, 5003 Bergen", updatedAt: "2026-09-01 10:00:00", geo: [60.39, 5.32] });
-    seedAgent({ id: "voss-ysteri", name: "Voss Ysteri", city: "Voss", categories: ["cheese", "dairy"], updatedAt: "2026-10-02 10:00:00", geo: [60.63, 6.42] });
+    seedAgent({ id: "voss-ysteri", name: "Voss Ysteri <Fjell>", city: "Voss", categories: ["cheese", "dairy"], updatedAt: "2026-10-02 10:00:00", geo: [60.63, 6.42] });
     seedAgent({ id: "norheimsund-gard", name: "Norheimsund Gard", city: "Norheimsund", categories: ["fruit"], geo: [60.37, 6.14] });
     seedAgent({ id: "os-gard", name: "Os Gard", city: "Os", categories: ["meat"], geo: [60.19, 5.47] });
     seedAgent({ id: "bo-gard", name: "Bø Gard", city: "Bø", categories: ["vegetables"], geo: [59.41, 9.06] });
@@ -237,6 +290,19 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
     seedAgent({ id: "akershus-only", name: "Akershus Eple", city: "Akershus", categories: ["fruit"], geo: [59.66, 10.79] });
     seedAgent({ id: "oslo-bakeri", name: "Oslo Bakeri", city: "Oslo", categories: ["bakery"], geo: [59.91, 10.75] });
     seedAgent({ id: "uten-sted", name: "Uten Sted", city: null });
+    // Review B1 on lokal#1109: the live producers whose city names a current
+    // kommune in another fylke, with their live coordinates and addresses.
+    seedAgent({ id: "gran-sondre", name: "Gran Søndre — Sande", city: "Sande", categories: ["meat"], address: "Gran 6", geo: [59.60360552016277, 10.229273400361958] });
+    seedAgent({ id: "granstad", name: "Granstad Gård — Sande", city: "Sande", categories: ["vegetables"], address: "Trollsrudveien 72, Sande", geo: [59.5934, 10.2026] });
+    seedAgent({ id: "flatan", name: "Flåtan Søndre Gårdsbutikk — Sande", city: "Sande", categories: ["berries"], address: "Gallebergveien 42-44, 3073 Sande i Vestfold", geo: [59.49, 10.17] });
+    seedAgent({ id: "ranaas", name: "Rånås Gård", city: "Nes", categories: ["meat"], address: "Hvamsvegen 1263, 1929 Auli", geo: [60.04679965585512, 11.33372745180509] });
+    seedAgent({ id: "molstad", name: "Mølstad Gård", city: "Nes", categories: ["vegetables"], address: "Mølstadveien 130, 2350 Nes på Hedmark", updatedAt: "2026-10-10 10:00:00", geo: [60.92741454507553, 10.709622024825517] });
+    seedAgent({ id: "furuset", name: "Furuset Tunet — Nes", city: "Nes", categories: ["dairy"], geo: [60.56348, 9.98776] });
+    seedAgent({ id: "bakke-modum", name: "Bakke Gårdsbakeri — Modum", city: "Åmot", categories: ["bakery"], address: "Nedre Bakke 29, 3340 Åmot", geo: [59.9478998491016, 9.800437734468055] });
+    // A city and a coordinate that contradict each other (live: "Hamar", coordinate in Rana).
+    seedAgent({ id: "matkvartalet", name: "LOKAL Matkvartalet Hamar", city: "Hamar", categories: ["bakery"], address: "Søderlundmyra 18", geo: [66.3173418944786, 14.145752939955319] });
+    seedAgent({ id: "rauma", name: "Rauma Gardsmat", city: "Rauma kommune", categories: ["meat"], geo: [62.567, 7.687] });
+    seedAgent({ id: "lier", name: "Lier Eple", city: "Lier kommune", categories: ["fruit"], geo: [0, 0] });
     resetRegistryCache();
 
     const router = seo.default as any;
@@ -294,6 +360,17 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
       assertTrue(fivePages[3]!.r.body.includes("Hva selger Berg &amp; Sønn&#39;s Honning?"), "c producer: visible FAQ text is HTML-escaped");
     }
     {
+      // S5 on lokal#1109: a "<" in a producer name, end to end.
+      const r = producer("voss-ysteri-fjell");
+      assertEq(r.status, 200, "c producer <: 200");
+      const shown = visibleFaq(r.body);
+      const faqLd = jsonLdBlocks(r.body).find((b) => b["@type"] === "FAQPage");
+      assertTrue(!!shown && shown.pairs.some((x) => x.q === "Hva selger Voss Ysteri <Fjell>?"), "c producer <: the name round-trips through the visible FAQ");
+      assertEq(shown?.pairs, ldPairs(faqLd), "c producer <: visible pairs equal the FAQPage");
+      const section = r.body.match(/<section id="faq"[\s\S]*?<\/section>/)?.[0] || "";
+      assertTrue(section.includes("Voss Ysteri &lt;Fjell&gt;") && !section.includes("<Fjell>"), "c producer <: the visible FAQ escapes < and >");
+    }
+    {
       const r = producer("uten-sted");
       assertEq(r.status, 200, "c gated-out: producer without city or categories renders 200");
       assertTrue(!jsonLdBlocks(r.body).some((b) => b["@type"] === "FAQPage"), "c gated-out: no FAQPage (quality gate)");
@@ -318,7 +395,7 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
       const faq = blocks.find((b) => b["@type"] === "FAQPage");
       assertEq(
         faq?.mainEntity?.[0]?.acceptedAnswer?.text,
-        "Rett fra Bonden har 2 lokale produsenter med registrert kommune i Vestland.",
+        "Rett fra Bonden har 2 lokale produsenter med registrert sted i Vestland.",
         "d /vestland: FAQ count is the real count",
       );
       const lbs = blocks.filter((b) => b["@type"] === "LocalBusiness");
@@ -340,7 +417,7 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
       assertEq(cardCount(r.body), 1, "d /ostfold: only the Fredrikstad producer");
       assertTrue(r.body.includes("Fredrikstad Gard"), "d /ostfold: Fredrikstad producer listed");
     }
-    for (const [slug, why] of [["akershus", "only a producer whose city is the fylke name"], ["rogaland", "no producers"], ["telemark", "Bø is not guessed into Telemark"]] as const) {
+    for (const [slug, why] of [["rogaland", "no producers"], ["telemark", "Bø is not guessed into Telemark"], ["nordland", "a coordinate never places a producer by itself"], ["trondelag", "no producers"]] as const) {
       const r = place(slug);
       assertEq(r.status, 404, `d /${slug}: 404 (${why})`);
       assertTrue(r.body.includes('content="noindex, follow"'), `d /${slug}: the 404 page is noindex`);
@@ -364,36 +441,94 @@ export async function runRfbSynligFaqOgFylkessiderTests(opts: { log?: boolean } 
       assertTrue(r.body.includes(name), `d /${slug}: lists ${name} as before`);
     }
 
-    // ══ (e) sitemap matches the route ════════════════════════════════════
+    // ══ (e) review B1 on lokal#1109: names shared with another fylke ══════
+    {
+      const r = place("more-og-romsdal");
+      assertEq(r.status, 200, "e /more-og-romsdal: 200 (the Rauma producer)");
+      assertEq(cardCount(r.body), 1, "e /more-og-romsdal: 1 producer card");
+      assertTrue(r.body.includes("Rauma Gardsmat"), "e /more-og-romsdal: \"Rauma kommune\" producer listed");
+      for (const name of ["Gran Søndre", "Granstad Gård", "Flåtan Søndre"]) {
+        assertTrue(!r.body.includes(name), `e /more-og-romsdal: ${name} (Sande i Vestfold) is not listed — the live repro`);
+      }
+      const blocks = jsonLdBlocks(r.body);
+      assertEq(blocks.filter((b) => b["@type"] === "LocalBusiness").map((b) => b.name), ["Rauma Gardsmat"], "e /more-og-romsdal: LocalBusiness holds only the Rauma producer");
+      assertEq(
+        blocks.find((b) => b["@type"] === "FAQPage")?.mainEntity?.[0]?.acceptedAnswer?.text,
+        "Rett fra Bonden har 1 lokal produsent med registrert sted i Møre og Romsdal.",
+        "e /more-og-romsdal: FAQ count is the real count (1)",
+      );
+    }
+    {
+      const r = place("akershus");
+      assertEq(r.status, 200, "e /akershus: 200 (Rånås Gård)");
+      assertEq(cardCount(r.body), 1, "e /akershus: 1 producer card");
+      assertTrue(r.body.includes("Rånås Gård"), "e /akershus: Rånås Gård (Auli, Nes) is listed");
+      assertTrue(!r.body.includes("Mølstad Gård"), "e /akershus: Mølstad Gård (Nes på Hedmark) is not listed — the live repro");
+      assertTrue(!r.body.includes("Furuset Tunet"), "e /akershus: Furuset Tunet (Nes i Ådal) is not listed — the live repro");
+      assertTrue(!r.body.includes("Akershus Eple"), "e /akershus: the city \"Akershus\" producer is still not listed");
+      const blocks = jsonLdBlocks(r.body);
+      assertEq(blocks.filter((b) => b["@type"] === "LocalBusiness").map((b) => b.name), ["Rånås Gård"], "e /akershus: LocalBusiness holds only Rånås Gård");
+      assertEq(
+        blocks.find((b) => b["@type"] === "FAQPage")?.mainEntity?.[0]?.acceptedAnswer?.text,
+        "Rett fra Bonden har 1 lokal produsent med registrert sted i Akershus.",
+        "e /akershus: FAQ count is the real count (1)",
+      );
+      assertTrue(r.body.includes('<p>1 lokale matprodusenter i kommunene i <span translate="no">Akershus</span>.</p>'), "e /akershus: hero count equals the cards");
+    }
+    {
+      const r = place("nes");
+      assertEq(r.status, 200, "e /nes: own city page still 200");
+      assertEq(cardCount(r.body), 3, "e /nes: lists all three Nes producers as before");
+      const s = place("sande");
+      assertEq(cardCount(s.body), 3, "e /sande: lists the three Sande producers as before");
+    }
+    {
+      const r = place("innlandet");
+      assertEq(r.status, 404, "e /innlandet: 404 — Åmot in Modum and the Hamar producer with a Rana coordinate are not placed there");
+      assertEq(place("buskerud").status, 200, "e /buskerud: 200");
+      assertTrue(place("buskerud").body.includes("Lier Eple"), "e /buskerud: \"Lier kommune\" with a 0/0 coordinate is listed by its name");
+      assertTrue(!place("buskerud").body.includes("Furuset Tunet") && !place("buskerud").body.includes("Bakke Gårdsbakeri"), "e /buskerud: Nes i Ådal and Åmot in Modum are not guessed into Buskerud");
+      const h = place("hamar");
+      assertEq(h.status, 200, "e /hamar: own city page still 200");
+      assertTrue(h.body.includes("LOKAL Matkvartalet Hamar"), "e /hamar: the producer stays on its own city page");
+      assertEq(place("lier-kommune").status, 200, "e /lier-kommune: own city page slug unchanged");
+    }
+
+    // ══ (f) sitemap matches the route ════════════════════════════════════
     {
       console.log = () => {};
       let xml = "";
       try { xml = seo.buildSitemapXml(); } finally { console.log = origLog; }
       const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]!);
-      assertEq(locs.length, new Set(locs).size, "e: no duplicate <loc>");
+      assertEq(locs.length, new Set(locs).size, "f: no duplicate <loc>");
       const has = (path: string) => locs.includes(`${BASE_URL}${path}`);
-      for (const p of ["/vestland", "/en/vestland", "/ostfold", "/oslo", "/bergen", "/voss", "/fredrikstad", "/bo", "/os", "/norheimsund"]) {
-        assertTrue(has(p), `e: ${p} listed`);
+      for (const p of ["/vestland", "/en/vestland", "/ostfold", "/oslo", "/bergen", "/voss", "/fredrikstad", "/bo", "/os", "/norheimsund",
+        "/akershus", "/more-og-romsdal", "/buskerud", "/nes", "/sande", "/amot", "/hamar", "/lier-kommune", "/rauma-kommune"]) {
+        assertTrue(has(p), `f: ${p} listed`);
       }
-      for (const p of ["/akershus", "/en/akershus", "/rogaland", "/telemark", "/nordland"]) {
-        assertTrue(!has(p), `e: ${p} not listed (no producers placed there)`);
+      for (const p of ["/rogaland", "/telemark", "/nordland", "/innlandet", "/en/innlandet", "/trondelag"]) {
+        assertTrue(!has(p), `f: ${p} not listed (no producers placed there)`);
       }
       const vestlandEntry = xml.match(/<url>\s*<loc>https:\/\/rettfrabonden\.com\/vestland<\/loc>[\s\S]*?<\/url>/)?.[0] || "";
-      assertTrue(vestlandEntry.includes("<lastmod>2026-10-02</lastmod>"), "e: /vestland lastmod is its newest producer's (Voss, 2026-10-02)");
+      assertTrue(vestlandEntry.includes("<lastmod>2026-10-02</lastmod>"), "f: /vestland lastmod is its newest producer's (Voss, 2026-10-02)");
+      const akershusEntry = xml.match(/<url>\s*<loc>https:\/\/rettfrabonden\.com\/akershus<\/loc>[\s\S]*?<\/url>/)?.[0] || "";
+      assertTrue(akershusEntry.includes("<lastmod>2026-08-01</lastmod>"), "f: /akershus lastmod is Rånås Gård's, not the newer Mølstad Gård's (not placed there)");
+      const nesEntry = xml.match(/<url>\s*<loc>https:\/\/rettfrabonden\.com\/nes<\/loc>[\s\S]*?<\/url>/)?.[0] || "";
+      assertTrue(nesEntry.includes("<lastmod>2026-10-10</lastmod>"), "f: /nes lastmod is its newest producer's (Mølstad Gård, 2026-10-10)");
       const bergenEntry = xml.match(/<url>\s*<loc>https:\/\/rettfrabonden\.com\/bergen<\/loc>[\s\S]*?<\/url>/)?.[0] || "";
-      assertTrue(bergenEntry.includes("<lastmod>2026-09-01</lastmod>"), "e: /bergen lastmod unchanged (its own producer)");
+      assertTrue(bergenEntry.includes("<lastmod>2026-09-01</lastmod>"), "f: /bergen lastmod unchanged (its own producer)");
 
       // Invariant: every place page in the sitemap answers 200 with producers.
       const reserved = new Set(["", "om", "teknologi", "guide-mat-ai", "personvern", "kjopsvilkar", "proveniens", "kategori"]);
       const placeSlugs = locs
         .map((l) => l.slice(BASE_URL.length).replace(/^\/en(?=\/|$)/, "").replace(/^\//, ""))
         .filter((p) => !p.includes("/") && !reserved.has(p));
-      assertTrue(placeSlugs.length >= 9, "e: setup — place pages found in the sitemap");
+      assertTrue(placeSlugs.length >= 9, "f: setup — place pages found in the sitemap");
       const bad = [...new Set(placeSlugs)].filter((slug) => {
         const r = place(slug);
         return r.status !== 200 || cardCount(r.body) === 0;
       });
-      assertEq(bad, [], "e: every place <loc> answers 200 with at least one producer card");
+      assertEq(bad, [], "f: every place <loc> answers 200 with at least one producer card");
     }
   } catch (err) {
     failed++;

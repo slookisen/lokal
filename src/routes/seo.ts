@@ -70,6 +70,8 @@ import { getPublishedProfileTranslations } from "../services/profile-translation
 import { faqPairsFromJsonLd, renderFaqSection } from "../services/faq-section";
 import { cityToFylke, normaliseFylke, EQUIVALENCE_CLASSES } from "../services/norway-fylke";
 import { resolveFylke2024 } from "../services/fylke-2024-migration";
+import { FYLKE_BOUNDS, inBounds, sharedKommuneNameBounds, type Bounds } from "../services/fylke-bounds";
+import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import {
   parseIsoOrSqlite,
   formatUpdatedPrettyNo,
@@ -3567,6 +3569,18 @@ const CITY_CSS = `
 // (and was wrong for Aarvik), so it places no one. Oslo is both a fylke and a
 // city and keeps its city page.
 //
+// A name match alone is not enough either (review B1 on lokal#1109):
+// `agents.city` is a place, not a kommune. A read-only check of every live
+// place page against Kartverket's point lookup found "Sande" (every live
+// producer is in Sande i Vestfold) placed in Møre og Romsdal, "Nes" (Nes på
+// Hedmark, Nes i Ådal) in Akershus, and producers whose coordinate lies far
+// from their city (a "Hamar" producer in Rana). So the producer's own
+// coordinate vetoes a placement outside the fylke's bounding box
+// (services/fylke-bounds.ts). For a name that is also a place in another
+// fylke (Nes, Sande, Hemnes, Osen, Åmot) the coordinate must lie in that
+// kommune's own box, and without one the producer is not placed. A missing or
+// implausible coordinate (0/0) says nothing, so the name decides as before.
+//
 // placeSlugsForCity() is the one predicate for the route and the sitemap, so
 // the sitemap lists exactly the place pages that have producers.
 
@@ -3574,27 +3588,59 @@ const CITY_CSS = `
 // are no longer fylker. EQUIVALENCE_CLASSES lists each merged name first.
 const LEGACY_MERGED_FYLKER: ReadonlySet<string> = new Set(EQUIVALENCE_CLASSES.map((cls) => cls[0]));
 
-// Both caches are keyed by `agents.city` values, a bounded set, and the lookup
-// tables behind them are static.
-const placeFylkeCache = new Map<string, string | null>();
-const placeSlugsCache = new Map<string, readonly string[]>();
+interface PlaceByName {
+  fylke: string | null;
+  kommuneBounds: Bounds | undefined;
+}
+
+/** A producer's coordinate as the registry carries it (`agent.location`). */
+type PlaceCoord = { lat?: number | null; lng?: number | null } | null | undefined;
+
+// The caches are keyed by `agents.city` values or fylke names, bounded sets,
+// and the lookup tables behind them are static. The coordinate check is not
+// cached; it is a few comparisons.
+const placeByNameCache = new Map<string, PlaceByName>();
+const ownPlaceSlugCache = new Map<string, string | null>();
+const fylkePageSlugCache = new Map<string, string | null>();
 
 /**
- * The fylke a producer's `city` value lies in, or null when it cannot be
- * placed without guessing (unknown name, a name the two tables put in
- * different fylker, or a fylke name rather than a place).
+ * What a `city` value says by itself: the fylke the two lookup tables give
+ * it (null when they disagree or neither knows it), and the kommune's box
+ * when the name is also a place in another fylke (fylke-bounds.ts). A
+ * trailing " kommune" is not part of the name ("Lier kommune" -> "Lier").
  */
-export function producerPlaceFylke(city: string | null | undefined): string | null {
-  const raw = typeof city === "string" ? city.trim() : "";
-  if (!raw) return null;
-  const cached = placeFylkeCache.get(raw);
-  if (cached !== undefined) return cached;
-  const kommune = resolveFylke2024({ kommune: raw });
-  const fromKommune = "fylke" in kommune ? kommune.fylke : null;
-  const fromTown = cityToFylke(raw);
-  const fylke = fromKommune && fromTown && fromKommune !== fromTown ? null : (fromKommune ?? fromTown);
-  placeFylkeCache.set(raw, fylke);
-  return fylke;
+function placeByName(city: string): PlaceByName {
+  const cached = placeByNameCache.get(city);
+  if (cached) return cached;
+  const name = city.trim().replace(/\s+kommune$/i, "");
+  let fylke: string | null = null;
+  if (name) {
+    const kommune = resolveFylke2024({ kommune: name });
+    const fromKommune = "fylke" in kommune ? kommune.fylke : null;
+    const fromTown = cityToFylke(name);
+    fylke = fromKommune && fromTown && fromKommune !== fromTown ? null : (fromKommune ?? fromTown);
+  }
+  const place = { fylke, kommuneBounds: name ? sharedKommuneNameBounds(name) : undefined };
+  placeByNameCache.set(city, place);
+  return place;
+}
+
+/**
+ * The fylke a producer lies in, from its `city` value and its own coordinate,
+ * or null when it cannot be placed without guessing: an unknown name, a name
+ * the two tables put in different fylker, a fylke name rather than a place, a
+ * coordinate outside the fylke's box, or a name that is also a place in
+ * another fylke (fylke-bounds.ts) without a coordinate in that kommune's box.
+ * Without a plausible coordinate the name decides.
+ */
+export function producerPlaceFylke(city: string | null | undefined, coord?: PlaceCoord): string | null {
+  const { fylke, kommuneBounds } = placeByName(typeof city === "string" ? city : "");
+  if (!fylke) return null;
+  const lat = coord?.lat;
+  const lng = coord?.lng;
+  const located = isPlausibleNorwayCoord(lat, lng);
+  if (kommuneBounds) return located && inBounds(kommuneBounds, lat as number, lng as number) ? fylke : null;
+  return !located || inBounds(FYLKE_BOUNDS[fylke], lat as number, lng as number) ? fylke : null;
 }
 
 /**
@@ -3606,24 +3652,36 @@ export function producerPlaceFylke(city: string | null | undefined): string | nu
 export function fylkeForPlaceSlug(slug: string): string | null {
   const fylke = normaliseFylke(slug);
   if (!fylke || slugify(fylke) !== slug || LEGACY_MERGED_FYLKER.has(fylke)) return null;
-  return producerPlaceFylke(fylke) ? null : fylke;
+  return placeByName(fylke).fylke ? null : fylke;
+}
+
+/** The page slug of a fylke ("Møre og Romsdal" -> "more-og-romsdal"), or null for Oslo, which has none. */
+function fylkePageSlug(fylke: string): string | null {
+  let slug = fylkePageSlugCache.get(fylke);
+  if (slug === undefined) {
+    slug = fylkeForPlaceSlug(slugify(fylke)) === fylke ? slugify(fylke) : null;
+    fylkePageSlugCache.set(fylke, slug);
+  }
+  return slug;
 }
 
 /**
- * The place pages a producer with this `city` value is listed on: its own
- * city page, unless the value is a fylke name, and the page of the fylke its
- * place lies in.
+ * The place pages a producer is listed on: the city page of its `city` value,
+ * unless the value is a fylke name, and the page of the fylke it is placed in
+ * (producerPlaceFylke(), with its coordinate).
  */
-export function placeSlugsForCity(city: string | null | undefined): readonly string[] {
+export function placeSlugsForCity(city: string | null | undefined, coord?: PlaceCoord): readonly string[] {
   const raw = typeof city === "string" ? city : "";
-  const cached = placeSlugsCache.get(raw);
-  if (cached) return cached;
-  const slugs: string[] = [];
-  const own = slugify(raw);
-  if (own && !fylkeForPlaceSlug(own)) slugs.push(own);
-  const fylke = producerPlaceFylke(raw);
-  if (fylke && fylkeForPlaceSlug(slugify(fylke)) === fylke) slugs.push(slugify(fylke));
-  placeSlugsCache.set(raw, slugs);
+  let own = ownPlaceSlugCache.get(raw);
+  if (own === undefined) {
+    const slug = slugify(raw);
+    own = slug && !fylkeForPlaceSlug(slug) ? slug : null;
+    ownPlaceSlugCache.set(raw, own);
+  }
+  const slugs: string[] = own ? [own] : [];
+  const fylke = producerPlaceFylke(raw, coord);
+  const fylkeSlug = fylke ? fylkePageSlug(fylke) : null;
+  if (fylkeSlug) slugs.push(fylkeSlug);
   return slugs;
 }
 
@@ -4011,12 +4069,13 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
 
   try {
     const agents = marketplaceRegistry.getActiveAgents();
-    // A fylke slug lists the producers placed in that fylke; see
-    // placeSlugsForCity() (SD-02). Every other slug works as before.
+    // A fylke slug lists the producers placed in that fylke, by their city
+    // and their own coordinate; see placeSlugsForCity() (SD-02). Every other
+    // slug works as before.
     const fylke = fylkeForPlaceSlug(citySlug);
     const cityAgents = agents.filter((a: any) => {
       const city = a.city || a.location?.city || "";
-      return placeSlugsForCity(city).includes(citySlug);
+      return placeSlugsForCity(city, a.location).includes(citySlug);
     });
 
     if (cityAgents.length === 0) {
@@ -4733,8 +4792,9 @@ export function buildProducerAnswerFirstOpening(params: {
 // no distinguishing catalog data (no category signal, nobody verified) stays without FAQ schema.
 //
 // isFylke (dev-request 2026-10-17-integrasjonstest-oppfolging, I-E / SD-02): on a fylke page
-// the count is the producers placed in the fylke's kommuner (placeSlugsForCity), so the answer
-// says exactly that instead of claiming every producer in the "område". City pages are unchanged.
+// the count is the producers whose registered place lies in the fylke (placeSlugsForCity), so
+// the answer says exactly that instead of claiming every producer in the "område". City pages
+// are unchanged.
 export function buildCityFaqJsonLd(params: {
   cityName: string;
   url: string;
@@ -4750,7 +4810,7 @@ export function buildCityFaqJsonLd(params: {
     qas.push({
       q: `Hvor mange lokale produsenter finnes i ${params.cityName}?`,
       a: params.isFylke
-        ? `Rett fra Bonden har ${params.producerCount} ${producers} med registrert kommune i ${params.cityName}.`
+        ? `Rett fra Bonden har ${params.producerCount} ${producers} med registrert sted i ${params.cityName}.`
         : `Det er ${params.producerCount} lokale produsenter registrert i ${params.cityName}-området.`,
     });
   }
@@ -6485,7 +6545,7 @@ export function buildSitemapXml(): string {
     const cities = new Set<string>();
     agents.forEach((a: any) => {
       const city = a.city || a.location?.city;
-      if (city) for (const placeSlug of placeSlugsForCity(city)) cities.add(placeSlug);
+      if (city) for (const placeSlug of placeSlugsForCity(city, a.location)) cities.add(placeSlug);
     });
 
     // ── PR-30: per-agent freshness + enrichment-status hints ──────────
@@ -6549,7 +6609,7 @@ export function buildSitemapXml(): string {
       const updatedAt = parseIsoOrSqlite(knowledgeByAgent.get(a.id)?.updatedAt);
       if (!updatedAt) continue;
       const lm = lastmodForDate(updatedAt);
-      for (const citySlug of placeSlugsForCity(city)) {
+      for (const citySlug of placeSlugsForCity(city, (a as any).location)) {
         const prev = cityLastmod.get(citySlug);
         if (!prev || lm > prev) cityLastmod.set(citySlug, lm);
       }

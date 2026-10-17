@@ -47765,7 +47765,9 @@ runSerial(async () => {
 // producer and place pages show their FAQPage as a visible <section id="faq">
 // built from the same object (shared services/faq-section.ts), and a fylke
 // slug (/vestland) lists the producers placed in that fylke with the real
-// count, the sitemap using the same predicate. Own in-memory DB — tail.
+// count, the sitemap using the same predicate. The producer's own coordinate
+// vetoes a placement outside the fylke's box (services/fylke-bounds.ts,
+// review B1 on lokal#1109). Own in-memory DB — tail.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-E: RFB visible FAQ + fylke pages ──");
   try {
@@ -47779,6 +47781,18 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("faq-section: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runFylkeBoundsTests } = require("../src/services/fylke-bounds.test") as
+      typeof import("../src/services/fylke-bounds.test");
+    const fb = runFylkeBoundsTests({ log: false });
+    passed += fb.passed;
+    failed += fb.failed;
+    for (const f of fb.failures) failures.push("fylke-bounds: " + f);
+    console.log(`  fylke-bounds: ${fb.passed} passed, ${fb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("fylke-bounds: unexpected error: " + String(err?.message || err));
   }
   try {
     const { runRfbSynligFaqOgFylkessiderTests } = require("../src/routes/rfb-synlig-faq-og-fylkessider.test") as
