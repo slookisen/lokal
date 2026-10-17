@@ -1120,10 +1120,14 @@
     // ── UI helpers ──
     function show(id) { document.getElementById(id).classList.remove('hidden'); }
     function hide(id) { document.getElementById(id).classList.add('hidden'); }
+    // The serializer escapes & < > (and a no-break space) but not quotes, so
+    // " and ' are escaped too: the result is then also safe inside a quoted
+    // attribute such as data-claim-name. As text it shows the same (dev-request
+    // 2026-10-17-integrasjonstest-oppfolging, I-K).
     function escHtml(s) {
       var d = document.createElement('div');
       d.textContent = s || '';
-      return d.innerHTML;
+      return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function showAlert(containerId, msg, type, persistent) {

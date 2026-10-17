@@ -1462,10 +1462,11 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
     var monthNames = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Des'];
 
     // ── Escaping (dev-request 2026-10-17-integrasjonstest-oppfolging, I-I) ──
-    // The producer modal builds HTML from API values, which owners and
-    // enrichment write. esc() makes a value safe as element text and in a
-    // quoted attribute; a value that is not text or a number gives "", so the
-    // modal never shows "[object Object]" or "undefined".
+    // The producer modal and the card grid (I-K) build HTML from API values,
+    // which owners, self-registrants and enrichment write. esc() makes a value
+    // safe as element text and in a quoted attribute; a value that is not text
+    // or a number gives "", so the page never shows "[object Object]" or
+    // "undefined".
     function esc(value) {
       var s = typeof value === 'string' ? value : (typeof value === 'number' && isFinite(value) ? String(value) : '');
       return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -1482,8 +1483,10 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
     var userLat = null;
     var userLng = null;
 
+    // The Norwegian name of a known category, any other value as it is. Only
+    // the table's own keys count, so "constructor" stays text (I-K).
     function formatCategory(cat) {
-      return categoryNames[cat] || cat;
+      return Object.prototype.hasOwnProperty.call(categoryNames, cat) ? categoryNames[cat] : cat;
     }
 
     // ── Initialize ──
@@ -1632,22 +1635,26 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       var visible = filteredAgents.slice(0, displayCount);
       var remaining = filteredAgents.length - displayCount;
 
+      // Every API value goes through esc(), the id in data-id too (I-K): a
+      // name, city or category anyone can write is text, never markup. A
+      // category that is not text gives no empty tag.
       var html = visible.map(function(agent) {
-        var cats = (agent.categories || []).slice(0, 3).map(function(c) {
-          return '<span class="category-tag">' + formatCategory(c) + '</span>';
+        var cats = (Array.isArray(agent.categories) ? agent.categories : []).slice(0, 3).map(function(c) {
+          var label = esc(formatCategory(c));
+          return label ? '<span class="category-tag">' + label + '</span>' : '';
         }).join('');
 
-        var cityText = agent.location && agent.location.city ? agent.location.city : 'Norge';
+        var cityText = (agent.location && esc(agent.location.city)) || 'Norge';
         if (agent.location && agent.location.distanceKm != null) {
           cityText += ' · ' + (agent.location.distanceKm < 1
             ? (agent.location.distanceKm * 1000).toFixed(0) + ' m'
             : agent.location.distanceKm.toFixed(1) + ' km');
         }
 
-        return '<div class="agent-card" data-id="' + agent.id + '">' +
+        return '<div class="agent-card" data-id="' + esc(agent.id) + '">' +
           '<div class="agent-header">' +
             '<div>' +
-              '<div class="agent-name">' + agent.name + '</div>' +
+              '<div class="agent-name">' + esc(agent.name) + '</div>' +
               '<div class="agent-city">' + cityText + '</div>' +
             '</div>' +
             (agent.isVerified ? '<span class="verified-badge">Verifisert av eier</span>' : '') +
@@ -1830,12 +1837,13 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       document.getElementById('modalAgentName').textContent = agent.name;
       document.getElementById('modalAgentLocation').textContent = (agent.location && agent.location.city ? agent.location.city : 'Norge');
 
-      // Badges
+      // Badges: a value that is not text gives no empty badge (I-K).
       var badgesHtml = '';
       if (agent.isVerified) badgesHtml += '<span class="modal-badge verified">&#10003; Verifisert av eier</span>';
-      badgesHtml += '<span class="modal-badge">' + esc(agent.role || 'producer') + '</span>';
-      (agent.categories || []).slice(0, 3).forEach(function(c) {
-        badgesHtml += '<span class="modal-badge">' + esc(formatCategory(c)) + '</span>';
+      badgesHtml += '<span class="modal-badge">' + (esc(agent.role) || 'producer') + '</span>';
+      (Array.isArray(agent.categories) ? agent.categories : []).slice(0, 3).forEach(function(c) {
+        var label = esc(formatCategory(c));
+        if (label) badgesHtml += '<span class="modal-badge">' + label + '</span>';
       });
       document.getElementById('modalBadges').innerHTML = badgesHtml;
 
@@ -1867,11 +1875,12 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       var html = '';
 
       // Every value from the API goes through esc() (I-I).
-      // About
-      if (knowledge.about || agent.description) {
+      // About: the first of about and description that is text (I-K).
+      var about = [knowledge.about, agent.description].filter(function(v) { return typeof v === 'string' && v; })[0];
+      if (about) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Om</div>' +
-          '<div class="modal-about">' + esc(knowledge.about || agent.description) + '</div>' +
+          '<div class="modal-about">' + esc(about) + '</div>' +
         '</div>';
       }
 
@@ -1951,26 +1960,31 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         extras.push({ label: 'Spesialiteter', items: knowledge.specialties, cls: '' });
       }
 
+      // A value that is not text gives no empty tag, and a section with no
+      // tag left is not shown (I-K).
       extras.forEach(function(extra) {
-        html += '<div class="modal-section">' +
-          '<div class="modal-section-title">' + extra.label + '</div>' +
-          '<div class="modal-tags">';
+        var tags = '';
         extra.items.forEach(function(item) {
-          html += '<span class="modal-tag ' + extra.cls + '">' + esc(item) + '</span>';
+          var label = esc(item);
+          if (label) tags += '<span class="modal-tag ' + extra.cls + '">' + label + '</span>';
         });
-        html += '</div></div>';
+        if (tags) {
+          html += '<div class="modal-section">' +
+            '<div class="modal-section-title">' + extra.label + '</div>' +
+            '<div class="modal-tags">' + tags + '</div></div>';
+        }
       });
 
       // Skills (A2A capabilities)
-      if (Array.isArray(agent.skills) && agent.skills.length > 0) {
+      var skillTags = '';
+      (Array.isArray(agent.skills) ? agent.skills : []).forEach(function(s) {
+        var skillName = esc(typeof s === 'string' ? s : (s && (s.name || s.id)));
+        if (skillName) skillTags += '<span class="modal-tag">' + skillName + '</span>';
+      });
+      if (skillTags) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">A2A Capabilities</div>' +
-          '<div class="modal-tags">';
-        agent.skills.forEach(function(s) {
-          var skillName = esc(typeof s === 'string' ? s : (s && (s.name || s.id)));
-          if (skillName) html += '<span class="modal-tag">' + skillName + '</span>';
-        });
-        html += '</div></div>';
+          '<div class="modal-tags">' + skillTags + '</div></div>';
       }
 
       // Data source
@@ -2009,28 +2023,31 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       var modalBody = document.getElementById('modalBody');
       var html = '';
 
-      if (agent.description) {
+      // About: the description when it is text (I-K).
+      if (typeof agent.description === 'string' && agent.description) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Om</div>' +
           '<div class="modal-about">' + esc(agent.description) + '</div>' +
         '</div>';
       }
 
-      // Categories & Tags
-      var allTags = (agent.categories || []).concat(agent.tags || []);
-      if (allTags.length > 0) {
+      // Categories & Tags: a value that is not text gives no empty tag (I-K).
+      var allTags = (Array.isArray(agent.categories) ? agent.categories : []).concat(agent.tags || []);
+      var tagsHtml = allTags.map(function(t) {
+        var label = esc(formatCategory(t));
+        return label ? '<span class="modal-tag">' + label + '</span>' : '';
+      }).join('');
+      if (tagsHtml) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Kategorier</div>' +
-          '<div class="modal-tags">' +
-          allTags.map(function(t) { return '<span class="modal-tag">' + esc(formatCategory(t)) + '</span>'; }).join('') +
-          '</div></div>';
+          '<div class="modal-tags">' + tagsHtml + '</div></div>';
       }
 
       // Info grid
       html += '<div class="modal-section">' +
         '<div class="modal-section-title">Detaljer</div>' +
         '<div class="modal-info-grid">' +
-          '<div class="modal-info-item"><div class="modal-info-label">Rolle</div><div class="modal-info-value">' + esc(agent.role || 'producer') + '</div></div>' +
+          '<div class="modal-info-item"><div class="modal-info-label">Rolle</div><div class="modal-info-value">' + (esc(agent.role) || 'producer') + '</div></div>' +
           '<div class="modal-info-item"><div class="modal-info-label">Status</div><div class="modal-info-value">' + (agent.isVerified ? 'Verifisert av eier' : 'Ikke verifisert av eier') + '</div></div>' +
         '</div></div>';
 
