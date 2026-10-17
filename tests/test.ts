@@ -47659,6 +47659,30 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S6): the
+// Claude directory packs in {rfb,opplevagent,dental}-connectors-prep/ equal what
+// scripts/gen-connector-packs.ts generates from the registered MCP tools,
+// brand-entities and the catalog floors — tool names/count/annotations, URLs,
+// floors (no stale figures), portal + Pro/Max premise, prerequisites, pinned
+// icon md5 per brand, MCPB marked deprecated. Builds throwaway MCP servers and
+// reads files; unsets PAYMENTS_ENABLED while rendering (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── connector-packs-fresh: Claude directory packs generated from the code ──");
+  try {
+    const { runConnectorPacksFreshTests } = require("../src/routes/connector-packs-fresh.test") as
+      typeof import("../src/routes/connector-packs-fresh.test");
+    const cp = runConnectorPacksFreshTests({ log: false });
+    passed += cp.passed;
+    failed += cp.failed;
+    for (const f of cp.failures) failures.push("connector-packs-fresh: " + f);
+    console.log(`  connector-packs-fresh: ${cp.passed} passed, ${cp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("connector-packs-fresh: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical (skive A):
 // sitemap role-gate (one batch query), two 404 umbrella slugs excluded, and the
 // shared BM event time-offset helper. Own in-memory DB; runSerial, tail position.
