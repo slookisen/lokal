@@ -79,6 +79,14 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
     ]);
     const parse = (q: string) => parser.parseDentalQuery(q, gazetteer);
     const filterOf = (q: string) => parse(q).filter;
+    // S3b: a poststed that is also the name of a kommune covers the whole
+    // kommune (its stored spellings OR the kommune's postnumre).
+    const withKommune = (poststed_in: string[], kommunenummer: string) =>
+      ({ poststed_or_postnummer: { poststed_in, postnummer_in: postnumreForKommune(kommunenummer) } });
+    const BERGEN = withKommune(["BERGEN", "Bergen"], "4601");
+    const STAVANGER = withKommune(["STAVANGER"], "1103");
+    const TROMSO = withKommune(["TROMSØ"], "5501");
+    const TRONDHEIM = withKommune(["TRONDHEIM"], "5001");
 
     assertEq(gazetteer.poststeder.get("bergen"), ["BERGEN", "Bergen"], "G1: every stored spelling of a poststed is kept, most common first");
     assertTrue(!gazetteer.poststeder.has("baerum") && !gazetteer.poststeder.has("kristiansand"), "G2: a kommune name stored as poststed is not a poststed");
@@ -86,12 +94,12 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
     assertEq(gazetteer.maxWords, 3, "G4: longest place is three words (Møre og Romsdal, Mo i Rana)");
 
     // ── Q: acceptance cases from the dev-request ──────────────────────────
-    assertEq(filterOf("tannlege i Bergen"), { poststed_in: ["BERGEN", "Bergen"] }, "Q1: «tannlege i Bergen» -> poststed BERGEN (all stored spellings)");
-    assertEq(filterOf("kjeveortoped Bergen"), { specialty: "kjeveortopedi", poststed_in: ["BERGEN", "Bergen"] }, "Q2: «kjeveortoped Bergen» -> kjeveortopedi + BERGEN");
-    assertEq(filterOf("find orthodontist in Bergen"), { specialty: "kjeveortopedi", poststed_in: ["BERGEN", "Bergen"] }, "Q3: «find orthodontist in Bergen» -> kjeveortopedi + BERGEN");
-    assertEq(filterOf("akuttvakt tannlege Stavanger"), { acute_vakt: 1, poststed_in: ["STAVANGER"] }, "Q4: «akuttvakt tannlege Stavanger» -> akutt + STAVANGER");
+    assertEq(filterOf("tannlege i Bergen"), BERGEN, "Q1: «tannlege i Bergen» -> poststed BERGEN (all stored spellings) or Bergen kommune (S3b)");
+    assertEq(filterOf("kjeveortoped Bergen"), { specialty: "kjeveortopedi", ...BERGEN }, "Q2: «kjeveortoped Bergen» -> kjeveortopedi + BERGEN");
+    assertEq(filterOf("find orthodontist in Bergen"), { specialty: "kjeveortopedi", ...BERGEN }, "Q3: «find orthodontist in Bergen» -> kjeveortopedi + BERGEN");
+    assertEq(filterOf("akuttvakt tannlege Stavanger"), { acute_vakt: 1, ...STAVANGER }, "Q4: «akuttvakt tannlege Stavanger» -> akutt + STAVANGER");
     assertEq(filterOf("finn tannlege med helfo-avtale i Oslo"), { helfo_agreement: "true", poststed_in: ["OSLO"] }, "Q5: «finn tannlege med helfo-avtale i Oslo» -> helfo + OSLO");
-    assertEq(filterOf("Tromsø"), { poststed_in: ["TROMSØ"] }, "Q6: «Tromsø» -> poststed TROMSØ");
+    assertEq(filterOf("Tromsø"), TROMSO, "Q6: «Tromsø» -> poststed TROMSØ (or Tromsø kommune, S3b)");
     assertTrue(filterOf("Tromsø").fylke === undefined, "Q7: «Tromsø» never becomes fylke Troms");
     assertEq(filterOf("tannlege i Troms"), { fylke: "Troms" }, "Q8: «Troms» on its own is the fylke");
     assertEq(filterOf("Møre og Romsdal"), { fylke: "Møre og Romsdal" }, "Q9: «Møre og Romsdal» -> fylke (the three words win over the region Romsdal)");
@@ -114,8 +122,8 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
     assertEq(filterOf("tannlege i Mo i Rana"), { poststed_in: ["MO I RANA"] }, "Q21: three-word poststed with a stopword inside");
     assertEq(filterOf("Kristiansand S"), { poststed_in: ["KRISTIANSAND S"] }, "Q22: «Kristiansand S» -> the poststed");
     assertEq(filterOf("tannlege Kristiansand").postnummer_in, postnumreForKommune("4204"), "Q23: «Kristiansand» -> the kommune (no poststed has that exact name)");
-    assertEq(filterOf("Bodø"), { poststed_in: ["BODØ", "Bodoe"] }, "Q24: «Bodø» -> BODØ and the ASCII spelling Bodoe");
-    assertEq(filterOf("emergency dentist Tromso"), { acute_vakt: 1, poststed_in: ["TROMSØ"] }, "Q25: ASCII «Tromso» -> TROMSØ");
+    assertEq(filterOf("Bodø"), withKommune(["BODØ", "Bodoe"], "1804"), "Q24: «Bodø» -> BODØ and the ASCII spelling Bodoe");
+    assertEq(filterOf("emergency dentist Tromso"), { acute_vakt: 1, ...TROMSO }, "Q25: ASCII «Tromso» -> TROMSØ");
     assertEq(filterOf("tannlege Lofoten"), { fylke: "Nordland" }, "Q26: region Lofoten -> its fylke");
     {
       const r = parse("Herøy");
@@ -123,7 +131,7 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       assertTrue(r.interpretation.some((s) => s.includes("flere kommuner")), "Q28: interpretation notes Herøy is several kommuner");
     }
     assertEq(filterOf("tannlege Våler"), { name_terms: ["våler"] }, "Q29: «Våler» likewise");
-    assertEq(filterOf("tannlege i Trondheim"), { poststed_in: ["TRONDHEIM"] }, "Q30: «Trondheim» -> poststed");
+    assertEq(filterOf("tannlege i Trondheim"), TRONDHEIM, "Q30: «Trondheim» -> poststed (or Trondheim kommune, S3b)");
     assertEq(filterOf("tannlege i Lillehammer").postnummer_in, postnumreForKommune("3405"), "Q31: a kommune not in the poststed list resolves by postnummer");
     {
       const r = parse("barnetannlege Oslo eller Bergen");
@@ -168,7 +176,7 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       assertEq(r.residual_terms.length, 7, "Q57: residual_terms keeps all 7 leftover words");
       assertTrue(r.interpretation.some((s) => s.includes("6 første")), "Q58: the cut is noted");
     }
-    assertEq(parse("tannlege i Bergen").interpretation, ["sted: Bergen (poststed)"], "Q59: interpretation for a plain place");
+    assertEq(parse("tannlege i Bergen").interpretation, ["sted: Bergen (poststed + kommune)"], "Q59: interpretation for a plain place");
     assertEq(parse("Hordaland").interpretation, ["sted: Vestland (fylke; «Hordaland»)"], "Q60: interpretation shows the alias that was folded");
 
     // ── B: bounds ─────────────────────────────────────────────────────────
@@ -177,7 +185,7 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       const r = parse("tannlege i Bergen " + "Oslo Stavanger ".repeat(70_000));
       const ms = Date.now() - t;
       assertTrue(ms < 200, "B1: a 1 MB query with thousands of places is parsed in well under a second");
-      assertEq(r.filter, { poststed_in: ["BERGEN", "Bergen"] }, "B2: ... the first place is used, the rest is not read");
+      assertEq(r.filter, BERGEN, "B2: ... the first place is used, the rest is not read");
       assertTrue(r.interpretation.includes(`merknad: bare de første ${parser.MAX_QUERY_CHARS} tegnene brukes`), "B3: ... and the cut is noted");
       const t16 = Date.now();
       const k16 = parse("kjeveortoped " + "Bergen Oslo Herøy ".repeat(900));
@@ -207,10 +215,10 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
 
     // ── W: words and places (review round 1) ─────────────────────────────
     assertEq(filterOf("Akuttklinikken Oslo"), { poststed_in: ["OSLO"], name_terms: ["akuttklinikken"] }, "W1: «Akuttklinikken» is a name word, not the akutt filter");
-    assertEq(filterOf("Helfotannlegen Bergen"), { poststed_in: ["BERGEN", "Bergen"], name_terms: ["helfotannlegen"] }, "W2: «Helfotannlegen» is a name word, not the Helfo filter");
+    assertEq(filterOf("Helfotannlegen Bergen"), { ...BERGEN, name_terms: ["helfotannlegen"] }, "W2: «Helfotannlegen» is a name word, not the Helfo filter");
     assertEq(filterOf("akutthjelp tannlegevakten Oslo"), { acute_vakt: 1, poststed_in: ["OSLO"] }, "W3: listed akutt forms still apply");
     assertEq(filterOf("tannlege med helfoavtale"), { helfo_agreement: "true" }, "W4: «helfoavtale» -> Helfo");
-    assertEq(filterOf("tannlege Bergen sentrum"), { poststed_in: ["BERGEN", "Bergen"] }, "W5: «sentrum» is a stopword");
+    assertEq(filterOf("tannlege Bergen sentrum"), BERGEN, "W5: «sentrum» is a stopword");
     assertEq(filterOf("is there any dentist open in Oslo"), { poststed_in: ["OSLO"] }, "W6: English function words are stopwords");
     assertEq(filterOf("tannlege for barn i Oslo"), { poststed_in: ["OSLO"] }, "W7: «barn» is not a name search");
     assertEq(filterOf("Can you find me an emergency dentist near Oslo?"), { acute_vakt: 1, poststed_in: ["OSLO"] }, "W7b: an English request sentence leaves no name words");
@@ -232,12 +240,12 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       const r = within("tannlege i Bergen", "Rogaland");
       assertEq(r.filter, {}, "W14: «Bergen» with explicit fylke Rogaland -> the place in the text is not used");
       assertEq(r.interpretation, ["merknad: «Bergen» ligger ikke i Rogaland; stedet i teksten brukes ikke"], "W15: ... and tolkning says so");
-      assertEq(within("tannlege i Bergen", "hordaland").filter, { poststed_in: ["BERGEN", "Bergen"] }, "W16: a place inside the explicit fylke (any spelling) is kept");
+      assertEq(within("tannlege i Bergen", "hordaland").filter, BERGEN, "W16: a place inside the explicit fylke (any spelling) is kept");
       assertEq(within("tannlege i Bærum", "Akershus").filter.postnummer_in?.length, postnumreForKommune("3201").length, "W17: a kommune inside the explicit fylke is kept");
       assertEq(within("tannlege i Bærum", "Oslo").filter, {}, "W18: a kommune outside it is not");
       assertEq(within("tannlege i Sandvika", "Viken").filter, { poststed_in: ["SANDVIKA"] }, "W19: an explicit merged fylke covers its parts");
-      assertEq(within("Bergen eller Stavanger", "Rogaland").filter, { poststed_in: ["STAVANGER"] }, "W20: the next place inside the explicit fylke is used");
-      assertEq(within("tannlege i Bergen", "Ukjent").filter, { poststed_in: ["BERGEN", "Bergen"] }, "W21: an unknown explicit fylke drops nothing");
+      assertEq(within("Bergen eller Stavanger", "Rogaland").filter, STAVANGER, "W20: the next place inside the explicit fylke is used");
+      assertEq(within("tannlege i Bergen", "Ukjent").filter, BERGEN, "W21: an unknown explicit fylke drops nothing");
     }
     assertEq(nq.fylkerForPoststed("Bergen"), ["Vestland"], "W22: fylkerForPoststed reads any stored spelling");
     assertEq(nq.fylkerForPoststed("Baerum"), [], "W23: ... and [] for a name that is not a poststed");
@@ -299,11 +307,11 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       const p = parser.planDentalSearch({ query: "Bergen Tannhelse", explicit: { chain_brand: "X" }, gazetteer: g, count: counter(() => 5) });
       assertEq(
         p.filter,
-        { chain_brand: "X", natural: { parsed: { poststed_in: ["BERGEN", "Bergen"], name_terms: ["tannhelse"] }, legacy: { q: "Bergen Tannhelse" } } },
+        { chain_brand: "X", natural: { parsed: { ...BERGEN, name_terms: ["tannhelse"] }, legacy: { q: "Bergen Tannhelse" } } },
         "S6: explicit AND (parsed OR the old whole-text q) — the old hits are never lost"
       );
       assertEq([p.count, p.tolkning?.fallback], [5, false], "S7: parsed hits -> no fallback");
-      assertEq(calls, [p.filter, { chain_brand: "X", poststed_in: ["BERGEN", "Bergen"], name_terms: ["tannhelse"] }], "S8: one count for the result, one for the parsed reading alone");
+      assertEq(calls, [p.filter, { chain_brand: "X", ...BERGEN, name_terms: ["tannhelse"] }], "S8: one count for the result, one for the parsed reading alone");
     }
     {
       const p = parser.planDentalSearch({ query: "Bergen Akutten", explicit: {}, gazetteer: g, count: (f) => (f.natural ? 4 : 0) });
@@ -334,7 +342,7 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       });
       assertEq(
         p.filter,
-        { natural: { parsed: { specialty: "kjeveortopedi", poststed_in: ["TRONDHEIM"] }, legacy: { helfo_agreement: "true", q: "kjeveortoped trondheim" } } },
+        { natural: { parsed: { specialty: "kjeveortopedi", ...TRONDHEIM }, legacy: { helfo_agreement: "true", q: "kjeveortoped trondheim" } } },
         "S13: a caller's old reading (A2A's keyword parser) is the legacy branch"
       );
     }
@@ -343,16 +351,16 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       const p = parser.planDentalSearch({ query: "tannlege i Tromsø", explicit: {}, gazetteer: g, count: counter(() => 8), legacy: () => ({ fylke: "Troms", q: undefined }) });
       assertEq(
         [p.filter, p.count, p.tolkning?.tolket_som],
-        [{ natural: { parsed: { poststed_in: ["TROMSØ"] }, legacy: { fylke: "Troms" } } }, 8, ["sted: Tromsø (poststed)"]],
+        [{ natural: { parsed: TROMSO, legacy: { fylke: "Troms" } } }, 8, ["sted: Tromsø (poststed + kommune)"]],
         "S14: an old reading without name words (A2A read fylke Troms) is kept in full, so nothing it found is lost; tolkning shows the parsed place"
       );
     }
     {
       const noFilter = (count: (f: Record<string, unknown>) => number) =>
         parser.planDentalSearch({ query: "tannlege i Tromsø", explicit: {}, gazetteer: g, count, legacy: () => ({}) });
-      const a = noFilter((f) => (f.poststed_in ? 2 : 20));
-      assertEq([a.filter, a.count, a.tolkning?.fallback], [{ poststed_in: ["TROMSØ"] }, 2, false], "S15: an old reading with no filter (A2A listed the first clinics) is replaced by the parsed one");
-      const z = noFilter((f) => (f.poststed_in ? 0 : 20));
+      const a = noFilter((f) => (f.poststed_or_postnummer ? 2 : 20));
+      assertEq([a.filter, a.count, a.tolkning?.fallback], [TROMSO, 2, false], "S15: an old reading with no filter (A2A listed the first clinics) is replaced by the parsed one");
+      const z = noFilter((f) => (f.poststed_or_postnummer ? 0 : 20));
       assertEq([z.filter, z.count, z.tolkning?.fallback], [{}, 20, true], "S15b: ... unless that finds nothing: the old answer, tolkning.fallback");
       const n = parser.planDentalSearch({ query: "tannlege", explicit: {}, gazetteer: g, count: () => 20, legacy: () => ({}) });
       assertEq([n.filter, n.tolkning?.fallback], [{}, false], "S15c: ... and as is when neither reading found anything to filter on");
