@@ -16,6 +16,7 @@ import {
 } from "../services/gardssalg-claim";
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
 import { emailService } from "../services/email-service";
+import { generalLimiter } from "../middleware/security";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -64,6 +65,48 @@ import { emailService } from "../services/email-service";
 const router = Router();
 
 const OPPLEVAGENT_BASE_URL = (process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no").replace(/\/$/, "");
+
+// ── Host isolation + rate limit (dev-request 2026-10-17-integrasjonstest-
+// oppfolging, I-U; FUNN gardssalg-claim-request-uten-limiter) ─────────────
+// index.ts mounts this router at "/" ahead of the opplevagent.no gate and
+// every limiter. It used to answer on every host — rettfrabonden.com served
+// the claim pages (live 2026-10-17: «Fant ikke produsent — Opplevagent» on
+// RFB) — and no IP limiter covered it: the entry page and the link request
+// below harvest the producer's own website, the request also sends an e-mail,
+// and the /api/opplevelser/gardssalg-claim/* routes answer before index.ts's
+// app.use("/api", generalLimiter). Two parts:
+//   - gardssalgClaimHostGate, mounted by index.ts on
+//     GARDSSALG_CLAIM_PATH_PREFIXES above the finn-tannlege.com gate. The
+//     claim paths are served on opplevagent.no only. Any other host
+//     (rettfrabonden.com, finn-tannlege.com, www.opplevagent.no, a fly.dev
+//     name) gets a 301 to the same path and query on https://opplevagent.no
+//     for GET/HEAD, so an old link still lands, and a 404 for any other
+//     method. The router is never reached there, so nothing is looked up,
+//     harvested or sent. The links already name that host: the e-mailed
+//     verify link is built on OPPLEVAGENT_BASE_URL, which is
+//     https://opplevagent.no in prod, and the produsent pages link here
+//     relatively from opplevagent.no. The target is fixed, as in the
+//     opplevagent.no gate's own www redirect, so a request's Host never
+//     chooses where it is sent.
+//   - generalLimiter, the shared instance, is the first handler of every
+//     route below — before the body parsers, as on the gårdssalg booking
+//     form post in experiences-seo.ts (I-T). One quota per client with /api,
+//     /sok and /reise. On the route rather than router-wide, so only a
+//     request a claim route serves is counted here, once; an unmatched
+//     /api/opplevelser/gardssalg-claim/* path falls through to the "/api"
+//     mount and is counted there instead. ac2LimitersFor (client-ip.ts)
+//     counts these paths as general. The per-provider limit in the claim
+//     service is unchanged; this is the per-client limit in front of it.
+export const GARDSSALG_CLAIM_HOST = "opplevagent.no";
+export const GARDSSALG_CLAIM_PATH_PREFIXES = ["/kategori/gardssalg/eier", "/api/opplevelser/gardssalg-claim"];
+
+export const gardssalgClaimHostGate: express.RequestHandler = (req, res, next) => {
+  if (req.hostname === GARDSSALG_CLAIM_HOST) return next();
+  if (req.method === "GET" || req.method === "HEAD") {
+    return res.redirect(301, `https://${GARDSSALG_CLAIM_HOST}${req.originalUrl}`);
+  }
+  res.status(404).json({ success: false, error: "not_found" });
+};
 
 // ── Owner-portal save receipt (dev-request 2026-08-03-eierportal-lagre-
 // knapp-henger) ─────────────────────────────────────────────────────────
@@ -238,7 +281,7 @@ function manualFallbackBlock(): string {
 // otherwise be swallowed by :providerSlug (and 404, since no provider has
 // that slug) rather than ever reaching this handler.
 // ─────────────────────────────────────────────────────────────────
-router.get("/kategori/gardssalg/eier/magic-link-verify", (req: Request, res: Response) => {
+router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: Request, res: Response) => {
   try {
     const { token } = req.query;
     if (!token || typeof token !== "string") {
@@ -278,7 +321,7 @@ router.get("/kategori/gardssalg/eier/magic-link-verify", (req: Request, res: Res
 // above and .../portal below) — an `await` inside a try block is caught by
 // that block exactly like a synchronous throw was, so the 500-page fallback
 // and its console.error line are unchanged, not re-invented.
-router.get("/kategori/gardssalg/eier/:providerSlug", async (req: Request, res: Response) => {
+router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req: Request, res: Response) => {
   try {
     const slug = String((req.params as any).providerSlug || "");
     const provider = getClaimProviderBySlug(slug);
@@ -434,6 +477,7 @@ function parseSelectedSource(value: unknown): (typeof CLAIM_EMAIL_SOURCES)[numbe
 
 router.post(
   "/kategori/gardssalg/eier/:providerId/request",
+  generalLimiter,
   express.json(),
   express.urlencoded({ extended: false }),
   // ASYNC since SLICE 5 / AC7 — issueClaimMagicLink() is now async (it can
@@ -502,7 +546,7 @@ router.post(
 // ─────────────────────────────────────────────────────────────────
 // GET /kategori/gardssalg/eier/:providerSlug/portal — session-gated edit page.
 // ─────────────────────────────────────────────────────────────────
-router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: Response) => {
+router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req: Request, res: Response) => {
   try {
     const slug = String((req.params as any).providerSlug || "");
     const provider = getClaimProviderBySlug(slug);
@@ -673,6 +717,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", (req: Request, res: 
 // ─────────────────────────────────────────────────────────────────
 router.post(
   "/kategori/gardssalg/eier/:providerSlug/save",
+  generalLimiter,
   express.urlencoded({ extended: false }),
   (req: Request, res: Response) => {
     const slug = String((req.params as any).providerSlug || "");
@@ -704,7 +749,7 @@ router.post(
 // POST /kategori/gardssalg/eier/:providerSlug/logout — real revoke (see
 // module doc) + clear cookie.
 // ─────────────────────────────────────────────────────────────────
-router.post("/kategori/gardssalg/eier/:providerSlug/logout", (req: Request, res: Response) => {
+router.post("/kategori/gardssalg/eier/:providerSlug/logout", generalLimiter, (req: Request, res: Response) => {
   const slug = String((req.params as any).providerSlug || "");
   const cookieToken = readSessionCookie(req);
   if (cookieToken) revokeClaimToken(cookieToken);
@@ -716,7 +761,7 @@ router.post("/kategori/gardssalg/eier/:providerSlug/logout", (req: Request, res:
 // JSON API — session-gated (mirrors RFB's GET/POST /api/agents/:id/* shape).
 // ─────────────────────────────────────────────────────────────────
 
-router.get("/api/opplevelser/gardssalg-claim/:providerId/profile", (req: Request, res: Response) => {
+router.get("/api/opplevelser/gardssalg-claim/:providerId/profile", generalLimiter, (req: Request, res: Response) => {
   const { providerId } = req.params as any;
   const session = sessionFromRequest(req);
   if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
@@ -744,7 +789,7 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/profile", (req: Request
   });
 });
 
-router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", express.json(), (req: Request, res: Response) => {
+router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", generalLimiter, express.json(), (req: Request, res: Response) => {
   const { providerId } = req.params as any;
   const session = sessionFromRequest(req);
   if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
@@ -758,7 +803,7 @@ router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", expre
   return res.json({ success: true, updated_fields: outcome.updatedFields, skipped_fields: outcome.skippedFields });
 });
 
-router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", (req: Request, res: Response) => {
+router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", generalLimiter, (req: Request, res: Response) => {
   const { providerId } = req.params as any;
   const session = sessionFromRequest(req);
   if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
@@ -796,7 +841,7 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", (req: Request, 
 // Fails closed (isOwner:false) on any invalid/missing/errored session so a
 // caller can never be shown the wrong owner affordance.
 // ─────────────────────────────────────────────────────────────────
-router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", (req: Request, res: Response) => {
+router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", generalLimiter, (req: Request, res: Response) => {
   // Set even on the error path below — this response varies per-visitor by
   // design and must never be cached, unlike the profile page that calls it.
   res.setHeader("Cache-Control", "no-store");

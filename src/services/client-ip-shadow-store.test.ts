@@ -590,6 +590,9 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           "/for-tilbydere/finn", "/For-Tilbydere/Finn/", "/en/for-tilbydere/finn", "/for-tilbydere", "/for-tilbydere/finnx",
           "/kategori/gardssalg/book/gard-x", "/kategori/gardssalg/book/gard-x/", "/kategori/gardssalg/book",
           "/kategori/gardssalg/book/gard-x/confirm/R1",
+          "/kategori/gardssalg/eier/gard-x", "/kategori/gardssalg/eier/magic-link-verify", "/Kategori/Gardssalg/Eier/p1/request",
+          "/en/kategori/gardssalg/eier/gard-x/portal", "/kategori/gardssalg/eier", "/kategori/gardssalg/eierx", "/kategori/gardssalg",
+          "/api/opplevelser/gardssalg-claim/p1/session-status",
           "/a2a", "/en/a2a", "/mcp", "/mcp/x", "/health", "/", "/produsent/x",
         ].map((p) => [p, ac2LimitersFor(p)]),
         [
@@ -600,6 +603,9 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           ["/for-tilbydere/finn", ["general"]], ["/For-Tilbydere/Finn/", ["general"]], ["/en/for-tilbydere/finn", ["general"]], ["/for-tilbydere", []], ["/for-tilbydere/finnx", []],
           ["/kategori/gardssalg/book/gard-x", ["general"]], ["/kategori/gardssalg/book/gard-x/", ["general"]], ["/kategori/gardssalg/book", []],
           ["/kategori/gardssalg/book/gard-x/confirm/R1", []],
+          ["/kategori/gardssalg/eier/gard-x", ["general"]], ["/kategori/gardssalg/eier/magic-link-verify", ["general"]], ["/Kategori/Gardssalg/Eier/p1/request", ["general"]],
+          ["/en/kategori/gardssalg/eier/gard-x/portal", ["general"]], ["/kategori/gardssalg/eier", ["general"]], ["/kategori/gardssalg/eierx", []], ["/kategori/gardssalg", []],
+          ["/api/opplevelser/gardssalg-claim/p1/session-status", ["general"]],
           ["/a2a", ["a2a", "dental"]], ["/en/a2a", ["a2a", "dental"]], ["/mcp", ["mcp"]], ["/mcp/x", ["mcp"]], ["/health", []], ["/", []], ["/produsent/x", []],
         ],
         "C7: ac2LimitersFor mirrors the mounts (segment-wise, case-insensitive, after the /en and /sv strip): search is also general; /api/tannlege* is not general (generalLimiter's case-sensitive skip) but dental; /a2a counts against jsonRpcLimiter and dentalLimiter"
@@ -916,10 +922,20 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           'routes/experiences-seo.ts: router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) => {',
           'routes/experiences-seo.ts: router.get("/reise", generalLimiter, async (req: Request, res: Response) => {',
           'routes/experiences-seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.get("/api/opplevelser/gardssalg-claim/:providerId/profile", generalLimiter, (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", generalLimiter, (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", generalLimiter, (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", generalLimiter, express.json(), (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.post("/kategori/gardssalg/eier/:providerSlug/logout", generalLimiter, (req: Request, res: Response) => {',
           'routes/seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
-          // POST /kategori/gardssalg/book/:providerSlug (experiences-seo.ts) carries generalLimiter on a line of
-          // its own, which the import-list rule above skips; host-gate-rate-limit.test.ts (a1) ties every
-          // route-level generalLimiter, by reference, to ac2LimitersFor.
+          // POST /kategori/gardssalg/book/:providerSlug (experiences-seo.ts) and POST
+          // /kategori/gardssalg/eier/:providerId/request and …/:providerSlug/save (gardssalg-claim.ts) carry
+          // generalLimiter on a line of their own, which the import-list rule above skips;
+          // host-gate-rate-limit.test.ts (a1) and gardssalg-claim-host-gate.test.ts (a1) tie every route-level
+          // generalLimiter, by reference, to ac2LimitersFor.
         ],
         "H: generalLimiter, searchLimiter, jsonRpcLimiter and dentalLimiter are applied exactly where ac2LimitersFor counts them"
       );
