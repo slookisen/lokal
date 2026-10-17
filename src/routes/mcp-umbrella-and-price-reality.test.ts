@@ -223,9 +223,17 @@ export async function runMcpUmbrellaAndPriceRealityTests(opts: { log?: boolean }
       assertTrue(/Beskrivelsesbasert reinkjøtt/.test(named) && !/category-only/.test(named),
         "Named matches preserve descriptions and are not misclassified by absent product scoring");
 
+      // Slice I-N (A2A dev-request 2026-10-17-integrasjonstest-oppfolging,
+      // AI-3a): «meat» is a category word, and a producer resting only on the
+      // label «Kjøtt» is a category match too (its prose claim omitted, as in
+      // a product search). The producer listing «Reinsdyrkjøtt» stays explicit,
+      // first, with its description.
       const general = textOf(await search.handler({ query: "meat", limit: 20 }));
-      assertTrue(/Beskrivelsesbasert reinkjøtt/.test(general) && !/category-only/.test(general),
-        "Broad category discovery preserves its original descriptions");
+      assertTrue(/^\*\*1\. Dokumentert Reinsdyrutsalg\*\*$/m.test(general) && /Dokumentert produsentbeskrivelse/.test(general),
+        "Broad category discovery keeps an explicit match first, with its description");
+      assertTrue([1, 2, 3, 4].every((i) => general.includes(`. Nordlys Gård ${i} — Kategoritreff / category-only: «kjøtt» bare som kategorinavn / category name only**`))
+        && !/Beskrivelsesbasert reinkjøtt/.test(general),
+        "Broad category discovery labels producers resting on the label «Kjøtt» and omits their prose claims");
     }
   } finally {
     __setGeocodingFetchForTesting();

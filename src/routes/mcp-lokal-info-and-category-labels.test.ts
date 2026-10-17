@@ -19,7 +19,9 @@
  *   is the enrichment's category label «Honning» like a beekeeper listing
  *   «Løvetannhonning». A producer whose matched product names are only
  *   generic category labels (productsAreGenericCategoryNames) is now a
- *   category match; the order of the results is unchanged. Fix round 1: the
+ *   category match; the order of the results was unchanged (slice I-N has
+ *   since put explicit matches first, and lists labels as categories in
+ *   lokal_info — mcp-product-labels-and-order.test.ts). Fix round 1: the
  *   names come from discover() (DiscoverMeta.productMatches), not from the
  *   «Produkter: …» reason, which names at most three.
  *
@@ -308,7 +310,10 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
       assertTrue(r?.isError !== true && t.startsWith("# Hevd Bakeri Fixture"),
         `AI-1 repro: lokal_info returns the profile of a producer with openingHours stored as text (got: ${t.slice(0, 120)})`);
       assertTrue(t.includes("\n## Åpningstider\nMan–Fre 10:00–17:00, Lør 10:00–15:00"), "AI-1 repro: the text opening hours are shown (slice I-O: as days and times)");
-      assertTrue(/## Produkter \(2 stk\)/.test(t) && t.includes("- Honning [honey]"), "AI-1 repro: the product list is still there");
+      // Slice I-N (AI2-02): both of the bakery's products are category labels,
+      // so lokal_info lists them as categories (mcp-product-labels-and-order.test.ts).
+      assertTrue(t.includes("\n**Kategorier:** Bakervarer, Honning\n") && !t.includes("## Produkter"),
+        "AI-1 repro: the product list is still there (as categories since I-N)");
       assertTrue(t.includes("\n## Spesialiteter\n- Surdeigsbrød") && t.includes("💳 **Betaling:** Vipps"),
         "AI-1 audit: specialties and paymentMethods stored as text are shown as one entry");
       assertTrue(!t.includes("Levering"), "AI-1 audit: deliveryOptions stored as an object is left out");
@@ -432,18 +437,21 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
         "Strinda Honning Fixture — Kategoritreff / category-only: «honning» ikke oppført / not listed",
         "AI-1 audit: products stored as text no longer take lokal_search down; the producer is a category match");
 
-      // Order unchanged: the headings follow discover() exactly.
+      // Slice I-N (AI-3b): the explicit match comes first; discover()'s order
+      // is kept within each group (mcp-product-labels-and-order.test.ts).
       const parsed = marketplaceRegistry.parseNaturalQuery(query);
       await enrichParsedWithGeo(parsed, query);
       const meta: import("../services/marketplace-registry").DiscoverMeta = {};
       const expected = marketplaceRegistry.discover({ ...parsed, limit: 10, offset: 0 }, meta).map((x) => x.agent.name);
-      assertEq(headings.map((h) => h.heading.split(" — ")[0]), expected, "AI-3: the order of the results is discover()'s order");
+      assertEq(headings.map((h) => h.heading.split(" — ")[0]),
+        ["Tirslaug Bigård Fixture", ...expected.filter((n) => n !== "Tirslaug Bigård Fixture")],
+        "AI-3: the explicit match comes first, the category matches follow in discover()'s order (I-N)");
       assertEq([BAKERY, BEEKEEPER, MEAT_FARM, PRODUCTS_TEXT].map((id) => meta.productMatches?.get(id) ?? null),
         [["Honning"], ["Løvetannhonning", "Lynghonning"], null, null],
         "AI-3: DiscoverMeta.productMatches holds the matched names of each producer with a product match");
       assertEq(headings.map((h) => h.n), [1, 2, 3, 4], "AI-3: the results stay numbered 1..n");
       assertTrue(headingOf("Hevd Bakeri Fixture") !== "" && expected.indexOf("Hevd Bakeri Fixture") < expected.indexOf("Tirslaug Bigård Fixture"),
-        "AI-3: the nearer bakery still comes before the beekeeper (labelling only, no re-ranking)");
+        "AI-3: discover() still ranks the nearer bakery before the beekeeper (lokal_search reorders, discover() is unchanged)");
     }
 
     // Fix round 1 (S2): the «Produkter: …» reason names at most three
