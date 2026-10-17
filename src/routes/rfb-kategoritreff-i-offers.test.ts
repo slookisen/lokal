@@ -53,8 +53,8 @@ const AARVIK = "1c000000-0000-4000-8000-000000000021";
 const LABEL_NAMES = ["Kjøtt", "Meieri", "Grønnsaker", "Bakervarer", "Honning", "Egg", "Fisk", "Urter"];
 const MATCH_KEYS = ["match", "category", "orderable", "note", "producer"];
 
-/** A router driven directly; the query is parsed from the url. */
-function callRoute(router: any, method: string, url: string, body?: any): Promise<{ status: number; body: any }> {
+/** A router driven directly; the query is parsed from the url. Exported for I-V (rfb-offers-priser-ordgrense-avstand.test.ts). */
+export function callRoute(router: any, method: string, url: string, body?: any): Promise<{ status: number; body: any }> {
   return new Promise((resolve) => {
     const query: Record<string, string> = {};
     for (const [k, v] of new URLSearchParams(url.split("?")[1] || "")) query[k] = v;
@@ -77,8 +77,8 @@ function callRoute(router: any, method: string, url: string, body?: any): Promis
   });
 }
 
-/** Just enough DOM for the shopping list script (handleliste-page.ts CLIENT_SCRIPT). */
-class FakeNode {
+/** Just enough DOM for the shopping list script (handleliste-page.ts CLIENT_SCRIPT). Exported for I-V. */
+export class FakeNode {
   readonly tagName: string;
   children: FakeNode[] = [];
   parentNode: FakeNode | null = null;
@@ -177,17 +177,18 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
       kjottAarvik: await findOffers({ q: "kjøtt", lat: AARVIK_POS.lat, lng: AARVIK_POS.lng }),
       bakervarerT: await findOffers({ q: "bakervarer", near: "Trondheim" }),
       erT: await findOffers({ q: "er", near: "Trondheim" }),
-      honningT4: await findOffers({ q: "honning", near: "Trondheim", limit: 4 }),
       honningT3: await findOffers({ q: "honning", near: "Trondheim", limit: 3 }),
+      honningT2: await findOffers({ q: "honning", near: "Trondheim", limit: 2 }),
     };
 
     // ══════════════════════════════════════════════════════════════
     // The field: who fills the free places, in what order, with what
     // ══════════════════════════════════════════════════════════════
+    // Slice I-V: one offer per producer, so Tirslaugtrøa's priced «Løvetannhonning» stands for its two honeys.
     assertEq([offersOf(searches.honningT), matchesOf(searches.honningT)], [
-      ["Eiersatt Honning Fixture: Honning", "Tirslaugtrøa Bigård Fixture: Løvetannhonning", "Tirslaugtrøa Bigård Fixture: Lynghonning"],
+      ["Eiersatt Honning Fixture: Honning", "Tirslaugtrøa Bigård Fixture: Løvetannhonning"],
       ["Hevd Håndverksbakeri Fixture: Honning", "Blandet Gårdsutsalg Fixture: Honning"],
-    ], "«honning» near Trondheim: three offers as after I-S; the two label producers fill the two free places, nearest first");
+    ], "«honning» near Trondheim: two offers, one per producer (I-V); the two label producers fill two of the free places, nearest first");
     const m = searches.honningT.category_matches?.[0];
     if (!m) assertTrue(false, "entry: «honning» near Trondheim has a category match");
     else {
@@ -220,8 +221,9 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
       const matched = (r.category_matches ?? []).map((m) => m.producer.agent_id);
       return matched.every((id) => !offered.has(id)) && new Set(matched).size === matched.length;
     }), "field: never a producer in offers, and one entry per producer, on every search");
-    assertEq(matchesOf(searches.erT), ["Hevd Håndverksbakeri Fixture: Bakervarer"],
-      "«er» near Trondheim: Hevd has four labels with «er» (Meieri, Grønnsaker, Bakervarer, Urter, written in that order) and gets one entry, the first by name (nb)");
+    // Slice I-V: one entry of several labels, the first by name, is the Tromsø order test below.
+    assertEq([searches.erT.offers, matchesOf(searches.erT)], [[], []],
+      "«er» near Trondheim: Hevd's labels have «er» only inside a word (Meieri, Grønnsaker, Bakervarer, Urter), so nothing matches (I-V word rule)");
     assertEq([matchesOf(searches.honningB), matchesOf(searches.eggB)], [["Reindyrka Fixture: Honning"], ["Reindyrka Fixture: Egg"]],
       "Bergen: Reindyrka's labels come back as category matches after the real, priced and owner-set offers");
     assertTrue(!(searches.honningT.category_matches ?? []).some((m) => m.producer.agent_id === EIER) && searches.honningT.offers.some((o) => o.producer.agent_id === EIER),
@@ -232,7 +234,7 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
     assertEq([Object.keys(searches.eggS), offersOf(searches.eggS).length, Object.keys(searches.eggS2), offersOf(searches.eggS2).length],
       [["term", "offers"], 5, ["term", "offers"], 2],
       "limit: when the offers fill the page (limit 5 and limit 2), there is no category_matches key, the response is {term, offers}");
-    assertEq([matchesOf(searches.honningT4), matchesOf(searches.honningT3)], [["Hevd Håndverksbakeri Fixture: Honning"], []],
+    assertEq([matchesOf(searches.honningT3), matchesOf(searches.honningT2)], [["Hevd Håndverksbakeri Fixture: Honning"], []],
       "limit: one free place gives the nearest label producer; no free place gives none");
     assertEq([offersOf(searches.eggS1km), matchesOf(searches.eggS1km)], [[], [0, 1, 2, 3, 4].map((i) => `Stavanger Etikett ${i} Fixture: Egg`)],
       "limit: five label producers and no offer in 1 km fill the five places, nearest first");
@@ -244,16 +246,17 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
     }
 
     // The order does not hang on the rows' order in the table. Three
-    // producers with the labels «Meieri» and «Bakervarer»: 1 and 2 at one
-    // point (as at a city centroid), 0 a little farther and with the lowest
-    // id. Written in that order, and in the reverse order with each
-    // producer's rows reversed too, each in its own DB.
+    // producers with the labels «Bakervarer» and «Bakeri» (both start with
+    // the term «bake», I-V): 1 and 2 at one point (as at a city centroid), 0
+    // a little farther and with the lowest id. Written in that order, and in
+    // the reverse order with each producer's rows reversed too, each in its
+    // own DB.
     {
       const P = { lat: 69.6492, lng: 18.9553 }; // Tromsø
       const tieSeed = (i: number, dLat: number): Seed => ({ id: `1c000000-0000-4000-8000-00000000005${i}`, name: `Tromsø Etikett ${i} Fixture`,
-        lat: P.lat + dLat, lng: P.lng, city: "Tromsø", categories: ["dairy", "bakery"],
-        products: [{ name: "Meieri", category: "dairy", seasonal: false }, { name: "Bakervarer", category: "bakery", seasonal: false }],
-        catalog: [{ name: "Meieri" }, { name: "Bakervarer" }] });
+        lat: P.lat + dLat, lng: P.lng, city: "Tromsø", categories: ["bakery"],
+        products: [{ name: "Bakervarer", category: "bakery", seasonal: false }, { name: "Bakeri", category: "bakery", seasonal: false }],
+        catalog: [{ name: "Bakervarer" }, { name: "Bakeri" }] });
       const forward = [tieSeed(0, 0.01), tieSeed(1, 0), tieSeed(2, 0)];
       const reverse = [...forward].reverse().map((s) => ({ ...s, catalog: [...s.catalog].reverse() }));
       const written: string[][] = [];
@@ -266,14 +269,14 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
         seedCategoryLabelOfferFixtures(tieDb, ownerSetAt, seeds);
         written.push((tieDb.prepare("SELECT agent_id, name FROM products ORDER BY rowid").all() as any[]).map((x) => `${x.agent_id}: ${x.name}`));
         const answer: string[][] = [];
-        for (const limit of [1, 2, 5]) answer.push(matchesOf(await findOffers({ q: "er", lat: P.lat, lng: P.lng, limit })));
+        for (const limit of [1, 2, 5]) answer.push(matchesOf(await findOffers({ q: "bake", lat: P.lat, lng: P.lng, limit })));
         answers.push(answer);
         __setDbForTesting(db as any);
       }
       assertEq(written[1], [...written[0]!].reverse(), "order setup: the second DB has the same rows in the reverse order");
-      const expected = [[1], [1, 2], [1, 2, 0]].map((ids) => ids.map((i) => `Tromsø Etikett ${i} Fixture: Bakervarer`));
+      const expected = [[1], [1, 2], [1, 2, 0]].map((ids) => ids.map((i) => `Tromsø Etikett ${i} Fixture: Bakeri`));
       assertEq(answers, [expected, expected],
-        "order: limit 1, 2 and 5 give the same entries in both orders: by distance, then agent id; per producer the label first by name (Bakervarer before Meieri)");
+        "order: limit 1, 2 and 5 give the same entries in both orders: by distance, then agent id; one entry per producer, the label first by name (Bakeri before Bakervarer)");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -377,10 +380,10 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
       await settle();
       const rows = el("hl-offers").querySelectorAll(".hl-offer");
       const rowText = rows.map((n) => n.textContent);
-      assertEq(rows.length, 5, "page: «honning» shows five rows, three offers and two category matches");
+      assertEq(rows.length, 4, "page: «honning» shows four rows, two offers (one per producer, I-V) and two category matches");
       const hevdRow = rows.findIndex((n) => n.textContent.startsWith("Hevd Håndverksbakeri Fixture"));
       const eierRow = rows.findIndex((n) => n.textContent.startsWith("Eiersatt Honning Fixture"));
-      assertTrue(hevdRow === 3 && rowText[hevdRow]!.includes(C.contact_only) && !rowText[hevdRow]!.includes(C.can_order) && rowText[hevdRow]!.includes(C.category_match),
+      assertTrue(hevdRow === 2 && rowText[hevdRow]!.includes(C.contact_only) && !rowText[hevdRow]!.includes(C.can_order) && rowText[hevdRow]!.includes(C.category_match),
         `page: Hevd's category match is a contact row with the category note, though its producer has can_order (got ${JSON.stringify(rowText[hevdRow])})`);
       assertTrue(eierRow === 0 && rowText[eierRow]!.includes(C.can_order) && !rowText[eierRow]!.includes(C.category_match),
         "page: an orderable offer is unchanged («Kan bestilles her», no category note)");

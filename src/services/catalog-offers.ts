@@ -50,6 +50,23 @@
 // availability and orderable:false, so a client can only offer to contact
 // them. The field is left out when it is empty, so a response whose offers
 // fill the page is what it was.
+//
+// Slice I-V (found live 2026-10-17):
+// - Term: the term must start a word of the product name, or end one when it
+//   has four letters or more (utils/product-name-match.ts), so «egg» no longer
+//   offers «Kjøttpålegg», and «honning» still offers «Lynghonning». The SQL
+//   LIKE stays as a pre-filter only.
+// - Limit: `limit` counts producers, as the tool says («up to 5 nearby
+//   producers»): one offer per producer, its best row (best match, then in
+//   stock, then with a price, then by name (nb) and id). Producers are ordered
+//   by distance, then agent id, as the category matches are, so neither list
+//   hangs on the rows' order.
+// - Distance: a producer placed at a centroid (geo_precision 'city',
+//   'kommune' or 'postal') has distance_km null, never «0 km» (Fase 1c,
+//   services/geo-precision.ts), and the additive distance_label says where it
+//   is («i Ski-området»); an address-precise one gets «2,4 km unna» beside its
+//   km figure. An untagged (null) producer is unchanged and has no label.
+//   Ranking still uses the real haversine, as discover() does.
 
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
@@ -61,6 +78,8 @@ import { isValidLatLng } from "../utils/geo-query";
 import { slugify } from "../utils/slug";
 import { publicListableSql } from "./agent-visibility";
 import { isCategoryLabel } from "../utils/category-label";
+import { productNameMatch, type ProductNameMatch } from "../utils/product-name-match";
+import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -94,7 +113,10 @@ export interface OfferProducer {
   agent_id: string;
   name: string;
   city: string | null;
-  distance_km: number;
+  /** I-V: null when the producer's position is a centroid (see distance_label). */
+  distance_km: number | null;
+  /** I-V: «2,4 km unna» (address precision) or «i Ski-området» (centroid); absent for an untagged position. */
+  distance_label?: string;
   verifisert_av_eier: boolean;
   can_order: boolean;
   salgskanaler: string[];
@@ -158,12 +180,39 @@ interface RawOfferRow {
   city: string | null;
   lat: number;
   lng: number;
+  geo_precision: string | null;
   is_verified: number;
+}
+
+/** A row in the radius whose name matches the term, with its distance and its effective availability. */
+interface OfferCandidate {
+  r: RawOfferRow;
+  dist: number;
+  match: ProductNameMatch;
+  availability: string;
 }
 
 /** I-S2: a producer's label rows by name (nb), then id, so its category match does not hang on the rows' order. */
 function compareLabelRows(a: RawOfferRow, b: RawOfferRow): number {
   return a.product_name.trim().localeCompare(b.product_name.trim(), "nb") || a.product_id.localeCompare(b.product_id);
+}
+
+/** I-V: a producer's best offer row first: best match, in stock, with a price, then by name (nb) and id. */
+function compareOfferRows(a: OfferCandidate, b: OfferCandidate): number {
+  return b.match - a.match
+    || Number(b.availability === "in_stock") - Number(a.availability === "in_stock")
+    || Number(b.r.price_nok != null) - Number(a.r.price_nok != null)
+    || compareLabelRows(a.r, b.r);
+}
+
+/** Nearest first; equal distances (one centroid, say) by agent id. */
+function byDistance(a: OfferCandidate, b: OfferCandidate): number {
+  return a.dist - b.dist || a.r.agent_id.localeCompare(b.r.agent_id);
+}
+
+/** A LIKE pattern for text that contains `s` (its %, _ and \ escaped, for ESCAPE '\'). */
+function likeContaining(s: string): string {
+  return `%${s.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
 async function defaultGeocode(place: string): Promise<{ lat: number; lng: number } | null> {
@@ -196,9 +245,10 @@ async function resolvePosition(
 }
 
 /**
- * Finds up to `limit` (max 5) product offers matching `q`, from eligible
- * producers within `radiusKm` of the resolved position, nearest first, and
- * fills the rest of the `limit` with category matches (I-S2).
+ * Finds the product offers matching `q` of up to `limit` (max 5) eligible
+ * producers within `radiusKm` of the resolved position, one offer per
+ * producer (I-V), nearest first, and fills the rest of the `limit` with
+ * category matches (I-S2).
  * Never throws: an unresolvable position or a geocode failure both result in
  * an empty `offers` array rather than an error.
  */
@@ -223,12 +273,18 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   const latDeltaDeg = radiusKm / KM_PER_DEG_LAT;
   const lngDeltaDeg = radiusKm / kmPerDegLng(position.lat);
 
+  // I-V: the LIKE only pre-filters on the term being in the name; the word
+  // rule below decides. SQLite's LOWER() and LIKE fold ASCII letters only, so
+  // the term is also tried with its first letter upper-cased, or «øl» would
+  // miss «Øl fra Lindheim» (an all-caps name is a section header and never
+  // reaches `products`).
+  const termLower = term.toLowerCase();
   const rows = db.prepare(`
     SELECT
       p.id AS product_id, p.name AS product_name, p.price_nok, p.unit,
       p.availability, p.availability_updated_at, p.availability_source,
       a.id AS agent_id, a.name AS agent_name, a.city AS city,
-      a.lat AS lat, a.lng AS lng,
+      a.lat AS lat, a.lng AS lng, a.geo_precision AS geo_precision,
       a.is_verified AS is_verified
     FROM products p
     INNER JOIN agents a ON a.id = p.agent_id
@@ -240,43 +296,45 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
       AND ${publicListableSql("a")}
       AND a.lat BETWEEN ? AND ? AND a.lng BETWEEN ? AND ?
-      AND LOWER(p.name) LIKE ?
+      AND (LOWER(p.name) LIKE ? ESCAPE '\\' OR LOWER(p.name) LIKE ? ESCAPE '\\')
   `).all(
     position.lat - latDeltaDeg, position.lat + latDeltaDeg,
     position.lng - lngDeltaDeg, position.lng + lngDeltaDeg,
-    `%${term.toLowerCase()}%`
+    likeContaining(termLower), likeContaining(termLower.charAt(0).toUpperCase() + termLower.slice(1))
   ) as RawOfferRow[];
 
-  const nearest = rows
-    .map((r) => ({ r, dist: haversineDistanceKm(position.lat, position.lng, r.lat, r.lng) }))
-    .filter((x) => x.dist <= radiusKm)
-    .sort((a, b) => a.dist - b.dist);
   // I-S: the labels are split off before the limit, so they do not shorten
-  // the page. The sort is stable, so the offers keep the order they had.
-  const productRows: typeof nearest = [];
-  const labelRows: typeof nearest = [];
-  for (const x of nearest) {
-    const label = isCategoryLabel({ name: x.r.product_name, hasPrice: x.r.price_nok != null, availabilitySource: x.r.availability_source });
-    (label ? labelRows : productRows).push(x);
-  }
-  const offerRows = productRows.slice(0, limit);
-
-  // I-S2: the free places go to the nearest label producers, one entry each.
-  // A producer with a real offer for the term is never one of them: when
-  // there are free places, every real offer in the radius is on the page.
+  // the page. I-V: one row per producer, its best (compareOfferRows).
+  // I-S2: the free places go to the nearest label producers, one entry each:
+  // per producer the label whose name sorts first (nb). A producer with a
+  // real offer for the term is never one of them: when there are free
+  // places, every such producer is on the page.
   // Equal distances are common (all rows of one producer, producers placed at
-  // a city centroid) and the query has no ORDER BY, so the choice does not
-  // use the rows' order: per producer the label whose name sorts first (nb),
-  // then the producers by distance and agent id. `offers` keeps its own order.
-  const offered = new Set(offerRows.map((x) => x.r.agent_id));
-  const labelOf = new Map<string, (typeof nearest)[number]>();
-  for (const x of labelRows) {
-    if (offered.has(x.r.agent_id)) continue;
-    const prev = labelOf.get(x.r.agent_id);
-    if (!prev || compareLabelRows(x.r, prev.r) < 0) labelOf.set(x.r.agent_id, x);
+  // a city centroid) and the query has no ORDER BY, so no choice uses the
+  // rows' order: both lists go by distance, then agent id.
+  const bestOffer = new Map<string, OfferCandidate>();
+  const firstLabel = new Map<string, OfferCandidate>();
+  for (const r of rows) {
+    const match = productNameMatch(r.product_name, term);
+    if (!match) continue;
+    const dist = haversineDistanceKm(position.lat, position.lng, r.lat, r.lng);
+    if (dist > radiusKm) continue;
+    const x: OfferCandidate = {
+      r, dist, match,
+      availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+    };
+    if (isCategoryLabel({ name: r.product_name, hasPrice: r.price_nok != null, availabilitySource: r.availability_source })) {
+      const prev = firstLabel.get(r.agent_id);
+      if (!prev || compareLabelRows(r, prev.r) < 0) firstLabel.set(r.agent_id, x);
+    } else {
+      const prev = bestOffer.get(r.agent_id);
+      if (!prev || compareOfferRows(x, prev) < 0) bestOffer.set(r.agent_id, x);
+    }
   }
-  const matchRows = [...labelOf.values()]
-    .sort((a, b) => a.dist - b.dist || a.r.agent_id.localeCompare(b.r.agent_id))
+  const offerRows = [...bestOffer.values()].sort(byDistance).slice(0, limit);
+  const matchRows = [...firstLabel.values()]
+    .filter((x) => !bestOffer.has(x.r.agent_id))
+    .sort(byDistance)
     .slice(0, limit - offerRows.length);
 
   const salgskanalStmt = db.prepare(`
@@ -298,11 +356,16 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     // skive 2: one shared gate with submitCart() — see the module doc comment.
     const canOrder = isEligibleForRealOrder(r.agent_id, db);
 
+    // I-V: no km figure for a centroid; the label says where it is instead.
+    const km = Math.round(dist * 10) / 10;
+    const distanceLabel = formatRfbDistanceLabel(km, r.geo_precision, r.city);
+
     return {
       agent_id: r.agent_id,
       name: r.agent_name,
       city: r.city ?? null,
-      distance_km: Math.round(dist * 10) / 10,
+      distance_km: shouldSuppressDistance(r.geo_precision) ? null : km,
+      ...(distanceLabel ? { distance_label: distanceLabel } : {}),
       verifisert_av_eier: isVerified,
       can_order: canOrder,
       salgskanaler,
@@ -314,12 +377,12 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     };
   };
 
-  const offers: Offer[] = offerRows.map(({ r, dist }) => ({
+  const offers: Offer[] = offerRows.map(({ r, dist, availability }) => ({
     product_id: r.product_id ?? null,
     product_name: r.product_name,
     price_nok: r.price_nok ?? null,
     unit: r.unit ?? null,
-    availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+    availability,
     producer: producerOf(r, dist),
   }));
 

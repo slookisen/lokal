@@ -288,8 +288,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
       honningB: await findOffers({ q: "honning", near: "Bergen" }),
       eggB: await findOffers({ q: "egg", near: "Bergen" }),
     };
+    // Slice I-V: one offer per producer, so Tirslaugtrøa's priced «Løvetannhonning» stands for its two honeys.
     assertEq(offerRows(searches.honningT), [
-      "Eiersatt Honning Fixture: Honning", "Tirslaugtrøa Bigård Fixture: Løvetannhonning", "Tirslaugtrøa Bigård Fixture: Lynghonning",
+      "Eiersatt Honning Fixture: Honning", "Tirslaugtrøa Bigård Fixture: Løvetannhonning",
     ], "offers «honning» near Trondheim: the bakery's and the mixed shop's label rows are gone; the owner-set row and real products stay, nearest first");
     assertEq(offerRows(searches.eggT), ["Blandet Gårdsutsalg Fixture: Frittgående egg"],
       "offers «egg» near Trondheim: the label rows «Egg» are gone, the real eggs stay");
