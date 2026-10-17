@@ -73,7 +73,7 @@ export const DENTAL_MCP_INSTRUCTIONS =
   "out-of-hours dental service (kommunal tannlegevakt) from tannlege_akutt. Finn-tannlege gives no medical or " +
   "dental advice. " +
   "Finn-tannlege takes no bookings and no payments: the user books through the clinic's `online_booking_url` " +
-  "when it has one, or by phone. `prisniva` is set only when the price level has a source, and the directory has " +
+  "when it has one, or by phone. `prisniva` is set only when the price level has a source, and the answers carry " +
   "no ratings or reviews.";
 
 /** serverInfo title; also the server card's title. */

@@ -15,11 +15,13 @@
  *   T   phones only when isDisplayablePhone passes;
  *   A   A2A message/send (search list and single clinic): the row's keys and
  *       id kept, rating fields and field_provenance gone, acute_vakt only
- *       with provenance, phones displayable, card fields added; the clinic
- *       ids are read as before;
+ *       with provenance, phones displayable, every search-card key with the
+ *       card's value (a row key the card leaves out is null); the clinic ids
+ *       are read as before;
  *   D   tannlege_info (the detail card) keeps exactly its keys; e-mail only
  *       there;
- *   M   MCP tannlege_search / tannlege_akutt over a real server + client;
+ *   M   MCP tannlege_search / tannlege_akutt over a real server + client,
+ *       and the same card values as the A2A clinic with the same id;
  *   Z   size: 25 clinics per call stay under 12 KB for a live-like mix, and
  *       under 16 KB when every clinic has every optional field.
  *
@@ -124,7 +126,11 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
     );
     // An off-spec band from before the 2026-08-25 enum guard, with a source.
     const offSpec = add({ navn: "Gammel Prisklasse Tann AS", org_nr: "918750004", poststed: "BERGEN", fylke: "Vestland" }, { price_band: "medium", price_band_source: "homepage" });
-    const blankSource = add({ navn: "Blank Kilde Tann AS", org_nr: "918750005", poststed: "BERGEN", fylke: "Vestland" }, { price_band: "rimelig", price_band_source: "  " });
+    // Blank values the card leaves out: a price source, a chain name and a booking link.
+    const blankSource = add(
+      { navn: "Blank Kilde Tann AS", org_nr: "918750005", poststed: "BERGEN", fylke: "Vestland" },
+      { price_band: "rimelig", price_band_source: "  ", chain_brand: "   ", online_booking_url: "" },
+    );
     const sourced = add({ navn: "Rimelig Med Kilde Tann AS", org_nr: "918750006", poststed: "BERGEN", fylke: "Vestland" }, { price_band: "rimelig", price_band_source: "website" });
 
     const row = (id: string) => store.getDentalAgentById(id)!;
@@ -155,6 +161,11 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       eq([c.adresse, c.postnummer, c.akutt], [null, null, null], "V6: no address -> null; acute_vakt without provenance -> akutt null");
       ok(c.profil_url === seo.clinicProfileUrl(row(bare)) && c.profil_url.endsWith(`/klinikk/id/${bare}`), "V7: a clinic without org.nr links to /klinikk/id/<id> (clinicProfileUrl)");
       eq([search(soft).akutt, search(soft).badges], ["accepts", ["Tar imot akuttpasienter"]], "V8: akutt focus without the flag -> «accepts» and the soft badge");
+      {
+        const r = row(blankSource);
+        ok(r.chain_brand === "   " && r.online_booking_url === "", "V9: (the fixture row has a blank chain name and an empty booking link)");
+        eq(["chain_brand", "online_booking_url"].filter((k) => k in search(blankSource)), [], "V10: a blank chain name and an empty booking link are left out of the card");
+      }
     }
 
     // ── H: compact opening hours ──────────────────────────────────────────
@@ -166,6 +177,12 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       eq(hours([...WEEKDAYS_8_16, { day: "sat", open: "10:00", close: "14:00" }]), ["Man–Fre 08:00–16:00", "Lør 10:00–14:00"], "H3: Saturday's own hours on their own line");
       eq(hours("Etter avtale"), ["Etter avtale"], "H4: stored free text is shown as it is");
       eq([hours(null), hours([])], [undefined, undefined], "H5: no hours -> no apningstider key");
+      {
+        const noted = { day: "tue", open: "08:00", close: "16:00", note: "Sesongåpent til ca. 20. september" };
+        const { normalizeOpeningHours, openingHoursEntryText } = require("../utils/opening-hours") as typeof import("../utils/opening-hours");
+        eq(hours([noted, ...WEEKDAYS_8_16.filter((h) => h.day === "mon" || h.day === "wed")]),
+          [openingHoursEntryText(normalizeOpeningHours([noted])[0]!), "Man/Ons 08:00–16:00"], "H6: a day with a note of its own keeps its own line; the others share theirs");
+      }
     }
 
     // ── P: prisniva ───────────────────────────────────────────────────────
@@ -199,6 +216,12 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
     }
 
     // ── A: A2A ────────────────────────────────────────────────────────────
+    /** The keys of a card whose value differs in `other`, compared as JSON (as they go on the wire). */
+    const differingKeys = (cardFields: Record<string, unknown>, other: Record<string, unknown>) =>
+      Object.keys(cardFields).filter((k) => JSON.stringify(cardFields[k]) !== JSON.stringify(other[k]));
+    /** The A2A list's clinics, compared with the MCP cards under M. */
+    let a2aClinics: Array<Record<string, any>> = [];
+    const a2aWireOf = (id: string) => JSON.parse(JSON.stringify(a2aClinics.find((c) => c.id === id) ?? {}));
     {
       const checkClinic = (c: Record<string, any>, label: string) => {
         const stored = row(c.id);
@@ -208,10 +231,14 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
         ok(c.mobil === null || isDisplayablePhone(c.mobil), `${label}: mobil is displayable or null`);
         ok(c.acute_vakt === null || (c.acute_vakt === 1 && hasAcuteVaktProvenance(stored.field_provenance)), `${label}: acute_vakt is 1 only with provenance`);
         eq(Object.keys(stored).filter((k) => !A2A_REMOVED.includes(k) && !(k in c)), [], `${label}: every other key of the stored row is kept (today's form)`);
-        ok(typeof c.profil_url === "string" && Array.isArray(c.badges) && "akutt" in c, `${label}: the card fields are added`);
+        // The values MCP shows: an A2A-only override of a card key (akutt from the raw
+        // acute_vakt flag, the untrimmed chain name, …) fails here.
+        const cardFields = card.toDentalClinicCard(stored, "search") as Record<string, unknown>;
+        eq(differingKeys(cardFields, c), [], `${label}: every search-card key has the card's value`);
+        eq(ALL_KEYS.filter((k) => !(k in cardFields) && k in c && c[k] !== null), [], `${label}: a key the card leaves out is null, not the row's raw value`);
       };
       const resp = a2a.handleDentalMessageSend({ message: { text: "tannlege" } }, "a2a-list") as any;
-      const clinics: any[] = resp.result.artifacts[1].parts[0].data.clinics;
+      const clinics: any[] = (a2aClinics = resp.result.artifacts[1].parts[0].data.clinics);
       ok(clinics.length === 6, `A0: (message/send lists the six fixture clinics, got ${clinics.length})`);
       for (const c of clinics) checkClinic(c, `A1 ${c.navn}`);
       // Ids are random per run: compared as a verdict, so a failure text stays the same across runs.
@@ -258,6 +285,15 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       const akutt = JSON.parse(await callText("tannlege_akutt", { fylke: "Vestland" }));
       const a = akutt.klinikker.find((k: any) => k.org_nr === "918750001");
       ok(a?.akutt === "vakt" && typeof akutt.rad_om_kommunal_tannlegevakt === "string", "M4: tannlege_akutt gives the same card, akutt «vakt», and the tannlegevakt advice");
+      // The same clinic over MCP and A2A message/send: one card, the same values.
+      const a2aWire = a2aWireOf(full);
+      ok(a2aWire.id === full && a2aWire.org_nr === "918750001", "M5: (the A2A list's clinic is the same clinic, by id)");
+      eq([Object.keys(c ?? {}), differingKeys(c ?? {}, a2aWire)], [ALL_KEYS, []], "M6: the tannlege_search card (every key) has the same values as the A2A clinic with the same id");
+      eq(differingKeys(a ?? { missing: true }, a2aWire), [], "M7: the tannlege_akutt card has the same values as the A2A clinic with the same id");
+      // A clinic flagged acute_vakt = 1 without a source: not «vakt» on either surface.
+      const oslo = JSON.parse(await callText("tannlege_search", { fylke: "Oslo", limit: 25 }));
+      const b = oslo.klinikker.find((k: any) => k.navn === "Tann Uten Data AS");
+      eq([b?.akutt, differingKeys(b ?? { missing: true }, a2aWireOf(bare))], [null, []], "M8: the unsourced acute_vakt clinic has akutt null and the same values over MCP and A2A");
     }
 
     // ── Z: size of a 25-clinic answer ─────────────────────────────────────
@@ -267,6 +303,9 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       // Live-like mix (finn-tannlege /api/tannlege/agents?fylke=Vestland, 200 rows, 2026-10-17): every row
       // has a postcode, about 70 % an address, 60 % a phone, 30 % a website, 25 % opening hours, 10 % a booking
       // link and 10 % a chain. And the same 25 with every optional field set.
+      // The limits against live rows (/api/tannlege/agents, Oslo, Vestland and Rogaland, 849 clinics
+      // in pages of 25, measured 2026-10-17): a tannlege_search answer is 8 555–9 472 B in median and
+      // at most 10 662 B; the 25 richest cards of a county give 12 907–13 457 B, under the 16 KB below.
       const seed = (fylke: string, prefix: string, rich: boolean) => surnames.forEach((name, i) => {
         const slug = name.toLowerCase();
         const has = (share: number) => rich || i % 20 < share * 20;

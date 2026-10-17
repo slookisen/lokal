@@ -154,16 +154,20 @@ export function toDentalClinicCard(
  * and every other key stay), with the values that were untrue made honest —
  * phone and mobile only when displayable, acute_vakt only with provenance —
  * the Google rating fields and the internal field_provenance left out, and
- * the search card's fields added.
+ * the search card's fields added with the card's values.
  */
 export function toDentalA2aClinic(agent: ClinicRow) {
   const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, field_provenance: _provenance, ...row } = agent;
   // The card's keys come last and keep the row's place for the ones it shares
-  // (navn, telefon, adresse, …); its telefon is the displayable one.
+  // (navn, telefon, adresse, …); its telefon is the displayable one. The two
+  // row keys the card leaves out without a value are null, not the raw value
+  // (a blank chain_brand).
   return {
     ...row,
     mobil: displayablePhone(agent.mobil),
     acute_vakt: publicAcuteVakt(agent),
+    chain_brand: null,
+    online_booking_url: null,
     ...toDentalClinicCard(agent, "search"),
   };
 }
@@ -204,8 +208,10 @@ function sourcedPriceBand(agent: ClinicRow): string | null {
 
 /**
  * Opening hours as short lines, through the shared normaliser
- * (utils/opening-hours.ts). Weekdays with the same hours and no season share
- * one line, so a Monday–Friday clinic takes one line instead of five.
+ * (utils/opening-hours.ts). Weekdays with the same hours, the same note and
+ * no season share one line, so a Monday–Friday clinic takes one line instead
+ * of five; a day with a note of its own keeps its own line, so the shared
+ * entry text never puts one day's note on another day.
  */
 function compactOpeningHours(value: unknown): string[] {
   const lines: OpeningHoursEntry[] = [];
@@ -215,7 +221,7 @@ function compactOpeningHours(value: unknown): string[] {
       lines.push(entry);
       continue;
     }
-    const key = `${entry.open}–${entry.close}`;
+    const key = JSON.stringify([entry.open, entry.close, entry.note ?? ""]);
     const same = byHours.get(key);
     if (same) {
       same.days = [...new Set([...same.days, ...entry.days])].sort((x, y) => x - y) as Weekday[];
