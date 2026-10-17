@@ -199,6 +199,34 @@ function parseReviewReason(raw: string | null): VerifierStoredVerdict | null {
   return null;
 }
 
+function secondLineView(
+  v: VerifierStoredVerdict | null,
+  asOf: string | null,
+): {
+  ran: boolean;
+  verdict: "pass" | "fail" | null;
+  reasons: unknown;
+  sources: string[];
+  judge_reason: string | null;
+  as_of: string | null;
+} | null {
+  const sl = v?.second_line;
+  if (!sl || typeof sl !== "object" || Array.isArray(sl)) return null;
+  const o = sl as Record<string, unknown>;
+  return {
+    ran: o.attempted === true,
+    verdict: o.passes === true ? "pass" : o.passes === false ? "fail" : null,
+    reasons: o.reasons ?? null,
+    sources: Array.isArray(o.sources) ? (o.sources as unknown[]).filter((x): x is string => typeof x === "string") : [],
+    judge_reason: typeof o.judge_reason === "string" ? o.judge_reason : null,
+    as_of: asOf,
+  };
+}
+
+function terminalReasonView(v: VerifierStoredVerdict | null): string | null {
+  return typeof v?.terminal_reason === "string" ? v.terminal_reason : null;
+}
+
 function withinDays(iso: string | null, days: number, nowMs: number): boolean {
   if (!iso) return false;
   const t = Date.parse(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z");
@@ -605,6 +633,10 @@ router.get("/", (req: Request, res: Response) => {
         verifier_verdict_as_of: row.last_verified_at,
       },
       pool_blockers: poolBlockers,
+      // dev-request 2026-10-01-rfb-verifier-innsyn-second-line-c5: second-line
+      // outcome and terminal reason from the stored verdict (all statuses).
+      second_line: secondLineView(storedVerdict, row.last_verified_at),
+      terminal_reason: terminalReasonView(storedVerdict),
       crawl_auto_select: {
         eligible: crawlBlockers.length === 0,
         blockers: crawlBlockers,

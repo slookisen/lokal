@@ -810,6 +810,76 @@ export async function runAdminPoolBlockerExplainTests(opts: { log?: boolean } = 
       const after = testDb.prepare("SELECT * FROM agent_knowledge WHERE agent_id = 'pbe-f1'").get();
       assertEq(after, before, "h1: agent_knowledge row is byte-identical after an explain call");
     }
+
+    // ── C5: second_line + terminal_reason surfaced from the stored verdict ──
+    {
+      insertAgent({
+        id: "pbe-sl",
+        name: "Andrelinje-gard",
+        website: "https://sl.example",
+        about: "Gard i test.",
+        verificationStatus: "pending_verify",
+        enrichmentStatus: "rich",
+        email: "post@sl.example",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = ?`,
+      ).run(
+        JSON.stringify({
+          second_line: {
+            attempted: true,
+            passes: false,
+            reasons: { has_accepted_source: true },
+            sources: ["own-website"],
+            judge_reason: "navn ikke bekreftet",
+          },
+        }),
+        "pbe-sl",
+      );
+      insertAgent({
+        id: "pbe-term",
+        name: "Terminal-gard",
+        website: "https://term.example",
+        about: "Gard i test.",
+        verificationStatus: "terminal_unconfirmable",
+        enrichmentStatus: "thin",
+        email: "post@term.example",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+      testDb.prepare(
+        `UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = ?`,
+      ).run(JSON.stringify({ terminal_reason: "brreg_konkurs" }), "pbe-term");
+      insertAgent({
+        id: "pbe-nosl",
+        name: "Uten-verdict",
+        website: "https://nosl.example",
+        about: "Gard i test.",
+        verificationStatus: "verified",
+        enrichmentStatus: "rich",
+        email: "post@nosl.example",
+        urlLastStatus: 200,
+        urlLastProbed: nowIso,
+      });
+
+      const r = await callExplain({ agentIds: "pbe-sl,pbe-term,pbe-nosl" });
+      const sl = r.body.agents.find((x: any) => x.agent_id === "pbe-sl");
+      const term = r.body.agents.find((x: any) => x.agent_id === "pbe-term");
+      const nosl = r.body.agents.find((x: any) => x.agent_id === "pbe-nosl");
+      assertEq(sl.second_line.ran, true, "c5-1: second_line.ran from stored verdict");
+      assertEq(sl.second_line.verdict, "fail", "c5-2: second_line.verdict fail");
+      assertEq(sl.second_line.sources, ["own-website"], "c5-3: second_line.sources");
+      assertEq(sl.second_line.judge_reason, "navn ikke bekreftet", "c5-4: second_line.judge_reason");
+      assertEq(sl.second_line.reasons, { has_accepted_source: true }, "c5-5: second_line.reasons");
+      assertTrue("as_of" in sl.second_line, "c5-6: second_line.as_of present");
+      assertEq(sl.terminal_reason, null, "c5-7: terminal_reason null when absent");
+      assertEq(term.terminal_reason, "brreg_konkurs", "c5-8: terminal row shows terminal_reason");
+      assertEq(term.second_line, null, "c5-9: second_line null when no stored second line");
+      assertEq(nosl.second_line, null, "c5-10: verified row without verdict -> second_line null");
+      assertEq(nosl.terminal_reason, null, "c5-11: verified row without verdict -> terminal_reason null");
+    }
   } catch (err: any) {
     failed++;
     failures.push("admin-pool-blocker-explain: unexpected error: " + String(err?.stack || err?.message || err));
