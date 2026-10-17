@@ -1662,10 +1662,17 @@ export const GARDSSALG_TYPE_SLUG_ALIASES: Record<string, string> = {
 // ─────────────────────────────────────────────────────────────
 export function homeStrings(lang: Lang) {
   const no = {
-    metaTitle: "Opplevagent — norske opplevelser, håndplukket og verifisert",
-    metaDesc: "Håndplukkede norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Alle tilbydere er verifisert mot Brønnøysundregistrene, og katalogen er søkbar for AI-agenter.",
-    ogTitle: "Opplevagent — norske opplevelser, søkbart for AI-agenter",
-    ogImageAlt: "Opplevagent — markedsplass for norske opplevelser",
+    // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S3: Daniel's
+    // decision 1=B (2026-10-17) positions the Norwegian front page around
+    // gårdssalg, smaking and local drink producers, without developer
+    // language. Only meta/og, hero (pill, H1, sub, search placeholder) and
+    // the agents H2 changed; the catalog stays reachable through the search
+    // box, «Alle opplevelser» and the hint link. `en` and `sv` deliberately
+    // keep their old copy (decision 6=A) — not out of sync by accident.
+    metaTitle: "Opplevagent — gårdssalg, smaking og lokale drikkeprodusenter",
+    metaDesc: "Besøk norske bryggerier, siderier, vingårder, destillerier og gårdskafeer — smaking og gårdssalg rett hos produsenten. Verifisert mot Brønnøysundregistrene.",
+    ogTitle: "Opplevagent — gårdssalg, smaking og drikke i Norge",
+    ogImageAlt: "Opplevagent — gårdssalg og smaking hos norske produsenter",
     skip: "Hopp til hovedinnhold",
     brandAria: "Opplevagent forside",
     navAria: "Hovednavigasjon",
@@ -1676,10 +1683,10 @@ export function homeStrings(lang: Lang) {
     // at the same Norwegian URL — exactly like /opplevelser and
     // /kategori/gardssalg already do. Keep in sync with the `en` object below.
     navProviders: "For tilbydere",
-    heroPill: "A2A-markedsplass for norske opplevelser",
-    heroH1: "Hva kan vi finne på ", heroAccent: "i dag?",
-    heroSub: "Fra hvalsafari og trehytter til fjellturer, matopplevelser og lasertag &mdash; håndplukkede norske opplevelser, samlet ett sted.",
-    searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
+    heroPill: "Håndplukket og Brreg-verifisert",
+    heroH1: "Gårdssalg og smaking ", heroAccent: "rett hos produsenten",
+    heroSub: "Besøk bryggerier, siderier, vingårder, destillerier og gårdskafeer over hele Norge, samlet på ett sted.",
+    searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: sideri, bryggeri, Hardanger …", searchBtn: "Finn opplevelser",
     hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ".",
     // dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
     // Goal 3: the reiserute (route/corridor) capability existed but was
@@ -1734,7 +1741,7 @@ export function homeStrings(lang: Lang) {
     s1t: "Håndplukket utvalg", s1b: "Vi henter inn opplevelser fortløpende fra utvalgte kilder &mdash; ikke et åpent annonsemarked, men ekte norske tilbydere vi har plukket ut.", s1src: "utvalgte tilbyderkilder",
     s2t: "Verifisert tilbyder", s2bPre: "Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et ", s2bStrong: "aktivt selskap", s2bPost: " bak opplevelsen.", s2src: "Brønnøysundregistrene (Brreg)",
     s3t: "Utfylt med detaljer", s3b: "Vi henter detaljer fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.", s3src: "tilbyderens egen side",
-    agentsKicker: "For AI-agenter", agentsTitle: "Bygget for å bli spurt av agenter", agentsBody: "Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.",
+    agentsKicker: "For AI-agenter", agentsTitle: "Spør AI-assistenten din om gårdssalg og smaking", agentsBody: "Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.",
     endpointsAria: "Endepunkter for agenter", codeAria: "Eksempler på agent-kall", codeCmt1: "# message/send &mdash; naturlig språk", codeCmt2: "«hva kan vi finne på i Tromsø i vinter?»",
     footTagline: "Norske opplevelser og aktiviteter, håndplukket og verifisert &mdash; søkbart for mennesker og AI-agenter.", footExplore: "Utforsk", footAgents: "For agenter", footPrivacy: "Personvern", footTerms: "Vilkår", footVerified: "Tilbydere verifisert mot Brønnøysundregistrene",
   };
@@ -2157,10 +2164,13 @@ router.get("/", (req: Request, res: Response) => {
     // T2 + G3-S1: Opplevagent's Organization from its brand entry — PNG logo
     // (/favicon-512.png), the domain as alternateName, and the company that
     // owns and operates opplevagent.no as parentOrganization.
+    // E4-S3 (decision 1=B): the description follows the gårdssalg/smaking
+    // positioning. It is one Norwegian string for every language, so the EN
+    // front page changes here too — the one exception to "en/sv unchanged".
     {
       ...organizationJsonLd("experiences"),
       description:
-        "A2A-markedsplass for norske opplevelser og aktiviteter. Tilbydere verifiseres mot Brønnøysundregistrene.",
+        "Gårdssalg, smaking og lokale drikkeprodusenter i Norge. Tilbydere verifiseres mot Brønnøysundregistrene.",
     },
   ];
   const ldScripts = jsonLd.map((ld) => jsonLdScriptTag(ld)).join("\n");
