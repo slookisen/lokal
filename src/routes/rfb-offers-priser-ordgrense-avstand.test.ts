@@ -6,12 +6,17 @@
  * - Price ranges (P2): parsePriceNok (product-catalog-sync.ts) ran every digit
  *   together, so «kr 70 – kr 650» became 70650 and «kr 48.00 – kr 220.00»
  *   48.0022. A range now gives its lowest price, a plain price what it gave
- *   before, and the next sync overwrites the stored wrong price.
+ *   before, and the next sync overwrites the stored wrong price. Review round
+ *   1: a dot before three digits groups thousands («kr 1.250»), a number
+ *   after «kr» that a quantity follows is no price («300 kr 2-3 kg»), and a
+ *   long text cannot stall the parse.
  * - Word rule and limit (P3, P2 for short words): findOffers matched
  *   LIKE '%term%', so «egg» offered «Kjøttpålegg». The term must now start a
  *   word, or end one when it has four letters or more («Lynghonning» for
- *   «honning»; utils/product-name-match.ts), and `limit` counts producers:
- *   one offer each, its best row, whatever order the rows are in.
+ *   «honning»; utils/product-name-match.ts), or, for a shorter term, when the
+ *   row is in the term's own category (review round 1: «Gårdsegg» for «egg»,
+ *   «Brunost» for «ost», not «Pålegg» or «Eplemost»). `limit` counts
+ *   producers: one offer each, its best row, whatever order the rows are in.
  * - Distance (P3): a producer placed at a centroid (geo_precision city,
  *   kommune, postal) showed «0 km». distance_km is now null for it, and the
  *   additive distance_label says where it is, on GET /catalog/offers,
@@ -53,13 +58,16 @@ const MANY = id(20), TIE_A = id(26), TIE_B = id(27);
 const REPPE = id(30), ADDR = id(31), LEGACY = id(32), NOCITY = id(33), KOMMUNE = id(34), POSTAL = id(35), ETIKETT = id(36);
 const FRAG = id(40);
 const INDEROY = id(50), SIGDAL = id(51);
+const GARDSEGG = id(60), VAKTEL = id(61), KJOTTEGG = id(62), YSTERI = id(63), MOSTERI = id(64), GARDSBU = id(65);
+const JULEOL = id(66), MOLLE = id(67), GARDSIS = id(68), PROSENT = id(69);
+const BRINGEBAER = id(70), JORDBAER = id(71), BIBAER = id(72);
 
 /** A producer whose knowledge products and catalog rows are the same names (and prices). */
 function seed(n: string, name: string, pos: { lat: number; lng: number }, city: string, categories: string[], catalog: CatalogRow[],
   extra: Partial<Seed> = {}): Seed {
   return {
     id: n, name, lat: pos.lat, lng: pos.lng, city, categories,
-    products: catalog.map((c) => ({ name: c.name, category: categories[0], ...(c.priceNok ? { price: `${c.priceNok} kr` } : {}) })),
+    products: catalog.map((c) => ({ name: c.name, category: c.category ?? categories[0], ...(c.priceNok ? { price: `${c.priceNok} kr` } : {}) })),
     catalog, ...extra,
   };
 }
@@ -84,6 +92,18 @@ const SEEDS: Seed[] = [
     [{ name: "Honning", priceNok: 200, ownerSet: true, availability: "out_of_stock" }, { name: "Honning, 1 kg", priceNok: 350 }]),
   seed(NAVN, "Navnelikhet Fixture", near(B, 0.021), "Bergen", ["honey"],
     [{ name: "Skogshonning", priceNok: 120 }, { name: "Blomsterhonning", priceNok: 120 }]),
+  // Bergen: a short term ends a word only in its own category (review round 1).
+  // A row's own category beats its producer's.
+  seed(GARDSEGG, "Gårdsegg Fixture", near(B, 0.023), "Bergen", ["eggs"], [{ name: "Gårdsegg", priceNok: 65 }]),
+  seed(VAKTEL, "Vaktelgård Fixture", near(B, 0.024), "Bergen", ["meat"], [{ name: "Vaktelegg", priceNok: 80, category: "eggs" }]),
+  seed(KJOTTEGG, "Kjøtt og Egg Fixture", near(B, 0.025), "Bergen", ["eggs", "meat"], [{ name: "Kjøttpålegg", priceNok: 89, category: "meat" }]),
+  seed(YSTERI, "Ysteri Fixture", near(B, 0.026), "Bergen", ["dairy"], [{ name: "Kvitost", priceNok: 110 }, { name: "Brunost", priceNok: 120 }]),
+  seed(MOSTERI, "Mosteri Fixture", near(B, 0.027), "Bergen", ["beverages"], [{ name: "Eplemost", priceNok: 60 }]),
+  seed(GARDSBU, "Gardsbu Fixture", near(B, 0.028), "Bergen", ["dairy", "beverages"], [{ name: "Eplemost", priceNok: 55, category: "beverages" }]),
+  seed(JULEOL, "Julebryggeri Fixture", near(B, 0.029), "Bergen", ["beverages"], [{ name: "Juleøl", priceNok: 95 }]),
+  seed(MOLLE, "Mølle Fixture", near(B, 0.03), "Bergen", ["bakery"], [{ name: "Steinmalt rugmjøl", priceNok: 48 }]),
+  seed(GARDSIS, "Gårdsis Fixture", near(B, 0.031), "Bergen", ["dairy"], [{ name: "Gårdsis vanilje", priceNok: 70 }]),
+  seed(PROSENT, "Saftpresseri Fixture", near(B, 0.032), "Bergen", ["beverages"], [{ name: "Eplesaft 100 %", priceNok: 45 }]),
   // Stavanger: the limit counts producers; equal distances go by agent id
   seed(MANY, "Potetgård Fixture", near(S, 0.001), "Stavanger", ["vegetables"],
     [{ name: "Mandelpoteter", priceNok: 40 }, { name: "Nypoteter", priceNok: 35 }, { name: "Poteter", priceNok: 25 }]),
@@ -91,6 +111,10 @@ const SEEDS: Seed[] = [
     [{ name: "Poteter", priceNok: 20 }])),
   seed(TIE_B, "Likt Sted B Fixture", near(S, 0.03), "Stavanger", ["vegetables"], [{ name: "Kålrot", priceNok: 15 }]),
   seed(TIE_A, "Likt Sted A Fixture", near(S, 0.03), "Stavanger", ["vegetables"], [{ name: "Kålrot", priceNok: 15 }]),
+  // Stavanger: «bær» is fruit on the platform (berries are sold under fruit)
+  seed(BRINGEBAER, "Bærgård Fixture", near(S, 0.04), "Stavanger", ["fruit"], [{ name: "Bringebær", priceNok: 70 }]),
+  seed(JORDBAER, "Grønnsakgård Fixture", near(S, 0.041), "Stavanger", ["vegetables"], [{ name: "Jordbær", priceNok: 60, category: "berries" }]),
+  seed(BIBAER, "Birøkter med Bær Fixture", near(S, 0.042), "Stavanger", ["honey"], [{ name: "Honning med bringebær", priceNok: 140 }]),
   // Oslo: distance honesty
   seed(REPPE, "Reppe Søndre Fixture", O, "Ski", ["vegetables"], [{ name: "Jordskokk", priceNok: 40, unit: "kg" }]),
   seed(ADDR, "Adressegård Fixture", near(O, 0.0216), "Oslo", ["vegetables"], [{ name: "Jordskokk", priceNok: 40, unit: "kg" }]),
@@ -156,7 +180,9 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
   try {
     const { parsePriceNok, runProductCatalogSync } = require("../services/product-catalog-sync") as typeof import("../services/product-catalog-sync");
     const { productNameMatch, COMPOUND_HEAD_MIN_LENGTH } = require("../utils/product-name-match") as typeof import("../utils/product-name-match");
-    const { findOffers } = require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+    const { findOffers, platformCategoriesOf } = require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+    const { PRODUCT_CATEGORY_KEYWORDS } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
+    const { PLATFORM_CATEGORIES, PRODUCT_KEY_TO_PLATFORM } = require("../services/search-enrich") as typeof import("../services/search-enrich");
     const { formatRfbDistanceLabel } = require("../services/geo-precision") as typeof import("../services/geo-precision");
     const { catalogRouter } = require("./marketplace-catalog") as typeof import("./marketplace-catalog");
     const mcp = require("./mcp") as typeof import("./mcp");
@@ -183,17 +209,35 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
       assertEq(ranges.map(([s]) => parsePriceNok(s)), ranges.map(([, v]) => v),
         "price: a range («-», «–», «—», «til», with or without «kr», thousands and decimals) gives its lowest price, whichever comes first");
       const plain = ["kr 275/kg", "kr 275", "275", "20 kr", "kr 55", "kr 49,90", "kr 1 200", "kr 1\u00a0200", "kr 350,-", "Fra kr 70",
-        "kr. 89", "120 kr/glass", "60 kr/brett", "300 kr/kg", "kr 45 pr. 0,5 l", "NOK 89", "kr 1.200,-"];
+        "kr. 89", "120 kr/glass", "60 kr/brett", "300 kr/kg", "kr 45 pr. 0,5 l", "NOK 89", "kr 48.00", "kr 1.5", "kr 0.250", "kr 1.2500"];
       assertEq(plain.map((s) => parsePriceNok(s)), plain.map(parsePriceNokBeforeIV),
         "price byte-like: a plain price reads exactly as before (thousands with a space, decimals with a comma or a dot, «fra», «,-», «/kg»)");
+      const dotThousands: Array<[string, number, number]> = [
+        ["kr 1.250", 1250, 1.25], ["kr 1.200,-", 1200, 1.2], ["kr 12.990,-", 12990, 12.99], ["kr 2.500,50", 2500.5, 2.5],
+        ["kr 1.500 – kr 2.000", 1500, 1.5002],
+      ];
+      assertEq(dotThousands.map(([s]) => [parsePriceNok(s), parsePriceNokBeforeIV(s)]), dotThousands.map(([, now, before]) => [now, before]),
+        "price (review S2): a dot and three digits after a non-zero start group thousands («kr 1.250» is 1250, not 1.25); «kr 48.00», «kr 1.5» and «kr 0.250» stay decimals (above)");
       const glued: Array<[string, number, number]> = [
         ["kr 60/6 stk", 60, 606], ["kr 120 per 500 g", 120, 120500], ["500 g – kr 89", 89, 50089],
         ["45 kr per 0,5 l", 45, 450.5], ["kr 60 - 6 stk", 60, 606], ["ca. 275 kr", 275, 0.275], ["70 kroner", 70, 70],
       ];
       assertEq(glued.map(([s]) => [parsePriceNok(s), parsePriceNokBeforeIV(s)]), glued.map(([, now, before]) => [now, before]),
         "price: two numbers are never run together; the number by «kr» is the price («kr 60/6 stk» is 60, «500 g – kr 89» is 89), and «kr 60 - 6 stk» is no range");
+      const quantity: Array<[string, number, number]> = [
+        ["300 kr 2-3 kg", 300, 30023], ["kr 120 500 g", 120, 120500], ["Kr 120 500 gram", 120, 120500], ["kr 89 1 kg", 89, 891],
+        ["kr 1 500 per 5 kg", 1500, 15005],
+      ];
+      assertEq(quantity.map(([s]) => [parsePriceNok(s), parsePriceNokBeforeIV(s)]), quantity.map(([, now, before]) => [now, before]),
+        "price (review S3): a quantity is no price: «300 kr 2-3 kg» is 300 (the number before «kr»), and a unit after «120 500» splits it («kr 120 500 g» is 120, «kr 1 500 per 5 kg» 1500)");
       assertEq([null, undefined, "", "gratis", "kr 0", "0", "kr 0 – kr 0", "Pris etter avtale"].map((s) => parsePriceNok(s as any)),
         [null, null, null, null, null, null, null, null], "price: no positive number is no price");
+      const t0 = Date.now();
+      const long = [parsePriceNok("1 ".repeat(40_000)), parsePriceNok("kr " + "1 ".repeat(40_000)), parsePriceNok("9".repeat(80_000) + " – kr")];
+      const ms = Date.now() - t0;
+      assertTrue(ms < 200, `price (review S1): 80 kB of digits and spaces parse at once (${ms} ms; seconds to tens of seconds without the cap)`);
+      assertEq([long[0], parsePriceNok("x".repeat(190) + " kr 70"), parsePriceNok("x".repeat(250) + " kr 70")], [1, 70, null],
+        "price (review S1): only the first 200 characters are read");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -230,15 +274,42 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
     {
       const cases: Array<[string, string, number]> = [
         ["Egg", "egg", 3], ["Frittgående egg", "egg", 3], ["Ferske egg fra Fana", "egg", 3], ["Eggekartong", "egg", 1],
-        ["Pålegg", "egg", 0], ["Kjøttpålegg", "egg", 0], ["Lammelegg", "egg", 0],
+        ["Pålegg", "egg", 0], ["Kjøttpålegg", "egg", 0], ["Lammelegg", "egg", 0], ["Gårdsegg", "egg", 0],
         ["Lynghonning", "honning", 2], ["Honningkake", "honning", 1], ["Honning, 1 kg", "honning", 3], ["Lammekjøtt", "kjøtt", 2],
         ["Øl fra Lindheim", "øl", 3], ["Mørkt øl", "øl", 3], ["Juleøl", "øl", 0], ["Grillpølser", "øl", 0],
         ["Iskrem vanilje", "is", 1], ["Fisk", "is", 0], ["Ris", "is", 0], ["Meieri", "er", 0],
         ["Poteter", "POTE", 1], ["  Egg  ", " EGG ", 3], ["Egg", "", 0], ["Pålegg og egg", "egg", 3], ["Jordbær", "bær", 0],
+        ["Ruovttočáhci", "áhci", 2], ["Ruovttočáhci", "čáhci", 2],
       ];
       assertEq(cases.map(([n, t]) => productNameMatch(n, t)), cases.map(([, , v]) => v),
         "word rule: whole word 3, compound head (≥ 4 letters) 2, start of a word 1, inside a word or a short word's end 0; case and spaces ignored; the best occurrence counts");
-      assertEq(COMPOUND_HEAD_MIN_LENGTH, 4, "word rule: a compound head needs a term of at least four letters");
+      assertEq(COMPOUND_HEAD_MIN_LENGTH, 4, "word rule: a compound head needs a term of at least four letters, or the row in the term's category");
+      const sameCategory: Array<[string, string, number]> = [
+        ["Gårdsegg", "egg", 2], ["Vaktelegg", "egg", 2], ["Brunost", "ost", 2], ["Bringebær", "bær", 2], ["Blomkål", "kål", 2],
+        ["Spekelam", "lam", 2], ["Juleøl", "øl", 2],
+        ["Egg", "egg", 3], ["Eggekartong", "egg", 1], ["Bringebærsaft", "bær", 0], ["Juleølet", "øl", 0], ["Lynghonning", "honning", 2],
+      ];
+      assertEq(sameCategory.map(([n, t]) => productNameMatch(n, t, true)), sameCategory.map(([, , v]) => v),
+        "word rule (review B1): with the row in the term's category a short term may end a word too («Gårdsegg», «Brunost», «Juleøl» 2); a word start and a whole word are as before, and a term inside a word still never counts");
+      assertEq(productNameMatch("Dálvečegg", "egg"), 0,
+        "word rule (review S4): any Unicode letter is a letter, so the Sámi «č» does not split «Dálvečegg» (the Latin-1 class read «egg» as a whole word)");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // The term's category (catalog-offers.ts platformCategoriesOf)
+    // ══════════════════════════════════════════════════════════════
+    {
+      const words = ["egg", "ost", "Brunost", "bær", "berries", "fruit", "kål", "lam", "øl", "te", "bread", "bakery", "Kjøtt", " EGG ",
+        "meat", "Pålegg", "Frukt og bær", "is", "zzzqqx", ""];
+      assertEq(words.map((w) => platformCategoriesOf(w)), [["eggs"], ["dairy"], ["dairy"], ["fruit"], ["fruit"], ["fruit"], ["vegetables"],
+        ["meat"], ["beverages"], ["beverages"], ["bakery"], ["bakery"], ["meat"], ["eggs"], ["meat"], [], [], [], [], []],
+      "category: a word names the platform category of the query parser's keyword map («bær» and «berries» → fruit, «bread» → bakery), a platform key itself, and a whole value only («Pålegg», «Frukt og bær», «is» name none)");
+      assertTrue(Object.entries(PRODUCT_CATEGORY_KEYWORDS).every(([key, kws]) => [key, ...kws].every((w) =>
+        platformCategoriesOf(w).includes(PRODUCT_KEY_TO_PLATFORM[key] ?? key)) && PLATFORM_CATEGORIES.includes(PRODUCT_KEY_TO_PLATFORM[key] ?? key)),
+      "category: every key and keyword of the parser's map names its category on a platform key");
+      const parsed = (q: string) => marketplaceRegistry.parseNaturalQuery(q).categories;
+      assertEq([parsed("brunost og egg"), parsed("bær"), parsed("øl i Bergen")], [["dairy", "eggs"], ["berries"], ["beverages"]],
+        "category: the query parser reads the hoisted map as before");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -250,6 +321,10 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
       isB: await findOffers({ q: "is", near: "Bergen" }),
       honningB: await findOffers({ q: "honning", near: "Bergen" }),
       paleggB: await findOffers({ q: "pålegg", near: "Bergen" }),
+      ostB: await findOffers({ q: "ost", near: "Bergen" }),
+      baerS: await findOffers({ q: "bær", lat: S.lat, lng: S.lng }),
+      prosentB: await findOffers({ q: "%", near: "Bergen" }),
+      understrekB: await findOffers({ q: "_", near: "Bergen" }),
       poteterS: await findOffers({ q: "poteter", lat: S.lat, lng: S.lng }),
       poteterS2: await findOffers({ q: "poteter", lat: S.lat, lng: S.lng, limit: 2 }),
       kalrotS: await findOffers({ q: "kålrot", lat: S.lat, lng: S.lng }),
@@ -259,14 +334,29 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
     };
     {
       const rows = (db.prepare("SELECT name FROM products WHERE LOWER(name) LIKE '%egg%'").all() as any[]).map((x) => x.name).sort();
-      assertEq(rows, ["Egg", "Eggekartong", "Eggekartong", "Frittgående egg", "Kjøttpålegg", "Lammelegg", "Pålegg"],
-        "egg setup: the catalog near Bergen has «egg» inside «Kjøttpålegg», «Pålegg» and «Lammelegg»");
-      assertEq(offersOf(searches.eggB), ["Fana Egg Fixture: Egg", "Kartong Fixture: Eggekartong"],
-        "«egg» near Bergen: no «Pålegg», «Kjøttpålegg» or «Lammelegg» (the acceptance criterion); «Egg» and «Eggekartong» stay");
-      assertEq(offersOf(searches.paleggB), ["Bergen Pålegg Fixture: Pålegg"], "«pålegg» near Bergen: «Pålegg» itself is still found");
-      assertEq(offersOf(searches.olB), ["Bryggeri Fixture: Mørkt øl", "Lindheim Fixture: Øl fra Lindheim"],
-        "«øl» near Bergen: «Mørkt øl» and «Øl fra Lindheim» (upper-case «Ø» too), not «Grillpølser» nor the short word's end in «Juleøl»");
-      assertEq(offersOf(searches.isB), ["Iskremfabrikk Fixture: Iskrem vanilje"], "«is» near Bergen: «Iskrem», not «Fisk» or «Ris»");
+      assertEq(rows, ["Egg", "Eggekartong", "Eggekartong", "Frittgående egg", "Gårdsegg", "Kjøttpålegg", "Kjøttpålegg", "Lammelegg", "Pålegg", "Vaktelegg"],
+        "egg setup: the catalog near Bergen has «egg» inside «Kjøttpålegg», «Pålegg» and «Lammelegg», and at the end of «Gårdsegg» and «Vaktelegg»");
+      assertEq(offersOf(searches.eggB),
+        ["Fana Egg Fixture: Egg", "Kartong Fixture: Eggekartong", "Gårdsegg Fixture: Gårdsegg", "Vaktelgård Fixture: Vaktelegg"],
+        "«egg» near Bergen: no «Pålegg», «Kjøttpålegg» or «Lammelegg» (the acceptance criterion); «Egg» and «Eggekartong» stay, "
+        + "and «Gårdsegg» (an egg producer) and «Vaktelegg» (a row in eggs at a meat producer) are found (review B1)");
+      assertTrue(!searches.eggB.offers.some((o) => o.producer.agent_id === KJOTTEGG),
+        "«egg» near Bergen: a row's own category (meat) beats its producer's (eggs, meat), so «Kjøttpålegg» is no egg offer");
+      assertEq(offersOf(searches.paleggB), ["Bergen Pålegg Fixture: Pålegg", "Kjøtt og Egg Fixture: Kjøttpålegg"],
+        "«pålegg» near Bergen: «Pålegg» itself is still found, and «Kjøttpålegg» (a term of six letters ends a word in any category)");
+      assertEq(offersOf(searches.ostB), ["Ysteri Fixture: Brunost"],
+        "«ost» near Bergen (review B1): the cheese producer's «Brunost» (its best row: «Brunost» before «Kvitost» by name); "
+        + "no «Eplemost», whether the producer is a cidery or the row is in beverages at a producer that also has dairy");
+      assertEq(offersOf(searches.olB), ["Bryggeri Fixture: Mørkt øl", "Lindheim Fixture: Øl fra Lindheim", "Julebryggeri Fixture: Juleøl"],
+        "«øl» near Bergen: «Mørkt øl» and «Øl fra Lindheim» (upper-case «Ø» too), «Juleøl» at a brewery (review B1; «Mørkt øl» stays the "
+        + "Bryggeri's best row as a whole word), not «Grillpølser» nor «Steinmalt rugmjøl» at a mill");
+      assertEq(offersOf(searches.isB), ["Iskremfabrikk Fixture: Iskrem vanilje"],
+        "«is» near Bergen: «Iskrem», not «Fisk» or «Ris»; nor «Gårdsis vanilje»: the keyword map knows no «is», so it only starts a word");
+      assertEq(offersOf(searches.baerS), ["Bærgård Fixture: Bringebær", "Grønnsakgård Fixture: Jordbær"],
+        "«bær» near Stavanger (review B1): «Bringebær» at a fruit producer and «Jordbær» in berries (berries are sold under fruit); "
+        + "not «Honning med bringebær» at a beekeeper");
+      assertEq([offersOf(searches.prosentB), offersOf(searches.understrekB)], [["Saftpresseri Fixture: Eplesaft 100 %"], []],
+        "LIKE escape (review S6): «%» finds only the name with a «%» in it, and «_» finds nothing (the LIKE wildcards are escaped, and the word rule decides)");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -295,6 +385,7 @@ export async function runRfbOffersPriserOrdgrenseAvstandTests(opts: { log?: bool
       const reversed = openDb([...SEEDS].reverse().map((s) => ({ ...s, catalog: [...s.catalog].reverse() })));
       const again = {
         honningB: await findOffers({ q: "honning", near: "Bergen" }), eggB: await findOffers({ q: "egg", near: "Bergen" }),
+        ostB: await findOffers({ q: "ost", near: "Bergen" }), baerS: await findOffers({ q: "bær", lat: S.lat, lng: S.lng }),
         poteterS: await findOffers({ q: "poteter", lat: S.lat, lng: S.lng }), kalrotS: await findOffers({ q: "kålrot", lat: S.lat, lng: S.lng }),
       };
       reversed.close();

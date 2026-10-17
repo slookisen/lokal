@@ -54,8 +54,14 @@
 // Slice I-V (found live 2026-10-17):
 // - Term: the term must start a word of the product name, or end one when it
 //   has four letters or more (utils/product-name-match.ts), so «egg» no longer
-//   offers «Kjøttpålegg», and «honning» still offers «Lynghonning». The SQL
-//   LIKE stays as a pre-filter only.
+//   offers «Kjøttpålegg», and «honning» still offers «Lynghonning». A shorter
+//   term may end a word too when the row is in the term's own category: its
+//   products.category, or its producer's categories when it has none, against
+//   the term's category in the query parser's keyword map
+//   (platformCategoriesOf). So «egg» offers «Gårdsegg» (eggs), not «Pålegg»
+//   (meat), and «ost» «Brunost» (dairy), not «Eplemost» (beverages). A term
+//   the map does not know («is») only starts a word. The SQL LIKE stays as a
+//   pre-filter only.
 // - Limit: `limit` counts producers, as the tool says («up to 5 nearby
 //   producers»): one offer per producer, its best row (best match, then in
 //   stock, then with a price, then by name (nb) and id). Producers are ordered
@@ -78,8 +84,10 @@ import { isValidLatLng } from "../utils/geo-query";
 import { slugify } from "../utils/slug";
 import { publicListableSql } from "./agent-visibility";
 import { isCategoryLabel } from "../utils/category-label";
-import { productNameMatch, type ProductNameMatch } from "../utils/product-name-match";
+import { productNameMatch, COMPOUND_HEAD_MIN_LENGTH, type ProductNameMatch } from "../utils/product-name-match";
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
+import { PRODUCT_CATEGORY_KEYWORDS } from "./marketplace-registry";
+import { PLATFORM_CATEGORIES, PRODUCT_KEY_TO_PLATFORM } from "./search-enrich";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -182,6 +190,54 @@ interface RawOfferRow {
   lng: number;
   geo_precision: string | null;
   is_verified: number;
+  product_category: string | null;
+  /** agents.categories, a JSON array. */
+  agent_categories: string | null;
+}
+
+// I-V: every word of the query parser's keyword map, and every platform key,
+// to the platform categories it names (see platformCategoriesOf).
+const PLATFORM_CATEGORIES_OF_WORD: ReadonlyMap<string, readonly string[]> = (() => {
+  const index = new Map<string, string[]>();
+  const add = (word: string, category: string) => {
+    const list = index.get(word) ?? [];
+    if (!list.includes(category)) list.push(category);
+    index.set(word, list);
+  };
+  for (const c of PLATFORM_CATEGORIES) add(c, c);
+  for (const [key, keywords] of Object.entries(PRODUCT_CATEGORY_KEYWORDS)) {
+    for (const w of [key, ...keywords]) add(w.toLowerCase(), PRODUCT_KEY_TO_PLATFORM[key] ?? key);
+  }
+  return index;
+})();
+
+/**
+ * I-V: the platform categories (search-enrich.ts PLATFORM_CATEGORIES) that a
+ * search term or a stored category value names: a platform key itself
+ * («fruit», «bakery»), or a key or keyword of the query parser's map
+ * (marketplace-registry.ts PRODUCT_CATEGORY_KEYWORDS) on its platform key
+ * (search-enrich.ts PRODUCT_KEY_TO_PLATFORM). «egg» → eggs, «bær» and
+ * «berries» → fruit (berries are sold under fruit), «Kjøtt» → meat. A whole
+ * value only, so «Frukt og bær» and «Pålegg» name none.
+ */
+export function platformCategoriesOf(word: string): readonly string[] {
+  return PLATFORM_CATEGORIES_OF_WORD.get(word.trim().toLowerCase()) ?? [];
+}
+
+/** I-V: whether a row is in one of `categories`: by its own category, or by its producer's when it has none. */
+function rowInCategories(r: RawOfferRow, categories: readonly string[]): boolean {
+  const values = r.product_category ? [r.product_category] : producerCategories(r.agent_categories);
+  return values.some((v) => platformCategoriesOf(v).some((c) => categories.includes(c)));
+}
+
+/** agents.categories (a JSON array) as strings; none when it is not one. */
+function producerCategories(raw: string | null): string[] {
+  try {
+    const v: unknown = JSON.parse(raw ?? "[]");
+    return Array.isArray(v) ? v.filter((c): c is string => typeof c === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 /** A row in the radius whose name matches the term, with its distance and its effective availability. */
@@ -285,7 +341,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       p.availability, p.availability_updated_at, p.availability_source,
       a.id AS agent_id, a.name AS agent_name, a.city AS city,
       a.lat AS lat, a.lng AS lng, a.geo_precision AS geo_precision,
-      a.is_verified AS is_verified
+      a.is_verified AS is_verified,
+      p.category AS product_category, a.categories AS agent_categories
     FROM products p
     INNER JOIN agents a ON a.id = p.agent_id
     INNER JOIN agent_knowledge k ON k.agent_id = a.id
@@ -312,10 +369,12 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   // Equal distances are common (all rows of one producer, producers placed at
   // a city centroid) and the query has no ORDER BY, so no choice uses the
   // rows' order: both lists go by distance, then agent id.
+  // A term shorter than COMPOUND_HEAD_MIN_LENGTH may end a word of a row in its own category.
+  const termCategories = term.length < COMPOUND_HEAD_MIN_LENGTH ? platformCategoriesOf(term) : [];
   const bestOffer = new Map<string, OfferCandidate>();
   const firstLabel = new Map<string, OfferCandidate>();
   for (const r of rows) {
-    const match = productNameMatch(r.product_name, term);
+    const match = productNameMatch(r.product_name, term, termCategories.length > 0 && rowInCategories(r, termCategories));
     if (!match) continue;
     const dist = haversineDistanceKm(position.lat, position.lng, r.lat, r.lng);
     if (dist > radiusKm) continue;

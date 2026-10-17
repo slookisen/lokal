@@ -802,82 +802,9 @@ class MarketplaceRegistry {
 
     // ── Product→Category mapping (expanded with Norwegian food terms) ──
     // Each keyword maps to a category AND is stored as a product search term
-    // so we can match at product-level, not just category-level.
-    const categoryMap: Record<string, string[]> = {
-      "vegetables": [
-        "grønnsaker", "grønt", "vegetables", "poteter", "potet", "gulrøtter", "gulrot",
-        "løk", "kål", "tomat", "tomater", "agurk", "brokkoli", "blomkål", "squash",
-        "paprika", "selleri", "purre", "spinat", "salat", "reddik", "gresskar",
-        "mais", "erter", "bønner", "rødbeter", "nepe", "pastinakk",
-      ],
-      "fruit": [
-        "frukt", "fruit", "epler", "eple", "pærer", "pære", "plommer", "plomme",
-        "kirsebær", "moreller", "rips", "stikkelsbær", "druer",
-      ],
-      "berries": [
-        "bær", "berries", "jordbær", "blåbær", "bringebær", "tyttebær",
-        "solbær", "multe", "multer", "markjordbær",
-      ],
-      "dairy": [
-        "meieri", "dairy", "melk", "ost", "smør", "yoghurt", "fløte", "rømme",
-        "brunost", "hvitost", "geitost", "pultost", "gamalost", "smøreost",
-      ],
-      "eggs": ["egg", "eggs", "frittgående", "økologiske egg"],
-      "meat": [
-        "kjøtt", "meat", "lam", "lammekjøtt", "svin", "svinekjøtt", "storfe",
-        "storfekjøtt", "kylling", "and", "vilt", "elg", "hjort", "rein",
-        "reinsdyr", "pølser", "spekemat", "fenalår", "ribbe", "pinnekjøtt",
-        // ChatGPT app re-review 2026-10-03: compounds are matched as whole
-        // words, so «reinsdyrkjøtt Finnmark» found neither «rein» nor
-        // «kjøtt» and fell back to every producer in Finnmark (a brewery and
-        // a bakery first).
-        "reinsdyrkjøtt", "reinkjøtt", "elgkjøtt", "hjortekjøtt", "viltkjøtt",
-      ],
-      "fish": [
-        "fisk", "fish", "sjømat", "laks", "torsk", "reker", "krabbe", "blåskjell",
-        "ørret", "røye", "sei", "hyse", "kveite", "steinbit", "tørrfisk",
-        "klippfisk", "lutefisk", "rakfisk", "gravlaks",
-      ],
-      "bread": [
-        "brød", "bread", "bakervarer", "lefse", "flatbrød", "rundstykker",
-        "boller", "kanelboller", "surdeig", "grovbrød",
-        // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: «bakeri» —
-        // the single most obvious word for this category, and a producer-name
-        // indicator since day one — was in no keyword list, so neither
-        // «bakeri Trondheim» nor "bakery in Trondheim" selected a category.
-        // Norwegian was broken here too; this is not an English-only gap.
-        "bakeri", "bakeriet", "bakevarer", "bakst",
-      ],
-      "honey": ["honning", "honey", "birøkt"],
-      "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
-      // ── Drikke (dev-request 2026-07-25-reisesok…, Fase 5a/5b) ──────────
-      // Daniel asked for this repeatedly: «Jeg ønsker også at søkefunksjon
-      // skal være inne på "drikkesteder"».
-      //
-      // `beverages` is not a new category — it is already the 8th-largest tag
-      // in the live catalogue (review N7 corrects an earlier "third-largest"
-      // overclaim). Full census 2026-07-25, all 1 523 production producers
-      // enumerated: `beverages` 65 rows, and 133 producers carry some
-      // drink-family category (`beverages` / `beer` / `sider` / `juice` /
-      // `coffee`) — Atlungstad Brenneri, Trysil Bryggeri, Senja Handbryggeri,
-      // Bent Gate Brewing, … It had simply never been reachable: this map had
-      // ten food categories and no drink one, so
-      // `øl`, `sider`, `drikke` and `brygg` produced NO category at all and
-      // fell through to a nationwide trust-ranked list. Verified live before
-      // this change: `q=øl` and `q=drikke` both returned `categories: null`
-      // and answered with Kringler Gjestegård / Homme Gård — neither of which
-      // sells drink. `bryggeri`/`sider`/`vin`/`brenneri` appeared to work only
-      // by accident, via the NAME branch matching producers with the word in
-      // their name; a `beverages` producer without it was unfindable.
-      //
-      // The stray one-off values the catalogue also carries (`beer`, `sider`,
-      // `juice`, `coffee`, 1 row each) are deliberately NOT added as separate
-      // categories — they are data noise, and normalising them is a data job,
-      // not a parser job. The keywords below route to `beverages`, and
-      // route-corridor-service.ts's DRINK_CATEGORIES treats the strays as
-      // drink too so a corridor search still finds them.
-      "beverages": DRINK_KEYWORDS,
-    };
+    // so we can match at product-level, not just category-level. The map is
+    // PRODUCT_CATEGORY_KEYWORDS, after the class (I-V: the offers read it too).
+    const categoryMap = PRODUCT_CATEGORY_KEYWORDS;
 
     const detectedCategories: string[] = [];
     const productTerms: string[] = [];
@@ -2262,6 +2189,88 @@ export const DRINK_KEYWORDS = [
   // "Pølser").
   "te", "urtete", "tea", "herbal tea",
 ];
+
+// ── Product → category keywords ──────────────────────────────────────
+// parseNaturalQuery's categoryMap: each keyword names a category and is a
+// product search term. Integration test 2026-10-17, slice I-V: hoisted out of
+// the method, unchanged, so the offers (catalog-offers.ts) tell a short
+// term's own category by the same words. Declared after DRINK_KEYWORDS, which
+// it reads.
+export const PRODUCT_CATEGORY_KEYWORDS: Record<string, string[]> = {
+  "vegetables": [
+    "grønnsaker", "grønt", "vegetables", "poteter", "potet", "gulrøtter", "gulrot",
+    "løk", "kål", "tomat", "tomater", "agurk", "brokkoli", "blomkål", "squash",
+    "paprika", "selleri", "purre", "spinat", "salat", "reddik", "gresskar",
+    "mais", "erter", "bønner", "rødbeter", "nepe", "pastinakk",
+  ],
+  "fruit": [
+    "frukt", "fruit", "epler", "eple", "pærer", "pære", "plommer", "plomme",
+    "kirsebær", "moreller", "rips", "stikkelsbær", "druer",
+  ],
+  "berries": [
+    "bær", "berries", "jordbær", "blåbær", "bringebær", "tyttebær",
+    "solbær", "multe", "multer", "markjordbær",
+  ],
+  "dairy": [
+    "meieri", "dairy", "melk", "ost", "smør", "yoghurt", "fløte", "rømme",
+    "brunost", "hvitost", "geitost", "pultost", "gamalost", "smøreost",
+  ],
+  "eggs": ["egg", "eggs", "frittgående", "økologiske egg"],
+  "meat": [
+    "kjøtt", "meat", "lam", "lammekjøtt", "svin", "svinekjøtt", "storfe",
+    "storfekjøtt", "kylling", "and", "vilt", "elg", "hjort", "rein",
+    "reinsdyr", "pølser", "spekemat", "fenalår", "ribbe", "pinnekjøtt",
+    // ChatGPT app re-review 2026-10-03: compounds are matched as whole
+    // words, so «reinsdyrkjøtt Finnmark» found neither «rein» nor
+    // «kjøtt» and fell back to every producer in Finnmark (a brewery and
+    // a bakery first).
+    "reinsdyrkjøtt", "reinkjøtt", "elgkjøtt", "hjortekjøtt", "viltkjøtt",
+  ],
+  "fish": [
+    "fisk", "fish", "sjømat", "laks", "torsk", "reker", "krabbe", "blåskjell",
+    "ørret", "røye", "sei", "hyse", "kveite", "steinbit", "tørrfisk",
+    "klippfisk", "lutefisk", "rakfisk", "gravlaks",
+  ],
+  "bread": [
+    "brød", "bread", "bakervarer", "lefse", "flatbrød", "rundstykker",
+    "boller", "kanelboller", "surdeig", "grovbrød",
+    // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: «bakeri» —
+    // the single most obvious word for this category, and a producer-name
+    // indicator since day one — was in no keyword list, so neither
+    // «bakeri Trondheim» nor "bakery in Trondheim" selected a category.
+    // Norwegian was broken here too; this is not an English-only gap.
+    "bakeri", "bakeriet", "bakevarer", "bakst",
+  ],
+  "honey": ["honning", "honey", "birøkt"],
+  "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
+  // ── Drikke (dev-request 2026-07-25-reisesok…, Fase 5a/5b) ──────────
+  // Daniel asked for this repeatedly: «Jeg ønsker også at søkefunksjon
+  // skal være inne på "drikkesteder"».
+  //
+  // `beverages` is not a new category — it is already the 8th-largest tag
+  // in the live catalogue (review N7 corrects an earlier "third-largest"
+  // overclaim). Full census 2026-07-25, all 1 523 production producers
+  // enumerated: `beverages` 65 rows, and 133 producers carry some
+  // drink-family category (`beverages` / `beer` / `sider` / `juice` /
+  // `coffee`) — Atlungstad Brenneri, Trysil Bryggeri, Senja Handbryggeri,
+  // Bent Gate Brewing, … It had simply never been reachable: this map had
+  // ten food categories and no drink one, so
+  // `øl`, `sider`, `drikke` and `brygg` produced NO category at all and
+  // fell through to a nationwide trust-ranked list. Verified live before
+  // this change: `q=øl` and `q=drikke` both returned `categories: null`
+  // and answered with Kringler Gjestegård / Homme Gård — neither of which
+  // sells drink. `bryggeri`/`sider`/`vin`/`brenneri` appeared to work only
+  // by accident, via the NAME branch matching producers with the word in
+  // their name; a `beverages` producer without it was unfindable.
+  //
+  // The stray one-off values the catalogue also carries (`beer`, `sider`,
+  // `juice`, `coffee`, 1 row each) are deliberately NOT added as separate
+  // categories — they are data noise, and normalising them is a data job,
+  // not a parser job. The keywords below route to `beverages`, and
+  // route-corridor-service.ts's DRINK_CATEGORIES treats the strays as
+  // drink too so a corridor search still finds them.
+  "beverages": DRINK_KEYWORDS,
+};
 
 // Keywords that identify a CATEGORY but must never be searched as a product
 // name. The first group is the pre-existing list (category words like

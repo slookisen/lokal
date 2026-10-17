@@ -42709,7 +42709,8 @@ runSerial(async () => {
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-V (found live
 // 2026-10-17): a price range gives its lowest price and the next catalog sync
 // overwrites the misread one (70650 → 70); in findOffers the term must start a
-// word (or end one, from four letters), so «egg» offers no «Pålegg», and
+// word (or end one, from four letters, or a shorter term in the row's own
+// category: «Gårdsegg», not «Pålegg»), so «egg» offers no «Pålegg», and
 // `limit` counts producers, one offer each, its best row; a centroid producer
 // has distance_km null and a distance_label (GET /catalog/offers,
 // lokal_find_offers, the shopping list page); mcpProse drops a tag cut off at

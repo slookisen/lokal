@@ -569,7 +569,10 @@ function productsWithMatchesShown(products: readonly unknown[], isMatch: (p: unk
  * Slice I-V: a stored description can end inside a tag, cut off before its
  * «>» («<div data-…», «<link rel='stylesheet' …»). A «<» (or «</») and a
  * letter with no «<» or «>» after it, to the end of the text, is such a
- * fragment and is removed too.
+ * fragment and is removed too. The trade-off: a tag left unclosed in the
+ * middle of the text looks the same, so the text after it goes with it
+ * («Velkommen <img src="x" Vi selger lam» keeps «Velkommen»). Showing less is
+ * the safer side; a tag's attributes never reach the text.
  */
 export function mcpProse(text: string | null | undefined, lineBreak = "\n"): string {
   const prose = normalizeProse(text);

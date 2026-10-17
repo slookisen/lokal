@@ -42,29 +42,41 @@ import { parseProductPrice, productPriceText, isProductHeader, isProductNoise } 
 //   lowest price. price_nok is one number, so this is the "from" price, as a
 //   «fra kr 70» already gives;
 // - otherwise the number after «kr» (or «kroner», «NOK»), else the one
-//   before it, else the first number: «kr 60/6 stk» is 60, not 606.
-// A number may group thousands with a space («kr 1 200») and have decimals
-// after a comma or a dot, as before, so a plain price gives what it gave.
+//   before it, else the first number: «kr 60/6 stk» is 60, not 606. A number
+//   after «kr» that a quantity follows («300 kr 2-3 kg») is that quantity, so
+//   the number before «kr» is the price.
+// A number may group thousands with a space («kr 1 200»), unless a unit
+// follows («kr 120 500 g» is 120), or with a dot and three digits after a
+// non-zero start («kr 1.250», «kr 1.200,-»; 1.25 and 1.2 before), and have
+// decimals after a comma or a dot, as before, so a plain price gives what it
+// gave. Only the first PRICE_TEXT_MAX characters are read: the patterns
+// backtrack on a long run of digits and spaces, inside the sync transaction.
 // The upsert below overwrites a stored price whenever this gives a number,
 // so the next sync replaces 70650 with 70 (no manual clean-up).
-const PRICE_NUM = String.raw`(\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)`;
+const PRICE_TEXT_MAX = 200;
+const PRICE_UNIT = String.raw`\s*(?:kg|kilo|hg|g|gr|gram|l|ltr|liter|dl|cl|ml|stk|pk)(?![a-zæøå])`;
+const PRICE_QTY = String.raw`(?:\s*[-–—]\s*\d+(?:[.,]\d+)?)?${PRICE_UNIT}`;
+const PRICE_NUM = String.raw`([1-9]\d{0,2}(?:\.\d{3})+(?!\d)(?:,\d+)?` +
+  String.raw`|\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d+)?(?!${PRICE_UNIT})|\d+(?:[.,]\d+)?)`;
 const PRICE_KR = String.raw`(?<![a-zæøå])(?:kroner|kr\.?|nok)(?![a-zæøå])`;
 const PRICE_ZERO_ORE = "(?:,[-–—])";
 const PRICE_RANGE = new RegExp(
   `${PRICE_NUM}\\s*(?:${PRICE_KR}|${PRICE_ZERO_ORE})?\\s*(?:[-–—]|til)\\s*(?:${PRICE_KR})?\\s*${PRICE_NUM}` +
   `(?=\\s*(?:${PRICE_KR}|${PRICE_ZERO_ORE}|\\/|$))`, "i");
-const PRICE_AFTER_KR = new RegExp(`${PRICE_KR}\\s*${PRICE_NUM}`, "i");
+const PRICE_AFTER_KR = new RegExp(`${PRICE_KR}\\s*${PRICE_NUM}(?!\\d|[.,]\\d|${PRICE_QTY})`, "i");
 const PRICE_BEFORE_KR = new RegExp(`${PRICE_NUM}\\s*(?:${PRICE_KR}|${PRICE_ZERO_ORE})`, "i");
-const PRICE_FIRST = new RegExp(PRICE_NUM);
+const PRICE_FIRST = new RegExp(PRICE_NUM, "i");
 
 function priceNumber(num: string): number {
-  return parseFloat(num.replace(/\s/g, "").replace(",", "."));
+  const n = num.replace(/\s/g, "");
+  return parseFloat((/^[1-9]\d{0,2}(?:\.\d{3})+(?:,\d+)?$/.test(n) ? n.replace(/\./g, "") : n).replace(",", "."));
 }
 
 export function parsePriceNok(priceStr: string | null | undefined): number | null {
   if (!priceStr) return null;
-  const range = priceStr.match(PRICE_RANGE);
-  const single = range ? null : priceStr.match(PRICE_AFTER_KR) || priceStr.match(PRICE_BEFORE_KR) || priceStr.match(PRICE_FIRST);
+  const text = priceStr.slice(0, PRICE_TEXT_MAX);
+  const range = text.match(PRICE_RANGE);
+  const single = range ? null : text.match(PRICE_AFTER_KR) || text.match(PRICE_BEFORE_KR) || text.match(PRICE_FIRST);
   const val = range ? Math.min(priceNumber(range[1]), priceNumber(range[2])) : single ? priceNumber(single[1]) : NaN;
   return isFinite(val) && val > 0 ? val : null;
 }
