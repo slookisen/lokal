@@ -42612,11 +42612,12 @@ runSerial(async () => {
 
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S2 (b): the
 // producers behind label rows fill the free places of an offers page in the
-// additive field category_matches (one entry per producer, nearest first, no
-// product id, never a producer already in offers, left out when empty, offers
-// unchanged), on GET /catalog/offers and lokal_find_offers (counted as
-// delivered), and as contact rows on the shopping list page. Own in-memory DB
-// (restored in finally), runSerial.
+// additive field category_matches (one entry per producer, nearest first and
+// the same whatever order the rows are in, no product id, never a producer
+// already in offers, left out when empty, offers unchanged), on GET
+// /catalog/offers and lokal_find_offers (counted as delivered), and as contact
+// rows on the shopping list page. Own in-memory DB (restored in finally),
+// runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-S2b (category_matches in the offers) ──");
   try {

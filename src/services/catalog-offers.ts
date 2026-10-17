@@ -45,11 +45,11 @@
 //
 // Slice I-S2 (b): the producers behind those label rows are not dropped. When
 // the real offers leave free places on the page, the nearest label producers
-// fill them in `category_matches`, one entry per producer: the producer and
-// its category, with no product id, name, price, unit or availability and
-// orderable:false, so a client can only offer to contact them. The field is
-// left out when it is empty, so a response whose offers fill the page is
-// what it was.
+// (ties by agent id) fill them in `category_matches`, one entry per producer:
+// the producer and its category, with no product id, name, price, unit or
+// availability and orderable:false, so a client can only offer to contact
+// them. The field is left out when it is empty, so a response whose offers
+// fill the page is what it was.
 
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
@@ -117,7 +117,7 @@ export interface Offer {
 /** I-S2: a producer whose catalog has the term only as a category label (see the module comment). */
 export interface CategoryMatch {
   match: "category";
-  /** The category name on the producer's label row, e.g. «Honning». */
+  /** The category name on the producer's label row, e.g. «Honning»; of several, the first by name (nb). */
   category: string;
   orderable: false;
   note: string;
@@ -159,6 +159,11 @@ interface RawOfferRow {
   lat: number;
   lng: number;
   is_verified: number;
+}
+
+/** I-S2: a producer's label rows by name (nb), then id, so its category match does not hang on the rows' order. */
+function compareLabelRows(a: RawOfferRow, b: RawOfferRow): number {
+  return a.product_name.trim().localeCompare(b.product_name.trim(), "nb") || a.product_id.localeCompare(b.product_id);
 }
 
 async function defaultGeocode(place: string): Promise<{ lat: number; lng: number } | null> {
@@ -259,14 +264,20 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   // I-S2: the free places go to the nearest label producers, one entry each.
   // A producer with a real offer for the term is never one of them: when
   // there are free places, every real offer in the radius is on the page.
-  const matchRows: typeof nearest = [];
-  const taken = new Set(offerRows.map((x) => x.r.agent_id));
+  // Equal distances are common (all rows of one producer, producers placed at
+  // a city centroid) and the query has no ORDER BY, so the choice does not
+  // use the rows' order: per producer the label whose name sorts first (nb),
+  // then the producers by distance and agent id. `offers` keeps its own order.
+  const offered = new Set(offerRows.map((x) => x.r.agent_id));
+  const labelOf = new Map<string, (typeof nearest)[number]>();
   for (const x of labelRows) {
-    if (offerRows.length + matchRows.length >= limit) break;
-    if (taken.has(x.r.agent_id)) continue;
-    taken.add(x.r.agent_id);
-    matchRows.push(x);
+    if (offered.has(x.r.agent_id)) continue;
+    const prev = labelOf.get(x.r.agent_id);
+    if (!prev || compareLabelRows(x.r, prev.r) < 0) labelOf.set(x.r.agent_id, x);
   }
+  const matchRows = [...labelOf.values()]
+    .sort((a, b) => a.dist - b.dist || a.r.agent_id.localeCompare(b.r.agent_id))
+    .slice(0, limit - offerRows.length);
 
   const salgskanalStmt = db.prepare(`
     SELECT sc.name AS name

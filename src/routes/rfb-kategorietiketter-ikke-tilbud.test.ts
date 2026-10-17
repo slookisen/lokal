@@ -74,7 +74,7 @@ const BLANDET_PRODUCTS = [
 /** The label names of the fixtures' enrichment rows (no price, not owner-set). */
 const FIXTURE_LABEL_NAMES = ["Kjøtt", "Meieri", "Grønnsaker", "Bakervarer", "Honning", "Egg", "Fisk", "Urter"];
 
-interface CatalogRow {
+export interface CatalogRow {
   name: string;
   priceNok?: number;
   unit?: string;
@@ -83,7 +83,7 @@ interface CatalogRow {
   availability?: string;
 }
 
-interface Seed {
+export interface Seed {
   id: string;
   name: string;
   lat: number;
@@ -143,9 +143,10 @@ export function sqliteTimestamp(d: Date): string {
  * The fixtures in `db`: verified, owner-claimed, opted-in producers (so an
  * offer is orderable), their knowledge and catalog rows. `ownerSetAt` is the
  * availability_updated_at of the owner-set rows. Exported so main's output
- * can be captured with the same data.
+ * can be captured with the same data. `seeds` replaces the fixtures, written
+ * in the order given (I-S2's order test in rfb-kategoritreff-i-offers.test.ts).
  */
-export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt: string): void {
+export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt: string, seeds: readonly Seed[] = SEED): void {
   const agentStmt = db.prepare(`
     INSERT INTO agents
       (id, name, description, provider, contact_email, url, version, role, api_key,
@@ -164,7 +165,7 @@ export function seedCategoryLabelOfferFixtures(db: Database.Database, ownerSetAt
     INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source, availability_updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  for (const s of SEED) {
+  for (const s of seeds) {
     agentStmt.run(s.id, s.name, s.description ?? `Beskrivelse av ${s.name}`, `${s.id}@example.no`, `https://${s.id}.example.no`,
       `key-${s.id}`, s.lat, s.lng, s.city, JSON.stringify(s.categories));
     knowledgeStmt.run(s.id, `${s.city}veien 1`, `${s.id}@example.no`, JSON.stringify(s.products), s.about ?? null);

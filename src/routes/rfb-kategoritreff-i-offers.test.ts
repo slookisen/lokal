@@ -9,8 +9,9 @@
  * them in the additive field `category_matches`:
  * - one entry per producer, {match:"category", category, orderable:false,
  *   note, producer}, with no product id, name, price, unit or availability;
- * - nearest first, offers + category matches ≤ limit, never a producer that
- *   is already in `offers`; owner-set rows stay offers;
+ * - nearest first (ties by agent id), per producer the label first by name
+ *   (nb), whatever order the rows are in; offers + category matches ≤ limit,
+ *   never a producer that is already in `offers`; owner-set rows stay offers;
  * - left out when empty, so a response whose offers fill the page is
  *   {term, offers} as before; `offers` itself is unchanged;
  * - GET /api/marketplace/catalog/offers and lokal_find_offers return it,
@@ -31,7 +32,7 @@ import Database from "better-sqlite3";
 import * as vm from "node:vm";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
-import { seedCategoryLabelOfferFixtures, sqliteTimestamp } from "./rfb-kategorietiketter-ikke-tilbud.test";
+import { seedCategoryLabelOfferFixtures, sqliteTimestamp, type Seed } from "./rfb-kategorietiketter-ikke-tilbud.test";
 
 export interface TestSummary {
   passed: number;
@@ -219,8 +220,8 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
       const matched = (r.category_matches ?? []).map((m) => m.producer.agent_id);
       return matched.every((id) => !offered.has(id)) && new Set(matched).size === matched.length;
     }), "field: never a producer in offers, and one entry per producer, on every search");
-    assertEq(matchesOf(searches.erT), ["Hevd Håndverksbakeri Fixture: Meieri"],
-      "«er» near Trondheim: Hevd has four labels with «er» (Meieri, Grønnsaker, Bakervarer, Urter) and gets one entry, its nearest row's");
+    assertEq(matchesOf(searches.erT), ["Hevd Håndverksbakeri Fixture: Bakervarer"],
+      "«er» near Trondheim: Hevd has four labels with «er» (Meieri, Grønnsaker, Bakervarer, Urter, written in that order) and gets one entry, the first by name (nb)");
     assertEq([matchesOf(searches.honningB), matchesOf(searches.eggB)], [["Reindyrka Fixture: Honning"], ["Reindyrka Fixture: Egg"]],
       "Bergen: Reindyrka's labels come back as category matches after the real, priced and owner-set offers");
     assertTrue(!(searches.honningT.category_matches ?? []).some((m) => m.producer.agent_id === EIER) && searches.honningT.offers.some((o) => o.producer.agent_id === EIER),
@@ -240,6 +241,39 @@ export async function runRfbKategoritreffIOffersTests(opts: { log?: boolean } = 
     // Pages that only had labels get a non-empty field
     for (const [key, who] of [["kjottAarvik", "Aarvik Gård Fixture: Kjøtt"], ["bakervarerT", "Hevd Håndverksbakeri Fixture: Bakervarer"]] as const) {
       assertEq([searches[key].offers, matchesOf(searches[key])], [[], [who]], `label-only page (${key}): no offer, and a non-empty category_matches`);
+    }
+
+    // The order does not hang on the rows' order in the table. Three
+    // producers with the labels «Meieri» and «Bakervarer»: 1 and 2 at one
+    // point (as at a city centroid), 0 a little farther and with the lowest
+    // id. Written in that order, and in the reverse order with each
+    // producer's rows reversed too, each in its own DB.
+    {
+      const P = { lat: 69.6492, lng: 18.9553 }; // Tromsø
+      const tieSeed = (i: number, dLat: number): Seed => ({ id: `1c000000-0000-4000-8000-00000000005${i}`, name: `Tromsø Etikett ${i} Fixture`,
+        lat: P.lat + dLat, lng: P.lng, city: "Tromsø", categories: ["dairy", "bakery"],
+        products: [{ name: "Meieri", category: "dairy", seasonal: false }, { name: "Bakervarer", category: "bakery", seasonal: false }],
+        catalog: [{ name: "Meieri" }, { name: "Bakervarer" }] });
+      const forward = [tieSeed(0, 0.01), tieSeed(1, 0), tieSeed(2, 0)];
+      const reverse = [...forward].reverse().map((s) => ({ ...s, catalog: [...s.catalog].reverse() }));
+      const written: string[][] = [];
+      const answers: string[][][] = [];
+      for (const seeds of [forward, reverse]) {
+        const tieDb = new Database(":memory:");
+        tieDb.pragma("foreign_keys = ON");
+        __setDbForTesting(tieDb as any);
+        __initSchemaForTesting(tieDb as any);
+        seedCategoryLabelOfferFixtures(tieDb, ownerSetAt, seeds);
+        written.push((tieDb.prepare("SELECT agent_id, name FROM products ORDER BY rowid").all() as any[]).map((x) => `${x.agent_id}: ${x.name}`));
+        const answer: string[][] = [];
+        for (const limit of [1, 2, 5]) answer.push(matchesOf(await findOffers({ q: "er", lat: P.lat, lng: P.lng, limit })));
+        answers.push(answer);
+        __setDbForTesting(db as any);
+      }
+      assertEq(written[1], [...written[0]!].reverse(), "order setup: the second DB has the same rows in the reverse order");
+      const expected = [[1], [1, 2], [1, 2, 0]].map((ids) => ids.map((i) => `Tromsø Etikett ${i} Fixture: Bakervarer`));
+      assertEq(answers, [expected, expected],
+        "order: limit 1, 2 and 5 give the same entries in both orders: by distance, then agent id; per producer the label first by name (Bakervarer before Meieri)");
     }
 
     // ══════════════════════════════════════════════════════════════
