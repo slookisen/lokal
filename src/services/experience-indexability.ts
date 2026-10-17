@@ -24,6 +24,9 @@
 //
 // Everything here is pure. The sitemap gets each row's description from
 // listPublishedExperienceSlugs() (experience-store.ts), behind the publish gate.
+// The aggregate pages below (combo, /kommune, /tilbyder) count their indexable
+// rows with shouldNoindexExperience() in experience-store.ts, in memory, since
+// isJunkDescription() has no SQL form.
 
 import { isJunkDescription } from "./description-quality";
 
@@ -71,10 +74,15 @@ export function shouldNoindexExperience(row: { description?: string | null }): b
 //
 // The rule that replaces both copies lives here:
 //   - A cell is indexable iff it has at least produktByMinExperiences()
-//     published experiences AND at least 2 real facts — the same three facts
-//     buildProduktByFaqJsonLd()/buildProduktByAnswerFirstOpening() count
-//     (experiences, providers, a stated price ≥ 0), so a cell that passes
-//     always gets its answer-first opening and its FAQ.
+//     INDEXABLE experiences (shouldNoindexExperience() false) AND at least 2
+//     real facts — the same three facts buildProduktByFaqJsonLd()/
+//     buildProduktByAnswerFirstOpening() count (experiences, providers, a
+//     stated price ≥ 0), so a cell that passes always gets its answer-first
+//     opening and its FAQ. dev-request 2026-10-17-integrasjonstest-
+//     oppfolging, IDX-1: the threshold used to count every published row,
+//     so /kategori/mat_drikke/Bergen was listed and indexed with 3
+//     experiences that were all noindex placeholders. The facts stay over
+//     every published row, because the page lists and states all of them.
 //   - The route serves an indexable cell. A cell with ≥1 experience that is
 //     not indexable answers 301 to /kommune/<kommune> (same experiences,
 //     richer page); an empty cell stays 404. The sitemap lists exactly the
@@ -82,19 +90,28 @@ export function shouldNoindexExperience(row: { description?: string | null }): b
 //   - The threshold is PRODUKT_BY_MIN_EXPERIENCES unless
 //     OPPLEVAGENT_COMBO_MIN_EXPERIENCES holds a whole number ≥ 1, read per
 //     call (no restart). "1" gives back the pre-E4-S1 behaviour (the fact
-//     rule alone); anything else falls back to the default. The route reads
-//     it per request; the sitemap per build, so after the sitemap cache TTL.
+//     rule alone), except that a cell still needs one indexable experience;
+//     OPPLEVAGENT_PLACEHOLDER_NOINDEX="false" counts placeholders again
+//     (IDX-1). Anything else falls back to the default. The route reads it
+//     per request; the sitemap per build, so after the sitemap cache TTL.
 
-/** Default minimum number of published experiences a combo page needs. */
+/** Default minimum number of indexable published experiences a combo page
+ *  needs. */
 export const PRODUKT_BY_MIN_EXPERIENCES = 2;
 
-/** The facts a combo cell is judged on — getProduktByStats() and
- *  listProduktByCombos() rows both carry them. */
-export type ProduktByCellStats = {
+/** The three real facts of a combo cell, over every published row in it —
+ *  what the page states and what the produkt×by FAQ builders gate on. */
+export type ProduktByCellFacts = {
   total: number;
   providerCount: number;
   minPriceFrom: number | null;
 };
+
+/** What a combo cell is judged on — getProduktByStats() and
+ *  listProduktByCombos() rows both carry it. `indexableTotal` is how many of
+ *  the `total` published experiences are indexable (shouldNoindexExperience()
+ *  false); the threshold applies to it. */
+export type ProduktByCellStats = ProduktByCellFacts & { indexableTotal: number };
 
 /** The combo threshold in force: OPPLEVAGENT_COMBO_MIN_EXPERIENCES when it is
  *  a whole number ≥ 1, else PRODUKT_BY_MIN_EXPERIENCES. Read per call. */
@@ -107,7 +124,7 @@ export function produktByMinExperiences(): number {
 
 /** How many of the three real facts (experiences, providers, a stated price
  *  ≥ 0) a combo cell has — the count the produkt×by FAQ builders gate on. */
-export function countProduktByRealFacts(stats: ProduktByCellStats): number {
+export function countProduktByRealFacts(stats: ProduktByCellFacts): number {
   return (
     (stats.total > 0 ? 1 : 0) +
     (stats.providerCount > 0 ? 1 : 0) +
@@ -121,5 +138,29 @@ export function countProduktByRealFacts(stats: ProduktByCellStats): number {
  * page; false = never list or link it (the route redirects or 404s).
  */
 export function isProduktByCellIndexable(stats: ProduktByCellStats): boolean {
-  return stats.total >= produktByMinExperiences() && countProduktByRealFacts(stats) >= 2;
+  return stats.indexableTotal >= produktByMinExperiences() && countProduktByRealFacts(stats) >= 2;
+}
+
+// ─── Aggregate pages: /kommune/:kommune and /tilbyder/:provider ─────────────
+// dev-request 2026-10-17-integrasjonstest-oppfolging, IDX-2.
+//
+// Measured live 2026-10-17: /kommune/Flakstad, /kommune/Averøy and three
+// /tilbyder/ pages answered `index, follow` and were in sitemap.xml although
+// every experience they list is a noindex placeholder — 0 indexable
+// experiences. The rule for such a page, in the spirit of E1-S1:
+//   - It answers 200 with `noindex, follow` in the robots meta and the
+//     X-Robots-Tag header, and is left out of sitemap.xml. It stays
+//     published and linked, like the placeholder pages it lists.
+//   - Once one of its experiences gets a real description it is indexable
+//     again, with no state kept here.
+//   - OPPLEVAGENT_PLACEHOLDER_NOINDEX="false" turns this off with the
+//     placeholder noindex itself (the count then includes every row).
+
+/**
+ * The verdict a /kommune or /tilbyder page, its X-Robots-Tag header and the
+ * sitemap use, from the number of indexable experiences the page lists:
+ * true = `noindex, follow` and not listed.
+ */
+export function shouldNoindexAggregatePage(indexableCount: number): boolean {
+  return isPlaceholderNoindexEnabled() && indexableCount < 1;
 }

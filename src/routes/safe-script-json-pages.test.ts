@@ -166,7 +166,7 @@ export async function runSafeScriptJsonPagesTests(opts: { log?: boolean } = {}):
       const db = dbFactory.getDb("experiences") as any;
       const router = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
 
-      // ── fixtures: the payload in titles, descriptions, names and places ──
+      // ── fixtures: the payload in titles, names and places ──
       const FYLKE = `Troms ${P}`;
       const KOMMUNE = `Tromsø ${P}`;
       const provId = expStore.createProvider({
@@ -177,7 +177,11 @@ export async function runSafeScriptJsonPagesTests(opts: { log?: boolean } = {}):
         const id = expStore.createExperience({
           title, provider_id: provId, provider_match_status: "matched",
           category: "dyreliv_safari", fylke: FYLKE, kommune: KOMMUNE,
-          description: `${title} — guidet tur med lokal tilbyder for små grupper hele året.`,
+          // Prose without the payload: a description holding it is a code
+          // artifact to isJunkDescription(), so the row would be a noindex
+          // placeholder, and the combo page counts only indexable rows
+          // (dev-request 2026-10-17-integrasjonstest-oppfolging, IDX-1).
+          description: "Guidet tur med lokal tilbyder for små grupper hele året.",
           price_from: price, price_unit: "per_person",
           loc_lat: at[0], loc_lon: at[1], geo_precision: "address",
           confidence: "high", verification_status: "verified",

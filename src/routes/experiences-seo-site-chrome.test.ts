@@ -153,7 +153,9 @@ function siteNavBlock(body: string): string {
 // experiences-seo-kategorimotiver.test.ts's seedPublishedExperience() already
 // proved renders live /fylke, /kommune and /kategori/:category/:kommune
 // pages. Returns the provider's row id (caller backfills + reads its slug
-// for the /tilbyder/<slug> URL).
+// for the /tilbyder/<slug> URL). The row has a real description: the combo
+// page counts indexable experiences only (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, IDX-1).
 function seedPublishedExperience(store: any, opts: { fylke: string; kommune: string; category: string; title: string }): string {
   const providerId = store.createProvider({
     navn: `${opts.title} AS`, fylke: opts.fylke, kommune: opts.kommune,
@@ -162,6 +164,7 @@ function seedPublishedExperience(store: any, opts: { fylke: string; kommune: str
   store.createExperience({
     title: opts.title, provider_id: providerId, provider_match_status: "matched",
     kommune: opts.kommune, fylke: opts.fylke,
+    description: `${opts.title} — guidet tur med lokal tilbyder og utstyr inkludert.`,
     category: opts.category, verification_status: "verified", confidence: "high",
   });
   return providerId;

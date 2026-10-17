@@ -153,6 +153,10 @@ export function runExperiencesSeoStedsetikettProdusentTests(opts: { log?: boolea
         assertTrue(r.body.includes("Ca. posisjon (kommune) – åpne i kart"),
           "approx-4: the OSM-link map-sub text is unchanged ('kommune' wording, not 'sted')");
         assertTrue(!/"latitude":62\.7661/.test(r.body), "approx-5: 'approximate' JSON-LD `geo` node is ABSENT (no fabricated precision)");
+        // dev-request 2026-10-17-integrasjonstest-oppfolging, SD-12: the
+        // experience page's card says «tilbyderen»; this one keeps «produsenten».
+        assertTrue(r.body.includes("siden vi bare vet hvilken kommune produsenten ligger i."),
+          "approx-6: the gårdssalg producer card names «produsenten»");
       }
 
       // ── (3) 'high' — unchanged, exact ───────────────────────────────────

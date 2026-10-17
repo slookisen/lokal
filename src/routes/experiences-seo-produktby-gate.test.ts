@@ -164,9 +164,11 @@ export function runExperiencesSeoProduktByGateTests(opts: { log?: boolean } = {}
       }
       setThreshold(undefined);
 
-      const one = { total: 1, providerCount: 1, minPriceFrom: null };
-      const two = { total: 2, providerCount: 2, minPriceFrom: null };
-      const three = { total: 3, providerCount: 1, minPriceFrom: 250 };
+      // Every experience indexable here; a cell with placeholders is covered
+      // by experiences-seo-indeks-tekst.test.ts (IDX-1).
+      const one = { total: 1, indexableTotal: 1, providerCount: 1, minPriceFrom: null };
+      const two = { total: 2, indexableTotal: 2, providerCount: 2, minPriceFrom: null };
+      const three = { total: 3, indexableTotal: 3, providerCount: 1, minPriceFrom: 250 };
       const matrix: Array<[string | undefined, [boolean, boolean, boolean]]> = [
         ["1", [true, true, true]],
         [undefined, [false, true, true]],
@@ -189,15 +191,15 @@ export function runExperiencesSeoProduktByGateTests(opts: { log?: boolean } = {}
       for (const value of ["1", undefined, "3"]) {
         setThreshold(value);
         const t = ix.produktByMinExperiences();
-        assertTrue(!ix.isProduktByCellIndexable({ total: 5, providerCount: 0, minPriceFrom: null }),
+        assertTrue(!ix.isProduktByCellIndexable({ total: 5, indexableTotal: 5, providerCount: 0, minPriceFrom: null }),
           `pb-a5: threshold ${t}: 5 experiences with no provider and no price (1 fact) → not indexable`);
-        assertTrue(!ix.isProduktByCellIndexable({ total: 0, providerCount: 1, minPriceFrom: 100 }),
+        assertTrue(!ix.isProduktByCellIndexable({ total: 0, indexableTotal: 0, providerCount: 1, minPriceFrom: 100 }),
           `pb-a6: threshold ${t}: an empty cell is never indexable`);
       }
       setThreshold(undefined);
-      assertTrue(ix.isProduktByCellIndexable({ total: 2, providerCount: 0, minPriceFrom: 0 }),
+      assertTrue(ix.isProduktByCellIndexable({ total: 2, indexableTotal: 2, providerCount: 0, minPriceFrom: 0 }),
         "pb-a7: a stated price of 0 kr is a real fact (2 experiences + price 0 → indexable)");
-      assertTrue(!ix.isProduktByCellIndexable({ total: 2, providerCount: 0, minPriceFrom: -1 }),
+      assertTrue(!ix.isProduktByCellIndexable({ total: 2, indexableTotal: 2, providerCount: 0, minPriceFrom: -1 }),
         "pb-a8: a negative price is not a fact, as in the FAQ builders (2 experiences + price -1 → not indexable)");
       assertTrue(ix.countProduktByRealFacts({ total: 2, providerCount: 1, minPriceFrom: 0 }) === 3
         && ix.countProduktByRealFacts({ total: 0, providerCount: 0, minPriceFrom: null }) === 0
@@ -231,7 +233,7 @@ export function runExperiencesSeoProduktByGateTests(opts: { log?: boolean } = {}
               const builders = faq !== null && opening !== null;
               const neither = faq === null && opening === null;
               if (ix.countProduktByRealFacts(stats) >= 2 ? !builders : !neither) factDrift++;
-              if (ix.isProduktByCellIndexable(stats) && !builders) gateDrift++;
+              if (ix.isProduktByCellIndexable({ ...stats, indexableTotal: total }) && !builders) gateDrift++;
             }
           }
         }
