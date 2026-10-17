@@ -39,7 +39,9 @@
  *      #1151), by mcpPrimaryKey with the routers' own session check — in
  *      parity with the real MCP chains over HTTP (RateLimit-Remaining, their
  *      stores, their 429s), and through installClientIp's default
- *      (isKnownToAnMcpRouter) with the real routers; covered_ms — a process
+ *      (isKnownToAnMcpRouter) with the real routers, which it reads only
+ *      while loaded and never loads — also in `npm test`, where earlier
+ *      suites have loaded them (review S1 of PR #1151); covered_ms — a process
  *      starting mid-window covers the rest of it only, two machines in one
  *      window count it once, the migration keeps old rows as full windows;
  *      the store's timer flush runs inside trackJob.
@@ -1379,11 +1381,23 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       );
       const routerFiles = MCP_ROUTER_SESSION_CHECKS.map((c) => require.resolve(path.join(middlewareDir, c.module)));
       const loaded = () => routerFiles.map((f) => f in require.cache);
-      const before = [Object.keys(require.cache).length, loaded()];
+      /**
+       * `ask` with no router loaded, as before a host's first /mcp (index.ts loads dental-mcp and experiences-mcp
+       * then): the three are swapped out of require.cache (tests/module-cache) and put back when `ask` returns. In
+       * `npm test` earlier suites have loaded all three, so "asking loads no module" held there whatever the check
+       * did (review S1 of PR #1151). `ask` is synchronous, so nothing else runs while they are out. Returns what
+       * `ask` returned, how many modules were loaded meanwhile and which routers are loaded after it.
+       */
+      const { withModulesSwappedOut } = require("../../tests/module-cache") as typeof import("../../tests/module-cache");
+      const withNoRouterLoaded = <T>(ask: () => T): [T, number, boolean[]] =>
+        withModulesSwappedOut(routerFiles, () => {
+          const size = Object.keys(require.cache).length;
+          return [ask(), Object.keys(require.cache).length - size, loaded()];
+        });
       assertEq(
-        [isKnownToAnMcpRouter(STALE_SID), Object.keys(require.cache).length, loaded()],
-        [false, ...before],
-        `I6: a UUID no router minted is not known, and asking loads no module (router modules loaded now: ${JSON.stringify(before[1])})`
+        withNoRouterLoaded(() => isKnownToAnMcpRouter(STALE_SID)),
+        [false, 0, [false, false, false]],
+        "I6: with no router loaded, a UUID is not known and asking loads no module — also in `npm test`, where earlier suites have loaded all three (review S1 of PR #1151)"
       );
 
       // The real routers: a session any of them minted is known, through each router's own map.
@@ -1399,18 +1413,24 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         method: "initialize",
         params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "client-ip-shadow-store-test", version: "1.0.0" } },
       };
-      // A client address of its own (TEST-NET-1, random): the routers' module-level chains are shared with other suites.
-      const FCI = `192.0.2.${1 + Math.floor(Math.random() * 254)}`;
+      // Client addresses of I6's own, fixed so every run sends the same requests (review S2 of PR #1151): the routers'
+      // module-level chains are shared with the rest of `npm test`, and no other suite sends TEST-NET-1 (192.0.2.0/24)
+      // through them (mcp-rate-limit-verticals draws from 100.64.0.0/10, the others come from the loopback). A chain
+      // keys a request on FCI behind installClientIp in enforce, and on its left-most X-Forwarded-For entry, one of
+      // SPOOFED (fanIn 3), where nothing rewrites the header (minting below).
+      const FCI = "192.0.2.61";
+      const SPOOFED = ["192.0.2.62", "192.0.2.63", "192.0.2.64"];
       let spoof = 0;
       const hdr = (sid?: string): Record<string, string> => ({
         Accept: MCP_ACCEPT,
         "Fly-Client-IP": FCI,
-        "X-Forwarded-For": flyXff(FCI, `203.0.113.${spoof++ % 3}`),
+        "X-Forwarded-For": flyXff(FCI, SPOOFED[spoof++ % SPOOFED.length]),
         ...(sid === undefined ? {} : { "Mcp-Session-Id": sid }),
       });
       __setDbAccessorFailureForTesting(new Error("I6: initialize, tools/list and a 404 read no DB"));
       try {
         const minted: Array<[string, boolean, boolean]> = [];
+        const sids: string[] = [];
         for (const [name, router] of Object.entries(routers)) {
           const app = express();
           app.set("trust proxy", true);
@@ -1420,6 +1440,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           try {
             const res = await httpRequest(srv.port, "POST", "/mcp", hdr(), INIT);
             const sid = String(res.headers["mcp-session-id"] ?? "");
+            sids.push(sid);
             minted.push([name, res.status === 200 && /^[0-9a-f-]{36}$/.test(sid), isKnownToAnMcpRouter(sid)]);
           } finally {
             await srv.close();
@@ -1429,6 +1450,12 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           [minted, isKnownToAnMcpRouter(randomUUID())],
           [[["rfb", true, true], ["experiences", true, true], ["dental", true, true]], false],
           "I6: a session each real router minted on initialize is known to isKnownToAnMcpRouter; a fresh UUID is not"
+        );
+        const knownNow = () => sids.map((sid) => isKnownToAnMcpRouter(sid));
+        assertEq(
+          [withNoRouterLoaded(knownNow), knownNow()],
+          [[[false, false, false], 0, [false, false, false]], [true, true, true]],
+          "I6: with the three routers out of require.cache, none of the sessions they minted is known and asking loads none of them back; put back, all three are known again — the check reads the routers loaded at each call (review S1 of PR #1151)"
         );
 
         // End to end: installClientIp's default in enforce in front of the real Opplevagent router and its own chain.
