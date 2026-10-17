@@ -35834,6 +35834,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agents-recently-enriched: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── orch-pr-20261017-dental-places-aldri-forsokte: google-places-batch selection order ──");
+  try {
+    const { runDentalPlacesBatchOrderTests } = require("../src/routes/dental-places-batch-order.test") as
+      typeof import("../src/routes/dental-places-batch-order.test");
+    const dpo = await runDentalPlacesBatchOrderTests({ log: false });
+    passed += dpo.passed;
+    failed += dpo.failed;
+    for (const f of dpo.failures) failures.push("dental-places-batch-order: " + f);
+    console.log(`  dental-places-batch-order: ${dpo.passed} passed, ${dpo.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-places-batch-order: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── orch-pr-20260719-dental-field-provenance: PUT /api/tannlege/agents/:id merges field_provenance ──");
   try {
     const { runDentalAgentPutFieldProvenanceTests } = require("../src/routes/dental-agent-put-field-provenance.test") as

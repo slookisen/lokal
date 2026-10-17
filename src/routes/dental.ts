@@ -1101,6 +1101,8 @@ router.post(
     } else {
       // Auto-select rows that NEED Places help. Priority: missing homepage
       // first (the key unlock), then missing addr/phone/opening_hours.
+      // Rows never attempted come before any retry (retries oldest first),
+      // so an expired no-retry window cannot put old A-names ahead of them.
       // Restricted to the enrichment states that can still benefit and
       // never rejected.
       rows = db
@@ -1123,10 +1125,12 @@ router.post(
                  OR places_attempted_at < datetime('now', '-${PLACES_NO_RETRY_DAYS} days')
               )
             ORDER BY
+              CASE WHEN places_attempted_at IS NULL THEN 0 ELSE 1 END ASC,
               CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
               CASE WHEN (adresse IS NULL OR adresse = '')
                      OR (telefon IS NULL OR telefon = '')
                      OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
+              COALESCE(places_attempted_at, '') ASC,
               navn ASC
             LIMIT ?`
         )
