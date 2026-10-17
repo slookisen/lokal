@@ -27324,14 +27324,17 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
 }
 
 // pr116-03: listPoststeder mot :memory:-DB
-{
+// dev-request 2026-10-17-dental-d3-rettelser (D3-0): pr116-03..05 lastet en
+// dental-db-init-modul som ikke finnes, og catch-grenen hoppet over alle tre
+// blokkene (også på main). Nå egen DB via db-factory, som pr114-04 over
+// (getDb("dental") lager skjemaet selv), og en feil gir rødt i stedet for skip.
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
+  const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory.__resetDbFactoryForTesting();
 
   try {
-    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
-    initDentalDb();
-
     const { createDentalAgent } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
     const { listPoststeder } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
 
@@ -27363,28 +27366,23 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
     assertTrue(rows[0]?.poststed === "OSLO", "pr116-03g: OSLO er øverst (høyest count)");
 
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
-    if (isDbErr) {
-      console.log("  [pr116-03] dental DB ikke tilgjengelig — skipping");
-    } else {
-      assertTrue(false, `pr116-03: uventet feil: ${msg}`);
-    }
+    assertTrue(false, `pr116-03: uventet feil: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
     else delete process.env.DENTAL_DB_PATH;
+    dbFactory.__resetDbFactoryForTesting();
   }
-}
+});
 
 // pr116-04: listRelatedClinics — ekskluderer seg selv + rejected
-{
+// (egen DB og hard feil som pr116-03, D3-0)
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
+  const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory.__resetDbFactoryForTesting();
 
   try {
-    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
-    initDentalDb();
-
     const { createDentalAgent, getDentalAgentByOrgnr } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
     const { listRelatedClinics } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
 
@@ -27405,28 +27403,23 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
     assertTrue(!related.some((r) => r.id === hoved!.id), "pr116-04e: hoved-klinikk ikke i related");
 
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
-    if (isDbErr) {
-      console.log("  [pr116-04] dental DB ikke tilgjengelig — skipping");
-    } else {
-      assertTrue(false, `pr116-04: uventet feil: ${msg}`);
-    }
+    assertTrue(false, `pr116-04: uventet feil: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
     else delete process.env.DENTAL_DB_PATH;
+    dbFactory.__resetDbFactoryForTesting();
   }
-}
+});
 
 // pr116-05: poststed-filter i listPublicDentalAgents
-{
+// (egen DB og hard feil som pr116-03, D3-0)
+withFreshModules(["../src/database/db-factory", "../src/services/dental-store"], () => {
   const prevPath = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
+  const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory.__resetDbFactoryForTesting();
 
   try {
-    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
-    initDentalDb();
-
     const { createDentalAgent, listPublicDentalAgents, countPublicDentalAgents } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
 
     createDentalAgent({ navn: "Stavanger A AS", org_nr: "940000001", poststed: "STAVANGER", fylke: "Rogaland", verification_status: "pending_verify" });
@@ -27444,18 +27437,13 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
     assertEq(sandnes.length, 1, "pr116-05d: SANDNES gir 1 klinikk");
 
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
-    if (isDbErr) {
-      console.log("  [pr116-05] dental DB ikke tilgjengelig — skipping");
-    } else {
-      assertTrue(false, `pr116-05: uventet feil: ${msg}`);
-    }
+    assertTrue(false, `pr116-05: uventet feil: ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
     else delete process.env.DENTAL_DB_PATH;
+    dbFactory.__resetDbFactoryForTesting();
   }
-}
+});
 
 
 // ── PR-127: opening_hours normalization (tolerant ingest) ────────────────────
