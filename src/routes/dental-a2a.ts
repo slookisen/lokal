@@ -38,6 +38,7 @@ import {
   type DentalSearchTolkning,
 } from "../services/dental-query-parser";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+import { tokenize } from "../services/search-intent/norwegian-query";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
@@ -99,13 +100,27 @@ function extractText(msg: unknown): string | null {
 // MCP tannlege_search and /sok use. The keyword matcher below
 // (legacyParseIntent) stays as the rollback (DENTAL_QUERY_PARSER_DISABLED=1)
 // and as the old reading planDentalSearch keeps next to the parsed one: its
-// hits stay in the result and come first, so no message finds fewer clinics.
+// hits stay in the result and come first, so no message finds fewer clinics
+// than the matcher does (since D3c2 it reads a fylke only from whole words).
 
 const FYLKER = [
   "oslo", "akershus", "østfold", "buskerud", "innlandet", "vestfold",
   "telemark", "agder", "rogaland", "vestland", "møre og romsdal",
   "trøndelag", "nordland", "troms", "finnmark",
 ];
+
+// D3c2 (dev-request 2026-10-17-dental-d3-rettelser): a fylke counts only
+// when its words stand as whole words in the text, so «Tromsø», «Tromso»
+// and «Tromsdalen» are no longer fylke Troms (they go to q), while «Troms»,
+// «Nord-Troms» and «Vest-Agder» still are. Whole words by the parser's
+// tokenize (hyphen and punctuation split), not a \b regex: JS doesn't count
+// ø as a word character, so /\btroms\b/ would still match inside «Tromsø».
+const FYLKE_WORDS = FYLKER.map((f) => ({ f, words: tokenize(f) }));
+
+/** Whether `words` stand in `tokens` as one run of whole tokens. */
+function hasWords(tokens: readonly string[], words: readonly string[]): boolean {
+  return tokens.some((_, i) => words.every((w, j) => tokens[i + j] === w));
+}
 
 const SPECIALTIES = [
   "kjeveortopedi", "oral kirurgi", "oral medisin", "periodonti",
@@ -126,9 +141,10 @@ function legacyParseIntent(text: string): DentalSearchParams {
   const lower = text.toLowerCase();
   const params: DentalSearchParams = {};
 
-  // Fylke detection
-  for (const f of FYLKER) {
-    if (lower.includes(f)) {
+  // Fylke detection (whole words, see FYLKE_WORDS)
+  const tokens = tokenize(text);
+  for (const { f, words } of FYLKE_WORDS) {
+    if (hasWords(tokens, words)) {
       params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
       break;
     }
