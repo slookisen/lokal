@@ -71,6 +71,7 @@ import crypto from "crypto";
 import type { Application, NextFunction, Request, Response } from "express";
 import { ipKeyGenerator } from "express-rate-limit";
 import { aiAssistantVendor, classifyUA } from "../services/traffic-classifier";
+import { stripLangPrefix } from "../i18n/t";
 import {
   createClientIpShadowStore,
   type ClientIpShadowStore,
@@ -317,7 +318,10 @@ type PathClass = "api" | "a2a" | "mcp" | "other";
 
 interface TopEntry {
   n: number;
+  /** The top list's path split (log line and window). */
   paths: Record<PathClass, number>;
+  /** Requests per AC2_FANIN_LIMITS limiter (ac2LimitersFor): what the fanIn criterion rates. */
+  limits: Record<Ac2FanInLimiter, number>;
   legacy: Set<string>;
   ua: Map<string, number>;
 }
@@ -401,14 +405,71 @@ export interface ClientIpStatsLine extends ClientIpCounters {
 // ─── AC2, the shadow gate before trinn 2 (trinn 1c) ─────────────────────
 
 /**
- * AC2's "smallest limit" per path class for the fanIn criterion, per 15 min
- * (the top list's span), all anonymous ceilings: /api generalLimiter 300 and
- * /a2a jsonRpcLimiter 200 (security.ts), MCP the primary limiter's 200
- * (mcp-rate-limit.ts). /mcp counts every /mcp request, an upper bound of the
- * `initialize` calls that 200 keys on the IP. Class `other` is not rated, as
- * in AC2. Pinned against the limiter sources by client-ip-shadow-store.test.ts.
+ * The limits behind AC2's fanIn criterion ("no top key with fanIn > 1 at
+ * ≥ 80 % of its smallest limit"): every IP-keyed limiter with a 15-min
+ * window (the top list's span), at its anonymous ceiling. One limiter
+ * instance keeps one count per key on every path it is mounted on, so a key
+ * is rated per limiter, not per path (review B1 of PR #1130):
+ *   general  generalLimiter 300 (security.ts): /api except /api/tannlege*,
+ *            /ut and /reise (index.ts), /sok (seo.ts, experiences-seo.ts).
+ *   search   searchLimiter 150: /api/marketplace/search and /discover,
+ *            which generalLimiter counts as well.
+ *   a2a      jsonRpcLimiter 200: /a2a on rettfrabonden.com and opplevagent.no.
+ *   dental   dentalLimiter 1000: /api/tannlege and /a2a on finn-tannlege.com
+ *            (dental-a2a.ts).
+ *   mcp      the smallest MCP primary ceiling, 200 (mcp-rate-limit.ts), per
+ *            vertical; every /mcp request counts, an upper bound of the
+ *            `initialize` calls it keys on the IP.
+ * ac2LimitersFor maps a path to them. Not rated: the limiters with another
+ * window — registrationLimiter and consumerKeyIssuanceLimiter (50 an hour),
+ * cartWishesLimiter and the MCP sideEffect quota (20 a minute),
+ * resendWebhookLimiter (120 a minute, Svix only), adminLimiter (500 an hour,
+ * admin key) — and the MCP brake (3 000, above every primary). A key near one
+ * of those does not fail the criterion.
+ * Pinned against the limiter sources and mounts by client-ip-shadow-store.test.ts.
  */
-export const AC2_FANIN_LIMITS = { api: 300, a2a: 200, mcp: 200 } as const;
+export const AC2_FANIN_LIMITS = { general: 300, search: 150, a2a: 200, dental: 1000, mcp: 200 } as const;
+
+export type Ac2FanInLimiter = keyof typeof AC2_FANIN_LIMITS;
+
+const AC2_FANIN_LIMITERS = Object.keys(AC2_FANIN_LIMITS) as Ac2FanInLimiter[];
+
+/** `path` is `mount` or below it, segment-wise, as an Express mount matches. */
+const under = (path: string, mount: string): boolean => path === mount || path.startsWith(mount + "/");
+
+/**
+ * The AC2_FANIN_LIMITS limiters a request to `path` (req.path here) counts
+ * against, as the limiter mounts see it: after langMiddleware's /en and /sv
+ * strip (it runs after this middleware), matched like Express matches a
+ * mount or a route (case-insensitive, whole segments, an optional trailing
+ * slash), with generalLimiter's own case-sensitive /api/tannlege skip.
+ * The host gates are not mirrored (this runs before them), so a path that
+ * reaches a limiter on some host counts against it on every host: /ut,
+ * /reise and /sok as general, /a2a against both jsonRpcLimiter and
+ * dentalLimiter, /mcp summed over the verticals' own chains. Each count is
+ * thus at least the key's count in that limiter, never below it: the
+ * criterion may fail early, but never passes a key at 80 % of a rated limiter.
+ * Exported for client-ip-shadow-store.test.ts.
+ */
+export function ac2LimitersFor(path: string): Ac2FanInLimiter[] {
+  const p = stripLangPrefix(path);
+  const lower = p.toLowerCase();
+  const out: Ac2FanInLimiter[] = [];
+  if (
+    (under(lower, "/api") && !p.startsWith("/api/tannlege")) ||
+    under(lower, "/ut") ||
+    under(lower, "/reise") ||
+    lower === "/sok" ||
+    lower === "/sok/"
+  ) {
+    out.push("general");
+  }
+  if (under(lower, "/api/marketplace/search") || under(lower, "/api/marketplace/discover")) out.push("search");
+  if (under(lower, "/a2a")) out.push("a2a", "dental");
+  else if (under(lower, "/api/tannlege")) out.push("dental");
+  if (under(lower, "/mcp")) out.push("mcp");
+  return out;
+}
 
 /** AC2 in the dev-request's `## Acceptance criteria`. */
 export const AC2_THRESHOLDS = {
@@ -424,16 +485,22 @@ export const AC2_THRESHOLDS = {
 
 /** A closed window's largest fanIn ratio: of the 15-min top keys with fanIn > 1, the one closest to a limit. */
 export interface ClientIpWindowFanIn {
-  /** The key's requests in `class` over the 15-min top list / AC2_FANIN_LIMITS[class]. */
+  /** The key's requests counted against limiter `class` over the 15-min top list / AC2_FANIN_LIMITS[class]. */
   ratio: number;
-  class: keyof typeof AC2_FANIN_LIMITS;
+  /** The limiter (AC2_FANIN_LIMITS key) it is closest to. */
+  class: Ac2FanInLimiter;
   /** Distinct legacy keys behind it, capped at 8. */
   fanIn: number;
   /** Its traffic-classifier family, as ClientIpTopKey.ua: tells a known AI egress apart. */
   ua: string;
 }
 
-/** `clientIp.cumulative`: every window stored in the main DB, across deploys (14-day retention). */
+/**
+ * `clientIp.cumulative`: every shadow window stored in the main DB, across
+ * deploys (14-day retention). Windows a process stored in another mode
+ * (CLIENT_IP_MODE=enforce, or after trinn 2) are kept but not summed: AC2 is
+ * the shadow gate (review S2 of PR #1130).
+ */
 export interface ClientIpCumulative {
   /** Start of the oldest stored window; null while none is stored. */
   since: string | null;
@@ -448,6 +515,12 @@ export interface ClientIpCumulative {
   counters: ClientIpCounters;
   /** The largest stored per-window fanIn ratio, with its window; null when no top key ever had fanIn > 1. */
   fanin_max: (ClientIpWindowFanIn & { window_start: string }) | null;
+  /**
+   * For the two "= 0" criteria a human may explain instead (AC2: "= 0 or
+   * explained"; review S3 of PR #1130): the stored rows with a count > 0, and
+   * the newest such window's start (null when none).
+   */
+  nonzero_windows: ClientIpStoredTotals["nonzero"];
   /** This process's writer: tells "nothing stored yet" from "writes failing". */
   writer: ClientIpShadowWriterStats;
 }
@@ -512,6 +585,7 @@ function cumulativeFrom(t: ClientIpStoredTotals, writer: ClientIpShadowWriterSta
     hours_covered: (t.windows * STATS_WINDOW_MS) / 3_600_000,
     counters: t.counters,
     fanin_max: t.fanInMax,
+    nonzero_windows: t.nonzero,
     writer,
   };
 }
@@ -540,7 +614,7 @@ export interface ClientIpOpsSnapshot {
    */
   window: ClientIpStatsLine | null;
   /**
-   * Trinn 1c: every window stored in the main DB, so AC2 survives deploys.
+   * Trinn 1c: every shadow window stored in the main DB, so AC2 survives deploys.
    * null without a store (off Fly, or a test that passes none); { error } when
    * the DB read failed (the rest of the snapshot still answers).
    */
@@ -637,14 +711,28 @@ function mainUa(e: TopEntry): string {
   return [...e.ua.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "none";
 }
 
-/** Of the merged 15-min top keys with fanIn > 1, the one closest to its AC2_FANIN_LIMITS limit (first wins a tie); null if none. */
+function newTopEntry(): TopEntry {
+  return {
+    n: 0,
+    paths: { api: 0, a2a: 0, mcp: 0, other: 0 },
+    limits: { general: 0, search: 0, a2a: 0, dental: 0, mcp: 0 },
+    legacy: new Set(),
+    ua: new Map(),
+  };
+}
+
+/**
+ * Of the merged 15-min top keys with fanIn > 1, the one closest to one of
+ * its limiters: its largest count / AC2_FANIN_LIMITS over every limiter, so
+ * its smallest limit relative to its traffic (first wins a tie); null if none.
+ */
 function fanInMax(merged: Map<string, TopEntry>): ClientIpWindowFanIn | null {
   let best: ClientIpWindowFanIn | null = null;
   for (const e of merged.values()) {
     if (e.legacy.size <= 1) continue;
-    for (const cls of ["api", "a2a", "mcp"] as const) {
-      const ratio = e.paths[cls] / AC2_FANIN_LIMITS[cls];
-      if (ratio > 0 && (best === null || ratio > best.ratio)) best = { ratio, class: cls, fanIn: e.legacy.size, ua: mainUa(e) };
+    for (const limiter of AC2_FANIN_LIMITERS) {
+      const ratio = e.limits[limiter] / AC2_FANIN_LIMITS[limiter];
+      if (ratio > 0 && (best === null || ratio > best.ratio)) best = { ratio, class: limiter, fanIn: e.legacy.size, ua: mainUa(e) };
     }
   }
   return best;
@@ -708,11 +796,12 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
       for (const [key, e] of win.top) {
         let m = merged.get(key);
         if (!m) {
-          m = { n: 0, paths: { api: 0, a2a: 0, mcp: 0, other: 0 }, legacy: new Set(), ua: new Map() };
+          m = newTopEntry();
           merged.set(key, m);
         }
         m.n += e.n;
         for (const p of ["api", "a2a", "mcp", "other"] as const) m.paths[p] += e.paths[p];
+        for (const l of AC2_FANIN_LIMITERS) m.limits[l] += e.limits[l];
         for (const l of e.legacy) addCapped(m.legacy, l, FANIN_CAP);
         for (const [u, c] of e.ua) m.ua.set(u, (m.ua.get(u) ?? 0) + c);
       }
@@ -763,7 +852,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     let ac2: ClientIpAc2 | null = null;
     if (store) {
       try {
-        const c = cumulativeFrom(store.totals(), store.writerStats());
+        const c = cumulativeFrom(store.totals("shadow"), store.writerStats());
         cumulative = c;
         ac2 = evaluateClientIpAc2(c);
       } catch {
@@ -865,12 +954,14 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
 
       let entry = w.top.get(fciKey);
       if (!entry && w.top.size < TOP_CAP) {
-        entry = { n: 0, paths: { api: 0, a2a: 0, mcp: 0, other: 0 }, legacy: new Set(), ua: new Map() };
+        entry = newTopEntry();
         w.top.set(fciKey, entry);
       }
       if (entry) {
         entry.n++;
-        entry.paths[pathClass(typeof req.path === "string" ? req.path : "")]++;
+        const reqPath = typeof req.path === "string" ? req.path : "";
+        entry.paths[pathClass(reqPath)]++;
+        for (const l of ac2LimitersFor(reqPath)) entry.limits[l]++;
         addCapped(entry.legacy, legacyKey, FANIN_CAP);
         const family = uaFamily(req.headers["user-agent"]);
         entry.ua.set(family, (entry.ua.get(family) ?? 0) + 1);

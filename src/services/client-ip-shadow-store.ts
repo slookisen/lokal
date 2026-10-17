@@ -6,8 +6,9 @@
 // on every deploy (about ten on 2026-10-17), so the shadow gate AC2 (≥48 h,
 // ≥5 000 requests) could not be read off any one process. This module keeps
 // every closed window in `client_ip_shadow_windows` (database/init.ts), one
-// row per machine per window, and sums the rows for `clientIp.cumulative` and
-// `clientIp.ac2` in GET /admin/analytics/ops/event-loop.
+// row per machine per window, and sums the rows of one mode (the reader asks
+// for shadow) for `clientIp.cumulative` and `clientIp.ac2` in
+// GET /admin/analytics/ops/event-loop.
 //
 // Request path: enqueue() only pushes the closed window's plain numbers onto
 // a bounded array (O(1), never throws, never touches the DB). A short unref'd
@@ -18,8 +19,8 @@
 // per machine — whatever the clock does; UNIQUE (machine, window_start) is
 // the DB-side guard.
 //
-// A row holds counters, the window's largest fanIn ratio (path class, fanIn
-// and traffic-classifier family of that key), the mode and the machine name.
+// A row holds counters, the window's largest fanIn ratio (limiter, fanIn and
+// traffic-classifier family of that key), the mode and the machine name.
 // No IP, no key, no hash.
 
 import os from "os";
@@ -43,7 +44,13 @@ export interface ClientIpWindowRecord {
   fanIn: ClientIpWindowFanIn | null;
 }
 
-/** Sums over every stored row: every deploy, every machine that wrote to this DB (one volume, so in practice one). */
+/** Rows of one mode with a count > 0, and the newest such row's window_start (null when none). */
+export interface ClientIpNonzeroWindows {
+  windows: number;
+  last: string | null;
+}
+
+/** Sums over every stored row of one mode: every deploy, every machine that wrote to this DB (one volume, so in practice one). */
 export interface ClientIpStoredTotals {
   /** Stored rows (one per machine per window). */
   rows: number;
@@ -56,6 +63,8 @@ export interface ClientIpStoredTotals {
   counters: ClientIpCounters;
   /** The row with the largest fanIn ratio; null when none had one. */
   fanInMax: (ClientIpWindowFanIn & { window_start: string }) | null;
+  /** Rows with top_overflow > 0, and with fallback invalid + non_public > 0. */
+  nonzero: { top_overflow: ClientIpNonzeroWindows; invalid_non_public: ClientIpNonzeroWindows };
 }
 
 /** This process's writer, so "no rows yet" and "writes failing" can be told apart. */
@@ -75,8 +84,8 @@ export interface ClientIpShadowStore {
   enqueue(rec: ClientIpWindowRecord): void;
   /** Timer (or a test): writes the queue, prunes when due. Never throws. Returns rows written. */
   flush(): number;
-  /** Ops read; throws when the DB read fails (the caller reports it). */
-  totals(): ClientIpStoredTotals;
+  /** Ops read over the rows stored in `mode`; throws when the DB read fails (the caller reports it). */
+  totals(mode: ClientIpMode): ClientIpStoredTotals;
   writerStats(): ClientIpShadowWriterStats;
   /** Stops the timer (tests). Queued windows stay queued. */
   stop(): void;
@@ -124,13 +133,20 @@ const INSERT_COLUMNS = [
 ];
 const INSERT_SQL = `INSERT OR IGNORE INTO client_ip_shadow_windows (${INSERT_COLUMNS.join(", ")}) VALUES (${INSERT_COLUMNS.map(() => "?").join(", ")})`;
 
+// The "= 0 or explained" criteria (evaluateClientIpAc2), as [name, SQL condition on a row].
+const NONZERO_CONDITIONS = [
+  ["top_overflow", "top_overflow > 0"],
+  ["invalid_non_public", "fallback_invalid + fallback_non_public > 0"],
+] as const;
+
 const TOTALS_SQL = `SELECT COUNT(*) AS rows_, COUNT(DISTINCT window_start) AS windows_, COUNT(DISTINCT machine) AS machines_,
   MIN(window_start) AS first_, MAX(window_start) AS last_,
-  ${COUNTER_COLUMNS.map(([col]) => `COALESCE(SUM(${col}), 0) AS ${col}`).join(", ")}
-  FROM client_ip_shadow_windows`;
+  ${COUNTER_COLUMNS.map(([col]) => `COALESCE(SUM(${col}), 0) AS ${col}`).join(", ")},
+  ${NONZERO_CONDITIONS.map(([name, cond]) => `COALESCE(SUM(${cond}), 0) AS nz_${name}_, MAX(CASE WHEN ${cond} THEN window_start END) AS nz_${name}_last_`).join(", ")}
+  FROM client_ip_shadow_windows WHERE mode = ?`;
 
 const FANIN_MAX_SQL = `SELECT window_start, fanin_ratio, fanin_class, fanin_fan_in, fanin_ua FROM client_ip_shadow_windows
-  WHERE fanin_ratio IS NOT NULL ORDER BY fanin_ratio DESC, window_start DESC LIMIT 1`;
+  WHERE mode = ? AND fanin_ratio IS NOT NULL ORDER BY fanin_ratio DESC, window_start DESC LIMIT 1`;
 
 function countersFromRow(r: Record<string, number>): ClientIpCounters {
   return {
@@ -240,10 +256,10 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
     return written;
   }
 
-  function totals(): ClientIpStoredTotals {
+  function totals(mode: ClientIpMode): ClientIpStoredTotals {
     const db = resolveDb();
-    const r = db.prepare(TOTALS_SQL).get() as Record<string, any>;
-    const m = db.prepare(FANIN_MAX_SQL).get() as
+    const r = db.prepare(TOTALS_SQL).get(mode) as Record<string, any>;
+    const m = db.prepare(FANIN_MAX_SQL).get(mode) as
       | { window_start: string; fanin_ratio: number; fanin_class: ClientIpWindowFanIn["class"]; fanin_fan_in: number; fanin_ua: string }
       | undefined;
     return {
@@ -256,6 +272,10 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
       fanInMax: m
         ? { ratio: m.fanin_ratio, class: m.fanin_class, fanIn: m.fanin_fan_in, ua: m.fanin_ua, window_start: m.window_start }
         : null,
+      nonzero: {
+        top_overflow: { windows: r.nz_top_overflow_, last: r.nz_top_overflow_last_ ?? null },
+        invalid_non_public: { windows: r.nz_invalid_non_public_, last: r.nz_invalid_non_public_last_ ?? null },
+      },
     };
   }
 

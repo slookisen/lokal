@@ -15,8 +15,10 @@
  *      enqueue is called there); each stored row equals the logged
  *      client_ip_stats line of its window; at most 12 rows an hour whatever
  *      the clock does; a restart (new process, new DB connection) reads the
- *      old windows and keeps summing; the per-window fanIn ratio; legacy
- *      stores nothing but still reads.
+ *      old windows and keeps summing; the per-window fanIn ratio, rated per
+ *      limiter the way each limiter counts (ac2LimitersFor; review B1 of PR
+ *      #1130); legacy stores nothing but still reads; only shadow rows are
+ *      summed (C8); the windows behind an "= 0 or explained" criterion (C9).
  *   D  evaluateClientIpAc2: every criterion at its exact threshold, each one
  *      alone flipping `ready`, nothing measured → not ready.
  *   E  end to end: 575 stored windows (47.9 h) → ac2.ready false on
@@ -26,7 +28,8 @@
  *      { error: "read_failed" } and the rest still answers.
  *   G  installClientIp: off Fly no store (no DB at all); on Fly the main-DB
  *      store by default.
- *   H  AC2_FANIN_LIMITS pinned against the limiter sources.
+ *   H  AC2_FANIN_LIMITS pinned against the limiter sources, ac2LimitersFor
+ *      against every place the four 15-min limiters are applied.
  *
  * Own in-memory / temp-file DBs, injected clocks, no timers except B's one
  * short unref'd timer (stopped). The DB-accessor failure hook and the
@@ -42,6 +45,7 @@ import os from "os";
 import path from "path";
 import {
   AC2_FANIN_LIMITS,
+  ac2LimitersFor,
   AC2_THRESHOLDS,
   createClientIpMiddleware,
   evaluateClientIpAc2,
@@ -91,6 +95,7 @@ const COLUMNS = [
   "xff_client_supplied", "agree_fci_edge_n", "agree_fci_edge_agree", "agree_legacy_eq_fci_n", "agree_legacy_eq_fci_agree",
   "would_trip", "top_overflow", "fanin_ratio", "fanin_class", "fanin_fan_in", "fanin_ua", "created_at",
 ];
+const NO_NONZERO_WINDOWS = { top_overflow: { windows: 0, last: null }, invalid_non_public: { windows: 0, last: null } };
 const CRITERIA = [
   "hours_covered", "requests", "fallback_beyond_health_checks", "invalid_non_public", "agree_fci_edge",
   "agree_legacy_eq_fci", "would_trip", "fanin_limit_ratio", "top_overflow",
@@ -251,11 +256,16 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         ],
         "B1: one row per window: start, machine, mode, counters, fanIn (null when none), write time"
       );
-      const t = s.store.totals();
+      const t = s.store.totals("shadow");
       assertEq(
         [t.rows, t.windows, t.machines, t.first, t.last, t.counters, t.fanInMax],
         [2, 2, 1, iso(T0), iso(T0 + W), counters(3), { ratio: 0.25, class: "a2a", fanIn: 3, ua: "ai_search:claude", window_start: iso(T0 + W) }],
         "B2: totals sum every counter field by field (1× + 2× = 3×) and give the largest fanIn row"
+      );
+      assertEq(
+        t.nonzero,
+        { top_overflow: { windows: 2, last: iso(T0 + W) }, invalid_non_public: { windows: 2, last: iso(T0 + W) } },
+        "B2: … and, for the two \"= 0 or explained\" criteria, how many rows had any and the newest one"
       );
       s.store.enqueue(rec(T0 + W));
       s.store.enqueue(rec(T0));
@@ -279,7 +289,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       b.store.enqueue(rec(T0, 5));
       other.store.enqueue(rec(T0, 2));
       assertEq([a.store.flush(), b.store.flush(), other.store.flush()], [1, 0, 1], "B5: UNIQUE (machine, window_start): the same machine's same window is written once");
-      const t = a.store.totals();
+      const t = a.store.totals("shadow");
       assertEq([t.rows, t.windows, t.machines, t.counters.n], [2, 1, 2, 3000], "B5: two machines, one window: 2 rows, 1 distinct window, 2 machines");
       assertEq([b.store.writerStats().persisted, b.store.writerStats().errors], [0, 0], "B5: the ignored duplicate is neither persisted nor an error (INSERT OR IGNORE)");
       const c = rig(SHADOW, a.store).mw.opsSnapshot().cumulative as ClientIpCumulative;
@@ -305,7 +315,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       try { n.store.flush(); } catch { threw2 = true; }
       assertEq([threw2, n.store.writerStats().errors >= 1, n.store.writerStats().dropped], [false, true, 1], "B6: no table (migration failed): flush never throws, counts the error");
       let totalsThrew = false;
-      try { n.store.totals(); } catch { totalsThrew = true; }
+      try { n.store.totals("shadow"); } catch { totalsThrew = true; }
       assertTrue(totalsThrew, "B6: totals() throws on a failed read (the snapshot reports it as read_failed)");
       const clockThrows = storeOn(db, { now: () => { throw new Error("clock"); } });
       clockThrows.store.enqueue(rec(T0));
@@ -369,7 +379,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       const spy: ClientIpShadowStore = {
         enqueue: (r) => { if (inRequest) calledInRequest.push("enqueue"); s.store.enqueue(r); },
         flush: () => { if (inRequest) calledInRequest.push("flush"); return s.store.flush(); },
-        totals: () => { if (inRequest) calledInRequest.push("totals"); return s.store.totals(); },
+        totals: (mode) => { if (inRequest) calledInRequest.push("totals"); return s.store.totals(mode); },
         writerStats: () => { if (inRequest) calledInRequest.push("writerStats"); return s.store.writerStats(); },
         stop: () => { if (inRequest) calledInRequest.push("stop"); s.store.stop(); },
       };
@@ -411,7 +421,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       s.store.flush();
       const line = JSON.parse(r.lines[0] ?? "{}");
       const row = db.prepare("SELECT * FROM client_ip_shadow_windows").get() as any;
-      const fromRow = s.store.totals().counters;
+      const fromRow = s.store.totals("shadow").counters;
       const fromLine: ClientIpCounters = {
         n: line.n, fci_valid: line.fci_valid, fallback: line.fallback, fallback_hc: line.fallback_hc, errors: line.errors,
         xff_client_supplied: line.xff_client_supplied, agree_fci_edge: line.agree_fci_edge, agree_legacy_eq_fci: line.agree_legacy_eq_fci,
@@ -512,7 +522,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       db.close();
     }
     {
-      // C7: the per-window fanIn ratio — a top key with fanIn > 1, its requests per class over the 15-min top list / the smallest limit.
+      // C7: the per-window fanIn ratio — a top key with fanIn > 1, its requests per limiter over the 15-min top list / that limit.
       const db = freshDb();
       const s = storeOn(db);
       const r = rig(SHADOW, s.store);
@@ -540,17 +550,17 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       assertEq(
         rows,
         [
-          [iso(T0), 0.333333, "api", 2, "ai_search:chatgpt"],
-          [iso(T0 + W), 0.8, "api", 2, "ai_search:chatgpt"],
-          [iso(T0 + 2 * W), 0.8, "api", 2, "ai_search:chatgpt"],
-          [iso(T0 + 3 * W), 0.466667, "api", 2, "ai_search:chatgpt"],
+          [iso(T0), 0.333333, "general", 2, "ai_search:chatgpt"],
+          [iso(T0 + W), 0.8, "general", 2, "ai_search:chatgpt"],
+          [iso(T0 + 2 * W), 0.8, "general", 2, "ai_search:chatgpt"],
+          [iso(T0 + 3 * W), 0.466667, "general", 2, "ai_search:chatgpt"],
           [iso(T0 + 4 * W), 0.3, "mcp", 2, "ai_search:chatgpt"],
           [iso(T0 + 5 * W), null, null, null, null],
         ],
         "C7: per window, the 15-min top list's largest requests/limit of a fanIn > 1 key (/api 100 → 240 → 240 of 300, 140 as the first window leaves, then /mcp 60 of 200); a fanIn 1 key (290 /api) is never rated"
       );
       const snap = r.mw.opsSnapshot();
-      assertEq(cum(snap).fanin_max, { ratio: 0.8, class: "api", fanIn: 2, ua: "ai_search:chatgpt", window_start: iso(T0 + 2 * W) }, "C7: cumulative.fanin_max is the largest stored (newest on a tie), with its class, fanIn and UA family");
+      assertEq(cum(snap).fanin_max, { ratio: 0.8, class: "general", fanIn: 2, ua: "ai_search:chatgpt", window_start: iso(T0 + 2 * W) }, "C7: cumulative.fanin_max is the largest stored (newest on a tie), with its class, fanIn and UA family");
       assertEq(snap.ac2?.criteria.fanin_limit_ratio, { value: 0.8, threshold: 0.8, op: "<", pass: false }, "C7: a fanIn > 1 key at 80 % of its limit fails the criterion");
       db.close();
     }
@@ -566,7 +576,114 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       s.setNow(T0 + W + 1000);
       s.store.flush();
       const row = db.prepare("SELECT fanin_ratio, fanin_class, fanin_fan_in, fanin_ua FROM client_ip_shadow_windows").get() as any;
-      assertEq([row?.fanin_ratio, row?.fanin_class, row?.fanin_fan_in, row?.fanin_ua], [0.75, "mcp", 3, "none"], "C7: 100 /a2a (0.5 of 200) and 150 /mcp (0.75 of 200) → the larger, mcp");
+      assertEq([row?.fanin_ratio, row?.fanin_class, row?.fanin_fan_in, row?.fanin_ua], [0.75, "mcp", 3, "none"], "C7: 100 /a2a (0.5 of jsonRpcLimiter's 200, 0.1 of dentalLimiter's 1 000) and 150 /mcp (0.75 of 200) → the largest, mcp");
+      db.close();
+    }
+    {
+      // C7 (review B1 of PR #1130): a key is rated per limiter, counted the way that limiter counts.
+      assertEq(
+        [
+          "/api/products", "/api", "/api/", "/API/products", "/apix", "/en/api/products",
+          "/api/marketplace/search", "/api/marketplace/discover/x", "/api/marketplace/searchx",
+          "/api/tannlege", "/api/tannlege/klinikker", "/api/tannlegex", "/Api/Tannlege/x",
+          "/ut/a1/web", "/utx", "/reise", "/en/reise", "/sv/reise", "/sok", "/sok/", "/en/sok", "/sok/x",
+          "/a2a", "/en/a2a", "/mcp", "/mcp/x", "/health", "/", "/produsent/x",
+        ].map((p) => [p, ac2LimitersFor(p)]),
+        [
+          ["/api/products", ["general"]], ["/api", ["general"]], ["/api/", ["general"]], ["/API/products", ["general"]], ["/apix", []], ["/en/api/products", ["general"]],
+          ["/api/marketplace/search", ["general", "search"]], ["/api/marketplace/discover/x", ["general", "search"]], ["/api/marketplace/searchx", ["general"]],
+          ["/api/tannlege", ["dental"]], ["/api/tannlege/klinikker", ["dental"]], ["/api/tannlegex", []], ["/Api/Tannlege/x", ["general", "dental"]],
+          ["/ut/a1/web", ["general"]], ["/utx", []], ["/reise", ["general"]], ["/en/reise", ["general"]], ["/sv/reise", ["general"]], ["/sok", ["general"]], ["/sok/", ["general"]], ["/en/sok", ["general"]], ["/sok/x", []],
+          ["/a2a", ["a2a", "dental"]], ["/en/a2a", ["a2a", "dental"]], ["/mcp", ["mcp"]], ["/mcp/x", ["mcp"]], ["/health", []], ["/", []], ["/produsent/x", []],
+        ],
+        "C7: ac2LimitersFor mirrors the mounts (segment-wise, case-insensitive, after the /en and /sv strip): search is also general; /api/tannlege* is not general (generalLimiter's case-sensitive skip) but dental; /a2a counts against jsonRpcLimiter and dentalLimiter"
+      );
+      // One key (fanIn 3) in one window; the fanIn ratio, its limiter, and whether the criterion passes.
+      const rate = (traffic: Array<[string, number]>) => {
+        const db = freshDb();
+        const s = storeOn(db);
+        const r = rig(SHADOW, s.store);
+        let i = 0;
+        for (const [p, n] of traffic) {
+          for (let j = 0; j < n; j++, i++) {
+            const spoof = `203.0.113.${i % 3}`;
+            r.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9", spoof), ip: spoof, path: p }, T0 + i);
+          }
+        }
+        r.ordinary("198.51.100.200", T0 + W);
+        s.setNow(T0 + W + 1000);
+        s.store.flush();
+        const snap = r.mw.opsSnapshot();
+        const f = cum(snap).fanin_max;
+        db.close();
+        return [f === null ? null : Math.round(f.ratio * 1e6) / 1e6, f?.class ?? null, f?.fanIn ?? null, snap.ac2?.criteria.fanin_limit_ratio.pass];
+      };
+      assertEq(rate([["/api/marketplace/search", 130]]), [0.866667, "search", 3, false], "C7: 130 /api/marketplace/search → 130 of searchLimiter's 150 (0.867), not 130 of 300 (0.433): fails");
+      assertEq(rate([["/api/products", 100], ["/reise", 200]]), [1, "general", 3, false], "C7: 100 /api + 200 /reise → one generalLimiter count, 300 of 300 (a 429 in enforce), not 0.333: fails");
+      assertEq(rate([["/ut/a1/web", 250]]), [0.833333, "general", 3, false], "C7: 250 /ut → 250 of generalLimiter's 300 (0.833), not unrated: fails");
+      assertEq(rate([["/en/sok", 130], ["/en/reise", 130]]), [0.866667, "general", 3, false], "C7: 130 /en/sok + 130 /en/reise → 260 of generalLimiter's 300 (the /en prefix is stripped before the limiters): fails");
+      assertEq(rate([["/api/tannlege/klinikker", 200], ["/api/products", 200]]), [0.666667, "general", 3, true], "C7: 200 /api/tannlege + 200 /api → general 200 of 300 (tannlege is skipped there, not 400), dental 200 of 1 000: passes");
+      assertEq(rate([["/api/tannlege/klinikker", 700], ["/a2a", 150]]), [0.85, "dental", 3, false], "C7: 700 /api/tannlege + 150 /a2a → dentalLimiter 850 of 1 000 (dental /a2a shares it), above /a2a's 150 of 200: fails");
+    }
+    {
+      // C8 (review S2 of PR #1130): cumulative and ac2 sum shadow windows only; another mode's rows are kept, not summed.
+      const db = freshDb();
+      const shadowStore = storeOn(db);
+      const enforceStore = storeOn(db, { machine: "m2" });
+      const shadow = rig(SHADOW, shadowStore.store);
+      const enforce = rig(ENFORCE, enforceStore.store);
+      normalWindow(shadow, 0);
+      shadow.ordinary("198.51.100.200", T0 + W);
+      for (let w = 0; w < 3; w++) {
+        normalWindow(enforce, w);
+        // An enforce window with an invalid Fly-Client-IP and a fanIn 3 key near a limit: neither may reach the shadow verdict.
+        enforce.send({ fci: "garbage", xff: flyXff("198.51.100.4"), ip: "198.51.100.4" }, T0 + w * W + 20_000);
+        for (let i = 0; i < 100; i++) {
+          const spoof = `203.0.113.${i % 3}`;
+          enforce.send({ fci: "198.51.100.9", xff: flyXff("198.51.100.9", spoof), ip: spoof, path: "/a2a" }, T0 + w * W + 30_000 + i);
+        }
+      }
+      enforce.ordinary("198.51.100.200", T0 + 3 * W);
+      shadowStore.setNow(T0 + 3 * W + 1000);
+      enforceStore.setNow(T0 + 3 * W + 1000);
+      shadowStore.store.flush();
+      enforceStore.store.flush();
+      const modes = (db.prepare("SELECT mode, COUNT(*) AS c FROM client_ip_shadow_windows GROUP BY mode ORDER BY mode").all() as any[]).map((x) => [x.mode, x.c]);
+      const snap = shadow.mw.opsSnapshot();
+      assertEq(
+        [modes, cum(snap).windows, cum(snap).counters.n, cum(snap).counters.fallback.invalid, cum(snap).fanin_max, failing(snap.ac2)],
+        [[["enforce", 3], ["shadow", 1]], 1, 9, 0, null, ["hours_covered", "requests"]],
+        "C8: 3 enforce rows and 1 shadow row stored; cumulative and ac2 see only the shadow row (no invalid, no fanIn from enforce)"
+      );
+      assertEq(
+        [enforceStore.store.totals("enforce").rows, enforceStore.store.totals("enforce").counters.fallback.invalid, enforceStore.store.totals("enforce").fanInMax?.class],
+        [3, 3, "a2a"],
+        "C8: … the enforce rows are there for an enforce read"
+      );
+      db.close();
+    }
+    {
+      // C9 (review S3 of PR #1130): which windows hold an "= 0 or explained" criterion at false, and the newest one.
+      const db = freshDb();
+      const s = storeOn(db);
+      const r = rig(SHADOW, s.store);
+      for (let w = 0; w < 4; w++) {
+        normalWindow(r, w);
+        if (w === 1) r.send({ fci: "10.1.2.3", xff: flyXff("198.51.100.5"), ip: "198.51.100.5" }, T0 + w * W + 50_000); // non_public
+        if (w === 2) r.send({ fci: "garbage", xff: flyXff("198.51.100.4"), ip: "198.51.100.4" }, T0 + w * W + 50_000); // invalid
+      }
+      r.ordinary("198.51.100.200", T0 + 4 * W);
+      s.setNow(T0 + 4 * W + 1000);
+      s.store.flush();
+      const snap = r.mw.opsSnapshot();
+      assertEq(
+        [cum(snap).nonzero_windows, snap.ac2?.criteria.invalid_non_public],
+        [
+          { top_overflow: { windows: 0, last: null }, invalid_non_public: { windows: 2, last: iso(T0 + 2 * W) } },
+          { value: 2, threshold: 0, op: "==", pass: false },
+        ],
+        "C9: two stored windows with an invalid/non-public Fly-Client-IP, the newest at window 2; no overflow window"
+      );
       db.close();
     }
 
@@ -595,7 +712,8 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           would_trip: 0,
           top_overflow: 0,
         },
-        fanin_max: { ratio: 0.7999, class: "api", fanIn: 2, ua: "browser", window_start: iso(T0) },
+        fanin_max: { ratio: 0.7999, class: "general", fanIn: 2, ua: "browser", window_start: iso(T0) },
+        nonzero_windows: NO_NONZERO_WINDOWS,
         writer: { persisted: 576, queued: 0, dropped: 0, out_of_order: 0, errors: 0, pruned: 0 },
       });
       const ok = evaluateClientIpAc2(base());
@@ -641,6 +759,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         since: null, until: null, windows: 0, machines: 0, hours_covered: 0,
         counters: { n: 0, fci_valid: 0, fallback: { missing: 0, invalid: 0, non_public: 0 }, fallback_hc: 0, errors: 0, xff_client_supplied: 0, agree_fci_edge: { n: 0, agree: 0 }, agree_legacy_eq_fci: { n: 0, agree: 0 }, would_trip: 0, top_overflow: 0 },
         fanin_max: null,
+        nonzero_windows: NO_NONZERO_WINDOWS,
         writer: { persisted: 0, queued: 0, dropped: 0, out_of_order: 0, errors: 0, pruned: 0 },
       });
       assertEq(
@@ -740,18 +859,66 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       }
     }
 
-    // ── H. AC2_FANIN_LIMITS = the limiters' anonymous ceilings ──
+    // ── H. AC2_FANIN_LIMITS = the limiters' anonymous ceilings, ac2LimitersFor = their mounts ──
     {
-      const sec = fs.readFileSync(path.join(__dirname, "..", "middleware", "security.ts"), "utf8");
+      const srcRoot = path.join(__dirname, "..");
+      const sec = fs.readFileSync(path.join(srcRoot, "middleware", "security.ts"), "utf8");
       const ceiling = (name: string): number | null => {
         const m = sec.match(new RegExp(`export const ${name} = rateLimit\\(\\{\\s*windowMs: 15 \\* 60 \\* 1000,[\\s\\S]*?max: keyedMax\\((\\d+),`));
         return m ? Number(m[1]) : null;
       };
+      // A flat `max: N` inside the limiter's own options (no "}" before it, so never the next limiter's).
+      const flat = (name: string): number | null => {
+        const m = sec.match(new RegExp(`export const ${name} = rateLimit\\(\\{\\s*windowMs: 15 \\* 60 \\* 1000,[^}]*?max: (\\d+),`));
+        return m ? Number(m[1]) : null;
+      };
       const mcp = Object.values(MCP_RATE_LIMIT_PROFILES).map((p) => p.primary);
       assertEq(
-        [AC2_FANIN_LIMITS, ceiling("generalLimiter"), ceiling("jsonRpcLimiter"), Math.min(...mcp.map((p) => p.anonymousMax)), mcp.every((p) => p.windowMs === 15 * 60_000)],
-        [{ api: 300, a2a: 200, mcp: 200 }, 300, 200, 200, true],
-        "H: AC2_FANIN_LIMITS = generalLimiter / jsonRpcLimiter / the smallest MCP primary ceiling, all per 15 min"
+        [AC2_FANIN_LIMITS, ceiling("generalLimiter"), flat("searchLimiter"), ceiling("jsonRpcLimiter"), flat("dentalLimiter"), Math.min(...mcp.map((p) => p.anonymousMax)), mcp.every((p) => p.windowMs === 15 * 60_000)],
+        [{ general: 300, search: 150, a2a: 200, dental: 1000, mcp: 200 }, 300, 150, 200, 1000, 200, true],
+        "H: AC2_FANIN_LIMITS = generalLimiter / searchLimiter / jsonRpcLimiter / dentalLimiter / the smallest MCP primary ceiling, all per 15 min"
+      );
+      assertTrue(
+        /skip: \(req\) => \{\s*const fullPath = \(req\.baseUrl \|\| ""\) \+ \(req\.path \|\| ""\);\s*return fullPath\.startsWith\("\/api\/tannlege"\);\s*\}/.test(sec),
+        "H: generalLimiter's skip is still the case-sensitive startsWith(\"/api/tannlege\") ac2LimitersFor mirrors"
+      );
+      // Every place outside security.ts that applies one of the four limiters, as code lines (no comments, no imports).
+      // A new mount fails here: add it to ac2LimitersFor (and to C7's table), then to this list.
+      const usages: string[] = [];
+      for (const rel of fs.readdirSync(srcRoot, { recursive: true }) as string[]) {
+        if (!rel.endsWith(".ts") || rel.endsWith(".test.ts") || rel.endsWith(".d.ts") || rel === path.join("middleware", "security.ts")) continue;
+        for (const raw of fs.readFileSync(path.join(srcRoot, rel), "utf8").split("\n")) {
+          const t = raw.trim();
+          if (!/\b(generalLimiter|searchLimiter|jsonRpcLimiter|dentalLimiter)\b/.test(t)) continue;
+          if (/^(\/\/|\*|\/\*)/.test(t) || /^import\b/.test(t) || /^\w+,$/.test(t)) continue;
+          usages.push(`${rel.split(path.sep).join("/")}: ${t}`);
+        }
+      }
+      assertEq(
+        usages.sort(),
+        [
+          'index.ts: app.use("/a2a", jsonRpcLimiter);',
+          'index.ts: app.use("/api", generalLimiter);',
+          'index.ts: app.use("/api/marketplace/discover", searchLimiter);',
+          'index.ts: app.use("/api/marketplace/search", searchLimiter);',
+          'index.ts: app.use("/api/tannlege", dentalLimiter);',
+          'index.ts: app.use("/reise", generalLimiter);',
+          'index.ts: app.use("/ut", generalLimiter);',
+          "routes/dental-a2a.ts: router.use(dentalLimiter);",
+          'routes/experiences-a2a.ts: router.use(jsonRpcLimiter);',
+          'routes/experiences-seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
+          'routes/seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
+        ],
+        "H: generalLimiter, searchLimiter, jsonRpcLimiter and dentalLimiter are applied exactly where ac2LimitersFor counts them"
+      );
+      const idx = fs.readFileSync(path.join(srcRoot, "index.ts"), "utf8");
+      const at = (s: string) => idx.indexOf(s);
+      assertTrue(
+        at("installClientIp(app,") >= 0 &&
+          at("installClientIp(app,") < at("app.use(langMiddleware);") &&
+          at("app.use(langMiddleware);") < at('app.use("/a2a", jsonRpcLimiter);') &&
+          at("app.use(langMiddleware);") < at("const DENTAL_HOSTS"),
+        "H: langMiddleware runs after this middleware and before the limiters and host gates, so ac2LimitersFor strips /en and /sv itself"
       );
     }
   } finally {
