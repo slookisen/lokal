@@ -2388,6 +2388,85 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
   return rows;
 }
 
+// ─── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S2) ───────────
+/**
+ * The newest updated_at day (YYYY-MM-DD) behind each dental aggregate page,
+ * for the sitemap's <lastmod>: a list page changed when a clinic it lists
+ * did, not when the sitemap was built. null = no dated row (the sitemap then
+ * leaves <lastmod> out).
+ *
+ * Read-only. Only buildDentalSitemapXml() calls it, and createSitemapCache
+ * builds that once per TTL; never call it in a request path.
+ *
+ * Rows: the public set the pages list (buildDentalWhere's publicOnly: not
+ * rejected, not closed, a clinic class, not the probe row). A row whose
+ * updated_at does not start with a date is skipped, so it can neither become
+ * a lastmod nor hide the newest real one (a string MAX ranks "ukjent" above
+ * every date).
+ *   all           every public row (the homepage).
+ *   forPoststed   /sted/<slug> for the poststed row the page uses: the same
+ *                 two spellings the poststed filter matches (pushFieldClauses).
+ *   forFylke      /fylke/<fylke>: the same values the fylke filter matches.
+ *   forSpecialty  /spesialitet/<slug> for one of `specialties`: the very
+ *                 predicate the page's list and count use (specialtyMatch).
+ * Cost: one MAX over all rows, one flat GROUP BY per poststed and per fylke,
+ * and one scan with one CASE per specialty over the rows that have specialty
+ * data. A new aggregate page gets its lastmod by adding one key here.
+ */
+export interface DentalAggregateLastmods {
+  all: string | null;
+  forPoststed(poststed: string): string | null;
+  forFylke(fylke: string): string | null;
+  forSpecialty(name: string): string | null;
+}
+
+export function getDentalAggregateLastmods(opts: { specialties: readonly string[] }): DentalAggregateLastmods {
+  const db = getDb("dental");
+  const { where } = buildDentalWhere({}, { publicOnly: true });
+  const datedUpdatedAt = "updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'";
+  const base = `FROM dental_agents WHERE ${[...where, datedUpdatedAt].join(" AND ")}`;
+  const day = (v: string | null | undefined): string | null => (v ? v.slice(0, 10) : null);
+  const newest = (values: Array<string | undefined>): string | null =>
+    values.reduce<string | null>((max, v) => (v !== undefined && (max === null || v > max) ? v : max), null);
+
+  const all = day((db.prepare(`SELECT MAX(updated_at) AS m ${base}`).get() as { m: string | null }).m);
+
+  const newestBy = (column: "poststed" | "fylke"): Map<string, string> => {
+    const rows = db.prepare(
+      `SELECT ${column} AS k, MAX(updated_at) AS m ${base} AND ${column} IS NOT NULL AND ${column} != '' GROUP BY ${column}`
+    ).all() as Array<{ k: string; m: string }>;
+    return new Map(rows.map((r) => [r.k, r.m.slice(0, 10)]));
+  };
+  const byPoststed = newestBy("poststed");
+  const byFylke = newestBy("fylke");
+
+  // A row with neither specialty column filled can match no clause of
+  // specialtyMatch (each one needs a quoted value inside one of them).
+  const bySpecialty = new Map<string, string | null>();
+  if (opts.specialties.length > 0) {
+    const columns: string[] = [];
+    const params: Record<string, unknown> = {};
+    opts.specialties.forEach((name, i) => {
+      const m = specialtyMatch(name, `sp${i}_`);
+      columns.push(`MAX(CASE WHEN ${m.sql} THEN updated_at END) AS s${i}`);
+      Object.assign(params, m.params);
+    });
+    const row = db.prepare(
+      `SELECT ${columns.join(", ")} ${base}` +
+      " AND ((available_specialties IS NOT NULL AND available_specialties NOT IN ('', '[]'))" +
+      " OR (specialists IS NOT NULL AND specialists NOT IN ('', '[]')))"
+    ).get(params) as Record<string, string | null>;
+    opts.specialties.forEach((name, i) => bySpecialty.set(name, day(row[`s${i}`])));
+  }
+
+  return {
+    all,
+    forPoststed: (poststed) => newest([byPoststed.get(poststed.toLocaleUpperCase("nb-NO")), byPoststed.get(poststed)]),
+    forFylke: (fylke) => newest([byFylke.get(normaliseFylke(fylke) ?? fylke), byFylke.get(fylke)]),
+    forSpecialty: (name) => bySpecialty.get(name) ?? null,
+  };
+}
+
 // ─── PR-127: opening_hours normalization (tolerant ingest) ───────────────────
 //
 // Real-world clinic hours are messy ("9–15.30", "Man-Tor 08-16", "mandag",
