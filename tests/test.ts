@@ -33596,6 +33596,16 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of tcr.failures) failures.push("traffic-classifier: " + f);
     console.log(`  traffic-classifier: ${tcr.passed} passed, ${tcr.failed} failed`);
 
+    // dev-request 2026-10-16 G2-S3: deterministic alert for sudden traffic
+    // falls and jumps (pure module, synthetic series).
+    const { runTrafficAlertsTests } = require("../src/services/traffic-alerts.test") as
+      typeof import("../src/services/traffic-alerts.test");
+    const tal = runTrafficAlertsTests({ log: false });
+    passed += tal.passed;
+    failed += tal.failed;
+    for (const f of tal.failures) failures.push("traffic-alerts: " + f);
+    console.log(`  traffic-alerts: ${tal.passed} passed, ${tal.failed} failed`);
+
     // Same dev-request, slice A: getTrafficStats() rewritten on top of the
     // shared classifier — sum identity (humanViews + aiSearchViews + botViews
     // === pageViews), realVisitors ≤ uniqueVisitors, windowDays from the

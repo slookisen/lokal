@@ -20,6 +20,7 @@ import {
 } from "../services/admin-stats-compute";
 import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
 import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
+import { computeTrafficAlertsFromDb } from "../services/traffic-alerts";
 import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { getRetentionWindowDays } from "../services/traffic-stats-compute";
 import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
@@ -763,6 +764,8 @@ router.get("/visitors", async (req: Request, res: Response) => {
  * stored week and month plus the current one so far. Raw rows only live 60
  * days; this is what the dashboard shows for longer windows and in its
  * month-by-month table. Definitions: services/traffic-history-compute.ts.
+ * `alerts[]` (additive, [] when none): yesterday vs. the median of the 7 days
+ * before, per group; vertical=all also covers each vertical. services/traffic-alerts.ts.
  */
 router.get("/history", async (req: Request, res: Response) => {
   const raw = String(req.query.days ?? "all");
@@ -775,7 +778,7 @@ router.get("/history", async (req: Request, res: Response) => {
     sendAdminStatsUnavailable(res, (r as { error: string }).error);
     return;
   }
-  res.json({ ...r.value, job: getTrafficHistoryJobState(), rawRetentionDays: rawRetentionDays() });
+  res.json({ ...r.value, job: getTrafficHistoryJobState(), rawRetentionDays: rawRetentionDays(), alerts: computeTrafficAlertsFromDb(getDb(), vertical ?? "all", Date.now()) });
 });
 
 /**
