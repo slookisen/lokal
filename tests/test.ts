@@ -33281,6 +33281,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of eslr.failures) failures.push("experience-store-lock-split: " + f);
     console.log(`  experience-store-lock-split: ${eslr.passed} passed, ${eslr.failed} failed`);
 
+    // dev-request 2026-10-01-opplevagent-fylke-fra-kommune: fill-only fylke
+    // from kommune (admin lever service + createProvider write path).
+    console.log("\n── gardssalg-fylke-from-kommune ──");
+    const { runGardssalgFylkeFromKommuneTests } = require("../src/services/gardssalg-fylke-from-kommune.test") as
+      typeof import("../src/services/gardssalg-fylke-from-kommune.test");
+    const gffk = await runGardssalgFylkeFromKommuneTests({ log: false });
+    passed += gffk.passed;
+    failed += gffk.failed;
+    for (const f of gffk.failures) failures.push("gardssalg-fylke-from-kommune: " + f);
+    console.log(`  gardssalg-fylke-from-kommune: ${gffk.passed} passed, ${gffk.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 1 (route level): GET /sok now renders a separate, clearly labeled
     // "Produsenter" section (never merged with "Opplevelser") when a gårdssalg
