@@ -48628,3 +48628,24 @@ runSerial(async () => {
     failures.push("experiences-description-candidates-innsyn: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S3: the
+// Norwegian front page is written around gårdssalg, smaking and drink
+// producers (decision 1=B) without developer language; search, «Alle
+// opplevelser» and the hint link stay; en/sv copy unchanged (decision 6=A)
+// except the shared Organization description. Own in-memory DB — tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-stedssider-kvalitet E4-S3: front-page copy for gårdssalg, smaking and drinks ──");
+  try {
+    const { runExperiencesSeoForsideCopyTests } = require("../src/routes/experiences-seo-forside-copy.test") as
+      typeof import("../src/routes/experiences-seo-forside-copy.test");
+    const efc = await runExperiencesSeoForsideCopyTests({ log: false });
+    passed += efc.passed;
+    failed += efc.failed;
+    for (const f of efc.failures) failures.push("experiences-seo-forside-copy: " + f);
+    console.log(`  experiences-seo-forside-copy: ${efc.passed} passed, ${efc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-forside-copy: unexpected error: " + String(err?.message || err));
+  }
+});
