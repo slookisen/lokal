@@ -377,7 +377,13 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     }
 
     // ═══════════════ T2 — parentOrganization in each site's Organization JSON-LD ═══════════════
+    // G3-S1 (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker):
+    // the parent carries sameAs with the Brreg page on every site, and the
+    // rettfrabonden.com and opplevagent.no front pages publish
+    // organizationJsonLd(<vertical>) (PNG logo, the domain as alternateName).
+    // finn-tannlege.com follows once dental-seo.ts is wired to it.
     const parent = legal.parentOrganizationJsonLd();
+    const builtFor: Record<string, "rfb" | "experiences" | null> = { [RFB]: "rfb", [OA]: "experiences", [FT]: null };
     for (const [host, p] of [[RFB, "/"], [RFB, "/en"], [OA, "/"], [OA, "/en"], [FT, "/"]] as const) {
       const r = await get(p, host);
       const lds = jsonLdOf(r.body);
@@ -385,9 +391,17 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       check(!!org, `T2 ${host}${p}: the site's Organization JSON-LD has parentOrganization`);
       check(!!org && JSON.stringify(org.parentOrganization) === JSON.stringify(parent), `T2 ${host}${p}: parentOrganization is parentOrganizationJsonLd() (Agentplatform.no AS, url https://agentplatform.no)`, org ? JSON.stringify(org.parentOrganization) : "");
       check(!!org && org.parentOrganization.url === "https://agentplatform.no", `T2 ${host}${p}: parentOrganization.url = https://agentplatform.no`);
+      check(!!org && Array.isArray(org.parentOrganization.sameAs) && org.parentOrganization.sameAs.includes(COMPANY_INFO.brregUrl), `G3-S1 ${host}${p}: parentOrganization.sameAs holds the Brreg URL`, org ? JSON.stringify(org.parentOrganization.sameAs) : "");
       check(!!org && org.name !== NAME && org.name !== COMPANY_INFO.displayName, `T2 ${host}${p}: the site's Organization keeps its brand name (${org?.name})`);
       check(!JSON.stringify(lds).includes(STREET), `T2 ${host}${p}: no street address in JSON-LD`);
       check(lds.some((o) => o && o["@type"] === "WebSite"), `T2 ${host}${p}: WebSite JSON-LD still present`);
+      const vertical = builtFor[host];
+      if (vertical) {
+        const built = legal.organizationJsonLd(vertical);
+        check(!!org && Object.entries(built).every(([k, v]) => JSON.stringify(org[k]) === JSON.stringify(v)), `G3-S1 ${host}${p}: the front-page Organization is organizationJsonLd("${vertical}")`, org ? JSON.stringify(org) : "");
+        check(!!org && typeof org.logo === "string" && /^https:\/\/\S+\.png$/.test(org.logo), `G3-S1 ${host}${p}: Organization.logo is a PNG`, String(org?.logo));
+        check(lds.filter((o) => o && o["@type"] === "Organization").length === 1, `G3-S1 ${host}${p}: exactly one site Organization on the front page`);
+      }
     }
 
     // ═══════════════ T3 — agent-card provider (+ server-card vendor) ═══════════════

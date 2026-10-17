@@ -30,7 +30,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { safeHonestCatalogCount, type CatalogVertical } from "../services/honest-count";
 import { COMPANY_INFO } from "../config/company-info";
-import { companyVatStatus } from "../services/company-legal";
+import { BRAND_ENTITIES } from "../config/brand-entities";
+import { companyVatStatus, organizationJsonLd } from "../services/company-legal";
 import { getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { getAgentToolCallsSnapshot } from "../services/agent-usage";
 import { jsonLdScriptTag } from "../services/safe-script-json";
@@ -1012,34 +1013,31 @@ ${footer(o.lang)}
 }
 
 // ─── Front page ─────────────────────────────────────────────────────────────
-function organizationJsonLd(lang: Lang): object {
+/**
+ * The company's Organization (name, logo, sameAs, legal name, org.nr.) from
+ * the shared builder (G3-S1, config/brand-entities.ts), plus what only the
+ * company site says about it. The brands come from the same brand entries.
+ */
+function homeJsonLd(lang: Lang): object {
   const t = T[lang];
   return {
-    "@context": "https://schema.org",
-    "@type": "Organization",
-    "@id": `${AGENTPLATFORM_BASE_URL}/#organization`,
-    name: COMPANY.displayName,
-    legalName: COMPANY.legalName,
-    url: AGENTPLATFORM_BASE_URL,
-    logo: `${AGENTPLATFORM_BASE_URL}/favicon-512.png`,
+    ...organizationJsonLd("company"),
     image: `${AGENTPLATFORM_BASE_URL}/og.png`,
     description: t.description,
     foundingDate: COMPANY.foundedDate,
     email: COMPANY.email,
-    identifier: { "@type": "PropertyValue", propertyID: "Organisasjonsnummer", value: COMPANY.orgNr },
     address: {
       "@type": "PostalAddress",
       addressLocality: COMPANY.address.city,
       addressCountry: COMPANY.address.countryCode,
     },
-    sameAs: [COMPANY.brregUrl],
     founder: {
       "@type": "Person",
       name: COMPANY.founder.name,
       jobTitle: COMPANY.founder.role[lang],
       ...(COMPANY.founder.linkedin ? { sameAs: [COMPANY.founder.linkedin] } : {}),
     },
-    brand: SERVICES.map((s) => ({ "@type": "Brand", name: s.name, url: `https://${s.domain}` })),
+    brand: SERVICES.map((s) => ({ "@type": "Brand", name: BRAND_ENTITIES[s.vertical].name, url: BRAND_ENTITIES[s.vertical].url })),
   };
 }
 
@@ -1165,7 +1163,7 @@ ${founderBlock(lang)}</div>
     canonicalPath: lang === "en" ? "/en" : "/",
     alternates: { nb: "/", en: "/en" },
     body,
-    jsonLd: organizationJsonLd(lang),
+    jsonLd: homeJsonLd(lang),
   });
 }
 

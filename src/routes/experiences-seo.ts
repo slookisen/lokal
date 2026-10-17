@@ -229,14 +229,15 @@ import { registeredMcpTools } from "../services/mcp-tool-manifest";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, /vilkar operator,
 // JSON-LD parentOrganization and the MCP server-card vendor all come from
-// COMPANY_INFO via these helpers.
+// COMPANY_INFO via these helpers; the front page's Organization from
+// config/brand-entities.ts (G3-S1).
 import {
   agentCardProvider,
   companyContactBlockHtml,
   companyControllerSentenceHtml,
   companyFooterLineHtml,
   companyOperatorSentence,
-  parentOrganizationJsonLd,
+  organizationJsonLd,
   toSiteLang,
 } from "../services/company-legal";
 import { renderExperienceOgImageSvg, resolveOgAccentColor, DEFAULT_OG_ACCENT } from "../services/experience-og-image";
@@ -2147,16 +2148,13 @@ router.get("/", (req: Request, res: Response) => {
         "query-input": "required name=search_term_string",
       },
     },
+    // T2 + G3-S1: Opplevagent's Organization from its brand entry — PNG logo
+    // (/favicon-512.png), the domain as alternateName, and the company that
+    // owns and operates opplevagent.no as parentOrganization.
     {
-      "@context": "https://schema.org",
-      "@type": "Organization",
-      name: "Opplevagent",
-      url: url,
+      ...organizationJsonLd("experiences"),
       description:
         "A2A-markedsplass for norske opplevelser og aktiviteter. Tilbydere verifiseres mot Brønnøysundregistrene.",
-      logo: `${url}/favicon.svg`,
-      // T2: the company that owns and operates opplevagent.no.
-      parentOrganization: parentOrganizationJsonLd(),
     },
   ];
   const ldScripts = jsonLd.map((ld) => jsonLdScriptTag(ld)).join("\n");

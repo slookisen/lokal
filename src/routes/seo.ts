@@ -131,12 +131,13 @@ export { formatAddressLine };
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // the operator facts (footer line, /kontakt facts, /personvern controller,
-// JSON-LD parentOrganization) all come from COMPANY_INFO via these helpers.
+// JSON-LD parentOrganization) all come from COMPANY_INFO via these helpers;
+// the front page's Organization from config/brand-entities.ts (G3-S1).
 import {
   companyContactBlockHtml,
   companyControllerSentenceHtml,
   companyFooterLineHtml,
-  parentOrganizationJsonLd,
+  organizationJsonLd,
   toSiteLang,
 } from "../services/company-legal";
 
@@ -1448,14 +1449,10 @@ router.get("/", (req: Request, res: Response) => {
     // T2 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
     // the site's own Organization, owned by Agentplatform.no AS — the same
     // WebSite + Organization pair opplevagent.no and finn-tannlege.com publish.
-    const orgJsonLd = {
-      "@context": "https://schema.org",
-      "@type": "Organization",
-      "name": `${getConfig().display_name}`,
-      "url": BASE_URL,
-      "logo": `${BASE_URL}/logo-512.png`,
-      "parentOrganization": parentOrganizationJsonLd(),
-    };
+    // G3-S1 (2026-10-16-merkevare-entitet-og-connector-pakker): built from the
+    // brand entry — PNG logo, the domain as alternateName, and the company's
+    // Brreg sameAs on parentOrganization.
+    const orgJsonLd = organizationJsonLd("rfb");
 
     const numFmt = lang === "en" ? "en-US" : "nb-NO";
 
