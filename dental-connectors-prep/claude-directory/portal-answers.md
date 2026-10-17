@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: no (4 open). See the prerequisites in ../README.md.
+Before you start: Ready to submit: no (3 open). See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -27,8 +27,8 @@ The client must send `initialize` first. A request without a live session gets 4
 |---|---|---|---|---|---|---|
 | `tannlege_search` | Search Norwegian dental clinics | (same) | true | false | true | Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by place, county (fylke), specialty, Helfo direct billing or emergency care. |
 | `tannlege_info` | Get full details for a dental clinic | Get dental clinic details | true | false | true | Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, by organisation number (org_nr) or id. |
-| `tannlege_stats` | Norwegian dental market statistics | (same) | true | false | false | Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, are flagged for emergency duty (akuttvakt) or list a specialist. |
-| `tannlege_akutt` | Find emergency-duty dental clinics in Norway | Find emergency-duty dental clinics | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics flagged for emergency care (akuttvakt), optionally in one county (fylke). |
+| `tannlege_stats` | Norwegian dental market statistics | (same) | true | false | false | Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show an emergency claim or list a specialist. |
+| `tannlege_akutt` | Find emergency-duty dental clinics in Norway | Find emergency-duty dental clinics | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a recorded source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke). |
 | `tannlege_kjeder` | List Norwegian dental chains | (same) | true | false | false | List dentist chains (tannlegekjeder) in Norway that are registered in the directory, each with its number of clinic locations. |
 
 ### Write (0)

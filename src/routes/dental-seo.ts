@@ -38,7 +38,7 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { buildRobotsGroups } from "../services/robots-policy";
-import { registeredMcpTools } from "../services/mcp-tool-manifest";
+import { registeredMcpCapabilities, registeredMcpTools } from "../services/mcp-tool-manifest";
 import { generalLimiter } from "../middleware/security";
 // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b/5d): reuse
 // the existing pure classifiers rather than reinventing name-word / host
@@ -2913,11 +2913,9 @@ function dentalMcpServerCard() {
       },
     ],
     transports: ["http", "streamable-http"],
-    capabilities: {
-      tools: { listChanged: false },
-      resources: { listChanged: false, subscribe: false },
-      prompts: { listChanged: false },
-    },
+    // What the live /mcp sends in initialize, read from the same registration as `tools`
+    // (A2A dev-request 2026-10-17-dental-d3-rettelser, D3a): tools only, no resources or prompts.
+    capabilities: registeredMcpCapabilities("dental"),
     // Generated from the tools the live /mcp server registers (services/mcp-tool-manifest.ts);
     // locked by src/routes/discovery-truth.test.ts against a real tools/list.
     tools: registeredMcpTools("dental"),

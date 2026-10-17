@@ -301,8 +301,8 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     },
     descriptionsGate: null,
     recordedPrerequisites: [
-      { item: "Natural-language search in tannlege_search (town, municipality, specialty, Helfo)", status: "open", owner: "2026-10-16-tannlege-sok-naturlig-sprak",
-        detail: "lokal#1086 (draft). The example prompts must return clinics against production (G3-S4)." },
+      { item: "Natural-language search in tannlege_search (town, municipality, specialty, Helfo)", status: "done", owner: "2026-10-16-tannlege-sok-naturlig-sprak",
+        detail: "lokal#1086, merged and live: the request goes in `query` as written, and `tolkning` shows how it was read. The example prompts must return clinics against production (G3-S4)." },
       { item: "Per-session rate limit on /mcp", status: "done", owner: "2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt",
         detail: "lokal#1098: one quota per MCP session, so users behind one shared AI-platform IP do not share a bucket." },
       { item: "Name decision for Finn-tannlege", status: "done", owner: "Daniel",

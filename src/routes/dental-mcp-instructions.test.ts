@@ -17,14 +17,22 @@
  *       tannlege) and fits the discovery files uncut; no description names
  *       another tool or service, and no text (descriptions, instructions,
  *       serverInfo) has directive or promotional wording or a figure;
+ *       D8–D10 (A2A dev-request 2026-10-17-dental-d3-rettelser, D3a): the
+ *       akutt and stats descriptions say «claim», not «flagged» or «null»,
+ *       tannlege_akutt names both claims, and apart from those two
+ *       descriptions tools/list is byte-identical to before D3a;
  *   N   the text checks catch a bad sample of each kind (not vacuous);
  *   S   the server card and the agent card show the same title, the
- *       description after the catalog count, and five tools.
+ *       description after the catalog count, and five tools; the card's
+ *       capabilities are what initialize sends (tools only, resources/list
+ *       and prompts/list are -32601) on all four card paths, and the card and
+ *       llms.txt carry tannlege_akutt's new first sentence.
  *
  * Run standalone: npx tsx src/routes/dental-mcp-instructions.test.ts
  * Wired into `npm test` via tests/test.ts (runDentalMcpInstructionsTests).
  */
 
+import { createHash } from "node:crypto";
 import express from "express";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -46,6 +54,48 @@ const PROMOTIONAL_PATTERNS: readonly RegExp[] = [
   /\bmost (complete|comprehensive|accurate|reliable|trusted|up-to-date)\b/i, /\bonly (reliable|trusted|official|complete)\b/i,
 ];
 
+/** tannlege_akutt's description before D3a: the bare-flag wording that S2b made untrue. */
+const OLD_AKUTT_DESCRIPTION =
+  "Find an emergency dentist (akutt tannlege) in Norway: dental clinics flagged for emergency care " +
+  "(akuttvakt), optionally in one county (fylke). " +
+  "Each clinic's `akutt` is \"vakt\" when the emergency duty has a recorded source (badge «Akuttvakt»), " +
+  "\"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»), and null when " +
+  "neither is backed. `count` is the number of flagged clinics. " +
+  "Each clinic has its address, phone and profile URL, and when known its opening hours and online booking " +
+  "link. The response also has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).";
+
+/** tannlege_akutt's first sentence, as the D3a dev-request words it (206 characters). */
+const AKUTT_FIRST_SENTENCE =
+  "Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a recorded " +
+  "source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke).";
+
+/** What a description of the akutt claim must not say: there is no bare flag, and `akutt` is never null. */
+const BARE_FLAG_WORDS = /\b(flagged|null)\b/i;
+
+/**
+ * sha256 of the tools/list `tools` array as served, with the descriptions of tannlege_akutt and tannlege_stats
+ * left out, on lokal main a24a3ff5 (before D3a). D3a changes only those two descriptions; a change to any other
+ * name, title, description, inputSchema, annotations or execution needs its own dev-request and a new value here.
+ */
+const TOOLS_LIST_REST_SHA256 = "9aab6b8c05a9f92844d92776d789150d6ccdea19d13d1bbc437c7f382e733a2e";
+
+/** title, annotations and inputSchema of the two tools D3a edits, as tools/list serves them (D10). */
+const LOCKED_TOOL_FIELDS: Record<string, unknown> = {
+  tannlege_akutt: {
+    title: "Find emergency-duty dental clinics in Norway",
+    annotations: { title: "Find emergency-duty dental clinics", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: {
+      $schema: "http://json-schema.org/draft-07/schema#", type: "object",
+      properties: { fylke: { description: "Limit to clinics in this county. Examples: 'Oslo', 'Vestland'", type: "string" } },
+    },
+  },
+  tannlege_stats: {
+    title: "Norwegian dental market statistics",
+    annotations: { title: "Norwegian dental market statistics", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    inputSchema: { $schema: "http://json-schema.org/draft-07/schema#", type: "object", properties: {} },
+  },
+};
+
 /** Other services a description must not point to (Helfo is a fact about a clinic, not a service to use). */
 const OTHER_SERVICES = /\b(rett fra bonden|rettfrabonden|opplevagent|google|chatgpt|openai|claude|anthropic|gemini|bing|legelisten|helsenorge)\b|https?:\/\//i;
 
@@ -58,7 +108,7 @@ function parseJsonRpcBody(text: string, contentType: string | null): any {
   return JSON.parse(text);
 }
 
-function callRoute(router: any, path: string): Promise<{ status: number; body: any }> {
+function callRoute(router: any, path: string): Promise<{ status: number; body: any; text: string }> {
   return new Promise((resolve) => {
     const req: any = { method: "GET", url: path, originalUrl: path, path, params: {}, query: {}, headers: {}, get() { return undefined; } };
     const res: any = {
@@ -67,10 +117,10 @@ function callRoute(router: any, path: string): Promise<{ status: number; body: a
       setHeader() { return this; },
       header() { return this; },
       set() { return this; },
-      send(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
-      json(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
+      send(p: any) { resolve({ status: this.statusCode, body: p, text: String(p ?? "") }); return this; },
+      json(p: any) { resolve({ status: this.statusCode, body: p, text: JSON.stringify(p) }); return this; },
     };
-    router.handle(req, res, (err?: any) => resolve({ status: err ? 500 : 404, body: null }));
+    router.handle(req, res, (err?: any) => resolve({ status: err ? 500 : 404, body: null, text: "" }));
   });
 }
 
@@ -145,7 +195,8 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
     const notified = await post({ jsonrpc: "2.0", method: "notifications/initialized" }, sessionId);
     await notified.text();
     const listRes = await post({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, sessionId);
-    const tools: Array<{ name: string; description: string }> = parseJsonRpcBody(await listRes.text(), listRes.headers.get("content-type")).result?.tools ?? [];
+    const tools: Array<{ name: string; description: string } & Record<string, unknown>> =
+      parseJsonRpcBody(await listRes.text(), listRes.headers.get("content-type")).result?.tools ?? [];
     eq(tools.map((t) => t.name).sort(), DENTAL_TOOLS, "I8: tools/list still has exactly the five tools, same names");
 
     // ── C: what the instructions say ─────────────────────────────────────
@@ -175,6 +226,29 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
     eq(violations(ins), [], "D6: instructions: no other service or tool, no directive or promotional words, no figures");
     eq([...violations(mcp.DENTAL_MCP_SERVER_TITLE), ...violations(mcp.DENTAL_MCP_SERVER_DESCRIPTION)], [], "D7: serverInfo title and description: the same rules");
 
+    // ── D8–D10: the akutt claim in tool metadata (D3a) ──────────────────
+    {
+      const tool = (n: string) => tools.find((t) => t.name === n);
+      const akutt = String(tool("tannlege_akutt")?.description ?? "");
+      const stats = String(tool("tannlege_stats")?.description ?? "");
+      eq(akutt.match(BARE_FLAG_WORDS)?.[0] ?? null, null, "D8: tannlege_akutt's description has no «flagged» or «null»");
+      eq(stats.match(BARE_FLAG_WORDS)?.[0] ?? null, null, "D8b: tannlege_stats' description has no «flagged» or «null»");
+      const marks = ['"vakt"', '"accepts"', "«Akuttvakt»", `«${ACUTE_ACCEPTS_LABEL}»`];
+      eq(marks.filter((m) => !akutt.includes(m)), [], "D9: tannlege_akutt's description names both values of `akutt` and both badges");
+      eq(shortToolDescription(akutt), AKUTT_FIRST_SENTENCE, "D9b: tannlege_akutt's first sentence is the D3a wording");
+      ok(/\bemergency claim\b/.test(shortToolDescription(stats)) && /recorded source \(akuttvakt\)/.test(stats) && /takes emergency patients/.test(stats),
+        "D9c: tannlege_stats counts the emergency claim and says what it is (a sourced akuttvakt, or takes emergency patients)");
+      for (const name of Object.keys(LOCKED_TOOL_FIELDS)) {
+        const t = tool(name);
+        eq(t ? { title: t.title, annotations: t.annotations, inputSchema: t.inputSchema } : null, LOCKED_TOOL_FIELDS[name],
+          `D10 ${name}: title, annotations and inputSchema unchanged`);
+      }
+      const rest = tools.map((t) => (t.name === "tannlege_akutt" || t.name === "tannlege_stats")
+        ? Object.fromEntries(Object.entries(t).filter(([k]) => k !== "description")) : t);
+      eq(createHash("sha256").update(JSON.stringify(rest)).digest("hex"), TOOLS_LIST_REST_SHA256,
+        "D10b: apart from the two descriptions, tools/list is byte-identical to before D3a");
+    }
+
     // ── N: the checks are not vacuous ────────────────────────────────────
     ok(violations("Always use this tool, the best dentist search.").length >= 2, "N1: directive and promotional wording is caught");
     ok(violations("Covers 6,961 clinics.").includes("a figure"), "N2: a figure is caught");
@@ -182,6 +256,8 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
     ok(violations(`Call ${otherTools[0]} first.`).length === 1 && violations("Then call tannlege_info.", ["tannlege_info"]).length === 1,
       "N4: another server's tool, and another of this server's tools, are caught");
     ok(!SEARCH_WORDS.dentist.test("Statistics for the Norwegian dental market") && SEARCH_WORDS.dentist.test("Find a dentist"), "N5: «dental» alone is no search word");
+    ok(BARE_FLAG_WORDS.test(OLD_AKUTT_DESCRIPTION) && shortToolDescription(OLD_AKUTT_DESCRIPTION) !== AKUTT_FIRST_SENTENCE,
+      "N6: the description before D3a fails D8 and D9b");
 
     // ── S: server card and agent card ────────────────────────────────────
     {
@@ -194,6 +270,29 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       eq((card?.tools ?? []).map((t: { name: string }) => t.name).sort(), DENTAL_TOOLS, "S3: server card lists exactly the five tools");
       const { getDentalAgentCard } = require("../services/dental-agent-card") as typeof import("../services/dental-agent-card");
       eq([...((getDentalAgentCard() as any)["x-mcp-tools"] ?? [])].sort(), DENTAL_TOOLS, "S4: agent card x-mcp-tools: exactly the five tools");
+
+      // S5–S9 (D3a): the card's capabilities are the ones initialize sends, on every card path.
+      const served = init.result?.capabilities;
+      eq(JSON.stringify(card?.capabilities), JSON.stringify(served), "S5: server card capabilities are byte-identical to initialize.result.capabilities");
+      ok(!!card?.capabilities && !("resources" in card.capabilities) && !("prompts" in card.capabilities),
+        `S6: the card claims no resources or prompts (${JSON.stringify(card?.capabilities)})`);
+      for (const [i, method] of ["resources/list", "prompts/list"].entries()) {
+        const r = await post({ jsonrpc: "2.0", id: 10 + i, method, params: {} }, sessionId);
+        eq(parseJsonRpcBody(await r.text(), r.headers.get("content-type")).error?.code, -32601, `S6b: ${method} on the live session is -32601`);
+      }
+      ok(served?.tools?.listChanged === true && card?.capabilities?.tools?.listChanged === served.tools.listChanged,
+        "S7: tools.listChanged is the same (true) in the card and in initialize");
+      const aliases = ["/.well-known/mcp.json", "/.well-known/mcp-server.json", "/.well-known/mcp/server-cards.json"];
+      for (const p of aliases) {
+        const r = await callRoute(seo.default, p);
+        const body = Array.isArray(r.body) ? r.body[0] : r.body;
+        eq([r.status, JSON.stringify(body?.capabilities)], [200, JSON.stringify(served)], `S8 ${p}: capabilities === initialize.result.capabilities`);
+      }
+      const cardAkutt = (card?.tools ?? []).find((t: { name: string }) => t.name === "tannlege_akutt")?.description;
+      const llms = (await callRoute(seo.default, "/llms.txt")).text;
+      ok(cardAkutt === AKUTT_FIRST_SENTENCE && llms.includes(`- tannlege_akutt — ${AKUTT_FIRST_SENTENCE}`),
+        "S9: the server card and llms.txt carry tannlege_akutt's new first sentence");
+      ok(![JSON.stringify(card), llms].some((t) => t.includes("flagged for emergency")), "S9b: «flagged for emergency» is in neither the card nor llms.txt");
     }
   } catch (err: any) {
     failed++;

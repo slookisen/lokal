@@ -9,16 +9,20 @@
  *       and patient_focus (malformed JSON, top-level arrays, objects, strings,
  *       nested and non-text elements), and malformed JSON raises no error;
  *   P   parity on the named fixture (Vakt Med Kilde, Vakt Uten Kilde,
- *       akutt-fokus, …): the public list and count are the claim rows;
+ *       akutt-fokus, …): the public list and count are the claim rows, and
+ *       getDentalStats().acute_count is that count (D3a, dev-request
+ *       2026-10-17-dental-d3-rettelser), row by row;
  *   M   MCP over a real server + client: tannlege_akutt (with and without
  *       fylke) and tannlege_search (`akutt`, a parsed «akuttvakt», akutt false)
  *       give only claim cards, every one badged, `count` the claim rows;
- *   W   /sok?akutt=1 and a parsed /sok query;
+ *       tannlege_stats' acute_count is tannlege_akutt's count;
+ *   W   /sok?akutt=1 and a parsed /sok query, and the same number as stats;
  *   A   A2A message/send: parsed text, the old keyword reading (switch-off
- *       path) and structured message.data;
+ *       path) and structured message.data; «statistikk» gives the same number;
  *   R   GET /api/tannlege/agents and the admin list/count keep the raw flag,
  *       and acute_vakt 0 stays the raw column; no row is written;
- *   T   timing on a 10,000-row fixture with live-like provenance sizes.
+ *   T   timing on a 10,000-row fixture with live-like provenance sizes, for the
+ *       filter and for getDentalStats().
  *
  * Standalone: npx tsx src/routes/dental-acute-filter.test.ts
  * Wired into tests/test.ts via runDentalAcuteFilterTests().
@@ -144,9 +148,11 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
     const nedlagtFokus = add("Nedlagt Fokus Tannklinikk AS", "918770010", { patient_focus: ["Akutt"], is_inactive: 1 });
     const osloVakt = add("Oslo Vakt Med Kilde AS", "918770011", { acute_vakt: 1, field_provenance: SOURCED }, { poststed: "OSLO", fylke: "Oslo", postnummer: "0150" });
     const osloUtenKilde = add("Oslo Vakt Uten Kilde AS", "918770012", { acute_vakt: 1 }, { poststed: "OSLO", fylke: "Oslo", postnummer: "0151" });
+    // D3a: one more bare flag, so the public raw-flag count (7) differs from the claim count (6).
+    const vaktUtenKildeTo = add("Vakt Uten Kilde To Tannklinikk AS", "918770013", { acute_vakt: 1 });
     const claimVestland = [vaktMedKilde, vaktKildeObjekt, vaktUtenKildeFokus, fokusUtenFlagg, fokusFlaggNull];
     const claimAll = [...claimVestland, osloVakt];
-    const rawFlag = [vaktMedKilde, vaktKildeObjekt, vaktUtenKilde, vaktUtenKildeFokus, avvistVakt, osloVakt, osloUtenKilde];
+    const rawFlag = [vaktMedKilde, vaktKildeObjekt, vaktUtenKilde, vaktUtenKildeFokus, avvistVakt, osloVakt, osloUtenKilde, vaktUtenKildeTo];
     const nameOf = new Map<string, string>(
       (db.prepare("SELECT id, navn FROM dental_agents").all() as Array<{ id: string; navn: string }>).map((r) => [r.id, r.navn])
     );
@@ -164,10 +170,45 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       eq(sorted(pubIds({ acute_vakt: 1 })), sorted(claimAll), "P2: ... which are the sourced duties and the akutt-focus clinics, flagged or not");
       eq(store.countPublicDentalAgents({ acute_vakt: 1 }), claimAll.length, "P3: countPublicDentalAgents agrees");
       eq(sorted(pubIds({ acute_vakt: 1, fylke: "Vestland" })), sorted(claimVestland), "P4: combined with fylke");
-      ok(!pubIds({ acute_vakt: 1 }).includes(vaktUtenKilde) && !pubIds({ acute_vakt: 1 }).includes(osloUtenKilde), "P5: a flag without a source and no akutt focus is not listed");
+      ok(![vaktUtenKilde, osloUtenKilde, vaktUtenKildeTo].some((id) => pubIds({ acute_vakt: 1 }).includes(id)), "P5: a flag without a source and no akutt focus is not listed");
       ok(!pubIds({ acute_vakt: 1 }).includes(avvistVakt) && !pubIds({ acute_vakt: 1 }).includes(nedlagtFokus), "P6: rejected and closed clinics stay out");
       const nat = { natural: { parsed: { acute_vakt: 1, poststed_in: ["BERGEN"] }, legacy: { acute_vakt: 1, fylke: "Vestland" } } };
       eq(sorted(pubIds(nat)), sorted(claimVestland), "P7: both branches of `natural` (parsed, and A2A's keyword reading) use the claim");
+    }
+
+    // ── P8–P9: getDentalStats().acute_count is the public akutt count (D3a) ─
+    {
+      const stats = store.getDentalStats();
+      eq([stats.acute_count, store.countPublicDentalAgents({ acute_vakt: 1 })], [claimAll.length, claimAll.length],
+        "P8: getDentalStats().acute_count === countPublicDentalAgents({acute_vakt: 1}), the claim rows");
+      const publicRawFlags = (db.prepare(
+        "SELECT COUNT(*) AS n FROM dental_agents WHERE acute_vakt = 1 AND verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)"
+      ).get() as { n: number }).n;
+      ok(publicRawFlags !== claimAll.length,
+        `P8b: (the fixture has ${publicRawFlags} public raw flags and ${claimAll.length} claims, so P8, M11, W4 and A5 tell them apart)`);
+      // Each kind of row is also added on its own: the count must move by exactly what its card shows.
+      const delta = (navn: string, org: string, extra: Record<string, unknown>): number => {
+        const before = store.getDentalStats().acute_count;
+        const id = add(navn, org, extra);
+        try {
+          return store.getDentalStats().acute_count - before;
+        } finally {
+          db.prepare("DELETE FROM dental_agents WHERE id = ?").run(id);
+        }
+      };
+      eq(delta("Ny Vakt Uten Kilde AS", "918770101", { acute_vakt: 1 }), 0, "P9a: a flag without a source is not counted");
+      eq(delta("Ny Vakt Annen Kilde AS", "918770102", { acute_vakt: 1, field_provenance: { telefon: [{ source_type: "brreg" }] } }), 0,
+        "P9b: a flag whose provenance is for another field is not counted");
+      eq(delta("Ny Avvist Vakt AS", "918770103", { acute_vakt: 1, field_provenance: SOURCED, verification_status: "rejected" }), 0,
+        "P9c: a rejected clinic with a sourced duty is not counted");
+      eq(delta("Ny Nedlagt Vakt AS", "918770104", { acute_vakt: 1, field_provenance: SOURCED, is_inactive: 1 }), 0,
+        "P9d: a closed clinic with a sourced duty is not counted");
+      eq(delta("Ny Lab Vakt AS", "918770105", { acute_vakt: 1, field_provenance: SOURCED, catalog_class: "lab_leverandor" }), 0,
+        "P9e: a non-clinic with a sourced duty is not counted");
+      eq(delta("Ny Akuttfokus Uten Flagg AS", "918770106", { acute_vakt: 0, patient_focus: ["Akutt"] }), 1,
+        "P9f: akutt in patient_focus without the flag is counted («Tar imot akuttpasienter»)");
+      eq(delta("Ny Vakt Med Kilde AS", "918770107", { acute_vakt: 1, field_provenance: SOURCED }), 1, "P9g: a sourced duty is counted");
+      eq(store.getDentalStats().total, store.countPublicDentalAgents({}), "P9h: `total` is still the honest public count");
     }
 
     // ── M: MCP over a real server + client ────────────────────────────────
@@ -207,6 +248,18 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       const plain = await call("tannlege_search", { fylke: "Vestland", limit: 25 });
       ok(plain.count > claimVestland.length, "M10: without akutt the filter does not apply");
     }
+    let mcpAcuteCount = -1;
+    let mcpAkuttCount = -1;
+    {
+      const stats = await call("tannlege_stats", {});
+      const akutt = await call("tannlege_akutt", {});
+      mcpAcuteCount = stats.acute_count;
+      mcpAkuttCount = akutt.count;
+      eq([stats.acute_count, akutt.count], [claimAll.length, claimAll.length], "M11: tannlege_stats acute_count === tannlege_akutt {}.count");
+      const why = String(stats._forklaring?.acute_count ?? "");
+      ok(why.includes("«Akuttvakt» (med kilde)") && why.includes("«Tar imot akuttpasienter»") && why.includes("tannlege_akutt.count") &&
+        why.includes("/sok?akutt=1") && !/akuttvakt-tilbud/.test(why), `M12: _forklaring.acute_count names the claim and the shared number («${why}»)`);
+    }
 
     // ── W: /sok ───────────────────────────────────────────────────────────
     {
@@ -217,6 +270,9 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       ok(page.text.includes(`${claimVestland.length} klinikker funnet`), "W2: ... and counts them");
       const parsed = await callRoute(seoRouter, "/sok", { q: "akutt tannlege Bergen" });
       eq(shown(parsed.text), names(claimVestland), "W3: /sok?q=akutt tannlege Bergen (parsed) shows the same clinics");
+      const all = await callRoute(seoRouter, "/sok", { akutt: "1" });
+      ok(mcpAcuteCount === claimAll.length && all.text.includes(`${mcpAcuteCount} klinikker funnet`),
+        `W4: /sok?akutt=1 counts the same number as tannlege_stats acute_count (${mcpAcuteCount})`);
     }
 
     // ── A: A2A message/send ───────────────────────────────────────────────
@@ -235,6 +291,9 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       } finally {
         delete process.env.DENTAL_QUERY_PARSER_DISABLED;
       }
+      const stats = (a2a.handleDentalMessageSend({ message: { text: "statistikk" } }, "d3a") as any).result;
+      eq([stats.metadata?.skill, stats.artifacts[0].parts[0].data.acute_count], ["tannlege_stats", mcpAkuttCount],
+        "A5: A2A «statistikk» gives tannlege_akutt's count as acute_count");
     }
 
     // ── R: the raw flag stays for admin and enrichment ────────────────────
@@ -288,6 +347,11 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
         // Stable label (no measured numbers): the CI determinism gate compares failure texts across runs.
         ok(c < budget && l < budget, `T1: ${label}: count and list each within budget on 10,000 rows (best of 7)`);
       }
+      // D3a: getDentalStats() reads the claim too, on the synchronous stats fill behind the 60 s cache.
+      // Its six aggregates over the same rows (one of them the claim count in T1) stay within two budgets.
+      const s = timed(() => store.getDentalStats());
+      if (log) console.log(`    getDentalStats: ${s.toFixed(1)} ms (budget ${(2 * budget).toFixed(1)} ms)`);
+      ok(s < 2 * budget, "T2: getDentalStats() within two count budgets on 10,000 rows (best of 7)");
     }
   } catch (err: any) {
     failed++;
