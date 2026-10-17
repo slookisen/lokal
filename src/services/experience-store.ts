@@ -1224,25 +1224,60 @@ export function getCategoryFaqStats(category: string): {
 
 /** Aggregate stats for one kommune's FAQPage JSON-LD: how many distinct
  *  categories have a published experience there, and the lowest listed
- *  starting price (null if no row states one — never guessed). Mirrors
- *  getCategoryFaqStats() but grouped by kommune instead of category. */
+ *  starting price (null if no row states one — never guessed). Thin wrapper
+ *  over getPlaceFaqStats({ kommune }) since E4-S2. */
 export function getKommuneFaqStats(kommune: string): {
   categoryCount: number;
   minPriceFrom: number | null;
 } {
+  const { categoryCount, minPriceFrom } = getPlaceFaqStats({ kommune });
+  return { categoryCount, minPriceFrom };
+}
+
+/** The place a /fylke/<x> or /kommune/<x> page lists: exactly one of the two. */
+export type PlaceFilter = { fylke: string; kommune?: never } | { kommune: string; fylke?: never };
+
+/** The facts a place page's answer-first opening and FAQPage are built from. */
+export type PlaceFaqStats = {
+  total: number;
+  categoryCount: number;
+  kommuneCount: number;
+  providerCount: number;
+  minPriceFrom: number | null;
+};
+
+/** Aggregate stats for one fylke's or kommune's answer-first opening and
+ *  FAQPage JSON-LD (dev-request 2026-10-16-opplevagent-stedssider-kvalitet,
+ *  E4-S2): how many published experiences the place has, across how many
+ *  distinct categories, kommuner and providers, and the lowest listed
+ *  starting price (null if no row states one — never guessed). Same
+ *  browseWhere() filter as the listing, so the facts match what the page
+ *  lists. A blank place name returns zeros: browseWhere() would drop the
+ *  filter and count the whole catalog instead. */
+export function getPlaceFaqStats(place: PlaceFilter): PlaceFaqStats {
+  const filter: BrowseFilter = place.fylke !== undefined ? { fylke: place.fylke } : { kommune: place.kommune };
+  if (!filter.fylke && !filter.kommune) {
+    return { total: 0, categoryCount: 0, kommuneCount: 0, providerCount: 0, minPriceFrom: null };
+  }
   const db = getDb(VERTICAL);
-  const { sql, params } = browseWhere({ kommune });
+  const { sql, params } = browseWhere(filter);
   const row = db
     .prepare(
-      `SELECT COUNT(DISTINCT e.category) AS categoryCount,
+      `SELECT COUNT(*) AS total,
+              COUNT(DISTINCT e.category) AS categoryCount,
+              COUNT(DISTINCT e.kommune) AS kommuneCount,
+              COUNT(DISTINCT e.provider_id) AS providerCount,
               MIN(e.price_from) AS minPriceFrom
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE ${sql}`
     )
-    .get(params) as { categoryCount: number; minPriceFrom: number | null } | undefined;
+    .get(params) as PlaceFaqStats | undefined;
   return {
+    total: row?.total || 0,
     categoryCount: row?.categoryCount || 0,
+    kommuneCount: row?.kommuneCount || 0,
+    providerCount: row?.providerCount || 0,
     minPriceFrom: row?.minPriceFrom ?? null,
   };
 }
@@ -1292,7 +1327,10 @@ export function getProduktByStats(category: string, kommune: string): {
  *  empty): one GROUP BY query returns exactly the combos that exist in the
  *  catalog, with the quality-gate facts already attached, so the sitemap
  *  builder can apply the ≥2-real-facts gate in-memory over this one result
- *  set instead of issuing a query per candidate combo. */
+ *  set instead of issuing a query per candidate combo. Rows without a slug
+ *  are left out, as browseWhere() leaves them out of getProduktByStats() and
+ *  the listing (E4-S2), so a listed or linked cell has the facts the route
+ *  sees. */
 export type ProduktByComboRow = {
   category: string;
   kommune: string;
@@ -1314,7 +1352,8 @@ export function listProduktByCombos(): ProduktByComboRow[] {
               MAX(e.updated_at) AS lastmod
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
-       WHERE e.category IS NOT NULL AND e.category != ''
+       WHERE e.slug IS NOT NULL
+         AND e.category IS NOT NULL AND e.category != ''
          AND e.kommune IS NOT NULL AND e.kommune != ''
          AND ${PUBLISH_GATE_SQL}
        GROUP BY e.category, e.kommune

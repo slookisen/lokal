@@ -42043,6 +42043,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S2: one place
+// helper (getPlaceFaqStats + buildPlaceFaqJsonLd/buildPlaceAnswerFirstOpening)
+// gives /kommune and /fylke their answer-first lede and FAQPage; category,
+// kommune, fylke and combo pages show the FAQ as visible text from the same
+// Q/A objects; plus the #1101 review follow-ups (fact rule, language prefix,
+// slug parity, cached /kommune chips).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-stedssider-kvalitet E4-S2: place answer-first + visible FAQ ──");
+  try {
+    const { runExperiencesSeoFylkeFaqTests } = require("../src/routes/experiences-seo-fylke-faq.test") as
+      typeof import("../src/routes/experiences-seo-fylke-faq.test");
+    const effq = await runExperiencesSeoFylkeFaqTests({ log: false });
+    passed += effq.passed;
+    failed += effq.failed;
+    for (const f of effq.failures) failures.push("experiences-seo-fylke-faq: " + f);
+    console.log(`  experiences-seo-fylke-faq: ${effq.passed} passed, ${effq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-fylke-faq: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-gardssalg-a2a-nl-routing: POST /a2a message/send on
 // opplevagent.no ALWAYS searched the generic `experiences` table, never the
 // gårdssalg (farm-sale drink producer) vertical in `experience_providers`.

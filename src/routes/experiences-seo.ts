@@ -89,9 +89,10 @@ import {
   foldPlaceSlug,
   listPublishedProviders,
   getCategoryFaqStats,
-  getKommuneFaqStats,
+  getPlaceFaqStats,
   getProduktByStats,
   listProduktByCombos,
+  type ProduktByComboRow,
   countGardssalgProviders,
   // dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering, S2: the
   // homepage drikkested feature section's per-type chips — same WHERE gate as
@@ -161,7 +162,7 @@ import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corrido
 // already relies on. See route-intent.ts's module header for why this must
 // stay a strict whole-string resolver + reluctant heuristic, unmodified.
 import { resolveRouteIntent, detectRouteIntent, reiseUrlFor } from "../services/route-intent";
-import { getDb as getExpDbForReise } from "../database/db-factory";
+import { getDb, getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
   getBookingByRef,
@@ -4544,6 +4545,14 @@ function renderBrowsePage(opts: {
   // the category whose PNG share card this page uses. Passed ONLY by
   // /kategori/:category; every other caller gets the default card.
   ogCategory?: string;
+  // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S2: also show
+  // the FAQPage from extraJsonLd as text, in a <section id="faq"> below the
+  // grid, built by renderFaqSectionHtml() from the SAME Q/A objects the
+  // JSON-LD serialises, so the visible text and the markup cannot drift.
+  // Passed by /kategori/:category, /fylke/:fylke, /kommune/:kommune and
+  // /kategori/:category/:kommune. No section (and no FAQ CSS) when the
+  // quality gate left no FAQPage; callers that omit it render as before.
+  faqVisible?: boolean;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -4584,6 +4593,9 @@ function renderBrowsePage(opts: {
   const ldScripts = [collectionLd, breadcrumbLd, ...(opts.extraJsonLd || [])]
     .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
     .join("\n");
+  const faqHtml = opts.faqVisible
+    ? renderFaqSectionHtml((opts.extraJsonLd || []).find((o) => o && o["@type"] === "FAQPage"))
+    : "";
 
   const crumbHtml = opts.crumbs
     .map((c, i) =>
@@ -4661,7 +4673,7 @@ ${pwaHeadTags({ includeThemeColor: false })}
 ${ldScripts}
 <style>${BROWSE_CSS}${sketchCss}${chromeCss}</style>
 ${opts.map ? `<style>${FYLKE_MAP_CSS}</style>` : ""}
-</head>
+${faqHtml ? `<style>${BROWSE_FAQ_CSS}</style>\n` : ""}</head>
 <body>
 ${navHtml}
 ${stageOpen}<main id="main" class="container">
@@ -4675,12 +4687,37 @@ ${stageOpen}<main id="main" class="container">
   ${opts.extraTopHtml || ""}
   ${grid}
   ${opts.map ? renderFylkeMapSection(opts.map.fylke, opts.map.points, opts.lang) : ""}
-  ${pager}
+  ${pager}${faqHtml ? `\n  ${faqHtml}` : ""}
 </main>${stageClose}
 ${footHtml}
 </body>
 </html>`;
 }
+
+// The visible half of a FAQPage (dev-request 2026-10-16-opplevagent-
+// stedssider-kvalitet, E4-S2): one <h3>/<p> per Question in its mainEntity,
+// the same `name` and `acceptedAnswer.text` the JSON-LD carries, escaped.
+// The section id matches the FAQPage's `@id` anchor (<url>#faq). "" for a
+// missing or empty FAQPage, so a gated-out FAQ renders nothing. Exported for
+// tests.
+export function renderFaqSectionHtml(faqLd: { mainEntity?: Array<{ name: string; acceptedAnswer: { text: string } }> } | null | undefined): string {
+  const qas = Array.isArray(faqLd?.mainEntity) ? faqLd.mainEntity : [];
+  if (qas.length === 0) return "";
+  const items = qas
+    .map((qa) => `<div class="faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`)
+    .join("");
+  return `<section id="faq" class="faq" aria-labelledby="faq-title"><h2 id="faq-title">Ofte stilte spørsmål</h2>${items}</section>`;
+}
+
+// Styles for renderFaqSectionHtml(), emitted only on a page that renders the
+// section. Uses BROWSE_CSS's tokens.
+const BROWSE_FAQ_CSS = `
+  .faq{margin:34px 0 12px;padding-top:22px;border-top:1px solid var(--line);max-width:760px}
+  .faq h2{font-size:1.15rem;font-weight:800;letter-spacing:-.01em;color:var(--fjord-900);margin-bottom:14px}
+  .faq-item{margin-bottom:14px}
+  .faq-item h3{font-size:.98rem;font-weight:700;color:var(--fjord-900);margin-bottom:4px}
+  .faq-item p{font-size:.92rem;color:var(--ink-soft);max-width:65ch}
+`;
 
 // Parse ?page= into a 1-based page number (defensive; defaults to 1).
 function parsePage(q: unknown): number {
@@ -4702,18 +4739,39 @@ function kommuneChips(fylke: string): string {
   return `<div class="chips" role="list" aria-label="Kommuner i ${escapeHtml(fylke)}">${chips}</div>`;
 }
 
+// The combo list behind the /kommune category chips, cached in memory for
+// the sitemap's TTL (resolveSitemapCacheTtlMs(), SITEMAP_CACHE_TTL_MS)
+// instead of a full-table GROUP BY on every /kommune request (#1101 review
+// S1). The rows are raw facts: produktByChips() applies the gate per
+// request, so a threshold change still takes effect at once, while a newly
+// published or unpublished cell reaches the chips on the sitemap's cadence.
+// The entry belongs to the experiences DB handle it was read from, so a
+// reopened DB never serves the old one's rows. Exported for tests.
+let produktByCombosCache: { db: unknown; rows: ProduktByComboRow[]; builtAt: number } | null = null;
+export function getCachedProduktByCombos(now: number = Date.now()): ProduktByComboRow[] {
+  const db = getDb("experiences");
+  const hit = produktByCombosCache;
+  if (hit && hit.db === db && now - hit.builtAt < resolveSitemapCacheTtlMs()) return hit.rows;
+  const rows = listProduktByCombos();
+  produktByCombosCache = { db, rows, builtAt: now };
+  return rows;
+}
+export function __resetProduktByCombosCacheForTesting(): void {
+  produktByCombosCache = null;
+}
+
 // Category chips for a kommune page (dev-request 2026-10-16-opplevagent-
 // stedssider-kvalitet, E4-S1): one chip per /kategori/<cat>/<kommune> combo
 // page that clears isProduktByCellIndexable() -- the gate the combo route and
 // the sitemap read too, so a chip never links to a cell that redirects back
-// here. One listProduktByCombos() query, filtered in memory; its rows come
+// here. The cached combo list above, filtered in memory; its rows come
 // largest first. Same chip markup as facetChips()'s category chips, colour
 // dot included. "" when the kommune has no combo page to link; a failed
 // query is logged (not a silent catch) and the page renders without chips.
 function produktByChips(kommune: string): string {
-  let combos: ReturnType<typeof listProduktByCombos> = [];
+  let combos: ProduktByComboRow[] = [];
   try {
-    combos = listProduktByCombos().filter((c) => c.kommune === kommune && !!c.category && isProduktByCellIndexable(c));
+    combos = getCachedProduktByCombos().filter((c) => c.kommune === kommune && !!c.category && isProduktByCellIndexable(c));
   } catch (e) {
     console.error(`[experiences-seo] /kommune/${kommune} category chips failed:`, e);
     return "";
@@ -7431,42 +7489,86 @@ export function buildCategoryFaqJsonLd(params: {
   };
 }
 
-// GEO: FAQPage JSON-LD for kommune (municipality) pages — the "city" half of
-// the same dev-request slice, for the experiences vertical's
-// /kommune/:kommune listing. Same shape/quality-gate as
-// buildCategoryFaqJsonLd(); see getKommuneFaqStats() for the aggregate query.
-export function buildKommuneFaqJsonLd(params: {
-  kommune: string;
-  fylke: string | null;
-  url: string;
+// GEO: place pages — /kommune/:kommune (dev-request
+// 2026-06-30-geo-content-structured-data, category/city slice) and, since
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet E4-S2,
+// /fylke/:fylke. One FAQPage builder and one answer-first builder serve both,
+// with the place kind as a parameter; buildKommuneFaqJsonLd() and
+// buildKommuneAnswerFirstOpening() below are thin wrappers kept for their
+// callers. Every answer comes from getPlaceFaqStats() over the SAME
+// publish-gated rows the page lists — never fabricated — and both builders
+// share one quality gate, placeRealFacts(): null unless ≥2 real facts, so a
+// thin place gets the generic lede and no FAQ.
+export type PlaceKind = "kommune" | "fylke";
+export type PlaceFacts = {
+  kind: PlaceKind;
+  /** The kommune or fylke the page lists. */
+  name: string;
+  /** kommune only: the fylke it sits in, shown in parentheses. */
+  fylke?: string | null;
   total: number;
   categoryCount: number;
+  /** fylke only: how many kommuner the experiences spread over. A clause on
+   *  the count, not a fact of its own (a kommune is always 1). */
+  kommuneCount?: number;
+  providerCount?: number;
   minPriceFrom: number | null;
-}): any | null {
+};
+
+/** The real facts a place page is judged on, and how many there are — the
+ *  one rule both place builders gate on and phrase from. */
+function placeRealFacts(p: PlaceFacts): { total: boolean; categories: boolean; providers: boolean; price: boolean; count: number } {
+  const total = p.total > 0;
+  const categories = p.categoryCount > 0;
+  const providers = (p.providerCount ?? 0) > 0;
+  const price = p.minPriceFrom !== null && p.minPriceFrom >= 0;
+  return { total, categories, providers, price, count: [total, categories, providers, price].filter(Boolean).length };
+}
+
+/** What follows the place name in the count answer and the opening: a
+ *  kommune's parent (" (Vestland)"), a fylke's spread ("14 kommuner"); ""
+ *  when there is nothing real to say. */
+function placeCountSuffix(p: PlaceFacts): { parent: string; spread: string } {
+  if (p.kind === "kommune") return { parent: p.fylke ? ` (${p.fylke})` : "", spread: "" };
+  const k = p.kommuneCount ?? 0;
+  return { parent: "", spread: k > 0 ? `${k} ${k === 1 ? "kommune" : "kommuner"}` : "" };
+}
+
+export function buildPlaceFaqJsonLd(params: PlaceFacts & { url: string }): any | null {
+  const has = placeRealFacts(params);
+  if (has.count < 2) return null;
+  const name = params.name;
+  const { parent, spread } = placeCountSuffix(params);
   const qas: Array<{ q: string; a: string }> = [];
 
-  if (params.total > 0) {
+  if (has.total) {
     qas.push({
-      q: `Hvor mange opplevelser finnes i ${params.kommune}?`,
-      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} i ${params.kommune}${params.fylke ? ` (${params.fylke})` : ""} på Opplevagent.`,
+      q: `Hvor mange opplevelser finnes i ${name}?`,
+      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} i ${name}${parent} på Opplevagent${spread ? `, fordelt på ${spread}` : ""}.`,
     });
   }
 
-  if (params.categoryCount > 0) {
+  if (has.categories) {
     qas.push({
-      q: `Hva slags opplevelser kan jeg finne i ${params.kommune}?`,
-      a: `Opplevelsene i ${params.kommune} spenner over ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"} på Opplevagent.`,
+      q: `Hva slags opplevelser kan jeg finne i ${name}?`,
+      a: `Opplevelsene i ${name} spenner over ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"} på Opplevagent.`,
     });
   }
 
-  if (params.minPriceFrom !== null && params.minPriceFrom >= 0) {
+  if (has.providers) {
+    const n = params.providerCount ?? 0;
     qas.push({
-      q: `Hva koster en opplevelse i ${params.kommune}?`,
-      a: `Prisene i ${params.kommune} starter fra ${params.minPriceFrom} kr — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
+      q: `Hvor mange tilbydere har opplevelser i ${name}?`,
+      a: `Opplevelsene i ${name} kommer fra ${n} ${n === 1 ? "tilbyder" : "tilbydere"} på Opplevagent.`,
     });
   }
 
-  if (qas.length < 2) return null;
+  if (has.price) {
+    qas.push({
+      q: `Hva koster en opplevelse i ${name}?`,
+      a: `Prisene i ${name} starter fra ${params.minPriceFrom} kr — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
+    });
+  }
 
   return {
     "@context": "https://schema.org",
@@ -7478,6 +7580,20 @@ export function buildKommuneFaqJsonLd(params: {
       "acceptedAnswer": { "@type": "Answer", "text": a },
     })),
   };
+}
+
+// FAQPage JSON-LD for a kommune page — thin wrapper over
+// buildPlaceFaqJsonLd(), same output as before E4-S2 for the same inputs.
+export function buildKommuneFaqJsonLd(params: {
+  kommune: string;
+  fylke: string | null;
+  url: string;
+  total: number;
+  categoryCount: number;
+  minPriceFrom: number | null;
+}): any | null {
+  const { kommune, ...rest } = params;
+  return buildPlaceFaqJsonLd({ kind: "kommune", name: kommune, ...rest });
 }
 
 // GEO: answer-first SSR opening for category pages (dev-request
@@ -7516,12 +7632,34 @@ export function buildCategoryAnswerFirstOpening(params: {
   return `${params.label} på Opplevagent: ${countPhrase}${spreadPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
 }
 
-// GEO: answer-first SSR opening for kommune (municipality) pages — the
-// "city" half of the same answer-first-opening slice, mirroring
-// buildCategoryAnswerFirstOpening() above. Grounded strictly in the same
-// getKommuneFaqStats() aggregate already verified real for
-// buildKommuneFaqJsonLd. Same quality gate, same fail-safe-and-log-on-fallback
-// contract.
+// GEO: answer-first SSR opening for place pages (kommune and, since E4-S2,
+// fylke), mirroring buildCategoryAnswerFirstOpening() above. Grounded in the
+// same getPlaceFaqStats() aggregate and the same placeRealFacts() gate as
+// buildPlaceFaqJsonLd(), so a place gets both or neither. Same
+// fail-safe-and-log-on-fallback contract: the caller logs a null and keeps
+// its generic lede (placeFaqAndLede()).
+export function buildPlaceAnswerFirstOpening(params: PlaceFacts): string | null {
+  const has = placeRealFacts(params);
+  if (has.count < 2) return null;
+  const { parent, spread } = placeCountSuffix(params);
+
+  const countPhrase = has.total
+    ? `${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"}`
+    : "opplevelser";
+  const spreadPhrase = spread ? ` i ${spread}` : "";
+  const categoryPhrase = has.categories
+    ? ` fordelt på ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"}`
+    : "";
+  const n = params.providerCount ?? 0;
+  const providerPhrase = has.providers ? ` hos ${n} ${n === 1 ? "tilbyder" : "tilbydere"}` : "";
+  const pricePhrase = has.price ? `, fra ${params.minPriceFrom} kr` : "";
+
+  return `Opplevelser i ${params.name}${parent}: ${countPhrase}${spreadPhrase}${categoryPhrase}${providerPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
+}
+
+// Answer-first opening for a kommune page — thin wrapper over
+// buildPlaceAnswerFirstOpening(), same output as before E4-S2 for the same
+// inputs.
 export function buildKommuneAnswerFirstOpening(params: {
   kommune: string;
   fylke: string | null;
@@ -7529,23 +7667,37 @@ export function buildKommuneAnswerFirstOpening(params: {
   categoryCount: number;
   minPriceFrom: number | null;
 }): string | null {
-  const hasTotal = params.total > 0;
-  const hasCategories = params.categoryCount > 0;
-  const hasPrice = params.minPriceFrom !== null && params.minPriceFrom >= 0;
+  const { kommune, ...rest } = params;
+  return buildPlaceAnswerFirstOpening({ kind: "kommune", name: kommune, ...rest });
+}
 
-  const factCount = (hasTotal ? 1 : 0) + (hasCategories ? 1 : 0) + (hasPrice ? 1 : 0);
-  if (factCount < 2) return null;
-
-  const countPhrase = hasTotal
-    ? `${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"}`
-    : "opplevelser";
-  const categoryPhrase = hasCategories
-    ? ` fordelt på ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"}`
-    : "";
-  const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
-  const fylkePart = params.fylke ? ` (${params.fylke})` : "";
-
-  return `Opplevelser i ${params.kommune}${fylkePart}: ${countPhrase}${categoryPhrase}${pricePhrase} — håndplukket og verifisert mot Brønnøysundregistrene.`;
+// The FAQPage and lede a place page renders: getPlaceFaqStats() feeds both
+// place builders (one query, one quality gate). /fylke/:fylke and
+// /kommune/:kommune both call this, so they are wired the same way. Never
+// allowed to break the page: on any error it fails safe to no FAQ block and
+// the generic lede, and it logs both that and a gate fallback (never a silent
+// catch-and-null — the PR-149 incident note in the dev-request).
+function placeFaqAndLede(p: {
+  kind: PlaceKind;
+  name: string;
+  fylke: string | null;
+  canonicalPath: string;
+  genericLede: string;
+}): { faqJsonLd: any | null; lede: string } {
+  const routePath = `/${p.kind}/${p.name}`;
+  try {
+    const stats = getPlaceFaqStats(p.kind === "fylke" ? { fylke: p.name } : { kommune: p.name });
+    const facts: PlaceFacts = { kind: p.kind, name: p.name, fylke: p.fylke, ...stats };
+    const faqJsonLd = buildPlaceFaqJsonLd({ ...facts, url: `${baseUrl()}${p.canonicalPath}` });
+    const answerFirst = buildPlaceAnswerFirstOpening(facts);
+    if (!answerFirst) {
+      console.log(`[experiences-seo] ${routePath}: answer-first opening skipped (insufficient real facts) — falling back to generic lede`);
+    }
+    return { faqJsonLd, lede: answerFirst || p.genericLede };
+  } catch (e) {
+    console.error(`[experiences-seo] ${routePath} FAQ stats failed:`, e);
+    return { faqJsonLd: null, lede: p.genericLede };
+  }
 }
 
 // GEO: FAQPage JSON-LD for the produkt×by "query landing pages" — the final
@@ -7570,6 +7722,9 @@ export function buildProduktByFaqJsonLd(params: {
   providerCount: number;
   minPriceFrom: number | null;
 }): any | null {
+  // The fact rule lives in countProduktByRealFacts() (experience-indexability.ts),
+  // which the combo gate reads too (#1101 review S3).
+  if (countProduktByRealFacts(params) < 2) return null;
   const qas: Array<{ q: string; a: string }> = [];
   const labelLc = params.categoryLabel.toLowerCase();
 
@@ -7583,7 +7738,7 @@ export function buildProduktByFaqJsonLd(params: {
   if (params.providerCount > 0) {
     qas.push({
       q: `Hvor mange tilbydere av ${labelLc} finnes i ${params.kommune}?`,
-      a: `${params.providerCount} verifiserte ${params.providerCount === 1 ? "tilbyder" : "tilbydere"} av ${labelLc} i ${params.kommune} er listet på Opplevagent — alle sjekket mot Brønnøysundregistrene.`,
+      a: `${params.providerCount} ${params.providerCount === 1 ? "verifisert tilbyder" : "verifiserte tilbydere"} av ${labelLc} i ${params.kommune} er listet på Opplevagent — alle sjekket mot Brønnøysundregistrene.`,
     });
   }
 
@@ -7593,8 +7748,6 @@ export function buildProduktByFaqJsonLd(params: {
       a: `Prisene for ${labelLc} i ${params.kommune} starter fra ${params.minPriceFrom} kr.`,
     });
   }
-
-  if (qas.length < 2) return null;
 
   return {
     "@context": "https://schema.org",
@@ -7622,12 +7775,10 @@ export function buildProduktByAnswerFirstOpening(params: {
   providerCount: number;
   minPriceFrom: number | null;
 }): string | null {
+  if (countProduktByRealFacts(params) < 2) return null;
   const hasTotal = params.total > 0;
   const hasProviders = params.providerCount > 0;
   const hasPrice = params.minPriceFrom !== null && params.minPriceFrom >= 0;
-
-  const factCount = (hasTotal ? 1 : 0) + (hasProviders ? 1 : 0) + (hasPrice ? 1 : 0);
-  if (factCount < 2) return null;
 
   const labelLc = params.categoryLabel.toLowerCase();
   const countPhrase = hasTotal
@@ -7744,6 +7895,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox("", { category }),
     extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined,
+    faqVisible: true,
     // dev-request 2026-08-08-opplevagent-ux-loft-kategorimotiver: category
     // pages adopt the shared S1 chrome (hamburger nav + full footer incl.
     // "For tilbydere") — the pre-existing slim BROWSE_NAV/browseFooter() this
@@ -7892,6 +8044,17 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
   // every `effective*` value below is exactly the SSR value computed above —
   // byte-identical to before this feature existed.
   const fylkeCanonicalPath = `/fylke/${encodeURIComponent(fylke)}`;
+  // GEO (dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S2):
+  // FAQPage JSON-LD + answer-first opening, wired exactly like
+  // /kommune/:kommune through placeFaqAndLede(). Falls back (logged) to the
+  // generic lede this page had before.
+  const { faqJsonLd: fylkeFaqJsonLd, lede: fylkeLede } = placeFaqAndLede({
+    kind: "fylke",
+    name: fylke,
+    fylke: null,
+    canonicalPath: fylkeCanonicalPath,
+    genericLede: `Hva kan du finne på i ${fylke}? Håndplukket oversikt over opplevelser i fylket.`,
+  });
   const geoSort = resolvePlaceGeoSort(req, { fylke });
   const effectiveRows = geoSort.geoActive && geoSort.rows ? geoSort.rows : rows;
   const effectiveTotal = geoSort.geoActive && geoSort.rows ? geoSort.rows.length : total;
@@ -7912,7 +8075,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     title: `Opplevelser i ${fylke} | Opplevagent`,
     h1: `Opplevelser i ${fylke}`,
     metaDesc: `Håndplukkede opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
-    lede: `Hva kan du finne på i ${fylke}? Håndplukket oversikt over opplevelser i fylket.`,
+    lede: fylkeLede,
     canonicalPath: fylkeCanonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: fylke }],
     rows: effectiveRows,
@@ -7920,6 +8083,8 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     page: effectivePage,
     pageSize: effectivePageSize,
     extraTopHtml: searchBox("", { fylke }) + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
+    extraJsonLd: fylkeFaqJsonLd ? [fylkeFaqJsonLd] : undefined,
+    faqVisible: true,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
     map: { fylke, points: mapPoints },
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
@@ -7974,43 +8139,16 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
   ];
 
   const kommuneCanonicalPath = `/kommune/${encodeURIComponent(kommune)}`;
-  const genericKommuneLede = `Hva kan du finne på i ${kommune}? Håndplukket oversikt over opplevelser i kommunen.`;
-  // GEO: FAQPage JSON-LD — see buildKommuneFaqJsonLd for the quality gate.
-  // The same getKommuneFaqStats() aggregate also feeds the answer-first
-  // opening paragraph (buildKommuneAnswerFirstOpening) below — one query, two
-  // GEO features sharing one quality gate. Never allowed to break the page:
-  // on any error we fail safe to no FAQ block + the generic lede, but log a
-  // structured, low-noise diagnostic so a regression here is visible in Fly
-  // logs without a live DB shell — this must NOT be a silent catch-and-null.
-  let kommuneFaqJsonLd: ReturnType<typeof buildKommuneFaqJsonLd> = null;
-  let kommuneLede = genericKommuneLede;
-  try {
-    const stats = getKommuneFaqStats(kommune);
-    kommuneFaqJsonLd = buildKommuneFaqJsonLd({
-      kommune,
-      fylke,
-      url: `${baseUrl()}${kommuneCanonicalPath}`,
-      total,
-      categoryCount: stats.categoryCount,
-      minPriceFrom: stats.minPriceFrom,
-    });
-    const answerFirst = buildKommuneAnswerFirstOpening({
-      kommune,
-      fylke,
-      total,
-      categoryCount: stats.categoryCount,
-      minPriceFrom: stats.minPriceFrom,
-    });
-    if (answerFirst) {
-      kommuneLede = answerFirst;
-    } else {
-      console.log(`[experiences-seo] /kommune/${kommune}: answer-first opening skipped (insufficient real facts) — falling back to generic lede`);
-    }
-  } catch (e) {
-    console.error(`[experiences-seo] /kommune/${kommune} FAQ stats failed:`, e);
-    kommuneFaqJsonLd = null;
-    kommuneLede = genericKommuneLede;
-  }
+  // GEO: FAQPage JSON-LD + answer-first opening from one getPlaceFaqStats()
+  // aggregate and one quality gate — see placeFaqAndLede(), which /fylke/:fylke
+  // calls the same way. Falls back (logged) to the generic lede.
+  const { faqJsonLd: kommuneFaqJsonLd, lede: kommuneLede } = placeFaqAndLede({
+    kind: "kommune",
+    name: kommune,
+    fylke,
+    canonicalPath: kommuneCanonicalPath,
+    genericLede: `Hva kan du finne på i ${kommune}? Håndplukket oversikt over opplevelser i kommunen.`,
+  });
 
   // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: "nærmest deg
   // først" sort — PROGRESSIVE ENHANCEMENT ONLY, mirrors /fylke/:fylke above
@@ -8049,6 +8187,7 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     // its kommuneChips().
     extraTopHtml: searchBox("") + produktByChips(kommune) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined,
+    faqVisible: true,
     distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
     // (delt header/footer): /kommune/:kommune adopts the shared S1 chrome
@@ -8121,9 +8260,10 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     const minExperiences = produktByMinExperiences();
     console.log(`[experiences-seo] /kategori/${category}/${kommune}: below combo gate (${stats.total} experience${stats.total === 1 ? "" : "s"}, min ${minExperiences}; ${countProduktByRealFacts(stats)} real facts) -- 301 to /kommune, not sitemapped`);
     // The threshold is an env setting (rollback = "1"), so the redirect is
-    // permanent for crawlers but not pinned forever in browser caches.
+    // permanent for crawlers but not pinned forever in browser caches. The
+    // target keeps the request's language prefix (#1101 review S2).
     res.setHeader("Cache-Control", "public, max-age=300");
-    return res.redirect(301, `/kommune/${encodeURIComponent(kommune)}`);
+    return res.redirect(301, localizedPath(`/kommune/${encodeURIComponent(kommune)}`, req.lang));
   }
 
   try {
@@ -8180,6 +8320,7 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox(""),
     extraJsonLd: produktByFaqJsonLd ? [produktByFaqJsonLd] : undefined,
+    faqVisible: true,
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 3
     // (delt header/footer): /kategori/:category/:kommune adopts the shared S1
     // chrome (hamburger nav + full footer incl. "For tilbydere"). "kategorier"
