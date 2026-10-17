@@ -2443,6 +2443,50 @@ export function listRelatedClinics(
   return rows.map(hydrateAgent);
 }
 
+/** Another clinic with the same name in the same place (listDentalNamesakes). */
+export interface DentalNamesake {
+  id: string;
+  org_nr: string | null;
+  postnummer: string | null;
+}
+
+/**
+ * Clinics with the same name as `agent` in its poststed: another id, the
+ * name equal once trimmed and case-folded, not rejected and not the
+ * synthetic probe row (dev-request 2026-10-17-dental-d3-rettelser, D3e).
+ * Their pages would otherwise get the same <title> and meta description;
+ * the profile page tells them apart with these rows (namesakeDisambiguator
+ * in routes/dental-seo.ts).
+ *
+ * Unlike listRelatedClinics this deliberately keeps closed and non-clinic
+ * rows: their pages render too, and a title must differ from every other
+ * page's. `spellings` are the place's other stored spellings (its /sted
+ * group: "BERGEN" and "Bergen" are both titled «Bergen»), looked up with
+ * the clinic's own on idx_dental_poststed. The name goes through nb_lower(),
+ * which folds Æ/Ø/Å; SQLite's own upper()/lower() fold ASCII only.
+ */
+export function listDentalNamesakes(
+  agent: Pick<DentalAgent, "navn" | "poststed"> & { id: string },
+  spellings: readonly string[] = []
+): DentalNamesake[] {
+  if (!agent.poststed) return [];
+  const places = [...new Set([agent.poststed, ...spellings])];
+  const rows = getDb("dental").prepare(`
+    SELECT id, org_nr, postnummer FROM dental_agents
+    WHERE poststed IN (${places.map(() => "?").join(", ")})
+      AND id != ?
+      AND verification_status != 'rejected'
+      AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
+      AND nb_lower(trim(navn)) = nb_lower(trim(?))
+    LIMIT 20
+  `).all(...places, agent.id, agent.navn) as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: r.id as string,
+    org_nr: (r.org_nr as string | null) ?? null,
+    postnummer: (r.postnummer as string | null) ?? null,
+  }));
+}
+
 /**
  * Minimal list for sitemap generation: org_nr, navn, updated_at.
  * Only non-rejected rows with an org_nr (required for stable slug).
