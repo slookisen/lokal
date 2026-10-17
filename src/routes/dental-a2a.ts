@@ -24,10 +24,19 @@ import { Router, Request, Response } from "express";
 import { z } from "zod";
 import {
   listPublicDentalAgents,
+  countPublicDentalAgents,
   getDentalAgentByOrgnr,
   getDentalStats,
+  listPoststeder,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import {
+  isDentalQueryParserDisabled,
+  parseDentalQuery,
+  planDentalSearch,
+  type DentalSearchTolkning,
+} from "../services/dental-query-parser";
+import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
@@ -83,8 +92,12 @@ function extractText(msg: unknown): string | null {
 }
 
 // ─── Intent parser ───────────────────────────────────────────
-// Extracts search parameters from a Norwegian/English natural-language query.
-// Keeps it simple: keyword matching on known fylker + specialties.
+// dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): free text goes
+// through the shared parser (services/dental-query-parser.ts), the same one
+// MCP tannlege_search and /sok use. The keyword matcher below
+// (legacyParseIntent) stays as the rollback (DENTAL_QUERY_PARSER_DISABLED=1)
+// and as the old reading planDentalSearch keeps next to the parsed one: its
+// hits stay in the result and come first, so no message finds fewer clinics.
 
 const FYLKER = [
   "oslo", "akershus", "østfold", "buskerud", "innlandet", "vestfold",
@@ -103,9 +116,18 @@ export interface DentalSearchParams {
   specialty?: string;
   helfo_agreement?: "true" | "false";
   acute_vakt?: 0 | 1;
+  // Set by the shared parser (see dental-store ListFilter).
+  poststed_in?: string[];
+  postnummer_in?: string[];
+  name_terms?: string[];
 }
 
 export function parseIntent(text: string): DentalSearchParams {
+  if (isDentalQueryParserDisabled()) return legacyParseIntent(text);
+  return parseDentalQuery(text, getDentalSearchGazetteer(listPoststeder)).filter;
+}
+
+function legacyParseIntent(text: string): DentalSearchParams {
   const lower = text.toLowerCase();
   const params: DentalSearchParams = {};
 
@@ -228,13 +250,11 @@ export function handleDentalMessageSend(
     return rpcErr(id, -32602, "Invalid params: 'message' required");
   }
 
-  // Parse intent
+  // Structured search (message.data); free text is planned in the search branch below.
   const messageText = extractText(message);
   let searchParams: DentalSearchParams = {};
 
-  if (messageText) {
-    searchParams = parseIntent(messageText);
-  } else if (message && typeof message === "object") {
+  if (!messageText && message && typeof message === "object") {
     const m = message as Record<string, unknown>;
     if (m.data && typeof m.data === "object") {
       const d = m.data as Record<string, unknown>;
@@ -321,14 +341,21 @@ export function handleDentalMessageSend(
 
   // Default: list/search
   try {
-    const filter: Record<string, unknown> = {};
-    if (searchParams.fylke) filter.fylke = searchParams.fylke;
-    if (searchParams.specialty) filter.specialty = searchParams.specialty;
-    if (searchParams.helfo_agreement) filter.helfo_agreement = searchParams.helfo_agreement;
-    if (searchParams.acute_vakt !== undefined) filter.acute_vakt = searchParams.acute_vakt;
-    if (searchParams.q) filter.q = searchParams.q;
+    let tolkning: DentalSearchTolkning | null = null;
+    if (messageText) {
+      const plan = planDentalSearch({
+        query: messageText,
+        explicit: {},
+        gazetteer: () => getDentalSearchGazetteer(listPoststeder),
+        count: (f) => countPublicDentalAgents(f as any),
+        legacy: (text) => ({ ...legacyParseIntent(text) }),
+      });
+      searchParams = plan.filter as DentalSearchParams;
+      tolkning = plan.tolkning;
+    }
 
-    const results = listPublicDentalAgents(filter as any, 20, 0);
+    // DentalSearchParams uses the store's own filter field names.
+    const results = listPublicDentalAgents(searchParams as any, 20, 0);
 
     const summaryText =
       results.length === 0
@@ -354,6 +381,7 @@ export function handleDentalMessageSend(
         skill: "tannlege_search",
         filter: searchParams,
         parsedFrom: messageText || null,
+        ...(tolkning ? { tolkning } : {}),
       },
     });
   } catch (err: unknown) {

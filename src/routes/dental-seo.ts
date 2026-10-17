@@ -42,6 +42,8 @@ import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { planDentalSearch, type DentalSearchTolkning } from "../services/dental-query-parser";
+import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
 // and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
@@ -133,7 +135,6 @@ export function findSpecialtyBySlug(slug: string): SpecialtyPage | undefined {
 // Cache getDentalStats() results in this module. dental-store has no cache
 // so API consumers always get fresh data; only SSR pages use the cache.
 let _dentalStatsCache: { value: ReturnType<typeof getDentalStats>; expires: number } | null = null;
-const DENTAL_STATS_TTL_MS = 60_000;
 
 function getCachedDentalStats(): ReturnType<typeof getDentalStats> {
   const now = Date.now();
@@ -445,15 +446,11 @@ export function buildClinicDescription(
 }
 
 // ─── Poststed cache (60 s, same TTL as stats) ────────────────
-let _poststedCache: { value: PoststedRow[]; expires: number } | null = null;
-
+// dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): one shared cache
+// (services/dental-search-gazetteer.ts) also feeds the search parser on /sok,
+// MCP and A2A, so listPoststeder(1) still runs at most once per TTL.
 function getCachedPoststeder(): PoststedRow[] {
-  const now = Date.now();
-  if (_poststedCache && now < _poststedCache.expires) return _poststedCache.value;
-  let value: PoststedRow[] = [];
-  try { value = listPoststeder(1); } catch { /* db not ready */ }
-  _poststedCache = { value, expires: now + DENTAL_STATS_TTL_MS };
-  return value;
+  return getCachedDentalPoststeder(listPoststeder);
 }
 
 // ─── "Åpent nå" helper ───────────────────────────────────────
@@ -1112,24 +1109,33 @@ router.get("/sok", (req: Request, res: Response) => {
   const page = Number.isFinite(sideRaw) && sideRaw > 0 ? sideRaw : 1;
   const offset = (page - 1) * PAGE_SIZE;
 
-  const filter: Record<string, unknown> = {};
-  if (q) filter.q = q;
-  if (fylke) filter.fylke = fylke;
-  if (spesialitet) filter.specialty = spesialitet;
-  if (helfo) filter.helfo_agreement = "true";
-  if (akutt) filter.acute_vakt = 1;
-  if (kjede) filter.chain_brand = kjede;
+  // The form's own fields win over what the parser reads out of `q`
+  // (dev-request 2026-10-16-tannlege-sok-naturlig-sprak, S3).
+  const explicit: Record<string, unknown> = {};
+  if (fylke) explicit.fylke = fylke;
+  if (spesialitet) explicit.specialty = spesialitet;
+  if (helfo) explicit.helfo_agreement = "true";
+  if (akutt) explicit.acute_vakt = 1;
+  if (kjede) explicit.chain_brand = kjede;
 
   let agents: Array<DentalAgent & { id: string }> = [];
   let total = 0;
+  let tolkning: DentalSearchTolkning | null = null;
   try {
-    agents = listPublicDentalAgents(filter as any, PAGE_SIZE, offset);
-    total = countPublicDentalAgents(filter as any);
+    const plan = planDentalSearch({
+      query: q,
+      explicit,
+      gazetteer: () => getDentalSearchGazetteer(listPoststeder),
+      count: (f) => countPublicDentalAgents(f as any),
+    });
+    tolkning = plan.tolkning;
+    total = plan.count;
+    agents = listPublicDentalAgents(plan.filter as any, PAGE_SIZE, offset);
   } catch { /* db not ready */ }
 
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: a search is
   // the first result page of a query or filter set (paging is not a new one).
-  if (page === 1 && Object.keys(filter).length > 0) {
+  if (page === 1 && (q || Object.keys(explicit).length > 0)) {
     analyticsService.logWebSearch(req, Date.now() - searchStarted, {
       query: q || filterQueryText({ fylke, spesialitet, helfo: helfo || undefined, akutt: akutt || undefined, kjede }),
       resultCount: total,
@@ -1223,6 +1229,9 @@ router.get("/sok", (req: Request, res: Response) => {
 
   <div class="container" style="padding-top:28px;padding-bottom:48px">
     <p class="result-meta">${total.toLocaleString("nb")} klinikker funnet${q ? ` for «${escapeHtml(q)}»` : ""}${fylke ? ` i ${escapeHtml(fylke)}` : ""} &mdash; viser side ${page} av ${totalPages}</p>
+    ${tolkning && tolkning.tolket_som.length > 0
+      ? `<p class="result-meta">${tolkning.fallback ? "Ingen treff med tolkningen (" + escapeHtml(tolkning.tolket_som.join(" · ")) + ") &mdash; viser treff på hele søketeksten." : "Tolket som: " + escapeHtml(tolkning.tolket_som.join(" · "))}</p>`
+      : ""}
     <div class="clinic-list" role="list" aria-label="Søkeresultater">
       ${resultCards}
     </div>

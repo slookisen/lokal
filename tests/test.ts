@@ -36109,6 +36109,28 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S1+S2+S3): shared
+  //    query parser + postnummer->kommune helper, one WHERE builder in
+  //    dental-store, parser wired into MCP tannlege_search, /sok and A2A ──
+  console.log("\n── dev-request 2026-10-16-tannlege-sok-naturlig-sprak: naturlig-språk-søk (finn-tannlege) ──");
+  for (const [label, load] of [
+    ["norway-postnummer", () => (require("../src/services/norway-postnummer.test") as typeof import("../src/services/norway-postnummer.test")).runNorwayPostnummerTests({ log: false })],
+    ["dental-query-parser", () => (require("../src/services/dental-query-parser.test") as typeof import("../src/services/dental-query-parser.test")).runDentalQueryParserTests({ log: false })],
+    ["dental-store search", () => (require("../src/services/dental-store-search.test") as typeof import("../src/services/dental-store-search.test")).runDentalStoreSearchTests({ log: false })],
+    ["dental natural search", () => (require("../src/routes/dental-natural-search.test") as typeof import("../src/routes/dental-natural-search.test")).runDentalNaturalSearchTests({ log: false })],
+  ] as Array<[string, () => { passed: number; failed: number; failures: string[] } | Promise<{ passed: number; failed: number; failures: string[] }>]>) {
+    try {
+      const r = await load();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ${f}`);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+
   console.log("\n── dev-request 2026-10-06-dental-profil-url-og-sitemap-uten-orgnr (skive A): clinicProfileUrl ──");
   try {
     const { runDentalProfileUrlTests } = require("../src/routes/dental-profile-url.test") as
