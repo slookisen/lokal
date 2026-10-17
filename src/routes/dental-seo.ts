@@ -22,6 +22,11 @@ import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-st
 import { analyticsService } from "../services/analytics-service";
 import { filterQueryText } from "../services/search-tracking";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+// dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): the
+// clinic's own «Hjemmeside» link carries UTM; booking and directory_url links
+// and the JSON-LD sameAs stay as stored.
+import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
@@ -1486,7 +1491,7 @@ function renderClinicProfile(
   { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
   { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
   if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
-  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
   // directory_url is NEVER the clinic's own homepage (that's `hjemmeside`
   // above) -- it's a county-directory listing, a Facebook page, or similar.
