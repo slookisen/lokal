@@ -42537,6 +42537,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-K (security
+// audit html-sink-audit): the card grid on /app and /dashboard and the
+// dashboard's search suggestions escape every API value, attributes too (the
+// pages' esc() from I-I); admin.html's showAdminAlert sets its message as
+// text; selger.html's escHtml escapes quotes, so a name stays inside
+// data-claim-name. The pages' inline scripts run in a vm with a fake DOM, fed
+// by the real GET /agents and /find-match handlers; own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-K (escaping: cards, suggestions, admin alert, seller list) ──");
+  try {
+    const { runRfbEscapingKortForslagAdminSelgerTests } = require("../src/routes/rfb-escaping-kort-forslag-admin-selger.test") as
+      typeof import("../src/routes/rfb-escaping-kort-forslag-admin-selger.test");
+    const r = await runRfbEscapingKortForslagAdminSelgerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-escaping-kort-forslag-admin-selger: " + f);
+    console.log(`  rfb-escaping-kort-forslag-admin-selger: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-escaping-kort-forslag-admin-selger: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)
