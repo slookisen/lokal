@@ -40,7 +40,7 @@ import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
 // specialty filter also matches the vocabulary's title stems.
 import { normaliseFylke } from "./norway-fylke";
 import { escapeLike } from "./search-intent/norwegian-query";
-import { findSearchSpecialty } from "../config/dental-search-vocabulary";
+import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-search-vocabulary";
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
 import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
@@ -534,14 +534,13 @@ function specialtyMatch(specialty: string, prefix: string): { sql: string; param
   // another one in the list is left out: "%kjeveortoped%" already matches
   // every title "%kjeveortopedi%" does, and each clause costs an
   // nb_lower(specialists) call per row. A specialty not in the vocabulary
-  // keeps exactly the three clauses it had.
-  const words = [...new Set([...names.map((n) => n.toLowerCase()), ...(entry?.title_stems ?? [])])];
-  words
-    .filter((w) => !words.some((other) => other !== w && w.includes(other)))
-    .forEach((w, i) => {
-      parts.push(`nb_lower(specialists) LIKE @${prefix}Title${i}`);
-      params[`${prefix}Title${i}`] = `%"title":"%${w}%`;
-    });
+  // keeps exactly the three clauses it had. The words come from the
+  // vocabulary (specialtyTitleWords), which the clinic cards read titles
+  // with too (dev-request 2026-10-17-dental-d3-rettelser, D3d).
+  specialtyTitleWords(names, entry).forEach((w, i) => {
+    parts.push(`nb_lower(specialists) LIKE @${prefix}Title${i}`);
+    params[`${prefix}Title${i}`] = `%"title":"%${w}%`;
+  });
   return { sql: `(${parts.join(" OR ")})`, params };
 }
 
