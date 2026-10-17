@@ -42152,6 +42152,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-P: /guide-opplevelser-mcp
+// lists every registered MCP tool (MCP2-01); /personvern and /vilkar get a
+// canonical and a description on every alias (MCP2-05); /opplevelse titles are
+// never cut after a preposition and say «Oslo» once (IDX2-05); RFB
+// /guide-mat-ai words prices as the tools do (MCP2-02).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging I-P: tool, legal and title copy ──");
+  try {
+    const { runSeoSideteksterTests } = require("../src/routes/seo-sidetekster.test") as
+      typeof import("../src/routes/seo-sidetekster.test");
+    const sst = await runSeoSideteksterTests({ log: false });
+    passed += sst.passed;
+    failed += sst.failed;
+    for (const f of sst.failures) failures.push("seo-sidetekster: " + f);
+    console.log(`  seo-sidetekster: ${sst.passed} passed, ${sst.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("seo-sidetekster: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-gardssalg-a2a-nl-routing: POST /a2a message/send on
 // opplevagent.no ALWAYS searched the generic `experiences` table, never the
 // gårdssalg (farm-sale drink producer) vertical in `experience_providers`.
