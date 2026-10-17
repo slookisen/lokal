@@ -131,18 +131,27 @@ export function getCatalogAvailabilityMap(
   return map;
 }
 
+// Integration test 2026-10-17 (AI-1): the knowledge fields are JSON columns
+// (knowledge-service rowToKnowledge) whose shape the type does not guarantee,
+// so `products` may hold a string, an object or null entries. A product only
+// counts when it is an object with a string name.
+function productNameOf(p: unknown): string {
+  const name = p && typeof p === "object" ? (p as { name?: unknown }).name : undefined;
+  return typeof name === "string" ? name.trim() : "";
+}
+
 export function formatProductsForMcp(
-  products: any[],
+  products: unknown,
   productIdByNorm?: Map<string, string>,
   availabilityByNorm?: Map<string, { availability: string; availabilityUpdatedAt: string | null }>
 ): string {
-  if (!products?.length) return "";
+  if (!Array.isArray(products) || !products.length) return "";
 
   const lines: string[] = [];
   let productCount = 0;
 
   for (const p of products) {
-    const name = (p.name || "").trim();
+    const name = productNameOf(p);
     if (!name) continue;
 
     const { cleanName, price, section } = parseProductPrice(p);
@@ -195,9 +204,9 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
   if (k.email) contact.email = k.email;
   if (k.website) contact.website = k.website;
 
-  const products = k.products || [];
-  const realProducts = products.filter((p: any) => {
-    const n = (p.name || "").trim();
+  const products: unknown[] = Array.isArray(k.products) ? k.products : [];
+  const realProducts = products.filter((p) => {
+    const n = productNameOf(p);
     return n && !isProductHeader(n) && !isProductNoise(n);
   });
 
@@ -216,6 +225,95 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
     productSummary,
     productsCount: realProducts.length,
   };
+}
+
+// ─── Integration test 2026-10-17 (AI-1): tolerant fields, no leaked errors ──
+// lokal_info answered `k.openingHours.map is not a function` for producers
+// whose openingHours is stored as text: `?.length` is true for a string too,
+// and the SDK puts an uncaught handler error's message into the tool result.
+
+/**
+ * Text entries of a list-valued DB JSON field (specialties, paymentMethods,
+ * labels, agent categories ...): an array gives its string entries, a string
+ * gives itself as one entry, anything else gives none.
+ */
+export function textEntries(value: unknown): string[] {
+  const items: unknown[] = Array.isArray(value) ? value : [value];
+  return items
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The «Åpningstider» section of lokal_info. An array is today's format
+ * ({day, open, close} entries; others are skipped). A string is free text
+ * such as "Man–fre 10–17" and is shown as it is, like the producer page
+ * (seo.ts) and the agent card (marketplace.ts) do. Any other value is left out.
+ */
+export function formatOpeningHoursForMcp(openingHours: unknown): string {
+  let text = "";
+  if (Array.isArray(openingHours)) {
+    const dayNames: Record<string, string> = { mon: "Man", tue: "Tir", wed: "Ons", thu: "Tor", fri: "Fre", sat: "Lør", sun: "Søn" };
+    text = openingHours
+      .filter((h): h is Record<string, unknown> => !!h && typeof h === "object")
+      .map((h) => `${dayNames[String(h.day)] || h.day} ${h.open}–${h.close}`)
+      .join(", ");
+  } else if (typeof openingHours === "string") {
+    text = openingHours.trim();
+  }
+  return text ? `\n## Åpningstider\n${text}` : "";
+}
+
+/**
+ * The whole text of a tool result when its handler throws. Without it the
+ * SDK returns the raw exception message (createToolError), which is how a
+ * JavaScript TypeError reached ChatGPT. The detail is logged instead.
+ */
+export const MCP_INTERNAL_ERROR_TEXT =
+  "Beklager, det oppstod en intern feil hos Rett fra Bonden, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
+  "Sorry, an internal error at Rett fra Bonden stopped this request. Please try again later.";
+
+/**
+ * Wraps a tool handler: an uncaught error is logged with the tool name and
+ * becomes an isError result with MCP_INTERNAL_ERROR_TEXT. The arguments are
+ * not logged (lokal_cart_* carry buyer contact details and the buyer_ref token).
+ */
+export function guardToolHandler<H extends (...args: any[]) => unknown>(tool: string, handler: H): H {
+  const guarded = async (...args: Parameters<H>) => {
+    try {
+      return await handler(...args);
+    } catch (err) {
+      console.error(`[mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
+      return { content: [{ type: "text" as const, text: MCP_INTERNAL_ERROR_TEXT }], isError: true };
+    }
+  };
+  return guarded as unknown as H;
+}
+
+// ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
+
+/**
+ * productsAreGenericCategoryNames (admin-outreach-candidates.ts), loaded
+ * lazily as admin-knowledge.ts does: that module pulls in routes/seo and
+ * routes/admin-knowledge, which every importer of this file (the tool
+ * manifest, the MCP tests) would otherwise load as well.
+ */
+function productsAreGenericCategoryNames(productsJson: string): boolean {
+  return (require("./admin-outreach-candidates") as typeof import("./admin-outreach-candidates"))
+    .productsAreGenericCategoryNames(productsJson);
+}
+
+/**
+ * True when a search match reason documents a real product. The registry's
+ * «Produkter: a, b, c» reason (calculateRelevance) also matches the generic
+ * category labels the enrichment writes as product names («Honning», «Egg»,
+ * «Bakervarer»); a reason that names only such labels is a category match.
+ */
+export function isDocumentedProductReason(reason: string): boolean {
+  if (!reason.startsWith("Produkter:")) return false;
+  const names = reason.slice("Produkter:".length).split(", ").map((n) => n.trim()).filter(Boolean);
+  return names.length > 0 && !productsAreGenericCategoryNames(JSON.stringify(names));
 }
 
 // ─── Tool definitions (shared logic) ────────────────────────
@@ -291,6 +389,9 @@ export function registerTools(
     });
   };
 
+  // Every tool handler below runs inside guardToolHandler (integration test
+  // 2026-10-17, AI-1): an internal error is logged and never returned.
+
   // Tool 1: Natural language search
   server.registerTool(
     "lokal_search",
@@ -322,7 +423,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ query, lat, lng, radius_km, limit }, extra) => {
+    guardToolHandler("lokal_search", async ({ query, lat, lng, radius_km, limit }, extra) => {
       const q = query || "";
       const foreign = foreignPlaceIn(q);
       if (foreign) return outsideNorwayAnswer(foreign);
@@ -425,9 +526,12 @@ export function registerTools(
           }
 
           // Extra details
-          if (k.specialties?.length) sections.push(`\n**Spesialiteter:** ${k.specialties.join(", ")}`);
-          if (k.paymentMethods?.length) sections.push(`💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
-          if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+          const specialties = textEntries(k.specialties);
+          const paymentMethods = textEntries(k.paymentMethods);
+          const deliveryOptions = textEntries(k.deliveryOptions);
+          if (specialties.length) sections.push(`\n**Spesialiteter:** ${specialties.join(", ")}`);
+          if (paymentMethods.length) sections.push(`💳 **Betaling:** ${paymentMethods.join(", ")}`);
+          if (deliveryOptions.length) sections.push(`🚚 **Levering:** ${deliveryOptions.join(", ")}`);
 
           // Profile link
           const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
@@ -440,16 +544,24 @@ export function registerTools(
           // for "lamb") says so, instead of reading like a documented match.
           const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
           const reasons = (r.matchReasons as string[] | undefined) ?? [];
-          const documented = reasons.some((m) => m.startsWith("Produkter:"));
+          // Integration test 2026-10-17 (AI-3): a product reason that names
+          // only generic category labels («Honning», «Egg») is not a listed
+          // product. The order of the results stays as discover() gave it.
+          const documented = reasons.some(isDocumentedProductReason);
+          const categoryLabelOnly = !documented && reasons.some((m) => m.startsWith("Produkter:"));
           // Name matches bypass product scoring; absent product evidence in
           // that branch must not turn a named lookup into a category match.
           const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
           const categoryOnly = productTerms.length > 0 && !documented && !nameMatch;
-          const categoryOnlyNote = categoryOnly
-            ? `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${productTerms.join("/")}» — spør produsenten. / Category match only: the listed products don't mention «${productTerms.join("/")}»; ask the producer.`
-            : "";
+          const terms = productTerms.join("/");
+          const categoryOnlyNote = !categoryOnly ? ""
+            : categoryLabelOnly
+              ? `\n   ⚠️ Kategoritreff: produktlista har «${terms}» bare som kategorinavn, ikke som et bestemt produkt — spør produsenten. / Category match only: the product list has «${terms}» only as a category name, not as a specific product; ask the producer.`
+              : `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${terms}» — spør produsenten. / Category match only: the listed products don't mention «${terms}»; ask the producer.`;
           return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.(), categoryOnly ? {
-            headingSuffix: ` — Kategoritreff / category-only: «${productTerms.join("/")}» ikke oppført / not listed`,
+            headingSuffix: categoryLabelOnly
+              ? ` — Kategoritreff / category-only: «${terms}» bare som kategorinavn / category name only`
+              : ` — Kategoritreff / category-only: «${terms}» ikke oppført / not listed`,
             hideDescription: true,
           } : undefined) + dist + categoryOnlyNote;
         }
@@ -457,7 +569,7 @@ export function registerTools(
 
       deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
-    }
+    })
   );
 
   // Tool 2: Structured discovery
@@ -500,7 +612,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+    guardToolHandler("lokal_discover", async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
       // ChatGPT app re-review 2026-10-03: lat/lng/maxDistanceKm used to be
       // passed top-level, but discover() reads `location: {lat, lng}` — so the
       // distance filter never ran and every call returned a nationwide list
@@ -557,7 +669,7 @@ export function registerTools(
 
       deliver("lokal_discover", { categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
-    }
+    })
   );
 
   // Tool 3: Producer details
@@ -577,7 +689,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ agentId }, extra) => {
+    guardToolHandler("lokal_info", async ({ agentId }, extra) => {
       const info = knowledgeService.getAgentInfo(agentId);
       if (!info) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
@@ -612,12 +724,9 @@ export function registerTools(
       // vCard
       sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
 
-      // Opening hours
-      if (k.openingHours?.length) {
-        const dayNames: Record<string, string> = { mon: "Man", tue: "Tir", wed: "Ons", thu: "Tor", fri: "Fre", sat: "Lør", sun: "Søn" };
-        const hours = k.openingHours.map((h: any) => `${dayNames[h.day] || h.day} ${h.open}–${h.close}`).join(", ");
-        sections.push(`\n## Åpningstider\n${hours}`);
-      }
+      // Opening hours (an array, or free text — see formatOpeningHoursForMcp)
+      const hoursSection = formatOpeningHoursForMcp(k.openingHours);
+      if (hoursSection) sections.push(hoursSection);
 
       // Products — structured with parsed prices.
       // orch-pr-14: attach catalog product_id (products.id) to each in-stock
@@ -627,19 +736,24 @@ export function registerTools(
         if (productSection) sections.push(productSection);
       }
 
-      if (k.specialties?.length) sections.push(`\n## Spesialiteter\n${k.specialties.map((s: string) => `- ${s}`).join("\n")}`);
-      if (k.certifications?.length) sections.push(`\n## Sertifiseringer\n${k.certifications.map((c: string) => `- ${c}`).join("\n")}`);
-      if (k.paymentMethods?.length) sections.push(`\n💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
-      if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+      const specialties = textEntries(k.specialties);
+      const certifications = textEntries(k.certifications);
+      const paymentMethods = textEntries(k.paymentMethods);
+      const deliveryOptions = textEntries(k.deliveryOptions);
+      if (specialties.length) sections.push(`\n## Spesialiteter\n${specialties.map((s) => `- ${s}`).join("\n")}`);
+      if (certifications.length) sections.push(`\n## Sertifiseringer\n${certifications.map((c) => `- ${c}`).join("\n")}`);
+      if (paymentMethods.length) sections.push(`\n💳 **Betaling:** ${paymentMethods.join(", ")}`);
+      if (deliveryOptions.length) sections.push(`🚚 **Levering:** ${deliveryOptions.join(", ")}`);
 
       if (meta.disclaimer) {
-        const src = meta.autoSources?.length ? ` (kilder: ${meta.autoSources.join(", ")})` : "";
+        const autoSources = textEntries(meta.autoSources);
+        const src = autoSources.length ? ` (kilder: ${autoSources.join(", ")})` : "";
         sections.push(`\n---\n_${meta.disclaimer}${src}_`);
       }
 
       deliver("lokal_info", { agentId }, extra, [agent.id]);
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 4: Platform stats
@@ -657,7 +771,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async () => {
+    guardToolHandler("lokal_stats", async () => {
       // Same three figures as the rettfrabonden.com front page: the honest
       // catalog count, and distinct cities and categories among the producers
       // a visitor can find. getStats().totalAgents also counts inactive,
@@ -678,7 +792,7 @@ export function registerTools(
         `Kategorier: ${categories.size}`,
       ].join("\n");
       return { content: [{ type: "text" as const, text }] };
-    }
+    })
   );
 
   // ─── Phase 5.11 A2.5 tools — umbrella discovery ────────────
@@ -702,7 +816,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ umbrellaType, limit }) => {
+    guardToolHandler("lokal_list_umbrellas", async ({ umbrellaType, limit }) => {
       const db = getDb();
       const wheres: string[] = ["umbrella_type IS NOT NULL", "is_active = 1"];
       const params: any[] = [];
@@ -759,7 +873,7 @@ export function registerTools(
         }
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 6: Producers in an umbrella's network
@@ -780,7 +894,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ umbrellaId, limit }, extra) => {
+    guardToolHandler("lokal_get_umbrella_members", async ({ umbrellaId, limit }, extra) => {
       const db = getDb();
       const umbrella = db.prepare(
         "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND umbrella_type IS NOT NULL AND is_active = 1"
@@ -808,7 +922,7 @@ export function registerTools(
       const sections = [`🤝 **${umbrella.name}** — ${rows.length} produsenter:\n`];
       for (const m of rows) {
         let labels: string[] = [];
-        if (m.labels) { try { labels = JSON.parse(m.labels); } catch { /* ignore */ } }
+        if (m.labels) { try { labels = textEntries(JSON.parse(m.labels)); } catch { /* ignore */ } }
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const where = m.city ? ` — ${m.city}` : "";
         sections.push(`- **${m.name}**${where}${labelStr}`);
@@ -816,7 +930,7 @@ export function registerTools(
       }
       deliver("lokal_get_umbrella_members", { umbrellaId, limit }, extra, rows.map((m: any) => m.id));
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 7: Umbrellas a producer belongs to
@@ -836,7 +950,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ producerId }) => {
+    guardToolHandler("lokal_get_producer_affiliations", async ({ producerId }) => {
       const db = getDb();
       const producer = db.prepare(
         "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
@@ -869,14 +983,14 @@ export function registerTools(
       const sections = [`🔗 **${producer.name}** — ${rows.length} tilknytninger:\n`];
       for (const a of rows) {
         let labels: string[] = [];
-        if (a.labels) { try { labels = JSON.parse(a.labels); } catch { /* ignore */ } }
+        if (a.labels) { try { labels = textEntries(JSON.parse(a.labels)); } catch { /* ignore */ } }
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const type = typeLabels[a.umbrella_type] || a.umbrella_type;
         sections.push(`- **${a.name}** (${type})${labelStr}`);
         sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(a.name)}`, getClientIdentity?.())}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 8: Upcoming Bondens marked events (PR-56, 2026-05-16)
@@ -901,7 +1015,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ region, lokallag_slug, days }) => {
+    guardToolHandler("lokal_bm_next_markets", async ({ region, lokallag_slug, days }) => {
       const db = getDb();
       const lookahead = Math.max(1, Math.min(days || 30, 90));
       const fromIso = new Date().toISOString();
@@ -969,7 +1083,7 @@ export function registerTools(
         sections.push(`  Kilde: ${r.source_url}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 9: Geocode Norwegian place names (PR-76)
@@ -997,7 +1111,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ place }) => {
+    guardToolHandler("lokal_geocode", async ({ place }) => {
       const result = await geocodingService.geocode(place);
       if (!result) {
         return {
@@ -1014,7 +1128,7 @@ export function registerTools(
           text: `📍 ${result.name}\nlat: ${result.lat}\nlng: ${result.lng}\nradius_km: ${result.radiusKm}\nsource: ${result.source}`,
         }],
       };
-    }
+    })
   );
 
   // Tool: lokal_find_offers — dev-request 2026-09-16-handleliste-med-
@@ -1047,7 +1161,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ items, near, lat, lng, radius_km }, extra) => {
+    guardToolHandler("lokal_find_offers", async ({ items, near, lat, lng, radius_km }, extra) => {
       const foreign = foreignPlaceIn(near);
       if (foreign) return outsideNorwayAnswer(foreign);
       const hasCoords = isValidLatLng(lat as number, lng as number);
@@ -1076,7 +1190,7 @@ export function registerTools(
 
       deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra, results.flatMap((r) => r.offers.map((o) => o.producer.agent_id)));
       return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
-    }
+    })
   );
 
   // ─── Cart tools (Phase 1) ────────────────────────────────────
@@ -1101,7 +1215,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async () => {
+    guardToolHandler("lokal_cart_create", async () => {
       try {
         const result = svcCreateCart();
         return {
@@ -1111,10 +1225,11 @@ export function registerTools(
           }],
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: msg }) }] };
+        // Same rule as guardToolHandler: the detail is logged, never returned.
+        console.error("[mcp] lokal_cart_create failed:", err instanceof Error ? err.stack || err.message : String(err));
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: MCP_INTERNAL_ERROR_TEXT }) }] };
       }
-    }
+    })
   );
 
   // Tool 11: Add item to cart
@@ -1143,7 +1258,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ cart_id, buyer_ref, product_id, qty, note }) => {
+    guardToolHandler("lokal_cart_add_item", async ({ cart_id, buyer_ref, product_id, qty, note }) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
@@ -1159,7 +1274,7 @@ export function registerTools(
           text: JSON.stringify({ success: true, item: result.item, cart }, null, 2),
         }],
       };
-    }
+    })
   );
 
   // Tool 12: View cart
@@ -1180,7 +1295,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ cart_id, buyer_ref }) => {
+    guardToolHandler("lokal_cart_view", async ({ cart_id, buyer_ref }) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
@@ -1190,7 +1305,7 @@ export function registerTools(
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Cart not found" }) }] };
       }
       return { content: [{ type: "text" as const, text: JSON.stringify(cart, null, 2) }] };
-    }
+    })
   );
 
   // Tool 13: Submit cart → place pickup orders
@@ -1235,7 +1350,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent, ...rest }: any) => {
+    guardToolHandler("lokal_cart_submit", async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent, ...rest }: any) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
@@ -1259,7 +1374,7 @@ export function registerTools(
           })
         : svcSubmitCart(cart_id, contact);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    }
+    })
   );
 
   // Tool 14: Order status
@@ -1282,10 +1397,10 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ order_id, buyer_ref }) => {
+    guardToolHandler("lokal_order_status", async ({ order_id, buyer_ref }) => {
       const result = svcGetOrder(order_id, buyer_ref);
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    }
+    })
   );
 
   // ─── MCP Resources ──────────────────────────────────────────
@@ -1344,7 +1459,8 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
 
   const meta: string[] = [];
   if ((agent as any).city || agent.location?.city) meta.push(`📍 ${(agent as any).city || agent.location?.city}`);
-  if (agent.categories?.length) meta.push(`🏷️ ${agent.categories.join(", ")}`);
+  const categories = textEntries(agent.categories);
+  if (categories.length) meta.push(`🏷️ ${categories.join(", ")}`);
   if (meta.length) lines.push(`   ${meta.join("  ·  ")}`);
 
   if (contact) {
