@@ -48436,3 +48436,22 @@ runSerial(async () => {
     failures.push("rfb-synlig-faq-og-fylkessider: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-16-berikelse-ruting-og-beskrivelseskø-innsyn (S1):
+// queue_diagnostics on GET /admin/experiences-description-candidates. Own
+// in-memory experiences DB; read-only.
+runSerial(async () => {
+  console.log("\n── experiences-description-candidates-innsyn ──");
+  try {
+    const { runExperiencesDescriptionCandidatesInnsynTests } = require("../src/routes/experiences-description-candidates-innsyn.test") as
+      typeof import("../src/routes/experiences-description-candidates-innsyn.test");
+    const ix = await runExperiencesDescriptionCandidatesInnsynTests({ log: false });
+    passed += ix.passed;
+    failed += ix.failed;
+    for (const f of ix.failures) failures.push("experiences-description-candidates-innsyn: " + f);
+    console.log(`  experiences-description-candidates-innsyn: ${ix.passed} passed, ${ix.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-description-candidates-innsyn: unexpected error: " + String(err?.message || err));
+  }
+});
