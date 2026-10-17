@@ -23,7 +23,9 @@
  *   M   MCP tannlege_search / tannlege_akutt over a real server + client,
  *       and the same card values as the A2A clinic with the same id;
  *   Z   size: 25 clinics per call stay under 12 KB for a live-like mix, and
- *       under 16 KB when every clinic has every optional field.
+ *       under 16 KB when every clinic has every optional field; a kommune
+ *       search (Bergen, whose tolkning names 144 postnumre) stays under
+ *       12 KB too.
  *
  * Standalone: npx tsx src/services/dental-clinic-card.test.ts
  * Wired into tests/test.ts via runDentalClinicCardTests().
@@ -306,12 +308,12 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       // The limits against live rows (/api/tannlege/agents, Oslo, Vestland and Rogaland, 849 clinics
       // in pages of 25, measured 2026-10-17): a tannlege_search answer is 8 555–9 472 B in median and
       // at most 10 662 B; the 25 richest cards of a county give 12 907–13 457 B, under the 16 KB below.
-      const seed = (fylke: string, prefix: string, rich: boolean) => surnames.forEach((name, i) => {
+      const seed = (fylke: string, prefix: string, rich: boolean, place = { postnummer: "4006", poststed: "STAVANGER" }) => surnames.forEach((name, i) => {
         const slug = name.toLowerCase();
         const has = (share: number) => rich || i % 20 < share * 20;
         add(
           {
-            navn: `Tannlege ${name} AS`, org_nr: `${prefix}${String(i).padStart(2, "0")}`, postnummer: "4006", poststed: "STAVANGER", fylke,
+            navn: `Tannlege ${name} AS`, org_nr: `${prefix}${String(i).padStart(2, "0")}`, ...place, fylke,
             helfo_agreement: "true", verification_status: "verified",
             ...(has(0.7) ? { adresse: `Kirkegata ${i + 1}` } : {}),
             ...(has(0.6) ? { telefon: `5189${String(1000 + i)}` } : {}),
@@ -338,6 +340,18 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
         // Stable labels (no measured numbers): the CI determinism gate compares failure texts across runs.
         ok(sizes.every((n) => n < limitBytes), `Z1 ${fylke}: 25 clinics, ${label}: tannlege_search and tannlege_akutt under ${limitBytes / 1024} KB`);
       }
+      // A kommune search (D3c): «tannlege i Bergen» reads Bergen kommune, whose
+      // 144 postnumre tolkning names as {kommunenummer, antall}, not the list.
+      seed("Vestland", "9187630", false, { postnummer: "5003", poststed: "BERGEN" });
+      const kommuneText = await callText("tannlege_search", { query: "tannlege i Bergen", limit: 25 });
+      const kommune = JSON.parse(kommuneText);
+      if (log) console.log(`    Bergen kommune: tannlege_search ${Buffer.byteLength(kommuneText)} B`);
+      eq(
+        [kommune.klinikker.length, kommune.tolkning?.filter?.natural?.parsed?.poststed_or_postnummer?.postnummer_in],
+        [25, { kommunenummer: "4601", antall: 144 }],
+        "Z2: (the kommune search carries 25 clinics, and tolkning names Bergen kommune instead of its postnumre)"
+      );
+      ok(Buffer.byteLength(kommuneText) < 12 * 1024, "Z3: 25 clinics found by kommune (Bergen), a live-like mix: tannlege_search under 12 KB");
     }
   } catch (err: any) {
     failed++;

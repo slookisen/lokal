@@ -38,6 +38,12 @@ export interface SearchVocabulary {
   helfo: readonly string[];
   /** A trigger right after one of these is not applied ("uten helfo"). */
   negations: ReadonlySet<string>;
+  /**
+   * Right after a place, one of these names it as the kommune ("Kvam
+   * kommune"), so a poststed of that name in another kommune also covers the
+   * kommune. Whole tokens; each is a stopword too.
+   */
+  kommuneWords: ReadonlySet<string>;
 }
 
 export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
@@ -119,6 +125,7 @@ export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
     "tannvakt", "emergency", "urgent", "øyeblikkelig hjelp"],
   helfo: ["helfo", "helfoavtale", "helfoavtalen", "direkteoppgjør", "direkteoppgjor", "direct billing"],
   negations: new Set(["uten", "ikke", "without", "not", "no"]),
+  kommuneWords: new Set(["kommune", "kommunen", "municipality"]),
 };
 
 /**

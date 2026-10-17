@@ -14,7 +14,9 @@
  *   V   the vocabulary mirrors SPECIALTY_PAGES (canonical names + slugs);
  *       findSearchSpecialty reads a whole value (name, slug, synonym)
  *   S   planDentalSearch: explicit arguments win, the old reading is kept
- *       (union; A2A's keyword reading in full), fallback flag, rollback switch
+ *       (union; A2A's keyword reading in full), fallback flag, rollback switch;
+ *       tolkning shows a kommune's postnumre as {kommunenummer, antall}
+ *       while the plan's filter keeps the list (D3c, tolkningFilter)
  *
  * Standalone: npx tsx src/services/dental-query-parser.test.ts
  * Wired into tests/test.ts via runDentalQueryParserTests().
@@ -279,6 +281,11 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
     for (const s of DENTAL_SEARCH_VOCABULARY.specialties) {
       assertEq(spec(s.canonical), s.canonical, `V6: the stored name «${s.canonical}» parses to itself`);
     }
+    assertEq(
+      [[...DENTAL_SEARCH_VOCABULARY.kommuneWords], [...DENTAL_SEARCH_VOCABULARY.kommuneWords].filter((w) => !DENTAL_SEARCH_VOCABULARY.stopwords.has(w))],
+      [["kommune", "kommunen", "municipality"], []],
+      "V7: the kommune words (D3c) are kommune, kommunen and municipality, and each is still a stopword"
+    );
 
     // ── S: planDentalSearch ───────────────────────────────────────────────
     const calls: Array<Record<string, unknown>> = [];
@@ -382,9 +389,69 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       assertEq(raw.filter, { seen: " Bergen " }, "S20: switched off -> the caller's old reading gets the text exactly as before (untrimmed)");
     }
     process.env.DENTAL_QUERY_PARSER_DISABLED = "true";
-    assertTrue(parser.isDentalQueryParserDisabled(), "S21: «true» also switches it off");
+    assertTrue(parser.isDentalQueryParserDisabled(), "S20b: «true» also switches it off");
     process.env.DENTAL_QUERY_PARSER_DISABLED = "0";
-    assertTrue(!parser.isDentalQueryParserDisabled(), "S22: any other value leaves the parser on");
+    assertTrue(!parser.isDentalQueryParserDisabled(), "S20c: any other value leaves the parser on");
+    delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+
+    // ── S: tolkning.filter shows a kommune, not its postnummer list (D3c) ─
+    {
+      const plan = (query: string, explicit: Record<string, unknown> = {}) => parser.planDentalSearch({ query, explicit, gazetteer: g, count: () => 5 });
+      const bergen = plan("tannlege i Bergen");
+      assertEq(
+        [bergen.filter, bergen.tolkning?.filter],
+        [
+          { natural: { parsed: BERGEN, legacy: { q: "tannlege i Bergen" } } },
+          { natural: { parsed: { poststed_or_postnummer: { poststed_in: ["BERGEN", "Bergen"], postnummer_in: { kommunenummer: "4601", antall: 144 } } }, legacy: { q: "tannlege i Bergen" } } },
+        ],
+        "S21: Bergen: the plan's filter keeps the 144 postnumre; tolkning shows {kommunenummer: 4601, antall: 144}"
+      );
+      const baerum = plan("tannlege i Bærum");
+      const baerumPnr = postnumreForKommune("3201");
+      assertEq(
+        [(baerum.filter.natural as any).parsed.postnummer_in, (baerum.tolkning?.filter.natural as any)?.parsed.postnummer_in],
+        [baerumPnr, { kommunenummer: "3201", antall: baerumPnr.length }],
+        "S22: Bærum (a kommune read by postnummer): the list in the plan's filter, {kommunenummer: 3201, antall} in tolkning"
+      );
+      const unchanged: Array<[string, Record<string, unknown>]> = [
+        ["tannlege i Oslo", {}], ["tannlege i Vestland", {}], ["tannlege i Viken", {}], ["kjeveortoped", {}],
+        ["Hordaland", { fylke: "Rogaland" }], ["helfo Oslo", { helfo_agreement: undefined, specialty: "periodonti" }],
+      ];
+      for (const [q, explicit] of unchanged) {
+        const p = plan(q, explicit);
+        assertEq(p.tolkning?.filter, p.filter, `S23: «${q}» ${JSON.stringify(explicit)}: no postnummer list, so tolkning.filter is the plan's filter`);
+      }
+    }
+    {
+      const bergenPnr = postnumreForKommune("4601");
+      const shown = (list: unknown[]) => {
+        try { return parser.tolkningFilter({ postnummer_in: list }).postnummer_in; } catch (err) { return `threw ${String(err)}`; }
+      };
+      assertEq(
+        [shown(["0000"]), shown(["abcd", 5]), shown([]), shown(["5003", "5004"]), shown([...bergenPnr, "5003"]), shown([...bergenPnr].reverse())],
+        [{ antall: 1 }, { antall: 2 }, { antall: 0 }, { antall: 2 }, { antall: 145 }, { kommunenummer: "4601", antall: 144 }],
+        "S24: {antall} alone, never a throw, for an unknown or malformed postnummer, an empty list or one that is not exactly one whole kommune (any order counts)"
+      );
+      const input = { fylke: "Vestland", q: null, fylke_in: ["Viken", "Akershus"], natural: { parsed: { postnummer_in: ["5003", "5004"] }, legacy: { q: "x" } } };
+      const before = JSON.stringify(input);
+      const once = parser.tolkningFilter(input);
+      assertEq(
+        [once, JSON.stringify(input) === before, parser.tolkningFilter(once)],
+        [{ fylke: "Vestland", q: null, fylke_in: ["Viken", "Akershus"], natural: { parsed: { postnummer_in: { antall: 2 } }, legacy: { q: "x" } } }, true, once],
+        "S24b: other fields are kept as they are, the input is not changed, and a shown filter passes through unchanged"
+      );
+    }
+    {
+      // No postnummer list of any length is left anywhere in tolkning.
+      const lists = (v: unknown, at = ""): string[] =>
+        v && typeof v === "object" && !Array.isArray(v)
+          ? Object.entries(v).flatMap(([k, x]) => (k === "postnummer_in" && Array.isArray(x) ? [`${at}${k}`] : lists(x, `${at}${k}.`)))
+          : [];
+      for (const q of ["tannlege i Bergen", "tannlege i Trondheim", "tannlege i Stavanger", "tannlege i Tromsø", "tannlege i Bærum", "tannlege i Kvam kommune"]) {
+        const p = parser.planDentalSearch({ query: q, explicit: {}, gazetteer: g, count: () => 1 });
+        assertEq([lists(p.filter).length > 0, lists(p.tolkning?.filter)], [true, []], `S25: «${q}»: the plan's filter has a postnummer list, tolkning has none`);
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental-query-parser: unexpected error: " + String(err?.stack || err?.message || err));
