@@ -414,7 +414,11 @@ router.post("/", async (req: Request, res: Response) => {
   const skipTickLock =
     req.query.skip_tick_lock === "1" ||
     req.query.skip_tick_lock === "true" ||
-    (req.body && (req.body.skip_tick_lock === true || req.body.skip_tick_lock === "1"));
+    // Numeric 1 is accepted too (dev-request 2026-10-14-verifier-tick-lock-
+    // ignorerer-skip-tick-lock-regresjon): the enrichment SKILL's held-list
+    // re-verify builds its JSON body with python (`'skip_tick_lock': 1`), which
+    // arrives here as the number 1, not true or "1", and used to be ignored.
+    (req.body && (req.body.skip_tick_lock === true || req.body.skip_tick_lock === "1" || req.body.skip_tick_lock === 1));
 
   // dev-request 2026-09-16-run-verifier-agentids-og-pool-blocker-explain-
   // gate-felt: optional explicit id filter — see parseAgentIds/runVerifierTick/
