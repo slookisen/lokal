@@ -28,8 +28,12 @@ Search by place, by specialty, or by the two things that change what a visit cos
 The data comes from public sources: Brønnøysundregistrene, the Norwegian health personnel register (HPR) and the clinics' own websites.
 
 The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.
+
+Finn-tannlege.com is an independent service from Agentplatform.no AS and is not affiliated with FINN.no.
 ```
-803 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
+909 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
+
+The last paragraph is `BRAND_ENTITIES.dental.disambiguation.en` (src/config/brand-entities.ts). Keep it when the text is edited in the portal.
 
 The catalog size is the floor in distribution/catalog-claims.json (5,400), not a live figure: listing text is only changed by hand in the portal, and the floor stays true while the catalog grows.
 

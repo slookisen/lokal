@@ -11,6 +11,8 @@
  *  - Pickup only: no delivery address.
  *  - Products must be from verified, non-umbrella producers.
  *  - Availability is checked on add AND re-checked on submit.
+ *  - A category label is no product: refused on add, on a wish's choice
+ *    and on submit (slice I-S2, see CATEGORY_LABEL_CART_ERROR).
  */
 
 import { formatAddressLine } from "../utils/address-format";
@@ -22,6 +24,7 @@ import { computeEffectiveAvailability } from "./supply-graph";
 import { knowledgeService } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { isBlocked } from "./blocklist-service";
+import { isCategoryLabel } from "../utils/category-label";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -254,6 +257,29 @@ export function checkCartToken(
   return { ok: true, cart: { id: cart.id, status: cart.status, buyer_ref: cart.buyer_ref } };
 }
 
+// ─── Category labels are no products ─────────────────────────────────────────
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S2 (a): a
+// catalog row that is only a generic category label («Honning» at a bakery,
+// written by the enrichment's category inference and copied into `products`
+// by product-catalog-sync.ts) can never be put in a cart. findOffers no longer
+// offers such rows (slice I-S), but their ids are still public via GET
+// /catalog/feed and /catalog/agents/:id/products, so the cart checks them
+// itself: in addCartItem, in chooseCartWishOffer (before it changes anything)
+// and again in submitCart. The rule is the one findOffers and lokal_info use
+// (utils/category-label.ts): a category name, no price_nok, not set by the
+// producer (availability_source 'producer_dashboard').
+
+/**
+ * The 422 error (NO / EN). The code leads the text because the REST routes
+ * and lokal_cart_add_item pass on only `error` and the status.
+ */
+export const CATEGORY_LABEL_CART_ERROR =
+  "category_label: kategorinavn, ikke et produkt — spør produsenten. / A category name, not a product — ask the producer.";
+
+function isCategoryLabelRow(row: { name: string; price_nok: number | null; availability_source: string | null }): boolean {
+  return isCategoryLabel({ name: row.name, hasPrice: row.price_nok != null, availabilitySource: row.availability_source });
+}
+
 // ─── Add / upsert item ───────────────────────────────────────────────────────
 
 export type AddItemResult =
@@ -283,13 +309,14 @@ export function addCartItem(
 
   // Verify product
   const product = db.prepare(`
-    SELECT p.id, p.agent_id, p.availability, p.price_nok, p.availability_source, p.availability_updated_at
+    SELECT p.id, p.agent_id, p.name, p.availability, p.price_nok, p.availability_source, p.availability_updated_at
     FROM products p
     WHERE p.id = ?
   `).get(productId) as
     | {
         id: string;
         agent_id: string;
+        name: string;
         availability: string;
         price_nok: number | null;
         availability_source: string;
@@ -298,6 +325,8 @@ export function addCartItem(
     | undefined;
 
   if (!product) return { success: false, status: 404, error: "Product not found" };
+  // I-S2: before the stock and producer checks, as a label is no product at all.
+  if (isCategoryLabelRow(product)) return { success: false, status: 422, error: CATEGORY_LABEL_CART_ERROR };
 
   // dev-request 2026-07-13-supply-graph-v1 (salvage slice): gate on the
   // EFFECTIVE availability (staleness-checked), not the raw column — a
@@ -541,6 +570,15 @@ export function chooseCartWishOffer(
     | undefined;
 
   if (productId) {
+    // I-S2: refuse a category label before this wish's own row is touched
+    // (addCartItem below would refuse it too, but only after the clean-up).
+    const chosen = db.prepare("SELECT name, price_nok, availability_source FROM products WHERE id = ?").get(productId) as
+      | { name: string; price_nok: number | null; availability_source: string }
+      | undefined;
+    if (chosen && isCategoryLabelRow(chosen)) {
+      return { success: false, status: 422, error: CATEGORY_LABEL_CART_ERROR };
+    }
+
     // Reject if a DIFFERENT wish (or a directly-added, non-wish item)
     // already owns the cart_items row for this exact product in this cart —
     // see doc comment above for why this is rejected rather than merged.
@@ -751,7 +789,14 @@ export interface ContactHandoff {
 
 export type SubmitResult =
   | { success: true; orders: OrderSummary[]; contact_handoffs: ContactHandoff[]; terms_url: string }
-  | { success: false; status: number; error: string; unavailable?: Array<{ product_id: string; product_name: string; availability: string }> };
+  | {
+      success: false;
+      status: number;
+      error: string;
+      unavailable?: Array<{ product_id: string; product_name: string; availability: string }>;
+      /** I-S2: the lines that are category labels (422 CATEGORY_LABEL_CART_ERROR). */
+      category_labels?: Array<{ product_id: string; product_name: string }>;
+    };
 
 const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -842,6 +887,7 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
       ci.line_note,
       p.name        AS product_name,
       p.unit        AS unit,
+      p.price_nok   AS price_nok,
       p.availability AS availability,
       p.availability_source AS availability_source,
       p.availability_updated_at AS availability_updated_at,
@@ -859,6 +905,7 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
     line_note: string | null;
     product_name: string;
     unit: string | null;
+    price_nok: number | null;
     availability: string;
     availability_source: string;
     availability_updated_at: string | null;
@@ -867,6 +914,20 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
 
   if (!items.length && !contactWishes.length) {
     return { success: false, status: 400, error: "Cart is empty" };
+  }
+
+  // I-S2: a category label in the cart (one added before addCartItem refused
+  // them) is no product, so the cart is not sent: no order, no handoff line.
+  // Checked on the row as it is now, like the availability below.
+  const labels = items.filter((i) =>
+    isCategoryLabelRow({ name: i.product_name, price_nok: i.price_nok, availability_source: i.availability_source }));
+  if (labels.length > 0) {
+    return {
+      success: false,
+      status: 422,
+      error: CATEGORY_LABEL_CART_ERROR,
+      category_labels: labels.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
+    };
   }
 
   // Re-check availability for every item (mandatory per spec). Gate on the

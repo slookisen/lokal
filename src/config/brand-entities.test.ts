@@ -37,6 +37,11 @@
  *   (k) G3-S2: no file in opplevagent-connectors-prep/assets/ is the RFB
  *       sprout (md5 e927c311…), and the icon the ChatGPT checklist names is
  *       Opplevagent's own.
+ *   (l) G3-S8 (Daniel's decision 4=A): only Finn-tannlege has a
+ *       `disambiguation` sentence, frozen, in nb and en, worded as the name
+ *       check allows; no entry carries FINN or finn.no in alternateName or
+ *       sameAs. Where the sentence is printed is checked in
+ *       src/routes/dental-finn-disambiguation.test.ts.
  *
  * The rendered rettfrabonden.com / opplevagent.no / finn-tannlege.com front
  * pages are checked through the real routers in
@@ -54,6 +59,7 @@ import * as yaml from "js-yaml";
 import { BRAND_ENTITIES, WIKIDATA_ITEM_BASE, brandSameAs, wikidataUrl, type BrandKey } from "./brand-entities";
 import { COMPANY_INFO } from "./company-info";
 import { organizationJsonLd, parentOrganizationJsonLd } from "../services/company-legal";
+import { NOT_AFFILIATED_EN, NOT_AFFILIATED_NB } from "../routes/dental-finn-disambiguation.test";
 
 export interface TestSummary {
   passed: number;
@@ -334,6 +340,22 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     assertTrue(!!size && size.w === 512 && size.h === 512 && md5(buf) !== RFB_SPROUT_MD5, "k4: opplevagent-brand-512.png (the icon the ChatGPT checklist names) is a 512×512 PNG and not the sprout");
     const readme = fs.readFileSync(path.join(REPO_ROOT, "opplevagent-connectors-prep", "chatgpt-app", "README.md"), "utf8");
     assertTrue(readme.includes("../assets/opplevagent-brand-512.png") && /green one was\s+byte-identical to the RFB icon and was removed/.test(readme), "k5: the ChatGPT checklist names the brand icon and records the removal");
+  }
+
+  // ── (l) G3-S8: the sentence that sets Finn-tannlege apart from FINN.no ──
+  {
+    assertEq(KEYS.filter((k) => E[k].disambiguation !== undefined), ["dental"], "l1: only Finn-tannlege has a disambiguation sentence (the field is optional)");
+    const d = E.dental.disambiguation;
+    assertEq(d ? Object.keys(d) : null, ["nb", "en"], "l2: the sentence is given in nb and en");
+    assertTrue(!!d && Object.isFrozen(d), "l3: the sentence object is frozen");
+    assertTrue(!!d && NOT_AFFILIATED_NB.test(d.nb) && NOT_AFFILIATED_EN.test(d.en), "l4: nb «ikke tilknyttet FINN.no» / en «not affiliated with FINN.no» (or the alternative wording)");
+    assertTrue(!!d && [d.nb, d.en].every((s) => s.startsWith("Finn-tannlege.com ") && s.includes(COMPANY_INFO.displayName)),
+      "l5: each names the service as «Finn-tannlege.com» and the company from COMPANY_INFO");
+    const finn = /\bFINN\b|\b[Ff][Ii][Nn][Nn]\.[Nn][Oo]\b/;
+    for (const k of KEYS) {
+      assertTrue(![...E[k].alternateName, ...brandSameAs(E[k])].some((v) => finn.test(v)), `l6 ${k}: no FINN or finn.no in alternateName or sameAs`);
+    }
+    assertEq(E.dental.name, "Finn-tannlege", "l7: the name stays «Finn-tannlege» (decision 4=A: no rename)");
   }
 
   return { passed, failed, failures };

@@ -5353,6 +5353,31 @@ function initSchema(db: Database.Database): void {
     console.error("Migration boot_job_state failed:", err);
   }
 
+  // dev-request 2026-10-16-indexnow-alle-verter (S2): state for the IndexNow sitemap-diff job
+  // (services/indexnow-sync.ts). Additive and inert while INDEXNOW_SYNC_ENABLED is off.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS indexnow_submissions (
+        host TEXT NOT NULL,
+        url TEXT NOT NULL,
+        lastmod TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_submitted_at TEXT,
+        last_status TEXT,
+        removed_at TEXT,
+        PRIMARY KEY (host, url)
+      );
+      CREATE TABLE IF NOT EXISTS indexnow_host_state (
+        host TEXT PRIMARY KEY,
+        baseline_at TEXT,
+        backoff_until TEXT,
+        last_error TEXT
+      );
+    `);
+  } catch (err) {
+    console.error("Migration indexnow_submissions failed:", err);
+  }
+
   // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): two small state
   // tables for the nightly RFB enrichment job (services/rfb-enrichment-
   // nightly.ts). Created in-module too (ensureRfbEnrichmentNightlyTables), so
@@ -5570,6 +5595,30 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_deliveries_vertical_day ON profile_ai_deliveries(vertical_id, day)`);
   } catch (err) {
     console.error("Migration profile_ai_deliveries failed:", err);
+  }
+
+  // ─── search_console_weekly (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c) ───
+  // Weekly numbers from Google Search Console and Bing Webmaster Tools per
+  // domain (source gsc | bing; week = Monday YYYY-MM-DD; metric e.g. clicks,
+  // impressions, sitemaps; dimension e.g. total, country:nor), upserted by
+  // services/search-console-fetch.ts. Aggregates only, no secrets. Same DDL as
+  // SEARCH_CONSOLE_WEEKLY_DDL there (a test compares them). Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS search_console_weekly (
+        domain TEXT NOT NULL,
+        source TEXT NOT NULL,
+        week TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        dimension TEXT NOT NULL,
+        value REAL NOT NULL,
+        fetched_at TEXT NOT NULL,
+        UNIQUE (domain, source, week, metric, dimension)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_console_weekly_week ON search_console_weekly(week)`);
+  } catch (err) {
+    console.error("Migration search_console_weekly failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

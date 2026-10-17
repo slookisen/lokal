@@ -9,6 +9,7 @@
 import { signAgentCard } from "./agent-card-signing";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
+import { distributionFor } from "../config/distribution-channels";
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
@@ -170,45 +171,8 @@ export function getDentalAgentCard(honestCount?: number | null): object {
     // registered tools, services/mcp-tool-manifest.ts; locked by discovery-truth.test.ts).
     ...(hasCount ? { "x-catalog": { vertical: "dental", honestCount } } : {}),
     "x-mcp-tools": registeredMcpTools("dental").map((t) => t.name),
-    // Channels verified live on 2026-10-07 (HTTP 200 / registry lookup). mcp.so is NOT
-    // listed: https://mcp.so/server/finn-tannlege-mcp returned 404 — add it when it is.
-    "x-distribution": [
-      {
-        channel: "custom-gpt",
-        url: "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge",
-        install: "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge",
-        status: "live",
-        description: "ChatGPT Custom GPT — Finn tannlege i Norge clinic discovery; Actions on finn-tannlege.com/openapi.json.",
-      },
-      {
-        channel: "npm",
-        url: "https://www.npmjs.com/package/finn-tannlege-mcp",
-        install: "npx finn-tannlege-mcp",
-        status: "live",
-        description: "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.",
-      },
-      {
-        channel: "official-mcp-registry",
-        url: "https://registry.modelcontextprotocol.io/v0/servers?search=finn-tannlege",
-        install: "npx finn-tannlege-mcp",
-        status: "live",
-        description: "Official Model Context Protocol Registry — io.github.slookisen/finn-tannlege-mcp.",
-      },
-      {
-        channel: "a2a-registry",
-        url: "https://a2aregistry.org/agents/cd035cbe-46f9-4591-889e-e4fa20663113",
-        install: `${url}/.well-known/agent-card.json`,
-        status: "live",
-        description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
-      },
-      {
-        channel: "agenstry",
-        url: "https://agenstry.com/agents/finn-tannlege.com",
-        install: `${url}/.well-known/agent-card.json`,
-        status: "live",
-        description: "Agenstry A2A agent directory — auto-indexed from agent-card.json.",
-      },
-    ],
+    // Channels come from config/distribution-channels.ts (one source, each with a probe URL).
+    "x-distribution": distributionFor("dental", `${url}/.well-known/agent-card.json`),
   };
   // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
   // sign the card exactly as assembled above (no `signatures` key present

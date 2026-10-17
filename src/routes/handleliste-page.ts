@@ -84,6 +84,7 @@ const COPY: Record<"no" | "en", Copy> = {
     badge_verified: "Verifisert av eier",
     can_order: "Kan bestilles her",
     contact_only: "Kontakt selv",
+    category_match: "Kategoritreff: profilen nevner bare kategorien, ikke varen. Spør produsenten om de har den.",
     km: "km",
     producer_says: "Produsenten oppgir:",
     channels: "Salgskanaler:",
@@ -150,6 +151,7 @@ const COPY: Record<"no" | "en", Copy> = {
     badge_verified: "Verified by owner",
     can_order: "Can be ordered here",
     contact_only: "Contact directly",
+    category_match: "Category match: the profile only names the category, not the item. Ask the producer whether they have it.",
     km: "km",
     producer_says: "The producer states:",
     channels: "Sales channels:",
@@ -333,8 +335,10 @@ const CLIENT_SCRIPT = `
       var anyOk = false;
       rs.forEach(function(r, i){
         var offers = (r.status === 200 && r.body && Array.isArray(r.body.offers)) ? r.body.offers.slice(0, 5) : [];
+        // I-S2: category matches fill the free places, as contact rows (no product id).
+        var cats = (r.status === 200 && r.body && Array.isArray(r.body.category_matches)) ? r.body.category_matches : [];
         if (r.status === 200) anyOk = true;
-        state.offers[i] = offers; state.picks[i] = null;
+        state.offers[i] = offers.concat(cats).slice(0, 5); state.picks[i] = null;
       });
       if (!anyOk) { msg('hl-msg1', C.error_generic); return; }
       renderOffers(); show('hl-s2');
@@ -348,7 +352,8 @@ const CLIENT_SCRIPT = `
     var lbl = mk('label', { cls: 'hl-offer', 'for': id });
     var head = mk('div', null, [radio, mk('span', { cls: 'hl-name', text: String(p.name || '') })]);
     if (p.verifisert_av_eier) head.appendChild(mk('span', { cls: 'hl-badge', text: C.badge_verified }));
-    head.appendChild(mk('span', { cls: 'hl-badge' + (p.can_order ? '' : ' warn'), text: p.can_order ? C.can_order : C.contact_only }));
+    var isCat = o.match === 'category', orderable = !!p.can_order && !isCat;
+    head.appendChild(mk('span', { cls: 'hl-badge' + (orderable ? '' : ' warn'), text: orderable ? C.can_order : C.contact_only }));
     lbl.appendChild(head);
     var bits = [];
     if (p.city) bits.push(String(p.city));
@@ -356,6 +361,7 @@ const CLIENT_SCRIPT = `
     if (o.product_name) bits.push(String(o.product_name));
     if (typeof o.price_nok === 'number') bits.push(o.price_nok + ' kr' + (o.unit ? '/' + o.unit : ''));
     lbl.appendChild(mk('div', { cls: 'hl-meta', text: bits.join(' · ') }));
+    if (isCat) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.category_match }));
     if (o.availability) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.availability + ' ' + String(o.availability) }));
     if (Array.isArray(p.salgskanaler) && p.salgskanaler.length) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.channels + ' ' + p.salgskanaler.join(', ') }));
     if (p.delivery_text) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.producer_says + ' ' + String(p.delivery_text) }));

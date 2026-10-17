@@ -877,6 +877,7 @@ import { findLocalOrgnrCandidate } from "../services/local-orgnr-candidates";
 // ved landing av nye NACE-oppdagede providere.
 import { cityToFylke } from "../services/norway-fylke";
 import { resolveFylke2024 } from "../services/fylke-2024-migration";
+import { fillFylkeFromKommune, runGardssalgFylkeFromKommune } from "../services/gardssalg-fylke-from-kommune";
 import {
   createBooking,
   getBookingByRef,
@@ -15849,7 +15850,7 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
           navn: agent.name,
           vertical: "experiences",
           hjemmeside: agent.url ?? null,
-          fylke: null,
+          fylke: fillFylkeFromKommune({ kommune: agent.city ?? null }),
           kommune: agent.city ?? null,
           postnummer: null,
           poststed: agent.city ?? null,
@@ -26564,6 +26565,28 @@ router.post("/admin/fylke-2024-migration", requireAdmin, (req: Request, res: Res
     res.json({ success: true, dry_run: !apply, batch_id: batchId, tables: reports });
   } catch (err) {
     console.error("[fylke-2024-migration] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-provider-fylke-from-kommune ──────
+//
+// dev-request 2026-10-01-opplevagent-fylke-fra-kommune. Fills an EMPTY
+// `fylke` on gårdssalg providers from kommune/kommunenummer via the pure
+// resolveFylke2024() lookup (never guesses: needs_review => no write). A set
+// fylke is never touched; content_source manual/claim rows are skipped; one
+// gardssalg_content_audit row per write. Dry-run by default — apply only on
+// body.apply === true / "true" (same strict parse as the other bulk levers).
+// Core logic: services/gardssalg-fylke-from-kommune.ts.
+router.post("/admin/gardssalg-provider-fylke-from-kommune", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { apply?: unknown; batch_id?: unknown };
+  const apply = body.apply === true || body.apply === "true";
+  const batchId = typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : null;
+  try {
+    const report = runGardssalgFylkeFromKommune({ apply, batchId });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[gardssalg-provider-fylke-from-kommune] failed:", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

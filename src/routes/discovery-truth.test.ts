@@ -561,12 +561,29 @@ export async function runDiscoveryTruthTests(opts: { log?: boolean } = {}): Prom
       const eCard = (await callRouter(expRouter, "/.well-known/agent-card.json", "opplevagent.no"))?.body;
       const dCh = (dCard?.["x-distribution"] || []).map((c: any) => c.channel).sort();
       const eCh = (eCard?.["x-distribution"] || []).map((c: any) => c.channel).sort();
-      assertEq(dCh, ["a2a-registry", "agenstry", "custom-gpt", "npm", "official-mcp-registry"], "xdist-dental: real channels declared (mcp.so omitted — not live)");
+      assertEq(dCh, ["a2a-registry", "agenstry", "custom-gpt", "glama", "mcp-so", "npm", "official-mcp-registry"], "xdist-dental: real channels declared (glama + mcp-so verified live 2026-10-16)");
       assertEq(eCh, ["a2a-registry", "agenstry", "custom-gpt", "mcp-so", "npm", "official-mcp-registry"], "xdist-exp: real channels declared");
       assertTrue(
         [...(dCard?.["x-distribution"] || []), ...(eCard?.["x-distribution"] || [])].every((c: any) => c.status === "live" && /^https:\/\//.test(c.url) && c.install),
         "xdist: every entry has status live, https url and install",
       );
+      assertTrue(
+        [...(dCard?.["x-distribution"] || []), ...(eCard?.["x-distribution"] || [])].every((c: any) => /^https:\/\//.test(c.probe?.url) && c.probe?.expect === 200 && c.verifiedAt),
+        "xdist: every dental/experiences entry has probe.url (https), probe.expect and verifiedAt",
+      );
+      // The config is the single source: every entry of every vertical (rfb included) carries a probe.
+      const distCfg = require("../config/distribution-channels") as typeof import("../config/distribution-channels");
+      for (const v of ["rfb", "dental", "experiences"] as const) {
+        const list = distCfg.distributionFor(v, "https://example.test/.well-known/agent-card.json");
+        assertTrue(
+          list.length > 0 && list.every((c) => /^https:\/\//.test(c.url) && /^https:\/\//.test(c.probe.url) && c.probe.expect === 200 && c.verifiedAt),
+          `xdist-config: every ${v} entry has an https url and probe.url`,
+        );
+        assertTrue(
+          list.every((c) => !/\bv?\d+\.\d+|\d[\d,]*\+|\d{3,}|isLatest/.test(c.description)),
+          `xdist-config: ${v} channel text carries no version numbers or counts`,
+        );
+      }
     }
   } catch (err: any) {
     failed++;

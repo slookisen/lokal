@@ -19,7 +19,8 @@
  *     internal verification_status cross-check.
  *   - salgskanaler[] / delivery_text / phone / email / profile_url /
  *     vcard_url are populated from the existing structured sources.
- *   - response envelope is exactly { term, offers: [...] } — no wrapper.
+ *   - response envelope is { term, offers: [...] } — no wrapper; slice I-S2
+ *     adds category_matches only when there are category matches (none here).
  *   - 400 when `q` is missing; 400 when neither `near` nor `lat`+`lng` given.
  *
  * Harness mirrors marketplace-catalog-supply-graph.test.ts: in-memory
@@ -271,14 +272,17 @@ export async function runMarketplaceCatalogOffersTests(opts: { log?: boolean } =
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // Test: response envelope is exactly { term, offers }
+    // Test: response envelope is { term, offers } (I-S2: plus category_matches
+    // only when there are category matches; rfb-kategoritreff-i-offers.test.ts)
     // ════════════════════════════════════════════════════════════════════
     {
       const r = await callRoute(catalogRouter, { url: "/offers", query: { q: "poteter", lat: String(OSLO_NEAR.lat), lng: String(OSLO_NEAR.lng), radius_km: "5", limit: "1" } });
       assertEq(r.status, 200, "envelope: 200 OK");
       assertEq(r.body.term, "poteter", "envelope: term echoes q");
       assertTrue(Array.isArray(r.body.offers), "envelope: offers is an array");
-      assertEq(Object.keys(r.body).sort(), ["offers", "term"], "envelope: exactly {term, offers}, no extra top-level fields");
+      assertTrue(Object.keys(r.body).every((k) => ["term", "offers", "category_matches"].includes(k)),
+        "envelope: top-level keys ⊆ {term, offers, category_matches}, no wrapper");
+      assertEq(Object.keys(r.body).sort(), ["offers", "term"], "envelope: exactly {term, offers} when there are no category matches");
     }
 
     // ════════════════════════════════════════════════════════════════════

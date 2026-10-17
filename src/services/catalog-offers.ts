@@ -40,8 +40,16 @@
 // enrichment's category inference and copied into `products` by
 // product-catalog-sync.ts) with no price_nok is no offer, unless the producer
 // set it (availability_source 'producer_dashboard'). The rule is the one
-// lokal_info lists such rows by (utils/category-label.ts); the response shape
-// is unchanged, there are only fewer such rows.
+// lokal_info lists such rows by (utils/category-label.ts); `offers` has the
+// same shape, there are only fewer such rows.
+//
+// Slice I-S2 (b): the producers behind those label rows are not dropped. When
+// the real offers leave free places on the page, the nearest label producers
+// (ties by agent id) fill them in `category_matches`, one entry per producer:
+// the producer and its category, with no product id, name, price, unit or
+// availability and orderable:false, so a client can only offer to contact
+// them. The field is left out when it is empty, so a response whose offers
+// fill the page is what it was.
 
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
@@ -106,9 +114,26 @@ export interface Offer {
   producer: OfferProducer;
 }
 
+/** I-S2: a producer whose catalog has the term only as a category label (see the module comment). */
+export interface CategoryMatch {
+  match: "category";
+  /** The category name on the producer's label row, e.g. «Honning»; of several, the first by name (nb). */
+  category: string;
+  orderable: false;
+  note: string;
+  producer: OfferProducer;
+}
+
 export interface FindOffersResult {
   term: string;
   offers: Offer[];
+  /** I-S2: only when non-empty; offers.length + category_matches.length ≤ limit. */
+  category_matches?: CategoryMatch[];
+}
+
+/** The note of a category match (NO / EN), as I-N labels a category match in lokal_search. */
+export function categoryMatchNote(term: string): string {
+  return `Kategoritreff — spør produsenten om de har «${term}». / Category match only — ask the producer whether they have «${term}».`;
 }
 
 export type OffersGeocodeFn = (place: string) => Promise<{ lat: number; lng: number } | null>;
@@ -134,6 +159,11 @@ interface RawOfferRow {
   lat: number;
   lng: number;
   is_verified: number;
+}
+
+/** I-S2: a producer's label rows by name (nb), then id, so its category match does not hang on the rows' order. */
+function compareLabelRows(a: RawOfferRow, b: RawOfferRow): number {
+  return a.product_name.trim().localeCompare(b.product_name.trim(), "nb") || a.product_id.localeCompare(b.product_id);
 }
 
 async function defaultGeocode(place: string): Promise<{ lat: number; lng: number } | null> {
@@ -167,7 +197,8 @@ async function resolvePosition(
 
 /**
  * Finds up to `limit` (max 5) product offers matching `q`, from eligible
- * producers within `radiusKm` of the resolved position, nearest first.
+ * producers within `radiusKm` of the resolved position, nearest first, and
+ * fills the rest of the `limit` with category matches (I-S2).
  * Never throws: an unresolvable position or a geocode failure both result in
  * an empty `offers` array rather than an error.
  */
@@ -216,13 +247,37 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     `%${term.toLowerCase()}%`
   ) as RawOfferRow[];
 
-  const withDistance = rows
-    // I-S: before the limit, so the labels do not shorten the page.
-    .filter((r) => !isCategoryLabel({ name: r.product_name, hasPrice: r.price_nok != null, availabilitySource: r.availability_source }))
+  const nearest = rows
     .map((r) => ({ r, dist: haversineDistanceKm(position.lat, position.lng, r.lat, r.lng) }))
     .filter((x) => x.dist <= radiusKm)
-    .sort((a, b) => a.dist - b.dist)
-    .slice(0, limit);
+    .sort((a, b) => a.dist - b.dist);
+  // I-S: the labels are split off before the limit, so they do not shorten
+  // the page. The sort is stable, so the offers keep the order they had.
+  const productRows: typeof nearest = [];
+  const labelRows: typeof nearest = [];
+  for (const x of nearest) {
+    const label = isCategoryLabel({ name: x.r.product_name, hasPrice: x.r.price_nok != null, availabilitySource: x.r.availability_source });
+    (label ? labelRows : productRows).push(x);
+  }
+  const offerRows = productRows.slice(0, limit);
+
+  // I-S2: the free places go to the nearest label producers, one entry each.
+  // A producer with a real offer for the term is never one of them: when
+  // there are free places, every real offer in the radius is on the page.
+  // Equal distances are common (all rows of one producer, producers placed at
+  // a city centroid) and the query has no ORDER BY, so the choice does not
+  // use the rows' order: per producer the label whose name sorts first (nb),
+  // then the producers by distance and agent id. `offers` keeps its own order.
+  const offered = new Set(offerRows.map((x) => x.r.agent_id));
+  const labelOf = new Map<string, (typeof nearest)[number]>();
+  for (const x of labelRows) {
+    if (offered.has(x.r.agent_id)) continue;
+    const prev = labelOf.get(x.r.agent_id);
+    if (!prev || compareLabelRows(x.r, prev.r) < 0) labelOf.set(x.r.agent_id, x);
+  }
+  const matchRows = [...labelOf.values()]
+    .sort((a, b) => a.dist - b.dist || a.r.agent_id.localeCompare(b.r.agent_id))
+    .slice(0, limit - offerRows.length);
 
   const salgskanalStmt = db.prepare(`
     SELECT sc.name AS name
@@ -232,7 +287,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     ORDER BY sc.sort_order
   `);
 
-  const offers: Offer[] = withDistance.map(({ r, dist }) => {
+  // One producer shape for offers and category matches.
+  const producerOf = (r: RawOfferRow, dist: number): OfferProducer => {
     const info = knowledgeService.getAgentInfo(r.agent_id);
     const k = info?.knowledge;
 
@@ -243,27 +299,38 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     const canOrder = isEligibleForRealOrder(r.agent_id, db);
 
     return {
-      product_id: r.product_id ?? null,
-      product_name: r.product_name,
-      price_nok: r.price_nok ?? null,
-      unit: r.unit ?? null,
-      availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
-      producer: {
-        agent_id: r.agent_id,
-        name: r.agent_name,
-        city: r.city ?? null,
-        distance_km: Math.round(dist * 10) / 10,
-        verifisert_av_eier: isVerified,
-        can_order: canOrder,
-        salgskanaler,
-        delivery_text: k?.deliveryOptions?.length ? k.deliveryOptions.join(", ") : null,
-        phone: k?.phone ?? null,
-        email: k?.email ?? null,
-        profile_url: `${BASE_URL}/produsent/${slugify(r.agent_name)}`,
-        vcard_url: `${BASE_URL}/api/marketplace/agents/${r.agent_id}/vcard`,
-      },
+      agent_id: r.agent_id,
+      name: r.agent_name,
+      city: r.city ?? null,
+      distance_km: Math.round(dist * 10) / 10,
+      verifisert_av_eier: isVerified,
+      can_order: canOrder,
+      salgskanaler,
+      delivery_text: k?.deliveryOptions?.length ? k.deliveryOptions.join(", ") : null,
+      phone: k?.phone ?? null,
+      email: k?.email ?? null,
+      profile_url: `${BASE_URL}/produsent/${slugify(r.agent_name)}`,
+      vcard_url: `${BASE_URL}/api/marketplace/agents/${r.agent_id}/vcard`,
     };
-  });
+  };
 
-  return { term, offers };
+  const offers: Offer[] = offerRows.map(({ r, dist }) => ({
+    product_id: r.product_id ?? null,
+    product_name: r.product_name,
+    price_nok: r.price_nok ?? null,
+    unit: r.unit ?? null,
+    availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+    producer: producerOf(r, dist),
+  }));
+
+  if (matchRows.length === 0) return { term, offers };
+  const note = categoryMatchNote(term);
+  const category_matches: CategoryMatch[] = matchRows.map(({ r, dist }) => ({
+    match: "category",
+    category: r.product_name.trim(),
+    orderable: false,
+    note,
+    producer: producerOf(r, dist),
+  }));
+  return { term, offers, category_matches };
 }

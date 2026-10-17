@@ -1496,7 +1496,9 @@ export function registerTools(
         results.push(result);
       }
 
-      deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra, results.flatMap((r) => r.offers.map((o) => o.producer.agent_id)));
+      // I-S2: a category match hands its producer to the caller too.
+      deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra,
+        results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
       return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
     })
   );

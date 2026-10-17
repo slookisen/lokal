@@ -11549,6 +11549,11 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       JSON.stringify(channels) === JSON.stringify(["a2a-registry", "agenstry", "custom-gpt", "glama", "mcp-so", "npm", "official-mcp-registry", "smithery"]),
       `pr-56: x-distribution channels are exactly [a2a-registry, agenstry, custom-gpt, glama, mcp-so, npm, official-mcp-registry, smithery] (got ${JSON.stringify(channels)})`
     );
+    const urlOf = (c: string) => (dist || []).find((d: any) => d.channel === c)?.url;
+    assertTrue(
+      urlOf("glama") === "https://glama.ai/mcp/servers/slookisen/lokal" && urlOf("mcp-so") === "https://mcp.so/servers/rett-fra-bonden-lokal",
+      "pr-56: x-distribution glama + mcp-so point to the live listings (G1-S4)"
+    );
     const a2aEntry = (dist || []).find((d: any) => d.channel === "a2a-registry");
     assertTrue(
       a2aEntry && typeof a2aEntry.install === "string" &&
@@ -33276,6 +33281,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of eslr.failures) failures.push("experience-store-lock-split: " + f);
     console.log(`  experience-store-lock-split: ${eslr.passed} passed, ${eslr.failed} failed`);
 
+    // dev-request 2026-10-01-opplevagent-fylke-fra-kommune: fill-only fylke
+    // from kommune (admin lever service + createProvider write path).
+    console.log("\n── gardssalg-fylke-from-kommune ──");
+    const { runGardssalgFylkeFromKommuneTests } = require("../src/services/gardssalg-fylke-from-kommune.test") as
+      typeof import("../src/services/gardssalg-fylke-from-kommune.test");
+    const gffk = await runGardssalgFylkeFromKommuneTests({ log: false });
+    passed += gffk.passed;
+    failed += gffk.failed;
+    for (const f of gffk.failures) failures.push("gardssalg-fylke-from-kommune: " + f);
+    console.log(`  gardssalg-fylke-from-kommune: ${gffk.passed} passed, ${gffk.failed} failed`);
+
     // dev-request 2026-08-01-gardssalg-profilkomplett-og-soekbar-foer-outreach,
     // Steg 1 (route level): GET /sok now renders a separate, clearly labeled
     // "Produsenter" section (never merged with "Opplevelser") when a gårdssalg
@@ -42644,6 +42660,52 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S2 (a): a
+// category label can never be put in a cart. cart-service refuses it with 422
+// category_label in addCartItem, in chooseCartWishOffer (before the wish's row
+// is touched) and in submitCart (a label line already in a cart), through the
+// REST routes and the MCP cart tools; a real product, a priced category name
+// and an owner-set row still can. Own in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-S2a (no category label in the cart) ──");
+  try {
+    const { runRfbKurvvaktKategorietiketterTests } = require("../src/routes/rfb-kurvvakt-kategorietiketter.test") as
+      typeof import("../src/routes/rfb-kurvvakt-kategorietiketter.test");
+    const r = await runRfbKurvvaktKategorietiketterTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-kurvvakt-kategorietiketter: " + f);
+    console.log(`  rfb-kurvvakt-kategorietiketter: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kurvvakt-kategorietiketter: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S2 (b): the
+// producers behind label rows fill the free places of an offers page in the
+// additive field category_matches (one entry per producer, nearest first and
+// the same whatever order the rows are in, no product id, never a producer
+// already in offers, left out when empty, offers unchanged), on GET
+// /catalog/offers and lokal_find_offers (counted as delivered), and as contact
+// rows on the shopping list page. Own in-memory DB (restored in finally),
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-S2b (category_matches in the offers) ──");
+  try {
+    const { runRfbKategoritreffIOffersTests } = require("../src/routes/rfb-kategoritreff-i-offers.test") as
+      typeof import("../src/routes/rfb-kategoritreff-i-offers.test");
+    const r = await runRfbKategoritreffIOffersTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-kategoritreff-i-offers: " + f);
+    console.log(`  rfb-kategoritreff-i-offers: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kategoritreff-i-offers: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no
@@ -43318,6 +43380,35 @@ runSerial(async () => {
     failed++;
     failures.push("traffic-history: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ traffic-history: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c: GSC and Bing Webmaster
+  // connectivity check, weekly fetch into search_console_weekly, /health status,
+  // GET /admin/analytics/search-consoles. Fetch stubs only (no network). Pins the
+  // main getDb() for the admin-route step and sets ADMIN_KEY (both restored), so serial.
+  console.log("\n── søkekonsoller S6c: GSC + Bing Webmaster ──");
+  try {
+    const { runBingWebmasterFetchTests } = require("../src/services/bing-webmaster-fetch.test") as
+      typeof import("../src/services/bing-webmaster-fetch.test");
+    const bw = await runBingWebmasterFetchTests({ log: false });
+    passed += bw.passed;
+    failed += bw.failed;
+    for (const f of bw.failures) failures.push("bing-webmaster-fetch: " + f);
+    console.log(`  bing-webmaster-fetch: ${bw.passed} passed, ${bw.failed} failed`);
+
+    const { runSearchConsoleFetchTests } = require("../src/services/search-console-fetch.test") as
+      typeof import("../src/services/search-console-fetch.test");
+    const scf = await runSearchConsoleFetchTests({ log: false });
+    passed += scf.passed;
+    failed += scf.failed;
+    for (const f of scf.failures) failures.push("search-console-fetch: " + f);
+    console.log(`  search-console-fetch: ${scf.passed} passed, ${scf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("search-consoles: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ search-consoles: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -44120,6 +44211,23 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("indexnow-submit: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-indexnow-alle-verter S2: indexnow-sync job (src/services/indexnow-sync.test.ts).
+runSerial(async () => {
+  console.log("\n── indexnow S2: sitemap-diff sync job ──");
+  try {
+    const { runIndexNowSyncTests } = require("../src/services/indexnow-sync.test") as
+      typeof import("../src/services/indexnow-sync.test");
+    const sc = await runIndexNowSyncTests({ log: false });
+    passed += sc.passed;
+    failed += sc.failed;
+    for (const f of sc.failures) failures.push("indexnow-sync: " + f);
+    console.log(`  indexnow-sync: ${sc.passed} passed, ${sc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("indexnow-sync: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -48218,6 +48326,28 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8, Daniel's decision 4=A):
+// Finn-tannlege.com says it is not affiliated with FINN.no — the one sentence from
+// brand-entities.ts in the footer of every dental page, on /om, in the Organization JSON-LD,
+// llms.txt, openapi.json, ai-plugin.json and the directory listing; FINN.no nowhere else and
+// no forbidden spelling of the name. Swaps DENTAL_DB_PATH (:memory:) and the dental modules
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dental-finn-disambiguation: Finn-tannlege set apart from FINN.no (G3-S8) ──");
+  try {
+    const { runDentalFinnDisambiguationTests } = require("../src/routes/dental-finn-disambiguation.test") as
+      typeof import("../src/routes/dental-finn-disambiguation.test");
+    const fd = await runDentalFinnDisambiguationTests({ log: false });
+    passed += fd.passed;
+    failed += fd.failed;
+    for (const f of fd.failures) failures.push("dental-finn-disambiguation: " + f);
+    console.log(`  dental-finn-disambiguation: ${fd.passed} passed, ${fd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-finn-disambiguation: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical (skive A):
 // sitemap role-gate (one batch query), two 404 umbrella slugs excluded, and the
 // shared BM event time-offset helper. Own in-memory DB; runSerial, tail position.
@@ -48410,6 +48540,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): UTM
+// on the partner's own website links (dental /klinikk, Opplevagent
+// /opplevelse, /tilbyder, /kategori/gardssalg/produsent), none on booking,
+// directory, «Kilde:» or JSON-LD; Referrer-Policy still no-referrer. Pins the
+// dental/experiences db-factory paths (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 utgående lenker S1: UTM on outbound partner links (dental/OA) ──");
+  try {
+    const { runOutboundUtmTests } = require("../src/routes/outbound-utm.test") as
+      typeof import("../src/routes/outbound-utm.test");
+    const ou = await runOutboundUtmTests({ log: false });
+    passed += ou.passed;
+    failed += ou.failed;
+    for (const f of ou.failures) failures.push("outbound-utm: " + f);
+    console.log(`  outbound-utm: ${ou.passed} passed, ${ou.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outbound-utm: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1 (T1–T16): the
 // client-IP choke point (middleware/client-ip.ts) — enforce makes req.ip
 // Fly-Client-IP whatever X-Forwarded-For says, every fallback is today's
@@ -48519,5 +48670,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-description-candidates-innsyn: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S3: the
+// Norwegian front page is written around gårdssalg, smaking and drink
+// producers (decision 1=B) without developer language; search, «Alle
+// opplevelser» and the hint link stay; en/sv copy unchanged (decision 6=A)
+// except the shared Organization description. Own in-memory DB — tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-opplevagent-stedssider-kvalitet E4-S3: front-page copy for gårdssalg, smaking and drinks ──");
+  try {
+    const { runExperiencesSeoForsideCopyTests } = require("../src/routes/experiences-seo-forside-copy.test") as
+      typeof import("../src/routes/experiences-seo-forside-copy.test");
+    const efc = await runExperiencesSeoForsideCopyTests({ log: false });
+    passed += efc.passed;
+    failed += efc.failed;
+    for (const f of efc.failures) failures.push("experiences-seo-forside-copy: " + f);
+    console.log(`  experiences-seo-forside-copy: ${efc.passed} passed, ${efc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-seo-forside-copy: unexpected error: " + String(err?.message || err));
   }
 });
