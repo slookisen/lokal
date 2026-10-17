@@ -36064,6 +36064,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
+  //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
+  //    every 404, agents.txt API-base /api/tannlege ──
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): dental lastmod, klinikkantall, 404 noindex, agents.txt ──");
+  try {
+    const { runDentalSeoLastmodAntall404AgentsTxtTests } = require("../src/routes/dental-seo-lastmod-antall-404-agents-txt.test") as
+      typeof import("../src/routes/dental-seo-lastmod-antall-404-agents-txt.test");
+    const diq = await runDentalSeoLastmodAntall404AgentsTxtTests({ log: false });
+    passed += diq.passed;
+    failed += diq.failed;
+    for (const f of diq.failures) failures.push("dental seo I-Q: " + f);
+    console.log(`  dental seo I-Q: ${diq.passed} passed, ${diq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental seo I-Q: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
