@@ -44105,6 +44105,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-indexnow-alle-verter S1: submitIndexNow (batch/await), host register,
+// SitemapCache.peek() (src/services/indexnow-submit.test.ts).
+runSerial(async () => {
+  console.log("\n── indexnow S1: submitIndexNow + host register + sitemap peek ──");
+  try {
+    const { runIndexNowSubmitTests } = require("../src/services/indexnow-submit.test") as
+      typeof import("../src/services/indexnow-submit.test");
+    const sc = await runIndexNowSubmitTests({ log: false });
+    passed += sc.passed;
+    failed += sc.failed;
+    for (const f of sc.failures) failures.push("indexnow-submit: " + f);
+    console.log(`  indexnow-submit: ${sc.passed} passed, ${sc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("indexnow-submit: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-03-rfb-korrigering-navn-sted-kategorier, Mål 1
 // (slug-alias/301 ved navnebytte): ensureAgentSlugAliasesTable /
 // insertAgentSlugAlias / resolveAgentSlugAlias (src/services/marketplace-
