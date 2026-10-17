@@ -12,7 +12,10 @@
  * buildBmEventJsonLd and the permanent "no Offer without price" invariant
  * (offersWithoutPrice, now in tests/helpers/jsonld-invariants.ts). Since
  * dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
- * (S1) the inner Offer carries no return/shipping terms.
+ * (S1) the inner Offer carries no return/shipping terms. Since S6 del A of the
+ * same dev-request a price comes from the product NAME only when "kr" names
+ * it, and the name is cut only then (splitNamePrice; unit tests (d), live
+ * names on the NO and EN page (e)).
  *
  * Same synthetic router.handle()-less harness as
  * rfb-trust-score-public-display-removed.test.ts (own `Database(":memory:")`,
@@ -63,6 +66,11 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       failures.push(`✗ ${label}`);
       if (log) console.log(`  ✗ ${label}`);
     }
+  }
+  function assertSame(got: unknown, want: unknown, label: string): void {
+    const g = JSON.stringify(got);
+    const w = JSON.stringify(want);
+    assertTrue(g === w, g === w ? label : `${label} — got ${g}, want ${w}`);
   }
 
   const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../database/init") as
@@ -243,6 +251,220 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       const cat = ld.hasOfferCatalog.itemListElement.map((i: any) => i.name);
       assertTrue(cat.length === 2 && cat.includes("Ost") && cat.includes("Skinke"), "mixed: Ost + range-priced Skinke go to the catalog");
       assertTrue(offersWithoutPrice(allJsonLd(r.body)) === 0, "invariant: mixed page has no Offer without price");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // (d) dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+    // (S6 del A): splitNamePrice. A price comes from the name only when "kr"
+    // names it, and the name is cut only then. Live 2026-10-17 the old rule
+    // (any dash before a digit) gave Product «Sesonggrønnsaker (40» at 50
+    // (Avdem), three «Gardsmjølk» at 1, 2 and 3 kr (Ødhumbla), «Pøyg (lagret
+    // ost, 3» at 6 (ryfylke-gardsysteri), cut Things («Tørrfisk, original
+    // filet 2», «Fenalår (spekebein lam), 1,5») and unclosed Bjerkelund names.
+    // ══════════════════════════════════════════════════════════════
+    const { splitNamePrice, productLabel, parseNokPrice: parsePrice } = require("./seo") as typeof import("./seo");
+    const balanced = (s: string): boolean => {
+      let depth = 0;
+      for (const ch of s) {
+        if (ch === "(") depth++;
+        else if (ch === ")" && --depth < 0) return false;
+      }
+      return depth === 0;
+    };
+    {
+      // [name, JSON-LD name on the NO page, price]: a "kr" price the name shows.
+      const NAME_PRICED: Array<[string, string, number]> = [
+        // Bjerkelund ×5: the price sits inside the parenthesis, so the cut closes it.
+        ["Selvplukk bringebær (kasse 3,6 kg - kr 600)", "Selvplukk bringebær (kasse 3,6 kg)", 600],
+        ["Selvplukk bringebær (kurv 300g - kr 50)", "Selvplukk bringebær (kurv 300g)", 50],
+        ["Ferdigplukka bringebær (kurv 300g - kr 60)", "Ferdigplukka bringebær (kurv 300g)", 60],
+        ["Ferdigplukka bringebær (kasse 3,6 kg - kr 700)", "Ferdigplukka bringebær (kasse 3,6 kg)", 700],
+        ["Frosne bringebær (kasse 3,6 kg - kr 600)", "Frosne bringebær (kasse 3,6 kg)", 600],
+        // A closing parenthesis anywhere in the price part, not only at its end.
+        ["Egg (6 stk – kr 40) økologisk", "Egg (6 stk)", 40],
+        // True prices knowledge-service's stricter parseProductPrice would lose.
+        ["Lammelår – kr 275/kg", "Lammelår", 275],
+        ["Pølse – kr 1.200,50", "Pølse", 1200.5],
+        ["Honning - kr. 150", "Honning", 150],
+        ["Lam 1/2 – kr 3500", "Lam 1/2", 3500],
+        ["Ost - kr. 89,-", "Ost", 89],
+        ["Øl kr. 50,-", "Øl", 50],
+        ["Honning – kr 150 (500g)", "Honning", 150],
+        ["Sesonggrønnsaker (40-50 sorter) – kr 300", "Sesonggrønnsaker (40-50 sorter)", 300],
+        ["Spekeskinke - kr 1 200", "Spekeskinke", 1200],
+        ["Kjøtt (lam) – kr 200", "Kjøtt (lam)", 200],
+        ["Lam (hel) kr 3000", "Lam (hel)", 3000],
+        ["Brød (stort) - kr 60 (bestill)", "Brød (stort)", 60],
+        ["Egg 6 stk – kr 50", "Egg 6 stk", 50],
+        ["Lam – kr 275 pr kg", "Lam", 275],
+      ];
+      // [name, what the old rule made of it]: no price, and the JSON-LD name is the whole name.
+      const NAME_UNPRICED: Array<[string, string]> = [
+        ["Sesonggrønnsaker (40-50 sorter)", "«Sesonggrønnsaker (40» at 50"],
+        ["Gardsmjølk – 1 liter/veke abonnement", "«Gardsmjølk» at 1"],
+        ["Gardsmjølk – 2 liter/veke abonnement", "«Gardsmjølk» at 2"],
+        ["Gardsmjølk – 3 liter/veke abonnement", "«Gardsmjølk» at 3"],
+        ["Pøyg (lagret ost, 3-6 mnd)", "«Pøyg (lagret ost, 3» at 6"],
+        ["Poteter 5-10 kg", "Thing «Poteter 5»"],
+        ["Tørrfisk, original filet 2-3kg", "Thing «Tørrfisk, original filet 2»"],
+        ["Fenalår (spekebein lam), 1,5–2,7 kg", "Thing «Fenalår (spekebein lam), 1,5»"],
+        // An interval is no price.
+        ["Skinke kr 150–200/kg", "«Skinke kr 150» at 200"],
+        // A multi-buy is no price for one item.
+        ["Gave - 2 for kr 100", "«Gave» at 2"],
+        ["Honning 2 for kr 100", "«Honning 2 for» at 100"],
+        ["Gave 2 x kr 100", "«Gave 2 x» at 100"],
+        ["Gave 2x kr 100", "«Gave 2x» at 100"],
+        ["Rømme - pr kr 50", "«Rømme - pr» at 50"],
+        ["Pakke kr 100 for 2", "Thing «Pakke»"],
+        // More than one kr price: no single number is the product's price.
+        ["Kake – kr 50 (liten), kr 90 (stor)", "«Kake» at 50"],
+        ["Ost – kr 89 / kr 150", "«Ost» at 89"],
+        ["Egg kr 40 – kr 70", "«Egg kr 40» at 70"],
+        // Known, deliberate loss: a price after the number. The 2026-10-17
+        // feed had no name of this form (dev-request S6 del A).
+        ["Egg – 60 kr", "«Egg» at 60"],
+        // "kr" inside a parenthesis without a separator: no price, as before.
+        ["Hjortekjøtt (kr 350/kg)", "Hjortekjøtt (kr 350/kg), no price"],
+      ];
+      for (const [raw, name, price] of NAME_PRICED) {
+        assertSame(splitNamePrice(raw, "no"), { name, price }, `splitNamePrice no: ${JSON.stringify(raw)} → ${JSON.stringify(name)} at ${price}`);
+        assertSame(splitNamePrice(raw, "en"), { name: productLabel(name, "en"), price },
+          `splitNamePrice en: ${JSON.stringify(raw)} → the cut name through productLabel, at ${price}`);
+        assertTrue(balanced(raw) && balanced(name), `splitNamePrice: ${JSON.stringify(name)} has balanced parentheses, as its source`);
+      }
+      for (const [raw, before] of NAME_UNPRICED) {
+        assertSame(splitNamePrice(raw, "no"), { name: raw, price: null },
+          `splitNamePrice no: ${JSON.stringify(raw)} gives no price and the whole name (old rule: ${before})`);
+        assertSame(splitNamePrice(raw, "en"), { name: productLabel(raw, "en"), price: null },
+          `splitNamePrice en: ${JSON.stringify(raw)} gives no price and the whole name through productLabel`);
+      }
+      // On an EN page the cut name is translated like a whole name.
+      for (const [raw, en] of [
+        ["Honning - kr. 150", "Honey"],
+        ["Pølse – kr 1.200,50", "Sausage"],
+        ["Ost - kr. 89,-", "Cheese"],
+        ["Kjøtt (lam) – kr 200", "Meat (lamb)"],
+      ] as const) {
+        assertSame(splitNamePrice(raw, "en").name, en, `splitNamePrice en: ${JSON.stringify(raw)} → ${JSON.stringify(en)}`);
+      }
+      assertSame(splitNamePrice("", "no"), { name: "", price: null }, "splitNamePrice: an empty name gives no price");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // (e) S6 del A on the page: live product names (Bjerkelund, Avdem,
+    // Ødhumbla, and one producer with the other forms) on the NO and the EN
+    // producer page. Each JSON-LD price is the price the same product's row
+    // shows, no name is cut without a price, and each name-only Thing is its
+    // row's visible name. Rows and JSON-LD are matched by order (the first 20
+    // products, Things skipped), since on EN «Honning - kr. 150» is the Offer
+    // «Honey» while the row keeps the whole name.
+    // ══════════════════════════════════════════════════════════════
+    {
+      type Row = { name: string; price?: string; want: [string, number] | null };
+      const FIXTURES: Array<{ id: string; name: string; slug: string; rows: Row[] }> = [
+        { id: "bjerkelund-gard", name: "Bjerkelund Gaard", slug: "bjerkelund-gaard", rows: [
+          { name: "Selvplukk bringebær (kasse 3,6 kg - kr 600)", want: ["Selvplukk bringebær (kasse 3,6 kg)", 600] },
+          { name: "Selvplukk bringebær (kurv 300g - kr 50)", want: ["Selvplukk bringebær (kurv 300g)", 50] },
+          { name: "Ferdigplukka bringebær (kurv 300g - kr 60)", want: ["Ferdigplukka bringebær (kurv 300g)", 60] },
+          { name: "Ferdigplukka bringebær (kasse 3,6 kg - kr 700)", want: ["Ferdigplukka bringebær (kasse 3,6 kg)", 700] },
+          { name: "Frosne bringebær (kasse 3,6 kg - kr 600)", want: ["Frosne bringebær (kasse 3,6 kg)", 600] },
+        ] },
+        // Before: Product «Sesonggrønnsaker (40» at an invented 50, and 3 Things.
+        { id: "avdem-gard", name: "Avdem Gaard", slug: "avdem-gaard", rows: [
+          { name: "Grønnsaksabonnement (ukentlig kasse)", want: null },
+          { name: "Sesonggrønnsaker (40-50 sorter)", want: null },
+          { name: "Urter", want: null },
+          { name: "Selvplukk fra Avdemsbue", want: null },
+        ] },
+        // Before: three Products «Gardsmjølk» at 1, 2 and 3 kr.
+        { id: "odhumbla-gard", name: "Odhumbla Gaard", slug: "odhumbla-gaard", rows: [
+          { name: "Gardsmjølk – 1 liter/veke abonnement", want: null },
+          { name: "Gardsmjølk – 2 liter/veke abonnement", want: null },
+          { name: "Gardsmjølk – 3 liter/veke abonnement", want: null },
+        ] },
+        { id: "navnepris-gard", name: "Navnepris Gaard", slug: "navnepris-gaard", rows: [
+          { name: "Pøyg (lagret ost, 3-6 mnd)", want: null },
+          { name: "Poteter 5-10 kg", want: null },
+          { name: "Tørrfisk, original filet 2-3kg", want: null },
+          { name: "Fenalår (spekebein lam), 1,5–2,7 kg", want: null },
+          { name: "Lammelår – kr 275/kg", want: ["Lammelår", 275] },
+          { name: "Pølse – kr 1.200,50", want: ["Pølse", 1200.5] },
+          { name: "Honning - kr. 150", want: ["Honning", 150] },
+          { name: "Lam 1/2 – kr 3500", want: ["Lam 1/2", 3500] },
+          { name: "Ost - kr. 89,-", want: ["Ost", 89] },
+          { name: "Øl kr. 50,-", want: ["Øl", 50] },
+          { name: "Honning – kr 150 (500g)", want: ["Honning", 150] },
+          { name: "Sesonggrønnsaker (40-50 sorter) – kr 300", want: ["Sesonggrønnsaker (40-50 sorter)", 300] },
+          { name: "Egg (6 stk – kr 40) økologisk", want: ["Egg (6 stk)", 40] },
+          { name: "Skinke kr 150–200/kg", want: null },
+          { name: "Gave - 2 for kr 100", want: null },
+          { name: "Egg – 60 kr", want: null },
+          { name: "Kake – kr 50 (liten), kr 90 (stor)", want: null },
+          // The price field still wins, and the name stays whole.
+          { name: "Flatbrød", price: "kr 65", want: ["Flatbrød", 65] },
+          { name: "Kjøtt (lam) – kr 200", want: ["Kjøtt (lam)", 200] },
+        ] },
+      ];
+      const unescapeHtml = (s: string): string =>
+        s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+      const rowsOnPage = (body: string): Array<{ name: string; price: string }> =>
+        [...body.matchAll(/<div class="prod-item"><span class="prod-name">([\s\S]*?)<\/span>(?:<span class="prod-price">([\s\S]*?)<\/span>)?/g)]
+          .map((m) => ({ name: unescapeHtml(m[1]), price: unescapeHtml(m[2] || "") }));
+      const digits = (s: string): string => s.replace(/\D/g, "");
+
+      for (const f of FIXTURES) {
+        assertTrue(f.rows.length <= 20, `S6 setup: ${f.slug} has at most the 20 products the JSON-LD reads`);
+        seedAgent({ id: f.id, name: f.name, city: "Lesja", lat: 62.13, lng: 8.86 });
+        seedProducts(f.id, f.rows.map((x) => (x.price ? { name: x.name, price: x.price } : { name: x.name })));
+      }
+      resetRegistryCache();
+
+      for (const f of FIXTURES) {
+        for (const lang of ["no", "en"] as const) {
+          const tag = `S6 ${f.slug} (${lang})`;
+          const r = invoke("/produsent/:slug", { params: { slug: f.slug }, lang, ip: "127.0.0.1" });
+          assertTrue(r.status === 200, `${tag}: renders 200`);
+          const blocks = jsonLdBlocks(r.body);
+          const ld = mainLd(r.body);
+          assertTrue(!!ld, `${tag}: main JSON-LD present`);
+          const offers: any[] = Array.isArray(ld?.makesOffer) ? ld.makesOffer : [];
+          const things: any[] = ld?.hasOfferCatalog?.itemListElement || [];
+          const wantOffers = f.rows.filter((x) => x.want).map((x) => [productLabel(x.want![0], lang), x.want![1]]);
+          const wantThings = f.rows.filter((x) => !x.want).map((x) => productLabel(x.name, lang));
+
+          assertSame(offers.map((o) => [o.itemOffered?.name, o.price]), wantOffers, `${tag}: makesOffer names and prices`);
+          assertTrue(offers.every((o) => o.itemOffered?.offers?.price === o.price), `${tag}: Product.offers.price is the Offer price`);
+          assertTrue(wantOffers.length > 0 || !("makesOffer" in (ld || {})), `${tag}: no makesOffer when nothing is priced`);
+          assertSame(things.map((x) => x.name), wantThings, `${tag}: the catalog Things are the whole names`);
+          if (lang === "en") {
+            for (const [no, en] of [["Honning", "Honey"], ["Pølse", "Sausage"], ["Kjøtt (lam)", "Meat (lamb)"]]) {
+              if (!f.rows.some((x) => x.want?.[0] === no)) continue;
+              const names = offers.map((o) => o.itemOffered?.name);
+              assertTrue(names.includes(en) && !names.includes(no), `${tag}: the cut name ${JSON.stringify(no)} is translated (${JSON.stringify(en)})`);
+            }
+          }
+
+          const rows = rowsOnPage(r.body);
+          assertSame(rows.map((x) => x.name), f.rows.map((x) => productLabel(x.name, lang)), `${tag}: the visible rows keep the whole names`);
+          // The price a row shows: parseNokPrice on its price, else the name rule on its name.
+          const shown = rows.map((x) => parsePrice(x.price) ?? splitNamePrice(x.name, "no").price);
+          const pricedRows = rows.filter((_, i) => shown[i] !== null);
+          const unpricedRows = rows.filter((_, i) => shown[i] === null);
+          assertSame(offers.map((o) => o.price), shown.filter((p) => p !== null), `${tag}: each JSON-LD price is the price its row shows, in order`);
+          assertTrue(offers.every((o, i) => !!pricedRows[i] && digits(`${pricedRows[i].name} ${pricedRows[i].price}`).includes(digits(String(o.price)))),
+            `${tag}: each JSON-LD price's digits stand in its row`);
+          assertSame(things.map((x) => x.name), unpricedRows.map((x) => x.name), `${tag}: each Thing.name is its row's visible name`);
+          assertTrue([...offers.map((o) => String(o.itemOffered?.name)), ...things.map((x) => String(x.name))].every(balanced),
+            `${tag}: no JSON-LD name has an unbalanced parenthesis (every source name is balanced)`);
+          if (lang === "no") {
+            assertTrue(offers.every((o, i) => !!pricedRows[i] && pricedRows[i].name.startsWith(String(o.itemOffered?.name).replace(/\)+$/, ""))),
+              `${tag}: each Offer name, less a parenthesis the cut closed, starts its row's name`);
+          }
+          assertSame(offersWithoutPrice(blocks), 0, `${tag}: offersWithoutPrice stays 0`);
+          assertSame(forbiddenNodes(blocks), [], `${tag}: no forbidden rating/review/return/shipping node`);
+        }
+      }
     }
 
     // ══════════════════════════════════════════════════════════════

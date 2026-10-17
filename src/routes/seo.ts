@@ -546,6 +546,45 @@ export function productLabel(name: string, lang: Lang): string {
 export function isCategoryWord(name: string): boolean {
   return !!CATEGORY_NAME_TO_KEY[(name || "").trim().toLowerCase()];
 }
+
+/**
+ * dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+ * (S6 del A): the producer-page JSON-LD name and price of a product whose
+ * price field holds no price, read from its name ("Lammelår – kr 275/kg" →
+ * "Lammelår", 275). A price it gives is always a "kr" price the visible name
+ * shows.
+ * - "kr" must come right before the number. Before, any dash before a digit
+ *   split the name: "Sesonggrønnsaker (40-50 sorter)" became
+ *   «Sesonggrønnsaker (40» at an invented 50, "Gardsmjølk – 2 liter/veke
+ *   abonnement" «Gardsmjølk» at 2, and "Poteter 5-10 kg" the Thing «Poteter 5».
+ * - A multi-buy ("Gave - 2 for kr 100", "2 x kr 100", "pr kr 50") and a name
+ *   with more than one kr price ("Kake – kr 50 (liten), kr 90 (stor)") give
+ *   no price: no single number is the product's price.
+ * - The name is cut only when a price was found, and a parenthesis the price
+ *   part closes is closed: "Selvplukk bringebær (kurv 300g - kr 50)" →
+ *   "Selvplukk bringebær (kurv 300g)", not "(kurv 300g".
+ * - The cut name goes through productLabel like a whole name, so EN pages
+ *   translate it ("Honning - kr. 150" → "Honey").
+ * - A price after the number ("Egg – 60 kr") gives none: the 2026-10-17
+ *   feed had no name of that form, and parseNokPrice stays the one judge of
+ *   the number.
+ * Without a price: the whole name (through productLabel) and null.
+ */
+export function splitNamePrice(rawName: string, lang: Lang): { name: string; price: number | null } {
+  const whole = { name: productLabel(rawName, lang), price: null };
+  const m = rawName.match(/^(.+?)\s*[–\-—]\s*(kr\.?\s*\d.*)$/i)
+    || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
+  if (!m) return whole;
+  const head = m[1].trim();
+  if (/(?:\b(?:for|per|pr)\.?|(?:^|[\s\d])[x×])\s*$/i.test(head)) return whole;
+  if ((rawName.match(/\bkr\.?\s*\d/gi) || []).length > 1) return whole;
+  const price = parseNokPrice(m[2]);
+  if (price === null) return whole;
+  const depth = (s: string): number => (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
+  const closes = Math.max(0, Math.min(depth(head), -depth(m[2])));
+  return { name: productLabel(head + ")".repeat(closes), lang), price };
+}
+
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
 }
@@ -6015,12 +6054,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
         let priceNum = parseNokPrice(priceValue);
         if (priceNum === null) {
-          const m = rawName.match(/^(.+?)\s*[–\-—]\s*((?:kr\.?\s*)?\d.*)$/i)
-            || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
-          if (m) {
-            productName = m[1].trim();
-            priceNum = parseNokPrice(m[2]);
-          }
+          // S6 del A: only a "kr" price the name shows, and the name is cut
+          // only when it has one (splitNamePrice).
+          const fromName = splitNamePrice(rawName, lang);
+          productName = fromName.name;
+          priceNum = fromName.price;
         }
 
         // dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): Google
