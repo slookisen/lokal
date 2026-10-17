@@ -12,7 +12,7 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: no** (4 open).
+**Ready to submit: no** (3 open).
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 | Public documentation page | **OPEN** | None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date. | G3-S4 of this dev-request (`/guide-tannlege-ai`) | code |
 | Square 512×512 PNG icon to upload | **OPEN** | None yet: no icon file in `dental-connectors-prep/assets/`, and `logoPng` is null in src/config/brand-entities.ts. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4) | code |
 | MCP server instructions and serverInfo title, description and websiteUrl | **DONE** | `new McpServer(...)` in `src/routes/dental-mcp.ts` sets serverInfo `name`, `version`, `title`, `description`, `websiteUrl` and instructions. | — | code |
-| Natural-language search in tannlege_search (town, municipality, specialty, Helfo) | **OPEN** | lokal#1086 (draft). The example prompts must return clinics against production (G3-S4). | 2026-10-16-tannlege-sok-naturlig-sprak | recorded 2026-10-17 |
+| Natural-language search in tannlege_search (town, municipality, specialty, Helfo) | **DONE** | lokal#1086, merged and live: the request goes in `query` as written, and `tolkning` shows how it was read. The example prompts must return clinics against production (G3-S4). | 2026-10-16-tannlege-sok-naturlig-sprak | recorded 2026-10-17 |
 | Per-session rate limit on /mcp | **DONE** | lokal#1098: one quota per MCP session, so users behind one shared AI-platform IP do not share a bucket. | 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt | recorded 2026-10-17 |
 | Name decision for Finn-tannlege | **DONE** | Daniel's decision 4=A (2026-10-17, A2A daniel-responses/2026-10-17-live-del-a-gjort-og-beslutninger-1-11.md): the name and the slug stay, and every text says the service is not affiliated with FINN.no (G3-S8). The listing description ends with that sentence. No paid PR with the name before the legal check (G3-J). | Daniel | recorded 2026-10-17 |
 

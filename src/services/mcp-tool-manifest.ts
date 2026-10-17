@@ -16,9 +16,13 @@
 // registeredMcpToolDefinitions() reads the same registration with full
 // description, title and annotations, for scripts/gen-connector-packs.ts
 // (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S6).
+//
+// registeredMcpCapabilities() reads the capabilities that registration gives
+// the server, which `initialize` sends, for the server card (A2A dev-request
+// 2026-10-17-dental-d3-rettelser, D3a).
 
 import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import type { ServerCapabilities, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { CatalogVertical } from "./honest-count";
 
 export interface McpToolEntry {
@@ -55,10 +59,16 @@ export function shortToolDescription(text: string, max = 220): string {
   return first.length <= max ? first : first.slice(0, max - 1).trimEnd() + "…";
 }
 
-/** Runs the vertical's register function on a throwaway server; the enabled tools in registration order. */
-function enabledRegisteredTools(vertical: CatalogVertical): Array<[string, RegisteredTool]> {
+/** A throwaway server with the vertical's register function run on it; no transport. */
+function registeredServer(vertical: CatalogVertical): McpServer {
   const server = new McpServer({ name: `manifest-${vertical}`, version: "0.0.0" });
   registerFor(vertical)(server);
+  return server;
+}
+
+/** Runs the vertical's register function on a throwaway server; the enabled tools in registration order. */
+function enabledRegisteredTools(vertical: CatalogVertical): Array<[string, RegisteredTool]> {
+  const server = registeredServer(vertical);
   const registered = (server as unknown as { _registeredTools: Record<string, RegisteredTool> })._registeredTools;
   return Object.entries(registered || {}).filter(([, t]) => t.enabled !== false);
 }
@@ -89,4 +99,20 @@ export function registeredMcpToolDefinitions(vertical: CatalogVertical): McpTool
 
 export function registeredMcpToolNames(vertical: CatalogVertical): string[] {
   return registeredMcpTools(vertical).map((t) => t.name);
+}
+
+const _capabilitiesCache = new Map<CatalogVertical, ServerCapabilities>();
+
+/**
+ * The capabilities `initialize` sends for the vertical's live MCP server: what the SDK registers along with the
+ * tools (`tools.listChanged`), so a discovery file cannot claim resources or prompts the server does not serve.
+ * The live servers set no `capabilities` option of their own. Memoised, as registeredMcpTools.
+ */
+export function registeredMcpCapabilities(vertical: CatalogVertical): ServerCapabilities {
+  const hit = _capabilitiesCache.get(vertical);
+  if (hit) return hit;
+  const server = registeredServer(vertical);
+  const out = (server.server as unknown as { getCapabilities(): ServerCapabilities }).getCapabilities();
+  _capabilitiesCache.set(vertical, out);
+  return out;
 }

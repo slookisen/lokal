@@ -285,7 +285,9 @@ export function registerDentalTools(server: McpServer): void {
       title: "Norwegian dental market statistics",
       description:
         "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many " +
-        "have Helfo direct billing, belong to a chain, are flagged for emergency duty (akuttvakt) or list a specialist.",
+        "have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. " +
+        "An emergency claim is an emergency duty with a recorded source (akuttvakt), or that the clinic says it " +
+        "takes emergency patients.",
       inputSchema: {},
       annotations: {
         title: "Norwegian dental market statistics",
@@ -304,7 +306,9 @@ export function registerDentalTools(server: McpServer): void {
             total: "Totalt antall tannlegeklinikker i databasen (ekskl. avviste).",
             helfo_count: "Antall klinikker med Helfo-direkteoppgjørsavtale.",
             chain_count: "Antall klinikker som er del av en kjede.",
-            acute_count: "Antall klinikker med akuttvakt-tilbud.",
+            acute_count:
+              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med kilde) eller «Tar imot akuttpasienter». " +
+              "Samme tall som tannlege_akutt.count og /sok?akutt=1.",
             specialist_clinic_count: "Antall klinikker der minst én spesialist er registrert.",
             per_fylke: "Fordeling per norsk fylke, sortert etter antall.",
           },
@@ -327,11 +331,11 @@ export function registerDentalTools(server: McpServer): void {
     {
       title: "Find emergency-duty dental clinics in Norway",
       description:
-        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics flagged for emergency care " +
-        "(akuttvakt), optionally in one county (fylke). " +
-        "Each clinic's `akutt` is \"vakt\" when the emergency duty has a recorded source (badge «Akuttvakt»), " +
-        "\"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»), and null when " +
-        "neither is backed. `count` is the number of flagged clinics. " +
+        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a " +
+        "recorded source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke). " +
+        "Each clinic's `akutt` is \"vakt\" when the emergency duty has a recorded source (badge «Akuttvakt») and " +
+        "\"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»). " +
+        "`count` is the number of matching clinics. " +
         "Each clinic has its address, phone and profile URL, and when known its opening hours and online booking " +
         "link. The response also has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
       inputSchema: TannlegeAkuttInputSchema,

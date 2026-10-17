@@ -23255,6 +23255,12 @@ withFreshModules([
       acute_vakt: acute,
       ...(orgNr ? { org_nr: orgNr } : {}),
     });
+    // D3a (A2A dev-request 2026-10-17-dental-d3-rettelser): acute_count counts the akutt claim,
+    // so a flagged fixture row carries the source its card needs for «Akuttvakt».
+    if (acute === 1) {
+      dbFactory109.getDb("dental").prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?")
+        .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage" }] }), id);
+    }
     ids.push(id);
     return id;
   };
@@ -23366,6 +23372,13 @@ withFreshModules([
     assertEq(osloEntry!.count, 1, "pr109-09d: Oslo count=1 (rejected excluded)");
     assertEq(stats.helfo_count, 3, "pr109-09e: helfo_count = 3 (Oslo+Stavanger+Bø, rejected excluded)");
     assertEq(stats.acute_count, 2, "pr109-09f: acute_count = 2 (Oslo Tannklinikk+Smilehuset Bø)");
+
+    // A flag without a source shows no akutt claim on the card, so it is not counted (D3a).
+    const flagOnly = createDentalAgent({ navn: "Flagg Uten Kilde", poststed: "Oslo", fylke: "Oslo", acute_vakt: 1, org_nr: "100000007" });
+    const withFlagOnly = getDentalStats();
+    assertEq(withFlagOnly.total, 6, "pr109-09g: a flag without a source counts in total");
+    assertEq(withFlagOnly.acute_count, 2, "pr109-09h: ... but not in acute_count");
+    dbFactory109.getDb("dental").prepare("DELETE FROM dental_agents WHERE id = ?").run(flagOnly);
   }
 
   // ── pr109-10: slugifyClinic / parseClinicSlug roundtrip incl. æøå
@@ -23485,6 +23498,10 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
   dbInactive.prepare(
     "UPDATE dental_agents SET is_inactive = 1, inactive_reason = ?, inactive_since = ? WHERE id = ?",
   ).run("Stengt, verifisert via fylkeskommunen", "2026-06-01T00:00:00.000Z", closedId);
+  // D3a (A2A dev-request 2026-10-17-dental-d3-rettelser): acute_count counts the akutt claim, so both
+  // flagged clinics carry a source; only is_inactive keeps the closed one out of inactive-11.
+  dbInactive.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id IN (?, ?)")
+    .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage" }] }), activeId1, closedId);
 
   // ── countPublicDentalAgents excludes the inactive fixture row ───────────
   {
@@ -23533,6 +23550,13 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
     assertEq(stats.acute_count, 1, "inactive-11: getDentalStats.acute_count excludes the inactive fixture row (only activeId1 has acute_vakt=1)");
     const osloEntry = stats.per_fylke.find((f) => f.fylke === "Oslo");
     assertEq(osloEntry?.count, 1, "inactive-12: getDentalStats.per_fylke Oslo count excludes the closed Oslo clinics (only activeId1)");
+  }
+  // An active clinic with the flag but no source shows no akutt claim, so it is not counted (D3a).
+  {
+    createAgentInactive({ navn: "Inactive-Fixture Flagg Uten Kilde", poststed: "BERGEN", fylke: "Vestland", acute_vakt: 1 } as any);
+    const stats = getDentalStatsInactive();
+    assertEq(stats.total, 3, "inactive-11b: an active flag without a source counts in total");
+    assertEq(stats.acute_count, 1, "inactive-11c: ... but not in acute_count");
   }
 
   // Cleanup.

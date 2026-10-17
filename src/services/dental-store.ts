@@ -1617,8 +1617,12 @@ export function getDentalStats(): DentalStats {
     `SELECT COUNT(*) AS n ${base} AND is_chain_member = 1`
   ).get() as { n: number }).n;
 
+  // A2A dev-request 2026-10-17-dental-d3-rettelser (D3a): the akutt claim
+  // (DENTAL_ACUTE_CLAIM_SQL), not the bare acute_vakt flag. `base` is the
+  // publicOnly WHERE, so this is countPublicDentalAgents({ acute_vakt: 1 }):
+  // the same number as MCP tannlege_akutt's `count` and /sok?akutt=1.
   const acute_count = (db.prepare(
-    `SELECT COUNT(*) AS n ${base} AND acute_vakt = 1`
+    `SELECT COUNT(*) AS n ${base} AND ${DENTAL_ACUTE_CLAIM_SQL}`
   ).get() as { n: number }).n;
 
   // specialist_clinic_count: clinics whose specialists OR available_specialties
