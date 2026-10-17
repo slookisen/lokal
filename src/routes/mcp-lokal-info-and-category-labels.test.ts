@@ -9,17 +9,24 @@
  *   rendered as before, a string as text, anything else is left out; the
  *   other list-valued JSON fields the handlers read get the same rule; and
  *   an uncaught handler error becomes a generic Norwegian/English message
- *   with the detail in the log (guardToolHandler).
+ *   with the detail in the log (guardToolHandler). Fix round 1: a cart-service
+ *   5xx result is internal error text too — lokal_cart_submit returned
+ *   `Submit failed: <SQLite message>` when its transaction failed. Its error
+ *   is now the generic message in the same JSON shape (cartResultText), with
+ *   PAYMENTS_ENABLED off and on; 4xx messages stay.
  *
  * AI-3 (P2): «honning nær Trondheim» presented a bakery whose only «product»
  *   is the enrichment's category label «Honning» like a beekeeper listing
- *   «Løvetannhonning». A product reason naming only generic category labels
- *   (productsAreGenericCategoryNames) is now a category match; the order of
- *   the results is unchanged.
+ *   «Løvetannhonning». A producer whose matched product names are only
+ *   generic category labels (productsAreGenericCategoryNames) is now a
+ *   category match; the order of the results is unchanged. Fix round 1: the
+ *   names come from discover() (DiscoverMeta.productMatches), not from the
+ *   «Produkter: …» reason, which names at most three.
  *
  * Same duck-typed-server harness as mcp-umbrella-and-price-reality.test.ts
  * against the real production schema in an in-memory DB, plus a real MCP
- * client over InMemoryTransport for the isError path the SDK serves.
+ * client over InMemoryTransport for the isError path the SDK serves. The
+ * frozen MCP contract is pinned in rfb-mcp-contract-freeze.test.ts.
  *
  * Exported runMcpLokalInfoAndCategoryLabelsTests({log}) -> TestSummary;
  * wired into tests/test.ts.
@@ -29,6 +36,7 @@
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
+import type { PaymentsStripeClient } from "../services/payment-provider";
 
 export interface TestSummary {
   passed: number;
@@ -50,6 +58,12 @@ const PRODUCTS_TEXT = "1a000000-0000-4000-8000-000000000004";
 const OBJECT_HOURS = "1a000000-0000-4000-8000-000000000005";
 const MALFORMED = "1a000000-0000-4000-8000-000000000006";
 const UMBRELLA = "1a000000-0000-4000-8000-000000000007";
+const MANY_LABELS = "1a000000-0000-4000-8000-000000000008";
+const CART_FARM = "1a000000-0000-4000-8000-000000000009";
+const CART_PRODUCT = "1a000000-0000-4000-8000-0000000000a1";
+
+// The DB error the reviewer's repro raised inside the submit transaction.
+const SUBMIT_DB_ERROR = "SQLITE internal detail: disk I/O error at page 4711";
 
 interface Seed {
   id: string;
@@ -110,6 +124,22 @@ const SEED: Seed[] = [
     categories: ["fish"],
     knowledge: { products: "{not json" },
   },
+  {
+    // Four matched names, the first three of them the category label: the
+    // «Produkter: …» reason names only those three.
+    id: MANY_LABELS, name: "Saltstraumen Bigård Fixture", lat: 67.2800, lng: 14.4000, city: "Bodø",
+    categories: ["honey"],
+    knowledge: {
+      products: JSON.stringify([{ name: "Honning" }, { name: "honning" }, { name: "HONNING" }, { name: "Lynghonning" }]),
+    },
+  },
+  {
+    // Owner-verified and opted in to orders (set in seed()), so a submit
+    // creates a real order — the path whose transaction the trigger fails.
+    id: CART_FARM, name: "Tromsdalen Eggegård Fixture", lat: 69.6500, lng: 18.9600, city: "Tromsø",
+    categories: ["eggs"],
+    knowledge: { products: JSON.stringify([{ name: "Gårdsegg", category: "eggs" }]), verification_status: "verified" },
+  },
 ];
 
 function seed(db: Database.Database): void {
@@ -137,6 +167,9 @@ function seed(db: Database.Database): void {
     INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, labels, created_at)
     VALUES (?, ?, 'active', 'admin', ?, datetime('now'))
   `).run(BEEKEEPER, UMBRELLA, JSON.stringify("Fast stand"));
+  db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = ?").run(CART_FARM);
+  db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
+    VALUES (?, ?, 'Gårdsegg', 'gardsegg', 60, 'brett', 'in_stock')`).run(CART_PRODUCT, CART_FARM);
 }
 
 export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -178,8 +211,8 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
 
   try {
     const mcp = require("./mcp") as typeof import("./mcp");
-    const { registerTools, guardToolHandler, textEntries, formatOpeningHoursForMcp,
-      isDocumentedProductReason, MCP_INTERNAL_ERROR_TEXT, enrichParsedWithGeo } = mcp;
+    const { registerTools, guardToolHandler, textEntries, formatOpeningHoursForMcp, cartResultText,
+      documentsListedProduct, MCP_INTERNAL_ERROR_TEXT, enrichParsedWithGeo } = mcp;
 
     const tools = new Map<string, CapturedTool>();
     const fakeServer: any = {
@@ -210,9 +243,27 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
     assertEq(formatOpeningHoursForMcp("  Man–fre 10–17  "), "\n## Åpningstider\nMan–fre 10–17",
       "AI-1 formatOpeningHoursForMcp: a string is shown as text");
     assertEq([formatOpeningHoursForMcp({ mon: "10-17" }), formatOpeningHoursForMcp(42), formatOpeningHoursForMcp(null),
-      formatOpeningHoursForMcp(""), formatOpeningHoursForMcp([]), formatOpeningHoursForMcp([null, 3, "x"])],
+      formatOpeningHoursForMcp(""), formatOpeningHoursForMcp([]), formatOpeningHoursForMcp([null, 3, {}, "  "])],
       ["", "", "", "", "", ""],
       "AI-1 formatOpeningHoursForMcp: an object, a number, null, empty text, an empty array and junk-only entries are left out");
+    {
+      // Fix round 1 (S5): entries without text open/close used to render as
+      // "undefined"; a text entry inside the array used to be dropped.
+      const mixed = formatOpeningHoursForMcp([
+        { day: "mon", open: "10:00", close: "17:00" },
+        " Lør etter avtale ",
+        { day: "tue" },
+        { day: "wed", open: "10:00" },
+        { day: "thu", open: 10, close: 17 },
+        { day: "fri", open: " ", close: "17:00" },
+        { open: "09:00", close: "12:00" },
+        { day: "constructor", open: "08:00", close: "09:00" },
+      ]);
+      assertEq(mixed, "\n## Åpningstider\nMan 10:00–17:00, Lør etter avtale, 09:00–12:00, constructor 08:00–09:00",
+        "AI-1 formatOpeningHoursForMcp: entries without text open/close are skipped, a text entry is shown, a missing day has no label");
+      assertTrue(!mixed.includes("undefined") && !mixed.includes("function"),
+        "AI-1 formatOpeningHoursForMcp: no 'undefined' and no inherited object property in the text");
+    }
 
     {
       const thrower = guardToolHandler("probe", async () => { throw new TypeError("k.openingHours.map is not a function"); });
@@ -319,13 +370,14 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
     // AI-3 — generic category labels are a category match
     // ══════════════════════════════════════════════════════════════
     assertEq(
-      ["Produkter: Honning", "Produkter: Egg", "Produkter: Bakervarer, Honning", "Produkter: HONNING", "Kategorier: honey"].map(isDocumentedProductReason),
+      [["Honning"], ["Egg"], ["Bakervarer", "Honning"], ["HONNING", " honning "], []].map(documentsListedProduct),
       [false, false, false, false, false],
-      "AI-3 isDocumentedProductReason: only generic category labels (any case), or no product reason, is no product evidence");
+      "AI-3 documentsListedProduct: only generic category labels (any case), or no matched name, is no product evidence");
     assertEq(
-      ["Produkter: Løvetannhonning", "Produkter: Honning, Lynghonning", "Produkter: Honning, flytende 500 g", "Produkter: Frittgående egg"].map(isDocumentedProductReason),
-      [true, true, true, true],
-      "AI-3 isDocumentedProductReason: one real product name is enough");
+      [["Løvetannhonning"], ["Honning", "Lynghonning"], ["Honning, flytende 500 g"], ["Frittgående egg"], ["Honning", "honning", "HONNING", "Lynghonning"]]
+        .map(documentsListedProduct),
+      [true, true, true, true, true],
+      "AI-3 documentsListedProduct: one real product name is enough, also as the fourth name");
 
     {
       const query = "honning nær Trondheim";
@@ -362,11 +414,212 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
       // Order unchanged: the headings follow discover() exactly.
       const parsed = marketplaceRegistry.parseNaturalQuery(query);
       await enrichParsedWithGeo(parsed, query);
-      const expected = marketplaceRegistry.discover({ ...parsed, limit: 10, offset: 0 }).map((x) => x.agent.name);
+      const meta: import("../services/marketplace-registry").DiscoverMeta = {};
+      const expected = marketplaceRegistry.discover({ ...parsed, limit: 10, offset: 0 }, meta).map((x) => x.agent.name);
       assertEq(headings.map((h) => h.heading.split(" — ")[0]), expected, "AI-3: the order of the results is discover()'s order");
+      assertEq([BAKERY, BEEKEEPER, MEAT_FARM, PRODUCTS_TEXT].map((id) => meta.productMatches?.get(id) ?? null),
+        [["Honning"], ["Løvetannhonning", "Lynghonning"], null, null],
+        "AI-3: DiscoverMeta.productMatches holds the matched names of each producer with a product match");
       assertEq(headings.map((h) => h.n), [1, 2, 3, 4], "AI-3: the results stay numbered 1..n");
       assertTrue(headingOf("Hevd Bakeri Fixture") !== "" && expected.indexOf("Hevd Bakeri Fixture") < expected.indexOf("Tirslaug Bigård Fixture"),
         "AI-3: the nearer bakery still comes before the beekeeper (labelling only, no re-ranking)");
+    }
+
+    // Fix round 1 (S2): the «Produkter: …» reason names at most three
+    // matched products. A producer whose first three matches are the label
+    // and whose fourth is «Lynghonning» lists a real product.
+    {
+      const query = "honning nær Bodø";
+      const parsed = marketplaceRegistry.parseNaturalQuery(query);
+      await enrichParsedWithGeo(parsed, query);
+      const meta: import("../services/marketplace-registry").DiscoverMeta = {};
+      const found = marketplaceRegistry.discover({ ...parsed, limit: 10, offset: 0 }, meta).find((x) => x.agent.id === MANY_LABELS);
+      assertTrue(!!found && found.matchReasons.includes("Produkter: Honning, honning, HONNING"),
+        `AI-3 S2 setup: discover()'s reason names only the three labels (got: ${JSON.stringify(found?.matchReasons)})`);
+      assertEq(meta.productMatches?.get(MANY_LABELS), ["Honning", "honning", "HONNING", "Lynghonning"],
+        "AI-3 S2: DiscoverMeta.productMatches carries every matched name");
+
+      const t = textOf(await search.handler({ query, limit: 10 }));
+      assertTrue(/^\*\*1\. Saltstraumen Bigård Fixture\*\*$/m.test(t) && !/Saltstraumen Bigård Fixture —/.test(t),
+        `AI-3 S2: the producer whose fourth match is a real product is an explicit match (got: ${t.slice(0, 300)})`);
+      assertTrue(t.includes("Beskrivelse av Saltstraumen Bigård Fixture") && !t.includes("Kategoritreff"),
+        "AI-3 S2: …with its description and no category note");
+    }
+    {
+      // A product search with no product term keeps no product signal.
+      const meta: import("../services/marketplace-registry").DiscoverMeta = {};
+      marketplaceRegistry.discover({ ...marketplaceRegistry.parseNaturalQuery("egg nær Tromsø"), limit: 10, offset: 0 }, meta);
+      assertTrue(meta.productMatches === undefined, "AI-3 S2: DiscoverMeta.productMatches is only set when the query has product terms");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // AI-1 audit, fix round 1 — lokal_search detailed view (S3), lokal_stats (S4)
+    // ══════════════════════════════════════════════════════════════
+    {
+      // products stored as text: the detailed view used to push the empty
+      // section formatProductsForMcp returns for it.
+      const t = textOf(await search.handler({ query: "Strinda Honning Fixture", limit: 10 }));
+      assertTrue(t.includes("**1. Strinda Honning Fixture**") && t.includes("\n\n🔗 [Se fullstendig profil]"),
+        `AI-3/AI-1 S3 setup: a name search gives the detailed view (got: ${t.slice(0, 300)})`);
+      assertTrue(!/\n\n\n/.test(t), "AI-1 S3: products stored as text add no empty section to lokal_search's detailed view");
+    }
+    {
+      const stats = tools.get("lokal_stats")!;
+      const categoriesOf = async () => {
+        marketplaceRegistry._agentsCache = null;
+        const r = await stats.handler({});
+        return { r, n: Number((textOf(r).match(/Kategorier: (\d+)/) || [])[1]) };
+      };
+      const base = await categoriesOf();
+      assertTrue(base.r?.isError !== true && base.n > 0, `AI-1 S4 setup: lokal_stats counts categories (got: ${textOf(base.r)})`);
+      // Bergen's fish producer is the only one with «fish».
+      db.prepare("UPDATE agents SET categories = ? WHERE id = ?").run(JSON.stringify("fish"), MALFORMED);
+      const asText = await categoriesOf();
+      assertEq(asText.n, base.n, "AI-1 S4: categories stored as text count as one category, not one per letter");
+      db.prepare("UPDATE agents SET categories = ? WHERE id = ?").run(JSON.stringify({ fish: true }), MALFORMED);
+      const asObject = await categoriesOf();
+      assertTrue(asObject.r?.isError !== true && asObject.n === base.n - 1,
+        `AI-1 S4: categories stored as an object are left out instead of failing lokal_stats (got: ${textOf(asObject.r)})`);
+      db.prepare("UPDATE agents SET categories = ? WHERE id = ?").run(JSON.stringify(["fish"]), MALFORMED);
+      marketplaceRegistry._agentsCache = null;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // AI-1, fix round 1 (B1) — a cart-service 5xx result is internal text
+    // ══════════════════════════════════════════════════════════════
+    {
+      const before = errorLog.length;
+      const failed503 = cartResultText("probe", { success: false, status: 503, error: "Submit failed: SQLITE_BUSY" });
+      assertEq(JSON.parse(failed503), { success: false, status: 503, error: MCP_INTERNAL_ERROR_TEXT },
+        "AI-1 B1 cartResultText: a 5xx result keeps its shape and status, its error is the generic text");
+      assertTrue(errorLog.slice(before).some((l) => l.includes("[mcp] probe failed: status 503:") && l.includes("SQLITE_BUSY")),
+        "AI-1 B1 cartResultText: the 5xx detail is logged under the tool name");
+      const kept = [
+        { success: false, status: 409, error: "Cart is already submitted" },
+        { success: false, status: 400, error: "Cart is empty" },
+        { success: true, order_id: "o-1", status: "pending" },
+      ];
+      assertEq(kept.map((r) => cartResultText("probe", r)), kept.map((r) => JSON.stringify(r, null, 2)),
+        "AI-1 B1 cartResultText: 4xx results and a success with a text status are returned as they are");
+    }
+
+    const cartSvc = require("../services/cart-service") as typeof import("../services/cart-service");
+    const notifySvc = require("../services/order-notify-service") as typeof import("../services/order-notify-service");
+    const paymentSvc = require("../services/payment-service") as typeof import("../services/payment-service");
+    const PAYMENT_ENV = ["PAYMENTS_ENABLED", "PAYMENTS_ALLOWED_AGENT_IDS", "STRIPE_SECRET_KEY", "PAYMENTS_LIVE"];
+    const prevPaymentEnv = Object.fromEntries(PAYMENT_ENV.map((k) => [k, process.env[k]]));
+    const notified: string[] = [];
+    cartSvc.__setCartTestDb(db as any);
+    notifySvc.__setOrderNotifySendForTesting(async (o) => { notified.push(o.to); return { success: true, messageId: "stub" }; });
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
+    const failSubmits = (on: boolean) => db.exec(on
+      ? `CREATE TRIGGER ia_submit_fails BEFORE UPDATE OF status ON carts WHEN NEW.status = 'submitted'
+         BEGIN SELECT RAISE(ABORT, '${SUBMIT_DB_ERROR}'); END`
+      : "DROP TRIGGER IF EXISTS ia_submit_fails");
+    const buyer = { buyer_name: "Kari Kjøper", buyer_email: "kari.kjoper@example.no", buyer_phone: "98765432", contact_consent: true };
+    const leaksDbError = (t: string) => /SQLITE|4711|Submit failed|disk I\/O/.test(t);
+
+    /** The real handler chain lokal_cart_create → lokal_cart_add_item → lokal_cart_submit (submit failing in its transaction). */
+    async function failedSubmitThroughHandlers(cartTools: Map<string, CapturedTool>, label: string): Promise<{ cart_id: string; buyer_ref: string }> {
+      const cart = JSON.parse(textOf(await cartTools.get("lokal_cart_create")!.handler({})));
+      const added = JSON.parse(textOf(await cartTools.get("lokal_cart_add_item")!.handler({ ...cart, product_id: CART_PRODUCT, qty: 2 })));
+      assertTrue(cart.success === true && added.success === true, `AI-1 B1 ${label} setup: cart created and item added (got: ${JSON.stringify(added).slice(0, 200)})`);
+
+      failSubmits(true);
+      const before = errorLog.length;
+      const r = await cartTools.get("lokal_cart_submit")!.handler({ ...cart, ...buyer });
+      failSubmits(false);
+      const t = textOf(r);
+      assertEq(JSON.parse(t), { success: false, status: 500, error: MCP_INTERNAL_ERROR_TEXT },
+        `AI-1 B1 ${label}: a failed submit transaction gives the generic message in the same JSON shape`);
+      assertTrue(!leaksDbError(t) && r?.isError !== true,
+        `AI-1 B1 ${label}: no DB error text in the tool result, and the result is not turned into an isError result`);
+      const logged = errorLog.slice(before).join("\n");
+      assertTrue(logged.includes("[mcp] lokal_cart_submit failed: status 500:") && logged.includes(`Submit failed: ${SUBMIT_DB_ERROR}`),
+        `AI-1 B1 ${label}: the DB error is logged under the tool name`);
+      assertTrue(![buyer.buyer_name, buyer.buyer_email, buyer.buyer_phone, cart.buyer_ref, cart.cart_id].some((v) => logged.includes(v)),
+        `AI-1 B1 ${label}: the log line carries no arguments and no buyer data`);
+      assertEq((db.prepare("SELECT status FROM carts WHERE id = ?").get(cart.cart_id) as any)?.status, "open",
+        `AI-1 B1 ${label}: the failed transaction left the cart open`);
+      return cart;
+    }
+
+    try {
+      // ── PAYMENTS_ENABLED off: lokal_cart_submit → submitCart ──
+      for (const k of PAYMENT_ENV) delete process.env[k];
+      {
+        const cart = await failedSubmitThroughHandlers(tools, "PAYMENTS_ENABLED=0");
+        const submit = tools.get("lokal_cart_submit")!;
+
+        const ok = JSON.parse(textOf(await submit.handler({ ...cart, ...buyer })));
+        await settle();
+        assertTrue(ok.success === true && ok.orders?.length === 1 && ok.orders[0].agent_id === CART_FARM && !("payments" in ok),
+          `AI-1 B1 PAYMENTS_ENABLED=0: the same cart submits once the DB works, result unchanged (got: ${JSON.stringify(ok).slice(0, 200)})`);
+        assertEq(notified, [`${CART_FARM}@example.no`], "AI-1 B1 PAYMENTS_ENABLED=0: the producer is notified of the order as before");
+
+        assertEq(JSON.parse(textOf(await submit.handler({ ...cart, ...buyer }))),
+          { success: false, status: 409, error: "Cart is already submitted" },
+          "AI-1 B1 PAYMENTS_ENABLED=0: a 4xx message is returned as it is");
+        const empty = JSON.parse(textOf(await tools.get("lokal_cart_create")!.handler({})));
+        assertEq(JSON.parse(textOf(await submit.handler({ cart_id: empty.cart_id, buyer_ref: empty.buyer_ref }))),
+          { success: false, status: 400, error: "Cart is empty" },
+          "AI-1 B1 PAYMENTS_ENABLED=0: «Cart is empty» is returned as it is");
+        assertEq(JSON.parse(textOf(await submit.handler({ cart_id: cart.cart_id, buyer_ref: "wrong-token" }))),
+          { success: false, error: "Invalid buyer token" },
+          "AI-1 B1 PAYMENTS_ENABLED=0: a token error is returned as it is");
+
+        const status = tools.get("lokal_order_status")!;
+        const order = JSON.parse(textOf(await status.handler({ order_id: ok.orders[0].order_id, buyer_ref: cart.buyer_ref })));
+        assertTrue(order.success === true && order.status === "pending" && order.order_id === ok.orders[0].order_id,
+          `AI-1 B1: lokal_order_status returns the order as before (a text status is not an error status) (got: ${JSON.stringify(order).slice(0, 200)})`);
+        assertEq(JSON.parse(textOf(await status.handler({ order_id: ok.orders[0].order_id, buyer_ref: "wrong-token" }))),
+          { success: false, status: 403, error: "Invalid buyer token" },
+          "AI-1 B1: lokal_order_status keeps its 4xx message");
+      }
+
+      // ── PAYMENTS_ENABLED on: lokal_cart_submit → submitCartWithPayments (prepay path) ──
+      process.env.PAYMENTS_ENABLED = "1";
+      process.env.PAYMENTS_ALLOWED_AGENT_IDS = CART_FARM;
+      db.prepare(`INSERT INTO payment_accounts (id, agent_id, livemode, stripe_account_id, charges_enabled, details_submitted)
+        VALUES ('pa-ia-1', ?, 0, 'acct_ia_test', 1, 1)`).run(CART_FARM);
+      paymentSvc.recordProducerTermsAcceptance(db, CART_FARM, "trader");
+      const checkoutAccounts: string[] = [];
+      paymentSvc.__setPaymentsStripeClientForTesting({
+        checkout: {
+          sessions: {
+            async create(params: any, opts: any) {
+              checkoutAccounts.push(opts.stripeAccount);
+              return { id: "cs_test_ia", url: "https://checkout.stripe.test/cs_test_ia", expires_at: params.expires_at, status: "open", payment_intent: null, metadata: params.metadata };
+            },
+          },
+        },
+      } as unknown as PaymentsStripeClient);
+      {
+        const toolsOn = new Map<string, CapturedTool>();
+        registerTools({ ...fakeServer, registerTool(name: string, config: any, handler: any) { toolsOn.set(name, { config, handler }); } },
+          () => "test-client", () => undefined);
+        assertTrue("pay_at_pickup" in (toolsOn.get("lokal_cart_submit")!.config.inputSchema ?? {}),
+          "AI-1 B1 PAYMENTS_ENABLED=1 setup: the tools are registered in their prepayment variant");
+
+        const cart = await failedSubmitThroughHandlers(toolsOn, "PAYMENTS_ENABLED=1");
+        assertEq(checkoutAccounts, [], "AI-1 B1 PAYMENTS_ENABLED=1: no payment link was created for the failed submit");
+
+        const ok = JSON.parse(textOf(await toolsOn.get("lokal_cart_submit")!.handler({ ...cart, ...buyer })));
+        assertTrue(ok.success === true && ok.orders?.[0]?.payment_mode === "prepay" && ok.payments?.[0]?.checkout_url === "https://checkout.stripe.test/cs_test_ia",
+          `AI-1 B1 PAYMENTS_ENABLED=1: the same cart submits through the prepayment path once the DB works, result unchanged (got: ${JSON.stringify(ok).slice(0, 300)})`);
+        assertEq(JSON.parse(textOf(await toolsOn.get("lokal_cart_submit")!.handler({ ...cart, ...buyer }))),
+          { success: false, status: 409, error: "Cart is already submitted" },
+          "AI-1 B1 PAYMENTS_ENABLED=1: a 4xx message is returned as it is");
+      }
+    } finally {
+      failSubmits(false);
+      for (const k of PAYMENT_ENV) {
+        if (prevPaymentEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = prevPaymentEnv[k];
+      }
+      paymentSvc.__setPaymentsStripeClientForTesting(null);
+      notifySvc.__setOrderNotifySendForTesting(null);
+      cartSvc.__setCartTestDb(null);
     }
   } finally {
     console.log = prevLog;

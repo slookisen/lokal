@@ -84,6 +84,14 @@ export interface DiscoverMeta {
    * wiped 70-100% of otherwise-correct results with no signal that it happened.
    */
   tagsRelaxed?: boolean;
+  /**
+   * Set when the query had product terms (step 6b): agent id → every product
+   * name that matched a term, in product-list order. The «Produkter: …»
+   * match reason names at most three; lokal_search reads the whole list to
+   * tell a listed product from a generic category label such as «Honning»
+   * (A2A dev-request 2026-10-17-integrasjonstest-oppfolging, AI-3).
+   */
+  productMatches?: ReadonlyMap<string, readonly string[]>;
 }
 
 /**
@@ -516,6 +524,7 @@ class MarketplaceRegistry {
           return false;
         });
       }
+      if (meta) meta.productMatches = productMatchMap;
     }
 
     // 7. Score and rank

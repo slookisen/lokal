@@ -245,20 +245,32 @@ export function textEntries(value: unknown): string[] {
     .filter(Boolean);
 }
 
+const OPENING_DAY_NAMES_NO: ReadonlyMap<string, string> = new Map([
+  ["mon", "Man"], ["tue", "Tir"], ["wed", "Ons"], ["thu", "Tor"], ["fri", "Fre"], ["sat", "Lør"], ["sun", "Søn"],
+]);
+
+/** One entry of an openingHours array as text: "" when it says nothing usable. */
+function openingHourEntryText(h: unknown): string {
+  if (typeof h === "string") return h.trim();
+  if (!h || typeof h !== "object") return "";
+  const { day, open, close } = h as Record<string, unknown>;
+  if (typeof open !== "string" || !open.trim() || typeof close !== "string" || !close.trim()) return "";
+  const dayLabel = typeof day === "string" ? OPENING_DAY_NAMES_NO.get(day) || day : "";
+  return `${dayLabel} ${open}–${close}`.trim();
+}
+
 /**
- * The «Åpningstider» section of lokal_info. An array is today's format
- * ({day, open, close} entries; others are skipped). A string is free text
- * such as "Man–fre 10–17" and is shown as it is, like the producer page
- * (seo.ts) and the agent card (marketplace.ts) do. Any other value is left out.
+ * The «Åpningstider» section of lokal_info. An array is today's format:
+ * {day, open, close} entries with text open/close render as before, a text
+ * entry is shown as it is, and anything else is skipped (it used to render
+ * as "undefined"). A string is free text such as "Man–fre 10–17" and is
+ * shown as it is, like the producer page (seo.ts) and the agent card
+ * (marketplace.ts) do. Any other value is left out.
  */
 export function formatOpeningHoursForMcp(openingHours: unknown): string {
   let text = "";
   if (Array.isArray(openingHours)) {
-    const dayNames: Record<string, string> = { mon: "Man", tue: "Tir", wed: "Ons", thu: "Tor", fri: "Fre", sat: "Lør", sun: "Søn" };
-    text = openingHours
-      .filter((h): h is Record<string, unknown> => !!h && typeof h === "object")
-      .map((h) => `${dayNames[String(h.day)] || h.day} ${h.open}–${h.close}`)
-      .join(", ");
+    text = openingHours.map(openingHourEntryText).filter(Boolean).join(", ");
   } else if (typeof openingHours === "string") {
     text = openingHours.trim();
   }
@@ -291,6 +303,24 @@ export function guardToolHandler<H extends (...args: any[]) => unknown>(tool: st
   return guarded as unknown as H;
 }
 
+/**
+ * The text of a tool result that returns a cart-service result as JSON.
+ * A 5xx result carries internal error text: submitCart answers a failed
+ * transaction with `Submit failed: ${err.message}`, which is the database's
+ * own message. Such a result keeps its JSON shape and status, its error
+ * becomes MCP_INTERNAL_ERROR_TEXT, and the detail is logged without the
+ * arguments (they carry buyer data). A 4xx error is a fixed text meant for
+ * the buyer ("Cart is empty", "1 item(s) are no longer available") and is
+ * returned as it is.
+ */
+export function cartResultText(tool: string, result: { success: boolean; status?: unknown; error?: unknown }): string {
+  if (result.success === false && typeof result.status === "number" && result.status >= 500) {
+    console.error(`[mcp] ${tool} failed: status ${result.status}:`, String(result.error));
+    return JSON.stringify({ ...result, error: MCP_INTERNAL_ERROR_TEXT }, null, 2);
+  }
+  return JSON.stringify(result, null, 2);
+}
+
 // ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
 
 /**
@@ -305,15 +335,14 @@ function productsAreGenericCategoryNames(productsJson: string): boolean {
 }
 
 /**
- * True when a search match reason documents a real product. The registry's
- * «Produkter: a, b, c» reason (calculateRelevance) also matches the generic
- * category labels the enrichment writes as product names («Honning», «Egg»,
- * «Bakervarer»); a reason that names only such labels is a category match.
+ * True when the product names a producer matched a search with
+ * (DiscoverMeta.productMatches) include a real product. The registry's
+ * product match also hits the generic category labels the enrichment writes
+ * as product names («Honning», «Egg», «Bakervarer»); a producer that matched
+ * only such labels is a category match.
  */
-export function isDocumentedProductReason(reason: string): boolean {
-  if (!reason.startsWith("Produkter:")) return false;
-  const names = reason.slice("Produkter:".length).split(", ").map((n) => n.trim()).filter(Boolean);
-  return names.length > 0 && !productsAreGenericCategoryNames(JSON.stringify(names));
+export function documentsListedProduct(matchedNames: readonly string[]): boolean {
+  return matchedNames.length > 0 && !productsAreGenericCategoryNames(JSON.stringify(matchedNames));
 }
 
 // ─── Tool definitions (shared logic) ────────────────────────
@@ -390,7 +419,9 @@ export function registerTools(
   };
 
   // Every tool handler below runs inside guardToolHandler (integration test
-  // 2026-10-17, AI-1): an internal error is logged and never returned.
+  // 2026-10-17, AI-1): an internal error is logged and never returned. The
+  // tools that return a cart-service result as JSON go through cartResultText,
+  // which does the same for a 5xx result.
 
   // Tool 1: Natural language search
   server.registerTool(
@@ -522,7 +553,8 @@ export function registerTools(
           // Full product list — orch-pr-14: pass catalog id map so each
           // priced/in-stock product line carries its product_id for cart use.
           if (k.products?.length) {
-            sections.push(formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id)));
+            const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+            if (productSection) sections.push(productSection);
           }
 
           // Extra details
@@ -544,11 +576,14 @@ export function registerTools(
           // for "lamb") says so, instead of reading like a documented match.
           const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
           const reasons = (r.matchReasons as string[] | undefined) ?? [];
-          // Integration test 2026-10-17 (AI-3): a product reason that names
-          // only generic category labels («Honning», «Egg») is not a listed
-          // product. The order of the results stays as discover() gave it.
-          const documented = reasons.some(isDocumentedProductReason);
-          const categoryLabelOnly = !documented && reasons.some((m) => m.startsWith("Produkter:"));
+          // Integration test 2026-10-17 (AI-3): a producer whose matched
+          // product names are only generic category labels («Honning», «Egg»)
+          // has no listed product. discover() hands over every matched name;
+          // its «Produkter: …» reason names at most three. The order of the
+          // results stays as discover() gave it.
+          const matchedNames = discoverMeta.productMatches?.get(agent.id) ?? [];
+          const documented = documentsListedProduct(matchedNames);
+          const categoryLabelOnly = matchedNames.length > 0 && !documented;
           // Name matches bypass product scoring; absent product evidence in
           // that branch must not turn a named lookup into a category match.
           const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
@@ -783,7 +818,7 @@ export function registerTools(
       for (const a of agents as any[]) {
         const city = a.city || a.location?.city;
         if (city) cities.add(city);
-        for (const c of a.categories || []) categories.add(c);
+        for (const c of textEntries(a.categories)) categories.add(c);
       }
       const text = [
         "📊 **Rett fra Bonden — Plattformstatistikk**",
@@ -1373,7 +1408,7 @@ export function registerTools(
             baseUrl: process.env.BASE_URL || "https://rettfrabonden.com",
           })
         : svcSubmitCart(cart_id, contact);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: "text" as const, text: cartResultText("lokal_cart_submit", result) }] };
     })
   );
 
@@ -1399,7 +1434,7 @@ export function registerTools(
     },
     guardToolHandler("lokal_order_status", async ({ order_id, buyer_ref }) => {
       const result = svcGetOrder(order_id, buyer_ref);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: "text" as const, text: cartResultText("lokal_order_status", result) }] };
     })
   );
 
