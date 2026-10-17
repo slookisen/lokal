@@ -48249,6 +48249,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1c: the closed
+// client-IP shadow windows are stored (client_ip_shadow_windows, written by
+// the store's timer, never by the request path), so clientIp.cumulative
+// survives deploys and clientIp.ac2 is the server's own AC2 verdict
+// (thresholds, ready only at ≥48 h). Own in-memory / temp-file DBs, injected
+// clocks; the DB-accessor failure hook and installed slot reset — tail.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1c: AC2 counters survive deploys ──");
+  try {
+    const { runClientIpShadowStoreTests } = require("../src/services/client-ip-shadow-store.test") as
+      typeof import("../src/services/client-ip-shadow-store.test");
+    const cis = await runClientIpShadowStoreTests({ log: false });
+    passed += cis.passed;
+    failed += cis.failed;
+    for (const f of cis.failures) failures.push("client-ip-shadow-store: " + f);
+    console.log(`  client-ip-shadow-store: ${cis.passed} passed, ${cis.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("client-ip-shadow-store: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-E (SD-01, SD-02): RFB
 // producer and place pages show their FAQPage as a visible <section id="faq">
 // built from the same object (shared services/faq-section.ts), and a fylke

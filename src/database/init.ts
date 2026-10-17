@@ -5340,6 +5340,45 @@ function initSchema(db: Database.Database): void {
     console.error("Migration event_loop_events failed:", err);
   }
 
+  // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1c: the
+  // client-IP shadow counters per closed 5-min window, one row per machine
+  // per window, so the AC2 gate (≥48 h) survives deploys
+  // (services/client-ip-shadow-store.ts). Counters only: no IP, no key.
+  // window_start is ISO-8601 UTC; 14-day retention, pruned by the writer.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS client_ip_shadow_windows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_start TEXT NOT NULL,
+        machine TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        n INTEGER NOT NULL,
+        fci_valid INTEGER NOT NULL,
+        fallback_missing INTEGER NOT NULL,
+        fallback_invalid INTEGER NOT NULL,
+        fallback_non_public INTEGER NOT NULL,
+        fallback_hc INTEGER NOT NULL,
+        errors INTEGER NOT NULL,
+        xff_client_supplied INTEGER NOT NULL,
+        agree_fci_edge_n INTEGER NOT NULL,
+        agree_fci_edge_agree INTEGER NOT NULL,
+        agree_legacy_eq_fci_n INTEGER NOT NULL,
+        agree_legacy_eq_fci_agree INTEGER NOT NULL,
+        would_trip INTEGER NOT NULL,
+        top_overflow INTEGER NOT NULL,
+        fanin_ratio REAL,
+        fanin_class TEXT,
+        fanin_fan_in INTEGER,
+        fanin_ua TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (machine, window_start)
+      );
+      CREATE INDEX IF NOT EXISTS idx_client_ip_shadow_windows_start ON client_ip_shadow_windows(window_start);
+    `);
+  } catch (err) {
+    console.error("Migration client_ip_shadow_windows failed:", err);
+  }
+
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
   // columns (services/agents-city-backfill.ts). `agents.city` itself already
   // exists (base CREATE TABLE above) — these three columns are the SAME
