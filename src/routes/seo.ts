@@ -964,7 +964,8 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 
   // Rating: "★ 4.7 · 159 anmeldelser på Google". The stored rating is Google's,
   // so the source is always named (dev-request 2026-10-16-rfb-strukturerte-data-
-  // tredjepartsrating-og-places-treffvakt, S2).
+  // tredjepartsrating-og-places-treffvakt, S2). Nothing in RATING_DISPLAY_MODE
+  // 'hidden', the mode since S4-A1a.
   const ratingDisplay = formatRatingDisplay({ rating: knowledge?.googleRating, count: knowledge?.googleReviewCount, source: "google" }, lang);
   const rating = ratingDisplay ? `<span class="pc-rating">${escapeHtml(ratingDisplay.text)}</span>` : "";
 
@@ -1401,10 +1402,11 @@ router.get("/", (req: Request, res: Response) => {
       }).join("");
 
     // Published translations for the whole featured list in one query
-    // (description on the row, about on the knowledge object).
+    // (description on the row, about on the knowledge object). The rich cards
+    // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
     featured.forEach((a: any, i: number) => {
-      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id)?.knowledge || {});
+      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {});
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
@@ -5210,7 +5212,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] claim status query failed:", e);
     }
 
-    const info = knowledgeService.getAgentInfo(agent.id);
+    // withGoogleRating: the profile stat reads it, RATING_DISPLAY_MODE decides (S4-A1a).
+    const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true });
     const k = (info?.knowledge || {}) as any;
     const meta = (info?.meta || {}) as any;
 
@@ -5979,7 +5982,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // (Google Places), and Google's review-snippet guidelines only accept
     // ratings a site collects itself, so neither becomes rating/review
     // markup (the policy module returns null for any non-first-party
-    // source). The rating is shown as text naming Google (S2); reviewsHtml
+    // source). The rating could be shown as text naming Google (S2), but not
+    // in RATING_DISPLAY_MODE 'hidden', the mode since S4-A1a; reviewsHtml
     // below is unchanged.
     const ratingJsonLd = buildRatingJsonLd({ source: "google", rating: k.googleRating, count: k.googleReviewCount });
     if (ratingJsonLd) jsonLd.aggregateRating = ratingJsonLd;

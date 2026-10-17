@@ -1,6 +1,7 @@
 /**
  * rfb-rating-visning-kildeangivelse.test.ts — dev-request
- * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S2.
+ * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S2
+ * and S4-A1a.
  *
  * The stored rating is Google's. Every place rettfrabonden.com shows it — the
  * producer profile stat, the ultra-rich homepage card (positions 1-3) and the
@@ -13,11 +14,14 @@
  * Matrix: 3 places × no/en × count known/unknown × both modes, plus a
  * producer without a rating (nothing shown).
  *
+ * Since S4-A1a (Daniel's decision 2=A) 'hidden' is the default, so that part
+ * runs without an override and checks what production renders; 'attributed'
+ * (S2) is set with __setRatingDisplayModeForTesting (restored in finally).
+ *
  * Same harness as rfb-verifisert-av-eier-badge-rename.test.ts: own
  * `Database(":memory:")`, claimed + verified high-trust producers so the
  * homepage renders the rich cards, the real seo.ts handlers off the route
- * stack. The mode is flipped with __setRatingDisplayModeForTesting (restored
- * in finally).
+ * stack.
  *
  * Exported runRfbRatingVisningKildeangivelseTests({log}) -> TestSummary;
  * wired into tests/test.ts.
@@ -126,8 +130,9 @@ export async function runRfbRatingVisningKildeangivelseTests(opts: { log?: boole
     const RATING_STAT = /<div class="pf-stat"><div class="pf-stat-icon r">/;
 
     // ══════════════════════════════════════════════════════════════
-    // Mode 'attributed' (default)
+    // Mode 'attributed' (S2; set by the test since S4-A1a)
     // ══════════════════════════════════════════════════════════════
+    policy.__setRatingDisplayModeForTesting("attributed");
     const expected = {
       no: { ultraCount: "★ 4.6 · 236 anmeldelser på Google", ultraNo: "★ 4.6 på Google", medCount: "★ 4.2 · 18 anmeldelser på Google", medNo: "★ 4.2 på Google",
         statCount: "<strong>4.6 / 5</strong><small>236 anmeldelser på Google</small>", statNo: "<strong>4.6 / 5</strong><small>på Google</small>" },
@@ -163,9 +168,10 @@ export async function runRfbRatingVisningKildeangivelseTests(opts: { log?: boole
     }
 
     // ══════════════════════════════════════════════════════════════
-    // Mode 'hidden' (Daniel's choice B as a one-line change)
+    // Mode 'hidden': the default since S4-A1a, so no override
     // ══════════════════════════════════════════════════════════════
-    policy.__setRatingDisplayModeForTesting("hidden");
+    policy.__setRatingDisplayModeForTesting(null);
+    assertTrue(policy.RATING_DISPLAY_MODE === "hidden", "hidden: RATING_DISPLAY_MODE is 'hidden' without an override (S4-A1a)");
     for (const lang of ["no", "en"] as const) {
       const noRatingText = (html: string): boolean =>
         !html.includes('class="pc-rating"') && !RATING_STAT.test(html) && !/★ \d\.\d/.test(html)

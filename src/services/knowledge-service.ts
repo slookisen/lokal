@@ -266,10 +266,11 @@ export interface AgentInfoResponse {
     seasonality: SeasonalProduct[];
     deliveryRadius?: number;
     minOrderValue?: number;
+    /** Never a Google rating (S4-A1a, see getAgentInfo). */
     ratings?: {
-      google?: { score: number; reviews: number };
       tripadvisor?: { score: number };
     };
+    /** Only with getAgentInfo(id, { withGoogleRating: true }): the site's own pages. */
     googleRating?: number;
     googleReviewCount?: number;
   };
@@ -510,7 +511,16 @@ class KnowledgeService {
 
   // ─── Get structured info response for buyer agents ────────
   // This is the main endpoint buyers use: "tell me about this seller"
-  getAgentInfo(agentId: string): AgentInfoResponse | null {
+  //
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (S4-A1a): A2A agent/info, GET /agents/:id/info, the MCP resource
+  // lokal://producers/{id} and the knowledge PUT hand this object on as it
+  // is, so it carries no Google rating. Google's Places terms call passing a
+  // stored rating on "reshare" (protocols/juridisk-sjekk-google-ratinger-
+  // 2026-10-17.md §4.2). Only the site's own pages ask for it with
+  // withGoogleRating, and RATING_DISPLAY_MODE (structured-data-policy.ts)
+  // decides whether they show it.
+  getAgentInfo(agentId: string, opts: { withGoogleRating?: boolean } = {}): AgentInfoResponse | null {
     const db = getDb();
     const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as any;
     if (!agent) return null;
@@ -571,8 +581,9 @@ class KnowledgeService {
         deliveryRadius: knowledge?.deliveryRadius,
         minOrderValue: knowledge?.minOrderValue,
         ratings: this.buildRatings(knowledge),
-        googleRating: knowledge?.googleRating,
-        googleReviewCount: knowledge?.googleReviewCount,
+        ...(opts.withGoogleRating
+          ? { googleRating: knowledge?.googleRating, googleReviewCount: knowledge?.googleReviewCount }
+          : {}),
       },
       meta: {
         dataSource,
@@ -1312,12 +1323,11 @@ class KnowledgeService {
     };
   }
 
+  // S4-A1a: no `google` entry (getAgentInfo above), and with it no invented
+  // `reviews: 0` when the count is unknown; the REST card read it from here.
   private buildRatings(knowledge: AgentKnowledge | null): AgentInfoResponse["knowledge"]["ratings"] {
     if (!knowledge) return undefined;
     const ratings: any = {};
-    if (knowledge.googleRating) {
-      ratings.google = { score: knowledge.googleRating, reviews: knowledge.googleReviewCount || 0 };
-    }
     if (knowledge.tripadvisorRating) {
       ratings.tripadvisor = { score: knowledge.tripadvisorRating };
     }

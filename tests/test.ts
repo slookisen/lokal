@@ -48549,6 +48549,29 @@ runSerial(async () => {
   }
 });
 
+// Same dev-request, S4-A1a (Daniel's decision 2=A): no stored Google rating
+// in getAgentInfo, the REST card, /agents/:id/info, A2A agent.json or
+// agent/info (a Tripadvisor rating and the site's own withGoogleRating read
+// stay), and no rating badge or info row on finn-tannlege clinic pages in the
+// default mode. Swaps the getDb() singleton, the store producers, the dental
+// db-factory path and the display mode (all restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S4-A1a: Google ratings not shown or passed on ──");
+  try {
+    const { runGoogleRatingUtfasingTests } = require("../src/routes/google-rating-utfasing-visning-og-deling.test") as
+      typeof import("../src/routes/google-rating-utfasing-visning-og-deling.test");
+    const gu = await runGoogleRatingUtfasingTests({ log: false });
+    passed += gu.passed;
+    failed += gu.failed;
+    for (const f of gu.failures) failures.push("google-rating-utfasing-visning-og-deling: " + f);
+    console.log(`  google-rating-utfasing-visning-og-deling: ${gu.passed} passed, ${gu.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("google-rating-utfasing-visning-og-deling: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (S3): shared Places match guard (services/places-match.ts). The
 // RFB rating routes write rating/address/phone only from a candidate whose
