@@ -12,21 +12,33 @@
  *       languages, and every parameter the copy names is in the tool's
  *       inputSchema from a real tools/list; `query` is documented; the
  *       book_gardssalg card and the booking FAQ say it is a pending visit
- *       request, no confirmed booking, no payment; the visible FAQ equals the
- *       FAQPage JSON-LD; a tool list without book_gardssalg drops the
- *       gårdssalg sentence; a registered tool with no copy is still listed,
- *       with its registered description escaped.
+ *       request, answered by e-mail, no confirmed booking, no payment; the
+ *       discover_gardssalg copy names the producer types the tool does,
+ *       seltzeri included; the intro and the examples mention gårdssalg; the
+ *       visible FAQ equals the FAQPage JSON-LD; a tool list without
+ *       book_gardssalg drops the gårdssalg sentence; a registered tool with no
+ *       copy is still listed, with its registered description escaped.
  *   (b) MCP2-05, OA /personvern and /vilkar with their aliases: one canonical
  *       each (/personvern, /vilkar) and a meta description; /proveniens keeps
  *       its own.
- *   (c) IDX2-05, seoPageTitle(): the repro titles are cut at the subtitle
- *       separator, never after a preposition; titles without a separator drop
- *       trailing closed-class words and an unclosed «(»; a short head falls
- *       through to the word cut; a title that fits is unchanged; the result
- *       is never empty; a live-title corpus never ends on a function word.
+ *   (c) IDX2-05, seoPageTitle(): the repro titles never end after a
+ *       preposition; a subtitle is cut at the separator only when the head
+ *       fills at least 60% of the budget (33 chars, boundary tested), else the
+ *       word cut keeps the start of the tagline; trailing closed-class words
+ *       and an unclosed «(» are dropped, «Å» and the name «Per» are not; a
+ *       title that fits is unchanged; the result is never empty.
  *   (d) IDX2-05, titlePlace(): «Oslo, Oslo» becomes «Oslo»; distinct names
  *       are unchanged; on a rendered /opplevelse page the <title> says the
  *       place once and og:title keeps the full title.
+ *   (f) IDX2-05 round-1 review B1 (lokal#1124): cutting every subtitle down
+ *       to its head gave distinct pages one <title>. The two repro pairs
+ *       (Dalane Folkemuseum, Hardanger Folkemuseum) keep distinct titles; over
+ *       the live-title fixture (tests/fixtures/opplevagent-live-titles-2026-
+ *       10-17.json: the 415 sitemap /opplevelse pages, Norwegian and English)
+ *       opplevelseSeoTitle() makes no two pages share a <title> that did not
+ *       before, keeps every title that fitted byte-identical, never ends on a
+ *       function word, punctuation or an open «(», and keeps at least 60% of
+ *       the budget on every cut.
  *   (e) MCP2-02, RFB /guide-mat-ai: no «full prisliste» / "full price list"
  *       in the page or its FAQPage JSON-LD (NO and EN, payments on and off);
  *       lokal_search and lokal_info say «med pris der produsenten har oppgitt
@@ -39,6 +51,9 @@
  * Run standalone: npx tsx src/routes/seo-sidetekster.test.ts
  * Wired into `npm test` via tests/test.ts.
  */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export interface TestSummary {
   passed: number;
@@ -121,6 +136,9 @@ const OA_TOOLS = ["discover_experiences", "list_experience_categories", "get_exp
 // Independent of the implementation's list: the words a cut title read as
 // broken on in the round-2 sample and the live corpus.
 const DANGLING_WORDS = new Set(["i", "på", "til", "fra", "av", "med", "ved", "for", "om", "nær", "og", "eller", "som", "the", "and", "of", "in", "on", "at", "to", "from", "with", "near"]);
+
+// The <title> corpus for (f): every /opplevelse page in the sitemap, read live.
+const LIVE_TITLES_FIXTURE = path.join(__dirname, "../../tests/fixtures/opplevagent-live-titles-2026-10-17.json");
 
 // Live /opplevelse display titles from 2026-10-17 that took the truncation path.
 const LIVE_LONG_TITLES = [
@@ -222,7 +240,7 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
             [...t.cardHtml.matchAll(/<code>([^<]*)<\/code>/g)].map((m) => m[1]).filter((p) => !(params.get(t.name) || []).includes(p)).map((p) => `${t.name}.${p}`));
           assertEq(unknownParams, [], `ip-a5 (${lang}): every parameter a card names is in that tool's inputSchema (no invented names)`);
           const byName = new Map(tools.map((t) => [t.name, t]));
-          assertTrue(["discover_experiences", "discover_gardssalg"].every((n) => byName.get(n)!.cardHtml.includes("<code>query</code>") && (params.get(n) || []).includes("query")),
+          assertTrue(["discover_experiences", "discover_gardssalg"].every((n) => !!byName.get(n)?.cardHtml.includes("<code>query</code>") && (params.get(n) || []).includes("query")),
             `ip-a6 (${lang}): \`query\` is documented for discover_experiences and discover_gardssalg, and both take it`);
         }
         assertEq(seo.opplevagentMcpGuideTools("sv").map((t) => t.faq), seo.opplevagentMcpGuideTools("no").map((t) => t.faq),
@@ -244,15 +262,15 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
         }
         const bookNo = guideCards(no.body).find((c) => c[0] === "book_gardssalg")?.[1] || "";
         const bookEn = guideCards(en.body).find((c) => c[0] === "book_gardssalg")?.[1] || "";
-        assertTrue(["besøksforespørsel", "står ventende til produsenten svarer", "aldri en bekreftet booking", "tar ikke imot betaling"].every((s) => bookNo.includes(s)),
-          `ip-a11: the NO book_gardssalg card says visit request, pending until the producer replies, never confirmed, no payment (got ${JSON.stringify(bookNo)})`);
-        assertTrue(["visit request", "stays pending until the producer replies", "never creates a confirmed booking", "takes no payment"].every((s) => bookEn.includes(s)),
+        assertTrue(["besøksforespørsel", "står ventende til produsenten svarer på e-post", "aldri en bekreftet booking", "tar ikke imot betaling"].every((s) => bookNo.includes(s)),
+          `ip-a11: the NO book_gardssalg card says visit request, pending until the producer replies by e-mail, never confirmed, no payment (got ${JSON.stringify(bookNo)})`);
+        assertTrue(["visit request", "stays pending until the producer replies by email", "never creates a confirmed booking", "takes no payment"].every((s) => bookEn.includes(s)),
           `ip-a12: the EN book_gardssalg card says the same (got ${JSON.stringify(bookEn)})`);
         const bookingNo = seo.buildOpplevagentMcpGuideFaqJsonLd("no", "u").mainEntity[3].acceptedAnswer.text as string;
         const bookingEn = seo.buildOpplevagentMcpGuideFaqJsonLd("en", "u").mainEntity[3].acceptedAnswer.text as string;
-        assertTrue(bookingNo.startsWith("Assistenten viser en booking_url") && ["book_gardssalg", "besøksforespørsel", "står ventende", "ingen bekreftet booking", "tar ikke imot betaling"].every((s) => bookingNo.includes(s)),
+        assertTrue(bookingNo.startsWith("Assistenten viser en booking_url") && ["book_gardssalg", "besøksforespørsel", "står ventende til produsenten svarer på e-post", "ingen bekreftet booking", "tar ikke imot betaling"].every((s) => bookingNo.includes(s)),
           `ip-a13: the NO booking answer keeps the experiences part and adds the gårdssalg request (got ${JSON.stringify(bookingNo)})`);
-        assertTrue(bookingEn.startsWith("The assistant surfaces a booking_url") && ["book_gardssalg", "visit request", "stays pending", "not a confirmed booking", "takes no payment"].every((s) => bookingEn.includes(s)),
+        assertTrue(bookingEn.startsWith("The assistant surfaces a booking_url") && ["book_gardssalg", "visit request", "stays pending until the producer replies by email", "not a confirmed booking", "takes no payment"].every((s) => bookingEn.includes(s)),
           `ip-a14: the EN booking answer does the same (got ${JSON.stringify(bookingEn)})`);
         assertTrue(!/\b(bekreftet booking hos|booking er bekreftet|confirmed booking with|instant booking)\b/i.test(no.body + en.body),
           "ip-a15: neither page promises a confirmed booking");
@@ -276,6 +294,21 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
         assertEq(futureFaq.mainEntity[1].acceptedAnswer.text, "future_tool: Does a thing.", "ip-a19: … and named in the tools FAQ answer");
         assertTrue(!["opplev_discover", "opplev_info", "opplev_categories"].some((n) => no.body.includes(n) || en.body.includes(n)),
           "ip-a20 (regression): the never-registered opplev_* names stay off the page");
+        // The producer answers by e-mail, as the server instructions say.
+        assertTrue(/stays pending until the producer answers by e-mail/.test((require("./experiences-mcp") as typeof import("./experiences-mcp")).OPPLEVAGENT_MCP_INSTRUCTIONS),
+          "ip-a21: the server instructions say the producer answers by e-mail, which ip-a11–a14 mirror");
+        // The producer types the discover_gardssalg description lists, seltzeri included.
+        const discoverDesc = manifest.registeredMcpTools("experiences").find((t) => t.name === "discover_gardssalg")?.description || "";
+        const gsCopy = (lang: "no" | "en") => seo.opplevagentMcpGuideTools(lang).find((t) => t.name === "discover_gardssalg");
+        assertTrue(discoverDesc.includes("seltzeri") && ["seltzerier", "mjøderier", "gårdskafeer"].every((w) => gsCopy("no")?.cardHtml.includes(w))
+          && ["seltzeri)", "mjøderi"].every((w) => gsCopy("no")?.faq.includes(w))
+          && !!gsCopy("en")?.cardHtml.includes("seltzer makers") && !!gsCopy("en")?.faq.includes("seltzer maker)"),
+          "ip-a22: the discover_gardssalg card and FAQ list seltzeri with the other producer types, as the tool's description does");
+        assertTrue(no.body.includes("Den kan også finne gårdssalg hos norske drikkeprodusenter og sende en besøksforespørsel til produsenten.")
+          && no.body.includes("<li>«Gårdssalg med cider i Hardanger»</li>")
+          && en.body.includes("It can also find farm sales (gårdssalg) at Norwegian drink producers and send a producer a visit request.")
+          && en.body.includes("<li>\"Farm-sale cider in Hardanger\"</li>"),
+          "ip-a23: the intro and the «Prøv å spørre» examples cover gårdssalg too (NO and EN)");
       }
 
       // ── (b) MCP2-05: /personvern, /vilkar and their aliases ────────────────
@@ -300,8 +333,8 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
         }
         const pv = await callHtmlRoute(router, "/personvern");
         const vk = await callHtmlRoute(router, "/vilkar");
-        assertTrue(metaContent(pv.body, "name", "description")!.startsWith("Personvernerklæring for Opplevagent")
-          && metaContent(vk.body, "name", "description")!.startsWith("Vilkår for bruk av Opplevagent"),
+        assertTrue((metaContent(pv.body, "name", "description") || "").startsWith("Personvernerklæring for Opplevagent")
+          && (metaContent(vk.body, "name", "description") || "").startsWith("Vilkår for bruk av Opplevagent"),
           "ip-b5: each page has its own description");
         assertTrue(titleTag(pv.body) === "Personvern / Privacy — Opplevagent" && titleTag(vk.body) === "Vilkår / Terms of Service — Opplevagent",
           "ip-b6: the titles are unchanged");
@@ -312,20 +345,33 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
       // ── (c) IDX2-05: seoPageTitle() ────────────────────────────────────────
       {
         const t = seo.seoPageTitle;
-        assertEq(t("Arctic Circle Raceway — motorsport like sør for Polarsirkelen"), "Arctic Circle Raceway" + BRAND,
-          "ip-c1 (IDX2-05 repro): «… motorsport like sør for» is cut at the em dash, not after «for»");
-        assertEq(t("Norsk Tindemuseum — klatringshistorie i hjertet av Romsdalen"), "Norsk Tindemuseum" + BRAND,
-          "ip-c2 (repro): «… i hjertet av» is cut at the em dash");
-        assertEq(t("Gaustatoppen – sommervandring til Norges mest panoramiske topp"), "Gaustatoppen" + BRAND,
-          "ip-c3: an en-dash subtitle is cut at the separator too (no «… Norges mest»)");
-        assertEq(t("Svartisen: Båttur og isvandring på Norges nest største isbre"), "Svartisen" + BRAND,
-          "ip-c4: a colon subtitle is cut at the colon");
-        assertEq(t("Stavanger - Preikestolen guidet fottur med transport og lunsj inkludert"), "Stavanger" + BRAND,
-          "ip-c5: a spaced hyphen counts as a separator");
+        assertEq(t("Arctic Circle Raceway — motorsport like sør for Polarsirkelen"), "Arctic Circle Raceway — motorsport like sør" + BRAND,
+          "ip-c1 (IDX2-05 repro): «… motorsport like sør for» loses the «for»; the 21-char head is under 60% of the budget, so the tagline start stays");
+        assertEq(t("Norsk Tindemuseum — klatringshistorie i hjertet av Romsdalen"), "Norsk Tindemuseum — klatringshistorie i hjertet" + BRAND,
+          "ip-c2 (repro): «… i hjertet av» loses the «av»");
+        assertEq(t("Boutique feriesenter ved Romsdalsfjellene – Villa Romsdal med fjellutsikt"), "Boutique feriesenter ved Romsdalsfjellene" + BRAND,
+          "ip-c3: an en-dash subtitle whose head fills ≥60% of the budget is cut at the separator (no «– Villa» stub)");
+        assertEq(t("Opplevelsessenteret ved Saltstraumen: tidevannsstrøm, havørn og RIB-tur"), "Opplevelsessenteret ved Saltstraumen" + BRAND,
+          "ip-c4: … a colon subtitle at the colon");
+        assertEq(t("Preikestolen og Lysefjorden fra Stavanger - guidet fottur med transport og lunsj"), "Preikestolen og Lysefjorden fra Stavanger" + BRAND,
+          "ip-c5: … a spaced hyphen counts as a separator");
+        assertEq(t("Atlantic Salmon Fly Fishing on the Namsen — Norway's Best Salmon River"), "Atlantic Salmon Fly Fishing on the Namsen" + BRAND,
+          "ip-c5b: … and an em dash («— Norway's» was the old stub; a live EN title)");
         assertEq(t("Norsk Folkemuseum – friluftsmuseum – stavkirke og historiske bygninger på Bygdøy"), "Norsk Folkemuseum – friluftsmuseum" + BRAND,
-          "ip-c6: the last separator whose head fits is used");
-        assertEq(t("Rorbuer i Å – autentisk fiskeropplevelse ytterst i Lofoten"), "Rorbuer i Å" + BRAND,
+          "ip-c6: the last separator whose head fits and fills ≥60% of the budget is used");
+        assertEq(t("Tradisjonelle rorbuer og sjøhus i Å – autentisk fiskeropplevelse ytterst i Lofoten"), "Tradisjonelle rorbuer og sjøhus i Å" + BRAND,
           "ip-c7: the place «Å» is not taken for the infinitive marker");
+        assertEq(t("Rorbuer i Å – autentisk fiskeropplevelse ytterst i Lofoten"), "Rorbuer i Å – autentisk fiskeropplevelse ytterst" + BRAND,
+          "ip-c7b: a short head («Rorbuer i Å») keeps the tagline start; the trailing «i» is dropped");
+        assertEq(t("Eplesider og eplemost frå Lofthus — sidersmaking og omvisning i frukthagen"), "Eplesider og eplemost frå Lofthus" + BRAND,
+          "ip-c7c (boundary): a 33-char head (= floor(56 × 0.6)) is cut at the separator");
+        assertEq(t("Eplesider og eplemost på Lofthus — sidersmaking og omvisning i frukthagen"), "Eplesider og eplemost på Lofthus — sidersmaking" + BRAND,
+          "ip-c7d (boundary): a 32-char head falls through to the word cut, and its trailing «og» is dropped");
+        assertEq([t("Gaustatoppen – sommervandring til Norges mest panoramiske topp"), t("Svartisen: Båttur og isvandring på Norges nest største isbre")],
+          ["Gaustatoppen – sommervandring til Norges mest" + BRAND, "Svartisen: Båttur og isvandring på Norges nest største" + BRAND],
+          "ip-c7e: short heads with an en dash or a colon keep the tagline start, as before the separator rule");
+        assertEq(t("Middag og overnatting på gården i Ulvik for: par, familier og grupper"), "Middag og overnatting på gården i Ulvik" + BRAND,
+          "ip-c7f: a head cut at the separator is tidied too (its trailing «for» is dropped)");
         assertEq(t("Guidet kajakktur på Hjørundfjorden med overnatting fra Urke"), "Guidet kajakktur på Hjørundfjorden med overnatting" + BRAND,
           "ip-c8: without a separator, a trailing preposition is dropped (nb)");
         assertEq(t("Farm stay with outdoor activities and sea fishing at Setran Gård"), "Farm stay with outdoor activities and sea fishing" + BRAND,
@@ -339,7 +385,7 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
         assertEq(t("Telemarks største alpin- og langrennsdestinasjon med mange flotte løyper"), "Telemarks største alpin- og langrennsdestinasjon" + BRAND,
           "ip-c13: «alpin- og» is not a separator; the trailing «med» is dropped");
         assertEq(t("Ski — familievennlig alpinsenter med heis og løyper for alle aldre"), "Ski — familievennlig alpinsenter med heis og løyper" + BRAND,
-          "ip-c14: a head shorter than 8 characters («Ski») falls through to the word cut");
+          "ip-c14: a very short head («Ski») falls through to the word cut");
         const longHead = "Et svært langt navn på en attraksjon ved fjorden som alene er lengre enn budsjettet — med undertittel";
         const longHeadTitle = t(longHead);
         assertTrue(longHead.startsWith(longHeadTitle.slice(0, -BRAND.length)) && !longHeadTitle.includes("—") && longHeadTitle.length <= 70
@@ -360,6 +406,8 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
             || DANGLING_WORDS.has(last) || /[\s\-–—,.&/:;]$/.test(main) || (open >= 0 && open > main.lastIndexOf(")"))) bad.push(`${title} -> ${out}`);
         }
         assertEq(bad, [], `ip-c19: ${LIVE_LONG_TITLES.length} live titles: ≤70, a clean prefix, no trailing function word, punctuation or open «(»`);
+        assertEq(t("Gårdsbesøk og kaffe på tunet hos bonden Per — med omvisning i fjøset og stabburet"), "Gårdsbesøk og kaffe på tunet hos bonden Per" + BRAND,
+          "ip-c20: the name «Per» is not dropped as a function word (review S5)");
       }
 
       // ── (d) IDX2-05: titlePlace() and the rendered /opplevelse title ───────
@@ -388,9 +436,78 @@ export function runSeoSideteksterTests(opts: { log?: boolean } = {}): Promise<Te
         const bergen = await callHtmlRoute(router, `/opplevelse/${mk("Fjordsafari", "Vestland", "Bergen")}`);
         assertEq(titleTag(bergen.body), "Fjordsafari – Bergen, Vestland" + BRAND, "ip-d6: distinct kommune and fylke render as before");
         const arctic = await callHtmlRoute(router, `/opplevelse/${mk("Arctic Circle Raceway", "Nordland", "Rana", "Arctic Circle Raceway — motorsport like sør for Polarsirkelen")}`);
-        assertTrue(titleTag(arctic.body) === "Arctic Circle Raceway" + BRAND
+        assertTrue(titleTag(arctic.body) === "Arctic Circle Raceway — motorsport like sør" + BRAND
           && metaContent(arctic.body, "property", "og:title") === "Arctic Circle Raceway — motorsport like sør for Polarsirkelen",
-          `ip-d7: a long title_no is cut at the separator in <title>, og:title keeps the full title (got ${JSON.stringify(titleTag(arctic.body))})`);
+          `ip-d7: a long title_no is cut without the trailing «for» in <title>, og:title keeps the full title (got ${JSON.stringify(titleTag(arctic.body))})`);
+        assertEq(titleTag(arctic.body), seo.opplevelseSeoTitle("Arctic Circle Raceway — motorsport like sør for Polarsirkelen", "Rana", "Nordland"),
+          "ip-d8: the page's <title> is opplevelseSeoTitle() (the cascade (f) runs over the live corpus)");
+      }
+
+      // ── (f) IDX2-05, review B1: distinct pages keep distinct titles ───────
+      {
+        const title = seo.opplevelseSeoTitle;
+        // The repro pairs (each pair is one provider, both pages index, follow
+        // with their own canonical): round 1 gave each pair one <title>.
+        const dalane = [
+          title("Dalane Folkemuseum — Regional Heritage & Fayance Pottery Museum in Egersund", "Egersund", "Rogaland"),
+          title("Dalane Folkemuseum – friluftsmuseum med historiske tømmerhus", "Eigersund", "Rogaland"),
+        ];
+        const hardanger = [
+          title("Hardanger Folkemuseum – bunad, hardangersøm og friluftsutstilling", "Ullensvang", "Vestland"),
+          title("Hardanger Folkemuseum — Folk Art & Culture Museum Hardanger", "Kvam", "Vestland"),
+        ];
+        assertEq(dalane, ["Dalane Folkemuseum — Regional Heritage & Fayance" + BRAND, "Dalane Folkemuseum – friluftsmuseum med historiske" + BRAND],
+          "ip-f1 (B1 repro): the two Dalane Folkemuseum pages keep distinct titles, as on main");
+        assertEq(hardanger, ["Hardanger Folkemuseum – bunad, hardangersøm" + BRAND, "Hardanger Folkemuseum — Folk Art & Culture Museum" + BRAND],
+          "ip-f2 (B1 repro): the two Hardanger Folkemuseum pages keep distinct titles (the first loses only its trailing «og»)");
+
+        // The live corpus: every /opplevelse page in the sitemap, both languages.
+        const fixture = JSON.parse(fs.readFileSync(LIVE_TITLES_FIXTURE, "utf8")) as { rows: Array<[string, string | null, string | null, string, string, string | null, string | null]> };
+        const pages: Array<{ lang: "no" | "en"; slug: string; kommune: string | null; fylke: string | null; text: string; live: string }> = [];
+        for (const [slug, kommune, fylke, titleNo, liveNo, titleEn, liveEn] of fixture.rows) {
+          pages.push({ lang: "no", slug, kommune, fylke, text: titleNo, live: liveNo });
+          pages.push({ lang: "en", slug, kommune, fylke, text: titleEn ?? titleNo, live: liveEn ?? liveNo });
+        }
+        assertEq(pages.length, 830, "ip-f3: the fixture has the 415 sitemap pages in two languages");
+        const budget = 70 - BRAND.length;
+        const minKeep = Math.floor(budget * 0.6);
+        const oldPlace = (k: string | null, f: string | null): string => [k, f].filter(Boolean).join(", ");
+        const fitted: Record<string, number> = { no: 0, en: 0 };
+        const unchanged: Record<string, number> = { no: 0, en: 0 };
+        const unfit: string[] = [];
+        const bad: string[] = [];
+        const short: string[] = [];
+        const byTitle = new Map<string, typeof pages>();
+        for (const p of pages) {
+          const out = title(p.text, p.kommune, p.fylke);
+          if (out === p.live) unchanged[p.lang]++;
+          const key = `${p.lang} ${out}`;
+          (byTitle.get(key) || byTitle.set(key, []).get(key)!).push(p);
+          // A title that fitted on main, with a place titlePlace() leaves as it
+          // was, must come out byte-identical.
+          const place = oldPlace(p.kommune, p.fylke);
+          const fittedOnMain = p.live === `${p.text}${place ? " – " + place : ""}${BRAND}` || p.live === p.text + BRAND;
+          if (fittedOnMain && seo.titlePlace(p.kommune, p.fylke) === place) {
+            fitted[p.lang]++;
+            if (out !== p.live) unfit.push(`${p.lang} ${p.slug}: ${p.live} -> ${out}`);
+          }
+          const main = out.slice(0, -BRAND.length);
+          const last = (main.split(" ").pop() || "").toLowerCase();
+          const open = main.lastIndexOf("(");
+          if (!out.endsWith(BRAND) || out.length > 70 || !main || !`${p.text} – ${seo.titlePlace(p.kommune, p.fylke)}`.startsWith(main)
+            || DANGLING_WORDS.has(last) || /[\s\-–—,.&/:;]$/.test(main) || (open >= 0 && open > main.lastIndexOf(")"))) bad.push(`${p.lang} ${p.slug}: ${out}`);
+          if (!p.text.startsWith(main) || main === p.text) continue; // not cut
+          if (main.length < minKeep) short.push(`${p.lang} ${p.slug}: ${out}`);
+        }
+        const shared = [...byTitle.entries()].filter(([, g]) => new Set(g.map((p) => p.live)).size > 1)
+          .map(([k, g]) => `${k} <- ${g.map((p) => `${p.slug} (main: ${p.live})`).join(" | ")}`);
+        assertEq(shared, [], "ip-f4 (B1): no two pages in one language share a <title> that had distinct titles on main (round 1: 2 NO + 9 EN groups)");
+        assertEq(unfit, [], `ip-f5: every title that fitted stays byte-identical (${fitted.no} NO + ${fitted.en} EN)`);
+        assertEq([fitted.no, fitted.en], [275, 179], "ip-f6: … which is 275 of the 415 Norwegian and 179 of the English pages");
+        assertEq([unchanged.no, unchanged.en], [340, 316],
+          "ip-f6b: 340 NO and 316 EN titles are byte-identical in all (round 1: 296 NO, 210 EN); the rest are Oslo-place or cut titles");
+        assertEq(bad, [], "ip-f7: no live title ends on a function word, punctuation or an open «(», and each is a ≤70-char prefix of its title (and place)");
+        assertEq(short, [], `ip-f8: every cut title keeps at least ${minKeep} chars (60% of the budget); round 1 cut 58 of them to 20 chars or less`);
       }
 
       // ── (e) MCP2-02: RFB /guide-mat-ai ─────────────────────────────────────

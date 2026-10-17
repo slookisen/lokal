@@ -3442,28 +3442,39 @@ const MAX_TITLE = 70;
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-P (IDX2-05): a cut
 // that ended on a preposition still read as broken in SERPs — «Arctic Circle
 // Raceway — motorsport like sør for», «Norsk Tindemuseum — klatringshistorie
-// i hjertet av». 145 of the 557 live titles took the truncation path (2026-10-17).
+// i hjertet av». Of the 415 /opplevelse pages in the sitemap, read in both
+// languages (2026-10-17), 122 Norwegian and 230 English titles took the
+// truncation path.
 // A title that fits is still returned unchanged; on the truncation path:
 //   1. A title with a subtitle («Navn — tagline», «Navn – tagline»,
-//      «Navn: tagline») is cut at the last separator whose head fits: the name
-//      without half a tagline. That gives up the tagline words that would have
-//      fitted, on purpose — no word-level rule tells «… like sør» or «… Norges
-//      mest» from a whole phrase — and the h1, og:title and description still
-//      carry the full title. The head must be at least TITLE_MIN_HEAD chars;
-//      a shorter one («Ski — …») falls through to 2.
+//      «Navn: tagline») is cut at the last separator whose head fits the
+//      budget and fills at least TITLE_MIN_KEEP of it, the floor the word cut
+//      uses too: the name without a stub of tagline («… on the Namsen —
+//      Norway's»). A shorter head falls through to 2, which keeps the start of
+//      the tagline. Cutting every subtitle down to its head, short heads
+//      included, gave distinct pages one <title>: in the live sample, 2
+//      Norwegian and 9 English groups («Dalane Folkemuseum», «Hardanger
+//      Folkemuseum», «TusenFryd» …), against 0 on the old cut, with the median
+//      Norwegian cut title down from 52 to 20 chars. With the floor: 0 groups
+//      in either language, median 49.
 //   2. Otherwise the word-boundary cut above.
 // Either way tidyCutTitle() then drops an unclosed «(…» and trailing
-// closed-class words (TITLE_TRAILING_WORDS), never down to nothing.
+// closed-class words (TITLE_TRAILING_WORDS), never down to nothing. The h1,
+// og:title and description still carry the full title.
 const TITLE_SEPARATOR_RE = /\s+[—–-]\s+|:\s+/g;
-const TITLE_MIN_HEAD = 8;
+const TITLE_MIN_KEEP = 0.6;
 // Prepositions, conjunctions and articles a cut title must not end on, bokmål,
 // nynorsk and English (titles come in both). Lower-case; only read on the
-// truncation path, and only for the last word left by the cut. «å» is left
-// out on purpose: it is also the place Å («Rorbuer i Å»).
+// truncation path, and only for the last word left by the cut. Left out on
+// purpose: «å», which is also the place Å («Rorbuer i Å»), and «per», which
+// is also a name. «by» (Norwegian «city») and «to» (Norwegian «two») stay:
+// in the live titles they are English prepositions («by Torget», «Railway to»;
+// 1 and 20 titles, none Norwegian), and when a Norwegian one is dropped the
+// word before it still ends the title cleanly («… i Bergen by» → «… i Bergen»).
 const TITLE_TRAILING_WORDS: ReadonlySet<string> = new Set([
   "i", "på", "til", "fra", "frå", "av", "med", "ved", "for", "om", "hos", "mot", "etter", "før",
   "under", "over", "mellom", "gjennom", "langs", "rundt", "uten", "utan", "innen", "nær", "bak",
-  "foran", "blant", "via", "per", "inkl", "og", "eller", "men", "samt", "som", "at", "enn",
+  "foran", "blant", "via", "inkl", "og", "eller", "men", "samt", "som", "at", "enn",
   "en", "ei", "et", "ein", "eit", "den", "det", "de", "dei",
   "a", "an", "the", "and", "or", "but", "of", "in", "on", "to", "from", "with", "by", "near",
   "into", "onto", "across", "around", "through", "along", "between", "among", "about", "incl",
@@ -3484,16 +3495,17 @@ function tidyCutTitle(cut: string): string {
 export function seoPageTitle(main: string): string {
   if (main.length + BRAND.length <= MAX_TITLE) return main + BRAND;
   const budget = MAX_TITLE - BRAND.length;
+  const minKeep = Math.floor(budget * TITLE_MIN_KEEP);
   let headEnd = -1;
   for (const m of main.matchAll(TITLE_SEPARATOR_RE)) {
     const head = main.slice(0, m.index).trimEnd();
     if (head.length > budget) break;
-    if (head.length >= TITLE_MIN_HEAD) headEnd = m.index;
+    if (head.length >= minKeep) headEnd = m.index;
   }
   if (headEnd > 0) return tidyCutTitle(main.slice(0, headEnd)) + BRAND;
   let truncated = main.slice(0, budget);
   const lastSpace = truncated.lastIndexOf(" ");
-  if (lastSpace >= Math.floor(budget * 0.6)) {
+  if (lastSpace >= minKeep) {
     truncated = truncated.slice(0, lastSpace);
   }
   return tidyCutTitle(truncated) + BRAND;
@@ -3506,6 +3518,15 @@ export function seoPageTitle(main: string): string {
 export function titlePlace(kommune: string | null | undefined, fylke: string | null | undefined): string {
   if (kommune && fylke && kommune.trim().toLowerCase() === fylke.trim().toLowerCase()) return kommune;
   return [kommune, fylke].filter(Boolean).join(", ");
+}
+
+// The <title> of an /opplevelse page: the title with its place when that
+// fits, else the title alone, cut by seoPageTitle(). Exported so the tests run
+// the live-title corpus through the same cascade the page uses.
+export function opplevelseSeoTitle(displayTitle: string, kommune: string | null | undefined, fylke: string | null | undefined): string {
+  const loc = titlePlace(kommune, fylke);
+  const withPlace = `${displayTitle}${loc ? " – " + loc : ""}`;
+  return seoPageTitle(withPlace.length + BRAND.length <= MAX_TITLE ? withPlace : displayTitle);
 }
 
 function renderOpplevelseDetail(
@@ -3799,12 +3820,8 @@ function renderOpplevelseDetail(
     .join("\n");
 
   // Build SEO title ≤70 chars: cascade full (with place) → without place → truncated
-  // (BRAND/MAX_TITLE/seoPageTitle are module-scope, defined above this function.)
-  const titleLoc = titlePlace(exp.kommune, exp.fylke);
-  const titleWithPlace = `${displayTitle}${titleLoc ? " – " + titleLoc : ""}`;
-  const title = seoPageTitle(
-    titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : displayTitle
-  );
+  // (opplevelseSeoTitle/seoPageTitle are module-scope, defined above this function.)
+  const title = opplevelseSeoTitle(displayTitle, exp.kommune, exp.fylke);
 
   // Share image: the category's PNG card (E2-S3; default card for no or an
   // unknown category). The title is in og:title and the alt text, which use
@@ -10411,24 +10428,24 @@ const OA_MCP_GUIDE_TOOL_COPY: Record<string, Record<GuideLang, GuideToolCopy>> =
   },
   discover_gardssalg: {
     no: {
-      card: "Finner gårdssalg: bryggerier, ciderier, vingårder, destillerier, gårdskafeer og mjøderier som selger rett fra gården. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
-      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg (bryggeri, cideri, vingård, destilleri, gårdskafé og mjøderi) etter fylke, kommune og type, eller én produsent ved navn i query",
+      card: "Finner gårdssalg: bryggerier, ciderier, vingårder, destillerier, gårdskafeer, mjøderier og seltzerier som selger rett fra gården. Filtrer på fylke, kommune og produsenttype, eller slå opp én produsent ved navn og sted i <code>query</code>, f.eks. «Fjordgard Bryggeri». Med <code>lat</code>/<code>lng</code> kommer de nærmeste først. Returnerer navn, sted, produsenttype, profilside og om produsenten tar imot besøksforespørsler nå.",
+      faq: "discover_gardssalg finner drikkeprodusenter med gårdssalg (bryggeri, cideri, vingård, destilleri, gårdskafé, mjøderi og seltzeri) etter fylke, kommune og type, eller én produsent ved navn i query",
     },
     en: {
-      card: "Finds farm sales (gårdssalg): breweries, cideries, wineries, distilleries, farm cafés, and meaderies that sell straight from the farm. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
-      faq: "discover_gardssalg finds drink producers with a farm sale (brewery, cidery, winery, distillery, farm café, and meadery) by county, municipality, and type, or one producer by name in query",
+      card: "Finds farm sales (gårdssalg): breweries, cideries, wineries, distilleries, farm cafés, meaderies, and seltzer makers that sell straight from the farm. Filter by county (fylke), municipality (kommune), and producer type, or look up one producer by name and place in <code>query</code>, e.g. \"Fjordgard Bryggeri\". With <code>lat</code>/<code>lng</code> the nearest come first. Returns name, location, producer type, profile page, and whether the producer takes visit requests right now.",
+      faq: "discover_gardssalg finds drink producers with a farm sale (brewery, cidery, winery, distillery, farm café, meadery, and seltzer maker) by county, municipality, and type, or one producer by name in query",
     },
   },
   book_gardssalg: {
     no: {
-      card: "Sender en besøksforespørsel til en gårdssalg-produsent, med ønsket tid, antall personer og gjestens navn og e-post. Forespørselen står ventende til produsenten svarer: bekrefter, foreslår et annet tidspunkt eller avslår. Verktøyet lager aldri en bekreftet booking, og Opplevagent tar ikke imot betaling — et eventuelt kjøp betales hos produsenten ved besøket. Gjesten får en statuslenke på e-post. Bare produsenter som tar imot forespørsler nå, kan få en.",
-      faq: "book_gardssalg sender en besøksforespørsel til en gårdssalg-produsent, og forespørselen står ventende til produsenten svarer",
-      bookingFaq: "For gårdssalg sender book_gardssalg en besøksforespørsel til produsenten. Den står ventende til produsenten svarer, så det er ingen bekreftet booking, og Opplevagent tar ikke imot betaling — et eventuelt kjøp betales hos produsenten ved besøket.",
+      card: "Sender en besøksforespørsel til en gårdssalg-produsent, med ønsket tid, antall personer og gjestens navn og e-post. Forespørselen står ventende til produsenten svarer på e-post: bekrefter, foreslår et annet tidspunkt eller avslår. Verktøyet lager aldri en bekreftet booking, og Opplevagent tar ikke imot betaling — et eventuelt kjøp betales hos produsenten ved besøket. Gjesten får en statuslenke på e-post. Bare produsenter som tar imot forespørsler nå, kan få en.",
+      faq: "book_gardssalg sender en besøksforespørsel til en gårdssalg-produsent, og forespørselen står ventende til produsenten svarer på e-post",
+      bookingFaq: "For gårdssalg sender book_gardssalg en besøksforespørsel til produsenten. Den står ventende til produsenten svarer på e-post, så det er ingen bekreftet booking, og Opplevagent tar ikke imot betaling — et eventuelt kjøp betales hos produsenten ved besøket.",
     },
     en: {
-      card: "Sends a visit request to a farm-sale (gårdssalg) producer, with the requested time, party size, and the guest's name and email. The request stays pending until the producer replies: confirms, proposes another time, or declines. The tool never creates a confirmed booking, and Opplevagent takes no payment — anything bought is paid to the producer at the visit. The guest gets a status link by email. Only producers that take requests right now can receive one.",
-      faq: "book_gardssalg sends a visit request to a farm-sale producer, and the request stays pending until the producer replies",
-      bookingFaq: "For farm sales (gårdssalg), book_gardssalg sends a visit request to the producer. It stays pending until the producer replies, so it is not a confirmed booking, and Opplevagent takes no payment — anything bought is paid to the producer at the visit.",
+      card: "Sends a visit request to a farm-sale (gårdssalg) producer, with the requested time, party size, and the guest's name and email. The request stays pending until the producer replies by email: confirms, proposes another time, or declines. The tool never creates a confirmed booking, and Opplevagent takes no payment — anything bought is paid to the producer at the visit. The guest gets a status link by email. Only producers that take requests right now can receive one.",
+      faq: "book_gardssalg sends a visit request to a farm-sale producer, and the request stays pending until the producer replies by email",
+      bookingFaq: "For farm sales (gårdssalg), book_gardssalg sends a visit request to the producer. It stays pending until the producer replies by email, so it is not a confirmed booking, and Opplevagent takes no payment — anything bought is paid to the producer at the visit.",
     },
   },
 };
@@ -10542,7 +10559,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
   </section>
   <section class="gom-sec">
     <h2>What is this?</h2>
-    <p>Opplevagent runs a remote MCP (Model Context Protocol) server at <code>https://opplevagent.no/mcp</code>. Once your AI assistant is connected, it can search, filter, and read our verified experience catalog directly — the same data behind <a href="/opplevelser">the browse pages</a>, but callable as tools inside a conversation.</p>
+    <p>Opplevagent runs a remote MCP (Model Context Protocol) server at <code>https://opplevagent.no/mcp</code>. Once your AI assistant is connected, it can search, filter, and read our verified experience catalog directly — the same data behind <a href="/opplevelser">the browse pages</a>, but callable as tools inside a conversation. It can also find farm sales (gårdssalg) at Norwegian drink producers and send a producer a visit request.</p>
 
     <h2>The tools, exactly as registered</h2>
     <div class="gom-tools">${toolsHtml}
@@ -10556,6 +10573,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
       <li>"Whale safari Tromsø"</li>
       <li>"Family-friendly activities under 500 kr"</li>
       <li>"What categories of experiences exist in Norway?"</li>
+      <li>"Farm-sale cider in Hardanger"</li>
     </ul></div>
 
     <h2>Get started</h2>
@@ -10584,7 +10602,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
   </section>
   <section class="gom-sec">
     <h2>Hva er dette?</h2>
-    <p>Opplevagent kjører en ekstern MCP (Model Context Protocol)-server på <code>https://opplevagent.no/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte opplevelsesregister direkte — samme data som driver <a href="/opplevelser">nettleser-sidene</a>, men tilgjengelig som verktøy i en samtale.</p>
+    <p>Opplevagent kjører en ekstern MCP (Model Context Protocol)-server på <code>https://opplevagent.no/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte opplevelsesregister direkte — samme data som driver <a href="/opplevelser">nettleser-sidene</a>, men tilgjengelig som verktøy i en samtale. Den kan også finne gårdssalg hos norske drikkeprodusenter og sende en besøksforespørsel til produsenten.</p>
 
     <h2>Verktøyene, slik de faktisk er registrert</h2>
     <div class="gom-tools">${toolsHtml}
@@ -10598,6 +10616,7 @@ router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
       <li>«Hvalsafari Tromsø»</li>
       <li>«Familievennlige aktiviteter under 500 kr»</li>
       <li>«Hvilke typer opplevelser finnes i Norge?»</li>
+      <li>«Gårdssalg med cider i Hardanger»</li>
     </ul></div>
 
     <h2>Kom i gang</h2>
