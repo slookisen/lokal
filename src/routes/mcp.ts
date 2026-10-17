@@ -22,6 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
+import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
 import { openingHoursText } from "../utils/opening-hours";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
@@ -94,6 +95,14 @@ export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, s
   return map;
 }
 
+/** One catalog row's availability, as lokal_info annotates a product with it. */
+export interface CatalogAvailability {
+  availability: string;
+  availabilityUpdatedAt: string | null;
+  /** products.availability_source ('producer_dashboard' when the producer set it). */
+  availabilitySource?: string | null;
+}
+
 // dev-request 2026-07-13-supply-graph-v1 (Slice 1): per-agent name_norm →
 // effective-availability lookup, built the same way getCatalogProductIdMap()
 // builds its id map. Deliberately NOT filtered to availability='in_stock' —
@@ -101,11 +110,13 @@ export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, s
 // SURFACE the current effective availability (including 'unknown' for a
 // stale producer_dashboard row, or 'out_of_stock' etc.) for every catalog
 // row, so callers can annotate products regardless of stock state.
+// Slice I-S (F2): the row's availability_source is carried along, so
+// formatProductsForMcp keeps a row the producer set as a product.
 export function getCatalogAvailabilityMap(
   agentId: string,
   db?: any
-): Map<string, { availability: string; availabilityUpdatedAt: string | null }> {
-  const map = new Map<string, { availability: string; availabilityUpdatedAt: string | null }>();
+): Map<string, CatalogAvailability> {
+  const map = new Map<string, CatalogAvailability>();
   try {
     const conn = db ?? getDb();
     const rows = conn
@@ -125,6 +136,7 @@ export function getCatalogAvailabilityMap(
         map.set(r.name_norm, {
           availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
           availabilityUpdatedAt: r.availability_updated_at ?? null,
+          availabilitySource: r.availability_source,
         });
       }
     }
@@ -155,12 +167,14 @@ export const MCP_CATEGORY_LABELS_NOTE =
  * written by the enrichment's category inference) is listed under
  * «Kategorier:» instead, without a catalog id or availability: it is no
  * product a cart could take or a stock status could be claimed for. Every
- * other entry is rendered exactly as before.
+ * other entry is rendered exactly as before. Slice I-S (F2): an entry whose
+ * catalog row the producer set (availabilitySource 'producer_dashboard') is
+ * a product, with its id and availability.
  */
 export function formatProductsForMcp(
   products: unknown,
   productIdByNorm?: Map<string, string>,
-  availabilityByNorm?: Map<string, { availability: string; availabilityUpdatedAt: string | null }>
+  availabilityByNorm?: Map<string, CatalogAvailability>
 ): string {
   if (!Array.isArray(products) || !products.length) return "";
 
@@ -187,7 +201,7 @@ export function formatProductsForMcp(
     // Skip noise
     if (isProductNoise(name)) continue;
 
-    if (isCategoryLabelProduct(p)) {
+    if (isCategoryLabelProduct(p, availabilityByNorm?.get(normalizeProductName(cleanName))?.availabilitySource)) {
       const key = cleanName.toLowerCase();
       if (!categoryLabels.has(key)) categoryLabels.set(key, cleanName);
       continue;
@@ -273,14 +287,20 @@ function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledge
   return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId));
 }
 
-/** The «🛒 …» line of a search result: the first five products with prices, and how many more there are. */
+/**
+ * The «🛒 …» line of a search result: the first five products with prices,
+ * and how many more there are. Slice I-S (F5): category labels are no
+ * products here either (isCategoryLabelProduct), so a producer with only
+ * labels has no line.
+ */
 function productSummaryText(realProducts: readonly unknown[]): string | undefined {
-  const topItems = realProducts.slice(0, 5).map((p: any) => {
+  const listed = realProducts.filter((p) => !isCategoryLabelProduct(p));
+  const topItems = listed.slice(0, 5).map((p: any) => {
     const { cleanName, price } = parseProductPrice(p);
     return price ? `${cleanName} (${price})` : cleanName;
   });
   return topItems.length
-    ? `🛒 ${topItems.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
+    ? `🛒 ${topItems.join(", ")}${listed.length > 5 ? ` +${listed.length - 5} flere` : ""}`
     : undefined;
 }
 
@@ -384,33 +404,24 @@ export function cartResultText(tool: string, result: { success: boolean; status?
 
 // ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
 
-/**
- * productsAreGenericCategoryNames (admin-outreach-candidates.ts), loaded
- * lazily as admin-knowledge.ts does: that module pulls in routes/seo and
- * routes/admin-knowledge, which every importer of this file (the tool
- * manifest, the MCP tests) would otherwise load as well.
- */
-function productsAreGenericCategoryNames(productsJson: string): boolean {
-  return (require("./admin-outreach-candidates") as typeof import("./admin-outreach-candidates"))
-    .productsAreGenericCategoryNames(productsJson);
-}
-
-/** True when a product name is only a platform category name («Honning», «egg », «Bakervarer»). */
-export function isGenericCategoryName(name: string): boolean {
-  return productsAreGenericCategoryNames(JSON.stringify([name]));
-}
+// isGenericCategoryName — I-A's name rule — lives in utils/category-label.ts
+// since slice I-S (catalog-offers.ts uses the same rule); it is re-exported
+// here so this module's exports stay as they were.
+export { isGenericCategoryName };
 
 /**
  * Slice I-N (AI2-02): a product entry that is only a generic category label,
  * the kind the enrichment's category inference writes as product names
- * («Honning», «Kjøtt», «Egg»). The name rule is I-A's
- * (productsAreGenericCategoryNames, per name). A category name with a price
- * («Egg» at «60 kr/brett») is something the producer listed, and stays a
- * product; category inference never writes a price.
+ * («Honning», «Kjøtt», «Egg»): a category name without a numeric price. A
+ * category name with a price («Egg» at «60 kr/brett») is something the
+ * producer listed, and stays a product; category inference never writes a
+ * price. Slice I-S: the rule is utils/category-label.ts (isCategoryLabel),
+ * and `availabilitySource` is that of the entry's catalog row, when known —
+ * a row the producer set is a product (F2).
  */
-export function isCategoryLabelProduct(p: unknown): boolean {
+export function isCategoryLabelProduct(p: unknown, availabilitySource?: string | null): boolean {
   const name = productNameOf(p);
-  return !!name && isGenericCategoryName(name) && !parseProductPrice(p as any).price;
+  return !!name && isCategoryLabel({ name, hasPrice: !!parseProductPrice(p as any).price, availabilitySource });
 }
 
 /**
@@ -421,7 +432,7 @@ export function isCategoryLabelProduct(p: unknown): boolean {
  * only such labels is a category match.
  */
 export function documentsListedProduct(matchedNames: readonly string[]): boolean {
-  return matchedNames.length > 0 && !productsAreGenericCategoryNames(JSON.stringify(matchedNames));
+  return matchedNames.length > 0 && !areGenericCategoryNames(matchedNames);
 }
 
 /**
@@ -536,12 +547,13 @@ function isListedMatch(p: unknown, matchedNames: ReadonlySet<string>, words: rea
 
 /**
  * The products in the order their «🛒 …» summary shows them (slice I-N, AI-3a):
- * unchanged when every listed match is among the first five; otherwise the
- * listed matches come first, so the product that made the match is shown
- * (Bønes Gårdsmat's «Ferske egg fra Fana» was its 7th product).
+ * unchanged when every listed match is among the first five shown (category
+ * labels are not shown, slice I-S); otherwise the listed matches come first,
+ * so the product that made the match is shown (Bønes Gårdsmat's «Ferske egg
+ * fra Fana» was its 7th product).
  */
 function productsWithMatchesShown(products: readonly unknown[], isMatch: (p: unknown) => boolean): readonly unknown[] {
-  if (!products.slice(5).some(isMatch)) return products;
+  if (!products.filter((p) => !isCategoryLabelProduct(p)).slice(5).some(isMatch)) return products;
   return [...products.filter(isMatch), ...products.filter((p) => !isMatch(p))];
 }
 
@@ -851,7 +863,7 @@ export function registerTools(
             : categoryLabelOnly
               ? `\n   ⚠️ Kategoritreff: produktlista har «${terms}» bare som kategorinavn, ikke som et bestemt produkt — spør produsenten. / Category match only: the product list has «${terms}» only as a category name, not as a specific product; ask the producer.`
               : `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${terms}» — spør produsenten. / Category match only: the listed products don't mention «${terms}»; ask the producer.`;
-          return formatAgentCompact(agent, i + 1, summary.contact, productSummary, getClientIdentity?.(), categoryOnly ? {
+          return formatAgentCompact(agent, i + 1, summary.contact, { ...summary, productSummary }, getClientIdentity?.(), categoryOnly ? {
             headingSuffix: categoryLabelOnly
               ? ` — Kategoritreff / category-only: «${terms}» bare som kategorinavn / category name only`
               : ` — Kategoritreff / category-only: «${terms}» ikke oppført / not listed`,
@@ -957,7 +969,7 @@ export function registerTools(
             ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
             : "";
         const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id);
-        return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
+        return formatAgentCompact(r.agent, i + 1, summary.contact, summary, getClientIdentity?.()) + dist;
       });
 
       deliver("lokal_discover", { categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra, results.map((r: any) => r.agent.id));
@@ -1003,7 +1015,9 @@ export function registerTools(
           // Strip an appended internal pipeline note (Daniel 2026-09-03) —
           // an AI agent must not relay the fleet's own working notes either.
           // I-N (AI2-08): scraped HTML tags («<br />») are no text either.
-          sections.push(`\n${mcpProse(k.about)}`);
+          // I-S (F1): an about of only tags gives no section.
+          const about = mcpProse(k.about);
+          if (about) sections.push(`\n${about}`);
         }
       }
 
@@ -1740,7 +1754,11 @@ export function registerTools(
 
 // ─── Compact agent formatter ────────────────────────────────
 
-function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string, clientIdentity?: string,
+// `products` is the producer's AgentKnowledgeSummary: its «🛒 …» line, and the
+// lokal_info pointer when it has products (I-S: also when they are only
+// category labels, which have no 🛒 line).
+function formatAgentCompact(agent: any, idx: number, contact?: any,
+  products?: Pick<AgentKnowledgeSummary, "productSummary" | "productsCount">, clientIdentity?: string,
   display?: { headingSuffix?: string; hideDescription?: boolean }): string {
   const lines = [`**${idx}. ${agent.name}${display?.headingSuffix ?? ""}**`];
   if (agent.description && !display?.hideDescription) {
@@ -1748,7 +1766,9 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
       console.log(`[description-guard] suppressed junk description (lokal_search) for ${agent.id} (${agent.name})`);
     } else {
       // I-N (AI2-08): a line break in scraped HTML keeps the result's indent.
-      lines.push(`   ${mcpProse(agent.description, "\n   ")}`);
+      // I-S (F1): a description of only tags gives no line.
+      const description = mcpProse(agent.description, "\n   ");
+      if (description) lines.push(`   ${description}`);
     }
   }
 
@@ -1768,8 +1788,8 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
   }
 
   // Product summary: top products with "get details" hint
-  if (productSummary) {
-    lines.push(`   ${productSummary}`);
+  if (products?.productSummary) lines.push(`   ${products.productSummary}`);
+  if (products?.productsCount) {
     // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: this line used
     // to promise "full prisliste". lokal_info's own tool description was
     // corrected in 2026-08-24-rfb-mcp-verktoybeskrivelser-vs-virkelighet

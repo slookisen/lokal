@@ -42565,6 +42565,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S (FUNN
+// rfb-mcp-oppfolging-etter-i-n): a generic category label without a price is
+// no offer in findOffers (lokal_find_offers, GET /catalog/offers, the shopping
+// list page), the limit applied after the filter; a row the producer set is
+// always a product (offers and lokal_info); the 🛒 summary shows no labels;
+// a description of only tags gives no empty line. One rule:
+// src/utils/category-label.ts. Own in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-S (a category label is no offer) ──");
+  try {
+    const { runRfbKategorietiketterIkkeTilbudTests } = require("../src/routes/rfb-kategorietiketter-ikke-tilbud.test") as
+      typeof import("../src/routes/rfb-kategorietiketter-ikke-tilbud.test");
+    const r = await runRfbKategorietiketterIkkeTilbudTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-kategorietiketter-ikke-tilbud: " + f);
+    console.log(`  rfb-kategorietiketter-ikke-tilbud: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kategorietiketter-ikke-tilbud: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

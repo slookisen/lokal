@@ -34,6 +34,14 @@
 // second-line + active + owner-claimed (is_verified) + opted in + a
 // non-blocklisted recipient e-mail. `verifisert_av_eier` stays is_verified-
 // only (see marketplace-catalog.ts's own note on why).
+//
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S: a row that
+// is only a generic category label («Honning» at a bakery, written by the
+// enrichment's category inference and copied into `products` by
+// product-catalog-sync.ts) with no price_nok is no offer, unless the producer
+// set it (availability_source 'producer_dashboard'). The rule is the one
+// lokal_info lists such rows by (utils/category-label.ts); the response shape
+// is unchanged, there are only fewer such rows.
 
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
@@ -44,6 +52,7 @@ import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance
 import { isValidLatLng } from "../utils/geo-query";
 import { slugify } from "../utils/slug";
 import { publicListableSql } from "./agent-visibility";
+import { isCategoryLabel } from "../utils/category-label";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -208,6 +217,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
   ) as RawOfferRow[];
 
   const withDistance = rows
+    // I-S: before the limit, so the labels do not shorten the page.
+    .filter((r) => !isCategoryLabel({ name: r.product_name, hasPrice: r.price_nok != null, availabilitySource: r.availability_source }))
     .map((r) => ({ r, dist: haversineDistanceKm(position.lat, position.lng, r.lat, r.lng) }))
     .filter((x) => x.dist <= radiusKm)
     .sort((a, b) => a.dist - b.dist)
