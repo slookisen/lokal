@@ -42410,6 +42410,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
+// rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
+// entries in the knowledge lists and a knowledge column that is not JSON no
+// longer fail lokal_info or a whole lokal_search answer. getAgentInfo hands
+// each field over in its declared shape, a bad column is read as empty and
+// logged without its value, the write path still reads strictly, and one
+// row's error leaves only that row's knowledge out. Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-F (knowledge-service type guards + per-row isolation) ──");
+  try {
+    const { runKnowledgeServiceTypeGuardsTests } = require("../src/services/knowledge-service-type-guards.test") as
+      typeof import("../src/services/knowledge-service-type-guards.test");
+    const r = await runKnowledgeServiceTypeGuardsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("knowledge-service-type-guards: " + f);
+    console.log(`  knowledge-service-type-guards: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("knowledge-service-type-guards: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)

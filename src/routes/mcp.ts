@@ -19,8 +19,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { textEntries } from "../utils/text-entries";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -156,10 +157,12 @@ export function formatProductsForMcp(
 
     const { cleanName, price, section } = parseProductPrice(p);
 
-    // Section header
+    // Section header. I-F: the price and category are DB JSON too — an object
+    // used to render as "[object Object]", so only text is shown.
+    const priceText = productPriceText(p.price);
     if (section && isProductHeader(name)) {
       lines.push(`\n**${section}**`);
-      if (p.price && !/^\d/.test(p.price)) lines.push(`_${p.price}_`);
+      if (priceText && !/^\d/.test(priceText)) lines.push(`_${priceText}_`);
       continue;
     }
 
@@ -167,7 +170,7 @@ export function formatProductsForMcp(
     if (isProductNoise(name)) continue;
 
     // Product line
-    const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
+    const cat = typeof p.category === "string" && p.category && p.category !== "other" ? ` [${p.category}]` : "";
     const priceStr = price ? ` — ${price}` : "";
     const seasonal = p.seasonal ? " 🌿sesong" : "";
     // orch-pr-14: append the catalog product_id when this product exists in the
@@ -192,8 +195,43 @@ export function formatProductsForMcp(
   return productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
 }
 
-// Build contact + product summary for a given agent ID, used by search results
-function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
+/**
+ * Integration test 2026-10-17 (I-F): the knowledge part of one row of a
+ * result list (lokal_search, lokal_discover). An error there leaves that
+ * row's knowledge out — the producer is still listed — instead of failing the
+ * whole list. It is logged as `[knowledge-guard]` with the tool, the agent id,
+ * the error class and where it was thrown, never the message: it can quote
+ * the stored value (JSON.parse's does), and the row holds contact details.
+ */
+export function knowledgeRowOrSkip<T>(tool: string, agentId: string, skipped: T, read: () => T): T {
+  try {
+    return read();
+  } catch (err) {
+    console.error(`[knowledge-guard] ${tool}: knowledge of agent ${agentId} skipped (${errorKindAndSite(err)})`);
+    return skipped;
+  }
+}
+
+/** "TypeError at fn (file:line:col)": the error class and its first stack frame, no message. */
+function errorKindAndSite(err: unknown): string {
+  if (!(err instanceof Error)) return typeof err;
+  // A V8 stack starts with String(err), the name and the message (which can
+  // span lines); the frames come after it.
+  const stack = err.stack ?? "";
+  const header = String(err);
+  const site = stack.startsWith(header)
+    ? stack.slice(header.length).split("\n").map((l) => l.trim()).find((l) => l.startsWith("at "))
+    : undefined;
+  return site ? `${err.name} ${site}` : err.name;
+}
+
+// Build contact + product summary for a given agent ID, used by search results.
+// I-F: one row's error leaves its summary out (knowledgeRowOrSkip).
+function getAgentKnowledgeSummary(tool: string, agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
+  return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId));
+}
+
+function buildAgentKnowledgeSummary(agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return { productsCount: 0 };
 
@@ -232,18 +270,10 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
 // whose openingHours is stored as text: `?.length` is true for a string too,
 // and the SDK puts an uncaught handler error's message into the tool result.
 
-/**
- * Text entries of a list-valued DB JSON field (specialties, paymentMethods,
- * labels, agent categories ...): an array gives its string entries, a string
- * gives itself as one entry, anything else gives none.
- */
-export function textEntries(value: unknown): string[] {
-  const items: unknown[] = Array.isArray(value) ? value : [value];
-  return items
-    .filter((v): v is string => typeof v === "string")
-    .map((v) => v.trim())
-    .filter(Boolean);
-}
+// textEntries — the text entries of a list-valued DB JSON field — lives in
+// utils/text-entries.ts since slice I-F (knowledge-service.ts uses it too);
+// it is re-exported here so this module's exports stay as they were.
+export { textEntries };
 
 const OPENING_DAY_NAMES_NO: ReadonlyMap<string, string> = new Map([
   ["mon", "Man"], ["tue", "Tir"], ["wed", "Ons"], ["thu", "Tor"], ["fri", "Fre"], ["sat", "Lør"], ["sun", "Søn"],
@@ -542,28 +572,34 @@ export function registerTools(
           : agent.location?.distanceLabel
             ? ` — ${agent.location.distanceLabel} (omtrentlig posisjon)`
             : "";
-        const summary = getAgentKnowledgeSummary(agent.id);
+        const summary = getAgentKnowledgeSummary("lokal_search", agent.id);
 
         if (isSpecificQuery) {
           // Detailed view: include full product list with prices
-          const info = knowledgeService.getAgentInfo(agent.id);
-          const k = info?.knowledge || {} as any;
           const sections = [formatAgentCompact(agent, i + 1, summary.contact, undefined, getClientIdentity?.()) + dist];
 
-          // Full product list — orch-pr-14: pass catalog id map so each
-          // priced/in-stock product line carries its product_id for cart use.
-          if (k.products?.length) {
-            const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
-            if (productSection) sections.push(productSection);
-          }
+          // I-F: products and details come from the same knowledge row as
+          // the summary; an error there leaves them out of this result only.
+          sections.push(...knowledgeRowOrSkip("lokal_search", agent.id, [] as string[], () => {
+            const details: string[] = [];
+            const k = knowledgeService.getAgentInfo(agent.id)?.knowledge || {} as any;
 
-          // Extra details
-          const specialties = textEntries(k.specialties);
-          const paymentMethods = textEntries(k.paymentMethods);
-          const deliveryOptions = textEntries(k.deliveryOptions);
-          if (specialties.length) sections.push(`\n**Spesialiteter:** ${specialties.join(", ")}`);
-          if (paymentMethods.length) sections.push(`💳 **Betaling:** ${paymentMethods.join(", ")}`);
-          if (deliveryOptions.length) sections.push(`🚚 **Levering:** ${deliveryOptions.join(", ")}`);
+            // Full product list — orch-pr-14: pass catalog id map so each
+            // priced/in-stock product line carries its product_id for cart use.
+            if (k.products?.length) {
+              const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+              if (productSection) details.push(productSection);
+            }
+
+            // Extra details
+            const specialties = textEntries(k.specialties);
+            const paymentMethods = textEntries(k.paymentMethods);
+            const deliveryOptions = textEntries(k.deliveryOptions);
+            if (specialties.length) details.push(`\n**Spesialiteter:** ${specialties.join(", ")}`);
+            if (paymentMethods.length) details.push(`💳 **Betaling:** ${paymentMethods.join(", ")}`);
+            if (deliveryOptions.length) details.push(`🚚 **Levering:** ${deliveryOptions.join(", ")}`);
+            return details;
+          }));
 
           // Profile link
           const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
@@ -698,7 +734,7 @@ export function registerTools(
           : r.agent.location?.distanceLabel
             ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
             : "";
-        const summary = getAgentKnowledgeSummary(r.agent.id);
+        const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id);
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });
 

@@ -119,7 +119,9 @@ const SEED: Seed[] = [
     },
   },
   {
-    // A knowledge column that is not JSON at all: getAgentInfo throws a SyntaxError.
+    // A knowledge column that is not JSON at all. Slice I-F reads it as empty
+    // (knowledge-service-type-guards.test.ts); the internal-error tests below
+    // make getAgentInfo throw for this producer instead (failInfoFor).
     id: MALFORMED, name: "Fana Fisk Fixture", lat: 60.3000, lng: 5.3300, city: "Bergen",
     categories: ["fish"],
     knowledge: { products: "{not json" },
@@ -200,6 +202,18 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
 
   const { marketplaceRegistry } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
   marketplaceRegistry._agentsCache = null;
+
+  // An internal error in lokal_info: getAgentInfo throws the SyntaxError a
+  // knowledge column that is not JSON raised before slice I-F made such a
+  // column read as empty. null restores the real method.
+  const { knowledgeService } = require("../services/knowledge-service") as typeof import("../services/knowledge-service");
+  const realGetAgentInfo = knowledgeService.getAgentInfo;
+  const failInfoFor = (failingId: string | null) => {
+    knowledgeService.getAgentInfo = failingId === null ? realGetAgentInfo : function (this: typeof knowledgeService, id: string) {
+      if (id === failingId) throw new SyntaxError("Expected property name or '}' in JSON at position 1 (line 1 column 2)");
+      return realGetAgentInfo.call(this, id);
+    };
+  };
 
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence registry chatter */ };
@@ -314,7 +328,8 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
     }
     {
       const before = errorLog.length;
-      const r = await info.handler({ agentId: MALFORMED });
+      failInfoFor(MALFORMED);
+      const r = await info.handler({ agentId: MALFORMED }).finally(() => failInfoFor(null));
       const t = textOf(r);
       assertTrue(r?.isError === true && t === MCP_INTERNAL_ERROR_TEXT,
         `AI-1: an internal error in lokal_info gives isError with the generic message (got: ${t.slice(0, 120)})`);
@@ -335,7 +350,9 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
       const client = new Client({ name: "rfb-ai1-test", version: "0.0.0" });
       await Promise.all([server.connect(st), client.connect(ct)]);
       try {
-        const bad: any = await client.callTool({ name: "lokal_info", arguments: { agentId: MALFORMED } });
+        failInfoFor(MALFORMED);
+        const bad: any = await client.callTool({ name: "lokal_info", arguments: { agentId: MALFORMED } })
+          .finally(() => failInfoFor(null));
         assertTrue(bad?.isError === true && textOf(bad) === MCP_INTERNAL_ERROR_TEXT && bad.content.length === 1,
           `AI-1 (MCP client): tools/call lokal_info answers an internal error with only the generic message (got: ${JSON.stringify(bad).slice(0, 200)})`);
         const good: any = await client.callTool({ name: "lokal_info", arguments: { agentId: BAKERY } });
@@ -622,6 +639,7 @@ export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolea
       cartSvc.__setCartTestDb(null);
     }
   } finally {
+    failInfoFor(null);
     console.log = prevLog;
     console.error = prevError;
     __setGeocodingFetchForTesting();

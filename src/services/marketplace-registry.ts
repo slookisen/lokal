@@ -491,10 +491,14 @@ class MarketplaceRegistry {
 
             const matchedNames: string[] = [];
             for (const p of products) {
-              const pName = (typeof p === "string" ? p : p?.name || "").toLowerCase();
+              // Integration test 2026-10-17 (I-F): an entry's name is DB JSON. A
+              // name that is not text (a number) threw here, and the catch below
+              // then dropped every product match of the producer.
+              const name: string = typeof p === "string" ? p : typeof p?.name === "string" ? p.name : "";
+              const pName = name.toLowerCase();
               for (const term of productTerms) {
                 if (pName.includes(term) || new RegExp(`\\b${term}\\b`).test(pName)) {
-                  matchedNames.push(typeof p === "string" ? p : p?.name || pName);
+                  matchedNames.push(name);
                   break;
                 }
               }
