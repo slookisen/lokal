@@ -6,10 +6,12 @@
 //
 // No env override for these, on purpose: listPageSize decides which clinics
 // an indexed ?side=N URL shows, so it must not differ between deploys or
-// machines, and the rest is page layout, not thresholds. The thresholds F1-S3
-// brings (sted.minClinicsForIndex, faq.*) join this module each with an env
-// override read per call, like OPPLEVAGENT_COMBO_MIN_EXPERIENCES
-// (services/experience-indexability.ts).
+// machines, and the rest is page layout, not thresholds. The faq.* numbers
+// (F1-S3) say when a /sted or /fylke page also gets a FAQ; they never decide
+// whether a page is indexed. A /sted page is indexable whenever it has a
+// clinic (isDentalStedIndexable in routes/dental-seo.ts, decision 7=A): there
+// is no clinic-count threshold and no env switch for it, and a threshold above
+// 0 needs a new decision from Daniel.
 
 export const DENTAL_LANDING_CONFIG = {
   /** Clinic cards per page on /fylke, /sted and /spesialitet (as before). */
@@ -21,6 +23,18 @@ export const DENTAL_LANDING_CONFIG = {
    * the place has a /sted page, /sok?q=<place> when it has none.
    */
   heroPlaces: ["Oslo", "Bergen", "Trondheim", "Stavanger"],
+  /**
+   * When a /sted or /fylke page shows the FAQ and its FAQPage JSON-LD (F1-S3,
+   * services/landing-facts.ts). Only the FAQ is gated by these, not indexing.
+   */
+  faq: {
+    /** Fewest clinics on the page. */
+    minListings: 3,
+    /** Fewest real facts (Helfo, akutt, verified, specialists) besides the clinic count. */
+    minFacts: 2,
+    /** Fewest question/answer pairs, for the visible FAQ and for FAQPage. */
+    minQas: 2,
+  },
 } as const;
 
 /**

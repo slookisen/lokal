@@ -54,6 +54,7 @@ import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazettee
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
 import { DENTAL_LANDING_CONFIG, DENTAL_STATIC_PAGE_DATES } from "../config/dental-landing";
+import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts } from "../services/dental-area-facts";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
 // and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
@@ -1839,6 +1840,25 @@ router.get("/klinikk/:slug", (req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// F1-S3 (decision 7=A): a /sted page is indexable whenever it lists a clinic.
+// The /sted route (robots) and the sitemap both ask this, so they cannot
+// drift apart. No clinic-count threshold, no env switch: a threshold above 0
+// is a new decision from Daniel. The FAQ gate (DENTAL_LANDING_CONFIG.faq)
+// never decides indexing.
+export function isDentalStedIndexable(total: number): boolean {
+  return total > 0;
+}
+
+const NO_LANDING: DentalAreaLanding = { introHtml: "", tableHtml: "", faqHtml: "", faqJsonLd: null };
+
+// The intro, table and FAQ for a /sted or /fylke page, or nothing: when the
+// aggregate is missing (page 2+, db not ready) or does not agree with the
+// page's own count (cache a little behind the data), no number is stated.
+function areaLandingFor(counts: DentalAreaCounts | undefined, total: number, name: string, url: string): DentalAreaLanding {
+  if (!counts || total <= 0 || counts.total !== total) return NO_LANDING;
+  return buildDentalAreaLanding(counts, { name, url });
+}
+
 // GET /fylke/:fylke
 // ═══════════════════════════════════════════════════════════
 
@@ -1874,6 +1894,8 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const pageUrl = `${DENTAL_BASE_URL}${listPageHref(baseUrl, page)}`;
   const pageMeta = listPageMeta(page, totalPages);
   const itemList = dentalItemListJsonLd(`Tannleger i ${matchedFylke.fylke}`, pageUrl, agents, offset);
+  // F1-S3: intro, fact table and FAQ from the cached aggregate, page 1 only.
+  const landing = areaLandingFor(page === 1 ? getDentalAreaFacts().byFylke.get(matchedFylke.fylke) : undefined, total, matchedFylke.fylke, pageUrl);
 
   // PR-116: Poststed chips for this fylke (≥2 clinics, max 30). One chip per
   // /sted group, with the group's count, in the fylke of its main row (D3b).
@@ -1904,11 +1926,13 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     </div>
   </div>
   <div class="container" style="padding-top:28px;padding-bottom:48px">
+    ${landing.introHtml}${landing.tableHtml}
     <p class="result-meta">Side ${page} av ${totalPages}</p>
     <div class="clinic-list" role="list" aria-label="Tannleger i ${escapeHtml(matchedFylke.fylke)}">
       ${agents.length > 0 ? agents.map(clinicCard).join("") : `<div class="empty-state"><h3>Ingen klinikker funnet</h3></div>`}
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
+    ${landing.faqHtml}
     ${poststedChips}
   </div>
 </main>`;
@@ -1919,7 +1943,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     title: `Tannleger i ${matchedFylke.fylke}${pageMeta.title} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
     canonical: pageUrl,
-    jsonLd: [itemList, fylkeBreadcrumb],
+    jsonLd: [itemList, fylkeBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
   }));
 });
 
@@ -2023,6 +2047,7 @@ function buildDentalSitemapXml(): string {
     // be listed twice (integrasjonstest IDX-3). The /sted groups keep the
     // list's order, and the lastmod covers every spelling the page lists (D3b).
     for (const [slug, group] of stedGroups().bySlug) {
+      if (!isDentalStedIndexable(group.count)) continue;
       xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/sted/${slug}`, "weekly", "0.75", lastmods?.forPoststed(stedSpellings(group)))}`;
     }
 
@@ -2755,6 +2780,11 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   const pageMeta = listPageMeta(page, totalPages);
 
   const itemList = dentalItemListJsonLd(`Tannlege i ${titledSted}`, pageUrl, agents, offset);
+  // F1-S3: intro, fact table and FAQ from the cached aggregate (the same
+  // spellings the page lists), page 1 only.
+  const landing = areaLandingFor(
+    page === 1 ? sumAreaCounts(stedSpellings(stedGroup).map((sp) => getDentalAreaFacts().byPoststed.get(sp))) : undefined,
+    total, titledSted, pageUrl);
 
   // BreadcrumbList
   const breadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
@@ -2780,11 +2810,13 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     </div>
   </div>
   <div class="container" style="padding-top:28px;padding-bottom:48px">
+    ${landing.introHtml}${landing.tableHtml}
     <p class="result-meta">Side ${page} av ${totalPages}</p>
     <div class="clinic-list" role="list" aria-label="Tannleger i ${escapeHtml(titledSted)}">
       ${resultCards}
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
+    ${landing.faqHtml}
     ${fylkeLink}
   </div>
 </main>`;
@@ -2796,8 +2828,8 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
     canonical: pageUrl,
     // skive A: a /sted page with 0 active clinics must never be indexable.
-    ...(total === 0 ? { robots: "noindex,follow" } : {}),
-    jsonLd: [itemList, stedBreadcrumb],
+    ...(isDentalStedIndexable(total) ? {} : { robots: "noindex,follow" }),
+    jsonLd: [itemList, stedBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
   }));
 });
 
