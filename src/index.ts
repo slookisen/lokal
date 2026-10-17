@@ -1906,6 +1906,22 @@ if (
   }), 60 * 60_000);
 }
 
+// ─── dev-request 2026-10-16-indexnow-alle-verter (S2): IndexNow sitemap-diff sync ───
+// Default OFF. First tick at boot + 10 min (after the geocode ticks), then hourly. The tick
+// itself skips 06:30-09:30 UTC and a run younger than 30 min (boot_job_state).
+if (process.env.INDEXNOW_SYNC_ENABLED === "true") {
+  const indexNowSyncTick = trackJob("indexnow-sync", async () => {
+    try {
+      const { indexNowSyncTick: tick } = await import("./services/indexnow-sync");
+      await tick();
+    } catch (err) {
+      console.error("[indexnow-sync] tick failed:", err);
+    }
+  });
+  setTimeout(indexNowSyncTick, 10 * 60_000);
+  setInterval(indexNowSyncTick, 60 * 60_000);
+}
+
 // ─── dev-request 2026-07-04-opplevagent-naer-meg-geosok (item 1, 2026-07-10):
 // Backend experiences geocoding worker ───────────────────────────────
 //
