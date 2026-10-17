@@ -144,8 +144,8 @@ export async function runRfbKurvvaktKategorietiketterTests(opts: { log?: boolean
     const ordersOf = (cartId: string) => (db.prepare("SELECT COUNT(*) AS n FROM orders WHERE cart_id = ?").get(cartId) as { n: number }).n;
     const handoffsOf = (cartId: string) => (db.prepare("SELECT COUNT(*) AS n FROM cart_handoffs WHERE cart_id = ?").get(cartId) as { n: number }).n;
 
-    assertEq(CATEGORY_LABEL_CART_ERROR, "category_label: kategorinavn, ikke et produkt — spør produsenten",
-      "error: the code category_label, then the spec's text for the buyer");
+    assertEq(CATEGORY_LABEL_CART_ERROR, "category_label: kategorinavn, ikke et produkt — spør produsenten. / A category name, not a product — ask the producer.",
+      "error: the code category_label, then the spec's text for the buyer (NO / EN)");
 
     // ══════════════════════════════════════════════════════════════
     // addCartItem

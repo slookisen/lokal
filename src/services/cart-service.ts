@@ -270,10 +270,11 @@ export function checkCartToken(
 // producer (availability_source 'producer_dashboard').
 
 /**
- * The 422 error. The code leads the text because the REST routes and
- * lokal_cart_add_item pass on only `error` and the status.
+ * The 422 error (NO / EN). The code leads the text because the REST routes
+ * and lokal_cart_add_item pass on only `error` and the status.
  */
-export const CATEGORY_LABEL_CART_ERROR = "category_label: kategorinavn, ikke et produkt — spør produsenten";
+export const CATEGORY_LABEL_CART_ERROR =
+  "category_label: kategorinavn, ikke et produkt — spør produsenten. / A category name, not a product — ask the producer.";
 
 function isCategoryLabelRow(row: { name: string; price_nok: number | null; availability_source: string | null }): boolean {
   return isCategoryLabel({ name: row.name, hasPrice: row.price_nok != null, availabilitySource: row.availability_source });
