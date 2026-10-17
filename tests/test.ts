@@ -36081,6 +36081,40 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental seo I-Q: unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1): /sok
+  //    noindex and out of the sitemap, hero chips to /sted, ItemList = cards,
+  //    paging with every page linked, canonical per page, /spesialitet paged ──
+  console.log("\n── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1): dental indexing hygiene ──");
+  try {
+    const { runDentalIndexingHygieneTests } = require("../src/routes/dental-indexing-hygiene.test") as
+      typeof import("../src/routes/dental-indexing-hygiene.test");
+    const dih = await runDentalIndexingHygieneTests({ log: false });
+    passed += dih.passed;
+    failed += dih.failed;
+    for (const f of dih.failures) failures.push("dental indexing hygiene (F1-S1): " + f);
+    console.log(`  dental indexing hygiene (F1-S1): ${dih.passed} passed, ${dih.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental indexing hygiene (F1-S1): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S2): sitemap
+  //    <lastmod> for /sted, /fylke, /spesialitet and / from the clinics they
+  //    list, static pages from their text date, never the build day ──
+  console.log("\n── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S2): dental aggregate lastmod ──");
+  try {
+    const { runDentalAggregateLastmodTests } = require("../src/services/dental-aggregate-lastmod.test") as
+      typeof import("../src/services/dental-aggregate-lastmod.test");
+    const dal = await runDentalAggregateLastmodTests({ log: false });
+    passed += dal.passed;
+    failed += dal.failed;
+    for (const f of dal.failures) failures.push("dental aggregate lastmod (F1-S2): " + f);
+    console.log(`  dental aggregate lastmod (F1-S2): ${dal.passed} passed, ${dal.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental aggregate lastmod (F1-S2): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
