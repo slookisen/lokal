@@ -21,6 +21,9 @@
  *   kept within each group.
  * AI2-08 (P3): «… Liamyrane 6<br />5132 Nyborg» reached MCP text; HTML tags
  *   in descriptions are now removed or become line breaks.
+ * Slice I-S has since left the labels out of the «🛒 …» summary
+ *   (rfb-kategorietiketter-ikke-tilbud.test.ts); the goldens below drop
+ *   main's 🛒 lines of label-only producers for that.
  *
  * Same duck-typed-server harness as mcp-lokal-info-and-category-labels.test.ts
  * against the real production schema in an in-memory DB. The frozen MCP
@@ -187,6 +190,17 @@ interface MainTexts {
   egg: string;
 }
 
+// Slice I-S (F5): the «🛒 …» lines main gives the producers with only category
+// labels; the summary shows no labels now, so these producers have none.
+const MAIN_LABEL_ONLY_SUMMARIES = [
+  "   🛒 Grønnsaker, Honning, Frukt\n", "   🛒 Kjøtt, Meieri, Grønnsaker, Bakervarer, Honning +3 flere\n",
+  "   🛒 Kjøtt, Grønnsaker, Frukt, Bakervarer, Egg +2 flere\n", "   🛒 Kjøtt, Grønnsaker\n", "   🛒 Bakervarer, Egg\n",
+];
+/** Main's text without the 🛒 lines of producers with only category labels (I-S). */
+function withoutLabelOnlySummaries(text: string): string {
+  return MAIN_LABEL_ONLY_SUMMARIES.reduce((t, line) => t.split(line).join(""), text);
+}
+
 /** The result blocks of a search text by producer name, without their number («**3. Navn**» → «**Navn**»). */
 function resultBlocks(text: string): Map<string, string> {
   const blocks = new Map<string, string>();
@@ -346,18 +360,18 @@ export async function runMcpProductLabelsAndOrderTests(opts: { log?: boolean } =
       "byte-like: lokal_info for a producer without labels or HTML is main's text");
     assertEq(textOf(await info.handler({ agentId: BONES })), main.infoBones,
       "byte-like: lokal_info for a producer with eleven real products and catalog ids is main's text");
-    assertEq(textOf(await discoverTool.handler({ categories: ["honey"], lat: 63.4305, lng: 10.3951, limit: 10 })), main.discoverHoney,
-      "byte-like: lokal_discover (no search terms; summaries with labels unchanged) is main's text");
-    assertEq(textOf(await search.handler({ query: "", lat: 63.4305, lng: 10.3951, radius_km: 20, limit: 10 })), main.nearTrondheim,
-      "byte-like: a lokal_search without product terms or category words is main's text");
+    assertEq(textOf(await discoverTool.handler({ categories: ["honey"], lat: 63.4305, lng: 10.3951, limit: 10 })), withoutLabelOnlySummaries(main.discoverHoney),
+      "byte-like: lokal_discover (no search terms) is main's text, without the 🛒 lines of label-only producers (I-S)");
+    assertEq(textOf(await search.handler({ query: "", lat: 63.4305, lng: 10.3951, radius_km: 20, limit: 10 })), withoutLabelOnlySummaries(main.nearTrondheim),
+      "byte-like: a lokal_search without product terms or category words is main's text, without the 🛒 lines of label-only producers (I-S)");
     {
       // The two searches I-N changes: every result block is main's, apart from
       // the order and what I-N adds (labels, the summary of a listed match).
       const honning = resultBlocks(textOf(await search.handler({ query: "honning nær Trondheim", limit: 5 })));
       const mainHonning = resultBlocks(main.honning);
       assertEq([...honning.keys()].sort(), [...mainHonning.keys()].sort(), "byte-like: «honning nær Trondheim» has main's producers");
-      assertTrue([...mainHonning].every(([name, block]) => honning.get(name) === block),
-        "byte-like: «honning nær Trondheim» has main's result blocks (I-A labels included), only reordered");
+      assertTrue([...mainHonning].every(([name, block]) => honning.get(name) === withoutLabelOnlySummaries(block)),
+        "byte-like: «honning nær Trondheim» has main's result blocks (I-A labels included), only reordered, without label-only 🛒 lines (I-S)");
       const egg = resultBlocks(textOf(await search.handler({ query: "egg i Bergen", limit: 10 })));
       const mainEgg = resultBlocks(main.egg);
       assertEq([...egg.keys()].sort(), [...mainEgg.keys()].sort(), "byte-like: «egg i Bergen» has main's producers");
@@ -446,8 +460,8 @@ export async function runMcpProductLabelsAndOrderTests(opts: { log?: boolean } =
         `AI-3a: Bønes' eggs (7th product) lead its summary (got: ${(blockOf(t, "Bønes Gårdsmat Fixture").match(/🛒.*/) || [""])[0]})`);
       assertTrue(blockOf(t, "Hordaland Eggsalg Fixture").includes("   🛒 Egg (60 kr/brett)\n"),
         "AI-3a: a summary whose match is already shown is unchanged");
-      assertTrue(blockOf(t, "Reindyrka Fixture").includes("   🛒 Kjøtt, Grønnsaker, Frukt, Bakervarer, Egg +2 flere\n"),
-        "AI-3a: a category match's summary is unchanged");
+      assertTrue(!blockOf(t, "Reindyrka Fixture").includes("🛒") && blockOf(t, "Reindyrka Fixture").includes("_Bruk lokal_info med agentId"),
+        "AI-3a/I-S: a category match with only labels has no 🛒 line (I-S, F5), and keeps its lokal_info pointer");
 
       // AI-3b: explicit first, discover()'s order within each group.
       const order = await discoverOrder(query);

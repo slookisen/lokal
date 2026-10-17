@@ -423,6 +423,8 @@ export async function runMarketplaceCatalogOffersTests(opts: { log?: boolean } =
 if (require.main === module) {
   runMarketplaceCatalogOffersTests({ log: true }).then((r) => {
     console.log(`\nmarketplace-catalog-offers: ${r.passed} passed, ${r.failed} failed`);
-    if (r.failed > 0) process.exit(1);
+    // Explicit exit: findOffers' label rule (utils/category-label.ts, slice
+    // I-S) requires route modules, which leave background timers open.
+    process.exit(r.failed > 0 ? 1 : 0);
   });
 }
