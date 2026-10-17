@@ -24,6 +24,12 @@ import type { Lang } from "../i18n/t";
  * helpers below give the day labels, the compact text form and the "open
  * now" status from it, so the three surfaces agree. Pure: no DB, and the
  * clock is a parameter.
+ *
+ * Slice I-J (FUNN rfb-apningstider-to-uleste-former) adds the two stored
+ * forms I-H left unread, one producer each in live data: schema.org's
+ * OpeningHoursSpecification ({dayOfWeek, opens, closes, description,
+ * validFrom, validThrough}; Hovdneset Gård had no hours card) and
+ * {byAppointment: true, description} (Små Vesen). See storedFormFields().
  */
 
 /** A weekday as an index: Monday = 0 … Sunday = 6 (the Norwegian week). */
@@ -42,8 +48,16 @@ export interface OpeningHoursEntry {
   /** Opening and closing time as text ("10:00", or "10" for a number); both are set, or neither. */
   open?: string;
   close?: string;
-  /** The season the entry is limited to ("Mai–September"), as stored. */
+  /** The season the entry is limited to ("Mai–September"), as stored; for schema.org's form, its validity in Norwegian dates ("1.7.–31.10.2026"). */
   period?: string;
+  /**
+   * The first and last day of the period as ISO dates ("2026-07-01"), for
+   * JSON-LD's validFrom/validThrough: set only for schema.org's form, when
+   * both are days in the calendar and the first is not after the last. Both
+   * are set, or neither.
+   */
+  validFrom?: string;
+  validThrough?: string;
   /** A note ("Kun i sesong"), "Stengt" for a closed day, other text in an hours field, or the whole text of a text entry. */
   note?: string;
 }
@@ -221,6 +235,95 @@ function entryDays(value: unknown): { days: Weekday[]; label: string } {
   return { days: [], label: "" };
 }
 
+// ─── schema.org's form and the byAppointment form (slice I-J) ─────────
+
+/**
+ * The note of an entry with byAppointment: true. Norwegian, like "Stengt":
+ * notes are shown as stored in every page language.
+ */
+const BY_APPOINTMENT_NOTE = "Etter avtale";
+
+/** Text that says so already ("Åpent etter avtale — ring først"), so "Etter avtale" is not said twice. */
+const SAYS_BY_APPOINTMENT = /etter avtale|by appointment/i;
+
+/** A day as schema.org's DayOfWeek URI: "https://schema.org/Friday" (or http) is "Friday". */
+const SCHEMA_ORG_URI = /^https?:\/\/schema\.org\//i;
+
+/** dayOfWeek as day names, one or a list: a schema.org URI is its name; a value that is not text as it is. */
+function dayOfWeekNames(value: unknown): unknown {
+  const name = (v: unknown) => (typeof v === "string" ? v.trim().replace(SCHEMA_ORG_URI, "") : v);
+  return Array.isArray(value) ? value.map(name) : name(value);
+}
+
+/** An ISO date ("2026-07-01") that is a day in the calendar, as its parts; null for anything else ("2026-02-30", "juli"). */
+function isoDateParts(value: unknown): { iso: string; year: number; month: number; day: number } | null {
+  if (typeof value !== "string") return null;
+  const iso = value.trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return null;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const date = new Date(Date.UTC(year, month - 1, day));
+  const inCalendar = date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  return inCalendar ? { iso, year, month, day } : null;
+}
+
+/**
+ * validFrom/validThrough as the entry's period in Norwegian dates:
+ * "1.7.–31.10.2026" within one year, "1.11.2026–31.3.2027" across a new
+ * year, "1.7.2026" for one day, "fra 1.7.2026" or "til 31.10.2026" for one
+ * end. A value that is not an ISO date is shown as written ("juli–oktober"),
+ * and so are dates out of order. validFrom/validThrough are the two ISO
+ * dates, set only when both are dates and in order: JSON-LD states no other
+ * case (see seo.ts).
+ */
+function validityPeriod(from: unknown, through: unknown): { text: string; validFrom?: string; validThrough?: string } {
+  const a = isoDateParts(from);
+  const b = isoDateParts(through);
+  const date = (p: { year: number; month: number; day: number }, withYear = true) => `${p.day}.${p.month}.${withYear ? p.year : ""}`;
+  if (a && b && a.iso <= b.iso) {
+    const text = a.iso === b.iso ? date(a) : `${date(a, a.year !== b.year)}–${date(b)}`;
+    return { text, validFrom: a.iso, validThrough: b.iso };
+  }
+  const asWritten = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const fromText = a ? date(a) : asWritten(from);
+  const throughText = b ? date(b) : asWritten(through);
+  if (fromText && throughText) return { text: `${fromText}–${throughText}` };
+  if (fromText) return { text: `fra ${fromText}` };
+  return { text: throughText ? `til ${throughText}` : "" };
+}
+
+/**
+ * An entry in one of the two stored forms that have keys of their own, in
+ * the keys normalizeEntry reads; any other entry as it is. Their keys are
+ * read only in their form, so every form read before I-J reads exactly as
+ * before.
+ * - schema.org's OpeningHoursSpecification, an entry with dayOfWeek
+ *   (Hovdneset Gård, live 2026-10-17: {dayOfWeek: "Friday", opens: "12:00",
+ *   closes: "17:00", description: "Grønnsakstor på Rena torg – …",
+ *   validFrom: "2026-07-01", validThrough: "2026-10-31"}): dayOfWeek (a name
+ *   or a URI, or a list of them) is the days, opens/closes the times,
+ *   description the note and validFrom/validThrough the period.
+ * - byAppointment: true (Små Vesen: {description: "Utsalet i bryggeriet er
+ *   ope på førespurnad – …", byAppointment: true}): the note "Etter avtale"
+ *   and the description, shown as {day: "by-appointment", note} is (the text,
+ *   no day). "Etter avtale" is left out when the text says so already. Only
+ *   the JSON value true counts.
+ */
+function storedFormFields(h: Record<string, unknown>): { fields: Record<string, unknown>; validFrom?: string; validThrough?: string } {
+  let fields = h;
+  let validity: ReturnType<typeof validityPeriod> = { text: "" };
+  if (field(h, "dayOfWeek") !== undefined) {
+    validity = validityPeriod(h.validFrom, h.validThrough);
+    fields = { days: dayOfWeekNames(h.dayOfWeek), open: h.opens, close: h.closes, note: h.description, period: validity.text };
+  }
+  if (h.byAppointment === true) {
+    const texts = [h.description, fields.note].filter((t): t is string => typeof t === "string" && !!t.trim()).map((t) => t.trim());
+    const text = [...new Set(texts)].join("; ");
+    fields = { ...fields, note: SAYS_BY_APPOINTMENT.test(text) ? text : [BY_APPOINTMENT_NOTE, text].filter(Boolean).join("; ") };
+  }
+  return { fields, validFrom: validity.validFrom, validThrough: validity.validThrough };
+}
+
 /** One entry in the fixed shape, or null when it says nothing usable. */
 function normalizeEntry(item: unknown): OpeningHoursEntry | null {
   if (typeof item === "string") {
@@ -228,7 +331,7 @@ function normalizeEntry(item: unknown): OpeningHoursEntry | null {
     return text ? { days: [], label: "", note: text } : null;
   }
   if (!item || typeof item !== "object" || Array.isArray(item)) return null;
-  const h = item as Record<string, unknown>;
+  const { fields: h, validFrom, validThrough } = storedFormFields(item as Record<string, unknown>);
   const { days, label } = entryDays(field(h, "day", "days"));
   const notes: string[] = [];
   let open = timeText(field(h, "open", "from"));
@@ -263,6 +366,7 @@ function normalizeEntry(item: unknown): OpeningHoursEntry | null {
   const entry: OpeningHoursEntry = { days, label };
   if (open) { entry.open = open; entry.close = close; }
   if (period) entry.period = period;
+  if (validFrom && validThrough) { entry.validFrom = validFrom; entry.validThrough = validThrough; }
   if (notes.length) entry.note = [...new Set(notes)].join("; ");
   return entry;
 }

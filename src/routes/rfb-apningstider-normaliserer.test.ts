@@ -30,6 +30,16 @@
  *   (d) GET /agents/:id/agent.json is seed-store only (see a2a.ts): no
  *       non-test source file links it, so no discovery surface points at a
  *       route that answers 404 for marketplace producers.
+ *   (e) slice I-J (FUNN rfb-apningstider-to-uleste-former), producers
+ *       added to the fixture above: Hovdneset Gård (schema.org's form) shows
+ *       "Fredag 12:00 – 17:00" with its period and note and has JSON-LD with
+ *       validFrom/validThrough; Små Vesen ({byAppointment: true,
+ *       description}) shows "Etter avtale" and its description (main: no
+ *       hours card for either); URIs, lists, a period with one end and a
+ *       DayOfWeek that is no weekday; every page's JSON-LD has only the
+ *       seven weekdays and validity only as two ISO dates in order; the
+ *       "today" highlight skips entries with a period. Their lokal_info and
+ *       auto-reply lines are in (c).
  *
  * Exported runRfbApningstiderNormalisererTests({log}) -> TestSummary; wired
  * into tests/test.ts. Standalone: npx tsx src/routes/rfb-apningstider-normaliserer.test.ts
@@ -205,6 +215,24 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
         { day: "sun", open: "closed", close: "closed" }, { day: "Tirsdag", hours: "12.00 – 18.00" },
         { day: "sat", open: 10, close: 17 }, { day: "fri", open: "9:00", close: "17:30" }, { day: "thu", open: "18:00", close: "01:30" },
       ] },
+      // I-J: schema.org's form, the stored value of Hovdneset Gård (4e2afba3-…, live 2026-10-17).
+      hovdneset: { id: "ij-hovdneset", name: "Hovdneset Gård — Rena", slug: "hovdneset-gard-rena", hours: [
+        { dayOfWeek: "Friday", opens: "12:00", closes: "17:00", description: "Grønnsakstor på Rena torg – sesongutsalg, juli–oktober", validFrom: "2026-07-01", validThrough: "2026-10-31" },
+      ] },
+      // I-J: {byAppointment: true, description}, the stored value of Små Vesen (5045eaa7-…, live 2026-10-17).
+      smaVesen: { id: "ij-smavesen", name: "Små Vesen", slug: "sma-vesen", hours: [
+        { description: "Utsalet i bryggeriet er ope på førespurnad – ring 476 82 708. Elles når det er annonsert på Facebook. Sjølvbetening frå kjøleskåp utanfor døra (alkoholfri drikke og ølglas), betal med Vipps.", byAppointment: true },
+      ] },
+      // I-J: schema.org's form with URIs, a list, validity across a new year,
+      // a period with one end and a DayOfWeek that is no weekday, beside the
+      // declared form.
+      schema: { id: "ij-schema", name: "Siri Skjema", slug: "siri-skjema", hours: [
+        { dayOfWeek: ["https://schema.org/Saturday", "https://schema.org/Sunday"], opens: "10:00", closes: "15:00" },
+        { dayOfWeek: "http://schema.org/Monday", opens: "9", closes: "14.30", description: "Vintertid", validFrom: "2026-11-01", validThrough: "2027-03-31" },
+        { dayOfWeek: "Wednesday", opens: "10:00", closes: "14:00", validFrom: "2026-07-01" },
+        { dayOfWeek: "https://schema.org/PublicHolidays", opens: "12:00", closes: "15:00" },
+        { day: "thu", open: "10:00", close: "17:00" },
+      ] },
     };
     seedProducer({ ...P.hours, city: "Oslo", geo: [59.91, 10.75] });
     seedProducer({ ...P.fromTo, city: "Tysnes", geo: [59.99, 5.5] });
@@ -212,6 +240,9 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
     seedProducer({ ...P.period, city: "Balestrand", geo: [61.2, 6.53] });
     seedProducer({ ...P.range, city: "Moss", geo: [59.43, 10.66] });
     seedProducer({ ...P.closed, city: "Bergen", geo: [60.39, 5.32] });
+    seedProducer({ ...P.hovdneset, city: "Rena", geo: [61.13, 11.37] });
+    seedProducer({ ...P.smaVesen, city: "Aurdal", geo: [60.93, 9.4] });
+    seedProducer({ ...P.schema, city: "Lillehammer", geo: [61.11, 10.47] });
     // Front page: the three claimed producers with the highest trust get the ultra-rich card.
     const allWeek = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
     seedProducer({ id: "ih-c-long", name: "Kari Langnavn", city: "Ctown", geo: [60.0, 10.0], claimed: true, trust: 0.99,
@@ -404,6 +435,10 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
         "per-periode": "Tor–Fre 12:00–16:00 (April), Man–Fre 08:00–18:00",
         "rita-rekkevidde": "Man–Søn 00:00–24:00",
         "stine-stengt": "Søn: Stengt, Tir 12.00–18.00, Lør 10–17, Fre 9:00–17:30, Tor 18:00–01:30",
+        // I-J (main: no hours line for either).
+        "hovdneset-gard-rena": "Fre 12:00–17:00 (1.7.–31.10.2026)",
+        "sma-vesen": "Etter avtale; Utsalet i bryggeriet er ope på førespurnad – ring 476 82 708. Elles når det er annonsert på Facebook. Sjølvbetening frå kjøleskåp utanfor døra (alkoholfri drikke og ølglas), betal med Vipps.",
+        "siri-skjema": "Lør–Søn 10:00–15:00, Man 9–14.30 (1.11.2026–31.3.2027), Ons 10:00–14:00 (fra 1.7.2026), PublicHolidays 12:00–15:00, Tor 10:00–17:00",
       };
       for (const p of Object.values(P)) {
         console.log = () => {};
@@ -441,6 +476,64 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
       const a2a = fs.readFileSync(path.join(root, "routes", "a2a.ts"), "utf8");
       assertTrue(a2a.includes('router.get("/agents/:id/agent.json"'), "d the route itself is still registered (behaviour unchanged)");
     }
+
+    // ══ (e) I-J: schema.org's form and the byAppointment form ════════════
+    {
+      const spec = (body: string) => jsonLdBlocks(body).find((b) => b["@type"] === "LocalBusiness")?.openingHoursSpecification ?? null;
+      const hov = pages["hovdneset-gard-rena"]!;
+      assertEq(withoutToday(hoursGrid(hov.no) ?? ""),
+        "<div class=\"hrs-day\">Fredag</div><div class=\"hrs-time\">12:00 – 17:00 (1.7.–31.10.2026; Grønnsakstor på Rena torg – sesongutsalg, juli–oktober)</div>",
+        "e Hovdneset Gård: \"Fredag 12:00 – 17:00\" with the period and the note (main: no hours card)");
+      assertEq(withoutToday(hoursGrid(hov.en) ?? ""),
+        "<div class=\"hrs-day\">Friday</div><div class=\"hrs-time\">12:00 – 17:00 (1.7.–31.10.2026; Grønnsakstor på Rena torg – sesongutsalg, juli–oktober)</div>",
+        "e Hovdneset Gård /en: \"Friday\"");
+      assertEq(spec(hov.no), [{
+        "@type": "OpeningHoursSpecification", dayOfWeek: "https://schema.org/Friday", opens: "12:00", closes: "17:00",
+        validFrom: "2026-07-01", validThrough: "2026-10-31",
+      }], "e Hovdneset Gård: JSON-LD states Friday 12:00–17:00 with its validFrom/validThrough (main: none)");
+      const sma = pages["sma-vesen"]!;
+      assertEq(hoursGrid(sma.no),
+        "<div class=\"hrs-day\"></div><div class=\"hrs-time\">Etter avtale; Utsalet i bryggeriet er ope på førespurnad – ring 476 82 708. " +
+        "Elles når det er annonsert på Facebook. Sjølvbetening frå kjøleskåp utanfor døra (alkoholfri drikke og ølglas), betal med Vipps.</div>",
+        "e Små Vesen: \"Etter avtale\" and the description, as {day: by-appointment, note} is shown (main: no hours card)");
+      assertEq(spec(sma.no), null, "e Små Vesen: no JSON-LD hours (no day, no times)");
+      const sch = pages["siri-skjema"]!;
+      assertEq(withoutToday(hoursGrid(sch.no) ?? ""),
+        "<div class=\"hrs-day\">Lørdag–Søndag</div><div class=\"hrs-time\">10:00 – 15:00</div>" +
+        "<div class=\"hrs-day\">Mandag</div><div class=\"hrs-time\">9 – 14.30 (1.11.2026–31.3.2027; Vintertid)</div>" +
+        "<div class=\"hrs-day\">Onsdag</div><div class=\"hrs-time\">10:00 – 14:00 (fra 1.7.2026)</div>" +
+        "<div class=\"hrs-day\">PublicHolidays</div><div class=\"hrs-time\">12:00 – 15:00</div>" +
+        "<div class=\"hrs-day\">Torsdag</div><div class=\"hrs-time\">10:00 – 17:00</div>",
+        "e schema.org's form: URIs and a list are days; validity across a new year and with one end; a DayOfWeek that is no weekday as written; the declared form as before");
+      const sp = (dayOfWeek: string | string[], opens: string, closes: string, validity: object = {}) =>
+        ({ "@type": "OpeningHoursSpecification", dayOfWeek, opens, closes, ...validity });
+      assertEq(spec(sch.no), [
+        sp(["https://schema.org/Saturday", "https://schema.org/Sunday"], "10:00", "15:00"),
+        sp("https://schema.org/Monday", "09:00", "14:30", { validFrom: "2026-11-01", validThrough: "2027-03-31" }),
+        sp("https://schema.org/Thursday", "10:00", "17:00"),
+      ], "e schema.org's form in JSON-LD: a list, times as \"HH:MM\", validity only as two ISO dates; a period with one end and PublicHolidays are left out");
+      // The "today" highlight skips an entry that holds only in a period, as I-H.
+      const at = (slug: string, iso: string) => todayRows(hoursGrid(atClock(iso, () => producer(slug)).body) ?? "");
+      assertEq(at("hovdneset-gard-rena", "2026-07-03T11:00:00Z"), [], "e today: Hovdneset on a Friday in its season is not highlighted (an entry with a period may not hold today)");
+      assertEq(at("siri-skjema", "2026-10-17T10:00:00Z"), ["Lørdag–Søndag"], "e today: Saturday highlights the year-round Saturday–Sunday entry");
+      assertEq([at("siri-skjema", "2026-11-02T10:00:00Z"), at("siri-skjema", "2026-10-14T10:00:00Z")], [[], []],
+        "e today: Monday's and Wednesday's entries hold only in a period and are not highlighted");
+      // Every page of the fixture: only the seven weekdays, validity only as two ISO dates in order.
+      const weekdays = new Set(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map((d) => `https://schema.org/${d}`));
+      const bad: string[] = [];
+      for (const [slug, page] of Object.entries(pages)) {
+        for (const lang of ["no", "en"] as const) {
+          for (const s of (spec(page[lang]) ?? []) as any[]) {
+            const days = Array.isArray(s.dayOfWeek) ? s.dayOfWeek : [s.dayOfWeek];
+            if (!days.length || !days.every((d: unknown) => weekdays.has(String(d)))) bad.push(`${slug} ${lang}: dayOfWeek ${JSON.stringify(s.dayOfWeek)}`);
+            const iso = (v: unknown) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+            const hasValidity = "validFrom" in s || "validThrough" in s;
+            if (hasValidity && !(iso(s.validFrom) && iso(s.validThrough) && s.validFrom <= s.validThrough)) bad.push(`${slug} ${lang}: validity ${s.validFrom}–${s.validThrough}`);
+          }
+        }
+      }
+      assertEq(bad, [], "e every page: JSON-LD dayOfWeek is one of the seven weekdays, and validity is two ISO dates in order");
+    }
   } finally {
     console.log = origLog;
     console.error = origError;
@@ -457,7 +550,7 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
 
 // Standalone runner: `npx tsx src/routes/rfb-apningstider-normaliserer.test.ts`
 if (require.main === module) {
-  console.log("── rfb-apningstider-normaliserer (I-H: one reading of opening hours) ──");
+  console.log("── rfb-apningstider-normaliserer (I-H, I-J: one reading of opening hours) ──");
   runRfbApningstiderNormalisererTests({ log: true }).then((r) => {
     console.log(`\nrfb-apningstider-normaliserer: ${r.passed} passed, ${r.failed} failed`);
     if (r.failed > 0) {
