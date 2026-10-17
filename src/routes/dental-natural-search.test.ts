@@ -134,6 +134,10 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
     const aas = add({ navn: "Ås Tannhelse", poststed: "ÅS", fylke: "Akershus", postnummer: "1430" });
     const total = 23;
     const bergenPoststed = 7;
+    // S3b: «Bergen» is also a kommune, so the place reads as poststed Bergen
+    // OR Bergen kommune's postnumre: + Bergen Tannhelse (Nesttun) and
+    // Helfotannlegen Bergen (Laksevåg).
+    const bergenKommune = bergenPoststed + 2;
 
     // ── M: MCP tannlege_search over a real server + client ───────────────
     const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js") as typeof import("@modelcontextprotocol/sdk/server/mcp.js");
@@ -152,8 +156,8 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
 
     {
       const r = await search({ query: "tannlege i Bergen" });
-      assertEq(r.count, bergenPoststed, "M1: «tannlege i Bergen» finds every clinic with poststed Bergen (both stored spellings; it used to find 0)");
-      assertEq(r.tolkning?.tolket_som, ["sted: Bergen (poststed)"], "M2: tolkning says what was used");
+      assertEq(r.count, bergenKommune, "M1: «tannlege i Bergen» finds every clinic with poststed Bergen (both stored spellings) or in Bergen kommune (it used to find 0)");
+      assertEq(r.tolkning?.tolket_som, ["sted: Bergen (poststed + kommune)"], "M2: tolkning says what was used");
       assertEq(r.tolkning?.fallback, false, "M3: no fallback");
       const bergen = await search({ query: "Bergen", limit: 25 });
       assertEq([bergen.count, names(bergen).sort()], [oldNames("Bergen").length, oldNames("Bergen").sort()], "M4: «Bergen» alone keeps every old whole-text hit (Bergen Tannhelse in Nesttun, Helfotannlegen Bergen in Laksevåg)");
@@ -283,10 +287,10 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
       {
         const now = ask("tannlege i Tromsø");
         assertTrue(now.ids.includes(tromsoNamed) && now.ids.includes(tromsoKjeve) && now.ids.length === 3, "U6: A2A «tannlege i Tromsø» still finds all it found (Troms, Harstad too)");
-        assertEq(now.metadata.tolkning.tolket_som, ["sted: Tromsø (poststed)"], "U6b: ... and tolkning says the text reads as Tromsø");
+        assertEq(now.metadata.tolkning.tolket_som, ["sted: Tromsø (poststed + kommune)"], "U6b: ... and tolkning says the text reads as Tromsø");
       }
       assertEq([old("tannlege i Ås").metadata.filter, old("tannlege i Ås").ids.length], [{}, 20], "U7: the old A2A parser had no filter for «tannlege i Ås» (two-letter words dropped): the first 20 clinics");
-      assertEq([ask("tannlege i Ås").ids, ask("tannlege i Ås").metadata.filter], [[aas], { poststed_in: ["ÅS"] }], "U7b: now the parsed place replaces that non-answer");
+      assertEq([ask("tannlege i Ås").ids, ask("tannlege i Ås").metadata.filter.poststed_or_postnummer?.poststed_in], [[aas], ["ÅS"]], "U7b: now the parsed place (poststed Ås or Ås kommune) replaces that non-answer");
     }
 
     // ── W: /sok ───────────────────────────────────────────────────────────
@@ -295,9 +299,9 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
       const r = await callRoute(seoRouter, "/sok", { q: "tannlege i Bergen" });
       assertEq(r.status, 200, "W1: /sok?q=tannlege+i+Bergen -> 200");
       assertTrue(!r.text.includes("Ingen klinikker funnet") && r.text.includes("Bergen Sentrum Tannlege"), "W2: shows clinic cards (it used to show «0 klinikker funnet»)");
-      assertTrue(r.text.includes(`${bergenPoststed} klinikker funnet`), "W3: the count line uses the parsed result");
-      assertTrue(r.text.includes("Tolket som: sted: Bergen (poststed)"), "W4: «Tolket som …» line");
-      assertEq(logged, [{ query: "tannlege i Bergen", resultCount: bergenPoststed }], "W5: logWebSearch still gets the raw q");
+      assertTrue(r.text.includes(`${bergenKommune} klinikker funnet`), "W3: the count line uses the parsed result");
+      assertTrue(r.text.includes("Tolket som: sted: Bergen (poststed + kommune)"), "W4: «Tolket som …» line");
+      assertEq(logged, [{ query: "tannlege i Bergen", resultCount: bergenKommune }], "W5: logWebSearch still gets the raw q");
       assertTrue(r.text.includes('value="tannlege i Bergen"'), "W6: the search box keeps the raw q");
     }
     {

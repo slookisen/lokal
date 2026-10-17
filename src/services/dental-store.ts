@@ -203,6 +203,9 @@ export const AffiliationSchema = z.object({
 });
 export type Affiliation = z.infer<typeof AffiliationSchema>;
 
+const PoststedInSchema = z.array(z.string().min(1).max(100)).min(1).max(20);
+const PostnummerInSchema = z.array(z.string().regex(/^\d{4}$/)).min(1).max(400);
+
 // The field filters; ListFilterSchema below adds `natural`, whose two
 // branches are field filters themselves.
 const ListFilterFieldsSchema = z.object({
@@ -224,10 +227,14 @@ const ListFilterFieldsSchema = z.object({
   //   poststed_in:   every stored spelling of one place ("BERGEN", "Bergen").
   //   postnummer_in: a kommune's postnumre (kommune that is not a poststed).
   //   fylke_in:      a re-split 2020 fylke ("Viken") and today's fylker in it.
+  //   poststed_or_postnummer (S3b): a poststed that is also a kommune
+  //                  ("Bergen"): a row matches one of the poststed's stored
+  //                  spellings OR one of the kommune's postnumre.
   name_terms: z.array(z.string().min(1).max(100)).min(1).max(6).optional(),
-  poststed_in: z.array(z.string().min(1).max(100)).min(1).max(20).optional(),
-  postnummer_in: z.array(z.string().regex(/^\d{4}$/)).min(1).max(400).optional(),
+  poststed_in: PoststedInSchema.optional(),
+  postnummer_in: PostnummerInSchema.optional(),
   fylke_in: z.array(z.string().min(1).max(100)).min(1).max(8).optional(),
+  poststed_or_postnummer: z.object({ poststed_in: PoststedInSchema, postnummer_in: PostnummerInSchema }).optional(),
 });
 type ListFilterFields = z.infer<typeof ListFilterFieldsSchema>;
 
@@ -682,6 +689,15 @@ function pushFieldClauses(
   }
   if (f.fylke_in) {
     pushEqualsAny(where, params, "fylke", `${p}fylkeIn`, f.fylke_in);
+  }
+  if (f.poststed_or_postnummer) {
+    // One place read two ways, OR-ed: the poststed's stored spellings or its
+    // kommune's postnumre. Bound parameters against the bare columns, as for
+    // poststed_in / postnummer_in above.
+    const either: string[] = [];
+    pushEqualsAny(either, params, "poststed", `${p}placePoststed`, f.poststed_or_postnummer.poststed_in);
+    pushEqualsAny(either, params, "postnummer", `${p}placePostnummer`, f.poststed_or_postnummer.postnummer_in);
+    where.push(`(${either.join(" OR ")})`);
   }
   if (f.name_terms) {
     f.name_terms.forEach((term, i) => {

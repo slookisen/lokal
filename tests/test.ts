@@ -36148,6 +36148,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     }
   }
 
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3b): a poststed
+  //    that is also a kommune («Bergen») covers the whole kommune ──
+  console.log("\n── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3b): poststed + kommune (finn-tannlege) ──");
+  try {
+    const { runDentalSearchKommuneUnionTests } = require("../src/routes/dental-search-kommune-union.test") as
+      typeof import("../src/routes/dental-search-kommune-union.test");
+    const dku = await runDentalSearchKommuneUnionTests({ log: false });
+    passed += dku.passed;
+    failed += dku.failed;
+    for (const f of dku.failures) failures.push("dental search kommune union: " + f);
+    console.log(`  dental search kommune union: ${dku.passed} passed, ${dku.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental search kommune union: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-10-06-dental-profil-url-og-sitemap-uten-orgnr (skive A): clinicProfileUrl ──");
   try {
     const { runDentalProfileUrlTests } = require("../src/routes/dental-profile-url.test") as

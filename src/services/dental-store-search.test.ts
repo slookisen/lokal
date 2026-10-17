@@ -386,6 +386,9 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
       ["combined", { specialty: "kjeveortopedi", poststed_in: ["BERGEN", "Bergen"], name_terms: ["klinikk"], helfo_agreement: "true" }],
       ["natural", { natural: { parsed: { poststed_in: ["BERGEN", "Bergen"] }, legacy: { q: "tannlege i bergen" } } }],
       ["natural, nothing parsed", { natural: { parsed: {}, legacy: { q: "tannlege" } } }],
+      // S3b: a poststed OR its kommune's postnumre (Bergen kommune has 144).
+      ["poststed_or_postnummer (144)", { poststed_or_postnummer: { poststed_in: ["BERGEN", "Bergen"], postnummer_in: Array.from({ length: 144 }, (_, i) => String(1000 + i)) } }],
+      ["natural, poststed_or_postnummer", { natural: { parsed: { poststed_or_postnummer: { poststed_in: ["BERGEN", "Bergen"], postnummer_in: Array.from({ length: 144 }, (_, i) => String(1000 + i)) } }, legacy: { q: "tannlege i bergen" } } }],
     ];
     assertEq(store.countPublicDentalAgents({}), 10_000, "T0: the timing fixture has 10,000 public rows");
     for (const [label, f] of perfFilters) {

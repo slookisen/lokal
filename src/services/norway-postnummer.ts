@@ -166,6 +166,25 @@ export function officialPoststedFylker(): ReadonlyMap<string, readonly string[]>
   return out;
 }
 
+let poststedKommuner: Map<string, string[]> | null = null;
+
+/**
+ * Each official poststed name (as Posten writes it, upper case) -> the
+ * kommunenumre its postnumre lie in. Computed once.
+ */
+export function officialPoststedKommuner(): ReadonlyMap<string, readonly string[]> {
+  if (poststedKommuner) return poststedKommuner;
+  const out = new Map<string, string[]>();
+  for (const r of load().byPostnummer.values()) {
+    if (!r.poststed) continue;
+    const list = out.get(r.poststed) ?? [];
+    if (!list.includes(r.kommunenummer)) list.push(r.kommunenummer);
+    out.set(r.poststed, list);
+  }
+  poststedKommuner = out;
+  return out;
+}
+
 /** The file's `meta` block (source, licence, fetched_at, kommune_basis). */
 export function postnummerDatasetMeta(): PostnummerDatasetMeta | null {
   return load().meta;
@@ -175,4 +194,5 @@ export function postnummerDatasetMeta(): PostnummerDatasetMeta | null {
 export function __setPostnummerRowsForTesting(rows: PostnummerRow[] | null): void {
   loaded = rows ? index(rows, null) : null;
   poststedFylker = null;
+  poststedKommuner = null;
 }
