@@ -125,7 +125,10 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
     const sandvika = add({ navn: "Sandvika Tann", poststed: "SANDVIKA", fylke: "Akershus", postnummer: "1337" });
     const stabekk = add({ navn: "Stabekk Tann", poststed: "Baerum", fylke: "Akershus", postnummer: "1368" });
     add({ navn: "Lillestrøm Tann", poststed: "LILLESTRØM", fylke: "Akershus", postnummer: "2000" });
-    add({ navn: "Stavanger Akuttvakt", poststed: "STAVANGER", fylke: "Rogaland", postnummer: "4006" }, { acute_vakt: 1 });
+    // A sourced emergency duty: since S2b a public akutt search lists only
+    // clinics whose card shows the akutt claim (dental-acute-filter.test.ts).
+    add({ navn: "Stavanger Akuttvakt", poststed: "STAVANGER", fylke: "Rogaland", postnummer: "4006" },
+      { acute_vakt: 1, field_provenance: JSON.stringify({ acute_vakt: [{ source_type: "homepage", value: 1 }] }) });
     add({ navn: "Trondheim Regulering", poststed: "TRONDHEIM", fylke: "Trøndelag", postnummer: "7010" }, kjeveTitle("Kjeveortoped"));
     const tromsoNamed = add({ navn: "Tannregulering Tromsø", poststed: "TROMSØ", fylke: "Troms", postnummer: "9008" });
     const tromsoKjeve = add({ navn: "Tromsø Kjeveortopedi", poststed: "TROMSØ", fylke: "Troms", postnummer: "9010", available_specialties: ["kjeveortopedi"] });

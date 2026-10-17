@@ -41,6 +41,9 @@ import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
 import { normaliseFylke } from "./norway-fylke";
 import { escapeLike } from "./search-intent/norwegian-query";
 import { findSearchSpecialty } from "../config/dental-search-vocabulary";
+// dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
+// the akutt filter is the claim the card shows, not the raw acute_vakt flag.
+import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -216,7 +219,7 @@ const ListFilterFieldsSchema = z.object({
   // PR-109 additive fields (also implements pending PR-105 spec)
   q: z.string().optional(),                                       // free-text: name OR poststed LIKE
   helfo_agreement: z.enum(["true", "false", "unknown"]).optional(),
-  acute_vakt: z.union([z.literal(0), z.literal(1)]).optional(),
+  acute_vakt: z.union([z.literal(0), z.literal(1)]).optional(),  // public lists/counts: 1 = the akutt claim (S2b)
   // PR-120: thin_site added as a valid enrichment_state filter value.
   enrichment_state: z.enum(["raw", "enriched", "thin_site"]).optional(),
   // PR-116: bysidesfilter
@@ -570,8 +573,9 @@ function pushFreeTextClause(
 // they had drifted: countDentalAgents never applied `poststed`. All four now
 // build their WHERE here.
 //   publicOnly        visitor-facing surfaces: no rejected or closed clinics,
-//                     no proven non-clinic (DENTAL_CLINIC_CLASS_SQL), and a
-//                     verification_status filter of 'rejected' is ignored.
+//                     no proven non-clinic (DENTAL_CLINIC_CLASS_SQL), a
+//                     verification_status filter of 'rejected' is ignored,
+//                     and acute_vakt 1 means the akutt claim (S2b, below).
 //   excludeParked     GET /agents?exclude_parked=1 (enrichment candidates).
 //   excludeNonClinic  GET /discover's opt-in catalog_class filter.
 // The synthetic probe row is skipped for every caller.
@@ -667,7 +671,15 @@ function pushFieldClauses(
     where.push(`helfo_agreement = @${p}helfo_agreement`);
     params[`${p}helfo_agreement`] = f.helfo_agreement;
   }
-  if (f.acute_vakt !== undefined) {
+  if (f.acute_vakt === 1 && opts.publicOnly) {
+    // S2b: a visitor-facing akutt filter lists the clinics whose card shows
+    // «Akuttvakt» (sourced) or «Tar imot akuttpasienter», never the bare
+    // flag. Read here, so every way a public search asks for akutt (MCP
+    // tannlege_akutt and `akutt`, /sok?akutt=1, the query parser, A2A's
+    // keyword reading and message.data) gets it. GET /agents (admin,
+    // enrichment) keeps the raw column, as does acute_vakt 0.
+    where.push(DENTAL_ACUTE_CLAIM_SQL);
+  } else if (f.acute_vakt !== undefined) {
     where.push(`acute_vakt = @${p}acute_vakt`);
     params[`${p}acute_vakt`] = f.acute_vakt;
   }
@@ -1841,31 +1853,85 @@ export function listSpecialistsForClinic(
   }));
 }
 
-export function listChains(): Array<{
-  id: string;
+/** A chain read from the clinics' chain_brand is listed from this many public clinics. */
+export const DENTAL_CHAIN_MIN_LOCATIONS = 2;
+
+export interface DentalChain {
+  /** The dental_chains row's id; null for a chain read from chain_brand alone. */
+  id: string | null;
   chain_brand: string;
   parent_orgnr: string | null;
   website: string | null;
   num_locations_advertised: number | null;
   tier: string | null;
   confidence: string | null;
-}> {
+  /** Public clinics (DENTAL_HONEST_BASE_SQL) whose chain_brand is this name, trimmed and case-folded. */
+  antall_lokasjoner_i_db: number;
+}
+
+/**
+ * The dental chains for MCP tannlege_kjeder and GET /api/tannlege/chains (A2A
+ * dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort, S6). The
+ * curated dental_chains table is empty in production while the clinics carry
+ * their chain in dental_agents.chain_brand, so the list is the dental_chains
+ * rows merged with one GROUP BY chain_brand over the honest public set (the
+ * rows getDentalStats counts). Names are compared trimmed and case-folded, for
+ * display only (no data is written); a merged name is shown in the spelling
+ * most of its clinics use. A chain read from chain_brand is listed from
+ * DENTAL_CHAIN_MIN_LOCATIONS clinics; a dental_chains row is listed with its
+ * own fields and its count, whatever that is. Two statements whatever the
+ * number of chains (the MCP handler counted each chain with its own query).
+ * Largest first, then by name.
+ */
+export function listChains(): DentalChain[] {
   const db = getDb("dental");
-  const rows = db
-    .prepare(
-      "SELECT id, chain_brand, parent_orgnr, website, num_locations_advertised, tier, confidence FROM dental_chains ORDER BY chain_brand ASC"
-    )
+  const curated = db
+    .prepare("SELECT id, chain_brand, parent_orgnr, website, num_locations_advertised, tier, confidence FROM dental_chains")
     .all() as Array<Record<string, unknown>>;
-  return rows.map((r) => ({
-    id: r.id as string,
-    chain_brand: r.chain_brand as string,
-    parent_orgnr: (r.parent_orgnr as string | null) ?? null,
-    website: (r.website as string | null) ?? null,
-    num_locations_advertised:
-      (r.num_locations_advertised as number | null) ?? null,
-    tier: (r.tier as string | null) ?? null,
-    confidence: (r.confidence as string | null) ?? null,
-  }));
+  const spellings = db
+    .prepare(`SELECT chain_brand, COUNT(*) AS n ${DENTAL_HONEST_BASE_SQL} AND chain_brand IS NOT NULL GROUP BY chain_brand`)
+    .all() as Array<{ chain_brand: string; n: number }>;
+
+  // Folded name -> clinics per trimmed spelling.
+  const byName = new Map<string, Map<string, number>>();
+  for (const { chain_brand, n } of spellings) {
+    const name = chain_brand.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    const counts = byName.get(key) ?? new Map<string, number>();
+    counts.set(name, (counts.get(name) ?? 0) + n);
+    byName.set(key, counts);
+  }
+  const total = (counts: Map<string, number> | undefined) => [...(counts?.values() ?? [])].reduce((a, b) => a + b, 0);
+  // The most used spelling; a tie goes to the first in code-point order, so the name is stable.
+  const shown = (counts: Map<string, number>) =>
+    [...counts].sort(([a, na], [b, nb]) => nb - na || (a < b ? -1 : a > b ? 1 : 0))[0][0];
+
+  const chains: DentalChain[] = curated.map((r) => {
+    const name = String(r.chain_brand).trim();
+    const key = name.toLowerCase();
+    const n = total(byName.get(key));
+    byName.delete(key);
+    return {
+      id: r.id as string,
+      chain_brand: name,
+      parent_orgnr: (r.parent_orgnr as string | null) ?? null,
+      website: (r.website as string | null) ?? null,
+      num_locations_advertised: (r.num_locations_advertised as number | null) ?? null,
+      tier: (r.tier as string | null) ?? null,
+      confidence: (r.confidence as string | null) ?? null,
+      antall_lokasjoner_i_db: n,
+    };
+  });
+  for (const counts of byName.values()) {
+    const n = total(counts);
+    if (n < DENTAL_CHAIN_MIN_LOCATIONS) continue;
+    chains.push({
+      id: null, chain_brand: shown(counts), parent_orgnr: null, website: null,
+      num_locations_advertised: null, tier: null, confidence: null, antall_lokasjoner_i_db: n,
+    });
+  }
+  return chains.sort((a, b) => b.antall_lokasjoner_i_db - a.antall_lokasjoner_i_db || a.chain_brand.localeCompare(b.chain_brand, "nb"));
 }
 
 // Allow-list of PUT-writable dental_agents fields — never id or vertical.

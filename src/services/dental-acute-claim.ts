@@ -7,7 +7,8 @@
  * Provenance rule: `field_provenance.acute_vakt` exists and is either a
  * non-empty array of sources (enrichment/mergeFieldProvenance shape) or an
  * object with a non-empty `sources` array (stage_v_correction shape).
- * Pure functions, no DB access, no data changes.
+ * Pure functions plus their SQL twin (DENTAL_ACUTE_CLAIM_SQL), no DB access,
+ * no data changes.
  */
 
 export type AcuteClaim = "vakt" | "accepts" | null;
@@ -42,3 +43,28 @@ export function resolveAcuteClaim(a: AcuteClaimInput): AcuteClaim {
   if (patientFocusMentionsAkutt(a.patient_focus)) return "accepts";
   return null;
 }
+
+/**
+ * SQL twin of `resolveAcuteClaim(row) !== null` on the dental_agents columns
+ * (dev-request 2026-10-16-tannlege-sok-naturlig-sprak, S2b): the public akutt
+ * filter, so a clinic is listed under akutt only when its card shows
+ * «Akuttvakt» or «Tar imot akuttpasienter». KEEP IN SYNC with the three
+ * functions above; dental-acute-filter.test.ts checks that both pick the same
+ * rows. Each step mirrors a JS check: the column is JSON that JSON.parse
+ * reads (json_valid), the provenance entry is a non-empty array or an object
+ * with a non-empty `sources` array (json_array_length is 0 for any other
+ * value), and patient_focus is an array (json_each would also walk an object
+ * or a lone string) with a string element containing «akutt» in any case
+ * (LIKE folds ASCII case, as /akutt/i does). CASE keeps json_valid ahead of
+ * the other JSON functions, which throw on malformed JSON, and reads the
+ * provenance only when acute_vakt = 1.
+ */
+export const DENTAL_ACUTE_CLAIM_SQL =
+  "(CASE" +
+  " WHEN acute_vakt = 1 AND json_valid(field_provenance) AND (" +
+  "json_array_length(field_provenance, '$.acute_vakt') > 0 OR json_array_length(field_provenance, '$.acute_vakt.sources') > 0" +
+  ") THEN 1" +
+  " WHEN json_valid(patient_focus) AND json_type(patient_focus) = 'array' AND EXISTS (" +
+  "SELECT 1 FROM json_each(patient_focus) WHERE json_each.type = 'text' AND json_each.value LIKE '%akutt%'" +
+  ") THEN 1" +
+  " ELSE 0 END) = 1";

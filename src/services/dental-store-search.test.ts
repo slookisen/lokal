@@ -5,7 +5,8 @@
  * against an in-memory fixture:
  *   R   regression: for every filter field that existed before, list ids/order
  *       and counts equal a verbatim copy of the old per-function WHERE code
- *       (LEGACY_* below); GET /api/tannlege/agents?limit=200 returns the same
+ *       (LEGACY_* below; a public acute_vakt 1 is the akutt claim since S2b,
+ *       see dental-acute-filter.test.ts); GET /api/tannlege/agents?limit=200 returns the same
  *       rows, in the same order, with the same JSON.
  *   N   name_terms (AND, LIKE-escaped), poststed_in, postnummer_in.
  *   F   fylke and poststed input normalisation (vestland/Hordaland, bergen).
@@ -167,8 +168,13 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
     ];
     for (const f of oldFilters) {
       const label = JSON.stringify(f);
-      assertEq(pubIds(f), legacyIds(f, "public"), `R1: listPublicDentalAgents ${label} == old WHERE (ids and order)`);
-      assertEq(store.countPublicDentalAgents(f as any), legacyIds(f, "public").length, `R2: countPublicDentalAgents ${label} == old count`);
+      // S2b changed one old field on purpose: a public acute_vakt 1 is the
+      // akutt claim (src/routes/dental-acute-filter.test.ts), and only the
+      // admin listing (R3) keeps the raw flag.
+      if (f.acute_vakt !== 1) {
+        assertEq(pubIds(f), legacyIds(f, "public"), `R1: listPublicDentalAgents ${label} == old WHERE (ids and order)`);
+        assertEq(store.countPublicDentalAgents(f as any), legacyIds(f, "public").length, `R2: countPublicDentalAgents ${label} == old count`);
+      }
       assertEq(admIds(f), legacyIds(f, "admin"), `R3: listDentalAgents ${label} == old WHERE`);
     }
     assertEq(store.countPublicDentalAgents({ specialty: "implantologi" } as any), 0, "R4: a specialty outside the vocabulary keeps the old three clauses");
