@@ -47708,8 +47708,10 @@ runSerial(async () => {
 // client-IP choke point (middleware/client-ip.ts) — enforce makes req.ip
 // Fly-Client-IP whatever X-Forwarded-For says, every fallback is today's
 // behaviour, shadow/legacy change nothing, the collapse breaker, the stats
-// line, and index.ts mounting it first. Own Express apps over real HTTP,
-// injected clock and log sinks; no DB, no env or global mutation — tail.
+// line, and index.ts mounting it first. Trinn 1b: the B1 / cap / ring pins
+// and the AC2 read-out (`clientIp` in GET /admin/analytics/ops/event-loop).
+// Own Express apps over real HTTP, injected clock and log sinks; no DB, no
+// env mutation, the installed-instance slot reset at the end — tail.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1: client IP from Fly-Client-IP ──");
   try {
