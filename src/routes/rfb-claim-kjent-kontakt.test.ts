@@ -332,8 +332,13 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const r = await claim("ac3", { name: "Eier", email: "post@ac3.example.test" });
       ownerToken = (await verify("ac3", r.body.data.claimId, codeIn(mails[mails.length - 1]))).body?.data?.claimToken;
       ok(!!ownerToken, "ac3: setup — the farm has a verified owner");
-      const rowsBefore = claimsOf("ac3").length;
-      const ownerRowBefore = JSON.stringify(claimsOf("ac3"));
+      // Compare the owner's rows by id, not by position: the new rows can share created_at with them and ids are
+      // random UUIDs, so ORDER BY created_at, id puts them in a random place (determinism gate, lokal#1141).
+      const rowsBeforeList = claimsOf("ac3");
+      const rowsBefore = rowsBeforeList.length;
+      const idsBefore = new Set(rowsBeforeList.map((c) => c.id));
+      const byId = (rows: any[]): string => JSON.stringify([...rows].sort((x, y) => String(x.id).localeCompare(String(y.id))));
+      const ownerRowBefore = byId(rowsBeforeList);
       const before = mails.length;
 
       const other = await claim("ac3", { name: "Ukjent", email: "post@ac3.example.test".replace("post", "annen") });
@@ -342,7 +347,7 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const same = await claim("ac3", { name: "Ukjent 2", email: "kopi@ac3.example.test" });
       eq([same.status, same.body?.data?.reason], [202, "has_owner"], "ac3: has_owner queues whatever address is typed");
       eq(claimsOf("ac3").length, rowsBefore + 2, "ac3: no agent_claims row is deleted (two added)");
-      ok(JSON.stringify(claimsOf("ac3").slice(0, rowsBefore)) === ownerRowBefore, "ac3: the owner's claim row is unchanged");
+      ok(byId(claimsOf("ac3").filter((x) => idsBefore.has(x.id))) === ownerRowBefore, "ac3: the owner's claim row is unchanged");
       const login = await invoke(loginH, makeReq({ body: { token: ownerToken } }));
       eq([login.status, login.body?.data?.agentId], [200, "ac3"], "ac3: the owner's token still logs in");
       eq(knowledgeService.getClaimByToken(ownerToken)?.agentId, "ac3", "ac3: the owner's token still authorizes the profile");
