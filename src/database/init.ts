@@ -5286,6 +5286,31 @@ function initSchema(db: Database.Database): void {
     console.error("Migration boot_job_state failed:", err);
   }
 
+  // dev-request 2026-10-16-indexnow-alle-verter (S2): state for the IndexNow sitemap-diff job
+  // (services/indexnow-sync.ts). Additive and inert while INDEXNOW_SYNC_ENABLED is off.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS indexnow_submissions (
+        host TEXT NOT NULL,
+        url TEXT NOT NULL,
+        lastmod TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_submitted_at TEXT,
+        last_status TEXT,
+        removed_at TEXT,
+        PRIMARY KEY (host, url)
+      );
+      CREATE TABLE IF NOT EXISTS indexnow_host_state (
+        host TEXT PRIMARY KEY,
+        baseline_at TEXT,
+        backoff_until TEXT,
+        last_error TEXT
+      );
+    `);
+  } catch (err) {
+    console.error("Migration indexnow_submissions failed:", err);
+  }
+
   // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): two small state
   // tables for the nightly RFB enrichment job (services/rfb-enrichment-
   // nightly.ts). Created in-module too (ensureRfbEnrichmentNightlyTables), so
