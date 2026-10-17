@@ -25,6 +25,9 @@ import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
+// dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: the
+// shell's JSON-LD goes through the serializer that escapes < > & U+2028 U+2029.
+import { jsonLdScriptTag } from "../services/safe-script-json";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -750,7 +753,7 @@ function dentalShell(content: string, opts: ShellOptions): string {
     ? (Array.isArray(opts.jsonLd) ? opts.jsonLd : [opts.jsonLd])
     : [];
   const ldScripts = ldArr
-    .map((ld) => `<script type="application/ld+json">${JSON.stringify(ld).replace(/<\//g, "<\\/")}</script>`)
+    .map((ld) => jsonLdScriptTag(ld))
     .join("\n");
   // OG/Twitter share image. SVG favicon is the only platform-owned visual asset
   // we ship, so it doubles as the default share image (overridable via opts.ogImage).

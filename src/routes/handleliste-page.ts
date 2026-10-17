@@ -36,6 +36,7 @@ import { localizedPath, type Lang } from "../i18n/t";
 import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
+import { serializeJsonForScript } from "../services/safe-script-json";
 
 export function isHandelisteEnabled(): boolean {
   const v = (process.env.HANDLELISTE_ENABLED || "").trim().toLowerCase();
@@ -594,10 +595,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
   const base = COPY[lang === "en" ? "en" : "no"];
   const c: Copy = isPaymentsEnabled() ? { ...base, ...PREPAY_COPY[lang === "en" ? "en" : "no"] } : base;
   const payHow = isPaymentsEnabled() ? { __pay_how_href: localizedPath(BETALING_PATH, lang) } : {};
-  const copyJson = JSON.stringify({ ...c, ...payHow, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL })
-    .replace(/</g, "\\u003c")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
+  const copy = { ...c, ...payHow, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">
@@ -649,7 +647,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
         <div class="hl-actions"><button type="button" class="hl-btn" id="hl-new">${e(c.new_list)}</button></div>
       </section>
     </form>
-    <script type="application/json" id="hl-copy">${copyJson}</script>
+    <script type="application/json" id="hl-copy">${serializeJsonForScript(copy)}</script>
     <script>${CLIENT_SCRIPT}</script>
   </main>`;
   return { title: c.title, description: c.description, content, extraCss: HANDELISTE_CSS };

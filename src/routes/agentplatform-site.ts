@@ -33,6 +33,7 @@ import { COMPANY_INFO } from "../config/company-info";
 import { companyVatStatus } from "../services/company-legal";
 import { getTrafficStatsSnapshot } from "../services/traffic-stats";
 import { getAgentToolCallsSnapshot } from "../services/agent-usage";
+import { jsonLdScriptTag } from "../services/safe-script-json";
 
 export const AGENTPLATFORM_HOSTS = new Set(["agentplatform.no", "www.agentplatform.no"]);
 /**
@@ -967,7 +968,7 @@ function footer(lang: Lang): string {
 function shell(o: ShellOpts): string {
   const t = T[o.lang];
   const canonical = AGENTPLATFORM_BASE_URL + o.canonicalPath;
-  const ld = o.jsonLd ? `<script type="application/ld+json">${JSON.stringify(o.jsonLd).replace(/</g, "\\u003c")}</script>` : "";
+  const ld = o.jsonLd ? jsonLdScriptTag(o.jsonLd) : "";
   return `<!doctype html>
 <html lang="${t.htmlLang}">
 <head>

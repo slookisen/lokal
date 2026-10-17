@@ -42065,6 +42065,39 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: one
+// serializer for JSON inside <script> (escapes < > & U+2028 U+2029), used by
+// every JSON-LD block, map data island and inline-script JSON value on
+// Opplevagent and Finn-tannlege; a source scan keeps src/routes on it, and
+// pages with <!--<script> in DB values keep every script element intact.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: safe JSON in <script> ──");
+  try {
+    const { runSafeScriptJsonTests } = require("../src/services/safe-script-json.test") as
+      typeof import("../src/services/safe-script-json.test");
+    const ssj = runSafeScriptJsonTests({ log: false });
+    passed += ssj.passed;
+    failed += ssj.failed;
+    for (const f of ssj.failures) failures.push("safe-script-json: " + f);
+    console.log(`  safe-script-json: ${ssj.passed} passed, ${ssj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("safe-script-json: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runSafeScriptJsonPagesTests } = require("../src/routes/safe-script-json-pages.test") as
+      typeof import("../src/routes/safe-script-json-pages.test");
+    const ssjp = await runSafeScriptJsonPagesTests({ log: false });
+    passed += ssjp.passed;
+    failed += ssjp.failed;
+    for (const f of ssjp.failures) failures.push("safe-script-json-pages: " + f);
+    console.log(`  safe-script-json-pages: ${ssjp.passed} passed, ${ssjp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("safe-script-json-pages: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-gardssalg-a2a-nl-routing: POST /a2a message/send on
 // opplevagent.no ALWAYS searched the generic `experiences` table, never the
 // gårdssalg (farm-sale drink producer) vertical in `experience_providers`.
