@@ -19,6 +19,7 @@ import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents, normaliseFylke } from "./norway-fylke";
 import { drinkWordProducerTypes } from "./drink-taxonomy";
+import { fillFylkeFromKommune } from "./gardssalg-fylke-from-kommune";
 // dev-request 2026-08-18-gardssalg-set-contact-phone: reuse the SAME write-time
 // phone guard the rfb `agent_knowledge` write path already uses (dev-request
 // 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) instead of inventing a
@@ -412,7 +413,11 @@ export function createProvider(input: Provider): string {
     )
   `).run({
     id, org_nr: p.org_nr ?? null, navn: p.navn,
-    postnummer: p.postnummer ?? null, poststed: p.poststed ?? null, fylke: p.fylke ?? null,
+    postnummer: p.postnummer ?? null, poststed: p.poststed ?? null,
+    // dev-request 2026-10-01-opplevagent-fylke-fra-kommune: fill-only — a set
+    // fylke is kept as-is; a blank one is filled from kommune/kommunenummer
+    // via resolveFylke2024 (needs_review => stays null, never guessed).
+    fylke: fillFylkeFromKommune({ fylke: p.fylke, kommune: p.kommune, kommunenummer: p.kommunenummer }),
     kommune: p.kommune ?? null, kommunenummer: p.kommunenummer ?? null, adresse: p.adresse ?? null,
     lat: p.lat ?? null, lon: p.lon ?? null, telefon: p.telefon ?? null, mobil: p.mobil ?? null,
     epost: p.epost ?? null, hjemmeside: p.hjemmeside ?? null,
@@ -10698,6 +10703,10 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // shape as every other field here, so the existing rollback lever covers
   // it with zero other changes.
   "navn",
+  // dev-request 2026-10-01-opplevagent-fylke-fra-kommune — fill-only fylke
+  // from kommune (POST /admin/gardssalg-provider-fylke-from-kommune) writes
+  // one audit row per fill; this lets the standard rollback restore it.
+  "fylke",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
