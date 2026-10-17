@@ -44,7 +44,7 @@ export interface OpeningHoursEntry {
   close?: string;
   /** The season the entry is limited to ("Mai–September"), as stored. */
   period?: string;
-  /** A note ("Kun i sesong"), text in an hours field ("Stengt"), or the whole text of a text entry. */
+  /** A note ("Kun i sesong"), "Stengt" for a closed day, other text in an hours field, or the whole text of a text entry. */
   note?: string;
 }
 
@@ -154,6 +154,19 @@ const TIME = /^\s*\d{1,2}(?:[:.]\d{2})?\s*$/;
 /** "10:00-17:00", "10–17", "09.00 - 15.30": one range and nothing else. */
 const TIME_RANGE = /^\s*(\d{1,2}(?:[:.]\d{2})?)\s*[-–—]\s*(\d{1,2}(?:[:.]\d{2})?)\s*$/;
 
+/**
+ * Text in a time field, or the hours field, that says the day is closed. Live
+ * data 2026-10-17 has {day: "sun", open: "closed", close: "closed"} (four
+ * producers; it showed "closed – closed" and went into JSON-LD as a time) and
+ * {day: "Mandag", hours: "Stengt"}. Both are the note "Stengt".
+ */
+const CLOSED_WORDS = new Set(["closed", "stengt", "stengd"]);
+const CLOSED_NOTE = "Stengt";
+
+function isClosedWord(text: string): boolean {
+  return CLOSED_WORDS.has(text.trim().toLowerCase());
+}
+
 /** A time field as text: text as it is, a finite number as its digits ("10"), anything else none. */
 function timeText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -166,6 +179,18 @@ export function timeMinutes(text: string): number | null {
   if (!m) return null;
   const minutes = Number(m[1]) * 60 + Number(m[2] ?? 0);
   return Number(m[2] ?? 0) < 60 && minutes <= 24 * 60 ? minutes : null;
+}
+
+/**
+ * A clock time as "HH:MM" ("9" and "09.00" are "09:00", "24:00" stays), or
+ * null when the text is not a clock time ("closed"): the form schema.org's
+ * opens/closes take. The identity for text that is already "HH:MM".
+ */
+export function clockTime(text: string): string | null {
+  const minutes = timeMinutes(text);
+  if (minutes === null) return null;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(minutes / 60))}:${pad(minutes % 60)}`;
 }
 
 // ─── Normalizer ────────────────────────────────────────────────────────
@@ -208,6 +233,13 @@ function normalizeEntry(item: unknown): OpeningHoursEntry | null {
   const notes: string[] = [];
   let open = timeText(field(h, "open", "from"));
   let close = timeText(field(h, "close", "to"));
+  // "closed" in the time fields, and no time beside it, is a closed day.
+  const given = [open, close].filter((t) => t.trim());
+  if (given.length && given.every(isClosedWord)) {
+    notes.push(CLOSED_NOTE);
+    open = "";
+    close = "";
+  }
   if (!open.trim() || !close.trim()) {
     // A lone time says nothing; lone text in a time field is a note
     // ({day: "note", open: "1. juli - 31. juli: Mandag-søndag 09:00-16:00"}).
@@ -222,7 +254,7 @@ function normalizeEntry(item: unknown): OpeningHoursEntry | null {
       open = range[1]!;
       close = range[2]!;
     } else if (hours) {
-      notes.push(hours);
+      notes.push(isClosedWord(hours) ? CLOSED_NOTE : hours);
     }
   }
   if (typeof h.note === "string" && h.note.trim()) notes.push(h.note.trim());
@@ -231,7 +263,7 @@ function normalizeEntry(item: unknown): OpeningHoursEntry | null {
   const entry: OpeningHoursEntry = { days, label };
   if (open) { entry.open = open; entry.close = close; }
   if (period) entry.period = period;
-  if (notes.length) entry.note = notes.join("; ");
+  if (notes.length) entry.note = [...new Set(notes)].join("; ");
   return entry;
 }
 
@@ -276,9 +308,15 @@ export function openingHoursEntryText(entry: OpeningHoursEntry): string {
   return day ? `${day}: ${text}` : text;
 }
 
-/** The opening hours as one line of text, at most `max` entries; "" when there are none. */
+/**
+ * The opening hours as one line of text, at most `max` entries; "" when there
+ * are none. Entries are separated by ", ", or by "; " when an entry has a
+ * comma of its own ("Boden (selvbetjent): uke 20-41, døgnåpen; Lør
+ * 11:00–15:00"), so it is clear where each one ends.
+ */
 export function openingHoursText(value: unknown, max = Infinity): string {
-  return normalizeOpeningHours(value).slice(0, max).map(openingHoursEntryText).join(", ");
+  const texts = normalizeOpeningHours(value).slice(0, max).map(openingHoursEntryText);
+  return texts.join(texts.some((t) => t.includes(",")) ? "; " : ", ");
 }
 
 // ─── Open now ──────────────────────────────────────────────────────────
@@ -298,23 +336,34 @@ export function osloWeekdayAndMinutes(at: Date): { day: Weekday; minutes: number
 }
 
 /**
- * Whether the producer is open at `at` in Norway, and the entry for today
- * that says so (the one open now, else the first for today). Only entries
- * with weekdays, two clock times and no period count: an entry for "Påske",
+ * Whether the producer is open at `at` in Norway, and the entry that says so
+ * (the one open now, else the first for today). Only entries with weekdays,
+ * two different clock times and no period count: an entry for "Påske",
  * "Varierer" or "Mai–September", or a text entry, cannot say whether it is
- * open on a given day. null when no entry counts: nothing is claimed then
- * (the front page used to say "Stengt"). A day with no entry is closed. Open
- * from the opening time up to, not including, the closing time.
+ * open on a given day, and neither can equal times ("00:00–00:00" is closed
+ * all day to schema.org and open all day elsewhere). null when no entry
+ * counts: nothing is claimed then (the front page used to say "Stengt"). A day
+ * with no entry is closed. Open from the opening time up to, not including,
+ * the closing time; a closing time before the opening time is on the next day
+ * (Tromsø Mikrobryggeri, mon 12:00–01:30, is open Tuesday 00:30 on Monday's
+ * entry).
  */
 export function openingStatusAt(
   entries: readonly OpeningHoursEntry[],
   at: Date,
 ): { isOpen: boolean; today?: OpeningHoursEntry } | null {
-  const timed = entries.filter((e) => e.days.length > 0 && !e.period &&
-    e.open !== undefined && e.close !== undefined && timeMinutes(e.open) !== null && timeMinutes(e.close) !== null);
+  const timed = entries.flatMap((entry) => {
+    if (!entry.days.length || entry.period || entry.open === undefined || entry.close === undefined) return [];
+    const open = timeMinutes(entry.open);
+    const close = timeMinutes(entry.close);
+    return open !== null && close !== null && open !== close ? [{ entry, open, close }] : [];
+  });
   if (!timed.length) return null;
   const now = osloWeekdayAndMinutes(at);
-  const today = timed.filter((e) => e.days.includes(now.day));
-  const openNow = today.find((e) => now.minutes >= timeMinutes(e.open!)! && now.minutes < timeMinutes(e.close!)!);
-  return { isOpen: !!openNow, today: openNow ?? today[0] };
+  const yesterday = ((now.day + 6) % 7) as Weekday;
+  const today = timed.filter((t) => t.entry.days.includes(now.day));
+  const openNow =
+    today.find((t) => now.minutes >= t.open && (t.close < t.open || now.minutes < t.close)) ??
+    timed.find((t) => t.entry.days.includes(yesterday) && t.close < t.open && now.minutes < t.close);
+  return { isOpen: !!openNow, today: (openNow ?? today[0])?.entry };
 }

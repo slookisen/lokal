@@ -75,6 +75,7 @@ import {
   entryDaysLabel,
   osloWeekdayAndMinutes,
   openingStatusAt,
+  clockTime,
   WEEKDAY_NAMES,
   type OpeningHoursEntry,
 } from "../utils/opening-hours";
@@ -186,7 +187,9 @@ const MONTH_NAMES_SV = ["", "Jan", "Feb", "Mar", "Apr", "Maj", "Jun", "Jul", "Au
  * BOTH languages, so a range of known days renders "Monday–Sunday" /
  * "Mandag–Søndag". Anything else is shown as written. The day tables
  * and the range rule live in utils/opening-hours.ts since slice I-H, shared
- * with lokal_info, the A2A auto-reply and "open now".
+ * with lokal_info, the A2A auto-reply and "open now". The hours card no
+ * longer calls this (it uses entryDaysLabel); kept, as a thin wrapper, for
+ * backwards compatibility with callers and tests that import it.
  */
 export function dayName(key: string, lang: Lang): string {
   const days = parseDayLabel(key || "");
@@ -897,8 +900,9 @@ function productNameText(p: unknown): string {
  * (a text entry, {note}, or a marker day such as "by-appointment"). Days are
  * in the page language ("Lørdag" is "Saturday" on /en); a label that names no
  * weekday ("Varierer", "Påske") is shown as written. `today` (Monday = 0, in
- * Norway) highlights every entry that covers it, ranges too. For the
- * declared form ({day, open, close, note}) the rows are the ones I-G gave.
+ * Norway) highlights every entry that covers it, ranges too, except an entry
+ * that holds only in a period ("Mai–September"): it may not hold today. For
+ * the declared form ({day, open, close, note}) the rows are the ones I-G gave.
  */
 export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang: Lang, today: number): string {
   return entries.map((h) => {
@@ -908,7 +912,7 @@ export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang
       ? `${escapeHtml(h.open)} \u2013 ${escapeHtml(h.close)}${qualifier ? ` (${escapeHtml(qualifier)})` : ""}`
       : escapeHtml(qualifier);
     if (!label) return `<div class="hrs-day"></div><div class="hrs-time">${time}</div>`;
-    const isToday = h.days.includes(today as OpeningHoursEntry["days"][number]);
+    const isToday = !h.period && h.days.includes(today as OpeningHoursEntry["days"][number]);
     const cls = isToday ? " hrs-today" : "";
     const todayBadge = isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : "";
     return `<div class="hrs-day${cls}">${escapeHtml(label)}${todayBadge}</div><div class="hrs-time${cls}">${time}</div>`;
@@ -921,8 +925,9 @@ export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang
  * The front-page card's "Åpent nå" / "Stengt" line. Slice I-H: the day and
  * interval rule of utils/opening-hours.ts (openingStatusAt, Europe/Oslo), so
  * "monday", "Lørdag", "mon-sun" and "Man-fre" count as well as "mon" (they
- * never matched before, and the card said "Stengt" in opening hours). null
- * (no line) when no entry says which days and times it is open.
+ * never matched before, and the card said "Stengt" in opening hours), and
+ * hours past midnight ("12:00–01:30") are open until the closing time on the
+ * next day. null (no line) when no entry says which days and times it is open.
  */
 export function isOpenNow(openingHours: unknown, at: Date = new Date()): { isOpen: boolean; todayLabel?: string } | null {
   if (!Array.isArray(openingHours)) return null;
@@ -5921,14 +5926,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // or that holds only in a period ("Mai–September") has no valid
     // OpeningHoursSpecification without validity dates and is left out; it
     // used to give "https://schema.org/Varierer" or a range key as the day.
-    const specHours = hoursList.filter((h) => h.days.length > 0 && h.open !== undefined && h.close !== undefined && !h.period);
+    // opens/closes are clock times as "HH:MM" ("12.00" and the number 10 are
+    // "12:00" and "10:00"; stored "HH:MM" is unchanged); an entry whose times
+    // are not clock times is left out (it gave "opens": "closed").
+    const specHours = hoursList.flatMap((h) => {
+      if (!h.days.length || h.period || h.open === undefined || h.close === undefined) return [];
+      const opens = clockTime(h.open);
+      const closes = clockTime(h.close);
+      return opens && closes ? [{ days: h.days, opens, closes }] : [];
+    });
     if (specHours.length) {
       const schemaDay = (d: number) => `https://schema.org/${WEEKDAY_NAMES.en[d]}`;
       jsonLd.openingHoursSpecification = specHours.map((h) => ({
         "@type": "OpeningHoursSpecification",
         "dayOfWeek": h.days.length === 1 ? schemaDay(h.days[0]!) : h.days.map(schemaDay),
-        "opens": h.open,
-        "closes": h.close,
+        "opens": h.opens,
+        "closes": h.closes,
       }));
     }
 

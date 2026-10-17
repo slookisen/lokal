@@ -441,10 +441,11 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
         "<div class=\"hrs-day\">Torsdag</div><div class=\"hrs-time\">&lt;b&gt;10&lt;/b&gt; – 17:00</div>" +
         "<div class=\"hrs-day\">Fredag</div><div class=\"hrs-time\">10:00 – 17:00</div>",
         "c hours: a text entry is shown as text; entries without both times are left out (main: \"undefined – undefined\", \"[object Object] – 17:00\", \"10:00 – undefined\"); times are escaped; an object note is left out");
+      // Slice I-H: JSON-LD takes only clock times, so the "<b>10</b>" entry
+      // (I-G wrote it as opens) is left out of it; the card still shows it.
       assertEq(localBusiness(r.body)?.openingHoursSpecification, [
-        { "@type": "OpeningHoursSpecification", dayOfWeek: "https://schema.org/Thursday", opens: "<b>10</b>", closes: "17:00" },
         { "@type": "OpeningHoursSpecification", dayOfWeek: "https://schema.org/Friday", opens: "10:00", closes: "17:00" },
-      ], "c hours: JSON-LD has the entries with a day and both times only (main: \"https://schema.org/undefined\", an object as opens)");
+      ], "c hours: JSON-LD has the entries with a day and two clock times only (main: \"https://schema.org/undefined\", an object as opens; I-G: \"<b>10</b>\" as opens)");
       assertTrue(!/<b>10<\/b>/.test(r.body.replace(/<script[\s\S]*?<\/script>/g, "")), "c hours: no raw HTML from a time in the page");
       assertEq(junk(r.body), [], "c hours: no junk text");
     }

@@ -16,10 +16,15 @@
  *   (a) producer page, one producer per stored form (no and en): the hours
  *       card shows the days and times or the text, the FAQ says hours are
  *       listed, JSON-LD has only valid weekdays (none for labels that are no
- *       weekday, or a period), the "today" highlight covers a range, no junk.
- *   (b) front page: featured producers with long English day names and a
- *       Norwegian range, open all day, say "Åpent nå"; a REKO ring with only
- *       "Varierer" says nothing (main: "Stengt" for all three).
+ *       weekday, or a period) and opens/closes as "HH:MM" (none for
+ *       "closed", which is a closed day "Stengt"), the "today" highlight
+ *       covers a range, is the day in Norway (fixed clock at 22:30Z) and
+ *       skips an entry that holds only in a period, no junk.
+ *   (b) front page at fixed clocks: featured producers with long English day
+ *       names (open past midnight) and a Norwegian range say "Åpent nå" in
+ *       their hours, also after midnight on the previous day's entry, and
+ *       "Stengt" after closing; a REKO ring with only "Varierer" says nothing
+ *       (main: "Stengt" for all three).
  *   (c) lokal_info and the auto-reply give the same hours text for every
  *       producer, and each time on the page is in it.
  *   (d) GET /agents/:id/agent.json is seed-store only (see a2a.ts): no
@@ -71,6 +76,30 @@ function junk(body: string): string[] {
     });
   }
   return found;
+}
+
+/**
+ * Runs fn with the clock at `iso`: `new Date()` and Date.now() inside the
+ * handlers (which read the clock themselves) give that instant. Date with
+ * arguments is unchanged.
+ */
+function atClock<T>(iso: string, fn: () => T): T {
+  const RealDate = Date;
+  const fixed = RealDate.parse(iso);
+  class FixedDate extends RealDate {
+    constructor(...args: any[]) {
+      if (args.length) super(...(args as [number]));
+      else super(fixed);
+    }
+    static now(): number { return fixed; }
+  }
+  globalThis.Date = FixedDate as unknown as DateConstructor;
+  try { return fn(); } finally { globalThis.Date = RealDate; }
+}
+
+/** The day labels of the rows the hours card highlights as today. */
+function todayRows(grid: string): string[] {
+  return [...grid.matchAll(/<div class="hrs-day hrs-today">([^<]*)/g)].map((m) => m[1]!);
 }
 
 /** Every non-test source file under a directory. */
@@ -170,16 +199,23 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
       ] },
       // A range every day, so "today" is always highlighted (main never highlighted a range).
       range: { id: "ih-range", name: "Rita Rekkevidde", slug: "rita-rekkevidde", hours: [{ day: "mon-sun", open: "00:00", close: "24:00", note: "Døgnåpen selvbetjent" }] },
+      // "closed" as the times (Aarsland Gårdsutsalg, Havens Kolonial, The ODD Bakery, Haugli Bakeri),
+      // times that are not "HH:MM", and hours past midnight (Tromsø Mikrobryggeri).
+      closed: { id: "ih-closed", name: "Stine Stengt", slug: "stine-stengt", hours: [
+        { day: "sun", open: "closed", close: "closed" }, { day: "Tirsdag", hours: "12.00 – 18.00" },
+        { day: "sat", open: 10, close: 17 }, { day: "fri", open: "9:00", close: "17:30" }, { day: "thu", open: "18:00", close: "01:30" },
+      ] },
     };
     seedProducer({ ...P.hours, city: "Oslo", geo: [59.91, 10.75] });
     seedProducer({ ...P.fromTo, city: "Tysnes", geo: [59.99, 5.5] });
     seedProducer({ ...P.notes, city: "Hamar", geo: [60.79, 11.07] });
     seedProducer({ ...P.period, city: "Balestrand", geo: [61.2, 6.53] });
     seedProducer({ ...P.range, city: "Moss", geo: [59.43, 10.66] });
+    seedProducer({ ...P.closed, city: "Bergen", geo: [60.39, 5.32] });
     // Front page: the three claimed producers with the highest trust get the ultra-rich card.
     const allWeek = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
     seedProducer({ id: "ih-c-long", name: "Kari Langnavn", city: "Ctown", geo: [60.0, 10.0], claimed: true, trust: 0.99,
-      hours: allWeek.map((day) => ({ day, open: "00:00", close: "24:00" })) });
+      hours: allWeek.map((day) => ({ day, open: "12:00", close: "03:00" })) });
     seedProducer({ id: "ih-c-range", name: "Kjell Norskuke", city: "Ctown", geo: [60.0, 10.0], claimed: true, trust: 0.98,
       hours: [{ day: "Mandag-Søndag", hours: "00:00-24:00" }] });
     seedProducer({ id: "ih-c-reko", name: "REKO Testringen", city: "Ctown", geo: [60.0, 10.0], claimed: true, trust: 0.97,
@@ -217,7 +253,8 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
     const homeHandler = handlerFor("/");
     const producer = (slug: string, lang: "no" | "en" = "no") =>
       invoke(producerHandler, { params: { slug }, lang, ip: "127.0.0.1", headers: {}, get: () => undefined, query: {} });
-    const home = (lang: "no" | "en") => invoke(homeHandler, { lang, query: {}, ip: "127.0.0.1", headers: {}, get: () => undefined });
+    const home = (lang: "no" | "en", iso: string) =>
+      atClock(iso, () => invoke(homeHandler, { lang, query: {}, ip: "127.0.0.1", headers: {}, get: () => undefined }));
     const specDays = (body: string) => (jsonLdBlocks(body).find((b) => b["@type"] === "LocalBusiness")?.openingHoursSpecification ?? [])
       .map((s: any) => s.dayOfWeek);
     const faqClaimsHours = (body: string) => JSON.stringify(jsonLdBlocks(body).find((b) => b["@type"] === "FAQPage") ?? {}).includes("har åpningstider oppført");
@@ -271,22 +308,58 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
       assertEq(specDays(pages["rita-rekkevidde"]!.no), [sd("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")],
         "a mon-sun: JSON-LD lists the seven days (main: \"https://schema.org/mon-sun\")");
     }
+    {
+      const page = pages["stine-stengt"]!.no;
+      assertEq(withoutToday(hoursGrid(page) ?? ""),
+        "<div class=\"hrs-day\">Søndag</div><div class=\"hrs-time\">Stengt</div>" +
+        "<div class=\"hrs-day\">Tirsdag</div><div class=\"hrs-time\">12.00 – 18.00</div>" +
+        "<div class=\"hrs-day\">Lørdag</div><div class=\"hrs-time\">10 – 17</div>" +
+        "<div class=\"hrs-day\">Fredag</div><div class=\"hrs-time\">9:00 – 17:30</div>" +
+        "<div class=\"hrs-day\">Torsdag</div><div class=\"hrs-time\">18:00 – 01:30</div>",
+        "a closed: \"closed\" as the times is \"Stengt\" (head before: \"closed – closed\"); other times as stored");
+      const sp = (day: string, opens: string, closes: string) => ({ "@type": "OpeningHoursSpecification", dayOfWeek: `https://schema.org/${day}`, opens, closes });
+      assertEq(jsonLdBlocks(page).find((b) => b["@type"] === "LocalBusiness")?.openingHoursSpecification,
+        [sp("Tuesday", "12:00", "18:00"), sp("Saturday", "10:00", "17:00"), sp("Friday", "09:00", "17:30"), sp("Thursday", "18:00", "01:30")],
+        "a closed: JSON-LD opens/closes are \"HH:MM\" (\"12.00\", 10 and \"9:00\" formatted; a closing time past midnight kept); the closed day has none (head before: \"opens\": \"closed\")");
+      const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<style[\s\S]*?<\/style>/g, "").replace(/<[^>]+>/g, " ");
+      assertTrue(!/\bclosed\b/i.test(visible) && !/"closed"/.test(JSON.stringify(jsonLdBlocks(page))), "a closed: the word \"closed\" is nowhere on the page or in its JSON-LD");
+    }
+    // The "today" highlight at a fixed clock. 2026-10-14 is a Wednesday:
+    // 21:30Z is Wednesday 23:30 in Oslo, 22:30Z is Thursday 00:30 there while
+    // the server (UTC on Fly) is still on Wednesday.
+    {
+      const at = (slug: string, iso: string) => todayRows(hoursGrid(atClock(iso, () => producer(slug)).body) ?? "");
+      assertEq(at("hanne-timer", "2026-10-14T21:30:00Z"), ["Tirsdag–Onsdag", "Mandag–Fredag"], "a today: Wednesday 23:30 in Oslo highlights the entries for Wednesday");
+      assertEq(at("hanne-timer", "2026-10-14T22:30:00Z"), ["Mandag–Fredag"],
+        "a today: at 22:30Z it is Thursday in Oslo, so only the entry for Thursday is highlighted (the server's UTC day would give Wednesday's too)");
+      assertEq(at("per-periode", "2026-10-15T10:00:00Z"), ["Mandag–Fredag"],
+        "a today: on a Thursday the year-round entry is highlighted, not the one that holds only in April");
+      assertEq(at("stine-stengt", "2026-10-18T10:00:00Z"), ["Søndag"], "a today: a closed day is highlighted on its day (it is today, and closed)");
+    }
 
     // ══ (b) front page ═══════════════════════════════════════════════════
-    for (const lang of ["no", "en"] as const) {
-      const r = home(lang);
-      assertEq(r.status, 200, `b / ${lang}: 200`);
-      const href = (slug: string) => `${lang === "en" ? "/en" : ""}/produsent/${slug}`;
-      const card = (slug: string): string => new RegExp(`<a href="${href(slug)}" class="pc pc-ultra">([\\s\\S]*?)</a>`).exec(r.body)?.[1] ?? "";
-      const openLine = (slug: string) => card(slug).match(/<div class="pc-meta-line">🕒[\s\S]*?<\/div>/)?.[0] ?? null;
-      const openNow = lang === "en" ? "Open now" : "Åpent nå";
-      assertTrue(!!card("kari-langnavn") && !!card("kjell-norskuke") && !!card("reko-testringen"), `b / ${lang}: the three claimed producers have ultra-rich cards`);
-      assertEq(openLine("kari-langnavn"), `<div class="pc-meta-line">🕒 <span class="pc-open-now">${openNow}</span> <span class="pc-hours">00:00–24:00</span></div>`,
-        `b / ${lang}: "monday"…"sunday" open all day is open now (main: "Stengt")`);
-      assertEq(openLine("kjell-norskuke"), `<div class="pc-meta-line">🕒 <span class="pc-open-now">${openNow}</span> <span class="pc-hours">00:00–24:00</span></div>`,
-        `b / ${lang}: a Norwegian range "Mandag-Søndag" from {day, hours} is open now (main: "Stengt")`);
-      assertEq(openLine("reko-testringen"), null, `b / ${lang}: only "Varierer" says nothing about the day, so no open-now line (main: "Stengt")`);
-      assertEq(junk(r.body), [], `b / ${lang}: no junk text`);
+    // At fixed clocks: Saturday 12:00, Tuesday 00:30 and Tuesday 04:00 in Oslo.
+    for (const [when, iso, kariOpen] of [
+      ["Saturday 12:00", "2026-10-17T10:00:00Z", true],
+      ["Tuesday 00:30, on Monday's 12:00–03:00", "2026-10-12T22:30:00Z", true],
+      ["Tuesday 04:00, after closing", "2026-10-13T02:00:00Z", false],
+    ] as Array<[string, string, boolean]>) {
+      for (const lang of ["no", "en"] as const) {
+        const r = home(lang, iso);
+        assertEq(r.status, 200, `b / ${lang} ${when}: 200`);
+        const href = (slug: string) => `${lang === "en" ? "/en" : ""}/produsent/${slug}`;
+        const card = (slug: string): string => new RegExp(`<a href="${href(slug)}" class="pc pc-ultra">([\\s\\S]*?)</a>`).exec(r.body)?.[1] ?? "";
+        const openLine = (slug: string) => card(slug).match(/<div class="pc-meta-line">🕒[\s\S]*?<\/div>/)?.[0] ?? null;
+        const openNow = `<span class="pc-open-now">${lang === "en" ? "Open now" : "Åpent nå"}</span>`;
+        const closed = `<span class="pc-closed">${lang === "en" ? "Closed" : "Stengt"}</span>`;
+        assertTrue(!!card("kari-langnavn") && !!card("kjell-norskuke") && !!card("reko-testringen"), `b / ${lang} ${when}: the three claimed producers have ultra-rich cards`);
+        assertEq(openLine("kari-langnavn"), `<div class="pc-meta-line">🕒 ${kariOpen ? openNow : closed} <span class="pc-hours">12:00–03:00</span></div>`,
+          `b / ${lang} ${when}: "monday"…"sunday" 12:00–03:00 is ${kariOpen ? "open now (main: \"Stengt\")" : "closed"}`);
+        assertEq(openLine("kjell-norskuke"), `<div class="pc-meta-line">🕒 ${openNow} <span class="pc-hours">00:00–24:00</span></div>`,
+          `b / ${lang} ${when}: a Norwegian range "Mandag-Søndag" from {day, hours} is open now (main: "Stengt")`);
+        assertEq(openLine("reko-testringen"), null, `b / ${lang} ${when}: only "Varierer" says nothing about the day, so no open-now line (main: "Stengt")`);
+        assertEq(junk(r.body), [], `b / ${lang} ${when}: no junk text`);
+      }
     }
     {
       // isOpenNow at a fixed time: Kringler Gjestegård's hours (live 2026-10-17), Saturday 12:00 in Oslo.
@@ -299,6 +372,18 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
         "b isOpenNow: the declared form as before (Monday 11:00)");
       assertEq([seo.isOpenNow("Man–fre 10–17"), seo.isOpenNow(null), seo.isOpenNow([])], [null, null, null],
         "b isOpenNow: free text, nothing and an empty list give no line, as before");
+      // Hours past midnight (live 2026-10-17): the review's cases.
+      const tromso = ["mon", "tue", "wed", "thu"].map((day) => ({ day, open: "12:00", close: "01:30" }))
+        .concat([{ day: "fri", open: "12:00", close: "03:00" }, { day: "sat", open: "12:00", close: "03:00" }, { day: "sun", open: "18:00", close: "01:30" }]);
+      const trondhjem = [{ day: "thu", open: "15:00", close: "23:00" }, { day: "fri", open: "14:00", close: "01:00" }, { day: "sat", open: "12:00", close: "01:00" }];
+      assertEq(seo.isOpenNow(tromso, new Date("2026-10-12T17:30:00Z")), { isOpen: true, todayLabel: "12:00–01:30" },
+        "b isOpenNow: Tromsø Mikrobryggeri on Monday 19:30 is open (head before: \"Stengt 12:00–01:30\")");
+      assertEq(seo.isOpenNow(tromso, new Date("2026-10-12T22:30:00Z")), { isOpen: true, todayLabel: "12:00–01:30" },
+        "b isOpenNow: Tromsø on Tuesday 00:30 is open, on Monday's entry");
+      assertEq(seo.isOpenNow(tromso, new Date("2026-10-13T00:00:00Z")), { isOpen: false, todayLabel: "12:00–01:30" },
+        "b isOpenNow: Tromsø on Tuesday 02:00 is closed");
+      assertEq(seo.isOpenNow(trondhjem, new Date("2026-10-16T22:30:00Z")), { isOpen: true, todayLabel: "14:00–01:00" },
+        "b isOpenNow: Trondhjem Mikrobryggeri on Saturday 00:30 is open, on Friday's entry");
     }
 
     // ══ (c) lokal_info and the A2A auto-reply agree ══════════════════════
@@ -318,6 +403,7 @@ export async function runRfbApningstiderNormalisererTests(opts: { log?: boolean 
         "nora-notat": "Åpent etter avtale — ring eller send SMS, 1. juli - 31. juli: Mandag-søndag 09:00-16:00, Selvbetjent <bod> & kjøleskap",
         "per-periode": "Tor–Fre 12:00–16:00 (April), Man–Fre 08:00–18:00",
         "rita-rekkevidde": "Man–Søn 00:00–24:00",
+        "stine-stengt": "Søn: Stengt, Tir 12.00–18.00, Lør 10–17, Fre 9:00–17:30, Tor 18:00–01:30",
       };
       for (const p of Object.values(P)) {
         console.log = () => {};

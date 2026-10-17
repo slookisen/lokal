@@ -13,17 +13,20 @@
  *   (b) weekdaysLabel: a day, a run (also over the weekend), all seven, a list.
  *   (c) normalizeOpeningHours: every stored form the spec names, and the
  *       others found in live data 2026-10-17 ({note}, {days, hours, note},
- *       {days, note}, {day: "note", open: <text>}); a lone time, wrong types
- *       and junk are left out; the declared form keeps its text.
+ *       {days, note}, {day: "note", open: <text>}); "closed"/"stengt" in a
+ *       time field is a closed day ("Stengt"); a lone time, wrong types and
+ *       junk are left out; the declared form keeps its text.
  *   (d) the compact text of lokal_info and the auto-reply: the declared form
- *       as before ("Man 10:00–17:00", note left out), the other forms read.
+ *       as before ("Man 10:00–17:00", note left out), the other forms read;
+ *       "; " between entries when one has a comma of its own.
  *   (e) the day and time in Norway (Europe/Oslo), across midnight and the
- *       summer-time change.
+ *       summer-time change; clock times as minutes and as "HH:MM".
  *   (f) openingStatusAt: long and Norwegian day names and ranges are matched
  *       (Kringler Gjestegård, monday…saturday, said "Stengt" on Saturday
- *       noon); closing time is exclusive; split hours; entries that cannot say
- *       whether it is open (no weekday, a period, text, a time that is not a
- *       clock time) give no claim.
+ *       noon); closing time is exclusive; split hours; hours past midnight
+ *       (Tromsø and Trondhjem Mikrobryggeri, 12:00–01:30) count on the next
+ *       day; entries that cannot say whether it is open (no weekday, a period,
+ *       text, a time that is not a clock time, equal times) give no claim.
  *   (g) the producers of the review's live sample whose hours the page, or
  *       lokal_info and the auto-reply, did not show (their stored values,
  *       2026-10-17): each now has entries with its days and times or text.
@@ -42,6 +45,7 @@ import {
   osloWeekdayAndMinutes,
   openingStatusAt,
   timeMinutes,
+  clockTime,
   WEEKDAY_NAMES,
   type OpeningHoursEntry,
 } from "./opening-hours";
@@ -159,6 +163,19 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
     assertEq(n([{ day: "Varierer", open: "16:00", close: "17:00", note: "Utlevering skjer på avtalt tid og sted." }]),
       [{ days: [], label: "Varierer", open: "16:00", close: "17:00", note: "Utlevering skjer på avtalt tid og sted." }],
       "c a label that is no weekday keeps its times");
+    // "closed" in the time fields (Aarsland Gårdsutsalg, Havens Kolonial, The ODD Bakery, Haugli Bakeri, live 2026-10-17).
+    assertEq(n([{ day: "sun", open: "closed", close: "closed" }, { day: "mon", open: " Closed ", close: "closed" }]), [
+      { days: [6], label: "sun", note: "Stengt" },
+      { days: [0], label: "mon", note: "Stengt" },
+    ], "c closed: \"closed\" as both times is a closed day, the note \"Stengt\" (main: \"closed – closed\")");
+    assertEq(n([{ day: "tue", open: "stengt" }, { day: "wed", close: "Stengd" }, { day: "Mandag", hours: "stengt" }, { day: "sun", open: "closed", close: "closed", note: "Stengt" }]), [
+      { days: [1], label: "tue", note: "Stengt" },
+      { days: [2], label: "wed", note: "Stengt" },
+      { days: [0], label: "Mandag", note: "Stengt" },
+      { days: [6], label: "sun", note: "Stengt" },
+    ], "c closed: \"stengt\"/\"stengd\" alone in a time or hours field too; the note is not repeated");
+    assertEq(n([{ day: "thu", open: "10:00", close: "closed" }]), [{ days: [3], label: "thu", open: "10:00", close: "closed" }],
+      "c closed: beside a time it is not read as a closed day (kept as written, not guessed)");
     assertEq(n([{ day: "mon-fri", open: 10, close: 17 }, { day: "sun", open: 0, close: 24 }]), [
       { days: [0, 1, 2, 3, 4], label: "mon-fri", open: "10", close: "17" },
       { days: [6], label: "sun", open: "0", close: "24" },
@@ -203,6 +220,14 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
     assertEq(text([{ days: "Torsdag", period: "Sommer", note: "Kun bestilling" }]), "Tor: Sommer; Kun bestilling", "d a period and a note without times");
     assertEq(text([{ open: "09:00", close: "12:00" }, { day: 1, open: 10, close: 17 }]), "09:00–12:00, 10–17", "d no day: just the times");
     assertEq(text("  Man–fre 10–17  "), "Man–fre 10–17", "d free text for the whole field, trimmed");
+    assertEq(text([{ day: "sun", open: "closed", close: "closed" }, { day: "mon", open: "10:00", close: "17:00" }]), "Søn: Stengt, Man 10:00–17:00",
+      "d a closed day is \"Stengt\" (main: \"Søn closed–closed\")");
+    // Ål Markedshage (live 2026-10-17): its notes have commas of their own.
+    assertEq(text([{ note: "Boden (selvbetjent): uke 20-41, døgnåpen" }, { day: "Lørdag", open: "11:00", close: "15:00", note: "Stabbursbutikken i sesong" }, { note: "Julebutikk: fra uke 42, lør 11-15, tor 17-20" }]),
+      "Boden (selvbetjent): uke 20-41, døgnåpen; Lør 11:00–15:00; Julebutikk: fra uke 42, lør 11-15, tor 17-20",
+      "d an entry with a comma of its own: \"; \" between the entries, so each one's end is clear");
+    assertEq(text([{ day: "Lørdag", hours: "10:00-12:00, 14:00-16:00" }, { day: "sun", open: "12:00", close: "15:00" }]), "Lør: 10:00-12:00, 14:00-16:00; Søn 12:00–15:00",
+      "d two ranges kept as text in one entry: \"; \" between the entries");
     assertEq([text(null), text([]), text({}), text(7), text([null, {}, "  "])], ["", "", "", "", ""], "d nothing usable gives no text");
     const nine = Array.from({ length: 9 }, (_, i) => ({ day: "mon", open: `0${i}:00`, close: "17:00" }));
     assertEq(openingHoursText([null, ...nine], 7).split(", ").length, 7, "d max: at most that many entries; unusable ones take no slot");
@@ -224,6 +249,10 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
       [600, 630, 630, 545, 1440, 0], "e clock times");
     assertEq([timeMinutes("24:01"), timeMinutes("25"), timeMinutes("10:60"), timeMinutes("<b>10</b>"), timeMinutes("10am"), timeMinutes("")],
       [null, null, null, null, null, null], "e text that is not a clock time");
+    assertEq(["09:30", "9", "9:05", "12.00", " 10 ", "0", "24:00", "00:00", "17:30"].map(clockTime),
+      ["09:30", "09:00", "09:05", "12:00", "10:00", "00:00", "24:00", "00:00", "17:30"], "e clockTime: \"HH:MM\"; the identity for \"HH:MM\"");
+    assertEq(["closed", "Stengt", "10am", "25:00", "10:60", "", "<b>10</b>", "12.00 – 18.00"].map(clockTime),
+      [null, null, null, null, null, null, null, null], "e clockTime: none for text that is not a clock time");
   }
 
   // ══ (f) openingStatusAt ══════════════════════════════════════════════
@@ -269,6 +298,55 @@ export function runOpeningHoursTests(opts: { log?: boolean } = {}): TestSummary 
     }
     assertEq(label(status([{ day: "Varierer", open: "00:00", close: "24:00" }, { day: "fri", open: "10:00", close: "17:00" }], "2026-10-17T10:00:00Z")),
       { isOpen: false, today: null }, "f an entry that cannot say is ignored beside one that can");
+
+    // Hours past midnight: the closing time is on the next day. Tromsø and
+    // Trondhjem Mikrobryggeri, live 2026-10-17 (the review measured "Stengt"
+    // at 186 of 476 instants they were open). 2026-10-12 is a Monday; Oslo is
+    // UTC+2 until 2026-10-25.
+    const tromso = [
+      ...["mon", "tue", "wed", "thu"].map((day) => ({ day, open: "12:00", close: "01:30" })),
+      { day: "fri", open: "12:00", close: "03:00" }, { day: "sat", open: "12:00", close: "03:00" }, { day: "sun", open: "18:00", close: "01:30" },
+    ];
+    const trondhjem = [
+      { day: "mon", open: "16:00", close: "23:00" }, { day: "tue", open: "16:00", close: "23:00" }, { day: "wed", open: "15:00", close: "23:00" },
+      { day: "thu", open: "15:00", close: "23:00" }, { day: "fri", open: "14:00", close: "01:00" }, { day: "sat", open: "12:00", close: "01:00" },
+    ];
+    for (const [why, hours, iso, expected] of [
+      ["Tromsø Monday 19:30 is open (head before: \"Stengt 12:00–01:30\")", tromso, "2026-10-12T17:30:00Z", { isOpen: true, today: "12:00–01:30" }],
+      ["Tromsø Monday 12:00, the opening time, is open", tromso, "2026-10-12T10:00:00Z", { isOpen: true, today: "12:00–01:30" }],
+      ["Tromsø Monday 11:59 is closed", tromso, "2026-10-12T09:59:00Z", { isOpen: false, today: "12:00–01:30" }],
+      ["Tromsø Tuesday 00:30 is open on Monday's entry", tromso, "2026-10-12T22:30:00Z", { isOpen: true, today: "12:00–01:30" }],
+      ["Tromsø Tuesday 01:29 is still open", tromso, "2026-10-12T23:29:00Z", { isOpen: true, today: "12:00–01:30" }],
+      ["Tromsø Tuesday 01:30 is closed (the closing time is exclusive); today's entry is shown", tromso, "2026-10-12T23:30:00Z", { isOpen: false, today: "12:00–01:30" }],
+      ["Tromsø Tuesday 02:00 is closed", tromso, "2026-10-13T00:00:00Z", { isOpen: false, today: "12:00–01:30" }],
+      ["Tromsø Friday 21:00 is open", tromso, "2026-10-16T19:00:00Z", { isOpen: true, today: "12:00–03:00" }],
+      ["Tromsø Saturday 02:59 is open on Friday's 12:00–03:00", tromso, "2026-10-17T00:59:00Z", { isOpen: true, today: "12:00–03:00" }],
+      ["Tromsø Saturday 03:00 is closed", tromso, "2026-10-17T01:00:00Z", { isOpen: false, today: "12:00–03:00" }],
+      ["Tromsø Sunday 17:00 is closed (Sunday opens 18:00)", tromso, "2026-10-18T15:00:00Z", { isOpen: false, today: "18:00–01:30" }],
+      ["Tromsø Monday 01:00 is open on Sunday's 18:00–01:30 (over the week's end)", tromso, "2026-10-11T23:00:00Z", { isOpen: true, today: "18:00–01:30" }],
+      ["Tromsø Tuesday 00:30 in winter time (UTC+1)", tromso, "2026-10-26T23:30:00Z", { isOpen: true, today: "12:00–01:30" }],
+      ["Trondhjem Friday 21:00 is open (head before: \"Stengt 14:00–01:00\")", trondhjem, "2026-10-16T19:00:00Z", { isOpen: true, today: "14:00–01:00" }],
+      ["Trondhjem Saturday 00:30 is open on Friday's entry", trondhjem, "2026-10-16T22:30:00Z", { isOpen: true, today: "14:00–01:00" }],
+      ["Trondhjem Sunday 00:30 is open on Saturday's entry (no Sunday entry)", trondhjem, "2026-10-17T22:30:00Z", { isOpen: true, today: "12:00–01:00" }],
+      ["Trondhjem Sunday 01:00 is closed, no entry today", trondhjem, "2026-10-17T23:00:00Z", { isOpen: false, today: null }],
+      ["Trondhjem Monday 00:30 is closed: Sunday has no entry to run past midnight", trondhjem, "2026-10-18T22:30:00Z", { isOpen: false, today: "16:00–23:00" }],
+      ["Trondhjem Tuesday 00:30 is closed: Monday closes 23:00", trondhjem, "2026-10-19T22:30:00Z", { isOpen: false, today: "16:00–23:00" }],
+      ["a range past midnight: Fre–lør 20:00–02:00, Sunday 01:00 is open on Saturday's", [{ day: "Fre–lør", open: "20:00", close: "02:00" }], "2026-10-17T23:00:00Z", { isOpen: true, today: "20:00–02:00" }],
+      ["a range past midnight: Friday 01:00 is closed (Thursday is not in it)", [{ day: "Fre–lør", open: "20:00", close: "02:00" }], "2026-10-15T23:00:00Z", { isOpen: false, today: "20:00–02:00" }],
+      ["18:00–00:00 is open at 23:59", [{ day: "sat", open: "18:00", close: "00:00" }], "2026-10-17T21:59:00Z", { isOpen: true, today: "18:00–00:00" }],
+      ["18:00–00:00 is closed at midnight", [{ day: "sat", open: "18:00", close: "00:00" }], "2026-10-17T22:00:00Z", { isOpen: false, today: null }],
+    ] as Array<[string, unknown, string, unknown]>) {
+      assertEq(label(status(hours, iso)), expected, `f past midnight: ${why}`);
+    }
+    // Equal times: "00:00–00:00" is closed all day to schema.org and open all
+    // day elsewhere, so such an entry cannot say.
+    assertEq(status([{ day: "sat", open: "00:00", close: "00:00" }], "2026-10-17T10:00:00Z"), null, "f no claim: only equal times (00:00–00:00)");
+    assertEq(label(status([{ day: "sat", open: "10:00", close: "10:00" }, { day: "fri", open: "10:00", close: "17:00" }], "2026-10-17T10:00:00Z")),
+      { isOpen: false, today: null }, "f equal times are ignored beside an entry that can say");
+    assertEq(status([{ day: "sun", open: "closed", close: "closed" }], "2026-10-18T10:00:00Z"), null,
+      "f no claim: only a closed day (\"closed\" in the time fields gives no times)");
+    assertEq(label(status([{ day: "sun", open: "closed", close: "closed" }, { day: "mon", open: "10:00", close: "17:00" }], "2026-10-18T10:00:00Z")),
+      { isOpen: false, today: null }, "f a closed day beside timed days is closed");
   }
 
   // ══ (g) the review's live sample: these producers now show their hours ══
