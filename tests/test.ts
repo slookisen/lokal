@@ -42610,6 +42610,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-S2 (b): the
+// producers behind label rows fill the free places of an offers page in the
+// additive field category_matches (one entry per producer, nearest first, no
+// product id, never a producer already in offers, left out when empty, offers
+// unchanged), on GET /catalog/offers and lokal_find_offers (counted as
+// delivered), and as contact rows on the shopping list page. Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-S2b (category_matches in the offers) ──");
+  try {
+    const { runRfbKategoritreffIOffersTests } = require("../src/routes/rfb-kategoritreff-i-offers.test") as
+      typeof import("../src/routes/rfb-kategoritreff-i-offers.test");
+    const r = await runRfbKategoritreffIOffersTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-kategoritreff-i-offers: " + f);
+    console.log(`  rfb-kategoritreff-i-offers: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-kategoritreff-i-offers: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

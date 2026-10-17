@@ -326,7 +326,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
       // GET /api/marketplace/catalog/offers — also what the shopping list page (handleliste-page.ts) fetches.
       for (const [q, near, key] of [["honning", "Trondheim", "honningT"], ["egg", "Bergen", "eggB"]] as const) {
         const r = await callRoute(catalogRouter, "/offers", { q, near, radius_km: "50", limit: "5" });
-        assertEq([r.status, Object.keys(r.body).sort()], [200, ["offers", "term"]], `GET /catalog/offers «${q}» near ${near}: 200, envelope unchanged`);
+        // I-S2 adds category_matches beside offers when the page has room (rfb-kategoritreff-i-offers.test.ts).
+        assertEq([r.status, Object.keys(r.body).sort()], [200, ["category_matches", "offers", "term"]],
+          `GET /catalog/offers «${q}» near ${near}: 200, {term, offers} plus I-S2's category_matches`);
         assertEq(r.body, searches[key], `GET /catalog/offers «${q}» near ${near}: findOffers' filtered result`);
       }
       const r = await tools.get("lokal_find_offers")!.handler({ items: ["honning", "egg"], near: "Trondheim" });
@@ -422,7 +424,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
         honningB: await findOffers({ q: "honning", near: "Bergen" }),
         eggB: await findOffers({ q: "egg", near: "Bergen" }),
       };
-      assertEq(again, searches, "byte-like: real products and owner-set rows are the same offers, field by field, with or without the label rows");
+      const offersOf = (r: Record<string, { offers: unknown[] }>) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v.offers]));
+      assertEq(offersOf(again), offersOf(searches),
+        "byte-like: real products and owner-set rows are the same offers, field by field, with or without the label rows");
     }
   } finally {
     console.log = prevLog;
