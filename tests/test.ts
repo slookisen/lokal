@@ -11549,6 +11549,11 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
       JSON.stringify(channels) === JSON.stringify(["a2a-registry", "agenstry", "custom-gpt", "glama", "mcp-so", "npm", "official-mcp-registry", "smithery"]),
       `pr-56: x-distribution channels are exactly [a2a-registry, agenstry, custom-gpt, glama, mcp-so, npm, official-mcp-registry, smithery] (got ${JSON.stringify(channels)})`
     );
+    const urlOf = (c: string) => (dist || []).find((d: any) => d.channel === c)?.url;
+    assertTrue(
+      urlOf("glama") === "https://glama.ai/mcp/servers/slookisen/lokal" && urlOf("mcp-so") === "https://mcp.so/servers/rett-fra-bonden-lokal",
+      "pr-56: x-distribution glama + mcp-so point to the live listings (G1-S4)"
+    );
     const a2aEntry = (dist || []).find((d: any) => d.channel === "a2a-registry");
     assertTrue(
       a2aEntry && typeof a2aEntry.install === "string" &&
