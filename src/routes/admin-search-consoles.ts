@@ -5,8 +5,9 @@
 // A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c. One week's rows per
 // domain from Google Search Console and Bing Webmaster Tools, as the weekly
 // job in services/search-console-fetch.ts stored them in search_console_weekly,
-// or an explicit `unavailable` reason per domain and source; plus
-// bing.sitemaps per domain and the same connection status /health shows.
+// or an explicit `unavailable` reason per domain and source (and `ui_only`
+// for the AI numbers only the console UI has); plus bing.sitemaps per domain
+// and the same connection and fetch status /health shows.
 // `week` is any day of the wanted Monday–Sunday week (default: the latest
 // complete week). The visibility routine
 // (A2A scheduled-agents/rfb-ai-visibility-growth.md, S6d) reads it.

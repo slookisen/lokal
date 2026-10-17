@@ -1487,7 +1487,7 @@ app.listen(Number(PORT), HOST, async () => {
   startTrafficHistoryScheduler({ getDb: () => getDb(), bootDelayMs: 6 * 60_000 });
 
   // ─── GSC and Bing Webmaster (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c)
-  // Read-only connectivity check 2 min after boot (inside the boot-job gate),
+  // Read-only connectivity check 2 min after boot (after the boot-job gate),
   // then every 24 h; the same run fetches the latest complete week into
   // search_console_weekly. Runs when GSC_SERVICE_ACCOUNT_JSON and/or
   // BING_WEBMASTER_API_KEY is set; SEARCH_CONSOLE_FETCH_ENABLED=0 turns it off.

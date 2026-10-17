@@ -39,7 +39,8 @@ export const TRAFFIC_PREWARM_BOOT_DELAY_MS = 60 * 1000;
 export const DENTAL_GEOCODE_BOOT_DELAY_MS = 3 * 60 * 1000;
 export const EXPERIENCES_GEOCODE_BOOT_DELAY_MS = 6 * 60 * 1000;
 /** First GSC/Bing connectivity check (services/search-console-fetch.ts, A2A 2026-10-16-gsc-bing-ai-rapporter):
- *  a few small HTTPS calls, run inside runExclusiveBootJob in the free slot before the 3 min geocode. */
+ *  a few small HTTPS calls in the free slot before the 3 min geocode. It waits for runExclusiveBootJob,
+ *  then makes the calls outside the gate (network waits, almost no CPU). */
 export const SEARCH_CONSOLE_BOOT_DELAY_MS = 2 * 60 * 1000;
 
 /** Resolve on the next macrotask so queued I/O and timers can run. */

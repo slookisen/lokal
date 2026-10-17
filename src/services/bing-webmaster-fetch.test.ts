@@ -2,8 +2,9 @@
  * bing-webmaster-fetch.test.ts — A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c.
  *
  * The Bing Webmaster client against a fetch stub passed as fetchImpl (no network): request shape, GetUserSites
- * parsing (verification codes dropped), site matching, error classification, /Date(…)/ parsing
- * and the weekly sums. The job around it is tested in search-console-fetch.test.ts.
+ * parsing (verification codes dropped), site matching, error classification (auth_failed /
+ * no_access / error), /Date(…)/ parsing, the weekly sums and the sitemaps' own dates. The job
+ * around it is tested in search-console-fetch.test.ts.
  */
 import {
   BING_API_BASE,
@@ -11,6 +12,7 @@ import {
   fetchBingWeek,
   matchBingSite,
   parseBingDate,
+  parseBingInstant,
   parseBingUserSites,
   readBingApiKey,
 } from "./bing-webmaster-fetch";
@@ -119,7 +121,7 @@ export async function runBingWebmasterFetchTests(opts: { log?: boolean } = {}): 
     const e1 = await failOf({ status: 400, body: { ErrorCode: 3, Message: "InvalidApiKey" } });
     t(e1?.status === "auth_failed" && e1.reason === "bing_InvalidApiKey", "E1: 400 ErrorCode 3 -> auth_failed bing_InvalidApiKey");
     const e2 = await failOf({ status: 400, body: { ErrorCode: 14, Message: "NotAuthorized" } });
-    t(e2?.status === "auth_failed" && e2.reason === "bing_NotAuthorized", "E2: ErrorCode 14 -> auth_failed bing_NotAuthorized");
+    t(e2?.status === "no_access" && e2.reason === "bing_NotAuthorized", "E2: ErrorCode 14 -> no_access bing_NotAuthorized (the key works, not for this; S6a §6)");
     const e3 = await failOf({ status: 400, body: { ErrorCode: 4, Message: "ThrottleUser" } });
     t(e3?.status === "error" && e3.reason === "bing_ThrottleUser", "E3: ErrorCode 4 -> error bing_ThrottleUser");
     const e4 = await failOf({ status: 401, raw: "" });
@@ -147,6 +149,13 @@ export async function runBingWebmasterFetchTests(opts: { log?: boolean } = {}): 
       "D2: no offset = UTC; a positive offset shifts the other way");
     t(parseBingDate("2011-09-16") === null && parseBingDate(null) === null && parseBingDate("/Date(x)/") === null, "D3: anything else -> null");
     t(parseBingDate(bingDay(5)) === "2026-10-05" && parseBingDate(bingDay(11)) === "2026-10-11", "D4: the fixture days parse to themselves");
+    // Instants on a day boundary of the offset's zone: a flipped sign gives the other day.
+    t(parseBingDate("/Date(1316131200000-0700)/") === "2011-09-15" && parseBingDate("/Date(1316127600000+0100)/") === "2011-09-16",
+      "D5: the offset's sign is applied the right way (00:00Z at -07:00 is still the 15th; 23:00Z at +01:00 is already the 16th)");
+    t(parseBingInstant("/Date(1316156400000-0700)/") === 1316156400000 && parseBingInstant("/Date(1316156400000)/") === 1316156400000,
+      "D6: parseBingInstant gives the instant itself; the offset does not move it");
+    t(parseBingInstant("/Date(-62135596800000)/") === null && parseBingInstant("/Date(0)/") === null && parseBingInstant("2011-09-16") === null &&
+      parseBingInstant(undefined) === null, "D7: DateTime.MinValue (never), 0 and non-dates -> null");
 
     // ── weekly numbers ──
     const week = { start: "2026-10-05", end: "2026-10-11" };
@@ -167,25 +176,53 @@ export async function runBingWebmasterFetchTests(opts: { log?: boolean } = {}): 
           },
         };
       }
-      if (method === "GetFeeds") return { status: 200, body: { d: [{ Url: "https://rettfrabonden.com/sitemap.xml", UrlCount: 1200 }, { Url: "https://rettfrabonden.com/s2.xml", UrlCount: 30 }] } };
+      if (method === "GetFeeds") {
+        return {
+          status: 200,
+          body: {
+            d: [
+              { Url: "https://rettfrabonden.com/sitemap.xml", UrlCount: 1200, Submitted: "/Date(1783000000000-0700)/", LastCrawled: "/Date(1791500000000-0700)/" },
+              { Url: "https://rettfrabonden.com/s2.xml", UrlCount: 30, Submitted: "/Date(1785000000000-0700)/", LastCrawled: "/Date(-62135596800000)/" },
+            ],
+          },
+        };
+      }
       return { status: 404, raw: "" };
     });
     const w1 = await fetchBingWeek(API_KEY, "https://rettfrabonden.com/", week, { fetchImpl: weekly.fetchImpl });
     const val = (m: string) => (w1.ok ? w1.rows.find((r) => r.metric === m && r.dimension === "total")?.value : undefined);
     t(w1.ok && val("clicks") === 6 && val("impressions") === 100, "W1: clicks/impressions summed over Monday–Sunday only");
     t(val("sitemaps") === 2 && val("sitemap_urls") === 1230, "W2: sitemaps = top-level feeds, sitemap_urls = their UrlCount");
+    t(val("sitemap_last_submitted_ms") === 1785000000000 && val("sitemap_last_crawled_ms") === 1791500000000,
+      "W2b (AC4): the sitemaps' own latest Submitted / LastCrawled are kept (epoch ms; a MinValue «never» is skipped)");
     t(weekly.calls.length === 2 && weekly.calls.every((c) => c.url.searchParams.get("siteUrl") === "https://rettfrabonden.com/" &&
       c.url.searchParams.get("apikey") === API_KEY), "W3: both calls carry siteUrl as Bing lists it, and the key");
 
     const empty = stubFetch(() => ({ status: 200, body: { d: null } }));
     const w2 = await fetchBingWeek(API_KEY, "https://finn-tannlege.com/", week, { fetchImpl: empty.fetchImpl });
     t(w2.ok && w2.rows.length === 4 && w2.rows.every((r) => r.value === 0),
-      "W4: no traffic and no sitemaps -> clicks, impressions, sitemaps, sitemap_urls all 0 (sitemap count 0 is a real answer)");
+      "W4: no traffic and no sitemaps -> clicks, impressions, sitemaps, sitemap_urls all 0 (sitemap count 0 is a real answer), no date rows");
     const feedsDown = stubFetch((url) => url.pathname.endsWith("GetFeeds") ? { status: 500, raw: "" } : { status: 200, body: { d: [] } });
     const w3 = await fetchBingWeek(API_KEY, "https://finn-tannlege.com/", week, { fetchImpl: feedsDown.fetchImpl });
     t(!w3.ok && w3.failure.reason === "http_500", "W5: a failing GetFeeds fails the week (nothing half-stored)");
     const badTraffic = await fetchBingWeek(API_KEY, "https://x.no/", week, { fetchImpl: stubFetch(() => ({ status: 200, body: { d: {} } })).fetchImpl });
     t(!badTraffic.ok && badTraffic.failure.reason === "unexpected_response", "W6: traffic d not a list -> unexpected_response");
+
+    // In the fetch step a 403 or NotAuthorized is about this one site: no_access; a rejected key stays auth_failed.
+    const stepFail = async (reply: Reply, on: "GetRankAndTrafficStats" | "GetFeeds") => {
+      const f = stubFetch((url) => (url.pathname.endsWith(on) ? reply : { status: 200, body: { d: [] } }));
+      const r = await fetchBingWeek(API_KEY, "https://x.no/", week, { fetchImpl: f.fetchImpl });
+      return r.ok ? null : r.failure;
+    };
+    const n403 = await stepFail({ status: 403, raw: "" }, "GetRankAndTrafficStats");
+    const n403b = await stepFail({ status: 403, raw: "" }, "GetFeeds");
+    const n14 = await stepFail({ status: 400, body: { ErrorCode: 14, Message: "NotAuthorized" } }, "GetRankAndTrafficStats");
+    t(n403?.status === "no_access" && n403.reason === "http_403" && n403b?.status === "no_access" && n14?.status === "no_access" &&
+      n14.reason === "bing_NotAuthorized", "W8: fetch step: 403 / ErrorCode 14 -> no_access (S6a §3/§6)");
+    const a401 = await stepFail({ status: 401, raw: "" }, "GetRankAndTrafficStats");
+    const a3 = await stepFail({ status: 400, body: { ErrorCode: 3, Message: "InvalidApiKey" } }, "GetFeeds");
+    t(a401?.status === "auth_failed" && a3?.status === "auth_failed" && a3.reason === "bing_InvalidApiKey",
+      "W9: fetch step: 401 / InvalidApiKey stay auth_failed");
 
     t(SEARCH_CONSOLE_DOMAINS.length === 3, "W7: three domains are checked by default");
   } catch (err: any) {

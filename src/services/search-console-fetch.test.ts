@@ -4,10 +4,13 @@
  *
  * No network: every call passes a fetch stub (fetchImpl) that answers as Google / Bing and fails
  * on anything else, and the service-account key is an RSA key generated here with node:crypto. Covers the GSC client (JWT,
- * token exchange, sites.list, Search Analytics), the job (status transitions, weekly upsert,
- * kill switch, missing secrets), /health (synchronous, additive), the scheduler (boot delay,
- * exclusive gate), GET /admin/analytics/search-consoles, the init.ts table, and that no secret
- * reaches a log line, an error, /health or the admin JSON.
+ * token exchange, sites.list, Search Analytics), the week rule (≥ 72 h after the Pacific-Time week
+ * end, checked hour by hour over 2026), the job (status transitions, weekly upsert, the one
+ * refetch after a week settles, check status kept apart from the fetch result, 403 / NotAuthorized
+ * in the fetch step = no_access, kill switch, missing secrets), /health (synchronous, additive),
+ * the scheduler (boot delay, waits for the exclusive gate but does not hold it),
+ * GET /admin/analytics/search-consoles, the init.ts table, and that no secret reaches a log line,
+ * an error, /health or the admin JSON.
  */
 import Database from "better-sqlite3";
 import * as crypto from "crypto";
@@ -29,7 +32,10 @@ import {
   getSearchConsolesHealth,
   gscHasAccess,
   isSearchConsoleFetchEnabled,
+  isSearchConsoleWeekOverFor,
+  isSearchConsoleWeekProvisional,
   matchGscProperty,
+  needsSearchConsoleFetch,
   parseGscSites,
   readGscCredentials,
   redactSecrets,
@@ -42,6 +48,7 @@ import {
 } from "./search-console-fetch";
 import { runExclusiveBootJob, SEARCH_CONSOLE_BOOT_DELAY_MS, DENTAL_GEOCODE_BOOT_DELAY_MS, TRAFFIC_PREWARM_BOOT_DELAY_MS } from "./boot-job-gate";
 import { SEARCH_CONSOLE_CHECK_INTERVAL_MS, SEARCH_CONSOLE_DOMAINS, SEARCH_CONSOLE_STATUSES, GSC_BREAKDOWNS, GSC_METRICS } from "../config/search-consoles";
+import { addDays } from "./traffic-history-compute";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
@@ -73,7 +80,7 @@ const PEM_LINE = PRIV_PEM.split("\n")[5]; // a line of the key body
 const SECRET_MARKERS = [SA_JSON, PRIV_PEM, PEM_LINE, CLIENT_EMAIL, BING_KEY, ACCESS_TOKEN, AUTH_CODE, DNS_CODE, KEY_ID];
 
 const ENV_BOTH = { GSC_SERVICE_ACCOUNT_JSON: SA_JSON, BING_WEBMASTER_API_KEY: BING_KEY } as NodeJS.ProcessEnv;
-// Saturday 2026-10-17: the latest complete week (Sunday ≥ 4 days old) is Mon 2026-10-05 .. Sun 2026-10-11.
+// Saturday 2026-10-17: the latest week over for ≥ 72 h (Pacific Time) is Mon 2026-10-05 .. Sun 2026-10-11.
 const NOW = new Date("2026-10-17T12:00:00.000Z");
 const WEEK = "2026-10-05";
 
@@ -102,6 +109,8 @@ const GSC_SITES_ALL = [
 const bingSite = (url: string, verified = true) => ({ __type: "Site:#Microsoft.Bing.Webmaster.Api", AuthenticationCode: AUTH_CODE, DnsVerificationCode: DNS_CODE, IsVerified: verified, Url: url });
 const BING_SITES_ALL = [bingSite("https://rettfrabonden.com/"), bingSite("https://opplevagent.no/"), bingSite("https://finn-tannlege.com/")];
 const bingDay = (day: number) => `/Date(${Date.UTC(2026, 9, day, 7, 0, 0)}-0700)/`;
+const SITEMAP_SUBMITTED_MS = Date.UTC(2026, 6, 4, 12, 0, 0);
+const SITEMAP_CRAWLED_MS = Date.UTC(2026, 9, 16, 3, 0, 0);
 
 /** Google + Bing as one stub; `over` replaces a single endpoint's reply. */
 interface Scenario {
@@ -138,7 +147,15 @@ function fakeApis(scn: Scenario = {}) {
       if (method === "GetFeeds") {
         if (scn.bingFeeds) return scn.bingFeeds(siteUrl);
         // finn-tannlege.com has no sitemap in Bing (the 2026-07-04 import showed «Sitemaps Count: 0»).
-        return { status: 200, body: { d: siteUrl.includes("finn-tannlege") ? [] : [{ Url: `${siteUrl}sitemap.xml`, UrlCount: 500, Status: "Success" }] } };
+        return {
+          status: 200,
+          body: {
+            d: siteUrl.includes("finn-tannlege") ? [] : [{
+              Url: `${siteUrl}sitemap.xml`, UrlCount: 500, Status: "Success",
+              Submitted: `/Date(${SITEMAP_SUBMITTED_MS}-0700)/`, LastCrawled: `/Date(${SITEMAP_CRAWLED_MS}-0700)/`,
+            }],
+          },
+        };
       }
     }
     return new Error(`unexpected request ${url.origin}${url.pathname}`);
@@ -162,6 +179,17 @@ function callRoute(router: any, url: string, headers: Record<string, string> = {
 }
 
 const tick = () => new Promise<void>((r) => setImmediate(r));
+/** Let queued work run until `cond` holds (bounded, so a broken run fails the test instead of hanging). */
+const until = async (cond: () => boolean, maxTicks = 500) => {
+  for (let i = 0; i < maxTicks && !cond(); i++) await tick();
+};
+
+/** The real end of a GSC week: the following Monday 00:00 in America/Los_Angeles (PDT or PST), via Intl. */
+const laHour = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", hour: "numeric", hourCycle: "h23" });
+const ptWeekEndMs = (weekStart: string) => {
+  const mondayAt7Z = Date.parse(`${addDays(weekStart, 7)}T07:00:00Z`);
+  return Number(laHour.format(new Date(mondayAt7Z))) === 0 ? mondayAt7Z : mondayAt7Z + 3_600_000;
+};
 
 export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   let passed = 0;
@@ -345,10 +373,33 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
 
     // ── week, kill switch, redaction ──
     t(targetSearchConsoleWeek(NOW) === WEEK, "W1: Saturday 2026-10-17 -> week of Monday 2026-10-05");
-    t(targetSearchConsoleWeek(new Date("2026-10-15T00:00:00Z")) === "2026-10-05" && targetSearchConsoleWeek(new Date("2026-10-14T23:59:59Z")) === "2026-09-28",
-      "W2: a week is due once its Sunday is 4 days old (Thursday), not before");
+    t(targetSearchConsoleWeek(new Date("2026-10-15T00:05:00Z")) === "2026-09-28" &&
+      targetSearchConsoleWeek(new Date("2026-10-15T07:59:59Z")) === "2026-09-28" && targetSearchConsoleWeek(new Date("2026-10-15T08:00:00Z")) === WEEK,
+      "W2: PDT: the week ending Sunday 2026-10-11 (PT, Mon 07:00Z) is due Thursday 08:00Z (73 h), not Thursday 00:00Z (65 h)");
+    t(targetSearchConsoleWeek(new Date("2026-11-19T07:59:59Z")) === "2026-11-02" && targetSearchConsoleWeek(new Date("2026-11-19T08:00:00Z")) === "2026-11-09",
+      "W2b: PST: the week ending Sunday 2026-11-15 (Mon 08:00Z) is due exactly 72 h later");
+    {
+      let bad = 0;
+      let hours = 0;
+      for (let ms = Date.UTC(2026, 0, 1); ms < Date.UTC(2027, 0, 1); ms += 3_600_000, hours++) {
+        const wk = targetSearchConsoleWeek(new Date(ms));
+        const sinceEndH = (ms - ptWeekEndMs(wk)) / 3_600_000;
+        const sinceNextEndH = (ms - ptWeekEndMs(addDays(wk, 7))) / 3_600_000;
+        if (sinceEndH < 72 || sinceNextEndH >= 73) bad++;
+      }
+      t(hours === 8760 && bad === 0,
+        "W2c: every hour of 2026, both DST switches included: the target week has been over ≥ 72 h in Pacific Time, and the next one is due at most 1 h late");
+    }
     t(targetSearchConsoleWeek(new Date("2026-01-03T12:00:00Z")) === "2025-12-22", "W3: across New Year");
     t(JSON.stringify(searchConsoleWeekRange(WEEK)) === JSON.stringify({ start: "2026-10-05", end: "2026-10-11" }), "W4: range Monday..Sunday");
+    t(isSearchConsoleWeekProvisional(WEEK, NOW.toISOString()) && isSearchConsoleWeekProvisional(WEEK, "2026-10-19T07:59:59.000Z") &&
+      !isSearchConsoleWeekProvisional(WEEK, "2026-10-19T08:00:00.000Z") && isSearchConsoleWeekOverFor(WEEK, new Date("2026-10-19T08:00:00Z"), 7) &&
+      !isSearchConsoleWeekOverFor(WEEK, new Date("2026-10-19T07:59:59Z"), 7),
+      "W8: rows fetched within 7 × 24 h of the week's end (PT) are provisional; from then on they are settled");
+    t(needsSearchConsoleFetch(WEEK, null, NOW) && !needsSearchConsoleFetch(WEEK, NOW.toISOString(), new Date("2026-10-19T07:59:59Z")) &&
+      needsSearchConsoleFetch(WEEK, NOW.toISOString(), new Date("2026-10-19T08:00:00Z")) &&
+      !needsSearchConsoleFetch(WEEK, "2026-10-19T08:00:00.000Z", new Date("2026-10-21T12:00:00Z")),
+      "W9: fetch when nothing is stored, or once more when provisional rows have settled since; never again after that");
     t(isSearchConsoleFetchEnabled({}) && isSearchConsoleFetchEnabled({ SEARCH_CONSOLE_FETCH_ENABLED: "1" }) && isSearchConsoleFetchEnabled({ SEARCH_CONSOLE_FETCH_ENABLED: "" }),
       "W5: on by default (unset, 1, empty)");
     t(["0", "false", " OFF ", "no"].every((x) => !isSearchConsoleFetchEnabled({ SEARCH_CONSOLE_FETCH_ENABLED: x })), "W6: 0 / false / off / no turn it off");
@@ -366,7 +417,11 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       const off = fakeApis();
       const s2 = await job(newDb(), off, { ...ENV_BOTH, SEARCH_CONSOLE_FETCH_ENABLED: "0" });
       t(s2.skipped === "disabled" && off.calls.length === 0, "R3: kill switch -> skipped disabled, 0 calls (check and fetch)");
-      t(health({ ...ENV_BOTH, SEARCH_CONSOLE_FETCH_ENABLED: "0" }).enabled === false, "R4: /health shows enabled:false under the kill switch");
+      const hOff = health({ ...ENV_BOTH, SEARCH_CONSOLE_FETCH_ENABLED: "0" });
+      t(hOff.enabled === false && hOff.gsc.status === "pending" && hOff.gsc.reason === "disabled" && hOff.bing.status === "pending" &&
+        hOff.bing.reason === "disabled" && hOff.gsc.fetch === null, "R4: kill switch with keys set: /health enabled:false, pending with reason disabled (never just pending)");
+      const hOffNoKeys = health({ SEARCH_CONSOLE_FETCH_ENABLED: "0" });
+      t(hOffNoKeys.gsc.status === "unconfigured" && hOffNoKeys.gsc.reason === null, "R4b: kill switch without keys: unconfigured");
     }
 
     // ── job: the happy path, status transitions, idempotent weekly upsert ──
@@ -374,7 +429,8 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       __resetSearchConsolesForTesting();
       const db = newDb();
       const h0 = health();
-      t(h0.gsc.status === "pending" && h0.bing.status === "pending" && h0.gsc.checkedAt === null, "R5: secrets set, nothing run yet -> pending");
+      t(h0.gsc.status === "pending" && h0.bing.status === "pending" && h0.gsc.checkedAt === null && h0.gsc.reason === null && h0.gsc.fetch === null,
+        "R5: secrets set, nothing run yet -> pending, no fetch yet");
 
       // A run in flight: /health stays synchronous, makes no call and still says pending.
       let release!: () => void;
@@ -398,18 +454,23 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       emitted.push(JSON.stringify(s1));
       t(s1.week === WEEK && s1.gsc?.status === "ok" && s1.gsc.count === 3 && s1.gsc.fetched === 3 && s1.gsc.rows === 24,
         "R8: gsc ok, 3 properties, 3 domains × 2 breakdowns × 4 metrics = 24 rows");
-      t(s1.bing?.status === "ok" && s1.bing.count === 3 && s1.bing.fetched === 3 && s1.bing.rows === 12, "R9: bing ok, 3 sites, 3 × 4 rows");
+      t(s1.bing?.status === "ok" && s1.bing.count === 3 && s1.bing.fetched === 3 && s1.bing.rows === 16,
+        "R9: bing ok, 3 sites, 4 rows each + the two sitemap dates where there are sitemaps (2 × 6 + 4)");
       const h1 = health();
       t(h1.gsc.status === "ok" && h1.gsc.properties === 3 && h1.gsc.checkedAt === NOW.toISOString() && h1.gsc.reason === null &&
         h1.bing.status === "ok" && h1.bing.sites === 3 && h1.bing.checkedAt === NOW.toISOString(), "R10: /health after the run: ok, counts, checkedAt");
-      t(Object.keys(h1).join(",") === "enabled,gsc,bing" && Object.keys(h1.gsc).join(",") === "status,properties,checkedAt,reason" &&
-        Object.keys(h1.bing).join(",") === "status,sites,checkedAt,reason", "R11: /health field shape {enabled, gsc{status,properties,checkedAt,reason}, bing{status,sites,checkedAt,reason}}");
+      t(Object.keys(h1).join(",") === "enabled,gsc,bing" && Object.keys(h1.gsc).join(",") === "status,properties,checkedAt,reason,fetch" &&
+        Object.keys(h1.bing).join(",") === "status,sites,checkedAt,reason,fetch",
+        "R11: /health field shape {enabled, gsc{status,properties,checkedAt,reason,fetch}, bing{status,sites,checkedAt,reason,fetch}}");
+      t(JSON.stringify(h1.gsc.fetch) === JSON.stringify({ week: WEEK, status: "ok", stored: 3, reason: null, at: NOW.toISOString() }) &&
+        JSON.stringify(h1.bing.fetch) === JSON.stringify({ week: WEEK, status: "ok", stored: 3, reason: null, at: NOW.toISOString() }),
+        "R11b: /health fetch: the week, ok, 3 domains stored, when");
       const count = () => (db.prepare("SELECT COUNT(*) AS c FROM search_console_weekly").get() as { c: number }).c;
-      t(count() === 36, "R12: 36 rows stored for the week");
+      t(count() === 40, "R12: 40 rows stored for the week (24 GSC + 16 Bing)");
       const row = db.prepare("SELECT * FROM search_console_weekly WHERE domain = 'finn-tannlege.com' AND source = 'bing' AND metric = 'sitemaps'").get() as any;
       t(row && row.week === WEEK && row.dimension === "total" && row.value === 0 && row.fetched_at === NOW.toISOString(),
         "R13: Bing sitemap count 0 for finn-tannlege.com stored with its date");
-      t(logs.some((l) => /^\[search-consoles\] week=2026-10-05 gsc=ok properties=3 fetched=3 rows=24 bing=ok sites=3 fetched=3 rows=12$/.test(l)),
+      t(logs.some((l) => /^\[search-consoles\] week=2026-10-05 gsc=ok properties=3 fetched=3 rows=24 bing=ok sites=3 fetched=3 rows=16$/.test(l)),
         "R14: one summary log line per run");
 
       // Next day: the check runs again, the stored week is not fetched again.
@@ -417,8 +478,8 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       const later = new Date("2026-10-18T12:00:00.000Z");
       const s2 = await job(db, f2, ENV_BOTH, later);
       const queries = f2.calls.filter((c) => c.url.pathname.endsWith("/searchAnalytics/query") || /GetRankAndTrafficStats|GetFeeds/.test(c.url.pathname));
-      t(s2.gsc?.fetched === 0 && s2.bing?.fetched === 0 && queries.length === 0 && f2.calls.length === 3 && count() === 36,
-        "R15: next run: only the 3 check calls; the stored week is not refetched; still 36 rows");
+      t(s2.gsc?.fetched === 0 && s2.bing?.fetched === 0 && queries.length === 0 && f2.calls.length === 3 && count() === 40,
+        "R15: next run (week not settled yet): only the 3 check calls; the stored week is not refetched; still 40 rows");
       t(health().gsc.checkedAt === later.toISOString(), "R16: checkedAt moves with every check");
 
       // Upsert is idempotent and updates in place.
@@ -426,19 +487,24 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       upsertSearchConsoleRows(db, "gsc", "rettfrabonden.com", WEEK, [{ metric: "clicks", dimension: "total", value: 11 }], at2);
       upsertSearchConsoleRows(db, "gsc", "rettfrabonden.com", WEEK, [{ metric: "clicks", dimension: "total", value: 11 }], at2);
       const r2 = db.prepare("SELECT value, fetched_at FROM search_console_weekly WHERE domain = 'rettfrabonden.com' AND source = 'gsc' AND metric = 'clicks' AND dimension = 'total' AND week = ?").get(WEEK) as any;
-      t(count() === 36 && r2.value === 11 && r2.fetched_at === at2, "R17: upsert twice -> same row count, value and fetched_at updated");
+      t(count() === 40 && r2.value === 11 && r2.fetched_at === at2, "R17: upsert twice -> same row count, value and fetched_at updated");
       ensureSearchConsoleWeeklyTable(db);
-      t(count() === 36, "R18: ensuring the table again keeps the rows");
+      t(count() === 40, "R18: ensuring the table again keeps the rows");
 
       // The admin view for that week.
       const view = getSearchConsoleWeekView({ db, week: "2026-10-08", env: ENV_BOTH, now: NOW });
       emitted.push(JSON.stringify(view));
       t(view.week === WEEK && view.weekEnd === "2026-10-11" && view.latestCompleteWeek === WEEK, "R19: ?week=Thursday -> its Monday");
-      t(view.domains.length === 3 && view.domains.every((d) => d.gsc.rows.length === 8 && d.bing.rows.length === 4 && d.gsc.unavailable === null && d.bing.unavailable === null),
-        "R20 (AC2): rows for all three domains from both sources");
+      t(view.domains.length === 3 && view.domains.every((d) => d.gsc.rows.length === 8 && d.bing.rows.length === (d.domain === "finn-tannlege.com" ? 4 : 6) &&
+        d.gsc.unavailable === null && d.bing.unavailable === null), "R20 (AC2): rows for all three domains from both sources");
+      t(view.domains.every((d) => d.gsc.provisional === true && d.bing.provisional === true),
+        "R20b: rows fetched before the week settled are marked provisional");
       const ft = view.bing.sitemaps["finn-tannlege.com"];
-      t(ft.count === 0 && typeof ft.checkedAt === "string" && ft.checkedAt.length > 0 && view.bing.sitemaps["rettfrabonden.com"].count === 1 &&
-        view.bing.sitemaps["rettfrabonden.com"].urls === 500, "R21 (AC4): bing.sitemaps for finn-tannlege.com: count ≥ 0 and a date");
+      const rs = view.bing.sitemaps["rettfrabonden.com"];
+      t(ft.count === 0 && typeof ft.checkedAt === "string" && ft.checkedAt.length > 0 && ft.lastCrawled === null && ft.lastSubmitted === null &&
+        rs.count === 1 && rs.urls === 500, "R21 (AC4): bing.sitemaps for finn-tannlege.com: count ≥ 0 and a date (no sitemap, so no sitemap date)");
+      t(rs.lastSubmitted === new Date(SITEMAP_SUBMITTED_MS).toISOString() && rs.lastCrawled === new Date(SITEMAP_CRAWLED_MS).toISOString(),
+        "R21b (AC4): the sitemaps' own latest Submitted / LastCrawled from GetFeeds");
       t(view.domains[0].gsc.property === "https://rettfrabonden.com/" && view.domains[0].gsc.permissionLevel === "siteRestrictedUser" &&
         view.domains[1].gsc.property === "sc-domain:opplevagent.no" && view.domains[2].bing.site === "https://finn-tannlege.com/" && view.domains[2].bing.verified === true,
         "R22: the view names each property and its access level");
@@ -448,6 +514,44 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
         future.bing.sitemaps["finn-tannlege.com"].unavailable === "week_not_complete", "R24: a week that is not complete -> week_not_complete");
       const older = getSearchConsoleWeekView({ db, week: "2026-09-28", env: ENV_BOTH, now: NOW });
       t(older.domains.every((d) => d.gsc.unavailable === "not_fetched"), "R25: an older week that was never fetched -> not_fetched");
+      const uiGsc = JSON.stringify([{ metric: "ai_impressions", value: null, unavailable: "ui_only" }]);
+      const uiBing = JSON.stringify([{ metric: "citation_share", value: null, unavailable: "ui_only" }]);
+      t([view, older].every((v) => v.domains.every((d) => JSON.stringify(d.gsc.uiOnly) === uiGsc && JSON.stringify(d.bing.uiOnly) === uiBing)),
+        "R26 (S6a): ai_impressions (GSC) and citation_share (Bing) are listed per domain as unavailable: ui_only, with or without rows");
+
+      // The week settles 7 × 24 h after its end (Mon 2026-10-19 08:00Z): the next run fetches it once more.
+      const val = (source: string, domain: string, metric: string) =>
+        db.prepare("SELECT value, fetched_at FROM search_console_weekly WHERE source = ? AND domain = ? AND metric = ? AND dimension = 'total' AND week = ?")
+          .get(source, domain, metric, WEEK) as { value: number; fetched_at: string };
+      // First the refetch fails for Bing: the provisional rows stay and still count as stored.
+      const failAt = new Date("2026-10-19T09:00:00.000Z");
+      const rfFail = fakeApis({ bingTraffic: () => ({ status: 500, raw: "" }) });
+      const sF = await job(db, rfFail, ENV_BOTH, failAt);
+      t(sF.week === WEEK && sF.gsc?.fetched === 3 && sF.bing?.fetched === 0 && sF.bing?.status === "ok" && sF.bing.fetchFailure?.reason === "http_500" &&
+        count() === 40 && val("bing", "opplevagent.no", "clicks").value === 5,
+        "RF1: settled week: GSC refetched; a failing Bing refetch keeps the provisional rows (still 40)");
+      const hF = health();
+      t(hF.bing.status === "ok" && hF.bing.fetch?.status === "error" && hF.bing.fetch.stored === 3 && hF.bing.fetch.reason === "http_500",
+        "RF2: /health: the check is ok, the fetch result says error, 3 still stored");
+      // Then it works, with a Sunday Bing did not have before and higher GSC numbers.
+      const settledAt = new Date("2026-10-19T12:00:00.000Z");
+      const rf = fakeApis({
+        query: (_siteUrl, body) => ({ status: 200, body: { rows: [{ clicks: body.dimensionFilterGroups ? 9 : 13, impressions: 260, ctr: 0.05, position: 7.4 }] } }),
+        bingTraffic: () => ({ status: 200, body: { d: [{ Date: bingDay(6), Clicks: 4, Impressions: 90 }, { Date: bingDay(8), Clicks: 1, Impressions: 10 }, { Date: bingDay(11), Clicks: 2, Impressions: 30 }] } }),
+      });
+      const sR = await job(db, rf, ENV_BOTH, settledAt);
+      t(sR.week === WEEK && sR.gsc?.fetched === 0 && sR.bing?.fetched === 3 && count() === 40,
+        "RF3: the next run refetches only what is still provisional (Bing); GSC was settled by RF1");
+      t(val("bing", "opplevagent.no", "clicks").value === 7 && val("bing", "opplevagent.no", "impressions").value === 130 &&
+        val("bing", "opplevagent.no", "clicks").fetched_at === settledAt.toISOString() && val("gsc", "rettfrabonden.com", "clicks").fetched_at === failAt.toISOString(),
+        "RF4: the settled answer replaces the provisional numbers (incl. the Sunday)");
+      const vS = getSearchConsoleWeekView({ db, week: WEEK, env: ENV_BOTH, now: settledAt });
+      t(vS.domains.every((d) => d.gsc.provisional === false && d.bing.provisional === false), "RF5: the view: no longer provisional");
+      const rfOnce = fakeApis();
+      const sO = await job(db, rfOnce, ENV_BOTH, new Date("2026-10-21T12:00:00.000Z"));
+      t(sO.week === WEEK && sO.gsc?.fetched === 0 && sO.bing?.fetched === 0 && rfOnce.calls.length === 3, "RF6: only once: the run after makes the 3 check calls only");
+      const sNext = await job(db, fakeApis(), ENV_BOTH, new Date("2026-10-22T08:00:00.000Z"));
+      t(sNext.week === "2026-10-12" && sNext.gsc?.fetched === 3 && sNext.bing?.fetched === 3, "RF7: then the next week is due, 72 h after its PT end");
     }
 
     // ── job: no_access, auth_failed, error, fetch failure and retry ──
@@ -484,8 +588,8 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       t(s.gsc?.status === "auth_failed" && s.gsc.reason === "invalid_grant" && s.gsc.count === null && s.bing?.status === "auth_failed" &&
         s.bing.reason === "bing_InvalidApiKey" && f.calls.length === 2, "A1: rejected key -> auth_failed (invalid_grant / bing_InvalidApiKey), no further calls");
       const h = health();
-      t(h.gsc.status === "auth_failed" && h.gsc.reason === "invalid_grant" && h.gsc.properties === null && h.bing.reason === "bing_InvalidApiKey",
-        "A2: /health: auth_failed with the code");
+      t(h.gsc.status === "auth_failed" && h.gsc.reason === "invalid_grant" && h.gsc.properties === null && h.bing.reason === "bing_InvalidApiKey" &&
+        h.gsc.fetch === null, "A2: /health: auth_failed with the code, no fetch");
       const view = getSearchConsoleWeekView({ db, week: WEEK, env: ENV_BOTH, now: NOW });
       emitted.push(JSON.stringify(view));
       t(view.domains.every((d) => d.gsc.unavailable === "auth_failed" && d.gsc.detail === "invalid_grant" && d.bing.unavailable === "auth_failed"),
@@ -515,8 +619,13 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       });
       const fl = flaky();
       const s2 = await job(db, fl);
-      t(s2.gsc?.status === "error" && s2.gsc.reason === "fetch_http_500" && s2.gsc.count === 3 && s2.gsc.fetched === 2,
-        "E2: one domain's fetch fails -> status error (fetch_http_500), the other two stored");
+      t(s2.gsc?.status === "ok" && s2.gsc.reason === null && s2.gsc.count === 3 && s2.gsc.fetched === 2 &&
+        s2.gsc.fetchFailure?.status === "error" && s2.gsc.fetchFailure.reason === "http_500",
+        "E2: one domain's fetch fails -> the connection stays ok; the run's fetch failure is error http_500; the other two stored");
+      const hE = health();
+      t(hE.gsc.status === "ok" && hE.gsc.reason === null && hE.gsc.properties === 3 && hE.gsc.fetch?.status === "error" &&
+        hE.gsc.fetch.reason === "http_500" && hE.gsc.fetch.stored === 2, "E2b: /health: status is the check (ok, 3); fetch has the failure and 2 stored");
+      t(logs[logs.length - 1].includes("gsc=ok properties=3 fetched=2 rows=16 fetch=error(http_500)"), "E2c: the log line names the fetch failure apart");
       const view = getSearchConsoleWeekView({ db, week: WEEK, env: ENV_BOTH, now: NOW });
       const opp = view.domains.find((d) => d.domain === "opplevagent.no")!;
       t(opp.gsc.unavailable === "fetch_failed" && opp.gsc.detail === "http_500", "E3: the view: fetch_failed with the code");
@@ -524,8 +633,41 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       const fl2 = flaky();
       const s3 = await job(db, fl2);
       const queried = fl2.calls.filter((c) => c.url.pathname.endsWith("/searchAnalytics/query")).map((c) => decodeURIComponent(c.url.pathname.split("/")[4]));
-      t(s3.gsc?.status === "ok" && s3.gsc.fetched === 1 && queried.length === 2 && queried.every((q) => q === "sc-domain:opplevagent.no"),
-        "E4: next run retries only the failed domain, then ok");
+      t(s3.gsc?.status === "ok" && s3.gsc.fetched === 1 && queried.length === 2 && queried.every((q) => q === "sc-domain:opplevagent.no") &&
+        health().gsc.fetch?.status === "ok" && health().gsc.fetch?.stored === 3, "E4: next run retries only the failed domain, then ok");
+    }
+
+    // ── job: 403 / NotAuthorized on one site's data = no_access, not a bad key (S6a §3/§6) ──
+    {
+      __resetSearchConsolesForTesting();
+      const db = newDb();
+      const f = fakeApis({
+        query: (siteUrl) => siteUrl === "sc-domain:finn-tannlege.com"
+          ? { status: 403, body: { error: { code: 403, message: "User does not have sufficient permission for site 'sc-domain:finn-tannlege.com'." } } }
+          : { status: 200, body: { rows: [{ clicks: 1, impressions: 2, ctr: 0.5, position: 3 }] } },
+        bingTraffic: (siteUrl) => siteUrl.includes("finn-tannlege")
+          ? { status: 400, body: { ErrorCode: 14, Message: "ERROR!!! NotAuthorized" } }
+          : { status: 200, body: { d: [] } },
+      });
+      const s = await job(db, f);
+      t(s.gsc?.status === "ok" && s.gsc.count === 3 && s.gsc.fetched === 2 && s.gsc.fetchFailure?.status === "no_access" && s.gsc.fetchFailure.reason === "http_403" &&
+        s.bing?.status === "ok" && s.bing.fetched === 2 && s.bing.fetchFailure?.status === "no_access" && s.bing.fetchFailure.reason === "bing_NotAuthorized",
+        "NA1: 403 on a property's query / Bing ErrorCode 14 -> fetch no_access; the key check stays ok");
+      const h = health();
+      t(h.gsc.status === "ok" && h.gsc.fetch?.status === "no_access" && h.gsc.fetch.reason === "http_403" && h.bing.fetch?.status === "no_access" &&
+        h.bing.fetch.reason === "bing_NotAuthorized", "NA2: /health: ok key, fetch no_access (not auth_failed)");
+      const v = getSearchConsoleWeekView({ db, week: WEEK, env: ENV_BOTH, now: NOW });
+      emitted.push(JSON.stringify(v));
+      const ft = v.domains.find((d) => d.domain === "finn-tannlege.com")!;
+      t(ft.gsc.unavailable === "no_access" && ft.gsc.detail === "http_403" && ft.bing.unavailable === "no_access" && ft.bing.detail === "bing_NotAuthorized",
+        "NA3: the view: no_access for that domain, with the code");
+      t(logs[logs.length - 1].includes("fetch=no_access(http_403)") && logs[logs.length - 1].includes("fetch=no_access(bing_NotAuthorized)"),
+        "NA4: the log line says no_access");
+
+      __resetSearchConsolesForTesting();
+      const s2 = await job(newDb(), fakeApis({ bingSites: () => ({ status: 400, body: { ErrorCode: 14, Message: "NotAuthorized" } }) }));
+      t(s2.bing?.status === "no_access" && s2.bing.reason === "bing_NotAuthorized" && s2.bing.count === null && health().bing.status === "no_access",
+        "NA5: GetUserSites with ErrorCode 14 -> no_access (S6a §6), not auth_failed");
     }
 
     // ── scheduler ──
@@ -557,9 +699,34 @@ export async function runSearchConsoleFetchTests(opts: { log?: boolean } = {}): 
       t(f.calls.length === 0, "SC5: the run queues behind a boot job holding the gate");
       releaseBlocker();
       await blocker;
-      await runExclusiveBootJob(() => undefined);
+      await until(() => getSearchConsolesHealth({ env: ENV_BOTH }).bing.fetch !== null);
       t(f.calls.length === 15 && health().gsc.status === "ok", "SC6: once the gate is free the run checks and fetches (8 Google + 7 Bing calls)");
       sOn.stop();
+      // The run waits for the gate but makes its calls outside it: a boot job queued after it does not wait for the network.
+      __resetSearchConsolesForTesting();
+      let releaseNet!: () => void;
+      const net = new Promise<void>((r) => { releaseNet = r; });
+      const netBase = fakeApis();
+      const slowNet = stubFetch(async (url, init) => {
+        await net;
+        const r = await netBase.fetchImpl(url, init);
+        return { status: r.status, raw: await r.text() };
+      });
+      const sSlow = startSearchConsoleScheduler({
+        getDb: newDb, env: ENV_BOTH, log, setTimeoutFn: fakeSet("t"), setIntervalFn: fakeSet("i"), run: { fetchImpl: slowNet.fetchImpl, now: () => NOW },
+      });
+      timers[timers.length - 2].fn();
+      await until(() => slowNet.calls.length > 0);
+      let laterRan = false;
+      const laterJob = runExclusiveBootJob(() => { laterRan = true; });
+      await until(() => laterRan, 50);
+      t(laterRan && slowNet.calls.length === 1 && getSearchConsolesHealth({ env: ENV_BOTH }).gsc.status === "pending",
+        "SC8: while the run waits on the network, a boot job queued after it runs (the gate is not held)");
+      releaseNet();
+      await laterJob;
+      await until(() => getSearchConsolesHealth({ env: ENV_BOTH }).bing.fetch !== null);
+      t(slowNet.calls.length === 15 && health().bing.status === "ok", "SC9: and the run then finishes as usual");
+      sSlow.stop();
       // A failing run is logged without secrets (console.error captured for this step only).
       const errOutLines: string[] = [];
       const sErr = startSearchConsoleScheduler({

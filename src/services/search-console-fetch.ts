@@ -7,15 +7,19 @@
 //       GSC:  RS256 JWT (node:crypto) -> access token (scope webmasters.readonly)
 //             -> sites.list -> how many of the three domains are readable, and how;
 //       Bing: GetUserSites (bing-webmaster-fetch.ts) -> how many are verified.
-//   - Weekly fetch in the same run: the latest complete Monday–Sunday week
-//     (once its Sunday is SEARCH_CONSOLE_WEEK_LAG_DAYS old) for every readable
-//     domain that has no rows for it yet, upserted into search_console_weekly.
-//     A failed domain is simply tried again on the next run.
+//   - Weekly fetch in the same run: the latest Monday–Sunday week that has been
+//     over for SEARCH_CONSOLE_WEEK_LAG_DAYS (Pacific Time, as GSC counts days),
+//     for every readable domain that has no rows for it yet, upserted into
+//     search_console_weekly. A week stored before it settled
+//     (SEARCH_CONSOLE_WEEK_SETTLED_DAYS) is fetched once more after that, so a
+//     late GSC day or a missing Bing day is filled in. A failed domain is
+//     simply tried again on the next run.
 //   - Status per source in memory, for /health (getSearchConsolesHealth: counts
 //     and fixed codes only, no network) and GET /admin/analytics/search-consoles
-//     (getSearchConsoleWeekView).
-// It runs whenever a key is set. SEARCH_CONSOLE_FETCH_ENABLED=0 turns the check
-// and the fetch off. Without keys the scheduler logs one line and does nothing.
+//     (getSearchConsoleWeekView). `status` is the connectivity check; the
+//     week's fetch has its own `fetch` result next to it.
+// It runs whenever a key is set (each source with its own key). SEARCH_CONSOLE_FETCH_ENABLED=0
+// turns the check and the fetch off. Without keys the scheduler logs one line and does nothing.
 //
 // Google endpoints (developers.google.com, read 2026-10-17):
 //   POST https://oauth2.googleapis.com/token  (identity/protocols/oauth2/service-account, HTTP/REST)
@@ -38,9 +42,12 @@ import {
   GSC_BREAKDOWNS,
   GSC_METRICS,
   SEARCH_CONSOLE_CHECK_INTERVAL_MS,
+  SEARCH_CONSOLE_DAY_UTC_OFFSET_HOURS,
   SEARCH_CONSOLE_DOMAINS,
   SEARCH_CONSOLE_REQUEST_TIMEOUT_MS,
+  SEARCH_CONSOLE_UI_ONLY_METRICS,
   SEARCH_CONSOLE_WEEK_LAG_DAYS,
+  SEARCH_CONSOLE_WEEK_SETTLED_DAYS,
   type SearchConsoleDomain,
   type SearchConsoleFailure,
   type SearchConsoleMetricRow,
@@ -291,7 +298,11 @@ export async function checkGsc(
 // No row back means no impressions that week: these are 0, ctr and position have no value.
 const GSC_ZERO_WHEN_EMPTY: ReadonlySet<string> = new Set(["clicks", "impressions"]);
 
-/** One property's week: one Search Analytics query per GSC_BREAKDOWNS entry (type web, final data). */
+/**
+ * One property's week: one Search Analytics query per GSC_BREAKDOWNS entry (type web, final data).
+ * A 403 here means this property's data is not readable with the key (S6a §3): no_access, not
+ * auth_failed — sites.list already accepted the token.
+ */
 export async function fetchGscWeek(
   accessToken: string,
   siteUrl: string,
@@ -315,7 +326,7 @@ export async function fetchGscWeek(
       },
       deps,
     );
-    if (!r.ok) return r;
+    if (!r.ok) return r.failure.reason === "http_403" ? fail("no_access", "http_403") : r;
     const list = r.body?.rows;
     if (list !== undefined && !Array.isArray(list)) return fail("error", "unexpected_response");
     const row = list?.[0];
@@ -373,16 +384,43 @@ export function upsertSearchConsoleRows(
   })();
 }
 
-function hasStoredWeek(db: Db, source: SearchConsoleSource, domain: string, week: string): boolean {
-  return !!db.prepare("SELECT 1 FROM search_console_weekly WHERE domain = ? AND source = ? AND week = ? LIMIT 1").get(domain, source, week);
+/** When one domain's week from `source` was last fetched (latest fetched_at of its rows); null when there are none. */
+function storedWeekFetchedAt(db: Db, source: SearchConsoleSource, domain: string, week: string): string | null {
+  const r = db
+    .prepare("SELECT MAX(fetched_at) AS at FROM search_console_weekly WHERE domain = ? AND source = ? AND week = ?")
+    .get(domain, source, week) as { at: string | null } | undefined;
+  return r?.at ?? null;
 }
 
 // ── Week, kill switch, redaction ──────────────────────────────────────
 
-/** Monday of the latest Monday–Sunday week whose Sunday is at least `lagDays` old. */
+/** The Pacific-Time calendar day (UTC−8, SEARCH_CONSOLE_DAY_UTC_OFFSET_HOURS) `days` × 24 h before `at`. */
+function pacificDayBefore(at: Date, days: number): string {
+  return dayOf(at.getTime() + SEARCH_CONSOLE_DAY_UTC_OFFSET_HOURS * 3_600_000 - days * 86_400_000);
+}
+
+/** True when the Monday–Sunday week starting `weekStart` had been over (Pacific Time) for `days` × 24 h at `at`. */
+export function isSearchConsoleWeekOverFor(weekStart: string, at: Date, days: number): boolean {
+  return pacificDayBefore(at, days) >= addDays(weekStart, 7);
+}
+
+/** Monday of the latest Monday–Sunday week that has been over (Pacific Time) for `lagDays` × 24 h. */
 export function targetSearchConsoleWeek(now: Date, lagDays = SEARCH_CONSOLE_WEEK_LAG_DAYS): string {
-  const day = dayOf(now.getTime() - lagDays * 86_400_000);
-  return addDays(weekStartOf(addDays(day, 1)), -7);
+  return addDays(weekStartOf(pacificDayBefore(now, lagDays)), -7);
+}
+
+/** True while rows fetched at `fetchedAt` may still change: the week had not settled yet then. */
+export function isSearchConsoleWeekProvisional(weekStart: string, fetchedAt: string): boolean {
+  return !isSearchConsoleWeekOverFor(weekStart, new Date(fetchedAt), SEARCH_CONSOLE_WEEK_SETTLED_DAYS);
+}
+
+/**
+ * Fetch a domain's week when nothing is stored, or once more when what is stored is provisional
+ * and the week has settled since (the refetch makes it final, so this happens once).
+ */
+export function needsSearchConsoleFetch(weekStart: string, fetchedAt: string | null, now: Date): boolean {
+  if (fetchedAt === null) return true;
+  return isSearchConsoleWeekProvisional(weekStart, fetchedAt) && isSearchConsoleWeekOverFor(weekStart, now, SEARCH_CONSOLE_WEEK_SETTLED_DAYS);
 }
 
 export function searchConsoleWeekRange(weekStart: string): SearchConsoleWeekRange {
@@ -417,6 +455,7 @@ interface DomainState {
   access: boolean;
 }
 
+/** The last connectivity check of one source. */
 interface SourceState {
   status: SearchConsoleStatus;
   count: number | null;
@@ -427,14 +466,27 @@ interface SourceState {
   domains: Record<string, DomainState>;
 }
 
+/** The last fetch attempt of one domain's week (null failure = stored). */
 interface FetchNote {
   week: string;
-  ok: boolean;
+  failure: SearchConsoleFailure | null;
+  at: string;
+}
+
+/**
+ * The weekly fetch of one source in the last run that got past the check: how many domains have
+ * the target week stored now, and the first failure of the run, if any ("ok" = none failed).
+ */
+export interface SearchConsoleFetchResult {
+  week: string;
+  status: "ok" | SearchConsoleFailure["status"];
+  stored: number;
   reason: string | null;
   at: string;
 }
 
 let sourceState: Record<SearchConsoleSource, SourceState | null> = { gsc: null, bing: null };
+let fetchState: Record<SearchConsoleSource, SearchConsoleFetchResult | null> = { gsc: null, bing: null };
 let lastFetch: Record<SearchConsoleSource, Record<string, FetchNote>> = { gsc: {}, bing: {} };
 let running = false;
 
@@ -449,12 +501,15 @@ type SourceCheck =
   | { ok: false; failure: SearchConsoleFailure };
 
 export interface SourceRunSummary {
+  /** The connectivity check. */
   status: SearchConsoleStatus;
   count: number | null;
   reason: string | null;
-  /** Domains whose week was fetched and stored in this run. */
+  /** Domains whose week was fetched and stored in this run (first time or the settled refetch). */
   fetched: number;
   rows: number;
+  /** The first fetch that failed in this run, if any; null when the check failed (no fetch). */
+  fetchFailure: SearchConsoleFailure | null;
 }
 
 export interface SearchConsoleRunSummary {
@@ -481,42 +536,58 @@ function defaultDb(): Db {
   return init.getDb();
 }
 
-/** Check one source, then fetch the target week for each readable domain that has no rows yet. */
+/**
+ * Check one source, then fetch the target week for each readable domain that has no rows for it
+ * yet, or only provisional ones while the week has settled since. The check's status is kept
+ * apart from the fetch result: a failed fetch never turns an "ok" connection into an error.
+ */
 async function runSource(
   source: SearchConsoleSource,
   check: () => Promise<SourceCheck>,
-  ctx: { db: Db; week: string; domains: readonly SearchConsoleDomain[]; at: () => string },
+  ctx: { db: Db; week: string; domains: readonly SearchConsoleDomain[]; now: () => Date },
 ): Promise<SourceRunSummary> {
+  const at = () => ctx.now().toISOString();
   const c = await check();
   if (!c.ok) {
-    sourceState[source] = { status: c.failure.status, count: null, checkedAt: ctx.at(), reason: c.failure.reason, checkOk: false, domains: {} };
-    return { status: c.failure.status, count: null, reason: c.failure.reason, fetched: 0, rows: 0 };
+    sourceState[source] = { status: c.failure.status, count: null, checkedAt: at(), reason: c.failure.reason, checkOk: false, domains: {} };
+    return { status: c.failure.status, count: null, reason: c.failure.reason, fetched: 0, rows: 0, fetchFailure: null };
   }
-  let status: SearchConsoleStatus = c.status;
-  let reason: string | null = null;
+  sourceState[source] = { status: c.status, count: c.count, checkedAt: at(), reason: null, checkOk: true, domains: c.domains };
+  let firstFailure: SearchConsoleFailure | null = null;
   let fetched = 0;
   let rows = 0;
+  let stored = 0;
   const range = searchConsoleWeekRange(ctx.week);
   for (const { domain } of ctx.domains) {
     const d = c.domains[domain];
-    if (!d?.access || !d.property || hasStoredWeek(ctx.db, source, domain, ctx.week)) continue;
-    const r = await c.fetchWeek(d.property, range);
-    const at = ctx.at();
-    if (!r.ok) {
-      lastFetch[source][domain] = { week: ctx.week, ok: false, reason: r.failure.reason, at };
-      if (reason === null) {
-        status = r.failure.status;
-        reason = `fetch_${r.failure.reason}`;
-      }
+    if (!d?.access || !d.property) continue;
+    const storedAt = storedWeekFetchedAt(ctx.db, source, domain, ctx.week);
+    if (!needsSearchConsoleFetch(ctx.week, storedAt, ctx.now())) {
+      stored++;
       continue;
     }
-    upsertSearchConsoleRows(ctx.db, source, domain, ctx.week, r.rows, at);
-    lastFetch[source][domain] = { week: ctx.week, ok: true, reason: null, at };
+    const r = await c.fetchWeek(d.property, range);
+    const fetchedAt = at();
+    if (!r.ok) {
+      lastFetch[source][domain] = { week: ctx.week, failure: r.failure, at: fetchedAt };
+      firstFailure ??= r.failure;
+      if (storedAt !== null) stored++; // the provisional rows stay until a refetch works
+      continue;
+    }
+    upsertSearchConsoleRows(ctx.db, source, domain, ctx.week, r.rows, fetchedAt);
+    lastFetch[source][domain] = { week: ctx.week, failure: null, at: fetchedAt };
     fetched++;
+    stored++;
     rows += r.rows.length;
   }
-  sourceState[source] = { status, count: c.count, checkedAt: ctx.at(), reason, checkOk: true, domains: c.domains };
-  return { status, count: c.count, reason, fetched, rows };
+  fetchState[source] = {
+    week: ctx.week,
+    status: firstFailure ? firstFailure.status : "ok",
+    stored,
+    reason: firstFailure ? firstFailure.reason : null,
+    at: at(),
+  };
+  return { status: c.status, count: c.count, reason: null, fetched, rows, fetchFailure: firstFailure };
 }
 
 function gscCheck(creds: GscCredentialsResult, deps: GscDeps, domains: readonly SearchConsoleDomain[]): () => Promise<SourceCheck> {
@@ -548,7 +619,8 @@ function bingCheck(apiKey: string, deps: GscDeps, domains: readonly SearchConsol
 function formatRunLine(s: SearchConsoleRunSummary): string {
   const part = (name: string, countLabel: string, r: SourceRunSummary | undefined) =>
     r
-      ? `${name}=${r.status}${r.reason ? `(${r.reason})` : ""} ${countLabel}=${r.count ?? "-"} fetched=${r.fetched} rows=${r.rows}`
+      ? `${name}=${r.status}${r.reason ? `(${r.reason})` : ""} ${countLabel}=${r.count ?? "-"} fetched=${r.fetched} rows=${r.rows}` +
+        (r.fetchFailure ? ` fetch=${r.fetchFailure.status}(${r.fetchFailure.reason})` : "")
       : `${name}=unconfigured`;
   return `[search-consoles] week=${s.week} ${part("gsc", "properties", s.gsc)} ${part("bing", "sites", s.bing)}`;
 }
@@ -571,7 +643,7 @@ export async function runSearchConsoleJob(opts: SearchConsoleRunOptions = {}): P
     ensureSearchConsoleWeeklyTable(db);
     const deps: GscDeps = { fetchImpl: opts.fetchImpl, timeoutMs: opts.timeoutMs, now };
     const domains = opts.domains ?? SEARCH_CONSOLE_DOMAINS;
-    const ctx = { db, week: targetSearchConsoleWeek(now()), domains, at: () => now().toISOString() };
+    const ctx = { db, week: targetSearchConsoleWeek(now()), domains, now };
     const summary: SearchConsoleRunSummary = { week: ctx.week };
     if (gscCreds) summary.gsc = await runSource("gsc", gscCheck(gscCreds, deps, domains), ctx);
     if (bingKey) summary.bing = await runSource("bing", bingCheck(bingKey, deps, domains), ctx);
@@ -587,7 +659,10 @@ export async function runSearchConsoleJob(opts: SearchConsoleRunOptions = {}): P
 /**
  * Called once from src/index.ts. With the kill switch off or no key set it logs one line and
  * schedules nothing. Otherwise: first run after SEARCH_CONSOLE_BOOT_DELAY_MS, then every
- * SEARCH_CONSOLE_CHECK_INTERVAL_MS, each inside the exclusive boot-job gate.
+ * SEARCH_CONSOLE_CHECK_INTERVAL_MS. Each run waits for the boot jobs queued in the exclusive gate
+ * before it, so it never starts while one of them runs, and then makes its calls outside the gate:
+ * it is network waits (up to SEARCH_CONSOLE_REQUEST_TIMEOUT_MS per call) and almost no CPU, so it
+ * must not hold back the CPU-heavy boot jobs queued after it.
  */
 export function startSearchConsoleScheduler(opts: {
   getDb: () => Db;
@@ -611,13 +686,13 @@ export function startSearchConsoleScheduler(opts: {
     return { started: false, stop: () => {} };
   }
   const tick = () => {
-    runExclusiveBootJob(trackJob("search-consoles", () => runSearchConsoleJob({ ...opts.run, db: opts.getDb(), env, log }))).catch(
-      (err: any) => {
+    runExclusiveBootJob(() => undefined)
+      .then(trackJob("search-consoles", () => runSearchConsoleJob({ ...opts.run, db: opts.getDb(), env, log })))
+      .catch((err: any) => {
         console.error(
           `[search-consoles] run failed (non-fatal): ${err?.name ?? "Error"}: ${redactSecrets(String(err?.message ?? err), secretValues(env))}`,
         );
-      },
-    );
+      });
   };
   const boot = (opts.setTimeoutFn ?? setTimeout)(tick, opts.bootDelayMs ?? SEARCH_CONSOLE_BOOT_DELAY_MS);
   const interval = (opts.setIntervalFn ?? setInterval)(tick, opts.intervalMs ?? SEARCH_CONSOLE_CHECK_INTERVAL_MS);
@@ -639,28 +714,34 @@ interface SourceView {
   count: number | null;
   checkedAt: string | null;
   reason: string | null;
+  fetch: SearchConsoleFetchResult | null;
 }
 
-function sourceView(source: SearchConsoleSource, configured: boolean): SourceView {
-  if (!configured) return { status: "unconfigured", count: null, checkedAt: null, reason: null };
+function sourceView(source: SearchConsoleSource, configured: boolean, enabled: boolean): SourceView {
+  if (!configured) return { status: "unconfigured", count: null, checkedAt: null, reason: null, fetch: null };
+  // Under the kill switch nothing runs, so the check stays pending; the reason says why.
+  if (!enabled) return { status: "pending", count: null, checkedAt: null, reason: "disabled", fetch: null };
   const s = sourceState[source];
-  if (!s) return { status: "pending", count: null, checkedAt: null, reason: null };
-  return { status: s.status, count: s.count, checkedAt: s.checkedAt, reason: s.reason };
+  const lastWeekFetch = fetchState[source] ? { ...fetchState[source]! } : null;
+  if (!s) return { status: "pending", count: null, checkedAt: null, reason: null, fetch: lastWeekFetch };
+  return { status: s.status, count: s.count, checkedAt: s.checkedAt, reason: s.reason, fetch: lastWeekFetch };
 }
 
 /**
  * The public /health field. Synchronous and network-free: it reads the in-memory result of the
- * last run and whether each secret is set. Counts and fixed codes only: no key, e-mail, token,
- * property URL or search data.
+ * last run and whether each secret is set. Counts, dates and fixed codes only: no key, e-mail,
+ * token, property URL or search data. `status` is the connectivity check; `fetch` is the last
+ * weekly fetch (null until a run got past the check).
  */
 export function getSearchConsolesHealth(opts: { env?: NodeJS.ProcessEnv } = {}) {
   const env = opts.env ?? process.env;
-  const gsc = sourceView("gsc", hasGscSecret(env));
-  const bing = sourceView("bing", readBingApiKey(env) !== null);
+  const enabled = isSearchConsoleFetchEnabled(env);
+  const gsc = sourceView("gsc", hasGscSecret(env), enabled);
+  const bing = sourceView("bing", readBingApiKey(env) !== null, enabled);
   return {
-    enabled: isSearchConsoleFetchEnabled(env),
-    gsc: { status: gsc.status, properties: gsc.count, checkedAt: gsc.checkedAt, reason: gsc.reason },
-    bing: { status: bing.status, sites: bing.count, checkedAt: bing.checkedAt, reason: bing.reason },
+    enabled,
+    gsc: { status: gsc.status, properties: gsc.count, checkedAt: gsc.checkedAt, reason: gsc.reason, fetch: gsc.fetch },
+    bing: { status: bing.status, sites: bing.count, checkedAt: bing.checkedAt, reason: bing.reason, fetch: bing.fetch },
   };
 }
 
@@ -675,9 +756,12 @@ interface StoredRow {
 
 /**
  * GET /admin/analytics/search-consoles: one week's rows per domain and source, or why there are
- * none (`unavailable`: disabled, unconfigured, pending, auth_failed, error, no_access,
- * week_not_complete, fetch_failed (+ detail) or not_fetched), plus bing.sitemaps per domain.
- * `week` is any YYYY-MM-DD in the week (Monday is used); default: the latest complete week.
+ * none (`unavailable`: disabled, unconfigured, pending, auth_failed, error, no_access (also a 403
+ * on the domain's data, with `detail`), week_not_complete, fetch_failed (+ detail) or
+ * not_fetched), plus bing.sitemaps per domain. Stored rows are `provisional` until the week has
+ * settled and been fetched once more. `uiOnly` lists the numbers only the console UI has
+ * (`unavailable: "ui_only"`). `week` is any YYYY-MM-DD in the week (Monday is used); default: the
+ * latest complete week.
  */
 export function getSearchConsoleWeekView(opts: {
   db?: Db;
@@ -709,8 +793,8 @@ export function getSearchConsoleWeekView(opts: {
     const d = s?.domains[domain];
     if (!d?.access) return { unavailable: "no_access", detail: null };
     if (week > latest) return { unavailable: "week_not_complete", detail: null };
-    const note = lastFetch[source][domain];
-    if (note && note.week === week && !note.ok) return { unavailable: "fetch_failed", detail: note.reason };
+    const failure = lastFetch[source][domain]?.week === week ? lastFetch[source][domain].failure : null;
+    if (failure) return { unavailable: failure.status === "no_access" ? "no_access" : "fetch_failed", detail: failure.reason };
     return { unavailable: "not_fetched", detail: null };
   };
 
@@ -721,16 +805,20 @@ export function getSearchConsoleWeekView(opts: {
       source === "gsc"
         ? { property: d?.property ?? null, permissionLevel: d?.permissionLevel ?? null }
         : { site: d?.property ?? null, verified: d ? d.access : null };
+    const uiOnly = SEARCH_CONSOLE_UI_ONLY_METRICS[source].map((metric) => ({ metric, value: null, unavailable: "ui_only" }));
     if (mine.length > 0) {
+      const fetchedAt = mine.reduce((max, r) => (r.fetched_at > max ? r.fetched_at : max), mine[0].fetched_at);
       return {
         ...where,
         rows: mine.map((r) => ({ metric: r.metric, dimension: r.dimension, value: r.value })),
-        fetchedAt: mine.reduce((max, r) => (r.fetched_at > max ? r.fetched_at : max), mine[0].fetched_at),
+        fetchedAt,
+        provisional: isSearchConsoleWeekProvisional(week, fetchedAt),
         unavailable: null,
         detail: null,
+        uiOnly,
       };
     }
-    return { ...where, rows: [], fetchedAt: null, ...unavailable(source, domain) };
+    return { ...where, rows: [], fetchedAt: null, provisional: null, ...unavailable(source, domain), uiOnly };
   };
 
   const domains = (opts.domains ?? SEARCH_CONSOLE_DOMAINS).map(({ brand, domain }) => ({
@@ -740,13 +828,31 @@ export function getSearchConsoleWeekView(opts: {
     bing: perSource("bing", domain),
   }));
 
-  const sitemaps: Record<string, { count: number | null; urls: number | null; checkedAt: string | null; unavailable: string | null }> = {};
+  // AC4: per domain the sitemap count (≥ 0), their URLs, the sitemaps' own latest Submitted /
+  // LastCrawled from GetFeeds (null when Bing gives none, e.g. no sitemaps) and when we read it.
+  type SitemapView = {
+    count: number | null;
+    urls: number | null;
+    lastSubmitted: string | null;
+    lastCrawled: string | null;
+    checkedAt: string | null;
+    unavailable: string | null;
+  };
+  const sitemaps: Record<string, SitemapView> = {};
   for (const d of domains) {
-    const count = d.bing.rows.find((r) => r.metric === "sitemaps" && r.dimension === "total");
-    const urls = d.bing.rows.find((r) => r.metric === "sitemap_urls" && r.dimension === "total");
-    sitemaps[d.domain] = count
-      ? { count: count.value, urls: urls ? urls.value : null, checkedAt: d.bing.fetchedAt, unavailable: null }
-      : { count: null, urls: null, checkedAt: null, unavailable: d.bing.unavailable ?? "not_fetched" };
+    const value = (metric: string) => d.bing.rows.find((r) => r.metric === metric && r.dimension === "total")?.value ?? null;
+    const isoOf = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString());
+    const count = value("sitemaps");
+    sitemaps[d.domain] = count !== null
+      ? {
+          count,
+          urls: value("sitemap_urls"),
+          lastSubmitted: isoOf(value("sitemap_last_submitted_ms")),
+          lastCrawled: isoOf(value("sitemap_last_crawled_ms")),
+          checkedAt: d.bing.fetchedAt,
+          unavailable: null,
+        }
+      : { count: null, urls: null, lastSubmitted: null, lastCrawled: null, checkedAt: null, unavailable: d.bing.unavailable ?? "not_fetched" };
   }
 
   return {
@@ -764,6 +870,7 @@ export function getSearchConsoleWeekView(opts: {
 /** Test-only: reset module state. */
 export function __resetSearchConsolesForTesting(): void {
   sourceState = { gsc: null, bing: null };
+  fetchState = { gsc: null, bing: null };
   lastFetch = { gsc: {}, bing: {} };
   running = false;
 }
