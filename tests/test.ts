@@ -42380,6 +42380,36 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-A: AI-1 —
+// lokal_info returned "k.openingHours.map is not a function" for opening
+// hours stored as text; text is now shown, other types left out, the same
+// rule covers the other list-valued JSON fields, and an internal error gives
+// a generic message (detail logged), also a cart-service 5xx result in
+// lokal_cart_submit. AI-3 — a producer whose matched product names are only
+// generic category labels («Honning») is a category match; order unchanged.
+// The RFB MCP contract (tools/list, instructions, resources) is pinned for
+// the OpenAI review. Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-A (lokal_info openingHours + category labels + contract freeze) ──");
+  type Summary = { passed: number; failed: number; failures: string[] };
+  const suites: Array<[string, () => Promise<Summary>]> = [
+    ["mcp-lokal-info-and-category-labels", () => (require("../src/routes/mcp-lokal-info-and-category-labels.test") as typeof import("../src/routes/mcp-lokal-info-and-category-labels.test")).runMcpLokalInfoAndCategoryLabelsTests({ log: false })],
+    ["rfb-mcp-contract-freeze", () => (require("../src/routes/rfb-mcp-contract-freeze.test") as typeof import("../src/routes/rfb-mcp-contract-freeze.test")).runRfbMcpContractFreezeTests({ log: false })],
+  ];
+  for (const [name, run] of suites) {
+    try {
+      const r = await run();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${name}: ` + f);
+      console.log(`  ${name}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${name}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)
