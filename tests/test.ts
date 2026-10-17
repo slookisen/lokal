@@ -47611,6 +47611,30 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S1 +
+// G3-S2): one brand entity per site in src/config/brand-entities.ts and the
+// shared organizationJsonLd() builder — names unchanged, https URLs on each
+// site's own origin, the domain as alternateName, sameAs only what exists
+// (Brreg on the company; Wikidata derived from wikidataId), the same
+// parentOrganization for every brand, agentplatform.no's Organization from the
+// builder, distinct PNG logos, and no RFB sprout in the Opplevagent connector
+// assets. Pure config + file reads, no DB or env — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── brand-entities: one brand entity in config + the shared Organization builder ──");
+  try {
+    const { runBrandEntitiesTests } = require("../src/config/brand-entities.test") as
+      typeof import("../src/config/brand-entities.test");
+    const be = runBrandEntitiesTests({ log: false });
+    passed += be.passed;
+    failed += be.failed;
+    for (const f of be.failures) failures.push("brand-entities: " + f);
+    console.log(`  brand-entities: ${be.passed} passed, ${be.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("brand-entities: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical (skive A):
 // sitemap role-gate (one batch query), two 404 umbrella slugs excluded, and the
 // shared BM event time-offset helper. Own in-memory DB; runSerial, tail position.
