@@ -2902,6 +2902,14 @@ export function buildRunEnvelope(input: {
   const verifiedDemoted = r.filter(
     (x) => x.prior_verification_status === "verified" && x.new_verification_status !== "verified"
   ).length;
+  // dev-request 2026-10-01-rfb-verifier-innsyn-second-line-c5: split growth
+  // from maintenance. newly + reverified === agents_verified.
+  const newlyVerified = r.filter(
+    (x) => x.new_verification_status === "verified" && x.prior_verification_status !== "verified"
+  ).length;
+  const reverified = r.filter(
+    (x) => x.new_verification_status === "verified" && x.prior_verification_status === "verified"
+  ).length;
   const paraplyBlocked = r.filter((x) => x.new_verification_status === "paraply_epost_mangler").length;
   // dev-request 2026-08-23-terminal-unconfirmable: always 0 when
   // RFB_TERMINAL_UNCONFIRMABLE_ENABLED is off. Lets the daily brief see how
@@ -2918,6 +2926,8 @@ export function buildRunEnvelope(input: {
     status: "completed",
     claims: [
       { type: "db_state_change", value: verified, meta: { kind: "agents_verified" } },
+      { type: "db_state_change", value: newlyVerified, meta: { kind: "agents_newly_verified" } },
+      { type: "db_state_change", value: reverified, meta: { kind: "agents_reverified" } },
       { type: "db_state_change", ...snap("agents_review_required", review) },
       { type: "db_state_change", ...snap("agents_pending_verify", pending) },
       { type: "db_state_change", ...snap("agents_data_insufficient", dataInsufficient) },
