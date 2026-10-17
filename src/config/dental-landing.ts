@@ -1,17 +1,26 @@
 // ─── Finn-tannlege landing pages (dev-request 2026-10-16-finn-tannlege-landingssider)
 //
-// The numbers and dates the dental list pages (/fylke, /sted, /spesialitet)
-// and the sitemap read, kept here so no handler in routes/dental-seo.ts holds
-// its own copy. F1-S1 (paging) and F1-S2 (sitemap lastmod) need no
-// threshold; the thresholds F1-S3 brings (sted.minClinicsForIndex, faq.*)
-// join this module, each with an env override read per call like
-// OPPLEVAGENT_COMBO_MIN_EXPERIENCES (services/experience-indexability.ts).
+// The numbers, places and dates the dental list pages (/fylke, /sted,
+// /spesialitet), the homepage hero and the sitemap read, kept here so no
+// handler in routes/dental-seo.ts holds its own copy.
+//
+// No env override for these, on purpose: listPageSize decides which clinics
+// an indexed ?side=N URL shows, so it must not differ between deploys or
+// machines, and the rest is page layout, not thresholds. The thresholds F1-S3
+// brings (sted.minClinicsForIndex, faq.*) join this module each with an env
+// override read per call, like OPPLEVAGENT_COMBO_MIN_EXPERIENCES
+// (services/experience-indexability.ts).
 
 export const DENTAL_LANDING_CONFIG = {
   /** Clinic cards per page on /fylke, /sted and /spesialitet (as before). */
   listPageSize: 50,
   /** Page links on each side of the current page in the page nav (F1-S1). */
   paginationWindow: 3,
+  /**
+   * The homepage hero chips, in order (F1-S1): each links /sted/<slug> when
+   * the place has a /sted page, /sok?q=<place> when it has none.
+   */
+  heroPlaces: ["Oslo", "Bergen", "Trondheim", "Stavanger"],
 } as const;
 
 /**
@@ -22,8 +31,10 @@ export const DENTAL_LANDING_CONFIG = {
  * clinic row (getDentalAggregateLastmods().all), since its numbers and place
  * lists come from them.
  *
- * Dates from git history of routes/dental-seo.ts (git log -L / git blame on
- * each route handler, 2026-10-17).
+ * Each date is the last commit on main that changed the page's route handler
+ * in routes/dental-seo.ts (the handler text compared across all 58 commits
+ * that touched the file up to 114fe2ad, 2026-10-17). The handlers interpolate
+ * no data, so that is the day their text last changed.
  */
 export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   "/hvordan-det-fungerer": "2026-06-05",

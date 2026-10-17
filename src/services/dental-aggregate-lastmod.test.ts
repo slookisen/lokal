@@ -101,13 +101,13 @@ export async function runDentalAggregateLastmodTests(
     const { DENTAL_STATIC_PAGE_DATES } = require("../config/dental-landing") as typeof import("../config/dental-landing");
     const router = dentalSeo.default as any;
     const base = process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
-    const today = new Date().toISOString().slice(0, 10);
     const specialtyNames = dentalSeo.SPECIALTY_PAGES.map((sp) => sp.navn);
 
     // ── fixture ──────────────────────────────────────────────────────────
     // Two places with different dates, a second Vestland place, a second
-    // spelling of Bergen, and a hidden row of every kind dated later than
-    // every public one. Every date is in the past, so nothing is "today".
+    // spelling of Bergen and of Tromsø, and a hidden row of every kind dated
+    // later than every public one. Every date is in the past, so nothing is
+    // "today".
     let orgSeq = 918970000;
     type Extra = {
       updatedAt: string | null; inactive?: boolean; rejected?: boolean; klass?: string;
@@ -144,6 +144,12 @@ export async function runDentalAggregateLastmodTests(
     const bergen2 = mk("Nordnes Tann AS", "BERGEN", "Vestland", { updatedAt: "2026-02-01T07:00:00.000Z" });
     mk("Fana Tann AS", "Bergen", "Vestland", { updatedAt: "2026-06-15 16:30:00" });
     mk("Voss Tann AS", "VOSS", "Vestland", { updatedAt: "2026-01-05 08:00:00" });
+    // Tromsø: the mixed-case spelling has the most rows, so it is the row
+    // /sted/tromsoe uses, and the upper-case row is the newer one: the page
+    // lists both, so its day must come from the upper-case row.
+    mk("Tromsø Tann AS", "Tromsø", "Troms", { updatedAt: "2026-02-10 09:00:00" });
+    mk("Ishavet Tann AS", "Tromsø", "Troms", { updatedAt: "2026-03-12 09:00:00" });
+    mk("Polar Tann AS", "TROMSØ", "Troms", { updatedAt: "2026-05-20 11:00:00" });
 
     // ── A. getDentalAggregateLastmods ────────────────────────────────────
     {
@@ -162,6 +168,9 @@ export async function runDentalAggregateLastmodTests(
       assertEq(["endodonti", "periodonti", "pedodonti"].map((s) => lm.forSpecialty(s)), [null, null, null], "A12: a specialty only hidden rows have -> null");
       assertEq(lm.forSpecialty("ikke-bedt-om"), null, "A13: a name not asked for -> null");
       assertTrue(/^\d{4}-\d{2}-\d{2}$/.test(lm.all ?? ""), "A14: days are YYYY-MM-DD (time and zone cut off)");
+      assertEq(lm.forPoststed("Tromsø"), "2026-05-20", "A16: Tromsø = both spellings, the newer upper-case TROMSØ row included (nb-NO upper case of ø)");
+      assertEq(lm.forPoststed("TROMSØ"), "2026-05-20", "A17: TROMSØ = the TROMSØ spelling only");
+      assertEq(lm.forFylke("Troms"), "2026-05-20", "A18: fylke Troms");
       const none = store.getDentalAggregateLastmods({ specialties: [] });
       assertEq([none.all, none.forSpecialty("kjeveortopedi")], ["2026-06-15", null], "A15: no specialties asked -> no specialty days, the rest unchanged");
     }
@@ -170,9 +179,12 @@ export async function runDentalAggregateLastmodTests(
     dentalSeo.__resetDentalSitemapCacheForTesting();
     let entries = sitemapEntries((await callRoute(router, "/sitemap.xml")).text);
     {
+      const today = new Date().toISOString().slice(0, 10);
       assertEq(entries.get(`${base}/sted/oslo`), "2026-05-02", "B1: /sted/oslo lastmod = newest public OSLO clinic (regression: was today)");
       assertEq(entries.get(`${base}/sted/bergen`), "2026-04-10", "B2: /sted/bergen lastmod = the clinics that page lists");
       assertEq(entries.get(`${base}/sted/voss`), "2026-01-05", "B3: /sted/voss");
+      assertEq(store.listPoststeder(1).find((p) => dentalSeo.slugifyText(p.poststed) === "tromsoe")?.poststed, "Tromsø", "B3b: fixture sanity — /sted/tromsoe uses the mixed-case row");
+      assertEq(entries.get(`${base}/sted/tromsoe`), "2026-05-20", "B3c: /sted/tromsoe lastmod = the newer TROMSØ row the page also lists");
       assertEq(entries.get(`${base}/fylke/Oslo`), "2026-05-02", "B4: /fylke/Oslo (regression: was today)");
       assertEq(entries.get(`${base}/fylke/Vestland`), "2026-06-15", "B5: /fylke/Vestland");
       assertEq(entries.get(`${base}/spesialitet/kjeveortopedi`), "2026-04-10", "B6: /spesialitet/kjeveortopedi (regression: was today)");
@@ -229,6 +241,9 @@ export async function runDentalAggregateLastmodTests(
     // ── D. today's dates = what changed today ────────────────────────────
     {
       db.prepare("UPDATE dental_agents SET updated_at = datetime('now') WHERE id = ?").run(bergen2.id);
+      // The day the row was given, read back, so a run across UTC midnight
+      // compares against the same day the sitemap sees.
+      const today = (db.prepare("SELECT substr(updated_at, 1, 10) AS d FROM dental_agents WHERE id = ?").get(bergen2.id) as { d: string }).d;
       dentalSeo.__resetDentalSitemapCacheForTesting();
       entries = sitemapEntries((await callRoute(router, "/sitemap.xml")).text);
       const todays = [...entries].filter(([, v]) => v === today).map(([k]) => k.slice(base.length) || "/").sort();

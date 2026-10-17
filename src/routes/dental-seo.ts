@@ -743,7 +743,9 @@ function dentalFooter(): string {
 interface ShellOptions {
   title: string;
   description?: string;
-  canonical?: string;
+  // Left out = the homepage. null = no canonical link and no og:url at all,
+  // for a page that is a copy of no other page (the 404s, sendDentalNotFound).
+  canonical?: string | null;
   jsonLd?: object | object[];
   ogImage?: string;
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): thin
@@ -755,7 +757,9 @@ interface ShellOptions {
 
 function dentalShell(content: string, opts: ShellOptions): string {
   const desc = opts.description || "Finn riktig tannlege i Norge. Søk etter klinikk, spesialitet, Helfo-avtale og tannlegevakt.";
-  const canonical = opts.canonical || DENTAL_BASE_URL;
+  const canonical = opts.canonical === null ? null : opts.canonical || DENTAL_BASE_URL;
+  const canonicalLink = canonical ? `\n<link rel="canonical" href="${escapeHtml(canonical)}">` : "";
+  const ogUrlMeta = canonical ? `\n<meta property="og:url" content="${escapeHtml(canonical)}">` : "";
   const robots = opts.robots || "index, follow, max-snippet:-1, max-image-preview:large";
   const ldArr = opts.jsonLd
     ? (Array.isArray(opts.jsonLd) ? opts.jsonLd : [opts.jsonLd])
@@ -773,12 +777,10 @@ function dentalShell(content: string, opts: ShellOptions): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
-<meta name="robots" content="${escapeHtml(robots)}">
-<link rel="canonical" href="${escapeHtml(canonical)}">
+<meta name="robots" content="${escapeHtml(robots)}">${canonicalLink}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(opts.title)}">
-<meta property="og:description" content="${escapeHtml(desc)}">
-<meta property="og:url" content="${escapeHtml(canonical)}">
+<meta property="og:description" content="${escapeHtml(desc)}">${ogUrlMeta}
 <meta property="og:type" content="website">
 <meta property="og:locale" content="nb_NO">
 <meta property="og:site_name" content="Finn-tannlege.com">
@@ -802,11 +804,15 @@ ${dentalFooter()}
 // Every HTML 404 on finn-tannlege.com goes through here, so none of them asks
 // to be indexed: "noindex, follow", like the Opplevagent and RFB 404 pages,
 // instead of the shell's default "index, follow" (integrasjonstest RYS-1,
-// dev-request 2026-10-17-integrasjonstest-oppfolging I-Q).
+// dev-request 2026-10-17-integrasjonstest-oppfolging I-Q). Nor do they carry a
+// canonical link or og:url: they used to fall back to the homepage, so every
+// 404 claimed to be a copy of https://finn-tannlege.com (FUNN
+// dental-404-canonical-til-forsiden, dev-request
+// 2026-10-16-finn-tannlege-landingssider F1-S1).
 const NOT_FOUND_ROBOTS = "noindex, follow";
 
-function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOptions, "robots">): void {
-  res.status(404).send(dentalShell(content, { ...opts, robots: NOT_FOUND_ROBOTS }));
+function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOptions, "robots" | "canonical">): void {
+  res.status(404).send(dentalShell(content, { ...opts, robots: NOT_FOUND_ROBOTS, canonical: null }));
 }
 
 // ─── Clinic card (used in /sok and /fylke) ───────────────────
@@ -885,6 +891,17 @@ export function listPageHref(baseUrl: string, n: number): string {
 }
 
 /**
+ * What page N ≥ 2 of a list adds to its <title> (« – side N») and description
+ * (« Side N av M.»): it is its own canonical, so it must not repeat page 1's
+ * title and description word for word. Page 1 adds nothing.
+ */
+export function listPageMeta(page: number, totalPages: number): { title: string; description: string } {
+  return page > 1
+    ? { title: ` – side ${page}`, description: ` Side ${page} av ${totalPages}.` }
+    : { title: "", description: "" };
+}
+
+/**
  * The page a list request is on, for `total` rows in pages of listPageSize:
  * ?side= parsed as before; missing, invalid, below 1 or past the last page =
  * page 1.
@@ -906,7 +923,9 @@ export function resolveListPage(
  * page). The gap mark between non-adjacent numbers is decoration and stands
  * for no page: every page is reachable through links, and the last page is
  * linked from every page. It used to link pages 1–10 only, with «... N» as
- * plain text, so page 11 and on could not be crawled.
+ * plain text, so page 11 and on could not be crawled. A currentPage past the
+ * last page (/sok parses ?side= with no upper bound) gets the window at the
+ * end and «Forrige» to the last page, never to a page that does not exist.
  */
 export function paginationHtml(
   currentPage: number,
@@ -918,12 +937,13 @@ export function paginationHtml(
   const a = (n: number, label: string, attrs: string): string =>
     `<a href="${escapeHtml(listPageHref(baseUrl, n))}"${attrs}>${label}</a>`;
 
+  const at = Math.min(currentPage, totalPages);
   const shown = new Set<number>([1, totalPages]);
-  for (let n = Math.max(1, currentPage - win); n <= Math.min(totalPages, currentPage + win); n++) shown.add(n);
+  for (let n = Math.max(1, at - win); n <= Math.min(totalPages, at + win); n++) shown.add(n);
   const numbers = [...shown].sort((x, y) => x - y);
 
   const parts: string[] = [];
-  if (currentPage > 1) parts.push(a(currentPage - 1, "&lsaquo; Forrige", ` class="page-btn" rel="prev"`));
+  if (currentPage > 1) parts.push(a(Math.min(currentPage - 1, totalPages), "&lsaquo; Forrige", ` class="page-btn" rel="prev"`));
   numbers.forEach((n, i) => {
     if (i > 0 && n - numbers[i - 1]! > 1) parts.push(`<span class="page-gap" aria-hidden="true">&hellip;</span>`);
     parts.push(a(n, String(n), n === currentPage ? ` class="page-btn active" aria-current="page"` : ` class="page-btn"`));
@@ -964,11 +984,9 @@ export function dentalItemListJsonLd(
 // ═══════════════════════════════════════════════════════════
 
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1): the hero chips
-// link the indexable /sted/<slug> page when the place has one in the cached
-// poststed list (findStedRow, the lookup /sted itself uses), and /sok?q=
-// (noindex) only when it has none.
-const HERO_PLACES = ["Oslo", "Bergen", "Trondheim", "Stavanger"];
-
+// (DENTAL_LANDING_CONFIG.heroPlaces) link the indexable /sted/<slug> page
+// when the place has one in the cached poststed list (findStedRow, the lookup
+// /sted itself uses), and /sok?q= (noindex) only when it has none.
 function heroPlaceHref(place: string): string {
   const slug = slugifyText(place);
   return findStedRow(slug) ? `/sted/${slug}` : `/sok?q=${encodeURIComponent(place)}`;
@@ -1034,7 +1052,7 @@ router.get("/", (_req: Request, res: Response) => {
       <button type="submit">Søk</button>
     </form>
     <div class="chips" role="list" aria-label="Snarvei-søk">
-      ${HERO_PLACES.map((place) => `<a href="${escapeHtml(heroPlaceHref(place))}" class="chip" role="listitem">${escapeHtml(place)}</a>`).join("\n      ")}
+      ${DENTAL_LANDING_CONFIG.heroPlaces.map((place) => `<a href="${escapeHtml(heroPlaceHref(place))}" class="chip" role="listitem">${escapeHtml(place)}</a>`).join("\n      ")}
       <a href="/sok?akutt=1" class="chip" role="listitem" style="background:rgba(251,191,36,.25)">Akutt</a>
     </div>
   </section>
@@ -1819,6 +1837,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const baseUrl = `/fylke/${encodeURIComponent(matchedFylke.fylke)}`;
   // Page 1 keeps the bare canonical; page N ≥ 2 is its own (F1-S1).
   const pageUrl = `${DENTAL_BASE_URL}${listPageHref(baseUrl, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
   const itemList = dentalItemListJsonLd(`Tannleger i ${matchedFylke.fylke}`, pageUrl, agents, offset);
 
   // PR-116: Poststed chips for this fylke (≥2 clinics, max 30)
@@ -1861,8 +1880,8 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `Tannleger i ${escapeHtml(matchedFylke.fylke)} — Finn-tannlege.com`,
-    description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
+    title: `Tannleger i ${escapeHtml(matchedFylke.fylke)}${pageMeta.title} — Finn-tannlege.com`,
+    description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
     canonical: pageUrl,
     jsonLd: [itemList, fylkeBreadcrumb],
   }));
@@ -2538,6 +2557,7 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   const basePath = `/spesialitet/${sp.slug}`;
   const canonicalUrl = `${DENTAL_BASE_URL}${basePath}`;
   const pageUrl = `${DENTAL_BASE_URL}${listPageHref(basePath, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
   const displayNavn = sp.navn.charAt(0).toUpperCase() + sp.navn.slice(1);
 
   const itemList = dentalItemListJsonLd(`Tannlegespesialister: ${displayNavn}`, pageUrl, agents, offset);
@@ -2585,8 +2605,8 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `${displayNavn} — Tannlegespesialister i Norge | Finn-tannlege.com`,
-    description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.`,
+    title: `${displayNavn}${pageMeta.title} — Tannlegespesialister i Norge | Finn-tannlege.com`,
+    description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.${pageMeta.description}`,
     canonical: pageUrl,
     jsonLd: [itemList, specBreadcrumb],
   }));
@@ -2643,6 +2663,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   const baseUrl = `/sted/${stedSlugParam}`;
   // Page 1 keeps the bare canonical; page N ≥ 2 is its own (F1-S1).
   const pageUrl = `${DENTAL_BASE_URL}${listPageHref(baseUrl, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
 
   const itemList = dentalItemListJsonLd(`Tannlege i ${titledSted}`, pageUrl, agents, offset);
 
@@ -2682,8 +2703,8 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `Tannlege i ${escapeHtml(titledSted)} — Finn-tannlege.com`,
-    description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
+    title: `Tannlege i ${escapeHtml(titledSted)}${pageMeta.title} — Finn-tannlege.com`,
+    description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
     canonical: pageUrl,
     // skive A: a /sted page with 0 active clinics must never be indexable.
     ...(total === 0 ? { robots: "noindex,follow" } : {}),

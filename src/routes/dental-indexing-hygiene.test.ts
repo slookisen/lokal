@@ -9,10 +9,13 @@
  *      cards (count, order, positions from the page offset).
  *   D  paginationHtml: a window of real links, every page reachable, the last
  *      page linked from page 1 (it linked 1–10 and «... N» as plain text).
- *   E  page N ≥ 2 of /fylke, /sted and /spesialitet is its own canonical;
- *      page 1 keeps the bare one; a bad or too high ?side= is page 1.
+ *   E  page N ≥ 2 of /fylke, /sted and /spesialitet is its own canonical,
+ *      with its own <title> and description; page 1 keeps the bare canonical
+ *      and its title; a bad or too high ?side= is page 1.
  *   F  /spesialitet/:slug is paged (it listed the first 50 only).
- *   G  404s stay "noindex, follow" (delivered by I-Q; regression only).
+ *   G  every HTML 404 (all eight sendDentalNotFound paths, the catch-all
+ *      included) is "noindex, follow" (I-Q) and has no canonical link and no
+ *      og:url (they pointed at the homepage); other pages keep both.
  *
  * Same harness as dental-seo-lastmod-antall-404-agents-txt.test.ts
  * (in-memory dental DB, the router driven through router.handle()); this
@@ -75,6 +78,9 @@ const canonicalOf = (html: string): string | null =>
   (html.match(/<link rel="canonical" href="([^"]*)">/) || [])[1] ?? null;
 const ogUrlOf = (html: string): string | null =>
   (html.match(/<meta property="og:url" content="([^"]*)">/) || [])[1] ?? null;
+const titleOf = (html: string): string | null => (html.match(/<title>([^<]*)<\/title>/) || [])[1] ?? null;
+const descriptionOf = (html: string): string | null =>
+  (html.match(/<meta name="description" content="([^"]*)">/) || [])[1] ?? null;
 const unescapeAttr = (s: string): string => s.replace(/&amp;/g, "&");
 
 function jsonLdBlocks(html: string): any[] {
@@ -197,6 +203,7 @@ export async function runDentalIndexingHygieneTests(
         ["Stavanger", "/sok?q=Stavanger"],
         ["Akutt", "/sok?akutt=1"],
       ], "B2: chips link /sted/<slug> for places with a page, /sok?q= for Stavanger (no clinics), Akutt unchanged");
+      assertEq(chips.map(([name]) => name), [...DENTAL_LANDING_CONFIG.heroPlaces, "Akutt"], "B2b: the place chips are DENTAL_LANDING_CONFIG.heroPlaces, in order");
       for (const p of ["/sted/oslo", "/sted/bergen", "/sted/trondheim"]) {
         const r = await callRoute(router, p);
         assertEq(r.status, 200, `B3: chip target ${p} -> 200`);
@@ -297,6 +304,16 @@ export async function runDentalIndexingHygieneTests(
       assertTrue(paginationHtml(2, 3, "/sok?").includes('href="/sok"') && paginationHtml(1, 3, "/sok?").includes('href="/sok?side=2"'), "D18: /sok without filters: /sok and /sok?side=N");
       assertEq([listPageHref("/fylke/Oslo", 1), listPageHref("/fylke/Oslo", 2), listPageHref("/sok?q=a", 3), listPageHref("/sok?", 1)], ["/fylke/Oslo", "/fylke/Oslo?side=2", "/sok?q=a&side=3", "/sok"], "D19: listPageHref");
 
+      // Past the last page (/sok takes ?side= with no upper bound): no link
+      // to a page that does not exist, «Forrige» to the last page.
+      const past = paginationHtml(999, 3, "/sok?q=x");
+      assertEq(navHrefs(past), ["/sok?q=x&side=3", "/sok?q=x", "/sok?q=x&side=2", "/sok?q=x&side=3"], "D22: paginationHtml(999, 3): Forrige -> side=3, then pages 1-3 (regression: Forrige -> side=998)");
+      assertTrue(past.includes('href="/sok?q=x&amp;side=3" class="page-btn" rel="prev"') && !past.includes('rel="next"') && !past.includes("aria-current"), "D23: …rel=prev to the last page, no rel=next, no page marked current");
+      assertEq(navHrefs(paginationHtml(4, 3, "/sok?q=x"))[0], "/sok?q=x&side=3", "D24: one past the last page: Forrige -> the last page");
+      const sokPast = await callRoute(router, "/sok?fylke=Oslo&side=999");
+      const sokPastPages = navHrefs(sokPast.text).map((h) => Number((h.match(/[?&]side=(\d+)/) || [])[1] ?? 1));
+      assertTrue(sokPast.status === 200 && sokPastPages.length > 0 && Math.max(...sokPastPages) === 3, `D25: /sok?fylke=Oslo&side=999 (3 pages) links no page past 3 (got ${JSON.stringify(sokPastPages)})`);
+
       // On the route: the last page of /fylke/Oslo is linked from page 1.
       const f1 = await callRoute(router, "/fylke/Oslo");
       assertTrue(navHrefs(f1.text).includes("/fylke/Oslo?side=3"), "D20: /fylke/Oslo page 1 links its last page (side=3)");
@@ -321,6 +338,19 @@ export async function runDentalIndexingHygieneTests(
           assertEq(cardHrefs(r.text), firstCards, `E7: ${path}?side=${bad} renders page 1`);
         }
       }
+      // Page N ≥ 2 has its own title and description; page 1 keeps its own.
+      for (const path of ["/fylke/Oslo", "/sted/oslo", "/spesialitet/kjeveortopedi"]) {
+        const [p1, p2] = [await callRoute(router, path), await callRoute(router, `${path}?side=2`)];
+        const t1 = titleOf(p1.text) ?? "";
+        const t2 = titleOf(p2.text) ?? "";
+        assertTrue(!/side \d/.test(t1) && !/Side \d/.test(descriptionOf(p1.text) ?? ""), `E9: ${path} page 1 title and description name no page (${t1})`);
+        assertEq(t2, t1.replace(/ (—|\|) /, " – side 2 $1 "), `E10: ${path}?side=2 title = page 1's with « – side 2» (regression: same title as page 1)`);
+        assertTrue((descriptionOf(p2.text) ?? "").endsWith(" Side 2 av " + (path.startsWith("/spesialitet") ? 2 : 3) + "."), `E11: ${path}?side=2 description ends «Side 2 av N.» (${descriptionOf(p2.text)})`);
+      }
+      const titles = await Promise.all(["", "?side=2", "?side=3"].map(async (q) => titleOf((await callRoute(router, `/sted/oslo${q}`)).text)));
+      assertEq(new Set(titles).size, 3, "E12: the three pages of /sted/oslo have three different titles");
+      assertEq([dentalSeo.listPageMeta(1, 3), dentalSeo.listPageMeta(3, 3)], [{ title: "", description: "" }, { title: " – side 3", description: " Side 3 av 3." }], "E13: listPageMeta");
+
       // The breadcrumb still ends at the list itself, not the page.
       const crumbs = jsonLdBlocks((await callRoute(router, "/fylke/Oslo?side=2")).text).find((b) => b && b["@type"] === "BreadcrumbList");
       assertEq(crumbs?.itemListElement?.at(-1)?.item, `${base}/fylke/Oslo`, "E8: breadcrumb unchanged on page 2");
@@ -340,11 +370,41 @@ export async function runDentalIndexingHygieneTests(
       assertTrue(!p1.text.includes("Nedlagt Oslo Klinikk"), "F6: closed clinic stays out");
     }
 
-    // ── G. 404s stay noindex (I-Q) ───────────────────────────────────────
+    // ── G. 404s: noindex (I-Q), no canonical, no og:url ──────────────────
     {
-      for (const p of ["/finnes-ikke", "/sted/finnes-ikke", "/fylke/Atlantis", "/spesialitet/finnes-ikke"]) {
+      // A rejected clinic and the synthetic probe row 404 by id and by slug.
+      const rejectedId = mk("Avvist Oslo Klinikk AS", "OSLO", "Oslo");
+      db.prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?").run(rejectedId);
+      const rejected = store.getDentalAgentById(rejectedId)!;
+      db.prepare(
+        `INSERT INTO dental_agents (id, org_nr, navn, poststed, fylke, adresse, verification_status, catalog_class)
+         VALUES ('persistence-probe-pr100b', '999999999', 'PR-100b Persistence Probe', 'TEST', 'Oslo', 'Volume Test 1', 'needs_review', 'klinikk')`
+      ).run();
+      const notFound: Array<[string, string]> = [
+        ["/finnes-ikke", "catch-all"],
+        ["/finnes-ikke-404", "catch-all"],
+        ["/sted/finnes-ikke", "unknown sted"],
+        ["/fylke/Atlantis", "unknown fylke"],
+        ["/spesialitet/finnes-ikke", "unknown specialty"],
+        ["/klinikk/finnes-ikke", "clinic slug without an org.nr"],
+        ["/klinikk/finnes-ikke--123456789", "clinic slug, unknown org.nr"],
+        ["/klinikk/id/finnes-ikke", "unknown clinic id"],
+        [`/klinikk/id/${rejectedId}`, "rejected clinic by id"],
+        [`/klinikk/${dentalSeo.slugifyClinic(rejected.navn, rejected.org_nr ?? undefined)}`, "rejected clinic by slug"],
+        ["/klinikk/id/persistence-probe-pr100b", "probe row by id"],
+        [`/klinikk/${dentalSeo.slugifyClinic("PR-100b Persistence Probe", "999999999")}`, "probe row by slug"],
+      ];
+      for (const [p, what] of notFound) {
         const r = await callRoute(router, p);
-        assertEq([r.status, robotsOf(r.text)], [404, ["noindex, follow"]], `G1: ${p} -> 404 with noindex, follow`);
+        assertEq([r.status, robotsOf(r.text)], [404, ["noindex, follow"]], `G1: ${p} (${what}) -> 404 with noindex, follow`);
+        assertTrue(!r.text.includes('rel="canonical"'), `G2: ${p} (${what}) has no canonical link (regression: canonical = the homepage)`);
+        assertTrue(!r.text.includes('property="og:url"'), `G3: ${p} (${what}) has no og:url (regression: og:url = the homepage)`);
+        assertTrue(r.text.includes('<meta property="og:title"') && r.text.includes('<link rel="icon"'), `G4: ${p} (${what}) keeps the rest of the head`);
+      }
+      // Pages that are not 404s keep both, and the homepage default stays.
+      for (const [p, want] of [["/", base], ["/om", `${base}/om`], ["/sted/oslo", `${base}/sted/oslo`]] as const) {
+        const r = await callRoute(router, p);
+        assertEq([r.status, canonicalOf(r.text), ogUrlOf(r.text)], [200, want, want], `G5: ${p} keeps canonical and og:url = ${want}`);
       }
     }
   } catch (err: any) {
