@@ -21,7 +21,17 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, productPriceText } from "../services/knowledge-service";
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
+// fields read by type (see "knowledge fields read by type" below).
+import { textEntries } from "../utils/text-entries";
+// Server values written into the producer page's inline <script> (agentId and
+// its language strings) go through serializeJsonForScript(), so a value with
+// "</script>" or "<!--<script>" cannot end or swallow the element; for the
+// UUIDs and fixed texts they hold today the bytes are unchanged (FUNN
+// rfb-seo-ra-json-stringify-inline, lokal#1105 review). The JSON-LD in
+// shell() keeps its own `<` escape: moving it would change bytes (`&`).
+import { serializeJsonForScript } from "../services/safe-script-json";
 import { getConfig } from "../config/vertical-config";
 import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
@@ -874,9 +884,71 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
   </a>`;
 }
 
+// ─── Integration test 2026-10-17 (I-G): knowledge fields read by type ─────
+// The knowledge columns are JSON whose shape nothing enforces. getAgentInfo
+// (I-F) hands each list over in its declared shape, but the fields inside a
+// product or an opening-hours entry are typed where they are read. Before
+// this, the producer page showed a price stored as an object as
+// "[object Object]" and hours without times as "undefined – undefined", and
+// answered 500 on a day that is a number, a month list stored as text or a
+// seasonality entry whose months are not a list; the front page answered 500
+// when a featured producer's hours held a number. Well-formed values give
+// exactly the text they gave before.
+
+/** A product entry's name: a text entry is its own name, an object its text `name`; anything else has none. */
+function productNameText(p: unknown): string {
+  if (typeof p === "string") return p;
+  const name = p !== null && typeof p === "object" ? (p as { name?: unknown }).name : undefined;
+  return typeof name === "string" ? name : "";
+}
+
+/** A time in an opening-hours entry: text as it is, a finite number as its digits ("10"), anything else none. */
+function openingTimeText(value: unknown): string {
+  if (typeof value === "string") return value;
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
+/** One opening-hours entry the pages can show: day/open/close/note as text, or a free-text entry. */
+export type OpeningHourRow =
+  | { kind: "times"; day: string; open: string; close: string; note: string }
+  | { kind: "text"; text: string };
+
+/**
+ * The entries of an openingHours list the RFB pages show, in order. An object
+ * needs both times (text, or a number as main showed it: "10 – 17"); its day
+ * and note count only as text. A text entry is shown as it is. Anything else,
+ * including an object without both times (main showed "undefined – undefined"),
+ * says nothing usable and is left out: the same rule as lokal_info (I-A) and
+ * the A2A auto-reply (I-G). A value that is not a list has no entries here;
+ * free text for the whole field is shown by the page itself.
+ */
+export function openingHourRows(openingHours: unknown): OpeningHourRow[] {
+  if (!Array.isArray(openingHours)) return [];
+  const rows: OpeningHourRow[] = [];
+  for (const h of openingHours) {
+    if (typeof h === "string") {
+      if (h.trim()) rows.push({ kind: "text", text: h.trim() });
+      continue;
+    }
+    if (!h || typeof h !== "object" || Array.isArray(h)) continue;
+    const { day, open, close, note } = h as Record<string, unknown>;
+    const openText = openingTimeText(open);
+    const closeText = openingTimeText(close);
+    if (!openText.trim() || !closeText.trim()) continue;
+    rows.push({
+      kind: "times",
+      day: typeof day === "string" ? day : "",
+      open: openText,
+      close: closeText,
+      note: typeof note === "string" ? note : "",
+    });
+  }
+  return rows;
+}
+
 // ─── PR-84: "Open now" computation from openingHours ───────
 
-function isOpenNow(openingHours: Array<{ day: string; open: string; close: string }> | undefined): { isOpen: boolean; todayLabel?: string } | null {
+function isOpenNow(openingHours: unknown): { isOpen: boolean; todayLabel?: string } | null {
   if (!Array.isArray(openingHours) || !openingHours.length) return null;
 
   // Get current Norway day + time
@@ -888,11 +960,16 @@ function isOpenNow(openingHours: Array<{ day: string; open: string; close: strin
   const minStr = parts.find(p => p.type === "minute")?.value || "00";
   const nowMins = parseInt(hourStr) * 60 + parseInt(minStr);
 
-  const today = openingHours.find(h => h.day?.toLowerCase() === dayKey);
+  // I-G: only an entry with both times can say whether it is open; a time
+  // without minutes ("10", or the number 10) is on the hour.
+  let today: { open: string; close: string } | undefined;
+  for (const h of openingHourRows(openingHours)) {
+    if (h.kind === "times" && h.day.toLowerCase() === dayKey) { today = h; break; }
+  }
   if (!today) return { isOpen: false };
 
-  const [oh, om] = (today.open || "00:00").split(":").map(Number);
-  const [ch, cm] = (today.close || "00:00").split(":").map(Number);
+  const [oh, om = 0] = today.open.split(":").map(Number);
+  const [ch, cm = 0] = today.close.split(":").map(Number);
   const openMins = oh * 60 + om;
   const closeMins = ch * 60 + cm;
 
@@ -928,7 +1005,8 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   const products = Array.isArray(knowledge?.products) ? knowledge.products : [];
   let productLine = "";
   if (products.length) {
-    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(p.name || "", lang))}`).join(", ");
+    // I-G: a text entry is its own name (it used to show as the emoji alone).
+    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(productNameText(p), lang))}`).join(", ");
     const more = products.length > 3 ? ` <span class="pc-more">+${products.length - 3} ${escapeHtml(lang === "en" ? "products" : "produkter")}</span>` : "";
     productLine = `<div class="pc-products">${top}${more}</div>`;
   }
@@ -4646,7 +4724,7 @@ export function buildProducerFaqJsonLd(params: {
   const qas: Array<{ q: string; a: string }> = [];
 
   const productNames = (params.productsList || [])
-    .map((p: any) => (typeof p === "string" ? p : p?.name))
+    .map((p: unknown) => productNameText(p))
     .filter(Boolean)
     .slice(0, 8);
   // Cap at 3 to match buildProducerAnswerFirstOpening's fallback cap — same
@@ -4752,7 +4830,7 @@ export function buildProducerAnswerFirstOpening(params: {
   const productsAreSourced = params.productsAreSourced ?? false;
   const hasDirectSaleSignal = params.hasDirectSaleSignal ?? false;
   const productNames = (params.productsList || [])
-    .map((p: any) => (typeof p === "string" ? p : p?.name))
+    .map((p: unknown) => productNameText(p))
     .filter(Boolean)
     .map((n: string) => productLabel(n, lang))
     .slice(0, 4);
@@ -5631,7 +5709,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // separate public badge. Distinct from `isVerified` (manual/legacy
     // verification) — an agent can have one, both, or neither.
     if (agent.brregVerified) badges.push(`<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.badge_brreg"))}</span>`);
-    const certs = k.certifications || [];
+    // I-G: the list fields are read with textEntries (text entries only), as
+    // getAgentInfo hands them over; for that shape this is the list itself.
+    const certs = textEntries(k.certifications);
     if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(catLabel(c, lang))}</span>`));
 
@@ -5669,27 +5749,40 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const productsList = Array.isArray(k.products) ? k.products : [];
     const productsHtml = productsList.length
       ? productsList.map((p: any) => {
-          // Handle both object products ({name, category, price}) and plain strings ("brød")
-          const name = typeof p === "string" ? p : (p.name || "");
+          // Handle both object products ({name, category, price}) and plain strings ("brød").
+          // I-G: each field is read by its type. A price that is not text or a
+          // positive number (an object showed as "[object Object]") is no price,
+          // the unit counts only as text, and the months only as a list of
+          // month numbers (or their text, which MONTH_NAMES also indexes).
+          const name = productNameText(p);
           if (!name) return "";
-          const months = (typeof p === "object" && (p.months || p.seasonMonths)) || [];
-          const seasonal = typeof p === "object" && p.seasonal && months.length
-            ? `<span class="prod-season">${months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
-          const org = typeof p === "object" && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
-          const price = typeof p === "object" && p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
+          const isObject = typeof p === "object";
+          const rawMonths = isObject ? (p.months || p.seasonMonths) : undefined;
+          const months: Array<number | string> = Array.isArray(rawMonths)
+            ? rawMonths.filter((m: unknown) => typeof m === "number" || typeof m === "string")
+            : [];
+          const seasonal = isObject && p.seasonal && months.length
+            ? `<span class="prod-season">${escapeHtml(months.map((m) => MONTH_NAMES[m as number] || m).join("\u2013"))}</span>` : "";
+          const org = isObject && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
+          const priceText = isObject ? productPriceText(p.price) : "";
+          const priceUnit = isObject && typeof p.priceUnit === "string" ? p.priceUnit : "";
+          const price = priceText ? `<span class="prod-price">${escapeHtml(priceText)}${priceUnit && priceUnit !== 'kr' ? ' ' + escapeHtml(priceUnit) : ''}</span>` : "";
           return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).filter(Boolean).join("") : "";
 
     // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
     const today = new Date().toLocaleDateString("en-US", { weekday: "long" }).toLowerCase();
     const todayShort = today.slice(0, 3);
-    const hoursList = Array.isArray(k.openingHours) ? k.openingHours : [];
+    // I-G: openingHourRows() keeps the entries that say something (both times,
+    // or a text entry) and reads each field by type; the times are escaped now.
+    const hoursList = openingHourRows(k.openingHours);
     const hoursText = !Array.isArray(k.openingHours) && typeof k.openingHours === "string" && k.openingHours ? k.openingHours : "";
     const hoursHtml = hoursList.length
-      ? hoursList.map((h: any) => {
+      ? hoursList.map((h) => {
+          if (h.kind === "text") return `<div class="hrs-day"></div><div class="hrs-time">${escapeHtml(h.text)}</div>`;
           const isToday = h.day === todayShort || h.day === today;
           const cls = isToday ? " hrs-today" : "";
-          return `<div class="hrs-day${cls}">${escapeHtml(dayName(h.day, lang))}${isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : ""}</div><div class="hrs-time${cls}">${h.open} \u2013 ${h.close}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
+          return `<div class="hrs-day${cls}">${escapeHtml(dayName(h.day, lang))}${isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : ""}</div><div class="hrs-time${cls}">${escapeHtml(h.open)} \u2013 ${escapeHtml(h.close)}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
         }).join("")
       : hoursText ? `<div class="hrs-day">${escapeHtml(hoursText)}</div>` : "";
 
@@ -5727,7 +5820,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const currentMonth = new Date().getMonth() + 1; // 1-12
     const seasonHtml = seasonList.length
       ? seasonList.map((s: any) => {
-          const months = s.months || [];
+          // I-G: a text entry is the product; in an object the product and the
+          // note count only as text and the months only as a list.
+          const product = typeof s === "string" ? s : typeof s?.product === "string" ? s.product : "";
+          const note = typeof s?.note === "string" ? s.note : "";
+          const months: unknown[] = Array.isArray(s?.months) ? s.months : [];
           const inSeason = months.includes(currentMonth);
           const monthDots = Array.from({ length: 12 }, (_, i) => {
             const m = i + 1;
@@ -5736,9 +5833,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             return `<span class="${cls}" title="${monthAbbr(m, lang)}">${monthAbbr(m, lang).charAt(0)}</span>`;
           }).join("");
           return `<div class="season-row">
-            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(s.product || "", lang))}</div>
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(product, lang))}</div>
             <div class="season-bar">${monthDots}</div>
-            ${s.note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(s.note)}</div>` : ""}
+            ${note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(note)}</div>` : ""}
           </div>`;
         }).join("")
       : "";
@@ -5747,8 +5844,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const deliveryParts: string[] = [];
     if (k.deliveryRadius) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_radius"))}</strong> ${escapeHtml(String(k.deliveryRadius))} km</div>`);
     if (k.minOrderValue) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.min_order"))}</strong> ${escapeHtml(String(k.minOrderValue))} kr</div>`);
-    if ((k.deliveryOptions || []).length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_methods"))}</strong> ${escapeHtml((k.deliveryOptions as string[]).map((v) => translateDeliveryTerm(String(v), lang)).join(", "))}</div>`);
-    if ((k.paymentMethods || []).length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.payment"))}</strong> ${escapeHtml((k.paymentMethods as string[]).map((v) => translateDeliveryTerm(String(v), lang)).join(", "))}</div>`);
+    const deliveryOptions = textEntries(k.deliveryOptions);
+    const paymentMethods = textEntries(k.paymentMethods);
+    if (deliveryOptions.length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_methods"))}</strong> ${escapeHtml(deliveryOptions.map((v) => translateDeliveryTerm(v, lang)).join(", "))}</div>`);
+    if (paymentMethods.length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.payment"))}</strong> ${escapeHtml(paymentMethods.map((v) => translateDeliveryTerm(v, lang)).join(", "))}</div>`);
     const deliveryHtml = deliveryParts.join("");
 
     // ─── Phase 5.11 A2: affiliations card (producer view) ───────────
@@ -5865,13 +5964,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     linksList.forEach((l: any) => { if (l.url) sameAsUrls.push(l.url); });
     if (sameAsUrls.length) jsonLd.sameAs = sameAsUrls.length === 1 ? sameAsUrls[0] : sameAsUrls;
 
-    // Opening hours — Schema.org format
-    if (hoursList.length) {
+    // Opening hours — Schema.org format. I-G: only entries with a day and both
+    // times; a text entry used to give "https://schema.org/undefined".
+    const specHours = hoursList.flatMap((h) => (h.kind === "times" && h.day ? [h] : []));
+    if (specHours.length) {
       const dayMap: Record<string, string> = {
         mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday",
         fri: "Friday", sat: "Saturday", sun: "Sunday",
       };
-      jsonLd.openingHoursSpecification = hoursList.map((h: any) => ({
+      jsonLd.openingHoursSpecification = specHours.map((h) => ({
         "@type": "OpeningHoursSpecification",
         "dayOfWeek": `https://schema.org/${dayMap[h.day] || h.day}`,
         "opens": h.open,
@@ -5910,7 +6011,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (productsList.length) {
       const unpricedItems: any[] = [];
       const pricedOffers = productsList.slice(0, 20).map((p: any) => {
-        const rawName = typeof p === "string" ? p : (p.name || "");
+        const rawName = productNameText(p);
         if (!rawName) return null;
 
         // Parse price from name if not in price field (e.g. "Lammelår – kr 275/kg")
@@ -6013,8 +6114,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     // Payment methods
-    if ((k.paymentMethods || []).length) {
-      jsonLd.paymentAccepted = (k.paymentMethods as string[]).join(", ");
+    if (paymentMethods.length) {
+      jsonLd.paymentAccepted = paymentMethods.join(", ");
     }
 
     // Categories as additionalType
@@ -6385,13 +6486,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // proceeds identically whether the beacon succeeds, fails, or
       // (JS-disabled) never runs at all.
       (function () {
-        var agentId = ${JSON.stringify(agent.id)};
+        var agentId = ${serializeJsonForScript(agent.id)};
         var url = "/api/agents/" + encodeURIComponent(agentId) + "/stats";
         fetch(url, { credentials: "same-origin" })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (s) {
             if (!s) return;
-            var fmt = function (n) { return (n || 0).toLocaleString(${JSON.stringify(lang === "en" ? "en-GB" : "nb-NO")}); };
+            var fmt = function (n) { return (n || 0).toLocaleString(${serializeJsonForScript(lang === "en" ? "en-GB" : "nb-NO")}); };
             if (s.humanViews > 0) {
               var h = document.querySelector('[data-stat="human"]');
               if (h) { h.querySelector('[data-fill="human"]').textContent = fmt(s.humanViews); h.style.display = "flex"; }
@@ -6405,7 +6506,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 var parts = [];
                 if (b.chatgpt) parts.push("ChatGPT " + b.chatgpt);
                 if (b.claude) parts.push("Claude " + b.claude);
-                if (b.other) parts.push(${JSON.stringify(lang === "en" ? "Other" : "Annet")} + " " + b.other);
+                if (b.other) parts.push(${serializeJsonForScript(lang === "en" ? "Other" : "Annet")} + " " + b.other);
                 // The approved tooltip text stays; the split is added under it (Daniel 2026-10-13: «behold teksten»).
                 if (parts.length) a.setAttribute("title", (a.getAttribute("title") || "") + "\\n" + parts.join(" · "));
               }
@@ -6416,7 +6517,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             // date the counting started instead of 0 (Daniel 2026-10-15).
             var d = s.aiDeliveries;
             var sinceMs = d && d.countingSince ? Date.parse(d.countingSince + "T00:00:00Z") : NaN;
-            var sinceTxt = isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString(${JSON.stringify(lang === "en" ? "en-GB" : "nb-NO")}, { day: "numeric", month: "short", timeZone: "UTC" });
+            var sinceTxt = isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString(${serializeJsonForScript(lang === "en" ? "en-GB" : "nb-NO")}, { day: "numeric", month: "short", timeZone: "UTC" });
             var partial = !!sinceTxt && d.windowDays && (Date.now() - sinceMs) < (d.windowDays - 1) * 86400000;
             // Shown with deliveries, or at 0 while the counting is younger than the window;
             // a 0 over a full window stays hidden, as before.
@@ -6426,20 +6527,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 var meta = tile.querySelector(".pf-stat-meta");
                 if (d.total > 0) {
                   tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
-                  if (partial && meta) meta.textContent = ${JSON.stringify(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
+                  if (partial && meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
                 } else {
-                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${JSON.stringify(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
-                  if (meta) meta.textContent = ${JSON.stringify(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
+                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${serializeJsonForScript(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
+                  if (meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
                 }
-                if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${JSON.stringify(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
+                if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${serializeJsonForScript(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
                 tile.style.display = "flex";
                 var v = d.byVendor || {};
                 var vp = [];
                 if (v.chatgpt) vp.push("ChatGPT " + v.chatgpt);
                 if (v.claude) vp.push("Claude " + v.claude);
                 if (v.perplexity) vp.push("Perplexity " + v.perplexity);
-                if (v.other) vp.push(${JSON.stringify(lang === "en" ? "Other" : "Annet")} + " " + v.other);
-                if (v.unknown) vp.push(${JSON.stringify(lang === "en" ? "Unknown" : "Ukjent")} + " " + v.unknown);
+                if (v.other) vp.push(${serializeJsonForScript(lang === "en" ? "Other" : "Annet")} + " " + v.other);
+                if (v.unknown) vp.push(${serializeJsonForScript(lang === "en" ? "Unknown" : "Ukjent")} + " " + v.unknown);
                 if (vp.length) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + vp.join(" · "));
               }
             }

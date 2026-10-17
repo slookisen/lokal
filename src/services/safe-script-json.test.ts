@@ -24,10 +24,12 @@
  *       idiom; every literal `<script type="application/ld+json">` or
  *       `<script type="application/json" …>` is filled directly by
  *       serializeJsonForScript() (RFB seo.ts keeps its own `<` escape, see
- *       LEGACY_LT_ESCAPE_FILES); experiences-seo.ts and dental-seo.ts
- *       interpolate no raw JSON.stringify() at all. The scanner is checked
- *       against synthetic offenders first, so it cannot pass by seeing
- *       nothing.
+ *       LEGACY_LT_ESCAPE_FILES); experiences-seo.ts, dental-seo.ts and RFB
+ *       seo.ts interpolate no raw JSON.stringify() at all, apart from that
+ *       exact seo.ts JSON-LD form (inline-script values included: seo.ts's
+ *       agentId, FUNN rfb-seo-ra-json-stringify-inline). The scanner is
+ *       checked against synthetic offenders first, so it cannot pass by
+ *       seeing nothing.
  *
  * Run standalone: npx tsx src/services/safe-script-json.test.ts
  * Wired into `npm test` via tests/test.ts.
@@ -58,8 +60,13 @@ const WEAK_ESCAPE = /\.replace\(\s*\/<\\\/\/g/;
 const LEGACY_LT_ESCAPE = /^\$\{JSON\.stringify\([\w.]+\)\.replace\(\/<\/g, "\\\\u003c"\)\}<\/script>/;
 const LEGACY_LT_ESCAPE_FILES = new Set(["seo.ts"]);
 // The two sites this dev-request moved off raw JSON.stringify(), including
-// JSON values written into inline scripts.
-const NO_RAW_STRINGIFY_FILES = ["experiences-seo.ts", "dental-seo.ts"];
+// JSON values written into inline scripts, and RFB seo.ts, whose inline-script
+// values (agentId and its language strings) moved in
+// 2026-10-17-integrasjonstest-oppfolging (FUNN rfb-seo-ra-json-stringify-inline,
+// lokal#1105 review). seo.ts's JSON-LD keeps LEGACY_LT_ESCAPE and is the only
+// raw JSON.stringify() the scan lets through there.
+const NO_RAW_STRINGIFY_FILES = ["experiences-seo.ts", "dental-seo.ts", "seo.ts"];
+const LD_JSON_TAG = '<script type="application/ld+json">';
 
 function isCommentLine(line: string): boolean {
   const t = line.trim();
@@ -82,9 +89,22 @@ export function scriptJsonOffenders(file: string, src: string): string[] {
   return out;
 }
 
-/** Lines of `src` that interpolate a raw JSON.stringify() into a template. */
+/**
+ * Lines of `src` that interpolate a raw JSON.stringify() into a template. In a
+ * LEGACY_LT_ESCAPE_FILES file, a JSON.stringify() that directly fills an
+ * ld+json tag in the LEGACY_LT_ESCAPE form is the one exception, the same rule
+ * scriptJsonOffenders() applies.
+ */
 function rawStringifyLines(file: string, src: string): string[] {
-  return src.split("\n").flatMap((line, i) => (!isCommentLine(line) && line.includes("${JSON.stringify(") ? [`${file}:${i + 1}`] : []));
+  const NEEDLE = "${JSON.stringify(";
+  return src.split("\n").flatMap((line, i) => {
+    if (isCommentLine(line)) return [];
+    for (let at = line.indexOf(NEEDLE); at !== -1; at = line.indexOf(NEEDLE, at + 1)) {
+      const legacy = LEGACY_LT_ESCAPE_FILES.has(file) && line.slice(0, at).endsWith(LD_JSON_TAG) && LEGACY_LT_ESCAPE.test(line.slice(at));
+      if (!legacy) return [`${file}:${i + 1}`];
+    }
+    return [];
+  });
 }
 
 function routeSources(): Array<{ file: string; src: string }> {
@@ -253,6 +273,25 @@ export function runSafeScriptJsonTests(opts: { log?: boolean } = {}): TestSummar
     });
     assertEq(rawStringifyLines("x.ts", "  var id = ${JSON.stringify(provider.id)};\n  // ${JSON.stringify(x)}\n  var ok = ${serializeJsonForScript(x)};"),
       ["x.ts:1"], "ssj-f0.12: raw-stringify scanner finds the inline-script value, skips comments and the helper");
+    {
+      // RFB seo.ts: its JSON-LD form passes, nothing else does (FUNN rfb-seo-ra-json-stringify-inline).
+      const legacyLd = "  extra.jsonLd.map(j => `" + LD + "${JSON.stringify(j).replace(/</g, \"\\\\u003c\")}</script>`).join(\"\\n\")";
+      const legacyLdSingle = "  : `" + LD + "${JSON.stringify(extra.jsonLd).replace(/</g, \"\\\\u003c\")}</script>`)";
+      const rawSamples: Array<[string, string, string[]]> = [
+        ["seo.ts", legacyLd, []],
+        ["seo.ts", legacyLdSingle, []],
+        ["x.ts", legacyLd, ["x.ts:1"]],
+        ["seo.ts", "        var agentId = ${JSON.stringify(agent.id)};", ["seo.ts:1"]],
+        ["seo.ts", "        var agentId = ${serializeJsonForScript(agent.id)};", []],
+        ["seo.ts", "  return (n || 0).toLocaleString(${JSON.stringify(lang === \"en\" ? \"en-GB\" : \"nb-NO\")});", ["seo.ts:1"]],
+        ["seo.ts", legacyLd + " + `<script>var a = ${JSON.stringify(a)};</script>`", ["seo.ts:1"]],
+        ["seo.ts", "  `<script type=\"application/json\">${JSON.stringify(j).replace(/</g, \"\\\\u003c\")}</script>`", ["seo.ts:1"]],
+        ["seo.ts", "  `" + LD + "${JSON.stringify(j)}</script>`", ["seo.ts:1"]],
+      ];
+      rawSamples.forEach(([file, src, want], i) => {
+        assertEq(rawStringifyLines(file, src), want, `ssj-f0.${13 + i}: raw-stringify scanner on ${file}: ${JSON.stringify(src.trim()).slice(0, 90)}`);
+      });
+    }
 
     // Then the real tree.
     const sources = routeSources();
@@ -272,7 +311,17 @@ export function runSafeScriptJsonTests(opts: { log?: boolean } = {}): TestSummar
         `ssj-f4: ${file} builds its ld+json elements with jsonLdScriptTag()`);
     }
     assertEq(NO_RAW_STRINGIFY_FILES.flatMap((file) => rawStringifyLines(file, sources.find((s) => s.file === file)?.src ?? "")), [],
-      "ssj-f5: experiences-seo.ts and dental-seo.ts interpolate no raw JSON.stringify() (inline-script values included)");
+      "ssj-f5: experiences-seo.ts, dental-seo.ts and seo.ts interpolate no raw JSON.stringify() (inline-script values included; seo.ts's JSON-LD keeps LEGACY_LT_ESCAPE)");
+    {
+      // ssj-f5 is not vacuous for seo.ts: the file is read, and the JSON.stringify()
+      // calls it still has are the JSON-LD fills the exception is for.
+      const seoSrc = sources.find((s) => s.file === "seo.ts")?.src ?? "";
+      const stringifyLines = seoSrc.split("\n").filter((l) => !isCommentLine(l) && l.includes("${JSON.stringify("));
+      assertTrue(stringifyLines.length > 0 && stringifyLines.every((l) => l.includes(LD_JSON_TAG + "${JSON.stringify(")),
+        `ssj-f6: seo.ts's remaining JSON.stringify() calls all fill an ld+json tag directly (${stringifyLines.length} found)`);
+      assertTrue(/import \{[^}]*\bserializeJsonForScript\b[^}]*\} from "\.\.\/services\/safe-script-json"/.test(seoSrc) && seoSrc.includes("var agentId = ${serializeJsonForScript(agent.id)};"),
+        "ssj-f7: seo.ts writes agentId into its inline script with serializeJsonForScript()");
+    }
   }
 
   return { passed, failed, failures };

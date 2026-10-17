@@ -42458,6 +42458,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-G, the seo.ts
+// part (FUNN rfb-knowledge-lesere-utenfor-i-f) and FUNN
+// rfb-seo-ra-json-stringify-inline (lokal#1105 review): RFB producer pages and
+// the front page read product price, name and months, opening hours,
+// seasonality and the list fields by type — no "[object Object]" or
+// "undefined", no 500 — and the producer page's inline-script agentId goes
+// through serializeJsonForScript(). Well-formed data renders as on main
+// (goldens from main). Own in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-G seo.ts (wrong-typed knowledge fields + inline-script JSON) ──");
+  try {
+    const { runRfbSeoFeiltypedeKnowledgeFeltTests } = require("../src/routes/rfb-seo-feiltypede-knowledge-felt.test") as
+      typeof import("../src/routes/rfb-seo-feiltypede-knowledge-felt.test");
+    const r = await runRfbSeoFeiltypedeKnowledgeFeltTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-seo-feiltypede-knowledge-felt: " + f);
+    console.log(`  rfb-seo-feiltypede-knowledge-felt: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-seo-feiltypede-knowledge-felt: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)
