@@ -29,6 +29,9 @@
  *   (f) shape of a returned row: id/name/website/last_enriched_at/
  *       field_provenance (parsed object)
  *   (g) malformed field_provenance JSON -> {}
+ *   (i) SQLite-format last_enriched_at ('YYYY-MM-DD HH:MM:SS') vs since at
+ *       00:00:00Z of the same day: 23:59:59 that day included, one second
+ *       before since excluded (text-compare regression: ' ' < 'T')
  */
 
 export interface TestSummary {
@@ -257,6 +260,23 @@ export function runDentalAgentsRecentlyEnrichedTests(
         dentalDb.prepare(`UPDATE dental_agents SET om_oss = 'Moderne klinikk i sentrum' WHERE id = 'clinic-recent'`).run();
         const some = await callRoute(dentalRouter, { headers: { "x-admin-key": testKey }, query: { ...q, with_fields: "1" } });
         assertEq((some.body.agents as any[]).map((a) => a.id), ["clinic-recent"], "h4: with_fields=1 serves only the clinic with a value");
+      }
+
+      // ── (i) same-day boundary with SQLite-format timestamps ──────────────
+      {
+        const insertSql = dentalDb.prepare(
+          `INSERT INTO dental_agents (id, navn, hjemmeside, last_enriched_at) VALUES (?, ?, ?, ?)`
+        );
+        insertSql.run("clinic-boundary-in", "Grense Inne AS", "https://grense-inne.example.no", "2026-03-10 23:59:59");
+        insertSql.run("clinic-boundary-out", "Grense Ute AS", "https://grense-ute.example.no", "2026-03-09 23:59:59");
+        const bres = await callRoute(dentalRouter, {
+          headers: { "x-admin-key": testKey },
+          query: { since: "2026-03-10T00:00:00Z", limit: "50" },
+        });
+        assertEq(bres.status, 200, "i1: since at day boundary -> 200");
+        const bids = (bres.body.agents as any[]).map((a) => a.id);
+        assertTrue(bids.includes("clinic-boundary-in"), "i2: row enriched 23:59:59 on the since day is included");
+        assertTrue(!bids.includes("clinic-boundary-out"), "i3: row enriched one second before since is excluded");
       }
     } catch (err: any) {
       failed++;
