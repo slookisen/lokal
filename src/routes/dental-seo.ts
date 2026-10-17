@@ -2712,6 +2712,9 @@ function dentalMcpServerCard() {
   // ONE catalog number (services/honest-count.ts): same as llms.txt, agent card, /api/stats, /health.
   const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
   const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "thousands of";
+  // Title and description as the live /mcp sends them in serverInfo (dental-mcp.ts, S4a).
+  // Required lazily, as mcp-tool-manifest.ts does for `tools` below: dental-mcp imports this file.
+  const { DENTAL_MCP_SERVER_TITLE, DENTAL_MCP_SERVER_DESCRIPTION } = require("./dental-mcp") as typeof import("./dental-mcp");
 
   return {
     // $schema deliberately omitted: the URL previously advertised here
@@ -2726,12 +2729,9 @@ function dentalMcpServerCard() {
     // never written down. See services/mcp-protocol-version.ts.
     ...mcpProtocolDeclaration(),
     name: "finn-tannlege",
-    title: "Finn-tannlege — Norwegian dental clinic search",
+    title: DENTAL_MCP_SERVER_TITLE,
     version: "0.1.0",
-    description:
-      `Search and compare ${totalLabel} Norwegian dental clinics. Filter by county (fylke), specialty, ` +
-      "Helfo direct-billing agreement, and emergency-duty (akuttvakt) availability. Supports " +
-      "natural-language queries in Norwegian and English.",
+    description: `Search and compare ${totalLabel} Norwegian dental clinics. ${DENTAL_MCP_SERVER_DESCRIPTION}`,
     homepage: DENTAL_BASE_URL,
     repository: {
       type: "git",

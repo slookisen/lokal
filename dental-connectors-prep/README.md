@@ -12,7 +12,7 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: no** (5 open, 1 waiting).
+**Ready to submit: no** (4 open, 1 waiting).
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
@@ -22,7 +22,7 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 | Terms page | **OPEN** | None yet (`termsUrl` is null in src/config/brand-entities.ts). The portal asks only for a privacy URL; a public terms page is still required before submission. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S5; Daniel approves the text) | code |
 | Public documentation page | **OPEN** | None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date. | G3-S4 of this dev-request (`/guide-tannlege-ai`) | code |
 | Square 512×512 PNG icon to upload | **OPEN** | None yet: no icon file in `dental-connectors-prep/assets/`, and `logoPng` is null in src/config/brand-entities.ts. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4) | code |
-| MCP server instructions and serverInfo title, description and websiteUrl | **OPEN** | `new McpServer(...)` in `src/routes/dental-mcp.ts` sets serverInfo `name`, `version` and no instructions. Missing: `instructions`, `title`, `description`, `websiteUrl`. | 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a) | code |
+| MCP server instructions and serverInfo title, description and websiteUrl | **DONE** | `new McpServer(...)` in `src/routes/dental-mcp.ts` sets serverInfo `name`, `version`, `title`, `description`, `websiteUrl` and instructions. | — | code |
 | Natural-language search in tannlege_search (town, municipality, specialty, Helfo) | **OPEN** | lokal#1086 (draft). The example prompts must return clinics against production (G3-S4). | 2026-10-16-tannlege-sok-naturlig-sprak | recorded 2026-10-17 |
 | Per-session rate limit on /mcp | **DONE** | lokal#1098: one quota per MCP session, so users behind one shared AI-platform IP do not share a bucket. | 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt | recorded 2026-10-17 |
 | Name decision for Finn-tannlege | **WAITING** | The listing slug is permanent once published. Submit after Daniel has settled the name. | Daniel | recorded 2026-10-17 |
