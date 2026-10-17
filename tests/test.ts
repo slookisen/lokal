@@ -42434,6 +42434,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-G (FUNN
+// rfb-knowledge-lesere-utenfor-i-f): the knowledge readers outside
+// knowledge-service.ts — the A2A seller auto-reply, GET /agents/:id/agent.json,
+// GET /ut redirects, the vCard and the daily catalog sync — no longer throw on
+// fields of the wrong type, and PUT /agents/:id/knowledge refuses products it
+// cannot store with a 400 field error. Well-formed data gives the same output
+// as before (goldens from main). Own in-memory DB and ADMIN_KEY (restored in
+// finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-G (remaining knowledge readers + write-path field errors) ──");
+  try {
+    const { runKnowledgeRemainingReadersTests } = require("../src/services/knowledge-remaining-readers.test") as
+      typeof import("../src/services/knowledge-remaining-readers.test");
+    const r = await runKnowledgeRemainingReadersTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("knowledge-remaining-readers: " + f);
+    console.log(`  knowledge-remaining-readers: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("knowledge-remaining-readers: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)

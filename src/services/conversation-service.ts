@@ -170,6 +170,39 @@ export interface ConversationMessage {
   createdAt: string;
 }
 
+// ─── Integration test 2026-10-17 (I-G): opening hours of the auto-reply ────
+const REPLY_DAY_NAMES: ReadonlyMap<string, string> = new Map([
+  ["mon", "Man"], ["tue", "Tir"], ["wed", "Ons"], ["thu", "Tor"], ["fri", "Fre"], ["sat", "Lør"], ["sun", "Søn"],
+  ["monday", "Man"], ["tuesday", "Tir"], ["wednesday", "Ons"], ["thursday", "Tor"], ["friday", "Fre"],
+  ["saturday", "Lør"], ["sunday", "Søn"],
+]);
+
+/** One entry of an openingHours array as text: "" when it says nothing usable. */
+function openingHourReplyEntry(h: unknown): string {
+  if (typeof h === "string") return h.trim();
+  if (!h || typeof h !== "object") return "";
+  const { day, open, close } = h as Record<string, unknown>;
+  if (typeof open !== "string" || !open.trim() || typeof close !== "string" || !close.trim()) return "";
+  const dayLabel = typeof day === "string" ? REPLY_DAY_NAMES.get(day) || day : "";
+  return dayLabel ? `${dayLabel} ${open}–${close}` : `${open}–${close}`;
+}
+
+/**
+ * The «Åpningstider» text of the seller's auto-reply, "" when there is none.
+ * getAgentInfo hands openingHours over as an array of {day, open, close}
+ * entries (today's format) or as free text such as "Man–fre 10–17"; a string
+ * reached `.slice(0, 7).map` and threw the whole reply away. Same rule as
+ * lokal_info (formatOpeningHoursForMcp in routes/mcp.ts): an entry with text
+ * open and close renders as before, a text entry or a string is shown as it
+ * is, and anything else is skipped (it rendered as "undefined"). At most 7
+ * entries, as before.
+ */
+export function openingHoursReplyText(openingHours: unknown): string {
+  if (typeof openingHours === "string") return openingHours.trim();
+  if (!Array.isArray(openingHours)) return "";
+  return openingHours.map(openingHourReplyEntry).filter(Boolean).slice(0, 7).join(", ");
+}
+
 class ConversationService {
   // ─── Start a conversation ────────────────────────────────
   // Called when a buyer agent wants to connect with a seller.
@@ -326,7 +359,8 @@ class ConversationService {
 
     const matchedProducts = queryLower ? allProducts.filter((p: any) => {
       const pName = (p.name || "").toLowerCase();
-      const pCat = (p.category || "").toLowerCase();
+      // I-G: the category is DB JSON; an object or a number threw here.
+      const pCat = typeof p.category === "string" ? p.category.toLowerCase() : "";
       return queryLower.split(/\s+/).some((word: string) =>
         word.length > 2 && (pName.includes(word) || pCat.includes(word))
       );
@@ -382,15 +416,9 @@ class ConversationService {
       parts.push(`\nSpesialiteter: ${k.specialties.join(", ")}`);
     }
 
-    // Opening hours
-    if (k.openingHours?.length) {
-      const dayNames: Record<string, string> = {
-        mon: "Man", tue: "Tir", wed: "Ons", thu: "Tor", fri: "Fre", sat: "Lør", sun: "Søn",
-        monday: "Man", tuesday: "Tir", wednesday: "Ons", thursday: "Tor", friday: "Fre", saturday: "Lør", sunday: "Søn"
-      };
-      const hours = k.openingHours.slice(0, 7).map((h: any) =>
-        `${dayNames[h.day] || h.day} ${h.open}–${h.close}`
-      ).join(", ");
+    // Opening hours (an array, or free text — see openingHoursReplyText)
+    const hours = openingHoursReplyText(k.openingHours);
+    if (hours) {
       parts.push(`\n🕐 Åpningstider: ${hours}`);
     }
 

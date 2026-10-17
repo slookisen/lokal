@@ -28,7 +28,7 @@
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { parseProductPrice, isProductHeader, isProductNoise } from "./knowledge-service";
+import { parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "./knowledge-service";
 
 // ─── Price string → numeric NOK ──────────────────────────────────────────
 // Parses "kr 275/kg", "kr 275", "275" → 275.0; null if unparseable.
@@ -98,7 +98,14 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
       const seen = new Set<string>(); // dedupe within this agent in this run
 
       for (const p of products) {
-        const rawName = (p.name || "").trim();
+        // Integration test 2026-10-17 (I-G): each entry is DB JSON. A null
+        // entry or a name that is not text threw on `.trim`, a negative,
+        // boolean or object price on `.replace` (parsePriceNok), and an
+        // object or boolean category failed the SQLite bind — any of them
+        // rolled back the whole sync for every agent. Such an entry is
+        // skipped, or its price or category left empty; text gives the same
+        // rows as before.
+        const rawName = p && typeof p.name === "string" ? p.name.trim() : "";
         if (!rawName) { skipped++; continue; }
         if (isProductHeader(rawName)) { skipped++; continue; }
         if (isProductNoise(rawName)) { skipped++; continue; }
@@ -111,8 +118,8 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
         if (seen.has(name_norm)) { skipped++; continue; } // in-batch dedupe
         seen.add(name_norm);
 
-        const price_nok = parsePriceNok(priceStr) ?? parsePriceNok(p.price);
-        const category = p.category && p.category !== "other" ? p.category : null;
+        const price_nok = parsePriceNok(priceStr) ?? parsePriceNok(productPriceText(p.price));
+        const category = typeof p.category === "string" && p.category && p.category !== "other" ? p.category : null;
 
         const existed = conn.prepare(
           "SELECT 1 FROM products WHERE agent_id = ? AND name_norm = ?"

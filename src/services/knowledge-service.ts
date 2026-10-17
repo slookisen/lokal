@@ -297,8 +297,12 @@ function recordEntries(value: unknown): unknown[] {
     : [];
 }
 
-/** products: text entries, and product objects with a text name, the field every reader keys on. */
-function productEntries(value: unknown): ProductInfo[] {
+/**
+ * products: text entries, and product objects with a text name, the field
+ * every reader keys on. Exported for the readers that take the products
+ * column from getKnowledge (the A2A agent.json, slice I-G).
+ */
+export function productEntries(value: unknown): ProductInfo[] {
   return recordEntries(value)
     .filter((e) => typeof e === "string" || typeof (e as { name?: unknown }).name === "string") as ProductInfo[];
 }
@@ -317,6 +321,44 @@ function openingHoursField(value: unknown): OpeningHour[] {
 /** A JSON object, or {} for anything else (text, a list, null). */
 function plainObjectOrEmpty(value: unknown): Record<string, any> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : {};
+}
+
+// ─── Integration test 2026-10-17 (I-G): refused knowledge writes ──────────
+// normalizeProducts threw a JavaScript TypeError on products stored as text
+// (`products.map`), on a null product (`p.name`) and on a product whose name
+// is not text (`.trim`), and PUT /agents/:id/knowledge answered 400 with that
+// raw text. Those inputs, and only those, are now refused with a field error
+// before anything is written; every value the write path accepted before is
+// accepted and stored exactly as before.
+
+/** A knowledge write refused because of one field: `field` is its path, e.g. "products[2].name". */
+export class KnowledgeFieldError extends Error {
+  constructor(readonly field: string, message: string) {
+    super(message);
+    this.name = "KnowledgeFieldError";
+  }
+}
+
+/** The products value a knowledge write cannot store, as a field error; null when it can. */
+export function productsWriteError(products: unknown): KnowledgeFieldError | null {
+  if (!Array.isArray(products)) {
+    // A value with a length reached `.map`; any other value is passed on as before.
+    if (!(products as { length?: unknown } | null | undefined)?.length) return null;
+    return new KnowledgeFieldError("products", typeof products === "string"
+      ? "products må være en liste med produkter, ikke tekst."
+      : "products må være en liste med produkter.");
+  }
+  for (let i = 0; i < products.length; i++) {
+    const p: unknown = products[i];
+    if (p === null || p === undefined) {
+      return new KnowledgeFieldError(`products[${i}]`, `products[${i}] må være et produkt, ikke null.`);
+    }
+    const name = typeof p === "object" ? (p as { name?: unknown }).name : undefined;
+    if (name && typeof name !== "string") {
+      return new KnowledgeFieldError(`products[${i}].name`, `products[${i}].name må være tekst.`);
+    }
+  }
+  return null;
 }
 
 class KnowledgeService {
@@ -438,6 +480,10 @@ class KnowledgeService {
   // This handles data from sellers who paste AI-extracted product lists.
   private normalizeProducts(products: ProductInfo[]): ProductInfo[] {
     if (!products?.length) return products;
+    // I-G: what the map below cannot read is refused with a field error
+    // (productsWriteError) instead of a TypeError, before anything is written.
+    const fieldError = productsWriteError(products);
+    if (fieldError) throw fieldError;
     return products.map(p => {
       const name = (p.name || "").trim();
       if (!name) return p;

@@ -3,7 +3,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
@@ -311,11 +311,16 @@ function buildVCard(agentId: string): string | null {
   if (k.products && Array.isArray(k.products) && k.products.length > 0) {
     const productList = k.products
       .map((p: any) => {
-        // Handle object products and plain strings; skip empty/unknown
-        const name = typeof p === "string" ? p : (p.name || p.product || "");
+        // Handle object products and plain strings; skip empty/unknown.
+        // I-G: the fields are DB JSON — a `product` that is not text reached
+        // `.toLowerCase()`, and a boolean or object price was shown as
+        // "(true)"; the price is read as parseProductPrice reads it.
+        const rawName = typeof p === "string" ? p : (p.name || p.product);
+        const name = typeof rawName === "string" ? rawName : "";
         if (!name || name.toLowerCase() === "ukjent") return null;
         let item = name;
-        if (p.price) item += ` (${p.price})`;
+        const price = productPriceText(p.price);
+        if (price) item += ` (${price})`;
         if (p.seasonal && p.months?.length) item += ` [sesong]`;
         return item;
       })
@@ -1965,6 +1970,16 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
   }
   if (typeof req.body?.about === "string" && hasInternalNote(req.body.about)) {
     res.status(400).json({ success: false, error: "about contains an internal pipeline note — rejected" });
+    return;
+  }
+  // Integration test 2026-10-17 (I-G): products the write path cannot store
+  // (text, a null product, a product whose name is not text) used to throw a
+  // TypeError in normalizeProducts, answered below as 400 with the raw
+  // JavaScript text. Refused here with the field's path, before the phone
+  // guard fetches anything; upsertKnowledge applies the same check.
+  const productsError = productsWriteError(req.body?.products);
+  if (productsError) {
+    res.status(400).json({ success: false, error: productsError.message, field: productsError.field });
     return;
   }
 
