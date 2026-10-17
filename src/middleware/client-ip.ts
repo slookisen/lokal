@@ -27,7 +27,8 @@
  *            manual rollback (`fly secrets set CLIENT_IP_MODE=legacy`).
  *   shadow   headers untouched (today's behaviour); measures what enforce
  *            would do and logs one `client_ip_stats` JSON line per process
- *            every 5 min. CLIENT_IP_MODE_DEFAULT in trinn 1.
+ *            per 5-min window (written lazily, see windowAt).
+ *            CLIENT_IP_MODE_DEFAULT in trinn 1.
  *   enforce  rewrites X-Forwarded-For as above. Trinn 2 flips the default,
  *            only once the shadow gate (AC2 in the dev-request) is met.
  *
@@ -44,11 +45,11 @@
  *       15 min when Fly-Client-IP collapses to ≤2 values while Fly's own
  *       X-Forwarded-For entries still show ≥10 distinct clients.
  *
- * Privacy (dev-request rule 5): no raw IP is ever logged. In memory the
- * stats hold ipKeyGenerator-normalized keys only (the same form the rate
- * limiter's MemoryStore already holds), every set is capped, and the few
- * keys that are logged (top list) are hashed with a random per-process salt
- * that is never logged, so they cannot be reversed or linked to analytics
+ * Privacy (dev-request rule 5) and memory: no raw IP is ever logged or kept
+ * past the request. The stats and the breaker hold only fixed-size salted
+ * hashes of ipKeyGenerator-normalized keys (createStatsKey), every set is
+ * capped, and the salt is random per process and never logged, so the few
+ * keys that are logged (top list) cannot be reversed or linked to analytics
  * ip_hash values or across restarts.
  *
  * A CDN or any other proxy in front of Fly breaks this design's premise:
@@ -151,8 +152,9 @@ export function deriveFlyClientIp(headers: Readonly<Record<string, unknown>> | n
   if (value === undefined) return { ok: false, fallback: "missing" };
   if (typeof value !== "string") return INVALID;
   let ip = value.trim();
-  // "," = a list, never one client; "%" = an IPv6 zone index, which has no
-  // meaning beyond the local link and would make every key unique.
+  // "," = a list, never one client (net.isIP rejects one too; this is a
+  // second guard); "%" = an IPv6 zone index, which has no meaning beyond the
+  // local link and would make every key unique.
   if (ip === "" || ip.length > MAX_IP_TEXT_LEN || ip.includes(",") || ip.includes("%")) return INVALID;
   const mapped = IPV4_MAPPED_DOTTED.exec(ip);
   if (mapped) ip = mapped[1];
@@ -163,13 +165,42 @@ export function deriveFlyClientIp(headers: Readonly<Record<string, unknown>> | n
   return { ok: true, ip };
 }
 
+// ─── Stats keys ─────────────────────────────────────────────────────────
+
+/**
+ * The only form in which an address outlives the request (stats sets, top
+ * list, breaker ring): the first 12 bytes of sha256(salt +
+ * ipKeyGenerator(ip)) as base64url, i.e. 16 freshly allocated chars whatever
+ * the input. Same limiter bucket → same key, so every distinct count is
+ * still a count of buckets.
+ *
+ * Never ipKeyGenerator's own output: for IPv4 and non-IP values that is its
+ * argument, a string the client controls (the left-most X-Forwarded-For
+ * entry, up to ~16 KB of garbage) or a V8 slice that keeps the whole
+ * X-Forwarded-For header alive. Count-capped sets of those held 40–60 MB in
+ * one process per 5-min window from a single client (review of PR #1102);
+ * with these keys the same traffic holds under 1 MB.
+ *
+ * Exported for client-ip.test.ts.
+ */
+export function createStatsKey(salt: Buffer): (ip: string) => string {
+  return (ip) =>
+    crypto.createHash("sha256").update(salt).update(ipKeyGenerator(ip), "utf8").digest().toString("base64url", 0, 12);
+}
+
+/** The logged form of a stats key: its first 6 bytes as 12 hex chars (= sha256(salt + ipKeyGenerator key), first 12 hex). */
+function logKey(key: string): string {
+  return Buffer.from(key, "base64url").toString("hex", 0, 6);
+}
+
 // ─── Collapse breaker (G4) ──────────────────────────────────────────────
 // Counts only requests whose Fly-Client-IP was used. N = requests, D_fci =
 // distinct Fly-Client-IP, D_edge = distinct ORIGINAL X-Forwarded-For[len-2]
 // (the client IP Fly itself appended, which the client cannot set), all
-// over a ring of 5 × 60 s, keys normalized with ipKeyGenerator, sets capped
-// at 64. A flood from one address has D_edge = 1, so only a collapse of
-// Fly-Client-IP itself (D_fci small while D_edge is large) can trip it.
+// over a ring of 5 × 60 s, keys normalized with ipKeyGenerator (held as
+// createStatsKey hashes), sets capped at 64. A flood from one address has
+// D_edge = 1, so only a collapse of Fly-Client-IP itself (D_fci small while
+// D_edge is large) can trip it.
 // N ≥ 60 trips long before a collapsed bucket of the smallest common limit
 // (jsonRpcLimiter, 200 per 15 min) is empty.
 
@@ -254,6 +285,8 @@ const TOP_N = 5;
 const TOP_CAP = 1024;
 const FANIN_CAP = 8;
 const DISTINCT_CAP = 4096;
+// Fly's http_service check (fly.toml) and the Dockerfile HEALTHCHECK (via localhost).
+const HEALTH_CHECK_PATHS: ReadonlySet<string> = new Set(["/.well-known/agent-card.json", "/health"]);
 
 type PathClass = "api" | "a2a" | "mcp" | "other";
 
@@ -269,6 +302,7 @@ interface StatsWindow {
   n: number;
   fciValid: number;
   fallback: Record<FlyClientIpFallback, number>;
+  fallbackHc: number;
   errors: number;
   xffClientSupplied: number;
   agreeFciEdge: { n: number; agree: number };
@@ -283,7 +317,7 @@ interface StatsWindow {
 }
 
 export interface ClientIpTopKey {
-  /** sha256(per-process salt + ipKeyGenerator key), 12 hex chars. */
+  /** sha256(per-process salt + ipKeyGenerator key), first 12 hex chars. */
   key: string;
   n: number;
   api: number;
@@ -304,6 +338,12 @@ export interface ClientIpStatsLine {
   n: number;
   fci_valid: number;
   fallback: Record<FlyClientIpFallback, number>;
+  /**
+   * Of fallback.missing: requests to a health-check path (HEALTH_CHECK_PATHS).
+   * AC2's "fallback ≤ health-check volume + 1 %" is
+   * (missing + invalid + non_public − fallback_hc) ≤ 1 % of n.
+   */
+  fallback_hc: number;
   errors: number;
   /** X-Forwarded-For had ≥3 entries: the client sent its own before Fly appended two. */
   xff_client_supplied: number;
@@ -330,6 +370,7 @@ function newWindow(index: number): StatsWindow {
     n: 0,
     fciValid: 0,
     fallback: { missing: 0, invalid: 0, non_public: 0 },
+    fallbackHc: 0,
     errors: 0,
     xffClientSupplied: 0,
     agreeFciEdge: { n: 0, agree: 0 },
@@ -382,7 +423,11 @@ export interface ClientIpMiddlewareOptions {
 
 export type ClientIpMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
   readonly mode: ClientIpMode;
-  /** The current, still-open stats window (also what the next log line will start from). */
+  /**
+   * The current, still-open stats window (what the next log line will be
+   * built from). For the tests, and for a possible later field in an existing
+   * ops response; no production code reads it today.
+   */
   snapshot(): ClientIpStatsLine;
 };
 
@@ -395,15 +440,12 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
   const log = opts.log ?? console.log;
   const logError = opts.logError ?? console.error;
   const mode = cfg.mode;
-  const salt = crypto.randomBytes(16);
+  const statsKey = createStatsKey(crypto.randomBytes(16));
   const breaker = new CollapseBreaker();
   let current: StatsWindow | null = null;
   // Only the top maps of the previous TOP_WINDOWS - 1 windows are kept, for top15m.
   let history: Array<Pick<StatsWindow, "index" | "top">> = [];
   let lastT = 0;
-
-  const hashKey = (key: string): string =>
-    crypto.createHash("sha256").update(salt).update(key, "utf8").digest("hex").slice(0, 12);
 
   function topList(w: StatsWindow): ClientIpTopKey[] {
     const merged = new Map<string, TopEntry>();
@@ -424,7 +466,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
       .sort((a, b) => b[1].n - a[1].n)
       .slice(0, TOP_N)
       .map(([key, e]) => ({
-        key: hashKey(key),
+        key: logKey(key),
         n: e.n,
         api: e.paths.api,
         a2a: e.paths.a2a,
@@ -444,6 +486,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
       n: w.n,
       fci_valid: w.fciValid,
       fallback: { ...w.fallback },
+      fallback_hc: w.fallbackHc,
       errors: w.errors,
       xff_client_supplied: w.xffClientSupplied,
       agree_fci_edge: { ...w.agreeFciEdge },
@@ -460,7 +503,16 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     };
   }
 
-  /** The window for time t; rotating out (and logging) the previous one. */
+  /**
+   * The window for time t; rotating out (and logging) the previous one.
+   *
+   * The stats line is written lazily, by the first request after a window
+   * closes, with no timer: nothing to clear on shutdown and nothing that
+   * keeps tests alive. So the window still open at SIGTERM/restart is never
+   * logged, a window without requests produces no line, and an idle window
+   * is logged late. Fly's health check every 30 s (fly.toml) keeps the
+   * 5-min cadence in practice.
+   */
   function windowAt(t: number): StatsWindow {
     const index = Math.floor(t / STATS_WINDOW_MS);
     if (current && current.index === index) return current;
@@ -486,6 +538,7 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     const d = deriveFlyClientIp(req.headers);
     if (!d.ok) {
       w.fallback[d.fallback]++;
+      if (d.fallback === "missing" && HEALTH_CHECK_PATHS.has(req.path)) w.fallbackHc++;
     } else {
       w.fciValid++;
       const xff = xffEntries(req.headers["x-forwarded-for"]);
@@ -501,9 +554,10 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
         w.agreeLegacyEqFci.n++;
         if (legacyIp === d.ip) w.agreeLegacyEqFci.agree++;
       }
-      const fciKey = ipKeyGenerator(d.ip);
-      const edgeKey = edge !== undefined ? ipKeyGenerator(edge) : undefined;
-      const legacyKey = ipKeyGenerator(legacyIp);
+      // Without a client-sent X-Forwarded-For, edge and legacy ARE d.ip: one hash.
+      const fciKey = statsKey(d.ip);
+      const edgeKey = edge === undefined ? undefined : edge === d.ip ? fciKey : statsKey(edge);
+      const legacyKey = legacyIp === d.ip ? fciKey : statsKey(legacyIp);
       distinct(w, w.dFci, fciKey);
       if (edgeKey !== undefined) distinct(w, w.dEdge, edgeKey);
       distinct(w, w.dLegacy, legacyKey);

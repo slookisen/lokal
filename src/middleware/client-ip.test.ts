@@ -25,7 +25,9 @@
  *   T15  `trust proxy` === true after installClientIp, in every mode.
  *   T16  no raw IP in any logged line or snapshot.
  * Plus the stats line itself (the AC2/AC4 instrument): its counters, the
- * 5-min cadence and the 15-min top list.
+ * 5-min cadence, the 15-min top list and fallback_hc; and the stats keys
+ * (createStatsKey): fixed size whatever the input, one per limiter bucket,
+ * so a client's padded X-Forwarded-For is never what the stats hold.
  *
  * Real Express apps + a fresh express-rate-limit instance per scenario, over
  * Node's own http module (not global fetch — see mcp-rate-limit.test.ts for
@@ -46,6 +48,7 @@ import {
   BREAKER_OPEN_MS,
   resolveClientIpConfig,
   deriveFlyClientIp,
+  createStatsKey,
   createClientIpMiddleware,
   installClientIp,
   type ClientIpConfig,
@@ -226,6 +229,9 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
       ["empty", ""],
       ["blank", " "],
       ["garbage", "garbage"],
+      // Lists: net.isIP is what rejects these. The explicit "," check in
+      // deriveFlyClientIp is a second guard, so mutant M10 (drop it) is
+      // equivalent and survives by design.
       ["a list", "1.2.3.4, 5.6.7.8"],
       ["trailing comma", "203.0.113.5,"],
       ["bracketed IPv6", "[::1]"],
@@ -710,6 +716,66 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
     clock = T0 + 40 * MIN;
     send({ fci: "198.51.100.6", xff: flyXff("198.51.100.6"), ip: "198.51.100.6" });
     assertEq(lines.length, 5, "stats: windows without traffic produce no line");
+  }
+
+  // ── fallback_hc: the health-check share of the fallbacks (AC2 allowance) ──
+  {
+    const mw = createClientIpMiddleware(SHADOW, { now: () => T0, log: () => {}, logError: () => {} });
+    const send = (o: Parameters<typeof fakeReq>[0]) => mw(fakeReq(o), {} as any, () => {});
+    send({ path: "/.well-known/agent-card.json" }); // Fly's http_service check
+    send({ path: "/health", ip: "127.0.0.1" }); // Dockerfile HEALTHCHECK via localhost
+    send({ path: "/api/products", xff: flyXff("198.51.100.3") }); // missing, not a health check
+    send({ path: "/health/x" }); // missing, not exactly a health-check path
+    send({ path: "/health", fci: "garbage" }); // invalid, not missing
+    send({ path: "/health", fci: "10.0.0.1" }); // non_public, not missing
+    send({ path: "/.well-known/agent-card.json", fci: "198.51.100.4", xff: flyXff("198.51.100.4") }); // valid
+    const s = mw.snapshot();
+    assertEq(
+      [s.n, s.fallback, s.fallback_hc],
+      [7, { missing: 4, invalid: 1, non_public: 1 }, 2],
+      "stats: fallback_hc counts only `missing` on /.well-known/agent-card.json and /health"
+    );
+  }
+
+  // ── Stats keys: fixed size whatever the input, one key per limiter bucket ──
+  {
+    const key = createStatsKey(Buffer.alloc(16, 7));
+    const pad = "x".repeat(14 * 1024);
+    const slicedV4 = `203.100.113.255, ${pad}`.split(",")[0]; // an IPv4 sliced out of a 14 KB header
+    const big = [pad, `${pad}1`, `${pad}2`, `198.51.100.7, ${pad}`];
+    assertTrue(
+      big.every((v) => /^[A-Za-z0-9_-]{16}$/.test(key(v))) && key(slicedV4).length <= 22,
+      "stats keys: a 14 KB input gives a 16-char base64url key (≤ 22 chars), never the input"
+    );
+    assertEq(key(pad), key("x".repeat(14 * 1024)), "stats keys: deterministic within a process (same salt)");
+    const inputs = [
+      ...big,
+      ...Array.from({ length: 1000 }, (_, i) => `198.51.${i >> 8}.${i & 255}`),
+      "2001:db8:abcd:1200::1",
+      "2001:db8:abcd:1300::1",
+      "garbage-not-an-ip",
+      "",
+    ];
+    assertEq(new Set(inputs.map(key)).size, inputs.length, `stats keys: ${inputs.length} distinct buckets (1000 IPv4, 4 × 14 KB, two IPv6 /56, garbage, empty) → as many distinct keys`);
+    assertEq(
+      [key("2001:db8:abcd:12ff::2") === key("2001:db8:abcd:1200::1"), key("::ffff:203.0.113.9") === key("203.0.113.9"), key(slicedV4) === key("203.100.113.255")],
+      [true, true, true],
+      "stats keys: one key per limiter bucket (same /56; ::ffff:-mapped; an IPv4 sliced out of a padded header)"
+    );
+    assertTrue(key("203.0.113.9") !== createStatsKey(Buffer.alloc(16, 8))("203.0.113.9"), "stats keys: another salt (another process) gives another key");
+
+    // Through the middleware: padded client values still count as distinct buckets.
+    const mw = createClientIpMiddleware(SHADOW, { now: () => T0, log: () => {}, logError: () => {} });
+    for (let i = 0; i < 50; i++) {
+      const junk = `${pad}${i}`;
+      mw(fakeReq({ fci: "198.51.100.7", xff: flyXff("198.51.100.7", junk), ip: junk }), {} as any, () => {});
+    }
+    const s = mw.snapshot();
+    assertEq(
+      [s.n, s.D_fci, s.D_edge, s.D_legacy, s.top15m[0]?.fanIn],
+      [50, 1, 1, 50, 8],
+      "stats keys: 50 distinct 14 KB X-Forwarded-For[0] values → 50 legacy buckets behind one client (fanIn capped at 8)"
+    );
   }
 
   // ── T16: no raw IP in any logged line or snapshot ──
