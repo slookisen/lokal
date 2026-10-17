@@ -52,6 +52,11 @@ import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+// dev-request 2026-10-17-dental-d3-rettelser (D3d): the web card's chips are
+// the specialties the filter finds a clinic by, and the placeholder postnummer
+// "0000" is never shown, as on the MCP/A2A cards.
+import { clinicSpecialties } from "../config/dental-search-vocabulary";
+import { shownPostnummer } from "../services/norway-postnummer";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
 import { DENTAL_LANDING_CONFIG, DENTAL_STATIC_PAGE_DATES } from "../config/dental-landing";
@@ -401,7 +406,8 @@ export function buildClinicDescription(
 
   // Address
   if (!short && agent.adresse && isValidLocality(agent.poststed)) {
-    parts.push(`Adresse: ${agent.adresse}, ${agent.postnummer ? agent.postnummer + " " : ""}${titleCasePoststed(agent.poststed!)}.`);
+    const postnummer = shownPostnummer(agent.postnummer);
+    parts.push(`Adresse: ${agent.adresse}, ${postnummer ? postnummer + " " : ""}${titleCasePoststed(agent.poststed!)}.`);
   }
 
   // Helfo
@@ -865,8 +871,9 @@ function clinicCard(
     : "";
 
   const specialties = (() => {
-    if (!agent.available_specialties || agent.available_specialties.length === 0) return "";
-    const links = agent.available_specialties.map((s) => {
+    const names = clinicSpecialties(agent);
+    if (names.length === 0) return "";
+    const links = names.map((s) => {
       const sp = SPECIALTY_PAGES.find((p) => p.navn === s.toLowerCase());
       return sp
         ? `<a href="/spesialitet/${escapeHtml(sp.slug)}" class="spec-chip" style="padding:3px 10px;font-size:.75rem">${escapeHtml(s)}</a>`
@@ -1511,7 +1518,8 @@ function renderClinicProfile(
 
   // ── Key info grid
   const infoItems: string[] = [];
-  if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${agent.postnummer ? `, ${escapeHtml(agent.postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
+  const postnummer = shownPostnummer(agent.postnummer);
+  if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${postnummer ? `, ${escapeHtml(postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
   { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
   { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
   if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
@@ -1639,7 +1647,7 @@ function renderClinicProfile(
     address: {
       "@type": "PostalAddress",
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
-      ...(agent.postnummer ? { postalCode: agent.postnummer } : {}),
+      ...(postnummer ? { postalCode: postnummer } : {}),
       // orch-PR-20260613: guard malformed/foreign locality values (e.g. "Se-44338 Lerum", "Ukjent")
       ...(isValidLocality(agent.poststed) ? { addressLocality: titleCasePoststed(agent.poststed!) } : {}),
       ...(isValidLocality(agent.fylke) ? { addressRegion: agent.fylke } : {}),

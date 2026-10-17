@@ -197,6 +197,54 @@ export function kommunerForPoststed(spelling: string): readonly string[] {
   return (_officialKommuner ??= byPlaceKey(officialPoststedKommuner())).get(placeKey(spelling)) ?? [];
 }
 
+/** An official place name: Posten's poststed (upper case, "TROMSØ") or a 2024 kommune ("Bærum"). */
+export interface OfficialPlaceSpelling {
+  kind: Extract<PlaceKind, "poststed" | "kommune">;
+  name: string;
+}
+
+// placeKey -> the official name with that key, or null where two different
+// names share it. Built on first use and again only when the register's
+// poststed index is a new object (its test seam swaps the rows).
+let _officialSpellings: {
+  source: ReadonlyMap<string, readonly string[]>;
+  byKey: Map<string, OfficialPlaceSpelling | null>;
+} | null = null;
+
+function officialSpellingsByKey(): Map<string, OfficialPlaceSpelling | null> {
+  const source = officialPoststedKommuner();
+  if (_officialSpellings?.source === source) return _officialSpellings.byKey;
+  const byKey = new Map<string, OfficialPlaceSpelling | null>();
+  // Poststeder first; a kommune only fills a key no poststed has.
+  const enter = (kind: OfficialPlaceSpelling["kind"], names: Iterable<string>) => {
+    const tier = new Map<string, string | null>();
+    for (const name of names) {
+      const k = placeKey(name);
+      if (!k) continue;
+      const seen = tier.get(k);
+      tier.set(k, seen === undefined || seen === name ? name : null);
+    }
+    for (const [k, name] of tier) if (!byKey.has(k)) byKey.set(k, name === null ? null : { kind, name });
+  };
+  enter("poststed", source.keys());
+  enter("kommune", kommuner2024().map((k) => k.kommune));
+  _officialSpellings = { source, byKey };
+  return byKey;
+}
+
+/**
+ * The official name a stored place value stands for, by placeKey, so the
+ * ASCII form some rows carry ("Tromsoe", "Baerum") finds "TROMSØ" / "Bærum"
+ * (dev-request 2026-10-17-dental-d3-rettelser, D3d). Posten's poststed comes
+ * first, else the 2024 kommune name. null when the name is unknown or two
+ * different official names share its key. Exact folds only: the ASCII alias a
+ * visitor types ("Tromso") is not read. From the bundled register, never a DB.
+ */
+export function officialPlaceSpelling(spelling: string): OfficialPlaceSpelling | null {
+  const k = placeKey(spelling);
+  return k ? officialSpellingsByKey().get(k) ?? null : null;
+}
+
 /**
  * The Norwegian gazetteer: `poststedSpellings` (stored poststed values, most
  * common first — e.g. from dental-store listPoststeder) plus the static

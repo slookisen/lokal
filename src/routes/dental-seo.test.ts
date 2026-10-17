@@ -14,6 +14,11 @@
  *   5d — directory_url renders as a labeled link ("Oversikt hos
  *        fylkeskommunen" for a county host, "Facebook" for facebook.com,
  *        a generic fallback otherwise) and is never labeled "Hjemmeside".
+ *   D3d — (dev-request 2026-10-17-dental-d3-rettelser) the placeholder
+ *        postnummer 0000 is in neither the description, the info box nor
+ *        the Dentist JSON-LD (no postalCode), a real one is unchanged; the
+ *        clinic card on /spesialitet and /fylke shows a chip for a specialty
+ *        found only through a specialist's title.
  *
  * Setup mirrors dental.test.ts (this repo's convention for testing dental
  * route files not registered in tests/test.ts's supertest-style harness):
@@ -283,6 +288,70 @@ export async function runDentalSeoProfilkvalitetTests(
     assertTrue(/<title>Testenhet lab_leverandor i Bergen \| Finn-tannlege.com<\/title>/.test(labHtml), "skive C lab: neutral title '<navn> i <by>'");
     const sm = await callRoute(dentalSeoRouter, { path: "/sitemap.xml" });
     assertTrue(!sm.body.includes("testenhet"), "skive C: non-clinics absent from sitemap");
+
+    // ── D3d: the placeholder postnummer 0000 is never shown ─────────────
+    // (dev-request 2026-10-17-dental-d3-rettelser) The profile's description,
+    // info box and Dentist JSON-LD leave it out; a real postnummer is unchanged.
+    const dentistLd = (html: string): any => {
+      for (const m of html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)) {
+        try {
+          const j = JSON.parse(m[1]);
+          const found = (Array.isArray(j) ? j : j["@graph"] ?? [j]).find((n: any) => n && n["@type"] === "Dentist");
+          if (found) return found;
+        } catch {
+          // not JSON-LD this test reads
+        }
+      }
+      return null;
+    };
+    const infoAddress = (html: string) => (html.match(/<div class="info-label">Adresse<\/div><div class="info-value">([\s\S]*?)<\/div>/) || [])[1] ?? null;
+    const metaDescription = (html: string) => (html.match(/<meta name="description" content="([^"]*)">/) || [])[1] ?? "";
+    const addressClinic = (navn: string, org_nr: string, adresse: string, postnummer: string, poststed: string, fylke: string) => {
+      const id = store.createDentalAgent({ navn, org_nr, adresse, postnummer, poststed, fylke, telefon: "61234567", hjemmeside: "https://adresse.example.no" } as any);
+      db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk' WHERE id = ?").run(id);
+      return id;
+    };
+    {
+      const id = addressClinic("Nullpost Tannklinikk AS", "918900201", "Eikerveien 65b", "0000", "Åmot", "Innlandet");
+      const html = (await callRoute(dentalSeoRouter, { path: `/klinikk/id/${id}` })).body;
+      const ld = dentistLd(html);
+      assertTrue(!!ld && !("postalCode" in ld.address), "D3d 0000: the Dentist JSON-LD address has no postalCode");
+      assertTrue(!!ld && ld.address.streetAddress === "Eikerveien 65b" && ld.address.addressLocality === "Åmot", "D3d 0000: streetAddress and addressLocality stay");
+      assertTrue(infoAddress(html) === "Eikerveien 65b Åmot", "D3d 0000: the info box shows «Eikerveien 65b Åmot»");
+      assertTrue(
+        !!ld && !String(ld.description).includes("0000") && String(ld.description).includes("Adresse: Eikerveien 65b, Åmot.") && !metaDescription(html).includes("0000"),
+        "D3d 0000: neither the description nor the meta description has 0000"
+      );
+    }
+    {
+      const id = addressClinic("Femtusen Tannklinikk AS", "918900202", "Strandgaten 1", "5003", "BERGEN", "Vestland");
+      const html = (await callRoute(dentalSeoRouter, { path: `/klinikk/id/${id}` })).body;
+      const ld = dentistLd(html);
+      assertTrue(!!ld && ld.address.postalCode === "5003" && String(ld.description).includes("Adresse: Strandgaten 1, 5003 Bergen."), "D3d 5003: postalCode and the description's address are unchanged");
+      assertTrue(infoAddress(html) === "Strandgaten 1, 5003 BERGEN", "D3d 5003: the info box is unchanged");
+    }
+
+    // ── D3d: the web card's chips are the specialties the filter finds ───
+    const titledClinic = (navn: string, org_nr: string, titles: string[]) => {
+      // Oslo: /fylke reads its fylker from the stats cache, which an earlier page has filled.
+      const id = store.createDentalAgent({ navn, org_nr, poststed: "OSLO", fylke: "Oslo", adresse: "Torggata 1", telefon: "22123456" } as any);
+      db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', specialists = ? WHERE id = ?")
+        .run(JSON.stringify(titles.map((title, i) => ({ name: `Person ${i}`, title }))), id);
+      return id;
+    };
+    titledClinic("Kjeveortoped Tittel AS", "918900203", ["Kjeveortoped", "Tannpleier"]);
+    titledClinic("Bare Tannlege Tittel AS", "918900204", ["Tannlege", "Spesialist"]);
+    const cardOf = (html: string, navn: string) =>
+      [...html.matchAll(/<article class="clinic-card">[\s\S]*?<\/article>/g)].map((m) => m[0]).find((c) => c.includes(`>${navn}</a>`)) ?? "";
+    const cardChips = (card: string) => [...card.matchAll(/class="spec-chip"[^>]*>([^<]*)<\/a>/g)].map((m) => m[1]);
+    {
+      const html = (await callRoute(dentalSeoRouter, { path: "/spesialitet/kjeveortopedi" })).body;
+      assertTrue(JSON.stringify(cardChips(cardOf(html, "Kjeveortoped Tittel AS"))) === JSON.stringify(["kjeveortopedi"]), "D3d chips: a clinic with only a title gets its chip on /spesialitet/kjeveortopedi");
+      const fylke = (await callRoute(dentalSeoRouter, { path: "/fylke/Oslo" })).body;
+      const plain = cardOf(fylke, "Bare Tannlege Tittel AS");
+      assertTrue(!!plain && cardChips(plain).length === 0, "D3d chips: titles Tannlege and Spesialist give no chip");
+      assertTrue(JSON.stringify(cardChips(cardOf(fylke, "Kjeveortoped Tittel AS"))) === JSON.stringify(["kjeveortopedi"]), "D3d chips: the same chip on /fylke");
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.stack || err?.message || err));
