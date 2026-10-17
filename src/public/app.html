@@ -1459,14 +1459,24 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       'herbs': 'Urter'
     };
 
-    var dayNames = {
-      'mon': 'Mandag', 'tue': 'Tirsdag', 'wed': 'Onsdag', 'thu': 'Torsdag',
-      'fri': 'Fredag', 'sat': 'Lørdag', 'sun': 'Søndag',
-      'monday': 'Mandag', 'tuesday': 'Tirsdag', 'wednesday': 'Onsdag',
-      'thursday': 'Torsdag', 'friday': 'Fredag', 'saturday': 'Lørdag', 'sunday': 'Søndag'
-    };
-
     var monthNames = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Des'];
+
+    // ── Escaping (dev-request 2026-10-17-integrasjonstest-oppfolging, I-I) ──
+    // The producer modal builds HTML from API values, which owners and
+    // enrichment write. esc() makes a value safe as element text and in a
+    // quoted attribute; a value that is not text or a number gives "", so the
+    // modal never shows "[object Object]" or "undefined".
+    function esc(value) {
+      var s = typeof value === 'string' ? value : (typeof value === 'number' && isFinite(value) ? String(value) : '');
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // A link target only for an http(s) URL; "" for anything else
+    // (javascript:, data:, a bare host), which is then shown as text.
+    function httpUrl(value) {
+      var s = typeof value === 'string' ? value.trim() : '';
+      return /^https?:\/\//i.test(s) ? s : '';
+    }
 
     // Geolocation state
     var userLat = null;
@@ -1823,9 +1833,9 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       // Badges
       var badgesHtml = '';
       if (agent.isVerified) badgesHtml += '<span class="modal-badge verified">&#10003; Verifisert av eier</span>';
-      badgesHtml += '<span class="modal-badge">' + (agent.role || 'producer') + '</span>';
+      badgesHtml += '<span class="modal-badge">' + esc(agent.role || 'producer') + '</span>';
       (agent.categories || []).slice(0, 3).forEach(function(c) {
-        badgesHtml += '<span class="modal-badge">' + formatCategory(c) + '</span>';
+        badgesHtml += '<span class="modal-badge">' + esc(formatCategory(c)) + '</span>';
       });
       document.getElementById('modalBadges').innerHTML = badgesHtml;
 
@@ -1856,41 +1866,54 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       var meta = data.meta || {};
       var html = '';
 
+      // Every value from the API goes through esc() (I-I).
       // About
       if (knowledge.about || agent.description) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Om</div>' +
-          '<div class="modal-about">' + (knowledge.about || agent.description) + '</div>' +
+          '<div class="modal-about">' + esc(knowledge.about || agent.description) + '</div>' +
         '</div>';
       }
 
-      // Products
-      if (knowledge.products && knowledge.products.length > 0) {
+      // Products: an object with a text name, or a text entry (getAgentInfo,
+      // I-F); its category and months only when they are text or numbers.
+      var products = Array.isArray(knowledge.products) ? knowledge.products : [];
+      if (products.length > 0) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Produkter</div>' +
           '<div class="modal-products-list">';
-        knowledge.products.forEach(function(p) {
+        products.forEach(function(p) {
+          var name = typeof p === 'string' ? p : (p && p.name);
+          var category = p && typeof p.category === 'string' ? p.category : '';
+          var months = p && Array.isArray(p.months)
+            ? p.months.filter(function(m) { return typeof m === 'number' || typeof m === 'string'; })
+            : [];
           var metaInfo = '';
-          if (p.seasonal && p.months && p.months.length > 0) {
-            metaInfo += p.months.map(function(m) { return monthNames[m] || m; }).join('-');
+          if (p && p.seasonal && months.length > 0) {
+            metaInfo += esc(months.map(function(m) { return monthNames[m] || m; }).join('-'));
           }
-          if (p.organic) metaInfo += ' <span class="organic-badge">Økologisk</span>';
+          if (p && p.organic) metaInfo += ' <span class="organic-badge">Økologisk</span>';
           html += '<div class="modal-product">' +
-            '<span class="modal-product-name">' + p.name + (p.category ? ' <span class="category-tag">' + formatCategory(p.category) + '</span>' : '') + '</span>' +
+            '<span class="modal-product-name">' + esc(name) + (category ? ' <span class="category-tag">' + esc(formatCategory(category)) + '</span>' : '') + '</span>' +
             '<span class="modal-product-meta">' + metaInfo + '</span>' +
           '</div>';
         });
         html += '</div></div>';
       }
 
-      // Opening Hours
-      if (knowledge.openingHours && knowledge.openingHours.length > 0) {
+      // Opening hours: the rows of /info's openingHoursDisplay (I-I), built on
+      // the server by the shared normalizer, so the modal shows the same days
+      // and times as /produsent/:slug. Without that field no hours are shown.
+      var hourRows = Array.isArray(data.openingHoursDisplay) ? data.openingHoursDisplay : [];
+      if (hourRows.length > 0) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Åpningstider</div>' +
           '<div class="modal-hours">';
-        knowledge.openingHours.forEach(function(h) {
-          html += '<span class="modal-hours-day">' + (dayNames[h.day] || h.day) + '</span>' +
-            '<span class="modal-hours-time">' + h.open + ' – ' + h.close + (h.note ? ' (' + h.note + ')' : '') + '</span>';
+        hourRows.forEach(function(row) {
+          var hours = esc(row && row.hours);
+          var note = esc(row && row.note);
+          html += '<span class="modal-hours-day">' + esc(row && row.days) + '</span>' +
+            '<span class="modal-hours-time">' + (hours ? hours + (note ? ' (' + note + ')' : '') : note) + '</span>';
         });
         html += '</div></div>';
       }
@@ -1901,25 +1924,30 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Kontakt</div>' +
           '<div class="modal-contact-list">';
-        if (knowledge.address) html += '<div class="modal-contact-item">' + knowledge.address + (knowledge.postalCode ? ', ' + knowledge.postalCode : '') + '</div>';
-        if (knowledge.phone) html += '<div class="modal-contact-item">Tlf: <a href="tel:' + knowledge.phone + '">' + knowledge.phone + '</a></div>';
-        if (knowledge.email) html += '<div class="modal-contact-item">E-post: <a href="mailto:' + knowledge.email + '">' + knowledge.email + '</a></div>';
-        if (knowledge.website) html += '<div class="modal-contact-item">Nett: <a href="' + knowledge.website + '" target="_blank" rel="noopener">' + knowledge.website + '</a></div>';
+        if (knowledge.address) html += '<div class="modal-contact-item">' + esc(knowledge.address) + (knowledge.postalCode ? ', ' + esc(knowledge.postalCode) : '') + '</div>';
+        if (knowledge.phone) html += '<div class="modal-contact-item">Tlf: <a href="tel:' + esc(knowledge.phone) + '">' + esc(knowledge.phone) + '</a></div>';
+        if (knowledge.email) html += '<div class="modal-contact-item">E-post: <a href="mailto:' + esc(knowledge.email) + '">' + esc(knowledge.email) + '</a></div>';
+        if (knowledge.website) {
+          var websiteUrl = httpUrl(knowledge.website);
+          html += '<div class="modal-contact-item">Nett: ' + (websiteUrl
+            ? '<a href="' + esc(websiteUrl) + '" target="_blank" rel="noopener">' + esc(knowledge.website) + '</a>'
+            : esc(knowledge.website)) + '</div>';
+        }
         html += '</div></div>';
       }
 
       // Certifications, Delivery, Payment
       var extras = [];
-      if (knowledge.certifications && knowledge.certifications.length > 0) {
+      if (Array.isArray(knowledge.certifications) && knowledge.certifications.length > 0) {
         extras.push({ label: 'Sertifiseringer', items: knowledge.certifications, cls: 'cert' });
       }
-      if (knowledge.deliveryOptions && knowledge.deliveryOptions.length > 0) {
+      if (Array.isArray(knowledge.deliveryOptions) && knowledge.deliveryOptions.length > 0) {
         extras.push({ label: 'Levering', items: knowledge.deliveryOptions, cls: '' });
       }
-      if (knowledge.paymentMethods && knowledge.paymentMethods.length > 0) {
+      if (Array.isArray(knowledge.paymentMethods) && knowledge.paymentMethods.length > 0) {
         extras.push({ label: 'Betaling', items: knowledge.paymentMethods, cls: '' });
       }
-      if (knowledge.specialties && knowledge.specialties.length > 0) {
+      if (Array.isArray(knowledge.specialties) && knowledge.specialties.length > 0) {
         extras.push({ label: 'Spesialiteter', items: knowledge.specialties, cls: '' });
       }
 
@@ -1928,19 +1956,19 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
           '<div class="modal-section-title">' + extra.label + '</div>' +
           '<div class="modal-tags">';
         extra.items.forEach(function(item) {
-          html += '<span class="modal-tag ' + extra.cls + '">' + item + '</span>';
+          html += '<span class="modal-tag ' + extra.cls + '">' + esc(item) + '</span>';
         });
         html += '</div></div>';
       });
 
       // Skills (A2A capabilities)
-      if (agent.skills && agent.skills.length > 0) {
+      if (Array.isArray(agent.skills) && agent.skills.length > 0) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">A2A Capabilities</div>' +
           '<div class="modal-tags">';
         agent.skills.forEach(function(s) {
-          var skillName = typeof s === 'string' ? s : (s.name || s.id);
-          html += '<span class="modal-tag">' + skillName + '</span>';
+          var skillName = esc(typeof s === 'string' ? s : (s && (s.name || s.id)));
+          if (skillName) html += '<span class="modal-tag">' + skillName + '</span>';
         });
         html += '</div></div>';
       }
@@ -1949,9 +1977,10 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       var source = meta.dataSource || 'auto';
       var sourceLabel = source === 'owner' ? 'Eierverifisert data' : source === 'hybrid' ? 'Automatisk + eierdata' : 'Automatisk innsamlet';
       html += '<div class="modal-section">' +
-        '<div class="modal-data-source"><span class="modal-data-dot ' + source + '"></span> ' + sourceLabel;
-      if (meta.lastUpdated) {
-        html += ' &middot; Oppdatert ' + new Date(meta.lastUpdated).toLocaleDateString('nb-NO');
+        '<div class="modal-data-source"><span class="modal-data-dot ' + esc(source) + '"></span> ' + sourceLabel;
+      var updated = meta.lastUpdated ? new Date(meta.lastUpdated) : null;
+      if (updated && !isNaN(updated.getTime())) {
+        html += ' &middot; Oppdatert ' + esc(updated.toLocaleDateString('nb-NO'));
       }
       html += '</div></div>';
 
@@ -1983,7 +2012,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       if (agent.description) {
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Om</div>' +
-          '<div class="modal-about">' + agent.description + '</div>' +
+          '<div class="modal-about">' + esc(agent.description) + '</div>' +
         '</div>';
       }
 
@@ -1993,7 +2022,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         html += '<div class="modal-section">' +
           '<div class="modal-section-title">Kategorier</div>' +
           '<div class="modal-tags">' +
-          allTags.map(function(t) { return '<span class="modal-tag">' + formatCategory(t) + '</span>'; }).join('') +
+          allTags.map(function(t) { return '<span class="modal-tag">' + esc(formatCategory(t)) + '</span>'; }).join('') +
           '</div></div>';
       }
 
@@ -2001,7 +2030,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       html += '<div class="modal-section">' +
         '<div class="modal-section-title">Detaljer</div>' +
         '<div class="modal-info-grid">' +
-          '<div class="modal-info-item"><div class="modal-info-label">Rolle</div><div class="modal-info-value">' + (agent.role || 'producer') + '</div></div>' +
+          '<div class="modal-info-item"><div class="modal-info-label">Rolle</div><div class="modal-info-value">' + esc(agent.role || 'producer') + '</div></div>' +
           '<div class="modal-info-item"><div class="modal-info-label">Status</div><div class="modal-info-value">' + (agent.isVerified ? 'Verifisert av eier' : 'Ikke verifisert av eier') + '</div></div>' +
         '</div></div>';
 
