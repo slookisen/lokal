@@ -43,6 +43,12 @@ import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { generalLimiter } from "../middleware/security";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, looksTruncatedMidWord } from "../services/description-quality";
+// dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): links
+// to the provider's own website carry UTM; booking_url, «Kilde:» and JSON-LD
+// url/sameAs stay as stored.
+import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+const PROVIDER_SITE_UTM = OUTBOUND_UTM.opplevagent.provider_profile;
+const GARDSSALG_SITE_UTM = OUTBOUND_UTM.opplevagent.gardssalg_profile;
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
 // one indexability verdict drives the detail page's robots meta, its
 // X-Robots-Tag header and its sitemap.xml entry — see the module's header.
@@ -3670,7 +3676,7 @@ function renderOpplevelseDetail(
   if (bookingUrl) {
     cta = `<a class="cta" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener nofollow">${L.ctaBook}</a>`;
   } else if (provSite) {
-    cta = `<a class="cta" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
+    cta = `<a class="cta" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${L.ctaSite}</a>`;
   } else {
     cta = `<p class="cta-soft">${L.ctaSoft}</p>`;
   }
@@ -3681,7 +3687,7 @@ function renderOpplevelseDetail(
 
   // Provider card.
   const provInner = provName
-    ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(provSite)}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
+    ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
        ${brregVerified ? `<p class="prov-verified">${L.provVerified}${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">${L.provPending}</p>`}
        <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.slug || provider!.id))}">${L.provAll}</a></p>`
     : `<p class="prov-soft">${L.provUnmatched}</p>`;
@@ -6199,7 +6205,7 @@ router.get(
     const aboutBody = hasRealAbout
       ? `<p>${escapeHtml(tr.about_text || (provider.about_text as string))}</p>`
       : site
-      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
+      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
       : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
 
     // "Besøket" — real enriched copy (visit_text) when present; otherwise the
@@ -6223,7 +6229,7 @@ router.get(
       && !isJunkDescription(provider.opening_hours_text)
       && !looksTruncatedMidWord(provider.opening_hours_text)
     ) facts.push([L.gsHours, escapeHtml(tr.opening_hours_text || provider.opening_hours_text)]);
-    if (site) facts.push([L.gsSite, `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
+    if (site) facts.push([L.gsSite, `<a href="${escapeHtml(addUtmParams(site, GARDSSALG_SITE_UTM.source, "referral", GARDSSALG_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
     if (isDisplayablePhone(provider.telefon)) facts.push([L.phone, `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
     // epostUnderReview: Skive C(b)/AC4 — a flagged (domain-deviating) address
     // is published NOWHERE on this page until a human resolves it: not in the
@@ -8599,7 +8605,7 @@ export function buildProviderContact(
     : "";
   if (addr) rows.push(`<li><strong>Adresse:</strong> ${escapeHtml(addr)}</li>`);
   if (phone) rows.push(`<li><strong>Telefon:</strong> <a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a></li>`);
-  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
+  if (site) rows.push(`<li><strong>Nettside:</strong> <a href="${escapeHtml(addUtmParams(site, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a></li>`);
   if (orgNr) rows.push(`<li><strong>Org.nr.:</strong> ${escapeHtml(orgNr)}</li>`);
   const contactHtml = rows.length
     ? `<section class="prov-contact" aria-label="Kontaktinformasjon"><ul style="list-style:none;padding:0;margin:12px 0">${rows.join("")}</ul></section>`
@@ -8661,8 +8667,8 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
   if (place) ledeBits += ` (${place})`;
   ledeBits += ".";
   const verifiedNote = brregVerified
-    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
-    : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
+    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
+    : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(addUtmParams(provSite, PROVIDER_SITE_UTM.source, "referral", PROVIDER_SITE_UTM.campaign))}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
 
   const providerCanonicalPath = `/tilbyder/${encodeURIComponent(String(provider.slug || providerId))}`;
   const contact = buildProviderContact(provider, `${baseUrl()}${providerCanonicalPath}`);

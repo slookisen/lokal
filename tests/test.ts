@@ -48479,6 +48479,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): UTM
+// on the partner's own website links (dental /klinikk, Opplevagent
+// /opplevelse, /tilbyder, /kategori/gardssalg/produsent), none on booking,
+// directory, «Kilde:» or JSON-LD; Referrer-Policy still no-referrer. Pins the
+// dental/experiences db-factory paths (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 utgående lenker S1: UTM on outbound partner links (dental/OA) ──");
+  try {
+    const { runOutboundUtmTests } = require("../src/routes/outbound-utm.test") as
+      typeof import("../src/routes/outbound-utm.test");
+    const ou = await runOutboundUtmTests({ log: false });
+    passed += ou.passed;
+    failed += ou.failed;
+    for (const f of ou.failures) failures.push("outbound-utm: " + f);
+    console.log(`  outbound-utm: ${ou.passed} passed, ${ou.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outbound-utm: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1 (T1–T16): the
 // client-IP choke point (middleware/client-ip.ts) — enforce makes req.ip
 // Fly-Client-IP whatever X-Forwarded-For says, every fallback is today's

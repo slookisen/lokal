@@ -61,6 +61,35 @@ export function addUtmParams(
   return parsed.toString();
 }
 
+// ─── Outbound partner links on finn-tannlege.com and opplevagent.no ───
+// dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1).
+// The sites keep Referrer-Policy: no-referrer (Daniel, beslutning 3=A), so a
+// clinic or provider can only see in its own analytics that a visit came from
+// us through UTM on the link itself, the way the RFB producer links already
+// work. One row per vertical and link type; the page hands it to the unchanged
+// addUtmParams:
+//   addUtmParams(url, row.source, "referral", row.campaign)
+// A new vertical or link type is one row here. Only links to the partner's own
+// website use these rows: never booking URLs (a booking engine's signed URL
+// can break), directory or «Kilde:» links, JSON-LD, or MCP/A2A/REST payloads.
+export interface OutboundUtmRow {
+  readonly source: string;
+  readonly campaign: string;
+}
+
+export const OUTBOUND_UTM = {
+  dental: {
+    // «Hjemmeside» on /klinikk/<slug>
+    clinic_profile: { source: "finn-tannlege", campaign: "clinic_profile" },
+  },
+  opplevagent: {
+    // /opplevelse/<slug> and /tilbyder/<slug>
+    provider_profile: { source: "opplevagent", campaign: "provider_profile" },
+    // /kategori/gardssalg/produsent/<slug>
+    gardssalg_profile: { source: "opplevagent", campaign: "gardssalg_profile" },
+  },
+} as const satisfies Record<string, Record<string, OutboundUtmRow>>;
+
 // ─── AI-source UTM tagging (PR-83) ─────────────────────────────
 // Mapping from detectMcpClient() return values to UTM source slugs.
 // Snake_case lower for analytics-friendliness.
