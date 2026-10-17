@@ -42513,6 +42513,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-I (FUNN
+// rfb-app-modal-apningstider-og-escaping): GET /agents/:id/info gets an
+// additive `openingHoursDisplay` (rows from the shared normalizer, the same
+// text as the hours card on /produsent/:slug); the producer modal on /app and
+// /dashboard and the /agent page show those rows, and the modal escapes every
+// API value (local esc(); a website is a link only for http(s)). The pages'
+// inline scripts run in a vm with a fake DOM, fed by the real /info handler;
+// own in-memory DB (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-I (producer modal: opening hours + escaping) ──");
+  try {
+    const { runRfbProdusentmodalApningstiderEscapingTests } = require("../src/routes/rfb-produsentmodal-apningstider-escaping.test") as
+      typeof import("../src/routes/rfb-produsentmodal-apningstider-escaping.test");
+    const r = await runRfbProdusentmodalApningstiderEscapingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-produsentmodal-apningstider-escaping: " + f);
+    console.log(`  rfb-produsentmodal-apningstider-escaping: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-produsentmodal-apningstider-escaping: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
 // END-TO-END: the symptom Daniel actually saw. OpplevAgent's
 // discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)

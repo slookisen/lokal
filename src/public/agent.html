@@ -94,8 +94,6 @@
 <div id="app"><div class="loading"><div class="spinner"></div><span>Laster inn...</span></div></div>
 <script>
 (function(){
-    var DAY_NAMES = {mon:'Mandag',tue:'Tirsdag',wed:'Onsdag',thu:'Torsdag',fri:'Fredag',sat:'Lordag',sun:'Sondag',
-        monday:'Mandag',tuesday:'Tirsdag',wednesday:'Onsdag',thursday:'Torsdag',friday:'Fredag',saturday:'Lordag',sunday:'Sondag'};
     var CAT_NAMES = {vegetables:'Gronnsaker',fruit:'Frukt',berries:'Baer',dairy:'Meieri',eggs:'Egg',meat:'Kjott',fish:'Fisk',bread:'Brød',honey:'Honning',herbs:'Urter',other:'Annet'};
 
     function esc(t){if(!t)return '';return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -171,15 +169,19 @@
             html+='</div></section>';
         }
 
-        // Opening hours
-        var hours=k.openingHours||[];
+        // Opening hours: the rows of /info's openingHoursDisplay, built on the
+        // server by the shared normalizer, so the page shows the same days and
+        // times as /produsent/:slug (dev-request 2026-10-17-integrasjonstest-
+        // oppfolging, I-I). Without that field no hours are shown. A row
+        // without times (a closed day, "Etter avtale") has its note as the time.
+        var hours=Array.isArray(data.openingHoursDisplay)?data.openingHoursDisplay:[];
         if(hours.length){
             html+='<section><h2>Apningstider</h2><table class="hours-table"><thead><tr><th>Dag</th><th>Tid</th><th></th></tr></thead><tbody>';
-            hours.forEach(function(h){
-                var day=DAY_NAMES[(h.day||'').toLowerCase()]||esc(h.day);
-                var time=(h.open&&h.close)?h.open+' — '+h.close:'Stengt';
-                var note=h.note?esc(h.note):'';
-                html+='<tr><td>'+day+'</td><td>'+esc(time)+'</td><td style="font-size:12px;color:#666">'+note+'</td></tr>';
+            hours.forEach(function(row){
+                row=row||{};
+                var time=row.hours||row.note;
+                var note=row.hours?row.note:'';
+                html+='<tr><td>'+esc(row.days)+'</td><td>'+esc(time)+'</td><td style="font-size:12px;color:#666">'+esc(note)+'</td></tr>';
             });
             html+='</tbody></table></section>';
         }

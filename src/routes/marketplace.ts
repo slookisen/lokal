@@ -47,6 +47,7 @@ import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423,
@@ -1468,7 +1469,44 @@ router.get("/agents", (req: Request, res: Response) => {
 // Example response:
 //   { agent: { name, city, trustScore, isClaimed },
 //     knowledge: { address, products, openingHours, ... },
-//     meta: { dataSource: "auto", disclaimer: "..." } }
+//     meta: { dataSource: "auto", disclaimer: "..." },
+//     openingHoursDisplay: [{ days: "Mandag–Fredag", hours: "10:00 – 17:00", note: "" }, ...] }
+
+/**
+ * One row of a producer's opening hours as the RFB pages show them: the day
+ * column and the time column of the hours card on /produsent/:slug. Every
+ * field is text, "" when there is nothing.
+ */
+export interface OpeningHoursDisplayRow {
+  /** The weekdays in Norwegian ("Mandag–Fredag"), the day label as stored when it names none ("Påske"), or "" (a text entry). */
+  days: string;
+  /** The opening and closing time ("10:00 – 17:00"), or "" when the entry has none. */
+  hours: string;
+  /** The period and the note ("April; Kun i sesong"), or "". Shown after the times in brackets, or alone when there are none. */
+  note: string;
+}
+
+/**
+ * The `openingHoursDisplay` rows of GET /agents/:id/info. Dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-I (FUNN
+ * rfb-app-modal-apningstider-og-escaping): the producer modal on /app and
+ * /dashboard and the /agent page read the raw `knowledge.openingHours` with a
+ * day table of their own, so {day, hours}, {day, from, to}, Norwegian day
+ * names, ranges and text showed as "undefined – undefined", as the stored
+ * key, or not at all. The rows come from the shared normalizer
+ * (utils/opening-hours.ts, I-H) and hold the same text as the hours card on
+ * the producer page (openingHoursCardHtml in seo.ts), so the pages show the
+ * same hours. Built here, not in knowledgeService.getAgentInfo, so lokal_info
+ * and the RFB MCP contract are unchanged; `knowledge.openingHours` stays as
+ * stored (selger.html edits it).
+ */
+export function openingHoursDisplayRows(openingHours: unknown): OpeningHoursDisplayRow[] {
+  return normalizeOpeningHours(openingHours).map((entry) => ({
+    days: entryDaysLabel(entry, "no"),
+    hours: entry.open !== undefined && entry.close !== undefined ? `${entry.open} \u2013 ${entry.close}` : "",
+    note: [entry.period, entry.note].filter(Boolean).join("; "),
+  }));
+}
 
 router.get("/agents/:id/info", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
@@ -1497,7 +1535,15 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // entity-level provenance summary — omitted entirely when there's nothing
   // to summarize (never emitted as null/empty).
   const provenance = getAgentProvenanceSummary(agentId);
-  const data = provenance ? { ...info, provenance } : info;
+  // I-I: additive display rows for the opening hours (openingHoursDisplayRows
+  // above), after every existing field and, like `provenance`, omitted when
+  // there are none; the existing fields are byte-identical.
+  const openingHoursDisplay = openingHoursDisplayRows(info.knowledge.openingHours);
+  const data = {
+    ...info,
+    ...(provenance ? { provenance } : {}),
+    ...(openingHoursDisplay.length ? { openingHoursDisplay } : {}),
+  };
 
   res.json({ success: true, data });
 });
