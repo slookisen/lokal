@@ -125,6 +125,17 @@ export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * A word right before an ambiguous place name that marks it as a place ("i Moss", "in Moss").
+ *
+ * Shared: moved here unchanged from experiences-query-intent.ts (which
+ * re-exports it) in dev-request 2026-10-17-integrasjonstest-oppfolging,
+ * slice I-W4, where the RFB search reads it too: a filler word is a place
+ * there only right after one of these («i Finnes») or as the whole search
+ * (search-intent/rfb-filler-words.ts).
+ */
+export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på", "ved", "nær", "near", "around", "rundt"]);
+
+/**
  * Fold a place name for lookup: lower case, æ/ø/å as ae/oe/aa, then only
  * letters and digits. "Bodø", "BODØ" and the ASCII spelling "Bodoe" that some
  * stored rows carry all fold to "bodoe"; "Aurskog-Høland" and "Aurskog
