@@ -52,6 +52,7 @@ import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { publicListableSql } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
@@ -681,6 +682,15 @@ export function registerTools(
       sessionId: extra?.sessionId,
     });
   };
+  // Slice I-Z: whether a search raises the producers' discovery counters.
+  // Not for our own traffic or a probe (search-tracking.ts searchCountable),
+  // read off the same headers and client name as deliver() above.
+  const countable = (extra: ToolExtra, text: string, structured = false) => searchCountable({
+    meta: buildRequestMeta({ headers: extra?.requestInfo?.headers }),
+    clientName: (server as any).server?.getClientVersion?.()?.name ?? null,
+    text,
+    structured,
+  });
 
   // Every tool handler below runs inside guardToolHandler (integration test
   // 2026-10-17, AI-1): an internal error is logged and never returned. The
@@ -766,7 +776,7 @@ export function registerTools(
       // directly), so it needs the same honest-drop signal as the REST/web
       // search surfaces — not just the underlying filter fix.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta);
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q) });
 
       // Integration test 2026-10-17, slice I-W: the words the parser could not
       // read are looked up in the product names (discover() step 3c). When no
@@ -1001,7 +1011,7 @@ export function registerTools(
       // gets back non-budget producers with no indication the filter was
       // silently dropped.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover(body, discoverMeta);
+      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true) });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
