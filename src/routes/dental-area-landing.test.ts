@@ -21,8 +21,11 @@
  *   F  cost on a synthetic 6,900-row DB: a coarse time guard on an uncached
  *      getDentalAreaFacts (best of 5 under 150 ms; 12-23 ms measured on an
  *      idle machine and on CI, ~300 ms for a quadratic fold); a hit comes
- *      from the cache; one computation runs exactly one statement (counted
- *      on the handle and on the connection), a hit none.
+ *      from the cache; one computation prepares one statement and runs it
+ *      once, a hit none. Runs are counted on better-sqlite3's
+ *      Statement.prototype, so every connection counts, and so does a
+ *      statement cached per connection and run per row. Within the TTL a
+ *      hit starts nothing; past it, one background computation.
  *   H  a failing background refresh keeps the old numbers and logs a warning
  *      (the message only, no row data).
  *
@@ -546,8 +549,9 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       // probe watches that, not this test. An algorithmic regression in the
       // fold lands at twice the bound even on the idle machine: a linear
       // search per row instead of the Map, or a rescan of all rows per row,
-      // takes 297-322 ms. A query per row costs only 34-61 ms here, so F4
-      // catches that by counting statements, not by the clock.
+      // takes 297-322 ms. A query per row costs only 23-61 ms here, also
+      // through a statement cached per connection, so F4d catches it by
+      // counting statement runs, not by the clock.
       const times: number[] = [];
       let last: ReturnType<typeof areaFacts.getDentalAreaFacts> | null = null;
       for (let r = 0; r < 5; r++) {
@@ -566,12 +570,13 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       // time bound only says a hit costs well under a millisecond (a scan
       // costs 12-25 ms, F1): 100 ms per 1,000 hits, best of 3 rounds as in F1.
       // Under tsx a hit takes 10-12 µs; the old single-round 20 ms bound
-      // failed at 20-35 ms on a GC pause or a busy core.
+      // failed at 20-35 ms on a GC pause or a busy core. Every round makes
+      // all 1,000 calls, so F3b times hits even when F3 fails.
       let same = true;
       const hitTimes: number[] = [];
       for (let r = 0; r < 3; r++) {
         const t1 = performance.now();
-        for (let i = 0; i < 1000; i++) same = same && areaFacts.getDentalAreaFacts() === last;
+        for (let i = 0; i < 1000; i++) if (areaFacts.getDentalAreaFacts() !== last) same = false;
         hitTimes.push(performance.now() - t1);
       }
       const hitBest = Math.min(...hitTimes);
@@ -579,22 +584,45 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       assertTrue(hitBest < 100, `F3b: 1,000 cache hits take under 100 ms (best of 3: ${hitBest.toFixed(1)} ms; all: ${hitTimes.map((t) => t.toFixed(1)).join(", ")})`);
 
       // One statement per computation, counted rather than timed, on these
-      // 6,900 rows. computeDentalAreaFacts gets a handle that counts each
-      // statement prepared on it and each run of one; the dental connection
-      // itself counts what is prepared on it, so a statement prepared behind
-      // the handle's back (a store helper with its own getDb()) shows too.
-      // Both counters run only inside synchronous calls, so no other test
-      // block can add to them.
+      // 6,900 rows. Three counters:
+      //   - the handle computeDentalAreaFacts gets counts each statement
+      //     prepared on it and each run of one (F4);
+      //   - the dental connection counts what is prepared on it, so a
+      //     statement prepared behind the handle's back (a store helper with
+      //     its own getDb()) shows too;
+      //   - better-sqlite3's Statement.prototype, which every statement on
+      //     every connection shares, counts each run (all, get, run,
+      //     iterate), however and whenever the statement was prepared. A
+      //     statement prepared once and cached per connection (as
+      //     _specialtyStatements in dental-store.ts does for
+      //     getAvailableSpecialties) and then run per row prepares nothing
+      //     inside the window, so only this counter sees it (F4d, F5).
+      // In F4, F4e and F5 the counters are on only inside synchronous calls,
+      // so no other test block can add to them. countOff() in a finally puts
+      // every method back.
+      const RUN_METHODS = ["all", "get", "run", "iterate"] as const;
+      const statementProto: Record<string, unknown> = Object.getPrototypeOf(db.prepare("SELECT 1"));
+      const realRuns = RUN_METHODS.map((k) => [k, statementProto[k] as (...args: unknown[]) => unknown] as const);
       const realPrepare = (db as any).prepare;
-      let onConnection = 0;
-      const countConnection = (): void => {
-        (db as any).prepare = function (this: unknown, sql: string) { onConnection++; return realPrepare.call(this, sql); };
+      /** Prepares on the dental connection, runs on any connection, runs on the dental connection. */
+      const tally = { onConnection: 0, runs: 0, runsOnDental: 0 };
+      const resetTally = (): void => { tally.onConnection = 0; tally.runs = 0; tally.runsOnDental = 0; };
+      const countOn = (): void => {
+        (db as any).prepare = function (this: unknown, sql: string) { tally.onConnection++; return realPrepare.call(this, sql); };
+        for (const [k, real] of realRuns) {
+          statementProto[k] = function (this: { database?: unknown }, ...args: unknown[]) {
+            tally.runs++;
+            if (this.database === db) tally.runsOnDental++;
+            return real.apply(this, args);
+          };
+        }
       };
-      const restoreConnection = (): void => {
+      const countOff = (): void => {
+        for (const [k, real] of realRuns) statementProto[k] = real;
         if (Object.prototype.hasOwnProperty.call(db, "prepare")) delete (db as any).prepare;
         if ((db as any).prepare !== realPrepare) (db as any).prepare = realPrepare;
       };
-      const RUNS = new Set<PropertyKey>(["all", "get", "run", "iterate"]);
+      const RUNS = new Set<PropertyKey>(RUN_METHODS);
       const countingHandle = () => {
         const seen = { prepared: [] as string[], runs: 0 };
         const wrapStatement = (stmt: any): any => {
@@ -617,41 +645,113 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       const asJson = (f: ReturnType<typeof areaFacts.getDentalAreaFacts>): string => JSON.stringify([[...f.byPoststed], [...f.byFylke]]);
 
       const perComputation: Array<[number, number, number]> = [];
+      const runsPerComputation: number[] = [];
       let sqls: string[] = [];
       let countedFacts: ReturnType<typeof areaFacts.computeDentalAreaFacts> | null = null;
-      countConnection();
+      countOn();
       try {
         for (let r = 0; r < 3; r++) {
           const { seen, handle } = countingHandle();
-          onConnection = 0;
+          resetTally();
           countedFacts = areaFacts.computeDentalAreaFacts(handle);
-          perComputation.push([seen.prepared.length, seen.runs, onConnection]);
+          perComputation.push([seen.prepared.length, seen.runs, tally.onConnection]);
+          runsPerComputation.push(tally.runs);
           sqls = seen.prepared;
         }
       } finally {
-        restoreConnection();
+        countOff();
       }
       assertEq(perComputation, [[1, 1, 1], [1, 1, 1], [1, 1, 1]], "F4: each of 3 computations prepares one statement on the handle, runs it once, and prepares nothing else on the connection ([prepared, runs, on connection])");
       assertTrue(sqls.length === 1 && sqls[0]!.startsWith("SELECT poststed, fylke,") && sqls[0]!.includes(" FROM dental_agents WHERE "), "F4b: that statement is the one aggregate SELECT over dental_agents");
       assertTrue(countedFacts !== null && asJson(countedFacts) === asJson(last!), "F4c: the counted computation gives the same aggregate as the uncounted one");
+      assertEq(runsPerComputation, [1, 1, 1], "F4d: each computation runs exactly one statement on any connection, however it was prepared (Statement.prototype: all, get, run, iterate)");
 
-      // The pages' path: getDentalAreaFacts() after a cache reset computes
-      // with one statement on the connection; a hit prepares none.
-      areaFacts.__resetDentalAreaFactsForTesting();
-      const onPagePath: number[] = [];
-      let hitIsCached = false;
-      countConnection();
+      // The run counter itself: a statement prepared before the window (as
+      // a per-connection cache holds it) and run three times inside it gives
+      // three runs and no prepare; a run on another connection is a run, but
+      // not one on the dental connection.
+      const preparedBefore = db.prepare("SELECT COUNT(*) AS n FROM dental_agents WHERE poststed = ?");
+      const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+      const otherConnection = new Database(":memory:");
+      const otherStatement = otherConnection.prepare("SELECT 1");
+      let probe: number[] = [];
+      countOn();
       try {
-        onConnection = 0;
-        const fresh = areaFacts.getDentalAreaFacts();
-        onPagePath.push(onConnection);
-        onConnection = 0;
-        hitIsCached = areaFacts.getDentalAreaFacts() === fresh;
-        onPagePath.push(onConnection);
+        resetTally();
+        for (const p of ["BERGEN", "OSLO", "SOLO"]) preparedBefore.get(p);
+        otherStatement.get();
+        probe = [tally.onConnection, tally.runs, tally.runsOnDental];
       } finally {
-        restoreConnection();
+        countOff();
+        otherConnection.close();
       }
-      assertEq([onPagePath, hitIsCached], [[1, 0], true], "F5: through getDentalAreaFacts() a computation is one statement on the dental connection and a cache hit none");
+      assertEq(probe, [0, 4, 3], "F4e: the counter sees runs of a statement prepared before the window and runs on another connection ([prepared on the dental connection, runs, runs on the dental connection])");
+
+      // The pages' path: getDentalAreaFacts() after a cache reset prepares
+      // one statement on the dental connection and runs one statement; a hit
+      // prepares and runs none.
+      areaFacts.__resetDentalAreaFactsForTesting();
+      const onPagePath: Array<[number, number]> = [];
+      let hitIsCached = false;
+      countOn();
+      try {
+        resetTally();
+        const fresh = areaFacts.getDentalAreaFacts();
+        onPagePath.push([tally.onConnection, tally.runs]);
+        resetTally();
+        hitIsCached = areaFacts.getDentalAreaFacts() === fresh;
+        onPagePath.push([tally.onConnection, tally.runs]);
+      } finally {
+        countOff();
+      }
+      assertEq([onPagePath, hitIsCached], [[[1, 1], [0, 0]], true], "F5: through getDentalAreaFacts() a computation prepares one statement on the dental connection and runs one statement, a cache hit neither ([[prepared, runs] computation, [prepared, runs] hit], hit cached)");
+
+      // The TTL and the refresh path. Within DENTAL_STATS_TTL_MS a hit
+      // starts nothing, not even in the background. Past it, hits get the
+      // old aggregate at once and start exactly one background computation,
+      // and the next hit gets its result. That computation runs in a later
+      // microtask, so here the counter stays on across a setImmediate, and
+      // the check reads only the runs on this block's own in-memory dental
+      // connection (no other test block holds it). Whatever an earlier check
+      // left queued runs first, before the counter is on. The clock is fixed
+      // for the whole check; the finally puts it and the counters back and
+      // drops the cache.
+      const { DENTAL_STATS_TTL_MS } = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
+      const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+      const realNow = Date.now;
+      const t0 = realNow();
+      let withinTtl: unknown[] = [];
+      let pastTtl: unknown[] = [];
+      try {
+        await tick();
+        Date.now = () => t0;
+        areaFacts.__resetDentalAreaFactsForTesting();
+        const first = areaFacts.getDentalAreaFacts();
+        countOn();
+        Date.now = () => t0 + DENTAL_STATS_TTL_MS - 1;
+        resetTally();
+        const hit = areaFacts.getDentalAreaFacts();
+        await tick();
+        withinTtl = [hit === first, tally.runsOnDental, areaFacts.getDentalAreaFacts() === first];
+        Date.now = () => t0 + DENTAL_STATS_TTL_MS;
+        resetTally();
+        const staleHits = [areaFacts.getDentalAreaFacts(), areaFacts.getDentalAreaFacts()];
+        const inCalls = tally.runsOnDental;
+        await tick();
+        const inBackground = tally.runsOnDental - inCalls;
+        const next = areaFacts.getDentalAreaFacts();
+        await tick();
+        pastTtl = [
+          staleHits.every((h) => h === first), inCalls, inBackground,
+          next !== first && asJson(next) === asJson(first), tally.runsOnDental - inCalls - inBackground,
+        ];
+      } finally {
+        countOff();
+        Date.now = realNow;
+        areaFacts.__resetDentalAreaFactsForTesting();
+      }
+      assertEq(withinTtl, [true, 0, true], "F6: within the TTL a hit is the cached aggregate and runs no statement, not even in the background ([cached, runs by the next macrotask, still cached])");
+      assertEq(pastTtl, [true, 0, 1, true, 0], "F7: past the TTL two hits get the old aggregate at once and start exactly one background computation; the next hit gets its result and starts nothing ([old served, runs in the calls, runs in the background, new equal aggregate, runs after])");
     }
   } catch (err: any) {
     failed++;
