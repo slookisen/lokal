@@ -104,7 +104,10 @@ export function getDentalAgentCard(honestCount?: number | null): object {
     // promotional words) without copying them. Each example, and each request
     // quoted «like this», is answered by its own skill when sent as text, and
     // each message.data key named here is read (dental-agent-card.test.ts).
-    // Ids, names, modes and x-mcp-tools are unchanged.
+    // Ids, names, modes and x-mcp-tools are unchanged. Dev-request
+    // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+    // (A4-D): address, phone and website are listed «when known», since a
+    // value only Google Places gives is null (dental-places-display.ts).
     skills: [
       {
         id: "tannlege_search",
@@ -123,8 +126,8 @@ export function getDentalAgentCard(honestCount?: number | null): object {
           "take emergency patients) and `q` (a clinic name or place as written); a data part in `parts` is not " +
           "read. `metadata.filter` shows the filter that was used. " +
           "`count` is the number of clinics in the answer (at most 20) and `total` the number of clinics that " +
-          "match. `clinics` lists them, each with its name, org.nr, address, postcode, place, county, phone, " +
-          "website, Helfo status, emergency claim and profile URL, and its online booking link, opening hours, " +
+          "match. `clinics` lists them, each with its name, org.nr, postcode, place, county, Helfo status, " +
+          "emergency claim and profile URL, and its address, phone, website, online booking link, opening hours, " +
           "specialties and chain when known.",
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],

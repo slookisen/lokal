@@ -51,6 +51,7 @@ import { generalLimiter } from "../middleware/security";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { shownDentalAgent } from "../services/dental-places-display";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { capFreeText } from "../utils/free-text";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
@@ -924,10 +925,14 @@ function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOpti
 }
 
 // ─── Clinic card (used in /sok and /fylke) ───────────────────
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A4-D): the card, like the profile below, shows the clinic
+// through shownDentalAgent (no phone or hours that only Google Places gives).
 
 function clinicCard(
-  agent: DentalAgent & { id: string }
+  stored: DentalAgent & { id: string }
 ): string {
+  const agent = shownDentalAgent(stored);
   const slug = slugifyClinic(agent.navn, agent.org_nr ?? undefined);
   const href = agent.org_nr
     ? `/klinikk/${escapeHtml(slug)}`
@@ -1515,10 +1520,17 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
 }
 
 function renderClinicProfile(
-  agent: DentalAgent & { id: string },
+  stored: DentalAgent & { id: string },
   req: Request,
   res: Response
 ): void {
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the page, its JSON-LD, its descriptions and its
+  // thin-profile check read the values the Places display rule shows
+  // (dental-places-display.ts). A hidden address, phone, website or opening
+  // hours is left out as if unknown; postnummer, place, map and coordinates
+  // stay (Daniel 2026-10-18T17:01Z).
+  const agent = shownDentalAgent(stored);
   // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   // synthetic schema-probe row 404s exactly like a rejected clinic, on both
   // /klinikk/id/:id and /klinikk/:slug (both render through here).
@@ -2634,7 +2646,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2>Kildene vi kryssjekker mot</h2>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, registrert adresse og næringsgruppekode</li>
-      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google</li>
+      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google. En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme.</li>
       <li><strong>Klinikkens egen nettside</strong> &mdash; behandlingstilbud, presentasjonstekst og praktisk informasjon</li>
     </ul>
 
@@ -2659,7 +2671,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2>The sources we cross-check against</h2>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; Norway's business register: company name, organisation number, registered address and industry code</li>
-      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google</li>
+      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google. An address, phone number, opening hours or website that only Google Places gives is not shown. We show the value when another source, such as the clinic's own website or Brønnøysundregistrene, gives the same.</li>
       <li><strong>The clinic's own website</strong> &mdash; treatment offerings, presentation text and practical information</li>
     </ul>
 

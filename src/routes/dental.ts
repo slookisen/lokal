@@ -39,7 +39,10 @@ import {
   recordStageVFieldObservation,
   type StageVField,
   DENTAL_AGENT_WRITABLE_FIELDS,
+  type DentalAgentRow,
 } from "../services/dental-store";
+import { shownDentalAgent } from "../services/dental-places-display";
+import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS, isDentalSyntheticProbeId } from "../services/dental-contamination";
@@ -71,10 +74,14 @@ function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
 
-function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+function hasAdminKey(req: Request): boolean {
   const expected = getAdminKey();
   const provided = (req.headers["x-admin-key"] as string) || "";
-  if (!expected || !provided || provided !== expected) {
+  return !!expected && !!provided && provided === expected;
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!hasAdminKey(req)) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
     return;
   }
@@ -93,6 +100,22 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 ): Omit<T, "rating" | "rating_count" | "rating_source"> {
   const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...rest } = agent;
   return rest;
+}
+
+// Same dev-request, slice A4-D: a public answer shows the clinic as its page
+// does (shownDentalAgent: an address, phone, website or opening hours that
+// only Google Places gives, or that is marked wrong, is null) and leaves out
+// field_provenance, which holds the Places values themselves. With a valid
+// X-Admin-Key the answer is as before, stored values and field_provenance:
+// the enrichment routine reads them back to decide what to write. With the
+// rule switched off (PLACES_DISPLAY_POLICY_ENABLED) every caller gets that
+// answer. Stage V's pending map (a read-only side column) is in neither.
+function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
+  const publicView = !adminView && placesDisplayPolicyEnabled();
+  const { stage_v_pending_correction: _pending, ...row } = withoutGoogleRating(publicView ? shownDentalAgent(agent) : agent);
+  if (!publicView) return row;
+  const { field_provenance: _provenance, ...shown } = row;
+  return shown;
 }
 
 // ─── GET /api/tannlege/agents — list with filters ───────────────────
@@ -162,11 +185,15 @@ router.get("/agents", (req: Request, res: Response) => {
     // consecutive homepage-fetch failures (30d backoff) — the enrichment
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
-    const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((a) => ({
-      ...withoutGoogleRating(a),
-      telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
-      mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
-    }));
+    const adminView = hasAdminKey(req);
+    const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((stored) => {
+      const a = restDentalAgent(stored, adminView);
+      return {
+        ...a,
+        telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
+        mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
+      };
+    });
     res.json({ count: agents.length, agents });
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -210,11 +237,12 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     verifiedRow?.last_verified_at ?? null
   );
 
+  const shown = restDentalAgent(agent, hasAdminKey(req));
   res.json({
     agent: {
-      ...withoutGoogleRating(agent),
-      telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
-      mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
+      ...shown,
+      telefon: isDisplayablePhone(shown.telefon) ? shown.telefon : null,
+      mobil: isDisplayablePhone(shown.mobil) ? shown.mobil : null,
       ...(provenance ? { provenance } : {}),
     },
   });
