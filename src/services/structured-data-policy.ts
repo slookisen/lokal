@@ -1,6 +1,6 @@
 // ─── Structured-data policy: what JSON-LD may claim, how ratings are shown ──
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
-// S1 + S2, S4-A1a and S4-A1b.
+// S1 + S2, S4-A1a, S4-A1b and S6 del B.
 //
 // Measured live 2026-10-16: 35 of 40 /produsent/:slug pages carried Google's
 // rating as their own LocalBusiness.aggregateRating (plus a copy on every
@@ -31,6 +31,15 @@
 //      takes first-party reviews only, and is neutral (0.3) for every agent
 //      until an own-review flow exists; that flow feeds both
 //      RATING_MARKUP_SOURCES_ALLOWED and trust-score-service.ts.
+//   7. Producer pages list products; Google's product rich results only
+//      support pages that focus on a single product, and merchant listings
+//      only pages where a shopper can purchase. No Product node on
+//      /produsent/:slug (PRODUCER_PAGE_PRODUCT_NODES, S6 del B): a priced
+//      product is an Offer from the farm with its name and real price, an
+//      unpriced one a name-only Thing in the catalog. With no product item
+//      on the page, Search Console has nothing to ask an image, rating,
+//      review, return or shipping terms for, which the platform cannot
+//      truthfully give (rules 1 to 3; no code writes product images).
 //
 // The page tests check the same rules against the rendered RFB, Opplevagent
 // and dental JSON-LD (tests/helpers/jsonld-invariants.ts).
@@ -152,4 +161,28 @@ export function formatRatingDisplay(
   const key = input.count === 1 ? "producer.rating_count_on_source_one" : "producer.rating_count_on_source";
   const attribution = t(lang, key, { count: input.count, source });
   return { score, attribution, text: `★ ${score} · ${attribution}` };
+}
+
+/**
+ * Whether /produsent/:slug (and /en/) wraps each priced product in a Product
+ * node (rule 7). false since S6 del B: Daniel's yes 2026-10-18
+ * (daniel-responses/2026-10-18-live-svar-9-18-19.md), after the Search
+ * Console export showed 0 valid product items and 0 impressions from
+ * 2026-07-20 to 2026-10-17. The page then gives makesOffer
+ * {"@type":"Offer", name, price, priceCurrency} per priced product. true is
+ * the rollback: the Product form with brand, seller and InStock as before,
+ * with the names and prices of S6 del A.
+ */
+export const PRODUCER_PAGE_PRODUCT_NODES: boolean = false;
+
+let producerPageProductNodesForTesting: boolean | null = null;
+
+/** What the producer page reads: PRODUCER_PAGE_PRODUCT_NODES, or the test override. */
+export function producerPageProductNodes(): boolean {
+  return producerPageProductNodesForTesting ?? PRODUCER_PAGE_PRODUCT_NODES;
+}
+
+/** Test-only: render as if PRODUCER_PAGE_PRODUCT_NODES were `v`; null restores it. */
+export function __setProducerPageProductNodesForTesting(v: boolean | null): void {
+  producerPageProductNodesForTesting = v;
 }

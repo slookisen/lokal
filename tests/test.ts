@@ -43047,7 +43047,9 @@ runSerial(async () => {
 // seasonality and the list fields by type — no "[object Object]" or
 // "undefined", no 500 — and the producer page's inline-script agentId goes
 // through serializeJsonForScript(). Well-formed data renders as on main
-// (goldens from main). Own in-memory DB (restored in finally), runSerial.
+// (goldens from main; makesOffer as on main in S6 del B's rollback mode).
+// Own in-memory DB and the policy module's test-only Product-node switch
+// (both restored in finally), runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-G seo.ts (wrong-typed knowledge fields + inline-script JSON) ──");
   try {
@@ -48017,7 +48019,10 @@ runSerial(async () => {
 // jsonLd.makesOffer builder no longer drops products without a parseable
 // numeric price — every named product gets an Offer, `price` is included
 // only when a real numeric price was found. Own in-memory DB — tail
-// position, not load-bearing.
+// position, not load-bearing. Since dev-request
+// 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt S6
+// del B it also flips the policy module's test-only Product-node switch
+// (restored in finally).
 runSerial(async () => {
   console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B1: makesOffer price optional ──");
   try {
@@ -48740,10 +48745,12 @@ runSerial(async () => {
 
 // Same dev-request, S1: rendered JSON-LD on RFB /produsent/:slug (Google
 // rating 4.6/236 and 4.6/NULL, priced + unpriced product) has 0
-// aggregateRating/review/hasMerchantReturnPolicy/shippingDetails and keeps
-// Product price/brand; the shared forbiddenNodes check also runs on
-// Opplevagent and finn-tannlege pages. Pins its own in-memory DB and the
-// experiences/dental db-factory paths (restored in finally) — runSerial, tail.
+// aggregateRating/review/hasMerchantReturnPolicy/shippingDetails, and (S6
+// del B) the priced product is an Offer without a Product node (the Product
+// with price/brand only in rollback mode); the shared forbiddenNodes check
+// also runs on Opplevagent and finn-tannlege pages. Pins its own in-memory
+// DB, the experiences/dental db-factory paths and the policy module's
+// test-only Product-node switch (restored in finally) — runSerial, tail.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-16 S1: JSON-LD without third-party rating (RFB/OA/dental) ──");
   try {

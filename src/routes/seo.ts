@@ -58,8 +58,9 @@ import { normalizeBmEventTime } from "../utils/bm-event-time";
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
 import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
-// rating markup, Offer return/shipping terms and the visible rating text.
-import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay } from "../services/structured-data-policy";
+// rating markup, Offer return/shipping terms, the visible rating text and
+// whether the producer page has Product nodes (S6 del B).
+import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay, producerPageProductNodes } from "../services/structured-data-policy";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
@@ -6055,7 +6056,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         }).join("")
       : "";
 
-    // Products as makesOffer — Google requires price + priceCurrency in every Offer
+    // Products as makesOffer — Google requires price + priceCurrency in every
+    // Offer. Since S6 del B a priced product is a plain Offer from the farm
+    // (name, price, priceCurrency), not a Product: structured-data-policy.ts
+    // rule 7.
     if (productsList.length) {
       const unpricedItems: any[] = [];
       const pricedOffers = productsList.slice(0, 20).map((p: any) => {
@@ -6085,6 +6089,17 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           return null;
         }
 
+        // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+        // (S6 del B): no Product node on a producer page (policy rule 7). The
+        // Offer sits in the farm's own makesOffer, so it needs no seller; it
+        // claims no stock status (no product data holds one), brand or
+        // description.
+        if (!producerPageProductNodes()) {
+          return { "@type": "Offer", "name": productName, "price": priceNum, "priceCurrency": "NOK" };
+        }
+
+        // Rollback mode only (PRODUCER_PAGE_PRODUCT_NODES = true): the Product
+        // form as before S6 del B, with del A's names and prices.
         const product: any = {
           "@type": "Product",
           "name": productName,
