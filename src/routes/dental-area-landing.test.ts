@@ -315,6 +315,19 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       assertTrue(introOf(evil.text).includes("&lt;i&gt;") && introOf(evil.text).includes("&amp;co"), "D7: the intro shows the name escaped");
       assertTrue(/&lt;i&gt;/.test(main.slice(main.indexOf("landing-faq"))), "D8: and so does the FAQ");
       assertTrue(faqPages(evil.text).length === 1 && !/<\/script>.*<i>/s.test(evil.text.replace(/<script type="application\/ld\+json">.*?<\/script>/gs, "")), "D9: the FAQPage is script-safe (parses) and no markup leaks outside it");
+
+      // One clinic with an akutt claim is «1 klinikk», in the visible FAQ and in FAQPage alike.
+      const one = areaFacts.buildDentalAreaLanding(
+        { total: 5, verified: 1, helfo_true: 2, acute_sourced: 1, specialist_clinics: 0, max_updated_at: null },
+        { name: "Testby", url: `${base}/sted/testby` }
+      );
+      const akuttAnswer = (one.faqJsonLd?.mainEntity as any[] | undefined)?.find((e) => /akutt/i.test(e.name))?.acceptedAnswer.text ?? "";
+      assertTrue(akuttAnswer.startsWith("1 klinikk oppgir akutt-tilbud med kilde.") && one.faqHtml.includes("1 klinikk oppgir akutt-tilbud med kilde."), `D10: one akutt clinic is «1 klinikk» (got «${akuttAnswer.slice(0, 45)}»)`);
+      const many = areaFacts.buildDentalAreaLanding(
+        { total: 5, verified: 1, helfo_true: 2, acute_sourced: 2, specialist_clinics: 0, max_updated_at: null },
+        { name: "Testby", url: `${base}/sted/testby` }
+      );
+      assertTrue(many.faqHtml.includes("2 klinikker oppgir akutt-tilbud med kilde."), "D11: two are «2 klinikker»");
     }
 
     // ── E. indexing, decision 7=A ────────────────────────────────────────

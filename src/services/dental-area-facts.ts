@@ -252,7 +252,7 @@ export function buildDentalAreaLanding(
   if (counts.acute_sourced > 0) {
     qas.push({
       q: `Finnes det akutt tannlegehjelp i ${name}?`,
-      a: `${nb(counts.acute_sourced)} klinikker oppgir akutt-tilbud med kilde. Ring klinikken først og spør om de kan ta deg imot. Ved akutt sykdom eller skade utenfor åpningstid kan du ringe legevakten på 116 117.`,
+      a: `${nb(counts.acute_sourced)} ${counts.acute_sourced === 1 ? "klinikk" : "klinikker"} oppgir akutt-tilbud med kilde. Ring klinikken først og spør om de kan ta deg imot. Ved akutt sykdom eller skade utenfor åpningstid kan du ringe legevakten på 116 117.`,
     });
   }
   if (counts.specialist_clinics > 0) {
