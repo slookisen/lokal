@@ -363,7 +363,7 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       assertEq(
         [p.filter, p.count, p.tolkning?.tolket_som],
         [{ natural: { parsed: TROMSO, legacy: { fylke: "Troms" } } }, 8, ["sted: Tromsø (poststed + kommune)"]],
-        "S14: an old reading without name words (A2A read fylke Troms) is kept in full, so nothing it found is lost; tolkning shows the parsed place"
+        "S14: an old reading without name words (here a stub fylke; since D3c2 A2A's own reading of «Tromsø» is q «tromsø») is kept in full, so nothing it found is lost; tolkning shows the parsed place"
       );
     }
     {

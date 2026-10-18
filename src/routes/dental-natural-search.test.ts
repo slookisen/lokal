@@ -18,7 +18,10 @@
  *   A   A2A message/send: the four agent-card examples find clinics;
  *       metadata.filter/tolkning; parseIntent still exported (pr113-03);
  *       total (D3c): every clinic found, as MCP counts it, next to count
- *       (the clinics in the answer); parseIntent typed as the store filter.
+ *       (the clinics in the answer); parseIntent typed as the store filter;
+ *       the keyword parser takes a fylke only as whole words (D3c2,
+ *       dev-request 2026-10-17-dental-d3-rettelser): «Tromsø» is no longer
+ *       fylke Troms, «Nord-Troms» still is.
  *   G   the gazetteer cache runs listPoststeder(1) once per TTL for all three.
  *   T   /sok answers well under the 1 s stall limit on a 3,000-row fixture.
  *
@@ -136,7 +139,7 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
     add({ navn: "Trondheim Regulering", poststed: "TRONDHEIM", fylke: "Trøndelag", postnummer: "7010" }, kjeveTitle("Kjeveortoped"));
     const tromsoNamed = add({ navn: "Tannregulering Tromsø", poststed: "TROMSØ", fylke: "Troms", postnummer: "9008" });
     const tromsoKjeve = add({ navn: "Tromsø Kjeveortopedi", poststed: "TROMSØ", fylke: "Troms", postnummer: "9010", available_specialties: ["kjeveortopedi"] });
-    add({ navn: "Harstad Tann", poststed: "HARSTAD", fylke: "Troms", postnummer: "9405" });
+    const harstad = add({ navn: "Harstad Tann", poststed: "HARSTAD", fylke: "Troms", postnummer: "9405" });
     add({ navn: "Bodø Tannregulering", poststed: "BODØ", fylke: "Nordland", postnummer: "8006" });
     const aas = add({ navn: "Ås Tannhelse", poststed: "ÅS", fylke: "Akershus", postnummer: "1430" });
     const total = 23;
@@ -295,10 +298,14 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
         if (Object.keys(before.metadata.filter).length === 0) continue;
         assertTrue(keeps(before.ids, ask(q).ids), `U4: A2A «${label(q)}»: every old hit is still found, first`);
       }
-      assertEq(old("tannlege i Tromsø").metadata.filter, { fylke: "Troms" }, "U5: (the old A2A parser read «Tromsø» as fylke Troms)");
+      // D3c2: the old A2A parser read «Tromsø» as fylke Troms («troms» is a
+      // substring of «tromsø»). It now takes a fylke only when its words stand
+      // whole in the text, so «Tromsø» is its q, and the whole of Troms
+      // (Harstad here) is no longer added to a Tromsø answer.
+      assertEq(old("tannlege i Tromsø").metadata.filter, { q: "tromsø" }, "U5: the old A2A parser reads «Tromsø» as q «tromsø», no longer as fylke Troms (D3c2: a fylke only as whole words)");
       {
         const now = ask("tannlege i Tromsø");
-        assertTrue(now.ids.includes(tromsoNamed) && now.ids.includes(tromsoKjeve) && now.ids.length === 3, "U6: A2A «tannlege i Tromsø» still finds all it found (Troms, Harstad too)");
+        assertEq([...now.ids].sort(), [tromsoNamed, tromsoKjeve].sort(), "U6: A2A «tannlege i Tromsø» finds Tromsø's clinics and not Harstad, elsewhere in Troms (D3c2: the old reading no longer adds the whole fylke)");
         assertEq(now.metadata.tolkning.tolket_som, ["sted: Tromsø (poststed + kommune)"], "U6b: ... and tolkning says the text reads as Tromsø");
       }
       assertEq([old("tannlege i Ås").metadata.filter, old("tannlege i Ås").ids.length], [{}, 20], "U7: the old A2A parser had no filter for «tannlege i Ås» (two-letter words dropped): the first 20 clinics");
@@ -430,6 +437,69 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
       } finally {
         delete process.env.DENTAL_QUERY_PARSER_DISABLED;
       }
+    }
+    {
+      // D3c2: the keyword parser (the rollback path, and the old reading A2A
+      // keeps next to the parsed one) takes a fylke only when its words stand
+      // whole in the text. «troms» inside «Tromsø», «Tromso» or «Tromsdalen»
+      // made all of Troms an answer to a Tromsø question; those words are now
+      // the q they are. (A \b regex would still match: JS's \b doesn't count
+      // ø as a word character; a word-prefix match would still take «Tromsdalen».)
+      process.env.DENTAL_QUERY_PARSER_DISABLED = "1";
+      try {
+        for (const [text, q] of [["tannlege i Tromsø", "tromsø"], ["tannlege i Tromso", "tromso"], ["tannlege i Tromsdalen", "tromsdalen"]]) {
+          assertEq(a2a.parseIntent(text), { q }, `A17: switched off, «${text}» has no fylke (Troms) but q «${q}»`);
+        }
+        const kept: Array<[text: string, fylke: string]> = [
+          ["Troms", "Troms"], ["Troms og Finnmark", "Troms"], ["Nord-Troms", "Troms"], ["Vest-Agder tannlege", "Agder"],
+          ["kjeveortoped møre og romsdal", "Møre og romsdal"], ["finn tannlege i Vestland", "Vestland"], ["tannlege i Oslo.", "Oslo"],
+        ];
+        for (const [text, fylke] of kept) {
+          assertEq(a2a.parseIntent(text).fylke, fylke, `A17b: switched off, «${text}» still reads fylke ${fylke} (its words stand whole, hyphen and full stop split)`);
+        }
+        // The accepted cost (dev-request risk): a fylke name inside a longer
+        // word is no fylke for the old reading; the word goes to q instead.
+        for (const [text, q] of [["tannlege Vestlands", "vestlands"], ["Rogalandsklinikken", "rogalandsklinikken"]]) {
+          assertEq(a2a.parseIntent(text), { q }, `A17c: switched off, «${text}» (genitive / compound) is q «${q}», not a fylke`);
+        }
+      } finally {
+        delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+      }
+    }
+    {
+      // D3c2: a TROMSDALEN clinic (9020, in Tromsø kommune). Before, A2A read
+      // «Tromsdalen» as fylke Troms and answered with Harstad and the Tromsø
+      // clinics too; now its old reading is q «tromsdalen», as MCP finds it.
+      const tromsdalen = add({ navn: "Tromsdalen Tannklinikk", poststed: "TROMSDALEN", fylke: "Troms", postnummer: "9020" });
+      gaz.__resetDentalSearchGazetteerForTesting();
+      const answer = (text: string) => {
+        const resp = a2a.handleDentalMessageSend({ message: { text } }, "a2a-d3c2") as any;
+        const data = resp.result.artifacts[1].parts[0].data;
+        return { ids: (data.clinics as any[]).map((c) => c.id).sort() as string[], total: data.total, metadata: resp.result.metadata };
+      };
+      const dalen = answer("tannlege i Tromsdalen");
+      assertEq(
+        [dalen.ids, dalen.metadata.filter.natural?.legacy],
+        [[tromsdalen], { q: "tromsdalen" }],
+        "A18: A2A «tannlege i Tromsdalen» -> only the Tromsdalen clinic (not Harstad or Tromsø); its old reading is q «tromsdalen»"
+      );
+      assertEq(dalen.total, (await search({ query: "tannlege i Tromsdalen" })).count, "A18b: ... total = MCP tannlege_search count for the same text");
+      const tromso = [tromsoNamed, tromsoKjeve, tromsdalen].sort();
+      for (const [text, q, shown] of [["tannlege i Tromsø", "tromsø", "Tromsø"], ["tannlege i Tromso", "tromso", "Tromso"]]) {
+        const r = answer(text);
+        assertEq(
+          [r.ids, r.metadata.filter.natural?.legacy, r.metadata.tolkning?.tolket_som],
+          [tromso, { q }, [`sted: ${shown} (poststed + kommune)`]],
+          `A18c: A2A «${text}» -> Tromsø kommune (Tromsdalen too), not Harstad; old reading q «${q}»; tolket_som as before`
+        );
+      }
+      const troms = answer("tannlege i Troms");
+      assertEq(
+        [troms.metadata.filter.natural?.legacy, troms.metadata.filter.natural?.parsed?.fylke],
+        [{ fylke: "Troms" }, "Troms"],
+        "A18d: negative: «tannlege i Troms» still reads fylke Troms, in the old reading and the parsed one"
+      );
+      assertEq(troms.ids, [...tromso, harstad].sort(), "A18e: ... and finds every clinic in Troms, Harstad too");
     }
 
     // ── G: one listPoststeder(1) per TTL ──────────────────────────────────
