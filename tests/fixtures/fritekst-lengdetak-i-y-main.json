@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging)",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance)",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -810,24 +810,24 @@
     },
     "dental GET /api/tannlege/agents": {
       "Bergen": {
-        "sha256": "76bdd0d3d3d09f0d2d0328a20d910c6ab5d7db4316a70bf3dd40df59951a6a67",
-        "chars": 2013
+        "sha256": "1e7a079f2073d597c9ade487a2a23294e4bb61ef5a242e54ea237a3a5c780017",
+        "chars": 1965
       },
       "BERGEN": {
-        "sha256": "76bdd0d3d3d09f0d2d0328a20d910c6ab5d7db4316a70bf3dd40df59951a6a67",
-        "chars": 2013
+        "sha256": "1e7a079f2073d597c9ade487a2a23294e4bb61ef5a242e54ea237a3a5c780017",
+        "chars": 1965
       },
       "Oslo Sentrum Tann": {
-        "sha256": "9c069506b19ad7a3b828ed14e53d0f84a3be2cf7019f2703254a566e799db11b",
-        "chars": 1026
+        "sha256": "4fcdde40fc95eca300d976ca17f58873e066f740ac237c9528ad72a6702c98ed",
+        "chars": 1002
       },
       "majorstua": {
-        "sha256": "944bf2b28587e7ab9fd87dc5f73b8d849a4195f39d5d4722bc70b18cfc783101",
-        "chars": 1013
+        "sha256": "20c2c4b3b898cc0a8731cfd1a5b6e2eb142285da048e16da7e4d2e387467d87f",
+        "chars": 989
       },
       "Stavanger Tann": {
-        "sha256": "ed9ca80c536af71c790aba4caf25b4239cc302e76c2877d0181102e5cef9f4c5",
-        "chars": 1025
+        "sha256": "b96951cbe895cb642af3d6d2998f632ba045ceb62bf9ec128ef0a3964911e45b",
+        "chars": 1001
       },
       "zzzqqx": {
         "sha256": "7cda35006027c8c9b0d20738b5a8f188e903993ad2bacbace1b557434ca40ab7",

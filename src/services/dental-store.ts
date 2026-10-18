@@ -44,6 +44,10 @@ import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-searc
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
 import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A4-D): the sitemap's thin-profile check reads the values the
+// clinic page shows. dental-places-display.ts imports only types from here.
+import { shownDentalAgent } from "./dental-places-display";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -306,10 +310,18 @@ function stringifyJsonOrNull(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
+// A hydrated clinic row: the schema's fields, its id, and one read-only side
+// column. dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+// places-treffvakt (A4-D): stage_v_pending_correction (recordStageVFieldObservation
+// below) is read by the public display rule (dental-places-display.ts), which
+// does not show opening hours Stage V has a pending correction for. It is not
+// on DentalAgentSchema, so no PUT body carries it, and the public answers
+// that spread a row (REST in routes/dental.ts, A2A in dental-clinic-card.ts)
+// leave it out.
+export type DentalAgentRow = DentalAgent & { id: string; stage_v_pending_correction?: unknown };
+
 // Hydrate raw SQLite row into a typed DentalAgent (parses JSON cols).
-function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
-  id: string;
-} {
+function hydrateAgent(row: Record<string, unknown>): DentalAgentRow {
   return {
     id: row.id as string,
     org_nr: (row.org_nr as string | null) ?? null,
@@ -382,6 +394,9 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     online_booking_url: (row.online_booking_url as string | null) ?? null,
     social_media: parseJsonOrNull(row.social_media) as DentalAgent["social_media"],
     treatments_subtypes: parseJsonOrNull(row.treatments_subtypes) as DentalAgent["treatments_subtypes"],
+
+    // ─── A4-D: read-only side column (see DentalAgentRow) ──────────────
+    stage_v_pending_correction: parseJsonOrNull(row.stage_v_pending_correction),
   };
 }
 
@@ -457,7 +472,7 @@ export function createDentalAgent(input: DentalAgent): string {
 
 export function getDentalAgentByOrgnr(
   orgnr: string
-): (DentalAgent & { id: string }) | null {
+): DentalAgentRow | null {
   const db = getDb("dental");
   const row = db
     .prepare("SELECT * FROM dental_agents WHERE org_nr = ?")
@@ -467,7 +482,7 @@ export function getDentalAgentByOrgnr(
 
 export function getDentalAgentById(
   id: string
-): (DentalAgent & { id: string }) | null {
+): DentalAgentRow | null {
   const db = getDb("dental");
   const row = db
     .prepare("SELECT * FROM dental_agents WHERE id = ?")
@@ -1406,7 +1421,7 @@ export function listDentalAgents(
   // agents, an admin/enrichment listing, not one of slice 1b's named public
   // surfaces) stays byte-identical.
   opts: { excludeParked?: boolean; excludeNonClinic?: boolean } = {}
-): Array<DentalAgent & { id: string }> {
+): DentalAgentRow[] {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
   const { where, params, orderFirst } = buildDentalWhere(parsed, opts);
@@ -1494,7 +1509,7 @@ export function listPublicDentalAgents(
   filter: ListFilter = {},
   limit = 50,
   offset = 0
-): Array<DentalAgent & { id: string }> {
+): DentalAgentRow[] {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
   // Same publicOnly WHERE as countPublicDentalAgents(), so the count and the
@@ -2419,7 +2434,7 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
 export function listRelatedClinics(
   agent: DentalAgent & { id: string },
   limit = 6
-): Array<DentalAgent & { id: string }> {
+): DentalAgentRow[] {
   if (!agent.poststed) return [];
   const db = getDb("dental");
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5a): same
@@ -2505,8 +2520,15 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
   // for its noindex+CTA) is placeholder-quality and must not be indexed —
   // exclude it from the sitemap entirely rather than submitting a page we
   // ourselves mark noindex.
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the page judges thinness on the values it shows
+  // (shownDentalAgent), so a clinic whose address, phone, website and hours
+  // are all hidden by the Places display rule is noindex there and left out
+  // here. The SQL keeps the cheap filter on the stored columns (a row thin on
+  // stored values is thin on shown ones); the rule runs on the rest.
   const rows = db.prepare(`
-    SELECT org_nr, navn, updated_at
+    SELECT org_nr, navn, updated_at,
+           adresse, telefon, mobil, hjemmeside, opening_hours, field_provenance, stage_v_pending_correction
     FROM dental_agents
     WHERE verification_status != 'rejected'
       AND org_nr IS NOT NULL AND org_nr != ''
@@ -2515,8 +2537,25 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
       AND NOT ${DENTAL_THIN_PROFILE_SQL}
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     ORDER BY navn ASC
-  `).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
-  return rows;
+  `).all() as Array<
+    { org_nr: string; navn: string; updated_at: string | null } &
+      Record<"adresse" | "telefon" | "mobil" | "hjemmeside" | "opening_hours" | "field_provenance" | "stage_v_pending_correction", string | null>
+  >;
+  return rows
+    .filter((r) =>
+      !isThinDentalProfile(
+        shownDentalAgent({
+          adresse: r.adresse,
+          telefon: r.telefon,
+          mobil: r.mobil,
+          hjemmeside: r.hjemmeside,
+          opening_hours: parseJsonOrNull(r.opening_hours) as DentalAgent["opening_hours"],
+          field_provenance: parseJsonOrNull(r.field_provenance) as DentalAgent["field_provenance"],
+          stage_v_pending_correction: r.stage_v_pending_correction,
+        })
+      )
+    )
+    .map(({ org_nr, navn, updated_at }) => ({ org_nr, navn, updated_at }));
 }
 
 // ─── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S2) ───────────

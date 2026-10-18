@@ -39,7 +39,10 @@ import {
   recordStageVFieldObservation,
   type StageVField,
   DENTAL_AGENT_WRITABLE_FIELDS,
+  type DentalAgentRow,
 } from "../services/dental-store";
+import { shownDentalAgent, shownDentalFieldProvenance } from "../services/dental-places-display";
+import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS, isDentalSyntheticProbeId } from "../services/dental-contamination";
@@ -81,6 +84,14 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   next();
 }
 
+// The same key check as the admin guard above, without the 403: the two
+// public GETs below answer every caller and only choose the view (A4-D).
+function hasAdminKey(req: Request): boolean {
+  const expected = getAdminKey();
+  const provided = (req.headers["x-admin-key"] as string) || "";
+  return !!expected && !!provided && provided === expected;
+}
+
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt, S4-A1b: the two public REST answers below leave out the stored
 // Google rating (rating, rating_count, rating_source; PR-130, written only
@@ -93,6 +104,44 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 ): Omit<T, "rating" | "rating_count" | "rating_source"> {
   const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...rest } = agent;
   return rest;
+}
+
+// Same dev-request, slice A4-D: a public answer shows the clinic as its page
+// does (shownDentalAgent: an address, phone, website or opening hours that
+// only Google Places gives, or that is marked wrong, is null) and leaves out
+// field_provenance, which holds the Places values themselves. With a valid
+// X-Admin-Key the answer is as before, stored values and field_provenance:
+// the enrichment routine reads them back to decide what to write. With the
+// rule switched off (PLACES_DISPLAY_POLICY_ENABLED) every caller gets that
+// answer. Stage V's pending map (a read-only side column) is in neither.
+function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
+  const publicView = !adminView && placesDisplayPolicyEnabled();
+  const { stage_v_pending_correction: _pending, ...row } = withoutGoogleRating(publicView ? shownDentalAgent(agent) : agent);
+  if (!publicView) return row;
+  const { field_provenance: _provenance, ...shown } = row;
+  return shown;
+}
+
+// The field_provenance the provenance summary on /agents/:id is built from:
+// in a public answer without the entries of the fields the rule hides, so the
+// summary names only the sources behind the values the answer shows (never
+// google_places for a hidden one). Admin view and rule off: as stored.
+function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
+  return !adminView && placesDisplayPolicyEnabled() ? shownDentalFieldProvenance(agent) : agent.field_provenance;
+}
+
+// Whether a REST caller gets the admin view. While the rule is on, the two
+// answers depend on X-Admin-Key, so no shared cache may keep one caller's
+// view for another: Cache-Control: private and Vary: X-Admin-Key (the A4-S
+// contract in the dev-request; res.vary keeps the Vary: Origin of the CORS
+// layer). With the rule off every caller gets the same answer and the
+// headers are as before.
+function restAdminView(req: Request, res: Response): boolean {
+  if (placesDisplayPolicyEnabled()) {
+    res.vary("X-Admin-Key");
+    res.set("Cache-Control", "private");
+  }
+  return hasAdminKey(req);
 }
 
 // ─── GET /api/tannlege/agents — list with filters ───────────────────
@@ -162,11 +211,15 @@ router.get("/agents", (req: Request, res: Response) => {
     // consecutive homepage-fetch failures (30d backoff) — the enrichment
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
-    const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((a) => ({
-      ...withoutGoogleRating(a),
-      telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
-      mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
-    }));
+    const adminView = restAdminView(req, res);
+    const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((stored) => {
+      const a = restDentalAgent(stored, adminView);
+      return {
+        ...a,
+        telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
+        mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
+      };
+    });
     res.json({ count: agents.length, agents });
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -205,16 +258,18 @@ router.get("/agents/:id", (req: Request, res: Response) => {
   const verifiedRow = getDb("dental")
     .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
     .get(agent.id) as { last_verified_at: string | null } | undefined;
+  const adminView = restAdminView(req, res);
   const provenance = buildProvenanceSummary(
-    (agent.field_provenance as Record<string, unknown> | null) ?? null,
+    (restSummaryProvenance(agent, adminView) as Record<string, unknown> | null) ?? null,
     verifiedRow?.last_verified_at ?? null
   );
 
+  const shown = restDentalAgent(agent, adminView);
   res.json({
     agent: {
-      ...withoutGoogleRating(agent),
-      telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
-      mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
+      ...shown,
+      telefon: isDisplayablePhone(shown.telefon) ? shown.telefon : null,
+      mobil: isDisplayablePhone(shown.mobil) ? shown.mobil : null,
       ...(provenance ? { provenance } : {}),
     },
   });

@@ -40,6 +40,7 @@ function callRoute(router: any, path: string, query: Record<string, string> = {}
       setHeader() { return this; },
       header() { return this; },
       set() { return this; },
+      vary() { return this; },
       once() { return this; },
       send(payload: any) { resolve({ status: this.statusCode, text: String(payload ?? ""), body: payload }); return this; },
       json(payload: any) { resolve({ status: this.statusCode, text: JSON.stringify(payload), body: payload }); return this; },
