@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: no (3 open). See the prerequisites in ../README.md.
+Before you start: Ready to submit: no (1 open). See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -112,7 +112,7 @@ Seven acknowledgments, all required. Our basis for each:
 | AI media generation | None: the connector generates no images, video or audio. |
 | Prompt injection | Tool descriptions say what each tool does and do not instruct Claude (checked against the directive patterns in scripts/gen-connector-packs.ts). |
 | Conversation data collection | The tools take only the arguments they need. The server never asks for chat history, memory or files. |
-| Public documentation | **Not yet.** None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date. |
+| Public documentation | https://finn-tannlege.com/guide-tannlege-ai |
 
 ## 10. Review and submit
 

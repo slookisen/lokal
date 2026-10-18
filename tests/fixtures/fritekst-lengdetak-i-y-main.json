@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance)",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai)",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -780,32 +780,32 @@
     },
     "dental GET /sok": {
       "912345678": {
-        "sha256": "0f48713ac6e1517b5aef96c164f8046fdf01f3597a7aa9ac813bfa0a4148fc67",
-        "chars": 19849
+        "sha256": "6d9005cde226150a02783150ad3668b6448a5e13270abd65e7fe58083763201d",
+        "chars": 20248
       },
       "tannlege i Oslo": {
-        "sha256": "0c9e71dcd97279136ef490d3df4b981441b45980d62efc770fc75fd98d069c58",
-        "chars": 22183
+        "sha256": "897a620669674cacf832b95733146c6f66e9d5cf2805039a3ee3d38a4da7fd6c",
+        "chars": 22582
       },
       "tannlege i Bergen": {
-        "sha256": "87b57884e1581aff358bf3fd96e8052fa7daec667f620241af7687e40c6c9f44",
-        "chars": 22313
+        "sha256": "13b5b58d5e8d54baf81529ade9cb6645a9896891fae176c00616a5196a4c76ec",
+        "chars": 22712
       },
       "kjeveortoped Bergen": {
-        "sha256": "8997271b552165ab9ce968f265fccd621804555ba20adf5c1fc3911fa28d92a5",
-        "chars": 21105
+        "sha256": "07fd16702ae579d3fbff77ecc8fc80edb0b70886ddefbe0228c82d56bac87947",
+        "chars": 21504
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "e9bf1b174a4753be7cdf56279413a484270d272f3bebbb758cc6689bc57d6ae0",
-        "chars": 19928
+        "sha256": "29f69d2043ceac294c1888db2133331fed89473b4f12340d93ce05b08b381a7e",
+        "chars": 20327
       },
       "tannlege 0150 Oslo": {
-        "sha256": "16825cf10079a9aa2771e36165d3610a54cc82f17a68cf6f598698ee71b9dda8",
-        "chars": 19913
+        "sha256": "45b0f0575eb59df146e3cf5ae0b2f0e7bb211f3ca041cb20cd7fecba8ece6cdc",
+        "chars": 20312
       },
       "ring 22 33 44 55": {
-        "sha256": "8e9a64b3b6a1ed6c690d610ba9a5b44733306c7d3af7b42e8b57fb8e6157ce09",
-        "chars": 19895
+        "sha256": "88fca8daf23793a1320bc0c7af73fa299f3e83baac3f217432b0ee343ef15f5b",
+        "chars": 20294
       }
     },
     "dental GET /api/tannlege/agents": {

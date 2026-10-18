@@ -40,8 +40,9 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { buildRobotsGroups } from "../services/robots-policy";
-import { registeredMcpCapabilities, registeredMcpTools } from "../services/mcp-tool-manifest";
+import { registeredMcpCapabilities, registeredMcpTools, type McpToolEntry } from "../services/mcp-tool-manifest";
 import { generalLimiter } from "../middleware/security";
+import { servePublicFile } from "./public-file";
 // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b/5d): reuse
 // the existing pure classifiers rather than reinventing name-word / host
 // checks. DENTAL_NAME_WORDS is the SAME "does this name read as a dental
@@ -78,6 +79,7 @@ import {
   companyFooterLineHtml,
   parentOrganizationJsonLd,
   toSiteLang,
+  type SiteLang,
 } from "../services/company-legal";
 // A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8,
 // Daniel's decision 4=A): the sentence that sets Finn-tannlege.com apart from
@@ -114,6 +116,19 @@ export function canonicalFylker(perFylke: Array<{ fylke: string; count: number }
 // ─── Brand / Logo constants (PR-112) ────────────────────────
 // Tooth SVG path — reused in nav logo, favicon, and future assets.
 const TOOTH_PATH = "M18 0 C8 0 2 7 2 16 C2 23 5 26 6 32 C7 39 9 46 12 46 C15 46 14 36 18 36 C22 36 21 46 24 46 C27 46 29 39 30 32 C31 26 34 23 34 16 C34 7 28 0 18 0 Z";
+
+// ─── PNG icons (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S4)
+// Square raster copies of the «Søket» mark (dentalMarkSvg(), served as
+// /favicon.svg): the share image, the Organization logo and ai-plugin.json's
+// logo_url use the 512, since most share scrapers show no SVG; the 192 and
+// the 180 are for browsers and home screens. The files are in src/public and
+// are served by the routes next to /favicon.svg.
+export const DENTAL_ICONS = {
+  png192: { path: "/favicon-192.png", file: "dental-favicon-192.png", size: 192 },
+  png512: { path: "/favicon-512.png", file: "dental-favicon-512.png", size: 512 },
+  appleTouch: { path: "/apple-touch-icon.png", file: "dental-apple-touch-icon-180.png", size: 180 },
+} as const;
+const DENTAL_LOGO_PNG_URL = `${DENTAL_BASE_URL}${DENTAL_ICONS.png512.path}`;
 
 // ─── Specialty pages (PR-112) ────────────────────────────────
 // 7 godkjente tannlegespesialiteter i Norge (Helsedirektoratets liste).
@@ -800,8 +815,12 @@ a:hover{text-decoration:underline}
 
 // ─── Shared nav / footer ─────────────────────────────────────
 
-function dentalNav(): string {
-  return `<nav class="nav" role="navigation" aria-label="Hovednavigasjon">
+// The nav and the footer are Norwegian on every page. On an English page
+// (pageLang "en", G3-S4) they say so with lang="nb".
+const chromeLangAttr = (pageLang: SiteLang): string => (pageLang === "en" ? ' lang="nb"' : "");
+
+function dentalNav(pageLang: SiteLang = "nb"): string {
+  return `<nav class="nav" role="navigation" aria-label="Hovednavigasjon"${chromeLangAttr(pageLang)}>
   <a href="/" class="nav-logo"><svg width="26" height="26" viewBox="0 0 72 72" aria-hidden="true"><circle cx="30" cy="30" r="24" fill="none" stroke="#0F766E" stroke-width="7"/><line x1="48" y1="48" x2="64" y2="64" stroke="#0F766E" stroke-width="9" stroke-linecap="round"/><g transform="translate(16,11) scale(0.78)"><path d="${TOOTH_PATH}" fill="#0F766E"/></g></svg> Finn-tannlege</a>
   <div class="nav-links">
     <a href="/sok">Søk</a>
@@ -813,8 +832,8 @@ function dentalNav(): string {
 </nav>`;
 }
 
-function dentalFooter(): string {
-  return `<footer class="footer" role="contentinfo">
+function dentalFooter(pageLang: SiteLang = "nb"): string {
+  return `<footer class="footer" role="contentinfo"${chromeLangAttr(pageLang)}>
   <div class="footer-inner">
     <div class="footer-col">
       <h4>Tjeneste</h4>
@@ -833,6 +852,7 @@ function dentalFooter(): string {
     <div class="footer-col">
       <h4>For agenter</h4>
       <a href="/llms.txt">llms.txt</a>
+      <a href="/guide-tannlege-ai">AI-assistenter (MCP)</a>
       <a href="/api/tannlege/agents">/api/tannlege</a>
       <a href="https://rettfrabonden.com" rel="noopener" target="_blank">Søsterplattform: rettfrabonden.com</a>
     </div>
@@ -863,9 +883,16 @@ interface ShellOptions {
   // "noindex,follow" — still crawled (follow) so its outbound links keep
   // being discovered, just not itself indexed/ranked.
   robots?: string;
+  // G3-S4 (/guide-tannlege-ai): the page's language (default "nb"), and its
+  // language versions for hreflang (nb is also x-default).
+  lang?: SiteLang;
+  alternates?: { nb: string; en: string };
+  // CSS for this page only, after DENTAL_CSS.
+  extraCss?: string;
 }
 
 function dentalShell(content: string, opts: ShellOptions): string {
+  const lang = opts.lang ?? "nb";
   const desc = opts.description || "Finn riktig tannlege i Norge. Søk etter klinikk, spesialitet, Helfo-avtale og tannlegevakt.";
   const canonical = opts.canonical === null ? null : opts.canonical || DENTAL_BASE_URL;
   const canonicalLink = canonical ? `\n<link rel="canonical" href="${escapeHtml(canonical)}">` : "";
@@ -877,36 +904,52 @@ function dentalShell(content: string, opts: ShellOptions): string {
   const ldScripts = ldArr
     .map((ld) => jsonLdScriptTag(ld))
     .join("\n");
-  // OG/Twitter share image. SVG favicon is the only platform-owned visual asset
-  // we ship, so it doubles as the default share image (overridable via opts.ogImage).
-  const ogImage = opts.ogImage || `${DENTAL_BASE_URL}/favicon.svg`;
+  // OG/Twitter share image: the 512×512 PNG of the mark (F2-S4). It was the
+  // SVG favicon, which most share scrapers do not show. A page's own image
+  // (opts.ogImage) gets no size tags here.
+  const ogImage = opts.ogImage || DENTAL_LOGO_PNG_URL;
+  const ogImageSize = opts.ogImage
+    ? ""
+    : `\n<meta property="og:image:type" content="image/png">` +
+      `\n<meta property="og:image:width" content="${DENTAL_ICONS.png512.size}">` +
+      `\n<meta property="og:image:height" content="${DENTAL_ICONS.png512.size}">`;
+  const ogImageAlt = lang === "en"
+    ? "Finn-tannlege.com — an independent directory of dentists in Norway"
+    : "Finn-tannlege.com — uavhengig oversikt over tannleger i Norge";
+  const alternates = opts.alternates
+    ? `\n<link rel="alternate" hreflang="nb" href="${escapeHtml(opts.alternates.nb)}">` +
+      `\n<link rel="alternate" hreflang="en" href="${escapeHtml(opts.alternates.en)}">` +
+      `\n<link rel="alternate" hreflang="x-default" href="${escapeHtml(opts.alternates.nb)}">`
+    : "";
   return `<!DOCTYPE html>
-<html lang="nb">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
-<meta name="robots" content="${escapeHtml(robots)}">${canonicalLink}
+<meta name="robots" content="${escapeHtml(robots)}">${canonicalLink}${alternates}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="192x192" href="${DENTAL_ICONS.png192.path}">
+<link rel="apple-touch-icon" sizes="180x180" href="${DENTAL_ICONS.appleTouch.path}">
 <meta property="og:title" content="${escapeHtml(opts.title)}">
 <meta property="og:description" content="${escapeHtml(desc)}">${ogUrlMeta}
 <meta property="og:type" content="website">
-<meta property="og:locale" content="nb_NO">
+<meta property="og:locale" content="${lang === "en" ? "en_US" : "nb_NO"}">
 <meta property="og:site_name" content="Finn-tannlege.com">
-<meta property="og:image" content="${escapeHtml(ogImage)}">
-<meta property="og:image:alt" content="Finn-tannlege.com — uavhengig oversikt over tannleger i Norge">
+<meta property="og:image" content="${escapeHtml(ogImage)}">${ogImageSize}
+<meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${escapeHtml(opts.title)}">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <meta name="twitter:image" content="${escapeHtml(ogImage)}">
 ${ldScripts}
-${DENTAL_CSS}
+${DENTAL_CSS}${opts.extraCss ? `\n<style>${opts.extraCss}</style>` : ""}
 </head>
 <body>
-${dentalNav()}
+${dentalNav(lang)}
 ${content}
-${dentalFooter()}
+${dentalFooter(lang)}
 </body>
 </html>`;
 }
@@ -1152,7 +1195,9 @@ router.get("/", (_req: Request, res: Response) => {
       "@type": "Organization",
       name: "Finn-tannlege",
       url: DENTAL_BASE_URL,
-      logo: DENTAL_BASE_URL + "/favicon.svg",
+      // F2-S4: the 512×512 PNG (was favicon.svg), the file
+      // BRAND_ENTITIES.dental.logoPng names; G3-S1-dental reads it from there.
+      logo: DENTAL_LOGO_PNG_URL,
       // G3-S8; G3-S1-dental moves it into organizationJsonLd("dental").
       ...(FINN_DISAMBIGUATION_NB ? { disambiguatingDescription: FINN_DISAMBIGUATION_NB } : {}),
       // T2: the company that owns and operates finn-tannlege.com.
@@ -2138,6 +2183,13 @@ function buildDentalSitemapXml(): string {
       xml += `\n  ${urlTag(`${DENTAL_BASE_URL}${p === "/" ? "" : p}`, freq, pri, day)}`;
     }
 
+    // The AI guide (G3-S4), Norwegian and English. No <lastmod>: the page
+    // lists the registered MCP tools, so its text changes with them, and no
+    // date in DENTAL_STATIC_PAGE_DATES would stay true.
+    for (const lang of ["nb", "en"] as const) {
+      xml += `\n  ${urlTag(dentalAiGuideUrl(lang), "monthly", "0.6")}`;
+    }
+
     // Specialty pages (PR-112)
     for (const sp of SPECIALTY_PAGES) {
       xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/spesialitet/${sp.slug}`, "weekly", "0.8", lastmods?.forSpecialty(sp.navn))}`;
@@ -2301,6 +2353,7 @@ ChatGPT Custom GPT — Finn tannlege i Norge: https://chatgpt.com/g/g-6a21e79241
 HTTP Streamable MCP:  ${DENTAL_BASE_URL}/mcp
 MCP Server Card:      ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 npm-pakke (stdio):    npx finn-tannlege-mcp
+Oppsettsguide:        ${dentalAiGuideUrl("nb")} (English: ${dentalAiGuideUrl("en")})
 
 Tilgjengelige MCP-tools:
 ${registeredMcpTools("dental").map((t) => `- ${t.name} — ${t.description}`).join("\n")}
@@ -2413,18 +2466,330 @@ hidden — just without the badge. See ${DENTAL_BASE_URL}/proveniens for the ful
 // GET /favicon.svg  (PR-112)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/favicon.svg", (_req: Request, res: Response) => {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
-  <rect width="96" height="96" rx="19.2" fill="#0F766E"/>
+// The «Søket» mark: a tooth in a magnifier, white on teal #0F766E, no text.
+// /favicon.svg serves it with rounded corners. The PNG icons (DENTAL_ICONS,
+// F2-S4) were rasterised once from dentalMarkSvg(0), full-bleed: clients that
+// round an icon (iOS home screens, the Claude directory, Android) crop the
+// square themselves, and a transparent corner shows black on iOS. With
+// ImageMagick and its rsvg delegate (librsvg2-bin), for each icon size N:
+//   DENTAL_DB_PATH=:memory: npx tsx -e 'process.stdout.write(require("./src/routes/dental-seo").dentalMarkSvg(0), () => process.exit(0))' \
+//     | sed 's/viewBox="0 0 96 96"/& width="N" height="N"/' > /tmp/mark-N.svg
+//   convert /tmp/mark-N.svg -strip -define png:color-type=2 -define png:bit-depth=8 src/public/<file>
+// dental-icons.test.ts pins the full-bleed SVG text and each PNG's md5, so a
+// change to the mark fails until the PNGs are rasterised again. Name check
+// (G3-J §6.2): the teal palette stays, never FINN's blue/cyan.
+export function dentalMarkSvg(cornerRadius = 19.2): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <rect width="96" height="96"${cornerRadius ? ` rx="${cornerRadius}"` : ""} fill="#0F766E"/>
   <circle cx="40" cy="40" r="20" fill="none" stroke="#fff" stroke-width="6"/>
   <line x1="54" y1="54" x2="70" y2="70" stroke="#fff" stroke-width="8" stroke-linecap="round"/>
   <g transform="translate(27,18) scale(0.72)">
     <path d="${TOOTH_PATH}" fill="#fff"/>
   </g>
 </svg>`;
+}
+
+router.get("/favicon.svg", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "image/svg+xml");
   res.setHeader("Cache-Control", "public, max-age=86400");
-  res.send(svg);
+  res.send(dentalMarkSvg());
+});
+
+// GET /favicon-192.png, /favicon-512.png, /apple-touch-icon.png (F2-S4). A
+// file missing on disk falls through to the 404 page.
+for (const icon of Object.values(DENTAL_ICONS)) {
+  router.get(icon.path, servePublicFile(icon.file, "image/png"));
+}
+
+// ═══════════════════════════════════════════════════════════
+// GET /guide-tannlege-ai (+ /en/guide-tannlege-ai) — the AI guide
+// ═══════════════════════════════════════════════════════════
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S4.
+//
+// How to use Finn-tannlege from an AI assistant over MCP, in Norwegian and
+// English (langMiddleware strips /en and sets req.lang), on a par with RFB's
+// /guide-mat-ai and Opplevagent's /guide-opplevelser-mcp. It is the page
+// BRAND_ENTITIES.dental.docsUrl names. Read, not typed:
+//   - the tools and the tools FAQ answer: registeredMcpTools("dental"), what
+//     the live /mcp registers, in registration order (dentalMcpGuideTools());
+//   - the example prompts: BRAND_ENTITIES.dental.exampleQueries, the ones the
+//     Claude directory pack gives its reviewers.
+// The remote URL is the /mcp the dental host gate mounts; the npm package
+// (mcp-server-dental/) is a stdio bridge to it since 0.2.0. The page
+// promises no booking: the service books nothing, and booking is named only
+// in the FAQ answer that says so (dental-guide-tannlege-ai.test.ts).
+
+const DENTAL_AI_GUIDE_PATH = "/guide-tannlege-ai";
+const DENTAL_MCP_URL = `${DENTAL_BASE_URL}/mcp`;
+const DENTAL_MCP_NPM_PACKAGE = "finn-tannlege-mcp";
+const DENTAL_MCP_SOURCE_URL = "https://github.com/slookisen/lokal/tree/main/mcp-server-dental";
+
+/** The guide's canonical URL in a language. */
+export function dentalAiGuideUrl(lang: SiteLang): string {
+  return `${DENTAL_BASE_URL}${lang === "en" ? "/en" : ""}${DENTAL_AI_GUIDE_PATH}`;
+}
+
+// The text per tool, as OA_MCP_GUIDE_TOOL_COPY in experiences-seo.ts: `card`
+// is trusted HTML for the tool card (<code> marks an input parameter), `faq`
+// plain text for the tools FAQ answer. A registered tool with no entry is
+// still listed, with its registered description (English); the test fails
+// until it gets one, and checks every <code> against the tool's input schema.
+interface DentalGuideToolCopy { card: string; faq: string }
+
+const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToolCopy>> = {
+  tannlege_search: {
+    nb: {
+      card: "Søker etter tannlege, kjeveortoped eller akutt tannlege etter sted, fylke, spesialitet, Helfo-direkteoppgjør eller akuttilbud. Skriv ønsket med egne ord i <code>query</code>, f.eks. «kjeveortoped i Bergen med Helfo-avtale», eller bruk filtrene <code>fylke</code>, <code>spesialitet</code>, <code>helfo</code> og <code>akutt</code>. Svaret viser hvordan forespørselen ble tolket, og hver klinikk har navn, adresse, kontaktinformasjon, Helfo-status, akuttstatus og lenke til profilsiden.",
+      faq: "tannlege_search finner klinikker etter sted, fylke, spesialitet, Helfo-avtale og akuttilbud, med forespørselen i fritekst (query) eller som filtre",
+    },
+    en: {
+      card: "Searches for a dentist, orthodontist or emergency dentist by place, county (fylke), specialty, Helfo direct billing or emergency care. Put the request in your own words in <code>query</code>, e.g. \"orthodontist in Bergen with a Helfo agreement\", or use the filters <code>fylke</code>, <code>spesialitet</code>, <code>helfo</code> and <code>akutt</code>. The answer shows how the request was read, and each clinic has its name, address, contact details, Helfo status, emergency status and a link to its profile page.",
+      faq: "tannlege_search finds clinics by place, county, specialty, Helfo agreement and emergency care, with the request in free text (query) or as filters",
+    },
+  },
+  tannlege_info: {
+    nb: {
+      card: "Henter hele oppføringen for én klinikk via organisasjonsnummer (<code>org_nr</code>) eller <code>id</code>: adresse, kontaktinformasjon, nettside, Helfo-status, spesialiteter, spesialister, behandlinger, åpningstider, klinikkens egen beskrivelse og profilside. Akuttvakt vises bare når den har en kilde.",
+      faq: "tannlege_info henter hele oppføringen for én klinikk via organisasjonsnummer eller id",
+    },
+    en: {
+      card: "Fetches the full record of one clinic by organisation number (<code>org_nr</code>) or <code>id</code>: address, contact details, website, Helfo status, specialties, specialists, treatments, opening hours, the clinic's own description and its profile page. Emergency duty is shown only when it has a recorded source.",
+      faq: "tannlege_info fetches the full record of one clinic by organisation number or id",
+    },
+  },
+  tannlege_stats: {
+    nb: {
+      card: "Antall tannlegeklinikker i Norge: totalt, per fylke, og hvor mange som har Helfo-direkteoppgjør, hører til en kjede, viser et akuttilbud eller har en spesialist.",
+      faq: "tannlege_stats teller klinikkene totalt og per fylke, og hvor mange som har Helfo-avtale, akuttilbud eller spesialist",
+    },
+    en: {
+      card: "Counts of dental clinics in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show emergency care or list a specialist.",
+      faq: "tannlege_stats counts the clinics in total and per county, and how many have a Helfo agreement, emergency care or a specialist",
+    },
+  },
+  tannlege_akutt: {
+    nb: {
+      card: "Finner akutt tannlege: klinikker med akuttvakt som har en kilde, eller som sier at de tar imot akuttpasienter, eventuelt i ett fylke (<code>fylke</code>). Svaret har også råd om kommunal tannlegevakt.",
+      faq: "tannlege_akutt finner klinikker med akuttvakt eller som tar imot akuttpasienter, eventuelt i ett fylke",
+    },
+    en: {
+      card: "Finds an emergency dentist: clinics with an emergency duty that has a recorded source, or that say they take emergency patients, optionally in one county (<code>fylke</code>). The answer also has advice on the municipal out-of-hours dental service.",
+      faq: "tannlege_akutt finds clinics with emergency duty or that take emergency patients, optionally in one county",
+    },
+  },
+  tannlege_kjeder: {
+    nb: {
+      card: "Lister tannlegekjedene som er registrert i katalogen, med antall klinikker i hver kjede.",
+      faq: "tannlege_kjeder lister tannlegekjedene med antall klinikker",
+    },
+    en: {
+      card: "Lists the dental chains registered in the directory, each with its number of clinics.",
+      faq: "tannlege_kjeder lists the dental chains with their number of clinics",
+    },
+  },
+};
+
+export interface DentalMcpGuideTool {
+  name: string;
+  /** The card body: the curated HTML, or the registered description escaped. */
+  cardHtml: string;
+  /** Plain text for the tools FAQ answer. */
+  faq: string;
+  /** False when the tool has no entry in DENTAL_MCP_GUIDE_TOOL_COPY. */
+  curated: boolean;
+}
+
+/** The guide's tools: one per registered tool, in registration order. `tools` is for tests. */
+export function dentalMcpGuideTools(lang: SiteLang, tools: McpToolEntry[] = registeredMcpTools("dental")): DentalMcpGuideTool[] {
+  return tools.map((t) => {
+    const copy = Object.prototype.hasOwnProperty.call(DENTAL_MCP_GUIDE_TOOL_COPY, t.name) ? DENTAL_MCP_GUIDE_TOOL_COPY[t.name][lang] : undefined;
+    if (copy) return { name: t.name, cardHtml: copy.card, faq: copy.faq, curated: true };
+    return { name: t.name, cardHtml: escapeHtml(t.description), faq: `${t.name}: ${t.description.replace(/[.!?]+$/, "")}`, curated: false };
+  });
+}
+
+/**
+ * The guide's FAQ as FAQPage JSON-LD; the page shows the same questions. The
+ * tools answer comes from dentalMcpGuideTools(), so it names the same tools as
+ * the list. Exported for tests; `tools` is for tests.
+ */
+export function buildDentalMcpGuideFaqJsonLd(lang: SiteLang, url: string, tools: McpToolEntry[] = registeredMcpTools("dental")) {
+  const toolsAnswer = dentalMcpGuideTools(lang, tools).map((t) => t.faq).join("; ") + ".";
+  const qas: Array<{ q: string; a: string }> = lang === "en" ? [
+    {
+      q: "Which AI assistants work with Finn-tannlege?",
+      a: `Any assistant that supports MCP (Model Context Protocol), such as Claude, ChatGPT (custom connectors in developer mode), Cursor and other MCP clients. Connect to the remote endpoint ${DENTAL_MCP_URL}, or use the npm package ${DENTAL_MCP_NPM_PACKAGE}.`,
+    },
+    { q: "What tools does the Finn-tannlege MCP server have?", a: toolsAnswer },
+    { q: "Does it cost anything?", a: "No. The server is free to use, and you need no account and no API key." },
+    {
+      q: "Can the assistant book an appointment with the dentist?",
+      a: "No. Finn-tannlege does not book appointments and takes no payment. The assistant shows the clinic's contact details and profile page, and you make the appointment with the clinic yourself.",
+    },
+    {
+      q: "Does Finn-tannlege give dental advice?",
+      a: "No. The tools tell you which clinics exist, what they offer and how to reach them. Questions about treatment belong with the dentist.",
+    },
+    {
+      q: "How do I connect my assistant?",
+      a: `See "Get started" further up this page: add ${DENTAL_MCP_URL} as a custom connector, or add the npm package ${DENTAL_MCP_NPM_PACKAGE} to your MCP client's configuration.`,
+    },
+  ] : [
+    {
+      q: "Hvilke AI-assistenter fungerer med Finn-tannlege?",
+      a: `Alle assistenter som støtter MCP (Model Context Protocol), for eksempel Claude, ChatGPT (egendefinerte connectorer i utviklermodus), Cursor og andre MCP-klienter. Koble til det eksterne endepunktet ${DENTAL_MCP_URL}, eller bruk npm-pakken ${DENTAL_MCP_NPM_PACKAGE}.`,
+    },
+    { q: "Hvilke verktøy har MCP-serveren til Finn-tannlege?", a: toolsAnswer },
+    { q: "Koster det noe?", a: "Nei. Serveren er gratis å bruke, og du trenger verken konto eller API-nøkkel." },
+    {
+      q: "Kan assistenten bestille time hos tannlegen?",
+      a: "Nei. Finn-tannlege bestiller ikke time og tar ikke imot betaling. Assistenten viser klinikkens kontaktinformasjon og profilside, og timen avtaler du med klinikken selv.",
+    },
+    {
+      q: "Gir Finn-tannlege råd om tannhelse?",
+      a: "Nei. Verktøyene forteller hvilke klinikker som finnes, hva de tilbyr og hvordan du når dem. Spørsmål om behandling hører hjemme hos tannlegen.",
+    },
+    {
+      q: "Hvordan kobler jeg til assistenten min?",
+      a: `Se «Kom i gang» lenger opp på siden: legg til ${DENTAL_MCP_URL} som en egendefinert connector, eller legg npm-pakken ${DENTAL_MCP_NPM_PACKAGE} til i MCP-klientens konfigurasjon.`,
+    },
+  ];
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${url}#faq`,
+    mainEntity: qas.map(({ q, a }) => ({
+      "@type": "Question",
+      name: q,
+      acceptedAnswer: { "@type": "Answer", text: a },
+    })),
+  };
+}
+
+const DENTAL_AI_GUIDE_CSS = `
+.gta-lang{text-align:right;font-size:.85rem;margin-bottom:4px}
+.content-page code{font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:.85em;background:var(--section-bg);padding:1px 6px;border-radius:4px}
+.gta-tools{display:grid;gap:12px;margin:8px 0 20px}
+.gta-tool{background:var(--white);border:1px solid var(--g200);border-radius:var(--r-lg);padding:16px 20px}
+.gta-tool>code{color:var(--teal-700);font-weight:700}
+.content-page .gta-tool p{margin:8px 0 0;font-size:.9rem}
+.gta-examples li{font-style:italic}
+.gta-setup{background:var(--section-bg);border-radius:var(--r-lg);padding:18px 22px;margin:14px 0}
+.gta-setup h3{font-size:1rem;font-weight:700;color:var(--navy);margin-bottom:8px}
+.gta-setup code{background:var(--white)}
+.gta-code{background:var(--navy);color:#E2E8F0;border-radius:var(--r-md);padding:14px 18px;font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:.8rem;line-height:1.6;overflow-x:auto;margin:8px 0 12px}
+.gta-faq-item h3{font-size:.98rem;font-weight:700;color:var(--navy);margin:16px 0 4px}
+.content-page .gta-faq-item p{margin:0}
+`;
+
+router.get(DENTAL_AI_GUIDE_PATH, (req: Request, res: Response) => {
+  const lang = toSiteLang(req.lang);
+  const canonical = dentalAiGuideUrl(lang);
+  const tools = registeredMcpTools("dental");
+  const faq = buildDentalMcpGuideFaqJsonLd(lang, canonical, tools);
+  const toolsHtml = dentalMcpGuideTools(lang, tools)
+    .map((t) => `\n      <div class="gta-tool"><code>${escapeHtml(t.name)}</code><p>${t.cardHtml}</p></div>`)
+    .join("");
+  const examplesHtml = BRAND_ENTITIES.dental.exampleQueries
+    .map((q) => `\n      <li>${lang === "en" ? `"${escapeHtml(q)}"` : `«${escapeHtml(q)}»`}</li>`)
+    .join("");
+  const faqHtml = faq.mainEntity
+    .map((qa) => `\n      <div class="gta-faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`)
+    .join("");
+  const desktopConfig = escapeHtml(JSON.stringify({ mcpServers: { "finn-tannlege": { command: "npx", args: [DENTAL_MCP_NPM_PACKAGE] } } }, null, 2));
+
+  const content = lang === "en" ? `
+<main>
+  <div class="content-page">
+    <p class="gta-lang"><a href="${DENTAL_AI_GUIDE_PATH}" hreflang="nb" lang="nb">Norsk</a></p>
+    <h1>Find a dentist in Norway with your AI assistant</h1>
+    <p>Ask Claude, ChatGPT or another AI assistant that supports MCP to find dental clinics in Norway: by place, specialty, Helfo agreement and emergency care.</p>
+
+    <h2>What is this?</h2>
+    <p>Finn-tannlege runs a remote MCP (Model Context Protocol) server at <code>${escapeHtml(DENTAL_MCP_URL)}</code>. Once your assistant is connected, it can search the same directory as <a href="/sok">the search page</a> with the tools below, and show you the clinics it finds with a link to each profile page.</p>
+
+    <h2>The tools, exactly as registered</h2>
+    <div class="gta-tools">${toolsHtml}
+    </div>
+
+    <h2>Try asking your assistant</h2>
+    <p>Ask in English or Norwegian, for example:</p>
+    <ul class="gta-examples">${examplesHtml}
+    </ul>
+
+    <h2>Get started</h2>
+    <div class="gta-setup">
+      <h3>Remote MCP server (easiest)</h3>
+      <p>Add a custom connector in your assistant's settings and paste the address <code>${escapeHtml(DENTAL_MCP_URL)}</code>. In Claude: Settings → Connectors → Add custom connector. No sign-in and no API key are needed.</p>
+    </div>
+    <div class="gta-setup">
+      <h3>Local npm package (Claude Desktop, Claude Code, Cursor)</h3>
+      <p>The npm package <code>${DENTAL_MCP_NPM_PACKAGE}</code> is a thin stdio bridge to the same server, so the tools are the same. Add it to your MCP client's configuration:</p>
+      <pre class="gta-code">${desktopConfig}</pre>
+      <p>Or run it directly: <code>npx ${DENTAL_MCP_NPM_PACKAGE}</code></p>
+    </div>
+    <p>Source and README: <a href="${DENTAL_MCP_SOURCE_URL}" rel="noopener" target="_blank">${DENTAL_MCP_NPM_PACKAGE} on GitHub</a>. More for AI agents: <a href="/llms.txt">llms.txt</a>.</p>
+
+    <h2>Frequently asked questions</h2>
+    <div class="gta-faq">${faqHtml}
+    </div>
+  </div>
+</main>` : `
+<main>
+  <div class="content-page">
+    <p class="gta-lang"><a href="/en${DENTAL_AI_GUIDE_PATH}" hreflang="en" lang="en">English</a></p>
+    <h1>Søk etter tannlege med AI-assistenten din</h1>
+    <p>Be Claude, ChatGPT eller en annen AI-assistent som støtter MCP, om å finne tannlegeklinikker i Norge: etter sted, spesialitet, Helfo-avtale og akuttilbud.</p>
+
+    <h2>Hva er dette?</h2>
+    <p>Finn-tannlege kjører en ekstern MCP-server (Model Context Protocol) på <code>${escapeHtml(DENTAL_MCP_URL)}</code>. Når assistenten din er koblet til, kan den søke i den samme katalogen som <a href="/sok">søkesiden</a> med verktøyene under, og vise deg klinikkene den finner med lenke til profilsiden.</p>
+
+    <h2>Verktøyene, slik de faktisk er registrert</h2>
+    <div class="gta-tools">${toolsHtml}
+    </div>
+
+    <h2>Prøv å spørre assistenten din</h2>
+    <p>Spør på norsk eller engelsk, for eksempel:</p>
+    <ul class="gta-examples">${examplesHtml}
+    </ul>
+
+    <h2>Kom i gang</h2>
+    <div class="gta-setup">
+      <h3>Ekstern MCP-server (enklest)</h3>
+      <p>Legg til en egendefinert connector i assistentens innstillinger, og lim inn adressen <code>${escapeHtml(DENTAL_MCP_URL)}</code>. I Claude: Settings → Connectors → Add custom connector. Du trenger verken innlogging eller API-nøkkel.</p>
+    </div>
+    <div class="gta-setup">
+      <h3>Lokal npm-pakke (Claude Desktop, Claude Code, Cursor)</h3>
+      <p>npm-pakken <code>${DENTAL_MCP_NPM_PACKAGE}</code> er en tynn stdio-bro til den samme serveren, så verktøyene er de samme. Legg den til i MCP-klientens konfigurasjon:</p>
+      <pre class="gta-code">${desktopConfig}</pre>
+      <p>Eller kjør den direkte: <code>npx ${DENTAL_MCP_NPM_PACKAGE}</code></p>
+    </div>
+    <p>Kildekode og README: <a href="${DENTAL_MCP_SOURCE_URL}" rel="noopener" target="_blank">${DENTAL_MCP_NPM_PACKAGE} på GitHub</a>. Mer for AI-agenter: <a href="/llms.txt">llms.txt</a>.</p>
+
+    <h2>Ofte stilte spørsmål</h2>
+    <div class="gta-faq">${faqHtml}
+    </div>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(content, lang === "en" ? {
+    title: "Find a dentist in Norway with an AI assistant (MCP) — Finn-tannlege.com",
+    description: "How to use Claude, ChatGPT and other AI assistants with the Finn-tannlege MCP server to find dental clinics in Norway — every tool explained.",
+    canonical,
+    lang,
+    alternates: { nb: dentalAiGuideUrl("nb"), en: dentalAiGuideUrl("en") },
+    jsonLd: [faq],
+    extraCss: DENTAL_AI_GUIDE_CSS,
+  } : {
+    title: "Søk etter tannlege med AI-assistent (MCP) — Finn-tannlege.com",
+    description: "Slik bruker du Claude, ChatGPT og andre AI-assistenter med MCP-serveren til Finn-tannlege for å finne tannlegeklinikker i Norge — alle verktøyene forklart.",
+    canonical,
+    lang,
+    alternates: { nb: dentalAiGuideUrl("nb"), en: dentalAiGuideUrl("en") },
+    jsonLd: [faq],
+    extraCss: DENTAL_AI_GUIDE_CSS,
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -3039,7 +3404,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
       type: "openapi",
       url: `${DENTAL_BASE_URL}/openapi.json`,
     },
-    logo_url: `${DENTAL_BASE_URL}/favicon.svg`,
+    logo_url: DENTAL_LOGO_PNG_URL, // F2-S4: PNG (was favicon.svg)
     contact_url: `${DENTAL_BASE_URL}/kontakt`,
     legal_info_url: `${DENTAL_BASE_URL}/om`,
   });

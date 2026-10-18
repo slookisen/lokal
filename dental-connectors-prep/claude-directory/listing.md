@@ -48,14 +48,14 @@ Pick the closest names the portal offers.
 
 | Field | Answer |
 |---|---|
-| Documentation URL | **Not yet** — see the prerequisites in ../README.md |
+| Documentation URL | `https://finn-tannlege.com/guide-tannlege-ai` |
 | Privacy policy URL | `https://finn-tannlege.com/personvern` |
 | Support contact | `kontakt@finn-tannlege.com` |
 | Website | `https://finn-tannlege.com` |
 
 ## Icon
 
-**Not yet.** There is no square PNG for this brand; see the prerequisites in ../README.md.
+Upload `dental-connectors-prep/assets/finn-tannlege-square-512.png`: 512×512 PNG, md5 `d699125e1528fb9c818550c1052b0bb3`. Square and full-bleed with no rounded corners; clients crop it themselves.
 
 ## Slug — permanent once published
 

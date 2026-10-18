@@ -11,7 +11,7 @@ Try these:
 
 1. "Find a dentist in Bergen" (usually tannlege_search)
 2. "Which dental clinics in Oslo have a Helfo agreement?" (usually tannlege_search)
-3. "I need emergency dental care in Rogaland tonight" (usually tannlege_akutt)
+3. "I need an emergency dentist in Rogaland" (usually tannlege_akutt)
 4. "How many dental clinics are there in Norway, by county?" (usually tannlege_stats)
 
 Every tool is read-only: nothing you try can create, change or send anything.
