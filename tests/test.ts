@@ -42810,6 +42810,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W (found live
+// 2026-10-17): a word outside the category map («kransekake») is looked up in
+// the product names (the offers' catalog and word rule), and lokal_search says
+// so when nothing matches («zzzqqx») instead of listing the standard list;
+// the category key is the platform's «bakery» (the old «bread» still matches);
+// place words come from the shared gazetteer («kransekake i Bærum» is no name
+// search); filler words («vil», «dag», «beste») are never looked up (review
+// round 1). The test sets answer as main did (tests/fixtures/rfb-sok-i-w-main.json).
+// Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W (RFB search: unknown words, bakery, place words) ──");
+  try {
+    const { runRfbSokUkjenteOrdBakeriStedTests } = require("../src/routes/rfb-sok-ukjente-ord-bakeri-sted.test") as
+      typeof import("../src/routes/rfb-sok-ukjente-ord-bakeri-sted.test");
+    const r = await runRfbSokUkjenteOrdBakeriStedTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-ukjente-ord-bakeri-sted: " + f);
+    console.log(`  rfb-sok-ukjente-ord-bakeri-sted: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-ukjente-ord-bakeri-sted: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

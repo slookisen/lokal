@@ -455,9 +455,10 @@ function matchedListedProduct(matchedNames: readonly string[], products: readonl
  * tells «Ferske egg fra Fana» from a bakery's label «Egg». This list only
  * drives the labelling; the matching is untouched. Each word maps to the
  * product categories whose products count for it; the first is the category
- * parseNaturalQuery gives the word ("brød" also counts the enrichment's
- * `bakery`). The words are Norwegian, as the product names are: an English
- * query is read with the parser's own glossary («meat» → «kjøtt»). Drink
+ * parseNaturalQuery gives the word (slice I-W: `bakery` for "brød", which
+ * also counts the old `bread`). The words are Norwegian, as the product
+ * names are: an English query is read with the parser's own glossary
+ * («meat» → «kjøtt»). Drink
  * words are not here: drink venues are found by category (Fase 5), and
  * «Drikke» is no product word.
  */
@@ -468,7 +469,7 @@ const CATEGORY_LABEL_WORDS: Readonly<Record<string, readonly string[]>> = {
   "meieri": ["dairy"],
   "kjøtt": ["meat"],
   "fisk": ["fish"], "sjømat": ["fish"],
-  "brød": ["bread", "bakery"], "bakervarer": ["bread", "bakery"],
+  "brød": ["bakery", "bread"], "bakervarer": ["bakery", "bread"],
   "urter": ["herbs"],
   "egg": ["eggs"],
 };
@@ -636,6 +637,25 @@ function outsideNorwayAnswer(place: string) {
   };
 }
 
+/**
+ * Slice I-W: lokal_search's answer to a search without a place when no product
+ * name matches the words the parser could not read (`words`, quoted).
+ */
+function noProductMatchText(words: string): string {
+  return `🔎 Ingen produsent har ${words} i produktlista eller i navnet, så søket gir ingen treff. ` +
+    "Prøv et annet ord, en kategori (for eksempel «bakervarer» eller «honning») eller et produsentnavn. / " +
+    `No producer lists ${words} as a product or has it in its name, so there are no matches. ` +
+    "Try another word, a category (for example «bakery» or «honey») or a producer name.";
+}
+
+/** Slice I-W: the line above a list of the producers near a place when no product there matches `words`. */
+function areaListText(words: string): string {
+  return `🔎 Ingen produsent i området har ${words} i produktlista. Listen under er produsentene i området, ikke treff på ${words}; ` +
+    "søk uten sted for hele landet. / " +
+    `No producer in the area lists ${words}. The list below is the producers in the area, not matches for ${words}; ` +
+    "search without a place to cover all of Norway.\n\n";
+}
+
 export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -745,7 +765,15 @@ export function registerTools(
       const discoverMeta: DiscoverMeta = {};
       const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta);
 
+      // Integration test 2026-10-17, slice I-W: the words the parser could not
+      // read are looked up in the product names (discover() step 3c). When no
+      // product matches, the answer says so: «zzzqqx» used to get the standard
+      // list as «fant 50 produsenter», with no mark that none of them matched.
+      const unknownTerms = (parsed as any)._unknownTerms as string[] | undefined;
+      const unmatched = discoverMeta.unmatchedTerms?.length ? `«${discoverMeta.unmatchedTerms.join(" ")}»` : null;
+
       if (!results?.length) {
+        if (unmatched && !parsed.location) return { content: [{ type: "text" as const, text: noProductMatchText(unmatched) }] };
         const where = hasCoords ? `innenfor ${parsed.maxDistanceKm} km` : `"${q}"`;
         return { content: [{ type: "text" as const, text: `Ingen resultater for ${where}. Prøv et bredere søk.` }] };
       }
@@ -766,9 +794,15 @@ export function registerTools(
       // were only rendered into the assistant's prose.
       const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
 
+      // I-W: near a place, the producers there are listed when no product
+      // matches, and the header says they are no matches.
+      const unmatchedLine = unmatched ? areaListText(unmatched) : "";
+      const found = unmatched
+        ? `${results.length} produsenter i området, ikke treff på ${unmatched}`
+        : `fant ${results.length} produsenter`;
       const header = hasCoords
-        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — fant ${results.length} produsenter:\n`
-        : `🥬 **Lokal mat-søk: "${q}"** — fant ${results.length} produsenter:\n`;
+        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — ${found}:\n`
+        : `🥬 **Lokal mat-søk: "${q}"** — ${found}:\n`;
 
       // If name match (1-3 results from specific query), include full product list
       // so AI can answer product/price questions directly without a second tool call
@@ -777,7 +811,9 @@ export function registerTools(
       // Compact view for broader searches. ChatGPT app re-review 2026-10-03:
       // a producer kept only for its broad category (`meat` for "lamb") says
       // so, instead of reading like a documented match.
-      const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
+      // I-W: the words step 3c matched in product names count as product terms.
+      const productTerms = ((parsed as any)._productTerms as string[] | undefined)
+        ?? (unknownTerms && !unmatched ? unknownTerms : undefined) ?? [];
       // Slice I-N (AI-3a): a search with no product term, only category words
       // («egg i Bergen», «meat»), is labelled against those words. A product
       // term («honning», «reinsdyr») is the more specific evidence and keeps
@@ -881,7 +917,7 @@ export function registerTools(
       });
 
       deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
-      return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
+      return { content: [{ type: "text" as const, text: tagsRelaxedLine + unmatchedLine + header + "\n" + lines.join("\n\n") }] };
     })
   );
 
