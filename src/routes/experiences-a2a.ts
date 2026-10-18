@@ -64,6 +64,7 @@ import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
+import { rpcInternalErrorReply } from "../utils/internal-error";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -123,6 +124,19 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
   const err: Record<string, unknown> = { code, message };
   if (data !== undefined) err.data = data;
   return { jsonrpc: "2.0", error: err, id };
+}
+
+/**
+ * The answer to a request that failed inside the handler: JSON-RPC's generic
+ * -32603 "Internal error", without the detail. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the caller
+ * as `data`, as Finn-tannlege A2A's did until slice I-Y2. The detail is
+ * logged instead, without the request (`where` says which step failed;
+ * utils/internal-error.ts).
+ */
+function rpcInternalError(id: unknown, where: string, err: unknown) {
+  return rpcInternalErrorReply("experiences-a2a", id, where, err);
 }
 
 // ─── Zod envelope schema ─────────────────────────────────────
@@ -357,8 +371,7 @@ export function handleExperiencesMessageSend(
         metadata: { skill: "opplevelser_categories" },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (opplevelser_categories)", err);
     }
   }
 
@@ -400,8 +413,7 @@ export function handleExperiencesMessageSend(
         metadata: { skill: "opplevelser_info", id: idMatch[1] },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (opplevelser_info)", err);
     }
   }
 
@@ -518,8 +530,7 @@ export function handleExperiencesMessageSend(
         },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (gardssalg_discover)", err);
     }
   }
 
@@ -712,8 +723,7 @@ export function handleExperiencesMessageSend(
       },
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return rpcErr(id, -32603, "Internal error", msg);
+    return rpcInternalError(id, "message/send (opplevelser_discover)", err);
   }
 }
 
@@ -778,8 +788,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         res.json(rpcErr(id, -32601, `Method not found: ${method}`));
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.json(rpcErr(id, -32603, "Internal error", msg));
+    res.json(rpcInternalError(id, "POST /a2a", err));
   }
 });
 
