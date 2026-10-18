@@ -50,6 +50,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { searchTrafficClass } from "../services/search-tracking";
 import { AI_DELIVERY_WINDOW_DAYS } from "../services/profile-ai-deliveries-compute";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
@@ -1813,7 +1814,13 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // discover() can widen a NAME search past our radius by itself, and the
     // ladder below never runs in that case (wasNameMatch short-circuits it).
     const discoverMeta: DiscoverMeta = {};
-    let results = marketplaceRegistry.discover(query, discoverMeta);
+    // Slice I-Z: our own traffic, probes and spam see the same page but raise
+    // no discovery counter, and the conversation below is stored as theirs
+    // (search-tracking.ts searchTrafficClass).
+    const requestMeta = buildRequestMeta(req);
+    const trafficClass = searchTrafficClass({ meta: requestMeta, text: q });
+    const trackDiscovery = trafficClass === "external";
+    let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery });
 
     // If discover returned name-matched results (relevanceScore≥0.9 +
     // matchReasons starts with "Navnematch"), don't run the geo-fallback —
@@ -1846,7 +1853,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         if (productTerms) (expanded as any)._productTerms = productTerms;
         if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         const expandedMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(expanded, expandedMeta);
+        results = marketplaceRegistry.discover(expanded, expandedMeta, { trackDiscovery });
         appliedRadiusKm = radius;
         tagsDropped = !!expandedMeta.tagsRelaxed;
       }
@@ -1855,7 +1862,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         if (productTerms) (noGeo as any)._productTerms = productTerms;
         if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         const noGeoMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(noGeo, noGeoMeta);
+        results = marketplaceRegistry.discover(noGeo, noGeoMeta, { trackDiscovery });
         geoDropped = true;
         tagsDropped = !!noGeoMeta.tagsRelaxed;
       }
@@ -1938,7 +1945,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
           queryText: q || "nærhetssøk",
           source: "web",
           buyerAgentName: "Besøkende",
-          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+          requestMeta, // (item 3) internal-traffic classification
+          trafficClass, // slice I-Z: a probe or spam is no countable conversation
           autoRespond: true,
         });
       } catch { /* non-critical — don't break search if logging fails */ }

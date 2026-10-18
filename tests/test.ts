@@ -42835,6 +42835,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Z (FUNN
+// rest-sok-teller-verifisering-som-oppdagelse, sesjonens-a2a-prober-telt-som-
+// ai-oppslag): our own traffic («session-lane-verify» is now an internal
+// marker, an admin key, the owner cookie) gets the same answer on every search
+// and lookup entry of RFB, Opplevagent and Finn-tannlege but changes no
+// counter (discovery, interactions, conversations, search and page-view
+// stats, AI-søk, «Med i AI-svar»); probes and spam raise no discovery counter;
+// external calls count as main did (tests/fixtures/intern-trafikk-i-z-main.json).
+// Own in-memory DBs, the dental/experiences db-factory and the module cache
+// swapped, three express apps on 127.0.0.1 (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Z (own traffic and probes counted as nothing, all three platforms) ──");
+  try {
+    const { runInternTrafikkTellesIkkeTests } = require("../src/routes/intern-trafikk-telles-ikke.test") as
+      typeof import("../src/routes/intern-trafikk-telles-ikke.test");
+    const r = await runInternTrafikkTellesIkkeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("intern-trafikk-telles-ikke: " + f);
+    console.log(`  intern-trafikk-telles-ikke: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("intern-trafikk-telles-ikke: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-X (FUNN
 // dental-a2a-datapart-ignoreres, dental-a2a-orgnr-med-mellomrom): the A2A
 // message/send handlers of RFB, Opplevagent and Finn-tannlege read the
