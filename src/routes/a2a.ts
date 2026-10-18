@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 import { agentCardService, store } from "../services";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { buildSearchNote } from "../utils/geo-query";
-import { DiscoveryQuerySchema } from "../models/marketplace";
+import { DiscoveryQuerySchema, type DiscoveryQuery } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
 import { conversationService, buildRequestMeta, isInternalTraffic, type MessageType } from "../services/conversation-service";
 import {
@@ -26,6 +26,7 @@ import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
+import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
 
 // ─── A2A Routes ──────────────────────────────────────────────
@@ -70,13 +71,12 @@ export function toA2ADataArtifact(opts: { artifactId: string; name: string; data
  * -32603 "Internal error", without the detail. dev-request
  * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
  * a2a-mcp-intern-feiltekst-rest): the error's own message went to the caller
- * as `data`, as Finn-tannlege A2A's did until slice I-Y2 (rpcInternalError in
- * routes/dental-a2a.ts). The detail is logged instead, without the request
- * (`where` says which step failed).
+ * as `data`, as Finn-tannlege A2A's did until slice I-Y2. The detail is
+ * logged instead, without the request (`where` says which step failed;
+ * utils/internal-error.ts).
  */
 function rpcInternalError(id: unknown, where: string, err: unknown) {
-  console.error(`[a2a] ${where} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-  return { jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id };
+  return rpcInternalErrorReply("a2a", id, where, err);
 }
 
 
@@ -175,7 +175,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
     res.json(card);
   } catch (err: any) {
     // Slice I-Y3: the error's own message is logged, not sent (as rpcInternalError).
-    console.error("[a2a] GET /a2a agent card failed:", err instanceof Error ? err.stack || err.message : String(err));
+    logInternalError("a2a", "GET /a2a agent card", err);
     res.status(500).json({ error: "Failed to generate agent card" });
   }
 });
@@ -275,19 +275,19 @@ export const MAX_A2A_QUERY_JSON_CHARS = 16_384;
 
 /**
  * A structured query (modes 2 and 3) as RFB A2A logs, stores and echoes it:
- * the query itself when its JSON is within MAX_A2A_QUERY_JSON_CHARS, so a
- * real query is the same object as before. A longer one is the fields of it
- * the discovery reads, as it reads them (DiscoveryQuerySchema), and only
- * those that were sent. The search reads the query as sent either way. A
- * query the schema rejects is answered as invalid, and nothing of it is
- * logged or echoed, so it is `{}` here (what the traffic class reads).
+ * `sent` itself when its JSON is within MAX_A2A_QUERY_JSON_CHARS, so a real
+ * query is the same object as before. A longer one is the fields of it the
+ * discovery read, with the values it read (`read`, the query the handler
+ * parsed for the search, so a `limit` of 0 is the 20 the search used), and
+ * only those that were sent. The search reads `read` either way, and the
+ * traffic class the query as sent (handleMessageSend). A query the schema
+ * rejects is answered as invalid before this, so nothing of it is logged or
+ * echoed.
  */
-export function boundedA2aQuery(query: unknown): unknown {
-  if (!query || typeof query !== "object" || Array.isArray(query)) return query;
-  if (JSON.stringify(query).length <= MAX_A2A_QUERY_JSON_CHARS) return query;
-  const read = DiscoveryQuerySchema.safeParse(query);
-  if (!read.success) return {};
-  return Object.fromEntries(Object.entries(read.data).filter(([key]) => Object.hasOwn(query, key)));
+export function boundedA2aQuery(sent: unknown, read: DiscoveryQuery): unknown {
+  if (!sent || typeof sent !== "object" || Array.isArray(sent)) return sent;
+  if (JSON.stringify(sent).length <= MAX_A2A_QUERY_JSON_CHARS) return sent;
+  return Object.fromEntries(Object.entries(read).filter(([key]) => Object.hasOwn(sent, key)));
 }
 
 function handleMessageSend(params: any, id: any, req: Request, res: Response) {
@@ -366,13 +366,14 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   // counters. Everything else still gets a valid completed task (results for
   // intent queries, an empty result + note for no-intent text) but leaves no
   // public trace. Real buyer queries take exactly the old path.
-  // Slice I-Y3: what is logged, stored and echoed of a structured query is
-  // bounded in total (boundedA2aQuery); a real query is the same object.
-  const loggedQuery = messageText ? discoveryQuery : boundedA2aQuery(discoveryQuery);
-  const queryText = messageText || JSON.stringify(loggedQuery);
+  // Slice I-Y3: the class reads the query as sent (each field cut by
+  // capA2aData, every key kept), not the bounded one that is logged below:
+  // a spam marker in a key the discovery never reads, such as implant_id,
+  // still counts past MAX_A2A_QUERY_JSON_CHARS (review of lokal#1171).
+  const classifiedText = messageText || JSON.stringify(discoveryQuery);
   const requestMeta = buildRequestMeta(req);
   const trafficClass = classifyA2aTraffic({
-    text: queryText,
+    text: classifiedText,
     ua: requestMeta.userAgent,
     hasStructuredData: !messageText,
     isInternal: isInternalTraffic(requestMeta),
@@ -395,6 +396,10 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       limit: discoveryQuery.limit || 20,
       offset: discoveryQuery.offset || 0,
     });
+    // Slice I-Y3: what is logged, stored and echoed of a structured query is
+    // bounded in total (boundedA2aQuery); a real query is the same object.
+    const loggedQuery = messageText ? discoveryQuery : boundedA2aQuery(discoveryQuery, query);
+    const queryText = messageText || JSON.stringify(loggedQuery);
 
     // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
     // review finding: this A2A discovery flow (Mode 1 via parseNaturalQuery's

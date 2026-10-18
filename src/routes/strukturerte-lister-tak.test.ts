@@ -27,9 +27,12 @@
  *       spreads 1 MB over many keys or nests it is logged, stored and echoed
  *       as the fields of it the discovery reads (at most
  *       MAX_A2A_QUERY_JSON_CHARS outside the task row, which keeps the
- *       params as sent: FUNN rfb-a2a-oppgaverad-lagrer-ra-params), and it
- *       answers as those fields do. A query within the bound is the same
- *       object.
+ *       params as sent: FUNN rfb-a2a-oppgaverad-lagrer-ra-params), with the
+ *       values the search read (a `limit` of 0 is echoed as the 20 it used),
+ *       and it answers as those fields do. A query within the bound is the
+ *       same object. The traffic class reads the query as sent (review of
+ *       lokal#1171, B1): a spam key such as implant_id past the bound still
+ *       leaves no interaction, no conversation and no discovery counter.
  *   E   no internal error text in an answer: with SQLite failing (a spy on
  *       better-sqlite3 that throws an error with a marker), RFB A2A
  *       (message/send, the dispatcher, the task row through tasks/get, GET
@@ -37,6 +40,8 @@
  *       MCP and Finn-tannlege MCP (each tool) answer a generic error and log
  *       the detail; an invalid RFB query is still -32602 with Zod's issues;
  *       Opplevagent MCP still answers a closed database with «Ingen data».
+ *       The three MCP texts are one template (utils/internal-error.ts), and
+ *       Rett fra Bonden's is unchanged.
  *       Then a sweep: every tool of the three MCP servers and every A2A
  *       method, with all of SQLite failing, never answers the marker.
  *   B1  real structured searches answer byte for byte as main did:
@@ -166,15 +171,15 @@ function rpc(router: any, method: string, params: unknown): Promise<{ status: nu
   });
 }
 
-/** The query each discover() call of `call` gets (a spy on the registry's method, restored in finally). */
-async function discoverQueries(call: () => Promise<unknown>): Promise<any[]> {
+/** Each discover() call of `call`: the query and the options it gets (a spy on the registry's method, restored in finally). */
+async function discoverCalls(call: () => Promise<unknown>): Promise<Array<{ query: any; opts: any }>> {
   const registry = (require("../services/marketplace-registry") as typeof import("../services/marketplace-registry")).marketplaceRegistry as any;
   const own = Object.prototype.hasOwnProperty.call(registry, "discover");
   const discover = registry.discover;
-  const seen: any[] = [];
-  registry.discover = function (this: unknown, query: unknown, ...rest: unknown[]) {
-    seen.push(query);
-    return discover.call(this, query, ...rest);
+  const seen: Array<{ query: any; opts: any }> = [];
+  registry.discover = function (this: unknown, query: unknown, meta: unknown, opts: unknown, ...rest: unknown[]) {
+    seen.push({ query, opts });
+    return discover.call(this, query, meta, opts, ...rest);
   };
   try {
     await call();
@@ -183,6 +188,11 @@ async function discoverQueries(call: () => Promise<unknown>): Promise<any[]> {
     else delete registry.discover; // the prototype's method again
   }
   return seen;
+}
+
+/** The query each discover() call of `call` gets (discoverCalls). */
+async function discoverQueries(call: () => Promise<unknown>): Promise<any[]> {
+  return (await discoverCalls(call)).map((c) => c.query);
 }
 
 /** [entries, longest entry] of a list discover() got, or null when it got none. */
@@ -500,24 +510,30 @@ export async function runStrukturerteListerTakTests(opts: { log?: boolean } = {}
       // ── T  RFB A2A: the total bound ────────────────────────────────────
       {
         const { boundedA2aQuery, MAX_A2A_QUERY_JSON_CHARS } = require("./a2a") as typeof import("./a2a");
+        const { DiscoveryQuerySchema } = require("../models/marketplace") as typeof import("../models/marketplace");
+        /** The query the search reads, as the handler parses it. */
+        const read = (sent: unknown) => DiscoveryQuerySchema.parse(sent);
         assertEq(MAX_A2A_QUERY_JSON_CHARS, 16_384, "T1 the bound");
         for (const ask of [...A2A_ASKS["rfb a2a data"]!, ...A2A_ASKS["rfb a2a params (mode 3)"]!]) {
-          assertTrue(boundedA2aQuery(ask) === ask, `T1 a query within the bound is the same object (${JSON.stringify(ask).slice(0, 60)})`);
+          if (!DiscoveryQuerySchema.safeParse(ask).success) continue; // answered as invalid before the bound
+          assertTrue(boundedA2aQuery(ask, read(ask)) === ask, `T1 a query within the bound is the same object (${JSON.stringify(ask).slice(0, 60)})`);
         }
         // In the schema's order, which the fields past the bound come in.
         const atCaps = { query: "q".repeat(MAX_FREE_TEXT_CHARS), categories: Array(50).fill("c".repeat(80)),
           tags: Array(50).fill("t".repeat(80)), skills: Array(50).fill("s".repeat(80)), drinkSubcategory: "d".repeat(MAX_FREE_TEXT_CHARS) };
-        assertTrue(JSON.stringify(atCaps).length > MAX_A2A_QUERY_JSON_CHARS && JSON.stringify(boundedA2aQuery(atCaps)) === JSON.stringify(atCaps),
+        assertTrue(JSON.stringify(atCaps).length > MAX_A2A_QUERY_JSON_CHARS && JSON.stringify(boundedA2aQuery(atCaps, read(atCaps))) === JSON.stringify(atCaps),
           `T1 the fields a discovery reads, all at their caps (${JSON.stringify(atCaps).length} characters), keep their values`);
         const junk = Object.fromEntries(Array.from({ length: 525 }, (_, i) => [`k${i}`, FILLER.repeat(666)]));
         const spread = { ...junk, categories: ["honey"], limit: 5 };
         assertTrue(JSON.stringify(spread).length > ONE_MB, "T2 setup: a query that spreads 1 MB over 525 keys of at most MAX_FREE_TEXT_CHARS");
-        assertEq(boundedA2aQuery(spread), { categories: ["honey"], limit: 5 }, "T2 past the bound: the fields the discovery reads, as sent");
+        assertEq(boundedA2aQuery(spread, read(spread)), { categories: ["honey"], limit: 5 }, "T2 past the bound: the fields the discovery reads, as sent");
         const nested = { categories: ["honey"], location: { lat: 63.43, lng: 10.4, junk: "x".repeat(ONE_MB) }, deep: { text: "y".repeat(ONE_MB) } };
-        assertEq(boundedA2aQuery(nested), { categories: ["honey"], location: { lat: 63.43, lng: 10.4 } },
+        assertEq(boundedA2aQuery(nested, read(nested)), { categories: ["honey"], location: { lat: 63.43, lng: 10.4 } },
           "T2 …as the discovery reads them: a nested object it never reads is left out, and `location` is its lat and lng");
-        assertEq(boundedA2aQuery({ ...junk, categories: [1] }), {}, "T2 a query the schema rejects (answered as invalid) is nothing");
-        assertEq([boundedA2aQuery(capFreeText("x".repeat(ONE_MB))), boundedA2aQuery(null), boundedA2aQuery(undefined)], [capFreeText("x".repeat(ONE_MB)), null, undefined],
+        assertEq(boundedA2aQuery(spread, { ...read(spread), limit: 20 }), { categories: ["honey"], limit: 20 },
+          "T2 …with the values the search read, not the ones sent");
+        assertEq([boundedA2aQuery(capFreeText("x".repeat(ONE_MB)), read({})), boundedA2aQuery(null, read({})), boundedA2aQuery(undefined, read({}))],
+          [capFreeText("x".repeat(ONE_MB)), null, undefined],
           "T2 data that is no object is as it is (a string is cut to MAX_FREE_TEXT_CHARS by capA2aData)");
 
         // What the call logs, stores and echoes.
@@ -543,6 +559,45 @@ export async function runStrukturerteListerTakTests(opts: { log?: boolean } = {}
         }
         const extra = { categories: ["honey"], note: "hei" };
         assertEq(parsedOf(await postA2a(h.a2a, dataMessage(extra))), extra, "T4 control: within the bound the echo is the query as sent, extra keys too");
+
+        // T5 (review of lokal#1171, B1): the traffic class reads the query as
+        // sent. Read from the bounded query, the implant_id key past the bound
+        // was gone, and the spam counted as a search.
+        const implant = { categories: ["honey"], limit: 5, implant_id: "x" };
+        for (const [label, params] of [
+          ["a DataPart with an implant_id key, within the bound (control)", dataMessage(implant)],
+          ["a DataPart with 525 keys and an implant_id key", dataMessage({ ...junk, ...implant })],
+          ["mode 3 with 525 keys and an implant_id key", { message: {}, ...junk, ...implant }],
+        ] as const) {
+          let answer: any;
+          const before = rows();
+          const calls = await discoverCalls(async () => { answer = await postA2a(h.a2a, params); });
+          assertEq(rows(), before, `T5 RFB A2A ${label}: spam, so no search interaction and no conversation`);
+          assertEq(calls.map((c) => c.opts?.trackDiscovery), [false], "T5 …and no discovery counter is raised");
+          assertEq(answer.body?.result?.artifacts?.[0]?.parts?.[0]?.data?.conversations, [], "T5 …the answer starts no conversation");
+          assertSameAnswer(agentsOf(answer), agentsOf(plain), "T5 …and it still finds what its fields find (spam is answered, not traced)");
+        }
+
+        // T6 (review of lokal#1171, S2): past the bound, the echo holds the
+        // values the search read. Parsed apart from the search, a `limit` of 0
+        // was echoed as the schema's 100 while the search used 20.
+        for (const [sent, want] of [
+          [{ limit: 0 }, { limit: 20 }], [{ limit: null }, { limit: 20 }], [{ limit: 500 }, { limit: 100 }],
+          [{ limit: 5, offset: -1 }, { limit: 5, offset: 0 }],
+        ] as const) {
+          let answer: any;
+          const [call] = await discoverCalls(async () => { answer = await postA2a(h.a2a, dataMessage({ ...junk, categories: ["honey"], ...sent })); });
+          const echo = parsedOf(answer);
+          assertEq(echo, { categories: ["honey"], ...want }, `T6 past the bound, ${JSON.stringify(sent)} is echoed as the search read it`);
+          assertEq(Object.keys(want).map((k) => call?.query?.[k]), Object.keys(want).map((k) => echo?.[k]), "T6 …the values discover() got");
+        }
+
+        // T7: a query the schema rejects past the bound is answered as invalid, and nothing of it is logged.
+        const before = rows();
+        const invalidBig = await postA2a(h.a2a, dataMessage({ ...junk, categories: [1] }));
+        assertTrue((invalidBig.body as any)?.error?.code === -32602 && JSON.stringify(invalidBig.body).length < 64 * 1024,
+          `T7 RFB A2A: an invalid query past the bound is -32602 with Zod's issues (${JSON.stringify(invalidBig.body).length} characters)`);
+        assertEq(rows(), before, "T7 …and leaves no interaction or conversation");
       }
 
       // ── E  RFB A2A: no internal error text ─────────────────────────────
@@ -669,6 +724,14 @@ export async function runStrukturerteListerTakTests(opts: { log?: boolean } = {}
       }
       assertTrue(EXPERIENCES_MCP_INTERNAL_ERROR_TEXT.includes("Opplevagent") && DENTAL_MCP_INTERNAL_ERROR_TEXT.includes("Finn-tannlege"),
         "E6 …each in the platform's own name");
+      const { MCP_INTERNAL_ERROR_TEXT } = require("./mcp") as typeof import("./mcp");
+      const { mcpInternalErrorText } = require("../utils/internal-error") as typeof import("../utils/internal-error");
+      assertEq([MCP_INTERNAL_ERROR_TEXT, EXPERIENCES_MCP_INTERNAL_ERROR_TEXT, DENTAL_MCP_INTERNAL_ERROR_TEXT],
+        ["Rett fra Bonden", "Opplevagent", "Finn-tannlege"].map(mcpInternalErrorText), "E6 …from one template (utils/internal-error.ts)");
+      assertEq(MCP_INTERNAL_ERROR_TEXT,
+        "Beklager, det oppstod en intern feil hos Rett fra Bonden, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
+        "Sorry, an internal error at Rett fra Bonden stopped this request. Please try again later.",
+        "E6 …and Rett fra Bonden's text is the one RFB MCP answered before (AI-1)");
 
       // A database that is not open is still «no data» on Opplevagent MCP (unchanged).
       const { statement } = sqlitePrototypes();

@@ -145,6 +145,7 @@ import { conversationService, buildRequestMeta, type RequestMeta } from "../serv
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { capName } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -629,17 +630,15 @@ function registerWidgetResource(
  * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
  * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
  * client («Sokefeil: …», «Feil: …», «Bookingfeil: …»), SQLite's for one. The
- * wording is Rett fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts). A
- * database that is not open still answers that no data is available.
+ * wording is Rett fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts), from
+ * the same template (utils/internal-error.ts). A database that is not open
+ * still answers that no data is available.
  */
-export const EXPERIENCES_MCP_INTERNAL_ERROR_TEXT =
-  "Beklager, det oppstod en intern feil hos Opplevagent, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
-  "Sorry, an internal error at Opplevagent stopped this request. Please try again later.";
+export const EXPERIENCES_MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Opplevagent");
 
 /** A failed tool's isError result with EXPERIENCES_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
 function toolInternalError(tool: string, err: unknown) {
-  console.error(`[experiences-mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-  return { content: [{ type: "text" as const, text: EXPERIENCES_MCP_INTERNAL_ERROR_TEXT }], isError: true };
+  return mcpToolInternalErrorResult("experiences-mcp", EXPERIENCES_MCP_INTERNAL_ERROR_TEXT, tool, err);
 }
 
 export function registerExperienceTools(

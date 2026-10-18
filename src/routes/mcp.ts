@@ -31,6 +31,7 @@ import { isJunkDescription, normalizeProse } from "../services/description-quali
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { capFreeText, capName, capNameList } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -365,9 +366,7 @@ export function formatOpeningHoursForMcp(openingHours: unknown): string {
  * SDK returns the raw exception message (createToolError), which is how a
  * JavaScript TypeError reached ChatGPT. The detail is logged instead.
  */
-export const MCP_INTERNAL_ERROR_TEXT =
-  "Beklager, det oppstod en intern feil hos Rett fra Bonden, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
-  "Sorry, an internal error at Rett fra Bonden stopped this request. Please try again later.";
+export const MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Rett fra Bonden");
 
 /**
  * Wraps a tool handler: an uncaught error is logged with the tool name and
@@ -379,8 +378,7 @@ export function guardToolHandler<H extends (...args: any[]) => unknown>(tool: st
     try {
       return await handler(...args);
     } catch (err) {
-      console.error(`[mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-      return { content: [{ type: "text" as const, text: MCP_INTERNAL_ERROR_TEXT }], isError: true };
+      return mcpToolInternalErrorResult("mcp", MCP_INTERNAL_ERROR_TEXT, tool, err);
     }
   };
   return guarded as unknown as H;

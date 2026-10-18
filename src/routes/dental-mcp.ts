@@ -38,6 +38,7 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 
 const router = Router();
 
@@ -143,16 +144,14 @@ export function buildSearchResults(
  * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
  * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
  * client («Søkefeil: …», «Feil: …»), SQLite's for one. The wording is Rett
- * fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts).
+ * fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts), from the same
+ * template (utils/internal-error.ts).
  */
-export const DENTAL_MCP_INTERNAL_ERROR_TEXT =
-  "Beklager, det oppstod en intern feil hos Finn-tannlege, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
-  "Sorry, an internal error at Finn-tannlege stopped this request. Please try again later.";
+export const DENTAL_MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Finn-tannlege");
 
 /** A failed tool's isError result with DENTAL_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
 function toolInternalError(tool: string, err: unknown) {
-  console.error(`[dental-mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-  return { content: [{ type: "text" as const, text: DENTAL_MCP_INTERNAL_ERROR_TEXT }], isError: true };
+  return mcpToolInternalErrorResult("dental-mcp", DENTAL_MCP_INTERNAL_ERROR_TEXT, tool, err);
 }
 
 // ─── Tool registrations ──────────────────────────────────────
