@@ -12,6 +12,7 @@
 // Admin POST requires X-Admin-Key (same env var as rfb/dental).
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
+import { capFreeText } from "../utils/free-text";
 // The gårdssalg product-name extractor (moved to its own service, behaviour
 // unchanged — see the re-export next to gardssalgProductSourceText below).
 import {
@@ -1344,7 +1345,9 @@ router.get("/discover", (req: Request, res: Response) => {
       if (producerType) gsFilter.producer_type = producerType;
       // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-
       // text name/place lookup (`q`), same semantics as the MCP tool's `query`.
-      const gsQuery = typeof req.query.q === "string" ? req.query.q.trim() : "";
+      // Slice I-Y: cut like search text (utils/free-text.ts) before the
+      // lookup and the echo in `query`.
+      const gsQuery = capFreeText(typeof req.query.q === "string" ? req.query.q.trim() : "");
       if (gsQuery) gsFilter.q = gsQuery;
       // Only the literal string "true" is a real filter — omitted/false means
       // "no filter on this column" (matches discover_gardssalg's own

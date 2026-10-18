@@ -59,6 +59,7 @@ import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatal
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { buildProvenanceSummary } from "../services/cross-source-validator";
+import { capFreeText } from "../utils/free-text";
 
 const router = Router();
 
@@ -115,7 +116,10 @@ router.get("/agents", (req: Request, res: Response) => {
       specialty: req.query.specialty as string | undefined,
       verification_status: req.query.verification_status as string | undefined,
       enrichment_state: req.query.enrichment_state as string | undefined,
-      q: req.query.q as string | undefined,
+      // Slice I-Y: a free-text LIKE pattern, cut like search text
+      // (utils/free-text.ts). One past SQLite's pattern limit (50 000 bytes)
+      // was an HTTP 500. A `q` that is no string is left to the schema.
+      q: typeof req.query.q === "string" ? capFreeText(req.query.q) : (req.query.q as string | undefined),
       helfo_agreement: req.query.helfo_agreement as string | undefined,
       poststed: req.query.poststed as string | undefined,
       // acute_vakt: parse to number so z.literal(0|1) validates correctly

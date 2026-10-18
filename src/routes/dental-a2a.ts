@@ -286,7 +286,10 @@ export function handleDentalMessageSend(
       if (d.acute_vakt === 1 || d.acute_vakt === 0) {
         searchParams.acute_vakt = d.acute_vakt as 0 | 1;
       }
-      if (typeof d.q === "string") searchParams.q = d.q;
+      // Slice I-Y: the free-text `q` (a name or place as written) is cut like
+      // message text (utils/free-text.ts). It is a LIKE pattern, and one past
+      // SQLite's pattern limit (50 000 bytes) was an internal error.
+      if (typeof d.q === "string") searchParams.q = capFreeText(d.q);
     }
   }
 

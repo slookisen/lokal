@@ -14,21 +14,38 @@
  *   H   capFreeText(): text within the cap is returned as is; longer text
  *       keeps its whole words up to the cap; one very long word is cut at
  *       the cap, never inside a surrogate pair; it never rejects.
- *   T   every free-text entry: a 1 MB search (a real search, filler words,
- *       and a last word far beyond the cap) answers exactly as its first
- *       MAX_FREE_TEXT_CHARS characters do, in under 50 ms (best of 3):
+ *   T   every mapped free-text entry: a 1 MB search (a real search, filler
+ *       words, and a last word far beyond the cap) answers exactly as its
+ *       first MAX_FREE_TEXT_CHARS characters do, and is no error:
  *         RFB            MCP lokal_search, A2A message/send, GET
  *                        /api/marketplace/search, GET /sok, MCP
  *                        lokal_find_offers, GET /api/marketplace/catalog/offers
  *         Opplevagent    MCP discover_experiences (reads 300 characters, as
- *                        before), A2A message/send
- *         Finn-tannlege  MCP tannlege_search, A2A message/send, GET /sok
+ *                        before), A2A message/send, GET /sok, GET
+ *                        /for-tilbydere/finn, GET /api/opplevelser/discover
+ *                        with category=gardssalg_smaking and q
+ *         Finn-tannlege  MCP tannlege_search, A2A message/send (text, and
+ *                        the DataPart's free-text q), GET /sok, GET
+ *                        /api/tannlege/agents?q=
+ *   D   the same call, deterministic: no more than MAX_FREE_TEXT_CHARS
+ *       characters of the text reach SQLite (every catalog lookup and log
+ *       row of the three platforms, but RFB's A2A task row, which keeps the
+ *       request as sent; a spy on better-sqlite3) or RFB's parser (a spy on
+ *       marketplaceRegistry.parseNaturalQuery). The Opplevagent and
+ *       Finn-tannlege parsers are plain module exports, which a spy cannot
+ *       replace; SQLite and T's answer are their check. Then a loose time
+ *       check per platform: its slowest entry answers the 1 MB search in at
+ *       most 250 ms (best of 3). The cap is what bounds the time; 250 ms only
+ *       catches a regression without failing on a busy machine.
  *   C   control: within the cap the last word changes the answer, so T's
  *       «the same answer» means it was not read. Not for tannlege_search:
  *       its parser reads 256 characters (MAX_QUERY_CHARS) and its answer
  *       echoes no more of the text. R covers it instead: with the parser
  *       switched off (DENTAL_QUERY_PARSER_DISABLED=1) the whole text was a
- *       LIKE pattern, and a 1 MB one is a search error.
+ *       LIKE pattern, and a 1 MB one is a search error. Nor for GET
+ *       /api/tannlege/agents: its q is one LIKE pattern over the whole text,
+ *       which no filler text matches, and the answer echoes none of it; D
+ *       and T's «no error» cover it (a 1 MB q was an HTTP 500 on main).
  *   W   the word the cut splits is dropped. RFB's parser matches whole
  *       words, so a piece of a word would be read as a word of its own:
  *       «ost» (cheese) of «ostehøvel». The Opplevagent and Finn-tannlege A2A
@@ -39,11 +56,24 @@
  *       ChatGPT test sets (chatgpt-app-submission.json for RFB,
  *       opplevagent-chatgpt-app-submission.json for Opplevagent), the
  *       acceptance searches of I-W and I-W2 on every RFB entry, the
- *       Finn-tannlege searches of I-X, and searches for the offers.
+ *       Finn-tannlege searches of I-X, and searches for the offers, the
+ *       gårdssalg producers and the clinic names.
  *       tests/fixtures/fritekst-lengdetak-i-y-main.json holds the sha256 of
  *       each answer (ids, timestamps and origins masked), captured with
  *       b1Answers() below on main ad67dba6. The I-X messages themselves keep
  *       their own golden (a2a-datapart-alle-plattformer.test.ts).
+ *
+ * Not mapped here, on purpose (each needs its own cap or slice):
+ *   - place fields: Opplevagent /sok's `sted`, lokal_find_offers' `near`,
+ *     lokal_geocode and GET /api/marketplace/geocode;
+ *   - structured DataPart fields other than dental's free-text q (RFB
+ *     data.query, dental data.fylke, Opplevagent data.*);
+ *   - GET /api/marketplace/find-match?name= (an edit distance over the whole
+ *     name per producer; needs a much lower cap of its own);
+ *   - the number of lokal_find_offers items (each item is capped here);
+ *   - RFB's A2A task row, which stores the request's params as sent.
+ * Already bounded before I-Y: the Opplevagent REST and MCP experience text
+ * (300 characters) and MCP discover_gardssalg's query (schema max 200).
  *
  * Data: own in-memory DBs (main, dental, experiences; restored in finally),
  * geocoding offline, the real handlers: MCP tools through a duck-typed
@@ -59,10 +89,12 @@
  */
 
 import { EventEmitter } from "node:events";
+import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { __pinInMemoryDbForTesting } from "../database/init";
+import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
 import { capFreeText, MAX_FREE_TEXT_CHARS } from "../utils/free-text";
 import type { Seed, CatalogRow } from "./rfb-kategorietiketter-ikke-tilbud.test";
 import { enterFixtures as enterRfbDb, captureTools, textOf } from "./rfb-sok-ukjente-ord-bakeri-sted.test";
@@ -172,6 +204,8 @@ function postA2a(router: any, params: unknown): Promise<{ status: number; body: 
 }
 
 const textMessage = (text: string) => ({ message: { role: "user", parts: [{ kind: "text", text }] } });
+/** A message of one standard DataPart with the free-text `q` (I-X, utils/a2a-message.ts). */
+const qDataMessage = (q: string) => ({ message: { role: "user", parts: [{ kind: "data", data: { q } }] } });
 
 type ToolHandler = (args: any, extra?: any) => Promise<any>;
 /** A tool registry's handlers, through a duck-typed server. */
@@ -265,7 +299,7 @@ function enterRfb(): { asks: Record<string, Ask>; restore: () => void } {
   }
 }
 
-/** Fresh in-memory DBs for Finn-tannlege and Opplevagent (and a pinned main DB); their entries. */
+/** Fresh in-memory DBs for Finn-tannlege and Opplevagent (and a pinned main DB), geocoding offline; their entries. */
 function enterVerticals(): { asks: Record<string, Ask>; restore: () => void } {
   const prevEnv: Record<string, string | undefined> = {};
   for (const k of ["DENTAL_DB_PATH", "EXPERIENCES_DB_PATH", "DENTAL_QUERY_PARSER_DISABLED", "BOOKING_DISPATCH_ENABLED"]) prevEnv[k] = process.env[k];
@@ -274,17 +308,23 @@ function enterVerticals(): { asks: Record<string, Ask>; restore: () => void } {
   delete process.env.DENTAL_QUERY_PARSER_DISABLED;
   delete process.env.BOOKING_DISPATCH_ENABLED;
   const restoreMainDb = __pinInMemoryDbForTesting();
+  // Opplevagent's /sok tries a route («Oslo til Bergen») through the geocoder.
+  __setGeocodingFetchForTesting((async () => ({ ok: false, status: 404, json: async () => ({}) } as Response)) as typeof fetch);
+  __clearGeocodeCacheForTesting();
   const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
     require.resolve("../database/db-factory"),
     require.resolve("../services/dental-store"),
     require.resolve("../services/dental-catalog-class"),
     require.resolve("../services/dental-search-gazetteer"),
+    require.resolve("./dental"),
     require.resolve("./dental-a2a"),
     require.resolve("./dental-mcp"),
     require.resolve("./dental-seo"),
     require.resolve("../services/experience-store"),
     require.resolve("./experiences-a2a"),
     require.resolve("./experiences-mcp"),
+    require.resolve("./experiences-seo"),
+    require.resolve("./opplevelser"),
   ]);
   const restore = () => {
     try {
@@ -294,6 +334,8 @@ function enterVerticals(): { asks: Record<string, Ask>; restore: () => void } {
     }
     restoreModuleCache();
     restoreMainDb();
+    __setGeocodingFetchForTesting();
+    __clearGeocodeCacheForTesting();
     for (const [k, v] of Object.entries(prevEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -327,18 +369,41 @@ function enterVerticals(): { asks: Record<string, Ask>; restore: () => void } {
     addExperience("Nordlysjakt fra Tromsø", "Tromsø", "Troms", { season: ["winter"], lat: 69.65, lng: 18.95 });
     addExperience("Hvalsafari fra Tromsø", "Tromsø", "Troms", { season: ["winter"], category: "dyreliv_safari", lat: 69.66, lng: 18.96 });
     addExperience("Nordlyscruise fra Bergen", "Bergen", "Vestland", { season: ["winter"], lat: 60.39, lng: 5.32 });
+    // Gårdssalg producers: createProvider() sets no producer_type or slug.
+    const expDb = dbFactory.getDb("experiences");
+    const addFarmShop = (navn: string, slug: string, producerType: string, kommune: string, poststed: string, fylke: string) => {
+      const id = expStore.createProvider({
+        navn, fylke, kommune, poststed, brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+      } as any);
+      expDb.prepare("UPDATE experience_providers SET producer_type = ?, slug = ? WHERE id = ?").run(producerType, slug, id);
+    };
+    addFarmShop("Fjordgard Bryggeri", "fjordgard-bryggeri", "bryggeri", "Ullensvang", "ODDA", "Vestland");
+    addFarmShop("Hardanger Sideri", "hardanger-sideri", "sideri", "Ullensvang", "LOFTHUS", "Vestland");
+    addFarmShop("Egge Gård", "egge-gard", "sideri", "Lier", "LIER", "Buskerud");
 
     const dentalTools = duckTools((s) => (require("./dental-mcp") as typeof import("./dental-mcp")).registerDentalTools(s));
     const oaTools = duckTools((s) => (require("./experiences-mcp") as typeof import("./experiences-mcp")).registerExperienceTools(s));
     const dentalA2a = (require("./dental-a2a") as any).default;
     const oaA2a = (require("./experiences-a2a") as any).default;
     const dentalSok = routeHandler((require("./dental-seo") as any).default, "/sok");
+    const dentalAgents = routeHandler((require("./dental") as any).default, "/agents");
+    const oaSeo = (require("./experiences-seo") as any).default;
+    const oaSok = routeHandler(oaSeo, "/sok");
+    const oaFinn = routeHandler(oaSeo, "/for-tilbydere/finn");
+    const oaDiscover = routeHandler((require("./opplevelser") as any).default, "/discover");
+    const oaHost = "opplevagent.no";
     const asks: Record<string, Ask> = {
       "oa mcp discover_experiences": async (t) => stable(await oaTools.get("discover_experiences")!({ query: t, limit: 10 })),
       "oa a2a message/send": async (t) => stable(await postA2a(oaA2a, textMessage(t))),
+      "oa GET /sok": async (t) => stable(await getRoute(oaSok, { q: t }, oaHost)),
+      "oa GET /for-tilbydere/finn": async (t) => stable(await getRoute(oaFinn, { q: t }, oaHost)),
+      "oa GET /api/opplevelser/discover gardssalg": async (t) =>
+        stable(await getRoute(oaDiscover, { category: "gardssalg_smaking", q: t }, oaHost)),
       "dental mcp tannlege_search": async (t) => stable(await dentalTools.get("tannlege_search")!({ query: t, limit: 10 })),
       "dental a2a message/send": async (t) => stable(await postA2a(dentalA2a, textMessage(t))),
+      "dental a2a message/send data.q": async (t) => stable(await postA2a(dentalA2a, qDataMessage(t))),
       "dental GET /sok": async (t) => stable(await getRoute(dentalSok, { q: t }, "finn-tannlege.com")),
+      "dental GET /api/tannlege/agents": async (t) => stable(await getRoute(dentalAgents, { q: t }, "finn-tannlege.com")),
     };
     return { asks, restore };
   } catch (err) {
@@ -374,6 +439,13 @@ const RFB_ACCEPTANCE = [
  */
 const RFB_PARSED_ECHO_TEXTS = [...RFB_PROMPTS.filter((p) => !/\bfarm\b/i.test(p)), ...RFB_ACCEPTANCE];
 
+/** Names and places of the gårdssalg producers, as an owner or a guest types them. */
+const FARM_SHOP_SEARCHES = ["Fjordgard", "Fjordgard Bryggeri", "sideri", "sideri Hardanger", "Ullensvang", "Egge gård", "zzzqqx"];
+/** The Finn-tannlege searches of I-X. */
+const DENTAL_SEARCHES = ["tannlege i Oslo", "tannlege i Bergen", "kjeveortoped Bergen", "Finn klinikk 912 345 678", "912345678", "tannlege 0150 Oslo", "ring 22 33 44 55"];
+/** A clinic name or place as written (a LIKE over navn and poststed). */
+const CLINIC_NAME_SEARCHES = ["Bergen", "BERGEN", "Oslo Sentrum Tann", "majorstua", "Stavanger Tann", "zzzqqx"];
+
 /** Per entry, the searches whose answers must be main's. */
 export const B1_PLAN: Readonly<Record<string, readonly string[]>> = {
   "rfb mcp lokal_search": [...RFB_PROMPTS, ...RFB_ACCEPTANCE],
@@ -384,9 +456,14 @@ export const B1_PLAN: Readonly<Record<string, readonly string[]>> = {
   "rfb GET /api/marketplace/catalog/offers": ["honning", "kransekake", "egg", "Lynghonning", "grovbrød"],
   "oa mcp discover_experiences": OA_PROMPTS,
   "oa a2a message/send": OA_PROMPTS,
-  "dental mcp tannlege_search": ["tannlege i Oslo", "tannlege i Bergen", "kjeveortoped Bergen", "Finn klinikk 912 345 678", "912345678", "tannlege 0150 Oslo", "ring 22 33 44 55"],
-  "dental a2a message/send": ["tannlege i Oslo", "tannlege i Bergen", "kjeveortoped Bergen", "Finn klinikk 912 345 678", "912345678", "tannlege 0150 Oslo", "ring 22 33 44 55"],
-  "dental GET /sok": ["tannlege i Oslo", "tannlege i Bergen", "kjeveortoped Bergen", "Finn klinikk 912 345 678", "912345678", "tannlege 0150 Oslo", "ring 22 33 44 55"],
+  "oa GET /sok": [...OA_PROMPTS, "nordlys", "hvalsafari Tromsø", "Oslo til Bergen", ...FARM_SHOP_SEARCHES],
+  "oa GET /for-tilbydere/finn": FARM_SHOP_SEARCHES,
+  "oa GET /api/opplevelser/discover gardssalg": FARM_SHOP_SEARCHES,
+  "dental mcp tannlege_search": DENTAL_SEARCHES,
+  "dental a2a message/send": DENTAL_SEARCHES,
+  "dental a2a message/send data.q": CLINIC_NAME_SEARCHES,
+  "dental GET /sok": DENTAL_SEARCHES,
+  "dental GET /api/tannlege/agents": CLINIC_NAME_SEARCHES,
 };
 
 type B1Answers = Record<string, Record<string, { sha256: string; chars: number }>>;
@@ -434,13 +511,96 @@ const PROBES: Readonly<Record<string, { base: string; last: string; control: boo
   "rfb GET /api/marketplace/catalog/offers": { base: "honning", last: "egg", control: true },
   "oa mcp discover_experiences": { base: "nordlys", last: "Tromsø", control: true },
   "oa a2a message/send": { base: "nordlys", last: "Tromsø", control: true },
+  "oa GET /sok": { base: "nordlys", last: "Tromsø", control: true },
+  "oa GET /for-tilbydere/finn": { base: "Fjordgard", last: "Ullensvang", control: true },
+  "oa GET /api/opplevelser/discover gardssalg": { base: "sideri", last: "Ullensvang", control: true },
   // The parser reads 256 characters (MAX_QUERY_CHARS) and the answer echoes no more: no control.
   "dental mcp tannlege_search": { base: "tannlege i Bergen", last: "Oslo", control: false },
   "dental a2a message/send": { base: "tannlege i Bergen", last: "Oslo", control: true },
+  "dental a2a message/send data.q": { base: "Bergen", last: "Oslo", control: true },
   "dental GET /sok": { base: "tannlege i Bergen", last: "Oslo", control: true },
+  // One LIKE pattern over the whole text, which no filler text matches, and no echo: no control.
+  "dental GET /api/tannlege/agents": { base: "Bergen", last: "Oslo", control: false },
 };
 
-const LIMIT_MS = 50;
+/** D's loose time check: a platform's slowest entry, best of 3 (the cap bounds the time; see the header). */
+const LOOSE_LIMIT_MS = 250;
+
+/** The longest run of FILLER in `s`, in characters: how much of a probe's filler text `s` holds. */
+function fillerRun(s: string): number {
+  let longest = 0;
+  for (let i = s.indexOf(FILLER); i !== -1; ) {
+    let end = i;
+    while (s.startsWith(FILLER, end)) end += FILLER.length;
+    longest = Math.max(longest, end - i);
+    i = s.indexOf(FILLER, end);
+  }
+  return longest;
+}
+
+interface SeenInputs {
+  /** Strings bound to SQLite statements (or SQL texts prepared) during the call. */
+  sqlStrings: number;
+  /** The most of the probe's filler text (fillerRun) in any of them. */
+  sqlText: number;
+  /** The longest text RFB's parser (marketplaceRegistry.parseNaturalQuery) got; 0 when not called. */
+  parserChars: number;
+}
+
+/**
+ * The one SQLite row D leaves out: RFB's A2A task row, which keeps the
+ * request's params as sent (tasks/get returns them) and which no search
+ * reads. It is not free text read before parsing (FUNN in the PR).
+ */
+const STORED_AS_SENT = /^\s*INSERT INTO tasks \(/;
+
+/**
+ * D: what `call` hands on. A spy on better-sqlite3, which all three platforms
+ * use for every catalog lookup and log row (the SQL text of each prepare(),
+ * every bound value of run/get/all/iterate/bind, except STORED_AS_SENT), and
+ * one on RFB's parser. Both are restored in finally.
+ */
+async function watchInputs(call: () => Promise<unknown>): Promise<SeenInputs> {
+  const seen: SeenInputs = { sqlStrings: 0, sqlText: 0, parserChars: 0 };
+  const note = (v: unknown, nested = false): void => {
+    if (typeof v === "string") {
+      seen.sqlStrings++;
+      seen.sqlText = Math.max(seen.sqlText, fillerRun(v));
+    } else if (!nested && v && typeof v === "object" && !Buffer.isBuffer(v)) {
+      for (const x of Array.isArray(v) ? v : Object.values(v)) note(x, true);
+    }
+  };
+  const scratch = new Database(":memory:");
+  const statement = Object.getPrototypeOf(scratch.prepare("SELECT 1")) as Record<string, Function>;
+  scratch.close();
+  const database = Database.prototype as unknown as Record<string, Function>;
+  const patched: Array<[Record<string, Function>, string, Function]> = [];
+  const spy = (target: Record<string, Function>, method: string) => {
+    const original = target[method]!;
+    patched.push([target, method, original]);
+    target[method] = function (this: { source?: unknown }, ...args: unknown[]) {
+      if (!STORED_AS_SENT.test(String(this?.source ?? ""))) for (const a of args) note(a);
+      return original.apply(this, args);
+    };
+  };
+  for (const m of ["run", "get", "all", "iterate", "bind"]) spy(statement, m);
+  spy(database, "prepare");
+  const registry = (require("../services/marketplace-registry") as typeof import("../services/marketplace-registry")).marketplaceRegistry as any;
+  const ownParse = Object.prototype.hasOwnProperty.call(registry, "parseNaturalQuery");
+  const parse = registry.parseNaturalQuery;
+  registry.parseNaturalQuery = function (this: unknown, text: string) {
+    seen.parserChars = Math.max(seen.parserChars, String(text).length);
+    return parse.call(this, text);
+  };
+  try {
+    await call();
+  } finally {
+    for (const [target, method, original] of patched.reverse()) target[method] = original;
+    if (ownParse) registry.parseNaturalQuery = parse;
+    else delete registry.parseNaturalQuery; // the prototype's method again
+  }
+  return seen;
+}
 
 export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -488,9 +648,14 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
     assertEq(capFreeText(emoji), "x".repeat(MAX_FREE_TEXT_CHARS - 1), "H7 one long word: never cut between the halves of a surrogate pair");
     const nbsp = capFreeText("ord ".repeat(1000));
     assertEq([nbsp.length, nbsp.endsWith("ord")], [1999, true], "H8 a no-break space separates words too");
-    const t0 = process.hrtime.bigint();
-    capFreeText(oneMegabyte("honning", "egg"));
-    assertTrue(Number(process.hrtime.bigint() - t0) / 1e6 < 5, "H9 cutting 1 MB costs well under 5 ms (it reads at most the first 2000 characters)");
+    const mb = oneMegabyte("honning", "egg");
+    let bestCut = Infinity;
+    for (let run = 0; run < 3; run++) {
+      const t0 = process.hrtime.bigint();
+      capFreeText(mb);
+      bestCut = Math.min(bestCut, Number(process.hrtime.bigint() - t0) / 1e6);
+    }
+    assertTrue(bestCut < 5, `H9 cutting 1 MB costs well under 5 ms (it reads at most the first 2000 characters; best of 3: ${bestCut.toFixed(2)} ms)`);
     const lengths = [...RFB_PROMPTS, ...OA_PROMPTS].map((p) => p.length);
     assertTrue(lengths.length >= 16 && Math.max(...lengths) * 10 < MAX_FREE_TEXT_CHARS,
       `H10 the cap covers every real search: the longest ChatGPT test prompt is ${Math.max(...lengths)} characters, under a tenth of the cap`);
@@ -501,7 +666,7 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
     const main = JSON.parse(fs.readFileSync(B1_FIXTURE, "utf8")) as { answers: B1Answers };
     const plan: Record<string, string[]> = Object.fromEntries(Object.entries(main.answers).map(([entry, byText]) => [entry, Object.keys(byText)]));
     const now = await b1Answers(plan);
-    assertEq(Object.keys(main.answers).sort(), Object.keys(PROBES).sort(), "B1 the fixture covers every free-text entry");
+    assertEq(Object.keys(main.answers).sort(), Object.keys(PROBES).sort(), "B1 the fixture covers the mapped entries (PROBES)");
     let compared = 0;
     for (const [entry, byText] of Object.entries(main.answers)) {
       for (const [text, want] of Object.entries(byText)) {
@@ -511,7 +676,7 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
           (got?.sha256 === want.sha256 ? "" : ` (main ${want.chars} characters, now ${got?.chars})`));
       }
     }
-    assertTrue(compared >= 150 && RFB_PROMPTS.every((p) => p in (main.answers["rfb mcp lokal_search"] ?? {}))
+    assertTrue(compared >= 200 && RFB_PROMPTS.every((p) => p in (main.answers["rfb mcp lokal_search"] ?? {}))
       && OA_PROMPTS.every((p) => p in (main.answers["oa a2a message/send"] ?? {})),
       `B1 the fixture holds the test sets of both submission files and the I-W/I-W2 searches (${compared} answers)`);
   }
@@ -519,26 +684,38 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence module chatter */ };
   try {
+    /** Per platform (rfb, oa, dental), its slowest entry: best of 3 for the 1 MB search. */
+    const slowest: Record<string, { entry: string; ms: number }> = {};
     // One fixture at a time: the vertical fixture pins its own main DB.
     for (const enter of [enterRfb, enterVerticals]) {
       const fx = enter();
       try {
-        // ══ T / C  every entry ═════════════════════════════════════════════
+        assertEq(Object.keys(fx.asks).filter((entry) => !PROBES[entry] || !B1_PLAN[entry]), [],
+          "T setup: every entry driven here has a probe and B1 searches");
+        // ══ T / D / C  every entry ═════════════════════════════════════════
         for (const [entry, ask] of Object.entries(fx.asks)) {
           const probe = PROBES[entry];
           const big = oneMegabyte(probe.base, probe.last);
           const capped = capFreeText(big);
           assertTrue(big.length >= ONE_MB && capped.length <= MAX_FREE_TEXT_CHARS && !capped.includes(probe.last),
             `T ${entry}: setup, a 1 MB search whose last word «${probe.last}» lies beyond the cap`);
-          let best = Infinity;
           let answer = "";
+          const seen = await watchInputs(async () => { answer = await ask(big); });
+          assertTrue(seen.sqlStrings > 0 && (!entry.startsWith("rfb ") || /lokal_find_offers|catalog\/offers/.test(entry) || seen.parserChars > 0),
+            `D ${entry}: setup, the spies see the call (${seen.sqlStrings} SQL strings, parser ${seen.parserChars} characters)`);
+          assertTrue(seen.sqlText <= MAX_FREE_TEXT_CHARS && seen.parserChars <= MAX_FREE_TEXT_CHARS,
+            `D ${entry}: at most ${MAX_FREE_TEXT_CHARS} characters of a 1 MB search reach SQLite (${seen.sqlText}) and RFB's parser (${seen.parserChars})`);
+          assertTrue(!/"isError":true|"error":\{"code":|"status":5\d\d\b/.test(answer),
+            `T ${entry}: a 1 MB search is no error (${answer.slice(0, 160)})`);
+          assertSameAnswer(answer, await ask(capped), `T ${entry}: a 1 MB search answers as its first ${MAX_FREE_TEXT_CHARS} characters (whole words)`);
+          let best = Infinity;
           for (let run = 0; run < 3; run++) {
             const t0 = process.hrtime.bigint();
-            answer = await ask(big);
+            await ask(big);
             best = Math.min(best, Number(process.hrtime.bigint() - t0) / 1e6);
           }
-          assertSameAnswer(answer, await ask(capped), `T ${entry}: a 1 MB search answers as its first ${MAX_FREE_TEXT_CHARS} characters (whole words)`);
-          assertTrue(best < LIMIT_MS, `T ${entry}: …in under ${LIMIT_MS} ms (best of 3: ${best.toFixed(1)} ms)`);
+          const platform = entry.split(" ")[0]!;
+          if (!slowest[platform] || best > slowest[platform].ms) slowest[platform] = { entry, ms: best };
           if (probe.control) {
             const near = probe.base + FILLER.repeat(50);
             assertTrue(await ask(`${near} ${probe.last}`) !== await ask(near),
@@ -605,6 +782,13 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
       } finally {
         fx.restore();
       }
+    }
+
+    // ══ D  the loose time check, per platform ═════════════════════════════
+    assertEq(Object.keys(slowest).sort(), ["dental", "oa", "rfb"], "D the time check covers the three platforms");
+    for (const [platform, { entry, ms }] of Object.entries(slowest)) {
+      assertTrue(ms <= LOOSE_LIMIT_MS,
+        `D ${platform}: its slowest entry answers a 1 MB search in at most ${LOOSE_LIMIT_MS} ms (${entry}: ${ms.toFixed(1)} ms, best of 3)`);
     }
   } catch (err: any) {
     failed++;

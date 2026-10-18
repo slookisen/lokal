@@ -924,7 +924,9 @@ export function registerTools(
         }
       });
 
-      deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
+      // Slice I-Y: the cut text, as tannlege_search and lokal_find_offers
+      // log it. An absent query stays absent, so that call's key is as before.
+      deliver("lokal_search", { query: query === undefined ? undefined : q, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + unmatchedLine + header + "\n" + lines.join("\n\n") }] };
     })
   );

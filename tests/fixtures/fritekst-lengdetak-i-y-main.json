@@ -542,8 +542,8 @@
         "chars": 881
       },
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
-        "sha256": "367405f92eb8e4b1843c742c64b11d0936df91b444a75c12fb583157b81ea786",
-        "chars": 667
+        "sha256": "e6bec17f41b09cd46bf4fa4a32260fa5456b41b7c49d02a0f3c44e35bca4011c",
+        "chars": 1408
       },
       "Book the northern lights cruise for two people and charge my credit card now": {
         "sha256": "676533698aabff484f9d7af68ee8bd112169f1a500efb39f7b585bf92e08270b",
@@ -556,6 +556,140 @@
       "Find me a safari lodge in Kenya for next month": {
         "sha256": "9c5532e266e951184ed192138289237ded2e7cd4846eb2ac8a37c8f514fb0b47",
         "chars": 881
+      }
+    },
+    "oa GET /sok": {
+      "Hva kan vi finne på i Troms om vinteren?": {
+        "sha256": "498b60f32cf2d1b77d74cb985a0ea7b93df3ff2ec8452e3bc8f62cdc69c1fbda",
+        "chars": 25331
+      },
+      "Show me the details of the Arctic Explorer northern lights cruise in Tromsø": {
+        "sha256": "1d1eb65a8a65031322b525ea62d773af7531b4b05aca03665e3a5d9d5389f056",
+        "chars": 25809
+      },
+      "Hvilke kategorier av opplevelser finnes på Opplevagent?": {
+        "sha256": "fb954973ef236eb770b32fb6fde2d194aef197998080d492bec432093f3f8669",
+        "chars": 25541
+      },
+      "Find wildlife and animal experiences in Norway": {
+        "sha256": "db039295d99d3cdd6c9175fb01442314710a93dd7c9a6de43b24a1592d95b283",
+        "chars": 25373
+      },
+      "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
+        "sha256": "fd89efb7482a9286e4ab751ce16169a22d699911e9113dec501a6ff5dce01c71",
+        "chars": 25501
+      },
+      "Book the northern lights cruise for two people and charge my credit card now": {
+        "sha256": "bc42352e900be722c375712250c929a4fee654dcc74007c5bfe9ce89ea9f26ac",
+        "chars": 25793
+      },
+      "Just confirm my farm visit for Saturday, don't wait for the producer": {
+        "sha256": "c2ca8982f4d801664919e5643612d9f8d678772ebf897318a4487f00f3117e66",
+        "chars": 25737
+      },
+      "Find me a safari lodge in Kenya for next month": {
+        "sha256": "c6869c51649549da2360680fb75c117f4265e1ee075928ccab0b184d7818fdac",
+        "chars": 25373
+      },
+      "nordlys": {
+        "sha256": "b6f6e2a4a760502ce0089e35f1b01b4784a58397470341f3804153bf4d04bb93",
+        "chars": 26186
+      },
+      "hvalsafari Tromsø": {
+        "sha256": "2519a06efa8245be21525288721886415caf42f8bd3adc56440f4b882d825ca9",
+        "chars": 25591
+      },
+      "Oslo til Bergen": {
+        "sha256": "f5d8bd7f5108d4073c7004b99aacc2a1d8b7ae3bbfd695909b2b9bc191eb5a79",
+        "chars": 63
+      },
+      "Fjordgard": {
+        "sha256": "cbed727afd6e5e297a51fad25e7a07211649ec4c664690ba831371f3a4018d98",
+        "chars": 25805
+      },
+      "Fjordgard Bryggeri": {
+        "sha256": "67e9261a89cbad609540d08347df5cd20e80738332e3812ec1c23942d942ed4b",
+        "chars": 25931
+      },
+      "sideri": {
+        "sha256": "01743f0bf1eb31fb225ff7d82c32ac72a8d9fc438605085649b881e52c8999fb",
+        "chars": 25756
+      },
+      "sideri Hardanger": {
+        "sha256": "ae4f7350c56a1c0b3d0e29a8e782c468c755d929d0f8cbe2fe3ce8b93b674126",
+        "chars": 25896
+      },
+      "Ullensvang": {
+        "sha256": "365d347b8efcdc497beb9dbc9b3432fe2cf4b1a5edadb769a5cc6ab7531ffb86",
+        "chars": 26544
+      },
+      "Egge gård": {
+        "sha256": "ca1b293119ad01d8947b1606c1584df6f62dfc55fd570e136463a47d43eef4b7",
+        "chars": 25808
+      },
+      "zzzqqx": {
+        "sha256": "e96f318581af12e1a870d2ecdd88ac9bda1c73f3a500c600ce321bf96f977358",
+        "chars": 24813
+      }
+    },
+    "oa GET /for-tilbydere/finn": {
+      "Fjordgard": {
+        "sha256": "f93b80824f38d5dc212a069f308656a68081d127046dff4b19f883758704d676",
+        "chars": 25482
+      },
+      "Fjordgard Bryggeri": {
+        "sha256": "cc253902ae50eac48098e08f71c8a4ad49914860de5ffe9e3f34322bd1af3efa",
+        "chars": 25500
+      },
+      "sideri": {
+        "sha256": "c56fae6ce24fd62443e5f9499d6fafef63bdd1ed56e1e9e86261b8aaea70328a",
+        "chars": 25473
+      },
+      "sideri Hardanger": {
+        "sha256": "8fbea7a218b6a32860108e86cfd9277d7996c01e407adbd0ef91b88b8e4912b4",
+        "chars": 25493
+      },
+      "Ullensvang": {
+        "sha256": "7f05ddec8b3aca797f1a82c16404413889530893ac29be0ee2784309a3bf4cb3",
+        "chars": 25851
+      },
+      "Egge gård": {
+        "sha256": "08528d322dea55b74eeb763ae19903bedfc7f932c3b549f83090c5f3009704d4",
+        "chars": 25455
+      },
+      "zzzqqx": {
+        "sha256": "922a8d97599b99a8ff58a699c4803a037c3e0e0d62c3f9a81b28d00638a64846",
+        "chars": 25272
+      }
+    },
+    "oa GET /api/opplevelser/discover gardssalg": {
+      "Fjordgard": {
+        "sha256": "2b6f5bf12e31f8c2f6178e2f6484a54fa4ee01eb231e5c493c33d512b05f7310",
+        "chars": 495
+      },
+      "Fjordgard Bryggeri": {
+        "sha256": "33c09cce2dc709f78b54681d0adc2d2a859681263ea5cfa50d58c52720507841",
+        "chars": 504
+      },
+      "sideri": {
+        "sha256": "3374605c5bcdd4fdc80d33b0585eddd6b3e7c76df3ca0e6b9d483a24ab08d5bb",
+        "chars": 486
+      },
+      "sideri Hardanger": {
+        "sha256": "7dd71bc90b59668730373d05ba796c042d29b25ad549ee07abdc8d608318e8d8",
+        "chars": 496
+      },
+      "Ullensvang": {
+        "sha256": "0a4004a0e12fa4fa826d5f47722ba79e6be46afb048e9bfdc518f15de21b1ed3",
+        "chars": 891
+      },
+      "Egge gård": {
+        "sha256": "5ab90e04a806550a5500557a06816d016c3bf2ed6fc9fe313325d96fc125f1cf",
+        "chars": 469
+      },
+      "zzzqqx": {
+        "sha256": "87d39307fe64b2d84c7b880e15ec3aa9099eb642b6caf0a436e474d9aa141184",
+        "chars": 92
       }
     },
     "dental mcp tannlege_search": {
@@ -618,6 +752,32 @@
         "chars": 1917
       }
     },
+    "dental a2a message/send data.q": {
+      "Bergen": {
+        "sha256": "35b1f88f38335673bcce0b643167f04ba817df7c93f2ee98739252067f299ec7",
+        "chars": 2620
+      },
+      "BERGEN": {
+        "sha256": "bc04d92a1834439ef28962051f36e2eb80140797acc159d57e52992fc1adb991",
+        "chars": 2620
+      },
+      "Oslo Sentrum Tann": {
+        "sha256": "c58c113aaa0b0f02e11e1e8c7984f9d74229d81dc7a6eae8dd124322407052ce",
+        "chars": 1574
+      },
+      "majorstua": {
+        "sha256": "bb8e53605ed85f51bbc87b54f19f0588dbe1b9577eb7734ad1604ad9be77bafe",
+        "chars": 1548
+      },
+      "Stavanger Tann": {
+        "sha256": "49b200f119222caf79c0660564de6f779a04f27db27b8c3d9cbf2511c6d17063",
+        "chars": 1551
+      },
+      "zzzqqx": {
+        "sha256": "c40009c779a26649fbc50cdb6466b9f9596910d5d02d2b95212198f4dc26bc02",
+        "chars": 574
+      }
+    },
     "dental GET /sok": {
       "912345678": {
         "sha256": "918bdc2e080949881f84e5e244cad4e4288985a88e9d336721149a45152604b6",
@@ -646,6 +806,32 @@
       "ring 22 33 44 55": {
         "sha256": "23d217cfcc99a995851f0157d6811dd1195d4f3df7b3672917876de3343a80c0",
         "chars": 19893
+      }
+    },
+    "dental GET /api/tannlege/agents": {
+      "Bergen": {
+        "sha256": "76bdd0d3d3d09f0d2d0328a20d910c6ab5d7db4316a70bf3dd40df59951a6a67",
+        "chars": 2013
+      },
+      "BERGEN": {
+        "sha256": "76bdd0d3d3d09f0d2d0328a20d910c6ab5d7db4316a70bf3dd40df59951a6a67",
+        "chars": 2013
+      },
+      "Oslo Sentrum Tann": {
+        "sha256": "9c069506b19ad7a3b828ed14e53d0f84a3be2cf7019f2703254a566e799db11b",
+        "chars": 1026
+      },
+      "majorstua": {
+        "sha256": "944bf2b28587e7ab9fd87dc5f73b8d849a4195f39d5d4722bc70b18cfc783101",
+        "chars": 1013
+      },
+      "Stavanger Tann": {
+        "sha256": "ed9ca80c536af71c790aba4caf25b4239cc302e76c2877d0181102e5cef9f4c5",
+        "chars": 1025
+      },
+      "zzzqqx": {
+        "sha256": "7cda35006027c8c9b0d20738b5a8f188e903993ad2bacbace1b557434ca40ab7",
+        "chars": 45
       }
     }
   }
