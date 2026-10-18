@@ -47,7 +47,7 @@ import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
 import { a2aMessageData } from "../utils/a2a-message";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 
 const router = Router();
 
@@ -60,6 +60,20 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
   const err: Record<string, unknown> = { code, message };
   if (data !== undefined) err.data = data;
   return { jsonrpc: "2.0", error: err, id };
+}
+
+/**
+ * The answer to a request that failed inside the handler: JSON-RPC's generic
+ * -32603 "Internal error", without the detail. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+ * dental-a2a-intern-feiltekst-i-svar): the error's own message went to the
+ * caller as `data`, for example SQLite's «LIKE or GLOB pattern too complex».
+ * The detail is logged instead, without the request (`where` says which step
+ * failed).
+ */
+function rpcInternalError(id: unknown, where: string, err: unknown) {
+  console.error(`[dental-a2a] ${where} failed:`, err instanceof Error ? err.stack || err.message : String(err));
+  return rpcErr(id, -32603, "Internal error");
 }
 
 // ─── Zod envelope schema ─────────────────────────────────────
@@ -278,7 +292,10 @@ export function handleDentalMessageSend(
     const data = a2aMessageData(message);
     if (data && typeof data === "object") {
       const d = data as Record<string, unknown>;
-      if (typeof d.fylke === "string") searchParams.fylke = d.fylke;
+      // Slice I-Y2: the data's strings are cut to MAX_FREE_TEXT_CHARS
+      // (utils/a2a-message.ts), and `fylke`, a place name, to MAX_NAME_CHARS
+      // (utils/free-text.ts), as in tannlege_search.
+      if (typeof d.fylke === "string") searchParams.fylke = capName(d.fylke);
       if (typeof d.specialty === "string") searchParams.specialty = d.specialty;
       if (d.helfo_agreement === "true" || d.helfo_agreement === "false") {
         searchParams.helfo_agreement = d.helfo_agreement as "true" | "false";
@@ -318,8 +335,7 @@ export function handleDentalMessageSend(
         metadata: { skill: "tannlege_stats" },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (tannlege_stats)", err);
     }
   }
 
@@ -358,8 +374,7 @@ export function handleDentalMessageSend(
         metadata: { skill: "tannlege_info", org_nr: orgNr },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (tannlege_info)", err);
     }
   }
 
@@ -420,8 +435,7 @@ export function handleDentalMessageSend(
       },
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return rpcErr(id, -32603, "Internal error", msg);
+    return rpcInternalError(id, "message/send (tannlege_search)", err);
   }
 }
 
@@ -466,8 +480,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         res.json(rpcErr(id, -32601, `Method not found: ${method}`));
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.json(rpcErr(id, -32603, "Internal error", msg));
+    res.json(rpcInternalError(id, "POST /a2a", err));
   }
 });
 

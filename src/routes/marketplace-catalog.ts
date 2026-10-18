@@ -33,7 +33,7 @@ import { computeEffectiveAvailability } from "../services/supply-graph";
 import { runProductCatalogSync } from "../services/product-catalog-sync";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { isValidLatLng } from "../utils/geo-query";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical) for the
 // public LIST surfaces below (/feed, /acp-feed.csv). The direct-id order-flow
@@ -427,7 +427,9 @@ catalogRouter.get("/offers", async (req: Request, res: Response) => {
   const lat = parseFloat(String(req.query.lat ?? ""));
   const lng = parseFloat(String(req.query.lng ?? ""));
   const hasCoords = isValidLatLng(lat, lng);
-  const near = typeof req.query.near === "string" ? req.query.near.trim() : "";
+  // Slice I-Y2: a place name, cut to MAX_NAME_CHARS at a word boundary, as
+  // lokal_find_offers' `near` is.
+  const near = capName(typeof req.query.near === "string" ? req.query.near.trim() : "");
 
   if (!hasCoords && !near) {
     res.status(400).json({

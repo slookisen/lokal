@@ -30,7 +30,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -402,6 +402,41 @@ export function cartResultText(tool: string, result: { success: boolean; status?
     return JSON.stringify({ ...result, error: MCP_INTERNAL_ERROR_TEXT }, null, 2);
   }
   return JSON.stringify(result, null, 2);
+}
+
+/**
+ * The most items one lokal_find_offers call looks up (dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y2, FUNN
+ * rfb-find-offers-items-uten-antallstak). Each item is a catalog lookup and
+ * the schema has no max (it is frozen while OpenAI reviews the app), so 5000
+ * items took about 5 s on live-like data, and a 1 MB list tens of seconds.
+ * A shopping list is far shorter. The items past the cap are left out, and
+ * the answer says so (offersItemsOmittedText).
+ */
+export const MAX_OFFER_ITEMS = 20;
+
+/** How many of the items left out the note names (offersItemsOmittedText). */
+const OMITTED_OFFER_ITEMS_NAMED = 5;
+
+/**
+ * The note of a lokal_find_offers answer that left items out (NO / EN): the
+ * first MAX_OFFER_ITEMS of `items` were looked up. It names the first
+ * OMITTED_OFFER_ITEMS_NAMED items left out, each cut as a name (capName), so
+ * the client can ask for exactly those.
+ */
+export function offersItemsOmittedText(items: readonly string[]): string {
+  const asked = items.length;
+  const left = asked - MAX_OFFER_ITEMS;
+  const named = items.slice(MAX_OFFER_ITEMS, MAX_OFFER_ITEMS + OMITTED_OFFER_ITEMS_NAMED)
+    .map((item) => JSON.stringify(capName(item))).join(", ");
+  const no = `Bare de ${MAX_OFFER_ITEMS} første av ${asked} varene er slått opp, og ${left} er utelatt`;
+  const en = `Only the first ${MAX_OFFER_ITEMS} of ${asked} items were looked up, and ${left} ${left === 1 ? "was" : "were"} left out`;
+  if (left <= OMITTED_OFFER_ITEMS_NAMED) {
+    return `${no}: ${named}. Spør etter ${left === 1 ? "den" : "dem"} i et nytt kall. / ` +
+      `${en}: ${named}. Ask for ${left === 1 ? "it" : "them"} in another call.`;
+  }
+  return `${no}. De første av dem er ${named}. Spør etter resten i et nytt kall. / ` +
+    `${en}, the first of them ${named}. Ask for the rest in another call.`;
 }
 
 // ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
@@ -1387,7 +1422,12 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    guardToolHandler("lokal_bm_next_markets", async ({ region, lokallag_slug, days }) => {
+    guardToolHandler("lokal_bm_next_markets", async ({ region: regionAsSent, lokallag_slug, days }) => {
+      // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): `region` is a
+      // place name, cut to MAX_NAME_CHARS at a word boundary
+      // (utils/free-text.ts). It is a LIKE over each event's place, and an
+      // empty answer echoes it.
+      const region = capName(regionAsSent);
       const db = getDb();
       const lookahead = Math.max(1, Math.min(days || 30, 90));
       const fromIso = new Date().toISOString();
@@ -1483,7 +1523,10 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    guardToolHandler("lokal_geocode", async ({ place }) => {
+    guardToolHandler("lokal_geocode", async ({ place: placeAsSent }) => {
+      // Slice I-Y2: a place name, cut to MAX_NAME_CHARS at a word boundary
+      // (utils/free-text.ts); the answer echoes it when nothing is found.
+      const place = capName(placeAsSent);
       const result = await geocodingService.geocode(place);
       if (!result) {
         return {
@@ -1533,7 +1576,11 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    guardToolHandler("lokal_find_offers", async ({ items, near, lat, lng, radius_km }, extra) => {
+    guardToolHandler("lokal_find_offers", async ({ items, near: nearAsSent, lat, lng, radius_km }, extra) => {
+      // Slice I-Y2: `near` is a place name, cut to MAX_NAME_CHARS at a word
+      // boundary (utils/free-text.ts). Each item's lookup used to geocode the
+      // whole text again.
+      const near = capName(nearAsSent);
       const foreign = foreignPlaceIn(near);
       if (foreign) return outsideNorwayAnswer(foreign);
       const hasCoords = isValidLatLng(lat as number, lng as number);
@@ -1550,7 +1597,8 @@ export function registerTools(
       // Slice I-Y: each item is a catalog lookup, so each is cut like the
       // search text (utils/free-text.ts). An item past SQLite's LIKE pattern
       // limit (50 000 bytes) used to fail the whole call.
-      const terms = items.map(capFreeText);
+      // Slice I-Y2: and only the first MAX_OFFER_ITEMS items are looked up.
+      const terms = items.slice(0, MAX_OFFER_ITEMS).map((item) => capFreeText(item));
       const results = [];
       for (const q of terms) {
         const result = await findOffers({
@@ -1567,7 +1615,10 @@ export function registerTools(
       // I-S2: a category match hands its producer to the caller too.
       deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
-      return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
+      const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
+      // I-Y2: the JSON stays the list of results; the note is its own part.
+      if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
+      return { content };
     })
   );
 

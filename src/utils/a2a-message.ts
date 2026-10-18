@@ -1,3 +1,5 @@
+import { capFreeText, capName } from "./free-text";
+
 /**
  * The structured data of an A2A message, shared by the three message/send
  * handlers: RFB (routes/a2a.ts), Opplevagent (routes/experiences-a2a.ts) and
@@ -15,18 +17,71 @@
  *   - a message with neither gives `message.data` itself (undefined, or a
  *     null the caller sent), so every handler answers it as before.
  * Text keeps the place it has in each handler: this reads data only.
+ *
+ * Slice I-Y2 (FUNN a2a-datapart-strengfelt-uten-lengdetak): the data comes
+ * back with its strings cut (capA2aData), as the message text is. A field of
+ * 1 MB (dental `fylke`, RFB `query`) went whole to the search, the logs and
+ * the answer, which echoes it.
  */
 export function a2aMessageData(message: unknown): unknown {
   if (!message || typeof message !== "object") return undefined;
   const m = message as Record<string, unknown>;
-  if (m.data !== undefined && m.data !== null) return m.data;
+  if (m.data !== undefined && m.data !== null) return capA2aData(m.data);
   if (Array.isArray(m.parts)) {
     for (const p of m.parts) {
       if (!p || typeof p !== "object") continue;
       const part = p as Record<string, unknown>;
       if ((part.kind ?? part.type) !== "data") continue;
-      if (part.data && typeof part.data === "object" && !Array.isArray(part.data)) return part.data;
+      if (part.data && typeof part.data === "object" && !Array.isArray(part.data)) return capA2aData(part.data);
     }
   }
   return m.data;
+}
+
+/**
+ * The most entries of a list in the data that are read (slice I-Y2). The
+ * lists the handlers read are RFB's `categories`, `tags` and `skills`, and
+ * each entry is compared with every producer's categories, tags or skills.
+ * The platform has 12 categories (PLATFORM_CATEGORIES in
+ * services/search-enrich.ts).
+ */
+export const MAX_A2A_DATA_LIST_ITEMS = 50;
+
+/** A string cut to MAX_FREE_TEXT_CHARS (utils/free-text.ts); any other value as it is. */
+function capString(v: unknown): unknown {
+  return typeof v === "string" ? capFreeText(v) : v;
+}
+
+/**
+ * A list's first MAX_A2A_DATA_LIST_ITEMS entries, each string a name cut to
+ * MAX_NAME_CHARS (utils/free-text.ts): a category, tag or skill. The list
+ * itself when that changes nothing.
+ */
+function capList(list: unknown[]): unknown[] {
+  const kept = list.length > MAX_A2A_DATA_LIST_ITEMS ? list.slice(0, MAX_A2A_DATA_LIST_ITEMS) : list;
+  const cut = kept.map((v) => (typeof v === "string" ? capName(v) : v));
+  return kept === list && cut.every((v, i) => v === list[i]) ? list : cut;
+}
+
+/**
+ * The data with its strings cut (slice I-Y2): a string, the string values of
+ * an object and the lists among them (capList). The handlers read no string
+ * deeper than that, so a nested object is kept as it is. Data within the
+ * caps is returned as the same value, so every such message answers as
+ * before. This bounds each field; the message as a whole is bounded by the
+ * body limit (express.json, 1 MB), as before.
+ */
+export function capA2aData(data: unknown): unknown {
+  if (typeof data === "string") return capFreeText(data);
+  if (Array.isArray(data)) return capList(data);
+  if (!data || typeof data !== "object") return data;
+  let changed = false;
+  const entries = Object.entries(data as Record<string, unknown>).map(([key, value]) => {
+    const capped = Array.isArray(value) ? capList(value) : capString(value);
+    if (capped !== value) changed = true;
+    return [key, capped] as const;
+  });
+  // fromEntries defines each key as an own property, also a `__proto__` key
+  // from the JSON body, which an assignment would take as the prototype.
+  return changed ? Object.fromEntries(entries) : data;
 }

@@ -24,7 +24,7 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
-import { a2aMessageData } from "../utils/a2a-message";
+import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
 import { searchCountable } from "../services/search-tracking";
 
@@ -306,8 +306,12 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     discoveryQuery = messageData;
   }
   // Mode 3: Treat entire params as query
+  // Slice I-Y2: cut as the data of Mode 2 is (capA2aData). These fields went
+  // whole to discover(): 100 000 categories, within the 1 MB body limit,
+  // blocked the process for about 46 s with 1500 producers. Params within
+  // the caps are the same object, so such a message answers as before.
   else {
-    discoveryQuery = params;
+    discoveryQuery = capA2aData(params);
   }
 
   // ─── Spam guard (2026-10-04) ──────────────────────────────

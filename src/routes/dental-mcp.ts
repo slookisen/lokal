@@ -29,7 +29,7 @@ import {
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch } from "../services/dental-query-parser";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
@@ -179,7 +179,11 @@ export function registerDentalTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async ({ query, fylke, spesialitet, helfo, akutt, limit }, extra) => {
+    async ({ query, fylke: fylkeAsSent, spesialitet, helfo, akutt, limit }, extra) => {
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+      // strukturerte-stedsfelt-uten-lengdetak): `fylke` is a place name, cut
+      // to MAX_NAME_CHARS at a word boundary (utils/free-text.ts).
+      const fylke = capName(fylkeAsSent);
       try {
         // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): `query`
         // goes through the shared parser; the explicit arguments win over
@@ -354,7 +358,9 @@ export function registerDentalTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async ({ fylke }) => {
+    async ({ fylke: fylkeAsSent }) => {
+      // Slice I-Y2: a place name, cut as in tannlege_search.
+      const fylke = capName(fylkeAsSent);
       try {
         // S2b: the public store reads acute_vakt 1 as the akutt claim
         // (DENTAL_ACUTE_CLAIM_SQL), so `count` and every card here are clinics

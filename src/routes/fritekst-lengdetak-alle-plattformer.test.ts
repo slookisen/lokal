@@ -77,7 +77,8 @@
  * only inside a hash (listKey, services/profile-ai-deliveries.ts), so neither
  * D's spy nor an answer shows whether they were cut.
  *
- * Not mapped here, on purpose (each needs its own cap or slice):
+ * Not mapped here, on purpose (each needs its own cap or slice; slice I-Y2
+ * caps all but the task row, dyre-oppslag-tak.test.ts):
  *   - place fields: Opplevagent /sok's `sted`, lokal_find_offers' `near`,
  *     lokal_geocode, GET /api/marketplace/geocode and lokal_bm_next_markets'
  *     `region` (a LIKE over the event's place, echoed in an empty answer);
@@ -123,11 +124,11 @@ export interface TestSummary {
 /** An entry's answer to one text, as one string with what differs per run masked. */
 type Ask = (text: string) => Promise<string>;
 
-const ONE_MB = 1024 * 1024;
-const FILLER = " og";
+export const ONE_MB = 1024 * 1024;
+export const FILLER = " og";
 
 /** `base`, FILLER up to 1 MB, then ` ${last}`: the last word lies far beyond the cap. */
-function oneMegabyte(base: string, last: string): string {
+export function oneMegabyte(base: string, last: string): string {
   return base + FILLER.repeat(Math.ceil((ONE_MB - base.length - last.length - 1) / FILLER.length)) + " " + last;
 }
 
@@ -137,7 +138,7 @@ function oneMegabyte(base: string, last: string): string {
  * pages' footers (new Date().getFullYear() in seo.ts, experiences-seo.ts and
  * dental-seo.ts), so the golden holds after New Year.
  */
-function stable(v: unknown): string {
+export function stable(v: unknown): string {
   return (typeof v === "string" ? v : JSON.stringify(v))
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>")
     .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g, "<ts>")
@@ -179,14 +180,14 @@ function mockRes(settle: (status: number, body: unknown) => void): any {
 }
 
 /** The last handler of a GET route: past generalLimiter, whose bucket other suites share. */
-function routeHandler(router: any, routePath: string): Function {
+export function routeHandler(router: any, routePath: string): Function {
   const layer = (router.stack as any[]).find((l: any) => l.route?.path === routePath && l.route.methods?.get);
   if (!layer) throw new Error(`route not found: GET ${routePath}`);
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
 /** GET through a route handler with `query`; the answer as { status, body }. */
-function getRoute(handler: Function, query: Record<string, string>, hostname: string): Promise<{ status: number; body: unknown }> {
+export function getRoute(handler: Function, query: Record<string, string>, hostname: string): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve) => {
     const ip = nextIp();
     const headers: Record<string, string> = { "user-agent": "curl/8.5.0", host: hostname };
@@ -208,7 +209,7 @@ function getRoute(handler: Function, query: Record<string, string>, hostname: st
 }
 
 /** POST /a2a message/send through router.handle(). */
-function postA2a(router: any, params: unknown): Promise<{ status: number; body: unknown }> {
+export function postA2a(router: any, params: unknown): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve) => {
     const ip = nextIp();
     const headers: Record<string, string> = { "content-type": "application/json", "user-agent": "curl/8.5.0" };
@@ -224,13 +225,13 @@ function postA2a(router: any, params: unknown): Promise<{ status: number; body: 
   });
 }
 
-const textMessage = (text: string) => ({ message: { role: "user", parts: [{ kind: "text", text }] } });
+export const textMessage = (text: string) => ({ message: { role: "user", parts: [{ kind: "text", text }] } });
 /** A message of one standard DataPart with the free-text `q` (I-X, utils/a2a-message.ts). */
 const qDataMessage = (q: string) => ({ message: { role: "user", parts: [{ kind: "data", data: { q } }] } });
 
-type ToolHandler = (args: any, extra?: any) => Promise<any>;
+export type ToolHandler = (args: any, extra?: any) => Promise<any>;
 /** A tool registry's handlers, through a duck-typed server. */
-function duckTools(register: (server: any) => void): Map<string, ToolHandler> {
+export function duckTools(register: (server: any) => void): Map<string, ToolHandler> {
   const tools = new Map<string, ToolHandler>();
   register({
     registerTool(name: string, _config: unknown, handler: ToolHandler) { tools.set(name, handler); },
@@ -280,8 +281,16 @@ function clearRegistryCaches(): void {
   registry._slugIdMap = null;
 }
 
+/** What the fixtures drive: the entries (`asks`), the tool handlers and the A2A routers. Exported for slice I-Y2. */
+export interface Fixture {
+  asks: Record<string, Ask>;
+  tools: Record<string, Map<string, ToolHandler>>;
+  a2a: Record<string, any>;
+  restore: () => void;
+}
+
 /** Fresh in-memory main DB with RFB_SEEDS, geocoding offline (I-W's enterFixtures); the RFB entries. */
-function enterRfb(): { asks: Record<string, Ask>; restore: () => void } {
+export function enterRfb(): Fixture {
   const db = enterRfbDb(RFB_SEEDS);
   clearRegistryCaches();
   try {
@@ -307,6 +316,8 @@ function enterRfb(): { asks: Record<string, Ask>; restore: () => void } {
     };
     return {
       asks,
+      tools: { rfb: tools },
+      a2a: { rfb: a2aRouter },
       restore: () => {
         a2aConversationCap.reset();
         db.restore();
@@ -321,7 +332,7 @@ function enterRfb(): { asks: Record<string, Ask>; restore: () => void } {
 }
 
 /** Fresh in-memory DBs for Finn-tannlege and Opplevagent (and a pinned main DB), geocoding offline; their entries. */
-function enterVerticals(): { asks: Record<string, Ask>; restore: () => void } {
+export function enterVerticals(): Fixture {
   const prevEnv: Record<string, string | undefined> = {};
   for (const k of ["DENTAL_DB_PATH", "EXPERIENCES_DB_PATH", "DENTAL_QUERY_PARSER_DISABLED", "BOOKING_DISPATCH_ENABLED"]) prevEnv[k] = process.env[k];
   process.env.DENTAL_DB_PATH = ":memory:";
@@ -426,7 +437,7 @@ function enterVerticals(): { asks: Record<string, Ask>; restore: () => void } {
       "dental GET /sok": async (t) => stable(await getRoute(dentalSok, { q: t }, "finn-tannlege.com")),
       "dental GET /api/tannlege/agents": async (t) => stable(await getRoute(dentalAgents, { q: t }, "finn-tannlege.com")),
     };
-    return { asks, restore };
+    return { asks, tools: { dental: dentalTools, oa: oaTools }, a2a: { dental: dentalA2a, oa: oaA2a }, restore };
   } catch (err) {
     restore();
     throw err;
@@ -548,7 +559,7 @@ const PROBES: Readonly<Record<string, { base: string; last: string; control: boo
 const LOOSE_LIMIT_MS = 250;
 
 /** The longest run of FILLER in `s`, in characters: how much of a probe's filler text `s` holds. */
-function fillerRun(s: string): number {
+export function fillerRun(s: string): number {
   let longest = 0;
   for (let i = s.indexOf(FILLER); i !== -1; ) {
     let end = i;
@@ -559,7 +570,7 @@ function fillerRun(s: string): number {
   return longest;
 }
 
-interface SeenInputs {
+export interface SeenInputs {
   /** Strings bound to SQLite statements (or SQL texts prepared) during the call. */
   sqlStrings: number;
   /** The most of the probe's filler text (fillerRun) in any of them. */
@@ -581,7 +592,7 @@ const STORED_AS_SENT = /^\s*INSERT INTO tasks \(/;
  * every bound value of run/get/all/iterate/bind, except STORED_AS_SENT), and
  * one on RFB's parser. Both are restored in finally.
  */
-async function watchInputs(call: () => Promise<unknown>): Promise<SeenInputs> {
+export async function watchInputs(call: () => Promise<unknown>): Promise<SeenInputs> {
   const seen: SeenInputs = { sqlStrings: 0, sqlText: 0, parserChars: 0 };
   const note = (v: unknown, nested = false): void => {
     if (typeof v === "string") {

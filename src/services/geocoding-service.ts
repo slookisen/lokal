@@ -11,6 +11,7 @@
 // Free, no API key, no rate limit issues at our scale.
 
 import { getDb } from "../database/init";
+import { MAX_NAME_CHARS } from "../utils/free-text";
 
 export interface GeoResult {
   lat: number;
@@ -35,8 +36,27 @@ export type StedLookupOutcome =
   | { status: "no_match"; reason: string };
 
 // ── In-memory cache (survives request cycle, clears on restart) ──
+// At most CACHE_MAX entries, the least recently used evicted first (cacheGet
+// and cacheResult; a Map keeps insertion order). dev-request
+// 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+// rfb-geokoding-ordkombinasjoner-uten-tak): it used to evict the oldest entry
+// even when it was used all the time, so one long search (thousands of word
+// combinations, each cached as a miss) emptied it of every place others
+// looked up. geocode(), the lookup searches reach, caches no place name
+// longer than MAX_NAME_CHARS, so a search bounds the cache in size as well
+// as in entries (a 1 MB `near` used to be one key).
 const geoCache = new Map<string, GeoResult | null>();
 const CACHE_MAX = 500;
+
+/**
+ * extractAndGeocode() reads at most this many words of a query (slice I-Y2).
+ * It tries every run of 3, 2 and 1 words, each a lookup that can reach
+ * Kartverket twice (Stedsnavn, then Kommuneinfo), so a 2000 character search
+ * of short unknown words made about 3000 outbound requests. 20 words make at
+ * most 57 lookups (114 requests). The longest prompt in the ChatGPT test sets
+ * has 15.
+ */
+export const MAX_GEOCODE_WORDS = 20;
 
 /**
  * Separate cache for geocodePlaceForBackfill(). Deliberately NOT geoCache: the
@@ -70,6 +90,11 @@ export function __setGeocodingFetchForTesting(impl?: typeof fetch): void {
 export function __clearGeocodeCacheForTesting(): void {
   geoCache.clear();
   backfillGeoCache.clear();
+}
+
+/** Test-only: geoCache's keys, least recently used first, and its bound. */
+export function __peekGeoCacheForTesting(): { keys: string[]; max: number } {
+  return { keys: [...geoCache.keys()], max: CACHE_MAX };
 }
 
 // ── Major Norwegian places hardcoded for speed (no API call needed) ──
@@ -514,10 +539,13 @@ class GeocodingService {
    */
   async geocode(placeName: string): Promise<GeoResult | null> {
     const key = placeName.toLowerCase().trim();
-    if (!key || key.length < 2) return null;
+    // Slice I-Y2: no place name is longer than MAX_NAME_CHARS, so a longer
+    // text is no lookup and no cache entry (a 1 MB `near` used to be both,
+    // and extractAndGeocode() tries runs of up to three words of any length).
+    if (!key || key.length < 2 || key.length > MAX_NAME_CHARS) return null;
 
     // 1. Cache hit
-    if (geoCache.has(key)) return geoCache.get(key) || null;
+    if (geoCache.has(key)) return this.cacheGet(key);
 
     // 2. Hardcoded major cities (instant)
     const hardcoded = MAJOR_CITIES[key];
@@ -697,7 +725,7 @@ class GeocodingService {
     if (!nr && name.length < 2) return null;
 
     const key = nr ? `kommunenr:${nr}` : `kommune:${name.toLowerCase()}`;
-    if (geoCache.has(key)) return geoCache.get(key) || null;
+    if (geoCache.has(key)) return this.cacheGet(key);
 
     let result: GeoResult | null = null;
     if (/^\d{4}$/.test(nr)) result = await this.lookupKommuneinfoByNumber(nr);
@@ -771,7 +799,7 @@ class GeocodingService {
     if (!nr && !kName) return null;
 
     const key = `sted:${nr || kName.toLowerCase()}:${sted.toLowerCase()}`;
-    if (geoCache.has(key)) return geoCache.get(key) || null;
+    if (geoCache.has(key)) return this.cacheGet(key);
 
     let result: GeoResult | null = null;
     try {
@@ -910,7 +938,8 @@ class GeocodingService {
       "sider", "øl", "vin", "mjød", "gårdsutsalg", "gårdssalg", "reko",
     ]);
 
-    const words = q.split(/\s+/).filter(w => w.length >= 2);
+    // Slice I-Y2: the first MAX_GEOCODE_WORDS words (see there).
+    const words = q.split(/\s+/).filter(w => w.length >= 2).slice(0, MAX_GEOCODE_WORDS);
 
     // Try 3-word combos first (e.g. "mo i rana")
     for (let i = 0; i < words.length - 2; i++) {
@@ -1154,12 +1183,22 @@ class GeocodingService {
     }
   }
 
+  /** A cached answer (the caller checked geoCache.has), now the most recently used entry. */
+  private cacheGet(key: string): GeoResult | null {
+    const result = geoCache.get(key) ?? null;
+    geoCache.delete(key);
+    geoCache.set(key, result);
+    return result;
+  }
+
   private cacheResult(key: string, result: GeoResult | null): void {
-    // Evict oldest entries if cache is full
-    if (geoCache.size >= CACHE_MAX) {
+    // Evict the least recently used entry if the cache is full (cacheGet
+    // moves a hit to the end, so the first key is that entry).
+    if (!geoCache.has(key) && geoCache.size >= CACHE_MAX) {
       const firstKey = geoCache.keys().next().value;
-      if (firstKey) geoCache.delete(firstKey);
+      if (firstKey !== undefined) geoCache.delete(firstKey);
     }
+    geoCache.delete(key);
     geoCache.set(key, result);
   }
 }

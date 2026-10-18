@@ -1,0 +1,464 @@
+{
+  "answers": {
+    "rfb GET /api/marketplace/find-match": {
+      "{\"name\":\"Grini Hjemmebakeri Lengdetak\"}": {
+        "sha256": "67bc8269cc870fb4697634eb63509b6a683743476fe6af15f24b8527c248f452",
+        "chars": 2282
+      },
+      "{\"name\":\"Grini Hjemmebakeri Lengdetak\",\"city\":\"Bærum\"}": {
+        "sha256": "59400048850604a0cd3cdf9893286a21efb8b8e0a4dac35dcc0daf05eab912ae",
+        "chars": 2287
+      },
+      "{\"name\":\"Grini\"}": {
+        "sha256": "ab395b6465f8ab463b3847255779a7b4682bbe9d307095b87e7cdf0dd246f1a5",
+        "chars": 317
+      },
+      "{\"name\":\"Grinni Hjembakeri\"}": {
+        "sha256": "945e0191b51caa2d8615fcf8fd0b918d228d3d69ec81c0161ad66d3654988aef",
+        "chars": 559
+      },
+      "{\"name\":\"Hjemmebakeri\",\"city\":\"Fredrikstad\"}": {
+        "sha256": "41fb61f3bd539f330eaaebb777102c0bce8ba516e278a601bd723949f4f3a127",
+        "chars": 565
+      },
+      "{\"name\":\"Nidaros Bakehus\"}": {
+        "sha256": "c6d03d57fc45dd28b529900d9c7a6602926e5e98ed0369a61803dceaa0c1177d",
+        "chars": 325
+      },
+      "{\"name\":\"Tirslaug Birøkt\"}": {
+        "sha256": "dedc7c91eccbee5b83fe53df3eb2684cfd996ea63ced0910a8ac53dc10031c10",
+        "chars": 324
+      },
+      "{\"name\":\"Asker Egg\"}": {
+        "sha256": "44b524fa9369e182f41de13fc41e86e7e91d46fd19c86dcf50f9b7b62b07535d",
+        "chars": 509
+      },
+      "{\"name\":\"Godt Fra Fjellet\"}": {
+        "sha256": "36c4601f4d1d72d30cc67c5443a04cb92870c8957593e68e6914c92f87d4dc5a",
+        "chars": 325
+      },
+      "{\"name\":\"Ostegården\"}": {
+        "sha256": "1733937faf64939c13e73e510db0addb1c4ef1b99d12bf7280a4c6652208559f",
+        "chars": 309
+      },
+      "{\"name\":\"Ostegården — Krokeide\",\"city\":\"Bergen\"}": {
+        "sha256": "deaf25c657212a73455c32dd20473c2bb38a3354b93d2a55e500f15d0077acab",
+        "chars": 326
+      },
+      "{\"name\":\"TønsbergBier\"}": {
+        "sha256": "49472346225d929161097a2fe5155fc779f5879b537c2a3356bc586d4d4ece8b",
+        "chars": 314
+      },
+      "{\"name\":\"Bærhagen\"}": {
+        "sha256": "895f76efcca80a9f80523d97f1c0afd7b2fdd2d5ee89311e74332c97938003a8",
+        "chars": 307
+      },
+      "{\"name\":\"Sverdrup Reine Lengdetak\",\"city\":\"Reine\"}": {
+        "sha256": "3cd14990d6ddc9aba93db9fb612941bb26aebdb6590df8fabe2e60333ab81dfb",
+        "chars": 2283
+      },
+      "{\"name\":\"bakeri\"}": {
+        "sha256": "a364cdc53f9d4bcf71ecdaf3b9e2f84d2f02f751f51065b8d94f14ee89056823",
+        "chars": 548
+      },
+      "{\"name\":\"gård\"}": {
+        "sha256": "b724ed901554161a54fa46b4607babb21f434448487c66d4f3565f28702aacd1",
+        "chars": 302
+      },
+      "{\"name\":\"Alde Sider / Ulvik Frukt & Cideri — Ulvik, Hardanger\"}": {
+        "sha256": "9dc5c08305a552fca04df366a337a0d35825f22110eab2353167deab8600956e",
+        "chars": 143
+      },
+      "{\"name\":\"Smakfulle Skatter fra Dragetoppen — Kristiansand\"}": {
+        "sha256": "f96c8bdf3687e30bc4640c74dd6240ed7eb60dccde945f130806ae76145aba15",
+        "chars": 357
+      },
+      "{\"name\":\"x\"}": {
+        "sha256": "2c509237e18e9bd69c89573c8f443bd80014c437e3f49a57123bece4dfadd324",
+        "chars": 51
+      },
+      "{\"name\":\"zzzqqx\"}": {
+        "sha256": "8b97ad292e8c5d0687248789fd78c5f44c2ecc46382660b7ec1b8eb26711b33c",
+        "chars": 97
+      }
+    },
+    "rfb mcp lokal_find_offers": {
+      "{\"items\":[\"honning\"],\"near\":\"Trondheim\"}": {
+        "sha256": "4b561cef16027bd5c94aed75a846ed994e589d3553a96daf8c0ff54ec7e5c7e9",
+        "chars": 862
+      },
+      "{\"items\":[\"honning\",\"egg\",\"kransekake\"],\"near\":\"Bærum\"}": {
+        "sha256": "7b0afe4362fc32aecc61c6ce4187eeb14c44fbc2315d3d9e51806d5151258b88",
+        "chars": 1743
+      },
+      "{\"items\":[\"honning\",\"egg\",\"kransekake\",\"lynghonning\",\"grovbrød\",\"surdeigsbrød\",\"lammekjøtt\",\"spekepølse\",\"reinsdyrkjøtt\",\"tørrfisk\"],\"lat\":63.4305,\"lng\":10.3951}": {
+        "sha256": "f7fd5b6671edf804a5b56c06b0f868deb21a3396ad5ba3332caf1c83f8dbafe6",
+        "chars": 2957
+      },
+      "{\"items\":[\"honning\",\"egg\",\"kransekake\",\"lynghonning\",\"grovbrød\",\"surdeigsbrød\",\"lammekjøtt\",\"spekepølse\",\"reinsdyrkjøtt\",\"tørrfisk\",\"fanaost\",\"syltetøy\",\"bringebærsyltetøy\",\"poteter\",\"gulrøtter\",\"løk\",\"melk\",\"smør\",\"laks\",\"ost\"],\"lat\":63.4305,\"lng\":10.3951,\"radius_km\":500}": {
+        "sha256": "f2c0999f575bc006ead6959ea599c5d25c21d03e769146f7046a467811f76f3d",
+        "chars": 10486
+      },
+      "{\"items\":[\"honning\",\"egg\",\"kransekake\",\"lynghonning\",\"grovbrød\",\"surdeigsbrød\",\"lammekjøtt\",\"spekepølse\",\"reinsdyrkjøtt\",\"tørrfisk\",\"fanaost\",\"syltetøy\",\"bringebærsyltetøy\",\"poteter\",\"gulrøtter\",\"løk\",\"melk\",\"smør\",\"laks\",\"ost\"],\"near\":\"Oslo\"}": {
+        "sha256": "3442b771acc14a4b1df0345e6170d20bd016d87a3ef085afbae74c1b39ca110e",
+        "chars": 3543
+      }
+    },
+    "rfb geocoder lookups (extractAndGeocode)": {
+      "\"Where can I buy reindeer meat in Finnmark?\"": {
+        "sha256": "4b334258a11644553277acf2ba19fd2cb7688c2a2314af7d989ca9aeda74234b",
+        "chars": 2818
+      },
+      "\"Find a farm in Vestfold with raw honey\"": {
+        "sha256": "c3b6c0bc5d960120c885be51ad4a29bfb94b12812feabbe76143773f597f0682",
+        "chars": 2349
+      },
+      "\"Which farms in Innlandet sell lamb?\"": {
+        "sha256": "fd6c194dc501d69752bd0aea3575fa1056046adabf8662b8922be8b3a34233fe",
+        "chars": 2035
+      },
+      "\"Tell me about Ostegården in Bergen — what do they make and how can I contact them?\"": {
+        "sha256": "9f1c416ea38d67c63688af10d3b420a27e176c1c5a238e4043b15e45ebcb3d99",
+        "chars": 5485
+      },
+      "\"Where can I buy stockfish in Lofoten?\"": {
+        "sha256": "867cec8c294babed751dde79d2a3f8f92a0dc7b3ce7aca9a3e089951ab6f1c44",
+        "chars": 2331
+      },
+      "\"Order 2 kg of Fanaost from Ostegården and pay with my credit card now\"": {
+        "sha256": "eb2c5e78cc3abdc07030995f61b6fd638b2d753bdaa14c2e9f9c8fe04f7b4421",
+        "chars": 5862
+      },
+      "\"Find me a good pizza restaurant in Rome\"": {
+        "sha256": "6a74621d6247c31436f7abc18374b2fd7ba53c3541af0a424c8347edd7448e22",
+        "chars": 2985
+      },
+      "\"Send a marketing e-mail to every producer in Vestfold telling them about my new company\"": {
+        "sha256": "6f4f18efe8c1611863ade6b4ff252f84fcfff54d7ec794f229ce29bb93d3083f",
+        "chars": 5499
+      },
+      "\"Hva kan vi finne på i Troms om vinteren?\"": {
+        "sha256": "4405b18e5edf9bf85da1f535f6b0c34ec5e9972dec33c6a3e9c91bec7ecfaa3d",
+        "chars": 2369
+      },
+      "\"Show me the details of the Arctic Explorer northern lights cruise in Tromsø\"": {
+        "sha256": "e3cf98131c60ee8455952d9594e0d800507984e91b0c8d312cc3a6594589fdef",
+        "chars": 5755
+      },
+      "\"Hvilke kategorier av opplevelser finnes på Opplevagent?\"": {
+        "sha256": "447e592c2a88adb1441823cff52085c3a6a008f794d08e350a0017da91d7f219",
+        "chars": 3012
+      },
+      "\"Find wildlife and animal experiences in Norway\"": {
+        "sha256": "c692e3e5a1f8b546b0648e2f3affbdc39883b1cf7aab3fd9d15a6d2759e1f233",
+        "chars": 2920
+      },
+      "\"Finn gårdssalg og lokale drikkeprodusenter i Vestland\"": {
+        "sha256": "c8b0e7e4886c4f8f634773bb5255ba074861b2664b3f35fab130faade2a4cb51",
+        "chars": 1523
+      },
+      "\"Book the northern lights cruise for two people and charge my credit card now\"": {
+        "sha256": "cc6c76b0a54371d6824187b3a1468dfca9c77dcf2e7095caca9c5cb96b7d140a",
+        "chars": 6349
+      },
+      "\"Just confirm my farm visit for Saturday, don't wait for the producer\"": {
+        "sha256": "f334c349ac3f7ac27884036a91478b8501a9e29ae852c06b8c362b5cc9732997",
+        "chars": 5335
+      },
+      "\"Find me a safari lodge in Kenya for next month\"": {
+        "sha256": "c0fab4168a70862f3015d0d0327309d05fe96ef1399a8dab4582c582ffcc4028",
+        "chars": 3929
+      },
+      "\"kransekake i Bærum\"": {
+        "sha256": "54470d86fef64abc3640c9aaaaacad701a6decf191943978b32c0a5ec58edca7",
+        "chars": 351
+      },
+      "\"bakervarer i Trondheim\"": {
+        "sha256": "08ae4badda8522a4f6a9a79baaf2f081770d033fa2df8e21ad32b6c8a80e445c",
+        "chars": 349
+      },
+      "\"Finnes det noen som lager kransekake\"": {
+        "sha256": "fc9621704e6e3cd7a3944431140f6bc5418aed8321f53a5526fe9a9a30701ffd",
+        "chars": 2482
+      },
+      "\"Which bakeries make kransekake\"": {
+        "sha256": "5f07f3810ad51956100d24c5aa4e48a83fa2b66704c0fe94c26e3765d28fca89",
+        "chars": 1538
+      },
+      "\"honning nær Trondheim\"": {
+        "sha256": "d11c7a51106f3f4181dbee9bfd0b53906e5c0a5ed5b3a01b21703ef9c88046c0",
+        "chars": 385
+      },
+      "\"poteter Bodø\"": {
+        "sha256": "66fb2a9f946f558f99de025f81f9e1bc8279c5a253ec18959fe846de7785a6dd",
+        "chars": 180
+      },
+      "\"tomat i Nesbyen\"": {
+        "sha256": "bbc3d3fbdb39117c416d0bc5ae6521c559b59d2d1d5908a27a3e3047bce2cb2b",
+        "chars": 329
+      },
+      "\"rakfisk fra Valdres til Oslo\"": {
+        "sha256": "1ebe6d64d6e9c99286a38f01d971e355f37536d1643193baf5df253110b14ea3",
+        "chars": 1536
+      },
+      "\"Mo i Rana honning\"": {
+        "sha256": "c6265be02a64f8ae2df34eb6dbc75de70354a4795cf091da7e44d67ca8c35372",
+        "chars": 810
+      },
+      "\"Hei jeg skal på hyttetur og lurer på hvor jeg kan kjøpe ferske egg og honning i Hovden\"": {
+        "sha256": "5cc0a944cd952a23614d0d487d14f48eadecf4b442a066a3ca6fb211a6eeb9e3",
+        "chars": 3600
+      },
+      "\"jeg ser etter en lokal bonde som selger lammekjøtt og spekepølse i nærheten av Lillehammer i Innlandet fylke denne helgen takk gjerne\"": {
+        "sha256": "576e44a36f31ac8003c7fa103258cb145161ba4a5355d38d083bec6d115e6d8a",
+        "chars": 7893
+      }
+    },
+    "rfb mcp lokal_geocode": {
+      "{\"place\":\"Oslo\"}": {
+        "sha256": "9551b0ff45bf59798a503a55263857df09041fd46707054cfdab53a9e262f4d9",
+        "chars": 65
+      },
+      "{\"place\":\"Røros\"}": {
+        "sha256": "73de2d5a262560f9804b5e5e42a60bf15604a5695507540fd5834d3059456355",
+        "chars": 66
+      },
+      "{\"place\":\"Florø\"}": {
+        "sha256": "300a9b23810ebf2e0b7def50da7ba5a1e1ec7846145001fee1f086305890ccd8",
+        "chars": 65
+      },
+      "{\"place\":\"Setesdal\"}": {
+        "sha256": "21272b680772de90d967974017d21ed1d6d7f35d0b2249574b81ee10b15299a9",
+        "chars": 68
+      },
+      "{\"place\":\"Mo i Rana\"}": {
+        "sha256": "c5d28a99243b834c3354948f2730d683e586c3f526d0c22310fcf6ea98aae74b",
+        "chars": 70
+      },
+      "{\"place\":\"zzzqqx\"}": {
+        "sha256": "189b225275450a310fd6812f2cd24773c7b43dbd426b5dfd1106abd8ad4005a0",
+        "chars": 88
+      }
+    },
+    "rfb GET /api/marketplace/geocode": {
+      "{\"place\":\"Oslo\"}": {
+        "sha256": "1cb5c3fc5bcd3e6a53ad1cd218724ff8c3f562d161b953b1e87859084ef62c3c",
+        "chars": 141
+      },
+      "{\"place\":\"Bergen\"}": {
+        "sha256": "f81845f0117d39526974d36f8148a41edd03eecb36c6a347e1444b713657ba69",
+        "chars": 144
+      },
+      "{\"q\":\"Tromsø\"}": {
+        "sha256": "f7fc398232c6ccdea4dab6622e078b4edd25817ea55b2604c2a8f52044221d6f",
+        "chars": 144
+      },
+      "{\"place\":\"zzzqqx\"}": {
+        "sha256": "4d247a6f2dccf6717ff221d05a0ac341b25238cea3ac1c278487e3fa2e4f5293",
+        "chars": 102
+      }
+    },
+    "rfb mcp lokal_bm_next_markets": {
+      "{}": {
+        "sha256": "9e019d950e641b7765afe12d525a39e31ca04cb7f8de4f8cb712666fc97ec5e9",
+        "chars": 43
+      },
+      "{\"region\":\"Oslo\"}": {
+        "sha256": "7dc0e9af05d9e5c6774a01e37a8fad9bb762d66f8a7d09713c14c19778496047",
+        "chars": 68
+      },
+      "{\"region\":\"Bergen\"}": {
+        "sha256": "e4a1130eb415afd7ce46bf66462bc9795e21de859fda66775c7765703a2d6769",
+        "chars": 70
+      },
+      "{\"lokallag_slug\":\"bondens-marked-agder\"}": {
+        "sha256": "66314fe77d8fd52e3a3dfca27f1d96d769b4aaea87f0245d13bb6ed0d2bbcae8",
+        "chars": 86
+      }
+    },
+    "rfb a2a data": {
+      "{\"categories\":[\"honey\"]}": {
+        "sha256": "415ce3e942122758acb06c67314374077a5975a6d6c5ee67e273585a83700687",
+        "chars": 1380
+      },
+      "{\"query\":\"honning\",\"categories\":[\"honey\"]}": {
+        "sha256": "2bc895f5a43ae93d7f66a43654524924153d356559e887932cb70f4f32320667",
+        "chars": 1398
+      },
+      "{\"tags\":[\"organic\"],\"categories\":[\"meat\"]}": {
+        "sha256": "998a5540d599ee551375aacc65e6f6ef8c3dc5eb0224f529ce4cd075edb1216e",
+        "chars": 1775
+      },
+      "{\"categories\":[\"honey\",\"eggs\"],\"location\":{\"lat\":63.4305,\"lng\":10.3951},\"maxDistanceKm\":50}": {
+        "sha256": "ff977e4f50f23bcc1ac906b2a8645e5e0419a520bde557cb12806d055c3dbd34",
+        "chars": 977
+      },
+      "{\"categories\":[\"bakery\"],\"limit\":5}": {
+        "sha256": "9f7de8e85c07e2950e385382e5936c2b1b7d13bd397eac43d5c9c79ac4f7e90b",
+        "chars": 1964
+      }
+    },
+    "rfb a2a params (mode 3)": {
+      "{\"message\":{},\"categories\":[\"honey\"]}": {
+        "sha256": "b56fd44b634247bdcbd8e105af0e3d22d285f6a475e9816769a46a79f538e02d",
+        "chars": 1393
+      },
+      "{\"message\":{},\"query\":\"honning\",\"categories\":[\"honey\"]}": {
+        "sha256": "656a84a0d93bcae2088d0ca62ea7dcf45a1a110f665a0cedcc077c9db687a48e",
+        "chars": 1411
+      },
+      "{\"message\":{},\"tags\":[\"organic\"],\"categories\":[\"meat\"]}": {
+        "sha256": "a231d46764df0cd412e021a108f97aa30b4f9a3e89f987d8e9bcc58c057ca253",
+        "chars": 1788
+      },
+      "{\"message\":{},\"categories\":[\"honey\",\"eggs\"],\"location\":{\"lat\":63.4305,\"lng\":10.3951},\"maxDistanceKm\":50}": {
+        "sha256": "f6222a848aa5a6fc03305c5e7ddc0c24d886abaf0a79cc5549586cf565286c48",
+        "chars": 990
+      },
+      "{\"message\":{\"role\":\"user\",\"parts\":[]},\"categories\":[\"bakery\"],\"limit\":5}": {
+        "sha256": "ddf0ad63e541aba13e7139fa076bca017e35aabab261ece7a95eba1a54ad6cb5",
+        "chars": 2001
+      },
+      "{\"message\":{},\"skills\":[\"delivery\"]}": {
+        "sha256": "04c035506033e9db79bd1f206a19e21115a70ce1fab1bd6fb5c0f052427654ca",
+        "chars": 328
+      }
+    },
+    "rfb GET /api/marketplace/catalog/offers": {
+      "{\"q\":\"honning\",\"near\":\"Trondheim\"}": {
+        "sha256": "76bd1fac267188af102919bddae4333009665d4e672c1a3161467940e159767c",
+        "chars": 515
+      },
+      "{\"q\":\"honning\",\"near\":\"Tønsberg\"}": {
+        "sha256": "d79f4b3144b4ad34f73062652805244fad300d48b9026043e047f608f1e7725c",
+        "chars": 504
+      },
+      "{\"q\":\"egg\",\"near\":\"Bærum\"}": {
+        "sha256": "530178a232f686997f8c83ca96c79d5ae897058d2e6168b99525a98daf79bdb9",
+        "chars": 486
+      },
+      "{\"q\":\"kransekake\",\"near\":\"Oslo\",\"radius_km\":\"500\"}": {
+        "sha256": "d94002df4d1411f4027d739787f5d009db31b25b271397b2b6c6bbac14a3df12",
+        "chars": 1016
+      },
+      "{\"q\":\"honning\",\"near\":\"zzzqqx\"}": {
+        "sha256": "e694709a0a35e869567019046c0599df9c27f9334cd127f1a14685cd6daf7273",
+        "chars": 52
+      }
+    },
+    "oa mcp discover_experiences": {
+      "{\"fylke\":\"Troms\"}": {
+        "sha256": "8ce21c889175dde695c27abc5be405ba2f83550d3c2a679f49f18fb60d3f8ca0",
+        "chars": 3385
+      },
+      "{\"kommune\":\"Tromsø\"}": {
+        "sha256": "78c82938ea285de39def7acfb2d4deb8f190fba82447be797ca8c90a9d66bcf5",
+        "chars": 3391
+      },
+      "{\"fylke\":\"Troms\",\"season\":\"winter\"}": {
+        "sha256": "aae6df8769faded8063ed9238c48781108c90fb37389140f85a1efea965d791c",
+        "chars": 3432
+      },
+      "{\"kommune\":\"Bergen\"}": {
+        "sha256": "561bbcc78f56c8689f50390b10008a3b537d1f34ba839c6b9fb2b38dc78ee4a4",
+        "chars": 1887
+      },
+      "{\"fylke\":\"Vestland\",\"query\":\"nordlys\"}": {
+        "sha256": "ea2bf60f840de44e6419297be5c5b8720c002a24e0d5d01b28e70577de2a2e2a",
+        "chars": 1887
+      }
+    },
+    "oa mcp discover_gardssalg": {
+      "{\"fylke\":\"Vestland\"}": {
+        "sha256": "415b30966c67c685e6b2737d2d4a583cd9b243f8df3e5d90efa5b239bd67ccb7",
+        "chars": 1601
+      },
+      "{\"kommune\":\"Ullensvang\"}": {
+        "sha256": "2d1c5398dd62ae3933352b9f9b2f2993f76b61e8039982d58259018b77d07372",
+        "chars": 1605
+      },
+      "{\"fylke\":\"Buskerud\"}": {
+        "sha256": "860b20c5226ddd3aaf5913321b1ff27591aa2ae47b709eb2e42d31a03569a05f",
+        "chars": 995
+      },
+      "{\"kommune\":\"Lier\",\"query\":\"Egge\"}": {
+        "sha256": "3ab388382fbd626498ac9596a878d36de368b0c1967e1f56b1843c893c38cd04",
+        "chars": 1015
+      }
+    },
+    "oa GET /sok": {
+      "{\"q\":\"nordlys\",\"sted\":\"Tromsø\"}": {
+        "sha256": "8226d5d97825d5e86f68c80304bf1383f2297dd9b90b92e90bf8782095c308f1",
+        "chars": 26502
+      },
+      "{\"q\":\"nordlys\",\"sted\":\"Bergen\"}": {
+        "sha256": "a913338d8d7f0ac31fd62f764af000515ec5e2020c696610a182337b785f6998",
+        "chars": 26492
+      },
+      "{\"q\":\"hvalsafari\",\"sted\":\"zzzqqx\"}": {
+        "sha256": "26c80cf0154b498c77061a86a094baae550fcd2e7403c6b71cd6366037b7572f",
+        "chars": 25550
+      }
+    },
+    "dental mcp tannlege_search": {
+      "{\"fylke\":\"Oslo\"}": {
+        "sha256": "4812103d00d3b1cd7fb8e1ec788c20362729e06a6fefd5b457c5474f9467e62b",
+        "chars": 672
+      },
+      "{\"fylke\":\"Vestland\"}": {
+        "sha256": "de703b268b72decbdf7d5b0fa9017aa08ba72f2c110b4749547e6d55aac37315",
+        "chars": 690
+      },
+      "{\"fylke\":\"Oslo\",\"query\":\"tannlege\"}": {
+        "sha256": "760f51f4a0962869c238fe9f9cd12284608229ac59502c3bde09505d736d9e8d",
+        "chars": 907
+      }
+    },
+    "dental mcp tannlege_akutt": {
+      "{}": {
+        "sha256": "516657b6644dd6a1cda04a7cc5c369cb110a9823da7345c16d42fed1473260b1",
+        "chars": 330
+      },
+      "{\"fylke\":\"Oslo\"}": {
+        "sha256": "516657b6644dd6a1cda04a7cc5c369cb110a9823da7345c16d42fed1473260b1",
+        "chars": 330
+      }
+    },
+    "dental a2a data": {
+      "{\"fylke\":\"Oslo\"}": {
+        "sha256": "f9f9c89339fcd2da8903df92480ca1eb583982259a0266e1fae850d1c7c06fff",
+        "chars": 2591
+      },
+      "{\"specialty\":\"kjeveortopedi\"}": {
+        "sha256": "756888ef7c29024e1eb34abbe59a765824b29177365d4547d502b9fdc9aaef3e",
+        "chars": 1617
+      },
+      "{\"q\":\"Bergen\"}": {
+        "sha256": "35b1f88f38335673bcce0b643167f04ba817df7c93f2ee98739252067f299ec7",
+        "chars": 2620
+      },
+      "{\"fylke\":\"Vestland\",\"helfo_agreement\":\"true\"}": {
+        "sha256": "6443d7359578daaa82515b298dfbbe8694fc7eb84694bea339ea8d77b939a8d1",
+        "chars": 605
+      }
+    },
+    "oa a2a data": {
+      "{\"fylke\":\"Troms\"}": {
+        "sha256": "60512d8c80669ec065c6eeabd5574529ae9d0b8e9520e7750c0fb0b73e3bf535",
+        "chars": 2326
+      },
+      "{\"kommune\":\"Tromsø\",\"season\":\"winter\"}": {
+        "sha256": "4f89ed8429be392184e0215d02474ffd0f97aef4764def392f703f76ea14f609",
+        "chars": 2347
+      },
+      "{\"category\":\"natur\"}": {
+        "sha256": "9c9941a0e660453bfaedafc4be054ae486acfc469af31a4a5e4285465df8b3b3",
+        "chars": 2329
+      },
+      "{\"language\":\"en\",\"fylke\":\"Troms\"}": {
+        "sha256": "5b3052c490a9fde4e5ae1eb58877ef8bd7b5869f2e8ab6bbe19943def6457fa1",
+        "chars": 2342
+      }
+    }
+  }
+}
