@@ -14,7 +14,8 @@
 //                                      one, so no query finds fewer clinics
 //                                      than before (see the function).
 //
-// No DB access here: the gazetteer (poststed spellings) and the count
+// No DB access here: the gazetteer (poststed spellings, and since D3f the
+// landsdeler and byområder of config/norway-search-areas.ts) and the count
 // function are passed in. Input is bounded (MAX_QUERY_CHARS, MAX_QUERY_TOKENS,
 // MAX_TERM_CHARS) before any work, so an oversized query costs no more than
 // a normal one on the main thread (dev-requests 2026-09-19 / 2026-09-26).
@@ -54,7 +55,7 @@ export interface DentalQueryFilter {
   /** A poststed in the kommune of the same name («Bergen»): its spellings OR the kommune's postnumre (S3b). */
   poststed_or_postnummer?: { poststed_in: string[]; postnummer_in: string[] };
   fylke?: string;
-  /** A re-split 2020 fylke ("Viken"): its own name plus today's fylker. */
+  /** A re-split 2020 fylke ("Viken"): its own name plus today's fylker. A landsdel ("Vestlandet", D3f): its fylker. */
   fylke_in?: string[];
   specialty?: string;
   helfo_agreement?: "true";
@@ -294,6 +295,19 @@ function readPlace(
       if (!fylke) return { note: `«${shown}» er en region uten ett fylke; ordet brukes som navnesøk` };
       return { fields: { fylke }, fylker: [fylke], line: `sted: ${fylke} (fylke; regionen ${place.name})` };
     }
+    case "landsdel": {
+      // D3f: a part of the country («Vestlandet», «Nord-Norge») is its
+      // fylker (config/norway-search-areas.ts), each as «tannlege i X» reads
+      // it (today's name, so fylke_in matches as fylke X does).
+      const fylker = place.values;
+      return {
+        fields: { fylke_in: [...fylker] },
+        fylker,
+        line: `sted: ${listNames(fylker)} (${fylker.length > 1 ? "fylker" : "fylke"}; landsdelen ${place.name})`,
+      };
+    }
+    case "byomrade":
+      return readCityArea(place, shown, gazetteer);
     case "kommune": {
       const kommune = kommuneNamed(place.name);
       if (kommune) {
@@ -318,6 +332,45 @@ function readPlace(
       return { note: `«${shown}» er navnet på flere kommuner; ordet brukes som navnesøk` };
     }
   }
+}
+
+// D3f: a city area («Osloområdet», «Tromsøya») is its kommuner
+// (config/norway-search-areas.ts), each read as its name alone is (S3b): the
+// poststed of the kommune's name in all its stored spellings, when that
+// poststed lies in the kommune, OR the kommune's postnumre. Spellings or
+// postnumre that would take the area past the store's caps (MAX_POSTSTED_IN,
+// MAX_POSTNUMMER_IN) are left out, as Oslo's 445 postnumre are left out of
+// «tannlege i Oslo», and a kommune left with neither is not in the line. The
+// areas in the table stay within the caps (checked in tests), so an area
+// finds every clinic that one of its kommuner finds alone.
+function readCityArea(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer): PlaceReading | { note: string } {
+  const poststeder: string[] = [];
+  const postnumre: string[] = [];
+  const fylker: string[] = [];
+  const used: string[] = [];
+  for (const name of place.values) {
+    const kommune = kommuneNamed(name);
+    if (!kommune) continue;
+    const stored = gazetteer.poststeder.get(placeKey(name)) ?? [];
+    const own = stored.length > 0 && kommunerForPoststed(stored[0]).includes(kommune.kommunenummer)
+      ? stored.filter((v) => v.length <= MAX_TERM_CHARS)
+      : [];
+    const withSpellings = own.length > 0 && poststeder.length + own.length <= MAX_POSTSTED_IN;
+    const withPostnumre = kommune.postnumre.length > 0 && postnumre.length + kommune.postnumre.length <= MAX_POSTNUMMER_IN;
+    if (!withSpellings && !withPostnumre) continue;
+    if (withSpellings) poststeder.push(...own);
+    if (withPostnumre) postnumre.push(...kommune.postnumre);
+    if (kommune.fylke && !fylker.includes(kommune.fylke)) fylker.push(kommune.fylke);
+    used.push(name);
+  }
+  if (used.length === 0) return { note: `«${shown}» kan ikke brukes som sted; ordet brukes som navnesøk` };
+  const fields: DentalQueryFilter =
+    poststeder.length === 0
+      ? { postnummer_in: postnumre }
+      : postnumre.length === 0
+        ? { poststed_in: poststeder }
+        : { poststed_or_postnummer: { poststed_in: poststeder, postnummer_in: postnumre } };
+  return { fields, fylker, line: `sted: ${listNames(used)} (${used.length > 1 ? "kommuner" : "kommune"}; ${place.name})` };
 }
 
 // The one kommune with this name: its number, fylke and postnumre. null for
