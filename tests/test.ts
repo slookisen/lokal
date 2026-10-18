@@ -42835,6 +42835,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W2 (review of
+// lokal#1160): a search of one filler word that names producers («Finnes»,
+// «Bondens», «Norsk») answers as main did (tests/fixtures/rfb-sok-i-w2-main.json);
+// a word inside a producer name («ser» in «Hvasser», «stor» in «Storfjord») no
+// longer makes a name search of a longer search with a place, category or
+// product in it; «bakeries» is the bakery category, and next to a category
+// word the unknown words only rank; words for the occasion, meal, size or
+// packaging («lunsj», «gave») count only when nothing else names a product.
+// Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W2 (RFB search: filler words, name hijacking, qualifier words) ──");
+  try {
+    const { runRfbSokFyllordNavnekapringTests } = require("../src/routes/rfb-sok-fyllord-navnekapring.test") as
+      typeof import("../src/routes/rfb-sok-fyllord-navnekapring.test");
+    const r = await runRfbSokFyllordNavnekapringTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-fyllord-navnekapring: " + f);
+    console.log(`  rfb-sok-fyllord-navnekapring: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-fyllord-navnekapring: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no
