@@ -36,7 +36,6 @@ import {
   coerceProvenanceToArrayShape,
   FREE_MAIL_DOMAINS,
   domainsEquivalent,
-  registrableDomain,
   collapseDomain,
   type FieldName,
   type ProvenanceRecord,
