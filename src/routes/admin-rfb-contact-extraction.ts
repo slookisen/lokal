@@ -337,6 +337,15 @@ const RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE = "harvest_contact_email";
 // match against the website's host (either direction — subdomain email on a
 // bare-domain site, or vice versa), OR the email's domain is a known
 // free-mail/ISP provider.
+//
+// Deliberately NOT mirrored: the verifier's cross-TLD branch (dev-request
+// 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld, same brand on another
+// TLD). That branch requires field_provenance.email homepage-evidence, and a
+// backfill row by definition has no email provenance yet (cohort requires
+// k.email empty); the on-site proof (findEmailOnOwnSite) only runs later. So
+// the mirror stays strict: a cross-TLD address stays rejected_domain_mismatch
+// here, and gets in via scrape mode (which writes homepage provenance) instead.
+// Stricter than the gate is safe; it only writes fewer rows, never wrong ones.
 function backfillEmailOwnDomain(email: string, website: string): boolean {
   const websiteHost = verifierHostnameFromUrl(website);
   const eDom = verifierEmailDomain(email);
