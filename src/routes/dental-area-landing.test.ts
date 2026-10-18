@@ -18,8 +18,11 @@
  *      200, «index, follow» and in the sitemap, no FAQPage; /sted with 0 is
  *      404 or noindex and not in the sitemap; the route and the sitemap use
  *      the same predicate; no env variable changes the rule.
- *   F  cost: getDentalAreaFacts on a synthetic 6,900-row DB under 20 ms
- *      uncached, a hit comes from the cache.
+ *   F  cost on a synthetic 6,900-row DB: a coarse time guard on an uncached
+ *      getDentalAreaFacts (best of 5 under 150 ms; 12-23 ms measured on an
+ *      idle machine and on CI, ~300 ms for a quadratic fold); a hit comes
+ *      from the cache; one computation runs exactly one statement (counted
+ *      on the handle and on the connection), a hit none.
  *   H  a failing background refresh keeps the old numbers and logs a warning
  *      (the message only, no row data).
  *
@@ -531,8 +534,20 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
           );
         }
       })();
-      // Best of 5: the first rounds pay for JIT warm-up (25-30 ms), and a GC
-      // pause or a busy core can hit any single round.
+      // A coarse regression guard, not a benchmark: best of 5 (the first
+      // rounds pay for JIT warm-up, and a GC pause or a busy core can hit any
+      // single round) against a bound a loaded runner does not reach. Best
+      // of 5 on this thin fixture: 11.7-15.6 ms on an idle 4-core machine,
+      // 22.5-23.4 ms on the GitHub CI runner (the old 20 ms bound failed
+      // there in all three runs of the determinism gate), at most 66 ms with
+      // the cores 2x oversubscribed by busy loops and at most 91 ms at 4x
+      // (20 runs each). Realistic rows cost more (code review, round 2:
+      // 25-35 ms warm, 55-87 ms cold); in production the event-loop stall
+      // probe watches that, not this test. An algorithmic regression in the
+      // fold lands at twice the bound even on the idle machine: a linear
+      // search per row instead of the Map, or a rescan of all rows per row,
+      // takes 297-322 ms. A query per row costs only 34-61 ms here, so F4
+      // catches that by counting statements, not by the clock.
       const times: number[] = [];
       let last: ReturnType<typeof areaFacts.getDentalAreaFacts> | null = null;
       for (let r = 0; r < 5; r++) {
@@ -542,14 +557,14 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
         times.push(performance.now() - t0);
       }
       const best = Math.min(...times);
-      assertTrue(best < 20, `F1: getDentalAreaFacts on ~6,900 rows uncached < 20 ms (best of 5: ${best.toFixed(1)} ms; all: ${times.map((t) => t.toFixed(1)).join(", ")})`);
+      assertTrue(best < 150, `F1: getDentalAreaFacts on ~6,900 rows uncached < 150 ms (best of 5: ${best.toFixed(1)} ms; all: ${times.map((t) => t.toFixed(1)).join(", ")})`);
       assertTrue(last!.byPoststed.size >= 1500, `F2: the aggregate has the 1,500 benchmark poststeder (${last!.byPoststed.size})`);
       const benchSpecialists = [...last!.byPoststed].filter(([k]) => k.startsWith("STED")).reduce((n, [, c]) => n + c.specialist_clinics, 0);
       assertEq(benchSpecialists, 276, "F2b: of the 1,380 benchmark staff lists only the 276 with a specialist title count");
       // A hit is the cached object itself (`same`): a recompute, in the
       // foreground or as a background refresh, would hand out a new one. The
       // time bound only says a hit costs well under a millisecond (a scan
-      // costs ~10 ms, F1): 100 ms per 1,000 hits, best of 3 rounds as in F1.
+      // costs 12-25 ms, F1): 100 ms per 1,000 hits, best of 3 rounds as in F1.
       // Under tsx a hit takes 10-12 µs; the old single-round 20 ms bound
       // failed at 20-35 ms on a GC pause or a busy core.
       let same = true;
@@ -562,6 +577,81 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       const hitBest = Math.min(...hitTimes);
       assertTrue(same, "F3: 1,000 later calls all return the cached aggregate (the same object)");
       assertTrue(hitBest < 100, `F3b: 1,000 cache hits take under 100 ms (best of 3: ${hitBest.toFixed(1)} ms; all: ${hitTimes.map((t) => t.toFixed(1)).join(", ")})`);
+
+      // One statement per computation, counted rather than timed, on these
+      // 6,900 rows. computeDentalAreaFacts gets a handle that counts each
+      // statement prepared on it and each run of one; the dental connection
+      // itself counts what is prepared on it, so a statement prepared behind
+      // the handle's back (a store helper with its own getDb()) shows too.
+      // Both counters run only inside synchronous calls, so no other test
+      // block can add to them.
+      const realPrepare = (db as any).prepare;
+      let onConnection = 0;
+      const countConnection = (): void => {
+        (db as any).prepare = function (this: unknown, sql: string) { onConnection++; return realPrepare.call(this, sql); };
+      };
+      const restoreConnection = (): void => {
+        if (Object.prototype.hasOwnProperty.call(db, "prepare")) delete (db as any).prepare;
+        if ((db as any).prepare !== realPrepare) (db as any).prepare = realPrepare;
+      };
+      const RUNS = new Set<PropertyKey>(["all", "get", "run", "iterate"]);
+      const countingHandle = () => {
+        const seen = { prepared: [] as string[], runs: 0 };
+        const wrapStatement = (stmt: any): any => {
+          const proxy: any = new Proxy(stmt, {
+            get(target, prop) {
+              const v = target[prop];
+              if (typeof v !== "function") return v;
+              return (...args: unknown[]) => {
+                if (RUNS.has(prop)) seen.runs++;
+                const out = v.apply(target, args);
+                // raw(), pluck() and bind() return the statement: chain on the counted one.
+                return out === target ? proxy : out;
+              };
+            },
+          });
+          return proxy;
+        };
+        return { seen, handle: { prepare: (sql: string) => { seen.prepared.push(sql); return wrapStatement(db.prepare(sql)); } } };
+      };
+      const asJson = (f: ReturnType<typeof areaFacts.getDentalAreaFacts>): string => JSON.stringify([[...f.byPoststed], [...f.byFylke]]);
+
+      const perComputation: Array<[number, number, number]> = [];
+      let sqls: string[] = [];
+      let countedFacts: ReturnType<typeof areaFacts.computeDentalAreaFacts> | null = null;
+      countConnection();
+      try {
+        for (let r = 0; r < 3; r++) {
+          const { seen, handle } = countingHandle();
+          onConnection = 0;
+          countedFacts = areaFacts.computeDentalAreaFacts(handle);
+          perComputation.push([seen.prepared.length, seen.runs, onConnection]);
+          sqls = seen.prepared;
+        }
+      } finally {
+        restoreConnection();
+      }
+      assertEq(perComputation, [[1, 1, 1], [1, 1, 1], [1, 1, 1]], "F4: each of 3 computations prepares one statement on the handle, runs it once, and prepares nothing else on the connection ([prepared, runs, on connection])");
+      assertTrue(sqls.length === 1 && sqls[0]!.startsWith("SELECT poststed, fylke,") && sqls[0]!.includes(" FROM dental_agents WHERE "), "F4b: that statement is the one aggregate SELECT over dental_agents");
+      assertTrue(countedFacts !== null && asJson(countedFacts) === asJson(last!), "F4c: the counted computation gives the same aggregate as the uncounted one");
+
+      // The pages' path: getDentalAreaFacts() after a cache reset computes
+      // with one statement on the connection; a hit prepares none.
+      areaFacts.__resetDentalAreaFactsForTesting();
+      const onPagePath: number[] = [];
+      let hitIsCached = false;
+      countConnection();
+      try {
+        onConnection = 0;
+        const fresh = areaFacts.getDentalAreaFacts();
+        onPagePath.push(onConnection);
+        onConnection = 0;
+        hitIsCached = areaFacts.getDentalAreaFacts() === fresh;
+        onPagePath.push(onConnection);
+      } finally {
+        restoreConnection();
+      }
+      assertEq([onPagePath, hitIsCached], [[1, 0], true], "F5: through getDentalAreaFacts() a computation is one statement on the dental connection and a cache hit none");
     }
   } catch (err: any) {
     failed++;
