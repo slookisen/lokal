@@ -26,6 +26,7 @@ import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
+import { searchCountable } from "../services/search-tracking";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -211,7 +212,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         handleExtendedCard(params, id, req, res);
         break;
       case "agent/info":
-        handleAgentInfo(params, id, res);
+        handleAgentInfo(params, id, req, res);
         break;
       default:
         res.json({
@@ -533,7 +534,7 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
 // This is the core of the dummy-agent system: every seller has
 // an agent that can answer based on what we know about them.
 
-function handleAgentInfo(params: any, id: any, res: Response) {
+function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
     res.json({
@@ -554,11 +555,14 @@ function handleAgentInfo(params: any, id: any, res: Response) {
     return;
   }
 
-  // Log the interaction
-  interactionLogger.log("view", {
-    agentId,
-    metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
-  });
+  // Log the interaction: not for our own traffic or a probe (slice I-Z,
+  // searchCountable), as its REST twin GET /api/marketplace/agents/:id/info.
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId,
+      metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
+    });
+  }
 
   res.json({
     jsonrpc: "2.0",

@@ -98,6 +98,19 @@
         "aiDeliveries": 3
       }
     },
+    "rfb a2a agent/info": {
+      "AI assistant (ChatGPT-User)": {
+        "interactions": 1,
+        "mcpCalls": 1
+      },
+      "browser (Firefox)": {
+        "interactions": 1,
+        "mcpCalls": 1
+      },
+      "curl": {
+        "interactions": 1
+      }
+    },
     "rfb GET /api/marketplace/search": {
       "AI assistant (ChatGPT-User)": {
         "discoveryCount": 3,
@@ -134,6 +147,31 @@
         "discoveryCount": 3,
         "timesDiscovered": 3,
         "interactions": 1
+      }
+    },
+    "rfb POST /api/marketplace/discover start_conversation": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 2,
+        "conversations": 2,
+        "interactions": 3,
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 2,
+        "conversations": 2,
+        "interactions": 3,
+        "searches": 1
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 2,
+        "conversations": 2,
+        "interactions": 3
       }
     },
     "rfb GET /api/marketplace/catalog/offers": {

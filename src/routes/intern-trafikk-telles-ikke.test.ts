@@ -37,9 +37,9 @@
  *       mounts them: a call that is our own traffic (UA session-lane-verify,
  *       UA rfb-session-lane-verify, a valid X-Admin-Key, the owner cookie)
  *       gets the answer an external call gets and changes no counter. RFB
- *       A2A keeps its one known difference: it starts conversations for
- *       external callers only (the spam guard of 2026-10-04), and its answer
- *       lists them.
+ *       A2A message/send keeps its one known difference: it starts
+ *       conversations for external callers only (the spam guard of
+ *       2026-10-04), and its answer lists them.
  *       An MCP session whose initialize.clientInfo.name is ours raises no
  *       discovery counter and no «Med i AI-svar» (the session's client name,
  *       as deliver() reads it); its tools/call rows still count in AI-søk,
@@ -47,7 +47,10 @@
  *       (FUNN in the PR).
  *   P   probes and spam (UA agentprobe, MCP client glama, a wallet address
  *       in the text) raise no discovery counter and no interactions row on
- *       any entry, and no countable conversation on RFB. A probe UA counts
+ *       any entry, and no countable conversation on RFB (also the one POST
+ *       /api/marketplace/discover starts with start_conversation; GET
+ *       /api/marketplace/search's is not driven here, FUNN in the PR, since
+ *       its answer shows the seller's reply). A probe UA counts
  *       in no AI-søk and no «Med i AI-svar» either, as before. Two gaps in
  *       those two stay as they were (FUNN in the PR): AI-søk counts an MCP
  *       probe known by its client name only, and over MCP neither reads the
@@ -484,20 +487,20 @@ async function enter(): Promise<Fixture> {
       return `${call.status} ${stable(json?.result ?? json?.error ?? call.text)}`;
     };
     /**
-     * POST /a2a message/send with one text part. RFB's answer lists the
+     * One JSON-RPC call to POST /a2a. RFB's message/send answer lists the
      * conversations it started, which it does for external callers only
      * (the spam guard): `conversations` is left out of the compared answer.
      */
-    const a2a = async (site: Site, c: Caller, text: string): Promise<string> => {
-      const r = await send(sites[site].port, "POST", "/a2a", headersFor(site, c), {
-        jsonrpc: "2.0", id: "z", method: "message/send", params: { message: { role: "user", parts: [{ kind: "text", text }] } },
-      });
+    const a2a = async (site: Site, c: Caller, method: string, params: unknown): Promise<string> => {
+      const r = await send(sites[site].port, "POST", "/a2a", headersFor(site, c), { jsonrpc: "2.0", id: "z", method, params });
       await settle();
       const json = rpcJson(r);
       const data = json?.result?.artifacts?.[0]?.parts?.[0]?.data;
-      if (site === "rfb" && data && Array.isArray(data.conversations)) data.conversations = "<conversations>";
+      if (site === "rfb" && method === "message/send" && data && Array.isArray(data.conversations)) data.conversations = "<conversations>";
       return `${r.status} ${stable(json ?? r.text)}`;
     };
+    /** message/send's params: one text part. */
+    const say = (text: string) => ({ message: { role: "user", parts: [{ kind: "text", text }] } });
     const get = async (site: Site, c: Caller, urlPath: string): Promise<string> => {
       const r = await send(sites[site].port, "GET", urlPath, headersFor(site, c));
       await settle();
@@ -525,9 +528,12 @@ async function enter(): Promise<Fixture> {
       { name: "rfb mcp lokal_discover", kind: "mcp", ask: (c) => mcp("rfb", c, "lokal_discover", { categories: ["honey"], ...TRONDHEIM, maxDistanceKm: 30, limit: 10 }) },
       { name: "rfb mcp lokal_info", kind: "mcp", ask: (c) => mcp("rfb", c, "lokal_info", { agentId: honey }) },
       { name: "rfb mcp lokal_find_offers", kind: "mcp", ask: (c) => mcp("rfb", c, "lokal_find_offers", { items: ["honning"], ...TRONDHEIM, radius_km: 50 }) },
-      { name: "rfb a2a message/send", kind: "a2a", freeText: true, ask: (c, t) => a2a("rfb", c, t ?? "honning i Trondheim") },
+      { name: "rfb a2a message/send", kind: "a2a", freeText: true, ask: (c, t) => a2a("rfb", c, "message/send", say(t ?? "honning i Trondheim")) },
+      { name: "rfb a2a agent/info", kind: "a2a", ask: (c) => a2a("rfb", c, "agent/info", { agentId: honey }) },
       { name: "rfb GET /api/marketplace/search", kind: "api", freeText: true, ask: (c, t) => get("rfb", c, "/api/marketplace/search" + qs({ q: t ?? "honning Trondheim" })) },
       { name: "rfb POST /api/marketplace/discover", kind: "api", ask: (c) => post("rfb", c, "/api/marketplace/discover", { categories: ["honey"], location: TRONDHEIM, maxDistanceKm: 30 }) },
+      // The opt-in conversation: its answer lists only the conversation ids.
+      { name: "rfb POST /api/marketplace/discover start_conversation", kind: "api", ask: (c) => post("rfb", c, "/api/marketplace/discover", { categories: ["honey"], location: TRONDHEIM, maxDistanceKm: 30, start_conversation: true }) },
       { name: "rfb GET /api/marketplace/catalog/offers", kind: "api", ask: (c) => get("rfb", c, "/api/marketplace/catalog/offers" + qs({ q: "honning", ...near, radius_km: "50" })) },
       { name: "rfb GET /api/marketplace/agents/:id/info", kind: "api", ask: (c) => get("rfb", c, `/api/marketplace/agents/${honey}/info`) },
       { name: "rfb GET /api/marketplace/agents/:id/vcard", kind: "api", ask: (c) => get("rfb", c, `/api/marketplace/agents/${honey}/vcard`) },
@@ -536,7 +542,7 @@ async function enter(): Promise<Fixture> {
       // Finn-tannlege
       { name: "dental mcp tannlege_search", kind: "mcp", ask: (c) => mcp("dental", c, "tannlege_search", { query: "tannlege i Oslo", limit: 10 }) },
       { name: "dental mcp tannlege_info", kind: "mcp", ask: (c) => mcp("dental", c, "tannlege_info", { org_nr: "912345678" }) },
-      { name: "dental a2a message/send", kind: "a2a", ask: (c) => a2a("dental", c, "tannlege i Oslo") },
+      { name: "dental a2a message/send", kind: "a2a", ask: (c) => a2a("dental", c, "message/send", say("tannlege i Oslo")) },
       { name: "dental GET /sok", kind: "page", ask: (c) => get("dental", c, "/sok" + qs({ q: "tannlege i Oslo" })) },
       { name: "dental GET /api/tannlege/agents", kind: "api", ask: (c) => get("dental", c, "/api/tannlege/agents" + qs({ q: "Oslo" })) },
       { name: "dental GET /api/tannlege/discover", kind: "api", ask: (c) => get("dental", c, "/api/tannlege/discover" + qs({ fylke: "Oslo" })) },
@@ -545,7 +551,7 @@ async function enter(): Promise<Fixture> {
       { name: "oa mcp discover_experiences", kind: "mcp", ask: (c) => mcp("oa", c, "discover_experiences", { query: "nordlys Tromsø", limit: 10 }) },
       { name: "oa mcp get_experience", kind: "mcp", ask: (c) => mcp("oa", c, "get_experience", { id: experienceId }) },
       { name: "oa mcp discover_gardssalg", kind: "mcp", ask: (c) => mcp("oa", c, "discover_gardssalg", { query: "sideri" }) },
-      { name: "oa a2a message/send", kind: "a2a", ask: (c) => a2a("oa", c, "nordlys i Tromsø") },
+      { name: "oa a2a message/send", kind: "a2a", ask: (c) => a2a("oa", c, "message/send", say("nordlys i Tromsø")) },
       { name: "oa GET /sok", kind: "page", ask: (c) => get("oa", c, "/sok" + qs({ q: "nordlys" })) },
       { name: "oa GET /api/opplevelser/discover", kind: "api", ask: (c) => get("oa", c, "/api/opplevelser/discover" + qs({ kommune: "Tromsø" })) },
       { name: "oa GET /opplevelse/:slug", kind: "page", ask: (c) => get("oa", c, `/opplevelse/${encodeURIComponent(experienceSlug)}`) },
@@ -758,6 +764,12 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
     for (const entry of fx.entries.filter((e) => e.kind === "page")) {
       assertTrue((d(entry.name).pageViews ?? 0) === 1, `B1 map: ${entry.name} is one page view for an external caller`);
     }
+    for (const entry of ["rfb a2a agent/info", "rfb GET /api/marketplace/agents/:id/info", "rfb GET /api/marketplace/agents/:id/vcard"]) {
+      assertTrue((d(entry).interactions ?? 0) === 1, `B1 map: ${entry} is one interactions row (a view) for an external caller`);
+    }
+    const started = d("rfb POST /api/marketplace/discover start_conversation");
+    assertTrue((started.conversations ?? 0) > 0 && (started.timesContacted ?? 0) > 0,
+      "B1 map: POST /api/marketplace/discover with start_conversation starts countable conversations for an external caller");
   } catch (err: any) {
     failed++;
     failures.push("intern-trafikk-telles-ikke: unexpected error: " + String(err?.stack || err?.message || err));

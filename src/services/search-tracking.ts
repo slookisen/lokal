@@ -162,12 +162,13 @@ export interface SearchCountInput {
 }
 
 /**
- * Who sent a search or lookup outside POST /a2a, for the counters it touches:
- * RFB's agents.discovery_count and agent_metrics.times_discovered (which
- * trust_score reads), the public interactions feed (/api/interactions,
- * /api/live) and the conversation /sok starts. POST /a2a decides this with
- * classifyA2aTraffic and its own `countable` (a2a.ts), which also asks for
- * intent and a per-IP cap.
+ * Who sent a search or lookup outside A2A message/send, for the counters it
+ * touches: RFB's agents.discovery_count and agent_metrics.times_discovered
+ * (which trust_score reads), the public interactions feed (/api/interactions,
+ * /api/live; also RFB A2A agent/info) and the conversations /sok and POST
+ * /api/marketplace/discover (start_conversation) start. message/send decides
+ * this with classifyA2aTraffic and its own `countable` (a2a.ts), which also
+ * asks for intent and a per-IP cap.
  *
  * 'internal': our own traffic (isInternalTraffic: admin key, owner cookie,
  * internal UA markers; MCP: also the session's client name). 'probe' or
@@ -175,7 +176,9 @@ export interface SearchCountInput {
  * monitors by client name or user agent (PROBE_CLIENT_MARKERS, which AI-søk
  * and «Med i AI-svar» leave out) and the A2A spam guard's UA and text rules
  * (classifyA2aTraffic). Only 'external' counts; the caller answers the same
- * either way.
+ * either way. The A2A rule that a JSON object typed as text is a probe holds
+ * here too: such free text in lokal_search, /sok or a REST search is 'probe'
+ * (a structured query sets `structured`).
  */
 export function searchTrafficClass(input: SearchCountInput): A2aTrafficClass {
   const clientName = input.clientName || "";

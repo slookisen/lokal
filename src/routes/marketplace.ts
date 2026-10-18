@@ -48,7 +48,7 @@ import { maskEmail } from "../services/gardssalg-claim";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText } from "../utils/free-text";
-import { searchCountable } from "../services/search-tracking";
+import { searchCountable, searchTrafficClass } from "../services/search-tracking";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
@@ -580,8 +580,11 @@ router.post("/discover", (req: Request, res: Response) => {
   try {
     const query = DiscoveryQuerySchema.parse(req.body);
     // Slice I-Z: our own traffic and probes get the same answer but raise no
-    // discovery counter and stay off the interactions feed (searchCountable).
-    const countable = searchCountable({ meta: buildRequestMeta(req), text: JSON.stringify(query), structured: true });
+    // discovery counter, stay off the interactions feed and start no
+    // countable conversation (searchTrafficClass).
+    const requestMeta = buildRequestMeta(req);
+    const trafficClass = searchTrafficClass({ meta: requestMeta, text: JSON.stringify(query), structured: true });
+    const countable = trafficClass === "external";
     // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
     // review finding: this route's own docstring documents `tags` as caller
     // input, but it never read discoverMeta.tagsRelaxed — a dropped tag
@@ -621,7 +624,11 @@ router.post("/discover", (req: Request, res: Response) => {
             sellerAgentId: r.agent.id,
             queryText: queryDesc,
             source: "api",
-            requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+            requestMeta, // (item 3) internal-traffic classification
+            // Slice I-Z: a probe or spam is no countable conversation. The
+            // answer lists only the ids, so it is the same either way (GET
+            // /search's lists messageCount, which the class would change).
+            trafficClass,
             autoRespond: true,
           });
           conversations.push({ conversationId: conv.id, sellerAgentId: r.agent.id });
