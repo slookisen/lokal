@@ -217,6 +217,44 @@ export function isBlocked(opts: {
   }
 }
 
+// ─── Owner-removed matcher (dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal) ──
+// A blocklist row whose reason contains "fjern oss" means the producer itself
+// asked to be removed (gardssalg-provider-visibility writes
+// "... hide (fjern oss)"; the CS flow uses the same wording). The readiness
+// tier and the unhide guard treat such a producer as terminal `eier_fjernet`.
+// ONE query per call builds in-memory sets, so a readiness pass over the whole
+// corpus does not issue per-row blocklist lookups. Fail-open on a DB error
+// (logged), same policy as isBlocked().
+export const OWNER_REMOVED_REASON_MARKER = "fjern oss";
+
+export function loadOwnerRemovedMatcher(): (ids: { orgNr?: string | null; website?: string | null; email?: string | null }) => boolean {
+  const orgNrs = new Set<string>();
+  const domains = new Set<string>();
+  const emails = new Set<string>();
+  try {
+    const rows = getDb()
+      .prepare(
+        "SELECT identifier_type, identifier_value FROM agent_blocklist WHERE reason LIKE ? AND identifier_type IN ('org_nr','website_domain','email')"
+      )
+      .all(`%${OWNER_REMOVED_REASON_MARKER}%`) as Array<{ identifier_type: string; identifier_value: string }>;
+    for (const r of rows) {
+      if (r.identifier_type === "org_nr") orgNrs.add(r.identifier_value);
+      else if (r.identifier_type === "website_domain") domains.add(r.identifier_value);
+      else emails.add(r.identifier_value);
+    }
+  } catch (err) {
+    console.error("[blocklist] loadOwnerRemovedMatcher failed (treating as no match):", err);
+  }
+  return (ids) => {
+    const o = normalizeOrgNr(ids.orgNr);
+    if (o && orgNrs.has(o)) return true;
+    const d = normalizeDomain(ids.website);
+    if (d && !OWN_DOMAINS.has(d) && domains.has(d)) return true;
+    const e = normalizeEmail(ids.email);
+    return !!e && emails.has(e);
+  };
+}
+
 // ─── add ───────────────────────────────────────────────────────
 // Inserts one or more rows in a single transaction. Returns the
 // number of rows actually inserted (UNIQUE conflicts are silently

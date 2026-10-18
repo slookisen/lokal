@@ -32348,6 +32348,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpv.failures) failures.push("opplevelser-gardssalg-provider-visibility: " + f);
     console.log(`  opplevelser-gardssalg-provider-visibility: ${gpv.passed} passed, ${gpv.failed} failed`);
 
+    // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal:
+    // terminal tier eier_fjernet + unhide guard on provider-visibility.
+    console.log("\n── opplevelser-gardssalg-eier-fjernet: terminal tier + unhide guard ──");
+    const { runOpplevelserGardssalgEierFjernetTests } = require("../src/routes/opplevelser-gardssalg-eier-fjernet.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-eier-fjernet.test");
+    const gef = await runOpplevelserGardssalgEierFjernetTests(false);
+    passed += gef.passed;
+    failed += gef.failed;
+    for (const f of gef.failures) failures.push("opplevelser-gardssalg-eier-fjernet: " + f);
+    console.log(`  opplevelser-gardssalg-eier-fjernet: ${gef.passed} passed, ${gef.failed} failed`);
+
     // dev-request 2026-07-19-gardssalg-nye-agenter-komplett-foer-synlig,
     // skive B: POST /admin/gardssalg-website-discovery (deterministiske
     // domenekandidater + eierskaps-evidens + review-kø, aldri direkte skriv)
