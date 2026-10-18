@@ -1122,9 +1122,10 @@ class MarketplaceRegistry {
           const publicRows = db.prepare(`SELECT id, name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[];
           const allNames = publicRows.map(r => (r.name || "").toLowerCase());
 
-          let nameMatches = nameCandidateWords.filter(word =>
+          const nameMatches = nameCandidateWords.filter(word =>
             allNames.some(name => name.includes(word))
           );
+          let nameSearch = nameMatches.length > 0;
           // Slice I-W2 (S4): in a search of several words, a word that only
           // sits inside a producer name («ser» in «Hvasser», «jul» in
           // «Julseth», «stor» in «Storfjord») makes no name search when
@@ -1141,7 +1142,7 @@ class MarketplaceRegistry {
           // search's order, so a search makes at most UNKNOWN_TERMS_MAX + 1
           // lookups. Places and categories need no lookup and count wherever
           // they stand; each distinct word is weighed once.
-          if (nonSkipWords.length > 1 && nameMatches.length > 0) {
+          if (nonSkipWords.length > 1 && nameSearch) {
             // a place or category word in the search (nameCandidateWords is nonSkipWords without them)
             const known = nameCandidateWords.length < nonSkipWords.length;
             const lookups = [...new Set(nonSkipWords)].filter(w => !/^\p{N}+$/u.test(w)).slice(0, UNKNOWN_TERMS_MAX + 1);
@@ -1151,12 +1152,12 @@ class MarketplaceRegistry {
               if (!hits.has(w)) hits.set(w, (catalogTermMatches(db, [w], ids)?.size ?? 0) > 0);
               return hits.get(w)!;
             };
-            nameMatches = [...new Set(nameMatches)].filter(word =>
+            nameSearch = [...new Set(nameMatches)].some(word =>
               allNames.some(name => name.includes(word) && productNameMatch(name, word) === 3)
               || !(known || lookups.filter(other => other !== word).slice(0, UNKNOWN_TERMS_MAX).some(inCatalog)));
           }
 
-          if (nameMatches.length > 0) {
+          if (nameSearch) {
             // At least one DISTINCTIVE word matches an agent name — use it as name query.
             // PR-72: If categories were also detected, prefer the category-filter path
             // over name-search (category match is stronger signal than a fuzzy name word).

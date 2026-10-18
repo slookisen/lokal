@@ -337,6 +337,11 @@ export async function runRfbSokFyllordNavnekapringTests(opts: { log?: boolean } 
       // Alone, a qualifier word still finds what matches it; next to a category word it counts for nothing
       assertEq([parse("lunsj")._unknownTerms, discover("lunsj"), parse("gave til jul")._unknownTerms],
         [["lunsj"], [LUNSJ], ["gave", "jul"]], "a search of qualifier words only still looks them up («lunsj» finds lunch)");
+      // Review round 2 (S1): the qualifier words stop at UNKNOWN_TERMS_MAX as the other words do, and a
+      // product word after the cap still counts and drops them
+      assertEq([parse("gave jul lunsj frokost selskap stor")._unknownTerms, parse("gave jul lunsj frokost selskap stor kransekake")._unknownTerms],
+        [["gave", "jul", "lunsj", "frokost"], ["kransekake"]],
+        "six qualifier words give the first 4 (UNKNOWN_TERMS_MAX); a product word after them is the one word looked up");
       assertEq([parse("brød til frokost").categories, parse("brød til frokost")._unknownTerms], [["bakery"], undefined],
         "next to a category word a qualifier word is no unknown word («brød til frokost»)");
       assertEq([parse("kransekake bryllup")._unknownTerms, discover("kransekake bryllup")[0]], [["kransekake", "bryllup"], FLATOY],
