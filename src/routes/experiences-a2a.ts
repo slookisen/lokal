@@ -62,6 +62,7 @@ import { conversationService, buildRequestMeta, isInternalTraffic, type RequestM
 import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
+import { a2aMessageData } from "../utils/a2a-message";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -259,7 +260,8 @@ export function experiencesAskedSomething(result: object): boolean {
 function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
-  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  // A DataPart counts as message.data (I-X, utils/a2a-message.ts).
+  const data = a2aMessageData(message);
   return a2aLookupCountable({
     vertical: "experiences",
     ipHash,
@@ -293,9 +295,10 @@ export function handleExperiencesMessageSend(
   if (messageText) {
     filter = parseExperiencesIntent(messageText);
   } else if (message && typeof message === "object") {
-    const m = message as Record<string, unknown>;
-    if (m.data && typeof m.data === "object") {
-      const d = m.data as Record<string, unknown>;
+    // message.data, or the first standard DataPart (I-X, utils/a2a-message.ts).
+    const data = a2aMessageData(message);
+    if (data && typeof data === "object") {
+      const d = data as Record<string, unknown>;
       if (typeof d.fylke === "string") filter.fylke = d.fylke;
       if (typeof d.kommune === "string") filter.kommune = d.kommune;
       if (typeof d.category === "string") filter.category = d.category;
@@ -425,9 +428,10 @@ export function handleExperiencesMessageSend(
       let gLng = typeof filter.lng === "number" ? filter.lng : undefined;
       let gRadiusKm = typeof filter.radius_km === "number" ? filter.radius_km : undefined;
       if ((gLat === undefined || gLng === undefined) && message && typeof message === "object") {
-        const m = message as Record<string, unknown>;
-        if (m.data && typeof m.data === "object") {
-          const d = m.data as Record<string, unknown>;
+        // message.data, or the first standard DataPart (I-X, utils/a2a-message.ts).
+        const data = a2aMessageData(message);
+        if (data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
           if (typeof d.lat === "number") gLat = d.lat;
           if (typeof d.lng === "number") gLng = d.lng;
           if (typeof d.radius_km === "number") gRadiusKm = d.radius_km;

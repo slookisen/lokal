@@ -42835,6 +42835,31 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-X (FUNN
+// dental-a2a-datapart-ignoreres, dental-a2a-orgnr-med-mellomrom): the A2A
+// message/send handlers of RFB, Opplevagent and Finn-tannlege read the
+// standard DataPart (message.parts [{kind: "data"}]) as message.data, with
+// message.data and text first; Finn-tannlege's A2A reads «912 345 678» as an
+// org.nr. Messages without a DataPart answer as main did
+// (tests/fixtures/a2a-datapart-i-x-main.json). Swaps the main DB singleton,
+// the dental/experiences db-factory and the module cache (restored in
+// finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-X (A2A DataPart on all three platforms + org.nr with spaces) ──");
+  try {
+    const { runA2aDatapartAllePlattformerTests } = require("../src/routes/a2a-datapart-alle-plattformer.test") as
+      typeof import("../src/routes/a2a-datapart-alle-plattformer.test");
+    const r = await runA2aDatapartAllePlattformerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("a2a-datapart-alle-plattformer: " + f);
+    console.log(`  a2a-datapart-alle-plattformer: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("a2a-datapart-alle-plattformer: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

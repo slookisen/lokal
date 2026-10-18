@@ -14,8 +14,10 @@
  *   F   each message.data key the search text names is read (echoed in
  *       metadata.filter), also fylke + specialty + helfo_agreement together;
  *       the keys the old text named (spesialitet, helfo, akutt) give filter {}
- *       and are not named; a data part in `parts` is not read, as the text
- *       says;
+ *       and are not named; the text says a data part in `parts` is not
+ *       read, but since I-X (dev-request 2026-10-17-integrasjonstest-
+ *       oppfolging) the handler reads it as message.data. The card is frozen
+ *       in I-X, so that sentence waits for its own change;
  *   P   the page size the search text gives is the answer's count, total
  *       counts every match, and the statistics are for all of Norway;
  *   T   the text rules: a search word in the first sentence, violations()
@@ -221,7 +223,8 @@ export async function runDentalAgentCardTests(opts: { log?: boolean } = {}): Pro
       }
       eq(search.match(OLD_KEY_NAMES)?.[0] ?? null, null, "F7: the search text does not name spesialitet, helfo or akutt as a key");
       ok(search.includes("a data part in `parts` is not read"), "F8: the search text says that a data part is not read ...");
-      eq(send({ parts: [{ kind: "data", data: { fylke: "Trøndelag" } }] }).result?.metadata?.filter, {}, "F9: ... and a data part in parts gives filter {}");
+      eq(send({ parts: [{ kind: "data", data: { fylke: "Trøndelag" } }] }).result?.metadata?.filter, { fylke: "Trøndelag" },
+        "F9: ... but since I-X a data part in parts is read as message.data (the card text is frozen in I-X)");
     }
 
     // ── P: page size, total, and statistics for all of Norway ─────────────
