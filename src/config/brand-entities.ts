@@ -140,7 +140,7 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
     supportEmail: "kontakt@finn-tannlege.com",
     docsUrl: null,
     privacyUrl: `${FT_URL}/personvern`,
-    termsUrl: null,
+    termsUrl: `${FT_URL}/vilkar`,
     // The reviewer prompts in dental-connectors-prep/claude-directory/test-instructions.md.
     exampleQueries: [
       "Find a dentist in Bergen",

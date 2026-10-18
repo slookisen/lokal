@@ -12,14 +12,14 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: no** (3 open).
+**Ready to submit: no** (2 open).
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
 | Every tool has a title and readOnlyHint/destructiveHint | **DONE** | All 5 tools. | — | code |
 | Tool descriptions describe and never instruct Claude | **DONE** | No directive wording in any tool description. | — | code |
 | Privacy policy page | **DONE** | https://finn-tannlege.com/personvern | — | code |
-| Terms page | **OPEN** | None yet (`termsUrl` is null in src/config/brand-entities.ts). The portal asks only for a privacy URL; a public terms page is still required before submission. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S5; Daniel approves the text) | code |
+| Terms page | **DONE** | https://finn-tannlege.com/vilkar | — | code |
 | Public documentation page | **OPEN** | None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date. | G3-S4 of this dev-request (`/guide-tannlege-ai`) | code |
 | Square 512×512 PNG icon to upload | **OPEN** | None yet: no icon file in `dental-connectors-prep/assets/`, and `logoPng` is null in src/config/brand-entities.ts. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4) | code |
 | MCP server instructions and serverInfo title, description and websiteUrl | **DONE** | `new McpServer(...)` in `src/routes/dental-mcp.ts` sets serverInfo `name`, `version`, `title`, `description`, `websiteUrl` and instructions. | — | code |
