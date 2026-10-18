@@ -1134,20 +1134,26 @@ class MarketplaceRegistry {
           // names. A word that is a whole word of a name (productNameMatch 3:
           // «Grini», «Lager» in «Lager 11», «REKO-ring» in «REKO-ring Hamar»)
           // still makes one, and so does a search of one word.
+          // Review round 1 (B1): each catalog lookup is a LIKE scan of
+          // `products`, and the search reaches this point with no length
+          // limit (a 98 kB search took 16 s). As in step 3c, a word has at
+          // most UNKNOWN_TERMS_MAX other words looked up, the first in the
+          // search's order, so a search makes at most UNKNOWN_TERMS_MAX + 1
+          // lookups. Places and categories need no lookup and count wherever
+          // they stand; each distinct word is weighed once.
           if (nonSkipWords.length > 1 && nameMatches.length > 0) {
-            const whole = new Set(nameMatches.filter(word => allNames.some(name => productNameMatch(name, word) === 3)));
-            if (whole.size < nameMatches.length) {
-              const ids = new Set<string>(publicRows.map(r => r.id));
-              const hits = new Map<string, boolean>();
-              const givesHit = (w: string): boolean => {
-                if (!hits.has(w)) {
-                  hits.set(w, isKnownTerm(w) || (!/^\p{N}+$/u.test(w) && (catalogTermMatches(db, [w], ids)?.size ?? 0) > 0));
-                }
-                return hits.get(w)!;
-              };
-              nameMatches = nameMatches.filter(word =>
-                whole.has(word) || !nonSkipWords.some(other => other !== word && givesHit(other)));
-            }
+            // a place or category word in the search (nameCandidateWords is nonSkipWords without them)
+            const known = nameCandidateWords.length < nonSkipWords.length;
+            const lookups = [...new Set(nonSkipWords)].filter(w => !/^\p{N}+$/u.test(w)).slice(0, UNKNOWN_TERMS_MAX + 1);
+            const ids = new Set<string>(publicRows.map(r => r.id));
+            const hits = new Map<string, boolean>();
+            const inCatalog = (w: string): boolean => {
+              if (!hits.has(w)) hits.set(w, (catalogTermMatches(db, [w], ids)?.size ?? 0) > 0);
+              return hits.get(w)!;
+            };
+            nameMatches = [...new Set(nameMatches)].filter(word =>
+              allNames.some(name => name.includes(word) && productNameMatch(name, word) === 3)
+              || !(known || lookups.filter(other => other !== word).slice(0, UNKNOWN_TERMS_MAX).some(inCatalog)));
           }
 
           if (nameMatches.length > 0) {
@@ -2714,17 +2720,26 @@ const UNKNOWN_TERMS_MAX = 4;
  * NO_PRODUCT_WORDS word: letters (or a mix with digits), three or more, in
  * query order, once each, at most UNKNOWN_TERMS_MAX. Slice I-W2: a
  * QUALIFIER_WORDS word only when there is no other such word and
- * `qualifiersAlone` (the search has no category word either).
+ * `qualifiersAlone` (the search has no category word either). Both lists
+ * stop at UNKNOWN_TERMS_MAX and each distinct word is weighed once, so a
+ * long search costs no more than in I-W.
  */
 function unknownProductWords(q: string, isKnown: (w: string) => boolean, qualifiersAlone: boolean): string[] {
   const words: string[] = [];
   const qualifiers: string[] = [];
+  const seen = new Set<string>();
   for (const w of q.split(/[^\p{L}\p{N}]+/u)) {
-    if (w.length < 3 || /^\p{N}+$/u.test(w) || words.includes(w) || qualifiers.includes(w)) continue;
+    if (w.length < 3 || seen.has(w) || /^\p{N}+$/u.test(w)) continue;
+    seen.add(w);
     if (isKnown(w) || GENERIC_NAME_WORDS.has(w) || QUERY_STOPWORDS.has(w) || NO_PRODUCT_WORDS.has(w)) continue;
-    (QUALIFIER_WORDS.has(w) ? qualifiers : words).push(w);
+    if (!QUALIFIER_WORDS.has(w)) {
+      words.push(w);
+      if (words.length === UNKNOWN_TERMS_MAX) break;
+    } else if (qualifiers.length < UNKNOWN_TERMS_MAX) {
+      qualifiers.push(w);
+    }
   }
-  return (words.length > 0 ? words : qualifiersAlone ? qualifiers : []).slice(0, UNKNOWN_TERMS_MAX);
+  return words.length > 0 ? words : qualifiersAlone ? qualifiers : [];
 }
 
 /** How a producer's catalog answers the words of discover() step 3c. */

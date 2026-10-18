@@ -22,7 +22,9 @@
  *   category or a product; a whole word of a name still does. «ser»,
  *   «lager», «lage», «make» and «makes» are filler words, and «bakeries» is
  *   the bakery category; next to a category word the unknown words only rank
- *   that category's producers.
+ *   that category's producers. Review round 1 (B1): that rule looks up at
+ *   most UNKNOWN_TERMS_MAX other words in the catalog, counted on a search of
+ *   2000 words.
  * - S1: words for the occasion, meal, size or packaging («lunsj», «selskap»,
  *   «gave», «frokost», «stor», «jul») next to a product word brought in
  *   producers that match only them, as product matches, and could rank first.
@@ -274,6 +276,36 @@ export async function runRfbSokFyllordNavnekapringTests(opts: { log?: boolean } 
         "«brød zzzqqx»: no product matches «zzzqqx», so the bakeries of «brød» in the same order, with no product matches and no unmatchedTerms");
       assertEq((await search("brød zzzqqx")).replace("\"brød zzzqqx\"", "\"brød\""), await search("brød"),
         "lokal_search «brød zzzqqx»: the answer of «brød», labelled by «brød» as before");
+
+      // Review round 1 (B1): the rule's catalog lookups are capped, as step 3c's. Each is a LIKE scan of
+      // `products`, and a search reaches the parser with no length limit: one lookup per word made a 98 kB
+      // search cost 16 s of synchronous work. Counted at db.prepare, the lookup's only way to the DB.
+      const lookupsDuring = async (fn: () => unknown): Promise<number> => {
+        const db = fixtures.db as any;
+        const prepare = db.prepare;
+        let n = 0;
+        db.prepare = (sql: string) => {
+          if (sql.startsWith("SELECT agent_id, name, price_nok, availability_source FROM products WHERE")) n++;
+          return prepare.call(db, sql);
+        };
+        try { await fn(); } finally { delete db.prepare; }
+        return n;
+      };
+      // «zqa», «zqb» …: words no name, product or place holds
+      const filler = Array.from({ length: 1999 }, (_, i) => `zq${[...i.toString(26)].map((d) => String.fromCharCode(97 + parseInt(d, 26))).join("")}`);
+      const long = ["jul", ...filler].join(" ");
+      assertEq([long.split(" ").length, new Set(filler).size, await lookupsDuring(() => parse(long))], [2000, 1999, 4],
+        "B1: a search of 2000 words with a word inside a name («jul») looks up the 4 words after it in the catalog (UNKNOWN_TERMS_MAX), not 1999");
+      const longKrans = ["kransekake", "jul", ...filler.slice(0, 1998)].join(" ");
+      assertEq([await lookupsDuring(() => parse(longKrans)), parse(longKrans)._nameQuery, parse(longKrans)._unknownTerms],
+        [1, undefined, ["kransekake", "zqa", "zqb", "zqc"]],
+        "B1: with «kransekake» first, one lookup finds it; no name search, and step 3c gets the first 4 unknown words as before");
+      let longText = "";
+      assertEq([await lookupsDuring(async () => { longText = await search(longKrans); }), namesIn(longText).sort()], [2, [...KRANS_NAMES].sort()],
+        "B1: lokal_search of those 2000 words makes 2 lookups (the parser's and step 3c's) and finds the kransekake producers");
+      assertEq([parse("jul zqa zqb zqc kransekake")._nameQuery, parse("jul zqa zqb zqc zqd kransekake")._nameQuery],
+        [undefined, "jul zqa zqb zqc zqd kransekake"],
+        "B1, the limit: a product word as the 4th word after «jul» still counts; as the 5th it is not looked up, and the name search stays as in I-W");
     }
 
     // ══════════════════════════════════════════════════════════════
