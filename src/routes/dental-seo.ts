@@ -53,6 +53,10 @@ import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+// dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
+// clinic page names its place in the official spelling, by the same lookup as
+// the MCP/A2A cards.
+import { officialPlaceSpelling } from "../services/search-intent/norwegian-query";
 // dev-request 2026-10-17-dental-d3-rettelser (D3d): the web card's chips are
 // the specialties the filter finds a clinic by, and the placeholder postnummer
 // "0000" is never shown, as on the MCP/A2A cards.
@@ -317,13 +321,42 @@ export function slugifyText(text: string): string {
 
 /** Title-case a DB poststed value (stored uppercase, e.g. "OSLO" → "Oslo",
  *  "MO I RANA" → "Mo i Rana"). Small Norwegian conjunctions stay lowercase
- *  when not first word. */
+ *  when not first word. Each part of a hyphenated name is capitalised
+ *  ("SØR-FRON" → "Sør-Fron", not "Sør-fron"; D3d trinn 3). */
 export function titleCasePoststed(s: string): string {
   const SMALL = new Set(["i", "og", "på", "av", "ved", "for"]);
   return s.toLowerCase().split(" ").map((word, idx) => {
     if (idx > 0 && SMALL.has(word)) return word;
-    return word.charAt(0).toUpperCase() + word.slice(1);
+    return word.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("-");
   }).join(" ");
+}
+
+/**
+ * A stored poststed as the clinic page names it (dev-request
+ * 2026-10-17-dental-d3-rettelser, D3d punkt 2 trinn 3): title-cased like
+ * titleCasePoststed, in the official spelling where the stored value is a
+ * fold of one ("Tromsoe" → "Tromsø", "Baerum" → "Bærum", "Nord Aurdal" →
+ * "Nord-Aurdal"), by officialPlaceSpelling, the lookup the MCP/A2A cards use.
+ * A value qualified with « i …» that is no official name as a whole gets the
+ * official spelling of the place before the qualifier ("Heroey I M Og R" →
+ * "Herøy i M og R"). The official spelling is taken only when it slugs like
+ * the stored value: /sted groups spellings by slugifyText (D3b) and the
+ * lookup goes by placeKey, so the name the page shows and its /sted/<slug>
+ * link are always the same place. Anything else is title-cased as stored.
+ */
+export function officialPlaceLabel(stored: string): string {
+  const asStored = titleCasePoststed(stored);
+  const words = asStored.split(" ");
+  const qualifierAt = words.indexOf("i", 1);
+  const candidates: Array<[place: string, qualifier: string]> = [[stored, ""]];
+  if (qualifierAt > 0) candidates.push([words.slice(0, qualifierAt).join(" "), ` ${words.slice(qualifierAt).join(" ")}`]);
+  for (const [place, qualifier] of candidates) {
+    const official = officialPlaceSpelling(place);
+    if (!official) continue;
+    const label = (official.kind === "poststed" ? titleCasePoststed(official.name) : official.name) + qualifier;
+    return slugifyText(label) === slugifyText(stored) ? label : asStored;
+  }
+  return asStored;
 }
 
 // ─── orch-PR-20260613 finn-tannlege clinic content differentiation ──────────────
@@ -372,7 +405,8 @@ export function isValidLocality(s: string | null | undefined): boolean {
  * the same <title> and meta description.
  *   { place }  "<postnummer> <Poststed>", when the clinic's own postnummer is
  *              a real one (not empty, not the placeholder 0000) that none of
- *              the namesakes has;
+ *              the namesakes has; the place named by officialPlaceLabel, as
+ *              everywhere else on the page (D3d trinn 3);
  *   { orgnr }  otherwise the org.nr, which no other row has;
  *   null       no namesake, or no org.nr either: the page is as before.
  * The street address is never used, because it can hold a c/o address.
@@ -392,7 +426,7 @@ export function namesakeDisambiguator(
   if (namesakes.length === 0) return null;
   const own = realPostnummer(agent.postnummer);
   if (own && isValidLocality(agent.poststed) && namesakes.every((n) => realPostnummer(n.postnummer) !== own)) {
-    return { place: `${own} ${titleCasePoststed(agent.poststed!)}` };
+    return { place: `${own} ${officialPlaceLabel(agent.poststed!)}` };
   }
   const orgnr = agent.org_nr?.trim();
   return orgnr ? { orgnr } : null;
@@ -424,8 +458,9 @@ export function buildClinicDescription(
 ): string {
   const parts: string[] = [];
 
-  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values
-  const validPoststed = isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : null;
+  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values;
+  // the official spelling ("i Tromsø", not "i Tromsoe"; D3d trinn 3)
+  const validPoststed = isValidLocality(agent.poststed) ? officialPlaceLabel(agent.poststed!) : null;
   const validFylke = isValidLocality(agent.fylke) ? agent.fylke! : null;
   // "i 0190 Oslo" on a namesake's page (D3e); { place } implies a valid poststed.
   const localityLabel = namesake && "place" in namesake ? namesake.place : validPoststed;
@@ -449,7 +484,7 @@ export function buildClinicDescription(
   // Address
   if (!short && agent.adresse && isValidLocality(agent.poststed)) {
     const postnummer = shownPostnummer(agent.postnummer);
-    parts.push(`Adresse: ${agent.adresse}, ${postnummer ? postnummer + " " : ""}${titleCasePoststed(agent.poststed!)}.`);
+    parts.push(`Adresse: ${agent.adresse}, ${postnummer ? postnummer + " " : ""}${validPoststed}.`);
   }
 
   // Helfo
@@ -1695,12 +1730,13 @@ function renderClinicProfile(
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
       ...(postnummer ? { postalCode: postnummer } : {}),
       // orch-PR-20260613: guard malformed/foreign locality values (e.g. "Se-44338 Lerum", "Ukjent")
-      ...(isValidLocality(agent.poststed) ? { addressLocality: titleCasePoststed(agent.poststed!) } : {}),
+      // D3d trinn 3: the official spelling, as in the title ("Tromsø", not "Tromsoe")
+      ...(isValidLocality(agent.poststed) ? { addressLocality: officialPlaceLabel(agent.poststed!) } : {}),
       ...(isValidLocality(agent.fylke) ? { addressRegion: agent.fylke } : {}),
       addressCountry: "NO",
     },
     ...((isValidLocality(agent.poststed) || isValidLocality(agent.fylke))
-      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : agent.fylke } }
+      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? officialPlaceLabel(agent.poststed!) : agent.fylke } }
       : {}),
     ...(agent.lat && agent.lng
       ? { geo: { "@type": "GeoCoordinates", latitude: agent.lat, longitude: agent.lng } }
@@ -1738,7 +1774,7 @@ function renderClinicProfile(
     try { related = listRelatedClinics(agent, 6); } catch { /* db not ready */ }
     if (related.length > 0) {
       const stedSlug = slugifyText(agent.poststed);
-      const titledSted = titleCasePoststed(agent.poststed);
+      const titledSted = officialPlaceLabel(agent.poststed);
       const relatedCards = related.map(clinicCard).join("");
       relatedSection = `<div class="section-box" style="margin-top:20px">
   <h2>Flere tannleger i ${escapeHtml(titledSted)}</h2>
@@ -1759,9 +1795,11 @@ function renderClinicProfile(
 
   // ── PR-116: BreadcrumbList for profile
   // orch-PR-20260613: guard malformed locality in breadcrumb
+  // D3d trinn 3: the official name; the /sted URL keeps the stored value's slug,
+  // which officialPlaceLabel's name always shares.
   const profileBreadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
   if (isValidLocality(agent.fylke)) profileBreadcrumbItems.push({ name: agent.fylke!, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke!)}` });
-  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
+  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: officialPlaceLabel(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
   profileBreadcrumbItems.push({ name: agent.navn, url: canonical });
   // skive C: a non-clinic must not claim to be a schema.org Dentist.
   const nonClinic = isNonClinicProfile(agent);
@@ -1794,7 +1832,7 @@ function renderClinicProfile(
       return dot > 60 ? t.slice(0, dot + 1) : t + "…";
     }
     if (nonClinic) {
-      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring.`;
+      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${officialPlaceLabel(agent.poststed!)}` : ""}. Registeroppføring.`;
     }
     return buildClinicDescription(agent, localityCount, true, namesake);
   })();
@@ -1829,7 +1867,9 @@ function renderClinicProfile(
   // sole-proprietor wording (display-name decision for ENK is a separate item).
   // D3e: a namesake's page names its place with the postnummer or adds the
   // org.nr, in all three templates; otherwise the place reads as before.
-  const titlePlace = namesake && "place" in namesake ? namesake.place : agent.poststed ? titleCasePoststed(agent.poststed) : null;
+  // D3d trinn 3: both labels (here and in namesakeDisambiguator) name the
+  // place by officialPlaceLabel, so a title never mixes «Tromsoe» and «Tromsø».
+  const titlePlace = namesake && "place" in namesake ? namesake.place : agent.poststed ? officialPlaceLabel(agent.poststed) : null;
   const titleLocality = `${titlePlace ? ` i ${titlePlace}` : ""}${namesake && "orgnr" in namesake ? ` (org.nr ${namesake.orgnr})` : ""}`;
   const profileTitleCore = nonClinic && agent.catalog_class !== "person_enk"
     ? `${agent.navn}${titleLocality}`
@@ -1843,7 +1883,7 @@ function renderClinicProfile(
     <div class="container">
       <div class="clinic-badges" style="margin-bottom:12px">${badges.join("")}</div>
       <h1 class="profile-name">${escapeHtml(agent.navn)}</h1>
-      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(titleCasePoststed(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
+      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(officialPlaceLabel(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
       <div class="profile-actions">${callBtn}${bookBtn}</div>
     </div>
   </div>
