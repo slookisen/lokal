@@ -816,7 +816,9 @@ a:hover{text-decoration:underline}
 // ─── Shared nav / footer ─────────────────────────────────────
 
 // The nav and the footer are Norwegian on every page. On an English page
-// (pageLang "en", G3-S4) they say so with lang="nb".
+// (pageLang "en", G3-S4) they say so with lang="nb", and the footer's
+// operator line and FINN.no sentence are the English ones, marked lang="en"
+// (G3-S8: English where the page is English; as /en/guide-opplevelser-mcp).
 const chromeLangAttr = (pageLang: SiteLang): string => (pageLang === "en" ? ' lang="nb"' : "");
 
 function dentalNav(pageLang: SiteLang = "nb"): string {
@@ -833,6 +835,13 @@ function dentalNav(pageLang: SiteLang = "nb"): string {
 }
 
 function dentalFooter(pageLang: SiteLang = "nb"): string {
+  const en = pageLang === "en";
+  const companyLine = en
+    ? `<div class="footer-company" lang="en">${companyFooterLineHtml("en", { contactHref: "/en/kontakt" })}</div>`
+    : `<div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>`;
+  const disambiguation = en
+    ? `<div class="footer-disambiguation" lang="en">${escapeHtml(FINN_DISAMBIGUATION_EN)}</div>`
+    : `<div class="footer-disambiguation">${escapeHtml(FINN_DISAMBIGUATION_NB)}</div>`;
   return `<footer class="footer" role="contentinfo"${chromeLangAttr(pageLang)}>
   <div class="footer-inner">
     <div class="footer-col">
@@ -860,8 +869,8 @@ function dentalFooter(pageLang: SiteLang = "nb"): string {
   <div class="footer-bottom">
     &copy; ${new Date().getFullYear()} Finn-tannlege.com &mdash; AI-agenter: <a href="/llms.txt">llms.txt</a> &middot; API: <a href="/api/tannlege/agents">/api/tannlege</a><br>
     En del av A2A-nettverket: <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot; <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a> &mdash; Bygget for både mennesker og AI-agenter
-    <div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
-    <div class="footer-disambiguation">${escapeHtml(FINN_DISAMBIGUATION_NB)}</div>
+    ${companyLine}
+    ${disambiguation}
   </div>
 </footer>`;
 }
@@ -1785,7 +1794,7 @@ function renderClinicProfile(
     url: canonical,
     // orch-PR-20260613: favicon-as-image is a quality negative for Google rich results.
     // Only emit image if a real clinic image/logo URL exists; otherwise omit the field.
-    // (The ogImage on the page shell still falls back to favicon.svg for social sharing.)
+    // (The page shell's share image is the 512×512 PNG of the mark, F2-S4.)
     // orch-PR-20260613: no real image field in DentalAgent; image is omitted
     // rather than falling back to favicon.svg which is a quality negative.
     ...(isDisplayablePhone(agent.telefon) ? { telephone: agent.telefon } : {}),

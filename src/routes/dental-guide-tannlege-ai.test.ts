@@ -26,6 +26,10 @@
  *   (d) no promise of booking: booking is named only in the FAQ answer that
  *       says the service books nothing; FINN.no only in the footer sentence
  *       (G3-S8); no HPR, NTF or Helsedirektoratet claim in the page body.
+ *       The footer's operator line and FINN.no sentence are in the page's
+ *       language: nb on the Norwegian page, en (lang="en", the org.nr.
+ *       linking /en/kontakt, as on /en/guide-opplevelser-mcp) on the English
+ *       one; the other pages keep the Norwegian ones (regression).
  *   (e) setup: the remote URL is the server card's endpoint, the npm package
  *       is mcp-server-dental/package.json's name and bin, the Claude Desktop
  *       config is valid JSON for it, and the source link is that folder.
@@ -42,7 +46,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
-import { NOT_AFFILIATED_NB } from "./dental-finn-disambiguation.test";
+import { NOT_AFFILIATED_EN, NOT_AFFILIATED_NB } from "./dental-finn-disambiguation.test";
 
 export interface TestSummary {
   passed: number;
@@ -191,6 +195,7 @@ export async function runDentalGuideTannlegeAiTests(opts: { log?: boolean } = {}
     const router = dentalSeo.default as any;
     const manifest = require("../services/mcp-tool-manifest") as typeof import("../services/mcp-tool-manifest");
     const { langMiddleware } = require("../i18n/middleware") as typeof import("../i18n/middleware");
+    const { companyFooterLineHtml } = require("../services/company-legal") as typeof import("../services/company-legal");
 
     // A real tools/list and tools/call, as a client gets them.
     const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js") as typeof import("@modelcontextprotocol/sdk/server/mcp.js");
@@ -316,11 +321,37 @@ export async function runDentalGuideTannlegeAiTests(opts: { log?: boolean } = {}
       assertTrue(!/\bbook|bestill|timebestilling/i.test(rest), `d4 ${lang}: no other text on the page mentions booking`, (rest.match(/.{0,40}(\bbook|bestill).{0,40}/i) || [""])[0]);
       assertTrue(!NOT_A_SOURCE.test(main), `d5 ${lang}: the page body names no HPR, NTF or Helsedirektoratet`);
       const footer = (r.text.match(/<footer[\s\S]*?<\/footer>/) || [""])[0];
-      assertTrue(NOT_AFFILIATED_NB.test(footer), `d6 ${lang}: the footer keeps the FINN.no sentence (G3-S8)`);
-      const nbSentence = BRAND_ENTITIES.dental.disambiguation?.nb ?? "\u0000";
-      assertTrue(!FINN_MENTION.test(r.text.split(nbSentence).join("")), `d7 ${lang}: FINN.no is named only in that sentence`);
+      const sentences = BRAND_ENTITIES.dental.disambiguation ?? { nb: "\u0000", en: "\u0000" };
+      const [sentence, otherSentence] = lang === "en" ? [sentences.en, sentences.nb] : [sentences.nb, sentences.en];
+      const sentenceLine = `<div class="footer-disambiguation"${lang === "en" ? ' lang="en"' : ""}>${sentence}</div>`;
+      assertTrue((lang === "en" ? NOT_AFFILIATED_EN : NOT_AFFILIATED_NB).test(sentence) && footer.split(sentenceLine).length - 1 === 1,
+        `d6 ${lang}: the footer has the FINN.no sentence (G3-S8) once, in the page's language${lang === "en" ? ', marked lang="en"' : ""}`, footer.slice(-700));
+      assertTrue(!FINN_MENTION.test(r.text.split(sentence).join("")) && !r.text.includes(otherSentence),
+        `d7 ${lang}: FINN.no is named only in that sentence, and the ${lang === "en" ? "Norwegian" : "English"} one is not on the page`);
+      const [companyLine, otherLine] = lang === "en"
+        ? [`<div class="footer-company" lang="en">${companyFooterLineHtml("en", { contactHref: "/en/kontakt" })}</div>`, companyFooterLineHtml("nb", { contactHref: "/kontakt" })]
+        : [`<div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>`, companyFooterLineHtml("en", { contactHref: "/en/kontakt" })];
+      assertTrue(footer.split(companyLine).length - 1 === 1 && !footer.includes(otherLine),
+        `d8 ${lang}: the operator line is in the page's language${lang === "en" ? ' (lang="en", the org.nr. links /en/kontakt)' : ""}, and only that one`, footer.slice(-700));
+      const afterLine = footer.indexOf(companyLine) + companyLine.length;
+      assertTrue(footer.includes(companyLine) && footer.indexOf(sentenceLine) > afterLine && footer.slice(afterLine, footer.indexOf(sentenceLine)).trim() === "",
+        `d9 ${lang}: the FINN.no sentence sits right under the operator line`);
       const spellings = FORBIDDEN_NAME_SPELLINGS.map((re) => r.text.match(re)?.[0]).filter((m): m is string => !!m);
-      assertEq(spellings, [], `d8 ${lang}: no «FINN-tannlege», «FINN Tannlege», «finntannlege(n)», «FinnTannlege» or «Finn Tannlege»`);
+      assertEq(spellings, [], `d10 ${lang}: no «FINN-tannlege», «FINN Tannlege», «finntannlege(n)», «FinnTannlege» or «Finn Tannlege»`);
+    }
+    {
+      // The English operator line links /en/kontakt, where the company facts are in English.
+      const enKontakt = await callThroughLangMiddleware(langMiddleware, router, "/en/kontakt");
+      assertTrue(enKontakt.status === 200 && enKontakt.text.includes('<section class="co-sec" id="selskap" lang="en">'),
+        "d11 control: /en/kontakt (through langMiddleware) is 200 with the company facts in English");
+      const nbFooterTail = `<div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>`;
+      const nbSentenceLine = `<div class="footer-disambiguation">${BRAND_ENTITIES.dental.disambiguation?.nb}</div>`;
+      for (const p of ["/", "/om", "/en/"]) {
+        const r = p.startsWith("/en/") ? await callThroughLangMiddleware(langMiddleware, router, p) : await callRoute(router, p);
+        const footer = (r.text.match(/<footer[\s\S]*?<\/footer>/) || [""])[0];
+        assertTrue(r.status === 200 && footer.includes(nbFooterTail) && footer.includes(nbSentenceLine) && !footer.includes(' lang="en"'),
+          `d12 ${p} (regression): a Norwegian page keeps the Norwegian operator line and FINN.no sentence, with no lang="en"`);
+      }
     }
 
     // ── (e) setup ─────────────────────────────────────────────────────────
