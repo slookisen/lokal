@@ -36143,6 +36143,24 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental namesake-titler (D3e): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
+  //    clinic page names its place in the official spelling («Tromsø», not
+  //    «Tromsoe») in title, meta, JSON-LD, breadcrumb and header; hyphenated
+  //    names title-case per part («Sør-Fron») ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3d trinn 3): dental profil-skrivemåte ──");
+  try {
+    const { runDentalProfilSkrivemateTests } = require("../src/routes/dental-profil-skrivemate.test") as
+      typeof import("../src/routes/dental-profil-skrivemate.test");
+    const dps = await runDentalProfilSkrivemateTests({ log: false });
+    passed += dps.passed;
+    failed += dps.failed;
+    for (const f of dps.failures) failures.push("dental profil-skrivemåte (D3d trinn 3): " + f);
+    console.log(`  dental profil-skrivemåte (D3d trinn 3): ${dps.passed} passed, ${dps.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental profil-skrivemåte (D3d trinn 3): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
   //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
   //    every 404, agents.txt API-base /api/tannlege ──
