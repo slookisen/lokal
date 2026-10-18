@@ -26,10 +26,13 @@
  *   A      A2A message/send (org.nr and search), the row's own fields too.
  *   R      public REST /agents and /agents/:id (no field_provenance, no pending
  *          map); with X-Admin-Key the stored values and field_provenance.
+ *          Over HTTP behind the CORS layer: Cache-Control: private and Vary:
+ *          Origin, X-Admin-Key on every answer (the A4-S contract).
  *   S      the sitemap: A is left out (its page is noindex).
  *   B      B1: C, and every shown field, as with the rule off.
  *   K      kill switch off: every surface as on main (= the same clinic with
- *          its google_places records removed, and REST as the admin answer).
+ *          its google_places records removed, and REST as the admin answer);
+ *          the REST headers, /proveniens and the agent card as main's.
  *   T      texts: /proveniens (no + en) and the A2A agent card.
  *   N      no DB write: the stored rows are unchanged after every surface.
  *
@@ -77,6 +80,7 @@ function callRoute(
       setHeader() { return this; },
       header() { return this; },
       set() { return this; },
+      vary() { return this; },
       once() { return this; },
       send(payload: any) { resolve({ status: this.statusCode, text: String(payload ?? ""), body: null }); return this; },
       json(payload: any) { resolve({ status: this.statusCode, text: JSON.stringify(payload), body: payload }); return this; },
@@ -97,6 +101,21 @@ function jsonLdNodes(html: string): any[] {
   return [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].flatMap((m) => {
     const v = JSON.parse(m[1]!);
     return Array.isArray(v) ? v : [v];
+  });
+}
+
+/** GET over HTTP; the status and the two cache headers of the answer. */
+function headersOf(
+  port: number,
+  path: string,
+  headers: Record<string, string> = {}
+): Promise<{ status: number; cacheControl?: string; vary?: string }> {
+  const http = require("http") as typeof import("http");
+  return new Promise((resolve, reject) => {
+    http.get({ host: "127.0.0.1", port, path, headers: { origin: "https://claude.ai", ...headers } }, (r) => {
+      r.resume();
+      r.on("end", () => resolve({ status: r.statusCode ?? 0, cacheControl: r.headers["cache-control"], vary: r.headers.vary }));
+    }).on("error", reject);
   });
 }
 
@@ -142,6 +161,7 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
   const realLogWebSearch = analyticsService.logWebSearch;
   (analyticsService as any).logWebSearch = () => {};
   let closeMcp: (() => Promise<void>) | null = null;
+  let closeHttp: (() => Promise<void>) | null = null;
 
   try {
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -376,6 +396,36 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
       ok("provenance" in restPublic.one[idA] === false, "R10: (no last_verified_at in the fixture, so no provenance summary either way)");
     }
 
+    // The same two routes over HTTP, behind the CORS layer as in index.ts.
+    const express = require("express") as typeof import("express");
+    const cors = require("cors") as typeof import("cors");
+    const { corsOptions } = require("../middleware/security") as typeof import("../middleware/security");
+    const app = express();
+    app.use(cors(corsOptions));
+    app.use("/api/tannlege", restRouter);
+    const httpServer = (require("http") as typeof import("http")).createServer(app);
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    closeHttp = () => new Promise<void>((resolve) => { httpServer.closeAllConnections?.(); httpServer.close(() => resolve()); });
+    const port = (httpServer.address() as import("net").AddressInfo).port;
+    const restHeaders = async () => {
+      const out: Record<string, unknown> = {};
+      for (const [route, path] of [["/agents", "/api/tannlege/agents?fylke=Oslo"], ["/agents/:id", `/api/tannlege/agents/${idA}`]]) {
+        for (const [who, headers] of [["no key", {}], ["valid key", { "x-admin-key": adminKey }], ["wrong key", { "x-admin-key": "wrong" }]] as const) {
+          out[`${route}, ${who}`] = await headersOf(port, path, headers);
+        }
+      }
+      return out;
+    };
+    const headersOn = await restHeaders();
+    {
+      // The answer depends on X-Admin-Key, so no shared cache may hand one
+      // caller's view to another; the CORS layer's Vary: Origin stays.
+      for (const [label, h] of Object.entries(headersOn)) {
+        eq(h, { status: 200, cacheControl: "private", vary: "Origin, X-Admin-Key" }, `R11 ${label}: Cache-Control: private, Vary: Origin, X-Admin-Key`);
+      }
+      eq(Object.keys(headersOn).length, 6, "R12: both routes, each without, with a valid and with a wrong key");
+    }
+
     // ── S: sitemap and indexing ───────────────────────────────────────────
     const sitemapOrgnrs = () => store.getDentalAgentsForSitemap().map((r) => r.org_nr).sort();
     eq(sitemapOrgnrs(), [B.org_nr, C.org_nr, D.org_nr], "S1: A (thin on the values it shows, noindex) is left out of the sitemap");
@@ -396,6 +446,9 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
     seo.__resetDentalSitemapCacheForTesting();
     const offXml = seo.getDentalSitemapXml();
     const offPages = { A: await page(A), B: await page(B), D: await page(D) };
+    const offHeaders = await restHeaders();
+    const offProv = (await callRoute(seoRouter, "/proveniens")).text;
+    const offCard = getDentalAgentCard() as any;
     policy.__setPlacesDisplayPolicyForTesting(null);
     {
       // Up to its «Flere tannleger i Oslo» list, which shows A, B and D.
@@ -440,6 +493,23 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
             .run(stored.get(id).field_provenance, stored.get(id).stage_v_pending_correction, id);
         }
       }
+      // Main sets neither header on these two answers; the CORS layer's Vary: Origin is all.
+      for (const [label, h] of Object.entries(offHeaders)) {
+        eq(h, { status: 200, vary: "Origin" }, `K7 ${label}: off -> no Cache-Control, Vary: Origin only (as on main)`);
+      }
+      // Main's texts, verbatim.
+      ok(offProv.includes("<li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google</li>") &&
+        offProv.includes("<li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google</li>"),
+        "K8: off -> /proveniens has main's Google Places items (no + en)");
+      ok(!offProv.includes("bare Google Places oppgir") && !offProv.includes("only Google Places gives"), "K8b: ... without the A4-D sentences");
+      const skillText = (card: any) => card.skills.find((s: any) => s.id === "tannlege_search").description as string;
+      ok(skillText(offCard).endsWith(
+        "`clinics` lists them, each with its name, org.nr, address, postcode, place, county, phone, website, Helfo status, " +
+        "emergency claim and profile URL, and its online booking link, opening hours, specialties and chain when known."),
+        "K9: off -> the agent card's tannlege_search text is main's");
+      const withoutSearchText = (card: any) =>
+        JSON.stringify({ ...card, signatures: undefined, skills: card.skills.map((s: any) => (s.id === "tannlege_search" ? { ...s, description: "" } : s)) });
+      eq(withoutSearchText(getDentalAgentCard()), withoutSearchText(offCard), "K9b: on and off, the card differs in that one text only");
     }
 
     // ── T: texts ──────────────────────────────────────────────────────────
@@ -449,6 +519,11 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
         "T1: /proveniens (no) says a value only Google Places gives is not shown");
       ok(prov.includes("An address, phone number, opening hours or website that only Google Places gives is not shown."),
         "T2: /proveniens (en) says the same");
+      const sentenceNo = ". En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. " +
+        "Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme.";
+      const sentenceEn = ". An address, phone number, opening hours or website that only Google Places gives is not shown. " +
+        "We show the value when another source, such as the clinic's own website or Brønnøysundregistrene, gives the same.";
+      eq(prov.replace(sentenceNo, "").replace(sentenceEn, ""), offProv, "T2b: ... and the page differs from the page with the rule off in those two sentences only");
       const skill = (getDentalAgentCard() as any).skills.find((s: any) => s.id === "tannlege_search").description as string;
       ok(/and its address, phone, website, online booking link, opening hours, specialties and chain when known\./.test(skill) &&
         !/each with its name, org\.nr, address/.test(skill), "T3: the A2A agent card lists address, phone and website «when known»");
@@ -463,6 +538,7 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
     policy.__setPlacesDisplayPolicyForTesting(null);
     (analyticsService as any).logWebSearch = realLogWebSearch;
     if (closeMcp) await closeMcp().catch(() => {});
+    if (closeHttp) await closeHttp().catch(() => {});
     try {
       (require("../services/profile-ai-deliveries") as typeof import("../services/profile-ai-deliveries")).__resetAiDeliveriesForTesting();
     } catch {

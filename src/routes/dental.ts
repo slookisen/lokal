@@ -74,18 +74,22 @@ function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
 
-function hasAdminKey(req: Request): boolean {
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   const expected = getAdminKey();
   const provided = (req.headers["x-admin-key"] as string) || "";
-  return !!expected && !!provided && provided === expected;
-}
-
-function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  if (!hasAdminKey(req)) {
+  if (!expected || !provided || provided !== expected) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
     return;
   }
   next();
+}
+
+// The same key check as the admin guard above, without the 403: the two
+// public GETs below answer every caller and only choose the view (A4-D).
+function hasAdminKey(req: Request): boolean {
+  const expected = getAdminKey();
+  const provided = (req.headers["x-admin-key"] as string) || "";
+  return !!expected && !!provided && provided === expected;
 }
 
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
@@ -116,6 +120,20 @@ function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
   if (!publicView) return row;
   const { field_provenance: _provenance, ...shown } = row;
   return shown;
+}
+
+// Whether a REST caller gets the admin view. While the rule is on, the two
+// answers depend on X-Admin-Key, so no shared cache may keep one caller's
+// view for another: Cache-Control: private and Vary: X-Admin-Key (the A4-S
+// contract in the dev-request; res.vary keeps the Vary: Origin of the CORS
+// layer). With the rule off every caller gets the same answer and the
+// headers are as before.
+function restAdminView(req: Request, res: Response): boolean {
+  if (placesDisplayPolicyEnabled()) {
+    res.vary("X-Admin-Key");
+    res.set("Cache-Control", "private");
+  }
+  return hasAdminKey(req);
 }
 
 // ─── GET /api/tannlege/agents — list with filters ───────────────────
@@ -185,7 +203,7 @@ router.get("/agents", (req: Request, res: Response) => {
     // consecutive homepage-fetch failures (30d backoff) — the enrichment
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
-    const adminView = hasAdminKey(req);
+    const adminView = restAdminView(req, res);
     const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((stored) => {
       const a = restDentalAgent(stored, adminView);
       return {
@@ -237,7 +255,7 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     verifiedRow?.last_verified_at ?? null
   );
 
-  const shown = restDentalAgent(agent, hasAdminKey(req));
+  const shown = restDentalAgent(agent, restAdminView(req, res));
   res.json({
     agent: {
       ...shown,

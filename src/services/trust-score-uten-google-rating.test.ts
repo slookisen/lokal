@@ -71,6 +71,8 @@ function callRoute(router: any, url: string): Promise<RouteResult> {
       status(code: number) { this.statusCode = code; return this; },
       setHeader() { return this; },
       header() { return this; },
+      set() { return this; },
+      vary() { return this; },
       json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       end() { resolve({ status: this.statusCode, body: undefined }); return this; },

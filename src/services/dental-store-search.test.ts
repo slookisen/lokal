@@ -70,6 +70,8 @@ function callRoute(router: any, path: string, query: Record<string, string>): Pr
       statusCode: 200,
       status(code: number) { this.statusCode = code; return this; },
       setHeader() { return this; },
+      set() { return this; },
+      vary() { return this; },
       json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
     };

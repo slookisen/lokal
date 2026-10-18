@@ -12,7 +12,7 @@
 //
 //   Places evidence  a google_places provenance record whose value is EXACTLY
 //                    V (trimmed; opening hours in canonical form). The Places
-//                    writers store the value they wrote verbatim, so this is
+//                    writers record Places' value verbatim, so this is
 //                    their fingerprint. A normalised match is not evidence: a
 //                    phone from Brreg ("35 08 10 60") that Places only
 //                    repeated ("+4735081060") is not Places' value.

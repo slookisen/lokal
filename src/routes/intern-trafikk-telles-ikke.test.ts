@@ -609,7 +609,6 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
     assertTrue(JSON.stringify(actual) === JSON.stringify(expected),
       `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
   }
-  /** Two answers: the same, or where they first differ. */
   /** A "<status> <json>" dental REST list answer without each agent's field_provenance (A4-D). */
   function withoutFieldProvenance(answer: string): string {
     const at = answer.indexOf(" ");
@@ -617,7 +616,7 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
     body.agents = (body.agents ?? []).map(({ field_provenance: _p, ...agent }: Record<string, unknown>) => agent);
     return `${answer.slice(0, at)} ${JSON.stringify(body)}`;
   }
-
+  /** Two answers: the same, or where they first differ. */
   function assertSameAnswer(actual: string, expected: string, label: string): void {
     if (actual === expected) return assertTrue(true, label);
     let i = 0;

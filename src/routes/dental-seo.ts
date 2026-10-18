@@ -52,6 +52,7 @@ import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } f
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { shownDentalAgent } from "../services/dental-places-display";
+import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { capFreeText } from "../utils/free-text";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
@@ -2637,6 +2638,16 @@ router.get("/personvern", (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/proveniens", (_req: Request, res: Response) => {
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the Google Places item says what the display rule
+  // (dental-places-display.ts) hides, while it is on; with it off the page is
+  // as before.
+  const placesRule = placesDisplayPolicyEnabled()
+    ? {
+        no: ". En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme.",
+        en: ". An address, phone number, opening hours or website that only Google Places gives is not shown. We show the value when another source, such as the clinic's own website or Brønnøysundregistrene, gives the same.",
+      }
+    : { no: "", en: "" };
   const html = `
 <main>
   <div class="content-page">
@@ -2646,7 +2657,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2>Kildene vi kryssjekker mot</h2>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, registrert adresse og næringsgruppekode</li>
-      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google. En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme.</li>
+      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google${placesRule.no}</li>
       <li><strong>Klinikkens egen nettside</strong> &mdash; behandlingstilbud, presentasjonstekst og praktisk informasjon</li>
     </ul>
 
@@ -2671,7 +2682,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2>The sources we cross-check against</h2>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; Norway's business register: company name, organisation number, registered address and industry code</li>
-      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google. An address, phone number, opening hours or website that only Google Places gives is not shown. We show the value when another source, such as the clinic's own website or Brønnøysundregistrene, gives the same.</li>
+      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google${placesRule.en}</li>
       <li><strong>The clinic's own website</strong> &mdash; treatment offerings, presentation text and practical information</li>
     </ul>
 

@@ -4,13 +4,16 @@
 //
 // Maps the four clinic columns Google Places can fill (POST
 // /api/tannlege/admin/google-places-batch, routes/dental.ts) onto the shared
-// rule in places-display-policy.ts. The batch writes only empty columns and
-// stores the value it wrote verbatim as a google_places record, so an exact
-// match is its fingerprint. Every public surface shows the clinic through
-// shownDentalAgent(): the profile page and its JSON-LD, the web cards, the MCP
-// and A2A cards (dental-clinic-card.ts), the public REST answers and the
-// sitemap's thin-profile check. The stored row is never changed; admin,
-// enrichment and verifier code keep reading it as stored.
+// rule in places-display-policy.ts. The batch writes only empty columns, and
+// records Places' value verbatim as a google_places record whether it wrote
+// it or not, so an exact match is its fingerprint. A value another writer
+// stored that is exactly Places' own (most likely a website) therefore counts
+// as Places evidence too, unless another source has it. Every public surface
+// shows the clinic through shownDentalAgent(): the profile page and its
+// JSON-LD, the web cards, the MCP and A2A cards (dental-clinic-card.ts), the
+// public REST answers and the sitemap's thin-profile check. The stored row is
+// never changed; admin, enrichment and verifier code keep reading it as
+// stored.
 //
 // Provenance keys: the batch writes address, phone, website and
 // opening_hours; other writers (and older rows) use the column names adresse,
