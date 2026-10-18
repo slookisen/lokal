@@ -323,16 +323,8 @@ class MarketplaceRegistry {
       // catches the case where the user typed "Dyrøy Sjømat" but the
       // actual producer is "Dyrøymat" (single word, no space). The
       // distinctive token "dyrøy" matches; "sjømat" is filtered out
-      // because it would otherwise pull in every fish producer.
-      const GENERIC_NAME_TOKENS = new Set([
-        // food categories that often appear in producer names but are
-        // not distinctive enough to fuzzy-match on alone
-        "mat", "sjømat", "kjøtt", "fisk", "bakeri", "bryggeri", "ysteri",
-        "meieri", "marked", "butikk", "gård", "gard", "farm", "kooperativ",
-        "slakteri", "gardsmat", "gardsutsalg", "frukt", "bær", "honning",
-        "egg", "melk", "ost", "brød", "korn", "grønt", "grønnsaker",
-        "lokalmat", "økologisk", "tradisjon", "tradisjons",
-      ]);
+      // because it would otherwise pull in every fish producer
+      // (GENERIC_NAME_TOKENS, at module scope since slice I-W3).
       // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: a place name
       // is never a distinctive producer-name token. "vestfold" matched eight
       // unrelated producers by name and buried the real honey producers.
@@ -1034,10 +1026,108 @@ class MarketplaceRegistry {
       parsed.role = "producer";
       return parsed;
     }
-    const indicatorIndex = queryWords.findIndex(w =>
-      nameIndicators.some(ind => w.toLowerCase().replace(/[.,!?]/g, "") === ind ||
-        w.toLowerCase().replace(/[.,!?]/g, "").endsWith(ind))
-    );
+    // The public producers and their names in lower case, read at most once
+    // per search (the indicator check and the name passes below).
+    // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
+    // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
+    // not-yet-vetted rows too — kept consistent with discover()'s own
+    // is_vetted filter even though this candidate-detection step alone
+    // can't leak a result (discover()'s actual lookup is gated too).
+    let publicRowsRead: any[] | null = null;
+    const publicNameRows = (): any[] => (publicRowsRead ??= getDb()
+      .prepare(`SELECT id, name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`)
+      .all() as any[]);
+    let publicNamesRead: string[] | null = null;
+    const publicNames = (): string[] => (publicNamesRead ??= publicNameRows().map(r => (r.name || "").toLowerCase()));
+    // One text of all names (a word holds no line break, so no match spans two names).
+    let namesTextRead: string | null = null;
+    const inSomeName = (w: string): boolean => (namesTextRead ??= publicNames().join("\n")).includes(w);
+    const oneWord = queryWords.filter(w => w.replace(/[.,!?]/g, "").length > 0).length === 1;
+
+    // Slice I-W3 (FUNN rfb-sok-pass1-fyllord): the filler and qualifier words
+    // of a name query, of the length the name passes weigh (three letters or
+    // more, so «HA» in «H.A. Hanssen» stays).
+    const nameFiller = (w: string) =>
+      w.length >= 3 && (QUERY_STOPWORDS.has(w) || NO_PRODUCT_WORDS.has(w) || QUALIFIER_WORDS.has(w));
+    // Slice I-W3: the name query of both passes leaves out the filler and
+    // qualifier words. With them, «kortreist såper» was the name query
+    // «kortreist såper», and discover()'s fuzzy match ranked «Osteverkstedet —
+    // Kortreist Italiener» before Reine Såper; «ren såper» gave ten producers
+    // with «ren» in their name.
+    // - The typed words stay (main's rule) when the words left have no
+    //   distinctive word in a producer name (one that discover()'s fuzzy
+    //   match weighs: not GENERIC_NAME_TOKENS, no big place), as in a search
+    //   of filler words only («Lager 11», «Norsk AS»). Then the filler word is
+    //   what names the producer: «When is the next Bondens marked in Oslo?»
+    //   (chatgpt-app-submission.json) finds Bondens Butikk Vulkan through
+    //   «Bondens», as on main, where «is marked» would find the producers with
+    //   «is» and «marked» in their name.
+    // - Otherwise a filler word stays when a producer name holds it as a
+    //   whole word together with a distinctive word of the search, so the
+    //   search still names that producer: «Tell me about Den Gode Baker»,
+    //   «Den Gode Baker Sandefjord» and «Den Gode Baker kransekake» keep «Den
+    //   Gode» («Den Gode Baker AS» has «baker»), while «kortreist såper» loses
+    //   «kortreist» («Kortreist Italiener» has no «såper»). Review round 1
+    //   (B2): they stayed only when one name held every word of the search,
+    //   so one word more (a request, a place, a product) gave the name query
+    //   «Baker», which missed Den Gode Baker.
+    // Cost: each distinct filler word (a few hundred at most: the lists)
+    // reads the names once, and the distinctive words are looked for in the
+    // text of the names that hold it.
+    const nameQueryOf = (typed: string[]): string => {
+      const low = typed.map(w => w.toLowerCase());
+      // No filler word: a shortcut, the rules below would keep every word too.
+      if (!low.some(nameFiller)) return typed.join(" ");
+      const distinctive = [...new Set(low)].filter(w => w.length >= 3 && !nameFiller(w)
+        && !GENERIC_NAME_TOKENS.has(w) && !NAME_PASS_PLACE_WORDS.has(w));
+      if (!distinctive.some(inSomeName)) return typed.join(" ");
+      const stays = new Map<string, boolean>();
+      const fillerStays = (f: string): boolean => {
+        let hit = stays.get(f);
+        if (hit === undefined) {
+          // the names that hold `f` as a whole word, as one text (see inSomeName)
+          const holders = publicNames().filter(name => productNameMatch(name, f) === 3).join("\n");
+          stays.set(f, hit = holders.length > 0 && distinctive.some(w => holders.includes(w)));
+        }
+        return hit;
+      };
+      return typed.filter((_, i) => !nameFiller(low[i]) || fillerStays(low[i])).join(" ");
+    };
+
+    // Is `w` (lower case) a whole word of a public producer name
+    // (productNameMatch 3)? The words of the names are read once, so a word
+    // of letters and digits costs one set lookup. A word with other
+    // characters («ar-sjømat») is matched against each name, but only when
+    // the text of all names holds it, and once per distinct word. Review
+    // round 1 (B1): it was matched against each of the 1 563 live names for
+    // every such word, so a 1 MB search of «x-mat» took 33 s (1.6 s on main).
+    let nameWordSet: Set<string> | null = null;
+    const nameWordSeen = new Map<string, boolean>();
+    const isNameWord = (w: string): boolean => {
+      if (/^[\p{L}\p{N}_]+$/u.test(w)) {
+        return (nameWordSet ??= new Set(publicNames().flatMap(name => name.split(/[^\p{L}\p{N}_]+/u)))).has(w);
+      }
+      let hit = nameWordSeen.get(w);
+      if (hit === undefined) nameWordSeen.set(w, hit = inSomeName(w) && publicNames().some(name => productNameMatch(name, w) === 3));
+      return hit;
+    };
+
+    // Slice I-W3 (FUNN rfb-sok-pass1-fyllord): an indicator counts only as a
+    // whole word. «mat» counted at the end of every word, so «kortreist
+    // sjømat» and «tomat fra Hardanger» went to Pass 1 and became name
+    // searches («kortreist», «Hardanger»). A word that only ends in an
+    // indicator still counts in two cases: it is the whole search
+    // («Fiskemat», «Gårds-bakeri»: a search of one word is read as before),
+    // or it is itself a whole word of a producer name («Spekemat» in «Bjerke
+    // Spekemat & Delikatesse», «Sjømat» in «Trøndelag Sjømat — Tiller»), so
+    // the search may name that producer and the live producer names are
+    // read as before (B1). «kortreist sjømat» is then no name search because
+    // Pass 1 reads the filler words (below).
+    const indicatorIndex = queryWords.findIndex(w => {
+      const low = w.toLowerCase().replace(/[.,!?]/g, "");
+      return nameIndicators.includes(low)
+        || (nameIndicators.some(ind => low.endsWith(ind)) && (oneWord || isNameWord(low)));
+    });
 
     if (indicatorIndex >= 0) {
       // Pass 1: Indicator word found — extract name from surrounding words.
@@ -1058,8 +1148,22 @@ class MarketplaceRegistry {
             && (isCategoryOrTagWord(low, categoryMap, tagMap) || isEnglishFoodWord(low))) continue;
         nameParts.push(clean);
       }
-      if (nameParts.length >= 1 && nameParts.join(" ").length >= 4) {
-        (parsed as any)._nameQuery = nameParts.join(" ");
+      // Slice I-W3 (FUNN rfb-sok-pass1-fyllord): Pass 1 read neither
+      // NO_PRODUCT_WORDS nor QUALIFIER_WORDS, so «kortreist mat», «sunn mat»
+      // and «kortreist sjømat» were name searches for «Osteverkstedet —
+      // Kortreist Italiener», «Overnaturlig Honning» and the producers with
+      // «Sunn» in their name (main too), and «Finnes det noen bakeri som
+      // lager kransekake» one for «Finnes noen lager kransekake». As in Pass
+      // 2, the filler and qualifier words make no name search: the other
+      // words must still make a name query of four letters or more («mat»
+      // alone does not). Next to a category word one of them must also sit
+      // inside a producer name; otherwise the category answers, and step 3c
+      // reads the rest («kransekake», in no name). A search of one word is
+      // read as before («nettbutikk», «kveldsmat»).
+      const nameWords = oneWord ? nameParts : nameParts.filter(w => !nameFiller(w.toLowerCase()));
+      const inAName = () => [...new Set(nameWords.map(w => w.toLowerCase()))].some(w => w.length >= 3 && inSomeName(w));
+      if (nameWords.join(" ").length >= 4 && (oneWord || detectedCategories.length === 0 || inAName())) {
+        (parsed as any)._nameQuery = nameQueryOf(nameParts);
       }
     } else {
       // Pass 2: No indicator word — check if query words match any agent name
@@ -1114,17 +1218,16 @@ class MarketplaceRegistry {
         if (nameCandidateWords.length > 0) {
           // Quick check: do any of these distinctive words appear in an agent name?
           const db = getDb();
-          // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
-          // dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 1): exclude
-          // not-yet-vetted rows too — kept consistent with discover()'s own
-          // is_vetted filter even though this candidate-detection step alone
-          // can't leak a result (discover()'s actual lookup is gated too).
-          const publicRows = db.prepare(`SELECT id, name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[];
-          const allNames = publicRows.map(r => (r.name || "").toLowerCase());
+          const publicRows = publicNameRows();
+          const allNames = publicNames();
 
-          const nameMatches = nameCandidateWords.filter(word =>
-            allNames.some(name => name.includes(word))
-          );
+          // Slice I-W3, review round 1 (B1): each distinct word once, in the
+          // text of all names (inSomeName), not in each name. A word that ends
+          // in an indicator without being one («x-mat», «a-mat») now comes here
+          // instead of to Pass 1, and a 1 MB search of it took 5–9 s (main
+          // 1.8–2.1 s). Below, only whether the list is empty and its
+          // distinct words are read, so dropping repeats changes nothing else.
+          const nameMatches = [...new Set(nameCandidateWords)].filter(inSomeName);
           let nameSearch = nameMatches.length > 0;
           // Slice I-W2 (S4): in a search of several words, a word that only
           // sits inside a producer name («ser» in «Hvasser», «jul» in
@@ -1152,7 +1255,7 @@ class MarketplaceRegistry {
               if (!hits.has(w)) hits.set(w, (catalogTermMatches(db, [w], ids)?.size ?? 0) > 0);
               return hits.get(w)!;
             };
-            nameSearch = [...new Set(nameMatches)].some(word =>
+            nameSearch = nameMatches.some(word =>
               allNames.some(name => name.includes(word) && productNameMatch(name, word) === 3)
               || !(known || lookups.filter(other => other !== word).slice(0, UNKNOWN_TERMS_MAX).some(inCatalog)));
           }
@@ -1162,12 +1265,16 @@ class MarketplaceRegistry {
             // PR-72: If categories were also detected, prefer the category-filter path
             // over name-search (category match is stronger signal than a fuzzy name word).
             // Pass 1 (explicit indicator words like "gård") still sets _nameQuery directly.
+            // Slice I-W3: without the filler and qualifier words (nameQueryOf).
+            // A search of filler words only keeps them (S2: main's rule,
+            // «Finnes», «Norsk AS»): the words left are under three letters.
             if (!parsed.categories || parsed.categories.length === 0) {
-              const nameParts = queryWords
+              const typed = queryWords
                 .map(w => w.replace(/[.,!?]/g, ""))
                 .filter(w => w.length >= 2 && !skipWords.has(w.toLowerCase()));
-              if (nameParts.join(" ").length >= 3) {
-                (parsed as any)._nameQuery = nameParts.join(" ");
+              const nameQuery = nameQueryOf(typed);
+              if (nameQuery.length >= 3) {
+                (parsed as any)._nameQuery = nameQuery;
               }
             }
           }
@@ -1185,13 +1292,24 @@ class MarketplaceRegistry {
     // only lets them rank that category's producers, never add any. A word
     // for the occasion, meal, size or packaging (QUALIFIER_WORDS) counts only
     // when nothing else in the search names the product (S1).
-    if (!(parsed as any)._nameQuery && !parsed._productTerms?.length) {
+    // Slice I-W3: a product term that names the kind of producer
+    // (PRODUCER_KIND_TERMS: «bakeri») gives way to those words, as
+    // «bakeries» does. «kransekake fra bakeri» ranked the producers with
+    // «… fra eget bakeri» in a product name first and labelled the bakeries
+    // with kransekake «Kategoritreff: «bakeri» ikke oppført». Next to an
+    // indicator word («sunn mat») a qualifier word counts no more than next
+    // to a category word: «mat» names what is sought, so the search reads as
+    // «mat» does, not as a lookup of «sunn» in the product names.
+    if (!(parsed as any)._nameQuery && (parsed._productTerms ?? []).every(t => PRODUCER_KIND_TERMS.has(t))) {
       const unknown = unknownProductWords(q, (w) =>
         skipWords.has(w) || isPlace(w) || nameIndicators.includes(w)
         || isCategoryOrTagWord(w, categoryMap, tagMap) || isEnglishFoodWord(w)
         || Object.values(tagMap).some((kws) => kws.some((kw) => !kw.includes(" ") && w.startsWith(kw))),
-      !parsed.categories?.length);
-      if (unknown.length > 0) parsed._unknownTerms = unknown;
+      !parsed.categories?.length && indicatorIndex < 0);
+      if (unknown.length > 0) {
+        parsed._unknownTerms = unknown;
+        delete parsed._productTerms;
+      }
     }
 
     parsed.role = "producer";
@@ -2445,6 +2563,17 @@ const PRODUCT_TERM_EXCLUSIONS = new Set<string>([
   ...DRINK_KEYWORDS,
 ]);
 
+/**
+ * Slice I-W3: product terms that name the kind of producer, not a product.
+ * In the live catalogue (2026-10-17) «bakeri» is only in six product names
+ * that say where the bread is baked («Brød og boller fra eget bakeri»). Next
+ * to a word the parser cannot read («Finnes det noen bakeri som lager
+ * kransekake») they give way to it (parseNaturalQuery), so that word ranks
+ * the bakeries, as for «bakeries». Alone («bakeri i Bergen») they stay
+ * product terms, as before.
+ */
+const PRODUCER_KIND_TERMS: ReadonlySet<string> = new Set(["bakeri", "bakeriet"]);
+
 // ── Category keys the platform has replaced (slice I-W) ─────────────────
 // A replaced key, to the key the platform stores now. 41 live producers still
 // carry «bread» from the first seeds (2026-10-17), and lokal_discover's frozen
@@ -2521,11 +2650,25 @@ const NORWEGIAN_WORD_CHAR = "0-9A-Za-zÀ-ÖØ-öø-ÿ_";
 // The list itself stays for the name passes (NAME_PASS_PLACE_WORDS).
 
 /**
+ * The words of a name query that discover()'s fuzzy name match leaves out:
+ * food categories that often appear in producer names but are not
+ * distinctive enough to fuzzy-match on alone. parseNaturalQuery reads them
+ * too (slice I-W3), to tell whether a name query names any producer.
+ */
+const GENERIC_NAME_TOKENS: ReadonlySet<string> = new Set([
+  "mat", "sjømat", "kjøtt", "fisk", "bakeri", "bryggeri", "ysteri",
+  "meieri", "marked", "butikk", "gård", "gard", "farm", "kooperativ",
+  "slakteri", "gardsmat", "gardsutsalg", "frukt", "bær", "honning",
+  "egg", "melk", "ost", "brød", "korn", "grønt", "grønnsaker",
+  "lokalmat", "økologisk", "tradisjon", "tradisjons",
+]);
+
+/**
  * The old list, now for the name passes only: Pass 0 and Pass 1 of
  * parseNaturalQuery and discover()'s fuzzy name match leave these big places
  * out of a producer-name lookup, as before («Mat i Bergen», «Tromsø Bakeri»,
  * «a farm in Vestfold»). Every other place can be part of a producer's name
- * («Valen Gård», «Dyrøy Fiskemat» for «Dyrøymat»), so those passes keep it;
+ * («Valen Gård», «Dyrøy Sjømat» for «Dyrøymat»), so those passes keep it;
  * where it would only turn a product search into a name search (Pass 2,
  * «kransekake i Bærum»), the gazetteer decides (isPlaceWord). With every
  * gazetteer place in the name passes, 76 of 1 537 live producer names no
@@ -2672,8 +2815,10 @@ const NO_PRODUCT_WORDS: ReadonlySet<string> = new Set([
   // they made a name search of the whole question: «ser» («Hvasser») in «Jeg
   // ser etter kransekake», «lager» («Fruktlager», «Lager 11») in «Hvem lager
   // spekepølse», «make» («Ostemakeri») in «Which bakeries make kransekake».
-  // «leter» ends «Fiskefileter».
-  "ser", "leter", "lete", "søker", "lager", "lage", "lages", "produserer", "produsere",
+  // «leter» ends «Fiskefileter». Slice I-W3, review round 1 (S1): «finner»,
+  // which «Finnerud Gård» begins, made «Hvor finner jeg kortreist mat i
+  // Oslo?» the name search «finner mat» («finne» and «finn» are skipWords).
+  "ser", "leter", "lete", "søker", "finner", "lager", "lage", "lages", "produserer", "produsere",
   "make", "makes", "making",
   // «hvor får jeg tak i kransekake», «… i nærheten av Bergen»
   "tak", "nærheten",
@@ -2741,6 +2886,13 @@ const QUALIFIER_WORDS: ReadonlySet<string> = new Set([
   // (tagMap) and never unknown words; and «kortreist», in NO_PRODUCT_WORDS.
   "nybakt", "nybakte", "frisk", "friske", "kortreiste", "gårdsprodusert", "gårdsproduserte", "småskala",
   "homegrown", "naturlig", "naturlige", "natural", "ren", "rene", "pure", "sunn", "sunne", "sunt", "healthy",
+  // Slice I-W3 (FUNN rfb-sok-egenskapsord-hale): next to a category word
+  // «gourmet» and «artisan» still labelled its producers «Kategoritreff:
+  // «…» ikke oppført» («gourmet brød», «artisan bread»). Alone each is read
+  // as before: «gourmet» names «Frøya Gourmet», and «artisan» finds
+  // «Syltetøy artisan» (live catalogue 2026-10-17). Review round 1 (S2):
+  // «artisanal» too, which no live producer or product name holds.
+  "gourmet", "artisan", "artisanal",
 ]);
 
 /** At most this many words of one query are looked up in the catalog. */
