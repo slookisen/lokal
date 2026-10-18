@@ -42885,6 +42885,34 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W3 (FUNN
+// rfb-sok-pass1-fyllord): a name indicator such as «mat» or «bakeri» counts
+// only as a whole word (or as a word of a producer name, or as the whole
+// search), so «tomat fra Hardanger» and «grillmat i Bergen» are no name
+// searches; Pass 1 reads the filler and qualifier lists, so «kortreist mat»,
+// «sunn mat» and «kortreist sjømat» are none either; «bakeri» as the only
+// product term gives way to the word the parser cannot read («Finnes det noen
+// bakeri som lager kransekake»); the name query of both passes leaves out the
+// filler and qualifier words («kortreist såper»). A search of one word, the
+// producer names and the names Pass 1 reads answer as main did
+// (tests/fixtures/rfb-sok-i-w3-main.json). Own in-memory DBs (restored in
+// finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W3 (RFB search: Pass 1 reads the filler lists) ──");
+  try {
+    const { runRfbSokPass1FyllordTests } = require("../src/routes/rfb-sok-pass1-fyllord.test") as
+      typeof import("../src/routes/rfb-sok-pass1-fyllord.test");
+    const r = await runRfbSokPass1FyllordTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-pass1-fyllord: " + f);
+    console.log(`  rfb-sok-pass1-fyllord: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-pass1-fyllord: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

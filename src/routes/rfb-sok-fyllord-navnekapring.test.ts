@@ -260,9 +260,10 @@ export async function runRfbSokFyllordNavnekapringTests(opts: { log?: boolean } 
       assertEq([parse("ostemaker zzzqqx")._nameQuery, ids(marketplaceRegistry.discover({ ...parse("ostemaker zzzqqx"), limit: 20 }, undefined, { trackDiscovery: false }))],
         ["ostemaker zzzqqx", [OSTEMAKERI]],
         "parser: a word inside a name still names when no other word is a place, a category or a product («zzzqqx»)");
-      assertEq(parse("Grini kransekake til jul")._nameQuery, "Grini kransekake jul",
+      // Slice I-W3: the name query leaves out the qualifier word «jul» (rfb-sok-pass1-fyllord.test.ts).
+      assertEq(parse("Grini kransekake til jul")._nameQuery, "Grini kransekake",
         "parser: a whole word of a name («Grini») keeps the name search even when the search also has a word only inside a name («jul») and a product");
-      assertEq(parse("Ostemakeri kransekake til jul")._nameQuery, "Ostemakeri kransekake jul",
+      assertEq(parse("Ostemakeri kransekake til jul")._nameQuery, "Ostemakeri kransekake",
         "parser: of two name words one that names is enough: «Ostemakeri» (a whole word of a name) does, «jul» (only inside «Julseth») does not");
       assertEq([parse("jul i Bærum")._nameQuery, parse("jul i Bærum")._unknownTerms], [undefined, ["jul"]],
         "parser: a word inside a name («Julseth») names nobody next to a place word");
