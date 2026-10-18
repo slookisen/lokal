@@ -2526,9 +2526,13 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
   // are all hidden by the Places display rule is noindex there and left out
   // here. The SQL keeps the cheap filter on the stored columns (a row thin on
   // stored values is thin on shown ones); the rule runs on the rest.
+  // dev-request 2026-10-18-dental-privat-adresse-skjules: the same holds for
+  // a sole proprietorship whose private address is hidden, so the rule also
+  // reads organisasjonsform.
   const rows = db.prepare(`
     SELECT org_nr, navn, updated_at,
-           adresse, telefon, mobil, hjemmeside, opening_hours, field_provenance, stage_v_pending_correction
+           adresse, telefon, mobil, hjemmeside, opening_hours, field_provenance, stage_v_pending_correction,
+           organisasjonsform
     FROM dental_agents
     WHERE verification_status != 'rejected'
       AND org_nr IS NOT NULL AND org_nr != ''
@@ -2539,7 +2543,10 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
     ORDER BY navn ASC
   `).all() as Array<
     { org_nr: string; navn: string; updated_at: string | null } &
-      Record<"adresse" | "telefon" | "mobil" | "hjemmeside" | "opening_hours" | "field_provenance" | "stage_v_pending_correction", string | null>
+      Record<
+        "adresse" | "telefon" | "mobil" | "hjemmeside" | "opening_hours" | "field_provenance" | "stage_v_pending_correction" | "organisasjonsform",
+        string | null
+      >
   >;
   return rows
     .filter((r) =>
@@ -2552,6 +2559,7 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
           opening_hours: parseJsonOrNull(r.opening_hours) as DentalAgent["opening_hours"],
           field_provenance: parseJsonOrNull(r.field_provenance) as DentalAgent["field_provenance"],
           stage_v_pending_correction: r.stage_v_pending_correction,
+          organisasjonsform: r.organisasjonsform,
         })
       )
     )

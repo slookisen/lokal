@@ -25,6 +25,14 @@
 // dental-store.ts recordStageVFieldObservation) hides the hours until Stage V
 // clears or corrects them. Dental has no owner flow, so no owner signal.
 //
+// Private address (dev-request 2026-10-18-dental-privat-adresse-skjules,
+// Daniel's question 13): a sole proprietorship (organisasjonsform ENK) whose
+// stored address has «c/o» as a word of its own or «Bruksenhetsnummer» is
+// registered at its owner's home, so the address is hidden as well
+// (isPrivateEnkAddress); postnummer and place stay, as for a Places address.
+// This rule does not depend on the Places switch, and an address the Places
+// rule hides stays hidden.
+//
 // PURE: no DB access (the caller passes the hydrated row).
 
 import type { DentalAgent } from "./dental-store";
@@ -49,10 +57,22 @@ const DENTAL_PLACES_COLUMNS: ReadonlyArray<{
   { column: "hjemmeside", field: "website", provenanceKeys: ["website", "hjemmeside"] },
 ];
 
-/** What the rule reads off a clinic row. */
-export type DentalPlacesRow = Pick<DentalAgent, DentalPlacesColumn | "field_provenance"> & {
+/** What the rules read off a clinic row. */
+export type DentalPlacesRow = Pick<DentalAgent, DentalPlacesColumn | "field_provenance" | "organisasjonsform"> & {
   stage_v_pending_correction?: unknown;
 };
+
+/** «c/o» with no letter or digit next to it, or «Bruksenhetsnummer»; any case. */
+const PRIVATE_ADDRESS_MARK = /(?<![\p{L}\p{N}])c\/o(?![\p{L}\p{N}])|bruksenhetsnummer/iu;
+
+/**
+ * Whether the clinic's stored address is its owner's home: the clinic is a
+ * sole proprietorship (organisasjonsform ENK, the Brreg code) and the address
+ * has «c/o» as a word of its own or «Bruksenhetsnummer», in any case.
+ */
+export function isPrivateEnkAddress(agent: Pick<DentalAgent, "adresse" | "organisasjonsform">): boolean {
+  return (agent.organisasjonsform ?? "").trim().toUpperCase() === "ENK" && PRIVATE_ADDRESS_MARK.test(agent.adresse ?? "");
+}
 
 /** The fields Stage V has a pending correction for (its JSON map, parsed or as stored). */
 function pendingStageVFields(pending: unknown): Set<string> {
@@ -89,16 +109,21 @@ export function dentalPlacesVerdicts(
   return verdicts;
 }
 
-/** The columns (with their provenance keys) the rule hides on this clinic. */
+/**
+ * The columns (with their provenance keys) hidden on this clinic: those the
+ * Places rule hides while `enabled`, and the address when it is a private one.
+ */
 function hiddenColumns(agent: DentalPlacesRow, enabled: boolean): typeof DENTAL_PLACES_COLUMNS {
   const verdicts = dentalPlacesVerdicts(agent, enabled);
-  return DENTAL_PLACES_COLUMNS.filter(({ column }) => verdicts[column] !== "shown");
+  const privateAddress = isPrivateEnkAddress(agent);
+  return DENTAL_PLACES_COLUMNS.filter(({ column }) => verdicts[column] !== "shown" || (column === "adresse" && privateAddress));
 }
 
 /**
- * The clinic as the public surfaces show it: each column the rule hides is
+ * The clinic as the public surfaces show it: each column the rules hide is
  * null, everything else (field_provenance included, for the callers' own
- * checks) as stored. The same object when nothing is hidden.
+ * checks) as stored. The same object when nothing is hidden. `enabled` is the
+ * Places rule's switch; a private address is hidden either way.
  */
 export function shownDentalAgent<T extends DentalPlacesRow>(agent: T, enabled: boolean = placesDisplayPolicyEnabled()): T {
   const hidden = hiddenColumns(agent, enabled);
@@ -109,12 +134,12 @@ export function shownDentalAgent<T extends DentalPlacesRow>(agent: T, enabled: b
 }
 
 /**
- * field_provenance less the entries (under either key) of each column the rule
- * hides, for the public provenance summary on GET /api/tannlege/agents/:id
+ * field_provenance less the entries (under either key) of each column the
+ * rules hide, for the public provenance summary on GET /api/tannlege/agents/:id
  * (routes/dental.ts): built from this, the summary names only the sources
  * behind values the answer shows, so never google_places for a hidden one. As
  * stored when nothing is hidden, or when it is not an object (the summary
- * reads nothing else).
+ * reads nothing else). `enabled` as for shownDentalAgent.
  */
 export function shownDentalFieldProvenance(
   agent: DentalPlacesRow,
