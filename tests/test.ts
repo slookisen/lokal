@@ -42955,6 +42955,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+// rfb-discover-lister-uten-tak, a2a-mcp-intern-feiltekst-rest and
+// rfb-a2a-strukturert-melding-totalstorrelse): MCP lokal_discover and POST
+// /api/marketplace/discover read MAX_NAME_LIST_ITEMS names of at most
+// MAX_NAME_CHARS per list, RFB A2A logs, stores and echoes a structured query
+// past MAX_A2A_QUERY_JSON_CHARS as the fields the discovery reads, and the
+// A2A and MCP answers of the three platforms hold no internal error text.
+// Real structured searches answer as main did
+// (tests/fixtures/strukturerte-lister-tak-i-y3-main.json). I-Y's fixtures
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Y3 (caps on structured-search lists, total bound, no internal error text) ──");
+  try {
+    const { runStrukturerteListerTakTests } = require("../src/routes/strukturerte-lister-tak.test") as
+      typeof import("../src/routes/strukturerte-lister-tak.test");
+    const r = await runStrukturerteListerTakTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("strukturerte-lister-tak: " + f);
+    console.log(`  strukturerte-lister-tak: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("strukturerte-lister-tak: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W2 (review of
 // lokal#1160): a search of one filler word that names producers («Finnes»,
 // «Bondens», «Norsk») answers as main did (tests/fixtures/rfb-sok-i-w2-main.json);

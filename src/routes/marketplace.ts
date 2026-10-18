@@ -48,6 +48,7 @@ import { maskEmail } from "../services/gardssalg-claim";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
+import { capA2aData } from "../utils/a2a-message";
 import { searchCountable, searchTrafficClass } from "../services/search-tracking";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
@@ -578,7 +579,18 @@ router.post("/register", (req: Request, res: Response) => {
 router.post("/discover", (req: Request, res: Response) => {
   const startTime = Date.now();
   try {
-    const query = DiscoveryQuerySchema.parse(req.body);
+    // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+    // rfb-discover-lister-uten-tak): the body is cut as RFB A2A's structured
+    // data is (capA2aData, utils/a2a-message.ts), whose query this route
+    // shares: `categories`, `tags` and `skills` to their first
+    // MAX_NAME_LIST_ITEMS names of at most MAX_NAME_CHARS, and the strings
+    // (`query`, `drinkSubcategory`) to MAX_FREE_TEXT_CHARS. discover()
+    // compares every entry with every producer's, so 175 000 categories took
+    // 45 s on live-like data. The cut comes before the validation, which
+    // then reads and reports at most those entries (each invalid entry of a
+    // 1 MB list was an issue in the 400 answer). A body within the caps is
+    // the same object, so a real search answers as before.
+    const query = DiscoveryQuerySchema.parse(capA2aData(req.body));
     // Slice I-Z: our own traffic and probes get the same answer but raise no
     // discovery counter, stay off the interactions feed and start no
     // countable conversation (searchTrafficClass).

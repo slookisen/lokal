@@ -49,6 +49,7 @@ import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
+import { rpcInternalErrorReply } from "../utils/internal-error";
 
 const router = Router();
 
@@ -70,11 +71,10 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
  * dental-a2a-intern-feiltekst-i-svar): the error's own message went to the
  * caller as `data`, for example SQLite's «LIKE or GLOB pattern too complex».
  * The detail is logged instead, without the request (`where` says which step
- * failed).
+ * failed; utils/internal-error.ts since slice I-Y3).
  */
 function rpcInternalError(id: unknown, where: string, err: unknown) {
-  console.error(`[dental-a2a] ${where} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-  return rpcErr(id, -32603, "Internal error");
+  return rpcInternalErrorReply("dental-a2a", id, where, err);
 }
 
 // ─── Zod envelope schema ─────────────────────────────────────
