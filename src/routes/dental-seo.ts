@@ -69,7 +69,7 @@ import { shownPostnummer } from "../services/norway-postnummer";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
 import { DENTAL_LANDING_CONFIG, DENTAL_STATIC_PAGE_DATES } from "../config/dental-landing";
-import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts } from "../services/dental-area-facts";
+import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts, type DentalAreaScope } from "../services/dental-area-facts";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
 // and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
@@ -2038,9 +2038,11 @@ const NO_LANDING: DentalAreaLanding = { introHtml: "", tableHtml: "", faqHtml: "
 // The intro, table and FAQ for a /sted or /fylke page, or nothing: when the
 // aggregate is missing (page 2+, db not ready) or does not agree with the
 // page's own count (cache a little behind the data), no number is stated.
-function areaLandingFor(counts: DentalAreaCounts | undefined, total: number, name: string, url: string): DentalAreaLanding {
+// `scope` says what the numbers count: a /sted page counts its poststed
+// spellings (not the whole kommune /sok?q= reads), a /fylke page the fylke.
+function areaLandingFor(counts: DentalAreaCounts | undefined, total: number, name: string, url: string, scope: DentalAreaScope): DentalAreaLanding {
   if (!counts || total <= 0 || counts.total !== total) return NO_LANDING;
-  return buildDentalAreaLanding(counts, { name, url });
+  return buildDentalAreaLanding(counts, { name, url, scope });
 }
 
 // GET /fylke/:fylke
@@ -2079,7 +2081,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const pageMeta = listPageMeta(page, totalPages);
   const itemList = dentalItemListJsonLd(`Tannleger i ${matchedFylke.fylke}`, pageUrl, agents, offset);
   // F1-S3: intro, fact table and FAQ from the cached aggregate, page 1 only.
-  const landing = areaLandingFor(page === 1 ? getDentalAreaFacts().byFylke.get(matchedFylke.fylke) : undefined, total, matchedFylke.fylke, pageUrl);
+  const landing = areaLandingFor(page === 1 ? getDentalAreaFacts().byFylke.get(matchedFylke.fylke) : undefined, total, matchedFylke.fylke, pageUrl, "fylke");
 
   // PR-116: Poststed chips for this fylke (≥2 clinics, max 30). One chip per
   // /sted group, with the group's count, in the fylke of its main row (D3b).
@@ -3298,7 +3300,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   // spellings the page lists), page 1 only.
   const landing = areaLandingFor(
     page === 1 ? sumAreaCounts(stedSpellings(stedGroup).map((sp) => getDentalAreaFacts().byPoststed.get(sp))) : undefined,
-    total, titledSted, pageUrl);
+    total, titledSted, pageUrl, "poststed");
 
   // BreadcrumbList
   const breadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
