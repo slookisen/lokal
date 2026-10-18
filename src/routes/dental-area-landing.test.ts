@@ -396,11 +396,22 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       const best = Math.min(...times);
       assertTrue(best < 20, `F1: getDentalAreaFacts on ~6,900 rows uncached < 20 ms (best of 3: ${best.toFixed(1)} ms; all: ${times.map((t) => t.toFixed(1)).join(", ")})`);
       assertTrue(last!.byPoststed.size >= 1500, `F2: the aggregate has the 1,500 benchmark poststeder (${last!.byPoststed.size})`);
-      const t1 = performance.now();
+      // A hit is the cached object itself (`same`): a recompute, in the
+      // foreground or as a background refresh, would hand out a new one. The
+      // time bound only says a hit costs well under a millisecond (a scan
+      // costs ~10 ms, F1): 100 ms per 1,000 hits, best of 3 rounds as in F1.
+      // Under tsx a hit takes 10-12 µs; the old single-round 20 ms bound
+      // failed at 20-35 ms on a GC pause or a busy core.
       let same = true;
-      for (let i = 0; i < 1000; i++) same = same && areaFacts.getDentalAreaFacts() === last;
-      const hitMs = performance.now() - t1;
-      assertTrue(same && hitMs < 20, `F3: 1,000 later calls all return the cached aggregate (${hitMs.toFixed(1)} ms)`);
+      const hitTimes: number[] = [];
+      for (let r = 0; r < 3; r++) {
+        const t1 = performance.now();
+        for (let i = 0; i < 1000; i++) same = same && areaFacts.getDentalAreaFacts() === last;
+        hitTimes.push(performance.now() - t1);
+      }
+      const hitBest = Math.min(...hitTimes);
+      assertTrue(same, "F3: 1,000 later calls all return the cached aggregate (the same object)");
+      assertTrue(hitBest < 100, `F3b: 1,000 cache hits take under 100 ms (best of 3: ${hitBest.toFixed(1)} ms; all: ${hitTimes.map((t) => t.toFixed(1)).join(", ")})`);
     }
   } catch (err: any) {
     failed++;
