@@ -9,7 +9,7 @@ import { copyFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const PACKAGES = ["mcp-server-dental"];
+export const PACKAGES = ["mcp-server", "mcp-server-dental", "mcp-server-opplevagent"];
 export const BRIDGE = "stdio-bridge.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");

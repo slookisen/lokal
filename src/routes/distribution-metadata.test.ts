@@ -133,13 +133,20 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
   const sj = JSON.parse(pkgSj.toString("utf8"));
   check("dist-10 lokal-mcp description", sj.description ===
     "Norwegian local-food MCP: 1,500+ farms, shops, markets + umbrellas (Bondens marked, Hanen, REKO).", sj.description);
-  check("dist-11 lokal-mcp stays 0.4.1", sj.version === "0.4.1" && JSON.parse(read("mcp-server/package.json")).version === "0.4.1");
+  check("dist-11 lokal-mcp is 0.5.0 (stdio bridge, G1-S2b)", sj.version === "0.5.0" && sj.packages[0].version === "0.5.0"
+    && JSON.parse(read("mcp-server/package.json")).version === "0.5.0" && JSON.parse(read("mcp-server/manifest.json")).version === "0.5.0");
   check("dist-12 mcp-server/package.json files ships server.json",
     (JSON.parse(read("mcp-server/package.json")).files as string[]).includes("server.json"));
   check("dist-13 dental server.json websiteUrl", JSON.parse(read("mcp-server-dental/server.json")).websiteUrl === "https://finn-tannlege.com");
   check("dist-14 opplevagent server.json websiteUrl", JSON.parse(read("mcp-server-opplevagent/server.json")).websiteUrl === "https://opplevagent.no");
   check("dist-15 dental package versions are 0.2.0 (stdio bridge, G1-S2a)",
     JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.0" && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.0");
+  check("dist-16 opplevagent-mcp is 0.4.0 in every place (0.3.0 was never published)",
+    JSON.parse(read("mcp-server-opplevagent/package.json")).version === "0.4.0"
+    && JSON.parse(read("mcp-server-opplevagent/server.json")).version === "0.4.0"
+    && JSON.parse(read("mcp-server-opplevagent/server.json")).packages[0].version === "0.4.0"
+    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/manifest.json")).version === "0.4.0"
+    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/server.json")).version === "0.4.0");
 
   return { passed, failed, failures };
 }

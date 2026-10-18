@@ -10017,7 +10017,13 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   console.log("\n── Phase 5.11 A2.5: A2A agent-card + MCP discovery ──");
   const fs = require("fs");
   const mp = fs.readFileSync("src/routes/marketplace.ts", "utf8");
-  const mcp = fs.readFileSync("mcp-server/index.js", "utf8");
+  // G1-S2b: mcp-server/index.js is a stdio bridge to the remote /mcp since 0.5.0, so the MCP-tool checks
+  // below run against what registerTools() (the remote's tool list, which the bridge forwards) registers.
+  const { McpServer: _a25McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+  const { registerTools: _a25RegisterTools } = require("../src/routes/mcp");
+  const _a25Server = new _a25McpServer({ name: "a25-rfb", version: "0.0.0" });
+  _a25RegisterTools(_a25Server);
+  const rfbTools: Record<string, any> = (_a25Server as any)._registeredTools;
   const serverJson = JSON.parse(fs.readFileSync("mcp-server/server.json", "utf8"));
   const pkgJson = JSON.parse(fs.readFileSync("mcp-server/package.json", "utf8"));
 
@@ -10111,44 +10117,41 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: agent-card adds top-level umbrella metadata block for umbrellas"
   );
 
-  // ── MCP tools (mcp-server/index.js) ─────────────────────────
-  // Test 4.11: 3 new MCP tools registered
-  for (const tool of ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"]) {
+  // ── MCP tools (registerTools(), forwarded by mcp-server/index.js since 0.5.0) ──
+  const umbrellaToolNames = ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"];
+
+  // Test 4.11: 3 umbrella MCP tools registered and enabled
+  for (const tool of umbrellaToolNames) {
     assertTrue(
-      mcp.includes(`registerTool(\n  "${tool}"`),
+      !!rfbTools[tool] && rfbTools[tool].enabled !== false,
       `phase5.11-a2.5: MCP tool ${tool} registered`
     );
   }
 
-  // Test 4.12: MCP tools all marked read-only + idempotent + open-world
-  const listStart = mcp.indexOf('"lokal_list_umbrellas"');
-  const startSect = mcp.indexOf('"lokal_list_umbrellas"');
-  // All three tool blocks contain the annotation set
-  const allMcpTools = mcp.slice(startSect);
-  const readonlyCount = (allMcpTools.match(/readOnlyHint:\s*true/g) || []).length;
+  // Test 4.12: MCP tools all marked read-only + idempotent
   assertTrue(
-    readonlyCount >= 3,
-    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint: true"
+    umbrellaToolNames.every((t) => rfbTools[t]?.annotations?.readOnlyHint === true && rfbTools[t]?.annotations?.idempotentHint === true),
+    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint + idempotentHint: true"
   );
 
   // Test 4.13: MCP tool descriptions include umbrella concepts
   assertTrue(
-    /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(mcp.slice(listStart)),
+    umbrellaToolNames.some((t) => /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(String(rfbTools[t]?.description || ""))),
     "phase5.11-a2.5: MCP tool descriptions reference real Norwegian umbrella names"
   );
 
-  // Test 4.14: MCP tools call our public discovery endpoints (not admin)
+  // Test 4.14: the stdio package carries no tool definitions or HTTP calls of its own — it is a bridge to the
+  // remote, and its mcpb manifest lists exactly the remote's tools (behaviour is covered by mcp-stdio-bridge.test.ts).
+  const stdioEntry = fs.readFileSync("mcp-server/index.js", "utf8");
   assertTrue(
-    mcp.includes("/api/marketplace/umbrellas?"),
-    "phase5.11-a2.5: lokal_list_umbrellas calls /api/marketplace/umbrellas"
+    /runBridge\(/.test(stdioEntry) && !/registerTool\(|\/api\/marketplace\//.test(stdioEntry),
+    "phase5.11-a2.5: mcp-server/index.js is a thin bridge (no own tools, no /api/marketplace calls)"
   );
-  assertTrue(
-    mcp.includes("/api/marketplace/umbrellas/${umbrellaId}/members"),
-    "phase5.11-a2.5: lokal_get_umbrella_members calls /api/marketplace/umbrellas/:id/members"
-  );
-  assertTrue(
-    mcp.includes("/api/marketplace/producers/${producerId}/affiliations"),
-    "phase5.11-a2.5: lokal_get_producer_affiliations calls /api/marketplace/producers/:id/affiliations"
+  const mcpbManifest = JSON.parse(fs.readFileSync("mcp-server/manifest.json", "utf8"));
+  assertEq(
+    JSON.stringify(mcpbManifest.tools.map((t: any) => t.name)),
+    JSON.stringify(Object.entries(rfbTools).filter(([, t]: [string, any]) => t.enabled !== false).map(([n]) => n)),
+    "phase5.11-a2.5: mcp-server/manifest.json lists exactly the tools registerTools() registers"
   );
 
   // Test 4.15: server.json + package.json versions bumped to 0.4.0, then to
@@ -10160,8 +10163,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json and mcp-server/package.json versions stay in lockstep"
   );
   assertTrue(
-    serverJson.version === "0.4.1",
-    "phase5.11-a2.5: server.json version bumped to 0.4.1 (remotes + websiteUrl + updated description)"
+    serverJson.version === "0.5.0" && pkgJson.version === "0.5.0" && mcpbManifest.version === "0.5.0",
+    "phase5.11-a2.5: server.json, package.json and manifest.json are at 0.5.0 (stdio bridge, G1-S2b)"
   );
 
   // Test 4.16: server.json description mentions umbrella organizations
@@ -10170,10 +10173,14 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json description updated to mention umbrella organizations"
   );
 
-  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter
+  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter (behaviour, not source text)
+  const umbrellaSchema = rfbTools.lokal_list_umbrellas?.inputSchema;
   assertTrue(
-    mcp.includes('z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"])'),
-    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType uses z.enum allow-list"
+    !!umbrellaSchema &&
+      ["market_network", "venue", "industry_org", "certification", "cooperative"].every(
+        (v) => umbrellaSchema.safeParse({ umbrellaType: v }).success) &&
+      !umbrellaSchema.safeParse({ umbrellaType: "bogus" }).success,
+    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType accepts the 5 allow-listed values and rejects others"
   );
 }
 
@@ -11483,8 +11490,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
   const serverParsed = JSON.parse(serverJsonRoot);
   assertTrue(
-    serverParsed.version === "0.4.1",
-    "pr-56: server.json bumped to v0.4.1 (was 0.3.3, then 0.4.0)"
+    serverParsed.version === "0.5.0",
+    "pr-56: server.json bumped to v0.5.0 (was 0.3.3, 0.4.0, 0.4.1; stdio bridge in G1-S2b)"
   );
   assertTrue(
     Array.isArray(serverParsed.remotes) &&
@@ -15693,7 +15700,6 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   console.log("\n── PR-76: lokal_geocode MCP tool ──");
   const fs = require("fs");
   const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf-8");
-  const stdioSrc = fs.readFileSync("mcp-server/index.js", "utf-8");
   const marketplaceSrc = fs.readFileSync("src/routes/marketplace.ts", "utf-8");
 
   // (1) HTTP-MCP server: lokal_geocode tool is registered
@@ -15727,16 +15733,22 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
     "pr-76: lokal_geocode is read-only + idempotent + openWorldHint:true"
   );
 
-  // (5) Stdio MCP server: lokal_geocode mirrored
-  assertTrue(
-    /registerTool\(\s*"lokal_geocode"/.test(stdioSrc),
-    "pr-76: lokal_geocode tool mirrored in mcp-server/index.js (stdio server)"
-  );
+  // (5) Stdio package: since 0.5.0 a bridge to the remote, so lokal_geocode reaches stdio clients through
+  // the remote tool list (registerTools()) and the mcpb manifest — not through a mirrored handler.
+  {
+    const { registeredMcpTools: _pr76Tools } = require("../src/services/mcp-tool-manifest");
+    const remoteGeocode = _pr76Tools("rfb").some((t: any) => t.name === "lokal_geocode");
+    const mcpbTools = JSON.parse(fs.readFileSync("mcp-server/manifest.json", "utf-8")).tools.map((t: any) => t.name);
+    assertTrue(
+      remoteGeocode && mcpbTools.includes("lokal_geocode"),
+      "pr-76: lokal_geocode is in registerTools() and in the lokal-mcp mcpb manifest (stdio bridge forwards it)"
+    );
+  }
 
-  // (6) Stdio mirror calls public /api/marketplace/geocode endpoint
+  // (6) Stdio package has no own geocode HTTP call any more
   assertTrue(
-    /\/api\/marketplace\/geocode/.test(stdioSrc),
-    "pr-76: stdio mirror calls /api/marketplace/geocode HTTP endpoint"
+    !/\/api\/marketplace\/geocode/.test(fs.readFileSync("mcp-server/index.js", "utf-8")),
+    "pr-76: mcp-server/index.js (bridge) has no own /api/marketplace/geocode call"
   );
 
   // (7) HTTP endpoint registered for stdio mirror to call
@@ -48263,7 +48275,7 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
-  console.log("\n── mcp-stdio-bridge: finn-tannlege-mcp stdio bridge vs the real dental /mcp ──");
+  console.log("\n── mcp-stdio-bridge: stdio bridges (finn-tannlege-mcp, lokal-mcp, opplevagent-mcp) vs the real /mcp routers ──");
   try {
     const { runMcpStdioBridgeTests } = require("../src/routes/mcp-stdio-bridge.test") as
       typeof import("../src/routes/mcp-stdio-bridge.test");
