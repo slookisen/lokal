@@ -457,15 +457,20 @@ class MarketplaceRegistry {
     // off as a hit: nationwide there is nothing to show, and near a place the
     // list stays for the caller to present as the producers there, not as
     // matches (meta.unmatchedTerms).
+    // Slice I-W2 (S4): next to a category («Which bakeries make kransekake»)
+    // the words name no producer of their own. The category's producers stay,
+    // and the ones whose products match the words rank first (step 7).
     const unknownTerms = ((query as any)._unknownTerms as string[] | undefined) ?? [];
     let termMatches: Map<string, CatalogTermMatch> | null = null;
     if (unknownTerms.length > 0 && !((query as any)._productTerms as string[] | undefined)?.length) {
       termMatches = catalogTermMatches(db, unknownTerms, new Set(candidates.map(c => c.id)));
-      if (termMatches && termMatches.size > 0) {
-        candidates = candidates.filter(a => termMatches!.has(a.id));
-      } else if (termMatches) {
-        if (meta) meta.unmatchedTerms = unknownTerms;
-        if (!query.location) return [];
+      if (termMatches && !query.categories?.length) {
+        if (termMatches.size > 0) {
+          candidates = candidates.filter(a => termMatches!.has(a.id));
+        } else {
+          if (meta) meta.unmatchedTerms = unknownTerms;
+          if (!query.location) return [];
+        }
       }
     }
 
@@ -639,9 +644,10 @@ class MarketplaceRegistry {
     // keep labels out of `offers`), then the one whose products name more of
     // the words, then the better match (a whole word before the head of a
     // compound before the start of a word, as in the offers); relevance
-    // orders the rest.
+    // orders the rest. Slice I-W2: next to a category word a producer without
+    // a match stays, after every producer with one (it matches no word).
     if (termMatches && termMatches.size > 0) {
-      const m = (r: DiscoveryResult) => termMatches!.get(r.agent.id)!;
+      const m = (r: DiscoveryResult) => termMatches!.get(r.agent.id) ?? NO_TERM_MATCH;
       results.sort((a, b) => Number(m(b).listed) - Number(m(a).listed) || m(b).terms - m(a).terms || m(b).best - m(a).best);
     }
 
@@ -1066,9 +1072,15 @@ class MarketplaceRegistry {
       // queries and the 107 searches of the B1 check nothing else changes
       // (2026-10-18); the name query, when another word triggers one, keeps
       // its words as before.
-      const nonSkipWords = queryWords
+      // Slice I-W2 (S2): a search of filler words only («Finnes», «Bondens»,
+      // «Norsk», «Topp») is read by main's rule again. The filter left no word
+      // there, so it gave the standard list where main found the producers
+      // with the word in their name.
+      const passWords = queryWords
         .map(w => w.replace(/[.,!?]/g, "").toLowerCase())
-        .filter(w => w.length >= 3 && !skipWords.has(w) && !QUERY_STOPWORDS.has(w) && !NO_PRODUCT_WORDS.has(w));
+        .filter(w => w.length >= 3 && !skipWords.has(w));
+      const contentWords = passWords.filter(w => !QUERY_STOPWORDS.has(w) && !NO_PRODUCT_WORDS.has(w));
+      const nonSkipWords = contentWords.length > 0 ? contentWords : passWords;
 
       // PR-72: Known Norwegian place names that should NOT trigger name-search.
       // Without this list, queries like "fersk fisk i Bergen" set
@@ -1107,14 +1119,45 @@ class MarketplaceRegistry {
           // not-yet-vetted rows too — kept consistent with discover()'s own
           // is_vetted filter even though this candidate-detection step alone
           // can't leak a result (discover()'s actual lookup is gated too).
-          const allNames = (db.prepare(`SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[])
-            .map(r => (r.name || "").toLowerCase());
+          const publicRows = db.prepare(`SELECT id, name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`).all() as any[];
+          const allNames = publicRows.map(r => (r.name || "").toLowerCase());
 
           const nameMatches = nameCandidateWords.filter(word =>
             allNames.some(name => name.includes(word))
           );
+          let nameSearch = nameMatches.length > 0;
+          // Slice I-W2 (S4): in a search of several words, a word that only
+          // sits inside a producer name («ser» in «Hvasser», «jul» in
+          // «Julseth», «stor» in «Storfjord») makes no name search when
+          // another word of the search is a place, a category or a product in
+          // the catalog (catalogTermMatches, the rule of step 3c). Otherwise
+          // «stor kransekake» was a name search and never reached the product
+          // names. A word that is a whole word of a name (productNameMatch 3:
+          // «Grini», «Lager» in «Lager 11», «REKO-ring» in «REKO-ring Hamar»)
+          // still makes one, and so does a search of one word.
+          // Review round 1 (B1): each catalog lookup is a LIKE scan of
+          // `products`, and the search reaches this point with no length
+          // limit (a 98 kB search took 16 s). As in step 3c, a word has at
+          // most UNKNOWN_TERMS_MAX other words looked up, the first in the
+          // search's order, so a search makes at most UNKNOWN_TERMS_MAX + 1
+          // lookups. Places and categories need no lookup and count wherever
+          // they stand; each distinct word is weighed once.
+          if (nonSkipWords.length > 1 && nameSearch) {
+            // a place or category word in the search (nameCandidateWords is nonSkipWords without them)
+            const known = nameCandidateWords.length < nonSkipWords.length;
+            const lookups = [...new Set(nonSkipWords)].filter(w => !/^\p{N}+$/u.test(w)).slice(0, UNKNOWN_TERMS_MAX + 1);
+            const ids = new Set<string>(publicRows.map(r => r.id));
+            const hits = new Map<string, boolean>();
+            const inCatalog = (w: string): boolean => {
+              if (!hits.has(w)) hits.set(w, (catalogTermMatches(db, [w], ids)?.size ?? 0) > 0);
+              return hits.get(w)!;
+            };
+            nameSearch = [...new Set(nameMatches)].some(word =>
+              allNames.some(name => name.includes(word) && productNameMatch(name, word) === 3)
+              || !(known || lookups.filter(other => other !== word).slice(0, UNKNOWN_TERMS_MAX).some(inCatalog)));
+          }
 
-          if (nameMatches.length > 0) {
+          if (nameSearch) {
             // At least one DISTINCTIVE word matches an agent name — use it as name query.
             // PR-72: If categories were also detected, prefer the category-filter path
             // over name-search (category match is stronger signal than a fuzzy name word).
@@ -1137,11 +1180,17 @@ class MarketplaceRegistry {
     // list. The words nothing above explains go to discover() step 3c, which
     // looks them up in the product names. Only then: a word next to a
     // category or a name is no reason to narrow those («god ost i Bergen»).
-    if (!parsed.categories?.length && !(parsed as any)._nameQuery) {
+    // Slice I-W2 (S4): next to a category word without a product term
+    // («Which bakeries make kransekake») the words are kept too; discover()
+    // only lets them rank that category's producers, never add any. A word
+    // for the occasion, meal, size or packaging (QUALIFIER_WORDS) counts only
+    // when nothing else in the search names the product (S1).
+    if (!(parsed as any)._nameQuery && !parsed._productTerms?.length) {
       const unknown = unknownProductWords(q, (w) =>
         skipWords.has(w) || isPlace(w) || nameIndicators.includes(w)
         || isCategoryOrTagWord(w, categoryMap, tagMap) || isEnglishFoodWord(w)
-        || Object.values(tagMap).some((kws) => kws.some((kw) => !kw.includes(" ") && w.startsWith(kw))));
+        || Object.values(tagMap).some((kws) => kws.some((kw) => !kw.includes(" ") && w.startsWith(kw))),
+      !parsed.categories?.length);
       if (unknown.length > 0) parsed._unknownTerms = unknown;
     }
 
@@ -2347,6 +2396,9 @@ export const PRODUCT_CATEGORY_KEYWORDS: Record<string, string[]> = {
     // «bakeri Trondheim» nor "bakery in Trondheim" selected a category.
     // Norwegian was broken here too; this is not an English-only gap.
     "bakeri", "bakeriet", "bakevarer", "bakst",
+    // Slice I-W2 (S4): the English plural; the glossary only knows «bakery»
+    // and «bakerys», so "Which bakeries make kransekake" had no category.
+    "bakeries",
   ],
   "honey": ["honning", "honey", "birøkt"],
   "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
@@ -2387,6 +2439,9 @@ const PRODUCT_TERM_EXCLUSIONS = new Set<string>([
   "grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
   "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
   "bakervarer", "urter", "herbs", "egg", "eggs",
+  // Slice I-W2: no product name holds it; as a product term it would also keep
+  // the words next to it from ranking the bakeries (discover() step 3c)
+  "bakeries",
   ...DRINK_KEYWORDS,
 ]);
 
@@ -2613,6 +2668,79 @@ const NO_PRODUCT_WORDS: ReadonlySet<string> = new Set([
   "traditional", "authentic", "quality",
   // amounts and the word «product» itself
   "kilo", "gram", "liter", "stk", "produkt", "produktet", "vare", "matvarer", "product", "products",
+  // Slice I-W2 (S4): looking for it, and who makes it. Inside a producer name
+  // they made a name search of the whole question: «ser» («Hvasser») in «Jeg
+  // ser etter kransekake», «lager» («Fruktlager», «Lager 11») in «Hvem lager
+  // spekepølse», «make» («Ostemakeri») in «Which bakeries make kransekake».
+  // «leter» ends «Fiskefileter».
+  "ser", "leter", "lete", "søker", "lager", "lage", "lages", "produserer", "produsere",
+  "make", "makes", "making",
+  // «hvor får jeg tak i kransekake», «… i nærheten av Bergen»
+  "tak", "nærheten",
+  // Slice I-W2, review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag):
+  // «kortreist», the platform's own word for what every producer here sells.
+  // Next to a category word it ranked the one producer with it in a product
+  // name first and labelled the rest «Kategoritreff: «kortreist» ikke
+  // oppført» («egg kortreist»: Lofseik Gård first, the farms with eggs
+  // labelled). No product name in the live catalogue (2026-10-17) starts
+  // with it; one has it as a label, «Rotgrønnsaker (kortreist)». It is a
+  // whole word of the producer name «Osteverkstedet — Kortreist Italiener»,
+  // so Pass 2 made «kortreist kransekake» and «kortreist i Trondheim» name
+  // searches for that producer alone (main too). As a filler word Pass 2
+  // skips it, and alone it still makes that name search (a search of filler
+  // words only is read by main's rule). «kortreiste» is in QUALIFIER_WORDS.
+  "kortreist",
+]);
+
+/**
+ * Slice I-W2 (S1): words for the occasion, the meal, the time of year, the
+ * size, the packaging or the price of what is sought, not the product. Next
+ * to a product word they only brought in producers that match them alone,
+ * as product matches: in the live catalogue (2026-10-17) a product name
+ * starts with «stor» at 47 producers («Storfekjøtt»), «gave» at 17, «lunsj»
+ * at 17 and «selskap» at 11, and «kransekake til lunsj» gave Lillehammer
+ * Bakeri («Frukost og lunsj») first. Such a word counts only when nothing
+ * else in the search names a product («lunsj» alone still finds lunch). Not
+ * here: «bryllup» and «konfirmasjon», which name a product («Kransekake
+ * bryllup», «Bryllupskaker»). Lower case; bokmål, nynorsk and English.
+ * A list, not «the word with the fewest producers is the product»: «frokost»
+ * starts a product name at 4 live producers and «syltetøy» at 48, so that
+ * rule would answer «syltetøy til frokost» with breakfast and no jam.
+ * Review round 3: also how fresh, near, natural or wholesome it is (the
+ * last group below).
+ */
+const QUALIFIER_WORDS: ReadonlySet<string> = new Set([
+  // occasion
+  "selskap", "selskaper", "selskapet", "gave", "gaver", "gaven", "presang", "fest", "festen", "bursdag",
+  "bursdagen", "jubileum", "feiring", "anledning", "party", "gift", "gifts", "present", "birthday", "wedding",
+  // holidays and the time of year («17. mai»)
+  "jul", "julen", "jula", "julaften", "påske", "påsken", "påska", "mai", "sommer", "sommeren", "vinter",
+  "vinteren", "høst", "høsten", "christmas", "easter", "summer", "winter", "autumn",
+  // meal
+  "frokost", "frukost", "lunsj", "lunch", "middag", "middagen", "kveldsmat", "brunsj", "brunch", "breakfast",
+  "dinner",
+  // size
+  "liten", "lite", "lita", "lille", "små", "stor", "store", "stort", "større", "størst", "small", "large", "big",
+  // packaging
+  "boks", "bokser", "pakke", "pakker", "pakning", "eske", "esker", "pose", "poser", "box", "pack", "package",
+  // price and offer
+  "tilbud", "tilbudet", "rabatt", "salg", "offer", "discount",
+  // Review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag): how
+  // fresh, near, natural or wholesome it is. Next to a category word such a
+  // word ranked the producers with it in a product name first and labelled
+  // the rest «Kategoritreff: «…» ikke oppført» («nybakt brød»: the bakeries
+  // without «Nybakt brød»). Here, not in NO_PRODUCT_WORDS: in the live
+  // catalogue (2026-10-17) product names start with «nybakt» («Nybakt
+  // brød», 3 producers), «frisk» («Friske urter», 2) and «naturlig»
+  // («Naturlige såper», «Naturlig kosmetikk», 3), and a search of one such
+  // word keeps main's answer: those products, a name search («ren», «sunn»
+  // sit inside many names) or the honest no-match answer («kortreiste»,
+  // «sunt»), where a NO_PRODUCT_WORDS word alone gives the standard list.
+  // Not here: «rein» (reindeer, «Reinkjøtt»); «lokal», «fersk», «økologisk»,
+  // «local», «fresh», «organic» and their forms, which are tag words
+  // (tagMap) and never unknown words; and «kortreist», in NO_PRODUCT_WORDS.
+  "nybakt", "nybakte", "frisk", "friske", "kortreiste", "gårdsprodusert", "gårdsproduserte", "småskala",
+  "homegrown", "naturlig", "naturlige", "natural", "ren", "rene", "pure", "sunn", "sunne", "sunt", "healthy",
 ]);
 
 /** At most this many words of one query are looked up in the catalog. */
@@ -2622,17 +2750,28 @@ const UNKNOWN_TERMS_MAX = 4;
  * The words of the lower-cased query `q` that `isKnown` does not explain and
  * that are no generic name, shared stopword (QUERY_STOPWORDS) or
  * NO_PRODUCT_WORDS word: letters (or a mix with digits), three or more, in
- * query order, once each, at most UNKNOWN_TERMS_MAX.
+ * query order, once each, at most UNKNOWN_TERMS_MAX. Slice I-W2: a
+ * QUALIFIER_WORDS word only when there is no other such word and
+ * `qualifiersAlone` (the search has no category word either). Both lists
+ * stop at UNKNOWN_TERMS_MAX and each distinct word is weighed once, so a
+ * long search costs no more than in I-W.
  */
-function unknownProductWords(q: string, isKnown: (w: string) => boolean): string[] {
-  const out: string[] = [];
+function unknownProductWords(q: string, isKnown: (w: string) => boolean, qualifiersAlone: boolean): string[] {
+  const words: string[] = [];
+  const qualifiers: string[] = [];
+  const seen = new Set<string>();
   for (const w of q.split(/[^\p{L}\p{N}]+/u)) {
-    if (w.length < 3 || /^\p{N}+$/u.test(w) || out.includes(w)) continue;
+    if (w.length < 3 || seen.has(w) || /^\p{N}+$/u.test(w)) continue;
+    seen.add(w);
     if (isKnown(w) || GENERIC_NAME_WORDS.has(w) || QUERY_STOPWORDS.has(w) || NO_PRODUCT_WORDS.has(w)) continue;
-    out.push(w);
-    if (out.length === UNKNOWN_TERMS_MAX) break;
+    if (!QUALIFIER_WORDS.has(w)) {
+      words.push(w);
+      if (words.length === UNKNOWN_TERMS_MAX) break;
+    } else if (qualifiers.length < UNKNOWN_TERMS_MAX) {
+      qualifiers.push(w);
+    }
   }
-  return out;
+  return words.length > 0 ? words : qualifiersAlone ? qualifiers : [];
 }
 
 /** How a producer's catalog answers the words of discover() step 3c. */
@@ -2646,6 +2785,9 @@ interface CatalogTermMatch {
   /** The best match among its products (utils/product-name-match.ts). */
   best: ProductNameMatch;
 }
+
+/** Slice I-W2: a producer whose catalog matches none of the words (next to a category word it stays). */
+const NO_TERM_MATCH: CatalogTermMatch = { names: [], listed: false, terms: 0, best: 0 };
 
 /**
  * The producers among `agentIds` with a product whose name matches one of

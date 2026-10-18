@@ -812,8 +812,13 @@ export function registerTools(
       // a producer kept only for its broad category (`meat` for "lamb") says
       // so, instead of reading like a documented match.
       // I-W: the words step 3c matched in product names count as product terms.
+      // I-W2: next to a category word the words only rank its producers, so
+      // they count only when a product name matched them («Which bakeries
+      // make kransekake»); otherwise the category words label as before.
+      const unknownTermsCount = !!unknownTerms && !unmatched
+        && (!parsed.categories?.length || !!discoverMeta.productMatches?.size);
       const productTerms = ((parsed as any)._productTerms as string[] | undefined)
-        ?? (unknownTerms && !unmatched ? unknownTerms : undefined) ?? [];
+        ?? (unknownTermsCount ? unknownTerms : undefined) ?? [];
       // Slice I-N (AI-3a): a search with no product term, only category words
       // («egg i Bergen», «meat»), is labelled against those words. A product
       // term («honning», «reinsdyr») is the more specific evidence and keeps

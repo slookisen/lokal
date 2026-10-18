@@ -167,9 +167,9 @@ function openFixtureDb(seeds: readonly Seed[] = I_W_SEEDS): Database.Database {
 /**
  * Makes an in-memory DB with `seeds` the getDb() singleton, with BASE_URL
  * unset and geocoding offline. restore() closes the DB and puts back what
- * was there.
+ * was there. Exported for slice I-W2 (rfb-sok-fyllord-navnekapring.test.ts).
  */
-function enterFixtures(seeds: readonly Seed[] = I_W_SEEDS): { db: Database.Database; restore: () => void } {
+export function enterFixtures(seeds: readonly Seed[] = I_W_SEEDS): { db: Database.Database; restore: () => void } {
   const prevDb = __peekDbForTesting();
   const prevBaseUrl = process.env.BASE_URL;
   delete process.env.BASE_URL;
@@ -194,7 +194,8 @@ function enterFixtures(seeds: readonly Seed[] = I_W_SEEDS): { db: Database.Datab
 
 type ToolMap = Map<string, (args: any, extra?: any) => Promise<any>>;
 
-function captureTools(): ToolMap {
+/** The MCP tool handlers, through a duck-typed server. Exported for slice I-W2. */
+export function captureTools(): ToolMap {
   const mcp = require("./mcp") as typeof import("./mcp");
   const tools: ToolMap = new Map();
   mcp.registerTools({
@@ -204,7 +205,7 @@ function captureTools(): ToolMap {
   return tools;
 }
 
-const textOf = (r: any) => String(r?.content?.[0]?.text ?? "");
+export const textOf = (r: any) => String(r?.content?.[0]?.text ?? "");
 
 /**
  * lokal_search's text for each query, and lokal_discover's for the two
@@ -230,8 +231,8 @@ export async function lokalSearchTexts(queries: readonly string[] = [...B1_QUERI
   }
 }
 
-/** The producer names of a lokal_search / lokal_discover text, in the order shown. */
-function namesIn(text: string): string[] {
+/** The producer names of a lokal_search / lokal_discover text, in the order shown. Exported for slice I-W2. */
+export function namesIn(text: string): string[] {
   return [...text.matchAll(/^\*\*\d+\. (.+?)(?: — Kategoritreff[^*]*)?\*\*/gm)].map((m) => m[1]);
 }
 
@@ -507,7 +508,7 @@ export async function runRfbSokUkjenteOrdBakeriStedTests(opts: { log?: boolean }
       assertEq(["beste zzzqqx", "zzzqqx i dag", "god zzzqqx i Bærum"].map((q) => parse(q)._unknownTerms), [["zzzqqx"], ["zzzqqx"], ["zzzqqx"]],
         "parser: «beste zzzqqx», «zzzqqx i dag», «god zzzqqx i Bærum» leave only «zzzqqx»");
       assertEq(["jeg vil ha", "beste", "i dag"].map((q) => parse(q)._unknownTerms), [undefined, undefined, undefined],
-        "parser: a search of filler words only has no unknown word (the standard list, as on main)");
+        "parser: a search of filler words only has no unknown word (slice I-W2: main's name search when a name holds the word, else the standard list)");
 
       const krans = ["Grini Hjemmebakeri Fixture", "Flatøy Hjemmebakeri Fixture", "Torgrim Hansen Bakeri Fixture", "Baker Walderhaug Fixture",
         "Mandelbakeren Fixture", "Ringbakeriet Fixture"];
