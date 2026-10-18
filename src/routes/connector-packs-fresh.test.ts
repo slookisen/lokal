@@ -46,12 +46,13 @@ const REGEN = "run: npx tsx scripts/gen-connector-packs.ts";
 
 /**
  * The icon each brand uploads, by md5; a new icon is a deliberate change here. RFB: the sprout (also
- * mcp-server/icon.png). Opplevagent: its own constellation mark (G3-S2). Dental: none until F2-S4.
+ * mcp-server/icon.png). Opplevagent: its own constellation mark (G3-S2). Dental: the «Søket» mark,
+ * the same file as src/public/dental-favicon-512.png (F2-S4; dental-icons.test.ts pins it there).
  */
 const PINNED_ICON_MD5: Record<CatalogVertical, string | null> = {
   rfb: "e927c3115d56f3c8d863f5bfbd18d2f4",
   experiences: "ae5af016bbaa21767fa71b66bda51750",
-  dental: null,
+  dental: "d699125e1528fb9c818550c1052b0bb3",
 };
 
 /** Icons that belong to no brand's pack: a recoloured copy has its own md5, which PINNED_ICON_MD5 cannot catch. */

@@ -255,10 +255,12 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       { host: OA, path: "/for-tilbydere", expect: NB_LINE },
       { host: OA, path: "/finnes-ikke-404", expect: NB_LINE },
       { host: OA, path: "/mcp", expect: NB_LINE, accept: "text/html,application/xhtml+xml" },
-      // finn-tannlege.com — dentalShell footer (Norwegian-only site: /en/ serves
-      // the same Norwegian page, footer included), /mcp browser page
+      // finn-tannlege.com — dentalShell footer (Norwegian site: /en/ serves the
+      // same Norwegian page, footer included; the AI guide is the one English
+      // page, G3-S4), /mcp browser page
       { host: FT, path: "/", expect: NB_LINE },
       { host: FT, path: "/en/", expect: NB_LINE },
+      { host: FT, path: "/en/guide-tannlege-ai", expect: EN_LINE_EN_KONTAKT },
       { host: FT, path: "/om", expect: NB_LINE },
       { host: FT, path: "/personvern", expect: NB_LINE },
       { host: FT, path: "/kontakt", expect: NB_LINE },
