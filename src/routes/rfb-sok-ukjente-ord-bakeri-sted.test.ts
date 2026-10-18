@@ -26,6 +26,14 @@
  *   main did (tests/fixtures/rfb-sok-i-w-main.json, captured with
  *   lokalSearchTexts below on main 9be8825f), and the bakery searches keep
  *   every producer main found.
+ * - Filler words (review round 1): a word such as «vil», «dag», «beste» or
+ *   «god» only has to start a word of a product name to match, so it let in
+ *   «Villsau lammelår» or «Dagens fangst» as product matches. The shared
+ *   QUERY_STOPWORDS (search-intent/norwegian-query.ts) and the search's own
+ *   filler words are never looked up; tested on FILLER_SEEDS, noise
+ *   producers whose products start with those words, in a DB of their own so
+ *   the B1 answers stay main's. Also a product name that starts with «Æ»
+ *   (SQLite folds ASCII only, so the LIKE needs the upper-case pattern).
  *
  * Data: own fixtures through seedCategoryLabelOfferFixtures
  * (rfb-kategorietiketter-ikke-tilbud.test.ts) in an in-memory DB with the
@@ -103,6 +111,27 @@ export const I_W_SEEDS: Seed[] = [
 ];
 const TRUST: Array<[string, number]> = [[GRINI, 0.461], [FLATOY, 0.434], [TORGRIM, 0.268], [WALDERHAUG, 0.268], [RINGER, 0.9], [MANDEL, 0.8], [INNI, 0.9]];
 
+const HAUGLAND = id(31), FJORDFISK = id(32), KORNMO = id(33), SANDVIKA = id(34), KAKEBUA = id(35);
+const VILJEHEIM = id(36), DAGSRUD = id(37), BESTEMORSTUA = id(38);
+/**
+ * Review round 1 (B1): producers whose products start with a filler word
+ * («vil», «dag», «beste», «god»; the reviewer's repro), producers whose names
+ * hold one (as many live names do, which made such a search a name search),
+ * and a product name that starts with «Æ». Only in their own DB (with
+ * I_W_SEEDS), never in the B1 capture.
+ */
+const FILLER_SEEDS: Seed[] = [
+  seed(HAUGLAND, "Haugland Sauegard Fixture", 60.63, 6.42, "Voss", ["meat"], [{ name: "Villsau lammelår", priceNok: 289 }]),
+  seed(FJORDFISK, "Fjordfisk Fixture", 62.47, 6.2, "Ålesund", ["fish"], [{ name: "Dagens fangst", priceNok: 180 }]),
+  seed(KORNMO, "Kornmo Mølle Fixture", 60.8, 11.07, "Hamar", ["bakery"], [{ name: "Bestemors flatbrød", priceNok: 75 }]),
+  // Bærum, inside the 25 km of «… i Bærum»
+  seed(SANDVIKA, "Sandvika Bakst Fixture", 59.89, 10.52, "Bærum", ["bakery"], [{ name: "Godt grovbrød", priceNok: 69 }]),
+  seed(KAKEBUA, "Kakebua Fixture", 59.13, 11.39, "Halden", ["bakery"], [{ name: "Æbleskiver 10 stk", priceNok: 59 }]),
+  seed(VILJEHEIM, "Viljeheim Fixture", 61.12, 10.47, "Lillehammer", ["vegetables"], [{ name: "Poteter", priceNok: 30 }]),
+  seed(DAGSRUD, "Dagsrud Fixture", 60.2, 11.1, "Nes", ["eggs"], [{ name: "Egg", priceNok: 50 }]),
+  seed(BESTEMORSTUA, "Bestemorstua Fixture", 58.15, 8.0, "Kristiansand", ["dairy"], [{ name: "Rømme", priceNok: 40 }]),
+];
+
 /** Searches whose lokal_search answer must be byte-identical to main's (no word outside the map, no bakery word). */
 export const B1_QUERIES: readonly string[] = [
   // chatgpt-app-submission.json test_cases and BRAND_ENTITIES.rfb.exampleQueries (rfb-connectors-prep)
@@ -135,6 +164,34 @@ function openFixtureDb(seeds: readonly Seed[] = I_W_SEEDS): Database.Database {
   return conn;
 }
 
+/**
+ * Makes an in-memory DB with `seeds` the getDb() singleton, with BASE_URL
+ * unset and geocoding offline. restore() closes the DB and puts back what
+ * was there.
+ */
+function enterFixtures(seeds: readonly Seed[] = I_W_SEEDS): { db: Database.Database; restore: () => void } {
+  const prevDb = __peekDbForTesting();
+  const prevBaseUrl = process.env.BASE_URL;
+  delete process.env.BASE_URL;
+  const db = openFixtureDb(seeds);
+  __setGeocodingFetchForTesting((async () => ({ ok: false, status: 404, json: async () => ({}) } as Response)) as typeof fetch);
+  __clearGeocodeCacheForTesting();
+  const registry = () => (require("../services/marketplace-registry") as typeof import("../services/marketplace-registry")).marketplaceRegistry;
+  registry()._agentsCache = null;
+  return {
+    db,
+    restore: () => {
+      if (prevBaseUrl === undefined) delete process.env.BASE_URL;
+      else process.env.BASE_URL = prevBaseUrl;
+      __setGeocodingFetchForTesting();
+      __clearGeocodeCacheForTesting();
+      registry()._agentsCache = null;
+      db.close();
+      if (prevDb) __setDbForTesting(prevDb as any);
+    },
+  };
+}
+
 type ToolMap = Map<string, (args: any, extra?: any) => Promise<any>>;
 
 function captureTools(): ToolMap {
@@ -156,14 +213,7 @@ const textOf = (r: any) => String(r?.content?.[0]?.text ?? "");
  * are captured with it: tests/fixtures/rfb-sok-i-w-main.json.
  */
 export async function lokalSearchTexts(queries: readonly string[] = [...B1_QUERIES, ...BAKERY_QUERIES]): Promise<Record<string, string>> {
-  const prevDb = __peekDbForTesting();
-  const prevBaseUrl = process.env.BASE_URL;
-  delete process.env.BASE_URL;
-  const db = openFixtureDb();
-  __setGeocodingFetchForTesting((async () => ({ ok: false, status: 404, json: async () => ({}) } as Response)) as typeof fetch);
-  __clearGeocodeCacheForTesting();
-  const { marketplaceRegistry } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
-  marketplaceRegistry._agentsCache = null;
+  const fixtures = enterFixtures();
   const prevLog = console.log;
   console.log = () => { /* silence module chatter */ };
   try {
@@ -176,13 +226,7 @@ export async function lokalSearchTexts(queries: readonly string[] = [...B1_QUERI
     return out;
   } finally {
     console.log = prevLog;
-    if (prevBaseUrl === undefined) delete process.env.BASE_URL;
-    else process.env.BASE_URL = prevBaseUrl;
-    __setGeocodingFetchForTesting();
-    __clearGeocodeCacheForTesting();
-    marketplaceRegistry._agentsCache = null;
-    db.close();
-    if (prevDb) __setDbForTesting(prevDb as any);
+    fixtures.restore();
   }
 }
 
@@ -209,15 +253,10 @@ export async function runRfbSokUkjenteOrdBakeriStedTests(opts: { log?: boolean }
   // B1 first: lokalSearchTexts opens (and closes) its own DB.
   const texts = await lokalSearchTexts();
 
-  const prevDb = __peekDbForTesting();
-  const prevBaseUrl = process.env.BASE_URL;
-  delete process.env.BASE_URL;
-  const db = openFixtureDb();
-  __setGeocodingFetchForTesting((async () => ({ ok: false, status: 404, json: async () => ({}) } as Response)) as typeof fetch);
-  __clearGeocodeCacheForTesting();
+  let fixtures = enterFixtures();
+  let db = fixtures.db;
   const { marketplaceRegistry, isPlaceWord, placeWordsIn, sameCategoryKey, categoryValueMatches, PRODUCT_CATEGORY_KEYWORDS } =
     require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
-  marketplaceRegistry._agentsCache = null;
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence module chatter */ };
 
@@ -438,14 +477,65 @@ export async function runRfbSokUkjenteOrdBakeriStedTests(opts: { log?: boolean }
         && !/Bærhagen Fixture — Kategoritreff/.test(sylt),
         "lokal_search «syltetøy»: the category label is marked «Kategoritreff … bare som kategorinavn», the product is not");
     }
+
+    // ══════════════════════════════════════════════════════════════
+    // Filler words (review round 1, B1): never looked up in the product names
+    // ══════════════════════════════════════════════════════════════
+    fixtures.restore();
+    fixtures = enterFixtures([...I_W_SEEDS, ...FILLER_SEEDS]);
+    db = fixtures.db;
+    {
+      const { QUERY_STOPWORDS } = require("../services/search-intent/norwegian-query") as typeof import("../services/search-intent/norwegian-query");
+      const oa = require("../services/experiences-query-intent") as typeof import("../services/experiences-query-intent");
+      assertTrue(oa.QUERY_STOPWORDS === QUERY_STOPWORDS && ["vil", "dag", "beste", "god", "dere", "helgen"].every((w) => QUERY_STOPWORDS.has(w)),
+        "shared list: Opplevagent's QUERY_STOPWORDS is the moved list itself (one list), and it has the reviewer's «vil», «dag», «beste», «god», «dere», «helgen»");
+
+      const termIds = (terms: string[]) =>
+        ids(marketplaceRegistry.discover({ role: "producer", _unknownTerms: terms, limit: 50 } as any, undefined, { trackDiscovery: false }));
+      assertEq([termIds(["vil"]), termIds(["dag"]), termIds(["beste"]), termIds(["god"])], [[HAUGLAND], [FJORDFISK], [KORNMO], [SANDVIKA]],
+        "setup: a filler word that reached step 3c would bring in the noise producer («Villsau…», «Dagens…», «Bestemors…», «Godt…»), so the tests below are not vacuous");
+      assertEq([parse("Viljeheim")._nameQuery, parse("Dagsrud")._nameQuery, parse("Bestemorstua")._nameQuery], ["Viljeheim", "Dagsrud", "Bestemorstua"],
+        "setup and Pass 2: producers whose names hold «vil», «dag» and «beste» are there, and their own names still make a name search");
+
+      const kransOnly = ["jeg vil ha kransekake", "kransekake i dag", "trenger kransekake", "kjøp kransekake på nett", "hjemmelaget kransekake",
+        "heimelaga kransekake", "kransekake levering", "kan dere levere kransekake", "norsk kransekake", "ekte kransekake", "kransekake til helgen",
+        "hvem selger kransekake", "kan jeg få kjøpt kransekake", "homemade kransekake delivery", "jeg trenger en god kransekake til helgen",
+        "beste kransekake i Bærum"];
+      assertEq(kransOnly.map((q) => parse(q)._unknownTerms), kransOnly.map(() => ["kransekake"]),
+        "parser: the filler words around «kransekake» (shared stopwords; buying, delivery, the web shop, «hjemmelaget», «norsk», «ekte», «hvem») are no unknown "
+        + "words, and make no name search for a producer whose name holds one (Pass 2)");
+      assertEq(["beste zzzqqx", "zzzqqx i dag", "god zzzqqx i Bærum"].map((q) => parse(q)._unknownTerms), [["zzzqqx"], ["zzzqqx"], ["zzzqqx"]],
+        "parser: «beste zzzqqx», «zzzqqx i dag», «god zzzqqx i Bærum» leave only «zzzqqx»");
+      assertEq(["jeg vil ha", "beste", "i dag"].map((q) => parse(q)._unknownTerms), [undefined, undefined, undefined],
+        "parser: a search of filler words only has no unknown word (the standard list, as on main)");
+
+      const krans = ["Grini Hjemmebakeri Fixture", "Flatøy Hjemmebakeri Fixture", "Torgrim Hansen Bakeri Fixture", "Baker Walderhaug Fixture",
+        "Mandelbakeren Fixture", "Ringbakeriet Fixture"];
+      const vil = await search("jeg vil ha kransekake");
+      assertTrue(JSON.stringify(namesIn(vil)) === JSON.stringify(krans) && vil.includes("— fant 6 produsenter:") && !vil.includes("Villsau"),
+        `lokal_search «jeg vil ha kransekake» (review repro): the six kransekake producers, not the villsau producer (got ${JSON.stringify(namesIn(vil))})`);
+      const dag = await search("kransekake i dag");
+      assertTrue(JSON.stringify(namesIn(dag)) === JSON.stringify(krans) && !dag.includes("Dagens fangst"),
+        `lokal_search «kransekake i dag» (review repro): the six kransekake producers, not «Dagens fangst» (got ${JSON.stringify(namesIn(dag))})`);
+      const nullText = "🔎 Ingen produsent har «zzzqqx» i produktlista eller i navnet, så søket gir ingen treff. "
+        + "Prøv et annet ord, en kategori (for eksempel «bakervarer» eller «honning») eller et produsentnavn. / "
+        + "No producer lists «zzzqqx» as a product or has it in its name, so there are no matches. "
+        + "Try another word, a category (for example «bakery» or «honey») or a producer name.";
+      assertEq([await search("beste zzzqqx"), await search("zzzqqx i dag")], [nullText, nullText],
+        "lokal_search «beste zzzqqx» and «zzzqqx i dag» (review repro): the honest null answer, not «Bestemors flatbrød» or «Dagens fangst»");
+      const area = await search("god zzzqqx i Bærum");
+      assertTrue(area.startsWith("🔎 Ingen produsent i området har «zzzqqx» i produktlista.")
+        && area.includes("— 4 produsenter i området, ikke treff på «zzzqqx»:") && !area.includes("fant ") && namesIn(area).includes("Sandvika Bakst Fixture"),
+      `lokal_search «god zzzqqx i Bærum» (review repro): the producers in the area, the one with «Godt grovbrød» among them, said to be no matches (got ${JSON.stringify(area.slice(0, 300))})`);
+
+      // S1: SQLite's LOWER() and LIKE fold ASCII only, so «æbleskiver» finds «Æbleskiver» only through the upper-case pattern.
+      assertEq(parse("æbleskiver")._unknownTerms, ["æbleskiver"], "parser: «æbleskiver» is an unknown word");
+      assertEq(termIds(["æbleskiver"]), [KAKEBUA], "step 3c: «æbleskiver» finds «Æbleskiver 10 stk» (a name that starts with «Æ»)");
+      assertEq(namesIn(await search("æbleskiver")), ["Kakebua Fixture"], "lokal_search «æbleskiver»: the producer with «Æbleskiver 10 stk»");
+    }
   } finally {
     console.log = prevLog;
-    if (prevBaseUrl === undefined) delete process.env.BASE_URL;
-    else process.env.BASE_URL = prevBaseUrl;
-    __setGeocodingFetchForTesting();
-    __clearGeocodeCacheForTesting();
-    marketplaceRegistry._agentsCache = null;
-    if (prevDb) __setDbForTesting(prevDb as any);
+    fixtures.restore();
   }
 
   return { passed, failed, failures };

@@ -47,10 +47,13 @@ import {
   noteNameFtsQueryFailure,
 } from "./name-search-fts";
 // Integration test 2026-10-17, slice I-W: the shared Norwegian gazetteer
-// (place words) and the offers' product-name word rule. Static data and pure
-// functions (the postnummer register is a bundled file read once), no DB and
-// no network, so the same isolation rule as above holds.
-import { buildNorwegianGazetteer, detectPlaces, escapeLike, placeKey, tokenize, type PlaceGazetteer } from "./search-intent/norwegian-query";
+// (place words), the shared NO/EN stopwords and the offers' product-name
+// word rule. Static data and pure functions (the postnummer register is a
+// bundled file read once), no DB and no network, so the same isolation rule
+// as above holds.
+import {
+  buildNorwegianGazetteer, detectPlaces, escapeLike, placeKey, QUERY_STOPWORDS, tokenize, type PlaceGazetteer,
+} from "./search-intent/norwegian-query";
 import { officialPoststedFylker } from "./norway-postnummer";
 import { productNameMatch, type ProductNameMatch } from "../utils/product-name-match";
 import { isCategoryLabel } from "../utils/category-label";
@@ -1055,9 +1058,17 @@ class MarketplaceRegistry {
     } else {
       // Pass 2: No indicator word — check if query words match any agent name
       // This catches "Rørosmat", "Bjørndal", "Erga" etc.
+      // Slice I-W, review round 1: a filler word (QUERY_STOPWORDS,
+      // NO_PRODUCT_WORDS) does not make the query a name search either. Any
+      // producer name holding «vil», «dag» or «beste» did, so «jeg vil ha
+      // kransekake» was a name search for «vil ha kransekake» and never
+      // reached the product names. Over the 1 537 live producer names as
+      // queries and the 107 searches of the B1 check nothing else changes
+      // (2026-10-18); the name query, when another word triggers one, keeps
+      // its words as before.
       const nonSkipWords = queryWords
         .map(w => w.replace(/[.,!?]/g, "").toLowerCase())
-        .filter(w => w.length >= 3 && !skipWords.has(w));
+        .filter(w => w.length >= 3 && !skipWords.has(w) && !QUERY_STOPWORDS.has(w) && !NO_PRODUCT_WORDS.has(w));
 
       // PR-72: Known Norwegian place names that should NOT trigger name-search.
       // Without this list, queries like "fersk fisk i Bergen" set
@@ -2571,10 +2582,37 @@ const GENERIC_NAME_WORDS = new Set([
 
 // ── Words the parser could not read (slice I-W) ─────────────────────────
 
-/** Words that say who is searched among, not which product («produsenter i Trondheim»). */
+/**
+ * Words of a food search that name no product, in addition to the shared
+ * QUERY_STOPWORDS (search-intent/norwegian-query.ts: question words,
+ * pronouns, request verbs, praise and time words). Review round 1 of slice
+ * I-W: a word step 3c looks up only has to start a word of a product name,
+ * so a filler word let in every producer whose products start with it, shown
+ * as a product match: in the live catalogue (2026-10-18) «vil» («jeg vil ha
+ * kransekake») starts a product name at 37 producers («Villsau…»,
+ * «Villblåbær…»), «dag» at 11 («Dagssuppe»), «hjemmelaget» at 7. Pass 2 of
+ * parseNaturalQuery skips them too, so they make no name search either.
+ * Lower case; Norwegian (bokmål and nynorsk) and English.
+ */
 const NO_PRODUCT_WORDS: ReadonlySet<string> = new Set([
+  // who is searched among («produsenter i Trondheim»), and «hvem», which the shared list lacks
   "produsent", "produsenter", "matprodusent", "matprodusenter", "bonde", "bonden", "bondens",
-  "bønder", "gårder", "butikker", "utsalg", "noen", "alle", "hvilke", "hvilken", "finnes",
+  "bønder", "gårder", "butikker", "utsalg", "hvem",
+  // buying, ordering and needing
+  "kjøp", "kjøper", "kjøpes", "kjøpt", "handle", "handler", "bestill", "bestilling", "bestiller",
+  "trenger", "trengs", "skaffe", "purchase", "buying",
+  // delivery, pickup and the web shop
+  "levering", "levere", "leverer", "leveres", "levert", "hjemlevering", "frakt", "sende", "sendes",
+  "hente", "henting", "hentes", "nett", "nettet", "nettbutikk", "nettbutikken", "online", "delivery",
+  "deliver", "shipping",
+  // how or where it is made, and how good, not what it is («hjemmelaget kransekake»)
+  "hjemmelaget", "hjemmelagd", "hjemmelagde", "hjemmelagede", "hjemmelaga", "heimelaga", "heimelaget",
+  "heimelagd", "hjemmebakt", "hjemmebakte", "håndlaget", "håndlagde", "handlaga", "homemade", "handmade",
+  "norsk", "norske", "norskprodusert", "norwegian", "ekte", "egen", "egne", "eget", "eige", "eigne",
+  "deilig", "deilige", "nydelig", "nydelige", "kvalitet", "tradisjonell", "tradisjonelle", "tradisjonelt",
+  "traditional", "authentic", "quality",
+  // amounts and the word «product» itself
+  "kilo", "gram", "liter", "stk", "produkt", "produktet", "vare", "matvarer", "product", "products",
 ]);
 
 /** At most this many words of one query are looked up in the catalog. */
@@ -2582,15 +2620,15 @@ const UNKNOWN_TERMS_MAX = 4;
 
 /**
  * The words of the lower-cased query `q` that `isKnown` does not explain and
- * that are no generic name or NO_PRODUCT_WORDS word: letters (or a mix with
- * digits), three or more, in query order, once each, at most
- * UNKNOWN_TERMS_MAX.
+ * that are no generic name, shared stopword (QUERY_STOPWORDS) or
+ * NO_PRODUCT_WORDS word: letters (or a mix with digits), three or more, in
+ * query order, once each, at most UNKNOWN_TERMS_MAX.
  */
 function unknownProductWords(q: string, isKnown: (w: string) => boolean): string[] {
   const out: string[] = [];
   for (const w of q.split(/[^\p{L}\p{N}]+/u)) {
     if (w.length < 3 || /^\p{N}+$/u.test(w) || out.includes(w)) continue;
-    if (isKnown(w) || GENERIC_NAME_WORDS.has(w) || NO_PRODUCT_WORDS.has(w)) continue;
+    if (isKnown(w) || GENERIC_NAME_WORDS.has(w) || QUERY_STOPWORDS.has(w) || NO_PRODUCT_WORDS.has(w)) continue;
     out.push(w);
     if (out.length === UNKNOWN_TERMS_MAX) break;
   }

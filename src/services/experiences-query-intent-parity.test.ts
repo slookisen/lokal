@@ -13,7 +13,10 @@
  *          that table moved from towns to real kommuner (dev-request
  *          2026-10-17-integrasjonstest-oppfolging, AI-2); the parser is the same;
  *   p4     normalizeExperienceCategory() likewise;
- *   p5     the module imports only norway-fylke and experience-store, never a
+ *   p5     the module imports only norway-fylke, experience-store and
+ *          search-intent/norwegian-query (which QUERY_STOPWORDS moved to,
+ *          unchanged, in slice I-W of 2026-10-17-integrasjonstest-oppfolging;
+ *          it imports only norway-fylke and norway-postnummer), never a
  *          route, so it cannot form an import cycle.
  *
  * Standalone: npx tsx src/services/experiences-query-intent-parity.test.ts
@@ -134,7 +137,8 @@ export function runExperiencesQueryIntentParityTests(opts: { log?: boolean } = {
 
     const src = fs.readFileSync(require.resolve("./experiences-query-intent"), "utf8");
     const specifiers = [...src.matchAll(/(?:from\s+|require\()\s*"([^"]+)"/g)].map((m) => m[1]);
-    assertEq([...new Set(specifiers)].sort(), ["./experience-store", "./norway-fylke"], "p5: the module imports only norway-fylke and experience-store");
+    assertEq([...new Set(specifiers)].sort(), ["./experience-store", "./norway-fylke", "./search-intent/norwegian-query"],
+      "p5: the module imports only norway-fylke, experience-store and search-intent/norwegian-query");
   } catch (err: any) {
     failed++;
     failures.push("experiences-query-intent-parity: unexpected error: " + String(err?.stack || err?.message || err));

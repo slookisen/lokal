@@ -42798,7 +42798,8 @@ runSerial(async () => {
 // so when nothing matches («zzzqqx») instead of listing the standard list;
 // the category key is the platform's «bakery» (the old «bread» still matches);
 // place words come from the shared gazetteer («kransekake i Bærum» is no name
-// search). The test sets answer as main did (tests/fixtures/rfb-sok-i-w-main.json).
+// search); filler words («vil», «dag», «beste») are never looked up (review
+// round 1). The test sets answer as main did (tests/fixtures/rfb-sok-i-w-main.json).
 // Own in-memory DBs (restored in finally), runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W (RFB search: unknown words, bakery, place words) ──");
