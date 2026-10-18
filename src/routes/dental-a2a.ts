@@ -235,16 +235,18 @@ export function dentalAnswerProfileIds(answer: unknown): string[] {
 }
 
 /**
- * The org.nr a message asks about: nine digits in a row, or 3+3+3 with a
- * space between the groups, as Brønnøysundregistrene print it
- * («912 345 678»; I-X, FUNN dental-a2a-orgnr-med-mellomrom). The digits
- * in a row are looked for first, as before. Eight digits (a phone number,
- * also «22 33 44 55» or «912 34 567») and a postnummer are no org.nr.
+ * The org.nr a message asks about: nine digits in a row, or 3+3+3 with one
+ * whitespace character (also no-break space) between the groups, as
+ * Brønnøysundregistrene print it («912 345 678»; I-X, FUNN
+ * dental-a2a-orgnr-med-mellomrom). The digits in a row are looked for
+ * first, as before. Eight digits (a phone number, also «22 33 44 55» or
+ * «912 34 567») and a postnummer are no org.nr, and nor are three groups
+ * inside a longer spaced number («123 912 345 678», «kr 1 234 567 890»).
  */
 function orgNrIn(text: string): string | null {
   const plain = text.match(/\b(\d{9})\b/);
   if (plain) return plain[1]!;
-  const spaced = text.match(/\b(\d{3})\s(\d{3})\s(\d{3})\b/);
+  const spaced = text.match(/(?<!\d\s)\b(\d{3})\s(\d{3})\s(\d{3})\b(?!\s\d)/);
   return spaced ? spaced[1]! + spaced[2]! + spaced[3]! : null;
 }
 

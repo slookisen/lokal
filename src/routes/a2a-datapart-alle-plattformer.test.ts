@@ -17,7 +17,8 @@
  *   D   Finn-tannlege: a DataPart gives message.data's answer (filter, count,
  *       total) and its AI-lookup count; message.data and text keep their
  *       precedence. «912 345 678» finds the same clinic as «912345678»;
- *       eight digits and a postnummer do not ask for tannlege_info.
+ *       eight digits, a postnummer and three groups inside a longer spaced
+ *       number («123 912 345 678») do not ask for tannlege_info.
  *   O   Opplevagent: the same for discover, and the gårdssalg origin
  *       (lat/lng) sent next to text.
  *   R   RFB: a DataPart is Mode 2 like message.data (same answer, same
@@ -453,6 +454,15 @@ export async function runA2aDatapartAllePlattformerTests(opts: { log?: boolean }
       }
       assertEq(asDental({ parts: [textPart(`${DENTAL_ORGNR} eller 923 456 789`)] }).result?.metadata?.org_nr, DENTAL_ORGNR,
         "D10 nine digits in a row are read first, as before");
+      for (const t of ["123 912 345 678", "912 345 678 9", "1 912 345 678", "kr 1 234 567 890", "kr 1 234 567 890"]) {
+        assertEq(asDental({ parts: [textPart(t)] }).result?.metadata?.skill, "tannlege_search",
+          `D11 «${t}»: three groups inside a longer spaced number are no org.nr: a search, not tannlege_info`);
+      }
+      for (const t of ["912 345 678", "org.nr 912 345 678", "912 345 678.", "(912 345 678)", "912 345 678"]) {
+        const r = asDental({ parts: [textPart(t)] });
+        assertEq([r.result?.metadata, r.result?.artifacts?.[0]?.parts?.[0]?.data?.id], [{ skill: "tannlege_info", org_nr: DENTAL_ORGNR }, fx.osloClinicId],
+          `D11 «${t}» still finds Oslo Sentrum Tann`);
+      }
     }
 
     // ══ O  Opplevagent ═══════════════════════════════════════════════════
