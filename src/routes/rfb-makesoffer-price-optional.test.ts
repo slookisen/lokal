@@ -15,7 +15,13 @@
  * (S1) the inner Offer carries no return/shipping terms. Since S6 del A of the
  * same dev-request a price comes from the product NAME only when "kr" names
  * it, and the name is cut only then (splitNamePrice; unit tests (d), live
- * names on the NO and EN page (e)).
+ * names on the NO and EN page (e)). Since S6 del B a priced product is an
+ * Offer from the farm with exactly @type, name, price and priceCurrency, and
+ * the page has no Product node (productNodes); (e) also renders the same
+ * fixtures in rollback mode (PRODUCER_PAGE_PRODUCT_NODES true), where the
+ * Product form comes back with the same names and prices, and the HTML
+ * outside the ld+json blocks is byte-identical in both modes (SQL RANDOM()
+ * is a constant in this suite's DB).
  *
  * Same synthetic router.handle()-less harness as
  * rfb-trust-score-public-display-removed.test.ts (own `Database(":memory:")`,
@@ -43,7 +49,7 @@
  */
 
 import Database from "better-sqlite3";
-import { jsonLdBlocks, offersWithoutPrice, forbiddenNodes } from "../../tests/helpers/jsonld-invariants";
+import { jsonLdBlocks, offersWithoutPrice, forbiddenNodes, productNodes } from "../../tests/helpers/jsonld-invariants";
 
 export interface TestSummary {
   passed: number;
@@ -75,6 +81,7 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
 
   const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../database/init") as
     typeof import("../database/init");
+  const policy = require("../services/structured-data-policy") as typeof import("../services/structured-data-policy");
 
   const prevDb = (() => {
     try { return getDb(); } catch { return undefined; }
@@ -83,6 +90,10 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
+  // (e) compares two renders of a page byte for byte. Related producers
+  // (seo.ts getRelatedBySameCity/getRelatedBySameCategory) break ties with SQL
+  // RANDOM(), so it is a constant in this suite's own DB.
+  testDb.function("random", () => 0);
 
   function seedAgent(row: { id: string; name: string; city?: string | null; lat?: number | null; lng?: number | null }): void {
     testDb.prepare(
@@ -158,9 +169,24 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       return null;
     }
 
+    /** The page with each ld+json block replaced by a marker: the HTML outside the JSON-LD, block positions included. */
+    const outsideJsonLd = (body: string): string =>
+      body.replace(/<script type="application\/ld\+json">[\s\S]*?<\/script>/g, "<!--ld+json-->");
+    /** null when a === b, else the first differing offset with the text around it on both sides. */
+    function firstDiff(a: string, b: string): string | null {
+      if (a === b) return null;
+      let i = 0;
+      while (i < a.length && i < b.length && a[i] === b[i]) i++;
+      const around = (s: string): string => JSON.stringify(s.slice(Math.max(0, i - 60), i + 60));
+      return `offset ${i} of ${a.length}/${b.length}: ${around(a)} vs ${around(b)}`;
+    }
+
     // ══════════════════════════════════════════════════════════════
-    // (a) Clean numeric price -> unchanged has-price behavior
-    // (regression guard for the existing path).
+    // (a) Clean numeric price -> one priced Offer (regression guard for the
+    // existing path). dev-request
+    // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+    // (S6 del B): an Offer from the farm, exactly name, price and currency,
+    // no Product (policy rule 7). The Product form is the rollback mode.
     // ══════════════════════════════════════════════════════════════
     {
       seedAgent({ id: "priced-gard", name: "Priset Gaard", city: "Oslo", lat: 59.91, lng: 10.75 });
@@ -171,27 +197,44 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       assertTrue(r.status === 200, "priced: renders 200");
       const ld = extractMakesOfferJsonLd(r.body);
       assertTrue(!!ld, "priced: a JSON-LD block with makesOffer is present");
-      assertTrue(ld.makesOffer.length === 1, "priced: makesOffer has exactly one entry");
-      const offer = ld.makesOffer[0];
-      const inner = offer.itemOffered.offers;
+      assertSame(ld?.makesOffer, [{ "@type": "Offer", "name": "Lammelår", "price": 275, "priceCurrency": "NOK" }],
+        "priced: makesOffer is exactly one Offer {@type, name, price, priceCurrency} (no Product, availability, seller or brand)");
+      const blocks = jsonLdBlocks(r.body);
+      assertSame(productNodes(blocks), [], "priced: productNodes is [] (no Product node anywhere)");
+      assertSame(offersWithoutPrice(blocks), 0, "priced: offersWithoutPrice is 0");
+      assertSame(forbiddenNodes(blocks), [], "priced: no forbidden rating/review/return/shipping node anywhere");
 
-      assertTrue(offer["@type"] === "Offer", "priced: outer @type is Offer");
-      assertTrue(offer.price === 275, "priced: outer price is the parsed numeric value (275)");
-      assertTrue(offer.priceCurrency === "NOK", "priced: outer priceCurrency is NOK");
-      assertTrue(offer.availability === "https://schema.org/InStock", "priced: outer availability is InStock");
+      // Rollback mode: the Product form as before S6 del B.
+      let rb: { status: number; body: string } = { status: 0, body: "" };
+      try {
+        policy.__setProducerPageProductNodesForTesting(true);
+        rb = invoke("/produsent/:slug", { params: { slug: "priset-gaard" }, lang: "no", ip: "127.0.0.1" });
+      } finally {
+        policy.__setProducerPageProductNodesForTesting(null);
+      }
+      assertTrue(rb.status === 200, "priced rollback: renders 200");
+      const rbLd = extractMakesOfferJsonLd(rb.body);
+      assertTrue(!!rbLd && rbLd.makesOffer.length === 1, "priced rollback: makesOffer has exactly one entry");
+      const offer = rbLd?.makesOffer?.[0] || {};
+      const inner = offer.itemOffered?.offers || {};
 
-      assertTrue(offer.itemOffered["@type"] === "Product", "priced: itemOffered @type is Product");
-      assertTrue(offer.itemOffered.name === "Lammelår", "priced: itemOffered.name is unchanged");
-      assertTrue(inner["@type"] === "Offer", "priced: inner offers @type is Offer");
-      assertTrue(inner.price === 275, "priced: inner offers.price is the parsed numeric value (275)");
-      assertTrue(inner.priceCurrency === "NOK", "priced: inner offers.priceCurrency is NOK");
-      assertTrue(inner.availability === "https://schema.org/InStock", "priced: inner offers.availability is InStock");
-      assertTrue(inner.seller && inner.seller["@type"] === "LocalBusiness", "priced: inner offers.seller is still present");
+      assertTrue(offer["@type"] === "Offer", "priced rollback: outer @type is Offer");
+      assertTrue(offer.price === 275, "priced rollback: outer price is the parsed numeric value (275)");
+      assertTrue(offer.priceCurrency === "NOK", "priced rollback: outer priceCurrency is NOK");
+      assertTrue(offer.availability === "https://schema.org/InStock", "priced rollback: outer availability is InStock");
+
+      assertTrue(offer.itemOffered?.["@type"] === "Product", "priced rollback: itemOffered @type is Product");
+      assertTrue(offer.itemOffered?.name === "Lammelår", "priced rollback: itemOffered.name is unchanged");
+      assertTrue(inner["@type"] === "Offer", "priced rollback: inner offers @type is Offer");
+      assertTrue(inner.price === 275, "priced rollback: inner offers.price is the parsed numeric value (275)");
+      assertTrue(inner.priceCurrency === "NOK", "priced rollback: inner offers.priceCurrency is NOK");
+      assertTrue(inner.availability === "https://schema.org/InStock", "priced rollback: inner offers.availability is InStock");
+      assertTrue(inner.seller && inner.seller["@type"] === "LocalBusiness", "priced rollback: inner offers.seller is still present");
       // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
       // (S1): WO-17's fixed return/shipping terms are gone (no per-producer policy).
-      assertTrue(!("hasMerchantReturnPolicy" in inner), "priced: inner offers has no hasMerchantReturnPolicy");
-      assertTrue(!("shippingDetails" in inner), "priced: inner offers has no shippingDetails");
-      assertTrue(forbiddenNodes(jsonLdBlocks(r.body)).length === 0, "priced: no forbidden rating/review/return/shipping node anywhere");
+      assertTrue(!("hasMerchantReturnPolicy" in inner), "priced rollback: inner offers has no hasMerchantReturnPolicy");
+      assertTrue(!("shippingDetails" in inner), "priced rollback: inner offers has no shippingDetails");
+      assertTrue(forbiddenNodes(jsonLdBlocks(rb.body)).length === 0, "priced rollback: no forbidden rating/review/return/shipping node anywhere");
     }
 
     // Permanent invariant (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx):
@@ -244,10 +287,11 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       const r = invoke("/produsent/:slug", { params: { slug: "blandet-gaard" }, lang: "no", ip: "127.0.0.1" });
       const ld = mainLd(r.body);
       assertTrue(Array.isArray(ld.makesOffer) && ld.makesOffer.length === 2, "mixed: only the two validly priced products in makesOffer");
-      const names = ld.makesOffer.map((o: any) => o.itemOffered.name);
+      // S6 del B: the Offer names the product itself (no itemOffered).
+      const names = ld.makesOffer.map((o: any) => o.name);
       assertTrue(names.includes("Lammelår") && names.includes("Pølse"), "mixed: priced names present");
-      const pol = ld.makesOffer.find((o: any) => o.itemOffered.name === "Pølse");
-      assertTrue(pol.price === 1200.5 && pol.itemOffered.offers.price === 1200.5, "mixed: Norwegian 1.200,50 parsed as 1200.5");
+      const pol = ld.makesOffer.find((o: any) => o.name === "Pølse");
+      assertTrue(pol?.price === 1200.5, "mixed: Norwegian 1.200,50 parsed as 1200.5");
       const cat = ld.hasOfferCatalog.itemListElement.map((i: any) => i.name);
       assertTrue(cat.length === 2 && cat.includes("Ost") && cat.includes("Skinke"), "mixed: Ost + range-priced Skinke go to the catalog");
       assertTrue(offersWithoutPrice(allJsonLd(r.body)) === 0, "invariant: mixed page has no Offer without price");
@@ -358,7 +402,10 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
     // shows, no name is cut without a price, and each name-only Thing is its
     // row's visible name. Rows and JSON-LD are matched by order (the first 20
     // products, Things skipped), since on EN «Honning - kr. 150» is the Offer
-    // «Honey» while the row keeps the whole name.
+    // «Honey» while the row keeps the whole name. S6 del B: each Offer has
+    // exactly @type, name, price and priceCurrency and the page has no Product
+    // node; in rollback mode the same names and prices come back as Products,
+    // and the rest of the page is byte for byte the same.
     // ══════════════════════════════════════════════════════════════
     {
       type Row = { name: string; price?: string; want: [string, number] | null };
@@ -420,6 +467,7 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
       }
       resetRegistryCache();
 
+      const OFFER_KEYS = ["@type", "name", "price", "priceCurrency"];
       for (const f of FIXTURES) {
         for (const lang of ["no", "en"] as const) {
           const tag = `S6 ${f.slug} (${lang})`;
@@ -433,14 +481,16 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
           const wantOffers = f.rows.filter((x) => x.want).map((x) => [productLabel(x.want![0], lang), x.want![1]]);
           const wantThings = f.rows.filter((x) => !x.want).map((x) => productLabel(x.name, lang));
 
-          assertSame(offers.map((o) => [o.itemOffered?.name, o.price]), wantOffers, `${tag}: makesOffer names and prices`);
-          assertTrue(offers.every((o) => o.itemOffered?.offers?.price === o.price), `${tag}: Product.offers.price is the Offer price`);
+          assertSame(offers.map((o) => [o.name, o.price]), wantOffers, `${tag}: makesOffer names and prices`);
+          assertTrue(offers.every((o) => JSON.stringify(Object.keys(o)) === JSON.stringify(OFFER_KEYS) && o["@type"] === "Offer" && o.priceCurrency === "NOK"),
+            `${tag}: each Offer has exactly @type, name, price and priceCurrency (NOK)`);
+          assertSame(productNodes(blocks), [], `${tag}: productNodes is [] (no Product node)`);
           assertTrue(wantOffers.length > 0 || !("makesOffer" in (ld || {})), `${tag}: no makesOffer when nothing is priced`);
           assertSame(things.map((x) => x.name), wantThings, `${tag}: the catalog Things are the whole names`);
           if (lang === "en") {
             for (const [no, en] of [["Honning", "Honey"], ["Pølse", "Sausage"], ["Kjøtt (lam)", "Meat (lamb)"]]) {
               if (!f.rows.some((x) => x.want?.[0] === no)) continue;
-              const names = offers.map((o) => o.itemOffered?.name);
+              const names = offers.map((o) => o.name);
               assertTrue(names.includes(en) && !names.includes(no), `${tag}: the cut name ${JSON.stringify(no)} is translated (${JSON.stringify(en)})`);
             }
           }
@@ -455,14 +505,53 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
           assertTrue(offers.every((o, i) => !!pricedRows[i] && digits(`${pricedRows[i].name} ${pricedRows[i].price}`).includes(digits(String(o.price)))),
             `${tag}: each JSON-LD price's digits stand in its row`);
           assertSame(things.map((x) => x.name), unpricedRows.map((x) => x.name), `${tag}: each Thing.name is its row's visible name`);
-          assertTrue([...offers.map((o) => String(o.itemOffered?.name)), ...things.map((x) => String(x.name))].every(balanced),
+          assertTrue([...offers.map((o) => String(o.name)), ...things.map((x) => String(x.name))].every(balanced),
             `${tag}: no JSON-LD name has an unbalanced parenthesis (every source name is balanced)`);
           if (lang === "no") {
-            assertTrue(offers.every((o, i) => !!pricedRows[i] && pricedRows[i].name.startsWith(String(o.itemOffered?.name).replace(/\)+$/, ""))),
+            assertTrue(offers.every((o, i) => !!pricedRows[i] && pricedRows[i].name.startsWith(String(o.name).replace(/\)+$/, ""))),
               `${tag}: each Offer name, less a parenthesis the cut closed, starts its row's name`);
           }
           assertSame(offersWithoutPrice(blocks), 0, `${tag}: offersWithoutPrice stays 0`);
           assertSame(forbiddenNodes(blocks), [], `${tag}: no forbidden rating/review/return/shipping node`);
+
+          // Rollback mode (PRODUCER_PAGE_PRODUCT_NODES = true): the Product
+          // form, with the same names and prices as the Offers above, so no
+          // Product for an unpriced name such as «Sesonggrønnsaker (40-50
+          // sorter)», and the catalog is the same.
+          let rb: { status: number; body: string } = { status: 0, body: "" };
+          try {
+            policy.__setProducerPageProductNodesForTesting(true);
+            rb = invoke("/produsent/:slug", { params: { slug: f.slug }, lang, ip: "127.0.0.1" });
+          } finally {
+            policy.__setProducerPageProductNodesForTesting(null);
+          }
+          const rbBlocks = jsonLdBlocks(rb.body);
+          const rbLd = mainLd(rb.body);
+          const rbOffers: any[] = Array.isArray(rbLd?.makesOffer) ? rbLd.makesOffer : [];
+          assertSame(rbOffers.map((o) => [o.itemOffered?.name, o.price]), wantOffers, `${tag} rollback: Product names and prices are the Offers' above`);
+          assertTrue(rbOffers.every((o) => o.itemOffered?.["@type"] === "Product" && o.itemOffered?.offers?.price === o.price),
+            `${tag} rollback: each Offer wraps a Product whose offers.price is the Offer price`);
+          assertSame(productNodes(rbBlocks), rbOffers.map((_, i) => `$[0].makesOffer[${i}].itemOffered`), `${tag} rollback: productNodes finds exactly those Products`);
+          assertTrue(rbOffers.every((o) => balanced(String(o.itemOffered?.name))), `${tag} rollback: no Product name has an unbalanced parenthesis`);
+          assertSame((rbLd?.hasOfferCatalog?.itemListElement || []).map((x: any) => x.name), wantThings, `${tag} rollback: the catalog Things are the same`);
+          assertSame(offersWithoutPrice(rbBlocks), 0, `${tag} rollback: offersWithoutPrice stays 0`);
+          assertSame(forbiddenNodes(rbBlocks), [], `${tag} rollback: no forbidden node`);
+
+          // S6 del B changes the JSON-LD only. Rollback mode renders the page
+          // as on main (rfb-seo-feiltypede-knowledge-felt.test.ts holds main's
+          // golden), so this is the before/after check: with the ld+json
+          // blocks cut out, the two pages are byte for byte the same (rows,
+          // prices, FAQ, related producers). With nothing priced the whole
+          // page is.
+          const again = invoke("/produsent/:slug", { params: { slug: f.slug }, lang, ip: "127.0.0.1" });
+          assertSame(firstDiff(again.body, r.body), null, `${tag}: two renders in the same mode are byte-identical (RANDOM() fixed)`);
+          const cut = outsideJsonLd(r.body);
+          assertTrue(blocks.length > 0 && cut.split("<!--ld+json-->").length - 1 === blocks.length && !cut.includes("application/ld+json")
+            && cut.includes(`<div class="prod-item">`) && cut.includes(`class="rp-card"`),
+            `${tag}: the HTML outside the JSON-LD has every ld+json block cut, the product rows and the related producers`);
+          assertSame(firstDiff(cut, outsideJsonLd(rb.body)), null, `${tag}: the HTML outside the ld+json blocks is byte-identical in rollback mode (main)`);
+          if (wantOffers.length) assertTrue(r.body !== rb.body, `${tag}: the two modes differ, in the JSON-LD only`);
+          else assertSame(firstDiff(r.body, rb.body), null, `${tag}: with nothing priced the whole page is byte-identical in rollback mode`);
         }
       }
     }
@@ -507,6 +596,7 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
     failed++;
     failures.push(`rfb-makesoffer-price-optional: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   } finally {
+    policy.__setProducerPageProductNodesForTesting(null);
     if (prevDb) __setDbForTesting(prevDb);
     try {
       const regModCleanup = require("../services/marketplace-registry");
