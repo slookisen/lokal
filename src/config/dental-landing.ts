@@ -43,8 +43,9 @@ export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   // /personvern handler); a test keeps the two equal.
   "/personvern": "2026-10-13",
   // The /vilkar handler prints this as its own «Sist oppdatert» (F2-S5, A2A
-  // dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon); the day
-  // the draft text was written. Daniel approves the text before merge.
+  // dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon). It is the
+  // day the terms take effect: set it to the day Daniel approves the text and
+  // merges, even if the text is unchanged since the draft of 2026-10-18.
   "/vilkar": "2026-10-18",
   "/proveniens": "2026-07-25",
 };

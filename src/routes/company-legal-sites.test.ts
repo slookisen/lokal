@@ -392,6 +392,13 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
         check(en.includes(eng), `F2-S5 /vilkar EN: ${what}`, eng);
       }
       check(!["kontakt@rettfrabonden.com", "kontakt@opplevagent.no"].some((e) => vilkar.body.includes(e)), "F2-S5 /vilkar: no other site's contact e-mail");
+      // Pkt. 7 and 11 in each language link the site's own address, read from
+      // BRAND_ENTITIES.dental.supportEmail (not a second copy in the handler).
+      const MAILTO = `href="mailto:${BRAND_ENTITIES.dental.supportEmail}"`;
+      for (const [lang, section] of [["NO", nb], ["EN", en]] as const) {
+        const links = section.match(/href="mailto:[^"]*"/g) || [];
+        check(links.length === 2 && links.every((l) => l === MAILTO), `F2-S5 /vilkar ${lang}: both e-mail links are BRAND_ENTITIES.dental.supportEmail`, links.join(", "));
+      }
       // F2-S1's acceptance grep, on the page content: none of the sources the
       // code does not use (the footer's «Datakilder» column is F2-S1's).
       const unused = main.match(/HPR|Helsepersonellregister|helsedirektoratet|ntf\.no|tannlegeforening/gi) || [];

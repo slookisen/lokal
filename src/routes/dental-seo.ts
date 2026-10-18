@@ -2636,8 +2636,9 @@ router.get("/personvern", (_req: Request, res: Response) => {
 // new legal text, merged by Daniel only after he has read it (merge_guard
 // needs_daniel). Bilingual in one page like /proveniens (NO section, then the
 // EN section under #en). Every alias carries the one canonical, /vilkar.
-// The operator line is companyOperatorSentence() and the FINN.no sentence is
-// BRAND_ENTITIES.dental.disambiguation, so neither is written here. No street
+// The operator line is companyOperatorSentence(), the FINN.no sentence is
+// BRAND_ENTITIES.dental.disambiguation and the e-mail address is
+// BRAND_ENTITIES.dental.supportEmail, so none of them is written here. No street
 // address (company-legal.ts: /kontakt and /personvern only). The page names
 // no data source of its own: /proveniens says which sources are used.
 // «Sist oppdatert» is the page's sitemap text date, so the two cannot drift.
@@ -2645,6 +2646,7 @@ router.get("/personvern", (_req: Request, res: Response) => {
 
 router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, res: Response) => {
   const updatedDate = DENTAL_STATIC_PAGE_DATES["/vilkar"];
+  const email = escapeHtml(BRAND_ENTITIES.dental.supportEmail);
   const html = `
 <main>
   <div class="content-page">
@@ -2683,7 +2685,7 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
     </ul>
 
     <h2>7. For klinikker: retting og fjerning</h2>
-    <p>Er opplysningene om en klinikk feil, kan klinikken be om at de rettes, eller at oppføringen fjernes, ved å skrive til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> eller bruke <a href="/kontakt">kontaktskjemaet</a>. Rettighetene etter personvernreglene står i <a href="/personvern">personvernerklæringen</a>.</p>
+    <p>Er opplysningene om en klinikk feil, kan klinikken be om at de rettes, eller at oppføringen fjernes, ved å skrive til <a href="mailto:${email}">${email}</a> eller bruke <a href="/kontakt">kontaktskjemaet</a>. Rettighetene etter personvernreglene står i <a href="/personvern">personvernerklæringen</a>.</p>
 
     <h2>8. Ansvar</h2>
     <p>Finn-tannlege.com er ikke part i avtaler mellom deg og klinikken, og er ikke ansvarlig for behandling, timebestilling, priser eller annet mellom deg og klinikken. Så langt loven tillater det, er vi ikke ansvarlige for tap som følge av feil, mangler eller forsinkelser i opplysningene eller i tjenesten.</p>
@@ -2695,7 +2697,7 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
     <p>Norsk rett gjelder. Tvister løses ved selskapets alminnelige verneting, med mindre ufravikelig lov gir deg rett til å bringe saken inn et annet sted.</p>
 
     <h2>11. Kontakt</h2>
-    <p>Spørsmål om vilkårene sender du til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Selskapsopplysningene står på <a href="/kontakt">kontaktsiden</a>.</p>
+    <p>Spørsmål om vilkårene sender du til <a href="mailto:${email}">${email}</a>. Selskapsopplysningene står på <a href="/kontakt">kontaktsiden</a>.</p>
 
     <hr style="margin:36px 0;border:none;border-top:1px solid var(--g100,#e5e7eb)">
 
@@ -2734,7 +2736,7 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
     </ul>
 
     <h2>7. For clinics: corrections and removal</h2>
-    <p>If the information about a clinic is wrong, the clinic can ask for it to be corrected, or for the listing to be removed, by writing to <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> or using <a href="/kontakt">the contact form</a>. Rights under data protection law are set out in <a href="/personvern">the privacy policy</a>.</p>
+    <p>If the information about a clinic is wrong, the clinic can ask for it to be corrected, or for the listing to be removed, by writing to <a href="mailto:${email}">${email}</a> or using <a href="/kontakt">the contact form</a>. Rights under data protection law are set out in <a href="/personvern">the privacy policy</a>.</p>
 
     <h2>8. Liability</h2>
     <p>Finn-tannlege.com is not a party to agreements between you and the clinic, and is not responsible for treatment, appointments, prices or anything else between you and the clinic. To the extent the law allows, we are not liable for loss caused by errors, omissions or delays in the information or in the service.</p>
@@ -2746,7 +2748,7 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
     <p>Norwegian law applies. Disputes are resolved at the company's ordinary venue, unless mandatory law gives you the right to bring the case elsewhere.</p>
 
     <h2>11. Contact</h2>
-    <p>Send questions about these terms to <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. The company details are on <a href="/en/kontakt">the contact page</a>.</p>
+    <p>Send questions about these terms to <a href="mailto:${email}">${email}</a>. The company details are on <a href="/en/kontakt">the contact page</a>.</p>
     </div>
   </div>
 </main>`;
