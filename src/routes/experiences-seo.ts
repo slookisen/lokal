@@ -269,7 +269,7 @@ import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-p
 // normalisation the parser itself already applies to location_hint, instead
 // of re-implementing it here.
 import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 
 const router = Router();
 
@@ -9061,7 +9061,10 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const gpsOrigin = parseGeoOriginFromQuery(req.query);
   let originLat: number | undefined = gpsOrigin?.lat;
   let originLng: number | undefined = gpsOrigin?.lng;
-  const typedPlace = String(req.query.sted ?? "").trim();
+  // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): a place name,
+  // cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts) before the
+  // geocoder and the page read it.
+  const typedPlace = capName(String(req.query.sted ?? "").trim());
   let placeNotFound = false;
   if ((originLat === undefined || originLng === undefined) && typedPlace) {
     try {

@@ -63,7 +63,7 @@ import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { a2aMessageData } from "../utils/a2a-message";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -305,8 +305,11 @@ export function handleExperiencesMessageSend(
     const data = a2aMessageData(message);
     if (data && typeof data === "object") {
       const d = data as Record<string, unknown>;
-      if (typeof d.fylke === "string") filter.fylke = d.fylke;
-      if (typeof d.kommune === "string") filter.kommune = d.kommune;
+      // Slice I-Y2: the data's strings are cut to MAX_FREE_TEXT_CHARS
+      // (utils/a2a-message.ts), and the place names to MAX_NAME_CHARS
+      // (utils/free-text.ts), as in discover_experiences.
+      if (typeof d.fylke === "string") filter.fylke = capName(d.fylke);
+      if (typeof d.kommune === "string") filter.kommune = capName(d.kommune);
       if (typeof d.category === "string") filter.category = d.category;
       if (d.indoor_outdoor === "indoor" || d.indoor_outdoor === "outdoor" || d.indoor_outdoor === "both") {
         filter.indoor_outdoor = d.indoor_outdoor;

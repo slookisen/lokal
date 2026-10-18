@@ -47,7 +47,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { maskEmail } from "../services/gardssalg-claim";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
-import { capFreeText } from "../utils/free-text";
+import { capFreeText, capName } from "../utils/free-text";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
@@ -1404,7 +1404,10 @@ router.get("/stats", (_req: Request, res: Response) => {
 // this endpoint over HTTP. The HTTP-MCP server (src/routes/mcp.ts) calls
 // the geocodingService directly without going through this endpoint.
 router.get("/geocode", async (req: Request, res: Response) => {
-  const place = (req.query.place || req.query.q || "").toString().trim();
+  // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): a place name,
+  // cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts), as
+  // lokal_geocode does; the answer echoes it.
+  const place = capName((req.query.place || req.query.q || "").toString().trim());
   if (!place) {
     res.status(400).json({ success: false, error: "Missing 'place' query parameter" });
     return;
@@ -4171,9 +4174,21 @@ function normalizeName(name: string): string {
     .replace(/\s+/g, " ");
 }
 
+/**
+ * The matrix cells levenshtein() has filled since the process started (slice
+ * I-Y2): the test reads the work of one /find-match call from it, not the
+ * clock.
+ */
+let levenshteinCells = 0;
+/** Test-only: levenshteinCells (see there). */
+export function __levenshteinCellsForTesting(): number {
+  return levenshteinCells;
+}
+
 // Simple Levenshtein distance for name similarity
 function levenshtein(a: string, b: string): number {
   const m = a.length, n = b.length;
+  levenshteinCells += m * n;
   const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
   for (let i = 0; i <= m; i++) dp[i][0] = i;
   for (let j = 0; j <= n; j++) dp[0][j] = j;
@@ -4197,8 +4212,15 @@ function similarityScore(a: string, b: string): number {
 // Used by the seller registration page to show "Is this you?"
 
 router.get("/find-match", (req: Request, res: Response) => {
-  const name = (req.query.name as string || "").trim();
-  const city = (req.query.city as string || "").trim();
+  // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+  // rfb-find-match-levenshtein-uten-tak): the name is cut to MAX_NAME_CHARS at
+  // a word boundary (utils/free-text.ts) before any matching. The edit
+  // distance below runs over the whole name for every producer, so a 2000
+  // character name took about 4 s and a 15 000 one, within the 16 kB header
+  // limit, about 30 s. Every real name is shorter than the cap. The city is
+  // a place field and is cut the same way; the answer echoes both as read.
+  const name = capName((req.query.name as string || "").trim());
+  const city = capName((req.query.city as string || "").trim());
 
   if (!name || name.length < 2) {
     res.json({ success: true, matches: [] });
