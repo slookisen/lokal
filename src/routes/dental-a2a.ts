@@ -46,6 +46,7 @@ import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
+import { a2aMessageData } from "../utils/a2a-message";
 
 const router = Router();
 
@@ -202,7 +203,8 @@ function hasFilter(filter: unknown): boolean {
 function a2aRequestCountable(req: Request, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
-  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  // A DataPart counts as message.data (I-X, utils/a2a-message.ts).
+  const data = a2aMessageData(message);
   const meta = buildRequestMeta(req);
   return a2aLookupCountable({
     vertical: "dental",
@@ -232,6 +234,22 @@ export function dentalAnswerProfileIds(answer: unknown): string[] {
   return ids;
 }
 
+/**
+ * The org.nr a message asks about: nine digits in a row, or 3+3+3 with one
+ * whitespace character (also no-break space) between the groups, as
+ * Brønnøysundregistrene print it («912 345 678»; I-X, FUNN
+ * dental-a2a-orgnr-med-mellomrom). The digits in a row are looked for
+ * first, as before. Eight digits (a phone number, also «22 33 44 55» or
+ * «912 34 567») and a postnummer are no org.nr, and nor are three groups
+ * inside a longer spaced number («123 912 345 678», «kr 1 234 567 890»).
+ */
+function orgNrIn(text: string): string | null {
+  const plain = text.match(/\b(\d{9})\b/);
+  if (plain) return plain[1]!;
+  const spaced = text.match(/(?<!\d\s)\b(\d{3})\s(\d{3})\s(\d{3})\b(?!\s\d)/);
+  return spaced ? spaced[1]! + spaced[2]! + spaced[3]! : null;
+}
+
 // ─── message/send handler (exported for unit tests) ──────────
 
 export function handleDentalMessageSend(
@@ -245,14 +263,15 @@ export function handleDentalMessageSend(
     return rpcErr(id, -32602, "Invalid params: 'message' required");
   }
 
-  // Structured search (message.data); free text is planned in the search branch below.
+  // Structured search (message.data, or the first standard DataPart: I-X,
+  // utils/a2a-message.ts); free text is planned in the search branch below.
   const messageText = extractText(message);
   let searchParams: DentalSearchParams = {};
 
   if (!messageText && message && typeof message === "object") {
-    const m = message as Record<string, unknown>;
-    if (m.data && typeof m.data === "object") {
-      const d = m.data as Record<string, unknown>;
+    const data = a2aMessageData(message);
+    if (data && typeof data === "object") {
+      const d = data as Record<string, unknown>;
       if (typeof d.fylke === "string") searchParams.fylke = d.fylke;
       if (typeof d.specialty === "string") searchParams.specialty = d.specialty;
       if (d.helfo_agreement === "true" || d.helfo_agreement === "false") {
@@ -295,11 +314,11 @@ export function handleDentalMessageSend(
     }
   }
 
-  // Special intent: single clinic by org_nr
-  const orgMatch = lowerText.match(/\b(\d{9})\b/);
-  if (orgMatch) {
+  // Special intent: single clinic by org_nr (also «912 345 678», orgNrIn)
+  const orgNr = orgNrIn(lowerText);
+  if (orgNr) {
     try {
-      const found = getDentalAgentByOrgnr(orgMatch[1]!);
+      const found = getDentalAgentByOrgnr(orgNr);
       // The synthetic schema-probe row (org_nr 999999999) is not a clinic.
       const clinic = found && !isDentalSyntheticProbeId(found.id) ? found : null;
       if (!clinic) {
@@ -310,10 +329,10 @@ export function handleDentalMessageSend(
             {
               artifactId: "clinic",
               name: "dental-clinic",
-              parts: [{ kind: "text", text: `Ingen klinikk funnet med orgnr ${orgMatch[1]}` }],
+              parts: [{ kind: "text", text: `Ingen klinikk funnet med orgnr ${orgNr}` }],
             },
           ],
-          metadata: { skill: "tannlege_info", org_nr: orgMatch[1] },
+          metadata: { skill: "tannlege_info", org_nr: orgNr },
         });
       }
       return rpcOk(id, {
@@ -327,7 +346,7 @@ export function handleDentalMessageSend(
             parts: [{ kind: "data", data: toDentalA2aClinic(clinic) }],
           },
         ],
-        metadata: { skill: "tannlege_info", org_nr: orgMatch[1] },
+        metadata: { skill: "tannlege_info", org_nr: orgNr },
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

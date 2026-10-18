@@ -24,6 +24,7 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
+import { a2aMessageData } from "../utils/a2a-message";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -233,7 +234,8 @@ router.post("/a2a", (req: Request, res: Response) => {
 //
 // Two modes:
 //   1. Natural language: { message: { text: "finn grønnsaker..." } }
-//   2. Structured:       { message: { data: { categories: [...] } } }
+//   2. Structured:       { message: { data: { categories: [...] } } }, or the
+//      standard DataPart { message: { parts: [{ kind: "data", data: {...} }] } }
 //
 // Returns a task with results (or "working" status for async).
 
@@ -285,14 +287,17 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   };
 
   const messageText = extractText(message);
+  // message.data, or the first standard DataPart (dev-request 2026-10-17-
+  // integrasjonstest-oppfolging, I-X: utils/a2a-message.ts).
+  const messageData = a2aMessageData(message);
 
   // Mode 1: Natural language search (flat text, parts array, or string)
   if (messageText) {
     discoveryQuery = marketplaceRegistry.parseNaturalQuery(messageText);
   }
   // Mode 2: Structured discovery query
-  else if (message.data) {
-    discoveryQuery = message.data;
+  else if (messageData) {
+    discoveryQuery = messageData;
   }
   // Mode 3: Treat entire params as query
   else {
