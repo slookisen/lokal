@@ -29,6 +29,15 @@
  *   «gave», «frokost», «stor», «jul») next to a product word brought in
  *   producers that match only them, as product matches, and could rank first.
  *   They now count only when nothing else in the search names a product.
+ * - Review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag): next to
+ *   a category word an unknown quality word («egg kortreist», «nybakt brød»)
+ *   ranked the producers with it in a product name first and labelled the
+ *   ones with the product «Kategoritreff: «kortreist» ikke oppført». The
+ *   words for how fresh, near, natural or wholesome it is are qualifier words
+ *   now, and «kortreist» a filler word, which also ends the name search for
+ *   «Kortreist Italiener» in «kortreist kransekake». Alone each word answers
+ *   as main (tests/fixtures/rfb-sok-i-w2-enkeltord-main.json, captured with
+ *   fyllordMainTexts on main 029fda76, I-W).
  *
  * Data: I-W's fixtures (rfb-sok-ukjente-ord-bakeri-sted.test.ts, I_W_SEEDS
  * and its trust scores) plus I_W2_SEEDS, in an in-memory DB with the
@@ -62,6 +71,8 @@ const FINNES = id(101), MELLOM = id(102), BONDENS_HAGE = id(103), BONDENS_KOLONI
 const HVASSER = id(111), FRUKTLAGER = id(112), LAGER11 = id(113), OSTEMAKERI = id(114), JULSETH = id(115), STORFJORD = id(116), TOMTERMAIS = id(117);
 // S1: products that only a qualifier word matches, and the products they were ranked against
 const LUNSJ = id(121), SELSKAP = id(122), GAVE = id(123), FROKOST = id(124), STORFE = id(125), JULEKAKE = id(126), SPEKE = id(127);
+// Review round 3 (FUNN): a name and products with «kortreist» or «nybakt», next to the eggs, meat and bread they qualify
+const KORTREIST_NAVN = id(131), BGO_EGG = id(132), BGO_KORTREIST = id(133), TRD_KORTREIST = id(134), TRD_KJOTT = id(135), NYBAKT = id(136);
 
 /** A producer whose knowledge products and catalog rows are the same names (and prices). */
 function seed(n: string, name: string, lat: number, lng: number, city: string, categories: string[], catalog: CatalogRow[]): Seed {
@@ -98,6 +109,16 @@ export const I_W2_SEEDS: Seed[] = [
   seed(STORFE, "Engvoll Fixture", 60.2, 11.6, "Kongsvinger", ["meat"], [{ name: "Storfekjøtt", priceNok: 250 }, { name: "Servelat", priceNok: 80 }]),
   seed(JULEKAKE, "Kakehuset Fixture", 59.92, 10.7, "Oslo", ["bakery"], [{ name: "Julekake", priceNok: 120 }, { name: "Julebrød", priceNok: 90 }]),
   seed(SPEKE, "Spekeloftet Fixture", 61.5, 9.9, "Vinstra", ["meat"], [{ name: "Spekepølse av lam", priceNok: 120 }]),
+
+  // Review round 3 (FUNN), after the live «Osteverkstedet — Kortreist Italiener» and Lofseik Gård («Rotgrønnsaker
+  // (kortreist)»): next to «egg», «kjøtt» or «brød» the producer with the quality word in a product name ranked
+  // first, and the ones with the product were labelled «Kategoritreff: «…» ikke oppført».
+  seed(KORTREIST_NAVN, "Kortreist Italiener Fixture", 59.74, 10.21, "Drammen", ["dairy"], [{ name: "Mozzarella", priceNok: 89 }]),
+  seed(BGO_EGG, "Fanahaugen Gård Fixture", 60.33, 5.36, "Bergen", ["eggs"], [{ name: "Egg fra frittgående høner", priceNok: 60 }]),
+  seed(BGO_KORTREIST, "Åsane Andelsgard Fixture", 60.46, 5.33, "Bergen", ["vegetables", "eggs"], [{ name: "Rotgrønnsaker (kortreist)", priceNok: 45 }]),
+  seed(TRD_KORTREIST, "Gaulosen Gårdsslakt Fixture", 63.4, 10.33, "Trondheim", ["meat"], [{ name: "Kortreist lammekjøtt", priceNok: 320 }]),
+  seed(TRD_KJOTT, "Leinstrand Gård Fixture", 63.38, 10.3, "Trondheim", ["meat"], [{ name: "Svinekjøtt", priceNok: 190 }]),
+  seed(NYBAKT, "Bakarstova Fixture", 60.63, 6.41, "Voss", ["bakery"], [{ name: "Nybakt brød", priceNok: 55 }]),
 ];
 
 /** The noise producers rank above the producers with the product on relevance alone. */
@@ -109,6 +130,12 @@ const I_W2_TRUST: Array<[string, number]> = [
 export const S2_QUERIES: readonly string[] = ["Finnes", "Mellom", "Bondens", "Godt", "Norsk", "Topp"];
 
 const MAIN_TEXTS_FIXTURE = path.join(__dirname, "../../tests/fixtures/rfb-sok-i-w2-main.json");
+
+/** Review round 3: a search of one quality word, one for each way it is read (a name, no match, a product). */
+export const ALONE_QUERIES: readonly string[] = ["kortreist", "kortreiste", "nybakt"];
+
+/** main's lokal_search texts for ALONE_QUERIES: fyllordMainTexts(ALONE_QUERIES) on main 029fda76 (I-W). */
+const ALONE_TEXTS_FIXTURE = path.join(__dirname, "../../tests/fixtures/rfb-sok-i-w2-enkeltord-main.json");
 
 /** I-W's fixtures and I_W2_SEEDS, with the trust scores above. */
 function enterI_W2Fixtures(): ReturnType<typeof enterFixtures> {
@@ -155,7 +182,7 @@ export async function runRfbSokFyllordNavnekapringTests(opts: { log?: boolean } 
   }
 
   // S2 first: fyllordMainTexts opens (and closes) its own DB.
-  const texts = await fyllordMainTexts();
+  const texts = await fyllordMainTexts([...S2_QUERIES, ...ALONE_QUERIES]);
 
   const fixtures = enterI_W2Fixtures();
   const { marketplaceRegistry } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
@@ -235,6 +262,8 @@ export async function runRfbSokFyllordNavnekapringTests(opts: { log?: boolean } 
         "parser: a word inside a name still names when no other word is a place, a category or a product («zzzqqx»)");
       assertEq(parse("Grini kransekake til jul")._nameQuery, "Grini kransekake jul",
         "parser: a whole word of a name («Grini») keeps the name search even when the search also has a word only inside a name («jul») and a product");
+      assertEq(parse("Ostemakeri kransekake til jul")._nameQuery, "Ostemakeri kransekake jul",
+        "parser: of two name words one that names is enough: «Ostemakeri» (a whole word of a name) does, «jul» (only inside «Julseth») does not");
       assertEq([parse("jul i Bærum")._nameQuery, parse("jul i Bærum")._unknownTerms], [undefined, ["jul"]],
         "parser: a word inside a name («Julseth») names nobody next to a place word");
       assertEq([parse("Lager 11 Fixture")._nameQuery, parse("Hvasser Reke og Fisk Fixture")._nameQuery, parse("Lager 11")._nameQuery],
@@ -342,10 +371,72 @@ export async function runRfbSokFyllordNavnekapringTests(opts: { log?: boolean } 
       assertEq([parse("gave jul lunsj frokost selskap stor")._unknownTerms, parse("gave jul lunsj frokost selskap stor kransekake")._unknownTerms],
         [["gave", "jul", "lunsj", "frokost"], ["kransekake"]],
         "six qualifier words give the first 4 (UNKNOWN_TERMS_MAX); a product word after them is the one word looked up");
+      assertEq([...discover("gave jul lunsj frokost selskap stor")].sort(), [LUNSJ, GAVE, FROKOST, JULEKAKE].sort(),
+        "discover: those 4 words bring in their producers; «selskap» and «stor», after the cap, bring in neither «Selskapsmeny» nor «Storfekjøtt»");
       assertEq([parse("brød til frokost").categories, parse("brød til frokost")._unknownTerms], [["bakery"], undefined],
         "next to a category word a qualifier word is no unknown word («brød til frokost»)");
+      assertEq((await search("brød til lunsj")).replace("\"brød til lunsj\"", "\"brød\""), await search("brød"),
+        "lokal_search «brød til lunsj»: the answer of «brød»; «lunsj» neither ranks the bakery with «Frukost og lunsj» first nor labels the rest");
       assertEq([parse("kransekake bryllup")._unknownTerms, discover("kransekake bryllup")[0]], [["kransekake", "bryllup"], FLATOY],
         "«bryllup» names a product («Kransekake bryllup»), so it stays a word to look up, as in I-W");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag):
+    // «kortreist» and the other words for how fresh, near, natural or wholesome
+    // ══════════════════════════════════════════════════════════════
+    {
+      // Next to a category word: the answer of the category word alone, as on I-W, with the producers that list
+      // the product as explicit hits and no label for the quality word
+      const alike: Array<[string, string, string]> = [
+        ["egg kortreist", "egg", "kortreist"],
+        ["kortreist egg i Bergen", "egg i Bergen", "kortreist"],
+        ["kortreist kjøtt i Trondheim", "kjøtt i Trondheim", "kortreist"],
+        ["nybakt brød", "brød", "nybakt"],
+      ];
+      for (const [q, base, word] of alike) {
+        const text = await search(q);
+        assertEq([parse(q)._unknownTerms, text.includes(`«${word}»`), text.replace(`"${q}"`, `"${base}"`) === await search(base)], [undefined, false, true],
+          `«${q}» (acceptance criterion): «${word}» is no unknown word, labels no producer, and lokal_search gives the answer of «${base}»`);
+      }
+      const eggs = await search("egg kortreist");
+      assertTrue(["Bærum Gårdsmat Fixture", "Fanahaugen Gård Fixture"].every((n) => namesIn(eggs).includes(n) && !eggs.includes(`${n} — Kategoritreff`))
+        && eggs.includes("Åsane Andelsgard Fixture — Kategoritreff / category-only: «egg» ikke oppført"),
+      "lokal_search «egg kortreist»: the farms with eggs in their product list are explicit hits; the one with only «Rotgrønnsaker (kortreist)» is labelled for «egg»");
+      const meat = await search("kortreist kjøtt i Trondheim");
+      assertTrue(["Gaulosen Gårdsslakt Fixture", "Leinstrand Gård Fixture"].every((n) => namesIn(meat).includes(n) && !meat.includes(`${n} — Kategoritreff`)),
+        "lokal_search «kortreist kjøtt i Trondheim»: both meat farms are explicit hits, also the one without «Kortreist» in a product name");
+      const honey = await search("lokal honning");
+      assertEq([parse("lokal honning").tags, parse("lokal honning")._productTerms, parse("lokal honning")._unknownTerms, honey.includes("«lokal»"),
+        namesIn(honey).includes("TønsbergBier Fixture")], [["local"], ["honning"], undefined, false, true],
+      "«lokal honning» (acceptance criterion): «lokal» is a tag word, never an unknown word, and labels no producer");
+
+      // Next to a product word: the product's producers, not a name search for «Kortreist Italiener Fixture»
+      for (const q of ["kortreist kransekake", "Jeg vil ha kortreist kransekake"]) {
+        assertEq([parse(q)._nameQuery, parse(q)._unknownTerms, namesIn(await search(q))], [undefined, ["kransekake"], KRANS_NAMES],
+          `«${q}»: «kortreist» is a filler word, so no name search for «Kortreist Italiener Fixture»; the kransekake producers, Grini first`);
+      }
+      assertEq([parse("kortreist i Trondheim")._nameQuery, (await search("kortreist i Trondheim")).replace("\"kortreist i Trondheim\"", "\"produsenter i Trondheim\""),
+        parse("Kortreist Italiener")._nameQuery], [undefined, await search("produsenter i Trondheim"), "Kortreist Italiener"],
+      "«kortreist i Trondheim»: the producers in Trondheim, as «produsenter i Trondheim»; the name with a word that is no filler is still a name search");
+
+      // The quality words of this round: next to a category or a product word none is an unknown word; alone each is
+      // read as on main, looked up in the product names, or for «ren» (inside «Mandelbakeren Fixture») a name search
+      const words = ["nybakt", "nybakte", "frisk", "friske", "kortreiste", "gårdsprodusert", "gårdsproduserte", "småskala", "homegrown", "naturlig",
+        "naturlige", "natural", "ren", "rene", "pure", "sunn", "sunne", "sunt", "healthy"];
+      const aloneAsMain = (w: string) => w === "ren" ? parse(w)._nameQuery === w : JSON.stringify(parse(w)._unknownTerms) === JSON.stringify([w]);
+      assertEq(words.filter((w) => parse(`egg ${w}`)._unknownTerms !== undefined || JSON.stringify(parse(`${w} kransekake`)._unknownTerms) !== "[\"kransekake\"]"
+        || !aloneAsMain(w)), [],
+      "«egg <word>» has no unknown word, «<word> kransekake» only «kransekake», and «<word>» alone is read as on main (QUALIFIER_WORDS, not NO_PRODUCT_WORDS)");
+
+      // Alone, byte for byte as main (I-W): a name search, the honest no-match answer, and the product
+      const alone = JSON.parse(fs.readFileSync(ALONE_TEXTS_FIXTURE, "utf8")) as Record<string, string>;
+      for (const q of ALONE_QUERIES) {
+        assertTrue(texts[q] === alone[q], `«${q}» alone (acceptance criterion): lokal_search answers byte for byte as main`);
+      }
+      assertEq([namesIn(alone.kortreist), alone.kortreiste.startsWith("🔎 Ingen produsent har «kortreiste»"), namesIn(alone.nybakt)],
+        [["Kortreist Italiener Fixture"], true, ["Bakarstova Fixture"]],
+        "setup: on main «kortreist» finds the producer with it in the name, «kortreiste» nothing, «nybakt» the producer with «Nybakt brød»");
     }
   } finally {
     console.log = prevLog;

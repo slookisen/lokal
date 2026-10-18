@@ -2677,6 +2677,19 @@ const NO_PRODUCT_WORDS: ReadonlySet<string> = new Set([
   "make", "makes", "making",
   // «hvor får jeg tak i kransekake», «… i nærheten av Bergen»
   "tak", "nærheten",
+  // Slice I-W2, review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag):
+  // «kortreist», the platform's own word for what every producer here sells.
+  // Next to a category word it ranked the one producer with it in a product
+  // name first and labelled the rest «Kategoritreff: «kortreist» ikke
+  // oppført» («egg kortreist»: Lofseik Gård first, the farms with eggs
+  // labelled). No product name in the live catalogue (2026-10-17) starts
+  // with it; one has it as a label, «Rotgrønnsaker (kortreist)». It is a
+  // whole word of the producer name «Osteverkstedet — Kortreist Italiener»,
+  // so Pass 2 made «kortreist kransekake» and «kortreist i Trondheim» name
+  // searches for that producer alone (main too). As a filler word Pass 2
+  // skips it, and alone it still makes that name search (a search of filler
+  // words only is read by main's rule). «kortreiste» is in QUALIFIER_WORDS.
+  "kortreist",
 ]);
 
 /**
@@ -2693,6 +2706,8 @@ const NO_PRODUCT_WORDS: ReadonlySet<string> = new Set([
  * A list, not «the word with the fewest producers is the product»: «frokost»
  * starts a product name at 4 live producers and «syltetøy» at 48, so that
  * rule would answer «syltetøy til frokost» with breakfast and no jam.
+ * Review round 3: also how fresh, near, natural or wholesome it is (the
+ * last group below).
  */
 const QUALIFIER_WORDS: ReadonlySet<string> = new Set([
   // occasion
@@ -2710,6 +2725,22 @@ const QUALIFIER_WORDS: ReadonlySet<string> = new Set([
   "boks", "bokser", "pakke", "pakker", "pakning", "eske", "esker", "pose", "poser", "box", "pack", "package",
   // price and offer
   "tilbud", "tilbudet", "rabatt", "salg", "offer", "discount",
+  // Review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag): how
+  // fresh, near, natural or wholesome it is. Next to a category word such a
+  // word ranked the producers with it in a product name first and labelled
+  // the rest «Kategoritreff: «…» ikke oppført» («nybakt brød»: the bakeries
+  // without «Nybakt brød»). Here, not in NO_PRODUCT_WORDS: in the live
+  // catalogue (2026-10-17) product names start with «nybakt» («Nybakt
+  // brød», 3 producers), «frisk» («Friske urter», 2) and «naturlig»
+  // («Naturlige såper», «Naturlig kosmetikk», 3), and a search of one such
+  // word keeps main's answer: those products, a name search («ren», «sunn»
+  // sit inside many names) or the honest no-match answer («kortreiste»,
+  // «sunt»), where a NO_PRODUCT_WORDS word alone gives the standard list.
+  // Not here: «rein» (reindeer, «Reinkjøtt»); «lokal», «fersk», «økologisk»,
+  // «local», «fresh», «organic» and their forms, which are tag words
+  // (tagMap) and never unknown words; and «kortreist», in NO_PRODUCT_WORDS.
+  "nybakt", "nybakte", "frisk", "friske", "kortreiste", "gårdsprodusert", "gårdsproduserte", "småskala",
+  "homegrown", "naturlig", "naturlige", "natural", "ren", "rene", "pure", "sunn", "sunne", "sunt", "healthy",
 ]);
 
 /** At most this many words of one query are looked up in the catalog. */
