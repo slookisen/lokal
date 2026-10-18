@@ -22,7 +22,7 @@
  */
 
 import { MAX_TEXT_TERMS, MAX_TEXT_TERM_LENGTH, type DiscoverFilter } from "./experience-store";
-import { QUERY_STOPWORDS } from "./search-intent/norwegian-query";
+import { PLACE_PREPOSITIONS, QUERY_STOPWORDS } from "./search-intent/norwegian-query";
 import {
   __FYLKE_INTERNAL,
   NON_KOMMUNE_REGION_LABELS,
@@ -257,8 +257,10 @@ export type QuerySeason = "winter" | "summer" | "spring" | "autumn";
 export type QueryWeather = "rain" | "snow" | "clear";
 export type QueryIndoorOutdoor = "indoor" | "outdoor";
 
-/** A word right before an ambiguous place name that marks it as a place ("i Moss", "in Moss"). */
-export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på", "ved", "nær", "near", "around", "rundt"]);
+// PLACE_PREPOSITIONS moved, unchanged, to search-intent/norwegian-query.ts
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W4), so the
+// RFB search reads the same list; imported above and re-exported here.
+export { PLACE_PREPOSITIONS };
 
 /**
  * Gazetteer names (CITY_TO_FYLKE_RAW) that are also everyday words. They are

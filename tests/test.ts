@@ -42992,6 +42992,35 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W4 (found live
+// 2026-10-18, P1): a filler word (QUERY_STOPWORDS, NO_PRODUCT_WORDS,
+// QUALIFIER_WORDS, the nynorsk question words) is no place unless a place
+// preposition stands right before it or it is the whole search. Kartverket
+// knows «Finnes» as a village, so «Finnes det kransekake» searched 15 km
+// around it; the geocoder no longer looks such a word up alone, and
+// isPlaceWord/placeWordsIn read «nå», «time» and «feiring» as places only
+// where the search says so. Next to a category word, a place right after a
+// place preposition is no part of a producer name in Pass 1 («… bakeri med
+// kransekake i Bærum» finds Grini). «Finnes», «i Finnes» and the other places
+// answer as main (tests/fixtures/rfb-sok-i-w4-main.json), and the geocoder's
+// requests are main's without the filler words alone, for I-Y2's texts too.
+// Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W4 (RFB search: filler words are no places) ──");
+  try {
+    const { runRfbSokFyllordIkkeStedTests } = require("../src/routes/rfb-sok-fyllord-ikke-sted.test") as
+      typeof import("../src/routes/rfb-sok-fyllord-ikke-sted.test");
+    const r = await runRfbSokFyllordIkkeStedTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-fyllord-ikke-sted: " + f);
+    console.log(`  rfb-sok-fyllord-ikke-sted: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-fyllord-ikke-sted: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no

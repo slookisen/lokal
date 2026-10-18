@@ -12,6 +12,7 @@
 
 import { getDb } from "../database/init";
 import { MAX_NAME_CHARS } from "../utils/free-text";
+import { isFillerNoPlaceAt } from "./search-intent/rfb-filler-words";
 
 export interface GeoResult {
   lat: number;
@@ -908,6 +909,8 @@ class GeocodingService {
    * Extract location words from a search query and try to geocode them.
    * Returns the first successful geocode result.
    * Tries multi-word combos first ("mo i rana"), then single words.
+   * Slice I-W4: a filler word alone («Finnes», «nå») is tried only right
+   * after a place preposition («i Finnes») or as the whole search.
    */
   async extractAndGeocode(query: string): Promise<GeoResult | null> {
     const q = query.toLowerCase().replace(/[?!.,]/g, "").trim();
@@ -939,7 +942,19 @@ class GeocodingService {
     ]);
 
     // Slice I-Y2: the first MAX_GEOCODE_WORDS words (see there).
-    const words = q.split(/\s+/).filter(w => w.length >= 2).slice(0, MAX_GEOCODE_WORDS);
+    // Slice I-W4: and which of them are filler words that name no place where
+    // they stand (isFillerNoPlaceAt, search-intent/rfb-filler-words.ts).
+    // Kartverket knows «Finnes» as a village, so «Finnes det kransekake»
+    // searched 15 km around it, and «… i Bærum» never reached Bærum. Read on
+    // every word of the search, also the «i» that `words` leaves out.
+    const tokens = q.split(/\s+/);
+    const words: string[] = [];
+    const noPlace = new Set<number>();
+    for (let i = 0; i < tokens.length && words.length < MAX_GEOCODE_WORDS; i++) {
+      if (tokens[i].length < 2) continue;
+      if (isFillerNoPlaceAt(tokens, i)) noPlace.add(words.length);
+      words.push(tokens[i]);
+    }
 
     // Try 3-word combos first (e.g. "mo i rana")
     for (let i = 0; i < words.length - 2; i++) {
@@ -959,10 +974,12 @@ class GeocodingService {
       }
     }
 
-    // Try single words (skip known food/preposition terms)
-    for (const word of words) {
-      if (skipWords.has(word)) continue;
-      const result = await this.geocode(word);
+    // Try single words (skip known food/preposition terms, and slice I-W4's
+    // filler words above; the runs of two and three words are tried as
+    // before, since Kartverket takes a run only by its full official name)
+    for (let i = 0; i < words.length; i++) {
+      if (skipWords.has(words[i]) || noPlace.has(i)) continue;
+      const result = await this.geocode(words[i]);
       if (result) return result;
     }
 
