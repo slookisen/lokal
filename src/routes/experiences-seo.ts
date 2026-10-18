@@ -430,7 +430,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
     gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
     gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
-    gsMeta: (navn: string, sted: string) => `Besøk ${navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`,
+    gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — produsentprofil på Opplevagent med fakta om produsenten.`,
   };
   const en: typeof no = {
     skip: "Skip to content", crumbs: "Breadcrumbs", crumbsGs: "Breadcrumbs", home: "Home",
@@ -451,7 +451,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
     gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
     gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
-    gsMeta: (navn: string, sted: string) => `Visit ${navn}${sted ? " in " + sted : ""} — book a tasting or tour directly with the producer on Opplevagent.`,
+    gsMeta: (navn: string, sted: string) => `${navn}${sted ? " in " + sted : ""} — producer profile on Opplevagent with facts about the producer.`,
   };
   const sv: typeof no = {
     skip: "Hoppa till innehållet", crumbs: "Brödsmulor", crumbsGs: "Brödsmulor", home: "Startsidan",
@@ -472,7 +472,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
     gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
     gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
-    gsMeta: (navn: string, sted: string) => `Besök ${navn}${sted ? " i " + sted : ""} — boka en provsmakning eller visning direkt hos producenten på Opplevagent.`,
+    gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — producentprofil på Opplevagent med fakta om producenten.`,
   };
   if (lang === "en") return en;
   if (lang === "sv") return sv;
@@ -2686,7 +2686,8 @@ function buildExperiencesSitemapXml(): string {
   const today = new Date().toISOString().slice(0, 10);
   const paths: Array<{ p: string; freq: string; pri: string }> = [
     { p: "/", freq: "daily", pri: "1.0" },
-    { p: "/en", freq: "daily", pri: "0.9" },
+    // /en only while the EN flag is on (same flag as hreflang / EN toggle).
+    ...(isOpplevagentLangSwitcherEnabled() ? [{ p: "/en", freq: "daily", pri: "0.9" }] : []),
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
     // S4 (dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering):
     // the /for-tilbydere provider-onboarding page is indexable and statically
