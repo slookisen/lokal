@@ -18,6 +18,14 @@
  * the whole name per producer, and a place field (`near`, `place`, `sted`,
  * `fylke`, `kommune`, `region`) goes to the geocoder, a LIKE or a filter and
  * is echoed in the answer.
+ *
+ * Slice I-Y3 (FUNN rfb-discover-lister-uten-tak): a list of names is cut
+ * too (capNameList). MCP lokal_discover and POST /api/marketplace/discover
+ * sent their lists (`categories`, `tags`, and the route's `skills`) whole to
+ * discover(), which compares every entry with every producer's: 175 000
+ * categories took 45 s on live-like data, and one category of 1 MB 6.1 s.
+ * I-Y2 already cut A2A's lists so (utils/a2a-message.ts); the cut now lives
+ * here, shared by all three.
  */
 
 /**
@@ -81,4 +89,29 @@ export function capName(text: string): string;
 export function capName(text: string | undefined): string | undefined;
 export function capName(text: string | undefined): string | undefined {
   return text === undefined ? undefined : cutAtWordBoundary(text, MAX_NAME_CHARS);
+}
+
+/**
+ * The most entries of a list of names a handler reads: RFB's `categories`,
+ * `tags` and `skills`, each entry compared with every producer's. The
+ * platform has 12 categories (PLATFORM_CATEGORIES in
+ * services/search-enrich.ts), and a real list names a few.
+ */
+export const MAX_NAME_LIST_ITEMS = 50;
+
+/**
+ * A list's first MAX_NAME_LIST_ITEMS entries, each string a name cut by
+ * capName. Any other entry is kept as it is, for the caller's validation to
+ * judge. A list within the caps is returned as the same list, so a real
+ * search reads exactly as before, and an optional list that was not sent
+ * stays undefined.
+ */
+export function capNameList(list: string[]): string[];
+export function capNameList(list: string[] | undefined): string[] | undefined;
+export function capNameList(list: unknown[]): unknown[];
+export function capNameList(list: unknown[] | undefined): unknown[] | undefined {
+  if (list === undefined) return undefined;
+  const kept = list.length > MAX_NAME_LIST_ITEMS ? list.slice(0, MAX_NAME_LIST_ITEMS) : list;
+  const cut = kept.map((v) => (typeof v === "string" ? capName(v) : v));
+  return kept === list && cut.every((v, i) => v === list[i]) ? list : cut;
 }

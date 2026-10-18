@@ -17,6 +17,7 @@ import {
   REGION_TO_KOMMUNER,
 } from "../norway-fylke";
 import { kommuner2024, officialPoststedFylker, officialPoststedKommuner } from "../norway-postnummer";
+import type { NorwegianSearchAreas, SearchArea } from "../../config/norway-search-areas";
 
 /** NFC + Unicode-aware lower case (folds Æ/Ø/Å, unlike SQLite's LOWER()). */
 export function normalize(text: string): string {
@@ -124,6 +125,17 @@ export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * A word right before an ambiguous place name that marks it as a place ("i Moss", "in Moss").
+ *
+ * Shared: moved here unchanged from experiences-query-intent.ts (which
+ * re-exports it) in dev-request 2026-10-17-integrasjonstest-oppfolging,
+ * slice I-W4, where the RFB search reads it too: a filler word is a place
+ * there only right after one of these («i Finnes») or as the whole search
+ * (search-intent/rfb-filler-words.ts).
+ */
+export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på", "ved", "nær", "near", "around", "rundt"]);
+
+/**
  * Fold a place name for lookup: lower case, æ/ø/å as ae/oe/aa, then only
  * letters and digits. "Bodø", "BODØ" and the ASCII spelling "Bodoe" that some
  * stored rows carry all fold to "bodoe"; "Aurskog-Høland" and "Aurskog
@@ -150,7 +162,7 @@ function placeKeys(name: string): [exact: string, ascii?: string] {
   return ascii !== exact && ascii.length >= 4 ? [exact, ascii] : [exact];
 }
 
-export type PlaceKind = "poststed" | "kommune" | "region" | "fylke";
+export type PlaceKind = "poststed" | "kommune" | "region" | "fylke" | "landsdel" | "byomrade";
 
 /** Place names by placeKey() (plus ASCII aliases). Built by buildPlaceGazetteer(); never read from a DB here. */
 export interface PlaceGazetteer {
@@ -162,15 +174,23 @@ export interface PlaceGazetteer {
   regioner: ReadonlyMap<string, string>;
   /** placeKey -> canonical 2024 fylke ("Hordaland" -> "Vestland"). */
   fylker: ReadonlyMap<string, string>;
+  /**
+   * placeKey of a name or alias -> a landsdel ("Vestlandet") or a byområde
+   * ("Osloområdet") and the places it covers (dev-request
+   * 2026-10-17-dental-d3-rettelser, D3f). Empty unless the builder was given
+   * areas (config/norway-search-areas.ts).
+   */
+  landsdeler: ReadonlyMap<string, SearchArea>;
+  byomrader: ReadonlyMap<string, SearchArea>;
   /** Longest entry, in tokens. */
   maxWords: number;
 }
 
 export interface PlaceMatch {
   kind: PlaceKind;
-  /** Display name (kommune/region/fylke) or the most common stored poststed spelling. */
+  /** Display name (kommune/region/fylke/area) or the most common stored poststed spelling. */
   name: string;
-  /** Stored spellings for a poststed; [name] otherwise. */
+  /** Stored spellings for a poststed; the fylker of a landsdel; the kommuner of a byområde; [name] otherwise. */
   values: readonly string[];
   /** The phrase as the user typed it (tokens joined by spaces). */
   phrase: string;
@@ -183,6 +203,8 @@ export function buildPlaceGazetteer(input: {
   kommuner?: Iterable<string>;
   regioner?: Iterable<string>;
   fylker?: Iterable<readonly [name: string, canonical: string]>;
+  landsdeler?: Iterable<SearchArea>;
+  byomrader?: Iterable<SearchArea>;
 }): PlaceGazetteer {
   let maxWords = 1;
   const seen = (name: string) => {
@@ -204,8 +226,8 @@ export function buildPlaceGazetteer(input: {
     const [k, ascii] = placeKeys(stored);
     if (ascii && !poststeder.has(ascii)) poststeder.set(ascii, poststeder.get(k)!);
   }
-  const named = (entries: ReadonlyArray<readonly [name: string, value: string]>) => {
-    const m = new Map<string, string>();
+  const named = <V>(entries: ReadonlyArray<readonly [name: string, value: V]>) => {
+    const m = new Map<string, V>();
     for (const [name, value] of entries) {
       const k = placeKey(name);
       if (k && !m.has(k)) m.set(k, value);
@@ -218,11 +240,16 @@ export function buildPlaceGazetteer(input: {
     return m;
   };
   const self = (names: Iterable<string> | undefined) => [...(names ?? [])].map((n) => [n, n] as const);
+  // An area under its name and each alias.
+  const areas = (list: Iterable<SearchArea> | undefined) =>
+    [...(list ?? [])].flatMap((area) => [area.name, ...area.aliases].map((n) => [n, area] as const));
   return {
     poststeder,
     kommuner: named(self(input.kommuner)),
     regioner: named(self(input.regioner)),
     fylker: named([...(input.fylker ?? [])]),
+    landsdeler: named(areas(input.landsdeler)),
+    byomrader: named(areas(input.byomrader)),
     maxWords,
   };
 }
@@ -316,8 +343,10 @@ export function officialPlaceSpelling(spelling: string): OfficialPlaceSpelling |
  * spelling counts as a poststed only when it folds to an official poststed
  * in the bundled postnummer register, so a kommune name stored in the
  * poststed column ("Baerum", "Indre Oestfold") resolves as the kommune.
+ * `areas` (D3f, config/norway-search-areas.ts) adds landsdeler and
+ * byområder; without it the gazetteer has none, as before.
  */
-export function buildNorwegianGazetteer(poststedSpellings: Iterable<string>): PlaceGazetteer {
+export function buildNorwegianGazetteer(poststedSpellings: Iterable<string>, areas?: NorwegianSearchAreas): PlaceGazetteer {
   const officialKeys = officialFylkerByKey();
   const official: string[] = [];
   for (const s of poststedSpellings) if (officialKeys.has(placeKey(s))) official.push(s);
@@ -326,6 +355,8 @@ export function buildNorwegianGazetteer(poststedSpellings: Iterable<string>): Pl
     kommuner: kommuner2024().map((k) => k.kommune),
     regioner: [...NON_KOMMUNE_REGION_LABELS, ...Object.keys(REGION_TO_KOMMUNER)],
     fylker: norwegianFylkeNames(),
+    landsdeler: areas?.landsdeler,
+    byomrader: areas?.byomrader,
   });
 }
 
@@ -357,16 +388,18 @@ export function mergedFylkeParts(name: string): readonly string[] | null {
   return cls ? cls.slice(1) : null;
 }
 
-const KIND_ORDER: readonly PlaceKind[] = ["poststed", "kommune", "region", "fylke"];
+// The areas (D3f) come last: a real place with the same key wins over one.
+const KIND_ORDER: readonly PlaceKind[] = ["poststed", "kommune", "region", "fylke", "landsdel", "byomrade"];
 
 /**
  * Every place in `tokens`, in one pass: the longest phrase first, and for
  * equal length the leftmost, each kind tried in the order poststed, kommune,
- * region, fylke. Matches never overlap (a token belongs to at most one), so
- * the work is linear in the number of tokens. Whole tokens only, so "Tromsø"
- * is the poststed TROMSØ and never the fylke Troms. A `null` token (already
- * used by the caller, e.g. for a specialty) never takes part in a phrase; a
- * phrase made only of `notAlone` words (stopwords such as "time") is skipped.
+ * region, fylke, landsdel, byområde. Matches never overlap (a token belongs
+ * to at most one), so the work is linear in the number of tokens. Whole
+ * tokens only, so "Tromsø" is the poststed TROMSØ and never the fylke Troms.
+ * A `null` token (already used by the caller, e.g. for a specialty) never
+ * takes part in a phrase; a phrase made only of `notAlone` words (stopwords
+ * such as "time") is skipped.
  */
 export function detectPlaces(
   tokens: ReadonlyArray<string | null>,
@@ -385,7 +418,7 @@ export function detectPlaces(
       for (const kind of KIND_ORDER) {
         const hit = lookup(gazetteer, kind, k);
         if (!hit) continue;
-        out.push({ kind, name: hit[0], values: hit, phrase, start, length: len });
+        out.push({ kind, name: hit.name, values: hit.values, phrase, start, length: len });
         used.fill(true, start, start + len);
         break;
       }
@@ -394,9 +427,16 @@ export function detectPlaces(
   return out;
 }
 
-function lookup(g: PlaceGazetteer, kind: PlaceKind, k: string): readonly string[] | null {
-  if (kind === "poststed") return g.poststeder.get(k) ?? null;
+function lookup(g: PlaceGazetteer, kind: PlaceKind, k: string): { name: string; values: readonly string[] } | null {
+  if (kind === "poststed") {
+    const spellings = g.poststeder.get(k);
+    return spellings ? { name: spellings[0], values: spellings } : null;
+  }
+  if (kind === "landsdel" || kind === "byomrade") {
+    const area = (kind === "landsdel" ? g.landsdeler : g.byomrader).get(k);
+    return area ? { name: area.name, values: area.places } : null;
+  }
   const m = kind === "kommune" ? g.kommuner : kind === "region" ? g.regioner : g.fylker;
   const v = m.get(k);
-  return v ? [v] : null;
+  return v ? { name: v, values: [v] } : null;
 }

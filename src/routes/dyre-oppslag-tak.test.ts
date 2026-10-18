@@ -60,6 +60,9 @@
  *       holds the sha256 of each masked answer (stable() from I-Y), captured
  *       with b1Answers() below on main b25dfbce. B1 also runs with
  *       Date.prototype.getFullYear() a year on (Opplevagent /sok's footer).
+ *       Since slice I-W4 the geocoder's lookups are main's without the
+ *       filler words alone, checked against this fixture's hashes in
+ *       rfb-sok-fyllord-ikke-sted.test.ts.
  *       The search answers of the test sets and of I-W, I-W2 and I-X are
  *       I-Y's golden (fritekst-lengdetak-alle-plattformer.test.ts) and I-X's
  *       (a2a-datapart-alle-plattformer.test.ts), which run unchanged. A
@@ -174,8 +177,12 @@ async function bestOf3(call: () => Promise<unknown>): Promise<number> {
   return best;
 }
 
-/** `n` distinct short words no lexicon knows («w0 w1 … wz w10 …»). */
-const unknownWords = (n: number) => Array.from({ length: n }, (_, i) => "w" + i.toString(36)).join(" ");
+/**
+ * `n` distinct short words no lexicon knows («q0 q1 … qz q10 …»). Slice I-W4:
+ * «q», not «w», since «we» is a filler word, which the geocoder no longer
+ * looks up alone.
+ */
+const unknownWords = (n: number) => Array.from({ length: n }, (_, i) => "q" + i.toString(36)).join(" ");
 
 /** The RFB handlers this slice drives, in the RFB fixture. */
 function rfbHandlers(fx: Fixture) {
@@ -487,11 +494,16 @@ export async function runDyreOppslagTakTests(opts: { log?: boolean } = {}): Prom
     const main = JSON.parse(fs.readFileSync(B1_FIXTURE, "utf8")) as { answers: B1Answers };
     const now = await b1Answers();
     assertEq(Object.keys(now).sort(), Object.keys(main.answers).sort(), "B1 the fixture covers every entry");
+    // Slice I-W4: extractAndGeocode() no longer looks up a filler word alone («Finnes» in «Finnes det …»), so its
+    // requests are main's without those. rfb-sok-fyllord-ikke-sted.test.ts checks that row against main's lists,
+    // whose hashes are this fixture's.
+    const changedOnPurpose = new Set(["rfb geocoder lookups (extractAndGeocode)"]);
     let compared = 0;
     for (const [entry, byKey] of Object.entries(main.answers)) {
       for (const [key, want] of Object.entries(byKey)) {
         const got = now[entry]?.[key];
         compared++;
+        if (changedOnPurpose.has(entry)) continue;
         assertTrue(got?.sha256 === want.sha256, `B1 ${entry} ${key}: the answer is main's` +
           (got?.sha256 === want.sha256 ? "" : ` (main ${want.chars} characters, now ${got?.chars})`));
       }
@@ -506,7 +518,7 @@ export async function runDyreOppslagTakTests(opts: { log?: boolean } = {}): Prom
     } finally {
       Date.prototype.getFullYear = getFullYear;
     }
-    const moved = Object.entries(main.answers).flatMap(([entry, byKey]) =>
+    const moved = Object.entries(main.answers).filter(([entry]) => !changedOnPurpose.has(entry)).flatMap(([entry, byKey]) =>
       Object.entries(byKey).filter(([key, want]) => nextYear[entry]?.[key]?.sha256 !== want.sha256).map(([key]) => `${entry} ${key}`));
     assertEq(moved, [], "B1 with getFullYear() a year on, every answer is still main's");
   }

@@ -36161,6 +36161,24 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental profil-skrivemåte (D3d trinn 3): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3f): landsdeler
+  //    («Vestlandet», «Nord-Norge») and byområder («Osloområdet», «Stor-Oslo»,
+  //    «Tromsøya») read as their fylker or kommuner, alike in MCP, A2A and
+  //    /sok; every other query parses as before ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3f): dental regionord og byområder ──");
+  try {
+    const { runDentalSearchRegionordTests } = require("../src/routes/dental-search-regionord.test") as
+      typeof import("../src/routes/dental-search-regionord.test");
+    const dsr = await runDentalSearchRegionordTests({ log: false });
+    passed += dsr.passed;
+    failed += dsr.failed;
+    for (const f of dsr.failures) failures.push("dental regionord (D3f): " + f);
+    console.log(`  dental regionord (D3f): ${dsr.passed} passed, ${dsr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental regionord (D3f): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
   //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
   //    every 404, agents.txt API-base /api/tannlege ──
@@ -42937,6 +42955,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+// rfb-discover-lister-uten-tak, a2a-mcp-intern-feiltekst-rest and
+// rfb-a2a-strukturert-melding-totalstorrelse): MCP lokal_discover and POST
+// /api/marketplace/discover read MAX_NAME_LIST_ITEMS names of at most
+// MAX_NAME_CHARS per list, RFB A2A logs, stores and echoes a structured query
+// past MAX_A2A_QUERY_JSON_CHARS as the fields the discovery reads, and the
+// A2A and MCP answers of the three platforms hold no internal error text.
+// Real structured searches answer as main did
+// (tests/fixtures/strukturerte-lister-tak-i-y3-main.json). I-Y's fixtures
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Y3 (caps on structured-search lists, total bound, no internal error text) ──");
+  try {
+    const { runStrukturerteListerTakTests } = require("../src/routes/strukturerte-lister-tak.test") as
+      typeof import("../src/routes/strukturerte-lister-tak.test");
+    const r = await runStrukturerteListerTakTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("strukturerte-lister-tak: " + f);
+    console.log(`  strukturerte-lister-tak: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("strukturerte-lister-tak: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W2 (review of
 // lokal#1160): a search of one filler word that names producers («Finnes»,
 // «Bondens», «Norsk») answers as main did (tests/fixtures/rfb-sok-i-w2-main.json);
@@ -42989,6 +43033,35 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-sok-pass1-fyllord: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W4 (found live
+// 2026-10-18, P1): a filler word (QUERY_STOPWORDS, NO_PRODUCT_WORDS,
+// QUALIFIER_WORDS, the nynorsk question words) is no place unless a place
+// preposition stands right before it or it is the whole search. Kartverket
+// knows «Finnes» as a village, so «Finnes det kransekake» searched 15 km
+// around it; the geocoder no longer looks such a word up alone, and
+// isPlaceWord/placeWordsIn read «nå», «time» and «feiring» as places only
+// where the search says so. Next to a category word, a place right after a
+// place preposition is no part of a producer name in Pass 1 («… bakeri med
+// kransekake i Bærum» finds Grini). «Finnes», «i Finnes» and the other places
+// answer as main (tests/fixtures/rfb-sok-i-w4-main.json), and the geocoder's
+// requests are main's without the filler words alone, for I-Y2's texts too.
+// Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W4 (RFB search: filler words are no places) ──");
+  try {
+    const { runRfbSokFyllordIkkeStedTests } = require("../src/routes/rfb-sok-fyllord-ikke-sted.test") as
+      typeof import("../src/routes/rfb-sok-fyllord-ikke-sted.test");
+    const r = await runRfbSokFyllordIkkeStedTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-fyllord-ikke-sted: " + f);
+    console.log(`  rfb-sok-fyllord-ikke-sted: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-fyllord-ikke-sted: unexpected error: " + String(err?.message || err));
   }
 });
 

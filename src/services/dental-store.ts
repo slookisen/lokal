@@ -233,6 +233,8 @@ const ListFilterFieldsSchema = z.object({
   //   poststed_or_postnummer (S3b): a poststed that is also a kommune
   //                  ("Bergen"): a row matches one of the poststed's stored
   //                  spellings OR one of the kommune's postnumre.
+  //   D3f: a landsdel ("Vestlandet") sets fylke_in, and a byområde
+  //                  ("Osloområdet") the fields above for all its kommuner.
   name_terms: z.array(z.string().min(1).max(100)).min(1).max(6).optional(),
   poststed_in: PoststedInSchema.optional(),
   postnummer_in: PostnummerInSchema.optional(),

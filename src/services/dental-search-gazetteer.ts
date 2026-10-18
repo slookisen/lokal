@@ -11,7 +11,13 @@
 // Callers pass their own `listPoststeder` import. The cache is keyed on that
 // function too, so a test block with a fresh dental-store copy never reads a
 // gazetteer built from another block's database.
+//
+// The gazetteer also knows the landsdeler and byområder of
+// config/norway-search-areas.ts (dev-request 2026-10-17-dental-d3-rettelser,
+// D3f), so «tannlege på Vestlandet» or «Osloområdet» reads the same on all
+// three surfaces.
 
+import { NORWEGIAN_SEARCH_AREAS } from "../config/norway-search-areas";
 import type { PoststedRow } from "./dental-store";
 import { buildNorwegianGazetteer, type PlaceGazetteer } from "./search-intent/norwegian-query";
 
@@ -45,7 +51,7 @@ export function getCachedDentalPoststeder(listPoststeder: PoststedLister): Posts
 export function getDentalSearchGazetteer(listPoststeder: PoststedLister): PlaceGazetteer {
   const rows = getCachedDentalPoststeder(listPoststeder);
   // rows come most-common first, so each place's first spelling is its most used one.
-  return (cache!.gazetteer ??= buildNorwegianGazetteer(rows.map((r) => r.poststed)));
+  return (cache!.gazetteer ??= buildNorwegianGazetteer(rows.map((r) => r.poststed), NORWEGIAN_SEARCH_AREAS));
 }
 
 /** Test-only: drop the cache. */
