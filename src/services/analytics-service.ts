@@ -14,6 +14,7 @@ import {
 import { shouldRecordPageView } from "./page-view-definition";
 import { apiSearchQueryText, clampQueryText, isApiSearchRequest, type SearchChannel } from "./search-tracking";
 import { readSessionVelocity } from "./agent-stats-compute";
+import { buildRequestMeta, isInternalTraffic } from "./internal-traffic";
 import {
   computeAdminSummary,
   computePageViewCount,
@@ -79,10 +80,15 @@ const OWNER_UA_MARKERS_LC = [
 export function isOwnerRequest(req: Request): boolean {
   const cookieHeader = req.headers?.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
-  return isOwnerScriptUA(req.headers?.["user-agent"] || "");
+  if (isOwnerScriptUA(req.headers?.["user-agent"] || "")) return true;
+  // Slice I-Z (A2A dev-request 2026-10-17-integrasjonstest-oppfolging): also
+  // our own traffic by the conversation rules (internal-traffic.ts: a valid
+  // X-Admin-Key, internal UA markers such as «session-lane-verify»), whose
+  // page views and searches were counted as people's.
+  return isInternalTraffic(buildRequestMeta(req));
 }
 
-/** True for our own scripts' UAs (the UA half of isOwnerRequest). */
+/** True for our own scripts' UAs (OWNER_UA_MARKERS_LC; isOwnerRequest adds internal-traffic.ts's rules). */
 export function isOwnerScriptUA(userAgent: string): boolean {
   const ua = (userAgent || "").toLowerCase();
   return OWNER_UA_MARKERS_LC.some(m => ua.includes(m));

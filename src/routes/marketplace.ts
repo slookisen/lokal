@@ -48,6 +48,7 @@ import { maskEmail } from "../services/gardssalg-claim";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText } from "../utils/free-text";
+import { searchCountable } from "../services/search-tracking";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
@@ -578,23 +579,28 @@ router.post("/discover", (req: Request, res: Response) => {
   const startTime = Date.now();
   try {
     const query = DiscoveryQuerySchema.parse(req.body);
+    // Slice I-Z: our own traffic and probes get the same answer but raise no
+    // discovery counter and stay off the interactions feed (searchCountable).
+    const countable = searchCountable({ meta: buildRequestMeta(req), text: JSON.stringify(query), structured: true });
     // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
     // review finding: this route's own docstring documents `tags` as caller
     // input, but it never read discoverMeta.tagsRelaxed — a dropped tag
     // filter (step 4 of discover()) went unreported here, unlike every other
     // discover() caller. See DiscoverMeta for why the drop happens.
     const discoverMeta: DiscoverMeta = {};
-    const results = marketplaceRegistry.discover(query, discoverMeta);
+    const results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable });
     const tagsDropped = !!discoverMeta.tagsRelaxed;
 
-    interactionLogger.log("discover", {
-      query: JSON.stringify({ categories: query.categories, tags: query.tags }),
-      resultCount: results.length,
-      matchedAgentIds: results.map(r => r.agent.id),
-      metadata: { query },
-      ipAddress: req.ip,
-      durationMs: Date.now() - startTime,
-    });
+    if (countable) {
+      interactionLogger.log("discover", {
+        query: JSON.stringify({ categories: query.categories, tags: query.tags }),
+        resultCount: results.length,
+        matchedAgentIds: results.map(r => r.agent.id),
+        metadata: { query },
+        ipAddress: req.ip,
+        durationMs: Date.now() - startTime,
+      });
+    }
 
     const enrichedResults = results.map((r: any) => ({
       ...r,
@@ -764,7 +770,11 @@ router.get("/search", async (req: Request, res: Response) => {
   // short-circuits it), so without this out-param the response would keep
   // claiming geoFiltered:true for results hundreds of km outside the radius.
   const discoverMeta: DiscoverMeta = {};
-  let results = marketplaceRegistry.discover(query, discoverMeta);
+  // Slice I-Z: our own traffic and probes get the same answer but raise no
+  // discovery counter and stay off the interactions feed (searchCountable),
+  // as POST /a2a already did with its `countable`.
+  const countable = searchCountable({ meta: buildRequestMeta(req), text: q });
+  let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable });
 
   // ── Auto-expanding radius ──
   // If geo-filtered and too few results, widen the search automatically.
@@ -840,7 +850,7 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
       const expandedMeta: DiscoverMeta = {};
-      results = marketplaceRegistry.discover(expandedQuery, expandedMeta);
+      results = marketplaceRegistry.discover(expandedQuery, expandedMeta, { trackDiscovery: countable });
       appliedRadiusKm = expandedRadius;
       tagsDropped = !!expandedMeta.tagsRelaxed;
     }
@@ -856,21 +866,23 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
       const noGeoMeta: DiscoverMeta = {};
-      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta);
+      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta, { trackDiscovery: countable });
       tagsDropped = !!noGeoMeta.tagsRelaxed;
       geoDropped = true;
       appliedRadiusKm = undefined;
     }
   }
 
-  interactionLogger.log("search", {
-    query: q,
-    resultCount: results.length,
-    matchedAgentIds: results.map(r => r.agent.id),
-    metadata: { parsed, geoSource },
-    ipAddress: req.ip,
-    durationMs: Date.now() - startTime,
-  });
+  if (countable) {
+    interactionLogger.log("search", {
+      query: q,
+      resultCount: results.length,
+      matchedAgentIds: results.map(r => r.agent.id),
+      metadata: { parsed, geoSource },
+      ipAddress: req.ip,
+      durationMs: Date.now() - startTime,
+    });
+  }
 
   // Slugify for profile links
   const slug = (text: string) => text.normalize("NFC").toLowerCase()
@@ -1020,11 +1032,14 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
   const info = knowledgeService.getAgentInfo(agentId);
   const contentDisposition = vcardContentDisposition(info?.agent.name || "agent");
 
-  interactionLogger.log("view", {
-    agentId: agentId,
-    metadata: { type: "vcard_download", buyerAgent: req.headers["x-agent-id"] as string },
-    ipAddress: req.ip,
-  });
+  // Slice I-Z: not for our own traffic or a probe (searchCountable).
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId: agentId,
+      metadata: { type: "vcard_download", buyerAgent: req.headers["x-agent-id"] as string },
+      ipAddress: req.ip,
+    });
+  }
 
   res.setHeader("Content-Type", "text/vcard; charset=utf-8");
   res.setHeader("Content-Disposition", contentDisposition);
@@ -1540,12 +1555,14 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
     return;
   }
 
-  // Log the view
-  interactionLogger.log("view", {
-    agentId: agentId,
-    metadata: { type: "agent_info_request", buyerAgent: req.headers["x-agent-id"] as string },
-    ipAddress: req.ip,
-  });
+  // Log the view: not for our own traffic or a probe (slice I-Z, searchCountable).
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId: agentId,
+      metadata: { type: "agent_info_request", buyerAgent: req.headers["x-agent-id"] as string },
+      ipAddress: req.ip,
+    });
+  }
 
   // dev-request 2026-07-13-proveniens-transparens-side, slice 2: additive
   // entity-level provenance summary — omitted entirely when there's nothing

@@ -27,6 +27,9 @@
 // Pure: no database import.
 
 import type { ClientClass } from "./traffic-classifier";
+import { classifyA2aTraffic, type A2aTrafficClass } from "./a2a-traffic-classifier";
+import { PROBE_CLIENT_MARKERS } from "./agent-usage-compute";
+import { isInternalTraffic, type RequestMeta } from "./internal-traffic";
 
 export type SearchChannel = "web" | "api" | "mcp" | "a2a";
 
@@ -142,4 +145,48 @@ export function apiSearchQueryText(query: Record<string, unknown> | undefined, b
     }
   }
   return filterQueryText({ ...(query ?? {}), ...b }) || "[alle]";
+}
+
+// ─── Which searches raise the counters ──────────────────────────────────
+// A2A dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Z.
+
+export interface SearchCountInput {
+  /** buildRequestMeta() of the request (MCP: of the tools/call request). */
+  meta: RequestMeta;
+  /** The search text, or the structured query as JSON. */
+  text?: string | null;
+  /** MCP: initialize.clientInfo.name of the session. */
+  clientName?: string | null;
+  /** A structured query: the A2A rule for a JSON object typed as text is skipped. */
+  structured?: boolean;
+}
+
+/**
+ * Who sent a search or lookup outside POST /a2a, for the counters it touches:
+ * RFB's agents.discovery_count and agent_metrics.times_discovered (which
+ * trust_score reads), the public interactions feed (/api/interactions,
+ * /api/live) and the conversation /sok starts. POST /a2a decides this with
+ * classifyA2aTraffic and its own `countable` (a2a.ts), which also asks for
+ * intent and a per-IP cap.
+ *
+ * 'internal': our own traffic (isInternalTraffic: admin key, owner cookie,
+ * internal UA markers; MCP: also the session's client name). 'probe' or
+ * 'spam': what is already classified so, that is catalogue probes and
+ * monitors by client name or user agent (PROBE_CLIENT_MARKERS, which AI-søk
+ * and «Med i AI-svar» leave out) and the A2A spam guard's UA and text rules
+ * (classifyA2aTraffic). Only 'external' counts; the caller answers the same
+ * either way.
+ */
+export function searchTrafficClass(input: SearchCountInput): A2aTrafficClass {
+  const clientName = input.clientName || "";
+  if (isInternalTraffic(input.meta) || isInternalTraffic({ userAgent: clientName })) return "internal";
+  const ua = input.meta.userAgent || "";
+  const names = `${clientName}\n${ua}`.toLowerCase();
+  if (PROBE_CLIENT_MARKERS.some((m) => names.includes(m))) return "probe";
+  return classifyA2aTraffic({ text: input.text, ua, hasStructuredData: input.structured });
+}
+
+/** May the search raise the counters (searchTrafficClass() is 'external')? */
+export function searchCountable(input: SearchCountInput): boolean {
+  return searchTrafficClass(input) === "external";
 }
