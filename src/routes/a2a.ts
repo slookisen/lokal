@@ -25,6 +25,7 @@ import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData } from "../utils/a2a-message";
+import { capFreeText } from "../utils/free-text";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -286,7 +287,11 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     return null;
   };
 
-  const messageText = extractText(message);
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of the text are read, cut at a
+  // word boundary (utils/free-text.ts); it used to reach the parser whole. A
+  // `text` that is no string (a client bug) is passed on as before.
+  const rawText = extractText(message);
+  const messageText = typeof rawText === "string" ? capFreeText(rawText) : rawText;
   // message.data, or the first standard DataPart (dev-request 2026-10-17-
   // integrasjonstest-oppfolging, I-X: utils/a2a-message.ts).
   const messageData = a2aMessageData(message);

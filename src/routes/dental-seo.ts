@@ -52,6 +52,7 @@ import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } f
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
+import { capFreeText } from "../utils/free-text";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 // dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
 // clinic page names its place in the official spelling, by the same lookup as
@@ -1332,7 +1333,9 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
 // /api/tannlege quota for the enrichment workers.
 router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   const searchStarted = Date.now();
-  const q = String(req.query.q || "").trim();
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read (search, log, the
+  // search box), cut at a word boundary (utils/free-text.ts).
+  const q = capFreeText(String(req.query.q || "").trim());
   const fylke = String(req.query.fylke || "").trim();
   const spesialitet = String(req.query.spesialitet || "").trim();
   const helfo = req.query.helfo === "1";

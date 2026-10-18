@@ -30,6 +30,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
+import { capFreeText } from "../utils/free-text";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -718,7 +719,9 @@ export function registerTools(
       },
     },
     guardToolHandler("lokal_search", async ({ query, lat, lng, radius_km, limit }, extra) => {
-      const q = query || "";
+      // Slice I-Y: at most MAX_FREE_TEXT_CHARS of the text are read, cut at a
+      // word boundary (utils/free-text.ts). The schema keeps no max (frozen).
+      const q = capFreeText(query || "");
       const foreign = foreignPlaceIn(q);
       if (foreign) return outsideNorwayAnswer(foreign);
       const parsed = marketplaceRegistry.parseNaturalQuery(q);
@@ -921,7 +924,9 @@ export function registerTools(
         }
       });
 
-      deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
+      // Slice I-Y: the cut text, as tannlege_search and lokal_find_offers
+      // log it. An absent query stays absent, so that call's key is as before.
+      deliver("lokal_search", { query: query === undefined ? undefined : q, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + unmatchedLine + header + "\n" + lines.join("\n\n") }] };
     })
   );
@@ -1532,8 +1537,12 @@ export function registerTools(
       }
 
       const radiusKm = resolveOffersRadiusKm(radius_km);
+      // Slice I-Y: each item is a catalog lookup, so each is cut like the
+      // search text (utils/free-text.ts). An item past SQLite's LIKE pattern
+      // limit (50 000 bytes) used to fail the whole call.
+      const terms = items.map(capFreeText);
       const results = [];
-      for (const q of items) {
+      for (const q of terms) {
         const result = await findOffers({
           q,
           near: hasCoords ? undefined : near,
@@ -1546,7 +1555,7 @@ export function registerTools(
       }
 
       // I-S2: a category match hands its producer to the caller too.
-      deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra,
+      deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
       return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
     })

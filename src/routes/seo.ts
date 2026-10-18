@@ -41,6 +41,7 @@ import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
+import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
@@ -1727,7 +1728,9 @@ const SEARCH_CSS = `
 router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const searchStarted = Date.now();
   const lang = req.lang;
-  const q = typeof req.query.q === "string" ? req.query.q : "";
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read, cut at a word
+  // boundary (utils/free-text.ts), before route intent, parser and geocoder.
+  const q = capFreeText(typeof req.query.q === "string" ? req.query.q : "");
   const frontendLat = parseFloat(req.query.lat as string);
   const frontendLng = parseFloat(req.query.lng as string);
   const hasBrowserCoords = isValidLatLng(frontendLat, frontendLng);

@@ -42860,6 +42860,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y (FUNN
+// rfb-sok-fritekst-uten-lengdetak): free text is cut to MAX_FREE_TEXT_CHARS
+// (utils/free-text.ts, at a word boundary) before anything reads it, on every
+// free-text entry of RFB, Opplevagent and Finn-tannlege: a 1 MB search
+// answers as its first 2000 characters, in under 50 ms; searches within the
+// cap answer as main did (tests/fixtures/fritekst-lengdetak-i-y-main.json).
+// Swaps the main DB singleton, the dental/experiences db-factory and the
+// module cache (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Y (length cap on free-text search, all three platforms) ──");
+  try {
+    const { runFritekstLengdetakAllePlattformerTests } = require("../src/routes/fritekst-lengdetak-alle-plattformer.test") as
+      typeof import("../src/routes/fritekst-lengdetak-alle-plattformer.test");
+    const r = await runFritekstLengdetakAllePlattformerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("fritekst-lengdetak-alle-plattformer: " + f);
+    console.log(`  fritekst-lengdetak-alle-plattformer: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("fritekst-lengdetak-alle-plattformer: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W2 (review of
 // lokal#1160): a search of one filler word that names producers («Finnes»,
 // «Bondens», «Norsk») answers as main did (tests/fixtures/rfb-sok-i-w2-main.json);

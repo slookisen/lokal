@@ -63,6 +63,7 @@ import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { a2aMessageData } from "../utils/a2a-message";
+import { capFreeText } from "../utils/free-text";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -135,13 +136,18 @@ const RpcEnvelopeSchema = z.object({
 
 // ─── Text extractor (mirrors dental a2a.ts approach) ─────────
 
-const MAX_MESSAGE_TEXT = 2000; // cap free-text length (DoS hygiene)
+// The text is cut to MAX_FREE_TEXT_CHARS (2000) by the helper the three
+// platforms share (utils/free-text.ts, dev-request 2026-10-17-integrasjonstest-
+// oppfolging, slice I-Y), at a word boundary. This file used to cut at 2000
+// itself, in the middle of a word, and the piece before the cut was read
+// («Bergen» of «Bergensbanen» as the kommune). A word the cut splits is now
+// dropped whole.
 
 function extractText(msg: unknown): string | null {
-  if (typeof msg === "string") return msg.slice(0, MAX_MESSAGE_TEXT);
+  if (typeof msg === "string") return capFreeText(msg);
   if (msg && typeof msg === "object") {
     const m = msg as Record<string, unknown>;
-    if (typeof m.text === "string" && m.text) return m.text.slice(0, MAX_MESSAGE_TEXT);
+    if (typeof m.text === "string" && m.text) return capFreeText(m.text);
     if (Array.isArray(m.parts)) {
       for (const p of m.parts) {
         if (!p || typeof p !== "object") continue;
@@ -149,7 +155,7 @@ function extractText(msg: unknown): string | null {
         if (typeof part.text === "string" && part.text) {
           if (part.type !== undefined && part.type !== "text") continue;
           if (part.kind !== undefined && part.kind !== "text") continue;
-          return part.text.slice(0, MAX_MESSAGE_TEXT);
+          return capFreeText(part.text);
         }
       }
     }

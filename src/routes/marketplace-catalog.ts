@@ -33,6 +33,7 @@ import { computeEffectiveAvailability } from "../services/supply-graph";
 import { runProductCatalogSync } from "../services/product-catalog-sync";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { isValidLatLng } from "../utils/geo-query";
+import { capFreeText } from "../utils/free-text";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical) for the
 // public LIST surfaces below (/feed, /acp-feed.csv). The direct-id order-flow
@@ -415,7 +416,9 @@ INNER JOIN agent_knowledge k ON k.agent_id = a.id
 // ../services/catalog-offers.ts for the full field-by-field contract.
 // ────────────────────────────────────────────────────────────────────────────
 catalogRouter.get("/offers", async (req: Request, res: Response) => {
-  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  // Slice I-Y: the term is cut like search text (utils/free-text.ts). A term
+  // past SQLite's LIKE pattern limit (50 000 bytes) fails the lookup.
+  const q = capFreeText(typeof req.query.q === "string" ? req.query.q.trim() : "");
   if (!q) {
     res.status(400).json({ success: false, error: "Mangler ?q= parameter" });
     return;
