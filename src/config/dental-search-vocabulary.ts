@@ -38,6 +38,12 @@ export interface SearchVocabulary {
   helfo: readonly string[];
   /** A trigger right after one of these is not applied ("uten helfo"). */
   negations: ReadonlySet<string>;
+  /**
+   * Right after a place, one of these names it as the kommune ("Kvam
+   * kommune"), so a poststed of that name in another kommune also covers the
+   * kommune. Whole tokens; each is a stopword too.
+   */
+  kommuneWords: ReadonlySet<string>;
 }
 
 export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
@@ -119,6 +125,7 @@ export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
     "tannvakt", "emergency", "urgent", "øyeblikkelig hjelp"],
   helfo: ["helfo", "helfoavtale", "helfoavtalen", "direkteoppgjør", "direkteoppgjor", "direct billing"],
   negations: new Set(["uten", "ikke", "without", "not", "no"]),
+  kommuneWords: new Set(["kommune", "kommunen", "municipality"]),
 };
 
 /**
@@ -134,4 +141,58 @@ export function findSearchSpecialty(
   const v = key(value);
   if (!v) return null;
   return vocabulary.specialties.find((s) => [s.canonical, s.slug, ...s.synonyms].some((w) => key(w) === v)) ?? null;
+}
+
+/**
+ * The lower-case words the specialty filter looks for inside
+ * specialists[].title (dental-store specialtyMatch): each name as given plus
+ * the entry's title stems. A word that contains another one in the list is
+ * left out: "kjeveortoped" already matches every title "kjeveortopedi" does.
+ * The clinic cards read titles with the same words (clinicSpecialties).
+ */
+export function specialtyTitleWords(names: readonly string[], entry: SearchSpecialty | null): string[] {
+  const words = [...new Set([...names.map((n) => n.toLowerCase()), ...(entry?.title_stems ?? [])])];
+  return words.filter((w) => !words.some((other) => other !== w && w.includes(other)));
+}
+
+/** What clinicSpecialties reads from a clinic row (a DentalAgent has both). */
+export interface ClinicSpecialtySource {
+  available_specialties?: readonly string[] | null;
+  specialists?: ReadonlyArray<{ specialty?: string | null; title?: string | null } | null> | null;
+}
+
+/**
+ * The specialties a clinic is shown with: the MCP/A2A card's spesialiteter
+ * and «Spesialist» badge, and the chips on the web card (dev-request
+ * 2026-10-17-dental-d3-rettelser, D3d). They are what the specialty filter
+ * finds the clinic by, in this order and without duplicates (ignoring case):
+ * available_specialties, then specialists[].specialty, then every vocabulary
+ * specialty whose title words (specialtyTitleWords, as the filter reads
+ * them) occur in a specialists[].title. A title such as "Tannlege" or
+ * "Spesialist" adds nothing. Kept here, next to the words, so the store, the
+ * card and the web pages read titles the same way without importing each
+ * other.
+ */
+export function clinicSpecialties(
+  clinic: ClinicSpecialtySource,
+  vocabulary: SearchVocabulary = DENTAL_SEARCH_VOCABULARY
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: unknown) => {
+    const name = typeof value === "string" ? value.trim() : "";
+    if (!name || seen.has(name.toLowerCase())) return;
+    seen.add(name.toLowerCase());
+    out.push(name);
+  };
+  for (const name of clinic.available_specialties ?? []) add(name);
+  const specialists = Array.isArray(clinic.specialists) ? clinic.specialists : [];
+  for (const person of specialists) add(person?.specialty);
+  const titles = specialists.flatMap((person) => (typeof person?.title === "string" ? [person.title.toLowerCase()] : []));
+  if (titles.length === 0) return out;
+  for (const entry of vocabulary.specialties) {
+    const words = specialtyTitleWords([entry.canonical], entry);
+    if (titles.some((title) => words.some((w) => title.includes(w)))) add(entry.canonical);
+  }
+  return out;
 }

@@ -30,8 +30,12 @@
  *       taken from main 1f92ad56): the product, hours, delivery and
  *       certification cards, the LocalBusiness and FAQPage JSON-LD (since
  *       I-H, openingHoursSpecification has valid days for range keys and
- *       long names, which main wrote as "https://schema.org/mon-fri"), and the
- *       whole inline script for a UUID agent id (no and en); the well-formed
+ *       long names, which main wrote as "https://schema.org/mon-fri"; since
+ *       S6 del B of dev-request
+ *       2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
+ *       makesOffer holds Offers from the farm without a Product, and main's
+ *       makesOffer bytes come back in rollback mode), and the whole inline
+ *       script for a UUID agent id (no and en); the well-formed
  *       ultra-rich card is checked against main in (d).
  *   (c) regression, one producer per repro: object/boolean/negative/array
  *       prices and non-text units; product months as text and with non-month
@@ -117,6 +121,7 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
 
   const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../database/init") as
     typeof import("../database/init");
+  const policy = require("../services/structured-data-policy") as typeof import("../services/structured-data-policy");
   const prevDb = (() => { try { return getDb(); } catch { return undefined; } })();
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
@@ -384,8 +389,25 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
         { "@type": "OpeningHoursSpecification", dayOfWeek: sd("Monday"), opens: "09:00", closes: "16:00" },
         { "@type": "OpeningHoursSpecification", dayOfWeek: sd("Saturday"), opens: "10:00", closes: "14:00" },
       ], "b W no: LocalBusiness openingHoursSpecification has valid days for ranges and long names (I-H); a short key as on main; no entry with a season note (I-O)");
+      // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+      // (S6 del B): each priced product is an Offer from the farm with exactly
+      // @type, name, price and priceCurrency, no Product node. The catalog,
+      // paymentAccepted and keywords are as on main.
       assertEq(JSON.stringify({ o: lb?.makesOffer, c: lb?.hasOfferCatalog, p: lb?.paymentAccepted, k: lb?.keywords }),
-        "{\"o\":[{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Honning\",\"description\":\"Honning fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Lammelår\",\"description\":\"Lammelår fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Egg\",\"description\":\"Egg fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Syltetøy & gelé <hjemmelaget>\",\"description\":\"Syltetøy & gelé <hjemmelaget> fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"  Smør  \",\"description\":\"  Smør   fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"}],\"c\":{\"@type\":\"OfferCatalog\",\"name\":\"Produkter\",\"itemListElement\":[{\"@type\":\"Thing\",\"name\":\"Ost\"},{\"@type\":\"Thing\",\"name\":\"Rabarbra\"},{\"@type\":\"Thing\",\"name\":\"🐑 LAM\"}]},\"p\":\"Vipps, Kontant\",\"k\":\"Nyt Norge, Spesialitet\"}", "b W no: LocalBusiness offers, catalog, paymentAccepted and keywords byte-identical to main");
+        "{\"o\":[{\"@type\":\"Offer\",\"name\":\"Honning\",\"price\":150,\"priceCurrency\":\"NOK\"},{\"@type\":\"Offer\",\"name\":\"Lammelår\",\"price\":275,\"priceCurrency\":\"NOK\"},{\"@type\":\"Offer\",\"name\":\"Egg\",\"price\":60,\"priceCurrency\":\"NOK\"},{\"@type\":\"Offer\",\"name\":\"Syltetøy & gelé <hjemmelaget>\",\"price\":89,\"priceCurrency\":\"NOK\"},{\"@type\":\"Offer\",\"name\":\"  Smør  \",\"price\":45,\"priceCurrency\":\"NOK\"}],\"c\":{\"@type\":\"OfferCatalog\",\"name\":\"Produkter\",\"itemListElement\":[{\"@type\":\"Thing\",\"name\":\"Ost\"},{\"@type\":\"Thing\",\"name\":\"Rabarbra\"},{\"@type\":\"Thing\",\"name\":\"🐑 LAM\"}]},\"p\":\"Vipps, Kontant\",\"k\":\"Nyt Norge, Spesialitet\"}", "b W no: LocalBusiness offers (S6 del B: Offer from the farm, no Product), catalog, paymentAccepted and keywords");
+      // Rollback mode (PRODUCER_PAGE_PRODUCT_NODES = true) gives back the
+      // golden from main byte for byte: del A's name rule reads every Wenche
+      // product as the old rule did («Lammelår – kr 275/kg» → Lammelår, 275).
+      let rollback: { status: number; body: string } = { status: 0, body: "" };
+      try {
+        policy.__setProducerPageProductNodesForTesting(true);
+        rollback = producer("wenche-gard");
+      } finally {
+        policy.__setProducerPageProductNodesForTesting(null);
+      }
+      const lbRollback = localBusiness(rollback.body);
+      assertEq(JSON.stringify({ o: lbRollback?.makesOffer, c: lbRollback?.hasOfferCatalog, p: lbRollback?.paymentAccepted, k: lbRollback?.keywords }),
+        "{\"o\":[{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Honning\",\"description\":\"Honning fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":150,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Lammelår\",\"description\":\"Lammelår fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":275,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Egg\",\"description\":\"Egg fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":60,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"Syltetøy & gelé <hjemmelaget>\",\"description\":\"Syltetøy & gelé <hjemmelaget> fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":89,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"},{\"@type\":\"Offer\",\"itemOffered\":{\"@type\":\"Product\",\"name\":\"  Smør  \",\"description\":\"  Smør   fra Wenche Gard\",\"brand\":{\"@type\":\"Brand\",\"name\":\"Wenche Gard\"},\"offers\":{\"@type\":\"Offer\",\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\",\"seller\":{\"@type\":\"LocalBusiness\",\"name\":\"Wenche Gard\"}}},\"price\":45,\"priceCurrency\":\"NOK\",\"availability\":\"https://schema.org/InStock\"}],\"c\":{\"@type\":\"OfferCatalog\",\"name\":\"Produkter\",\"itemListElement\":[{\"@type\":\"Thing\",\"name\":\"Ost\"},{\"@type\":\"Thing\",\"name\":\"Rabarbra\"},{\"@type\":\"Thing\",\"name\":\"🐑 LAM\"}]},\"p\":\"Vipps, Kontant\",\"k\":\"Nyt Norge, Spesialitet\"}", "b W no rollback mode: LocalBusiness offers, catalog, paymentAccepted and keywords byte-identical to main");
       assertEq(JSON.stringify(faqPage(no.body)), "{\"@context\":\"https://schema.org\",\"@type\":\"FAQPage\",\"@id\":\"https://rettfrabonden.com/produsent/wenche-gard#faq\",\"mainEntity\":[{\"@type\":\"Question\",\"name\":\"Hva selger Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Wenche Gard tilbyr Honning, Lammelår – kr 275/kg, Egg, Syltetøy & gelé <hjemmelaget>, Ost,   Smør  , Rabarbra, 🐑 LAM.\"}},{\"@type\":\"Question\",\"name\":\"Hvor ligger Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Wenche Gard holder til i Wtown.\"}},{\"@type\":\"Question\",\"name\":\"Kan jeg besøke eller bestille fra Wenche Gard?\",\"acceptedAnswer\":{\"@type\":\"Answer\",\"text\":\"Ja — Wenche Gard har åpningstider oppført på profilen.\"}}]}", "b W no: FAQPage byte-identical to main");
       assertEq(junk(no.body).concat(junk(en.body)), [], "b W: no junk text (no, en)");
     }
@@ -557,6 +579,7 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
   } finally {
     console.log = origLog;
     console.error = origError;
+    policy.__setProducerPageProductNodesForTesting(null);
     if (prevDb) __setDbForTesting(prevDb as any);
     const regMod = require("../services/marketplace-registry");
     regMod.marketplaceRegistry._agentsCache = null;

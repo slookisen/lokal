@@ -70,6 +70,8 @@ function callRoute(router: any, path: string, query: Record<string, string>): Pr
       statusCode: 200,
       status(code: number) { this.statusCode = code; return this; },
       setHeader() { return this; },
+      set() { return this; },
+      vary() { return this; },
       json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
     };
@@ -186,11 +188,25 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
       assertEq(Object.keys(r.body), ["count", "agents"], "R6: response shape {count, agents}");
       assertEq(r.body.agents.map((a: any) => a.id), ids, "R7: same rows in the same order as the old query");
       const { isDisplayablePhone } = require("./contact-normalizer") as typeof import("./contact-normalizer");
+      // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+      // places-treffvakt, S4-A1b: the route leaves the stored Google rating
+      // (rating, rating_count, rating_source) out, so the snapshot does too.
+      // Same dev-request, A4-D: a public answer also leaves out
+      // field_provenance (it holds the Places values) and Stage V's pending
+      // map (a read-only side column of the hydrated row). No fixture value
+      // comes from Places, so every other value is as stored.
       const snapshot = ids.map((id) => {
-        const a = store.getDentalAgentById(id)!;
+        const {
+          rating: _rating,
+          rating_count: _ratingCount,
+          rating_source: _ratingSource,
+          field_provenance: _provenance,
+          stage_v_pending_correction: _pending,
+          ...a
+        } = store.getDentalAgentById(id)!;
         return { ...a, telefon: isDisplayablePhone(a.telefon) ? a.telefon : null, mobil: isDisplayablePhone(a.mobil) ? a.mobil : null };
       });
-      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot");
+      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot, less the three Google rating keys, field_provenance and the pending map (A4-D)");
       const q = await callRoute(route, "/agents", { limit: "200", name_terms: "solo", postnummer_in: "0150" });
       assertEq(q.body.count, ids.length, "R9: the new fields are not read from GET /agents query params");
     }

@@ -9,15 +9,20 @@
  *   P   parser: the union, «Bergen kommune»; unchanged: a poststed that is
  *       not a kommune (Nesttun), Oslo (over the postnummer cap), a name
  *       several kommuner share (Herøy), a poststed in another kommune with a
- *       kommune's name (KVAM in Nord-Fron); an explicit fylke keeps or drops
- *       the place as before; over the whole register every kommune-named
- *       poststed gives a filter the store accepts.
+ *       kommune's name (KVAM in Nord-Fron) unless the text says kommune
+ *       (D3c: «Kvam kommune» is KVAM OR Kvam kommune); an explicit fylke
+ *       keeps or drops the place as before; over the whole register every
+ *       kommune-named poststed, with and without «kommune», gives a filter
+ *       the store accepts.
  *   Z   store: OR between the two halves, AND with every other field, inside
  *       the natural branches, count/list parity, schema bounds.
  *   M   MCP tannlege_search (tools/call on a real McpServer): Nesttun,
  *       Fyllingsdalen, a postbox postnummer and a row without postnummer all
  *       count as Bergen; never fewer hits than the poststed-only reading.
- *   W   /sok, and A   A2A message/send, for the same query.
+ *       D3c: tolkning shows the kommune's postnumre as {kommunenummer,
+ *       antall} (under 300 B), with the same count and clinics.
+ *   W   /sok, and A   A2A message/send, for the same query; A2A keeps the
+ *       full list in metadata.filter.
  *   R   DENTAL_QUERY_PARSER_DISABLED=1 still restores the old search.
  *
  * Standalone: npx tsx src/routes/dental-search-kommune-union.test.ts
@@ -49,11 +54,17 @@ function callRoute(router: any, path: string, query: Record<string, string> = {}
 }
 
 // The filter as S3 read it: the poststed half alone (for "never fewer").
+// tolkning shows a kommune's postnumre as {kommunenummer, antall} (D3c), so
+// a kommune read by postnummer («Askøy») gets its list back for the store.
 function poststedOnly(f: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = { ...f };
   if (out.poststed_or_postnummer) {
     out.poststed_in = out.poststed_or_postnummer.poststed_in;
     delete out.poststed_or_postnummer;
+  }
+  if (out.postnummer_in && !Array.isArray(out.postnummer_in)) {
+    const pn = require("../services/norway-postnummer") as typeof import("../services/norway-postnummer");
+    out.postnummer_in = pn.postnumreForKommune(out.postnummer_in.kommunenummer);
   }
   if (out.natural) out.natural = { parsed: poststedOnly(out.natural.parsed), legacy: out.natural.legacy };
   return out;
@@ -143,9 +154,17 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
       // fylke Vestland (the place used to be dropped there), so it stays.
       const r = parse("tannlege Kvam");
       assertEq([r.filter, r.interpretation], [{ poststed_in: ["KVAM"] }, ["sted: Kvam (poststed)"]], "P11: a poststed in another kommune than the one of its name (KVAM) is read as before");
-      assertEq(parse("tannlege Kvam kommune").filter, r.filter, "P12: ... also with «kommune» after it");
+      // D3c: a kommune word after it names Kvam kommune (Vestland, 4622):
+      // the poststed KVAM OR the kommune's postnumre (NORHEIMSUND, ØYSTESE …).
+      for (const q of ["tannlege i Kvam kommune", "Kvam kommunen", "dentist in Kvam municipality"]) {
+        const k = parse(q);
+        assertEq([k.filter, k.interpretation], [union(["KVAM"], "4622"), ["sted: Kvam (poststed + kommune)"]], `P12: «${q}» -> the poststed KVAM OR Kvam kommune's postnumre (4622)`);
+      }
+      assertEq([parse("tannlege i Kvam").filter, parse("Kvam tannlege").filter], [r.filter, r.filter], "P12b: without a kommune word right after it, the poststed alone, as before");
       assertEq(parse("tannlege Kvam", "Vestland").filter, {}, "P13: ... and an explicit fylke Vestland still drops it, as before");
+      assertEq(parse("tannlege Kvam kommune", "Vestland").filter, {}, "P13b: «Kvam kommune» + fylke Vestland is dropped too: the union keeps the poststed's fylker (Innlandet), so the result is as before");
       assertEq(parse("tannlege Kvam", "Innlandet").filter, r.filter, "P14: ... while Innlandet keeps it");
+      assertEq(parse("tannlege Kvam kommune", "Innlandet").filter, union(["KVAM"], "4622"), "P14b: ... and keeps «Kvam kommune» as the union");
       assertEq(parse("tannlege i Bergen", "Vestland").filter, union(["BERGEN", "Bergen"], "4601"), "P15: the union is kept by the fylke the poststed lies in");
     }
     assertEq(parse("tannlege i Bergen", "Rogaland").filter, {}, "P16: Bergen + explicit fylke Rogaland -> the place in the text is not used (as before)");
@@ -173,6 +192,11 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
         ["HEMNES", "HERØY", "KVAM", "LUND", "OS", "OSEN", "OSLO", "SULA", "ÅMOT"],
         "P23: all but Herøy (two kommuner), Oslo (over the cap) and seven poststeder in another kommune than their name's cover their kommune"
       );
+      // D3c: followed by «kommune», the seven in another kommune cover their
+      // name's kommune too; Herøy and Oslo stay the poststed alone.
+      const named = kommuneNamed.map((p) => parser.parseDentalQuery(`${p} kommune`, full).filter as Record<string, any>);
+      assertEq(kommuneNamed.filter((_, i) => !store.ListFilterSchema.safeParse(named[i]).success), [], `P22b: all ${kommuneNamed.length} kommune-named poststeder followed by «kommune» give a filter the store accepts`);
+      assertEq(kommuneNamed.filter((_, i) => !named[i].poststed_or_postnummer).sort(), ["HERØY", "OSLO"], "P23b: followed by «kommune», all but Herøy (two kommuner) and Oslo (over the cap) cover their kommune");
       // The union's fylker are the poststed's own: a fylke it does not lie
       // in still drops the place, as before.
       const outside = kommuneNamed.filter((p, i) => {
@@ -214,7 +238,10 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
     add({ navn: "Oslo Tann", poststed: "OSLO", postnummer: "0150", fylke: "Oslo" });
     add({ navn: "Ullevål Tann", poststed: "OSLO", postnummer: "0450", fylke: "Oslo" });
     add({ navn: "Kvam Tann", poststed: "KVAM", postnummer: "2642", fylke: "Innlandet" });
+    // The kommune name stored as poststed on a Kvam kommune postnummer (as in prod).
+    add({ navn: "Hardanger Tannhelse", poststed: "Kvam", postnummer: "5600", ...vest });
     add({ navn: "Norheimsund Tann", poststed: "NORHEIMSUND", postnummer: "5600", ...vest });
+    add({ navn: "Øystese Tann", poststed: "ØYSTESE", postnummer: "5610", ...vest });
     add({ navn: "Herøy Tann", poststed: "HERØY", postnummer: "8850", fylke: "Nordland" });
     add({ navn: "Tromsø Tann", poststed: "TROMSØ", postnummer: "9008", fylke: "Troms" });
     add({ navn: "Tromsdalen Tann", poststed: "TROMSDALEN", postnummer: "9020", fylke: "Troms" });
@@ -278,7 +305,16 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
     assertEq(sorted(names(await search({ query: "kjeveortoped Bergen" }))), ["Fana Regulering", "Nesttun Regulering"], "M4: «kjeveortoped Bergen» now finds the orthodontist in Nesttun too");
     assertEq(sorted(names(await search({ query: "Nesttun" }))), ["Nesttun Regulering", "Nesttun Tann"], "M5: «Nesttun» is unchanged");
     assertEq(sorted(names(await search({ query: "tannlege i Oslo" }))), ["Oslo Tann", "Ullevål Tann"], "M6: «tannlege i Oslo» is unchanged");
-    assertEq(names(await search({ query: "tannlege Kvam" })), ["Kvam Tann"], "M7: «tannlege Kvam» -> the poststed KVAM, as before");
+    {
+      const r = await search({ query: "tannlege Kvam" });
+      assertEq([sorted(names(r)), r.tolkning?.tolket_som], [["Hardanger Tannhelse", "Kvam Tann"], ["sted: Kvam (poststed)"]], "M7: «tannlege Kvam» -> the poststed KVAM (both stored spellings), as before: not Norheimsund or Øystese");
+      const k = await search({ query: "tannlege i Kvam kommune" });
+      assertEq(
+        [sorted(names(k)), k.tolkning?.tolket_som],
+        [["Hardanger Tannhelse", "Kvam Tann", "Norheimsund Tann", "Øystese Tann"], ["sted: Kvam (poststed + kommune)"]],
+        "M7b: «tannlege i Kvam kommune» -> the poststed KVAM plus Kvam kommune (Norheimsund 5600, Øystese 5610)"
+      );
+    }
     assertEq(sorted(names(await search({ query: "tannlege Tromsø" }))), ["Tromsdalen Tann", "Tromsø Tann"], "M8: «tannlege Tromsø» -> Tromsø kommune (Tromsdalen too)");
     {
       // Never fewer: every clinic the poststed-only reading (S3) found is
@@ -286,7 +322,7 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
       const queries = [
         "Bergen", "tannlege i Bergen", "Bergen kommune", "kjeveortoped Bergen", "helfo tannlege Bergen", "Bergen Tannhelse",
         "Bergen Sentrum Tann", "Nesttun", "Fyllingsdalen Tann", "Oslo", "Kvam", "tannlege i Tromsø", "Tromso", "Herøy",
-        "tannlege Bergen eller Oslo", "Askøy",
+        "tannlege Bergen eller Oslo", "Askøy", "tannlege i Kvam kommune",
       ];
       const argSets: Array<Record<string, unknown>> = [{}, { fylke: "Vestland" }, { spesialitet: "kjeveortopedi" }, { helfo: true }, { helfo: false }];
       let unions = 0;
@@ -301,6 +337,22 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
       }
       assertTrue(unions >= 40, "M10: (the check above ran the union in at least 40 of its cases)");
     }
+    {
+      // D3c: tolkning shows Bergen kommune's 144 postnumre as the kommune and
+      // how many; the search itself still uses the list.
+      const r = await search({ query: "tannlege i Bergen" });
+      assertEq(
+        r.tolkning?.filter?.natural?.parsed?.poststed_or_postnummer,
+        { poststed_in: ["BERGEN", "Bergen"], postnummer_in: { kommunenummer: "4601", antall: bergenPnr.length } },
+        "M11: tolkning.filter has Bergen kommune as {kommunenummer, antall}, not the postnummer list"
+      );
+      assertTrue(Buffer.byteLength(JSON.stringify(r.tolkning)) < 300, "M11b: ... so the whole tolkning is under 300 B");
+      assertEq([r.count, sorted(names(r))], [allBergen.length, sorted(allBergen)], "M11c: ... with the same count and clinics as M1");
+      const k = await search({ query: "tannlege i Kvam kommune" });
+      assertEq(k.tolkning?.filter?.natural?.parsed?.poststed_or_postnummer?.postnummer_in, { kommunenummer: "4622", antall: pn.postnumreForKommune("4622").length }, "M12: «Kvam kommune» likewise ({kommunenummer: 4622, antall})");
+      const b = await search({ query: "tannlege Askøy" });
+      assertEq(b.tolkning?.filter?.natural?.parsed?.postnummer_in, { kommunenummer: "4627", antall: pn.postnumreForKommune("4627").length }, "M12b: a kommune read by postnummer (Askøy) likewise");
+    }
 
     // ── W: /sok, A: A2A message/send ──────────────────────────────────────
     const seoRouter = (require("./dental-seo") as typeof import("./dental-seo")).default as any;
@@ -310,6 +362,13 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
       assertTrue(allBergen.every((n) => page.text.includes(`>${n}<`)) && !page.text.includes(">Askøy Tann<"), "W2: ... shows Nesttun and Fyllingsdalen, not Kleppestø");
       assertTrue(page.text.includes("Tolket som: sted: Bergen (poststed + kommune)"), "W3: ... and «Tolket som: sted: Bergen (poststed + kommune)»");
     }
+    {
+      const page = await callRoute(seoRouter, "/sok", { q: "tannlege i Kvam kommune" });
+      assertTrue(
+        page.text.includes("Tolket som: sted: Kvam (poststed + kommune)") && page.text.includes("4 klinikker funnet") && page.text.includes(">Øystese Tann<"),
+        "W4: /sok?q=tannlege+i+Kvam+kommune: «(poststed + kommune)» and Kvam kommune's clinics"
+      );
+    }
     const a2a = require("./dental-a2a") as typeof import("./dental-a2a");
     const ask = (text: string) => a2a.handleDentalMessageSend({ message: { text } }, "s3b") as any;
     {
@@ -318,6 +377,23 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
       assertEq(sorted(ids), sorted([...Object.values(bergenRows), bergenNamedAskoy]), "A1: A2A «tannlege i Bergen» finds the whole kommune (and, as before, its keyword reading «bergen» in a name)");
       assertEq(resp.result.metadata.tolkning?.tolket_som, ["sted: Bergen (poststed + kommune)"], "A2: ... metadata.tolkning says so");
       assertTrue(a2a.dentalAskedSomething(resp) && sorted(a2a.dentalAnswerProfileIds(resp)).join() === sorted(ids).join(), "A3: ... counted as a question, the same clinics delivered");
+      // D3c: metadata.filter is what was searched (the full list); only
+      // metadata.tolkning shows the kommune as {kommunenummer, antall}.
+      const md = resp.result.metadata;
+      assertEq(
+        [md.filter.natural.parsed.poststed_or_postnummer.postnummer_in, md.tolkning.filter.natural.parsed.poststed_or_postnummer.postnummer_in],
+        [bergenPnr, { kommunenummer: "4601", antall: bergenPnr.length }],
+        "A4: A2A keeps the postnummer list in metadata.filter and shows {kommunenummer, antall} in metadata.tolkning"
+      );
+      assertEq(resp.result.artifacts[1].parts[0].data.total, ids.length, "A4b: ... and total is every clinic found");
+    }
+    {
+      const resp = ask("tannlege i Kvam kommune");
+      assertEq(
+        [resp.result.artifacts[0].parts[0].text, resp.result.metadata.tolkning?.tolket_som],
+        ["Fant 4 tannlegeklinikk(er). / Found 4 dental clinic(s).", ["sted: Kvam (poststed + kommune)"]],
+        "A5: A2A «tannlege i Kvam kommune» finds Kvam kommune's clinics"
+      );
     }
 
     // ── R: rollback switch ────────────────────────────────────────────────
@@ -329,6 +405,8 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
       const page = await callRoute(seoRouter, "/sok", { q: "tannlege i Bergen" });
       assertTrue(page.text.includes("Ingen klinikker funnet") && !page.text.includes("Tolket som"), "R3: ... /sok likewise");
       assertTrue(ask("tannlege i Bergen").result.metadata.tolkning === undefined, "R4: ... A2A likewise");
+      const k = await search({ query: "tannlege i Kvam kommune" });
+      assertTrue(k.count === 0 && k.tolkning === undefined, "R5: ... and «tannlege i Kvam kommune» is the old whole-text search (0), no tolkning");
     }
     delete process.env.DENTAL_QUERY_PARSER_DISABLED;
   } catch (err: any) {

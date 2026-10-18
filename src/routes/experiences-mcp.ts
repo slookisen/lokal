@@ -144,6 +144,8 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { capName } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -623,6 +625,22 @@ function registerWidgetResource(
   );
 }
 
+/**
+ * The whole text of a tool result when the tool fails inside. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
+ * client («Sokefeil: …», «Feil: …», «Bookingfeil: …»), SQLite's for one. The
+ * wording is Rett fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts), from
+ * the same template (utils/internal-error.ts). A database that is not open
+ * still answers that no data is available.
+ */
+export const EXPERIENCES_MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Opplevagent");
+
+/** A failed tool's isError result with EXPERIENCES_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
+function toolInternalError(tool: string, err: unknown) {
+  return mcpToolInternalErrorResult("experiences-mcp", EXPERIENCES_MCP_INTERNAL_ERROR_TEXT, tool, err);
+}
+
 export function registerExperienceTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -686,7 +704,13 @@ export function registerExperienceTools(
         "openai/toolInvocation/invoked": "Found experiences",
       },
     },
-    async ({ query, fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
+    async ({ query, fylke: fylkeAsSent, kommune: kommuneAsSent, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+      // strukturerte-stedsfelt-uten-lengdetak): `fylke` and `kommune` are place
+      // names, cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts)
+      // before the filter, the free-text reading and the answer use them.
+      const fylke = capName(fylkeAsSent);
+      const kommune = capName(kommuneAsSent);
       try {
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
@@ -943,10 +967,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_experiences", err);
       }
     }
   );
@@ -1004,10 +1025,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen kategorier tilgjengelig for oyeblikket. / No category data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("list_experience_categories", err);
       }
     }
   );
@@ -1143,10 +1161,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("get_experience", err);
       }
     }
   );
@@ -1190,7 +1205,10 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+    async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+      // Slice I-Y2: place names, cut as in discover_experiences.
+      const fylke = capName(fylkeAsSent);
+      const kommune = capName(kommuneAsSent);
       try {
         const foreign = outsideNorwayPlace({ fylke, kommune, query, lat, lng });
         if (foreign) return outsideNorwayResult(foreign, "gardssalg_producers", { fylke, kommune, query });
@@ -1286,10 +1304,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_gardssalg", err);
       }
     }
   );
@@ -1594,10 +1609,7 @@ export function registerExperienceTools(
           }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Bookingfeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("book_gardssalg", err);
       }
     }
   );

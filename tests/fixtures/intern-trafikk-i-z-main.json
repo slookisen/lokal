@@ -1,0 +1,424 @@
+{
+  "captured_on": "main b25dfbce, before I-Z (dev-request 2026-10-17-integrasjonstest-oppfolging)",
+  "how": "externalDeltas() in src/routes/intern-trafikk-telles-ikke.test.ts (--print): per search or lookup entry and external caller, what one call changes in the counters (readCounters), on fresh fixtures",
+  "deltas": {
+    "rfb mcp lokal_search": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3
+      }
+    },
+    "rfb mcp lokal_discover": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3
+      }
+    },
+    "rfb mcp lokal_info": {
+      "AI assistant (ChatGPT-User)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "curl": {}
+    },
+    "rfb mcp lokal_find_offers": {
+      "AI assistant (ChatGPT-User)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "browser (Firefox)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "curl": {}
+    },
+    "rfb a2a message/send": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 3,
+        "conversations": 3,
+        "interactions": 4,
+        "mcpCalls": 1,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 3,
+        "conversations": 3,
+        "interactions": 4,
+        "mcpCalls": 1,
+        "aiLookups": 1,
+        "aiDeliveries": 3
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 3,
+        "conversations": 3,
+        "interactions": 4,
+        "aiDeliveries": 3
+      }
+    },
+    "rfb a2a agent/info": {
+      "AI assistant (ChatGPT-User)": {
+        "interactions": 1,
+        "mcpCalls": 1
+      },
+      "browser (Firefox)": {
+        "interactions": 1,
+        "mcpCalls": 1
+      },
+      "curl": {
+        "interactions": 1
+      }
+    },
+    "rfb GET /api/marketplace/search": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "interactions": 1,
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "interactions": 1,
+        "searches": 1
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "interactions": 1
+      }
+    },
+    "rfb POST /api/marketplace/discover": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "interactions": 1,
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "interactions": 1,
+        "searches": 1
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "interactions": 1
+      }
+    },
+    "rfb POST /api/marketplace/discover start_conversation": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 2,
+        "conversations": 2,
+        "interactions": 3,
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 2,
+        "conversations": 2,
+        "interactions": 3,
+        "searches": 1
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 2,
+        "conversations": 2,
+        "interactions": 3
+      }
+    },
+    "rfb GET /api/marketplace/catalog/offers": {
+      "AI assistant (ChatGPT-User)": {
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "searches": 1
+      },
+      "curl": {}
+    },
+    "rfb GET /api/marketplace/agents/:id/info": {
+      "AI assistant (ChatGPT-User)": {
+        "interactions": 1
+      },
+      "browser (Firefox)": {
+        "interactions": 1
+      },
+      "curl": {
+        "interactions": 1
+      }
+    },
+    "rfb GET /api/marketplace/agents/:id/vcard": {
+      "AI assistant (ChatGPT-User)": {
+        "interactions": 1
+      },
+      "browser (Firefox)": {
+        "interactions": 1
+      },
+      "curl": {
+        "interactions": 1
+      }
+    },
+    "rfb GET /sok": {
+      "AI assistant (ChatGPT-User)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "searches": 1,
+        "pageViews": 1,
+        "aiDeliveries": 3
+      },
+      "browser (Firefox)": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3,
+        "timesContacted": 1,
+        "conversations": 1,
+        "interactions": 1,
+        "searches": 1,
+        "pageViews": 1
+      },
+      "curl": {
+        "discoveryCount": 3,
+        "timesDiscovered": 3
+      }
+    },
+    "rfb GET /produsent/:slug": {
+      "AI assistant (ChatGPT-User)": {
+        "pageViews": 1,
+        "agentViews": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "pageViews": 1,
+        "agentViews": 1
+      },
+      "curl": {}
+    },
+    "dental mcp tannlege_search": {
+      "AI assistant (ChatGPT-User)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 2
+      },
+      "browser (Firefox)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 2
+      },
+      "curl": {}
+    },
+    "dental mcp tannlege_info": {
+      "AI assistant (ChatGPT-User)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "curl": {}
+    },
+    "dental a2a message/send": {
+      "AI assistant (ChatGPT-User)": {
+        "mcpCalls": 1,
+        "aiLookups": 1,
+        "aiDeliveries": 2
+      },
+      "browser (Firefox)": {
+        "mcpCalls": 1,
+        "aiLookups": 1,
+        "aiDeliveries": 2
+      },
+      "curl": {
+        "aiDeliveries": 2
+      }
+    },
+    "dental GET /sok": {
+      "AI assistant (ChatGPT-User)": {
+        "searches": 1,
+        "pageViews": 1,
+        "aiDeliveries": 2
+      },
+      "browser (Firefox)": {
+        "searches": 1,
+        "pageViews": 1
+      },
+      "curl": {}
+    },
+    "dental GET /api/tannlege/agents": {
+      "AI assistant (ChatGPT-User)": {
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "searches": 1
+      },
+      "curl": {}
+    },
+    "dental GET /api/tannlege/discover": {
+      "AI assistant (ChatGPT-User)": {
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "searches": 1
+      },
+      "curl": {}
+    },
+    "dental GET /klinikk/id/:id": {
+      "AI assistant (ChatGPT-User)": {
+        "pageViews": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "pageViews": 1
+      },
+      "curl": {}
+    },
+    "oa mcp discover_experiences": {
+      "AI assistant (ChatGPT-User)": {
+        "conversations": 1,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "conversations": 1,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "curl": {
+        "conversations": 1
+      }
+    },
+    "oa mcp get_experience": {
+      "AI assistant (ChatGPT-User)": {
+        "conversations": 1,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "conversations": 1,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "curl": {
+        "conversations": 1
+      }
+    },
+    "oa mcp discover_gardssalg": {
+      "AI assistant (ChatGPT-User)": {
+        "conversations": 1,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "conversations": 1,
+        "mcpCalls": 3,
+        "aiLookups": 1,
+        "aiDeliveries": 1
+      },
+      "curl": {
+        "conversations": 1
+      }
+    },
+    "oa a2a message/send": {
+      "AI assistant (ChatGPT-User)": {
+        "conversations": 1,
+        "mcpCalls": 1,
+        "aiLookups": 1,
+        "aiDeliveries": 2
+      },
+      "browser (Firefox)": {
+        "conversations": 1,
+        "mcpCalls": 1,
+        "aiLookups": 1,
+        "aiDeliveries": 2
+      },
+      "curl": {
+        "conversations": 1,
+        "aiDeliveries": 2
+      }
+    },
+    "oa GET /sok": {
+      "AI assistant (ChatGPT-User)": {
+        "searches": 1,
+        "pageViews": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "searches": 1,
+        "pageViews": 1
+      },
+      "curl": {}
+    },
+    "oa GET /api/opplevelser/discover": {
+      "AI assistant (ChatGPT-User)": {
+        "searches": 1
+      },
+      "browser (Firefox)": {
+        "searches": 1
+      },
+      "curl": {}
+    },
+    "oa GET /opplevelse/:slug": {
+      "AI assistant (ChatGPT-User)": {
+        "pageViews": 1,
+        "aiDeliveries": 1
+      },
+      "browser (Firefox)": {
+        "pageViews": 1
+      },
+      "curl": {}
+    }
+  }
+}

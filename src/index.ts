@@ -161,7 +161,7 @@ import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
-import { trustScoreService } from "./services/trust-score-service";
+import { trustScoreService, TRUST_SCORE_FORMULA_VERSION } from "./services/trust-score-service";
 import {
   runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted, shouldSkipRecentRun,
   resolveMinIntervalHours, URL_BACKFILL_JOB, URL_BACKFILL_BOOT_DELAY_MS,
@@ -1439,9 +1439,13 @@ app.listen(Number(PORT), HOST, async () => {
   // boot-job gate, so it never blocks >500 ms nor overlaps url-backfill.
   // Slice 2 of dev-request 2026-10-08-serverheng-...: starts 4 min after listen
   // (was 2 s) and is skipped when it completed within the last 24 h
-  // (boot_job_state, same pattern as url-backfill).
+  // (boot_job_state, same pattern as url-backfill). The stamp is per formula
+  // version (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-
+  // og-places-treffvakt, S4-A1b), so the first boot after a formula change
+  // recalculates every score.
   scheduleBootTrustRecalc({
     getDb: () => getDb(),
+    formulaVersion: TRUST_SCORE_FORMULA_VERSION,
     recalc: trackJob("boot-trust-recalc", async () => {
       console.log("📊 Recalculating trust scores (background, chunked)...");
       const trustResult = await trustScoreService.recalculateAllChunked({ chunkSize: 20, pauseMs: 5 });

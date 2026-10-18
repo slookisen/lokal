@@ -42,7 +42,7 @@ export interface TestSummary { passed: number; failed: number; failures: string[
 const DENTAL_TOOLS = ["tannlege_akutt", "tannlege_info", "tannlege_kjeder", "tannlege_search", "tannlege_stats"];
 
 /** The words people search with (dev-request S4a); a first sentence needs at least one. */
-const SEARCH_WORDS = {
+export const SEARCH_WORDS = {
   dentist: /\b(dentists?|tannleger?)\b/i,
   orthodontist: /\b(orthodontists?|kjeveortoped(er)?)\b/i,
   emergency: /\b(emergency dentists?|akutt tannlege)\b/i,
@@ -99,6 +99,23 @@ const LOCKED_TOOL_FIELDS: Record<string, unknown> = {
 /** Other services a description must not point to (Helfo is a fact about a clinic, not a service to use). */
 const OTHER_SERVICES = /\b(rett fra bonden|rettfrabonden|opplevagent|google|chatgpt|openai|claude|anthropic|gemini|bing|legelisten|helsenorge)\b|https?:\/\//i;
 
+/**
+ * What a text breaks (S4a): directive or promotional words, figures, another service, or a tool of another
+ * vertical or one of `ownTools` (this server's other tools). `figures: false` leaves the figure rule out, for the
+ * A2A agent card's skill texts (dev-request 2026-10-17-dental-d3-rettelser, D3d), which check /\d{3,}/ instead.
+ */
+export function violations(text: string, ownTools: readonly string[] = [], opts: { figures?: boolean } = {}): string[] {
+  const { registeredMcpToolNames } = require("../services/mcp-tool-manifest") as typeof import("../services/mcp-tool-manifest");
+  const { DIRECTIVE_PATTERNS } = require("../../scripts/gen-connector-packs") as typeof import("../../scripts/gen-connector-packs");
+  const otherTools = [...registeredMcpToolNames("rfb"), ...registeredMcpToolNames("experiences")];
+  return [
+    ...[...DIRECTIVE_PATTERNS, ...PROMOTIONAL_PATTERNS].map((re) => text.match(re)?.[0]).filter((m): m is string => !!m),
+    ...(opts.figures !== false && /\d/.test(text) ? ["a figure"] : []),
+    ...(text.match(OTHER_SERVICES) ?? []).slice(0, 1),
+    ...[...otherTools, ...ownTools].filter((t) => text.includes(t)),
+  ];
+}
+
 function parseJsonRpcBody(text: string, contentType: string | null): any {
   if (contentType && contentType.includes("text/event-stream")) {
     const dataLine = text.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("data:")).pop();
@@ -147,17 +164,8 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
     const mcp = require("./dental-mcp") as typeof import("./dental-mcp");
     const { BRAND_ENTITIES } = require("../config/brand-entities") as typeof import("../config/brand-entities");
     const { shortToolDescription, registeredMcpToolNames } = require("../services/mcp-tool-manifest") as typeof import("../services/mcp-tool-manifest");
-    const { DIRECTIVE_PATTERNS } = require("../../scripts/gen-connector-packs") as typeof import("../../scripts/gen-connector-packs");
     const { ACUTE_ACCEPTS_LABEL } = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
-
-    /** What a text breaks: directive or promotional words, figures, other services or other tools. */
     const otherTools = [...registeredMcpToolNames("rfb"), ...registeredMcpToolNames("experiences")];
-    const violations = (text: string, ownTools: readonly string[] = []): string[] => [
-      ...[...DIRECTIVE_PATTERNS, ...PROMOTIONAL_PATTERNS].map((re) => text.match(re)?.[0]).filter((m): m is string => !!m),
-      ...(/\d/.test(text) ? ["a figure"] : []),
-      ...(text.match(OTHER_SERVICES) ?? []).slice(0, 1),
-      ...[...otherTools, ...ownTools].filter((t) => text.includes(t)),
-    ];
 
     // ── I: initialize and tools/list over real HTTP ──────────────────────
     const app = express();

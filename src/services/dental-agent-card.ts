@@ -10,6 +10,7 @@ import { signAgentCard } from "./agent-card-signing";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
 import { distributionFor } from "../config/distribution-channels";
+import { placesDisplayPolicyEnabled } from "./places-display-policy";
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
@@ -97,19 +98,43 @@ export function getDentalAgentCard(honestCount?: number | null): object {
           "otherwise per IP) is not raised by a key.",
       },
     },
+    // A2A dev-request 2026-10-17-dental-d3-rettelser (D3d, point 4): the skill
+    // texts say what message/send in routes/dental-a2a.ts does, under the S4a
+    // rules for the MCP descriptions (a search word in the first sentence,
+    // only what the answer has, no other tool or service, no directive or
+    // promotional words) without copying them. Each example, and each request
+    // quoted «like this», is answered by its own skill when sent as text, and
+    // each message.data key named here is read (dental-agent-card.test.ts).
+    // Ids, names, modes and x-mcp-tools are unchanged. Dev-request
+    // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+    // (A4-D): while the Places display rule is on, address, phone and website
+    // are listed «when known», since a value only Google Places gives is null
+    // (dental-places-display.ts); with it off the text is as before.
     skills: [
       {
         id: "tannlege_search",
         name: "Søk tannlegeklinikker / Search dental clinics",
         description:
-          "Søk blant norske tannlegeklinikker med fritekst og/eller strukturerte filtre. " +
-          "Search Norwegian dental clinics using free text and/or structured filters. " +
-          "Parameters: q (free text, matches name/city), fylke (county name, e.g. «Oslo», «Vestland»), " +
-          "spesialitet (specialty, e.g. «kjeveortopedi», «endodonti»), " +
-          "helfo («true» = Helfo direct-billing agreement only), " +
-          "akutt (1 = emergency duty clinics only). " +
-          "Eksempel / Example: «finn tannlege med Helfo-avtale i Bergen», " +
-          "\"find orthodontist in Trondheim\".",
+          "Finn en tannlege, kjeveortoped eller akutt tannlege i Norge etter sted, fylke, spesialitet, " +
+          "Helfo-avtale eller akuttilbud. " +
+          "Find a dentist, orthodontist or emergency dentist in Norway by place, county (fylke), specialty, " +
+          "Helfo agreement or emergency care. " +
+          "Send the request as written in a text part, in Norwegian or English, such as «kjeveortoped Trondheim»; " +
+          "`metadata.tolkning` shows how it was read. A text with a nine-digit org.nr gets that clinic, and a " +
+          "text with a statistics word gets the statistics. " +
+          "For a structured search, send `message.data` without a text part, with one or more of `fylke` " +
+          "(a county such as Vestland), `specialty` (such as kjeveortopedi), `helfo_agreement` (\"true\" or " +
+          "\"false\"), `acute_vakt` (1: clinics with an emergency claim, that is a sourced akuttvakt or that they " +
+          "take emergency patients) and `q` (a clinic name or place as written); a data part in `parts` is not " +
+          "read. `metadata.filter` shows the filter that was used. " +
+          "`count` is the number of clinics in the answer (at most 20) and `total` the number of clinics that " +
+          "match. `clinics` lists them, each with its name, org.nr, " +
+          (placesDisplayPolicyEnabled()
+            ? "postcode, place, county, Helfo status, emergency claim and profile URL, and its address, phone, " +
+              "website, online booking link, opening hours, "
+            : "address, postcode, place, county, phone, website, Helfo status, emergency claim and profile URL, " +
+              "and its online booking link, opening hours, ") +
+          "specialties and chain when known.",
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],
         examples: [
@@ -123,16 +148,16 @@ export function getDentalAgentCard(honestCount?: number | null): object {
         id: "tannlege_info",
         name: "Hent klinikkdetaljer / Get clinic details",
         description:
-          "Hent fullstendig profil for én tannlegeklinikk via organisasjonsnummer. " +
-          "Fetch full profile for a single dental clinic by organisation number (org_nr). " +
-          "Returns: name, address, county, phone, website, Helfo status, emergency duty, " +
-          "specialities, chain affiliation, and enrichment metadata. " +
-          "Parameter: org_nr (9-digit Norwegian organisation number). " +
-          "Eksempel / Example: org_nr «912345678».",
+          "Hent én tannlege eller spesialistpraksis i Norge etter organisasjonsnummer (org.nr). " +
+          "Get one dental clinic in Norway, a dentist or specialist practice, by its organisation number " +
+          "(org.nr). " +
+          "Send the nine-digit org.nr in a text part; it is read from the text only. " +
+          "The answer has the clinic with the same fields as each clinic in a search answer, or a text saying " +
+          "that no clinic has that org.nr.",
         inputModes: ["application/json"],
         outputModes: ["application/json"],
         examples: [
-          "{ \"org_nr\": \"912345678\" }",
+          "dental clinic with org.nr 912345678",
           "hent klinikk med orgnr 912345678",
         ],
       },
@@ -140,16 +165,19 @@ export function getDentalAgentCard(honestCount?: number | null): object {
         id: "tannlege_stats",
         name: "Aggregert statistikk / Aggregated statistics",
         description:
-          "Hent aggregerte nøkkeltall for den norske tannlegemarkedet. " +
-          "Fetch aggregated key figures for the Norwegian dental market. " +
-          "Returns: total clinic count, per-county breakdown, Helfo count, chain count, " +
-          "emergency-duty count, and specialist-clinic count. " +
-          "Eksempel / Example: «hvor mange tannleger finnes det i Norge?», " +
-          "\"how many dental clinics have Helfo agreement?\".",
+          "Nøkkeltall for det norske tannlegemarkedet: antall tannlege- og spesialistklinikker totalt og per " +
+          "fylke, og hvor mange som har Helfo-avtale, hører til en kjede, viser en akuttpåstand (akuttvakt med " +
+          "kilde, eller at klinikken tar imot akuttpasienter) eller oppgir spesialister eller spesialiteter. " +
+          "En tekst med «statistikk», «totalt» eller «oversikt» gir tallene. " +
+          "Key figures for dentist and specialist clinics in Norway: the total, per county (fylke), and how many " +
+          "have a Helfo agreement, belong to a chain, show an emergency claim (a sourced akuttvakt, or that the " +
+          "clinic takes emergency patients) or list specialists or specialties. " +
+          "A text part with «stats», «total» or «how many» gets them too. " +
+          "The figures are for all of Norway: a place or filter in the text is not applied.",
         inputModes: ["text/plain", "application/json"],
         outputModes: ["application/json"],
         examples: [
-          "hvor mange tannleger er det i Norge totalt?",
+          "hvor mange tannlegeklinikker er det i Norge totalt?",
           "statistikk per fylke",
           "how many clinics have Helfo agreement?",
         ],

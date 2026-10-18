@@ -9,18 +9,29 @@
  * raw acute_vakt flag only with provenance, and the profile link only from
  * clinicProfileUrl. No variant carries a Google rating: that waits for
  * Daniel's rating policy (Maps Platform terms allow caching only lat/lng and
- * place_id).
+ * place_id). Dev-request 2026-10-17-dental-d3-rettelser (D3d): the search
+ * card lists the specialties the specialty filter finds the clinic by
+ * (clinicSpecialties), and every variant shows the poststed in its official
+ * spelling and no placeholder postnummer "0000". Dev-request
+ * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+ * (A4-D): every variant shows the clinic through shownDentalAgent, so an
+ * address, phone, website or opening hours that only Google Places gives, or
+ * that is marked wrong, is null (dental-places-display.ts).
  *
  * Pure: no DB access (the detail card gets its specialists from the caller).
  */
 
-import { DentalAgentSchema, type DentalAgent, type DentalPerson } from "./dental-store";
+import { DentalAgentSchema, type DentalAgent, type DentalAgentRow, type DentalPerson } from "./dental-store";
 import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL, type AcuteClaim } from "./dental-acute-claim";
 import { isDisplayablePhone } from "./contact-normalizer";
+import { shownPostnummer } from "./norway-postnummer";
+import { officialPlaceSpelling } from "./search-intent/norwegian-query";
+import { clinicSpecialties } from "../config/dental-search-vocabulary";
 import { normalizeOpeningHours, openingHoursEntryText, type OpeningHoursEntry, type Weekday } from "../utils/opening-hours";
-import { clinicProfileUrl } from "../routes/dental-seo";
+import { clinicProfileUrl, titleCasePoststed } from "../routes/dental-seo";
+import { shownDentalAgent } from "./dental-places-display";
 
-type ClinicRow = DentalAgent & { id: string };
+type ClinicRow = DentalAgentRow;
 
 /**
  * One clinic in a search list (tannlege_search, tannlege_akutt). The required
@@ -57,7 +68,7 @@ export interface DentalDetailCard {
   org_nr: string | null | undefined;
   navn: string;
   adresse: string | null | undefined;
-  postnummer: string | null | undefined;
+  postnummer: string | null;
   poststed: string | null | undefined;
   fylke: string | null | undefined;
   telefon: string | null;
@@ -88,18 +99,19 @@ export function toDentalClinicCard(
   extra: { specialists: readonly DentalClinicSpecialist[] }
 ): DentalDetailCard;
 export function toDentalClinicCard(
-  agent: ClinicRow,
+  stored: ClinicRow,
   variant: "search" | "detail",
   extra?: { specialists: readonly DentalClinicSpecialist[] }
 ): DentalSearchCard | DentalDetailCard {
+  const agent = shownDentalAgent(stored);
   if (variant === "detail") {
     return {
       id: agent.id,
       org_nr: agent.org_nr,
       navn: agent.navn,
       adresse: agent.adresse,
-      postnummer: agent.postnummer,
-      poststed: agent.poststed,
+      postnummer: shownPostnummer(agent.postnummer),
+      poststed: displayPoststed(agent.poststed),
       fylke: agent.fylke,
       telefon: displayablePhone(agent.telefon),
       mobil: displayablePhone(agent.mobil),
@@ -125,15 +137,15 @@ export function toDentalClinicCard(
     };
   }
   const apningstider = compactOpeningHours(agent.opening_hours);
-  const spesialiteter = agent.available_specialties ?? [];
+  const spesialiteter = clinicSpecialties(agent);
   const chainBrand = agent.chain_brand?.trim();
   const prisniva = sourcedPriceBand(agent);
   return {
     navn: agent.navn,
     org_nr: agent.org_nr,
     adresse: agent.adresse ?? null,
-    postnummer: agent.postnummer ?? null,
-    poststed: agent.poststed,
+    postnummer: shownPostnummer(agent.postnummer),
+    poststed: displayPoststed(agent.poststed),
     fylke: agent.fylke,
     telefon: displayablePhone(agent.telefon),
     hjemmeside: agent.hjemmeside,
@@ -144,7 +156,7 @@ export function toDentalClinicCard(
     ...(spesialiteter.length ? { spesialiteter } : {}),
     ...(chainBrand ? { chain_brand: chainBrand } : {}),
     ...(prisniva ? { prisniva } : {}),
-    badges: clinicBadges(agent, true),
+    badges: clinicBadges(agent, spesialiteter.length > 0),
     profil_url: clinicProfileUrl(agent),
   };
 }
@@ -152,12 +164,22 @@ export function toDentalClinicCard(
 /**
  * A clinic in an A2A message/send answer: the stored row as before (so `id`
  * and every other key stay), with the values that were untrue made honest —
- * phone and mobile only when displayable, acute_vakt only with provenance —
- * the Google rating fields and the internal field_provenance left out, and
- * the search card's fields added with the card's values.
+ * phone and mobile only when displayable, acute_vakt only with provenance,
+ * the Places-only values null as on the cards (A4-D; also the row's own
+ * opening_hours and hjemmeside) — the Google rating fields, the internal
+ * field_provenance and Stage V's pending map left out, and the search card's
+ * fields added with the card's values.
  */
-export function toDentalA2aClinic(agent: ClinicRow) {
-  const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, field_provenance: _provenance, ...row } = agent;
+export function toDentalA2aClinic(stored: ClinicRow) {
+  const agent = shownDentalAgent(stored);
+  const {
+    rating: _rating,
+    rating_count: _ratingCount,
+    rating_source: _ratingSource,
+    field_provenance: _provenance,
+    stage_v_pending_correction: _pending,
+    ...row
+  } = agent;
   // The card's keys come last and keep the row's place for the ones it shares
   // (navn, telefon, adresse, …); its telefon is the displayable one. The two
   // row keys the card leaves out without a value are null, not the raw value
@@ -181,16 +203,38 @@ function publicAcuteVakt(agent: ClinicRow): 1 | null {
   return agent.acute_vakt === 1 && hasAcuteVaktProvenance(agent.field_provenance) ? 1 : null;
 }
 
-/** «Spesialist» is a search-list badge only, as before; tannlege_info lists the specialties themselves. */
-function clinicBadges(agent: ClinicRow, withSpecialist: boolean): string[] {
+/**
+ * «Spesialist» is a search-list badge only, as before, given when the search
+ * card lists a specialty (clinicSpecialties); tannlege_info lists the
+ * specialties themselves.
+ */
+function clinicBadges(agent: ClinicRow, specialist: boolean): string[] {
   const badges: string[] = [];
   if (agent.helfo_agreement === "true") badges.push("Helfo-avtale");
   const acute = resolveAcuteClaim(agent);
   if (acute === "vakt") badges.push("Akuttvakt");
   else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);
   if (agent.verification_status === "verified") badges.push("Verifisert");
-  if (withSpecialist && agent.available_specialties?.length) badges.push("Spesialist");
+  if (specialist) badges.push("Spesialist");
   return badges;
+}
+
+/**
+ * The poststed as the cards show it (D3d): a value stored in ASCII form gets
+ * its official spelling (officialPlaceSpelling), in capitals when stored in
+ * capitals ("TROMSOE" -> "TROMSØ"), else title-cased for a poststed
+ * ("Tromsoe" -> "Tromsø") or as the kommune is written ("Baerum" -> "Bærum").
+ * An empty or unknown value, or one that differs from the official name only
+ * in case ("Bergen", "Mo i Rana"), is kept as stored. Only the stored value is
+ * read, never the postnummer's own poststed (a Tromsø clinic at 9022 Kroken
+ * still shows Tromsø).
+ */
+function displayPoststed(stored: string | null | undefined): string | null | undefined {
+  if (!stored) return stored;
+  const official = officialPlaceSpelling(stored);
+  if (!official || official.name.toLowerCase() === stored.toLowerCase()) return stored;
+  if (stored === stored.toUpperCase()) return official.name.toUpperCase();
+  return official.kind === "poststed" ? titleCasePoststed(official.name) : official.name;
 }
 
 // The canonical price bands, read from the write schema (dental-store's

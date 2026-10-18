@@ -14,7 +14,8 @@
 //                                      one, so no query finds fewer clinics
 //                                      than before (see the function).
 //
-// No DB access here: the gazetteer (poststed spellings) and the count
+// No DB access here: the gazetteer (poststed spellings, and since D3f the
+// landsdeler and byområder of config/norway-search-areas.ts) and the count
 // function are passed in. Input is bounded (MAX_QUERY_CHARS, MAX_QUERY_TOKENS,
 // MAX_TERM_CHARS) before any work, so an oversized query costs no more than
 // a normal one on the main thread (dev-requests 2026-09-19 / 2026-09-26).
@@ -35,7 +36,7 @@ import {
 } from "./search-intent/norwegian-query";
 import { resolveFylke2024, resolveKommunenummerForName } from "./fylke-2024-migration";
 import { cityToFylke, fylkeEquivalents, normaliseFylke } from "./norway-fylke";
-import { postnumreForKommune } from "./norway-postnummer";
+import { postnumreForKommune, resolveKommuneFromPostnummer } from "./norway-postnummer";
 
 /** Only this much of the text is read (the rest is ignored, with a note). */
 export const MAX_QUERY_CHARS = 256;
@@ -54,7 +55,7 @@ export interface DentalQueryFilter {
   /** A poststed in the kommune of the same name («Bergen»): its spellings OR the kommune's postnumre (S3b). */
   poststed_or_postnummer?: { poststed_in: string[]; postnummer_in: string[] };
   fylke?: string;
-  /** A re-split 2020 fylke ("Viken"): its own name plus today's fylker. */
+  /** A re-split 2020 fylke ("Viken"): its own name plus today's fylker. A landsdel ("Vestlandet", D3f): its fylker. */
   fylke_in?: string[];
   specialty?: string;
   helfo_agreement?: "true";
@@ -128,7 +129,8 @@ export function parseDentalQuery(
   //    (longest) usable one applies and further places are used up with a
   //    note. A place that cannot be a filter (Herøy: several kommuner, no
   //    single fylke) stays in the text as name words; one outside the
-  //    caller's explicit fylke is used up and noted.
+  //    caller's explicit fylke is used up and noted. A kommune word right
+  //    after the place ("Kvam kommune") names it as the kommune.
   const scope = opts.withinFylke && normaliseFylke(opts.withinFylke) ? new Set(fylkeEquivalents(opts.withinFylke)) : null;
   let placeSet = false;
   let placeDropped = false;
@@ -139,7 +141,8 @@ export function parseDentalQuery(
       notes.push(`flere steder nevnt; «${shown}» brukes ikke`);
       continue;
     }
-    const reading = readPlace(place, shown, gazetteer);
+    const next = tokens[place.start + place.length];
+    const reading = readPlace(place, shown, gazetteer, !!next && vocabulary.kommuneWords.has(next));
     if (!("fields" in reading)) {
       notes.push(reading.note);
       continue;
@@ -235,8 +238,14 @@ interface PlaceReading {
 
 // The filter fields for one place, or a note when the place cannot be used
 // as a filter (ambiguous kommune with no fylke); its words then stay in the
-// text and are matched as name words.
-function readPlace(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer): PlaceReading | { note: string } {
+// text and are matched as name words. `namedAsKommune`: a kommune word
+// follows the place in the text ("Kvam kommune").
+function readPlace(
+  place: PlaceMatch,
+  shown: string,
+  gazetteer: PlaceGazetteer,
+  namedAsKommune: boolean
+): PlaceReading | { note: string } {
   switch (place.kind) {
     case "poststed": {
       const values = place.values.filter((v) => v.length <= MAX_TERM_CHARS).slice(0, MAX_POSTSTED_IN);
@@ -245,17 +254,20 @@ function readPlace(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer):
       // S3b: a poststed that lies in the one kommune of the same name
       // («Bergen», «Tromsø») covers the whole kommune: its stored spellings
       // OR the kommune's postnumre, so Nesttun and Fyllingsdalen count as
-      // Bergen. The poststed alone, as before, when several kommuner share
-      // the name (Herøy), when the poststed lies in another kommune (KVAM is
-      // in Nord-Fron, not Kvam kommune), or when the kommune has more
-      // postnumre than the store takes (Oslo, where the poststed and the
-      // kommune are nearly the same). The fylker stay those of the poststed,
-      // so an explicit fylke keeps or drops the place as before, and the
-      // filter only widens: no query finds fewer clinics than before.
+      // Bergen. So does a poststed in another kommune when the text names
+      // the kommune (D3c: «Kvam kommune» is the poststed KVAM in Nord-Fron
+      // OR Kvam kommune's NORHEIMSUND, ØYSTESE …). The poststed alone, as
+      // before, when several kommuner share the name (Herøy), when the
+      // poststed lies in another kommune and the text does not say kommune
+      // («tannlege i Kvam»), or when the kommune has more postnumre than the
+      // store takes (Oslo, where the poststed and the kommune are nearly the
+      // same). The fylker stay those of the poststed, so an explicit fylke
+      // keeps or drops the place as before, and the filter only widens: no
+      // query finds fewer clinics than before.
       const kommune = kommuneNamed(gazetteer.kommuner.get(placeKey(place.phrase)));
       if (
         kommune &&
-        kommunerForPoststed(place.values[0]).includes(kommune.kommunenummer) &&
+        (namedAsKommune || kommunerForPoststed(place.values[0]).includes(kommune.kommunenummer)) &&
         kommune.postnumre.length > 0 &&
         kommune.postnumre.length <= MAX_POSTNUMMER_IN
       ) {
@@ -283,6 +295,19 @@ function readPlace(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer):
       if (!fylke) return { note: `«${shown}» er en region uten ett fylke; ordet brukes som navnesøk` };
       return { fields: { fylke }, fylker: [fylke], line: `sted: ${fylke} (fylke; regionen ${place.name})` };
     }
+    case "landsdel": {
+      // D3f: a part of the country («Vestlandet», «Nord-Norge») is its
+      // fylker (config/norway-search-areas.ts), each as «tannlege i X» reads
+      // it (today's name, so fylke_in matches as fylke X does).
+      const fylker = place.values;
+      return {
+        fields: { fylke_in: [...fylker] },
+        fylker,
+        line: `sted: ${listNames(fylker)} (${fylker.length > 1 ? "fylker" : "fylke"}; landsdelen ${place.name})`,
+      };
+    }
+    case "byomrade":
+      return readCityArea(place, shown, gazetteer);
     case "kommune": {
       const kommune = kommuneNamed(place.name);
       if (kommune) {
@@ -309,6 +334,45 @@ function readPlace(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer):
   }
 }
 
+// D3f: a city area («Osloområdet», «Tromsøya») is its kommuner
+// (config/norway-search-areas.ts), each read as its name alone is (S3b): the
+// poststed of the kommune's name in all its stored spellings, when that
+// poststed lies in the kommune, OR the kommune's postnumre. Spellings or
+// postnumre that would take the area past the store's caps (MAX_POSTSTED_IN,
+// MAX_POSTNUMMER_IN) are left out, as Oslo's 445 postnumre are left out of
+// «tannlege i Oslo», and a kommune left with neither is not in the line. The
+// areas in the table stay within the caps (checked in tests), so an area
+// finds every clinic that one of its kommuner finds alone.
+function readCityArea(place: PlaceMatch, shown: string, gazetteer: PlaceGazetteer): PlaceReading | { note: string } {
+  const poststeder: string[] = [];
+  const postnumre: string[] = [];
+  const fylker: string[] = [];
+  const used: string[] = [];
+  for (const name of place.values) {
+    const kommune = kommuneNamed(name);
+    if (!kommune) continue;
+    const stored = gazetteer.poststeder.get(placeKey(name)) ?? [];
+    const own = stored.length > 0 && kommunerForPoststed(stored[0]).includes(kommune.kommunenummer)
+      ? stored.filter((v) => v.length <= MAX_TERM_CHARS)
+      : [];
+    const withSpellings = own.length > 0 && poststeder.length + own.length <= MAX_POSTSTED_IN;
+    const withPostnumre = kommune.postnumre.length > 0 && postnumre.length + kommune.postnumre.length <= MAX_POSTNUMMER_IN;
+    if (!withSpellings && !withPostnumre) continue;
+    if (withSpellings) poststeder.push(...own);
+    if (withPostnumre) postnumre.push(...kommune.postnumre);
+    if (kommune.fylke && !fylker.includes(kommune.fylke)) fylker.push(kommune.fylke);
+    used.push(name);
+  }
+  if (used.length === 0) return { note: `«${shown}» kan ikke brukes som sted; ordet brukes som navnesøk` };
+  const fields: DentalQueryFilter =
+    poststeder.length === 0
+      ? { postnummer_in: postnumre }
+      : postnumre.length === 0
+        ? { poststed_in: poststeder }
+        : { poststed_or_postnummer: { poststed_in: poststeder, postnummer_in: postnumre } };
+  return { fields, fylker, line: `sted: ${listNames(used)} (${used.length > 1 ? "kommuner" : "kommune"}; ${place.name})` };
+}
+
 // The one kommune with this name: its number, fylke and postnumre. null for
 // no name, a name several kommuner share (Herøy, Våler) or an unknown one.
 function kommuneNamed(name: string | undefined): { kommunenummer: string; fylke?: string; postnumre: string[] } | null {
@@ -333,10 +397,29 @@ export interface DentalSearchTolkning {
   /** The text that was read (at most MAX_QUERY_CHARS characters). */
   sporring: string;
   tolket_som: string[];
-  /** The filter the result was found with. */
-  filter: Record<string, unknown>;
+  /**
+   * The filter the result was found with, as tolkningFilter() shows it: each
+   * postnummer list is {kommunenummer, antall} (or {antall}), not the list.
+   * The plan's own filter, and A2A metadata.filter, keep the list.
+   */
+  filter: DentalTolkningFilter;
   /** true: the parsed reading found nothing; every hit comes from the old reading of the text. */
   fallback: boolean;
+}
+
+/** A postnummer list as tolkning shows it: one whole kommune and how many, or just how many. */
+export type TolkningPostnumre = { kommunenummer: string; antall: number } | { antall: number };
+
+/**
+ * A store filter as tolkning shows it (tolkningFilter): the same fields, with
+ * each postnummer_in, at any depth, a TolkningPostnumre. For display only;
+ * the store never reads it (its filter is dental-store's ListFilter).
+ */
+export interface DentalTolkningFilter {
+  [field: string]: unknown;
+  postnummer_in?: TolkningPostnumre;
+  poststed_or_postnummer?: { poststed_in: string[]; postnummer_in: TolkningPostnumre };
+  natural?: { parsed: DentalTolkningFilter; legacy: DentalTolkningFilter };
 }
 
 export interface DentalSearchPlan {
@@ -359,13 +442,17 @@ export interface DentalSearchPlan {
  *   query never finds fewer clinics than before, and a clinic named in the
  *   text («Bergen Tannhelse») still comes first. The old reading is the
  *   whole text as `q` (MCP, /sok), or `legacy(text)` (A2A: its keyword
- *   parser, kept in full, so «Tromsø» still finds what fylke Troms found).
+ *   parser, kept in full; since D3c2 it reads a fylke only from whole
+ *   words, so «Tromsø» is its q «tromsø», no longer fylke Troms).
  * - An old reading with no filter at all (A2A «tannlege i Ås»: words of two
  *   letters were dropped, and it listed the first clinics, which is no
  *   answer) is replaced by the parsed one, and used only when the parsed
  *   one finds nothing.
  * - tolkning.fallback is true when the parsed reading found nothing and
  *   every hit comes from the old reading.
+ * - tolkning.filter shows `filter` with each postnummer list shortened
+ *   (tolkningFilter); `filter` itself, which the caller searches with,
+ *   keeps the lists.
  *
  * With the parser disabled the old behaviour is used as is (no tolkning);
  * with no query text the explicit fields are used as is.
@@ -401,7 +488,7 @@ export function planDentalSearch(opts: {
   const plan = (filter: Record<string, unknown>, count: number, fallback: boolean): DentalSearchPlan => ({
     filter,
     count,
-    tolkning: { sporring: query.slice(0, MAX_QUERY_CHARS), tolket_som: parsed.interpretation, filter, fallback },
+    tolkning: { sporring: query.slice(0, MAX_QUERY_CHARS), tolket_som: parsed.interpretation, filter: tolkningFilter(filter), fallback },
   });
 
   if (Object.keys(legacy).length === 0) {
@@ -416,6 +503,35 @@ export function planDentalSearch(opts: {
   const filter = { ...explicit, natural: { parsed: parsedPart, legacy } };
   const count = opts.count(filter);
   return plan(filter, count, hasParsed && count > 0 && opts.count(parsedFilter) === 0);
+}
+
+/**
+ * A store filter as tolkning shows it (D3c). A kommune's postnummer list
+ * (up to MAX_POSTNUMMER_IN; Bergen's 144 were about 1.1 KB of every answer)
+ * says no more than the kommune, so each postnummer_in, at any depth,
+ * becomes {kommunenummer, antall} when it is one whole kommune's postnumre,
+ * else {antall}. Pure: `filter` is not changed.
+ */
+export function tolkningFilter(filter: Record<string, unknown>): DentalTolkningFilter {
+  const out: Record<string, unknown> = {};
+  for (const [field, value] of Object.entries(filter)) {
+    if (field === "postnummer_in" && Array.isArray(value)) out[field] = shownPostnumre(value);
+    else if (value !== null && typeof value === "object" && !Array.isArray(value)) out[field] = tolkningFilter(value as Record<string, unknown>);
+    else out[field] = value;
+  }
+  return out;
+}
+
+function shownPostnumre(list: readonly unknown[]): TolkningPostnumre {
+  const first = typeof list[0] === "string" ? resolveKommuneFromPostnummer(list[0]) : null;
+  if (first && "kommunenummer" in first) {
+    const whole = postnumreForKommune(first.kommunenummer);
+    const given = new Set(list);
+    if (whole.length === list.length && whole.every((p) => given.has(p))) {
+      return { kommunenummer: first.kommunenummer, antall: list.length };
+    }
+  }
+  return { antall: list.length };
 }
 
 function definedOnly(o: Record<string, unknown>): Record<string, unknown> {

@@ -242,7 +242,8 @@ export async function runDentalStedStavematerTests(
         assertEq([page.status, finnes(page.text)], [200, "Det finnes 5 klinikker i Bergen."], `C1: ${c.navn} (${c === bergenUpper[0] ? "BERGEN" : "Bergen, offentlig_klinikk"}) gives the /sted/bergen count`);
       }
       const aalPage = await callRoute(router, `/klinikk/${aalClinic.slug}`);
-      assertEq(finnes(aalPage.text), "Det finnes 3 klinikker i Aal.", "C2: an Aal clinic gives the /sted/aal count (3)");
+      // The place is named in its official spelling since D3d trinn 3 (was «i Aal.»).
+      assertEq(finnes(aalPage.text), "Det finnes 3 klinikker i Ål.", "C2: an Aal clinic gives the /sted/aal count (3), named Ål");
     }
 
     // ── D. the sitemap ───────────────────────────────────────────────────

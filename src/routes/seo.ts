@@ -41,6 +41,7 @@ import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
+import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
@@ -49,6 +50,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { searchTrafficClass } from "../services/search-tracking";
 import { AI_DELIVERY_WINDOW_DAYS } from "../services/profile-ai-deliveries-compute";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
@@ -56,8 +58,9 @@ import { normalizeBmEventTime } from "../utils/bm-event-time";
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
 import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
-// rating markup, Offer return/shipping terms and the visible rating text.
-import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay } from "../services/structured-data-policy";
+// rating markup, Offer return/shipping terms, the visible rating text and
+// whether the producer page has Product nodes (S6 del B).
+import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay, producerPageProductNodes } from "../services/structured-data-policy";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
@@ -546,6 +549,45 @@ export function productLabel(name: string, lang: Lang): string {
 export function isCategoryWord(name: string): boolean {
   return !!CATEGORY_NAME_TO_KEY[(name || "").trim().toLowerCase()];
 }
+
+/**
+ * dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+ * (S6 del A): the producer-page JSON-LD name and price of a product whose
+ * price field holds no price, read from its name ("Lammelår – kr 275/kg" →
+ * "Lammelår", 275). A price it gives is always a "kr" price the visible name
+ * shows.
+ * - "kr" must come right before the number. Before, any dash before a digit
+ *   split the name: "Sesonggrønnsaker (40-50 sorter)" became
+ *   «Sesonggrønnsaker (40» at an invented 50, "Gardsmjølk – 2 liter/veke
+ *   abonnement" «Gardsmjølk» at 2, and "Poteter 5-10 kg" the Thing «Poteter 5».
+ * - A multi-buy ("Gave - 2 for kr 100", "2 x kr 100", "pr kr 50") and a name
+ *   with more than one kr price ("Kake – kr 50 (liten), kr 90 (stor)") give
+ *   no price: no single number is the product's price.
+ * - The name is cut only when a price was found, and a parenthesis the price
+ *   part closes is closed: "Selvplukk bringebær (kurv 300g - kr 50)" →
+ *   "Selvplukk bringebær (kurv 300g)", not "(kurv 300g".
+ * - The cut name goes through productLabel like a whole name, so EN pages
+ *   translate it ("Honning - kr. 150" → "Honey").
+ * - A price after the number ("Egg – 60 kr") gives none: the 2026-10-17
+ *   feed had no name of that form, and parseNokPrice stays the one judge of
+ *   the number.
+ * Without a price: the whole name (through productLabel) and null.
+ */
+export function splitNamePrice(rawName: string, lang: Lang): { name: string; price: number | null } {
+  const whole = { name: productLabel(rawName, lang), price: null };
+  const m = rawName.match(/^(.+?)\s*[–\-—]\s*(kr\.?\s*\d.*)$/i)
+    || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
+  if (!m) return whole;
+  const head = m[1].trim();
+  if (/(?:\b(?:for|per|pr)\.?|(?:^|[\s\d])[x×])\s*$/i.test(head)) return whole;
+  if ((rawName.match(/\bkr\.?\s*\d/gi) || []).length > 1) return whole;
+  const price = parseNokPrice(m[2]);
+  if (price === null) return whole;
+  const depth = (s: string): number => (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
+  const closes = Math.max(0, Math.min(depth(head), -depth(m[2])));
+  return { name: productLabel(head + ")".repeat(closes), lang), price };
+}
+
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
 }
@@ -964,7 +1006,8 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 
   // Rating: "★ 4.7 · 159 anmeldelser på Google". The stored rating is Google's,
   // so the source is always named (dev-request 2026-10-16-rfb-strukturerte-data-
-  // tredjepartsrating-og-places-treffvakt, S2).
+  // tredjepartsrating-og-places-treffvakt, S2). Nothing in RATING_DISPLAY_MODE
+  // 'hidden', the mode since S4-A1a.
   const ratingDisplay = formatRatingDisplay({ rating: knowledge?.googleRating, count: knowledge?.googleReviewCount, source: "google" }, lang);
   const rating = ratingDisplay ? `<span class="pc-rating">${escapeHtml(ratingDisplay.text)}</span>` : "";
 
@@ -1401,10 +1444,11 @@ router.get("/", (req: Request, res: Response) => {
       }).join("");
 
     // Published translations for the whole featured list in one query
-    // (description on the row, about on the knowledge object).
+    // (description on the row, about on the knowledge object). The rich cards
+    // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
     featured.forEach((a: any, i: number) => {
-      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id)?.knowledge || {});
+      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {});
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
@@ -1686,7 +1730,9 @@ const SEARCH_CSS = `
 router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const searchStarted = Date.now();
   const lang = req.lang;
-  const q = typeof req.query.q === "string" ? req.query.q : "";
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read, cut at a word
+  // boundary (utils/free-text.ts), before route intent, parser and geocoder.
+  const q = capFreeText(typeof req.query.q === "string" ? req.query.q : "");
   const frontendLat = parseFloat(req.query.lat as string);
   const frontendLng = parseFloat(req.query.lng as string);
   const hasBrowserCoords = isValidLatLng(frontendLat, frontendLng);
@@ -1769,7 +1815,13 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // discover() can widen a NAME search past our radius by itself, and the
     // ladder below never runs in that case (wasNameMatch short-circuits it).
     const discoverMeta: DiscoverMeta = {};
-    let results = marketplaceRegistry.discover(query, discoverMeta);
+    // Slice I-Z: our own traffic, probes and spam see the same page but raise
+    // no discovery counter, and the conversation below is stored as theirs
+    // (search-tracking.ts searchTrafficClass).
+    const requestMeta = buildRequestMeta(req);
+    const trafficClass = searchTrafficClass({ meta: requestMeta, text: q });
+    const trackDiscovery = trafficClass === "external";
+    let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery });
 
     // If discover returned name-matched results (relevanceScore≥0.9 +
     // matchReasons starts with "Navnematch"), don't run the geo-fallback —
@@ -1802,7 +1854,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         if (productTerms) (expanded as any)._productTerms = productTerms;
         if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         const expandedMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(expanded, expandedMeta);
+        results = marketplaceRegistry.discover(expanded, expandedMeta, { trackDiscovery });
         appliedRadiusKm = radius;
         tagsDropped = !!expandedMeta.tagsRelaxed;
       }
@@ -1811,7 +1863,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
         if (productTerms) (noGeo as any)._productTerms = productTerms;
         if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         const noGeoMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(noGeo, noGeoMeta);
+        results = marketplaceRegistry.discover(noGeo, noGeoMeta, { trackDiscovery });
         geoDropped = true;
         tagsDropped = !!noGeoMeta.tagsRelaxed;
       }
@@ -1894,7 +1946,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
           queryText: q || "nærhetssøk",
           source: "web",
           buyerAgentName: "Besøkende",
-          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+          requestMeta, // (item 3) internal-traffic classification
+          trafficClass, // slice I-Z: a probe or spam is no countable conversation
           autoRespond: true,
         });
       } catch { /* non-critical — don't break search if logging fails */ }
@@ -5210,7 +5263,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] claim status query failed:", e);
     }
 
-    const info = knowledgeService.getAgentInfo(agent.id);
+    // withGoogleRating: the profile stat reads it, RATING_DISPLAY_MODE decides (S4-A1a).
+    const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true });
     const k = (info?.knowledge || {}) as any;
     const meta = (info?.meta || {}) as any;
 
@@ -5979,7 +6033,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // (Google Places), and Google's review-snippet guidelines only accept
     // ratings a site collects itself, so neither becomes rating/review
     // markup (the policy module returns null for any non-first-party
-    // source). The rating is shown as text naming Google (S2); reviewsHtml
+    // source). The rating could be shown as text naming Google (S2), but not
+    // in RATING_DISPLAY_MODE 'hidden', the mode since S4-A1a; reviewsHtml
     // below is unchanged.
     const ratingJsonLd = buildRatingJsonLd({ source: "google", rating: k.googleRating, count: k.googleReviewCount });
     if (ratingJsonLd) jsonLd.aggregateRating = ratingJsonLd;
@@ -6001,7 +6056,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         }).join("")
       : "";
 
-    // Products as makesOffer — Google requires price + priceCurrency in every Offer
+    // Products as makesOffer — Google requires price + priceCurrency in every
+    // Offer. Since S6 del B a priced product is a plain Offer from the farm
+    // (name, price, priceCurrency), not a Product: structured-data-policy.ts
+    // rule 7.
     if (productsList.length) {
       const unpricedItems: any[] = [];
       const pricedOffers = productsList.slice(0, 20).map((p: any) => {
@@ -6015,12 +6073,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
         let priceNum = parseNokPrice(priceValue);
         if (priceNum === null) {
-          const m = rawName.match(/^(.+?)\s*[–\-—]\s*((?:kr\.?\s*)?\d.*)$/i)
-            || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
-          if (m) {
-            productName = m[1].trim();
-            priceNum = parseNokPrice(m[2]);
-          }
+          // S6 del A: only a "kr" price the name shows, and the name is cut
+          // only when it has one (splitNamePrice).
+          const fromName = splitNamePrice(rawName, lang);
+          productName = fromName.name;
+          priceNum = fromName.price;
         }
 
         // dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): Google
@@ -6032,6 +6089,17 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           return null;
         }
 
+        // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+        // (S6 del B): no Product node on a producer page (policy rule 7). The
+        // Offer sits in the farm's own makesOffer, so it needs no seller; it
+        // claims no stock status (no product data holds one), brand or
+        // description.
+        if (!producerPageProductNodes()) {
+          return { "@type": "Offer", "name": productName, "price": priceNum, "priceCurrency": "NOK" };
+        }
+
+        // Rollback mode only (PRODUCER_PAGE_PRODUCT_NODES = true): the Product
+        // form as before S6 del B, with del A's names and prices.
         const product: any = {
           "@type": "Product",
           "name": productName,

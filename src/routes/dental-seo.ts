@@ -10,11 +10,12 @@ import {
   getDentalAgentById,
   listPoststeder,
   listRelatedClinics,
+  listDentalNamesakes,
   getDentalAgentsForSitemap,
   getDentalAggregateLastmods,
   isThinDentalProfile,
 } from "../services/dental-store";
-import type { DentalAgent, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
+import type { DentalAgent, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
@@ -34,6 +35,7 @@ import { INDEXNOW_KEY } from "../services/indexnow-service";
 // dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: the
 // shell's JSON-LD goes through the serializer that escapes < > & U+2028 U+2029.
 import { jsonLdScriptTag } from "../services/safe-script-json";
+import { formatRatingDisplay } from "../services/structured-data-policy";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -49,8 +51,20 @@ import { generalLimiter } from "../middleware/security";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { shownDentalAgent } from "../services/dental-places-display";
+import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
+import { capFreeText } from "../utils/free-text";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+// dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
+// clinic page names its place in the official spelling, by the same lookup as
+// the MCP/A2A cards.
+import { officialPlaceSpelling } from "../services/search-intent/norwegian-query";
+// dev-request 2026-10-17-dental-d3-rettelser (D3d): the web card's chips are
+// the specialties the filter finds a clinic by, and the placeholder postnummer
+// "0000" is never shown, as on the MCP/A2A cards.
+import { clinicSpecialties } from "../config/dental-search-vocabulary";
+import { shownPostnummer } from "../services/norway-postnummer";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
 import { DENTAL_LANDING_CONFIG, DENTAL_STATIC_PAGE_DATES } from "../config/dental-landing";
@@ -311,13 +325,42 @@ export function slugifyText(text: string): string {
 
 /** Title-case a DB poststed value (stored uppercase, e.g. "OSLO" → "Oslo",
  *  "MO I RANA" → "Mo i Rana"). Small Norwegian conjunctions stay lowercase
- *  when not first word. */
+ *  when not first word. Each part of a hyphenated name is capitalised
+ *  ("SØR-FRON" → "Sør-Fron", not "Sør-fron"; D3d trinn 3). */
 export function titleCasePoststed(s: string): string {
   const SMALL = new Set(["i", "og", "på", "av", "ved", "for"]);
   return s.toLowerCase().split(" ").map((word, idx) => {
     if (idx > 0 && SMALL.has(word)) return word;
-    return word.charAt(0).toUpperCase() + word.slice(1);
+    return word.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("-");
   }).join(" ");
+}
+
+/**
+ * A stored poststed as the clinic page names it (dev-request
+ * 2026-10-17-dental-d3-rettelser, D3d punkt 2 trinn 3): title-cased like
+ * titleCasePoststed, in the official spelling where the stored value is a
+ * fold of one ("Tromsoe" → "Tromsø", "Baerum" → "Bærum", "Nord Aurdal" →
+ * "Nord-Aurdal"), by officialPlaceSpelling, the lookup the MCP/A2A cards use.
+ * A value qualified with « i …» that is no official name as a whole gets the
+ * official spelling of the place before the qualifier ("Heroey I M Og R" →
+ * "Herøy i M og R"). The official spelling is taken only when it slugs like
+ * the stored value: /sted groups spellings by slugifyText (D3b) and the
+ * lookup goes by placeKey, so the name the page shows and its /sted/<slug>
+ * link are always the same place. Anything else is title-cased as stored.
+ */
+export function officialPlaceLabel(stored: string): string {
+  const asStored = titleCasePoststed(stored);
+  const words = asStored.split(" ");
+  const qualifierAt = words.indexOf("i", 1);
+  const candidates: Array<[place: string, qualifier: string]> = [[stored, ""]];
+  if (qualifierAt > 0) candidates.push([words.slice(0, qualifierAt).join(" "), ` ${words.slice(qualifierAt).join(" ")}`]);
+  for (const [place, qualifier] of candidates) {
+    const official = officialPlaceSpelling(place);
+    if (!official) continue;
+    const label = (official.kind === "poststed" ? titleCasePoststed(official.name) : official.name) + qualifier;
+    return slugifyText(label) === slugifyText(stored) ? label : asStored;
+  }
+  return asStored;
 }
 
 // ─── orch-PR-20260613 finn-tannlege clinic content differentiation ──────────────
@@ -359,6 +402,40 @@ export function isValidLocality(s: string | null | undefined): boolean {
   return true;
 }
 
+// ─── dev-request 2026-10-17-dental-d3-rettelser (D3e): namesakes ──────────
+/**
+ * What tells a clinic's page apart from the page of another clinic with the
+ * same name in the same place (listDentalNamesakes). Without it the two have
+ * the same <title> and meta description.
+ *   { place }  "<postnummer> <Poststed>", when the clinic's own postnummer is
+ *              a real one (not empty, not the placeholder 0000) that none of
+ *              the namesakes has; the place named by officialPlaceLabel, as
+ *              everywhere else on the page (D3d trinn 3);
+ *   { orgnr }  otherwise the org.nr, which no other row has;
+ *   null       no namesake, or no org.nr either: the page is as before.
+ * The street address is never used, because it can hold a c/o address.
+ */
+export type NamesakeDisambiguator = { place: string } | { orgnr: string };
+
+/** A stored postnummer that may be shown and is four digits, trimmed; else null. */
+function realPostnummer(pnr: string | null | undefined): string | null {
+  const value = shownPostnummer(pnr)?.trim();
+  return value && /^\d{4}$/.test(value) ? value : null;
+}
+
+export function namesakeDisambiguator(
+  agent: Pick<DentalAgent, "org_nr" | "postnummer" | "poststed">,
+  namesakes: ReadonlyArray<Pick<DentalNamesake, "postnummer">>
+): NamesakeDisambiguator | null {
+  if (namesakes.length === 0) return null;
+  const own = realPostnummer(agent.postnummer);
+  if (own && isValidLocality(agent.poststed) && namesakes.every((n) => realPostnummer(n.postnummer) !== own)) {
+    return { place: `${own} ${officialPlaceLabel(agent.poststed!)}` };
+  }
+  const orgnr = agent.org_nr?.trim();
+  return orgnr ? { orgnr } : null;
+}
+
 /**
  * Build a unique, natural-Norwegian clinic description from structured fields.
  * Only states facts that are present in the data; omits clauses when the field
@@ -372,36 +449,46 @@ export function isValidLocality(s: string | null | undefined): boolean {
  *                      differentiating locality clause to the short variant
  *                      when it is at least 2.
  * @param short         If true, produce a meta-description-length string (≤160 chars).
+ * @param namesake      Optional (D3e): what tells the page apart from a
+ *                      namesake's (namesakeDisambiguator). The opening sentence
+ *                      then names the place with its postnummer, or ends with
+ *                      «Org.nr N.», and the short variant never cuts it.
  */
 export function buildClinicDescription(
   agent: DentalAgent,
   localityCount?: number,
-  short?: boolean
+  short?: boolean,
+  namesake?: NamesakeDisambiguator | null
 ): string {
   const parts: string[] = [];
 
-  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values
-  const validPoststed = isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : null;
+  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values;
+  // the official spelling ("i Tromsø", not "i Tromsoe"; D3d trinn 3)
+  const validPoststed = isValidLocality(agent.poststed) ? officialPlaceLabel(agent.poststed!) : null;
   const validFylke = isValidLocality(agent.fylke) ? agent.fylke! : null;
+  // "i 0190 Oslo" on a namesake's page (D3e); { place } implies a valid poststed.
+  const localityLabel = namesake && "place" in namesake ? namesake.place : validPoststed;
 
   const locPart = validPoststed
     ? validFylke && validFylke.toLowerCase() !== validPoststed.toLowerCase()
-      ? `i ${validPoststed}, ${validFylke}`
-      : `i ${validPoststed}`
+      ? `i ${localityLabel}, ${validFylke}`
+      : `i ${localityLabel}`
     : validFylke
     ? `i ${validFylke}`
     : null;
 
   // Opening sentence
+  const orgnrLabel = namesake && "orgnr" in namesake ? ` Org.nr ${namesake.orgnr}.` : "";
   if (locPart) {
-    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.`);
+    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.${orgnrLabel}`);
   } else {
-    parts.push(`${agent.navn} er en tannlegeklinikk.`);
+    parts.push(`${agent.navn} er en tannlegeklinikk.${orgnrLabel}`);
   }
 
   // Address
   if (!short && agent.adresse && isValidLocality(agent.poststed)) {
-    parts.push(`Adresse: ${agent.adresse}, ${agent.postnummer ? agent.postnummer + " " : ""}${titleCasePoststed(agent.poststed!)}.`);
+    const postnummer = shownPostnummer(agent.postnummer);
+    parts.push(`Adresse: ${agent.adresse}, ${postnummer ? postnummer + " " : ""}${validPoststed}.`);
   }
 
   // Helfo
@@ -461,6 +548,10 @@ export function buildClinicDescription(
   if (short) {
     // Trim to ≤ 160 chars at sentence boundary
     if (full.length <= 160) return full;
+    // D3e: on a namesake's page the opening sentence tells the two pages
+    // apart, so it is kept whole. Only a very long name makes it longer than
+    // the cut, which would leave the two descriptions alike or end on «Org.».
+    if (namesake && parts[0]!.length > 157) return parts[0]!;
     let truncated = full.slice(0, 157);
     const lastDot = truncated.lastIndexOf(".");
     if (lastDot > 60) truncated = truncated.slice(0, lastDot + 1);
@@ -836,10 +927,14 @@ function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOpti
 }
 
 // ─── Clinic card (used in /sok and /fylke) ───────────────────
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A4-D): the card, like the profile below, shows the clinic
+// through shownDentalAgent (no phone or hours that only Google Places gives).
 
 function clinicCard(
-  agent: DentalAgent & { id: string }
+  stored: DentalAgent & { id: string }
 ): string {
+  const agent = shownDentalAgent(stored);
   const slug = slugifyClinic(agent.navn, agent.org_nr ?? undefined);
   const href = agent.org_nr
     ? `/klinikk/${escapeHtml(slug)}`
@@ -865,8 +960,9 @@ function clinicCard(
     : "";
 
   const specialties = (() => {
-    if (!agent.available_specialties || agent.available_specialties.length === 0) return "";
-    const links = agent.available_specialties.map((s) => {
+    const names = clinicSpecialties(agent);
+    if (names.length === 0) return "";
+    const links = names.map((s) => {
       const sp = SPECIALTY_PAGES.find((p) => p.navn === s.toLowerCase());
       return sp
         ? `<a href="/spesialitet/${escapeHtml(sp.slug)}" class="spec-chip" style="padding:3px 10px;font-size:.75rem">${escapeHtml(s)}</a>`
@@ -1244,7 +1340,9 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
 // /api/tannlege quota for the enrichment workers.
 router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   const searchStarted = Date.now();
-  const q = String(req.query.q || "").trim();
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read (search, log, the
+  // search box), cut at a word boundary (utils/free-text.ts).
+  const q = capFreeText(String(req.query.q || "").trim());
   const fylke = String(req.query.fylke || "").trim();
   const spesialitet = String(req.query.spesialitet || "").trim();
   const helfo = req.query.helfo === "1";
@@ -1424,10 +1522,17 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
 }
 
 function renderClinicProfile(
-  agent: DentalAgent & { id: string },
+  stored: DentalAgent & { id: string },
   req: Request,
   res: Response
 ): void {
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the page, its JSON-LD, its descriptions and its
+  // thin-profile check read the values the Places display rule shows
+  // (dental-places-display.ts). A hidden address, phone, website or opening
+  // hours is left out as if unknown; postnummer, place, map and coordinates
+  // stay (Daniel 2026-10-18T17:01Z).
+  const agent = shownDentalAgent(stored);
   // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   // synthetic schema-probe row 404s exactly like a rejected clinic, on both
   // /klinikk/id/:id and /klinikk/:slug (both render through here).
@@ -1463,13 +1568,14 @@ function renderClinicProfile(
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
   // ── Rating badge (Google Places)
-  // Only render when rating is non-null; never show "0 anmeldelser" noise.
-  if ((agent as any).rating != null) {
-    const ratingVal: number = (agent as any).rating;
-    const ratingCount: number | null = (agent as any).rating_count ?? null;
-    const stars = "★".repeat(Math.round(ratingVal)) + "☆".repeat(Math.max(0, 5 - Math.round(ratingVal)));
-    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
-    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${stars} ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</span>`);
+  // The stored rating (PR-130) goes through the same policy as on RFB
+  // (structured-data-policy.ts), here and in the info row below: nothing in
+  // RATING_DISPLAY_MODE 'hidden', the mode since S4-A1a (dev-request
+  // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt);
+  // otherwise Google named as the source and never "0 anmeldelser".
+  const ratingDisplay = formatRatingDisplay({ rating: agent.rating, count: agent.rating_count, source: "google" }, "no");
+  if (ratingDisplay) {
+    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${escapeHtml(ratingDisplay.text)}</span>`);
   }
 
   // ── Price band badge
@@ -1510,7 +1616,13 @@ function renderClinicProfile(
 
   // ── Key info grid
   const infoItems: string[] = [];
-  if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${agent.postnummer ? `, ${escapeHtml(agent.postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
+  const postnummer = shownPostnummer(agent.postnummer);
+  // A4-D: when the Places display rule hides the address, the postnummer and
+  // place the Adresse line carried stay visible on a line of their own (Daniel
+  // 17:01Z: postnummer stays). Only then: a shown address, or none stored, is
+  // as before.
+  if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${postnummer ? `, ${escapeHtml(postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
+  else if (stored.adresse && (postnummer || agent.poststed)) infoItems.push(`<div class="info-item"><div class="info-label">Postnummer og sted</div><div class="info-value">${[postnummer, agent.poststed].filter(Boolean).map((v) => escapeHtml(v!)).join(" ")}</div></div>`);
   { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
   { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
   if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
@@ -1524,12 +1636,9 @@ function renderClinicProfile(
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
   if (agent.chain_brand) infoItems.push(`<div class="info-item"><div class="info-label">Kjede</div><div class="info-value">${escapeHtml(agent.chain_brand)}</div></div>`);
-  // Rating info item — only if rating is present
-  if ((agent as any).rating != null) {
-    const ratingVal: number = (agent as any).rating;
-    const ratingCount: number | null = (agent as any).rating_count ?? null;
-    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
-    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering (Google)</div><div class="info-value">★ ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</div></div>`);
+  // Rating info item — the badge's text, under the same policy (S4-A1a)
+  if (ratingDisplay) {
+    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering</div><div class="info-value">${escapeHtml(ratingDisplay.text)}</div></div>`);
   }
   // Price band info item — only if present and not 'ukjent'
   if ((agent as any).price_band && (agent as any).price_band !== "ukjent") {
@@ -1641,14 +1750,15 @@ function renderClinicProfile(
     address: {
       "@type": "PostalAddress",
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
-      ...(agent.postnummer ? { postalCode: agent.postnummer } : {}),
+      ...(postnummer ? { postalCode: postnummer } : {}),
       // orch-PR-20260613: guard malformed/foreign locality values (e.g. "Se-44338 Lerum", "Ukjent")
-      ...(isValidLocality(agent.poststed) ? { addressLocality: titleCasePoststed(agent.poststed!) } : {}),
+      // D3d trinn 3: the official spelling, as in the title ("Tromsø", not "Tromsoe")
+      ...(isValidLocality(agent.poststed) ? { addressLocality: officialPlaceLabel(agent.poststed!) } : {}),
       ...(isValidLocality(agent.fylke) ? { addressRegion: agent.fylke } : {}),
       addressCountry: "NO",
     },
     ...((isValidLocality(agent.poststed) || isValidLocality(agent.fylke))
-      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : agent.fylke } }
+      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? officialPlaceLabel(agent.poststed!) : agent.fylke } }
       : {}),
     ...(agent.lat && agent.lng
       ? { geo: { "@type": "GeoCoordinates", latitude: agent.lat, longitude: agent.lng } }
@@ -1686,7 +1796,7 @@ function renderClinicProfile(
     try { related = listRelatedClinics(agent, 6); } catch { /* db not ready */ }
     if (related.length > 0) {
       const stedSlug = slugifyText(agent.poststed);
-      const titledSted = titleCasePoststed(agent.poststed);
+      const titledSted = officialPlaceLabel(agent.poststed);
       const relatedCards = related.map(clinicCard).join("");
       relatedSection = `<div class="section-box" style="margin-top:20px">
   <h2>Flere tannleger i ${escapeHtml(titledSted)}</h2>
@@ -1707,15 +1817,29 @@ function renderClinicProfile(
 
   // ── PR-116: BreadcrumbList for profile
   // orch-PR-20260613: guard malformed locality in breadcrumb
+  // D3d trinn 3: the official name; the /sted URL keeps the stored value's slug,
+  // which officialPlaceLabel's name always shares.
   const profileBreadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
   if (isValidLocality(agent.fylke)) profileBreadcrumbItems.push({ name: agent.fylke!, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke!)}` });
-  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
+  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: officialPlaceLabel(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
   profileBreadcrumbItems.push({ name: agent.navn, url: canonical });
   // skive C: a non-clinic must not claim to be a schema.org Dentist.
   const nonClinic = isNonClinicProfile(agent);
   const jsonLdArr = nonClinic
     ? [breadcrumbJsonLd(profileBreadcrumbItems)]
     : [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
+
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3e): another clinic with
+  // the same name in the same place (any spelling of it) would share this
+  // page's title and meta description. The title then reads «i 0190 Oslo» or
+  // ends «(org.nr N)», and the meta's opening sentence says the same. H1 and
+  // the JSON-LD name stay the registered name. No namesake = no change.
+  let namesakes: DentalNamesake[] = [];
+  try {
+    const spellings = agent.poststed ? findStedGroup(slugifyText(agent.poststed))?.spellings : undefined;
+    namesakes = listDentalNamesakes(agent, spellings);
+  } catch { /* db not ready */ }
+  const namesake = namesakeDisambiguator(agent, namesakes);
 
   // ── orch-PR-20260613: unique meta description
   // Use rich om_oss (when not a placeholder) or a structured-field summary.
@@ -1730,9 +1854,9 @@ function renderClinicProfile(
       return dot > 60 ? t.slice(0, dot + 1) : t + "…";
     }
     if (nonClinic) {
-      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring.`;
+      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${officialPlaceLabel(agent.poststed!)}` : ""}. Registeroppføring.`;
     }
-    return buildClinicDescription(agent, localityCount, true);
+    return buildClinicDescription(agent, localityCount, true, namesake);
   })();
 
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): a
@@ -1763,11 +1887,17 @@ function renderClinicProfile(
   // byte-identical to before this dev-request.
   // skive C: lab/holding get a neutral title; person_enk keeps the
   // sole-proprietor wording (display-name decision for ENK is a separate item).
+  // D3e: a namesake's page names its place with the postnummer or adds the
+  // org.nr, in all three templates; otherwise the place reads as before.
+  // D3d trinn 3: both labels (here and in namesakeDisambiguator) name the
+  // place by officialPlaceLabel, so a title never mixes «Tromsoe» and «Tromsø».
+  const titlePlace = namesake && "place" in namesake ? namesake.place : agent.poststed ? officialPlaceLabel(agent.poststed) : null;
+  const titleLocality = `${titlePlace ? ` i ${titlePlace}` : ""}${namesake && "orgnr" in namesake ? ` (org.nr ${namesake.orgnr})` : ""}`;
   const profileTitleCore = nonClinic && agent.catalog_class !== "person_enk"
-    ? `${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
+    ? `${agent.navn}${titleLocality}`
     : isSoleProprietorProfile(agent)
-    ? `Tannlege ${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
-    : `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`;
+    ? `Tannlege ${agent.navn}${titleLocality}`
+    : `${agent.navn} — Tannlegeklinikk${titleLocality}`;
 
   const html = `
 <main>
@@ -1775,7 +1905,7 @@ function renderClinicProfile(
     <div class="container">
       <div class="clinic-badges" style="margin-bottom:12px">${badges.join("")}</div>
       <h1 class="profile-name">${escapeHtml(agent.navn)}</h1>
-      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(titleCasePoststed(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
+      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(officialPlaceLabel(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
       <div class="profile-actions">${callBtn}${bookBtn}</div>
     </div>
   </div>
@@ -2538,6 +2668,16 @@ router.get("/personvern", (_req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/proveniens", (_req: Request, res: Response) => {
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the Google Places item says what the display rule
+  // (dental-places-display.ts) hides, while it is on; with it off the page is
+  // as before.
+  const placesRule = placesDisplayPolicyEnabled()
+    ? {
+        no: ". En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme.",
+        en: ". An address, phone number, opening hours or website that only Google Places gives is not shown. We show the value when another source, such as the clinic's own website or Brønnøysundregistrene, gives the same.",
+      }
+    : { no: "", en: "" };
   const html = `
 <main>
   <div class="content-page">
@@ -2547,7 +2687,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2>Kildene vi kryssjekker mot</h2>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, registrert adresse og næringsgruppekode</li>
-      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google</li>
+      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google${placesRule.no}</li>
       <li><strong>Klinikkens egen nettside</strong> &mdash; behandlingstilbud, presentasjonstekst og praktisk informasjon</li>
     </ul>
 
@@ -2572,7 +2712,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2>The sources we cross-check against</h2>
     <ul>
       <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; Norway's business register: company name, organisation number, registered address and industry code</li>
-      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google</li>
+      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google${placesRule.en}</li>
       <li><strong>The clinic's own website</strong> &mdash; treatment offerings, presentation text and practical information</li>
     </ul>
 

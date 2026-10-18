@@ -131,6 +131,24 @@ export function resolveKommuneFromPostnummer(pnr: string): ResolveKommuneFromPos
   return { kommunenummer: row.kommunenummer, kommune, fylke: fylke.fylke };
 }
 
+/**
+ * The placeholder some stored rows carry instead of a postnummer. It is not
+ * in the register, so it is never shown as one.
+ */
+export const PLACEHOLDER_POSTNUMMER = "0000";
+
+/**
+ * A stored postnummer as it may be shown: null when it is empty or the
+ * placeholder "0000" (dev-request 2026-10-17-dental-d3-rettelser, D3d);
+ * any other value unchanged. Display only: the stored row and the search
+ * WHERE keep the value as it is.
+ */
+export function shownPostnummer(pnr: string | null | undefined): string | null {
+  if (typeof pnr !== "string") return null;
+  const value = pnr.trim();
+  return value === "" || value === PLACEHOLDER_POSTNUMMER ? null : pnr;
+}
+
 /** Every postnummer in a kommune, sorted; [] for an unknown kommunenummer. */
 export function postnumreForKommune(kommunenummer: string): string[] {
   return [...(load().byKommune.get((kommunenummer || "").trim()) ?? [])];

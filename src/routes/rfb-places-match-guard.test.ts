@@ -33,9 +33,29 @@
  * Text Search query stay linear on long runs of spaces and give the same
  * output as the old regexes.
  *
+ * S4-A2 (same dev-request, Daniel's decision 2=A): Google's rating is no
+ * longer fetched (places-match.ts GOOGLE_RATING_FETCH_ENABLED = false). The
+ * S3 route scenarios run with that lever forced ON, its rollback position,
+ * where they pin the S3 behaviour unchanged. The "S4-A2" sections run in the
+ * production default (off): placesFieldMask, fieldMaskRequestsRating and the
+ * lever's default; both routes ask Google for no rating field and write or
+ * report no rating, a stored rating stays untouched, the flag-less batch and
+ * the single route make no Places call, and the write pause still answers 423
+ * first. Review round 1 (PR #1153): with the lever off the batch makes no
+ * Enterprise-tier call; every agent gets the repeat-run Pro mask, so address
+ * comes as on main's repeat run and phone only through the Details fallback
+ * the caller caps (B2: a first-time agent whose place has no rating, lever
+ * off and on; an agent without an agent_knowledge row); the Places call log
+ * marks a call whose mask asked for a rating field, and GET
+ * /admin/places-usage counts them (B1: 0 with the lever off, 1 on); the
+ * single route logs its call (S2) and answers without `found` (S4).
+ *
  * Harness: better-sqlite3 ":memory:" + __setDbForTesting/__initSchemaForTesting,
  * the real marketplace router driven through router.handle() with a fake
  * req/res, globalThis.fetch and console.warn stubbed (restored in finally).
+ * The fetch stub answers, as Google does, only the fields the FieldMask asks
+ * for; one S4-A2 scenario turns that off to show a route ignores a rating it
+ * did not ask for.
  *
  * Exported runRfbPlacesMatchGuardTests({log}) -> TestSummary; wired into
  * tests/test.ts. Standalone: npx tsx src/routes/rfb-places-match-guard.test.ts
@@ -508,6 +528,74 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
   }
 
   // ═════════════════════════════════════════════════════════════════════
+  // S4-A2 (pure): Google's rating fields out of the Places masks
+  // ═════════════════════════════════════════════════════════════════════
+  {
+    assertEq(pm.GOOGLE_RATING_FETCH_ENABLED, false, "A2-U01: GOOGLE_RATING_FETCH_ENABLED defaults to false (decision 2=A)");
+    assertEq(pm.googleRatingFetchEnabled(), false, "A2-U02: …and that is what the routes read without an override");
+    assertEq([...pm.PLACES_RATING_FIELDS], ["places.rating", "places.userRatingCount"], "A2-U03: the rating fields are rating and userRatingCount");
+    const full = ["places.id", "places.rating", "places.userRatingCount", "places.displayName", "places.internationalPhoneNumber"];
+    assertEq(pm.placesFieldMask(full, false), "places.id,places.displayName,places.internationalPhoneNumber",
+      "A2-U04: fetch off → exactly the two rating fields dropped, the order kept");
+    assertEq(pm.placesFieldMask(full, true), full.join(","), "A2-U05: fetch on → the mask as listed (the pre-S4-A2 masks)");
+    assertEq(pm.placesFieldMask(full), "places.id,places.displayName,places.internationalPhoneNumber", "A2-U06: the default follows the lever (off)");
+    const noRating = ["places.displayName", "places.formattedAddress", "places.regularOpeningHours", "places.addressComponents"];
+    assertEq([pm.placesFieldMask(noRating, false), pm.placesFieldMask(noRating, true)], [noRating.join(","), noRating.join(",")],
+      "A2-U07: a mask without rating fields (dental's) is the same either way");
+    try {
+      pm.__setGoogleRatingFetchForTesting(true);
+      assertEq([pm.googleRatingFetchEnabled(), pm.placesFieldMask(full)], [true, full.join(",")], "A2-U08: the test override turns the default on");
+    } finally {
+      pm.__setGoogleRatingFetchForTesting(null);
+    }
+    assertEq(pm.googleRatingFetchEnabled(), false, "A2-U09: null restores the lever");
+
+    // Review round 1, B1: the log mark.
+    assertEq(
+      ["places.id,places.displayName", "places.rating", "places.displayName, places.userRatingCount", "formattedAddress,internationalPhoneNumber", "rating", "", "places.ratings"]
+        .map((m) => pm.fieldMaskRequestsRating(m)),
+      [false, true, true, false, true, false, false],
+      "A2-U10: fieldMaskRequestsRating — either rating field, with or without the Details spelling; whole names only",
+    );
+    assertEq([pm.fieldMaskRequestsRating(pm.placesFieldMask(full, false)), pm.fieldMaskRequestsRating(pm.placesFieldMask(full, true))], [false, true],
+      "A2-U11: a mask built with rating fetch off is never marked; on, it is");
+  }
+
+  // ── Review round 1, B1: services/places-usage-tracker.ts ───────────────
+  {
+    const tracker = require("../services/places-usage-tracker") as typeof import("../services/places-usage-tracker");
+    const tdb = new Database(":memory:");
+    try {
+      tdb.exec(`CREATE TABLE places_api_call_log (id INTEGER PRIMARY KEY AUTOINCREMENT, vertical TEXT NOT NULL,
+        endpoint TEXT NOT NULL, sku TEXT NOT NULL, called_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+      tracker.logPlacesCall(tdb as any, "rfb", "google-rating-batch", "text_search_enterprise", "places.rating,places.displayName");
+      tracker.logPlacesCall(tdb as any, "rfb", "google-rating-batch", "text_search_enterprise", "places.displayName,places.internationalPhoneNumber");
+      tracker.logPlacesCall(tdb as any, "rfb", "google-rating-batch", "text_search_pro");
+      tracker.logPlacesCall(tdb as any, "rfb", "google-rating-batch-details", "place_details", "formattedAddress,internationalPhoneNumber");
+      const rows = tdb.prepare(`SELECT endpoint, sku FROM places_api_call_log ORDER BY id`).all() as Array<{ endpoint: string; sku: string }>;
+      assertEq(rows.map((r) => [r.endpoint, r.sku]), [
+        ["google-rating-batch+rating", "text_search_enterprise"],
+        ["google-rating-batch", "text_search_enterprise"],
+        ["google-rating-batch", "text_search_pro"],
+        ["google-rating-batch-details", "place_details"],
+      ], "A2-T01: only the call whose mask asked for a rating field gets the +rating mark; the SKU is unchanged");
+      tdb.prepare(`INSERT INTO places_api_call_log (vertical, endpoint, sku, called_at) VALUES ('rfb', 'google-rating-batch+rating', 'text_search_enterprise', '2000-01-01T00:00:00.000Z')`).run();
+      assertEq(tracker.getPlacesRatingFieldCallsThisMonth(tdb as any), 1, "A2-T02: rating-field calls this month = 1 (an older month's row is not counted)");
+      assertEq(tracker.getPlacesUsageThisMonth(tdb as any, "rfb").find((r) => r.sku === "text_search_enterprise")?.calls_this_month, 2,
+        "A2-T03: the per-SKU sums still count the marked call (enterprise 2)");
+    } finally {
+      tdb.close();
+    }
+    const bare = new Database(":memory:");
+    try {
+      tracker.logPlacesCall(bare as any, "rfb", "google-rating-batch", "text_search_pro", "places.rating");
+      assertEq(tracker.getPlacesRatingFieldCallsThisMonth(bare as any), 0, "A2-T04: no log table → logging and counting never throw (0)");
+    } finally {
+      bare.close();
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════
   // Routes: POST /admin/google-rating-batch and /admin/google-rating/:id
   // ═════════════════════════════════════════════════════════════════════
   const prevDb = initMod.__peekDbForTesting();
@@ -524,6 +612,10 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
   const adminHeaders = { "x-admin-key": ADMIN_KEY, "content-type": "application/json" };
 
   let placesAnswer: unknown[] = [];
+  let detailsAnswer: Record<string, unknown> = {};
+  // Google answers only the fields the FieldMask asks for ("places.<f>" in
+  // Text Search, "<f>" in Place Details). false answers every field (S4-A2).
+  let placesHonorMask = true;
   const placesCalls: Array<{ url: string; mask: string | undefined }> = [];
   let brregCalls = 0;
   const warnings: string[] = [];
@@ -535,12 +627,22 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
     delete process.env.ANALYTICS_ADMIN_KEY;
     process.env.GOOGLE_PLACES_API_KEY = "test-places-key";
 
+    const masked = (obj: any, mask: string | undefined, prefix: string): any => {
+      if (!placesHonorMask || !obj || typeof obj !== "object") return obj;
+      const want = new Set(maskFields(mask).filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length)));
+      return Object.fromEntries(Object.entries(obj).filter(([k]) => want.has(k)));
+    };
     (globalThis as any).fetch = async (url: string, init?: any) => {
       const u = String(url);
       if (u.includes("places.googleapis.com")) {
-        placesCalls.push({ url: u, mask: init?.headers?.["X-Goog-FieldMask"] });
-        const answer = JSON.parse(JSON.stringify(placesAnswer));
-        return { ok: true, status: 200, json: async () => ({ places: answer }), text: async () => "" } as any;
+        const mask = init?.headers?.["X-Goog-FieldMask"];
+        placesCalls.push({ url: u, mask });
+        if (u.includes("places:searchText")) {
+          const answer = (JSON.parse(JSON.stringify(placesAnswer)) as unknown[]).map((p) => masked(p, mask, "places."));
+          return { ok: true, status: 200, json: async () => ({ places: answer }), text: async () => "" } as any;
+        }
+        const det = masked(JSON.parse(JSON.stringify(detailsAnswer)), mask, "");
+        return { ok: true, status: 200, json: async () => det, text: async () => "" } as any;
       }
       if (u.includes("brreg.no")) brregCalls++;
       return { ok: false, status: 404, json: async () => ({}), text: async () => "" } as any;
@@ -551,12 +653,18 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
 
     delete require.cache[require.resolve("./marketplace")];
     const router = require("./marketplace").default as any;
+    // S4-A2: the S3 scenarios run with rating fetch forced ON, the rollback
+    // position of GOOGLE_RATING_FETCH_ENABLED; the production default (off)
+    // is the "S4-A2" section after (h). Restored in finally.
+    pm.__setGoogleRatingFetchForTesting(true);
 
-    const insertAgent = (id: string, name: string, city: string | null, knowledge: Record<string, unknown> = {}) => {
+    // knowledge null: the agent has no agent_knowledge row at all.
+    const insertAgent = (id: string, name: string, city: string | null, knowledge: Record<string, unknown> | null = {}) => {
       db.prepare(
         `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, city, created_at)
          VALUES (?, ?, 't', 't', '', '', 'producer', ?, 'rfb', ?, '2026-01-01 00:00:00')`,
       ).run(id, name, `key-${id}`, city);
+      if (knowledge === null) return;
       const cols = ["agent_id", ...Object.keys(knowledge)];
       db.prepare(
         `INSERT INTO agent_knowledge (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
@@ -568,11 +676,11 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
            FROM agent_knowledge WHERE agent_id = ?`,
       ).get(id) as any;
     const trust = (id: string) => (db.prepare(`SELECT trust_score FROM agents WHERE id = ?`).get(id) as any)?.trust_score;
-    const runBatch = async (id: string, includeAddrPhone = true) => {
+    const runBatch = async (id: string, includeAddrPhone = true, maxDetailsCalls = 0) => {
       const r = await callRoute(router, {
         url: "/admin/google-rating-batch",
         headers: adminHeaders,
-        body: { agentIds: [id], include_address_phone: includeAddrPhone, max_details_calls: 0 },
+        body: { agentIds: [id], include_address_phone: includeAddrPhone, max_details_calls: maxDetailsCalls },
       });
       return { status: r.status, row: r.body?.data?.results?.[0], body: r.body };
     };
@@ -581,6 +689,20 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
     const { __clearBrregCacheForTesting } = require("../services/brreg-client") as typeof import("../services/brreg-client");
     const runSingle = (id: string) => callRoute(router, { url: `/admin/google-rating/${id}`, headers: adminHeaders, body: {} });
     const lastMask = () => placesCalls[placesCalls.length - 1]?.mask;
+    // places_api_call_log (B1): every row, and the rows marked as a rating call.
+    const tracker = require("../services/places-usage-tracker") as typeof import("../services/places-usage-tracker");
+    const logRows = () => db.prepare(`SELECT endpoint, sku FROM places_api_call_log ORDER BY id`).all() as Array<{ endpoint: string; sku: string }>;
+    const ratingLogRows = () => logRows().filter((r) => r.endpoint.endsWith(tracker.PLACES_RATING_ENDPOINT_SUFFIX));
+    // GET /admin/places-usage, rfb only (ENABLE_DENTAL would add the dental DB's log).
+    const usage = async () => {
+      const prevDental = process.env.ENABLE_DENTAL;
+      delete process.env.ENABLE_DENTAL;
+      try {
+        return (await callRoute(router, { method: "GET", url: "/admin/places-usage", headers: adminHeaders })).body?.data;
+      } finally {
+        if (prevDental !== undefined) process.env.ENABLE_DENTAL = prevDental;
+      }
+    };
 
     // ── (a) the right place is written ─────────────────────────────────
     {
@@ -752,6 +874,8 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         "R31 (g): single route logs the [places-match-guard] line");
       assertEq(maskFields(lastMask()), maskFields(OLD_MASKS.single + ",places.addressComponents"),
         "R32 (g): single-route mask = the old mask + places.addressComponents");
+      assertEq(logRows().slice(-1), [{ endpoint: "google-rating+rating", sku: "text_search_enterprise" }],
+        "R32b (g, review round 1 S2): the single route logs its call, marked as a rating call");
 
       insertAgent("pmg-g2", "Bergen Mathall", "Bergen", { postal_code: "5013" });
       placesAnswer = [MATHALLEN_OSLO, BERGEN_MATHALL];
@@ -792,10 +916,268 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         svc.setEnrichmentWritePause(db as any, { vertical: "rfb", enabled: false, cleared_by: "daniel" }, "test");
       }
     }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // S4-A2: both routes in the production default (rating fetch off). The
+    // stubbed answers still carry Google's rating: the routes must neither ask
+    // for it nor take it.
+    // ═════════════════════════════════════════════════════════════════════
+    pm.__setGoogleRatingFetchForTesting(null);
+    const a2CallsFrom = placesCalls.length;
+    // From here on the Places call log holds only this section's calls (B1).
+    db.prepare(`DELETE FROM places_api_call_log`).run();
+    const hasRating = (o: any) => !!o && ("googleRating" in o || "googleReviewCount" in o);
+    const PRO_MASK = maskFields(OLD_MASKS.batchPro + ",places.addressComponents");
+    // A confident place for "Haugen Gård" (1400 Ski) that has no Google rating.
+    const HAUGEN_SKI_NO_RATING = place("Haugen Gård", "1400", "Ski", {
+      id: "place-haugen-norating",
+      formattedAddress: "Haugenveien 5, 1400 Ski",
+      internationalPhoneNumber: "+47 64 87 00 00",
+    });
+    assertEq(pm.googleRatingFetchEnabled(), false, "A2-R00: the scenarios below run with the production default");
+
+    // ── first-time agent, matching place with a rating: Pro mask only ────
+    {
+      insertAgent("a2-a", "Haugen Gård — Ski", "Ski", { postal_code: "1400" });
+      placesAnswer = [HAUGEN_SKI];
+      const trustBefore = trust("a2-a");
+      const r = await runBatch("a2-a");
+      assertEq(maskFields(lastMask()), PRO_MASK,
+        "A2-R01: a first-time agent gets the repeat-run Pro mask (no rating field, no internationalPhoneNumber)");
+      assertEq([r.status, r.row?.status, r.row?.addressWritten, r.row?.phoneWritten], [200, "enriched_addr_phone_only", true, false],
+        "A2-R02: address written as on main's repeat run; no phone from Text Search (the reduction for a place with a rating)");
+      assertTrue(!hasRating(r.row), "A2-R03: the row reports no Google rating");
+      const k = row("a2-a");
+      assertEq([k.google_rating, k.google_review_count, k.address, k.phone], [null, null, "Haugenveien 5, 1400 Ski", null],
+        "A2-R04: no rating and no phone stored; address stored");
+      assertTrue(String(k.field_provenance).includes("google_places"), "A2-R05: google_places provenance for the address, as before");
+      assertEq(k.google_enterprise_fetched_at, null, "A2-R06: no Enterprise-tier call, so no Enterprise attempt recorded");
+      assertEq([r.body?.data?.enriched, r.body?.data?.rating_calls, r.body?.data?.enterprise_calls, r.body?.data?.pro_calls], [0, 0, 0, 1],
+        "A2-R07: enriched 0 (no rating), rating_calls 0, enterprise_calls 0, pro_calls 1");
+      assertEq(trust("a2-a"), trustBefore, "A2-R08: trust score untouched");
+      assertTrue(String(r.body?.message).startsWith("Google-ratinger hentes ikke lenger"), "A2-R08b: the message says ratings are not fetched");
+    }
+
+    // ── Review round 1, B2: first-time agent, confident place WITHOUT a rating ──
+    // On main (and with the lever on, A2-R49) this is no_rating and nothing is
+    // written. Lever off: main's repeat-run pass, so the address but no Places
+    // phone without a Details call.
+    {
+      insertAgent("a2-nr", "Haugen Gård", "Ski", { postal_code: "1400" });
+      placesAnswer = [HAUGEN_SKI_NO_RATING];
+      const r = await runBatch("a2-nr");
+      const k = row("a2-nr");
+      assertEq([r.row?.status, r.row?.addressWritten, r.row?.phoneWritten, k.address, k.phone, k.google_enterprise_fetched_at],
+        ["enriched_addr_phone_only", true, false, "Haugenveien 5, 1400 Ski", null, null],
+        "A2-R09 (B2): lever off, place without a rating → the address as on main's repeat run, no phone, no Enterprise call");
+      assertEq(maskFields(lastMask()), PRO_MASK, "A2-R10 (B2): …on the Pro mask");
+    }
+
+    // ── phone only through the Details fallback the caller caps ──────────
+    {
+      insertAgent("a2-det", "Haugen Gård", "Ski", { postal_code: "1400" });
+      placesAnswer = [HAUGEN_SKI_NO_RATING];
+      detailsAnswer = { formattedAddress: "Haugenveien 5, 1400 Ski", internationalPhoneNumber: "+47 64 87 00 00" };
+      const logFrom = logRows().length;
+      try {
+        const r = await runBatch("a2-det", true, 1);
+        assertEq([r.row?.phoneWritten, row("a2-det").phone, r.body?.data?.details_calls], [true, "+4764870000", 1],
+          "A2-R11: max_details_calls 1 → the phone from one Details call, as on main's repeat run");
+        assertEq(maskFields(lastMask()), ["internationalPhoneNumber"], "A2-R12: …which asks for the phone only (Text Search gave the address)");
+        assertEq(logRows().slice(logFrom), [
+          { endpoint: "google-rating-batch", sku: "text_search_pro" },
+          { endpoint: "google-rating-batch-details", sku: "place_details" },
+        ], "A2-R13: both calls are in the Places log, neither marked as a rating call");
+      } finally {
+        detailsAnswer = {};
+      }
+    }
+
+    // ── Review round 1, S3: an agent with no agent_knowledge row ─────────
+    {
+      insertAgent("a2-nok", "Haugen Gård", "Ski", null);
+      placesAnswer = [HAUGEN_SKI_NO_RATING];
+      const r = await runBatch("a2-nok");
+      const k = row("a2-nok");
+      assertEq([r.row?.status, r.row?.addressWritten, k?.address, k?.google_enterprise_fetched_at],
+        ["enriched_addr_phone_only", true, "Haugenveien 5, 1400 Ski", null],
+        "A2-R14 (S3): no agent_knowledge row → the address pass creates it, so addressWritten matches what is stored");
+      assertTrue(String(k?.field_provenance).includes("google_places"), "A2-R15 (S3): …with the address provenance");
+      insertAgent("a2-nok-mis", "Haugen Gård", "Ski", null);
+      placesAnswer = [HAUGEN_OPPDAL];
+      const m = await runBatch("a2-nok-mis");
+      assertEq([m.row?.status, row("a2-nok-mis") === undefined], ["place_mismatch", true],
+        "A2-R16 (S3): …and a mismatch creates no row (nothing is written)");
+    }
+
+    // ── the guard is unchanged: places[0] wrong, places[1] right ─────────
+    {
+      insertAgent("a2-d", "Bergen Mathall", "Bergen", { postal_code: "5013" });
+      placesAnswer = [MATHALLEN_OSLO, BERGEN_MATHALL];
+      const r = await runBatch("a2-d");
+      const k = row("a2-d");
+      assertEq([r.row?.status, k.google_rating, k.address, k.phone], ["enriched_addr_phone_only", null, "Strandkaien 3, 5013 Bergen", null],
+        "A2-R17: the address from places[1] (Bergen Mathall), no rating");
+      assertTrue(!String(k.field_provenance).includes("Vulkan 5"), "A2-R18: nothing of Mathallen Oslo in provenance");
+    }
+
+    // ── a stored rating stays: mismatch, and a confident match ───────────
+    {
+      insertAgent("a2-f", "Bergen Mathall", "Bergen", { postal_code: "5013", google_rating: 4.0, google_review_count: 100 });
+      placesAnswer = [MATHALLEN_OSLO];
+      let r = await runBatch("a2-f");
+      assertEq([r.row?.status, r.row?.mismatchReason], ["place_mismatch", "no_confident_candidate"], "A2-R19: wrong place → place_mismatch, as before");
+      assertTrue(!hasRating(r.row), "A2-R20: …and the row does not report the rating on file either");
+      let k = row("a2-f");
+      assertEq([k.google_rating, k.google_review_count, k.address, k.phone], [4, 100, null, null],
+        "A2-R21: stored rating untouched, nothing written");
+
+      insertAgent("a2-s", "Bergen Mathall", "Bergen", { postal_code: "5013", google_rating: 4.0, google_review_count: 100 });
+      placesAnswer = [BERGEN_MATHALL];
+      r = await runBatch("a2-s");
+      k = row("a2-s");
+      assertEq([r.row?.status, k.google_rating, k.google_review_count, k.address], ["enriched_addr_phone_only", 4, 100, "Strandkaien 3, 5013 Bergen"],
+        "A2-R22: a confident match neither overwrites nor nulls the stored 4.0/100; address written");
+    }
+
+    // ── a rating Google sends without being asked for is not taken ───────
+    {
+      insertAgent("a2-leak", "Haugen Gård", "Ski", { postal_code: "1400" });
+      placesAnswer = [HAUGEN_SKI];
+      placesHonorMask = false;
+      try {
+        const r = await runBatch("a2-leak");
+        assertEq([r.row?.status, hasRating(r.row)], ["enriched_addr_phone_only", false],
+          "A2-R23: an answer carrying 4.6/236 anyway → the row reports no rating");
+        assertEq([row("a2-leak").google_rating, row("a2-leak").google_review_count], [null, null], "A2-R24: …and none is stored");
+      } finally {
+        placesHonorMask = true;
+      }
+    }
+
+    // ── no candidates ────────────────────────────────────────────────────
+    {
+      insertAgent("a2-n", "Haugen Gård", "Ski", { postal_code: "1400" });
+      placesAnswer = [];
+      const r = await runBatch("a2-n");
+      assertEq([r.row?.status, hasRating(r.row)], ["no_place", false], "A2-R25: no candidates → no_place (no rating was asked for)");
+      assertEq(row("a2-n").google_enterprise_fetched_at, null, "A2-R26: …and no Enterprise attempt recorded (none was made)");
+    }
+
+    // ── repeat run (fresh Enterprise marker): Pro mask, as before ────────
+    {
+      insertAgent("a2-p", "Haugen Gård", "Ski", {
+        postal_code: "1400", google_rating: 4.6, google_review_count: 236, google_enterprise_fetched_at: "2099-01-01T00:00:00.000Z",
+      });
+      placesAnswer = [HAUGEN_SKI];
+      let r = await runBatch("a2-p");
+      assertEq(maskFields(lastMask()), PRO_MASK, "A2-R27: repeat run → the Pro mask, unchanged");
+      assertEq([r.row?.status, r.row?.addressWritten, hasRating(r.row)], ["enriched_addr_phone_only", true, false],
+        "A2-R28: repeat run → the address pass as before, no rating on the row");
+      const k = row("a2-p");
+      assertEq([k.google_rating, k.google_review_count, k.google_enterprise_fetched_at], [4.6, 236, "2099-01-01T00:00:00.000Z"],
+        "A2-R29: stored rating and the Enterprise marker untouched");
+      placesAnswer = [];
+      r = await runBatch("a2-p");
+      assertEq(r.row?.status, "no_place", "A2-R30: repeat run, no candidates → no_place");
+    }
+
+    // ── without include_address_phone nothing is left to fetch ───────────
+    {
+      insertAgent("a2-x", "Haugen Gård", "Ski", { postal_code: "1400", google_rating: 4.6, google_review_count: 236 });
+      placesAnswer = [HAUGEN_SKI];
+      const callsBefore = placesCalls.length;
+      const r = await runBatch("a2-x", false);
+      assertEq(placesCalls.length, callsBefore, "A2-R31: flag-less batch → no Places call");
+      assertEq([r.status, r.row?.status, hasRating(r.row)], [200, "skipped_rating_fetch_disabled", false],
+        "A2-R32: …status skipped_rating_fetch_disabled, no rating on the row");
+      assertEq([r.body?.data?.places_api_calls, r.body?.data?.enterprise_calls, r.body?.data?.rating_calls], [0, 0, 0],
+        "A2-R33: …and no call counted");
+      const k = row("a2-x");
+      assertEq([k.google_rating, k.google_review_count, k.google_enterprise_fetched_at], [4.6, 236, null],
+        "A2-R34: stored rating untouched, no Enterprise attempt recorded");
+    }
+
+    // ── POST /admin/google-rating/:id: no Places call, nothing written ───
+    {
+      insertAgent("a2-g", "Bergen Mathall", "Bergen", { postal_code: "5013", google_rating: 4.0, google_review_count: 100 });
+      placesAnswer = [BERGEN_MATHALL];
+      const callsBefore = placesCalls.length;
+      const trustBefore = trust("a2-g");
+      const s = await runSingle("a2-g");
+      assertEq([s.status, s.body?.success, s.body?.status], [200, true, "rating_fetch_disabled"],
+        "A2-R35: single route → status rating_fetch_disabled");
+      assertTrue(!!s.body && !("found" in s.body), "A2-R36 (review round 1, S4): …without `found` (no lookup was made)");
+      assertEq(placesCalls.length, callsBefore, "A2-R37: …without a Places call");
+      assertTrue(!hasRating(s.body), "A2-R38: …and with no rating in the answer");
+      assertEq([row("a2-g").google_rating, row("a2-g").google_review_count, trust("a2-g")], [4, 100, trustBefore],
+        "A2-R39: stored rating and trust score untouched");
+      const missing = await runSingle("a2-nope");
+      assertEq(missing.status, 404, "A2-R40: an unknown agent is still 404");
+    }
+
+    // ── the write pause still answers 423 first ──────────────────────────
+    {
+      const svc = require("../services/enrichment-write-pause") as typeof import("../services/enrichment-write-pause");
+      svc.setEnrichmentWritePause(db as any, {
+        vertical: "rfb", enabled: true, reason: "test: skrivepause", triggered_by: "platform-verifier",
+      }, "test");
+      const callsBefore = placesCalls.length;
+      try {
+        const b = await runBatch("a2-a");
+        const s = await runSingle("a2-a");
+        assertEq([b.status, s.status], [423, 423], "A2-R41: paused rfb → batch and single route answer 423");
+        assertEq(placesCalls.length, callsBefore, "A2-R42: …before any Places call");
+      } finally {
+        svc.setEnrichmentWritePause(db as any, { vertical: "rfb", enabled: false, cleared_by: "daniel" }, "test");
+      }
+    }
+
+    // ── every call above, the Places log (B1), and the rollback lever ────
+    {
+      const a2Masks = placesCalls.slice(a2CallsFrom).map((c) => maskFields(c.mask));
+      assertTrue(
+        a2Masks.length >= 12 &&
+          a2Masks.every((m) => !m.some((f) => pm.PLACES_RATING_FIELDS.includes(f) || f === "places.internationalPhoneNumber")),
+        "A2-R43: no Places call in the S4-A2 scenarios asked for a rating field or for the phone in Text Search (Enterprise tier)",
+      );
+      const logged = logRows();
+      assertEq([logged.length, ratingLogRows().length, logged.filter((r) => r.sku === "text_search_enterprise").length], [a2Masks.length, 0, 0],
+        "A2-R44 (B1): every one of those calls is in the Places log; 0 rows marked as a rating call, 0 Enterprise-tier rows");
+      const off = await usage();
+      assertEq([off?.rating_field_calls_this_month, off?.enterprise_calls_this_month], [0, 0],
+        "A2-R45 (B1): GET /admin/places-usage → rating_field_calls_this_month 0, enterprise_calls_this_month 0");
+
+      pm.__setGoogleRatingFetchForTesting(true);
+      try {
+        insertAgent("a2-on", "Haugen Gård — Ski", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_SKI];
+        const r = await runBatch("a2-on");
+        assertEq([r.row?.status, r.row?.googleRating, row("a2-on").google_rating, row("a2-on").phone, r.body?.data?.rating_calls],
+          ["enriched", 4.6, 4.6, "+4764870000", 1],
+          "A2-R46: lever set back on → rating, address and phone from the first call again, rating_calls 1 (rollback without a revert)");
+        assertEq(ratingLogRows(), [{ endpoint: "google-rating-batch+rating", sku: "text_search_enterprise" }],
+          "A2-R47 (B1): …and the Places log holds exactly 1 row marked as a rating call");
+        const on = await usage();
+        assertEq([on?.rating_field_calls_this_month, on?.enterprise_calls_this_month], [1, 1],
+          "A2-R48 (B1): GET /admin/places-usage → rating_field_calls_this_month 1, enterprise_calls_this_month 1");
+
+        insertAgent("a2-nr-on", "Haugen Gård", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_SKI_NO_RATING];
+        const n = await runBatch("a2-nr-on");
+        const k = row("a2-nr-on");
+        assertEq([n.row?.status, k.address, k.phone, String(k.field_provenance ?? "").includes("google_places"), !!k.google_enterprise_fetched_at],
+          ["no_rating", null, null, false, true],
+          "A2-R49 (B2): lever on, place without a rating → no_rating, nothing written, the attempt recorded (main's behaviour)");
+      } finally {
+        pm.__setGoogleRatingFetchForTesting(null);
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("rfb-places-match-guard: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
+    pm.__setGoogleRatingFetchForTesting(null);
     console.warn = prevWarn;
     (globalThis as any).fetch = prevFetch;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

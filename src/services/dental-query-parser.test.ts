@@ -14,7 +14,13 @@
  *   V   the vocabulary mirrors SPECIALTY_PAGES (canonical names + slugs);
  *       findSearchSpecialty reads a whole value (name, slug, synonym)
  *   S   planDentalSearch: explicit arguments win, the old reading is kept
- *       (union; A2A's keyword reading in full), fallback flag, rollback switch
+ *       (union; A2A's keyword reading in full), fallback flag, rollback switch;
+ *       tolkning shows a kommune's postnumre as {kommunenummer, antall}
+ *       while the plan's filter keeps the list (D3c, tolkningFilter)
+ *   D   the clinic cards' readings (dev-request 2026-10-17-dental-d3-rettelser,
+ *       D3d): specialtyTitleWords (the filter's title words);
+ *       officialPlaceSpelling (poststed first, else kommune; null for an
+ *       unknown name or a collision; no collision in the bundled register)
  *
  * Standalone: npx tsx src/services/dental-query-parser.test.ts
  * Wired into tests/test.ts via runDentalQueryParserTests().
@@ -279,6 +285,11 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
     for (const s of DENTAL_SEARCH_VOCABULARY.specialties) {
       assertEq(spec(s.canonical), s.canonical, `V6: the stored name «${s.canonical}» parses to itself`);
     }
+    assertEq(
+      [[...DENTAL_SEARCH_VOCABULARY.kommuneWords], [...DENTAL_SEARCH_VOCABULARY.kommuneWords].filter((w) => !DENTAL_SEARCH_VOCABULARY.stopwords.has(w))],
+      [["kommune", "kommunen", "municipality"], []],
+      "V7: the kommune words (D3c) are kommune, kommunen and municipality, and each is still a stopword"
+    );
 
     // ── S: planDentalSearch ───────────────────────────────────────────────
     const calls: Array<Record<string, unknown>> = [];
@@ -352,7 +363,7 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       assertEq(
         [p.filter, p.count, p.tolkning?.tolket_som],
         [{ natural: { parsed: TROMSO, legacy: { fylke: "Troms" } } }, 8, ["sted: Tromsø (poststed + kommune)"]],
-        "S14: an old reading without name words (A2A read fylke Troms) is kept in full, so nothing it found is lost; tolkning shows the parsed place"
+        "S14: an old reading without name words (here a stub fylke; since D3c2 A2A's own reading of «Tromsø» is q «tromsø») is kept in full, so nothing it found is lost; tolkning shows the parsed place"
       );
     }
     {
@@ -382,9 +393,149 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       assertEq(raw.filter, { seen: " Bergen " }, "S20: switched off -> the caller's old reading gets the text exactly as before (untrimmed)");
     }
     process.env.DENTAL_QUERY_PARSER_DISABLED = "true";
-    assertTrue(parser.isDentalQueryParserDisabled(), "S21: «true» also switches it off");
+    assertTrue(parser.isDentalQueryParserDisabled(), "S20b: «true» also switches it off");
     process.env.DENTAL_QUERY_PARSER_DISABLED = "0";
-    assertTrue(!parser.isDentalQueryParserDisabled(), "S22: any other value leaves the parser on");
+    assertTrue(!parser.isDentalQueryParserDisabled(), "S20c: any other value leaves the parser on");
+    delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+
+    // ── S: tolkning.filter shows a kommune, not its postnummer list (D3c) ─
+    {
+      const plan = (query: string, explicit: Record<string, unknown> = {}) => parser.planDentalSearch({ query, explicit, gazetteer: g, count: () => 5 });
+      const bergen = plan("tannlege i Bergen");
+      assertEq(
+        [bergen.filter, bergen.tolkning?.filter],
+        [
+          { natural: { parsed: BERGEN, legacy: { q: "tannlege i Bergen" } } },
+          { natural: { parsed: { poststed_or_postnummer: { poststed_in: ["BERGEN", "Bergen"], postnummer_in: { kommunenummer: "4601", antall: 144 } } }, legacy: { q: "tannlege i Bergen" } } },
+        ],
+        "S21: Bergen: the plan's filter keeps the 144 postnumre; tolkning shows {kommunenummer: 4601, antall: 144}"
+      );
+      const baerum = plan("tannlege i Bærum");
+      const baerumPnr = postnumreForKommune("3201");
+      assertEq(
+        [(baerum.filter.natural as any).parsed.postnummer_in, (baerum.tolkning?.filter.natural as any)?.parsed.postnummer_in],
+        [baerumPnr, { kommunenummer: "3201", antall: baerumPnr.length }],
+        "S22: Bærum (a kommune read by postnummer): the list in the plan's filter, {kommunenummer: 3201, antall} in tolkning"
+      );
+      const unchanged: Array<[string, Record<string, unknown>]> = [
+        ["tannlege i Oslo", {}], ["tannlege i Vestland", {}], ["tannlege i Viken", {}], ["kjeveortoped", {}],
+        ["Hordaland", { fylke: "Rogaland" }], ["helfo Oslo", { helfo_agreement: undefined, specialty: "periodonti" }],
+      ];
+      for (const [q, explicit] of unchanged) {
+        const p = plan(q, explicit);
+        assertEq(p.tolkning?.filter, p.filter, `S23: «${q}» ${JSON.stringify(explicit)}: no postnummer list, so tolkning.filter is the plan's filter`);
+      }
+    }
+    {
+      const bergenPnr = postnumreForKommune("4601");
+      const shown = (list: unknown[]) => {
+        try { return parser.tolkningFilter({ postnummer_in: list }).postnummer_in; } catch (err) { return `threw ${String(err)}`; }
+      };
+      assertEq(
+        [shown(["0000"]), shown(["abcd", 5]), shown([]), shown(["5003", "5004"]), shown([...bergenPnr, "5003"]), shown([...bergenPnr].reverse())],
+        [{ antall: 1 }, { antall: 2 }, { antall: 0 }, { antall: 2 }, { antall: 145 }, { kommunenummer: "4601", antall: 144 }],
+        "S24: {antall} alone, never a throw, for an unknown or malformed postnummer, an empty list or one that is not exactly one whole kommune (any order counts)"
+      );
+      const input = { fylke: "Vestland", q: null, fylke_in: ["Viken", "Akershus"], natural: { parsed: { postnummer_in: ["5003", "5004"] }, legacy: { q: "x" } } };
+      const before = JSON.stringify(input);
+      const once = parser.tolkningFilter(input);
+      assertEq(
+        [once, JSON.stringify(input) === before, parser.tolkningFilter(once)],
+        [{ fylke: "Vestland", q: null, fylke_in: ["Viken", "Akershus"], natural: { parsed: { postnummer_in: { antall: 2 } }, legacy: { q: "x" } } }, true, once],
+        "S24b: other fields are kept as they are, the input is not changed, and a shown filter passes through unchanged"
+      );
+    }
+    {
+      // No postnummer list of any length is left anywhere in tolkning.
+      const lists = (v: unknown, at = ""): string[] =>
+        v && typeof v === "object" && !Array.isArray(v)
+          ? Object.entries(v).flatMap(([k, x]) => (k === "postnummer_in" && Array.isArray(x) ? [`${at}${k}`] : lists(x, `${at}${k}.`)))
+          : [];
+      for (const q of ["tannlege i Bergen", "tannlege i Trondheim", "tannlege i Stavanger", "tannlege i Tromsø", "tannlege i Bærum", "tannlege i Kvam kommune"]) {
+        const p = parser.planDentalSearch({ query: q, explicit: {}, gazetteer: g, count: () => 1 });
+        assertEq([lists(p.filter).length > 0, lists(p.tolkning?.filter)], [true, []], `S25: «${q}»: the plan's filter has a postnummer list, tolkning has none`);
+      }
+    }
+
+    // ── D: the clinic cards' readings (dev-request 2026-10-17-dental-d3-rettelser, D3d) ──
+    {
+      const { specialtyTitleWords } = require("../config/dental-search-vocabulary") as typeof import("../config/dental-search-vocabulary");
+      const entry = (name: string) => findSearchSpecialty(name);
+      assertEq(specialtyTitleWords(["kjeveortopedi"], entry("kjeveortopedi")), ["kjeveortoped"], "D1: kjeveortopedi -> [kjeveortoped] (the stem covers the name)");
+      assertEq(
+        specialtyTitleWords(["oral kirurgi og oral medisin"], entry("oral kirurgi og oral medisin")),
+        ["oral kirurgi og oral medisin", "oralkirurg"],
+        "D2: oral kirurgi og oral medisin -> both words (neither contains the other)"
+      );
+      assertEq(
+        [specialtyTitleWords(["Kjeveortoped", "kjeveortopedi"], entry("kjeveortoped")), specialtyTitleWords(["Implantologi"], null)],
+        [["kjeveortoped"], ["implantologi"]],
+        "D3: a synonym with its stored name gives the stem once; a specialty outside the vocabulary gives its own name, lower case"
+      );
+      assertTrue(
+        DENTAL_SEARCH_VOCABULARY.specialties.every((s) => {
+          const words = specialtyTitleWords([s.canonical], s);
+          return words.length > 0 && words.every((w) => w === w.toLowerCase());
+        }),
+        "D4: every vocabulary specialty has at least one lower-case title word"
+      );
+    }
+    {
+      const spelling = (v: string) => nq.officialPlaceSpelling(v);
+      assertEq(
+        [spelling("Tromsoe"), spelling("TROMSOE"), spelling("Aalesund"), spelling("Baerum"), spelling("Indre Oestfold"), spelling("Karlsoey")],
+        [
+          { kind: "poststed", name: "TROMSØ" }, { kind: "poststed", name: "TROMSØ" }, { kind: "poststed", name: "ÅLESUND" },
+          { kind: "kommune", name: "Bærum" }, { kind: "kommune", name: "Indre Østfold" }, { kind: "poststed", name: "KARLSØY" },
+        ],
+        "D5: an ASCII spelling finds the official name: Posten's poststed first, else the kommune"
+      );
+      assertEq(
+        ["Amsterdam", "1014BV AMSTERDAM", "Tromso", "Alesund", "", "  ", "TEST"].map(spelling),
+        [null, null, null, null, null, null, null],
+        "D5b: an unknown name, the ASCII alias a visitor types (Tromso, Alesund) and an empty value -> null"
+      );
+      // The bundled register: no two official names share a key, so every
+      // poststed, and every kommune without a poststed of its key, reads back as itself.
+      const { officialPoststedKommuner, kommuner2024 } = require("./norway-postnummer") as typeof import("./norway-postnummer");
+      const poststeder = [...officialPoststedKommuner().keys()];
+      const poststedKeys = new Set(poststeder.map((n) => nq.placeKey(n)));
+      const kommuner = kommuner2024().map((k) => k.kommune).filter((n) => !poststedKeys.has(nq.placeKey(n)));
+      assertEq(
+        [
+          poststeder.filter((n) => JSON.stringify(spelling(n)) !== JSON.stringify({ kind: "poststed", name: n })),
+          kommuner.filter((n) => JSON.stringify(spelling(n)) !== JSON.stringify({ kind: "kommune", name: n })),
+          poststeder.length > 1000 && kommuner.length > 100,
+        ],
+        [[], [], true],
+        "D6: the bundled register has no collision: every poststed and kommune name reads back as itself"
+      );
+    }
+    {
+      // A collision gives null. Fresh copies of the register and the query
+      // module, so the rows injected here reach no other test.
+      const { swapOutModules } = require("../../tests/module-cache") as typeof import("../../tests/module-cache");
+      const restore = swapOutModules([require.resolve("./norway-postnummer"), require.resolve("./search-intent/norwegian-query")]);
+      try {
+        const pn = require("./norway-postnummer") as typeof import("./norway-postnummer");
+        const fresh = require("./search-intent/norwegian-query") as typeof import("./search-intent/norwegian-query");
+        assertEq(fresh.officialPlaceSpelling("Tromsoe"), { kind: "poststed", name: "TROMSØ" }, "D7a: (a fresh copy reads the bundled register)");
+        pn.__setPostnummerRowsForTesting([
+          { postnummer: "1111", poststed: "MØN", kommunenummer: "0301" },
+          { postnummer: "1112", poststed: "MOEN", kommunenummer: "0301" },
+          { postnummer: "1113", poststed: "TESTBY", kommunenummer: "0301" },
+        ]);
+        assertEq(
+          ["Moen", "MØN", "Testby", "Oslo", "Tromsoe"].map((v) => fresh.officialPlaceSpelling(v)),
+          [null, null, { kind: "poststed", name: "TESTBY" }, { kind: "kommune", name: "Oslo" }, null],
+          "D7: two poststeder on one key (MØN, MOEN) -> null; the map is rebuilt for new register rows"
+        );
+        pn.__setPostnummerRowsForTesting(null);
+        assertEq(fresh.officialPlaceSpelling("Tromsoe"), { kind: "poststed", name: "TROMSØ" }, "D7b: after the reset the bundled register is read again");
+      } finally {
+        restore();
+      }
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental-query-parser: unexpected error: " + String(err?.stack || err?.message || err));

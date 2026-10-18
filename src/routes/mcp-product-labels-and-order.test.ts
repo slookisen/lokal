@@ -391,7 +391,8 @@ export async function runMcpProductLabelsAndOrderTests(opts: { log?: boolean } =
     assertEq([categoryLabelWordsOf("eggs near Bergen", ["eggs"]), categoryLabelWordsOf("meat", ["meat"]), categoryLabelWordsOf("fish and vegetables", ["fish", "vegetables"])],
       [["egg"], ["kjøtt"], ["fisk", "grønnsaker"]],
       "AI-3a categoryLabelWordsOf: an English word is read as the parser's Norwegian term (product-glossary)");
-    assertEq(categoryLabelWordsOf("brød og bakervarer i Oslo", ["bread"]), ["brød", "bakervarer"], "AI-3a categoryLabelWordsOf: «brød» and «bakervarer» are bread");
+    // Integration test 2026-10-17, slice I-W: the parser's key for them is the platform's «bakery» (it was «bread»).
+    assertEq(categoryLabelWordsOf("brød og bakervarer i Oslo", ["bakery"]), ["brød", "bakervarer"], "AI-3a categoryLabelWordsOf: «brød» and «bakervarer» are bakery");
     assertEq(
       [categoryLabelWordsOf("eggerøre i Bergen", ["eggs"]), categoryLabelWordsOf("honning nær Trondheim", ["honey"]),
         categoryLabelWordsOf("egg i Bergen", ["meat"]), categoryLabelWordsOf("egg i Bergen", undefined),

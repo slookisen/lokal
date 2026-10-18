@@ -15,12 +15,14 @@
  *      so REST /discover?q= and the A2A search words refuse the same
  *      food-purchase request as discover_experiences.
  *
- * Platform-neutral: imports only norway-fylke (the local gazetteer) and
- * experience-store (the catalogue), never a route, so MCP, REST and A2A can
- * all use it without an import cycle. No outside service is called.
+ * Platform-neutral: imports only norway-fylke (the local gazetteer),
+ * experience-store (the catalogue) and search-intent/norwegian-query (the
+ * shared QUERY_STOPWORDS), never a route, so MCP, REST and A2A can all use
+ * it without an import cycle. No outside service is called.
  */
 
 import { MAX_TEXT_TERMS, MAX_TEXT_TERM_LENGTH, type DiscoverFilter } from "./experience-store";
+import { PLACE_PREPOSITIONS, QUERY_STOPWORDS } from "./search-intent/norwegian-query";
 import {
   __FYLKE_INTERNAL,
   NON_KOMMUNE_REGION_LABELS,
@@ -255,8 +257,10 @@ export type QuerySeason = "winter" | "summer" | "spring" | "autumn";
 export type QueryWeather = "rain" | "snow" | "clear";
 export type QueryIndoorOutdoor = "indoor" | "outdoor";
 
-/** A word right before an ambiguous place name that marks it as a place ("i Moss", "in Moss"). */
-export const PLACE_PREPOSITIONS: ReadonlySet<string> = new Set(["i", "in", "på", "ved", "nær", "near", "around", "rundt"]);
+// PLACE_PREPOSITIONS moved, unchanged, to search-intent/norwegian-query.ts
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W4), so the
+// RFB search reads the same list; imported above and re-exported here.
+export { PLACE_PREPOSITIONS };
 
 /**
  * Gazetteer names (CITY_TO_FYLKE_RAW) that are also everyday words. They are
@@ -382,61 +386,11 @@ export const GENERIC_CATEGORY_ALIAS_WORDS: ReadonlySet<string> = new Set([
   "stay", "stays", "adventure", "action", "transport",
 ]);
 
-/**
- * Words that carry no search meaning on their own: question words, pronouns,
- * prepositions, request verbs, "experiences"/"activities", praise words, time
- * words, number words and who is travelling (a keyword filter on "family"
- * would only keep the rows whose text happens to say so). Norwegian and
- * English. A word missing here costs little: discoverExperiencesRelaxed()
- * relaxes the search words one at a time.
- */
-export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
-  // Norwegian
-  "hva", "hvor", "hvordan", "hvilke", "hvilken", "hvilket", "når", "hvorfor", "kva", "kor", "korleis",
-  "kan", "kunne", "skal", "vil", "ville", "må", "bør", "får", "jeg", "eg", "meg", "du", "deg", "vi", "oss",
-  "dere", "de", "dem", "man", "min", "mitt", "mine", "din", "ditt", "dine", "vår", "vårt", "våre", "deres",
-  "sin", "sitt", "sine", "en", "ei", "et", "ein", "eit", "den", "det", "denne", "dette", "disse", "noe",
-  "noen", "noko", "nokon", "alle", "alt", "all", "mange", "mye", "flere", "litt", "annet", "andre", "slik",
-  "og", "eller", "men", "som", "at", "så", "om", "hvis", "enn", "også", "bare", "helst", "gjerne", "veldig",
-  "mest", "mer", "i", "på", "til", "fra", "frå", "for", "med", "av", "ved", "nær", "rundt", "hos", "mellom",
-  "etter", "før", "uten", "innen", "langs", "mot", "er", "var", "blir", "bli", "være", "vere", "ha", "har",
-  "hadde", "gjøre", "gjør", "finne", "finn", "finnes", "fins", "se", "vise", "vis", "søk", "søke",
-  "anbefal", "anbefale", "anbefaler", "anbefaling", "anbefalinger", "forslag", "tips", "gi", "vite", "lyst",
-  "ønsker", "oppleve", "besøke", "besøk", "dra", "reise", "komme", "opplevelse", "opplevelsen",
-  "opplevelser", "opplevelsene", "aktivitet", "aktiviteten", "aktiviteter", "aktivitetene", "ting",
-  "sted", "steder", "stedet", "område", "området", "severdighet", "severdigheter", "attraksjon",
-  "attraksjoner", "tur", "turer", "turen", "god", "gode", "godt", "beste", "best", "bra", "fin", "fine",
-  "fint", "flott", "flotte", "gøy", "morsom", "morsomme", "morsomt", "artig", "spennende", "populær",
-  "populære", "kjent", "kjente", "lokal", "lokale", "unik", "unike", "topp", "her", "der", "nå", "neste",
-  "dag", "dagen", "dager", "helg", "helgen", "uke", "uka", "ferie", "ferien", "tid", "vær", "været",
-  "kveld", "kvelden", "skjer", "skje", "kommer", "bo", "bor", "besøker", "reiser", "hele", "landet",
-  "kommune", "kommunen", "fylke", "fylket",
-  "familie", "familien", "barn", "barna", "venner", "par", "voksen", "voksne", "person", "personer",
-  "gjester", "fem", "seks", "sju", "syv", "åtte", "ni", "ti", "hei", "takk",
-  // English
-  "what", "where", "which", "how", "when", "why", "who", "can", "could", "would", "should", "will", "may",
-  "might", "must", "do", "does", "did", "me", "my", "we", "us", "our", "you", "your", "they", "them",
-  "their", "it", "its", "a", "an", "the", "this", "that", "these", "those", "some", "any", "many", "much",
-  "more", "most", "other", "such", "and", "or", "but", "if", "than", "then", "also", "just", "only",
-  "very", "really", "please", "so", "too", "of", "in", "on", "at", "to", "from", "with", "near", "around",
-  "about", "by", "into", "within", "nearby", "during", "while", "up", "out", "is", "are", "was", "were",
-  "be", "been", "am", "have", "has", "get", "go", "going", "visit", "visiting", "see", "try", "want",
-  "like", "love", "need", "looking", "look", "find", "show", "give", "list", "recommend",
-  "recommendation", "recommendations", "suggest", "suggestions", "search", "tell", "know", "plan",
-  "planning", "book", "things", "thing", "stuff", "something", "activities", "activity", "experiences",
-  "experience", "ideas", "idea", "options", "places", "place", "spots", "attractions", "attraction",
-  "sights", "tours", "tour", "trips", "trip", "excursions", "excursion", "day", "days", "weekend", "week",
-  "today", "tonight", "tomorrow", "next", "time", "good", "great", "nice", "fun", "cool", "top", "awesome",
-  "amazing", "interesting", "unique", "popular", "famous", "local", "beautiful", "worth", "here", "there",
-  "now", "details", "detail", "info", "information", "family", "families", "kids", "children", "couple",
-  "friends", "people", "persons", "adult", "adults", "guests", "two", "three", "four", "five", "six",
-  "seven", "eight", "nine", "ten", "hi", "hello", "thanks", "happening", "happens", "arrive", "arriving",
-  "travel", "travelling", "traveling", "fly", "flying", "staying", "spend", "spending", "across",
-  "throughout", "anywhere", "everywhere", "whole", "entire", "country", "county", "municipality",
-  // What is left of a contraction once the apostrophe splits it ("don't" → "don", "we'll" → "ll").
-  "don", "doesn", "didn", "isn", "aren", "wasn", "weren", "won", "wouldn", "couldn", "shouldn", "haven",
-  "hasn", "ll", "ve", "re", "let", "lets",
-]);
+// QUERY_STOPWORDS moved, unchanged, to search-intent/norwegian-query.ts
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W), so the RFB
+// search reads the same list without importing Opplevagent code; imported
+// above and re-exported here for the callers of this module.
+export { QUERY_STOPWORDS };
 
 // The limits live with DiscoverFilterSchema (experience-store.ts), which
 // enforces them; re-exported here with the rest of the configuration.

@@ -1,26 +1,35 @@
 /**
  * rfb-jsonld-ingen-tredjepartsrating.test.ts — dev-request
- * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S1.
+ * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt, S1
+ * and S6 del B.
  *
  * Rendered-page check that the JSON-LD only claims what the platform can back:
  *   (A) the shared checker (tests/helpers/jsonld-invariants.ts) is not
  *       vacuous: a WO-17-shaped payload yields every forbidden node, a clean
- *       one none, and a broken ld+json block throws;
+ *       one none, and a broken ld+json block throws; productNodes finds a
+ *       Product in itemOffered, in an array @type, a ProductGroup with its
+ *       variant and the schema.org URL spelling, and not an Offer, a Thing or
+ *       an OfferCatalog;
  *   (B) RFB GET /produsent/:slug with a Google rating (4.6 / 236, and 4.6
  *       with googleReviewCount NULL — the case that used to get an invented
  *       reviewCount 1), externalReviews from Google (one without an author —
  *       the case that used to get an invented author «Kunde»), one priced and
  *       one unpriced product: 0 aggregateRating, 0 review, 0
  *       hasMerchantReturnPolicy, 0 shippingDetails anywhere (incl. the nested
- *       Product), no reviewCount/ratingValue at all, Product keeps
- *       price > 0 + priceCurrency + availability + seller + brand, and
- *       offersWithoutPrice is 0. (knowledgeService.getAgentInfo does not pass
+ *       Product), no reviewCount/ratingValue at all, and offersWithoutPrice
+ *       is 0. Since S6 del B the priced product is an Offer with exactly
+ *       @type, name, price > 0 and priceCurrency, and productNodes is [];
+ *       in rollback mode (PRODUCER_PAGE_PRODUCT_NODES true) it is the old
+ *       Product with price, priceCurrency, availability, seller and brand,
+ *       still without a forbidden node. (knowledgeService.getAgentInfo does not pass
  *       externalReviews to the page today, so the seeded reviews only guard
  *       the day it does; seo.ts has no Review builder either way.)
  *   (C) Opplevagent and (D) finn-tannlege pages: forbiddenNodes is [] on
  *       every page tested (dental with a stored Google rating on the clinic);
  *       on Opplevagent, offersWithoutPrice is 0 too (S5: the live gårdssalg
  *       page signals a ReserveAction instead of a price-less Offer).
+ *   (E) source check (S6 del B): seo.ts's makesOffer builder asks
+ *       producerPageProductNodes() before it builds a Product.
  *
  * Harnesses: (B) same as rfb-makesoffer-price-optional.test.ts (own
  * `Database(":memory:")`, the real seo.ts handler off the route stack);
@@ -34,7 +43,9 @@
  */
 
 import Database from "better-sqlite3";
-import { jsonLdBlocks, offersWithoutPrice, forbiddenNodes } from "../../tests/helpers/jsonld-invariants";
+import { readFileSync } from "fs";
+import { join } from "path";
+import { jsonLdBlocks, offersWithoutPrice, forbiddenNodes, productNodes } from "../../tests/helpers/jsonld-invariants";
 
 export interface TestSummary {
   passed: number;
@@ -145,6 +156,27 @@ export async function runRfbJsonLdIngenTredjepartsratingTests(opts: { log?: bool
     let threw = false;
     try { jsonLdBlocks('<script type="application/ld+json">{"broken":</script>'); } catch { threw = true; }
     assertTrue(threw, "checker: a broken ld+json block throws instead of being skipped");
+
+    // S6 del B: productNodes.
+    assertEq(productNodes(wo17Shaped), ["$[0].makesOffer[0].itemOffered"], "checker: productNodes finds the Product nested in itemOffered");
+    assertEq(productNodes([
+      { "@type": "LocalBusiness", name: "X", makesOffer: [{ "@type": "Offer", itemOffered: { "@type": ["Product", "Thing"], name: "Lam" } }] },
+      { "@type": "ProductGroup", name: "Ost", hasVariant: [{ "@type": "Product", name: "Ost 500 g" }, { "@type": "Thing", name: "Ost 1 kg" }] },
+      [{ "@type": "Offer", price: 1, itemOffered: { "@type": "https://schema.org/Product", name: "Egg" } }],
+      { "@type": "Car", name: "Traktor" },
+    ]), [
+      "$[0].makesOffer[0].itemOffered",
+      "$[1]",
+      "$[1].hasVariant[0]",
+      "$[2][0].itemOffered",
+      "$[3]",
+    ], "checker: productNodes finds an array @type, a ProductGroup and its variant, nodes in nested arrays, the schema.org URL spelling and a subtype");
+    assertEq(productNodes([{
+      "@type": "LocalBusiness", name: "Product",
+      makesOffer: [{ "@type": "Offer", name: "Product", price: 79, priceCurrency: "NOK" }],
+      hasOfferCatalog: { "@type": "OfferCatalog", name: "Produkter", itemListElement: [{ "@type": "Thing", name: "Product" }] },
+      brand: { "@type": "Brand", name: "Product" },
+    }]), [], "checker: productNodes finds none in an Offer, a Thing, an OfferCatalog or a Brand (a name \"Product\" is no @type)");
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -196,6 +228,7 @@ export async function runRfbJsonLdIngenTredjepartsratingTests(opts: { log?: bool
       });
       seedAgent("rated-nocount", "Uten Antall Gaard");
       seedKnowledge("rated-nocount", { rating: 4.6, count: null, reviews: [{ source: "Google", text: "Gode egg", rating: 4 }] });
+      const policy = require("../services/structured-data-policy") as typeof import("../services/structured-data-policy");
       const regMod = require("../services/marketplace-registry");
       regMod.marketplaceRegistry._agentsCache = null;
       regMod.marketplaceRegistry._statsCache = null;
@@ -233,15 +266,42 @@ export async function runRfbJsonLdIngenTredjepartsratingTests(opts: { log?: bool
           assertTrue(!!biz, `${tag}: LocalBusiness block present`);
           const offers = Array.isArray(biz?.makesOffer) ? biz.makesOffer : [];
           assertTrue(offers.length === 1, `${tag}: exactly the one priced product is in makesOffer`);
-          const product = offers[0]?.itemOffered;
-          const inner = product?.offers;
-          assertTrue(product?.["@type"] === "Product" && product?.brand?.["@type"] === "Brand" && !!product?.brand?.name, `${tag}: Product keeps brand`);
-          assertTrue(typeof inner?.price === "number" && inner.price > 0 && inner.priceCurrency === "NOK", `${tag}: Product.offers keeps price > 0 + priceCurrency`);
-          assertTrue(inner?.availability === "https://schema.org/InStock" && inner?.seller?.["@type"] === "LocalBusiness", `${tag}: Product.offers keeps availability + seller`);
+          // S6 del B: an Offer from the farm, no Product (policy rule 7).
+          const offer = offers[0];
+          assertEq(Object.keys(offer || {}).sort(), ["@type", "name", "price", "priceCurrency"], `${tag}: the Offer has exactly @type, name, price and priceCurrency`);
+          assertTrue(offer?.["@type"] === "Offer" && typeof offer?.name === "string" && offer.name !== "", `${tag}: the Offer is typed Offer and names the product`);
+          assertTrue(typeof offer?.price === "number" && offer.price > 0 && offer.priceCurrency === "NOK", `${tag}: the Offer has price > 0 + priceCurrency NOK`);
+          assertEq(productNodes(blocks), [], `${tag}: productNodes is [] (no Product node on the producer page)`);
           const catalog = biz?.hasOfferCatalog?.itemListElement || [];
           assertTrue(catalog.length === 1 && catalog[0]?.["@type"] === "Thing" && typeof catalog[0]?.name === "string" && catalog[0].name !== "",
             `${tag}: the unpriced product stays in the name-only catalog`);
         }
+      }
+
+      // Rollback mode (PRODUCER_PAGE_PRODUCT_NODES = true): the Product form
+      // as before S6 del B, and still none of S1's forbidden nodes.
+      try {
+        policy.__setProducerPageProductNodesForTesting(true);
+        for (const [slug, label] of [["vurdert-gaard", "rfb 4.6/236"], ["uten-antall-gaard", "rfb 4.6/null"]] as const) {
+          for (const lang of ["no", "en"] as const) {
+            const tag = `${label} (${lang}, rollback mode)`;
+            const r = invoke(slug, lang);
+            assertTrue(r.status === 200, `${tag}: renders 200`);
+            const blocks = assertCleanPage(r.body, tag);
+            assertEq(offersWithoutPrice(blocks), 0, `${tag}: offersWithoutPrice stays 0`);
+            const biz = (blocks.flatMap((b) => (Array.isArray(b) ? b : [b])) as any[]).find((n) => n?.["@type"] === "LocalBusiness");
+            const offers = Array.isArray(biz?.makesOffer) ? biz.makesOffer : [];
+            assertTrue(offers.length === 1, `${tag}: exactly the one priced product is in makesOffer`);
+            const product = offers[0]?.itemOffered;
+            const inner = product?.offers;
+            assertTrue(product?.["@type"] === "Product" && product?.brand?.["@type"] === "Brand" && !!product?.brand?.name, `${tag}: Product keeps brand`);
+            assertTrue(typeof inner?.price === "number" && inner.price > 0 && inner.priceCurrency === "NOK", `${tag}: Product.offers keeps price > 0 + priceCurrency`);
+            assertTrue(inner?.availability === "https://schema.org/InStock" && inner?.seller?.["@type"] === "LocalBusiness", `${tag}: Product.offers keeps availability + seller`);
+            assertEq(productNodes(blocks), ["$[0].makesOffer[0].itemOffered"], `${tag}: productNodes finds the one Product`);
+          }
+        }
+      } finally {
+        policy.__setProducerPageProductNodesForTesting(null);
       }
     } catch (err) {
       failed++;
@@ -383,12 +443,31 @@ export async function runRfbJsonLdIngenTredjepartsratingTests(opts: { log?: bool
     }
   }
 
+  // ══════════════════════════════════════════════════════════════
+  // (E) source check (S6 del B): the makesOffer builder in seo.ts asks the
+  // policy module before it builds a Product, so the Product form is only
+  // reached in rollback mode.
+  // ══════════════════════════════════════════════════════════════
+  {
+    const seoSrc = readFileSync(join(__dirname, "seo.ts"), "utf8");
+    assertTrue(/import \{[^}]*\bproducerPageProductNodes\b[^}]*\} from "\.\.\/services\/structured-data-policy";/.test(seoSrc),
+      "source: seo.ts imports producerPageProductNodes from structured-data-policy");
+    const start = seoSrc.indexOf("const pricedOffers = productsList");
+    const end = seoSrc.indexOf("jsonLd.makesOffer = pricedOffers", start);
+    const builder = start >= 0 && end > start ? seoSrc.slice(start, end) : "";
+    assertTrue(builder !== "", "source: seo.ts's makesOffer builder is found");
+    const ask = builder.indexOf("if (!producerPageProductNodes())");
+    const product = builder.indexOf("const product: any = {");
+    assertTrue(ask >= 0 && product > ask, "source: the builder calls producerPageProductNodes() before const product");
+    assertEq((seoSrc.match(/producerPageProductNodes\(\)/g) || []).length, 1, "source: seo.ts reads producerPageProductNodes() in one place");
+  }
+
   return { passed, failed, failures };
 }
 
 // Standalone runner: `npx tsx src/routes/rfb-jsonld-ingen-tredjepartsrating.test.ts`
 if (require.main === module) {
-  console.log("── RFB/OA/dental JSON-LD without third-party rating (dev-request 2026-10-16 S1) ──");
+  console.log("── RFB/OA/dental JSON-LD without third-party rating (dev-request 2026-10-16 S1, S6 del B) ──");
   runRfbJsonLdIngenTredjepartsratingTests({ log: true }).then((r) => {
     console.log(`\nrfb-jsonld-ingen-tredjepartsrating: ${r.passed} passed, ${r.failed} failed`);
     if (r.failed > 0) {

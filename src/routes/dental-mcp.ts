@@ -29,6 +29,7 @@ import {
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
 import { planDentalSearch } from "../services/dental-query-parser";
+import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
@@ -37,6 +38,7 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 
 const router = Router();
 
@@ -137,6 +139,21 @@ export function buildSearchResults(
   return agents.map((a) => toDentalClinicCard(a, "search"));
 }
 
+/**
+ * The whole text of a tool result when the tool fails inside. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
+ * client («Søkefeil: …», «Feil: …»), SQLite's for one. The wording is Rett
+ * fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts), from the same
+ * template (utils/internal-error.ts).
+ */
+export const DENTAL_MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Finn-tannlege");
+
+/** A failed tool's isError result with DENTAL_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
+function toolInternalError(tool: string, err: unknown) {
+  return mcpToolInternalErrorResult("dental-mcp", DENTAL_MCP_INTERNAL_ERROR_TEXT, tool, err);
+}
+
 // ─── Tool registrations ──────────────────────────────────────
 
 export function registerDentalTools(server: McpServer): void {
@@ -178,7 +195,11 @@ export function registerDentalTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async ({ query, fylke, spesialitet, helfo, akutt, limit }, extra) => {
+    async ({ query, fylke: fylkeAsSent, spesialitet, helfo, akutt, limit }, extra) => {
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+      // strukturerte-stedsfelt-uten-lengdetak): `fylke` is a place name, cut
+      // to MAX_NAME_CHARS at a word boundary (utils/free-text.ts).
+      const fylke = capName(fylkeAsSent);
       try {
         // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): `query`
         // goes through the shared parser; the explicit arguments win over
@@ -191,9 +212,15 @@ export function registerDentalTools(server: McpServer): void {
         if (spesialitet) explicit.specialty = spesialitet;
         if (helfo !== undefined) explicit.helfo_agreement = helfo ? "true" : undefined;
         if (akutt !== undefined) explicit.acute_vakt = akutt ? 1 : undefined;
+        // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `query` reach the search,
+        // cut at a word boundary (utils/free-text.ts). The parser reads 256 of
+        // them. All of it reached the delivery log and, with the parser
+        // switched off (DENTAL_QUERY_PARSER_DISABLED), the whole-text search,
+        // where a text past SQLite's LIKE pattern limit was a search error.
+        const queryText = query === undefined ? undefined : capFreeText(query);
 
         const plan = planDentalSearch({
-          query,
+          query: queryText,
           explicit,
           gazetteer: () => getDentalSearchGazetteer(listPoststeder),
           count: (f) => countPublicDentalAgents(f as any),
@@ -203,16 +230,13 @@ export function registerDentalTools(server: McpServer): void {
 
         // `tolkning` (only when a query was parsed) says what the search used.
         const result = { count: plan.count, klinikker, ...(plan.tolkning ? { tolkning: plan.tolkning } : {}) };
-        deliver("tannlege_search", { query, fylke, spesialitet, helfo, akutt, limit }, extra, agents.map((a) => a.id));
+        deliver("tannlege_search", { query: queryText, fylke, spesialitet, helfo, akutt, limit }, extra, agents.map((a) => a.id));
         // Compact JSON: indentation was a third of a 25-card answer (S4b keeps it near 12 KB).
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Søkefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_search", err);
       }
     }
   );
@@ -270,10 +294,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_info", err);
       }
     }
   );
@@ -317,10 +338,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(explanation, null, 2) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Statistikkfeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_stats", err);
       }
     }
   );
@@ -347,7 +365,9 @@ export function registerDentalTools(server: McpServer): void {
         openWorldHint: true,
       },
     },
-    async ({ fylke }) => {
+    async ({ fylke: fylkeAsSent }) => {
+      // Slice I-Y2: a place name, cut as in tannlege_search.
+      const fylke = capName(fylkeAsSent);
       try {
         // S2b: the public store reads acute_vakt 1 as the akutt claim
         // (DENTAL_ACUTE_CLAIM_SQL), so `count` and every card here are clinics
@@ -375,10 +395,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_akutt", err);
       }
     }
   );
@@ -413,10 +430,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_kjeder", err);
       }
     }
   );
