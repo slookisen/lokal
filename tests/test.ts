@@ -42893,10 +42893,12 @@ runSerial(async () => {
 // «sunn mat» and «kortreist sjømat» are none either; «bakeri» as the only
 // product term gives way to the word the parser cannot read («Finnes det noen
 // bakeri som lager kransekake»); the name query of both passes leaves out the
-// filler and qualifier words («kortreist såper»). A search of one word, the
-// producer names and the names Pass 1 reads answer as main did
-// (tests/fixtures/rfb-sok-i-w3-main.json). Own in-memory DBs (restored in
-// finally), runSerial.
+// filler and qualifier words («kortreist såper»), unless a producer name holds
+// them with a distinctive word of the search («Tell me about Den Gode Baker»,
+// review round 1, B2). A search of one word, the producer names and the names
+// Pass 1 reads answer as main did (tests/fixtures/rfb-sok-i-w3-main.json), and
+// a long search matches no word against every name (B1). Own in-memory DBs
+// (restored in finally), runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W3 (RFB search: Pass 1 reads the filler lists) ──");
   try {

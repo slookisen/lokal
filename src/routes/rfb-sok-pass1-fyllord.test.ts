@@ -21,16 +21,26 @@
  *   read, as «bakeries» does (I-W2): «kransekake fra bakeri» put the producers
  *   with «… fra eget bakeri» in a product name first.
  * - The name query of both passes leaves out the filler and qualifier words
- *   («kortreist såper», «kortreist mat fra Valen gård»). They stay when
- *   nothing else is left, when a producer name holds them as whole words, and
- *   when the words left have no distinctive word in a producer name («When is
- *   the next Bondens marked in Oslo?», «stor zzzqqx»).
+ *   («kortreist såper», «kortreist mat fra Valen gård»). They stay when the
+ *   words left have no distinctive word in a producer name («When is the next
+ *   Bondens marked in Oslo?», «stor zzzqqx», a search of filler words only),
+ *   and a filler word stays when a producer name holds it as a whole word
+ *   together with a distinctive word of the search. Review round 1 (B2): they
+ *   stayed only when one name held every word of the search, so «Tell me
+ *   about Den Gode Baker» and «Den Gode Baker Sandefjord» lost «Den Gode» and
+ *   missed Den Gode Baker.
  * - Next to an indicator word a qualifier word counts no more than next to a
- *   category word («sunn mat» reads as «mat»), and «gourmet» and «artisan»
- *   are qualifier words (FUNN rfb-sok-egenskapsord-hale).
+ *   category word («sunn mat» reads as «mat»), and «gourmet», «artisan» and
+ *   «artisanal» are qualifier words (FUNN rfb-sok-egenskapsord-hale).
+ * - Review round 1 (S1): «finner» is a filler word («Hvor finner jeg kortreist
+ *   mat i Oslo?» was the name search «finner mat», for Finnerud Gård).
+ * - Review round 1 (B1): the cost of a long search. A word with other
+ *   characters than letters that ends in an indicator («x-mat») was matched
+ *   against every producer name, for each such word: a 1 MB search took 33 s.
  * - B1: a search of one word, the producer names and the name searches that
  *   Pass 1 reads («Bjerke Spekemat & Delikatesse», «Dyrøy Sjømat», «When is the
- *   next Bondens marked in Oslo?») answer byte for byte as on I-W2
+ *   next Bondens marked in Oslo?»), and names with filler words with more
+ *   words around them («Den Gode Baker Sandefjord»), answer byte for byte as on I-W2
  *   (tests/fixtures/rfb-sok-i-w3-main.json, captured with pass1MainTexts below
  *   on main ad67dba6).
  *
@@ -66,6 +76,11 @@ const KNEIPPEN = id(147);
 const HITRA = id(148), SORFJORD = id(149), HARDANGER_SAFT = id(150), FJORDGRILL = id(151);
 // A filler word inside a word of a name («ren» in «Grenland»), and a generic word in a name («marked» in «Matmarked»)
 const GRENLAND = id(152), SOLLI = id(153), MATMARKED = id(154);
+// Review round 1 (B2): names with filler words («Den», «Gode», «Norsk», «Topp»), and producers that share their
+// distinctive word (live 2026-10-17); I-W2's «Topp Sopp Fixture»
+const DEN_GODE_BAKER = id(155), NORSK_ULLGRIS = id(156), SETESDAL_ULLGRIS = id(157), HELLA_SOPPERI = id(158), TOPP = id(107);
+// Review round 1 (B1, S1): a word of a name with a character other than a letter that ends in «mat», and a name «finner» begins
+const AR_SJOMAT = id(159), FINNERUD = id(160);
 
 /** A producer whose knowledge products and catalog rows are the same names (and prices). */
 function seed(n: string, name: string, lat: number, lng: number, city: string, categories: string[], catalog: CatalogRow[]): Seed {
@@ -99,22 +114,36 @@ export const I_W3_SEEDS: Seed[] = [
   seed(SOLLI, "Solli Krydderhage Fixture", 59.28, 11.11, "Sarpsborg", ["herbs"], [{ name: "Basilikum", priceNok: 35 }]),
   // live: «Maschmanns Matmarked»
   seed(MATMARKED, "Maschmanns Matmarked Fixture", 60.39, 5.32, "Bergen", ["other"], [{ name: "Ferskvarer", priceNok: 99 }]),
+  // live: «Den Gode Baker AS» (Sandefjord), «Norsk Ullgris», «Setesdal Ullgris», «Hella Sopperi»
+  seed(DEN_GODE_BAKER, "Den Gode Baker AS Fixture", 59.13, 10.22, "Sandefjord", ["bakery"], [{ name: "Grovbrød", priceNok: 55 }]),
+  seed(NORSK_ULLGRIS, "Norsk Ullgris Fixture", 59.58, 11.17, "Askim", ["meat"], [{ name: "Ullgrispølse", priceNok: 89 }]),
+  seed(SETESDAL_ULLGRIS, "Setesdal Ullgris Fixture", 59.33, 7.38, "Valle", ["meat"], [{ name: "Ullgriskoteletter", priceNok: 159 }]),
+  seed(HELLA_SOPPERI, "Hella Sopperi Fixture", 61.2, 6.6, "Leikanger", ["vegetables"], [{ name: "Østerssopp", priceNok: 79 }]),
+  // live: «AR-Sjømat — Averøy», «Finnerud Gård»
+  seed(AR_SJOMAT, "AR-Sjømat Fixture", 63.05, 7.6, "Averøy", ["fish"], [{ name: "Klippfisk", priceNok: 199 }]),
+  seed(FINNERUD, "Finnerud Gård Fixture", 60.8, 10.69, "Gjøvik", ["vegetables"], [{ name: "Poteter", priceNok: 35 }]),
 ];
 
-const I_W3_TRUST: Array<[string, number]> = [[AARVIK, 0.95], [SUNNMORSMAT, 0.9], [OVERNATURLIG, 0.9], [HARDANGER_SAFT, 0.9]];
+// The producers that share a distinctive word rank first by trust, as live
+const I_W3_TRUST: Array<[string, number]> = [[AARVIK, 0.95], [SUNNMORSMAT, 0.9], [OVERNATURLIG, 0.9], [HARDANGER_SAFT, 0.9],
+  [SETESDAL_ULLGRIS, 0.9], [HELLA_SOPPERI, 0.9]];
 
 /**
  * B1: searches that must answer byte for byte as on main (ad67dba6, I-W2): a
  * search of one word (also one that ends in an indicator or is a filler
- * word), producer names, and searches Pass 1 or Pass 2 reads as a name.
+ * word), producer names, searches Pass 1 or Pass 2 reads as a name, and
+ * names with filler words with a place or a product word after them.
  */
 export const B1_W3_QUERIES: readonly string[] = [
   // one word
   "Fiskemat", "Dyrøymat", "sjømat", "mat", "sunn", "kortreist", "gourmet", "artisan", "bakeri", "Finnes", "Bondens", "lunsj",
-  "kransekake", "Grini", "såper", "Gårds-bakeri", "grillmat", "tomat", "nettbutikk", "kveldsmat",
+  "kransekake", "Grini", "såper", "Gårds-bakeri", "grillmat", "tomat", "nettbutikk", "kveldsmat", "finner", "artisanal",
   // names through Pass 0, Pass 1 (an indicator, also at the end of a word that is a word of a name) and Pass 2
   "Bjerke Spekemat & Delikatesse", "Hitra Sjømat", "Dyrøy Sjømat", "Valen Gård", "Mat i Bergen", "When is the next Bondens marked in Oslo?",
-  "Bondens Hage", "Godt og Hjemmelaget", "Lager 11", "Norsk AS", "H.A. Hanssen",
+  "Bondens Hage", "Godt og Hjemmelaget", "Lager 11", "Norsk AS", "H.A. Hanssen", "AR-Sjømat laks", "Finnerud Gård",
+  // review round 1 (B2): names with filler words, with a place or a product word after them
+  "Den Gode Baker", "Den Gode Baker Sandefjord", "Den Gode Baker kransekake", "Norsk Ullgris kransekake", "Norsk Ullgris Askim",
+  "Topp Sopp kransekake",
   // a category word with «bakeri» and nothing else
   "bakeri i Bergen", "bakeri Trondheim",
 ];
@@ -308,10 +337,41 @@ export async function runRfbSokPass1FyllordTests(opts: { log?: boolean } = {}): 
       assertEq([parse("Bondens Hage")._nameQuery, parse("Godt og Hjemmelaget")._nameQuery, parse("Lager 11")._nameQuery, parse("Norsk AS")._nameQuery,
         parse("sunn")._nameQuery, parse("H.A. Hanssen")._nameQuery],
       ["Bondens Hage", "Godt Hjemmelaget", "Lager 11", "Norsk AS", "sunn", "HA Hanssen"],
-      "the filler words stay when a producer name holds them («Bondens Hage»), in a search of filler words only («Godt og Hjemmelaget», «Lager 11», "
-        + "«Norsk AS»), when nothing else would be left («sunn»), and a word under three letters is never left out («HA»)");
+      "the filler words stay when a producer name holds them with a distinctive word of the search («Bondens Hage»), in a search of filler words "
+        + "only («Godt og Hjemmelaget», «Lager 11», «Norsk AS»), when nothing else would be left («sunn»), and a word under three letters is never "
+        + "left out («HA»)");
       assertEq([parse("stor zzzqqx")._nameQuery, discover("stor zzzqqx").includes(KORTREIST_NAVN)], ["stor zzzqqx", false],
         "and when the words left name nobody («zzzqqx»): the name query stays as on I-W2, not one that finds nobody and falls back to the standard list");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Review round 1 (B2): a name with filler words, with more words around it
+    // ══════════════════════════════════════════════════════════════
+    {
+      // [search, name query, the producer it names, its name]. Round 1 kept the filler words only when one name held every
+      // word of the search, so these were «Baker», «Ullgris …» and «Sopp …»: Den Gode Baker fell out of the list, and
+      // Setesdal Ullgris and Hella Sopperi (higher trust) came first.
+      const cases: Array<[string, string, string, string]> = [
+        ["Tell me about Den Gode Baker", "Den Gode Baker", DEN_GODE_BAKER, "Den Gode Baker AS Fixture"],
+        ["Jeg vil kontakte Den Gode Baker", "kontakte Den Gode Baker", DEN_GODE_BAKER, "Den Gode Baker AS Fixture"],
+        ["Den Gode Baker Sandefjord", "Den Gode Baker Sandefjord", DEN_GODE_BAKER, "Den Gode Baker AS Fixture"],
+        ["Den Gode Baker kransekake", "Den Gode Baker kransekake", DEN_GODE_BAKER, "Den Gode Baker AS Fixture"],
+        ["Tell me about Norsk Ullgris", "Norsk Ullgris", NORSK_ULLGRIS, "Norsk Ullgris Fixture"],
+        ["Norsk Ullgris kransekake", "Norsk Ullgris kransekake", NORSK_ULLGRIS, "Norsk Ullgris Fixture"],
+        ["Jeg vil kontakte Norsk Ullgris", "kontakte Norsk Ullgris", NORSK_ULLGRIS, "Norsk Ullgris Fixture"],
+        ["Tell me about Topp Sopp", "Topp Sopp", TOPP, "Topp Sopp Fixture"],
+        ["Topp Sopp kransekake", "Topp Sopp kransekake", TOPP, "Topp Sopp Fixture"],
+        ["Jeg vil kontakte Topp Sopp", "kontakte Topp Sopp", TOPP, "Topp Sopp Fixture"],
+      ];
+      for (const [q, nameQuery, first, firstName] of cases) {
+        assertEq([parse(q)._nameQuery, discover(q)[0], namesIn(await search(q))[0]], [nameQuery, first, firstName],
+          `«${q}» (review round 1, B2): the name query keeps the filler words of the producer's name, and the producer comes first, as on main`);
+      }
+      assertEq([parse("Ullgris kransekake")._nameQuery, discover("Ullgris kransekake")[0]], ["Ullgris kransekake", SETESDAL_ULLGRIS],
+        "setup: without «Norsk» the higher trust of Setesdal Ullgris puts it first");
+      assertEq([parse("gode såper")._nameQuery, parse("Den Gode Baker zzzqqx")._nameQuery], ["såper", "Den Gode Baker zzzqqx"],
+        "a filler word stays only with a distinctive word of the search in the same name: «gode såper» is «såper» («Gode» is in «Den Gode Baker», "
+          + "«såper» is not), and a word in no name («zzzqqx») does not take «Den Gode» away");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -321,7 +381,7 @@ export async function runRfbSokPass1FyllordTests(opts: { log?: boolean } = {}): 
       assertEq([parse("sunn mat")._unknownTerms, parse("mat til lunsj")._unknownTerms, parse("lunsj")._unknownTerms, parse("gave til jul")._unknownTerms],
         [undefined, undefined, ["lunsj"], ["gave", "jul"]],
         "next to «mat» a qualifier word is no word to look up, as next to a category word; alone it still is");
-      for (const [q, base, word] of [["gourmet brød", "brød", "gourmet"], ["artisan bread", "bread", "artisan"]]) {
+      for (const [q, base, word] of [["gourmet brød", "brød", "gourmet"], ["artisan bread", "bread", "artisan"], ["artisanal bread", "bread", "artisanal"]]) {
         const text = await search(q);
         assertEq([parse(q)._unknownTerms, text.includes(`«${word}»`), await searchAs(q, base) === await search(base)], [undefined, false, true],
           `«${q}» (FUNN rfb-sok-egenskapsord-hale): «${word}» labels no bakery, and lokal_search gives the answer of «${base}»`);
@@ -330,6 +390,63 @@ export async function runRfbSokPass1FyllordTests(opts: { log?: boolean } = {}): 
         "alone «artisan» still finds «Artisan surdeigsbrød» (B1 above), and «gourmet» names no fixture producer");
       assertEq([discover("Reine Såper")[0], discover("Sunnmørsmat")[0], discover("Overnaturlig Honning")[0], discover("H.A. Hanssen")[0]],
         [REINE_SAPER, SUNNMORSMAT, OVERNATURLIG, HANSSEN], "setup: each fixture producer is found by its name");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Review round 1 (S1): «finner»
+    // ══════════════════════════════════════════════════════════════
+    {
+      const q = "Hvor finner jeg kortreist mat i Oslo?";
+      assertEq([parse(q)._nameQuery, parse(q)._unknownTerms, namesIn(await search(q)).includes("Finnerud Gård Fixture"), await searchAs(q, "mat i Oslo") === await search("mat i Oslo")],
+        [undefined, undefined, false, true],
+        `«${q}»: no name search («finner mat» found Finnerud Gård alone), and lokal_search gives the answer of «mat i Oslo»`);
+      assertEq([parse("finner")._nameQuery, namesIn(texts.finner), parse("Finnerud Gård")._nameQuery], ["finner", ["Finnerud Gård Fixture"], "Finnerud Gård"],
+        "alone «finner» is still the name search of main (B1 above), and «Finnerud Gård» names its producer");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Review round 1 (B1): the cost of a long search
+    // ══════════════════════════════════════════════════════════════
+    {
+      // A name, or the text of all names, is searched for a word with String.prototype.indexOf (productNameMatch) or
+      // .includes, so the calls of those two with a word of the search as the needle count how often that word is
+      // looked for (as in security-sanitize-fixpoint.test.ts, the methods are put back in finally). Round 1 looked
+      // for each word with a character other than a letter that ends in an indicator in every name, and Pass 2,
+      // where such a word now goes, did the same for each word: a 1 MB search of «x-mat» took 33 s on the 1 563
+      // live names (main 1.8 s).
+      const lookupsOf = (isNeedle: (s: string) => boolean, fn: () => unknown): number => {
+        const orig = { indexOf: String.prototype.indexOf, includes: String.prototype.includes };
+        let n = 0;
+        for (const m of ["indexOf", "includes"] as const) {
+          (String.prototype as any)[m] = function (this: string, search: any, ...rest: any[]) {
+            if (typeof search === "string" && isNeedle(search)) n++;
+            return (orig[m] as any).call(this, search, ...rest);
+          };
+        }
+        try { fn(); } finally { Object.assign(String.prototype, orig); }
+        return n;
+      };
+      const names = [...I_W_SEEDS, ...I_W2_SEEDS, ...I_W3_SEEDS].length;
+      assertEq([parse("AR-Sjømat laks")._nameQuery, discover("AR-Sjømat laks")], ["AR-Sjømat", [AR_SJOMAT]],
+        "setup: «AR-Sjømat», a whole word of «AR-Sjømat Fixture», still makes Pass 1 read the name (B1 above)");
+      // «zqa-mat», «zqb-mat» …: 2000 words no name holds
+      const words = Array.from({ length: 2000 }, (_, i) => `zq${[...i.toString(26)].map((d) => String.fromCharCode(97 + parseInt(d, 26))).join("")}-mat`);
+      const long = words.join(" ");
+      const longCalls = lookupsOf((s) => s.endsWith("-mat"), () => parse(long));
+      assertTrue(new Set(words).size === 2000 && longCalls <= 2 * words.length && parse(long)._nameQuery === undefined,
+        `B1: a search of 2000 different words like «x-mat» looks for each in the text of all names, in the indicator check and in Pass 2 `
+          + `(${longCalls} calls ≤ ${2 * words.length}), not in each name (round 1: 2 × 2000 × ${names})`);
+      // «r-sjømat» is inside «AR-Sjømat», but no whole word of it
+      const inside = Array(2000).fill("r-sjømat").join(" ");
+      const insideCalls = lookupsOf((s) => s === "r-sjømat", () => parse(inside));
+      assertTrue(insideCalls <= 4 * names && parse("r-sjømat laks")._nameQuery === undefined,
+        `B1: 2000 times a word inside a name («r-sjømat»): the names are read for it a few times in all (${insideCalls} calls ≤ ${4 * names}), `
+          + "not once per word, and it is no indicator");
+      // the name query reads the names once for each different filler word
+      const fillers = [...Array(1999).fill("kortreist"), "Grini"].join(" ");
+      const fillerCalls = lookupsOf((s) => s === "kortreist", () => parse(fillers));
+      assertTrue(fillerCalls <= 2 * names && parse(fillers)._nameQuery === "Grini",
+        `B1: 1999 times «kortreist» and «Grini»: the names are read for «kortreist» once (${fillerCalls} calls ≤ ${2 * names}), and the name query is «Grini»`);
     }
   } finally {
     console.log = prevLog;
