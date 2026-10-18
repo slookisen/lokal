@@ -19,7 +19,9 @@
  * Offer from the farm with exactly @type, name, price and priceCurrency, and
  * the page has no Product node (productNodes); (e) also renders the same
  * fixtures in rollback mode (PRODUCER_PAGE_PRODUCT_NODES true), where the
- * Product form comes back with the same names and prices.
+ * Product form comes back with the same names and prices, and the HTML
+ * outside the ld+json blocks is byte-identical in both modes (SQL RANDOM()
+ * is a constant in this suite's DB).
  *
  * Same synthetic router.handle()-less harness as
  * rfb-trust-score-public-display-removed.test.ts (own `Database(":memory:")`,
@@ -88,6 +90,10 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
   const testDb = new Database(":memory:");
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = OFF");
+  // (e) compares two renders of a page byte for byte. Related producers
+  // (seo.ts getRelatedBySameCity/getRelatedBySameCategory) break ties with SQL
+  // RANDOM(), so it is a constant in this suite's own DB.
+  testDb.function("random", () => 0);
 
   function seedAgent(row: { id: string; name: string; city?: string | null; lat?: number | null; lng?: number | null }): void {
     testDb.prepare(
@@ -161,6 +167,18 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
         }
       }
       return null;
+    }
+
+    /** The page with each ld+json block replaced by a marker: the HTML outside the JSON-LD, block positions included. */
+    const outsideJsonLd = (body: string): string =>
+      body.replace(/<script type="application\/ld\+json">[\s\S]*?<\/script>/g, "<!--ld+json-->");
+    /** null when a === b, else the first differing offset with the text around it on both sides. */
+    function firstDiff(a: string, b: string): string | null {
+      if (a === b) return null;
+      let i = 0;
+      while (i < a.length && i < b.length && a[i] === b[i]) i++;
+      const around = (s: string): string => JSON.stringify(s.slice(Math.max(0, i - 60), i + 60));
+      return `offset ${i} of ${a.length}/${b.length}: ${around(a)} vs ${around(b)}`;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -386,7 +404,8 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
     // products, Things skipped), since on EN «Honning - kr. 150» is the Offer
     // «Honey» while the row keeps the whole name. S6 del B: each Offer has
     // exactly @type, name, price and priceCurrency and the page has no Product
-    // node; in rollback mode the same names and prices come back as Products.
+    // node; in rollback mode the same names and prices come back as Products,
+    // and the rest of the page is byte for byte the same.
     // ══════════════════════════════════════════════════════════════
     {
       type Row = { name: string; price?: string; want: [string, number] | null };
@@ -517,6 +536,22 @@ export async function runMakesOfferPriceOptionalTests(opts: { log?: boolean } = 
           assertSame((rbLd?.hasOfferCatalog?.itemListElement || []).map((x: any) => x.name), wantThings, `${tag} rollback: the catalog Things are the same`);
           assertSame(offersWithoutPrice(rbBlocks), 0, `${tag} rollback: offersWithoutPrice stays 0`);
           assertSame(forbiddenNodes(rbBlocks), [], `${tag} rollback: no forbidden node`);
+
+          // S6 del B changes the JSON-LD only. Rollback mode renders the page
+          // as on main (rfb-seo-feiltypede-knowledge-felt.test.ts holds main's
+          // golden), so this is the before/after check: with the ld+json
+          // blocks cut out, the two pages are byte for byte the same (rows,
+          // prices, FAQ, related producers). With nothing priced the whole
+          // page is.
+          const again = invoke("/produsent/:slug", { params: { slug: f.slug }, lang, ip: "127.0.0.1" });
+          assertSame(firstDiff(again.body, r.body), null, `${tag}: two renders in the same mode are byte-identical (RANDOM() fixed)`);
+          const cut = outsideJsonLd(r.body);
+          assertTrue(blocks.length > 0 && cut.split("<!--ld+json-->").length - 1 === blocks.length && !cut.includes("application/ld+json")
+            && cut.includes(`<div class="prod-item">`) && cut.includes(`class="rp-card"`),
+            `${tag}: the HTML outside the JSON-LD has every ld+json block cut, the product rows and the related producers`);
+          assertSame(firstDiff(cut, outsideJsonLd(rb.body)), null, `${tag}: the HTML outside the ld+json blocks is byte-identical in rollback mode (main)`);
+          if (wantOffers.length) assertTrue(r.body !== rb.body, `${tag}: the two modes differ, in the JSON-LD only`);
+          else assertSame(firstDiff(r.body, rb.body), null, `${tag}: with nothing priced the whole page is byte-identical in rollback mode`);
         }
       }
     }
