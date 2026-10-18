@@ -53,11 +53,13 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
+import { placesFieldMask } from "../services/places-match";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { buildProvenanceSummary } from "../services/cross-source-validator";
+import { capFreeText } from "../utils/free-text";
 
 const router = Router();
 
@@ -77,6 +79,20 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   next();
+}
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt, S4-A1b: the two public REST answers below leave out the stored
+// Google rating (rating, rating_count, rating_source; PR-130, written only
+// from Places), as the clinic card and the A2A answer do
+// (dental-clinic-card.ts). Passing it on is «reshare» under the Places terms
+// (protocols/juridisk-sjekk-google-ratinger-2026-10-17.md). The stored values
+// stay untouched.
+function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknown; rating_source?: unknown }>(
+  agent: T
+): Omit<T, "rating" | "rating_count" | "rating_source"> {
+  const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...rest } = agent;
+  return rest;
 }
 
 // ─── GET /api/tannlege/agents — list with filters ───────────────────
@@ -100,7 +116,10 @@ router.get("/agents", (req: Request, res: Response) => {
       specialty: req.query.specialty as string | undefined,
       verification_status: req.query.verification_status as string | undefined,
       enrichment_state: req.query.enrichment_state as string | undefined,
-      q: req.query.q as string | undefined,
+      // Slice I-Y: a free-text LIKE pattern, cut like search text
+      // (utils/free-text.ts). One past SQLite's pattern limit (50 000 bytes)
+      // was an HTTP 500. A `q` that is no string is left to the schema.
+      q: typeof req.query.q === "string" ? capFreeText(req.query.q) : (req.query.q as string | undefined),
       helfo_agreement: req.query.helfo_agreement as string | undefined,
       poststed: req.query.poststed as string | undefined,
       // acute_vakt: parse to number so z.literal(0|1) validates correctly
@@ -144,7 +163,7 @@ router.get("/agents", (req: Request, res: Response) => {
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
     const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((a) => ({
-      ...a,
+      ...withoutGoogleRating(a),
       telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
       mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
     }));
@@ -193,7 +212,7 @@ router.get("/agents/:id", (req: Request, res: Response) => {
 
   res.json({
     agent: {
-      ...agent,
+      ...withoutGoogleRating(agent),
       telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
       mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
       ...(provenance ? { provenance } : {}),
@@ -980,10 +999,21 @@ const OpeningHoursArraySchema = z.array(
 // needed: fill-only semantics mean "already filled" IS the durable marker,
 // unlike the RFB rating-batch (measure 2, RFB slice) where a rating can
 // legitimately not exist yet at all.
-const PLACES_ENTERPRISE_FIELD_MASK =
-  "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.regularOpeningHours,places.businessStatus,places.addressComponents";
-const PLACES_PRO_FIELD_MASK =
-  "places.displayName,places.formattedAddress,places.regularOpeningHours,places.businessStatus,places.addressComponents";
+//
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (S4-A2): built through the shared placesFieldMask with rating
+// fetch off, so a Google rating field is never requested for a clinic, also
+// not if RFB's GOOGLE_RATING_FETCH_ENABLED is set back. Daniel's decision 2
+// covers finn-tannlege too. The masks are the same as before: dental has
+// never requested one.
+const PLACES_ENTERPRISE_FIELD_MASK = placesFieldMask(
+  ["places.displayName", "places.formattedAddress", "places.internationalPhoneNumber", "places.websiteUri", "places.regularOpeningHours", "places.businessStatus", "places.addressComponents"],
+  false
+);
+const PLACES_PRO_FIELD_MASK = placesFieldMask(
+  ["places.displayName", "places.formattedAddress", "places.regularOpeningHours", "places.businessStatus", "places.addressComponents"],
+  false
+);
 
 interface PlacesAgentRow {
   id: string;
@@ -1244,12 +1274,15 @@ router.post(
         placesCallsThisRun++;
         // measure 2 (dental slice, lokal#130): log the SKU tier actually
         // requested, not always "enterprise" — needsEnterprise/fieldMask
-        // above already decide which mask this specific call uses.
+        // above already decide which mask this specific call uses. The mask
+        // goes along so the log can show it asked for no Google rating
+        // (S4-A2, places-usage-tracker.ts).
         logPlacesCall(
           db,
           "dental",
           "google-places-batch",
-          needsEnterprise ? "text_search_enterprise" : "text_search_pro"
+          needsEnterprise ? "text_search_enterprise" : "text_search_pro",
+          fieldMask
         );
         const resp = await fetch(
           "https://places.googleapis.com/v1/places:searchText",

@@ -20,12 +20,20 @@
 // the DB-side guard.
 //
 // A row holds counters, the window's largest fanIn ratio (limiter, fanIn and
-// traffic-classifier family of that key), the mode and the machine name.
+// traffic-classifier family of that key), the mode, the machine name and,
+// from trinn 1d, covered_ms: how much of the window the process measured (its
+// first window only from its first request), so hours_covered no longer
+// counts a restart's partial window as a full 5 min. Rows stored before 1d
+// keep the column's default, a full window, as they were counted then.
 // No IP, no key, no hash.
+//
+// The timer's flush runs inside trackJob, as every other periodic DB job
+// does, so the event-loop monitor can name it in a stall (trinn 1d).
 
 import os from "os";
 import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
+import { trackJob } from "./event-loop-monitor";
 import type { ClientIpCounters, ClientIpMode, ClientIpWindowFanIn } from "../middleware/client-ip";
 
 export const CLIENT_IP_WINDOW_RETENTION_DAYS = 14;
@@ -33,6 +41,8 @@ const FLUSH_EVERY_MS = 30_000;
 const MAX_QUEUE = 12; // one hour of 5-min windows
 const PRUNE_EVERY_MS = 3_600_000;
 const MAX_MACHINE_CHARS = 64;
+/** The timer's name in the event-loop monitor (stalls, [slow-job]). */
+export const FLUSH_JOB_NAME = "client-ip-shadow-flush";
 
 /** One closed stats window, as client-ip.ts hands it over. */
 export interface ClientIpWindowRecord {
@@ -40,8 +50,10 @@ export interface ClientIpWindowRecord {
   windowStart: number;
   mode: ClientIpMode;
   counters: ClientIpCounters;
-  /** The window's largest fanIn ratio; null when no 15-min top key had fanIn > 1. */
+  /** The window's largest fanIn ratio; null when no key had fanIn > 1 over the 20 min it is rated on. */
   fanIn: ClientIpWindowFanIn | null;
+  /** How much of the window the process measured, ms (≤ 5 min): its first window only from its first request. */
+  coveredMs: number;
 }
 
 /** Rows of one mode with a count > 0, and the newest such row's window_start (null when none). */
@@ -56,6 +68,8 @@ export interface ClientIpStoredTotals {
   rows: number;
   /** Distinct window starts among them. */
   windows: number;
+  /** Per distinct window start, the largest covered_ms of its rows, summed: the time measured, never a window twice. */
+  coveredMs: number;
   machines: number;
   /** window_start of the oldest and newest row; null when the table is empty. */
   first: string | null;
@@ -130,6 +144,7 @@ const INSERT_COLUMNS = [
   "fanin_fan_in",
   "fanin_ua",
   "created_at",
+  "covered_ms",
 ];
 const INSERT_SQL = `INSERT OR IGNORE INTO client_ip_shadow_windows (${INSERT_COLUMNS.join(", ")}) VALUES (${INSERT_COLUMNS.map(() => "?").join(", ")})`;
 
@@ -144,6 +159,11 @@ const TOTALS_SQL = `SELECT COUNT(*) AS rows_, COUNT(DISTINCT window_start) AS wi
   ${COUNTER_COLUMNS.map(([col]) => `COALESCE(SUM(${col}), 0) AS ${col}`).join(", ")},
   ${NONZERO_CONDITIONS.map(([name, cond]) => `COALESCE(SUM(${cond}), 0) AS nz_${name}_, MAX(CASE WHEN ${cond} THEN window_start END) AS nz_${name}_last_`).join(", ")}
   FROM client_ip_shadow_windows WHERE mode = ?`;
+
+// Two machines in one window measured the same 5 min (at most), not 10: the
+// largest of their covered_ms is a lower bound of the union.
+const COVERED_SQL = `SELECT COALESCE(SUM(covered), 0) AS covered_ms FROM
+  (SELECT MAX(covered_ms) AS covered FROM client_ip_shadow_windows WHERE mode = ? GROUP BY window_start)`;
 
 const FANIN_MAX_SQL = `SELECT window_start, fanin_ratio, fanin_class, fanin_fan_in, fanin_ua FROM client_ip_shadow_windows
   WHERE mode = ? AND fanin_ratio IS NOT NULL ORDER BY fanin_ratio DESC, window_start DESC LIMIT 1`;
@@ -186,7 +206,7 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
     }
     queue.push(rec);
     if (!timer && flushEveryMs !== null) {
-      timer = setInterval(flush, flushEveryMs);
+      timer = setInterval(trackJob(FLUSH_JOB_NAME, flush), flushEveryMs);
       if (typeof (timer as any).unref === "function") (timer as any).unref();
     }
   }
@@ -234,7 +254,8 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
               f ? f.class : null,
               f ? f.fanIn : null,
               f ? f.ua : null,
-              createdAt
+              createdAt,
+              Math.round(r.coveredMs)
             ).changes;
           }
         })();
@@ -259,12 +280,14 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
   function totals(mode: ClientIpMode): ClientIpStoredTotals {
     const db = resolveDb();
     const r = db.prepare(TOTALS_SQL).get(mode) as Record<string, any>;
+    const covered = db.prepare(COVERED_SQL).get(mode) as { covered_ms: number };
     const m = db.prepare(FANIN_MAX_SQL).get(mode) as
       | { window_start: string; fanin_ratio: number; fanin_class: ClientIpWindowFanIn["class"]; fanin_fan_in: number; fanin_ua: string }
       | undefined;
     return {
       rows: r.rows_,
       windows: r.windows_,
+      coveredMs: covered.covered_ms,
       machines: r.machines_,
       first: r.first_ ?? null,
       last: r.last_ ?? null,

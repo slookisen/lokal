@@ -17,6 +17,10 @@
  *       (union; A2A's keyword reading in full), fallback flag, rollback switch;
  *       tolkning shows a kommune's postnumre as {kommunenummer, antall}
  *       while the plan's filter keeps the list (D3c, tolkningFilter)
+ *   D   the clinic cards' readings (dev-request 2026-10-17-dental-d3-rettelser,
+ *       D3d): specialtyTitleWords (the filter's title words);
+ *       officialPlaceSpelling (poststed first, else kommune; null for an
+ *       unknown name or a collision; no collision in the bundled register)
  *
  * Standalone: npx tsx src/services/dental-query-parser.test.ts
  * Wired into tests/test.ts via runDentalQueryParserTests().
@@ -450,6 +454,86 @@ export function runDentalQueryParserTests(opts: { log?: boolean } = {}): TestSum
       for (const q of ["tannlege i Bergen", "tannlege i Trondheim", "tannlege i Stavanger", "tannlege i Tromsø", "tannlege i Bærum", "tannlege i Kvam kommune"]) {
         const p = parser.planDentalSearch({ query: q, explicit: {}, gazetteer: g, count: () => 1 });
         assertEq([lists(p.filter).length > 0, lists(p.tolkning?.filter)], [true, []], `S25: «${q}»: the plan's filter has a postnummer list, tolkning has none`);
+      }
+    }
+
+    // ── D: the clinic cards' readings (dev-request 2026-10-17-dental-d3-rettelser, D3d) ──
+    {
+      const { specialtyTitleWords } = require("../config/dental-search-vocabulary") as typeof import("../config/dental-search-vocabulary");
+      const entry = (name: string) => findSearchSpecialty(name);
+      assertEq(specialtyTitleWords(["kjeveortopedi"], entry("kjeveortopedi")), ["kjeveortoped"], "D1: kjeveortopedi -> [kjeveortoped] (the stem covers the name)");
+      assertEq(
+        specialtyTitleWords(["oral kirurgi og oral medisin"], entry("oral kirurgi og oral medisin")),
+        ["oral kirurgi og oral medisin", "oralkirurg"],
+        "D2: oral kirurgi og oral medisin -> both words (neither contains the other)"
+      );
+      assertEq(
+        [specialtyTitleWords(["Kjeveortoped", "kjeveortopedi"], entry("kjeveortoped")), specialtyTitleWords(["Implantologi"], null)],
+        [["kjeveortoped"], ["implantologi"]],
+        "D3: a synonym with its stored name gives the stem once; a specialty outside the vocabulary gives its own name, lower case"
+      );
+      assertTrue(
+        DENTAL_SEARCH_VOCABULARY.specialties.every((s) => {
+          const words = specialtyTitleWords([s.canonical], s);
+          return words.length > 0 && words.every((w) => w === w.toLowerCase());
+        }),
+        "D4: every vocabulary specialty has at least one lower-case title word"
+      );
+    }
+    {
+      const spelling = (v: string) => nq.officialPlaceSpelling(v);
+      assertEq(
+        [spelling("Tromsoe"), spelling("TROMSOE"), spelling("Aalesund"), spelling("Baerum"), spelling("Indre Oestfold"), spelling("Karlsoey")],
+        [
+          { kind: "poststed", name: "TROMSØ" }, { kind: "poststed", name: "TROMSØ" }, { kind: "poststed", name: "ÅLESUND" },
+          { kind: "kommune", name: "Bærum" }, { kind: "kommune", name: "Indre Østfold" }, { kind: "poststed", name: "KARLSØY" },
+        ],
+        "D5: an ASCII spelling finds the official name: Posten's poststed first, else the kommune"
+      );
+      assertEq(
+        ["Amsterdam", "1014BV AMSTERDAM", "Tromso", "Alesund", "", "  ", "TEST"].map(spelling),
+        [null, null, null, null, null, null, null],
+        "D5b: an unknown name, the ASCII alias a visitor types (Tromso, Alesund) and an empty value -> null"
+      );
+      // The bundled register: no two official names share a key, so every
+      // poststed, and every kommune without a poststed of its key, reads back as itself.
+      const { officialPoststedKommuner, kommuner2024 } = require("./norway-postnummer") as typeof import("./norway-postnummer");
+      const poststeder = [...officialPoststedKommuner().keys()];
+      const poststedKeys = new Set(poststeder.map((n) => nq.placeKey(n)));
+      const kommuner = kommuner2024().map((k) => k.kommune).filter((n) => !poststedKeys.has(nq.placeKey(n)));
+      assertEq(
+        [
+          poststeder.filter((n) => JSON.stringify(spelling(n)) !== JSON.stringify({ kind: "poststed", name: n })),
+          kommuner.filter((n) => JSON.stringify(spelling(n)) !== JSON.stringify({ kind: "kommune", name: n })),
+          poststeder.length > 1000 && kommuner.length > 100,
+        ],
+        [[], [], true],
+        "D6: the bundled register has no collision: every poststed and kommune name reads back as itself"
+      );
+    }
+    {
+      // A collision gives null. Fresh copies of the register and the query
+      // module, so the rows injected here reach no other test.
+      const { swapOutModules } = require("../../tests/module-cache") as typeof import("../../tests/module-cache");
+      const restore = swapOutModules([require.resolve("./norway-postnummer"), require.resolve("./search-intent/norwegian-query")]);
+      try {
+        const pn = require("./norway-postnummer") as typeof import("./norway-postnummer");
+        const fresh = require("./search-intent/norwegian-query") as typeof import("./search-intent/norwegian-query");
+        assertEq(fresh.officialPlaceSpelling("Tromsoe"), { kind: "poststed", name: "TROMSØ" }, "D7a: (a fresh copy reads the bundled register)");
+        pn.__setPostnummerRowsForTesting([
+          { postnummer: "1111", poststed: "MØN", kommunenummer: "0301" },
+          { postnummer: "1112", poststed: "MOEN", kommunenummer: "0301" },
+          { postnummer: "1113", poststed: "TESTBY", kommunenummer: "0301" },
+        ]);
+        assertEq(
+          ["Moen", "MØN", "Testby", "Oslo", "Tromsoe"].map((v) => fresh.officialPlaceSpelling(v)),
+          [null, null, { kind: "poststed", name: "TESTBY" }, { kind: "kommune", name: "Oslo" }, null],
+          "D7: two poststeder on one key (MØN, MOEN) -> null; the map is rebuilt for new register rows"
+        );
+        pn.__setPostnummerRowsForTesting(null);
+        assertEq(fresh.officialPlaceSpelling("Tromsoe"), { kind: "poststed", name: "TROMSØ" }, "D7b: after the reset the bundled register is read again");
+      } finally {
+        restore();
       }
     }
   } catch (err: any) {

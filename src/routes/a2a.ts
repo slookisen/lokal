@@ -24,6 +24,9 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
+import { a2aMessageData, capA2aData } from "../utils/a2a-message";
+import { capFreeText } from "../utils/free-text";
+import { searchCountable } from "../services/search-tracking";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -209,7 +212,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         handleExtendedCard(params, id, req, res);
         break;
       case "agent/info":
-        handleAgentInfo(params, id, res);
+        handleAgentInfo(params, id, req, res);
         break;
       default:
         res.json({
@@ -233,7 +236,8 @@ router.post("/a2a", (req: Request, res: Response) => {
 //
 // Two modes:
 //   1. Natural language: { message: { text: "finn grønnsaker..." } }
-//   2. Structured:       { message: { data: { categories: [...] } } }
+//   2. Structured:       { message: { data: { categories: [...] } } }, or the
+//      standard DataPart { message: { parts: [{ kind: "data", data: {...} }] } }
 //
 // Returns a task with results (or "working" status for async).
 
@@ -284,19 +288,30 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     return null;
   };
 
-  const messageText = extractText(message);
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of the text are read, cut at a
+  // word boundary (utils/free-text.ts); it used to reach the parser whole. A
+  // `text` that is no string (a client bug) is passed on as before.
+  const rawText = extractText(message);
+  const messageText = typeof rawText === "string" ? capFreeText(rawText) : rawText;
+  // message.data, or the first standard DataPart (dev-request 2026-10-17-
+  // integrasjonstest-oppfolging, I-X: utils/a2a-message.ts).
+  const messageData = a2aMessageData(message);
 
   // Mode 1: Natural language search (flat text, parts array, or string)
   if (messageText) {
     discoveryQuery = marketplaceRegistry.parseNaturalQuery(messageText);
   }
   // Mode 2: Structured discovery query
-  else if (message.data) {
-    discoveryQuery = message.data;
+  else if (messageData) {
+    discoveryQuery = messageData;
   }
   // Mode 3: Treat entire params as query
+  // Slice I-Y2: cut as the data of Mode 2 is (capA2aData). These fields went
+  // whole to discover(): 100 000 categories, within the 1 MB body limit,
+  // blocked the process for about 46 s with 1500 producers. Params within
+  // the caps are the same object, so such a message answers as before.
   else {
-    discoveryQuery = params;
+    discoveryQuery = capA2aData(params);
   }
 
   // ─── Spam guard (2026-10-04) ──────────────────────────────
@@ -523,7 +538,7 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
 // This is the core of the dummy-agent system: every seller has
 // an agent that can answer based on what we know about them.
 
-function handleAgentInfo(params: any, id: any, res: Response) {
+function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
     res.json({
@@ -544,11 +559,14 @@ function handleAgentInfo(params: any, id: any, res: Response) {
     return;
   }
 
-  // Log the interaction
-  interactionLogger.log("view", {
-    agentId,
-    metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
-  });
+  // Log the interaction: not for our own traffic or a probe (slice I-Z,
+  // searchCountable), as its REST twin GET /api/marketplace/agents/:id/info.
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId,
+      metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
+    });
+  }
 
   res.json({
     jsonrpc: "2.0",

@@ -269,6 +269,7 @@ import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-p
 // normalisation the parser itself already applies to location_hint, instead
 // of re-implementing it here.
 import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
+import { capFreeText, capName } from "../utils/free-text";
 
 const router = Router();
 
@@ -8977,7 +8978,9 @@ function renderNearMeBox(q: string, activeTags: ExperienceTag[], radiusKm: numbe
 // before this feature existed.
 router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const searchStarted = Date.now();
-  const q = String(req.query.q ?? "").trim();
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read (route intent,
+  // search, log, the page), cut at a word boundary (utils/free-text.ts).
+  const q = capFreeText(String(req.query.q ?? "").trim());
   const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
 
   // ── dev-request 2026-07-30-opplevagent-kategori-sok-og-reiserute-info,
@@ -9058,7 +9061,10 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const gpsOrigin = parseGeoOriginFromQuery(req.query);
   let originLat: number | undefined = gpsOrigin?.lat;
   let originLng: number | undefined = gpsOrigin?.lng;
-  const typedPlace = String(req.query.sted ?? "").trim();
+  // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): a place name,
+  // cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts) before the
+  // geocoder and the page read it.
+  const typedPlace = capName(String(req.query.sted ?? "").trim());
   let placeNotFound = false;
   if ((originLat === undefined || originLng === undefined) && typedPlace) {
     try {
@@ -10171,7 +10177,9 @@ router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
 // I-T revision): it runs the same free-text LIKE search as /sok's producer
 // section, and the host gate sends it here before any index.ts limiter mount.
 router.get("/for-tilbydere/finn", generalLimiter, (req: Request, res: Response) => {
-  const q = String(req.query.q ?? "").trim();
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read (search and the
+  // page), cut at a word boundary (utils/free-text.ts).
+  const q = capFreeText(String(req.query.q ?? "").trim());
   let hits: GardssalgSearchByQueryRow[] = [];
   if (q) {
     try {

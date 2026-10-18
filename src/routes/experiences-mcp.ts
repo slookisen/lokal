@@ -144,6 +144,7 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { capName } from "../utils/free-text";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -686,7 +687,13 @@ export function registerExperienceTools(
         "openai/toolInvocation/invoked": "Found experiences",
       },
     },
-    async ({ query, fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
+    async ({ query, fylke: fylkeAsSent, kommune: kommuneAsSent, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+      // strukturerte-stedsfelt-uten-lengdetak): `fylke` and `kommune` are place
+      // names, cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts)
+      // before the filter, the free-text reading and the answer use them.
+      const fylke = capName(fylkeAsSent);
+      const kommune = capName(kommuneAsSent);
       try {
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
@@ -1190,7 +1197,10 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+    async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+      // Slice I-Y2: place names, cut as in discover_experiences.
+      const fylke = capName(fylkeAsSent);
+      const kommune = capName(kommuneAsSent);
       try {
         const foreign = outsideNorwayPlace({ fylke, kommune, query, lat, lng });
         if (foreign) return outsideNorwayResult(foreign, "gardssalg_producers", { fylke, kommune, query });

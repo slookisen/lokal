@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import {
   runChunked, runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted, resolveDailyJobLastRunAt,
   shouldSkipRecentRun, resolveMinIntervalHours, URL_BACKFILL_JOB, URL_BACKFILL_BOOT_DELAY_MS,
-  scheduleBootTrustRecalc, TRUST_RECALC_JOB, TRUST_RECALC_BOOT_DELAY_MS, TRUST_RECALC_MIN_INTERVAL_HOURS,
+  scheduleBootTrustRecalc, trustRecalcJobKey, TRUST_RECALC_BOOT_DELAY_MS, TRUST_RECALC_MIN_INTERVAL_HOURS,
   TRAFFIC_PREWARM_BOOT_DELAY_MS, DENTAL_GEOCODE_BOOT_DELAY_MS, EXPERIENCES_GEOCODE_BOOT_DELAY_MS,
 } from "./boot-job-gate";
 import { runUrlBackfill } from "../agents/lokal-agent-verifier";
@@ -148,27 +148,29 @@ export async function runBootJobGateTests(opts: { log?: boolean } = {}): Promise
     const fakeSet = (fn: () => void, ms: number) => { timers.push({ fn, ms }); return 0; };
     let recalcs = 0;
     const logs: string[] = [];
+    // The stamp key is per trust formula version (S4-A1b); trust-score-uten-google-rating.test.ts covers a version change.
+    const TRUST_JOB = trustRecalcJobKey("test-v1");
     const sched = () => scheduleBootTrustRecalc({
-      getDb: () => sdb, recalc: async () => { recalcs++; }, log: (m) => logs.push(m), now: () => nowS, setTimeoutFn: fakeSet,
+      getDb: () => sdb, formulaVersion: "test-v1", recalc: async () => { recalcs++; }, log: (m) => logs.push(m), now: () => nowS, setTimeoutFn: fakeSet,
     });
     sched();
     t(timers.length === 1 && timers[0].ms === TRUST_RECALC_BOOT_DELAY_MS && recalcs === 0, "G5: scheduled with the 4 min delay, nothing runs at once");
     timers[0].fn();
     await runExclusiveBootJob(() => undefined);
     t(recalcs === 1, "G6: first boot (no stamp) runs the recalculation");
-    t(getJobLastCompletedAt(sdb, TRUST_RECALC_JOB)?.getTime() === nowS.getTime(), "G7: completion is stamped in boot_job_state");
+    t(getJobLastCompletedAt(sdb, TRUST_JOB)?.getTime() === nowS.getTime(), "G7: completion is stamped in boot_job_state");
     sched(); timers[1].fn();
     await runExclusiveBootJob(() => undefined);
     t(recalcs === 1 && logs.some((l) => l.includes("skipped")), "G8: a restart within 24 h skips the recalculation");
-    markJobCompleted(sdb, TRUST_RECALC_JOB, new Date(nowS.getTime() - 25 * 3600_000));
+    markJobCompleted(sdb, TRUST_JOB, new Date(nowS.getTime() - 25 * 3600_000));
     sched(); timers[2].fn();
     await runExclusiveBootJob(() => undefined);
     t(recalcs === 2, "G9: a stamp older than 24 h runs again");
-    markJobCompleted(sdb, TRUST_RECALC_JOB, new Date(nowS.getTime() - 25 * 3600_000));
-    scheduleBootTrustRecalc({ getDb: () => sdb, recalc: async () => { throw new Error("boom"); }, now: () => nowS, setTimeoutFn: fakeSet });
+    markJobCompleted(sdb, TRUST_JOB, new Date(nowS.getTime() - 25 * 3600_000));
+    scheduleBootTrustRecalc({ getDb: () => sdb, formulaVersion: "test-v1", recalc: async () => { throw new Error("boom"); }, now: () => nowS, setTimeoutFn: fakeSet });
     const origErr = console.error; console.error = () => {};
     try { timers[3].fn(); await runExclusiveBootJob(() => undefined); } finally { console.error = origErr; }
-    t(getJobLastCompletedAt(sdb, TRUST_RECALC_JOB)?.getTime() === nowS.getTime() - 25 * 3600_000, "G10: a failed recalculation is not stamped (retried next boot)");
+    t(getJobLastCompletedAt(sdb, TRUST_JOB)?.getTime() === nowS.getTime() - 25 * 3600_000, "G10: a failed recalculation is not stamped (retried next boot)");
 
     // Wiring guard: index.ts uses the constants instead of the old literals.
     const fsMod = require("fs") as typeof import("fs");

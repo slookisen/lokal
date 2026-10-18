@@ -22,10 +22,18 @@
  *       there;
  *   M   MCP tannlege_search / tannlege_akutt over a real server + client,
  *       and the same card values as the A2A clinic with the same id;
+ *   S   (dev-request 2026-10-17-dental-d3-rettelser, D3d) spesialiteter and
+ *       «Spesialist» are the specialties the filter finds a clinic by,
+ *       specialist titles included, once each, the same over MCP and A2A;
+ *       a title without a specialty word gives nothing;
+ *   F   (D3d) poststed in its official spelling (Tromsoe -> Tromsø, Baerum ->
+ *       Bærum) in the search, detail and A2A card, from the stored value
+ *       only; other values unchanged;
+ *   N   (D3d) postnummer «0000» is null in every variant, the key kept;
  *   Z   size: 25 clinics per call stay under 12 KB for a live-like mix, and
- *       under 16 KB when every clinic has every optional field; a kommune
- *       search (Bergen, whose tolkning names 144 postnumre) stays under
- *       12 KB too.
+ *       under 16 KB when every clinic has every optional field, specialist
+ *       titles included; a kommune search (Bergen, whose tolkning names 144
+ *       postnumre) stays under 12 KB too.
  *
  * Standalone: npx tsx src/services/dental-clinic-card.test.ts
  * Wired into tests/test.ts via runDentalClinicCardTests().
@@ -298,6 +306,112 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       eq([b?.akutt, differingKeys(b ?? { missing: true }, a2aWireOf(bare))], [null, []], "M8: the unsourced acute_vakt clinic has akutt null and the same values over MCP and A2A");
     }
 
+    // ── S, F, N: D3d (specialties, official spelling, postnummer 0000) ────
+    // Rows in Trøndelag and Troms, added after A and M so the counts there
+    // stay; Z searches other places.
+    const { DENTAL_SEARCH_VOCABULARY, clinicSpecialties } = require("../config/dental-search-vocabulary") as typeof import("../config/dental-search-vocabulary");
+    /** The clinics of an A2A message/send with structured message.data. */
+    const a2aSearch = (data: Record<string, unknown>): any[] =>
+      (a2a.handleDentalMessageSend({ message: { data } }, "a2a-data") as any).result.artifacts[1].parts[0].data.clinics;
+    const trondheim = (navn: string, org_nr: string, row: Record<string, unknown>, extra: Record<string, unknown>) =>
+      add({ navn, org_nr, postnummer: "7010", poststed: "TRONDHEIM", fylke: "Trøndelag", ...row }, extra);
+    const titled = trondheim("Tittel Kjeve Tann AS", "918750101", {}, {
+      specialists: [{ name: "Kari Kjeve", title: "Kjeveortoped" }, { name: "Per Rot", title: "Spesialist i endodonti" }, { name: "Ola Tann", title: "Tannlege" }],
+    });
+    const twice = trondheim("Dobbel Kjeve Tann AS", "918750102", { available_specialties: ["kjeveortopedi"] }, {
+      specialists: [{ name: "Anne A", specialty: "Kjeveortopedi" }, { name: "Bjørn B", title: "Spesialist i kjeveortopedi" }, { name: "Cato C", title: "kjeveortoped" }],
+    });
+    const general = trondheim("Allmenn Tann AS", "918750103", {}, {
+      specialists: [{ name: "Dag D", title: "Tannlege" }, { name: "Eva E", title: "Tannpleier" }, { name: "Finn F", title: "Spesialist" }],
+    });
+    const jaw = trondheim("Kjevekirurg Tann AS", "918750104", {}, { specialists: [{ name: "Gro G", title: "Kjevekirurg" }] });
+    const many = trondheim("Mange Spesialister Tann AS", "918750105", {}, {
+      specialists: ["Oralkirurg", "Periodontist", "Spesialist i pedodonti", "Spesialist i oral protetikk og bittfunksjon", "Radiolog"].map((title, i) => ({ name: `Spesialist ${i}`, title })),
+    });
+    const listedOnly = trondheim("Bare Specialty Tann AS", "918750106", {}, { specialists: [{ name: "Hege H", specialty: "periodonti" }] });
+
+    {
+      const c = search(titled);
+      eq([c.spesialiteter, c.badges], [["kjeveortopedi", "endodonti"], ["Spesialist"]], "S1: titles alone give spesialiteter (vocabulary order) and the «Spesialist» badge");
+      const a = card.toDentalA2aClinic(row(titled));
+      eq([a.spesialiteter, a.badges], [c.spesialiteter, c.badges], "S1b: the A2A clinic has the same spesialiteter and badges");
+      const d = card.toDentalClinicCard(row(titled), "detail", { specialists: [] });
+      eq([Object.keys(d), d.available_specialties, d.badges], [DETAIL_KEYS, [], []], "S1c: tannlege_info keeps its keys, the stored available_specialties and no «Spesialist» badge");
+      eq(search(twice).spesialiteter, ["kjeveortopedi"], "S2: the same specialty from available_specialties, specialists[].specialty and two titles is listed once");
+      eq(search(listedOnly).spesialiteter, ["periodonti"], "S2b: specialists[].specialty alone gives the specialty");
+      for (const [label, id] of [["S3: Tannlege, Tannpleier and Spesialist", general], ["S4: Kjevekirurg", jaw]] as const) {
+        eq(["spesialiteter" in search(id), search(id).badges.includes("Spesialist")], [false, false], `${label}: no spesialiteter, no «Spesialist» badge`);
+      }
+      eq(search(many).spesialiteter, ["oral kirurgi og oral medisin", "periodonti", "pedodonti", "oral protetikk", "kjeve- og ansiktsradiologi"],
+        "S5: each specialty title gives its vocabulary specialty, in vocabulary order");
+      eq(
+        [clinicSpecialties({}), clinicSpecialties({ available_specialties: null, specialists: null }),
+          clinicSpecialties({ available_specialties: ["", "  "], specialists: [null, { title: null, specialty: " " }] }),
+          clinicSpecialties({ available_specialties: [" Kjeveortopedi "], specialists: [{ title: "KJEVEORTOPED" }] })],
+        [[], [], [], ["Kjeveortopedi"]],
+        "S6: missing, null and blank values give nothing; a value is trimmed and a later one equal but for case is left out"
+      );
+    }
+    {
+      // The card and the filter agree: every clinic the specialty filter finds
+      // lists that specialty, and no other clinic does (org.nr: ids are random).
+      const orgNrs = (rows: Array<{ org_nr?: string | null }>) => rows.map((r) => r.org_nr ?? "-").sort();
+      const everyone = store.listPublicDentalAgents({}, 500, 0);
+      for (const s of DENTAL_SEARCH_VOCABULARY.specialties) {
+        const byFilter = orgNrs(store.listPublicDentalAgents({ specialty: s.canonical }, 500, 0));
+        const byCard = orgNrs(everyone.filter((r) => (card.toDentalClinicCard(r, "search").spesialiteter ?? []).includes(s.canonical)));
+        ok(byFilter.length > 0 && JSON.stringify(byFilter) === JSON.stringify(byCard), `S7 ${s.canonical}: the clinics the filter finds are exactly the cards that list it`);
+      }
+    }
+    {
+      const res = JSON.parse(await callText("tannlege_search", { spesialitet: "kjeveortopedi", fylke: "Trøndelag", limit: 25 }));
+      eq(res.klinikker.map((k: any) => k.navn).sort(), ["Dobbel Kjeve Tann AS", "Tittel Kjeve Tann AS"], "S8: (MCP tannlege_search spesialitet kjeveortopedi finds both Trøndelag clinics)");
+      ok(res.klinikker.every((k: any) => k.spesialiteter?.includes("kjeveortopedi") && k.badges.includes("Spesialist")), "S8b: every card it finds lists kjeveortopedi and has the «Spesialist» badge");
+      const a2a = a2aSearch({ fylke: "Trøndelag", specialty: "kjeveortopedi" });
+      eq(a2a.map((c: any) => [c.org_nr, c.spesialiteter, c.badges]).sort(), res.klinikker.map((k: any) => [k.org_nr, k.spesialiteter, k.badges]).sort(),
+        "S8c: A2A message.data finds the same clinics with the same spesialiteter and badges");
+      const perio = JSON.parse(await callText("tannlege_search", { spesialitet: "periodonti", fylke: "Trøndelag", limit: 25 }));
+      ok(perio.klinikker.length === 2 && perio.klinikker.every((k: any) => k.spesialiteter?.includes("periodonti")), "S9: spesialitet periodonti: every card lists periodonti");
+    }
+
+    {
+      // Spelling: the card's poststed in its official form, read from the stored value only.
+      const at = (poststed: unknown, postnummer?: string) => ({ ...row(bare), poststed, ...(postnummer === undefined ? {} : { postnummer }) }) as any;
+      const shown = (r: any) => [card.toDentalClinicCard(r, "search").poststed, card.toDentalClinicCard(r, "detail", { specialists: [] }).poststed, card.toDentalA2aClinic(r).poststed];
+      eq([shown(at("Tromsoe")), shown(at("TROMSOE"))], [["Tromsø", "Tromsø", "Tromsø"], ["TROMSØ", "TROMSØ", "TROMSØ"]], "F1: Tromsoe -> Tromsø in search, detail and A2A; capitals stay capitals");
+      eq(shown(at("Baerum", "1369")), ["Bærum", "Bærum", "Bærum"], "F2: Baerum (a kommune) -> Bærum, not the postnummer's poststed STABEKK");
+      eq([shown(at("Aurskog Hoeland"))[0], shown(at("Soer Varanger"))[0]], ["Aurskog-Høland", "Sør-Varanger"], "F2b: a kommune is written as the kommune is (not title-cased)");
+      for (const v of ["BERGEN", "Bergen", "Nesttun", "Mo i Rana", "Tromso", "As", "TEST", "bergen", "Mo I Rana"]) eq(shown(at(v)), [v, v, v], `F3: «${v}» is shown as stored`);
+      eq([shown(at(null)), shown(at(""))], [[null, null, null], ["", "", ""]], "F4: null and an empty value pass through unchanged");
+      eq(shown(at("Tromsoe", "9100")), ["Tromsø", "Tromsø", "Tromsø"], "F5: a Tromsoe clinic with a KVALØYSLETTA postnummer still shows Tromsø");
+      eq([Object.keys(card.toDentalClinicCard(at("Tromsoe"), "search")), Object.keys(card.toDentalClinicCard(at("Tromsoe"), "detail", { specialists: [] }))],
+        [REQUIRED_KEYS, DETAIL_KEYS], "F6: the key sets do not change");
+    }
+    {
+      // 0000: null in every variant, the key kept.
+      const at = (postnummer: unknown) => ({ ...row(bare), postnummer }) as any;
+      const shown = (r: any) => {
+        const variants = [card.toDentalClinicCard(r, "search"), card.toDentalClinicCard(r, "detail", { specialists: [] }), card.toDentalA2aClinic(r)] as Array<Record<string, unknown>>;
+        return variants.map((v) => ("postnummer" in v ? v.postnummer : "missing"));
+      };
+      for (const v of ["0000", " 0000 ", ""]) eq(shown(at(v)), [null, null, null], `N1: postnummer «${v}» is null in search, detail and A2A, and the key is there`);
+      eq([shown(at("5003")), shown(at("0010"))], [["5003", "5003", "5003"], ["0010", "0010", "0010"]], "N2: a real postnummer is unchanged");
+    }
+    {
+      // Spelling and 0000 over MCP and A2A, from stored rows.
+      const troms = (navn: string, org_nr: string, postnummer: string, poststed: string) => add({ navn, org_nr, postnummer, poststed, fylke: "Troms" });
+      troms("Kroken Tann AS", "918750111", "9022", "Tromsoe");
+      troms("Hansnes Tann AS", "918750112", "0000", "Karlsoey");
+      const res = JSON.parse(await callText("tannlege_search", { fylke: "Troms", limit: 25 }));
+      const a2a = a2aSearch({ fylke: "Troms" });
+      const pick = (list: any[]) => list.map((k) => [k.org_nr, k.poststed, "postnummer" in k ? k.postnummer : "missing"]).sort();
+      eq(pick(res.klinikker), [["918750111", "Tromsø", "9022"], ["918750112", "Karlsøy", null]], "F7/N3: MCP tannlege_search shows Tromsø and Karlsøy, and postnummer null (key kept) for 0000");
+      eq(pick(a2a), pick(res.klinikker), "F7b/N3b: A2A message.data gives the same poststed and postnummer");
+      const info = JSON.parse(await callText("tannlege_info", { org_nr: "918750112" }));
+      eq([info.poststed, info.postnummer, Object.keys(info)], ["Karlsøy", null, DETAIL_KEYS], "F8/N4: tannlege_info shows Karlsøy and postnummer null, with the same keys");
+      eq(row(a2a.find((c: any) => c.org_nr === "918750112").id).postnummer, "0000", "N5: the stored row keeps 0000 (display only)");
+    }
+
     // ── Z: size of a 25-clinic answer ─────────────────────────────────────
     {
       const surnames = ["Hansen", "Johansen", "Olsen", "Larsen", "Andersen", "Pedersen", "Nilsen", "Kristiansen", "Jensen", "Karlsen", "Johnsen",
@@ -308,6 +422,8 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       // The limits against live rows (/api/tannlege/agents, Oslo, Vestland and Rogaland, 849 clinics
       // in pages of 25, measured 2026-10-17): a tannlege_search answer is 8 555–9 472 B in median and
       // at most 10 662 B; the 25 richest cards of a county give 12 907–13 457 B, under the 16 KB below.
+      // Specialist titles (D3d): about 6 % of live rows list a specialty only through a title
+      // (378 of 6 500, 2026-10-17); here 10 % of the mix has one, and every rich clinic a second one.
       const seed = (fylke: string, prefix: string, rich: boolean, place = { postnummer: "4006", poststed: "STAVANGER" }) => surnames.forEach((name, i) => {
         const slug = name.toLowerCase();
         const has = (share: number) => rich || i % 20 < share * 20;
@@ -326,6 +442,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
             ...(has(0.25) ? { opening_hours: [...WEEKDAYS_8_16.slice(0, 3), { day: "thu", open: "08:00", close: "18:00" }, { day: "fri", open: "08:00", close: "16:00" }] } : {}),
             ...(has(0.1) ? { online_booking_url: `https://tannlege${slug}.no/bestill-time` } : {}),
             ...(rich ? { price_band: "standard", price_band_source: "homepage" } : {}),
+            ...(has(0.1) ? { specialists: [{ name: `Kari ${name}`, title: "Spesialist i kjeveortopedi" }, ...(rich ? [{ name: `Per ${name}`, title: "Endodontist" }] : [])] } : {}),
           },
         );
       });
@@ -337,6 +454,11 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
         const sizes = [Buffer.byteLength(searchText), Buffer.byteLength(akuttText)];
         if (log) console.log(`    ${fylke}: tannlege_search ${sizes[0]} B, tannlege_akutt ${sizes[1]} B`);
         eq([JSON.parse(searchText).klinikker.length, JSON.parse(akuttText).klinikker.length], [25, 25], `Z0 ${fylke}: (both answers carry 25 clinics)`);
+        eq(
+          JSON.parse(searchText).klinikker.filter((k: any) => k.spesialiteter).map((k: any) => k.spesialiteter),
+          fylke === "Agder" ? Array(25).fill(["kjeveortopedi", "endodonti"]) : Array(4).fill(["kjeveortopedi"]),
+          `Z0b ${fylke}: (the specialist titles show: every rich card lists two specialties, four cards of the mix one)`
+        );
         // Stable labels (no measured numbers): the CI determinism gate compares failure texts across runs.
         ok(sizes.every((n) => n < limitBytes), `Z1 ${fylke}: 25 clinics, ${label}: tannlege_search and tannlege_akutt under ${limitBytes / 1024} KB`);
       }

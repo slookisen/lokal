@@ -47,6 +47,8 @@ import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
+import { a2aMessageData } from "../utils/a2a-message";
+import { capFreeText, capName } from "../utils/free-text";
 
 const router = Router();
 
@@ -61,6 +63,20 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
   return { jsonrpc: "2.0", error: err, id };
 }
 
+/**
+ * The answer to a request that failed inside the handler: JSON-RPC's generic
+ * -32603 "Internal error", without the detail. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+ * dental-a2a-intern-feiltekst-i-svar): the error's own message went to the
+ * caller as `data`, for example SQLite's «LIKE or GLOB pattern too complex».
+ * The detail is logged instead, without the request (`where` says which step
+ * failed).
+ */
+function rpcInternalError(id: unknown, where: string, err: unknown) {
+  console.error(`[dental-a2a] ${where} failed:`, err instanceof Error ? err.stack || err.message : String(err));
+  return rpcErr(id, -32603, "Internal error");
+}
+
 // ─── Zod envelope schema ─────────────────────────────────────
 
 const RpcEnvelopeSchema = z.object({
@@ -72,13 +88,18 @@ const RpcEnvelopeSchema = z.object({
 
 // ─── Text extractor (mirrors rfb a2a.ts approach) ────────────
 
-const MAX_MESSAGE_TEXT = 2000; // review note #1: cap free-text length (DoS hygiene)
+// The text is cut to MAX_FREE_TEXT_CHARS (2000; review note #1, DoS hygiene)
+// by the helper the three platforms share (utils/free-text.ts, dev-request
+// 2026-10-17-integrasjonstest-oppfolging, slice I-Y), at a word boundary. This
+// file used to cut at 2000 itself, in the middle of a word, and the piece
+// before the cut was read («Oslo» of «Osloveien» as the fylke). A word the cut
+// splits is now dropped whole.
 
 function extractText(msg: unknown): string | null {
-  if (typeof msg === "string") return msg.slice(0, MAX_MESSAGE_TEXT);
+  if (typeof msg === "string") return capFreeText(msg);
   if (msg && typeof msg === "object") {
     const m = msg as Record<string, unknown>;
-    if (typeof m.text === "string" && m.text) return m.text.slice(0, MAX_MESSAGE_TEXT);
+    if (typeof m.text === "string" && m.text) return capFreeText(m.text);
     if (Array.isArray(m.parts)) {
       for (const p of m.parts) {
         if (!p || typeof p !== "object") continue;
@@ -86,7 +107,7 @@ function extractText(msg: unknown): string | null {
         if (typeof part.text === "string" && part.text) {
           if (part.type !== undefined && part.type !== "text") continue;
           if (part.kind !== undefined && part.kind !== "text") continue;
-          return part.text.slice(0, MAX_MESSAGE_TEXT);
+          return capFreeText(part.text);
         }
       }
     }
@@ -218,7 +239,8 @@ function hasFilter(filter: unknown): boolean {
 function a2aRequestCountable(req: Request, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
-  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  // A DataPart counts as message.data (I-X, utils/a2a-message.ts).
+  const data = a2aMessageData(message);
   const meta = buildRequestMeta(req);
   return a2aLookupCountable({
     vertical: "dental",
@@ -248,6 +270,22 @@ export function dentalAnswerProfileIds(answer: unknown): string[] {
   return ids;
 }
 
+/**
+ * The org.nr a message asks about: nine digits in a row, or 3+3+3 with one
+ * whitespace character (also no-break space) between the groups, as
+ * Brønnøysundregistrene print it («912 345 678»; I-X, FUNN
+ * dental-a2a-orgnr-med-mellomrom). The digits in a row are looked for
+ * first, as before. Eight digits (a phone number, also «22 33 44 55» or
+ * «912 34 567») and a postnummer are no org.nr, and nor are three groups
+ * inside a longer spaced number («123 912 345 678», «kr 1 234 567 890»).
+ */
+function orgNrIn(text: string): string | null {
+  const plain = text.match(/\b(\d{9})\b/);
+  if (plain) return plain[1]!;
+  const spaced = text.match(/(?<!\d\s)\b(\d{3})\s(\d{3})\s(\d{3})\b(?!\s\d)/);
+  return spaced ? spaced[1]! + spaced[2]! + spaced[3]! : null;
+}
+
 // ─── message/send handler (exported for unit tests) ──────────
 
 export function handleDentalMessageSend(
@@ -261,15 +299,19 @@ export function handleDentalMessageSend(
     return rpcErr(id, -32602, "Invalid params: 'message' required");
   }
 
-  // Structured search (message.data); free text is planned in the search branch below.
+  // Structured search (message.data, or the first standard DataPart: I-X,
+  // utils/a2a-message.ts); free text is planned in the search branch below.
   const messageText = extractText(message);
   let searchParams: DentalSearchParams = {};
 
   if (!messageText && message && typeof message === "object") {
-    const m = message as Record<string, unknown>;
-    if (m.data && typeof m.data === "object") {
-      const d = m.data as Record<string, unknown>;
-      if (typeof d.fylke === "string") searchParams.fylke = d.fylke;
+    const data = a2aMessageData(message);
+    if (data && typeof data === "object") {
+      const d = data as Record<string, unknown>;
+      // Slice I-Y2: the data's strings are cut to MAX_FREE_TEXT_CHARS
+      // (utils/a2a-message.ts), and `fylke`, a place name, to MAX_NAME_CHARS
+      // (utils/free-text.ts), as in tannlege_search.
+      if (typeof d.fylke === "string") searchParams.fylke = capName(d.fylke);
       if (typeof d.specialty === "string") searchParams.specialty = d.specialty;
       if (d.helfo_agreement === "true" || d.helfo_agreement === "false") {
         searchParams.helfo_agreement = d.helfo_agreement as "true" | "false";
@@ -277,7 +319,10 @@ export function handleDentalMessageSend(
       if (d.acute_vakt === 1 || d.acute_vakt === 0) {
         searchParams.acute_vakt = d.acute_vakt as 0 | 1;
       }
-      if (typeof d.q === "string") searchParams.q = d.q;
+      // Slice I-Y: the free-text `q` (a name or place as written) is cut like
+      // message text (utils/free-text.ts). It is a LIKE pattern, and one past
+      // SQLite's pattern limit (50 000 bytes) was an internal error.
+      if (typeof d.q === "string") searchParams.q = capFreeText(d.q);
     }
   }
 
@@ -306,16 +351,15 @@ export function handleDentalMessageSend(
         metadata: { skill: "tannlege_stats" },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (tannlege_stats)", err);
     }
   }
 
-  // Special intent: single clinic by org_nr
-  const orgMatch = lowerText.match(/\b(\d{9})\b/);
-  if (orgMatch) {
+  // Special intent: single clinic by org_nr (also «912 345 678», orgNrIn)
+  const orgNr = orgNrIn(lowerText);
+  if (orgNr) {
     try {
-      const found = getDentalAgentByOrgnr(orgMatch[1]!);
+      const found = getDentalAgentByOrgnr(orgNr);
       // The synthetic schema-probe row (org_nr 999999999) is not a clinic.
       const clinic = found && !isDentalSyntheticProbeId(found.id) ? found : null;
       if (!clinic) {
@@ -326,10 +370,10 @@ export function handleDentalMessageSend(
             {
               artifactId: "clinic",
               name: "dental-clinic",
-              parts: [{ kind: "text", text: `Ingen klinikk funnet med orgnr ${orgMatch[1]}` }],
+              parts: [{ kind: "text", text: `Ingen klinikk funnet med orgnr ${orgNr}` }],
             },
           ],
-          metadata: { skill: "tannlege_info", org_nr: orgMatch[1] },
+          metadata: { skill: "tannlege_info", org_nr: orgNr },
         });
       }
       return rpcOk(id, {
@@ -343,11 +387,10 @@ export function handleDentalMessageSend(
             parts: [{ kind: "data", data: toDentalA2aClinic(clinic) }],
           },
         ],
-        metadata: { skill: "tannlege_info", org_nr: orgMatch[1] },
+        metadata: { skill: "tannlege_info", org_nr: orgNr },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (tannlege_info)", err);
     }
   }
 
@@ -408,8 +451,7 @@ export function handleDentalMessageSend(
       },
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return rpcErr(id, -32603, "Internal error", msg);
+    return rpcInternalError(id, "message/send (tannlege_search)", err);
   }
 }
 
@@ -454,8 +496,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         res.json(rpcErr(id, -32601, `Method not found: ${method}`));
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.json(rpcErr(id, -32603, "Internal error", msg));
+    res.json(rpcInternalError(id, "POST /a2a", err));
   }
 });
 

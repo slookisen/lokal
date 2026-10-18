@@ -62,6 +62,8 @@ import { conversationService, buildRequestMeta, isInternalTraffic, type RequestM
 import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
+import { a2aMessageData } from "../utils/a2a-message";
+import { capFreeText, capName } from "../utils/free-text";
 // Only isBookingPaused is used here (same import + reasoning as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
 // base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
@@ -134,13 +136,18 @@ const RpcEnvelopeSchema = z.object({
 
 // ─── Text extractor (mirrors dental a2a.ts approach) ─────────
 
-const MAX_MESSAGE_TEXT = 2000; // cap free-text length (DoS hygiene)
+// The text is cut to MAX_FREE_TEXT_CHARS (2000) by the helper the three
+// platforms share (utils/free-text.ts, dev-request 2026-10-17-integrasjonstest-
+// oppfolging, slice I-Y), at a word boundary. This file used to cut at 2000
+// itself, in the middle of a word, and the piece before the cut was read
+// («Bergen» of «Bergensbanen» as the kommune). A word the cut splits is now
+// dropped whole.
 
 function extractText(msg: unknown): string | null {
-  if (typeof msg === "string") return msg.slice(0, MAX_MESSAGE_TEXT);
+  if (typeof msg === "string") return capFreeText(msg);
   if (msg && typeof msg === "object") {
     const m = msg as Record<string, unknown>;
-    if (typeof m.text === "string" && m.text) return m.text.slice(0, MAX_MESSAGE_TEXT);
+    if (typeof m.text === "string" && m.text) return capFreeText(m.text);
     if (Array.isArray(m.parts)) {
       for (const p of m.parts) {
         if (!p || typeof p !== "object") continue;
@@ -148,7 +155,7 @@ function extractText(msg: unknown): string | null {
         if (typeof part.text === "string" && part.text) {
           if (part.type !== undefined && part.type !== "text") continue;
           if (part.kind !== undefined && part.kind !== "text") continue;
-          return part.text.slice(0, MAX_MESSAGE_TEXT);
+          return capFreeText(part.text);
         }
       }
     }
@@ -259,7 +266,8 @@ export function experiencesAskedSomething(result: object): boolean {
 function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
-  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  // A DataPart counts as message.data (I-X, utils/a2a-message.ts).
+  const data = a2aMessageData(message);
   return a2aLookupCountable({
     vertical: "experiences",
     ipHash,
@@ -293,11 +301,15 @@ export function handleExperiencesMessageSend(
   if (messageText) {
     filter = parseExperiencesIntent(messageText);
   } else if (message && typeof message === "object") {
-    const m = message as Record<string, unknown>;
-    if (m.data && typeof m.data === "object") {
-      const d = m.data as Record<string, unknown>;
-      if (typeof d.fylke === "string") filter.fylke = d.fylke;
-      if (typeof d.kommune === "string") filter.kommune = d.kommune;
+    // message.data, or the first standard DataPart (I-X, utils/a2a-message.ts).
+    const data = a2aMessageData(message);
+    if (data && typeof data === "object") {
+      const d = data as Record<string, unknown>;
+      // Slice I-Y2: the data's strings are cut to MAX_FREE_TEXT_CHARS
+      // (utils/a2a-message.ts), and the place names to MAX_NAME_CHARS
+      // (utils/free-text.ts), as in discover_experiences.
+      if (typeof d.fylke === "string") filter.fylke = capName(d.fylke);
+      if (typeof d.kommune === "string") filter.kommune = capName(d.kommune);
       if (typeof d.category === "string") filter.category = d.category;
       if (d.indoor_outdoor === "indoor" || d.indoor_outdoor === "outdoor" || d.indoor_outdoor === "both") {
         filter.indoor_outdoor = d.indoor_outdoor;
@@ -425,9 +437,10 @@ export function handleExperiencesMessageSend(
       let gLng = typeof filter.lng === "number" ? filter.lng : undefined;
       let gRadiusKm = typeof filter.radius_km === "number" ? filter.radius_km : undefined;
       if ((gLat === undefined || gLng === undefined) && message && typeof message === "object") {
-        const m = message as Record<string, unknown>;
-        if (m.data && typeof m.data === "object") {
-          const d = m.data as Record<string, unknown>;
+        // message.data, or the first standard DataPart (I-X, utils/a2a-message.ts).
+        const data = a2aMessageData(message);
+        if (data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
           if (typeof d.lat === "number") gLat = d.lat;
           if (typeof d.lng === "number") gLng = d.lng;
           if (typeof d.radius_km === "number") gRadiusKm = d.radius_km;

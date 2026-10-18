@@ -197,8 +197,13 @@ export function runDentalAgentProvenanceTests(
         const direct = getDentalAgentById("clinic-no-prov") as Record<string, unknown>;
         // route additionally normalizes telefon/mobil via isDisplayablePhone —
         // telefon is null in this fixture either way, so direct comparison holds.
+        // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+        // places-treffvakt, S4-A1b: the route also leaves out the stored Google
+        // rating (rating, rating_count, rating_source), so those three are
+        // taken off the direct read before comparing.
+        const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...directWithoutRating } = direct;
         assertTrue(!!direct, "d1: setup — getDentalAgentById returns a value for clinic-no-prov");
-        assertEq(rest, direct, "d2: additive regression — every non-provenance field of the route response matches a direct getDentalAgentById() read exactly");
+        assertEq(rest, directWithoutRating, "d2: additive regression — every non-provenance field of the route response matches a direct getDentalAgentById() read exactly, less the three Google rating keys");
       }
     } catch (err: any) {
       failed++;

@@ -234,7 +234,12 @@ export async function runDentalNaturalSearchTests(opts: { log?: boolean } = {}):
       const t = Date.now();
       const r = await call({ query: "tannlege i Bergen " + "x".repeat(1024 * 1024) });
       const ms = Date.now() - t;
-      assertTrue(!r.isError && JSON.parse(r.content[0].text).count === 0, "M27: a 1 MB query answers without an error");
+      // Slice I-Y (utils/free-text.ts): the handler cuts the text to 2000
+      // characters at a word boundary, so the 1 MB word is dropped whole and
+      // the search is «tannlege i Bergen» (main read a 256-character piece of
+      // it as a name and found 0).
+      assertTrue(!r.isError && JSON.parse(r.content[0].text).count === bergenKommune,
+        "M27: a 1 MB query answers without an error, as the words before the cap («tannlege i Bergen»)");
       assertTrue(ms < 1000, "M28: ... in well under a second");
       const long = await call({ query: "tannlege i Bergen " + "x".repeat(150) });
       assertTrue(!long.isError && !String(long.content[0].text).includes("Søkefeil"), "M29: a word over 100 characters is no Zod error");

@@ -40,7 +40,7 @@ import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
 // specialty filter also matches the vocabulary's title stems.
 import { normaliseFylke } from "./norway-fylke";
 import { escapeLike } from "./search-intent/norwegian-query";
-import { findSearchSpecialty } from "../config/dental-search-vocabulary";
+import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-search-vocabulary";
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
 import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
@@ -534,14 +534,13 @@ function specialtyMatch(specialty: string, prefix: string): { sql: string; param
   // another one in the list is left out: "%kjeveortoped%" already matches
   // every title "%kjeveortopedi%" does, and each clause costs an
   // nb_lower(specialists) call per row. A specialty not in the vocabulary
-  // keeps exactly the three clauses it had.
-  const words = [...new Set([...names.map((n) => n.toLowerCase()), ...(entry?.title_stems ?? [])])];
-  words
-    .filter((w) => !words.some((other) => other !== w && w.includes(other)))
-    .forEach((w, i) => {
-      parts.push(`nb_lower(specialists) LIKE @${prefix}Title${i}`);
-      params[`${prefix}Title${i}`] = `%"title":"%${w}%`;
-    });
+  // keeps exactly the three clauses it had. The words come from the
+  // vocabulary (specialtyTitleWords), which the clinic cards read titles
+  // with too (dev-request 2026-10-17-dental-d3-rettelser, D3d).
+  specialtyTitleWords(names, entry).forEach((w, i) => {
+    parts.push(`nb_lower(specialists) LIKE @${prefix}Title${i}`);
+    params[`${prefix}Title${i}`] = `%"title":"%${w}%`;
+  });
   return { sql: `(${parts.join(" OR ")})`, params };
 }
 
@@ -2442,6 +2441,50 @@ export function listRelatedClinics(
     LIMIT ?
   `).all(agent.poststed, agent.id, Math.max(1, Math.min(20, limit))) as Array<Record<string, unknown>>;
   return rows.map(hydrateAgent);
+}
+
+/** Another clinic with the same name in the same place (listDentalNamesakes). */
+export interface DentalNamesake {
+  id: string;
+  org_nr: string | null;
+  postnummer: string | null;
+}
+
+/**
+ * Clinics with the same name as `agent` in its poststed: another id, the
+ * name equal once trimmed and case-folded, not rejected and not the
+ * synthetic probe row (dev-request 2026-10-17-dental-d3-rettelser, D3e).
+ * Their pages would otherwise get the same <title> and meta description;
+ * the profile page tells them apart with these rows (namesakeDisambiguator
+ * in routes/dental-seo.ts).
+ *
+ * Unlike listRelatedClinics this deliberately keeps closed and non-clinic
+ * rows: their pages render too, and a title must differ from every other
+ * page's. `spellings` are the place's other stored spellings (its /sted
+ * group: "BERGEN" and "Bergen" are both titled «Bergen»), looked up with
+ * the clinic's own on idx_dental_poststed. The name goes through nb_lower(),
+ * which folds Æ/Ø/Å; SQLite's own upper()/lower() fold ASCII only.
+ */
+export function listDentalNamesakes(
+  agent: Pick<DentalAgent, "navn" | "poststed"> & { id: string },
+  spellings: readonly string[] = []
+): DentalNamesake[] {
+  if (!agent.poststed) return [];
+  const places = [...new Set([agent.poststed, ...spellings])];
+  const rows = getDb("dental").prepare(`
+    SELECT id, org_nr, postnummer FROM dental_agents
+    WHERE poststed IN (${places.map(() => "?").join(", ")})
+      AND id != ?
+      AND verification_status != 'rejected'
+      AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
+      AND nb_lower(trim(navn)) = nb_lower(trim(?))
+    LIMIT 20
+  `).all(...places, agent.id, agent.navn) as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: r.id as string,
+    org_nr: (r.org_nr as string | null) ?? null,
+    postnummer: (r.postnummer as string | null) ?? null,
+  }));
 }
 
 /**

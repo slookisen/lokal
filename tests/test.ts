@@ -1683,27 +1683,26 @@ function getCommunity(id: string): number {
 seedAgent("test-no-rating", null, 0);
 assertEq(Math.round(getCommunity("test-no-rating") * 1000), 300, "no rating → 0.3 neutral");
 
-// Case 2: 4.7/5 with 22 reviews → ~0.925 (Homme Gård profile in prod)
+// Cases 2–5 (rewritten for dev-request 2026-10-16-rfb-strukturerte-data-
+// tredjepartsrating-og-places-treffvakt, S4-A1b): community v2 read the stored
+// Google rating (Homme-like 4.7/22 gave ~0.925, 5.0/1 ~0.6, 5.0/20 1.0 and
+// 2.0/100 <0.3). v3 takes first-party reviews only and none exist yet, so
+// every one of them is the neutral 0.3: no lift and no penalty from Google.
 seedAgent("test-homme", 4.7, 22);
-const homme = getCommunity("test-homme");
-assertTrue(homme > 0.9 && homme < 0.95, `Homme-like (4.7, 22 reviews) → ${homme.toFixed(3)} expected ~0.925`);
+assertEq(Math.round(getCommunity("test-homme") * 1000), 300, "Homme-like (Google 4.7, 22 reviews) → 0.3: a Google rating is not read");
 
-// Case 3: 5.0 with only 1 review → moderate, NOT 1.0 (volume guard)
 seedAgent("test-cherrypicked", 5.0, 1);
-const cherry = getCommunity("test-cherrypicked");
-assertTrue(cherry > 0.5 && cherry < 0.7, `5.0 + 1 review → ${cherry.toFixed(3)}, expected 0.5–0.7 (volume guard)`);
+assertEq(Math.round(getCommunity("test-cherrypicked") * 1000), 300, "Google 5.0 + 1 review → 0.3 (no volume guard needed: not read)");
 
-// Case 4: 5.0 with 20 reviews → exactly 1.0 ceiling
 seedAgent("test-perfect", 5.0, 20);
-const perfect = getCommunity("test-perfect");
-assertEq(Math.round(perfect * 1000), 1000, "5.0 + 20 reviews → 1.0 ceiling");
+assertEq(Math.round(getCommunity("test-perfect") * 1000), 300, "Google 5.0 + 20 reviews → 0.3, no longer the 1.0 ceiling");
 
-// Case 5: 2.0 with 100 reviews → genuine penalty
 seedAgent("test-bad", 2.0, 100);
-const bad = getCommunity("test-bad");
-assertTrue(bad < 0.3, `2.0 + 100 reviews → ${bad.toFixed(3)}, expected <0.3 (real penalty)`);
+assertEq(Math.round(getCommunity("test-bad") * 1000), 300, "Google 2.0 + 100 reviews → 0.3, no longer a penalty");
 
-// Case 6: full trust score with all signals at max — confirms 100% is now reachable
+// Case 6: full trust score with every other signal at max. With community
+// neutral until own reviews exist, the ceiling is 0.9 + 0.1 × 0.3 = 0.93
+// (v2 reached ≥ 0.99 through a 5.0/20 Google rating).
 memdb.prepare("UPDATE agents SET is_verified = 1, last_seen_at = ?, created_at = ? WHERE id = ?")
   .run(new Date().toISOString(), new Date().toISOString(), "test-perfect");
 memdb.prepare("UPDATE agent_knowledge SET address = \'x\', postal_code = \'1\', website = \'x\', phone = \'1\', email = \'x@y\', opening_hours = \'[1]\', products = \'[1]\', about = \'x\', specialties = \'[1]\', certifications = \'[1]\', payment_methods = \'[1]\', delivery_options = \'[1]\', images = \'[1]\', owner_updated_at = ? WHERE agent_id = ?")
@@ -1711,7 +1710,7 @@ memdb.prepare("UPDATE agent_knowledge SET address = \'x\', postal_code = \'1\', 
 memdb.prepare("INSERT INTO agent_metrics (agent_id, times_discovered, times_contacted, times_chosen, last_interaction_at) VALUES (?, 100, 30, 10, ?)")
   .run("test-perfect", new Date().toISOString());
 const fullScore = trustScoreService.calculate("test-perfect");
-assertTrue(fullScore >= 0.99, `max-everything agent → ${fullScore}, expected ≥ 0.99 (100% now reachable)`);
+assertEq(fullScore, 0.93, `max-everything agent with a Google 5.0/20 rating → ${fullScore}, expected 0.93 (community neutral)`);
 
 memdb.close();
 
@@ -36127,6 +36126,41 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-seo profilkvalitet (5b/5d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3e): two clinics with the
+  //    same name in the same place get different titles and meta («i 0190
+  //    Oslo» or «(org.nr N)»); a page without a namesake is unchanged ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3e): dental namesake-titler ──");
+  try {
+    const { runDentalNamesakeTitlerTests } = require("../src/routes/dental-namesake-titler.test") as
+      typeof import("../src/routes/dental-namesake-titler.test");
+    const dnt = await runDentalNamesakeTitlerTests({ log: false });
+    passed += dnt.passed;
+    failed += dnt.failed;
+    for (const f of dnt.failures) failures.push("dental namesake-titler (D3e): " + f);
+    console.log(`  dental namesake-titler (D3e): ${dnt.passed} passed, ${dnt.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental namesake-titler (D3e): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
+  //    clinic page names its place in the official spelling («Tromsø», not
+  //    «Tromsoe») in title, meta, JSON-LD, breadcrumb and header; hyphenated
+  //    names title-case per part («Sør-Fron») ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3d trinn 3): dental profil-skrivemåte ──");
+  try {
+    const { runDentalProfilSkrivemateTests } = require("../src/routes/dental-profil-skrivemate.test") as
+      typeof import("../src/routes/dental-profil-skrivemate.test");
+    const dps = await runDentalProfilSkrivemateTests({ log: false });
+    passed += dps.passed;
+    failed += dps.failed;
+    for (const f of dps.failures) failures.push("dental profil-skrivemåte (D3d trinn 3): " + f);
+    console.log(`  dental profil-skrivemåte (D3d trinn 3): ${dps.passed} passed, ${dps.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental profil-skrivemåte (D3d trinn 3): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
   //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
   //    every 404, agents.txt API-base /api/tannlege ──
@@ -36193,6 +36227,22 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("dental /sted stavemåter (D3b): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3d, point 4): the A2A
+  //    agent card's skill texts say what message/send does ──
+  console.log("\n── dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 4): A2A-agentkortets skilltekster ──");
+  try {
+    const { runDentalAgentCardTests } = require("../src/services/dental-agent-card.test") as
+      typeof import("../src/services/dental-agent-card.test");
+    const dac = await runDentalAgentCardTests({ log: false });
+    passed += dac.passed;
+    failed += dac.failed;
+    for (const f of dac.failures) failures.push("dental agent card (D3d): " + f);
+    console.log(`  dental agent card (D3d): ${dac.passed} passed, ${dac.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental agent card (D3d): unexpected error: " + String(err?.message || err));
   }
 
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
@@ -42760,6 +42810,188 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W (found live
+// 2026-10-17): a word outside the category map («kransekake») is looked up in
+// the product names (the offers' catalog and word rule), and lokal_search says
+// so when nothing matches («zzzqqx») instead of listing the standard list;
+// the category key is the platform's «bakery» (the old «bread» still matches);
+// place words come from the shared gazetteer («kransekake i Bærum» is no name
+// search); filler words («vil», «dag», «beste») are never looked up (review
+// round 1). The test sets answer as main did (tests/fixtures/rfb-sok-i-w-main.json).
+// Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W (RFB search: unknown words, bakery, place words) ──");
+  try {
+    const { runRfbSokUkjenteOrdBakeriStedTests } = require("../src/routes/rfb-sok-ukjente-ord-bakeri-sted.test") as
+      typeof import("../src/routes/rfb-sok-ukjente-ord-bakeri-sted.test");
+    const r = await runRfbSokUkjenteOrdBakeriStedTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-ukjente-ord-bakeri-sted: " + f);
+    console.log(`  rfb-sok-ukjente-ord-bakeri-sted: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-ukjente-ord-bakeri-sted: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Z (FUNN
+// rest-sok-teller-verifisering-som-oppdagelse, sesjonens-a2a-prober-telt-som-
+// ai-oppslag): our own traffic («session-lane-verify» is now an internal
+// marker, an admin key, the owner cookie) gets the same answer on every search
+// and lookup entry of RFB, Opplevagent and Finn-tannlege but changes no
+// counter (discovery, interactions, conversations, search and page-view
+// stats, AI-søk, «Med i AI-svar»); probes and spam raise no discovery counter;
+// external calls count as main did (tests/fixtures/intern-trafikk-i-z-main.json).
+// Own in-memory DBs, the dental/experiences db-factory and the module cache
+// swapped, three express apps on 127.0.0.1 (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Z (own traffic and probes counted as nothing, all three platforms) ──");
+  try {
+    const { runInternTrafikkTellesIkkeTests } = require("../src/routes/intern-trafikk-telles-ikke.test") as
+      typeof import("../src/routes/intern-trafikk-telles-ikke.test");
+    const r = await runInternTrafikkTellesIkkeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("intern-trafikk-telles-ikke: " + f);
+    console.log(`  intern-trafikk-telles-ikke: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("intern-trafikk-telles-ikke: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-X (FUNN
+// dental-a2a-datapart-ignoreres, dental-a2a-orgnr-med-mellomrom): the A2A
+// message/send handlers of RFB, Opplevagent and Finn-tannlege read the
+// standard DataPart (message.parts [{kind: "data"}]) as message.data, with
+// message.data and text first; Finn-tannlege's A2A reads «912 345 678» as an
+// org.nr. Messages without a DataPart answer as main did
+// (tests/fixtures/a2a-datapart-i-x-main.json). Swaps the main DB singleton,
+// the dental/experiences db-factory and the module cache (restored in
+// finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-X (A2A DataPart on all three platforms + org.nr with spaces) ──");
+  try {
+    const { runA2aDatapartAllePlattformerTests } = require("../src/routes/a2a-datapart-alle-plattformer.test") as
+      typeof import("../src/routes/a2a-datapart-alle-plattformer.test");
+    const r = await runA2aDatapartAllePlattformerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("a2a-datapart-alle-plattformer: " + f);
+    console.log(`  a2a-datapart-alle-plattformer: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("a2a-datapart-alle-plattformer: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y (FUNN
+// rfb-sok-fritekst-uten-lengdetak): free text is cut to MAX_FREE_TEXT_CHARS
+// (utils/free-text.ts, at a word boundary) before anything reads it, on every
+// free-text entry of RFB, Opplevagent and Finn-tannlege: a 1 MB search
+// answers as its first 2000 characters, in under 50 ms; searches within the
+// cap answer as main did (tests/fixtures/fritekst-lengdetak-i-y-main.json).
+// Swaps the main DB singleton, the dental/experiences db-factory and the
+// module cache (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Y (length cap on free-text search, all three platforms) ──");
+  try {
+    const { runFritekstLengdetakAllePlattformerTests } = require("../src/routes/fritekst-lengdetak-alle-plattformer.test") as
+      typeof import("../src/routes/fritekst-lengdetak-alle-plattformer.test");
+    const r = await runFritekstLengdetakAllePlattformerTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("fritekst-lengdetak-alle-plattformer: " + f);
+    console.log(`  fritekst-lengdetak-alle-plattformer: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("fritekst-lengdetak-alle-plattformer: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+// rfb-find-match-levenshtein-uten-tak, rfb-find-offers-items-uten-antallstak,
+// rfb-geokoding-ordkombinasjoner-uten-tak and the P3 caps): find-match reads
+// MAX_NAME_CHARS of a name, lokal_find_offers looks up MAX_OFFER_ITEMS items
+// and says the rest were left out, extractAndGeocode reads MAX_GEOCODE_WORDS
+// words, geoCache is a bounded LRU, the place fields and A2A data strings
+// (also RFB's params read as the query) are cut, and Finn-tannlege A2A
+// answers an internal failure without its detail.
+// Real names, lists, places and messages answer as main did
+// (tests/fixtures/dyre-oppslag-tak-i-y2-main.json). I-Y's fixtures (restored
+// in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-Y2 (caps on expensive lookups: find-match, find_offers items, geocoding, place fields) ──");
+  try {
+    const { runDyreOppslagTakTests } = require("../src/routes/dyre-oppslag-tak.test") as
+      typeof import("../src/routes/dyre-oppslag-tak.test");
+    const r = await runDyreOppslagTakTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("dyre-oppslag-tak: " + f);
+    console.log(`  dyre-oppslag-tak: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dyre-oppslag-tak: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W2 (review of
+// lokal#1160): a search of one filler word that names producers («Finnes»,
+// «Bondens», «Norsk») answers as main did (tests/fixtures/rfb-sok-i-w2-main.json);
+// a word inside a producer name («ser» in «Hvasser», «stor» in «Storfjord») no
+// longer makes a name search of a longer search with a place, category or
+// product in it; «bakeries» is the bakery category, and next to a category
+// word the unknown words only rank; words for the occasion, meal, size or
+// packaging («lunsj», «gave») count only when nothing else names a product.
+// Own in-memory DBs (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W2 (RFB search: filler words, name hijacking, qualifier words) ──");
+  try {
+    const { runRfbSokFyllordNavnekapringTests } = require("../src/routes/rfb-sok-fyllord-navnekapring.test") as
+      typeof import("../src/routes/rfb-sok-fyllord-navnekapring.test");
+    const r = await runRfbSokFyllordNavnekapringTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-fyllord-navnekapring: " + f);
+    console.log(`  rfb-sok-fyllord-navnekapring: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-fyllord-navnekapring: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-W3 (FUNN
+// rfb-sok-pass1-fyllord): a name indicator such as «mat» or «bakeri» counts
+// only as a whole word (or as a word of a producer name, or as the whole
+// search), so «tomat fra Hardanger» and «grillmat i Bergen» are no name
+// searches; Pass 1 reads the filler and qualifier lists, so «kortreist mat»,
+// «sunn mat» and «kortreist sjømat» are none either; «bakeri» as the only
+// product term gives way to the word the parser cannot read («Finnes det noen
+// bakeri som lager kransekake»); the name query of both passes leaves out the
+// filler and qualifier words («kortreist såper»), unless a producer name holds
+// them with a distinctive word of the search («Tell me about Den Gode Baker»,
+// review round 1, B2). A search of one word, the producer names and the names
+// Pass 1 reads answer as main did (tests/fixtures/rfb-sok-i-w3-main.json), and
+// a long search matches no word against every name (B1). Own in-memory DBs
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-W3 (RFB search: Pass 1 reads the filler lists) ──");
+  try {
+    const { runRfbSokPass1FyllordTests } = require("../src/routes/rfb-sok-pass1-fyllord.test") as
+      typeof import("../src/routes/rfb-sok-pass1-fyllord.test");
+    const r = await runRfbSokPass1FyllordTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-sok-pass1-fyllord: " + f);
+    console.log(`  rfb-sok-pass1-fyllord: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-sok-pass1-fyllord: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-F (FUNN
 // rfb-knowledge-service-typesikkerhet): a numeric product price, non-text
 // entries in the knowledge lists and a knowledge column that is not JSON no
@@ -48574,12 +48806,17 @@ runSerial(async () => {
 
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (S3): shared Places match guard (services/places-match.ts). The
-// RFB rating routes write rating/address/phone only from a candidate whose
-// name and postal code / town match; dental's isConfidentPlaceMatch is pinned
-// to its pre-S3 behaviour. Swaps the getDb() singleton, the global fetch and
-// console.warn (restored in finally) — runSerial, tail position.
+// RFB rating routes write address/phone (and rating, with the S4-A2 lever set
+// back on) only from a candidate whose name and postal code / town match;
+// dental's isConfidentPlaceMatch is pinned to its pre-S3 behaviour. S4-A2:
+// by default neither route asks Google for a rating field or writes a rating,
+// the batch makes no Enterprise-tier call, and the Places call log marks a
+// rating call (GET /admin/places-usage counts them). Swaps the getDb()
+// singleton, the global fetch, console.warn, the S4-A2 rating-fetch lever and,
+// around each places-usage call, ENABLE_DENTAL (restored in finally) —
+// runSerial, tail position.
 runSerial(async () => {
-  console.log("\n── dev-request 2026-10-16 S3: shared Places match guard ──");
+  console.log("\n── dev-request 2026-10-16 S3 + S4-A2: shared Places match guard, no Google rating fetched ──");
   try {
     const { runRfbPlacesMatchGuardTests } = require("../src/routes/rfb-places-match-guard.test") as
       typeof import("../src/routes/rfb-places-match-guard.test");
@@ -48666,8 +48903,13 @@ runSerial(async () => {
 // client-IP shadow windows are stored (client_ip_shadow_windows, written by
 // the store's timer, never by the request path), so clientIp.cumulative
 // survives deploys and clientIp.ac2 is the server's own AC2 verdict
-// (thresholds, ready only at ≥48 h). Own in-memory / temp-file DBs, injected
-// clocks; the DB-accessor failure hook and installed slot reset — tail.
+// (thresholds, ready only at ≥48 h). Trinn 1d (section I): the fanIn ratio
+// over 20 min bounds every 15-min limiter window, /mcp rated as the MCP
+// chain keys it (a session its router holds → brake only; parity with the
+// real chains and routers over HTTP), covered_ms for a restart's partial
+// window, and the store's flush timer inside trackJob. Own in-memory /
+// temp-file DBs, injected clocks; the DB-accessor failure hook and installed
+// slot reset — tail.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1c: AC2 counters survive deploys ──");
   try {
@@ -48768,5 +49010,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-seo-forside-copy: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt, S4-A1b (Daniel's decision 2=A): trust_score's community signal
+// no longer reads the stored Google rating (neutral 0.3 for every agent until
+// own reviews exist), GET /agents/:id/trust shows no Google text, the boot
+// recalculation stamps per TRUST_SCORE_FORMULA_VERSION, and the finn-tannlege
+// REST answers leave rating/rating_count/rating_source out. Swaps the getDb()
+// singleton, the dental db-factory path and the module cache (all restored in
+// finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-16 S4-A1b: trust_score, /trust and dental REST without Google ratings ──");
+  try {
+    const { runTrustScoreUtenGoogleRatingTests } = require("../src/services/trust-score-uten-google-rating.test") as
+      typeof import("../src/services/trust-score-uten-google-rating.test");
+    const tg = await runTrustScoreUtenGoogleRatingTests({ log: false });
+    passed += tg.passed;
+    failed += tg.failed;
+    for (const f of tg.failures) failures.push("trust-score-uten-google-rating: " + f);
+    console.log(`  trust-score-uten-google-rating: ${tg.passed} passed, ${tg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("trust-score-uten-google-rating: unexpected error: " + String(err?.message || err));
   }
 });

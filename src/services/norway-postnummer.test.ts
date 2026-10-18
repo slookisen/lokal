@@ -11,6 +11,9 @@
  *   P7     meta names source, licence, fetched_at and kommune basis.
  *   P8     the file is read lazily, once — not at import time.
  *   P9     kommuner2024 / officialPoststedFylker feed the search gazetteer.
+ *   P11    shownPostnummer: the placeholder "0000" and an empty value are
+ *          never shown as a postnummer (dev-request 2026-10-17-dental-d3-
+ *          rettelser, D3d).
  *
  * Standalone: npx tsx src/services/norway-postnummer.test.ts
  * Wired into tests/test.ts via runNorwayPostnummerTests().
@@ -140,6 +143,19 @@ export function runNorwayPostnummerTests(opts: { log?: boolean } = {}): TestSumm
     assertEq([officialFylker.get("BERGEN"), officialFylker.get("SANDVIKA"), officialFylker.get("TROMSØ")], [["Vestland"], ["Akershus"], ["Troms"]], "P9f: each poststed carries the fylke its postnumre lie in");
     assertTrue([...officialFylker.values()].every((f) => f.length >= 1), "P9g: every official poststed has at least one fylke");
     assertTrue(pn.officialPoststedFylker() === officialFylker, "P9h: computed once");
+
+    // ── P11: shownPostnummer (D3d) ────────────────────────────────────────
+    assertEq(
+      ["0000", " 0000 ", "", "   ", null, undefined].map((v) => pn.shownPostnummer(v)),
+      [null, null, null, null, null, null],
+      "P11a: the placeholder 0000 (also padded), an empty value, null and undefined -> null"
+    );
+    assertEq(["3340", "0010", "0001", "5003"].map((v) => pn.shownPostnummer(v)), ["3340", "0010", "0001", "5003"], "P11b: a real postnummer is unchanged");
+    assertEq(
+      [pn.PLACEHOLDER_POSTNUMMER, pn.resolveKommuneFromPostnummer(pn.PLACEHOLDER_POSTNUMMER)],
+      ["0000", { needs_review: "postnummer_not_found:0000" }],
+      "P11c: the placeholder is 0000, and it is not in the register"
+    );
 
     // ── test seam ─────────────────────────────────────────────────────────
     pn.__setPostnummerRowsForTesting([{ postnummer: "1234", poststed: "TESTSTED", kommunenummer: "0301" }]);

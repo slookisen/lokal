@@ -30,6 +30,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
+import { capFreeText, capName } from "../utils/free-text";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -51,6 +52,7 @@ import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { publicListableSql } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
@@ -402,6 +404,41 @@ export function cartResultText(tool: string, result: { success: boolean; status?
   return JSON.stringify(result, null, 2);
 }
 
+/**
+ * The most items one lokal_find_offers call looks up (dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y2, FUNN
+ * rfb-find-offers-items-uten-antallstak). Each item is a catalog lookup and
+ * the schema has no max (it is frozen while OpenAI reviews the app), so 5000
+ * items took about 5 s on live-like data, and a 1 MB list tens of seconds.
+ * A shopping list is far shorter. The items past the cap are left out, and
+ * the answer says so (offersItemsOmittedText).
+ */
+export const MAX_OFFER_ITEMS = 20;
+
+/** How many of the items left out the note names (offersItemsOmittedText). */
+const OMITTED_OFFER_ITEMS_NAMED = 5;
+
+/**
+ * The note of a lokal_find_offers answer that left items out (NO / EN): the
+ * first MAX_OFFER_ITEMS of `items` were looked up. It names the first
+ * OMITTED_OFFER_ITEMS_NAMED items left out, each cut as a name (capName), so
+ * the client can ask for exactly those.
+ */
+export function offersItemsOmittedText(items: readonly string[]): string {
+  const asked = items.length;
+  const left = asked - MAX_OFFER_ITEMS;
+  const named = items.slice(MAX_OFFER_ITEMS, MAX_OFFER_ITEMS + OMITTED_OFFER_ITEMS_NAMED)
+    .map((item) => JSON.stringify(capName(item))).join(", ");
+  const no = `Bare de ${MAX_OFFER_ITEMS} første av ${asked} varene er slått opp, og ${left} er utelatt`;
+  const en = `Only the first ${MAX_OFFER_ITEMS} of ${asked} items were looked up, and ${left} ${left === 1 ? "was" : "were"} left out`;
+  if (left <= OMITTED_OFFER_ITEMS_NAMED) {
+    return `${no}: ${named}. Spør etter ${left === 1 ? "den" : "dem"} i et nytt kall. / ` +
+      `${en}: ${named}. Ask for ${left === 1 ? "it" : "them"} in another call.`;
+  }
+  return `${no}. De første av dem er ${named}. Spør etter resten i et nytt kall. / ` +
+    `${en}, the first of them ${named}. Ask for the rest in another call.`;
+}
+
 // ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
 
 // isGenericCategoryName — I-A's name rule — lives in utils/category-label.ts
@@ -455,9 +492,10 @@ function matchedListedProduct(matchedNames: readonly string[], products: readonl
  * tells «Ferske egg fra Fana» from a bakery's label «Egg». This list only
  * drives the labelling; the matching is untouched. Each word maps to the
  * product categories whose products count for it; the first is the category
- * parseNaturalQuery gives the word ("brød" also counts the enrichment's
- * `bakery`). The words are Norwegian, as the product names are: an English
- * query is read with the parser's own glossary («meat» → «kjøtt»). Drink
+ * parseNaturalQuery gives the word (slice I-W: `bakery` for "brød", which
+ * also counts the old `bread`). The words are Norwegian, as the product
+ * names are: an English query is read with the parser's own glossary
+ * («meat» → «kjøtt»). Drink
  * words are not here: drink venues are found by category (Fase 5), and
  * «Drikke» is no product word.
  */
@@ -468,7 +506,7 @@ const CATEGORY_LABEL_WORDS: Readonly<Record<string, readonly string[]>> = {
   "meieri": ["dairy"],
   "kjøtt": ["meat"],
   "fisk": ["fish"], "sjømat": ["fish"],
-  "brød": ["bread", "bakery"], "bakervarer": ["bread", "bakery"],
+  "brød": ["bakery", "bread"], "bakervarer": ["bakery", "bread"],
   "urter": ["herbs"],
   "egg": ["eggs"],
 };
@@ -636,6 +674,25 @@ function outsideNorwayAnswer(place: string) {
   };
 }
 
+/**
+ * Slice I-W: lokal_search's answer to a search without a place when no product
+ * name matches the words the parser could not read (`words`, quoted).
+ */
+function noProductMatchText(words: string): string {
+  return `🔎 Ingen produsent har ${words} i produktlista eller i navnet, så søket gir ingen treff. ` +
+    "Prøv et annet ord, en kategori (for eksempel «bakervarer» eller «honning») eller et produsentnavn. / " +
+    `No producer lists ${words} as a product or has it in its name, so there are no matches. ` +
+    "Try another word, a category (for example «bakery» or «honey») or a producer name.";
+}
+
+/** Slice I-W: the line above a list of the producers near a place when no product there matches `words`. */
+function areaListText(words: string): string {
+  return `🔎 Ingen produsent i området har ${words} i produktlista. Listen under er produsentene i området, ikke treff på ${words}; ` +
+    "søk uten sted for hele landet. / " +
+    `No producer in the area lists ${words}. The list below is the producers in the area, not matches for ${words}; ` +
+    "search without a place to cover all of Norway.\n\n";
+}
+
 export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -660,6 +717,15 @@ export function registerTools(
       sessionId: extra?.sessionId,
     });
   };
+  // Slice I-Z: whether a search raises the producers' discovery counters.
+  // Not for our own traffic or a probe (search-tracking.ts searchCountable),
+  // read off the same headers and client name as deliver() above.
+  const countable = (extra: ToolExtra, text: string, structured = false) => searchCountable({
+    meta: buildRequestMeta({ headers: extra?.requestInfo?.headers }),
+    clientName: (server as any).server?.getClientVersion?.()?.name ?? null,
+    text,
+    structured,
+  });
 
   // Every tool handler below runs inside guardToolHandler (integration test
   // 2026-10-17, AI-1): an internal error is logged and never returned. The
@@ -698,7 +764,9 @@ export function registerTools(
       },
     },
     guardToolHandler("lokal_search", async ({ query, lat, lng, radius_km, limit }, extra) => {
-      const q = query || "";
+      // Slice I-Y: at most MAX_FREE_TEXT_CHARS of the text are read, cut at a
+      // word boundary (utils/free-text.ts). The schema keeps no max (frozen).
+      const q = capFreeText(query || "");
       const foreign = foreignPlaceIn(q);
       if (foreign) return outsideNorwayAnswer(foreign);
       const parsed = marketplaceRegistry.parseNaturalQuery(q);
@@ -743,9 +811,17 @@ export function registerTools(
       // directly), so it needs the same honest-drop signal as the REST/web
       // search surfaces — not just the underlying filter fix.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta);
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q) });
+
+      // Integration test 2026-10-17, slice I-W: the words the parser could not
+      // read are looked up in the product names (discover() step 3c). When no
+      // product matches, the answer says so: «zzzqqx» used to get the standard
+      // list as «fant 50 produsenter», with no mark that none of them matched.
+      const unknownTerms = (parsed as any)._unknownTerms as string[] | undefined;
+      const unmatched = discoverMeta.unmatchedTerms?.length ? `«${discoverMeta.unmatchedTerms.join(" ")}»` : null;
 
       if (!results?.length) {
+        if (unmatched && !parsed.location) return { content: [{ type: "text" as const, text: noProductMatchText(unmatched) }] };
         const where = hasCoords ? `innenfor ${parsed.maxDistanceKm} km` : `"${q}"`;
         return { content: [{ type: "text" as const, text: `Ingen resultater for ${where}. Prøv et bredere søk.` }] };
       }
@@ -766,9 +842,15 @@ export function registerTools(
       // were only rendered into the assistant's prose.
       const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
 
+      // I-W: near a place, the producers there are listed when no product
+      // matches, and the header says they are no matches.
+      const unmatchedLine = unmatched ? areaListText(unmatched) : "";
+      const found = unmatched
+        ? `${results.length} produsenter i området, ikke treff på ${unmatched}`
+        : `fant ${results.length} produsenter`;
       const header = hasCoords
-        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — fant ${results.length} produsenter:\n`
-        : `🥬 **Lokal mat-søk: "${q}"** — fant ${results.length} produsenter:\n`;
+        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — ${found}:\n`
+        : `🥬 **Lokal mat-søk: "${q}"** — ${found}:\n`;
 
       // If name match (1-3 results from specific query), include full product list
       // so AI can answer product/price questions directly without a second tool call
@@ -777,7 +859,14 @@ export function registerTools(
       // Compact view for broader searches. ChatGPT app re-review 2026-10-03:
       // a producer kept only for its broad category (`meat` for "lamb") says
       // so, instead of reading like a documented match.
-      const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
+      // I-W: the words step 3c matched in product names count as product terms.
+      // I-W2: next to a category word the words only rank its producers, so
+      // they count only when a product name matched them («Which bakeries
+      // make kransekake»); otherwise the category words label as before.
+      const unknownTermsCount = !!unknownTerms && !unmatched
+        && (!parsed.categories?.length || !!discoverMeta.productMatches?.size);
+      const productTerms = ((parsed as any)._productTerms as string[] | undefined)
+        ?? (unknownTermsCount ? unknownTerms : undefined) ?? [];
       // Slice I-N (AI-3a): a search with no product term, only category words
       // («egg i Bergen», «meat»), is labelled against those words. A product
       // term («honning», «reinsdyr») is the more specific evidence and keeps
@@ -880,8 +969,10 @@ export function registerTools(
         }
       });
 
-      deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
-      return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
+      // Slice I-Y: the cut text, as tannlege_search and lokal_find_offers
+      // log it. An absent query stays absent, so that call's key is as before.
+      deliver("lokal_search", { query: query === undefined ? undefined : q, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
+      return { content: [{ type: "text" as const, text: tagsRelaxedLine + unmatchedLine + header + "\n" + lines.join("\n\n") }] };
     })
   );
 
@@ -955,7 +1046,7 @@ export function registerTools(
       // gets back non-budget producers with no indication the filter was
       // silently dropped.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover(body, discoverMeta);
+      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true) });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
@@ -1331,7 +1422,12 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    guardToolHandler("lokal_bm_next_markets", async ({ region, lokallag_slug, days }) => {
+    guardToolHandler("lokal_bm_next_markets", async ({ region: regionAsSent, lokallag_slug, days }) => {
+      // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): `region` is a
+      // place name, cut to MAX_NAME_CHARS at a word boundary
+      // (utils/free-text.ts). It is a LIKE over each event's place, and an
+      // empty answer echoes it.
+      const region = capName(regionAsSent);
       const db = getDb();
       const lookahead = Math.max(1, Math.min(days || 30, 90));
       const fromIso = new Date().toISOString();
@@ -1427,7 +1523,10 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    guardToolHandler("lokal_geocode", async ({ place }) => {
+    guardToolHandler("lokal_geocode", async ({ place: placeAsSent }) => {
+      // Slice I-Y2: a place name, cut to MAX_NAME_CHARS at a word boundary
+      // (utils/free-text.ts); the answer echoes it when nothing is found.
+      const place = capName(placeAsSent);
       const result = await geocodingService.geocode(place);
       if (!result) {
         return {
@@ -1477,7 +1576,11 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    guardToolHandler("lokal_find_offers", async ({ items, near, lat, lng, radius_km }, extra) => {
+    guardToolHandler("lokal_find_offers", async ({ items, near: nearAsSent, lat, lng, radius_km }, extra) => {
+      // Slice I-Y2: `near` is a place name, cut to MAX_NAME_CHARS at a word
+      // boundary (utils/free-text.ts). Each item's lookup used to geocode the
+      // whole text again.
+      const near = capName(nearAsSent);
       const foreign = foreignPlaceIn(near);
       if (foreign) return outsideNorwayAnswer(foreign);
       const hasCoords = isValidLatLng(lat as number, lng as number);
@@ -1491,8 +1594,13 @@ export function registerTools(
       }
 
       const radiusKm = resolveOffersRadiusKm(radius_km);
+      // Slice I-Y: each item is a catalog lookup, so each is cut like the
+      // search text (utils/free-text.ts). An item past SQLite's LIKE pattern
+      // limit (50 000 bytes) used to fail the whole call.
+      // Slice I-Y2: and only the first MAX_OFFER_ITEMS items are looked up.
+      const terms = items.slice(0, MAX_OFFER_ITEMS).map((item) => capFreeText(item));
       const results = [];
-      for (const q of items) {
+      for (const q of terms) {
         const result = await findOffers({
           q,
           near: hasCoords ? undefined : near,
@@ -1505,9 +1613,12 @@ export function registerTools(
       }
 
       // I-S2: a category match hands its producer to the caller too.
-      deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra,
+      deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
-      return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
+      const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
+      // I-Y2: the JSON stays the list of results; the note is its own part.
+      if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
+      return { content };
     })
   );
 
