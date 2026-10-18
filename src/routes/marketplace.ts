@@ -47,6 +47,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { maskEmail } from "../services/gardssalg-claim";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
+import { capFreeText } from "../utils/free-text";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
@@ -662,7 +663,9 @@ router.get("/search", async (req: Request, res: Response) => {
   // Coordinates alone ("what is near me?") is a complete, valid search — this
   // endpoint used to hard-400 without ?q=, so proximity search was impossible
   // without first typing a place name.
-  const q = typeof req.query.q === "string" ? req.query.q : "";
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read, cut at a word
+  // boundary (utils/free-text.ts), before route intent, parser and geocoder.
+  const q = capFreeText(typeof req.query.q === "string" ? req.query.q : "");
   if (!q && !hasBrowserCoords) {
     res.status(400).json({
       success: false,

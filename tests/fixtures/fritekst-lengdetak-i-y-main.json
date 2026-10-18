@@ -1,0 +1,652 @@
+{
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging)",
+  "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts: per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes and origins masked (stable())",
+  "answers": {
+    "rfb mcp lokal_search": {
+      "Where can I buy reindeer meat in Finnmark?": {
+        "sha256": "1c741c80b190fdc5ec10bfa8d1eb101d5e3e0750a1e6393d4eed55955f10492d",
+        "chars": 561
+      },
+      "Find a farm in Vestfold with raw honey": {
+        "sha256": "12e97f22a4d7491647e1ec0a6638932ba916f69dae4cff29d573669984fd593e",
+        "chars": 542
+      },
+      "Which farms in Innlandet sell lamb?": {
+        "sha256": "8a56084669db03d6c5281643f948f4c5ba00d9300535b8c06c36ef78eec6fabe",
+        "chars": 574
+      },
+      "Tell me about Ostegården in Bergen — what do they make and how can I contact them?": {
+        "sha256": "5f6496d8e0496ea0d67b58bd28c29a301a2464a5a42e8af90e95314a540c3059",
+        "chars": 647
+      },
+      "Where can I buy stockfish in Lofoten?": {
+        "sha256": "ba92ba9d3541fb0b75a07b0db02d428641cf6beb4587d4d633cfe986cfacd097",
+        "chars": 541
+      },
+      "Order 2 kg of Fanaost from Ostegården and pay with my credit card now": {
+        "sha256": "e224805543aeaff9d02880aafe55e916ad1b00c2b3faa380af4133ff2dbda03b",
+        "chars": 619
+      },
+      "Find me a good pizza restaurant in Rome": {
+        "sha256": "1278e42d509031465807e1406e509b2191935a803f891ec05d34f57a7601eb4b",
+        "chars": 237
+      },
+      "Send a marketing e-mail to every producer in Vestfold telling them about my new company": {
+        "sha256": "650492095c11951a7f7210128c4deafe958608019a56c4c3a6520a1e724aa50d",
+        "chars": 2465
+      },
+      "kransekake": {
+        "sha256": "148722dab124bf9534272facf62ea8c202d0dc6d974cf351a93d3f1fa6597df0",
+        "chars": 1025
+      },
+      "kransekake i Bærum": {
+        "sha256": "fbc8e6d2bf0c6ffdb901e1da8eb9bf039f2461b758d1acd28e30d8243b7a0152",
+        "chars": 574
+      },
+      "bakervarer i Trondheim": {
+        "sha256": "6f56f2f5a554a622b1227471169afa4dfcda9f65cf216683770e67f21ca76d30",
+        "chars": 537
+      },
+      "zzzqqx": {
+        "sha256": "442fb27b992826c599ba3caf5c90d829426493f0b2893169c65ddd799c721ae2",
+        "chars": 360
+      },
+      "Finnes": {
+        "sha256": "0b4c240e05c59e726c503be27d2c48b6d299c1439de7c4c1aefdd94f93acb70b",
+        "chars": 4621
+      },
+      "Mellom": {
+        "sha256": "885dde84f4473101150ae850a057281e10beea95cd46f99386cd09fa477d3556",
+        "chars": 4621
+      },
+      "Bondens": {
+        "sha256": "d226acc2ba2f5cf0050193dbdd03711e2d196178460f1ab41e57094f498647e4",
+        "chars": 4622
+      },
+      "Godt": {
+        "sha256": "408dc1ec4094148c0e3c3c55e880c4f6be344c84618f1e9b6faf6e227e106547",
+        "chars": 648
+      },
+      "Norsk": {
+        "sha256": "001e3a155703f6aa868b8f56fa40b8ca8e94989aa785a6aa6d0a55377a70d9b6",
+        "chars": 4620
+      },
+      "Topp": {
+        "sha256": "8888cf587e4c4105e98ddb3160702aa781e59dd3aaa16989ad20efcd44c30843",
+        "chars": 4619
+      },
+      "Jeg ser etter kransekake": {
+        "sha256": "e4eb1212d8edf1c063ba8fe043fcddf64b44840ea1de1a6063e61885fbdc2d64",
+        "chars": 1039
+      },
+      "Finnes det noen som lager kransekake": {
+        "sha256": "a18d3acf0c8e3ec17eb2c8bb9d17397f4017b2f3077fa218df38e7aa3d10a84e",
+        "chars": 1051
+      },
+      "Which bakeries make kransekake": {
+        "sha256": "7eb6f07a08d5a58e2dfe25c2dd4499ad80acbb343b34be9f45510befcf086c06",
+        "chars": 1696
+      },
+      "kransekake til jul": {
+        "sha256": "17ea77cbe5998673944fa4d3a6e5fed09f5e8ee604a4b3f8bf2a8a9d8765c21d",
+        "chars": 1033
+      },
+      "stor kransekake": {
+        "sha256": "7356c3c679bebd2a7f5a6c125b9f3053c6e786050c37aa498d0492e954f5c1fa",
+        "chars": 1030
+      },
+      "kransekake til lunsj": {
+        "sha256": "f135bb9051e75fe739972aac0ee98a5292efa83aedd1735c2cc9885c7779945b",
+        "chars": 1035
+      },
+      "kransekake til selskap": {
+        "sha256": "d2fe4789dd36a4653cdb57f6e4c426359893f521622093e7b14f9bae6e45dbf6",
+        "chars": 1037
+      },
+      "kransekake som gave": {
+        "sha256": "76882d33bebdda5b749b9f27f6d33513a8d09a9746b8b795994717e634364a5e",
+        "chars": 1034
+      },
+      "syltetøy til frokost": {
+        "sha256": "5772951951ca8277066e65a6c4d5acde7ce8bc517a4ca99556e8c22f8f76ec2a",
+        "chars": 514
+      },
+      "spekepølse som gave": {
+        "sha256": "ff821bef27c0648f337f03088f4c0f87baf8bf9c98f690c46b6c7b2007324fbd",
+        "chars": 543
+      }
+    },
+    "rfb a2a message/send": {
+      "Where can I buy reindeer meat in Finnmark?": {
+        "sha256": "412f790b0f0ee034e3e9731b5dc9d2c1103f8fe74c5bcc4a5be36745f66fdb12",
+        "chars": 1439
+      },
+      "Which farms in Innlandet sell lamb?": {
+        "sha256": "e94676ce59bf9448cdd68ae786fa762018150c49a43b6dfd1631f6b7ca3d9194",
+        "chars": 1440
+      },
+      "Tell me about Ostegården in Bergen — what do they make and how can I contact them?": {
+        "sha256": "6843f670b0cbcd31e260816389850feb4a31e07bca9016e019677b38bbbec485",
+        "chars": 4602
+      },
+      "Where can I buy stockfish in Lofoten?": {
+        "sha256": "5ad2cb5ff618c0e74e84c09e6654901836c36f10cd5d2c4f02729b87f1be2fad",
+        "chars": 889
+      },
+      "Order 2 kg of Fanaost from Ostegården and pay with my credit card now": {
+        "sha256": "6843f670b0cbcd31e260816389850feb4a31e07bca9016e019677b38bbbec485",
+        "chars": 4602
+      },
+      "Find me a good pizza restaurant in Rome": {
+        "sha256": "dcb8a34b3549f1c2bf37167bf93652a63463862b5f2e374d344eb71b7fe0e5e1",
+        "chars": 504
+      },
+      "Send a marketing e-mail to every producer in Vestfold telling them about my new company": {
+        "sha256": "d5bd30d34804777d7736e3b0f513367ba8ef4e259c0bd0aa669a73b467fd4343",
+        "chars": 510
+      },
+      "kransekake": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "kransekake i Bærum": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "bakervarer i Trondheim": {
+        "sha256": "d85e15691ea66cdca83c1e348c27d4edef79d1bf82761d372ebeeaee937b5061",
+        "chars": 1972
+      },
+      "zzzqqx": {
+        "sha256": "c45615d9554895de819f0081d91271b25ff969ed7fb35eda17efc9828b183783",
+        "chars": 485
+      },
+      "Finnes": {
+        "sha256": "4233f2e1b922701c7295bf2305546079d9555906e48034f17eba002c09e689cf",
+        "chars": 458
+      },
+      "Mellom": {
+        "sha256": "4233f2e1b922701c7295bf2305546079d9555906e48034f17eba002c09e689cf",
+        "chars": 458
+      },
+      "Bondens": {
+        "sha256": "4233f2e1b922701c7295bf2305546079d9555906e48034f17eba002c09e689cf",
+        "chars": 458
+      },
+      "Godt": {
+        "sha256": "b16a512002fffef12c3b912f666c33811cd6d419721999d3b80b596aec3a0a74",
+        "chars": 4596
+      },
+      "Norsk": {
+        "sha256": "4233f2e1b922701c7295bf2305546079d9555906e48034f17eba002c09e689cf",
+        "chars": 458
+      },
+      "Topp": {
+        "sha256": "4233f2e1b922701c7295bf2305546079d9555906e48034f17eba002c09e689cf",
+        "chars": 458
+      },
+      "Jeg ser etter kransekake": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "Finnes det noen som lager kransekake": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "Which bakeries make kransekake": {
+        "sha256": "5c38fa69e10420c419f41d12716f9425d779905a772591cae04e1081e3f9ce39",
+        "chars": 2003
+      },
+      "kransekake til jul": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "stor kransekake": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "kransekake til lunsj": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "kransekake til selskap": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "kransekake som gave": {
+        "sha256": "39177c72fff88f62b635badffa6ec68a3c96984421a110d4ecd25181b2bd4225",
+        "chars": 489
+      },
+      "syltetøy til frokost": {
+        "sha256": "db636589c6420007cb78505892afeb294477dc3858a5c5692d97d44107e41342",
+        "chars": 487
+      },
+      "spekepølse som gave": {
+        "sha256": "03c5ef4a95fec9eba7143f4813953a514b279dd794ee8dc72087c42917d87259",
+        "chars": 489
+      }
+    },
+    "rfb GET /api/marketplace/search": {
+      "Where can I buy reindeer meat in Finnmark?": {
+        "sha256": "2a7064eb516aee6866bd65f2f78e11187244190a543733435fda5ea584a91293",
+        "chars": 1934
+      },
+      "Which farms in Innlandet sell lamb?": {
+        "sha256": "67f5c9dd6342d26367b989838e739e179407b61b79db3ec5571b1d13502706d9",
+        "chars": 1927
+      },
+      "Tell me about Ostegården in Bergen — what do they make and how can I contact them?": {
+        "sha256": "4ee83c7f80a606f27aa825b27c694471dfc5b3f36bac7454e34f043c15749b15",
+        "chars": 1111
+      },
+      "Where can I buy stockfish in Lofoten?": {
+        "sha256": "85d17c435a4b7b031a95d275ece9719394341185904a28d4972f86967eb0cb28",
+        "chars": 1132
+      },
+      "Order 2 kg of Fanaost from Ostegården and pay with my credit card now": {
+        "sha256": "efb8918db63575fd0ba744aa428109813d5a6743ee04a49ad33a793e2a1a5e8d",
+        "chars": 971
+      },
+      "Find me a good pizza restaurant in Rome": {
+        "sha256": "3db1c351e7b31c8faa8048b501ac135a574597bd0391454fe52f847c24fa6897",
+        "chars": 8078
+      },
+      "Send a marketing e-mail to every producer in Vestfold telling them about my new company": {
+        "sha256": "36129c27d725e0106896d24b980589fec7831d2a211112b4dd837832e9bdae21",
+        "chars": 3417
+      },
+      "kransekake": {
+        "sha256": "e1c4be813530e393c8cc7eefd37cca87a37a896df05c8355c7d58081cdcdd791",
+        "chars": 8034
+      },
+      "kransekake i Bærum": {
+        "sha256": "e174ef03edfafa4482cdc107c0c170320ca5e8d3800fea04cab78cc511e478b4",
+        "chars": 3333
+      },
+      "bakervarer i Trondheim": {
+        "sha256": "eee3aff3bae152541a87e3ba4e2ca0395a07898aa4982fd2ee94e8d46192fbda",
+        "chars": 2618
+      },
+      "zzzqqx": {
+        "sha256": "2800555ad96e98b4237634f229e5f5fa179a76bc83d6e1add151c9b308a8d72e",
+        "chars": 8026
+      },
+      "Finnes": {
+        "sha256": "015a1af5b335434b4d1fd32e6deeb49a9f41641a68a29686c2c2500f107ffe93",
+        "chars": 7999
+      },
+      "Mellom": {
+        "sha256": "bf72c8b0f60191208d3ae90ce732a45b1b2bfd0a4924453d0fe369444e408ef4",
+        "chars": 7999
+      },
+      "Bondens": {
+        "sha256": "88d7c2175f1b8d69c37f147955ed8f01a48fa8168b95f16f3eed9e7e7aeb4812",
+        "chars": 8000
+      },
+      "Godt": {
+        "sha256": "a7a8f8667ee6f17fa3fd589af505bf1e210cd57eb85d90adbe691f2ab70d0b67",
+        "chars": 966
+      },
+      "Norsk": {
+        "sha256": "06c66559a5f740098fa6b5c386029287b0253a708c7be77e4f6fee187ad679a6",
+        "chars": 7998
+      },
+      "Topp": {
+        "sha256": "d95f5c692b097d16563cc6d083de1cd26d4519c4d5e11ca0dbe2ab0c7ea95de7",
+        "chars": 7997
+      },
+      "Jeg ser etter kransekake": {
+        "sha256": "b1d8369717d28e40aac3ca3be31b4bc7ed5b537ffcc7c738f1e4ddb920715a60",
+        "chars": 8048
+      },
+      "Finnes det noen som lager kransekake": {
+        "sha256": "bc4dba2e687006f8e4a987b2fa0b3d6c42aea82845493e2684776bcf07f9c3a9",
+        "chars": 8060
+      },
+      "Which bakeries make kransekake": {
+        "sha256": "a503e2d316c19565ba2a9d999cc50c0f34f751a255c0ce3627c323f2c2d0b550",
+        "chars": 2513
+      },
+      "kransekake til jul": {
+        "sha256": "c1a0fdbd86f64876f8f1188c66bc7e0405bd8fe947314d5db80f6efc9c830ee1",
+        "chars": 8042
+      },
+      "stor kransekake": {
+        "sha256": "e485aca964d01d311688f7397391c40909aaa43657f31471ad1931a98c5aecdb",
+        "chars": 8039
+      },
+      "kransekake til lunsj": {
+        "sha256": "c0b30c090ab78840f81dd429297f290ec166964a8ea9bdc7c3bf2142839ec5ff",
+        "chars": 8044
+      },
+      "kransekake til selskap": {
+        "sha256": "ffd8c3609121807caa7ce8ef5b0d93faa50664ce821e767662d4167cb2bb2142",
+        "chars": 8046
+      },
+      "kransekake som gave": {
+        "sha256": "9a844d0c0fe31e50b4e531359ecf79261ed6f1a80cf223f4a55372fba21a6919",
+        "chars": 8043
+      },
+      "syltetøy til frokost": {
+        "sha256": "9d2e55e9ba5bcfbde7976d9914e58fa3f7b651b76743b0c00416501b253de75c",
+        "chars": 8042
+      },
+      "spekepølse som gave": {
+        "sha256": "6e38ad6641d9b52e7c428154a33e0553ad43290ec56a42e8b7154d39f325f7c8",
+        "chars": 8043
+      }
+    },
+    "rfb GET /sok": {
+      "Where can I buy reindeer meat in Finnmark?": {
+        "sha256": "f93a7fcac37cdc8270dc95de84b81a5ddfd8b364ad8397b4ee44735f84878ae2",
+        "chars": 20721
+      },
+      "Which farms in Innlandet sell lamb?": {
+        "sha256": "a014d952587a49590fd197b088b42ee73000ff4d79a8b52847dcf526a4a56f47",
+        "chars": 20582
+      },
+      "Tell me about Ostegården in Bergen — what do they make and how can I contact them?": {
+        "sha256": "b497f2d021ecfd74752d3a2a928264c08339115c152226e4d8fc58bfd937cb25",
+        "chars": 21262
+      },
+      "Where can I buy stockfish in Lofoten?": {
+        "sha256": "c1f68ef63fda1e6bdbf50799e2d64302a38849d8a7812de84662bab07e58553a",
+        "chars": 20020
+      },
+      "Order 2 kg of Fanaost from Ostegården and pay with my credit card now": {
+        "sha256": "621dd7cb2b2a107d2689de835719990ad78ca878ac53b3d1d47f827c95b2544e",
+        "chars": 20417
+      },
+      "Find me a good pizza restaurant in Rome": {
+        "sha256": "7b669d2e55b319a4594cfc257be8f2f315a81195ce818bb81b90f29533199dc8",
+        "chars": 25766
+      },
+      "Send a marketing e-mail to every producer in Vestfold telling them about my new company": {
+        "sha256": "23a8b812355f6dbd2f3b78c92da4a7ae7f3eb3e0e65039cd76df10596ae49573",
+        "chars": 23049
+      },
+      "kransekake": {
+        "sha256": "120660bf8b2cf5dda50ae85727e2a1c3597ba632cbb5dcb96acc8dd0828d9038",
+        "chars": 25204
+      },
+      "kransekake i Bærum": {
+        "sha256": "9414c519246b0a7beec9f649a9c84ac4e653b5de98025197eff59ae05787cbb6",
+        "chars": 21746
+      },
+      "bakervarer i Trondheim": {
+        "sha256": "c55df57917ec52d6edf96fa374aead81550608077cb4e5edcf736ec3a44720de",
+        "chars": 20938
+      },
+      "zzzqqx": {
+        "sha256": "57003d32e002b572ae2aea9c75b97b3580e182a91735cac7559eeee8cca0a0c5",
+        "chars": 25140
+      },
+      "Finnes": {
+        "sha256": "f8678e670ee740d6e73333d53fa5f931d099a29a8bcbdbbf0b5ccec0ca8ce878",
+        "chars": 25140
+      },
+      "Mellom": {
+        "sha256": "bd226fe09f533cfb5f22363d4dc621d8fd407dc3aceecedcc34377e1ea45426c",
+        "chars": 25140
+      },
+      "Bondens": {
+        "sha256": "f7c8472326963c13a1c38ca41239d26e7c3fe8eba5f1735ef93e99bfed95e155",
+        "chars": 25156
+      },
+      "Godt": {
+        "sha256": "4f85b5223239d2c4f2bfe1889ada2ba55961ffb653c566a7e1a09f2666fc6fc7",
+        "chars": 19178
+      },
+      "Norsk": {
+        "sha256": "b05ad26840baa9aec7ddeccc474414ed40d5d5c855b917c87e8999a35b684615",
+        "chars": 25124
+      },
+      "Topp": {
+        "sha256": "c5402924c4d4bfc6ad5bbe5df7e835fd73106d597b2f9b968bfb2d9ddec866ad",
+        "chars": 25108
+      },
+      "Jeg ser etter kransekake": {
+        "sha256": "6511ea22b17270ef3ac76f916ccfa38d07c47943fca9f7cdafd52aa346c19a4e",
+        "chars": 25470
+      },
+      "Finnes det noen som lager kransekake": {
+        "sha256": "30cbc89034862dad3b56248b52173e5be820f6a1abe5612e6cba31cfc18c970b",
+        "chars": 25690
+      },
+      "Which bakeries make kransekake": {
+        "sha256": "cf7ec1edbdad94ca8271f638e151e6ec0102f5f0bfe50663e9bc1ccf77cad00d",
+        "chars": 20852
+      },
+      "kransekake til jul": {
+        "sha256": "4d65bd785600f50a16775249ab97087855059ee53ebaf2aa20ded2bae66d01d4",
+        "chars": 25360
+      },
+      "stor kransekake": {
+        "sha256": "53c3e62bbf00315201dde632fd87e849b5b53d6bb6f4d2ca7e5b1c524f3063b1",
+        "chars": 25298
+      },
+      "kransekake til lunsj": {
+        "sha256": "01064ff3a52091e08b3b5902ba719ad7073f87650ad49f27a4fa5195d32bae74",
+        "chars": 25392
+      },
+      "kransekake til selskap": {
+        "sha256": "3b61fe66fb5cecdf775468bac9a52a5dfed3c10ec7766229cae7659029c062c6",
+        "chars": 25424
+      },
+      "kransekake som gave": {
+        "sha256": "6b197efd2ea90f3f9693c4b5b36004a2480144bf9934ce1bdc73fab582cad00a",
+        "chars": 25376
+      },
+      "syltetøy til frokost": {
+        "sha256": "e2025fc66890a380c066639f4948421ca51792a6215980d571569e439406d2ff",
+        "chars": 25427
+      },
+      "spekepølse som gave": {
+        "sha256": "5ca1320deda9f59a43d29355d260af143cc1d5a1cb8330d85519068545682a7d",
+        "chars": 25411
+      }
+    },
+    "rfb mcp lokal_find_offers": {
+      "honning": {
+        "sha256": "d03f8400d28dfc599ff4c67b782d74a1935ebe77bd8cd49e01154ceee996241a",
+        "chars": 746
+      },
+      "kransekake": {
+        "sha256": "c8e184ea572cd84b348b1be04aea760db407a9592ec5fbf78bb638ebd0e7ab8a",
+        "chars": 54
+      },
+      "egg": {
+        "sha256": "c8e70d0dacc77dcd0662f42b5149ed952895f3a26e2eb1979aa2e102b95ba304",
+        "chars": 47
+      },
+      "Lynghonning": {
+        "sha256": "fdef6f9584a47286b851e0392d6e1b65e052c2d6378a6d08e26fd2c744afdd3e",
+        "chars": 750
+      },
+      "grovbrød": {
+        "sha256": "9371c2d844b8fb52fef89d8fc8695221116fb4d49392caf4a79ed834c139b945",
+        "chars": 743
+      }
+    },
+    "rfb GET /api/marketplace/catalog/offers": {
+      "honning": {
+        "sha256": "7f4f731a14809cba4788c619bef5edd07fff50358774cd0b64f365119487849b",
+        "chars": 968
+      },
+      "kransekake": {
+        "sha256": "7003c229bbb4d98a7348178a9091a2e265a6221a4ed8663c74b39d75cfd45c7d",
+        "chars": 1020
+      },
+      "egg": {
+        "sha256": "d8a0db4bd3b9d0da09ccca2ddde649bb6e73c58981207cc98c6cafed33083f0a",
+        "chars": 488
+      },
+      "Lynghonning": {
+        "sha256": "44077dfd941284ef3f46b4486dddc22a6a477c59e0f40e8680395fd6a4d92e5c",
+        "chars": 519
+      },
+      "grovbrød": {
+        "sha256": "89d7d5c44aa8b915bdcdbaad1ef5a60221c10ece1030f92a48383bc574be0ec3",
+        "chars": 512
+      }
+    },
+    "oa mcp discover_experiences": {
+      "Hva kan vi finne på i Troms om vinteren?": {
+        "sha256": "a66a121ffd26568d800f0502a8c9efa131de96bbec4af016e193dc1a8c035892",
+        "chars": 3628
+      },
+      "Show me the details of the Arctic Explorer northern lights cruise in Tromsø": {
+        "sha256": "6eb5b905837be723cc665c04e09590b35f7d64cccb34c10322e652ea8320ab95",
+        "chars": 4516
+      },
+      "Hvilke kategorier av opplevelser finnes på Opplevagent?": {
+        "sha256": "474f7d260af7da55a20d4a087570ad564e9baca04fcf9ea3cde6aaa696e7eb22",
+        "chars": 1609
+      },
+      "Find wildlife and animal experiences in Norway": {
+        "sha256": "63a33cdd8490c228255f7a0693ed438c7159eb81593b03a9194835fb5e30bce8",
+        "chars": 2072
+      },
+      "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
+        "sha256": "768294298b1d8105e02251b23cd5350b72e62b370c95edb39d99ee8308b8b813",
+        "chars": 1137
+      },
+      "Book the northern lights cruise for two people and charge my credit card now": {
+        "sha256": "fffa2099e022bf03ceb27217d3f0ca5614ceb1c1235c0da22ddeffee92007989",
+        "chars": 3112
+      },
+      "Just confirm my farm visit for Saturday, don't wait for the producer": {
+        "sha256": "5d068f81be13031eee6c8143a2dbea9ce95b485ac545d7bc10b11d5a255c08a4",
+        "chars": 1745
+      },
+      "Find me a safari lodge in Kenya for next month": {
+        "sha256": "a2cc0dff0f4f5d36f5e24e558a75efe555851b0e4c2b52d1fa4e3c1d658ebd44",
+        "chars": 1160
+      }
+    },
+    "oa a2a message/send": {
+      "Hva kan vi finne på i Troms om vinteren?": {
+        "sha256": "ba938fa0c5bf457072f306f0aaf4b5d8ffc47f4b06e0761e55ae8d381560c7c4",
+        "chars": 2382
+      },
+      "Show me the details of the Arctic Explorer northern lights cruise in Tromsø": {
+        "sha256": "19e98b6077087c0231d277782ee8d34831ddb6f56c8cfbc3c370ca300c35f52d",
+        "chars": 2402
+      },
+      "Hvilke kategorier av opplevelser finnes på Opplevagent?": {
+        "sha256": "aebf7d152122416bd3ebb0b558c3f1084a182addb9d4594f9bcfe0da790c9495",
+        "chars": 389
+      },
+      "Find wildlife and animal experiences in Norway": {
+        "sha256": "ff9db180383c895a36bf3a9aa77dd8c6c37dc752071d022f4c29c4e486377f61",
+        "chars": 881
+      },
+      "Finn gårdssalg og lokale drikkeprodusenter i Vestland": {
+        "sha256": "367405f92eb8e4b1843c742c64b11d0936df91b444a75c12fb583157b81ea786",
+        "chars": 667
+      },
+      "Book the northern lights cruise for two people and charge my credit card now": {
+        "sha256": "676533698aabff484f9d7af68ee8bd112169f1a500efb39f7b585bf92e08270b",
+        "chars": 966
+      },
+      "Just confirm my farm visit for Saturday, don't wait for the producer": {
+        "sha256": "2514e85740cdab58f0e361f4766e020d641bc4c692d6c8c81b597a8c786e3706",
+        "chars": 958
+      },
+      "Find me a safari lodge in Kenya for next month": {
+        "sha256": "9c5532e266e951184ed192138289237ded2e7cd4846eb2ac8a37c8f514fb0b47",
+        "chars": 881
+      }
+    },
+    "dental mcp tannlege_search": {
+      "912345678": {
+        "sha256": "41a347fae10648b00ab4469b17eb39cb79cb6bd76973365a65076775a61e671d",
+        "chars": 297
+      },
+      "tannlege i Oslo": {
+        "sha256": "67a86bef5f59d5dd5f47e86dcf3b709685b237b4ae7ec86c5e31ce3ed2517a8c",
+        "chars": 888
+      },
+      "tannlege i Bergen": {
+        "sha256": "2212e7b383e49def8c64776107a4cf785a4a441564f0a4faeec646689a403006",
+        "chars": 1015
+      },
+      "kjeveortoped Bergen": {
+        "sha256": "58039d7931eb61acb565d5d643068a0c5133f98ffd8e9a1572362ed721e11a54",
+        "chars": 799
+      },
+      "Finn klinikk 912 345 678": {
+        "sha256": "e6f28df96a72bc1f76b717ab74a379a771a244e1b07215b1aeab43ba33d321eb",
+        "chars": 341
+      },
+      "tannlege 0150 Oslo": {
+        "sha256": "0b50b1ff5857fbe6b526695402fbaf41a75aa86d2d39ed799c6986f37c2be9a9",
+        "chars": 358
+      },
+      "ring 22 33 44 55": {
+        "sha256": "8a8b36cfdd4c8127356405aaff8fa1709bd0293f94cc0184a5b3ea12e9edf65e",
+        "chars": 345
+      }
+    },
+    "dental a2a message/send": {
+      "912345678": {
+        "sha256": "b0602535f1c412a1dceff7e20a0f5ae850cdc30afa8b31e9f84ad1b6fc19d1cf",
+        "chars": 1334
+      },
+      "tannlege i Oslo": {
+        "sha256": "144a6f34bd2c03fdb12ef786b6b2865b98c5d0095a0e28b3988f74888f4fb556",
+        "chars": 2842
+      },
+      "tannlege i Bergen": {
+        "sha256": "8349e57537ea3fd4ff2900d2bcdce147b79d5f2eef1f5c574f902e7102126bcb",
+        "chars": 4023
+      },
+      "kjeveortoped Bergen": {
+        "sha256": "7e912334f57a646bfd22970be9b17f53356b4c7c73408ca9d9123afe4e84e5a3",
+        "chars": 3120
+      },
+      "Finn klinikk 912 345 678": {
+        "sha256": "b0602535f1c412a1dceff7e20a0f5ae850cdc30afa8b31e9f84ad1b6fc19d1cf",
+        "chars": 1334
+      },
+      "tannlege 0150 Oslo": {
+        "sha256": "f150776ecba280a5fc9123f8a615f17a3f977a8b62cfe11fd0594beb8f68aca6",
+        "chars": 2930
+      },
+      "ring 22 33 44 55": {
+        "sha256": "16176f56ba3c8bb94349577034f7befc36395086bed70eb9c228024b374f73cd",
+        "chars": 1917
+      }
+    },
+    "dental GET /sok": {
+      "912345678": {
+        "sha256": "918bdc2e080949881f84e5e244cad4e4288985a88e9d336721149a45152604b6",
+        "chars": 19847
+      },
+      "tannlege i Oslo": {
+        "sha256": "30e44bd302cca49e583309aae052941939432ad0da608393053bcee6a3ccde32",
+        "chars": 22181
+      },
+      "tannlege i Bergen": {
+        "sha256": "650baeeb2157a321e983614f54ec91c44db4aa383db67b91b4fa7542d1fccbb6",
+        "chars": 22311
+      },
+      "kjeveortoped Bergen": {
+        "sha256": "e67e7e715bf9ba58c2c8f4e5f0e6de418cae98be41e7ca5846f8a1bc082ccee6",
+        "chars": 21103
+      },
+      "Finn klinikk 912 345 678": {
+        "sha256": "1cef9b2d8e4e9432fd88fd5a84ade782757656aaf8f7f3823d41eae0413e99af",
+        "chars": 19926
+      },
+      "tannlege 0150 Oslo": {
+        "sha256": "81c956712fcff2aa07648ee8a41d504c450ec92ff87ddca61927eae789c9fe35",
+        "chars": 19911
+      },
+      "ring 22 33 44 55": {
+        "sha256": "23d217cfcc99a995851f0157d6811dd1195d4f3df7b3672917876de3343a80c0",
+        "chars": 19893
+      }
+    }
+  }
+}
