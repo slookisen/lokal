@@ -59,13 +59,28 @@
  *       Finn-tannlege searches of I-X, and searches for the offers, the
  *       gårdssalg producers and the clinic names.
  *       tests/fixtures/fritekst-lengdetak-i-y-main.json holds the sha256 of
- *       each answer (ids, timestamps and origins masked), captured with
- *       b1Answers() below on main ad67dba6. The I-X messages themselves keep
- *       their own golden (a2a-datapart-alle-plattformer.test.ts).
+ *       each answer (ids, timestamps, origins and the footers' copyright
+ *       year masked), captured with b1Answers() below on main ad67dba6. The
+ *       answers are whole responses, so the four HTML pages (RFB, Opplevagent
+ *       and Finn-tannlege /sok, Opplevagent /for-tilbydere/finn) are hashed
+ *       with their head, header and footer: a later change to one of those
+ *       templates moves their rows too. When such a change is meant, capture
+ *       the answers again with
+ *         npx tsx src/routes/fritekst-lengdetak-alle-plattformer.test.ts --print
+ *       and put its `answers` into the fixture. B1 also runs once with
+ *       Date.prototype.getFullYear() a year on (the footers' source), so the
+ *       golden holds after New Year. The I-X messages themselves keep their
+ *       own golden (a2a-datapart-alle-plattformer.test.ts).
+ *
+ * Not checked here: the args that lokal_search, lokal_find_offers and
+ * tannlege_search hand deliver() (the cut text). They reach the delivery log
+ * only inside a hash (listKey, services/profile-ai-deliveries.ts), so neither
+ * D's spy nor an answer shows whether they were cut.
  *
  * Not mapped here, on purpose (each needs its own cap or slice):
  *   - place fields: Opplevagent /sok's `sted`, lokal_find_offers' `near`,
- *     lokal_geocode and GET /api/marketplace/geocode;
+ *     lokal_geocode, GET /api/marketplace/geocode and lokal_bm_next_markets'
+ *     `region` (a LIKE over the event's place, echoed in an empty answer);
  *   - structured DataPart fields other than dental's free-text q (RFB
  *     data.query, dental data.fylke, Opplevagent data.*);
  *   - GET /api/marketplace/find-match?name= (an edit distance over the whole
@@ -85,7 +100,7 @@
  * and services/dental-agent-card.test.ts.
  *
  * Exported runFritekstLengdetakAllePlattformerTests({log}) -> TestSummary; wired into tests/test.ts.
- * Standalone: npx tsx src/routes/fritekst-lengdetak-alle-plattformer.test.ts
+ * Standalone: npx tsx src/routes/fritekst-lengdetak-alle-plattformer.test.ts [--print]
  */
 
 import { EventEmitter } from "node:events";
@@ -116,14 +131,20 @@ function oneMegabyte(base: string, last: string): string {
   return base + FILLER.repeat(Math.ceil((ONE_MB - base.length - last.length - 1) / FILLER.length)) + " " + last;
 }
 
-/** The answer with what differs per run masked: ids, timestamps, Date.now() task ids, slug suffixes, origins. */
+/**
+ * The answer with what differs per run masked: ids, timestamps, Date.now()
+ * task ids, slug suffixes, origins, and the copyright year of the HTML
+ * pages' footers (new Date().getFullYear() in seo.ts, experiences-seo.ts and
+ * dental-seo.ts), so the golden holds after New Year.
+ */
 function stable(v: unknown): string {
   return (typeof v === "string" ? v : JSON.stringify(v))
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>")
     .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g, "<ts>")
     .replace(/-\d{13}\b/g, "-<now>")
     .replace(/--[0-9a-f]{8}(?![0-9a-z])/g, "--<id8>")
-    .replace(/https?:\/\/[^/"'\s<>]+/g, "<origin>");
+    .replace(/https?:\/\/[^/"'\s<>]+/g, "<origin>")
+    .replace(/(©|&copy;)(\s*)\d{4}\b/g, "$1$2<year>");
 }
 
 // ─── Route drivers ────────────────────────────────────────────────────────
@@ -679,6 +700,24 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
     assertTrue(compared >= 200 && RFB_PROMPTS.every((p) => p in (main.answers["rfb mcp lokal_search"] ?? {}))
       && OA_PROMPTS.every((p) => p in (main.answers["oa a2a message/send"] ?? {})),
       `B1 the fixture holds the test sets of both submission files and the I-W/I-W2 searches (${compared} answers)`);
+
+    // The HTML pages print new Date().getFullYear() in their footers. With
+    // getFullYear() a year on, every answer must still be main's: stable()
+    // masks the footers' year, and no other part of an answer reads it.
+    assertEq([stable("Rett fra Bonden © 2026. Gjør"), stable("<span>&copy; 2026 Opplevagent"), stable("tannlege 0150 Oslo, 2026 ©")],
+      ["Rett fra Bonden © <year>. Gjør", "<span>&copy; <year> Opplevagent", "tannlege 0150 Oslo, 2026 ©"],
+      "B1 stable() masks the copyright year of the footers, and only that year");
+    const getFullYear = Date.prototype.getFullYear;
+    Date.prototype.getFullYear = function (this: Date) { return getFullYear.call(this) + 1; };
+    let nextYear: B1Answers;
+    try {
+      nextYear = await b1Answers(plan);
+    } finally {
+      Date.prototype.getFullYear = getFullYear;
+    }
+    const moved = Object.entries(main.answers).flatMap(([entry, byText]) =>
+      Object.entries(byText).filter(([text, want]) => nextYear[entry]?.[text]?.sha256 !== want.sha256).map(([text]) => `${entry} «${text}»`));
+    assertEq(moved, [], "B1 with getFullYear() a year on, every answer is still main's (the golden holds after New Year)");
   }
 
   const prevLog = console.log;
@@ -801,9 +840,17 @@ export async function runFritekstLengdetakAllePlattformerTests(opts: { log?: boo
 }
 
 if (require.main === module) {
-  runFritekstLengdetakAllePlattformerTests({ log: true }).then((s) => {
-    console.log(`\n${s.passed} passed, ${s.failed} failed`);
-    for (const f of s.failures) console.log(f);
-    process.exit(s.failed > 0 ? 1 : 0);
-  });
+  if (process.argv.includes("--print")) {
+    // B1's answers for the fixture (see the header).
+    b1Answers().then((answers) => {
+      console.log(JSON.stringify({ answers }, null, 2));
+      process.exit(0);
+    });
+  } else {
+    runFritekstLengdetakAllePlattformerTests({ log: true }).then((s) => {
+      console.log(`\n${s.passed} passed, ${s.failed} failed`);
+      for (const f of s.failures) console.log(f);
+      process.exit(s.failed > 0 ? 1 : 0);
+    });
+  }
 }
