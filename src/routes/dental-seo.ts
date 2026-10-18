@@ -15,7 +15,7 @@ import {
   getDentalAggregateLastmods,
   isThinDentalProfile,
 } from "../services/dental-store";
-import type { DentalAgent, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
+import type { DentalAgent, DentalAgentRow, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
@@ -983,7 +983,7 @@ function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOpti
 // through shownDentalAgent (no phone or hours that only Google Places gives).
 
 function clinicCard(
-  stored: DentalAgent & { id: string }
+  stored: DentalAgentRow
 ): string {
   const agent = shownDentalAgent(stored);
   const slug = slugifyClinic(agent.navn, agent.org_nr ?? undefined);
@@ -1411,7 +1411,7 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   if (akutt) explicit.acute_vakt = 1; // the public store reads this as the akutt claim on the card (S2b)
   if (kjede) explicit.chain_brand = kjede;
 
-  let agents: Array<DentalAgent & { id: string }> = [];
+  let agents: DentalAgentRow[] = [];
   let total = 0;
   let tolkning: DentalSearchTolkning | null = null;
   let filter: DentalSearchPlan["filter"] | null = null;
@@ -1575,7 +1575,7 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
 }
 
 function renderClinicProfile(
-  stored: DentalAgent & { id: string },
+  stored: DentalAgentRow,
   req: Request,
   res: Response
 ): void {
@@ -1845,7 +1845,7 @@ function renderClinicProfile(
   // ── PR-116: Related clinics (same poststed)
   let relatedSection = "";
   if (agent.poststed) {
-    let related: Array<DentalAgent & { id: string }> = [];
+    let related: DentalAgentRow[] = [];
     try { related = listRelatedClinics(agent, 6); } catch { /* db not ready */ }
     if (related.length > 0) {
       const stedSlug = slugifyText(agent.poststed);
@@ -2048,7 +2048,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   let total = 0;
   try { total = countPublicDentalAgents({ fylke: matchedFylke.fylke }); } catch { /* ok */ }
   const { page, offset, totalPages } = resolveListPage(req.query.side, total);
-  let agents: Array<DentalAgent & { id: string }> = [];
+  let agents: DentalAgentRow[] = [];
   try {
     agents = listPublicDentalAgents({ fylke: matchedFylke.fylke }, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* ok */ }
@@ -3103,7 +3103,7 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   let total = 0;
   try { total = countPublicDentalAgents({ specialty: sp.navn } as any); } catch { /* db not ready */ }
   const { page, offset, totalPages } = resolveListPage(req.query.side, total);
-  let agents: Array<DentalAgent & { id: string }> = [];
+  let agents: DentalAgentRow[] = [];
   try {
     agents = listPublicDentalAgents({ specialty: sp.navn } as any, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* db not ready */ }
@@ -3257,7 +3257,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   let total = 0;
   try { total = countPublicDentalAgents(filter); } catch { /* db not ready */ }
   const { page, offset, totalPages } = resolveListPage(req.query.side, total);
-  let agents: Array<DentalAgent & { id: string }> = [];
+  let agents: DentalAgentRow[] = [];
   try {
     agents = listPublicDentalAgents(filter, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* db not ready */ }

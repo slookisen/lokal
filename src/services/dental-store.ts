@@ -317,8 +317,10 @@ function stringifyJsonOrNull(value: unknown): string | null {
 // does not show opening hours Stage V has a pending correction for. It is not
 // on DentalAgentSchema, so no PUT body carries it, and the public answers
 // that spread a row (REST in routes/dental.ts, A2A in dental-clinic-card.ts)
-// leave it out.
-export type DentalAgentRow = DentalAgent & { id: string; stage_v_pending_correction?: unknown };
+// leave it out. dev-request 2026-10-18-dental-privat-adresse-skjules:
+// organisasjonsform is always hydrated (null when unknown) and required here,
+// because the private-address rule reads it.
+export type DentalAgentRow = DentalAgent & { id: string; organisasjonsform: string | null; stage_v_pending_correction?: unknown };
 
 // Hydrate raw SQLite row into a typed DentalAgent (parses JSON cols).
 function hydrateAgent(row: Record<string, unknown>): DentalAgentRow {

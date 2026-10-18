@@ -27,11 +27,16 @@
 //
 // Private address (dev-request 2026-10-18-dental-privat-adresse-skjules,
 // Daniel's question 13): a sole proprietorship (organisasjonsform ENK) whose
-// stored address has «c/o» as a word of its own or «Bruksenhetsnummer» is
+// stored address has «Bruksenhetsnummer», or «c/o» as a word of its own, is
 // registered at its owner's home, so the address is hidden as well
 // (isPrivateEnkAddress); postnummer and place stay, as for a Places address.
-// This rule does not depend on the Places switch, and an address the Places
-// rule hides stays hidden.
+// One exception: when every «c/o» names a business (a clinic, a centre or a
+// company, BUSINESS_WORD and COMPANY_FORM_LAST) and there is no
+// «Bruksenhetsnummer», the address is that business's (the owner rents a
+// chair there) and is shown. «c/o» with a name only, «Tannlege <name>»
+// included, stays hidden: it cannot be told from a home. This rule does not
+// depend on the Places switch, and an address the Places rule hides stays
+// hidden.
 //
 // PURE: no DB access (the caller passes the hydrated row).
 
@@ -57,21 +62,60 @@ const DENTAL_PLACES_COLUMNS: ReadonlyArray<{
   { column: "hjemmeside", field: "website", provenanceKeys: ["website", "hjemmeside"] },
 ];
 
-/** What the rules read off a clinic row. */
-export type DentalPlacesRow = Pick<DentalAgent, DentalPlacesColumn | "field_provenance" | "organisasjonsform"> & {
-  stage_v_pending_correction?: unknown;
-};
+/**
+ * What the private-address rule reads off a clinic row. organisasjonsform is
+ * a required key (optional on DentalAgent), so a caller that builds a row by
+ * hand cannot leave it out and skip the rule unnoticed.
+ */
+export type PrivateAddressRow = Pick<DentalAgent, "adresse"> & { organisasjonsform: string | null };
 
-/** «c/o» with no letter or digit next to it, or «Bruksenhetsnummer»; any case. */
-const PRIVATE_ADDRESS_MARK = /(?<![\p{L}\p{N}])c\/o(?![\p{L}\p{N}])|bruksenhetsnummer/iu;
+/** What the rules read off a clinic row. */
+export type DentalPlacesRow = Pick<DentalAgent, DentalPlacesColumn | "field_provenance"> &
+  PrivateAddressRow & {
+    stage_v_pending_correction?: unknown;
+  };
+
+/** «Bruksenhetsnummer», a dwelling's unit number; any case. */
+const UNIT_NUMBER = /bruksenhetsnummer/i;
+
+/** Each «c/o» with no letter or digit next to it, and its addressee: the text up to the next comma. */
+const CARE_OF = /(?<![\p{L}\p{N}])c\/o(?![\p{L}\p{N}])([^,]*)/giu;
+
+/**
+ * A word, with no letter or digit next to it and in any case, that names a
+ * business: a clinic, a dental or health centre, a practice, an office, the
+ * dentists of a group (tannlegene, tannleger; «tannlege» alone is a title
+ * before a name), dental health, orthodontics, «dental», or a shopping
+ * centre. Each is on the list review round 2 asked for, or occurs after
+ * «c/o» in the ENK addresses of the 2026-10-18 public dump; none is a name.
+ */
+const BUSINESS_WORD =
+  /(?<![\p{L}\p{N}])(?:(?:tann)?klinikk(?:en|ene)?|(?:tannlege|tannhelse|lege|helse|stor)?senter(?:et)?|tannlegekontor(?:et)?|tannlegepraksis|tannlege(?:ne|r|gruppen)|tannhelse|tannregulering|tannmedisin|dental)(?![\p{L}\p{N}])/iu;
+
+/**
+ * A company form, AS or ASA, as the addressee's last word («X Tannlegesenter
+ * AS»), as Brreg writes a company name. Anywhere else ASA can be a given name:
+ * the dump has a clinic named «ASA <name>».
+ */
+const COMPANY_FORM_LAST = /(?<![\p{L}\p{N}])asa?[^\p{L}\p{N}]*$/iu;
+
+/** Whether a «c/o» addressee is a business rather than a person. */
+function isBusinessAddressee(addressee: string): boolean {
+  return BUSINESS_WORD.test(addressee) || COMPANY_FORM_LAST.test(addressee);
+}
 
 /**
  * Whether the clinic's stored address is its owner's home: the clinic is a
  * sole proprietorship (organisasjonsform ENK, the Brreg code) and the address
- * has «c/o» as a word of its own or «Bruksenhetsnummer», in any case.
+ * has «Bruksenhetsnummer», or a «c/o» (as a word of its own, any case) whose
+ * addressee is not a business. An address whose every «c/o» names a business
+ * is that business's, and is not private.
  */
-export function isPrivateEnkAddress(agent: Pick<DentalAgent, "adresse" | "organisasjonsform">): boolean {
-  return (agent.organisasjonsform ?? "").trim().toUpperCase() === "ENK" && PRIVATE_ADDRESS_MARK.test(agent.adresse ?? "");
+export function isPrivateEnkAddress(agent: PrivateAddressRow): boolean {
+  if ((agent.organisasjonsform ?? "").trim().toUpperCase() !== "ENK") return false;
+  const adresse = agent.adresse ?? "";
+  if (UNIT_NUMBER.test(adresse)) return true;
+  return [...adresse.matchAll(CARE_OF)].some(([, addressee]) => !isBusinessAddressee(addressee));
 }
 
 /** The fields Stage V has a pending correction for (its JSON map, parsed or as stored). */

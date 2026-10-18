@@ -3,23 +3,32 @@
  * 2026-10-18-dental-privat-adresse-skjules (Daniel's question 13).
  *
  * A sole proprietorship (organisasjonsform ENK) whose stored address has
- * «c/o» as a word of its own or «Bruksenhetsnummer» is registered at its
- * owner's home: Finn-tannlege shows that address on no public surface.
- * Postnummer and place stay. The rule sits in the A4-D funnel
- * (dental-places-display.ts) and does not depend on the Places switch.
- * Nothing stored changes. Fixture (in-memory dental DB, all in Oslo, every
- * name and address made up):
+ * «Bruksenhetsnummer», or a «c/o» (as a word of its own) whose addressee is
+ * not a business, is registered at its owner's home: Finn-tannlege shows that
+ * address on no public surface. Postnummer and place stay. «c/o» naming a
+ * clinic, a centre or a company (round 2) is that business's address and is
+ * shown. The rule sits in the A4-D funnel (dental-places-display.ts) and does
+ * not depend on the Places switch. Nothing stored changes. Fixture (in-memory
+ * dental DB, all in Oslo, every name and address made up):
  *   E1  ENK, «c/o …, Bruksenhetsnummer …, <street>», a phone: hidden, indexable
  *   E2  ENK, «C/O …, <street>», nothing else: hidden, so thin (noindex)
  *   E3  ENK as « enk », «<street>, bruksenhetsnummer …» with a phone: hidden
+ *   E4  ENK, «c/o Tannlege <name>, <street>», a phone: hidden (a title and a
+ *       name is no business)
+ *   E5  ENK, «c/o <name> Tannklinikk AS, Bruksenhetsnummer …, <street>», a
+ *       phone: hidden (a unit number always hides)
  *   N1  ENK with an ordinary address: as stored
  *   N2  AS with a «c/o» address: as stored (only ENK is in Daniel's answer)
  *   N3  no organisasjonsform, «c/o …, Bruksenhetsnummer …»: as stored
+ *   C1  ENK, «c/o <name> Tannklinikk AS, <street>», a phone: as stored (the
+ *       clinic it rents a chair in)
  *   G   ENK, «c/o» address that only Google Places gives: hidden by both
  *       rules, and still hidden with the Places rule off
  *
  *   U   the rule (isPrivateEnkAddress): «c/o» as a word, «Bruksenhetsnummer»,
- *       any case; ENK only; words that only contain «c/o» do not count.
+ *       any case; ENK only; words that only contain «c/o» do not count; a
+ *       «c/o» whose addressee has a business word (or ends in AS/ASA) does
+ *       not count unless the address has «Bruksenhetsnummer».
  *   D   the funnel: shownDentalAgent / shownDentalFieldProvenance (address
  *       and its provenance entries gone, the rest as stored, same object when
  *       nothing is hidden, the stored row unchanged, the Places verdicts as
@@ -34,7 +43,7 @@
  *       X-Admin-Key the stored values and field_provenance.
  *   P   the provenance summary on public /agents/:id names no source of the
  *       hidden address; with X-Admin-Key as stored.
- *   S   the sitemap: E2 is left out, the other six stay.
+ *   S   the sitemap: E2 is left out, the other nine stay.
  *   K   the Places switch off: every surface still hides the private
  *       address; public REST keeps field_provenance less its entries; the
  *       REST answers that show such a clinic are Cache-Control: private,
@@ -191,9 +200,86 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       for (const organisasjonsform of ["ENK", "enk", " ENK "]) {
         ok(display.isPrivateEnkAddress({ organisasjonsform, adresse: coAddress }), `U3: organisasjonsform ${JSON.stringify(organisasjonsform)} is ENK`);
       }
+      // undefined: a row read without the column (the type requires the key; the rule still reads it safely).
       for (const organisasjonsform of ["AS", "NUF", "ANS", "ENKX", "", null, undefined]) {
-        ok(!display.isPrivateEnkAddress({ organisasjonsform, adresse: coAddress }), `U4: organisasjonsform ${JSON.stringify(organisasjonsform)} -> not private`);
+        ok(!display.isPrivateEnkAddress({ organisasjonsform: organisasjonsform as string | null, adresse: coAddress }),
+          `U4: organisasjonsform ${JSON.stringify(organisasjonsform)} -> not private`);
       }
+
+      // Round 2: «c/o» naming a business. Every business word, in each of
+      // its forms: as the addressee (any case) it is shown; inside a longer
+      // word, only after the addressee, or with «Bruksenhetsnummer» it is not.
+      const businessWords = [
+        "tannklinikk", "tannklinikken", "tannklinikkene", "klinikk", "klinikken", "klinikkene",
+        "tannlegesenter", "tannlegesenteret", "tannhelsesenter", "tannhelsesenteret", "legesenter", "legesenteret",
+        "helsesenter", "helsesenteret", "senter", "senteret", "storsenter", "storsenteret",
+        "tannlegekontor", "tannlegekontoret", "tannlegepraksis", "tannlegene", "tannleger", "tannlegegruppen",
+        "tannhelse", "tannregulering", "tannmedisin", "dental",
+      ];
+      const title = (w: string) => w[0]!.toUpperCase() + w.slice(1);
+      for (const w of businessWords) {
+        ok(!enk(`c/o Testby ${title(w)}, Prøvegata 1`), `U5: «c/o Testby ${title(w)}» -> not private`);
+        ok(!enk(`C/O ${w.toUpperCase()} TESTBY, PRØVEGATA 1`) && !enk(`c/o testby ${w}`), `U5b: «${w}» in any case, first or last -> not private`);
+        ok(enk(`c/o Ola ${title(w)}sen, Prøvegata 1`) && enk(`c/o Ola Pre${w}, Prøvegata 1`), `U6: «${w}» inside a longer word does not count -> private`);
+        ok(enk(`c/o Ola Testmann, Testby ${title(w)}, Prøvegata 1`), `U7: «${w}» only after the addressee's comma does not count -> private`);
+        ok(enk(`c/o Testby ${title(w)}, Bruksenhetsnummer H0101, Prøvegata 1`), `U8: «${w}» with «Bruksenhetsnummer» -> private`);
+      }
+      // The company forms count as the addressee's last word, as Brreg writes a company name.
+      for (const adresse of ["c/o Testby Holding AS, Prøvegata 1", "c/o Testby Holding ASA, Prøvegata 1", "c/o Testby Holding as", "c/o Testby Holding AS., Prøvegata 1",
+        "c/o Tannlege Kari Nordmann AS, Prøvegata 1", "c/o Testby Tannklinikk AS, Prøvegata 1"]) {
+        ok(!enk(adresse), `U9: ${JSON.stringify(adresse)} (a company) -> not private`);
+      }
+      for (const adresse of ["c/o ASA Testdatter, Prøvegata 1", "c/o Asa Testdatter, Prøvegata 1", "c/o Ola Assen, Prøvegata 1", "c/o Ola Asmund, Prøvegata 1",
+        "c/o Testby AS v/ Ola Testmann, Prøvegata 1", "c/o Ola Testmann, Testby Holding AS, Prøvegata 1"]) {
+        ok(enk(adresse), `U10: ${JSON.stringify(adresse)} (AS/ASA not the addressee's last word) -> private`);
+      }
+      for (const adresse of ["c/o Tannlege Kari Nordmann, Prøvegata 1", "c/o tannlege Kari Nordmann", "c/o TANNLEGE KARI NORDMANN, PRØVEGATA 1", "c/o Ola Testmann Klinikkveien 3"]) {
+        ok(enk(adresse), `U11: ${JSON.stringify(adresse)} (a title and a name, or a street word) -> private`);
+      }
+      eq([enk("c/o Testby Tannklinikk AS, Bruksenhetsnummer H0101, Prøvegata 1"), enk("Bruksenhetsnummer H0101, c/o Testby Tannklinikk AS")], [true, true],
+        "U12: a business «c/o» with «Bruksenhetsnummer» -> private");
+      eq([enk("c/o Ola Testmann, c/o Testby Tannklinikk AS, Prøvegata 1"), enk("c/o Testby Tannklinikk AS, c/o Ola Testmann")], [true, true],
+        "U13: one «c/o» naming a person among business ones -> private");
+      eq([enk("c/o Testby Tannklinikk, c/o Testby Tannlegesenter AS, Prøvegata 1"), enk("v/Ola Testmann, c/o Testby Tannlegesenter, Prøvegata 1")], [false, false],
+        "U14: every «c/o» names a business («v/» is outside the rule) -> not private");
+      for (const organisasjonsform of ["AS", null]) {
+        ok(!display.isPrivateEnkAddress({ organisasjonsform, adresse: "c/o Tannlege Kari Nordmann, Prøvegata 1" }), `U15: ${organisasjonsform}: still only ENK`);
+      }
+    }
+
+    // ── T: the types (round 2) ────────────────────────────────────────────
+    // organisasjonsform is a required key on the rows the rule reads, so tsc
+    // rejects a caller that builds a row without it. Checked with the
+    // compiler on a file that is never written, next to the module.
+    {
+      const ts = require("typescript") as typeof import("typescript");
+      const path = require("path") as typeof import("path");
+      const root = path.resolve(__dirname, "../..");
+      const probe = path.join(root, "src/services/__privat_adresse_type_probe__.ts");
+      const lines = [
+        'import { isPrivateEnkAddress, shownDentalAgent, shownDentalFieldProvenance } from "./dental-places-display";',
+        'import type { DentalAgentRow } from "./dental-store";',
+        "declare const stored: DentalAgentRow;",
+        'const bare = { adresse: "c/o Ola", telefon: null, opening_hours: null, hjemmeside: null, field_provenance: null };',
+        "isPrivateEnkAddress(bare);",
+        "shownDentalAgent(bare);",
+        "shownDentalFieldProvenance(bare);",
+        "isPrivateEnkAddress({ ...bare, organisasjonsform: null });",
+        "shownDentalAgent({ ...bare, organisasjonsform: null });",
+        "shownDentalAgent(stored);",
+        "isPrivateEnkAddress(stored);",
+      ];
+      const config = ts.getParsedCommandLineOfConfigFile(path.join(root, "tsconfig.json"), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: () => {} });
+      const host = ts.createCompilerHost(config!.options);
+      const getSourceFile = host.getSourceFile.bind(host);
+      const fileExists = host.fileExists.bind(host);
+      host.getSourceFile = (file, lang, ...rest) => (path.resolve(file) === probe ? ts.createSourceFile(file, lines.join("\n"), lang) : getSourceFile(file, lang, ...rest));
+      host.fileExists = (file) => path.resolve(file) === probe || fileExists(file);
+      const program = ts.createProgram([probe], { ...config!.options, noEmit: true }, host);
+      const errors = program.getSemanticDiagnostics(program.getSourceFile(probe))
+        .map((d) => `${lines[d.file!.getLineAndCharacterOfPosition(d.start!).line]} TS${d.code}`);
+      eq(errors, ["isPrivateEnkAddress(bare); TS2345", "shownDentalAgent(bare); TS2345", "shownDentalFieldProvenance(bare); TS2345"],
+        "T1: tsc rejects a row without organisasjonsform, and accepts one with it and the hydrated DentalAgentRow");
     }
 
     // ── Fixture ───────────────────────────────────────────────────────────
@@ -228,10 +314,24 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         phone: [src("brreg", G.telefon)],
       },
     });
-    const ids = [idE1, idE2, idE3, idN1, idN2, idN3, idG];
-    const hiddenClinics = [E1, E2, E3, G];
-    /** Words of the four private addresses (street, care-of name, unit). */
-    const privateWords = ["Testmann", "H0101", "Prøvegata", "NORDTEST", "Eksempelveien", "Demoveien", "h0302", "Testdatter", "Placesveien"];
+    // Round 2: «c/o» a title and a name (E4), a clinic with a unit number (E5) and a clinic (C1).
+    const E4 = { navn: "Tannlege Tittelsen", org_nr: "918770008", organisasjonsform: "ENK", telefon: "+4722330088", adresse: "c/o Tannlege Kari Nordprøve, Tittelveien 88" };
+    const idE4 = add(E4, { field_provenance: { address: [src("brreg", E4.adresse)] } });
+    const E5 = {
+      navn: "Tannlege Enhetsen", org_nr: "918770009", organisasjonsform: "ENK", telefon: "+4722330099",
+      adresse: "c/o Byprøve Tannklinikk AS, Bruksenhetsnummer H0909, Enhetsveien 99",
+    };
+    const idE5 = add(E5);
+    const C1 = { navn: "Tannlege Stolleiesen", org_nr: "918770010", organisasjonsform: "ENK", telefon: "+4722330010", adresse: "c/o Byprøve Tannklinikk AS, Klinikkgata 10" };
+    const idC1 = add(C1, { field_provenance: { address: [src("brreg", C1.adresse)] } });
+    const ids = [idE1, idE2, idE3, idE4, idE5, idN1, idN2, idN3, idC1, idG];
+    const hiddenClinics = [E1, E2, E3, E4, E5, G];
+    /** The clinics shown as stored: an ordinary address, not ENK, no organisasjonsform, and «c/o» a clinic. */
+    const storedClinics = [N1, N2, N3, C1];
+    const allClinics = [E1, E2, E3, E4, E5, N1, N2, N3, C1, G];
+    /** Words of the six private addresses (street, care-of name, unit). */
+    const privateWords = ["Testmann", "H0101", "Prøvegata", "NORDTEST", "Eksempelveien", "Demoveien", "h0302", "Testdatter", "Placesveien",
+      "Nordprøve", "Tittelveien", "H0909", "Enhetsveien"];
     const leaked = (text: string) => privateWords.filter((w) => text.includes(w));
     const snapshot = () => JSON.stringify(db.prepare("SELECT * FROM dental_agents ORDER BY id").all());
     const before = snapshot();
@@ -251,8 +351,8 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       eq(Object.keys(shown), Object.keys(stored), "D2b: ... the same keys in the same order");
       eq(display.dentalPlacesVerdicts(stored), { adresse: "shown", telefon: "shown", opening_hours: "shown", hjemmeside: "shown" },
         "D3: E1 — the Places verdicts are unchanged (a Brreg address is no Places value)");
-      eq([display.shownDentalAgent(row(idE2)).adresse, display.shownDentalAgent(row(idE3)).adresse], [null, null], "D4: E2 and E3 — the address null");
-      for (const [label, id] of [["N1", idN1], ["N2", idN2], ["N3", idN3]] as const) {
+      eq([idE2, idE3, idE4, idE5].map((id) => display.shownDentalAgent(row(id)).adresse), [null, null, null, null], "D4: E2, E3, E4 and E5 — the address null");
+      for (const [label, id] of [["N1", idN1], ["N2", idN2], ["N3", idN3], ["C1", idC1]] as const) {
         const r = row(id);
         ok(display.shownDentalAgent(r) === r, `D5 ${label}: nothing hidden -> the same row object`);
         ok(display.shownDentalFieldProvenance(r) === r.field_provenance, `D5b ${label}: ... and field_provenance as stored`);
@@ -272,7 +372,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
     }
 
     // ── H: the clinic page ────────────────────────────────────────────────
-    const html = Object.fromEntries(await Promise.all([E1, E2, E3, N1, N2, N3, G].map(async (c) => [c.navn, await page(c)] as const)));
+    const html = Object.fromEntries(await Promise.all(allClinics.map(async (c) => [c.navn, await page(c)] as const)));
     {
       for (const c of hiddenClinics) {
         const h = html[c.navn]!;
@@ -287,12 +387,12 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         eq([ld.address?.postalCode, ld.address?.addressLocality], ["0150", "Oslo"], `H6 ${c.navn}: postalCode and addressLocality stay`);
         ok(typeof ld.description === "string" && !ld.description.includes("Adresse:"), `H7 ${c.navn}: Dentist.description has no Adresse sentence`);
       }
-      for (const c of [E1, E3, G]) {
+      for (const c of [E1, E3, E4, E5, G]) {
         ok(!html[c.navn]!.includes('content="noindex'), `H8 ${c.navn}: a phone is left -> still indexable`);
       }
       ok(html[E2.navn]!.includes('content="noindex,follow"') && html[E2.navn]!.includes("Ufullstendig oppføring"),
         "H9 E2: nothing left of address, phone, website and hours -> thin: noindex and the CTA");
-      for (const c of [N1, N2, N3]) {
+      for (const c of storedClinics) {
         const h = html[c.navn]!;
         const ld = dentist(h);
         ok(h.includes(`<div class="info-label">Adresse</div><div class="info-value">${c.adresse}, 0150 OSLO</div>`), `H10 ${c.navn}: the stored address on the Adresse line`);
@@ -305,7 +405,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
     // ── W: web lists ──────────────────────────────────────────────────────
     for (const [path, query] of [["/sted/oslo"], ["/fylke/Oslo"], ["/sok", { q: "tann" }]] as Array<[string, Record<string, string>?]>) {
       const list = (await callRoute(seoRouter, path, { query })).text;
-      ok(hiddenClinics.every((c) => list.includes(`>${c.navn}<`)), `W1 ${path}: the four clinics are listed`);
+      ok(hiddenClinics.every((c) => list.includes(`>${c.navn}<`)), `W1 ${path}: the six clinics with a hidden address are listed`);
       eq(leaked(list), [], `W2 ${path}: no word of a private address on the page`);
     }
 
@@ -323,7 +423,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       JSON.parse(((await client.callTool({ name, arguments: args })) as any).content[0].text);
     const mcpSurfaces = async () => ({
       search: (await tool("tannlege_search", { fylke: "Oslo", limit: 25 })).klinikker as any[],
-      info: Object.fromEntries(await Promise.all([E1, E2, E3, N1, N2, N3, G].map(async (c) => [c.navn, await tool("tannlege_info", { org_nr: c.org_nr })]))),
+      info: Object.fromEntries(await Promise.all(allClinics.map(async (c) => [c.navn, await tool("tannlege_info", { org_nr: c.org_nr })]))),
     });
     const mcpCheck = (m: { search: any[]; info: Record<string, any> }, tag: string) => {
       const byName = (navn: string) => m.search.find((k) => k.navn === navn) ?? {};
@@ -333,7 +433,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         eq([m.info[c.navn].adresse, m.info[c.navn].postnummer], [null, "0150"], `M2${tag} tannlege_info ${c.navn}: address null, postnummer stays`);
       }
       eq(byName(E1.navn).telefon, E1.telefon, `M3${tag} tannlege_search E1: its phone stays`);
-      for (const c of [N1, N2, N3]) {
+      for (const c of storedClinics) {
         eq([byName(c.navn).adresse, m.info[c.navn].adresse], [c.adresse, c.adresse], `M4${tag} ${c.navn}: the stored address in both tools`);
       }
       eq(leaked(JSON.stringify(m)), [], `M5${tag}: no word of a private address in any MCP answer`);
@@ -346,7 +446,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       const info = (orgNr: string) =>
         (a2a.handleDentalMessageSend({ message: { text: `info om ${orgNr}` } }, "privat") as any).result.artifacts[0].parts[0].data;
       const list = (a2a.handleDentalMessageSend({ message: { data: { fylke: "Oslo" } } }, "privat") as any).result.artifacts[1].parts[0].data.clinics as any[];
-      return { info: Object.fromEntries([E1, E2, E3, N1, N2, N3, G].map((c) => [c.navn, info(c.org_nr)])), list };
+      return { info: Object.fromEntries(allClinics.map((c) => [c.navn, info(c.org_nr)])), list };
     };
     const a2aCheck = (a: { info: Record<string, any>; list: any[] }, tag: string) => {
       for (const c of hiddenClinics) {
@@ -355,7 +455,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         eq([a.info[c.navn].postnummer, a.info[c.navn].poststed], ["0150", "OSLO"], `A2${tag} ${c.navn}: postnummer and place stay`);
       }
       eq(["field_provenance" in a.info[E1.navn], a.info[E1.navn].telefon], [false, E1.telefon], `A3${tag} E1: no field_provenance, its phone stays`);
-      for (const c of [N1, N2, N3]) {
+      for (const c of storedClinics) {
         eq([a.info[c.navn].adresse, a.list.find((x) => x.navn === c.navn)?.adresse], [c.adresse, c.adresse], `A4${tag} ${c.navn}: the stored address`);
       }
       eq(leaked(JSON.stringify(a)), [], `A5${tag}: no word of a private address in any A2A answer`);
@@ -370,11 +470,11 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
     });
     const restCheck = (r: { list: any[]; one: Record<string, any>; byOrgnr: any }, tag: string) => {
       for (const [label, list] of [["/agents", r.list], ["/agents/:id", Object.values(r.one)]] as const) {
-        for (const [c, id] of [[E1, idE1], [E2, idE2], [E3, idE3], [G, idG]] as const) {
+        for (const [c, id] of [[E1, idE1], [E2, idE2], [E3, idE3], [E4, idE4], [E5, idE5], [G, idG]] as const) {
           const x = list.find((y: any) => y.id === id);
           eq([x.adresse, x.postnummer, x.poststed, x.organisasjonsform], [null, "0150", "OSLO", c.organisasjonsform], `R1${tag} ${label} ${c.navn}: address null, the rest as stored`);
         }
-        for (const [c, id] of [[N1, idN1], [N2, idN2], [N3, idN3]] as const) {
+        for (const [c, id] of [[N1, idN1], [N2, idN2], [N3, idN3], [C1, idC1]] as const) {
           eq(list.find((y: any) => y.id === id).adresse, c.adresse, `R2${tag} ${label} ${c.navn}: the stored address`);
         }
         eq(leaked(JSON.stringify(list)), [], `R3${tag} ${label}: no word of a private address in the answer (field_provenance included)`);
@@ -419,7 +519,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
 
     // ── S: sitemap ────────────────────────────────────────────────────────
     const sitemapOrgnrs = () => store.getDentalAgentsForSitemap().map((r) => r.org_nr).sort();
-    const allButE2 = [E1, E3, N1, N2, N3, G].map((c) => c.org_nr).sort();
+    const allButE2 = [E1, E3, E4, E5, N1, N2, N3, C1, G].map((c) => c.org_nr).sort();
     eq(sitemapOrgnrs(), allButE2, "S1: E2 (thin on the values it shows, noindex) is left out of the sitemap; the others stay");
     seo.__resetDentalSitemapCacheForTesting();
     {
@@ -453,7 +553,11 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       "/agents/<org.nr> E1": `/api/tannlege/agents/${E1.org_nr}`,
       "/agents?fylke=Oslo": "/api/tannlege/agents?fylke=Oslo",
     };
-    const withoutPrivate = { "/agents/:id N2": `/api/tannlege/agents/${idN2}`, "/agents?fylke=Viken (no clinic)": "/api/tannlege/agents?fylke=Viken" };
+    const withoutPrivate = {
+      "/agents/:id N2": `/api/tannlege/agents/${idN2}`,
+      "/agents/:id C1 (ENK, «c/o» a clinic)": `/api/tannlege/agents/${idC1}`,
+      "/agents?fylke=Viken (no clinic)": "/api/tannlege/agents?fylke=Viken",
+    };
     for (const [label, h] of Object.entries(await restHeaders({ ...withPrivate, ...withoutPrivate }))) {
       eq(h, privateHeaders, `R9 ${label}: Places rule on -> Cache-Control: private, Vary: Origin, X-Admin-Key (as A4-S)`);
     }
@@ -467,7 +571,9 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         ok(!("streetAddress" in (dentist(h).address ?? {})) && ownPart(h).includes('<div class="info-label">Postnummer og sted</div>'),
           `K2 ${c.navn}: ... no streetAddress, «Postnummer og sted» stays`);
       }
-      ok((await page(N2)).includes(`<div class="info-value">${N2.adresse}, 0150 OSLO</div>`), "K3 N2: switch off -> the stored address as before");
+      for (const c of [N2, C1]) {
+        ok((await page(c)).includes(`<div class="info-value">${c.adresse}, 0150 OSLO</div>`), `K3 ${c.navn}: switch off -> the stored address as before`);
+      }
       mcpCheck(await mcpSurfaces(), " (switch off)");
       a2aCheck(a2aSurfaces(), " (switch off)");
       const offPublic = await restSurfaces();
@@ -477,11 +583,11 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       eq(offPublic.one[idG].field_provenance, { phone: [src("brreg", G.telefon)] }, "K4b: ... G too (its Places address entry goes)");
       // Compared without printing the rows (their ids differ per run).
       const same = (x: unknown, y: unknown) => JSON.stringify(x) === JSON.stringify(y);
-      for (const [label, id] of [["N1", idN1], ["N2", idN2], ["N3", idN3]] as const) {
+      for (const [label, id] of [["N1", idN1], ["N2", idN2], ["N3", idN3], ["C1", idC1]] as const) {
         ok(same(offPublic.one[id], offAdmin.one[id]), `K5 ${label}: switch off -> the public answer is the stored one (as on main)`);
       }
-      const others = (list: any[]) => list.filter((x) => ![idE1, idE2, idE3, idG].includes(x.id));
-      ok(others(offPublic.list).length === 3 && same(others(offPublic.list), others(offAdmin.list)), "K5b: switch off -> /agents: every other clinic as stored");
+      const others = (list: any[]) => list.filter((x) => ![idE1, idE2, idE3, idE4, idE5, idG].includes(x.id));
+      ok(others(offPublic.list).length === 4 && same(others(offPublic.list), others(offAdmin.list)), "K5b: switch off -> /agents: every other clinic as stored");
       eq(sitemapOrgnrs(), allButE2, "K6: switch off -> E2 is still out of the sitemap");
       // The answer depends on X-Admin-Key only where it shows such a clinic.
       for (const [label, h] of Object.entries(await restHeaders(withPrivate))) {
