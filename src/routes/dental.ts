@@ -41,7 +41,7 @@ import {
   DENTAL_AGENT_WRITABLE_FIELDS,
   type DentalAgentRow,
 } from "../services/dental-store";
-import { shownDentalAgent } from "../services/dental-places-display";
+import { shownDentalAgent, shownDentalFieldProvenance } from "../services/dental-places-display";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -120,6 +120,14 @@ function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
   if (!publicView) return row;
   const { field_provenance: _provenance, ...shown } = row;
   return shown;
+}
+
+// The field_provenance the provenance summary on /agents/:id is built from:
+// in a public answer without the entries of the fields the rule hides, so the
+// summary names only the sources behind the values the answer shows (never
+// google_places for a hidden one). Admin view and rule off: as stored.
+function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
+  return !adminView && placesDisplayPolicyEnabled() ? shownDentalFieldProvenance(agent) : agent.field_provenance;
 }
 
 // Whether a REST caller gets the admin view. While the rule is on, the two
@@ -250,12 +258,13 @@ router.get("/agents/:id", (req: Request, res: Response) => {
   const verifiedRow = getDb("dental")
     .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
     .get(agent.id) as { last_verified_at: string | null } | undefined;
+  const adminView = restAdminView(req, res);
   const provenance = buildProvenanceSummary(
-    (agent.field_provenance as Record<string, unknown> | null) ?? null,
+    (restSummaryProvenance(agent, adminView) as Record<string, unknown> | null) ?? null,
     verifiedRow?.last_verified_at ?? null
   );
 
-  const shown = restDentalAgent(agent, restAdminView(req, res));
+  const shown = restDentalAgent(agent, adminView);
   res.json({
     agent: {
       ...shown,

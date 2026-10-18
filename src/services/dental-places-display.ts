@@ -11,9 +11,10 @@
 // as Places evidence too, unless another source has it. Every public surface
 // shows the clinic through shownDentalAgent(): the profile page and its
 // JSON-LD, the web cards, the MCP and A2A cards (dental-clinic-card.ts), the
-// public REST answers and the sitemap's thin-profile check. The stored row is
-// never changed; admin, enrichment and verifier code keep reading it as
-// stored.
+// public REST answers and the sitemap's thin-profile check; the provenance
+// summary on GET /agents/:id reads shownDentalFieldProvenance(). The stored
+// row is never changed; admin, enrichment and verifier code keep reading it
+// as stored.
 //
 // Provenance keys: the batch writes address, phone, website and
 // opening_hours; other writers (and older rows) use the column names adresse,
@@ -88,16 +89,40 @@ export function dentalPlacesVerdicts(
   return verdicts;
 }
 
+/** The columns (with their provenance keys) the rule hides on this clinic. */
+function hiddenColumns(agent: DentalPlacesRow, enabled: boolean): typeof DENTAL_PLACES_COLUMNS {
+  const verdicts = dentalPlacesVerdicts(agent, enabled);
+  return DENTAL_PLACES_COLUMNS.filter(({ column }) => verdicts[column] !== "shown");
+}
+
 /**
  * The clinic as the public surfaces show it: each column the rule hides is
  * null, everything else (field_provenance included, for the callers' own
  * checks) as stored. The same object when nothing is hidden.
  */
 export function shownDentalAgent<T extends DentalPlacesRow>(agent: T, enabled: boolean = placesDisplayPolicyEnabled()): T {
-  const verdicts = dentalPlacesVerdicts(agent, enabled);
-  const hidden = DENTAL_PLACES_COLUMNS.filter(({ column }) => verdicts[column] !== "shown");
+  const hidden = hiddenColumns(agent, enabled);
   if (hidden.length === 0) return agent;
   const shown: T = { ...agent };
   for (const { column } of hidden) (shown as DentalPlacesRow)[column] = null;
   return shown;
+}
+
+/**
+ * field_provenance less the entries (under either key) of each column the rule
+ * hides, for the public provenance summary on GET /api/tannlege/agents/:id
+ * (routes/dental.ts): built from this, the summary names only the sources
+ * behind values the answer shows, so never google_places for a hidden one. As
+ * stored when nothing is hidden, or when it is not an object (the summary
+ * reads nothing else).
+ */
+export function shownDentalFieldProvenance(
+  agent: DentalPlacesRow,
+  enabled: boolean = placesDisplayPolicyEnabled()
+): DentalPlacesRow["field_provenance"] {
+  const prov = agent.field_provenance;
+  if (!prov || typeof prov !== "object" || Array.isArray(prov)) return prov;
+  const hiddenKeys = new Set(hiddenColumns(agent, enabled).flatMap(({ provenanceKeys }) => provenanceKeys));
+  if (hiddenKeys.size === 0) return prov;
+  return Object.fromEntries(Object.entries(prov).filter(([key]) => !hiddenKeys.has(key)));
 }

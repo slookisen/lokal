@@ -16,11 +16,14 @@
  *   D  Feilmerket Tann    hours from the site with a pending Stage V
  *                         correction; a Brreg-format phone Places only repeated
  *
- *   D1-D6  the dental adapter (dental-places-display.ts): verdicts, provenance
- *          key aliases, the pending map, same object / no mutation.
+ *   D1-D7  the dental adapter (dental-places-display.ts): verdicts, provenance
+ *          key aliases, the pending map, same object / no mutation, the
+ *          field_provenance the public summary is built from.
  *   H      the clinic page /klinikk/:slug (HTML, JSON-LD, meta description):
- *          hidden fields gone, postnummer, place, map and geo kept; A is thin
- *          (noindex + CTA).
+ *          hidden fields gone, postnummer, place, map and geo kept (a hidden
+ *          address leaves a «Postnummer og sted» line); A is thin (noindex +
+ *          CTA).
+ *   E      A without provenance: its page as with the rule off.
  *   W      the web cards on /sted, /fylke, /sok and the related list.
  *   M      MCP tannlege_search, tannlege_akutt, tannlege_info.
  *   A      A2A message/send (org.nr and search), the row's own fields too.
@@ -28,6 +31,8 @@
  *          map); with X-Admin-Key the stored values and field_provenance.
  *          Over HTTP behind the CORS layer: Cache-Control: private and Vary:
  *          Origin, X-Admin-Key on every answer (the A4-S contract).
+ *   P      the provenance summary on public /agents/:id names no source of a
+ *          hidden field; with X-Admin-Key and with the rule off as stored.
  *   S      the sitemap: A is left out (its page is noindex).
  *   B      B1: C, and every shown field, as with the rule off.
  *   K      kill switch off: every surface as on main (= the same clinic with
@@ -259,6 +264,15 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
         eq(display.dentalPlacesVerdicts({ ...row(idD), stage_v_pending_correction: pending }).opening_hours, "shown",
           `D6e: pending ${JSON.stringify(pending)} -> the hours stay`);
       }
+      // The field_provenance the public provenance summary is built from.
+      eq(display.shownDentalFieldProvenance(stored), {}, "D7: A — no entry of a hidden field is left");
+      eq(stored.field_provenance, row(idA).field_provenance, "D7a: ... and the stored value is not changed");
+      eq(Object.keys(display.shownDentalFieldProvenance(row(idB))!), ["address", "acute_vakt"], "D7b: B — its shown address and acute_vakt stay");
+      eq(Object.keys(display.shownDentalFieldProvenance(row(idD))!), ["phone"], "D7c: D — the hours marked wrong go, the shown phone stays");
+      ok(display.shownDentalFieldProvenance(storedC) === storedC.field_provenance, "D7d: nothing hidden -> the stored value itself");
+      eq(display.shownDentalFieldProvenance(aliased), {}, "D7e: the column-named keys of hidden fields go too");
+      ok(display.shownDentalFieldProvenance(stored, false) === stored.field_provenance, "D7f: rule off -> the stored value itself");
+      eq(display.shownDentalFieldProvenance({ ...stored, field_provenance: null }), null, "D7g: no provenance -> null");
     }
 
     // ── H: the clinic page ────────────────────────────────────────────────
@@ -293,6 +307,37 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
       ok(ownPart(htmlC).includes(`tel:${C.telefon}`) && htmlC.includes("<h2>Åpningstider</h2>") && htmlC.includes(">Hjemmeside<"), "H14 C: ... and on the page");
       ok(!htmlD.includes("<h2>Åpningstider</h2>") && !("openingHoursSpecification" in dentist(htmlD)) && !/Åpent \d+ dag/.test(htmlD), "H15 D: hours marked wrong are not shown");
       ok(htmlD.includes("tel:22110044") && htmlD.includes("Pilestredet 4"), "H16 D: its Brreg-format phone and its address are shown");
+      // Postnummer stays (Daniel 17:01Z): the Adresse line carried it, so a
+      // hidden address leaves postnummer and place on a line of their own.
+      ok(ownPart(htmlA).includes('<div class="info-label">Postnummer og sted</div><div class="info-value">0150 OSLO</div>'),
+        "H17 A: the address hidden -> «Postnummer og sted: 0150 OSLO» in Nøkkelinformasjon");
+      ok(htmlB.includes('<div class="info-label">Adresse</div><div class="info-value">Kirkegata 2, 0150 OSLO</div>') &&
+        [htmlB, htmlC, htmlD].every((html) => !html.includes("Postnummer og sted")),
+        "H18 B, C, D: the address shown -> postnummer and place on the Adresse line as before, no extra line");
+    }
+
+    // ── E: no provenance — the page as with the rule off ──────────────────
+    {
+      const storedProv = (db.prepare("SELECT field_provenance FROM dental_agents WHERE id = ?").get(idA) as any).field_provenance;
+      db.prepare("UPDATE dental_agents SET field_provenance = NULL WHERE id = ?").run(idA);
+      try {
+        const on = await page(A);
+        policy.__setPlacesDisplayPolicyForTesting(false);
+        const off = await page(A);
+        // Up to its «Flere tannleger i Oslo» list, which shows B, C and D.
+        eq(maskClock(ownPart(on)), maskClock(ownPart(off)), "E1: A without provenance -> its page is byte for byte the page with the rule off");
+        ok(on.includes(">Storgata 1, 0150 Oslo, Norge, 0150 OSLO<") && !on.includes("Postnummer og sted"), "E2: ... its Adresse line, no «Postnummer og sted»");
+        // No address stored at all: no Adresse line on main, and no new line either.
+        db.prepare("UPDATE dental_agents SET adresse = NULL WHERE id = ?").run(idA);
+        const noAddressOff = await page(A);
+        policy.__setPlacesDisplayPolicyForTesting(null);
+        const noAddressOn = await page(A);
+        eq(maskClock(ownPart(noAddressOn)), maskClock(ownPart(noAddressOff)), "E3: A without an address -> its page as with the rule off");
+        ok(!noAddressOn.includes(">Adresse<") && !noAddressOn.includes("Postnummer og sted"), "E4: ... neither an Adresse line nor «Postnummer og sted»");
+      } finally {
+        policy.__setPlacesDisplayPolicyForTesting(null);
+        db.prepare("UPDATE dental_agents SET field_provenance = ?, adresse = ? WHERE id = ?").run(storedProv, A.adresse, idA);
+      }
     }
 
     // ── W: web cards ──────────────────────────────────────────────────────
@@ -396,6 +441,40 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
       ok("provenance" in restPublic.one[idA] === false, "R10: (no last_verified_at in the fixture, so no provenance summary either way)");
     }
 
+    // ── P: the provenance summary on /agents/:id ──────────────────────────
+    // A public answer's summary is built from the fields it shows, so it names
+    // no source (google_places included) of a field the rule hides.
+    {
+      const ids = [idA, idB, idC, idD];
+      const verified = new Map(ids.map((id) => [id, (db.prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?").get(id) as any).last_verified_at]));
+      for (const id of ids) db.prepare("UPDATE dental_agents SET last_verified_at = ? WHERE id = ?").run("2026-10-01T08:00:00.000Z", id);
+      try {
+        const summaries = async (headers?: Record<string, string>) => Object.fromEntries(await Promise.all(ids.map(async (id) => {
+          const agent = (await callRoute(restRouter, `/agents/${id}`, { params: { id }, headers })).body.agent;
+          return [id, "provenance" in agent ? agent.provenance : "none"];
+        })));
+        const pub = await summaries();
+        const admin = await summaries({ "x-admin-key": adminKey });
+        policy.__setPlacesDisplayPolicyForTesting(false);
+        const off = await summaries();
+        policy.__setPlacesDisplayPolicyForTesting(null);
+        const sources = (summary: any) => (summary === "none" ? "none" : summary.sources);
+        eq(sources(admin[idA]), ["google_places"], "P1: X-Admin-Key — A's summary as stored names google_places");
+        eq(pub[idA], "none", "P2: public — A shows none of its four fields, so no summary (google_places not named)");
+        eq(sources(admin[idB]), ["google_places", "brreg", "own_homepage"], "P3: X-Admin-Key — B's summary as stored");
+        eq(sources(pub[idB]), ["brreg", "google_places", "own_homepage"],
+          "P4: public — B: the sources of its shown address (Brreg, and Places' own different record of it) and acute_vakt only");
+        eq(sources(admin[idD]), ["google_places", "own_homepage"], "P5: X-Admin-Key — D's summary as stored");
+        eq(sources(pub[idD]), ["google_places"], "P6: public — D: its hidden hours' own_homepage goes; its shown phone's Places record stays");
+        eq(pub[idC], admin[idC], "P7: public — C (all shown) as stored (B1)");
+        eq(pub[idC].last_verified, "2026-10-01T08:00:00.000Z", "P7b: ... with last_verified");
+        eq(off, admin, "P8: rule off -> every public summary as stored (as on main)");
+      } finally {
+        policy.__setPlacesDisplayPolicyForTesting(null);
+        for (const id of ids) db.prepare("UPDATE dental_agents SET last_verified_at = ? WHERE id = ?").run(verified.get(id), id);
+      }
+    }
+
     // The same two routes over HTTP, behind the CORS layer as in index.ts.
     const express = require("express") as typeof import("express");
     const cors = require("cors") as typeof import("cors");
@@ -469,6 +548,8 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
       eq(offSitemap, [A.org_nr, B.org_nr, C.org_nr, D.org_nr], "K1: off -> A is in the sitemap again");
       ok(offXml.includes(seo.slugifyClinic(A.navn, A.org_nr)), "K1b: ... in sitemap.xml too");
       ok(!offPages.A.includes('content="noindex') && offPages.A.includes(`tel:${A.telefon}`), "K2: off -> A's page is indexable with its phone");
+      ok(offPages.A.includes(">Storgata 1, 0150 Oslo, Norge, 0150 OSLO<") && !offPages.A.includes("Postnummer og sted"),
+        "K2b: off -> A's page has its Adresse line and no «Postnummer og sted»");
       eq(offRest, offRestAdmin, "K3: off -> the public REST answers are the stored ones with field_provenance (as on main)");
       const stripPlaces = (prov: Record<string, any[]>) =>
         Object.fromEntries(Object.entries(prov).map(([k, rs]) => [k, rs.filter((r) => r.source_type !== "google_places")]));
