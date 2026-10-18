@@ -138,6 +138,23 @@ export function buildSearchResults(
   return agents.map((a) => toDentalClinicCard(a, "search"));
 }
 
+/**
+ * The whole text of a tool result when the tool fails inside. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
+ * client («Søkefeil: …», «Feil: …»), SQLite's for one. The wording is Rett
+ * fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts).
+ */
+export const DENTAL_MCP_INTERNAL_ERROR_TEXT =
+  "Beklager, det oppstod en intern feil hos Finn-tannlege, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
+  "Sorry, an internal error at Finn-tannlege stopped this request. Please try again later.";
+
+/** A failed tool's isError result with DENTAL_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
+function toolInternalError(tool: string, err: unknown) {
+  console.error(`[dental-mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
+  return { content: [{ type: "text" as const, text: DENTAL_MCP_INTERNAL_ERROR_TEXT }], isError: true };
+}
+
 // ─── Tool registrations ──────────────────────────────────────
 
 export function registerDentalTools(server: McpServer): void {
@@ -220,10 +237,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Søkefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_search", err);
       }
     }
   );
@@ -281,10 +295,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_info", err);
       }
     }
   );
@@ -328,10 +339,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(explanation, null, 2) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Statistikkfeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_stats", err);
       }
     }
   );
@@ -388,10 +396,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_akutt", err);
       }
     }
   );
@@ -426,10 +431,7 @@ export function registerDentalTools(server: McpServer): void {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("tannlege_kjeder", err);
       }
     }
   );

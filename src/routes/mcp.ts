@@ -30,7 +30,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
-import { capFreeText, capName } from "../utils/free-text";
+import { capFreeText, capName, capNameList } from "../utils/free-text";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -1016,7 +1016,18 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    guardToolHandler("lokal_discover", async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+    guardToolHandler("lokal_discover", async ({ categories: categoriesAsSent, tags: tagsAsSent, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+      // rfb-discover-lister-uten-tak): discover() compares every category and
+      // tag with every producer's, and the schema has no max (it is frozen
+      // while OpenAI reviews the app). 175 000 categories took 45 s on
+      // live-like data, one category of 1 MB 6.1 s. The lists are cut to
+      // their first MAX_NAME_LIST_ITEMS names of at most MAX_NAME_CHARS
+      // (utils/free-text.ts), as A2A's are, before the search, the traffic
+      // class and the delivery log read them. Lists within the caps are the
+      // same lists, so a real call answers as before.
+      const categories = capNameList(categoriesAsSent);
+      const tags = capNameList(tagsAsSent);
       // ChatGPT app re-review 2026-10-03: lat/lng/maxDistanceKm used to be
       // passed top-level, but discover() reads `location: {lat, lng}` — so the
       // distance filter never ran and every call returned a nationwide list

@@ -624,6 +624,24 @@ function registerWidgetResource(
   );
 }
 
+/**
+ * The whole text of a tool result when the tool fails inside. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
+ * client («Sokefeil: …», «Feil: …», «Bookingfeil: …»), SQLite's for one. The
+ * wording is Rett fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts). A
+ * database that is not open still answers that no data is available.
+ */
+export const EXPERIENCES_MCP_INTERNAL_ERROR_TEXT =
+  "Beklager, det oppstod en intern feil hos Opplevagent, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
+  "Sorry, an internal error at Opplevagent stopped this request. Please try again later.";
+
+/** A failed tool's isError result with EXPERIENCES_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
+function toolInternalError(tool: string, err: unknown) {
+  console.error(`[experiences-mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
+  return { content: [{ type: "text" as const, text: EXPERIENCES_MCP_INTERNAL_ERROR_TEXT }], isError: true };
+}
+
 export function registerExperienceTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -950,10 +968,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_experiences", err);
       }
     }
   );
@@ -1011,10 +1026,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen kategorier tilgjengelig for oyeblikket. / No category data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("list_experience_categories", err);
       }
     }
   );
@@ -1150,10 +1162,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("get_experience", err);
       }
     }
   );
@@ -1296,10 +1305,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_gardssalg", err);
       }
     }
   );
@@ -1604,10 +1610,7 @@ export function registerExperienceTools(
           }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Bookingfeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("book_gardssalg", err);
       }
     }
   );
