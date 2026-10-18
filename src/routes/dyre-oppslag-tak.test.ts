@@ -23,8 +23,8 @@
  *   O   MCP lokal_find_offers: of 25 items, or a 1 MB list, the first
  *       MAX_OFFER_ITEMS are looked up (one catalog query each, a spy on
  *       better-sqlite3); the JSON part is the answer for those items, and a
- *       second part says how many were left out. A list within the cap has
- *       no second part.
+ *       second part says how many were left out and names the first five of
+ *       them, each cut as a name. A list within the cap has no second part.
  *   G   the geocoder: extractAndGeocode() looks up the runs of the first
  *       MAX_GEOCODE_WORDS words only, so a 2000 character search of short
  *       unknown words makes at most 114 outbound requests (a fetch stub
@@ -33,7 +33,8 @@
  *       MAX_NAME_CHARS; geoCache keeps at most its 500 entries and evicts
  *       the least recently used, so a place in use survives a flood of
  *       misses.
- *   P   the place fields: `near` (lokal_find_offers), `place` (lokal_geocode,
+ *   P   the place fields: `near` (lokal_find_offers, GET
+ *       /api/marketplace/catalog/offers), `place` (lokal_geocode,
  *       GET /api/marketplace/geocode), `region` (lokal_bm_next_markets),
  *       `city` (find-match), `fylke` and `kommune` (discover_experiences,
  *       discover_gardssalg, Opplevagent A2A data), `sted` (Opplevagent GET
@@ -42,7 +43,9 @@
  *       characters, no more of it reaches SQLite, the geocoder or the answer,
  *       and within the cap the field changes the answer (control).
  *   S   the other strings of A2A data: RFB `query`, `categories` and `tags`
- *       (one long name, or 175 000 entries), a `message.data` that is a
+ *       (one long name, or 175 000 entries), in a DataPart and in the params
+ *       themselves (RFB's mode 3: a message with neither text nor data reads
+ *       the whole params as the query), a `message.data` that is a
  *       string, Finn-tannlege `specialty`, Opplevagent `category`, `season`
  *       and `language`: at most MAX_FREE_TEXT_CHARS of a string, and
  *       MAX_A2A_DATA_LIST_ITEMS entries of a list, each a name of at most
@@ -50,8 +53,9 @@
  *   E   Finn-tannlege A2A: a failure inside message/send (the dental DB
  *       closed) answers JSON-RPC -32603 "Internal error" without `data`; the
  *       detail is logged.
- *   B1  real names, shopping lists, place values, structured messages and
- *       the geocoder's lookups for the searches of the test sets answer byte
+ *   B1  real names, shopping lists, place values, structured messages (a
+ *       DataPart, and RFB's params as the query) and the geocoder's lookups
+ *       for the searches of the test sets answer byte
  *       for byte as main did: tests/fixtures/dyre-oppslag-tak-i-y2-main.json
  *       holds the sha256 of each masked answer (stable() from I-Y), captured
  *       with b1Answers() below on main b25dfbce. B1 also runs with
@@ -182,6 +186,7 @@ function rfbHandlers(fx: Fixture) {
     findMatch: routeHandler(marketplace, "/find-match"),
     geocode: routeHandler(marketplace, "/geocode"),
     search: routeHandler(marketplace, "/search"),
+    catalogOffers: routeHandler((require("./marketplace-catalog") as typeof import("./marketplace-catalog")).catalogRouter, "/offers"),
     sok: routeHandler((require("./seo") as any).default, "/sok"),
   };
 }
@@ -236,6 +241,10 @@ const PLACE_ASKS: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>
   "rfb mcp lokal_geocode": [{ place: "Oslo" }, { place: "Røros" }, { place: "Florø" }, { place: "Setesdal" }, { place: "Mo i Rana" }, { place: "zzzqqx" }],
   "rfb GET /api/marketplace/geocode": [{ place: "Oslo" }, { place: "Bergen" }, { q: "Tromsø" }, { place: "zzzqqx" }],
   "rfb mcp lokal_bm_next_markets": [{}, { region: "Oslo" }, { region: "Bergen" }, { lokallag_slug: "bondens-marked-agder" }],
+  "rfb GET /api/marketplace/catalog/offers": [
+    { q: "honning", near: "Trondheim" }, { q: "honning", near: "Tønsberg" }, { q: "egg", near: "Bærum" },
+    { q: "kransekake", near: "Oslo", radius_km: "500" }, { q: "honning", near: "zzzqqx" },
+  ],
   "oa mcp discover_experiences": [{ fylke: "Troms" }, { kommune: "Tromsø" }, { fylke: "Troms", season: "winter" }, { kommune: "Bergen" }, { fylke: "Vestland", query: "nordlys" }],
   "oa mcp discover_gardssalg": [{ fylke: "Vestland" }, { kommune: "Ullensvang" }, { fylke: "Buskerud" }, { kommune: "Lier", query: "Egge" }],
   "oa GET /sok": [{ q: "nordlys", sted: "Tromsø" }, { q: "nordlys", sted: "Bergen" }, { q: "hvalsafari", sted: "zzzqqx" }],
@@ -248,6 +257,12 @@ const DATA_ASKS: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>
   "rfb a2a data": [
     { categories: ["honey"] }, { query: "honning", categories: ["honey"] }, { tags: ["organic"], categories: ["meat"] },
     { categories: ["honey", "eggs"], location: TRONDHEIM, maxDistanceKm: 50 }, { categories: ["bakery"], limit: 5 },
+  ],
+  /** RFB's mode 3: no text and no data in the message, so the params themselves are the query. */
+  "rfb a2a params (mode 3)": [
+    { message: {}, categories: ["honey"] }, { message: {}, query: "honning", categories: ["honey"] },
+    { message: {}, tags: ["organic"], categories: ["meat"] }, { message: {}, categories: ["honey", "eggs"], location: TRONDHEIM, maxDistanceKm: 50 },
+    { message: { role: "user", parts: [] }, categories: ["bakery"], limit: 5 }, { message: {}, skills: ["delivery"] },
   ],
   "dental a2a data": [{ fylke: "Oslo" }, { specialty: "kjeveortopedi" }, { q: "Bergen" }, { fylke: "Vestland", helfo_agreement: "true" }],
   "oa a2a data": [{ fylke: "Troms" }, { kommune: "Tromsø", season: "winter" }, { category: "natur" }, { language: "en", fylke: "Troms" }],
@@ -288,6 +303,10 @@ export async function b1Answers(): Promise<B1Answers> {
         note("rfb mcp lokal_bm_next_markets", ask, stable(textOf(await h.tools.get("lokal_bm_next_markets")!(ask))));
       }
       for (const data of DATA_ASKS["rfb a2a data"]!) note("rfb a2a data", data, stable(await postA2a(h.a2a, dataMessage(data))));
+      for (const params of DATA_ASKS["rfb a2a params (mode 3)"]!) note("rfb a2a params (mode 3)", params, stable(await postA2a(h.a2a, params)));
+      for (const ask of PLACE_ASKS["rfb GET /api/marketplace/catalog/offers"]!) {
+        note("rfb GET /api/marketplace/catalog/offers", ask, stable(await getRoute(h.catalogOffers, ask as Record<string, string>, RFB_HOST)));
+      }
     } finally {
       rfb.restore();
     }
@@ -343,6 +362,9 @@ function rfbFieldProbes(h: ReturnType<typeof rfbHandlers>): Record<string, Field
       ask: async (v) => stable(await getRoute(h.geocode, { place: v }, RFB_HOST)), cap: MAX_NAME_CHARS, control: ["Oslo", "Bergen"], geocoded: true,
     },
     "P rfb mcp lokal_bm_next_markets region": { ask: tool("lokal_bm_next_markets", (v) => ({ region: v })), cap: MAX_NAME_CHARS, control: ["Oslo", "Bergen"] },
+    "P rfb GET /api/marketplace/catalog/offers near": {
+      ask: async (v) => stable(await getRoute(h.catalogOffers, { q: "honning", near: v }, RFB_HOST)), cap: MAX_NAME_CHARS, control: ["Trondheim", "Tønsberg"], geocoded: true,
+    },
     "P rfb GET /api/marketplace/find-match city": {
       ask: async (v) => stable(await getRoute(h.findMatch, { name: "Grini Hjemmebakeri Lengdetak", city: v }, RFB_HOST)),
       cap: MAX_NAME_CHARS, control: ["Bærum", "Oslo"],
@@ -358,6 +380,15 @@ function rfbFieldProbes(h: ReturnType<typeof rfbHandlers>): Record<string, Field
     },
     "S rfb a2a message.data (a string)": {
       ask: async (v) => stable(await postA2a(h.a2a, { message: { data: v } })), cap: MAX_FREE_TEXT_CHARS, control: ["honning", "egg"],
+    },
+    "S rfb a2a params.query (mode 3)": {
+      ask: async (v) => stable(await postA2a(h.a2a, { message: {}, query: v, categories: ["honey"] })), cap: MAX_FREE_TEXT_CHARS, control: ["honning", "egg"],
+    },
+    "S rfb a2a params.categories (mode 3, one string)": {
+      ask: async (v) => stable(await postA2a(h.a2a, { message: {}, categories: [v] })), cap: MAX_NAME_CHARS, control: ["honey", "eggs"],
+    },
+    "S rfb a2a params.tags (mode 3, one string)": {
+      ask: async (v) => stable(await postA2a(h.a2a, { message: {}, tags: [v] })), cap: MAX_NAME_CHARS, control: ["organic", "sesong"],
     },
   };
 }
@@ -465,8 +496,8 @@ export async function runDyreOppslagTakTests(opts: { log?: boolean } = {}): Prom
           (got?.sha256 === want.sha256 ? "" : ` (main ${want.chars} characters, now ${got?.chars})`));
       }
     }
-    assertTrue(compared >= 90 && GEOCODE_TEXTS.every((t) => JSON.stringify(t) in (main.answers["rfb geocoder lookups (extractAndGeocode)"] ?? {})),
-      `B1 the fixture holds the names, lists, place values, messages and the test sets' geocoder lookups (${compared} answers)`);
+    assertTrue(compared >= 107 && GEOCODE_TEXTS.every((t) => JSON.stringify(t) in (main.answers["rfb geocoder lookups (extractAndGeocode)"] ?? {})),
+      `B1 the fixture holds the names, lists, place values, messages (also RFB's mode 3) and the test sets' geocoder lookups (${compared} answers)`);
     const getFullYear = Date.prototype.getFullYear;
     Date.prototype.getFullYear = function (this: Date) { return getFullYear.call(this) + 1; };
     let nextYear: B1Answers;
@@ -530,17 +561,31 @@ export async function runDyreOppslagTakTests(opts: { log?: boolean } = {}): Prom
         assertEq([MAX_OFFER_ITEMS, items25.length, lookups25], [20, 25, MAX_OFFER_ITEMS], "O1 of 25 items, MAX_OFFER_ITEMS are looked up (one catalog query each)");
         assertEq(JSON.parse(textOf(r25)).map((x: any) => x.term), items25.slice(0, MAX_OFFER_ITEMS), "O1 …the first ones, in order");
         assertSameAnswer(stable(textOf(r25)), stable(textOf(r20)), "O1 …and the JSON part is the answer for those items");
-        assertEq(r25.content.length === 2 && r25.content[1], { type: "text", text: offersItemsOmittedText(25) }, "O2 a second part says how many were left out");
-        assertEq(offersItemsOmittedText(25),
-          "Bare de 20 første av 25 varene er slått opp, og 5 er utelatt. Spør etter resten i et nytt kall. / " +
-          "Only the first 20 of 25 items were looked up, and 5 were left out. Ask for the rest in another call.", "O2 …in Norwegian and English");
+        assertEq(r25.content.length === 2 && r25.content[1], { type: "text", text: offersItemsOmittedText(items25) }, "O2 a second part says how many were left out");
+        assertEq(offersItemsOmittedText(items25),
+          'Bare de 20 første av 25 varene er slått opp, og 5 er utelatt: "rømme", "fløte", "brunost", "hvetemel", "rabarbra". Spør etter dem i et nytt kall. / ' +
+          'Only the first 20 of 25 items were looked up, and 5 were left out: "rømme", "fløte", "brunost", "hvetemel", "rabarbra". Ask for them in another call.',
+          "O2 …and names them, in Norwegian and English");
+        assertEq(offersItemsOmittedText([...SHOPPING_ITEMS, "rømme"]),
+          'Bare de 20 første av 21 varene er slått opp, og 1 er utelatt: "rømme". Spør etter den i et nytt kall. / ' +
+          'Only the first 20 of 21 items were looked up, and 1 was left out: "rømme". Ask for it in another call.', "O2 …one item left out");
+        const longItem = "rømme " + FILLER.repeat(1000);
+        assertEq(offersItemsOmittedText([...items25, 'brun"ost', longItem, "egg"]),
+          'Bare de 20 første av 28 varene er slått opp, og 8 er utelatt. De første av dem er "rømme", "fløte", "brunost", "hvetemel", "rabarbra". ' +
+          'Spør etter resten i et nytt kall. / Only the first 20 of 28 items were looked up, and 8 were left out, the first of them ' +
+          '"rømme", "fløte", "brunost", "hvetemel", "rabarbra". Ask for the rest in another call.', "O2 …of more than five left out, the first five are named");
+        const odd = offersItemsOmittedText([...SHOPPING_ITEMS, 'brun"ost', longItem]);
+        assertTrue(odd.includes(`"brun\\"ost", ${JSON.stringify(capName(longItem))}.`) && capName(longItem).length <= MAX_NAME_CHARS && fillerRun(odd) <= MAX_NAME_CHARS,
+          "O2 …each named item is cut as a name (capName) and quoted as JSON");
         assertEq([r20.content.length, (await offers({ items: ["honning"], ...TRONDHEIM })).content.length], [1, 1], "O3 a list within the cap has no second part");
         const megaList = Array(175_000).fill("egg"); // its JSON is 1 MB
         let rMega: any;
         const lookupsMega = await catalogLookups(async () => { rMega = await offers({ items: megaList, near: "Trondheim" }); });
         assertTrue(JSON.stringify(megaList).length >= ONE_MB, "O4 setup: a list whose JSON is 1 MB");
-        assertEq([lookupsMega, JSON.parse(textOf(rMega)).length, rMega.content[1]?.text], [MAX_OFFER_ITEMS, MAX_OFFER_ITEMS, offersItemsOmittedText(175_000)],
+        assertEq([lookupsMega, JSON.parse(textOf(rMega)).length, rMega.content[1]?.text], [MAX_OFFER_ITEMS, MAX_OFFER_ITEMS, offersItemsOmittedText(megaList)],
           "O4 a 1 MB list makes MAX_OFFER_ITEMS catalog queries and says the rest were left out");
+        assertTrue(rMega.content[1].text.includes("og 174980 er utelatt. De første av dem er \"egg\", \"egg\", \"egg\", \"egg\", \"egg\". ") &&
+          rMega.content[1].text.length < 400, `O4 …naming five of them (${rMega.content[1].text.length} characters)`);
         const ms = await bestOf3(() => offers({ items: megaList, near: "Trondheim" }));
         assertTrue(ms <= LOOSE_LIMIT_MS, `O5 a 1 MB list answers in at most ${LOOSE_LIMIT_MS} ms (${ms.toFixed(1)} ms, best of 3)`);
       }
@@ -613,6 +658,30 @@ export async function runDyreOppslagTakTests(opts: { log?: boolean } = {}): Prom
         assertSameAnswer(stable(answer), stable(fifty), "S1 …and it answers as those");
         const ms = await bestOf3(() => postA2a(h.a2a, dataMessage({ categories: many })));
         assertTrue(ms <= LOOSE_LIMIT_MS, `S1 …in at most ${LOOSE_LIMIT_MS} ms (${ms.toFixed(1)} ms, best of 3)`);
+      }
+
+      // ── S  RFB mode 3: the params themselves are the query ─────────────
+      {
+        const many = Array(175_000).fill("honey");
+        const tags = Array(175_000).fill("organic");
+        const skills = ["delivery", "x".repeat(ONE_MB)];
+        const parsedOf = (answer: any) => answer.body?.result?.artifacts?.[0]?.parts?.[0]?.data?.parsedQuery;
+        const answer = (await postA2a(h.a2a, { message: {}, categories: many, tags, skills })) as any;
+        const fifty = (await postA2a(h.a2a, {
+          message: {}, categories: many.slice(0, MAX_A2A_DATA_LIST_ITEMS), tags: tags.slice(0, MAX_A2A_DATA_LIST_ITEMS), skills: skills.map(capName),
+        })) as any;
+        const parsed = parsedOf(answer);
+        assertEq([parsed?.categories?.length, parsed?.tags?.length, parsed?.skills?.map((x: string) => x.length), parsed?.message],
+          [MAX_A2A_DATA_LIST_ITEMS, MAX_A2A_DATA_LIST_ITEMS, [8, MAX_NAME_CHARS], {}],
+          "S2 RFB A2A mode 3 (a message with neither text nor data): of 175 000 categories and tags, MAX_A2A_DATA_LIST_ITEMS are read, each a name of at most MAX_NAME_CHARS");
+        assertTrue(!isError(stable(answer)) && (answer.body?.result?.artifacts?.[0]?.parts?.[0]?.data?.count ?? -1) >= 0, "S2 …and it is a search answer, no error");
+        assertSameAnswer(stable(answer), stable(fifty), "S2 …and it answers as those");
+        const honey = (await postA2a(h.a2a, { message: {}, categories: ["honey"] })) as any;
+        const eggs = (await postA2a(h.a2a, { message: {}, categories: ["eggs"] })) as any;
+        assertTrue(stable(honey) !== stable(eggs) && parsedOf(honey)?.categories?.[0] === "honey",
+          "S2 control: within the caps mode 3 reads the params' categories");
+        const ms = await bestOf3(() => postA2a(h.a2a, { message: {}, categories: many }));
+        assertTrue(ms <= LOOSE_LIMIT_MS, `S2 …in at most ${LOOSE_LIMIT_MS} ms (${ms.toFixed(1)} ms, best of 3; about 9 s with 20 000 categories and 1500 producers before)`);
       }
 
       await checkFieldProbes(rfbFieldProbes(h));

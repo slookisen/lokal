@@ -42889,8 +42889,9 @@ runSerial(async () => {
 // rfb-geokoding-ordkombinasjoner-uten-tak and the P3 caps): find-match reads
 // MAX_NAME_CHARS of a name, lokal_find_offers looks up MAX_OFFER_ITEMS items
 // and says the rest were left out, extractAndGeocode reads MAX_GEOCODE_WORDS
-// words, geoCache is a bounded LRU, the place fields and A2A data strings are
-// cut, and Finn-tannlege A2A answers an internal failure without its detail.
+// words, geoCache is a bounded LRU, the place fields and A2A data strings
+// (also RFB's params read as the query) are cut, and Finn-tannlege A2A
+// answers an internal failure without its detail.
 // Real names, lists, places and messages answer as main did
 // (tests/fixtures/dyre-oppslag-tak-i-y2-main.json). I-Y's fixtures (restored
 // in finally), runSerial.

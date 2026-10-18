@@ -298,6 +298,54 @@
         "chars": 1964
       }
     },
+    "rfb a2a params (mode 3)": {
+      "{\"message\":{},\"categories\":[\"honey\"]}": {
+        "sha256": "b56fd44b634247bdcbd8e105af0e3d22d285f6a475e9816769a46a79f538e02d",
+        "chars": 1393
+      },
+      "{\"message\":{},\"query\":\"honning\",\"categories\":[\"honey\"]}": {
+        "sha256": "656a84a0d93bcae2088d0ca62ea7dcf45a1a110f665a0cedcc077c9db687a48e",
+        "chars": 1411
+      },
+      "{\"message\":{},\"tags\":[\"organic\"],\"categories\":[\"meat\"]}": {
+        "sha256": "a231d46764df0cd412e021a108f97aa30b4f9a3e89f987d8e9bcc58c057ca253",
+        "chars": 1788
+      },
+      "{\"message\":{},\"categories\":[\"honey\",\"eggs\"],\"location\":{\"lat\":63.4305,\"lng\":10.3951},\"maxDistanceKm\":50}": {
+        "sha256": "f6222a848aa5a6fc03305c5e7ddc0c24d886abaf0a79cc5549586cf565286c48",
+        "chars": 990
+      },
+      "{\"message\":{\"role\":\"user\",\"parts\":[]},\"categories\":[\"bakery\"],\"limit\":5}": {
+        "sha256": "ddf0ad63e541aba13e7139fa076bca017e35aabab261ece7a95eba1a54ad6cb5",
+        "chars": 2001
+      },
+      "{\"message\":{},\"skills\":[\"delivery\"]}": {
+        "sha256": "04c035506033e9db79bd1f206a19e21115a70ce1fab1bd6fb5c0f052427654ca",
+        "chars": 328
+      }
+    },
+    "rfb GET /api/marketplace/catalog/offers": {
+      "{\"q\":\"honning\",\"near\":\"Trondheim\"}": {
+        "sha256": "76bd1fac267188af102919bddae4333009665d4e672c1a3161467940e159767c",
+        "chars": 515
+      },
+      "{\"q\":\"honning\",\"near\":\"Tønsberg\"}": {
+        "sha256": "d79f4b3144b4ad34f73062652805244fad300d48b9026043e047f608f1e7725c",
+        "chars": 504
+      },
+      "{\"q\":\"egg\",\"near\":\"Bærum\"}": {
+        "sha256": "530178a232f686997f8c83ca96c79d5ae897058d2e6168b99525a98daf79bdb9",
+        "chars": 486
+      },
+      "{\"q\":\"kransekake\",\"near\":\"Oslo\",\"radius_km\":\"500\"}": {
+        "sha256": "d94002df4d1411f4027d739787f5d009db31b25b271397b2b6c6bbac14a3df12",
+        "chars": 1016
+      },
+      "{\"q\":\"honning\",\"near\":\"zzzqqx\"}": {
+        "sha256": "e694709a0a35e869567019046c0599df9c27f9334cd127f1a14685cd6daf7273",
+        "chars": 52
+      }
+    },
     "oa mcp discover_experiences": {
       "{\"fylke\":\"Troms\"}": {
         "sha256": "8ce21c889175dde695c27abc5be405ba2f83550d3c2a679f49f18fb60d3f8ca0",

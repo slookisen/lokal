@@ -414,11 +414,28 @@ export function cartResultText(tool: string, result: { success: boolean; status?
  */
 export const MAX_OFFER_ITEMS = 20;
 
-/** The note of a lokal_find_offers answer that left items out (NO / EN): `asked` items, MAX_OFFER_ITEMS looked up. */
-export function offersItemsOmittedText(asked: number): string {
+/** How many of the items left out the note names (offersItemsOmittedText). */
+const OMITTED_OFFER_ITEMS_NAMED = 5;
+
+/**
+ * The note of a lokal_find_offers answer that left items out (NO / EN): the
+ * first MAX_OFFER_ITEMS of `items` were looked up. It names the first
+ * OMITTED_OFFER_ITEMS_NAMED items left out, each cut as a name (capName), so
+ * the client can ask for exactly those.
+ */
+export function offersItemsOmittedText(items: readonly string[]): string {
+  const asked = items.length;
   const left = asked - MAX_OFFER_ITEMS;
-  return `Bare de ${MAX_OFFER_ITEMS} første av ${asked} varene er slått opp, og ${left} er utelatt. Spør etter resten i et nytt kall. / ` +
-    `Only the first ${MAX_OFFER_ITEMS} of ${asked} items were looked up, and ${left} were left out. Ask for the rest in another call.`;
+  const named = items.slice(MAX_OFFER_ITEMS, MAX_OFFER_ITEMS + OMITTED_OFFER_ITEMS_NAMED)
+    .map((item) => JSON.stringify(capName(item))).join(", ");
+  const no = `Bare de ${MAX_OFFER_ITEMS} første av ${asked} varene er slått opp, og ${left} er utelatt`;
+  const en = `Only the first ${MAX_OFFER_ITEMS} of ${asked} items were looked up, and ${left} ${left === 1 ? "was" : "were"} left out`;
+  if (left <= OMITTED_OFFER_ITEMS_NAMED) {
+    return `${no}: ${named}. Spør etter ${left === 1 ? "den" : "dem"} i et nytt kall. / ` +
+      `${en}: ${named}. Ask for ${left === 1 ? "it" : "them"} in another call.`;
+  }
+  return `${no}. De første av dem er ${named}. Spør etter resten i et nytt kall. / ` +
+    `${en}, the first of them ${named}. Ask for the rest in another call.`;
 }
 
 // ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
@@ -1590,7 +1607,7 @@ export function registerTools(
         results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
       const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
       // I-Y2: the JSON stays the list of results; the note is its own part.
-      if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items.length) });
+      if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
       return { content };
     })
   );
