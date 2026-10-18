@@ -442,7 +442,8 @@ export interface DentalSearchPlan {
  *   query never finds fewer clinics than before, and a clinic named in the
  *   text («Bergen Tannhelse») still comes first. The old reading is the
  *   whole text as `q` (MCP, /sok), or `legacy(text)` (A2A: its keyword
- *   parser, kept in full, so «Tromsø» still finds what fylke Troms found).
+ *   parser, kept in full; since D3c2 it reads a fylke only from whole
+ *   words, so «Tromsø» is its q «tromsø», no longer fylke Troms).
  * - An old reading with no filter at all (A2A «tannlege i Ås»: words of two
  *   letters were dropped, and it listed the first clinics, which is no
  *   answer) is replaced by the parsed one, and used only when the parsed
