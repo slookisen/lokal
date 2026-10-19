@@ -2,9 +2,10 @@
 // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S1.
 //
 // Every surface that says where the clinic data comes from reads this list:
-// the footer's «Datakilder» column, /om, /hvordan-det-fungerer, /proveniens
-// and llms.txt (routes/dental-seo.ts), and the OpenAPI description and
-// licence (services/dental-openapi.ts). The pages read it on each request,
+// the footer's «Datakilder» column, /om, /hvordan-det-fungerer, the field
+// table on /proveniens («Metode og kilder», F2-S2) and llms.txt
+// (routes/dental-seo.ts), and the OpenAPI description and licence
+// (services/dental-openapi.ts). The pages read it on each request,
 // so a new integration (HPR, NTF, an official Helfo list) is one entry here,
 // added in the same change that ships the code that uses it. A source the
 // code does not use is never listed: HPR, NTF and Helsedirektoratet are not
@@ -29,11 +30,25 @@ export interface DentalDataSource {
    */
   name_nb: string;
   name_en: string;
+  /**
+   * The list label, when the name alone does not tell the entry apart from
+   * another one with the same name (Kartverket's two datasets). Lists and the
+   * field table show it; running text and the footer keep the name.
+   */
+  label_nb?: string;
+  label_en?: string;
   /** What the source gives a clinic profile, in display words. */
   fields: readonly { nb: string; en: string }[];
   /** How the values are obtained, as the code named above the entry does it. */
   method_nb: string;
   method_en: string;
+  /**
+   * Which date is stored for a value from this source, as the code writing it
+   * stores it (the «Dato» column of the field table on /proveniens). No
+   * promise of how often anything is fetched.
+   */
+  date_nb: string;
+  date_en: string;
   /** Where to read about the source; null when it has no single address (each clinic's own site). */
   url: string | null;
   license?: DentalDataSourceLicense;
@@ -49,7 +64,15 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
   // and NACE check (dental-verifier.ts). Licence read on data.brreg.no's
   // Enhetsregisteret API documentation and brreg.no/produkter-og-tjenester/
   // apne-data on 2026-10-19: NLOD, not CC0. The credit line is NLOD 2.0 §5's
-  // default; Brreg gives no wording of its own.
+  // default; Brreg gives no wording of its own. Dates: the Phase-A import
+  // stored none; the address sweep and the website candidate write a
+  // field_provenance record with fetched_at; the verifier stamps
+  // brreg_checked_at on each lookup (applyDentalVerifierResult), also when
+  // Brreg gives no definite answer (orgnr_not_found_or_unreachable: not
+  // found, no response or an error), and writes NULL only for a clinic
+  // without an org.nr. (no lookup). So the date says when we asked, not that
+  // Brreg confirmed anything (and a repeat lookup in the same process can be
+  // answered from brreg-client's verifyCache).
   {
     id: "brreg",
     name_nb: "Brønnøysundregistrene",
@@ -64,6 +87,8 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
     ],
     method_nb: "Oppslag på organisasjonsnummeret i Enhetsregisteret.",
     method_en: "A lookup by organisation number in the Central Coordinating Register for Legal Entities (Enhetsregisteret).",
+    date_nb: "Det som kom med den første importen, har ingen egen dato. En adresse eller et nettsted hentet fra registeret senere lagres med hentedato. Når kontrollen slår opp organisasjonsnummeret, lagres datoen for oppslaget, også når registeret ikke gir et sikkert svar.",
+    date_en: "What came with the first import has no date of its own. An address or website taken from the register later is stored with the date it was fetched. When the check looks up the organisation number, the date of the lookup is stored, also when the register gives no definite answer.",
     url: "https://www.brreg.no/",
     license: { name: "Norsk lisens for offentlige data (NLOD) 2.0", url: "https://data.norge.no/nlod/no/2.0" },
     attribution: "Inneholder data under Norsk lisens for offentlige data (NLOD) tilgjengeliggjort av Brønnøysundregistrene",
@@ -71,6 +96,9 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
   // The dental-agent-enrichment routine (Stage X/V) reads the site with an AI
   // model and writes through PUT /api/tannlege/agents/:id; the verifier only
   // matches the org.nr. or name and place on it (websiteOwnershipMatch).
+  // Dates: the field_provenance records the routine sends are merged per
+  // field (mergeFieldProvenance, which does not require fetched_at), and a
+  // PUT that marks the row enriched stamps last_enriched_at (updateDentalAgent).
   {
     id: "clinic_websites",
     name_nb: "klinikkenes egne nettsider (KI-assistert uttrekk)",
@@ -86,12 +114,15 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
     ],
     method_nb: "En KI-modell leser klinikkens egne nettsider og henter ut opplysningene. Helfo-avtale og akuttvakt er derfor tolket automatisk fra klinikkens egen tekst, ikke hentet fra Helfo.",
     method_en: "An AI model reads the clinic's own web pages and extracts the details. A Helfo agreement and emergency duty are therefore read automatically from the clinic's own text, not taken from Helfo.",
+    date_nb: "Når uttrekket oppgir kilden, lagres den sammen med feltet, og hentedatoen når den er oppgitt. Datoen for siste fullførte uttrekk lagres også.",
+    date_en: "When the extraction gives its source, it is stored with the field, and the date it was fetched when that is given. The date of the last completed extraction is stored too.",
     url: null,
   },
   // POST /api/tannlege/admin/google-places-batch (routes/dental.ts): the
   // match guard isConfidentPlaceMatch (places-match.ts) and fill-only writes
   // of hjemmeside, adresse, telefon and opening_hours. businessStatus is in
   // the field mask but nothing writes it. Display rule: dental-places-display.ts.
+  // Dates: each value it writes gets a google_places record with fetched_at.
   {
     id: "google_places",
     name_nb: "Google Places",
@@ -104,31 +135,47 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
     ],
     method_nb: "Søk på klinikkens navn og sted. Et treff brukes bare når navnet ligner og postnummer eller poststed stemmer, og det fyller bare felt som er tomme.",
     method_en: "A search on the clinic's name and place. A result is used only when the name is similar and the postcode or town matches, and it only fills fields that are empty.",
+    date_nb: "Hentedatoen lagres sammen med hvert felt det fyller.",
+    date_en: "The date it was fetched is stored with each field it fills.",
     url: "https://developers.google.com/maps/documentation/places/web-service/overview",
   },
   // dental-geocode-worker.ts: ws.geonorge.no/adresser, lat/lng with
-  // geocode_source 'kartverket'. No licence is stated: the API documentation
-  // names none (read 2026-10-19), and none is guessed here.
+  // geocode_source 'kartverket'. Licence as Kartkatalog gives it for
+  // «Adresse REST-API» (metadata 44eeffdc-6069-4000-a49b-2d6bfc59ac61, owner
+  // Kartverket, read 2026-10-19): CC BY 4.0, linked to the licence text
+  // below. The catalogue gives no credit wording, so the line names the
+  // licensor and the service. Dates: the worker writes no date of its own
+  // (only lat, lng, geocode_source and geocode_confidence).
   {
     id: "kartverket_geocoding",
     name_nb: "Kartverket",
     name_en: "Kartverket",
+    label_nb: "Kartverket (adresse-API)",
+    label_en: "Kartverket (address API)",
     fields: [{ nb: "kartplassering", en: "map position" }],
     method_nb: "Adressen slås opp i Kartverkets åpne adresse-API for å plassere klinikken på kartet.",
     method_en: "The address is looked up in Kartverket's open address API to place the clinic on the map.",
-    url: "https://ws.geonorge.no/adresser/v1/",
+    date_nb: "Ingen egen dato lagres for kartplasseringen.",
+    date_en: "No date of its own is stored for the map position.",
+    url: "https://kartkatalog.geonorge.no/metadata/44eeffdc-6069-4000-a49b-2d6bfc59ac61",
+    license: { name: "CC BY 4.0", url: "https://creativecommons.org/licenses/by/4.0/" },
+    attribution: "Inneholder data fra Kartverket (Adresse REST-API)",
   },
   // norway-postnummer.ts over src/data/postnummer-kommune-2026.json (A2A
   // dev-request 2026-10-16-tannlege-sok-naturlig-sprak, S1): the kommune
-  // search in dental-query-parser.ts. Licence and credit line as in the
-  // file's own meta block (the truth test keeps them equal).
+  // search in dental-query-parser.ts. Licence, credit line and the extract
+  // date as in the file's own meta block (the truth test keeps them equal).
   {
     id: "kartverket_postnummer",
     name_nb: "Kartverket",
     name_en: "Kartverket",
+    label_nb: "Kartverket (postnummerområder)",
+    label_en: "Kartverket (postcode areas)",
     fields: [{ nb: "kommune (ut fra postnummeret)", en: "municipality (from the postcode)" }],
     method_nb: "Kartverkets åpne datasett over postnummerområder, lagret i tjenesten, sier hvilken kommune et postnummer hører til. Det brukes når du søker på en kommune.",
     method_en: "Kartverket's open dataset of postcode areas, stored in the service, tells which municipality a postcode belongs to. It is used when you search for a municipality.",
+    date_nb: "Datasettet er et uttrekk fra 29. september 2026.",
+    date_en: "The dataset is an extract from 29 September 2026.",
     url: "https://kartkatalog.geonorge.no/metadata/462a5297-33ef-438a-82a5-07fff5799be3",
     license: { name: "CC BY 4.0", url: "https://creativecommons.org/licenses/by/4.0/deed.no" },
     attribution: "Inneholder data under norsk lisens CC BY 4.0 fra Kartverket (Postnummerområder, Posten Norge/Kartverket)",
@@ -174,10 +221,18 @@ export function dentalSourceName(source: DentalDataSource, lang: DentalSourceLan
   return lang === "en" ? source.name_en : source.name_nb;
 }
 
-/** The name as a list label: first letter capitalised (proper names are already). */
+/** First letter capitalised (proper names are already). */
+function capitalise(text: string, lang: DentalSourceLang): string {
+  return text.charAt(0).toLocaleUpperCase(lang === "en" ? "en" : "nb") + text.slice(1);
+}
+
+/**
+ * The source as a list label: its own label when it has one (Kartverket's two
+ * datasets), otherwise the name with the first letter capitalised.
+ */
 export function dentalSourceLabel(source: DentalDataSource, lang: DentalSourceLang): string {
-  const name = dentalSourceName(source, lang);
-  return name.charAt(0).toLocaleUpperCase(lang === "en" ? "en" : "nb") + name.slice(1);
+  const label = lang === "en" ? source.label_en : source.label_nb;
+  return label ?? capitalise(dentalSourceName(source, lang), lang);
 }
 
 /** The source's fields joined for running text: "navn, adresse og næringskode". */
@@ -190,6 +245,16 @@ export function dentalSourceMethod(source: DentalDataSource, lang: DentalSourceL
   return lang === "en" ? source.method_en : source.method_nb;
 }
 
+/** One of the source's fields as a table label: «Helfo-direkteoppgjør», «Om enheten er aktiv». */
+export function dentalFieldLabel(field: DentalDataSource["fields"][number], lang: DentalSourceLang): string {
+  return capitalise(lang === "en" ? field.en : field.nb, lang);
+}
+
+/** Which date is stored for the source's values, in the given language. */
+export function dentalSourceDate(source: DentalDataSource, lang: DentalSourceLang): string {
+  return lang === "en" ? source.date_en : source.date_nb;
+}
+
 /**
  * The sources by name, each name once, in list order (two Kartverket datasets
  * are one «Kartverket»). Read on each call, so a test can add an entry.
@@ -198,9 +263,12 @@ export function dentalSourceNames(lang: DentalSourceLang): string[] {
   return [...new Set(DENTAL_DATA_SOURCES.map((s) => dentalSourceName(s, lang)))];
 }
 
-/** The same, as list labels (the footer column). */
-export function dentalSourceLabels(lang: DentalSourceLang): string[] {
-  return [...new Set(DENTAL_DATA_SOURCES.map((s) => dentalSourceLabel(s, lang)))];
+/**
+ * The names with the first letter capitalised, each once, in list order: the
+ * footer column, where Kartverket's two datasets stay one «Kartverket».
+ */
+export function dentalSourceNameLabels(lang: DentalSourceLang): string[] {
+  return [...new Set(DENTAL_DATA_SOURCES.map((s) => capitalise(dentalSourceName(s, lang), lang)))];
 }
 
 /** «Brønnøysundregistrene, klinikkenes egne nettsider (KI-assistert uttrekk), Google Places og Kartverket». */
