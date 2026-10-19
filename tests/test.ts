@@ -38988,8 +38988,10 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
     assertEq(statusDp, 200, "prov-dental-01: GET /proveniens -> 200");
     assertTrue(bodyDp.includes('<link rel="canonical" href="https://finn-tannlege.com/proveniens">'),
       "prov-dental-02: canonical URL present");
-    assertTrue(bodyDp.includes("Slik verifiserer vi dataene våre"), "prov-dental-03: NO section renders the expected h1");
-    assertTrue(bodyDp.includes('id="en"') && bodyDp.includes("How we verify our data"),
+    // F2-S2 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
+    // the page is the method page «Metode og kilder», at the same URL.
+    assertTrue(bodyDp.includes("<h1>Metode og kilder</h1>"), "prov-dental-03: NO section renders the expected h1");
+    assertTrue(bodyDp.includes('<h1 id="en">Method and sources</h1>'),
       "prov-dental-04: EN section present in the same page (id=\"en\" anchor)");
     assertTrue(bodyDp.includes("Brønnøysundregistrene"), "prov-dental-05: page names Brønnøysundregistrene as a source");
     // The whole page, footer included: since F2-S1 (A2A dev-request

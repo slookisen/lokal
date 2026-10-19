@@ -578,16 +578,16 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
       for (const [label, h] of Object.entries(offHeaders)) {
         eq(h, { status: 200, vary: "Origin" }, `K7 ${label}: off -> no Cache-Control, Vary: Origin only (as on main)`);
       }
-      // Main's texts: since F2-S1 (A2A dev-request 2026-10-16-finn-tannlege-
-      // tillit-kilder-metode-ikon) the item is the source list's Google Places
-      // entry (services/dental-data-sources.ts), its fields and method, with
-      // nothing after them.
+      // Main's texts: since F2-S2 (A2A dev-request 2026-10-16-finn-tannlege-
+      // tillit-kilder-metode-ikon) the Google Places method is a cell of the
+      // field table on /proveniens, from the source list's entry
+      // (services/dental-data-sources.ts), with nothing after it.
       const sources = require("../services/dental-data-sources") as typeof import("../services/dental-data-sources");
       const gp = sources.DENTAL_DATA_SOURCES.find((s) => s.id === "google_places")!;
-      const placesItems = [...offProv.matchAll(/<li><strong>(?:<a [^>]*>)?Google Places(?:<\/a>)?<\/strong> &mdash; ([^<]*)<\/li>/g)]
+      const placesMethods = [...offProv.matchAll(/<tbody data-source="google_places">\s*<tr><th scope="row">[^<]*<\/th><td[^>]*>[\s\S]*?<\/td><td[^>]*>([^<]*)<\/td>/g)]
         .map((m) => m[1]!.replace(/&#39;/g, "'"));
-      eq(placesItems, (["nb", "en"] as const).map((l) => `${sources.dentalSourceFields(gp, l)}. ${sources.dentalSourceMethod(gp, l)}`),
-        "K8: off -> /proveniens has main's Google Places items (no + en)");
+      eq(placesMethods, (["nb", "en"] as const).map((l) => sources.dentalSourceMethod(gp, l)),
+        "K8: off -> /proveniens has main's Google Places method (no + en)");
       ok(!offProv.includes("bare Google Places oppgir") && !offProv.includes("only Google Places gives"), "K8b: ... without the A4-D sentences");
       const skillText = (card: any) => card.skills.find((s: any) => s.id === "tannlege_search").description as string;
       ok(skillText(offCard).endsWith(
@@ -606,7 +606,7 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
         "T1: /proveniens (no) says a value only Google Places gives is not shown");
       ok(prov.includes("An address, phone number, opening hours or website that only Google Places gives is not shown."),
         "T2: /proveniens (en) says the same");
-      // After the item's method sentence since F2-S1, so a space leads (was ". ").
+      // After the method sentence (F2-S1; a table cell since F2-S2), so a space leads (was ". ").
       const sentenceNo = " En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. " +
         "Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme.";
       const sentenceEn = " An address, phone number, opening hours or website that only Google Places gives is not shown. " +

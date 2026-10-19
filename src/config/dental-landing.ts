@@ -52,7 +52,9 @@ export const DENTAL_LANDING_CONFIG = {
  */
 export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   // F2-S1 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
-  // the data sources and the «Verifisert» text on these three pages.
+  // the data sources and the «Verifisert» text on these three pages; F2-S2,
+  // the same day: the method page on /proveniens, «Om plattformen» on /om and
+  // the Kartverket labels in the lists.
   "/hvordan-det-fungerer": "2026-10-19",
   "/om": "2026-10-19",
   // Same day as the page's own «Sist oppdatert» (updatedDate in the
