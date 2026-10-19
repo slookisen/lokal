@@ -212,7 +212,8 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
         address: [src("brreg", "Kirkegata 2"), gp("Kirkegata 2, 0153 Oslo, Norge")],
         website: [gp(B.hjemmeside)],
         opening_hours: [gp(JSON.stringify(ALL_WEEK))],
-        acute_vakt: [src("own_homepage", "1")],
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4c): «Akuttvakt» needs the quote from the source.
+        acute_vakt: [{ ...src("own_homepage", "1"), quote: "Akuttvakt hver kveld og i helgene." }],
       },
     });
     const C = {

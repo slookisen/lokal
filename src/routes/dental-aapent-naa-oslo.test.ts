@@ -12,7 +12,7 @@
  *      overnight entry on its own day, no hours and no entry for the day. The
  *      same answers with the process in TZ=UTC, America/New_York,
  *      Pacific/Auckland and Europe/Oslo. Without `at` it reads the clock.
- *   C  the clinic card on /sted/oslo/tannlegevakt and /sted/oslo at fixed
+ *   C  the clinic card on /sted/oslo/kjeveortopedi and /sted/oslo at fixed
  *      clocks, the process in TZ=UTC as the server: «Stengt nå» at 20:03 in
  *      Oslo for a clinic that closes at 20:00, «Åpent nå» at 09:30 for one
  *      that opens at 09:00, «Stengt nå» at 16:30 in winter time for one that
@@ -247,16 +247,18 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
       "U10: without `at` it reads the clock: closed at 20:03 and open at 09:30 in Oslo, the process in UTC"
     );
 
-    // ── fixture: four clinics in Oslo with sourced vakt (one Helfo, so the
-    //    tannlegevakt facet passes the gate: 4 clinics, 2 facts) ──
+    // ── fixture: four kjeveortopedi clinics in Oslo (one Helfo, so the
+    //    kjeveortopedi facet passes the gate: 4 clinics, 2 facts). The
+    //    tannlegevakt facet, where the live check saw the badge, is off since
+    //    F1-S4c; the facet pages share the card. ──
     let orgSeq = 928990000;
-    const PROV = '{"acute_vakt":[{"source":"https://example.test/akutt"}]}';
+    const KJEVE = '["kjeveortopedi"]';
     const mk = (navn: string, hours: Hours | null, helfo = false): string => {
       const id = store.createDentalAgent({ navn, org_nr: String(++orgSeq), poststed: "OSLO", fylke: "Oslo", adresse: "Storgata 1", telefon: "22110099" } as any);
       db.prepare(
         "UPDATE dental_agents SET catalog_class = 'klinikk', is_inactive = 0, verification_status = 'unverified', helfo_agreement = ?," +
-        " acute_vakt = 1, field_provenance = ?, opening_hours = ? WHERE id = ?"
-      ).run(helfo ? "true" : "unknown", PROV, hours === null ? null : JSON.stringify(hours), id);
+        " available_specialties = ?, opening_hours = ? WHERE id = ?"
+      ).run(helfo ? "true" : "unknown", KJEVE, hours === null ? null : JSON.stringify(hours), id);
       return id;
     };
     const KVELD = "Oslo Kveld Tann AS";
@@ -274,13 +276,13 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
       if (!r || r.status !== 200) return null;
       return Object.fromEntries([KVELD, MORGEN, LANG, UTEN].map((n) => [n, badgeOf(cardOf(r.text, n))]));
     };
-    const facetEve = badges(MON_2003_OSLO, "/sted/oslo/tannlegevakt");
-    assertTrue(facetEve !== null, "C0: /sted/oslo/tannlegevakt answers 200, synchronously");
-    assertEq(facetEve?.[KVELD], "Stengt nå", "C1: /sted/oslo/tannlegevakt at 20:03 in Oslo: «Stengt nå» for the clinic that closes at 20:00 (main: «Åpent nå»)");
-    assertEq(facetEve?.[LANG], "Åpent nå", "C2: /sted/oslo/tannlegevakt at 20:03 in Oslo: «Åpent nå» for the clinic open until 21:00");
-    const facetMorning = badges(MON_0930_OSLO, "/sted/oslo/tannlegevakt");
-    assertEq(facetMorning?.[MORGEN], "Åpent nå", "C3: /sted/oslo/tannlegevakt at 09:30 in Oslo: «Åpent nå» for the clinic that opens at 09:00 (main: «Stengt nå»)");
-    assertEq([facetMorning?.[KVELD], facetMorning?.[LANG]], ["Åpent nå", "Åpent nå"], "C4: /sted/oslo/tannlegevakt at 09:30 in Oslo: the two others open");
+    const facetEve = badges(MON_2003_OSLO, "/sted/oslo/kjeveortopedi");
+    assertTrue(facetEve !== null, "C0: /sted/oslo/kjeveortopedi answers 200, synchronously");
+    assertEq(facetEve?.[KVELD], "Stengt nå", "C1: /sted/oslo/kjeveortopedi at 20:03 in Oslo: «Stengt nå» for the clinic that closes at 20:00 (main: «Åpent nå»)");
+    assertEq(facetEve?.[LANG], "Åpent nå", "C2: /sted/oslo/kjeveortopedi at 20:03 in Oslo: «Åpent nå» for the clinic open until 21:00");
+    const facetMorning = badges(MON_0930_OSLO, "/sted/oslo/kjeveortopedi");
+    assertEq(facetMorning?.[MORGEN], "Åpent nå", "C3: /sted/oslo/kjeveortopedi at 09:30 in Oslo: «Åpent nå» for the clinic that opens at 09:00 (main: «Stengt nå»)");
+    assertEq([facetMorning?.[KVELD], facetMorning?.[LANG]], ["Åpent nå", "Åpent nå"], "C4: /sted/oslo/kjeveortopedi at 09:30 in Oslo: the two others open");
     const stedWinter = badges(WINTER_MON_1630_OSLO, "/sted/oslo");
     assertTrue(stedWinter !== null, "C0b: /sted/oslo answers 200, synchronously");
     assertEq(stedWinter?.[MORGEN], "Stengt nå", "C5: /sted/oslo in winter time at 16:30 in Oslo (15:30 UTC): «Stengt nå» for the clinic that closes at 16:00 (main: «Åpent nå»)");

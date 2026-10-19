@@ -8,6 +8,14 @@
  *       resolveAcuteClaim() is not null, over every shape of field_provenance
  *       and patient_focus (malformed JSON, top-level arrays, objects, strings,
  *       nested and non-text elements), and malformed JSON raises no error;
+ *       F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): the
+ *       vakt twin (DENTAL_ACUTE_VAKT_SQL) picks exactly the rows
+ *       resolveAcuteClaim() calls "vakt", over the same table with every
+ *       shape of `quote` (empty, blank, not a string, outside the sources,
+ *       on another field), and for a quote of each character of the BMP
+ *       (the blanks of String.prototype.trim); before and after, the akutt
+ *       filter has the same rows, and the old vakt rows without a quote are
+ *       now «Tar imot akuttpasienter»;
  *   P   parity on the named fixture (Vakt Med Kilde, Vakt Uten Kilde,
  *       akutt-fokus, …): the public list and count are the claim rows, and
  *       getDentalStats().acute_count is that count (D3a, dev-request
@@ -15,14 +23,16 @@
  *   M   MCP over a real server + client: tannlege_akutt (with and without
  *       fylke) and tannlege_search (`akutt`, a parsed «akuttvakt», akutt false)
  *       give only claim cards, every one badged, `count` the claim rows;
- *       tannlege_stats' acute_count is tannlege_akutt's count;
+ *       tannlege_stats' acute_count is tannlege_akutt's count; tannlege_akutt
+ *       has «vakt» only on the clinic with a quote, and its
+ *       rad_om_kommunal_tannlegevakt is DENTAL_EMERGENCY_NOTICE.text (F1-S4c);
  *   W   /sok?akutt=1 and a parsed /sok query, and the same number as stats;
  *   A   A2A message/send: parsed text, the old keyword reading (switch-off
  *       path) and structured message.data; «statistikk» gives the same number;
  *   R   GET /api/tannlege/agents and the admin list/count keep the raw flag,
  *       and acute_vakt 0 stays the raw column; no row is written;
  *   T   timing on a 10,000-row fixture with live-like provenance sizes, for the
- *       filter and for getDentalStats().
+ *       filter, the vakt filter and getDentalStats().
  *
  * Standalone: npx tsx src/routes/dental-acute-filter.test.ts
  * Wired into tests/test.ts via runDentalAcuteFilterTests().
@@ -49,7 +59,15 @@ function callRoute(router: any, path: string, query: Record<string, string> = {}
   });
 }
 
+// A stamp, as every live «Akuttvakt» row stored it before F1-S4c: «Tar imot
+// akuttpasienter» now. QUOTED has the quote from the page: «Akuttvakt».
 const SOURCED = { acute_vakt: [{ source_type: "homepage", value: 1 }] };
+const QUOTED = { acute_vakt: [{ source_type: "homepage", value: 1, quote: "Vi har akuttvakt alle kvelder og i helgene." }] };
+// DENTAL_ACUTE_VAKT_SQL before F1-S4c (main 46e5c664): acute_vakt = 1 with any provenance.
+const VAKT_SQL_BEFORE_S4C =
+  "(CASE WHEN acute_vakt = 1 AND json_valid(field_provenance) AND (" +
+  "json_array_length(field_provenance, '$.acute_vakt') > 0 OR json_array_length(field_provenance, '$.acute_vakt.sources') > 0" +
+  ") THEN 1 ELSE 0 END) = 1";
 
 export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -90,7 +108,9 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
     const db = dbFactory.getDb("dental");
     const store = require("../services/dental-store") as typeof import("../services/dental-store");
     (require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer")).__resetDentalSearchGazetteerForTesting();
-    const { resolveAcuteClaim, DENTAL_ACUTE_CLAIM_SQL } = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
+    const { resolveAcuteClaim, hasAcuteVaktProvenance, patientFocusMentionsAkutt, hasAcuteVaktQuote, DENTAL_ACUTE_CLAIM_SQL, DENTAL_ACUTE_VAKT_SQL } =
+      require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
+    const { DENTAL_EMERGENCY_NOTICE } = require("../config/dental-landing") as typeof import("../config/dental-landing");
 
     // ── S: the SQL twin against resolveAcuteClaim, every JSON shape ───────
     {
@@ -100,6 +120,16 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
         JSON.stringify(SOURCED), '{"acute_vakt":{}}', '{"acute_vakt":{"sources":[]}}', '{"acute_vakt":{"sources":"x"}}',
         '{"acute_vakt":{"sources":{"a":1}}}', '{"acute_vakt":{"sources":[{"source_type":"stage_v_correction"}]}}',
         '[{"acute_vakt":[1]}]', '{"acute_vakt":[[]]}',
+        // F1-S4c: the quote, in every shape.
+        JSON.stringify(QUOTED), '{"acute_vakt":{"sources":[{"source_type":"stage_v_correction","quote":"Akuttvakt i helgene"}]}}',
+        '{"acute_vakt":[{"source_type":"homepage"},{"quote":" Akuttvakt "}]}', '{"acute_vakt":[{"quote":""}]}', '{"acute_vakt":[{"quote":"   "}]}',
+        '{"acute_vakt":[{"quote":"\\n\\t\\u00a0\\u2003\\u3000\\ufeff"}]}', '{"acute_vakt":[{"quote":"\\u200b"}]}',
+        '{"acute_vakt":[{"quote":1}]}', '{"acute_vakt":[{"quote":true}]}', '{"acute_vakt":[{"quote":null}]}',
+        '{"acute_vakt":[{"quote":["Akuttvakt"]}]}', '{"acute_vakt":[{"quote":{"text":"Akuttvakt"}}]}', '{"acute_vakt":[{"Quote":"Akuttvakt"}]}',
+        '{"acute_vakt":["Akuttvakt"]}', '{"acute_vakt":[["quote","Akuttvakt"]]}', '{"acute_vakt":{"quote":"Akuttvakt"}}',
+        '{"acute_vakt":{"quote":"Akuttvakt","sources":[{"source_type":"x"}]}}', '{"acute_vakt":{"sources":[],"x":{"quote":"Akuttvakt"}}}',
+        '{"acute_vakt":{"a":{"quote":"Akuttvakt"}}}', '{"acute_vakt":{"sources":{"a":{"quote":"Akuttvakt"}}}}', '{"telefon":[{"quote":"Akuttvakt"}]}',
+        '{"acute_vakt":[{"quote":"Akuttvakt"}],"acute_vakt_note":"x"}', '{"acute_vakt":[{"quote":"Akuttvakt"}]', '[{"quote":"Akuttvakt"}]',
       ];
       const focuses: Array<string | null> = [
         null, "", "{bad", "[]", '["barn"]', '["Akutt"]', '["AKUTTPASIENTER"]', '["Tar imot akuttpasienter"]',
@@ -125,7 +155,51 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
         `S0: (the shape table has ${all.length} rows, ${jsIds.length} with a claim)`);
       eq(sorted(sqlIds), sorted(jsIds), "S2: DENTAL_ACUTE_CLAIM_SQL picks exactly the rows where resolveAcuteClaim is not null");
       eq(store.countPublicDentalAgents({ acute_vakt: 1 }), jsIds.length, "S3: the public count for acute_vakt 1 goes through the same SQL");
+
+      // F1-S4c: the vakt twin over the same table, and the same akutt rows before and after.
+      const rowOf = new Map(all.map((id) => [id, store.getDentalAgentById(id)!]));
+      let vaktSql: string[] = [];
+      let vaktThrew = "";
+      try {
+        vaktSql = (db.prepare(`SELECT id FROM dental_agents WHERE id LIKE 'par-%' AND ${DENTAL_ACUTE_VAKT_SQL}`).all() as Array<{ id: string }>).map((r) => r.id);
+      } catch (err: any) {
+        vaktThrew = String(err?.message || err);
+      }
+      eq(vaktThrew, "", "S4: DENTAL_ACUTE_VAKT_SQL raises no SQL error on malformed JSON in either column");
+      const vaktJs = all.filter((id) => resolveAcuteClaim(rowOf.get(id)!) === "vakt");
+      // The five shapes with a quote: QUOTED, the {sources} form, the second of two sources, a zero-width
+      // space (not blank to String.prototype.trim) and a sibling key beside the entry.
+      const quoteShapes = new Set(vaktJs.map((id) => JSON.stringify(rowOf.get(id)!.field_provenance)));
+      ok(vaktJs.length === 5 * focuses.length && quoteShapes.size === 5, `S4b: (the table has ${vaktJs.length} vakt rows, from ${quoteShapes.size} shapes with a quote)`);
+      eq(sorted(vaktSql), sorted(vaktJs), "S5: DENTAL_ACUTE_VAKT_SQL picks exactly the rows where resolveAcuteClaim is «vakt»");
+      const claimBefore = all.filter((id) => {
+        const a = rowOf.get(id)!;
+        return (a.acute_vakt === 1 && hasAcuteVaktProvenance(a.field_provenance)) || patientFocusMentionsAkutt(a.patient_focus);
+      });
+      eq(sorted(jsIds), sorted(claimBefore), "S6: the akutt rows (resolveAcuteClaim not null) are the same as before F1-S4c: acute_vakt 1 with provenance, or akutt in patient_focus");
+      const vaktBefore = (db.prepare(`SELECT id FROM dental_agents WHERE id LIKE 'par-%' AND ${VAKT_SQL_BEFORE_S4C}`).all() as Array<{ id: string }>).map((r) => r.id);
+      const vaktSet = new Set(vaktSql);
+      const nowAccepts = vaktBefore.filter((id) => !vaktSet.has(id));
+      ok(vaktSql.every((id) => vaktBefore.includes(id)) && nowAccepts.length > 0 && nowAccepts.every((id) => resolveAcuteClaim(rowOf.get(id)!) === "accepts"),
+        `S7: every vakt row was a vakt row before; the ${nowAccepts.length} old vakt rows without a quote are now «Tar imot akuttpasienter»`);
       db.prepare("DELETE FROM dental_agents WHERE id LIKE 'par-%'").run();
+
+      // A quote of each character of the BMP (no lone surrogates): blank exactly
+      // for the characters String.prototype.trim removes, in SQL as in JS.
+      const sqlBlankless = db.prepare(
+        "WITH RECURSIVE cp(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM cp WHERE n < 65535)," +
+        " r AS (SELECT n, 1 AS acute_vakt, json_object('acute_vakt', json_array(json_object('quote', char(n)))) AS field_provenance" +
+        " FROM cp WHERE n NOT BETWEEN 55296 AND 57343)" +
+        ` SELECT n FROM r WHERE ${DENTAL_ACUTE_VAKT_SQL}`
+      ).pluck().all() as number[];
+      const jsBlankless: number[] = [];
+      const jsBlank: number[] = [];
+      for (let n = 0; n <= 0xffff; n++) {
+        if (n >= 0xd800 && n <= 0xdfff) continue;
+        (hasAcuteVaktQuote({ acute_vakt: [{ quote: String.fromCharCode(n) }] }) ? jsBlankless : jsBlank).push(n);
+      }
+      eq(sqlBlankless.length === jsBlankless.length && sqlBlankless.every((n, i) => n === jsBlankless[i]), true,
+        `S8: a one-character quote is a vakt in SQL exactly when it is in JS, for each of the ${jsBlankless.length + jsBlank.length} BMP characters (blank in both: ${jsBlank.map((n) => n.toString(16)).join(",")})`);
     }
 
     // ── Fixture ───────────────────────────────────────────────────────────
@@ -151,9 +225,11 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
     const osloUtenKilde = add("Oslo Vakt Uten Kilde AS", "918770012", { acute_vakt: 1 }, { poststed: "OSLO", fylke: "Oslo", postnummer: "0151" });
     // D3a: one more bare flag, so the public raw-flag count (7) differs from the claim count (6).
     const vaktUtenKildeTo = add("Vakt Uten Kilde To Tannklinikk AS", "918770013", { acute_vakt: 1 });
-    const claimVestland = [vaktMedKilde, vaktKildeObjekt, vaktUtenKildeFokus, fokusUtenFlagg, fokusFlaggNull];
+    // F1-S4c: the one clinic whose source stores the quote, so the only «Akuttvakt».
+    const vaktMedSitat = add("Vakt Med Sitat Tannklinikk AS", "918770014", { acute_vakt: 1, field_provenance: QUOTED });
+    const claimVestland = [vaktMedKilde, vaktKildeObjekt, vaktUtenKildeFokus, fokusUtenFlagg, fokusFlaggNull, vaktMedSitat];
     const claimAll = [...claimVestland, osloVakt];
-    const rawFlag = [vaktMedKilde, vaktKildeObjekt, vaktUtenKilde, vaktUtenKildeFokus, avvistVakt, osloVakt, osloUtenKilde, vaktUtenKildeTo];
+    const rawFlag = [vaktMedKilde, vaktKildeObjekt, vaktUtenKilde, vaktUtenKildeFokus, avvistVakt, osloVakt, osloUtenKilde, vaktUtenKildeTo, vaktMedSitat];
     const nameOf = new Map<string, string>(
       (db.prepare("SELECT id, navn FROM dental_agents").all() as Array<{ id: string; navn: string }>).map((r) => [r.id, r.navn])
     );
@@ -261,6 +337,17 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       ok(why.includes("«Akuttvakt» (med kilde)") && why.includes("«Tar imot akuttpasienter»") && why.includes("tannlege_akutt.count") &&
         why.includes("/sok?akutt=1") && !/akuttvakt-tilbud/.test(why), `M12: _forklaring.acute_count names the claim and the shared number («${why}»)`);
     }
+    {
+      // F1-S4c: «vakt» only with the quote; the advice is the reviewed emergency notice.
+      const akutt = await call("tannlege_akutt", {});
+      const vakt = akutt.klinikker.filter((k: any) => k.akutt === "vakt").map((k: any) => k.navn);
+      eq(vakt, [nameOf.get(vaktMedSitat)], "M13: tannlege_akutt: only the clinic with a quote has akutt «vakt»; the stamped ones (Vakt Med Kilde, Oslo Vakt …) are «accepts»");
+      ok(akutt.klinikker.filter((k: any) => k.akutt !== "vakt").every((k: any) => !k.badges.includes("Akuttvakt")), "M14: ... and no other card has the «Akuttvakt» badge");
+      eq(akutt.rad_om_kommunal_tannlegevakt, DENTAL_EMERGENCY_NOTICE.text, "M15: rad_om_kommunal_tannlegevakt is DENTAL_EMERGENCY_NOTICE.text, word for word");
+      ok(!/Akuttvakt-merke/.test(String(akutt.rad_om_kommunal_tannlegevakt)), "M16: ... and no longer says what clinics with the Akuttvakt badge do");
+      const vestland = await call("tannlege_akutt", { fylke: "Vestland" });
+      eq(vestland.rad_om_kommunal_tannlegevakt, DENTAL_EMERGENCY_NOTICE.text, "M17: the same notice with fylke");
+    }
 
     // ── W: /sok ───────────────────────────────────────────────────────────
     {
@@ -323,7 +410,7 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
         for (let i = 0; i < 10_000; i++) {
           const flagged = i % 10 === 0;
           const prov = flagged
-            ? JSON.stringify({ ...(i % 20 === 0 ? SOURCED : {}), om_oss: [{ source_type: "homepage", note: filler }] })
+            ? JSON.stringify({ ...(i % 40 === 0 ? QUOTED : i % 20 === 0 ? SOURCED : {}), om_oss: [{ source_type: "homepage", note: filler }] })
             : i % 2 ? JSON.stringify({ telefon: [{ source_type: "brreg" }] }) : null;
           const focus = i % 6 === 0 ? JSON.stringify(i % 12 === 0 ? ["Akutt", "barn"] : ["barn", "eldre"]) : null;
           ins.run(`perf-${i}`, `Klinikk ${i} Tannhelse`, "OSLO", fylker[i % fylker.length], flagged ? 1 : 0, prov, focus);
@@ -341,7 +428,7 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       // As dental-store-search.test.ts T: 20 ms, or 3x the old whole-text q scan where the machine is slower.
       const baseline = timed(() => store.countPublicDentalAgents({ q: "solo tannlege" }));
       const budget = Math.max(20, 3 * baseline);
-      for (const [label, f] of [["akutt", { acute_vakt: 1 }], ["akutt + fylke", { acute_vakt: 1, fylke: "Vestland" }]] as const) {
+      for (const [label, f] of [["akutt", { acute_vakt: 1 }], ["akutt + fylke", { acute_vakt: 1, fylke: "Vestland" }], ["vakt (F1-S4c)", { acute_claim: "vakt" }]] as const) {
         const c = timed(() => store.countPublicDentalAgents(f as any));
         const l = timed(() => store.listPublicDentalAgents(f as any, 25, 0));
         if (log) console.log(`    ${label}: count ${c.toFixed(1)} ms, list ${l.toFixed(1)} ms (budget ${budget.toFixed(1)} ms)`);

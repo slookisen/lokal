@@ -8,9 +8,10 @@
  *   b  the specialty facets are SPECIALTY_PAGES (routes/dental-seo.ts): the
  *      same slugs in the same order, each filtering on its stored name, with
  *      the specialist's title as H1 label («Kjeveortoped»).
- *   c  the other facets: tannlegevakt filters on sourced vakt only
- *      (acute_claim "vakt"); helfo is off until F2-S6 (Daniel, question 24:
- *      Helfo only with a source).
+ *   c  the other facets: tannlegevakt filters on vakt only (acute_claim
+ *      "vakt") and is off since F1-S4c (vakt needs a stored quote, which no
+ *      row has yet); helfo is off until F2-S6 (Daniel, question 24: Helfo
+ *      only with a source).
  *   d  every filter sets exactly one facet field, never a place field, and
  *      the store keeps it (a field the schema strips would list every clinic
  *      of the place).
@@ -76,10 +77,12 @@ export function runDentalLandingConfigTests(opts: { log?: boolean } = {}): TestS
   // ── c. tannlegevakt and helfo ────────────────────────────────────────────
   assertEq(F.filter((f) => f.kind !== "specialty").map((f) => [f.slug, f.kind]), [["helfo", "helfo"], ["tannlegevakt", "tannlegevakt"]], "c1: besides the specialties exactly two facets: helfo and tannlegevakt");
   const vakt = findDentalLandingFacet("tannlegevakt")!;
-  assertEq([vakt.filter, vakt.enabled], [{ acute_claim: "vakt" }, true], "c2: tannlegevakt lists sourced «Akuttvakt» only (acute_claim vakt), not the akutt claim that also takes «Tar imot akuttpasienter»");
+  assertEq(vakt.filter, { acute_claim: "vakt" }, "c2: tannlegevakt lists «Akuttvakt» only (acute_claim vakt), not the akutt claim that also takes «Tar imot akuttpasienter»");
+  assertEq(vakt.enabled, false, "c2b: tannlegevakt is off (F1-S4c) until vakt is defined and its quote stored; it is turned on in its own PR");
   const helfo = findDentalLandingFacet("helfo")!;
   assertEq(helfo.filter, { helfo_agreement: "true" }, "c3: helfo filters on the public Helfo field, which F2-S6 makes the sourced claim (DENTAL_HELFO_CLAIM_SQL)");
   assertEq(helfo.enabled, false, "c4: helfo is off until F2-S6 is merged (Helfo only with a source, question 24); it is turned on in its own PR");
+  assertEq(F.filter((f) => !f.enabled).map((f) => f.slug), ["helfo", "tannlegevakt"], "c5: helfo and tannlegevakt are the only facets that are off");
 
   // ── d. filters ───────────────────────────────────────────────────────────
   const FACET_FIELDS = new Set(["helfo_agreement", "acute_claim", "specialty"]);

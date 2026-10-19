@@ -1,7 +1,13 @@
 /**
  * dental-landing.test.ts -- A2A dev-request 2026-10-16-finn-tannlege-fasettsider,
  * skive F1-S4a (fasett-landingssider /sted/<sted>/<fasett> og
- * /fylke/<fylke>/<fasett>, med felles gate og sitemap-paritet).
+ * /fylke/<fylke>/<fasett>, med felles gate og sitemap-paritet) og F1-S4c
+ * (tannlegevakt-fasetten er av til vakt-påstanden har et lagret sitat).
+ *
+ * The tannlegevakt facet is off as shipped (F1-S4c). Sections A–P switch it
+ * on, to test its pages as they are once it is switched on again with one
+ * line in the config and no new code in the read path; Q switches it back
+ * off and tests the shipped state.
  *
  *   A  the aggregate's facet counts: for every stored poststed and fylke and
  *      every facet, the count and the newest date equal what the page's own
@@ -14,15 +20,16 @@
  *      ItemList = the rendered cards, intro (40-60 words) / table / FAQ that
  *      say what the clinics have and leave out the count the facet is named
  *      for; visible FAQ = FAQPage.
- *   C  tannlegevakt: only clinics whose card shows «Akuttvakt» (sourced);
- *      acute_vakt = 1 without provenance and «Tar imot akuttpasienter» are
- *      never on it; the akutt FAQ answer names 116 117 and 113; /fylke and a
- *      place with two spellings; the URL is read in any case, the canonical
- *      is the one spelling.
+ *   C  tannlegevakt: only clinics whose card shows «Akuttvakt» (a source
+ *      with its quote); a stamp without a quote, acute_vakt = 1 without
+ *      provenance and «Tar imot akuttpasienter» are never on it; the akutt
+ *      FAQ answer names 116 117 and 113; /fylke and a place with two
+ *      spellings; the URL is read in any case, the canonical is the one
+ *      spelling.
  *   D  the gate (facets.minListings 3, facets.minFacts 2): a thin facet, a
  *      facet with one fact, the disabled Helfo facet (unsourced Helfo rows),
  *      an unknown facet, place or fylke are 404 with noindex; 3 clinics with
- *      2 facts is 200.
+ *      2 facts is 200; as shipped, Helfo and tannlegevakt are off.
  *   E  the sitemap: exactly the facet pages over the gate that are their own
  *      canonical, once each, lastmod the newest clinic in the facet; parity:
  *      every facet URL in it answers 200 as its own canonical, and every
@@ -58,6 +65,12 @@
  *   P  the sitemap runs no statement per place or facet: as many with 5
  *      more facet URLs (counted on Statement.prototype, as in
  *      dental-area-landing.test.ts F4d).
+ *   Q  F1-S4c, the facet off as shipped: every tannlegevakt URL is a 404
+ *      with noindex, also over the gate and in any case; switching it off
+ *      takes exactly its URLs out of the sitemap, its links off /sted and
+ *      /fylke and its slug and sentence out of llms.txt, and every facet URL
+ *      left in the sitemap answers 200 (parity); the cards keep their claim
+ *      («Akuttvakt» with a quote, «Tar imot akuttpasienter» for a stamp).
  *
  * Same harness as dental-area-landing.test.ts (in-memory dental DB, the
  * router driven through router.handle()).
@@ -168,6 +181,8 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     require.resolve("./dental-seo"),
   ];
   const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
+  // F1-S4c: puts the tannlegevakt facet back as shipped (set where A–P switch it on).
+  let restoreVaktFacet = (): void => {};
 
   try {
     if (!log) console.log = () => { /* silence schema chatter */ };
@@ -212,14 +227,18 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       );
       return id;
     };
-    const PROV = '{"acute_vakt":[{"source":"https://example.test/akutt"}]}';
+    // A source with the quote from the page: «Akuttvakt» (F1-S4c). STAMP is the
+    // same source without the quote, as every live row stored it: «Tar imot akuttpasienter».
+    const STAMP = '{"acute_vakt":[{"value":"1","source_type":"homepage","source_url":"https://example.test/akutt","fetched_at":"2026-05-01T10:00:00Z"}]}';
+    const PROV = '{"acute_vakt":[{"value":"1","source_type":"homepage","source_url":"https://example.test/akutt","fetched_at":"2026-05-01T10:00:00Z","quote":"Vi har akuttvakt alle kvelder og i helgene."}]}';
     const KJEVE_TITLE = '[{"navn":"Kari","title":"Kjeveortoped"}]';
 
-    // BERGEN (Vestland): 4 clinics with sourced vakt (one Helfo, one verified).
+    // BERGEN (Vestland): 4 clinics with a quote for their vakt (one Helfo, one verified).
     for (let i = 1; i <= 4; i++) mk(`Bergen Vakt ${i} AS`, "BERGEN", "Vestland", { acuteVakt: 1, provenance: PROV, helfo: i === 1, verified: i === 2, updatedAt: `2026-05-0${i} 10:00:00` });
-    // Never on a tannlegevakt page: the flag without provenance, and «Tar imot akuttpasienter».
+    // Never on a tannlegevakt page: the flag without provenance, «Tar imot akuttpasienter», and a stamp without a quote.
     mk("Bergen Uten Kilde AS", "BERGEN", "Vestland", { acuteVakt: 1, helfo: true, updatedAt: "2026-09-09 10:00:00" });
     mk("Bergen Tar Imot AS", "BERGEN", "Vestland", { focus: '["Akutt"]', updatedAt: "2026-09-10 10:00:00" });
+    mk("Bergen Stempel AS", "BERGEN", "Vestland", { acuteVakt: 1, provenance: STAMP, updatedAt: "2026-01-01 10:00:00" });
     // Helfo = 'true' with no source on 5 more: the Helfo facet is off, so no page.
     for (let i = 1; i <= 5; i++) mk(`Bergen Helfo ${i} AS`, "BERGEN", "Vestland", { helfo: true });
     // One kjeveortoped: under minListings.
@@ -252,7 +271,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     // MOLDE in two spellings: 2 + 1 sourced vakt, one Helfo.
     mk("Molde Vakt 1 AS", "MOLDE", "Møre og Romsdal", { acuteVakt: 1, provenance: PROV, helfo: true, updatedAt: "2026-06-01 10:00:00" });
     mk("Molde Vakt 2 AS", "MOLDE", "Møre og Romsdal", { acuteVakt: 1, provenance: PROV, updatedAt: "2026-06-02 10:00:00" });
-    mk("Molde Vakt 3 AS", "Molde", "Møre og Romsdal", { acuteVakt: 1, provenance: '{"acute_vakt":{"sources":["https://example.test/x"]}}', updatedAt: "2026-06-03 10:00:00" });
+    mk("Molde Vakt 3 AS", "Molde", "Møre og Romsdal", { acuteVakt: 1, provenance: '{"acute_vakt":{"sources":[{"source_url":"https://example.test/x","quote":"Akuttvakt alle dager."}]}}', updatedAt: "2026-06-03 10:00:00" });
 
     // A place name with markup: 3 kjeveortopedi, one Helfo.
     const evilPlace = 'Ås<i>"&Co';
@@ -266,7 +285,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
 
     // PARITET (Nordland): every shape the akutt claim distinguishes.
     const edge: Array<[string, Extra]> = [
-      ["a", { acuteVakt: 1, provenance: '{"acute_vakt":{"sources":["x"]}}' }],
+      ["a", { acuteVakt: 1, provenance: '{"acute_vakt":{"sources":[{"quote":"Tannlegevakt i helgene."}]}}' }],
       ["b", { acuteVakt: 1, provenance: '{"acute_vakt":[]}' }],
       ["c", { acuteVakt: 1, provenance: '{bad json' }],
       ["d", { focus: '["AKUTT hjelp"]' }],
@@ -276,6 +295,8 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       ["h", { acuteVakt: 1, provenance: PROV, focus: "ikke json" }],
       ["i", { acuteVakt: 1, provenance: '{"other":[1]}' }],
       ["j", {}],
+      ["k", { acuteVakt: 1, provenance: STAMP }],
+      ["l", { acuteVakt: 1, provenance: '{"acute_vakt":{"sources":["x"]}}' }],
     ];
     for (const [k, x] of edge) mk(`Paritet ${k} AS`, "PARITET", "Nordland", x);
 
@@ -296,6 +317,11 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     mk("Grense Trøndelag Vakt AS", "GRENSE", "Trøndelag", { acuteVakt: 1, provenance: PROV, updatedAt: "2026-03-11 10:00:00" });
 
     const facetBySlug = (slug: string) => DENTAL_LANDING_FACETS.find((f) => f.slug === slug)!;
+    // F1-S4c: the facets that are off as shipped (D4), before A–P switch tannlegevakt on.
+    const shippedOff = DENTAL_LANDING_FACETS.filter((f) => !f.enabled).map((f) => f.slug);
+    const vaktFacet = facetBySlug("tannlegevakt") as { enabled: boolean };
+    restoreVaktFacet = ((shipped: boolean) => () => { vaktFacet.enabled = shipped; })(vaktFacet.enabled);
+    vaktFacet.enabled = true;
     const dayOf = (v: string | null | undefined): string | null => (v && /^\d{4}-\d{2}-\d{2}/.test(v) ? v.slice(0, 10) : null);
 
     // ── A. the aggregate's facet counts ──────────────────────────────────
@@ -320,7 +346,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
         }
       }
       assertEq(mismatches, [], `A1: for every stored poststed and fylke and every facet (${checked} cells), the aggregate's count and newest date = what the page's store filter lists`);
-      assertEq(f.byPoststed.get("BERGEN")!.facets?.tannlegevakt?.total, 4, "A2: BERGEN tannlegevakt = the 4 with sourced vakt (no flag without provenance, no «Tar imot», no rejected/closed/non-clinic/probe row)");
+      assertEq(f.byPoststed.get("BERGEN")!.facets?.tannlegevakt?.total, 4, "A2: BERGEN tannlegevakt = the 4 with a quote (no stamp without one, no flag without provenance, no «Tar imot», no rejected/closed/non-clinic/probe row)");
       assertEq(f.byPoststed.get("OSLO")!.facets?.kjeveortopedi?.total, 5, "A3: OSLO kjeveortopedi = 5 (available_specialties in either case, specialists[].specialty, two titles); the rejected, closed and lab rows are not counted");
       assertEq(f.byPoststed.get("BERGEN")!.facets?.helfo?.total, 7, "A4: the aggregate counts the Helfo facet too (7 rows say Helfo = 'true'), though the facet is off");
       const oslo = f.byPoststed.get("OSLO")!.facets!.kjeveortopedi!;
@@ -336,16 +362,16 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       assertEq(vaktMismatch, [], `A8: DENTAL_ACUTE_VAKT_SQL picks exactly the rows resolveAcuteClaim calls "vakt" (${all.length} rows, ${sqlVakt.size} vakt)`);
       const byName = (navn: string) => all.find((a) => a.navn === navn)!;
       assertEq(
-        ["Bergen Vakt 1 AS", "Bergen Tar Imot AS", "Bergen Uten Kilde AS", "Paritet g AS", "Paritet h AS", "Paritet c AS"].map((n) => [resolveAcuteClaim(byName(n)), sqlVakt.has(byName(n).id!)]),
-        [["vakt", true], ["accepts", false], [null, false], ["accepts", false], ["vakt", true], [null, false]],
-        "A9: vakt with a source is vakt; «Tar imot akuttpasienter» (accepts) and the flag without a source (null) are not; malformed JSON is no vakt"
+        ["Bergen Vakt 1 AS", "Bergen Tar Imot AS", "Bergen Uten Kilde AS", "Paritet g AS", "Paritet h AS", "Paritet c AS", "Bergen Stempel AS", "Paritet k AS", "Paritet l AS"].map((n) => [resolveAcuteClaim(byName(n)), sqlVakt.has(byName(n).id!)]),
+        [["vakt", true], ["accepts", false], [null, false], ["accepts", false], ["vakt", true], [null, false], ["accepts", false], ["accepts", false], ["accepts", false]],
+        "A9: vakt with a quote is vakt; «Tar imot akuttpasienter» (accepts) and the flag without a source (null) are not; malformed JSON is no vakt; a stamp without a quote, in either form, is «accepts» (F1-S4c)"
       );
-      assertEq(f.byPoststed.get("PARITET")!.facets?.tannlegevakt?.total, 2, "A10: PARITET: a (sources) and h (provenance array, focus not JSON) are vakt; b, c, e, f, g, i, j are not");
+      assertEq(f.byPoststed.get("PARITET")!.facets?.tannlegevakt?.total, 2, "A10: PARITET: a (sources with a quote) and h (array with a quote, focus not JSON) are vakt; b, c, e, f, g, i, j, k and l (stamps) are not");
       const ids = (rows: Array<{ id?: string }>): string[] => rows.map((a) => a.id!).sort();
       const publicRows = store.listPublicDentalAgents({}, 500, 0);
       assertEq(ids(store.listPublicDentalAgents({ acute_claim: "vakt" }, 500, 0)), ids(publicRows.filter((a) => resolveAcuteClaim(a) === "vakt")), "A11: the public acute_claim «vakt» filter lists exactly the public rows resolveAcuteClaim calls vakt");
       assertEq(store.countPublicDentalAgents({ acute_claim: "vakt" }), publicRows.filter((a) => resolveAcuteClaim(a) === "vakt").length, "A11b: and counts them");
-      assertEq(store.countPublicDentalAgents({ acute_vakt: 1, poststed: "BERGEN" }), 5, "A12: the akutt filter acute_vakt 1 keeps its meaning (vakt or «Tar imot»: 4 + 1)");
+      assertEq(store.countPublicDentalAgents({ acute_vakt: 1, poststed: "BERGEN" }), 6, "A12: the akutt filter acute_vakt 1 keeps its meaning (vakt or «Tar imot»: 4 + 2, the stamp among them)");
     }
 
     // ── B. /sted/oslo/kjeveortopedi ──────────────────────────────────────
@@ -396,10 +422,11 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       assertEq(page.status, 200, "C1: GET /sted/bergen/tannlegevakt -> 200");
       assertEq([h1Of(page.text), titleOf(page.text)], ["Tannlegevakt i Bergen", "Tannlegevakt i Bergen: klinikker med akuttvakt med kilde — Finn-tannlege.com"], "C2: H1 and title");
       const cs = cards(page.text);
-      assertEq(cardNames(page.text).sort(), ["Bergen Vakt 1 AS", "Bergen Vakt 2 AS", "Bergen Vakt 3 AS", "Bergen Vakt 4 AS"], "C3: only the 4 clinics with sourced vakt");
-      assertTrue(cs.length === 4 && cs.every((c) => c.includes(`<span class="badge badge-akutt">Akuttvakt</span>`)), "C4: every card shows «Akuttvakt» (sourced on the profile)");
+      assertEq(cardNames(page.text).sort(), ["Bergen Vakt 1 AS", "Bergen Vakt 2 AS", "Bergen Vakt 3 AS", "Bergen Vakt 4 AS"], "C3: only the 4 clinics with a quote for their vakt");
+      assertTrue(cs.length === 4 && cs.every((c) => c.includes(`<span class="badge badge-akutt">Akuttvakt</span>`)), "C4: every card shows «Akuttvakt» (a quote on the profile)");
       const main = mainOf(page.text);
-      assertTrue(!main.includes("Bergen Uten Kilde AS") && !main.includes("Tar imot akuttpasienter") && !main.includes("Bergen Tar Imot AS"), "C5: acute_vakt = 1 without provenance and «Tar imot akuttpasienter» are never on it");
+      assertTrue(!main.includes("Bergen Uten Kilde AS") && !main.includes("Tar imot akuttpasienter") && !main.includes("Bergen Tar Imot AS") && !main.includes("Bergen Stempel AS"),
+        "C5: acute_vakt = 1 without provenance, «Tar imot akuttpasienter» and a stamp without a quote are never on it");
       assertTrue(!/Probe Vakt|Avvist Vakt|Nedlagt Vakt|Bergen Enk/.test(page.text), "C6: nor the probe, rejected, closed or non-clinic row");
       const intro = introOf(page.text);
       assertTrue(intro.startsWith("Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen i oversikten. Alle oppgir akuttvakt med kilde."), `C7: intro («${intro.slice(0, 100)}»)`);
@@ -456,7 +483,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
         [false, false, false, true, true, false],
         "D3: passesDentalFacetGate: none, 2 clinics, 1 fact -> no; 3 clinics with 2 facts -> yes; 100 clinics with 1 fact -> no"
       );
-      assertTrue(DENTAL_LANDING_FACETS.filter((f) => !f.enabled).every((f) => f.slug === "helfo"), "D4: only the Helfo facet is off");
+      assertEq(shippedOff, ["helfo", "tannlegevakt"], "D4: as shipped, only the Helfo and tannlegevakt facets are off (F1-S4c)");
     }
 
     // ── E. the sitemap ───────────────────────────────────────────────────
@@ -678,6 +705,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       assertEq(line.split(", "), DENTAL_LANDING_FACETS.filter((x) => x.enabled).map((x) => x.slug), "M2: and the facets that are on (no helfo)");
       assertTrue(txt.includes(`minst ${DENTAL_LANDING_CONFIG.facets.minListings} klinikker`) && txt.includes(`${base}/sitemap.xml`), "M3: and the gate, pointing to the sitemap for the pages that exist");
       assertTrue(txt.includes("Har en fylkesside nøyaktig de samme klinikkene som én stedsside, står bare stedssiden der."), "M4: and says a fylke page with the clinics of one /sted page is not in it (S3)");
+      assertTrue(txt.includes("\nFasetten tannlegevakt lister bare klinikker som oppgir akuttvakt med kilde.\nEn fasettside finnes"), "M5: while tannlegevakt is on, a line says it lists only clinics with akuttvakt with a source");
     }
 
     // ── N. the emergency notice on the tannlegevakt pages ────────────────
@@ -861,11 +889,76 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       for (const id of added) db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = ?").run(id);
       resetCaches();
     }
+
+    // ── Q. F1-S4c: the tannlegevakt facet as shipped (off) ───────────────
+    {
+      // The same data with the facet on (as in A–P) and off (as shipped).
+      const snapshot = async (): Promise<{ sitemap: string[]; links: string[]; llms: string }> => {
+        resetCaches();
+        const sitemap = locs((await callRoute(router, "/sitemap.xml")).text);
+        const links: string[] = [];
+        for (const url of ["/sted/bergen", "/sted/oslo", "/sted/molde", "/sted/grense", "/fylke/Vestland", "/fylke/Oslo", "/fylke/Innlandet"]) {
+          links.push(...facetLinks((await callRoute(router, url)).text).map((l) => `${url}: ${l}`));
+        }
+        return { sitemap, links, llms: (await callRoute(router, "/llms.txt")).text };
+      };
+      const on = await snapshot();
+      restoreVaktFacet();
+      const off = await snapshot();
+      assertEq(facetBySlug("tannlegevakt").enabled, false, "Q0: (the facet is back as shipped: off)");
+
+      const urls = [
+        "/sted/bergen/tannlegevakt", "/sted/oslo/tannlegevakt", "/sted/molde/tannlegevakt", "/sted/grense/tannlegevakt?side=2",
+        "/fylke/Vestland/tannlegevakt", "/fylke/Innlandet/tannlegevakt", `/fylke/${encodeURIComponent("Møre og Romsdal")}/tannlegevakt`, "/sted/BERGEN/Tannlegevakt",
+      ];
+      const answers: Array<[string, number, boolean, number]> = [];
+      for (const url of urls) {
+        const r = await callRoute(router, url);
+        answers.push([url, r.status, /^noindex/.test(robotsOf(r.text)), cards(r.text).length]);
+      }
+      assertEq(answers, urls.map((u) => [u, 404, true, 0]), "Q1: every tannlegevakt facet URL is a 404 with noindex and no clinic, also those over the gate (Bergen 4, Grense 55, Vestland 5) and in any case");
+
+      const isVakt = (l: string): boolean => /\/tannlegevakt\b/.test(l);
+      assertTrue(on.sitemap.filter(isVakt).length >= 5, `Q2: (with the facet on, the sitemap has ${on.sitemap.filter(isVakt).length} tannlegevakt URLs)`);
+      assertEq(off.sitemap.filter(isVakt), [], "Q3: as shipped, the sitemap has no tannlegevakt URL");
+      assertEq(off.sitemap, on.sitemap.filter((l) => !isVakt(l)), "Q4: switching the facet off takes out exactly its URLs; every other sitemap URL stays, in order");
+      const facetLocs = off.sitemap.filter((l) => /\/(?:sted|fylke)\/[^/]+\/[^/]+$/.test(l));
+      const notOwn: string[] = [];
+      for (const l of facetLocs) {
+        const r = await callRoute(router, l.slice(base.length));
+        if (r.status !== 200 || canonicalOf(r.text) !== l) notOwn.push(`${l}: ${r.status}`);
+      }
+      assertTrue(facetLocs.length >= 5 && notOwn.length === 0, `Q5: every facet URL left in the sitemap answers 200 as its own canonical (${facetLocs.length}; ${JSON.stringify(notOwn)})`);
+
+      assertTrue(on.links.some(isVakt), "Q6: (with the facet on, /sted and /fylke link tannlegevakt pages)");
+      assertEq(off.links, on.links.filter((l) => !isVakt(l)), "Q7: as shipped, /sted and /fylke link no tannlegevakt page, and every other facet link stays");
+      const bergen = await callRoute(router, "/sted/bergen");
+      assertTrue(bergen.status === 200 && /^index, follow/.test(robotsOf(bergen.text)) && !bergen.text.includes("landing-facet-links") && !bergen.text.includes("/tannlegevakt"),
+        "Q8: /sted/bergen stays 200 and indexable, with no facet links and no link to a tannlegevakt page");
+
+      const fasetter = (txt: string): string[] => ((txt.match(/^Fasetter: (.*)$/m) || [])[1] ?? "").split(", ");
+      assertEq(fasetter(off.llms), fasetter(on.llms).filter((x) => x !== "tannlegevakt"), "Q9: llms.txt's «Fasetter:» line loses tannlegevakt and keeps the rest");
+      assertEq(fasetter(off.llms), DENTAL_LANDING_FACETS.filter((x) => x.enabled).map((x) => x.slug), "Q9b: ... which are the facets that are on");
+      assertTrue(!/tannlegevakt/.test(fasetter(off.llms).join(" ")) && !off.llms.includes("Fasetten tannlegevakt") && on.llms.includes("Fasetten tannlegevakt"),
+        "Q10: and its sentence on the tannlegevakt facet is gone with it");
+      assertEq(off.llms.replace(/<!-- generated-at: [^>]* -->/, ""), on.llms.replace(/<!-- generated-at: [^>]* -->/, "")
+        .replace(/^(Fasetter: .*)$/m, (m) => m.replace(/, tannlegevakt|tannlegevakt, /, ""))
+        .replace("Fasetten tannlegevakt lister bare klinikker som oppgir akuttvakt med kilde.\n", ""), "Q11: nothing else in llms.txt changes");
+
+      const bergenCards = cards(bergen.text);
+      const cardOf = (navn: string): string => bergenCards.find((c) => c.includes(`>${navn}</a>`)) ?? "";
+      assertTrue(
+        ["Bergen Vakt 1 AS", "Bergen Vakt 4 AS"].every((n) => cardOf(n).includes(`<span class="badge badge-akutt">Akuttvakt</span>`)) &&
+          cardOf("Bergen Stempel AS").includes(`<span class="badge badge-akutt">Tar imot akuttpasienter</span>`) && !cardOf("Bergen Stempel AS").includes(">Akuttvakt<"),
+        "Q12: the cards keep their claim: «Akuttvakt» with a quote, «Tar imot akuttpasienter» for a stamp without one"
+      );
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental landing (F1-S4a): unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     console.log = prevLog;
+    restoreVaktFacet();
     if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH;
     else process.env.DENTAL_DB_PATH = prevDentalPath;
     try {

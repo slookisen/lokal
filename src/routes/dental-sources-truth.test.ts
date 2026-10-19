@@ -826,12 +826,16 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       assertTrue(akuttNb.includes("vises bare når kilden til opplysningen er lagret sammen med feltet") && akuttNb.includes(`«${acute.ACUTE_ACCEPTS_LABEL}»`) &&
         akuttEn.includes("is shown only when the source of the detail is stored with the field") && akuttEn.includes(`<span lang="nb">${acute.ACUTE_ACCEPTS_LABEL}</span>`),
         "l5: «Akuttvakt» only with a stored source, otherwise «Tar imot akuttpasienter» when the extraction mentions akutt");
+      // F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): the stored source must carry
+      // the quote from the page; a stamp without it gives the soft claim. The text above stays true:
+      // «Akuttvakt» is still never shown without a stored source.
       assertEq([
         acute.resolveAcuteClaim({ acute_vakt: 1, field_provenance: null, patient_focus: null }),
+        acute.resolveAcuteClaim({ acute_vakt: 1, field_provenance: { acute_vakt: [{ source_type: "website", value: "1", quote: "Vi har akuttvakt i helgene." }] }, patient_focus: null }),
         acute.resolveAcuteClaim({ acute_vakt: 1, field_provenance: { acute_vakt: [{ source_type: "website", value: "1" }] }, patient_focus: null }),
         acute.resolveAcuteClaim({ acute_vakt: 0, field_provenance: null, patient_focus: ["Akuttpasienter"] }),
         acute.resolveAcuteClaim({ acute_vakt: 0, field_provenance: null, patient_focus: ["Barn"] }),
-      ], [null, "vakt", "accepts", null], "l5b: … as resolveAcuteClaim decides (no source: no «Akuttvakt»; akutt in the extraction: the soft claim; else none)");
+      ], [null, "vakt", "accepts", "accepts", null], "l5b: … as resolveAcuteClaim decides (no source: no «Akuttvakt»; a source with its quote: «Akuttvakt»; a source without one, or akutt in the extraction: the soft claim; else none)");
 
       // Specialties: as clinicSpecialties reads them.
       const { clinicSpecialties } = require("../config/dental-search-vocabulary") as typeof import("../config/dental-search-vocabulary");
