@@ -39,7 +39,7 @@ import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
-import { DiscoveryQuerySchema } from "../models/marketplace";
+import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
@@ -1774,24 +1774,25 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   }
 
   try {
-    const parsed = marketplaceRegistry.parseNaturalQuery(q);
-    const proximityIntent = !!(parsed as any)._proximityIntent;
     const heleNorge = req.query.heleNorge === "true";
+    // Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): read as
+    // MCP lokal_search reads it (services/rfb-search-reading.ts): a place
+    // outside Norway gets no producers («cheese in Stockholm» listed Norwegian
+    // dairies), and the place in the text is geocoded as before (e.g.
+    // "honning oslo" → Oslo coords), unless the visitor's position or «hele
+    // Norge» decides the area.
+    const { outsideNorway, parsed } = readSearchText(q);
+    const proximityIntent = !outsideNorway && !!(parsed as any)._proximityIntent;
     let geoPlaceLabel: string | undefined;
 
-    // Geocode location from query text (e.g. "honning oslo" → Oslo coords)
-    if (!heleNorge && !parsed.location) {
+    if (!outsideNorway && !heleNorge) {
       if (hasBrowserCoords) {
         parsed.location = { lat: frontendLat, lng: frontendLng };
         parsed.maxDistanceKm = searchRadiusKm;
         geoPlaceLabel = lang === "en" ? "your location" : "din posisjon";
       } else if (q) {
-        const geoResult = await geocodingService.extractAndGeocode(q);
-        if (geoResult) {
-          parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
-          parsed.maxDistanceKm = geoResult.radiusKm;
-          geoPlaceLabel = formatPlaceLabel(geoResult.name);
-        }
+        const place = await geocodeSearchPlace(parsed, q);
+        if (place) geoPlaceLabel = formatPlaceLabel(place.name);
       }
     }
 
@@ -1800,16 +1801,16 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // different question with a nationwide trust-ranked list.
     const needsLocation = proximityIntent && !parsed.location && !heleNorge;
 
-    // Preserve internal fields through Zod parsing (Zod strips unknown keys).
+    // Preserve internal fields through Zod parsing (Zod strips unknown keys):
+    // discoveryQueryOf puts the parser's words back on every query below.
     // _nameQuery is critical: when present, discover() returns name-matched
     // agents anywhere in Norway and skips geo. Without this re-attach, /sok
     // silently fell back to geo-rank fallback and surfaced unrelated nearby
     // producers when the user typed a producer name not present locally.
-    const productTerms = parsed._productTerms;
+    // Slice I-AA: _unknownTerms too, so discover() step 3c looks the words
+    // up in the product names: «kransekake» showed the standard list.
     const nameQuery = (parsed as any)._nameQuery as string | undefined;
-    const query = DiscoveryQuerySchema.parse({ ...parsed, limit: 30, offset: 0 });
-    if (productTerms) (query as any)._productTerms = productTerms;
-    if (nameQuery) (query as any)._nameQuery = nameQuery;
+    const query = discoveryQueryOf(parsed, { limit: 30, offset: 0 });
 
     // REVIEW FOLLOW-UP B1: same out-param as /api/marketplace/search —
     // discover() can widen a NAME search past our radius by itself, and the
@@ -1821,7 +1822,16 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     const requestMeta = buildRequestMeta(req);
     const trafficClass = searchTrafficClass({ meta: requestMeta, text: q });
     const trackDiscovery = trafficClass === "external";
-    let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery });
+    // Slice I-AA: a page whose unknown words match no product name
+    // (meta.unmatchedTerms) is the producers near the place, not results: it
+    // is shown as none, so the ladder below widens as for an empty page, and
+    // it is not counted as discovered. unmatchedTerms is the last step's.
+    const search = (stepQuery: typeof query, meta: DiscoverMeta) => {
+      const found = marketplaceRegistry.discover(stepQuery, meta, { trackDiscovery, countUnmatched: false });
+      return meta.unmatchedTerms ? [] : found;
+    };
+    let results = outsideNorway ? [] : search(query, discoverMeta);
+    let unmatchedTerms = discoverMeta.unmatchedTerms;
 
     // If discover returned name-matched results (relevanceScore≥0.9 +
     // matchReasons starts with "Navnematch"), don't run the geo-fallback —
@@ -1840,7 +1850,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // from the first call, but RE-CAPTURED at every ladder step below — see
     // the matching comment in /api/marketplace/search (marketplace.ts) for
     // why a stale first-call flag is wrong once the ladder actually widens.
-    let tagsDropped = !!discoverMeta.tagsRelaxed;
+    // Slice I-AA: a tag dropped for a page shown as none is no news.
+    let tagsDropped = !unmatchedTerms && !!discoverMeta.tagsRelaxed;
     let appliedRadiusKm = parsed.maxDistanceKm;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       // REVIEW FOLLOW-UP item 6: only ever WIDEN. This ladder is fixed at
@@ -1850,22 +1861,18 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       const steps = [50, 100, 200].filter((r) => r > (parsed.maxDistanceKm ?? 0));
       for (const radius of steps) {
         if (results.length >= MIN_RESULTS) break;
-        const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
-        if (productTerms) (expanded as any)._productTerms = productTerms;
-        if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         const expandedMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(expanded, expandedMeta, { trackDiscovery });
+        results = search(discoveryQueryOf(parsed, { maxDistanceKm: radius, limit: 30, offset: 0 }), expandedMeta);
+        unmatchedTerms = expandedMeta.unmatchedTerms;
         appliedRadiusKm = radius;
-        tagsDropped = !!expandedMeta.tagsRelaxed;
+        tagsDropped = !unmatchedTerms && !!expandedMeta.tagsRelaxed;
       }
       if (results.length < MIN_RESULTS) {
-        const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
-        if (productTerms) (noGeo as any)._productTerms = productTerms;
-        if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         const noGeoMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(noGeo, noGeoMeta, { trackDiscovery });
+        results = search(discoveryQueryOf(parsed, { location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 }), noGeoMeta);
+        unmatchedTerms = noGeoMeta.unmatchedTerms;
         geoDropped = true;
-        tagsDropped = !!noGeoMeta.tagsRelaxed;
+        tagsDropped = !unmatchedTerms && !!noGeoMeta.tagsRelaxed;
       }
     }
     if (geoDropped) appliedRadiusKm = undefined;
@@ -1886,13 +1893,12 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     let totalAtMax = false;
     if (results.length >= 30) {
       try {
-        const countQuery = DiscoveryQuerySchema.parse({
-          ...parsed,
+        // The product words, and slice I-AA's unknown words; no name query, as before.
+        const countQuery = discoveryQueryOf(parsed, {
           location: heleNorge ? undefined : parsed.location,
           maxDistanceKm: heleNorge ? undefined : parsed.maxDistanceKm,
           limit: 100, offset: 0,
-        });
-        if (productTerms) (countQuery as any)._productTerms = productTerms;
+        }, ["_productTerms", "_unknownTerms"]);
         // Count-only: these rows are never shown, so they are not "discovered".
         const countResults = marketplaceRegistry.discover(countQuery, undefined, { trackDiscovery: false });
         totalCount = countResults.length;
@@ -2036,6 +2042,15 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     const queryLabel = q
       ? `\u201c${escapeHtml(q)}\u201d`
       : (lang === "en" ? "your location" : "din posisjon");
+    // Slice I-AA: an empty page says why, in lokal_search's words: a place
+    // outside Norway, or words that no product name matches (also after the
+    // ladder looked in all of Norway). Otherwise as before.
+    const textLang = lang === "en" ? "en" : "no";
+    const nullNote = outsideNorway ? outsideNorwayText(outsideNorway, textLang)
+      : unmatchedTerms ? noProductMatchText(unmatchedTerms, textLang) : null;
+    const emptyLine = nullNote
+      ? `<p id="searchNullNote" style="font-size:1.1rem;">${escapeHtml(nullNote)}</p>`
+      : `<p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>`;
     // REVIEW FOLLOW-UP R2: `heleNorge=true` is the OTHER way a coordinates-only
     // page ends up nationwide, and it was not covered by the geoDropped guard —
     // /sok?lat=..&lng=..&heleNorge=true rendered «Produsenter nær deg (30 km)»
@@ -2076,7 +2091,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       ${results.length > 0
         ? `<div class="results-grid">${resultCards}</div>`
         : `<div style="text-align:center;padding:48px 0;color:var(--g500);">
-            <p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>
+            ${emptyLine}
             <p style="margin-top:8px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Try a different search" : "Pr\u00f8v et annet s\u00f8k"}</a></p>
           </div>`
       }

@@ -153,11 +153,21 @@ function nonEmpty(v: unknown): boolean {
  * Did the (parsed or structured) query ask for anything? parseNaturalQuery
  * ALWAYS sets role:"producer", so `role` only counts for structured calls,
  * where a client deliberately built a query ("list producers").
+ * Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): the words
+ * the parser could not read (`_unknownTerms`, which discover() looks up in
+ * the product names) count for a text: «Finnes det kransekake» asked for
+ * kransekake and got no search. Not when they are all pings and fillers
+ * (NO_INTENT_TERMS: «ping», «test» …): the parser hands those to step 3c as
+ * well, and a product name can contain one («Smakstest»). Not for a
+ * structured call either, whose `_unknownTerms` discover() never reads
+ * (DiscoveryQuerySchema drops it).
  */
 export function hasDiscoveryIntent(q: any, opts: { structured?: boolean } = {}): boolean {
   if (!q || typeof q !== "object") return false;
   if (nonEmpty(q.categories) || nonEmpty(q.tags) || nonEmpty(q.skills)) return true;
   if (nonEmpty(q._productTerms) || nonEmpty(q._nameQuery) || nonEmpty(q.drinkSubcategory)) return true;
+  if (!opts.structured && Array.isArray(q._unknownTerms)
+    && q._unknownTerms.some((t: unknown) => typeof t === "string" && t.trim() && !NO_INTENT_TERMS.has(t.trim().toLowerCase()))) return true;
   if (q.location && typeof q.location === "object") return true;
   return !!opts.structured && nonEmpty(q.role);
 }

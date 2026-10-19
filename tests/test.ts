@@ -42829,6 +42829,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-AA (integration
+// test round 3: RFB-M-01, RFB-M-02, R3-RS-01): A2A message/send and GET /sok
+// read a search as MCP lokal_search does (services/rfb-search-reading.ts):
+// the place in the text, a place abroad, and the parser's product, name and
+// unknown words reach discover(); /sok shows an honest null text instead of
+// the standard list. lokal_search and /sok's control searches are byte-like
+// main (tests/fixtures/rfb-a2a-sok-paritet-main.json). Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-AA (A2A and /sok read the search as lokal_search) ──");
+  try {
+    const { runRfbA2aSokParitetTests } = require("../src/routes/rfb-a2a-sok-paritet.test") as
+      typeof import("../src/routes/rfb-a2a-sok-paritet.test");
+    const r = await runRfbA2aSokParitetTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-a2a-sok-paritet: " + f);
+    console.log(`  rfb-a2a-sok-paritet: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-a2a-sok-paritet: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-N (round 2:
 // AI2-02, AI-3a, AI-3b, AI2-08): lokal_info lists generic category labels as
 // «Kategorier:» without cart id or availability; lokal_search labels a match

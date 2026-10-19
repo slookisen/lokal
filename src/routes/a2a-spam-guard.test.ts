@@ -75,11 +75,14 @@ function callRoute(
   });
 }
 
+// Each producer at its city: since slice I-AA (dev-request 2026-10-17-
+// integrasjonstest-oppfolging) A2A reads the place of «honning i Oslo» as
+// lokal_search does, and a producer without a position is outside every area.
 const SEED = [
-  { id: "sg-honning-1", name: "Oslo Honningbu", city: "Oslo", categories: ["honey"], trust: 0.72 },
-  { id: "sg-honning-2", name: "Birøkter Hansen", city: "Asker", categories: ["honey"], trust: 0.61 },
-  { id: "sg-meieri", name: "Fjellmeieriet", city: "Vågå", categories: ["dairy"], trust: 0.66 },
-  { id: "sg-top-trust", name: "Kringler Testgjestegård", city: "Nannestad", categories: ["vegetables"], trust: 0.95 },
+  { id: "sg-honning-1", name: "Oslo Honningbu", city: "Oslo", lat: 59.9139, lng: 10.7522, categories: ["honey"], trust: 0.72 },
+  { id: "sg-honning-2", name: "Birøkter Hansen", city: "Asker", lat: 59.8333, lng: 10.4392, categories: ["honey"], trust: 0.61 },
+  { id: "sg-meieri", name: "Fjellmeieriet", city: "Vågå", lat: 61.8769, lng: 9.097, categories: ["dairy"], trust: 0.66 },
+  { id: "sg-top-trust", name: "Kringler Testgjestegård", city: "Nannestad", lat: 60.2189, lng: 11.0129, categories: ["vegetables"], trust: 0.95 },
 ];
 
 function seedAgents(db: Database.Database): void {
@@ -89,11 +92,11 @@ function seedAgents(db: Database.Database): void {
        lat, lng, city, radius_km, categories, tags, skills, capabilities, languages,
        trust_score, is_active, is_verified, discovery_count, interaction_count,
        total_interactions, created_at, last_seen_at)
-    VALUES (?, ?, 'Lokal produsent', 'test', ?, ?, '1.0.0', 'producer', ?, NULL, NULL, ?, NULL, ?, '[]', '[]', '{}', '["no"]',
+    VALUES (?, ?, 'Lokal produsent', 'test', ?, ?, '1.0.0', 'producer', ?, ?, ?, ?, NULL, ?, '[]', '[]', '{}', '["no"]',
             ?, 1, 0, 0, 0, 0, datetime('now'), datetime('now'))
   `);
   for (const a of SEED) {
-    stmt.run(a.id, a.name, `${a.id}@example.no`, `https://${a.id}.example.no`, "key-" + a.id, a.city,
+    stmt.run(a.id, a.name, `${a.id}@example.no`, `https://${a.id}.example.no`, "key-" + a.id, a.lat, a.lng, a.city,
       JSON.stringify(a.categories), a.trust);
   }
 }
@@ -197,7 +200,11 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
     {
       const r = await send(router, '{"module": "ziwei-comm-module/v1", "implant_id": "x"}', { ua: "Mozilla/5.0 (compatible; ziwei-implant/1.0)" });
       assertEq(dataOf(r)?.count, 0, "(b) unparseable spam no longer falls back to the nationwide trust ranking");
-      assertTrue(/No food query/.test(dataOf(r)?.note || ""), "(b) …and says no food query was detected");
+      // Slice I-AA: the words the parser cannot read are a search, looked up
+      // in the product names as lokal_search does; these match none.
+      assertTrue((dataOf(r)?.note || "").startsWith("🔎 Ingen produsent har «module ziwei comm implant» i produktlista")
+        && /No producer lists «module ziwei comm implant»/.test(dataOf(r)?.note || ""),
+        "(b) …and says, in lokal_search's words, that no product matches its words");
     }
 
     // ── (c) no-intent external text ─────────────────────────────────────
