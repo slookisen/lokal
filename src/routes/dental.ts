@@ -18,6 +18,9 @@ import {
   getDentalAgentById,
   getDentalAgentByOrgnr,
   listDentalAgents,
+  listPublicDentalAgents,
+  countPublicDentalAgents,
+  listPoststeder,
   listSpecialistsForClinic,
   listChains,
   updateDentalAgent,
@@ -63,6 +66,9 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { findOrgnumberByName } from "../services/brreg-client";
 import { buildProvenanceSummary } from "../services/cross-source-validator";
 import { capFreeText } from "../utils/free-text";
+import { planDentalSearch } from "../services/dental-query-parser";
+import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+import { toDentalClinicCard } from "../services/dental-clinic-card";
 
 const router = Router();
 
@@ -459,43 +465,64 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   }
 });
 
-// ─── GET /api/tannlege/discover — A2A-style search ──────────────────
-// Lightweight discovery endpoint for AI-agent integration. Same query
-// shape as listDentalAgents but the response envelope mirrors the
-// marketplace discovery contract (so consumer agents have one mental
-// model across verticals).
+// ─── GET /api/tannlege/discover — public search ────────────────────
+// The primary public search (dev-request 2026-10-16-tannlege-mcp-instrukser-og-
+// klinikkort, S7). Same honest set and the same free-text reading as MCP
+// tannlege_search: listPublicDentalAgents/countPublicDentalAgents leave out
+// rejected, permanently closed, non-clinic and synthetic-probe rows, and `q`
+// goes through planDentalSearch (parseDentalQuery). Explicit parameters win
+// over what the text says. The envelope mirrors the marketplace discovery
+// contract (so consumer agents have one mental model across verticals).
+//   ?q=tannlege i Bergen   ?fylke=  ?specialty=  ?poststed=
+//   ?helfo_agreement=true (alias ?helfo=)   ?akutt=1 (alias ?acute_vakt=)
+//   ?chain_brand=  ?verification_status=  ?limit=20 (max 100)  ?offset=0
 router.get("/discover", (req: Request, res: Response) => {
   try {
-    const filter = ListFilterSchema.parse({
-      fylke: req.query.fylke as string | undefined,
-      chain_brand: req.query.chain_brand as string | undefined,
-      specialty: req.query.specialty as string | undefined,
-      verification_status: req.query.verification_status as
-        | string
-        | undefined,
-    });
+    const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v : undefined);
+    const explicit: Record<string, unknown> = {
+      fylke: str(req.query.fylke),
+      chain_brand: str(req.query.chain_brand),
+      specialty: str(req.query.specialty),
+      verification_status: str(req.query.verification_status),
+      poststed: str(req.query.poststed),
+      helfo_agreement: str(req.query.helfo_agreement) ?? str(req.query.helfo),
+    };
+    // akutt is an honest filter: 1/true/ja = the akutt claim (acute_vakt 1, S2b).
+    const akutt = str(req.query.akutt) ?? str(req.query.acute_vakt);
+    if (akutt !== undefined) {
+      const on = ["1", "true", "ja"].includes(akutt.toLowerCase());
+      const off = ["0", "false", "nei"].includes(akutt.toLowerCase());
+      if (!on && !off) {
+        res.status(400).json({ error: "Invalid query", details: [{ path: ["akutt"], message: "akutt must be 1 or 0" }] });
+        return;
+      }
+      if (on) explicit.acute_vakt = 1;
+    }
+    const q = typeof req.query.q === "string" ? capFreeText(req.query.q) : undefined;
     const limit = Math.min(
       100,
       Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20)
     );
-    // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-    // opt-in via listDentalAgents's excludeNonClinic (4th param) -- gated
-    // behind DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" so GET /agents (this
-    // module's OTHER listDentalAgents caller, not one of slice 1b's named
-    // public surfaces) stays byte-identical.
-    const agents = listDentalAgents(filter, limit, 0, {
-      excludeNonClinic: isDentalPublicCatalogClassFilterEnabled(),
+    const offset = Math.max(0, parseInt((req.query.offset as string) || "0", 10) || 0);
+
+    const plan = planDentalSearch({
+      query: q,
+      explicit,
+      gazetteer: () => getDentalSearchGazetteer(listPoststeder),
+      count: (f) => countPublicDentalAgents(f as any),
     });
+    const agents = listPublicDentalAgents(plan.filter as any, limit, offset);
     res.json({
       vertical: "dental",
-      query: filter,
+      query: plan.filter,
       count: agents.length,
+      total: plan.count,
+      ...(plan.tolkning ? { tolkning: plan.tolkning } : {}),
       results: agents.map((a) => ({
+        // The card first (honest phone, akutt, badges, profil_url ...); the
+        // keys /discover has always returned keep their stored values.
+        ...toDentalClinicCard(a, "search"),
         id: a.id,
-        navn: a.navn,
-        org_nr: a.org_nr,
-        fylke: a.fylke,
-        poststed: a.poststed,
         chain_brand: a.chain_brand,
         available_specialties: a.available_specialties,
         verification_status: a.verification_status,
