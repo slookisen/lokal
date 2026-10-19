@@ -25133,6 +25133,9 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       last_seen_at TEXT DEFAULT (datetime('now')),
       -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
       catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      -- + retail-shop gate columns (dev-request 2026-10-01-rfb-butikker-i-outreach-poolen)
+      business_type TEXT,
+      retail_focus TEXT,
       vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
 
@@ -47856,6 +47859,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("lokal-agent-verifier-field-spotcheck: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop gate in
+// outreach_ready_pool + pool-blocker-explain named reasons + admin
+// business-type lever and classification dry-run. Own in-memory DB (swaps the
+// shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop pool gate ──");
+  try {
+    const { runInitOutreachPoolRetailGateTests } = require("../src/database/init-outreach-pool-retail-gate.test") as
+      typeof import("../src/database/init-outreach-pool-retail-gate.test");
+    const rg = await runInitOutreachPoolRetailGateTests({ log: false });
+    passed += rg.passed;
+    failed += rg.failed;
+    for (const f of rg.failures) failures.push("init-outreach-pool-retail-gate: " + f);
+    console.log(`  init-outreach-pool-retail-gate: ${rg.passed} passed, ${rg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("init-outreach-pool-retail-gate: unexpected error: " + String(err?.message || err));
   }
 });
 

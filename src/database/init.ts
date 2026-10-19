@@ -231,6 +231,104 @@ export function isOwnPlatformHomepage(row: {
   return homepageUrl.toLowerCase().includes("rettfrabonden.com");
 }
 
+// ─── Retail-shop gate for the `outreach_ready_pool` VIEW ─────────────────────
+// dev-request 2026-10-01-rfb-butikker-i-outreach-poolen (Daniel live
+// 2026-10-01). `agents.business_type` marks what kind of business a row is
+// ('producer' | 'farm_shop' | 'retail_shop' | 'cafe'; NULL = unmarked =
+// untouched by this gate, exactly like before). Only 'retail_shop' is gated:
+// a producer's own farm shop ('farm_shop') and ordinary producers (NULL /
+// 'producer') are NEVER affected. `agents.retail_focus` ('frukt_gront' |
+// 'fisk' | 'annet') says what a retail_shop sells.
+//
+// A retail_shop is outreach-eligible ONLY when BOTH hold:
+//   (a) retail_focus = 'frukt_gront'. 'fisk' is deliberately NOT allowed: Daniel
+//       has not answered whether fish shops count (open question in the
+//       dev-request) — it must be added here explicitly once he does.
+//   (b) the profile passes the quality gate: about >= 150 chars AND the `about`
+//       field has a 'homepage' provenance record (own site), AND >= 3 products,
+//       AND the about text describes the business as a shop (butikk /
+//       kolonial / dagligvare).
+//
+// Named reasons (pool-blocker-explain): retail_shop_not_eligible (fails a),
+// retail_profile_not_ready (passes a, fails b). `k`/`a` must alias
+// agent_knowledge/agents. WHERE-clause use only; CASE guards make malformed
+// JSON in field_provenance/products fail the gate safely (excluded, no crash).
+export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront"] as const;
+export const RETAIL_SHOP_MIN_ABOUT_CHARS = 150;
+export const RETAIL_SHOP_MIN_PRODUCTS = 3;
+const RETAIL_SHOP_ABOUT_LIKE = [
+  "%butikk%",
+  "%kolonial%",
+  "%dagligvare%",
+];
+
+export const POOL_RETAIL_SHOP_PROFILE_READY_SQL =
+  `(length(COALESCE(k.about,'')) >= ${RETAIL_SHOP_MIN_ABOUT_CHARS}` +
+  ` AND CASE WHEN json_valid(COALESCE(k.field_provenance,'{}')) THEN` +
+  ` (COALESCE(json_extract(k.field_provenance,'$.about'),'') LIKE '%"source_type":"homepage"%'` +
+  ` OR COALESCE(json_extract(k.field_provenance,'$.about'),'') LIKE '%"source":"homepage"%') ELSE 0 END` +
+  ` AND CASE WHEN json_valid(COALESCE(k.products,'[]')) THEN json_array_length(COALESCE(k.products,'[]')) >= ${RETAIL_SHOP_MIN_PRODUCTS} ELSE 0 END` +
+  ` AND (${RETAIL_SHOP_ABOUT_LIKE.map((l) => `LOWER(COALESCE(k.about,'')) LIKE '${l}'`).join(" OR ")}))`;
+
+export const POOL_RETAIL_SHOP_GATE_SQL =
+  `(COALESCE(a.business_type,'') != 'retail_shop'` +
+  ` OR (COALESCE(a.retail_focus,'') IN (${RETAIL_SHOP_FOCUS_ALLOWED.map((f) => `'${f}'`).join(",")})` +
+  ` AND ${POOL_RETAIL_SHOP_PROFILE_READY_SQL}))`;
+
+function provenanceHasHomepageSource(raw: unknown, field: string): boolean {
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try { parsed = JSON.parse(raw); } catch { return false; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const val = (parsed as Record<string, unknown>)[field];
+  let recs: unknown[] = [];
+  if (Array.isArray(val)) recs = val;
+  else if (val && typeof val === "object") {
+    const w = (val as { sources?: unknown }).sources;
+    recs = Array.isArray(w) ? w : [val];
+  }
+  return recs.some((r) => {
+    if (!r || typeof r !== "object") return false;
+    const o = r as Record<string, unknown>;
+    return o.source_type === "homepage" || o.source === "homepage";
+  });
+}
+
+/**
+ * Pure TS mirror of POOL_RETAIL_SHOP_GATE_SQL, returning the NAMED blocker
+ * (empty array = not blocked). MUST stay logically equivalent to the SQL — do
+ * not hand-edit one without the other.
+ */
+export function retailShopPoolBlockers(row: {
+  business_type?: string | null;
+  retail_focus?: string | null;
+  about?: string | null;
+  products?: string | unknown[] | null;
+  field_provenance?: string | null;
+}): string[] {
+  if ((row.business_type ?? "") !== "retail_shop") return [];
+  if (!(RETAIL_SHOP_FOCUS_ALLOWED as readonly string[]).includes(row.retail_focus ?? "")) {
+    return ["retail_shop_not_eligible"];
+  }
+  const about = row.about ?? "";
+  let products: unknown[] = [];
+  if (Array.isArray(row.products)) products = row.products;
+  else if (typeof row.products === "string" && row.products.length > 0) {
+    try {
+      const p = JSON.parse(row.products);
+      if (Array.isArray(p)) products = p;
+    } catch { products = []; }
+  }
+  const lower = about.toLowerCase();
+  const ready =
+    about.length >= RETAIL_SHOP_MIN_ABOUT_CHARS &&
+    provenanceHasHomepageSource(row.field_provenance ?? null, "about") &&
+    products.length >= RETAIL_SHOP_MIN_PRODUCTS &&
+    RETAIL_SHOP_ABOUT_LIKE.some((l) => lower.includes(l.replace(/%/g, "")));
+  return ready ? [] : ["retail_profile_not_ready"];
+}
+
 // ─── Producer-profile view honesty (analytics_agent_views) ──────────────────
 // humanAgentViewSql / LEGACY_AGENT_VIEW_SOURCE live in ./analytics-sql (a pure
 // module the off-thread stats worker can import without this file) and are
@@ -2765,6 +2863,19 @@ function initSchema(db: Database.Database): void {
   // sites agree. Daniel, live session 2026-09-02, verbatim: "go på A, og kjør
   // dublettene og skjul-lista" (daniel-responses/2026-09-02-go-a-dubletter-og-
   // skjul-lista.md).
+  // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: business marker +
+  // retail focus on the agent row (nullable, additive; NULL = unmarked = no
+  // effect). Read ONLY by the outreach_ready_pool VIEW's retail gate below and
+  // pool-blocker-explain; written only by POST /admin/agents/business-type.
+  // Added BEFORE the VIEW so a fresh DB resolves it. Rollback: revert the PR —
+  // the columns may stay (nothing else reads them).
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN business_type TEXT`,
+    `ALTER TABLE agents ADD COLUMN retail_focus TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
     // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
@@ -2829,6 +2940,12 @@ function initSchema(db: Database.Database): void {
            site — never eligible for marketing outreach. See
            POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL's own comment above. */
         AND ${POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL}
+        /* dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: a row marked
+           business_type='retail_shop' is out unless it is a fruit/veg shop
+           with an enriched, shop-describing profile. Producers and
+           producer-run farm shops (business_type NULL/'producer'/'farm_shop')
+           are untouched. See POOL_RETAIL_SHOP_GATE_SQL's comment above. */
+        AND ${POOL_RETAIL_SHOP_GATE_SQL}
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200
