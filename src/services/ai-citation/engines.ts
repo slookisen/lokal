@@ -12,29 +12,37 @@
 // is already in prod.
 //
 //   anthropic   POST api.anthropic.com/v1/messages, server tool web_search_20250305
-//               (max_uses 3). Cited = the text blocks' web_search_result_location
-//               citations. Searches = usage.server_tool_use.web_search_requests.
+//               (max_uses 3), output_config.effort. Cited = the text blocks'
+//               web_search_result_location citations. Searches =
+//               usage.server_tool_use.web_search_requests. Cut off = stop_reason
+//               max_tokens / model_context_window_exceeded.
 //   openai      POST api.openai.com/v1/responses, tool web_search (max_tool_calls 3,
-//               store false). Cited = output_text url_citation annotations.
-//               Searches = the web_search_call items.
+//               store false), reasoning.effort. Cited = output_text url_citation
+//               annotations. Searches = the web_search_call items. Cut off = status
+//               incomplete.
 //   perplexity  POST api.perplexity.ai/v1/sonar (Sonar chat shape; Perplexity now serves
-//               it through its Agent API), search context low. Cited = `citations`
-//               (else search_results[].url). Cost = usage.cost.total_cost when the
-//               API reports it, else tokens + the request fee.
+//               it through its Agent API), search context low, no effort setting.
+//               Cited = `citations` (else search_results[].url). Cost =
+//               usage.cost.total_cost when the API reports it, else tokens + the
+//               request fee. Cut off = finish_reason length.
 //   gemini      POST generativelanguage.googleapis.com/v1beta/models/<m>:generateContent,
-//               tool google_search, thinkingConfig.thinkingLevel from the config.
-//               Cited = groundingMetadata.groundingChunks. Their uri is an expiring
+//               tool google_search, thinkingConfig.thinkingLevel. Cited =
+//               groundingMetadata.groundingChunks. Their uri is an expiring
 //               Google redirect link, so it is not kept: the source domain comes from
 //               chunk.web.domain / .title (citedDomains). Searches = webSearchQueries
 //               (Gemini 3 bills grounding per search query; the 5 000 free a month are
-//               not counted, so the figure errs high).
+//               not counted, so the figure errs high). Cut off = finishReason MAX_TOKENS.
 //
-// Models and prices are config, not code: config/ai-citation-panel.json "engines"
-// holds, per engine, the default model and, per model id, the list prices
-// (input / output per MTok, an optional long-prompt tier, per search, per request)
-// and maxCostUsdPerCall. AI_CITATION_<ENGINE>_MODEL (e.g. AI_CITATION_OPENAI_MODEL)
-// picks another model, which must be listed there as well: the caps are computed
-// with the asked model's own prices, so a model without prices is never asked (the
+// Models, prices and the two request settings an answer depends on are config, not
+// code: config/ai-citation-panel.json "engines" holds, per engine, the default model
+// and, per model id, the list prices (input / output per MTok, an optional long-prompt
+// tier, per search, per request), maxCostUsdPerCall, maxOutputTokens (the answer's token
+// limit, reasoning included) and an optional effort (the reasoning depth, sent as the
+// engine's own field above; absent = the model's default, which for a reasoning model
+// may spend the whole limit before the answer). AI_CITATION_<ENGINE>_MODEL (e.g.
+// AI_CITATION_OPENAI_MODEL) picks another model, which must be listed there as well:
+// the caps are computed with the asked model's own prices and it is asked with its
+// own token limit and effort, so a model that is not listed is never asked (the
 // engine is off). The config is checked when it is loaded (loadCitationEngineConfig);
 // an invalid one makes no call. The shipped prices are the providers' list prices as
 // read on 2026-10-19 (Perplexity no longer lists Sonar prices, so the last published
@@ -44,15 +52,23 @@
 // Caps: maxCostUsdPerCall is an upper bound the runner checks against the run and
 // month caps BEFORE a call. A call whose cost cannot be read (timeout, a 2xx that is
 // not the documented shape or has no usage object) is booked at that bound, so the
-// caps stay safe. A non-2xx answer is booked at 0 (not billed).
+// caps stay safe. A non-2xx answer is booked at 0 (not billed). The shipped bounds
+// cover a call that spends the model's whole token limit with its most searches
+// (Gemini sets no search limit: 8 queries are covered).
+//
+// Only a whole answer is stored as one: an answer cut off at the token limit is the
+// error incomplete (what it cited so far is not what the answer cites), and an answer
+// with no visible text is empty_answer, so neither counts as "answered, not cited" in
+// the share. Both are billed, so their cost is booked as for an answer.
 //
 // Secrets: a key is read from the environment when a call starts (keyEnv) and
 // goes only into a request header (Gemini too: x-goog-api-key, not the URL).
 // Nothing here logs. Failures are fixed reason codes (no_key, model_unpriced,
 // timeout, network, http_<status>, invalid_json, unexpected_response, refusal,
-// pause_turn, search_tool_error), never response text or an exception message, so
-// a provider error that echoes the key cannot carry it any further. Each request is
-// counted with noteLlmCall("ai-citation-<engine>") right before it is sent.
+// pause_turn, search_tool_error, incomplete, empty_answer), never response text or
+// an exception message, so a provider error that echoes the key cannot carry it any
+// further. Each request is counted with noteLlmCall("ai-citation-<engine>") right
+// before it is sent.
 
 import panelConfig from "../../config/ai-citation-panel.json";
 import { noteLlmCall } from "../llm-call-meter";
@@ -114,8 +130,10 @@ export interface CitationModelPrice {
   usdPerRequest: number;
   /** Upper bound of one call: checked against the caps before the call, booked when the cost cannot be read. */
   maxCostUsdPerCall: number;
-  /** Gemini 3: generationConfig.thinkingConfig.thinkingLevel; null = the model's default. */
-  thinkingLevel: string | null;
+  /** The answer's token limit, reasoning included (max_tokens / max_output_tokens / maxOutputTokens). */
+  maxOutputTokens: number;
+  /** Reasoning depth, one of the engine's effortLevels (CitationEngineDef); null = the model's default. */
+  effort: string | null;
 }
 
 export interface CitationEngineConfig {
@@ -128,10 +146,9 @@ export interface CitationEngineConfig {
 export type CitationEnginesConfig = Readonly<Record<CitationEngineId, CitationEngineConfig>>;
 
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
-const GEMINI_THINKING_LEVELS = ["minimal", "low", "medium", "high"];
 const PRICE_KEYS = [
   "inUsdPerMTok", "outUsdPerMTok", "longPromptTokens", "longInUsdPerMTok", "longOutUsdPerMTok",
-  "usdPerSearch", "usdPerRequest", "maxCostUsdPerCall", "thinkingLevel",
+  "usdPerSearch", "usdPerRequest", "maxCostUsdPerCall", "maxOutputTokens", "effort",
 ];
 
 const isObject = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -146,9 +163,10 @@ export function citationModelEnvOf(engine: CitationEngineId): string {
  * The "engines" block of config/ai-citation-panel.json (or `raw`), checked: exactly the four
  * engines; per engine a default model that is listed under models; per model the input and
  * output price, optional per-search / per-request fees (default 0), a long-prompt tier given in
- * full or not at all, a maxCostUsdPerCall above 0 and, for Gemini, a known thinkingLevel; no
- * unknown keys (a misspelt fee must not silently drop out of the cost). Prices are finite and
- * ≥ 0. Throws with every problem listed by its path, so a broken edit makes no call.
+ * full or not at all, a maxCostUsdPerCall above 0, a maxOutputTokens and, optionally, an effort
+ * the engine knows (its effortLevels; Perplexity has none); no unknown keys (a misspelt fee must
+ * not silently drop out of the cost). Prices are finite and ≥ 0. Throws with every problem
+ * listed by its path, so a broken edit makes no call.
  */
 export function loadCitationEngineConfig(raw: unknown = panelConfig): CitationEnginesConfig {
   const engines = isObject(raw) ? raw.engines : undefined;
@@ -171,11 +189,8 @@ export function loadCitationEngineConfig(raw: unknown = panelConfig): CitationEn
       for (const [modelId, m] of Object.entries(e.models)) {
         const mat = `${at}.models.${modelId}`;
         if (!MODEL_ID_RE.test(modelId)) problems.push(`${mat}: model id`);
-        const price = checkPrice(m, mat, problems);
-        if (price) {
-          if (price.thinkingLevel !== null && id !== "gemini") problems.push(`${mat}.thinkingLevel: only for gemini`);
-          models[modelId] = Object.freeze(price);
-        }
+        const price = checkPrice(m, mat, problems, id);
+        if (price) models[modelId] = Object.freeze(price);
       }
     }
     if (typeof e.model !== "string" || !MODEL_ID_RE.test(e.model)) problems.push(`${at}.model: model id`);
@@ -187,7 +202,7 @@ export function loadCitationEngineConfig(raw: unknown = panelConfig): CitationEn
   return Object.freeze(out as Record<CitationEngineId, CitationEngineConfig>);
 }
 
-function checkPrice(m: unknown, at: string, problems: string[]): CitationModelPrice | null {
+function checkPrice(m: unknown, at: string, problems: string[], engine: CitationEngineId): CitationModelPrice | null {
   if (!isObject(m)) {
     problems.push(`${at}: must be an object`);
     return null;
@@ -208,9 +223,12 @@ function checkPrice(m: unknown, at: string, problems: string[]): CitationModelPr
     usdPerSearch: usd("usdPerSearch", false),
     usdPerRequest: usd("usdPerRequest", false),
     maxCostUsdPerCall: usd("maxCostUsdPerCall", true),
-    thinkingLevel: null,
+    maxOutputTokens: 0,
+    effort: null,
   };
   if (!(price.maxCostUsdPerCall > 0)) problems.push(`${at}.maxCostUsdPerCall: must be above 0`);
+  if (!Number.isInteger(m.maxOutputTokens) || m.maxOutputTokens <= 0) problems.push(`${at}.maxOutputTokens: must be a whole number above 0`);
+  else price.maxOutputTokens = m.maxOutputTokens;
   const longKeys = ["longPromptTokens", "longInUsdPerMTok", "longOutUsdPerMTok"].filter((k) => m[k] !== undefined);
   if (longKeys.length === 3) {
     const t = m.longPromptTokens;
@@ -221,9 +239,11 @@ function checkPrice(m: unknown, at: string, problems: string[]): CitationModelPr
   } else if (longKeys.length > 0) {
     problems.push(`${at}: longPromptTokens, longInUsdPerMTok and longOutUsdPerMTok go together`);
   }
-  if (m.thinkingLevel !== undefined) {
-    if (!GEMINI_THINKING_LEVELS.includes(m.thinkingLevel)) problems.push(`${at}.thinkingLevel: one of ${GEMINI_THINKING_LEVELS.join(", ")}`);
-    else price.thinkingLevel = m.thinkingLevel;
+  if (m.effort !== undefined) {
+    const levels = effortLevelsOf(engine);
+    if (levels.length === 0) problems.push(`${at}.effort: ${engine} has no effort setting`);
+    else if (!levels.includes(m.effort)) problems.push(`${at}.effort: one of ${levels.join(", ")}`);
+    else price.effort = m.effort;
   }
   for (const k of Object.keys(m)) if (!PRICE_KEYS.includes(k)) problems.push(`${at}.${k}: unknown key`);
   return problems.length === before ? price : null;
@@ -365,15 +385,22 @@ async function postJson(url: string, headers: Record<string, string>, body: unkn
   }
 }
 
-/** A 2xx body read by one engine: the answer or a failure code, with what the call used (null = not reported). */
-type ParsedCall =
-  | { ok: true; citedUrls: string[]; citedDomains?: string[]; answerSnippet: string; usage: CitationUsage | null; reportedCostUsd?: number | null }
-  | { ok: false; reason: string; usage: CitationUsage | null };
+/**
+ * A 2xx body read by one engine: the answer or a failure code, with what the call used (null =
+ * not reported) and the cost the API reports, if it does.
+ */
+type ParsedCall = (
+  | { ok: true; citedUrls: string[]; citedDomains?: string[]; answerSnippet: string }
+  | { ok: false; reason: string }
+) & { usage: CitationUsage | null; reportedCostUsd?: number | null };
 
 /** What one engine adds to the shared run: its request and how to read its answer. */
 export interface CitationEngineDef {
   engine: CitationEngineId;
   keyEnv: string;
+  /** The values a model's `effort` may take in the config (the API's own names); empty = no such setting. */
+  effortLevels: readonly string[];
+  /** The request for `model`, with its maxOutputTokens and effort from the config. */
   request(prompt: string, key: string, model: string, price: CitationModelPrice): { url: string; headers: Record<string, string>; body: unknown };
   /** The 2xx body -> the answer; null when it is not the documented shape. */
   parse(body: any): ParsedCall | null;
@@ -382,7 +409,8 @@ export interface CitationEngineDef {
 /**
  * An adapter from its definition and the resolved model. run(): no model -> model_unpriced
  * and no key -> no_key, both without a call; else count the call, POST, parse, and book the
- * cost: the reported cost, else the model's prices on the reported usage, else the bound.
+ * cost: the reported cost, else the model's prices on the reported usage, else the bound. An
+ * answer without visible text is empty_answer, whatever the engine.
  */
 function bindEngine(def: CitationEngineDef, model: string | null, price: CitationModelPrice | null): CitationEngine {
   const bound = price?.maxCostUsdPerCall ?? 0;
@@ -404,9 +432,11 @@ function bindEngine(def: CitationEngineDef, model: string | null, price: Citatio
       if (!r.ok) return { ok: false, reason: r.reason, costUsd: r.costUnknown ? bound : 0 };
       const p = def.parse(r.body);
       if (!p) return { ok: false, reason: "unexpected_response", costUsd: bound };
-      const reported = p.ok ? p.reportedCostUsd ?? null : null;
+      const reported = p.reportedCostUsd ?? null;
       const costUsd = reported !== null ? reported : p.usage ? citationCallCostUsd(price, p.usage) : bound;
       if (!p.ok) return { ok: false, reason: p.reason, costUsd };
+      // Only reasoning, or nothing: not an answer that happens to cite nothing.
+      if (!p.answerSnippet) return { ok: false, reason: "empty_answer", costUsd };
       return {
         ok: true,
         citedUrls: p.citedUrls,
@@ -473,15 +503,20 @@ export function parseAnthropicAnswer(body: any): AnthropicParsed | null {
   };
 }
 
+/** stop_reason values that cut the answer off before its end. */
+const ANTHROPIC_CUT_OFF = ["max_tokens", "model_context_window_exceeded"];
+
 const anthropicDef: CitationEngineDef = {
   engine: "anthropic",
   keyEnv: "ANTHROPIC_API_KEY",
-  request: (prompt, key, model) => ({
+  effortLevels: ["low", "medium", "high", "xhigh", "max"],
+  request: (prompt, key, model, price) => ({
     url: ANTHROPIC_MESSAGES_URL,
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
     body: {
       model,
-      max_tokens: 2048,
+      // Thinking (on by default in current models) counts against max_tokens.
+      max_tokens: price.maxOutputTokens,
       system: CITATION_PANEL_INSTRUCTION,
       messages: [{ role: "user", content: prompt }],
       tools: [{
@@ -490,7 +525,7 @@ const anthropicDef: CitationEngineDef = {
         max_uses: ANTHROPIC_MAX_SEARCHES,
         user_location: { type: "approximate", country: "NO", timezone: "Europe/Oslo" },
       }],
-      output_config: { effort: "low" },
+      ...(price.effort ? { output_config: { effort: price.effort } } : {}),
     },
   }),
   parse(body) {
@@ -500,6 +535,7 @@ const anthropicDef: CitationEngineDef = {
     if (p.stopReason === "refusal") return { ok: false, reason: "refusal", usage };
     // The server-side search loop stopped before an answer; resuming would be a second billed call.
     if (p.stopReason === "pause_turn") return { ok: false, reason: "pause_turn", usage };
+    if (p.stopReason !== null && ANTHROPIC_CUT_OFF.includes(p.stopReason)) return { ok: false, reason: "incomplete", usage };
     if (p.toolError && p.citedUrls.length === 0) return { ok: false, reason: "search_tool_error", usage };
     return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), usage };
   },
@@ -515,7 +551,10 @@ export interface OpenAiParsed {
   citedUrls: string[];
   searches: number;
   inputTokens: number;
+  /** Reasoning included. */
   outputTokens: number;
+  /** The response status: "incomplete" = cut off (incomplete_details.reason, e.g. max_output_tokens). */
+  status: string | null;
   usageKnown: boolean;
 }
 
@@ -543,6 +582,7 @@ export function parseOpenAiAnswer(body: any): OpenAiParsed | null {
     searches,
     inputTokens: num(u.input_tokens),
     outputTokens: num(u.output_tokens),
+    status: typeof body.status === "string" ? body.status : null,
     usageKnown: isObject(body.usage),
   };
 }
@@ -550,7 +590,8 @@ export function parseOpenAiAnswer(body: any): OpenAiParsed | null {
 const openAiDef: CitationEngineDef = {
   engine: "openai",
   keyEnv: "OPENAI_API_KEY",
-  request: (prompt, key, model) => ({
+  effortLevels: ["none", "minimal", "low", "medium", "high", "xhigh"],
+  request: (prompt, key, model, price) => ({
     url: OPENAI_RESPONSES_URL,
     headers: { Authorization: `Bearer ${key}` },
     body: {
@@ -559,7 +600,9 @@ const openAiDef: CitationEngineDef = {
       input: prompt,
       tools: [{ type: "web_search", user_location: { type: "approximate", country: "NO" } }],
       max_tool_calls: OPENAI_MAX_SEARCHES,
-      max_output_tokens: 2048,
+      // A reasoning model spends this on reasoning first; at the limit it stops, maybe before any text.
+      max_output_tokens: price.maxOutputTokens,
+      ...(price.effort ? { reasoning: { effort: price.effort } } : {}),
       store: false,
     },
   }),
@@ -567,6 +610,7 @@ const openAiDef: CitationEngineDef = {
     const p = parseOpenAiAnswer(body);
     if (!p) return null;
     const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: p.searches } : null;
+    if (p.status === "incomplete") return { ok: false, reason: "incomplete", usage };
     return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), usage };
   },
 };
@@ -582,6 +626,8 @@ export interface PerplexityParsed {
   outputTokens: number;
   /** usage.cost.total_cost when the API reports it. */
   reportedCostUsd: number | null;
+  /** choices[0].finish_reason: "length" = cut off at max_tokens. */
+  finishReason: string | null;
   usageKnown: boolean;
 }
 
@@ -595,12 +641,14 @@ export function parsePerplexityAnswer(body: any): PerplexityParsed | null {
     : Array.isArray(body.search_results) ? body.search_results.map((r: any) => r?.url) : [];
   const u = body.usage ?? {};
   const reported = u.cost?.total_cost;
+  const finish = body.choices[0].finish_reason;
   return {
     text,
     citedUrls: cleanCitedUrls(urls),
     inputTokens: num(u.prompt_tokens),
     outputTokens: num(u.completion_tokens),
     reportedCostUsd: typeof reported === "number" && Number.isFinite(reported) && reported >= 0 ? reported : null,
+    finishReason: typeof finish === "string" ? finish : null,
     usageKnown: isObject(body.usage),
   };
 }
@@ -608,7 +656,8 @@ export function parsePerplexityAnswer(body: any): PerplexityParsed | null {
 const perplexityDef: CitationEngineDef = {
   engine: "perplexity",
   keyEnv: "PERPLEXITY_API_KEY",
-  request: (prompt, key, model) => ({
+  effortLevels: [],
+  request: (prompt, key, model, price) => ({
     url: PERPLEXITY_SONAR_URL,
     headers: { Authorization: `Bearer ${key}` },
     body: {
@@ -617,7 +666,7 @@ const perplexityDef: CitationEngineDef = {
         { role: "system", content: CITATION_PANEL_INSTRUCTION },
         { role: "user", content: prompt },
       ],
-      max_tokens: 1024,
+      max_tokens: price.maxOutputTokens,
       web_search_options: { search_context_size: "low", user_location: { country: "NO" } },
     },
   }),
@@ -625,6 +674,7 @@ const perplexityDef: CitationEngineDef = {
     const p = parsePerplexityAnswer(body);
     if (!p) return null;
     const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: 0 } : null;
+    if (p.finishReason === "length") return { ok: false, reason: "incomplete", usage, reportedCostUsd: p.reportedCostUsd };
     return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), usage, reportedCostUsd: p.reportedCostUsd };
   },
 };
@@ -644,7 +694,10 @@ export interface GeminiParsed {
   /** Billed search queries: webSearchQueries, at least 1 when the answer is grounded. */
   searches: number;
   inputTokens: number;
+  /** Thinking included. */
   outputTokens: number;
+  /** candidates[0].finishReason: "MAX_TOKENS" = cut off at maxOutputTokens. */
+  finishReason: string | null;
   usageKnown: boolean;
 }
 
@@ -680,6 +733,7 @@ export function parseGeminiAnswer(body: any): GeminiParsed | null {
     searches: Math.max(queries, chunks.length > 0 ? 1 : 0),
     inputTokens: num(u.promptTokenCount) + num(u.toolUsePromptTokenCount),
     outputTokens: num(u.candidatesTokenCount) + num(u.thoughtsTokenCount),
+    finishReason: typeof cand.finishReason === "string" ? cand.finishReason : null,
     usageKnown: isObject(body.usageMetadata),
   };
 }
@@ -687,6 +741,7 @@ export function parseGeminiAnswer(body: any): GeminiParsed | null {
 const geminiDef: CitationEngineDef = {
   engine: "gemini",
   keyEnv: "GEMINI_API_KEY",
+  effortLevels: ["minimal", "low", "medium", "high"],
   request: (prompt, key, model, price) => ({
     url: `${GEMINI_API_BASE}${encodeURIComponent(model)}:generateContent`,
     headers: { "x-goog-api-key": key },
@@ -695,8 +750,9 @@ const geminiDef: CitationEngineDef = {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       tools: [{ google_search: {} }],
       generationConfig: {
-        maxOutputTokens: 2048,
-        ...(price.thinkingLevel ? { thinkingConfig: { thinkingLevel: price.thinkingLevel } } : {}),
+        // Thinking counts against maxOutputTokens.
+        maxOutputTokens: price.maxOutputTokens,
+        ...(price.effort ? { thinkingConfig: { thinkingLevel: price.effort } } : {}),
       },
     },
   }),
@@ -704,12 +760,18 @@ const geminiDef: CitationEngineDef = {
     const p = parseGeminiAnswer(body);
     if (!p) return null;
     const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: p.searches } : null;
+    if (p.finishReason === "MAX_TOKENS") return { ok: false, reason: "incomplete", usage };
     return { ok: true, citedUrls: p.citedUrls, citedDomains: p.citedDomains, answerSnippet: answerSnippetOf(p.text), usage };
   },
 };
 
 /** The engine definitions, in the order the runner asks them (CITATION_ENGINE_IDS). */
 export const CITATION_ENGINE_DEFS: readonly CitationEngineDef[] = Object.freeze([anthropicDef, openAiDef, perplexityDef, geminiDef]);
+
+/** The effort values the config may give a model of `engine` (its definition's effortLevels). */
+function effortLevelsOf(engine: CitationEngineId): readonly string[] {
+  return CITATION_ENGINE_DEFS.find((d) => d.engine === engine)?.effortLevels ?? [];
+}
 
 // ── Engines for an environment ───────────────────────────────────────
 

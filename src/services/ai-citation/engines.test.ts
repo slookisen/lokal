@@ -4,13 +4,16 @@
  * No network: every call passes a fetch stub (deps.fetchImpl) that answers as the provider and
  * records the request; the keys are fakes. Covers the "engines" block of
  * config/ai-citation-panel.json (the shipped defaults, its validation, AI_CITATION_<ENGINE>_MODEL
- * picking a listed model, an unpriced model never asked, cost and per-call bound following the
- * config); per engine the request (URL, the key only in a header, the search tool, the
- * instruction, the configured model), the parsing of a documented answer (cited URLs, snippet ≤
- * 300 chars) and the cost; that an engine without its key is off and never calls; the failure
- * codes and how their cost is booked (non-2xx 0, timeout / unreadable 2xx at the bound); that
- * each request is counted with noteLlmCall("ai-citation-<engine>"); the URL and domain helpers;
- * and that a key never reaches a result, even when the provider echoes it.
+ * picking a listed model, an unpriced model never asked, cost, per-call bound and the request
+ * settings maxOutputTokens / effort following the config); per engine the request (URL, the key
+ * only in a header, the search tool, the instruction, the configured model, its token limit and
+ * reasoning effort), the parsing of a documented answer (cited URLs, snippet ≤ 300 chars) and the
+ * cost; that an answer cut off at the token limit is incomplete and one without visible text is
+ * empty_answer, both with their cost booked (B3); that an engine without its key is off and never
+ * calls; the failure codes and how their cost is booked (non-2xx 0, timeout / unreadable 2xx at
+ * the bound); that each per-call bound covers a call at the full token limit; that each request
+ * is counted with noteLlmCall("ai-citation-<engine>"); the URL and domain helpers; and that a key
+ * never reaches a result, even when the provider echoes it.
  */
 import panelConfig from "../../config/ai-citation-panel.json";
 import {
@@ -120,6 +123,72 @@ export function answerFor(engine: CitationEngineId, urls: readonly string[], tex
   }
 }
 
+/**
+ * A documented answer per engine that was cut off at its token limit before any visible text
+ * (B3): reasoning / thinking and a search only. Anthropic stop_reason max_tokens, OpenAI status
+ * incomplete (max_output_tokens), Perplexity finish_reason length, Gemini finishReason MAX_TOKENS.
+ */
+export function cutOffAnswerFor(engine: CitationEngineId) {
+  switch (engine) {
+    case "anthropic":
+      return {
+        type: "message",
+        role: "assistant",
+        stop_reason: "max_tokens",
+        content: [
+          { type: "thinking", thinking: "", signature: "s1" },
+          { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "q" } },
+          { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [{ type: "web_search_result", url: "https://www.rettfrabonden.com/x", title: "t", encrypted_content: "x" }] },
+          { type: "thinking", thinking: "", signature: "s2" },
+        ],
+        usage: { input_tokens: 12_000, output_tokens: 16_000, server_tool_use: { web_search_requests: 1 } },
+      };
+    case "openai":
+      return {
+        id: "resp_2",
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [
+          { type: "reasoning", id: "rs_1", summary: [] },
+          { type: "web_search_call", id: "ws_1", status: "completed" },
+          { type: "reasoning", id: "rs_2", summary: [] },
+        ],
+        usage: { input_tokens: 9_000, output_tokens: 25_000, output_tokens_details: { reasoning_tokens: 25_000 } },
+      };
+    case "perplexity":
+      return {
+        id: "p2",
+        model: "sonar",
+        citations: ["https://www.rettfrabonden.com/x"],
+        choices: [{ index: 0, finish_reason: "length", message: { role: "assistant", content: "" } }],
+        usage: { prompt_tokens: 20, completion_tokens: 2_048, cost: { total_cost: 0.0071 } },
+      };
+    case "gemini":
+      return {
+        candidates: [{
+          content: { role: "model" },
+          finishReason: "MAX_TOKENS",
+          groundingMetadata: { webSearchQueries: ["q"], groundingChunks: [{ web: { uri: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x", title: "rettfrabonden.com" } }] },
+        }],
+        usageMetadata: { promptTokenCount: 30, thoughtsTokenCount: 8_192, toolUsePromptTokenCount: 1_000 },
+      };
+  }
+}
+
+/** A documented, finished answer per engine with no visible text (reasoning or a search only). */
+export function emptyAnswerFor(engine: CitationEngineId) {
+  switch (engine) {
+    case "anthropic":
+      return { stop_reason: "end_turn", content: [{ type: "thinking", thinking: "", signature: "s" }, { type: "text", text: " \n " }], usage: { input_tokens: 500, output_tokens: 300 } };
+    case "openai":
+      return { status: "completed", output: [{ type: "reasoning", id: "rs_1", summary: [] }, { type: "web_search_call", id: "ws_1", status: "completed" }], usage: { input_tokens: 500, output_tokens: 300 } };
+    case "perplexity":
+      return { citations: [], choices: [{ finish_reason: "stop", message: { content: "  " } }], usage: { prompt_tokens: 20, completion_tokens: 1 } };
+    case "gemini":
+      return { candidates: [{ content: { role: "model", parts: [{ text: "" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 30, candidatesTokenCount: 0 } };
+  }
+}
+
 const ENGINES = loadCitationEngines(ENV_ALL);
 const byId = (id: CitationEngineId, engines: readonly CitationEngine[] = ENGINES): CitationEngine => engines.find((e) => e.engine === id)!;
 const close = (a: number, b: number) => Math.abs(a - b) < 1e-9;
@@ -164,8 +233,11 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       t(CITATION_ENGINE_IDS.every((id) => Object.entries(cfg[id].models).every(([, m]) => m.inUsdPerMTok > 0 && m.outUsdPerMTok > 0 && m.maxCostUsdPerCall > 0)) &&
         cfg.anthropic.models["claude-haiku-5-5"].usdPerSearch === 0.01 && cfg.openai.models["gpt-6-luna"].usdPerSearch === 0.01 &&
         cfg.gemini.models["gemini-3.5-flash-lite"].usdPerSearch === 0.014 && cfg.perplexity.models.sonar.usdPerRequest === 0.005 &&
-        cfg.gemini.models["gemini-3.5-flash-lite"].thinkingLevel === "minimal" && cfg.openai.models["gpt-6-luna"].longPromptTokens === 272_000,
-        "CFG3: list prices per model: tokens, per search (Gemini per search query), Perplexity's request fee, Gemini 3's thinkingLevel");
+        cfg.openai.models["gpt-6-luna"].longPromptTokens === 272_000,
+        "CFG3: list prices per model: tokens, per search (Gemini per search query), Perplexity's request fee");
+      t(JSON.stringify(CITATION_ENGINE_IDS.map((id) => { const m = cfg[id].models[cfg[id].model]; return [m.maxOutputTokens, m.effort]; })) ===
+        JSON.stringify([[16_000, "low"], [25_000, "low"], [2_048, null], [8_192, "minimal"]]),
+        "CFG3b (B3): per model the token limit (reasoning included) and the effort: low for Anthropic and OpenAI, none for Perplexity, minimal for Gemini 3");
       t(Object.isFrozen(cfg) && Object.isFrozen(cfg.openai.models) && Object.isFrozen(cfg.openai.models["gpt-6-luna"]), "CFG4: the loaded config is frozen");
     }
     {
@@ -177,24 +249,36 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       c.engines.anthropic.model = "claude-unlisted";
       c.engines.openai.models["gpt-6-luna"].inUsdPerMTok = -1;
       c.engines.openai.models["gpt-6-luna"].usdPerSerch = 0.01;
-      c.engines.openai.models["gpt bad"] = { inUsdPerMTok: 1, outUsdPerMTok: 1, maxCostUsdPerCall: 0.1 };
+      c.engines.openai.models["gpt bad"] = { inUsdPerMTok: 1, outUsdPerMTok: 1, maxCostUsdPerCall: 0.1, maxOutputTokens: 1000 };
       c.engines.gemini.models["gemini-3.5-flash-lite"].maxCostUsdPerCall = 0;
-      c.engines.gemini.models["gemini-3.5-flash-lite"].thinkingLevel = "max";
-      c.engines.gemini.models["g-long"] = { inUsdPerMTok: 1, outUsdPerMTok: 1, maxCostUsdPerCall: 0.1, longPromptTokens: 1000 };
-      c.engines.gemini.models["g-long2"] = { inUsdPerMTok: 1, outUsdPerMTok: 1, maxCostUsdPerCall: 0.1, longPromptTokens: 1.5, longInUsdPerMTok: 2, longOutUsdPerMTok: 2 };
+      c.engines.gemini.models["gemini-3.5-flash-lite"].effort = "max";
+      c.engines.gemini.models["g-long"] = { inUsdPerMTok: 1, outUsdPerMTok: 1, maxCostUsdPerCall: 0.1, maxOutputTokens: 1000, longPromptTokens: 1000 };
+      c.engines.gemini.models["g-long2"] = { inUsdPerMTok: 1, outUsdPerMTok: 1, maxCostUsdPerCall: 0.1, maxOutputTokens: 1000, longPromptTokens: 1.5, longInUsdPerMTok: 2, longOutUsdPerMTok: 2 };
       c.engines.gemini.extra = true;
-      c.engines.anthropic.models["claude-haiku-5-5"].thinkingLevel = "low";
+      c.engines.anthropic.models["claude-haiku-5-5"].effort = "minimal";
       const msg = bad(c);
       const want = [
         "engines.bing: unknown engine", "engines.perplexity: missing", "engines.anthropic.model: not listed under models",
         "engines.openai.models.gpt-6-luna.inUsdPerMTok: must be a number ≥ 0", "engines.openai.models.gpt-6-luna.usdPerSerch: unknown key",
         "engines.openai.models.gpt bad: model id", "engines.gemini.models.gemini-3.5-flash-lite.maxCostUsdPerCall: must be above 0",
-        "engines.gemini.models.gemini-3.5-flash-lite.thinkingLevel: one of", "engines.gemini.models.g-long: longPromptTokens, longInUsdPerMTok and longOutUsdPerMTok go together",
+        "engines.gemini.models.gemini-3.5-flash-lite.effort: one of minimal, low, medium, high", "engines.gemini.models.g-long: longPromptTokens, longInUsdPerMTok and longOutUsdPerMTok go together",
         "engines.gemini.models.g-long2.longPromptTokens: must be a whole number above 0", "engines.gemini.extra: unknown key",
-        "engines.anthropic.models.claude-haiku-5-5.thinkingLevel: only for gemini",
+        "engines.anthropic.models.claude-haiku-5-5.effort: one of low, medium, high, xhigh, max",
       ];
       const missing = want.filter((w) => !msg.includes(w));
-      t(missing.length === 0, `CFG6: every problem is listed by its path (missing engine, unknown engine / key / misspelt fee, unlisted default, bad price, bound 0, half long tier, bad thinkingLevel)` + (missing.length ? ` — not found: ${missing.join(" | ")}` : ""));
+      t(missing.length === 0, `CFG6: every problem is listed by its path (missing engine, unknown engine / key / misspelt fee, unlisted default, bad price, bound 0, half long tier, an effort the engine does not know)` + (missing.length ? ` — not found: ${missing.join(" | ")}` : ""));
+      const s = configCopy();
+      s.engines.perplexity.models.sonar.effort = "low";
+      delete s.engines.openai.models["gpt-6-luna"].maxOutputTokens;
+      s.engines.anthropic.models["claude-haiku-5-5"].maxOutputTokens = 1.5;
+      s.engines.gemini.models["gemini-3.5-flash-lite"].maxOutputTokens = 0;
+      const smsg = bad(s);
+      const swant = [
+        "engines.perplexity.models.sonar.effort: perplexity has no effort setting", "engines.openai.models.gpt-6-luna.maxOutputTokens: must be a whole number above 0",
+        "engines.anthropic.models.claude-haiku-5-5.maxOutputTokens: must be a whole number above 0", "engines.gemini.models.gemini-3.5-flash-lite.maxOutputTokens: must be a whole number above 0",
+      ];
+      const smissing = swant.filter((w) => !smsg.includes(w));
+      t(smissing.length === 0, "CFG6b (B3): a model must give its token limit (a whole number above 0); an effort on an engine without one is rejected" + (smissing.length ? ` — not found: ${smissing.join(" | ")}` : ""));
       const empty = configCopy();
       empty.engines.openai.models = {};
       t(bad(empty).includes("engines.openai.models: must list at least one model"), "CFG7: an engine with no models is rejected");
@@ -213,7 +297,7 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
     // ── AI_CITATION_<ENGINE>_MODEL picks a listed model; its prices follow (B1) ──
     {
       const c = configCopy();
-      c.engines.openai.models["gpt-6.1-sol"] = { inUsdPerMTok: 2, outUsdPerMTok: 10, usdPerSearch: 0.01, maxCostUsdPerCall: 0.2 };
+      c.engines.openai.models["gpt-6.1-sol"] = { inUsdPerMTok: 2, outUsdPerMTok: 10, usdPerSearch: 0.01, maxCostUsdPerCall: 0.6, maxOutputTokens: 30_000, effort: "medium" };
       const env = { ...ENV_ALL, AI_CITATION_OPENAI_MODEL: " gpt-6.1-sol " } as NodeJS.ProcessEnv;
       const engines = loadCitationEngines(env, c);
       const f = stubFetch(() => ({ status: 200, body: answerFor("openai", ["https://a.no/"]) }));
@@ -221,10 +305,12 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       t(citationModelEnvOf("openai") === "AI_CITATION_OPENAI_MODEL" && byId("openai", engines).model === "gpt-6.1-sol" && f.calls[0].body.model === "gpt-6.1-sol" &&
         byId("anthropic", engines).model === "claude-haiku-5-5",
         "MO1: AI_CITATION_OPENAI_MODEL picks another listed model for that engine only");
-      t(!!r && close(r.costUsd, (8_000 * 2 + 300 * 10) / 1e6 + 0.01) && byId("openai", engines).maxCostUsdPerCall === 0.2,
+      t(f.calls[0].body.max_output_tokens === 30_000 && f.calls[0].body.reasoning?.effort === "medium",
+        "MO1b (B3): the token limit and the effort sent are that model's own, from the config");
+      t(!!r && close(r.costUsd, (8_000 * 2 + 300 * 10) / 1e6 + 0.01) && byId("openai", engines).maxCostUsdPerCall === 0.6,
         "MO2: the cost and the per-call bound are that model's own, from the config");
       const hang = await run("openai", stubFetch(() => new DOMException("timed out", "TimeoutError") as any), env, { engines });
-      t(!hang.ok && hang.reason === "timeout" && hang.costUsd === 0.2, "MO3: a timeout is booked at the overriding model's bound");
+      t(!hang.ok && hang.reason === "timeout" && hang.costUsd === 0.6, "MO3: a timeout is booked at the overriding model's bound");
       const unpriced = { ...ENV_ALL, AI_CITATION_GEMINI_MODEL: "gemini-2.5-flash" } as NodeJS.ProcessEnv;
       const ue = loadCitationEngines(unpriced);
       const uf = stubFetch(() => ({ status: 200, body: answerFor("gemini", ["https://a.no/"]) }));
@@ -262,10 +348,10 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       t(f.calls.length === 1 && c.url === ANTHROPIC_MESSAGES_URL && c.init.method === "POST" &&
         c.init.headers["x-api-key"] === FAKE_KEYS.ANTHROPIC_API_KEY && c.init.headers["anthropic-version"] === "2023-06-01",
         "A1: POST /v1/messages with the key in x-api-key");
-      t(c.body.model === "claude-haiku-5-5" && c.body.system === CITATION_PANEL_INSTRUCTION && c.body.output_config.effort === "low" &&
+      t(c.body.model === "claude-haiku-5-5" && c.body.system === CITATION_PANEL_INSTRUCTION && c.body.output_config.effort === "low" && c.body.max_tokens === 16_000 &&
         c.body.messages[0].content === "Tannlege i Bodø" && c.body.tools[0].type === "web_search_20250305" &&
         c.body.tools[0].name === "web_search" && c.body.tools[0].max_uses === 3 && c.body.tools[0].user_location.country === "NO",
-        "A2: the question as the user turn, the web_search tool (max 3 searches, Norway) and the shared instruction");
+        "A2: the question as the user turn, the web_search tool (max 3 searches, Norway), the shared instruction, effort and max_tokens from the config");
       t(!JSON.stringify(c.body).includes(FAKE_KEYS.ANTHROPIC_API_KEY) && !c.url.includes(FAKE_KEYS.ANTHROPIC_API_KEY), "A3: the key is only in the header");
       t(!!r && r.citedUrls.join(" ") === "https://www.rettfrabonden.com/produsent/lia-gard https://visitnorway.no/x" && r.answerSnippet === "Her er noen forslag.",
         "A4: cited URLs come from the text citations, distinct, in order");
@@ -292,6 +378,22 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       const noSearch = parseAnthropicAnswer({ content: [{ type: "text", text: "Kun " }, { type: "text", text: "tekst." }], usage: {} });
       t(!!preR && preR.answerSnippet === "Her er tre tannleger i Bodø." && preR.citedUrls.length === 1 && noSearch?.text === "Kun tekst.",
         "A11 (S6): the snippet is the text after the last search; the preamble before it is dropped (no search: all text)");
+      const cut = await run("anthropic", stubFetch(() => ({ status: 200, body: cutOffAnswerFor("anthropic") })));
+      t(!cut.ok && cut.reason === "incomplete" && close(cut.costUsd, (12_000 * 0.1 + 16_000 * 0.5) / 1e6 + 0.01),
+        "A12 (B3): stop_reason max_tokens with only thinking and a search is incomplete, its cost booked from the usage");
+      const partial = { ...answerFor("anthropic", ["https://visitnorway.no/x"], "Her er de tre beste tannlegene i Bodø: 1."), stop_reason: "max_tokens" };
+      const contextFull = { ...answerFor("anthropic", ["https://visitnorway.no/x"]), stop_reason: "model_context_window_exceeded" };
+      const cuts = await Promise.all([partial, contextFull].map((body) => run("anthropic", stubFetch(() => ({ status: 200, body })))));
+      t(cuts.every((r) => !r.ok && r.reason === "incomplete" && r.costUsd > 0),
+        "A13 (B3): an answer cut off after some text and citations is incomplete too (what it cited so far is not what the answer cites)");
+      const empty = await run("anthropic", stubFetch(() => ({ status: 200, body: emptyAnswerFor("anthropic") })));
+      t(!empty.ok && empty.reason === "empty_answer" && close(empty.costUsd, (500 * 0.1 + 300 * 0.5) / 1e6),
+        "A14 (B3): a finished answer without visible text is empty_answer, its cost booked");
+      const noEffort = configCopy();
+      delete noEffort.engines.anthropic.models["claude-haiku-5-5"].effort;
+      const nf = stubFetch(() => ({ status: 200, body: answerFor("anthropic", []) }));
+      await run("anthropic", nf, ENV_ALL, { engines: loadCitationEngines(ENV_ALL, noEffort) });
+      t(!("output_config" in nf.calls[0].body) && nf.calls[0].body.max_tokens === 16_000, "A15: a model without effort sends no output_config (the model's default)");
     }
 
     // ── OpenAI ──
@@ -305,14 +407,30 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
         c.body.model === "gpt-6-luna" && c.body.input === "Tannlege i Bodø" && c.body.instructions === CITATION_PANEL_INSTRUCTION &&
         c.body.tools[0].type === "web_search" && c.body.tools[0].user_location.country === "NO" && c.body.max_tool_calls === 3 && c.body.store === false,
         "O1: POST /v1/responses, Bearer key, web_search tool (Norway, max 3), not stored at OpenAI");
+      t(JSON.stringify(c.body.reasoning) === JSON.stringify({ effort: "low" }) && c.body.max_output_tokens === 25_000,
+        "O1b (B3): reasoning.effort and max_output_tokens come from the config (low, 25 000)");
       t(!!r && r.citedUrls.length === 2 && r.citedUrls[0].startsWith("https://www.opplevagent.no/"), "O2: cited URLs from url_citation annotations");
       t(!!r && close(r.costUsd, (8_000 * 0.1 + 300 * 0.5) / 1e6 + 2 * 0.01), "O3: cost = tokens at $0.10/$0.50 per MTok + $0.01 per web_search_call");
       const op = byId("openai").price!;
       t(close(citationCallCostUsd(op, { inputTokens: 300_000, outputTokens: 1_000, searches: 3 }), (300_000 * 0.2 + 1_000 * 0.75) / 1e6 + 0.03) &&
         close(citationCallCostUsd(op, { inputTokens: 272_000, outputTokens: 0, searches: 0 }), (272_000 * 0.1) / 1e6),
         "O4: over 272K input tokens the long-context rates apply");
-      t(byId("openai").maxCostUsdPerCall >= citationCallCostUsd(op, { inputTokens: 272_000, outputTokens: 2_048, searches: 3 }),
-        "O5 (S8): the per-call bound covers 3 searches, a full short-context prompt and max_output_tokens");
+      t(op.maxOutputTokens >= 25_000 && byId("openai").maxCostUsdPerCall >= citationCallCostUsd(op, { inputTokens: 272_000, outputTokens: op.maxOutputTokens, searches: 3 }),
+        "O5 (S8, B3): the per-call bound covers 3 searches, a full short-context prompt and max_output_tokens (at least the 25 000 OpenAI advises for reasoning models)");
+      const cut = await run("openai", stubFetch(() => ({ status: 200, body: cutOffAnswerFor("openai") })));
+      t(!cut.ok && cut.reason === "incomplete" && close(cut.costUsd, (9_000 * 0.1 + 25_000 * 0.5) / 1e6 + 0.01),
+        "O6 (B3): status incomplete (max_output_tokens) with only reasoning and a search is incomplete, its cost booked from the usage");
+      const partial = { ...answerFor("openai", ["https://visitnorway.no/x"]), status: "incomplete", incomplete_details: { reason: "max_output_tokens" } };
+      const pr = await run("openai", stubFetch(() => ({ status: 200, body: partial })));
+      t(!pr.ok && pr.reason === "incomplete" && pr.costUsd > 0, "O7 (B3): an incomplete answer with some text and citations is incomplete too");
+      const empty = await run("openai", stubFetch(() => ({ status: 200, body: emptyAnswerFor("openai") })));
+      t(!empty.ok && empty.reason === "empty_answer" && close(empty.costUsd, (500 * 0.1 + 300 * 0.5) / 1e6 + 0.01),
+        "O8 (B3): a completed response without a message (reasoning and a search only) is empty_answer, its cost booked");
+      const noEffort = configCopy();
+      delete noEffort.engines.openai.models["gpt-6-luna"].effort;
+      const nf = stubFetch(() => ({ status: 200, body: answerFor("openai", []) }));
+      await run("openai", nf, ENV_ALL, { engines: loadCitationEngines(ENV_ALL, noEffort) });
+      t(!("reasoning" in nf.calls[0].body) && nf.calls[0].body.max_output_tokens === 25_000, "O9: a model without effort sends no reasoning (the model's default)");
     }
 
     // ── Perplexity ──
@@ -321,8 +439,9 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       const r = okOf(await run("perplexity", f));
       const c = f.calls[0];
       t(c.url === PERPLEXITY_SONAR_URL && c.url === "https://api.perplexity.ai/v1/sonar" && c.init.headers.Authorization === `Bearer ${FAKE_KEYS.PERPLEXITY_API_KEY}` && c.body.model === "sonar" &&
-        c.body.messages[0].role === "system" && c.body.messages[1].content === "Tannlege i Bodø" && c.body.web_search_options.search_context_size === "low",
-        "P1: POST /v1/sonar, Bearer key, sonar with low search context");
+        c.body.messages[0].role === "system" && c.body.messages[1].content === "Tannlege i Bodø" && c.body.web_search_options.search_context_size === "low" &&
+        c.body.max_tokens === 2_048 && Object.keys(c.body).sort().join(",") === "max_tokens,messages,model,web_search_options",
+        "P1: POST /v1/sonar, Bearer key, sonar with low search context, max_tokens from the config and no effort field");
       t(!!r && r.citedUrls.length === 2 && close(r.costUsd, 0.0064), "P2: cited URLs from `citations`; the reported usage.cost.total_cost is the cost");
       const r2 = okOf(await run("perplexity", stubFetch(() => ({ status: 200, body: {
         search_results: [{ title: "a", url: "https://a.no/1" }, { title: "b", url: "https://b.no/2" }],
@@ -331,6 +450,14 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       } }))));
       t(!!r2 && r2.citedUrls.join(",") === "https://a.no/1,https://b.no/2" && close(r2.costUsd, 2_000 / 1e6 + 0.005),
         "P3: without `citations` the search_results URLs count; without a reported cost: tokens + the $0.005 request fee");
+      const cut = await run("perplexity", stubFetch(() => ({ status: 200, body: cutOffAnswerFor("perplexity") })));
+      const partial: any = answerFor("perplexity", ["https://visitnorway.no/x"]);
+      partial.choices[0].finish_reason = "length";
+      const pr = await run("perplexity", stubFetch(() => ({ status: 200, body: partial })));
+      t(!cut.ok && cut.reason === "incomplete" && close(cut.costUsd, 0.0071) && !pr.ok && pr.reason === "incomplete" && close(pr.costUsd, 0.0064),
+        "P4 (B3): finish_reason length is incomplete, with or without text; the reported cost is booked");
+      const empty = await run("perplexity", stubFetch(() => ({ status: 200, body: emptyAnswerFor("perplexity") })));
+      t(!empty.ok && empty.reason === "empty_answer" && close(empty.costUsd, 21 / 1e6 + 0.005), "P5 (B3): a blank answer is empty_answer, its cost booked");
     }
 
     // ── Gemini ──
@@ -344,8 +471,8 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
         !c.url.includes("key=") && !c.url.includes(FAKE_KEYS.GEMINI_API_KEY) && JSON.stringify(c.body.tools) === JSON.stringify([{ google_search: {} }]) &&
         c.body.contents[0].parts[0].text === "Tannlege i Bodø" && c.body.system_instruction.parts[0].text === CITATION_PANEL_INSTRUCTION,
         "G1: generateContent on the configured model with google_search; the key in x-goog-api-key, never in the URL");
-      t(JSON.stringify(c.body.generationConfig) === JSON.stringify({ maxOutputTokens: 2048, thinkingConfig: { thinkingLevel: "minimal" } }),
-        "G1b: Gemini 3 thinking is set with thinkingLevel from the config (no thinkingBudget)");
+      t(JSON.stringify(c.body.generationConfig) === JSON.stringify({ maxOutputTokens: 8_192, thinkingConfig: { thinkingLevel: "minimal" } }),
+        "G1b: Gemini 3 thinking is set with thinkingLevel from the config's effort (no thinkingBudget); maxOutputTokens from the config");
       t(!!r && r.citedUrls.length === 0 && JSON.stringify(r.citedDomains) === JSON.stringify(["finn-tannlege.com", "legelisten.no"]),
         "G2 (S5): the expiring redirect links are not kept; the source domains come from the chunks' titles");
       t(!!r && close(r.costUsd, (1_030 * 0.3 + 250 * 2.5) / 1e6 + 2 * 0.014),
@@ -363,10 +490,38 @@ export async function runEnginesTests(opts: { log?: boolean } = {}): Promise<Tes
       t(!!ungrounded && ungrounded.searches === 0 && close(citationCallCostUsd(gp, ungrounded), (10 * 0.3 + 15 * 2.5) / 1e6),
         "G5: an answer without grounding pays no search fee; thinking tokens are output");
       const noLevel = configCopy();
-      delete noLevel.engines.gemini.models["gemini-3.5-flash-lite"].thinkingLevel;
+      delete noLevel.engines.gemini.models["gemini-3.5-flash-lite"].effort;
       const nf = stubFetch(() => ({ status: 200, body: answerFor("gemini", []) }));
       await run("gemini", nf, ENV_ALL, { engines: loadCitationEngines(ENV_ALL, noLevel) });
-      t(JSON.stringify(nf.calls[0].body.generationConfig) === JSON.stringify({ maxOutputTokens: 2048 }), "G6: a model without thinkingLevel keeps its default thinking");
+      t(JSON.stringify(nf.calls[0].body.generationConfig) === JSON.stringify({ maxOutputTokens: 8_192 }), "G6: a model without effort keeps its default thinking");
+      const cut = await run("gemini", stubFetch(() => ({ status: 200, body: cutOffAnswerFor("gemini") })));
+      t(!cut.ok && cut.reason === "incomplete" && close(cut.costUsd, (1_030 * 0.3 + 8_192 * 2.5) / 1e6 + 0.014),
+        "G7 (B3): finishReason MAX_TOKENS with only thinking is incomplete, its cost (thinking and the search query) booked");
+      const partial: any = answerFor("gemini", ["https://visitnorway.no/x"]);
+      partial.candidates[0].finishReason = "MAX_TOKENS";
+      const pr = await run("gemini", stubFetch(() => ({ status: 200, body: partial })));
+      const empty = await run("gemini", stubFetch(() => ({ status: 200, body: emptyAnswerFor("gemini") })));
+      t(!pr.ok && pr.reason === "incomplete" && !empty.ok && empty.reason === "empty_answer" && close(empty.costUsd, (30 * 0.3) / 1e6),
+        "G8 (B3): MAX_TOKENS after some text is incomplete too; a finished answer with no text is empty_answer, its cost booked");
+    }
+
+    // ── the per-call bounds cover a full call (S5, B3) ──
+    {
+      const cover = (id: CitationEngineId, u: { inputTokens: number; searches: number }) => {
+        const p = byId(id).price!;
+        return byId(id).maxCostUsdPerCall >= citationCallCostUsd(p, { inputTokens: u.inputTokens, outputTokens: p.maxOutputTokens, searches: u.searches });
+      };
+      t(cover("anthropic", { inputTokens: 100_000, searches: 3 }) && cover("perplexity", { inputTokens: 10_000, searches: 0 }) && cover("gemini", { inputTokens: 20_000, searches: 8 }),
+        "BD1 (S5): each bound covers the full token limit: Anthropic 3 searches and a 100K prompt, Perplexity a 10K prompt, Gemini 8 search queries (it has no search limit) and a 20K grounded prompt");
+    }
+
+    // ── every engine: cut off / no text (B3) ──
+    {
+      const cut = await Promise.all(ENGINES.map((e) => run(e.engine, stubFetch(() => ({ status: 200, body: cutOffAnswerFor(e.engine) })))));
+      const empty = await Promise.all(ENGINES.map((e) => run(e.engine, stubFetch(() => ({ status: 200, body: emptyAnswerFor(e.engine) })))));
+      t(cut.every((r, i) => !r.ok && r.reason === "incomplete" && r.costUsd > 0 && r.costUsd < ENGINES[i].maxCostUsdPerCall) &&
+        empty.every((r, i) => !r.ok && r.reason === "empty_answer" && r.costUsd > 0 && r.costUsd < ENGINES[i].maxCostUsdPerCall),
+        "TR1 (B3): on every engine a cut-off answer is incomplete and one without text empty_answer, never ok; both cost what the usage says");
     }
 
     // ── failures and how their cost is booked ──

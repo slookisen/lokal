@@ -10,7 +10,8 @@
  * and with the per-call bound from the config, no overlapping runs, the
  * scheduler (15 min after boot, hourly, behind the exclusive boot gate without holding it, a
  * failed run logged without keys), the status (models and prices, month_cost_usd ≤ 30), GET
- * /admin/analytics/ai-citations[/status] (auth, 200 with cost_usd_total, 400 on a bad week), the
+ * /admin/analytics/ai-citations[/status] (auth, 200 with cost_usd_total, 400 on a bad week), a
+ * cut-off answer and one without text stored as errors and kept out of the share (B3), the
  * wiring in src/index.ts, and that no key reaches a log line, an error, the DB or a response.
  */
 import Database from "better-sqlite3";
@@ -26,9 +27,9 @@ import {
   runAiCitationPanelTick,
   startAiCitationPanelScheduler,
 } from "./panel-job";
-import { aiCitationWeekTotals, loadCitationPrompts } from "./panel-runner";
+import { aiCitationWeekTotals, getAiCitationWeekView, loadCitationPrompts } from "./panel-runner";
 import { ANTHROPIC_MESSAGES_URL, GEMINI_API_BASE, OPENAI_RESPONSES_URL, PERPLEXITY_SONAR_URL, loadCitationEngines, type CitationEngineId } from "./engines";
-import { ENV_ALL, FAKE_KEYS, answerFor, configCopy, stubFetch } from "./engines.test";
+import { ENV_ALL, FAKE_KEYS, answerFor, configCopy, cutOffAnswerFor, emptyAnswerFor, stubFetch } from "./engines.test";
 import {
   AI_CITATION_PANEL_BOOT_DELAY_MS,
   DENTAL_GEOCODE_BOOT_DELAY_MS,
@@ -432,6 +433,35 @@ export async function runPanelJobTests(opts: { log?: boolean } = {}): Promise<Te
         "EK1: a provider error is stored as its code only");
       dump(db);
       emitted.push(JSON.stringify(status({ db, env: ENV_ON_ALL, now: NOW })));
+    }
+
+    // ── a cut-off answer and one without text (B3) ──
+    {
+      __resetAiCitationPanelForTesting();
+      const db = newDb();
+      const [whole, cut, blank] = PROMPTS.slice(0, 3);
+      const f = stubFetch((url, body) => {
+        const id = engineOfUrl(url);
+        if (!id) return new Error(`unexpected request ${url}`);
+        const sent = JSON.stringify(body);
+        if (sent.includes(cut.prompt)) return { status: 200, body: cutOffAnswerFor(id) };
+        if (sent.includes(blank.prompt)) return { status: 200, body: emptyAnswerFor(id) };
+        return { status: 200, body: answerFor(id, ["https://www.rettfrabonden.com/produsent/x"]) };
+      });
+      const r = await runAiCitationPanelTick({ env: ENV_ON_ALL, db, fetchImpl: f.fetchImpl, now: () => NOW, log, prompts: [whole, cut, blank] });
+      emitted.push(JSON.stringify(r));
+      const rows = db.prepare("SELECT prompt_id, status, reason, cost_usd FROM ai_citation_results WHERE week = ?").all(WEEK) as any[];
+      const of = (id: string) => rows.filter((x) => x.prompt_id === id);
+      t(!r.skipped && r.calls === 12 && r.errors === 8 && of(whole.id).length === 4 && of(whole.id).every((x) => x.status === "ok") &&
+        of(cut.id).length === 4 && of(cut.id).every((x) => x.status === "error" && x.reason === "incomplete" && x.cost_usd > 0) &&
+        of(blank.id).length === 4 && of(blank.id).every((x) => x.status === "error" && x.reason === "empty_answer" && x.cost_usd > 0),
+        "TR2 (B3): with the real adapters a cut-off answer is stored as error incomplete and one without text as empty_answer, each with its cost");
+      const view = getAiCitationWeekView({ db, week: WEEK, env: ENV_ON_ALL, now: NOW, prompts: [whole, cut, blank] });
+      emitted.push(JSON.stringify(view));
+      t(view.engines.length === 4 && view.engines.every((e) => e.prompts === 1 && e.hits === 1 && e.share === 1 && e.errors === 2) &&
+        view.cost_usd_total === Math.round(rows.reduce((sum, x) => sum + x.cost_usd, 0) * 1e6) / 1e6,
+        "TR3 (B3): the week view counts them as errors, not as answers without a hit (share 1 of 1, not 1 of 3); their cost is in cost_usd_total");
+      dump(db);
     }
 
     // ── wiring in src/index.ts ──
