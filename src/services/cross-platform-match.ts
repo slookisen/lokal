@@ -12,15 +12,18 @@
 // reported as `match` in this priority order:
 //   1. email    — same full address (case-insensitive)
 //   2. domain   — same e-mail domain, unless that domain is a free-mail /
-//                 consumer-ISP domain (FREE_MAIL_DOMAINS): two unrelated
-//                 gmail.com mailboxes must never block each other
+//                 consumer-ISP domain (FREE_MAIL_DOMAINS) or a regional
+//                 internet provider (SHARED_ISP_MAIL_DOMAINS): two unrelated
+//                 gmail.com or enivest.net mailboxes must never block each other
 //   3. website  — same website host (www. stripped), unless the host is a
-//                 shared platform (social media, search, ...)
+//                 shared platform (social media, search, ...) or a catalogue /
+//                 tourism-board host standing in for the producer's own site
 //   4. org_nr   — same 9-digit organisation number, both sides having one
 //
 // Pure functions, no I/O. Normalisation only; nothing here writes data.
 
 import { FREE_MAIL_DOMAINS } from "./recipient-policy";
+import { isDirectoryOrAggregatorHost } from "./cross-source-validator";
 
 export type CrossPlatformMatch = "email" | "domain" | "website" | "org_nr";
 
@@ -70,6 +73,33 @@ const SHARED_WEBSITE_HOSTS: ReadonlySet<string> = new Set([
   "matmerk.no",
 ]);
 
+/**
+ * E-mail domains of regional internet providers that many unrelated farms use
+ * as their address. FREE_MAIL_DOMAINS was built for reporting and does not
+ * list them; this list is used ONLY here, so matching stays narrow without
+ * widening the reporting classification.
+ */
+const SHARED_ISP_MAIL_DOMAINS: ReadonlySet<string> = new Set([
+  "enivest.net",
+  "hesbynett.no",
+  "haugnett.no",
+  "sensewave.com",
+  "mimer.no",
+  "kvamnet.no",
+  "sol.no",
+  "tussa.com",
+  "nextgentel.com",
+  "telia.no",
+]);
+
+function isSharedIspMailDomain(domain: string): boolean {
+  if (SHARED_ISP_MAIL_DOMAINS.has(domain)) return true;
+  for (const isp of SHARED_ISP_MAIL_DOMAINS) {
+    if (domain.endsWith("." + isp)) return true;
+  }
+  return false;
+}
+
 export function normalizeEmailForMatch(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const v = value.trim().toLowerCase();
@@ -85,6 +115,7 @@ export function emailDomainForMatch(value: unknown): string | null {
   const domain = email.slice(at + 1).trim().replace(/^www\./, "");
   if (!domain || domain.indexOf(".") < 0) return null;
   if (FREE_MAIL_DOMAINS.has(domain)) return null;
+  if (isSharedIspMailDomain(domain)) return null;
   return domain;
 }
 
@@ -106,6 +137,9 @@ export function websiteDomainForMatch(value: unknown): string | null {
   for (const shared of SHARED_WEBSITE_HOSTS) {
     if (host.endsWith("." + shared)) return null;
   }
+  // Catalogue / tourism-board hosts (visitnorway.com, lokalmat.no, ...) stand in
+  // for a producer's own site in seed data; two listings there are not one producer.
+  if (isDirectoryOrAggregatorHost(host)) return null;
   return host;
 }
 

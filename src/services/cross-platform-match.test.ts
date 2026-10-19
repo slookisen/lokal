@@ -16,6 +16,7 @@ import {
   CrossPlatformIndex,
   buildCrossPlatformIdentity,
   emailDomainForMatch,
+  matchCrossPlatformIdentity,
   normalizeOrgNrForMatch,
   websiteDomainForMatch,
 } from "./cross-platform-match";
@@ -51,6 +52,24 @@ export function runCrossPlatformMatchTests(): TestSummary {
   eq(websiteDomainForMatch("druehagen.no"), "druehagen.no", "n6: bare host accepted");
   eq(websiteDomainForMatch("https://www.facebook.com/druehagen"), null, "n7: shared platform host is not a producer identity");
   eq(websiteDomainForMatch(""), null, "n8: empty website");
+  // B1: catalogue / tourism hosts are never a producer's own website
+  eq(websiteDomainForMatch("https://www.visitnorway.com/listings/gard-a/123"), null, "n11: visitnorway.com listing is not a producer identity");
+  eq(websiteDomainForMatch("https://www.visitnorway.com/listings/gard-b/456"), null, "n12: a second visitnorway.com listing does not match the first");
+  eq(websiteDomainForMatch("https://siderruta.no/gard-c"), null, "n13: siderruta.no is a catalogue host");
+  eq(websiteDomainForMatch("https://lokalmat.no/produsent/x"), null, "n14: lokalmat.no is a catalogue host");
+  eq(websiteDomainForMatch("https://rekonorge.no/x"), null, "n15: rekonorge.no is a catalogue host");
+  eq(websiteDomainForMatch("https://visitnorwayfarm.no/"), "visitnorwayfarm.no", "n16: a producer domain merely containing a catalogue name still matches");
+  // B2: regional ISP mail domains are never a producer identity
+  eq(emailDomainForMatch("gard-a@enivest.net"), null, "n17: enivest.net mailbox has no matchable domain");
+  eq(emailDomainForMatch("gard-b@enivest.net"), null, "n18: a second enivest.net mailbox has none either");
+  eq(emailDomainForMatch("x@hesbynett.no"), null, "n19: hesbynett.no excluded");
+  eq(emailDomainForMatch("x@post.telia.no"), null, "n20: subdomain of an ISP domain excluded");
+  eq(emailDomainForMatch("post@enivestgard.no"), "enivestgard.no", "n21: a producer domain merely containing an ISP name still matches");
+  {
+    const a = buildCrossPlatformIdentity({ email: "gard-a@enivest.net", website: "https://www.visitnorway.com/listings/a" });
+    const b = buildCrossPlatformIdentity({ email: "gard-b@enivest.net", website: "https://www.visitnorway.com/listings/b" });
+    eq(matchCrossPlatformIdentity(a, b), null, "n22: two unrelated producers on shared ISP and catalogue host do not match");
+  }
   eq(normalizeOrgNrForMatch("123 456 789"), "123456789", "n9: org.nr spaces stripped");
   eq(normalizeOrgNrForMatch("12345"), null, "n10: short org.nr rejected");
 
