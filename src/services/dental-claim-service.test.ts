@@ -477,6 +477,123 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
     assertTrue(capped.filter((p) => typeof p === "string" && String(p).startsWith("id")).length === 500, "exclude_ids: capped at 500");
   }
 
+  // ── A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d punkt 4b:
+  //    ClaimFilter.ids (the akutt round §4.1c claims a snapshot of ids) ─────
+  {
+    const { clause, params } = buildWhereClause(
+      { ids: ["a1", "b2", "", 42 as unknown as string, "x".repeat(65), "c".repeat(64)] },
+      NOW
+    );
+    const c = norm(clause);
+    assertTrue(c.includes("id IN (?,?,?)"), "ids-01: the three valid ids (1..64 characters) give a three-placeholder IN");
+    assertTrue(params.slice(-3).join(",") === `a1,b2,${"c".repeat(64)}`, "ids-02: the ids are bound as the trailing params");
+    const { clause: absent } = buildWhereClause({ enrichment_state: "raw" }, NOW);
+    assertTrue(!norm(absent).includes("id IN"), "ids-03: omitted ids adds no clause");
+    const many = Array.from({ length: 600 }, (_, i) => `id${i}`);
+    const { clause: cappedClause, params: capped } = buildWhereClause({ ids: many }, NOW);
+    assertTrue(
+      capped.filter((p) => typeof p === "string" && String(p).startsWith("id")).length === 500 &&
+        (norm(cappedClause).match(/id IN \(([?,]+)\)/)?.[1].split(",").length ?? 0) === 500,
+      "ids-04: capped at 500, as exclude_ids"
+    );
+    const { clause: both } = buildWhereClause({ ids: ["a1"], exclude_ids: ["b2"] }, NOW);
+    assertTrue(norm(both).includes("id NOT IN (?)") && norm(both).includes("id IN (?)"), "ids-05: ids and exclude_ids compose");
+    for (const bad of [[], ["", 7], "a1", null, { 0: "a1" }] as unknown[]) {
+      const { clause: none, params: noneParams } = buildWhereClause({ ids: bad as string[] }, NOW);
+      assertTrue(
+        / AND 0$/.test(norm(none)) && !norm(none).includes("id IN") && noneParams.length === 1,
+        `ids-06: ids ${JSON.stringify(bad)} (no valid id) is a false clause, never the whole pool`
+      );
+    }
+  }
+  {
+    const { clause: withIds } = buildWhereClause({ enrichment_state: "enriched", ids: ["a1"] }, NOW);
+    assertTrue(!norm(withIds).includes("om_oss IS NOT NULL"), "ids-07: with ids, the completion-mode exclusion of rich rows does not apply");
+    const c = norm(withIds);
+    assertTrue(
+      c.includes("enrichment_state = ?") &&
+        c.includes("(verification_status IS NULL OR verification_status NOT IN ('needs_review','rejected'))") &&
+        c.includes("(is_inactive IS NULL OR is_inactive = 0)") &&
+        c.includes("extraction_unreachable_since") &&
+        c.includes("catalog_class"),
+      "ids-08: with ids, every other exclusion still applies (state, junk, inactive, parking, non-clinic)"
+    );
+    const { clause: withoutIds } = buildWhereClause({ enrichment_state: "enriched" }, NOW);
+    assertTrue(norm(withoutIds).includes("om_oss IS NOT NULL"), "ids-09: without ids, the completion-mode exclusion is unchanged (regression pin)");
+  }
+  // ids against real rows via claimBatch(), same isolated-DB idiom as the
+  // homepage-parking block above.
+  {
+    const prevPath = process.env.DENTAL_DB_PATH;
+    process.env.DENTAL_DB_PATH = ":memory:";
+    const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules([
+      require.resolve("../database/db-factory"),
+      require.resolve("./dental-store"),
+      require.resolve("./dental-claim-service"),
+    ]);
+    const dbFac = require("../database/db-factory") as typeof import("../database/db-factory");
+    dbFac.__resetDbFactoryForTesting();
+    const dstore = require("./dental-store") as typeof import("./dental-store");
+    const { claimBatch: claim, releaseBatch: release } = require("./dental-claim-service") as typeof import("./dental-claim-service");
+    try {
+      const db = dbFac.getDb("dental");
+      const mk = (navn: string, org: string, set: string) => {
+        const id = dstore.createDentalAgent({ navn, org_nr: org } as any);
+        db.prepare(`UPDATE dental_agents SET enrichment_state = 'enriched', ${set} WHERE id = ?`).run(id);
+        return id;
+      };
+      const RICH =
+        "om_oss = 'Vi tar imot akuttpasienter.', treatments = '[\"Akutt\"]', opening_hours = '[{\"day\":\"Man\"}]', specialists = '[\"Kari\"]'";
+      const rich = mk("Rik Akutt Tannklinikk AS", "912600001", RICH);
+      const thin = mk("Tynn Akutt Tannklinikk AS", "912600002", "om_oss = NULL");
+      const other = mk("Annen Tannklinikk AS", "912600003", "om_oss = NULL");
+      const inactive = mk("Nedlagt Akutt Tannklinikk AS", "912600004", `${RICH}, is_inactive = 1`);
+      const review = mk("Til Gjennomgang Akutt Tannklinikk AS", "912600005", `${RICH}, verification_status = 'needs_review'`);
+      const held = mk("Holdt Akutt Tannklinikk AS", "912600006", RICH);
+      claim("other-worker", 500, { enrichment_state: "enriched", ids: [held] });
+      const ids = (rows: Array<{ id: string }>) => rows.map((r) => r.id).sort();
+      const all = [rich, thin, other, inactive, review, held];
+
+      const withIds = claim("ids-w1", 12, { enrichment_state: "enriched", ids: [rich] });
+      assertTrue(JSON.stringify(ids(withIds)) === JSON.stringify([rich]), "ids-db-01: a rich enriched row named in ids is claimed");
+      release("ids-w1", all);
+      const withoutIds = claim("ids-w2", 12, { enrichment_state: "enriched" });
+      assertTrue(
+        !ids(withoutIds).includes(rich) && ids(withoutIds).includes(thin),
+        "ids-db-02: without ids, the same rich row is not claimed (completion-mode exclusion), a thin one is"
+      );
+      release("ids-w2", all);
+
+      const named = claim("ids-w3", 12, { enrichment_state: "enriched", ids: [rich, thin, inactive, review, held] });
+      assertTrue(
+        JSON.stringify(ids(named)) === JSON.stringify([rich, thin].sort()),
+        "ids-db-03: only the named ids are claimed (not «Annen»); an inactive, a needs_review and a row claimed by another worker stay out"
+      );
+      release("ids-w3", all);
+      assertTrue(claim("ids-w4", 12, { ids: [rich, thin] }).length === 2, "ids-db-04: ids without enrichment_state claims the named rows");
+      release("ids-w4", all);
+      assertTrue(claim("ids-w5", 1, { ids: [rich, thin] }).length === 1, "ids-db-05: the batch size still caps the claim");
+      release("ids-w5", all);
+      assertTrue(
+        claim("ids-w6", 12, { ids: [] }).length === 0 && claim("ids-w6", 12, { ids: ["", 7] as unknown as string[] }).length === 0,
+        "ids-db-06: an ids list with no valid id claims nothing, though claimable rows exist"
+      );
+      assertTrue(
+        claim("ids-w7", 12, { ids: [rich, thin], exclude_ids: [rich] }).map((r) => r.id).join() === thin,
+        "ids-db-07: exclude_ids still applies with ids"
+      );
+      release("ids-w7", all);
+    } catch (err) {
+      failed++;
+      failures.push(`ClaimFilter.ids claim pool: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      if (prevPath === undefined) delete process.env.DENTAL_DB_PATH;
+      else process.env.DENTAL_DB_PATH = prevPath;
+      dbFac.__resetDbFactoryForTesting();
+      restoreModuleCache();
+    }
+  }
+
   return { passed, failed, failures };
 }
 
