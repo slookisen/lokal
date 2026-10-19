@@ -7,14 +7,18 @@
  * that stores it. By prefix:
  *   Q   normaliseSource via mergeFieldProvenance (admin-knowledge.ts): the
  *       quote survives in the array and the {sources} form, trimmed and cut
- *       to 300 code points; a quote that is not a string, or blank, is
- *       dropped; quote_basis only with a quote and one of the two values.
+ *       to 300 code points (never inside a surrogate pair, trimmed at the
+ *       end again, read from the first 600 UTF-16 units only); a quote that
+ *       is not a string, or blank, is dropped; quote_basis only with a quote
+ *       and one of the two values.
  *       Dedup: a source with a quote replaces, in the place of the first,
  *       every stored source with the same source_type::value (a stamp or an
  *       older quote), so the list does not grow; a source without a quote is
  *       a duplicate as before; the inputs are not changed.
  *   P   PUT /api/tannlege/agents/:id (dental.ts): with acute_vakt in the
- *       validated body the stored quotes are removed before the merge; an
+ *       validated body the stored quotes are removed before the merge (with
+ *       no field_provenance in the body nothing else in the column changes,
+ *       audit entries such as inactive and hjemmeside included); an
  *       incoming quote is kept only on a source with value "1" when the body
  *       has acute_vakt = 1; the answer's acute_vakt_quote is stored, missing
  *       or dropped, and absent for a PUT that is not about acute_vakt.
@@ -205,6 +209,34 @@ export async function runDentalAgentPutAcuteVaktQuoteTests(opts: { log?: boolean
         "Q23: without a quote the merge is as before (dedup keeps the first, a new source is appended)"
       );
     }
+    {
+      const max = PROVENANCE_QUOTE_MAX_CODE_POINTS;
+      const tooth = "\u{1F9B7}";
+      const cutTo = (quote: string) => merged1([{ ...quoted, quote }])[0]?.quote;
+      eq(cutTo("a".repeat(max - 2) + " \u3000" + "bcd"), "a".repeat(max - 2), "Q24: a quote whose cut at 300 code points ends on whitespace is trimmed at the end");
+      eq(cutTo("a".repeat(max - 1) + "\n" + "b".repeat(10)), "a".repeat(max - 1), "Q25: ... also for a line break as the 300th code point");
+      // Array.from reads the first 2 × 300 UTF-16 units; these straddle that slice and the 300th code point.
+      eq(cutTo("a" + tooth.repeat(max)), "a" + tooth.repeat(max - 1), "Q26a: a pair the 600-unit slice splits lies past the 300 code points kept (no lone surrogate)");
+      eq(cutTo(tooth.repeat(max) + "b"), tooth.repeat(max), "Q26b: 300 pairs filling the 600 units are kept whole");
+      eq(cutTo("a".repeat(max - 1) + tooth + "c"), "a".repeat(max - 1) + tooth, "Q26c: a pair as the 300th code point is kept whole");
+      eq(cutTo("a".repeat(max - 1) + tooth.repeat(max)), "a".repeat(max - 1) + tooth, "Q26d: ... also with more pairs past the 600-unit slice");
+      // The cost of the cut does not grow with the quote: Array.from is
+      // watched for the one merge and put back before anything else runs.
+      const realFrom = Array.from;
+      let longest = 0;
+      let long: string | undefined;
+      (Array as { from: unknown }).from = function (this: unknown, items: unknown, ...rest: unknown[]) {
+        if (typeof items === "string") longest = Math.max(longest, items.length);
+        return (realFrom as (...args: unknown[]) => unknown).apply(this, [items, ...rest]);
+      };
+      try {
+        long = cutTo("x".repeat(100_000));
+      } finally {
+        Array.from = realFrom;
+      }
+      ok(long === "x".repeat(max) && longest > 0 && longest <= 2 * max,
+        `Q27: Array.from reads at most 600 UTF-16 units of a 100 000-unit quote (read ${longest})`);
+    }
 
     // ── P / E: the PUT route against an in-memory DB ──────────────────────
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
@@ -365,7 +397,7 @@ export async function runDentalAgentPutAcuteVaktQuoteTests(opts: { log?: boolean
     }
     {
       const id = mk("Enkeltpost Sitat Tannklinikk AS", 1, { acute_vakt: quotedStored });
-      const r = await put(id, { acute_vakt: 1 });
+      const r = await put(id, { acute_vakt: 1, field_provenance: { acute_vakt: [stampIn()] } });
       const p = prov(id);
       ok(r.body?.acute_vakt_quote === "missing" && Array.isArray(p.acute_vakt) && !hasAcuteVaktQuote(p) && card(id).akutt === "accepts",
         "P32: a stored single-record entry (which the merge wraps in an array) loses its quote too");
@@ -402,6 +434,48 @@ export async function runDentalAgentPutAcuteVaktQuoteTests(opts: { log?: boolean
       const p = prov(id).acute_vakt;
       ok(r.body?.acute_vakt_quote === "stored" && p.length === 1 && p[0].quote === QUOTE && !("quote_basis" in p[0]),
         "P38: a new quote replaces the old one (one source); an unknown quote_basis is not stored and the old one does not linger");
+    }
+
+    // P39–P43: acute_vakt with no field_provenance in the body removes the
+    // stored quotes and writes every other entry back as stored, also those
+    // that are not lists of sources: `inactive` and `hjemmeside`, built here
+    // by the helpers the mark-inactive and hjemmeside-cleanup routes write
+    // with, and a source whose value is not a string.
+    {
+      const { mergeInactiveProvenance } = require("./admin-dental-mark-inactive") as typeof import("./admin-dental-mark-inactive");
+      const { mergeHjemmesideCleanupProvenance } = require("./admin-dental-hjemmeside-cleanup") as typeof import("./admin-dental-hjemmeside-cleanup");
+      const inactive = { reason: "Nedlagt ifølge Brønnøysund", marked_inactive_at: "2026-10-01T08:00:00.000Z" };
+      const hjemmeside = { cleaned_reason: "directory", previous_value: "https://www.gulesider.no/klinikk", cleaned_at: "2026-10-02T09:00:00.000Z" };
+      const behandlere = [{ source_type: "own_homepage", value: 4, fetched_at: "2026-09-01T00:00:00Z" }];
+      const column = (acuteVaktEntry: unknown) =>
+        mergeHjemmesideCleanupProvenance(
+          mergeInactiveProvenance(JSON.stringify({ acute_vakt: acuteVaktEntry, telefon: telefonProv, antall_behandlere: behandlere }), inactive),
+          hjemmeside
+        );
+      const quotedWithBasis = { ...quotedStored, quote_basis: "aapningstider_paa_siden" };
+      const shapes: Array<[string, unknown, unknown]> = [
+        ["array", [quotedWithBasis, { source_type: "brreg", value: "1", fetched_at: "t" }], [stamp, { source_type: "brreg", value: "1", fetched_at: "t" }]],
+        ["{sources}", { sources: [quotedWithBasis], note: "stage_v" }, { sources: [stamp], note: "stage_v" }],
+        ["single record", quotedWithBasis, stamp],
+      ];
+      for (const [shape, stored, expected] of shapes) {
+        const id = mk(`Revisjon ${shape} Tannklinikk AS`, 1, column(stored));
+        const r = await put(id, { acute_vakt: 1 });
+        ok(r.status === 200 && r.body?.acute_vakt_quote === "missing" && r.body.fields_updated.includes("field_provenance"),
+          `P39 (${shape}): PUT acute_vakt 1 with no field_provenance on a row with a quote and audit entries -> 200, «missing», field_provenance written`);
+        ok(provColumn(id) === column(expected),
+          `P40 (${shape}): the column is the stored one with only quote and quote_basis removed, byte for byte (got ${provColumn(id)})`);
+        const p = prov(id);
+        ok(canon(p.inactive) === canon(inactive) && canon(p.hjemmeside) === canon(hjemmeside) && canon(p.antall_behandlere) === canon(behandlere),
+          `P41 (${shape}): the inactive and hjemmeside entries and the source with a number value survive`);
+        ok(!(provColumn(id) ?? "").includes(`"quote`) && !hasAcuteVaktQuote(p) && card(id).akutt !== "vakt",
+          `P42 (${shape}): the acute_vakt quote is gone (no «Akuttvakt»)`);
+      }
+      const id = mk("Revisjon Uten Sitat Tannklinikk AS", 1, column([stamp]));
+      const before = provColumn(id);
+      const r = await put(id, { acute_vakt: 1 });
+      ok(r.status === 200 && provColumn(id) === before && !r.body.fields_updated.includes("field_provenance"),
+        "P43: with audit entries and no quote to remove, field_provenance is not written (byte-identical)");
     }
   } catch (err: any) {
     failed++;

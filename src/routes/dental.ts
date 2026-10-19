@@ -370,7 +370,8 @@ router.post("/agents", requireAdmin, (req: Request, res: Response) => {
 // quote. So that only the extraction that writes acute_vakt can give «vakt»:
 //   - when the validated body has acute_vakt, the quote (with its
 //     quote_basis) is removed from every stored acute_vakt source before
-//     the merge, also when the body has no field_provenance;
+//     the merge, also when the body has no field_provenance (then nothing
+//     else in the column changes);
 //   - an incoming acute_vakt source keeps its quote only when its value is
 //     "1" and the validated body has acute_vakt = 1 (not stripped);
 //     otherwise the quote is removed before the merge.
@@ -512,8 +513,16 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
         existingProv = existingAgent.field_provenance as Record<string, unknown>;
       }
       const storedProv = acuteVakt !== undefined ? mapAcuteVaktSources(existingProv, withoutQuote) : existingProv;
-      if (incomingProv || storedProv !== existingProv) {
-        result.data.field_provenance = mergeFieldProvenance(storedProv, (incomingProv ?? {}) as any) as any;
+      if (incomingProv) {
+        result.data.field_provenance = mergeFieldProvenance(storedProv, incomingProv as any) as any;
+      } else if (storedProv !== existingProv) {
+        // No field_provenance to merge: only the quotes go, every other entry
+        // is written back as stored. mergeFieldProvenance would rewrite the
+        // column (an entry that is not a list of sources, such as `inactive`
+        // from admin-dental-mark-inactive or `hjemmeside` from
+        // admin-dental-hjemmeside-cleanup, becomes [], as does a source whose
+        // value is not a string).
+        result.data.field_provenance = storedProv as any;
       }
     }
     const acuteVaktQuote =

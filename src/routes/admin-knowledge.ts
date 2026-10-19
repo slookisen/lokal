@@ -226,11 +226,18 @@ function normaliseSource(s: IncomingSource): ProvenanceRecord | null {
   if (s.source_url) rec.source_url = String(s.source_url);
   // F1-S4d: the quote is kept only as a string with more than whitespace in
   // it, trimmed and cut to 300 code points (Array.from, so a surrogate pair
-  // is never split); anything else is dropped, as is quote_basis without a
-  // quote or with a value outside PROVENANCE_QUOTE_BASES.
+  // is never split), and trimmed at the end again, as the cut may end on
+  // whitespace; anything else is dropped, as is quote_basis without a quote
+  // or with a value outside PROVENANCE_QUOTE_BASES. Array.from reads only the
+  // first 2 × 300 UTF-16 units, so the cost does not grow with the quote: a
+  // code point is one or two units, so those units hold the first 300 code
+  // points whole, and a pair the slice splits starts after them and is cut.
   const quote = typeof s.quote === "string" ? s.quote.trim() : "";
   if (quote) {
-    rec.quote = Array.from(quote).slice(0, PROVENANCE_QUOTE_MAX_CODE_POINTS).join("");
+    rec.quote = Array.from(quote.slice(0, 2 * PROVENANCE_QUOTE_MAX_CODE_POINTS))
+      .slice(0, PROVENANCE_QUOTE_MAX_CODE_POINTS)
+      .join("")
+      .trimEnd();
     const basis = PROVENANCE_QUOTE_BASES.find((b) => b === s.quote_basis);
     if (basis) rec.quote_basis = basis;
   }
