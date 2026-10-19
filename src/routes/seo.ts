@@ -4821,8 +4821,7 @@ export function buildProducerFaqJsonLd(params: {
 //   - category-tag fallback (no real product list)      → "tilbyr"
 //   - real product list, confirmed direct-sale signal    → "selger"
 //   - real product list, no confirmed direct-sale signal → "produserer"
-// "bestill direkte" only appears with a confirmed direct-sale signal;
-// otherwise the closing clause is "finn kontaktinfo".
+// The closing clause is always "finn kontaktinfo" (no "bestill direkte" any more, 2026-10-18).
 //
 // Extracted so the DB-derivation logic used by the /produsent/:slug route
 // handler is directly unit-testable without a DB — round-2 review found two
@@ -4875,8 +4874,11 @@ export function buildProducerAnswerFirstOpening(params: {
 
   const verbNo = !usingRealProducts ? "tilbyr" : hasDirectSaleSignal ? "selger" : "produserer";
   const verbEn = !usingRealProducts ? "offers" : hasDirectSaleSignal ? "sells" : "produces";
-  const closingNo = hasDirectSaleSignal ? "finn kontaktinfo og bestill direkte under" : "finn kontaktinfo under";
-  const closingEn = hasDirectSaleSignal ? "find contact details and order directly below" : "find contact details below";
+  // dev-request 2026-10-08-malsetning-bestill-direkte-ordlyd-produsentside (Daniel, alt. C):
+  // the closing clause no longer urges "bestill direkte" on any page, also with a confirmed
+  // sale signal (a producer owner objected). The signal still picks the verb ("selger").
+  const closingNo = "finn kontaktinfo under";
+  const closingEn = "find contact details below";
 
   if (lang === "en") {
     const whatPartEn = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " and more" : "");
