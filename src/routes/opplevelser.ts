@@ -15702,6 +15702,8 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
+import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
+import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
 import { recordRun } from "../services/run-ledger";
 import { markJobCompleted, resolveDailyJobLastRunAt } from "../services/boot-job-gate";
 import {
@@ -18579,6 +18581,8 @@ export type GardssalgOutreachEligibility =
       last_sent_at?: string;
       suppressed_by?: string;
       cross_platform?: boolean;
+      // cross-platform suppression only: which rule matched the same producer.
+      match?: CrossPlatformMatch;
       // reason "hard_bounced" only: the email_bounces row that suppressed it.
       bounce_type?: string;
       bounced_at?: string;
@@ -18677,6 +18681,8 @@ export function computeGardssalgOutreachSendEligibility(
   const cooldownCutoff = gardssalgOutreachCooldownCutoffIso();
 
   const out: GardssalgOutreachEligibility[] = [];
+  // Built on first use, once per call (not per provider).
+  let rfbSendIndex: ReturnType<typeof getRfbSendIndexForOpplevagent> | null = null;
 
   for (const providerId of providerIds) {
     const pf = preflightById.get(providerId);
@@ -18699,8 +18705,16 @@ export function computeGardssalgOutreachSendEligibility(
     }
 
     const providerRow = expDb
-      .prepare(`SELECT navn, slug, epost FROM experience_providers WHERE id = ?`)
-      .get(providerId) as { navn: string | null; slug: string | null; epost: string | null } | undefined;
+      .prepare(`SELECT navn, slug, epost, org_nr, hjemmeside FROM experience_providers WHERE id = ?`)
+      .get(providerId) as
+      | {
+          navn: string | null;
+          slug: string | null;
+          epost: string | null;
+          org_nr: string | null;
+          hjemmeside: string | null;
+        }
+      | undefined;
 
     const email = providerRow?.epost?.trim();
     if (!email) {
@@ -18800,16 +18814,33 @@ export function computeGardssalgOutreachSendEligibility(
     // lookup stays, and a recent cross-platform send is surfaced on the
     // ELIGIBLE row as cross_platform_recent so daily-prep and run reports can
     // show the overlap if reply/complaint rates ever diverge.
-    const rfbDb = getRfbDb();
-    const crossPrior = rfbDb
-      .prepare(
-        `SELECT sent_at, vertical_id FROM outreach_sent_log
-          WHERE recipient_email IS NOT NULL
-            AND LOWER(recipient_email) = LOWER(?)
-            AND sent_at >= ?
-          ORDER BY sent_at DESC LIMIT 1`,
-      )
-      .get(email, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
+    //
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // the lookup now recognises the same PRODUCER, not only the same address
+    // (cross-platform-match.ts: e-mail domain unless free-mail, website, org.nr).
+    // The exact-address hit keeps its informational behaviour above (Daniel
+    // 2026-08-20); a hit on domain / website / org_nr is the Druehagen case —
+    // two addresses, one producer — and BLOCKS, reported with `match`.
+    if (!rfbSendIndex) rfbSendIndex = getRfbSendIndexForOpplevagent(getRfbDb(), cooldownCutoff);
+    const crossFound = rfbSendIndex.find(
+      buildCrossPlatformIdentity({ email, website: providerRow?.hjemmeside, orgNr: providerRow?.org_nr }),
+    );
+    if (crossFound && crossFound.match !== "email") {
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "cooldown_suppressed",
+        last_sent_at: crossFound.hit.last_sent_at,
+        suppressed_by: crossFound.hit.vertical_id,
+        cross_platform: true,
+        match: crossFound.match,
+      });
+      continue;
+    }
+    const crossPrior = crossFound
+      ? { sent_at: crossFound.hit.last_sent_at, vertical_id: crossFound.hit.vertical_id }
+      : undefined;
 
     out.push({
       provider_id: providerId,
@@ -19013,6 +19044,9 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     let hardBouncedCount = 0;
     let blocklistedCount = 0;
     let crossPlatformCooldownCount = 0;
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // which rule suppressed each cross-platform row (dry-run visibility).
+    const crossPlatformMatches: Array<{ provider_id: string; match: CrossPlatformMatch }> = [];
     let preflightNoGoCount = 0;
     let personalAddressCount = 0;
 
@@ -19052,14 +19086,19 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     // beyond the shared readiness/preflight machinery.
     const idPlaceholders = outreachReadyIds.map(() => "?").join(", ");
     const baseRows = expDb
-      .prepare(`SELECT id, navn, epost, created_at FROM experience_providers WHERE id IN (${idPlaceholders})`)
+      .prepare(
+        `SELECT id, navn, epost, created_at, org_nr, hjemmeside FROM experience_providers WHERE id IN (${idPlaceholders})`,
+      )
       .all(...outreachReadyIds) as Array<{
       id: string;
       navn: string;
       epost: string | null;
       created_at: string | null;
+      org_nr: string | null;
+      hjemmeside: string | null;
     }>;
     const baseById = new Map(baseRows.map((r) => [r.id, r]));
+    const providerWebById = baseById;
 
     // Own-table send history for the outreach_ready cohort — fetched once,
     // grouped by LOWER(email), most-recent REAL (is_test = 0) send only.
@@ -19083,18 +19122,11 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     // Cross-platform (RFB) 60-day cooldown — read-only, same query pattern as
     // computeGardssalgOutreachSendEligibility (~L9568-9591) above. Scoped to
     // OUTREACH_COOLDOWN_DAYS, NOT GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS.
-    const crossPlatformByEmail = new Map<string, { sent_at: string; vertical_id: string }>();
-    for (const r of rfbDb
-      .prepare(
-        `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
-           FROM outreach_sent_log
-          WHERE recipient_email IS NOT NULL AND recipient_email != ''
-            AND sent_at >= ?
-          GROUP BY LOWER(recipient_email)`,
-      )
-      .all(crossPlatformCutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
-      crossPlatformByEmail.set(r.email, { sent_at: r.last_sent_at, vertical_id: r.vertical_id });
-    }
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // the same shared index computeGardssalgOutreachSendEligibility uses —
+    // matches the same producer (domain / website / org.nr), not only the
+    // exact address.
+    const crossPlatformIndex = getRfbSendIndexForOpplevagent(rfbDb, crossPlatformCutoff);
 
     // ── replied: mirrors admin-outreach-candidates.ts's has_replied subquery
     // (~L242-250), agent_id -> provider_id + vertical_id = 'experiences'
@@ -19166,8 +19198,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         } else if (e.reason === "max_touch_reached") {
           contactedOrCooldownCount++;
         } else if (e.reason === "cooldown_suppressed") {
-          if (e.cross_platform) crossPlatformCooldownCount++;
-          else contactedOrCooldownCount++;
+          if (e.cross_platform) {
+            crossPlatformCooldownCount++;
+            if (e.match) crossPlatformMatches.push({ provider_id: e.provider_id, match: e.match });
+          } else contactedOrCooldownCount++;
         } else {
           // preflight_no_go / large_company_excluded / no_email — folded
           // into preflight_no_go; none of the three has a dedicated bucket
@@ -19224,9 +19258,16 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           blocklistedCount++;
           continue;
         }
-        const crossHit = crossPlatformByEmail.get(email.toLowerCase());
+        const crossHit = crossPlatformIndex.find(
+          buildCrossPlatformIdentity({
+            email,
+            website: providerWebById.get(pf.provider_id)?.hjemmeside,
+            orgNr: providerWebById.get(pf.provider_id)?.org_nr,
+          }),
+        );
         if (crossHit) {
           crossPlatformCooldownCount++;
+          crossPlatformMatches.push({ provider_id: pf.provider_id, match: crossHit.match });
           continue;
         }
         if (hasCrmReply(pf.provider_id)) {
@@ -19293,6 +19334,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         preflight_no_go: preflightNoGoCount,
         personal_address: personalAddressCount,
       },
+      // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+      // one entry per cross-platform-suppressed provider, with the rule that
+      // matched (email | domain | website | org_nr). Bounded at 100.
+      cross_platform_cooldown_matches: crossPlatformMatches.slice(0, 100),
       // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
       // address each selected candidate has (reporting only, not a filter).
       recipient_address_types: countRecipientAddressTypes(capped.map((c) => c.email)),
@@ -19412,6 +19457,7 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
           last_sent_at: elig.last_sent_at,
           suppressed_by: elig.suppressed_by,
           cross_platform: elig.cross_platform,
+          match: elig.match,
         });
         continue;
       }
@@ -19464,6 +19510,7 @@ export type GardssalgOutreachSendResultRow = {
   last_sent_at?: string;
   suppressed_by?: string;
   cross_platform?: boolean;
+  match?: CrossPlatformMatch;
   // Grep 7 (2026-08-19-kursjustering-drikkefunnel-llm-og-supply): the
   // cross-platform cooldown no longer blocks; on ELIGIBLE rows a recent
   // RFB send to the same address is surfaced through these informational

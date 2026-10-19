@@ -43663,6 +43663,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene: samme produsent, ikke bare samme adresse ──");
+  try {
+    const { runCrossPlatformMatchTests } = require("../src/services/cross-platform-match.test") as
+      typeof import("../src/services/cross-platform-match.test");
+    const cpm = runCrossPlatformMatchTests();
+    passed += cpm.passed;
+    failed += cpm.failed;
+    for (const f of cpm.failures) failures.push("cross-platform-match: " + f);
+    console.log(`  cross-platform-match: ${cpm.passed} passed, ${cpm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cross-platform-match: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cross-platform-match: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as
