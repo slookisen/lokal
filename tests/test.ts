@@ -36535,6 +36535,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failed++;
     failures.push("dental landing (F1-S4a): unexpected error: " + String(err?.message || err));
   }
+  // Live check after F1-S4a (FUNN aapent-naa-badge-regnes-i-utc): «Åpent nå»
+  // on the clock in Norway (Europe/Oslo), not the server's (UTC).
+  try {
+    const { runDentalAapentNaaOsloTests } = require("../src/routes/dental-aapent-naa-oslo.test") as
+      typeof import("../src/routes/dental-aapent-naa-oslo.test");
+    const dano = await runDentalAapentNaaOsloTests({ log: false });
+    passed += dano.passed;
+    failed += dano.failed;
+    for (const f of dano.failures) failures.push("dental «Åpent nå» in Oslo time: " + f);
+    console.log(`  dental «Åpent nå» in Oslo time: ${dano.passed} passed, ${dano.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental «Åpent nå» in Oslo time: unexpected error: " + String(err?.message || err));
+  }
 
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface

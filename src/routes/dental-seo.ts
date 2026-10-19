@@ -56,6 +56,7 @@ import { shownDentalAgent } from "../services/dental-places-display";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
 import { capFreeText } from "../utils/free-text";
+import { osloWeekdayAndMinutes } from "../utils/opening-hours";
 import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 // dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
 // clinic page names its place in the official spelling, by the same lookup as
@@ -618,23 +619,33 @@ function getCachedPoststeder(): PoststedRow[] {
 
 // ─── "Åpent nå" helper ───────────────────────────────────────
 
-const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+// Monday first: the index is osloWeekdayAndMinutes().day (Monday = 0).
+const DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
 const DAY_NAMES_NO: Record<string, string> = {
   mon: "Mandag", tue: "Tirsdag", wed: "Onsdag", thu: "Torsdag",
   fri: "Fredag", sat: "Lørdag", sun: "Søndag",
 };
 
-function isOpenNow(
-  opening_hours: DentalAgent["opening_hours"]
+/**
+ * Whether the clinic is open at `at` by its hours, on the clock in Norway
+ * (Europe/Oslo). The weekday and the time used to come from the server's
+ * clock, which runs in UTC, one or two hours behind Norway: at 20:03 in Oslo
+ * (18:03 UTC) a clinic that closes at 20:00 still said «Åpent nå» (dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, live check after F1-S4a, 2026-10-19).
+ * Exported for the tests.
+ */
+export function isOpenNow(
+  opening_hours: DentalAgent["opening_hours"],
+  at: Date = new Date()
 ): boolean {
   if (!opening_hours || opening_hours.length === 0) return false;
-  const now = new Date();
-  const dayKey = DAY_KEYS[now.getDay()];
+  const now = osloWeekdayAndMinutes(at);
+  const dayKey = DAY_KEYS[now.day];
   const entry = opening_hours.find((h) => h.day === dayKey);
   if (!entry) return false;
   const [oh, om] = entry.open.split(":").map(Number);
   const [ch, cm] = entry.close.split(":").map(Number);
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowMin = now.minutes;
   const openMin = (oh ?? 0) * 60 + (om ?? 0);
   const closeMin = (ch ?? 0) * 60 + (cm ?? 0);
   // Handle overnight spans (e.g. 22:00–02:00)
