@@ -16,9 +16,16 @@
  *   AC3       /personvern names the company as data controller; no public
  *             legal page says «Daniel Fredriksen», «uavhengig prosjekt»,
  *             «independent project» or «Finn-tannlege.com er behandlingsansvarlig».
- *   AC4       /vilkar + /terms (rfb, opplevagent) name the company as operator;
- *             «Daniels alminnelige verneting» is gone. finn-tannlege.com still
- *             has no terms page (non-goal).
+ *   AC4       /vilkar + /terms (rfb, opplevagent, finn-tannlege) name the
+ *             company as operator; «Daniels alminnelige verneting» is gone.
+ *   F2-S5     finn-tannlege.com /vilkar (+ /terms, /terms-of-service, /tos;
+ *             A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+ *             Daniel approves the text): one canonical, NO + EN, the health
+ *             wording (no medical advice, 113 / 116 117, «som de er», clinics'
+ *             corrections), the FINN.no sentence, no HPR/NTF claim, the
+ *             footer link, the sitemap and ai-plugin.json legal_info_url;
+ *             the effective date 2026-10-19, the day Daniel approved the
+ *             text (NO, EN and the sitemap <lastmod>).
  *   T2        site Organization JSON-LD carries parentOrganization.
  *   T3        agent-card provider (+ MCP server-card vendor, agent-skills
  *             provider) is Agentplatform.no AS; the cards keep their brand name.
@@ -264,6 +271,8 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       { host: FT, path: "/om", expect: NB_LINE },
       { host: FT, path: "/personvern", expect: NB_LINE },
       { host: FT, path: "/kontakt", expect: NB_LINE },
+      { host: FT, path: "/vilkar", expect: NB_LINE },
+      { host: FT, path: "/terms", expect: NB_LINE },
       { host: FT, path: "/finnes-ikke-404", expect: NB_LINE },
       { host: FT, path: "/mcp", expect: NB_LINE, accept: "text/html,application/xhtml+xml" },
     ];
@@ -333,7 +342,7 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     }
 
     // ═══════════════ AC4 — /vilkar + /terms name the company as operator ═══════════════
-    for (const host of [RFB, OA]) {
+    for (const host of [RFB, OA, FT]) {
       for (const p of ["/vilkar", "/terms"]) {
         const r = await page(host, p);
         const label = `AC4 ${host}${p}`;
@@ -345,9 +354,93 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
         check(!r.body.includes(STREET), `${label}: no street address on the terms page`);
       }
     }
+
+    // ═══════════════ F2-S5 — finn-tannlege.com /vilkar ═══════════════
+    // A 404 until this slice: new terms were a non-goal of the 2026-10-08
+    // legal-info dev-request, because Daniel approves the text first.
     {
-      const r = await page(FT, "/vilkar");
-      check(r.status === 404, "AC4 finn-tannlege.com/vilkar: still no terms page (non-goal — new terms need Daniel's approval)", String(r.status));
+      const { BRAND_ENTITIES } = require("../config/brand-entities") as typeof import("../config/brand-entities");
+      const FINN_NB = BRAND_ENTITIES.dental.disambiguation?.nb ?? "";
+      const FINN_EN = BRAND_ENTITIES.dental.disambiguation?.en ?? "";
+      const CANONICAL = '<link rel="canonical" href="https://finn-tannlege.com/vilkar">';
+      const vilkar = await page(FT, "/vilkar");
+      for (const p of ["/vilkar", "/terms", "/terms-of-service", "/tos"]) {
+        const r = p === "/vilkar" ? vilkar : await page(FT, p);
+        const label = `F2-S5 ${FT}${p}`;
+        check(r.status === 200 && String(r.headers["content-type"]).startsWith("text/html"), `${label}: 200 text/html`, `${r.status} ${r.headers["content-type"]}`);
+        check(r.body.split(CANONICAL).length === 2, `${label}: one canonical, https://finn-tannlege.com/vilkar`);
+        check(r.body === vilkar.body, `${label}: the same page as /vilkar`);
+      }
+      const main = vilkar.body.match(/<main>[\s\S]*?<\/main>/)?.[0] ?? "";
+      const [nb, en = ""] = main.split('<h1 id="en">');
+      check(nb.includes("<h1>Vilkår for bruk</h1>") && en.startsWith("Terms of Service</h1>"), "F2-S5 /vilkar: Norwegian section, then the English one under #en");
+      check(/<div lang="en">\s*$/.test(nb) && nb.includes('<a href="#en">English</a>'), "F2-S5 /vilkar: the English section is marked lang=\"en\" and linked from the top");
+      check(nb.includes(legal.companyOperatorSentence("nb")) && en.includes(legal.companyOperatorSentence("en")), "F2-S5 /vilkar: each language has its operator line");
+      check(FINN_NB !== "" && nb.includes(FINN_NB) && FINN_EN !== "" && en.includes(FINN_EN), "F2-S5 /vilkar: each language says Finn-tannlege.com is not affiliated with FINN.no (BRAND_ENTITIES.dental)");
+      // The health wording the spec asks for, in both languages.
+      const wording: Array<[string, string, string]> = [
+        ["bestiller ikke timer og tar ikke imot betaling", "do not book appointments and we do not take payments", "no booking, no payment"],
+        ["ikke medisinsk eller odontologisk rådgivning", "not medical or dental advice", "not medical advice"],
+        ["<strong>Ved akutt fare for liv eller helse: ring 113.</strong>", "<strong>If life or health is in immediate danger: call 113.</strong>", "113 first"],
+        ["legevakten på 116 117 eller tannlegevakten der du bor", "(legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live", "legevakt 116 117 or tannlegevakt"],
+        ["betyr ikke at den kan ta imot deg nå", "may still be unable to see you now", "an emergency badge is no promise"],
+        ["<strong>Opplysningene vises «som de er».</strong>", "<strong>The information is provided \"as is\".</strong>", "as is"],
+        ['står på <a href="/proveniens">siden om kilder og metode</a>', 'are explained on <a href="/proveniens">the sources and method page</a>', "sources and method on /proveniens"],
+        ["er ingen vurdering av kvaliteten på behandlingen", "are not an assessment of the quality of treatment", "the order and the badges are no quality assessment"],
+        ["kan klinikken be om at de rettes, eller at oppføringen fjernes", "the clinic can ask for it to be corrected, or for the listing to be removed", "clinics' corrections and removal"],
+        ['href="mailto:kontakt@finn-tannlege.com"', 'href="mailto:kontakt@finn-tannlege.com"', "the site's own e-mail"],
+        ['href="/personvern"', 'href="/personvern"', "the privacy policy"],
+        ["Norsk rett gjelder.", "Norwegian law applies.", "Norwegian law"],
+      ];
+      for (const [no, eng, what] of wording) {
+        check(nb.includes(no), `F2-S5 /vilkar NO: ${what}`, no);
+        check(en.includes(eng), `F2-S5 /vilkar EN: ${what}`, eng);
+      }
+      check(!["kontakt@rettfrabonden.com", "kontakt@opplevagent.no"].some((e) => vilkar.body.includes(e)), "F2-S5 /vilkar: no other site's contact e-mail");
+      // Pkt. 7 and 11 in each language link the site's own address, read from
+      // BRAND_ENTITIES.dental.supportEmail (not a second copy in the handler).
+      const MAILTO = `href="mailto:${BRAND_ENTITIES.dental.supportEmail}"`;
+      for (const [lang, section] of [["NO", nb], ["EN", en]] as const) {
+        const links = section.match(/href="mailto:[^"]*"/g) || [];
+        check(links.length === 2 && links.every((l) => l === MAILTO), `F2-S5 /vilkar ${lang}: both e-mail links are BRAND_ENTITIES.dental.supportEmail`, links.join(", "));
+      }
+      // F2-S1's acceptance grep, on the page content: none of the sources the
+      // code does not use (the footer's «Datakilder» column is F2-S1's).
+      const unused = main.match(/HPR|Helsepersonellregister|helsedirektoratet|ntf\.no|tannlegeforening/gi) || [];
+      check(unused.length === 0, "F2-S5 /vilkar: names no HPR, Helsedirektoratet or NTF source", unused.join(", "));
+      const compliance = ["sertifisert", "certified", "compliance", "compliant"].filter((w) => main.toLowerCase().includes(w));
+      check(compliance.length === 0, "F2-S5 /vilkar: claims no certification or compliance", compliance.join(", "));
+
+      // Footer link on every dental shell page fetched above, once per path
+      // (not the /mcp browser page, which has only the company line).
+      const shellPages = [...new Map(seen.filter((s) => s.host === FT && s.path !== "/mcp").map((s) => [s.path, s])).values()];
+      check(shellPages.length >= 8, `F2-S5 control: dental shell pages fetched (${shellPages.length})`);
+      for (const s of shellPages) {
+        check(footersOf(s.body).includes('<a href="/vilkar">Vilkår</a>'), `F2-S5 ${s.label}: the footer links /vilkar`);
+      }
+
+      const plug = await get("/.well-known/ai-plugin.json", FT, "application/json");
+      let manifest: any = null;
+      try { manifest = JSON.parse(plug.body); } catch { /* reported below */ }
+      check(manifest?.legal_info_url === "https://finn-tannlege.com/vilkar", "F2-S5 ai-plugin.json: legal_info_url is /vilkar (regression: /om)", String(manifest?.legal_info_url));
+      check(manifest?.contact_url === "https://finn-tannlege.com/kontakt", "F2-S5 ai-plugin.json: contact_url unchanged");
+      const sitemap = await get("/sitemap.xml", FT, "application/xml");
+      check(sitemap.body.split("<loc>https://finn-tannlege.com/vilkar</loc>").length === 2, "F2-S5 sitemap.xml: lists /vilkar once");
+      check(!/<loc>https:\/\/finn-tannlege\.com\/(terms|terms-of-service|tos)<\/loc>/.test(sitemap.body), "F2-S5 sitemap.xml: the aliases are not listed");
+      check(BRAND_ENTITIES.dental.termsUrl === "https://finn-tannlege.com/vilkar", "F2-S5 brand-entities: BRAND_ENTITIES.dental.termsUrl is /vilkar", String(BRAND_ENTITIES.dental.termsUrl));
+
+      // The terms take effect the day Daniel approved the text, 2026-10-19
+      // (A2A daniel-responses/2026-10-19-live-svar-steg-a-og-vilkar.md). Pinned
+      // here as a literal: a new date means new terms, and Daniel's approval.
+      const EFFECTIVE = "2026-10-19";
+      const { DENTAL_STATIC_PAGE_DATES } = require("../config/dental-landing") as typeof import("../config/dental-landing");
+      check(DENTAL_STATIC_PAGE_DATES["/vilkar"] === EFFECTIVE, `F2-S5 DENTAL_STATIC_PAGE_DATES["/vilkar"] is ${EFFECTIVE}`, String(DENTAL_STATIC_PAGE_DATES["/vilkar"]));
+      const shownNb = Array.from(nb.matchAll(/Sist oppdatert: ([^<]*)<\/p>/g), (m) => m[1]);
+      const shownEn = Array.from(en.matchAll(/Last updated: ([^<]*)<\/p>/g), (m) => m[1]);
+      check(JSON.stringify(shownNb) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar NO: «Sist oppdatert: ${EFFECTIVE}», once`, shownNb.join(", "));
+      check(JSON.stringify(shownEn) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar EN: «Last updated: ${EFFECTIVE}», once`, shownEn.join(", "));
+      const vilkarLastmod = sitemap.body.match(/<loc>https:\/\/finn-tannlege\.com\/vilkar<\/loc><lastmod>([^<]*)<\/lastmod>/)?.[1];
+      check(vilkarLastmod === EFFECTIVE, `F2-S5 sitemap.xml: /vilkar <lastmod> is ${EFFECTIVE}`, String(vilkarLastmod));
     }
 
     // ═══════════════ AC3 / AC4 — forbidden phrases on every page fetched ═══════════════

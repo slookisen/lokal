@@ -199,7 +199,7 @@ export async function runDentalFinnDisambiguationTests(opts: { log?: boolean } =
     const footerLine = `<div class="footer-disambiguation">${NB}</div>`;
     const pages: Array<[string, number]> = [
       ["/", 200], ["/om", 200], ["/hvordan-det-fungerer", 200], ["/kontakt", 200], ["/personvern", 200],
-      ["/proveniens", 200], ["/sok?q=oslo", 200], ["/sted/oslo", 200], ["/fylke/Oslo", 200],
+      ["/proveniens", 200], ["/vilkar", 200], ["/sok?q=oslo", 200], ["/sted/oslo", 200], ["/fylke/Oslo", 200],
       [`/klinikk/${clinics[0]}`, 200], ["/finnes-ikke-404", 404],
     ];
     const html: Record<string, string> = {};

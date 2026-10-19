@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens)",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar)",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -780,32 +780,32 @@
     },
     "dental GET /sok": {
       "912345678": {
-        "sha256": "394947d3746e360d09ebd0dde501eb20442c81c85eb89c7193fd0a6e68ddbc6f",
-        "chars": 20204
+        "sha256": "d00910d57daf9cd76c10728d58cefe7e2f7bb49c28b66144e1a6a9c8ce4050c8",
+        "chars": 20242
       },
       "tannlege i Oslo": {
-        "sha256": "01ba53e5540719f1e86d34467aded201ec57ccaabdc8b2baa4fc66749813f6d0",
-        "chars": 22538
+        "sha256": "8c241505723bbaaea4e3b7b2fbae9e8e8276d80c24240a13c14bc25982565309",
+        "chars": 22576
       },
       "tannlege i Bergen": {
-        "sha256": "0053cf0338d2f9a63ad86fe593243d8f7f52d12f3c97b707a71b43be2f54e9d4",
-        "chars": 22668
+        "sha256": "e5f27013516df9af57e9d54f0363422933d95a91ed00e1aad974513b8c5fa4f4",
+        "chars": 22706
       },
       "kjeveortoped Bergen": {
-        "sha256": "800284bddbf609edb4a8a3ad1bfc34a5cef2ab5747e6e52110879db813b2bf3a",
-        "chars": 21460
+        "sha256": "dfa8a78149829ea129aa21afc52c36725624972974d7202f1158862645762392",
+        "chars": 21498
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "de3381dd11dea23ca56c8fd562220cf906eb40fa2bc94b67da4c12afcb0e327c",
-        "chars": 20283
+        "sha256": "061baa0824e57592f335e2bfd83f8d13bc9145e30b72d57dd3eb96b34a13f7fe",
+        "chars": 20321
       },
       "tannlege 0150 Oslo": {
-        "sha256": "95f81af17aa656ffc6a83c350b9229792ba86fa98cd2a65a805d4496e5408758",
-        "chars": 20268
+        "sha256": "1cb30e4c7bcd5d8ddb906528c0de9951fb96c6a01a3154e0ca5d2aaa823f3db5",
+        "chars": 20306
       },
       "ring 22 33 44 55": {
-        "sha256": "69a6ba66af1f0bc527d2e63ea8b961d52cf9720bfba4a99b9f8ba7a642d73e7c",
-        "chars": 20250
+        "sha256": "691522a9e3f926193e9a3006d5eeee742e551c3ad467ffa31ef30199f79452f5",
+        "chars": 20288
       }
     },
     "dental GET /api/tannlege/agents": {

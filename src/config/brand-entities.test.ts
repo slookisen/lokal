@@ -13,9 +13,9 @@
  *       verticals/rfb/config.yaml display_name (what the front page used),
  *       and the agentplatform.no service list agrees with the entries.
  *   (c) URLs: https, `url` is a bare origin, logo/docs/privacy/terms live on
- *       the entry's own origin, logos are .png; dental's logo is the F2-S4 PNG
- *       and its docs page the G3-S4 guide; pages that do not exist yet are
- *       null (dental terms, company terms/docs).
+ *       the entry's own origin, logos are .png; dental's logo is the F2-S4 PNG,
+ *       its docs page the G3-S4 guide and its terms page /vilkar (F2-S5);
+ *       pages that do not exist yet are null (company terms/docs).
  *   (d) alternateName: each brand carries its bare domain — RFB
  *       «rettfrabonden.com» (FUNN rett-fra-bonden-generisk-frase-forveksling);
  *       no duplicates, nothing equal to the name.
@@ -166,10 +166,12 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
   );
   assertTrue(!KEYS.some((k) => /\.svg$/i.test(E[k].logoPng ?? "")), "c5: no entry uses an SVG as its logo (Opplevagent's Organization used /favicon.svg)");
   assertEq(
-    [E.dental.termsUrl, E.company.termsUrl, E.company.docsUrl],
-    [null, null, null],
-    "c6: pages that do not exist yet are null, not a guess (dental terms, company terms/docs)",
+    [E.company.termsUrl, E.company.docsUrl],
+    [null, null],
+    "c6: pages that do not exist yet are null, not a guess (company terms/docs)",
   );
+  assertEq(E.dental.termsUrl, "https://finn-tannlege.com/vilkar",
+    "c6b: dental terms is /vilkar (F2-S5, A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon)");
   assertEq(E.dental.docsUrl, "https://finn-tannlege.com/guide-tannlege-ai", "c7: Finn-tannlege's docs page is the AI guide (G3-S4)");
 
   // ── (d) alternateName ───────────────────────────────────────────────────
