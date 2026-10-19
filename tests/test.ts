@@ -36019,6 +36019,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agent-put-field-provenance: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4d): «Akuttvakt»-sitatet i proveniensen og PUT-vakten ──");
+  try {
+    const { runDentalAgentPutAcuteVaktQuoteTests } = require("../src/routes/dental-agent-put-acute-vakt-quote.test") as
+      typeof import("../src/routes/dental-agent-put-acute-vakt-quote.test");
+    const daq = await runDentalAgentPutAcuteVaktQuoteTests({ log: false });
+    passed += daq.passed;
+    failed += daq.failed;
+    for (const f of daq.failures) failures.push("dental-agent-put-acute-vakt-quote: " + f);
+    console.log(`  dental-agent-put-acute-vakt-quote: ${daq.passed} passed, ${daq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agent-put-acute-vakt-quote: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dental-schema-probe-writepath-fix: PUT /api/tannlege/agents/:id test-fingerprint guard ──");
   try {
     const { runDentalTests } = require("../src/routes/dental.test") as

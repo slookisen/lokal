@@ -20,7 +20,7 @@
 //   field_provenance = {
 //     <field>: ProvenanceRecord[]
 //   }
-//   ProvenanceRecord = { value, source_type, source_url?, fetched_at }
+//   ProvenanceRecord = { value, source_type, source_url?, fetched_at, quote?, quote_basis? }
 //
 // Wire-shape this endpoint accepts (two flavours, both normalised in):
 //   1. Wrapped:
@@ -33,6 +33,9 @@
 // Merge semantics:
 //   - For each tracked field, append new sources to the existing array.
 //   - Dedupe by {source_type, normalised value}: same pair = no-op.
+//   - A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d: an
+//     incoming source with a `quote` replaces the stored sources with the
+//     same pair instead (see mergeFieldProvenance).
 //   - Untouched fields preserve existing provenance.
 //   - Untouched columns (about, products, ...) preserve existing values.
 //
@@ -173,12 +176,25 @@ function requireAdmin(req: Request, res: Response): boolean {
 
 // ─── Shape & merge logic for field_provenance ──────────────────────────
 
-// On-disk shape (matches cross-source-validator.ProvenanceRecord)
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d: a source may
+// carry `quote`, the sentence from the source page that the value rests on
+// (dental «Akuttvakt» is shown only with one, dental-acute-claim.ts), and
+// with it `quote_basis`, where in the source the time rule of Daniel's
+// definition A is met: in the quoted sentence itself, or in the opening hours
+// on the clinic's page.
+export const PROVENANCE_QUOTE_MAX_CODE_POINTS = 300;
+export const PROVENANCE_QUOTE_BASES = ["tider_i_sitatet", "aapningstider_paa_siden"] as const;
+type ProvenanceQuoteBasis = (typeof PROVENANCE_QUOTE_BASES)[number];
+
+// On-disk shape (matches cross-source-validator.ProvenanceRecord, plus the
+// optional quote above)
 type ProvenanceRecord = {
   value: string;
   source_type: string;
   source_url?: string;
   fetched_at: string;
+  quote?: string;
+  quote_basis?: ProvenanceQuoteBasis;
 };
 
 // Wire-shape — the enrichment SKILL may emit either flat array or wrapped
@@ -192,6 +208,8 @@ type IncomingSource = {
   fetched_at?: string;
   captured_at?: string;
   source_url?: string;
+  quote?: string;
+  quote_basis?: string;
 };
 type IncomingFieldEntry = IncomingSource[] | { sources?: IncomingSource[] };
 type IncomingProvenance = Record<string, IncomingFieldEntry>;
@@ -206,6 +224,16 @@ function normaliseSource(s: IncomingSource): ProvenanceRecord | null {
   const fetched_at = (s.fetched_at ?? s.captured_at ?? new Date().toISOString()).toString();
   const rec: ProvenanceRecord = { value, source_type, fetched_at };
   if (s.source_url) rec.source_url = String(s.source_url);
+  // F1-S4d: the quote is kept only as a string with more than whitespace in
+  // it, trimmed and cut to 300 code points (Array.from, so a surrogate pair
+  // is never split); anything else is dropped, as is quote_basis without a
+  // quote or with a value outside PROVENANCE_QUOTE_BASES.
+  const quote = typeof s.quote === "string" ? s.quote.trim() : "";
+  if (quote) {
+    rec.quote = Array.from(quote).slice(0, PROVENANCE_QUOTE_MAX_CODE_POINTS).join("");
+    const basis = PROVENANCE_QUOTE_BASES.find((b) => b === s.quote_basis);
+    if (basis) rec.quote_basis = basis;
+  }
   return rec;
 }
 
@@ -255,6 +283,13 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
  * produced by the phase51 backfill migration) are filtered out instead
  * of being carried forward. The route handler will overwrite the column
  * with the cleaned shape on the next provenance write.
+ *
+ * F1-S4d (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): an incoming
+ * source with a quote is not a duplicate of the stored sources with the same
+ * dedupKey (the stamp `own_homepage::1` an earlier run stored, or an older
+ * quote). It takes the place of the first of them and the others are
+ * removed, so the list does not grow and only the newest source for a key
+ * has a quote. An incoming source without a quote is a duplicate as before.
  *
  * @param existing parsed JSON from agent_knowledge.field_provenance (may be {})
  * @param incoming wire-shape payload (wrapped or flat per field)
@@ -307,6 +342,15 @@ export function mergeFieldProvenance(
       if (!rec) continue;
       const key = dedupKey(rec);
       if (key === null) continue;
+      // F1-S4d: a source with a quote replaces the sources with its key.
+      const first = rec.quote === undefined ? -1 : existingForField.findIndex((r) => dedupKey(r) === key);
+      if (first !== -1) {
+        existingForField[first] = rec;
+        for (let i = existingForField.length - 1; i > first; i--) {
+          if (dedupKey(existingForField[i]) === key) existingForField.splice(i, 1);
+        }
+        continue;
+      }
       if (seen.has(key)) continue;
       seen.add(key);
       existingForField.push(rec);

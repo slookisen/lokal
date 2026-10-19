@@ -73,6 +73,7 @@ import { capFreeText } from "../utils/free-text";
 import { planDentalSearch } from "../services/dental-query-parser";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { toDentalClinicCard } from "../services/dental-clinic-card";
+import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
 
 const router = Router();
 
@@ -362,6 +363,66 @@ router.post("/agents", requireAdmin, (req: Request, res: Response) => {
 // on the exact same reserved ids and per-field literal matches. See that
 // module's doc comment for the full fingerprint definition.
 
+// ─── The «Akuttvakt» quote on the PUT (F1-S4d) ──────────────────────
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d punkt 3.
+// «Akuttvakt» is shown for acute_vakt = 1 when any acute_vakt source stores a
+// quote (resolveAcuteClaim, F1-S4c), and mergeFieldProvenance now keeps the
+// quote. So that only the extraction that writes acute_vakt can give «vakt»:
+//   - when the validated body has acute_vakt, the quote (with its
+//     quote_basis) is removed from every stored acute_vakt source before
+//     the merge, also when the body has no field_provenance;
+//   - an incoming acute_vakt source keeps its quote only when its value is
+//     "1" and the validated body has acute_vakt = 1 (not stripped);
+//     otherwise the quote is removed before the merge.
+// acute_vakt = 1 without a quote is stored and shows «Tar imot
+// akuttpasienter». The answer says acute_vakt_quote: "stored" (this PUT's
+// quote is stored), "dropped" (a quote was sent, none is stored) or
+// "missing" (acute_vakt in the body, no quote sent); the enrichment
+// report counts it (SKILL §4.4).
+
+/** The source without `quote` and `quote_basis`; the source itself when it has neither. */
+function withoutQuote(source: unknown): unknown {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return source;
+  if (!("quote" in source) && !("quote_basis" in source)) return source;
+  const { quote: _quote, quote_basis: _quoteBasis, ...rest } = source as Record<string, unknown>;
+  return rest;
+}
+
+/** The source's value is "1" (value or raw_value, as normaliseSource reads it, trimmed as dedupKey does). */
+function sourceValueIsOne(source: unknown): boolean {
+  if (!source || typeof source !== "object") return false;
+  const s = source as { value?: unknown; raw_value?: unknown };
+  const value = s.value ?? s.raw_value;
+  return value != null && String(value).trim() === "1";
+}
+
+/**
+ * `prov` with `fn` applied to each acute_vakt source, read as
+ * mergeFieldProvenance reads a stored entry: an array, the `sources` array of
+ * an object, or else the object as one source. `prov` itself when no source
+ * changed, so the caller can tell whether anything was removed.
+ */
+function mapAcuteVaktSources(prov: Record<string, unknown>, fn: (source: unknown) => unknown): Record<string, unknown> {
+  const entry = prov.acute_vakt;
+  let next: unknown = entry;
+  const mapAll = (sources: unknown[]) => {
+    const mapped = sources.map(fn);
+    return mapped.some((s, i) => s !== sources[i]) ? mapped : sources;
+  };
+  if (Array.isArray(entry)) {
+    next = mapAll(entry);
+  } else if (entry && typeof entry === "object") {
+    const sources = (entry as { sources?: unknown }).sources;
+    if (Array.isArray(sources)) {
+      const mapped = mapAll(sources);
+      if (mapped !== sources) next = { ...(entry as Record<string, unknown>), sources: mapped };
+    } else {
+      next = fn(entry);
+    }
+  }
+  return next === entry ? prov : { ...prov, acute_vakt: next };
+}
+
 // ─── PUT /api/tannlege/agents/:id (admin) ───────────────────────────
 router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   const id = req.params.id as string;
@@ -426,11 +487,21 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
     // Places homepage-backfill block above (~line 1156): read the row's
     // current field_provenance, tolerate junk/missing JSON, merge via the
     // shared mergeFieldProvenance() helper. Only runs when the body actually
-    // includes field_provenance — no extra DB read otherwise.
-    if (
-      result.data.field_provenance &&
-      typeof result.data.field_provenance === "object"
-    ) {
+    // includes field_provenance or acute_vakt (F1-S4d, above) — no extra DB
+    // read otherwise.
+    const acuteVakt = result.data.acute_vakt;
+    let incomingProv: Record<string, unknown> | null =
+      result.data.field_provenance && typeof result.data.field_provenance === "object"
+        ? (result.data.field_provenance as Record<string, unknown>)
+        : null;
+    const acuteVaktQuoteSent = incomingProv !== null && hasAcuteVaktQuote(incomingProv);
+    if (incomingProv) {
+      incomingProv = mapAcuteVaktSources(incomingProv, (s) =>
+        acuteVakt === 1 && sourceValueIsOne(s) ? s : withoutQuote(s)
+      );
+    }
+    // (field_provenance: null in the body still clears the column, quotes and all.)
+    if (incomingProv || (acuteVakt !== undefined && result.data.field_provenance === undefined)) {
       const existingAgent = getDentalAgentById(id);
       let existingProv: Record<string, unknown> = {};
       if (
@@ -440,11 +511,19 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       ) {
         existingProv = existingAgent.field_provenance as Record<string, unknown>;
       }
-      result.data.field_provenance = mergeFieldProvenance(
-        existingProv,
-        result.data.field_provenance as any
-      ) as any;
+      const storedProv = acuteVakt !== undefined ? mapAcuteVaktSources(existingProv, withoutQuote) : existingProv;
+      if (incomingProv || storedProv !== existingProv) {
+        result.data.field_provenance = mergeFieldProvenance(storedProv, (incomingProv ?? {}) as any) as any;
+      }
     }
+    const acuteVaktQuote =
+      acuteVakt === 1 && result.data.field_provenance && hasAcuteVaktQuote(result.data.field_provenance)
+        ? "stored"
+        : acuteVaktQuoteSent
+          ? "dropped"
+          : acuteVakt !== undefined
+            ? "missing"
+            : undefined;
 
     const ok = updateDentalAgent(id, result.data);
     if (!ok) {
@@ -462,6 +541,7 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       fields_updated: Object.keys(result.data).filter((k) => DENTAL_AGENT_WRITABLE_FIELDS.includes(k)),
       ...(strippedFields.length ? { stripped_fields: strippedFields } : {}),
       ...(openingHoursDropped ? { opening_hours_dropped: openingHoursDropped } : {}),
+      ...(acuteVaktQuote ? { acute_vakt_quote: acuteVaktQuote } : {}),
     });
   } catch (err) {
     if (err instanceof z.ZodError) {
