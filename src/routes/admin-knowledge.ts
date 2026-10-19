@@ -36,6 +36,9 @@
 //   - A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d: an
 //     incoming source with a `quote` replaces the stored sources with the
 //     same pair instead (see mergeFieldProvenance).
+//   - Same dev-request, F1-S4f: with `keepAuditEntries` (the dental PUT), an
+//     entry other routes write on purpose that is not a source (`inactive`,
+//     the hjemmeside cleanup's) is kept as stored (see mergeFieldProvenance).
 //   - Untouched fields preserve existing provenance.
 //   - Untouched columns (about, products, ...) preserve existing values.
 //
@@ -282,6 +285,28 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
   return true;
 }
 
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: an audit
+// entry is one another route writes into dental field_provenance on purpose
+// and that is not a source: `inactive: {reason, marked_inactive_at}`
+// (admin-dental-mark-inactive.ts), `hjemmeside: {cleaned_reason,
+// previous_value, cleaned_at}` (admin-dental-hjemmeside-cleanup.ts, the only
+// record of why the address was moved) and `directory_url: {moved_reason,
+// previous_field, moved_at}` (admin-dental-offentlig-klinikk-hjemmeside-
+// korrigering.ts). A plain object with at least one key and none of the keys
+// of a source (source_type, value, and quote and quote_basis, which the akutt
+// readers and the dental PUT's quote guard act on) that is not the {sources}
+// wrapper. An object with one of them is a source record, malformed if PR-28
+// says so; an empty object records nothing and is dropped as before.
+const SOURCE_RECORD_KEYS = ["source_type", "value", "quote", "quote_basis", "sources"] as const;
+export type ProvenanceAuditEntry = Record<string, unknown>;
+export function isProvenanceAuditEntry(v: unknown): v is ProvenanceAuditEntry {
+  if (!v || typeof v !== "object" || Array.isArray(v) || Object.keys(v).length === 0) return false;
+  return SOURCE_RECORD_KEYS.every((key) => !(key in v));
+}
+
+/** A field's entry from mergeFieldProvenance with keepAuditEntries. */
+export type MergedProvenanceEntry = Array<ProvenanceRecord | ProvenanceAuditEntry> | ProvenanceAuditEntry;
+
 /**
  * Merge an incoming field_provenance payload into an existing on-disk
  * field_provenance object. Pure function — exported for unit-testing.
@@ -298,6 +323,21 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
  * removed, so the list does not grow and only the newest source for a key
  * has a quote. An incoming source without a quote is a duplicate as before.
  *
+ * F1-S4f (same dev-request): with `keepAuditEntries` (the dental PUT; every
+ * other caller leaves it out and gets the merge above unchanged), an audit
+ * entry (isProvenanceAuditEntry) is kept as stored, as a field's entry or as
+ * an element of its list, where the merge above would make it `[]` or drop
+ * it. When sources come in for a field whose entry is an audit entry (in
+ * practice `hjemmeside` after the cleanup), the field becomes a list with
+ * the audit entry, unchanged, first and the sources after it. The readers
+ * take a list element as a source only with a source_type and a string value
+ * (fieldProvenanceRecords, buildProvenanceSummary) or with a quote
+ * (hasAcuteVaktQuote), and hasAcuteVaktProvenance only asks whether the list
+ * is empty, which a list the audit entry is put in never is. So they see the
+ * same sources as without the audit entry; nothing is dropped and the
+ * field's provenance is not lost either. PR-28 still drops a source record
+ * that is malformed, also with the option.
+ *
  * @param existing parsed JSON from agent_knowledge.field_provenance (may be {})
  * @param incoming wire-shape payload (wrapped or flat per field)
  * @returns merged on-disk shape
@@ -305,12 +345,30 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
 export function mergeFieldProvenance(
   existing: Record<string, unknown>,
   incoming: IncomingProvenance,
-): Record<string, ProvenanceRecord[]> {
+): Record<string, ProvenanceRecord[]>;
+export function mergeFieldProvenance(
+  existing: Record<string, unknown>,
+  incoming: IncomingProvenance,
+  options: { keepAuditEntries: true },
+): Record<string, MergedProvenanceEntry>;
+export function mergeFieldProvenance(
+  existing: Record<string, unknown>,
+  incoming: IncomingProvenance,
+  options: { keepAuditEntries?: boolean } = {},
+): Record<string, MergedProvenanceEntry> {
+  const keepAuditEntries = options.keepAuditEntries === true;
+  const keep = (r: unknown): r is ProvenanceRecord | ProvenanceAuditEntry =>
+    isWellFormedRecord(r) || (keepAuditEntries && isProvenanceAuditEntry(r));
   // Start from a shallow copy of existing — coerce legacy single-record
   // shape into arrays, then drop malformed entries (PR-28 defensive
   // coding for back-catalogue rows from phase51 backfill).
-  const out: Record<string, ProvenanceRecord[]> = {};
+  const out: Record<string, MergedProvenanceEntry> = {};
   for (const [field, val] of Object.entries(existing)) {
+    if (keepAuditEntries && isProvenanceAuditEntry(val)) {
+      // F1-S4f: an audit entry is kept as stored, not wrapped and filtered.
+      out[field] = val;
+      continue;
+    }
     let arr: unknown[];
     if (Array.isArray(val)) {
       arr = val.slice();
@@ -328,20 +386,30 @@ export function mergeFieldProvenance(
       // null / primitives → drop (mirrors validator behaviour).
       continue;
     }
-    // PR-28: filter out malformed records before they reach dedupKey.
-    out[field] = arr.filter(isWellFormedRecord);
+    // PR-28: filter out malformed records before they reach dedupKey
+    // (F1-S4f: with keepAuditEntries, an audit entry in the list stays).
+    out[field] = arr.filter(keep);
   }
 
   for (const [field, entry] of Object.entries(incoming)) {
     const incomingSources = extractSources(entry);
     if (incomingSources.length === 0) continue;
-    const existingForField = out[field] ?? [];
+    // F1-S4f: a field whose entry is an audit entry (only with
+    // keepAuditEntries) takes the sources in a list after it.
+    const stored = out[field];
+    const auditEntry = stored === undefined || Array.isArray(stored) ? undefined : stored;
+    const existingForField: Array<ProvenanceRecord | ProvenanceAuditEntry> = Array.isArray(stored)
+      ? stored
+      : auditEntry
+        ? [auditEntry]
+        : [];
     // Seed seen-set from well-formed existing records. dedupKey now
     // returns null on malformed inputs — they were already filtered
-    // above, but the null-guard keeps belt-and-braces.
+    // above, but the null-guard keeps belt-and-braces (and an audit
+    // entry, F1-S4f, has no key: it is never a duplicate or replaced).
     const seen = new Set<string>();
     for (const r of existingForField) {
-      const k = dedupKey(r);
+      const k = dedupKey(r as ProvenanceRecord);
       if (k !== null) seen.add(k);
     }
     for (const s of incomingSources) {
@@ -350,11 +418,11 @@ export function mergeFieldProvenance(
       const key = dedupKey(rec);
       if (key === null) continue;
       // F1-S4d: a source with a quote replaces the sources with its key.
-      const first = rec.quote === undefined ? -1 : existingForField.findIndex((r) => dedupKey(r) === key);
+      const first = rec.quote === undefined ? -1 : existingForField.findIndex((r) => dedupKey(r as ProvenanceRecord) === key);
       if (first !== -1) {
         existingForField[first] = rec;
         for (let i = existingForField.length - 1; i > first; i--) {
-          if (dedupKey(existingForField[i]) === key) existingForField.splice(i, 1);
+          if (dedupKey(existingForField[i] as ProvenanceRecord) === key) existingForField.splice(i, 1);
         }
         continue;
       }
@@ -362,6 +430,8 @@ export function mergeFieldProvenance(
       seen.add(key);
       existingForField.push(rec);
     }
+    // F1-S4f: no source was added, so the audit entry stays as stored.
+    if (auditEntry && existingForField.length === 1) continue;
     out[field] = existingForField;
   }
 

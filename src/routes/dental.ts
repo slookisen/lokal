@@ -514,14 +514,17 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       }
       const storedProv = acuteVakt !== undefined ? mapAcuteVaktSources(existingProv, withoutQuote) : existingProv;
       if (incomingProv) {
-        result.data.field_provenance = mergeFieldProvenance(storedProv, incomingProv as any) as any;
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: the
+        // audit entries other routes write here (`inactive` from
+        // admin-dental-mark-inactive, `hjemmeside` from
+        // admin-dental-hjemmeside-cleanup) are kept as stored, also when
+        // this PUT sends sources for the same field (keepAuditEntries).
+        result.data.field_provenance = mergeFieldProvenance(storedProv, incomingProv as any, { keepAuditEntries: true }) as any;
       } else if (storedProv !== existingProv) {
         // No field_provenance to merge: only the quotes go, every other entry
         // is written back as stored. mergeFieldProvenance would rewrite the
-        // column (an entry that is not a list of sources, such as `inactive`
-        // from admin-dental-mark-inactive or `hjemmeside` from
-        // admin-dental-hjemmeside-cleanup, becomes [], as does a source whose
-        // value is not a string).
+        // column (PR-28 drops a malformed source, such as one whose value is
+        // not a string, and wraps a single record in a list).
         result.data.field_provenance = storedProv as any;
       }
     }
