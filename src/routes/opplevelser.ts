@@ -30647,6 +30647,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     orgNrs?: unknown;
     hidden?: unknown;
     apply?: unknown;
+    mode?: unknown;
   };
 
   if (typeof body.hidden !== "boolean") {
@@ -30654,6 +30655,13 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     return;
   }
   const hidden = body.hidden;
+  // mode (dev-request 2026-10-01-opplevagent-skjul-uten-sperre): "remove_request"
+  // (default, "fjern oss" → blocklist) or "quality" (hide only, no blocklist).
+  if (body.mode !== undefined && body.mode !== "remove_request" && body.mode !== "quality") {
+    res.status(400).json({ error: "Body field 'mode' must be 'remove_request' or 'quality'" });
+    return;
+  }
+  const mode: "remove_request" | "quality" = body.mode === "quality" ? "quality" : "remove_request";
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -30723,7 +30731,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     const targetValue = hidden ? 1 : null;
 
     const upd = expDb.prepare(
-      `UPDATE experience_providers SET catalog_hidden = ?, updated_at = datetime('now') WHERE id = ?`
+      `UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ?, updated_at = datetime('now') WHERE id = ?`
     );
     // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
     // utfoerelse): this lever is the CS "fjern oss" delist mechanism for real
@@ -30751,8 +30759,8 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       }
       let blocklistInserted: number | undefined;
       if (!dryRun) {
-        upd.run(targetValue, row.id);
-        if (hidden) {
+        upd.run(targetValue, hidden ? mode : null, row.id);
+        if (hidden && mode === "remove_request") {
           try {
             const bl = blocklistAdd({
               orgNr: row.org_nr ?? undefined,
@@ -30780,6 +30788,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       success: true,
       dry_run: dryRun,
       hidden,
+      mode,
       matched_count: matched.size,
       changed_count: changed.length,
       changed,
