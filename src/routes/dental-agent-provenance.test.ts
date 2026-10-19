@@ -211,17 +211,22 @@ export function runDentalAgentProvenanceTests(
         // field_provenance, which holds the Places values, and Stage V's
         // pending map (a read-only side column of the hydrated row), so both
         // are taken off too. Nothing in this fixture comes from Places, so
-        // every other value is as stored.
+        // every other value is as stored. A2A dev-request
+        // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8): so are
+        // the side values the «Verifisert» claim reads.
         const {
           rating: _rating,
           rating_count: _ratingCount,
           rating_source: _ratingSource,
           field_provenance: _fieldProvenance,
           stage_v_pending_correction: _pending,
+          brreg_status: _brreg,
+          website_ownership: _ownership,
+          rich_field_count: _rich,
           ...directWithoutRating
         } = direct;
         assertTrue(!!direct, "d1: setup — getDentalAgentById returns a value for clinic-no-prov");
-        assertEq(rest, directWithoutRating, "d2: additive regression — every non-provenance field of the route response matches a direct getDentalAgentById() read exactly, less the three Google rating keys, field_provenance and the pending map (A4-D)");
+        assertEq(rest, directWithoutRating, "d2: additive regression — every non-provenance field of the route response matches a direct getDentalAgentById() read exactly, less the three Google rating keys, field_provenance, the pending map (A4-D) and the claim's side values (F2-S8)");
       }
     } catch (err: any) {
       failed++;

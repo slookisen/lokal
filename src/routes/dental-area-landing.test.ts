@@ -28,6 +28,13 @@
  *      hit starts nothing; past it, one background computation.
  *   H  a failing background refresh keeps the old numbers and logs a warning
  *      (the message only, no row data).
+ *   V  (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+ *      F2-S8) the «Verifisert» count is the read-time claim: per poststed it
+ *      equals resolveVerifiedClaim over the public rows; a place whose
+ *      stored 'verified' clinics have no basis counts 0, so its intro
+ *      sentence, table row and FAQ question go, and with them the FAQ and
+ *      FAQPage through the gate (the same counts with the badge pass it).
+ *      The fixture's other verified clinics carry the verifier's basis.
  *
  * Same harness as dental-sted-stavemater.test.ts (in-memory dental DB, the
  * router driven through router.handle()).
@@ -142,6 +149,8 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
     let orgSeq = 927770000;
     interface Extra {
       updatedAt?: string; rejected?: boolean; inactive?: boolean; klass?: string; verified?: boolean;
+      /** F2-S8: a stored 'verified' without the verifier's basis (Brreg status, own website, rich fields). */
+      noBasis?: boolean;
       helfo?: boolean; acuteVakt?: 0 | 1; provenance?: string | null; focus?: string | null; specialists?: string | null;
       /** Raw available_specialties column. */
       specialties?: string | null;
@@ -160,6 +169,13 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
         x.helfo ? "true" : "unknown", x.acuteVakt ?? 0,
         x.provenance ?? null, x.focus ?? null, x.specialists ?? null, x.specialties ?? null, x.updatedAt ?? null, id
       );
+      // F2-S8: a verified clinic gets what the verifier stores when the rule
+      // passes, so it shows «Verifisert» (unless noBasis).
+      if (x.verified && !x.noBasis) {
+        db.prepare(
+          "UPDATE dental_agents SET brreg_status = 'active', website_ownership = 'verified', om_oss = 'Om klinikken.', payment_options = '[\"kort\"]', social_media = '{\"facebook\":\"https://example.test\"}' WHERE id = ?"
+        ).run(id);
+      }
       return id;
     };
     // A deep-scraped staff list: every employee, no specialist among them.
@@ -235,6 +251,9 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
     for (const [k, x] of specEdge) mk(`Spesparitet ${k} AS`, "SPESPARITET", "Nordland", x);
     // SPESTOM: 4 clinics, 2 Helfo, 2 with a staff-only list. One real fact, so no FAQ.
     for (let i = 1; i <= 4; i++) mk(`Spestom Tann ${i} AS`, "SPESTOM", "Innlandet", { helfo: i <= 2, specialists: i >= 3 ? STAFF_ONLY : null, updatedAt: "2026-05-07 10:00:00" });
+    // MERKE (F2-S8): 4 clinics, Helfo 2, and 2 stored 'verified' without a basis.
+    // With the badge the place would have two facts and a FAQ; without, one.
+    for (let i = 1; i <= 4; i++) mk(`Merke Tann ${i} AS`, "MERKE", "Finnmark", { helfo: i <= 2, verified: i >= 3, noBasis: true, updatedAt: "2026-05-08 10:00:00" });
     // UDATERT: one row whose updated_at is not a date; it must not hide the other's date.
     mk("Udatert Tann 1 AS", "UDATERT", "Innlandet", { updatedAt: "ukjent" });
     mk("Udatert Tann 2 AS", "UDATERT", "Innlandet", { updatedAt: "2026-03-03 10:00:00" });
@@ -436,6 +455,30 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       assertEq(spestom.status, 200, "D15: /sted/spestom -> 200");
       assertTrue(faqPages(spestom.text).length === 0 && !spestom.text.includes("landing-faq"), "D16: staff-only lists are no fact: 1 real fact < faq.minFacts, so no FAQ and no FAQPage");
       assertTrue(!/spesialit|spesialist/i.test(introOf(spestom.text) + JSON.stringify(tableRows(spestom.text))) && !spestomMain.includes("spec-chip"), "D17: no specialty claim in intro or table, and the cards show no specialty chip either");
+    }
+
+    // ── V. the «Verifisert» count is the read-time claim (F2-S8) ──────────
+    {
+      resetCaches();
+      const { resolveVerifiedClaim } = require("../services/dental-verified-claim") as typeof import("../services/dental-verified-claim");
+      const f = areaFacts.getDentalAreaFacts();
+      const jsVerified = new Map<string, number>();
+      for (const a of store.listPublicDentalAgents({}, 500, 0)) {
+        if (resolveVerifiedClaim(a)) jsVerified.set(a.poststed!, (jsVerified.get(a.poststed!) ?? 0) + 1);
+      }
+      const sqlVerified = new Map([...f.byPoststed].filter(([, c]) => c.verified > 0).map(([k, c]) => [k, c.verified]));
+      assertEq([...sqlVerified].sort(), [...jsVerified].sort(), "V1: per poststed, the «Verifisert» count is resolveVerifiedClaim over the public rows");
+      assertTrue(jsVerified.size >= 5 && !jsVerified.has("MERKE"), "V1b control: (verified clinics with a basis in several places, none in MERKE)");
+      const merke = f.byPoststed.get("MERKE")!;
+      const stored = (db.prepare("SELECT COUNT(*) AS n FROM dental_agents WHERE poststed = 'MERKE' AND verification_status = 'verified'").get() as { n: number }).n;
+      assertEq([merke.total, merke.verified, merke.helfo_true, stored], [4, 0, 2, 2], "V2: MERKE counts 0 with the badge, though 2 are stored 'verified'");
+      const page = await callRoute(router, "/sted/merke");
+      assertEq(page.status, 200, "V3: /sted/merke -> 200");
+      assertTrue(!/Verifisert/.test(introOf(page.text)) && !tableRows(page.text).some(([k]) => /Verifisert/.test(k)),
+        "V4: no «Verifisert» sentence in the intro and no «Med Verifisert-merket» row");
+      assertTrue(faqPages(page.text).length === 0 && !page.text.includes("landing-faq"), "V5: one real fact left (Helfo): the gate gives no FAQ and no FAQPage");
+      const withBadge = areaFacts.buildDentalAreaLanding({ ...merke, verified: 2 }, { name: "Merke", url: `${base}/sted/merke`, scope: "poststed" });
+      assertTrue(withBadge.faqJsonLd !== null && withBadge.faqHtml.includes("har Verifisert-merket"), "V6 control: the same counts with 2 badges pass the gate, with the FAQ question");
     }
 
     // ── E. indexing, decision 7=A ────────────────────────────────────────

@@ -29,6 +29,10 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
 const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// «Verifisert» on the cards and the profile only when the stored fields meet
+// the rule the badge text describes.
+import { resolveVerifiedClaim } from "../services/dental-verified-claim";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
@@ -1060,7 +1064,7 @@ function clinicCard(
     : `/klinikk/id/${escapeHtml(agent.id)}`;
 
   const badges: string[] = [];
-  if (agent.verification_status === "verified")
+  if (resolveVerifiedClaim(agent))
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
   if (agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-avtale</span>`);
@@ -1666,7 +1670,7 @@ function renderClinicProfile(
   const badges: string[] = [];
   if (inactive)
     badges.push(`<span class="badge" style="background:#FEE2E2;color:#7F1D1D;border:1px solid #FECACA">Nedlagt</span>`);
-  if (!inactive && agent.verification_status === "verified")
+  if (!inactive && resolveVerifiedClaim(agent))
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
   if (!inactive && agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-direkteoppgjør</span>`);
@@ -2205,7 +2209,8 @@ router.get("/om", (_req: Request, res: Response) => {
   // (neither exists), and no claim of how often anything runs. A clinic
   // without the badge gets no note about the check, but a closed one shows
   // «Nedlagt» (the profile's header badges), so the text does not say «no
-  // other marking».
+  // other marking». F2-S8: no manual way to the badge either; it shows only
+  // when the stored fields meet the check's rule (resolveVerifiedClaim).
   const html = `
 <main>
   <div class="content-page">
@@ -2229,7 +2234,7 @@ router.get("/om", (_req: Request, res: Response) => {
     <p>Klinikker kan be om oppdatering eller fjerning av sin profil ved å sende e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 5 virkedager.</p>
 
     <h2>Om plattformen</h2>
-    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket settes enten manuelt eller av en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket får ingen merknad om kontrollen. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
+    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket får ingen merknad om kontrollen. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
 
     <p>Søsterplattform: <a href="https://rettfrabonden.com" rel="noopener" target="_blank">rettfrabonden.com</a> — lokal mat direkte fra bønder i Norge.</p>
   </div>
@@ -3387,7 +3392,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <p>${escapeHtml(DENTAL_VERIFIED_BADGE_TEXT.nb)}</p>
     <p>I disse tilfellene settes klinikken til ny vurdering, og den har ikke merket før den er kontrollert på nytt. Er enheten slettet, konkurs eller under avvikling, markeres klinikken i tillegg som nedlagt.</p>${repeatParkToReview ? `
     <p>En klinikk settes også til ny vurdering når hjemmesiden ikke kan nås, når opplysningene ikke kan hentes fra den, eller når nettstedet ser ut til å høre til en annen virksomhet, tre ganger på rad og så igjen etter minst 30 dager.</p>` : ""}
-    <p>Klinikker uten merket forblir synlige i katalogen &mdash; de skjules ikke &mdash; men sorteres lenger ned enn verifiserte klinikker i søkeresultatene. Kun klinikker markert som varig avviklet eller ugyldige oppføringer holdes utenfor det offentlige søket.</p>
+    <p>Klinikker uten merket forblir synlige i katalogen &mdash; de skjules ikke. I lister og søkeresultater kommer klinikker med merket foran klinikker uten, men ved et fritekstsøk kommer først klinikkene som treffer søketeksten slik det tidligere søket leste den, for eksempel der navnet eller stedet inneholder hele teksten. Kun klinikker markert som varig avviklet eller ugyldige oppføringer holdes utenfor det offentlige søket.</p>
 
     <h2>Sist kontrollert og sist oppdatert</h2>
     <p>Datoen for siste kontroll («sist kontrollert») lagres for hver klinikk kontrollen har gått gjennom. En klinikk som ikke er kontrollert, har ingen slik dato.</p>
@@ -3425,7 +3430,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <p>${escapeHtml(DENTAL_VERIFIED_BADGE_TEXT.en)}</p>
     <p>In these cases the clinic is set for review, and it has no badge until it has been checked again. If the entity is dissolved, bankrupt or being wound up, the clinic is also marked as closed.</p>${repeatParkToReview ? `
     <p>A clinic is also set for review when its website cannot be reached, when no details can be extracted from it, or when the website appears to belong to another business, three times in a row and then again after at least 30 days.</p>` : ""}
-    <p>Clinics without the badge remain fully listed in the directory &mdash; they are not hidden &mdash; just ranked below verified clinics in search results. Only permanently closed clinics or invalid listings are excluded from public search.</p>
+    <p>Clinics without the badge remain fully listed in the directory &mdash; they are not hidden. In lists and search results, clinics with the badge come before clinics without it, but in a free-text search the clinics that match the search text as the earlier search read it come first, for example those whose name or place contains the whole text. Only permanently closed clinics or invalid listings are excluded from public search.</p>
 
     <h2>Last checked and last updated</h2>
     <p>The date of the last check ("last checked") is stored for each clinic the check has gone through. A clinic that has not been checked has no such date.</p>

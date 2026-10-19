@@ -39093,17 +39093,22 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
     const mainDp = bodyDp.slice(bodyDp.indexOf("<main>"), bodyDp.indexOf("</main>"));
     assertTrue(!bodyDp.includes("HPR") && !bodyDp.includes("Helsepersonellregisteret"),
       "prov-dental-05b: /proveniens (the whole page, footer included) does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
-    // As dental-verifier.ts sets the badge: by hand, or by the rule-based check
-    // (computeDentalVerifiedRule), which is itself run by hand in small batches.
+    // As the pages show the badge since F2-S8 (A2A dev-request
+    // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon): only when the
+    // stored results of the rule-based check (computeDentalVerifiedRule, run
+    // by hand in small batches) meet its conditions; no manual way, and no
+    // order the code does not keep.
     {
       const { DENTAL_VERIFIED_BADGE_TEXT } = require("../src/services/dental-data-sources") as typeof import("../src/services/dental-data-sources");
       const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
       assertTrue(mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.nb)) && mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.en)) &&
-        mainDp.includes("manuelt, etter at en administrator har gått gjennom profilen, eller av en regelstyrt kontroll") &&
-        mainDp.includes("by hand, after an administrator has reviewed the profile, or by a rule-based check") &&
+        mainDp.includes("«Verifisert»-merket vises bare når den siste kontrollen fant enheten aktiv i Brønnøysundregistrene") &&
+        mainDp.includes(esc("The \"Verified\" badge is shown only when the latest check found the entity active in Brønnøysundregistrene")) &&
         mainDp.includes("i små partier") && mainDp.includes("in small batches") &&
+        !mainDp.includes("etter at en administrator") && !mainDp.includes("after an administrator") &&
+        !mainDp.includes("sorteres lenger ned enn verifiserte klinikker") && !mainDp.includes("ranked below verified clinics") &&
         !mainDp.includes("Statusen settes manuelt per klinikk") && !mainDp.includes("The status is set manually per clinic"),
-        "prov-dental-05c: 'Verified' badge is described as set by hand OR by the rule-based check (run by hand, in small batches), not as manual-only (NO + EN)");
+        "prov-dental-05c: 'Verified' badge is described as shown only when the rule-based check's stored results meet its conditions (run by hand, in small batches), with no manual way and no unkept ranking promise (NO + EN)");
     }
     assertTrue(bodyDp.includes("badge-verified"), "prov-dental-06: page shows the Verifisert badge example");
     assertTrue(bodyDp.length > 2000, "prov-dental-07: page body has substantial server-rendered content (SSR, no JS)");
@@ -39162,6 +39167,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-sources-truth: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// «Verifisert» only when the stored fields meet the rule the badge text
+// describes (resolveVerifiedClaim and its SQL twin DENTAL_VERIFIED_CLAIM_SQL,
+// with JSON edge cases). Swaps DENTAL_DB_PATH (:memory:) and the dental store
+// (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dental-verified-claim: «Verifisert» bare med grunnlag (F2-S8) ──");
+  try {
+    const { runDentalVerifiedClaimTests } = require("../src/services/dental-verified-claim.test") as
+      typeof import("../src/services/dental-verified-claim.test");
+    const dvc = await runDentalVerifiedClaimTests({ log: false });
+    passed += dvc.passed;
+    failed += dvc.failed;
+    for (const f of dvc.failures) failures.push("dental-verified-claim: " + f);
+    console.log(`  dental-verified-claim: ${dvc.passed} passed, ${dvc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-verified-claim: unexpected error: " + String(err?.message || err));
   }
 });
 
