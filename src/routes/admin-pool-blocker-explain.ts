@@ -41,7 +41,7 @@
 // import).
 
 import { Router, Request, Response } from "express";
-import { getDb, isContentQualified } from "../database/init";
+import { getDb, isContentQualified, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors } from "../services/outreach-suppression-signals";
 
@@ -100,6 +100,8 @@ interface ExplainRow {
   about: string | null;
   products: string | null;
   field_provenance: string | null;
+  business_type: string | null;
+  retail_focus: string | null;
   verification_review_reason: string | null;
   last_verified_at: string | null;
   curated_fields: string | null;
@@ -449,6 +451,7 @@ router.get("/", (req: Request, res: Response) => {
            k.phone AS k_phone, k.address AS k_address, k.about AS about,
            k.products AS products,
            k.field_provenance AS field_provenance,
+           a.business_type AS business_type, a.retail_focus AS retail_focus,
            k.verification_review_reason AS verification_review_reason,
            k.last_verified_at AS last_verified_at,
            k.curated_fields AS curated_fields,
@@ -539,6 +542,10 @@ router.get("/", (req: Request, res: Response) => {
       if (!urlFresh) poolBlockers.push("url_probe_missing_or_stale_30d");
       else if (!urlHealthy) poolBlockers.push(`url_unhealthy (last_status=${row.url_last_status ?? "NULL"})`);
     }
+    // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: the VIEW's retail
+    // gate (retail_shop_not_eligible / retail_profile_not_ready), via the
+    // shared pure mirror of POOL_RETAIL_SHOP_GATE_SQL.
+    poolBlockers.push(...retailShopPoolBlockers(row));
     if (row.contacted_at) poolBlockers.push("already_contacted");
     if (row.already_sent === 1) poolBlockers.push("already_sent (outreach_sent_log)");
 
@@ -604,6 +611,8 @@ router.get("/", (req: Request, res: Response) => {
       gate,
       signals: {
         umbrella_type: row.umbrella_type,
+        business_type: row.business_type,
+        retail_focus: row.retail_focus,
         is_active: row.is_active === 1,
         verification_status: row.verification_status,
         enrichment_status: row.enrichment_status,
