@@ -106,20 +106,35 @@ const STATS_FIRST_SENTENCE_BEFORE_S4E =
 
 /** The duty named, in English or (since F1-S4e) Norwegian: «emergency duty», «emergency-duty», «akuttvakt», «Akuttvakt-merket». */
 const NAMES_EMERGENCY_DUTY = /\bemergency[- ]duty\b|\bakuttvakt/i;
-/** The quote rule of F1-S4c in the same sentence, in English or Norwegian («lagret sitat», «lagret setningen som sitat»). */
-const STATES_QUOTE_RULE = /\b(stored (source )?quote|quote from the source|lagret (setningen som )?sitat|sitat fra kilden)\b/gi;
-/** The words just before a quote rule that negate it: «uten (et) lagret sitat», «without a (stored) quote», «no stored quote». */
-const NEGATES_QUOTE_RULE = /\b(uten|ikke|ingen|without|no|not)\s+((et|en|noe|slikt|a|an|any|such)\s+){0,2}$/i;
+/**
+ * The quote rule of F1-S4c in the same sentence, in English or Norwegian («lagret sitat», «lagret setningen som
+ * sitat», and «akuttvakt med sitat» on /sted and /fylke since round 3 of lokal#1207). Flag g: read with matchAll
+ * only, never with .test(), which would keep lastIndex between calls.
+ */
+const STATES_QUOTE_RULE = /\b(stored (source )?quote|quote from the source|lagret (setningen som )?sitat|sitat fra kilden|akuttvakt med sitat)\b/gi;
+/** A negation: «uten», «ikke», «ingen», «aldri», «without», «no», «not», «never», «…n't», but not the «no» of a domain (helfo.no). */
+const NEGATION = /(?<![\w.])(uten|ikke|ingen|aldri|without|no|not|never)\b|n['’]t\b/i;
+/** Where a clause ends inside a sentence: a comma, a colon, a dash or a bracket. */
+const CLAUSE_BREAK = /[,:—–()]/;
+
+/** The clause of `sentence` that holds [start, end): from the clause break before it to the one after it. */
+function clauseAround(sentence: string, start: number, end: number): string {
+  let from = start;
+  while (from > 0 && !CLAUSE_BREAK.test(sentence[from - 1]!)) from--;
+  const after = sentence.slice(end).search(CLAUSE_BREAK);
+  return sentence.slice(from, after < 0 ? sentence.length : end + after);
+}
 
 /**
- * True when `sentence` states the quote rule: a quote rule that is not negated, or a negated one («uten et lagret
- * sitat», «without a stored quote») in a sentence that also names the soft claim «Tar imot akuttpasienter»
+ * True when `sentence` states the quote rule: a quote rule with no negation in its clause, or a negated one («uten et
+ * lagret sitat», «without a stored quote») in a sentence that also names the soft claim «Tar imot akuttpasienter»
  * (ACUTE_ACCEPTS_LABEL), as the badge list does: «Akuttvakt vises også uten et lagret sitat.» says the opposite of
- * the rule (forslag S1 in the review of lokal#1207, F1-S4e).
+ * the rule (forslag S1 in the review of lokal#1207, F1-S4e). The negation may stand anywhere in the clause, not
+ * only just before the rule: «does not need a stored quote», «ikke har lagret sitat» (forslag S2, round 2).
  */
 function statesQuoteRule(sentence: string): boolean {
   const rules = [...sentence.matchAll(STATES_QUOTE_RULE)];
-  if (rules.some((m) => !NEGATES_QUOTE_RULE.test(sentence.slice(0, m.index)))) return true;
+  if (rules.some((m) => !NEGATION.test(clauseAround(sentence, m.index!, m.index! + m[0].length)))) return true;
   return rules.length > 0 && sentence.toLowerCase().includes(ACUTE_ACCEPTS_LABEL.toLowerCase());
 }
 
@@ -389,6 +404,17 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       emergencyDutyWithoutQuote(`«${ACUTE_ACCEPTS_LABEL}» when an emergency duty has no stored quote.`).length,
       emergencyDutyWithoutQuote("«Akuttvakt» only when an emergency duty has a stored quote from the source, not without a stored quote.").length], [1, 1, 1, 0, 0, 0],
       "N10 (forslag S1, review of lokal#1207): a negated quote rule («uten et lagret sitat», «without a stored quote») is flagged, unless the sentence also names «Tar imot akuttpasienter»; a sentence that states the rule and also negates it passes");
+    eq([emergencyDutyWithoutQuote("Akuttvakt does not need a stored quote.").length,
+      emergencyDutyWithoutQuote("An emergency duty is shown even if there isn't a stored quote from the source.").length,
+      emergencyDutyWithoutQuote("Emergency duty doesn’t need a stored quote.").length,
+      emergencyDutyWithoutQuote("Akuttvakt vises selv om klinikken ikke har lagret sitat.").length,
+      emergencyDutyWithoutQuote("Akuttvakt vises når det ikke finnes et lagret sitat.").length,
+      emergencyDutyWithoutQuote("Akuttvakt med sitat er aldri nødvendig.").length,
+      emergencyDutyWithoutQuote("«Akuttvakt» vises bare med et lagret sitat, ikke bare med en lagret kilde.").length,
+      emergencyDutyWithoutQuote("Emergency duty needs a stored quote from the source (not only a stored source).").length,
+      emergencyDutyWithoutQuote("3 oppgir akuttvakt med sitat eller at de tar imot akuttpasienter.").length,
+      emergencyDutyWithoutQuote("«Akuttvakt» vises bare med et lagret sitat fra nettsiden klinikk.no.").length], [1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+      "N11 (forslag S2, review of lokal#1207 round 2): a negation anywhere in the clause of the quote rule («does not need a stored quote», «ikke har lagret sitat», «isn't», «doesn’t») is flagged; one in another clause, «akuttvakt med sitat» (/sted, /fylke) and the «.no» of a domain are not");
 
     // ── S: server card and agent card ────────────────────────────────────
     {

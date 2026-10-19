@@ -343,8 +343,9 @@ export function registerDentalTools(server: McpServer): void {
             total: "Totalt antall tannlegeklinikker i databasen (ekskl. avviste).",
             helfo_count: "Antall klinikker med Helfo-direkteoppgjørsavtale.",
             chain_count: "Antall klinikker som er del av en kjede.",
+            // «Akuttvakt» only with a stored quote (F1-S4c), as the tool texts say; response text, not tools/list (F1-S4e round 3).
             acute_count:
-              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med kilde) eller «Tar imot akuttpasienter». " +
+              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med lagret sitat) eller «Tar imot akuttpasienter». " +
               "Samme tall som tannlege_akutt.count og /sok?akutt=1.",
             specialist_clinic_count: "Antall klinikker der minst én spesialist er registrert.",
             per_fylke: "Fordeling per norsk fylke, sortert etter antall.",

@@ -34,10 +34,13 @@
  *       lists on /om and /hvordan-det-fungerer, the method table on
  *       /proveniens and the method sentence;
  *   E   /sted and /fylke [13, 14]: the intro, the fact table and the FAQ say
- *       «akuttvakt med lagret sitat eller … tar imot akuttpasienter», the akutt
+ *       «akuttvakt med sitat eller … tar imot akuttpasienter», the akutt
  *       answer ends with DENTAL_EMERGENCY_NOTICE.text, and the visible FAQ is
- *       the FAQ JSON-LD; the tannlegevakt facet (off) says «med lagret sitat»
- *       too;
+ *       the FAQ JSON-LD; the tannlegevakt facet (off) says «med sitat» too;
+ *       «med sitat» has as many words as «med kilde» before F1-S4e, so an
+ *       intro at 60 words is still shown (round 3, FUNN
+ *       dental-sted-intro-faller-bort-paa-ordgrensen in the review of
+ *       lokal#1207);
  *   L   the lock [11, 12]: emergencyDutyWithoutQuote() finds nothing on the
  *       surfaces of points 3–9, on the whole of /om, /hvordan-det-fungerer and
  *       /proveniens (the data sources included) and on the area text of /sted
@@ -58,6 +61,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { emergencyDutyWithoutQuote } from "./dental-mcp-instructions.test";
+import { buildAnswerFirst, wordCount } from "../services/landing-facts";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
@@ -193,6 +197,23 @@ const OLD = {
   facetTitle: "Tannlegevakt i {sted}: klinikker med akuttvakt med kilde",
   guideStatsNbR1: "«Tar imot akuttpasienter», at klinikken sier at den tar imot akuttpasienter.",
   guideQuoteNbR1: "bare når akuttvakten har et lagret sitat fra kilden",
+  // Round 3: the round-2 wording (be758bb2), one word longer than «med kilde».
+  areaPhraseR2: "akuttvakt med lagret sitat",
+};
+
+// An intro at exactly 60 words on main before F1-S4e (fixture counts; live,
+// /sted/maalselv had a 60-word intro in the review of round 2): one word more
+// and the source sentence no longer fits, the rest is under 40 words, and the
+// page shows no intro (E10, N9).
+const SIXTY_WORD_INTRO = {
+  counts: { total: 3, verified: 0, helfo_true: 0, acute_sourced: 1, specialist_clinics: 1, max_updated_at: "2026-10-19 08:00:00" },
+  sentences: [
+    "Vi har 3 tannlegeklinikker med poststed Målselv i oversikten.",
+    "1 oppgir akuttvakt med sitat eller at den tar imot akuttpasienter.",
+    "1 har minst én oppført spesialitet.",
+    "Oversikten ble sist oppdatert 19. oktober 2026.",
+    "Opplysningene er hentet fra offentlige registre og fra klinikkenes egne nettsider. Ta kontakt med klinikken direkte for å bekrefte avtaler, priser og åpningstider før du bestiller time.",
+  ],
 };
 
 // The quote, as the extraction stores it once F1-S4d is in (F1-S4c reads it already).
@@ -474,17 +495,17 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
     const facetLanding = (total: number) => buildDentalFacetLanding(counts({ total, helfo_true: Math.min(2, total), acute_sourced: total }),
       { name: "Bergen", url: "https://finn-tannlege.com/sted/bergen/tannlegevakt", scope: "poststed", facet: vaktFacet });
     {
-      assertTrue(intros.sted.includes(" 3 oppgir akuttvakt med lagret sitat eller at de tar imot akuttpasienter. ") &&
-        intros.fylke.includes(" 3 oppgir akuttvakt med lagret sitat eller at de tar imot akuttpasienter. ") &&
-        intros.stedOne.includes(" Den oppgir akuttvakt med lagret sitat eller at den tar imot akuttpasienter. "),
-        "E1: the intro on /sted and /fylke says «akuttvakt med lagret sitat eller at de (den) tar imot akuttpasienter» [13]", JSON.stringify(intros));
+      assertTrue(intros.sted.includes(" 3 oppgir akuttvakt med sitat eller at de tar imot akuttpasienter. ") &&
+        intros.fylke.includes(" 3 oppgir akuttvakt med sitat eller at de tar imot akuttpasienter. ") &&
+        intros.stedOne.includes(" Den oppgir akuttvakt med sitat eller at den tar imot akuttpasienter. "),
+        "E1: the intro on /sted and /fylke says «akuttvakt med sitat eller at de (den) tar imot akuttpasienter» [13]", JSON.stringify(intros));
       for (const [where, r] of [["/sted/bergen", sted], ["/fylke/Vestland", fylke]] as const) {
-        assertEq(areaRows(r.text).filter(([k]) => /akutt/i.test(k!)), [["Akuttvakt med lagret sitat eller tar imot akuttpasienter", "3"]],
-          `E2 ${where}: the fact table's akutt row is «Akuttvakt med lagret sitat eller tar imot akuttpasienter» [13]`);
+        assertEq(areaRows(r.text).filter(([k]) => /akutt/i.test(k!)), [["Akuttvakt med sitat eller tar imot akuttpasienter", "3"]],
+          `E2 ${where}: the fact table's akutt row is «Akuttvakt med sitat eller tar imot akuttpasienter» [13]`);
         const faq = areaFaq(r.text);
         assertEq(faq.find(([q]) => q.endsWith(" tar imot akuttpasienter?"))?.[1],
-          `3 klinikker oppgir akuttvakt med lagret sitat eller at de tar imot akuttpasienter. ${DENTAL_EMERGENCY_NOTICE.text}`,
-          `E3 ${where}: the akutt FAQ answer says «med lagret sitat» and ends with DENTAL_EMERGENCY_NOTICE.text, word for word [13, 14]`);
+          `3 klinikker oppgir akuttvakt med sitat eller at de tar imot akuttpasienter. ${DENTAL_EMERGENCY_NOTICE.text}`,
+          `E3 ${where}: the akutt FAQ answer says «med sitat» and ends with DENTAL_EMERGENCY_NOTICE.text, word for word [13, 14]`);
         const visible = [...elementStarting(r.text, '<section class="landing-faq"').matchAll(/<div class="landing-faq-item"[^>]*><h3[^>]*>([^<]*)<\/h3><p[^>]*>([^<]*)<\/p><\/div>/g)]
           .map((m) => [unescapeHtml(m[1]!), unescapeHtml(m[2]!)]);
         assertTrue(faq.length === 3 && JSON.stringify(visible) === JSON.stringify(faq),
@@ -498,14 +519,21 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
       // The tannlegevakt facet is off (F1-S4c); its text says the same for when it is turned on again.
       const many = facetLanding(4);
       const one = facetLanding(1);
-      assertEq([vaktFacet.enabled, vaktFacet.titleTemplate], [false, "Tannlegevakt i {sted}: klinikker med akuttvakt med lagret sitat"],
-        "E7: the tannlegevakt facet stays off, and its title says «med lagret sitat» [13]");
-      assertEq([many.summary, one.summary.endsWith(" Den oppgir akuttvakt med lagret sitat."), many.uncountedSummary.endsWith(" Alle oppgir akuttvakt med lagret sitat.")],
-        ["Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen i oversikten. Alle oppgir akuttvakt med lagret sitat.", true, true],
-        "E8: the facet's definition is «Alle (Den) oppgir akuttvakt med lagret sitat.» [13]");
+      assertEq([vaktFacet.enabled, vaktFacet.titleTemplate], [false, "Tannlegevakt i {sted}: klinikker med akuttvakt med sitat"],
+        "E7: the tannlegevakt facet stays off, and its title says «med sitat» [13]");
+      assertEq([many.summary, one.summary.endsWith(" Den oppgir akuttvakt med sitat."), many.uncountedSummary.endsWith(" Alle oppgir akuttvakt med sitat.")],
+        ["Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen i oversikten. Alle oppgir akuttvakt med sitat.", true, true],
+        "E8: the facet's definition is «Alle (Den) oppgir akuttvakt med sitat.» [13]");
       assertEq((many.faqJsonLd as any)?.mainEntity?.[0]?.acceptedAnswer?.text,
-        `Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen registrert. Alle oppgir akuttvakt med lagret sitat. ${DENTAL_EMERGENCY_NOTICE.text}`,
+        `Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen registrert. Alle oppgir akuttvakt med sitat. ${DENTAL_EMERGENCY_NOTICE.text}`,
         "E9: the facet's first FAQ answer ends with DENTAL_EMERGENCY_NOTICE.text [14]");
+      // Round 3: the intro is shown on the same pages as before F1-S4e.
+      const sixty = textOf(buildDentalAreaLanding(SIXTY_WORD_INTRO.counts, { name: "Målselv", url: "https://finn-tannlege.com/sted/maalselv", scope: "poststed" }).introHtml);
+      assertEq([sixty, wordCount(sixty)], [SIXTY_WORD_INTRO.sentences.join(" "), 60],
+        "E10: an intro at 60 words (as /sted/maalselv had before F1-S4e) is still shown, word for word, at 60 words (round 3, review of lokal#1207)");
+      const akuttSentence = intros.sted.match(/ (3 oppgir [^.]*\.)/)?.[1] ?? "";
+      assertEq([akuttSentence, wordCount(akuttSentence)], ["3 oppgir akuttvakt med sitat eller at de tar imot akuttpasienter.", wordCount(OLD.areaIntro)],
+        "E11: the akutt sentence has as many words as before F1-S4e («med kilde»), so no intro appears or disappears");
     }
 
     // ── L: the lock [11, 12] ─────────────────────────────────────────────
@@ -593,6 +621,11 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
       const oldWebItem = "Klinikkenes egne nettsider (KI-assistert uttrekk) — Helfo-direkteoppgjør, akuttvakt, spesialiteter, behandlinger, åpningstider, kontaktinformasjon og presentasjon";
       assertEq([emergencyDutyWithoutQuote(oldWebItem).length, DENTAL_EMERGENCY_NOTICE.text.includes(OLD.areaAdvice)], [1, false],
         "N8: the old source list item fails L1, and the old akutt advice on /sted and /fylke fails E3 and E9 [12, 14]");
+      // The round-2 wording on the same 60-word intro: 61 words, so the source sentence is left out and the rest is too short.
+      const r2Sentences = SIXTY_WORD_INTRO.sentences.map((s) => s.replace("akuttvakt med sitat", OLD.areaPhraseR2));
+      assertEq([r2Sentences[1] !== SIXTY_WORD_INTRO.sentences[1], wordCount(r2Sentences.join(" ")), buildAnswerFirst(r2Sentences, { minWords: 40, maxWords: 60 }),
+        wordCount(OLD.areaIntro.replace("akuttvakt med kilde", OLD.areaPhraseR2))], [true, 61, null, wordCount(OLD.areaIntro) + 1],
+        "N9: with «med lagret sitat» (round 2) the same intro comes to 61 words and is left out, so E10 and E11 fail on it");
     }
   } catch (err: any) {
     failed++;

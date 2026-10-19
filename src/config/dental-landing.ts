@@ -113,10 +113,10 @@ export const DENTAL_LANDING_FACETS: readonly DentalLandingFacet[] = [
   // lifted, (3) the extraction stores `quote` in the acute_vakt provenance
   // (SKILL schema, mergeFieldProvenance/normaliseSource in
   // admin-knowledge.ts) and (4) a new enrichment run has stored the quotes.
-  // The title says «med lagret sitat», as the page text does (F1-S4e point 13).
+  // The title says «med sitat», as the page text does (F1-S4e point 13).
   {
     slug: "tannlegevakt", kind: "tannlegevakt", filter: { acute_claim: "vakt" },
-    h1Label: "Tannlegevakt", titleTemplate: "Tannlegevakt i {sted}: klinikker med akuttvakt med lagret sitat", enabled: false,
+    h1Label: "Tannlegevakt", titleTemplate: "Tannlegevakt i {sted}: klinikker med akuttvakt med sitat", enabled: false,
   },
   ...DENTAL_SEARCH_VOCABULARY.specialties.map((s): DentalLandingFacet => {
     const title = SPECIALIST_TITLES[s.slug] ?? s.canonical.charAt(0).toUpperCase() + s.canonical.slice(1);
