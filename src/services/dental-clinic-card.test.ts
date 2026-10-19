@@ -55,7 +55,11 @@ const DETAIL_KEYS = [
   "acute_vakt", "chain_brand", "is_chain_member", "available_specialties", "treatments", "opening_hours", "payment_options", "om_oss",
   "online_booking_url", "specialists", "badges", "profil_url",
 ];
-const A2A_REMOVED = ["rating", "rating_count", "rating_source", "field_provenance"];
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A4-D): the hydrated row also carries Stage V's pending map, a
+// read-only side column the display rule reads; A2A passes it on no more than
+// field_provenance.
+const A2A_REMOVED = ["rating", "rating_count", "rating_source", "field_provenance", "stage_v_pending_correction"];
 
 const PROVENANCE = { acute_vakt: [{ source_type: "homepage", value: 1 }], telefon: [{ source_type: "brreg" }] };
 const UNDISPLAYABLE_PHONE = "+47 19 09 49";

@@ -167,6 +167,7 @@ function mockRes(settle: (status: number, body: unknown) => void): any {
     getHeader() { return undefined; },
     header() { return this; },
     set() { return this; },
+    vary() { return this; },
     type() { return this; },
     append() { return this; },
     json(payload: unknown) { settle(this.statusCode, payload); return this; },

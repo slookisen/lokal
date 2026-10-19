@@ -609,6 +609,13 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
     assertTrue(JSON.stringify(actual) === JSON.stringify(expected),
       `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
   }
+  /** A "<status> <json>" dental REST list answer without each agent's field_provenance (A4-D). */
+  function withoutFieldProvenance(answer: string): string {
+    const at = answer.indexOf(" ");
+    const body = JSON.parse(answer.slice(at + 1));
+    body.agents = (body.agents ?? []).map(({ field_provenance: _p, ...agent }: Record<string, unknown>) => agent);
+    return `${answer.slice(0, at)} ${JSON.stringify(body)}`;
+  }
   /** Two answers: the same, or where they first differ. */
   function assertSameAnswer(actual: string, expected: string, label: string): void {
     if (actual === expected) return assertTrue(true, label);
@@ -735,7 +742,14 @@ export async function runInternTrafikkTellesIkkeTests(opts: { log?: boolean } = 
 
         // ══ I  …and the answer the external call gets ════════════════════
         for (const [label, internalAnswer] of Object.entries(internalAnswers)) {
-          assertSameAnswer(internalAnswer, answer, `I ${entry.name}, ${label}: the answer an external call gets (${extLabel})`);
+          // Dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+          // places-treffvakt (A4-D): with a valid X-Admin-Key the dental REST
+          // list keeps field_provenance (the enrichment reads it back), which
+          // the public answer leaves out. That is its one difference.
+          const compared = entry.name === "dental GET /api/tannlege/agents" && label === "valid X-Admin-Key"
+            ? withoutFieldProvenance(internalAnswer)
+            : internalAnswer;
+          assertSameAnswer(compared, answer, `I ${entry.name}, ${label}: the answer an external call gets (${extLabel})`);
         }
       }
       assertTrue(Object.values(main.deltas[entry.name] ?? {}).some((d) => Object.keys(d).length > 0),

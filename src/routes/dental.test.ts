@@ -105,6 +105,12 @@ function callRoute(
         this.statusCode = code;
         return this;
       },
+      set() {
+        return this;
+      },
+      vary() {
+        return this;
+      },
       json(payload: any) {
         resolve({ status: this.statusCode, body: payload });
         return this;

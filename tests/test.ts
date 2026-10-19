@@ -36211,6 +36211,58 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental regionord (D3f): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+  //    places-treffvakt (A4-D): an address, phone, website or opening hours
+  //    only Google Places gives (or marked wrong) is shown on no public
+  //    Finn-tannlege surface (page, JSON-LD, cards, MCP, A2A, public REST,
+  //    sitemap); corroborated values and the switch off as before ──
+  console.log("\n── dev-request 2026-10-16 (A4-D): Places-verdier vises ikke uten bekreftelse (finn-tannlege) ──");
+  try {
+    const { runPlacesDisplayPolicyTests } = require("../src/services/places-display-policy.test") as
+      typeof import("../src/services/places-display-policy.test");
+    const pdp = runPlacesDisplayPolicyTests({ log: false });
+    passed += pdp.passed;
+    failed += pdp.failed;
+    for (const f of pdp.failures) failures.push("places-display-policy (A4): " + f);
+    console.log(`  places-display-policy (A4): ${pdp.passed} passed, ${pdp.failed} failed`);
+    const { runDentalPlacesVisningTests } = require("../src/routes/dental-places-visning.test") as
+      typeof import("../src/routes/dental-places-visning.test");
+    const dpv = await runDentalPlacesVisningTests({ log: false });
+    passed += dpv.passed;
+    failed += dpv.failed;
+    for (const f of dpv.failures) failures.push("dental places visning (A4-D): " + f);
+    console.log(`  dental places visning (A4-D): ${dpv.passed} passed, ${dpv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental places visning (A4-D): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4):
+  //    square PNG icons of the «Søket» mark as og:image, Organization logo
+  //    and ai-plugin logo_url; dev-request 2026-10-16-merkevare-entitet-og-
+  //    connector-pakker (G3-S4): the AI guide /guide-tannlege-ai (nb + en),
+  //    its tools = live tools/list, its example prompts find clinics ──
+  console.log("\n── dev-request 2026-10-16 (F2-S4, G3-S4): dental PNG-ikon og AI-guiden /guide-tannlege-ai ──");
+  try {
+    const { runDentalIconsTests } = require("../src/routes/dental-icons.test") as
+      typeof import("../src/routes/dental-icons.test");
+    const dic = await runDentalIconsTests({ log: false });
+    passed += dic.passed;
+    failed += dic.failed;
+    for (const f of dic.failures) failures.push("dental icons (F2-S4): " + f);
+    console.log(`  dental icons (F2-S4): ${dic.passed} passed, ${dic.failed} failed`);
+    const { runDentalGuideTannlegeAiTests } = require("../src/routes/dental-guide-tannlege-ai.test") as
+      typeof import("../src/routes/dental-guide-tannlege-ai.test");
+    const dga = await runDentalGuideTannlegeAiTests({ log: false });
+    passed += dga.passed;
+    failed += dga.failed;
+    for (const f of dga.failures) failures.push("dental guide-tannlege-ai (G3-S4): " + f);
+    console.log(`  dental guide-tannlege-ai (G3-S4): ${dga.passed} passed, ${dga.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental icons / guide-tannlege-ai (F2-S4, G3-S4): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
   //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
   //    every 404, agents.txt API-base /api/tannlege ──

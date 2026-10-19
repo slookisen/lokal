@@ -16,7 +16,10 @@
 //     the one `disambiguation` sentence below (G3-S8). «FINN» or «finn.no» is
 //     never an alternateName, a keyword or a sameAs.
 //   - Every URL is https and answered 200 to a GET on 2026-10-17 (logos as
-//     image/png). A page that does not exist yet is null, not a guess.
+//     image/png), or is served by a route that ships in the same change and
+//     is tested there (Finn-tannlege's logo and guide: dental-icons.test.ts,
+//     dental-guide-tannlege-ai.test.ts). A page that does not exist yet is
+//     null, not a guess.
 //   - sameAs lists only profiles that exist. The brands have none yet; the
 //     brands' own social profiles come from Daniel, one line each.
 //   - Wikidata is never typed into sameAs: set `wikidataId` ("Q…") once the
@@ -126,26 +129,31 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland",
     ],
   }),
-  // dental-seo.ts reads only `disambiguation` from here so far (G3-S8); its
-  // Organization moves to organizationJsonLd() in G3-S1-dental. Logo, terms
-  // and docs are null until F2-S4 (PNG), F2-S5 (/vilkar) and G3-S4
-  // (/guide-tannlege-ai) ship.
+  // dental-seo.ts reads `disambiguation` (G3-S8) and `exampleQueries` (the
+  // guide, G3-S4) from here; its Organization moves to organizationJsonLd()
+  // in G3-S1-dental. The logo is the PNG from F2-S4 and the docs page the
+  // guide from G3-S4; terms stay null until F2-S5 (/vilkar) ships.
   dental: entity({
     name: "Finn-tannlege",
     alternateName: ["finn-tannlege.com"],
     url: FT_URL,
-    logoPng: null,
+    logoPng: `${FT_URL}/favicon-512.png`,
     sameAs: [],
     wikidataId: null,
     supportEmail: "kontakt@finn-tannlege.com",
-    docsUrl: null,
+    docsUrl: `${FT_URL}/guide-tannlege-ai`,
     privacyUrl: `${FT_URL}/personvern`,
     termsUrl: null,
     // The reviewer prompts in dental-connectors-prep/claude-directory/test-instructions.md.
+    // Also shown on /guide-tannlege-ai (G3-S4), and each must find clinics
+    // through tannlege_search as written: the parser reads leftover English
+    // words as name terms («care», «tonight»), so «I need emergency dental
+    // care in Rogaland tonight» found none and became the third prompt below
+    // (dental-guide-tannlege-ai.test.ts runs all three).
     exampleQueries: [
       "Find a dentist in Bergen",
       "Which dental clinics in Oslo have a Helfo agreement?",
-      "I need emergency dental care in Rogaland tonight",
+      "I need an emergency dentist in Rogaland",
     ],
     // Daniel's decision 4=A (A2A daniel-responses/2026-10-17-live-del-a-gjort-og-beslutninger-1-11.md).
     // The name check (G3-J) also allows «har ingen tilknytning til FINN.no»; a
