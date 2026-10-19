@@ -160,13 +160,15 @@ function nonEmpty(v: unknown): boolean {
  * (NO_INTENT_TERMS: «ping», «test» …): the parser hands those to step 3c as
  * well, and a product name can contain one («Smakstest»). Not for a
  * structured call either, whose `_unknownTerms` discover() never reads
- * (DiscoveryQuerySchema drops it).
+ * (DiscoveryQuerySchema drops it). Not with `unknownTerms: false`, which POST
+ * /a2a passes for spam and probe traffic: nearly every such payload has words
+ * the parser cannot read (review of lokal#1193, B1).
  */
-export function hasDiscoveryIntent(q: any, opts: { structured?: boolean } = {}): boolean {
+export function hasDiscoveryIntent(q: any, opts: { structured?: boolean; unknownTerms?: boolean } = {}): boolean {
   if (!q || typeof q !== "object") return false;
   if (nonEmpty(q.categories) || nonEmpty(q.tags) || nonEmpty(q.skills)) return true;
   if (nonEmpty(q._productTerms) || nonEmpty(q._nameQuery) || nonEmpty(q.drinkSubcategory)) return true;
-  if (!opts.structured && Array.isArray(q._unknownTerms)
+  if (!opts.structured && opts.unknownTerms !== false && Array.isArray(q._unknownTerms)
     && q._unknownTerms.some((t: unknown) => typeof t === "string" && t.trim() && !NO_INTENT_TERMS.has(t.trim().toLowerCase()))) return true;
   if (q.location && typeof q.location === "object") return true;
   return !!opts.structured && nonEmpty(q.role);

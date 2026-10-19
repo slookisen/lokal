@@ -28,6 +28,8 @@
  *       a text that asks for something («hei», «Oslo» stay no search, as on
  *       main, so they start no conversations). No match: no producers, with
  *       lokal_search's null text, or an area text near a place; nothing counted.
+ *       Spam and probe clients are read as on main: their unknown words are no
+ *       search and no place is looked up (review of lokal#1193, B1).
  *   R   the reading is lokal_search's: readSearchText/geocodeSearchPlace give
  *       parseNaturalQuery + enrichParsedWithGeo's query, discoveryQueryOf
  *       keeps the parser's words, and the texts are lokal_search's word for
@@ -472,6 +474,8 @@ export async function runRfbA2aSokParitetTests(opts: { log?: boolean } = {}): Pr
       assertEq([["ping"], ["test", "ping"], ["Status"], [], [" "], [5]].map((t) => hasDiscoveryIntent({ _unknownTerms: t })),
         [false, false, false, false, false, false], "A hasDiscoveryIntent: pings and fillers (NO_INTENT_TERMS), empty and non-text words are no search");
       assertEq(hasDiscoveryIntent({ _unknownTerms: ["test", "kransekake"] }), true, "A hasDiscoveryIntent: …but one real word among them is");
+      assertEq([hasDiscoveryIntent({ _unknownTerms: ["kransekake"] }, { unknownTerms: false }), hasDiscoveryIntent({ _productTerms: ["honning"] }, { unknownTerms: false })],
+        [false, true], "A hasDiscoveryIntent: unknownTerms: false (spam and probe traffic) makes only those words no search");
       assertEq([hasDiscoveryIntent({ categories: ["honey"] }), hasDiscoveryIntent({ role: "producer" })], [true, false],
         "A hasDiscoveryIntent: the other rules are as before");
 
@@ -505,6 +509,18 @@ export async function runRfbA2aSokParitetTests(opts: { log?: boolean } = {}): Pr
       surfaces.asked.length = 0;
       await surfaces.search("hei");
       assertTrue(surfaces.asked.includes("hei"), "A setup: lokal_search does look «hei» up (the stub knows it), so the A2A check above is not vacuous");
+
+      // Review of lokal#1193 (B1): a probe or spam client is read as on main.
+      surfaces.asked.length = 0;
+      const probe = await sendA2a(surfaces.a2a, textMessage("Finnes det kransekake"), "agentprobe/0.1.0 (+https://agentprobe.org/methodology; read-only)");
+      assertEq([a2aData(probe)?.count, /Fant ingen matforespørsel/.test(a2aData(probe)?.note ?? ""), probe.countable, surfaces.asked],
+        [0, true, false, []], "A «Finnes det kransekake» from a probe client: its unknown word is no search, and nothing is looked up");
+      const probeHoney = await sendA2a(surfaces.a2a, textMessage("honning Trondheim"), "a2a-probe/1.0 (research)");
+      assertEq([a2aData(probeHoney)?.parsedQuery?.location, a2aData(probeHoney)?.count > 0, probeHoney.countable, surfaces.asked], [undefined, true, false, []],
+        "A «honning Trondheim» from a probe client: a nationwide honey search, as on main, with no place looked up");
+      const spam = await askA2a("honning Trondheim WALLET RECOVERY");
+      assertEq([a2aData(spam)?.parsedQuery?.location, a2aData(spam)?.conversations, surfaces.asked], [undefined, [], []],
+        "A spam with a food word and a place: no place looked up, no conversation");
 
       const structured = await sendA2a(surfaces.a2a, { message: { data: { _unknownTerms: ["kransekake"] } } });
       assertEq([a2aData(structured)?.count, /Fant ingen matforespørsel/.test(a2aData(structured)?.note ?? "")], [0, true],

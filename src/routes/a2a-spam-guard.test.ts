@@ -4,15 +4,18 @@
  * Drives the REAL POST /a2a router (and the REST conversation endpoints in
  * the same router, plus GET /api/agents/:id/stats) through router.handle()
  * against an in-memory DB with the full init.ts schema — same harness as
- * a2a-tags-relaxed.test.ts. No HTTP server, no network.
+ * a2a-tags-relaxed.test.ts. No HTTP server, no network: Kartverket is a stub
+ * that knows no name (geocodingService's own test seam), and logs each request.
  *
  * Covers:
  *   (a) a real buyer query keeps the old path: results, ≤3 conversations,
  *       one 'search' interaction, times_contacted + discovery counters
  *   (b) the real prod spam/probe payloads: valid completed task, but NO
- *       conversation, NO 'search' interaction, NO discovery-counter write
+ *       conversation, NO 'search' interaction, NO discovery-counter write,
+ *       and NO geocoder request (slice I-AA, review of lokal#1193, B1)
  *   (c) no-intent external text: empty result + note, nothing written
- *   (d) spam WITH intent and internal fleet traffic: results, no trace
+ *   (d) spam WITH intent and internal fleet traffic: results, no trace;
+ *       the spam looks no place up
  *   (e) per-ip_hash cap: the 11th conversation-creating call in an hour
  *       still gets results but starts no conversations
  *   (f) discover() counts only the RETURNED page (limit:1 → one bump)
@@ -30,6 +33,7 @@
 
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
+import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting, __peekGeoCacheForTesting } from "../services/geocoding-service";
 
 export interface TestSummary {
   passed: number;
@@ -134,6 +138,16 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
   const { a2aConversationCap } = require("../services/a2a-traffic-classifier") as typeof import("../services/a2a-traffic-classifier");
   a2aConversationCap.reset();
 
+  // Slice I-AA: A2A looks the place of a search up, as lokal_search does.
+  // Kartverket (Stedsnavn and Kommuneinfo) is a stub that knows no name, so
+  // only the built-in places resolve; each request is logged.
+  const geoAsked: string[] = [];
+  __setGeocodingFetchForTesting((async (url: unknown) => {
+    geoAsked.push(String(url));
+    return { ok: false, status: 404, json: async () => ({}) } as Response;
+  }) as typeof fetch);
+  __clearGeocodeCacheForTesting();
+
   const convCount = () => (db.prepare(`SELECT COUNT(*) c FROM conversations`).get() as { c: number }).c;
   const convForTask = (taskId: string) =>
     (db.prepare(`SELECT COUNT(*) c FROM conversations WHERE task_id = ?`).get(taskId) as { c: number }).c;
@@ -183,12 +197,20 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
       assertEq(cls.map(x => x.t), ["external"], "(a) stored traffic_class = external");
       assertEq(d?.note, undefined, "(a) no note on a normal hit");
       assertEq(r.locals?.a2aCountable, true, "(a) the call is logged as countable («AI-søk», S7)");
+      assertTrue(geoAsked.length > 0 && __peekGeoCacheForTesting().keys.includes("oslo"),
+        "(a) its place is looked up, as lokal_search does (slice I-AA)");
     }
 
     // ── (b) real prod spam/probe payloads: no trace at all ───────────────
     const { SPAM_SAMPLES } = require("../services/a2a-traffic-classifier.test") as typeof import("../services/a2a-traffic-classifier.test");
+    // Slice I-AA (review of lokal#1193, B1): nearly every payload has words
+    // the parser cannot read; they used to count as a search and the place
+    // lookup ran on them (14–100 requests to Kartverket per call). The cache
+    // is emptied first, so a lookup answered from it shows too.
+    geoAsked.length = 0;
+    __clearGeocodeCacheForTesting();
     for (const s of SPAM_SAMPLES) {
-      const before = { conv: convCount(), search: searchCount(), disc: discoverySum() };
+      const before = { conv: convCount(), search: searchCount(), disc: discoverySum(), geo: geoAsked.length };
       const r = await send(router, s.text, { ua: s.ua });
       assertEq(r.body?.result?.task?.status?.state, "completed", `(b) ${s.label}: still a valid completed task`);
       assertEq(dataOf(r)?.conversations, [], `(b) ${s.label}: no conversations in the response`);
@@ -196,15 +218,20 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
       assertEq(searchCount(), before.search, `(b) ${s.label}: no 'search' interaction`);
       assertEq(discoverySum(), before.disc, `(b) ${s.label}: no discovery-counter writes`);
       assertEq(r.locals?.a2aCountable, false, `(b) ${s.label}: logged as not countable`);
+      assertEq(geoAsked.length - before.geo, 0, `(b) ${s.label}: no geocoder request`);
+    }
+    assertEq([geoAsked, __peekGeoCacheForTesting().keys], [[], []],
+      `(b) the ${SPAM_SAMPLES.length} payloads made no geocoder request and left nothing in the geocode cache`);
+    {
+      const probe = SPAM_SAMPLES.find((s) => s.ua?.startsWith("a2a-probe"))!;
+      const r = await send(router, probe.text, { ua: "RFB-HealthCheck/1.0" });
+      assertTrue(dataOf(r)?.count === 2 && geoAsked.length > 0 && __peekGeoCacheForTesting().keys.includes("oslo"),
+        `(b) control: «${probe.text}» from our own fleet (internal) is looked up, so the check above is not vacuous`);
     }
     {
       const r = await send(router, '{"module": "ziwei-comm-module/v1", "implant_id": "x"}', { ua: "Mozilla/5.0 (compatible; ziwei-implant/1.0)" });
       assertEq(dataOf(r)?.count, 0, "(b) unparseable spam no longer falls back to the nationwide trust ranking");
-      // Slice I-AA: the words the parser cannot read are a search, looked up
-      // in the product names as lokal_search does; these match none.
-      assertTrue((dataOf(r)?.note || "").startsWith("🔎 Ingen produsent har «module ziwei comm implant» i produktlista")
-        && /No producer lists «module ziwei comm implant»/.test(dataOf(r)?.note || ""),
-        "(b) …and says, in lokal_search's words, that no product matches its words");
+      assertTrue(/No food query/.test(dataOf(r)?.note || ""), "(b) …and says no food query was detected");
     }
 
     // ── (c) no-intent external text ─────────────────────────────────────
@@ -231,8 +258,10 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
     // ── (d) spam WITH intent, and internal fleet traffic ────────────────
     {
       const before = { conv: convCount(), search: searchCount(), disc: discoverySum() };
+      const geo = geoAsked.length;
       const r = await send(router, "honning WALLET RECOVERY");
       assertEq(dataOf(r)?.count, 2, "(d) spam with a food word still gets results");
+      assertEq(geoAsked.length, geo, "(d) …and looks no place up in its words (slice I-AA)");
       assertEq([convCount(), searchCount(), discoverySum()], [before.conv, before.search, before.disc],
         "(d) …but leaves no conversation / search log / discovery bump");
       assertEq(r.locals?.a2aCountable, false, "(d) …and is not logged as countable");
@@ -393,6 +422,8 @@ export async function runA2aSpamGuardTests(opts: { log?: boolean } = {}): Promis
   } finally {
     console.log = prevLog;
     a2aConversationCap.reset();
+    __setGeocodingFetchForTesting();
+    __clearGeocodeCacheForTesting();
     if (prevDb) __setDbForTesting(prevDb as any);
     if (setKeyOurselves) delete process.env.ADMIN_KEY;
   }

@@ -364,18 +364,14 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
   // Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): read as
   // MCP lokal_search reads it (services/rfb-search-reading.ts): a place
   // outside Norway gets no producers, and the place in the text is looked
-  // up. «honning Trondheim» used to be answered with honey producers in
-  // Tønsberg, Hurum and Stathelle, and «cheese in Stockholm» with Norwegian
-  // dairies. The place is looked up only for a text that asks for something
-  // (hasDiscoveryIntent): a place alone, or a greeting the geocoder may know
-  // as a place («hei»), stays no search, as before, so it starts no
-  // conversations.
+  // up below, once the traffic class is known. «honning Trondheim» used to
+  // be answered with honey producers in Tønsberg, Hurum and Stathelle, and
+  // «cheese in Stockholm» with Norwegian dairies.
   let outsideNorway: string | null = null;
   if (messageText) {
     const read = readSearchText(messageText);
     discoveryQuery = read.parsed;
     outsideNorway = read.outsideNorway;
-    if (!outsideNorway && hasDiscoveryIntent(read.parsed)) await geocodeSearchPlace(read.parsed, messageText);
   }
   // Mode 2: Structured discovery query
   else if (messageData) {
@@ -409,7 +405,22 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
     hasStructuredData: !messageText,
     isInternal: isInternalTraffic(requestMeta),
   });
-  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText });
+  // Slice I-AA: only external and internal traffic has its text read as a
+  // search the way lokal_search reads it. Spam and probe traffic is read as
+  // before: the words the parser cannot read, which nearly every such payload
+  // has, are no search (so it gets no discover() at all), and no place is
+  // looked up. Looking up a text's place is up to 114 sequential requests to
+  // Kartverket (MAX_GEOCODE_WORDS), and the misses would fill the geocode
+  // cache that lokal_search and /sok share (review of lokal#1193, B1). A
+  // place is looked up only for a text that asks for something
+  // (hasDiscoveryIntent): a place alone, or a greeting the geocoder may know
+  // as a place («hei»), stays no search, as before, so it starts no
+  // conversations.
+  const readAsSearch = trafficClass === "external" || trafficClass === "internal";
+  if (messageText && readAsSearch && !outsideNorway && hasDiscoveryIntent(discoveryQuery)) {
+    await geocodeSearchPlace(discoveryQuery, messageText);
+  }
+  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText, unknownTerms: readAsSearch });
   const capKey = req.ip ? hashIP(req.ip) : "unknown";
   const rateCapped = trafficClass === "external" && hasIntent && a2aConversationCap.isOver(capKey);
   const countable = trafficClass === "external" && hasIntent && !rateCapped;
