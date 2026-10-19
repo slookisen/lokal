@@ -42,9 +42,13 @@ import {
   recordStageVFieldObservation,
   type StageVField,
   DENTAL_AGENT_WRITABLE_FIELDS,
+  withoutDentalSideColumns,
   type DentalAgentRow,
 } from "../services/dental-store";
 import { shownDentalAgent, shownDentalFieldProvenance, isPrivateEnkAddress } from "../services/dental-places-display";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// GET /discover gives verification_status as the badge says it.
+import { shownVerificationStatus } from "../services/dental-verified-claim";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -125,8 +129,12 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 // of a sole proprietorship is hidden from a public answer whether or not the
 // Places rule is on (shownDentalAgent); with the rule off the answer keeps
 // field_provenance, less that address's entries.
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// the side values the «Verifisert» claim reads are left out of both as well,
+// and verification_status stays the stored value here (the raw REST answer
+// is F2-S7's), so both answers are as before.
 function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
-  const { stage_v_pending_correction: _pending, ...row } = withoutGoogleRating(adminView ? agent : shownDentalAgent(agent));
+  const row = withoutDentalSideColumns(withoutGoogleRating(adminView ? agent : shownDentalAgent(agent)));
   if (adminView) return row;
   if (!placesDisplayPolicyEnabled()) return { ...row, field_provenance: shownDentalFieldProvenance(agent) };
   const { field_provenance: _provenance, ...shown } = row;
@@ -525,7 +533,9 @@ router.get("/discover", (req: Request, res: Response) => {
         id: a.id,
         chain_brand: a.chain_brand,
         available_specialties: a.available_specialties,
-        verification_status: a.verification_status,
+        // F2-S8: as A2A gives it ('pending_verify' where the claim hides a
+        // stored 'verified'), so the field and the filter say the same.
+        verification_status: shownVerificationStatus(a),
       })),
     });
   } catch (err) {

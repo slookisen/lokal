@@ -524,8 +524,11 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       `b1: the text's numbers are the verifier's (${MIN} of ${ALL} rich fields)`);
     assertTrue(T.nb.includes("tre ganger på rad") && T.en.includes("three times in a row") && verifier.DENTAL_VERIFIER_STREAK_DOWNGRADE_AT === 3,
       "b2: «tre ganger på rad» is DENTAL_VERIFIER_STREAK_DOWNGRADE_AT");
-    assertTrue(T.nb.includes("manuelt, etter at en administrator har gått gjennom profilen, eller av en regelstyrt kontroll") &&
-      T.en.includes("by hand, after an administrator has reviewed the profile, or by a rule-based check"), "b3: two ways: by hand or by the rule-based check");
+    // F2-S8: no manual way (no review is recorded anywhere), and the badge is
+    // shown only on what the check stored (resolveVerifiedClaim, b15-b18).
+    assertTrue(T.nb.startsWith("«Verifisert»-merket vises bare når den siste kontrollen fant ") && T.en.startsWith("The \"Verified\" badge is shown only when the latest check found ") &&
+      !/administrator|gått gjennom profilen|settes på to måter/i.test(T.nb) && !/administrator|reviewed the profile|one of two ways/i.test(T.en),
+      "b3: one way: the badge shows only when the latest check found the conditions; no manual way");
     assertTrue(T.nb.includes("Kontrollen kjøres i dag manuelt, i små partier") && T.en.includes("The check is run by hand today, in small batches"), "b4: the check is run by hand, in small batches");
     assertTrue(!NOT_A_SOURCE.test(T.nb + T.en) && !/[<>&]/.test(T.nb + T.en), "b5: the text names no HPR and has no HTML-special characters besides quotes");
     const rule = verifier.computeDentalVerifiedRule;
@@ -537,7 +540,7 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
     assertTrue(!rule({ ...base, websiteOwnership: "unverified" }) && !rule({ ...base, websiteOwnership: null }), "b8: website not confirmed -> no badge");
     assertTrue(!rule({ ...base, richFieldCount: MIN - 1 }), `b9: ${MIN - 1} fields -> no badge`);
     assertTrue(rule({ ...base, websiteOwnership: "n/a", catalogClass: "offentlig_klinikk", directoryUrl: "https://example.org/klinikk" }),
-      "b10: a public clinic with a directory listing -> the badge («for en offentlig tannklinikk holder det med en katalogoppføring»)");
+      "b10: a public clinic with a directory listing -> the badge («en katalogoppføring kan erstatte kravet om bekreftet nettsted»)");
     assertTrue(!rule({ ...base, websiteOwnership: "n/a", catalogClass: "offentlig_klinikk", directoryUrl: null }) &&
       !rule({ ...base, websiteOwnership: "unverified", catalogClass: "klinikk", directoryUrl: "https://example.org/klinikk" }),
       "b11: … but no listing, or a listing for a private clinic, gives none");
@@ -553,19 +556,46 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       read("src/scripts/run-dental-verifier.ts").includes('process.env.DENTAL_VERIFIER_SCHEDULER_ENABLED !== "1"') &&
       read("src/routes/admin-run-dental-verifier.ts").includes("|| 20, 1), 50);"),
       "b14: «manuelt, i små partier»: only the admin route (at most 50 a call) runs the verifier; the runner is off by default");
+    // F2-S8: each condition the text names is one the read-time claim reads,
+    // and the badge goes when it fails.
+    {
+      const claim = require("../services/dental-verified-claim") as typeof import("../services/dental-verified-claim");
+      const shown = { verification_status: "verified", is_inactive: 0, brreg_status: "active", website_ownership: "verified", catalog_class: "klinikk", directory_url: null, rich_field_count: MIN };
+      assertTrue(claim.VERIFIED_CLAIM_REQUIRES_RULE && claim.resolveVerifiedClaim(shown), "b15 control: the claim is on, and a row with every condition shows the badge");
+      const conditions: Array<[string, string, Record<string, unknown>]> = [
+        ["aktiv i Brønnøysundregistrene", "active in Brønnøysundregistrene", { brreg_status: "orgnr_not_found_or_unreachable" }],
+        ["nettstedet bekreftet som klinikkens eget", "the website confirmed as the clinic's own", { website_ownership: "unverified" }],
+        [`minst ${MIN} av ${ALL} utvidede profilfelt`, `at least ${MIN} of ${ALL} extended profile fields`, { rich_field_count: MIN - 1 }],
+      ];
+      for (const [nb, en, broken] of conditions) {
+        assertTrue(T.nb.includes(nb) && T.en.includes(en) && !claim.resolveVerifiedClaim({ ...shown, ...broken }), `b15 «${nb}»: named in nb and en, and the badge goes without it`);
+      }
+      const listed = { ...shown, website_ownership: "n/a", catalog_class: "offentlig_klinikk", directory_url: "https://example.org/klinikk" };
+      assertTrue(T.nb.includes("For en offentlig tannklinikk kan en katalogoppføring erstatte kravet om bekreftet nettsted, men ikke kravet om aktiv enhet i Brønnøysundregistrene.") &&
+        T.en.includes("For a public dental clinic, a directory listing can take the place of a confirmed website, but not of an active entity in Brønnøysundregistrene.") &&
+        claim.resolveVerifiedClaim(listed) && !claim.resolveVerifiedClaim({ ...listed, brreg_status: null }),
+        "b16: a public clinic's listing stands in for the website, not for an active entity (text and claim)");
+      assertTrue(T.nb.includes("Et merke som er satt på annen måte, for eksempel av en tidligere automatisk rutine, vises bare når de samme vilkårene er oppfylt.") &&
+        T.en.includes("A badge set in another way, for example by an earlier automated routine, is shown only when the same conditions are met.") &&
+        !claim.resolveVerifiedClaim({ verification_status: "verified" }), "b17: a badge stored without the check's results is not shown");
+      assertTrue(!/uverifisert|unverified|ikke verifisert|not verified/i.test(T.nb + T.en), "b18: the text marks no clinic «uverifisert»");
+    }
 
     // ── fixture: two public clinics in Oslo, so the listings have content ──
     // The first has the «Verifisert» badge. A third, also verified, has no
     // stored fylke: the total counts it, the fylke aggregate does not (l12).
     // Set before any page is served, since the pages cache the numbers.
+    // F2-S8: both verified clinics carry what the verifier stores when the
+    // rule passes, so the badge shows.
+    const BASIS = "brreg_status = 'active', website_ownership = 'verified', om_oss = 'Om klinikken.', payment_options = '[\"kort\"]', social_media = '{\"facebook\":\"https://example.test\"}'";
     const slugs = [["Sentrum Tannklinikk AS", "918960001"], ["Majorstuen Tann AS", "918960002"]].map(([navn, org_nr], i) => {
       const id = store.createDentalAgent({ navn, org_nr, poststed: "OSLO", fylke: "Oslo", adresse: "Storgata 1", postnummer: "0150", telefon: "22110099" } as any);
-      db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = ? WHERE id = ?").run(i === 0 ? "verified" : "pending_verify", id);
+      db.prepare(`UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = ?${i === 0 ? `, ${BASIS}` : ""} WHERE id = ?`).run(i === 0 ? "verified" : "pending_verify", id);
       return dentalSeo.slugifyClinic(navn!, org_nr!);
     });
     {
       const id = store.createDentalAgent({ navn: "Fjordkanten Tann AS", org_nr: "918960003", poststed: "HAMAR", adresse: "Torget 2", postnummer: "2317" } as any);
-      db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = 'verified', fylke = NULL WHERE id = ?").run(id);
+      db.prepare(`UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = 'verified', fylke = NULL, ${BASIS} WHERE id = ?`).run(id);
     }
 
     // ── (c) + (d) every page ──────────────────────────────────────────────
@@ -932,8 +962,9 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       const platform = om.split("<h2>Om plattformen</h2>")[1]?.match(/<p>([\s\S]*?)<\/p>/)?.[1] ?? "";
       assertTrue(platform.length > 0, "m2 control: «Om plattformen» is read");
       assertTrue(!/kontinuerlig|uverifisert|tydelig merket/i.test(om), "m3: /om claims no continuous verification and no «uverifisert» marking (regression)");
-      assertTrue(platform.includes("«Verifisert»-merket settes enten manuelt eller av en regelstyrt kontroll") && platform.includes("kontrollen kjøres i dag manuelt, i små partier"),
-        "m4: «Om plattformen» says how the badge is set, as the «Verifisert» text does");
+      assertTrue(platform.includes("«Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll") && platform.includes("kontrollen kjøres i dag manuelt, i små partier") &&
+        !/settes enten manuelt|manuelt eller/.test(platform),
+        "m4: «Om plattformen» says when the badge shows, as the «Verifisert» text does, with no manual way (F2-S8)");
       assertTrue(platform.includes("Klinikker uten merket får ingen merknad om kontrollen.") && !platform.includes("uten noen annen markering"),
         "m4b: … and that a clinic without the badge gets no note about the check (not «no other marking»: a closed clinic shows «Nedlagt»)", platform);
       assertTrue(platform.includes('<a href="/proveniens">'), "m5: … and points to the method page");

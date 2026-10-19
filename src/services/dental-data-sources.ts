@@ -223,26 +223,32 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
 ];
 
 /**
- * What the «Verifisert» badge means, as dental-verifier.ts sets and removes it
- * (computeDentalVerifiedRule and runDentalVerifierBatch's downgrade rules;
- * the numbers are DENTAL_VERIFIER_MIN_RICH_FIELDS of DENTAL_RICH_FIELDS). In
- * production the verifier runs only by hand, through POST
- * /admin/run-dental-verifier (at most 50 rows a call); the standalone runner
- * src/scripts/run-dental-verifier.ts does nothing unless
- * DENTAL_VERIFIER_SCHEDULER_ENABLED=1, and nothing schedules it.
- * /proveniens, /hvordan-det-fungerer and llms.txt print this text; the truth
- * test checks the numbers and the rule against the verifier. Plain text
- * without HTML-special characters other than quotes.
+ * What the «Verifisert» badge means, as the public pages show it (F2-S8): the
+ * read-time claim resolveVerifiedClaim (dental-verified-claim.ts) shows it
+ * only when the stored fields pass computeDentalVerifiedRule (the numbers are
+ * DENTAL_VERIFIER_MIN_RICH_FIELDS of DENTAL_RICH_FIELDS) and the clinic is
+ * not closed, whoever stored 'verified'. No manual way is named: no review is
+ * recorded anywhere, and the stored badges came mostly from the enrichment
+ * routine through PUT, not from a review. The last sentence is
+ * runDentalVerifierBatch's downgrade rules. In production the verifier runs
+ * only by hand, through POST /admin/run-dental-verifier (at most 50 rows a
+ * call); the standalone runner src/scripts/run-dental-verifier.ts does
+ * nothing unless DENTAL_VERIFIER_SCHEDULER_ENABLED=1, and nothing schedules
+ * it. /proveniens, /hvordan-det-fungerer and llms.txt print this text; the
+ * truth test checks the numbers and the rule against the verifier and the
+ * claim. Plain text without HTML-special characters other than quotes.
  */
 export const DENTAL_VERIFIED_BADGE_TEXT = {
   nb:
-    "«Verifisert»-merket settes på to måter: manuelt, etter at en administrator har gått gjennom profilen, eller av en regelstyrt kontroll. " +
-    "Kontrollen gir merket når enheten er aktiv i Brønnøysundregistrene, nettstedet er bekreftet som klinikkens eget (siden viser klinikkens organisasjonsnummer, eller navnet sammen med poststed eller postnummer; for en offentlig tannklinikk holder det med en katalogoppføring), og minst 3 av 10 utvidede profilfelt er fylt ut. " +
+    "«Verifisert»-merket vises bare når den siste kontrollen fant enheten aktiv i Brønnøysundregistrene og nettstedet bekreftet som klinikkens eget (siden viser klinikkens organisasjonsnummer, eller navnet sammen med poststed eller postnummer), og minst 3 av 10 utvidede profilfelt er fylt ut. " +
+    "For en offentlig tannklinikk kan en katalogoppføring erstatte kravet om bekreftet nettsted, men ikke kravet om aktiv enhet i Brønnøysundregistrene. " +
+    "Et merke som er satt på annen måte, for eksempel av en tidligere automatisk rutine, vises bare når de samme vilkårene er oppfylt. " +
     "Kontrollen kjøres i dag manuelt, i små partier, så de fleste klinikker er ikke kontrollert ennå. " +
     "Den tar også merket bort når Brønnøysundregistrene viser at enheten er slettet, konkurs eller under avvikling, når næringskoden ikke passer en tannklinikk, eller når nettstedet ikke kan bekreftes tre ganger på rad.",
   en:
-    "The \"Verified\" badge is set in one of two ways: by hand, after an administrator has reviewed the profile, or by a rule-based check. " +
-    "The check gives the badge when the entity is active in Brønnøysundregistrene, the website is confirmed as the clinic's own (the page shows the clinic's organisation number, or its name together with its town or postcode; for a public dental clinic a directory listing is enough), and at least 3 of 10 extended profile fields are filled in. " +
+    "The \"Verified\" badge is shown only when the latest check found the entity active in Brønnøysundregistrene and the website confirmed as the clinic's own (the page shows the clinic's organisation number, or its name together with its town or postcode), and at least 3 of 10 extended profile fields are filled in. " +
+    "For a public dental clinic, a directory listing can take the place of a confirmed website, but not of an active entity in Brønnøysundregistrene. " +
+    "A badge set in another way, for example by an earlier automated routine, is shown only when the same conditions are met. " +
     "The check is run by hand today, in small batches, so most clinics have not been checked yet. " +
     "It also removes the badge when Brønnøysundregistrene shows the entity as dissolved, bankrupt or being wound up, when its industry code does not fit a dental clinic, or when the website cannot be confirmed three times in a row.",
 } as const;

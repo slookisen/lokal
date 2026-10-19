@@ -10,7 +10,9 @@
 // acute_sourced counts with DENTAL_ACUTE_CLAIM_SQL, the SQL twin of
 // resolveAcuteClaim(row) !== null: the clinics /sok?akutt=1 lists, whose card
 // shows «Akuttvakt» (with provenance) or «Tar imot akuttpasienter». No new
-// JSON check lives here.
+// JSON check lives here. `verified` counts the same way, with the SQL twin of
+// resolveVerifiedClaim (A2A dev-request 2026-10-16-finn-tannlege-tillit-
+// kilder-metode-ikon, F2-S8): the clinics whose card shows «Verifisert».
 //
 // specialist_clinics counts the clinics whose card shows a specialty: the
 // cards' own predicate, clinicSpecialties(row).length > 0, run in JS over the
@@ -44,6 +46,7 @@
 
 import { createSwrCache, type SwrCache } from "./offthread-stats";
 import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
+import { dentalVerifiedClaimSql } from "./dental-verified-claim";
 import { clinicSpecialties } from "../config/dental-search-vocabulary";
 import { DENTAL_STATS_TTL_MS } from "./dental-search-gazetteer";
 import { DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, type DentalLandingFacet } from "../config/dental-landing";
@@ -59,6 +62,7 @@ import {
 /** The numbers for one place or one fylke. */
 export interface DentalAreaCounts {
   total: number;
+  /** Clinics that show «Verifisert» (the read-time claim, F2-S8). */
   verified: number;
   /** helfo_agreement = 'true': what the clinics' own websites say. */
   helfo_true: number;
@@ -159,7 +163,7 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
   // Raw rows (arrays, in this column order): one scan, no object per row.
   const rows = db.prepare(
     "SELECT poststed, fylke," +
-    " CASE WHEN verification_status = 'verified' THEN 1 ELSE 0 END," +
+    ` CASE WHEN ${dentalVerifiedClaimSql()} THEN 1 ELSE 0 END,` +
     " CASE WHEN helfo_agreement = 'true' THEN 1 ELSE 0 END," +
     ` CASE WHEN ${DENTAL_ACUTE_CLAIM_SQL} THEN 1 ELSE 0 END,` +
     ` CASE WHEN ${DATED_UPDATED_AT_SQL} THEN updated_at END,` +

@@ -19,6 +19,12 @@
  *        the Dentist JSON-LD (no postalCode), a real one is unchanged; the
  *        clinic card on /spesialitet and /fylke shows a chip for a specialty
  *        found only through a specialist's title.
+ *   F2-S8 — (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-
+ *        ikon) «Verifisert» on the profile header and the web card only when
+ *        the stored fields meet the rule: a stored 'verified' without the
+ *        verifier's basis has neither, nor does a public clinic without an
+ *        org.nr. or a closed clinic; the card with the badge is listed first
+ *        on /fylke; no page marks a clinic «uverifisert».
  *
  * Setup mirrors dental.test.ts (this repo's convention for testing dental
  * route files not registered in tests/test.ts's supertest-style harness):
@@ -351,6 +357,38 @@ export async function runDentalSeoProfilkvalitetTests(
       const plain = cardOf(fylke, "Bare Tannlege Tittel AS");
       assertTrue(!!plain && cardChips(plain).length === 0, "D3d chips: titles Tannlege and Spesialist give no chip");
       assertTrue(JSON.stringify(cardChips(cardOf(fylke, "Kjeveortoped Tittel AS"))) === JSON.stringify(["kjeveortopedi"]), "D3d chips: the same chip on /fylke");
+    }
+
+    // ── F2-S8: «Verifisert» only with a basis ────────────────────────────
+    {
+      const BASIS = "brreg_status = 'active', website_ownership = 'verified', om_oss = 'Om klinikken.', payment_options = '[\"kort\"]', social_media = '{\"facebook\":\"https://example.test\"}'";
+      const verifiedClinic = (navn: string, org_nr: string | null, set: string) => {
+        const id = store.createDentalAgent({ navn, ...(org_nr ? { org_nr } : {}), poststed: "OSLO", fylke: "Oslo", adresse: "Torggata 2", telefon: "22123457" } as any);
+        db.prepare(`UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = 'verified'${set ? `, ${set}` : ""} WHERE id = ?`).run(id);
+        return id;
+      };
+      // «Aaa …» sorts first by name, so only the badge can put «Zzz …» before it.
+      const unbased = verifiedClinic("Aaa Merke Uten Grunnlag AS", "918900301", "");
+      const based = verifiedClinic("Zzz Merke Med Grunnlag AS", "918900302", BASIS);
+      const noOrgNr = verifiedClinic("Oslo Offentlig Tannklinikk", null,
+        `${BASIS}, brreg_status = NULL, website_ownership = 'n/a', catalog_class = 'offentlig_klinikk', directory_url = 'https://example.test/oslo'`);
+      const closed = verifiedClinic("Nedlagt Merke Med Grunnlag AS", "918900304", `${BASIS}, is_inactive = 1`);
+      const headerBadges = async (id: string) =>
+        (await callRoute(dentalSeoRouter, { path: `/klinikk/id/${id}` })).body.match(/<div class="clinic-badges" style="margin-bottom:12px">([\s\S]*?)<\/div>/)?.[1] ?? "?";
+      const VERIFIED = '<span class="badge badge-verified">Verifisert</span>';
+      const [u, b, n, c] = [await headerBadges(unbased), await headerBadges(based), await headerBadges(noOrgNr), await headerBadges(closed)];
+      assertTrue(!u.includes(VERIFIED) && u !== "?", "F2-S8 profile: a stored 'verified' without a basis has no «Verifisert» badge");
+      assertTrue(b.includes(VERIFIED), "F2-S8 profile: with the verifier's basis it has the badge");
+      assertTrue(!n.includes(VERIFIED) && n !== "?", "F2-S8 profile: a public clinic without an org.nr. (no Brreg status) has none, though it has a directory listing");
+      assertTrue(c.includes("Nedlagt") && !c.includes(VERIFIED), "F2-S8 profile: a closed clinic shows «Nedlagt» and no badge");
+      const fylke = (await callRoute(dentalSeoRouter, { path: "/fylke/Oslo" })).body;
+      const badgeOf = (navn: string) => cardOf(fylke, navn).match(/<div class="clinic-badges">([\s\S]*?)<\/div>/)?.[1] ?? "?";
+      assertTrue(badgeOf("Zzz Merke Med Grunnlag AS").includes(VERIFIED) && !badgeOf("Aaa Merke Uten Grunnlag AS").includes(VERIFIED) && badgeOf("Aaa Merke Uten Grunnlag AS") !== "?",
+        "F2-S8 card: /fylke/Oslo shows the badge on the card with a basis only");
+      assertTrue(fylke.indexOf(">Zzz Merke Med Grunnlag AS</a>") > 0 && fylke.indexOf(">Zzz Merke Med Grunnlag AS</a>") < fylke.indexOf(">Aaa Merke Uten Grunnlag AS</a>"),
+        "F2-S8 card: the clinic with the badge is listed before the one without, though it sorts last by name");
+      const pages = [fylke, ...(await Promise.all([unbased, noOrgNr].map(async (id) => (await callRoute(dentalSeoRouter, { path: `/klinikk/id/${id}` })).body)))];
+      assertTrue(pages.every((html) => !/uverifisert|ikke verifisert/i.test(html)), "F2-S8: no page marks a clinic «uverifisert»");
     }
   } catch (err: any) {
     failed++;

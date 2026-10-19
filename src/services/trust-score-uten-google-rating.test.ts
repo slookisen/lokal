@@ -381,7 +381,9 @@ export async function runTrustScoreUtenGoogleRatingTests(opts: { log?: boolean }
        * Same dev-request, A4-D: a public answer also leaves out field_provenance
        * (it holds the Places values) and Stage V's pending map (a read-only
        * side column of the hydrated row). Nothing here comes from Places, so
-       * every other value is as stored.
+       * every other value is as stored. A2A dev-request
+       * 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8): nor the
+       * side values the «Verifisert» claim reads.
        */
       const expectedRow = (id: string): Record<string, unknown> => {
         const {
@@ -390,6 +392,9 @@ export async function runTrustScoreUtenGoogleRatingTests(opts: { log?: boolean }
           rating_source: _s,
           field_provenance: _p,
           stage_v_pending_correction: _v,
+          brreg_status: _b,
+          website_ownership: _w,
+          rich_field_count: _n,
           ...row
         } = dstore.getDentalAgentById(id) as Record<string, unknown>;
         return {

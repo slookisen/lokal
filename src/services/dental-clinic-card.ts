@@ -16,12 +16,17 @@
  * 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
  * (A4-D): every variant shows the clinic through shownDentalAgent, so an
  * address, phone, website or opening hours that only Google Places gives, or
- * that is marked wrong, is null (dental-places-display.ts).
+ * that is marked wrong, is null (dental-places-display.ts). A2A dev-request
+ * 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8): «Verifisert»
+ * and the A2A verification_status follow the read-time claim
+ * (dental-verified-claim.ts), so a stored 'verified' without a basis shows no
+ * badge and answers 'pending_verify'. No key is added or removed.
  *
  * Pure: no DB access (the detail card gets its specialists from the caller).
  */
 
-import { DentalAgentSchema, type DentalAgent, type DentalAgentRow, type DentalPerson } from "./dental-store";
+import { DentalAgentSchema, withoutDentalSideColumns, type DentalAgent, type DentalAgentRow, type DentalPerson } from "./dental-store";
+import { resolveVerifiedClaim, shownVerificationStatus } from "./dental-verified-claim";
 import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL, type AcuteClaim } from "./dental-acute-claim";
 import { isDisplayablePhone } from "./contact-normalizer";
 import { shownPostnummer } from "./norway-postnummer";
@@ -166,9 +171,11 @@ export function toDentalClinicCard(
  * and every other key stay), with the values that were untrue made honest —
  * phone and mobile only when displayable, acute_vakt only with provenance,
  * the Places-only values null as on the cards (A4-D; also the row's own
- * opening_hours and hjemmeside) — the Google rating fields, the internal
- * field_provenance and Stage V's pending map left out, and the search card's
- * fields added with the card's values.
+ * opening_hours and hjemmeside), verification_status as the badge says it
+ * (F2-S8: 'pending_verify' where the claim hides a stored 'verified') — the
+ * Google rating fields, the internal field_provenance and the read-only side
+ * values (Stage V's pending map, the claim's inputs) left out, and the search
+ * card's fields added with the card's values.
  */
 export function toDentalA2aClinic(stored: ClinicRow) {
   const agent = shownDentalAgent(stored);
@@ -177,9 +184,8 @@ export function toDentalA2aClinic(stored: ClinicRow) {
     rating_count: _ratingCount,
     rating_source: _ratingSource,
     field_provenance: _provenance,
-    stage_v_pending_correction: _pending,
     ...row
-  } = agent;
+  } = withoutDentalSideColumns(agent);
   // The card's keys come last and keep the row's place for the ones it shares
   // (navn, telefon, adresse, …); its telefon is the displayable one. The two
   // row keys the card leaves out without a value are null, not the raw value
@@ -188,6 +194,7 @@ export function toDentalA2aClinic(stored: ClinicRow) {
     ...row,
     mobil: displayablePhone(agent.mobil),
     acute_vakt: publicAcuteVakt(agent),
+    verification_status: shownVerificationStatus(agent),
     chain_brand: null,
     online_booking_url: null,
     ...toDentalClinicCard(agent, "search"),
@@ -214,7 +221,7 @@ function clinicBadges(agent: ClinicRow, specialist: boolean): string[] {
   const acute = resolveAcuteClaim(agent);
   if (acute === "vakt") badges.push("Akuttvakt");
   else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);
-  if (agent.verification_status === "verified") badges.push("Verifisert");
+  if (resolveVerifiedClaim(agent)) badges.push("Verifisert");
   if (specialist) badges.push("Spesialist");
   return badges;
 }
