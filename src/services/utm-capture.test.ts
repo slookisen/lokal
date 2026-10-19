@@ -81,6 +81,18 @@ export async function runUtmCaptureTests(opts: { log?: boolean } = {}): Promise<
     assertEq(bd.length, 1, "breakdown: only utm-tagged landings");
     assertEq(bd[0].utm_source + "/" + bd[0].utm_medium + "/" + bd[0].views, "chatgpt/mcp/1", "breakdown: values");
 
+    // Only human visits with 2xx/304 count: ChatGPT-User fetching a marked link and a 301 do not.
+    const insB = testDb.prepare(
+      `INSERT INTO analytics_page_views (path, source, session_id, status_code, utm_source, utm_medium, utm_campaign)
+       VALUES ('/produsent/x', 'direct', ?, ?, 'claude', 'mcp', 'ai_search')`);
+    insB.run("h1:Mozilla/5.0 (iPhone) Safari", 200);
+    insB.run("h2:Mozilla/5.0 (iPhone) Safari", 304);
+    insB.run("h3:Mozilla/5.0 (iPhone) Safari", 301);
+    insB.run("b1:Mozilla/5.0 AppleWebKit/537.36; compatible; ChatGPT-User/1.0; +https://openai.com/bot", 200);
+    const bd1 = analyticsService.getUtmBreakdown(24).find((x) => x.utm_source === "claude");
+    assertEq(bd1 ? bd1.views + "/" + bd1.sessions : null, "2/2", "breakdown: bots (ChatGPT-User) and 3xx excluded, 200+304 humans counted");
+    testDb.exec("DELETE FROM analytics_page_views WHERE utm_source = 'claude'");
+
     // ── rollup ──
     const old = (d: number) => { const t = new Date(); t.setDate(t.getDate() - d); return t.toISOString().replace("T", " ").slice(0, 19); };
     testDb.exec("DELETE FROM analytics_page_views; DELETE FROM page_view_daily; DELETE FROM page_view_utm_daily;");

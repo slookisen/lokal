@@ -233,17 +233,26 @@ export function computeUtmBreakdown(db: Db, hours: number, vertical: string | un
     cur.sessions += r.sessions;
     merged.set(key, cur);
   };
-  const raw = db.prepare(`
+  // Human page views only (2xx/304): ChatGPT-User & co. fetching a marked link, and
+  // redirects, are not clicks. Classified per row in JS (client_class, else the UA in session_id).
+  const rawRows = db.prepare(`
     SELECT COALESCE(utm_source, '') AS utm_source, COALESCE(utm_medium, '') AS utm_medium,
-           COALESCE(utm_campaign, '') AS utm_campaign,
-           COUNT(*) AS views, COUNT(DISTINCT session_id) AS sessions
+           COALESCE(utm_campaign, '') AS utm_campaign, session_id, client_class, status_code
     FROM analytics_page_views
     WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
       AND (utm_source IS NOT NULL OR utm_medium IS NOT NULL OR utm_campaign IS NOT NULL)${V}
-    GROUP BY 1, 2, 3
-    ORDER BY views DESC LIMIT 200
-  `).all(cutoff, ...vp) as any[];
-  raw.forEach(add);
+  `).all(cutoff, ...vp) as Array<{ utm_source: string; utm_medium: string; utm_campaign: string; session_id: string | null; client_class: string | null; status_code: number | null }>;
+  const rawGroups = new Map<string, { row: UtmRow; sids: Set<string> }>();
+  for (const r of rawRows) {
+    if (!isPageViewStatus(r.status_code)) continue;
+    if (groupOf(storedClientClass(r.session_id ?? "", r.client_class)) !== "human") continue;
+    const key = `${r.utm_source}\u0000${r.utm_medium}\u0000${r.utm_campaign}`;
+    let g = rawGroups.get(key);
+    if (!g) { g = { row: { utm_source: r.utm_source, utm_medium: r.utm_medium, utm_campaign: r.utm_campaign, views: 0, sessions: 0 }, sids: new Set() }; rawGroups.set(key, g); }
+    g.row.views += 1;
+    g.sids.add(r.session_id ?? "");
+  }
+  for (const g of rawGroups.values()) { g.row.sessions = g.sids.size; add(g.row); }
   const oldestRaw = ((db.prepare(
     "SELECT MIN(created_at) AS d FROM analytics_page_views"
   ).get() as { d: string | null } | undefined)?.d || "").slice(0, 10) || null;
@@ -251,7 +260,7 @@ export function computeUtmBreakdown(db: Db, hours: number, vertical: string | un
     SELECT utm_source, utm_medium, utm_campaign,
            SUM(view_count) AS views, SUM(session_count) AS sessions
     FROM page_view_utm_daily
-    WHERE day >= ? ${oldestRaw ? "AND day < ?" : ""}${V}
+    WHERE day >= ? ${oldestRaw ? "AND day < ?" : ""} AND bot_type = 'human'${V}
     GROUP BY 1, 2, 3
   `).all(...(oldestRaw ? [cutoff.slice(0, 10), oldestRaw] : [cutoff.slice(0, 10)]), ...vp) as any[];
   rolled.forEach(add);
@@ -697,12 +706,13 @@ export function computeHumanReferralPatterns(
   const own = externalReferrerSqlFilter();
 
   const rows = db.prepare(`
-    SELECT referrer, path, session_id, is_owner
+    SELECT referrer, path, session_id, is_owner, utm_source, utm_campaign
     FROM analytics_page_views${pageViewsWindowIndexHint(db, vertical)}
     WHERE created_at > ?
       AND (is_owner IS NULL OR is_owner = 0)
-      AND referrer IS NOT NULL AND TRIM(referrer) != ''${V}${own.sql}
-  `).all(cutoff, ...vp, ...own.params) as HumanReferralRow[];
+      AND ((referrer IS NOT NULL AND TRIM(referrer) != ''${own.sql})
+           OR (utm_source IS NOT NULL AND utm_source != '') OR utm_campaign = 'ai_search')${V}
+  `).all(cutoff, ...own.params, ...vp) as HumanReferralRow[];
 
   if (rows.length === 0) return [];
 

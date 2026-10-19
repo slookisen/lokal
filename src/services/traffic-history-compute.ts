@@ -46,7 +46,7 @@ import { computeQueryStats } from "./search-stats-compute";
 type Db = Database.Database;
 
 /** Bump when a summary's numbers change meaning; rows of an older version are recomputed while their raw days exist. */
-export const TRAFFIC_HISTORY_VERSION = 1;
+export const TRAFFIC_HISTORY_VERSION = 2;
 
 export type HistoryPeriod = "day" | "week" | "month";
 export type HistoryVertical = VerticalId | "all";
