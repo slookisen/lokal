@@ -14,7 +14,7 @@ Finn-tannlege
 ## One-liner (limit 200)
 
 ```
-Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency duty.
+Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency care.
 ```
 97 characters.
 
@@ -23,7 +23,7 @@ Search dental clinics across Norway by place, specialty, Helfo direct billing an
 ```
 Finn-tannlege is an independent directory of dental clinics in Norway: more than 5,400 clinics, from single-dentist practices to large clinics, in every county. It is not affiliated with any clinic chain, insurer or booking portal.
 
-Search by place, by specialty, or by the two things that change what a visit costs and how soon you get one: a Helfo direct-billing agreement and emergency duty (akuttvakt). Every record carries the clinic's address, contact details and a profile page.
+Search by place or specialty, and filter for clinics with a Helfo direct-billing agreement or emergency care. With direct billing, Helfo's share of a treatment that qualifies for support is settled with the clinic and you pay the rest; the agreement is read from the clinic's own website, not from a list kept by Helfo. Emergency care means an emergency duty (akuttvakt) with a recorded source, or a clinic that says it takes emergency patients. Every record carries the clinic's address, contact details and a profile page.
 
 The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places, Kartverket and a one-time import from an online directory (May 2026).
 
@@ -31,7 +31,7 @@ The connector is read-only and gives no dental advice. It tells you which clinic
 
 Finn-tannlege.com is an independent service from Agentplatform.no AS and is not affiliated with FINN.no.
 ```
-953 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
+1,225 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
 
 The last paragraph is `BRAND_ENTITIES.dental.disambiguation.en` (src/config/brand-entities.ts). Keep it when the text is edited in the portal.
 

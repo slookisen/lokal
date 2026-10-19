@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: yes. Every prerequisite below is done. See the prerequisites in ../README.md.
+Before you start: Ready to submit: yes. Every prerequisite is done. See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -46,7 +46,7 @@ See `listing.md` in this folder. Slug: `finn-tannlege` (permanent once published
 Primary use cases:
 
 - Find a dentist in a town or county.
-- Find emergency dental care (akuttvakt) outside normal hours.
+- Find clinics with an emergency duty (akuttvakt) or that take emergency patients.
 - Filter for clinics with a Helfo direct-billing agreement.
 - Find a clinic with a specific specialty, such as orthodontics.
 - Read one clinic's full record by organisation number.
@@ -77,7 +77,7 @@ The server is a public, read-only directory of Norwegian dental clinics. There a
 | Question | Answer |
 |---|---|
 | Whose API is behind the connector | Our own: the server reads Finn-tannlege's own clinic directory on the same domain. |
-| Personal health data | No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency duty) and asks for no health information about the user. |
+| Personal health data | No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency care) and asks for no health information about the user. |
 | Sponsored content | No. The tools return no ads or paid placements. |
 
 Paste if the portal asks what data the connector handles:
@@ -108,7 +108,7 @@ Seven acknowledgments, all required. Our basis for each:
 |---|---|
 | Directory guidelines | Read the Software Directory Terms (https://support.claude.com/en/articles/13145338-anthropic-software-directory-terms) and Policy (https://support.claude.com/en/articles/13145358-anthropic-software-directory-policy). Tick when every prerequisite in ../README.md is done. |
 | First-party API usage | Our own: the server reads Finn-tannlege's own clinic directory on the same domain. |
-| Financial transactions | No money moves through the connector. Helfo agreement status is reported as a fact about a clinic, nothing more. No card or bank details are asked for. |
+| Financial transactions | No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as the clinic's own website states it (not confirmed by Helfo). No card or bank details are asked for. |
 | AI media generation | None: the connector generates no images, video or audio. |
 | Prompt injection | Tool descriptions say what each tool does and do not instruct Claude (checked against the directive patterns in scripts/gen-connector-packs.ts). |
 | Conversation data collection | The tools take only the arguments they need. The server never asks for chat history, memory or files. |
@@ -121,5 +121,6 @@ Check the summary, then submit. Status and reviewer feedback appear in the porta
 ## Known caveats, to state if asked
 
 - tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.
-- tannlege_akutt filters by county (fylke) only: a town name gives no results. Town-level emergency search goes through tannlege_search with `akutt: true`.
+- tannlege_akutt narrows by county (fylke) only: a town name is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.
+- Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).
 - Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.

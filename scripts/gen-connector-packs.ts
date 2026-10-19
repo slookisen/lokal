@@ -260,13 +260,17 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ],
   },
 
+  // The dental text says no more than the service does (the independent check
+  // of the directory prompt, 2026-10-19). What Helfo and emergency care mean is
+  // DENTAL_MCP_INSTRUCTIONS (src/routes/dental-mcp.ts) and the /proveniens and
+  // /vilkar pages; connector-packs-fresh.test.ts (k) keeps the old claims out.
   dental: {
     dir: "dental-connectors-prep",
     slug: "finn-tannlege",
-    oneLiner: "Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency duty.",
+    oneLiner: "Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency care.",
     description: (floor) => [
       `Finn-tannlege is an independent directory of dental clinics in Norway: more than ${floor} clinics, from single-dentist practices to large clinics, in every county. It is not affiliated with any clinic chain, insurer or booking portal.`,
-      "Search by place, by specialty, or by the two things that change what a visit costs and how soon you get one: a Helfo direct-billing agreement and emergency duty (akuttvakt). Every record carries the clinic's address, contact details and a profile page.",
+      "Search by place or specialty, and filter for clinics with a Helfo direct-billing agreement or emergency care. With direct billing, Helfo's share of a treatment that qualifies for support is settled with the clinic and you pay the rest; the agreement is read from the clinic's own website, not from a list kept by Helfo. Emergency care means an emergency duty (akuttvakt) with a recorded source, or a clinic that says it takes emergency patients. Every record carries the clinic's address, contact details and a profile page.",
       // The sources as src/services/dental-data-sources.ts names them (F2-S1 of
       // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon); HPR is not one.
       // dental-sources-truth.test.ts keeps this sentence equal to that list.
@@ -280,7 +284,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     serverSetup: { routeFile: "src/routes/dental-mcp.ts", owner: "2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a)" },
     useCases: [
       "Find a dentist in a town or county.",
-      "Find emergency dental care (akuttvakt) outside normal hours.",
+      "Find clinics with an emergency duty (akuttvakt) or that take emergency patients.",
       "Filter for clinics with a Helfo direct-billing agreement.",
       "Find a clinic with a specific specialty, such as orthodontics.",
       "Read one clinic's full record by organisation number.",
@@ -289,8 +293,8 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     authRationale: "The server is a public, read-only directory of Norwegian dental clinics. There are no user accounts and no write operations, so there is nothing to sign in to.",
     dataHandling: "The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.",
     dataStored: null,
-    healthData: "No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency duty) and asks for no health information about the user.",
-    financial: "No money moves through the connector. Helfo agreement status is reported as a fact about a clinic, nothing more. No card or bank details are asked for.",
+    healthData: "No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency care) and asks for no health information about the user.",
+    financial: "No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as the clinic's own website states it (not confirmed by Helfo). No card or bank details are asked for.",
     reviewerTools: {
       "Find a dentist in Bergen": "tannlege_search",
       "Which dental clinics in Oslo have a Helfo agreement?": "tannlege_search",
@@ -314,7 +318,9 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ],
     caveats: [
       "tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.",
-      "tannlege_akutt filters by county (fylke) only: a town name gives no results. Town-level emergency search goes through tannlege_search with `akutt: true`.",
+      // A town in `fylke` goes through normaliseFylke() in the store (dental-acute-filter.test.ts M1b).
+      "tannlege_akutt narrows by county (fylke) only: a town name is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.",
+      "Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
       "Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.",
     ],
     otherContents: [["assets/finn-tannlege-square-512.png", "The icon to upload: the «Søket» mark (a tooth in a magnifier, white on teal), square, full-bleed, no rounded corners. The same file as the site's /favicon-512.png."]],
@@ -565,10 +571,11 @@ const andList = (xs: readonly string[]): string => (xs.length > 1 ? `${xs.slice(
 
 const STATUS_LABEL: Record<PrereqStatus, string> = { done: "DONE", open: "OPEN", waiting: "WAITING" };
 
+/** The readiness line. README.md has the table under it, portal-answers.md does not, so it says no «below» (S10 in the review of lokal#1178). */
 function readiness(rows: readonly Prerequisite[]): string {
   const open = rows.filter((r) => r.status === "open").length;
   const waiting = rows.filter((r) => r.status === "waiting").length;
-  if (!open && !waiting) return "**Ready to submit: yes.** Every prerequisite below is done.";
+  if (!open && !waiting) return "**Ready to submit: yes.** Every prerequisite is done.";
   const parts = [open ? `${open} open` : "", waiting ? `${waiting} waiting` : ""].filter(Boolean).join(", ");
   return `**Ready to submit: no** (${parts}).`;
 }

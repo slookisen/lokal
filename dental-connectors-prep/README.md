@@ -12,7 +12,7 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: yes.** Every prerequisite below is done.
+**Ready to submit: yes.** Every prerequisite is done.
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|

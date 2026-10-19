@@ -17,7 +17,11 @@
  *   (g) icon md5 pinned per brand, 512×512, no foreign icons;
  *   (h) listing counts and limits, reviewer prompts, write-tool warnings;
  *   (i) the MCPB path marked deprecated;
- *   (j) protocol versions from the SDK and the data-handling paste block.
+ *   (j) protocol versions from the SDK and the data-handling paste block;
+ *   (k) the dental pack says no more than the service does (the independent
+ *       check of the directory prompt, 2026-10-19): emergency care per place,
+ *       no out-of-hours promise, Helfo as the clinic's own website states it;
+ *       and the readiness line points at no table portal-answers.md lacks (S10).
  *
  * Run standalone: npx tsx src/routes/connector-packs-fresh.test.ts
  * Wired into `npm test` via tests/test.ts.
@@ -30,8 +34,12 @@ import * as path from "path";
 import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { parseDentalQuery } from "../services/dental-query-parser";
 import type { CatalogVertical } from "../services/honest-count";
 import { registeredMcpToolDefinitions, registeredMcpToolNames, type McpToolDefinition } from "../services/mcp-tool-manifest";
+import { normaliseFylke } from "../services/norway-fylke";
+import { buildNorwegianGazetteer } from "../services/search-intent/norwegian-query";
+import { DENTAL_MCP_INSTRUCTIONS } from "./dental-mcp";
 import { parseClaims } from "./distribution-metadata.test";
 import {
   DIRECTIVE_PATTERNS, FLOOR_KEY, LIMITS, PACKS, PACK_FILES, PACK_VERTICALS, PORTAL_URL, SERVER_INFO_FIELDS, cardTemplatesMd5,
@@ -440,7 +448,12 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
         icon: { path: "dental-connectors-prep/assets/x.png", width: 512, height: 512, md5: "0".repeat(32) },
       };
       const doneServer = { info: ["name", "version", ...SERVER_INFO_FIELDS], instructions: true };
-      assertTrue(renderPack(allDone, { ...doneInput, server: doneServer })["README.md"].includes("**Ready to submit: yes.**"), "f24: all rows done reads «Ready to submit: yes»");
+      const allDoneFiles = renderPack(allDone, { ...doneInput, server: doneServer });
+      assertTrue(allDoneFiles["README.md"].includes("**Ready to submit: yes.**"), "f24: all rows done reads «Ready to submit: yes»");
+      assertTrue(allDoneFiles["claude-directory/portal-answers.md"].includes("\nBefore you start: Ready to submit: yes. Every prerequisite is done. See the prerequisites in ../README.md.\n") &&
+        !allDoneFiles["claude-directory/portal-answers.md"].includes("prerequisite below"),
+        "k11: all rows done: portal-answers.md says «Ready to submit: yes» with no «below» (S10: its prerequisites are in ../README.md)");
+      assertTrue(allDoneFiles["README.md"].includes("**Ready to submit: yes.** Every prerequisite is done.\n\n| Prerequisite |"), "k12: … and the README says it right above its table");
 
       // Screenshots (review finding B1): every other Opplevagent row done, the
       // card templates changed since the PNGs were rendered → not ready.
@@ -507,6 +520,65 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       const readme = read("opplevagent-connectors-prep/claude-desktop/README.md");
       assertTrue(/^# .*\n\n> \*\*Deprecated path/.test(readme) && readme.includes("../claude-directory/"),
         "i3: claude-desktop/README.md opens with the deprecation note and points at the generated pack");
+    }
+
+    // ── (k) the dental pack says no more than the service does ─────────────
+    // The independent check of the directory prompt (2026-10-19), and S10 in
+    // the review of lokal#1178.
+    {
+      const listing = pack("dental", "claude-directory/listing.md");
+      const portal = pack("dental", "claude-directory/portal-answers.md");
+      const oneLiner = fencedAfter(listing, "One-liner")?.text ?? "";
+      const description = fencedAfter(listing, "Description")?.text ?? "";
+      const useCases = portal.split("Primary use cases:")[1]?.split("\n\n|")[0] ?? "";
+      const caveats = portal.split("## Known caveats, to state if asked")[1] ?? "";
+      assertTrue(oneLiner !== "" && description !== "" && /^- Find a dentist/m.test(useCases) && caveats.includes("tannlege_akutt"),
+        "k0 control: the dental one-liner, description, use cases and caveats are read");
+
+      // What the pack said before the check, each more than the service does.
+      const OVERCLAIMS: ReadonlyArray<readonly [RegExp, string]> = [
+        [/a town name gives no results/i, "tannlege_akutt reads a town as its county"],
+        [/outside normal hours/i, "the data has no out-of-hours times"],
+        [/change what a visit costs|how soon you get one/i, "direct billing settles Helfo's share; emergency care promises no time"],
+        [/reported as a fact/i, "Helfo direct billing is the clinic's own statement, not Helfo's"],
+      ];
+      for (const [re, why] of OVERCLAIMS) assertTrue(!re.test(whole("dental")), `k1: no dental pack file says ${re} (${why})`);
+
+      // Out of hours: emergency care is a duty with a source or a clinic's own word, never a time.
+      const HOURS = /\b(outside|after) (normal|opening|business|office) hours\b|\bout[- ]of[- ]hours\b|\bafter[- ]hours\b|\b24\/7\b|\bround the clock\b/i;
+      assertTrue(HOURS.test("Find emergency dental care (akuttvakt) outside normal hours."), "k2 control: the hours pattern catches the old use case");
+      assertEq([["one-liner", oneLiner], ["description", description], ["use cases", useCases]].filter(([, t]) => HOURS.test(t)).map(([n]) => n), [],
+        "k3: the one-liner, description and use cases promise no out-of-hours care");
+      assertTrue(/^- Emergency care says nothing about hours: the data has no out-of-hours times/m.test(caveats), "k4: a caveat says emergency care says nothing about hours");
+      assertTrue(/^- Find clinics with an emergency duty \(akuttvakt\) or that take emergency patients\.$/m.test(useCases),
+        "k5: the emergency use case names both claims the akutt filter lists («vakt» and «accepts»)");
+
+      // Helfo: what direct billing means is the server instructions' sentence; where it comes from is /proveniens'.
+      const SETTLED = "Helfo's share of a treatment that qualifies for support is settled with the clinic";
+      assertTrue(DENTAL_MCP_INSTRUCTIONS.includes(SETTLED) && description.includes(SETTLED), "k6: the description says what direct billing means in DENTAL_MCP_INSTRUCTIONS' words");
+      assertTrue(read("src/routes/dental-seo.ts").includes("We have no list from Helfo, so the badge is not a confirmation from Helfo") &&
+        description.includes("the agreement is read from the clinic's own website, not from a list kept by Helfo"),
+        "k7: the description gives the Helfo source as /proveniens does (read from the clinic's website, no list from Helfo)");
+      assertTrue(/^\| Financial transactions \| [^\n]*as the clinic's own website states it \(not confirmed by Helfo\)/m.test(portal),
+        "k8: the financial-transactions basis says the same");
+
+      // Emergency care per place: the caveat's two examples hold.
+      const town = caveats.match(/so «([^»]+)» lists the emergency clinics in all of ([^.]+)\./);
+      assertTrue(!!town && normaliseFylke(town[1]) === town[2],
+        `k9: tannlege_akutt reads a town as its county, as the caveat says (normaliseFylke(«${town?.[1]}») = ${town ? normaliseFylke(town[1]) : "?"}; dental-acute-filter.test.ts M1b runs it through the tool)`);
+      const example = caveats.match(/for example «([^»]+)»/)?.[1] ?? "";
+      const oneTown = parseDentalQuery(example, buildNorwegianGazetteer(["STAVANGER", "BERGEN", "OSLO", "TROMSØ", "TRONDHEIM"])).filter;
+      assertTrue(example !== "" && oneTown.acute_vakt === 1 && !oneTown.fylke && !oneTown.fylke_in && !oneTown.name_terms &&
+        !!(oneTown.poststed_or_postnummer || oneTown.poststed_in || oneTown.postnummer_in),
+        `k10: the caveat's one-town example («${example}») reads in tannlege_search's parser as akutt + that town, not a county (${JSON.stringify(oneTown).slice(0, 120)})`);
+
+      // S10: portal-answers.md repeats the README's readiness line, which names no table it lacks.
+      for (const v of PACK_VERTICALS) {
+        const readmeLine = pack(v, "README.md").split("\n").find((l) => l.startsWith("**Ready to submit:")) ?? "";
+        const before = pack(v, "claude-directory/portal-answers.md").split("\n").find((l) => l.startsWith("Before you start: ")) ?? "";
+        assertEq(before, `Before you start: ${readmeLine.replace(/\*\*/g, "")} See the prerequisites in ../README.md.`, `k13 ${v}: portal-answers.md repeats the README's readiness line`);
+        assertTrue(readmeLine !== "" && !/\bbelow\b/.test(before), `k14 ${v}: … and it points at nothing «below» (S10)`);
+      }
     }
   } catch (err) {
     fail("unexpected error", err instanceof Error ? (err.stack || err.message) : String(err));

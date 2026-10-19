@@ -21,7 +21,8 @@
  *       getDentalStats().acute_count is that count (D3a, dev-request
  *       2026-10-17-dental-d3-rettelser), row by row;
  *   M   MCP over a real server + client: tannlege_akutt (with and without
- *       fylke) and tannlege_search (`akutt`, a parsed «akuttvakt», akutt false)
+ *       fylke, and a town in fylke read as its county) and tannlege_search
+ *       (`akutt`, a parsed «akuttvakt», akutt false)
  *       give only claim cards, every one badged, `count` the claim rows;
  *       tannlege_stats' acute_count is tannlege_akutt's count; tannlege_akutt
  *       has «vakt» only on the clinic with a quote, and its
@@ -310,6 +311,11 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       eq(cardNames(r), names(claimVestland), "M1: tannlege_akutt {fylke: Vestland} lists exactly the claim clinics");
       eq(r.count, claimVestland.length, "M2: ... and `count` is their number");
       ok(allBadged(r), "M3: every card has akutt «vakt» with the Akuttvakt badge or «accepts» with «Tar imot akuttpasienter»");
+      // The dental connector pack's caveat (scripts/gen-connector-packs.ts): a
+      // town is read as its county, so it neither narrows nor gives nothing.
+      const town = await call("tannlege_akutt", { fylke: "Voss" });
+      eq([cardNames(town), town.count], [names(claimVestland), claimVestland.length],
+        "M1b: a town in `fylke` is read as its county: «Voss» (no fixture clinic there) lists the Vestland claim clinics");
       const all = await call("tannlege_akutt", {});
       eq([cardNames(all), all.count], [names(claimAll), claimAll.length], "M4: tannlege_akutt without fylke: the claim clinics in every county");
     }
