@@ -3263,7 +3263,7 @@ console.log("── human-visits strip: referral classification + aggregation �
   const sqlite = require("better-sqlite3");
   const wo8db = new sqlite(":memory:");
   wo8db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -3337,7 +3337,7 @@ console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
   const sqlite = require("better-sqlite3");
   const db = new sqlite(":memory:");
   db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -16352,7 +16352,7 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
   function makeDb() {
     const db = new sqlite(":memory:");
     db.exec(`
-      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
         address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -41853,6 +41853,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("run-verifier-agentids: unexpected error: " + String(err?.stack || err?.message || err));
+  }
+});
+
+// ── dev-request 2026-10-01-rfb-verifier-paraplyer-og-vertikaler-ut-c6: RFB
+// verifier pickers skip umbrella / other-vertical rows; stats gets
+// by_verification_status_rfb_producers. Own in-memory DB (swaps getDb()) —
+// runSerial like the agentIds suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01 C6: verifier RFB scope (paraplyer og vertikaler ut) ──");
+  try {
+    const { runLokalAgentVerifierRfbScopeTests } = require("../src/agents/lokal-agent-verifier-rfb-scope.test") as
+      typeof import("../src/agents/lokal-agent-verifier-rfb-scope.test");
+    const rs = await runLokalAgentVerifierRfbScopeTests({ log: false });
+    passed += rs.passed;
+    failed += rs.failed;
+    for (const f of rs.failures) failures.push("verifier-rfb-scope: " + f);
+    console.log(`  verifier-rfb-scope: ${rs.passed} passed, ${rs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("verifier-rfb-scope: unexpected error: " + String(err?.stack || err?.message || err));
   }
 });
 

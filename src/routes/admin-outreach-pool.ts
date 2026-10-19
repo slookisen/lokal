@@ -19,6 +19,7 @@ import { publicListableSql } from "../services/agent-visibility";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+import { RFB_VERIFIER_SCOPE_SQL } from "../agents/lokal-agent-verifier";
 import {
   crossSourceAgreement,
   tierForSource,
@@ -138,6 +139,19 @@ router.get("/stats", (req: Request, res: Response) => {
            FROM agents a
            LEFT JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.role = 'producer' AND a.umbrella_type IS NULL
+          GROUP BY COALESCE(k.verification_status, 'unverified')`,
+      )
+      .all() as Array<{ k: string; c: number }>;
+    // dev-request 2026-10-01-rfb-verifier-paraplyer-og-vertikaler-ut-c6: the
+    // clean RFB-producer queue number (same scope as the verifier pickers —
+    // RFB_VERIFIER_SCOPE_SQL — plus role='producer'). Additive; the fields
+    // above keep their meaning for existing readers.
+    const byStatusRfbProducers = db
+      .prepare(
+        `SELECT COALESCE(k.verification_status, 'unverified') AS k, COUNT(*) AS c
+           FROM agents a
+           LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.role = 'producer' AND ${RFB_VERIFIER_SCOPE_SQL}
           GROUP BY COALESCE(k.verification_status, 'unverified')`,
       )
       .all() as Array<{ k: string; c: number }>;
@@ -509,6 +523,7 @@ router.get("/stats", (req: Request, res: Response) => {
       pool_size: total?.c ?? 0,
       by_verification_status: byStatus,
       by_verification_status_all_knowledge_rows: byStatusAllKnowledgeRows,
+      by_verification_status_rfb_producers: byStatusRfbProducers,
       by_enrichment_status: byEnrichment,
       pool_funnel: {
         verified_and_rich_or_partial: verifiedRichOrPartial?.c ?? 0,
