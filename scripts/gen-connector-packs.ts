@@ -270,7 +270,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       // The sources as src/services/dental-data-sources.ts names them (F2-S1 of
       // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon); HPR is not one.
       // dental-sources-truth.test.ts keeps this sentence equal to that list.
-      "The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places and Kartverket.",
+      "The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places, Kartverket and a one-time import from an online directory (May 2026).",
       "The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.",
     ],
     categories: ["Health", "Reference"],

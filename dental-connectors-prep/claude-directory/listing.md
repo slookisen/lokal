@@ -25,13 +25,13 @@ Finn-tannlege is an independent directory of dental clinics in Norway: more than
 
 Search by place, by specialty, or by the two things that change what a visit costs and how soon you get one: a Helfo direct-billing agreement and emergency duty (akuttvakt). Every record carries the clinic's address, contact details and a profile page.
 
-The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places and Kartverket.
+The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places, Kartverket and a one-time import from an online directory (May 2026).
 
 The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.
 
 Finn-tannlege.com is an independent service from Agentplatform.no AS and is not affiliated with FINN.no.
 ```
-898 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
+953 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
 
 The last paragraph is `BRAND_ENTITIES.dental.disambiguation.en` (src/config/brand-entities.ts). Keep it when the text is edited in the portal.
 
