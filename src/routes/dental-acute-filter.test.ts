@@ -21,7 +21,8 @@
  *       getDentalStats().acute_count is that count (D3a, dev-request
  *       2026-10-17-dental-d3-rettelser), row by row;
  *   M   MCP over a real server + client: tannlege_akutt (with and without
- *       fylke, and a town in fylke read as its county) and tannlege_search
+ *       fylke, a town in fylke read as its county, and an unknown town that
+ *       gives nothing while tannlege_search finds its clinic) and tannlege_search
  *       (`akutt`, a parsed «akuttvakt», akutt false)
  *       give only claim cards, every one badged, `count` the claim rows;
  *       tannlege_stats' acute_count is tannlege_akutt's count; tannlege_akutt
@@ -316,6 +317,29 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       const town = await call("tannlege_akutt", { fylke: "Voss" });
       eq([cardNames(town), town.count], [names(claimVestland), claimVestland.length],
         "M1b: a town in `fylke` is read as its county: «Voss» (no fixture clinic there) lists the Vestland claim clinics");
+      // … but only a town normaliseFylke() knows: any other gives nothing, even
+      // with a claim clinic in that very town, which tannlege_search does find
+      // (the caveat's «Sandvika», B1 in the review of lokal#1201).
+      const gen = require("../../scripts/gen-connector-packs") as typeof import("../../scripts/gen-connector-packs");
+      const caveatTown = gen.PACKS.dental.caveats.join("\n").match(/A town it does not know, such as «([^»]+)», gives no results\./)?.[1];
+      eq(caveatTown, "Sandvika", "M1c control: the pack caveat's unknown town is the one this fixture places a clinic in");
+      const gazetteer = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
+      const sandvika = add("Sandvika Vakt Med Kilde AS", "918770015", { acute_vakt: 1, field_provenance: SOURCED },
+        { poststed: "SANDVIKA", fylke: "Akershus", postnummer: "1337" });
+      gazetteer.__resetDentalSearchGazetteerForTesting();
+      try {
+        const unknown = await call("tannlege_akutt", { fylke: "Sandvika" });
+        const county = await call("tannlege_akutt", { fylke: "Akershus" });
+        const oneTown = await call("tannlege_search", { query: "emergency dentist Sandvika", limit: 25 });
+        const withFlag = await call("tannlege_search", { query: "Sandvika", akutt: true, limit: 25 });
+        eq([unknown.klinikker, unknown.count], [[], 0], "M1c: a town normaliseFylke() does not know, in `fylke`, gives no clinics and `count` 0");
+        eq([cardNames(county), county.count], [["Sandvika Vakt Med Kilde AS"], 1], "M1d: … though its county lists the town's claim clinic");
+        eq([cardNames(oneTown), oneTown.count, cardNames(withFlag), withFlag.count], [["Sandvika Vakt Med Kilde AS"], 1, ["Sandvika Vakt Med Kilde AS"], 1],
+          "M1e: … and tannlege_search finds it, from «emergency dentist Sandvika» and from `akutt: true` with the town in `query`");
+      } finally {
+        db.prepare("DELETE FROM dental_agents WHERE id = ?").run(sandvika);
+        gazetteer.__resetDentalSearchGazetteerForTesting();
+      }
       const all = await call("tannlege_akutt", {});
       eq([cardNames(all), all.count], [names(claimAll), claimAll.length], "M4: tannlege_akutt without fylke: the claim clinics in every county");
     }

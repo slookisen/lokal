@@ -83,7 +83,7 @@ The server is a public, read-only directory of Norwegian dental clinics. There a
 Paste if the portal asks what data the connector handles:
 
 ```
-The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.
+The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-care flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.
 
 Every call is logged with the tool name, the protocol, the response time, the client's name and version, the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address (never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.
 
@@ -108,7 +108,7 @@ Seven acknowledgments, all required. Our basis for each:
 |---|---|
 | Directory guidelines | Read the Software Directory Terms (https://support.claude.com/en/articles/13145338-anthropic-software-directory-terms) and Policy (https://support.claude.com/en/articles/13145358-anthropic-software-directory-policy). Tick when every prerequisite in ../README.md is done. |
 | First-party API usage | Our own: the server reads Finn-tannlege's own clinic directory on the same domain. |
-| Financial transactions | No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as the clinic's own website states it (not confirmed by Helfo). No card or bank details are asked for. |
+| Financial transactions | No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as read automatically from the clinic's own website (not confirmed by Helfo). No card or bank details are asked for. |
 | AI media generation | None: the connector generates no images, video or audio. |
 | Prompt injection | Tool descriptions say what each tool does and do not instruct Claude (checked against the directive patterns in scripts/gen-connector-packs.ts). |
 | Conversation data collection | The tools take only the arguments they need. The server never asks for chat history, memory or files. |
@@ -121,6 +121,6 @@ Check the summary, then submit. Status and reviewer feedback appear in the porta
 ## Known caveats, to state if asked
 
 - tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.
-- tannlege_akutt narrows by county (fylke) only: a town name is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.
-- Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).
+- tannlege_akutt narrows by county (fylke) only: a town the server knows is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. A town it does not know, such as «Sandvika», gives no results. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.
+- Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).
 - Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.

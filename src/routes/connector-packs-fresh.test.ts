@@ -19,9 +19,11 @@
  *   (i) the MCPB path marked deprecated;
  *   (j) protocol versions from the SDK and the data-handling paste block;
  *   (k) the dental pack says no more than the service does (the independent
- *       check of the directory prompt, 2026-10-19): emergency care per place,
- *       no out-of-hours promise, Helfo as the clinic's own website states it;
- *       and the readiness line points at no table portal-answers.md lacks (S10).
+ *       check of the directory prompt, 2026-10-19): emergency care per place
+ *       (a known town gives its county, an unknown one nothing), no
+ *       out-of-hours promise but /vilkar's advice, Helfo as read automatically
+ *       from the clinic's own website; and the readiness line points at no
+ *       table portal-answers.md lacks (S10).
  *
  * Run standalone: npx tsx src/routes/connector-packs-fresh.test.ts
  * Wired into `npm test` via tests/test.ts.
@@ -34,10 +36,12 @@ import * as path from "path";
 import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { NORWEGIAN_SEARCH_AREAS } from "../config/norway-search-areas";
 import { parseDentalQuery } from "../services/dental-query-parser";
 import type { CatalogVertical } from "../services/honest-count";
 import { registeredMcpToolDefinitions, registeredMcpToolNames, type McpToolDefinition } from "../services/mcp-tool-manifest";
 import { normaliseFylke } from "../services/norway-fylke";
+import { officialPoststedFylker } from "../services/norway-postnummer";
 import { buildNorwegianGazetteer } from "../services/search-intent/norwegian-query";
 import { DENTAL_MCP_INSTRUCTIONS } from "./dental-mcp";
 import { parseClaims } from "./distribution-metadata.test";
@@ -537,7 +541,8 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
 
       // What the pack said before the check, each more than the service does.
       const OVERCLAIMS: ReadonlyArray<readonly [RegExp, string]> = [
-        [/a town name gives no results/i, "tannlege_akutt reads a town as its county"],
+        [/a town name gives no results/i, "tannlege_akutt reads a town it knows as its county"],
+        [/a town name is read as the county/i, "only a town the server knows is; any other gives no results"],
         [/outside normal hours/i, "the data has no out-of-hours times"],
         [/change what a visit costs|how soon you get one/i, "direct billing settles Helfo's share; emergency care promises no time"],
         [/reported as a fact/i, "Helfo direct billing is the clinic's own statement, not Helfo's"],
@@ -545,8 +550,12 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       for (const [re, why] of OVERCLAIMS) assertTrue(!re.test(whole("dental")), `k1: no dental pack file says ${re} (${why})`);
 
       // Out of hours: emergency care is a duty with a source or a clinic's own word, never a time.
-      const HOURS = /\b(outside|after) (normal|opening|business|office) hours\b|\bout[- ]of[- ]hours\b|\bafter[- ]hours\b|\b24\/7\b|\bround the clock\b/i;
-      assertTrue(HOURS.test("Find emergency dental care (akuttvakt) outside normal hours."), "k2 control: the hours pattern catches the old use case");
+      const HOURS = /\b(outside|after) (normal|opening|business|office) hours\b|\bout[- ]of[- ]hours\b|\bafter[- ]hours\b|\b24\/7\b|\b24[- ]hours?\b|\ba?round[- ]the[- ]clock\b|\bevenings?\b|\bweekends?\b|\bnight(s|time)?\b|\bovernight\b|\bany ?time\b/i;
+      const OPEN_LATE = [
+        "Find emergency dental care (akuttvakt) outside normal hours.", "… and 24-hour emergency care.", "open 24 hours", "24/7 emergency dentist",
+        "around the clock", "also in the evening and at weekends.", "evenings", "a weekend dentist", "a dentist at night", "overnight", "any time", "anytime",
+      ];
+      assertEq(OPEN_LATE.filter((t) => !HOURS.test(t)), [], "k2 control: the hours pattern catches the old use case and the other ways to promise a time (24 hours, evenings, weekends, nights, any time)");
       assertEq([["one-liner", oneLiner], ["description", description], ["use cases", useCases]].filter(([, t]) => HOURS.test(t)).map(([n]) => n), [],
         "k3: the one-liner, description and use cases promise no out-of-hours care");
       assertTrue(/^- Emergency care says nothing about hours: the data has no out-of-hours times/m.test(caveats), "k4: a caveat says emergency care says nothing about hours");
@@ -559,18 +568,41 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       assertTrue(read("src/routes/dental-seo.ts").includes("We have no list from Helfo, so the badge is not a confirmation from Helfo") &&
         description.includes("the agreement is read from the clinic's own website, not from a list kept by Helfo"),
         "k7: the description gives the Helfo source as /proveniens does (read from the clinic's website, no list from Helfo)");
-      assertTrue(/^\| Financial transactions \| [^\n]*as the clinic's own website states it \(not confirmed by Helfo\)/m.test(portal),
-        "k8: the financial-transactions basis says the same");
+      assertTrue(read("src/routes/dental-seo.ts").includes("<strong>Helfo direct billing</strong> is read automatically from the clinic's website") &&
+        /^\| Financial transactions \| [^\n]*is only reported, as read automatically from the clinic's own website \(not confirmed by Helfo\)\./m.test(portal),
+        "k8: the financial-transactions basis says the same, read automatically as on /proveniens (an AI reading, not the website's own words)");
 
-      // Emergency care per place: the caveat's two examples hold.
-      const town = caveats.match(/so «([^»]+)» lists the emergency clinics in all of ([^.]+)\./);
-      assertTrue(!!town && normaliseFylke(town[1]) === town[2],
-        `k9: tannlege_akutt reads a town as its county, as the caveat says (normaliseFylke(«${town?.[1]}») = ${town ? normaliseFylke(town[1]) : "?"}; dental-acute-filter.test.ts M1b runs it through the tool)`);
+      // Emergency care per place: the caveat's three examples hold. The
+      // gazetteer is production's shape over every official poststed (S5 in the
+      // review of lokal#1201), not a hand-picked list.
+      const gazetteer = buildNorwegianGazetteer(officialPoststedFylker().keys(), NORWEGIAN_SEARCH_AREAS);
+      const asOneTown = (q: string) => {
+        const f = parseDentalQuery(q, gazetteer).filter;
+        return { f, ok: !f.fylke && !f.fylke_in && !f.name_terms && !!(f.poststed_or_postnummer || f.poststed_in || f.postnummer_in) };
+      };
+      const town = caveats.match(/a town the server knows is read as the county it lies in, so «([^»]+)» lists the emergency clinics in all of ([^.]+)\./);
+      assertTrue(!!town && normaliseFylke(town[1]) === town[2] && (officialPoststedFylker().get(town[1].toUpperCase()) ?? []).includes(town[2]),
+        `k9: tannlege_akutt reads a town it knows as the county the town lies in, as the caveat says (normaliseFylke(«${town?.[1]}») = ${town ? normaliseFylke(town[1]) : "?"}; dental-acute-filter.test.ts M1b runs it through the tool)`);
+      const unknown = caveats.match(/A town it does not know, such as «([^»]+)», gives no results\./)?.[1] ?? "";
+      const unknownAsTown = asOneTown(`emergency dentist ${unknown}`);
+      assertTrue(unknown !== "" && normaliseFylke(unknown) === null && unknownAsTown.ok && unknownAsTown.f.acute_vakt === 1,
+        `k9b: the caveat's unknown town («${unknown}») is one normaliseFylke() does not know (${unknown ? normaliseFylke(unknown) : "?"}), so tannlege_akutt gives nothing ` +
+        `(dental-acute-filter.test.ts M1c), and tannlege_search reads it as that town (${JSON.stringify(unknownAsTown.f).slice(0, 120)})`);
       const example = caveats.match(/for example «([^»]+)»/)?.[1] ?? "";
-      const oneTown = parseDentalQuery(example, buildNorwegianGazetteer(["STAVANGER", "BERGEN", "OSLO", "TROMSØ", "TRONDHEIM"])).filter;
-      assertTrue(example !== "" && oneTown.acute_vakt === 1 && !oneTown.fylke && !oneTown.fylke_in && !oneTown.name_terms &&
-        !!(oneTown.poststed_or_postnummer || oneTown.poststed_in || oneTown.postnummer_in),
-        `k10: the caveat's one-town example («${example}») reads in tannlege_search's parser as akutt + that town, not a county (${JSON.stringify(oneTown).slice(0, 120)})`);
+      const oneTown = asOneTown(example);
+      assertTrue(example !== "" && oneTown.ok && oneTown.f.acute_vakt === 1,
+        `k10: the caveat's one-town example («${example}») reads in tannlege_search's parser as akutt + that town, not a county (${JSON.stringify(oneTown.f).slice(0, 120)})`);
+
+      // Out of hours: the advice is /vilkar section 3's, word for word (B2 in the review of lokal#1201).
+      const vilkar3 = read("src/routes/dental-seo.ts").match(/<h2>3\. Emergencies<\/h2>[\s\S]*?<p>(If you need emergency dental treatment[^<]*)<\/p>/)?.[1] ?? "";
+      const hoursCaveat = caveats.split("\n").find((l) => l.startsWith("- Emergency care says nothing about hours")) ?? "";
+      const VILKAR_ADVICE = [
+        "may still be unable to see you now",
+        "Call the clinic before you go there",
+        "contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live",
+      ];
+      assertEq(VILKAR_ADVICE.filter((a) => !vilkar3.includes(a) || !hoursCaveat.includes(a)), [],
+        `k15: the hours caveat gives /vilkar section 3's advice in its words (call the clinic; legevakt 116 117 or tannlegevakt) (/vilkar read: ${vilkar3 !== ""})`);
 
       // S10: portal-answers.md repeats the README's readiness line, which names no table it lacks.
       for (const v of PACK_VERTICALS) {

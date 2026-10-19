@@ -291,10 +291,10 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ],
     ownApi: "Our own: the server reads Finn-tannlege's own clinic directory on the same domain.",
     authRationale: "The server is a public, read-only directory of Norwegian dental clinics. There are no user accounts and no write operations, so there is nothing to sign in to.",
-    dataHandling: "The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.",
+    dataHandling: "The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-care flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.",
     dataStored: null,
     healthData: "No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency care) and asks for no health information about the user.",
-    financial: "No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as the clinic's own website states it (not confirmed by Helfo). No card or bank details are asked for.",
+    financial: "No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as read automatically from the clinic's own website (not confirmed by Helfo). No card or bank details are asked for.",
     reviewerTools: {
       "Find a dentist in Bergen": "tannlege_search",
       "Which dental clinics in Oslo have a Helfo agreement?": "tannlege_search",
@@ -318,9 +318,12 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ],
     caveats: [
       "tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.",
-      // A town in `fylke` goes through normaliseFylke() in the store (dental-acute-filter.test.ts M1b).
-      "tannlege_akutt narrows by county (fylke) only: a town name is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.",
-      "Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
+      // A town in `fylke` goes through normaliseFylke() in the store: a town it
+      // knows gives its county, any other gives nothing (dental-acute-filter.test.ts
+      // M1b and M1c; connector-packs-fresh.test.ts k9 and k9b check both examples).
+      "tannlege_akutt narrows by county (fylke) only: a town the server knows is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. A town it does not know, such as «Sandvika», gives no results. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.",
+      // The advice is /vilkar section 3's (dental-seo.ts); connector-packs-fresh.test.ts k15 keeps them equal.
+      "Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
       "Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.",
     ],
     otherContents: [["assets/finn-tannlege-square-512.png", "The icon to upload: the «Søket» mark (a tooth in a magnifier, white on teal), square, full-bleed, no rounded corners. The same file as the site's /favicon-512.png."]],
