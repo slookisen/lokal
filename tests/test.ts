@@ -36492,6 +36492,7 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   console.log("\n── dev-request 2026-10-16 (S2b+S6): akutt med proveniens og kjeder fra chain_brand (finn-tannlege) ──");
   for (const [label, load] of [
     ["dental acute filter", () => (require("../src/routes/dental-acute-filter.test") as typeof import("../src/routes/dental-acute-filter.test")).runDentalAcuteFilterTests({ log: false })],
+    ["dental openapi truth", () => (require("../src/routes/dental-openapi-truth.test") as typeof import("../src/routes/dental-openapi-truth.test")).runDentalOpenapiTruthTests({ log: false })],
     ["dental chains", () => (require("../src/routes/dental-chains.test") as typeof import("../src/routes/dental-chains.test")).runDentalChainsTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
