@@ -27,8 +27,9 @@
  *
  *   U   the rule (isPrivateEnkAddress): «c/o» as a word, «Bruksenhetsnummer»,
  *       any case; ENK only; words that only contain «c/o» do not count; a
- *       «c/o» whose addressee has a business word (or ends in AS/ASA) does
- *       not count unless the address has «Bruksenhetsnummer».
+ *       «c/o» whose addressee has a business word (or ends in AS/ASA, in
+ *       capitals) does not count unless the address has «Bruksenhetsnummer»;
+ *       an addressee ends at the next comma or the next «c/o» (round 3).
  *   D   the funnel: shownDentalAgent / shownDentalFieldProvenance (address
  *       and its provenance entries gone, the rest as stored, same object when
  *       nothing is hidden, the stored row unchanged, the Places verdicts as
@@ -224,8 +225,8 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         ok(enk(`c/o Ola Testmann, Testby ${title(w)}, Prøvegata 1`), `U7: «${w}» only after the addressee's comma does not count -> private`);
         ok(enk(`c/o Testby ${title(w)}, Bruksenhetsnummer H0101, Prøvegata 1`), `U8: «${w}» with «Bruksenhetsnummer» -> private`);
       }
-      // The company forms count as the addressee's last word, as Brreg writes a company name.
-      for (const adresse of ["c/o Testby Holding AS, Prøvegata 1", "c/o Testby Holding ASA, Prøvegata 1", "c/o Testby Holding as", "c/o Testby Holding AS., Prøvegata 1",
+      // The company forms count as the addressee's last word and in capitals, as Brreg writes a company name.
+      for (const adresse of ["c/o Testby Holding AS, Prøvegata 1", "c/o Testby Holding ASA, Prøvegata 1", "c/o Testby Holding AS", "c/o Testby Holding AS., Prøvegata 1",
         "c/o Tannlege Kari Nordmann AS, Prøvegata 1", "c/o Testby Tannklinikk AS, Prøvegata 1"]) {
         ok(!enk(adresse), `U9: ${JSON.stringify(adresse)} (a company) -> not private`);
       }
@@ -244,6 +245,39 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
         "U14: every «c/o» names a business («v/» is outside the rule) -> not private");
       for (const organisasjonsform of ["AS", null]) {
         ok(!display.isPrivateEnkAddress({ organisasjonsform, adresse: "c/o Tannlege Kari Nordmann, Prøvegata 1" }), `U15: ${organisasjonsform}: still only ENK`);
+      }
+
+      // Round 3 (review round 2, S1): an addressee also ends at the next «c/o»
+      // of its own, so a person after (or before) a business in the same
+      // comma part is an addressee of its own and hides the address.
+      for (const adresse of [
+        "c/o Testby Tannklinikk c/o Ola Testmann, Prøvegata 1",
+        "c/o Ola Testmann c/o Testby Tannklinikk, Prøvegata 1",
+        "c/o Testby Tannklinikk C/O Ola Testmann",
+        "c/o Testby Tannklinikk c/o Testby Tannlegesenter AS c/o Ola Testmann, Prøvegata 1",
+        "c/o Testby Tannklinikk c/o Ola Testmann c/o Testby Tannlegesenter AS, Prøvegata 1",
+        "c/o Ola Testmann c/o Testby Tannklinikk c/o Testby Tannlegesenter AS, Prøvegata 1",
+      ]) {
+        ok(enk(adresse), `U16: ${JSON.stringify(adresse)} (a person «c/o» in the same comma part as a business one) -> private`);
+      }
+      for (const adresse of [
+        "c/o Testby Tannklinikk c/o Testby Tannlegesenter AS, Prøvegata 1",
+        "c/o Testby Tannklinikk c/o Testby Tannlegesenter AS c/o Testby Dental, Prøvegata 1",
+        "c/o Testby Tannklinikk Abc/o, Prøvegata 1",
+      ]) {
+        ok(!enk(adresse), `U16b: ${JSON.stringify(adresse)} (every «c/o» of its own names a business) -> not private`);
+      }
+
+      // Round 3 (review round 2, S2): AS/ASA counts only in capitals, as
+      // Brreg writes the company form, so a surname «As» is no company. An
+      // addressee all in capitals stays a company: «KARI AS» cannot be told
+      // from «TESTBY AS», and the dump writes every AS after «c/o» in capitals.
+      for (const adresse of ["c/o Kari As, Prøvegata 1", "c/o Testby Holding as, Prøvegata 1", "c/o Testby Holding as", "c/o Testby Holding aS, Prøvegata 1",
+        "c/o Testby Holding Asa, Prøvegata 1", "c/o Testby Holding asa, Prøvegata 1", "c/o Kari As."]) {
+        ok(enk(adresse), `U17: ${JSON.stringify(adresse)} (AS/ASA not in capitals) -> private`);
+      }
+      for (const adresse of ["C/O KARI AS, PRØVEGATA 1", "C/O TESTBY HOLDING ASA, PRØVEGATA 1", "c/o Kari AS, Prøvegata 1"]) {
+        ok(!enk(adresse), `U17b: ${JSON.stringify(adresse)} (AS/ASA in capitals, the accepted ambiguity) -> not private`);
       }
     }
 

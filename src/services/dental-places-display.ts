@@ -78,8 +78,16 @@ export type DentalPlacesRow = Pick<DentalAgent, DentalPlacesColumn | "field_prov
 /** «Bruksenhetsnummer», a dwelling's unit number; any case. */
 const UNIT_NUMBER = /bruksenhetsnummer/i;
 
-/** Each «c/o» with no letter or digit next to it, and its addressee: the text up to the next comma. */
-const CARE_OF = /(?<![\p{L}\p{N}])c\/o(?![\p{L}\p{N}])([^,]*)/giu;
+/** «c/o» with no letter or digit next to it; any case. */
+const CARE_OF = /(?<![\p{L}\p{N}])c\/o(?![\p{L}\p{N}])/iu;
+
+/**
+ * The addressee of each «c/o»: the text after it up to the next comma or the
+ * next «c/o», so «c/o <clinic> c/o <person>, <street>» has two (round 3).
+ */
+function careOfAddressees(adresse: string): string[] {
+  return adresse.split(CARE_OF).slice(1).map((after) => after.split(",")[0]!);
+}
 
 /**
  * A word, with no letter or digit next to it and in any case, that names a
@@ -94,10 +102,13 @@ const BUSINESS_WORD =
 
 /**
  * A company form, AS or ASA, as the addressee's last word («X Tannlegesenter
- * AS»), as Brreg writes a company name. Anywhere else ASA can be a given name:
- * the dump has a clinic named «ASA <name>».
+ * AS») and in capitals, as Brreg writes a company name. In other cases it can
+ * be a surname («Kari As»), and anywhere else ASA can be a given name: the
+ * dump has a clinic named «ASA <name>». An addressee all in capitals («C/O
+ * KARI AS») still counts as a company: it cannot be told apart, and the dump
+ * writes every AS after «c/o» in capitals.
  */
-const COMPANY_FORM_LAST = /(?<![\p{L}\p{N}])asa?[^\p{L}\p{N}]*$/iu;
+const COMPANY_FORM_LAST = /(?<![\p{L}\p{N}])ASA?[^\p{L}\p{N}]*$/u;
 
 /** Whether a «c/o» addressee is a business rather than a person. */
 function isBusinessAddressee(addressee: string): boolean {
@@ -115,7 +126,7 @@ export function isPrivateEnkAddress(agent: PrivateAddressRow): boolean {
   if ((agent.organisasjonsform ?? "").trim().toUpperCase() !== "ENK") return false;
   const adresse = agent.adresse ?? "";
   if (UNIT_NUMBER.test(adresse)) return true;
-  return [...adresse.matchAll(CARE_OF)].some(([, addressee]) => !isBusinessAddressee(addressee));
+  return careOfAddressees(adresse).some((addressee) => !isBusinessAddressee(addressee));
 }
 
 /** The fields Stage V has a pending correction for (its JSON map, parsed or as stored). */
