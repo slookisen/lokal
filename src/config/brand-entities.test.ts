@@ -250,6 +250,7 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     assertTrue(Array.isArray((org.parentOrganization as any)?.sameAs) && (org.parentOrganization as any).sameAs.includes(COMPANY_INFO.brregUrl), `h7 ${k}: parentOrganization.sameAs holds the Brreg URL`);
     assertTrue(!("legalName" in org) && !("identifier" in org), `h8 ${k}: the brand does not claim the company's legal name or org.nr.`);
     assertTrue(!("sameAs" in org), `h9 ${k}: no empty sameAs on the brand while it has no profiles`);
+    assertTrue(("disambiguatingDescription" in org) === !!e.disambiguation?.nb && (!e.disambiguation?.nb || org.disambiguatingDescription === e.disambiguation.nb), `h10b ${k}: disambiguatingDescription only (and exactly) when the entry has disambiguation`);
     assertTrue(!hasEmptyValue(org), `h10 ${k}: no empty string, empty array or null anywhere`);
     assertTrue(!JSON.stringify(org).includes(COMPANY_INFO.address.street), `h11 ${k}: no street address`);
   }

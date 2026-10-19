@@ -165,6 +165,8 @@ export function organizationJsonLd(key: BrandKey): Record<string, unknown> {
     url: b.url,
     ...(b.logoPng ? { logo: b.logoPng } : {}),
     ...(sameAs.length > 0 ? { sameAs } : {}),
+    // G3-S8: only a brand that sets `disambiguation` (dental: not FINN.no) emits it.
+    ...(b.disambiguation?.nb ? { disambiguatingDescription: b.disambiguation.nb } : {}),
     ...(key === "company"
       ? { legalName: C.legalName, identifier: orgNrIdentifier() }
       : { parentOrganization: parentOrganizationJsonLd() }),
