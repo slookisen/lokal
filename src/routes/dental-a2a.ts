@@ -193,7 +193,12 @@ function legacyParseIntent(text: string): DentalSearchParams {
     params.acute_vakt = 1;
   }
 
-  // Residual free-text (words not yet captured, for name/city matching)
+  // Residual free-text (words not yet captured, for name/city matching).
+  // This list belongs to the old reading and stays as it was: it is the
+  // rollback, and planDentalSearch only adds its hits to the parsed ones, so
+  // a filler word it keeps («care») never empties an answer. The parsed
+  // reading uses the shared list (DENTAL_SEARCH_VOCABULARY.stopwords), as
+  // MCP and /sok do (S-EN, 2026-10-19).
   const stopwords = new Set([
     "finn", "find", "søk", "search", "tannlege", "dental", "klinikk", "clinic",
     "i", "in", "med", "with", "og", "and", "en", "a", "på", "at",
