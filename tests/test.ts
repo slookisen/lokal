@@ -42793,8 +42793,9 @@ runSerial(async () => {
 // a generic message (detail logged), also a cart-service 5xx result in
 // lokal_cart_submit. AI-3 — a producer whose matched product names are only
 // generic category labels («Honning») is a category match; order unchanged.
-// The RFB MCP contract (tools/list, instructions, resources) is pinned for
-// the OpenAI review. Own in-memory DBs (restored in finally), runSerial.
+// The RFB MCP contract (tools/list, instructions, serverInfo since I-A2,
+// resources) is pinned for the OpenAI review. Own in-memory DBs (restored in
+// finally), runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-A (lokal_info openingHours + category labels + contract freeze) ──");
   type Summary = { passed: number; failed: number; failures: string[] };

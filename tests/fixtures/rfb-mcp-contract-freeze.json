@@ -1,7 +1,8 @@
 {
-  "_doc": "SHA-256 of the Rett fra Bonden MCP contract (initialize instructions, tools/list, resources/list, resources/templates/list), once per PAYMENTS_ENABLED value, frozen while OpenAI reviews the ChatGPT app. Dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-A. Pinned at lokal 40eeb7bc; the I-A branch hashes the same. Change only together with a planned re-submission; print current hashes with: npx tsx src/routes/rfb-mcp-contract-freeze.test.ts --print",
+  "_doc": "SHA-256 of the Rett fra Bonden MCP contract (initialize instructions and serverInfo, tools/list, resources/list, resources/templates/list), once per PAYMENTS_ENABLED value, frozen while OpenAI reviews the ChatGPT app. Dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-A. Pinned at lokal 40eeb7bc; the I-A branch hashes the same. serverInfo (canonical JSON, keys sorted) added in slice I-A2 at lokal e73574a9; its literal in mcp.ts is the same at 40eeb7bc. Change only together with a planned re-submission; print current hashes with: npx tsx src/routes/rfb-mcp-contract-freeze.test.ts --print",
   "hashes": {
     "PAYMENTS_ENABLED=0 initialize.instructions": "56d13f36d1ec6f069785262a7f325dca6573da27aa48733e161792aa50be0bdd",
+    "PAYMENTS_ENABLED=0 initialize.serverInfo": "165411e4e8d5058f26f5620cd5e6d5b15008e445c291482697b18e6327635bfa",
     "PAYMENTS_ENABLED=0 tools/list": "b31f45fe8cfd80339779744a6a07b72fe560a2f82de3aa0a64fdb2e89dd3c05c",
     "PAYMENTS_ENABLED=0 tools/list#lokal_search": "206cd93709ddc0bf53dfce9725eccbcb30b5fc683dcd2e17ead2089cd96cc43d",
     "PAYMENTS_ENABLED=0 tools/list#lokal_discover": "0d0a30a33627a39a886326521773e660dc31b495ba06bc3e872dbb96ecc389e8",
@@ -21,6 +22,7 @@
     "PAYMENTS_ENABLED=0 resources/list": "d47c133df0c910e6e3f0034a9bb86bd2656f00b0712264c45bafee91c95c920f",
     "PAYMENTS_ENABLED=0 resources/templates/list": "87854a2460a872ff5a0a898621e75c3133f9673bb5a98357a2a80681437e693d",
     "PAYMENTS_ENABLED=1 initialize.instructions": "687aed16bae9a7ceb5f361e383504eb5f95512e7a8cb963a7d6fda5b7cfe069a",
+    "PAYMENTS_ENABLED=1 initialize.serverInfo": "165411e4e8d5058f26f5620cd5e6d5b15008e445c291482697b18e6327635bfa",
     "PAYMENTS_ENABLED=1 tools/list": "8d99eb99a5e730ea9799f030521feb8f8cc0c6cb9fd7c5b724b3886a6df0c391",
     "PAYMENTS_ENABLED=1 tools/list#lokal_search": "206cd93709ddc0bf53dfce9725eccbcb30b5fc683dcd2e17ead2089cd96cc43d",
     "PAYMENTS_ENABLED=1 tools/list#lokal_discover": "0d0a30a33627a39a886326521773e660dc31b495ba06bc3e872dbb96ecc389e8",
