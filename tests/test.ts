@@ -38992,15 +38992,24 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
     assertTrue(bodyDp.includes('id="en"') && bodyDp.includes("How we verify our data"),
       "prov-dental-04: EN section present in the same page (id=\"en\" anchor)");
     assertTrue(bodyDp.includes("Brønnøysundregistrene"), "prov-dental-05: page names Brønnøysundregistrene as a source");
-    // Scope the "no HPR claim" check to the /proveniens <main> content itself, not the
-    // sitewide footer's pre-existing (out-of-scope) "Datakilder" link to Helsedirektoratet/HPR
-    // — this test only guards against the NEW page/llms.txt copy overclaiming an automated
-    // HPR cross-check, not the unrelated footer link that exists on every page.
+    // The whole page, footer included: since F2-S1 (A2A dev-request
+    // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon) the footer's «Datakilder»
+    // column lists DENTAL_DATA_SOURCES, which has no HPR.
     const mainDp = bodyDp.slice(bodyDp.indexOf("<main>"), bodyDp.indexOf("</main>"));
-    assertTrue(!mainDp.includes("HPR") && !mainDp.includes("Helsepersonellregisteret"),
-      "prov-dental-05b: /proveniens page content does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
-    assertTrue(mainDp.includes("redaksjonelt satt status") && mainDp.includes("editorially-set status"),
-      "prov-dental-05c: 'Verified' badge is described as an editorially-set/admin-reviewed status, not an automated registry cross-check");
+    assertTrue(!bodyDp.includes("HPR") && !bodyDp.includes("Helsepersonellregisteret"),
+      "prov-dental-05b: /proveniens (the whole page, footer included) does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
+    // As dental-verifier.ts sets the badge: by hand, or by the rule-based check
+    // (computeDentalVerifiedRule), which is itself run by hand in small batches.
+    {
+      const { DENTAL_VERIFIED_BADGE_TEXT } = require("../src/services/dental-data-sources") as typeof import("../src/services/dental-data-sources");
+      const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      assertTrue(mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.nb)) && mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.en)) &&
+        mainDp.includes("manuelt, etter at en administrator har gått gjennom profilen, eller av en regelstyrt kontroll") &&
+        mainDp.includes("by hand, after an administrator has reviewed the profile, or by a rule-based check") &&
+        mainDp.includes("i små partier") && mainDp.includes("in small batches") &&
+        !mainDp.includes("Statusen settes manuelt per klinikk") && !mainDp.includes("The status is set manually per clinic"),
+        "prov-dental-05c: 'Verified' badge is described as set by hand OR by the rule-based check (run by hand, in small batches), not as manual-only (NO + EN)");
+    }
     assertTrue(bodyDp.includes("badge-verified"), "prov-dental-06: page shows the Verifisert badge example");
     assertTrue(bodyDp.length > 2000, "prov-dental-07: page body has substantial server-rendered content (SSR, no JS)");
     assertNoForbiddenCompliancePhrases(bodyDp, "prov-dental-08");
@@ -39036,6 +39045,28 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
   } catch (err) {
     failed++;
     failures.push(`proveniens-transparens (dental): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S1): every
+// finn-tannlege.com surface (footer, /om, /hvordan-det-fungerer, /proveniens, llms.txt,
+// openapi.json, the directory listing) names its data sources from DENTAL_DATA_SOURCES,
+// none names HPR, NTF or Helsedirektoratet (/personvern exempt, personvern part B), and
+// the «Verifisert» text matches dental-verifier.ts. Swaps DENTAL_DB_PATH (:memory:) and
+// the dental modules (restored in finally) — runSerial, next to prov-dental above.
+runSerial(async () => {
+  console.log("\n── dental-sources-truth: Finn-tannlege data sources from one list (F2-S1) ──");
+  try {
+    const { runDentalSourcesTruthTests } = require("../src/routes/dental-sources-truth.test") as
+      typeof import("../src/routes/dental-sources-truth.test");
+    const dst = await runDentalSourcesTruthTests({ log: false });
+    passed += dst.passed;
+    failed += dst.failed;
+    for (const f of dst.failures) failures.push("dental-sources-truth: " + f);
+    console.log(`  dental-sources-truth: ${dst.passed} passed, ${dst.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-sources-truth: unexpected error: " + String(err?.message || err));
   }
 });
 
