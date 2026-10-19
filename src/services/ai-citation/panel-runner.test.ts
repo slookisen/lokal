@@ -4,7 +4,7 @@
  *
  * No network: the run is driven with fake engines (same CitationEngine shape as engines.ts) on
  * in-memory SQLite. Covers the shipped question config and its validation, domain matching
- * (www., subdomains, look-alikes), the ISO weeks, the caps from the environment, the run
+ * (www., subdomains, look-alikes, a host as WHATWG URL reads it), the ISO weeks, the caps from the environment, the run
  * (Anthropic first per question; each (week, engine, question) asked once; the run cap stopping
  * mid-run with the rest stored as skipped_cost_cap; the month cap blocking a new run and stopping
  * one mid-run; a pause that leaves the rest for a later run; errors stored and not retried; an
@@ -22,6 +22,7 @@ import {
   aiCitationMonthCostUsd,
   aiCitationWeekOf,
   aiCitationWeekTotals,
+  citedDomainsOf,
   ensureAiCitationResultsTable,
   getAiCitationWeekView,
   isoWeekStart,
@@ -59,7 +60,9 @@ function fakeEngine(
   return {
     engine,
     keyEnv: `${engine.toUpperCase()}_API_KEY`,
+    modelEnv: `AI_CITATION_${engine.toUpperCase()}_MODEL`,
     model: `${engine}-test`,
+    price: null,
     maxCostUsdPerCall: opts.maxCostUsdPerCall ?? 0.1,
     enabled: () => opts.enabled ?? true,
     calls,
@@ -143,6 +146,10 @@ export async function runPanelRunnerTests(opts: { log?: boolean } = {}): Promise
     t(JSON.stringify(ownBrandsCited(["https://finn-tannlege.com/a", "https://x.no/", "https://www.rettfrabonden.com/b", "https://finn-tannlege.com/c"], ["opplevagent.no"])) ===
       JSON.stringify(["rfb", "experiences", "dental"]),
       "DM5: our brands cited by an answer, each once, in brand order (URLs and named domains)");
+    t(ownBrandOfHost("https://evil.example\\@rettfrabonden.com/x") === null && ownBrandOfHost("https://evil.example\\@www.finn-tannlege.com/") === null &&
+      JSON.stringify(citedDomainsOf(["https://evil.example\\@rettfrabonden.com/x"])) === JSON.stringify(["evil.example"]) &&
+      JSON.stringify(ownBrandsCited(["https://evil.example\\@rettfrabonden.com/x"], citedDomainsOf(["https://evil.example\\@rettfrabonden.com/x"]))) === "[]",
+      "DM6 (S2): a URL whose host is another site (backslash before @, read as WHATWG URL reads it) is not a hit on us");
 
     // ── weeks ──
     t(aiCitationWeekOf(NOW) === WEEK && isoWeekStart(WEEK) === "2026-10-19" && aiCitationWeekOf(new Date("2026-10-25T23:59:59Z")) === WEEK &&
@@ -279,13 +286,13 @@ export async function runPanelRunnerTests(opts: { log?: boolean } = {}): Promise
     {
       const db = newDb();
       const a = fakeEngine("anthropic", () => answer(["https://a.no/"], 0.01));
-      const g = fakeEngine("gemini", () => answer(["https://vertexaisearch.cloud.google.com/grounding-api-redirect/1"], 0.01, { citedDomains: ["finn-tannlege.com", "legelisten.no"] }));
+      const g = fakeEngine("gemini", () => answer([], 0.01, { citedDomains: ["finn-tannlege.com", "legelisten.no"] }));
       await runCitationPanel({ db, week: WEEK, prompts: PROMPTS, engines: [a], caps: CAPS, now });
       const later = await runCitationPanel({ db, week: WEEK, prompts: PROMPTS, engines: [a, g], caps: CAPS, now });
       const gr = rowsOf(db).filter((r) => r.engine === "gemini");
       t(later.calls === 3 && a.calls.length === 3 && g.calls.length === 3, "KM1: an engine whose key arrives mid-week is asked that week; the others are not asked again");
-      t(gr.length === 3 && gr.every((r) => r.hit_self === 1 && r.cited_domains === JSON.stringify(["finn-tannlege.com", "legelisten.no"])),
-        "KM2: an engine's named domains (Gemini's redirect links) are the cited domains and decide hit_self");
+      t(gr.length === 3 && gr.every((r) => r.hit_self === 1 && r.cited_domains === JSON.stringify(["finn-tannlege.com", "legelisten.no"]) && r.cited_urls === "[]"),
+        "KM2: an engine's named domains (Gemini, which keeps no redirect URLs) are the cited domains and decide hit_self");
     }
 
     // ── the week view (AC4) ──

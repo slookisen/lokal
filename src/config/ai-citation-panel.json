@@ -1,4 +1,30 @@
 {
+  "engines": {
+    "anthropic": {
+      "model": "claude-haiku-5-5",
+      "models": {
+        "claude-haiku-5-5": { "inUsdPerMTok": 0.1, "outUsdPerMTok": 0.5, "longPromptTokens": 100000, "longInUsdPerMTok": 0.5, "longOutUsdPerMTok": 2.5, "usdPerSearch": 0.01, "maxCostUsdPerCall": 0.12 }
+      }
+    },
+    "openai": {
+      "model": "gpt-6-luna",
+      "models": {
+        "gpt-6-luna": { "inUsdPerMTok": 0.1, "outUsdPerMTok": 0.5, "longPromptTokens": 272000, "longInUsdPerMTok": 0.2, "longOutUsdPerMTok": 0.75, "usdPerSearch": 0.01, "maxCostUsdPerCall": 0.08 }
+      }
+    },
+    "perplexity": {
+      "model": "sonar",
+      "models": {
+        "sonar": { "inUsdPerMTok": 1, "outUsdPerMTok": 1, "usdPerRequest": 0.005, "maxCostUsdPerCall": 0.03 }
+      }
+    },
+    "gemini": {
+      "model": "gemini-3.5-flash-lite",
+      "models": {
+        "gemini-3.5-flash-lite": { "inUsdPerMTok": 0.3, "outUsdPerMTok": 2.5, "usdPerSearch": 0.014, "maxCostUsdPerCall": 0.1, "thinkingLevel": "minimal" }
+      }
+    }
+  },
   "prompts": [
     { "id": "rfb-01", "vertical": "rfb", "prompt": "Hvor kan jeg kjøpe lokal honning i Trøndelag?" },
     { "id": "rfb-02", "vertical": "rfb", "prompt": "Gårdsutsalg nær Lillehammer" },

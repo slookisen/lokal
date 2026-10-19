@@ -6,50 +6,61 @@
 // search the web, and stores which URLs each answer cites. This file is the
 // four APIs. Every adapter has the same shape (CitationEngine):
 //   { engine, enabled(), run(prompt) -> { citedUrls, answerSnippet, costUsd } }
-// and is built by defineEngine() from its request and its parser, so a new
-// engine is one more defineEngine({...}) in CITATION_ENGINES. Order there is the
-// order the runner asks in: Anthropic first, since its key is already in prod.
+// and is built from its definition (request + parser) in CITATION_ENGINE_DEFS,
+// so a new engine is one more definition there plus its block in the config.
+// Order there is the order the runner asks in: Anthropic first, since its key
+// is already in prod.
 //
 //   anthropic   POST api.anthropic.com/v1/messages, server tool web_search_20250305
 //               (max_uses 3). Cited = the text blocks' web_search_result_location
-//               citations. Billed: tokens + usage.server_tool_use.web_search_requests.
+//               citations. Searches = usage.server_tool_use.web_search_requests.
 //   openai      POST api.openai.com/v1/responses, tool web_search (max_tool_calls 3,
 //               store false). Cited = output_text url_citation annotations.
-//               Billed: tokens + one fee per web_search_call item.
-//   perplexity  POST api.perplexity.ai/chat/completions, model sonar, search context
-//               low. Cited = `citations` (else search_results[].url). Billed:
-//               usage.cost.total_cost when the API reports it, else tokens + the
-//               request fee.
+//               Searches = the web_search_call items.
+//   perplexity  POST api.perplexity.ai/v1/sonar (Sonar chat shape; Perplexity now serves
+//               it through its Agent API), search context low. Cited = `citations`
+//               (else search_results[].url). Cost = usage.cost.total_cost when the
+//               API reports it, else tokens + the request fee.
 //   gemini      POST generativelanguage.googleapis.com/v1beta/models/<m>:generateContent,
-//               tool google_search, thinking off. Cited = groundingMetadata.groundingChunks.
-//               Their uri is a Google redirect link, so the source domain comes from
-//               chunk.web.domain / .title instead (citedDomains). Billed: tokens + one
-//               fee per grounded prompt (the free daily allowance is not counted, so the
-//               figure errs high).
-// Prices and model ids are the providers' list prices as known when this was
-// built (2026-10-19), not re-read from their pages (the build has no network);
-// check them, and the providers' own spend caps, before the flag goes on (the
-// spec's cost estimate, «verifiseres ved bygging»). They feed the caps and the
-// report only, never a bill.
+//               tool google_search, thinkingConfig.thinkingLevel from the config.
+//               Cited = groundingMetadata.groundingChunks. Their uri is an expiring
+//               Google redirect link, so it is not kept: the source domain comes from
+//               chunk.web.domain / .title (citedDomains). Searches = webSearchQueries
+//               (Gemini 3 bills grounding per search query; the 5 000 free a month are
+//               not counted, so the figure errs high).
 //
-// Caps: each adapter states maxCostUsdPerCall, an upper bound the runner checks
-// against the run and month caps BEFORE a call. A call whose cost cannot be read
-// (timeout, a 2xx that is not the documented shape or has no usage object) is
-// booked at that bound, so the caps stay safe. A non-2xx answer is booked at 0
-// (not billed).
+// Models and prices are config, not code: config/ai-citation-panel.json "engines"
+// holds, per engine, the default model and, per model id, the list prices
+// (input / output per MTok, an optional long-prompt tier, per search, per request)
+// and maxCostUsdPerCall. AI_CITATION_<ENGINE>_MODEL (e.g. AI_CITATION_OPENAI_MODEL)
+// picks another model, which must be listed there as well: the caps are computed
+// with the asked model's own prices, so a model without prices is never asked (the
+// engine is off). The config is checked when it is loaded (loadCitationEngineConfig);
+// an invalid one makes no call. The shipped prices are the providers' list prices as
+// read on 2026-10-19 (Perplexity no longer lists Sonar prices, so the last published
+// ones stand in until the API reports a cost). They feed the caps and the report
+// only, never a bill; the providers' own spend caps stay the outer limit.
+//
+// Caps: maxCostUsdPerCall is an upper bound the runner checks against the run and
+// month caps BEFORE a call. A call whose cost cannot be read (timeout, a 2xx that is
+// not the documented shape or has no usage object) is booked at that bound, so the
+// caps stay safe. A non-2xx answer is booked at 0 (not billed).
 //
 // Secrets: a key is read from the environment when a call starts (keyEnv) and
 // goes only into a request header (Gemini too: x-goog-api-key, not the URL).
-// Nothing here logs. Failures are fixed reason codes (no_key, timeout, network,
-// http_<status>, invalid_json, unexpected_response, refusal, search_tool_error),
-// never response text or an exception message, so a provider error that echoes
-// the key cannot carry it any further. Each request is counted with
-// noteLlmCall("ai-citation-<engine>") right before it is sent.
+// Nothing here logs. Failures are fixed reason codes (no_key, model_unpriced,
+// timeout, network, http_<status>, invalid_json, unexpected_response, refusal,
+// pause_turn, search_tool_error), never response text or an exception message, so
+// a provider error that echoes the key cannot carry it any further. Each request is
+// counted with noteLlmCall("ai-citation-<engine>") right before it is sent.
 
+import panelConfig from "../../config/ai-citation-panel.json";
 import { noteLlmCall } from "../llm-call-meter";
 import { hostFromUrlLike, registrableDomain } from "../cross-source-validator";
 
-export type CitationEngineId = "anthropic" | "openai" | "perplexity" | "gemini";
+/** The engines, in the order the runner asks them. */
+export const CITATION_ENGINE_IDS = ["anthropic", "openai", "perplexity", "gemini"] as const;
+export type CitationEngineId = (typeof CITATION_ENGINE_IDS)[number];
 
 /** One request (fetch + body read) is aborted after this long. Web search answers take 10–60 s. */
 export const AI_CITATION_REQUEST_TIMEOUT_MS = 120_000;
@@ -76,8 +87,8 @@ export interface CitationAnswer {
   /** Distinct http(s) URLs the answer cites, in the order the engine gave them. */
   citedUrls: string[];
   /**
-   * Source domains as the engine names them, when its URLs are redirect links
-   * (Gemini). Absent: the runner takes the domains from citedUrls.
+   * Source domains as the engine names them, when it gives no source URLs (Gemini's
+   * are redirect links). Absent: the runner takes the domains from citedUrls.
    */
   citedDomains?: string[];
   /** The answer text, whitespace collapsed, at most ANSWER_SNIPPET_MAX_CHARS. */
@@ -87,14 +98,170 @@ export interface CitationAnswer {
 
 export type CitationRunResult = ({ ok: true } & CitationAnswer) | { ok: false; reason: string; costUsd: number };
 
+// ── Models and prices (config/ai-citation-panel.json "engines") ──────
+
+/** One model's list prices (USD) and the bound of one call. */
+export interface CitationModelPrice {
+  inUsdPerMTok: number;
+  outUsdPerMTok: number;
+  /** Long-prompt tier: above this many input tokens both long rates apply; null = one tier. */
+  longPromptTokens: number | null;
+  longInUsdPerMTok: number;
+  longOutUsdPerMTok: number;
+  /** Per search the answer reports (see the table at the top). */
+  usdPerSearch: number;
+  /** Per request (Perplexity's request fee). */
+  usdPerRequest: number;
+  /** Upper bound of one call: checked against the caps before the call, booked when the cost cannot be read. */
+  maxCostUsdPerCall: number;
+  /** Gemini 3: generationConfig.thinkingConfig.thinkingLevel; null = the model's default. */
+  thinkingLevel: string | null;
+}
+
+export interface CitationEngineConfig {
+  /** The model asked unless AI_CITATION_<ENGINE>_MODEL names another listed one. */
+  model: string;
+  /** Prices per model id; only a model listed here is ever asked. */
+  models: Readonly<Record<string, CitationModelPrice>>;
+}
+
+export type CitationEnginesConfig = Readonly<Record<CitationEngineId, CitationEngineConfig>>;
+
+const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
+const GEMINI_THINKING_LEVELS = ["minimal", "low", "medium", "high"];
+const PRICE_KEYS = [
+  "inUsdPerMTok", "outUsdPerMTok", "longPromptTokens", "longInUsdPerMTok", "longOutUsdPerMTok",
+  "usdPerSearch", "usdPerRequest", "maxCostUsdPerCall", "thinkingLevel",
+];
+
+const isObject = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
+const hasOwn = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+
+/** The env var that overrides an engine's model, e.g. AI_CITATION_OPENAI_MODEL. */
+export function citationModelEnvOf(engine: CitationEngineId): string {
+  return `AI_CITATION_${engine.toUpperCase()}_MODEL`;
+}
+
+/**
+ * The "engines" block of config/ai-citation-panel.json (or `raw`), checked: exactly the four
+ * engines; per engine a default model that is listed under models; per model the input and
+ * output price, optional per-search / per-request fees (default 0), a long-prompt tier given in
+ * full or not at all, a maxCostUsdPerCall above 0 and, for Gemini, a known thinkingLevel; no
+ * unknown keys (a misspelt fee must not silently drop out of the cost). Prices are finite and
+ * ≥ 0. Throws with every problem listed by its path, so a broken edit makes no call.
+ */
+export function loadCitationEngineConfig(raw: unknown = panelConfig): CitationEnginesConfig {
+  const engines = isObject(raw) ? raw.engines : undefined;
+  if (!isObject(engines)) throw new Error("ai-citation-panel.json: engines must be an object");
+  const problems: string[] = [];
+  for (const k of Object.keys(engines)) {
+    if (!(CITATION_ENGINE_IDS as readonly string[]).includes(k)) problems.push(`engines.${k}: unknown engine`);
+  }
+  const out: Partial<Record<CitationEngineId, CitationEngineConfig>> = {};
+  for (const id of CITATION_ENGINE_IDS) {
+    const e = engines[id];
+    const at = `engines.${id}`;
+    if (!isObject(e)) {
+      problems.push(`${at}: missing`);
+      continue;
+    }
+    const models: Record<string, CitationModelPrice> = {};
+    if (!isObject(e.models) || Object.keys(e.models).length === 0) problems.push(`${at}.models: must list at least one model`);
+    else {
+      for (const [modelId, m] of Object.entries(e.models)) {
+        const mat = `${at}.models.${modelId}`;
+        if (!MODEL_ID_RE.test(modelId)) problems.push(`${mat}: model id`);
+        const price = checkPrice(m, mat, problems);
+        if (price) {
+          if (price.thinkingLevel !== null && id !== "gemini") problems.push(`${mat}.thinkingLevel: only for gemini`);
+          models[modelId] = Object.freeze(price);
+        }
+      }
+    }
+    if (typeof e.model !== "string" || !MODEL_ID_RE.test(e.model)) problems.push(`${at}.model: model id`);
+    else if (isObject(e.models) && !hasOwn(e.models, e.model)) problems.push(`${at}.model: not listed under models`);
+    for (const k of Object.keys(e)) if (k !== "model" && k !== "models") problems.push(`${at}.${k}: unknown key`);
+    out[id] = Object.freeze({ model: e.model, models: Object.freeze(models) });
+  }
+  if (problems.length > 0) throw new Error(`ai-citation-panel.json: ${problems.join("; ")}`);
+  return Object.freeze(out as Record<CitationEngineId, CitationEngineConfig>);
+}
+
+function checkPrice(m: unknown, at: string, problems: string[]): CitationModelPrice | null {
+  if (!isObject(m)) {
+    problems.push(`${at}: must be an object`);
+    return null;
+  }
+  const before = problems.length;
+  const usd = (k: string, required: boolean): number => {
+    const v = m[k];
+    if (v === undefined && !required) return 0;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) problems.push(`${at}.${k}: must be a number ≥ 0`);
+    return typeof v === "number" ? v : 0;
+  };
+  const price: CitationModelPrice = {
+    inUsdPerMTok: usd("inUsdPerMTok", true),
+    outUsdPerMTok: usd("outUsdPerMTok", true),
+    longPromptTokens: null,
+    longInUsdPerMTok: 0,
+    longOutUsdPerMTok: 0,
+    usdPerSearch: usd("usdPerSearch", false),
+    usdPerRequest: usd("usdPerRequest", false),
+    maxCostUsdPerCall: usd("maxCostUsdPerCall", true),
+    thinkingLevel: null,
+  };
+  if (!(price.maxCostUsdPerCall > 0)) problems.push(`${at}.maxCostUsdPerCall: must be above 0`);
+  const longKeys = ["longPromptTokens", "longInUsdPerMTok", "longOutUsdPerMTok"].filter((k) => m[k] !== undefined);
+  if (longKeys.length === 3) {
+    const t = m.longPromptTokens;
+    if (!Number.isInteger(t) || t <= 0) problems.push(`${at}.longPromptTokens: must be a whole number above 0`);
+    price.longPromptTokens = typeof t === "number" ? t : null;
+    price.longInUsdPerMTok = usd("longInUsdPerMTok", true);
+    price.longOutUsdPerMTok = usd("longOutUsdPerMTok", true);
+  } else if (longKeys.length > 0) {
+    problems.push(`${at}: longPromptTokens, longInUsdPerMTok and longOutUsdPerMTok go together`);
+  }
+  if (m.thinkingLevel !== undefined) {
+    if (!GEMINI_THINKING_LEVELS.includes(m.thinkingLevel)) problems.push(`${at}.thinkingLevel: one of ${GEMINI_THINKING_LEVELS.join(", ")}`);
+    else price.thinkingLevel = m.thinkingLevel;
+  }
+  for (const k of Object.keys(m)) if (!PRICE_KEYS.includes(k)) problems.push(`${at}.${k}: unknown key`);
+  return problems.length === before ? price : null;
+}
+
+/** What a call used, as the answer reports it. */
+export interface CitationUsage {
+  inputTokens: number;
+  outputTokens: number;
+  searches: number;
+}
+
+/** USD for one call at `price`: tokens (the long tier when the prompt is over its threshold) + searches + the request fee. */
+export function citationCallCostUsd(price: CitationModelPrice, u: CitationUsage): number {
+  const long = price.longPromptTokens !== null && u.inputTokens > price.longPromptTokens;
+  return (
+    tokenUsd(u.inputTokens, long ? price.longInUsdPerMTok : price.inUsdPerMTok) +
+    tokenUsd(u.outputTokens, long ? price.longOutUsdPerMTok : price.outUsdPerMTok) +
+    u.searches * price.usdPerSearch +
+    price.usdPerRequest
+  );
+}
+
+// ── The adapter shape ─────────────────────────────────────────────────
+
 export interface CitationEngine {
   engine: CitationEngineId;
   /** The Fly secret that holds the API key. */
   keyEnv: string;
-  model: string;
-  /** Upper bound of one call's cost; the runner checks it against the caps before the call. */
+  /** The env var that overrides the model (AI_CITATION_<ENGINE>_MODEL). */
+  modelEnv: string;
+  /** The model asked; null when the override names a model without prices in the config (the engine is then off). */
+  model: string | null;
+  /** That model's prices; null with model. */
+  price: CitationModelPrice | null;
+  /** Upper bound of one call (price.maxCostUsdPerCall; 0 without a model); the runner checks it against the caps before the call. */
   maxCostUsdPerCall: number;
-  /** True when the key is set. */
+  /** True when the model has prices and the key is set. */
   enabled(env?: NodeJS.ProcessEnv): boolean;
   run(prompt: string, deps?: CitationEngineDeps): Promise<CitationRunResult>;
 }
@@ -136,19 +303,34 @@ export function cleanCitedUrls(list: readonly unknown[]): string[] {
 }
 
 /**
+ * The host of a cited URL or of a bare host name: lowercase, without www. and trailing dots.
+ * An http(s) URL is read with WHATWG URL, the parser cleanCitedUrls validated it with (so
+ * "https://evil.example\@rettfrabonden.com/x" is evil.example, as a browser reads it); a bare
+ * host (Gemini's web.domain / title) goes through cross-source-validator's hostFromUrlLike.
+ */
+export function citationHostOf(urlOrHost: string): string | null {
+  const s = urlOrHost.trim();
+  if (!/^https?:\/\//i.test(s)) return hostFromUrlLike(s);
+  try {
+    return new URL(s).hostname.toLowerCase().replace(/\.+$/, "").replace(/^www\./, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The domain a citation counts for: the registrable domain (eTLD+1) of a URL or a bare
- * host, lowercase, without www. and a trailing dot (cross-source-validator's own
- * hostFromUrlLike + registrableDomain). "https://www.visitnorway.no/x" -> "visitnorway.no",
- * "m.facebook.com" -> "facebook.com". null when there is no host.
+ * host (citationHostOf + cross-source-validator's registrableDomain).
+ * "https://www.visitnorway.no/x" -> "visitnorway.no", "m.facebook.com" -> "facebook.com".
+ * null when there is no host.
  */
 export function citedDomainOf(urlOrHost: string): string | null {
-  const host = hostFromUrlLike(urlOrHost);
+  const host = citationHostOf(urlOrHost);
   if (!host || !host.includes(".") || /\s/.test(host)) return null;
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? host : registrableDomain(host);
 }
 
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0);
-const isObject = (v: unknown): boolean => !!v && typeof v === "object" && !Array.isArray(v);
 
 /** USD for `tokens` at `usdPerMTok`. */
 const tokenUsd = (tokens: number, usdPerMTok: number): number => (tokens * usdPerMTok) / 1_000_000;
@@ -183,32 +365,55 @@ async function postJson(url: string, headers: Record<string, string>, body: unkn
   }
 }
 
+/** A 2xx body read by one engine: the answer or a failure code, with what the call used (null = not reported). */
+type ParsedCall =
+  | { ok: true; citedUrls: string[]; citedDomains?: string[]; answerSnippet: string; usage: CitationUsage | null; reportedCostUsd?: number | null }
+  | { ok: false; reason: string; usage: CitationUsage | null };
+
 /** What one engine adds to the shared run: its request and how to read its answer. */
-interface EngineDef extends Pick<CitationEngine, "engine" | "keyEnv" | "model" | "maxCostUsdPerCall"> {
-  request(prompt: string, key: string): { url: string; headers: Record<string, string>; body: unknown };
-  /** The 2xx body -> result; null when it is not the documented shape. */
-  parse(body: any): CitationRunResult | null;
+export interface CitationEngineDef {
+  engine: CitationEngineId;
+  keyEnv: string;
+  request(prompt: string, key: string, model: string, price: CitationModelPrice): { url: string; headers: Record<string, string>; body: unknown };
+  /** The 2xx body -> the answer; null when it is not the documented shape. */
+  parse(body: any): ParsedCall | null;
 }
 
 /**
- * An adapter from its definition. run(): key check (no key -> no_key, no call), count the
- * call, POST, then parse; the cost of a failure is booked per the rules at the top.
+ * An adapter from its definition and the resolved model. run(): no model -> model_unpriced
+ * and no key -> no_key, both without a call; else count the call, POST, parse, and book the
+ * cost: the reported cost, else the model's prices on the reported usage, else the bound.
  */
-function defineEngine(def: EngineDef): CitationEngine {
+function bindEngine(def: CitationEngineDef, model: string | null, price: CitationModelPrice | null): CitationEngine {
+  const bound = price?.maxCostUsdPerCall ?? 0;
   return Object.freeze({
     engine: def.engine,
     keyEnv: def.keyEnv,
-    model: def.model,
-    maxCostUsdPerCall: def.maxCostUsdPerCall,
-    enabled: (env: NodeJS.ProcessEnv = process.env) => readKey(env, def.keyEnv) !== null,
+    modelEnv: citationModelEnvOf(def.engine),
+    model: price ? model : null,
+    price,
+    maxCostUsdPerCall: bound,
+    enabled: (env: NodeJS.ProcessEnv = process.env) => price !== null && readKey(env, def.keyEnv) !== null,
     async run(prompt: string, deps: CitationEngineDeps = {}): Promise<CitationRunResult> {
+      if (!price || !model) return { ok: false, reason: "model_unpriced", costUsd: 0 };
       const key = readKey(deps.env ?? process.env, def.keyEnv);
       if (!key) return { ok: false, reason: "no_key", costUsd: 0 };
-      const req = def.request(prompt, key);
+      const req = def.request(prompt, key, model, price);
       noteLlmCall(`ai-citation-${def.engine}`);
       const r = await postJson(req.url, req.headers, req.body, deps);
-      if (!r.ok) return { ok: false, reason: r.reason, costUsd: r.costUnknown ? def.maxCostUsdPerCall : 0 };
-      return def.parse(r.body) ?? { ok: false, reason: "unexpected_response", costUsd: def.maxCostUsdPerCall };
+      if (!r.ok) return { ok: false, reason: r.reason, costUsd: r.costUnknown ? bound : 0 };
+      const p = def.parse(r.body);
+      if (!p) return { ok: false, reason: "unexpected_response", costUsd: bound };
+      const reported = p.ok ? p.reportedCostUsd ?? null : null;
+      const costUsd = reported !== null ? reported : p.usage ? citationCallCostUsd(price, p.usage) : bound;
+      if (!p.ok) return { ok: false, reason: p.reason, costUsd };
+      return {
+        ok: true,
+        citedUrls: p.citedUrls,
+        ...(p.citedDomains ? { citedDomains: p.citedDomains } : {}),
+        answerSnippet: p.answerSnippet,
+        costUsd,
+      };
     },
   });
 }
@@ -216,14 +421,10 @@ function defineEngine(def: EngineDef): CitationEngine {
 // ── Anthropic: Messages API + web_search ─────────────────────────────
 
 export const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_MODEL = "claude-haiku-5-5";
 const ANTHROPIC_MAX_SEARCHES = 3;
-// claude-haiku-5-5: $0.10 / $0.50 per MTok for a prompt up to 100K tokens, $0.50 / $2.50 above; search $10 / 1 000.
-const ANTHROPIC_PRICE = { inUsdPerMTok: 0.1, outUsdPerMTok: 0.5, longInUsdPerMTok: 0.5, longOutUsdPerMTok: 2.5, longPromptTokens: 100_000, usdPerSearch: 0.01 };
-/** One call at most: 3 searches ($0.03) + a long prompt of up to ~150K tokens ($0.075) + output. */
-const ANTHROPIC_MAX_COST_USD = 0.12;
 
 export interface AnthropicParsed {
+  /** The answer: the text after the last search (any preamble before it is dropped), else all text. */
   text: string;
   citedUrls: string[];
   searches: number;
@@ -239,22 +440,29 @@ export interface AnthropicParsed {
 /** Messages API body -> answer text, cited URLs and usage; null when it is not that shape. */
 export function parseAnthropicAnswer(body: any): AnthropicParsed | null {
   if (!body || !Array.isArray(body.content)) return null;
-  const texts: string[] = [];
+  const blocks: any[] = body.content;
+  let lastSearch = -1;
+  blocks.forEach((b, i) => {
+    if (b?.type === "server_tool_use" || b?.type === "web_search_tool_result") lastSearch = i;
+  });
+  const all: string[] = [];
+  const after: string[] = [];
   const urls: unknown[] = [];
   let toolError = false;
-  for (const block of body.content) {
+  blocks.forEach((block, i) => {
     if (block?.type === "text" && typeof block.text === "string") {
-      texts.push(block.text);
+      all.push(block.text);
+      if (i > lastSearch) after.push(block.text);
       if (Array.isArray(block.citations)) {
         for (const c of block.citations) if (c?.type === "web_search_result_location") urls.push(c.url);
       }
     } else if (block?.type === "web_search_tool_result" && !Array.isArray(block.content)) {
       toolError = true;
     }
-  }
+  });
   const u = body.usage ?? {};
   return {
-    text: texts.join(""),
+    text: (after.length > 0 ? after : all).join(""),
     citedUrls: cleanCitedUrls(urls),
     searches: num(u.server_tool_use?.web_search_requests),
     inputTokens: num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens),
@@ -265,25 +473,14 @@ export function parseAnthropicAnswer(body: any): AnthropicParsed | null {
   };
 }
 
-export function anthropicCostUsd(p: Pick<AnthropicParsed, "inputTokens" | "outputTokens" | "searches">): number {
-  const long = p.inputTokens > ANTHROPIC_PRICE.longPromptTokens;
-  return (
-    tokenUsd(p.inputTokens, long ? ANTHROPIC_PRICE.longInUsdPerMTok : ANTHROPIC_PRICE.inUsdPerMTok) +
-    tokenUsd(p.outputTokens, long ? ANTHROPIC_PRICE.longOutUsdPerMTok : ANTHROPIC_PRICE.outUsdPerMTok) +
-    p.searches * ANTHROPIC_PRICE.usdPerSearch
-  );
-}
-
-const anthropicEngine = defineEngine({
+const anthropicDef: CitationEngineDef = {
   engine: "anthropic",
   keyEnv: "ANTHROPIC_API_KEY",
-  model: ANTHROPIC_MODEL,
-  maxCostUsdPerCall: ANTHROPIC_MAX_COST_USD,
-  request: (prompt, key) => ({
+  request: (prompt, key, model) => ({
     url: ANTHROPIC_MESSAGES_URL,
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
     body: {
-      model: ANTHROPIC_MODEL,
+      model,
       max_tokens: 2048,
       system: CITATION_PANEL_INSTRUCTION,
       messages: [{ role: "user", content: prompt }],
@@ -299,22 +496,19 @@ const anthropicEngine = defineEngine({
   parse(body) {
     const p = parseAnthropicAnswer(body);
     if (!p) return null;
-    const costUsd = p.usageKnown ? anthropicCostUsd(p) : ANTHROPIC_MAX_COST_USD;
-    if (p.stopReason === "refusal") return { ok: false, reason: "refusal", costUsd };
-    if (p.toolError && p.citedUrls.length === 0) return { ok: false, reason: "search_tool_error", costUsd };
-    return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), costUsd };
+    const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: p.searches } : null;
+    if (p.stopReason === "refusal") return { ok: false, reason: "refusal", usage };
+    // The server-side search loop stopped before an answer; resuming would be a second billed call.
+    if (p.stopReason === "pause_turn") return { ok: false, reason: "pause_turn", usage };
+    if (p.toolError && p.citedUrls.length === 0) return { ok: false, reason: "search_tool_error", usage };
+    return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), usage };
   },
-});
+};
 
 // ── OpenAI: Responses API + web_search ───────────────────────────────
 
 export const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const OPENAI_MODEL = "gpt-4.1-mini";
 const OPENAI_MAX_SEARCHES = 3;
-// gpt-4.1-mini: $0.40 / $1.60 per MTok; web search tool call $25 / 1 000 (the higher of the two published rates).
-const OPENAI_PRICE = { inUsdPerMTok: 0.4, outUsdPerMTok: 1.6, usdPerSearch: 0.025 };
-/** One call at most: 3 searches ($0.075) + ~30K input and 2K output tokens. */
-const OPENAI_MAX_COST_USD = 0.1;
 
 export interface OpenAiParsed {
   text: string;
@@ -353,20 +547,14 @@ export function parseOpenAiAnswer(body: any): OpenAiParsed | null {
   };
 }
 
-export function openAiCostUsd(p: Pick<OpenAiParsed, "inputTokens" | "outputTokens" | "searches">): number {
-  return tokenUsd(p.inputTokens, OPENAI_PRICE.inUsdPerMTok) + tokenUsd(p.outputTokens, OPENAI_PRICE.outUsdPerMTok) + p.searches * OPENAI_PRICE.usdPerSearch;
-}
-
-const openAiEngine = defineEngine({
+const openAiDef: CitationEngineDef = {
   engine: "openai",
   keyEnv: "OPENAI_API_KEY",
-  model: OPENAI_MODEL,
-  maxCostUsdPerCall: OPENAI_MAX_COST_USD,
-  request: (prompt, key) => ({
+  request: (prompt, key, model) => ({
     url: OPENAI_RESPONSES_URL,
     headers: { Authorization: `Bearer ${key}` },
     body: {
-      model: OPENAI_MODEL,
+      model,
       instructions: CITATION_PANEL_INSTRUCTION,
       input: prompt,
       tools: [{ type: "web_search", user_location: { type: "approximate", country: "NO" } }],
@@ -378,18 +566,14 @@ const openAiEngine = defineEngine({
   parse(body) {
     const p = parseOpenAiAnswer(body);
     if (!p) return null;
-    return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), costUsd: p.usageKnown ? openAiCostUsd(p) : OPENAI_MAX_COST_USD };
+    const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: p.searches } : null;
+    return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), usage };
   },
-});
+};
 
-// ── Perplexity: Sonar chat completions ───────────────────────────────
+// ── Perplexity: Sonar ────────────────────────────────────────────────
 
-export const PERPLEXITY_CHAT_URL = "https://api.perplexity.ai/chat/completions";
-const PERPLEXITY_MODEL = "sonar";
-// sonar: $1 / $1 per MTok; request fee $5 / 1 000 at search context "low".
-const PERPLEXITY_PRICE = { inUsdPerMTok: 1, outUsdPerMTok: 1, usdPerRequest: 0.005 };
-/** One call at most: the $0.005 request fee + a few thousand tokens. */
-const PERPLEXITY_MAX_COST_USD = 0.02;
+export const PERPLEXITY_SONAR_URL = "https://api.perplexity.ai/v1/sonar";
 
 export interface PerplexityParsed {
   text: string;
@@ -401,7 +585,7 @@ export interface PerplexityParsed {
   usageKnown: boolean;
 }
 
-/** Chat completions body -> answer, citations and usage; null when it is not that shape. */
+/** Sonar body -> answer, citations and usage; null when it is not that shape. */
 export function parsePerplexityAnswer(body: any): PerplexityParsed | null {
   const text = body?.choices?.[0]?.message?.content;
   if (typeof text !== "string") return null;
@@ -421,21 +605,14 @@ export function parsePerplexityAnswer(body: any): PerplexityParsed | null {
   };
 }
 
-export function perplexityCostUsd(p: Pick<PerplexityParsed, "inputTokens" | "outputTokens" | "reportedCostUsd">): number {
-  if (p.reportedCostUsd !== null) return p.reportedCostUsd;
-  return tokenUsd(p.inputTokens, PERPLEXITY_PRICE.inUsdPerMTok) + tokenUsd(p.outputTokens, PERPLEXITY_PRICE.outUsdPerMTok) + PERPLEXITY_PRICE.usdPerRequest;
-}
-
-const perplexityEngine = defineEngine({
+const perplexityDef: CitationEngineDef = {
   engine: "perplexity",
   keyEnv: "PERPLEXITY_API_KEY",
-  model: PERPLEXITY_MODEL,
-  maxCostUsdPerCall: PERPLEXITY_MAX_COST_USD,
-  request: (prompt, key) => ({
-    url: PERPLEXITY_CHAT_URL,
+  request: (prompt, key, model) => ({
+    url: PERPLEXITY_SONAR_URL,
     headers: { Authorization: `Bearer ${key}` },
     body: {
-      model: PERPLEXITY_MODEL,
+      model,
       messages: [
         { role: "system", content: CITATION_PANEL_INSTRUCTION },
         { role: "user", content: prompt },
@@ -447,27 +624,25 @@ const perplexityEngine = defineEngine({
   parse(body) {
     const p = parsePerplexityAnswer(body);
     if (!p) return null;
-    return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), costUsd: p.usageKnown ? perplexityCostUsd(p) : PERPLEXITY_MAX_COST_USD };
+    const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: 0 } : null;
+    return { ok: true, citedUrls: p.citedUrls, answerSnippet: answerSnippetOf(p.text), usage, reportedCostUsd: p.reportedCostUsd };
   },
-});
+};
 
 // ── Gemini: generateContent + Google Search grounding ────────────────
 
 export const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
-const GEMINI_MODEL = "gemini-2.5-flash";
-/** groundingChunks[].web.uri points here (a redirect), not at the source. */
+/** groundingChunks[].web.uri points here (an expiring redirect), not at the source. */
 export const GEMINI_REDIRECT_HOST = "vertexaisearch.cloud.google.com";
-// gemini-2.5-flash: $0.30 / $2.50 per MTok; grounding with Google Search $35 / 1 000 grounded prompts.
-const GEMINI_PRICE = { inUsdPerMTok: 0.3, outUsdPerMTok: 2.5, usdPerGroundedPrompt: 0.035 };
-/** One call at most: one grounded prompt ($0.035) + ~20K input and 2K output tokens. */
-const GEMINI_MAX_COST_USD = 0.05;
 const HOSTNAME_RE = /^(?=.{3,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\.?$/i;
 
 export interface GeminiParsed {
   text: string;
+  /** Source URLs only: the redirect links are left out. */
   citedUrls: string[];
   citedDomains: string[];
-  grounded: boolean;
+  /** Billed search queries: webSearchQueries, at least 1 when the answer is grounded. */
+  searches: number;
   inputTokens: number;
   outputTokens: number;
   usageKnown: boolean;
@@ -479,13 +654,8 @@ function geminiChunkDomain(web: any): string | null {
     if (typeof cand === "string" && HOSTNAME_RE.test(cand.trim())) return citedDomainOf(cand.trim());
   }
   if (typeof web?.uri !== "string") return null;
-  let host: string;
-  try {
-    host = new URL(web.uri).hostname.toLowerCase();
-  } catch {
-    return null;
-  }
-  return host === GEMINI_REDIRECT_HOST ? null : citedDomainOf(host);
+  const host = citationHostOf(web.uri);
+  return host === null || host === GEMINI_REDIRECT_HOST ? null : citedDomainOf(web.uri);
 }
 
 /** generateContent body -> answer, grounding sources and usage; null when it is not that shape. */
@@ -505,45 +675,73 @@ export function parseGeminiAnswer(body: any): GeminiParsed | null {
   const u = body.usageMetadata ?? {};
   return {
     text,
-    citedUrls: cleanCitedUrls(chunks.map((ch) => ch?.web?.uri)),
+    citedUrls: cleanCitedUrls(chunks.map((ch) => ch?.web?.uri)).filter((url) => citationHostOf(url) !== GEMINI_REDIRECT_HOST),
     citedDomains: domains,
-    grounded: queries > 0 || chunks.length > 0,
+    searches: Math.max(queries, chunks.length > 0 ? 1 : 0),
     inputTokens: num(u.promptTokenCount) + num(u.toolUsePromptTokenCount),
     outputTokens: num(u.candidatesTokenCount) + num(u.thoughtsTokenCount),
     usageKnown: isObject(body.usageMetadata),
   };
 }
 
-export function geminiCostUsd(p: Pick<GeminiParsed, "inputTokens" | "outputTokens" | "grounded">): number {
-  return tokenUsd(p.inputTokens, GEMINI_PRICE.inUsdPerMTok) + tokenUsd(p.outputTokens, GEMINI_PRICE.outUsdPerMTok) + (p.grounded ? GEMINI_PRICE.usdPerGroundedPrompt : 0);
-}
-
-const geminiEngine = defineEngine({
+const geminiDef: CitationEngineDef = {
   engine: "gemini",
   keyEnv: "GEMINI_API_KEY",
-  model: GEMINI_MODEL,
-  maxCostUsdPerCall: GEMINI_MAX_COST_USD,
-  request: (prompt, key) => ({
-    url: `${GEMINI_API_BASE}${GEMINI_MODEL}:generateContent`,
+  request: (prompt, key, model, price) => ({
+    url: `${GEMINI_API_BASE}${encodeURIComponent(model)}:generateContent`,
     headers: { "x-goog-api-key": key },
     body: {
       system_instruction: { parts: [{ text: CITATION_PANEL_INSTRUCTION }] },
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       tools: [{ google_search: {} }],
-      generationConfig: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } },
+      generationConfig: {
+        maxOutputTokens: 2048,
+        ...(price.thinkingLevel ? { thinkingConfig: { thinkingLevel: price.thinkingLevel } } : {}),
+      },
     },
   }),
   parse(body) {
     const p = parseGeminiAnswer(body);
     if (!p) return null;
-    return { ok: true, citedUrls: p.citedUrls, citedDomains: p.citedDomains, answerSnippet: answerSnippetOf(p.text), costUsd: p.usageKnown ? geminiCostUsd(p) : GEMINI_MAX_COST_USD };
+    const usage = p.usageKnown ? { inputTokens: p.inputTokens, outputTokens: p.outputTokens, searches: p.searches } : null;
+    return { ok: true, citedUrls: p.citedUrls, citedDomains: p.citedDomains, answerSnippet: answerSnippetOf(p.text), usage };
   },
-});
+};
 
-/** All engines, in the order the runner asks them. */
-export const CITATION_ENGINES: readonly CitationEngine[] = Object.freeze([anthropicEngine, openAiEngine, perplexityEngine, geminiEngine]);
+/** The engine definitions, in the order the runner asks them (CITATION_ENGINE_IDS). */
+export const CITATION_ENGINE_DEFS: readonly CitationEngineDef[] = Object.freeze([anthropicDef, openAiDef, perplexityDef, geminiDef]);
+
+// ── Engines for an environment ───────────────────────────────────────
+
+/**
+ * The four engines for `env` from a checked config: each asks AI_CITATION_<ENGINE>_MODEL when
+ * that is set, else the config's default, at that model's prices. An override without prices in
+ * the config (or no config at all) leaves the engine off (model null).
+ */
+export function buildCitationEngines(config: CitationEnginesConfig | null, env: NodeJS.ProcessEnv = process.env): CitationEngine[] {
+  return CITATION_ENGINE_DEFS.map((def) => {
+    const cfg = config?.[def.engine];
+    if (!cfg) return bindEngine(def, null, null);
+    const model = (env[citationModelEnvOf(def.engine)] ?? "").trim() || cfg.model;
+    return bindEngine(def, model, hasOwn(cfg.models, model) ? cfg.models[model] : null);
+  });
+}
+
+/** buildCitationEngines on config/ai-citation-panel.json (or `raw`); throws when the config is invalid. */
+export function loadCitationEngines(env: NodeJS.ProcessEnv = process.env, raw: unknown = panelConfig): CitationEngine[] {
+  return buildCitationEngines(loadCitationEngineConfig(raw), env);
+}
+
+/** loadCitationEngines for the read views: with an invalid config every engine is off (model null) and configValid is false. */
+export function citationEnginesForView(env: NodeJS.ProcessEnv = process.env, raw: unknown = panelConfig): { engines: CitationEngine[]; configValid: boolean } {
+  try {
+    return { engines: loadCitationEngines(env, raw), configValid: true };
+  } catch {
+    return { engines: buildCitationEngines(null, env), configValid: false };
+  }
+}
 
 /** The keys currently set, for redacting log lines (never logged or returned themselves). */
-export function citationEngineKeys(env: NodeJS.ProcessEnv = process.env, engines: readonly CitationEngine[] = CITATION_ENGINES): string[] {
+export function citationEngineKeys(env: NodeJS.ProcessEnv = process.env, engines: readonly { keyEnv: string }[] = CITATION_ENGINE_DEFS): string[] {
   return engines.map((e) => readKey(env, e.keyEnv)).filter((k): k is string => k !== null);
 }

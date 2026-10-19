@@ -5,10 +5,11 @@
  * No network: the real engine adapters run against a fetch stub that answers as each provider
  * (fixtures from engines.test.ts) and fails on anything else; the keys are fakes. Covers the flag
  * (off = no timer, no call, no DB), the blocked windows (00–01Z, 06:30–09:30Z, also mid-run), an
- * engine without its key (skipped, one log line), a full panel (50 questions × 4 engines) and the
- * same week again (no call), the run cap with the real adapters, no overlapping runs, the
+ * engine without its key or with an unpriced model override (skipped, one log line), a full panel
+ * (50 questions × 4 engines) and the same week again (no call), the run cap with the real adapters
+ * and with the per-call bound from the config, no overlapping runs, the
  * scheduler (15 min after boot, hourly, behind the exclusive boot gate without holding it, a
- * failed run logged without keys), the status (month_cost_usd ≤ 30), GET
+ * failed run logged without keys), the status (models and prices, month_cost_usd ≤ 30), GET
  * /admin/analytics/ai-citations[/status] (auth, 200 with cost_usd_total, 400 on a bad week), the
  * wiring in src/index.ts, and that no key reaches a log line, an error, the DB or a response.
  */
@@ -26,8 +27,8 @@ import {
   startAiCitationPanelScheduler,
 } from "./panel-job";
 import { aiCitationWeekTotals, loadCitationPrompts } from "./panel-runner";
-import { ANTHROPIC_MESSAGES_URL, GEMINI_API_BASE, OPENAI_RESPONSES_URL, PERPLEXITY_CHAT_URL, type CitationEngineId } from "./engines";
-import { ENV_ALL, FAKE_KEYS, answerFor, stubFetch } from "./engines.test";
+import { ANTHROPIC_MESSAGES_URL, GEMINI_API_BASE, OPENAI_RESPONSES_URL, PERPLEXITY_SONAR_URL, loadCitationEngines, type CitationEngineId } from "./engines";
+import { ENV_ALL, FAKE_KEYS, answerFor, configCopy, stubFetch } from "./engines.test";
 import {
   AI_CITATION_PANEL_BOOT_DELAY_MS,
   DENTAL_GEOCODE_BOOT_DELAY_MS,
@@ -49,7 +50,7 @@ const ENV_ON_ALL = { ...ENV_ALL, ...ON } as NodeJS.ProcessEnv;
 const engineOfUrl = (url: string): CitationEngineId | null =>
   url === ANTHROPIC_MESSAGES_URL ? "anthropic"
     : url === OPENAI_RESPONSES_URL ? "openai"
-      : url === PERPLEXITY_CHAT_URL ? "perplexity"
+      : url === PERPLEXITY_SONAR_URL ? "perplexity"
         : url.startsWith(GEMINI_API_BASE) ? "gemini" : null;
 
 /** All four providers; each answer cites our RFB site and one other site. Anything else fails. */
@@ -155,6 +156,40 @@ export async function runPanelJobTests(opts: { log?: boolean } = {}): Promise<Te
       const b3 = logs.length;
       await runAiCitationPanelTick({ env, db, fetchImpl: f.fetchImpl, now: () => new Date("2026-10-27T12:00:00Z"), log });
       t(!logs.slice(b3).some((l) => l.includes("is not set")), "NK3: the skip line is not repeated on later checks");
+      dump(db);
+    }
+
+    // ── an override naming a model without prices (B1) ──
+    {
+      __resetAiCitationPanelForTesting();
+      const db = newDb();
+      const f = fakeProviders();
+      const env = { ...ENV_ON_ALL, AI_CITATION_GEMINI_MODEL: "gemini-2.5-flash" } as NodeJS.ProcessEnv;
+      const before = logs.length;
+      const r = await runAiCitationPanelTick({ env, db, fetchImpl: f.fetchImpl, now: () => NOW, log, prompts: PROMPTS.slice(0, 2) });
+      const lines = logs.slice(before).filter((l) => l.includes(" skipped: "));
+      t(!r.skipped && r.calls === 6 && !f.calls.some((c) => c.url.startsWith(GEMINI_API_BASE)) && lines.length === 1 &&
+        lines[0] === "[ai-citations] gemini skipped: AI_CITATION_GEMINI_MODEL names a model without prices in config/ai-citation-panel.json",
+        "MOJ1: an unpriced AI_CITATION_GEMINI_MODEL skips Gemini (one log line, the value not echoed); the other engines run");
+      const st = status({ db, env, now: NOW });
+      const g = st.engines.find((e) => e.engine === "gemini")!;
+      t(g.model === null && g.price === null && !g.active && g.model_env === "AI_CITATION_GEMINI_MODEL" && !!g.model_error?.includes("AI_CITATION_GEMINI_MODEL") &&
+        st.week_expected === PROMPTS.length * 3 && st.config_valid,
+        "MOJ2: the status shows the engine off with why, and expects only the active engines");
+      dump(db);
+    }
+
+    // ── the per-call bound comes from the config (B1) ──
+    {
+      __resetAiCitationPanelForTesting();
+      const db = newDb();
+      const f = fakeProviders();
+      const c = configCopy();
+      for (const e of Object.values(c.engines) as any[]) for (const m of Object.values(e.models) as any[]) m.maxCostUsdPerCall = 0.5;
+      const env = { ...ENV_ON_ALL, AI_CITATION_MAX_USD_PER_RUN: "0.5" } as NodeJS.ProcessEnv;
+      const r = await runAiCitationPanelTick({ env, db, fetchImpl: f.fetchImpl, now: () => NOW, log, engines: loadCitationEngines(env, c), prompts: PROMPTS.slice(0, 2) });
+      t(!r.skipped && r.calls === 1 && f.calls.length === 1 && f.calls[0].url === ANTHROPIC_MESSAGES_URL && r.stopped === "run_cap" && r.skippedCostCap === 7,
+        "CB1: with the config's bound of 0.50 a call each and a run cap of 0.50, exactly one call fits (the caps use the config's bound)");
       dump(db);
     }
 
@@ -323,6 +358,10 @@ export async function runPanelJobTests(opts: { log?: boolean } = {}): Promise<Te
         JSON.stringify(st.engines.map((e) => [e.engine, e.active, e.key_env])) ===
           JSON.stringify([["anthropic", true, "ANTHROPIC_API_KEY"], ["openai", false, "OPENAI_API_KEY"], ["perplexity", false, "PERPLEXITY_API_KEY"], ["gemini", false, "GEMINI_API_KEY"]]),
         "ST1: flag off, which engines have a key (by the secret's name only)");
+      t(JSON.stringify(st.engines.map((e) => e.model)) === JSON.stringify(["claude-haiku-5-5", "gpt-6-luna", "sonar", "gemini-3.5-flash-lite"]) &&
+        st.engines.every((e) => e.model_error === null && e.price !== null && e.price.maxCostUsdPerCall === e.max_cost_usd_per_call) &&
+        st.engines.find((e) => e.engine === "gemini")!.price!.usdPerSearch === 0.014,
+        "ST1b: each engine's model, its prices and per-call bound as in the config");
       t(st.month === "2026-10" && st.month_cost_usd === 0 && st.month_remaining_usd === 30 && st.caps.per_run_usd === 8 && st.prompts === PROMPTS.length &&
         st.config_valid && st.week_expected === PROMPTS.length && st.week_results === 0 && st.blocked_now === "06:30-09:30" &&
         JSON.stringify(st.blocked_windows_utc) === JSON.stringify(["00:00-01:00", "06:30-09:30"]),
@@ -337,11 +376,12 @@ export async function runPanelJobTests(opts: { log?: boolean } = {}): Promise<Te
       const prevEnv = { a: process.env.ADMIN_KEY, b: process.env.ANALYTICS_ADMIN_KEY };
       try {
         const mainDb = initMod.getDb();
-        const thisWeek = (await import("./panel-runner")).aiCitationWeekOf(new Date());
+        const { aiCitationWeekOf } = await import("./panel-runner");
+        // A fixed week, so no step depends on the wall clock (S7).
         mainDb.prepare(
           `INSERT INTO ai_citation_results (week, engine, prompt_id, vertical, status, reason, cited_urls, cited_domains, hit_self, answer_snippet, cost_usd, created_at)
            VALUES (?, 'anthropic', 'rfb-02', 'rfb', 'ok', NULL, '["https://www.rettfrabonden.com/x"]', '["rettfrabonden.com"]', 1, 'Svar', 0.0125, ?)`,
-        ).run(thisWeek, new Date().toISOString());
+        ).run(WEEK, NOW.toISOString());
         const router = (require("../../routes/admin-ai-citations") as typeof import("../../routes/admin-ai-citations")).default;
         delete process.env.ADMIN_KEY;
         delete process.env.ANALYTICS_ADMIN_KEY;
@@ -351,14 +391,18 @@ export async function runPanelJobTests(opts: { log?: boolean } = {}): Promise<Te
         process.env.ADMIN_KEY = "test-admin-key-1234";
         const bad = [await callRoute(router, "/", { "x-admin-key": "wrong" }), await callRoute(router, "/status"), await callRoute(router, "/status", { "x-admin-key": "wrong" })];
         t(bad.every((b) => b.status === 401), "AD2: wrong / missing X-Admin-Key -> 401");
-        const ok = await callRoute(router, `/?week=${thisWeek}`, { "x-admin-key": "test-admin-key-1234" });
+        const ok = await callRoute(router, `/?week=${WEEK}`, { "x-admin-key": "test-admin-key-1234" });
         emitted.push(JSON.stringify(ok.body));
-        t(ok.status === 200 && ok.body.week === thisWeek && ok.body.cost_usd_total === 0.0125 && ok.body.results.length === 1 &&
-          ok.body.engines.find((e: any) => e.engine === "anthropic").hits === 1,
-          "AD3 (AC4): GET /admin/analytics/ai-citations?week= -> 200 with cost_usd_total");
+        t(ok.status === 200 && ok.body.week === WEEK && ok.body.cost_usd_total === 0.0125 && ok.body.results.length === 1 &&
+          ok.body.engines.find((e: any) => e.engine === "anthropic").hits === 1 && ok.body.engines.find((e: any) => e.engine === "gemini").model === "gemini-3.5-flash-lite",
+          "AD3 (AC4): GET /admin/analytics/ai-citations?week= -> 200 with cost_usd_total and each engine's model");
         const byDay = await callRoute(router, "/?week=2026-10-25", { "x-admin-key": "test-admin-key-1234" });
+        const weekBefore = aiCitationWeekOf(new Date());
         const def = await callRoute(router, "/", { "x-admin-key": "test-admin-key-1234" });
-        t(byDay.status === 200 && byDay.body.week === WEEK && def.status === 200 && def.body.week === thisWeek, "AD4: a day of the week also works; no week -> the current week");
+        const weekAfter = aiCitationWeekOf(new Date());
+        t(byDay.status === 200 && byDay.body.week === WEEK && byDay.body.cost_usd_total === 0.0125 && def.status === 200 &&
+          (def.body.week === weekBefore || def.body.week === weekAfter),
+          "AD4: a day of the week also works; no week -> the current week (read on either side of the call)");
         const bads = await Promise.all(["/?week=2026-W54", "/?week=abc", "/?week=2026-13-01", "/?week="].map((u) => callRoute(router, u, { "x-admin-key": "test-admin-key-1234" })));
         t(bads.every((b) => b.status === 400), "AD5: a week that is neither an ISO week nor a date -> 400");
         const st = await callRoute(router, "/status", { "x-admin-key": "test-admin-key-1234" });

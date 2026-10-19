@@ -17,10 +17,15 @@
 //     resumes it.
 //   - Caps AI_CITATION_MAX_USD_PER_RUN (8) and AI_CITATION_MAX_USD_PER_MONTH
 //     (30), applied by the runner before every call.
-//   - An engine without its key is skipped, with one log line per process.
-//   - Status (GET /admin/analytics/ai-citations/status): the flag, which
-//     engines are active, the caps, month_cost_usd from the stored results,
-//     the current week's progress and the last run of this process.
+//   - Models and prices come from config/ai-citation-panel.json ("engines"),
+//     with AI_CITATION_<ENGINE>_MODEL to pick another listed model
+//     (engines.ts). An engine without its key, or whose override names a
+//     model without prices there, is skipped, with one log line per process.
+//     An invalid config makes no call.
+//   - Status (GET /admin/analytics/ai-citations/status): the flag, each
+//     engine's model, prices and whether it is active, the caps,
+//     month_cost_usd from the stored results, the current week's progress and
+//     the last run of this process.
 // Keys are read from the environment per call and never logged; every log
 // line also goes through redactSecrets().
 
@@ -29,7 +34,13 @@ import { runExclusiveBootJob, AI_CITATION_PANEL_BOOT_DELAY_MS } from "../boot-jo
 import { trackJob } from "../event-loop-monitor";
 import { createLlmCallMeter, runWithLlmCallMeter } from "../llm-call-meter";
 import { redactSecrets } from "../search-console-fetch";
-import { CITATION_ENGINES, citationEngineKeys, type CitationEngine, type CitationEngineId } from "./engines";
+import {
+  citationEngineKeys,
+  citationEnginesForView,
+  loadCitationEngines,
+  type CitationEngine,
+  type CitationEngineId,
+} from "./engines";
 import {
   aiCitationMonthCostUsd,
   aiCitationWeekOf,
@@ -87,7 +98,8 @@ interface LastRun {
 let running = false;
 let schedulerStarted = false;
 let lastRun: LastRun | null = null;
-const loggedInactive = new Set<CitationEngineId>();
+/** Per engine, why it was last logged as skipped (so the line is not repeated every hour). */
+const loggedInactive = new Map<CitationEngineId, string>();
 
 function defaultDb(): Db {
   // Lazy: keeps this module loadable in tests without opening the prod DB.
@@ -105,7 +117,7 @@ export interface AiCitationTickOptions {
   timeoutMs?: number;
   now?: () => Date;
   log?: (msg: string) => void;
-  /** Tests: other engines / questions. */
+  /** Tests: other engines / questions (default: config/ai-citation-panel.json for `env`). */
   engines?: readonly CitationEngine[];
   prompts?: readonly CitationPrompt[];
 }
@@ -123,36 +135,47 @@ function formatRunLine(r: CitationPanelRunSummary & { llmCalls: Record<string, n
   );
 }
 
+/** Why an engine has no model (it then makes no call). The override's value is not echoed. */
+const unpricedModel = (e: CitationEngine) => `${e.modelEnv} names a model without prices in config/ai-citation-panel.json`;
+
+/** Why an engine is off, for its one log line; null when it is active. */
+function inactiveReason(e: CitationEngine, env: NodeJS.ProcessEnv): string | null {
+  if (e.model === null) return unpricedModel(e);
+  return e.enabled(env) ? null : `${e.keyEnv} is not set`;
+}
+
 /**
- * One check: with the flag on, outside the blocked windows and with at least one key set, run
- * the current week's missing questions within the caps. Logs one line when it asked or skipped
- * anything. Makes no call with the flag off.
+ * One check: with the flag on, outside the blocked windows, with a valid config and at least one
+ * active engine (model priced, key set), run the current week's missing questions within the
+ * caps. Logs one line when it asked or skipped anything. Makes no call with the flag off.
  */
 export async function runAiCitationPanelTick(opts: AiCitationTickOptions = {}): Promise<AiCitationTickResult> {
   const env = opts.env ?? process.env;
   if (!isAiCitationPanelEnabled(env)) return { skipped: "disabled" };
   const now = opts.now ?? (() => new Date());
   const log = opts.log ?? ((m: string) => console.log(m));
-  const engines = opts.engines ?? CITATION_ENGINES;
-  const say = (m: string) => log(redactSecrets(m, citationEngineKeys(env, engines)));
+  const say = (m: string) => log(redactSecrets(m, citationEngineKeys(env, opts.engines)));
   const window = aiCitationBlockedWindowAt(now());
   if (window) return { skipped: "blocked_window", detail: window };
   if (running) return { skipped: "already_running" };
   let prompts: readonly CitationPrompt[];
+  let engines: readonly CitationEngine[];
   try {
     prompts = opts.prompts ?? loadCitationPrompts();
+    engines = opts.engines ?? loadCitationEngines(env);
   } catch {
-    say("[ai-citations] skipped: config/ai-citation-panel.json is invalid (see the panel-runner test)");
+    say("[ai-citations] skipped: config/ai-citation-panel.json is invalid (see the engines and panel-runner tests)");
     return { skipped: "invalid_config" };
   }
-  const active = engines.filter((e) => e.enabled(env));
   for (const e of engines) {
-    if (active.includes(e)) loggedInactive.delete(e.engine);
-    else if (!loggedInactive.has(e.engine)) {
-      loggedInactive.add(e.engine);
-      say(`[ai-citations] ${e.engine} skipped: ${e.keyEnv} is not set`);
+    const why = inactiveReason(e, env);
+    if (why === null) loggedInactive.delete(e.engine);
+    else if (loggedInactive.get(e.engine) !== why) {
+      loggedInactive.set(e.engine, why);
+      say(`[ai-citations] ${e.engine} skipped: ${why}`);
     }
   }
+  const active = engines.filter((e) => e.enabled(env));
   if (active.length === 0) return { skipped: "no_active_engine" };
 
   running = true;
@@ -232,8 +255,8 @@ export function startAiCitationPanelScheduler(opts: {
   boot?.unref?.();
   interval?.unref?.();
   schedulerStarted = true;
-  const active = (opts.run?.engines ?? CITATION_ENGINES).filter((e) => e.enabled(env)).map((e) => e.engine);
-  log(`[ai-citations] on: first check in ${Math.round(bootDelayMs / 60_000)} min, then hourly; engines with a key: ${active.join(", ") || "none"}`);
+  const active = (opts.run?.engines ?? citationEnginesForView(env).engines).filter((e) => e.enabled(env)).map((e) => `${e.engine} (${e.model})`);
+  log(`[ai-citations] on: first check in ${Math.round(bootDelayMs / 60_000)} min, then hourly; active engines: ${active.join(", ") || "none"}`);
   return {
     started: true,
     stop: () => {
@@ -247,10 +270,12 @@ export function startAiCitationPanelScheduler(opts: {
 // ── Status ────────────────────────────────────────────────────────────
 
 /**
- * GET /admin/analytics/ai-citations/status. Read-only, no network: the flag, the engines (key
- * set or not; never the key), the caps, the month's stored cost (month_cost_usd) and what is
- * left of it, the current week's stored results against questions × active engines, the
- * blocked windows and this process's last run.
+ * GET /admin/analytics/ai-citations/status. Read-only, no network: the flag, the engines (model,
+ * its prices and per-call bound as in config/ai-citation-panel.json, why the model cannot be
+ * used if so, key set or not; never the key), the caps, the month's stored cost
+ * (month_cost_usd) and what is left of it, the current week's stored results against
+ * questions × active engines, the blocked windows and this process's last run. config_valid is
+ * false when the questions or the engines block of the config are invalid.
  */
 export function getAiCitationPanelStatus(opts: {
   db?: Db;
@@ -263,12 +288,16 @@ export function getAiCitationPanelStatus(opts: {
   const now = opts.now ?? new Date();
   const db = opts.db ?? defaultDb();
   const caps = resolveAiCitationCaps(env);
-  const engines = (opts.engines ?? CITATION_ENGINES).map((e) => ({
+  const loaded = opts.engines ? { engines: opts.engines, configValid: true } : citationEnginesForView(env);
+  const engines = loaded.engines.map((e) => ({
     engine: e.engine,
     model: e.model,
+    model_env: e.modelEnv,
+    model_error: e.model !== null ? null : loaded.configValid ? unpricedModel(e) : "config/ai-citation-panel.json is invalid",
     key_env: e.keyEnv,
     active: e.enabled(env),
     max_cost_usd_per_call: e.maxCostUsdPerCall,
+    price: e.price ? { ...e.price } : null,
   }));
   let prompts: number | null = null;
   try {
@@ -291,7 +320,7 @@ export function getAiCitationPanelStatus(opts: {
     month_cost_usd: round(monthCost),
     month_remaining_usd: round(Math.max(0, caps.perMonthUsd - monthCost)),
     month_cap_reached: monthCost >= caps.perMonthUsd,
-    config_valid: prompts !== null,
+    config_valid: prompts !== null && loaded.configValid,
     prompts,
     week,
     week_cost_usd: round(weekTotals.costUsd),

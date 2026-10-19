@@ -10,8 +10,9 @@
 // answer snippet and the cost, in ai_citation_results.
 //
 // Our domains are the three brands' sites from config/brand-entities.ts
-// (rettfrabonden.com, opplevagent.no, finn-tannlege.com): a cited host counts
-// when it is the domain or a subdomain of it, www. included, so producer pages
+// (rettfrabonden.com, opplevagent.no, finn-tannlege.com): a cited host (read
+// with WHATWG URL, engines.ts citationHostOf) counts when it is the domain or a
+// subdomain of it, www. included, so producer pages
 // (/produsent/…), clinic pages and experience pages on our sites are hits.
 // A new vertical is a new brand there plus its questions here. A producer's or
 // clinic's OWN website is not "us" and is not a hit; it shows up among the
@@ -38,11 +39,10 @@
 import type Database from "better-sqlite3";
 import panelConfig from "../../config/ai-citation-panel.json";
 import { BRAND_ENTITIES, type BrandKey } from "../../config/brand-entities";
-import { hostFromUrlLike } from "../cross-source-validator";
 import { isoWeekKey } from "../offsite-backup";
 import { addDays, dayOf, isDay, monthStartOf, nextMonthStart } from "../traffic-history-compute";
 import { yieldToEventLoop } from "../boot-job-gate";
-import { CITATION_ENGINES, citedDomainOf, type CitationEngine, type CitationEngineDeps } from "./engines";
+import { citationEnginesForView, citationHostOf, citedDomainOf, type CitationEngine, type CitationEngineDeps } from "./engines";
 
 type Db = Database.Database;
 
@@ -96,10 +96,11 @@ export const AI_CITATION_OWN_DOMAINS: readonly { brand: CitationVertical; domain
 /**
  * Which of our brands a cited URL or host belongs to: the brand's domain itself or any
  * subdomain of it, case-insensitive, with or without www. and a trailing dot. A look-alike
- * («notrettfrabonden.com», «rettfrabonden.com.example.no») is not ours.
+ * («notrettfrabonden.com», «rettfrabonden.com.example.no») is not ours, and neither is a URL
+ * whose host is another site («https://evil.example\@rettfrabonden.com/» is evil.example).
  */
 export function ownBrandOfHost(urlOrHost: string): CitationVertical | null {
-  const host = hostFromUrlLike(urlOrHost);
+  const host = citationHostOf(urlOrHost);
   if (!host) return null;
   for (const { brand, domain } of AI_CITATION_OWN_DOMAINS) {
     if (host === domain || host.endsWith(`.${domain}`)) return brand;
@@ -427,10 +428,10 @@ function defaultDb(): Db {
 }
 
 /**
- * GET /admin/analytics/ai-citations: one ISO week (default: the current one). Per engine: active
- * (key set), answered questions, hits on our domains and that share (also last week's and the
- * change, for the week-over-week view), errors, skipped_cost_cap, cost and the top-5 cited
- * domains. Per vertical: our hits per engine and the top-10 cited domains (the competitor
+ * GET /admin/analytics/ai-citations: one ISO week (default: the current one). Per engine: the
+ * model, active (model priced and key set), answered questions, hits on our domains and that
+ * share (also last week's and the change, for the week-over-week view), errors,
+ * skipped_cost_cap, cost and the top-5 cited domains. Per vertical: our hits per engine and the top-10 cited domains (the competitor
  * picture). `results` is one entry per question and engine (what the visibility routine writes
  * to visibility-reports/citations/<week>.jsonl). `cost_usd_total` is the week's stored cost.
  * Read-only, no network.
@@ -446,7 +447,7 @@ export function getAiCitationWeekView(opts: {
   const db = opts.db ?? defaultDb();
   ensureAiCitationResultsTable(db);
   const env = opts.env ?? process.env;
-  const engines = opts.engines ?? CITATION_ENGINES;
+  const engines = opts.engines ?? citationEnginesForView(env).engines;
   let prompts: readonly CitationPrompt[] = [];
   try {
     prompts = opts.prompts ?? loadCitationPrompts();
