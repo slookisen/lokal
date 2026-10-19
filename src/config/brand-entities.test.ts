@@ -154,9 +154,10 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     let origin = "";
     try { origin = new URL(e.url).origin; } catch { /* reported below */ }
     assertTrue(e.url.startsWith("https://") && origin === e.url, `c1 ${k}: url is a bare https origin, no trailing slash (${e.url})`);
-    const own = [e.logoPng, e.docsUrl, e.privacyUrl, e.termsUrl].filter((u): u is string => u !== null);
-    assertTrue(own.every((u) => u.startsWith(`${e.url}/`) && !/\s/.test(u)), `c2 ${k}: logo, docs, privacy and terms are https pages on ${e.url}`);
+    const own = [e.logoPng, e.iconPng192, e.docsUrl, e.privacyUrl, e.termsUrl].filter((u): u is string => u !== null);
+    assertTrue(own.every((u) => u.startsWith(`${e.url}/`) && !/\s/.test(u)), `c2 ${k}: logo, 192 icon, docs, privacy and terms are https pages on ${e.url}`);
     if (e.logoPng !== null) assertTrue(/\.png$/.test(e.logoPng), `c3 ${k}: the logo is a PNG (${e.logoPng})`);
+    if (e.iconPng192 !== null) assertTrue(/\.png$/.test(e.iconPng192) && e.logoPng !== null, `c3b ${k}: the 192 icon is a PNG, next to a logo (${e.iconPng192})`);
   }
   assertEq(
     [E.rfb.logoPng, E.experiences.logoPng, E.dental.logoPng, E.company.logoPng],

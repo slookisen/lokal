@@ -3471,7 +3471,7 @@ function dentalMcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${DENTAL_BASE_URL}/llms.txt`,
-    icon: DENTAL_MCP_SERVER_ICONS?.[0]?.src, // the 512 PNG (was favicon.svg)
+    icon: DENTAL_MCP_SERVER_ICONS?.[0]?.src, // the 512 PNG logo (was favicon.svg); no `icon` while BRAND_ENTITIES.dental.logoPng is null
     // T3: the organisation behind the server is the company (same as the agent
     // card's provider); `name`/`title` above keep the brand.
     vendor: {

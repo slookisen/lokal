@@ -56,7 +56,7 @@ router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSes
 // figures (the catalog count lives in honest-count). The server card in
 // dental-seo.ts reads the title, description and icons below, so there is no
 // copy to keep in step. Locked by dental-mcp-instructions.test.ts.
-// The brand's name (in the title), URL (websiteUrl) and PNG logo (icons) come
+// The brand's name (in the title), URL (websiteUrl) and PNG icons (icons) come
 // from BRAND_ENTITIES.dental (A2A dev-request
 // 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S5;
 // dental-mcp-serverinfo-icons.test.ts).
@@ -91,7 +91,7 @@ export const DENTAL_MCP_SERVER_DESCRIPTION =
   "place, county (fylke), specialty, Helfo direct-billing agreement or emergency care. Supports natural-language " +
   "queries in Norwegian and English. Read-only: no booking, no payment and no dental advice.";
 
-/** serverInfo icons: the brand's 512×512 PNG logo (G3-S5); the server card's `icon` is its src. */
+/** serverInfo icons: the brand's 512 PNG logo, then its 192 (G3-S5); the server card's `icon` is icons[0].src. */
 export const DENTAL_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.dental);
 
 // ─── Zod input schemas (exported for testing — pr114-01) ─────

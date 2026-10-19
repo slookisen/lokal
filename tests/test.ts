@@ -36198,8 +36198,9 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
 
   // ── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5,
   //    Finn-tannlege): /mcp serverInfo has the brand's title, websiteUrl and
-  //    PNG icons from BRAND_ENTITIES.dental, icons[0].src answers 200
-  //    image/png, and the MCP server card's icon is the same PNG ──
+  //    PNG icons (512, then 192) from BRAND_ENTITIES.dental, each icon's src
+  //    answers 200 image/png at its declared size, and the MCP server card's
+  //    icon is the 512 ──
   console.log("\n── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5): dental serverInfo og PNG-ikon ──");
   try {
     const { runDentalMcpServerInfoIconsTests } = require("../src/routes/dental-mcp-serverinfo-icons.test") as
