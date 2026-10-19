@@ -55,7 +55,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -947,8 +947,11 @@ export function registerTools(
           }));
 
           // Profile link
-          const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
-          sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+          // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+          if (!failsProducerRoleGate((agent as any).role, false)) {
+            const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
+            sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+          }
 
           return sections.join("\n");
         } else {
@@ -1321,7 +1324,7 @@ export function registerTools(
 
       const lim = Math.min(limit || 100, 500);
       const rows = db.prepare(`
-        SELECT p.id, p.name, p.city, aff.labels
+        SELECT p.id, p.name, p.city, p.role, p.umbrella_type AS member_umbrella_type, aff.labels
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
@@ -1342,7 +1345,10 @@ export function registerTools(
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const where = m.city ? ` — ${m.city}` : "";
         sections.push(`- **${m.name}**${where}${labelStr}`);
-        sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
+        // Skive A2: no link for roles whose /produsent/<slug> page 404s.
+        if (!failsProducerRoleGate(m.role, !!m.member_umbrella_type)) {
+          sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
+        }
       }
       deliver("lokal_get_umbrella_members", { umbrellaId, limit }, extra, rows.map((m: any) => m.id));
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
@@ -1933,7 +1939,10 @@ function formatAgentCompact(agent: any, idx: number, contact?: any,
 
   // Profile link
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
-  lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
+  // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+  if (!failsProducerRoleGate((agent as any).role, false)) {
+    lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
+  }
 
   return lines.join("\n");
 }

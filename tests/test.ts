@@ -45081,6 +45081,25 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-10-06 (Skive A2): agent card / llms-full role gate —
+// no canonicalUrl/links.profile/Profil-link to /produsent/<slug> pages that
+// 404 under the role gate. Own in-memory DB, real handlers off the router stacks.
+runSerial(async () => {
+  console.log("\n── Skive A2: agent-card role gate ──");
+  try {
+    const { runAgentCardRoleGateTests } = require("../src/routes/agent-card-role-gate.test") as
+      typeof import("../src/routes/agent-card-role-gate.test");
+    const acr = await runAgentCardRoleGateTests({ log: false });
+    passed += acr.passed;
+    failed += acr.failed;
+    for (const f of acr.failures) failures.push("agent-card-role-gate: " + f);
+    console.log(`  agent-card-role-gate: ${acr.passed} passed, ${acr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-card-role-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 1
 // ("Innholdsberikelse"): POST /api/opplevelser/admin/experiences-description-
 // enrichment — the source-grounded, judge-gated writer for
