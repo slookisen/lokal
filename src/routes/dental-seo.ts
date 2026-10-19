@@ -2174,7 +2174,10 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
 router.get("/om", (_req: Request, res: Response) => {
   // F2-S2: «Om plattformen» says what the code does, as the «Verifisert» text
   // on /proveniens: no continuous verification and no «uverifisert» marking
-  // (neither exists), and no claim of how often anything runs.
+  // (neither exists), and no claim of how often anything runs. A clinic
+  // without the badge gets no note about the check, but a closed one shows
+  // «Nedlagt» (the profile's header badges), so the text does not say «no
+  // other marking».
   const html = `
 <main>
   <div class="content-page">
@@ -2198,7 +2201,7 @@ router.get("/om", (_req: Request, res: Response) => {
     <p>Klinikker kan be om oppdatering eller fjerning av sin profil ved å sende e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 5 virkedager.</p>
 
     <h2>Om plattformen</h2>
-    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket settes enten manuelt eller av en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket vises uten noen annen markering. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
+    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket settes enten manuelt eller av en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket får ingen merknad om kontrollen. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
 
     <p>Søsterplattform: <a href="https://rettfrabonden.com" rel="noopener" target="_blank">rettfrabonden.com</a> — lokal mat direkte fra bønder i Norge.</p>
   </div>

@@ -67,7 +67,12 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
   // default; Brreg gives no wording of its own. Dates: the Phase-A import
   // stored none; the address sweep and the website candidate write a
   // field_provenance record with fetched_at; the verifier stamps
-  // brreg_checked_at on each lookup (applyDentalVerifierResult).
+  // brreg_checked_at on each lookup (applyDentalVerifierResult), also when
+  // Brreg gives no definite answer (orgnr_not_found_or_unreachable: not
+  // found, no response or an error), and writes NULL only for a clinic
+  // without an org.nr. (no lookup). So the date says when we asked, not that
+  // Brreg confirmed anything (and a repeat lookup in the same process can be
+  // answered from brreg-client's verifyCache).
   {
     id: "brreg",
     name_nb: "Brønnøysundregistrene",
@@ -82,8 +87,8 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
     ],
     method_nb: "Oppslag på organisasjonsnummeret i Enhetsregisteret.",
     method_en: "A lookup by organisation number in the Central Coordinating Register for Legal Entities (Enhetsregisteret).",
-    date_nb: "Det som kom med den første importen, har ingen egen dato. En adresse eller et nettsted hentet fra registeret senere lagres med hentedato. Når kontrollen slår opp enheten, lagres datoen for oppslaget.",
-    date_en: "What came with the first import has no date of its own. An address or website taken from the register later is stored with the date it was fetched. When the check looks the entity up, the date of the lookup is stored.",
+    date_nb: "Det som kom med den første importen, har ingen egen dato. En adresse eller et nettsted hentet fra registeret senere lagres med hentedato. Når kontrollen slår opp organisasjonsnummeret, lagres datoen for oppslaget, også når registeret ikke gir et sikkert svar.",
+    date_en: "What came with the first import has no date of its own. An address or website taken from the register later is stored with the date it was fetched. When the check looks up the organisation number, the date of the lookup is stored, also when the register gives no definite answer.",
     url: "https://www.brreg.no/",
     license: { name: "Norsk lisens for offentlige data (NLOD) 2.0", url: "https://data.norge.no/nlod/no/2.0" },
     attribution: "Inneholder data under Norsk lisens for offentlige data (NLOD) tilgjengeliggjort av Brønnøysundregistrene",

@@ -12,8 +12,10 @@
  *       in the field mask; Brreg's licence is NLOD 2.0 (data.brreg.no, read
  *       2026-10-19), not CC0; the Kartverket address API is CC BY 4.0
  *       (Kartkatalog, read 2026-10-19); the Kartverket postnummer licence,
- *       credit line and extract date equal the dataset's own meta; each
- *       entry has its own list label; the name sentences.
+ *       credit line and extract date equal the dataset's own meta; the
+ *       Brreg date says what the verifier stores (brreg_checked_at on every
+ *       lookup, also one Brreg gives no definite answer to); each entry has
+ *       its own list label; the name sentences.
  *   (b) the «Verifisert» text matches dental-verifier.ts: its numbers are the
  *       verifier's constants, computeDentalVerifiedRule and
  *       websiteOwnershipMatch give the badge in exactly the cases the text
@@ -54,7 +56,9 @@
  *       DENTAL_REPEAT_PARK_TO_REVIEW is on; no claim of how often anything
  *       runs.
  *   (m) /om links the method page, and «Om plattformen» no longer claims
- *       continuous verification or an «uverifisert» marking.
+ *       continuous verification or an «uverifisert» marking; it says a clinic
+ *       without the badge gets no note about the check, as the profile shows
+ *       it (not «no other marking»: a closed clinic shows «Nedlagt»).
  *
  * Harness as in dental-finn-disambiguation.test.ts: in-memory dental DB, the
  * router driven through router.handle(). dental-data-sources and
@@ -328,6 +332,46 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       : "?";
     assertTrue(!!areaFacts.formatNorwegianDate(extract) && pn!.date_nb.includes(`${areaFacts.formatNorwegianDate(extract)}.`) && pn!.date_en.includes(`${extractEn}.`),
       `a17c: the postnummer entry's date is the dataset's extract date (${extract})`, `${pn?.date_nb} / ${pn?.date_en}`);
+    // The Brreg date is the verifier's brreg_checked_at, which it stamps on
+    // every lookup, also one Brreg gives no definite answer to, and leaves
+    // NULL without an org.nr. Driven through the real verifyOrgNumber with a
+    // stubbed fetch (no network), on throwaway rows removed before the
+    // fixture below is made.
+    {
+      const brreg = byId("brreg");
+      const dates = `${brreg?.date_nb} / ${brreg?.date_en}`;
+      assertTrue(!!brreg?.date_nb.endsWith("Når kontrollen slår opp organisasjonsnummeret, lagres datoen for oppslaget, også når registeret ikke gir et sikkert svar.") &&
+        !!brreg?.date_en.endsWith("When the check looks up the organisation number, the date of the lookup is stored, also when the register gives no definite answer."),
+        "a17d: the Brreg date is the date of the check's lookup, also when Brreg gives no definite answer", dates);
+      assertTrue(!/får et sikkert svar|bare når|gets a definite answer|only when/i.test(dates), "a17e: … not only when Brreg gives a definite answer (the verifier does not work that way)", dates);
+      const NOW = "2026-10-19T08:00:00.000Z";
+      const asked: string[] = [];
+      const fetchImpl = (async (url: string) => {
+        const orgNr = String(url).split("/").pop() ?? "";
+        asked.push(orgNr);
+        if (orgNr === "918960091") {
+          return new Response(JSON.stringify({ organisasjonsnummer: orgNr, navn: "Svar Tann AS", naeringskode1: { kode: "86.230" } }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (orgNr === "918960092") return new Response("", { status: 503 });
+        throw new TypeError("fetch failed");
+      }) as unknown as typeof fetch;
+      const ids = ([["Svar Tann AS", "918960091"], ["Utilgjengelig Tann AS", "918960092"], ["Nettfeil Tann AS", "918960093"], ["Uten Orgnr Tann AS", null]] as const)
+        .map(([navn, org_nr]) => store.createDentalAgent({ navn, org_nr, poststed: "OSLO" } as any));
+      try {
+        const rows = ids.map((id) => db.prepare("SELECT * FROM dental_agents WHERE id = ?").get(id));
+        await verifier.runDentalVerifierBatch({ db, pickFn: () => rows as any, fetchImpl, now: () => Date.parse(NOW) });
+        const stored = ids.map((id) => db.prepare("SELECT brreg_status, brreg_checked_at FROM dental_agents WHERE id = ?").get(id) as { brreg_status: string | null; brreg_checked_at: string | null });
+        assertEq(asked, ["918960091", "918960092", "918960093"], "a17f control: the verifier asked Brreg for each org.nr., and for no clinic without one");
+        assertEq(stored.map((r) => [r.brreg_status, r.brreg_checked_at]), [
+          ["active", NOW],
+          ["orgnr_not_found_or_unreachable", NOW],
+          ["orgnr_not_found_or_unreachable", NOW],
+          [null, null],
+        ], "a17g control: brreg_checked_at is the lookup's date with a definite answer, with an error status and with a network error; NULL without an org.nr.");
+      } finally {
+        for (const id of ids) db.prepare("DELETE FROM dental_agents WHERE id = ?").run(id);
+      }
+    }
     // Names and sentences.
     assertEq(src.dentalSourceNames("nb"), ["Brønnøysundregistrene", "klinikkenes egne nettsider (KI-assistert uttrekk)", "Google Places", "Kartverket"],
       "a18: the names, each once (the two Kartverket datasets are one name)");
@@ -696,9 +740,16 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       }
 
       // No claim of how often anything runs, here or on /om.
-      const FREQUENCY = /kontinuerlig|daglig|ukentlig|hver (?:dag|uke|natt|time|måned)|continuous|daily|weekly|hourly|every (?:day|week|night|hour|month)/i;
+      const FREQUENCY = new RegExp([
+        "kontinuerlig", "daglig", "ukentlig", "hver (?:dag|uke|natt|time|måned)", "jevnlig", "regelmessig", "løpende", "automatisk oppdatert",
+        "continuous", "daily", "weekly", "hourly", "every (?:day|week|night|hour|month)", "regularly", "periodically", "automatically updated",
+      ].join("|"), "i");
       const omMain = (await callRoute(router, "/om")).text.match(/<main>[\s\S]*?<\/main>/)?.[0] ?? "";
       assertTrue(FREQUENCY.test("AI-agenter jobber kontinuerlig") && FREQUENCY.test("updated daily"), "l11 control: the pattern catches a frequency claim");
+      for (const claim of ["Dataene sjekkes jevnlig", "Vi kontrollerer regelmessig", "Profilene oppdateres løpende", "Data blir automatisk oppdatert",
+        "The data is checked regularly", "Profiles are refreshed periodically", "Automatically updated listings"]) {
+        assertTrue(FREQUENCY.test(claim), `l11a control: the pattern catches «${claim}»`);
+      }
       assertTrue(!FREQUENCY.test(main) && !FREQUENCY.test(omMain), "l11b: /proveniens and /om claim no frequency", (main + omMain).match(FREQUENCY)?.[0]);
 
       // The live numbers: the fixture has 3 public clinics, 2 verified, one of
@@ -757,9 +808,32 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       const platform = om.split("<h2>Om plattformen</h2>")[1]?.match(/<p>([\s\S]*?)<\/p>/)?.[1] ?? "";
       assertTrue(platform.length > 0, "m2 control: «Om plattformen» is read");
       assertTrue(!/kontinuerlig|uverifisert|tydelig merket/i.test(om), "m3: /om claims no continuous verification and no «uverifisert» marking (regression)");
-      assertTrue(platform.includes("«Verifisert»-merket settes enten manuelt eller av en regelstyrt kontroll") && platform.includes("kontrollen kjøres i dag manuelt, i små partier") &&
-        platform.includes("Klinikker uten merket vises uten noen annen markering"), "m4: «Om plattformen» says how the badge is set, as the «Verifisert» text does");
+      assertTrue(platform.includes("«Verifisert»-merket settes enten manuelt eller av en regelstyrt kontroll") && platform.includes("kontrollen kjøres i dag manuelt, i små partier"),
+        "m4: «Om plattformen» says how the badge is set, as the «Verifisert» text does");
+      assertTrue(platform.includes("Klinikker uten merket får ingen merknad om kontrollen.") && !platform.includes("uten noen annen markering"),
+        "m4b: … and that a clinic without the badge gets no note about the check (not «no other marking»: a closed clinic shows «Nedlagt»)", platform);
       assertTrue(platform.includes('<a href="/proveniens">'), "m5: … and points to the method page");
+      // As the profile shows it: no header badge and no note about the check
+      // for a clinic without the badge (the fixture's second clinic),
+      // «Nedlagt» for a closed one (a throwaway row, removed again). Only the
+      // header row is read: the page also lists other clinics, with theirs.
+      const profile = async (navn: string, orgNr: string): Promise<{ badges: string | null; main: string }> => {
+        const main = (await callRoute(router, `/klinikk/${dentalSeo.slugifyClinic(navn, orgNr)}`)).text.match(/<main[\s\S]*<\/main>/)?.[0] ?? "";
+        return { badges: main.match(/<div class="clinic-badges"[^>]*>([\s\S]*?)<\/div>/)?.[1] ?? null, main };
+      };
+      const NOT_CHECKED = /uverifisert|ikke verifisert|ikke kontrollert|unverified|not verified|not checked/i;
+      const plain = await profile("Majorstuen Tann AS", "918960002");
+      assertTrue(plain.main.includes("<h1 class=\"profile-name\">Majorstuen Tann AS</h1>") && plain.badges === "" && !NOT_CHECKED.test(plain.main),
+        "m4c control: a profile without the badge has no header badge and no note that it is not checked", `${plain.badges} ${plain.main.match(NOT_CHECKED)?.[0] ?? ""}`);
+      const closedId = store.createDentalAgent({ navn: "Nedlagt Fjord Tann AS", org_nr: "918960094", poststed: "OSLO", fylke: "Oslo" } as any);
+      try {
+        db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = 'needs_review', is_inactive = 1 WHERE id = ?").run(closedId);
+        const closed = await profile("Nedlagt Fjord Tann AS", "918960094");
+        assertTrue(!!closed.badges && /^<span class="badge"[^>]*>Nedlagt<\/span>$/.test(closed.badges),
+          "m4d control: a closed clinic's only header badge is «Nedlagt», so «no other marking» would be wrong", closed.badges ?? "no header");
+      } finally {
+        db.prepare("DELETE FROM dental_agents WHERE id = ?").run(closedId);
+      }
     }
   } catch (err: any) {
     failed++;

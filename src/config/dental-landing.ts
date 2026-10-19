@@ -48,7 +48,10 @@ export const DENTAL_LANDING_CONFIG = {
  * Each date is the last commit on main that changed the page's route handler
  * in routes/dental-seo.ts (the handler text compared across all 58 commits
  * that touched the file up to 114fe2ad, 2026-10-17). The handlers interpolate
- * no data, so that is the day their text last changed.
+ * no clinic data, except the two live numbers on /proveniens (F2-S2: the
+ * clinics in the directory and those with the «Verifisert» badge, from the
+ * caches). The numbers are not a change of the page's text and do not move
+ * its <lastmod>, so the date stays the day the text last changed.
  */
 export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   // F2-S1 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
