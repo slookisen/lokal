@@ -36179,6 +36179,23 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental regionord (D3f): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S-EN): English
+  //    time and filler words («care», «tonight») are stopwords, not a clinic
+  //    name, alike in MCP, A2A and /sok; Norwegian queries parse as before ──
+  console.log("\n── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S-EN): dental engelske fyllord ──");
+  try {
+    const { runDentalSearchEngelskeFyllordTests } = require("../src/routes/dental-search-engelske-fyllord.test") as
+      typeof import("../src/routes/dental-search-engelske-fyllord.test");
+    const dsen = await runDentalSearchEngelskeFyllordTests({ log: false });
+    passed += dsen.passed;
+    failed += dsen.failed;
+    for (const f of dsen.failures) failures.push("dental engelske fyllord (S-EN): " + f);
+    console.log(`  dental engelske fyllord (S-EN): ${dsen.passed} passed, ${dsen.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental engelske fyllord (S-EN): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
   //    places-treffvakt (A4-D): an address, phone, website or opening hours
   //    only Google Places gives (or marked wrong) is shown on no public
