@@ -18822,19 +18822,21 @@ export function computeGardssalgOutreachSendEligibility(
     // 2026-08-20); a hit on domain / website / org_nr is the Druehagen case —
     // two addresses, one producer — and BLOCKS, reported with `match`.
     if (!rfbSendIndex) rfbSendIndex = getRfbSendIndexForOpplevagent(getRfbDb(), cooldownCutoff);
-    const crossFound = rfbSendIndex.find(
-      buildCrossPlatformIdentity({ email, website: providerRow?.hjemmeside, orgNr: providerRow?.org_nr }),
-    );
-    if (crossFound && crossFound.match !== "email") {
+    const crossIdentity = buildCrossPlatformIdentity({ email, website: providerRow?.hjemmeside, orgNr: providerRow?.org_nr });
+    const crossFound = rfbSendIndex.find(crossIdentity);
+    // The producer-level lookup skips the exact-address key, so a same-address row (e.g. our own
+    // mirrored send) cannot shadow a domain / website / org.nr hit from a different row.
+    const crossBlock = rfbSendIndex.findProducerMatch(crossIdentity);
+    if (crossBlock) {
       out.push({
         provider_id: providerId,
         eligible: false,
         status: "skipped",
         reason: "cooldown_suppressed",
-        last_sent_at: crossFound.hit.last_sent_at,
-        suppressed_by: crossFound.hit.vertical_id,
+        last_sent_at: crossBlock.hit.last_sent_at,
+        suppressed_by: crossBlock.hit.vertical_id,
         cross_platform: true,
-        match: crossFound.match,
+        match: crossBlock.match,
       });
       continue;
     }

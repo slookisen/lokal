@@ -126,6 +126,15 @@ export function runCrossPlatformMatchTests(): TestSummary {
     const idx2 = getRfbSendIndexForOpplevagent(rfbDb, cutoff);
     eq(idx2.find(buildCrossPlatformIdentity({ email: "kontakt@egen-lane.no" }))?.match, "email", "ac1i: own-lane row still matches by address");
     eq(idx2.find(buildCrossPlatformIdentity({ email: "annen@egen-lane.no" })), undefined, "ac1j: own-lane row never widens to domain");
+    // Druehagen shadow case: own-lane row on eventer@ must not hide the RFB row on post@.
+    rfbDb
+      .prepare(`INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, vertical_id) VALUES ('a-drue', 'eventer@druehagen.no', ?, 'experiences')`)
+      .run(nowIso);
+    const idx3 = getRfbSendIndexForOpplevagent(rfbDb, cutoff);
+    const druId = buildCrossPlatformIdentity({ email: "eventer@druehagen.no" });
+    eq(idx3.find(druId)?.match, "email", "ac1k: exact-address lookup still sees the own-lane row");
+    eq(idx3.findProducerMatch(druId)?.match, "domain", "ac1l: producer lookup skips the address key and finds the RFB domain hit");
+    eq(idx3.findProducerMatch(druId)?.hit.vertical_id, "rfb", "ac1m: the producer hit is the RFB row");
     rfbDb.close();
   }
 

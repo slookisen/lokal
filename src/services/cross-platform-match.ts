@@ -179,6 +179,12 @@ export class CrossPlatformIndex<T extends { last_sent_at: string }> {
     return undefined;
   }
 
+  /** Like find(), but ignores the exact-address key: a same-address row must not shadow a
+   *  domain / website / org.nr hit from another row (Druehagen: eventer@ own-lane row hid post@). */
+  findProducerMatch(identity: CrossPlatformIdentity): { match: CrossPlatformMatch; hit: T } | undefined {
+    return this.find({ ...identity, email: null });
+  }
+
   get size(): number {
     return this.byEmail.size + this.byDomain.size + this.byWebsite.size + this.byOrgNr.size;
   }
