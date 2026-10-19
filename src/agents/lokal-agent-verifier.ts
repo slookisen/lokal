@@ -35,6 +35,8 @@ import {
   registrableDomain,
   coerceProvenanceToArrayShape,
   FREE_MAIL_DOMAINS,
+  domainsEquivalent,
+  collapseDomain,
   type FieldName,
   type ProvenanceRecord,
   type CrossSourceResult,
@@ -97,6 +99,9 @@ export interface VerifierResult {
   new_enrichment_status: string;
   outreach_eligible_at: string | null;
   cross_source_reason: Record<string, unknown>;
+  // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld: set to
+  // "cross_tld_homepage" when email_own_domain passed only via that branch.
+  email_own_domain_via?: "cross_tld_homepage";
   // PR-21 / WO-19: link-freshness probe outcome
   url_last_probed: string | null;
   url_last_status: number | null;
@@ -324,6 +329,44 @@ export async function probeAgentUrl(
 // problem in practice; not needed for this fix.
 export type BrregFn = (name: string, city: string | null) => Promise<BrregLookupResult | null>;
 
+// Same brand on another TLD: domainsEquivalent (shared rule) AND an identical
+// hyphen-stripped registrable label. The extra label check is deliberately
+// stricter than domainsEquivalent, which also accepts fuzzy brand variants
+// (substring/edit distance: knattenfrukt.com ~ knatten-frukt-salg.no). For
+// this gate branch that fuzziness is too loose, so those stay a mismatch.
+function sameBrandAcrossTld(a: string, b: string): boolean {
+  const ra = registrableDomain(a);
+  const rb = registrableDomain(b);
+  if (!domainsEquivalent(ra, rb)) return false;
+  const label = (r: string) => collapseDomain(r.split(".")[0] ?? r);
+  return label(ra) === label(rb);
+}
+
+// True iff field_provenance.email holds a "homepage" record for exactly this
+// email whose source_url host equals (or is domainsEquivalent to) the site host.
+// Not hasHomepageEvidence (cross-source-validator): that helper is looser on
+// the host (any host under the agent's URL root counts), which is fine for the
+// free-mail ownership guard but too permissive for a rule that relaxes the
+// email-domain check, so this one pins the host to the site explicitly.
+function hasOwnSiteHomepageEmailProvenance(raw: unknown, email: string, websiteHost: string): boolean {
+  try {
+    let obj: unknown = raw;
+    if (typeof obj === "string") obj = JSON.parse(obj);
+    if (!obj || typeof obj !== "object") return false;
+    const recs = coerceProvenanceToArrayShape(obj as Record<string, unknown>).email;
+    if (!Array.isArray(recs)) return false;
+    const want = email.trim().toLowerCase();
+    return recs.some((r) => {
+      if (!r || r.source_type !== "homepage" || typeof r.value !== "string") return false;
+      if (r.value.trim().toLowerCase() !== want) return false;
+      const srcHost = hostnameFromUrl(r.source_url);
+      return !!srcHost && (srcHost === websiteHost || sameBrandAcrossTld(srcHost, websiteHost));
+    });
+  } catch {
+    return false;
+  }
+}
+
 // Compute kvalitets-gate from observed signals. Pure function for testability.
 export function computeKvalitetsGate(input: {
   http_status: number | null;
@@ -333,10 +376,17 @@ export function computeKvalitetsGate(input: {
   products: unknown[];
   brreg: BrregLookupResult | null;
   nace_blacklist?: readonly string[];
+  // Optional: agent_knowledge.field_provenance (JSON string or parsed object).
+  // Only read by the cross-TLD branch of email_own_domain; omitted/unparsable
+  // provenance means that branch never fires (fail-closed).
+  field_provenance?: unknown;
 }): {
   passes: boolean;
   flags: string[];
   reasons: Record<string, boolean>;
+  // Informational only. Deliberately NOT a key in `reasons`: callers derive
+  // fields_verified/fields_failed and `passes` from Object.entries(reasons).
+  email_own_domain_via?: "cross_tld_homepage";
 } {
   const flags: string[] = [];
   const blacklist = input.nace_blacklist ?? NACE_BLACKLIST;
@@ -368,8 +418,24 @@ export function computeKvalitetsGate(input: {
   const eDom = emailDomain(input.email);
   const emailMatchesSite = !!(websiteHost && eDom && (eDom === websiteHost || eDom.endsWith("." + websiteHost) || websiteHost.endsWith("." + eDom)));
   const isFreeMail = !!(eDom && FREE_MAIL_DOMAINS.includes(eDom));
-  const email_own_domain = emailMatchesSite || isFreeMail;
-  if (input.email && !emailMatchesSite && !isFreeMail) flags.push("email_domain_mismatch");
+  //
+  // Cross-TLD same-brand branch (dev-request
+  // 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld): knattenfrukt.no
+  // address on a knattenfrukt.com site. Accepted ONLY when domainsEquivalent
+  // (the same rule domainCoherenceCheck uses) holds AND field_provenance.email
+  // has a "homepage" record whose value equals this email (case-insensitive)
+  // and whose source_url host is the site's host (or equivalent) — i.e. the
+  // address was actually published on the producer's own site, which is what
+  // keeps a look-alike domain owned by someone else out. No provenance, wrong
+  // value or a foreign source_url host: unchanged email_domain_mismatch.
+  let email_own_domain_via: "cross_tld_homepage" | undefined;
+  if (!emailMatchesSite && !isFreeMail && websiteHost && eDom && input.email
+      && sameBrandAcrossTld(eDom, websiteHost)
+      && hasOwnSiteHomepageEmailProvenance(input.field_provenance, input.email, websiteHost)) {
+    email_own_domain_via = "cross_tld_homepage";
+  }
+  const email_own_domain = emailMatchesSite || isFreeMail || !!email_own_domain_via;
+  if (input.email && !email_own_domain) flags.push("email_domain_mismatch");
 
   // no_wrong_fit (NACE-blacklist)
   let no_wrong_fit = true;
@@ -403,7 +469,7 @@ export function computeKvalitetsGate(input: {
 
   const reasons = { website_ok, email_own_domain, no_wrong_fit, brreg_active, content_threshold };
   const passes = Object.values(reasons).every((v) => v);
-  return { passes, flags, reasons };
+  return email_own_domain_via ? { passes, flags, reasons, email_own_domain_via } : { passes, flags, reasons };
 }
 
 // Compute enrichment_status from content depth. Pure function.
@@ -2293,6 +2359,7 @@ export async function runVerifierBatch(opts: {
       about: agent.about,
       products,
       brreg,
+      field_provenance: agent.field_provenance,
     });
 
     // ── Cross-source gate (Phase 5.3 / WO-16) ───────────────────────────────
@@ -2341,6 +2408,16 @@ export async function runVerifierBatch(opts: {
     const inferenceOnlyFields = factualFieldsWithOnlyInference(fieldProv);
     for (const f of inferenceOnlyFields) {
       gate.flags.push(`inference_only_field:${f}`);
+    }
+
+    // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld
+    // (Endring 3): persist the "passed only via the cross-TLD homepage branch"
+    // marker onto the stored verdict, same pattern as the markers below, so
+    // /admin/pool-blocker-explain and reviewers can see why the row got in and
+    // AC3 can be counted. Deliberately NOT in gate.reasons/gate.flags: it is
+    // informational and must not change passes or fields_verified/failed.
+    if (gate.email_own_domain_via) {
+      (crossSourceResults as Record<string, unknown>).email_own_domain_via = "cross_tld_homepage";
     }
 
     // ── Guard #1 (verifier side): website-ownership marker (orch-pr-16) ───────
@@ -2820,6 +2897,7 @@ export async function runVerifierBatch(opts: {
       new_enrichment_status: newEnrichment,
       outreach_eligible_at: eligibleAt,
       cross_source_reason: crossSourceResults,
+      ...(gate.email_own_domain_via ? { email_own_domain_via: gate.email_own_domain_via } : {}),
       url_last_probed: probeResult ? startedAt : null,
       url_last_status: probeResult ? probeResult.status : null,
       url_demoted: urlDemoted,
@@ -2911,6 +2989,10 @@ export function buildRunEnvelope(input: {
     (x) => x.new_verification_status === "verified" && x.prior_verification_status === "verified"
   ).length;
   const paraplyBlocked = r.filter((x) => x.new_verification_status === "paraply_epost_mangler").length;
+  // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld (AC3):
+  // rows whose email_own_domain passed only via the cross-TLD homepage branch.
+  // The claim is always emitted (value 0 when none), like the other counters.
+  const emailCrossTldHomepage = r.filter((x) => x.email_own_domain_via === "cross_tld_homepage");
   // dev-request 2026-08-23-terminal-unconfirmable: always 0 when
   // RFB_TERMINAL_UNCONFIRMABLE_ENABLED is off. Lets the daily brief see how
   // many agents this run permanently removed from the hourly sweep.
@@ -2962,6 +3044,14 @@ export function buildRunEnvelope(input: {
       },
       { type: "db_state_change", value: verifiedDemoted, meta: { kind: "verified_demoted" } },
       { type: "db_state_change", value: paraplyBlocked, meta: { kind: "agents_paraply_epost_mangler" } },
+      {
+        type: "db_state_change",
+        value: emailCrossTldHomepage.length,
+        meta: {
+          kind: "agents_email_cross_tld_homepage",
+          examples: emailCrossTldHomepage.slice(0, 5).map((x) => x.agent_id),
+        },
+      },
       { type: "db_state_change", value: terminalUnconfirmable, meta: { kind: "agents_terminal_unconfirmable" } },
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]

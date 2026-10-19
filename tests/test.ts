@@ -3206,6 +3206,38 @@ console.log("── human-visits strip: referral classification + aggregation �
   assertTrue(!gateEmailMatch.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: matching email (post@gard.no on gard.no) → no flag");
   assertTrue(gateEmailMatch.passes, "orch-pr-20260614-4: matching email still passes gate");
 
+  // Test 5f: cross-TLD same-brand (dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld)
+  {
+    const base = {
+      http_status: 200,
+      website: "https://www.knattenfrukt.com",
+      about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+      products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+      brreg: null,
+    };
+    const prov = (value: string, url: string, st = "homepage") => ({ email: [{ value, source_type: st, source_url: url, fetched_at: "2026-10-01T16:00:00Z" }] });
+    const okProv = prov("Nils@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/");
+    const g1 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: okProv });
+    assertTrue(g1.passes && !g1.flags.includes("email_domain_mismatch"), "cross-tld: .no email + .com site + homepage provenance → passes");
+    assertEq(g1.email_own_domain_via, "cross_tld_homepage", "cross-tld: via marker set");
+    const g1s = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: JSON.stringify(okProv) });
+    assertTrue(g1s.passes, "cross-tld: provenance as JSON string works");
+    const g2 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no" });
+    assertTrue(g2.flags.includes("email_domain_mismatch") && !g2.passes && g2.email_own_domain_via === undefined, "cross-tld: no provenance → mismatch");
+    const g3 = computeKvalitetsGate({ ...base, email: "nils@knatten-frukt-salg.no", field_provenance: prov("nils@knatten-frukt-salg.no", "https://www.knattenfrukt.com/kontakt/") });
+    assertTrue(g3.flags.includes("email_domain_mismatch") && !g3.passes, "cross-tld: different brand → mismatch even with provenance");
+    const g4 = computeKvalitetsGate({ ...base, email: "post@gmail.com" });
+    assertTrue(g4.passes && g4.email_own_domain_via === undefined, "cross-tld: free-mail unchanged, no via marker");
+    const g5 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("annen@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/") });
+    assertTrue(g5.flags.includes("email_domain_mismatch"), "cross-tld: provenance with wrong email value → mismatch");
+    const g6 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("nils@knattenfrukt.no", "https://annenside.no/kontakt/") });
+    assertTrue(g6.flags.includes("email_domain_mismatch"), "cross-tld: provenance with foreign source_url host → mismatch");
+    const g7 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("nils@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/", "harvest_contact_email") });
+    assertTrue(g7.flags.includes("email_domain_mismatch"), "cross-tld: non-homepage source_type → mismatch");
+    const g8 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: "{not json" });
+    assertTrue(g8.flags.includes("email_domain_mismatch"), "cross-tld: unparsable provenance → mismatch (fail-closed)");
+  }
+
   // Test 5e: no-email case unchanged — email_own_domain=false, gate fails
   const gateNoEmail = computeKvalitetsGate({
     http_status: 200,
@@ -36784,6 +36816,13 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
     failed += eop.failed;
     for (const f of eop.failures) failures.push("email-ownership-provenance: " + f);
     console.log(`  email-ownership-provenance: ${eop.passed} passed, ${eop.failed} failed`);
+    const { runLokalAgentVerifierEmailCrossTldMarkerTests } = require("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test") as
+      typeof import("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test");
+    const ctm = await runLokalAgentVerifierEmailCrossTldMarkerTests({ log: false });
+    passed += ctm.passed;
+    failed += ctm.failed;
+    for (const f of ctm.failures) failures.push("email-cross-tld-marker: " + f);
+    console.log(`  email-cross-tld-marker: ${ctm.passed} passed, ${ctm.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("email-ownership-provenance: unexpected error: " + String(err?.message || err));
