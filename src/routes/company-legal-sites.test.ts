@@ -23,7 +23,9 @@
  *             Daniel approves the text): one canonical, NO + EN, the health
  *             wording (no medical advice, 113 / 116 117, «som de er», clinics'
  *             corrections), the FINN.no sentence, no HPR/NTF claim, the
- *             footer link, the sitemap and ai-plugin.json legal_info_url.
+ *             footer link, the sitemap and ai-plugin.json legal_info_url;
+ *             the effective date 2026-10-19, the day Daniel approved the
+ *             text (NO, EN and the sitemap <lastmod>).
  *   T2        site Organization JSON-LD carries parentOrganization.
  *   T3        agent-card provider (+ MCP server-card vendor, agent-skills
  *             provider) is Agentplatform.no AS; the cards keep their brand name.
@@ -426,6 +428,19 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       check(sitemap.body.split("<loc>https://finn-tannlege.com/vilkar</loc>").length === 2, "F2-S5 sitemap.xml: lists /vilkar once");
       check(!/<loc>https:\/\/finn-tannlege\.com\/(terms|terms-of-service|tos)<\/loc>/.test(sitemap.body), "F2-S5 sitemap.xml: the aliases are not listed");
       check(BRAND_ENTITIES.dental.termsUrl === "https://finn-tannlege.com/vilkar", "F2-S5 brand-entities: BRAND_ENTITIES.dental.termsUrl is /vilkar", String(BRAND_ENTITIES.dental.termsUrl));
+
+      // The terms take effect the day Daniel approved the text, 2026-10-19
+      // (A2A daniel-responses/2026-10-19-live-svar-steg-a-og-vilkar.md). Pinned
+      // here as a literal: a new date means new terms, and Daniel's approval.
+      const EFFECTIVE = "2026-10-19";
+      const { DENTAL_STATIC_PAGE_DATES } = require("../config/dental-landing") as typeof import("../config/dental-landing");
+      check(DENTAL_STATIC_PAGE_DATES["/vilkar"] === EFFECTIVE, `F2-S5 DENTAL_STATIC_PAGE_DATES["/vilkar"] is ${EFFECTIVE}`, String(DENTAL_STATIC_PAGE_DATES["/vilkar"]));
+      const shownNb = Array.from(nb.matchAll(/Sist oppdatert: ([^<]*)<\/p>/g), (m) => m[1]);
+      const shownEn = Array.from(en.matchAll(/Last updated: ([^<]*)<\/p>/g), (m) => m[1]);
+      check(JSON.stringify(shownNb) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar NO: «Sist oppdatert: ${EFFECTIVE}», once`, shownNb.join(", "));
+      check(JSON.stringify(shownEn) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar EN: «Last updated: ${EFFECTIVE}», once`, shownEn.join(", "));
+      const vilkarLastmod = sitemap.body.match(/<loc>https:\/\/finn-tannlege\.com\/vilkar<\/loc><lastmod>([^<]*)<\/lastmod>/)?.[1];
+      check(vilkarLastmod === EFFECTIVE, `F2-S5 sitemap.xml: /vilkar <lastmod> is ${EFFECTIVE}`, String(vilkarLastmod));
     }
 
     // ═══════════════ AC3 / AC4 — forbidden phrases on every page fetched ═══════════════
