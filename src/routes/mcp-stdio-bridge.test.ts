@@ -1,6 +1,7 @@
 /**
- * mcp-stdio-bridge.test.ts — dev-request 2026-10-16-distribusjon-synk, slices G1-S2a (dental) and G1-S2b
- * (lokal-mcp 0.5.0 = rfb, opplevagent-mcp 0.4.0 = experiences).
+ * mcp-stdio-bridge.test.ts — dev-request 2026-10-16-distribusjon-synk, slices G1-S2a (dental), G1-S2b
+ * (lokal-mcp 0.5.0 = rfb, opplevagent-mcp 0.4.0 = experiences) and G1-S2c (finn-tannlege-mcp 0.2.1, which ships
+ * the shared bridge that exits on stdin EOF; npm already has 0.2.0 with the first bridge).
  *
  * The npm packages finn-tannlege-mcp, lokal-mcp and opplevagent-mcp are thin stdio bridges to their remote /mcp.
  * For each of them this test runs the REAL package entry (`node <package>/index.js`) over stdio against the REAL
@@ -18,12 +19,14 @@
  *     persistent 404 is returned as an error without looping; a failing re-init is not retried forever
  *   - stdout carries only JSON-RPC (logs go to stderr), and the process exits when stdin reaches EOF
  *   - package.json/server.json/manifest versions and `files` shipping the bridge
+ *   - `npm pack --dry-run` ships <package>@<version> with exactly the 5 files every bridge package has
  *
  * Exported runMcpStdioBridgeTests({log}) -> TestSummary; wired into tests/test.ts.
  * Standalone: npx tsx src/routes/mcp-stdio-bridge.test.ts
  */
 import Database from "better-sqlite3";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as http from "http";
 import { spawn, execFileSync } from "child_process";
@@ -149,6 +152,19 @@ const SCENARIOS: Scenario[] = [
   },
 ];
 
+/** What every bridge package ships to npm (finn-tannlege-mcp 0.2.0 on npm has exactly these). */
+const PACKED_FILES = ["README.md", "index.js", "package.json", "server.json", "stdio-bridge.js"];
+
+/** What `npm publish` would ship: `npm pack --dry-run --json` (offline, no tarball written, no lifecycle scripts). */
+function npmPackDryRun(pkgDir: string): { id: string; files: string[] } {
+  const out = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+    cwd: path.resolve(ROOT, pkgDir), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000,
+    env: { ...process.env, npm_config_update_notifier: "false" },
+  });
+  const [pack] = JSON.parse(out);
+  return { id: String(pack.id), files: pack.files.map((f: { path: string }) => f.path).sort() };
+}
+
 /** Spawns the real package over raw pipes: stdout must be JSON-RPC only, and EOF on stdin must end the process. */
 async function rawStdioSession(entry: string, env: Record<string, string>, beforeCall: () => void) {
   const child = spawn(process.execPath, [entry], { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -200,11 +216,17 @@ export async function runMcpStdioBridgeTests(opts: { log?: boolean } = {}): Prom
       shared.equals(fs.readFileSync(path.join(ROOT, sc.pkgDir, "stdio-bridge.js"))));
     const pkg = JSON.parse(read(`${sc.pkgDir}/package.json`));
     const sj = JSON.parse(read(`${sc.pkgDir}/server.json`));
-    const version = { dental: "0.2.0", rfb: "0.5.0", experiences: "0.4.0" }[id];
+    const version = { dental: "0.2.1", rfb: "0.5.0", experiences: "0.4.0" }[id];
     check(`${id}-bridge-2 package.json + server.json are ${version} (both places in server.json)`,
       pkg.version === version && sj.version === version && sj.packages[0].version === version, `${pkg.version}/${sj.version}`);
     check(`${id}-bridge-3 package.json files ships index.js + stdio-bridge.js`,
       pkg.files.includes("index.js") && pkg.files.includes("stdio-bridge.js"));
+    let packed: { id: string; files: string[] } | null = null;
+    let packErr = "";
+    try { packed = npmPackDryRun(sc.pkgDir); } catch (e: any) { packErr = String(e?.stderr || e?.message || e).slice(0, 200); }
+    check(`${id}-bridge-3b npm pack --dry-run ships ${sc.packageName}@${version} with exactly ${PACKED_FILES.join(", ")}`,
+      packed?.id === `${sc.packageName}@${version}` && JSON.stringify(packed.files) === JSON.stringify(PACKED_FILES),
+      packed ? `${packed.id}: ${packed.files.join(", ")}` : packErr);
     check(`${id}-bridge-4 sdk ^1.29 and no zod dependency`,
       /^\^1\.29/.test(pkg.dependencies["@modelcontextprotocol/sdk"]) && !pkg.dependencies.zod);
     const entry = read(`${sc.pkgDir}/index.js`);
@@ -213,6 +235,20 @@ export async function runMcpStdioBridgeTests(opts: { log?: boolean } = {}): Prom
     check(`${id}-bridge-5b server.json declares ${sc.urlEnv}`,
       (sj.packages[0].environmentVariables || []).some((e: any) => e.name === sc.urlEnv));
   }
+  // Control for bridge-3b: npm skips a missing `files` entry without an error, so only the exact list catches it.
+  const withoutBridge = PACKED_FILES.filter((f) => f !== "stdio-bridge.js");
+  const noBridge = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-stdio-bridge-pack-"));
+  let controlFiles = "";
+  try {
+    for (const f of withoutBridge) fs.copyFileSync(path.join(ROOT, "mcp-server-dental", f), path.join(noBridge, f));
+    controlFiles = JSON.stringify(npmPackDryRun(noBridge).files);
+  } catch (e: any) {
+    controlFiles = String(e?.stderr || e?.message || e).slice(0, 200);
+  } finally {
+    fs.rmSync(noBridge, { recursive: true, force: true });
+  }
+  check("bridge-3c control: npm packs a package missing stdio-bridge.js without an error (4 files), so only bridge-3b's exact list catches it",
+    controlFiles === JSON.stringify(withoutBridge), controlFiles);
   check("bridge-6 no '6,900' claim in dental package text",
     !/6[,. ]?900/.test(read("mcp-server-dental/README.md") + read("mcp-server-dental/index.js")
       + read("mcp-server-dental/package.json") + read("mcp-server-dental/server.json")));
