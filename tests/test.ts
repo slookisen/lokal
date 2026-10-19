@@ -33575,6 +33575,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esvmt.failures) failures.push("experiences-seo-visning-mcp-tilbyder: " + f);
     console.log(`  experiences-seo-visning-mcp-tilbyder: ${esvmt.passed} passed, ${esvmt.failed} failed`);
 
+    // S2 of the same dev-request (reviewer follow-ups): MCP phone wash,
+    // booking_url validation, /en out of sitemap with the flag off, neutral gsMeta.
+    console.log("\n── experiences-visning-s2: reviewer follow-ups ──");
+    const { runExperiencesVisningS2Tests } = require("../src/routes/experiences-visning-s2.test") as
+      typeof import("../src/routes/experiences-visning-s2.test");
+    const evs2 = await runExperiencesVisningS2Tests({ log: false });
+    passed += evs2.passed;
+    failed += evs2.failed;
+    for (const f of evs2.failures) failures.push("experiences-visning-s2: " + f);
+    console.log(`  experiences-visning-s2: ${evs2.passed} passed, ${evs2.failed} failed`);
+
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
     // arbeidspunkt 5: gårdssalg produsent-profil template render-guards —
     // drivingSted() adjacent-duplicate collapse, the new
