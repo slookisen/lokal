@@ -1671,7 +1671,11 @@ router.post(
             /* tolerate junk */
           }
         }
-        patch.field_provenance = mergeFieldProvenance(existingProv, incomingProv);
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: the
+        // audit entries other routes write here (`inactive`, the hjemmeside
+        // cleanup's, the offentlig klinikk correction's `directory_url`) are
+        // kept as stored, as in the dental PUT (keepAuditEntries).
+        patch.field_provenance = mergeFieldProvenance(existingProv, incomingProv, { keepAuditEntries: true });
       }
 
       // ── Apply (single updateDentalAgent call) unless dry-run ─────────

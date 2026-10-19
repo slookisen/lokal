@@ -36,9 +36,10 @@
 //   - A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d: an
 //     incoming source with a `quote` replaces the stored sources with the
 //     same pair instead (see mergeFieldProvenance).
-//   - Same dev-request, F1-S4f: with `keepAuditEntries` (the dental PUT), an
-//     entry other routes write on purpose that is not a source (`inactive`,
-//     the hjemmeside cleanup's) is kept as stored (see mergeFieldProvenance).
+//   - Same dev-request, F1-S4f: with `keepAuditEntries` (the dental writers:
+//     the PUT, the Places batch and Stage V's correction), an entry other
+//     routes write on purpose that is not a source (`inactive`, the
+//     hjemmeside cleanup's) is kept as stored (see mergeFieldProvenance).
 //   - Untouched fields preserve existing provenance.
 //   - Untouched columns (about, products, ...) preserve existing values.
 //
@@ -323,8 +324,12 @@ export type MergedProvenanceEntry = Array<ProvenanceRecord | ProvenanceAuditEntr
  * removed, so the list does not grow and only the newest source for a key
  * has a quote. An incoming source without a quote is a duplicate as before.
  *
- * F1-S4f (same dev-request): with `keepAuditEntries` (the dental PUT; every
- * other caller leaves it out and gets the merge above unchanged), an audit
+ * F1-S4f (same dev-request): with `keepAuditEntries` (the dental writers:
+ * the PUT and the Places batch in dental.ts and Stage V's correction in
+ * dental-store.ts; every other caller leaves it out and gets the merge above
+ * unchanged, the RFB/knowledge ones and the dental legacy-shape normalize in
+ * admin-agent-audit.ts among them, which only rewrites a {sources} wrapper
+ * and never sees an audit entry), an audit
  * entry (isProvenanceAuditEntry) is kept as stored, as a field's entry or as
  * an element of its list, where the merge above would make it `[]` or drop
  * it. When sources come in for a field whose entry is an audit entry (in

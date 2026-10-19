@@ -20,10 +20,21 @@
  *       a PUT with field_provenance for other fields and for their own
  *       field; the public answer, the Places rule, the provenance summary and
  *       the akutt claim and its SQL twins are as for a row without them.
+ *   S   Stage V's correction (POST /admin/stage-v-drift-result →
+ *       recordStageVFieldObservation, dental-store.ts) and
+ *   P   the Places batch (POST /admin/google-places-batch, dental.ts), the
+ *       other two dental writers that merge the column: the audit entries,
+ *       also the PUT's list with the cleanup's entry first, survive byte for
+ *       byte, and the writer's own sources are stored as on a row without
+ *       them.
+ *   N   (lock) the dental legacy-shape normalize (admin-agent-audit.ts)
+ *       merges without the option: it only rewrites a {sources} wrapper, so
+ *       the audit entries next to one stay as stored.
  *
  * Setup mirrors dental-agent-put-acute-vakt-quote.test.ts: a fresh in-memory
  * dental DB (DENTAL_DB_PATH=":memory:"), fresh requires through
- * swapOutModules, and the router exercised with router.handle().
+ * swapOutModules, and the router exercised with router.handle(). The Places
+ * batch gets a mocked global fetch (no network) and a test Places key.
  *
  * Standalone: npx tsx src/routes/dental-agent-put-audit-entries.test.ts
  * Wired into tests/test.ts via runDentalAgentPutAuditEntriesTests().
@@ -122,6 +133,8 @@ export async function runDentalAgentPutAuditEntriesTests(opts: { log?: boolean }
   const prevDentalPath = process.env.DENTAL_DB_PATH;
   const prevAdminKey = process.env.ADMIN_KEY;
   const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+  const prevPlacesKey = process.env.GOOGLE_PLACES_API_KEY;
+  const prevFetch = (globalThis as any).fetch;
   const testKey = process.env.ADMIN_KEY || "dental-put-audit-entries-test-key";
   process.env.DENTAL_DB_PATH = ":memory:";
   process.env.ADMIN_KEY = testKey;
@@ -130,6 +143,7 @@ export async function runDentalAgentPutAuditEntriesTests(opts: { log?: boolean }
     require.resolve("../database/db-factory"),
     require.resolve("../services/dental-store"),
     require.resolve("./dental"),
+    require.resolve("./admin-agent-audit"),
   ]);
 
   try {
@@ -382,6 +396,119 @@ export async function runDentalAgentPutAuditEntriesTests(opts: { log?: boolean }
       ok(resolveAcuteClaim(store.getDentalAgentById(audited) as any) === "accepts" && resolveAcuteClaim(store.getDentalAgentById(control) as any) === "accepts",
         "U20: ... as does the card's claim («Tar imot akuttpasienter»)");
     }
+
+    // ── S and P: the other two dental writers ─────────────────────────────
+    const AUDIT_KEYS = ["inactive", "hjemmeside", "directory_url"];
+    const korrigeringSource = {
+      source_type: "brreg_registered_website", value: "https://ny.example.no", source_url: "https://ny.example.no",
+      replaced_offentlig_klinikk_host: "https://kommune.example.no", fetched_at: "2026-10-03T10:00:00.000Z",
+    };
+    // All three audit entries, each written by its own route's helper (the
+    // correction first, so the cleanup's hjemmeside entry is the one left).
+    const allAudit = (base: Record<string, unknown>) =>
+      mergeHjemmesideCleanupProvenance(
+        mergeInactiveProvenance(mergeOffentligKlinikkKorrigeringProvenance(JSON.stringify(base), directoryUrl, korrigeringSource), inactive),
+        hjemmeside,
+      );
+    // The writer's own sources carry the time of the run: compare them without it.
+    const runStamped = (v: unknown, types: string[]) =>
+      JSON.parse(JSON.stringify(v, (_key, x) =>
+        x && typeof x === "object" && !Array.isArray(x) && types.includes(x.source_type) && typeof x.fetched_at === "string" ? { ...x, fetched_at: "<run>" } : x));
+    const withoutAudit = (p: Record<string, unknown>) => Object.fromEntries(Object.entries(p).filter(([k]) => !AUDIT_KEYS.includes(k)));
+    const post = (path: string, body: unknown) => callRoute(dentalRouter, { method: "POST", path, headers: { "x-admin-key": testKey }, body });
+    const ownSite = { source_type: "own_homepage", value: "https://ny-klinikk.example.no", fetched_at: "2026-10-18T00:00:00Z", source_url: "https://ny-klinikk.example.no" };
+    // The PUT's list for hjemmeside on a cleaned row: the cleanup's entry first, then the source.
+    const putConflictRow = async (label: string, navn: string, base: Record<string, unknown>) => {
+      const id = mk(navn, auditColumn(base));
+      const r = await put(id, { hjemmeside: ownSite.value, field_provenance: { hjemmeside: [ownSite] } });
+      ok(r.status === 200, `${label}: setup, PUT hjemmeside with a source on a cleaned row -> 200 (${r.status})`);
+      auditFirst(prov(id).hjemmeside, hjemmeside, [ownSite], `${label}: setup, the PUT stored [the cleanup's entry, the source] for hjemmeside`);
+      return id;
+    };
+
+    // S0–S7: Stage V's correction (two matching contradictions → helfo_agreement corrected).
+    {
+      const helfoProv = [{ source_type: "own_homepage", value: "true", fetched_at: "2026-08-01T00:00:00Z", source_url: "https://klinikk.example.no/helfo" }];
+      const base = { telefon: telefonProv, helfo_agreement: helfoProv };
+      const audited = mk("Revisjon Stage V Tannklinikk AS", allAudit(base));
+      const control = mk("Kontroll Stage V Tannklinikk AS", base);
+      const conflict = await putConflictRow("S0", "Revisjon Stage V Liste Tannklinikk AS", base);
+      const conflictBefore = JSON.stringify(prov(conflict).hjemmeside);
+      const observe = (id: string) => post("/admin/stage-v-drift-result", { agentId: id, field: "helfo_agreement", value: "false" });
+      const corrected: boolean[] = [];
+      for (const id of [audited, control, conflict]) {
+        db.prepare("UPDATE dental_agents SET helfo_agreement = 'true' WHERE id = ?").run(id);
+        const first = await observe(id);
+        const second = await observe(id);
+        corrected.push(first.status === 200 && first.body?.pending === true && second.status === 200 && second.body?.corrected === true);
+      }
+      ok(corrected.every(Boolean), `S1: Stage V corrects helfo_agreement on all three rows (${JSON.stringify(corrected)})`);
+      const pA = prov(audited);
+      same(pA.inactive, inactive, "S2: after Stage V's correction `inactive` is in the column as mark-inactive wrote it");
+      same(pA.hjemmeside, hjemmeside, "S3: ... and the hjemmeside cleanup's entry");
+      same(pA.directory_url, directoryUrl, "S4: ... and the offentlig klinikk correction's directory_url entry");
+      eq(runStamped(pA.helfo_agreement, ["stage_v_correction"]), [...helfoProv, { source_type: "stage_v_correction", value: "false", fetched_at: "<run>" }],
+        "S5: Stage V's source is appended to helfo_agreement as before");
+      eq(runStamped(withoutAudit(pA), ["stage_v_correction"]), runStamped(prov(control), ["stage_v_correction"]),
+        "S6: ... and the rest of the column is the one Stage V writes on a row without audit entries");
+      ok(JSON.stringify(prov(conflict).hjemmeside) === conflictBefore && JSON.stringify(prov(conflict).inactive) === JSON.stringify(inactive),
+        `S7: the PUT's list with the cleanup's entry first survives Stage V byte for byte (${JSON.stringify(prov(conflict).hjemmeside)})`);
+    }
+
+    // P0–P7: the Places batch (write:true, mocked Places answer, no network).
+    {
+      process.env.GOOGLE_PLACES_API_KEY = "test-places-key";
+      const placesSite = "https://revisjon-places.example.no";
+      (globalThis as any).fetch = async (url: unknown, init?: any) => {
+        if (!String(url).includes("places.googleapis.com")) throw new Error(`unexpected fetch ${String(url)}`);
+        const textQuery = String(JSON.parse(String(init?.body ?? "{}")).textQuery ?? "");
+        const place = {
+          displayName: { text: textQuery.replace(/ REVISJONSBY Norway$/, "") },
+          addressComponents: [{ longText: "0150", shortText: "0150", types: ["postal_code"] }],
+          formattedAddress: "Storgata 1, 0150 Oslo, Norge",
+          internationalPhoneNumber: "+47 22 11 00 99",
+          websiteUri: placesSite,
+        };
+        return { ok: true, status: 200, json: async () => ({ places: [place] }), text: async () => "{}" };
+      };
+      const base = { telefon: telefonProv };
+      const audited = mk("Revisjon Places Batch Tannklinikk AS", allAudit(base));
+      const control = mk("Kontroll Places Batch Tannklinikk AS", base);
+      const conflict = await putConflictRow("P0", "Revisjon Places Batch Liste Tannklinikk AS", base);
+      const conflictBefore = JSON.stringify(prov(conflict).hjemmeside);
+      const ids = [audited, control, conflict];
+      for (const id of ids) db.prepare("UPDATE dental_agents SET postnummer = '0150' WHERE id = ?").run(id);
+      const r = await post("/admin/google-places-batch", { agentIds: ids, write: true });
+      const statuses = (r.body?.data?.results ?? []).map((x: any) => x.status);
+      ok(r.status === 200 && JSON.stringify(statuses) === JSON.stringify(["matched", "matched", "matched"]),
+        `P1: the Places batch matches all three rows (${r.status} ${JSON.stringify(statuses)})`);
+      const pA = prov(audited);
+      same(pA.inactive, inactive, "P2: after the Places batch `inactive` is in the column as mark-inactive wrote it");
+      same(pA.hjemmeside, hjemmeside, "P3: ... and the hjemmeside cleanup's entry");
+      same(pA.directory_url, directoryUrl, "P4: ... and the offentlig klinikk correction's directory_url entry");
+      ok(Array.isArray(pA.website) && pA.website.length === 1 && pA.website[0].source_type === "google_places" && pA.website[0].value === placesSite &&
+        Array.isArray(pA.address) && pA.address[0]?.source_type === "google_places" && Array.isArray(pA.phone) && pA.phone[0]?.source_type === "google_places",
+        `P5: the batch's google_places sources are stored (website, address, phone): ${JSON.stringify([pA.website, pA.address, pA.phone])}`);
+      eq(runStamped(withoutAudit(pA), ["google_places"]), runStamped(prov(control), ["google_places"]),
+        "P6: ... and the rest of the column is the one the batch writes on a row without audit entries");
+      ok(JSON.stringify(prov(conflict).hjemmeside) === conflictBefore && JSON.stringify(prov(conflict).inactive) === JSON.stringify(inactive),
+        `P7: the PUT's list with the cleanup's entry first survives the Places batch byte for byte (${JSON.stringify(prov(conflict).hjemmeside)})`);
+    }
+
+    // N1–N2 (lock): the legacy-shape normalize takes no option and needs none.
+    {
+      const auditRouter = (require("./admin-agent-audit") as typeof import("./admin-agent-audit")).default as any;
+      const good = { source_type: "brreg", value: "22110099", fetched_at: "2026-07-01T00:00:00Z" };
+      const id = mk("Revisjon Normalize Tannklinikk AS", allAudit({ telefon: { sources: [good, { source_type: "own_homepage", fetched_at: "t" }] } }));
+      const r = await callRoute(auditRouter, {
+        method: "POST", path: "/field-provenance-legacy-shape-normalize", headers: { "x-admin-key": testKey }, body: { apply: 1 },
+      });
+      const p = prov(id);
+      ok(r.status === 200 && r.body?.apply === true && JSON.stringify(p.telefon) === JSON.stringify([good]),
+        `N1: the normalize (apply) unwraps the {sources} wrapper and drops the malformed record (${r.status} ${JSON.stringify(p.telefon)})`);
+      ok(JSON.stringify([p.inactive, p.hjemmeside, p.directory_url]) === JSON.stringify([inactive, hjemmeside, directoryUrl]),
+        "N2: ... and leaves the three audit entries as stored, without keepAuditEntries");
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental-agent-put-audit-entries: unexpected error: " + String(err?.stack || err?.message || err));
@@ -389,6 +516,8 @@ export async function runDentalAgentPutAuditEntriesTests(opts: { log?: boolean }
     if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+    if (prevPlacesKey === undefined) delete process.env.GOOGLE_PLACES_API_KEY; else process.env.GOOGLE_PLACES_API_KEY = prevPlacesKey;
+    (globalThis as any).fetch = prevFetch;
     try {
       (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting();
     } catch {
