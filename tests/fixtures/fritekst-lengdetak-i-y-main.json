@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens)",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -780,32 +780,32 @@
     },
     "dental GET /sok": {
       "912345678": {
-        "sha256": "6d9005cde226150a02783150ad3668b6448a5e13270abd65e7fe58083763201d",
-        "chars": 20248
+        "sha256": "394947d3746e360d09ebd0dde501eb20442c81c85eb89c7193fd0a6e68ddbc6f",
+        "chars": 20204
       },
       "tannlege i Oslo": {
-        "sha256": "897a620669674cacf832b95733146c6f66e9d5cf2805039a3ee3d38a4da7fd6c",
-        "chars": 22582
+        "sha256": "01ba53e5540719f1e86d34467aded201ec57ccaabdc8b2baa4fc66749813f6d0",
+        "chars": 22538
       },
       "tannlege i Bergen": {
-        "sha256": "13b5b58d5e8d54baf81529ade9cb6645a9896891fae176c00616a5196a4c76ec",
-        "chars": 22712
+        "sha256": "0053cf0338d2f9a63ad86fe593243d8f7f52d12f3c97b707a71b43be2f54e9d4",
+        "chars": 22668
       },
       "kjeveortoped Bergen": {
-        "sha256": "07fd16702ae579d3fbff77ecc8fc80edb0b70886ddefbe0228c82d56bac87947",
-        "chars": 21504
+        "sha256": "800284bddbf609edb4a8a3ad1bfc34a5cef2ab5747e6e52110879db813b2bf3a",
+        "chars": 21460
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "29f69d2043ceac294c1888db2133331fed89473b4f12340d93ce05b08b381a7e",
-        "chars": 20327
+        "sha256": "de3381dd11dea23ca56c8fd562220cf906eb40fa2bc94b67da4c12afcb0e327c",
+        "chars": 20283
       },
       "tannlege 0150 Oslo": {
-        "sha256": "45b0f0575eb59df146e3cf5ae0b2f0e7bb211f3ca041cb20cd7fecba8ece6cdc",
-        "chars": 20312
+        "sha256": "95f81af17aa656ffc6a83c350b9229792ba86fa98cd2a65a805d4496e5408758",
+        "chars": 20268
       },
       "ring 22 33 44 55": {
-        "sha256": "88fca8daf23793a1320bc0c7af73fa299f3e83baac3f217432b0ee343ef15f5b",
-        "chars": 20294
+        "sha256": "69a6ba66af1f0bc527d2e63ea8b961d52cf9720bfba4a99b9f8ba7a642d73e7c",
+        "chars": 20250
       }
     },
     "dental GET /api/tannlege/agents": {

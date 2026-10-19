@@ -7,12 +7,18 @@
  */
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { DENTAL_DATA_SOURCES, dentalSourceName, dentalSourceNamesSentence } from "./dental-data-sources";
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
 export function getDentalOpenapi(): object {
   const url = (DENTAL_BASE_URL || "https://finn-tannlege.com").replace(/\/$/, "");
+  // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S1):
+  // the sources and the Brreg licence come from dental-data-sources.ts, as on
+  // the pages. The licence was "CC0 (Brreg data)"; Brreg publishes the
+  // register under NLOD 2.0 (data.brreg.no, read 2026-10-19).
+  const brreg = DENTAL_DATA_SOURCES.find((s) => s.id === "brreg");
   return {
     openapi: "3.1.0",
     info: {
@@ -25,13 +31,15 @@ export function getDentalOpenapi(): object {
       // A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8):
       // the sentence that sets Finn-tannlege.com apart from FINN.no, from brand-entities.ts.
       description: (
-        "REST API for Norwegian dental clinic discovery, sourced from Brreg, HPR, and direct enrichment. " +
+        `REST API for Norwegian dental clinic discovery, sourced from ${dentalSourceNamesSentence("en")}. ` +
         "All read endpoints are public; no authentication required. " +
         (BRAND_ENTITIES.dental.disambiguation?.en ?? "")
       ).trim(),
       version: "0.1.0",
       contact: { url: `${url}/kontakt` },
-      license: { name: "CC0 (Brreg data)", url: "https://creativecommons.org/publicdomain/zero/1.0/" },
+      ...(brreg?.license
+        ? { license: { name: `${brreg.license.name}, for data from ${dentalSourceName(brreg, "en")}`, url: brreg.license.url } }
+        : {}),
     },
     servers: [{ url, description: "Production" }],
     paths: {

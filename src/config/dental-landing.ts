@@ -51,10 +51,12 @@ export const DENTAL_LANDING_CONFIG = {
  * no data, so that is the day their text last changed.
  */
 export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
-  "/hvordan-det-fungerer": "2026-06-05",
-  "/om": "2026-06-04",
+  // F2-S1 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
+  // the data sources and the «Verifisert» text on these three pages.
+  "/hvordan-det-fungerer": "2026-10-19",
+  "/om": "2026-10-19",
   // Same day as the page's own «Sist oppdatert» (updatedDate in the
   // /personvern handler); a test keeps the two equal.
   "/personvern": "2026-10-13",
-  "/proveniens": "2026-07-25",
+  "/proveniens": "2026-10-19",
 };
