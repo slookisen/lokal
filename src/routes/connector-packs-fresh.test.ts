@@ -17,7 +17,18 @@
  *   (g) icon md5 pinned per brand, 512×512, no foreign icons;
  *   (h) listing counts and limits, reviewer prompts, write-tool warnings;
  *   (i) the MCPB path marked deprecated;
- *   (j) protocol versions from the SDK and the data-handling paste block.
+ *   (j) protocol versions from the SDK and the data-handling paste block;
+ *   (k) the dental pack says no more than the service does (the independent
+ *       check of the directory prompt, 2026-10-19): emergency care per place
+ *       (a known town gives its county, an unknown one nothing), no
+ *       out-of-hours promise but /vilkar's 113 line and advice, Helfo as read
+ *       automatically from the clinic's own website; and the readiness line
+ *       points at no table portal-answers.md lacks (S10). G3-S6d (lokal#1201
+ *       round 3): emergency care is the clinic's own word and no «emergency
+ *       duty» without the stored quote (F1-S4c), «more than 4,500 clinics»,
+ *       only the caveats that hold, and the portal's real fields: three use
+ *       cases with example prompts within its limits, «Consumer Health», and
+ *       «Use only if the portal asks» on the texts it has no field for.
  *
  * Run standalone: npx tsx src/routes/connector-packs-fresh.test.ts
  * Wired into `npm test` via tests/test.ts.
@@ -30,13 +41,20 @@ import * as path from "path";
 import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { NORWEGIAN_SEARCH_AREAS } from "../config/norway-search-areas";
+import { parseDentalQuery } from "../services/dental-query-parser";
 import type { CatalogVertical } from "../services/honest-count";
 import { registeredMcpToolDefinitions, registeredMcpToolNames, type McpToolDefinition } from "../services/mcp-tool-manifest";
+import { normaliseFylke } from "../services/norway-fylke";
+import { officialPoststedFylker } from "../services/norway-postnummer";
+import { buildNorwegianGazetteer } from "../services/search-intent/norwegian-query";
+import { DENTAL_MCP_INSTRUCTIONS } from "./dental-mcp";
+import { emergencyDutyWithoutQuote } from "./dental-mcp-instructions.test";
 import { parseClaims } from "./distribution-metadata.test";
 import {
-  DIRECTIVE_PATTERNS, FLOOR_KEY, LIMITS, PACKS, PACK_FILES, PACK_VERTICALS, PORTAL_URL, SERVER_INFO_FIELDS, cardTemplatesMd5,
-  directivePhrases, formatInt, gatherPackInput, readCatalogFloors, readServerConstruction, renderConnectorPacks, renderPack,
-  stalePackFiles, type PackInput, type PackSpec,
+  DIRECTIVE_PATTERNS, FLOOR_KEY, LIMITS, ONLY_IF_ASKED, PACKS, PACK_FILES, PACK_VERTICALS, PORTAL_FIELDS, PORTAL_URL, SERVER_INFO_FIELDS,
+  USE_CASE_LIMITS, cardTemplatesMd5, directivePhrases, formatInt, gatherPackInput, readCatalogFloors, readServerConstruction,
+  renderConnectorPacks, renderPack, stalePackFiles, type PackInput, type PackSpec,
 } from "../../scripts/gen-connector-packs";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
@@ -130,6 +148,12 @@ function toolTableRows(portal: string): Map<string, string[]> {
     if (m) out.set(m[1], m[2].split(" | "));
   }
   return out;
+}
+
+/** Rows of the Use cases table in portal-answers.md, for a pack checked against the portal: [use case, characters, example prompt]. */
+function useCaseTableRows(portal: string): string[][] {
+  const section = portal.split("## 4. Use cases")[1]?.split("\n## ")[0] ?? "";
+  return section.split("\n").map((l) => l.match(/^\| (.+?) \| (\d+) \| (.+) \|$/)).filter((m): m is RegExpMatchArray => !!m).map((m) => [m[1], m[2], m[3]]);
 }
 
 /** The fenced block after "Paste if the portal asks what data the connector handles:" in portal-answers.md. */
@@ -440,7 +464,12 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
         icon: { path: "dental-connectors-prep/assets/x.png", width: 512, height: 512, md5: "0".repeat(32) },
       };
       const doneServer = { info: ["name", "version", ...SERVER_INFO_FIELDS], instructions: true };
-      assertTrue(renderPack(allDone, { ...doneInput, server: doneServer })["README.md"].includes("**Ready to submit: yes.**"), "f24: all rows done reads «Ready to submit: yes»");
+      const allDoneFiles = renderPack(allDone, { ...doneInput, server: doneServer });
+      assertTrue(allDoneFiles["README.md"].includes("**Ready to submit: yes.**"), "f24: all rows done reads «Ready to submit: yes»");
+      assertTrue(allDoneFiles["claude-directory/portal-answers.md"].includes("\nBefore you start: Ready to submit: yes. Every prerequisite is done. See the prerequisites in ../README.md.\n") &&
+        !allDoneFiles["claude-directory/portal-answers.md"].includes("prerequisite below"),
+        "k11: all rows done: portal-answers.md says «Ready to submit: yes» with no «below» (S10: its prerequisites are in ../README.md)");
+      assertTrue(allDoneFiles["README.md"].includes("**Ready to submit: yes.** Every prerequisite is done.\n\n| Prerequisite |"), "k12: … and the README says it right above its table");
 
       // Screenshots (review finding B1): every other Opplevagent row done, the
       // card templates changed since the PNGs were rendered → not ready.
@@ -507,6 +536,191 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       const readme = read("opplevagent-connectors-prep/claude-desktop/README.md");
       assertTrue(/^# .*\n\n> \*\*Deprecated path/.test(readme) && readme.includes("../claude-directory/"),
         "i3: claude-desktop/README.md opens with the deprecation note and points at the generated pack");
+    }
+
+    // ── (k) the dental pack says no more than the service does ─────────────
+    // The independent check of the directory prompt (2026-10-19), S10 in the
+    // review of lokal#1178, and G3-S6d (lokal#1201 round 3): «Akuttvakt» after
+    // F1-S4c, the catalog size after F2-S10 and the portal's real fields.
+    {
+      const readme = pack("dental", "README.md");
+      const listing = pack("dental", "claude-directory/listing.md");
+      const portal = pack("dental", "claude-directory/portal-answers.md");
+      const oneLiner = fencedAfter(listing, "One-liner")?.text ?? "";
+      const description = fencedAfter(listing, "Description")?.text ?? "";
+      const useCaseRows = useCaseTableRows(portal);
+      const useCases = useCaseRows.map(([u]) => u).join("\n");
+      const caveats = portal.split("## Known caveats, to state if asked")[1] ?? "";
+      const caveatLines = caveats.split("\n").filter((l) => l.startsWith("- "));
+      const hoursCaveat = caveatLines.find((l) => l.includes("Emergency care says nothing about hours")) ?? "";
+      assertTrue(oneLiner !== "" && description !== "" && useCaseRows.length > 0 && caveats.includes("tannlege_akutt"),
+        "k0 control: the dental one-liner, description, use cases and caveats are read");
+
+      // What the pack said before, each more than the service does.
+      const OVERCLAIMS: ReadonlyArray<readonly [RegExp, string]> = [
+        [/a town name gives no results/i, "tannlege_akutt reads a town it knows as its county"],
+        [/a town name is read as the county/i, "only a town the server knows is; any other gives no results"],
+        [/outside normal hours/i, "the data has no out-of-hours times"],
+        [/change what a visit costs|how soon you get one/i, "direct billing settles Helfo's share; emergency care promises no time"],
+        [/reported as a fact/i, "Helfo direct billing is the clinic's own statement, not Helfo's"],
+        [/emergency duty \(akuttvakt\) with a recorded source|recorded source \(akuttvakt\)/i, "«Akuttvakt» needs a stored quote from the source (F1-S4c)"],
+        [/lists the emergency clinics in all of/i, "tannlege_akutt counts the whole county but lists at most 25 (S2)"],
+        [/Every record carries the clinic's address, contact details/i, "contact details are there only where known"],
+        [/chain_count 0|chain data was empty/i, "on 2026-10-19 prod had chain_count 346 and 37 chains"],
+        [/case-fold Ø|until lokal#1086 has landed/i, "«Bodø» finds 52 in all three spellings, and lokal#1086 is live"],
+        [/5,400|\b5400\b|5,446|5 446/, "the size is the floor, 4,500, true before and after F2-S10"],
+      ];
+      for (const [re, why] of OVERCLAIMS) assertTrue(!re.test(whole("dental")), `k1: no dental pack file says ${re} (${why})`);
+
+      // Out of hours: emergency care is a clinic's own word, never a time.
+      const HOURS = /\b(outside|after) (normal|opening|business|office) hours\b|\bout[- ]of[- ]hours\b|\bafter[- ]hours\b|\b24\/7\b|\b24[- ]hours?\b|\ba?round[- ]the[- ]clock\b|\bevenings?\b|\bweekends?\b|\bnight(s|time)?\b|\bovernight\b|\bany ?time\b/i;
+      const OPEN_LATE = [
+        "Find emergency dental care (akuttvakt) outside normal hours.", "… and 24-hour emergency care.", "open 24 hours", "24/7 emergency dentist",
+        "around the clock", "also in the evening and at weekends.", "evenings", "a weekend dentist", "a dentist at night", "overnight", "any time", "anytime",
+      ];
+      assertEq(OPEN_LATE.filter((t) => !HOURS.test(t)), [], "k2 control: the hours pattern catches the old use case and the other ways to promise a time (24 hours, evenings, weekends, nights, any time)");
+      // Two phrases name out-of-hours care without promising it (G3-S6d points 4 and 9); only they are taken out.
+      const NOT_A_PROMISE = ["It is not a promise of out-of-hours care.", "with advice on the out-of-hours dental service"];
+      const promisesHours = (t: string): boolean => HOURS.test(NOT_A_PROMISE.reduce((acc, p) => acc.split(p).join(""), t));
+      assertTrue(NOT_A_PROMISE.every((p) => HOURS.test(p)) && promisesHours("Emergency care is a promise of out-of-hours care.") &&
+        promisesHours("Find clinics open out of hours, with advice on the out-of-hours dental service."),
+        "k2b control: the two disclaimers match the hours pattern, and a promise next to one, or one reworded, is still caught");
+      assertEq([["one-liner", oneLiner], ["description", description], ["use cases", useCases]].filter(([, t]) => promisesHours(t)).map(([n]) => n), [],
+        "k3: the one-liner, description and use cases promise no out-of-hours care");
+      assertTrue(description.includes("Emergency care means that the clinic says it takes emergency patients. It is not a promise of out-of-hours care."),
+        "k3b: the description says emergency care is the clinic's own word and no promise of out-of-hours care (point 4)");
+      assertTrue(/^- If life or health is in immediate danger: call 113\. Emergency care says nothing about hours: the data has no out-of-hours times/.test(hoursCaveat),
+        "k4: the hours caveat starts with the 113 line, then says emergency care says nothing about hours (S4)");
+      assertEq([useCaseRows[2]?.[0], useCaseRows[2]?.[2]],
+        ["Find clinics that say they take emergency patients, with advice on the out-of-hours dental service.", "I need an emergency dentist in Rogaland"],
+        "k5: the emergency use case is what every listed clinic says, with the out-of-hours advice, and its example is the emergency prompt");
+      assertTrue(/rad_om_kommunal_tannlegevakt: DENTAL_EMERGENCY_NOTICE\.text/.test(read("src/routes/dental-mcp.ts")),
+        "k5b: … and tannlege_akutt's answer has that advice (rad_om_kommunal_tannlegevakt in src/routes/dental-mcp.ts)");
+
+      // Helfo: what direct billing means is the server instructions' sentence; where it comes from is /proveniens'.
+      const SETTLED = "Helfo's share of a treatment that qualifies for support is settled with the clinic";
+      assertTrue(DENTAL_MCP_INSTRUCTIONS.includes(SETTLED) && description.includes(SETTLED), "k6: the description says what direct billing means in DENTAL_MCP_INSTRUCTIONS' words");
+      assertTrue(read("src/routes/dental-seo.ts").includes("We have no list from Helfo, so the badge is not a confirmation from Helfo") &&
+        description.includes("the agreement is read from the clinic's own website, not from a list kept by Helfo"),
+        "k7: the description gives the Helfo source as /proveniens does (read from the clinic's website, no list from Helfo)");
+      assertTrue(read("src/routes/dental-seo.ts").includes("<strong>Helfo direct billing</strong> is read automatically from the clinic's website") &&
+        /^\| Financial transactions \| [^\n]*is only reported, as read automatically from the clinic's own website \(not confirmed by Helfo\)\./m.test(portal),
+        "k8: the financial-transactions basis says the same, read automatically as on /proveniens (an AI reading, not the website's own words)");
+
+      // Emergency care per place: the caveat's three examples hold. The
+      // gazetteer is production's shape over every official poststed (S5 in the
+      // review of lokal#1201), not a hand-picked list.
+      const gazetteer = buildNorwegianGazetteer(officialPoststedFylker().keys(), NORWEGIAN_SEARCH_AREAS);
+      const asOneTown = (q: string) => {
+        const f = parseDentalQuery(q, gazetteer).filter;
+        return { f, ok: !f.fylke && !f.fylke_in && !f.name_terms && !!(f.poststed_or_postnummer || f.poststed_in || f.postnummer_in) };
+      };
+      const town = caveats.match(/a town the server knows is read as the county it lies in, so «([^»]+)» covers all of ([^.]+)\./);
+      assertTrue(!!town && normaliseFylke(town[1]) === town[2] && (officialPoststedFylker().get(town[1].toUpperCase()) ?? []).includes(town[2]),
+        `k9: tannlege_akutt reads a town it knows as the county the town lies in, as the caveat says (normaliseFylke(«${town?.[1]}») = ${town ? normaliseFylke(town[1]) : "?"}; dental-acute-filter.test.ts M1b runs it through the tool)`);
+      const unknown = caveats.match(/A town it does not know, such as «([^»]+)», gives no results\./)?.[1] ?? "";
+      const unknownAsTown = asOneTown(`emergency dentist ${unknown}`);
+      assertTrue(unknown !== "" && normaliseFylke(unknown) === null && unknownAsTown.ok && unknownAsTown.f.acute_vakt === 1,
+        `k9b: the caveat's unknown town («${unknown}») is one normaliseFylke() does not know (${unknown ? normaliseFylke(unknown) : "?"}), so tannlege_akutt gives nothing ` +
+        `(dental-acute-filter.test.ts M1c), and tannlege_search reads it as that town (${JSON.stringify(unknownAsTown.f).slice(0, 120)})`);
+      const example = caveats.match(/for example «([^»]+)»/)?.[1] ?? "";
+      const oneTown = asOneTown(example);
+      assertTrue(example !== "" && oneTown.ok && oneTown.f.acute_vakt === 1,
+        `k10: the caveat's one-town example («${example}») reads in tannlege_search's parser as akutt + that town, not a county (${JSON.stringify(oneTown.f).slice(0, 120)})`);
+
+      // Out of hours: the 113 line and the advice are /vilkar section 3's, word for word (B2 and S4 in the reviews of lokal#1201).
+      const vilkar3 = read("src/routes/dental-seo.ts")
+        .match(/<h2>3\. Emergencies<\/h2>\s*<p><strong>([^<]*)<\/strong><\/p>\s*<p>(If you need emergency dental treatment[^<]*)<\/p>/);
+      const VILKAR_ADVICE = [
+        "may still be unable to see you now",
+        "Call the clinic before you go there",
+        "contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live",
+      ];
+      assertEq(VILKAR_ADVICE.filter((a) => !vilkar3?.[2].includes(a) || !hoursCaveat.includes(a)), [],
+        `k15: the hours caveat gives /vilkar section 3's advice in its words (call the clinic; legevakt 116 117 or tannlegevakt) (/vilkar read: ${!!vilkar3})`);
+      assertTrue(!!vilkar3 && vilkar3[1] === "If life or health is in immediate danger: call 113." && hoursCaveat.startsWith(`- ${vilkar3[1]} `),
+        `k15b: … and opens with /vilkar section 3's first line, «${vilkar3?.[1]}» (S4)`);
+
+      // G3-S6d points 1–3: the size, the profile page and the sources.
+      assertTrue(floors.dental === 4500 && description.includes("more than 4,500 clinics"),
+        "k16: the description says «more than 4,500 clinics», the floor that is true before and after F2-S10 (point 1, point 13)");
+      assertTrue(description.includes("Every clinic has a profile page with its address and, where known, its contact details."),
+        "k17: every clinic has a profile page, with contact details where known (point 2)");
+      const sourcesParagraph = description.split("\n\n").find((p) => p.startsWith("The data comes from ")) ?? "";
+      const methodPage = `${new URL(BRAND_ENTITIES.dental.url).host}/proveniens`;
+      assertTrue(sourcesParagraph.endsWith(` How each field is sourced is described at ${methodPage}.`) && /router\.get\("\/proveniens"/.test(read("src/routes/dental-seo.ts")),
+        `k18: the sources paragraph ends with the method page, ${methodPage}, which the dental site serves (point 3)`);
+
+      // Point 5: only the two caveats that hold; the chain and Ø caveats are gone (k1).
+      assertEq(caveatLines.map((l) => l.split(":")[0]), ["- tannlege_akutt narrows by county (fylke) only", "- If life or health is in immediate danger"],
+        "k19: the caveats are the per-place one and the hours one, nothing else (point 5)");
+
+      // Points 9–11: the portal's real fields (Daniel's run of prompt 11, 2026-10-19).
+      const spec = PACKS.dental;
+      assertEq(useCaseRows.length, USE_CASE_LIMITS.rows, `k20: exactly ${USE_CASE_LIMITS.rows} use cases, the most the portal takes`);
+      assertEq(useCaseRows.filter(([u, n, ex]) => u.length > USE_CASE_LIMITS.useCase || Number(n) !== u.length || ex.length > USE_CASE_LIMITS.example ||
+        !BRAND_ENTITIES.dental.exampleQueries.includes(ex)), [],
+        `k20b: each use case is at most ${USE_CASE_LIMITS.useCase} characters, as printed, and its example prompt at most ${USE_CASE_LIMITS.example} and one of the reviewer prompts`);
+      assertTrue([/town or county/, /Helfo/, /emergency patients/].every((re, i) => re.test(useCaseRows[i]?.[0] ?? "")),
+        "k20c: the three are place or county, Helfo and emergency care, in that order (point 9)");
+      const base = gatherPackInput("dental", floors);
+      const checked = spec.portalChecked!;
+      const withUseCases = (useCases: string[], examples: Record<string, string>): PackSpec => ({ ...spec, useCases, portalChecked: { ...checked, examples } });
+      const prompt = base.brand.exampleQueries[0];
+      throwsWith(() => renderPack(withUseCases([...spec.useCases, "Read one clinic's full record."], { ...checked.examples, "Read one clinic's full record.": prompt }), base),
+        /4 use cases \(the portal takes 1–3\)/, "k20d: a fourth use case throws");
+      throwsWith(() => renderPack(withUseCases(["x".repeat(101)], { ["x".repeat(101)]: prompt }), base), /is 101 characters \(limit 100\)/, "k20e: a use case over 100 characters throws");
+      throwsWith(() => renderPack(withUseCases(["A use case."], {}), base), /"A use case\." has no example prompt/, "k20f: a use case without an example prompt throws");
+      throwsWith(() => renderPack(withUseCases(["A use case."], { "A use case.": "Find a dentist in Tromsø tonight" }), base),
+        /is not in BRAND_ENTITIES\.dental\.exampleQueries/, "k20g: an example prompt that is not a reviewer prompt throws (those are the ones checked against production)");
+      throwsWith(() => renderPack(withUseCases(["A use case."], { "A use case.": prompt, "Gone.": prompt }), base), /set for "Gone\.", which is not a use case/,
+        "k20h: an example prompt for a use case that is gone throws");
+      const longPrompt = "y".repeat(501);
+      throwsWith(() => renderPack({ ...withUseCases(["A use case."], { "A use case.": longPrompt }), reviewerTools: { ...spec.reviewerTools, [longPrompt]: "tannlege_search" } },
+        { ...base, brand: { ...base.brand, exampleQueries: [...base.brand.exampleQueries, longPrompt] } }), /is 501 characters \(limit 500\)/,
+        "k20i: an example prompt over 500 characters throws");
+
+      const categories = listing.split("## Categories (one to five)")[1]?.split("\n## ")[0] ?? "";
+      assertEq(categories.split("\n").filter((l) => l.startsWith("- ")), ["- Consumer Health"], "k21: the one category is the portal's «Consumer Health» (point 10)");
+      assertTrue(!/\bReference\b/.test(whole("dental")), "k21b: no dental pack file names «Reference», which the portal does not have");
+
+      const fills = readme.split("## What the portal fills")[1]?.split("\n## ")[0] ?? "";
+      assertTrue(fills.includes(`It has these fields: ${PORTAL_FIELDS.slice(0, -1).join(", ")} and ${PORTAL_FIELDS[PORTAL_FIELDS.length - 1]}.`) &&
+        fills.includes(`Checked against the portal on ${checked.date} (${checked.source}).`) && PORTAL_FIELDS.length === 14,
+        "k22: the README names the 14 fields the portal fills, and when and where that was seen (point 11)");
+      assertTrue(fills.includes("It has no field for terms, known caveats, an explanation of authentication, data-handling text, a test account, language or price."),
+        "k22b: … and what it has no field for");
+      const section = (md: string, heading: string): string => md.split(`\n## ${heading}`)[1]?.split("\n## ")[0] ?? "";
+      const marked = (md: string, heading: string): boolean => section(md, heading).includes(ONLY_IF_ASKED);
+      assertEq(["6. Authentication", "7. Data handling", "Known caveats, to state if asked"].filter((h) => !marked(portal, h)), [],
+        "k22c: the authentication text, the data-handling texts and the caveats are marked «Use only if the portal asks»");
+      assertTrue(/^\| Test account \| \*\*Use only if the portal asks\.\*\* It has no field for this\. None needed/m.test(portal) && marked(listing, "Language"),
+        "k22d: … and so are the test account and the language note");
+      assertEq([...["1. Connection", "3. Listing", "4. Use cases", "5. Company"].filter((h) => marked(portal, h)),
+        ...["Server name", "One-liner", "Description", "Categories", "Links and contact", "Icon"].filter((h) => marked(listing, h))], [],
+        "k22e: nothing the portal has a field for is marked");
+      assertEq((portal.match(/\*\*Use only if the portal asks\.\*\*/g) ?? []).length + (listing.match(/\*\*Use only if the portal asks\.\*\*/g) ?? []).length, 5,
+        "k22f: five texts are marked in all");
+      const unchecked = renderPack({ ...spec, portalChecked: null }, base);
+      assertTrue(!Object.values(unchecked).some((f) => f.includes(ONLY_IF_ASKED) || f.includes("## What the portal fills")) &&
+        unchecked["claude-directory/portal-answers.md"].includes("Primary use cases:\n\n- Find a dentist in a town or county.") &&
+        unchecked["claude-directory/listing.md"].includes("Pick the closest names the portal offers."),
+        "k22g: a pack not checked against the portal marks nothing and lists its use cases as before (RFB and Opplevagent)");
+      assertTrue(PACK_VERTICALS.filter((v) => v !== "dental").every((v) => PACKS[v].portalChecked === null && !whole(v).includes(ONLY_IF_ASKED)),
+        "k22h: RFB and Opplevagent are not checked against the portal yet, so their packs stay as they were");
+
+      // The quote rule of F1-S4c, in the pack as in the tool text (dental-mcp-instructions.test.ts D11).
+      assertEq(emergencyDutyWithoutQuote(whole("dental")), [], "k23: no dental pack file says «emergency duty» without «a stored quote from the source»");
+      assertEq(emergencyDutyWithoutQuote("- Find clinics with an emergency duty (akuttvakt) or that take emergency patients."),
+        ["- Find clinics with an emergency duty (akuttvakt) or that take emergency patients."], "k23 control: the round-2 use case is caught");
+
+      // S10: portal-answers.md repeats the README's readiness line, which names no table it lacks.
+      for (const v of PACK_VERTICALS) {
+        const readmeLine = pack(v, "README.md").split("\n").find((l) => l.startsWith("**Ready to submit:")) ?? "";
+        const before = pack(v, "claude-directory/portal-answers.md").split("\n").find((l) => l.startsWith("Before you start: ")) ?? "";
+        assertEq(before, `Before you start: ${readmeLine.replace(/\*\*/g, "")} See the prerequisites in ../README.md.`, `k13 ${v}: portal-answers.md repeats the README's readiness line`);
+        assertTrue(readmeLine !== "" && !/\bbelow\b/.test(before), `k14 ${v}: … and it points at nothing «below» (S10)`);
+      }
     }
   } catch (err) {
     fail("unexpected error", err instanceof Error ? (err.stack || err.message) : String(err));

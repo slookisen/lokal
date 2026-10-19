@@ -12,7 +12,7 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: yes.** Every prerequisite below is done.
+**Ready to submit: yes.** Every prerequisite is done.
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
@@ -30,6 +30,12 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 The directory reviews against its connector checklist: https://claude.com/docs/connectors/building/review-criteria.
 
 Rows with source "code" are computed when the pack is generated. Rows with source "recorded" are kept by hand in `scripts/gen-connector-packs.ts` (`PACKS`), and no test checks them against the code or GitHub: the pull requests they cite (lokal#1086 and lokal#1098) can be merged or closed while the row stays as it is. Update the row there and regenerate when its status changes.
+
+## What the portal fills
+
+Checked against the portal on 2026-10-19 (A2A daniel-responses/2026-10-19-live-svar-token-rotert-og-prompt-11.md). It has these fields: Name, Slug, One-liner, Description, Categories, Icon, Documentation, Support, Privacy policy, Use cases, Prerequisites, Read/write, Company and Test setup instructions. Use cases take at most 3 rows of at most 100 characters, each with an example prompt of at most 500 characters.
+
+It has no field for terms, known caveats, an explanation of authentication, data-handling text, a test account, language or price. The pack's texts for those are marked «Use only if the portal asks»: keep them for a reviewer who asks.
 
 ## Contents
 

@@ -4,7 +4,7 @@
 
 Every step of the developer portal at https://claude.ai/directory/manage (**Submit new** → **MCP connector**), answered. Copy the fenced blocks as they are. Steps as listed in https://claude.com/docs/connectors/building/submission (read 2026-10-17).
 
-Before you start: Ready to submit: yes. Every prerequisite below is done. See the prerequisites in ../README.md.
+Before you start: Ready to submit: yes. Every prerequisite is done. See the prerequisites in ../README.md.
 
 ## 1. Connection
 
@@ -28,7 +28,7 @@ The client must send `initialize` first. A request without a live session gets 4
 | `tannlege_search` | Search Norwegian dental clinics | (same) | true | false | true | Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by place, county (fylke), specialty, Helfo direct billing or emergency care. |
 | `tannlege_info` | Get full details for a dental clinic | Get dental clinic details | true | false | true | Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, by organisation number (org_nr) or id. |
 | `tannlege_stats` | Norwegian dental market statistics | (same) | true | false | false | Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. |
-| `tannlege_akutt` | Find emergency-duty dental clinics in Norway | Find emergency-duty dental clinics | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a recorded source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke). |
+| `tannlege_akutt` | Find dental clinics for emergency care in Norway | Find dental clinics for emergency care | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics that say they take emergency patients, optionally in one county (fylke). |
 | `tannlege_kjeder` | List Norwegian dental chains | (same) | true | false | false | List dentist chains (tannlegekjeder) in Norway that are registered in the directory, each with its number of clinic locations. |
 
 ### Write (0)
@@ -43,13 +43,13 @@ See `listing.md` in this folder. Slug: `finn-tannlege` (permanent once published
 
 ## 4. Use cases
 
-Primary use cases:
+At most 3 use cases of at most 100 characters, each with an example prompt of at most 500 characters. Each prompt is one of the reviewer prompts in `test-instructions.md`.
 
-- Find a dentist in a town or county.
-- Find emergency dental care (akuttvakt) outside normal hours.
-- Filter for clinics with a Helfo direct-billing agreement.
-- Find a clinic with a specific specialty, such as orthodontics.
-- Read one clinic's full record by organisation number.
+| Use case | Characters | Example prompt |
+|---|---|---|
+| Find a dentist in a town or county. | 35 | Find a dentist in Bergen |
+| Filter for clinics with a Helfo direct-billing agreement. | 57 | Which dental clinics in Oslo have a Helfo agreement? |
+| Find clinics that say they take emergency patients, with advice on the out-of-hours dental service. | 99 | I need an emergency dentist in Rogaland |
 
 | Field | Answer |
 |---|---|
@@ -66,7 +66,11 @@ Primary use cases:
 
 ## 6. Authentication
 
-**No authentication.** Paste if the portal asks why:
+**No authentication.**
+
+**Use only if the portal asks.** It has no field for this.
+
+Why there is none:
 
 ```
 The server is a public, read-only directory of Norwegian dental clinics. There are no user accounts and no write operations, so there is nothing to sign in to.
@@ -74,16 +78,18 @@ The server is a public, read-only directory of Norwegian dental clinics. There a
 
 ## 7. Data handling
 
+**Use only if the portal asks.** It has no field for this.
+
 | Question | Answer |
 |---|---|
 | Whose API is behind the connector | Our own: the server reads Finn-tannlege's own clinic directory on the same domain. |
-| Personal health data | No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency duty) and asks for no health information about the user. |
+| Personal health data | No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency care) and asks for no health information about the user. |
 | Sponsored content | No. The tools return no ads or paid placements. |
 
 Paste if the portal asks what data the connector handles:
 
 ```
-The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.
+The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-care flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.
 
 Every call is logged with the tool name, the protocol, the response time, the client's name and version, the caller's full User-Agent string (stored as sent, not hashed) and a salted, truncated hash of the IP address (never the full address), to see which AI clients use the service. That log is deleted automatically after 60 days.
 
@@ -96,7 +102,7 @@ Privacy policy: https://finn-tannlege.com/personvern
 
 | Field | Answer |
 |---|---|
-| Test account | None needed: the server has no authentication and serves public data. |
+| Test account | **Use only if the portal asks.** It has no field for this. None needed: the server has no authentication and serves public data. |
 | Access instructions | The paste block in `test-instructions.md` in this folder. |
 | You ran every tool | Before ticking: call each tool once, through MCP Inspector or as a custom connector in Claude. |
 
@@ -108,7 +114,7 @@ Seven acknowledgments, all required. Our basis for each:
 |---|---|
 | Directory guidelines | Read the Software Directory Terms (https://support.claude.com/en/articles/13145338-anthropic-software-directory-terms) and Policy (https://support.claude.com/en/articles/13145358-anthropic-software-directory-policy). Tick when every prerequisite in ../README.md is done. |
 | First-party API usage | Our own: the server reads Finn-tannlege's own clinic directory on the same domain. |
-| Financial transactions | No money moves through the connector. Helfo agreement status is reported as a fact about a clinic, nothing more. No card or bank details are asked for. |
+| Financial transactions | No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as read automatically from the clinic's own website (not confirmed by Helfo). No card or bank details are asked for. |
 | AI media generation | None: the connector generates no images, video or audio. |
 | Prompt injection | Tool descriptions say what each tool does and do not instruct Claude (checked against the directive patterns in scripts/gen-connector-packs.ts). |
 | Conversation data collection | The tools take only the arguments they need. The server never asks for chat history, memory or files. |
@@ -120,6 +126,7 @@ Check the summary, then submit. Status and reviewer feedback appear in the porta
 
 ## Known caveats, to state if asked
 
-- tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.
-- tannlege_akutt filters by county (fylke) only: a town name gives no results. Town-level emergency search goes through tannlege_search with `akutt: true`.
-- Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.
+**Use only if the portal asks.** It has no field for this.
+
+- tannlege_akutt narrows by county (fylke) only: a town the server knows is read as the county it lies in, so «Bergen» covers all of Vestland. A town it does not know, such as «Sandvika», gives no results. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.
+- If life or health is in immediate danger: call 113. Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).

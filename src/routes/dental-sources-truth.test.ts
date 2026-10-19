@@ -708,8 +708,10 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
     {
       const listing = read("dental-connectors-prep/claude-directory/listing.md");
       const block = listing.match(/## Description \(limit [\d,]+\)\n\n```\n([\s\S]*?)\n```/)?.[1] ?? "";
-      assertTrue(block.split("\n\n").includes(`The data comes from ${src.dentalSourceNamesSentence("en")}.`),
-        "h1: the listing description names the list's sources (scripts/gen-connector-packs.ts, PACKS.dental)", block);
+      // The paragraph opens with the list's sentence; since G3-S6d the method-page sentence follows it.
+      const sources = `The data comes from ${src.dentalSourceNamesSentence("en")}.`;
+      assertTrue(block.split("\n\n").some((p) => p === sources || p.startsWith(`${sources} `)),
+        "h1: a paragraph of the listing description opens with the list's sources (scripts/gen-connector-packs.ts, PACKS.dental)", block);
       for (const f of ["README.md", "claude-directory/listing.md", "claude-directory/portal-answers.md", "claude-directory/test-instructions.md"]) {
         const text = read(`dental-connectors-prep/${f}`);
         assertTrue(!NOT_A_SOURCE.test(text), `h2 ${f}: names no HPR, NTF or Helsedirektoratet`, text.match(NOT_A_SOURCE)?.[0]);

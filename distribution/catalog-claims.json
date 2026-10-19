@@ -1,9 +1,10 @@
 {
   "_comment": "Conservative floors for catalog-size claims in static distribution files (npm/registry metadata, READMEs, connector listings). Honest count rounded DOWN to the hundred (2026-10-16: rfb 1563, dental 5446). Immutable artefacts must never claim more than these floors. Locked by src/routes/distribution-metadata.test.ts.",
-  "updated": "2026-10-16",
+  "_comment_dental": "dental is 4500, not 5400 (5446 on 2026-10-19, rounded down): it stays true after F2-S10 takes the rows of the catalog import without an org.nr. off the public lists (about 4635 left), and it is the figure Daniel gave the Claude directory and mcp.directory (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S6d point 13; S10c of 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon).",
+  "updated": "2026-10-19",
   "floors": {
     "rfb": 1500,
-    "dental": 5400,
+    "dental": 4500,
     "opplevelser": 500
   }
 }
