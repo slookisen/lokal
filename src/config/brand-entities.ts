@@ -18,9 +18,10 @@
 //     never an alternateName, a keyword or a sameAs.
 //   - Every URL is https and answered 200 to a GET on 2026-10-17 (logos as
 //     image/png), or is served by a route that ships in the same change and
-//     is tested there (Finn-tannlege's logo and guide: dental-icons.test.ts,
-//     dental-guide-tannlege-ai.test.ts). A page that does not exist yet is
-//     null, not a guess.
+//     is tested there (Finn-tannlege's logo, guide and terms:
+//     dental-icons.test.ts, dental-guide-tannlege-ai.test.ts,
+//     company-legal-sites.test.ts). A page that does not exist yet is null,
+//     not a guess.
 //   - sameAs lists only profiles that exist. The brands have none yet; the
 //     brands' own social profiles come from Daniel, one line each.
 //   - Wikidata is never typed into sameAs: set `wikidataId` ("Q…") once the
@@ -180,10 +181,11 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
       "Finn gårdssalg og lokale drikkeprodusenter i Vestland",
     ],
   }),
-  // dental-seo.ts reads `disambiguation` (G3-S8) and `exampleQueries` (the
-  // guide, G3-S4) from here; its Organization moves to organizationJsonLd()
-  // in G3-S1-dental. The logo is the PNG from F2-S4 and the docs page the
-  // guide from G3-S4; terms stay null until F2-S5 (/vilkar) ships.
+  // dental-seo.ts reads `disambiguation` (G3-S8), `exampleQueries` (the
+  // guide, G3-S4) and `supportEmail` (/vilkar, F2-S5) from here; its
+  // Organization moves to organizationJsonLd() in G3-S1-dental. The logo is
+  // the PNG from F2-S4, the docs page the guide from G3-S4 and the terms page
+  // /vilkar from F2-S5.
   dental: entity({
     name: "Finn-tannlege",
     alternateName: ["finn-tannlege.com"],
@@ -195,7 +197,7 @@ export const BRAND_ENTITIES: Readonly<Record<BrandKey, Readonly<BrandEntity>>> =
     supportEmail: "kontakt@finn-tannlege.com",
     docsUrl: `${FT_URL}/guide-tannlege-ai`,
     privacyUrl: `${FT_URL}/personvern`,
-    termsUrl: null,
+    termsUrl: `${FT_URL}/vilkar`,
     // The reviewer prompts in dental-connectors-prep/claude-directory/test-instructions.md.
     // Also shown on /guide-tannlege-ai (G3-S4), and each must find clinics
     // through tannlege_search as written: the parser reads leftover English

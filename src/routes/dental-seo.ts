@@ -78,6 +78,7 @@ import {
   companyContactBlockHtml,
   companyControllerSentenceHtml,
   companyFooterLineHtml,
+  companyOperatorSentence,
   organizationJsonLd,
   toSiteLang,
   type SiteLang,
@@ -896,6 +897,7 @@ function dentalFooter(pageLang: SiteLang = "nb"): string {
       <a href="/om">Om finn-tannlege.com</a>
       <a href="/hvordan-det-fungerer">Slik fungerer det</a>
       <a href="/personvern">Personvern</a>
+      <a href="/vilkar">Vilkår</a>
       <a href="/sok">Søk etter tannlege</a>
       <a href="/kontakt">Kontakt oss</a>
     </div>
@@ -2253,6 +2255,7 @@ function buildDentalSitemapXml(): string {
       ["/hvordan-det-fungerer", "monthly", "0.7"],
       ["/om", "monthly", "0.6"],
       ["/personvern", "monthly", "0.4"],
+      ["/vilkar", "monthly", "0.4"],
       ["/proveniens", "monthly", "0.5"],
     ];
     for (const [p, freq, pri] of statics) {
@@ -3063,6 +3066,138 @@ router.get("/personvern", (_req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// GET /vilkar (+ /terms, /terms-of-service, /tos) — terms of use
+//
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S5:
+// new legal text, merged by Daniel only after he has read it (merge_guard
+// needs_daniel). Bilingual in one page like /proveniens (NO section, then the
+// EN section under #en). Every alias carries the one canonical, /vilkar.
+// The operator line is companyOperatorSentence(), the FINN.no sentence is
+// BRAND_ENTITIES.dental.disambiguation and the e-mail address is
+// BRAND_ENTITIES.dental.supportEmail, so none of them is written here. No street
+// address (company-legal.ts: /kontakt and /personvern only). The page names
+// no data source of its own: /proveniens says which sources are used.
+// «Sist oppdatert» is the page's sitemap text date, so the two cannot drift.
+// ═══════════════════════════════════════════════════════════
+
+router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, res: Response) => {
+  const updatedDate = DENTAL_STATIC_PAGE_DATES["/vilkar"];
+  const email = escapeHtml(BRAND_ENTITIES.dental.supportEmail);
+  const html = `
+<main>
+  <div class="content-page">
+    <p style="text-align:right;font-size:.9rem"><a href="#en">English</a></p>
+    <h1>Vilkår for bruk</h1>
+    <p style="font-size:.85rem;color:var(--g500)">Sist oppdatert: ${updatedDate}</p>
+    <p>Disse vilkårene gjelder for alle som bruker Finn-tannlege.com &mdash; på nettsiden, gjennom REST-API-et, MCP-serveren eller A2A-endepunktet, også når en AI-assistent eller AI-agent bruker tjenesten for deg. Ved å bruke tjenesten godtar du vilkårene.</p>
+    <p>${companyOperatorSentence("nb")} ${escapeHtml(FINN_DISAMBIGUATION_NB)}</p>
+
+    <h2>1. Hva tjenesten er</h2>
+    <p>Finn-tannlege.com er en gratis, søkbar oversikt over tannlegeklinikker i Norge, med opplysninger som adresse, kontaktinformasjon, spesialiteter, Helfo-avtale og akuttilbud. Vi bestiller ikke timer og tar ikke imot betaling. Time avtaler du direkte med klinikken.</p>
+
+    <h2>2. Ikke medisinsk rådgivning</h2>
+    <p>Innholdet er generell informasjon som skal hjelpe deg å finne en klinikk. Det er ikke medisinsk eller odontologisk rådgivning, og det erstatter ikke undersøkelse, diagnose eller råd fra tannlege eller annet helsepersonell. Spørsmål om din egen tannhelse eller behandling tar du med klinikken.</p>
+
+    <h2>3. Akutt hjelp</h2>
+    <p><strong>Ved akutt fare for liv eller helse: ring 113.</strong></p>
+    <p>Trenger du akutt tannbehandling når klinikken din er stengt, kontakter du legevakten på 116 117 eller tannlegevakten der du bor. At en klinikk er merket med akuttilbud her, betyr ikke at den kan ta imot deg nå. Ring klinikken før du drar dit.</p>
+
+    <h2>4. Opplysningene i katalogen</h2>
+    <p>Opplysningene er samlet inn fra offentlige registre, klinikkenes egne nettsider og andre offentlig tilgjengelige kilder, delvis automatisk og med hjelp av KI. Hvilke kilder vi bruker, og hva merkene i katalogen betyr, står på <a href="/proveniens">siden om kilder og metode</a>.</p>
+    <p><strong>Opplysningene vises «som de er».</strong> De kan være utdaterte, ufullstendige eller feil, og vi garanterer ikke at de stemmer. Sjekk åpningstider, Helfo-avtale og akuttilbud med klinikken før du bestiller time eller drar dit. Rekkefølgen i søkeresultatene og merkene på profilene er ingen vurdering av kvaliteten på behandlingen.</p>
+
+    <h2>5. Akseptabel bruk</h2>
+    <ul>
+      <li>Bruk nettsiden, API-et, MCP-serveren og A2A-endepunktet til å finne og sammenligne tannlegeklinikker.</li>
+      <li>Bygg tjenesten inn i egne agenter og verktøy innenfor rate-grensene vi oppgir i <a href="/llms.txt">llms.txt</a>.</li>
+      <li>Følg robots.txt.</li>
+    </ul>
+
+    <h2>6. Forbudt bruk</h2>
+    <ul>
+      <li>Å laste ned hele eller store deler av katalogen for å publisere den som et konkurrerende register uten skriftlig tillatelse.</li>
+      <li>Å bruke kontaktinformasjon herfra til markedsføring, masseutsendelser eller spam til klinikker eller tannleger.</li>
+      <li>Å omgå sikkerhetstiltak, rate-grenser eller tilgangskontroll.</li>
+    </ul>
+
+    <h2>7. For klinikker: retting og fjerning</h2>
+    <p>Er opplysningene om en klinikk feil, kan klinikken be om at de rettes, eller at oppføringen fjernes, ved å skrive til <a href="mailto:${email}">${email}</a> eller bruke <a href="/kontakt">kontaktskjemaet</a>. Rettighetene etter personvernreglene står i <a href="/personvern">personvernerklæringen</a>.</p>
+
+    <h2>8. Ansvar</h2>
+    <p>Finn-tannlege.com er ikke part i avtaler mellom deg og klinikken, og er ikke ansvarlig for behandling, timebestilling, priser eller annet mellom deg og klinikken. Så langt loven tillater det, er vi ikke ansvarlige for tap som følge av feil, mangler eller forsinkelser i opplysningene eller i tjenesten.</p>
+
+    <h2>9. Endringer</h2>
+    <p>Vi kan endre disse vilkårene. Datoen øverst viser når de sist ble endret.</p>
+
+    <h2>10. Gjeldende rett</h2>
+    <p>Norsk rett gjelder. Tvister løses ved selskapets alminnelige verneting, med mindre ufravikelig lov gir deg rett til å bringe saken inn et annet sted.</p>
+
+    <h2>11. Kontakt</h2>
+    <p>Spørsmål om vilkårene sender du til <a href="mailto:${email}">${email}</a>. Selskapsopplysningene står på <a href="/kontakt">kontaktsiden</a>.</p>
+
+    <hr style="margin:36px 0;border:none;border-top:1px solid var(--g100,#e5e7eb)">
+
+    <div lang="en">
+    <h1 id="en">Terms of Service</h1>
+    <p style="font-size:.85rem;color:var(--g500)">Last updated: ${updatedDate}</p>
+    <p>These terms apply to everyone who uses Finn-tannlege.com &mdash; on the website, through the REST API, the MCP server or the A2A endpoint, including when an AI assistant or AI agent uses the service for you. By using the service you accept these terms.</p>
+    <p>${companyOperatorSentence("en")} ${escapeHtml(FINN_DISAMBIGUATION_EN)}</p>
+
+    <h2>1. What the service is</h2>
+    <p>Finn-tannlege.com is a free, searchable directory of dental clinics in Norway, with details such as address, contact information, specialties, Helfo agreement and emergency care. We do not book appointments and we do not take payments. You make appointments directly with the clinic.</p>
+
+    <h2>2. Not medical advice</h2>
+    <p>The content is general information to help you find a clinic. It is not medical or dental advice, and it does not replace an examination, diagnosis or advice from a dentist or other health professional. Take questions about your own dental health or treatment to the clinic.</p>
+
+    <h2>3. Emergencies</h2>
+    <p><strong>If life or health is in immediate danger: call 113.</strong></p>
+    <p>If you need emergency dental treatment while your clinic is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. A clinic marked with emergency care here may still be unable to see you now. Call the clinic before you go there.</p>
+
+    <h2>4. The information in the directory</h2>
+    <p>The information is collected from public registers, the clinics' own websites and other publicly available sources, partly automatically and with the help of AI. Which sources we use, and what the badges in the directory mean, are explained on <a href="/proveniens">the sources and method page</a>.</p>
+    <p><strong>The information is provided "as is".</strong> It may be out of date, incomplete or wrong, and we do not guarantee that it is correct. Check opening hours, Helfo agreement and emergency care with the clinic before you book or go there. The order of search results and the badges on profiles are not an assessment of the quality of treatment.</p>
+
+    <h2>5. Acceptable use</h2>
+    <ul>
+      <li>Use the website, the API, the MCP server and the A2A endpoint to find and compare dental clinics.</li>
+      <li>Build the service into your own agents and tools within the rate limits given in <a href="/llms.txt">llms.txt</a>.</li>
+      <li>Respect robots.txt.</li>
+    </ul>
+
+    <h2>6. Prohibited use</h2>
+    <ul>
+      <li>Downloading all or large parts of the directory to republish it as a competing register without written permission.</li>
+      <li>Using contact details from here for marketing, bulk messages or spam to clinics or dentists.</li>
+      <li>Circumventing security measures, rate limits or access control.</li>
+    </ul>
+
+    <h2>7. For clinics: corrections and removal</h2>
+    <p>If the information about a clinic is wrong, the clinic can ask for it to be corrected, or for the listing to be removed, by writing to <a href="mailto:${email}">${email}</a> or using <a href="/kontakt">the contact form</a>. Rights under data protection law are set out in <a href="/personvern">the privacy policy</a>.</p>
+
+    <h2>8. Liability</h2>
+    <p>Finn-tannlege.com is not a party to agreements between you and the clinic, and is not responsible for treatment, appointments, prices or anything else between you and the clinic. To the extent the law allows, we are not liable for loss caused by errors, omissions or delays in the information or in the service.</p>
+
+    <h2>9. Changes</h2>
+    <p>We may change these terms. The date at the top shows when they last changed.</p>
+
+    <h2>10. Governing law</h2>
+    <p>Norwegian law applies. Disputes are resolved at the company's ordinary venue, unless mandatory law gives you the right to bring the case elsewhere.</p>
+
+    <h2>11. Contact</h2>
+    <p>Send questions about these terms to <a href="mailto:${email}">${email}</a>. The company details are on <a href="/en/kontakt">the contact page</a>.</p>
+    </div>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: "Vilkår for bruk — Finn-tannlege.com",
+    description: "Vilkår for bruk av Finn-tannlege.com: hva tjenesten er, akutt hjelp, hvor opplysningene kommer fra, akseptabel bruk, ansvar og gjeldende rett. Også på engelsk.",
+    canonical: `${DENTAL_BASE_URL}/vilkar`,
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
 // GET /proveniens — Metode og kilder (the method page)
 //
 // Public, SSR, bilingual (NO primary, EN section in the same page — this
@@ -3604,7 +3739,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
     },
     logo_url: DENTAL_LOGO_PNG_URL, // F2-S4: PNG (was favicon.svg)
     contact_url: `${DENTAL_BASE_URL}/kontakt`,
-    legal_info_url: `${DENTAL_BASE_URL}/om`,
+    legal_info_url: `${DENTAL_BASE_URL}/vilkar`,
   });
 });
 

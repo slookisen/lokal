@@ -63,5 +63,12 @@ export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   // Same day as the page's own «Sist oppdatert» (updatedDate in the
   // /personvern handler); a test keeps the two equal.
   "/personvern": "2026-10-13",
+  // The /vilkar handler prints this as its own «Sist oppdatert» (F2-S5, A2A
+  // dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon). It is the
+  // day the terms take effect: the day Daniel approved the text, 2026-10-19
+  // (A2A daniel-responses/2026-10-19-live-svar-steg-a-og-vilkar.md). The text
+  // is the draft of 2026-10-18; only this date changed. A new date means new
+  // terms, which Daniel approves again (company-legal-sites.test.ts pins it).
+  "/vilkar": "2026-10-19",
   "/proveniens": "2026-10-19",
 };
