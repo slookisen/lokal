@@ -61,6 +61,10 @@ router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSes
 // from BRAND_ENTITIES.dental (A2A dev-request
 // 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S5;
 // dental-mcp-serverinfo-icons.test.ts).
+// The emergency claim (`akutt`) reads the same everywhere it is described, here
+// and in the tool texts below: «Akuttvakt» only with a stored quote from the
+// source (F1-S4c in 2026-10-16-finn-tannlege-fasettsider), otherwise «Tar imot
+// akuttpasienter» (G3-S6d; dental-mcp-instructions.test.ts D11).
 
 /** Server-wide guidance returned from `initialize`, read by clients alongside the tool descriptions. */
 export const DENTAL_MCP_INSTRUCTIONS =
@@ -74,8 +78,9 @@ export const DENTAL_MCP_INSTRUCTIONS =
   "Helfo (`helfo_agreement`) means the clinic has a direct-settlement agreement (direkteoppgjør) with Helfo: " +
   "Helfo's share of a treatment that qualifies for support is settled with the clinic, and the patient pays the " +
   "rest. It does not mean the treatment is free. " +
-  "«Akuttvakt» (`akutt`: \"vakt\") is an emergency duty backed by a recorded source; «Tar imot akuttpasienter» " +
-  "(`akutt`: \"accepts\") only says that the clinic takes emergency patients. " +
+  "An emergency claim (`akutt`) is «Akuttvakt» (`akutt`: \"vakt\"), an emergency duty backed by a stored quote " +
+  "from the source, or «Tar imot akuttpasienter» (`akutt`: \"accepts\"), which only says that the clinic takes " +
+  "emergency patients. " +
   "For acute toothache or a dental injury, give the clinic's phone number and the advice on the municipal " +
   "out-of-hours dental service (kommunal tannlegevakt) from tannlege_akutt. Finn-tannlege gives no medical or " +
   "dental advice. " +
@@ -111,7 +116,7 @@ export const TannlegeSearchInputSchema = {
     "If true, only return clinics with Helfo direct-billing agreement"
   ),
   akutt: z.boolean().optional().describe(
-    "If true, only return clinics with emergency-duty (akuttvakt)"
+    "If true, only return clinics with an emergency claim: «Akuttvakt» backed by a stored source quote, or «Tar imot akuttpasienter»."
   ),
   limit: z.number().min(1).max(25).default(10).describe(
     "Max results (default 10, max 25)"
@@ -257,9 +262,10 @@ export function registerDentalTools(server: McpServer): void {
       description:
         "Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, " +
         "by organisation number (org_nr) or id. " +
-        "Returns name, address, phone, mobile, e-mail, website, online booking link, Helfo status, emergency duty " +
-        "when it has a recorded source, specialties, chain, specialists, treatments, opening hours, payment options, " +
-        "the clinic's own description and profile URL.",
+        "Returns name, address, phone, mobile, e-mail, website, online booking link, Helfo status, the emergency " +
+        "claim («Akuttvakt» only when an emergency duty has a stored quote from the source; «Tar imot " +
+        "akuttpasienter» when the clinic says it takes emergency patients), specialties, chain, specialists, " +
+        "treatments, opening hours, payment options, the clinic's own description and profile URL.",
       inputSchema: TannlegeInfoInputSchema,
       annotations: {
         title: "Get dental clinic details",
@@ -315,8 +321,8 @@ export function registerDentalTools(server: McpServer): void {
       description:
         "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many " +
         "have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. " +
-        "An emergency claim is an emergency duty with a recorded source (akuttvakt), or that the clinic says it " +
-        "takes emergency patients.",
+        "An emergency claim is «Akuttvakt», an emergency duty backed by a stored quote from the source, or «Tar " +
+        "imot akuttpasienter», that the clinic says it takes emergency patients.",
       inputSchema: {},
       annotations: {
         title: "Norwegian dental market statistics",
@@ -355,18 +361,18 @@ export function registerDentalTools(server: McpServer): void {
   server.registerTool(
     "tannlege_akutt",
     {
-      title: "Find emergency-duty dental clinics in Norway",
+      title: "Find dental clinics for emergency care in Norway",
       description:
-        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a " +
-        "recorded source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke). " +
-        "Each clinic's `akutt` is \"vakt\" when the emergency duty has a recorded source (badge «Akuttvakt») and " +
-        "\"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»). " +
+        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics that say they take emergency " +
+        "patients, optionally in one county (fylke). " +
+        "Each clinic's `akutt` is \"vakt\" only when its emergency duty has a stored quote from the source (badge " +
+        "«Akuttvakt»), and \"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»). " +
         "`count` is the number of matching clinics. " +
         "Each clinic has its address, phone and profile URL, and when known its opening hours and online booking " +
         "link. The response also has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
       inputSchema: TannlegeAkuttInputSchema,
       annotations: {
-        title: "Find emergency-duty dental clinics",
+        title: "Find dental clinics for emergency care",
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,

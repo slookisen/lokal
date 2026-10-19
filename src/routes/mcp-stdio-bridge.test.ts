@@ -216,7 +216,8 @@ export async function runMcpStdioBridgeTests(opts: { log?: boolean } = {}): Prom
       shared.equals(fs.readFileSync(path.join(ROOT, sc.pkgDir, "stdio-bridge.js"))));
     const pkg = JSON.parse(read(`${sc.pkgDir}/package.json`));
     const sj = JSON.parse(read(`${sc.pkgDir}/server.json`));
-    const version = { dental: "0.2.1", rfb: "0.5.0", experiences: "0.4.0" }[id];
+    // dental 0.2.2: the text of G3-S6d (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker); same bridge as 0.2.1.
+    const version = { dental: "0.2.2", rfb: "0.5.0", experiences: "0.4.0" }[id];
     check(`${id}-bridge-2 package.json + server.json are ${version} (both places in server.json)`,
       pkg.version === version && sj.version === version && sj.packages[0].version === version, `${pkg.version}/${sj.version}`);
     check(`${id}-bridge-3 package.json files ships index.js + stdio-bridge.js`,

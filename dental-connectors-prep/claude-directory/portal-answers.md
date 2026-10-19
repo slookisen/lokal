@@ -28,7 +28,7 @@ The client must send `initialize` first. A request without a live session gets 4
 | `tannlege_search` | Search Norwegian dental clinics | (same) | true | false | true | Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by place, county (fylke), specialty, Helfo direct billing or emergency care. |
 | `tannlege_info` | Get full details for a dental clinic | Get dental clinic details | true | false | true | Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, by organisation number (org_nr) or id. |
 | `tannlege_stats` | Norwegian dental market statistics | (same) | true | false | false | Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. |
-| `tannlege_akutt` | Find emergency-duty dental clinics in Norway | Find emergency-duty dental clinics | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a recorded source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke). |
+| `tannlege_akutt` | Find dental clinics for emergency care in Norway | Find dental clinics for emergency care | true | false | true | Find an emergency dentist (akutt tannlege) in Norway: dental clinics that say they take emergency patients, optionally in one county (fylke). |
 | `tannlege_kjeder` | List Norwegian dental chains | (same) | true | false | false | List dentist chains (tannlegekjeder) in Norway that are registered in the directory, each with its number of clinic locations. |
 
 ### Write (0)
@@ -43,13 +43,13 @@ See `listing.md` in this folder. Slug: `finn-tannlege` (permanent once published
 
 ## 4. Use cases
 
-Primary use cases:
+At most 3 use cases of at most 100 characters, each with an example prompt of at most 500 characters. Each prompt is one of the reviewer prompts in `test-instructions.md`.
 
-- Find a dentist in a town or county.
-- Find clinics with an emergency duty (akuttvakt) or that take emergency patients.
-- Filter for clinics with a Helfo direct-billing agreement.
-- Find a clinic with a specific specialty, such as orthodontics.
-- Read one clinic's full record by organisation number.
+| Use case | Characters | Example prompt |
+|---|---|---|
+| Find a dentist in a town or county. | 35 | Find a dentist in Bergen |
+| Filter for clinics with a Helfo direct-billing agreement. | 57 | Which dental clinics in Oslo have a Helfo agreement? |
+| Find clinics that say they take emergency patients, with advice on the out-of-hours dental service. | 99 | I need an emergency dentist in Rogaland |
 
 | Field | Answer |
 |---|---|
@@ -66,13 +66,19 @@ Primary use cases:
 
 ## 6. Authentication
 
-**No authentication.** Paste if the portal asks why:
+**No authentication.**
+
+**Use only if the portal asks.** It has no field for this.
+
+Why there is none:
 
 ```
 The server is a public, read-only directory of Norwegian dental clinics. There are no user accounts and no write operations, so there is nothing to sign in to.
 ```
 
 ## 7. Data handling
+
+**Use only if the portal asks.** It has no field for this.
 
 | Question | Answer |
 |---|---|
@@ -96,7 +102,7 @@ Privacy policy: https://finn-tannlege.com/personvern
 
 | Field | Answer |
 |---|---|
-| Test account | None needed: the server has no authentication and serves public data. |
+| Test account | **Use only if the portal asks.** It has no field for this. None needed: the server has no authentication and serves public data. |
 | Access instructions | The paste block in `test-instructions.md` in this folder. |
 | You ran every tool | Before ticking: call each tool once, through MCP Inspector or as a custom connector in Claude. |
 
@@ -120,7 +126,7 @@ Check the summary, then submit. Status and reviewer feedback appear in the porta
 
 ## Known caveats, to state if asked
 
-- tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.
-- tannlege_akutt narrows by county (fylke) only: a town the server knows is read as the county it lies in, so «Bergen» lists the emergency clinics in all of Vestland. A town it does not know, such as «Sandvika», gives no results. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.
-- Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).
-- Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.
+**Use only if the portal asks.** It has no field for this.
+
+- tannlege_akutt narrows by county (fylke) only: a town the server knows is read as the county it lies in, so «Bergen» covers all of Vestland. A town it does not know, such as «Sandvika», gives no results. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.
+- If life or health is in immediate danger: call 113. Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).
