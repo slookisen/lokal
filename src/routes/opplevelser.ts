@@ -18827,7 +18827,9 @@ export function computeGardssalgOutreachSendEligibility(
     // The producer-level lookup skips the exact-address key, so a same-address row (e.g. our own
     // mirrored send) cannot shadow a domain / website / org.nr hit from a different row.
     const crossBlock = rfbSendIndex.findProducerMatch(crossIdentity);
-    if (crossBlock) {
+    // A producer hit from the SAME row as the exact-address hit is still just the informational
+    // address overlap (Daniel 2026-08-20); only a different row proves a second address.
+    if (crossBlock && !(crossFound && crossFound.match === "email" && crossBlock.hit === crossFound.hit)) {
       out.push({
         provider_id: providerId,
         eligible: false,
