@@ -68,8 +68,18 @@ import { clinicSpecialties } from "../config/dental-search-vocabulary";
 import { shownPostnummer } from "../services/norway-postnummer";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
-import { DENTAL_LANDING_CONFIG, DENTAL_STATIC_PAGE_DATES } from "../config/dental-landing";
+import { DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, DENTAL_STATIC_PAGE_DATES } from "../config/dental-landing";
 import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts, type DentalAreaScope } from "../services/dental-area-facts";
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): the facet
+// pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett>, their sitemap URLs
+// and the links to them from /sted and /fylke.
+import {
+  registerDentalLandingRoutes,
+  publishedDentalFacets,
+  dentalFacetPath,
+  dentalFacetLinksHtml,
+  type DentalLandingPlace,
+} from "./dental-landing";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
 // and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
@@ -2082,16 +2092,19 @@ function areaLandingFor(counts: DentalAreaCounts | undefined, total: number, nam
 // GET /fylke/:fylke
 // ═══════════════════════════════════════════════════════════
 
+// The canonical fylke a /fylke URL segment names, case-insensitive
+// (canonical fylker only, PR-111). /fylke/:fylke and its facet pages (F1-S4a)
+// both read it.
+function findCanonicalFylke(fylkeParam: string): { fylke: string; count: number } | undefined {
+  let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
+  try { stats = getCachedDentalStats(); } catch { /* ok */ }
+  return canonicalFylker(stats.per_fylke).find((f) => f.fylke.toLowerCase() === fylkeParam.toLowerCase());
+}
+
 router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const fylkeParam = String(req.params.fylke);
 
-  let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
-  try { stats = getCachedDentalStats(); } catch { /* ok */ }
-
-  // Case-insensitive match — canonical fylker only (PR-111)
-  const matchedFylke = canonicalFylker(stats.per_fylke).find(
-    (f) => f.fylke.toLowerCase() === fylkeParam.toLowerCase()
-  );
+  const matchedFylke = findCanonicalFylke(fylkeParam);
   if (!matchedFylke) {
     sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Ukjent fylke</h3><p>Vi fant ikke «${escapeHtml(fylkeParam)}» i registeret.</p><a href="/#fylker" class="btn-secondary" style="margin-top:16px">Se alle fylker</a></div></div>`,
@@ -2115,7 +2128,8 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const pageMeta = listPageMeta(page, totalPages);
   const itemList = dentalItemListJsonLd(`Tannleger i ${matchedFylke.fylke}`, pageUrl, agents, offset);
   // F1-S3: intro, fact table and FAQ from the cached aggregate, page 1 only.
-  const landing = areaLandingFor(page === 1 ? getDentalAreaFacts().byFylke.get(matchedFylke.fylke) : undefined, total, matchedFylke.fylke, pageUrl, "fylke");
+  const fylkePlace = fylkeLandingPlace(matchedFylke.fylke);
+  const landing = areaLandingFor(page === 1 ? fylkePlace.counts : undefined, total, matchedFylke.fylke, pageUrl, "fylke");
 
   // PR-116: Poststed chips for this fylke (≥2 clinics, max 30). One chip per
   // /sted group, with the group's count, in the fylke of its main row (D3b).
@@ -2153,6 +2167,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
     ${landing.faqHtml}
+    ${dentalFacetLinksHtml(fylkePlace)}
     ${poststedChips}
   </div>
 </main>`;
@@ -2285,6 +2300,20 @@ function buildDentalSitemapXml(): string {
       if (!isDentalStedIndexable(group.count)) continue;
       xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/sted/${slug}`, "weekly", "0.75", lastmods?.forPoststed(stedSpellings(group)))}`;
     }
+
+    // Facet pages (A2A dev-request 2026-10-16-finn-tannlege-fasettsider,
+    // F1-S4a): the ones over the facet gate, of the places the facet routes
+    // look up (findStedLandingPlace, findFylkeLandingPlace), so each URL here
+    // answers 200. lastmod: the newest clinic in the facet, from the cached
+    // aggregate the gate and the page's «Sist oppdatert» read.
+    const facetUrls = (place: DentalLandingPlace | undefined): void => {
+      if (!place) return;
+      for (const { facet, counts } of publishedDentalFacets(place)) {
+        xml += `\n  ${urlTag(`${DENTAL_BASE_URL}${dentalFacetPath(place, facet)}`, "weekly", "0.6", counts.max_updated_at?.slice(0, 10))}`;
+      }
+    };
+    for (const slug of stedGroups().bySlug.keys()) facetUrls(findStedLandingPlace(slug));
+    for (const f of canonicalFylker(stats.per_fylke)) facetUrls(findFylkeLandingPlace(f.fylke));
 
     // Clinic pages — getDentalAgentsForSitemap for lastmod support (PR-116)
     let clinicRows: Array<{ org_nr: string; navn: string; updated_at: string | null }> = [];
@@ -2477,6 +2506,16 @@ ${DENTAL_BASE_URL}/spesialitet/endodonti
 ${DENTAL_BASE_URL}/spesialitet/pedodonti
 ${DENTAL_BASE_URL}/spesialitet/oral-protetikk
 ${DENTAL_BASE_URL}/spesialitet/kjeve-og-ansiktsradiologi
+
+## Fasettsider
+
+Klinikkene på ett sted eller i ett fylke med ett bestemt tilbud:
+${DENTAL_BASE_URL}/sted/{sted}/{fasett}
+${DENTAL_BASE_URL}/fylke/{fylke}/{fasett}
+
+Fasetter: ${DENTAL_LANDING_FACETS.filter((f) => f.enabled).map((f) => f.slug).join(", ")}
+Fasetten tannlegevakt lister bare klinikker som oppgir akuttvakt med kilde.
+En fasettside finnes bare når minst ${DENTAL_LANDING_CONFIG.facets.minListings} klinikker på stedet har tilbudet. Alle som finnes, står i ${DENTAL_BASE_URL}/sitemap.xml.
 
 ## Slik fungerer det
 
@@ -3453,9 +3492,8 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   const itemList = dentalItemListJsonLd(`Tannlege i ${titledSted}`, pageUrl, agents, offset);
   // F1-S3: intro, fact table and FAQ from the cached aggregate (the same
   // spellings the page lists), page 1 only.
-  const landing = areaLandingFor(
-    page === 1 ? sumAreaCounts(stedSpellings(stedGroup).map((sp) => getDentalAreaFacts().byPoststed.get(sp))) : undefined,
-    total, titledSted, pageUrl, "poststed");
+  const stedPlace = stedLandingPlace(stedSlugParam, stedGroup);
+  const landing = areaLandingFor(page === 1 ? stedPlace.counts : undefined, total, titledSted, pageUrl, "poststed");
 
   // BreadcrumbList
   const breadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
@@ -3488,6 +3526,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
     ${landing.faqHtml}
+    ${dentalFacetLinksHtml(stedPlace)}
     ${fylkeLink}
   </div>
 </main>`;
@@ -3502,6 +3541,60 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     ...(isDentalStedIndexable(total) ? {} : { robots: "noindex,follow" }),
     jsonLd: [itemList, stedBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
   }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /sted/:stedSlug/:facet + GET /fylke/:fylke/:facet (A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider, F1-S4a; routes/dental-landing.ts)
+// ═══════════════════════════════════════════════════════════
+
+// The places the facet routes, the sitemap and the facet links on /sted and
+// /fylke are about, built one way for all three: a facet URL is in the
+// sitemap exactly when its route answers 200.
+
+/** A /sted group as a facet place: the counts of the spellings it lists, summed. */
+function stedLandingPlace(slug: string, group: StedGroup): DentalLandingPlace {
+  const facts = getDentalAreaFacts();
+  return {
+    scope: "poststed",
+    name: titleCasePoststed(group.row.poststed),
+    path: `/sted/${slug}`,
+    filter: stedFilter(group),
+    counts: sumAreaCounts(stedSpellings(group).map((sp) => facts.byPoststed.get(sp))),
+  };
+}
+
+/** The facet place of a /sted slug whose /sted page is indexable (decision 7=A), else undefined. */
+function findStedLandingPlace(slug: string): DentalLandingPlace | undefined {
+  const group = findStedGroup(slug);
+  return group && isDentalStedIndexable(group.count) ? stedLandingPlace(slug, group) : undefined;
+}
+
+/** A canonical fylke as a facet place. */
+function fylkeLandingPlace(fylke: string): DentalLandingPlace {
+  return { scope: "fylke", name: fylke, path: `/fylke/${encodeURIComponent(fylke)}`, filter: { fylke }, counts: getDentalAreaFacts().byFylke.get(fylke) };
+}
+
+/** The facet place of a /fylke URL segment that names a canonical fylke, else undefined. */
+function findFylkeLandingPlace(param: string): DentalLandingPlace | undefined {
+  const matched = findCanonicalFylke(param);
+  return matched ? fylkeLandingPlace(matched.fylke) : undefined;
+}
+
+// Before the catch-all 404, which answers for every facet URL these leave to next().
+registerDentalLandingRoutes(router, {
+  baseUrl: DENTAL_BASE_URL,
+  shell: dentalShell,
+  clinicCard,
+  breadcrumbJsonLd,
+  itemListJsonLd: dentalItemListJsonLd,
+  paginationHtml,
+  listPageHref,
+  listPageMeta,
+  resolveListPage,
+  listAgents: listPublicDentalAgents,
+  findSted: findStedLandingPlace,
+  findFylke: findFylkeLandingPlace,
 });
 
 // ═══════════════════════════════════════════════════════════

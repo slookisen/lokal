@@ -44,6 +44,13 @@ export function resolveAcuteClaim(a: AcuteClaimInput): AcuteClaim {
   return null;
 }
 
+// The "vakt" branch of resolveAcuteClaim: acute_vakt = 1 with provenance
+// (hasAcuteVaktProvenance). Shared by the two SQL twins below.
+const ACUTE_VAKT_WITH_PROVENANCE_SQL =
+  "acute_vakt = 1 AND json_valid(field_provenance) AND (" +
+  "json_array_length(field_provenance, '$.acute_vakt') > 0 OR json_array_length(field_provenance, '$.acute_vakt.sources') > 0" +
+  ")";
+
 /**
  * SQL twin of `resolveAcuteClaim(row) !== null` on the dental_agents columns
  * (dev-request 2026-10-16-tannlege-sok-naturlig-sprak, S2b): the public akutt
@@ -61,10 +68,19 @@ export function resolveAcuteClaim(a: AcuteClaimInput): AcuteClaim {
  */
 export const DENTAL_ACUTE_CLAIM_SQL =
   "(CASE" +
-  " WHEN acute_vakt = 1 AND json_valid(field_provenance) AND (" +
-  "json_array_length(field_provenance, '$.acute_vakt') > 0 OR json_array_length(field_provenance, '$.acute_vakt.sources') > 0" +
-  ") THEN 1" +
+  ` WHEN ${ACUTE_VAKT_WITH_PROVENANCE_SQL} THEN 1` +
   " WHEN json_valid(patient_focus) AND json_type(patient_focus) = 'array' AND EXISTS (" +
   "SELECT 1 FROM json_each(patient_focus) WHERE json_each.type = 'text' AND json_each.value LIKE '%akutt%'" +
   ") THEN 1" +
   " ELSE 0 END) = 1";
+
+/**
+ * SQL twin of `resolveAcuteClaim(row) === "vakt"`: «Akuttvakt» with a source,
+ * never the softer «Tar imot akuttpasienter» (A2A dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, F1-S4: the tannlegevakt pages list
+ * only clinics with sourced vakt). A row with acute_vakt = 1 and no
+ * provenance is not one. In a CASE, as above, so json_valid is read before
+ * json_array_length wherever the planner puts the clause. KEEP IN SYNC with
+ * resolveAcuteClaim; dental-landing.test.ts checks that both pick the same rows.
+ */
+export const DENTAL_ACUTE_VAKT_SQL = `(CASE WHEN ${ACUTE_VAKT_WITH_PROVENANCE_SQL} THEN 1 ELSE 0 END) = 1`;

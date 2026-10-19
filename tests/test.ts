@@ -36457,6 +36457,35 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental area landing (F1-S3): unexpected error: " + String(err?.message || err));
   }
 
+  // ── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): facet
+  //    pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett> behind one gate,
+  //    the same predicate for route, sitemap and links, and the facet config ──
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): dental facet pages ──");
+  try {
+    const { runDentalLandingConfigTests } = require("../src/config/dental-landing.test") as
+      typeof import("../src/config/dental-landing.test");
+    const dlc = runDentalLandingConfigTests({ log: false });
+    passed += dlc.passed;
+    failed += dlc.failed;
+    for (const f of dlc.failures) failures.push("dental landing config (F1-S4a): " + f);
+    console.log(`  dental landing config (F1-S4a): ${dlc.passed} passed, ${dlc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental landing config (F1-S4a): unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runDentalLandingTests } = require("../src/routes/dental-landing.test") as
+      typeof import("../src/routes/dental-landing.test");
+    const dl4 = await runDentalLandingTests({ log: false });
+    passed += dl4.passed;
+    failed += dl4.failed;
+    for (const f of dl4.failures) failures.push("dental landing (F1-S4a): " + f);
+    console.log(`  dental landing (F1-S4a): ${dl4.passed} passed, ${dl4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental landing (F1-S4a): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
