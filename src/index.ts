@@ -8,6 +8,7 @@ import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
 import { getSearchConsolesHealth, startSearchConsoleScheduler } from "./services/search-console-fetch";
+import { startAiCitationPanelScheduler } from "./services/ai-citation/panel-job";
 import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
   securityHeaders,
@@ -68,6 +69,7 @@ import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
 import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
+import adminAiCitationsRoutes from "./routes/admin-ai-citations";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
@@ -807,6 +809,9 @@ app.get("/health", (_req, res) => {
 // (A2A 2026-10-16-gsc-bing-ai-rapporter, S6c). Own router, mounted before the
 // analytics router below.
 app.use("/admin/analytics/search-consoles", adminLimiter, adminSearchConsolesRoutes);
+// GET /admin/analytics/ai-citations[/status] — the weekly AI citation panel
+// (A2A 2026-10-16-siteringspanel, S5a/S5b). Own router, before the analytics router.
+app.use("/admin/analytics/ai-citations", adminLimiter, adminAiCitationsRoutes);
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
@@ -1514,6 +1519,14 @@ app.listen(Number(PORT), HOST, async () => {
   // BING_WEBMASTER_API_KEY is set; SEARCH_CONSOLE_FETCH_ENABLED=0 turns it off.
   // Status in /health (searchConsoles), numbers at /admin/analytics/search-consoles.
   startSearchConsoleScheduler({ getDb: () => getDb() });
+
+  // ─── AI citation panel (A2A dev-request 2026-10-16-siteringspanel, S5b)
+  // Weekly: ~50 Norwegian questions to the AI engines whose key is set, cited
+  // URLs stored in ai_citation_results. OFF unless AI_CITATION_PANEL_ENABLED=1;
+  // first check 15 min after boot, then hourly, never 00–01Z / 06:30–09:30Z,
+  // capped by AI_CITATION_MAX_USD_PER_RUN / _PER_MONTH. Read at
+  // /admin/analytics/ai-citations (+ /status).
+  startAiCitationPanelScheduler({ getDb: () => getDb() });
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // in-memory delivery counts are written as daily sums every minute and on
