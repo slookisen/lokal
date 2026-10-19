@@ -56,7 +56,7 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
@@ -5087,7 +5087,7 @@ function passesRoleGate(
     console.error("[seo] role-gate umbrella lookup failed:", e);
   }
   const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
-  const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
+  const failsRoleGate = failsProducerRoleGate(agent.role, agentIsUmbrellaForGate);
   if (failsRoleGate || !roleGateIsVetted || !roleGateListable) {
     if (!roleGateListable) {
       console.log(`[seo:listability-gate] suppressed hidden/non-RFB agent ${agent.id} on /produsent/${requestedSlug}`);
