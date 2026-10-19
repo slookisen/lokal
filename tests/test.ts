@@ -43714,6 +43714,25 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // Varies process.env.ADMIN_KEY itself (own restore-in-finally) — runSerial
+  // chain, same exemption reasoning as analytics-adminkey.test.ts above.
+  console.log("\n── dev-request 2026-10-03-partner-effektrapport-per-gaard (slice 1): GET /admin/analytics/partner-report ──");
+  try {
+    const { runAnalyticsPartnerReportTests } = require("../src/routes/analytics-partner-report.test") as
+      typeof import("../src/routes/analytics-partner-report.test");
+    const apr = await runAnalyticsPartnerReportTests({ log: false });
+    passed += apr.passed;
+    failed += apr.failed;
+    for (const f of apr.failures) failures.push("analytics-partner-report: " + f);
+    console.log(`  analytics-partner-report: ${apr.passed} passed, ${apr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-partner-report: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ analytics-partner-report: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // Runs in the runSerial() chain, right after analytics-adminkey.test.ts,
   // i.e. post-barrier/sequential — same exemption reasoning as crm.test.ts
   // and analytics-adminkey.test.ts above: it varies process.env.ADMIN_KEY
