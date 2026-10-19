@@ -160,6 +160,10 @@ function provenanceSourceCounts(raw: string | null): Record<string, number> {
 interface VerifierStoredVerdict {
   domain_coherence?: { coherent?: boolean; reason?: string } | null;
   email_ownership_unproven?: boolean | null;
+  // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld: set by
+  // the verifier when email_own_domain passed only via the cross-TLD homepage
+  // branch. Informational, never a blocker.
+  email_own_domain_via?: string | null;
   // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
   // og-uten-reevaluering, punkt 1 — the additional shapes
   // lokal-agent-verifier.ts's crossSourceResults can carry, read here so
@@ -600,6 +604,9 @@ router.get("/", (req: Request, res: Response) => {
         // caller can act on them without string-parsing.
         domain_coherence: domainCoherence,
         email_ownership_unproven: emailOwnershipUnproven,
+        // Informational only (not in pool_blockers): why the email-domain leg
+        // passed although the address is on a different TLD than the site.
+        email_own_domain_via: storedVerdict?.email_own_domain_via ?? null,
         // The verifier's verdict is only as fresh as its last pass over this
         // agent — surfaced so a stale verdict is never mistaken for a live one.
         verifier_verdict_as_of: row.last_verified_at,

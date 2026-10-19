@@ -36708,6 +36708,13 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
     failed += eop.failed;
     for (const f of eop.failures) failures.push("email-ownership-provenance: " + f);
     console.log(`  email-ownership-provenance: ${eop.passed} passed, ${eop.failed} failed`);
+    const { runLokalAgentVerifierEmailCrossTldMarkerTests } = require("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test") as
+      typeof import("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test");
+    const ctm = await runLokalAgentVerifierEmailCrossTldMarkerTests({ log: false });
+    passed += ctm.passed;
+    failed += ctm.failed;
+    for (const f of ctm.failures) failures.push("email-cross-tld-marker: " + f);
+    console.log(`  email-cross-tld-marker: ${ctm.passed} passed, ${ctm.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("email-ownership-provenance: unexpected error: " + String(err?.message || err));

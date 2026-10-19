@@ -344,7 +344,9 @@ const RFB_CX_BACKFILL_PROVENANCE_SOURCE_TYPE = "harvest_contact_email";
 // backfill row by definition has no email provenance yet (cohort requires
 // k.email empty); the on-site proof (findEmailOnOwnSite) only runs later. So
 // the mirror stays strict: a cross-TLD address stays rejected_domain_mismatch
-// here, and gets in via scrape mode (which writes homepage provenance) instead.
+// here. Scrape mode does not help either: it writes source_type
+// "rfb_contact_extraction" provenance, which the verifier's cross-TLD branch
+// does not accept (homepage only), so such an address is not let through there.
 // Stricter than the gate is safe; it only writes fewer rows, never wrong ones.
 function backfillEmailOwnDomain(email: string, website: string): boolean {
   const websiteHost = verifierHostnameFromUrl(website);

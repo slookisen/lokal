@@ -344,6 +344,10 @@ function sameBrandAcrossTld(a: string, b: string): boolean {
 
 // True iff field_provenance.email holds a "homepage" record for exactly this
 // email whose source_url host equals (or is domainsEquivalent to) the site host.
+// Not hasHomepageEvidence (cross-source-validator): that helper is looser on
+// the host (any host under the agent's URL root counts), which is fine for the
+// free-mail ownership guard but too permissive for a rule that relaxes the
+// email-domain check, so this one pins the host to the site explicitly.
 function hasOwnSiteHomepageEmailProvenance(raw: unknown, email: string, websiteHost: string): boolean {
   try {
     let obj: unknown = raw;
@@ -2406,6 +2410,16 @@ export async function runVerifierBatch(opts: {
       gate.flags.push(`inference_only_field:${f}`);
     }
 
+    // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld
+    // (Endring 3): persist the "passed only via the cross-TLD homepage branch"
+    // marker onto the stored verdict, same pattern as the markers below, so
+    // /admin/pool-blocker-explain and reviewers can see why the row got in and
+    // AC3 can be counted. Deliberately NOT in gate.reasons/gate.flags: it is
+    // informational and must not change passes or fields_verified/failed.
+    if (gate.email_own_domain_via) {
+      (crossSourceResults as Record<string, unknown>).email_own_domain_via = "cross_tld_homepage";
+    }
+
     // ── Guard #1 (verifier side): website-ownership marker (orch-pr-16) ───────
     // The homepage-provenance crawl stamps field_provenance.website_ownership =
     // { status: "unverified", ... } when the fetched site did not mention the
@@ -2967,6 +2981,10 @@ export function buildRunEnvelope(input: {
     (x) => x.prior_verification_status === "verified" && x.new_verification_status !== "verified"
   ).length;
   const paraplyBlocked = r.filter((x) => x.new_verification_status === "paraply_epost_mangler").length;
+  // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld (AC3):
+  // rows whose email_own_domain passed only via the cross-TLD homepage branch.
+  // The claim is always emitted (value 0 when none), like the other counters.
+  const emailCrossTldHomepage = r.filter((x) => x.email_own_domain_via === "cross_tld_homepage");
   // dev-request 2026-08-23-terminal-unconfirmable: always 0 when
   // RFB_TERMINAL_UNCONFIRMABLE_ENABLED is off. Lets the daily brief see how
   // many agents this run permanently removed from the hourly sweep.
@@ -3016,6 +3034,14 @@ export function buildRunEnvelope(input: {
       },
       { type: "db_state_change", value: verifiedDemoted, meta: { kind: "verified_demoted" } },
       { type: "db_state_change", value: paraplyBlocked, meta: { kind: "agents_paraply_epost_mangler" } },
+      {
+        type: "db_state_change",
+        value: emailCrossTldHomepage.length,
+        meta: {
+          kind: "agents_email_cross_tld_homepage",
+          examples: emailCrossTldHomepage.slice(0, 5).map((x) => x.agent_id),
+        },
+      },
       { type: "db_state_change", value: terminalUnconfirmable, meta: { kind: "agents_terminal_unconfirmable" } },
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
