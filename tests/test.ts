@@ -27367,8 +27367,9 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
       helfo_agreement: "false",
       verification_status: "pending_verify",
     });
+    // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4c): «Akuttvakt» needs the quote from the source.
     db.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?")
-      .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage", value: 1 }] }), akuttId);
+      .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage", value: 1, quote: "Akuttvakt hver kveld og i helgene." }] }), akuttId);
     createDentalAgent({
       navn: "Bergen Uten Kilde Tannlege AS",
       org_nr: "910000003",

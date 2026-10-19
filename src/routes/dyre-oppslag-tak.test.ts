@@ -68,6 +68,9 @@
  *       (a2a-datapart-alle-plattformer.test.ts), which run unchanged. A
  *       change meant to move a row is captured again with
  *         npx tsx src/routes/dyre-oppslag-tak.test.ts --print
+ *       F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider) moved
+ *       the two tannlege_akutt rows, captured again: their
+ *       rad_om_kommunal_tannlegevakt is DENTAL_EMERGENCY_NOTICE.text.
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the

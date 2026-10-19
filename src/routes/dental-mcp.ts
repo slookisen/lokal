@@ -33,6 +33,7 @@ import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
+import { DENTAL_EMERGENCY_NOTICE } from "../config/dental-landing";
 
 import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
@@ -292,7 +293,7 @@ export function registerDentalTools(server: McpServer): void {
         }
 
         // The detail card: the keys this tool has always returned, with the
-        // phone, acute_vakt (Skive B: only with provenance) and profile-link
+        // phone, acute_vakt (only with «Akuttvakt», F1-S4c) and profile-link
         // rules of the search card.
         const result = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
 
@@ -386,15 +387,14 @@ export function registerDentalTools(server: McpServer): void {
         const total = countPublicDentalAgents(filter as any);
         const klinikker = buildSearchResults(agents);
 
-        const advice =
-          "Mange kommuner har kommunal tannlegevakt på kvelder og helger — " +
-          "ring klinikken direkte for å bekrefte åpningstider og tilgjengelighet. " +
-          "Klinikker med Akuttvakt-merke setter som regel av tid til akuttpasienter på kort varsel.";
-
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4c): the
+        // advice is the reviewed emergency notice of the tannlegevakt pages
+        // (113, legevakten 116 117, the local tannlegevakt and the caveat of
+        // /vilkar pkt. 3), not a claim about what clinics with a badge do.
         const result = {
           count: total,
           klinikker,
-          rad_om_kommunal_tannlegevakt: advice,
+          rad_om_kommunal_tannlegevakt: DENTAL_EMERGENCY_NOTICE.text,
         };
 
         // Compact JSON, as tannlege_search: up to 25 cards.

@@ -103,11 +103,19 @@ export const DENTAL_LANDING_FACETS: readonly DentalLandingFacet[] = [
     slug: "helfo", kind: "helfo", filter: { helfo_agreement: "true" },
     h1Label: "Tannleger med Helfo-direkteoppgjør", titleTemplate: "Tannleger med Helfo-direkteoppgjør i {sted}", enabled: false,
   },
-  // Only sourced «Akuttvakt» (resolveAcuteClaim = "vakt"), never the softer
-  // «Tar imot akuttpasienter».
+  // Only «Akuttvakt» (resolveAcuteClaim = "vakt"), never the softer «Tar imot
+  // akuttpasienter». Off since F1-S4c (live check 2026-10-19): a stored
+  // source was only a stamp of where acute_vakt was read, and most of the
+  // clinics it listed describe emergency appointments in opening hours, not
+  // a vakt outside them. «vakt» now needs a stored quote, which no row has
+  // yet, so the pages would be empty. Turned on again in its own small PR
+  // only when (1) Daniel has defined «vakt», (2) the dental write pause is
+  // lifted, (3) the extraction stores `quote` in the acute_vakt provenance
+  // (SKILL schema, mergeFieldProvenance/normaliseSource in
+  // admin-knowledge.ts) and (4) a new enrichment run has stored the quotes.
   {
     slug: "tannlegevakt", kind: "tannlegevakt", filter: { acute_claim: "vakt" },
-    h1Label: "Tannlegevakt", titleTemplate: "Tannlegevakt i {sted}: klinikker med akuttvakt med kilde", enabled: true,
+    h1Label: "Tannlegevakt", titleTemplate: "Tannlegevakt i {sted}: klinikker med akuttvakt med kilde", enabled: false,
   },
   ...DENTAL_SEARCH_VOCABULARY.specialties.map((s): DentalLandingFacet => {
     const title = SPECIALIST_TITLES[s.slug] ?? s.canonical.charAt(0).toUpperCase() + s.canonical.slice(1);
@@ -127,10 +135,12 @@ export function findDentalLandingFacet(slug: string): DentalLandingFacet | undef
  * The emergency notice on the tannlegevakt pages (A2A dev-request
  * 2026-10-16-finn-tannlege-fasettsider, F1-S4): a box above the clinic list
  * on every /sted/<sted>/tannlegevakt and /fylke/<fylke>/tannlegevakt page,
- * and on the national /tannlegevakt hub (F1-S4b). YMYL text, reviewed line
- * by line: change it here only, never in a page. `phones` are the numbers
- * in the text as it writes them, each shown as a tel: link to `tel`. The
- * facet pages are in Norwegian only, so there is no English text.
+ * and on the national /tannlegevakt hub (F1-S4b); MCP tannlege_akutt gives
+ * the same text as rad_om_kommunal_tannlegevakt (F1-S4c). YMYL text,
+ * reviewed line by line: change it here only, never in a page or a tool
+ * answer. `phones` are the numbers in the text as it writes them, each shown
+ * as a tel: link to `tel`. The facet pages are in Norwegian only, so there
+ * is no English text.
  *
  * The last two sentences are word for word the caveat in pkt. 3 of /vilkar,
  * which Daniel approved on 2026-10-19 (A2A

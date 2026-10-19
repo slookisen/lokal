@@ -2440,6 +2440,10 @@ Sitemap: ${DENTAL_BASE_URL}/sitemap.xml
 router.get("/llms.txt", (_req: Request, res: Response) => {
   // ONE catalog number (services/honest-count.ts), read live — not via the 60 s SSR stats cache.
   const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
+  // The tannlegevakt facet is described only while it is on (off since F1-S4c).
+  const vaktFacetLine = DENTAL_LANDING_FACETS.some((f) => f.kind === "tannlegevakt" && f.enabled)
+    ? "Fasetten tannlegevakt lister bare klinikker som oppgir akuttvakt med kilde.\n"
+    : "";
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -2534,8 +2538,7 @@ ${DENTAL_BASE_URL}/sted/{sted}/{fasett}
 ${DENTAL_BASE_URL}/fylke/{fylke}/{fasett}
 
 Fasetter: ${DENTAL_LANDING_FACETS.filter((f) => f.enabled).map((f) => f.slug).join(", ")}
-Fasetten tannlegevakt lister bare klinikker som oppgir akuttvakt med kilde.
-En fasettside finnes bare når minst ${DENTAL_LANDING_CONFIG.facets.minListings} klinikker på stedet har tilbudet. Sidene står i ${DENTAL_BASE_URL}/sitemap.xml. Har en fylkesside nøyaktig de samme klinikkene som én stedsside, står bare stedssiden der.
+${vaktFacetLine}En fasettside finnes bare når minst ${DENTAL_LANDING_CONFIG.facets.minListings} klinikker på stedet har tilbudet. Sidene står i ${DENTAL_BASE_URL}/sitemap.xml. Har en fylkesside nøyaktig de samme klinikkene som én stedsside, står bare stedssiden der.
 
 ## Slik fungerer det
 

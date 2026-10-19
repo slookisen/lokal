@@ -6,7 +6,7 @@
  * (the "detail" card) and A2A message/send (toDentalA2aClinic) all build their
  * clinic objects here, so a field is added, cleaned or link-tagged in one
  * place. Every variant shows a phone only when isDisplayablePhone passes, the
- * raw acute_vakt flag only with provenance, and the profile link only from
+ * raw acute_vakt flag only with «Akuttvakt», and the profile link only from
  * clinicProfileUrl. No variant carries a Google rating: that waits for
  * Daniel's rating policy (Maps Platform terms allow caching only lat/lng and
  * place_id). Dev-request 2026-10-17-dental-d3-rettelser (D3d): the search
@@ -27,7 +27,7 @@
 
 import { DentalAgentSchema, withoutDentalSideColumns, type DentalAgent, type DentalAgentRow, type DentalPerson } from "./dental-store";
 import { resolveVerifiedClaim, shownVerificationStatus } from "./dental-verified-claim";
-import { resolveAcuteClaim, hasAcuteVaktProvenance, ACUTE_ACCEPTS_LABEL, type AcuteClaim } from "./dental-acute-claim";
+import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL, type AcuteClaim } from "./dental-acute-claim";
 import { isDisplayablePhone } from "./contact-normalizer";
 import { shownPostnummer } from "./norway-postnummer";
 import { officialPlaceSpelling } from "./search-intent/norwegian-query";
@@ -57,7 +57,11 @@ export interface DentalSearchCard {
   /** Compact lines, weekdays with the same hours on one line ("Man–Fre 08:00–16:00"). */
   apningstider?: string[];
   helfo_agreement: string | undefined;
-  /** "vakt": emergency duty with a recorded source; "accepts": the clinic says it takes emergency patients; null: neither. */
+  /**
+   * "vakt": emergency duty whose source is stored with its quote (F1-S4c);
+   * "accepts": a source without a quote, or the clinic says it takes
+   * emergency patients; null: neither (resolveAcuteClaim).
+   */
   akutt: AcuteClaim;
   spesialiteter?: string[];
   chain_brand?: string;
@@ -169,7 +173,7 @@ export function toDentalClinicCard(
 /**
  * A clinic in an A2A message/send answer: the stored row as before (so `id`
  * and every other key stay), with the values that were untrue made honest —
- * phone and mobile only when displayable, acute_vakt only with provenance,
+ * phone and mobile only when displayable, acute_vakt only with «Akuttvakt»,
  * the Places-only values null as on the cards (A4-D; also the row's own
  * opening_hours and hjemmeside), verification_status as the badge says it
  * (F2-S8: 'pending_verify' where the claim hides a stored 'verified') — the
@@ -205,9 +209,14 @@ function displayablePhone(phone: string | null | undefined): string | null {
   return isDisplayablePhone(phone) ? phone : null;
 }
 
-/** The raw emergency-duty flag, shown only when the row carries a source for it (dental-acute-claim.ts). */
+/**
+ * The raw emergency-duty flag, shown only when the card says «Akuttvakt»
+ * (resolveAcuteClaim "vakt": a stored quote from the source, A2A dev-request
+ * 2026-10-16-finn-tannlege-fasettsider F1-S4c), so no answer says
+ * acute_vakt: 1 for a clinic whose card says «Tar imot akuttpasienter».
+ */
 function publicAcuteVakt(agent: ClinicRow): 1 | null {
-  return agent.acute_vakt === 1 && hasAcuteVaktProvenance(agent.field_provenance) ? 1 : null;
+  return resolveAcuteClaim(agent) === "vakt" ? 1 : null;
 }
 
 /**
