@@ -139,8 +139,11 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
     (JSON.parse(read("mcp-server/package.json")).files as string[]).includes("server.json"));
   check("dist-13 dental server.json websiteUrl", JSON.parse(read("mcp-server-dental/server.json")).websiteUrl === "https://finn-tannlege.com");
   check("dist-14 opplevagent server.json websiteUrl", JSON.parse(read("mcp-server-opplevagent/server.json")).websiteUrl === "https://opplevagent.no");
-  check("dist-15 dental package versions are 0.2.0 (stdio bridge, G1-S2a)",
-    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.0" && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.0");
+  // 0.2.1 ships the shared bridge that exits on stdin EOF; npm already has 0.2.0 with the first bridge (G1-S2c).
+  check("dist-15 finn-tannlege-mcp is 0.2.1 in every place (shared bridge, G1-S2c)",
+    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.1"
+    && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.1"
+    && JSON.parse(read("mcp-server-dental/server.json")).packages[0].version === "0.2.1");
   check("dist-16 opplevagent-mcp is 0.4.0 in every place (0.3.0 was never published)",
     JSON.parse(read("mcp-server-opplevagent/package.json")).version === "0.4.0"
     && JSON.parse(read("mcp-server-opplevagent/server.json")).version === "0.4.0"
