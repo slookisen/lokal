@@ -3092,8 +3092,8 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
     <p>If you need emergency dental treatment while your clinic is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. A clinic marked with emergency care here may still be unable to see you now. Call the clinic before you go there.</p>
 
     <h2>4. The information in the directory</h2>
-    <p>The information is collected from public registers, the clinics' own websites and other publicly available sources, partly automatically and with the help of AI. Which sources we use, and what the badges in the directory mean, is on <a href="/proveniens">the sources and method page</a>.</p>
-    <p><strong>The information is provided "as is".</strong> It may be out of date, incomplete or wrong, and we do not guarantee that it is correct. Check opening hours, Helfo agreement and emergency care with the clinic before you book or go there. The order of search results and the badges on profiles are no assessment of the quality of treatment.</p>
+    <p>The information is collected from public registers, the clinics' own websites and other publicly available sources, partly automatically and with the help of AI. Which sources we use, and what the badges in the directory mean, are explained on <a href="/proveniens">the sources and method page</a>.</p>
+    <p><strong>The information is provided "as is".</strong> It may be out of date, incomplete or wrong, and we do not guarantee that it is correct. Check opening hours, Helfo agreement and emergency care with the clinic before you book or go there. The order of search results and the badges on profiles are not an assessment of the quality of treatment.</p>
 
     <h2>5. Acceptable use</h2>
     <ul>
