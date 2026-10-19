@@ -23,21 +23,37 @@
  *      facet with one fact, the disabled Helfo facet (unsourced Helfo rows),
  *      an unknown facet, place or fylke are 404 with noindex; 3 clinics with
  *      2 facts is 200.
- *   E  the sitemap: exactly the facet pages over the gate, once each, lastmod
- *      the newest clinic in the facet; parity: every facet URL in it answers
- *      200 and every other place × facet combination 404.
+ *   E  the sitemap: exactly the facet pages over the gate that are their own
+ *      canonical, once each, lastmod the newest clinic in the facet; parity:
+ *      every facet URL in it answers 200 as its own canonical, and every
+ *      other place × facet combination is a 404 or a fylke page whose
+ *      canonical is a /sted facet URL in it (section O).
  *   F  links from /sted and /fylke to the place's facet pages (and only
  *      those), each answering 200.
  *   G  paging: page 2 has its own canonical, ItemList positions from 51, no
  *      intro, table or FAQ; a ?side= past the end is page 1.
  *   H  escaping of a place name with markup.
  *   I  a cache behind the data: the page states no number until it catches
- *      up; a facet whose clinics all closed is 404.
+ *      up, nor does its meta description; a facet whose clinics all closed
+ *      is 404.
  *   J  the two facet routes are registered before the catch-all, and no
  *      other route matches a facet URL.
  *   K  the facet pages' text never says FINN or «Finn» alone (decision 4=A).
  *   L  recordAiPageDelivery: an AI search fetch counts the page's clinics.
  *   M  llms.txt names the URL patterns and the facets that are on.
+ *   N  the emergency notice (DENTAL_EMERGENCY_NOTICE): one marked box with
+ *      the config's text and tel: links for 113 and 116 117, above the list
+ *      on every tannlegevakt page of /sted and /fylke, on page 2 and while
+ *      the cache is behind; on no other facet page and no /sted or /fylke
+ *      page.
+ *   O  a fylke facet page with exactly the clinics of one /sted facet page
+ *      (one spelling, two spellings, two pages) has that page as canonical
+ *      and is not in the sitemap; one with a clinic in another poststed, in
+ *      no poststed, or whose /sted page has a clinic in another fylke is its
+ *      own canonical and in it; the decision follows the cached aggregate.
+ *   P  the sitemap runs no statement per place or facet: as many with 5
+ *      more facet URLs (counted on Statement.prototype, as in
+ *      dental-area-landing.test.ts F4d).
  *
  * Same harness as dental-area-landing.test.ts (in-memory dental DB, the
  * router driven through router.handle()).
@@ -85,6 +101,12 @@ const robotsOf = (html: string): string => (html.match(/<meta name="robots" cont
 const canonicalOf = (html: string): string => (html.match(/<link rel="canonical" href="([^"]*)">/) || [])[1] ?? "";
 const titleOf = (html: string): string => (html.match(/<title>([^<]*)<\/title>/) || [])[1] ?? "";
 const descriptionOf = (html: string): string => (html.match(/<meta name="description" content="([^"]*)">/) || [])[1] ?? "";
+/** The description, og:description and twitter:description, decoded. */
+const metaDescriptions = (html: string): string[] =>
+  Array.from(html.matchAll(/<meta (?:name|property)="(?:description|og:description|twitter:description)" content="([^"]*)">/g), (m) => decode(m[1]!));
+/** The emergency notice boxes (DENTAL_EMERGENCY_NOTICE) on a page. */
+const noticesOf = (html: string): string[] => Array.from(html.matchAll(/<aside class="akutt-banner emergency-notice"[^>]*>([\s\S]*?)<\/aside>/g), (m) => m[1]!);
+const textOf = (html: string): string => decode(html.replace(/<[^>]*>/g, ""));
 const h1Of = (html: string): string => (html.match(/<h1 class="profile-name">([^<]*)<\/h1>/) || [])[1] ?? "";
 const mainOf = (html: string): string => html.slice(html.indexOf("<main>"), html.indexOf("</main>"));
 const jsonLdBlocks = (html: string): any[] =>
@@ -152,7 +174,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     const store = require("../services/dental-store") as typeof import("../services/dental-store");
     const areaFacts = require("../services/dental-area-facts") as typeof import("../services/dental-area-facts");
     const dentalSeo = require("./dental-seo") as typeof import("./dental-seo");
-    const { DENTAL_LANDING_FACETS, DENTAL_LANDING_CONFIG } = require("../config/dental-landing") as typeof import("../config/dental-landing");
+    const { DENTAL_LANDING_FACETS, DENTAL_LANDING_CONFIG, DENTAL_EMERGENCY_NOTICE } = require("../config/dental-landing") as typeof import("../config/dental-landing");
     const { resolveAcuteClaim, DENTAL_ACUTE_VAKT_SQL } = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
     const { __resetDentalSearchGazetteerForTesting } = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
     const router = dentalSeo.default as any;
@@ -253,6 +275,18 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     ];
     for (const [k, x] of edge) mk(`Paritet ${k} AS`, "PARITET", "Nordland", x);
 
+    // Fylke facet pages that list more than any one /sted facet page (S3):
+    // ASKØY puts a fifth sourced vakt in Vestland besides Bergen's 4; a
+    // kjeveortopedi clinic in Telemark has no poststed at all.
+    mk("Askøy Vakt AS", "ASKØY", "Vestland", { acuteVakt: 1, provenance: PROV, updatedAt: "2026-04-01 10:00:00" });
+    const noPoststed = mk("Uten Poststed Kjeve AS", "UTEN", "Telemark", { specialties: '["kjeveortopedi"]', updatedAt: "2026-07-01 10:00:00" });
+    db.prepare("UPDATE dental_agents SET poststed = NULL WHERE id = ?").run(noPoststed);
+    // GRENSE: 54 sourced vakt in Innlandet (one Helfo) and 1 in Trøndelag, so
+    // /sted/grense/tannlegevakt (55) lists more than /fylke/Innlandet/… (54),
+    // and both have a page 2.
+    for (let i = 1; i <= 54; i++) mk(`Grense Vakt ${String(i).padStart(2, "0")} AS`, "GRENSE", "Innlandet", { acuteVakt: 1, provenance: PROV, helfo: i === 1, updatedAt: "2026-03-10 10:00:00" });
+    mk("Grense Trøndelag Vakt AS", "GRENSE", "Trøndelag", { acuteVakt: 1, provenance: PROV, updatedAt: "2026-03-11 10:00:00" });
+
     const facetBySlug = (slug: string) => DENTAL_LANDING_FACETS.find((f) => f.slug === slug)!;
     const dayOf = (v: string | null | undefined): string | null => (v && /^\d{4}-\d{2}-\d{2}/.test(v) ? v.slice(0, 10) : null);
 
@@ -342,7 +376,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       assertTrue(page.text.includes("5 klinikker registrert"), "B21: the header count");
 
       const fylke = await callRoute(router, "/fylke/Oslo/kjeveortopedi");
-      assertEq([fylke.status, h1Of(fylke.text), canonicalOf(fylke.text)], [200, "Kjeveortoped i Oslo", `${base}/fylke/Oslo/kjeveortopedi`], "B22: /fylke/Oslo/kjeveortopedi -> 200, same H1, its own canonical");
+      assertEq([fylke.status, h1Of(fylke.text), canonicalOf(fylke.text)], [200, "Kjeveortoped i Oslo", `${base}/sted/oslo/kjeveortopedi`], "B22: /fylke/Oslo/kjeveortopedi -> 200, same H1; it lists the same 5 clinics as /sted/oslo/kjeveortopedi, which is its canonical (S3, section O)");
       assertTrue(introOf(fylke.text).startsWith("I Oslo har vi 5 tannlegeklinikker med kjeveortopedi i oversikten."), "B23: the fylke wording");
       assertEq(ofType(fylke.text, "FAQPage")[0]?.mainEntity?.[0]?.name, "Hvor mange tannlegeklinikker med kjeveortopedi finnes det i Oslo?", "B24: the fylke FAQ asks about the fylke");
       assertEq(ofType(fylke.text, "BreadcrumbList")[0]?.itemListElement?.map((c: any) => c.item), [base, `${base}/fylke/Oslo`, `${base}/fylke/Oslo/kjeveortopedi`], "B25: breadcrumb Hjem → Oslo (fylke) → facet");
@@ -368,8 +402,8 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
 
       const fylke = await callRoute(router, "/fylke/Vestland/tannlegevakt");
       assertEq([fylke.status, h1Of(fylke.text)], [200, "Tannlegevakt i Vestland"], "C11: /fylke/Vestland/tannlegevakt -> 200");
-      assertTrue(introOf(fylke.text).startsWith("I Vestland har vi 4 tannlegeklinikker med akuttvakt i oversikten."), "C12: fylke intro");
-      assertEq(cardNames(fylke.text).sort(), ["Bergen Vakt 1 AS", "Bergen Vakt 2 AS", "Bergen Vakt 3 AS", "Bergen Vakt 4 AS"], "C13: the same 4 clinics");
+      assertTrue(introOf(fylke.text).startsWith("I Vestland har vi 5 tannlegeklinikker med akuttvakt i oversikten."), "C12: fylke intro");
+      assertEq(cardNames(fylke.text).sort(), ["Askøy Vakt AS", "Bergen Vakt 1 AS", "Bergen Vakt 2 AS", "Bergen Vakt 3 AS", "Bergen Vakt 4 AS"], "C13: the same 4 clinics and Askøy's");
       const lower = await callRoute(router, "/fylke/vestland/tannlegevakt");
       assertEq([lower.status, canonicalOf(lower.text)], [200, `${base}/fylke/Vestland/tannlegevakt`], "C14: /fylke/vestland/… is read in any case; canonical is the fylke's spelling");
       const upper = await callRoute(router, "/sted/BERGEN/Tannlegevakt");
@@ -377,7 +411,11 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       const molde = await callRoute(router, "/sted/molde/tannlegevakt");
       assertEq([molde.status, cardNames(molde.text).sort()], [200, ["Molde Vakt 1 AS", "Molde Vakt 2 AS", "Molde Vakt 3 AS"]], "C16: /sted/molde/tannlegevakt lists both spellings (MOLDE 2 + Molde 1)");
       const mr = await callRoute(router, `/fylke/${encodeURIComponent("Møre og Romsdal")}/tannlegevakt`);
-      assertEq([mr.status, canonicalOf(mr.text)], [200, `${base}/fylke/M%C3%B8re%20og%20Romsdal/tannlegevakt`], "C17: a fylke with spaces and ø: 200, canonical URL-encoded as /fylke's");
+      assertEq(
+        [mr.status, ofType(mr.text, "BreadcrumbList")[0]?.itemListElement?.[2]?.item, canonicalOf(mr.text)],
+        [200, `${base}/fylke/M%C3%B8re%20og%20Romsdal/tannlegevakt`, `${base}/sted/molde/tannlegevakt`],
+        "C17: a fylke with spaces and ø: 200, its URL encoded as /fylke's; its 3 clinics are /sted/molde's (two spellings), so that is the canonical (S3)"
+      );
     }
 
     // ── D. the gate ──────────────────────────────────────────────────────
@@ -421,35 +459,60 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       const facetLocs = all.filter((l) => /\/(?:sted|fylke)\/[^/]+\/[^/]+$/.test(l));
       const expected = [
         "/sted/bergen/tannlegevakt", "/sted/oslo/kjeveortopedi", "/sted/oslo/periodonti", "/sted/molde/tannlegevakt",
-        `/sted/${dentalSeo.slugifyText(evilPlace)}/kjeveortopedi`, "/sted/paged/kjeveortopedi",
-        "/fylke/Oslo/kjeveortopedi", "/fylke/Oslo/periodonti", "/fylke/Vestland/tannlegevakt", "/fylke/Rogaland/kjeveortopedi",
-        "/fylke/M%C3%B8re%20og%20Romsdal/tannlegevakt", "/fylke/Telemark/kjeveortopedi",
+        `/sted/${dentalSeo.slugifyText(evilPlace)}/kjeveortopedi`, "/sted/paged/kjeveortopedi", "/sted/grense/tannlegevakt",
+        "/fylke/Vestland/tannlegevakt", "/fylke/Innlandet/tannlegevakt", "/fylke/Telemark/kjeveortopedi",
       ].map((p) => `${base}${p}`).sort();
-      assertEq([...facetLocs].sort(), expected, "E1: the sitemap's facet URLs are exactly the facet pages over the gate (not Bergen kjeveortopedi 1, Oslo pedodonti 2 or endodonti with one fact, PARITET vakt 2, any Helfo)");
+      assertEq([...facetLocs].sort(), expected, "E1: the sitemap's facet URLs are exactly the facet pages over the gate (not Bergen kjeveortopedi 1, Oslo pedodonti 2 or endodonti with one fact, PARITET vakt 2, any Helfo), less the fylke pages that list the same clinics as a /sted page (Oslo, Rogaland, Møre og Romsdal; S3)");
       assertEq(new Set(facetLocs).size, facetLocs.length, "E2: each facet URL once");
       assertTrue(!facetLocs.some((l) => l.endsWith("/helfo")), "E3: no Helfo facet URL (the facet is off)");
       assertEq(lastmodOf(xml, `${base}/sted/oslo/kjeveortopedi`), "2026-08-20", "E4: lastmod = the newest clinic in the facet");
       assertEq(lastmodOf(xml, `${base}/sted/oslo`), "2026-09-30", "E5: while /sted/oslo keeps its own (the newest Oslo clinic)");
       assertEq(lastmodOf(xml, `${base}/fylke/Vestland/tannlegevakt`), "2026-05-04", "E6: fylke facet lastmod");
 
-      // Parity: every facet URL in the sitemap answers 200; every other place × facet is a 404.
-      const statusOf = new Map<string, number>();
-      for (const l of facetLocs) statusOf.set(l, (await callRoute(router, l.slice(base.length))).status);
-      assertTrue(facetLocs.length > 0 && facetLocs.every((l) => statusOf.get(l) === 200), `E7: every facet URL in the sitemap answers 200 (${facetLocs.length})`);
+      // Parity: every facet URL in the sitemap answers 200 and is its own
+      // canonical; every other place × facet is a 404, or a fylke page that
+      // answers 200 with a /sted facet URL of the sitemap as its canonical.
+      const answer = new Map<string, { status: number; canonical: string }>();
+      const fetchFacet = async (url: string): Promise<{ status: number; canonical: string }> => {
+        let r = answer.get(url);
+        if (!r) {
+          const page = await callRoute(router, url);
+          answer.set(url, (r = { status: page.status, canonical: page.status === 200 ? canonicalOf(page.text) : "" }));
+        }
+        return r;
+      };
+      const ownAnswers: string[] = [];
+      for (const l of facetLocs) {
+        const r = await fetchFacet(l.slice(base.length));
+        if (r.status !== 200 || r.canonical !== l) ownAnswers.push(`${l}: ${r.status} ${r.canonical}`);
+      }
+      assertTrue(facetLocs.length > 0 && ownAnswers.length === 0, `E7: every facet URL in the sitemap answers 200 and is its own canonical (${facetLocs.length}; ${JSON.stringify(ownAnswers)})`);
       const stedSlugs = [...new Set(store.listPoststeder(1).map((p) => dentalSeo.slugifyText(p.poststed)))];
       const fylker = all.filter((l) => /\/fylke\/[^/]+$/.test(l)).map((l) => l.slice(`${base}/fylke/`.length));
       const segments = [...DENTAL_LANDING_FACETS.map((x) => x.slug), "ukjent"];
       const offenders: string[] = [];
+      const pointing: string[] = [];
       let combos = 0;
       for (const p of [...stedSlugs.map((s) => `/sted/${s}`), ...fylker.map((x) => `/fylke/${x}`)]) {
         for (const seg of segments) {
           const url = `${p}/${seg}`;
           combos++;
-          const status = statusOf.get(`${base}${url}`) ?? (await callRoute(router, url)).status;
-          if ((status === 200) !== facetLocs.includes(`${base}${url}`)) offenders.push(`${url}: ${status}`);
+          const { status, canonical } = await fetchFacet(url);
+          const inSitemap = facetLocs.includes(`${base}${url}`);
+          if (status !== 200) {
+            if (inSitemap) offenders.push(`${url}: ${status}, in the sitemap`);
+          } else if (canonical === `${base}${url}`) {
+            if (!inSitemap) offenders.push(`${url}: 200 and its own canonical, not in the sitemap`);
+          } else {
+            pointing.push(url);
+            if (inSitemap || !p.startsWith("/fylke/") || !canonical.startsWith(`${base}/sted/`) || !facetLocs.includes(canonical)) {
+              offenders.push(`${url}: 200 with canonical ${canonical}${inSitemap ? ", in the sitemap" : ""}`);
+            }
+          }
         }
       }
-      assertEq(offenders, [], `E8: over every place × facet (${combos} URLs), 200 exactly when the URL is in the sitemap`);
+      assertEq(offenders, [], `E8: over every place × facet (${combos} URLs), a URL is in the sitemap exactly when it answers 200 as its own canonical; a fylke page with another canonical points to a /sted facet URL of the sitemap`);
+      assertEq(pointing.sort(), ["/fylke/M%C3%B8re%20og%20Romsdal/tannlegevakt", "/fylke/Oslo/kjeveortopedi", "/fylke/Oslo/periodonti", "/fylke/Rogaland/kjeveortopedi"], "E9: the fylke pages with a /sted facet page as canonical are the four that list the same clinics");
     }
 
     // ── F. links from /sted and /fylke ───────────────────────────────────
@@ -510,9 +573,22 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       const behind = await callRoute(router, "/sted/oslo/kjeveortopedi");
       assertEq([behind.status, cards(behind.text).length], [200, 6], "I2: the page lists the live 6 while the aggregate says 5");
       assertTrue(introOf(behind.text) === "" && tableRows(behind.text).length === 0 && ofType(behind.text, "FAQPage").length === 0 && !behind.text.includes("klinikker registrert"), "I3: and states no number (no intro, table, FAQ or header count) until the cache catches up");
+      assertEq(
+        metaDescriptions(behind.text),
+        Array(3).fill("Oversikt over tannlegeklinikker med kjeveortopedi og poststed Oslo. Kjeveortopedi er oppført som spesialitet hos hver av dem."),
+        "I3b: nor does the meta description (and og:/twitter:description): what the page lists, without a count (S1)"
+      );
+      const fylkeBehind = await callRoute(router, "/fylke/Oslo/kjeveortopedi");
+      assertEq(
+        [cards(fylkeBehind.text).length, introOf(fylkeBehind.text), decode(descriptionOf(fylkeBehind.text))],
+        [6, "", "Oversikt over tannlegeklinikker med kjeveortopedi i Oslo. Kjeveortopedi er oppført som spesialitet hos hver av dem."],
+        "I3c: the same on /fylke/Oslo/kjeveortopedi, worded for the fylke"
+      );
+      assertTrue(![...metaDescriptions(behind.text), ...metaDescriptions(fylkeBehind.text)].some((d) => /\d/.test(d)), "I3d: no digit in any of them");
       resetCaches();
       const caught = await callRoute(router, "/sted/oslo/kjeveortopedi");
       assertTrue(introOf(caught.text).startsWith("Vi har 6 tannlegeklinikker med kjeveortopedi") && caught.text.includes("6 klinikker registrert"), "I4: after the refresh it says 6");
+      assertTrue(decode(descriptionOf(caught.text)).startsWith("Vi har 6 tannlegeklinikker med kjeveortopedi og poststed Oslo i oversikten."), "I4b: and the description states the count again");
 
       db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE navn LIKE 'Oslo Perio %'").run();
       assertEq((await callRoute(router, "/sted/oslo/periodonti")).status, 404, "I5: every clinic of a facet closed since the cache: 404, not an empty page");
@@ -593,6 +669,163 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       const line = (txt.match(/^Fasetter: (.*)$/m) || [])[1] ?? "";
       assertEq(line.split(", "), DENTAL_LANDING_FACETS.filter((x) => x.enabled).map((x) => x.slug), "M2: and the facets that are on (no helfo)");
       assertTrue(txt.includes(`minst ${DENTAL_LANDING_CONFIG.facets.minListings} klinikker`) && txt.includes(`${base}/sitemap.xml`), "M3: and the gate, pointing to the sitemap for the pages that exist");
+      assertTrue(txt.includes("Har en fylkesside nøyaktig de samme klinikkene som én stedsside, står bare stedssiden der."), "M4: and says a fylke page with the clinics of one /sted page is not in it (S3)");
+    }
+
+    // ── N. the emergency notice on the tannlegevakt pages ────────────────
+    {
+      resetCaches();
+      const vakt = await callRoute(router, "/sted/bergen/tannlegevakt");
+      const boxes = noticesOf(vakt.text);
+      assertEq([boxes.length, textOf(boxes[0] ?? "")], [1, DENTAL_EMERGENCY_NOTICE.text], "N1: /sted/bergen/tannlegevakt has one emergency notice, its text exactly DENTAL_EMERGENCY_NOTICE's");
+      const box = boxes[0] ?? "";
+      assertTrue(
+        box.includes(`<a href="tel:113" style="white-space:nowrap">113</a>`) && box.includes(`<a href="tel:116117" style="white-space:nowrap">116 117</a>`) && (box.match(/<a /g) || []).length === 2,
+        "N2: 113 and 116 117 are tel: links (tel:113, tel:116117), and nothing else is a link"
+      );
+      assertTrue(/<aside class="akutt-banner emergency-notice" role="note" /.test(vakt.text), "N3: a marked box: an aside with role note, in the akutt banner style");
+      const main = mainOf(vakt.text);
+      const at = main.indexOf(`class="akutt-banner emergency-notice"`);
+      assertTrue(at > 0 && at < main.indexOf(`class="landing-intro"`) && at < main.indexOf(`<article class="clinic-card">`), "N4: it stands above the intro and the clinic list");
+      const others: Array<[string, number]> = [
+        ["/fylke/Vestland/tannlegevakt", 5],
+        ["/sted/grense/tannlegevakt?side=2", 5],
+        ["/fylke/Innlandet/tannlegevakt?side=2", 4],
+      ];
+      for (const [url, n] of others) {
+        const r = await callRoute(router, url);
+        assertTrue(
+          r.status === 200 && cards(r.text).length === n && noticesOf(r.text).length === 1 && textOf(noticesOf(r.text)[0] ?? "") === DENTAL_EMERGENCY_NOTICE.text &&
+            mainOf(r.text).indexOf("emergency-notice") < mainOf(r.text).indexOf(`<article class="clinic-card">`),
+          `N5: ${url} (${n} cards) has it above the list too`
+        );
+      }
+      assertTrue(introOf((await callRoute(router, "/sted/grense/tannlegevakt?side=2")).text) === "", "N6: (page 2 has no intro, but the notice)");
+      // While the list and the aggregate disagree the facts are hidden, the notice is not.
+      const extra = mk("Bergen Vakt 5 AS", "BERGEN", "Vestland", { acuteVakt: 1, provenance: PROV });
+      const behind = await callRoute(router, "/sted/bergen/tannlegevakt");
+      assertTrue(
+        cards(behind.text).length === 5 && introOf(behind.text) === "" && !behind.text.includes("klinikker registrert") && noticesOf(behind.text).length === 1,
+        "N7: with the cache behind the data (5 listed, 4 counted) no number is stated, and the notice stays"
+      );
+      db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = ?").run(extra);
+      resetCaches();
+      const without: string[] = [];
+      for (const url of ["/sted/oslo/kjeveortopedi", "/sted/oslo/periodonti", "/fylke/Telemark/kjeveortopedi", "/sted/paged/kjeveortopedi?side=2", "/sted/bergen", "/fylke/Vestland", "/sted/grense"]) {
+        const r = await callRoute(router, url);
+        if (r.status !== 200 || noticesOf(r.text).length > 0 || r.text.includes("tel:116117")) without.push(`${url}: ${r.status}`);
+      }
+      assertEq(without, [], "N8: no other facet page, and no /sted or /fylke page, has the notice");
+    }
+
+    // ── O. a fylke facet page with the clinics of one /sted facet page ───
+    {
+      resetCaches();
+      const sm = locs((await callRoute(router, "/sitemap.xml")).text);
+      const ogUrlOf = (html: string): string => (html.match(/<meta property="og:url" content="([^"]*)">/) || [])[1] ?? "";
+      const same: Array<[string, string, string]> = [
+        ["/fylke/Oslo/kjeveortopedi", "/sted/oslo/kjeveortopedi", "one spelling"],
+        ["/fylke/Oslo/periodonti", "/sted/oslo/periodonti", "a second facet of the same place"],
+        [`/fylke/${encodeURIComponent("Møre og Romsdal")}/tannlegevakt`, "/sted/molde/tannlegevakt", "two spellings, MOLDE and Molde"],
+        ["/fylke/Rogaland/kjeveortopedi", "/sted/paged/kjeveortopedi", "two pages"],
+      ];
+      for (const [fylkeUrl, stedUrl, what] of same) {
+        const f = await callRoute(router, fylkeUrl);
+        const s = await callRoute(router, stedUrl);
+        assertEq(
+          [f.status, /^index, follow/.test(robotsOf(f.text)), canonicalOf(f.text), ogUrlOf(f.text), cardNames(f.text), sm.includes(`${base}${fylkeUrl}`), sm.includes(`${base}${stedUrl}`), canonicalOf(s.text)],
+          [200, true, `${base}${stedUrl}`, `${base}${stedUrl}`, cardNames(s.text), false, true, `${base}${stedUrl}`],
+          `O1: ${fylkeUrl} lists the clinics of ${stedUrl} (${what}): 200 and indexable, canonical and og:url ${stedUrl}, out of the sitemap; ${stedUrl} stays its own canonical, in the sitemap`
+        );
+      }
+      const f2 = await callRoute(router, "/fylke/Rogaland/kjeveortopedi?side=2");
+      const s2 = await callRoute(router, "/sted/paged/kjeveortopedi?side=2");
+      assertEq([canonicalOf(f2.text), cardNames(f2.text)], [`${base}/sted/paged/kjeveortopedi?side=2`, cardNames(s2.text)], "O2: page 2 of it points to page 2 of the /sted page, which shows the same 5 clinics");
+      const differ: Array<[string, string]> = [
+        ["/fylke/Vestland/tannlegevakt", "Askøy's clinic is in no Bergen page"],
+        ["/fylke/Innlandet/tannlegevakt", "/sted/grense has a 55th clinic, in Trøndelag"],
+        ["/fylke/Telemark/kjeveortopedi", "a clinic without a poststed is in no /sted page"],
+      ];
+      for (const [url, why] of differ) {
+        const r = await callRoute(router, url);
+        assertEq([r.status, canonicalOf(r.text), sm.includes(`${base}${url}`)], [200, `${base}${url}`, true], `O3: ${url} lists clinics no single /sted facet page has (${why}): its own canonical, in the sitemap`);
+      }
+      // Decided from the cached aggregate, not a query per request: a sixth
+      // kjeveortopedi clinic in Oslo the fylke, with another poststed, moves
+      // the canonical only once the cache has it.
+      const listed = cards((await callRoute(router, "/fylke/Oslo/kjeveortopedi")).text).length;
+      const nydalen = mk("Nydalen Kjeve AS", "NYDALEN", "Oslo", { specialties: '["kjeveortopedi"]' });
+      const cached = await callRoute(router, "/fylke/Oslo/kjeveortopedi");
+      assertEq([cards(cached.text).length, canonicalOf(cached.text)], [listed + 1, `${base}/sted/oslo/kjeveortopedi`], "O4: the canonical follows the cached aggregate, though the list already has Nydalen's clinic");
+      resetCaches();
+      const fresh = await callRoute(router, "/fylke/Oslo/kjeveortopedi");
+      const freshSm = locs((await callRoute(router, "/sitemap.xml")).text);
+      assertEq(
+        [canonicalOf(fresh.text), freshSm.includes(`${base}/fylke/Oslo/kjeveortopedi`), freshSm.includes(`${base}/sted/oslo/kjeveortopedi`)],
+        [`${base}/fylke/Oslo/kjeveortopedi`, true, true],
+        "O5: after the refresh the fylke page lists one more than /sted/oslo's: its own canonical, and both are in the sitemap"
+      );
+      db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = ?").run(nydalen);
+      resetCaches();
+
+      // canonicalFacetPlace points only to a /sted facet page that is published.
+      const landing = require("./dental-landing") as typeof import("./dental-landing");
+      const c = (total: number, helfo: number) => ({ total, verified: 0, helfo_true: helfo, acute_sourced: 0, specialist_clinics: total, max_updated_at: null });
+      const kjeve = facetBySlug("kjeveortopedi");
+      const helfoFacet = facetBySlug("helfo");
+      const sted = (n: number): any => ({ scope: "poststed", name: "X", path: "/sted/x", filter: {}, counts: { ...c(n, 1), facets: { kjeveortopedi: c(n, 1), helfo: { ...c(n, n), specialist_clinics: 1 } } } });
+      const fylkeOf = (twin: any): any => ({ scope: "fylke", name: "Y", path: "/fylke/Y", filter: {}, counts: undefined, sameClinicsAs: () => twin });
+      const over = sted(3);
+      const under = sted(2);
+      const fOver = fylkeOf(over);
+      const fUnder = fylkeOf(under);
+      const fNone = fylkeOf(undefined);
+      assertTrue(
+        landing.canonicalFacetPlace(fOver, kjeve) === over && landing.canonicalFacetPlace(fUnder, kjeve) === fUnder &&
+          landing.canonicalFacetPlace(fOver, helfoFacet) === fOver && landing.canonicalFacetPlace(fNone, kjeve) === fNone,
+        "O6: canonicalFacetPlace: the /sted place when its facet page is published, else the place itself (under the gate, a facet that is off, no such place)"
+      );
+    }
+
+    // ── P. the sitemap's facet loop runs no query of its own ─────────────
+    {
+      // Statement runs while the sitemap is built from warm caches (the
+      // aggregate, the place lists), counted on better-sqlite3's
+      // Statement.prototype as in dental-area-landing.test.ts F4d: every run
+      // of every statement on any connection, however it was prepared. Four
+      // more places with a tannlegevakt page, and their fylke's, must not
+      // add one: the loop reads the cached aggregate, never a query per
+      // place or facet.
+      const RUN_METHODS = ["all", "get", "run", "iterate"] as const;
+      const statementProto: Record<string, unknown> = Object.getPrototypeOf(db.prepare("SELECT 1"));
+      const realRuns = RUN_METHODS.map((k) => [k, statementProto[k] as (...args: unknown[]) => unknown] as const);
+      const isFacetLoc = (l: string): boolean => /\/(?:sted|fylke)\/[^/]+\/[^/]+$/.test(l);
+      const countedSitemap = async (): Promise<{ runs: number; facetUrls: number }> => {
+        resetCaches();
+        await callRoute(router, "/sitemap.xml");
+        dentalSeo.__resetDentalSitemapCacheForTesting();
+        let runs = 0;
+        for (const [k, real] of realRuns) {
+          statementProto[k] = function (this: unknown, ...args: unknown[]) { runs++; return real.apply(this, args); };
+        }
+        let xml = "";
+        try {
+          xml = (await callRoute(router, "/sitemap.xml")).text;
+        } finally {
+          for (const [k, real] of realRuns) statementProto[k] = real;
+        }
+        return { runs, facetUrls: locs(xml).filter(isFacetLoc).length };
+      };
+      const before = await countedSitemap();
+      const added: string[] = [];
+      for (let p = 1; p <= 4; p++) {
+        for (let i = 1; i <= 3; i++) added.push(mk(`Vaktsted ${p}-${i} AS`, `VAKTSTED${p}`, "Nordland", { acuteVakt: 1, provenance: PROV, helfo: i === 1 }));
+      }
+      const after = await countedSitemap();
+      assertEq(after.facetUrls, before.facetUrls + 5, `P1: (the fixture adds 5 facet URLs: 4 /sted/vaktstedN/tannlegevakt and /fylke/Nordland/tannlegevakt; ${before.facetUrls} -> ${after.facetUrls})`);
+      assertTrue(before.runs > 0 && after.runs === before.runs, `P2: building the sitemap runs as many statements with ${after.facetUrls} facet URLs as with ${before.facetUrls} (${before.runs} -> ${after.runs}): no query per place or facet`);
+      for (const id of added) db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = ?").run(id);
+      resetCaches();
     }
   } catch (err: any) {
     failed++;

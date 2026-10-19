@@ -18,6 +18,9 @@
  *      (decision 4=A).
  *   f  the gate: facets.minListings 3 (Daniel, question 7, 2026-10-18),
  *      facets.minFacts 2; faq.* unchanged.
+ *   g  DENTAL_EMERGENCY_NOTICE: the reviewed text word for word (113,
+ *      legevakten 116 117, else the local tannlegevakt); each phone number
+ *      occurs once in it and dials its own digits; no FINN.
  *
  * The routes, the gate on real counts and the sitemap are tested in
  * src/routes/dental-landing.test.ts.
@@ -26,7 +29,7 @@
  * Wired into tests/test.ts via runDentalLandingConfigTests().
  */
 
-import { DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, findDentalLandingFacet } from "./dental-landing";
+import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, findDentalLandingFacet } from "./dental-landing";
 
 export interface TestSummary {
   passed: number;
@@ -93,6 +96,18 @@ export function runDentalLandingConfigTests(opts: { log?: boolean } = {}): TestS
   // ── f. the gate ──────────────────────────────────────────────────────────
   assertEq(DENTAL_LANDING_CONFIG.facets, { minListings: 3, minFacts: 2 }, "f1: facets.minListings 3 (Daniel, question 7, 2026-10-18) and facets.minFacts 2");
   assertEq(DENTAL_LANDING_CONFIG.faq, { minListings: 3, minFacts: 2, minQas: 2 }, "f2: the /sted and /fylke FAQ gate is unchanged");
+
+  // ── g. the emergency notice ──────────────────────────────────────────────
+  const notice = DENTAL_EMERGENCY_NOTICE;
+  assertEq(
+    notice.text,
+    "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor.",
+    "g1: the notice text, word for word as reviewed (YMYL)"
+  );
+  assertEq(notice.phones.map((p) => [p.number, p.tel]), [["113", "113"], ["116 117", "116117"]], "g2: its phone numbers: 113 and 116 117, dialled as tel:113 and tel:116117");
+  assertTrue(notice.phones.every((p) => notice.text.split(p.number).length === 2), "g3: each number occurs exactly once in the text, so each gets one link");
+  assertTrue(notice.phones.every((p) => /^\d+$/.test(p.tel) && p.tel === p.number.replace(/\s/g, "")), "g4: each tel: is the number's own digits, without spaces");
+  assertTrue(!brand(notice.text), "g5: no FINN, finn.no or «Finn» alone in it");
 
   return { passed, failed, failures };
 }

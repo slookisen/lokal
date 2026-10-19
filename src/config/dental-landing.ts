@@ -124,6 +124,23 @@ export function findDentalLandingFacet(slug: string): DentalLandingFacet | undef
 }
 
 /**
+ * The emergency notice on the tannlegevakt pages (A2A dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, F1-S4): a box above the clinic list
+ * on every /sted/<sted>/tannlegevakt and /fylke/<fylke>/tannlegevakt page,
+ * and on the national /tannlegevakt hub (F1-S4b). YMYL text, reviewed line
+ * by line: change it here only, never in a page. `phones` are the numbers
+ * in the text as it writes them, each shown as a tel: link to `tel`. The
+ * facet pages are in Norwegian only, so there is no English text.
+ */
+export const DENTAL_EMERGENCY_NOTICE = {
+  text: "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor.",
+  phones: [
+    { number: "113", tel: "113" },
+    { number: "116 117", tel: "116117" },
+  ],
+} as const;
+
+/**
  * The day (YYYY-MM-DD) each static page's own text last changed, the sitemap
  * <lastmod> for that page (F1-S2). Update the date in the same commit that
  * changes the page text. A page left out gets no <lastmod> rather than the

@@ -28,7 +28,10 @@
 // over the clinics in each facet (DentalAreaCounts.facets), from the same
 // scan: one column per DENTAL_LANDING_FACETS entry, built from the facet's
 // store filter by the store's own clause builder (dentalPublicFilterClauses),
-// so a facet is counted with the SQL its page lists the clinics with.
+// so a facet is counted with the SQL its page lists the clinics with. A
+// fylke's facet counts also say how many of the clinics have each poststed
+// (DentalAreaCounts.poststeder), so a fylke facet page that lists exactly
+// the clinics of one /sted facet page is found from memory.
 //
 // buildDentalAreaLanding() and buildDentalFacetLanding() turn the numbers
 // into the answer-first paragraph, the fact table and the FAQ through the
@@ -71,6 +74,14 @@ export interface DentalAreaCounts {
    * slug from the config, never one from a URL.
    */
   facets?: Record<string, DentalAreaCounts>;
+  /**
+   * On a fylke's facet counts only (byFylke, F1-S4a): the stored poststed of
+   * the facet's clinics in the fylke and how many have each. A clinic with
+   * no poststed is in `total` but not here. It tells whether a /sted facet
+   * page lists exactly the same clinics (routes/dental-seo.ts). sumAreaCounts
+   * does not add it up.
+   */
+  poststeder?: Map<string, number>;
 }
 
 export interface DentalAreaFacts {
@@ -175,16 +186,24 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
     c.specialist_clinics += specialist;
     if (updatedAt && (!c.max_updated_at || updatedAt > c.max_updated_at)) c.max_updated_at = updatedAt;
   };
+  // `inPoststed`: the row's poststed, for a fylke's facet breakdown
+  // (DentalAreaCounts.poststeder); null on the poststed map.
   const bump = (
     map: Map<string, DentalAreaCounts>, key: string, row: (typeof rows)[number],
-    verified: number, helfo: number, acute: number, specialist: number, updatedAt: string | null
+    verified: number, helfo: number, acute: number, specialist: number, updatedAt: string | null,
+    inPoststed: string | null
   ): void => {
     let c = map.get(key);
     if (!c) map.set(key, (c = emptyCounts()));
     add(c, verified, helfo, acute, specialist, updatedAt);
     for (let i = 0; i < DENTAL_LANDING_FACETS.length; i++) {
       if (row[FIRST_FACET_COLUMN + i] !== 1) continue;
-      add((c.facets ??= {})[DENTAL_LANDING_FACETS[i]!.slug] ??= emptyCounts(), verified, helfo, acute, specialist, updatedAt);
+      const fc = (c.facets ??= {})[DENTAL_LANDING_FACETS[i]!.slug] ??= emptyCounts();
+      add(fc, verified, helfo, acute, specialist, updatedAt);
+      if (inPoststed) {
+        const perPoststed = (fc.poststeder ??= new Map());
+        perPoststed.set(inPoststed, (perPoststed.get(inPoststed) ?? 0) + 1);
+      }
     }
   };
   for (const row of rows) {
@@ -192,8 +211,8 @@ export function computeDentalAreaFacts(db: DbHandle): DentalAreaFacts {
     // The cards' specialty predicate, on the columns parsed as the cards' rows are.
     const specialist = candidate === 1 &&
       clinicSpecialties(store.hydrateSpecialtySource({ available_specialties: availableSpecialties, specialists })).length > 0 ? 1 : 0;
-    if (poststed) bump(byPoststed, poststed, row, verified, helfo, acute, specialist, updatedAt);
-    if (fylke) bump(byFylke, fylke, row, verified, helfo, acute, specialist, updatedAt);
+    if (poststed) bump(byPoststed, poststed, row, verified, helfo, acute, specialist, updatedAt, null);
+    if (fylke) bump(byFylke, fylke, row, verified, helfo, acute, specialist, updatedAt, poststed);
   }
   return { byPoststed, byFylke };
 }
@@ -296,6 +315,13 @@ export type DentalAreaScope = "poststed" | "fylke";
 export interface DentalFacetLanding extends DentalAreaLanding {
   /** The lead and what every clinic in the facet has, plain text (the meta description). */
   summary: string;
+  /**
+   * The same without a number, for a page whose list and aggregate disagree
+   * (the cache a little behind the data), which states no count: «Oversikt
+   * over tannlegeklinikker med akuttvakt i Vestland. Alle oppgir akuttvakt
+   * med kilde.»
+   */
+  uncountedSummary: string;
 }
 
 /** The FAQ answer's advice for akutt: call first, legevakten and 113. */
@@ -321,30 +347,30 @@ interface FacetWords {
   feature: string;
   /** The count the facet is named for. It is the clinic total, so it is not stated again. */
   own: "helfo_true" | "acute_sourced" | "specialist_clinics";
-  /** What every clinic in the facet has, for `n` clinics. */
-  definition(n: number): string;
+  /** What every clinic in the facet has, worded for one clinic or for several. */
+  definition(single: boolean): string;
   /** Said after the count in the FAQ answer. */
   advice: string;
 }
 
 function facetWords(facet: DentalLandingFacet): FacetWords {
-  const all = (n: number): string => (n === 1 ? "Den" : "Alle");
+  const all = (single: boolean): string => (single ? "Den" : "Alle");
   switch (facet.kind) {
     case "helfo":
       return {
         feature: "Helfo-direkteoppgjør",
         own: "helfo_true",
-        definition: (n) => `${all(n)} oppgir Helfo-direkteoppgjør ifølge ${n === 1 ? "klinikkens egen nettside" : "klinikkenes egne nettsider"}.`,
+        definition: (single) => `${all(single)} oppgir Helfo-direkteoppgjør ifølge ${single ? "klinikkens egen nettside" : "klinikkenes egne nettsider"}.`,
         advice: "Bekreft alltid med klinikken før du bestiller time.",
       };
     case "tannlegevakt":
-      return { feature: "akuttvakt", own: "acute_sourced", definition: (n) => `${all(n)} oppgir akuttvakt med kilde.`, advice: AKUTT_ADVICE };
+      return { feature: "akuttvakt", own: "acute_sourced", definition: (single) => `${all(single)} oppgir akuttvakt med kilde.`, advice: AKUTT_ADVICE };
     case "specialty": {
       const navn = facet.filter.specialty ?? "";
       return {
         feature: navn,
         own: "specialist_clinics",
-        definition: (n) => `${navn.charAt(0).toUpperCase()}${navn.slice(1)} er oppført som spesialitet hos ${n === 1 ? "den" : "hver av dem"}.`,
+        definition: (single) => `${navn.charAt(0).toUpperCase()}${navn.slice(1)} er oppført som spesialitet hos ${single ? "den" : "hver av dem"}.`,
         advice: "",
       };
     }
@@ -361,7 +387,7 @@ export function buildDentalAreaLanding(
   counts: DentalAreaCounts,
   opts: { name: string; url: string; scope: DentalAreaScope }
 ): DentalAreaLanding {
-  const { summary: _summary, ...landing } = buildLanding(counts, opts, null);
+  const { summary: _summary, uncountedSummary: _uncounted, ...landing } = buildLanding(counts, opts, null);
   return landing;
 }
 
@@ -411,8 +437,9 @@ function buildLanding(
       ? `Vi har ${clinics} ${where} i oversikten.`
       : `I ${name} har vi ${clinics}${withFeature} i oversikten.`,
   ];
-  if (words) sentences.push(words.definition(n));
+  if (words) sentences.push(words.definition(n === 1));
   const summary = sentences.join(" ");
+  const uncountedSummary = `Oversikt over tannlegeklinikker ${where}.${words ? ` ${words.definition(false)}` : ""}`;
   if (states("helfo_true")) {
     sentences.push(`${n === 1 ? "Den" : `${nb(counts.helfo_true)} av dem`} oppgir Helfo-direkteoppgjør ifølge ${websites(counts.helfo_true)}.`);
   }
@@ -451,7 +478,7 @@ function buildLanding(
   // that both the visible block and the JSON-LD come from. The questions ask
   // about clinics in the page's scope, as the answers count them.
   const ofAll = (k: number): string => `${nb(k)} av ${nb(n)} ${plural(n, "klinikk", "klinikker")}`;
-  const countTail = words ? ` ${words.definition(n)}${words.advice ? ` ${words.advice}` : ""}` : "";
+  const countTail = words ? ` ${words.definition(n === 1)}${words.advice ? ` ${words.advice}` : ""}` : "";
   const qas: LandingQa[] = [
     scope === "poststed"
       ? { q: `Hvor mange tannlegeklinikker${withFeature} har poststed ${name}?`, a: `Vi har ${clinics} ${where} registrert.${countTail}` }
@@ -484,5 +511,5 @@ function buildLanding(
   const gate = words ? passesDentalFacetGate(counts) : passesLandingGate(gateFacts(counts), DENTAL_LANDING_CONFIG.faq);
   const faq: FactFaq = gate ? buildFactFaq(qas, { url: opts.url, minQas: DENTAL_LANDING_CONFIG.faq.minQas }) : { html: "", jsonLd: null };
 
-  return { introHtml, tableHtml, faqHtml: faq.html, faqJsonLd: faq.jsonLd, summary };
+  return { introHtml, tableHtml, faqHtml: faq.html, faqJsonLd: faq.jsonLd, summary, uncountedSummary };
 }
