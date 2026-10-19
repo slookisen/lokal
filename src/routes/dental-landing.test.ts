@@ -45,12 +45,16 @@
  *      the config's text and tel: links for 113 and 116 117, above the list
  *      on every tannlegevakt page of /sted and /fylke, on page 2 and while
  *      the cache is behind; on no other facet page and no /sted or /fylke
- *      page.
+ *      page. Its full text is pinned on each of them, ending with the
+ *      caveat of /vilkar pkt. 3 as /vilkar itself words it (call the clinic
+ *      before you go).
  *   O  a fylke facet page with exactly the clinics of one /sted facet page
  *      (one spelling, two spellings, two pages) has that page as canonical
  *      and is not in the sitemap; one with a clinic in another poststed, in
- *      no poststed, or whose /sted page has a clinic in another fylke is its
- *      own canonical and in it; the decision follows the cached aggregate.
+ *      no poststed (also when the /sted page makes up the count with a
+ *      clinic in another fylke), or whose /sted page has a clinic in another
+ *      fylke is its own canonical and in it; the decision follows the cached
+ *      aggregate.
  *   P  the sitemap runs no statement per place or facet: as many with 5
  *      more facet URLs (counted on Statement.prototype, as in
  *      dental-area-landing.test.ts F4d).
@@ -281,6 +285,10 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     mk("Askøy Vakt AS", "ASKØY", "Vestland", { acuteVakt: 1, provenance: PROV, updatedAt: "2026-04-01 10:00:00" });
     const noPoststed = mk("Uten Poststed Kjeve AS", "UTEN", "Telemark", { specialties: '["kjeveortopedi"]', updatedAt: "2026-07-01 10:00:00" });
     db.prepare("UPDATE dental_agents SET poststed = NULL WHERE id = ?").run(noPoststed);
+    // ... and evilPlace has a fourth in Vestfold: 4 in /sted's facet and 4 in
+    // Telemark's, but not the same 4. Only the check that every clinic of the
+    // fylke's facet has a listed poststed tells them apart (E1, E9, O3).
+    mk("Markup Kjeve Vestfold AS", evilPlace, "Vestfold", { specialties: '["kjeveortopedi"]', updatedAt: "2026-07-02 10:00:00" });
     // GRENSE: 54 sourced vakt in Innlandet (one Helfo) and 1 in Trøndelag, so
     // /sted/grense/tannlegevakt (55) lists more than /fylke/Innlandet/… (54),
     // and both have a page 2.
@@ -692,8 +700,10 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
         ["/sted/grense/tannlegevakt?side=2", 5],
         ["/fylke/Innlandet/tannlegevakt?side=2", 4],
       ];
+      const shown: Array<[string, string]> = [["/sted/bergen/tannlegevakt", vakt.text]];
       for (const [url, n] of others) {
         const r = await callRoute(router, url);
+        shown.push([url, r.text]);
         assertTrue(
           r.status === 200 && cards(r.text).length === n && noticesOf(r.text).length === 1 && textOf(noticesOf(r.text)[0] ?? "") === DENTAL_EMERGENCY_NOTICE.text &&
             mainOf(r.text).indexOf("emergency-notice") < mainOf(r.text).indexOf(`<article class="clinic-card">`),
@@ -707,6 +717,30 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       assertTrue(
         cards(behind.text).length === 5 && introOf(behind.text) === "" && !behind.text.includes("klinikker registrert") && noticesOf(behind.text).length === 1,
         "N7: with the cache behind the data (5 listed, 4 counted) no number is stated, and the notice stays"
+      );
+      shown.push(["/sted/bergen/tannlegevakt (cache behind)", behind.text]);
+      // The full text, pinned here as well (YMYL): on page 1, on page 2 of
+      // /sted and /fylke and while the cache is behind. Those have no FAQ,
+      // so the box is the only place they say to call the clinic first.
+      const NOTICE =
+        "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor. " +
+        "At en klinikk er merket med akuttilbud her, betyr ikke at den kan ta imot deg nå. Ring klinikken før du drar dit.";
+      assertEq(
+        shown.map(([url, html]) => [url, noticesOf(html).map(textOf)]),
+        shown.map(([url]) => [url, [NOTICE]]),
+        "N9: every tannlegevakt page shows the notice word for word, ending with «Ring klinikken før du drar dit.»: page 1, page 2 of /sted and /fylke, the cache behind"
+      );
+      assertEq(
+        shown.filter(([url]) => url.includes("side=2") || url.includes("cache behind")).map(([url, html]) => [url, faqQuestions(html).length]),
+        [["/sted/grense/tannlegevakt?side=2", 0], ["/fylke/Innlandet/tannlegevakt?side=2", 0], ["/sted/bergen/tannlegevakt (cache behind)", 0]],
+        "N9b: (page 2 and the page with the cache behind show no FAQ)"
+      );
+      // The caveat is the one Daniel approved in /vilkar pkt. 3: read from the page itself.
+      const vilkar = await callRoute(router, "/vilkar");
+      const caveat = (textOf(vilkar.text).match(/At en klinikk er merket med akuttilbud her[^.]*\. Ring klinikken[^.]*\./) || [])[0] ?? "";
+      assertTrue(
+        vilkar.status === 200 && caveat !== "" && DENTAL_EMERGENCY_NOTICE.text.endsWith(` ${caveat}`),
+        `N10: the notice ends with the caveat of /vilkar pkt. 3, word for word («${caveat}»)`
       );
       db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = ?").run(extra);
       resetCaches();
@@ -744,7 +778,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       const differ: Array<[string, string]> = [
         ["/fylke/Vestland/tannlegevakt", "Askøy's clinic is in no Bergen page"],
         ["/fylke/Innlandet/tannlegevakt", "/sted/grense has a 55th clinic, in Trøndelag"],
-        ["/fylke/Telemark/kjeveortopedi", "a clinic without a poststed is in no /sted page"],
+        ["/fylke/Telemark/kjeveortopedi", "a clinic without a poststed is in no /sted page, though its place has as many with one in Vestfold"],
       ];
       for (const [url, why] of differ) {
         const r = await callRoute(router, url);

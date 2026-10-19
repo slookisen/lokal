@@ -19,7 +19,8 @@
  *   f  the gate: facets.minListings 3 (Daniel, question 7, 2026-10-18),
  *      facets.minFacts 2; faq.* unchanged.
  *   g  DENTAL_EMERGENCY_NOTICE: the reviewed text word for word (113,
- *      legevakten 116 117, else the local tannlegevakt); each phone number
+ *      legevakten 116 117, else the local tannlegevakt, then the caveat of
+ *      /vilkar pkt. 3: call the clinic before you go); each phone number
  *      occurs once in it and dials its own digits; no FINN.
  *
  * The routes, the gate on real counts and the sitemap are tested in
@@ -101,8 +102,12 @@ export function runDentalLandingConfigTests(opts: { log?: boolean } = {}): TestS
   const notice = DENTAL_EMERGENCY_NOTICE;
   assertEq(
     notice.text,
-    "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor.",
-    "g1: the notice text, word for word as reviewed (YMYL)"
+    "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor. At en klinikk er merket med akuttilbud her, betyr ikke at den kan ta imot deg nå. Ring klinikken før du drar dit.",
+    "g1: the notice text, word for word as reviewed (YMYL), ending with the caveat of /vilkar pkt. 3"
+  );
+  assertTrue(
+    notice.text.endsWith(" At en klinikk er merket med akuttilbud her, betyr ikke at den kan ta imot deg nå. Ring klinikken før du drar dit."),
+    "g6: it ends with the caveat Daniel approved in /vilkar pkt. 3 (2026-10-19): a clinic marked with akuttilbud may not be able to see you now; call it before you go"
   );
   assertEq(notice.phones.map((p) => [p.number, p.tel]), [["113", "113"], ["116 117", "116117"]], "g2: its phone numbers: 113 and 116 117, dialled as tel:113 and tel:116117");
   assertTrue(notice.phones.every((p) => notice.text.split(p.number).length === 2), "g3: each number occurs exactly once in the text, so each gets one link");

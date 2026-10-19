@@ -28,11 +28,14 @@
 //
 // dental-seo.ts registers the routes before its catch-all and hands in its
 // shell, card, JSON-LD and paging helpers, the store's list and the place
-// lookups with their aggregate counts (deps), so this module imports neither
-// dental-seo.ts nor anything that reads a DB: from services/dental-area-facts
+// lookups with their aggregate counts (deps), so this module neither imports
+// dental-seo.ts nor reads clinic data itself: from services/dental-area-facts
 // it takes only the gate and the text builder, which work on the counts they
 // are given. Tests swap the store and the aggregate modules for a fresh
-// in-memory DB, and a DB read held here would read another DB.
+// in-memory DB, and a clinic read held here would read another DB. The one
+// import that uses a DB is recordAiPageDelivery (services/profile-ai-deliveries):
+// it counts the page's clinics in memory, and that module writes the daily
+// sums to the main DB (getDb) every minute and on shutdown, not per request.
 
 import type { Request, Response, NextFunction, Router } from "express";
 import type { DentalAgentRow, ListFilter } from "../services/dental-store";

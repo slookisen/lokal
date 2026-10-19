@@ -131,9 +131,17 @@ export function findDentalLandingFacet(slug: string): DentalLandingFacet | undef
  * by line: change it here only, never in a page. `phones` are the numbers
  * in the text as it writes them, each shown as a tel: link to `tel`. The
  * facet pages are in Norwegian only, so there is no English text.
+ *
+ * The last two sentences are word for word the caveat in pkt. 3 of /vilkar,
+ * which Daniel approved on 2026-10-19 (A2A
+ * daniel-responses/2026-10-19-live-svar-steg-a-og-vilkar.md, message 5):
+ * a clinic on a tannlegevakt page has a sourced akuttvakt, not a promise
+ * that it can see you now. They stand here so every tannlegevakt page says
+ * it, also page 2 and later and while the cache is behind, where the FAQ is
+ * not shown (dental-landing.test.ts N9-N10 compare them with /vilkar).
  */
 export const DENTAL_EMERGENCY_NOTICE = {
-  text: "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor.",
+  text: "Ved akutt fare for liv eller helse: ring 113. Trenger du rask hjelp utenom åpningstid, ring legevakten på 116 117. Ellers kan du kontakte tannlegevakten der du bor. At en klinikk er merket med akuttilbud her, betyr ikke at den kan ta imot deg nå. Ring klinikken før du drar dit.",
   phones: [
     { number: "113", tel: "113" },
     { number: "116 117", tel: "116117" },
