@@ -44,6 +44,7 @@ import { createHash } from "node:crypto";
 import express from "express";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import { ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
@@ -106,19 +107,34 @@ const STATS_FIRST_SENTENCE_BEFORE_S4E =
 /** The duty named, in English or (since F1-S4e) Norwegian: «emergency duty», «emergency-duty», «akuttvakt», «Akuttvakt-merket». */
 const NAMES_EMERGENCY_DUTY = /\bemergency[- ]duty\b|\bakuttvakt/i;
 /** The quote rule of F1-S4c in the same sentence, in English or Norwegian («lagret sitat», «lagret setningen som sitat»). */
-const STATES_QUOTE_RULE = /\b(stored (source )?quote|quote from the source|lagret (setningen som )?sitat|sitat fra kilden)\b/i;
+const STATES_QUOTE_RULE = /\b(stored (source )?quote|quote from the source|lagret (setningen som )?sitat|sitat fra kilden)\b/gi;
+/** The words just before a quote rule that negate it: «uten (et) lagret sitat», «without a (stored) quote», «no stored quote». */
+const NEGATES_QUOTE_RULE = /\b(uten|ikke|ingen|without|no|not)\s+((et|en|noe|slikt|a|an|any|such)\s+){0,2}$/i;
+
+/**
+ * True when `sentence` states the quote rule: a quote rule that is not negated, or a negated one («uten et lagret
+ * sitat», «without a stored quote») in a sentence that also names the soft claim «Tar imot akuttpasienter»
+ * (ACUTE_ACCEPTS_LABEL), as the badge list does: «Akuttvakt vises også uten et lagret sitat.» says the opposite of
+ * the rule (forslag S1 in the review of lokal#1207, F1-S4e).
+ */
+function statesQuoteRule(sentence: string): boolean {
+  const rules = [...sentence.matchAll(STATES_QUOTE_RULE)];
+  if (rules.some((m) => !NEGATES_QUOTE_RULE.test(sentence.slice(0, m.index)))) return true;
+  return rules.length > 0 && sentence.toLowerCase().includes(ACUTE_ACCEPTS_LABEL.toLowerCase());
+}
 
 /**
  * The sentences of `text` that name the emergency duty («emergency duty», «emergency-duty» or the Norwegian
  * «akuttvakt») without the quote rule of F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): a duty is
- * «Akuttvakt» only with a stored quote from the source, so a text may name the duty only where it says so (G3-S6d).
+ * «Akuttvakt» only with a stored quote from the source, so a text may name the duty only where it says so (G3-S6d),
+ * and a negated rule counts only beside the soft claim (statesQuoteRule).
  * A sentence ends at . ! ? or ;, a line or a table cell. connector-packs-fresh.test.ts (k) runs it over the dental
  * pack, and dental-akutt-tekster.test.ts (F1-S4e) over the public texts about the badge; neither runs it over the
  * search words (dental-search-vocabulary.ts, the agent card's examples), where «akuttvakt» is what a person types.
  */
 export function emergencyDutyWithoutQuote(text: string): string[] {
   return text.split(/(?<=[.!?;])\s+|\s*\|\s*|\n+/)
-    .filter((s) => NAMES_EMERGENCY_DUTY.test(s) && !STATES_QUOTE_RULE.test(s));
+    .filter((s) => NAMES_EMERGENCY_DUTY.test(s) && !statesQuoteRule(s));
 }
 
 /** What a description of the akutt claim must not say: there is no bare flag, and `akutt` is never null. */
@@ -228,7 +244,6 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
     const mcp = require("./dental-mcp") as typeof import("./dental-mcp");
     const { BRAND_ENTITIES } = require("../config/brand-entities") as typeof import("../config/brand-entities");
     const { shortToolDescription, registeredMcpToolNames } = require("../services/mcp-tool-manifest") as typeof import("../services/mcp-tool-manifest");
-    const { ACUTE_ACCEPTS_LABEL } = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
     const otherTools = [...registeredMcpToolNames("rfb"), ...registeredMcpToolNames("experiences")];
 
     // ── I: initialize and tools/list over real HTTP ──────────────────────
@@ -367,6 +382,13 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       emergencyDutyWithoutQuote("«Akuttvakt» vises bare med et lagret sitat fra klinikkens egen nettside.").length,
       emergencyDutyWithoutQuote("Klinikken sier det på egne sider, og vi har lagret setningen som sitat. Akuttvakt-merket står.").length], [1, 1, 0, 1],
       "N9: D11 reads the Norwegian «akuttvakt» (F1-S4e): the stats sentence before F1-S4e and a source without a quote are flagged, «lagret sitat» passes, and the rule in one sentence does not cover the next");
+    eq([emergencyDutyWithoutQuote("Akuttvakt vises også uten et lagret sitat.").length,
+      emergencyDutyWithoutQuote("Emergency duty is shown without a stored quote too.").length,
+      emergencyDutyWithoutQuote("Without such a quote from the source the badge still says akuttvakt.").length,
+      emergencyDutyWithoutQuote(`${ACUTE_ACCEPTS_LABEL} Klinikken nevner akutt behandling på egne sider, uten et lagret sitat om akuttvakt.`).length,
+      emergencyDutyWithoutQuote(`«${ACUTE_ACCEPTS_LABEL}» when an emergency duty has no stored quote.`).length,
+      emergencyDutyWithoutQuote("«Akuttvakt» only when an emergency duty has a stored quote from the source, not without a stored quote.").length], [1, 1, 1, 0, 0, 0],
+      "N10 (forslag S1, review of lokal#1207): a negated quote rule («uten et lagret sitat», «without a stored quote») is flagged, unless the sentence also names «Tar imot akuttpasienter»; a sentence that states the rule and also negates it passes");
 
     // ── S: server card and agent card ────────────────────────────────────
     {

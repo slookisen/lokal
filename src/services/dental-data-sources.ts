@@ -106,6 +106,10 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
   // The dental-agent-enrichment routine (Stage X/V) reads the site with an AI
   // model and writes through PUT /api/tannlege/agents/:id; the verifier only
   // matches the org.nr. or name and place on it (websiteOwnershipMatch).
+  // «akuttopplysninger» / «emergency details», not «akuttvakt» (A2A
+  // dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4e point 12): the
+  // extraction gives both akutt claims, and «Akuttvakt» needs a stored quote
+  // (F1-S4c), which the field name and method cannot say.
   // Dates: the field_provenance records the routine sends are merged per
   // field (mergeFieldProvenance, which does not require fetched_at), and a
   // PUT that marks the row enriched stamps last_enriched_at (updateDentalAgent).
@@ -115,15 +119,15 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
     name_en: "the clinics' own websites (AI-assisted extraction)",
     fields: [
       { nb: "Helfo-direkteoppgjør", en: "Helfo direct billing" },
-      { nb: "akuttvakt", en: "emergency duty" },
+      { nb: "akuttopplysninger", en: "emergency details" },
       { nb: "spesialiteter", en: "specialties" },
       { nb: "behandlinger", en: "treatments" },
       { nb: "åpningstider", en: "opening hours" },
       { nb: "kontaktinformasjon", en: "contact details" },
       { nb: "presentasjon", en: "presentation" },
     ],
-    method_nb: "En KI-modell leser klinikkens egne nettsider og henter ut opplysningene. Helfo-avtale og akuttvakt er derfor tolket automatisk fra klinikkens egen tekst, ikke hentet fra Helfo.",
-    method_en: "An AI model reads the clinic's own web pages and extracts the details. A Helfo agreement and emergency duty are therefore read automatically from the clinic's own text, not taken from Helfo.",
+    method_nb: "En KI-modell leser klinikkens egne nettsider og henter ut opplysningene. Helfo-avtale og akuttopplysninger er derfor tolket automatisk fra klinikkens egen tekst, ikke hentet fra Helfo.",
+    method_en: "An AI model reads the clinic's own web pages and extracts the details. A Helfo agreement and emergency details are therefore read automatically from the clinic's own text, not taken from Helfo.",
     date_nb: "Når uttrekket oppgir kilden, lagres den sammen med feltet, og hentedatoen når den er oppgitt. Datoen for siste fullførte uttrekk lagres også.",
     date_en: "When the extraction gives its source, it is stored with the field, and the date it was fetched when that is given. The date of the last completed extraction is stored too.",
     url: null,

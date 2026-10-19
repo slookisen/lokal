@@ -1453,7 +1453,8 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
  * 2026-10-16-finn-tannlege-fasettsider, F1-S4e): the filter is the akutt claim
  * on the card (DENTAL_ACUTE_CLAIM_SQL), «Akuttvakt» and «Tar imot
  * akuttpasienter» both, so its label names neither badge.
- * /hvordan-det-fungerer names the filter with the same word.
+ * /hvordan-det-fungerer names the filter with the same word. Both pages print
+ * it through escapeHtml, as every other label.
  */
 export const DENTAL_ACUTE_FILTER_LABEL = "Akutthjelp";
 
@@ -1590,7 +1591,7 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
               <input type="checkbox" name="helfo" value="1"${helfo ? " checked" : ""}> Helfo-avtale
             </label>
             <label class="filter-check">
-              <input type="checkbox" name="akutt" value="1"${akutt ? " checked" : ""}> ${DENTAL_ACUTE_FILTER_LABEL}
+              <input type="checkbox" name="akutt" value="1"${akutt ? " checked" : ""}> ${escapeHtml(DENTAL_ACUTE_FILTER_LABEL)}
             </label>
           </div>
           <div class="filter-group" style="padding-bottom:2px">
@@ -2703,7 +2704,7 @@ const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToo
   tannlege_info: {
     nb: {
       card: "Henter hele oppføringen for én klinikk via organisasjonsnummer (<code>org_nr</code>) eller <code>id</code>: adresse, kontaktinformasjon, nettside, Helfo-status, akuttpåstand, spesialiteter, spesialister, behandlinger, åpningstider, klinikkens egen beskrivelse og profilside. " +
-        `Akuttpåstanden er «Akuttvakt» bare når akuttvakten har et lagret sitat fra kilden, og «${GUIDE_ACCEPTS_NB}» når klinikken sier at den tar imot akuttpasienter.`,
+        `Akuttpåstanden er «Akuttvakt» bare når vi har lagret et sitat fra kilden om akuttvakten, og «${GUIDE_ACCEPTS_NB}» når klinikken sier at den tar imot akuttpasienter.`,
       faq: "tannlege_info henter hele oppføringen for én klinikk via organisasjonsnummer eller id",
     },
     en: {
@@ -2715,7 +2716,7 @@ const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToo
   tannlege_stats: {
     nb: {
       card: "Antall tannlegeklinikker i Norge: totalt, per fylke, og hvor mange som har Helfo-direkteoppgjør, hører til en kjede, viser en akuttpåstand eller har en spesialist. " +
-        `En akuttpåstand er «Akuttvakt», som krever et lagret sitat fra kilden, eller «${GUIDE_ACCEPTS_NB}», at klinikken sier at den tar imot akuttpasienter.`,
+        `En akuttpåstand er «Akuttvakt», som krever et lagret sitat fra kilden, eller «${GUIDE_ACCEPTS_NB}», som betyr at klinikken sier at den tar imot akuttpasienter.`,
       faq: "tannlege_stats teller klinikkene totalt og per fylke, og hvor mange som har Helfo-avtale, akuttpåstand eller spesialist",
     },
     en: {
@@ -2727,7 +2728,7 @@ const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToo
   tannlege_akutt: {
     nb: {
       card: "Finner akutt tannlege: klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke (<code>fylke</code>). " +
-        `Akuttpåstanden er «Akuttvakt» bare når akuttvakten har et lagret sitat fra kilden, og ellers «${GUIDE_ACCEPTS_NB}». Svaret har også råd om kommunal tannlegevakt.`,
+        `Akuttpåstanden er «Akuttvakt» bare når vi har lagret et sitat fra kilden om akuttvakten, og ellers «${GUIDE_ACCEPTS_NB}». Svaret har også råd om kommunal tannlegevakt.`,
       faq: "tannlege_akutt finner klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke",
     },
     en: {
@@ -3015,7 +3016,7 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Tre steg til riktig tannlege</h3>
     <ol style="padding-left:20px;margin-bottom:16px">
-      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og ${DENTAL_ACUTE_FILTER_LABEL.toLowerCase()}.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og ${escapeHtml(DENTAL_ACUTE_FILTER_LABEL.toLowerCase())}.</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Sammenlign</strong> &mdash; se Helfo-avtale, spesialiteter, åpningstider og kontaktinformasjon side om side for de klinikkene som passer deg.</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Kontakt</strong> &mdash; ring klinikken direkte eller bruk online-booking der det finnes. Ingen mellomledd, ingen gebyrer fra vår side.</li>
     </ol>

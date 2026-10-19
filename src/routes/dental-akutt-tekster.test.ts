@@ -9,7 +9,8 @@
  * nothing). Groups, by prefix (the spec's points in brackets):
  *   S   /sok: the filter's label is «Akutthjelp», for both claims; akutt=1
  *       lists the same clinics as before (the claim rows, DENTAL_ACUTE_CLAIM_SQL
- *       and resolveAcuteClaim agree) and keeps the box ticked [1];
+ *       and resolveAcuteClaim agree) and keeps the box ticked [1]; both pages
+ *       that print the label escape it (forslag S2, review of lokal#1207);
  *   F   the homepage banner links /sok?akutt=1 with «Se klinikker som oppgir
  *       akutthjelp» [2];
  *   H   /hvordan-det-fungerer: the FAQ JSON-LD answer to «Hva gjør jeg ved
@@ -24,15 +25,25 @@
  *       claim, not the duty alone [7];
  *   G   the tool cards and the tools FAQ on /guide-tannlege-ai (nb, en) read as
  *       the tool texts of G3-S6d: an «akuttpåstand» / «emergency claim»,
- *       «Akuttvakt» only with a stored quote [8];
+ *       «Akuttvakt» only with a stored quote [8], in the Norwegian wording of
+ *       forslag S3 (review of lokal#1207);
  *   A   the A2A agent card's description and skill texts [9]; tannlege_stats'
  *       «(akutt)» [10] is in dental-mcp-instructions.test.ts (D9d, D10c);
- *   L   the lock [11]: emergencyDutyWithoutQuote() finds nothing on the
- *       surfaces of points 3–9, and each surface still names the claim (not
- *       vacuous). Left out, as the spec says: the search words (the agent
- *       card's examples, dental-search-vocabulary.ts), and the field list and
- *       method table built from DENTAL_DATA_SOURCES, whose «akuttvakt» /
- *       «emergency duty» names the stored field;
+ *   K   the data sources [12]: the clinics' websites give «akuttopplysninger»
+ *       / «emergency details», not «akuttvakt» / «emergency duty», in the field
+ *       lists on /om and /hvordan-det-fungerer, the method table on
+ *       /proveniens and the method sentence;
+ *   E   /sted and /fylke [13, 14]: the intro, the fact table and the FAQ say
+ *       «akuttvakt med lagret sitat eller … tar imot akuttpasienter», the akutt
+ *       answer ends with DENTAL_EMERGENCY_NOTICE.text, and the visible FAQ is
+ *       the FAQ JSON-LD; the tannlegevakt facet (off) says «med lagret sitat»
+ *       too;
+ *   L   the lock [11, 12]: emergencyDutyWithoutQuote() finds nothing on the
+ *       surfaces of points 3–9, on the whole of /om, /hvordan-det-fungerer and
+ *       /proveniens (the data sources included) and on the area text of /sted
+ *       and /fylke, and each surface still names the claim (not vacuous).
+ *       Left out, as the spec says: the search words (the agent card's
+ *       examples, dental-search-vocabulary.ts);
  *   Z   no public page or document in this test says «Akuttvakt-merke» or
  *       «akuttvakt-tilbud», or gives the directory-enquiry number the spec
  *       rules out; the akutt texts give no phone number beyond
@@ -44,6 +55,8 @@
  * Wired into tests/test.ts via runDentalAkuttTeksterTests().
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { emergencyDutyWithoutQuote } from "./dental-mcp-instructions.test";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
@@ -169,6 +182,17 @@ const OLD = {
   cardEn: "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-duty data.",
   cardSearch: "`acute_vakt` (1: clinics with an emergency claim, that is a sourced akuttvakt or that they take emergency patients)",
   cardStatsNb: "viser en akuttpåstand (akuttvakt med kilde, eller at klinikken tar imot akuttpasienter)",
+  // Round 2: points 12–14 (main b30ee3d2) and forslag S3 (round 1, 0834c8aa).
+  sourceField: { nb: "akuttvakt", en: "emergency duty" },
+  methodNb: "En KI-modell leser klinikkens egne nettsider og henter ut opplysningene. Helfo-avtale og akuttvakt er derfor tolket automatisk fra klinikkens egen tekst, ikke hentet fra Helfo.",
+  methodEn: "An AI model reads the clinic's own web pages and extracts the details. A Helfo agreement and emergency duty are therefore read automatically from the clinic's own text, not taken from Helfo.",
+  areaIntro: "3 oppgir akuttvakt med kilde eller at de tar imot akuttpasienter.",
+  areaRow: "Akuttvakt med kilde eller tar imot akuttpasienter",
+  areaAdvice: "Ring klinikken først og spør om de kan ta deg imot. Ved akutt sykdom eller skade utenfor åpningstid kan du ringe legevakten på 116 117. Ved livstruende situasjoner ringer du 113.",
+  facetDefinition: "Alle oppgir akuttvakt med kilde.",
+  facetTitle: "Tannlegevakt i {sted}: klinikker med akuttvakt med kilde",
+  guideStatsNbR1: "«Tar imot akuttpasienter», at klinikken sier at den tar imot akuttpasienter.",
+  guideQuoteNbR1: "bare når akuttvakten har et lagret sitat fra kilden",
 };
 
 // The quote, as the extraction stores it once F1-S4d is in (F1-S4c reads it already).
@@ -213,7 +237,7 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
     (require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer")).__resetDentalSearchGazetteerForTesting();
     const { ACUTE_ACCEPTS_LABEL, DENTAL_ACUTE_CLAIM_SQL, resolveAcuteClaim } =
       require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
-    const { DENTAL_EMERGENCY_NOTICE } = require("../config/dental-landing") as typeof import("../config/dental-landing");
+    const { DENTAL_EMERGENCY_NOTICE, findDentalLandingFacet } = require("../config/dental-landing") as typeof import("../config/dental-landing");
     const { dentalEmergencyNoticeHtml } = require("./dental-landing") as typeof import("./dental-landing");
     const { langMiddleware } = require("../i18n/middleware") as typeof import("../i18n/middleware");
 
@@ -229,9 +253,11 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
     add("Sitat Vakt Tannklinikk AS", "918780101", { acute_vakt: 1, field_provenance: QUOTED });
     add("Stempel Akutt Tannklinikk AS", "918780102", { acute_vakt: 1, field_provenance: STAMP });
     add("Fokus Akutt Tannklinikk AS", "918780103", { acute_vakt: 0, patient_focus: ["Akuttpasienter"] });
-    add("Flagg Uten Kilde Tannklinikk AS", "918780104", { acute_vakt: 1 });
-    add("Vanlig Tannklinikk AS", "918780105", {});
-    const rows = db.prepare("SELECT navn, acute_vakt, field_provenance, patient_focus FROM dental_agents").all() as Array<Record<string, any>>;
+    // Helfo on two clinics without a claim: /sted and /fylke then have two facts and show their FAQ (E).
+    add("Flagg Uten Kilde Tannklinikk AS", "918780104", { acute_vakt: 1, helfo_agreement: "true" });
+    add("Vanlig Tannklinikk AS", "918780105", { helfo_agreement: "true" });
+    // In org_nr order, the order the fixture adds them (forslag S5, review of lokal#1207).
+    const rows = db.prepare("SELECT navn, acute_vakt, field_provenance, patient_focus FROM dental_agents ORDER BY org_nr").all() as Array<Record<string, any>>;
     const claimOf = (r: Record<string, any>) => resolveAcuteClaim({
       acute_vakt: r.acute_vakt, field_provenance: r.field_provenance ? JSON.parse(r.field_provenance) : null,
       patient_focus: r.patient_focus ? JSON.parse(r.patient_focus) : null,
@@ -261,6 +287,10 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
       assertEq([shown, sqlCount, store.countPublicDentalAgents({ acute_vakt: 1 } as any)], [claimNames, 3, 3],
         "S5: /sok?akutt=1 lists the same clinics as before: the three with a claim (Akuttvakt or the soft claim), as DENTAL_ACUTE_CLAIM_SQL and the store count");
       assertTrue(akutt.includes("3 klinikker funnet"), "S6: … and counts them (3)");
+      // The label has no character to escape today, so the rendered pages cannot tell; the source can.
+      const seoSource = fs.readFileSync(path.join(__dirname, "dental-seo.ts"), "utf8");
+      assertEq([(seoSource.match(/\$\{DENTAL_ACUTE_FILTER_LABEL\b/g) ?? []).length, (seoSource.match(/\$\{escapeHtml\(DENTAL_ACUTE_FILTER_LABEL\b/g) ?? []).length], [0, 2],
+        "S7: /sok and /hvordan-det-fungerer print the label through escapeHtml, never raw (forslag S2, review of lokal#1207)");
     }
 
     // ── F: the homepage banner [2] ───────────────────────────────────────
@@ -349,19 +379,19 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
       const en = cardsOf(guide.en.text);
       assertEq([guide.nb.status, guide.en.status, nb.size, en.size], [200, 200, 5, 5], "G0: both guide pages are 200 with five tool cards");
       assertTrue((nb.get("tannlege_info") ?? "").includes(`Helfo-status, akuttpåstand, spesialiteter`) &&
-        (nb.get("tannlege_info") ?? "").endsWith(`Akuttpåstanden er «Akuttvakt» bare når akuttvakten har et lagret sitat fra kilden, og «${ACUTE_ACCEPTS_LABEL}» når klinikken sier at den tar imot akuttpasienter.`),
+        (nb.get("tannlege_info") ?? "").endsWith(`Akuttpåstanden er «Akuttvakt» bare når vi har lagret et sitat fra kilden om akuttvakten, og «${ACUTE_ACCEPTS_LABEL}» når klinikken sier at den tar imot akuttpasienter.`),
         "G1 nb: tannlege_info returns the akuttpåstand, «Akuttvakt» only with a stored quote (the tool text of G3-S6d)", nb.get("tannlege_info"));
       assertTrue((en.get("tannlege_info") ?? "").includes("Helfo status, emergency claim, specialties") &&
         (en.get("tannlege_info") ?? "").endsWith(`The emergency claim is «Akuttvakt» only when an emergency duty has a stored quote from the source, and «${ACUTE_ACCEPTS_LABEL}» when the clinic says it takes emergency patients.`),
         "G1 en: tannlege_info returns the emergency claim, with the same rule", en.get("tannlege_info"));
       assertTrue((nb.get("tannlege_stats") ?? "").includes("viser en akuttpåstand eller har en spesialist.") &&
-        (nb.get("tannlege_stats") ?? "").endsWith(`En akuttpåstand er «Akuttvakt», som krever et lagret sitat fra kilden, eller «${ACUTE_ACCEPTS_LABEL}», at klinikken sier at den tar imot akuttpasienter.`),
+        (nb.get("tannlege_stats") ?? "").endsWith(`En akuttpåstand er «Akuttvakt», som krever et lagret sitat fra kilden, eller «${ACUTE_ACCEPTS_LABEL}», som betyr at klinikken sier at den tar imot akuttpasienter.`),
         "G2 nb: tannlege_stats counts the akuttpåstand and says what it is", nb.get("tannlege_stats"));
       assertTrue((en.get("tannlege_stats") ?? "").includes("show an emergency claim or list a specialist.") &&
         (en.get("tannlege_stats") ?? "").endsWith(`An emergency claim is «Akuttvakt», an emergency duty backed by a stored quote from the source, or «${ACUTE_ACCEPTS_LABEL}», that the clinic says it takes emergency patients.`),
         "G2 en: tannlege_stats counts the emergency claim and says what it is (the tool's own sentence)", en.get("tannlege_stats"));
       assertTrue((nb.get("tannlege_akutt") ?? "").startsWith("Finner akutt tannlege: klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke (fylke).") &&
-        (nb.get("tannlege_akutt") ?? "").includes(`Akuttpåstanden er «Akuttvakt» bare når akuttvakten har et lagret sitat fra kilden, og ellers «${ACUTE_ACCEPTS_LABEL}».`),
+        (nb.get("tannlege_akutt") ?? "").includes(`Akuttpåstanden er «Akuttvakt» bare når vi har lagret et sitat fra kilden om akuttvakten, og ellers «${ACUTE_ACCEPTS_LABEL}».`),
         "G3 nb: tannlege_akutt finds clinics that say they take emergency patients, «Akuttvakt» only with a stored quote", nb.get("tannlege_akutt"));
       assertTrue((en.get("tannlege_akutt") ?? "").startsWith("Finds an emergency dentist: clinics that say they take emergency patients, optionally in one county (fylke).") &&
         (en.get("tannlege_akutt") ?? "").includes(`The emergency claim is «Akuttvakt» only when an emergency duty has a stored quote from the source, and otherwise «${ACUTE_ACCEPTS_LABEL}».`),
@@ -374,6 +404,9 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
         "tannlege_stats counts the clinics in total and per county, and how many have a Helfo agreement, an emergency claim or a specialist",
         "tannlege_akutt finds clinics that say they take emergency patients, optionally in one county",
       ], "G5: the tools FAQ answers say the same");
+      const nbCards = [...nb.values()].join(" ");
+      assertTrue(!nbCards.includes(OLD.guideStatsNbR1) && !nbCards.includes(OLD.guideQuoteNbR1) && nbCards.includes(`«${ACUTE_ACCEPTS_LABEL}», som betyr at`),
+        "G6 nb: the two wordings of forslag S3 (review of lokal#1207) are in, the round-1 wordings («…, at klinikken sier», «bare når akuttvakten har et lagret sitat») are gone");
     }
 
     // ── A: the A2A agent card [9] ────────────────────────────────────────
@@ -393,18 +426,106 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
         "A4 control: the search example «akuttvakt tannlege Stavanger» is a search word and stays (the lock leaves examples out)");
     }
 
-    // ── L: the lock [11] ─────────────────────────────────────────────────
-    // The field list (/hvordan-det-fungerer «For klinikker») and the method
-    // table (/proveniens) come from DENTAL_DATA_SOURCES; their «akuttvakt» /
-    // «emergency duty» names the stored field, not the badge.
-    const withoutDataSources = (html: string): string => html
-      .replace(/<div class="method-table-wrap"[\s\S]*?<\/table>\s*<\/div>/g, "")
-      .replace(/(henter klinikkdata fra disse kildene:<\/p>\s*)<ul>[\s\S]*?<\/ul>/, "$1");
+    // ── K: the data sources [12] ─────────────────────────────────────────
+    const om = await page("/om");
+    const omMain = mainOf(om);
+    {
+      const { DENTAL_DATA_SOURCES } = require("../services/dental-data-sources") as typeof import("../services/dental-data-sources");
+      const web = DENTAL_DATA_SOURCES.find((s) => s.id === "clinic_websites");
+      assertEq(web?.fields.filter((f) => /akutt|emergency/i.test(`${f.nb} ${f.en}`)), [{ nb: "akuttopplysninger", en: "emergency details" }],
+        "K1: the clinics' websites give «akuttopplysninger» / «emergency details», a name for both akutt claims [12]");
+      assertEq(DENTAL_DATA_SOURCES.flatMap((s) => s.fields).filter((f) => /akuttvakt|emergency[- ]duty/i.test(`${f.nb} ${f.en}`)), [],
+        "K2: no source names a field «akuttvakt» / «emergency duty»");
+      assertEq([web?.method_nb, web?.method_en], [
+        "En KI-modell leser klinikkens egne nettsider og henter ut opplysningene. Helfo-avtale og akuttopplysninger er derfor tolket automatisk fra klinikkens egen tekst, ikke hentet fra Helfo.",
+        "An AI model reads the clinic's own web pages and extracts the details. A Helfo agreement and emergency details are therefore read automatically from the clinic's own text, not taken from Helfo.",
+      ], "K3: the method sentence says the same, nb and en [12]");
+      const listItems = (html: string) => [...html.matchAll(/<li><strong>[\s\S]*?<\/li>/g)].map((m) => textOf(m[0]));
+      const webItem = "Klinikkenes egne nettsider (KI-assistert uttrekk) — Helfo-direkteoppgjør, akuttopplysninger, spesialiteter, behandlinger, åpningstider, kontaktinformasjon og presentasjon";
+      assertEq([listItems(omMain).includes(webItem), listItems(hvordanMain).includes(webItem)], [true, true],
+        "K4: the source lists on /om and /hvordan-det-fungerer name the field «akuttopplysninger»");
+      const webRows = (html: string) => elementStarting(html, '<tbody data-source="clinic_websites">');
+      assertTrue(webRows(provNb).includes('<th scope="row">Akuttopplysninger</th>') && textOf(webRows(provNb)).includes(web?.method_nb ?? "\u0000"),
+        "K5 nb: the method table on /proveniens has the row «Akuttopplysninger» and the method sentence");
+      assertTrue(webRows(provEn).includes('<th scope="row">Emergency details</th>') && textOf(webRows(provEn)).includes(web?.method_en ?? "\u0000"),
+        "K5 en: … and «Emergency details» in English");
+    }
+
+    // ── E: /sted and /fylke [13, 14] ─────────────────────────────────────
+    const sted = await callRoute(router, "/sted/bergen");
+    const fylke = await callRoute(router, "/fylke/Vestland");
+    const areaFaq = (html: string) => (jsonLdOf(html).find((x) => x["@type"] === "FAQPage")?.mainEntity ?? [])
+      .map((e: any): [string, string] => [e.name, e.acceptedAnswer?.text]);
+    const areaRows = (html: string) => [...elementStarting(html, '<table class="landing-facts"').matchAll(/<tr><th[^>]*>([^<]*)<\/th><td[^>]*>([^<]*)<\/td><\/tr>/g)]
+      .map((m) => [unescapeHtml(m[1]!), unescapeHtml(m[2]!)]);
+    const { buildDentalAreaLanding, buildDentalFacetLanding } = require("../services/dental-area-facts") as typeof import("../services/dental-area-facts");
+    const counts = (o: { total: number; helfo_true?: number; acute_sourced: number }) =>
+      ({ verified: 0, helfo_true: 0, specialist_clinics: 0, max_updated_at: "2026-10-19 08:00:00", ...o });
+    // The intro is shown only at 40–60 words. With Helfo as well (which the
+    // fixture's place has, so that its FAQ is shown), the sentences before the
+    // source sentence come to 36 words and the paragraph is left out, so E1
+    // reads the intro from the same function with counts that leave room for it.
+    const intros = {
+      sted: textOf(buildDentalAreaLanding(counts({ total: 5, acute_sourced: 3 }), { name: "Bergen", url: "https://finn-tannlege.com/sted/bergen", scope: "poststed" }).introHtml),
+      stedOne: textOf(buildDentalAreaLanding(counts({ total: 1, acute_sourced: 1 }), { name: "Solo", url: "https://finn-tannlege.com/sted/solo", scope: "poststed" }).introHtml),
+      fylke: textOf(buildDentalAreaLanding(counts({ total: 5, acute_sourced: 3 }), { name: "Vestland", url: "https://finn-tannlege.com/fylke/Vestland", scope: "fylke" }).introHtml),
+    };
+    const vaktFacet = findDentalLandingFacet("tannlegevakt")!;
+    const facetLanding = (total: number) => buildDentalFacetLanding(counts({ total, helfo_true: Math.min(2, total), acute_sourced: total }),
+      { name: "Bergen", url: "https://finn-tannlege.com/sted/bergen/tannlegevakt", scope: "poststed", facet: vaktFacet });
+    {
+      assertTrue(intros.sted.includes(" 3 oppgir akuttvakt med lagret sitat eller at de tar imot akuttpasienter. ") &&
+        intros.fylke.includes(" 3 oppgir akuttvakt med lagret sitat eller at de tar imot akuttpasienter. ") &&
+        intros.stedOne.includes(" Den oppgir akuttvakt med lagret sitat eller at den tar imot akuttpasienter. "),
+        "E1: the intro on /sted and /fylke says «akuttvakt med lagret sitat eller at de (den) tar imot akuttpasienter» [13]", JSON.stringify(intros));
+      for (const [where, r] of [["/sted/bergen", sted], ["/fylke/Vestland", fylke]] as const) {
+        assertEq(areaRows(r.text).filter(([k]) => /akutt/i.test(k!)), [["Akuttvakt med lagret sitat eller tar imot akuttpasienter", "3"]],
+          `E2 ${where}: the fact table's akutt row is «Akuttvakt med lagret sitat eller tar imot akuttpasienter» [13]`);
+        const faq = areaFaq(r.text);
+        assertEq(faq.find(([q]) => q.endsWith(" tar imot akuttpasienter?"))?.[1],
+          `3 klinikker oppgir akuttvakt med lagret sitat eller at de tar imot akuttpasienter. ${DENTAL_EMERGENCY_NOTICE.text}`,
+          `E3 ${where}: the akutt FAQ answer says «med lagret sitat» and ends with DENTAL_EMERGENCY_NOTICE.text, word for word [13, 14]`);
+        const visible = [...elementStarting(r.text, '<section class="landing-faq"').matchAll(/<div class="landing-faq-item"[^>]*><h3[^>]*>([^<]*)<\/h3><p[^>]*>([^<]*)<\/p><\/div>/g)]
+          .map((m) => [unescapeHtml(m[1]!), unescapeHtml(m[2]!)]);
+        assertTrue(faq.length === 3 && JSON.stringify(visible) === JSON.stringify(faq),
+          `E4 ${where}: the visible FAQ is the FAQ JSON-LD, question for question and word for word [14]`, JSON.stringify(visible));
+        const pageText = textOf(mainOf(r.text)) + " " + stringsOf(jsonLdOf(r.text)).join(" ");
+        assertTrue(!/\bmed kilde\b/.test(pageText) && !pageText.includes(OLD.areaAdvice.split(". ")[0]!),
+          `E5 ${where}: no «med kilde» and no old akutt advice («Ring klinikken først og spør …») on the page`);
+        const numbers = [...(faq.find(([q]) => q.endsWith(" tar imot akuttpasienter?"))?.[1] ?? "").matchAll(/\d[\d ]*\d|\d/g)].map((m) => m[0].trim());
+        assertEq(numbers, ["3", ...DENTAL_EMERGENCY_NOTICE.phones.map((p) => p.number)], `E6 ${where}: the akutt answer gives the count and the notice's numbers, no other`);
+      }
+      // The tannlegevakt facet is off (F1-S4c); its text says the same for when it is turned on again.
+      const many = facetLanding(4);
+      const one = facetLanding(1);
+      assertEq([vaktFacet.enabled, vaktFacet.titleTemplate], [false, "Tannlegevakt i {sted}: klinikker med akuttvakt med lagret sitat"],
+        "E7: the tannlegevakt facet stays off, and its title says «med lagret sitat» [13]");
+      assertEq([many.summary, one.summary.endsWith(" Den oppgir akuttvakt med lagret sitat."), many.uncountedSummary.endsWith(" Alle oppgir akuttvakt med lagret sitat.")],
+        ["Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen i oversikten. Alle oppgir akuttvakt med lagret sitat.", true, true],
+        "E8: the facet's definition is «Alle (Den) oppgir akuttvakt med lagret sitat.» [13]");
+      assertEq((many.faqJsonLd as any)?.mainEntity?.[0]?.acceptedAnswer?.text,
+        `Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen registrert. Alle oppgir akuttvakt med lagret sitat. ${DENTAL_EMERGENCY_NOTICE.text}`,
+        "E9: the facet's first FAQ answer ends with DENTAL_EMERGENCY_NOTICE.text [14]");
+    }
+
+    // ── L: the lock [11, 12] ─────────────────────────────────────────────
+    // The whole of /om, /hvordan-det-fungerer and /proveniens, the data
+    // sources included (point 12), and the area text of /sted and /fylke.
     const surfaces: Array<[string, string]> = [
-      ["/hvordan-det-fungerer (main)", textOf(withoutDataSources(hvordanMain))],
+      ["/om (main)", textOf(omMain)],
+      ...jsonLdOf(om).flatMap(stringsOf).map((s, i): [string, string] => [`/om JSON-LD #${i}`, s]),
+      ["/hvordan-det-fungerer (main)", textOf(hvordanMain)],
       ...jsonLdOf(hvordan).flatMap(stringsOf).map((s, i): [string, string] => [`/hvordan-det-fungerer JSON-LD #${i}`, s]),
-      ["/proveniens (main)", textOf(withoutDataSources(provMain))],
+      ["/proveniens (main)", textOf(provMain)],
       ...jsonLdOf(prov).flatMap(stringsOf).map((s, i): [string, string] => [`/proveniens JSON-LD #${i}`, s]),
+      ...([["/sted/bergen", sted], ["/fylke/Vestland", fylke]] as const).flatMap(([where, r]): Array<[string, string]> => [
+        [`${where} (area table)`, areaRows(r.text).map((row) => row.join(" | ")).join("\n")],
+        [`${where} (area FAQ)`, areaFaq(r.text).flat().join("\n")],
+        [`${where} (area FAQ, visible)`, textOf(elementStarting(r.text, '<section class="landing-faq"'))],
+      ]),
+      ...Object.entries(intros).map(([k, t]): [string, string] => [`area intro (${k})`, t]),
+      // The definition sentence only: the first one names the facet («med akuttvakt»), as its URL does.
+      ["tannlegevakt facet definition", [facetLanding(4).summary, facetLanding(1).summary].map((t) => t.split(". ").slice(1).join(". ")).join("\n")],
       ["ai-plugin description_for_human", String(plugJson?.description_for_human ?? "")],
       ["ai-plugin description_for_model", String(plugJson?.description_for_model ?? "")],
       ["/guide-tannlege-ai (main)", textOf(mainOf(guide.nb.text))],
@@ -415,22 +536,21 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
     ];
     {
       assertEq(surfaces.flatMap(([where, text]) => emergencyDutyWithoutQuote(text).map((s) => `${where}: ${s}`)), [],
-        "L1: no surface of points 3–9 names «Akuttvakt» / an emergency duty without the quote rule");
+        "L1: no surface of points 3–9, 12 and 13 names «Akuttvakt» / an emergency duty without the quote rule");
       const names = (where: string) => surfaces.filter(([w]) => w.startsWith(where)).some(([, t]) => /\bakuttvakt|\bemergency[- ]duty\b/i.test(t));
-      assertEq(["/hvordan-det-fungerer (main)", "/proveniens (main)", "ai-plugin description_for_model", "/guide-tannlege-ai (main)", "/en/guide-tannlege-ai (main)", "agent card skill"].filter((w) => !names(w)), [],
+      assertEq(["/hvordan-det-fungerer (main)", "/proveniens (main)", "ai-plugin description_for_model", "/guide-tannlege-ai (main)", "/en/guide-tannlege-ai (main)", "agent card skill",
+        "/sted/bergen (area", "/fylke/Vestland (area", "area intro", "tannlegevakt facet definition"].filter((w) => !names(w)), [],
         "L2: the lock is not vacuous: each of these still names the duty, with the rule");
       assertTrue(surfaces.every(([, t]) => t.length > 0) && surfaces.length > 10, `L3 control: every surface was read (${surfaces.length})`);
     }
 
     // ── Z: no page says «Akuttvakt-merke» or «akuttvakt-tilbud», and no new phone number ──
     {
-      const sted = await callRoute(router, "/sted/bergen");
-      const fylke = await callRoute(router, "/fylke/Vestland");
       const profile = await callRoute(router, `/klinikk/${dentalSeo.slugifyClinic("Sitat Vakt Tannklinikk AS", "918780101")}`);
       assertEq([sted.status, fylke.status, profile.status], [200, 200, 200], "Z0 control: /sted/bergen, /fylke/Vestland and a profile answer 200");
       const docs: Array<[string, string]> = [
         ["/", home], ["/sok", await page("/sok")], ["/sok?akutt=1", await page("/sok?akutt=1")], ["/hvordan-det-fungerer", hvordan],
-        ["/proveniens", prov], ["/om", await page("/om")], ["/guide-tannlege-ai", guide.nb.text], ["/en/guide-tannlege-ai", guide.en.text],
+        ["/proveniens", prov], ["/om", om], ["/guide-tannlege-ai", guide.nb.text], ["/en/guide-tannlege-ai", guide.en.text],
         ["/sted/bergen", sted.text], ["/fylke/Vestland", fylke.text], ["profile", profile.text],
         ["ai-plugin.json", plug.text], ["agent card", JSON.stringify(card)],
       ];
@@ -463,6 +583,16 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
       assertEq(emergencyDutyWithoutQuote("Akuttvakt Klinikken tar imot nye pasienter for akutt behandling utenom vanlig åpningstid. Vi har lagret setningen som sitat."),
         ["Akuttvakt Klinikken tar imot nye pasienter for akutt behandling utenom vanlig åpningstid."],
         "N5: the quote rule counts only in the sentence that names the badge");
+      // M6 in the review of lokal#1207: a new sentence in step «Kontakt» that negates the rule (forslag S1).
+      const kontakt = "Ingen mellomledd, ingen gebyrer fra vår side.";
+      assertEq([hvordanMain.includes(kontakt), emergencyDutyWithoutQuote(textOf(hvordanMain.replace(kontakt, `${kontakt} Akuttvakt vises også uten et lagret sitat.`)))],
+        [true, ["Akuttvakt vises også uten et lagret sitat."]], "N6: the lock (L1) catches «Akuttvakt vises også uten et lagret sitat.» on /hvordan-det-fungerer");
+      const round2Old = [OLD.sourceField.nb, OLD.sourceField.en, OLD.methodNb, OLD.methodEn, OLD.areaIntro, OLD.areaRow, OLD.facetDefinition, OLD.facetTitle];
+      assertEq(round2Old.filter((t) => emergencyDutyWithoutQuote(t).length === 0), [],
+        "N7: the lock flags the data-source field and method, the /sted and /fylke wording and the facet's definition and title before round 2 [12, 13]");
+      const oldWebItem = "Klinikkenes egne nettsider (KI-assistert uttrekk) — Helfo-direkteoppgjør, akuttvakt, spesialiteter, behandlinger, åpningstider, kontaktinformasjon og presentasjon";
+      assertEq([emergencyDutyWithoutQuote(oldWebItem).length, DENTAL_EMERGENCY_NOTICE.text.includes(OLD.areaAdvice)], [1, false],
+        "N8: the old source list item fails L1, and the old akutt advice on /sted and /fylke fails E3 and E9 [12, 14]");
     }
   } catch (err: any) {
     failed++;

@@ -9,10 +9,13 @@
 //
 // acute_sourced counts with DENTAL_ACUTE_CLAIM_SQL, the SQL twin of
 // resolveAcuteClaim(row) !== null: the clinics /sok?akutt=1 lists, whose card
-// shows «Akuttvakt» (with provenance) or «Tar imot akuttpasienter». No new
-// JSON check lives here. `verified` counts the same way, with the SQL twin of
-// resolveVerifiedClaim (A2A dev-request 2026-10-16-finn-tannlege-tillit-
-// kilder-metode-ikon, F2-S8): the clinics whose card shows «Verifisert».
+// shows «Akuttvakt» (with a stored quote, F1-S4c) or «Tar imot
+// akuttpasienter»; the text says «akuttvakt med lagret sitat eller … tar imot
+// akuttpasienter» (A2A dev-request 2026-10-16-finn-tannlege-fasettsider,
+// F1-S4e point 13). No new JSON check lives here. `verified` counts the same
+// way, with the SQL twin of resolveVerifiedClaim (A2A dev-request
+// 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S8): the clinics
+// whose card shows «Verifisert».
 //
 // specialist_clinics counts the clinics whose card shows a specialty: the
 // cards' own predicate, clinicSpecialties(row).length > 0, run in JS over the
@@ -49,7 +52,7 @@ import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
 import { dentalVerifiedClaimSql } from "./dental-verified-claim";
 import { clinicSpecialties } from "../config/dental-search-vocabulary";
 import { DENTAL_STATS_TTL_MS } from "./dental-search-gazetteer";
-import { DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, type DentalLandingFacet } from "../config/dental-landing";
+import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, type DentalLandingFacet } from "../config/dental-landing";
 import {
   buildAnswerFirst,
   buildFactFaq,
@@ -323,13 +326,10 @@ export interface DentalFacetLanding extends DentalAreaLanding {
    * The same without a number, for a page whose list and aggregate disagree
    * (the cache a little behind the data), which states no count: «Oversikt
    * over tannlegeklinikker med akuttvakt i Vestland. Alle oppgir akuttvakt
-   * med kilde.»
+   * med lagret sitat.»
    */
   uncountedSummary: string;
 }
-
-/** The FAQ answer's advice for akutt: call first, legevakten and 113. */
-const AKUTT_ADVICE = "Ring klinikken først og spør om de kan ta deg imot. Ved akutt sykdom eller skade utenfor åpningstid kan du ringe legevakten på 116 117. Ved livstruende situasjoner ringer du 113.";
 
 /** The facts the landing gates weigh: every count except the clinic total, which is the listing count. */
 function gateFacts(c: DentalAreaCounts): LandingFacts & { listings: number } {
@@ -353,7 +353,7 @@ interface FacetWords {
   own: "helfo_true" | "acute_sourced" | "specialist_clinics";
   /** What every clinic in the facet has, worded for one clinic or for several. */
   definition(single: boolean): string;
-  /** Said after the count in the FAQ answer. */
+  /** Said after the count in the FAQ answer (for akutt the emergency notice, F1-S4e point 14). */
   advice: string;
 }
 
@@ -368,7 +368,7 @@ function facetWords(facet: DentalLandingFacet): FacetWords {
         advice: "Bekreft alltid med klinikken før du bestiller time.",
       };
     case "tannlegevakt":
-      return { feature: "akuttvakt", own: "acute_sourced", definition: (single) => `${all(single)} oppgir akuttvakt med kilde.`, advice: AKUTT_ADVICE };
+      return { feature: "akuttvakt", own: "acute_sourced", definition: (single) => `${all(single)} oppgir akuttvakt med lagret sitat.`, advice: DENTAL_EMERGENCY_NOTICE.text };
     case "specialty": {
       const navn = facet.filter.specialty ?? "";
       return {
@@ -399,7 +399,7 @@ export function buildDentalAreaLanding(
  * The same for a facet page: `counts` are the facet's own (the place's
  * counts.facets[facet.slug]). The text says what the clinics have («med
  * kjeveortopedi og poststed Bergen», «med akuttvakt i Vestland») and what
- * that means (Helfo «ifølge klinikkenes egne nettsider», akutt «med kilde»),
+ * that means (Helfo «ifølge klinikkenes egne nettsider», akutt «med lagret sitat»),
  * and leaves out the count the facet is named for. The FAQ follows the facet
  * gate (passesDentalFacetGate), which the page itself is behind.
  */
@@ -448,7 +448,7 @@ function buildLanding(
     sentences.push(`${n === 1 ? "Den" : `${nb(counts.helfo_true)} av dem`} oppgir Helfo-direkteoppgjør ifølge ${websites(counts.helfo_true)}.`);
   }
   if (states("acute_sourced")) {
-    sentences.push(`${lead(counts.acute_sourced)} oppgir akuttvakt med kilde eller ${theyAccept(counts.acute_sourced)}.`);
+    sentences.push(`${lead(counts.acute_sourced)} oppgir akuttvakt med lagret sitat eller ${theyAccept(counts.acute_sourced)}.`);
   }
   if (states("specialist_clinics")) sentences.push(`${lead(counts.specialist_clinics)} har minst én oppført spesialitet.`);
   if (states("verified")) sentences.push(`${lead(counts.verified)} har Verifisert-merket hos Finn-tannlege.`);
@@ -468,7 +468,7 @@ function buildLanding(
   const rows: Array<[string, string]> = [["Klinikker totalt", nb(n)]];
   if (states("verified")) rows.push(["Med Verifisert-merket", nb(counts.verified)]);
   if (states("helfo_true")) rows.push(["Oppgir Helfo-direkteoppgjør (ifølge klinikkenes nettsider)", nb(counts.helfo_true)]);
-  if (states("acute_sourced")) rows.push(["Akuttvakt med kilde eller tar imot akuttpasienter", nb(counts.acute_sourced)]);
+  if (states("acute_sourced")) rows.push(["Akuttvakt med lagret sitat eller tar imot akuttpasienter", nb(counts.acute_sourced)]);
   if (states("specialist_clinics")) rows.push(["Med minst én oppført spesialitet", nb(counts.specialist_clinics)]);
   if (updated) rows.push(["Sist oppdatert", updated]);
   const tableHtml =
@@ -480,7 +480,10 @@ function buildLanding(
 
   // The FAQ. Each Q/A is built only from a number above zero, in one list
   // that both the visible block and the JSON-LD come from. The questions ask
-  // about clinics in the page's scope, as the answers count them.
+  // about clinics in the page's scope, as the answers count them. The akutt
+  // answer ends with the reviewed emergency notice from its one source,
+  // config/dental-landing.ts, as on /hvordan-det-fungerer and in MCP
+  // tannlege_akutt (F1-S4e point 14).
   const ofAll = (k: number): string => `${nb(k)} av ${nb(n)} ${plural(n, "klinikk", "klinikker")}`;
   const countTail = words ? ` ${words.definition(n === 1)}${words.advice ? ` ${words.advice}` : ""}` : "";
   const qas: LandingQa[] = [
@@ -497,7 +500,7 @@ function buildLanding(
   if (states("acute_sourced")) {
     qas.push({
       q: `Hvor mange tannlegeklinikker ${where} tar imot akuttpasienter?`,
-      a: `${nb(counts.acute_sourced)} ${plural(counts.acute_sourced, "klinikk", "klinikker")} oppgir akuttvakt med kilde eller ${theyAccept(counts.acute_sourced)}. ${AKUTT_ADVICE}`,
+      a: `${nb(counts.acute_sourced)} ${plural(counts.acute_sourced, "klinikk", "klinikker")} oppgir akuttvakt med lagret sitat eller ${theyAccept(counts.acute_sourced)}. ${DENTAL_EMERGENCY_NOTICE.text}`,
     });
   }
   if (states("specialist_clinics")) {
