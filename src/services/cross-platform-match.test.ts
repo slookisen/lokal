@@ -64,6 +64,13 @@ export function runCrossPlatformMatchTests(): TestSummary {
   eq(emailDomainForMatch("gard-b@enivest.net"), null, "n18: a second enivest.net mailbox has none either");
   eq(emailDomainForMatch("x@hesbynett.no"), null, "n19: hesbynett.no excluded");
   eq(emailDomainForMatch("x@post.telia.no"), null, "n20: subdomain of an ISP domain excluded");
+  eq(websiteDomainForMatch("https://www.visitbergen.com/x"), null, "n23: visitbergen.com (DIRECTORY_HOSTS / harvest source) excluded");
+  eq(websiteDomainForMatch("https://m.visitnorway.com/y"), null, "n24: m.visitnorway.com subdomain excluded");
+  eq(websiteDomainForMatch("https://www.booking.com/hotel/no/z.html"), null, "n25: booking.com excluded");
+  eq(websiteDomainForMatch("https://rettfrabonden.com/produsent/1"), null, "n26: rettfrabonden.com excluded");
+  eq(emailDomainForMatch("x@epost.no"), null, "n27: epost.no is consumer mail");
+  eq(emailDomainForMatch("x@posteo.no"), null, "n28: posteo.no is consumer mail");
+  eq(emailDomainForMatch("x@posteo.de"), null, "n29: posteo.de is consumer mail");
   eq(emailDomainForMatch("post@enivestgard.no"), "enivestgard.no", "n21: a producer domain merely containing an ISP name still matches");
   {
     const a = buildCrossPlatformIdentity({ email: "gard-a@enivest.net", website: "https://www.visitnorway.com/listings/a" });

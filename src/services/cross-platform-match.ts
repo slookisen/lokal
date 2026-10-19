@@ -23,7 +23,10 @@
 // Pure functions, no I/O. Normalisation only; nothing here writes data.
 
 import { FREE_MAIL_DOMAINS } from "./recipient-policy";
-import { isDirectoryOrAggregatorHost } from "./cross-source-validator";
+import {
+  isDirectoryOrAggregatorHost,
+  FREE_MAIL_DOMAINS as VALIDATOR_FREE_MAIL_DOMAINS,
+} from "./cross-source-validator";
 
 export type CrossPlatformMatch = "email" | "domain" | "website" | "org_nr";
 
@@ -71,6 +74,36 @@ const SHARED_WEBSITE_HOSTS: ReadonlySet<string> = new Set([
   "bondensmarked.no",
   "hanen.no",
   "matmerk.no",
+  // Catalogue / tourism-board hosts from admin-agents-url-write DIRECTORY_HOSTS
+  // and the Opplevagent HARVEST_SOURCE_HOSTS. Kept HERE, not added to
+  // KNOWN_DIRECTORY_HOSTS: that list drives irreversible NULL sweeps.
+  "bondensmarkedtroms.no",
+  "rekonorge.no",
+  "lokalmat.no",
+  "visittelemark.no",
+  "visitnorway.com",
+  "visitbergen.com",
+  "visitgreateroslo.com",
+  "visitsorlandet.com",
+  "visitbo.no",
+  "mathallenoslo.no",
+  "matrikevestfold.no",
+  "gladmat.no",
+  "ostelandet.no",
+  "ivaldres.no",
+  "godtlokalt.no",
+  "rensmak.no",
+  "siderlandet.no",
+  "honninglandet.no",
+  "debio.no",
+  "maps.google.com",
+  "nordnorge.com",
+  "visittromso.no",
+  "visitoslo.com",
+  "visittrondheim.no",
+  "fjordtours.com",
+  "booking.com",
+  "rettfrabonden.com",
 ]);
 
 /**
@@ -115,6 +148,8 @@ export function emailDomainForMatch(value: unknown): string | null {
   const domain = email.slice(at + 1).trim().replace(/^www\./, "");
   if (!domain || domain.indexOf(".") < 0) return null;
   if (FREE_MAIL_DOMAINS.has(domain)) return null;
+  // The validator's list also covers epost.no, posteo.no/de and other consumer hosts.
+  if (VALIDATOR_FREE_MAIL_DOMAINS.includes(domain)) return null;
   if (isSharedIspMailDomain(domain)) return null;
   return domain;
 }
