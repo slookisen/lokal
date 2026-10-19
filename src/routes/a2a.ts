@@ -28,6 +28,7 @@ import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
+import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -214,7 +215,11 @@ router.post("/a2a", (req: Request, res: Response) => {
       case "message/send":
       case "tasks/send": // Backward-compat alias for older A2A clients (<0.3)
       case "SendMessage": // A2A v1.0
-        handleMessageSend(params, id, req, res);
+        // Slice I-AA: a text is read with its place looked up (async); a
+        // failure outside the handler's own try gets this catch's answer.
+        handleMessageSend(params, id, req, res).catch((err) => {
+          if (!res.headersSent) res.json(rpcInternalError(id, "POST /a2a", err));
+        });
         break;
       case "tasks/get":
       case "GetTask": // A2A v1.0
@@ -258,6 +263,19 @@ const NO_INTENT_NOTE =
   "No food query detected in the message — try e.g. \"honey in Oslo\".";
 
 /**
+ * Slice I-AA: the note to a text with a place whose words the parser could
+ * not read match no product of the producers there (DiscoverMeta.unmatchedTerms).
+ * lokal_search lists those producers, marked as no matches; this answer has
+ * none, since a client reads `agents` as matches and the top three would get
+ * a conversation.
+ */
+function areaNoProductMatchNote(terms: readonly string[]): string {
+  const words = `«${terms.join(" ")}»`;
+  return `🔎 Ingen produsent i området har ${words} i produktlista, så søket gir ingen treff der. Søk uten sted for hele landet. / ` +
+    `No producer in the area lists ${words}, so there are no matches there. Search without a place to cover all of Norway.`;
+}
+
+/**
  * The most characters of a structured query's JSON that RFB A2A logs, stores
  * and echoes as it was sent. dev-request
  * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
@@ -290,7 +308,7 @@ export function boundedA2aQuery(sent: unknown, read: DiscoveryQuery): unknown {
   return Object.fromEntries(Object.entries(read).filter(([key]) => Object.hasOwn(sent, key)));
 }
 
-function handleMessageSend(params: any, id: any, req: Request, res: Response) {
+async function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   const message = params?.message;
   if (!message) {
     res.json({
@@ -343,8 +361,17 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   const messageData = a2aMessageData(message);
 
   // Mode 1: Natural language search (flat text, parts array, or string)
+  // Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): read as
+  // MCP lokal_search reads it (services/rfb-search-reading.ts): a place
+  // outside Norway gets no producers, and the place in the text is looked
+  // up below, once the traffic class is known. «honning Trondheim» used to
+  // be answered with honey producers in Tønsberg, Hurum and Stathelle, and
+  // «cheese in Stockholm» with Norwegian dairies.
+  let outsideNorway: string | null = null;
   if (messageText) {
-    discoveryQuery = marketplaceRegistry.parseNaturalQuery(messageText);
+    const read = readSearchText(messageText);
+    discoveryQuery = read.parsed;
+    outsideNorway = read.outsideNorway;
   }
   // Mode 2: Structured discovery query
   else if (messageData) {
@@ -378,7 +405,22 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     hasStructuredData: !messageText,
     isInternal: isInternalTraffic(requestMeta),
   });
-  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText });
+  // Slice I-AA: only external and internal traffic has its text read as a
+  // search the way lokal_search reads it. Spam and probe traffic is read as
+  // before: the words the parser cannot read, which nearly every such payload
+  // has, are no search (so it gets no discover() at all), and no place is
+  // looked up. Looking up a text's place is up to 114 sequential requests to
+  // Kartverket (MAX_GEOCODE_WORDS), and the misses would fill the geocode
+  // cache that lokal_search and /sok share (review of lokal#1193, B1). A
+  // place is looked up only for a text that asks for something
+  // (hasDiscoveryIntent): a place alone, or a greeting the geocoder may know
+  // as a place («hei»), stays no search, as before, so it starts no
+  // conversations.
+  const readAsSearch = trafficClass === "external" || trafficClass === "internal";
+  if (messageText && readAsSearch && !outsideNorway && hasDiscoveryIntent(discoveryQuery)) {
+    await geocodeSearchPlace(discoveryQuery, messageText);
+  }
+  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText, unknownTerms: readAsSearch });
   const capKey = req.ip ? hashIP(req.ip) : "unknown";
   const rateCapped = trafficClass === "external" && hasIntent && a2aConversationCap.isOver(capKey);
   const countable = trafficClass === "external" && hasIntent && !rateCapped;
@@ -391,11 +433,14 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   // Execute discovery
   const startTime = Date.now();
   try {
-    const query = DiscoveryQuerySchema.parse({
-      ...discoveryQuery,
-      limit: discoveryQuery.limit || 20,
-      offset: discoveryQuery.offset || 0,
-    });
+    // Slice I-AA: a text's product, name and unknown words reach discover(),
+    // as lokal_search's do (discoveryQueryOf); the parse dropped them, so
+    // «Which farms in Innlandet sell lamb?» was a search for any meat. A
+    // structured query is parsed as before.
+    const page = { limit: discoveryQuery.limit || 20, offset: discoveryQuery.offset || 0 };
+    const query = messageText
+      ? discoveryQueryOf(discoveryQuery, page)
+      : DiscoveryQuerySchema.parse({ ...discoveryQuery, ...page });
     // Slice I-Y3: what is logged, stored and echoed of a structured query is
     // bounded in total (boundedA2aQuery); a real query is the same object.
     const loggedQuery = messageText ? discoveryQuery : boundedA2aQuery(discoveryQuery, query);
@@ -409,11 +454,18 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     // No intent → no discover() at all: an empty query used to fall back to
     // the nationwide trust ranking (full-table scan + ~1.2 s event-loop block
     // per spam call) and hand the same three producers every payload.
+    // Slice I-AA: a text naming a place outside Norway gets no producers.
+    // When the words the parser could not read match no product name
+    // (discover() step 3c, meta.unmatchedTerms), the answer has no
+    // producers either: nationwide discover() gives none, and near a place
+    // the producers there are no matches, nor counted as discovered.
     const discoverMeta: DiscoverMeta = {};
-    const results = hasIntent
-      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable })
+    const found = hasIntent && !outsideNorway
+      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false })
       : [];
-    const tagsRelaxed = !!discoverMeta.tagsRelaxed;
+    const unmatchedTerms = discoverMeta.unmatchedTerms;
+    const results = unmatchedTerms ? [] : found;
+    const tagsRelaxed = !unmatchedTerms && !!discoverMeta.tagsRelaxed;
     res.locals.a2aCountable = countable && results.length > 0;
     // «Med i AI-svar»: the producers in a countable answer, once per profile.
     recordA2aDelivery(req, res, results.map((r) => r.agent.id), queryText);
@@ -484,7 +536,11 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     // present only when the tag filter was actually dropped, so a
     // tagsRelaxed:false result is byte-identical to before this change.
     const relaxedFilters = tagsRelaxed ? ["tags"] : undefined;
-    const note = hasIntent ? buildSearchNote({ tagsDropped: tagsRelaxed }) : NO_INTENT_NOTE;
+    // Slice I-AA: lokal_search's texts for a place outside Norway and for
+    // words that match no product nationwide (services/rfb-search-reading.ts).
+    const note = outsideNorway ? outsideNorwayText(outsideNorway)
+      : unmatchedTerms ? (query.location ? areaNoProductMatchNote(unmatchedTerms) : noProductMatchText(unmatchedTerms))
+      : hasIntent ? buildSearchNote({ tagsDropped: tagsRelaxed }) : NO_INTENT_NOTE;
 
     // A2A response format — now includes conversation links
     res.json({
