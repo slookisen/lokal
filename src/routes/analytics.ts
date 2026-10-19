@@ -25,6 +25,7 @@ import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { getRetentionWindowDays } from "../services/traffic-stats-compute";
 import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, computeAiDeliveryTopProfiles } from "../services/profile-ai-deliveries-compute";
+import { computePartnerReport, partnerReportToCsv, PartnerReportInputError } from "../services/partner-report-service";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
@@ -1677,6 +1678,38 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 //   since_hours=24 (default, min 1, max 87600 = 10y)
 //
 // Response shape — see PR-74 spec in repo notes.
+/**
+ * GET /admin/analytics/partner-report — effect report for a group of producers
+ * (dev-request 2026-10-03-partner-effektrapport-per-gaard, slice 1: contact
+ * clicks, is_bot = 0, by kind and utm_source). Query: agentIds=<csv> XOR
+ * umbrella=<id>; days (default 30, max 365) XOR from+to (YYYY-MM-DD);
+ * format=csv. Aggregates only. views_by_class / discoveries_by_channel are
+ * slices 2/3 and not yet built (omitted).
+ */
+router.get("/partner-report", requireAdminAuth, (req: Request, res: Response) => {
+  const format = req.query.format === undefined ? "json" : String(req.query.format);
+  if (format !== "json" && format !== "csv") {
+    res.status(400).json({ error: "Invalid format — must be json or csv" });
+    return;
+  }
+  try {
+    const report = computePartnerReport(getDb(), req.query as any);
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", 'attachment; filename="partner-report.csv"');
+      res.send(partnerReportToCsv(report));
+      return;
+    }
+    res.json(report);
+  } catch (err: any) {
+    if (err instanceof PartnerReportInputError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    res.status(500).json({ error: "Query failed", detail: err.message });
+  }
+});
+
 router.get("/umbrella-traffic", async (req: Request, res: Response) => {
   // Markedsnettverk (umbrellas) are an rfb-only concept. Never expose on a
   // locked secondary host even though the dashboard hides the panel there.

@@ -997,6 +997,15 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden INTEGER DEFAULT 0");
   } catch { /* already present */ }
 
+  // catalog_hidden_reason: why a provider was hidden via POST
+  // /admin/gardssalg-provider-visibility (dev-request 2026-10-01-opplevagent-
+  // skjul-uten-sperre): 'remove_request' (fjern oss, blocklisted) or
+  // 'quality' (hidden for quality reasons, NOT blocklisted). NULL = visible or
+  // hidden before this column existed. Additive.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden_reason TEXT");
+  } catch { /* already present */ }
+
   // ─── Test-provider identity (dev-request 2026-10-03-booking-avlistet-
   // produsent-bypass) ───────────────────────────────────────────────────────
   // catalog_hidden=1 also marks REAL producers who asked to be delisted, so it

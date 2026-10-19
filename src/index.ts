@@ -118,6 +118,7 @@ import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
@@ -886,6 +887,9 @@ app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMerge
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/deactivate", adminLimiter, adminAgentsDeactivateRoutes);
+// POST /admin/agents/business-type + GET .../classification-dryrun — shop marker
+// (dev-request 2026-10-01-rfb-butikker-i-outreach-poolen). Mount BEFORE /admin/agents.
+app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRoutes);
 // POST /admin/test-producer — the ONE hidden RFB test producer for real test
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.

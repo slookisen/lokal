@@ -23,6 +23,13 @@ Or add to Claude Desktop config (`~/.claude/claude_desktop_config.json`):
 }
 ```
 
+## How it works
+
+Since 0.4.0 the package is a thin stdio bridge to the live remote server
+(`https://opplevagent.no/mcp`). Tools, descriptions, instructions and UI resources always
+match the remote service, so the npm package and the remote never drift, and free-text
+`query` reaches `discover_experiences` unchanged. Remote rate limits apply.
+
 ## Remote (Streamable HTTP)
 
 For ChatGPT and other remote MCP clients, paste this URL directly:
@@ -70,7 +77,7 @@ Outcomes are always honest and explicit: `provider_not_found`, `provider_ambiguo
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPPLEVAGENT_URL` | `https://opplevagent.no` | Override API base URL |
+| `OPPLEVAGENT_URL` | `https://opplevagent.no` | Override the remote base URL (or a full `/mcp` URL) |
 
 ## License
 

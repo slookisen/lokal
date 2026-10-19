@@ -12,7 +12,7 @@ import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -913,7 +913,10 @@ router.get("/search", async (req: Request, res: Response) => {
 
   const enrichedResults = results.map((r: any) => {
     const contact = buildContactBlock(r.agent.id);
-    const profileUrl = `${BASE_URL}/produsent/${slug(r.agent.name)}`;
+    // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+    const profileUrl = failsProducerRoleGate(r.agent.role, false)
+      ? undefined
+      : `${BASE_URL}/produsent/${slug(r.agent.name)}`;
 
     // Include products with prices for all results (essential for AI agents)
     const info = knowledgeService.getAgentInfo(r.agent.id);
@@ -1165,9 +1168,19 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
 
     // Top-level canonical URL — explicit so AI agents reading the
     // card don't have to dig into links.profile or invent one from name.
-    card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
+    // Skive A2: /produsent/:slug 404s for non-producer, non-umbrella roles
+    // (quality/logistics) — omit canonicalUrl + links.profile for those so AI
+    // agents never follow a link to a 404. Same predicate as seo.ts.
+    let cardHasProfilePage = true;
+    try {
+      const gateRow = getDb()
+        .prepare("SELECT role, umbrella_type, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?")
+        .get(agentId) as any;
+      if (gateRow) cardHasProfilePage = hasProducerPage(gateRow);
+    } catch { /* fail-open: keep the link, as before */ }
+    if (cardHasProfilePage) card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
     card.links = {
-      profile: `https://rettfrabonden.com/produsent/${slug}`,
+      ...(cardHasProfilePage ? { profile: `https://rettfrabonden.com/produsent/${slug}` } : {}),
       googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
       vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
     };
@@ -1183,7 +1196,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
       const a = (agent as any);
       if (a.umbrella_type) {
         const members = db.prepare(`
-          SELECT p.id, p.name, p.city, aff.labels, aff.status
+          SELECT p.id, p.name, p.city, p.role, p.umbrella_type AS member_umbrella_type, aff.labels, aff.status
           FROM agent_affiliations aff
           INNER JOIN agents p ON p.id = aff.producer_id
           WHERE aff.umbrella_id = ?
@@ -1205,7 +1218,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
               city: m.city,
               labels: m.labels ? (() => { try { return JSON.parse(m.labels); } catch { return []; } })() : [],
               card_url: `${getBaseUrl(req)}/api/marketplace/agents/${m.id}/card`,
-              profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}`,
+              ...(failsProducerRoleGate(m.role, !!m.member_umbrella_type)
+                ? {}
+                : { profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}` }),
             })),
           }]);
         }
@@ -5485,7 +5500,7 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
 
     const rows = db.prepare(`
       SELECT
-        p.id, p.name, p.city, p.trust_score, p.is_verified,
+        p.id, p.name, p.city, p.trust_score, p.is_verified, p.role, p.umbrella_type AS member_umbrella_type,
         aff.id AS affiliation_id, aff.status, aff.labels, aff.joined_at
       FROM agent_affiliations aff
       INNER JOIN agents p ON p.id = aff.producer_id
@@ -5499,7 +5514,9 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
       name: r.name,
       city: r.city,
       slug: slugify(r.name),
-      profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+      ...(failsProducerRoleGate(r.role, !!r.member_umbrella_type)
+        ? {}
+        : { profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}` }),
       card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
       trust_score: r.trust_score,
       is_verified: r.is_verified === 1,
@@ -5676,7 +5693,9 @@ router.get("/salgskanal/:slug", (req: Request, res: Response) => {
         categories: a.categories || [],
         trustScore: a.trustScore ?? null,
         isVerified: !!a.isVerified,
-        profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}`,
+        ...(failsProducerRoleGate((a as any).role, false)
+          ? {}
+          : { profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}` }),
         card_url: `${getBaseUrl(req)}/api/marketplace/agents/${a.id}/card`,
         evidence: evidence || null,
       })),

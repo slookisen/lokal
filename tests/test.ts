@@ -3206,6 +3206,38 @@ console.log("── human-visits strip: referral classification + aggregation �
   assertTrue(!gateEmailMatch.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: matching email (post@gard.no on gard.no) → no flag");
   assertTrue(gateEmailMatch.passes, "orch-pr-20260614-4: matching email still passes gate");
 
+  // Test 5f: cross-TLD same-brand (dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld)
+  {
+    const base = {
+      http_status: 200,
+      website: "https://www.knattenfrukt.com",
+      about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+      products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+      brreg: null,
+    };
+    const prov = (value: string, url: string, st = "homepage") => ({ email: [{ value, source_type: st, source_url: url, fetched_at: "2026-10-01T16:00:00Z" }] });
+    const okProv = prov("Nils@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/");
+    const g1 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: okProv });
+    assertTrue(g1.passes && !g1.flags.includes("email_domain_mismatch"), "cross-tld: .no email + .com site + homepage provenance → passes");
+    assertEq(g1.email_own_domain_via, "cross_tld_homepage", "cross-tld: via marker set");
+    const g1s = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: JSON.stringify(okProv) });
+    assertTrue(g1s.passes, "cross-tld: provenance as JSON string works");
+    const g2 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no" });
+    assertTrue(g2.flags.includes("email_domain_mismatch") && !g2.passes && g2.email_own_domain_via === undefined, "cross-tld: no provenance → mismatch");
+    const g3 = computeKvalitetsGate({ ...base, email: "nils@knatten-frukt-salg.no", field_provenance: prov("nils@knatten-frukt-salg.no", "https://www.knattenfrukt.com/kontakt/") });
+    assertTrue(g3.flags.includes("email_domain_mismatch") && !g3.passes, "cross-tld: different brand → mismatch even with provenance");
+    const g4 = computeKvalitetsGate({ ...base, email: "post@gmail.com" });
+    assertTrue(g4.passes && g4.email_own_domain_via === undefined, "cross-tld: free-mail unchanged, no via marker");
+    const g5 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("annen@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/") });
+    assertTrue(g5.flags.includes("email_domain_mismatch"), "cross-tld: provenance with wrong email value → mismatch");
+    const g6 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("nils@knattenfrukt.no", "https://annenside.no/kontakt/") });
+    assertTrue(g6.flags.includes("email_domain_mismatch"), "cross-tld: provenance with foreign source_url host → mismatch");
+    const g7 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("nils@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/", "harvest_contact_email") });
+    assertTrue(g7.flags.includes("email_domain_mismatch"), "cross-tld: non-homepage source_type → mismatch");
+    const g8 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: "{not json" });
+    assertTrue(g8.flags.includes("email_domain_mismatch"), "cross-tld: unparsable provenance → mismatch (fail-closed)");
+  }
+
   // Test 5e: no-email case unchanged — email_own_domain=false, gate fails
   const gateNoEmail = computeKvalitetsGate({
     http_status: 200,
@@ -3231,7 +3263,7 @@ console.log("── human-visits strip: referral classification + aggregation �
   const sqlite = require("better-sqlite3");
   const wo8db = new sqlite(":memory:");
   wo8db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -3305,7 +3337,7 @@ console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
   const sqlite = require("better-sqlite3");
   const db = new sqlite(":memory:");
   db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -10017,7 +10049,13 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   console.log("\n── Phase 5.11 A2.5: A2A agent-card + MCP discovery ──");
   const fs = require("fs");
   const mp = fs.readFileSync("src/routes/marketplace.ts", "utf8");
-  const mcp = fs.readFileSync("mcp-server/index.js", "utf8");
+  // G1-S2b: mcp-server/index.js is a stdio bridge to the remote /mcp since 0.5.0, so the MCP-tool checks
+  // below run against what registerTools() (the remote's tool list, which the bridge forwards) registers.
+  const { McpServer: _a25McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+  const { registerTools: _a25RegisterTools } = require("../src/routes/mcp");
+  const _a25Server = new _a25McpServer({ name: "a25-rfb", version: "0.0.0" });
+  _a25RegisterTools(_a25Server);
+  const rfbTools: Record<string, any> = (_a25Server as any)._registeredTools;
   const serverJson = JSON.parse(fs.readFileSync("mcp-server/server.json", "utf8"));
   const pkgJson = JSON.parse(fs.readFileSync("mcp-server/package.json", "utf8"));
 
@@ -10111,44 +10149,41 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: agent-card adds top-level umbrella metadata block for umbrellas"
   );
 
-  // ── MCP tools (mcp-server/index.js) ─────────────────────────
-  // Test 4.11: 3 new MCP tools registered
-  for (const tool of ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"]) {
+  // ── MCP tools (registerTools(), forwarded by mcp-server/index.js since 0.5.0) ──
+  const umbrellaToolNames = ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"];
+
+  // Test 4.11: 3 umbrella MCP tools registered and enabled
+  for (const tool of umbrellaToolNames) {
     assertTrue(
-      mcp.includes(`registerTool(\n  "${tool}"`),
+      !!rfbTools[tool] && rfbTools[tool].enabled !== false,
       `phase5.11-a2.5: MCP tool ${tool} registered`
     );
   }
 
-  // Test 4.12: MCP tools all marked read-only + idempotent + open-world
-  const listStart = mcp.indexOf('"lokal_list_umbrellas"');
-  const startSect = mcp.indexOf('"lokal_list_umbrellas"');
-  // All three tool blocks contain the annotation set
-  const allMcpTools = mcp.slice(startSect);
-  const readonlyCount = (allMcpTools.match(/readOnlyHint:\s*true/g) || []).length;
+  // Test 4.12: MCP tools all marked read-only + idempotent
   assertTrue(
-    readonlyCount >= 3,
-    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint: true"
+    umbrellaToolNames.every((t) => rfbTools[t]?.annotations?.readOnlyHint === true && rfbTools[t]?.annotations?.idempotentHint === true),
+    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint + idempotentHint: true"
   );
 
   // Test 4.13: MCP tool descriptions include umbrella concepts
   assertTrue(
-    /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(mcp.slice(listStart)),
+    umbrellaToolNames.some((t) => /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(String(rfbTools[t]?.description || ""))),
     "phase5.11-a2.5: MCP tool descriptions reference real Norwegian umbrella names"
   );
 
-  // Test 4.14: MCP tools call our public discovery endpoints (not admin)
+  // Test 4.14: the stdio package carries no tool definitions or HTTP calls of its own — it is a bridge to the
+  // remote, and its mcpb manifest lists exactly the remote's tools (behaviour is covered by mcp-stdio-bridge.test.ts).
+  const stdioEntry = fs.readFileSync("mcp-server/index.js", "utf8");
   assertTrue(
-    mcp.includes("/api/marketplace/umbrellas?"),
-    "phase5.11-a2.5: lokal_list_umbrellas calls /api/marketplace/umbrellas"
+    /runBridge\(/.test(stdioEntry) && !/registerTool\(|\/api\/marketplace\//.test(stdioEntry),
+    "phase5.11-a2.5: mcp-server/index.js is a thin bridge (no own tools, no /api/marketplace calls)"
   );
-  assertTrue(
-    mcp.includes("/api/marketplace/umbrellas/${umbrellaId}/members"),
-    "phase5.11-a2.5: lokal_get_umbrella_members calls /api/marketplace/umbrellas/:id/members"
-  );
-  assertTrue(
-    mcp.includes("/api/marketplace/producers/${producerId}/affiliations"),
-    "phase5.11-a2.5: lokal_get_producer_affiliations calls /api/marketplace/producers/:id/affiliations"
+  const mcpbManifest = JSON.parse(fs.readFileSync("mcp-server/manifest.json", "utf8"));
+  assertEq(
+    JSON.stringify(mcpbManifest.tools.map((t: any) => t.name)),
+    JSON.stringify(Object.entries(rfbTools).filter(([, t]: [string, any]) => t.enabled !== false).map(([n]) => n)),
+    "phase5.11-a2.5: mcp-server/manifest.json lists exactly the tools registerTools() registers"
   );
 
   // Test 4.15: server.json + package.json versions bumped to 0.4.0, then to
@@ -10160,8 +10195,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json and mcp-server/package.json versions stay in lockstep"
   );
   assertTrue(
-    serverJson.version === "0.4.1",
-    "phase5.11-a2.5: server.json version bumped to 0.4.1 (remotes + websiteUrl + updated description)"
+    serverJson.version === "0.5.0" && pkgJson.version === "0.5.0" && mcpbManifest.version === "0.5.0",
+    "phase5.11-a2.5: server.json, package.json and manifest.json are at 0.5.0 (stdio bridge, G1-S2b)"
   );
 
   // Test 4.16: server.json description mentions umbrella organizations
@@ -10170,10 +10205,14 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json description updated to mention umbrella organizations"
   );
 
-  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter
+  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter (behaviour, not source text)
+  const umbrellaSchema = rfbTools.lokal_list_umbrellas?.inputSchema;
   assertTrue(
-    mcp.includes('z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"])'),
-    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType uses z.enum allow-list"
+    !!umbrellaSchema &&
+      ["market_network", "venue", "industry_org", "certification", "cooperative"].every(
+        (v) => umbrellaSchema.safeParse({ umbrellaType: v }).success) &&
+      !umbrellaSchema.safeParse({ umbrellaType: "bogus" }).success,
+    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType accepts the 5 allow-listed values and rejects others"
   );
 }
 
@@ -11483,8 +11522,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
   const serverParsed = JSON.parse(serverJsonRoot);
   assertTrue(
-    serverParsed.version === "0.4.1",
-    "pr-56: server.json bumped to v0.4.1 (was 0.3.3, then 0.4.0)"
+    serverParsed.version === "0.5.0",
+    "pr-56: server.json bumped to v0.5.0 (was 0.3.3, 0.4.0, 0.4.1; stdio bridge in G1-S2b)"
   );
   assertTrue(
     Array.isArray(serverParsed.remotes) &&
@@ -15693,7 +15732,6 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   console.log("\n── PR-76: lokal_geocode MCP tool ──");
   const fs = require("fs");
   const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf-8");
-  const stdioSrc = fs.readFileSync("mcp-server/index.js", "utf-8");
   const marketplaceSrc = fs.readFileSync("src/routes/marketplace.ts", "utf-8");
 
   // (1) HTTP-MCP server: lokal_geocode tool is registered
@@ -15727,16 +15765,22 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
     "pr-76: lokal_geocode is read-only + idempotent + openWorldHint:true"
   );
 
-  // (5) Stdio MCP server: lokal_geocode mirrored
-  assertTrue(
-    /registerTool\(\s*"lokal_geocode"/.test(stdioSrc),
-    "pr-76: lokal_geocode tool mirrored in mcp-server/index.js (stdio server)"
-  );
+  // (5) Stdio package: since 0.5.0 a bridge to the remote, so lokal_geocode reaches stdio clients through
+  // the remote tool list (registerTools()) and the mcpb manifest — not through a mirrored handler.
+  {
+    const { registeredMcpTools: _pr76Tools } = require("../src/services/mcp-tool-manifest");
+    const remoteGeocode = _pr76Tools("rfb").some((t: any) => t.name === "lokal_geocode");
+    const mcpbTools = JSON.parse(fs.readFileSync("mcp-server/manifest.json", "utf-8")).tools.map((t: any) => t.name);
+    assertTrue(
+      remoteGeocode && mcpbTools.includes("lokal_geocode"),
+      "pr-76: lokal_geocode is in registerTools() and in the lokal-mcp mcpb manifest (stdio bridge forwards it)"
+    );
+  }
 
-  // (6) Stdio mirror calls public /api/marketplace/geocode endpoint
+  // (6) Stdio package has no own geocode HTTP call any more
   assertTrue(
-    /\/api\/marketplace\/geocode/.test(stdioSrc),
-    "pr-76: stdio mirror calls /api/marketplace/geocode HTTP endpoint"
+    !/\/api\/marketplace\/geocode/.test(fs.readFileSync("mcp-server/index.js", "utf-8")),
+    "pr-76: mcp-server/index.js (bridge) has no own /api/marketplace/geocode call"
   );
 
   // (7) HTTP endpoint registered for stdio mirror to call
@@ -16308,7 +16352,7 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
   function makeDb() {
     const db = new sqlite(":memory:");
     db.exec(`
-      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
         address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -25133,6 +25177,9 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       last_seen_at TEXT DEFAULT (datetime('now')),
       -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
       catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      -- + retail-shop gate columns (dev-request 2026-10-01-rfb-butikker-i-outreach-poolen)
+      business_type TEXT,
+      retail_focus TEXT,
       vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
 
@@ -33563,6 +33610,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of esvmt.failures) failures.push("experiences-seo-visning-mcp-tilbyder: " + f);
     console.log(`  experiences-seo-visning-mcp-tilbyder: ${esvmt.passed} passed, ${esvmt.failed} failed`);
 
+    // S2 of the same dev-request (reviewer follow-ups): MCP phone wash,
+    // booking_url validation, /en out of sitemap with the flag off, neutral gsMeta.
+    console.log("\n── experiences-visning-s2: reviewer follow-ups ──");
+    const { runExperiencesVisningS2Tests } = require("../src/routes/experiences-visning-s2.test") as
+      typeof import("../src/routes/experiences-visning-s2.test");
+    const evs2 = await runExperiencesVisningS2Tests({ log: false });
+    passed += evs2.passed;
+    failed += evs2.failed;
+    for (const f of evs2.failures) failures.push("experiences-visning-s2: " + f);
+    console.log(`  experiences-visning-s2: ${evs2.passed} passed, ${evs2.failed} failed`);
+
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
     // arbeidspunkt 5: gårdssalg produsent-profil template render-guards —
     // drivingSted() adjacent-duplicate collapse, the new
@@ -36179,6 +36237,42 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental regionord (D3f): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S-EN): English
+  //    time and filler words («care», «tonight») are stopwords, not a clinic
+  //    name, alike in MCP, A2A and /sok; Norwegian queries parse as before ──
+  console.log("\n── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S-EN): dental engelske fyllord ──");
+  try {
+    const { runDentalSearchEngelskeFyllordTests } = require("../src/routes/dental-search-engelske-fyllord.test") as
+      typeof import("../src/routes/dental-search-engelske-fyllord.test");
+    const dsen = await runDentalSearchEngelskeFyllordTests({ log: false });
+    passed += dsen.passed;
+    failed += dsen.failed;
+    for (const f of dsen.failures) failures.push("dental engelske fyllord (S-EN): " + f);
+    console.log(`  dental engelske fyllord (S-EN): ${dsen.passed} passed, ${dsen.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental engelske fyllord (S-EN): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5,
+  //    Finn-tannlege): /mcp serverInfo has the brand's title, websiteUrl and
+  //    PNG icons (512, then 192) from BRAND_ENTITIES.dental, each icon's src
+  //    answers 200 image/png at its declared size, and the MCP server card's
+  //    icon is the 512 ──
+  console.log("\n── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5): dental serverInfo og PNG-ikon ──");
+  try {
+    const { runDentalMcpServerInfoIconsTests } = require("../src/routes/dental-mcp-serverinfo-icons.test") as
+      typeof import("../src/routes/dental-mcp-serverinfo-icons.test");
+    const dsi = await runDentalMcpServerInfoIconsTests({ log: false });
+    passed += dsi.passed;
+    failed += dsi.failed;
+    for (const f of dsi.failures) failures.push("dental serverInfo icons (G3-S5): " + f);
+    console.log(`  dental serverInfo icons (G3-S5): ${dsi.passed} passed, ${dsi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental serverInfo icons (G3-S5): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
   //    places-treffvakt (A4-D): an address, phone, website or opening hours
   //    only Google Places gives (or marked wrong) is shown on no public
@@ -36334,6 +36428,35 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental agent card (D3d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3): the shared
+  //    landing gate + answer-first/FAQ helpers, and the /sted and /fylke
+  //    intro, fact table and FAQ built from them ──
+  console.log("\n── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3): landing facts ──");
+  try {
+    const { runLandingFactsTests } = require("../src/services/landing-facts.test") as
+      typeof import("../src/services/landing-facts.test");
+    const lf = await runLandingFactsTests({ log: false });
+    passed += lf.passed;
+    failed += lf.failed;
+    for (const f of lf.failures) failures.push("landing facts (F1-S3): " + f);
+    console.log(`  landing facts (F1-S3): ${lf.passed} passed, ${lf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("landing facts (F1-S3): unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runDentalAreaLandingTests } = require("../src/routes/dental-area-landing.test") as
+      typeof import("../src/routes/dental-area-landing.test");
+    const dal3 = await runDentalAreaLandingTests({ log: false });
+    passed += dal3.passed;
+    failed += dal3.failed;
+    for (const f of dal3.failures) failures.push("dental area landing (F1-S3): " + f);
+    console.log(`  dental area landing (F1-S3): ${dal3.passed} passed, ${dal3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental area landing (F1-S3): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
@@ -36444,6 +36567,7 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   console.log("\n── dev-request 2026-10-16 (S2b+S6): akutt med proveniens og kjeder fra chain_brand (finn-tannlege) ──");
   for (const [label, load] of [
     ["dental acute filter", () => (require("../src/routes/dental-acute-filter.test") as typeof import("../src/routes/dental-acute-filter.test")).runDentalAcuteFilterTests({ log: false })],
+    ["dental openapi truth", () => (require("../src/routes/dental-openapi-truth.test") as typeof import("../src/routes/dental-openapi-truth.test")).runDentalOpenapiTruthTests({ log: false })],
     ["dental chains", () => (require("../src/routes/dental-chains.test") as typeof import("../src/routes/dental-chains.test")).runDentalChainsTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
@@ -36695,6 +36819,13 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
     failed += eop.failed;
     for (const f of eop.failures) failures.push("email-ownership-provenance: " + f);
     console.log(`  email-ownership-provenance: ${eop.passed} passed, ${eop.failed} failed`);
+    const { runLokalAgentVerifierEmailCrossTldMarkerTests } = require("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test") as
+      typeof import("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test");
+    const ctm = await runLokalAgentVerifierEmailCrossTldMarkerTests({ log: false });
+    passed += ctm.passed;
+    failed += ctm.failed;
+    for (const f of ctm.failures) failures.push("email-cross-tld-marker: " + f);
+    console.log(`  email-cross-tld-marker: ${ctm.passed} passed, ${ctm.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("email-ownership-provenance: unexpected error: " + String(err?.message || err));
@@ -38857,19 +38988,30 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
     assertEq(statusDp, 200, "prov-dental-01: GET /proveniens -> 200");
     assertTrue(bodyDp.includes('<link rel="canonical" href="https://finn-tannlege.com/proveniens">'),
       "prov-dental-02: canonical URL present");
-    assertTrue(bodyDp.includes("Slik verifiserer vi dataene våre"), "prov-dental-03: NO section renders the expected h1");
-    assertTrue(bodyDp.includes('id="en"') && bodyDp.includes("How we verify our data"),
+    // F2-S2 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
+    // the page is the method page «Metode og kilder», at the same URL.
+    assertTrue(bodyDp.includes("<h1>Metode og kilder</h1>"), "prov-dental-03: NO section renders the expected h1");
+    assertTrue(bodyDp.includes('<h1 id="en">Method and sources</h1>'),
       "prov-dental-04: EN section present in the same page (id=\"en\" anchor)");
     assertTrue(bodyDp.includes("Brønnøysundregistrene"), "prov-dental-05: page names Brønnøysundregistrene as a source");
-    // Scope the "no HPR claim" check to the /proveniens <main> content itself, not the
-    // sitewide footer's pre-existing (out-of-scope) "Datakilder" link to Helsedirektoratet/HPR
-    // — this test only guards against the NEW page/llms.txt copy overclaiming an automated
-    // HPR cross-check, not the unrelated footer link that exists on every page.
+    // The whole page, footer included: since F2-S1 (A2A dev-request
+    // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon) the footer's «Datakilder»
+    // column lists DENTAL_DATA_SOURCES, which has no HPR.
     const mainDp = bodyDp.slice(bodyDp.indexOf("<main>"), bodyDp.indexOf("</main>"));
-    assertTrue(!mainDp.includes("HPR") && !mainDp.includes("Helsepersonellregisteret"),
-      "prov-dental-05b: /proveniens page content does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
-    assertTrue(mainDp.includes("redaksjonelt satt status") && mainDp.includes("editorially-set status"),
-      "prov-dental-05c: 'Verified' badge is described as an editorially-set/admin-reviewed status, not an automated registry cross-check");
+    assertTrue(!bodyDp.includes("HPR") && !bodyDp.includes("Helsepersonellregisteret"),
+      "prov-dental-05b: /proveniens (the whole page, footer included) does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
+    // As dental-verifier.ts sets the badge: by hand, or by the rule-based check
+    // (computeDentalVerifiedRule), which is itself run by hand in small batches.
+    {
+      const { DENTAL_VERIFIED_BADGE_TEXT } = require("../src/services/dental-data-sources") as typeof import("../src/services/dental-data-sources");
+      const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      assertTrue(mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.nb)) && mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.en)) &&
+        mainDp.includes("manuelt, etter at en administrator har gått gjennom profilen, eller av en regelstyrt kontroll") &&
+        mainDp.includes("by hand, after an administrator has reviewed the profile, or by a rule-based check") &&
+        mainDp.includes("i små partier") && mainDp.includes("in small batches") &&
+        !mainDp.includes("Statusen settes manuelt per klinikk") && !mainDp.includes("The status is set manually per clinic"),
+        "prov-dental-05c: 'Verified' badge is described as set by hand OR by the rule-based check (run by hand, in small batches), not as manual-only (NO + EN)");
+    }
     assertTrue(bodyDp.includes("badge-verified"), "prov-dental-06: page shows the Verifisert badge example");
     assertTrue(bodyDp.length > 2000, "prov-dental-07: page body has substantial server-rendered content (SSR, no JS)");
     assertNoForbiddenCompliancePhrases(bodyDp, "prov-dental-08");
@@ -38905,6 +39047,28 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
   } catch (err) {
     failed++;
     failures.push(`proveniens-transparens (dental): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S1): every
+// finn-tannlege.com surface (footer, /om, /hvordan-det-fungerer, /proveniens, llms.txt,
+// openapi.json, the directory listing) names its data sources from DENTAL_DATA_SOURCES,
+// none names HPR, NTF or Helsedirektoratet (/personvern exempt, personvern part B), and
+// the «Verifisert» text matches dental-verifier.ts. Swaps DENTAL_DB_PATH (:memory:) and
+// the dental modules (restored in finally) — runSerial, next to prov-dental above.
+runSerial(async () => {
+  console.log("\n── dental-sources-truth: Finn-tannlege data sources from one list (F2-S1) ──");
+  try {
+    const { runDentalSourcesTruthTests } = require("../src/routes/dental-sources-truth.test") as
+      typeof import("../src/routes/dental-sources-truth.test");
+    const dst = await runDentalSourcesTruthTests({ log: false });
+    passed += dst.passed;
+    failed += dst.failed;
+    for (const f of dst.failures) failures.push("dental-sources-truth: " + f);
+    console.log(`  dental-sources-truth: ${dst.passed} passed, ${dst.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-sources-truth: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -41725,6 +41889,26 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-10-01-rfb-verifier-paraplyer-og-vertikaler-ut-c6: RFB
+// verifier pickers skip umbrella / other-vertical rows; stats gets
+// by_verification_status_rfb_producers. Own in-memory DB (swaps getDb()) —
+// runSerial like the agentIds suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01 C6: verifier RFB scope (paraplyer og vertikaler ut) ──");
+  try {
+    const { runLokalAgentVerifierRfbScopeTests } = require("../src/agents/lokal-agent-verifier-rfb-scope.test") as
+      typeof import("../src/agents/lokal-agent-verifier-rfb-scope.test");
+    const rs = await runLokalAgentVerifierRfbScopeTests({ log: false });
+    passed += rs.passed;
+    failed += rs.failed;
+    for (const f of rs.failures) failures.push("verifier-rfb-scope: " + f);
+    console.log(`  verifier-rfb-scope: ${rs.passed} passed, ${rs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("verifier-rfb-scope: unexpected error: " + String(err?.stack || err?.message || err));
+  }
+});
+
 // ── orch-pr-20260905-dental-verifier-canary: admin-key-gated canary trigger
 // route for the dental verifier (POST /admin/run-dental-verifier). Mutates
 // process.env.ADMIN_KEY/ANALYTICS_ADMIN_KEY and the route's own
@@ -42757,8 +42941,9 @@ runSerial(async () => {
 // a generic message (detail logged), also a cart-service 5xx result in
 // lokal_cart_submit. AI-3 — a producer whose matched product names are only
 // generic category labels («Honning») is a category match; order unchanged.
-// The RFB MCP contract (tools/list, instructions, resources) is pinned for
-// the OpenAI review. Own in-memory DBs (restored in finally), runSerial.
+// The RFB MCP contract (tools/list, instructions, serverInfo since I-A2,
+// resources) is pinned for the OpenAI review. Own in-memory DBs (restored in
+// finally), runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-A (lokal_info openingHours + category labels + contract freeze) ──");
   type Summary = { passed: number; failed: number; failures: string[] };
@@ -42777,6 +42962,30 @@ runSerial(async () => {
       failed++;
       failures.push(`${name}: unexpected error: ` + String(err?.message || err));
     }
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-AA (integration
+// test round 3: RFB-M-01, RFB-M-02, R3-RS-01): A2A message/send and GET /sok
+// read a search as MCP lokal_search does (services/rfb-search-reading.ts):
+// the place in the text, a place abroad, and the parser's product, name and
+// unknown words reach discover(); /sok shows an honest null text instead of
+// the standard list. lokal_search and /sok's control searches are byte-like
+// main (tests/fixtures/rfb-a2a-sok-paritet-main.json). Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-AA (A2A and /sok read the search as lokal_search) ──");
+  try {
+    const { runRfbA2aSokParitetTests } = require("../src/routes/rfb-a2a-sok-paritet.test") as
+      typeof import("../src/routes/rfb-a2a-sok-paritet.test");
+    const r = await runRfbA2aSokParitetTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-a2a-sok-paritet: " + f);
+    console.log(`  rfb-a2a-sok-paritet: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-a2a-sok-paritet: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -43673,6 +43882,25 @@ runSerial(async () => {
     failed++;
     failures.push("analytics-auth: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ analytics-auth: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // Varies process.env.ADMIN_KEY itself (own restore-in-finally) — runSerial
+  // chain, same exemption reasoning as analytics-adminkey.test.ts above.
+  console.log("\n── dev-request 2026-10-03-partner-effektrapport-per-gaard (slice 1): GET /admin/analytics/partner-report ──");
+  try {
+    const { runAnalyticsPartnerReportTests } = require("../src/routes/analytics-partner-report.test") as
+      typeof import("../src/routes/analytics-partner-report.test");
+    const apr = await runAnalyticsPartnerReportTests({ log: false });
+    passed += apr.passed;
+    failed += apr.failed;
+    for (const f of apr.failures) failures.push("analytics-partner-report: " + f);
+    console.log(`  analytics-partner-report: ${apr.passed} passed, ${apr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-partner-report: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ analytics-partner-report: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -45078,6 +45306,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("marketplace-quarantine-gates: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-10-06 (Skive A2): agent card / llms-full role gate —
+// no canonicalUrl/links.profile/Profil-link to /produsent/<slug> pages that
+// 404 under the role gate. Own in-memory DB, real handlers off the router stacks.
+runSerial(async () => {
+  console.log("\n── Skive A2: agent-card role gate ──");
+  try {
+    const { runAgentCardRoleGateTests } = require("../src/routes/agent-card-role-gate.test") as
+      typeof import("../src/routes/agent-card-role-gate.test");
+    const acr = await runAgentCardRoleGateTests({ log: false });
+    passed += acr.passed;
+    failed += acr.failed;
+    for (const f of acr.failures) failures.push("agent-card-role-gate: " + f);
+    console.log(`  agent-card-role-gate: ${acr.passed} passed, ${acr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-card-role-gate: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -47823,6 +48070,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop gate in
+// outreach_ready_pool + pool-blocker-explain named reasons + admin
+// business-type lever and classification dry-run. Own in-memory DB (swaps the
+// shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop pool gate ──");
+  try {
+    const { runInitOutreachPoolRetailGateTests } = require("../src/database/init-outreach-pool-retail-gate.test") as
+      typeof import("../src/database/init-outreach-pool-retail-gate.test");
+    const rg = await runInitOutreachPoolRetailGateTests({ log: false });
+    passed += rg.passed;
+    failed += rg.failed;
+    for (const f of rg.failures) failures.push("init-outreach-pool-retail-gate: " + f);
+    console.log(`  init-outreach-pool-retail-gate: ${rg.passed} passed, ${rg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("init-outreach-pool-retail-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
 // point 4: POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL / isOwnPlatformHomepage
 // (src/database/init.ts) — an agent whose homepage is our own platform
@@ -48612,7 +48879,7 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
-  console.log("\n── mcp-stdio-bridge: finn-tannlege-mcp stdio bridge vs the real dental /mcp ──");
+  console.log("\n── mcp-stdio-bridge: stdio bridges (finn-tannlege-mcp, lokal-mcp, opplevagent-mcp) vs the real /mcp routers ──");
   try {
     const { runMcpStdioBridgeTests } = require("../src/routes/mcp-stdio-bridge.test") as
       typeof import("../src/routes/mcp-stdio-bridge.test");

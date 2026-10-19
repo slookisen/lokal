@@ -461,9 +461,9 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     // the parent carries sameAs with the Brreg page on every site, and the
     // rettfrabonden.com and opplevagent.no front pages publish
     // organizationJsonLd(<vertical>) (PNG logo, the domain as alternateName).
-    // finn-tannlege.com follows once dental-seo.ts is wired to it.
+    // finn-tannlege.com does too (G3-S1-dental).
     const parent = legal.parentOrganizationJsonLd();
-    const builtFor: Record<string, "rfb" | "experiences" | null> = { [RFB]: "rfb", [OA]: "experiences", [FT]: null };
+    const builtFor: Record<string, "rfb" | "experiences" | "dental" | null> = { [RFB]: "rfb", [OA]: "experiences", [FT]: "dental" };
     for (const [host, p] of [[RFB, "/"], [RFB, "/en"], [OA, "/"], [OA, "/en"], [FT, "/"]] as const) {
       const r = await get(p, host);
       const lds = jsonLdOf(r.body);

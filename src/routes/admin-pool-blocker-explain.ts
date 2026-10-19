@@ -41,7 +41,7 @@
 // import).
 
 import { Router, Request, Response } from "express";
-import { getDb, isContentQualified } from "../database/init";
+import { getDb, isContentQualified, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors } from "../services/outreach-suppression-signals";
 
@@ -100,6 +100,8 @@ interface ExplainRow {
   about: string | null;
   products: string | null;
   field_provenance: string | null;
+  business_type: string | null;
+  retail_focus: string | null;
   verification_review_reason: string | null;
   last_verified_at: string | null;
   curated_fields: string | null;
@@ -160,6 +162,10 @@ function provenanceSourceCounts(raw: string | null): Record<string, number> {
 interface VerifierStoredVerdict {
   domain_coherence?: { coherent?: boolean; reason?: string } | null;
   email_ownership_unproven?: boolean | null;
+  // dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld: set by
+  // the verifier when email_own_domain passed only via the cross-TLD homepage
+  // branch. Informational, never a blocker.
+  email_own_domain_via?: string | null;
   // dev-request 2026-09-17-rfb-review-required-poolblokker-uten-forklaring-
   // og-uten-reevaluering, punkt 1 — the additional shapes
   // lokal-agent-verifier.ts's crossSourceResults can carry, read here so
@@ -197,6 +203,34 @@ function parseReviewReason(raw: string | null): VerifierStoredVerdict | null {
     /* malformed → treat as absent, same tolerance as the provenance parser */
   }
   return null;
+}
+
+function secondLineView(
+  v: VerifierStoredVerdict | null,
+  asOf: string | null,
+): {
+  ran: boolean;
+  verdict: "pass" | "fail" | null;
+  reasons: unknown;
+  sources: string[];
+  judge_reason: string | null;
+  as_of: string | null;
+} | null {
+  const sl = v?.second_line;
+  if (!sl || typeof sl !== "object" || Array.isArray(sl)) return null;
+  const o = sl as Record<string, unknown>;
+  return {
+    ran: o.attempted === true,
+    verdict: o.passes === true ? "pass" : o.passes === false ? "fail" : null,
+    reasons: o.reasons ?? null,
+    sources: Array.isArray(o.sources) ? (o.sources as unknown[]).filter((x): x is string => typeof x === "string") : [],
+    judge_reason: typeof o.judge_reason === "string" ? o.judge_reason : null,
+    as_of: asOf,
+  };
+}
+
+function terminalReasonView(v: VerifierStoredVerdict | null): string | null {
+  return typeof v?.terminal_reason === "string" ? v.terminal_reason : null;
 }
 
 function withinDays(iso: string | null, days: number, nowMs: number): boolean {
@@ -417,6 +451,7 @@ router.get("/", (req: Request, res: Response) => {
            k.phone AS k_phone, k.address AS k_address, k.about AS about,
            k.products AS products,
            k.field_provenance AS field_provenance,
+           a.business_type AS business_type, a.retail_focus AS retail_focus,
            k.verification_review_reason AS verification_review_reason,
            k.last_verified_at AS last_verified_at,
            k.curated_fields AS curated_fields,
@@ -507,6 +542,10 @@ router.get("/", (req: Request, res: Response) => {
       if (!urlFresh) poolBlockers.push("url_probe_missing_or_stale_30d");
       else if (!urlHealthy) poolBlockers.push(`url_unhealthy (last_status=${row.url_last_status ?? "NULL"})`);
     }
+    // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: the VIEW's retail
+    // gate (retail_shop_not_eligible / retail_profile_not_ready), via the
+    // shared pure mirror of POOL_RETAIL_SHOP_GATE_SQL.
+    poolBlockers.push(...retailShopPoolBlockers(row));
     if (row.contacted_at) poolBlockers.push("already_contacted");
     if (row.already_sent === 1) poolBlockers.push("already_sent (outreach_sent_log)");
 
@@ -572,6 +611,8 @@ router.get("/", (req: Request, res: Response) => {
       gate,
       signals: {
         umbrella_type: row.umbrella_type,
+        business_type: row.business_type,
+        retail_focus: row.retail_focus,
         is_active: row.is_active === 1,
         verification_status: row.verification_status,
         enrichment_status: row.enrichment_status,
@@ -600,11 +641,18 @@ router.get("/", (req: Request, res: Response) => {
         // caller can act on them without string-parsing.
         domain_coherence: domainCoherence,
         email_ownership_unproven: emailOwnershipUnproven,
+        // Informational only (not in pool_blockers): why the email-domain leg
+        // passed although the address is on a different TLD than the site.
+        email_own_domain_via: storedVerdict?.email_own_domain_via ?? null,
         // The verifier's verdict is only as fresh as its last pass over this
         // agent — surfaced so a stale verdict is never mistaken for a live one.
         verifier_verdict_as_of: row.last_verified_at,
       },
       pool_blockers: poolBlockers,
+      // dev-request 2026-10-01-rfb-verifier-innsyn-second-line-c5: second-line
+      // outcome and terminal reason from the stored verdict (all statuses).
+      second_line: secondLineView(storedVerdict, row.last_verified_at),
+      terminal_reason: terminalReasonView(storedVerdict),
       crawl_auto_select: {
         eligible: crawlBlockers.length === 0,
         blockers: crawlBlockers,

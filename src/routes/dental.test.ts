@@ -524,15 +524,15 @@ export function runDentalTests(
         );
       }
 
-      // ── (h) GET /discover, flag unset -> unchanged (all 7 seeded rows) ──
+      // ── (h) GET /discover, flag unset -> non-clinic rows already excluded (S7: the public store, no exceptions) ──
       {
         delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
         const resp = await callRoute(dentalRouter, { method: "GET", path: "/discover?limit=100", headers: {} });
         assertEq(resp.status, 200, "h1: GET /discover -> 200");
         const navnSet = new Set((resp.body?.results ?? []).map((r: any) => r.navn));
-        assertTrue(navnSet.has("KARI DISCOVER"), "h2: flag unset -- /discover includes the person_enk row (unchanged behavior)");
-        assertTrue(navnSet.has("Discover Dental Lab AS"), "h3: flag unset -- /discover includes the lab_leverandor row");
-        assertTrue(navnSet.has("Discover Holding AS"), "h4: flag unset -- /discover includes the holding row");
+        assertTrue(!navnSet.has("KARI DISCOVER"), "h2: flag unset -- /discover excludes the person_enk row (S7: public set, no flag needed)");
+        assertTrue(!navnSet.has("Discover Dental Lab AS"), "h3: flag unset -- /discover excludes the lab_leverandor row");
+        assertTrue(!navnSet.has("Discover Holding AS"), "h4: flag unset -- /discover excludes the holding row");
         assertTrue(navnSet.has("Discover Klinikk AS"), "h5: flag unset -- /discover includes the klinikk row");
       }
 

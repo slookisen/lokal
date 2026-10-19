@@ -267,7 +267,10 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     description: (floor) => [
       `Finn-tannlege is an independent directory of dental clinics in Norway: more than ${floor} clinics, from single-dentist practices to large clinics, in every county. It is not affiliated with any clinic chain, insurer or booking portal.`,
       "Search by place, by specialty, or by the two things that change what a visit costs and how soon you get one: a Helfo direct-billing agreement and emergency duty (akuttvakt). Every record carries the clinic's address, contact details and a profile page.",
-      "The data comes from public sources: Brønnøysundregistrene, the Norwegian health personnel register (HPR) and the clinics' own websites.",
+      // The sources as src/services/dental-data-sources.ts names them (F2-S1 of
+      // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon); HPR is not one.
+      // dental-sources-truth.test.ts keeps this sentence equal to that list.
+      "The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places and Kartverket.",
       "The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.",
     ],
     categories: ["Health", "Reference"],

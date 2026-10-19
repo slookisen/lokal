@@ -125,6 +125,13 @@ export interface DiscoverMeta {
  */
 export interface DiscoverOptions {
   trackDiscovery?: boolean;
+  /**
+   * Slice I-AA: false counts no discovery for a page of producers near a
+   * place whose products match none of the unknown words (meta.unmatchedTerms):
+   * A2A and /sok show no such page. Default true: lokal_search lists it,
+   * marked as no matches.
+   */
+  countUnmatched?: boolean;
 }
 
 class MarketplaceRegistry {
@@ -456,12 +463,14 @@ class MarketplaceRegistry {
     // and the ones whose products match the words rank first (step 7).
     const unknownTerms = ((query as any)._unknownTerms as string[] | undefined) ?? [];
     let termMatches: Map<string, CatalogTermMatch> | null = null;
+    let unmatched = false;
     if (unknownTerms.length > 0 && !((query as any)._productTerms as string[] | undefined)?.length) {
       termMatches = catalogTermMatches(db, unknownTerms, new Set(candidates.map(c => c.id)));
       if (termMatches && !query.categories?.length) {
         if (termMatches.size > 0) {
           candidates = candidates.filter(a => termMatches!.has(a.id));
         } else {
+          unmatched = true;
           if (meta) meta.unmatchedTerms = unknownTerms;
           if (!query.location) return [];
         }
@@ -648,7 +657,8 @@ class MarketplaceRegistry {
     const page = results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
     // Count a discovery only for what is actually returned (a2a spam guard:
     // this used to bump every CANDIDATE — ~5k row writes per unfiltered call).
-    if (trackDiscovery) this.incrementDiscovery(page.map(r => r.agent.id));
+    // Slice I-AA: and not for a page of no matches the caller does not show.
+    if (trackDiscovery && !(unmatched && opts.countUnmatched === false)) this.incrementDiscovery(page.map(r => r.agent.id));
     return page;
   }
 

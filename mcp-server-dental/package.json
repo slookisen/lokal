@@ -1,6 +1,6 @@
 {
   "name": "finn-tannlege-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "mcpName": "io.github.slookisen/finn-tannlege-mcp",
   "description": "MCP server for finn-tannlege.com — find Norwegian dental clinics from Claude Desktop, ChatGPT, and other AI assistants. 5,400+ clinics with Helfo-agreement, specialty, and emergency-duty data.",
   "main": "index.js",

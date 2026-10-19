@@ -84,7 +84,7 @@ export function runRfbProducerAnswerFirstOpeningSaleSignalTests(opts: { log?: bo
   }
 
   // ── (c) NB: sourced product list + confirmed direct-sale signal →
-  //     "selger" + "bestill direkte". ─────────────────────────────────────
+  //     "selger" + "finn kontaktinfo" (no "bestill direkte" since 2026-10-18). ─────────────────────────────────────
   {
     const out = buildProducerAnswerFirstOpening({
       ...baseParams,
@@ -92,7 +92,7 @@ export function runRfbProducerAnswerFirstOpeningSaleSignalTests(opts: { log?: bo
       hasDirectSaleSignal: true,
     });
     assertTrue(!!out && out.includes("selger"), "c1: NB sourced products + sale signal uses 'selger'");
-    assertTrue(!!out && out.includes("bestill direkte"), "c2: NB sourced products + sale signal closes with 'bestill direkte'");
+    assertTrue(!!out && out.includes("finn kontaktinfo under") && !out.includes("bestill direkte"), "c2: NB sourced products + sale signal closes with 'finn kontaktinfo', never 'bestill direkte'");
   }
 
   // ── (d)/(e)/(f) same three cases, lang === "en" ────────────────────────
@@ -123,7 +123,7 @@ export function runRfbProducerAnswerFirstOpeningSaleSignalTests(opts: { log?: bo
       hasDirectSaleSignal: true,
     });
     assertTrue(!!outSells && outSells.includes("sells"), "f1: EN sourced products + sale signal uses 'sells'");
-    assertTrue(!!outSells && outSells.includes("order directly"), "f2: EN sourced products + sale signal closes with 'order directly'");
+    assertTrue(!!outSells && outSells.includes("find contact details below") && !outSells.includes("order directly"), "f2: EN sourced products + sale signal closes with 'find contact details', never 'order directly'");
   }
 
   // ── (g) Omitting productsAreSourced/hasDirectSaleSignal entirely (older

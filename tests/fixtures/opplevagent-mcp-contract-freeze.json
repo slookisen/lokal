@@ -1,7 +1,8 @@
 {
-  "_doc": "SHA-256 of the Opplevagent MCP contract (tools/list, initialize instructions, every resource in resources/list) frozen while OpenAI reviews the ChatGPT app. Dev-request 2026-10-16-opplevagent-mcp-fritekst-query (felles regel 1). Pinned at lokal a6edc5cb; the three older widget URIs added in fix round 1 hash the same at a6edc5cb and 73f3da15. Change only together with a planned re-submission; print current hashes with: npx tsx src/routes/opplevagent-mcp-contract-freeze.test.ts --print",
+  "_doc": "SHA-256 of the Opplevagent MCP contract (tools/list, initialize instructions and serverInfo, every resource in resources/list) frozen while OpenAI reviews the ChatGPT app. Dev-request 2026-10-16-opplevagent-mcp-fritekst-query (felles regel 1). Pinned at lokal a6edc5cb; the three older widget URIs added in fix round 1 hash the same at a6edc5cb and 73f3da15. serverInfo (canonical JSON, keys sorted) added in dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-A2, at lokal e73574a9; its literal in experiences-mcp.ts is the same at a6edc5cb. Change only together with a planned re-submission; print current hashes with: npx tsx src/routes/opplevagent-mcp-contract-freeze.test.ts --print",
   "hashes": {
     "initialize.instructions": "90d33b8a6a982c420c2f38d905ef22b1baa1334e72866712e5821b37220cb560",
+    "initialize.serverInfo": "3d8a895e481f799df20d8a85c78d9604f2fe47c000a0ae13f5c1878c92406682",
     "tools/list": "143e0fcc89f7d6fb000b1f461d8543a0d179655d0fc439fcc84f6e78a7d8bf34",
     "tools/list#discover_experiences": "c68a75628d06c46f58e318910de0ee66562fd4590ecf19a7c25f09dff5d622a5",
     "tools/list#list_experience_categories": "cb93742b04919c0dfc398cbd27ba0f9b5ba1fd1f3169864d0ed1a6ffa5fe1034",
