@@ -26,6 +26,10 @@
  *             footer link, the sitemap and ai-plugin.json legal_info_url;
  *             the effective date 2026-10-19, the day Daniel approved the
  *             text (NO, EN and the sitemap <lastmod>).
+ *   S12       the text Daniel approved, pinned whole: SHA-256 of the visible
+ *             text per language (links with their targets, the date masked),
+ *             on /vilkar, its aliases and its English addresses (FUNN
+ *             dental-vilkar-tekst-ikke-laast, code review round 4 of lokal#1178).
  *   T2        site Organization JSON-LD carries parentOrganization.
  *   T3        agent-card provider (+ MCP server-card vendor, agent-skills
  *             provider) is Agentplatform.no AS; the cards keep their brand name.
@@ -40,10 +44,12 @@
  */
 
 import Database from "better-sqlite3";
+import { createHash } from "crypto";
 import express from "express";
 import * as fs from "fs";
 import * as http from "http";
 import * as path from "path";
+import { decode } from "../../tests/helpers/html-injection";
 
 export interface TestSummary {
   passed: number;
@@ -93,6 +99,44 @@ function walk(dir: string, out: string[] = []): string[] {
     else out.push(p);
   }
   return out;
+}
+
+/**
+ * The terms in an HTML fragment as a reader gets them (S12 text lock): one
+ * line per block (heading, paragraph, list item), inline tags dropped,
+ * entities decoded, whitespace collapsed (a line break in the markup is not a
+ * new line). A link is written [text](href), because where it points is part
+ * of the terms. Attributes such as style, and the indentation of the markup,
+ * are not.
+ */
+function termsLines(html: string): string[] {
+  return html
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, "")
+    .replace(/\s+/g, " ")
+    .replace(/<a\s[^>]*?href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href: string, text: string) => `[${text}](${href})`)
+    .replace(/<\/?(?:main|div|p|h[1-6]|ul|ol|li|hr|br)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .split("\n")
+    .map((l) => decode(l).replace(/\s+/g, " ").trim())
+    .filter((l) => l !== "");
+}
+
+/**
+ * SHA-256 of the terms per language of the /vilkar <main>: the NO section,
+ * then the EN one from <h1 id="en"> to the end, so every line of <main> is
+ * in one of them. The «Sist oppdatert» / «Last updated» date is masked, and
+ * `masked` counts the masked date lines.
+ */
+function termsFingerprint(mainHtml: string): Record<"nb" | "en", { sha256: string; lines: number; masked: number }> {
+  const one = (section: string) => {
+    let masked = 0;
+    const lines = termsLines(section).map((l) =>
+      l.replace(/^(Sist oppdatert|Last updated): \d{4}-\d{2}-\d{2}$/, (_m, label: string) => (masked++, `${label}: <date>`)),
+    );
+    return { sha256: createHash("sha256").update(lines.join("\n")).digest("hex"), lines: lines.length, masked };
+  };
+  const at = mainHtml.indexOf('<h1 id="en">');
+  return at < 0 ? { nb: one(mainHtml), en: one("") } : { nb: one(mainHtml.slice(0, at)), en: one(mainHtml.slice(at)) };
 }
 
 export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -212,10 +256,10 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     server = http.createServer(app);
     await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as any).port;
-    const get = (p: string, host: string, accept = "text/html"): Promise<Resp> =>
+    const get = (p: string, host: string, accept = "text/html", extra: http.OutgoingHttpHeaders = {}): Promise<Resp> =>
       new Promise((resolve, reject) => {
         http
-          .get({ host: "127.0.0.1", port, path: p, headers: { host, accept } }, (resp) => {
+          .get({ host: "127.0.0.1", port, path: p, headers: { host, accept, ...extra } }, (resp) => {
             const chunks: Buffer[] = [];
             resp.on("data", (c) => chunks.push(c as Buffer));
             resp.on("end", () => resolve({ status: resp.statusCode || 0, headers: resp.headers, body: Buffer.concat(chunks).toString("utf8") }));
@@ -225,8 +269,8 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
 
     // Pages collected for the cross-cutting checks at the end.
     const seen: { label: string; host: string; path: string; body: string }[] = [];
-    const page = async (host: string, p: string, accept?: string): Promise<Resp> => {
-      const r = await get(p, host, accept);
+    const page = async (host: string, p: string, accept?: string, extra?: http.OutgoingHttpHeaders): Promise<Resp> => {
+      const r = await get(p, host, accept, extra);
       seen.push({ label: `${host}${p}`, host, path: p, body: r.body });
       return r;
     };
@@ -441,6 +485,84 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       check(JSON.stringify(shownEn) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar EN: «Last updated: ${EFFECTIVE}», once`, shownEn.join(", "));
       const vilkarLastmod = sitemap.body.match(/<loc>https:\/\/finn-tannlege\.com\/vilkar<\/loc><lastmod>([^<]*)<\/lastmod>/)?.[1];
       check(vilkarLastmod === EFFECTIVE, `F2-S5 sitemap.xml: /vilkar <lastmod> is ${EFFECTIVE}`, String(vilkarLastmod));
+
+      // ── S12: the approved text, pinned whole ──
+      // FUNN dental-vilkar-tekst-ikke-laast (code review round 4 of lokal#1178,
+      // mutation M8): the phrases above pin parts of the terms, so a changed
+      // sentence elsewhere passed every test. This pins the whole text Daniel
+      // approved on 2026-10-19 (quoted word for word under «### Norsk» and
+      // «### English» in lokal#1178) as SHA-256 of termsLines() per language.
+      // A new hash means new terms: Daniel approves the new text before it is
+      // merged, and the same PR gives the terms a new date (EFFECTIVE above and
+      // DENTAL_STATIC_PAGE_DATES["/vilkar"]) and the new hashes here. The
+      // operator line, the FINN.no sentence and the e-mail address come from
+      // shared config (company-info.ts, brand-entities.ts), so a change there
+      // changes these terms too. The date lines are masked, because the date
+      // has its own checks above.
+      const APPROVED_TERMS_SHA256 = {
+        nb: "12ef9055e0f4ece225443598270ac0790d345341c50a345896567f07bf340ae2",
+        en: "10d980ed44ea11fbfdd389c8a0724388c1a5a29235ae9c18ec011cc74de4e3c6",
+      };
+      const approved = termsFingerprint(main);
+      check(approved.nb.masked === 1 && approved.en.masked === 1, "S12 /vilkar: one date line masked per language (control: the mask is not vacuous)", `NO ${approved.nb.masked}, EN ${approved.en.masked}`);
+      for (const lang of ["nb", "en"] as const) {
+        const got = approved[lang];
+        check(
+          got.sha256 === APPROVED_TERMS_SHA256[lang],
+          `S12 /vilkar ${lang === "nb" ? "NO" : "EN"}: the text is the one Daniel approved (SHA-256, date masked)`,
+          `sha256 ${got.sha256} over ${got.lines} lines; new terms need Daniel's approval, a new date and the new hash (see the comment)`,
+        );
+      }
+      // Every address that serves the terms serves that text: the aliases, and
+      // the English ways in (/en/, ?lang=en, Accept-Language).
+      const addresses: Array<[string, http.OutgoingHttpHeaders | undefined]> = [
+        ["/terms", undefined],
+        ["/terms-of-service", undefined],
+        ["/tos", undefined],
+        ["/en/vilkar", undefined],
+        ["/vilkar?lang=en", undefined],
+        ["/vilkar", { "accept-language": "en" }],
+      ];
+      for (const [p, extra] of addresses) {
+        const r = await page(FT, p, undefined, extra);
+        const fp = termsFingerprint(r.body.match(/<main>[\s\S]*?<\/main>/)?.[0] ?? "");
+        check(
+          r.status === 200 && fp.nb.sha256 === APPROVED_TERMS_SHA256.nb && fp.en.sha256 === APPROVED_TERMS_SHA256.en,
+          `S12 ${FT}${p}${extra ? " (Accept-Language: en)" : ""}: serves the approved text`,
+          `${r.status}, NO ${fp.nb.sha256}, EN ${fp.en.sha256}`,
+        );
+      }
+      // Control on this page's own HTML: the hash of a language moves when its
+      // wording or a link target moves, and stays put when only the date, the
+      // style attributes or the line breaks of the markup move. Each edit must
+      // apply exactly once, so no case passes on an edit that missed.
+      const edited = (from: string, to: string): string => (main.split(from).length === 2 ? main.replace(from, to) : "");
+      const moves: Array<[string, string, "nb" | "en", string]> = [
+        ["We may change these terms.", "We can change these terms at any time.", "en", "a changed sentence in EN pkt. 9 (M8, round 4)"],
+        ["Vi kan endre disse vilkårene.", "Vi kan endre disse vilkårene når som helst.", "nb", "a changed sentence in NO pkt. 9"],
+        ['<a href="/personvern">personvernerklæringen</a>', '<a href="/om">personvernerklæringen</a>', "nb", "a link with the same text pointing elsewhere"],
+        ["<li>Respect robots.txt.</li>", "", "en", "a removed list item"],
+      ];
+      for (const [from, to, lang, what] of moves) {
+        const html = edited(from, to);
+        const other = lang === "nb" ? "en" : "nb";
+        const fp = html ? termsFingerprint(html) : null;
+        check(
+          !!fp && fp[lang].sha256 !== approved[lang].sha256 && fp[other].sha256 === approved[other].sha256,
+          `S12 control: ${what} changes the ${lang === "nb" ? "NO" : "EN"} hash, and only that one`,
+          html ? "" : `edit not applied: ${from}`,
+        );
+      }
+      const redated = main.split(EFFECTIVE).join("2027-01-01");
+      const restyled = edited("Ved å bruke tjenesten", "Ved å bruke\n      tjenesten").replace(/ style="[^"]*"/g, "").replace(/\n[ \t]+/g, "\n");
+      const stays: Array<[string, boolean, string]> = [
+        [redated, main.split(EFFECTIVE).length === 3, "a new date alone (the date checks above catch that)"],
+        [restyled, restyled !== "" && !restyled.includes(" style=") && restyled !== main, "style attributes, indentation and a line break inside a paragraph"],
+      ];
+      for (const [html, applied, what] of stays) {
+        const fp = termsFingerprint(html);
+        check(applied && fp.nb.sha256 === approved.nb.sha256 && fp.en.sha256 === approved.en.sha256, `S12 control: ${what} leaves both hashes as they are`);
+      }
     }
 
     // ═══════════════ AC3 / AC4 — forbidden phrases on every page fetched ═══════════════
