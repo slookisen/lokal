@@ -36231,6 +36231,25 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental icons / guide-tannlege-ai (F2-S4, G3-S4): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-18-dental-privat-adresse-skjules (Daniel's
+  //    question 13): the private address («c/o», «Bruksenhetsnummer») of a
+  //    sole proprietorship is shown on no public Finn-tannlege surface (page,
+  //    JSON-LD, lists, MCP, A2A, public REST, provenance summary, sitemap),
+  //    also with the Places switch off; other clinics as before ──
+  console.log("\n── dev-request 2026-10-18 (privat adresse): ENK-boadresse vises ikke som klinikkadresse (finn-tannlege) ──");
+  try {
+    const { runDentalPrivatAdresseTests } = require("../src/routes/dental-privat-adresse.test") as
+      typeof import("../src/routes/dental-privat-adresse.test");
+    const dpa = await runDentalPrivatAdresseTests({ log: false });
+    passed += dpa.passed;
+    failed += dpa.failed;
+    for (const f of dpa.failures) failures.push("dental privat adresse: " + f);
+    console.log(`  dental privat adresse: ${dpa.passed} passed, ${dpa.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental privat adresse: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-17-integrasjonstest-oppfolging (I-Q): sitemap
   //    lastmod as W3C date, real /sted count in the clinic meta, noindex on
   //    every 404, agents.txt API-base /api/tannlege ──
