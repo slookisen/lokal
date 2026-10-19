@@ -419,6 +419,15 @@ export function computeEnrichmentStatus(input: {
   return "thin";
 }
 
+// dev-request 2026-10-01-rfb-verifier-paraplyer-og-vertikaler-ut-c6: the RFB
+// pickers only spend time on RFB rows — umbrella agents (Bondens marked
+// markets, HANEN) and other verticals' rows (experiences, dental) that live in
+// the same lokal.db are kept out. Same predicate as
+// agentsBrregContactBackfillCandidateWhereSql (admin-agents.ts). Both columns
+// live on `agents` (alias `a` in every picker). pickByIds deliberately does
+// NOT use it: explicit run-verifier {agentIds} may target anything.
+export const RFB_VERIFIER_SCOPE_SQL = `a.umbrella_type IS NULL AND COALESCE(a.vertical_id,'rfb') = 'rfb'`;
+
 // Pick the next batch of agents to verify. Oldest-verified first;
 // http-failures bumped to the front so we re-check broken sites.
 export function pickBatch(db: any, limit = 30): any[] {
@@ -432,7 +441,8 @@ export function pickBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')${hidden}
+        WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status NOT IN ('opt_out', 'terminal_unconfirmable')${hidden}
      -- dev-request 2026-08-23-terminal-unconfirmable: demonstrably
      -- unconfirmable agents (Brreg-dead, or zero identity sources on the
      -- second line) are removed from the hourly sweep permanently, same as
@@ -617,7 +627,8 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status = 'pending_verify'
+        WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status = 'pending_verify'
           AND k.verification_status NOT IN ('opt_out')${hidden}
           ${parkingExclusion}
      ORDER BY COALESCE(k.sweep_processed_at, k.last_verified_at, '1970-01-01') ASC
@@ -749,7 +760,8 @@ export function pickBatchBiased(
     if (quota <= 0) return;
     const rows = db.prepare(
       `${SELECT_COLS}
-        WHERE k.verification_status = ?
+        WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status = ?
         ${ORDER}
         LIMIT ?`
     ).all(status, quota);
@@ -769,7 +781,8 @@ export function pickBatchBiased(
   if (growthQuotaShortfall > 0) {
     let growthBackfill = db.prepare(
       `${SELECT_COLS}
-        WHERE k.verification_status IN ('pending_verify', 'review_required', 'unverified', 'data_insufficient')
+        WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status IN ('pending_verify', 'review_required', 'unverified', 'data_insufficient')
         ${ORDER}
         LIMIT ?`
     ).all(growthTarget);
@@ -785,7 +798,8 @@ export function pickBatchBiased(
   const verifiedRows = verifiedTarget > 0
     ? db.prepare(
         `${SELECT_COLS}
-          WHERE k.verification_status = 'verified'
+          WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status = 'verified'
           ${ORDER}
           LIMIT ?`
       ).all(verifiedTarget)
@@ -799,7 +813,8 @@ export function pickBatchBiased(
   if (growthDeficit > 0) {
     extraVerified = db.prepare(
       `${SELECT_COLS}
-        WHERE k.verification_status = 'verified'
+        WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status = 'verified'
         ${ORDER}
         LIMIT ?`
     ).all(verifiedTarget + growthDeficit);
@@ -812,7 +827,8 @@ export function pickBatchBiased(
   if (verifiedDeficit > 0) {
     extraGrowth = db.prepare(
       `${SELECT_COLS}
-        WHERE k.verification_status IN ('unverified', 'pending_verify', 'review_required', 'data_insufficient')
+        WHERE ${RFB_VERIFIER_SCOPE_SQL}
+          AND k.verification_status IN ('unverified', 'pending_verify', 'review_required', 'data_insufficient')
         ${ORDER}
         LIMIT ?`
     ).all(growthTarget + verifiedDeficit);
