@@ -41,7 +41,7 @@ import {
   DENTAL_AGENT_WRITABLE_FIELDS,
   type DentalAgentRow,
 } from "../services/dental-store";
-import { shownDentalAgent, shownDentalFieldProvenance } from "../services/dental-places-display";
+import { shownDentalAgent, shownDentalFieldProvenance, isPrivateEnkAddress } from "../services/dental-places-display";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -113,21 +113,27 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 // X-Admin-Key the answer is as before, stored values and field_provenance:
 // the enrichment routine reads them back to decide what to write. With the
 // rule switched off (PLACES_DISPLAY_POLICY_ENABLED) every caller gets that
-// answer. Stage V's pending map (a read-only side column) is in neither.
+// answer, but for a private address. Stage V's pending map (a read-only side
+// column) is in neither.
+// dev-request 2026-10-18-dental-privat-adresse-skjules: the private address
+// of a sole proprietorship is hidden from a public answer whether or not the
+// Places rule is on (shownDentalAgent); with the rule off the answer keeps
+// field_provenance, less that address's entries.
 function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
-  const publicView = !adminView && placesDisplayPolicyEnabled();
-  const { stage_v_pending_correction: _pending, ...row } = withoutGoogleRating(publicView ? shownDentalAgent(agent) : agent);
-  if (!publicView) return row;
+  const { stage_v_pending_correction: _pending, ...row } = withoutGoogleRating(adminView ? agent : shownDentalAgent(agent));
+  if (adminView) return row;
+  if (!placesDisplayPolicyEnabled()) return { ...row, field_provenance: shownDentalFieldProvenance(agent) };
   const { field_provenance: _provenance, ...shown } = row;
   return shown;
 }
 
 // The field_provenance the provenance summary on /agents/:id is built from:
-// in a public answer without the entries of the fields the rule hides, so the
+// in a public answer without the entries of the fields the rules hide, so the
 // summary names only the sources behind the values the answer shows (never
-// google_places for a hidden one). Admin view and rule off: as stored.
+// google_places for a hidden one). Admin view: as stored. Places rule off: as
+// stored, but for a private address.
 function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
-  return !adminView && placesDisplayPolicyEnabled() ? shownDentalFieldProvenance(agent) : agent.field_provenance;
+  return adminView ? agent.field_provenance : shownDentalFieldProvenance(agent);
 }
 
 // Whether a REST caller gets the admin view. While the rule is on, the two
@@ -135,9 +141,10 @@ function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
 // view for another: Cache-Control: private and Vary: X-Admin-Key (the A4-S
 // contract in the dev-request; res.vary keeps the Vary: Origin of the CORS
 // layer). With the rule off every caller gets the same answer and the
-// headers are as before.
-function restAdminView(req: Request, res: Response): boolean {
-  if (placesDisplayPolicyEnabled()) {
+// headers are as before, unless the answer has a clinic whose private
+// address is hidden (dev-request 2026-10-18-dental-privat-adresse-skjules).
+function restAdminView(req: Request, res: Response, agents: readonly DentalAgentRow[]): boolean {
+  if (placesDisplayPolicyEnabled() || agents.some((agent) => isPrivateEnkAddress(agent))) {
     res.vary("X-Admin-Key");
     res.set("Cache-Control", "private");
   }
@@ -211,8 +218,9 @@ router.get("/agents", (req: Request, res: Response) => {
     // consecutive homepage-fetch failures (30d backoff) — the enrichment
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
-    const adminView = restAdminView(req, res);
-    const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((stored) => {
+    const rows = listDentalAgents(filter, limit, offset, { excludeParked });
+    const adminView = restAdminView(req, res, rows);
+    const agents = rows.map((stored) => {
       const a = restDentalAgent(stored, adminView);
       return {
         ...a,
@@ -258,7 +266,7 @@ router.get("/agents/:id", (req: Request, res: Response) => {
   const verifiedRow = getDb("dental")
     .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
     .get(agent.id) as { last_verified_at: string | null } | undefined;
-  const adminView = restAdminView(req, res);
+  const adminView = restAdminView(req, res, [agent]);
   const provenance = buildProvenanceSummary(
     (restSummaryProvenance(agent, adminView) as Record<string, unknown> | null) ?? null,
     verifiedRow?.last_verified_at ?? null

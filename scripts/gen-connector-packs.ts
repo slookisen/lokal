@@ -271,7 +271,8 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.",
     ],
     categories: ["Health", "Reference"],
-    icon: null,
+    // A copy of src/public/dental-favicon-512.png (2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S4).
+    icon: "dental-connectors-prep/assets/finn-tannlege-square-512.png",
     screenshots: null,
     serverSetup: { routeFile: "src/routes/dental-mcp.ts", owner: "2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a)" },
     useCases: [
@@ -290,7 +291,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     reviewerTools: {
       "Find a dentist in Bergen": "tannlege_search",
       "Which dental clinics in Oslo have a Helfo agreement?": "tannlege_search",
-      "I need emergency dental care in Rogaland tonight": "tannlege_akutt",
+      "I need an emergency dentist in Rogaland": "tannlege_akutt",
     },
     extraPrompts: [{ prompt: "How many dental clinics are there in Norway, by county?", tool: "tannlege_stats" }],
     writeToolNotes: {},
@@ -313,7 +314,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "tannlege_akutt filters by county (fylke) only: a town name gives no results. Town-level emergency search goes through tannlege_search with `akutt: true`.",
       "Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.",
     ],
-    otherContents: [],
+    otherContents: [["assets/finn-tannlege-square-512.png", "The icon to upload: the «Søket» mark (a tooth in a magnifier, white on teal), square, full-bleed, no rounded corners. The same file as the site's /favicon-512.png."]],
     notADirectoryPath: ["Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. The npm package `finn-tannlege-mcp` still works for manual install, but it is not a directory submission."],
   },
 };
