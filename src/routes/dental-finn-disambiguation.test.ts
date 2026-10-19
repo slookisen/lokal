@@ -39,6 +39,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import { BRAND_ENTITIES } from "../config/brand-entities";
+import { organizationJsonLd, parentOrganizationJsonLd } from "../services/company-legal";
 
 export interface TestSummary {
   passed: number;
@@ -240,6 +241,11 @@ export async function runDentalFinnDisambiguationTests(opts: { log?: boolean } =
       assertEq(org?.disambiguatingDescription, NB, "d2: Organization.disambiguatingDescription is the nb sentence");
       assertEq([org?.name, org?.url], ["Finn-tannlege", "https://finn-tannlege.com"], "d3: name and url unchanged (no rename)");
       assertTrue(!!org?.parentOrganization?.["@id"], "d4: parentOrganization kept");
+      // G3-S1-dental: the node is the shared builder's output (mutation-sensitive: a hand-rolled node would miss @id / logo / parent).
+      assertEq(org?.["@id"], "https://finn-tannlege.com/#organization", "d6: Organization has the brand @id");
+      assertEq(org?.logo, "https://finn-tannlege.com/favicon-512.png", "d7: Organization.logo is the brand-config PNG");
+      assertEq(org?.parentOrganization, parentOrganizationJsonLd(), "d8: parentOrganization deep-equals parentOrganizationJsonLd()");
+      assertEq(org, organizationJsonLd("dental"), "d9: the front-page Organization is exactly organizationJsonLd(\"dental\")");
       const site = ld.find((n) => n?.["@type"] === "WebSite");
       assertTrue(!!site && !("disambiguatingDescription" in site) && !FINN_MENTION.test(JSON.stringify(site)), "d5: the WebSite node (the main field) does not mention FINN");
       const nodes = ld.flatMap((n) => objectNodes(n));

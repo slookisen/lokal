@@ -77,7 +77,7 @@ import {
   companyContactBlockHtml,
   companyControllerSentenceHtml,
   companyFooterLineHtml,
-  parentOrganizationJsonLd,
+  organizationJsonLd,
   toSiteLang,
   type SiteLang,
 } from "../services/company-legal";
@@ -1199,19 +1199,9 @@ router.get("/", (_req: Request, res: Response) => {
         "query-input": "required name=search_term_string",
       },
     },
-    {
-      "@context": "https://schema.org",
-      "@type": "Organization",
-      name: "Finn-tannlege",
-      url: DENTAL_BASE_URL,
-      // F2-S4: the 512×512 PNG (was favicon.svg), the file
-      // BRAND_ENTITIES.dental.logoPng names; G3-S1-dental reads it from there.
-      logo: DENTAL_LOGO_PNG_URL,
-      // G3-S8; G3-S1-dental moves it into organizationJsonLd("dental").
-      ...(FINN_DISAMBIGUATION_NB ? { disambiguatingDescription: FINN_DISAMBIGUATION_NB } : {}),
-      // T2: the company that owns and operates finn-tannlege.com.
-      parentOrganization: parentOrganizationJsonLd(),
-    },
+    // G3-S1-dental: the shared brand builder (@id, alternateName, PNG logo,
+    // G3-S8 disambiguatingDescription, T2 parentOrganization).
+    organizationJsonLd("dental"),
   ];
 
   const html = `
