@@ -402,6 +402,22 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgentRow {
   };
 }
 
+/**
+ * The two columns clinicSpecialties() reads, parsed exactly as hydrateAgent
+ * parses them. dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3):
+ * the /sted and /fylke specialist count (dental-area-facts.ts) runs the
+ * cards' own predicate over raw rows without hydrating every column.
+ */
+export function hydrateSpecialtySource(row: {
+  available_specialties?: unknown;
+  specialists?: unknown;
+}): Pick<DentalAgent, "available_specialties" | "specialists"> {
+  return {
+    available_specialties: parseJsonArray(row.available_specialties),
+    specialists: parseJsonOrNull(row.specialists) as DentalAgent["specialists"],
+  };
+}
+
 // ─── Public API ─────────────────────────────────────────────────────
 
 export function createDentalAgent(input: DentalAgent): string {

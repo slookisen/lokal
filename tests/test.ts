@@ -36393,6 +36393,35 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental agent card (D3d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3): the shared
+  //    landing gate + answer-first/FAQ helpers, and the /sted and /fylke
+  //    intro, fact table and FAQ built from them ──
+  console.log("\n── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3): landing facts ──");
+  try {
+    const { runLandingFactsTests } = require("../src/services/landing-facts.test") as
+      typeof import("../src/services/landing-facts.test");
+    const lf = await runLandingFactsTests({ log: false });
+    passed += lf.passed;
+    failed += lf.failed;
+    for (const f of lf.failures) failures.push("landing facts (F1-S3): " + f);
+    console.log(`  landing facts (F1-S3): ${lf.passed} passed, ${lf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("landing facts (F1-S3): unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runDentalAreaLandingTests } = require("../src/routes/dental-area-landing.test") as
+      typeof import("../src/routes/dental-area-landing.test");
+    const dal3 = await runDentalAreaLandingTests({ log: false });
+    passed += dal3.passed;
+    failed += dal3.failed;
+    for (const f of dal3.failures) failures.push("dental area landing (F1-S3): " + f);
+    console.log(`  dental area landing (F1-S3): ${dal3.passed} passed, ${dal3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental area landing (F1-S3): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
