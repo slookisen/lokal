@@ -272,13 +272,13 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         assertTrue(blocklistSvc.isBlocked({ email: "post@full-identitet-gard.no" }).blocked, "pv-9f: email now blocked");
       }
 
-      // ── pv-10: un-hiding (hidden=false) never writes to the blocklist —
+      // ── pv-10 (needs override_owner_removed since 2026-10-01: pv-full carries a "fjern oss" blocklist reason): un-hiding (hidden=false) never writes to the blocklist —
       //    only an actual removal does; the 24h angrefrist reversal must
       //    not itself add a NEW block entry. ────────────────────────────────
       {
         const r = await callRoute(opplevelserRouter, {
           headers: adminHeaders,
-          body: { hidden: false, providerIds: ["pv-full"], apply: true },
+          body: { hidden: false, providerIds: ["pv-full"], apply: true, override_owner_removed: true },
         });
         assertEq(r.body.changed_count, 1, "pv-10a: un-hidden");
         const row = (r.body.changed as any[]).find((c) => c.id === "pv-full");

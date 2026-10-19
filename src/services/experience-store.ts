@@ -7576,14 +7576,16 @@ export function applyGardssalgSetProducerType(
  * routes/opplevelser.ts) on the very next read. No separate rollback route
  * exists or is needed.
  *
- * Validation of `terminalStatus` against the three allowed values
- * ("krever_eier" | "dod_kilde" | null) is the HTTP handler's job (same
+ * Validation of `terminalStatus` against the allowed values
+ * ("krever_eier" | "dod_kilde" | "eier_fjernet" | null) is the HTTP handler's job (same
  * division of labor as validatePhoneForWrite's caller above) — this function
  * trusts its typed parameter.
  */
+export type GardssalgTerminalStatus = "krever_eier" | "dod_kilde" | "eier_fjernet";
+
 export function applyGardssalgSetTerminalStatus(
   providerId: string,
-  terminalStatus: "krever_eier" | "dod_kilde" | null,
+  terminalStatus: GardssalgTerminalStatus | null,
   reason: string,
   sourceUrl?: string
 ): GardssalgSetTerminalStatusResult {

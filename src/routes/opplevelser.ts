@@ -813,7 +813,8 @@ import { CRM_SENDER_ADDRESS } from "../services/crm-platform-identity";
 // was removed; a merge with main's independently-built AC6 slice (#508)
 // silently dropped the import since neither side's diff hunk touched the
 // same line the other needed, tsc caught it as the two branches combined.
-import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd } from "../services/blocklist-service";
+import { normalizeDomain, normalizeEmail, isBlocked, add as blocklistAdd, loadOwnerRemovedMatcher } from "../services/blocklist-service";
+import type { GardssalgTerminalStatus } from "../services/experience-store";
 import {
   countRecipientAddressTypes,
   isColdRecipientAllowed,
@@ -12104,7 +12105,7 @@ router.post("/admin/gardssalg-set-content-field", requireAdmin, (req: Request, r
 // requirement.
 //
 // Body: { provider_id: string, terminal_status: "krever_eier" | "dod_kilde"
-// | null, reason: string, source_url?: string }.
+// | "eier_fjernet" (producer asked for removal; dev-request 2026-10-01) | null, reason: string, source_url?: string }.
 //
 // `terminal_status: null` CLEARS the column — this IS the rollback path for
 // this endpoint (dev-request's own Rollback section); no separate rollback
@@ -12135,11 +12136,11 @@ router.post("/admin/gardssalg-set-terminal-status", requireAdmin, (req: Request,
   }
 
   const rawTerminalStatus = body.terminal_status;
-  if (rawTerminalStatus !== null && rawTerminalStatus !== "krever_eier" && rawTerminalStatus !== "dod_kilde") {
+  if (rawTerminalStatus !== null && rawTerminalStatus !== "krever_eier" && rawTerminalStatus !== "dod_kilde" && rawTerminalStatus !== "eier_fjernet") {
     res.status(400).json({ error: "invalid_terminal_status" });
     return;
   }
-  const terminalStatus = rawTerminalStatus as "krever_eier" | "dod_kilde" | null;
+  const terminalStatus = rawTerminalStatus as GardssalgTerminalStatus | null;
 
   const reason = typeof body.reason === "string" ? body.reason.trim() : "";
   if (!reason) {
@@ -17156,7 +17157,7 @@ export async function computeGardssalgSecondLineVerification(input: {
   email: string | null;
   field_provenance: Record<string, unknown>;
   brreg_verified: boolean;
-  terminal_status: "krever_eier" | "dod_kilde" | null;
+  terminal_status: GardssalgTerminalStatus | null;
   org_nr?: string | null;
   evidence?: readonly { source_url: string; content_excerpt: string }[];
   brregLookupFn?: (orgNr: string) => Promise<{ exists: boolean; active: boolean; name: string | null }>;
@@ -17174,7 +17175,8 @@ export async function computeGardssalgSecondLineVerification(input: {
   const brreg_ok =
     input.brreg_verified === true &&
     input.terminal_status !== "krever_eier" &&
-    input.terminal_status !== "dod_kilde";
+    input.terminal_status !== "dod_kilde" &&
+    input.terminal_status !== "eier_fjernet";
 
   const email = (input.email ?? "").trim() || null;
   const email_present = !!email;
@@ -17294,7 +17296,25 @@ export type GardssalgReadinessTier =
   | "dublettkonflikt"
   | "navnekollisjon"
   | "krever_eier"
-  | "dod_kilde";
+  | "dod_kilde"
+  // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: the
+  // producer asked to be removed. Highest precedence together with
+  // krever_eier/dod_kilde; derived from an explicit terminal_status or a
+  // "fjern oss" blocklist match (see computeGardssalgReadinessRows).
+  | "eier_fjernet";
+
+// dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: effective
+// terminal status of a provider row. (c) explicit column value, else (b) a
+// "fjern oss" blocklist match on org_nr / hjemmeside / epost -> eier_fjernet.
+export function deriveGardssalgTerminalStatus(
+  stored: string | null | undefined,
+  ids: { org_nr?: string | null; hjemmeside?: string | null; epost?: string | null },
+  ownerRemovedMatcher: (ids: { orgNr?: string | null; website?: string | null; email?: string | null }) => boolean,
+): GardssalgTerminalStatus | null {
+  if (stored === "krever_eier" || stored === "dod_kilde" || stored === "eier_fjernet") return stored;
+  if (ownerRemovedMatcher({ orgNr: ids.org_nr, website: ids.hjemmeside, email: ids.epost })) return "eier_fjernet";
+  return null;
+}
 
 export function computeGardssalgReadinessTier(input: {
   has_website: boolean;
@@ -17314,7 +17334,7 @@ export function computeGardssalgReadinessTier(input: {
   // must never be recounted as unreachable/no_website/etc. NULL/undefined
   // means "no terminal status", falls through to the existing checks
   // unchanged.
-  terminal_status?: "krever_eier" | "dod_kilde" | null;
+  terminal_status?: GardssalgTerminalStatus | null;
   // dev-request 2026-08-28-gardssalg-kildebredde-wiring, Grep 2: the
   // GS_SECOND_LINE_VERIFICATION_ENABLED-gated 2.linje stamp (field_provenance.
   // second_line_verification, isGardssalgSecondLineVerified below). Optional
@@ -17476,7 +17496,7 @@ export function computeGardssalgReadinessRows(
   // surfaced so a caller can see WHY a row landed in krever_eier/dod_kilde
   // without a separate lookup — same additive-surfacing precedent as
   // hjemmeside/epost below.
-  terminal_status: "krever_eier" | "dod_kilde" | null;
+  terminal_status: GardssalgTerminalStatus | null;
   /** The stored homepage URL. See the construction site below for why. */
   hjemmeside: string | null;
   /** The stored outreach address. See the construction site below for why. */
@@ -17615,6 +17635,8 @@ export function computeGardssalgReadinessRows(
   // blocking override (computeGardssalgOutreachPreflight, below) reads
   // `enabled`.
   const sizeGateThreshold = getGardssalgSizeGateConfig(expDb).threshold;
+  // One blocklist query per call (not per row) — see loadOwnerRemovedMatcher.
+  const ownerRemovedMatcher = loadOwnerRemovedMatcher();
 
   return rows.map((p) => {
     const has_website = present(p.hjemmeside);
@@ -17653,8 +17675,13 @@ export function computeGardssalgReadinessRows(
       p.antall_ansatte === null && isGardssalgAntallAnsatteBrregConsulted(p.field_provenance);
     const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold, antallAnsatteBrregConsulted);
     const size_flag_reason: GardssalgSizeFlagReason = antallAnsatteBrregConsulted ? "no_registered_figure" : null;
-    const terminal_status =
-      p.terminal_status === "krever_eier" || p.terminal_status === "dod_kilde" ? p.terminal_status : null;
+    // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: an explicit
+    // terminal_status wins; otherwise a row whose org.nr / domain / e-post sits
+    // on the blocklist with a "fjern oss" reason is derived as eier_fjernet.
+    // (The hidden_reason `remove_request` source is NOT wired: that value does
+    // not exist in EXP_DC_HIDE_REASONS on main, and hidden_reason lives on
+    // experiences, not providers.)
+    const terminal_status = deriveGardssalgTerminalStatus(p.terminal_status, p, ownerRemovedMatcher);
     // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
     // AC3: see computeGardssalgReadinessTier's own `name_collision` doc
     // comment for what this stamp means and why it excludes a row here.
@@ -17767,6 +17794,9 @@ router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, 
     // than omitting the key.
     krever_eier: 0,
     dod_kilde: 0,
+    // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: producer
+    // asked for removal — own bucket, same discipline as the two above.
+    eier_fjernet: 0,
     // dev-request 2026-08-07-dublett-evidensbasis-og-pool-avblokkering,
     // slice 1: NOT a tier — the count of rows carrying the informational
     // name_token/host_name candidate flag (rows may sit in any tier).
@@ -17965,6 +17995,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     return row !== undefined;
   };
 
+  const ownerRemovedMatcher = loadOwnerRemovedMatcher();
   const results: GardssalgSecondLineVerifyResultItem[] = [];
 
   for (const id of ids) {
@@ -18000,8 +18031,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
       continue;
     }
 
-    const terminal_status =
-      row.terminal_status === "krever_eier" || row.terminal_status === "dod_kilde" ? row.terminal_status : null;
+    const terminal_status = deriveGardssalgTerminalStatus(row.terminal_status, row, ownerRemovedMatcher);
     if (terminal_status) {
       results.push({ provider_id: id, outcome: "disqualified_terminal", detail: terminal_status });
       continue;
@@ -30647,6 +30677,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     orgNrs?: unknown;
     hidden?: unknown;
     apply?: unknown;
+    override_owner_removed?: unknown;
   };
 
   if (typeof body.hidden !== "boolean") {
@@ -30662,6 +30693,9 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     req.query?.apply === "1" ||
     req.query?.apply === "true";
   const dryRun = !apply;
+  // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: explicit,
+  // per-call override of the owner-removed unhide guard (strictly boolean true).
+  const overrideOwnerRemoved = body.override_owner_removed === true;
 
   const providerIds = Array.isArray(body.providerIds)
     ? (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim())
@@ -30681,11 +30715,11 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source, terminal_status FROM experience_providers
         WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source, terminal_status FROM experience_providers
         WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     type PvRow = {
@@ -30696,6 +30730,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       epost: string | null;
       catalog_hidden: number | null;
       content_source: string | null;
+      terminal_status: string | null;
     };
 
     const matched = new Map<string, PvRow>();
@@ -30712,6 +30747,9 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     }
 
     const skippedLocked: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const skippedOwnerRemoved: Array<{ id: string; navn: string; org_nr: string | null; outcome: "skipped_owner_removed" }> = [];
+    const overriddenOwnerRemoved: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const ownerRemovedMatcher = hidden ? null : loadOwnerRemovedMatcher();
     const unchanged: Array<{ id: string; navn: string; org_nr: string | null }> = [];
     const changed: Array<{
       id: string;
@@ -30749,6 +30787,17 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
         unchanged.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
       }
+      // Owner-removed guard: a producer that asked for removal (explicit
+      // terminal_status, or org.nr/domain/e-post on the blocklist with a
+      // "fjern oss" reason) must not be unhidden by accident. (The
+      // hidden_reason `remove_request` source is not available on main.)
+      if (!hidden && ownerRemovedMatcher && deriveGardssalgTerminalStatus(row.terminal_status, row, ownerRemovedMatcher) === "eier_fjernet") {
+        if (!overrideOwnerRemoved) {
+          skippedOwnerRemoved.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, outcome: "skipped_owner_removed" });
+          continue;
+        }
+        overriddenOwnerRemoved.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
+      }
       let blocklistInserted: number | undefined;
       if (!dryRun) {
         upd.run(targetValue, row.id);
@@ -30785,6 +30834,8 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       changed,
       unchanged,
       skipped_locked: skippedLocked,
+      skipped_owner_removed: skippedOwnerRemoved,
+      ...(overrideOwnerRemoved ? { override_owner_removed: true, overridden_owner_removed: overriddenOwnerRemoved } : {}),
       not_found: notFound,
       ...(!dryRun && hidden ? { blocklist_inserted_total: blocklistInsertedTotal } : {}),
     });
