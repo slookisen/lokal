@@ -1,7 +1,8 @@
 /**
  * dental-sources-truth.test.ts — A2A dev-request
  * 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S1 (honest data
- * sources, from one list) and F2-S2 (the method page «Metode og kilder»).
+ * sources, from one list), F2-S2 (the method page «Metode og kilder») and
+ * F2-S9 (the directory import of May 2026 in the list, interim).
  *
  * Finn-tannlege.com names no data source it does not use, and every surface
  * reads DENTAL_DATA_SOURCES (src/services/dental-data-sources.ts). HPR, NTF
@@ -15,7 +16,14 @@
  *       credit line and extract date equal the dataset's own meta; the
  *       Brreg date says what the verifier stores (brreg_checked_at on every
  *       lookup, also one Brreg gives no definite answer to); each entry has
- *       its own list label; the name sentences.
+ *       its own list label; the name sentences. F2-S9: the directory
+ *       import is grounded in src/data/dental-import-2026-05.json (the counts
+ *       of A2A dental-phase-a/dental-merge-report-all.md) and rule 4 of
+ *       dental-catalog-class.ts; it stays neutral until Daniel has answered
+ *       (no url, licence or credit line, no web address, no number besides
+ *       the year, not «åpen»); its fields, month and filled columns are the
+ *       data file's; Brreg says it applies to clinics with an org.nr., and
+ *       the industry codes its method names are the data file's.
  *   (b) the «Verifisert» text matches dental-verifier.ts: its numbers are the
  *       verifier's constants, computeDentalVerifiedRule and
  *       websiteOwnershipMatch give the badge in exactly the cases the text
@@ -59,6 +67,10 @@
  *       continuous verification or an «uverifisert» marking; it says a clinic
  *       without the badge gets no note about the check, as the profile shows
  *       it (not «no other marking»: a closed clinic shows «Nedlagt»).
+ *   (n) F2-S9, as the pages show it: the import's rows in the field table
+ *       (nb and en), its item on /om and /hvordan-det-fungerer, the footer,
+ *       llms.txt and openapi.json, with no link and no licence; Brreg's
+ *       method there says it applies to clinics with an org.nr.
  *
  * Harness as in dental-finn-disambiguation.test.ts: in-memory dental DB, the
  * router driven through router.handle(). dental-data-sources and
@@ -90,6 +102,16 @@ const ROOT = path.join(__dirname, "..", "..");
  * widened to the bare words Helsedirektorat(et) and NTF.
  */
 export const NOT_A_SOURCE = /HPR|Helsepersonellregister|Helsedirektorat|helsedirektoratet\.no|ntf\.no|tannlegeforening|\bNTF\b/i;
+
+/** F2-S9: the counts of the Phase-A import, which ran outside this repository. */
+const IMPORT_FILE = "src/data/dental-import-2026-05.json";
+/**
+ * The numbers in A2A dental-phase-a/dental-merge-report-all.md (input and
+ * match stats) and PHASE6-DENTAL-VERTICAL.md (run date): entities from the
+ * Enhetsregisteret search, directory entries fetched, kept as rows without an
+ * org.nr., and rows with an org.nr. the directory filled.
+ */
+const PHASE_A = { run_date: "2026-05-27", entities: 6247, fetched: 2803, withoutOrgnr: 821, filled: 1466 } as const;
 
 interface RouteResult {
   status: number;
@@ -257,6 +279,7 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
     const verifier = require("../services/dental-verifier") as typeof import("../services/dental-verifier");
     const { postnummerDatasetMeta } = require("../services/norway-postnummer") as typeof import("../services/norway-postnummer");
     const areaFacts = require("../services/dental-area-facts") as typeof import("../services/dental-area-facts");
+    const { classifyDentalCatalogEntry } = require("../services/dental-catalog-class") as typeof import("../services/dental-catalog-class");
     const S = src.DENTAL_DATA_SOURCES;
     const byId = (id: string): DentalDataSource | undefined => S.find((s) => s.id === id);
 
@@ -277,14 +300,31 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
     }
 
     // Every entry has code behind it. A new id needs its own check here,
-    // written with the integration it lists (no code, no entry).
+    // written with the integration it lists (no code, no entry). The Phase-A
+    // import of 2026-05-27 ran outside this repository (F2-S9): its counts
+    // are in a data file, checked against the A2A merge report's numbers.
     const dentalRoute = read("src/routes/dental.ts");
     const verifierSrc = read("src/services/dental-verifier.ts");
+    let importData: any = null;
+    try { importData = JSON.parse(read(IMPORT_FILE)); } catch { /* a10 and a23 report it */ }
+    /** The data file has the merge report's numbers. */
+    const importCounted = (d: any): boolean =>
+      d?.meta?.run_date === PHASE_A.run_date && d?.enhetsregisteret_search?.entities === PHASE_A.entities &&
+      d?.directory_import?.entries_fetched === PHASE_A.fetched && d?.directory_import?.entries_added_without_orgnr === PHASE_A.withoutOrgnr &&
+      d?.directory_import?.orgnr_rows_filled === PHASE_A.filled;
+    /** The industry codes a text names, each once, sorted. */
+    const naceIn = (text: string): string[] => [...new Set(text.match(/\b\d{2}\.\d{3}\b/g) ?? [])].sort();
+    /** The text names exactly the industry codes the Phase-A search used (F2-S9). */
+    const searchCodesNamed = (text: string, d: any): boolean => {
+      const codes = d?.enhetsregisteret_search?.naeringskoder;
+      return Array.isArray(codes) && codes.length > 0 && JSON.stringify(naceIn(text)) === JSON.stringify([...codes].sort());
+    };
     const GROUNDED: Record<string, () => boolean> = {
       brreg: () =>
         /import \{[^}]*\bverifyOrgNumber\b[^}]*\} from "\.\/brreg-client"/.test(verifierSrc) &&
         read("src/routes/admin-dental-brreg-address-sweep.ts").includes('import { fetchBrregBusinessAddress } from "../services/brreg-client"') &&
-        read("src/routes/admin-dental-hjemmeside-discovery.ts").includes('import { fetchBrregWebsite } from "../services/brreg-client"'),
+        read("src/routes/admin-dental-hjemmeside-discovery.ts").includes('import { fetchBrregWebsite } from "../services/brreg-client"') &&
+        [byId("brreg")!.method_nb, byId("brreg")!.method_en].every((t) => searchCodesNamed(t, importData)),
       clinic_websites: () =>
         typeof verifier.websiteOwnershipMatch === "function" &&
         dentalRoute.includes('router.post("/admin/extraction-result"') && dentalRoute.includes('router.post("/admin/stage-v-drift-result"'),
@@ -295,6 +335,11 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       kartverket_postnummer: () =>
         /^Kartverket/.test(String(postnummerDatasetMeta()?.source ?? "")) &&
         read("src/services/dental-query-parser.ts").includes('from "./norway-postnummer"'),
+      // The data file has the merge report's numbers, and the rows without an
+      // org.nr. are the ones catalog-class rule 4 classifies (no Brreg metadata).
+      katalogimport_2026_05: () =>
+        importCounted(importData) &&
+        classifyDentalCatalogEntry({ navn: "Kari Nordmann", organisasjonsform: null, naeringskode: null, hjemmeside: null }).rule === "no_brreg_metadata",
     };
     for (const s of S) {
       const check = GROUNDED[s.id];
@@ -373,11 +418,11 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       }
     }
     // Names and sentences.
-    assertEq(src.dentalSourceNames("nb"), ["Brønnøysundregistrene", "klinikkenes egne nettsider (KI-assistert uttrekk)", "Google Places", "Kartverket"],
+    assertEq(src.dentalSourceNames("nb"), ["Brønnøysundregistrene", "klinikkenes egne nettsider (KI-assistert uttrekk)", "Google Places", "Kartverket", "en engangsimport fra en nettkatalog (mai 2026)"],
       "a18: the names, each once (the two Kartverket datasets are one name)");
-    assertEq(src.dentalSourceNamesSentence("nb"), "Brønnøysundregistrene, klinikkenes egne nettsider (KI-assistert uttrekk), Google Places og Kartverket", "a19: nb sentence");
-    assertEq(src.dentalSourceNamesSentence("en"), "Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places and Kartverket", "a20: en sentence (the spec's OpenAPI wording)");
-    assertEq(src.dentalSourceNameLabels("en"), ["Brønnøysundregistrene", "The clinics' own websites (AI-assisted extraction)", "Google Places", "Kartverket"],
+    assertEq(src.dentalSourceNamesSentence("nb"), "Brønnøysundregistrene, klinikkenes egne nettsider (KI-assistert uttrekk), Google Places, Kartverket og en engangsimport fra en nettkatalog (mai 2026)", "a19: nb sentence");
+    assertEq(src.dentalSourceNamesSentence("en"), "Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places, Kartverket and a one-time import from an online directory (May 2026)", "a20: en sentence (the spec's OpenAPI wording, and the import)");
+    assertEq(src.dentalSourceNameLabels("en"), ["Brønnøysundregistrene", "The clinics' own websites (AI-assisted extraction)", "Google Places", "Kartverket", "A one-time import from an online directory (May 2026)"],
       "a21: the footer's names capitalise the first letter, each once");
     // Each entry has a label of its own in the lists and the field table: the
     // two Kartverket datasets were both «Kartverket» (F2-S1 review).
@@ -394,6 +439,82 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       ["Om enheten er aktiv", "Map position"], "a21e: a field as a table label capitalises its first letter");
     assertEq([src.joinDentalList([], "nb"), src.joinDentalList(["a"], "nb"), src.joinDentalList(["a", "b"], "en"), src.joinDentalList(["a", "b", "c"], "nb")],
       ["", "a", "a and b", "a, b og c"], "a22: joinDentalList");
+
+    // F2-S9: the directory import of May 2026, interim until Daniel has
+    // decided what happens to its data (A2A FUNN dental-katalogimport-valg-
+    // hos-daniel). The data file is the merge report's counts, and nothing else.
+    {
+      const imp = byId("katalogimport_2026_05");
+      const brreg = byId("brreg")!;
+      const dir = importData?.directory_import;
+      const reg = importData?.enhetsregisteret_search;
+      assertTrue(!!imp, "a23 control: the list has the directory import");
+      assertTrue(!!importData && importCounted(importData), `a23b: ${IMPORT_FILE} has the merge report's numbers (${JSON.stringify(PHASE_A)})`);
+      assertEq((dir?.entries_added_without_orgnr ?? 0) + (dir?.entries_matched_to_orgnr_rows?.by_phone ?? 0) + (dir?.entries_matched_to_orgnr_rows?.by_name_and_postcode ?? 0) + (dir?.entries_not_used ?? 0),
+        PHASE_A.fetched, "a23c: every directory entry fetched was kept as its own row, matched to a row with an org.nr., or not used");
+      assertEq(Object.values(reg?.entities_by_first_industry_code ?? {}).reduce((a: number, b) => a + Number(b), 0), PHASE_A.entities,
+        "a23d: the entities from the Enhetsregisteret search add up by industry code");
+      assertEq(Object.keys(reg?.entities_by_first_industry_code ?? {}).filter((k) => k !== "other").sort(), [...(reg?.naeringskoder ?? [])].sort(),
+        "a23e: the codes searched are the codes counted (and three entities had another first code)");
+      // Counts only: no rows, no names, no contact details, no address of
+      // the directory, and no number in its text but the year.
+      const strings: string[] = [];
+      const walk = (v: unknown): void => {
+        if (typeof v === "string") strings.push(v);
+        else if (v && typeof v === "object") Object.values(v).forEach(walk);
+      };
+      walk(importData);
+      const WEB = /https?:|www\.|\b[a-z0-9-]+\.(?:no|com|net|org)\b/i;
+      assertEq(Object.keys(importData ?? {}), ["meta", "enhetsregisteret_search", "directory_import"], "a24: the data file has counts, nothing else (no rows)");
+      assertTrue(strings.length > 0 && !strings.some((t) => WEB.test(t)) && strings.every((t) => (t.match(/\d{4}/g) ?? []).every((d) => d === "2026")),
+        "a24b: … and its text has no web address and no four-digit number but the year", strings.find((t) => WEB.test(t) || (t.match(/\d{4}/g) ?? []).some((d) => d !== "2026")));
+      if (imp) {
+        // Neutral until Daniel has answered: no link, licence or credit line.
+        assertEq([imp.url, imp.license, imp.attribution], [null, undefined, undefined], "a25: the import entry has no url, licence or credit line until Daniel has answered");
+        const { id: _id, ...shown } = imp; // the id is a key, not text
+        const text = JSON.stringify(shown);
+        assertTrue(!WEB.test(text) && (text.match(/\d+/g) ?? []).every((d) => d === "2026") && !/åpen|\bopen\b/i.test(text),
+          "a26: … names no web address and no number but the year, and does not say «åpen» (it could read as an open licence)", text.match(WEB)?.[0] ?? text.match(/åpen|\bopen\b/i)?.[0]);
+        assertEq([imp.label_nb, imp.label_en], ["Katalogimport (mai 2026)", "Directory import (May 2026)"], "a26b: its list labels");
+        // Its fields are the columns the import wrote on rows without an
+        // org.nr.; the columns it filled on rows with one are among them.
+        const COLUMN: Record<string, string> = { navn: "navn", adresse: "adresse", telefon: "telefon", nettsted: "hjemmeside" };
+        const cols = imp.fields.map((f) => COLUMN[f.nb] ?? `?${f.nb}`);
+        assertEq(imp.fields.map((f) => f.nb), ["navn", "adresse", "telefon", "nettsted"], "a27: the import gives name, address, phone and website");
+        assertTrue(cols.every((c) => (dir?.fields_on_rows_without_orgnr ?? []).includes(c)), "a27b: … columns the import wrote on rows without an org.nr.", cols.join(", "));
+        assertTrue((dir?.fields_filled_on_orgnr_rows_when_empty ?? []).length > 0 && (dir?.fields_filled_on_orgnr_rows_when_empty ?? []).every((c: string) => cols.includes(c)),
+          "a27c: … and the columns it filled on rows with an org.nr. are among them");
+        // The month is the run date's.
+        const run = new Date(`${importData?.meta?.run_date}T00:00:00Z`);
+        const month = { nb: run.toLocaleDateString("nb", { month: "long", year: "numeric", timeZone: "UTC" }), en: run.toLocaleDateString("en-GB", { month: "long", year: "numeric", timeZone: "UTC" }) };
+        assertEq(month, { nb: "mai 2026", en: "May 2026" }, "a28 control: the run date's month");
+        assertTrue([imp.name_nb, imp.label_nb!, imp.method_nb, imp.date_nb, brreg.method_nb].every((t) => t.includes(month.nb)) &&
+          [imp.name_en, imp.label_en!, imp.method_en, imp.date_en, brreg.method_en].every((t) => t.includes(month.en)),
+          "a28b: the import's name, label, method and date, and Brreg's method, give the run date's month");
+        assertTrue(imp.method_nb.includes("for oppføringer uten organisasjonsnummer") && imp.method_nb.includes("tomme adresser, telefonnumre og nettsteder på en del klinikker med organisasjonsnummer") &&
+          imp.method_nb.endsWith("Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.") &&
+          imp.method_en.includes("for listings without an organisation number") && imp.method_en.includes("empty addresses, phone numbers and websites on some clinics with an organisation number") &&
+          imp.method_en.endsWith("The values have not been fetched again, and no source is stored per field."),
+          "a29: the method: rows without an org.nr. from the import, empty fields filled on some with one, no source per field", `${imp.method_nb} / ${imp.method_en}`);
+        assertEq([imp.date_nb, imp.date_en], ["Ingen dato per felt. Verdiene er fra mai 2026.", "No date per field. The values are from May 2026."], "a29b: the date: none per field");
+      }
+      // Brreg applies to clinics with an org.nr., and the clinic list was built
+      // by one search by industry code (FUNN dental-brreg-metode-nace-sveip).
+      assertTrue(brreg.method_nb.startsWith("Gjelder klinikker med organisasjonsnummer. ") && brreg.method_en.startsWith("Applies to clinics with an organisation number. "),
+        "a30: Brreg's method applies to clinics with an org.nr. (no field from the import is credited to Brreg)", brreg.method_nb);
+      assertTrue(brreg.method_nb.includes("Klinikklisten ble bygd i mai 2026 med ett søk i Enhetsregisteret etter næringskoden for tannlegetjenester (86.230) og to nærliggende koder (86.221 og 32.500)") &&
+        brreg.method_en.includes("The list of clinics was built in May 2026 with one search of the Central Coordinating Register for Legal Entities (Enhetsregisteret) by the industry code for dental practice activities (86.230) and two related codes (86.221 and 32.500)"),
+        "a30b: … the clinic list was built by one search of Enhetsregisteret by industry code", brreg.method_en);
+      assertTrue(brreg.date_nb.startsWith("Det som kom med søket i mai 2026, har ingen egen dato. ") && brreg.date_en.startsWith("What came with the search in May 2026 has no date of its own. "),
+        "a30c: the date names that search, not «the first import»", brreg.date_nb);
+      // Negative controls: the grounding checks see a wrong count or code.
+      assertTrue(!importCounted(null) && !importCounted({ ...importData, directory_import: { ...dir, entries_fetched: PHASE_A.fetched - 1 } }) &&
+        !importCounted({ ...importData, meta: { ...importData?.meta, run_date: "2026-06-27" } }),
+        "a31 control: a missing data file, a wrong count or a wrong date fails the import's grounding");
+      assertTrue(searchCodesNamed(brreg.method_nb, importData) && !searchCodesNamed("Søk etter 86.230 og 86.221.", importData) &&
+        !searchCodesNamed(`${brreg.method_nb} Også 86.900.`, importData) && !searchCodesNamed(brreg.method_nb, null),
+        "a31b control: a code left out, a code added or no data file fails Brreg's grounding");
+    }
 
     // ── (b) the «Verifisert» text and the verifier ────────────────────────
     const T = src.DENTAL_VERIFIED_BADGE_TEXT;
@@ -581,6 +702,9 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         attribution: "Inneholder prøvedata",
       };
       const list = S as DentalDataSource[];
+      // The names before the probe's: the probe comes last in every sentence.
+      const lastNb = src.dentalSourceName(S[S.length - 1]!, "nb");
+      const lastEn = src.dentalSourceName(S[S.length - 1]!, "en");
       const surfaces = async () => ({
         footer: sourceColumnOf((await callRoute(router, "/")).text).links.map(([, t]) => t),
         om: sourceItemsAfter((await callRoute(router, "/om")).text, "<h2>Datakilder</h2>").map((i) => i.label),
@@ -600,9 +724,9 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         assertEq([on.provNb?.fields, on.provNb?.method, on.provNb?.date, on.provNb?.licence?.name], [["Prøvefelt"], "Prøvemetode.", "Prøvedato.", "Prøvelisens 1.0"],
           "j2b: the field table (nb) gives its field, method, date and licence");
         assertTrue(on.omLicence, "j3: /om gives its credit line");
-        assertTrue(on.llms.includes("Kartverket og Prøveregisteret.") && on.llms.includes("- Prøveregisteret: Prøvelisens 1.0, https://example.org/lisens"),
+        assertTrue(on.llms.includes(`${lastNb} og Prøveregisteret.`) && on.llms.includes("- Prøveregisteret: Prøvelisens 1.0, https://example.org/lisens"),
           "j4: llms.txt names it in the intro and under «Lisens»");
-        assertTrue(on.openapi.includes("Google Places, Kartverket and the Probe Register."), "j5: openapi.json names it");
+        assertTrue(on.openapi.includes(`, ${lastEn} and the Probe Register.`), "j5: openapi.json names it");
       } finally {
         list.splice(list.indexOf(probe), 1);
       }
@@ -835,6 +959,39 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         db.prepare("DELETE FROM dental_agents WHERE id = ?").run(closedId);
       }
     }
+
+    // ── (n) F2-S9: the directory import, as the pages show it ─────────────
+    {
+      const imp = byId("katalogimport_2026_05")!;
+      const prov = (await callRoute(router, "/proveniens")).text;
+      const nb = methodTableOf(prov, "felt-for-felt");
+      const en = methodTableOf(prov, "field-by-field");
+      const rowNb = nb.find((g) => g.id === "katalogimport_2026_05");
+      const rowEn = en.find((g) => g.id === "katalogimport_2026_05");
+      assertEq([rowNb?.fields, rowNb?.url, rowNb?.label, rowNb?.licence, rowNb?.method, rowNb?.date],
+        [["Navn", "Adresse", "Telefon", "Nettsted"], null, "Katalogimport (mai 2026)", null, imp.method_nb, "Ingen dato per felt. Verdiene er fra mai 2026."],
+        "n1 /proveniens nb: the import's rows: name, address, phone and website, no link and no licence, its method and date");
+      assertEq([rowEn?.fields, rowEn?.url, rowEn?.label, rowEn?.licence, rowEn?.method, rowEn?.date],
+        [["Name", "Address", "Phone", "Website"], null, "Directory import (May 2026)", null, imp.method_en, "No date per field. The values are from May 2026."],
+        "n1b /proveniens en: … and in English");
+      assertTrue(!!nb.find((g) => g.id === "brreg")?.method.startsWith("Gjelder klinikker med organisasjonsnummer. ") &&
+        !!en.find((g) => g.id === "brreg")?.method.startsWith("Applies to clinics with an organisation number. "),
+        "n2 /proveniens: Brreg's method says it applies to clinics with an org.nr. (nb and en)", nb.find((g) => g.id === "brreg")?.method);
+      for (const [p, marker] of [["/om", "<h2>Datakilder</h2>"], ["/hvordan-det-fungerer", "henter klinikkdata fra disse kildene:"]] as const) {
+        const items = sourceItemsAfter((await callRoute(router, p)).text, marker);
+        assertEq(items[items.length - 1], { url: null, label: "Katalogimport (mai 2026)", rest: "navn, adresse, telefon og nettsted" }, `n3 ${p}: lists the import, without a link`);
+      }
+      assertTrue(sourceColumnOf((await callRoute(router, "/")).text).links.some(([href, t]) => href === "/proveniens" && t === "En engangsimport fra en nettkatalog (mai 2026)"),
+        "n4: the footer's «Datakilder» names it, linking /proveniens");
+      const omLicences = (await callRoute(router, "/om")).text.match(/<p>Lisenser og kildeangivelse:<\/p>\s*<ul>([\s\S]*?)<\/ul>/)?.[1] ?? "";
+      assertTrue(omLicences.includes("<li>") && !/nettkatalog|katalogimport/i.test(omLicences), "n5 /om: no licence or credit line for it");
+      const llms = (await callRoute(router, "/llms.txt")).text;
+      assertTrue(llms.includes("Google Places, Kartverket og en engangsimport fra en nettkatalog (mai 2026).") &&
+        !/nettkatalog|katalogimport/i.test(llms.split("## Lisens")[1]?.split("\n## ")[0] ?? "nettkatalog"),
+        "n6: llms.txt names it in the intro, and not under «Lisens»");
+      const description = String((await callRoute(router, "/openapi.json")).json?.info?.description ?? "");
+      assertTrue(description.includes("Google Places, Kartverket and a one-time import from an online directory (May 2026)."), "n7: openapi.json names it", description);
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental sources truth: unexpected error: " + String(err?.stack || err?.message || err));
@@ -855,7 +1012,7 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
 
 if (require.main === module) {
   runDentalSourcesTruthTests({ log: true }).then((r) => {
-    console.log(`\ndental sources truth (F2-S1, F2-S2): ${r.passed} passed, ${r.failed} failed`);
+    console.log(`\ndental sources truth (F2-S1, F2-S2, F2-S9): ${r.passed} passed, ${r.failed} failed`);
     if (r.failures.length) console.log(r.failures.join("\n"));
     process.exit(r.failed > 0 ? 1 : 0);
   });

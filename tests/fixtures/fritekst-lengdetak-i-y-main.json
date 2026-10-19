@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar)",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026)",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -780,32 +780,32 @@
     },
     "dental GET /sok": {
       "912345678": {
-        "sha256": "d00910d57daf9cd76c10728d58cefe7e2f7bb49c28b66144e1a6a9c8ce4050c8",
-        "chars": 20242
+        "sha256": "70cf62aba7f6c5a8bf4978f366ba5348c9992d9bb774a8aa11d0862614daa5fb",
+        "chars": 20324
       },
       "tannlege i Oslo": {
-        "sha256": "8c241505723bbaaea4e3b7b2fbae9e8e8276d80c24240a13c14bc25982565309",
-        "chars": 22576
+        "sha256": "2a2e1a66e049c660c909fa0adcdb2ef84bf09fe70e636bdacaedf8d2aeb17d23",
+        "chars": 22658
       },
       "tannlege i Bergen": {
-        "sha256": "e5f27013516df9af57e9d54f0363422933d95a91ed00e1aad974513b8c5fa4f4",
-        "chars": 22706
+        "sha256": "e42df791db474f319ddfe68379e65d19f41bf00a6c96e2f8f6515c3ed265b5ce",
+        "chars": 22788
       },
       "kjeveortoped Bergen": {
-        "sha256": "dfa8a78149829ea129aa21afc52c36725624972974d7202f1158862645762392",
-        "chars": 21498
+        "sha256": "fe0d2353afd496a77e8201650cd17563351f791bbd9260d05cc8f70222f9ca6c",
+        "chars": 21580
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "061baa0824e57592f335e2bfd83f8d13bc9145e30b72d57dd3eb96b34a13f7fe",
-        "chars": 20321
+        "sha256": "a854ebb9eac72547f65067ce9115bcb6d46b21a2522b4b2ac02e5dba10bd33db",
+        "chars": 20403
       },
       "tannlege 0150 Oslo": {
-        "sha256": "1cb30e4c7bcd5d8ddb906528c0de9951fb96c6a01a3154e0ca5d2aaa823f3db5",
-        "chars": 20306
+        "sha256": "90878975c5eb24baac9ddccb8a02345083086cfd9bff587ff2997c8d2e684932",
+        "chars": 20388
       },
       "ring 22 33 44 55": {
-        "sha256": "691522a9e3f926193e9a3006d5eeee742e551c3ad467ffa31ef30199f79452f5",
-        "chars": 20288
+        "sha256": "5d8ecd4cfa270b295ff426cb9b4ff6a42c022a9adbdf93225b3750cf1158ce34",
+        "chars": 20370
       }
     },
     "dental GET /api/tannlege/agents": {

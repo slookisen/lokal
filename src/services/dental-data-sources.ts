@@ -12,6 +12,8 @@
 // sources today (no client exists; Daniel 2026-10-18, question 14: each comes
 // later as its own case). dental-sources-truth.test.ts fails when a page names
 // a source this list does not have, and when an entry has no code behind it.
+// The one past import without code here (katalogimport_2026_05, F2-S9) is
+// grounded in a data file with its counts instead.
 //
 // Pure data and plain-text helpers, no I/O. The pages escape the text.
 
@@ -49,7 +51,10 @@ export interface DentalDataSource {
    */
   date_nb: string;
   date_en: string;
-  /** Where to read about the source; null when it has no single address (each clinic's own site). */
+  /**
+   * Where to read about the source; null when it has no single address (each
+   * clinic's own site) or is not named (the directory import, F2-S9).
+   */
   url: string | null;
   license?: DentalDataSourceLicense;
   /** The credit line the licence asks for, worded as the licensor gives it. */
@@ -64,7 +69,12 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
   // and NACE check (dental-verifier.ts). Licence read on data.brreg.no's
   // Enhetsregisteret API documentation and brreg.no/produkter-og-tjenester/
   // apne-data on 2026-10-19: NLOD, not CC0. The credit line is NLOD 2.0 §5's
-  // default; Brreg gives no wording of its own. Dates: the Phase-A import
+  // default; Brreg gives no wording of its own. Origin (F2-S9): the clinic
+  // list was built from one Phase-A search of Enhetsregisteret by industry
+  // code on 2026-05-27, with the codes and counts in
+  // src/data/dental-import-2026-05.json; later lookups go by org.nr. A row
+  // without one comes from the directory import below, so this entry says it
+  // applies to clinics with an org.nr. Dates: the Phase-A search
   // stored none; the address sweep and the website candidate write a
   // field_provenance record with fetched_at; the verifier stamps
   // brreg_checked_at on each lookup (applyDentalVerifierResult), also when
@@ -85,10 +95,10 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
       { nb: "om enheten er aktiv", en: "whether the entity is active" },
       { nb: "nettstedet klinikken har registrert", en: "the website the clinic has registered" },
     ],
-    method_nb: "Oppslag på organisasjonsnummeret i Enhetsregisteret.",
-    method_en: "A lookup by organisation number in the Central Coordinating Register for Legal Entities (Enhetsregisteret).",
-    date_nb: "Det som kom med den første importen, har ingen egen dato. En adresse eller et nettsted hentet fra registeret senere lagres med hentedato. Når kontrollen slår opp organisasjonsnummeret, lagres datoen for oppslaget, også når registeret ikke gir et sikkert svar.",
-    date_en: "What came with the first import has no date of its own. An address or website taken from the register later is stored with the date it was fetched. When the check looks up the organisation number, the date of the lookup is stored, also when the register gives no definite answer.",
+    method_nb: "Gjelder klinikker med organisasjonsnummer. Klinikklisten ble bygd i mai 2026 med ett søk i Enhetsregisteret etter næringskoden for tannlegetjenester (86.230) og to nærliggende koder (86.221 og 32.500). Senere oppslag gjøres på organisasjonsnummeret.",
+    method_en: "Applies to clinics with an organisation number. The list of clinics was built in May 2026 with one search of the Central Coordinating Register for Legal Entities (Enhetsregisteret) by the industry code for dental practice activities (86.230) and two related codes (86.221 and 32.500). Later lookups are by organisation number.",
+    date_nb: "Det som kom med søket i mai 2026, har ingen egen dato. En adresse eller et nettsted hentet fra registeret senere lagres med hentedato. Når kontrollen slår opp organisasjonsnummeret, lagres datoen for oppslaget, også når registeret ikke gir et sikkert svar.",
+    date_en: "What came with the search in May 2026 has no date of its own. An address or website taken from the register later is stored with the date it was fetched. When the check looks up the organisation number, the date of the lookup is stored, also when the register gives no definite answer.",
     url: "https://www.brreg.no/",
     license: { name: "Norsk lisens for offentlige data (NLOD) 2.0", url: "https://data.norge.no/nlod/no/2.0" },
     attribution: "Inneholder data under Norsk lisens for offentlige data (NLOD) tilgjengeliggjort av Brønnøysundregistrene",
@@ -179,6 +189,36 @@ export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
     url: "https://kartkatalog.geonorge.no/metadata/462a5297-33ef-438a-82a5-07fff5799be3",
     license: { name: "CC BY 4.0", url: "https://creativecommons.org/licenses/by/4.0/deed.no" },
     attribution: "Inneholder data under norsk lisens CC BY 4.0 fra Kartverket (Postnummerområder, Posten Norge/Kartverket)",
+  },
+  // F2-S9 (interim). The Phase-A import of 2026-05-27 also took entries from
+  // an online directory: the rows without an org.nr. (navn, adresse,
+  // postnummer, poststed, fylke, telefon, hjemmeside), and empty adresse,
+  // telefon and hjemmeside filled on rows with one. It ran outside this
+  // repository and stored no source per field, so nothing here re-fetches it;
+  // the counts are in src/data/dental-import-2026-05.json (from A2A
+  // dental-phase-a/dental-merge-report-all.md), and the rows without an
+  // org.nr. are the ones dental-catalog-class.ts rule 4 (no_brreg_metadata)
+  // classifies. The directory is not named, and the entry has no url,
+  // licence or credit line, until Daniel has decided what happens to its data
+  // (A2A FUNN dental-katalogimport-valg-hos-daniel); the truth test locks
+  // that. Not «åpen nettkatalog»: «åpen» could read as an open licence.
+  {
+    id: "katalogimport_2026_05",
+    name_nb: "en engangsimport fra en nettkatalog (mai 2026)",
+    name_en: "a one-time import from an online directory (May 2026)",
+    label_nb: "Katalogimport (mai 2026)",
+    label_en: "Directory import (May 2026)",
+    fields: [
+      { nb: "navn", en: "name" },
+      { nb: "adresse", en: "address" },
+      { nb: "telefon", en: "phone" },
+      { nb: "nettsted", en: "website" },
+    ],
+    method_nb: "Navn, adresse, telefon og nettsted for oppføringer uten organisasjonsnummer ble hentet én gang fra en nettkatalog i mai 2026. Importen fylte samtidig tomme adresser, telefonnumre og nettsteder på en del klinikker med organisasjonsnummer. Verdiene er ikke hentet på nytt, og ingen kilde er lagret per felt.",
+    method_en: "Name, address, phone and website for listings without an organisation number were taken once from an online directory in May 2026. The import also filled empty addresses, phone numbers and websites on some clinics with an organisation number. The values have not been fetched again, and no source is stored per field.",
+    date_nb: "Ingen dato per felt. Verdiene er fra mai 2026.",
+    date_en: "No date per field. The values are from May 2026.",
+    url: null,
   },
 ];
 
@@ -271,7 +311,7 @@ export function dentalSourceNameLabels(lang: DentalSourceLang): string[] {
   return [...new Set(DENTAL_DATA_SOURCES.map((s) => capitalise(dentalSourceName(s, lang), lang)))];
 }
 
-/** «Brønnøysundregistrene, klinikkenes egne nettsider (KI-assistert uttrekk), Google Places og Kartverket». */
+/** «Brønnøysundregistrene, klinikkenes egne nettsider (KI-assistert uttrekk), Google Places, Kartverket og en engangsimport fra en nettkatalog (mai 2026)». */
 export function dentalSourceNamesSentence(lang: DentalSourceLang): string {
   return joinDentalList(dentalSourceNames(lang), lang);
 }
