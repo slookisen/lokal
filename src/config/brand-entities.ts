@@ -5,8 +5,9 @@
 // and the company that operates them, Agentplatform.no AS, is described HERE:
 // name, URL, PNG logo, sameAs, support e-mail, docs / privacy / terms pages
 // and example queries. The sites' front-page Organization JSON-LD is built
-// from it (organizationJsonLd() in services/company-legal.ts); the MCP
-// serverInfo (G3-S5) and the Claude directory packs (G3-S6) are to read the
+// from it (organizationJsonLd() in services/company-legal.ts); the Claude
+// directory packs (G3-S6) and the MCP serverInfo (G3-S5, brandMcpIcons():
+// Finn-tannlege now, RFB and Opplevagent once OpenAI has decided) read the
 // same entries instead of keeping their own copies.
 //
 // Rules for editing:
@@ -27,6 +28,8 @@
 //     protocols/wikidata-utkast-2026-10-17.md §9).
 //   - The company's legal facts (legal name, org.nr., Brreg URL, e-mail) stay
 //     in company-info.ts; the company entry reads them from there.
+
+import type { Icon } from "@modelcontextprotocol/sdk/types.js";
 
 import { COMPANY_INFO } from "./company-info";
 import type { CatalogVertical } from "../services/honest-count";
@@ -77,6 +80,17 @@ export function wikidataUrl(qid: string): string {
 /** sameAs as published: the configured profiles, then the Wikidata item when there is one. */
 export function brandSameAs(entity: Pick<BrandEntity, "sameAs" | "wikidataId">): string[] {
   return entity.wikidataId ? [...entity.sameAs, wikidataUrl(entity.wikidataId)] : [...entity.sameAs];
+}
+
+/**
+ * serverInfo `icons` (MCP Implementation) for a brand's MCP server (G3-S5):
+ * the PNG logo (PNG is a type every client that shows icons must support), at
+ * the 512×512 every logo file has (brand-entities.test.ts, j1). Undefined while
+ * `logoPng` is null, so serverInfo leaves `icons` out rather than sending an
+ * empty list or falling back to an SVG.
+ */
+export function brandMcpIcons(entity: Pick<BrandEntity, "logoPng">): Icon[] | undefined {
+  return entity.logoPng ? [{ src: entity.logoPng, mimeType: "image/png", sizes: ["512x512"] }] : undefined;
 }
 
 function entity(e: BrandEntity): Readonly<BrandEntity> {

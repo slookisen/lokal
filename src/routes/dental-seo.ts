@@ -3445,9 +3445,9 @@ function dentalMcpServerCard() {
   // ONE catalog number (services/honest-count.ts): same as llms.txt, agent card, /api/stats, /health.
   const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
   const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "thousands of";
-  // Title and description as the live /mcp sends them in serverInfo (dental-mcp.ts, S4a).
+  // Title, description (S4a) and icon (G3-S5) as the live /mcp sends them in serverInfo (dental-mcp.ts).
   // Required lazily, as mcp-tool-manifest.ts does for `tools` below: dental-mcp imports this file.
-  const { DENTAL_MCP_SERVER_TITLE, DENTAL_MCP_SERVER_DESCRIPTION } = require("./dental-mcp") as typeof import("./dental-mcp");
+  const { DENTAL_MCP_SERVER_TITLE, DENTAL_MCP_SERVER_DESCRIPTION, DENTAL_MCP_SERVER_ICONS } = require("./dental-mcp") as typeof import("./dental-mcp");
 
   return {
     // $schema deliberately omitted: the URL previously advertised here
@@ -3471,7 +3471,7 @@ function dentalMcpServerCard() {
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${DENTAL_BASE_URL}/llms.txt`,
-    icon: `${DENTAL_BASE_URL}/favicon.svg`,
+    icon: DENTAL_MCP_SERVER_ICONS?.[0]?.src, // the 512 PNG (was favicon.svg)
     // T3: the organisation behind the server is the company (same as the agent
     // card's provider); `name`/`title` above keep the brand.
     vendor: {

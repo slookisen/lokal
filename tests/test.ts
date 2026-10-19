@@ -36196,6 +36196,24 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental engelske fyllord (S-EN): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5,
+  //    Finn-tannlege): /mcp serverInfo has the brand's title, websiteUrl and
+  //    PNG icons from BRAND_ENTITIES.dental, icons[0].src answers 200
+  //    image/png, and the MCP server card's icon is the same PNG ──
+  console.log("\n── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5): dental serverInfo og PNG-ikon ──");
+  try {
+    const { runDentalMcpServerInfoIconsTests } = require("../src/routes/dental-mcp-serverinfo-icons.test") as
+      typeof import("../src/routes/dental-mcp-serverinfo-icons.test");
+    const dsi = await runDentalMcpServerInfoIconsTests({ log: false });
+    passed += dsi.passed;
+    failed += dsi.failed;
+    for (const f of dsi.failures) failures.push("dental serverInfo icons (G3-S5): " + f);
+    console.log(`  dental serverInfo icons (G3-S5): ${dsi.passed} passed, ${dsi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental serverInfo icons (G3-S5): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
   //    places-treffvakt (A4-D): an address, phone, website or opening hours
   //    only Google Places gives (or marked wrong) is shown on no public

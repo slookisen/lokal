@@ -37,7 +37,7 @@ import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-cl
 import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { companyFooterLineHtml } from "../services/company-legal";
-import { BRAND_ENTITIES } from "../config/brand-entities";
+import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 
 const router = Router();
@@ -54,8 +54,12 @@ router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSes
 // OPPLEVAGENT_MCP_INSTRUCTIONS (experiences-mcp.ts). Facts about what the
 // server covers and returns; nothing about other servers or their tools, and no
 // figures (the catalog count lives in honest-count). The server card in
-// dental-seo.ts reads the title and description below, so there is no copy to
-// keep in step. Locked by dental-mcp-instructions.test.ts.
+// dental-seo.ts reads the title, description and icons below, so there is no
+// copy to keep in step. Locked by dental-mcp-instructions.test.ts.
+// The brand's name (in the title), URL (websiteUrl) and PNG logo (icons) come
+// from BRAND_ENTITIES.dental (A2A dev-request
+// 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S5;
+// dental-mcp-serverinfo-icons.test.ts).
 
 /** Server-wide guidance returned from `initialize`, read by clients alongside the tool descriptions. */
 export const DENTAL_MCP_INSTRUCTIONS =
@@ -86,6 +90,9 @@ export const DENTAL_MCP_SERVER_DESCRIPTION =
   "Find a dentist (tannlege), orthodontist (kjeveortoped) or emergency dentist (akutt tannlege) in Norway by " +
   "place, county (fylke), specialty, Helfo direct-billing agreement or emergency care. Supports natural-language " +
   "queries in Norwegian and English. Read-only: no booking, no payment and no dental advice.";
+
+/** serverInfo icons: the brand's 512×512 PNG logo (G3-S5); the server card's `icon` is its src. */
+export const DENTAL_MCP_SERVER_ICONS = brandMcpIcons(BRAND_ENTITIES.dental);
 
 // ─── Zod input schemas (exported for testing — pr114-01) ─────
 
@@ -505,6 +512,7 @@ async function getOrCreateDentalSession(
     title: DENTAL_MCP_SERVER_TITLE,
     description: DENTAL_MCP_SERVER_DESCRIPTION,
     websiteUrl: BRAND_ENTITIES.dental.url,
+    icons: DENTAL_MCP_SERVER_ICONS,
   }, { instructions: DENTAL_MCP_INSTRUCTIONS });
 
   registerDentalTools(server);
