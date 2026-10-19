@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "lokal-mcp",
   "display_name": "Rett fra Bonden — Finn lokal mat i Norge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Find local food producers in Norway. Search for farms, markets and shops by name, category or location. Get contact info and add producers to your contacts with one click.",
   "long_description": "Rett fra Bonden connects you to more than 1,500 local food producers across Norway. Search by natural language in Norwegian or English, filter by category (vegetables, honey, dairy, meat, fish, bread), discover farms near you, and get full contact details including opening hours, payment methods, and delivery options. Every result includes a vCard link so you can add the producer to your phone contacts instantly.\n\nExamples:\n- \"Hvor finner jeg fersk honning i Oslo?\"\n- \"organic vegetables near Grunerloekka\"\n- \"ost Trondheim\"\n- \"gaardsbutikker i Lofoten\"",
   "author": {
@@ -58,8 +58,36 @@
       "description": "List the umbrella organizations a specific producer belongs to - which markets they sell at, certifications they hold, or networks they're part of."
     },
     {
+      "name": "lokal_bm_next_markets",
+      "description": "List upcoming Bondens marked market days for a region or a specific local chapter or venue."
+    },
+    {
       "name": "lokal_geocode",
       "description": "Resolve a Norwegian place name (city, region, or kommune) to lat/lng coordinates, for use with lokal_discover's distance filters."
+    },
+    {
+      "name": "lokal_find_offers",
+      "description": "For each item on a shopping list, find nearby producers who sell it, sorted by distance, with contact info and whether an order can be placed through the platform."
+    },
+    {
+      "name": "lokal_cart_create",
+      "description": "Create a new anonymous shopping cart (handleliste) for a pickup order."
+    },
+    {
+      "name": "lokal_cart_add_item",
+      "description": "Add a product to the cart or update its quantity."
+    },
+    {
+      "name": "lokal_cart_view",
+      "description": "View the cart grouped by producer, with subtotals and a total."
+    },
+    {
+      "name": "lokal_cart_submit",
+      "description": "Submit the cart as a pickup order. Payment is made to the producer at pickup; the platform never takes payment."
+    },
+    {
+      "name": "lokal_order_status",
+      "description": "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit."
     }
   ],
   "keywords": [

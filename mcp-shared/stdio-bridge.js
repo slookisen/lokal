@@ -15,6 +15,9 @@
  *    attribution on the remote still sees the real client
  *  - an unknown/expired remote session (HTTP 404) is re-initialised ONCE per request,
  *    with a timeout; a second failure is returned as an error (no loops)
+ *  - when the client closes stdin (EOF), the remote session is terminated and the process
+ *    exits, instead of lingering until the remote connection times out
+ *  - stdout carries only JSON-RPC (the SDK stdio transport); all logging goes to stderr
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -56,7 +59,9 @@ function isUnknownSession(err) {
  * @param {string} [cfg.urlEnv]      env var that overrides the URL
  * @returns {Promise<{server: Server, close: () => Promise<void>}>}
  */
-export async function runBridge(cfg, { transport = new StdioServerTransport() } = {}) {
+export async function runBridge(cfg, { transport } = {}) {
+  const ownsStdio = !transport;
+  transport = transport || new StdioServerTransport();
   const url = resolveRemoteUrl((cfg.urlEnv && process.env[cfg.urlEnv]) || cfg.defaultUrl);
   let originalClient = { name: "unknown", version: "0.0.0" };
   let remote = null;
@@ -164,5 +169,18 @@ export async function runBridge(cfg, { transport = new StdioServerTransport() } 
   };
 
   await server.connect(transport);
+
+  if (ownsStdio) {
+    let exiting = false;
+    const onStdinGone = () => {
+      if (exiting) return;
+      exiting = true;
+      // Failsafe: never hang on a slow remote DELETE.
+      setTimeout(() => process.exit(0), 2000).unref();
+      close().finally(() => process.exit(0));
+    };
+    process.stdin.once("end", onStdinGone);
+    process.stdin.once("close", onStdinGone);
+  }
   return { server, close };
 }
