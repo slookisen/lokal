@@ -43,7 +43,7 @@ import { escapeLike } from "./search-intent/norwegian-query";
 import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-search-vocabulary";
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
-import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
+import { DENTAL_ACUTE_CLAIM_SQL, DENTAL_ACUTE_VAKT_SQL } from "./dental-acute-claim";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (A4-D): the sitemap's thin-profile check reads the values the
 // clinic page shows. dental-places-display.ts imports only types from here.
@@ -244,6 +244,11 @@ const ListFilterFieldsSchema = z.object({
   postnummer_in: PostnummerInSchema.optional(),
   fylke_in: z.array(z.string().min(1).max(100)).min(1).max(8).optional(),
   poststed_or_postnummer: z.object({ poststed_in: PoststedInSchema, postnummer_in: PostnummerInSchema }).optional(),
+  // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4): "vakt" =
+  // only clinics whose card shows «Akuttvakt» with a source
+  // (DENTAL_ACUTE_VAKT_SQL), for the tannlegevakt pages. Not read from GET
+  // /agents query params; acute_vakt above keeps its meaning.
+  acute_claim: z.literal("vakt").optional(),
 });
 type ListFilterFields = z.infer<typeof ListFilterFieldsSchema>;
 
@@ -668,6 +673,23 @@ export function buildDentalWhere(
   return { where, params, orderFirst };
 }
 
+/**
+ * The clauses the field filters in `filter` add to a public WHERE (the
+ * publicOnly base clauses not included), as one SQL condition, with every
+ * parameter name prefixed by `prefix`. For an aggregate that counts a subset
+ * in the same scan as the whole: the facet columns of the dental area facts
+ * (A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4) count a
+ * facet with the very SQL its page lists the clinics with
+ * (listPublicDentalAgents({ ...place, ...facet })). "1" when the filter sets
+ * no field. `natural` is not read.
+ */
+export function dentalPublicFilterClauses(filter: ListFilter, prefix: string): { sql: string; params: Record<string, unknown> } {
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+  pushFieldClauses(where, params, ListFilterFieldsSchema.parse(filter), { publicOnly: true }, prefix);
+  return { sql: where.length > 0 ? `(${where.join(" AND ")})` : "1", params };
+}
+
 // The clauses for the field filters, AND-ed into `where`. `p` prefixes every
 // parameter name ("" for the top level), so the branches of `natural` can
 // carry the same fields without a name clash.
@@ -716,6 +738,9 @@ function pushFieldClauses(
   } else if (f.acute_vakt !== undefined) {
     where.push(`acute_vakt = @${p}acute_vakt`);
     params[`${p}acute_vakt`] = f.acute_vakt;
+  }
+  if (f.acute_claim === "vakt") {
+    where.push(DENTAL_ACUTE_VAKT_SQL);
   }
   if (f.enrichment_state !== undefined) {
     where.push(`enrichment_state = @${p}enrichment_state`);

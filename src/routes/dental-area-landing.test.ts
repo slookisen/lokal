@@ -551,7 +551,12 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       // search per row instead of the Map, or a rescan of all rows per row,
       // takes 297-322 ms. A query per row costs only 23-61 ms here, also
       // through a statement cached per connection, so F4d catches it by
-      // counting statement runs, not by the clock.
+      // counting statement runs, not by the clock. Since F1-S4a (A2A
+      // dev-request 2026-10-16-finn-tannlege-fasettsider) the scan also has
+      // one column per facet (DENTAL_LANDING_FACETS; a specialty column reads
+      // a staff list through nb_lower once per title word): best of 5 on this
+      // fixture 29-46 ms, against 17-26 ms without them, on the same idle
+      // 4-core machine.
       const times: number[] = [];
       let last: ReturnType<typeof areaFacts.getDentalAreaFacts> | null = null;
       for (let r = 0; r < 5; r++) {
