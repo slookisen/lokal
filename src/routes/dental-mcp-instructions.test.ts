@@ -25,7 +25,10 @@
  *       G3-S6d): no tool text, instruction or serverInfo text says «emergency
  *       duty» without the quote rule of F1-S4c («Akuttvakt» only with a stored
  *       quote from the source), tannlege_akutt is «for emergency care», and the
- *       whole tools/list is pinned too (D10c, the live baseline);
+ *       whole tools/list is pinned too (D10c, the live baseline); since F1-S4e
+ *       (A2A dev-request 2026-10-16-finn-tannlege-fasettsider) D11 reads the
+ *       Norwegian «akuttvakt» too, and tannlege_stats glosses the claim as
+ *       «(akutt)» (D9d);
  *   N   the text checks catch a bad sample of each kind (not vacuous);
  *   S   the server card and the agent card show the same title, the
  *       description after the catalog count, and five tools; the card's
@@ -93,14 +96,29 @@ const OLD_EMERGENCY_DUTY_TEXTS: readonly string[] = [
 ];
 
 /**
- * The sentences of `text` that say «emergency duty» or «emergency-duty» without the quote rule of F1-S4c (A2A
- * dev-request 2026-10-16-finn-tannlege-fasettsider): a duty is «Akuttvakt» only with a stored quote from the source,
- * so a text may name the duty only where it says so (G3-S6d). A sentence ends at . ! ? or ;, a line or a table cell.
- * connector-packs-fresh.test.ts (k) runs it over the dental pack.
+ * tannlege_stats' first sentence from D3a until F1-S4e: «(akuttvakt)» made the whole claim a vakt (forslag S2 in A2A
+ * supervisor-inbox/2026-10-19-session-pr-1201-review.md). D11 flags it since it reads «akuttvakt» (N9).
+ */
+const STATS_FIRST_SENTENCE_BEFORE_S4E =
+  "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many have Helfo " +
+  "direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist.";
+
+/** The duty named, in English or (since F1-S4e) Norwegian: «emergency duty», «emergency-duty», «akuttvakt», «Akuttvakt-merket». */
+const NAMES_EMERGENCY_DUTY = /\bemergency[- ]duty\b|\bakuttvakt/i;
+/** The quote rule of F1-S4c in the same sentence, in English or Norwegian («lagret sitat», «lagret setningen som sitat»). */
+const STATES_QUOTE_RULE = /\b(stored (source )?quote|quote from the source|lagret (setningen som )?sitat|sitat fra kilden)\b/i;
+
+/**
+ * The sentences of `text` that name the emergency duty («emergency duty», «emergency-duty» or the Norwegian
+ * «akuttvakt») without the quote rule of F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): a duty is
+ * «Akuttvakt» only with a stored quote from the source, so a text may name the duty only where it says so (G3-S6d).
+ * A sentence ends at . ! ? or ;, a line or a table cell. connector-packs-fresh.test.ts (k) runs it over the dental
+ * pack, and dental-akutt-tekster.test.ts (F1-S4e) over the public texts about the badge; neither runs it over the
+ * search words (dental-search-vocabulary.ts, the agent card's examples), where «akuttvakt» is what a person types.
  */
 export function emergencyDutyWithoutQuote(text: string): string[] {
   return text.split(/(?<=[.!?;])\s+|\s*\|\s*|\n+/)
-    .filter((s) => /\bemergency[- ]duty\b/i.test(s) && !/\b(stored (source )?quote|quote from the source)\b/i.test(s));
+    .filter((s) => NAMES_EMERGENCY_DUTY.test(s) && !STATES_QUOTE_RULE.test(s));
 }
 
 /** What a description of the akutt claim must not say: there is no bare flag, and `akutt` is never null. */
@@ -118,10 +136,12 @@ const TOOLS_LIST_REST_SHA256 = "7e8f058d618a2511aa1fe9c6ebf8e97d52544d6339c6abc2
 
 /**
  * sha256 of `{ tools }` (the tools/list result) as served: the hash the live checks compare, whose first 12
- * characters are the baseline in the verdict. 2f8a4b5d0cd4… on lokal main 44e1b1b2 (after F1-S4c, before G3-S6d).
- * Every change to the dental tools/list changes it, so it moves with D10b and gets a new value here.
+ * characters are the baseline in the verdict. 2f8a4b5d0cd4… on lokal main 44e1b1b2 (after F1-S4c, before G3-S6d),
+ * 08a0af03b0dd… on b30ee3d2 (G3-S6d). F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider) changes only
+ * tannlege_stats' description («(akuttvakt)» → «(akutt)»), which D10b leaves out, so D10b holds and this moves.
+ * Every change to the dental tools/list changes it, so it gets a new value here.
  */
-const TOOLS_LIST_SHA256 = "08a0af03b0dd502fb1b680b6ec937513294e0efd1d8afc9fa58c97ad7df90b49";
+const TOOLS_LIST_SHA256 = "c57aed91e529ad5bc766403dc31c5d9e23634e6b63675c0f2b73fd6cfa173923";
 
 /** title, annotations and inputSchema of the two tools D3a edits, as tools/list serves them (D10); tannlege_akutt's titles are G3-S6d's. */
 const LOCKED_TOOL_FIELDS: Record<string, unknown> = {
@@ -293,6 +313,8 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       ok(/\bemergency claim\b/.test(shortToolDescription(stats)) &&
         stats.includes(`An emergency claim is «Akuttvakt», an emergency duty backed by a stored quote from the source, or «${ACUTE_ACCEPTS_LABEL}», that the clinic says it takes emergency patients.`),
         "D9c: tannlege_stats counts the emergency claim and says what it is (Akuttvakt with a stored quote, or takes emergency patients)");
+      ok(shortToolDescription(stats).includes("show an emergency claim (akutt) or list a specialist") && !/akuttvakt/i.test(shortToolDescription(stats)),
+        "D9d: tannlege_stats' first sentence glosses the claim as «(akutt)», not «(akuttvakt)» (F1-S4e)");
       for (const name of Object.keys(LOCKED_TOOL_FIELDS)) {
         const t = tool(name);
         eq(t ? { title: t.title, annotations: t.annotations, inputSchema: t.inputSchema } : null, LOCKED_TOOL_FIELDS[name],
@@ -303,7 +325,7 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       eq(createHash("sha256").update(JSON.stringify(rest)).digest("hex"), TOOLS_LIST_REST_SHA256,
         "D10b: apart from the two descriptions, tools/list is byte-identical to its pinned baseline (G3-S6d)");
       eq(createHash("sha256").update(JSON.stringify({ tools })).digest("hex"), TOOLS_LIST_SHA256,
-        "D10c: the whole tools/list is the pinned G3-S6d baseline (08a0af03b0dd)");
+        "D10c: the whole tools/list is the pinned F1-S4e baseline (c57aed91e529)");
 
       // D11–D13 (G3-S6d): every dental text that describes the claim says it as F1-S4c made it.
       const schemaTexts = (t: Record<string, any>): string[] =>
@@ -341,6 +363,10 @@ export async function runDentalMcpInstructionsTests(opts: { log?: boolean } = {}
       "N7: D11 flags each text before G3-S6d that named an emergency duty without the quote rule (instructions, search `akutt`, info, stats, title, D3a's first sentence)");
     eq(emergencyDutyWithoutQuote("A table | an emergency duty backed by a stored quote from the source | an emergency-duty clinic |"), ["an emergency-duty clinic"],
       "N8: D11 reads table cells and «emergency-duty» one by one: the quote rule in one cell does not cover the next");
+    eq([emergencyDutyWithoutQuote(STATS_FIRST_SENTENCE_BEFORE_S4E).length, emergencyDutyWithoutQuote("Viser «Akuttvakt» når kilden er lagret.").length,
+      emergencyDutyWithoutQuote("«Akuttvakt» vises bare med et lagret sitat fra klinikkens egen nettside.").length,
+      emergencyDutyWithoutQuote("Klinikken sier det på egne sider, og vi har lagret setningen som sitat. Akuttvakt-merket står.").length], [1, 1, 0, 1],
+      "N9: D11 reads the Norwegian «akuttvakt» (F1-S4e): the stats sentence before F1-S4e and a source without a quote are flagged, «lagret sitat» passes, and the rule in one sentence does not cover the next");
 
     // ── S: server card and agent card ────────────────────────────────────
     {

@@ -258,9 +258,10 @@ export async function runDentalAgentCardTests(opts: { log?: boolean } = {}): Pro
       const stats = skill("tannlege_stats").description;
       eq(["statistikk", "totalt", "oversikt", "how many"].filter((w) => !quotedRequests(stats).includes(w)), [],
         "T8: tannlege_stats quotes the words that reach it («statistikk», «totalt», «oversikt», «how many»)");
-      ok(/akuttpåstand \(akuttvakt med kilde, eller at klinikken tar imot akuttpasienter\)/.test(stats) &&
-        /emergency claim \(a sourced akuttvakt, or that the clinic takes emergency patients\)/.test(stats),
-      "T9: tannlege_stats counts the akutt claim in the D3a wording (sourced akuttvakt, or takes emergency patients)");
+      // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4e): «akuttvakt» only with the quote rule of F1-S4c.
+      ok(/akuttpåstand \(akuttvakt med lagret sitat fra kilden, eller at klinikken tar imot akuttpasienter\)/.test(stats) &&
+        /emergency claim \(an akuttvakt with a stored quote from the source, or that the clinic takes emergency patients\)/.test(stats),
+      "T9: tannlege_stats counts the akutt claim (an akuttvakt with a stored quote from the source, or takes emergency patients; F1-S4e)");
       ok(stats.includes("det norske tannlegemarkedet") && !JSON.stringify(card).includes("den norske tannlegemarkedet"), "T10: «det norske tannlegemarkedet», not «den»");
     }
 

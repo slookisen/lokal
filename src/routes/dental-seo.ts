@@ -73,16 +73,18 @@ import { clinicSpecialties } from "../config/dental-search-vocabulary";
 import { shownPostnummer } from "../services/norway-postnummer";
 // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
 // page-nav window and the static pages' text dates.
-import { DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, DENTAL_STATIC_PAGE_DATES, type DentalLandingFacet } from "../config/dental-landing";
+import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, DENTAL_STATIC_PAGE_DATES, type DentalLandingFacet } from "../config/dental-landing";
 import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts, type DentalAreaScope } from "../services/dental-area-facts";
 // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): the facet
 // pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett>, their sitemap URLs
-// and the links to them from /sted and /fylke.
+// and the links to them from /sted and /fylke; F1-S4e: the emergency notice
+// box on /hvordan-det-fungerer.
 import {
   registerDentalLandingRoutes,
   sitemapDentalFacets,
   dentalFacetPath,
   dentalFacetLinksHtml,
+  dentalEmergencyNoticeHtml,
   type DentalLandingPlace,
 } from "./dental-landing";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
@@ -1365,7 +1367,7 @@ router.get("/", (_req: Request, res: Response) => {
     <div class="container">
       <div class="akutt-banner" role="region" aria-label="Tannlegevakt">
         <h3>Tannlegevakt og akuttbehandling</h3>
-        <p>Tannlegevakttilbudet i Norge er fragmentert og varierer mye fra kommune til kommune. Mange fylker har kommunal tannlegevakt for akutte smerter og skader, men åpningstidene er begrenset. <a href="/sok?akutt=1">Se klinikker med akuttvakt-tilbud</a> &rarr;</p>
+        <p>Tannlegevakttilbudet i Norge er fragmentert og varierer mye fra kommune til kommune. Mange fylker har kommunal tannlegevakt for akutte smerter og skader, men åpningstidene er begrenset. <a href="/sok?akutt=1">Se klinikker som oppgir akutthjelp</a> &rarr;</p>
       </div>
     </div>
   </section>
@@ -1445,6 +1447,15 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     aiQueries: s.aiQueries,
   });
 });
+
+/**
+ * The /sok checkbox for `akutt=1` (A2A dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, F1-S4e): the filter is the akutt claim
+ * on the card (DENTAL_ACUTE_CLAIM_SQL), «Akuttvakt» and «Tar imot
+ * akuttpasienter» both, so its label names neither badge.
+ * /hvordan-det-fungerer names the filter with the same word.
+ */
+export const DENTAL_ACUTE_FILTER_LABEL = "Akutthjelp";
 
 // generalLimiter on the route, like /sok in seo.ts and experiences-seo.ts
 // (dev-request 2026-10-17-integrasjonstest-oppfolging, I-T revision). The
@@ -1579,7 +1590,7 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
               <input type="checkbox" name="helfo" value="1"${helfo ? " checked" : ""}> Helfo-avtale
             </label>
             <label class="filter-check">
-              <input type="checkbox" name="akutt" value="1"${akutt ? " checked" : ""}> Akuttvakt
+              <input type="checkbox" name="akutt" value="1"${akutt ? " checked" : ""}> ${DENTAL_ACUTE_FILTER_LABEL}
             </label>
           </div>
           <div class="filter-group" style="padding-bottom:2px">
@@ -2669,7 +2680,14 @@ export function dentalAiGuideUrl(lang: SiteLang): string {
 // plain text for the tools FAQ answer. A registered tool with no entry is
 // still listed, with its registered description (English); the test fails
 // until it gets one, and checks every <code> against the tool's input schema.
+// The akutt claim reads as in the tool texts (G3-S6d, A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider F1-S4e): an «akuttpåstand» / «emergency
+// claim», «Akuttvakt» only with a stored quote from the source
+// (dental-akutt-tekster.test.ts).
 interface DentalGuideToolCopy { card: string; faq: string }
+
+const GUIDE_ACCEPTS_NB = escapeHtml(ACUTE_ACCEPTS_LABEL);
+const GUIDE_ACCEPTS_EN = `<span lang="nb">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span>`;
 
 const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToolCopy>> = {
   tannlege_search: {
@@ -2684,32 +2702,38 @@ const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToo
   },
   tannlege_info: {
     nb: {
-      card: "Henter hele oppføringen for én klinikk via organisasjonsnummer (<code>org_nr</code>) eller <code>id</code>: adresse, kontaktinformasjon, nettside, Helfo-status, spesialiteter, spesialister, behandlinger, åpningstider, klinikkens egen beskrivelse og profilside. Akuttvakt vises bare når den har en kilde.",
+      card: "Henter hele oppføringen for én klinikk via organisasjonsnummer (<code>org_nr</code>) eller <code>id</code>: adresse, kontaktinformasjon, nettside, Helfo-status, akuttpåstand, spesialiteter, spesialister, behandlinger, åpningstider, klinikkens egen beskrivelse og profilside. " +
+        `Akuttpåstanden er «Akuttvakt» bare når akuttvakten har et lagret sitat fra kilden, og «${GUIDE_ACCEPTS_NB}» når klinikken sier at den tar imot akuttpasienter.`,
       faq: "tannlege_info henter hele oppføringen for én klinikk via organisasjonsnummer eller id",
     },
     en: {
-      card: "Fetches the full record of one clinic by organisation number (<code>org_nr</code>) or <code>id</code>: address, contact details, website, Helfo status, specialties, specialists, treatments, opening hours, the clinic's own description and its profile page. Emergency duty is shown only when it has a recorded source.",
+      card: "Fetches the full record of one clinic by organisation number (<code>org_nr</code>) or <code>id</code>: address, contact details, website, Helfo status, emergency claim, specialties, specialists, treatments, opening hours, the clinic's own description and its profile page. " +
+        `The emergency claim is «<span lang="nb">Akuttvakt</span>» only when an emergency duty has a stored quote from the source, and «${GUIDE_ACCEPTS_EN}» when the clinic says it takes emergency patients.`,
       faq: "tannlege_info fetches the full record of one clinic by organisation number or id",
     },
   },
   tannlege_stats: {
     nb: {
-      card: "Antall tannlegeklinikker i Norge: totalt, per fylke, og hvor mange som har Helfo-direkteoppgjør, hører til en kjede, viser et akuttilbud eller har en spesialist.",
-      faq: "tannlege_stats teller klinikkene totalt og per fylke, og hvor mange som har Helfo-avtale, akuttilbud eller spesialist",
+      card: "Antall tannlegeklinikker i Norge: totalt, per fylke, og hvor mange som har Helfo-direkteoppgjør, hører til en kjede, viser en akuttpåstand eller har en spesialist. " +
+        `En akuttpåstand er «Akuttvakt», som krever et lagret sitat fra kilden, eller «${GUIDE_ACCEPTS_NB}», at klinikken sier at den tar imot akuttpasienter.`,
+      faq: "tannlege_stats teller klinikkene totalt og per fylke, og hvor mange som har Helfo-avtale, akuttpåstand eller spesialist",
     },
     en: {
-      card: "Counts of dental clinics in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show emergency care or list a specialist.",
-      faq: "tannlege_stats counts the clinics in total and per county, and how many have a Helfo agreement, emergency care or a specialist",
+      card: "Counts of dental clinics in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show an emergency claim or list a specialist. " +
+        `An emergency claim is «<span lang="nb">Akuttvakt</span>», an emergency duty backed by a stored quote from the source, or «${GUIDE_ACCEPTS_EN}», that the clinic says it takes emergency patients.`,
+      faq: "tannlege_stats counts the clinics in total and per county, and how many have a Helfo agreement, an emergency claim or a specialist",
     },
   },
   tannlege_akutt: {
     nb: {
-      card: "Finner akutt tannlege: klinikker med akuttvakt som har en kilde, eller som sier at de tar imot akuttpasienter, eventuelt i ett fylke (<code>fylke</code>). Svaret har også råd om kommunal tannlegevakt.",
-      faq: "tannlege_akutt finner klinikker med akuttvakt eller som tar imot akuttpasienter, eventuelt i ett fylke",
+      card: "Finner akutt tannlege: klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke (<code>fylke</code>). " +
+        `Akuttpåstanden er «Akuttvakt» bare når akuttvakten har et lagret sitat fra kilden, og ellers «${GUIDE_ACCEPTS_NB}». Svaret har også råd om kommunal tannlegevakt.`,
+      faq: "tannlege_akutt finner klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke",
     },
     en: {
-      card: "Finds an emergency dentist: clinics with an emergency duty that has a recorded source, or that say they take emergency patients, optionally in one county (<code>fylke</code>). The answer also has advice on the municipal out-of-hours dental service.",
-      faq: "tannlege_akutt finds clinics with emergency duty or that take emergency patients, optionally in one county",
+      card: "Finds an emergency dentist: clinics that say they take emergency patients, optionally in one county (<code>fylke</code>). " +
+        `The emergency claim is «<span lang="nb">Akuttvakt</span>» only when an emergency duty has a stored quote from the source, and otherwise «${GUIDE_ACCEPTS_EN}». The answer also has advice on the municipal out-of-hours dental service.`,
+      faq: "tannlege_akutt finds clinics that say they take emergency patients, optionally in one county",
     },
   },
   tannlege_kjeder: {
@@ -2965,7 +2989,8 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
           name: "Hva gjør jeg ved akutt tannverk?",
           acceptedAnswer: {
             "@type": "Answer",
-            text: "Søk etter klinikker med Akuttvakt-merke på Finn-tannlege.com. Mange kommuner har kommunal tannlegevakt — ring klinikken for informasjon om åpningstider.",
+            // F1-S4e: the reviewed emergency notice, as in «Akutt tannverk» below.
+            text: DENTAL_EMERGENCY_NOTICE.text,
           },
         },
         {
@@ -2990,7 +3015,7 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Tre steg til riktig tannlege</h3>
     <ol style="padding-left:20px;margin-bottom:16px">
-      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og akuttvakt.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og ${DENTAL_ACUTE_FILTER_LABEL.toLowerCase()}.</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Sammenlign</strong> &mdash; se Helfo-avtale, spesialiteter, åpningstider og kontaktinformasjon side om side for de klinikkene som passer deg.</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Kontakt</strong> &mdash; ring klinikken direkte eller bruk online-booking der det finnes. Ingen mellomledd, ingen gebyrer fra vår side.</li>
     </ol>
@@ -2999,7 +3024,8 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
     <ul style="padding-left:0;list-style:none;margin-bottom:16px">
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-verified" style="margin-right:8px">Verifisert</span> ${escapeHtml(DENTAL_VERIFIED_BADGE_TEXT.nb)}</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-helfo" style="margin-right:8px">Helfo-avtale</span> Klinikken har direkteoppgjørsavtale med Helfo. Du betaler kun egenandelen for stønadspliktige behandlinger &mdash; ikke full pris.</li>
-      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">Akuttvakt</span> Klinikken tilbyr akuttbehandling utenom ordinær arbeidstid. Ring alltid for å bekrefte åpningstider.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">Akuttvakt</span> Klinikken sier på egne sider at den tar imot nye pasienter for akutt behandling utenom vanlig åpningstid (kveld, helg eller natt), og vi har lagret setningen som sitat. Ring alltid klinikken først.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span> Klinikken nevner akutt behandling på egne sider, uten et lagret sitat om akuttvakt. Ring alltid klinikken først.</li>
     </ul>
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Helfo og tannhelsestønad</h3>
@@ -3013,7 +3039,8 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
     <p style="margin-top:12px">Dette er ikke en uttømmende juridisk liste. Se <a href="https://www.helfo.no/tannlege" rel="nofollow noopener" target="_blank">helfo.no/tannlege</a> for fullstendig oversikt og vilkår.</p>
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Akutt tannverk</h3>
-    <p>Tilbudet om kommunal tannlegevakt varierer mye fra kommune til kommune, og åpningstidene er som regel begrenset til kvelder og helger. Det beste rådet er å søke på klinikker med <span class="badge badge-akutt">Akuttvakt</span>-merke og ringe direkte. Mange klinikker setter av tid til akuttpasienter på kort varsel i ordinær åpningstid.</p>
+    <p>Tilbudet om kommunal tannlegevakt varierer mye fra kommune til kommune, og åpningstidene er som regel begrenset til kvelder og helger. Mange klinikker setter av tid til akuttpasienter på kort varsel i ordinær åpningstid.</p>
+    ${dentalEmergencyNoticeHtml()}
 
     <h2>For klinikker</h2>
     <p>Finn-tannlege.com henter klinikkdata fra disse kildene:</p>
@@ -3268,8 +3295,10 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
 // the canonical method page, at the same URL. The field table is
 // DENTAL_DATA_SOURCES (field, source, method, which date is stored), so a new
 // integration is one entry there. The live numbers come from the caches only
-// (dentalMethodCounts). The texts say what the code does: the akutt claim
-// needs provenance (resolveAcuteClaim); the Helfo badge is shown from
+// (dentalMethodCounts). The texts say what the code does: «Akuttvakt» needs
+// a stored quote from the clinic's own page (resolveAcuteClaim and
+// hasAcuteVaktQuote since F1-S4c; the text gives definition A since F1-S4e,
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider); the Helfo badge is shown from
 // helfo_agreement alone until F2-S6 (resolveHelfoClaim) changes that rule,
 // and the text with it. Daniel is the responsible editor (Daniel 2026-10-18,
 // question 14). No claim of how often anything is fetched or checked.
@@ -3388,7 +3417,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
 
     <h2>Helfo, akutt og spesialiteter</h2>
     <p><strong>Helfo-direkteoppgjør</strong> er tolket automatisk fra klinikkens nettside: KI-modellen leser om klinikken skriver at den har direkteoppgjør med Helfo, og merket vises når uttrekket har registrert det. Vi har ingen liste fra Helfo, så merket er ikke en bekreftelse fra Helfo. Spør klinikken før du bestiller time.</p>
-    <p><strong>Akuttvakt</strong> vises bare når kilden til opplysningen er lagret sammen med feltet. Uten en slik kilde viser vi «${escapeHtml(ACUTE_ACCEPTS_LABEL)}» når uttrekket fra klinikkens nettside nevner akutt, og ellers ingen akuttopplysning. Ring alltid klinikken først.</p>
+    <p><strong>Akuttvakt</strong> vises bare med et lagret sitat fra klinikkens egen nettside, der klinikken sier at den tar imot nye pasienter for akutt behandling utenom vanlig åpningstid (kveld, helg eller natt). Det holder ikke at kilden til opplysningen er lagret. Uten et slikt sitat viser vi «${escapeHtml(ACUTE_ACCEPTS_LABEL)}» når uttrekket fra klinikkens nettside nevner akutt, og ellers ingen akuttopplysning. Ring alltid klinikken først.</p>
     <p><strong>Spesialiteter</strong> vises når klinikkens nettside oppgir dem, enten som noe klinikken tilbyr eller som tittelen til en behandler der (for eksempel «kjeveortoped»). Vi har ikke kontrollert at behandlerne har spesialistgodkjenning.</p>
 
     <h2>Hva «Verifisert»-merket betyr</h2>
@@ -3424,9 +3453,9 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     <h2 id="field-by-field">Field by field</h2>
     ${dentalMethodTableHtml("en", "field-by-field", placesRule.en)}
 
-    <h2>Helfo, emergency duty and specialties</h2>
+    <h2>Helfo, emergency claims and specialties</h2>
     <p><strong>Helfo direct billing</strong> is read automatically from the clinic's website: the AI model reads whether the clinic says it has direct billing with Helfo, and the badge is shown when the extraction has recorded that. We have no list from Helfo, so the badge is not a confirmation from Helfo. Ask the clinic before you book.</p>
-    <p><strong>Emergency duty</strong> (the "<span lang="nb">Akuttvakt</span>" badge) is shown only when the source of the detail is stored with the field. Without such a source we show "<span lang="nb">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span>" (accepts emergency patients) when the extraction from the clinic's website mentions emergencies, and otherwise no emergency detail. Always call the clinic first.</p>
+    <p><strong>Emergency duty</strong> (the "<span lang="nb">Akuttvakt</span>" badge) is shown only with a stored quote from the clinic's own website, in which the clinic says it takes new patients for emergency treatment outside regular opening hours (evening, weekend or night). A stored source for the detail is not enough. Without such a quote we show "<span lang="nb">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span>" (accepts emergency patients) when the extraction from the clinic's website mentions emergencies, and otherwise no emergency detail. Always call the clinic first.</p>
     <p><strong>Specialties</strong> are shown when the clinic's website gives them, either as something the clinic offers or as the title of a practitioner there (for example "<span lang="nb">kjeveortoped</span>", orthodontist). We have not checked that the practitioners are approved specialists.</p>
 
     <h2>What the "Verified" badge means</h2>
@@ -3857,7 +3886,10 @@ router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) 
 // GET /.well-known/ai-plugin.json — ChatGPT plugin manifest (parity with rfb
 // discovery.ts). OpenAI no longer loads plugins, but AI-discovery indexes still
 // scan the file as a machine-readable API-contract signal and it points at the
-// OpenAPI spec the Custom GPT's Actions use.
+// OpenAPI spec the Custom GPT's Actions use. The akutt filter is the claim on
+// the card, «Akuttvakt» (with a stored quote) or «Tar imot akuttpasienter», so
+// the descriptions name both (F1-S4e, A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider).
 router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
   const total = safeHonestCatalogCount("dental");
   res.header("Content-Type", "application/json");
@@ -3868,12 +3900,13 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
     name_for_human: "Finn-tannlege",
     name_for_model: "finn_tannlege",
     description_for_human:
-      `Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akuttvakt. ${FINN_DISAMBIGUATION_NB}`.trim(),
+      `Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akutthjelp. ${FINN_DISAMBIGUATION_NB}`.trim(),
     description_for_model:
       "Plugin for searching and comparing Norwegian dental clinics. " +
       (total ? `Provides access to ${total.toLocaleString("nb")} clinics ` : "Provides access to clinics ") +
-      "with filters for county (fylke), specialty, Helfo direct-billing agreement and emergency-duty " +
-      `(akuttvakt). Read-only: it does not book appointments — users contact the clinic directly. ${FINN_DISAMBIGUATION_EN}`.trim(),
+      "with filters for county (fylke), specialty, Helfo direct-billing agreement and emergency claims " +
+      "(an emergency duty backed by a stored quote from the source, or that the clinic says it takes emergency patients). " +
+      `Read-only: it does not book appointments — users contact the clinic directly. ${FINN_DISAMBIGUATION_EN}`.trim(),
     auth: { type: "none" },
     api: {
       type: "openapi",

@@ -136,7 +136,9 @@ export function findDentalLandingFacet(slug: string): DentalLandingFacet | undef
  * 2026-10-16-finn-tannlege-fasettsider, F1-S4): a box above the clinic list
  * on every /sted/<sted>/tannlegevakt and /fylke/<fylke>/tannlegevakt page,
  * and on the national /tannlegevakt hub (F1-S4b); MCP tannlege_akutt gives
- * the same text as rad_om_kommunal_tannlegevakt (F1-S4c). YMYL text,
+ * the same text as rad_om_kommunal_tannlegevakt (F1-S4c), and
+ * /hvordan-det-fungerer shows it under «Akutt tannverk» and gives it as the
+ * FAQ answer to «Hva gjør jeg ved akutt tannverk?» (F1-S4e). YMYL text,
  * reviewed line by line: change it here only, never in a page or a tool
  * answer. `phones` are the numbers in the text as it writes them, each shown
  * as a tel: link to `tel`. The facet pages are in Norwegian only, so there
@@ -178,7 +180,9 @@ export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   // F2-S1 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
   // the data sources and the «Verifisert» text on these three pages; F2-S2,
   // the same day: the method page on /proveniens, «Om plattformen» on /om and
-  // the Kartverket labels in the lists.
+  // the Kartverket labels in the lists. F1-S4e (A2A dev-request
+  // 2026-10-16-finn-tannlege-fasettsider), the same day: the akutt texts on
+  // /hvordan-det-fungerer and /proveniens.
   "/hvordan-det-fungerer": "2026-10-19",
   "/om": "2026-10-19",
   // Same day as the page's own «Sist oppdatert» (updatedDate in the
