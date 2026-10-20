@@ -231,7 +231,7 @@ export function runAdminDbBackupTests(opts: { log?: boolean } = {}): Promise<Tes
       const router = dbBackupMod.default;
       const KEY_TABLES: string[] = dbBackupMod.KEY_TABLES;
       const EXPERIENCES_KEY_TABLES: string[] = dbBackupMod.EXPERIENCES_KEY_TABLES;
-      const pruneBackups: (dir: string, keep?: number, filenameRe?: RegExp) => string[] =
+      const pruneBackups: (dir: string, keep?: number, filenameRe?: RegExp, maxAgeDays?: number, now?: number) => Promise<string[]> =
         dbBackupMod.pruneBackups;
       const BACKUP_FILENAME_RE: RegExp = dbBackupMod.BACKUP_FILENAME_RE;
       const EXPERIENCES_BACKUP_FILENAME_RE: RegExp = dbBackupMod.EXPERIENCES_BACKUP_FILENAME_RE;
@@ -312,12 +312,59 @@ export function runAdminDbBackupTests(opts: { log?: boolean } = {}): Promise<Tes
       for (const name of syntheticNames) {
         fs.writeFileSync(path.join(retentionDir, name), "x");
       }
-      const deleted = pruneBackups(retentionDir, 10);
+      const SYNTH_NOW = Date.parse("2026-01-02T00:00:00Z"); // synthetic names are all recent relative to this
+      const deleted = await pruneBackups(retentionDir, 10, undefined, 30, SYNTH_NOW);
       const remaining = fs.readdirSync(retentionDir).sort();
       assertEq(remaining.length, 10, "retention: exactly 10 files remain after pruning 13 down to the cap");
       assertEq(deleted.length, 3, "retention: pruneBackups reports the 3 files it deleted");
       assertEq(remaining, syntheticNames.slice(3), "retention: the 10 remaining are the 10 most recent by filename");
       fs.rmSync(retentionDir, { recursive: true, force: true });
+
+      // ── (d2) age limit: >30 days deleted, 10 newest within the limit kept ─
+      const ageNow = Date.parse("2026-10-20T12:00:00Z");
+      const mk = (daysAgo: number, i = 0) =>
+        `lokal-${new Date(ageNow - daysAgo * 86_400_000 - i * 1000).toISOString().replace(/:/g, "-")}.db`;
+      const ageDir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-db-backup-age-"));
+      // 3 old (31/45/90 days) + 12 recent (1..12 days) -> old go by age, 2 oldest recent go by count.
+      const oldNames = [mk(90), mk(45), mk(31)];
+      const recentNames = Array.from({ length: 12 }, (_, i) => mk(i + 1));
+      for (const n of [...oldNames, ...recentNames]) fs.writeFileSync(path.join(ageDir, n), "x");
+      const ageDeleted = await pruneBackups(ageDir, 10, undefined, 30, ageNow);
+      const ageRemaining = fs.readdirSync(ageDir).sort();
+      assertEq(ageRemaining, [...recentNames].sort().slice(2), "age limit: only the 10 newest within 30 days remain");
+      assertEq(ageDeleted.length, 5, "age limit: 3 old + 2 over-count files deleted");
+      assertTrue(oldNames.every((n) => !ageRemaining.includes(n)), "age limit: every copy older than 30 days is gone");
+      // Fewer than 10 files: old ones still go, recent ones stay.
+      const fewDir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-db-backup-age-few-"));
+      const fewNames = [mk(40), mk(31), mk(29), mk(2)];
+      for (const n of fewNames) fs.writeFileSync(path.join(fewDir, n), "x");
+      await pruneBackups(fewDir, 10, undefined, 30, ageNow);
+      assertEq(fs.readdirSync(fewDir).sort(), [mk(29), mk(2)].sort(), "age limit: copies >30 days deleted even with fewer than 10 files");
+      // Configurable via env.
+      assertEq(dbBackupMod.backupMaxAgeDays({}), 30, "age limit: default is 30 days");
+      assertEq(dbBackupMod.backupMaxAgeDays({ DB_BACKUP_MAX_AGE_DAYS: "7" }), 7, "age limit: DB_BACKUP_MAX_AGE_DAYS overrides");
+      assertEq(dbBackupMod.backupMaxAgeDays({ DB_BACKUP_MAX_AGE_DAYS: "abc" }), 30, "age limit: invalid env falls back to 30");
+
+      // ── (d3) nightly sweep cleans without any new copy, only at 02 UTC, once/day ─
+      const sweepDir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-db-backup-sweep-"));
+      const sweepNames = [mk(50), mk(35), mk(3)];
+      for (const n of sweepNames) fs.writeFileSync(path.join(sweepDir, n), "x");
+      let sweepClock = new Date("2026-10-20T12:00:00Z");
+      const sweep = dbBackupMod.createBackupAgeSweepTick({
+        now: () => sweepClock,
+        dirs: () => [{ dir: sweepDir, filenameRe: BACKUP_FILENAME_RE }],
+      });
+      await sweep();
+      assertEq(fs.readdirSync(sweepDir).length, 3, "sweep: does nothing outside the 02 UTC hour");
+      sweepClock = new Date("2026-10-21T02:05:00Z");
+      const sweepDeleted: string[] = await sweep();
+      assertEq(sweepDeleted.length, 2, "sweep: deletes the 2 copies older than 30 days with no new backup taken");
+      assertEq(fs.readdirSync(sweepDir), [mk(3)], "sweep: the recent copy remains");
+      fs.writeFileSync(path.join(sweepDir, mk(60)), "x");
+      sweepClock = new Date("2026-10-21T02:20:00Z");
+      await sweep();
+      assertTrue(fs.existsSync(path.join(sweepDir, mk(60))), "sweep: runs at most once per UTC day");
+      for (const d of [ageDir, fewDir, sweepDir]) fs.rmSync(d, { recursive: true, force: true });
 
       // ── (e) GET /backup lists the created file(s) ────────────────
       const list = await callRoute(router, {
@@ -465,8 +512,8 @@ export function runAdminDbBackupTests(opts: { log?: boolean } = {}): Promise<Tes
       );
       for (const name of lokalSyntheticNames) fs.writeFileSync(path.join(lokalRetentionDir, name), "x");
 
-      const expDeleted = pruneBackups(expRetentionDir, 10, EXPERIENCES_BACKUP_FILENAME_RE);
-      const lokalDeletedFromCombined = pruneBackups(lokalRetentionDir, 10, BACKUP_FILENAME_RE);
+      const expDeleted = await pruneBackups(expRetentionDir, 10, EXPERIENCES_BACKUP_FILENAME_RE, 30, Date.parse("2026-01-02T00:00:00Z"));
+      const lokalDeletedFromCombined = await pruneBackups(lokalRetentionDir, 10, BACKUP_FILENAME_RE, 30, Date.parse("2026-01-02T00:00:00Z"));
 
       const expRemaining = fs
         .readdirSync(expRetentionDir)

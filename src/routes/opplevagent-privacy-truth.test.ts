@@ -118,8 +118,9 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
     "ground truth: experiences.db is in the Tigris offsite backup with 7 daily + 4 weekly copies"
   );
   assertTrue(
-    /pruneBackups\(dir, 10, config\.filenameRe\)/.test(dbBackupRoute) && /\?db=experiences/.test(dbBackupRoute),
-    "ground truth: manual experiences.db copies on the volume keep the ten newest, no age limit"
+    /pruneBackups\(dir, 10, config\.filenameRe\)/.test(dbBackupRoute) && /\?db=experiences/.test(dbBackupRoute) &&
+      /DEFAULT_BACKUP_MAX_AGE_DAYS = 30;/.test(dbBackupRoute),
+    "ground truth: manual experiences.db copies on the volume keep the ten newest, max 30 days"
   );
   assertTrue(
     /primary_region = 'arn'/.test(flyToml),
@@ -246,8 +247,8 @@ export async function runOpplevagentPrivacyTruthTests(opts: { log?: boolean } = 
   // 4. Retention matches the backup code.
   assertTrue(/beholdes i 7 dager, og én kopi per uke i 4 uker til/.test(noT) && /kept for 7 days, and one copy per week for 4 more weeks/.test(enT) &&
     /Tigris/.test(noT) && /Tigris/.test(enT), "both parts state Tigris 7 days + 4 weeks");
-  assertTrue(/de ti nyeste beholdes, uten fast tidsgrense/.test(noT) && /the ten newest are kept, with no fixed time limit/.test(enT),
-    "both parts state the manual on-volume copies (ten newest, no time limit)");
+  assertTrue(/de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager/.test(noT) && /the ten newest are kept, and never longer than 30 days/.test(enT),
+    "both parts state the manual on-volume copies (ten newest, 30-day limit)");
 
   // 5. Vendors: each named vendor exists in code; the central ones are all named; OpenAI is not.
   const vendors: Array<{ name: string; proof: boolean }> = [
