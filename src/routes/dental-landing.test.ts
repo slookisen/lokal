@@ -391,13 +391,13 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       const intro = introOf(page.text);
       assertTrue(intro.startsWith("Vi har 5 tannlegeklinikker med kjeveortopedi og poststed Oslo i oversikten. Kjeveortopedi er oppført som spesialitet hos hver av dem."), `B10: the intro says what the clinics have and where («${intro.slice(0, 90)}»)`);
       assertTrue(words(intro) >= 40 && words(intro) <= 60, `B11: 40-60 words (${words(intro)})`);
-      assertTrue(intro.includes("2 av dem oppgir Helfo-direkteoppgjør ifølge klinikkenes nettsider.") && intro.includes("1 oppgir akuttvakt med kilde eller at den tar imot akuttpasienter."), "B12: Helfo and akutt among them, worded as on /sted");
+      assertTrue(intro.includes("2 av dem oppgir Helfo-direkteoppgjør ifølge klinikkenes nettsider.") && intro.includes("1 oppgir akuttvakt med sitat eller at den tar imot akuttpasienter."), "B12: Helfo and akutt among them, worded as on /sted");
       assertTrue(!/minst én oppført spesialitet/.test(intro), "B13: the count the facet is named for is not stated again («minst én oppført spesialitet»)");
       assertEq(captionOf(page.text), "Fakta om tannlegeklinikker med kjeveortopedi og poststed Oslo", "B14: the table caption says what it counts");
       assertEq(tableRows(page.text), [
         ["Klinikker totalt", "5"],
         ["Oppgir Helfo-direkteoppgjør (ifølge klinikkenes nettsider)", "2"],
-        ["Akuttvakt med kilde eller tar imot akuttpasienter", "1"],
+        ["Akuttvakt med sitat eller tar imot akuttpasienter", "1"],
         ["Sist oppdatert", "20. august 2026"],
       ], "B15: the table: total, Helfo, akutt and «Sist oppdatert» from the facet's newest clinic; no specialty row, no Verifisert at 0");
       const faq = ofType(page.text, "FAQPage");
@@ -420,7 +420,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
     {
       const page = await callRoute(router, "/sted/bergen/tannlegevakt");
       assertEq(page.status, 200, "C1: GET /sted/bergen/tannlegevakt -> 200");
-      assertEq([h1Of(page.text), titleOf(page.text)], ["Tannlegevakt i Bergen", "Tannlegevakt i Bergen: klinikker med akuttvakt med kilde — Finn-tannlege.com"], "C2: H1 and title");
+      assertEq([h1Of(page.text), titleOf(page.text)], ["Tannlegevakt i Bergen", "Tannlegevakt i Bergen: klinikker med akuttvakt med sitat — Finn-tannlege.com"], "C2: H1 and title");
       const cs = cards(page.text);
       assertEq(cardNames(page.text).sort(), ["Bergen Vakt 1 AS", "Bergen Vakt 2 AS", "Bergen Vakt 3 AS", "Bergen Vakt 4 AS"], "C3: only the 4 clinics with a quote for their vakt");
       assertTrue(cs.length === 4 && cs.every((c) => c.includes(`<span class="badge badge-akutt">Akuttvakt</span>`)), "C4: every card shows «Akuttvakt» (a quote on the profile)");
@@ -429,11 +429,11 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
         "C5: acute_vakt = 1 without provenance, «Tar imot akuttpasienter» and a stamp without a quote are never on it");
       assertTrue(!/Probe Vakt|Avvist Vakt|Nedlagt Vakt|Bergen Enk/.test(page.text), "C6: nor the probe, rejected, closed or non-clinic row");
       const intro = introOf(page.text);
-      assertTrue(intro.startsWith("Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen i oversikten. Alle oppgir akuttvakt med kilde."), `C7: intro («${intro.slice(0, 100)}»)`);
+      assertTrue(intro.startsWith("Vi har 4 tannlegeklinikker med akuttvakt og poststed Bergen i oversikten. Alle oppgir akuttvakt med sitat."), `C7: intro («${intro.slice(0, 100)}»)`);
       assertTrue(!/tar imot akuttpasienter/i.test(intro + JSON.stringify(tableRows(page.text))), "C8: the facet's own count (the akutt claim) is not restated as «tar imot akuttpasienter»");
       const first = ofType(page.text, "FAQPage")[0]?.mainEntity?.[0];
       assertEq(first?.name, "Hvor mange tannlegeklinikker med akuttvakt har poststed Bergen?", "C9: first question");
-      assertTrue(/Alle oppgir akuttvakt med kilde\./.test(first?.acceptedAnswer?.text ?? "") && /116 117/.test(first?.acceptedAnswer?.text ?? "") && /113/.test(first?.acceptedAnswer?.text ?? ""), "C10: its answer says «med kilde» and points to legevakten (116 117) and 113");
+      assertTrue(/Alle oppgir akuttvakt med sitat\./.test(first?.acceptedAnswer?.text ?? "") && /116 117/.test(first?.acceptedAnswer?.text ?? "") && /113/.test(first?.acceptedAnswer?.text ?? ""), "C10: its answer says «med sitat» (F1-S4e) and points to legevakten (116 117) and 113");
 
       const fylke = await callRoute(router, "/fylke/Vestland/tannlegevakt");
       assertEq([fylke.status, h1Of(fylke.text)], [200, "Tannlegevakt i Vestland"], "C11: /fylke/Vestland/tannlegevakt -> 200");

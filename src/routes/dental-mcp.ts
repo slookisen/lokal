@@ -64,7 +64,9 @@ router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSes
 // The emergency claim (`akutt`) reads the same everywhere it is described, here
 // and in the tool texts below: «Akuttvakt» only with a stored quote from the
 // source (F1-S4c in 2026-10-16-finn-tannlege-fasettsider), otherwise «Tar imot
-// akuttpasienter» (G3-S6d; dental-mcp-instructions.test.ts D11).
+// akuttpasienter» (G3-S6d; dental-mcp-instructions.test.ts D11). Since F1-S4e
+// D11 reads the Norwegian «akuttvakt» too, so tannlege_stats glosses the claim
+// as «(akutt)»: «akuttvakt» names only the narrow vakt claim.
 
 /** Server-wide guidance returned from `initialize`, read by clients alongside the tool descriptions. */
 export const DENTAL_MCP_INSTRUCTIONS =
@@ -320,7 +322,7 @@ export function registerDentalTools(server: McpServer): void {
       title: "Norwegian dental market statistics",
       description:
         "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many " +
-        "have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. " +
+        "have Helfo direct billing, belong to a chain, show an emergency claim (akutt) or list a specialist. " +
         "An emergency claim is «Akuttvakt», an emergency duty backed by a stored quote from the source, or «Tar " +
         "imot akuttpasienter», that the clinic says it takes emergency patients.",
       inputSchema: {},
@@ -341,8 +343,9 @@ export function registerDentalTools(server: McpServer): void {
             total: "Totalt antall tannlegeklinikker i databasen (ekskl. avviste).",
             helfo_count: "Antall klinikker med Helfo-direkteoppgjørsavtale.",
             chain_count: "Antall klinikker som er del av en kjede.",
+            // «Akuttvakt» only with a stored quote (F1-S4c), as the tool texts say; response text, not tools/list (F1-S4e round 3).
             acute_count:
-              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med kilde) eller «Tar imot akuttpasienter». " +
+              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med lagret sitat) eller «Tar imot akuttpasienter». " +
               "Samme tall som tannlege_akutt.count og /sok?akutt=1.",
             specialist_clinic_count: "Antall klinikker der minst én spesialist er registrert.",
             per_fylke: "Fordeling per norsk fylke, sortert etter antall.",

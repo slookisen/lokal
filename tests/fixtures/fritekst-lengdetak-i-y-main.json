@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026)",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt»)",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -780,32 +780,32 @@
     },
     "dental GET /sok": {
       "912345678": {
-        "sha256": "70cf62aba7f6c5a8bf4978f366ba5348c9992d9bb774a8aa11d0862614daa5fb",
-        "chars": 20324
+        "sha256": "bbf2570b3d2fcd7cda7c7fb4e46ee2d124cf4177a7cc046247383e35cf212155",
+        "chars": 20325
       },
       "tannlege i Oslo": {
-        "sha256": "2a2e1a66e049c660c909fa0adcdb2ef84bf09fe70e636bdacaedf8d2aeb17d23",
-        "chars": 22658
+        "sha256": "00b9d2759af53bda422841013ead87f04747b6eea7d17dc83fb22a0ae82985f9",
+        "chars": 22659
       },
       "tannlege i Bergen": {
-        "sha256": "e42df791db474f319ddfe68379e65d19f41bf00a6c96e2f8f6515c3ed265b5ce",
-        "chars": 22788
+        "sha256": "f772669c462e7a116d19046f8dd8141d33ec1c30a861729bd70821a74f94f9e0",
+        "chars": 22789
       },
       "kjeveortoped Bergen": {
-        "sha256": "fe0d2353afd496a77e8201650cd17563351f791bbd9260d05cc8f70222f9ca6c",
-        "chars": 21580
+        "sha256": "9c650d2babda6f3f56d2a4b72d733d676f6668fb097be4efb410bc7466980825",
+        "chars": 21581
       },
       "Finn klinikk 912 345 678": {
-        "sha256": "a854ebb9eac72547f65067ce9115bcb6d46b21a2522b4b2ac02e5dba10bd33db",
-        "chars": 20403
+        "sha256": "6f51e2e5a9bd235ebb27bdc3f15ec6cd28f09deed26785ba5d584fa26e2299a0",
+        "chars": 20404
       },
       "tannlege 0150 Oslo": {
-        "sha256": "90878975c5eb24baac9ddccb8a02345083086cfd9bff587ff2997c8d2e684932",
-        "chars": 20388
+        "sha256": "e4bd13dcb53fc7483fdbe76996ba2db804063a8d849acea82b06633857595868",
+        "chars": 20389
       },
       "ring 22 33 44 55": {
-        "sha256": "5d8ecd4cfa270b295ff426cb9b4ff6a42c022a9adbdf93225b3750cf1158ce34",
-        "chars": 20370
+        "sha256": "b7d90320431faa3ecee881459ae9878497dcdbb8a1b8779020e6be2d09017e65",
+        "chars": 20371
       }
     },
     "dental GET /api/tannlege/agents": {

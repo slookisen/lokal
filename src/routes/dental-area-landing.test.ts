@@ -8,7 +8,7 @@
  *      with the cards' clinicSpecialties() (staff-only lists do not count);
  *      a non-date updated_at hides no date; served from the cache.
  *   B  /sted/bergen: answer-first paragraph (40-60 words, Helfo «ifølge
- *      klinikkenes nettsider», akutt «med kilde»), fact table, visible FAQ =
+ *      klinikkenes nettsider», akutt «med sitat» since F1-S4e), fact table, visible FAQ =
  *      FAQPage JSON-LD; the page counts its poststed («med poststed Bergen»),
  *      /sok?q=Bergen also the rest of Bergen kommune (Nesttun 5221).
  *   C  /fylke/Vestland and /fylke/Oslo; page 2 repeats neither FAQ nor table.
@@ -334,11 +334,11 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
       assertTrue(intro.startsWith("Vi har 13 tannlegeklinikker med poststed Bergen i oversikten."), `B2: the paragraph leads with the number of clinics and says what it counts (poststed Bergen) («${intro.slice(0, 70)}»)`);
       assertTrue(words(intro) >= 40 && words(intro) <= 60, `B3: the paragraph is 40-60 words (${words(intro)})`);
       assertTrue(intro.includes("5 av dem oppgir Helfo-direkteoppgjør ifølge klinikkenes nettsider"), "B4: Helfo is worded «ifølge klinikkenes nettsider» with its number");
-      assertTrue(intro.includes("4 oppgir akuttvakt med kilde eller at de tar imot akuttpasienter."), "B5: akutt is worded as the cards show it («akuttvakt med kilde» or «tar imot akuttpasienter») with its number");
+      assertTrue(intro.includes("4 oppgir akuttvakt med sitat eller at de tar imot akuttpasienter."), "B5: akutt is worded as the cards show it («akuttvakt med sitat» or «tar imot akuttpasienter», F1-S4e) with its number");
       const rows = tableRows(page.text);
       assertEq(rows.map(([k]) => k), [
         "Klinikker totalt", "Med Verifisert-merket",
-        "Oppgir Helfo-direkteoppgjør (ifølge klinikkenes nettsider)", "Akuttvakt med kilde eller tar imot akuttpasienter",
+        "Oppgir Helfo-direkteoppgjør (ifølge klinikkenes nettsider)", "Akuttvakt med sitat eller tar imot akuttpasienter",
         "Med minst én oppført spesialitet", "Sist oppdatert",
       ], "B6: the fact table has the expected rows, Helfo and akutt labelled");
       assertTrue(page.text.includes("Fakta om tannlegeklinikker med poststed Bergen</caption>"), "B6b: the table caption says what it counts");
@@ -423,14 +423,14 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
         { name: "Testby", url: `${base}/sted/testby`, scope: "poststed" }
       );
       const akuttAnswer = (one.faqJsonLd?.mainEntity as any[] | undefined)?.find((e) => /akutt/i.test(e.name))?.acceptedAnswer.text ?? "";
-      const oneAkutt = "1 klinikk oppgir akuttvakt med kilde eller at den tar imot akuttpasienter.";
+      const oneAkutt = "1 klinikk oppgir akuttvakt med sitat eller at den tar imot akuttpasienter.";
       assertTrue(akuttAnswer.startsWith(oneAkutt) && one.faqHtml.includes(oneAkutt), `D10: one akutt clinic is «1 klinikk … at den» (got «${akuttAnswer.slice(0, 75)}»)`);
       assertTrue(akuttAnswer.includes("116 117") && akuttAnswer.includes("113"), "D10b: the akutt answer points to legevakten (116 117) and to 113 for life-threatening situations");
       const many = areaFacts.buildDentalAreaLanding(
         { total: 5, verified: 1, helfo_true: 2, acute_sourced: 2, specialist_clinics: 0, max_updated_at: null },
         { name: "Testby", url: `${base}/sted/testby`, scope: "poststed" }
       );
-      assertTrue(many.faqHtml.includes("2 klinikker oppgir akuttvakt med kilde eller at de tar imot akuttpasienter."), "D11: two are «2 klinikker … at de»");
+      assertTrue(many.faqHtml.includes("2 klinikker oppgir akuttvakt med sitat eller at de tar imot akuttpasienter."), "D11: two are «2 klinikker … at de»");
 
       // Singular wording: one Helfo clinic among several, and a page with one clinic.
       const oneHelfo = introOf(areaFacts.buildDentalAreaLanding(
@@ -443,7 +443,7 @@ export async function runDentalAreaLandingTests(opts: { log?: boolean } = {}): P
         { name: "Solo", url: `${base}/sted/solo`, scope: "poststed" }
       ).introHtml);
       assertTrue(
-        single.startsWith("Vi har 1 tannlegeklinikk med poststed Solo i oversikten. Den oppgir Helfo-direkteoppgjør ifølge klinikkens nettside. Den oppgir akuttvakt med kilde eller at den tar imot akuttpasienter.") &&
+        single.startsWith("Vi har 1 tannlegeklinikk med poststed Solo i oversikten. Den oppgir Helfo-direkteoppgjør ifølge klinikkens nettside. Den oppgir akuttvakt med sitat eller at den tar imot akuttpasienter.") &&
           !/\b1 av dem\b|\b1 oppgir\b|\b1 har\b/.test(single),
         `D13: a page with one clinic says «Den», never «1 av dem» («${single}»)`
       );

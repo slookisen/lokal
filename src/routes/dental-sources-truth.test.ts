@@ -825,12 +825,14 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       const acute = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");
       const akuttNb = paragraphStarting(nbPart, "Akuttvakt");
       const akuttEn = paragraphStarting(enPart, "Emergency duty");
-      assertTrue(akuttNb.includes("vises bare når kilden til opplysningen er lagret sammen med feltet") && akuttNb.includes(`«${acute.ACUTE_ACCEPTS_LABEL}»`) &&
-        akuttEn.includes("is shown only when the source of the detail is stored with the field") && akuttEn.includes(`<span lang="nb">${acute.ACUTE_ACCEPTS_LABEL}</span>`),
-        "l5: «Akuttvakt» only with a stored source, otherwise «Tar imot akuttpasienter» when the extraction mentions akutt");
       // F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): the stored source must carry
-      // the quote from the page; a stamp without it gives the soft claim. The text above stays true:
-      // «Akuttvakt» is still never shown without a stored source.
+      // the quote from the page; a stamp without it gives the soft claim. F1-S4e says so on the page,
+      // with definition A (Daniel, questions 33 and 34); dental-akutt-tekster.test.ts P reads it whole.
+      assertTrue(akuttNb.includes("vises bare med et lagret sitat fra klinikkens egen nettside") && akuttNb.includes("Det holder ikke at kilden til opplysningen er lagret.") &&
+        akuttNb.includes(`«${acute.ACUTE_ACCEPTS_LABEL}»`) &&
+        akuttEn.includes("is shown only with a stored quote from the clinic's own website") && akuttEn.includes("A stored source for the detail is not enough.") &&
+        akuttEn.includes(`<span lang="nb">${acute.ACUTE_ACCEPTS_LABEL}</span>`),
+        "l5: «Akuttvakt» only with a stored quote from the clinic's own page (a stored source is not enough), otherwise «Tar imot akuttpasienter» when the extraction mentions akutt");
       assertEq([
         acute.resolveAcuteClaim({ acute_vakt: 1, field_provenance: null, patient_focus: null }),
         acute.resolveAcuteClaim({ acute_vakt: 1, field_provenance: { acute_vakt: [{ source_type: "website", value: "1", quote: "Vi har akuttvakt i helgene." }] }, patient_focus: null }),

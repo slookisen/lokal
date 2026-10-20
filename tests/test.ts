@@ -36564,6 +36564,21 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failed++;
     failures.push("dental «Åpent nå» in Oslo time: unexpected error: " + String(err?.message || err));
   }
+  // F1-S4e: the akutt texts (/sok, the homepage banner, /hvordan-det-fungerer,
+  // /proveniens, ai-plugin.json, /guide-tannlege-ai, the agent card) follow
+  // F1-S4c and definition A, and the lock keeps them so.
+  try {
+    const { runDentalAkuttTeksterTests } = require("../src/routes/dental-akutt-tekster.test") as
+      typeof import("../src/routes/dental-akutt-tekster.test");
+    const dat = await runDentalAkuttTeksterTests({ log: false });
+    passed += dat.passed;
+    failed += dat.failed;
+    for (const f of dat.failures) failures.push("dental akutt-tekster (F1-S4e): " + f);
+    console.log(`  dental akutt-tekster (F1-S4e): ${dat.passed} passed, ${dat.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental akutt-tekster (F1-S4e): unexpected error: " + String(err?.message || err));
+  }
 
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface

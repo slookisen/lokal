@@ -113,9 +113,10 @@ export const DENTAL_LANDING_FACETS: readonly DentalLandingFacet[] = [
   // lifted, (3) the extraction stores `quote` in the acute_vakt provenance
   // (SKILL schema, mergeFieldProvenance/normaliseSource in
   // admin-knowledge.ts) and (4) a new enrichment run has stored the quotes.
+  // The title says «med sitat», as the page text does (F1-S4e point 13).
   {
     slug: "tannlegevakt", kind: "tannlegevakt", filter: { acute_claim: "vakt" },
-    h1Label: "Tannlegevakt", titleTemplate: "Tannlegevakt i {sted}: klinikker med akuttvakt med kilde", enabled: false,
+    h1Label: "Tannlegevakt", titleTemplate: "Tannlegevakt i {sted}: klinikker med akuttvakt med sitat", enabled: false,
   },
   ...DENTAL_SEARCH_VOCABULARY.specialties.map((s): DentalLandingFacet => {
     const title = SPECIALIST_TITLES[s.slug] ?? s.canonical.charAt(0).toUpperCase() + s.canonical.slice(1);
@@ -136,7 +137,10 @@ export function findDentalLandingFacet(slug: string): DentalLandingFacet | undef
  * 2026-10-16-finn-tannlege-fasettsider, F1-S4): a box above the clinic list
  * on every /sted/<sted>/tannlegevakt and /fylke/<fylke>/tannlegevakt page,
  * and on the national /tannlegevakt hub (F1-S4b); MCP tannlege_akutt gives
- * the same text as rad_om_kommunal_tannlegevakt (F1-S4c). YMYL text,
+ * the same text as rad_om_kommunal_tannlegevakt (F1-S4c), and
+ * /hvordan-det-fungerer shows it under «Akutt tannverk» and gives it as the
+ * FAQ answer to «Hva gjør jeg ved akutt tannverk?» (F1-S4e), and the akutt
+ * FAQ answer on /sted and /fylke ends with it (F1-S4e point 14). YMYL text,
  * reviewed line by line: change it here only, never in a page or a tool
  * answer. `phones` are the numbers in the text as it writes them, each shown
  * as a tel: link to `tel`. The facet pages are in Norwegian only, so there
@@ -145,8 +149,8 @@ export function findDentalLandingFacet(slug: string): DentalLandingFacet | undef
  * The last two sentences are word for word the caveat in pkt. 3 of /vilkar,
  * which Daniel approved on 2026-10-19 (A2A
  * daniel-responses/2026-10-19-live-svar-steg-a-og-vilkar.md, message 5):
- * a clinic on a tannlegevakt page has a sourced akuttvakt, not a promise
- * that it can see you now. They stand here so every tannlegevakt page says
+ * a clinic on a tannlegevakt page has an akuttvakt with a stored quote, not a
+ * promise that it can see you now. They stand here so every tannlegevakt page says
  * it, also page 2 and later and while the cache is behind, where the FAQ is
  * not shown (dental-landing.test.ts N9-N10 compare them with /vilkar).
  */
@@ -178,7 +182,10 @@ export const DENTAL_STATIC_PAGE_DATES: Readonly<Record<string, string>> = {
   // F2-S1 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
   // the data sources and the «Verifisert» text on these three pages; F2-S2,
   // the same day: the method page on /proveniens, «Om plattformen» on /om and
-  // the Kartverket labels in the lists.
+  // the Kartverket labels in the lists. F1-S4e (A2A dev-request
+  // 2026-10-16-finn-tannlege-fasettsider), the same day: the akutt texts on
+  // /hvordan-det-fungerer and /proveniens, and «akuttopplysninger» in the
+  // data sources on all three.
   "/hvordan-det-fungerer": "2026-10-19",
   "/om": "2026-10-19",
   // Same day as the page's own «Sist oppdatert» (updatedDate in the

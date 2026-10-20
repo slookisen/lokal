@@ -131,8 +131,9 @@ export function sitemapDentalFacets(place: DentalLandingPlace): Array<{ facet: D
 
 /**
  * The emergency notice (DENTAL_EMERGENCY_NOTICE) as a marked box, its phone
- * numbers as tel: links. The tannlegevakt facet pages show it, and the
- * /tannlegevakt hub (F1-S4b) is to show the same.
+ * numbers as tel: links. The tannlegevakt facet pages show it, and so does
+ * «Akutt tannverk» on /hvordan-det-fungerer (F1-S4e); the /tannlegevakt hub
+ * (F1-S4b) is to show the same.
  */
 export function dentalEmergencyNoticeHtml(): string {
   const { text, phones } = DENTAL_EMERGENCY_NOTICE;

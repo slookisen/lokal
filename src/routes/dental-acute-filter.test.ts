@@ -364,8 +364,12 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       mcpAkuttCount = akutt.count;
       eq([stats.acute_count, akutt.count], [claimAll.length, claimAll.length], "M11: tannlege_stats acute_count === tannlege_akutt {}.count");
       const why = String(stats._forklaring?.acute_count ?? "");
-      ok(why.includes("«Akuttvakt» (med kilde)") && why.includes("«Tar imot akuttpasienter»") && why.includes("tannlege_akutt.count") &&
+      ok(why.includes("«Akuttvakt» (med lagret sitat)") && why.includes("«Tar imot akuttpasienter»") && why.includes("tannlege_akutt.count") &&
         why.includes("/sok?akutt=1") && !/akuttvakt-tilbud/.test(why), `M12: _forklaring.acute_count names the claim and the shared number («${why}»)`);
+      // F1-S4e round 3: «(med kilde)» was the wording before F1-S4c; the lock of F1-S4c (D11) reads the answer too.
+      const { emergencyDutyWithoutQuote } = require("./dental-mcp-instructions.test") as typeof import("./dental-mcp-instructions.test");
+      eq([why.includes("(med kilde)"), emergencyDutyWithoutQuote(why)], [false, []],
+        "M12b: _forklaring.acute_count says «Akuttvakt» only with a stored quote («med lagret sitat», not «med kilde»), so the lock finds nothing");
     }
     {
       // F1-S4c: «vakt» only with the quote; the advice is the reviewed emergency notice.
