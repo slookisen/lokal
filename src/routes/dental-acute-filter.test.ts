@@ -21,13 +21,24 @@
  *       getDentalStats().acute_count is that count (D3a, dev-request
  *       2026-10-17-dental-d3-rettelser), row by row;
  *   M   MCP over a real server + client: tannlege_akutt (with and without
- *       fylke, a town in fylke read as its county, and an unknown town that
- *       gives nothing while tannlege_search finds its clinic) and tannlege_search
+ *       fylke, a town in fylke read as its county, and since S8 a town
+ *       normaliseFylke() does not know read as that town, as tannlege_search
+ *       reads it) and tannlege_search
  *       (`akutt`, a parsed «akuttvakt», akutt false)
  *       give only claim cards, every one badged, `count` the claim rows;
  *       tannlege_stats' acute_count is tannlege_akutt's count; tannlege_akutt
  *       has «vakt» only on the clinic with a quote, and its
  *       rad_om_kommunal_tannlegevakt is DENTAL_EMERGENCY_NOTICE.text (F1-S4c);
+ *   U   S8 (A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort,
+ *       FUNN tannlege-akutt-fylke-ukjent-sted-null): a county, a town
+ *       normaliseFylke() knows and no fylke answer as main 61ebb322 did, byte
+ *       for byte, with `tolkning` added last (none without fylke); any other
+ *       place is read with tannlege_search's place lookup (poststed, kommune,
+ *       landsdel) and the akutt filter applies within it; a place not found
+ *       gives 0 and a `tolkning` that says so, with no fall back to the whole
+ *       country and no name search; only the place of the text is used;
+ *       DENTAL_QUERY_PARSER_DISABLED restores the old answer; planDentalAkutt
+ *       on production's gazetteer shape;
  *   W   /sok?akutt=1 and a parsed /sok query, and the same number as stats;
  *   A   A2A message/send: parsed text, the old keyword reading (switch-off
  *       path) and structured message.data; «statistikk» gives the same number;
@@ -313,26 +324,28 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       eq(r.count, claimVestland.length, "M2: ... and `count` is their number");
       ok(allBadged(r), "M3: every card has akutt «vakt» with the Akuttvakt badge or «accepts» with «Tar imot akuttpasienter»");
       // The dental connector pack's caveat (scripts/gen-connector-packs.ts): a
-      // town is read as its county, so it neither narrows nor gives nothing.
+      // town normaliseFylke() knows is read as its county, so it does not narrow.
       const town = await call("tannlege_akutt", { fylke: "Voss" });
       eq([cardNames(town), town.count], [names(claimVestland), claimVestland.length],
         "M1b: a town in `fylke` is read as its county: «Voss» (no fixture clinic there) lists the Vestland claim clinics");
-      // … but only a town normaliseFylke() knows: any other gives nothing, even
-      // with a claim clinic in that very town, which tannlege_search does find
-      // (the caveat's «Sandvika», B1 in the review of lokal#1201).
+      // … and since S8 (A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort)
+      // any other place is read as tannlege_search reads it: the caveat's
+      // «Sandvika» lists its claim clinic (before S8 it gave nothing, B1 in the
+      // review of lokal#1201; FUNN tannlege-akutt-fylke-ukjent-sted-null).
       const gen = require("../../scripts/gen-connector-packs") as typeof import("../../scripts/gen-connector-packs");
-      const caveatTown = gen.PACKS.dental.caveats.join("\n").match(/A town it does not know, such as «([^»]+)», gives no results\./)?.[1];
-      eq(caveatTown, "Sandvika", "M1c control: the pack caveat's unknown town is the one this fixture places a clinic in");
+      const caveatTown = gen.PACKS.dental.caveats.join("\n").match(/Any other place, such as «([^»]+)», is read as a town or municipality/)?.[1];
+      eq(caveatTown, "Sandvika", "M1c control: the pack caveat's other place is the one this fixture places a clinic in");
       const gazetteer = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
       const sandvika = add("Sandvika Vakt Med Kilde AS", "918770015", { acute_vakt: 1, field_provenance: SOURCED },
         { poststed: "SANDVIKA", fylke: "Akershus", postnummer: "1337" });
       gazetteer.__resetDentalSearchGazetteerForTesting();
       try {
-        const unknown = await call("tannlege_akutt", { fylke: "Sandvika" });
+        const notCounty = await call("tannlege_akutt", { fylke: "Sandvika" });
         const county = await call("tannlege_akutt", { fylke: "Akershus" });
         const oneTown = await call("tannlege_search", { query: "emergency dentist Sandvika", limit: 25 });
         const withFlag = await call("tannlege_search", { query: "Sandvika", akutt: true, limit: 25 });
-        eq([unknown.klinikker, unknown.count], [[], 0], "M1c: a town normaliseFylke() does not know, in `fylke`, gives no clinics and `count` 0");
+        eq([cardNames(notCounty), notCounty.count, notCounty.tolkning?.tolket_som], [["Sandvika Vakt Med Kilde AS"], 1, ["sted: Sandvika (poststed)", "akutt: ja"]],
+          "M1c: a town normaliseFylke() does not know, in `fylke`, lists its claim clinic, and `tolkning` says it was read as that poststed (S8)");
         eq([cardNames(county), county.count], [["Sandvika Vakt Med Kilde AS"], 1], "M1d: … though its county lists the town's claim clinic");
         eq([cardNames(oneTown), oneTown.count, cardNames(withFlag), withFlag.count], [["Sandvika Vakt Med Kilde AS"], 1, ["Sandvika Vakt Med Kilde AS"], 1],
           "M1e: … and tannlege_search finds it, from «emergency dentist Sandvika» and from `akutt: true` with the town in `query`");
@@ -381,6 +394,141 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       ok(!/Akuttvakt-merke/.test(String(akutt.rad_om_kommunal_tannlegevakt)), "M16: ... and no longer says what clinics with the Akuttvakt badge do");
       const vestland = await call("tannlege_akutt", { fylke: "Vestland" });
       eq(vestland.rad_om_kommunal_tannlegevakt, DENTAL_EMERGENCY_NOTICE.text, "M17: the same notice with fylke");
+    }
+
+    // ── U: S8, how tannlege_akutt reads `fylke` ───────────────────────────
+    // A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort, S8.
+    {
+      const gazetteer = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
+      const { postnumreForKommune, officialPoststedFylker } = require("../services/norway-postnummer") as typeof import("../services/norway-postnummer");
+      const { parseDentalQuery } = require("../services/dental-query-parser") as typeof import("../services/dental-query-parser");
+      const { buildNorwegianGazetteer } = require("../services/search-intent/norwegian-query") as typeof import("../services/search-intent/norwegian-query");
+      const { NORWEGIAN_SEARCH_AREAS } = require("../config/norway-search-areas") as typeof import("../config/norway-search-areas");
+      const akuttText = async (args: Record<string, unknown>) =>
+        String(((await client.callTool({ name: "tannlege_akutt", arguments: args })) as any).content[0].text);
+      // The answer as main 61ebb322 built it, before S8: `fylke` as a county filter and no `tolkning`.
+      const before = (fylke?: string): string => {
+        const filter: Record<string, unknown> = { acute_vakt: 1 };
+        if (fylke) filter.fylke = fylke;
+        return JSON.stringify({
+          count: store.countPublicDentalAgents(filter as any),
+          klinikker: mcp.buildSearchResults(store.listPublicDentalAgents(filter as any, 25)),
+          rad_om_kommunal_tannlegevakt: DENTAL_EMERGENCY_NOTICE.text,
+        });
+      };
+      const notFound = (place: string) =>
+        `merknad: «${place}» ble ikke funnet som fylke, kommune eller poststed med tannklinikker, så ingen klinikker er listet; ` +
+        "tannlege_search med stedet i query og akutt: true kan prøves, eller tannlege_akutt uten fylke for hele landet";
+      const akershus = { poststed: "SANDVIKA", fylke: "Akershus", postnummer: "1337" };
+      const added = [
+        add("Sandvika Akutt Sted AS", "918770201", { acute_vakt: 1, field_provenance: QUOTED }, akershus),
+        add("Sandvika Uten Akutt AS", "918770202", {}, { ...akershus, postnummer: "1338" }),
+        add("Ski Akuttfokus AS", "918770203", { patient_focus: ["Akutt"] }, { ...akershus, poststed: "SKI", postnummer: "1400" }),
+        add("Lillestrøm Vakt AS", "918770204", { acute_vakt: 1, field_provenance: SOURCED }, { ...akershus, poststed: "LILLESTRØM", postnummer: "2000" }),
+        // A claim clinic in Bergen whose name is the unknown place below: an unknown place is no name search.
+        add("Xyzby Akutt Tannklinikk AS", "918770205", { acute_vakt: 1, field_provenance: SOURCED }),
+      ];
+      const claimAkershus = ["Lillestrøm Vakt AS", "Sandvika Akutt Sted AS", "Ski Akuttfokus AS"];
+      gazetteer.__resetDentalSearchGazetteerForTesting();
+      try {
+        // U1–U3: a county, a town normaliseFylke() knows, and no fylke answer as before.
+        const county = ["Vestland", "vestland", "Hordaland", "Bergen", "Voss", "Oslo", "Akershus"];
+        for (const fylke of county) {
+          const text = await akuttText({ fylke });
+          const { tolkning, ...rest } = JSON.parse(text);
+          const old = before(fylke);
+          ok(JSON.stringify(rest) === old && text === `${old.slice(0, -1)},"tolkning":${JSON.stringify(tolkning)}}`,
+            `U1 ${fylke}: the answer is main's, byte for byte, with \`tolkning\` added last`);
+        }
+        const tolkningOf = async (fylke: string) => JSON.parse(await akuttText({ fylke })).tolkning;
+        eq(await tolkningOf("Vestland"), { sporring: "Vestland", tolket_som: ["sted: Vestland (fylke)", "akutt: ja"], filter: { acute_vakt: 1, fylke: "Vestland" }, fallback: false },
+          "U2: «Vestland»: `tolkning` says it was read as the county, in tannlege_search's form");
+        eq(await tolkningOf("Bergen"), { sporring: "Bergen", tolket_som: ["sted: Vestland (fylke; «Bergen»)", "akutt: ja"], filter: { acute_vakt: 1, fylke: "Bergen" }, fallback: false },
+          "U2b: «Bergen»: read as Vestland, and `tolkning` says so");
+        eq([(await tolkningOf("vestland")).tolket_som[0], (await tolkningOf("Hordaland")).tolket_som[0]], ["sted: Vestland (fylke)", "sted: Vestland (fylke; «Hordaland»)"],
+          "U2c: the county's own name in any case reads as «(fylke)», an old county name with the name given");
+        const [bergen, vestland] = [JSON.parse(await akuttText({ fylke: "Bergen" })), JSON.parse(await akuttText({ fylke: "Vestland" }))];
+        eq([bergen.count, cardNames(bergen)], [vestland.count, cardNames(vestland)], "U2d: «Bergen» still covers all of Vestland");
+        const all = await akuttText({});
+        ok(all === before() && !("tolkning" in JSON.parse(all)), "U3: without `fylke` the answer is main's, byte for byte, and has no `tolkning`");
+
+        // U4–U6: a place normaliseFylke() does not know is read as tannlege_search reads it.
+        ok(JSON.parse(before("Sandvika")).count === 0, "U4 control: before S8, «Sandvika» in `fylke` gave 0 (the FUNN)");
+        const sandvika = JSON.parse(await akuttText({ fylke: "Sandvika" }));
+        eq([cardNames(sandvika), sandvika.count], [["Sandvika Akutt Sted AS"], 1],
+          "U4: «Sandvika» lists the poststed's claim clinic: not the one without a claim there, nor the other Akershus claims");
+        eq(sandvika.tolkning, { sporring: "Sandvika", tolket_som: ["sted: Sandvika (poststed)", "akutt: ja"], filter: { acute_vakt: 1, poststed_in: ["SANDVIKA"] }, fallback: false },
+          "U4b: … and `tolkning` says it was read as that poststed");
+        ok(allBadged(sandvika) && sandvika.klinikker[0].akutt === "vakt", "U4c: … the card badged, «vakt» from its quote");
+        eq(Object.keys(sandvika), ["count", "klinikker", "rad_om_kommunal_tannlegevakt", "tolkning"], "U4d: the keys are the old ones, then `tolkning`");
+        const follo = JSON.parse(await akuttText({ fylke: "Nordre Follo" }));
+        const folloPostnumre = follo.tolkning?.filter?.postnummer_in;
+        eq([cardNames(follo), follo.count, follo.tolkning?.tolket_som], [["Ski Akuttfokus AS"], 1, ["sted: Nordre Follo kommune (etter postnummer)", "akutt: ja"]],
+          "U5: a kommune only («Nordre Follo») lists its claim clinic, by postnummer, and `tolkning` says so");
+        ok(typeof folloPostnumre?.kommunenummer === "string" && folloPostnumre.antall === postnumreForKommune(folloPostnumre.kommunenummer).length,
+          `U5b: … with the kommune's postnumre shown as {kommunenummer, antall}, as tannlege_search shows them (${JSON.stringify(folloPostnumre)})`);
+        const ost = JSON.parse(await akuttText({ fylke: "Østlandet" }));
+        eq([cardNames(ost), ost.tolkning?.tolket_som[0]],
+          [sorted([...claimAkershus, "Oslo Vakt Med Kilde AS"]), "sted: Oslo, Akershus, Østfold, Buskerud, Innlandet, Vestfold og Telemark (fylker; landsdelen Østlandet)"],
+          "U6: a landsdel («Østlandet») lists the claim clinics in its fylker");
+
+        // U7: a place that is not found lists nothing, and says why; no fall back to the whole country.
+        const xyzby = JSON.parse(await akuttText({ fylke: "Xyzby" }));
+        eq(xyzby, { count: 0, klinikker: [], rad_om_kommunal_tannlegevakt: DENTAL_EMERGENCY_NOTICE.text,
+          tolkning: { sporring: "Xyzby", tolket_som: ["sted: ukjent («Xyzby»)", notFound("Xyzby")], filter: null, fallback: false } },
+          "U7: an unknown place («Xyzby») gives 0 and a `tolkning` that it was not found and what to try, though a claim clinic has it in its name");
+        const viaSearch = await call("tannlege_search", { query: "Xyzby", akutt: true, limit: 25 });
+        eq(cardNames(viaSearch), ["Xyzby Akutt Tannklinikk AS"], "U7b: … and tannlege_search with the place in `query` and `akutt: true`, which the note names, finds it");
+        for (const [fylke, why] of [["Stockholm", "a place abroad"], ["Norge", "the country"], ["Stabekk", "a poststed with no clinic"], ["  ", "a blank value"]]) {
+          const r = JSON.parse(await akuttText({ fylke }));
+          eq([r.count, r.klinikker, r.tolkning?.tolket_som, r.tolkning?.filter], [0, [], [`sted: ukjent («${fylke.trim()}»)`, notFound(fylke.trim())], null],
+            `U7c: ${why} («${fylke}») gives 0 and says it was not found`);
+        }
+
+        // U8: only the place of the text is used.
+        const withSpecialty = JSON.parse(await akuttText({ fylke: "kjeveortoped Sandvika" }));
+        eq([cardNames(withSpecialty), withSpecialty.tolkning?.tolket_som, withSpecialty.tolkning?.filter],
+          [["Sandvika Akutt Sted AS"], ["sted: Sandvika (poststed)", "akutt: ja", "merknad: bare stedet brukes, ikke resten av teksten"], { acute_vakt: 1, poststed_in: ["SANDVIKA"] }],
+          "U8: «kjeveortoped Sandvika» lists Sandvika's claim clinic, without the specialty, and notes that only the place is used");
+        const asked = JSON.parse(await akuttText({ fylke: "akutt tannlege i Sandvika" }));
+        eq([cardNames(asked), asked.tolkning?.tolket_som], [["Sandvika Akutt Sted AS"], ["sted: Sandvika (poststed)", "akutt: ja"]],
+          "U8b: «akutt tannlege i Sandvika» has nothing besides the place to note");
+
+        // U9: DENTAL_QUERY_PARSER_DISABLED restores the old answer here too.
+        process.env.DENTAL_QUERY_PARSER_DISABLED = "1";
+        try {
+          eq([await akuttText({ fylke: "Sandvika" }), await akuttText({ fylke: "Bergen" })], [before("Sandvika"), before("Bergen")],
+            "U9: with the parser switched off, `fylke` is a county filter again and the answer has no `tolkning` (main's, byte for byte)");
+        } finally {
+          delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+        }
+
+        // U10–U11: planDentalAkutt on its own, against production's gazetteer shape (every official poststed).
+        const prodGazetteer = buildNorwegianGazetteer(officialPoststedFylker().keys(), NORWEGIAN_SEARCH_AREAS);
+        const placeKinds = ["Sandvika", "Nordre Follo", "Rælingen", "Østlandet", "Sørlandet"];
+        const kinds = placeKinds.map((place) => {
+          const parsed = parseDentalQuery(place, prodGazetteer).filter;
+          const plan = mcp.planDentalAkutt(place, () => prodGazetteer);
+          return { place, keys: Object.keys(parsed), same: JSON.stringify(plan.filter) === JSON.stringify({ acute_vakt: 1, ...parsed }) };
+        });
+        eq([kinds.filter((k) => !k.same).map((k) => k.place), [...new Set(kinds.flatMap((k) => k.keys))].sort()],
+          [[], ["fylke_in", "postnummer_in", "poststed_in", "poststed_or_postnummer"]],
+          "U10: each place kind the parser reads (poststed, kommune, poststed + kommune, landsdel) is the filter, with akutt");
+        const mixed = mcp.planDentalAkutt("kjeveortoped med helfo Sandvika Bjarne", () => prodGazetteer).filter;
+        eq(mixed, { acute_vakt: 1, poststed_in: ["SANDVIKA"] }, "U10b: the specialty, Helfo and name words of the text are not filters");
+        const readsGazetteer = (fylke: string | undefined) => {
+          let read = false;
+          const { filter } = mcp.planDentalAkutt(fylke, () => { read = true; return prodGazetteer; });
+          return [filter, read];
+        };
+        eq([undefined, "", "Bergen", "Sandvika"].map(readsGazetteer),
+          [[{ acute_vakt: 1 }, false], [{ acute_vakt: 1 }, false], [{ acute_vakt: 1, fylke: "Bergen" }, false], [{ acute_vakt: 1, poststed_in: ["SANDVIKA"] }, true]],
+          "U11: no fylke, an empty one and a county read no gazetteer (no parse on the path that is as before); another place does");
+      } finally {
+        delete process.env.DENTAL_QUERY_PARSER_DISABLED;
+        for (const id of added) db.prepare("DELETE FROM dental_agents WHERE id = ?").run(id);
+        gazetteer.__resetDentalSearchGazetteerForTesting();
+      }
     }
 
     // ── W: /sok ───────────────────────────────────────────────────────────

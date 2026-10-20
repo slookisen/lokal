@@ -20,7 +20,9 @@
  *   (j) protocol versions from the SDK and the data-handling paste block;
  *   (k) the dental pack says no more than the service does (the independent
  *       check of the directory prompt, 2026-10-19): emergency care per place
- *       (a known town gives its county, an unknown one nothing), no
+ *       (a known town gives its county; since S8 of A2A dev-request
+ *       2026-10-16-tannlege-mcp-instrukser-og-klinikkort any other place is
+ *       read as that place, as tannlege_search reads it), no
  *       out-of-hours promise but /vilkar's 113 line and advice, Helfo as read
  *       automatically from the clinic's own website; and the readiness line
  *       points at no table portal-answers.md lacks (S10). G3-S6d (lokal#1201
@@ -559,7 +561,9 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       // What the pack said before, each more than the service does.
       const OVERCLAIMS: ReadonlyArray<readonly [RegExp, string]> = [
         [/a town name gives no results/i, "tannlege_akutt reads a town it knows as its county"],
-        [/a town name is read as the county/i, "only a town the server knows is; any other gives no results"],
+        [/a town name is read as the county/i, "only a town the server knows is; any other is read as that place (S8)"],
+        [/narrows by county \(fylke\) only|A town it does not know, such as «[^»]+», gives no results/i,
+          "since S8 tannlege_akutt reads a place normaliseFylke() does not know as that town or municipality"],
         [/outside normal hours/i, "the data has no out-of-hours times"],
         [/change what a visit costs|how soon you get one/i, "direct billing settles Helfo's share; emergency care promises no time"],
         [/reported as a fact/i, "Helfo direct billing is the clinic's own statement, not Helfo's"],
@@ -618,11 +622,16 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       const town = caveats.match(/a town the server knows is read as the county it lies in, so «([^»]+)» covers all of ([^.]+)\./);
       assertTrue(!!town && normaliseFylke(town[1]) === town[2] && (officialPoststedFylker().get(town[1].toUpperCase()) ?? []).includes(town[2]),
         `k9: tannlege_akutt reads a town it knows as the county the town lies in, as the caveat says (normaliseFylke(«${town?.[1]}») = ${town ? normaliseFylke(town[1]) : "?"}; dental-acute-filter.test.ts M1b runs it through the tool)`);
-      const unknown = caveats.match(/A town it does not know, such as «([^»]+)», gives no results\./)?.[1] ?? "";
-      const unknownAsTown = asOneTown(`emergency dentist ${unknown}`);
-      assertTrue(unknown !== "" && normaliseFylke(unknown) === null && unknownAsTown.ok && unknownAsTown.f.acute_vakt === 1,
-        `k9b: the caveat's unknown town («${unknown}») is one normaliseFylke() does not know (${unknown ? normaliseFylke(unknown) : "?"}), so tannlege_akutt gives nothing ` +
-        `(dental-acute-filter.test.ts M1c), and tannlege_search reads it as that town (${JSON.stringify(unknownAsTown.f).slice(0, 120)})`);
+      // S8 (A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort): the
+      // caveat's other place is one normaliseFylke() does not know, which
+      // tannlege_akutt now reads as tannlege_search's parser reads it alone, a town.
+      const other = caveats.match(/Any other place, such as «([^»]+)», is read as a town or municipality, the way tannlege_search reads a place in `query`\./)?.[1] ?? "";
+      const otherAsTown = asOneTown(other);
+      assertTrue(other !== "" && normaliseFylke(other) === null && otherAsTown.ok &&
+        /A place it cannot find gives no results, and the answer's `tolkning` says how the place was read\./.test(caveats),
+        `k9b: the caveat's other place («${other}») is one normaliseFylke() does not know (${other ? normaliseFylke(other) : "?"}), and the parser reads it ` +
+        `as that town (${JSON.stringify(otherAsTown.f).slice(0, 120)}), so tannlege_akutt lists its clinics (dental-acute-filter.test.ts M1c); ` +
+        "a place not found gives nothing, with `tolkning`");
       const example = caveats.match(/for example «([^»]+)»/)?.[1] ?? "";
       const oneTown = asOneTown(example);
       assertTrue(example !== "" && oneTown.ok && oneTown.f.acute_vakt === 1,
@@ -651,8 +660,8 @@ export function runConnectorPacksFreshTests(opts: { log?: boolean } = {}): TestS
       assertTrue(sourcesParagraph.endsWith(` How each field is sourced is described at ${methodPage}.`) && /router\.get\("\/proveniens"/.test(read("src/routes/dental-seo.ts")),
         `k18: the sources paragraph ends with the method page, ${methodPage}, which the dental site serves (point 3)`);
 
-      // Point 5: only the two caveats that hold; the chain and Ø caveats are gone (k1).
-      assertEq(caveatLines.map((l) => l.split(":")[0]), ["- tannlege_akutt narrows by county (fylke) only", "- If life or health is in immediate danger"],
+      // Point 5: only the two caveats that hold; the chain and Ø caveats are gone (k1). S8 reworded the per-place one.
+      assertEq(caveatLines.map((l) => l.split(":")[0]), ["- tannlege_akutt reads `fylke` as a county first", "- If life or health is in immediate danger"],
         "k19: the caveats are the per-place one and the hours one, nothing else (point 5)");
 
       // Points 9–11: the portal's real fields (Daniel's run of prompt 11, 2026-10-19).

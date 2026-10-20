@@ -71,6 +71,10 @@
  *       F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider) moved
  *       the two tannlege_akutt rows, captured again: their
  *       rad_om_kommunal_tannlegevakt is DENTAL_EMERGENCY_NOTICE.text.
+ *       S8 (A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort)
+ *       moved the tannlege_akutt {fylke: "Oslo"} row, captured again: the
+ *       answer ends with `tolkning`, and without it is the row's old hash
+ *       (dental-acute-filter.test.ts U1 checks the same byte for byte).
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the

@@ -356,10 +356,12 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     // on 2026-10-19 prod had chain_count 346 and 37 chains, and «Bodø» found 52
     // clinics in all three spellings, with lokal#1086 live (G3-S6d point 5).
     caveats: [
-      // A town in `fylke` goes through normaliseFylke() in the store: a town it
-      // knows gives its county, any other gives nothing (dental-acute-filter.test.ts
-      // M1b and M1c; connector-packs-fresh.test.ts k9 and k9b check both examples).
-      "tannlege_akutt narrows by county (fylke) only: a town the server knows is read as the county it lies in, so «Bergen» covers all of Vestland. A town it does not know, such as «Sandvika», gives no results. For one town, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.",
+      // A place in `fylke` is a county when normaliseFylke() knows it (a town it
+      // knows gives its county), else the place tannlege_search's parser reads in
+      // it, else nothing, with `tolkning` saying which (S8 in
+      // 2026-10-16-tannlege-mcp-instrukser-og-klinikkort; dental-acute-filter.test.ts
+      // M1b, M1c and U; connector-packs-fresh.test.ts k9 and k9b check both examples).
+      "tannlege_akutt reads `fylke` as a county first: a town the server knows is read as the county it lies in, so «Bergen» covers all of Vestland. Any other place, such as «Sandvika», is read as a town or municipality, the way tannlege_search reads a place in `query`. A place it cannot find gives no results, and the answer's `tolkning` says how the place was read. To search only a town that is read as its county, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.",
       // The 113 line and the advice are /vilkar section 3's (dental-seo.ts); connector-packs-fresh.test.ts k15 keeps them equal.
       "If life or health is in immediate danger: call 113. Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
     ],
