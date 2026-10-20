@@ -36033,6 +36033,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agent-put-acute-vakt-quote: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4f): dental-PUT tar vare på revisjonsoppføringene i proveniensen ──");
+  try {
+    const { runDentalAgentPutAuditEntriesTests } = require("../src/routes/dental-agent-put-audit-entries.test") as
+      typeof import("../src/routes/dental-agent-put-audit-entries.test");
+    const dae = await runDentalAgentPutAuditEntriesTests({ log: false });
+    passed += dae.passed;
+    failed += dae.failed;
+    for (const f of dae.failures) failures.push("dental-agent-put-audit-entries: " + f);
+    console.log(`  dental-agent-put-audit-entries: ${dae.passed} passed, ${dae.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agent-put-audit-entries: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dental-schema-probe-writepath-fix: PUT /api/tannlege/agents/:id test-fingerprint guard ──");
   try {
     const { runDentalTests } = require("../src/routes/dental.test") as

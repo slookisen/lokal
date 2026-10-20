@@ -1474,6 +1474,11 @@ export function recordStageVFieldObservation(
         /* tolerate junk */
       }
     }
+    // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: the
+    // audit entries other routes write into the column (`inactive`, the
+    // hjemmeside cleanup's, the offentlig klinikk correction's
+    // `directory_url`) are kept as stored, as in the dental PUT
+    // (keepAuditEntries).
     const mergedProv = mergeFieldProvenance(existingProv, {
       [field]: {
         sources: [
@@ -1484,7 +1489,7 @@ export function recordStageVFieldObservation(
           },
         ],
       },
-    });
+    }, { keepAuditEntries: true });
 
     delete pendingMap[field];
     db.prepare(
