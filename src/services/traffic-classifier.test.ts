@@ -25,6 +25,7 @@ import {
   uaFromSessionId,
   isScannerUA,
   aiVendorBucket,
+  storedClientClass,
   isVelocityScraper,
   SCRAPER_UNIQUE_PAGES_PER_10_MIN,
   SCRAPER_PRODUSENT_PAGES_PER_HOUR,
@@ -84,6 +85,8 @@ export function runTrafficClassifierTests(opts: { log?: boolean } = {}): TestSum
   expectBucket(
     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot",
     "ai_crawler", "ac2 OAI-SearchBot");
+  expectBucket("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-SearchBot/1.0; +Claude-SearchBot@anthropic.com)",
+    "ai_crawler", "ac2b Claude-SearchBot is an indexer, not ai_search");
   expectBucket(
     "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
     "ai_crawler", "ac3 ClaudeBot");
@@ -264,6 +267,15 @@ export function runTrafficClassifierTests(opts: { log?: boolean } = {}): TestSum
   assertEq(aiVendorBucket("Mozilla/5.0 (compatible; OAI-SearchBot/1.0)"), "chatgpt", "v3 OAI-SearchBot → chatgpt");
   assertEq(aiVendorBucket("Mozilla/5.0 (compatible; Claude-User/1.0)"), "claude", "v4 Claude-User → claude");
   assertEq(aiVendorBucket("Mozilla/5.0 (compatible; anthropic-ai/1.0)"), "claude", "v5 anthropic-ai → claude");
+  assertEq(aiVendorBucket("Mozilla/5.0 (compatible; Claude-SearchBot/1.0)"), "claude", "v5b Claude-SearchBot → claude");
+  assertEq(classifyUA("Mozilla/5.0 (compatible; Claude-Web/1.0)"), "ai_search", "v5c Claude-Web stays ai_search");
+
+  // ── storedClientClass: raw bot UA is reclassified, bucketed sessions keep the stored class ──
+  assertEq(storedClientClass("h1:Mozilla/5.0 (compatible; Claude-SearchBot/1.0)", "other_bot"), "ai_crawler", "sc1 raw bot UA + stored other_bot → ai_crawler");
+  assertEq(storedClientClass("h1:desktop:0123abcd0123abcd", "scanner"), "scanner", "sc2 bucketed session keeps stored scanner");
+  assertEq(storedClientClass("h1:Mozilla/5.0 (compatible; Claude-User/1.0)", "ai_search"), "ai_search", "sc3 Claude-User stays ai_search");
+  assertEq(storedClientClass("h1:RFB-ContactVerifier/1.0", "dev"), "dev", "sc4 owner override dev wins");
+  assertEq(storedClientClass("h1:Mozilla/5.0 (compatible; Claude-SearchBot/1.0)", null), "ai_crawler", "sc5 legacy row without stored class");
   assertEq(aiVendorBucket("Mozilla/5.0 (compatible; ExaSearchBot/1.0)"), "other", "v6 ExaSearchBot → other");
 
   // ── velocity heuristic (strict thresholds) ──────────────────────────────
