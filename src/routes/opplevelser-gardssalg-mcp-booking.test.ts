@@ -64,6 +64,25 @@ function parseJsonRpcBody(text: string, contentType: string | null): any {
   return JSON.parse(text);
 }
 
+// Next `targetDow` (0=Sun … 6=Sat) at `hour:minute`, at least `minDaysAhead`
+// UTC calendar days from now, as a naked "YYYY-MM-DDTHH:mm" string.
+// Offset-from-now (never a hardcoded calendar date) so no slot_at in this
+// suite goes stale — a hardcoded "2026-10-20T12:00" in blocks (b)/(f)/(c)/
+// (e)/(a) turned the happy path into a past-slot rejection, and main's CI
+// red, once that time had passed (dev-request
+// 2026-10-20-ci-tidsbombe-hardkodede-testdatoer). A calendar date's
+// day-of-week is timezone-independent, so walking it via getUTCDay() is safe
+// even though the returned string is later read as EUROPE/OSLO wall time by
+// normaliseBookingSlotInput()/osloDatetimeLocalToUtcIso().
+function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() + minDaysAhead);
+  while (d.getUTCDay() !== targetDow) d.setUTCDate(d.getUTCDate() + 1);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(hour)}:${pad(minute)}`;
+}
+
 export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
@@ -220,10 +239,17 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
         return (db.prepare("SELECT COUNT(*) AS n FROM gardssalg_bookings").get() as { n: number }).n;
       }
 
+      // Next Tuesday at noon — the same weekday and wall time as the old
+      // hardcoded "2026-10-20T12:00". Always in the future (Oslo noon on a
+      // UTC date at least one day out), at most 8 days ahead (well inside
+      // the default 90-day window), and a weekday daytime slot (bk-live
+      // carries no opening_hours_text, so no soft check applies).
+      const bookableSlotMcp = nextWeekdayDatetimeLocal(2, 12, 0);
+
       // ── (b) non-live producer (booking_live=0) -> clear rejection ────────
       const pausedCall = await callTool("book_gardssalg", {
         provider_id: "bk-paused",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 2,
         guest_name: "Ola Nordmann",
         guest_email: "ola@example.no",
@@ -239,7 +265,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       // ── (f) unknown provider_id -> same gate, same clear rejection ───────
       const unknownCall = await callTool("book_gardssalg", {
         provider_id: "does-not-exist",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 2,
         guest_name: "Ola Nordmann",
         guest_email: "ola@example.no",
@@ -253,7 +279,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       delete process.env.BOOKING_DISPATCH_ENABLED;
       const dispatchOffCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -268,7 +294,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
 
       const badEmailCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "not-an-email",
@@ -279,7 +305,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
 
       const badPartySizeCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 0,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -289,7 +315,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
 
       const emptyNameCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 2,
         guest_name: "",
         guest_email: "kari@example.no",
@@ -301,7 +327,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       //     booking_live=1 -> pending row + confirm_token created ──────────
       const okCall = await callTool("book_gardssalg", {
         provider_id: "bk-live",
-        slot_at: "2026-10-20T12:00",
+        slot_at: bookableSlotMcp,
         party_size: 3,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -362,21 +388,7 @@ export function runOpplevelserGardssalgMcpBookingTests(opts: { log?: boolean } =
       // session probe as a permanent test.
       // ═══════════════════════════════════════════════════════════════════
       {
-        // Offset-from-now (never a hardcoded calendar date) so this section
-        // never goes stale the way the hardcoded slot_at fixtures elsewhere
-        // in this suite periodically need a "date-repairs" bump. A calendar
-        // date's day-of-week is timezone-independent, so walking it via
-        // getUTCDay() is safe even though the returned "YYYY-MM-DDTHH:mm"
-        // string is later read as EUROPE/OSLO wall time by
-        // normaliseBookingSlotInput()/osloDatetimeLocalToUtcIso().
-        function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
-          const d = new Date();
-          d.setUTCHours(0, 0, 0, 0);
-          d.setUTCDate(d.getUTCDate() + minDaysAhead);
-          while (d.getUTCDay() !== targetDow) d.setUTCDate(d.getUTCDate() + 1);
-          const pad = (n: number): string => String(n).padStart(2, "0");
-          return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(hour)}:${pad(minute)}`;
-        }
+        // Offset-from-now via the file-scope nextWeekdayDatetimeLocal().
         // Next Saturday at noon — OUTSIDE "Man-fre 10:00-18:00", always a
         // few days out, always well inside the (default 90-day) window.
         const outsideHoursSlotMcp = nextWeekdayDatetimeLocal(6, 12, 0);

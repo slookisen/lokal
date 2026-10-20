@@ -100,15 +100,17 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
 
   const claims = JSON.parse(read("distribution/catalog-claims.json"));
   const floors = claims.floors as Record<Vertical, number>;
-  check("dist-1 floors are rfb 1500 / dental 5400 / opplevelser 500",
-    floors.rfb === 1500 && floors.dental === 5400 && floors.opplevelser === 500, JSON.stringify(floors));
+  // dental 4500 (G3-S6d / S10c): true at 5446 now and at about 4635 once F2-S10 hides the catalog-import rows.
+  check("dist-1 floors are rfb 1500 / dental 4500 / opplevelser 500",
+    floors.rfb === 1500 && floors.dental === 4500 && floors.opplevelser === 500, JSON.stringify(floors));
 
   // parser self-checks (the test must bite)
   check("dist-2 parser flags '~6,900 clinics'", violations("MCP: ~6,900 clinics with Helfo", floors).length === 1);
   check("dist-3 parser flags '1,700+ farms'", violations("1,700+ farms, shops", floors).length === 1);
   check("dist-4 parser flags 'over 1600 matprodusenter'", violations("over 1600 matprodusenter", floors).length === 1);
   check("dist-5 parser accepts floors and equal numbers",
-    violations("5,400+ clinics, 1,500+ farms, 500+ experiences", floors).length === 0);
+    violations("4,500+ clinics, 1,500+ farms, 500+ experiences", floors).length === 0);
+  check("dist-5b parser flags the old dental floor '5,400+ clinics'", violations("5,400+ clinics", floors).length === 1);
 
   const files = scannedFiles();
   check("dist-6 scanned set covers the listed files",
@@ -133,13 +135,41 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
   const sj = JSON.parse(pkgSj.toString("utf8"));
   check("dist-10 lokal-mcp description", sj.description ===
     "Norwegian local-food MCP: 1,500+ farms, shops, markets + umbrellas (Bondens marked, Hanen, REKO).", sj.description);
-  check("dist-11 lokal-mcp stays 0.4.1", sj.version === "0.4.1" && JSON.parse(read("mcp-server/package.json")).version === "0.4.1");
+  check("dist-11 lokal-mcp is 0.5.0 (stdio bridge, G1-S2b)", sj.version === "0.5.0" && sj.packages[0].version === "0.5.0"
+    && JSON.parse(read("mcp-server/package.json")).version === "0.5.0" && JSON.parse(read("mcp-server/manifest.json")).version === "0.5.0");
   check("dist-12 mcp-server/package.json files ships server.json",
     (JSON.parse(read("mcp-server/package.json")).files as string[]).includes("server.json"));
   check("dist-13 dental server.json websiteUrl", JSON.parse(read("mcp-server-dental/server.json")).websiteUrl === "https://finn-tannlege.com");
   check("dist-14 opplevagent server.json websiteUrl", JSON.parse(read("mcp-server-opplevagent/server.json")).websiteUrl === "https://opplevagent.no");
-  check("dist-15 dental package versions are 0.2.0 (stdio bridge, G1-S2a)",
-    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.0" && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.0");
+  // 0.2.1 shipped the shared bridge that exits on stdin EOF (G1-S2c); 0.2.2 is the text of G3-S6d (point 12),
+  // since npm and the MCP registry do not take a new text under a published version.
+  check("dist-15 finn-tannlege-mcp is 0.2.2 in every place (G3-S6d text)",
+    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.2"
+    && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.2"
+    && JSON.parse(read("mcp-server-dental/server.json")).packages[0].version === "0.2.2");
+  // G3-S6d point 12: the npm text says what the service does after F1-S4c and F2-S10. The registry's
+  // server.json schema takes a description of at most 100 characters.
+  {
+    const texts: Array<[string, string]> = [
+      ["README.md", read("mcp-server-dental/README.md")],
+      ["package.json", JSON.parse(read("mcp-server-dental/package.json")).description],
+      ["server.json", JSON.parse(read("mcp-server-dental/server.json")).description],
+    ];
+    for (const [f, t] of texts) {
+      check(`dist-17 mcp-server-dental/${f} says «more than 4,500 clinics» and «emergency care»`,
+        /\bmore than 4,500 clinics\b/i.test(t) && /\bemergency care\b/.test(t), t.slice(0, 200));
+      check(`dist-17b mcp-server-dental/${f} has no «5,400+» and no «emergency duty» or «duty»`,
+        !/5,400|\bduty\b|akuttvakt/i.test(t), (t.match(/5,400|\bduty\b|akuttvakt/i) ?? [""])[0]);
+    }
+    const sjDesc = texts[2][1];
+    check("dist-17c dental server.json description fits the registry's 100 characters", sjDesc.length > 0 && sjDesc.length <= 100, String(sjDesc.length));
+  }
+  check("dist-16 opplevagent-mcp is 0.4.0 in every place (0.3.0 was never published)",
+    JSON.parse(read("mcp-server-opplevagent/package.json")).version === "0.4.0"
+    && JSON.parse(read("mcp-server-opplevagent/server.json")).version === "0.4.0"
+    && JSON.parse(read("mcp-server-opplevagent/server.json")).packages[0].version === "0.4.0"
+    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/manifest.json")).version === "0.4.0"
+    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/server.json")).version === "0.4.0");
 
   return { passed, failed, failures };
 }

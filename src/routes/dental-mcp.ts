@@ -28,11 +28,22 @@ import {
   listSpecialistsForClinic,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
-import { planDentalSearch } from "../services/dental-query-parser";
+import {
+  isDentalQueryParserDisabled,
+  parseDentalQuery,
+  planDentalSearch,
+  tolkningFilter,
+  type DentalQueryFilter,
+  type DentalSearchTolkning,
+  type DentalTolkningFilter,
+} from "../services/dental-query-parser";
+import { key as fylkeKey, normaliseFylke } from "../services/norway-fylke";
+import type { PlaceGazetteer } from "../services/search-intent/norwegian-query";
 import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
+import { DENTAL_EMERGENCY_NOTICE } from "../config/dental-landing";
 
 import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
@@ -60,6 +71,12 @@ router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.dental, isKnownSes
 // from BRAND_ENTITIES.dental (A2A dev-request
 // 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S5;
 // dental-mcp-serverinfo-icons.test.ts).
+// The emergency claim (`akutt`) reads the same everywhere it is described, here
+// and in the tool texts below: «Akuttvakt» only with a stored quote from the
+// source (F1-S4c in 2026-10-16-finn-tannlege-fasettsider), otherwise «Tar imot
+// akuttpasienter» (G3-S6d; dental-mcp-instructions.test.ts D11). Since F1-S4e
+// D11 reads the Norwegian «akuttvakt» too, so tannlege_stats glosses the claim
+// as «(akutt)»: «akuttvakt» names only the narrow vakt claim.
 
 /** Server-wide guidance returned from `initialize`, read by clients alongside the tool descriptions. */
 export const DENTAL_MCP_INSTRUCTIONS =
@@ -73,8 +90,9 @@ export const DENTAL_MCP_INSTRUCTIONS =
   "Helfo (`helfo_agreement`) means the clinic has a direct-settlement agreement (direkteoppgjør) with Helfo: " +
   "Helfo's share of a treatment that qualifies for support is settled with the clinic, and the patient pays the " +
   "rest. It does not mean the treatment is free. " +
-  "«Akuttvakt» (`akutt`: \"vakt\") is an emergency duty backed by a recorded source; «Tar imot akuttpasienter» " +
-  "(`akutt`: \"accepts\") only says that the clinic takes emergency patients. " +
+  "An emergency claim (`akutt`) is «Akuttvakt» (`akutt`: \"vakt\"), an emergency duty backed by a stored quote " +
+  "from the source, or «Tar imot akuttpasienter» (`akutt`: \"accepts\"), which only says that the clinic takes " +
+  "emergency patients. " +
   "For acute toothache or a dental injury, give the clinic's phone number and the advice on the municipal " +
   "out-of-hours dental service (kommunal tannlegevakt) from tannlege_akutt. Finn-tannlege gives no medical or " +
   "dental advice. " +
@@ -110,7 +128,7 @@ export const TannlegeSearchInputSchema = {
     "If true, only return clinics with Helfo direct-billing agreement"
   ),
   akutt: z.boolean().optional().describe(
-    "If true, only return clinics with emergency-duty (akuttvakt)"
+    "If true, only return clinics with an emergency claim: «Akuttvakt» backed by a stored source quote, or «Tar imot akuttpasienter»."
   ),
   limit: z.number().min(1).max(25).default(10).describe(
     "Max results (default 10, max 25)"
@@ -144,6 +162,85 @@ export function buildSearchResults(
   agents: ReturnType<typeof listPublicDentalAgents>
 ): SearchResult["klinikker"] {
   return agents.map((a) => toDentalClinicCard(a, "search"));
+}
+
+// ─── tannlege_akutt: how `fylke` is read (S8) ────────────────
+// A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort, S8 (FUNN
+// tannlege-akutt-fylke-ukjent-sted-null): a place normaliseFylke() did not
+// know went to the store as a county and matched no clinic, so «Sandvika»
+// gave nothing and no reason. A county, or a town the store reads as its
+// county (normaliseFylke also reads cityToFylke's towns), still filters as
+// the county, so «Bergen» covers all of Vestland. Any other value is read
+// with tannlege_search's place lookup (parseDentalQuery: poststed, kommune,
+// landsdel …), and only its place is used: the akutt filter applies within
+// it. A value with no place lists nothing; there is no fall back to the whole
+// country. `tolkning` says which of the three it was. Only the answer
+// changes: the tool's title, description and inputSchema are as before
+// (tools/list, D10c in dental-mcp-instructions.test.ts).
+
+/** The parser's filter fields that name a place. Its specialty, Helfo, akutt and name words are not read here. */
+const AKUTT_PLACE_FIELDS = [
+  "poststed_in", "postnummer_in", "poststed_or_postnummer", "fylke", "fylke_in",
+] as const satisfies ReadonlyArray<keyof DentalQueryFilter>;
+
+/** tannlege_akutt's `tolkning`: tannlege_search's form, with `filter` null when no place was found and nothing was searched. */
+export interface DentalAkuttTolkning extends Omit<DentalSearchTolkning, "filter"> {
+  filter: DentalTolkningFilter | null;
+}
+
+export interface DentalAkuttPlan {
+  /** The store filter, or null when the place was not found (nothing is searched, `count` is 0). */
+  filter: Record<string, unknown> | null;
+  /** null without `fylke` and with the parser switched off: the answer is the old one. */
+  tolkning: DentalAkuttTolkning | null;
+}
+
+/**
+ * The store filter and `tolkning` for tannlege_akutt's `fylke` (S8, above).
+ * With DENTAL_QUERY_PARSER_DISABLED the value is a county filter as before
+ * S8, so the parser's switch restores this tool's old answer too.
+ */
+export function planDentalAkutt(fylke: string | undefined, gazetteer: () => PlaceGazetteer): DentalAkuttPlan {
+  // S2b: acute_vakt 1 is the akutt claim in the public store (DENTAL_ACUTE_CLAIM_SQL).
+  const akutt = { acute_vakt: 1 };
+  if (!fylke) return { filter: akutt, tolkning: null };
+  if (isDentalQueryParserDisabled()) return { filter: { ...akutt, fylke }, tolkning: null };
+
+  const sporring = fylke.trim();
+  const plan = (filter: Record<string, unknown> | null, tolket_som: string[]): DentalAkuttPlan => ({
+    filter,
+    tolkning: { sporring, tolket_som, filter: filter && tolkningFilter(filter), fallback: false },
+  });
+
+  // As before S8: the value itself, which the store folds with normaliseFylke.
+  const county = normaliseFylke(fylke);
+  if (county) {
+    const line = fylkeKey(sporring) === fylkeKey(county) ? `sted: ${county} (fylke)` : `sted: ${county} (fylke; «${sporring}»)`;
+    return plan({ ...akutt, fylke }, [line, "akutt: ja"]);
+  }
+
+  const parsed = parseDentalQuery(sporring, gazetteer());
+  const place = Object.fromEntries(
+    AKUTT_PLACE_FIELDS.filter((field) => parsed.filter[field] !== undefined).map((field) => [field, parsed.filter[field]])
+  );
+  // No place: a word the parser does not know as one, or a poststed with no
+  // clinic (the parser's poststeder are the catalog's).
+  if (Object.keys(place).length === 0) {
+    return plan(null, [
+      `sted: ukjent («${sporring}»)`,
+      `merknad: «${sporring}» ble ikke funnet som fylke, kommune eller poststed med tannklinikker, så ingen klinikker er listet; ` +
+        "tannlege_search med stedet i query og akutt: true kan prøves, eller tannlege_akutt uten fylke for hele landet",
+    ]);
+  }
+  // The parser's line for the place it used. Anything else it read (a
+  // specialty, name words, a second place) is not used here, and is noted.
+  const isPlaceLine = (line: string) => line.startsWith("sted: ");
+  const rest = parsed.interpretation.some((line) => !isPlaceLine(line) && line !== "akutt: ja");
+  return plan({ ...akutt, ...place }, [
+    ...parsed.interpretation.filter(isPlaceLine),
+    "akutt: ja",
+    ...(rest ? ["merknad: bare stedet brukes, ikke resten av teksten"] : []),
+  ]);
 }
 
 /**
@@ -256,9 +353,10 @@ export function registerDentalTools(server: McpServer): void {
       description:
         "Get the full record of one dental clinic in Norway, a dentist (tannlege) or specialist practice, " +
         "by organisation number (org_nr) or id. " +
-        "Returns name, address, phone, mobile, e-mail, website, online booking link, Helfo status, emergency duty " +
-        "when it has a recorded source, specialties, chain, specialists, treatments, opening hours, payment options, " +
-        "the clinic's own description and profile URL.",
+        "Returns name, address, phone, mobile, e-mail, website, online booking link, Helfo status, the emergency " +
+        "claim («Akuttvakt» only when an emergency duty has a stored quote from the source; «Tar imot " +
+        "akuttpasienter» when the clinic says it takes emergency patients), specialties, chain, specialists, " +
+        "treatments, opening hours, payment options, the clinic's own description and profile URL.",
       inputSchema: TannlegeInfoInputSchema,
       annotations: {
         title: "Get dental clinic details",
@@ -292,7 +390,7 @@ export function registerDentalTools(server: McpServer): void {
         }
 
         // The detail card: the keys this tool has always returned, with the
-        // phone, acute_vakt (Skive B: only with provenance) and profile-link
+        // phone, acute_vakt (only with «Akuttvakt», F1-S4c) and profile-link
         // rules of the search card.
         const result = toDentalClinicCard(agent, "detail", { specialists: listSpecialistsForClinic(agent.id) });
 
@@ -313,9 +411,9 @@ export function registerDentalTools(server: McpServer): void {
       title: "Norwegian dental market statistics",
       description:
         "Counts of dentist practices (tannlegeklinikker) in Norway: the total, per county (fylke), and how many " +
-        "have Helfo direct billing, belong to a chain, show an emergency claim (akuttvakt) or list a specialist. " +
-        "An emergency claim is an emergency duty with a recorded source (akuttvakt), or that the clinic says it " +
-        "takes emergency patients.",
+        "have Helfo direct billing, belong to a chain, show an emergency claim (akutt) or list a specialist. " +
+        "An emergency claim is «Akuttvakt», an emergency duty backed by a stored quote from the source, or «Tar " +
+        "imot akuttpasienter», that the clinic says it takes emergency patients.",
       inputSchema: {},
       annotations: {
         title: "Norwegian dental market statistics",
@@ -334,8 +432,9 @@ export function registerDentalTools(server: McpServer): void {
             total: "Totalt antall tannlegeklinikker i databasen (ekskl. avviste).",
             helfo_count: "Antall klinikker med Helfo-direkteoppgjørsavtale.",
             chain_count: "Antall klinikker som er del av en kjede.",
+            // «Akuttvakt» only with a stored quote (F1-S4c), as the tool texts say; response text, not tools/list (F1-S4e round 3).
             acute_count:
-              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med kilde) eller «Tar imot akuttpasienter». " +
+              "Antall klinikker som viser akuttpåstand på kortet: «Akuttvakt» (med lagret sitat) eller «Tar imot akuttpasienter». " +
               "Samme tall som tannlege_akutt.count og /sok?akutt=1.",
             specialist_clinic_count: "Antall klinikker der minst én spesialist er registrert.",
             per_fylke: "Fordeling per norsk fylke, sortert etter antall.",
@@ -354,18 +453,18 @@ export function registerDentalTools(server: McpServer): void {
   server.registerTool(
     "tannlege_akutt",
     {
-      title: "Find emergency-duty dental clinics in Norway",
+      title: "Find dental clinics for emergency care in Norway",
       description:
-        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics with an emergency duty that has a " +
-        "recorded source (akuttvakt) or that say they take emergency patients, optionally in one county (fylke). " +
-        "Each clinic's `akutt` is \"vakt\" when the emergency duty has a recorded source (badge «Akuttvakt») and " +
-        "\"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»). " +
+        "Find an emergency dentist (akutt tannlege) in Norway: dental clinics that say they take emergency " +
+        "patients, optionally in one county (fylke). " +
+        "Each clinic's `akutt` is \"vakt\" only when its emergency duty has a stored quote from the source (badge " +
+        "«Akuttvakt»), and \"accepts\" when the clinic says it takes emergency patients («Tar imot akuttpasienter»). " +
         "`count` is the number of matching clinics. " +
         "Each clinic has its address, phone and profile URL, and when known its opening hours and online booking " +
         "link. The response also has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
       inputSchema: TannlegeAkuttInputSchema,
       annotations: {
-        title: "Find emergency-duty dental clinics",
+        title: "Find dental clinics for emergency care",
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -378,23 +477,27 @@ export function registerDentalTools(server: McpServer): void {
       try {
         // S2b: the public store reads acute_vakt 1 as the akutt claim
         // (DENTAL_ACUTE_CLAIM_SQL), so `count` and every card here are clinics
-        // whose `akutt` is "vakt" or "accepts", never a bare flag.
-        const filter: Record<string, unknown> = { acute_vakt: 1 };
-        if (fylke) filter.fylke = fylke;
+        // whose `akutt` is "vakt" or "accepts", never a bare flag. S8: `fylke`
+        // is a county, or else a place read as tannlege_search reads one
+        // (planDentalAkutt); for a place that is not found the filter is null
+        // and nothing is searched.
+        const { filter, tolkning } = planDentalAkutt(fylke, () => getDentalSearchGazetteer(listPoststeder));
 
-        const agents = listPublicDentalAgents(filter as any, 25);
-        const total = countPublicDentalAgents(filter as any);
+        const agents = filter ? listPublicDentalAgents(filter as any, 25) : [];
+        const total = filter ? countPublicDentalAgents(filter as any) : 0;
         const klinikker = buildSearchResults(agents);
 
-        const advice =
-          "Mange kommuner har kommunal tannlegevakt på kvelder og helger — " +
-          "ring klinikken direkte for å bekrefte åpningstider og tilgjengelighet. " +
-          "Klinikker med Akuttvakt-merke setter som regel av tid til akuttpasienter på kort varsel.";
-
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4c): the
+        // advice is the reviewed emergency notice of the tannlegevakt pages
+        // (113, legevakten 116 117, the local tannlegevakt and the caveat of
+        // /vilkar pkt. 3), not a claim about what clinics with a badge do.
+        // `tolkning` (S8, only when `fylke` was read) comes last, so the keys
+        // before it are the answer as it was.
         const result = {
           count: total,
           klinikker,
-          rad_om_kommunal_tannlegevakt: advice,
+          rad_om_kommunal_tannlegevakt: DENTAL_EMERGENCY_NOTICE.text,
+          ...(tolkning ? { tolkning } : {}),
         };
 
         // Compact JSON, as tannlege_search: up to 25 cards.

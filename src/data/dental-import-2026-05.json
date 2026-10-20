@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "description": "Counts from Finn-tannlege's one-time Phase A import: one search of Enhetsregisteret (Brønnøysundregistrene) by industry code, and the entries taken from an online directory and merged into it. Counts only: no rows, no names and no contact details.",
+    "dev_request": "A2A dev-requests/2026-10-16-finn-tannlege-tillit-kilder-metode-ikon.md, F2-S9",
+    "source": "A2A dental-phase-a/dental-merge-report-all.md (input and match counts), dental-phase-a/A1-brreg-summary.csv (industry codes) and PHASE6-DENTAL-VERTICAL.md (run date)",
+    "run_date": "2026-05-27",
+    "per_field_source_stored": false,
+    "note": "The import ran outside this repository (A2A dental-phase-a/merge.py and bulk-insert.py) and stored no source per field. The directory is not named here until Daniel has decided what happens to its data (A2A FUNN dental-katalogimport-valg-hos-daniel). Read by dental-sources-truth.test.ts only; no route serves this file."
+  },
+  "enhetsregisteret_search": {
+    "naeringskoder": ["86.230", "86.221", "32.500"],
+    "entities": 6247,
+    "entities_by_first_industry_code": { "86.230": 5890, "32.500": 332, "86.221": 22, "other": 3 }
+  },
+  "directory_import": {
+    "entries_fetched": 2803,
+    "entries_added_without_orgnr": 821,
+    "entries_matched_to_orgnr_rows": { "by_phone": 1109, "by_name_and_postcode": 620 },
+    "entries_not_used": 253,
+    "orgnr_rows_filled": 1466,
+    "fields_on_rows_without_orgnr": ["navn", "adresse", "postnummer", "poststed", "fylke", "telefon", "hjemmeside"],
+    "fields_filled_on_orgnr_rows_when_empty": ["adresse", "telefon", "hjemmeside"]
+  }
+}

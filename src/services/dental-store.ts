@@ -43,11 +43,15 @@ import { escapeLike } from "./search-intent/norwegian-query";
 import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-search-vocabulary";
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
-import { DENTAL_ACUTE_CLAIM_SQL } from "./dental-acute-claim";
+import { DENTAL_ACUTE_CLAIM_SQL, DENTAL_ACUTE_VAKT_SQL } from "./dental-acute-claim";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (A4-D): the sitemap's thin-profile check reads the values the
 // clinic page shows. dental-places-display.ts imports only types from here.
 import { shownDentalAgent } from "./dental-places-display";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// on public surfaces «verified» (filter, order) is the read-time claim, and
+// hydrateAgent carries what the claim reads. The module imports no store.
+import { countRichFields, dentalVerifiedClaimSql } from "./dental-verified-claim";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -244,6 +248,11 @@ const ListFilterFieldsSchema = z.object({
   postnummer_in: PostnummerInSchema.optional(),
   fylke_in: z.array(z.string().min(1).max(100)).min(1).max(8).optional(),
   poststed_or_postnummer: z.object({ poststed_in: PoststedInSchema, postnummer_in: PostnummerInSchema }).optional(),
+  // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4): "vakt" =
+  // only clinics whose card shows «Akuttvakt» with a source
+  // (DENTAL_ACUTE_VAKT_SQL), for the tannlegevakt pages. Not read from GET
+  // /agents query params; acute_vakt above keeps its meaning.
+  acute_claim: z.literal("vakt").optional(),
 });
 type ListFilterFields = z.infer<typeof ListFilterFieldsSchema>;
 
@@ -320,7 +329,43 @@ function stringifyJsonOrNull(value: unknown): string | null {
 // leave it out. dev-request 2026-10-18-dental-privat-adresse-skjules:
 // organisasjonsform is always hydrated (null when unknown) and required here,
 // because the private-address rule reads it.
-export type DentalAgentRow = DentalAgent & { id: string; organisasjonsform: string | null; stage_v_pending_correction?: unknown };
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// three more read-only side values for the «Verifisert» claim
+// (resolveVerifiedClaim, dental-verified-claim.ts), left out of the same
+// answers (withoutDentalSideColumns): the verifier's stored brreg_status and
+// website_ownership, and rich_field_count, countRichFields over the stored
+// text of a row stored as 'verified' (null otherwise, where the claim does
+// not read it). A hydrated row has parsed its JSON columns, and malformed
+// JSON is null there, so the count of the stored text, which the verifier
+// and the SQL twin use, cannot be taken from the parsed values.
+export type DentalAgentRow = DentalAgent & {
+  id: string;
+  organisasjonsform: string | null;
+  stage_v_pending_correction?: unknown;
+  brreg_status?: string | null;
+  website_ownership?: string | null;
+  rich_field_count?: number | null;
+};
+
+/** The read-only side values above, which no answer that spreads a row passes on. */
+export type DentalSideColumn = "stage_v_pending_correction" | "brreg_status" | "website_ownership" | "rich_field_count";
+
+/**
+ * A row without the read-only side values (DentalAgentRow), for an answer
+ * that spreads it: REST GET /agents and /agents/:id (routes/dental.ts, the
+ * admin view included) and A2A (dental-clinic-card.ts). The other keys keep
+ * their order.
+ */
+export function withoutDentalSideColumns<T extends Partial<Record<DentalSideColumn, unknown>>>(row: T): Omit<T, DentalSideColumn> {
+  const {
+    stage_v_pending_correction: _pending,
+    brreg_status: _brreg,
+    website_ownership: _ownership,
+    rich_field_count: _rich,
+    ...rest
+  } = row;
+  return rest;
+}
 
 // Hydrate raw SQLite row into a typed DentalAgent (parses JSON cols).
 function hydrateAgent(row: Record<string, unknown>): DentalAgentRow {
@@ -399,6 +444,27 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgentRow {
 
     // ─── A4-D: read-only side column (see DentalAgentRow) ──────────────
     stage_v_pending_correction: parseJsonOrNull(row.stage_v_pending_correction),
+
+    // ─── F2-S8: read-only side values for the «Verifisert» claim ───────
+    brreg_status: (row.brreg_status as string | null) ?? null,
+    website_ownership: (row.website_ownership as string | null) ?? null,
+    rich_field_count: row.verification_status === "verified" ? countRichFields(row) : null,
+  };
+}
+
+/**
+ * The two columns clinicSpecialties() reads, parsed exactly as hydrateAgent
+ * parses them. dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3):
+ * the /sted and /fylke specialist count (dental-area-facts.ts) runs the
+ * cards' own predicate over raw rows without hydrating every column.
+ */
+export function hydrateSpecialtySource(row: {
+  available_specialties?: unknown;
+  specialists?: unknown;
+}): Pick<DentalAgent, "available_specialties" | "specialists"> {
+  return {
+    available_specialties: parseJsonArray(row.available_specialties),
+    specialists: parseJsonOrNull(row.specialists) as DentalAgent["specialists"],
   };
 }
 
@@ -593,6 +659,7 @@ function pushFreeTextClause(
 //   publicOnly        visitor-facing surfaces: no rejected or closed clinics,
 //                     no proven non-clinic (DENTAL_CLINIC_CLASS_SQL), a
 //                     verification_status filter of 'rejected' is ignored,
+//                     'verified' means the «Verifisert» claim (F2-S8, below)
 //                     and acute_vakt 1 means the akutt claim (S2b, below).
 //   excludeParked     GET /agents?exclude_parked=1 (enrichment candidates).
 //   excludeNonClinic  GET /discover's opt-in catalog_class filter.
@@ -652,6 +719,23 @@ export function buildDentalWhere(
   return { where, params, orderFirst };
 }
 
+/**
+ * The clauses the field filters in `filter` add to a public WHERE (the
+ * publicOnly base clauses not included), as one SQL condition, with every
+ * parameter name prefixed by `prefix`. For an aggregate that counts a subset
+ * in the same scan as the whole: the facet columns of the dental area facts
+ * (A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4) count a
+ * facet with the very SQL its page lists the clinics with
+ * (listPublicDentalAgents({ ...place, ...facet })). "1" when the filter sets
+ * no field. `natural` is not read.
+ */
+export function dentalPublicFilterClauses(filter: ListFilter, prefix: string): { sql: string; params: Record<string, unknown> } {
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+  pushFieldClauses(where, params, ListFilterFieldsSchema.parse(filter), { publicOnly: true }, prefix);
+  return { sql: where.length > 0 ? `(${where.join(" AND ")})` : "1", params };
+}
+
 // The clauses for the field filters, AND-ed into `where`. `p` prefixes every
 // parameter name ("" for the top level), so the branches of `natural` can
 // carry the same fields without a name clash.
@@ -675,8 +759,20 @@ function pushFieldClauses(
     params[`${p}chain_brand`] = f.chain_brand;
   }
   if (f.verification_status && !(opts.publicOnly && f.verification_status === "rejected")) {
-    where.push(`verification_status = @${p}verification_status`);
-    params[`${p}verification_status`] = f.verification_status;
+    // F2-S8: on a public surface the filter lists the clinics whose answer
+    // has the status asked for (shownVerificationStatus): «verified» is the
+    // claim, and a stored 'verified' the claim hides answers
+    // 'pending_verify'. GET /agents (admin, enrichment) keeps the column.
+    const claim = dentalVerifiedClaimSql();
+    if (opts.publicOnly && f.verification_status === "verified") {
+      where.push(claim);
+    } else if (opts.publicOnly && f.verification_status === "pending_verify") {
+      where.push(`(verification_status = @${p}verification_status OR (verification_status = 'verified' AND NOT ${claim}))`);
+      params[`${p}verification_status`] = f.verification_status;
+    } else {
+      where.push(`verification_status = @${p}verification_status`);
+      params[`${p}verification_status`] = f.verification_status;
+    }
   }
   if (f.specialty) {
     pushSpecialtyClause(where, params, f.specialty, `${p}specialty`);
@@ -700,6 +796,9 @@ function pushFieldClauses(
   } else if (f.acute_vakt !== undefined) {
     where.push(`acute_vakt = @${p}acute_vakt`);
     params[`${p}acute_vakt`] = f.acute_vakt;
+  }
+  if (f.acute_claim === "vakt") {
+    where.push(DENTAL_ACUTE_VAKT_SQL);
   }
   if (f.enrichment_state !== undefined) {
     where.push(`enrichment_state = @${p}enrichment_state`);
@@ -1375,6 +1474,11 @@ export function recordStageVFieldObservation(
         /* tolerate junk */
       }
     }
+    // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: the
+    // audit entries other routes write into the column (`inactive`, the
+    // hjemmeside cleanup's, the offentlig klinikk correction's
+    // `directory_url`) are kept as stored, as in the dental PUT
+    // (keepAuditEntries).
     const mergedProv = mergeFieldProvenance(existingProv, {
       [field]: {
         sources: [
@@ -1385,7 +1489,7 @@ export function recordStageVFieldObservation(
           },
         ],
       },
-    });
+    }, { keepAuditEntries: true });
 
     delete pendingMap[field];
     db.prepare(
@@ -1504,8 +1608,9 @@ export function isThinDentalProfile(
 /**
  * Public-facing list: same WHERE building as listDentalAgents but
  * ALWAYS excludes verification_status='rejected', and applies a
- * quality-first sort: verified first, then enriched, then those with
- * website or phone, then alphabetically.
+ * quality-first sort: after a free-text query's `legacy` matches, the
+ * clinics that show «Verifisert» first (the read-time claim, F2-S8), then
+ * enriched, then those with website or phone, then alphabetically.
  */
 export function listPublicDentalAgents(
   filter: ListFilter = {},
@@ -1523,7 +1628,7 @@ export function listPublicDentalAgents(
     ` WHERE ${where.join(" AND ")}` +
     " ORDER BY" +
     orderFirst.map((o) => ` ${o},`).join("") +
-    "  CASE verification_status WHEN 'verified' THEN 0 ELSE 1 END ASC," +
+    `  CASE WHEN ${dentalVerifiedClaimSql()} THEN 0 ELSE 1 END ASC,` +
     "  CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC," +
     "  CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC," +
     "  navn ASC" +
@@ -2453,7 +2558,7 @@ export function listRelatedClinics(
       ${catalogClassClause}
       AND ${DENTAL_NOT_SYNTHETIC_PROBE_SQL}
     ORDER BY
-      CASE verification_status WHEN 'verified' THEN 0 ELSE 1 END ASC,
+      CASE WHEN ${dentalVerifiedClaimSql()} THEN 0 ELSE 1 END ASC,
       CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC,
       CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC,
       navn ASC

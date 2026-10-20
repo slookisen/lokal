@@ -424,8 +424,11 @@ export async function runRfbHiddenTestProducerTests(opts: { log?: boolean } = {}
       if (surface.startsWith("__")) continue;
       assertTrue(ids.includes(NORMAL_ID), `ac3-control: normal row present on ${surface} (got ${JSON.stringify(ids)})`);
       assertTrue(ids.includes(LEGACY_ID), `ac3-control: not-yet-hidden fixture present on ${surface} — the hidden-phase check below is not vacuous (got ${JSON.stringify(ids)})`);
-      if (VERIFIER_SURFACES.has(surface)) {
-        assertTrue(ids.includes(DENTAL_ID), `vertical: verifier pickers are hidden-only — dental row still picked by ${surface} (vertical behaviour unchanged)`);
+      if (surface === "verifier_pickByIds") {
+        assertTrue(ids.includes(DENTAL_ID), `vertical: explicit-id picker is hidden-only — dental row still picked by ${surface} (vertical behaviour unchanged)`);
+      } else if (VERIFIER_SURFACES.has(surface)) {
+        // dev-request 2026-10-01 C6: the sweep pickers now keep other verticals out.
+        assertTrue(!ids.includes(DENTAL_ID), `vertical: dental row not picked by sweep picker ${surface} (C6 RFB scope)`);
       } else {
         assertTrue(!ids.includes(DENTAL_ID), `vertical: dental-vertical row absent from RFB surface ${surface} (got ${JSON.stringify(ids)})`);
       }

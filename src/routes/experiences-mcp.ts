@@ -49,6 +49,7 @@
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
 import { outsideNorwayPlace } from "../services/outside-norway";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -204,7 +205,7 @@ export function buildExperienceVisibilityFields(e: {
           name: cleanStr(p.navn),
           org_nr: cleanStr(p.org_nr),
           website: cleanHttpUrl(p.hjemmeside),
-          phone: cleanStr(p.telefon),
+          phone: isDisplayablePhone(cleanStr(p.telefon)) ? cleanStr(p.telefon) : null,
         };
       }
     } catch { /* provider lookup is best-effort; the experience is still returned */ }
@@ -932,7 +933,7 @@ export function registerExperienceTools(
           description: e.description
             ? e.description.slice(0, 300) + (e.description.length > 300 ? "…" : "")
             : null,
-          booking_url: e.booking_url ?? null,
+          booking_url: cleanHttpUrl(e.booking_url),
           booking_type: e.booking_type ?? null,
           ...buildExperienceVisibilityFields(e),
           tags: e.tags ?? [],
@@ -1130,7 +1131,7 @@ export function registerExperienceTools(
           price_unit: experience.price_unit ?? null,
           languages: experience.languages ?? [],
           accessibility: experience.accessibility ?? [],
-          booking_url: experience.booking_url ?? null,
+          booking_url: cleanHttpUrl(experience.booking_url),
           booking_type: experience.booking_type ?? null,
           ...buildExperienceVisibilityFields(experience),
           meeting_point: experience.meeting_point ?? null,

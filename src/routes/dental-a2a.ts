@@ -442,7 +442,7 @@ export function handleDentalMessageSend(
           name: "dental-search-results",
           // dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4b):
           // the stored row with untrue values made honest (displayable phones,
-          // acute_vakt only with provenance), no rating fields or
+          // acute_vakt only with «Akuttvakt», F1-S4c), no rating fields or
           // field_provenance, plus the search card shared with MCP. count is
           // the clinics in this answer; total (D3c) every clinic that matches.
           parts: [{ kind: "data", data: { count: results.length, total, clinics: results.map(toDentalA2aClinic) } }],

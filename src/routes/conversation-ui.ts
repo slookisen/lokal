@@ -525,6 +525,7 @@ const CHAT_CSS = `
   .hv-chatgpt { background: #dcfce7; color: #15803d; }
   .hv-perplexity { background: #f3e8ff; color: #7c3aed; }
   .hv-gemini { background: #e0e7ff; color: #4338ca; }
+  .hv-ai { background: #dcfce7; color: #15803d; }
   .hv-duckduckgo { background: #fef3c7; color: #b45309; }
   .hv-sosial { background: #e0f2fe; color: #0369a1; }
 
@@ -637,6 +638,7 @@ function humanSourceIcon(key: string): string {
     perplexity: "&#128302;",  // 🔮
     gemini: "&#10024;",       // ✨
     copilot: "&#129302;",     // 🤖
+    ai: "&#129302;",          // 🤖 (all AI assistants grouped, aggregateHumanReferrals)
     sosial: "&#128241;",      // 📱
     annet: "&#127760;",       // 🌐
   };

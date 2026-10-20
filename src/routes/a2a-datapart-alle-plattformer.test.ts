@@ -30,7 +30,9 @@
  *       captured with b1Answers() below on main 58d5974e.
  *
  * Data: own in-memory DBs (main, dental, experiences; restored in finally),
- * the real routers through router.handle() (no HTTP server, no network).
+ * the real routers through router.handle() (no HTTP server, no network:
+ * Kartverket is a stub that knows no name, since RFB A2A looks the place of
+ * a text up as of slice I-AA).
  * MCP tools and the agent cards are not touched by I-X; their freezes are
  * rfb-mcp-contract-freeze.test.ts, opplevagent-mcp-contract-freeze.test.ts,
  * dental-mcp-instructions.test.ts and dental-agent-card.test.ts.
@@ -215,8 +217,15 @@ function enterFixtures(): Fixtures {
     require.resolve("./experiences-a2a"),
   ]);
   const { a2aConversationCap } = require("../services/a2a-traffic-classifier") as typeof import("../services/a2a-traffic-classifier");
+  // Slice I-AA: RFB A2A looks up the place of «honning i Oslo». Offline, only
+  // the built-in places resolve, as when Kartverket knows no such name.
+  const geo = require("../services/geocoding-service") as typeof import("../services/geocoding-service");
+  geo.__setGeocodingFetchForTesting((async () => ({ ok: false, status: 404, json: async () => ({}) } as Response)) as typeof fetch);
+  geo.__clearGeocodeCacheForTesting();
   const restore = () => {
     a2aConversationCap.reset();
+    geo.__setGeocodingFetchForTesting();
+    geo.__clearGeocodeCacheForTesting();
     try {
       (require("../database/db-factory") as typeof import("../database/db-factory")).__resetDbFactoryForTesting();
     } catch {

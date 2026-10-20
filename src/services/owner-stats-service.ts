@@ -289,17 +289,65 @@ function getConversationsByChannel(db: Database.Database, agentId: string): Owne
  * click intent, not confirmed contact (see dev-request spec).
  */
 function getContactClicksByKind(db: Database.Database, agentId: string, windowDays: number): OwnerStatsClickKindCount[] {
+  return countContactClicksByKind(db, agentId, { days: windowDays });
+}
+
+/**
+ * Window for contact-click reads: either "last N days" (the owner-stats
+ * shape) or an explicit calendar range (YYYY-MM-DD, `to` inclusive).
+ */
+export type ContactClickWindow = { days: number } | { from: string; to: string };
+
+function contactClickWindowSql(win: ContactClickWindow): { sql: string; params: string[] } {
+  if ("days" in win) return { sql: `created_at >= datetime('now', ?)`, params: [`-${win.days} days`] };
+  return { sql: `created_at >= ? AND created_at < date(?, '+1 day')`, params: [win.from, win.to] };
+}
+
+/**
+ * Shared by owner-stats (days window) and the admin partner-report (days or
+ * from/to window) so both read contact_clicks with identical semantics:
+ * is_bot = 0, grouped by kind, count desc.
+ */
+export function countContactClicksByKind(
+  db: Database.Database,
+  agentId: string,
+  win: ContactClickWindow,
+): OwnerStatsClickKindCount[] {
+  const w = contactClickWindowSql(win);
   const rows = db
     .prepare(
       `SELECT kind, COUNT(*) as cnt
        FROM contact_clicks
        WHERE agent_id = ? AND is_bot = 0
-         AND created_at >= datetime('now', ?)
+         AND ${w.sql}
        GROUP BY kind
        ORDER BY cnt DESC`,
     )
-    .all(agentId, `-${windowDays} days`) as Array<{ kind: string; cnt: number }>;
+    .all(agentId, ...w.params) as Array<{ kind: string; cnt: number }>;
   return rows.map((r) => ({ kind: r.kind, count: r.cnt }));
+}
+
+/**
+ * Same filter as countContactClicksByKind, grouped by utm_source instead
+ * (NULL/empty -> "(none)"). Aggregates only — never session_id.
+ */
+export function countContactClicksByUtmSource(
+  db: Database.Database,
+  agentId: string,
+  win: ContactClickWindow,
+): Array<{ source: string; count: number }> {
+  const w = contactClickWindowSql(win);
+  const rows = db
+    .prepare(
+      `SELECT COALESCE(NULLIF(utm_source, ''), '(none)') AS src, COUNT(*) as cnt
+       FROM contact_clicks
+       WHERE agent_id = ? AND is_bot = 0
+         AND ${w.sql}
+       GROUP BY src
+       ORDER BY cnt DESC, src ASC`,
+    )
+    .all(agentId, ...w.params) as Array<{ src: string; cnt: number }>;
+  return rows.map((r) => ({ source: r.src, count: r.cnt }));
 }
 
 /**

@@ -324,6 +324,69 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         const row = (r.body.changed as any[]).find((c) => c.id === "pv-bare");
         assertEq(row?.blocklist_inserted, 0, "pv-12b: blocklist_inserted is 0, not undefined/absent — the write was attempted, just had nothing to insert");
       }
+
+      // ── pv-13 (dev-request 2026-10-01-opplevagent-skjul-uten-sperre): mode. ─
+      {
+        const ins = (id: string, org: string, web: string, mail: string) =>
+          expDb.prepare(
+            `INSERT INTO experience_providers
+               (id, navn, vertical, org_nr, hjemmeside, epost, catalog_hidden, content_source, products,
+                producer_type, enrichment_state, verification_status, source, confidence)
+             VALUES (?, ?, 'experiences', ?, ?, ?, NULL, NULL, '["x"]', 'sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+          ).run(id, id, org, web, mail);
+        const reasonOf = (id: string): string | null =>
+          (expDb.prepare(`SELECT catalog_hidden_reason r FROM experience_providers WHERE id = ?`).get(id) as any).r;
+        const blCount = (): number =>
+          (initMod.getDb().prepare(`SELECT COUNT(*) c FROM agent_blocklist`).get() as any).c;
+        ins("pv-q", "966000071", "https://kvalitet-gard.no", "post@kvalitet-gard.no");
+        ins("pv-r", "966000072", "https://fjernoss-gard.no", "post@fjernoss-gard.no");
+        ins("pv-s", "966000073", "https://ukjent-gard.no", "post@ukjent-gard.no");
+        ins("pv-t", "966000074", "https://toerr-gard.no", "post@toerr-gard.no");
+
+        // unknown mode → 400, nothing written
+        const bad = await callRoute(opplevelserRouter, {
+          headers: adminHeaders, body: { hidden: true, providerIds: ["pv-s"], mode: "bogus", apply: true },
+        });
+        assertEq(bad.status, 400, "pv-13a: unknown mode → 400");
+        assertEq(hiddenFlag("pv-s"), null, "pv-13b: unknown mode wrote nothing");
+
+        // dry-run with mode quality writes nothing
+        const before = blCount();
+        const dry = await callRoute(opplevelserRouter, {
+          headers: adminHeaders, body: { hidden: true, providerIds: ["pv-t"], mode: "quality" },
+        });
+        assertEq(dry.body.dry_run, true, "pv-13c: dry-run");
+        assertEq(dry.body.mode, "quality", "pv-13d: dry-run reports mode");
+        assertEq(hiddenFlag("pv-t"), null, "pv-13e: dry-run wrote no flag");
+        assertEq(reasonOf("pv-t"), null, "pv-13f: dry-run wrote no reason");
+        assertEq(blCount(), before, "pv-13g: dry-run wrote no blocklist rows");
+
+        // quality apply: hidden, reason stored, 0 blocklist rows
+        const q = await callRoute(opplevelserRouter, {
+          headers: adminHeaders, body: { hidden: true, providerIds: ["pv-q"], mode: "quality", apply: true },
+        });
+        assertEq(q.body.mode, "quality", "pv-13h: response carries mode");
+        assertEq(q.body.changed_count, 1, "pv-13i: quality hide changed row");
+        assertEq(hiddenFlag("pv-q"), 1, "pv-13j: catalog_hidden = 1");
+        assertEq(reasonOf("pv-q"), "quality", "pv-13k: reason stored as quality");
+        assertEq(q.body.blocklist_inserted_total, 0, "pv-13l: blocklist_inserted_total is 0 in quality");
+        assertEq(blCount(), before, "pv-13m: quality adds 0 blocklist rows");
+        assertTrue(!blocklistSvc.isBlocked({ orgNr: "966000071" }).blocked, "pv-13n: quality producer not blocked");
+
+        // default and explicit remove_request behave as before
+        const rr = await callRoute(opplevelserRouter, {
+          headers: adminHeaders, body: { hidden: true, providerIds: ["pv-r"], mode: "remove_request", apply: true },
+        });
+        assertEq(rr.body.mode, "remove_request", "pv-13o: explicit remove_request reported");
+        assertEq(rr.body.blocklist_inserted_total, 3, "pv-13p: remove_request blocklists all 3 identifiers");
+        assertEq(reasonOf("pv-r"), "remove_request", "pv-13q: reason stored as remove_request");
+        assertEq(blCount(), before + 3, "pv-13r: 3 blocklist rows added");
+        const def = await callRoute(opplevelserRouter, {
+          headers: adminHeaders, body: { hidden: false, providerIds: ["pv-r"], apply: true },
+        });
+        assertEq(def.body.mode, "remove_request", "pv-13s: default mode is remove_request");
+        assertEq(reasonOf("pv-r"), null, "pv-13t: unhide clears the reason");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-provider-visibility: unexpected error: " + String(err?.stack || err?.message || err));

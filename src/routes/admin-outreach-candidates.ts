@@ -38,7 +38,7 @@
 //      Idempotent: rows with the same message_id are skipped.
 
 import { Router, Request, Response } from "express";
-import { getDb, isContentQualified, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
+import { getDb, isContentQualified, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE, POOL_RETAIL_SHOP_GATE_SQL, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { customerRuleSql } from "../services/customer-rule";
 import { publicListableSql } from "../services/agent-visibility";
@@ -233,6 +233,11 @@ export interface CoreEligibilityRow {
   // them entirely.
   about?: string | null | undefined;
   products?: string | unknown[] | null | undefined;
+  // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop gate
+  // inputs (see retailShopPoolBlockers, database/init.ts). Omitted = unmarked.
+  business_type?: string | null | undefined;
+  retail_focus?: string | null | undefined;
+  field_provenance?: string | null | undefined;
 }
 
 export function coreEligibilityCheck(
@@ -273,6 +278,10 @@ export function coreEligibilityCheck(
   }
   if (row.umbrella_type !== null && row.umbrella_type !== undefined) {
     return { ok: false, failedCondition: "umbrella_type_not_null" };
+  }
+  const retailBlockers = retailShopPoolBlockers(row);
+  if (retailBlockers.length > 0) {
+    return { ok: false, failedCondition: retailBlockers[0] };
   }
   return { ok: true, failedCondition: null };
 }
@@ -529,6 +538,9 @@ export function computeOutreachCandidates(
           -- dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt:
           -- mirrors the VIEW's shared public-listability predicate too.
           AND ${publicListableSql("a")}
+          -- dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: mirrors the
+          -- VIEW's retail-shop gate (a re-touch must not reach a shop either).
+          AND ${POOL_RETAIL_SHOP_GATE_SQL}
           AND k.verification_status = 'verified'
           AND k.enrichment_status = 'rich'
           AND k.url_last_status IS NOT NULL
@@ -1007,7 +1019,10 @@ export function computeOutreachCandidates(
           k.email,
           a.umbrella_type,
           k.about,
-          k.products
+          k.products,
+          a.business_type,
+          a.retail_focus,
+          k.field_provenance
         FROM agents a
         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id IN (${placeholders})
@@ -1019,6 +1034,9 @@ export function computeOutreachCandidates(
         umbrella_type: string | null;
         about: string | null;
         products: string | null;
+        business_type: string | null;
+        retail_focus: string | null;
+        field_provenance: string | null;
       }>;
       const recheckById = new Map(recheckRows.map((r) => [r.agent_id, r]));
 

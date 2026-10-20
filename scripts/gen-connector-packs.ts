@@ -50,6 +50,22 @@ export const PACK_FILES = ["README.md", "claude-directory/listing.md", "claude-d
 export const LIMITS = { name: 100, oneLiner: 200, description: 2000 } as const;
 
 /**
+ * The portal as Daniel filled it in for Finn-tannlege (his run of prompt 11 on 2026-10-19, short of submitting;
+ * A2A daniel-responses/2026-10-19-live-svar-token-rotert-og-prompt-11.md), for a pack whose `portalChecked` is
+ * set: the fields it has, those it has none for, and the limits of its Use cases step. A checked pack marks its
+ * texts for PORTAL_HAS_NO_FIELD with ONLY_IF_ASKED, for a reviewer who asks.
+ */
+export const PORTAL_FIELDS = [
+  "Name", "Slug", "One-liner", "Description", "Categories", "Icon", "Documentation", "Support", "Privacy policy",
+  "Use cases", "Prerequisites", "Read/write", "Company", "Test setup instructions",
+] as const;
+export const PORTAL_HAS_NO_FIELD = [
+  "terms", "known caveats", "an explanation of authentication", "data-handling text", "a test account", "language", "price",
+] as const;
+export const USE_CASE_LIMITS = { rows: 3, useCase: 100, example: 500 } as const;
+export const ONLY_IF_ASKED = "**Use only if the portal asks.** It has no field for this.";
+
+/**
  * Description wording the directory rejects as prompt injection ("describe what
  * the tool does, and don't tell Claude how to behave"). Same patterns as the
  * lint planned in A2A dev-request 2026-10-16-mcp-beskrivelser-intensjonsord-og-lint (S6).
@@ -102,6 +118,12 @@ export interface PackSpec {
   /** The route file whose `new McpServer(...)` must send instructions and SERVER_INFO_FIELDS, and who adds them. */
   serverSetup: { routeFile: string; owner: string } | null;
   useCases: readonly string[];
+  /**
+   * When the pack was checked against the portal's real fields (PORTAL_FIELDS), and each use case's example
+   * prompt, which must be one of the brand's example prompts. null: not checked, so every step the submission
+   * docs list is answered as if it had a field.
+   */
+  portalChecked: { date: string; source: string; examples: Readonly<Record<string, string>> } | null;
   /** Where the data comes from (Data handling and first-party API answers). */
   ownApi: string;
   authRationale: string;
@@ -140,6 +162,16 @@ export interface ScreenshotSpec {
 /** Table placeholder: no value, or nobody to act. */
 const DASH = "—";
 
+/**
+ * Finn-tannlege's use cases in the portal, each with its example prompt (BRAND_ENTITIES.dental.exampleQueries):
+ * place or county, Helfo and emergency care, at most USE_CASE_LIMITS (G3-S6d points 4 and 9).
+ */
+const DENTAL_USE_CASES: ReadonlyArray<readonly [useCase: string, example: string]> = [
+  ["Find a dentist in a town or county.", "Find a dentist in Bergen"],
+  ["Filter for clinics with a Helfo direct-billing agreement.", "Which dental clinics in Oslo have a Helfo agreement?"],
+  ["Find clinics that say they take emergency patients, with advice on the out-of-hours dental service.", "I need an emergency dentist in Rogaland"],
+];
+
 export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
   rfb: {
     dir: "rfb-connectors-prep",
@@ -163,6 +195,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "Turn a shopping list into the nearest producers for each item.",
       "Put together a pickup order from one or more producers.",
     ],
+    portalChecked: null,
     ownApi: "Our own: the server reads Rett fra Bonden's own producer catalogue on the same domain. Place-name lookups can fall back to Kartverket's public place-name service.",
     authRationale: "The server serves public directory data about Norwegian food producers. There are no user accounts, so there is nothing to sign in to. The write tools build an anonymous cart and send pickup orders; they take no credentials and no payment details.",
     dataHandling: "The tools receive only what a question needs: a search term, a place, a category or coordinates, and for a pickup order the products chosen. Contact details the user gives are passed to an ordering producer only when the user consents to it (contact_consent).",
@@ -226,6 +259,7 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       "Find wildlife, outdoor, cultural and food experiences.",
       "Find breweries, cideries and other farm-sale drink producers near a place, and request a visit.",
     ],
+    portalChecked: null,
     ownApi: "Our own: the server reads Opplevagent's own experience and gårdssalg catalogue on the same domain.",
     authRationale: "The server serves public data about experiences and farm-sale producers in Norway. There are no user accounts, so there is nothing to sign in to. The one write tool sends a visit request with the guest's own name and e-mail so the producer can answer; it takes no credentials and no payment details.",
     dataHandling: "The tools receive only what a question needs: a search text, a place, filters or coordinates. A visit request (book_gardssalg) passes the guest's name and e-mail, and an optional phone number and note, to the producer so the producer can answer.",
@@ -260,34 +294,43 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
     ],
   },
 
+  // The dental text says no more than the service does (the independent check
+  // of the directory prompt, 2026-10-19), before and after F2-S10 hides the
+  // rows of the catalog import. What Helfo and emergency care mean is
+  // DENTAL_MCP_INSTRUCTIONS (src/routes/dental-mcp.ts) and the /proveniens and
+  // /vilkar pages; connector-packs-fresh.test.ts (k) keeps the old claims out.
   dental: {
     dir: "dental-connectors-prep",
     slug: "finn-tannlege",
-    oneLiner: "Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency duty.",
+    oneLiner: "Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency care.",
     description: (floor) => [
       `Finn-tannlege is an independent directory of dental clinics in Norway: more than ${floor} clinics, from single-dentist practices to large clinics, in every county. It is not affiliated with any clinic chain, insurer or booking portal.`,
-      "Search by place, by specialty, or by the two things that change what a visit costs and how soon you get one: a Helfo direct-billing agreement and emergency duty (akuttvakt). Every record carries the clinic's address, contact details and a profile page.",
-      "The data comes from public sources: Brønnøysundregistrene, the Norwegian health personnel register (HPR) and the clinics' own websites.",
+      "Search by place or specialty, and filter for clinics with a Helfo direct-billing agreement or emergency care. With direct billing, Helfo's share of a treatment that qualifies for support is settled with the clinic and you pay the rest; the agreement is read from the clinic's own website, not from a list kept by Helfo. Emergency care means that the clinic says it takes emergency patients. It is not a promise of out-of-hours care. Every clinic has a profile page with its address and, where known, its contact details.",
+      // The sources as src/services/dental-data-sources.ts names them (F2-S1 of
+      // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon); HPR is not one.
+      // dental-sources-truth.test.ts keeps this sentence equal to that list;
+      // the next one points at the method page (/proveniens) field by field.
+      "The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places, Kartverket and a one-time import from an online directory (May 2026). How each field is sourced is described at finn-tannlege.com/proveniens.",
       "The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.",
     ],
-    categories: ["Health", "Reference"],
+    // The portal's own category name; it has no «Reference» (Daniel's run of prompt 11).
+    categories: ["Consumer Health"],
     // A copy of src/public/dental-favicon-512.png (2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S4).
     icon: "dental-connectors-prep/assets/finn-tannlege-square-512.png",
     screenshots: null,
     serverSetup: { routeFile: "src/routes/dental-mcp.ts", owner: "2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4a)" },
-    useCases: [
-      "Find a dentist in a town or county.",
-      "Find emergency dental care (akuttvakt) outside normal hours.",
-      "Filter for clinics with a Helfo direct-billing agreement.",
-      "Find a clinic with a specific specialty, such as orthodontics.",
-      "Read one clinic's full record by organisation number.",
-    ],
+    useCases: DENTAL_USE_CASES.map(([useCase]) => useCase),
+    portalChecked: {
+      date: "2026-10-19",
+      source: "A2A daniel-responses/2026-10-19-live-svar-token-rotert-og-prompt-11.md",
+      examples: Object.fromEntries(DENTAL_USE_CASES),
+    },
     ownApi: "Our own: the server reads Finn-tannlege's own clinic directory on the same domain.",
     authRationale: "The server is a public, read-only directory of Norwegian dental clinics. There are no user accounts and no write operations, so there is nothing to sign in to.",
-    dataHandling: "The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-duty flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.",
+    dataHandling: "The tools receive only search terms and filters: a place or county, a specialty, the Helfo and emergency-care flags, or a clinic's organisation number. They ask for no symptoms, patient records or identity.",
     dataStored: null,
-    healthData: "No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency duty) and asks for no health information about the user.",
-    financial: "No money moves through the connector. Helfo agreement status is reported as a fact about a clinic, nothing more. No card or bank details are asked for.",
+    healthData: "No. The connector returns public business information about clinics (address, contact details, specialties, Helfo agreement, emergency care) and asks for no health information about the user.",
+    financial: "No money moves through the connector. Whether a clinic has Helfo direct billing is only reported, as read automatically from the clinic's own website (not confirmed by Helfo). No card or bank details are asked for.",
     reviewerTools: {
       "Find a dentist in Bergen": "tannlege_search",
       "Which dental clinics in Oslo have a Helfo agreement?": "tannlege_search",
@@ -309,10 +352,18 @@ export const PACKS: Readonly<Record<CatalogVertical, PackSpec>> = {
       { item: "Name decision for Finn-tannlege", status: "done", owner: "Daniel",
         detail: "Daniel's decision 4=A (2026-10-17, A2A daniel-responses/2026-10-17-live-del-a-gjort-og-beslutninger-1-11.md): the name and the slug stay, and every text says the service is not affiliated with FINN.no (G3-S8). The listing description ends with that sentence. No paid PR with the name before the legal check (G3-J)." },
     ],
+    // The chain caveat (chain_count 0 on 2026-08-24) and the Ø caveat are gone:
+    // on 2026-10-19 prod had chain_count 346 and 37 chains, and «Bodø» found 52
+    // clinics in all three spellings, with lokal#1086 live (G3-S6d point 5).
     caveats: [
-      "tannlege_kjeder: the chain data was empty when last measured (chain_count 0 on 2026-08-24). Check tannlege_stats before showing chain comparison as a feature.",
-      "tannlege_akutt filters by county (fylke) only: a town name gives no results. Town-level emergency search goes through tannlege_search with `akutt: true`.",
-      "Place names with Ø: search did not case-fold Ø when last measured (2026-08-24). Keep Ø place names out of the reviewer prompts until lokal#1086 has landed and been checked.",
+      // A place in `fylke` is a county when normaliseFylke() knows it (a town it
+      // knows gives its county), else the place tannlege_search's parser reads in
+      // it, else nothing, with `tolkning` saying which (S8 in
+      // 2026-10-16-tannlege-mcp-instrukser-og-klinikkort; dental-acute-filter.test.ts
+      // M1b, M1c and U; connector-packs-fresh.test.ts k9 and k9b check both examples).
+      "tannlege_akutt reads `fylke` as a county first: a town the server knows is read as the county it lies in, so «Bergen» covers all of Vestland. Any other place, such as «Sandvika», is read as a town or municipality, the way tannlege_search reads a place in `query`. A place it cannot find gives no results, and the answer's `tolkning` says how the place was read. To search only a town that is read as its county, tannlege_search reads both the place and the emergency wish from `query` (for example «emergency dentist Stavanger»), or takes `akutt: true` with the place in `query`.",
+      // The 113 line and the advice are /vilkar section 3's (dental-seo.ts); connector-packs-fresh.test.ts k15 keeps them equal.
+      "If life or health is in immediate danger: call 113. Emergency care says nothing about hours: the data has no out-of-hours times, and a clinic marked with emergency care may still be unable to see you now. Call the clinic before you go there; when it is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. tannlege_akutt's answer has advice on the municipal out-of-hours dental service (kommunal tannlegevakt).",
     ],
     otherContents: [["assets/finn-tannlege-square-512.png", "The icon to upload: the «Søket» mark (a tooth in a magnifier, white on teal), square, full-bleed, no rounded corners. The same file as the site's /favicon-512.png."]],
     notADirectoryPath: ["Desktop extension (MCPB): the directory no longer accepts local servers packaged as MCPB. The npm package `finn-tannlege-mcp` still works for manual install, but it is not a directory submission."],
@@ -557,15 +608,16 @@ function table(headers: readonly string[], rows: ReadonlyArray<readonly string[]
   return [`| ${headers.join(" | ")} |`, `|${headers.map(() => "---").join("|")}|`, ...rows.map((r) => `| ${r.map(cell).join(" | ")} |`)].join("\n");
 }
 
-/** "a", "a and b", "a, b and c". */
-const andList = (xs: readonly string[]): string => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}` : xs.join(""));
+/** "a", "a and b", "a, b and c" (or "a, b or c"). */
+const andList = (xs: readonly string[], conj = "and"): string => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} ${conj} ${xs[xs.length - 1]}` : xs.join(""));
 
 const STATUS_LABEL: Record<PrereqStatus, string> = { done: "DONE", open: "OPEN", waiting: "WAITING" };
 
+/** The readiness line. README.md has the table under it, portal-answers.md does not, so it says no «below» (S10 in the review of lokal#1178). */
 function readiness(rows: readonly Prerequisite[]): string {
   const open = rows.filter((r) => r.status === "open").length;
   const waiting = rows.filter((r) => r.status === "waiting").length;
-  if (!open && !waiting) return "**Ready to submit: yes.** Every prerequisite below is done.";
+  if (!open && !waiting) return "**Ready to submit: yes.** Every prerequisite is done.";
   const parts = [open ? `${open} open` : "", waiting ? `${waiting} waiting` : ""].filter(Boolean).join(", ");
   return `**Ready to submit: no** (${parts}).`;
 }
@@ -604,6 +656,19 @@ function validate(spec: PackSpec, input: PackInput, name: string, description: s
     if (!names.has(tool)) throw new Error(`${where}: reviewerTools names unregistered tool ${tool}`);
   }
   for (const { tool } of spec.extraPrompts) if (!names.has(tool)) throw new Error(`${where}: extraPrompts names unregistered tool ${tool}`);
+  if (spec.portalChecked) {
+    const { examples } = spec.portalChecked;
+    const L = USE_CASE_LIMITS;
+    if (spec.useCases.length < 1 || spec.useCases.length > L.rows) throw new Error(`${where}: ${spec.useCases.length} use cases (the portal takes 1–${L.rows})`);
+    for (const u of spec.useCases) {
+      if (u.length > L.useCase) throw new Error(`${where}: use case "${u}" is ${u.length} characters (limit ${L.useCase})`);
+      const example = examples[u];
+      if (!example) throw new Error(`${where}: use case "${u}" has no example prompt`);
+      if (example.length > L.example) throw new Error(`${where}: the example prompt of "${u}" is ${example.length} characters (limit ${L.example})`);
+      if (!queries.includes(example)) throw new Error(`${where}: the example prompt "${example}" is not in BRAND_ENTITIES.${input.vertical}.exampleQueries`);
+    }
+    for (const u of Object.keys(examples)) if (!spec.useCases.includes(u)) throw new Error(`${where}: an example prompt is set for "${u}", which is not a use case`);
+  }
   const writeTools = input.tools.filter((t) => !isReadOnly(t)).map((t) => t.name);
   for (const t of writeTools) if (!spec.writeToolNotes[t]) throw new Error(`${where}: write tool ${t} has no writeToolNotes entry`);
   for (const t of Object.keys(spec.writeToolNotes)) {
@@ -633,6 +698,9 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
   const shotsRow = rows.find((r) => r.item.startsWith("MCP App carousel screenshots"));
   const titleDiffs = tools.filter((t) => t.annotations.title && t.title && t.annotations.title !== t.title);
   const recordedPrs = [...new Set(spec.recordedPrerequisites.flatMap((p) => `${p.item} ${p.detail}`.match(/\blokal#\d+/g) ?? []))];
+  // A pack checked against the portal's real fields marks the texts it has no field for (PORTAL_HAS_NO_FIELD).
+  const checked = spec.portalChecked;
+  const ifAsked = (lines: string[]): string[] => (checked ? [ONLY_IF_ASKED, "", ...lines] : lines);
 
   // ── README ──
   const readme = [
@@ -662,6 +730,17 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
         " Update the row there and regenerate when its status changes."
       : ""),
     "",
+    ...(checked
+      ? [
+          "## What the portal fills",
+          "",
+          `Checked against the portal on ${checked.date} (${checked.source}). It has these fields: ${andList(PORTAL_FIELDS)}. ` +
+            `Use cases take at most ${USE_CASE_LIMITS.rows} rows of at most ${USE_CASE_LIMITS.useCase} characters, each with an example prompt of at most ${USE_CASE_LIMITS.example} characters.`,
+          "",
+          `It has no field for ${andList(PORTAL_HAS_NO_FIELD, "or")}. The pack's texts for those are marked «Use only if the portal asks»: keep them for a reviewer who asks.`,
+          "",
+        ]
+      : []),
     "## Contents",
     "",
     table(["File", "What it is"], [
@@ -726,7 +805,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     ...spec.categories.map((c) => `- ${c}`),
     "",
-    "Pick the closest names the portal offers.",
+    checked ? `The portal's own category ${spec.categories.length === 1 ? "name" : "names"} (checked ${checked.date}).` : "Pick the closest names the portal offers.",
     "",
     "## Links and contact",
     "",
@@ -764,7 +843,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     "## Language",
     "",
-    "The listing text is English because the directory audience is. The server answers in Norwegian and English, whichever the user writes in.",
+    ...ifAsked(["The listing text is English because the directory audience is. The server answers in Norwegian and English, whichever the user writes in."]),
   ].join("\n");
 
   // ── portal-answers.md ──
@@ -821,10 +900,12 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     "## 4. Use cases",
     "",
-    "Primary use cases:",
-    "",
-    ...spec.useCases.map((u) => `- ${u}`),
-    "",
+    ...(checked
+      ? [`At most ${USE_CASE_LIMITS.rows} use cases of at most ${USE_CASE_LIMITS.useCase} characters, each with an example prompt of at most ${USE_CASE_LIMITS.example} characters. Each prompt is one of the reviewer prompts in \`test-instructions.md\`.`,
+          "",
+          table(["Use case", "Characters", "Example prompt"], spec.useCases.map((u) => [u, String(u.length), checked.examples[u]])),
+          ""]
+      : ["Primary use cases:", "", ...spec.useCases.map((u) => `- ${u}`), ""]),
     table(["Field", "Answer"], [
       ["What users need before they can connect", "Nothing: no account, plan or setup. The server is public and has no sign-in."],
       ["Reads, writes or both", writeTools.length ? `Both (${readTools.length} read-only tools, ${writeTools.length} write tools)` : "Reads only"],
@@ -840,12 +921,13 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     "## 6. Authentication",
     "",
-    "**No authentication.** Paste if the portal asks why:",
+    ...(checked ? ["**No authentication.**", "", ONLY_IF_ASKED, "", "Why there is none:"] : ["**No authentication.** Paste if the portal asks why:"]),
     "",
     fence(spec.authRationale),
     "",
     "## 7. Data handling",
     "",
+    ...ifAsked([]),
     table(["Question", "Answer"], [
       ["Whose API is behind the connector", spec.ownApi],
       ["Personal health data", spec.healthData],
@@ -860,7 +942,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "## 8. Test & launch",
     "",
     table(["Field", "Answer"], [
-      ["Test account", "None needed: the server has no authentication and serves public data."],
+      ["Test account", `${checked ? `${ONLY_IF_ASKED} ` : ""}None needed: the server has no authentication and serves public data.`],
       ["Access instructions", "The paste block in `test-instructions.md` in this folder."],
       ["You ran every tool", "Before ticking: call each tool once, through MCP Inspector or as a custom connector in Claude."],
     ]),
@@ -887,7 +969,7 @@ export function renderPack(spec: PackSpec, input: PackInput): Record<(typeof PAC
     "",
     "## Known caveats, to state if asked",
     "",
-    ...spec.caveats.map((c) => `- ${c}`),
+    ...ifAsked(spec.caveats.map((c) => `- ${c}`)),
   ].join("\n");
 
   // ── test-instructions.md ──

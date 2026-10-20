@@ -86,3 +86,43 @@ export function isPubliclyListable(row: { catalog_hidden?: number | null; vertic
   if ((row.catalog_hidden ?? 0) !== 0) return false;
   return (row.vertical_id ?? RFB_VERTICAL_ID) === RFB_VERTICAL_ID;
 }
+
+// ─── Does /produsent/<slug> exist for this agent? — ONE shared predicate ────
+// dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical
+// (Skive A2). routes/seo.ts's GET /produsent/:slug 404s an agent when
+//   - it is NOT an umbrella AND has a non-"producer" role (quality/logistics:
+//     HANEN, Debio, Dyrket.no …), or
+//   - it is not vetted (is_vetted = 0), or
+//   - it is not publicly listable (hidden fixture / non-RFB vertical).
+// Every surface that emits a link to /produsent/<slug> (agent card
+// canonicalUrl/links.profile, API/MCP/llms-full lists) asks THIS function so
+// nobody hands out a URL that would 404. Umbrellas always have a page.
+// PURE (no imports).
+
+/** The role half of the gate: true when the page would 404 on role alone. */
+export function failsProducerRoleGate(role: string | null | undefined, isUmbrella: boolean): boolean {
+  return !isUmbrella && !!role && role !== "producer";
+}
+
+/**
+ * Raw `agents` row (snake_case columns). Missing columns read like the
+ * route's defaults: is_vetted NULL/undefined = vetted (schema default 1),
+ * no umbrella_type = not an umbrella.
+ */
+export function hasProducerPage(
+  row:
+    | {
+        role?: string | null;
+        umbrella_type?: string | null;
+        is_vetted?: number | null;
+        catalog_hidden?: number | null;
+        vertical_id?: string | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!row) return false;
+  if (failsProducerRoleGate(row.role, !!row.umbrella_type)) return false;
+  if (row.is_vetted != null && !row.is_vetted) return false;
+  return isPubliclyListable(row);
+}

@@ -213,9 +213,22 @@ export function clinicSpecialties(
   for (const person of specialists) add(person?.specialty);
   const titles = specialists.flatMap((person) => (typeof person?.title === "string" ? [person.title.toLowerCase()] : []));
   if (titles.length === 0) return out;
-  for (const entry of vocabulary.specialties) {
-    const words = specialtyTitleWords([entry.canonical], entry);
-    if (titles.some((title) => words.some((w) => title.includes(w)))) add(entry.canonical);
+  for (const { canonical, words } of titleWordsOf(vocabulary)) {
+    if (titles.some((title) => words.some((w) => title.includes(w)))) add(canonical);
   }
   return out;
+}
+
+// Each vocabulary specialty's title words (specialtyTitleWords of its
+// canonical name), worked out once per vocabulary object: clinicSpecialties
+// runs per clinic card and, for the /sted and /fylke specialist count
+// (dental-area-facts.ts, F1-S3), per row with a staff list.
+const titleWordsByVocabulary = new WeakMap<SearchVocabulary, ReadonlyArray<{ canonical: string; words: string[] }>>();
+function titleWordsOf(vocabulary: SearchVocabulary): ReadonlyArray<{ canonical: string; words: string[] }> {
+  let list = titleWordsByVocabulary.get(vocabulary);
+  if (!list) {
+    list = vocabulary.specialties.map((entry) => ({ canonical: entry.canonical, words: specialtyTitleWords([entry.canonical], entry) }));
+    titleWordsByVocabulary.set(vocabulary, list);
+  }
+  return list;
 }

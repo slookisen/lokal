@@ -8,9 +8,11 @@
 // rows are not patient-facing clinics at all: sole-proprietorship dentists
 // registered under their own name (who work in somebody else's clinic),
 // dental-technician labs and suppliers (32.500), holding/investment vehicles
-// owned by dentists, and a batch of county-directory rows imported without
-// any Brreg metadata. Every downstream consumer (claim pool, Places
-// backfill, public listing, MCP/A2A discovery) treats all of them as
+// owned by dentists, and the rows from the one-time directory import of May
+// 2026 that have no org.nr. and so no Brreg metadata (A2A dental-phase-a/
+// dental-merge-report-all.md; src/data/dental-import-2026-05.json). Every
+// downstream consumer (claim pool, Places backfill, public listing, MCP/A2A
+// discovery) treats all of them as
 // clinics, which is (a) why the enrichment pipeline's wrong-entity counter
 // fills up — the raw+hjemmeside pool is now almost entirely this residue —
 // and (b) why the public site advertises "6 961 klinikker".
@@ -29,9 +31,12 @@
 //   klinikk            patient-facing clinic (default when a dental word is
 //                      in the name, or an AS/DA/ANS with dental NACE and no
 //                      exclusion signal)
-//   offentlig_klinikk  public (fylkeskommunal/kommunal) clinic — county-
-//                      directory import rows (no organisasjonsform) or a
-//                      hjemmeside on a county/municipality host
+//   offentlig_klinikk  public (fylkeskommunal/kommunal) clinic — a
+//                      hjemmeside on a county/municipality host; also, for
+//                      now, every row from the May 2026 directory import
+//                      without an org.nr. (no organisasjonsform), though not
+//                      all of them are public clinics: the class is decided
+//                      with Daniel's choice for that data
 //   person_enk         ENK registered under a person's own name with no
 //                      dental word in it (individual dentist, not a clinic)
 //   lab_leverandor     dental-technician lab / supplier / instrument maker
@@ -235,8 +240,8 @@ function hasAny(name: string, words: readonly string[]): boolean {
  *   1. NACE 32.500 or lab words            → lab_leverandor
  *   2. holding/invest words, no dental word → holding
  *   3. county/municipality hjemmeside       → offentlig_klinikk
- *   4. no organisasjonsform + no NACE       → offentlig_klinikk (county-
- *      directory import rows carry neither)
+ *   4. no organisasjonsform + no NACE       → offentlig_klinikk (rows from
+ *      the May 2026 directory import without an org.nr. carry neither)
  *   5. ENK with no dental word              → person_enk
  *   6. any dental word in the name          → klinikk
  *   7. AS/DA/ANS/NUF/SA with dental NACE    → klinikk (company under a
@@ -269,7 +274,10 @@ export function classifyDentalCatalogEntry(input: CatalogClassInput): CatalogCla
     return { catalog_class: "offentlig_klinikk", rule: "public_service_host" };
   }
 
-  // 4. County-directory import rows (no Brreg metadata at all).
+  // 4. Rows from the May 2026 directory import without an org.nr. (no Brreg
+  //    metadata at all). The class stays as it is until Daniel has decided
+  //    what happens to that data (F2-S9 of A2A dev-request
+  //    2026-10-16-finn-tannlege-tillit-kilder-metode-ikon).
   if (!form && !nace) {
     return { catalog_class: "offentlig_klinikk", rule: "no_brreg_metadata" };
   }
