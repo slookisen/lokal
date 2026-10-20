@@ -28,7 +28,17 @@ import {
   listSpecialistsForClinic,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
-import { planDentalSearch } from "../services/dental-query-parser";
+import {
+  isDentalQueryParserDisabled,
+  parseDentalQuery,
+  planDentalSearch,
+  tolkningFilter,
+  type DentalQueryFilter,
+  type DentalSearchTolkning,
+  type DentalTolkningFilter,
+} from "../services/dental-query-parser";
+import { key as fylkeKey, normaliseFylke } from "../services/norway-fylke";
+import type { PlaceGazetteer } from "../services/search-intent/norwegian-query";
 import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
@@ -152,6 +162,85 @@ export function buildSearchResults(
   agents: ReturnType<typeof listPublicDentalAgents>
 ): SearchResult["klinikker"] {
   return agents.map((a) => toDentalClinicCard(a, "search"));
+}
+
+// ─── tannlege_akutt: how `fylke` is read (S8) ────────────────
+// A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort, S8 (FUNN
+// tannlege-akutt-fylke-ukjent-sted-null): a place normaliseFylke() did not
+// know went to the store as a county and matched no clinic, so «Sandvika»
+// gave nothing and no reason. A county, or a town the store reads as its
+// county (normaliseFylke also reads cityToFylke's towns), still filters as
+// the county, so «Bergen» covers all of Vestland. Any other value is read
+// with tannlege_search's place lookup (parseDentalQuery: poststed, kommune,
+// landsdel …), and only its place is used: the akutt filter applies within
+// it. A value with no place lists nothing; there is no fall back to the whole
+// country. `tolkning` says which of the three it was. Only the answer
+// changes: the tool's title, description and inputSchema are as before
+// (tools/list, D10c in dental-mcp-instructions.test.ts).
+
+/** The parser's filter fields that name a place. Its specialty, Helfo, akutt and name words are not read here. */
+const AKUTT_PLACE_FIELDS = [
+  "poststed_in", "postnummer_in", "poststed_or_postnummer", "fylke", "fylke_in",
+] as const satisfies ReadonlyArray<keyof DentalQueryFilter>;
+
+/** tannlege_akutt's `tolkning`: tannlege_search's form, with `filter` null when no place was found and nothing was searched. */
+export interface DentalAkuttTolkning extends Omit<DentalSearchTolkning, "filter"> {
+  filter: DentalTolkningFilter | null;
+}
+
+export interface DentalAkuttPlan {
+  /** The store filter, or null when the place was not found (nothing is searched, `count` is 0). */
+  filter: Record<string, unknown> | null;
+  /** null without `fylke` and with the parser switched off: the answer is the old one. */
+  tolkning: DentalAkuttTolkning | null;
+}
+
+/**
+ * The store filter and `tolkning` for tannlege_akutt's `fylke` (S8, above).
+ * With DENTAL_QUERY_PARSER_DISABLED the value is a county filter as before
+ * S8, so the parser's switch restores this tool's old answer too.
+ */
+export function planDentalAkutt(fylke: string | undefined, gazetteer: () => PlaceGazetteer): DentalAkuttPlan {
+  // S2b: acute_vakt 1 is the akutt claim in the public store (DENTAL_ACUTE_CLAIM_SQL).
+  const akutt = { acute_vakt: 1 };
+  if (!fylke) return { filter: akutt, tolkning: null };
+  if (isDentalQueryParserDisabled()) return { filter: { ...akutt, fylke }, tolkning: null };
+
+  const sporring = fylke.trim();
+  const plan = (filter: Record<string, unknown> | null, tolket_som: string[]): DentalAkuttPlan => ({
+    filter,
+    tolkning: { sporring, tolket_som, filter: filter && tolkningFilter(filter), fallback: false },
+  });
+
+  // As before S8: the value itself, which the store folds with normaliseFylke.
+  const county = normaliseFylke(fylke);
+  if (county) {
+    const line = fylkeKey(sporring) === fylkeKey(county) ? `sted: ${county} (fylke)` : `sted: ${county} (fylke; «${sporring}»)`;
+    return plan({ ...akutt, fylke }, [line, "akutt: ja"]);
+  }
+
+  const parsed = parseDentalQuery(sporring, gazetteer());
+  const place = Object.fromEntries(
+    AKUTT_PLACE_FIELDS.filter((field) => parsed.filter[field] !== undefined).map((field) => [field, parsed.filter[field]])
+  );
+  // No place: a word the parser does not know as one, or a poststed with no
+  // clinic (the parser's poststeder are the catalog's).
+  if (Object.keys(place).length === 0) {
+    return plan(null, [
+      `sted: ukjent («${sporring}»)`,
+      `merknad: «${sporring}» ble ikke funnet som fylke, kommune eller poststed med tannklinikker, så ingen klinikker er listet; ` +
+        "tannlege_search med stedet i query og akutt: true kan prøves, eller tannlege_akutt uten fylke for hele landet",
+    ]);
+  }
+  // The parser's line for the place it used. Anything else it read (a
+  // specialty, name words, a second place) is not used here, and is noted.
+  const isPlaceLine = (line: string) => line.startsWith("sted: ");
+  const rest = parsed.interpretation.some((line) => !isPlaceLine(line) && line !== "akutt: ja");
+  return plan({ ...akutt, ...place }, [
+    ...parsed.interpretation.filter(isPlaceLine),
+    "akutt: ja",
+    ...(rest ? ["merknad: bare stedet brukes, ikke resten av teksten"] : []),
+  ]);
 }
 
 /**
@@ -388,22 +477,27 @@ export function registerDentalTools(server: McpServer): void {
       try {
         // S2b: the public store reads acute_vakt 1 as the akutt claim
         // (DENTAL_ACUTE_CLAIM_SQL), so `count` and every card here are clinics
-        // whose `akutt` is "vakt" or "accepts", never a bare flag.
-        const filter: Record<string, unknown> = { acute_vakt: 1 };
-        if (fylke) filter.fylke = fylke;
+        // whose `akutt` is "vakt" or "accepts", never a bare flag. S8: `fylke`
+        // is a county, or else a place read as tannlege_search reads one
+        // (planDentalAkutt); for a place that is not found the filter is null
+        // and nothing is searched.
+        const { filter, tolkning } = planDentalAkutt(fylke, () => getDentalSearchGazetteer(listPoststeder));
 
-        const agents = listPublicDentalAgents(filter as any, 25);
-        const total = countPublicDentalAgents(filter as any);
+        const agents = filter ? listPublicDentalAgents(filter as any, 25) : [];
+        const total = filter ? countPublicDentalAgents(filter as any) : 0;
         const klinikker = buildSearchResults(agents);
 
         // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4c): the
         // advice is the reviewed emergency notice of the tannlegevakt pages
         // (113, legevakten 116 117, the local tannlegevakt and the caveat of
         // /vilkar pkt. 3), not a claim about what clinics with a badge do.
+        // `tolkning` (S8, only when `fylke` was read) comes last, so the keys
+        // before it are the answer as it was.
         const result = {
           count: total,
           klinikker,
           rad_om_kommunal_tannlegevakt: DENTAL_EMERGENCY_NOTICE.text,
+          ...(tolkning ? { tolkning } : {}),
         };
 
         // Compact JSON, as tannlege_search: up to 25 cards.
