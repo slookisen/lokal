@@ -482,7 +482,21 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       // ── (i) AC1: a domain_match autosvar candidate is reflected in the
       // SAME daily run's outcome counts (dry run: would_apply > 0) ───────
       setGardssalgOutreachLanePaused(expDb, { paused: false, by: "test-suite", reason: null });
-      const ac1Now = new Date("2026-10-15T08:10:00Z"); // fresh calendar day -> full budget; far past (g)'s bounce lookback
+      // ac1Now-ac3Now: 08:10Z on three consecutive days a week out, computed
+      // from the real clock. (e)'s sends and (g)'s bounce happened at real
+      // now, so each is a fresh calendar day (full budget) and far past (g)'s
+      // bounce lookback: the 48h window starts after those sends, so Guard 3
+      // has nothing to see even without (g)'s bounce ack. The hardcoded
+      // 2026-10-15/16/17 they replace stopped being "far past" once the real
+      // clock came within 48h of them (dev-request
+      // 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+      const realNow = new Date();
+      const ac1Now = new Date(Date.UTC(realNow.getUTCFullYear(), realNow.getUTCMonth(), realNow.getUTCDate() + 7, 8, 10));
+      assertEq(
+        findGardssalgOutreachRecentBounces(expDb, rfbDb, ac1Now, null),
+        [],
+        "i0: ac1Now is far past (g)'s bounce lookback — no recent bounce at ac1Now even with the bounce ack ignored",
+      );
       mkAutosvarProvider({ id: "prov-ac1-match", navn: "AC1 Match Gård", hjemmeside: "https://ac1match.no", epost: "gammel@ac1match.no" });
       mkAutosvarInboundMessage({
         providerId: "prov-ac1-match",
@@ -501,7 +515,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
 
       // ── (j) AC2: a domain_mismatch candidate lands in the review queue,
       // never auto-written to epost, on an apply:true daily run ──────────
-      const ac2Now = new Date("2026-10-16T08:10:00Z");
+      const ac2Now = new Date(ac1Now.getTime() + 24 * 3600 * 1000);
       mkAutosvarProvider({ id: "prov-ac2-mismatch", navn: "AC2 Mismatch Gård", hjemmeside: "https://ac2mismatch.no", epost: "post@ac2mismatch.no" });
       mkAutosvarInboundMessage({
         providerId: "prov-ac2-mismatch",
@@ -530,7 +544,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       // NOTHING — neither an epost write nor a review-queue row — even
       // though autosvar candidates (domain_match + domain_mismatch from (i)
       // and (j)) already exist ───────────────────────────────────────────
-      const ac3Now = new Date("2026-10-17T08:10:00Z");
+      const ac3Now = new Date(ac1Now.getTime() + 2 * 24 * 3600 * 1000);
       const queueSizeBeforeAc3 = countAutosvarQueueRows();
       const ac1EpostBeforeAc3 = getAutosvarProviderEpost("prov-ac1-match");
       const ac2EpostBeforeAc3 = getAutosvarProviderEpost("prov-ac2-mismatch");

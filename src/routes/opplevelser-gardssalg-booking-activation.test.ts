@@ -116,6 +116,26 @@ function parseJsonRpcBody(text: string, contentType: string | null): any {
   return JSON.parse(text);
 }
 
+// Next `targetDow` (0=Sun … 6=Sat) at `hour:minute`, at least `minDaysAhead`
+// UTC calendar days from now, as a naked "YYYY-MM-DDTHH:mm" string.
+// Offset-from-now (never a hardcoded calendar date) so no slot_at in this
+// suite goes stale — the AC4/AC5 slots used to be hardcoded
+// "2026-11-01T12:00" … "2026-11-04T12:00", which POST /book, the SSR form
+// and book_gardssalg would reject as passed from 2026-11-01T11:00Z on
+// (ac4-8/ac4-9 failing, then a TypeError skipping the rest of the suite;
+// dev-request 2026-10-20-ci-tidsbombe-hardkodede-testdatoer). A calendar date's
+// day-of-week is timezone-independent, so walking it via getUTCDay() is safe
+// even though the returned string is later read as EUROPE/OSLO wall time by
+// normaliseBookingSlotInput()/osloDatetimeLocalToUtcIso().
+function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() + minDaysAhead);
+  while (d.getUTCDay() !== targetDow) d.setUTCDate(d.getUTCDate() + 1);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(hour)}:${pad(minute)}`;
+}
+
 export function runOpplevelserGardssalgBookingActivationTests(
   opts: { log?: boolean } = {},
 ): Promise<TestSummary> {
@@ -471,10 +491,19 @@ export function runOpplevelserGardssalgBookingActivationTests(
       function countBookings(): number {
         return (expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_bookings`).get() as { n: number }).n;
       }
+      // Next Sunday … Wednesday at noon — the same weekdays and wall time as
+      // the old hardcoded "2026-11-01T12:00" … "2026-11-04T12:00", one day
+      // per surface plus AC5. Always in the future, at most 7 days ahead
+      // (well inside the default 90-day window); prov-a/prov-b carry no
+      // opening_hours_text, so no soft check applies.
+      const slotJsonApi = nextWeekdayDatetimeLocal(0, 12, 0);
+      const slotMcp = nextWeekdayDatetimeLocal(1, 12, 0);
+      const slotSsr = nextWeekdayDatetimeLocal(2, 12, 0);
+      const slotDispatchOff = nextWeekdayDatetimeLocal(3, 12, 0);
       const bookA = await callRoute(opplevelserRouter, {
         url: "/book", headers: {},
         body: {
-          provider_id: "prov-a", slot_at: "2026-11-01T12:00", party_size: 2,
+          provider_id: "prov-a", slot_at: slotJsonApi, party_size: 2,
           guest_name: "Gjest A", guest_email: "gjest.a@example.no",
         },
       });
@@ -485,14 +514,16 @@ export function runOpplevelserGardssalgBookingActivationTests(
       const bookB = await callRoute(opplevelserRouter, {
         url: "/book", headers: {},
         body: {
-          provider_id: "prov-b", slot_at: "2026-11-01T12:00", party_size: 2,
+          provider_id: "prov-b", slot_at: slotJsonApi, party_size: 2,
           guest_name: "Gjest B", guest_email: "gjest.b@example.no",
         },
       });
       assertEq(bookB.body.success, true, "ac4-8: POST /book against still-live prov-b -> success:true (NOT blocked by prov-a's brake)");
       assertEq(countBookings(), 1, "ac4-9: exactly one booking row created, for prov-b");
-      const bRow = expDb.prepare(`SELECT provider_id FROM gardssalg_bookings LIMIT 1`).get() as { provider_id: string };
-      assertEq(bRow.provider_id, "prov-b", "ac4-10: the created row belongs to prov-b, not prov-a");
+      // `?.`: with no row, ac4-10 reports as a failure instead of a TypeError
+      // that silently skips every check after it.
+      const bRow = expDb.prepare(`SELECT provider_id FROM gardssalg_bookings LIMIT 1`).get() as { provider_id: string } | undefined;
+      assertEq(bRow?.provider_id, "prov-b", "ac4-10: the created row belongs to prov-b, not prov-a");
 
       // -- surface 2: MCP book_gardssalg, real HTTP MCP session -----------
       {
@@ -534,13 +565,13 @@ export function runOpplevelserGardssalgBookingActivationTests(
         }
 
         const mcpA = await callTool("book_gardssalg", {
-          provider_id: "prov-a", slot_at: "2026-11-02T12:00", party_size: 2,
+          provider_id: "prov-a", slot_at: slotMcp, party_size: 2,
           guest_name: "MCP Gjest A", guest_email: "mcp.a@example.no",
         });
         assertEq(mcpA?.success, false, "ac4-11: MCP book_gardssalg against paused prov-a -> success:false");
 
         const mcpB = await callTool("book_gardssalg", {
-          provider_id: "prov-b", slot_at: "2026-11-02T12:00", party_size: 2,
+          provider_id: "prov-b", slot_at: slotMcp, party_size: 2,
           guest_name: "MCP Gjest B", guest_email: "mcp.b@example.no",
         });
         assertEq(mcpB?.success, true, "ac4-12: MCP book_gardssalg against still-live prov-b -> success:true (no leak from prov-a's brake)");
@@ -569,12 +600,12 @@ export function runOpplevelserGardssalgBookingActivationTests(
         }
 
         const locA = await postForm("gard-a", {
-          slot_at: "2026-11-03T12:00", party_size: "2", guest_name: "SSR Gjest A", guest_email: "ssr.a@example.no",
+          slot_at: slotSsr, party_size: "2", guest_name: "SSR Gjest A", guest_email: "ssr.a@example.no",
         });
         assertTrue(!!locA && locA.includes("error=paused"), `ac4-14: SSR no-JS form against paused prov-a redirects with ?error=paused (got ${locA})`);
 
         const locB = await postForm("gard-b", {
-          slot_at: "2026-11-03T12:00", party_size: "2", guest_name: "SSR Gjest B", guest_email: "ssr.b@example.no",
+          slot_at: slotSsr, party_size: "2", guest_name: "SSR Gjest B", guest_email: "ssr.b@example.no",
         });
         assertTrue(!!locB && locB.includes("/confirm/"), `ac4-15: SSR no-JS form against still-live prov-b redirects to the confirmation page (got ${locB})`);
         assertEq(countBookings(), 3, "ac4-16: three total bookings now (all prov-b across the three surfaces), still zero for prov-a");
@@ -587,7 +618,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       const dispatchOffBook = await callRoute(opplevelserRouter, {
         url: "/book", headers: {},
         body: {
-          provider_id: "prov-b", slot_at: "2026-11-04T12:00", party_size: 2,
+          provider_id: "prov-b", slot_at: slotDispatchOff, party_size: 2,
           guest_name: "Gjest Uten Dispatch", guest_email: "nodispatch@example.no",
         },
       });
@@ -635,22 +666,7 @@ export function runOpplevelserGardssalgBookingActivationTests(
       // lives in opplevelser-gardssalg-mcp-booking.test.ts.
       // ═══════════════════════════════════════════════════════════════════
       {
-        // Offset-from-now (never a hardcoded calendar date) so this section
-        // never goes stale the way the hardcoded slot_at fixtures elsewhere
-        // in this file periodically need a "date-repairs" bump (see this
-        // very branch's own prior commit). A calendar date's day-of-week is
-        // timezone-independent, so walking it via getUTCDay() is safe even
-        // though the returned "YYYY-MM-DDTHH:mm" string is later read as
-        // EUROPE/OSLO wall time by normaliseBookingSlotInput()/
-        // osloDatetimeLocalToUtcIso().
-        function nextWeekdayDatetimeLocal(targetDow: number, hour: number, minute: number, minDaysAhead = 1): string {
-          const d = new Date();
-          d.setUTCHours(0, 0, 0, 0);
-          d.setUTCDate(d.getUTCDate() + minDaysAhead);
-          while (d.getUTCDay() !== targetDow) d.setUTCDate(d.getUTCDate() + 1);
-          const pad = (n: number): string => String(n).padStart(2, "0");
-          return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(hour)}:${pad(minute)}`;
-        }
+        // Offset-from-now via the file-scope nextWeekdayDatetimeLocal().
         // Next Saturday at noon — OUTSIDE "Man-fre 10:00-18:00", always a
         // few days out, always well inside the (default 90-day) window.
         const outsideHoursSlot = nextWeekdayDatetimeLocal(6, 12, 0);

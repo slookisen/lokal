@@ -389,9 +389,24 @@ export function runOpplevelserBookingSendGuardTests(
         org_nr: "988888887", catalog_hidden: null,
       });
 
+      // A slot ~20 days ahead at 11:00 Oslo, computed from now (never stale).
+      // Hoisted above bookingInput, whose slot_at takes the same date: (q)
+      // posts bookingInput to the public POST /book, which rejects a passed
+      // slot — the hardcoded "2026-11-01T12:00:00.000Z" it replaces would have
+      // made q1/q2 fail from that instant on (dev-request
+      // 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+      const osloParts = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+      const oget = (t: string): number => +(osloParts.find((x) => x.type === t)?.value ?? "0");
+      const aheadDate = new Date(Date.UTC(oget("year"), oget("month") - 1, oget("day") + 20));
+      const pad = (n: number): string => String(n).padStart(2, "0");
+      const aheadDay = `${aheadDate.getUTCFullYear()}-${pad(aheadDate.getUTCMonth() + 1)}-${pad(aheadDate.getUTCDate())}`;
+      const aheadSlot = `${aheadDay}T11:00`;
+
       const bookingInput = {
         provider_id: "prov-live",
-        slot_at: "2026-11-01T12:00:00.000Z",
+        // Same zone-carrying shape and time of day as before (12:00Z), so
+        // normaliseBookingSlotInput() still passes it through untouched.
+        slot_at: `${aheadDay}T12:00:00.000Z`,
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -509,12 +524,7 @@ export function runOpplevelserBookingSendGuardTests(
       insertNamed.run({ id: "prov-amb-1", navn: "Ambig Bryggeri Nord", epost: "nord@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-nord" });
       insertNamed.run({ id: "prov-amb-2", navn: "Ambig Bryggeri Sør", epost: "sor@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-sor" });
 
-      // A slot ~20 days ahead at 11:00 Oslo, computed from now (never stale).
-      const osloParts = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
-      const oget = (t: string): number => +(osloParts.find((x) => x.type === t)?.value ?? "0");
-      const aheadDate = new Date(Date.UTC(oget("year"), oget("month") - 1, oget("day") + 20));
-      const pad = (n: number): string => String(n).padStart(2, "0");
-      const aheadSlot = `${aheadDate.getUTCFullYear()}-${pad(aheadDate.getUTCMonth() + 1)}-${pad(aheadDate.getUTCDate())}T11:00`;
+      // aheadSlot/aheadDate: computed from now above bookingInput.
       const weekdayNb = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"];
       const aheadWeekday = weekdayNb[(aheadDate.getUTCDay() + 6) % 7]!;
       const wrongWeekday = weekdayNb[((aheadDate.getUTCDay() + 6) % 7 + 1) % 7]!;
