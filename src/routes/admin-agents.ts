@@ -116,6 +116,7 @@ import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { maskEmail } from "../services/gardssalg-claim";
 
+import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
 
 // ─── Slice 2 of dev-request 2026-06-30-brreg-verification-gate ─────────
@@ -792,7 +793,10 @@ router.delete("/:id", (req: Request, res: Response) => {
       return;
     }
 
-    db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+    db.transaction(() => {
+      deleteAgentProfileTranslations(db, String(id));
+      db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+    })();
 
     res.json({
       success: true,
