@@ -19568,6 +19568,10 @@ export const GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE = "reserved";
 // db_write_failed row, and after a send that threw (reservation_kept).
 export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON = "not_attempted_after_db_write_failure";
 export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_UNKNOWN_OUTCOME_REASON = "not_attempted_after_send_outcome_unknown";
+// Dev-request 2026-10-10-gardssalg-outreach-bounce-sjekk-kun-for-sending: en ny
+// hard bounce/klage midt i batchen (Vakt 3 re-sjekket mellom to utsendelser)
+// stopper resten av SAMME kjøring; hver igjenværende kandidat blir en skipped-rad.
+export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_BOUNCE_REASON = "not_attempted_after_bounce_recheck";
 
 /**
  * The one stop rule both looping callers (POST /admin/gardssalg-outreach-
@@ -21090,6 +21094,7 @@ async function runGardssalgOutreachDailyOnce(
       : report.stopped_on_send_outcome_unknown
         ? "send outcome unknown"
         : null;
+    const midBatchBounceSkipped = results.filter((r) => r.reason === GARDSSALG_OUTREACH_NOT_ATTEMPTED_BOUNCE_REASON).length;
     const notAttempted = results
       .filter(
         (r) =>
@@ -21135,6 +21140,7 @@ async function runGardssalgOutreachDailyOnce(
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
         (stopCause ? ` STOPPED (${stopCause}): not_attempted=${notAttempted.length}` : "") +
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
+        (midBatchBounceSkipped > 0 ? ` mid_batch_bounce_skipped=${midBatchBounceSkipped}` : "") +
         (report.autosvar_apply
           ? ` autosvar: applied=${report.autosvar_apply.counts.applied} queued=${report.autosvar_apply.counts.queued} ` +
             `already_set=${report.autosvar_apply.counts.already_set} queue_size=${report.autosvar_apply.queue_size}`
@@ -21286,10 +21292,35 @@ async function runGardssalgOutreachDailyOnce(
   // gardssalgOutreachBatchStopReason) — no further candidate is tried; each
   // one left is a skipped row carrying that reason (see finish()).
   let notAttemptedReason: string | null = null;
+  // Vakt 3 re-sjekkes mellom hver utsendelse: en bounce/klage som lander midt i
+  // batchen (f.eks. 08:00:31Z, mens 08:00:25-08:00:34Z-batchen pågår) pauser lanen
+  // og stopper resten av DENNE kjøringen, ikke først neste. Samme pause og
+  // kvitteringsmekanisme (bounce_ack_max_id) som førsjekken over.
+  let midBatchBounces: GardssalgOutreachBounceHit[] = [];
   for (const elig of selected) {
     if (!opts.apply) {
       results.push({ provider_id: elig.provider_id, status: "would_send" });
       continue;
+    }
+    if (!notAttemptedReason && results.length > 0) {
+      midBatchBounces = findGardssalgOutreachRecentBounces(
+        expDb,
+        getRfbDb(),
+        now,
+        getGardssalgOutreachLaneState(expDb).bounce_ack_max_id,
+      );
+      if (midBatchBounces.length > 0) {
+        setGardssalgOutreachLanePaused(expDb, {
+          paused: true,
+          by: GARDSSALG_OUTREACH_DAILY_AGENT,
+          reason:
+            `auto-pause (mid-batch): hard bounce/complaint on ${midBatchBounces.length} recipient(s) contacted in the last ` +
+            `${GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS}h (${midBatchBounces.map((b) => b.recipient_email).join(", ")}). ` +
+            `Clearing the pause is Daniel's call: POST /api/opplevelser/admin/gardssalg-outreach-lane {"paused": false}.`,
+          bounceAckMaxId: Math.max(...midBatchBounces.map((b) => b.bounce_id)),
+        });
+        notAttemptedReason = GARDSSALG_OUTREACH_NOT_ATTEMPTED_BOUNCE_REASON;
+      }
     }
     if (notAttemptedReason) {
       results.push({ provider_id: elig.provider_id, status: "skipped", reason: notAttemptedReason });
@@ -21307,6 +21338,8 @@ async function runGardssalgOutreachDailyOnce(
     skipped_reason: null,
     sent_today_before: sentToday,
     budget,
+    auto_paused: midBatchBounces.length > 0,
+    recent_bounces: midBatchBounces,
     candidates,
     results,
     autosvar_apply: autosvarApply,

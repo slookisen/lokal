@@ -694,6 +694,78 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
           "m5: the 08:00Z tick in index.ts goes through tickGardssalgOutreachDaily",
         );
       }
+
+      // ── (n) dev-request 2026-10-10-gardssalg-outreach-bounce-sjekk-kun-for-sending:
+      // Guard 3 re-checks between every send, so a bounce that lands MID-batch
+      // stops the rest of the SAME run. Real clock; cap raised so budget is no
+      // limit; the lane is still paused + acked (betaComplaintId) from (l) ──
+      {
+        process.env.DAILY_PREP_MAX_CANDIDATES = "20";
+        const mkN = (id: string, n: number): string => {
+          const email = `post@${id}.no`;
+          insertProvider.run({
+            id: `prov-${id}`, navn: id, org_nr: `30000000${n}`, kommune: "Voss", producer_type: "sideri",
+            epost: email, hjemmeside: `https://${id}.no`, about_text: REALISTIC_ABOUT_TEXT, products: "Sider",
+            slug: id, field_provenance: withBrregEmail(VERIFIED_PROVENANCE, email, `30000000${n}`),
+          });
+          return email;
+        };
+        setGardssalgOutreachLanePaused(expDb, { paused: false, by: "test-suite", reason: null });
+        const ackBeforeN = getGardssalgOutreachLaneState(expDb).bounce_ack_max_id;
+        // n1 (+ acked case): no new bounce -> every candidate sent; the acked
+        // (l) bounces inside the 48h lookback do NOT re-trip the mid-batch check.
+        mkN("nord-sideri", 1); mkN("sor-sideri", 2); mkN("ost-sideri", 3);
+        const sentBeforeN1 = sent.length;
+        const n1 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+        assertEq([n1.summary.sent, n1.summary.skipped, n1.auto_paused, n1.recent_bounces], [3, 0, false, []], "n1: no new bounce -> all 3 sent, not paused");
+        assertEq(sent.length - sentBeforeN1, 3, "n2: three mails left the transporter");
+        assertEq(getGardssalgOutreachLaneState(expDb).paused, false, "n3: acked (l) bounces do not re-trip the mid-batch check");
+        assertEq(getGardssalgOutreachLaneState(expDb).bounce_ack_max_id, ackBeforeN, "n4: ack unchanged by a clean run");
+
+        // n5+: a hard bounce on the FIRST recipient arrives right after it is sent.
+        mkN("vest-sideri", 4); mkN("midt-sideri", 5); mkN("fjell-sideri", 6);
+        const realSendMail = emailSvc.transporter.sendMail;
+        let nCalls = 0;
+        let nBounceId = 0;
+        emailSvc.transporter = {
+          sendMail: async (mailOptions: Record<string, any>) => {
+            const r = await realSendMail(mailOptions);
+            nCalls += 1;
+            if (nCalls === 1) {
+              nBounceId = Number(
+                rfbDb
+                  .prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type, reason) VALUES (?, ?, 'hard', 'test')`)
+                  .run(String(mailOptions.to), new Date().toISOString()).lastInsertRowid,
+              );
+            }
+            return r;
+          },
+        };
+        const sentBeforeN2 = sent.length;
+        const n2 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+        emailSvc.transporter = { sendMail: realSendMail };
+        assertEq(nCalls, 1, "n5: only the first send happened before the mid-batch bounce stopped the run");
+        assertEq(sent.length - sentBeforeN2, 1, "n6: exactly one mail left the transporter");
+        assertEq([n2.summary.sent, n2.summary.skipped], [1, 2], "n7: 1 sent, remaining 2 skipped");
+        assertEq(
+          n2.results.filter((r) => r.status === "skipped").map((r) => r.reason),
+          ["not_attempted_after_bounce_recheck", "not_attempted_after_bounce_recheck"],
+          "n8: skipped rows carry the mid-batch bounce reason",
+        );
+        assertEq([n2.auto_paused, n2.skipped_reason], [true, null], "n9: report says auto_paused, run itself not a Guard-3 skip");
+        assertEq(n2.recent_bounces.map((b) => b.bounce_id), [nBounceId], "n10: report names the mid-batch bounce");
+        const laneN = getGardssalgOutreachLaneState(expDb);
+        assertEq([laneN.paused, laneN.changed_by, laneN.bounce_ack_max_id], [true, GARDSSALG_OUTREACH_DAILY_AGENT, nBounceId], "n11: lane paused as Guard 3 does, bounce acked");
+        const nRun = runsFor().filter((r) => r.run_id === n2.run_id)[0];
+        assertTrue(
+          !!nRun && nRun.notes.includes("AUTO-PAUSED") && nRun.notes.includes("mid_batch_bounce_skipped=2"),
+          "n12: envelope notes carry AUTO-PAUSED + mid_batch_bounce_skipped",
+        );
+        // Next run stays paused (a human lifts it).
+        const n3 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+        assertEq(n3.skipped_reason, "paused", "n13: next run is paused until a human lifts it");
+        delete process.env.DAILY_PREP_MAX_CANDIDATES;
+      }
     } catch (err) {
       failed++;
       failures.push(`✗ harness error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
