@@ -67,6 +67,15 @@ export interface EmailOptions {
    * Opplevagent content. Omitted keeps the previous behaviour exactly.
    */
   from?: string;
+  /**
+   * F8 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+   * transactional mail about a buyer's own order (producer order e-mail,
+   * buyer receipts) must not carry the outreach header
+   * `X-Lokal-Agent: outreach-system/v1`: it is not outreach, and the header
+   * makes it look like it. true = send without that header. Omitted/false
+   * leaves the header exactly as before.
+   */
+  omitAgentHeader?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -276,13 +285,14 @@ export class EmailService {
   async sendClaimConfirmation(
     email: string,
     agentName: string,
-    dashboardUrl: string
+    dashboardUrl: string,
+    agentId?: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
       const subject = `Gratulerer! ${agentName} er nå ditt på ${this.brand}`;
 
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl);
-      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl);
+      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl, agentId);
+      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -356,9 +366,9 @@ export class EmailService {
     }
 
     try {
-      const headers: Record<string, string> = {
-        'X-Lokal-Agent': 'outreach-system/v1',
-      };
+      const headers: Record<string, string> = options.omitAgentHeader
+        ? {}
+        : { 'X-Lokal-Agent': 'outreach-system/v1' };
       if (options.listUnsubscribe) {
         headers['List-Unsubscribe'] = options.listUnsubscribe;
       }
@@ -811,11 +821,25 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     `;
   }
 
-  private orderToggleUrl(dashboardUrl: string): string {
+  /**
+   * The «slå på bestillinger» link in the claim confirmation. F7 (dev-request
+   * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): with the agent
+   * id it points at the portal card, /eier/<id>/portal#bestillinger, where
+   * the switch is. The login link (dashboardUrl) goes through /selger, a page
+   * with no such switch, so appending #bestillinger to it led nowhere. The
+   * portal sends a not-yet-logged-in owner to the login page for that agent.
+   * Without an agent id the old behaviour stays (callers that only have a
+   * dashboard URL).
+   */
+  private orderToggleUrl(dashboardUrl: string, agentId?: string): string {
+    if (agentId) {
+      const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
+      return `${base}/eier/${encodeURIComponent(agentId)}/portal#bestillinger`;
+    }
     return dashboardUrl.includes('#') ? dashboardUrl : `${dashboardUrl}#bestillinger`;
   }
 
-  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string): string {
+  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string, agentId?: string): string {
     return `
 <!DOCTYPE html>
 <html lang="no">
@@ -871,7 +895,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       <li>Følge med på interaksjoner og preferanser</li>
     </ul>
     <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">Gå til dashboarden din</a>
-    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl))}">dashboarden din</a>.</p>
+    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl, agentId))}">dashboarden din</a>.</p>
     <p>Lykke til!</p>
   </div>
 </body>
@@ -879,7 +903,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     `;
   }
 
-  private generateClaimConfirmationText(agentName: string, dashboardUrl: string): string {
+  private generateClaimConfirmationText(agentName: string, dashboardUrl: string, agentId?: string): string {
     return `
 Gratulerer!
 
@@ -894,7 +918,7 @@ Gå til dashboarden din:
 ${dashboardUrl}
 
 Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk her:
-${this.orderToggleUrl(dashboardUrl)}
+${this.orderToggleUrl(dashboardUrl, agentId)}
 
 Lykke til!
     `;

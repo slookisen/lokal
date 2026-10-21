@@ -906,6 +906,37 @@ router.post("/eier/:agentId/request", express.urlencoded({ extended: false }), a
   }
 });
 
+
+// F1 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// the «Bestillinger» card. The opt-in switch needs an owner-verified profile
+// (agents.is_verified = 1): the real-order gate (cart-service
+// isEligibleForRealOrder) requires it, so an unverified profile that switched
+// orders on would get a switch that does nothing. Without verification the
+// card explains why and links to the ownership claim instead. A profile that
+// already has the opt-in on keeps its «turn off» button.
+export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?: number; is_verified?: number }): string {
+  const optIn = agent.order_notifications_opt_in ? 1 : 0;
+  const verified = agent.is_verified === 1;
+  const id = encodeURIComponent(agent.id);
+  if (!verified && !optIn) {
+    return `<div class="ep-card" id="bestillinger">
+        <h2>Bestillinger</h2>
+        <p>Motta bestillinger på e-post: <strong>Av</strong></p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Bestillinger fra kunder kan bare slås på for profiler der eierskapet er bekreftet. Bekreft først at du eier profilen, så kan du slå på bestillinger her.</p>
+        <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>
+      </div>`;
+  }
+  return `<div class="ep-card" id="bestillinger">
+        <h2>Bestillinger</h2>
+        <p>Motta bestillinger på e-post: <strong>${optIn ? "På" : "Av"}</strong></p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Når den er på, sender vi bestillinger fra kunder til e-postadressen din. Du kan slå den av igjen når som helst.</p>
+        <form method="post" action="/eier/${id}/order-notifications" style="margin:0;">
+          <input type="hidden" name="opt_in" value="${optIn ? "0" : "1"}">
+          <button type="submit" class="ep-btn ep-btn-primary">${optIn ? "Slå av bestillinger på e-post" : "Slå på bestillinger på e-post"}</button>
+        </form>
+      </div>`;
+}
+
 // ─────────────────────────────────────────────────────────────────
 // GET /eier/:agentId/portal — authenticated edit page (requires session)
 // ─────────────────────────────────────────────────────────────────
@@ -940,6 +971,13 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         const o = db.prepare("SELECT order_notifications_opt_in AS v FROM agents WHERE id = ?").get(agentId) as any;
         agent.order_notifications_opt_in = o && o.v === 1 ? 1 : 0;
       } catch { agent.order_notifications_opt_in = 0; }
+      // F1 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+      // the opt-in switch is only offered to an owner-verified profile.
+      // Tolerant read: a DB without the column renders as "not verified".
+      try {
+        const v = db.prepare("SELECT is_verified AS v FROM agents WHERE id = ?").get(agentId) as any;
+        agent.is_verified = v && v.v === 1 ? 1 : 0;
+      } catch { agent.is_verified = 0; }
     }
     if (!agent) {
       return res.status(404).send(portalShell(
@@ -1060,15 +1098,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      <div class="ep-card" id="bestillinger">
-        <h2>Bestillinger</h2>
-        <p>Motta bestillinger på e-post: <strong>${agent.order_notifications_opt_in ? "På" : "Av"}</strong></p>
-        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Når den er på, sender vi bestillinger fra kunder til e-postadressen din. Du kan slå den av igjen når som helst.</p>
-        <form method="post" action="/eier/${encodeURIComponent(agent.id)}/order-notifications" style="margin:0;">
-          <input type="hidden" name="opt_in" value="${agent.order_notifications_opt_in ? "0" : "1"}">
-          <button type="submit" class="ep-btn ep-btn-primary">${agent.order_notifications_opt_in ? "Slå av bestillinger på e-post" : "Slå på bestillinger på e-post"}</button>
-        </form>
-      </div>${paymentCardHtml}
+      ${ordersCardHtml(agent)}${paymentCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -1180,6 +1210,18 @@ function applyOwnerOrderOptIn(
   if (rawOptIn === true || rawOptIn === 1 || rawOptIn === "1" || rawOptIn === "true") optIn = 1;
   else if (rawOptIn === false || rawOptIn === 0 || rawOptIn === "0" || rawOptIn === "false") optIn = 0;
   else return { status: 400, body: { success: false, error: "bad_opt_in", message: "opt_in må være true eller false." } };
+  // F1: turning orders ON needs an owner-verified profile (the real-order
+  // gate requires it too). Turning them OFF is always allowed.
+  if (optIn === 1) {
+    let verified = false;
+    try {
+      const v = getDb().prepare("SELECT is_verified AS v FROM agents WHERE id = ?").get(agentId) as any;
+      verified = !!v && v.v === 1;
+    } catch { verified = false; }
+    if (!verified) {
+      return { status: 409, body: { success: false, error: "ownership_not_verified", message: "Bestillinger kan bare slås på for profiler der eierskapet er bekreftet. Bekreft eierskap først." } };
+    }
+  }
   const info = getDb()
     .prepare("UPDATE agents SET order_notifications_opt_in = ? WHERE id = ?")
     .run(optIn, agentId);

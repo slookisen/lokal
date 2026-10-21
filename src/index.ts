@@ -2375,6 +2375,29 @@ if (
   }), 60 * 60_000);
 }
 
+// ─── F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// order follow-ups — one re-send of a failed producer e-mail, one reminder
+// (+ admin alert) after ORDER_REMINDER_HOURS (24), auto-cancel with
+// producer_no_response after ORDER_AUTOCANCEL_HOURS (72) for pay-at-pickup
+// orders nobody answered. Hourly; idempotent (services/order-followups.ts).
+// Rollback: set the hours very high, or RFB_DISABLE_ORDER_FOLLOWUPS=1.
+if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
+  setInterval(trackJob("order-followups", async () => {
+    try {
+      const { processOrderFollowups } = await import("./services/order-followups");
+      const r = await processOrderFollowups();
+      if (r.retried || r.reminders_sent || r.cancelled || r.errors) {
+        console.log(
+          `[order-followups] tick examined=${r.examined} retried=${r.retried} reminders=${r.reminders_sent} ` +
+          `cancelled=${r.cancelled} errors=${r.errors}`
+        );
+      }
+    } catch (err) {
+      console.error("[order-followups] tick failed:", err);
+    }
+  }), 60 * 60_000);
+}
+
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───
 //
 // Ticks runDispatchTick("active") every ~10 min so the fleet's self-continue

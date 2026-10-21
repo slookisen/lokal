@@ -45,10 +45,14 @@ export async function runOwnerOrderOptinHandoffStatsTests(opts: { log?: boolean 
     ins.run("s4-a", "Gard A", "a@example.no", "k-a");
     ins.run("s4-b", "Gard B", "b@example.no", "k-b");
     ins.run("s4-c", "Gard C", "c@example.no", "k-c");
+    // F1: the opt-in switch needs an owner-verified profile. s4-a / s4-b are
+    // verified (the pre-F1 cases below); s4-c stays unverified (AC1 cases).
+    db.exec(`UPDATE agents SET is_verified = 1 WHERE id IN ('s4-a', 's4-b')`);
     const future = "datetime('now', '+1 day')";
     db.exec(`INSERT INTO magic_links (id, email, token, agent_id, used, expires_at) VALUES
       ('ml-a', 'a@example.no', 'tok-a', 's4-a', 1, ${future}),
       ('ml-b', 'b@example.no', 'tok-b', 's4-b', 1, ${future}),
+      ('ml-c', 'c@example.no', 'tok-c', 's4-c', 1, ${future}),
       ('ml-unused', 'a@example.no', 'tok-unused', 's4-a', 0, ${future})`);
 
     const app = express();
@@ -128,6 +132,29 @@ export async function runOwnerOrderOptinHandoffStatsTests(opts: { log?: boolean 
     ok(r.text.includes('action="/eier/s4-a/order-notifications"'), "portal-03: toggle form posts to the new route");
     ok(r.text.includes("name=\"opt_in\" value=\"0\""), "portal-04: state on -> one click turns it off ");
 
+    // ── AC1 / F1: opt-in needs an owner-verified profile ───────────────────
+    const cookieC = { Cookie: "rfb_owner_session=tok-c" };
+    r = await req("POST", "/api/agents/s4-c/order-notifications", { headers: cookieC, body: { opt_in: true } });
+    eq(r.status, 409, "ac1-01: opt_in=1 on an unverified profile -> 409");
+    eq(r.body?.error, "ownership_not_verified", "ac1-02: the 409 names the reason");
+    eq(optIn("s4-c"), 0, "ac1-03: nothing written for the unverified profile");
+    r = await req("POST", "/eier/s4-c/order-notifications", { headers: cookieC, form: { opt_in: "1" } });
+    eq(r.status, 409, "ac1-04: the form route gives 409 as well");
+    eq(optIn("s4-c"), 0, "ac1-05: form route wrote nothing");
+    r = await req("POST", "/api/agents/s4-c/order-notifications", { headers: cookieC, body: { opt_in: false } });
+    eq(r.status, 200, "ac1-06: turning orders OFF is always allowed");
+    db.prepare("INSERT OR IGNORE INTO agent_knowledge (agent_id) VALUES ('s4-c')").run();
+    r = await req("GET", "/eier/s4-c/portal", { headers: cookieC });
+    eq(r.status, 200, "ac1-07: portal renders for the unverified owner");
+    ok(r.text.includes('id="bestillinger"'), "ac1-08: the Bestillinger card is there");
+    ok(!r.text.includes('action="/eier/s4-c/order-notifications"') && !r.text.includes('name="opt_in"'), "ac1-09: no switch / opt_in field for an unverified profile");
+    ok(r.text.includes("eierskapet er bekreftet") && r.text.includes('href="/selger?agent=s4-c"'), "ac1-10: the card explains and links to the ownership claim");
+    // An unverified profile that already has the opt-in on (set before F1) can still turn it off.
+    db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 's4-c'").run();
+    r = await req("GET", "/eier/s4-c/portal", { headers: cookieC });
+    ok(r.text.includes('name="opt_in" value="0"') && r.text.includes("Slå av bestillinger på e-post"), "ac1-11: opt-in already on -> the off button is still offered");
+    db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 's4-c'").run();
+
     // ── (b) claim confirmation e-mail ───────────────────────────────────────
     const vc = require("../config/vertical-config") as typeof import("../config/vertical-config");
     try { vc.getConfig("rfb"); } catch { vc.loadConfigsAtBoot(); }
@@ -136,6 +163,13 @@ export async function runOwnerOrderOptinHandoffStatsTests(opts: { log?: boolean 
     ok(txt.includes("bestillinger") && txt.includes("https://x.no/eier/s4-a/portal#bestillinger"), "mail-01: text mentions orders toggle + link");
     ok(html.includes("bestillinger") && html.includes("portal#bestillinger"), "mail-02: html mentions orders toggle + link");
     ok(txt.includes("Gratulerer!") && txt.includes("Lykke til!"), "mail-03: existing text unchanged");
+    // F7: with the agent id the order link goes to the portal card, not to the login link + #bestillinger.
+    const login = "https://rettfrabonden.com/api/marketplace/auth/m/tok123";
+    const txt7: string = (emailService as any).generateClaimConfirmationText("Gard A", login, "s4-a");
+    const html7: string = (emailService as any).generateClaimConfirmationHtml("Gard A", login, "s4-a");
+    ok(txt7.includes("https://rettfrabonden.com/eier/s4-a/portal#bestillinger") && !txt7.includes("tok123#bestillinger"), "f7-01: text order link is /eier/<id>/portal#bestillinger");
+    ok(html7.includes("/eier/s4-a/portal#bestillinger") && !html7.includes("tok123#bestillinger"), "f7-02: html order link is /eier/<id>/portal#bestillinger");
+    ok(txt7.includes(login), "f7-03: the login (dashboard) link is still in the mail");
 
     // ── (c) handoff-stats ───────────────────────────────────────────────────
     const h = db.prepare("INSERT INTO cart_handoffs (id, agent_id, cart_id, item_count, created_at) VALUES (?, ?, ?, ?, ?)");

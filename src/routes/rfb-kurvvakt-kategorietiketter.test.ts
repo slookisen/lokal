@@ -220,14 +220,14 @@ export async function runRfbKurvvaktKategorietiketterTests(opts: { log?: boolean
 
       const line = db.prepare("SELECT id FROM cart_items WHERE cart_id = ? AND product_id = 'ks-honning'").get(cart_id) as { id: string };
       assertTrue(cartSvc.deleteCartItem(cart_id, line.id).success, "submitCart: the buyer removes the label line");
-      const ok = cartSvc.submitCart(cart_id, { contact_consent: false });
+      const ok = cartSvc.submitCart(cart_id, { contact_consent: true, buyer_email: "kjoper@example.com" }); // F2: a real order needs contact info
       assertTrue(ok.success === true && ok.orders.length === 1 && ok.orders[0]!.agent_id === BAKERI && ok.contact_handoffs.length === 1,
         "submitCart: without the label the same cart is sent (one order for the real product, one contact handoff)");
 
       const owner = cartSvc.createCart();
       assertTrue(cartSvc.addCartItem(owner.cart_id, "ks-egg-eier", 1).success && cartSvc.addCartItem(owner.cart_id, "ks-egg-pris", 1).success,
         "submitCart setup: an owner-set row and a priced category name in a cart");
-      const sent = cartSvc.submitCart(owner.cart_id, { contact_consent: false });
+      const sent = cartSvc.submitCart(owner.cart_id, { contact_consent: true, buyer_email: "kjoper2@example.com" });
       assertTrue(sent.success === true && sent.orders.length === 2, "submitCart: an owner-set row and a priced category name are sent as orders");
     }
 

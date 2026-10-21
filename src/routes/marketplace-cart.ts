@@ -39,6 +39,7 @@ import {
   getOrder,
   transitionOrder,
   getOrderByConfirmToken,
+  orderPaymentMode,
   addCartWish,
   chooseCartWishOffer,
   deleteCartWish,
@@ -56,6 +57,7 @@ import {
 } from "../services/payment-service";
 import { getDb } from "../database/init";
 import { sendBuyerOrderReceipt, type ReceiptEvent } from "../services/order-receipt-service";
+import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "../services/order-pricing";
 import type { PaymentsStripeClient } from "../services/payment-provider";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
@@ -470,7 +472,11 @@ for (const action of LIFECYCLE_ACTIONS) {
     if (action === "cancel") {
       // Ships with prepayment, like the producer page's cancellation box:
       // with the lifecycle off a captured payment could not be refunded.
-      if (!cancelActionsEnabled()) {
+      // F5: an order that is NOT a prepay order has no money to refund, so
+      // the cancellation works for it whatever PAYMENTS_ENABLED says.
+      let adminOrderMode: string | null = null;
+      try { adminOrderMode = orderPaymentMode(getDb(), cartId(req)); } catch { adminOrderMode = null; }
+      if (!cancelActionsEnabled(adminOrderMode)) {
         res.status(409).json({ success: false, error: "cancellation with a reason requires PAYMENTS_ENABLED=1 or drain" });
         return;
       }
@@ -523,6 +529,7 @@ const CANCEL_REASON_LABEL: Record<string, string> = Object.assign(Object.create(
   producer_cancelled: "kansellert av produsenten",
   buyer_cancelled: "avbestilt av kunden",
   payment_expired: "ikke bekreftet innen fristen – reservasjonen er frigjort",
+  producer_no_response: "ikke besvart innen fristen",
 });
 
 const ORDER_STATUS_LABEL: Record<string, string> = {
@@ -588,11 +595,24 @@ const CANCEL_ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: s
   ],
 };
 
-// The cancellation box ships with prepayment: shown (and accepted on POST)
-// only while the payment lifecycle is on (PAYMENTS_ENABLED=1 or "drain"),
-// so the producer page is unchanged until then.
-function cancelActionsEnabled(): boolean {
-  return isPaymentsLifecycleActive();
+// The cancellation box shipped with prepayment: for a PREPAY order it is shown
+// (and accepted on POST) only while the payment lifecycle is on
+// (PAYMENTS_ENABLED=1 or "drain"), as a captured payment must be refunded.
+// F5 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// an order that is not a prepay order (pay at pickup, the pilot) has no money
+// to refund, so the choices exist for it regardless of PAYMENTS_ENABLED.
+function cancelActionsEnabled(paymentMode: string | null | undefined): boolean {
+  return paymentMode !== "prepay" || isPaymentsLifecycleActive();
+}
+
+/** F8: a SQLite UTC timestamp («2026-10-21 13:05:00») or ISO string, shown in Oslo time. */
+function osloTime(ts: string | null | undefined): string {
+  if (!ts) return "";
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.exec(ts);
+  if (!m) return ts;
+  const iso = `${m[1]}T${m[2]}${m[4] ?? "Z"}`;
+  if (Number.isNaN(Date.parse(iso))) return ts;
+  return formatOsloDateTime(iso);
 }
 
 function cancelHint(p: ReturnType<typeof getPaymentForOrder>): string {
@@ -696,7 +716,7 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
   try { paymentRow = getPaymentForOrder(getDb(), order.order_id); } catch { paymentRow = null; }
 
   const postTo = `/produsent/ordre/${encodeURIComponent(token)}`;
-  const cancelActions = cancelActionsEnabled() ? (CANCEL_ACTIONS_FOR_STATUS[order.status] || []) : [];
+  const cancelActions = cancelActionsEnabled(order.payment_mode) ? (CANCEL_ACTIONS_FOR_STATUS[order.status] || []) : [];
   const actionsHtml = (ACTIONS_FOR_STATUS[order.status] || [])
     .map(
       (a) =>
@@ -708,10 +728,15 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
           .join("\n      ")}\n    </details>`
       : "");
 
+  // F6: no «0 kr» for lines without a price; a sum over only some lines says so.
+  const pageSum = summarizePricing(order.items);
+  const sumHtml = !pageSum.any_priced
+    ? (order.items.length ? `<div><strong>Pris:</strong> ${PRICE_BY_AGREEMENT}</div>` : "")
+    : `<div><strong>${pageSum.is_partial ? PARTIAL_SUM_LABEL : "Sum"}:</strong> ${pageSum.is_partial ? pageSum.priced_total : (order.total_nok ?? pageSum.priced_total)} kr</div>`;
   const itemsHtml = order.items
     .map(
       (i) =>
-        `<div>${escapePageHtml(i.name_snapshot || "Vare")} — ${i.qty ?? "?"} stk${i.line_total != null ? ` (${i.line_total} kr)` : ""}</div>`
+        `<div>${escapePageHtml(i.name_snapshot || "Vare")} — ${i.qty ?? "?"} stk (${i.line_total != null ? `${i.line_total} kr` : PRICE_BY_AGREEMENT})</div>`
     )
     .join("\n      ");
 
@@ -737,7 +762,7 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
 
   const timelineHtml = order.timeline.length
     ? `<div class="recap"><strong>Tidslinje:</strong>\n      ${order.timeline
-        .map((e) => `<div>${escapePageHtml(e.created_at)}: ${escapePageHtml(e.from_status || "–")} → ${escapePageHtml(e.to_status)}</div>`)
+        .map((e) => `<div>${escapePageHtml(osloTime(e.created_at))}: ${escapePageHtml(e.from_status || "–")} → ${escapePageHtml(e.to_status)}</div>`)
         .join("\n      ")}</div>`
     : "";
 
@@ -775,9 +800,9 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
     ${banner}
     <div class="status-line">Status: <strong>${escapePageHtml(statusLabel)}</strong>${CANCEL_REASON_LABEL[order.cancel_reason || ""] ? ` (${CANCEL_REASON_LABEL[order.cancel_reason || ""]})` : ""}</div>
     <div class="recap">
-      <div><strong>Opprettet:</strong> ${escapePageHtml(order.created_at)}</div>
+      <div><strong>Opprettet:</strong> ${escapePageHtml(osloTime(order.created_at))}</div>
       ${order.pickup_time ? `<div><strong>Hentetid:</strong> ${escapePageHtml(order.pickup_time)}</div>` : ""}
-      ${order.total_nok != null ? `<div><strong>Sum:</strong> ${order.total_nok} kr</div>` : ""}
+      ${sumHtml}
       ${itemsHtml}
     </div>
     ${buyerBlockHtml}${paymentRow ? `\n    ${paymentBanner}${paymentHtml}` : ""}
@@ -809,7 +834,7 @@ producerOrderRouter.post(
     const backTo = `/produsent/ordre/${encodeURIComponent(token)}`;
     const action = String((req.body || {})["action"] || "");
     const mapped = PRODUCER_ACTIONS[action];
-    if (!mapped || (action.startsWith("cancel_") && !cancelActionsEnabled())) {
+    if (!mapped || (action.startsWith("cancel_") && !cancelActionsEnabled(order.payment_mode))) {
       res.redirect(303, `${backTo}?error=ugyldig`);
       return;
     }

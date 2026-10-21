@@ -46,7 +46,7 @@ const ENV_KEYS = [
   "PAYMENTS_ENABLED", "PAYMENTS_ALLOWED_AGENT_IDS", "STRIPE_SECRET_KEY", "STRIPE_CONNECT_WEBHOOK_SECRET",
   "PAYMENTS_LIVE", "PAYMENTS_ORG_NR", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "BASE_URL", "ORDER_NOTIFY_EMAIL_VERSION",
   "PAYMENT_CHECKOUT_MINUTES", "PAYMENT_CONFIRM_HOURS", "PLATFORM_FEE_BPS", "PLATFORM_FEE_FIXED_ORE",
-  "ORDER_BUYER_RECEIPTS_ENABLED",
+  "ORDER_BUYER_RECEIPTS_ENABLED", "ORDER_CAP_OPEN_PENDING_PER_BUYER", "ORDER_CAP_NEW_PER_PRODUCER_PER_DAY",
 ];
 
 function makeFakeStripe() {
@@ -170,6 +170,10 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     notifySvc.__setOrderNotifySendForTesting(async (o) => { sent.push({ to: o.to, subject: o.subject, textContent: o.textContent }); return { success: true, messageId: "stub" }; });
     for (const k of ENV_KEYS) delete process.env[k];
     process.env.ADMIN_KEY = "flow-admin-key";
+    // F8: this suite places dozens of orders for the same producers from one
+    // buyer address; the spam caps are tested in order-bestillinger-skive1.test.ts.
+    process.env.ORDER_CAP_OPEN_PENDING_PER_BUYER = "1000";
+    process.env.ORDER_CAP_NEW_PER_PRODUCER_PER_DAY = "1000";
     process.env.BASE_URL = "https://rfb.test";
     process.env.STRIPE_SECRET_KEY = FAKE_TEST_KEY;
 
@@ -248,7 +252,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
       return { cart_id: c.body.cart_id, buyer_ref: c.body.buyer_ref };
     }
     const submit = async (cart: { cart_id: string; buyer_ref: string }, extra: any = {}) => {
-      const r = await req("POST", `/api/marketplace/cart/${cart.cart_id}/submit`, { body: { buyer_ref: cart.buyer_ref, ...extra } });
+      const r = await req("POST", `/api/marketplace/cart/${cart.cart_id}/submit`, { body: { buyer_ref: cart.buyer_ref, contact_consent: true, buyer_email: "default-buyer@example.no", ...extra } });
+      // F2: a real order needs contact info + consent; the default supplies it.
       await settle();
       return r;
     };
@@ -846,7 +851,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
 
     // No e-mail → no receipt; receipts off → nothing sent.
     cart = await newCart([["p-egg", 1]]);
-    r = await submit(cart, { pay_at_pickup: true });
+    // (phone only: F2 needs e-mail OR phone; the receipt needs an e-mail)
+    r = await submit(cart, { pay_at_pickup: true, buyer_email: "", buyer_phone: "+47 400 00 001" });
     oid = r.body.orders[0].order_id;
     receipts.length = 0;
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
@@ -908,7 +914,9 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     ok(!!payAtPickupReceipt && payAtPickupReceipt.text.includes("Du betaler Gård ved henting"), "F17-22: pay-at-pickup receipt says so");
     eq(receiptSvc.renderBuyerReceipt("cancelled", { orderRef: "x", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "u" }, traderStatus: null, items: [], totalNok: null, cancelReason: "no_show", payment: null }), null, "F17-23: no receipt for a no-show");
 
-    // Payments off: no cancellation box, and the POST is refused.
+    // F5 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+    // an order that is NOT a prepay order has no money to refund, so the
+    // cancellation box and the cancel actions exist for it with payments off.
     process.env.PAYMENTS_ENABLED = "1";
     cart = await newCart([["p-poteter", 1]]);
     r = await submit(cart);
@@ -916,11 +924,32 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
     delete process.env.PAYMENTS_ENABLED;
     r = await req("GET", `/produsent/ordre/${tokenOf(oid)}`);
-    ok(!r.text.includes("Kanseller ordren …"), "F17-24: payments off → producer page without the cancellation box");
+    ok(r.text.includes("Kanseller ordren …") && r.text.includes("Jeg kan ikke levere"), "F17-24: payments off, pay-at-pickup order → producer page HAS the cancellation box (F5)");
     r = await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "cancel_producer" } });
-    ok((r.location || "").includes("error=ugyldig") && orderRow(oid).status === "confirmed", "F17-25: payments off → cancel POST refused, order unchanged");
+    ok((r.location || "").includes("done=cancelled") && orderRow(oid).status === "cancelled" && orderRow(oid).cancel_reason === "producer_cancelled", "F17-25: payments off, pay-at-pickup order → cancel POST works (F5)");
+    cart = await newCart([["p-poteter", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
     r = await req("POST", `/admin/marketplace/orders/${oid}/cancel`, { headers: { "X-Admin-Key": "flow-admin-key" }, body: { reason: "producer_cancelled" } });
-    ok(r.status === 409 && orderRow(oid).status === "confirmed", "F17-25b: payments off → admin cancel with a reason refused too");
+    ok(r.status === 200 && orderRow(oid).status === "cancelled", "F17-25b: payments off, pay-at-pickup order → admin cancel with a reason works (F5)");
+
+    // A PREPAY order keeps the old rule: with payments off a captured payment
+    // could not be refunded, so no cancellation box and the POSTs are refused.
+    process.env.PAYMENTS_ENABLED = "1";
+    cart = await newCart([["p-egg", 1]]);
+    r = await submit(cart);
+    oid = r.body.orders[0].order_id;
+    pi = fake.pay(r.body.payments[0].checkout_url.split("/").pop());
+    await webhook("payment_intent.amount_capturable_updated", { ...fake.intents.get(pi) });
+    await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
+    delete process.env.PAYMENTS_ENABLED;
+    r = await req("GET", `/produsent/ordre/${tokenOf(oid)}`);
+    ok(!r.text.includes("Kanseller ordren …"), "F17-24p: payments off, PREPAY order → no cancellation box");
+    r = await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "cancel_producer" } });
+    ok((r.location || "").includes("error=ugyldig") && orderRow(oid).status === "confirmed", "F17-25p: payments off, PREPAY order → cancel POST refused, order unchanged");
+    r = await req("POST", `/admin/marketplace/orders/${oid}/cancel`, { headers: { "X-Admin-Key": "flow-admin-key" }, body: { reason: "producer_cancelled" } });
+    ok(r.status === 409 && orderRow(oid).status === "confirmed", "F17-25bp: payments off, PREPAY order → admin cancel with a reason refused too");
 
     // MCP and A2A copy follow the flag.
     const toolsOn2: Record<string, { def: any }> = {};

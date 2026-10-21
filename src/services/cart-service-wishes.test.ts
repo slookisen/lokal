@@ -37,6 +37,9 @@
 
 import Database from "better-sqlite3";
 
+// F2: a real order needs contact info + consent (cart-service CONTACT_REQUIRED_ERROR).
+const BUYER = { buyer_email: "kjoper@example.com", contact_consent: true } as const;
+
 export interface TestSummary {
   passed: number;
   failed: number;
@@ -312,7 +315,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       // (2kg prod-egg for wish #1) — no missing/lost line, matching the
       // reviewer's concern that submitCart() would otherwise silently
       // succeed with an order line missing entirely.
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === true, "repro FIX: submitCart succeeds after the switch");
       if (sub.success) {
         assertEq(sub.orders.length, 1, "repro FIX: exactly one order created");
@@ -372,7 +375,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       if (!w.success) throw new Error("setup failed");
       cartSvc.chooseCartWishOffer(cart.cart_id, w.wish.id, { productId: "prod-potet" });
 
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === true, "submitCart: cart with an eligible chosen offer submits successfully");
       if (sub.success) {
         assertEq(sub.orders.length, 1, "submitCart: exactly one order created for the eligible producer");
@@ -450,7 +453,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       db.prepare("UPDATE agent_knowledge SET verification_status = 'pending' WHERE agent_id = ?").run("agent-turns-ineligible");
       assertTrue(cartSvc.isProducerEligible("agent-turns-ineligible") === false, "setup: isProducerEligible() now correctly reports false");
 
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === true, "submitCart: still submits successfully (re-check demotes to handoff, does not fail submit)");
       if (sub.success) {
         assertEq(sub.orders.length, 0, "submitCart: no order for the now-ineligible producer");
@@ -468,7 +471,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       const add = cartSvc.addCartItem(cart.cart_id, "prod-potet", 2);
       assertTrue(add.success === true, "regression setup: plain addCartItem still works with no wishes involved");
 
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === true, "regression: fase-1 submit (no wishes) still succeeds");
       if (sub.success) {
         assertEq(sub.orders.length, 1, "regression: exactly one order, same as before Slice 1");
@@ -491,7 +494,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       const add = cartSvc.addCartItem(cart.cart_id, "prod-potet", 2);
       assertTrue(add.success === true, "skive2 setup: the product can still be put in a cart (add gate unchanged)");
 
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === true, "skive2: submit still succeeds for a producer that fails the real-order gate (demoted, not rejected)");
       if (sub.success) {
         assertEq(sub.orders.length, 0, "skive2: NO order row for a cross-check-verified producer who has not opted in");
@@ -514,7 +517,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
 
       const cart = cartSvc.createCart();
       cartSvc.addCartItem(cart.cart_id, "prod-potet", 1);
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === true, "skive2: submit succeeds (handoff) for an unclaimed profile");
       if (sub.success) {
         assertEq(sub.orders.length, 0, "skive2: NO order for an opted-in but not owner-claimed producer");
@@ -552,12 +555,14 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       assertEq(view?.delivery_note, "Henter etter kl 16", "skive2 consent: getOrderByConfirmToken() surfaces delivery_note");
     }
 
-    // ═══════════ skive 2: NO consent → the order's contact copy stays NULL ═
-    // ═══════════ (the cart still stores what was typed — Slice 1 unchanged) ═
+    // ═══════════ skive 2 + F2: NO consent → since F2 a real order is ═════
+    // ═══════════ refused (no order, no e-mail, cart stays open); the ══════
+    // ═══════════ typed fields are still stored on the cart (Slice 1) ══════
 
     {
       const cart = cartSvc.createCart();
       cartSvc.addCartItem(cart.cart_id, "prod-potet", 1);
+      const ordersBefore = (db.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n;
       const sub = cartSvc.submitCart(cart.cart_id, {
         buyer_name: "Ola Nordmann",
         buyer_email: "ola@example.com",
@@ -565,17 +570,15 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
         delivery_note: "Ring først",
         contact_consent: false,
       });
-      assertTrue(sub.success === true && sub.orders.length === 1, "skive2 no-consent: the real order is still created");
-      const orderId = sub.success ? sub.orders[0]?.order_id : undefined;
-      const o = db.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(orderId) as any;
-      assertEq([o?.buyer_name, o?.buyer_email, o?.buyer_phone, o?.delivery_note, o?.contact_consent_at], [null, null, null, null, null],
-        "skive2 no-consent: all five producer-facing contact columns on the order are NULL");
-      const c = db.prepare("SELECT buyer_name, buyer_email, contact_consent_at FROM carts WHERE id = ?").get(cart.cart_id) as any;
-      assertEq(c?.buyer_name, "Ola Nordmann", "skive2 no-consent: the cart row still stores the typed name (Slice 1 behaviour unchanged)");
-      assertEq(c?.contact_consent_at, null, "skive2 no-consent: cart contact_consent_at stays NULL");
-      const view = cartSvc.getOrderByConfirmToken(o?.confirm_token);
-      assertEq([view?.buyer_name, view?.buyer_email, view?.buyer_phone, view?.delivery_note], [null, null, null, null],
-        "skive2 no-consent: the producer order view exposes no contact fields");
+      assertTrue(sub.success === false && sub.status === 422 && sub.error.startsWith("contact_required"), "F2 no-consent: a real order without consent is refused with contact_required (422)");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n, ordersBefore, "F2 no-consent: no order row");
+      assertEq((db.prepare("SELECT status FROM carts WHERE id = ?").get(cart.cart_id) as any).status, "open", "F2 no-consent: the cart stays open");
+      const noContact = cartSvc.submitCart(cart.cart_id, { contact_consent: true });
+      assertTrue(noContact.success === false && noContact.status === 422, "F2: consent without an e-mail or phone is refused too");
+      const badEmail = cartSvc.submitCart(cart.cart_id, { contact_consent: true, buyer_email: "not-an-email", buyer_phone: "123" });
+      assertTrue(badEmail.success === false && badEmail.status === 422, "F2: an implausible e-mail and a too-short phone are refused");
+      const phoneOnly = cartSvc.submitCart(cart.cart_id, { contact_consent: true, buyer_phone: "+47 99887766" });
+      assertTrue(phoneOnly.success === true && phoneOnly.orders.length === 1, "F2: consent + phone only is enough");
     }
 
     // ═══════════ skive 2: isEligibleForRealOrder() unit matrix — every ═══
@@ -665,6 +668,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
       // Exactly at the cap is accepted and the submit goes through as normal.
       const atCap = cartSvc.submitCart(cart.cart_id, {
         delivery_note: "y".repeat(cartSvc.SUBMIT_CONTACT_MAX_LEN.delivery_note),
+        buyer_email: "cap-test@example.com", // own address: the F8 per-buyer cap (3 open) is not what this case tests
         contact_consent: true,
       });
       assertTrue(atCap.success === true && atCap.orders.length === 1, "caps: a value exactly at the cap is accepted (one real order)");
@@ -679,7 +683,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
 
     {
       const cart = cartSvc.createCart();
-      const sub = cartSvc.submitCart(cart.cart_id);
+      const sub = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(sub.success === false, "submitCart: a truly empty cart (no items, no wishes) is still rejected");
       if (!sub.success) assertEq(sub.status, 400, "submitCart: empty-cart rejection is a 400");
     }

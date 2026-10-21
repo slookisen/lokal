@@ -25,6 +25,8 @@ import { knowledgeService } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { isBlocked } from "./blocklist-service";
 import { isCategoryLabel } from "../utils/category-label";
+import { classifyCartItemBan, banErrorText, BAN_CHECK_FAILED_ERROR, type BannedItemKind } from "./cart-item-ban";
+import { summarizePricing } from "./order-pricing";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -77,6 +79,8 @@ export interface CartView {
   status: string;
   groups: CartGroup[];
   total_nok: number;
+  /** F6: at least one line has no price; total_nok is the sum over the lines with a price. */
+  total_is_partial: boolean;
   item_count: number;
 }
 
@@ -85,6 +89,8 @@ export interface OrderSummary {
   agent_id: string;
   producer_name: string;
   total_nok: number;
+  /** F6: at least one line has no price, so total_nok only covers the lines with a price. */
+  total_is_partial: boolean;
   status: string;
   // Prerequisite 3 of the prepayment dev-request: the buyer reaches the
   // seller directly for cancellation, withdrawal and complaints — the
@@ -280,6 +286,49 @@ function isCategoryLabelRow(row: { name: string; price_nok: number | null; avail
   return isCategoryLabel({ name: row.name, hasPrice: row.price_nok != null, availabilitySource: row.availability_source });
 }
 
+// ─── F9: alcohol and services/experiences are no cart items ──────────────────
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, F9.
+// Fail-closed (see cart-item-ban.ts): a classifier error refuses the row too.
+
+/** The producer's own types (agents.categories / tags). Tolerant of a DB without the columns. */
+function producerTypesOf(db: any, agentId: string): string[] {
+  try {
+    const row = db.prepare("SELECT categories, tags FROM agents WHERE id = ?").get(agentId) as
+      | { categories: string | null; tags: string | null }
+      | undefined;
+    if (!row) return [];
+    const out: string[] = [];
+    for (const raw of [row.categories, row.tags]) {
+      if (!raw) continue;
+      try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) for (const v of arr) if (typeof v === "string") out.push(v);
+      } catch { /* not JSON: ignore */ }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** The refusal for a catalog row, or null when it may be ordered. Never throws. */
+function bannedItemError(
+  db: any,
+  row: { agent_id: string; name: string; description?: string | null; category?: string | null },
+): { kind: BannedItemKind | "check_failed"; error: string } | null {
+  try {
+    const ban = classifyCartItemBan({
+      name: row.name,
+      description: row.description,
+      category: row.category,
+      producerTypes: producerTypesOf(db, row.agent_id),
+    });
+    return ban ? { kind: ban.kind, error: banErrorText(ban.kind) } : null;
+  } catch {
+    return { kind: "check_failed", error: BAN_CHECK_FAILED_ERROR };
+  }
+}
+
 // ─── Add / upsert item ───────────────────────────────────────────────────────
 
 export type AddItemResult =
@@ -309,7 +358,7 @@ export function addCartItem(
 
   // Verify product
   const product = db.prepare(`
-    SELECT p.id, p.agent_id, p.name, p.availability, p.price_nok, p.availability_source, p.availability_updated_at
+    SELECT p.id, p.agent_id, p.name, p.description, p.category, p.availability, p.price_nok, p.availability_source, p.availability_updated_at
     FROM products p
     WHERE p.id = ?
   `).get(productId) as
@@ -317,6 +366,8 @@ export function addCartItem(
         id: string;
         agent_id: string;
         name: string;
+        description: string | null;
+        category: string | null;
         availability: string;
         price_nok: number | null;
         availability_source: string;
@@ -327,6 +378,9 @@ export function addCartItem(
   if (!product) return { success: false, status: 404, error: "Product not found" };
   // I-S2: before the stock and producer checks, as a label is no product at all.
   if (isCategoryLabelRow(product)) return { success: false, status: 422, error: CATEGORY_LABEL_CART_ERROR };
+  // F9: alcohol and services/experiences can never be ordered (fail-closed).
+  const banned = bannedItemError(db, product);
+  if (banned) return { success: false, status: 422, error: banned.error };
 
   // dev-request 2026-07-13-supply-graph-v1 (salvage slice): gate on the
   // EFFECTIVE availability (staleness-checked), not the raw column — a
@@ -572,12 +626,15 @@ export function chooseCartWishOffer(
   if (productId) {
     // I-S2: refuse a category label before this wish's own row is touched
     // (addCartItem below would refuse it too, but only after the clean-up).
-    const chosen = db.prepare("SELECT name, price_nok, availability_source FROM products WHERE id = ?").get(productId) as
-      | { name: string; price_nok: number | null; availability_source: string }
+    const chosen = db.prepare("SELECT agent_id, name, description, category, price_nok, availability_source FROM products WHERE id = ?").get(productId) as
+      | { agent_id: string; name: string; description: string | null; category: string | null; price_nok: number | null; availability_source: string }
       | undefined;
     if (chosen && isCategoryLabelRow(chosen)) {
       return { success: false, status: 422, error: CATEGORY_LABEL_CART_ERROR };
     }
+    // F9: same refusal before the clean-up (addCartItem would refuse it too).
+    const chosenBan = chosen ? bannedItemError(db, chosen) : null;
+    if (chosenBan) return { success: false, status: 422, error: chosenBan.error };
 
     // Reject if a DIFFERENT wish (or a directly-added, non-wish item)
     // already owns the cart_items row for this exact product in this cart —
@@ -732,8 +789,11 @@ export function viewCart(cartId: string): CartView | null {
   const groups = Array.from(groupMap.values());
   const total_nok = groups.reduce((s, g) => s + g.subtotal_nok, 0);
   const item_count = rows.length;
+  const total_is_partial = summarizePricing(
+    groups.flatMap((g) => g.items.map((i) => ({ line_total: i.line_total })))
+  ).is_partial;
 
-  return { success: true, cart_id: cartId, status: cart.status, groups, total_nok, item_count };
+  return { success: true, cart_id: cartId, status: cart.status, groups, total_nok, total_is_partial, item_count };
 }
 
 // ─── Submit cart ─────────────────────────────────────────────────────────────
@@ -796,6 +856,8 @@ export type SubmitResult =
       unavailable?: Array<{ product_id: string; product_name: string; availability: string }>;
       /** I-S2: the lines that are category labels (422 CATEGORY_LABEL_CART_ERROR). */
       category_labels?: Array<{ product_id: string; product_name: string }>;
+      /** F9: the lines that are alcohol or services/experiences (422). */
+      banned_items?: Array<{ product_id: string; product_name: string; kind: BannedItemKind | "check_failed" }>;
     };
 
 const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -843,6 +905,58 @@ function buildContactHandoff(
   };
 }
 
+// ─── F2: a real order needs buyer contact info ────────────────────────────────
+export const CONTACT_REQUIRED_ERROR =
+  "contact_required: for å legge inn en bestilling trenger produsenten å kunne nå deg. Oppgi e-post eller telefon, og sett contact_consent=true (du godtar at kontaktinfoen deles med produsenten). Ingen bestilling er opprettet. / To place an order the producer must be able to reach you: give an e-mail or a phone number and set contact_consent=true. No order was created.";
+
+const BUYER_EMAIL_RE = /^[^\s@<>,;"'()\\\x00-\x1f\x7f]+@[^\s@<>,;"'()\\\x00-\x1f\x7f]+\.[A-Za-z0-9-]{2,}$/;
+
+/** contact_consent=true and a plausible e-mail or a phone number with at least 6 digits. */
+export function hasUsableBuyerContact(contact?: SubmitContactInput): boolean {
+  if (!contact || contact.contact_consent !== true) return false;
+  const email = (contact.buyer_email || "").trim();
+  if (email && email.length <= 254 && BUYER_EMAIL_RE.test(email)) return true;
+  const phone = (contact.buyer_phone || "").trim();
+  return (phone.match(/\d/g) || []).length >= 6;
+}
+
+// ─── F8: per-producer spam cap ────────────────────────────────────────────────
+// At most N open (pending) orders from the same buyer address to one producer,
+// and at most M new orders per producer per rolling 24 hours (all buyers).
+// Defaults N=3, M=10, read from env on every call.
+function envPositiveInt(name: string, dflt: number): number {
+  const n = Number(process.env[name]);
+  return Number.isInteger(n) && n > 0 ? n : dflt;
+}
+export function orderCapOpenPerBuyer(): number { return envPositiveInt("ORDER_CAP_OPEN_PENDING_PER_BUYER", 3); }
+export function orderCapNewPerDay(): number { return envPositiveInt("ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", 10); }
+
+function orderCapReached(db: any, agentId: string, contact?: SubmitContactInput): boolean {
+  try {
+    const perDay = db.prepare(
+      "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND created_at >= datetime('now', '-1 day')"
+    ).get(agentId) as { n: number };
+    if (perDay.n >= orderCapNewPerDay()) return true;
+    const email = (contact?.buyer_email || "").trim().toLowerCase();
+    const phone = (contact?.buyer_phone || "").replace(/\s+/g, "");
+    if (email) {
+      const open = db.prepare(
+        "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending' AND lower(buyer_email) = ?"
+      ).get(agentId, email) as { n: number };
+      if (open.n >= orderCapOpenPerBuyer()) return true;
+    } else if (phone) {
+      const open = db.prepare(
+        "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending' AND replace(buyer_phone, ' ', '') = ?"
+      ).get(agentId, phone) as { n: number };
+      if (open.n >= orderCapOpenPerBuyer()) return true;
+    }
+    return false;
+  } catch {
+    // A cap that cannot be read must not block a real buyer.
+    return false;
+  }
+}
+
 export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: SubmitOptions): SubmitResult {
   const db = _cartTestDb ?? getDb();
 
@@ -886,6 +1000,8 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
       ci.unit_price_snapshot,
       ci.line_note,
       p.name        AS product_name,
+      p.description AS product_description,
+      p.category    AS product_category,
       p.unit        AS unit,
       p.price_nok   AS price_nok,
       p.availability AS availability,
@@ -904,6 +1020,8 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
     unit_price_snapshot: number | null;
     line_note: string | null;
     product_name: string;
+    product_description: string | null;
+    product_category: string | null;
     unit: string | null;
     price_nok: number | null;
     availability: string;
@@ -927,6 +1045,21 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
       status: 422,
       error: CATEGORY_LABEL_CART_ERROR,
       category_labels: labels.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
+    };
+  }
+
+  // F9: alcohol and services/experiences are no cart items. A row that got in
+  // before the ban existed (or whose catalog row was edited since) is caught
+  // here, on the row as it is now: no order, no handoff, no e-mail.
+  const bannedLines = items
+    .map((i) => ({ i, ban: bannedItemError(db, { agent_id: i.agent_id, name: i.product_name, description: i.product_description, category: i.product_category }) }))
+    .filter((x) => x.ban !== null);
+  if (bannedLines.length > 0) {
+    return {
+      success: false,
+      status: 422,
+      error: bannedLines[0]!.ban!.error,
+      banned_items: bannedLines.map((x) => ({ product_id: x.i.product_id, product_name: x.i.product_name, kind: x.ban!.kind })),
     };
   }
 
@@ -979,6 +1112,25 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   const ineligibleAgentIds = new Set<string>();
   for (const agent_id of byAgent.keys()) {
     (isEligibleForRealOrder(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
+  }
+
+  // F2: a REAL order needs a way for the producer to reach the buyer — consent
+  // to share the contact details plus an e-mail address or a phone number.
+  // Without it the API answers with a clear error: no order row, no e-mail,
+  // and the cart stays open so the buyer can retry with contact details.
+  // Only evaluated when at least one producer would get a real order; a cart
+  // that is all contact-handoffs needs no buyer contact info.
+  if (eligibleAgentIds.size > 0 && !hasUsableBuyerContact(contact)) {
+    return { success: false, status: 422, error: CONTACT_REQUIRED_ERROR };
+  }
+
+  // F8: per-producer spam cap. A producer over the cap gets a contact handoff
+  // instead of one more order (no order row, no e-mail).
+  for (const agent_id of Array.from(eligibleAgentIds)) {
+    if (orderCapReached(db, agent_id, contact)) {
+      eligibleAgentIds.delete(agent_id);
+      ineligibleAgentIds.add(agent_id);
+    }
   }
 
   // Everything that will NOT become a real order — mode='contact' wishes
@@ -1127,11 +1279,15 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
         );
       }
 
+      const pricing = summarizePricing(agentItems.map((i) => ({
+        line_total: i.unit_price_snapshot != null ? i.unit_price_snapshot * i.qty : null,
+      })));
       orderSummaries.push({
         order_id,
         agent_id,
         producer_name,
         total_nok,
+        total_is_partial: pricing.is_partial,
         status: "pending",
       });
 
@@ -1146,8 +1302,15 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
         buyer_ref,
         confirm_token,
         pickup_time: null,
-        total_nok,
-        items: agentItems.map((i) => ({ name: i.product_name, qty: i.qty, unit: i.unit })),
+        // F6: no «0 kr» for an order whose lines have no price at all.
+        total_nok: pricing.any_priced ? total_nok : null,
+        total_is_partial: pricing.is_partial,
+        items: agentItems.map((i) => ({
+          name: i.product_name,
+          qty: i.qty,
+          unit: i.unit,
+          line_total: i.unit_price_snapshot != null ? i.unit_price_snapshot * i.qty : null,
+        })),
         // skive 2: same consent-gated values the transaction just wrote to
         // `orders` — the v2 template renders them (and sets Reply-To).
         ...sharedContact,
@@ -1172,6 +1335,19 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
     void sendOrderNotificationForOrder(notif).catch((err) => {
       console.error(`[order-notify] unexpected rejection order=${notif.order_id}:`, err);
     });
+  }
+
+  // F3: the buyer's receipt at submit («forespørsel til produsenten har
+  // bekreftet», betaling ved henting, lenke til /kjopsvilkar). Behind
+  // ORDER_BUYER_RECEIPTS_ENABLED (a no-op while it is off). A prepay order is
+  // left out: its payment flow tells the buyer something else, and the
+  // «betaling ved henting» sentence would be false for it.
+  for (const o of orderSummaries) {
+    if (prepayAgentIds.has(o.agent_id)) continue;
+    try {
+      const { sendBuyerOrderReceipt } = require("./order-receipt-service") as typeof import("./order-receipt-service");
+      void sendBuyerOrderReceipt(o.order_id, "submitted").catch(() => { /* never fails the submit */ });
+    } catch { /* never fails the submit */ }
   }
 
   // Built AFTER the transaction committed (cart_handoffs rows already
@@ -1205,10 +1381,11 @@ export function buildOrderNotificationInput(orderId: string): OrderNotificationI
     | undefined;
   if (!o || !o.confirm_token) return null;
   const items = db.prepare(`
-    SELECT oi.name_snapshot AS name, oi.qty AS qty, p.unit AS unit
+    SELECT oi.name_snapshot AS name, oi.qty AS qty, p.unit AS unit, oi.line_total AS line_total
     FROM order_items oi LEFT JOIN products p ON p.id = oi.product_id
     WHERE oi.order_id = ? ORDER BY oi.rowid
-  `).all(orderId) as Array<{ name: string | null; qty: number | null; unit: string | null }>;
+  `).all(orderId) as Array<{ name: string | null; qty: number | null; unit: string | null; line_total: number | null }>;
+  const pricing = summarizePricing(items);
   return {
     order_id: o.id,
     agent_id: o.agent_id,
@@ -1216,8 +1393,9 @@ export function buildOrderNotificationInput(orderId: string): OrderNotificationI
     buyer_ref: o.buyer_ref,
     confirm_token: o.confirm_token,
     pickup_time: o.pickup_time,
-    total_nok: o.total_nok,
-    items: items.map((i) => ({ name: i.name ?? "", qty: i.qty ?? 0, unit: i.unit ?? null })),
+    total_nok: items.length > 0 && !pricing.any_priced ? null : o.total_nok,
+    total_is_partial: pricing.is_partial,
+    items: items.map((i) => ({ name: i.name ?? "", qty: i.qty ?? 0, unit: i.unit ?? null, line_total: i.line_total ?? null })),
     buyer_name: o.buyer_name,
     buyer_email: o.buyer_email,
     buyer_phone: o.buyer_phone,
@@ -1240,6 +1418,8 @@ export type OrderView =
       fulfilment: string;
       pickup_time: string | null;
       total_nok: number | null;
+      /** F6: at least one line has no price; total_nok then only covers the lines with a price. */
+      total_is_partial: boolean;
       items: Array<{
         id: string;
         product_id: string | null;
@@ -1377,6 +1557,7 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
     fulfilment: order.fulfilment,
     pickup_time: order.pickup_time,
     total_nok: order.total_nok,
+    total_is_partial: summarizePricing(orderItems).is_partial,
     items: orderItems,
     timeline: getOrderTimeline(order.id),
     ...(() => { const payment = buyerPaymentView(db, order.id); return payment ? { payment } : {}; })(),
@@ -1398,7 +1579,10 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
   cancelled: [],
 };
 
-const SYSTEM_PENDING_CANCEL_REASONS = new Set(["payment_expired", "buyer_cancelled"]);
+// F4: 'producer_no_response' — the producer did not answer within the
+// deadline (set by the order-followups job). Not a decline, so it writes no
+// trust-ledger event.
+const SYSTEM_PENDING_CANCEL_REASONS = new Set(["payment_expired", "buyer_cancelled", "producer_no_response"]);
 
 export type TransitionResult =
   | { success: true; order_id: string; status: string }
@@ -1548,6 +1732,10 @@ export interface ProducerOrderView {
   total_nok: number | null;
   buyer_ref: string;
   created_at: string;
+  /** F5/F6: 'prepay' / 'at_pickup' / null (null = pay at pickup). */
+  payment_mode: string | null;
+  /** F6: at least one line has no price. */
+  total_is_partial: boolean;
   // skive 2: the buyer's consented contact fields, read-only display on the
   // /produsent/ordre/:token page — null for orders created before skive 2,
   // for a no-consent submit, or after the 30-day sweep nulled them.
@@ -1562,6 +1750,16 @@ export interface ProducerOrderView {
     line_total: number | null;
   }>;
   timeline: OrderEvent[];
+}
+
+/** orders.payment_mode, tolerant of a DB without the column (null = pay at pickup). */
+export function orderPaymentMode(db: any, orderId: string): string | null {
+  try {
+    const r = db.prepare("SELECT payment_mode FROM orders WHERE id = ?").get(orderId) as { payment_mode: string | null } | undefined;
+    return r?.payment_mode ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export function getOrderByConfirmToken(token: string): ProducerOrderView | null {
@@ -1603,6 +1801,8 @@ export function getOrderByConfirmToken(token: string): ProducerOrderView | null 
     total_nok: order.total_nok,
     buyer_ref: order.buyer_ref,
     created_at: order.created_at,
+    payment_mode: orderPaymentMode(db, order.id),
+    total_is_partial: summarizePricing(items).is_partial,
     buyer_name: order.buyer_name ?? null,
     buyer_email: order.buyer_email ?? null,
     buyer_phone: order.buyer_phone ?? null,

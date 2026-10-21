@@ -5115,6 +5115,23 @@ function initSchema(db: Database.Database): void {
   //   which also means pay at pickup.
   try { db.exec(`ALTER TABLE orders ADD COLUMN payment_mode TEXT`); } catch { /* already exists — expected */ }
 
+  // F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+  // follow-up bookkeeping for orders nobody answers, all additive and NULL on
+  // every existing row:
+  //   orders.reminder_sent_at : when the single producer reminder (pending for
+  //     ORDER_REMINDER_HOURS, default 24) was sent. Non-NULL = never again.
+  //   orders.notify_failed_at : when the first producer e-mail for the order
+  //     FAILED to send (a skip is no failure). Set by order-notify-service.
+  //   orders.notify_retried_at: when the single re-send of that e-mail was
+  //     tried by the order-followups job. Non-NULL = no further retry.
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN reminder_sent_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_failed_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_retried_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.
