@@ -391,6 +391,20 @@ function markNotifyFailed(orderId: string): void {
 }
 
 /**
+ * Skive 1b (B1): records that the producer e-mail for an order was actually
+ * SENT (the first send or the follow-ups retry, never the reminder). The
+ * follow-ups job only reminds about and auto-cancels orders carrying this
+ * stamp. Best-effort like markNotifyFailed: a DB without the column is
+ * tolerated (the order then simply gets no follow-ups, the safe side).
+ */
+function markNotifySent(orderId: string): void {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    db.prepare("UPDATE orders SET notify_sent_at = COALESCE(notify_sent_at, datetime('now')) WHERE id = ?").run(orderId);
+  } catch { /* best-effort */ }
+}
+
+/**
  * F4: the admin alert («den eksisterende varselkanalen» = the admin
  * notification e-mail, ADMIN_NOTIFICATION_EMAIL, same as the claim
  * notifications). No address configured → logged only. Never throws.
@@ -439,6 +453,29 @@ export async function sendOrderNotificationForOrder(order: OrderNotificationInpu
       console.log(
         `[order-notify] skipped order=${order.order_id} agent=${order.agent_id} reason=${recipient.reason}`
       );
+      // Skive 1b (B1): an order that exists but never reached the producer
+      // (they turned orders off, or the address was blocklisted, between the
+      // submit and this send) gets no notify_sent_at, so the follow-ups never
+      // call it «not answered». The admin is told once, here, instead. The
+      // reminder reports its own outcome (order-followups), and a retry only
+      // follows a failure, so neither alerts again.
+      if (!opts.retry && !opts.reminder) {
+        // Review round 2 (S4): an order that already reached the producer
+        // once (e.g. a prepay order notified at authorization whose later
+        // fallback notice is skipped) is still followed up as usual.
+        let sentBefore: string | null = null;
+        try {
+          const db = _notifyTestDb ?? getDb();
+          sentBefore = (db.prepare("SELECT notify_sent_at FROM orders WHERE id = ?").get(order.order_id) as { notify_sent_at: string | null } | undefined)?.notify_sent_at ?? null;
+        } catch { /* best-effort */ }
+        await sendAdminOrderAlert(
+          `Ordre ${order.order_id.slice(0, 8)}: produsent-e-posten ble ikke sendt`,
+          `Ordre ${order.order_id} (produsent ${order.producer_name}, ${order.agent_id}) ble ikke sendt til produsenten (${recipient.reason}).\n` +
+          (sentBefore
+            ? `Produsenten fikk ordren tidligere (${sentBefore} UTC), så den følges opp som vanlig.`
+            : "Ordren står som «venter på bekreftelse», men får verken påminnelse eller automatisk kansellering. Kontakt produsenten eller kjøperen direkte."),
+        );
+      }
       return "skipped";
     }
 
@@ -459,6 +496,7 @@ export async function sendOrderNotificationForOrder(order: OrderNotificationInpu
     if (result && result.success) {
       // Latency log line — the <1 min notification SLA is measured off this.
       console.log(`[order-notify] sent ${ms}ms order=${order.order_id} agent=${order.agent_id} via=${recipient.via}`);
+      if (!opts.reminder) markNotifySent(order.order_id);
       return "sent";
     }
     console.error(

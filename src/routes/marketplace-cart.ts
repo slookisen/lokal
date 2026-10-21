@@ -40,6 +40,7 @@ import {
   transitionOrder,
   getOrderByConfirmToken,
   orderPaymentMode,
+  PAYMENT_MODE_UNKNOWN,
   addCartWish,
   chooseCartWishOffer,
   deleteCartWish,
@@ -475,7 +476,7 @@ for (const action of LIFECYCLE_ACTIONS) {
       // F5: an order that is NOT a prepay order has no money to refund, so
       // the cancellation works for it whatever PAYMENTS_ENABLED says.
       let adminOrderMode: string | null = null;
-      try { adminOrderMode = orderPaymentMode(getDb(), cartId(req)); } catch { adminOrderMode = null; }
+      try { adminOrderMode = orderPaymentMode(getDb(), cartId(req)); } catch { adminOrderMode = PAYMENT_MODE_UNKNOWN; }
       if (!cancelActionsEnabled(adminOrderMode)) {
         res.status(409).json({ success: false, error: "cancellation with a reason requires PAYMENTS_ENABLED=1 or drain" });
         return;
@@ -601,8 +602,11 @@ const CANCEL_ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: s
 // F5 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
 // an order that is not a prepay order (pay at pickup, the pilot) has no money
 // to refund, so the choices exist for it regardless of PAYMENTS_ENABLED.
-function cancelActionsEnabled(paymentMode: string | null | undefined): boolean {
-  return paymentMode !== "prepay" || isPaymentsLifecycleActive();
+// Skive 1b (S6): a payment_mode that could not be read (PAYMENT_MODE_UNKNOWN)
+// is treated like prepay — fail-closed, never a cancellation without refund.
+export function cancelActionsEnabled(paymentMode: string | null | undefined): boolean {
+  const mayBePrepay = paymentMode === "prepay" || paymentMode === PAYMENT_MODE_UNKNOWN;
+  return !mayBePrepay || isPaymentsLifecycleActive();
 }
 
 /** F8: a SQLite UTC timestamp («2026-10-21 13:05:00») or ISO string, shown in Oslo time. */
