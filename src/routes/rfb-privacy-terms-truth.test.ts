@@ -175,8 +175,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
   const translationsSrc = fs.readFileSync(path.join(__dirname, "..", "services", "profile-translations.ts"), "utf8");
   const marketplaceSrc = fs.readFileSync(path.join(__dirname, "marketplace.ts"), "utf8");
   assertTrue(
-    !/DELETE FROM profile_translations/.test(translationsSrc) && !/DELETE FROM profile_translations/.test(marketplaceSrc),
-    "ground truth: deleting a profile leaves its translations in profile_translations (no DELETE anywhere)"
+    /DELETE FROM profile_translations/.test(translationsSrc) && /deleteAgentProfileTranslations\(db, agentId\)/.test(marketplaceSrc),
+    "ground truth: permanently deleting a profile also deletes its profile_translations + audit rows (slettefrist slice B)"
   );
   assertTrue(
     /CREATE TABLE IF NOT EXISTS crm_contacts[\s\S]{0,300}agent_id TEXT REFERENCES agents\(id\) ON DELETE SET NULL/.test(dbInitSrc) &&

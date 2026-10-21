@@ -247,6 +247,54 @@ export async function runMarketplaceAgentDeleteBlocklistSurvivorTests(
       const agentIdRows = blocklistRowsFor("agent_id", "del-case-1");
       assertEq(agentIdRows.length, 1, "case4: agentId still blocklisted despite the case-insensitive email match");
     }
+
+    // ── Case 5 (slettefrist slice B): permanent delete also removes the
+    // agent's profile_translations + profile_translation_audit rows, and
+    // leaves other agents' rows alone. ───────────────────────────────────
+    {
+      insertAgent({ id: "del-trans-1", name: "Translated Producer AS", email: "trans-del@example.no", url: "https://trans-del.no" });
+      insertAgent({ id: "keep-trans-1", name: "Kept Translated AS", email: "trans-keep@example.no", url: "https://trans-keep.no" });
+      marketplaceRegistry._agentsCache = null;
+
+      const insTr = testDb.prepare(
+        `INSERT INTO profile_translations
+           (platform, entity_type, entity_id, entity_name, field, lang, source_text, source_hash, status)
+         VALUES (?, ?, ?, 'n', ?, ?, 'kilde', 'h', 'published')`,
+      );
+      const insAudit = testDb.prepare(
+        `INSERT INTO profile_translation_audit (translation_id, from_status, to_status, actor) VALUES (?, 'draft', 'published', 'test')`,
+      );
+      const delTrIds: number[] = [];
+      for (const field of ["description", "about"]) {
+        for (const lang of ["en", "sv"]) {
+          delTrIds.push(Number(insTr.run("rfb", "agent", "del-trans-1", field, lang).lastInsertRowid));
+        }
+      }
+      const keepTrId = Number(insTr.run("rfb", "agent", "keep-trans-1", "description", "en").lastInsertRowid);
+      // Same id on the other platform must not be touched by an rfb delete.
+      const oppTrId = Number(insTr.run("opplevagent", "provider", "del-trans-1", "about_text", "en").lastInsertRowid);
+      for (const id of delTrIds) insAudit.run(id);
+      insAudit.run(keepTrId);
+      insAudit.run(oppTrId);
+
+      const r = await callDelete("del-trans-1");
+      assertEq(r.status, 200, "case5: DELETE succeeds (200)");
+      assertEq(readAgent("del-trans-1"), undefined, "case5: agent row is gone");
+
+      const cnt = (sql: string, ...a: unknown[]) => (testDb.prepare(sql).get(...a) as any).c as number;
+      assertEq(cnt("SELECT COUNT(*) c FROM profile_translations WHERE platform = 'rfb' AND entity_id = ?", "del-trans-1"), 0,
+        "case5: deleted agent's profile_translations rows are removed");
+      assertEq(cnt(`SELECT COUNT(*) c FROM profile_translation_audit WHERE translation_id IN (${delTrIds.join(",")})`), 0,
+        "case5: deleted agent's profile_translation_audit rows are removed");
+      assertEq(cnt("SELECT COUNT(*) c FROM profile_translations WHERE entity_id = ?", "keep-trans-1"), 1,
+        "case5: other agent's translation row is untouched");
+      assertEq(cnt("SELECT COUNT(*) c FROM profile_translation_audit WHERE translation_id = ?", keepTrId), 1,
+        "case5: other agent's audit row is untouched");
+      assertEq(cnt("SELECT COUNT(*) c FROM profile_translations WHERE platform = 'opplevagent' AND entity_id = ?", "del-trans-1"), 1,
+        "case5: non-rfb platform row with the same entity_id is untouched");
+      assertEq(cnt("SELECT COUNT(*) c FROM profile_translation_audit WHERE translation_id = ?", oppTrId), 1,
+        "case5: non-rfb audit row is untouched");
+    }
   } catch (err) {
     failed++;
     failures.push(`marketplace-agent-delete-blocklist-survivor: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);

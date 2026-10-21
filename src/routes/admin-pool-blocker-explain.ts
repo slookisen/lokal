@@ -43,7 +43,8 @@
 import { Router, Request, Response } from "express";
 import { getDb, isContentQualified, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
-import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors } from "../services/outreach-suppression-signals";
+import { buildCrossPlatformIdentity } from "../services/cross-platform-match";
+import { getRecentlyEmailedAddresses, getCrossPlatformSuppressors, getOpenExperiencesDb } from "../services/outreach-suppression-signals";
 
 const router = Router();
 
@@ -89,6 +90,7 @@ interface ExplainRow {
   umbrella_type: string | null;
   is_active: number | null;
   a_url: string | null;
+  org_nr: string | null;
   contact_email: string | null;
   claimed_at: string | null;
   k_website: string | null;
@@ -440,12 +442,12 @@ router.get("/", (req: Request, res: Response) => {
   // (GET /admin/outreach-candidates?mode=first) uses, see
   // outreach-suppression-signals.ts.
   const recentlyEmailedAddresses = getRecentlyEmailedAddresses(db, cooldownDays);
-  const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays);
+  const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays, { expDb: getOpenExperiencesDb() });
 
   const stmt = db.prepare(`
     SELECT a.id AS id, a.name AS name, a.umbrella_type AS umbrella_type,
            a.is_active AS is_active, a.url AS a_url, a.contact_email AS contact_email,
-           a.claimed_at AS claimed_at,
+           a.claimed_at AS claimed_at, a.org_nr AS org_nr,
            k.website AS k_website, k.verification_status AS verification_status,
            k.enrichment_status AS enrichment_status, k.email AS k_email,
            k.phone AS k_phone, k.address AS k_address, k.about AS about,
@@ -511,6 +513,9 @@ router.get("/", (req: Request, res: Response) => {
     // reasons (replied/opted-out/customer/hard-bounced/etc.) are already
     // covered by this route's existing pool_blockers/signals above.
     const emailLower = email.toLowerCase();
+    const crossPlatformFound = email.length > 0
+      ? crossPlatformSuppressors.find(buildCrossPlatformIdentity({ email, website: homepage, orgNr: row.org_nr }))
+      : undefined;
     const gate = {
       blocklisted: isBlocked({
         agentId: row.id,
@@ -519,7 +524,7 @@ router.get("/", (req: Request, res: Response) => {
         website: kWebsite || undefined,
       }).blocked,
       recent_crm_send_email_match: email.length > 0 && recentlyEmailedAddresses.has(emailLower),
-      cross_platform_cooldown: email.length > 0 && crossPlatformSuppressors.has(emailLower),
+      cross_platform_cooldown: crossPlatformFound !== undefined,
     };
 
     // ── Funnel A: outreach-ready pool legs (admin-outreach-pool.ts order) ──
@@ -609,6 +614,9 @@ router.get("/", (req: Request, res: Response) => {
       // gate-felt: see the `gate` computation above — same helpers the real
       // gate uses, never a parallel reimplementation.
       gate,
+      // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+      // which rule made gate.cross_platform_cooldown true (kept outside `gate`).
+      cross_platform_match: crossPlatformFound?.match ?? null,
       signals: {
         umbrella_type: row.umbrella_type,
         business_type: row.business_type,

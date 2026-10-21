@@ -7,6 +7,7 @@ import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, p
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
+import { deleteAgentProfileTranslations } from "../services/profile-translations";
 import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
@@ -3844,6 +3845,9 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       // admin-outreach-candidates.ts sum rollup + remaining raw) would reappear
       // out of the rollup remainder if the same agent_id were ever reused.
       db.prepare("DELETE FROM agent_view_daily WHERE agent_id = ?").run(agentId);
+      // EN/SV profile translations + their audit rows are derived from the
+      // agent's own prose, so they go with it (slettefrist slice B).
+      deleteAgentProfileTranslations(db, agentId);
       db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
     });
     deleteAll();
@@ -4138,7 +4142,10 @@ router.post("/admin/deduplicate", (req: Request, res: Response) => {
   if (!dryRun && duplicates.length > 0) {
     const deleteStmt = db.prepare("DELETE FROM agents WHERE id = ?");
     const deleteMany = db.transaction((ids: string[]) => {
-      for (const id of ids) deleteStmt.run(id);
+      for (const id of ids) {
+        deleteAgentProfileTranslations(db, id);
+        deleteStmt.run(id);
+      }
     });
     deleteMany(duplicates.map(d => d.id));
   }
