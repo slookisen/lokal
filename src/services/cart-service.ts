@@ -1752,13 +1752,26 @@ export interface ProducerOrderView {
   timeline: OrderEvent[];
 }
 
-/** orders.payment_mode, tolerant of a DB without the column (null = pay at pickup). */
+/**
+ * Skive 1b (S6): returned by orderPaymentMode when the order's payment_mode
+ * could not be READ. Distinct from null (a pay-at-pickup order), so a read
+ * error can never open the cancellation of a prepay order whose captured
+ * payment would then not be refunded — the callers treat it like prepay.
+ */
+export const PAYMENT_MODE_UNKNOWN = "unknown";
+
+/**
+ * orders.payment_mode (null = pay at pickup). A DB without the column (an old
+ * or minimal schema) has no prepay orders at all, so it reads as null; any
+ * other read error is PAYMENT_MODE_UNKNOWN (fail-closed, S6).
+ */
 export function orderPaymentMode(db: any, orderId: string): string | null {
   try {
     const r = db.prepare("SELECT payment_mode FROM orders WHERE id = ?").get(orderId) as { payment_mode: string | null } | undefined;
     return r?.payment_mode ?? null;
-  } catch {
-    return null;
+  } catch (err) {
+    if (/no such column/i.test(String((err as any)?.message || err))) return null;
+    return PAYMENT_MODE_UNKNOWN;
   }
 }
 

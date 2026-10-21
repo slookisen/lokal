@@ -72,17 +72,17 @@ const ALCOHOL_STEMS = [
   "rodvin", "hvitvin", "rosevin", "baervin", "plommevin", "paerevin", "eplevin", "fruktvin", "dessertvin", "portvin",
   "musserende", "champagne", "prosecco", "sherry",
   "mjod", "cider", "sider", "pilsner", "juleol", "pasketo", "bokkol", "halvol", "hveteol", "lagerol", "mikrobryggeri",
-  "hardcider", "seltzer",
+  "hardcider", "seltzer", "spritz",
 ];
 const ALCOHOL_WORDS = new Set([
   "gin", "rom", "rum", "ol", "vin", "ale", "ipa", "stout", "porter", "beer", "wine", "spirits", "pils",
-  "vermouth", "vermut", "cava", "bitter",
+  "vermouth", "vermut", "cava",
 ]);
 // Whole tokens that look like alcohol but are goods.
 const NOT_ALCOHOL_TOKENS = new Set(["rommegrot", "rommekolle", "romsaus", "vinaigrette", "vinegar", "vineddik", "vinbaer"]);
 // «rom» is Norwegian for fish roe as well as the spirit: a roe marker in the
 // same text clears it. Without one the word is treated as alcohol (fail-closed).
-const ROE_MARKERS = new Set(["rogn", "kaviar", "romkaviar", "fiskerom", "torskerom", "sildrom", "lakserom", "stromming"]);
+const ROE_MARKERS = new Set(["rogn", "kaviar", "romkaviar", "fiskerom", "torskerom", "sildrom", "lakserom", "stromming", "lodderom", "sikrom", "lojrom", "loyrom", "krepsrom"]);
 
 // Compounds ending in «ol» («gardsol», «hveteol») or «vin» («gardsvin»,
 // «rabarbravin») are drinks. Long tokens only (not «sol», «kol», «Kevin»), and
@@ -91,7 +91,16 @@ const NOT_ALCOHOL_COMPOUNDS = new Set(["mentol", "sorbitol", "xylitol", "erytrit
 
 function isAlcoholToken(t: string): boolean {
   if (NOT_ALCOHOL_TOKENS.has(t)) return false;
+  // Skive 1b (S1): vinegar is food whatever it was made from («Cidereddik»,
+  // «Rødvinseddik», «Sherryeddik»).
+  if (t.endsWith("eddik")) return false;
   if (ALCOHOL_WORDS.has(t)) return true;
+  // S1: brews («Julebrygg», «Høstbrygg»; not «bryggekaffe»), rum compounds
+  // («Krydderrom»; the roe compounds are ROE_MARKERS) and bitters compounds
+  // («Gårdsbitter», «Urtebitter»).
+  if (t === "brygg" || (t.length >= 6 && t.endsWith("brygg"))) return true;
+  if (t.length >= 6 && t.endsWith("rom") && !ROE_MARKERS.has(t)) return true;
+  if (t.length >= 8 && t.endsWith("bitter")) return true;
   for (const s of ALCOHOL_STEMS) if (t.startsWith(s) || t.endsWith(s)) return true;
   if (t.length >= 6 && t.endsWith("ol") && !NOT_ALCOHOL_COMPOUNDS.has(t)) return true;
   if (t.length >= 7 && t.endsWith("vin")) return true;
@@ -102,12 +111,14 @@ function isAlcoholToken(t: string): boolean {
 function hasAlcoholFreeMarker(all: string[], raw: string): boolean {
   const lowered = raw.toLowerCase();
   if (/(^|[^0-9])0[,.]?0?\s*%/.test(lowered)) return true;
-  if (/uten alkohol|non[- ]alcoholic|alcohol[- ]free/.test(lowered)) return true;
+  if (/(uten|ingen)( tilsatt)? alkohol|non[- ]alcoholic|alcohol[- ]free/.test(lowered)) return true;
   for (const t of all) {
     if (t === "alkoholfri" || t === "alkoholfritt" || t === "alcoholfree" || t === "nonalcoholic") return true;
     if (t === "saft" || t === "juice" || t === "cordial" || t === "kombucha" || t === "mineralvann" || t === "kildevann" || t === "iste" || t === "kaffe") return true;
     // Musts and squashes: eplemost, paeremost, baermost, solbaersaft.
     if (t.length > 4 && (t.endsWith("most") || t.endsWith("saft")) && !t.endsWith("vinmost")) return true;
+    // S1: juices («Eplejuice», «Gulrotjuice»), also from a cidery.
+    if (t.length > 5 && t.endsWith("juice")) return true;
   }
   return false;
 }
@@ -115,15 +126,43 @@ function hasAlcoholFreeMarker(all: string[], raw: string): boolean {
 // Service / experience stems and words.
 const SERVICE_STEMS = [
   "omvisning", "guidet", "guiding", "gardsbesok", "smaking", "smakskurs", "vinsmaking", "olsmaking",
-  "middag", "kveldsmat", "fireretters", "treretters", "femretters", "konferanse",
+  "kveldsmat", "fireretters", "treretters", "femretters", "konferanse", "servering",
   "moterom", "kurslokale", "selskapslokale", "overnatting", "overnatte", "losji", "hytteutleie", "utleie",
   "dagpakke", "workshop", "opplevelse", "aktivitet", "ridetur", "kanotur", "fisketur",
   "safari", "teambuilding", "billett",
+  // Rooms to rent (skive 1b): without these the «-rom» rule below would call
+  // them rum. Either way they are refused; this gives the right message.
+  "selskapsrom", "festrom", "gjesterom", "hotellrom", "dobbeltrom", "enkeltrom",
 ];
 const SERVICE_WORDS = new Set([
-  "tur", "event", "kurs", "foredrag", "camping", "rom", "spa", "massasje", "lunsj", "frokost",
-  "brunsj", "brunch", "tour", "tasting", "experience", "dinner", "accommodation", "arrangement", "booking",
+  "event", "kurs", "foredrag", "camping", "rom", "spa", "massasje", "middag",
+  "tour", "tasting", "experience", "dinner", "accommodation", "arrangement", "booking",
 ]);
+// Skive 1b (S1): compounds that END in a service word are services too
+// («Ostesmaking», «Gårdsomvisning», «Utvandringshistorier rundtur»).
+// «middag» counts only as a word of its own: «Middagspakke» and «Middagskasse
+// for 4» are goods.
+const SERVICE_SUFFIXES = [
+  "smaking", "omvisning", "servering", "rundtur", "sykkeltur", "battur", "kanotur", "fisketur", "ridetur",
+  "vandretur", "fjelltur", "skogstur", "bygdetur", "gardstur", "kajakktur",
+];
+// S1: weak words. A seated meal or a trip («Frokost», «Lunsj på gården»,
+// «Tur») and the drink «Bitter» are banned only when the word stands for the
+// whole row. Next to a real goods noun it is a modifier and the row is goods:
+// «Frokost egg 12 stk», «Lunsj-baguette», «Grillpølser til tur», «Bitter
+// sjokolade 70 %», «Bitter appelsinmarmelade».
+const WEAK_SERVICE_WORDS = new Set(["frokost", "lunsj", "brunsj", "brunch", "tur"]);
+const WEAK_ALCOHOL_WORDS = new Set(["bitter"]);
+const FILLER_TOKENS = new Set([
+  "pa", "i", "med", "og", "til", "for", "hos", "ved", "av", "en", "et", "ei", "the", "a", "an", "of", "with", "and", "at",
+  "stk", "pk", "kg", "g", "l", "dl", "cl", "ml", "x", "per", "pr",
+  "gard", "garden", "gardsbutikken", "tunet", "laven", "stabburet", "kafe", "kafeen", "cafe", "restaurant", "restauranten",
+]);
+/** True when the tokens hold a weak word and nothing else but filler and numbers. */
+function onlyWeakWord(tks: readonly string[], weak: ReadonlySet<string>): boolean {
+  if (!tks.some((t) => weak.has(t))) return false;
+  return tks.every((t) => weak.has(t) || FILLER_TOKENS.has(t) || /^(\d+%?|%)$/.test(t));
+}
 // «Lunsj/frokost/brunsj» as a SERVICE only means a seated meal; as a take-home
 // goods name («Lunsjpakke») it would not be a bare token. «Rom» is ambiguous
 // (room, roe, rum): see the roe markers; ambiguity is resolved fail-closed.
@@ -168,8 +207,8 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
   const hasRoe = nameTokens.some((t) => ROE_MARKERS.has(t));
   const serviceByName = nameTokens.some((t) => {
     if (t === "rom" && hasRoe) return false;
-    return SERVICE_WORDS.has(t) || startsWithAny(t, SERVICE_STEMS);
-  });
+    return SERVICE_WORDS.has(t) || startsWithAny(t, SERVICE_STEMS) || SERVICE_SUFFIXES.some((s) => t.endsWith(s));
+  }) || onlyWeakWord(nameTokens, WEAK_SERVICE_WORDS);
   if (serviceCategory || serviceByName) {
     return { kind: "service", reason: serviceCategory ? "category" : "name" };
   }
@@ -182,13 +221,16 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
 
   const alcoholWordHit = (tks: string[]): boolean =>
     tks.some((t) => {
-      if (t === "rom" && tks.some((x) => ROE_MARKERS.has(x))) return false;
+      if (t.endsWith("rom") && tks.some((x) => ROE_MARKERS.has(x))) return false;
       return isAlcoholToken(t);
-    });
+    }) || onlyWeakWord(tks, WEAK_ALCOHOL_WORDS);
+  // S1: «rosé» with its accent is the wine; plain «rose» is left alone (the
+  // tokens fold é to e, so this reads the raw name).
+  const roseHit = /(^|[^\p{L}])rosé(?!\p{L})/u.test(name.toLowerCase());
 
   // The name is what the buyer orders: a hit there is alcohol unless the
   // name carries an explicit alcohol-free marker.
-  if (alcoholWordHit(nameTokens) && !alcoholFree) return { kind: "alcohol", reason: "name" };
+  if ((alcoholWordHit(nameTokens) || roseHit) && !alcoholFree) return { kind: "alcohol", reason: "name" };
   if (alcoholCategory && !alcoholFree) return { kind: "alcohol", reason: "category" };
   // beverages + an alcohol word anywhere in the text (description) → alcohol.
   if (isBeverageCategory && !alcoholFree && (alcoholWordHit(textTokens) || textTokens.some((t) => t.startsWith("alkohol")))) {

@@ -471,6 +471,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       const sub = cartSvc.submitCart(cartWith([["p-bonde-potet", 2]]), { ...BUYER, buyer_email: "f4@example.com" });
       const oid = sub.success ? sub.orders[0]!.order_id : "";
       await settle();
+      assertTrue(!!(db.prepare("SELECT notify_sent_at FROM orders WHERE id = ?").get(oid) as any).notify_sent_at, "1b-b1-10: a producer e-mail that was sent stamps notify_sent_at");
       const T0 = new Date("2026-03-10T08:00:00Z");
       db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), oid);
       const at = (h: number) => new Date(T0.getTime() + h * 3600_000);
@@ -512,6 +513,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       process.env.ORDER_AUTOCANCEL_HOURS = "4";
       const s2 = cartSvc.submitCart(cartWith([["p-bonde-potet", 1]]), { ...BUYER, buyer_email: "f4b@example.com" });
       const oid2 = s2.success ? s2.orders[0]!.order_id : "";
+      await settle(); // skive 1b (B1): only an order the producer received gets follow-ups
       db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), oid2);
       sent.length = 0;
       res = await followSvc.processOrderFollowups({ now: at(3) });
@@ -534,6 +536,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       res = await followSvc.processOrderFollowups({ now: new Date() });
       assertEq(res.retried, 1, "ac4-22: the job retries the producer e-mail once");
       assertEq(sent.filter((m) => m.to === "bonde@example.no").length, 1, "ac4-23: …the producer finally gets the order");
+      assertTrue(!!(db.prepare("SELECT notify_sent_at FROM orders WHERE id = ?").get(oid3) as any).notify_sent_at, "1b-b1-11: a retry that succeeds stamps notify_sent_at");
       res = await followSvc.processOrderFollowups({ now: new Date() });
       assertEq(res.retried, 0, "ac4-24: no second retry");
       // A retry that fails too: one more alert, then silence.
@@ -559,6 +562,154 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       const res = await followSvc.processOrderFollowups({ now: new Date("2026-03-20T00:00:00Z") });
       assertEq((db.prepare("SELECT status FROM orders WHERE id = ?").get(oid) as any).status, "pending", "ac4-27: a prepay order is not touched by the follow-ups");
       void res;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Skive 1b — B1: follow-ups only for orders the producer actually RECEIVED
+    // (notify_sent_at); S4: the reminder alert states the outcome; S5: the
+    // reminder UPDATE guard on its own; S6: an unreadable payment_mode is
+    // fail-closed; S1: the F9 word lists.
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      process.env.ORDER_BUYER_RECEIPTS_ENABLED = "1";
+      db.prepare("UPDATE orders SET status = 'completed' WHERE status = 'pending'").run();
+      const T0 = new Date("2026-03-10T08:00:00Z");
+      const at = (h: number) => new Date(T0.getTime() + h * 3600_000);
+      const submitOne = async (email: string): Promise<string> => {
+        const r = cartSvc.submitCart(cartWith([["p-bonde-potet", 1]]), { ...BUYER, buyer_email: email });
+        await settle();
+        return r.success ? r.orders[0]!.order_id : "";
+      };
+      const rowOf = (id: string) => db.prepare("SELECT status, cancel_reason, reminder_sent_at, notify_sent_at FROM orders WHERE id = ?").get(id) as any;
+      const notAnswered = () => receipts.filter((m) => m.textContent.includes("ikke svart"));
+
+      // (i) The pre-gate backlog: an old pending order no code ever sent to the producer.
+      const legacyId = await submitOne("legacy@example.com");
+      db.prepare("UPDATE orders SET notify_sent_at = NULL, created_at = ? WHERE id = ?").run(SQL_NOW(T0), legacyId);
+      sent.length = 0; receipts.length = 0;
+      let res = await followSvc.processOrderFollowups({ now: at(25) });
+      res = await followSvc.processOrderFollowups({ now: at(24 * 120) });
+      const lrow = rowOf(legacyId);
+      assertEq([lrow.status, lrow.cancel_reason, lrow.reminder_sent_at], ["pending", null, null], "1b-b1-01: an old order never sent to the producer is neither reminded about nor cancelled");
+      assertEq(sent.length + receipts.length, 0, "1b-b1-02: …and nobody gets an e-mail about it");
+      assertEq([res.examined, res.cancelled, res.reminders_sent], [0, 0, 0], "1b-b1-03: the job does not pick it up at all");
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(legacyId);
+
+      // (ii) A SKIPPED send (the producer turned orders off between the submit and the e-mail).
+      const skId = await submitOne("skipped@example.com");
+      db.prepare("UPDATE orders SET notify_sent_at = NULL, created_at = ? WHERE id = ?").run(SQL_NOW(T0), skId);
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-bonde'").run();
+      sent.length = 0; receipts.length = 0;
+      const outcome = await notifySvc.sendOrderNotificationForOrder(cartSvc.buildOrderNotificationInput(skId)!);
+      assertEq(outcome, "skipped", "1b-b1-04: the producer e-mail is skipped");
+      assertEq(rowOf(skId).notify_sent_at, null, "1b-b1-05: a skipped send leaves notify_sent_at empty");
+      assertEq(sent.filter((m) => m.to === ADMIN_MAIL && m.subject.includes("ble ikke sendt")).length, 1, "1b-b1-06: the admin is told once that the producer e-mail was not sent");
+      assertEq(sent.filter((m) => m.to === "bonde@example.no").length, 0, "1b-b1-07: nothing goes to the producer");
+      sent.length = 0;
+      res = await followSvc.processOrderFollowups({ now: at(100) });
+      const srow = rowOf(skId);
+      assertEq([srow.status, srow.cancel_reason], ["pending", null], "1b-b1-08: a skipped order is never cancelled as producer_no_response");
+      assertEq(notAnswered().length, 0, "1b-b1-09: the buyer never gets the «har ikke svart» receipt for it");
+      assertEq(sent.length, 0, "1b-b1-12: no reminder and no further alert for it");
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-bonde'").run();
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(skId);
+      // (iii) AC4 for orders that WERE sent is unchanged: ac4-01…ac4-26 above (now with notify_sent_at).
+
+      // S4: the reminder alert says what actually happened to the reminder.
+      const s4Id = await submitOne("s4@example.com");
+      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), s4Id);
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-bonde'").run();
+      sent.length = 0;
+      res = await followSvc.processOrderFollowups({ now: at(25) });
+      const s4Alert = sent.find((m) => m.to === ADMIN_MAIL && m.subject.includes("ubesvart"));
+      assertEq(res.reminders_sent, 0, "1b-s4-01: a reminder that could not be sent is not counted as sent");
+      assertTrue(!!s4Alert && s4Alert.textContent.includes("Påminnelsen ble ikke sendt") && !s4Alert.textContent.includes("har fått én påminnelse"), "1b-s4-02: …and the alert says it was not sent");
+      assertTrue(!!rowOf(s4Id).reminder_sent_at, "1b-s4-03: the reminder step is still spent (no retry loop)");
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-bonde'").run();
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(s4Id);
+      const s4bId = await submitOne("s4b@example.com");
+      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), s4bId);
+      sent.length = 0;
+      failSends = 1; // the reminder fails; the alerts after it go through
+      res = await followSvc.processOrderFollowups({ now: at(25) });
+      const s4bAlert = sent.find((m) => m.to === ADMIN_MAIL && m.subject.includes("ubesvart"));
+      assertTrue(!!s4bAlert && s4bAlert.textContent.includes("kunne ikke sendes") && res.reminders_sent === 0, "1b-s4-04: a failed reminder: the alert says it could not be sent");
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(s4bId);
+
+      // S5: the reminder UPDATE guard on its own — a run that read reminder_sent_at as NULL
+      // before another run stamped it must not send a second reminder.
+      const s5Id = await submitOne("s5@example.com");
+      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), s5Id);
+      const stale = { id: s5Id, agent_id: "ag-bonde", created_at: SQL_NOW(T0), reminder_sent_at: null, producer_name: "Bonde Gård" };
+      sent.length = 0;
+      res = await followSvc.processOrderFollowups({ now: at(25) });
+      assertEq(res.reminders_sent, 1, "1b-s5-01: the first run sends the reminder");
+      const staleDb = new Proxy(db as any, {
+        get(target, prop) {
+          if (prop === "prepare") {
+            return (sql: string) => (/FROM orders o INNER JOIN agents a/.test(sql) ? { all: () => [stale] } : target.prepare(sql));
+          }
+          const v = target[prop];
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+      sent.length = 0;
+      res = await followSvc.processOrderFollowups({ now: at(26), db: staleDb });
+      assertEq([res.reminders_sent, sent.length], [0, 0], "1b-s5-02: a stale read sends no second reminder and no second alert");
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(s5Id);
+
+      // S6: an unreadable payment_mode is fail-closed (never a cancellation without refund).
+      const busy = { prepare: () => { throw new Error("SQLITE_BUSY: database is locked"); } };
+      const noColumn = { prepare: () => { throw new Error("no such column: payment_mode"); } };
+      assertEq(cartSvc.orderPaymentMode(busy, "x"), cartSvc.PAYMENT_MODE_UNKNOWN, "1b-s6-01: a read error is «unknown», not pay at pickup");
+      assertEq(cartSvc.orderPaymentMode(noColumn, "x"), null, "1b-s6-02: a DB without the column has no prepay orders (null)");
+      delete process.env.PAYMENTS_ENABLED;
+      const cartRoutes = require("./marketplace-cart") as typeof import("./marketplace-cart");
+      assertEq(
+        [cartRoutes.cancelActionsEnabled(null), cartRoutes.cancelActionsEnabled("at_pickup"), cartRoutes.cancelActionsEnabled("prepay"), cartRoutes.cancelActionsEnabled(cartSvc.PAYMENT_MODE_UNKNOWN)],
+        [true, true, false, false],
+        "1b-s6-03: with payments off the cancel choices are closed for prepay AND for an unreadable mode",
+      );
+
+      // S1: the F9 word lists — one assertion per row (review probe 2026-10-21).
+      const c = (name: string, category?: string, producerTypes: string[] = [], description?: string) =>
+        banSvc.classifyCartItemBan({ name, category, producerTypes, description })?.kind ?? null;
+      assertEq(c("Julebrygg"), "alcohol", "1b-s1-01: «-brygg» is a brew (Julebrygg)");
+      assertEq(c("Julebrygg", "beverages"), "alcohol", "1b-s1-02: …also as a beverage of a non-drink producer");
+      assertEq(c("Høstbrygg"), "alcohol", "1b-s1-03: «-brygg» (Høstbrygg)");
+      assertEq(c("Bryggekaffe"), null, "1b-s1-04: «brygg-» as the first part is not a brew (Bryggekaffe)");
+      assertEq(c("Krydderrom"), "alcohol", "1b-s1-05: a «rom» compound is rum (Krydderrom)");
+      assertEq(c("Torskerom"), null, "1b-s1-06: …but a roe compound is food (Torskerom)");
+      assertEq(c("Romkaviar"), null, "1b-s1-07: …and so is «Romkaviar»");
+      assertEq(c("Selskapsrom"), "service", "1b-s1-08: a room to rent is a service (Selskapsrom)");
+      assertEq(c("Rosé"), "alcohol", "1b-s1-09: «Rosé» with its accent is wine");
+      assertEq(c("Rose"), null, "1b-s1-10: …plain «Rose» is not");
+      assertEq(c("Rosenkål"), null, "1b-s1-11: …nor «Rosenkål»");
+      assertEq(c("Spritz"), "alcohol", "1b-s1-12: «Spritz»");
+      assertEq(c("Ostesmaking"), "service", "1b-s1-13: «-smaking» as the last part is a tasting (Ostesmaking)");
+      assertEq(c("Utvandringshistorier rundtur"), "service", "1b-s1-14: a «rundtur» is a tour");
+      assertEq(c("Servering med lokale råvarer"), "service", "1b-s1-15: «servering» is a service");
+      assertEq(c("Cidereddik"), null, "1b-s1-16: vinegar is food (Cidereddik)");
+      assertEq(c("Sidereddik"), null, "1b-s1-17: (Sidereddik)");
+      assertEq(c("Rødvinseddik"), null, "1b-s1-18: (Rødvinseddik)");
+      assertEq(c("Sherryeddik"), null, "1b-s1-19: (Sherryeddik)");
+      assertEq(c("Middagspakke"), null, "1b-s1-20: «middag» in a compound is goods (Middagspakke)");
+      assertEq(c("Middagskasse for 4"), null, "1b-s1-21: (Middagskasse for 4)");
+      assertEq(c("To-retters middag"), "service", "1b-s1-22: «middag» as a word of its own is still a service");
+      assertEq(c("Frokost egg 12 stk"), null, "1b-s1-23: «frokost» next to a goods noun is goods");
+      assertEq(c("Lunsj-baguette"), null, "1b-s1-24: «lunsj» next to a goods noun is goods");
+      assertEq(c("Frokost"), "service", "1b-s1-25: «Frokost» on its own is a service");
+      assertEq(c("Lunsj på gården"), "service", "1b-s1-26: «Lunsj på gården» is a service");
+      assertEq(c("Bitter sjokolade 70 %"), null, "1b-s1-27: «bitter» next to a goods noun is goods");
+      assertEq(c("Bitter appelsinmarmelade"), null, "1b-s1-28: (Bitter appelsinmarmelade)");
+      assertEq(c("Bitter"), "alcohol", "1b-s1-29: «Bitter» on its own is the drink");
+      assertEq(c("Bitter 40 %"), "alcohol", "1b-s1-30: (Bitter 40 %)");
+      assertEq(c("Gårdsbitter"), "alcohol", "1b-s1-31: a bitters compound is the drink (Gårdsbitter)");
+      assertEq(c("Grillpølser til tur"), null, "1b-s1-32: «tur» after a goods noun is goods");
+      assertEq(c("Tur"), "service", "1b-s1-33: «Tur» on its own is a service");
+      assertEq(c("Eplejuice", "beverages", ["sideri"]), null, "1b-s1-34: «-juice» is alcohol-free, also from a cidery");
+      assertEq(c("Eplejuice", "beverages", ["sideri"], "Ingen tilsatt alkohol"), null, "1b-s1-35: …also when the description mentions «alkohol»");
+      delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
     }
 
     // ════════════════════════════════════════════════════════════════════════

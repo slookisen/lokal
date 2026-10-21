@@ -2381,8 +2381,12 @@ if (
 // producer_no_response after ORDER_AUTOCANCEL_HOURS (72) for pay-at-pickup
 // orders nobody answered. Hourly; idempotent (services/order-followups.ts).
 // Rollback: set the hours very high, or RFB_DISABLE_ORDER_FOLLOWUPS=1.
+// Skive 1b (S3): a bare 60-min setInterval restarts its clock on every deploy
+// or machine restart, so with restarts more often than hourly the job never
+// ran. It now also runs once 5 min after boot; the job is idempotent, so the
+// extra run is harmless.
 if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
-  setInterval(trackJob("order-followups", async () => {
+  const orderFollowupsTick = trackJob("order-followups", async () => {
     try {
       const { processOrderFollowups } = await import("./services/order-followups");
       const r = await processOrderFollowups();
@@ -2395,7 +2399,9 @@ if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
     } catch (err) {
       console.error("[order-followups] tick failed:", err);
     }
-  }), 60 * 60_000);
+  });
+  setTimeout(orderFollowupsTick, 5 * 60_000);
+  setInterval(orderFollowupsTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───

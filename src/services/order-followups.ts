@@ -15,6 +15,15 @@
  *      event for it. The buyer gets the cancellation receipt with the
  *      producer's contact details when ORDER_BUYER_RECEIPTS_ENABLED=1.
  *
+ * Steps 2 and 3 only apply to orders the producer actually RECEIVED
+ * (orders.notify_sent_at, skive 1b / B1). An order whose producer e-mail was
+ * skipped or never sent — including every order created before the strict
+ * order gate, which no code ever notified — is never reminded about and never
+ * cancelled as «not answered»: that would be a false statement about the
+ * producer. A skipped send alerts the admin once (order-notify-service), a
+ * failed one alerts and is retried once (step 1). The pre-gate backlog is
+ * left for Daniel's one-off clean-up.
+ *
  * Prepay orders have their own deadline job (payment-service, payment_expired)
  * and are left alone. Idempotent: every step claims its row with a guarded
  * UPDATE first, so two overlapping runs (or two instances) do each step once.
@@ -83,11 +92,13 @@ export async function processOrderFollowups(
     }
   }
 
-  // 2 + 3. reminder and auto-cancel of orders nobody answered
+  // 2 + 3. reminder and auto-cancel of orders nobody answered — only orders
+  // the producer actually received (notify_sent_at, B1).
   const pending = db.prepare(`
     SELECT o.id, o.agent_id, o.created_at, o.reminder_sent_at, a.name AS producer_name
     FROM orders o INNER JOIN agents a ON a.id = o.agent_id
     WHERE o.status = 'pending' AND COALESCE(o.payment_mode, '') <> 'prepay'
+      AND o.notify_sent_at IS NOT NULL
   `).all() as Array<{ id: string; agent_id: string; created_at: string; reminder_sent_at: string | null; producer_name: string }>;
   for (const o of pending) {
     out.examined++;
@@ -109,13 +120,18 @@ export async function processOrderFollowups(
         ).run(stamp, o.id);
         if (claimed.changes !== 1) continue;
         const input = buildOrderNotificationInput(o.id);
-        if (input) await sendOrderNotificationForOrder({ ...input, reminder: true }, { reminder: true });
+        const outcome = input ? await sendOrderNotificationForOrder({ ...input, reminder: true }, { reminder: true }) : "skipped";
+        // S4: the alert states what actually happened to the reminder.
+        const reminderLine =
+          outcome === "sent" ? "Produsenten har fått én påminnelse."
+          : outcome === "failed" ? "Påminnelsen til produsenten kunne ikke sendes."
+          : "Påminnelsen ble ikke sendt, fordi produsenten ikke lenger kan motta bestillinger på e-post.";
         await sendAdminOrderAlert(
           `Ordre ${o.id.slice(0, 8)} er ubesvart etter ${orderReminderHours(env)} t`,
           `Ordre ${o.id} hos ${o.producer_name} (${o.agent_id}) har stått som «venter på bekreftelse» siden ${o.created_at} (UTC). ` +
-          `Produsenten har fått én påminnelse. Uten svar blir ordren kansellert etter ${orderAutocancelHours(env)} t.`,
+          `${reminderLine} Uten svar blir ordren kansellert etter ${orderAutocancelHours(env)} t.`,
         );
-        out.reminders_sent++;
+        if (outcome === "sent") out.reminders_sent++;
       }
     } catch (err) {
       out.errors++;

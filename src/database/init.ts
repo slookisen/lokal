@@ -5124,10 +5124,16 @@ function initSchema(db: Database.Database): void {
   //     FAILED to send (a skip is no failure). Set by order-notify-service.
   //   orders.notify_retried_at: when the single re-send of that e-mail was
   //     tried by the order-followups job. Non-NULL = no further retry.
+  //   orders.notify_sent_at   : skive 1b (B1) — when the producer e-mail for
+  //     the order was actually SENT (first send or the retry). Only orders
+  //     with it get the reminder and the producer_no_response cancellation;
+  //     an order the producer never received (the pre-gate backlog, a skipped
+  //     or failed send) is never claimed to be «not answered».
   for (const stmt of [
     `ALTER TABLE orders ADD COLUMN reminder_sent_at TEXT`,
     `ALTER TABLE orders ADD COLUMN notify_failed_at TEXT`,
     `ALTER TABLE orders ADD COLUMN notify_retried_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_sent_at TEXT`,
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
