@@ -473,7 +473,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       await settle();
       assertTrue(!!(db.prepare("SELECT notify_sent_at FROM orders WHERE id = ?").get(oid) as any).notify_sent_at, "1b-b1-10: a producer e-mail that was sent stamps notify_sent_at");
       const T0 = new Date("2026-03-10T08:00:00Z");
-      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), oid);
+      db.prepare("UPDATE orders SET created_at = ?, notify_sent_at = ? WHERE id = ?").run(SQL_NOW(T0), SQL_NOW(T0), oid);
       const at = (h: number) => new Date(T0.getTime() + h * 3600_000);
       const link = `/produsent/ordre/${tokenOf(oid)}`;
       sent.length = 0;
@@ -514,7 +514,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       const s2 = cartSvc.submitCart(cartWith([["p-bonde-potet", 1]]), { ...BUYER, buyer_email: "f4b@example.com" });
       const oid2 = s2.success ? s2.orders[0]!.order_id : "";
       await settle(); // skive 1b (B1): only an order the producer received gets follow-ups
-      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), oid2);
+      db.prepare("UPDATE orders SET created_at = ?, notify_sent_at = ? WHERE id = ?").run(SQL_NOW(T0), SQL_NOW(T0), oid2);
       sent.length = 0;
       res = await followSvc.processOrderFollowups({ now: at(3) });
       assertEq(res.reminders_sent, 1, "ac4-17: ORDER_REMINDER_HOURS=2 -> reminder at 3 h");
@@ -617,7 +617,7 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
 
       // S4: the reminder alert says what actually happened to the reminder.
       const s4Id = await submitOne("s4@example.com");
-      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), s4Id);
+      db.prepare("UPDATE orders SET created_at = ?, notify_sent_at = ? WHERE id = ?").run(SQL_NOW(T0), SQL_NOW(T0), s4Id);
       db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-bonde'").run();
       sent.length = 0;
       res = await followSvc.processOrderFollowups({ now: at(25) });
@@ -625,10 +625,11 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(res.reminders_sent, 0, "1b-s4-01: a reminder that could not be sent is not counted as sent");
       assertTrue(!!s4Alert && s4Alert.textContent.includes("Påminnelsen ble ikke sendt") && !s4Alert.textContent.includes("har fått én påminnelse"), "1b-s4-02: …and the alert says it was not sent");
       assertTrue(!!rowOf(s4Id).reminder_sent_at, "1b-s4-03: the reminder step is still spent (no retry loop)");
+      assertEq(sent.filter((m) => m.to === ADMIN_MAIL).length, 1, "1b-s4-05: a skipped reminder gives exactly one admin alert");
       db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-bonde'").run();
       db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(s4Id);
       const s4bId = await submitOne("s4b@example.com");
-      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), s4bId);
+      db.prepare("UPDATE orders SET created_at = ?, notify_sent_at = ? WHERE id = ?").run(SQL_NOW(T0), SQL_NOW(T0), s4bId);
       sent.length = 0;
       failSends = 1; // the reminder fails; the alerts after it go through
       res = await followSvc.processOrderFollowups({ now: at(25) });
@@ -639,8 +640,8 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       // S5: the reminder UPDATE guard on its own — a run that read reminder_sent_at as NULL
       // before another run stamped it must not send a second reminder.
       const s5Id = await submitOne("s5@example.com");
-      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(SQL_NOW(T0), s5Id);
-      const stale = { id: s5Id, agent_id: "ag-bonde", created_at: SQL_NOW(T0), reminder_sent_at: null, producer_name: "Bonde Gård" };
+      db.prepare("UPDATE orders SET created_at = ?, notify_sent_at = ? WHERE id = ?").run(SQL_NOW(T0), SQL_NOW(T0), s5Id);
+      const stale = { id: s5Id, agent_id: "ag-bonde", created_at: SQL_NOW(T0), notify_sent_at: SQL_NOW(T0), reminder_sent_at: null, producer_name: "Bonde Gård" };
       sent.length = 0;
       res = await followSvc.processOrderFollowups({ now: at(25) });
       assertEq(res.reminders_sent, 1, "1b-s5-01: the first run sends the reminder");
@@ -657,6 +658,30 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       res = await followSvc.processOrderFollowups({ now: at(26), db: staleDb });
       assertEq([res.reminders_sent, sent.length], [0, 0], "1b-s5-02: a stale read sends no second reminder and no second alert");
       db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(s5Id);
+
+      // Review round 2 (R1): after the job was down > 72 h, a first send that only now
+      // succeeds must not be followed in the same run by a «not answered» cancellation.
+      failSends = 1; // the first producer e-mail fails; the admin alert after it goes through
+      const r1Id = await submitOne("r1@example.com");
+      assertTrue(!!rowOf(r1Id) && rowOf(r1Id).notify_sent_at == null, "1b-r1-01: setup: the first send failed (no notify_sent_at)");
+      db.prepare("UPDATE orders SET created_at = ? WHERE id = ?").run(hoursAgo(80), r1Id);
+      sent.length = 0; receipts.length = 0;
+      res = await followSvc.processOrderFollowups({ now: new Date() });
+      const r1row = rowOf(r1Id);
+      assertEq([res.retried, r1row.status, r1row.cancel_reason], [1, "pending", null], "1b-r1-02: the retry delivers the order and the same run does not cancel it");
+      assertEq(notAnswered().length, 0, "1b-r1-03: …and the buyer gets no «har ikke svart» receipt");
+      assertTrue(!!r1row.notify_sent_at, "1b-r1-04: the clock now starts at the successful retry");
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(r1Id);
+
+      // Review round 2 (S4): the skip alert says so when the producer got the order before.
+      const sbId = await submitOne("sentbefore@example.com");
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-bonde'").run();
+      sent.length = 0;
+      await notifySvc.sendOrderNotificationForOrder(cartSvc.buildOrderNotificationInput(sbId)!);
+      const sbAlert = sent.find((m) => m.to === ADMIN_MAIL && m.subject.includes("ble ikke sendt"));
+      assertTrue(!!sbAlert && sbAlert.textContent.includes("fikk ordren tidligere") && !sbAlert.textContent.includes("verken påminnelse"), "1b-s4-06: a skip after an earlier send says the order is followed up as usual");
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-bonde'").run();
+      db.prepare("UPDATE orders SET status = 'completed' WHERE id = ?").run(sbId);
 
       // S6: an unreadable payment_mode is fail-closed (never a cancellation without refund).
       const busy = { prepare: () => { throw new Error("SQLITE_BUSY: database is locked"); } };
@@ -709,6 +734,45 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(c("Tur"), "service", "1b-s1-33: «Tur» on its own is a service");
       assertEq(c("Eplejuice", "beverages", ["sideri"]), null, "1b-s1-34: «-juice» is alcohol-free, also from a cidery");
       assertEq(c("Eplejuice", "beverages", ["sideri"], "Ingen tilsatt alkohol"), null, "1b-s1-35: …also when the description mentions «alkohol»");
+      // Review round 2, B1(a): «bitter» is the drink unless it stands before a food it describes.
+      assertEq(c("Atlungstad Bitter"), "alcohol", "1b-r2-01: «Atlungstad Bitter» (brand + bitter)");
+      assertEq(c("Atlungstad Bitter", "beverages"), "alcohol", "1b-r2-02: …also as a beverage of a producer not typed as a distillery");
+      assertEq(c("Hval Bitter"), "alcohol", "1b-r2-03: «Hval Bitter»");
+      assertEq(c("Bitter fra gården"), "alcohol", "1b-r2-04: «Bitter fra gården»");
+      assertEq(c("Bitter fra gården", "beverages"), "alcohol", "1b-r2-05: …also in beverages");
+      assertEq(c("Gammel bitter"), "alcohol", "1b-r2-06: «Gammel bitter»");
+      assertEq(c("Taffel bitter"), "alcohol", "1b-r2-07: «Taffel bitter»");
+      assertEq(c("Bitter Original 70 cl"), "alcohol", "1b-r2-08: «Bitter Original 70 cl»");
+      assertEq(c("Halvbitter sjokolade"), null, "1b-r2-09: «Halvbitter sjokolade» is chocolate");
+      // B1(b): the juice / «ingen tilsatt alkohol» markers never clear an alcohol word in the name.
+      assertEq(c("Eplesider", "beverages", ["sideri"], "Gjæret eplejuice fra egne epler, 6 %"), "alcohol", "1b-r2-10: cider described as fermented apple juice");
+      assertEq(c("Sider", undefined, [], "Laget av 100 % eplejuice"), "alcohol", "1b-r2-11: «Sider» made of apple juice");
+      assertEq(c("Mjød", undefined, [], "Honning og eplejuice"), "alcohol", "1b-r2-12: «Mjød» with apple juice");
+      assertEq(c("Fruktvin", undefined, [], "Laget av solbærjuice"), "alcohol", "1b-r2-13: «Fruktvin» of blackcurrant juice");
+      assertEq(c("Rabarbravin", undefined, [], "Vin av rabarbrajuice"), "alcohol", "1b-r2-14: «Rabarbravin»");
+      assertEq(c("Eplesider", undefined, [], "Naturlig gjæret, ingen tilsatt alkohol"), "alcohol", "1b-r2-15: «ingen tilsatt alkohol» does not clear «Eplesider»");
+      assertEq(c("Sider", undefined, [], "Ingen alkohol tilsatt"), "alcohol", "1b-r2-16: «Ingen alkohol tilsatt» does not clear «Sider»");
+      // S1 of round 2: new false positives fixed.
+      assertEq(c("Honning fra Bergstrøm gård"), null, "1b-r2-17: «-strøm» names are not rum (Bergstrøm)");
+      assertEq(c("Lindstrøm egg"), null, "1b-r2-18: (Lindstrøm egg)");
+      assertEq(c("Gjedderom"), null, "1b-r2-19: pike roe");
+      assertEq(c("Ørretrom"), null, "1b-r2-20: trout roe");
+      assertEq(c("Seirom"), null, "1b-r2-21: saithe roe");
+      assertEq(c("Hyserom"), null, "1b-r2-22: haddock roe");
+      assertEq(c("Serveringsklar ribbe"), null, "1b-r2-23: «Serveringsklar ribbe» is goods");
+      assertEq(c("Serveringsbrett i eik"), null, "1b-r2-24: «Serveringsbrett i eik» is goods");
+      assertEq(c("Rosé-pepper"), null, "1b-r2-25: «Rosé-pepper» is a spice");
+      assertEq(c("Rosépepper"), null, "1b-r2-26: «Rosépepper» is a spice");
+      assertEq(c("Kaffebrygg"), null, "1b-r2-27: «Kaffebrygg» is coffee");
+      assertEq(c("Tebrygg"), null, "1b-r2-28: «Tebrygg» is tea");
+      assertEq(c("Urtebrygg"), null, "1b-r2-29: «Urtebrygg» is herbal tea");
+      assertEq(c("Spritzkaker"), null, "1b-r2-30: «Spritzkaker» are cookies");
+      assertEq(c("Spritzer"), "alcohol", "1b-r2-31: «Spritzer» is the drink");
+      assertEq(c("Aperolspritz"), "alcohol", "1b-r2-32: «Aperolspritz»");
+      // S2 of round 2: services that start with a weak word and a preposition.
+      assertEq(c("Tur til seteren"), "service", "1b-r2-33: «Tur til seteren»");
+      assertEq(c("Lunsj med utsikt"), "service", "1b-r2-34: «Lunsj med utsikt»");
+      assertEq(c("Lunsj for to personer"), "service", "1b-r2-35: «Lunsj for to personer»");
       delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
     }
 

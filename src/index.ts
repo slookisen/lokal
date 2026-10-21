@@ -2400,7 +2400,10 @@ if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
       console.error("[order-followups] tick failed:", err);
     }
   });
-  setTimeout(orderFollowupsTick, 5 * 60_000);
+  setTimeout(() => {
+    console.log("[order-followups] first run after boot");
+    void orderFollowupsTick();
+  }, 5 * 60_000);
   setInterval(orderFollowupsTick, 60 * 60_000);
 }
 

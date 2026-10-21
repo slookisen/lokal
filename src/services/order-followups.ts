@@ -24,6 +24,11 @@
  * failed one alerts and is retried once (step 1). The pre-gate backlog is
  * left for Daniel's one-off clean-up.
  *
+ * The 24 h / 72 h clock starts when the producer GOT the order:
+ * MAX(created_at, notify_sent_at). After the job was down for longer than the
+ * deadline, a first send that only now succeeds (step 1) must not be followed
+ * in the same run by a «not answered» cancellation (review round 2 of skive 1b).
+ *
  * Prepay orders have their own deadline job (payment-service, payment_expired)
  * and are left alone. Idempotent: every step claims its row with a guarded
  * UPDATE first, so two overlapping runs (or two instances) do each step once.
@@ -95,15 +100,17 @@ export async function processOrderFollowups(
   // 2 + 3. reminder and auto-cancel of orders nobody answered — only orders
   // the producer actually received (notify_sent_at, B1).
   const pending = db.prepare(`
-    SELECT o.id, o.agent_id, o.created_at, o.reminder_sent_at, a.name AS producer_name
+    SELECT o.id, o.agent_id, o.created_at, o.notify_sent_at, o.reminder_sent_at, a.name AS producer_name
     FROM orders o INNER JOIN agents a ON a.id = o.agent_id
     WHERE o.status = 'pending' AND COALESCE(o.payment_mode, '') <> 'prepay'
       AND o.notify_sent_at IS NOT NULL
-  `).all() as Array<{ id: string; agent_id: string; created_at: string; reminder_sent_at: string | null; producer_name: string }>;
+  `).all() as Array<{ id: string; agent_id: string; created_at: string; notify_sent_at?: string | null; reminder_sent_at: string | null; producer_name: string }>;
   for (const o of pending) {
     out.examined++;
     try {
-      const ageMs = now.getTime() - sqliteUtcMs(o.created_at);
+      const sentMs = o.notify_sent_at ? sqliteUtcMs(o.notify_sent_at) : NaN;
+      const startMs = Math.max(sqliteUtcMs(o.created_at), Number.isFinite(sentMs) ? sentMs : -Infinity);
+      const ageMs = now.getTime() - startMs;
       if (!Number.isFinite(ageMs)) continue;
       if (ageMs >= cancelMs) {
         const res = transitionOrder(o.id, "cancelled", { actor: "system", cancelReason: "producer_no_response" });

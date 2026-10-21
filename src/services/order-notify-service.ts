@@ -460,10 +460,20 @@ export async function sendOrderNotificationForOrder(order: OrderNotificationInpu
       // reminder reports its own outcome (order-followups), and a retry only
       // follows a failure, so neither alerts again.
       if (!opts.retry && !opts.reminder) {
+        // Review round 2 (S4): an order that already reached the producer
+        // once (e.g. a prepay order notified at authorization whose later
+        // fallback notice is skipped) is still followed up as usual.
+        let sentBefore: string | null = null;
+        try {
+          const db = _notifyTestDb ?? getDb();
+          sentBefore = (db.prepare("SELECT notify_sent_at FROM orders WHERE id = ?").get(order.order_id) as { notify_sent_at: string | null } | undefined)?.notify_sent_at ?? null;
+        } catch { /* best-effort */ }
         await sendAdminOrderAlert(
           `Ordre ${order.order_id.slice(0, 8)}: produsent-e-posten ble ikke sendt`,
           `Ordre ${order.order_id} (produsent ${order.producer_name}, ${order.agent_id}) ble ikke sendt til produsenten (${recipient.reason}).\n` +
-          "Ordren står som «venter på bekreftelse», men får verken påminnelse eller automatisk kansellering. Kontakt produsenten eller kjøperen direkte.",
+          (sentBefore
+            ? `Produsenten fikk ordren tidligere (${sentBefore} UTC), så den følges opp som vanlig.`
+            : "Ordren står som «venter på bekreftelse», men får verken påminnelse eller automatisk kansellering. Kontakt produsenten eller kjøperen direkte."),
         );
       }
       return "skipped";
