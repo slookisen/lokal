@@ -86,7 +86,8 @@ const ROE_MARKERS = new Set(["rogn", "kaviar", "romkaviar", "fiskerom", "torsker
 // Skive 1b, review round 2: «<fish>rom» is roe («Gjedderom», «Ørretrom», «Seirom», «Hyserom»).
 const ROE_FISH_PREFIXES = [
   "torske", "torsk", "lakse", "laks", "sild", "lodde", "sik", "lojr", "loy", "gjedde", "orret", "sjoorret", "sei", "hyse",
-  "kolje", "abbor", "makrell", "kveite", "steinbit", "fiske", "kreps", "rakfisk", "rodspette", "rodrye", "rye",
+  "kolje", "abbor", "makrell", "kveite", "steinbit", "fiske", "kreps", "krepse", "rakfisk", "rodspette", "rodrye", "rye",
+  "roye", "roy", "hvitfisk", "breiflabb", "rognkjeks",
 ];
 function isRoeToken(t: string): boolean {
   return ROE_MARKERS.has(t) || ROE_FISH_PREFIXES.some((f) => t === f + "rom");
@@ -134,10 +135,11 @@ function hasAlcoholFreeMarker(all: string[], raw: string): boolean {
 }
 
 // Skive 1b (S1) markers: juice compounds («Eplejuice», «Gulrotjuice») and
-// «ingen (tilsatt) alkohol». They clear a beverage from a cidery or a
-// beverage whose description mentions alcohol, but NEVER an alcohol word in
-// the name: «Eplesider» described as «gjæret eplejuice» or «ingen tilsatt
-// alkohol» stays alcohol (review round 2).
+// «ingen (tilsatt) alkohol». Read from the NAME only (review round 3): in a
+// description they say nothing about the row («Eple Brut», a cidery's
+// beverage described as «gjæret eplejuice, 7 %»), so they can never lift an
+// alcohol word in the name, an alcohol category, a beverage mentioning
+// alcohol or a drink producer's beverage. «Eplejuice» from a cidery passes.
 function hasJuiceOrNoAddedAlcoholMarker(all: string[], raw: string): boolean {
   if (/(uten|ingen) tilsatt alkohol|ingen alkohol/.test(raw.toLowerCase())) return true;
   return all.some((t) => t.length > 5 && t.endsWith("juice"));
@@ -259,8 +261,9 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
   const drinkProducer = producerTypeTokens.some((t) => DRINK_PRODUCER_TYPES.has(t) || startsWithAny(t, ["bryggeri", "destilleri", "cideri", "sideri", "vingard", "mjoderi", "brenneri"]));
 
   const alcoholWordHit = (tks: string[]): boolean =>
-    tks.some((t) => {
+    tks.some((t, i) => {
       if (t.endsWith("rom") && tks.some((x) => isRoeToken(x))) return false;
+      if (t === "spritz" && (tks[i + 1] ?? "").startsWith("kak")) return false; // «Spritz-kaker»
       return isAlcoholToken(t);
     }) || bitterIsDrink(tks);
   // S1: «rosé» with its accent is the wine; plain «rose» and «Rosé-pepper» are
@@ -268,7 +271,7 @@ export function classifyCartItemBan(input: CartItemBanInput): CartItemBan | null
   const roseHit = /(^|[^\p{L}])rosé(?!\p{L}|-\p{L})/u.test(name.toLowerCase());
   const nameAlcoholHit = alcoholWordHit(nameTokens) || roseHit;
   const alcoholFree = hasAlcoholFreeMarker(textTokens, raw) ||
-    (!nameAlcoholHit && hasJuiceOrNoAddedAlcoholMarker(textTokens, raw));
+    (!nameAlcoholHit && hasJuiceOrNoAddedAlcoholMarker(nameTokens, name));
 
   // The name is what the buyer orders: a hit there is alcohol unless the
   // name carries an explicit alcohol-free marker.

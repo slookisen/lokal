@@ -773,6 +773,22 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(c("Tur til seteren"), "service", "1b-r2-33: «Tur til seteren»");
       assertEq(c("Lunsj med utsikt"), "service", "1b-r2-34: «Lunsj med utsikt»");
       assertEq(c("Lunsj for to personer"), "service", "1b-r2-35: «Lunsj for to personer»");
+      // Review round 3, B1 rest: the juice / «ingen tilsatt alkohol» markers count from the name only.
+      assertEq(c("Eple Brut", "beverages", ["sideri"], "Gjæret eplejuice, 7 %"), "alcohol", "1b-r3-01: a cidery's beverage described as fermented apple juice");
+      assertEq(c("Høstgull", "beverages", [], "Gjæret eplejuice med 6 % alkohol"), "alcohol", "1b-r3-02: beverages + «alkohol» in the description");
+      assertEq(c("Eple Brut", "cider", [], "Gjæret eplejuice"), "alcohol", "1b-r3-03: an alcohol category is not lifted by «eplejuice» in the description");
+      assertEq(c("Gårdens beste", "beverages", [], "Naturlig gjæret til 7 %, ingen tilsatt alkohol"), "alcohol", "1b-r3-04: «ingen tilsatt alkohol» in the description lifts nothing");
+      assertEq(c("Honningdrikk", "beverages", ["mjoderi"], "Gjæret honning og eplejuice, 11 %"), "alcohol", "1b-r3-05: a meadery's beverage");
+      assertEq(c("Gulrotjuice", "beverages", [], "Inneholder ingen alkohol"), null, "1b-r3-06: a juice named as juice still passes");
+      assertEq(c("Tomatjuice", "beverages", ["bryggeri"]), null, "1b-r3-07: …also from a brewery");
+      // Round 3, S1: more roe; the roe prefix must match exactly (N14).
+      assertEq(c("Røyerom"), null, "1b-r3-08: char roe (Røyerom)");
+      assertEq(c("Krepserom"), null, "1b-r3-09: crayfish roe (Krepserom)");
+      assertEq(c("Hvitfiskrom"), null, "1b-r3-10: whitefish roe");
+      assertEq(c("Breiflabbrom"), null, "1b-r3-11: monkfish roe");
+      assertEq(c("Rognkjeksrom"), null, "1b-r3-12: lumpfish roe");
+      assertEq(c("Sikkerhetsrom") !== null, true, "1b-r3-13: a word that only STARTS like a fish («sik…rom») is not roe");
+      assertEq(c("Spritz-kaker"), null, "1b-r3-14: «Spritz-kaker» are cookies");
       delete process.env.ORDER_BUYER_RECEIPTS_ENABLED;
     }
 
