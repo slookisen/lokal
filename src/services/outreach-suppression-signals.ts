@@ -17,6 +17,12 @@
 // admin-outreach-candidates.ts) — callers are responsible for passing a
 // matching value if they want an identical verdict to a live gate call.
 
+import { getOpenDbHandles } from "../database/db-factory";
+import {
+  CrossPlatformIndex,
+  buildCrossPlatformIdentity,
+} from "./cross-platform-match";
+
 export interface CrossPlatformSuppressor {
   vertical: string;
   last_sent_at: string;
@@ -72,23 +78,33 @@ export function outreachSentLogHasVerticalColumn(db: any): boolean {
     .some((c) => c.name === "vertical_id");
 }
 
-// Steg 4 / 4e (cross-platform cooldown): a map of lowercased recipient email
-// -> the most-recent NON-'rfb' vertical send (and when), within
-// `cooldownDays`, read from outreach_sent_log. Both platforms send from the
-// same verified address, so a recipient mailed recently by another vertical
-// must be excluded from THIS vertical's outreach too — see
-// admin-outreach-candidates.ts's own header comment for the full rationale.
+// Steg 4 / 4e (cross-platform cooldown): an index of the most-recent NON-'rfb'
+// vertical sends (and when), within `cooldownDays`, read from
+// outreach_sent_log. Both platforms send from the same verified address, so a
+// producer mailed recently by another vertical must be excluded from THIS
+// vertical's outreach too — see admin-outreach-candidates.ts's own header
+// comment for the full rationale.
+//
+// dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene: the
+// index no longer answers on the exact e-mail address only. `find()` also
+// matches the same (non-free-mail) e-mail domain, the same website host and
+// the same org number — see cross-platform-match.ts — and says which rule hit.
+// The prior send's website / org number are not stored in outreach_sent_log;
+// for Opplevagent sends they are read from the experiences database when the
+// caller passes it (`opts.expDb`). Without it only email + domain can match.
 // Defensive: on a database that hasn't run the `vertical_id` migration yet,
-// this returns an empty map rather than throwing (same probe the original
+// this returns an empty index rather than throwing (same probe the original
 // inline code used).
 export function getCrossPlatformSuppressors(
   db: any,
   cooldownDays: number,
-): Map<string, CrossPlatformSuppressor> {
+  opts?: { expDb?: any },
+): CrossPlatformIndex<CrossPlatformSuppressor> {
   const cutoff = new Date(Date.now() - cooldownDays * 86400 * 1000).toISOString();
-  const crossPlatformSuppressors = new Map<string, CrossPlatformSuppressor>();
+  const index = new CrossPlatformIndex<CrossPlatformSuppressor>();
 
   if (outreachSentLogHasVerticalColumn(db)) {
+    const opplevagentById = opts?.expDb ? loadOpplevagentIdentityByEmail(opts.expDb, cutoff) : new Map();
     for (const r of db
       .prepare(
         `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
@@ -99,11 +115,110 @@ export function getCrossPlatformSuppressors(
           GROUP BY LOWER(recipient_email), vertical_id`,
       )
       .all(cutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
-      const prev = crossPlatformSuppressors.get(r.email);
-      if (!prev || r.last_sent_at > prev.last_sent_at) {
-        crossPlatformSuppressors.set(r.email, { vertical: r.vertical_id, last_sent_at: r.last_sent_at });
-      }
+      const extra = opplevagentById.get(r.email) as { website: string | null; orgNr: string | null } | undefined;
+      index.add(
+        buildCrossPlatformIdentity({ email: r.email, website: extra?.website, orgNr: extra?.orgNr }),
+        { vertical: r.vertical_id, last_sent_at: r.last_sent_at },
+      );
     }
   }
-  return crossPlatformSuppressors;
+  return index;
+}
+
+// `agents.org_nr` came with a later migration; a database (or fixture) that
+// lacks it simply has no org-number matching, never a failing query.
+export function agentsHasOrgNrColumn(db: any): boolean {
+  try {
+    return (db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>).some((c) => c.name === "org_nr");
+  } catch {
+    return false;
+  }
+}
+
+// The experiences (Opplevagent) database handle IF it is already open — the
+// server opens it at boot (index.ts). Deliberately never opens it: a gate or
+// diagnostic call must not create a database connection as a side effect, and
+// without it the cross-platform check degrades to address + domain matching.
+export function getOpenExperiencesDb(): any | null {
+  try {
+    return getOpenDbHandles().find((h) => h.vertical === "experiences")?.db ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Opplevagent provider website + org number per recipient address, for the
+// sends in the window. Best effort: a missing table / column (older or test
+// database) just means no website / org_nr matching, never an error.
+function loadOpplevagentIdentityByEmail(
+  expDb: any,
+  cutoff: string,
+): Map<string, { website: string | null; orgNr: string | null }> {
+  const out = new Map<string, { website: string | null; orgNr: string | null }>();
+  try {
+    for (const r of expDb
+      .prepare(
+        `SELECT LOWER(l.recipient_email) AS email, p.hjemmeside AS hjemmeside, p.org_nr AS org_nr
+           FROM experience_outreach_sent_log l
+           JOIN experience_providers p ON p.id = l.provider_id
+          WHERE l.is_test = 0 AND l.sent_at >= ?`,
+      )
+      .all(cutoff) as Array<{ email: string; hjemmeside: string | null; org_nr: string | null }>) {
+      out.set(r.email, { website: r.hjemmeside, orgNr: r.org_nr });
+    }
+  } catch {
+    /* experiences schema not available — email + domain matching only */
+  }
+  return out;
+}
+
+export interface RfbSendForOpplevagent {
+  last_sent_at: string;
+  vertical_id: string;
+}
+
+// The mirror image for the Opplevagent lane: an index of what ANY lane sent
+// from the RFB outreach_sent_log within the window, for Opplevagent's own
+// candidate / eligibility checks.
+//   • email key: every row, exactly as before (Opplevagent's own earlier
+//     sends mirrored into this table keep their old exact-address behaviour);
+//   • domain / website / org_nr keys: only rows of OTHER verticals than
+//     'experiences' — an Opplevagent send must not widen into a
+//     same-domain block against Opplevagent itself. Website and org number
+//     of an 'rfb' send are resolved through its agent row
+//     (agents.org_nr, COALESCE(agent_knowledge.website, agents.url)).
+export function getRfbSendIndexForOpplevagent(
+  rfbDb: any,
+  cutoffIso: string,
+): CrossPlatformIndex<RfbSendForOpplevagent> {
+  const index = new CrossPlatformIndex<RfbSendForOpplevagent>();
+  const rows = rfbDb
+    .prepare(
+      `SELECT LOWER(o.recipient_email) AS email, o.vertical_id AS vertical_id, o.sent_at AS sent_at,
+              ${agentsHasOrgNrColumn(rfbDb) ? "a.org_nr" : "NULL"} AS org_nr,
+              COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS website
+         FROM outreach_sent_log o
+         LEFT JOIN agents a ON a.id = o.agent_id
+         LEFT JOIN agent_knowledge k ON k.agent_id = o.agent_id
+        WHERE o.recipient_email IS NOT NULL AND o.recipient_email != ''
+          AND o.sent_at >= ?`,
+    )
+    .all(cutoffIso) as Array<{
+    email: string;
+    vertical_id: string | null;
+    sent_at: string;
+    org_nr: string | null;
+    website: string | null;
+  }>;
+  for (const r of rows) {
+    const payload = { last_sent_at: r.sent_at, vertical_id: r.vertical_id ?? "rfb" };
+    if (payload.vertical_id === "experiences") {
+      index.add(buildCrossPlatformIdentity({ email: r.email }), payload, ["email"]);
+    } else if (payload.vertical_id === "rfb") {
+      index.add(buildCrossPlatformIdentity({ email: r.email, website: r.website, orgNr: r.org_nr }), payload);
+    } else {
+      index.add(buildCrossPlatformIdentity({ email: r.email }), payload);
+    }
+  }
+  return index;
 }
