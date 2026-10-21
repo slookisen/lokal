@@ -38,10 +38,12 @@
 // Correction mode (body.mode = "correct_mixed"): finds rows whose street
 // came from a Brreg write (latest address provenance record has
 // source_type "brreg" and is the stored street) while the stored postnummer
-// or poststed does not match the Brreg address with that street. Dry run by
-// default; it changes rows only with body.apply === true (strict boolean;
-// any other apply value is a 400). Applying sets postnummer/poststed from
-// that same Brreg address and clears lat/lng/geocode_* so the geocode worker
+// does not match the Brreg address with that street (a poststed-only
+// difference is reported and flagged, never written; a unit abroad or not
+// active is flagged). Dry run by default; it changes rows only with
+// body.apply === true (strict boolean; any other apply value is a 400).
+// Applying sets postnummer, and poststed only when it differs too, from that
+// same Brreg address and clears lat/lng/geocode_* so the geocode worker
 // redoes them.
 //
 // Other guard rails (unchanged):
@@ -224,7 +226,7 @@ export function chooseAddress(
 ): Choice {
   // A unit registered abroad (NUF with a foreign forretningsadresse) is
   // skipped even when it also has a Norwegian postadresse or sub-unit.
-  if (ev.forretningsadresse?.adresse && !isNorwegian(ev.forretningsadresse)) return { kind: "foreign" };
+  if (ev.forretningsadresse && !isNorwegian(ev.forretningsadresse)) return { kind: "foreign" };
 
   const distinct = new Map<string, BrregStructuredAddress>();
   for (const s of ev.activeSubUnits) {
@@ -519,6 +521,7 @@ export type CorrectionOutcome =
   | "street_not_in_brreg"      // the stored street is no longer any Brreg address of the unit (flagged)
   | "incomplete_address"       // the matching Brreg address lacks postnummer/poststed (flagged)
   | "foreign_address"          // forretningsadresse or the matching address outside Norway (flagged)
+  | "poststed_only_mismatch"   // postnummer fits, only poststed differs: reported, never written (flagged)
   | "under_liquidation" | "bankrupt" | "deleted" | "not_found" // (flagged, not corrected)
   | "changed_meanwhile"
   | "api_error";
@@ -596,7 +599,7 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
 
       // A unit registered abroad is never corrected (same rule as
       // chooseAddress): a foreign forretningsadresse flags the row.
-      if (ev.forretningsadresse?.adresse && !isNorwegian(ev.forretningsadresse)) {
+      if (ev.forretningsadresse && !isNorwegian(ev.forretningsadresse)) {
         push({ id: row.id, outcome: "foreign_address", fields: [], flagged: true });
         continue;
       }
@@ -631,7 +634,13 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
         counts.consistent++;
         continue;
       }
-      const fields = [...(pnOk ? [] : ["postnummer"]), ...(psOk ? [] : ["poststed"]), "lat", "lng"];
+      // Only a postnummer that does not fit is corrected (Daniel's limit);
+      // a poststed-only difference (e.g. an old spelling) is reported.
+      if (pnOk) {
+        push({ id: row.id, outcome: "poststed_only_mismatch", fields: [], address_source: match.source, flagged: true });
+        continue;
+      }
+      const fields = ["postnummer", ...(psOk ? [] : ["poststed"]), "lat", "lng"];
       if (!apply) {
         counts.would_correct++;
         push({ id: row.id, outcome: "would_correct", fields, address_source: match.source, flagged: false });
@@ -640,20 +649,20 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
       const rec = (value: string) => ({
         value, source_type: "brreg", address_source: match.source, correction: "mixed_address", fetched_at: nowIso,
       });
-      if (!pnOk) appendProv(prov, "postnummer", rec(a.postnummer));
+      appendProv(prov, "postnummer", rec(a.postnummer));
       if (!psOk) appendProv(prov, "poststed", rec(a.poststed));
       beforeWriteHookForTesting?.(row.id);
       const r = db
         .prepare(
           `UPDATE dental_agents
-              SET postnummer = @pn, poststed = @ps, field_provenance = @prov,
+              SET postnummer = @pn,${psOk ? "" : " poststed = @ps,"} field_provenance = @prov,
                   lat = NULL, lng = NULL, geocode_confidence = NULL, geocode_source = NULL,
                   updated_at = datetime('now')
             WHERE id = @id AND adresse = @adresse
               AND IFNULL(postnummer, '') = @pn_before AND IFNULL(poststed, '') = @ps_before`,
         )
         .run({
-          id: row.id, adresse: row.adresse, pn: a.postnummer, ps: a.poststed, prov: JSON.stringify(prov),
+          id: row.id, adresse: row.adresse, pn: a.postnummer, ...(psOk ? {} : { ps: a.poststed }), prov: JSON.stringify(prov),
           pn_before: row.postnummer ?? "", ps_before: row.poststed ?? "",
         });
       if (r.changes > 0) {
