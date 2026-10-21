@@ -26585,8 +26585,14 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   let order1Id = "";
   let order2Id = "";
   {
-    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
+    // F2 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+    // a real order needs contact_consent + e-mail/phone.
+    const noContact = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
       body: { buyer_ref: buyerRef6 },
+    });
+    assertEq(noContact.status, 422, `cart-27b: submit without buyer contact info → 422 (got ${noContact.status})`);
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
+      body: { buyer_ref: buyerRef6, buyer_email: "kjoper@example.com", contact_consent: true },
     });
     assertEq(r.status, 201, `cart-28: submit returns 201 (got ${r.status})`);
     assertEq(r.body.success, true, "cart-29: submit success=true");
@@ -26620,11 +26626,11 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       assertEq(items1[0].line_total, 60, `cart-41: carrot line_total=60 (got ${items1[0].line_total})`);
     }
 
-    // skive 2: no contact fields were sent with this submit → the order's
-    // consent-gated contact copy stays NULL (and so does contact_consent_at).
+    // skive 2 + F2: the consent-gated contact copy is on the order (a real
+    // order always has consent now; non-NULL contact columns ⇒ consent given).
     const o1 = cartDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at FROM orders WHERE id = ?").get(order1Id) as any;
-    assertTrue(!!o1 && o1.buyer_name === null && o1.buyer_email === null && o1.buyer_phone === null && o1.delivery_note === null && o1.contact_consent_at === null,
-      "cart-41b: order carries no buyer contact copy when the submit had no consent (skive 2 invariant)");
+    assertTrue(!!o1 && o1.buyer_email === "kjoper@example.com" && typeof o1.contact_consent_at === "string" && o1.contact_consent_at.length > 0,
+      "cart-41b: order carries the buyer's consented contact copy (skive 2 invariant, F2)");
   }
 
   // ── Test: re-check at submit — mark product OOS after add, then submit ────────
@@ -37013,6 +37019,40 @@ const _pilotOrdreLoopPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// skive 1 (F2–F6, F8–F10): kontaktinfo-krav, kvittering ved innsending,
+// påminnelse/auto-kansellering (falsk klokke), kansellering ved henting,
+// varer uten pris, spamtak, varesperre og pilot-status. Own in-memory
+// prod-schema DB and module-local pins (same idiom as the pilot-ordre-loop
+// block above), so it runs strictly after it; the next block in the chain
+// awaits _orderSkive1Promise.
+let _orderSkive1Resolve: () => void = () => {};
+const _orderSkive1Promise: Promise<void> = new Promise<void>(r => {
+  _orderSkive1Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_pilotOrdreLoopPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 1 (F2–F10) ──");
+  try {
+    const { runOrderBestillingerSkive1Tests } = require("../src/routes/order-bestillinger-skive1.test") as
+      typeof import("../src/routes/order-bestillinger-skive1.test");
+    const bs1 = await runOrderBestillingerSkive1Tests({ log: false });
+    passed += bs1.passed;
+    failed += bs1.failed;
+    for (const f of bs1.failures) failures.push("bestillinger-skive1: " + f);
+    console.log(`  bestillinger-skive1: ${bs1.passed} passed, ${bs1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive1: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive1Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
 // no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
 // rotasjon-no-yield-backoff) to the experiences vertical's
@@ -37028,7 +37068,7 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_pilotOrdreLoopPromise]);
+  await Promise.allSettled([_orderSkive1Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");

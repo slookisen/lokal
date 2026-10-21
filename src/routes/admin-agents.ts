@@ -2244,7 +2244,7 @@ router.post("/claim-review-approve", async (req: Request, res: Response) => {
   const link = knowledgeService.createMagicLink(approved.email);
   if (link.success && link.token) {
     const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
-    const sent = await emailService.sendClaimConfirmation(approved.email, link.agentName || "din agent", `${baseUrl}/api/marketplace/auth/m/${link.token}`);
+    const sent = await emailService.sendClaimConfirmation(approved.email, link.agentName || "din agent", `${baseUrl}/api/marketplace/auth/m/${link.token}`, approved.agentId);
     loginLinkSent = sent.success && sent.messageId !== "DRY_RUN";
   }
 

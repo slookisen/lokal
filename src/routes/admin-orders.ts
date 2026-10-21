@@ -21,6 +21,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { isEligibleForRealOrder } from "../services/cart-service";
+import { orderReminderHours } from "../services/order-followups";
 
 const router = Router();
 
@@ -37,6 +39,22 @@ function requireAdmin(req: Request, res: Response): boolean {
   const provided = (req.headers["x-admin-key"] as string) || "";
   if (provided !== expected) {
     res.status(403).json({ error: "Requires X-Admin-Key header" });
+    return false;
+  }
+  return true;
+}
+
+// F10: 401 (not 403) for a missing or wrong key, so a probe without the key
+// reads as «unauthorised». 503 when no admin key is configured at all.
+function requirePilotAdmin(req: Request, res: Response): boolean {
+  const expected = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+  if (!expected) {
+    res.status(503).json({ error: "Admin not configured" });
+    return false;
+  }
+  const provided = (req.headers["x-admin-key"] as string) || "";
+  if (provided !== expected) {
+    res.status(401).json({ error: "Requires X-Admin-Key header" });
     return false;
   }
   return true;
@@ -137,6 +155,54 @@ router.get("/inbox", (req: Request, res: Response) => {
     }>;
 
     res.json({ success: true, agent_id: agentId, open_orders: rows.length, orders: rows });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+// ─── GET /pilot-status ──────────────────────────────────────────────────────
+// F10 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// where the order pilot stands. Read-only; no buyer data (no names, e-mail
+// addresses or phone numbers), only producers, counts and order ids.
+//   opt_in           : producers with order_notifications_opt_in = 1
+//   passes_gate      : of those, who pass cart-service.isEligibleForRealOrder()
+//   verified_count   : owner-verified producers (the pool the pilot draws from)
+//   orders_30d       : orders created in the last 30 days, per status
+//   unanswered       : pay-at-pickup orders still pending after ORDER_REMINDER_HOURS (24)
+router.get("/pilot-status", (req: Request, res: Response) => {
+  if (!requirePilotAdmin(req, res)) return;
+  try {
+    const db = _adminOrdersTestDb ?? getDb();
+    const optIn = db.prepare(
+      "SELECT id, name FROM agents WHERE order_notifications_opt_in = 1 ORDER BY name"
+    ).all() as Array<{ id: string; name: string }>;
+    const passes = optIn.filter((a) => isEligibleForRealOrder(a.id, db));
+    const verified = db.prepare("SELECT COUNT(*) AS n FROM agents WHERE is_verified = 1").get() as { n: number };
+
+    const byStatus: Record<string, number> = { pending: 0, confirmed: 0, declined: 0, ready: 0, completed: 0, cancelled: 0 };
+    const rows = db.prepare(
+      "SELECT status, COUNT(*) AS n FROM orders WHERE created_at >= datetime('now', '-30 days') GROUP BY status"
+    ).all() as Array<{ status: string; n: number }>;
+    for (const r of rows) byStatus[r.status] = r.n;
+
+    const hours = orderReminderHours();
+    const unanswered = db.prepare(
+      `SELECT o.id AS order_id, o.agent_id, a.name AS producer_name, o.created_at
+         FROM orders o INNER JOIN agents a ON a.id = o.agent_id
+        WHERE o.status = 'pending' AND COALESCE(o.payment_mode, '') <> 'prepay'
+          AND o.created_at <= datetime('now', ?)
+        ORDER BY o.created_at LIMIT 200`
+    ).all(`-${Math.round(hours * 60)} minutes`) as Array<{ order_id: string; agent_id: string; producer_name: string; created_at: string }>;
+
+    res.json({
+      success: true,
+      opt_in: { count: optIn.length, producers: optIn },
+      passes_gate: { count: passes.length, producers: passes },
+      verified_count: verified.n,
+      orders_30d: { window_days: 30, by_status: byStatus, total: Object.values(byStatus).reduce((a, b) => a + b, 0) },
+      unanswered: { over_hours: hours, count: unanswered.length, orders: unanswered },
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ success: false, error: msg });

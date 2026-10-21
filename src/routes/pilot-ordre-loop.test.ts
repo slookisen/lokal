@@ -257,7 +257,10 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
         body: { product_id: productId, qty: 2, buyer_ref: buyerRef },
       });
       const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
-        body: { buyer_ref: buyerRef, ...contact },
+        // F2: a real order needs buyer contact info + consent; the helper
+        // supplies a default so existing cases keep ordering. Pass
+        // contact_consent:false (or other fields) to override.
+        body: { buyer_ref: buyerRef, buyer_email: "kjoper@example.com", contact_consent: true, ...contact },
       });
       const orderId = s.body?.orders?.[0]?.order_id as string;
       return {
@@ -806,12 +809,16 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // (l) skive 2 — NO consent: nothing buyer-identifying reaches the producer
-    //     (no «Kunde» block, default Reply-To, NULL order columns, PRG page
-    //     without the block) even though the fields were typed.
+    // (l) skive 2 + F2 — NO consent: since F2 (dev-request 2026-10-21-rfb-
+    //     bestillinger-klar-for-forste-ekte-handel) a real order REQUIRES
+    //     contact_consent=true and an e-mail or phone, so a no-consent submit
+    //     against an eligible producer is refused: clear error, no order row,
+    //     no e-mail, the cart stays open. The consent-gated copy invariant
+    //     (non-NULL contact columns ⇒ consent) therefore always holds.
     // ════════════════════════════════════════════════════════════════════════
     {
       sent.length = 0;
+      const ordersBefore = (testDb.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n;
       const r = await submitCartFor("prod-optin", {
         buyer_name: "Ola Uten Samtykke",
         buyer_email: "ola@example.com",
@@ -819,26 +826,13 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
         delivery_note: "Ring først",
         contact_consent: false,
       });
-      assertEq(r.orders.length, 1, "noconsent-01: the real order is still created");
-      await waitFor(() => sent.length >= 1);
-      assertEq(sent.length, 1, "noconsent-02: exactly one notification sent");
-      const mail = sent[0]!;
-      assertEq(mail.replyTo, notifySvc.DEFAULT_ORDER_NOTIFY_REPLY_TO, "noconsent-03: Reply-To is the platform default, not the buyer");
-      assertTrue(!mail.textContent.includes("Kunde:") && !mail.htmlContent.includes("Kunde:"), "noconsent-04: no «Kunde» block at all (not even empty rows)");
-      assertTrue(!mail.textContent.includes("Ola Uten Samtykke") && !mail.textContent.includes("ola@example.com") && !mail.textContent.includes("99887766") && !mail.textContent.includes("Ring først"),
-        "noconsent-05: none of the typed contact fields appear in the text body");
-      assertTrue(!mail.htmlContent.includes("Ola Uten Samtykke") && !mail.htmlContent.includes("ola@example.com") && !mail.htmlContent.includes("99887766"),
-        "noconsent-06: none of the typed contact fields appear in the HTML body");
-      const o = testDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(r.orderId) as any;
-      assertTrue(!!o && o.buyer_name === null && o.buyer_email === null && o.buyer_phone === null && o.delivery_note === null && o.contact_consent_at === null,
-        "noconsent-07: all five contact columns on the order are NULL (non-NULL ⇒ consent invariant)");
-      const c = testDb.prepare("SELECT buyer_name, contact_consent_at FROM carts WHERE id = ?").get(r.cartId) as any;
-      assertEq(c?.buyer_name, "Ola Uten Samtykke", "noconsent-08: the cart still stores the typed name (Slice 1 behaviour unchanged)");
-      assertEq(c?.contact_consent_at, null, "noconsent-09: cart contact_consent_at stays NULL");
-      const page = await req("GET", `/produsent/ordre/${o.confirm_token}`);
-      assertEq(page.status, 200, "noconsent-10: producer PRG page renders");
-      assertTrue(!page.text.includes("Kunde:") && !page.text.includes("Ola Uten Samtykke") && !page.text.includes("ola@example.com"),
-        "noconsent-11: PRG page shows no buyer block and no contact fields");
+      assertEq(r.status, 422, "noconsent-01: a submit without consent against an eligible producer is refused (422)");
+      assertEq(r.orders.length, 0, "noconsent-02: no order in the response");
+      await new Promise((res) => setTimeout(res, 50));
+      assertEq(sent.length, 0, "noconsent-03: no e-mail sent");
+      assertEq((testDb.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n, ordersBefore, "noconsent-04: no order row written");
+      const c = testDb.prepare("SELECT status FROM carts WHERE id = ?").get(r.cartId) as any;
+      assertEq(c?.status, "open", "noconsent-05: the cart stays open so the buyer can retry with contact details");
     }
 
     // ════════════════════════════════════════════════════════════════════════
