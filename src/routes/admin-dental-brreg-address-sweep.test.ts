@@ -2,34 +2,41 @@
  * admin-dental-brreg-address-sweep.test.ts — tests for
  * POST /admin/dental/brreg-address-sweep (src/routes/admin-dental-brreg-
  * address-sweep.ts), dev-request 2026-10-21-dental-brreg-adresse-feil-for-
- * videre-sweep, spec 1-5.
+ * videre-sweep, spec 2-5 and Daniel's answer after filing (rule 1 for every
+ * organisation form, plus the correct_mixed mode).
  *
  * Setup mirrors admin-dental-mark-inactive.test.ts: fresh in-memory dental
  * DB via DENTAL_DB_PATH=":memory:" + db-factory __resetDbFactoryForTesting(),
  * fresh route module via swapOutModules(), exercised through router.handle().
  * Brreg and clinic-website requests go through the route's own fetch seam
  * (__setBrregAddressSweepFetchForTesting); globalThis.fetch is never touched
- * and no request leaves the process. A URL the stub does not know throws,
- * which the route must report as api_error (Brreg) or no support (website).
+ * and no request leaves the process. A URL the stub does not know throws.
  *
  * Covers:
- *   (a) 403 without / with a wrong X-Admin-Key.
- *   (b) ENK (acceptance 1): without support no street line, only the empty
- *       poststed is filled; with another clinic row at the same address the
- *       street is written; the clinic's own website naming street and
- *       postnummer counts as support, a website that does not name them
- *       does not; an active sub-unit's beliggenhetsadresse counts.
+ *   (a) 403 without / with a wrong X-Admin-Key; 400 for an unknown mode.
+ *   (b) rule 1: an ENK without support now gets its forretningsadresse; a
+ *       clinic row at the same address is support (basis other_clinic_row),
+ *       but not when that row's own street came from a Brreg write; the
+ *       clinic's website picks the postadresse it names over the
+ *       forretningsadresse (basis own_website); a single registered address
+ *       does not cost a page fetch; a street postadresse is used when the
+ *       forretningsadresse has no street, a postbox never.
  *   (c) acceptance 2: stored postnummer != Brreg postnummer -> nothing
  *       written, flagged; stored poststed differing with no postnummer too.
  *   (d) acceptance 3: underAvvikling, konkurs, slettet (slettedato and HTTP
  *       410) and land != Norge are skipped and flagged.
- *   (e) spec 4: an active sub-unit's beliggenhetsadresse wins over the
- *       forretningsadresse; a closed sub-unit is ignored; two distinct
- *       active sub-unit addresses with nothing to narrow them -> flagged.
- *   (f) spec 5: one results[] entry per row, never the address text;
- *       field_provenance gets address_source on address, postnummer and
- *       poststed.
- *   (g) dry run writes nothing (no stamp either); api_error is not stamped.
+ *   (e) beliggenhetsadresse before forretningsadresse, with the source in
+ *       field_provenance; a closed sub-unit is ignored; two distinct active
+ *       sub-unit addresses -> flagged.
+ *   (f) spec 5: results[] never has the address or name; provenance has
+ *       address_source and address_basis on address, postnummer, poststed.
+ *   (g) dry run writes nothing (no stamp either); api_error is not stamped;
+ *       changed_meanwhile when another writer changes the row first.
+ *   (h) correct_mixed: dry run (default) reports and writes nothing; apply
+ *       must be a strict boolean (400 otherwise, write is refused); apply
+ *       sets postnummer/poststed from the Brreg address with the stored
+ *       street and clears lat/lng; rows whose street is not from a Brreg
+ *       write, consistent rows and a street Brreg no longer has are handled.
  *
  * Two ways to run:
  *   1. Standalone: npx tsx src/routes/admin-dental-brreg-address-sweep.test.ts
@@ -138,14 +145,15 @@ export function runAdminDentalBrregAddressSweepTests(
       const underenheter: Record<string, any[]> = {};
       const pages: Record<string, string> = {};
       const throwFor = new Set<string>();
+      const pageHits: string[] = [];
       const enhet = (org: string, form: string, extra: Record<string, unknown>) => {
         enheter[org] = { body: { organisasjonsnummer: org, navn: "X", organisasjonsform: { kode: form }, ...extra } };
       };
-      let fetchCalls = 0;
+      let brregCalls = 0;
       const stub = (async (input: any) => {
-        fetchCalls++;
         const url = new URL(String(input));
         if (url.hostname === "data.brreg.no") {
+          brregCalls++;
           const m = url.pathname.match(/\/enheter\/(\d{9})$/);
           if (m) {
             if (throwFor.has(m[1])) throw new Error("ECONNRESET stub");
@@ -159,6 +167,7 @@ export function runAdminDentalBrregAddressSweepTests(
             return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
           }
         }
+        pageHits.push(url.hostname);
         const html = pages[url.hostname];
         if (html !== undefined) return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
         throw new Error(`unexpected fetch in test: ${url.hostname}`);
@@ -166,49 +175,61 @@ export function runAdminDentalBrregAddressSweepTests(
       routeMod.__setBrregAddressSweepFetchForTesting(stub);
 
       const insert = db.prepare(
-        `INSERT INTO dental_agents (id, org_nr, navn, postnummer, poststed, adresse, hjemmeside, organisasjonsform, field_provenance)
-         VALUES (@id, @org_nr, @navn, @postnummer, @poststed, @adresse, @hjemmeside, @organisasjonsform, @field_provenance)`,
+        `INSERT INTO dental_agents (id, org_nr, navn, postnummer, poststed, adresse, hjemmeside, organisasjonsform, field_provenance, lat, lng)
+         VALUES (@id, @org_nr, @navn, @postnummer, @poststed, @adresse, @hjemmeside, @organisasjonsform, @field_provenance, @lat, @lng)`,
       );
-      const row = (r: Partial<Record<string, string | null>> & { id: string }) =>
+      const row = (r: Record<string, string | number | null> & { id: string }) =>
         insert.run({
           org_nr: null, navn: r.id, postnummer: null, poststed: null, adresse: null, hjemmeside: null,
-          organisasjonsform: null, field_provenance: null, ...r,
+          organisasjonsform: null, field_provenance: null, lat: null, lng: null, ...r,
         });
+      const homepageProv = (v: string) => JSON.stringify({ address: [{ value: v, source_type: "own_homepage" }] });
+      const brregProv = (v: string, src = "forretningsadresse") =>
+        JSON.stringify({ address: [{ value: v, source_type: "brreg", address_source: src }] });
 
-      // Another clinic row already at Storgata 10, 0155 (support for enk-row).
-      row({ id: "other-clinic", navn: "Sentrum Tannklinikk", adresse: "Storgata 10, 0155 Oslo", postnummer: "0155", poststed: "Oslo" });
+      // Rows that already have a street (support sources, not candidates).
+      row({ id: "other-clinic", adresse: "Storgata 10, 0155 Oslo", postnummer: "0155", poststed: "Oslo", field_provenance: homepageProv("Storgata 10") });
+      row({ id: "twin-src", adresse: "Bryggen 1", postnummer: "5003", poststed: "BERGEN", field_provenance: brregProv("Bryggen 1") });
 
-      // (b) ENK cases
-      row({ id: "enk-unsupported", org_nr: "100000001", postnummer: "1234", hjemmeside: "https://enk1.example.no", organisasjonsform: "ENK" });
+      // (b) rule 1
+      row({ id: "enk-plain", org_nr: "100000001", postnummer: "1234", hjemmeside: "https://enk1.example.no", organisasjonsform: "ENK" });
       enhet("100000001", "ENK", { forretningsadresse: no("Heimveien 3", "1234", "BYGD") });
-      pages["enk1.example.no"] = "<html><body><p>Velkommen til tannlegen. Ring oss.</p></body></html>";
-
+      pages["enk1.example.no"] = "<html><body><p>Velkommen til tannlegen.</p></body></html>";
       row({ id: "enk-row", org_nr: "100000002", postnummer: "0155", organisasjonsform: "ENK" });
       enhet("100000002", "ENK", { forretningsadresse: no("Storgata 10", "0155", "OSLO") });
+      row({ id: "brreg-twin", org_nr: "100000003", postnummer: "5003" });
+      enhet("100000003", "ENK", { forretningsadresse: no("Bryggen 1", "5003", "BERGEN") });
+      row({ id: "web-post", org_nr: "100000004", hjemmeside: "https://web.example.no" });
+      enhet("100000004", "AS", { forretningsadresse: no("Kontorbygg 1", "5004", "BERGEN"), postadresse: no("Fjordveien 5", "5003", "BERGEN") });
+      pages["web.example.no"] = "<html><body><footer>Besøk oss i <b>Fjordveien&nbsp;5</b>, 5003 Bergen</footer></body></html>";
+      row({ id: "postbox-only", org_nr: "100000005" });
+      enhet("100000005", "AS", { forretningsadresse: { adresse: [], postnummer: "0101", poststed: "OSLO", land: "Norge", landkode: "NO" }, postadresse: no("Postboks 12", "0101", "OSLO") });
+      row({ id: "post-street", org_nr: "100000006" });
+      enhet("100000006", "AS", { forretningsadresse: { adresse: [], postnummer: "0102", poststed: "OSLO" }, postadresse: no("Postgata 3", "0102", "OSLO") });
 
-      row({ id: "enk-web", org_nr: "100000003", hjemmeside: "https://enk3.example.no" });
-      enhet("100000003", "ENK", { forretningsadresse: no("Fjordveien 5", "5003", "BERGEN") });
-      pages["enk3.example.no"] = "<html><body><footer>Besøk oss i <b>Fjordveien&nbsp;5</b>, 5003 Bergen</footer></body></html>";
-
-      row({ id: "enk-sub", org_nr: "100000004", organisasjonsform: "ENK" });
-      enhet("100000004", "ENK", { forretningsadresse: no("Hjemmegata 1", "7010", "TRONDHEIM") });
-      underenheter["100000004"] = [
+      // (e) sub-units
+      row({ id: "enk-sub", org_nr: "100000007", organisasjonsform: "ENK" });
+      enhet("100000007", "ENK", { forretningsadresse: no("Hjemmegata 1", "7010", "TRONDHEIM") });
+      underenheter["100000007"] = [
         { organisasjonsnummer: "900000004", beliggenhetsadresse: no("Gammel Klinikkvei 9", "7011", "TRONDHEIM"), nedleggelsesdato: "2020-01-01" },
         { organisasjonsnummer: "900000005", beliggenhetsadresse: no("Klinikkgata 2", "7012", "TRONDHEIM") },
       ];
-
-      row({ id: "enk-nothing", org_nr: "100000005", postnummer: "9008", poststed: "Tromsø", organisasjonsform: "ENK" });
-      enhet("100000005", "ENK", { forretningsadresse: no("Privatveien 7", "9008", "TROMSØ") });
+      row({ id: "as-sub", org_nr: "400000001" });
+      enhet("400000001", "AS", { forretningsadresse: no("Kontorveien 1", "0250", "OSLO") });
+      underenheter["400000001"] = [{ organisasjonsnummer: "900000010", beliggenhetsadresse: no("Klinikkveien 8", "0251", "OSLO") }];
+      row({ id: "as-sub-ambig", org_nr: "400000002" });
+      enhet("400000002", "AS", { forretningsadresse: no("Kontorveien 2", "0250", "OSLO") });
+      underenheter["400000002"] = [
+        { organisasjonsnummer: "900000011", beliggenhetsadresse: no("Avdeling A 1", "0252", "OSLO") },
+        { organisasjonsnummer: "900000012", beliggenhetsadresse: no("Avdeling B 2", "0253", "OSLO") },
+      ];
 
       // (c) whole-address cases
       row({ id: "as-pn-mismatch", org_nr: "200000001", postnummer: "0150", poststed: "Oslo" });
       enhet("200000001", "AS", { forretningsadresse: no("Karl Johans gate 1", "0155", "OSLO") });
       row({ id: "as-ps-mismatch", org_nr: "200000002", poststed: "Bergen" });
       enhet("200000002", "AS", { forretningsadresse: no("Karl Johans gate 2", "0155", "OSLO") });
-      row({
-        id: "as-ok", org_nr: "200000003",
-        field_provenance: JSON.stringify({ phone: [{ value: "12345678", source_type: "own_homepage" }] }),
-      });
+      row({ id: "as-ok", org_nr: "200000003", field_provenance: JSON.stringify({ phone: [{ value: "12345678", source_type: "own_homepage" }] }) });
       enhet("200000003", "AS", { forretningsadresse: no("Torget 4", "4006", "STAVANGER") });
 
       // (d) status / country
@@ -226,47 +247,48 @@ export function runAdminDentalBrregAddressSweepTests(
         postadresse: no("Postveien 1", "0010", "OSLO"),
       });
 
-      // (e) sub-unit preference
-      row({ id: "as-sub", org_nr: "400000001" });
-      enhet("400000001", "AS", { forretningsadresse: no("Kontorveien 1", "0250", "OSLO") });
-      underenheter["400000001"] = [{ organisasjonsnummer: "900000010", beliggenhetsadresse: no("Klinikkveien 8", "0251", "OSLO") }];
-      row({ id: "as-sub-ambig", org_nr: "400000002" });
-      enhet("400000002", "AS", { forretningsadresse: no("Kontorveien 2", "0250", "OSLO") });
-      underenheter["400000002"] = [
-        { organisasjonsnummer: "900000011", beliggenhetsadresse: no("Avdeling A 1", "0252", "OSLO") },
-        { organisasjonsnummer: "900000012", beliggenhetsadresse: no("Avdeling B 2", "0253", "OSLO") },
-      ];
-
-      // (g) transport failure
+      // (g) transport failure, concurrent writer
       row({ id: "as-api-error", org_nr: "500000001" });
       throwFor.add("500000001");
+      row({ id: "cm-sweep", org_nr: "500000002" });
+      enhet("500000002", "AS", { forretningsadresse: no("Raceveien 1", "0300", "OSLO") });
 
       const ADDRESS_TEXTS = [
-        "Heimveien", "Storgata", "Fjordveien", "Hjemmegata", "Klinikkgata", "Privatveien", "Karl Johans",
-        "Torget", "Drottninggatan", "Kontorveien", "Klinikkveien", "Avdeling",
+        "Heimveien", "Storgata", "Bryggen", "Kontorbygg", "Fjordveien", "Postboks", "Postgata", "Hjemmegata", "Klinikkgata",
+        "Karl Johans", "Torget", "Drottninggatan", "Kontorveien", "Klinikkveien", "Avdeling", "Raceveien", "Elvegata",
       ];
       const post = (body: any, key: string | false = testKey) =>
         callRoute(router, { headers: key === false ? {} : { "x-admin-key": key }, body });
       const byId = (r: RouteResult): Record<string, any> =>
         Object.fromEntries((r.body?.data?.results ?? []).map((x: any) => [x.id, x]));
       const get = (id: string): any => db.prepare("SELECT * FROM dental_agents WHERE id = ?").get(id);
+      const lastProv = (id: string, field: string): any => {
+        const p = JSON.parse(get(id).field_provenance || "{}");
+        return Array.isArray(p[field]) ? p[field][p[field].length - 1] : undefined;
+      };
 
-      // ── (a) admin gate ───────────────────────────────────────────────────
+      // ── (a) admin gate, mode validation ─────────────────────────────────
       assertEq((await post({}, false)).status, 403, "a1: missing X-Admin-Key -> 403");
       assertEq((await post({}, "wrong-key")).status, 403, "a2: wrong X-Admin-Key -> 403");
+      assertEq((await post({ mode: "fix_everything" })).status, 400, "a3: unknown mode -> 400");
 
       // ── (g) dry run ──────────────────────────────────────────────────────
       const dry = await post({ limit: 100 });
       assertEq(dry.status, 200, "g1: dry run -> 200");
-      assertEq(dry.body.data.dry_run, true, "g2: dry_run true by default");
+      assertEq([dry.body.data.dry_run, dry.body.data.mode], [true, "sweep"], "g2: dry_run true, mode sweep by default");
       const d = byId(dry);
-      assertEq(dry.body.data.results.length, 16, "g3: one result per candidate row (other-clinic is not a candidate)");
+      assertEq(dry.body.data.results.length, 19, "g3: one result per candidate row (rows with a street are not candidates)");
       assertEq(d["as-ok"].status, "would_write", "g4: dry run reports would_write");
       assertEq(get("as-ok").adresse, null, "g5: dry run writes no adresse");
-      assertEq(get("enk-nothing").brreg_address_attempted_at, null, "g6: dry run stamps nothing");
+      assertEq(get("as-pn-mismatch").brreg_address_attempted_at, null, "g6: dry run stamps nothing");
 
       // ── write run ────────────────────────────────────────────────────────
+      pageHits.length = 0;
+      routeMod.__setBrregAddressSweepBeforeWriteForTesting((id) => {
+        if (id === "cm-sweep") db.prepare("UPDATE dental_agents SET postnummer = '0301' WHERE id = 'cm-sweep'").run();
+      });
       const wr = await post({ write: true, limit: 100 });
+      routeMod.__setBrregAddressSweepBeforeWriteForTesting(null);
       assertEq(wr.status, 200, "w1: write run -> 200");
       const w = byId(wr);
       const resultsJson = JSON.stringify(wr.body.data.results);
@@ -277,37 +299,39 @@ export function runAdminDentalBrregAddressSweepTests(
         "f3: every result has id, outcome and fields_written",
       );
 
-      // (b) acceptance 1 — ENK
-      assertEq(w["enk-unsupported"].outcome, "write_postal_only", "b1: ENK without support -> write_postal_only");
-      assertEq(w["enk-unsupported"].fields_written, ["poststed"], "b2: ENK without support fills only the empty poststed");
-      assertEq(w["enk-unsupported"].enk_support, null, "b3: website without the address is no support");
-      assertEq(get("enk-unsupported").adresse, null, "b4: ENK without support gets no street address in the DB");
-      assertEq(get("enk-unsupported").poststed, "BYGD", "b5: ENK without support: poststed filled from the same Brreg address");
-      assertEq(w["enk-row"].outcome, "write_address", "b6: ENK with another clinic row at the same address -> write_address");
-      assertEq(w["enk-row"].enk_support, "other_clinic_row", "b7: support recorded as other_clinic_row");
-      assertEq(get("enk-row").adresse, "Storgata 10", "b8: ENK with support gets the street address");
-      assertEq(w["enk-web"].enk_support, "own_website", "b9: Brreg ENK (stored form empty) supported by its own website");
-      assertEq(get("enk-web").adresse, "Fjordveien 5", "b10: website-supported ENK street written");
-      assertEq([get("enk-web").postnummer, get("enk-web").poststed], ["5003", "BERGEN"], "b11: postnummer/poststed from the same address");
-      assertEq(w["enk-sub"].enk_support, "sub_unit", "b12: ENK with an active sub-unit -> sub_unit support");
-      assertEq(w["enk-sub"].address_source, "beliggenhetsadresse", "b13: ENK sub-unit address source");
-      assertEq(get("enk-sub").adresse, "Klinikkgata 2", "b14: active sub-unit address, not the closed one or the forretningsadresse");
-      assertEq(w["enk-nothing"].outcome, "enk_unsupported", "b15: ENK without support and nothing empty -> enk_unsupported");
-      assertEq(w["enk-nothing"].status, "skipped", "b16: enk_unsupported is skipped");
-      assertTrue(!!get("enk-nothing").brreg_address_attempted_at, "b17: enk_unsupported is stamped");
-      assertEq(get("enk-nothing").adresse, null, "b18: enk_unsupported writes no street");
+      // (b) rule 1, for every organisation form
+      assertEq([w["enk-plain"].outcome, w["enk-plain"].address_basis], ["write_address", "forretningsadresse"], "b1: ENK without support gets its forretningsadresse");
+      assertEq(w["enk-plain"].fields_written, ["adresse", "poststed"], "b2: street + the empty poststed");
+      assertEq([get("enk-plain").adresse, get("enk-plain").poststed], ["Heimveien 3", "BYGD"], "b3: ENK street written from Brreg");
+      assertTrue(!pageHits.includes("enk1.example.no"), "b4: one registered address -> no website fetch");
+      assertEq(w["enk-row"].address_basis, "other_clinic_row", "b5: clinic row at the same address -> basis other_clinic_row");
+      assertEq(get("enk-row").adresse, "Storgata 10", "b6: supported street written");
+      assertEq(w["brreg-twin"].address_basis, "forretningsadresse", "b7: a row whose street came from a Brreg write is not support");
+      assertEq([w["web-post"].address_basis, w["web-post"].address_source], ["own_website", "postadresse"], "b8: website picks the postadresse it names");
+      assertEq([get("web-post").adresse, get("web-post").postnummer], ["Fjordveien 5", "5003"], "b9: website-supported street + its own postnummer");
+      assertTrue(pageHits.includes("web.example.no"), "b10: two registered addresses -> website read");
+      assertEq(w["postbox-only"].outcome, "no_address", "b11: a postbox postadresse is never a street");
+      assertEq(get("postbox-only").adresse, null, "b12: postbox not written");
+      assertEq([w["post-street"].address_basis, get("post-street").adresse], ["postadresse", "Postgata 3"], "b13: street postadresse used when forretningsadresse has no street");
 
-      // (c) acceptance 2 — whole address from one source
-      assertEq(w["as-pn-mismatch"].outcome, "postnummer_mismatch", "c1: stored postnummer != Brreg -> postnummer_mismatch");
-      assertEq(w["as-pn-mismatch"].flagged, true, "c2: postnummer_mismatch flagged");
-      assertEq(w["as-pn-mismatch"].fields_written, [], "c3: postnummer_mismatch writes no field");
-      assertEq([get("as-pn-mismatch").adresse, get("as-pn-mismatch").postnummer], [null, "0150"], "c4: DB unchanged on postnummer mismatch");
-      assertEq(w["as-ps-mismatch"].outcome, "poststed_mismatch", "c5: no postnummer, stored poststed differs -> poststed_mismatch");
-      assertEq(get("as-ps-mismatch").adresse, null, "c6: DB unchanged on poststed mismatch");
-      assertEq(w["as-ok"].fields_written, ["adresse", "postnummer", "poststed"], "c7: AS with empty fields gets all three");
-      assertEq(w["as-ok"].flagged, false, "c8: a normal write is not flagged");
+      // (e) beliggenhetsadresse before forretningsadresse, source in provenance
+      assertEq([w["enk-sub"].address_source, w["enk-sub"].address_basis], ["beliggenhetsadresse", "beliggenhetsadresse"], "e1: active sub-unit wins");
+      assertEq(get("enk-sub").adresse, "Klinikkgata 2", "e2: active sub-unit address, not the closed one or the forretningsadresse");
+      assertEq([get("as-sub").adresse, get("as-sub").postnummer], ["Klinikkveien 8", "0251"], "e3: sub-unit street and postnummer together");
+      for (const f of ["address", "postnummer", "poststed"]) {
+        const rec = lastProv("as-sub", f);
+        assertEq([rec?.source_type, rec?.address_source, rec?.address_basis], ["brreg", "beliggenhetsadresse", "beliggenhetsadresse"], `e4: provenance ${f} names beliggenhetsadresse`);
+      }
+      assertEq([w["as-sub-ambig"].outcome, w["as-sub-ambig"].flagged], ["ambiguous_sub_units", true], "e5: two sub-unit addresses -> flagged");
 
-      // (d) acceptance 3 — status and country
+      // (c) acceptance 2
+      assertEq([w["as-pn-mismatch"].outcome, w["as-pn-mismatch"].flagged, w["as-pn-mismatch"].fields_written], ["postnummer_mismatch", true, []], "c1: postnummer mismatch -> flagged, nothing written");
+      assertEq([get("as-pn-mismatch").adresse, get("as-pn-mismatch").postnummer], [null, "0150"], "c2: DB unchanged on postnummer mismatch");
+      assertEq(w["as-ps-mismatch"].outcome, "poststed_mismatch", "c3: no postnummer, stored poststed differs -> poststed_mismatch");
+      assertEq(get("as-ps-mismatch").adresse, null, "c4: DB unchanged on poststed mismatch");
+      assertEq([w["as-ok"].fields_written, w["as-ok"].flagged], [["adresse", "postnummer", "poststed"], false], "c5: AS with empty fields gets all three");
+
+      // (d) acceptance 3
       for (const [id, outcome] of [
         ["as-avvikling", "under_liquidation"], ["as-konkurs", "bankrupt"], ["enk-slettet", "deleted"],
         ["gone-410", "deleted"], ["nuf-sverige", "foreign_address"],
@@ -316,36 +340,73 @@ export function runAdminDentalBrregAddressSweepTests(
         assertEq(get(id).adresse, null, `d: ${id} writes nothing`);
       }
 
-      // (e) spec 4 — sub-unit preference
-      assertEq(w["as-sub"].address_source, "beliggenhetsadresse", "e1: AS with an active sub-unit uses its beliggenhetsadresse");
-      assertEq([get("as-sub").adresse, get("as-sub").postnummer], ["Klinikkveien 8", "0251"], "e2: sub-unit street and postnummer together");
-      assertEq([w["as-sub-ambig"].outcome, w["as-sub-ambig"].flagged], ["ambiguous_sub_units", true], "e3: two sub-unit addresses -> flagged");
-
       // (f) provenance
-      const prov = JSON.parse(get("as-ok").field_provenance);
-      assertTrue(Array.isArray(prov.phone), "f4: unrelated provenance kept");
+      const asOkProv = JSON.parse(get("as-ok").field_provenance);
+      assertTrue(Array.isArray(asOkProv.phone), "f4: unrelated provenance kept");
       for (const f of ["address", "postnummer", "poststed"]) {
-        const last = prov[f]?.[prov[f].length - 1];
-        assertEq([last?.source_type, last?.address_source], ["brreg", "forretningsadresse"], `f5: provenance ${f} has address_source`);
+        const rec = lastProv("as-ok", f);
+        assertEq([rec?.address_source, rec?.address_basis], ["forretningsadresse", "forretningsadresse"], `f5: provenance ${f} has source and basis`);
       }
-      const provSub = JSON.parse(get("enk-sub").field_provenance);
-      assertEq(provSub.address?.[0]?.address_source, "beliggenhetsadresse", "f6: sub-unit write provenance says beliggenhetsadresse");
-      const provPostal = JSON.parse(get("enk-unsupported").field_provenance);
-      assertEq([!!provPostal.address, provPostal.poststed?.[0]?.address_source], [false, "forretningsadresse"], "f7: postal-only write has poststed provenance, no address provenance");
+      assertEq(lastProv("web-post", "address")?.address_basis, "own_website", "f6: provenance basis own_website");
 
-      // (g) api_error
+      // (g) api_error, changed_meanwhile, counters
       assertEq(w["as-api-error"].status, "api_error", "g7: transport failure -> api_error");
       assertEq(get("as-api-error").brreg_address_attempted_at, null, "g8: api_error not stamped");
-      assertEq(wr.body.data.flagged, 8, "g9: flagged counter = 2 mismatch + 5 status/country + 1 ambiguous");
-
-      // A second write run asks only the unstamped row again.
-      const before = fetchCalls;
+      assertEq([w["cm-sweep"].outcome, w["cm-sweep"].fields_written], ["changed_meanwhile", []], "g9: concurrent change -> changed_meanwhile");
+      assertEq([get("cm-sweep").adresse, get("cm-sweep").postnummer], [null, "0301"], "g10: changed_meanwhile writes nothing over the other writer");
+      assertEq(wr.body.data.flagged, 8, "g11: flagged = 2 mismatch + 5 status/country + 1 ambiguous");
+      const before = brregCalls;
       const again = await post({ write: true, limit: 100 });
-      assertEq(again.body.data.results.map((x: any) => x.id), ["as-api-error"], "g10: only the unstamped api_error row is retried");
-      assertTrue(fetchCalls - before === 1, "g11: the retry makes exactly one Brreg request");
+      assertEq(again.body.data.results.map((x: any) => x.id).sort(), ["as-api-error", "cm-sweep"], "g12: only unstamped rows are asked again");
+      assertTrue(brregCalls - before >= 1, "g13: the retry asks Brreg again");
+
+      // ── (h) correct_mixed ──────────────────────────────────────────────
+      row({ id: "mix-1", org_nr: "600000001", adresse: "Elvegata 4", postnummer: "0150", poststed: "OSLO", lat: 59.9, lng: 10.7, field_provenance: brregProv("Elvegata 4") });
+      enhet("600000001", "AS", { forretningsadresse: no("Elvegata 4", "0155", "OSLO") });
+      row({ id: "mix-gone", org_nr: "600000002", adresse: "Gammelgata 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Gammelgata 1") });
+      enhet("600000002", "AS", { forretningsadresse: no("Nygata 2", "0151", "OSLO") });
+      row({
+        id: "mix-not-brreg", org_nr: "600000003", adresse: "Hjemmesidegata 1", postnummer: "0150", poststed: "OSLO",
+        field_provenance: JSON.stringify({ address: [{ value: "Hjemmesidegata 1", source_type: "own_homepage" }], postnummer: [{ value: "0150", source_type: "brreg" }] }),
+      });
+      enhet("600000003", "AS", { forretningsadresse: no("Hjemmesidegata 1", "0155", "OSLO") });
+      row({ id: "mix-cm", org_nr: "600000004", adresse: "Kappgata 5", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Kappgata 5") });
+      enhet("600000004", "AS", { forretningsadresse: no("Kappgata 5", "0155", "OSLO") });
+
+      assertEq((await post({ mode: "correct_mixed", apply: "true" })).status, 400, "h1: apply as a string -> 400");
+      assertEq((await post({ mode: "correct_mixed", apply: 1 })).status, 400, "h2: apply as a number -> 400");
+      assertEq((await post({ mode: "correct_mixed", write: true })).status, 400, "h3: write in correct_mixed -> 400");
+
+      const cdry = await post({ mode: "correct_mixed", limit: 100 });
+      assertEq([cdry.status, cdry.body.data.dry_run, cdry.body.data.mode], [200, true, "correct_mixed"], "h4: correct_mixed is a dry run by default");
+      const cd = byId(cdry);
+      assertEq([cd["mix-1"]?.outcome, cd["mix-1"]?.fields], ["would_correct", ["postnummer", "lat", "lng"]], "h5: mixed row reported as would_correct");
+      assertEq([cd["mix-gone"]?.outcome, cd["mix-gone"]?.flagged], ["street_not_in_brreg", true], "h6: street Brreg no longer has -> flagged");
+      assertTrue(!cd["mix-not-brreg"], "h7: street not from a Brreg write is not reported");
+      assertTrue(cdry.body.data.not_from_brreg_write >= 1, "h8: counted as not_from_brreg_write");
+      assertTrue(!cd["as-ok"] && cdry.body.data.consistent >= 1, "h9: rows the sweep wrote whole are consistent, not reported");
+      const cdJson = JSON.stringify(cdry.body.data.results);
+      assertTrue(ADDRESS_TEXTS.every((t) => !cdJson.includes(t)) && !cdJson.includes("Gammelgata"), "h10: correction results have no address");
+      assertEq([get("mix-1").postnummer, get("mix-1").lat], ["0150", 59.9], "h11: dry run writes nothing");
+
+      routeMod.__setBrregAddressSweepBeforeWriteForTesting((id) => {
+        if (id === "mix-cm") db.prepare("UPDATE dental_agents SET poststed = 'Annet' WHERE id = 'mix-cm'").run();
+      });
+      const capply = await post({ mode: "correct_mixed", apply: true, limit: 100 });
+      routeMod.__setBrregAddressSweepBeforeWriteForTesting(null);
+      const ca = byId(capply);
+      assertEq([capply.body.data.dry_run, ca["mix-1"]?.outcome], [false, "corrected"], "h12: apply:true corrects");
+      const m1 = get("mix-1");
+      assertEq([m1.adresse, m1.postnummer, m1.poststed, m1.lat, m1.lng], ["Elvegata 4", "0155", "OSLO", null, null], "h13: postnummer from the same Brreg address, geo cleared");
+      assertEq([lastProv("mix-1", "postnummer")?.correction, lastProv("mix-1", "postnummer")?.address_source], ["mixed_address", "forretningsadresse"], "h14: correction provenance");
+      assertEq(ca["mix-cm"]?.outcome, "changed_meanwhile", "h15: correction re-checks the row at write time");
+      assertEq(get("mix-cm").postnummer, "0150", "h16: changed_meanwhile correction writes nothing");
+      assertEq(get("mix-gone").postnummer, "0150", "h17: flagged row not corrected");
+      assertEq(get("mix-not-brreg").postnummer, "0150", "h18: row with street from elsewhere not corrected");
     } finally {
       try {
         routeMod?.__setBrregAddressSweepFetchForTesting();
+        routeMod?.__setBrregAddressSweepBeforeWriteForTesting(null);
       } catch {
         // best-effort
       }
