@@ -214,7 +214,7 @@ export function deviceForSession(sessionId: string): Device {
 
 /** Readable name of a bot UA ("Googlebot", "facebookexternalhit", …). */
 export function botNameForUA(ua: string): string {
-  const known = ua.match(/(ChatGPT-User|Claude-User|Claude-Web|Perplexity-User|DuckAssistBot|OAI-SearchBot|ClaudeBot|GPTBot|PerplexityBot|ExaSearchBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|Google-Extended|DuckDuckBot|Applebot-Extended|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|bingbot|facebookexternalhit|facebookexternal|Twitterbot|YandexBot|Bytespider|Amazonbot|PetalBot|SemrushBot|AhrefsBot|DotBot|BLEXBot|MojeekBot|SeekportBot|CCBot|meta-externalagent|anthropic-ai|LinkedInBot|Slackbot|TelegramBot|WhatsApp|ImagesiftBot|Diffbot|Baiduspider|DataForSeoBot|AwarioBot|MCPCensus|rokmcp-collector|WellknownBot|Reflectionbot|AgentFitBot|AgenstryBot|cohere-ai|YouBot)/i);
+  const known = ua.match(/(ChatGPT-User|Claude-User|Claude-Web|Perplexity-User|DuckAssistBot|OAI-SearchBot|Claude-SearchBot|ClaudeBot|GPTBot|PerplexityBot|ExaSearchBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|Google-Extended|DuckDuckBot|Applebot-Extended|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|bingbot|facebookexternalhit|facebookexternal|Twitterbot|YandexBot|Bytespider|Amazonbot|PetalBot|SemrushBot|AhrefsBot|DotBot|BLEXBot|MojeekBot|SeekportBot|CCBot|meta-externalagent|anthropic-ai|LinkedInBot|Slackbot|TelegramBot|WhatsApp|ImagesiftBot|Diffbot|Baiduspider|DataForSeoBot|AwarioBot|MCPCensus|rokmcp-collector|WellknownBot|Reflectionbot|AgentFitBot|AgenstryBot|cohere-ai|YouBot)/i);
   if (known) return known[1];
   const generic = ua.match(/([A-Za-z][A-Za-z0-9_-]*(?:Bot|Crawler|Spider|bot|crawler|spider))/);
   if (generic) return generic[1];
