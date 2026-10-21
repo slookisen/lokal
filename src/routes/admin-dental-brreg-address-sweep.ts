@@ -518,6 +518,7 @@ export type CorrectionOutcome =
   | "corrected"
   | "street_not_in_brreg"      // the stored street is no longer any Brreg address of the unit (flagged)
   | "incomplete_address"       // the matching Brreg address lacks postnummer/poststed (flagged)
+  | "foreign_address"          // forretningsadresse or the matching address outside Norway (flagged)
   | "under_liquidation" | "bankrupt" | "deleted" | "not_found" // (flagged, not corrected)
   | "changed_meanwhile"
   | "api_error";
@@ -593,6 +594,13 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
         continue;
       }
 
+      // A unit registered abroad is never corrected (same rule as
+      // chooseAddress): a foreign forretningsadresse flags the row.
+      if (ev.forretningsadresse?.adresse && !isNorwegian(ev.forretningsadresse)) {
+        push({ id: row.id, outcome: "foreign_address", fields: [], flagged: true });
+        continue;
+      }
+
       // The Brreg address carrying the stored street; the one the write
       // recorded as its source first.
       const all: Candidate[] = [
@@ -609,6 +617,10 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
         continue;
       }
       const a = match.address;
+      if (!isNorwegian(a)) {
+        push({ id: row.id, outcome: "foreign_address", fields: [], address_source: match.source, flagged: true });
+        continue;
+      }
       if (!a.postnummer || !a.poststed) {
         push({ id: row.id, outcome: "incomplete_address", fields: [], address_source: match.source, flagged: true });
         continue;

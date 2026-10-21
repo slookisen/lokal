@@ -192,7 +192,7 @@ export function runAdminDentalBrregAddressSweepTests(
       row({ id: "twin-src", adresse: "Bryggen 1", postnummer: "5003", poststed: "BERGEN", field_provenance: brregProv("Bryggen 1") });
 
       // (b) rule 1
-      row({ id: "enk-plain", org_nr: "100000001", postnummer: "1234", hjemmeside: "https://enk1.example.no", organisasjonsform: "ENK" });
+      row({ id: "enk-plain", navn: "Tannlege Ola Navnesen", org_nr: "100000001", postnummer: "1234", hjemmeside: "https://enk1.example.no", organisasjonsform: "ENK" });
       enhet("100000001", "ENK", { forretningsadresse: no("Heimveien 3", "1234", "BYGD") });
       pages["enk1.example.no"] = "<html><body><p>Velkommen til tannlegen.</p></body></html>";
       row({ id: "enk-row", org_nr: "100000002", postnummer: "0155", organisasjonsform: "ENK" });
@@ -217,6 +217,12 @@ export function runAdminDentalBrregAddressSweepTests(
       row({ id: "as-sub", org_nr: "400000001" });
       enhet("400000001", "AS", { forretningsadresse: no("Kontorveien 1", "0250", "OSLO") });
       underenheter["400000001"] = [{ organisasjonsnummer: "900000010", beliggenhetsadresse: no("Klinikkveien 8", "0251", "OSLO") }];
+      row({ id: "as-sub-narrow", org_nr: "400000003", postnummer: "0255" });
+      enhet("400000003", "AS", { forretningsadresse: no("Kontorveien 3", "0250", "OSLO") });
+      underenheter["400000003"] = [
+        { organisasjonsnummer: "900000013", beliggenhetsadresse: no("Avdeling C 3", "0254", "OSLO") },
+        { organisasjonsnummer: "900000014", beliggenhetsadresse: no("Avdeling D 4", "0255", "OSLO") },
+      ];
       row({ id: "as-sub-ambig", org_nr: "400000002" });
       enhet("400000002", "AS", { forretningsadresse: no("Kontorveien 2", "0250", "OSLO") });
       underenheter["400000002"] = [
@@ -253,9 +259,10 @@ export function runAdminDentalBrregAddressSweepTests(
       row({ id: "cm-sweep", org_nr: "500000002" });
       enhet("500000002", "AS", { forretningsadresse: no("Raceveien 1", "0300", "OSLO") });
 
+      const POSTSTED_TEXTS = ["BYGD", "OSLO", "Oslo", "BERGEN", "TRONDHEIM", "STAVANGER", "STOCKHOLM"];
       const ADDRESS_TEXTS = [
         "Heimveien", "Storgata", "Bryggen", "Kontorbygg", "Fjordveien", "Postboks", "Postgata", "Hjemmegata", "Klinikkgata",
-        "Karl Johans", "Torget", "Drottninggatan", "Kontorveien", "Klinikkveien", "Avdeling", "Raceveien", "Elvegata",
+        "Karl Johans", "Torget", "Drottninggatan", "Kontorveien", "Klinikkveien", "Avdeling", "Raceveien", "Elvegata", "Kungsgatan", "Norgegata", "Lukkegata", "Flyttegata",
       ];
       const post = (body: any, key: string | false = testKey) =>
         callRoute(router, { headers: key === false ? {} : { "x-admin-key": key }, body });
@@ -277,8 +284,13 @@ export function runAdminDentalBrregAddressSweepTests(
       assertEq(dry.status, 200, "g1: dry run -> 200");
       assertEq([dry.body.data.dry_run, dry.body.data.mode], [true, "sweep"], "g2: dry_run true, mode sweep by default");
       const d = byId(dry);
-      assertEq(dry.body.data.results.length, 19, "g3: one result per candidate row (rows with a street are not candidates)");
+      assertEq(dry.body.data.results.length, 20, "g3: one result per candidate row (rows with a street are not candidates)");
       assertEq(d["as-ok"].status, "would_write", "g4: dry run reports would_write");
+      {
+        const dj = JSON.stringify(dry.body.data.results);
+        assertTrue(ADDRESS_TEXTS.every((t) => !dj.includes(t)), "g4b: dry-run results[] have no address");
+        assertTrue(POSTSTED_TEXTS.every((t) => !dj.includes(t)) && !dj.includes("Navnesen"), "g4c: dry-run results[] have no poststed or name");
+      }
       assertEq(get("as-ok").adresse, null, "g5: dry run writes no adresse");
       assertEq(get("as-pn-mismatch").brreg_address_attempted_at, null, "g6: dry run stamps nothing");
 
@@ -323,6 +335,7 @@ export function runAdminDentalBrregAddressSweepTests(
         assertEq([rec?.source_type, rec?.address_source, rec?.address_basis], ["brreg", "beliggenhetsadresse", "beliggenhetsadresse"], `e4: provenance ${f} names beliggenhetsadresse`);
       }
       assertEq([w["as-sub-ambig"].outcome, w["as-sub-ambig"].flagged], ["ambiguous_sub_units", true], "e5: two sub-unit addresses -> flagged");
+      assertEq([w["as-sub-narrow"].outcome, get("as-sub-narrow").adresse], ["write_address", "Avdeling D 4"], "e6: two sub-unit addresses narrowed by the stored postnummer");
 
       // (c) acceptance 2
       assertEq([w["as-pn-mismatch"].outcome, w["as-pn-mismatch"].flagged, w["as-pn-mismatch"].fields_written], ["postnummer_mismatch", true, []], "c1: postnummer mismatch -> flagged, nothing written");
@@ -373,6 +386,22 @@ export function runAdminDentalBrregAddressSweepTests(
       row({ id: "mix-cm", org_nr: "600000004", adresse: "Kappgata 5", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Kappgata 5") });
       enhet("600000004", "AS", { forretningsadresse: no("Kappgata 5", "0155", "OSLO") });
 
+      row({ id: "mix-nuf", navn: "Svensk Tandvård Filial", org_nr: "600000005", adresse: "Drottninggatan 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Drottninggatan 1") });
+      enhet("600000005", "NUF", { forretningsadresse: { adresse: ["Drottninggatan 1"], postnummer: "11143", poststed: "STOCKHOLM", land: "Sverige", landkode: "SE" } });
+      row({ id: "mix-post-abroad", org_nr: "600000006", adresse: "Kungsgatan 2", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Kungsgatan 2", "postadresse") });
+      enhet("600000006", "AS", {
+        forretningsadresse: no("Norgegata 1", "0150", "OSLO"),
+        postadresse: { adresse: ["Kungsgatan 2"], postnummer: "11156", poststed: "STOCKHOLM", land: "Sverige", landkode: "SE" },
+      });
+      row({ id: "mix-avvikling", org_nr: "600000007", adresse: "Lukkegata 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Lukkegata 1") });
+      enhet("600000007", "AS", { underAvvikling: true, forretningsadresse: no("Lukkegata 1", "0155", "OSLO") });
+      row({ id: "mix-konkurs", org_nr: "600000008", adresse: "Lukkegata 2", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Lukkegata 2") });
+      enhet("600000008", "AS", { konkurs: true, forretningsadresse: no("Lukkegata 2", "0155", "OSLO") });
+      row({ id: "mix-slettet", org_nr: "600000009", adresse: "Lukkegata 3", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Lukkegata 3") });
+      enhet("600000009", "AS", { slettedato: "2026-09-01", forretningsadresse: no("Lukkegata 3", "0155", "OSLO") });
+      row({ id: "mix-addr-race", org_nr: "600000010", adresse: "Flyttegata 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Flyttegata 1") });
+      enhet("600000010", "AS", { forretningsadresse: no("Flyttegata 1", "0155", "OSLO") });
+
       assertEq((await post({ mode: "correct_mixed", apply: "true" })).status, 400, "h1: apply as a string -> 400");
       assertEq((await post({ mode: "correct_mixed", apply: 1 })).status, 400, "h2: apply as a number -> 400");
       assertEq((await post({ mode: "correct_mixed", write: true })).status, 400, "h3: write in correct_mixed -> 400");
@@ -388,9 +417,16 @@ export function runAdminDentalBrregAddressSweepTests(
       const cdJson = JSON.stringify(cdry.body.data.results);
       assertTrue(ADDRESS_TEXTS.every((t) => !cdJson.includes(t)) && !cdJson.includes("Gammelgata"), "h10: correction results have no address");
       assertEq([get("mix-1").postnummer, get("mix-1").lat], ["0150", 59.9], "h11: dry run writes nothing");
+      assertTrue(POSTSTED_TEXTS.every((t) => !cdJson.includes(t)) && !cdJson.includes("Navnesen") && !cdJson.includes("Tandv"), "h11b: correction results have no poststed or name");
+      assertEq([cd["mix-nuf"]?.outcome, cd["mix-nuf"]?.flagged], ["foreign_address", true], "h11c: foreign forretningsadresse -> foreign_address, flagged (dry run)");
+      assertEq([cd["mix-post-abroad"]?.outcome, cd["mix-post-abroad"]?.flagged], ["foreign_address", true], "h11d: matching address abroad -> foreign_address, flagged");
+      for (const [id, outcome] of [["mix-avvikling", "under_liquidation"], ["mix-konkurs", "bankrupt"], ["mix-slettet", "deleted"]] as const) {
+        assertEq([cd[id]?.outcome, cd[id]?.flagged], [outcome, true], `h11e: ${id} -> ${outcome}, flagged`);
+      }
 
       routeMod.__setBrregAddressSweepBeforeWriteForTesting((id) => {
         if (id === "mix-cm") db.prepare("UPDATE dental_agents SET poststed = 'Annet' WHERE id = 'mix-cm'").run();
+        if (id === "mix-addr-race") db.prepare("UPDATE dental_agents SET adresse = 'Annen gate 9' WHERE id = 'mix-addr-race'").run();
       });
       const capply = await post({ mode: "correct_mixed", apply: true, limit: 100 });
       routeMod.__setBrregAddressSweepBeforeWriteForTesting(null);
@@ -403,6 +439,12 @@ export function runAdminDentalBrregAddressSweepTests(
       assertEq(get("mix-cm").postnummer, "0150", "h16: changed_meanwhile correction writes nothing");
       assertEq(get("mix-gone").postnummer, "0150", "h17: flagged row not corrected");
       assertEq(get("mix-not-brreg").postnummer, "0150", "h18: row with street from elsewhere not corrected");
+      assertEq([ca["mix-nuf"]?.outcome, get("mix-nuf").postnummer, get("mix-nuf").poststed], ["foreign_address", "0150", "OSLO"], "h19: apply never writes a foreign address");
+      assertEq([ca["mix-post-abroad"]?.outcome, get("mix-post-abroad").postnummer], ["foreign_address", "0150"], "h20: apply skips a matching address abroad");
+      for (const id of ["mix-avvikling", "mix-konkurs", "mix-slettet"]) {
+        assertEq(get(id).postnummer, "0150", `h21: apply does not correct ${id}`);
+      }
+      assertEq([ca["mix-addr-race"]?.outcome, get("mix-addr-race").postnummer], ["changed_meanwhile", "0150"], "h22: adresse changed before write -> changed_meanwhile, nothing written");
     } finally {
       try {
         routeMod?.__setBrregAddressSweepFetchForTesting();
