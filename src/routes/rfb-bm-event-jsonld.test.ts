@@ -139,10 +139,17 @@ export async function runBmEventJsonLdTests(opts: { log?: boolean } = {}): Promi
       return parsed;
     }
 
-    // A future date, well clear of "now" regardless of when this suite runs
-    // (2026-09-25 authored) — venues render up to 5 rows ordered by start_at.
-    const FUTURE_START = "2026-12-01T10:00:00.000Z";
-    const FUTURE_END = "2026-12-01T14:00:00.000Z";
+    // A future date, well clear of "now" regardless of when this suite runs:
+    // 1 December NEXT year, 11-23 months out. The venue query keeps rows with
+    // start_at >= now and has no upper horizon; venues render up to 5 rows
+    // ordered by start_at. Still 1 December, so the "Z label corrected" checks
+    // below keep asserting the CET (+01:00) offset. A hardcoded
+    // "2026-12-01T10:00:00.000Z" (2026-09-25 authored) would have dropped out
+    // of that query from that instant on (dev-request
+    // 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+    const FUTURE_DAY = `${new Date().getUTCFullYear() + 1}-12-01`;
+    const FUTURE_START = `${FUTURE_DAY}T10:00:00.000Z`;
+    const FUTURE_END = `${FUTURE_DAY}T14:00:00.000Z`;
     const PAST_START = "2020-01-01T10:00:00.000Z";
 
     // ══════════════════════════════════════════════════════════════
@@ -153,12 +160,12 @@ export async function runBmEventJsonLdTests(opts: { log?: boolean } = {}): Promi
       seedVenueAgent({ id: "bm-venue-with-event", name: "Torget Marked", city: "Oslo", lat: 59.91, lng: 10.75 });
       seedEvent({
         venueAgentId: "bm-venue-with-event",
-        eventSlug: "torget-marked-2026-12-01",
+        eventSlug: `torget-marked-${FUTURE_DAY}`,
         eventName: "Julemarked på Torget",
         locationText: "Torget",
         startAt: FUTURE_START,
         endAt: FUTURE_END,
-        sourceUrl: "https://bondensmarked.no/marked/torget-2026-12-01",
+        sourceUrl: `https://bondensmarked.no/marked/torget-${FUTURE_DAY}`,
       });
       resetRegistryCache();
 
@@ -179,9 +186,9 @@ export async function runBmEventJsonLdTests(opts: { log?: boolean } = {}): Promi
       assertTrue(!!ev, "with-event: an Event entry is present");
 
       assertTrue(!!ev && ev.name === "Julemarked på Torget", "with-event: Event.name matches the seeded event_name");
-      assertTrue(!!ev && ev.startDate === "2026-12-01T10:00:00.000+01:00", "with-event: Event.startDate is the seeded wall-clock with the real Oslo offset (Z label corrected)");
-      assertTrue(!!ev && ev.endDate === "2026-12-01T14:00:00.000+01:00", "with-event: Event.endDate is the seeded wall-clock with the real Oslo offset (Z label corrected)");
-      assertTrue(!!ev && ev.url === "https://bondensmarked.no/marked/torget-2026-12-01", "with-event: Event.url matches the seeded source_url");
+      assertTrue(!!ev && ev.startDate === `${FUTURE_DAY}T10:00:00.000+01:00`, "with-event: Event.startDate is the seeded wall-clock with the real Oslo offset (Z label corrected)");
+      assertTrue(!!ev && ev.endDate === `${FUTURE_DAY}T14:00:00.000+01:00`, "with-event: Event.endDate is the seeded wall-clock with the real Oslo offset (Z label corrected)");
+      assertTrue(!!ev && ev.url === `https://bondensmarked.no/marked/torget-${FUTURE_DAY}`, "with-event: Event.url matches the seeded source_url");
       assertTrue(!!ev && typeof ev.location === "object" && ev.location !== null, "with-event: Event.location object is present");
       assertTrue(!!ev && ev.location["@type"] === "Place", "with-event: Event.location.@type is Place");
       assertTrue(!!ev && ev.location.name === "Torget Marked", "with-event: Event.location.name is the venue's name");
