@@ -36767,6 +36767,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("admin-dental-mark-inactive: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dev-request 2026-10-21-dental-brreg-adresse-feil-for-videre-sweep: POST /admin/dental/brreg-address-sweep ──");
+  try {
+    const { runAdminDentalBrregAddressSweepTests } = require("../src/routes/admin-dental-brreg-address-sweep.test") as
+      typeof import("../src/routes/admin-dental-brreg-address-sweep.test");
+    const dbas = await runAdminDentalBrregAddressSweepTests({ log: false });
+    passed += dbas.passed;
+    failed += dbas.failed;
+    for (const f of dbas.failures) failures.push("admin-dental-brreg-address-sweep: " + f);
+    console.log(`  admin-dental-brreg-address-sweep: ${dbas.passed} passed, ${dbas.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-brreg-address-sweep: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-21-dental-schema-probe-writepath-fix (follow-up): POST /admin/dental/schema-probe-sweep ──");
   try {
     const { runAdminDentalSchemaProbeSweepTests } = require("../src/routes/admin-dental-schema-probe-sweep.test") as

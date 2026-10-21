@@ -322,7 +322,7 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
     const GROUNDED: Record<string, () => boolean> = {
       brreg: () =>
         /import \{[^}]*\bverifyOrgNumber\b[^}]*\} from "\.\/brreg-client"/.test(verifierSrc) &&
-        read("src/routes/admin-dental-brreg-address-sweep.ts").includes('import { fetchBrregBusinessAddress } from "../services/brreg-client"') &&
+        /import \{[^}]*\bfetchBrregAddressEvidence\b[^}]*\} from "\.\.\/services\/brreg-client"/.test(read("src/routes/admin-dental-brreg-address-sweep.ts")) &&
         read("src/routes/admin-dental-hjemmeside-discovery.ts").includes('import { fetchBrregWebsite } from "../services/brreg-client"') &&
         [byId("brreg")!.method_nb, byId("brreg")!.method_en].every((t) => searchCodesNamed(t, importData)),
       clinic_websites: () =>

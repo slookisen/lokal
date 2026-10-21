@@ -62,7 +62,7 @@ export interface DentalDataSource {
 }
 
 export const DENTAL_DATA_SOURCES: readonly DentalDataSource[] = [
-  // brreg-client.ts (verifyOrgNumber, fetchBrregBusinessAddress,
+  // brreg-client.ts (verifyOrgNumber, fetchBrregAddressEvidence,
   // fetchBrregWebsite): the import, the address sweep
   // (admin-dental-brreg-address-sweep.ts), the website candidate
   // (admin-dental-hjemmeside-discovery.ts, tier 1) and the verifier's status
