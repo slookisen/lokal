@@ -61,6 +61,9 @@ type RawBrregAddress = {
   postnummer?: string | null;
   poststed?: string | null;
   adresse?: string[] | null;
+  // Present on the real API; read only by fetchBrregAddressEvidence below.
+  land?: string | null;
+  landkode?: string | null;
 };
 
 type RawEnhet = {
@@ -540,6 +543,148 @@ export async function fetchBrregBusinessAddress(
   const result = pickBrregAddress(json.forretningsadresse, json.postadresse);
   addressCache.set(cleanOrgNr, result);
   return result;
+}
+
+// ─── Address evidence for the dental address sweep ─────────────────────
+// dev-request 2026-10-21-dental-brreg-adresse-feil-for-videre-sweep.
+//
+// fetchBrregBusinessAddress() above returns one street line and drops what
+// the sweep needs to decide whether that line may be written: the
+// organisation form (ENK or not), the status flags, the country, which of
+// the two sub-objects the line came from, and the unit's active
+// sub-units (underenheter) with their beliggenhetsadresse. This function
+// returns all of it, from GET /enheter/{orgNr} plus
+// GET /underenheter?overordnetEnhet={orgNr}. No cache: the sweep asks each
+// org.nr once per call, and a cached status would hide a later
+// underAvvikling/konkurs. Never throws: a transport failure, a non-2xx
+// other than 404/410, or unparseable JSON is reported as
+// { kind: "error" } so the caller can leave the row unstamped.
+
+export type BrregAddressSource = "forretningsadresse" | "postadresse" | "beliggenhetsadresse";
+
+export type BrregStructuredAddress = {
+  adresse: string | null;      // street line(s) joined with ", "; null when Brreg has none
+  postnummer: string | null;
+  poststed: string | null;
+  land: string | null;
+  landkode: string | null;
+};
+
+export type BrregSubUnitAddress = {
+  orgnumber: string;
+  address: BrregStructuredAddress;
+};
+
+export type BrregAddressEvidence =
+  | { kind: "error" }
+  | { kind: "not_found" }
+  | {
+      kind: "found";
+      orgForm: string | null;            // organisasjonsform.kode, e.g. "ENK", "AS", "NUF"
+      konkurs: boolean;
+      underAvvikling: boolean;           // underAvvikling OR underTvangsavviklingEllerTvangsopplosning
+      slettet: boolean;                  // slettedato set, or HTTP 410 (Brreg's answer for a deleted unit)
+      forretningsadresse: BrregStructuredAddress | null;
+      postadresse: BrregStructuredAddress | null;
+      /** Active sub-units (no nedleggelsesdato/slettedato) with a beliggenhetsadresse. */
+      activeSubUnits: BrregSubUnitAddress[];
+    };
+
+function trimOrNull(v: unknown): string | null {
+  return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+}
+
+function toStructuredAddress(addr: RawBrregAddress | null | undefined): BrregStructuredAddress | null {
+  if (!addr || typeof addr !== "object") return null;
+  const street = Array.isArray(addr.adresse)
+    ? addr.adresse.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim()).join(", ")
+    : "";
+  return {
+    adresse: street || null,
+    postnummer: trimOrNull(addr.postnummer),
+    poststed: trimOrNull(addr.poststed),
+    land: trimOrNull(addr.land),
+    landkode: trimOrNull(addr.landkode),
+  };
+}
+
+type RawUnderenhet = {
+  organisasjonsnummer?: string;
+  beliggenhetsadresse?: RawBrregAddress | null;
+  nedleggelsesdato?: string | null;
+  slettedato?: string | null;
+};
+
+export async function fetchBrregAddressEvidence(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BrregAddressEvidence> {
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!cleanOrgNr) return { kind: "not_found" };
+
+  const enhetUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(enhetUrl, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch {
+    return { kind: "error" };
+  }
+  if (res.status === 404) return { kind: "not_found" };
+  if (res.status === 410) {
+    // Brreg answers a deleted unit with 410 Gone and a short body.
+    return {
+      kind: "found", orgForm: null, konkurs: false, underAvvikling: false, slettet: true,
+      forretningsadresse: null, postadresse: null, activeSubUnits: [],
+    };
+  }
+  if (!res.ok) return { kind: "error" };
+
+  let json: RawEnhetDetail & { organisasjonsform?: { kode?: string } | null };
+  try {
+    json = (await res.json()) as typeof json;
+  } catch {
+    return { kind: "error" };
+  }
+
+  const underAvvikling = json.underAvvikling === true || json.underTvangsavviklingEllerTvangsopplosning === true;
+  const konkurs = json.konkurs === true;
+  const slettet = typeof json.slettedato === "string" && json.slettedato.trim() !== "";
+  const base = {
+    kind: "found" as const,
+    orgForm: trimOrNull(json.organisasjonsform?.kode)?.toUpperCase() ?? null,
+    konkurs,
+    underAvvikling,
+    slettet,
+    forretningsadresse: toStructuredAddress(json.forretningsadresse),
+    postadresse: toStructuredAddress(json.postadresse),
+    activeSubUnits: [] as BrregSubUnitAddress[],
+  };
+  // A unit the sweep will skip anyway needs no sub-unit lookup.
+  if (konkurs || underAvvikling || slettet) return base;
+
+  const subUrl = `${BRREG_BASE_URL}/underenheter?overordnetEnhet=${encodeURIComponent(cleanOrgNr)}&size=50`;
+  let subRes: Response;
+  try {
+    subRes = await fetchWithTimeout(subUrl, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch {
+    return { kind: "error" };
+  }
+  if (subRes.status === 404) return base;
+  if (!subRes.ok) return { kind: "error" };
+  let subJson: { _embedded?: { underenheter?: RawUnderenhet[] } };
+  try {
+    subJson = (await subRes.json()) as typeof subJson;
+  } catch {
+    return { kind: "error" };
+  }
+  const subs = Array.isArray(subJson?._embedded?.underenheter) ? subJson._embedded!.underenheter! : [];
+  for (const u of subs) {
+    if (trimOrNull(u.nedleggelsesdato) || trimOrNull(u.slettedato)) continue;
+    const address = toStructuredAddress(u.beliggenhetsadresse);
+    if (!address || !address.adresse) continue;
+    base.activeSubUnits.push({ orgnumber: trimOrNull(u.organisasjonsnummer) ?? "", address });
+  }
+  return base;
 }
 
 // ─── Website (hjemmeside) lookup (dev-request 2026-07-12-experiences- ───
