@@ -26284,7 +26284,12 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       buyer_email TEXT,
       buyer_phone TEXT,
       delivery_note TEXT,
-      contact_consent_at TEXT
+      contact_consent_at TEXT,
+      -- Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-
+      -- kjoperagent): the shared order-action layer reads notify_sent_at and
+      -- transitionOrder writes completion_source.
+      notify_sent_at TEXT,
+      completion_source TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_orders_cart_id  ON orders(cart_id);
     CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id);
@@ -26307,7 +26312,11 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       from_status TEXT,
       to_status TEXT NOT NULL,
       actor TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- Fase A1: every row carries actor_role + channel (+ idempotency key).
+      actor_role TEXT,
+      channel TEXT,
+      idempotency_key TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_order_events_order_id ON order_events(order_id);
     CREATE TABLE trust_events (
@@ -26317,6 +26326,7 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
         'order_completed','order_no_show','order_declined',
         'booking_attended','booking_no_show')),
       ref TEXT,
+      completion_source TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id);
@@ -37053,6 +37063,40 @@ const _orderSkive1Promise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent, Fase A1:
+// shared order-action layer, one-click lifecycle, automatic close (fake
+// clock, switch on/off, prepay without payment events), no_show /
+// buyer_cancelled / cannot_deliver + receipts, buyer/seller conflict → admin
+// alert, actor_role + channel on every order_events row, idempotency. Own
+// in-memory prod-schema DB and module-local pins, strictly after skive 1;
+// the next block in the chain awaits _orderActionsA1Promise.
+let _orderActionsA1Resolve: () => void = () => {};
+const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
+  _orderActionsA1Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: Mine ordrer Fase A1 (handlingslag + livsløp med ett klikk) ──");
+  try {
+    const { runOrderActionsFaseA1Tests } = require("../src/routes/order-actions-fase-a1.test") as
+      typeof import("../src/routes/order-actions-fase-a1.test");
+    const a1 = await runOrderActionsFaseA1Tests({ log: false });
+    passed += a1.passed;
+    failed += a1.failed;
+    for (const f of a1.failures) failures.push("order-actions-fase-a1: " + f);
+    console.log(`  order-actions-fase-a1: ${a1.passed} passed, ${a1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-actions-fase-a1: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderActionsA1Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
 // no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
 // rotasjon-no-yield-backoff) to the experiences vertical's
@@ -37068,7 +37112,7 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_orderSkive1Promise]);
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");

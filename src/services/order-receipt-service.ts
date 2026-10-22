@@ -28,6 +28,7 @@ import { isBlocked } from "./blocklist-service";
 import { producerContact, producerTraderStatus, TERMS_OF_PURCHASE_URL, type ProducerContact } from "./cart-service";
 import { companyOperatorSentence } from "./company-legal";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "./order-pricing";
+import { formatPickupTimeOslo, isOrderAutocompleteEnabled } from "./order-lifecycle";
 
 export function isBuyerReceiptsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.ORDER_BUYER_RECEIPTS_ENABLED === "1";
@@ -83,7 +84,13 @@ export interface ReceiptData {
   totalNok: number | null;
   cancelReason: string | null;
   payment: ReceiptPayment | null;
+  /** Fase A1: the pickup time the producer set when confirming (ISO / SQLite UTC); null = none. */
+  pickupTime?: string | null;
+  /** Fase A1: ORDER_AUTOCOMPLETE_ENABLED — the confirmation then says the order closes by itself. */
+  autoCloseOn?: boolean;
 }
+
+const PLATFORM_CONTACT = "kontakt@rettfrabonden.com";
 
 const RELEASED = " Reservasjonen på betalingskortet ditt blir frigjort, og du belastes ikke.";
 const NOT_CHARGED = " Du er ikke belastet.";
@@ -165,8 +172,16 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
       `Denne e-posten er bekreftelsen din – ta vare på den.\n\n` +
       `Ordre: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
       `Varer:\n${itemLines}\n${sumLine}\n\n` +
-      `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n` +
+      (d.pickupTime
+        ? `Henting: Du henter varene hos ${d.producerName}. Hentetid: ${formatPickupTimeOslo(d.pickupTime)}.\n`
+        : `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n`) +
       `Betaling: ${pay}\n\n` +
+      // Fase A1: only promised while the automatic close is actually on.
+      (d.autoCloseOn
+        ? `Du trenger ikke gjøre noe mer etter hentingen: ordren avsluttes av seg selv etter hentetiden. ` +
+          `Stemmer ikke noe – for eksempel hvis du ikke fikk hentet varene – sier du fra til ${d.producerName} (kontaktinformasjon over) ` +
+          `eller til Rett fra Bonden på ${PLATFORM_CONTACT}, så retter vi det.\n\n`
+        : "") +
       rights +
       footer;
     return { subject: `Ordrebekreftelse fra ${d.producerName} (${d.orderRef})`, text };
@@ -210,10 +225,20 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
         pay = notChargedLine(p);
       }
       break;
+    case "no_show": {
+      // Fase A1 (AC2): the producer recorded that the order was not picked
+      // up. The buyer gets a receipt so a wrong registration can be corrected.
+      why = `${d.producerName} har registrert at bestillingen ikke ble hentet. ` +
+        `Har du hentet varene, eller stemmer ikke dette, sier du fra til ${d.producerName} eller til Rett fra Bonden på ${PLATFORM_CONTACT}.`;
+      const settled = !!p && (p.status === "captured" || p.status === "authorized");
+      pay = settled ? ` Betalingen for en bestilling som ikke hentes, behandles etter kjøpsvilkårene (${TERMS_OF_PURCHASE_URL}).` : "";
+      break;
+    }
     default:
-      return null; // no_show and other reasons: no receipt
+      return null; // other reasons: no receipt
   }
   const text = `Hei!\n\n${why}${pay} (Ordre ${d.orderRef}.)\n\nKontakt produsenten:\n${contactLines}\n\n` + footer;
+  if (d.cancelReason === "no_show") return { subject: `Bestillingen er registrert som ikke hentet (${d.orderRef})`, text };
   return { subject: `Bestillingen er kansellert (${d.orderRef})`, text };
 }
 
@@ -223,12 +248,12 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
   try {
     const db = _testDb ?? getDb();
     const o = db.prepare(`
-      SELECT o.id, o.agent_id, o.total_nok, o.cancel_reason, o.buyer_email AS order_email, c.buyer_email AS cart_email,
+      SELECT o.id, o.agent_id, o.total_nok, o.cancel_reason, o.pickup_time, o.buyer_email AS order_email, c.buyer_email AS cart_email,
              a.name AS producer_name
       FROM orders o INNER JOIN agents a ON a.id = o.agent_id LEFT JOIN carts c ON c.id = o.cart_id
       WHERE o.id = ?
     `).get(orderId) as
-      | { id: string; agent_id: string; total_nok: number | null; cancel_reason: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
+      | { id: string; agent_id: string; total_nok: number | null; cancel_reason: string | null; pickup_time: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
       | undefined;
     if (!o) return;
     const to = plausibleEmail(o.order_email) ?? plausibleEmail(o.cart_email);
@@ -256,6 +281,8 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
       totalNok: o.total_nok,
       cancelReason: o.cancel_reason,
       payment,
+      pickupTime: o.pickup_time,
+      autoCloseOn: isOrderAutocompleteEnabled(),
     });
     if (!rendered) return;
     const replyTo = plausibleEmail(contact.email) ?? "kontakt@rettfrabonden.com";

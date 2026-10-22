@@ -35,6 +35,8 @@ import { summarizePricing } from "./order-pricing";
 // concurrent test blocks that re-pin the global cannot clobber this handle.
 let _cartTestDb: any = null;
 export function __setCartTestDb(db: any): void { _cartTestDb = db; }
+/** The DB cart-service writes to (its test pin, else getDb()) — shared with order-actions.ts. */
+export function cartServiceDb(): any { return _cartTestDb ?? getDb(); }
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -1570,9 +1572,13 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
 // write trust-ledger events (trust-event-service). `ready → cancelled` is the
 // producer "no-show" path and stores cancel_reason='no_show'.
 
+// Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+// «Klar for henting» is no longer a step — a confirmed order can be completed
+// directly (seller «Hentet», buyer «picked_up», or the automatic close).
+// `ready` stays for existing rows and is handled like `confirmed`.
 const VALID_TRANSITIONS: Record<string, string[]> = {
   pending:   ["confirmed", "declined"],
-  confirmed: ["ready", "cancelled"],
+  confirmed: ["ready", "completed", "cancelled"],
   ready:     ["completed", "cancelled"],
   declined:  [],
   completed: [],
@@ -1588,10 +1594,42 @@ export type TransitionResult =
   | { success: true; order_id: string; status: string }
   | { success: false; status: number; error: string };
 
+export type OrderActorRole = "seller" | "buyer" | "system" | "admin";
+/** transitionOrder's error when the idempotency key was already used on the order. */
+export const IDEMPOTENCY_KEY_TAKEN = "idempotency_key_taken";
+export type OrderCompletionSource = "auto" | "buyer" | "seller" | "admin";
+
+/**
+ * Fase A1: every order_events row carries actor_role + channel. Callers that
+ * predate the action layer (payment-service's payment_expired) pass only the
+ * legacy `actor`; the role and channel are derived from it here.
+ */
+export function deriveActorRoleChannel(actor: string | null | undefined): { role: OrderActorRole; channel: string } {
+  switch (actor) {
+    case "producer": return { role: "seller", channel: "producer_page" };
+    case "admin":    return { role: "admin", channel: "admin" };
+    case "buyer":    return { role: "buyer", channel: "internal" };
+    case "system":   return { role: "system", channel: "system_job" };
+    default:         return { role: "system", channel: "internal" };
+  }
+}
+
 export function transitionOrder(
   orderId: string,
   toStatus: string,
-  opts?: { actor?: string; cancelReason?: string | null }
+  opts?: {
+    actor?: string;
+    cancelReason?: string | null;
+    /** Fase A1: who acted and through which channel (derived from `actor` when absent). */
+    actorRole?: OrderActorRole;
+    channel?: string;
+    /** Fase A1: stored on the order_events row; unique per order. */
+    idempotencyKey?: string | null;
+    /** Fase A1: stored on orders.completion_source when toStatus is 'completed'. */
+    completionSource?: OrderCompletionSource | null;
+    /** Fase A1: set orders.pickup_time in the same write (confirm with a pickup time). */
+    pickupTime?: string | null;
+  }
 ): TransitionResult {
   const db = _cartTestDb ?? getDb();
 
@@ -1638,13 +1676,25 @@ export function transitionOrder(
       error: `Cannot expire the payment of an order in '${order.status}' — only pending orders expire`,
     };
   }
-  if (cancelReason === "no_show" && order.status !== "ready") {
+  // Fase A1: «Klar for henting» is no longer a step, so a no-show can be
+  // recorded for any confirmed order (confirmed or the legacy ready) until it
+  // is closed — never for one that was not confirmed.
+  if (cancelReason === "no_show" && order.status !== "ready" && order.status !== "confirmed") {
     return {
       success: false,
       status: 409,
-      error: `Cannot record a no-show for an order in '${order.status}' — only orders that were ready for pickup can be no-shows`,
+      error: `Cannot record a no-show for an order in '${order.status}' — only confirmed orders can be no-shows`,
     };
   }
+
+  const derived = deriveActorRoleChannel(actor);
+  const actorRole: OrderActorRole = opts?.actorRole ?? derived.role;
+  const channel = opts?.channel ?? derived.channel;
+  const idempotencyKey = opts?.idempotencyKey ?? null;
+  const completionSource: OrderCompletionSource | null = toStatus === "completed"
+    ? (opts?.completionSource ?? (actorRole === "admin" ? "admin" : actorRole === "seller" ? "seller" : actorRole === "buyer" ? "buyer" : null))
+    : null;
+  const pickupTime = toStatus === "confirmed" ? (opts?.pickupTime ?? null) : null;
 
   // Concurrency guard: the UPDATE re-asserts the from-status we validated
   // against (id AND status), so two racing transitions (multi-instance, or
@@ -1659,10 +1709,16 @@ export function transitionOrder(
       conflict = true;
       throw new Error("concurrent status change");
     }
+    if (completionSource) {
+      db.prepare("UPDATE orders SET completion_source = ? WHERE id = ?").run(completionSource, orderId);
+    }
+    if (pickupTime) {
+      db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(pickupTime, orderId);
+    }
     db.prepare(`
-      INSERT INTO order_events (id, order_id, from_status, to_status, actor, created_at)
-      VALUES (?, ?, ?, ?, ?, datetime('now'))
-    `).run(randomUUID(), orderId, order.status, toStatus, actor);
+      INSERT INTO order_events (id, order_id, from_status, to_status, actor, actor_role, channel, idempotency_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run(randomUUID(), orderId, order.status, toStatus, actor, actorRole, channel, idempotencyKey);
   });
 
   try {
@@ -1676,12 +1732,17 @@ export function transitionOrder(
       };
     }
     const msg = err instanceof Error ? err.message : String(err);
+    // Fase A1: a racing repeat of the same idempotency key lost the unique
+    // index (order_id, idempotency_key); the whole write rolled back.
+    if (idempotencyKey && /UNIQUE constraint failed: order_events/i.test(msg)) {
+      return { success: false, status: 409, error: IDEMPOTENCY_KEY_TAKEN };
+    }
     return { success: false, status: 500, error: `Transition failed: ${msg}` };
   }
 
   // Trust-ledger: terminal outcomes only. recordTrustEvent never throws.
   if (toStatus === "completed") {
-    recordTrustEvent({ agentId: order.agent_id, eventType: "order_completed", ref: orderId });
+    recordTrustEvent({ agentId: order.agent_id, eventType: "order_completed", ref: orderId, completionSource });
   } else if (toStatus === "declined") {
     recordTrustEvent({ agentId: order.agent_id, eventType: "order_declined", ref: orderId });
   } else if (toStatus === "cancelled" && cancelReason === "no_show") {
