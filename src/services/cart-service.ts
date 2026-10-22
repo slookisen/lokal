@@ -779,7 +779,7 @@ export function deleteCartWish(cartId: string, wishId: string): UpdateItemResult
 // ─── View cart ───────────────────────────────────────────────────────────────
 
 /** Skive 4: the stored food columns as FoodInfo, or null when none of them is stated. Never throws. */
-function foodInfoOf(r: { ingredients: string | null; allergens: string | null; net_weight: string | null }): FoodInfo | null {
+export function foodInfoOf(r: { ingredients: string | null; allergens: string | null; net_weight: string | null }): FoodInfo | null {
   let allergens: string[] | null = null;
   if (typeof r.allergens === "string") {
     try {

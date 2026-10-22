@@ -77,7 +77,7 @@
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
 import { geocodingService } from "./geocoding-service";
-import { isEligibleForRealOrder } from "./cart-service";
+import { isEligibleForRealOrder, isProducerStatedSource, foodInfoOf, type FoodInfo } from "./cart-service";
 import { computeEffectiveAvailability } from "./supply-graph";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
@@ -141,6 +141,13 @@ export interface Offer {
   price_nok: number | null;
   unit: string | null;
   availability: string;
+  /**
+   * Skive 4: present only together with food_info (left out for an item without food information,
+   * so such an answer is what it was): the row was stated by the producer, not scraped.
+   */
+  producer_confirmed?: boolean;
+  /** Skive 4: ingredients / allergens / net weight where stated, shown to the buyer before submit; left out when none is stated. */
+  food_info?: FoodInfo;
   producer: OfferProducer;
 }
 
@@ -193,6 +200,9 @@ interface RawOfferRow {
   product_category: string | null;
   /** agents.categories, a JSON array. */
   agent_categories: string | null;
+  ingredients: string | null;
+  allergens: string | null;
+  net_weight: string | null;
 }
 
 // I-V: every word of the query parser's keyword map, and every platform key,
@@ -342,7 +352,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       a.id AS agent_id, a.name AS agent_name, a.city AS city,
       a.lat AS lat, a.lng AS lng, a.geo_precision AS geo_precision,
       a.is_verified AS is_verified,
-      p.category AS product_category, a.categories AS agent_categories
+      p.category AS product_category, a.categories AS agent_categories,
+      p.ingredients AS ingredients, p.allergens AS allergens, p.net_weight AS net_weight
     FROM products p
     INNER JOIN agents a ON a.id = p.agent_id
     INNER JOIN agent_knowledge k ON k.agent_id = a.id
@@ -436,14 +447,18 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     };
   };
 
-  const offers: Offer[] = offerRows.map(({ r, dist, availability }) => ({
-    product_id: r.product_id ?? null,
-    product_name: r.product_name,
-    price_nok: r.price_nok ?? null,
-    unit: r.unit ?? null,
-    availability,
-    producer: producerOf(r, dist),
-  }));
+  const offers: Offer[] = offerRows.map(({ r, dist, availability }) => {
+    const food_info = foodInfoOf(r);
+    return {
+      product_id: r.product_id ?? null,
+      product_name: r.product_name,
+      price_nok: r.price_nok ?? null,
+      unit: r.unit ?? null,
+      availability,
+      ...(food_info ? { producer_confirmed: isProducerStatedSource(r.availability_source), food_info } : {}),
+      producer: producerOf(r, dist),
+    };
+  });
 
   if (matchRows.length === 0) return { term, offers };
   const note = categoryMatchNote(term);

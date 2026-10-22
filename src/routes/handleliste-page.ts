@@ -89,6 +89,11 @@ const COPY: Record<"no" | "en", Copy> = {
     producer_says: "Produsenten oppgir:",
     channels: "Salgskanaler:",
     availability: "Tilgjengelighet:",
+    producer_confirmed: "Oppgitt av produsenten",
+    food_ingredients: "Ingredienser:",
+    food_allergens: "Allergener:",
+    food_allergens_none: "ingen oppgitt av produsenten",
+    food_net_weight: "Nettovekt:",
     back: "Tilbake",
     next_summary: "Videre til oppsummering",
     pick_one: "Velg minst én produsent for å gå videre.",
@@ -156,6 +161,11 @@ const COPY: Record<"no" | "en", Copy> = {
     producer_says: "The producer states:",
     channels: "Sales channels:",
     availability: "Availability:",
+    producer_confirmed: "Stated by the producer",
+    food_ingredients: "Ingredients:",
+    food_allergens: "Allergens:",
+    food_allergens_none: "none stated by the producer",
+    food_net_weight: "Net weight:",
     back: "Back",
     next_summary: "Continue to summary",
     pick_one: "Choose at least one producer to continue.",
@@ -345,6 +355,20 @@ const CLIENT_SCRIPT = `
     }).catch(function(){ el('hl-find').disabled = false; msg('hl-msg1', C.error_generic); });
   }
 
+  // Skive 4: food information (ingredients / allergens / net weight) and the producer-confirmed
+  // mark, shown before submit. Text only (textContent), whatever the data holds.
+  function foodNodes(o){
+    var out = [];
+    if (o.producer_confirmed === true) out.push(mk('div', { cls: 'hl-meta', text: C.producer_confirmed }));
+    var f = o.food_info;
+    if (f && typeof f === 'object') {
+      if (typeof f.ingredients === 'string' && f.ingredients) out.push(mk('div', { cls: 'hl-meta', text: C.food_ingredients + ' ' + f.ingredients }));
+      if (Array.isArray(f.allergens)) out.push(mk('div', { cls: 'hl-meta', text: C.food_allergens + ' ' + (f.allergens.length ? f.allergens.join(', ') : C.food_allergens_none) }));
+      if (typeof f.net_weight === 'string' && f.net_weight) out.push(mk('div', { cls: 'hl-meta', text: C.food_net_weight + ' ' + f.net_weight }));
+    }
+    return out;
+  }
+
   function offerNode(i, j, o){
     var p = o.producer || {};
     var id = 'hl-o-' + i + '-' + j;
@@ -367,6 +391,7 @@ const CLIENT_SCRIPT = `
     if (typeof o.price_nok === 'number') bits.push(o.price_nok + ' kr' + (o.unit ? '/' + o.unit : ''));
     lbl.appendChild(mk('div', { cls: 'hl-meta', text: bits.join(' · ') }));
     if (isCat) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.category_match }));
+    foodNodes(o).forEach(function(n){ lbl.appendChild(n); });
     if (o.availability) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.availability + ' ' + String(o.availability) }));
     if (Array.isArray(p.salgskanaler) && p.salgskanaler.length) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.channels + ' ' + p.salgskanaler.join(', ') }));
     if (p.delivery_text) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.producer_says + ' ' + String(p.delivery_text) }));
@@ -434,7 +459,8 @@ const CLIENT_SCRIPT = `
       if (!list.length) return;
       box.appendChild(mk('h3', { text: title }));
       list.forEach(function(c){
-        box.appendChild(mk('div', { cls: 'hl-meta', text: c.item.qty + ' × ' + c.item.term + ' — ' + String((c.offer.producer || {}).name || '') }));
+        box.appendChild(mk('div', { cls: 'hl-meta', text: c.item.qty + ' × ' + c.item.term + ' — ' + String((c.offer.producer || {}).name || '') + (typeof c.offer.price_nok === 'number' ? ' · ' + c.offer.price_nok + ' kr' + (c.offer.unit ? '/' + c.offer.unit : '') : '') }));
+        foodNodes(c.offer).forEach(function(n){ box.appendChild(n); });
       });
     }
     group(C.summary_order, orderable);

@@ -15,6 +15,8 @@
  *         availability_source='admin_producer_confirmed', and the catalog sync
  *         never overwrites the confirmed price
  *   S4-3  price + food information are shown in the cart view (REST and MCP)
+ *   S4-4  the offers answer (REST + lokal_find_offers) carries food_info + producer_confirmed
+ *   S4-5  unconfirmedItemError fails closed when the gate cannot be evaluated
  *
  * Standalone: npx tsx src/routes/order-bestillinger-skive4.test.ts
  * Wired into `npm test` by tests/test.ts.
@@ -196,6 +198,7 @@ export async function runOrderBestillingerSkive4Tests(opts: { log?: boolean } = 
       const app = express();
       app.use(express.json());
       app.use("/admin/products", catalog.adminCatalogRouter);
+      app.use("/api/marketplace/catalog", catalog.catalogRouter);
       app.use("/api/marketplace", cartRoutes.cartRouter);
       server = http.createServer(app);
       await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", () => resolve()));
@@ -356,6 +359,73 @@ export async function runOrderBestillingerSkive4Tests(opts: { log?: boolean } = 
       db.prepare("UPDATE products SET allergens = '{kaputt' WHERE id = ?").run(syl.id);
       const v2 = await req("GET", `/api/marketplace/cart/${c.body.cart_id}`, { headers: H });
       assertEq(v2.status, 200, "s4-84: a malformed allergens value does not break the cart view");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // S4-5 — fail closed when the gate cannot be evaluated (unconfirmedItemError catch)
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      // A producer who does not pass the gate: its scraped row is normally addable (as s4-07).
+      insAgent.run("ag-s1", "Failclosed Gård", "s1@example.no", "k-s1");
+      insKnow.run("ag-s1", "s1@example.no", null);
+      insProd.run("p-s1", "ag-s1", "Skrapt fail-closed", "skrapt fail-closed", 40, "enrichment", null);
+      // With the gate's own table unreadable the check throws; the row must then be refused, not sold.
+      const cart = cartSvc.createCart();
+      db.exec("ALTER TABLE agent_knowledge RENAME TO agent_knowledge_s4_away");
+      let r: ReturnType<typeof cartSvc.addCartItem>;
+      try { r = cartSvc.addCartItem(cart.cart_id, "p-s1", 1); }
+      finally { db.exec("ALTER TABLE agent_knowledge_s4_away RENAME TO agent_knowledge"); }
+      assertTrue(!r.success && r.status === 422 && r.error.startsWith("not_producer_confirmed"), "s4-90: gate cannot be evaluated -> scraped row refused (fail closed, 422)");
+      assertEq(cartSvc.viewCart(cart.cart_id)?.item_count, 0, "s4-91: …and no cart line was written");
+      const again = cartSvc.addCartItem(cart.cart_id, "p-s1", 1);
+      assertTrue(again.success === true, "s4-92: with the gate readable again the same row is added (control)");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // S4-4 — the offers answer (REST /catalog/offers + lokal_find_offers) carries the food information
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      const { findOffers } = require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+      const LAT = 59.9, LNG = 10.75;
+      const addOffAgent = (id: string, name: string) => {
+        db.prepare(`INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, categories, lat, lng, city, is_active, is_verified)
+                    VALUES (?, ?, 'x', 'self', ?, 'https://example.no', 'producer', ?, '["vegetables"]', ?, ?, 'Oslo', 1, 1)`)
+          .run(id, name, `${id}@example.no`, `k-${id}`, LAT, LNG);
+        db.prepare("INSERT INTO agent_knowledge (agent_id, verification_status, email) VALUES (?, 'verified', ?)").run(id, `${id}@example.no`);
+      };
+      const addOffProd = (id: string, agent: string, name: string, source: string, extra: { ing?: string | null; all?: string | null; nw?: string | null } = {}) =>
+        db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, category, availability_source, availability_updated_at, ingredients, allergens, net_weight)
+                    VALUES (?, ?, ?, ?, 55, 'stk', 'in_stock', 'vegetables', ?, datetime('now'), ?, ?, ?)`)
+          .run(id, agent, name, name.toLowerCase(), source, extra.ing ?? null, extra.all ?? null, extra.nw ?? null);
+      const XSS = `<img src=x onerror=alert(1)>`;
+      addOffAgent("ag-off-food", "Mat Gård"); addOffProd("p-off-food", "ag-off-food", "Fruktgele", "admin_producer_confirmed", { ing: XSS + "Frukt, sukker", all: JSON.stringify(["gluten", XSS]), nw: "200 g" });
+      addOffAgent("ag-off-bare", "Bar Gård"); addOffProd("p-off-bare", "ag-off-bare", "Fruktkurv", "producer_dashboard");
+      addOffAgent("ag-off-scr", "Skrap Gård"); addOffProd("p-off-scr", "ag-off-scr", "Fruktpai", "enrichment", { nw: "100 g" });
+      const res = await findOffers({ q: "frukt", lat: LAT, lng: LNG, radiusKm: 50, limit: 5 }, { db });
+      const byProd = (id: string) => res.offers.find((o) => o.product_id === id);
+      assertEq(byProd("p-off-food")?.food_info, { ingredients: XSS + "Frukt, sukker", allergens: ["gluten", XSS], net_weight: "200 g" }, "s4-100: an offer carries ingredients, allergens and net weight (hostile text stays raw data)");
+      assertEq(byProd("p-off-food")?.producer_confirmed, true, "s4-101: …and producer_confirmed");
+      assertEq(byProd("p-off-food")?.price_nok, 55, "s4-102: …and the price");
+      assertTrue(!!byProd("p-off-bare") && !("food_info" in byProd("p-off-bare")!) && !("producer_confirmed" in byProd("p-off-bare")!), "s4-103: an item without food information carries neither field (the answer is what it was)");
+      assertEq(byProd("p-off-scr")?.food_info?.net_weight, "100 g", "s4-104: a scraped row with food information still shows it…");
+      assertEq(byProd("p-off-scr")?.producer_confirmed, false, "s4-105: …and is not producer_confirmed");
+      db.prepare("UPDATE products SET allergens = '{kaputt' WHERE id = 'p-off-food'").run();
+      const res2 = await findOffers({ q: "frukt", lat: LAT, lng: LNG, radiusKm: 50, limit: 5 }, { db });
+      assertEq(res2.offers.find((o) => o.product_id === "p-off-food")?.food_info?.allergens, null, "s4-106: malformed stored allergens do not break the offers answer");
+
+      // REST + MCP return the same fields (same findOffers).
+      const rest = await req("GET", `/api/marketplace/catalog/offers?q=frukt&lat=${LAT}&lng=${LNG}`);
+      assertEq(rest.status, 200, "s4-107: REST offers 200");
+      assertEq(rest.body?.offers?.find((o: any) => o.product_id === "p-off-food")?.food_info?.net_weight, "200 g", "s4-108: REST offers carry food_info");
+      const mcp = require("./mcp") as typeof import("./mcp");
+      const tools = new Map<string, (args: any, extra?: any) => Promise<any>>();
+      mcp.registerTools({
+        registerTool(name: string, _config: any, handler: any) { tools.set(name, handler); },
+        resource() {}, prompt() {}, registerResource() {}, registerPrompt() {},
+      } as any, () => "test-client", () => undefined);
+      const mo = JSON.parse(String((await tools.get("lokal_find_offers")!({ items: ["frukt"], lat: LAT, lng: LNG }))?.content?.[0]?.text ?? "null"));
+      const moOffers: any[] = mo?.[0]?.offers ?? [];
+      assertEq(moOffers.find((o) => o.product_id === "p-off-food")?.food_info?.net_weight, "200 g", "s4-109: lokal_find_offers carries food_info");
     }
   } catch (err) {
     failed++;

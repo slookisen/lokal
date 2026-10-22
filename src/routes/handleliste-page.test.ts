@@ -203,6 +203,55 @@ export async function runHandelistePageTests(opts: { log?: boolean } = {}): Prom
     assertTrue(script.includes("'/wishes'") && script.includes("'/submit'") && script.includes("/wishes/"), "client script uses wishes + wishes/:wid + submit");
     assertTrue(built.content.includes("noscript"), "page has a noscript fallback message");
     assertTrue(page.HANDELISTE_OFFERS_INITIAL < 5 && page.HANDELISTE_MAX_ITEMS >= 2, "show-more window < 5 (endpoint cap) so 'vis flere' has something to reveal");
+    // ═══════════ Skive 4: food information shown before submit (selection + summary step) ═══════════
+    {
+      const grab = (name: string): string => {
+        const m = script.match(new RegExp(`  function ${name}\\([^)]*\\)\\{[\\s\\S]*?\\n  \\}\\n`));
+        return m ? m[0] : "";
+      };
+      const mkSrc = grab("mk"), foodSrc = grab("foodNodes");
+      assertTrue(mkSrc.length > 0 && foodSrc.length > 0, "s4-page: foodNodes + mk found in the client script");
+      assertTrue(!/innerHTML/.test(foodSrc), "s4-page: foodNodes never uses innerHTML");
+      // Both the offer card (before choosing) and the summary (before submit) render the food information.
+      const offerSrc = grab("offerNode"), summarySrc = grab("toSummary");
+      assertTrue(/foodNodes\(o\)/.test(offerSrc), "s4-page: the offer card shows the food information");
+      assertTrue(/foodNodes\(c\.offer\)/.test(summarySrc), "s4-page: the summary step (just before submit) shows it again");
+      const copy = JSON.parse(copyJson);
+      for (const k of ["producer_confirmed", "food_ingredients", "food_allergens", "food_allergens_none", "food_net_weight"]) {
+        assertTrue(typeof copy[k] === "string" && copy[k].length > 0, `s4-page: NO copy has ${k}`);
+        assertTrue(typeof JSON.parse((enHtml.match(/<script type="application\/json" id="hl-copy">([\s\S]*?)<\/script>/) || [])[1] || "{}")[k] === "string", `s4-page: EN copy has ${k}`);
+      }
+      // Run the real functions against a minimal fake DOM that records what is set as text vs. markup.
+      const made: Array<{ tag: string; text: string; html: string | null }> = [];
+      const fakeDoc = {
+        createElement(tag: string) {
+          const n: any = { tag, text: "", html: null as string | null, children: [] as any[], appendChild(c: any) { this.children.push(c); return c; } };
+          Object.defineProperty(n, "textContent", { get() { return this.text; }, set(v: string) { this.text = String(v); } });
+          Object.defineProperty(n, "innerHTML", { get() { return this.html; }, set(v: string) { this.html = String(v); } });
+          made.push(n);
+          return n;
+        },
+      };
+      const factory = new Function("document", "C", `${mkSrc}\n${foodSrc}\nreturn foodNodes;`);
+      const foodNodes = factory(fakeDoc, copy) as (o: any) => any[];
+      const texts = (o: any) => foodNodes(o).map((n) => n.text);
+      const EVIL = "<img src=x onerror=alert(1)>";
+      const full = texts({ producer_confirmed: true, food_info: { ingredients: `Jordbær, ${EVIL}`, allergens: ["gluten", EVIL], net_weight: "250 g" } });
+      assertEq(full.length, 4, "s4-page: confirmed item with full food info renders four lines");
+      assertTrue(full[1]!.startsWith(copy.food_ingredients) && full[1]!.includes("Jordbær"), "s4-page: ingredients are shown");
+      assertTrue(full[2]!.startsWith(copy.food_allergens) && full[2]!.includes("gluten"), "s4-page: allergens are shown");
+      assertTrue(full[3]!.startsWith(copy.food_net_weight) && full[3]!.includes("250 g"), "s4-page: net weight is shown");
+      assertEq(full[0], copy.producer_confirmed, "s4-page: the producer-confirmed mark is shown");
+      assertTrue(full[1]!.includes(EVIL) && full[2]!.includes(EVIL), "s4-page: hostile markup is carried as literal text (textContent)");
+      assertTrue(made.every((n) => n.html === null), "s4-page: no element ever receives innerHTML");
+      assertTrue(texts({ producer_confirmed: true, food_info: { ingredients: null, allergens: [], net_weight: null } }).some((t) => t.includes(copy.food_allergens_none)), "s4-page: an empty allergen list says none stated by the producer");
+      // An item without food information renders without error.
+      assertEq(texts({ producer_confirmed: false, food_info: null }), [], "s4-page: scraped item without food_info renders no food lines, no error");
+      assertEq(texts({}), [], "s4-page: an offer from an older response (no new fields) renders no food lines, no error");
+      assertEq(texts({ producer_confirmed: true, food_info: "x" }), [copy.producer_confirmed], "s4-page: a malformed food_info is ignored");
+      assertEq(texts({ food_info: { ingredients: "Mel", allergens: null, net_weight: null } }).length, 1, "s4-page: unstated allergens (null) are not claimed as none");
+    }
+
     // Hardcoded demo of the escaper used for static copy.
     const enBuilt = page.buildHandelistePage("en");
     assertTrue(!enBuilt.content.includes("<img") && !enBuilt.content.includes("onerror"), "static copy has no injected markup");
