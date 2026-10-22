@@ -3236,7 +3236,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>MCP/A2A tool-call log</td><td>Deleted automatically after 60 days, in the same daily pass as page visits and searches. No daily counts are kept from this log.</td></tr>
         <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
         <tr><td>Buyer contact details (name/email/phone/note)</td><td>Deleted automatically 30 days after the order is finally resolved (completed/declined/cancelled), or 30 days after submission if no order was created.</td></tr>
-        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, with no fixed time limit. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
+        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, and never longer than 30 days. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
         <tr><td>Email correspondence and send log</td><td>No automatic deletion today. We delete it on request.</td></tr>
         <tr><td>Do-not-re-add list</td><td>For as long as the service exists, so a removed profile is not created again.</td></tr>
       </tbody>
@@ -3408,7 +3408,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Fra denne loggen beholdes bare antall søk per dag, uke og måned per kanal (MCP eller A2A), uten klient-streng, IP-hash eller annen kobling til den som kalte.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
         <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
-        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
+        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
         <tr><td>E-postkorrespondanse og utsendingslogg</td><td>Ingen automatisk sletting i dag. Vi sletter på forespørsel.</td></tr>
         <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt.</td></tr>
       </tbody>

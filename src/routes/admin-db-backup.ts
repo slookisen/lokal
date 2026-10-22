@@ -20,8 +20,8 @@
 // ─── Safety notes ─────────────────────────────────────────────
 // - Genuinely additive/read-mostly: the ONLY writes this file ever performs
 //   are (a) a brand-new file under `backups/` per POST call and (b) deleting
-//   OLDER files under that same `backups/` dir once more than 10 exist
-//   (retention). No DELETE/UPDATE ever touches any existing application
+//   OLDER files under that same `backups/` dir once more than 10 exist or a
+//   file is older than 30 days (retention). No DELETE/UPDATE ever touches any existing application
 //   table or row.
 // - Uses better-sqlite3's built-in `.backup()` (SQLite's online/incremental
 //   backup API): it copies the live DB in small page-sized chunks scheduled
@@ -33,8 +33,8 @@
 // - sha256 is computed by streaming the backup file through Node's crypto
 //   hash (fs.createReadStream + incremental .update()), not a single
 //   fs.readFileSync of the whole file — same non-blocking rationale.
-// - Retention (readdir + sort + unlink of everything past the 10 newest) is
-//   synchronous, but only ever touches the small `backups/` directory
+// - Retention (readdir + sort + async unlink of everything past the 10 newest
+//   or older than the age limit) only ever touches the small `backups/` directory
 //   listing, never the live multi-hundred-MB DB file — bounded, cheap work.
 // - Backups made by THIS route live on the SAME Fly volume as the live DB:
 //   they protect against a bad mutation/apply, not against loss of the whole
@@ -203,47 +203,106 @@ export const BACKUP_FILENAME_RE = /^lokal-.*\.db$/;
 // already does; it only guards against stray non-backup files in that dir.
 export const EXPERIENCES_BACKUP_FILENAME_RE = /^experiences-.*\.db$/;
 
-// Retention: keep only the `keep` most recent backup files (by filename,
-// which sorts chronologically since it's built from an ISO timestamp),
-// deleting the rest. Exported (not test-prefixed) so a test can exercise the
-// deletion logic in isolation with a low `keep` value without needing to
-// create 10+ real backups end-to-end. Never called from production code with
-// anything but the default `keep` of 10.
-// `filenameRe` defaults to BACKUP_FILENAME_RE (lokal.db's pattern) so every
-// call site that predates the `?db=` parameter — including this file's own
-// pre-existing test — is completely unaffected; the experiences branch below
-// passes EXPERIENCES_BACKUP_FILENAME_RE explicitly. Retention is ALWAYS run
-// against one single directory at a time (lokal's flat backups/ dir, or
-// experiences' own backups/experiences/ subdirectory) — never both — which
-// is what keeps the two databases' 10-newest caps independent.
-export function pruneBackups(
+// Retention has two limits: keep at most the `keep` most recent backup files
+// (by filename, which sorts chronologically since it is built from an ISO
+// timestamp) AND delete anything older than `maxAgeDays` (default 30, env
+// DB_BACKUP_MAX_AGE_DAYS) even when fewer than `keep` files exist (dev-request
+// 2026-10-12-manuelle-db-kopier-aldersgrense; /personvern states this limit).
+// Age is read from the timestamp in the filename (falls back to mtime for a
+// file whose name carries none). Deletion uses fs.promises, never blocking the
+// main thread. Exported so tests can exercise it in isolation with a low
+// `keep` and a fixed `now`. `filenameRe` defaults to BACKUP_FILENAME_RE
+// (lokal.db's pattern); the experiences branch passes
+// EXPERIENCES_BACKUP_FILENAME_RE. Retention always runs against ONE directory
+// at a time, which keeps the two databases' caps independent.
+export const DEFAULT_BACKUP_MAX_AGE_DAYS = 30;
+
+export function backupMaxAgeDays(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.DB_BACKUP_MAX_AGE_DAYS;
+  if (typeof raw === "string" && /^\d+$/.test(raw.trim()) && Number(raw) >= 1) return Number(raw);
+  return DEFAULT_BACKUP_MAX_AGE_DAYS;
+}
+
+const BACKUP_TS_RE = /(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})[.-](\d{3})Z/;
+
+async function backupTimeMs(dir: string, name: string): Promise<number> {
+  const m = BACKUP_TS_RE.exec(name);
+  if (m) {
+    const t = Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`);
+    if (!isNaN(t)) return t;
+  }
+  try {
+    return (await fs.promises.stat(path.join(dir, name))).mtimeMs;
+  } catch {
+    return Date.now();
+  }
+}
+
+export async function pruneBackups(
   dir: string,
   keep: number = 10,
   filenameRe: RegExp = BACKUP_FILENAME_RE,
-): string[] {
+  maxAgeDays: number = backupMaxAgeDays(),
+  now: number = Date.now(),
+): Promise<string[]> {
   let entries: string[];
   try {
-    entries = fs.readdirSync(dir).filter((f) => filenameRe.test(f));
+    entries = (await fs.promises.readdir(dir)).filter((f) => filenameRe.test(f));
   } catch {
     return [];
   }
 
   entries.sort(); // filename timestamp -> chronological ascending
 
+  const cutoff = now - maxAgeDays * 86_400_000;
+  const toDelete = new Set<string>(entries.slice(0, Math.max(0, entries.length - keep)));
+  for (const name of entries) {
+    if (!toDelete.has(name) && (await backupTimeMs(dir, name)) < cutoff) toDelete.add(name);
+  }
+
   const deleted: string[] = [];
-  if (entries.length > keep) {
-    const toDelete = entries.slice(0, entries.length - keep);
-    for (const name of toDelete) {
-      try {
-        fs.unlinkSync(path.join(dir, name));
-        deleted.push(name);
-      } catch {
-        // Best-effort: a stray file that fails to delete doesn't fail the
-        // backup response that triggered this retention pass.
-      }
+  for (const name of entries) {
+    if (!toDelete.has(name)) continue;
+    try {
+      await fs.promises.unlink(path.join(dir, name));
+      deleted.push(name);
+    } catch {
+      // Best-effort: a stray file that fails to delete doesn't fail the
+      // backup response that triggered this retention pass.
     }
   }
   return deleted;
+}
+
+// Nightly age sweep: prunes every configured backup dir even when no new copy
+// was taken. Runs once per UTC day in the 02 UTC hour (outside the blocked
+// windows 00-01Z and 06:30-09:30Z; before the 03 UTC prune and the 04-05 UTC
+// offsite window). Never throws; unlink is async.
+export const BACKUP_AGE_SWEEP_TICK_MS = 15 * 60_000;
+export const BACKUP_AGE_SWEEP_HOUR_UTC = 2;
+
+export function createBackupAgeSweepTick(
+  opts: { now?: () => Date; dirs?: () => { dir: string; filenameRe: RegExp }[] } = {},
+): () => Promise<string[]> {
+  let lastDay = "";
+  return async () => {
+    const out: string[] = [];
+    try {
+      const now = (opts.now ?? (() => new Date()))();
+      const day = now.toISOString().slice(0, 10);
+      if (now.getUTCHours() !== BACKUP_AGE_SWEEP_HOUR_UTC || lastDay === day) return out;
+      lastDay = day;
+      const targets = (opts.dirs ?? (() => Object.values(DB_CONFIGS).map((c) => ({ dir: c.backupDir(), filenameRe: c.filenameRe }))))();
+      for (const t of targets) {
+        const del = await pruneBackups(t.dir, 10, t.filenameRe, backupMaxAgeDays(), now.getTime());
+        if (del.length > 0) console.log(`[db-backup-age-sweep] ${t.dir}: deleted ${del.length} (${del.join(", ")})`);
+        out.push(...del);
+      }
+    } catch (err) {
+      console.error("[db-backup-age-sweep] failed (non-fatal):", err);
+    }
+    return out;
+  };
 }
 
 type DbKey = "lokal" | "experiences";
@@ -345,7 +404,7 @@ router.get("/disk", (req: Request, res: Response) => {
 
 // ─── POST /backup/prune ───────────────────────────────────────
 // Manual retention: keep only the `keep` newest backups for one db.
-router.post("/backup/prune", (req: Request, res: Response) => {
+router.post("/backup/prune", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const dbKey = parseDbKey(req.query.db, res);
   if (dbKey === null) return;
@@ -357,7 +416,7 @@ router.post("/backup/prune", (req: Request, res: Response) => {
   const config = DB_CONFIGS[dbKey];
   const dir = config.backupDir();
   const diskBefore = diskUsage(dir);
-  const deleted = pruneBackups(dir, Number(rawKeep), config.filenameRe);
+  const deleted = await pruneBackups(dir, Number(rawKeep), config.filenameRe);
   res.json({ success: true, db: dbKey, keep: Number(rawKeep), deleted, disk_before: diskBefore, disk_after: diskUsage(dir) });
 });
 
@@ -418,7 +477,7 @@ router.post("/backup", (req: Request, res: Response) => {
     // backup must never cost an existing older one. Scoped to THIS db's own
     // directory only (see pruneBackups' doc comment) so lokal's and
     // experiences' 10-newest caps never interact.
-    pruneBackups(dir, 10, config.filenameRe);
+    await pruneBackups(dir, 10, config.filenameRe);
 
     res.json({
       backup_path: destPath,
