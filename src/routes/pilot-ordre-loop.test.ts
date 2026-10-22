@@ -134,8 +134,8 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       "INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, ?)"
     );
     const insertProduct = testDb.prepare(`
-      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
-      VALUES (?, ?, ?, ?, ?, ?, 'in_stock')
+      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
+      VALUES (?, ?, ?, ?, ?, ?, 'in_stock', 'admin_producer_confirmed')
     `);
 
     // Verified producer WITHOUT opt-in (the platform default) — negative case.
@@ -461,24 +461,11 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       assertTrue(bogus.status === 303 && (bogus.location || "").includes("error=ugyldig"),
         "prg-13: unknown action → error redirect");
 
-      // Review fix, finding 3: no_show is NOT reachable from 'confirmed' —
-      // an order that was never ready for pickup can't be booked as no-show.
-      const earlyNoShow = await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "no_show" } });
-      assertTrue(earlyNoShow.status === 303 && (earlyNoShow.location || "").includes("error=ugyldig"),
-        "prg-13b: PRG no_show on a confirmed order → rejected (error=ugyldig)");
-      const afterEarly = testDb.prepare("SELECT status, cancel_reason FROM orders WHERE id = ?").get(optinOrderId) as any;
-      assertTrue(afterEarly?.status === "confirmed" && afterEarly?.cancel_reason == null,
-        "prg-13c: rejected early no_show changes nothing (still confirmed, no cancel_reason)");
-      const earlyTrust = testDb.prepare(
-        "SELECT COUNT(*) AS c FROM trust_events WHERE event_type = 'order_no_show' AND ref = ?"
-      ).get(optinOrderId) as any;
-      assertEq(earlyTrust?.c, 0, "prg-13d: rejected early no_show writes no trust event");
-      const adminEarlyNoShow = await req("POST", `/admin/marketplace/orders/${optinOrderId}/no-show`, {
-        headers: { "x-admin-key": ADMIN_KEY },
-      });
-      assertEq(adminEarlyNoShow.status, 409, "prg-13e: admin no-show on a confirmed order → 409 (same central guard)");
-      // Plain confirmed → cancelled (no reason) stays legal — verified in the
-      // 6×6 matrix below; here we only pin that the no_show REASON is gated.
+      // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-
+      // kjoperagent): «Klar for henting» is no longer a step, so no_show is
+      // now legal from 'confirmed' too (until the order closes). That is
+      // covered in order-actions-fase-a1.test.ts; here the legacy
+      // confirmed → ready → no_show path (an existing `ready` row) is kept.
 
       // confirmed → ready → cancelled (no_show)
       await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "ready" } });
@@ -527,7 +514,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const STATUSES = ["pending", "confirmed", "declined", "ready", "completed", "cancelled"] as const;
       const ALLOWED: Record<string, string[]> = {
         pending:   ["confirmed", "declined"],
-        confirmed: ["ready", "cancelled"],
+        confirmed: ["ready", "completed", "cancelled"], // Fase A1: confirmed → completed directly
         ready:     ["completed", "cancelled"],
         declined:  [],
         completed: [],
@@ -567,16 +554,29 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const after = (testDb.prepare("SELECT updated_at FROM orders WHERE id = 'matrix-upd'").get() as any)?.updated_at;
       assertTrue(String(after) > String(before), "matrix-03: legal transition bumps updated_at");
 
-      // Review fix, finding 3 (unit level): the no_show REASON is gated on
-      // from-status 'ready' even though confirmed → cancelled itself is legal.
+      // Review fix, finding 3 (unit level), as changed by Fase A1: the no_show
+      // REASON is gated on a confirmed from-status (confirmed or ready).
       testDb.prepare(`
         INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
         VALUES ('matrix-ns-conf', 'ag-optout', 'bref_matrix', 'confirmed', 'pickup', 'ctok_nsconf', datetime('now'), datetime('now'))
       `).run();
+      // Fase A1: no_show is legal from 'confirmed' (no «Klar» step any more),
+      // but still never from 'pending' (never confirmed).
       const nsConf = cartSvc.transitionOrder("matrix-ns-conf", "cancelled", { actor: "test", cancelReason: "no_show" });
-      assertTrue(!nsConf.success && nsConf.status === 409,
-        "matrix-04: cancelled with cancelReason='no_show' from 'confirmed' → 409 (never was ready)");
-      const plainCancel = cartSvc.transitionOrder("matrix-ns-conf", "cancelled", { actor: "test" });
+      assertTrue(nsConf.success === true,
+        "matrix-04: Fase A1 — cancelled with cancelReason='no_show' from 'confirmed' is legal");
+      testDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
+        VALUES ('matrix-ns-pend', 'ag-optout', 'bref_matrix', 'pending', 'pickup', 'ctok_nspend', datetime('now'), datetime('now'))
+      `).run();
+      const nsPend = cartSvc.transitionOrder("matrix-ns-pend", "cancelled", { actor: "test", cancelReason: "no_show" });
+      assertTrue(!nsPend.success && nsPend.status === 409,
+        "matrix-04b: cancelled with cancelReason='no_show' from 'pending' → 409 (never confirmed)");
+      testDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
+        VALUES ('matrix-plain-conf', 'ag-optout', 'bref_matrix', 'confirmed', 'pickup', 'ctok_plainconf', datetime('now'), datetime('now'))
+      `).run();
+      const plainCancel = cartSvc.transitionOrder("matrix-plain-conf", "cancelled", { actor: "test" });
       assertTrue(plainCancel.success === true,
         "matrix-05: plain confirmed → cancelled (no reason) remains legal");
       testDb.prepare(`

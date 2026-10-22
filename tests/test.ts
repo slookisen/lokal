@@ -25931,6 +25931,9 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       availability TEXT NOT NULL DEFAULT 'in_stock',
       availability_updated_at TEXT,
       availability_source TEXT NOT NULL DEFAULT 'enrichment',
+      ingredients TEXT,
+      allergens TEXT,
+      net_weight TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -26221,6 +26224,9 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       availability TEXT NOT NULL DEFAULT 'in_stock',
       availability_updated_at TEXT,
       availability_source TEXT NOT NULL DEFAULT 'enrichment',
+      ingredients TEXT,
+      allergens TEXT,
+      net_weight TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -26284,7 +26290,12 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       buyer_email TEXT,
       buyer_phone TEXT,
       delivery_note TEXT,
-      contact_consent_at TEXT
+      contact_consent_at TEXT,
+      -- Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-
+      -- kjoperagent): the shared order-action layer reads notify_sent_at and
+      -- transitionOrder writes completion_source.
+      notify_sent_at TEXT,
+      completion_source TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_orders_cart_id  ON orders(cart_id);
     CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id);
@@ -26307,7 +26318,11 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       from_status TEXT,
       to_status TEXT NOT NULL,
       actor TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- Fase A1: every row carries actor_role + channel (+ idempotency key).
+      actor_role TEXT,
+      channel TEXT,
+      idempotency_key TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_order_events_order_id ON order_events(order_id);
     CREATE TABLE trust_events (
@@ -26317,6 +26332,7 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
         'order_completed','order_no_show','order_declined',
         'booking_attended','booking_no_show')),
       ref TEXT,
+      completion_source TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id);
@@ -26392,13 +26408,15 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   // submit below to still create their two orders.
   cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-carrot", "Gangstad Gård", "Trondheim", "carrot@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // skive 4: an eligible producer's lines must be producer-stated to be orderable.
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?,?,?,?,?,?,?,'admin_producer_confirmed')").run(
     "prod-carrot", "ag-carrot", "Gulrøtter", "gulrøtter", 30.0, "kg", "in_stock"
   );
 
   cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-honey", "Biene Honning", "Bergen", "honey@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-honey");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // skive 4: an eligible producer's lines must be producer-stated to be orderable.
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?,?,?,?,?,?,?,'admin_producer_confirmed')").run(
     "prod-honey", "ag-honey", "Honning", "honning", 150.0, "glass", "in_stock"
   );
 
@@ -37067,6 +37085,102 @@ const _orderSkive1Promise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent, Fase A1:
+// shared order-action layer, one-click lifecycle, automatic close (fake
+// clock, switch on/off, prepay without payment events), no_show /
+// buyer_cancelled / cannot_deliver + receipts, buyer/seller conflict → admin
+// alert, actor_role + channel on every order_events row, idempotency. Own
+// in-memory prod-schema DB and module-local pins, strictly after skive 1;
+// the next block in the chain awaits _orderActionsA1Promise.
+let _orderActionsA1Resolve: () => void = () => {};
+const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
+  _orderActionsA1Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: Mine ordrer Fase A1 (handlingslag + livsløp med ett klikk) ──");
+  try {
+    const { runOrderActionsFaseA1Tests } = require("../src/routes/order-actions-fase-a1.test") as
+      typeof import("../src/routes/order-actions-fase-a1.test");
+    const a1 = await runOrderActionsFaseA1Tests({ log: false });
+    passed += a1.passed;
+    failed += a1.failed;
+    for (const f of a1.failures) failures.push("order-actions-fase-a1: " + f);
+    console.log(`  order-actions-fase-a1: ${a1.passed} passed, ${a1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-actions-fase-a1: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderActionsA1Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// skive 4: bare produsentoppgitte varer kan bestilles, admin-vareliste
+// (POST /admin/products/producer-list), matinformasjon i kurvvisningen.
+// Own in-memory prod-schema DB; runs strictly after skive 1 and Fase A1.
+let _orderSkive4Resolve: () => void = () => {};
+const _orderSkive4Promise: Promise<void> = new Promise<void>(r => {
+  _orderSkive4Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 4 (matinformasjon) ──");
+  try {
+    const { runOrderBestillingerSkive4Tests } = require("../src/routes/order-bestillinger-skive4.test") as
+      typeof import("../src/routes/order-bestillinger-skive4.test");
+    const bs4 = await runOrderBestillingerSkive4Tests({ log: false });
+    passed += bs4.passed;
+    failed += bs4.failed;
+    for (const f of bs4.failures) failures.push("bestillinger-skive4: " + f);
+    console.log(`  bestillinger-skive4: ${bs4.passed} passed, ${bs4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive4: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive4Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// fix-up skive 4b: tilbudsvalg, /handleliste-kontaktvalg, allergener for all
+// mat, bekreftet pris/kategori etter portalendring, pris-snapshot, testhull.
+// Own in-memory prod-schema DB; runs strictly after skive 4.
+let _orderSkive4bResolve: () => void = () => {};
+const _orderSkive4bPromise: Promise<void> = new Promise<void>(r => {
+  _orderSkive4bResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 4b (fix-up) ──");
+  try {
+    const { runOrderBestillingerSkive4bTests } = require("../src/routes/order-bestillinger-skive4b.test") as
+      typeof import("../src/routes/order-bestillinger-skive4b.test");
+    const bs4b = await runOrderBestillingerSkive4bTests({ log: false });
+    passed += bs4b.passed;
+    failed += bs4b.failed;
+    for (const f of bs4b.failures) failures.push("bestillinger-skive4b: " + f);
+    console.log(`  bestillinger-skive4b: ${bs4b.passed} passed, ${bs4b.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive4b: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive4bResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
 // no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
 // rotasjon-no-yield-backoff) to the experiences vertical's
@@ -37082,7 +37196,7 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_orderSkive1Promise]);
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise, _orderSkive4bPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");
@@ -49048,6 +49162,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-hidden-test-producer: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1a points 1+2: owner lock in
+// the write layer (OWNER_LOCK_ENFORCE_WRITES) and the one by-id visibility
+// predicate (OWNER_VISIBILITY_ENFORCE_BY_ID), both flag states, per surface.
+// Swaps the getDb() singleton and the two env flags (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1a: owner lock + by-id visibility ──");
+  try {
+    const { runOwnerVisibilityS1aTests } = require("../src/routes/owner-visibility-s1a.test") as
+      typeof import("../src/routes/owner-visibility-s1a.test");
+    const ov = await runOwnerVisibilityS1aTests({ log: false });
+    passed += ov.passed;
+    failed += ov.failed;
+    for (const f of ov.failures) failures.push("owner-visibility-s1a: " + f);
+    console.log(`  owner-visibility-s1a: ${ov.passed} passed, ${ov.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-visibility-s1a: unexpected error: " + String(err?.message || err));
   }
 });
 

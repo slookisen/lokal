@@ -182,7 +182,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     insA.run("ag-pay", "Betal Gård", "betal@example.no", "k-pay");
     insA.run("ag-plain", "Vanlig Gård", "vanlig@example.no", "k-plain");
     for (const id of ["ag-pay", "ag-plain"]) db.prepare(`INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')`).run(id);
-    const insP = db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?, ?, ?, ?, ?, ?, 'in_stock')`);
+    const insP = db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?, ?, ?, ?, ?, ?, 'in_stock', 'admin_producer_confirmed')`);
     insP.run("p-egg", "ag-pay", "Egg", "egg", 60, "brett");
     insP.run("p-honning", "ag-pay", "Honning", "honning", 49.5, "glass");
     insP.run("p-nopris", "ag-pay", "Ost", "ost", null, "stk");
@@ -912,7 +912,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     ok(svc.canProducerTakePrepayment(db, "ag-pay"), "F17-21f: current terms accepted again → prepayment back");
     const payAtPickupReceipt = receiptSvc.renderBuyerReceipt("confirmed", { orderRef: "abcd1234", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "https://rfb.test/produsent/gard" }, traderStatus: null, items: [{ name: "Egg", qty: 1, line_total: 60 }], totalNok: 60, cancelReason: null, payment: null });
     ok(!!payAtPickupReceipt && payAtPickupReceipt.text.includes("Du betaler Gård ved henting"), "F17-22: pay-at-pickup receipt says so");
-    eq(receiptSvc.renderBuyerReceipt("cancelled", { orderRef: "x", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "u" }, traderStatus: null, items: [], totalNok: null, cancelReason: "no_show", payment: null }), null, "F17-23: no receipt for a no-show");
+    eq(receiptSvc.renderBuyerReceipt("cancelled", { orderRef: "x", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "u" }, traderStatus: null, items: [], totalNok: null, cancelReason: "no_show", payment: null })?.subject, "Bestillingen er registrert som ikke hentet (x)", "F17-23: Fase A1 (AC2) — a no-show gets a receipt");
 
     // F5 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
     // an order that is NOT a prepay order has no money to refund, so the

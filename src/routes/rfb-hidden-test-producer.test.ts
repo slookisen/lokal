@@ -137,8 +137,8 @@ function seedProducer(
     ]),
   );
   db.prepare(
-    `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, availability, category, image_url)
-     VALUES (?, ?, 'Listepoteter', 'listepoteter', 'kg', 30, 'in_stock', 'vegetables', 'https://img.example.no/p.jpg')`,
+    `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, availability, category, image_url, availability_source)
+     VALUES (?, ?, 'Listepoteter', 'listepoteter', 'kg', 30, 'in_stock', 'vegetables', 'https://img.example.no/p.jpg', 'admin_producer_confirmed')`,
   ).run(`prod-${o.id}`, o.id);
   db.prepare(
     // is_owner/traffic_category: top producers count human, non-owner views

@@ -4,6 +4,7 @@
 //
 // Endpoints:
 //   POST  /admin/products/backfill          — admin-only; upsert from agent_knowledge
+//   POST  /admin/products/producer-list     — admin-only; a producer's confirmed product list (skive 4)
 //   GET   /api/marketplace/catalog/feed     — public ACP feed (verified producers)
 //   GET   /api/marketplace/catalog/acp-feed.csv — public ACP non-Ads CSV product feed
 //   GET   /api/marketplace/catalog/agents/:id/products — public per-agent product list
@@ -27,10 +28,11 @@
 // with the lokal_find_offers MCP tool (src/routes/mcp.ts).
 
 import { Router, Request, Response } from "express";
+import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
 import { computeEffectiveAvailability } from "../services/supply-graph";
-import { runProductCatalogSync } from "../services/product-catalog-sync";
+import { runProductCatalogSync, normalizeName } from "../services/product-catalog-sync";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { isValidLatLng } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
@@ -38,7 +40,7 @@ import { capFreeText, capName } from "../utils/free-text";
 // public-listability predicate (catalog_hidden fixture + RFB vertical) for the
 // public LIST surfaces below (/feed, /acp-feed.csv). The direct-id order-flow
 // path /agents/:id/products deliberately does NOT use it.
-import { publicListableSql } from "../services/agent-visibility";
+import { publiclyVisibleSql } from "../services/agent-visibility";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
 export const catalogRouter = Router();
@@ -91,6 +93,194 @@ adminCatalogRouter.post("/backfill", (req: Request, res: Response) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// POST /admin/products/producer-list
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4.
+// Admin-gated (401 without a valid X-Admin-Key, 503 when no admin key is
+// configured). Enters a producer's CONFIRMED product list: name, price and,
+// for pre-packaged food, ingredients, allergens and net weight. Rows are
+// written with availability_source = 'admin_producer_confirmed', which is what
+// lets a producer who passes isEligibleForRealOrder() actually sell them
+// (scraped rows stay contact rows; see cart-service.ts). The catalog sync does
+// not overwrite price/category of such rows.
+//
+// Body: { agent_id, products: [{ name, price_nok, unit?, description?,
+//   category?, availability? ('in_stock' default | 'out_of_stock'),
+//   packaged?: boolean, ingredients?, allergens?: string[], net_weight? }] }
+// allergens (an array; [] = the producer states none) is required for every
+// product (skive 4b). packaged:true also requires ingredients and net_weight
+// ('250 g', '1,5 kg', '33 cl'). The whole request
+// is validated first and written in one transaction: any error = nothing written.
+// Idempotent per (agent_id, name): sending a name again updates that row.
+// Never deletes rows. Producer-set availability on a row is replaced (the admin
+// is stating the producer's current list).
+// ────────────────────────────────────────────────────────────────────────────
+const PRODUCER_LIST_MAX_PRODUCTS = 100;
+const NET_WEIGHT_RE = /^\d{1,6}([.,]\d{1,3})?\s?(g|kg|ml|cl|dl|l)$/i;
+const CTRL_CHARS_RE = /[\u0000-\u001f\u007f]/;
+
+function requireAdmin401(req: Request, res: Response): boolean {
+  const expected = getAdminKey();
+  if (!expected) {
+    res.status(503).json({ error: "Admin not configured" });
+    return false;
+  }
+  const provided = (req.headers["x-admin-key"] as string) || "";
+  if (provided !== expected) {
+    res.status(401).json({ error: "Krever X-Admin-Key header" });
+    return false;
+  }
+  return true;
+}
+
+interface ValidatedProducerProduct {
+  name: string;
+  name_norm: string;
+  price_nok: number;
+  unit: string | null;
+  description: string | null;
+  category: string | null;
+  availability: string;
+  ingredients: string | null;
+  allergens: string | null; // JSON array text or null
+  net_weight: string | null;
+}
+
+function optText(v: unknown, max: number, field: string, errs: string[]): string | null {
+  if (v === undefined || v === null || v === "") return null;
+  if (typeof v !== "string") { errs.push(`${field} må være tekst`); return null; }
+  const t = v.trim();
+  if (t.length > max) { errs.push(`${field} er for lang (maks ${max} tegn)`); return null; }
+  if (CTRL_CHARS_RE.test(t)) { errs.push(`${field} har ugyldige tegn`); return null; }
+  return t || null;
+}
+
+export function validateProducerList(raw: unknown): { ok: true; products: ValidatedProducerProduct[] } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+  if (!Array.isArray(raw) || raw.length === 0) return { ok: false, errors: ["products må være en ikke-tom liste"] };
+  if (raw.length > PRODUCER_LIST_MAX_PRODUCTS) return { ok: false, errors: [`products har for mange varer (maks ${PRODUCER_LIST_MAX_PRODUCTS})`] };
+  const out: ValidatedProducerProduct[] = [];
+  const seen = new Set<string>();
+  raw.forEach((item, idx) => {
+    const at = `products[${idx}]`;
+    const errs: string[] = [];
+    if (!item || typeof item !== "object" || Array.isArray(item)) { errors.push(`${at} må være et objekt`); return; }
+    const o = item as Record<string, unknown>;
+    const name = optText(o.name, 120, "name", errs);
+    if (!name) errs.push("name er påkrevd");
+    const price = o.price_nok;
+    if (typeof price !== "number" || !Number.isFinite(price) || price <= 0 || price > 100000) {
+      errs.push("price_nok er påkrevd og må være et tall over 0 (maks 100000)");
+    }
+    const unit = optText(o.unit, 30, "unit", errs);
+    const description = optText(o.description, 500, "description", errs);
+    const category = optText(o.category, 40, "category", errs);
+    let availability = "in_stock";
+    if (o.availability !== undefined && o.availability !== null) {
+      if (o.availability === "in_stock" || o.availability === "out_of_stock") availability = o.availability;
+      else errs.push("availability må være 'in_stock' eller 'out_of_stock'");
+    }
+    const packaged = o.packaged === true;
+    if (o.packaged !== undefined && typeof o.packaged !== "boolean") errs.push("packaged må være true eller false");
+    const ingredients = optText(o.ingredients, 1500, "ingredients", errs);
+    let allergens: string[] | null = null;
+    if (o.allergens !== undefined && o.allergens !== null) {
+      if (!Array.isArray(o.allergens) || o.allergens.length > 30) errs.push("allergens må være en liste (maks 30)");
+      else {
+        const list: string[] = [];
+        for (const a of o.allergens) {
+          if (typeof a !== "string" || !a.trim() || a.trim().length > 40 || CTRL_CHARS_RE.test(a)) { errs.push("allergens har en ugyldig verdi"); break; }
+          list.push(a.trim().toLowerCase());
+        }
+        allergens = Array.from(new Set(list));
+      }
+    }
+    const netWeight = optText(o.net_weight, 20, "net_weight", errs);
+    if (netWeight !== null && !NET_WEIGHT_RE.test(netWeight)) errs.push("net_weight må være et tall med enhet, f.eks. '250 g' eller '1,5 kg'");
+    // Skive 4b (S3, Daniel's choice): allergens are required for ALL food on the list, not only
+    // pre-packaged food ([] = the producer states none). Ingredients and net weight stay
+    // required for pre-packaged food only.
+    if (allergens === null) errs.push("allergens er påkrevd for all mat (tom liste = ingen allergener oppgitt av produsenten)");
+    if (packaged) {
+      if (!ingredients) errs.push("ingredients er påkrevd for ferdigpakket mat");
+      if (!netWeight) errs.push("net_weight er påkrevd for ferdigpakket mat");
+    }
+    if (name) {
+      const norm = normalizeName(name);
+      if (seen.has(norm)) errs.push("name er oppgitt flere ganger");
+      seen.add(norm);
+    }
+    if (errs.length) { for (const e of errs) errors.push(`${at}: ${e}`); return; }
+    out.push({
+      name: name!, name_norm: normalizeName(name!), price_nok: price as number,
+      unit, description, category, availability, ingredients,
+      allergens: allergens === null ? null : JSON.stringify(allergens),
+      net_weight: netWeight,
+    });
+  });
+  return errors.length ? { ok: false, errors } : { ok: true, products: out };
+}
+
+adminCatalogRouter.post("/producer-list", (req: Request, res: Response) => {
+  if (!requireAdmin401(req, res)) return;
+  const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+  const agentId = typeof body.agent_id === "string" ? body.agent_id.trim() : "";
+  if (!agentId) {
+    res.status(400).json({ success: false, error: "agent_id er påkrevd" });
+    return;
+  }
+  const v = validateProducerList(body.products);
+  if (!v.ok) {
+    res.status(400).json({ success: false, error: "Ugyldig vareliste", errors: v.errors });
+    return;
+  }
+  try {
+    const db = getDb();
+    const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as { id: string; name: string } | undefined;
+    if (!agent) {
+      res.status(404).json({ success: false, error: "Produsent ikke funnet" });
+      return;
+    }
+    const existing = db.prepare("SELECT id FROM products WHERE agent_id = ? AND name_norm = ?");
+    const insert = db.prepare(`
+      INSERT INTO products
+        (id, agent_id, name, name_norm, description, unit, price_nok, currency, availability,
+         category, source, availability_updated_at, availability_source,
+         ingredients, allergens, net_weight, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'NOK', ?, ?, 'admin', datetime('now'), 'admin_producer_confirmed',
+              ?, ?, ?, datetime('now'), datetime('now'))
+    `);
+    const update = db.prepare(`
+      UPDATE products
+         SET name = ?, description = ?, unit = ?, price_nok = ?, availability = ?, category = ?,
+             availability_updated_at = datetime('now'), availability_source = 'admin_producer_confirmed',
+             ingredients = ?, allergens = ?, net_weight = ?, updated_at = datetime('now')
+       WHERE id = ? AND agent_id = ?
+    `);
+    let inserted = 0;
+    let updated = 0;
+    const tx = db.transaction(() => {
+      for (const p of v.products) {
+        const row = existing.get(agentId, p.name_norm) as { id: string } | undefined;
+        if (row) {
+          update.run(p.name, p.description, p.unit, p.price_nok, p.availability, p.category,
+            p.ingredients, p.allergens, p.net_weight, row.id, agentId);
+          updated++;
+        } else {
+          insert.run(randomUUID(), agentId, p.name, p.name_norm, p.description, p.unit, p.price_nok, p.availability,
+            p.category, p.ingredients, p.allergens, p.net_weight);
+          inserted++;
+        }
+      }
+    });
+    tx();
+    res.json({ success: true, agent_id: agentId, producer_name: agent.name, inserted, updated, availability_source: "admin_producer_confirmed" });
+  } catch (err) {
+    console.error("[admin/products/producer-list] failed:", err instanceof Error ? err.message : String(err));
+    res.status(500).json({ success: false, error: "Intern feil" });
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // GET /api/marketplace/catalog/feed
 // Public — no auth. ACP-shaped product feed.
 // Filters: verified non-umbrella producers, availability='in_stock'.
@@ -121,7 +311,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publicListableSql("a")}
+      AND ${publiclyVisibleSql("a")}
       ${cityFilter}
   `).get(...params) as { total: number };
 
@@ -151,7 +341,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publicListableSql("a")}
+      AND ${publiclyVisibleSql("a")}
       ${cityFilter}
     ORDER BY p.updated_at DESC, p.id
     LIMIT ? OFFSET ?
@@ -246,7 +436,7 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publicListableSql("a")}
+      AND ${publiclyVisibleSql("a")}
     ORDER BY p.updated_at DESC, p.id
   `).all() as Array<{
     id: string;

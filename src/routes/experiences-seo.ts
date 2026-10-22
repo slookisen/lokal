@@ -9680,7 +9680,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes.</td></tr>
 <tr><td>Agent-forespørsler</td><td>Loggen over, uten personopplysninger, slettes ikke automatisk i dag.</td></tr>
 <tr><td>Besøksforespørsler</td><td>Ingen automatisk sletting i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
-<tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
+<tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
 </tbody></table>
 <h2>Rettighetene dine</h2><p>Etter personopplysningsloven og personvernforordningen (GDPR) har du rett til å:</p><ul>
 <li><strong>Be om innsyn</strong> — vi kan fortelle deg hva vi har lagret om deg.</li>
@@ -9728,7 +9728,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Deleted automatically after 60 days. Before deletion they are summed into totals with no link to the visitor (for example visits per day and searches per search text), and only those totals are kept.</td></tr>
 <tr><td>Agent requests</td><td>The log above, without personal data, is not deleted automatically today.</td></tr>
 <tr><td>Visit requests</td><td>No automatic deletion today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
-<tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, with no fixed time limit. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
+<tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, and never longer than 30 days. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
 </tbody></table>
 <h2>Your rights</h2><p>Under the Norwegian Personal Data Act and the GDPR you have the right to:</p><ul>
 <li><strong>Access</strong> — we can tell you what we have stored about you.</li>

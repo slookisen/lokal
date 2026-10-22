@@ -85,6 +85,11 @@ export function computeEffectiveAvailability(
   return availability;
 }
 
+// Skive 4b (S9): a row the admin confirmed with the producer
+// ('admin_producer_confirmed') keeps that source when the producer changes the
+// stock status in the portal. The write path only updates availability and its
+// timestamp then; resetting the source to 'producer_dashboard' would drop the
+// catalog sync's protection of the confirmed price and category.
 export type SetProducerAvailabilityResult =
   | { success: true; productId: string }
   | { success: false; reason: "not_found" };
@@ -119,7 +124,8 @@ export function setProducerAvailability(
         `UPDATE products
             SET availability = ?,
                 availability_updated_at = datetime('now'),
-                availability_source = 'producer_dashboard',
+                availability_source = CASE WHEN availability_source = 'admin_producer_confirmed'
+                                          THEN availability_source ELSE 'producer_dashboard' END,
                 updated_at = datetime('now')
           WHERE id = ? AND agent_id = ?`
       )
@@ -161,7 +167,8 @@ export function setProducerAvailabilityByProductId(
         `UPDATE products
             SET availability = ?,
                 availability_updated_at = datetime('now'),
-                availability_source = 'producer_dashboard',
+                availability_source = CASE WHEN availability_source = 'admin_producer_confirmed'
+                                          THEN availability_source ELSE 'producer_dashboard' END,
                 updated_at = datetime('now')
           WHERE id = ? AND agent_id = ?`
       )

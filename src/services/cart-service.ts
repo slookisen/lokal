@@ -35,6 +35,8 @@ import { summarizePricing } from "./order-pricing";
 // concurrent test blocks that re-pin the global cannot clobber this handle.
 let _cartTestDb: any = null;
 export function __setCartTestDb(db: any): void { _cartTestDb = db; }
+/** The DB cart-service writes to (its test pin, else getDb()) — shared with order-actions.ts. */
+export function cartServiceDb(): any { return _cartTestDb ?? getDb(); }
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -69,8 +71,23 @@ export interface CartGroup {
     unit_price_snapshot: number | null;
     line_total: number | null;
     line_note: string | null;
+    /**
+     * Skive 4: the price and food information come from the producer (or were
+     * confirmed with the producer by the platform admin), not from scraping.
+     */
+    producer_confirmed: boolean;
+    /** Skive 4: ingredients / allergens / net weight where stated (pre-packaged food); null otherwise. */
+    food_info: FoodInfo | null;
   }>;
   subtotal_nok: number;
+}
+
+/** Skive 4: food information shown to the buyer before submit. Each field is null when not stated. */
+export interface FoodInfo {
+  ingredients: string | null;
+  /** Declared allergens; [] = the producer states none. null = not stated. */
+  allergens: string[] | null;
+  net_weight: string | null;
 }
 
 export interface CartView {
@@ -329,6 +346,44 @@ function bannedItemError(
   }
 }
 
+// ─── Skive 4: only producer-stated products can be ordered ───────────────────
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4.
+// For a producer who passes isEligibleForRealOrder(), a REAL order may only
+// contain products whose price/availability the producer gave
+// (availability_source 'producer_dashboard') or the admin confirmed with the
+// producer ('admin_producer_confirmed'). A scraped (enrichment) row is only a
+// contact row: it is refused here, and the buyer is pointed at the producer.
+// Producers who are not eligible are unchanged: their lines already become
+// contact handoffs at submit.
+
+/** availability_source values that mean "the producer stated this". */
+export const PRODUCER_STATED_SOURCES: readonly string[] = ["producer_dashboard", "admin_producer_confirmed"];
+
+export function isProducerStatedSource(source: string | null | undefined): boolean {
+  return typeof source === "string" && PRODUCER_STATED_SOURCES.includes(source);
+}
+
+/** The 422 error (NO / EN). The code leads the text, like the other cart refusals. */
+export const NOT_PRODUCER_CONFIRMED_ERROR =
+  "not_producer_confirmed: denne varen er hentet fra produsentens nettside og er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte. / This item was taken from the producer's website and is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly.";
+
+/** Skive 4b (S11): 409 at submit when a real-order line's price has changed since it was added. */
+export const PRICE_CHANGED_ERROR =
+  "price_changed: prisen på en vare i handlekurven er endret siden den ble lagt til. Fjern varen og legg den til på nytt for å se gjeldende pris. / The price of an item in the cart has changed since it was added. Remove the item and add it again to see the current price.";
+
+function unconfirmedItemError(
+  db: any,
+  row: { agent_id: string; availability_source: string | null },
+): string | null {
+  if (isProducerStatedSource(row.availability_source)) return null;
+  try {
+    return isEligibleForRealOrder(row.agent_id, db) ? NOT_PRODUCER_CONFIRMED_ERROR : null;
+  } catch {
+    // Fail closed: if the gate cannot be evaluated the row is not sold.
+    return NOT_PRODUCER_CONFIRMED_ERROR;
+  }
+}
+
 // ─── Add / upsert item ───────────────────────────────────────────────────────
 
 export type AddItemResult =
@@ -396,6 +451,11 @@ export function addCartItem(
   if (effectiveAvailability !== "in_stock") {
     return { success: false, status: 409, error: `Product is not in stock (availability: ${effectiveAvailability})` };
   }
+
+  // Skive 4: an eligible producer's scraped row is a contact row, not orderable
+  // (after the stock check, so an out-of-stock row keeps its 409).
+  const unconfirmed = unconfirmedItemError(db, product);
+  if (unconfirmed) return { success: false, status: 422, error: unconfirmed };
 
   // Verify producer eligibility
   if (!isProducerEligible(product.agent_id)) {
@@ -635,6 +695,9 @@ export function chooseCartWishOffer(
     // F9: same refusal before the clean-up (addCartItem would refuse it too).
     const chosenBan = chosen ? bannedItemError(db, chosen) : null;
     if (chosenBan) return { success: false, status: 422, error: chosenBan.error };
+    // Skive 4: same refusal for a scraped row of an eligible producer.
+    const chosenUnconfirmed = chosen ? unconfirmedItemError(db, chosen) : null;
+    if (chosenUnconfirmed) return { success: false, status: 422, error: chosenUnconfirmed };
 
     // Reject if a DIFFERENT wish (or a directly-added, non-wish item)
     // already owns the cart_items row for this exact product in this cart —
@@ -721,6 +784,21 @@ export function deleteCartWish(cartId: string, wishId: string): UpdateItemResult
 
 // ─── View cart ───────────────────────────────────────────────────────────────
 
+/** Skive 4: the stored food columns as FoodInfo, or null when none of them is stated. Never throws. */
+export function foodInfoOf(r: { ingredients: string | null; allergens: string | null; net_weight: string | null }): FoodInfo | null {
+  let allergens: string[] | null = null;
+  if (typeof r.allergens === "string") {
+    try {
+      const arr = JSON.parse(r.allergens);
+      if (Array.isArray(arr)) allergens = arr.filter((v): v is string => typeof v === "string");
+    } catch { /* malformed: treated as not stated */ }
+  }
+  const ingredients = r.ingredients && r.ingredients.trim() ? r.ingredients : null;
+  const net_weight = r.net_weight && r.net_weight.trim() ? r.net_weight : null;
+  if (ingredients === null && allergens === null && net_weight === null) return null;
+  return { ingredients, allergens, net_weight };
+}
+
 export function viewCart(cartId: string): CartView | null {
   const db = _cartTestDb ?? getDb();
 
@@ -740,6 +818,10 @@ export function viewCart(cartId: string): CartView | null {
       ci.added_at,
       p.name   AS product_name,
       p.unit   AS unit,
+      p.availability_source AS availability_source,
+      p.ingredients AS ingredients,
+      p.allergens   AS allergens,
+      p.net_weight  AS net_weight,
       a.name   AS producer_name
     FROM cart_items ci
     INNER JOIN products p ON p.id = ci.product_id
@@ -756,6 +838,10 @@ export function viewCart(cartId: string): CartView | null {
     added_at: string;
     product_name: string;
     unit: string | null;
+    availability_source: string | null;
+    ingredients: string | null;
+    allergens: string | null;
+    net_weight: string | null;
     producer_name: string;
   }>;
 
@@ -782,6 +868,8 @@ export function viewCart(cartId: string): CartView | null {
       unit_price_snapshot: r.unit_price_snapshot,
       line_total,
       line_note: r.line_note,
+      producer_confirmed: isProducerStatedSource(r.availability_source),
+      food_info: foodInfoOf(r),
     });
     if (line_total != null) group.subtotal_nok += line_total;
   }
@@ -858,6 +946,10 @@ export type SubmitResult =
       category_labels?: Array<{ product_id: string; product_name: string }>;
       /** F9: the lines that are alcohol or services/experiences (422). */
       banned_items?: Array<{ product_id: string; product_name: string; kind: BannedItemKind | "check_failed" }>;
+      /** Skive 4: scraped lines of a producer who would get a real order (422 NOT_PRODUCER_CONFIRMED_ERROR). */
+      unconfirmed_items?: Array<{ product_id: string; product_name: string }>;
+      /** Skive 4b (S11): lines whose price changed since they were added (409 PRICE_CHANGED_ERROR). */
+      price_changed_items?: Array<{ product_id: string; product_name: string }>;
     };
 
 const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -1112,6 +1204,38 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   const ineligibleAgentIds = new Set<string>();
   for (const agent_id of byAgent.keys()) {
     (isEligibleForRealOrder(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
+  }
+
+  // Skive 4: a scraped (not producer-stated) line of a producer who would get a
+  // real order is refused, like the F9 lines: no order, no handoff, no e-mail.
+  // Producers that are not eligible keep their lines as contact handoffs.
+  const unconfirmedLines = items.filter((i) => eligibleAgentIds.has(i.agent_id) && !isProducerStatedSource(i.availability_source));
+  if (unconfirmedLines.length > 0) {
+    return {
+      success: false,
+      status: 422,
+      error: NOT_PRODUCER_CONFIRMED_ERROR,
+      unconfirmed_items: unconfirmedLines.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
+    };
+  }
+
+  // Skive 4b (S11): the price in a real order comes from unit_price_snapshot,
+  // taken when the line was added. If the product's price has changed since
+  // (the admin confirmed the item with a new price after a scraped row was
+  // added, or the producer changed it), the snapshot is stale and may be a
+  // scraped price: refuse, no order and no e-mail. The buyer adds the item
+  // again, which takes a fresh snapshot. Only lines of producers who would get
+  // a real order are checked; contact handoffs carry no price.
+  const staleLines = items.filter(
+    (i) => eligibleAgentIds.has(i.agent_id) && (i.unit_price_snapshot ?? null) !== (i.price_nok ?? null),
+  );
+  if (staleLines.length > 0) {
+    return {
+      success: false,
+      status: 409,
+      error: PRICE_CHANGED_ERROR,
+      price_changed_items: staleLines.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
+    };
   }
 
   // F2: a REAL order needs a way for the producer to reach the buyer — consent
@@ -1570,9 +1694,13 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
 // write trust-ledger events (trust-event-service). `ready → cancelled` is the
 // producer "no-show" path and stores cancel_reason='no_show'.
 
+// Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+// «Klar for henting» is no longer a step — a confirmed order can be completed
+// directly (seller «Hentet», buyer «picked_up», or the automatic close).
+// `ready` stays for existing rows and is handled like `confirmed`.
 const VALID_TRANSITIONS: Record<string, string[]> = {
   pending:   ["confirmed", "declined"],
-  confirmed: ["ready", "cancelled"],
+  confirmed: ["ready", "completed", "cancelled"],
   ready:     ["completed", "cancelled"],
   declined:  [],
   completed: [],
@@ -1588,10 +1716,42 @@ export type TransitionResult =
   | { success: true; order_id: string; status: string }
   | { success: false; status: number; error: string };
 
+export type OrderActorRole = "seller" | "buyer" | "system" | "admin";
+/** transitionOrder's error when the idempotency key was already used on the order. */
+export const IDEMPOTENCY_KEY_TAKEN = "idempotency_key_taken";
+export type OrderCompletionSource = "auto" | "buyer" | "seller" | "admin";
+
+/**
+ * Fase A1: every order_events row carries actor_role + channel. Callers that
+ * predate the action layer (payment-service's payment_expired) pass only the
+ * legacy `actor`; the role and channel are derived from it here.
+ */
+export function deriveActorRoleChannel(actor: string | null | undefined): { role: OrderActorRole; channel: string } {
+  switch (actor) {
+    case "producer": return { role: "seller", channel: "producer_page" };
+    case "admin":    return { role: "admin", channel: "admin" };
+    case "buyer":    return { role: "buyer", channel: "internal" };
+    case "system":   return { role: "system", channel: "system_job" };
+    default:         return { role: "system", channel: "internal" };
+  }
+}
+
 export function transitionOrder(
   orderId: string,
   toStatus: string,
-  opts?: { actor?: string; cancelReason?: string | null }
+  opts?: {
+    actor?: string;
+    cancelReason?: string | null;
+    /** Fase A1: who acted and through which channel (derived from `actor` when absent). */
+    actorRole?: OrderActorRole;
+    channel?: string;
+    /** Fase A1: stored on the order_events row; unique per order. */
+    idempotencyKey?: string | null;
+    /** Fase A1: stored on orders.completion_source when toStatus is 'completed'. */
+    completionSource?: OrderCompletionSource | null;
+    /** Fase A1: set orders.pickup_time in the same write (confirm with a pickup time). */
+    pickupTime?: string | null;
+  }
 ): TransitionResult {
   const db = _cartTestDb ?? getDb();
 
@@ -1638,13 +1798,25 @@ export function transitionOrder(
       error: `Cannot expire the payment of an order in '${order.status}' — only pending orders expire`,
     };
   }
-  if (cancelReason === "no_show" && order.status !== "ready") {
+  // Fase A1: «Klar for henting» is no longer a step, so a no-show can be
+  // recorded for any confirmed order (confirmed or the legacy ready) until it
+  // is closed — never for one that was not confirmed.
+  if (cancelReason === "no_show" && order.status !== "ready" && order.status !== "confirmed") {
     return {
       success: false,
       status: 409,
-      error: `Cannot record a no-show for an order in '${order.status}' — only orders that were ready for pickup can be no-shows`,
+      error: `Cannot record a no-show for an order in '${order.status}' — only confirmed orders can be no-shows`,
     };
   }
+
+  const derived = deriveActorRoleChannel(actor);
+  const actorRole: OrderActorRole = opts?.actorRole ?? derived.role;
+  const channel = opts?.channel ?? derived.channel;
+  const idempotencyKey = opts?.idempotencyKey ?? null;
+  const completionSource: OrderCompletionSource | null = toStatus === "completed"
+    ? (opts?.completionSource ?? (actorRole === "admin" ? "admin" : actorRole === "seller" ? "seller" : actorRole === "buyer" ? "buyer" : null))
+    : null;
+  const pickupTime = toStatus === "confirmed" ? (opts?.pickupTime ?? null) : null;
 
   // Concurrency guard: the UPDATE re-asserts the from-status we validated
   // against (id AND status), so two racing transitions (multi-instance, or
@@ -1659,10 +1831,16 @@ export function transitionOrder(
       conflict = true;
       throw new Error("concurrent status change");
     }
+    if (completionSource) {
+      db.prepare("UPDATE orders SET completion_source = ? WHERE id = ?").run(completionSource, orderId);
+    }
+    if (pickupTime) {
+      db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(pickupTime, orderId);
+    }
     db.prepare(`
-      INSERT INTO order_events (id, order_id, from_status, to_status, actor, created_at)
-      VALUES (?, ?, ?, ?, ?, datetime('now'))
-    `).run(randomUUID(), orderId, order.status, toStatus, actor);
+      INSERT INTO order_events (id, order_id, from_status, to_status, actor, actor_role, channel, idempotency_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run(randomUUID(), orderId, order.status, toStatus, actor, actorRole, channel, idempotencyKey);
   });
 
   try {
@@ -1676,12 +1854,17 @@ export function transitionOrder(
       };
     }
     const msg = err instanceof Error ? err.message : String(err);
+    // Fase A1: a racing repeat of the same idempotency key lost the unique
+    // index (order_id, idempotency_key); the whole write rolled back.
+    if (idempotencyKey && /UNIQUE constraint failed: order_events/i.test(msg)) {
+      return { success: false, status: 409, error: IDEMPOTENCY_KEY_TAKEN };
+    }
     return { success: false, status: 500, error: `Transition failed: ${msg}` };
   }
 
   // Trust-ledger: terminal outcomes only. recordTrustEvent never throws.
   if (toStatus === "completed") {
-    recordTrustEvent({ agentId: order.agent_id, eventType: "order_completed", ref: orderId });
+    recordTrustEvent({ agentId: order.agent_id, eventType: "order_completed", ref: orderId, completionSource });
   } else if (toStatus === "declined") {
     recordTrustEvent({ agentId: order.agent_id, eventType: "order_declined", ref: orderId });
   } else if (toStatus === "cancelled" && cancelReason === "no_show") {
@@ -1752,13 +1935,26 @@ export interface ProducerOrderView {
   timeline: OrderEvent[];
 }
 
-/** orders.payment_mode, tolerant of a DB without the column (null = pay at pickup). */
+/**
+ * Skive 1b (S6): returned by orderPaymentMode when the order's payment_mode
+ * could not be READ. Distinct from null (a pay-at-pickup order), so a read
+ * error can never open the cancellation of a prepay order whose captured
+ * payment would then not be refunded — the callers treat it like prepay.
+ */
+export const PAYMENT_MODE_UNKNOWN = "unknown";
+
+/**
+ * orders.payment_mode (null = pay at pickup). A DB without the column (an old
+ * or minimal schema) has no prepay orders at all, so it reads as null; any
+ * other read error is PAYMENT_MODE_UNKNOWN (fail-closed, S6).
+ */
 export function orderPaymentMode(db: any, orderId: string): string | null {
   try {
     const r = db.prepare("SELECT payment_mode FROM orders WHERE id = ?").get(orderId) as { payment_mode: string | null } | undefined;
     return r?.payment_mode ?? null;
-  } catch {
-    return null;
+  } catch (err) {
+    if (/no such column/i.test(String((err as any)?.message || err))) return null;
+    return PAYMENT_MODE_UNKNOWN;
   }
 }
 

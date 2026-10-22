@@ -113,7 +113,7 @@ export function runCartServiceWishesTests(opts: { log?: boolean } = {}): TestSum
   function insertProduct(id: string, agentId: string, name: string) {
     db.prepare(`
       INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
-      VALUES (?, ?, ?, ?, 30, 'kg', 'in_stock', 'enrichment')
+      VALUES (?, ?, ?, ?, 30, 'kg', 'in_stock', 'admin_producer_confirmed')
     `).run(id, agentId, name, name.toLowerCase());
   }
 

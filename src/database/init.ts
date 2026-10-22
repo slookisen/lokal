@@ -3951,6 +3951,21 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4:
+  // food information the buyer sees before submitting. Written only by the
+  // admin producer-list endpoint (POST /admin/products/producer-list) for
+  // pre-packaged food: ingredients (free text), allergens (JSON array of
+  // strings; '[]' = the producer states none) and net_weight (text such as
+  // '250 g'). Additive nullable columns; NULL = not stated. Same
+  // try/catch-duplicate-column guard as above.
+  for (const col of ["ingredients TEXT", "allergens TEXT", "net_weight TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists
+    }
+  }
+
   // ─── Phase 1 (orch-pr-20260614-6): cart + orders tables ─────────────────
   // Cart MVP ("handleliste"). No payment, no seller notification (Phase 1).
   // Anonymous buyer: capability-token model (buyer_ref). Pickup only.
@@ -5124,13 +5139,45 @@ function initSchema(db: Database.Database): void {
   //     FAILED to send (a skip is no failure). Set by order-notify-service.
   //   orders.notify_retried_at: when the single re-send of that e-mail was
   //     tried by the order-followups job. Non-NULL = no further retry.
+  //   orders.notify_sent_at   : skive 1b (B1) — when the producer e-mail for
+  //     the order was actually SENT (first send or the retry). Only orders
+  //     with it get the reminder and the producer_no_response cancellation;
+  //     an order the producer never received (the pre-gate backlog, a skipped
+  //     or failed send) is never claimed to be «not answered».
   for (const stmt of [
     `ALTER TABLE orders ADD COLUMN reminder_sent_at TEXT`,
     `ALTER TABLE orders ADD COLUMN notify_failed_at TEXT`,
     `ALTER TABLE orders ADD COLUMN notify_retried_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_sent_at TEXT`,
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
+
+  // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // one shared order-action layer (services/order-actions.ts) and the
+  // one-click lifecycle. All additive, NULL on every existing row:
+  //   orders.completion_source       : who closed a completed order —
+  //     'auto' (the follow-ups job, ORDER_AUTOCOMPLETE_ENABLED), 'buyer',
+  //     'seller' or 'admin'. NULL for orders completed before Fase A1.
+  //   order_events.actor_role        : 'seller' | 'buyer' | 'system' | 'admin'.
+  //   order_events.channel           : 'producer_page' | 'owner_portal' |
+  //     'admin' | 'system_job' | 'internal' (later 'mcp' / 'a2a').
+  //   order_events.idempotency_key   : the caller's idempotency key; a repeat
+  //     of the same key on the same order returns the stored transition.
+  //   trust_events.completion_source : copied from the order for
+  //     order_completed, so automatic closes are counted apart.
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN completion_source TEXT`,
+    `ALTER TABLE order_events ADD COLUMN actor_role TEXT`,
+    `ALTER TABLE order_events ADD COLUMN channel TEXT`,
+    `ALTER TABLE order_events ADD COLUMN idempotency_key TEXT`,
+    `ALTER TABLE trust_events ADD COLUMN completion_source TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  } catch { /* best-effort — the lookup before the transition still works */ }
 
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a

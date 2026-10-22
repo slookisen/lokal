@@ -41,6 +41,8 @@ interface Row {
   name: string;
   priceNok?: number;
   ownerSet?: boolean;
+  /** skive 4: confirmed with the producer by the admin (orderable for an eligible producer). */
+  confirmed?: boolean;
   availability?: string;
 }
 
@@ -48,8 +50,8 @@ const ROWS: Row[] = [
   { id: "ks-honning", agent: BAKERI, name: "Honning" },
   { id: "ks-bakervarer", agent: BAKERI, name: "BAKERVARER" },
   { id: "ks-kjott-oos", agent: BAKERI, name: "Kjøtt", availability: "out_of_stock" },
-  { id: "ks-brod", agent: BAKERI, name: "Surdeigsbrød" },
-  { id: "ks-egg-pris", agent: BAKERI, name: "Egg", priceNok: 60 },
+  { id: "ks-brod", agent: BAKERI, name: "Surdeigsbrød", confirmed: true },
+  { id: "ks-egg-pris", agent: BAKERI, name: "Egg", priceNok: 60, confirmed: true },
   { id: "ks-egg-eier", agent: EIER, name: "Egg", ownerSet: true },
   { id: "ks-honning-eier", agent: EIER, name: "Honning", ownerSet: true, availability: "out_of_stock" },
 ];
@@ -130,7 +132,7 @@ export async function runRfbKurvvaktKategorietiketterTests(opts: { log?: boolean
         INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source, availability_updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(r.id, r.agent, r.name, r.name.toLowerCase(), r.priceNok ?? null, r.priceNok ? "brett" : null, r.availability ?? "in_stock",
-        r.ownerSet ? "producer_dashboard" : "enrichment", r.ownerSet ? ownerSetAt : null);
+        r.ownerSet ? "producer_dashboard" : r.confirmed ? "admin_producer_confirmed" : "enrichment", r.ownerSet ? ownerSetAt : null);
     }
 
     const { CATEGORY_LABEL_CART_ERROR } = cartSvc;

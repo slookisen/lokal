@@ -45,6 +45,12 @@ export function recordTrustEvent(input: {
   agentId: string;
   eventType: TrustEventType;
   ref?: string | null;
+  /**
+   * Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+   * for order_completed, who closed the order ('auto' | 'buyer' | 'seller' |
+   * 'admin'). 'auto' is counted apart (completedAuto) and does not score.
+   */
+  completionSource?: string | null;
 }): boolean {
   try {
     if (!input.agentId || !VALID_EVENT_TYPES.has(input.eventType)) {
@@ -54,10 +60,18 @@ export function recordTrustEvent(input: {
       return false;
     }
     const db = _trustTestDb ?? getDb();
-    db.prepare(`
-      INSERT INTO trust_events (id, agent_id, event_type, ref, created_at)
-      VALUES (?, ?, ?, ?, datetime('now'))
-    `).run(randomUUID(), input.agentId, input.eventType, input.ref ?? null);
+    const source = input.eventType === "order_completed" ? (input.completionSource ?? null) : null;
+    if (source) {
+      db.prepare(`
+        INSERT INTO trust_events (id, agent_id, event_type, ref, completion_source, created_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+      `).run(randomUUID(), input.agentId, input.eventType, input.ref ?? null, source);
+    } else {
+      db.prepare(`
+        INSERT INTO trust_events (id, agent_id, event_type, ref, created_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+      `).run(randomUUID(), input.agentId, input.eventType, input.ref ?? null);
+    }
     return true;
   } catch (err) {
     console.error(
@@ -69,7 +83,9 @@ export function recordTrustEvent(input: {
 }
 
 export interface TrustEventCounts {
-  completed: number; // order_completed + booking_attended
+  completed: number; // order_completed (confirmed by buyer/seller/admin, or pre-Fase-A1) + booking_attended
+  /** Fase A1: order_completed closed automatically (completion_source='auto') — counted apart, never in `completed`. */
+  completedAuto: number;
   noShows: number;   // order_no_show + booking_no_show
   declined: number;  // order_declined
   total: number;
@@ -83,18 +99,32 @@ export interface TrustEventCounts {
 export function getTrustEventCounts(agentId: string): TrustEventCounts {
   try {
     const db = _trustTestDb ?? getDb();
-    const rows = db.prepare(
-      "SELECT event_type, COUNT(*) AS c FROM trust_events WHERE agent_id = ? GROUP BY event_type"
-    ).all(agentId) as Array<{ event_type: string; c: number }>;
-    const counts: TrustEventCounts = { completed: 0, noShows: 0, declined: 0, total: 0 };
+    const rows = readTrustEventRows(db, agentId);
+    const counts: TrustEventCounts = { completed: 0, completedAuto: 0, noShows: 0, declined: 0, total: 0 };
     for (const r of rows) {
-      if (r.event_type === "order_completed" || r.event_type === "booking_attended") counts.completed += r.c;
+      if (r.event_type === "order_completed" && r.auto === 1) counts.completedAuto += r.c;
+      else if (r.event_type === "order_completed" || r.event_type === "booking_attended") counts.completed += r.c;
       else if (r.event_type === "order_no_show" || r.event_type === "booking_no_show") counts.noShows += r.c;
       else if (r.event_type === "order_declined") counts.declined += r.c;
       counts.total += r.c;
     }
     return counts;
   } catch {
-    return { completed: 0, noShows: 0, declined: 0, total: 0 };
+    return { completed: 0, completedAuto: 0, noShows: 0, declined: 0, total: 0 };
+  }
+}
+
+/** Counts per (event_type, auto); a DB without the Fase A1 column reads every row as non-auto. */
+function readTrustEventRows(db: any, agentId: string): Array<{ event_type: string; auto: number; c: number }> {
+  try {
+    return db.prepare(`
+      SELECT event_type, CASE WHEN completion_source = 'auto' THEN 1 ELSE 0 END AS auto, COUNT(*) AS c
+      FROM trust_events WHERE agent_id = ? GROUP BY event_type, auto
+    `).all(agentId) as Array<{ event_type: string; auto: number; c: number }>;
+  } catch (err) {
+    if (!/no such column/i.test(String((err as any)?.message || err))) throw err;
+    return (db.prepare(
+      "SELECT event_type, 0 AS auto, COUNT(*) AS c FROM trust_events WHERE agent_id = ? GROUP BY event_type"
+    ).all(agentId) as Array<{ event_type: string; auto: number; c: number }>);
   }
 }

@@ -66,7 +66,7 @@ import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
-import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
+import adminDbBackupRoutes, { diskUsage, createBackupAgeSweepTick, BACKUP_AGE_SWEEP_TICK_MS } from "./routes/admin-db-backup";
 import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
@@ -1716,6 +1716,13 @@ if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
   setInterval(trackJob("offsite-backup", createOffsiteBackupTick({ getStateDb: () => getDb() })), OFFSITE_TICK_MS);
 }
 
+// ─── Manual DB copies: nightly age sweep (dev-request 2026-10-12-manuelle-db-kopier-aldersgrense) ──
+// Deletes on-volume copies older than 30 days (DB_BACKUP_MAX_AGE_DAYS) even when no new copy is
+// taken. Runs once per UTC day in the 02 UTC hour (outside 00-01Z and 06:30-09:30Z); async unlink.
+if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
+  setInterval(trackJob("db-backup-age-sweep", createBackupAgeSweepTick()), BACKUP_AGE_SWEEP_TICK_MS);
+}
+
 // ─── PR-95 (2026-06-01): daily Debio verification sync ──────────────
 //
 // Pulls https://finnoko.debio.no/api/acm/companies once per day (target:
@@ -2381,21 +2388,30 @@ if (
 // producer_no_response after ORDER_AUTOCANCEL_HOURS (72) for pay-at-pickup
 // orders nobody answered. Hourly; idempotent (services/order-followups.ts).
 // Rollback: set the hours very high, or RFB_DISABLE_ORDER_FOLLOWUPS=1.
+// Skive 1b (S3): a bare 60-min setInterval restarts its clock on every deploy
+// or machine restart, so with restarts more often than hourly the job never
+// ran. It now also runs once 5 min after boot; the job is idempotent, so the
+// extra run is harmless.
 if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
-  setInterval(trackJob("order-followups", async () => {
+  const orderFollowupsTick = trackJob("order-followups", async () => {
     try {
       const { processOrderFollowups } = await import("./services/order-followups");
       const r = await processOrderFollowups();
-      if (r.retried || r.reminders_sent || r.cancelled || r.errors) {
+      if (r.retried || r.reminders_sent || r.cancelled || r.auto_completed || r.errors) {
         console.log(
           `[order-followups] tick examined=${r.examined} retried=${r.retried} reminders=${r.reminders_sent} ` +
-          `cancelled=${r.cancelled} errors=${r.errors}`
+          `cancelled=${r.cancelled} auto_completed=${r.auto_completed} errors=${r.errors}`
         );
       }
     } catch (err) {
       console.error("[order-followups] tick failed:", err);
     }
-  }), 60 * 60_000);
+  });
+  setTimeout(() => {
+    console.log("[order-followups] first run after boot");
+    void orderFollowupsTick();
+  }, 5 * 60_000);
+  setInterval(orderFollowupsTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───

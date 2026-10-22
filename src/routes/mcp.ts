@@ -55,7 +55,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql, failsProducerRoleGate } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -1107,7 +1107,10 @@ export function registerTools(
     },
     guardToolHandler("lokal_info", async ({ agentId }, extra) => {
       const info = knowledgeService.getAgentInfo(agentId);
-      if (!info) {
+      // Shared by-id visibility predicate (agent-visibility.ts; flag-gated —
+      // off = served as before). allowCatalogHidden: the hidden test fixture
+      // stays orderable by id.
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
@@ -1880,7 +1883,8 @@ export function registerTools(
     async (uri) => {
       const agentId = uri.pathname?.split("/").pop() || "";
       const info = knowledgeService.getAgentInfo(agentId);
-      if (!info) {
+      // Shared by-id visibility predicate (flag-gated, see lokal_info).
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
       return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };

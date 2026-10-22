@@ -187,7 +187,7 @@ export async function runMarketplaceCartWishesTests(opts: { log?: boolean } = {}
     `).run();
     db.prepare(`
       INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
-      VALUES ('prod-a', 'agent-a', 'Poteter', 'poteter', 20, 'kg', 'in_stock', 'enrichment')
+      VALUES ('prod-a', 'agent-a', 'Poteter', 'poteter', 20, 'kg', 'in_stock', 'admin_producer_confirmed')
     `).run();
     // skive 2: a REAL order additionally needs the owner claim + opt-in
     // (cart-service.isEligibleForRealOrder); agent-b below stays a
