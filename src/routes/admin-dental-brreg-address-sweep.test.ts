@@ -184,8 +184,9 @@ export function runAdminDentalBrregAddressSweepTests(
           organisasjonsform: null, field_provenance: null, lat: null, lng: null, ...r,
         });
       const homepageProv = (v: string) => JSON.stringify({ address: [{ value: v, source_type: "own_homepage" }] });
-      const brregProv = (v: string, src = "forretningsadresse") =>
-        JSON.stringify({ address: [{ value: v, source_type: "brreg", address_source: src }] });
+      const SWEEP_AT = "2026-10-20T10:00:00.000Z";
+      const brregProv = (v: string, src = "forretningsadresse", fetchedAt: string | null = SWEEP_AT) =>
+        JSON.stringify({ address: [{ value: v, source_type: "brreg", address_source: src, ...(fetchedAt ? { fetched_at: fetchedAt } : {}) }] });
 
       // Rows that already have a street (support sources, not candidates).
       row({ id: "other-clinic", adresse: "Storgata 10, 0155 Oslo", postnummer: "0155", poststed: "Oslo", field_provenance: homepageProv("Storgata 10") });
@@ -425,6 +426,20 @@ export function runAdminDentalBrregAddressSweepTests(
         postadresse: no("Bryggeveien 2", "0155", "OSLO"),
       });
 
+      // Rows the sweep wrote carry the stamp; the Places-shaped and other rows below do not match it.
+      db.prepare("UPDATE dental_agents SET brreg_address_attempted_at = ? WHERE id LIKE 'mix-%'").run(SWEEP_AT);
+      row({ id: "mix-places", org_nr: "600000020", adresse: "Elvegata 20", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Elvegata 20", "forretningsadresse", null) });
+      enhet("600000020", "AS", { forretningsadresse: no("Elvegata 20", "0155", "OSLO") });
+      row({ id: "mix-stale-stamp", org_nr: "600000021", adresse: "Elvegata 21", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Elvegata 21", "forretningsadresse", "2026-09-01T08:00:00.000Z") });
+      enhet("600000021", "AS", { forretningsadresse: no("Elvegata 21", "0155", "OSLO") });
+      db.prepare("UPDATE dental_agents SET brreg_address_attempted_at = ? WHERE id = 'mix-stale-stamp'").run(SWEEP_AT);
+      row({ id: "mix-inactive", org_nr: "600000022", adresse: "Elvegata 22", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Elvegata 22") });
+      enhet("600000022", "AS", { forretningsadresse: no("Elvegata 22", "0155", "OSLO") });
+      row({ id: "mix-rejected", org_nr: "600000023", adresse: "Elvegata 23", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Elvegata 23") });
+      enhet("600000023", "AS", { forretningsadresse: no("Elvegata 23", "0155", "OSLO") });
+      db.prepare("UPDATE dental_agents SET brreg_address_attempted_at = ?, is_inactive = 1 WHERE id = 'mix-inactive'").run(SWEEP_AT);
+      db.prepare("UPDATE dental_agents SET brreg_address_attempted_at = ?, verification_status = 'rejected' WHERE id = 'mix-rejected'").run(SWEEP_AT);
+
       assertEq((await post({ mode: "correct_mixed", apply: "true" })).status, 400, "h1: apply as a string -> 400");
       assertEq((await post({ mode: "correct_mixed", apply: 1 })).status, 400, "h2: apply as a number -> 400");
       assertEq((await post({ mode: "correct_mixed", write: true })).status, 400, "h3: write in correct_mixed -> 400");
@@ -478,6 +493,10 @@ export function runAdminDentalBrregAddressSweepTests(
         assertEq(get(id).postnummer, "0150", `h21: apply does not correct ${id}`);
       }
       assertEq([ca["mix-addr-race"]?.outcome, get("mix-addr-race").postnummer], ["changed_meanwhile", "0150"], "h22: adresse changed before write -> changed_meanwhile, nothing written");
+      for (const id of ["mix-places", "mix-stale-stamp", "mix-inactive", "mix-rejected"]) {
+        assertTrue(!cd[id] && !ca[id], `h33: ${id} is never reported or corrected`);
+        assertEq(get(id).postnummer, "0150", `h34: ${id} postnummer untouched by apply`);
+      }
     } finally {
       try {
         routeMod?.__setBrregAddressSweepFetchForTesting();

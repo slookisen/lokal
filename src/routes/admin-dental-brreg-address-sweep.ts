@@ -541,6 +541,7 @@ interface CorrectionRow {
   postnummer: string | null;
   poststed: string | null;
   field_provenance: string | null;
+  brreg_address_attempted_at: string | null;
 }
 
 async function correctMixed(body: Record<string, unknown>, res: Response): Promise<void> {
@@ -561,9 +562,14 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
     const db = getDb("dental");
     const rows = db
       .prepare(
-        `SELECT id, org_nr, adresse, postnummer, poststed, field_provenance FROM dental_agents
+        `SELECT id, org_nr, adresse, postnummer, poststed, field_provenance, brreg_address_attempted_at FROM dental_agents
           WHERE org_nr IS NOT NULL AND org_nr <> '' AND adresse IS NOT NULL AND adresse <> ''
-            AND field_provenance LIKE '%"brreg"%' AND id > ?
+            AND field_provenance LIKE '%"brreg"%'
+            AND brreg_address_attempted_at IS NOT NULL
+            AND (is_inactive IS NULL OR is_inactive = 0)
+            AND (verification_status IS NULL OR verification_status <> 'rejected')
+            AND ${DENTAL_CLINIC_CLASS_SQL}
+            AND id > ?
           ORDER BY id ASC LIMIT ?`,
       )
       .all(afterId, limit) as CorrectionRow[];
@@ -579,7 +585,15 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
     for (const row of rows) {
       const prov = parseProv(row.field_provenance);
       const last = latestProv(prov, "address");
-      if (last?.source_type !== "brreg" || normaliseStreet(String(last.value ?? "")) !== normaliseStreet(row.adresse)) {
+      // Only an address THIS sweep wrote: the Places batch writes the same
+      // brreg-shaped provenance but never sets brreg_address_attempted_at, and
+      // the sweep stamps both in one UPDATE, so fetched_at must equal the stamp.
+      if (
+        last?.source_type !== "brreg" ||
+        !row.brreg_address_attempted_at ||
+        last.fetched_at !== row.brreg_address_attempted_at ||
+        normaliseStreet(String(last.value ?? "")) !== normaliseStreet(row.adresse)
+      ) {
         counts.not_from_brreg_write++;
         continue;
       }
