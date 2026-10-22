@@ -224,7 +224,7 @@ export async function runHandelistePageTests(opts: { log?: boolean } = {}): Prom
       `).run(id, second, `${id}@example.com`);
     };
     const addProd = (id: string, agent: string, name: string) =>
-      db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?, ?, ?, ?, 20, 'kg', 'in_stock', 'enrichment')`)
+      db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?, ?, ?, ?, 20, 'kg', 'in_stock', 'admin_producer_confirmed')`)
         .run(id, agent, name, name.toLowerCase());
     addAgent("hl-order", XSS, 1, 1, 0, OSLO_NEAR.lat);
     addProd("hl-p-pot", "hl-order", "Poteter");

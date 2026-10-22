@@ -25931,6 +25931,9 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       availability TEXT NOT NULL DEFAULT 'in_stock',
       availability_updated_at TEXT,
       availability_source TEXT NOT NULL DEFAULT 'enrichment',
+      ingredients TEXT,
+      allergens TEXT,
+      net_weight TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -26221,6 +26224,9 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       availability TEXT NOT NULL DEFAULT 'in_stock',
       availability_updated_at TEXT,
       availability_source TEXT NOT NULL DEFAULT 'enrichment',
+      ingredients TEXT,
+      allergens TEXT,
+      net_weight TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -26392,13 +26398,15 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   // submit below to still create their two orders.
   cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-carrot", "Gangstad Gård", "Trondheim", "carrot@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // skive 4: an eligible producer's lines must be producer-stated to be orderable.
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?,?,?,?,?,?,?,'admin_producer_confirmed')").run(
     "prod-carrot", "ag-carrot", "Gulrøtter", "gulrøtter", 30.0, "kg", "in_stock"
   );
 
   cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-honey", "Biene Honning", "Bergen", "honey@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-honey");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // skive 4: an eligible producer's lines must be producer-stated to be orderable.
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?,?,?,?,?,?,?,'admin_producer_confirmed')").run(
     "prod-honey", "ag-honey", "Honning", "honning", 150.0, "glass", "in_stock"
   );
 
@@ -37053,6 +37061,37 @@ const _orderSkive1Promise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// skive 4: bare produsentoppgitte varer kan bestilles, admin-vareliste
+// (POST /admin/products/producer-list), matinformasjon i kurvvisningen.
+// Own in-memory prod-schema DB; runs strictly after skive 1.
+let _orderSkive4Resolve: () => void = () => {};
+const _orderSkive4Promise: Promise<void> = new Promise<void>(r => {
+  _orderSkive4Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 4 (matinformasjon) ──");
+  try {
+    const { runOrderBestillingerSkive4Tests } = require("../src/routes/order-bestillinger-skive4.test") as
+      typeof import("../src/routes/order-bestillinger-skive4.test");
+    const bs4 = await runOrderBestillingerSkive4Tests({ log: false });
+    passed += bs4.passed;
+    failed += bs4.failed;
+    for (const f of bs4.failures) failures.push("bestillinger-skive4: " + f);
+    console.log(`  bestillinger-skive4: ${bs4.passed} passed, ${bs4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive4: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive4Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
 // no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
 // rotasjon-no-yield-backoff) to the experiences vertical's
@@ -37068,7 +37107,7 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_orderSkive1Promise]);
+  await Promise.allSettled([_orderSkive4Promise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");

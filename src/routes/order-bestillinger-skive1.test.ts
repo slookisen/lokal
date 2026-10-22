@@ -109,8 +109,8 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
     `);
     const insKnow = db.prepare("INSERT INTO agent_knowledge (agent_id, verification_status, email, phone) VALUES (?, 'verified', ?, ?)");
     const insProd = db.prepare(`
-      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, category, description)
-      VALUES (?, ?, ?, ?, ?, ?, 'in_stock', ?, ?)
+      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, category, description, availability_source)
+      VALUES (?, ?, ?, ?, ?, ?, 'in_stock', ?, ?, 'admin_producer_confirmed')
     `);
     const makeEligible = (id: string) => db.prepare("UPDATE agents SET order_notifications_opt_in = 1, is_verified = 1 WHERE id = ?").run(id);
 

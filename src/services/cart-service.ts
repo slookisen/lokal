@@ -69,8 +69,23 @@ export interface CartGroup {
     unit_price_snapshot: number | null;
     line_total: number | null;
     line_note: string | null;
+    /**
+     * Skive 4: the price and food information come from the producer (or were
+     * confirmed with the producer by the platform admin), not from scraping.
+     */
+    producer_confirmed: boolean;
+    /** Skive 4: ingredients / allergens / net weight where stated (pre-packaged food); null otherwise. */
+    food_info: FoodInfo | null;
   }>;
   subtotal_nok: number;
+}
+
+/** Skive 4: food information shown to the buyer before submit. Each field is null when not stated. */
+export interface FoodInfo {
+  ingredients: string | null;
+  /** Declared allergens; [] = the producer states none. null = not stated. */
+  allergens: string[] | null;
+  net_weight: string | null;
 }
 
 export interface CartView {
@@ -329,6 +344,40 @@ function bannedItemError(
   }
 }
 
+// ─── Skive 4: only producer-stated products can be ordered ───────────────────
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4.
+// For a producer who passes isEligibleForRealOrder(), a REAL order may only
+// contain products whose price/availability the producer gave
+// (availability_source 'producer_dashboard') or the admin confirmed with the
+// producer ('admin_producer_confirmed'). A scraped (enrichment) row is only a
+// contact row: it is refused here, and the buyer is pointed at the producer.
+// Producers who are not eligible are unchanged: their lines already become
+// contact handoffs at submit.
+
+/** availability_source values that mean "the producer stated this". */
+export const PRODUCER_STATED_SOURCES: readonly string[] = ["producer_dashboard", "admin_producer_confirmed"];
+
+export function isProducerStatedSource(source: string | null | undefined): boolean {
+  return typeof source === "string" && PRODUCER_STATED_SOURCES.includes(source);
+}
+
+/** The 422 error (NO / EN). The code leads the text, like the other cart refusals. */
+export const NOT_PRODUCER_CONFIRMED_ERROR =
+  "not_producer_confirmed: denne varen er hentet fra produsentens nettside og er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte. / This item was taken from the producer's website and is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly.";
+
+function unconfirmedItemError(
+  db: any,
+  row: { agent_id: string; availability_source: string | null },
+): string | null {
+  if (isProducerStatedSource(row.availability_source)) return null;
+  try {
+    return isEligibleForRealOrder(row.agent_id, db) ? NOT_PRODUCER_CONFIRMED_ERROR : null;
+  } catch {
+    // Fail closed: if the gate cannot be evaluated the row is not sold.
+    return NOT_PRODUCER_CONFIRMED_ERROR;
+  }
+}
+
 // ─── Add / upsert item ───────────────────────────────────────────────────────
 
 export type AddItemResult =
@@ -396,6 +445,11 @@ export function addCartItem(
   if (effectiveAvailability !== "in_stock") {
     return { success: false, status: 409, error: `Product is not in stock (availability: ${effectiveAvailability})` };
   }
+
+  // Skive 4: an eligible producer's scraped row is a contact row, not orderable
+  // (after the stock check, so an out-of-stock row keeps its 409).
+  const unconfirmed = unconfirmedItemError(db, product);
+  if (unconfirmed) return { success: false, status: 422, error: unconfirmed };
 
   // Verify producer eligibility
   if (!isProducerEligible(product.agent_id)) {
@@ -635,6 +689,9 @@ export function chooseCartWishOffer(
     // F9: same refusal before the clean-up (addCartItem would refuse it too).
     const chosenBan = chosen ? bannedItemError(db, chosen) : null;
     if (chosenBan) return { success: false, status: 422, error: chosenBan.error };
+    // Skive 4: same refusal for a scraped row of an eligible producer.
+    const chosenUnconfirmed = chosen ? unconfirmedItemError(db, chosen) : null;
+    if (chosenUnconfirmed) return { success: false, status: 422, error: chosenUnconfirmed };
 
     // Reject if a DIFFERENT wish (or a directly-added, non-wish item)
     // already owns the cart_items row for this exact product in this cart —
@@ -721,6 +778,21 @@ export function deleteCartWish(cartId: string, wishId: string): UpdateItemResult
 
 // ─── View cart ───────────────────────────────────────────────────────────────
 
+/** Skive 4: the stored food columns as FoodInfo, or null when none of them is stated. Never throws. */
+function foodInfoOf(r: { ingredients: string | null; allergens: string | null; net_weight: string | null }): FoodInfo | null {
+  let allergens: string[] | null = null;
+  if (typeof r.allergens === "string") {
+    try {
+      const arr = JSON.parse(r.allergens);
+      if (Array.isArray(arr)) allergens = arr.filter((v): v is string => typeof v === "string");
+    } catch { /* malformed: treated as not stated */ }
+  }
+  const ingredients = r.ingredients && r.ingredients.trim() ? r.ingredients : null;
+  const net_weight = r.net_weight && r.net_weight.trim() ? r.net_weight : null;
+  if (ingredients === null && allergens === null && net_weight === null) return null;
+  return { ingredients, allergens, net_weight };
+}
+
 export function viewCart(cartId: string): CartView | null {
   const db = _cartTestDb ?? getDb();
 
@@ -740,6 +812,10 @@ export function viewCart(cartId: string): CartView | null {
       ci.added_at,
       p.name   AS product_name,
       p.unit   AS unit,
+      p.availability_source AS availability_source,
+      p.ingredients AS ingredients,
+      p.allergens   AS allergens,
+      p.net_weight  AS net_weight,
       a.name   AS producer_name
     FROM cart_items ci
     INNER JOIN products p ON p.id = ci.product_id
@@ -756,6 +832,10 @@ export function viewCart(cartId: string): CartView | null {
     added_at: string;
     product_name: string;
     unit: string | null;
+    availability_source: string | null;
+    ingredients: string | null;
+    allergens: string | null;
+    net_weight: string | null;
     producer_name: string;
   }>;
 
@@ -782,6 +862,8 @@ export function viewCart(cartId: string): CartView | null {
       unit_price_snapshot: r.unit_price_snapshot,
       line_total,
       line_note: r.line_note,
+      producer_confirmed: isProducerStatedSource(r.availability_source),
+      food_info: foodInfoOf(r),
     });
     if (line_total != null) group.subtotal_nok += line_total;
   }
@@ -858,6 +940,8 @@ export type SubmitResult =
       category_labels?: Array<{ product_id: string; product_name: string }>;
       /** F9: the lines that are alcohol or services/experiences (422). */
       banned_items?: Array<{ product_id: string; product_name: string; kind: BannedItemKind | "check_failed" }>;
+      /** Skive 4: scraped lines of a producer who would get a real order (422 NOT_PRODUCER_CONFIRMED_ERROR). */
+      unconfirmed_items?: Array<{ product_id: string; product_name: string }>;
     };
 
 const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -1112,6 +1196,19 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   const ineligibleAgentIds = new Set<string>();
   for (const agent_id of byAgent.keys()) {
     (isEligibleForRealOrder(agent_id) ? eligibleAgentIds : ineligibleAgentIds).add(agent_id);
+  }
+
+  // Skive 4: a scraped (not producer-stated) line of a producer who would get a
+  // real order is refused, like the F9 lines: no order, no handoff, no e-mail.
+  // Producers that are not eligible keep their lines as contact handoffs.
+  const unconfirmedLines = items.filter((i) => eligibleAgentIds.has(i.agent_id) && !isProducerStatedSource(i.availability_source));
+  if (unconfirmedLines.length > 0) {
+    return {
+      success: false,
+      status: 422,
+      error: NOT_PRODUCER_CONFIRMED_ERROR,
+      unconfirmed_items: unconfirmedLines.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
+    };
   }
 
   // F2: a REAL order needs a way for the producer to reach the buyer — consent
