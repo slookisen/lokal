@@ -471,6 +471,8 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "ready" } });
       assertEq((testDb.prepare("SELECT status FROM orders WHERE id = ?").get(optinOrderId) as any)?.status,
         "ready", "prg-14: Klar for henting → ready");
+      // A1b (S2): «Kunden kom ikke» is only possible after the pickup time.
+      testDb.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(new Date(Date.now() - 3600_000).toISOString(), optinOrderId);
       const noshow = await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "no_show" } });
       assertTrue((noshow.location || "").includes("done=cancelled"), "prg-15: no_show redirects with done=cancelled");
       const finalRow = testDb.prepare("SELECT status, cancel_reason FROM orders WHERE id = ?").get(optinOrderId) as any;

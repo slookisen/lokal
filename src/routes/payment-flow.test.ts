@@ -459,6 +459,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     // no-show after capture keeps the money.
     r = await req("POST", `/produsent/ordre/${tok1}`, { form: { action: "ready" } });
     const refundsBefore = count("refund");
+    // A1b (S2): no_show is only possible after the pickup time.
+    db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(new Date(Date.now() - 3600_000).toISOString(), payOrder.order_id);
     r = await req("POST", `/produsent/ordre/${tok1}`, { form: { action: "no_show" } });
     ok(orderRow(payOrder.order_id).status === "cancelled" && count("refund") === refundsBefore, "F12-07: no-show after capture → no automatic refund (terms §7)");
 
@@ -549,6 +551,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "ready" } });
     fake.setCaptureMode("ok");
+    // A1b (S2): no_show is only possible after the pickup time.
+    db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(new Date(Date.now() - 3600_000).toISOString(), oid);
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "no_show" } });
     ok(payRow(oid).status === "captured" && fake.intents.get(pi)!.status === "succeeded", "F15-08: no-show with a reserved payment → captured, producer keeps it");
 
@@ -596,6 +600,8 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "confirm" } });
     await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "ready" } });
     fake.setCaptureMode("gone");
+    // A1b (S2): no_show is only possible after the pickup time.
+    db.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(new Date(Date.now() - 3600_000).toISOString(), oid);
     r = await req("POST", `/produsent/ordre/${tokenOf(oid)}`, { form: { action: "no_show" } });
     fake.setCaptureMode("ok");
     ok((r.location || "").includes("betaling=feilet"), "F16-04: no-show with the reservation gone → «feilet» banner");

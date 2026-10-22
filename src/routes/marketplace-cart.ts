@@ -57,7 +57,7 @@ import {
 } from "../services/payment-service";
 import { getDb } from "../database/init";
 import { applyOrderAction, cancelActionsEnabled as layerCancelActionsEnabled, type OrderAction } from "../services/order-actions";
-import { isOrderAutocompleteEnabled } from "../services/order-lifecycle";
+import { isOrderAutocompleteEnabled, noShowEarliestMs, formatPickupTimeOslo } from "../services/order-lifecycle";
 import { randomUUID } from "crypto";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "../services/order-pricing";
 import type { PaymentsStripeClient } from "../services/payment-provider";
@@ -720,8 +720,17 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
   // a resubmitted form gives the same answer instead of an error.
   const idemField = () => `<input type="hidden" name="idem" value="${randomUUID()}">`;
   // Fase A1: «Bekreft» takes an optional pickup time (Oslo time).
-  const pickupField = `<label class="pickup">Hentetid (valgfritt)<input type="datetime-local" name="pickup_time"></label>`;
+  // S5: `min` = now in Oslo time as a datetime-local value (the server accepts up to 24 h back).
+  const pickupMin = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(new Date()).replace(" ", "T");
+  const pickupField = `<label class="pickup">Hentetid (valgfritt)<input type="datetime-local" name="pickup_time" min="${pickupMin}"></label>`;
+  // S2: «Kunden kom ikke» is offered only once the pickup time has passed.
+  const confirmedAtForNoShow = order.timeline.find((e) => e.to_status === "confirmed")?.created_at ?? null;
+  const noShowFrom = noShowEarliestMs({ pickup_time: order.pickup_time, confirmed_at: confirmedAtForNoShow });
+  const noShowLocked = noShowFrom !== null && Date.now() < noShowFrom;
   const actionsHtml = (ACTIONS_FOR_STATUS[order.status] || [])
+    .filter((a) => !(a.action === "no_show" && noShowLocked))
     .map(
       (a) =>
         `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}">${idemField()}${a.action === "confirm" ? pickupField : ""}<button type="submit" class="act-btn ${a.cls}">${a.label}</button></form>`
@@ -817,6 +826,7 @@ body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
     ${buyerBlockHtml}${paymentRow ? `\n    ${paymentBanner}${paymentHtml}` : ""}
     ${timelineHtml}
     ${autoCloseHint}
+    ${noShowLocked && (order.status === "confirmed" || order.status === "ready") ? `<p class="hint">«Kunden kom ikke» kan registreres fra ${escapePageHtml(formatPickupTimeOslo(new Date(noShowFrom!).toISOString()))}.</p>` : ""}
     ${actionsHtml}
     <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. ${paymentRow ? "Betalingen går via Stripe direkte til din egen Stripe-konto." : "Ingen betaling skjer via plattformen."}</p>
   </div>

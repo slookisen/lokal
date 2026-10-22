@@ -287,7 +287,7 @@ export function renderOrderNotificationEmailV1(order: OrderNotificationInput): R
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — samme side brukes for «klar for henting» og «hentet».<br>
+<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — her bekrefter eller avslår du ordren.<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
@@ -350,7 +350,7 @@ ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — samme side brukes for «klar for henting» og «hentet».<br>
+<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — her bekrefter eller avslår du ordren.<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
