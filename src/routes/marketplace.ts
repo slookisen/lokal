@@ -3850,6 +3850,9 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       // admin-outreach-candidates.ts sum rollup + remaining raw) would reappear
       // out of the rollup remainder if the same agent_id were ever reused.
       db.prepare("DELETE FROM agent_view_daily WHERE agent_id = ?").run(agentId);
+      // Its AI-assistant bucket (agent_ai_view_daily, dev-request
+      // 2026-10-22-statistikk-samme-tall-12-mnd S0) goes with it, same reason.
+      db.prepare("DELETE FROM agent_ai_view_daily WHERE agent_id = ?").run(agentId);
       // EN/SV profile translations + their audit rows are derived from the
       // agent's own prose, so they go with it (slettefrist slice B).
       deleteAgentProfileTranslations(db, agentId);
