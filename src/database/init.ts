@@ -3951,6 +3951,21 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4:
+  // food information the buyer sees before submitting. Written only by the
+  // admin producer-list endpoint (POST /admin/products/producer-list) for
+  // pre-packaged food: ingredients (free text), allergens (JSON array of
+  // strings; '[]' = the producer states none) and net_weight (text such as
+  // '250 g'). Additive nullable columns; NULL = not stated. Same
+  // try/catch-duplicate-column guard as above.
+  for (const col of ["ingredients TEXT", "allergens TEXT", "net_weight TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists
+    }
+  }
+
   // ─── Phase 1 (orch-pr-20260614-6): cart + orders tables ─────────────────
   // Cart MVP ("handleliste"). No payment, no seller notification (Phase 1).
   // Anonymous buyer: capability-token model (buyer_ref). Pickup only.

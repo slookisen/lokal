@@ -25,6 +25,11 @@
 // functions) safe from being clobbered by an enrichment-driven catalog sync.
 // See src/services/product-catalog-sync.test.ts for the regression test that
 // proves this.
+//
+// Skive 4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// price_nok and category of a row whose availability_source is
+// 'admin_producer_confirmed' are likewise left alone, so a producer-confirmed
+// price entered by the admin is never overwritten by scraped enrichment data.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
@@ -82,7 +87,9 @@ export function parsePriceNok(priceStr: string | null | undefined): number | nul
 }
 
 // ─── Name normalization for dedupe ───────────────────────────────────────
-function normalizeName(name: string): string {
+// Exported for the admin producer-list endpoint (skive 4), which must produce
+// the same name_norm as this sync so both address the same UNIQUE row.
+export function normalizeName(name: string): string {
   return name.toLowerCase().trim().replace(/\s+/g, " ");
 }
 
@@ -116,8 +123,10 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
       (@id, @agent_id, @name, @name_norm, @category, @price_nok, 'NOK',
        'in_stock', 'enrichment', datetime('now'), datetime('now'))
     ON CONFLICT(agent_id, name_norm) DO UPDATE SET
-      price_nok  = CASE WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END,
-      category   = CASE WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END,
+      price_nok  = CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.price_nok
+                        WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END,
+      category   = CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.category
+                        WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END,
       updated_at = datetime('now')
   `);
 

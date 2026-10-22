@@ -182,7 +182,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     insA.run("ag-pay", "Betal Gård", "betal@example.no", "k-pay");
     insA.run("ag-plain", "Vanlig Gård", "vanlig@example.no", "k-plain");
     for (const id of ["ag-pay", "ag-plain"]) db.prepare(`INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')`).run(id);
-    const insP = db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?, ?, ?, ?, ?, ?, 'in_stock')`);
+    const insP = db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?, ?, ?, ?, ?, ?, 'in_stock', 'admin_producer_confirmed')`);
     insP.run("p-egg", "ag-pay", "Egg", "egg", 60, "brett");
     insP.run("p-honning", "ag-pay", "Honning", "honning", 49.5, "glass");
     insP.run("p-nopris", "ag-pay", "Ost", "ost", null, "stk");

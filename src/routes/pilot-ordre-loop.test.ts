@@ -134,8 +134,8 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       "INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, ?)"
     );
     const insertProduct = testDb.prepare(`
-      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
-      VALUES (?, ?, ?, ?, ?, ?, 'in_stock')
+      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
+      VALUES (?, ?, ?, ?, ?, ?, 'in_stock', 'admin_producer_confirmed')
     `);
 
     // Verified producer WITHOUT opt-in (the platform default) — negative case.

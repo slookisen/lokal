@@ -172,8 +172,8 @@ function seed(db: Database.Database): void {
     VALUES (?, ?, 'active', 'admin', ?, datetime('now'))
   `).run(BEEKEEPER, UMBRELLA, JSON.stringify("Fast stand"));
   db.prepare("UPDATE agents SET is_verified = 1, order_notifications_opt_in = 1 WHERE id = ?").run(CART_FARM);
-  db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
-    VALUES (?, ?, 'Gårdsegg', 'gardsegg', 60, 'brett', 'in_stock')`).run(CART_PRODUCT, CART_FARM);
+  db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
+    VALUES (?, ?, 'Gårdsegg', 'gardsegg', 60, 'brett', 'in_stock', 'admin_producer_confirmed')`).run(CART_PRODUCT, CART_FARM);
 }
 
 export async function runMcpLokalInfoAndCategoryLabelsTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
