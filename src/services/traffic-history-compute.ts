@@ -9,8 +9,9 @@
 //
 //   day    every UTC day: page views, visits and visitors per client class,
 //          entry sources, devices, top pages, referrer hosts, named bots and
-//          searches per channel. Views, visits and searches add up across
-//          days; visitors do not (one person on two days is one visitor).
+//          searches per channel, and AI lookups over MCP/A2A (aiLookups,
+//          computeAiLookups' rule). Views, visits, searches and lookups add up
+//          across days; visitors do not (one person on two days is one visitor).
 //   week   every ISO week (Monday–Sunday, UTC) and
 //   month  every calendar month: the same numbers computed over the whole
 //          period at once, so their unique visitors are exact. Written once
@@ -41,12 +42,17 @@ import {
   type Totals,
   type TrafficGroup,
 } from "./traffic-report";
-import { computeQueryStats } from "./search-stats-compute";
+import { computeQueryStats, type AiLookups } from "./search-stats-compute";
 
 type Db = Database.Database;
 
-/** Bump when a summary's numbers change meaning; rows of an older version are recomputed while their raw days exist. */
-export const TRAFFIC_HISTORY_VERSION = 3;
+/**
+ * Bump when a summary's numbers change meaning; rows of an older version are
+ * recomputed while their raw days exist (planHistoryItems, and the prune's
+ * ensureTrafficHistoryForDaySync), and kept as they are once those are gone.
+ * 4: aiLookups (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0).
+ */
+export const TRAFFIC_HISTORY_VERSION = 4;
 
 export type HistoryPeriod = "day" | "week" | "month";
 export type HistoryVertical = VerticalId | "all";
@@ -93,6 +99,16 @@ export interface HistorySummary extends HistoryItem {
   topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; botViews: number; visitors: number; humanVisitors: number }>;
   bots: Array<{ name: string; group: TrafficGroup; cls: SessionCategory; views: number; visitors: number }>;
   searches: SearchCounts & { topTerms: Array<{ query: string; count: number }> };
+  /**
+   * AI agents' lookups over MCP data tools and countable A2A requests in the
+   * covered range (computeAiLookups: the same rule as the public AI-søk
+   * number), for this row's site. analytics_mcp_calls is pruned after 60 days
+   * with no rollup of its own, so this is its only lasting record.
+   *   absent  the row was stored before version 4;
+   *   null    the raw MCP/A2A rows of the covered range were (partly) gone
+   *           when the row was computed: unknown, never a zero.
+   */
+  aiLookups?: AiLookups | null;
 }
 
 // ── Calendar helpers (UTC) ──────────────────────────────────────────────
@@ -160,6 +176,30 @@ export function firstCompleteRawDay(db: Db): string | null {
   return oldest;
 }
 
+/**
+ * The first UTC day whose raw MCP/A2A calls are still stored: the oldest
+ * stored day of analytics_mcp_calls (pruneAnalyticsMcpCalls deletes whole UTC
+ * days in one statement, so that day is complete). Null when there are no rows,
+ * which cannot be told from rows already pruned.
+ */
+export function firstRawMcpCallDay(db: Db): string | null {
+  if (!tableExists(db, "analytics_mcp_calls")) return null;
+  const oldest = (db.prepare("SELECT substr(MIN(created_at), 1, 10) AS d FROM analytics_mcp_calls WHERE created_at >= '1970'").get() as { d: string | null } | undefined)?.d ?? null;
+  return oldest && isDay(oldest) ? oldest : null;
+}
+
+/**
+ * AI lookups of [from, end) when every raw MCP/A2A call of that range is still
+ * stored, else null. Holds for the prune's safety net too: the nightly prune
+ * deletes analytics_mcp_calls after the page views (analytics-service.ts
+ * runAutoPrune), so a day being pruned still has its calls.
+ */
+function aiLookupsIfCovered(db: Db, from: string, lookups: AiLookups | undefined): AiLookups | null {
+  const first = firstRawMcpCallDay(db);
+  if (!first || first > from || !lookups) return null;
+  return { mcp: lookups.mcp, a2a: lookups.a2a, total: lookups.total };
+}
+
 // ── One summary ─────────────────────────────────────────────────────────
 
 /**
@@ -218,6 +258,7 @@ function computeHistorySummaryInTx(db: Db, item: HistoryItem, nowMs: number, opt
       ownerQueries: q.ownerQueries,
       topTerms: q.topSearchTerms,
     },
+    aiLookups: aiLookupsIfCovered(db, from, q.aiLookups),
   };
 }
 
@@ -368,6 +409,7 @@ function liveSummary(db: Db, period: "week" | "month", vertical: HistoryVertical
     human: { devices: report.human.devices, entrySources: [], referrers: [], visitSeconds: report.human.visitSeconds, singleViewVisits: report.human.singleViewVisits },
     topPages: [], bots: [],
     searches: { total: q.totalQueries, byChannel: { web: 0, api: 0, mcp: 0, a2a: 0, ai: 0, ...q.byChannel }, botQueries: q.botQueries ?? 0, ownerQueries: q.ownerQueries, topTerms: [] },
+    aiLookups: aiLookupsIfCovered(db, from, q.aiLookups),
   };
 }
 

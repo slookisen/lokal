@@ -800,6 +800,24 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_agent_view_daily_day ON agent_view_daily(day DESC);
     CREATE INDEX IF NOT EXISTS idx_agent_view_daily_agent ON agent_view_daily(agent_id);
 
+    -- agent_ai_view_daily: the AI-assistant bucket next to agent_view_daily's
+    -- human one — producer-profile views per day×agent fetched by an AI
+    -- assistant for a person (analytics_agent_views.traffic_category =
+    -- 'ai_search', not the owner), rolled up by retention-service.ts
+    -- (rollupAndPruneAgentViews) before the raw rows are deleted after the
+    -- retention window. Counts only: no city, source, session or IP. Kept in a
+    -- table of its own so agent_view_daily stays people only for every reader.
+    -- Same lifetime as agent_view_daily: never pruned, cleared for an agent_id
+    -- by the opt-out path (DELETE /admin/agents/:id, routes/marketplace.ts).
+    -- dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0.
+    CREATE TABLE IF NOT EXISTS agent_ai_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_ai_view_daily_agent ON agent_ai_view_daily(agent_id);
+
     -- sessions_daily: TRUE distinct-session count per day×vertical×bot_type.
     -- Deliberately NOT derivable from page_view_daily: that table's
     -- session_count is per-PATH, so summing it overcounts any session that

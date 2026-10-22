@@ -44375,6 +44375,21 @@ runSerial(async () => {
     failures.push("traffic-history: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ traffic-history: unexpected error: ${String(err?.message || err)}`);
   }
+
+  console.log("\n── statistikk 12 mnd S0: AI lookups and AI profile views kept before the prune ──");
+  try {
+    const { runStatistikkS0Tests } = require("../src/services/statistikk-s0-store-before-prune.test") as
+      typeof import("../src/services/statistikk-s0-store-before-prune.test");
+    const s0 = await runStatistikkS0Tests({ log: false });
+    passed += s0.passed;
+    failed += s0.failed;
+    for (const f of s0.failures) failures.push("statistikk-s0: " + f);
+    console.log(`  statistikk-s0: ${s0.passed} passed, ${s0.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("statistikk-s0: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ statistikk-s0: unexpected error: ${String(err?.message || err)}`);
+  }
 });
 
 runSerial(async () => {
