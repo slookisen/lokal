@@ -3,7 +3,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type ClaimRateLimitScope } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
@@ -2287,12 +2287,15 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
     // searches in the wrong county). Compared before/after the write so a
     // re-sent identical address never resets a good geocode.
     const placeBefore = knowledgeService.getKnowledge(agentId);
+    let ownerLockSkipped: SkippedKnowledgeField[] = [];
     if (isAdmin) {
-      // Admin enrichment — preserve dataSource as "auto" (or what's in body)
-      knowledgeService.upsertKnowledge(agentId, {
+      // Admin enrichment — preserve dataSource as "auto" (or what's in body).
+      // Not the owner path: with OWNER_LOCK_ENFORCE_WRITES on, owner-locked
+      // fields are left alone and listed in the response as skipped.
+      ownerLockSkipped = knowledgeService.upsertKnowledge(agentId, {
         ...(body as any),
         dataSource: (body.dataSource as any) || "auto",
-      });
+      }).skipped;
     } else {
       // Owner update — sets dataSource to "owner"
       knowledgeService.ownerUpdate(agentId, req.body);
@@ -2319,6 +2322,8 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       data: { ...updated, trustScore: newTrustScore },
       // Same flag PUT /admin/knowledge reports; absent when nothing moved.
       ...(addressMoved ? { geocode_invalidated: true } : {}),
+      // Owner lock: present only when a field was left alone (flag on).
+      ...(ownerLockSkipped.length ? { skipped: ownerLockSkipped } : {}),
       // W40 write guards: present only on an admin call that carried `phone`.
       ...(phoneWrite ? { phone_write: phoneWrite } : {}),
       ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),

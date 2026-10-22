@@ -126,3 +126,113 @@ export function hasProducerPage(
   if (row.is_vetted != null && !row.is_vetted) return false;
   return isPubliclyListable(row);
 }
+
+// ─── By-id public visibility — ONE shared predicate (dev-request ────────────
+// 2026-10-22-rfb-mine-valg-eierbrytere, slice S1a point 2) ───────────────────
+// Until now each by-id surface did its own thing:
+//   - /agents/:id/card|info|vcard|trust (and /api/agents/:id/stats) ask
+//     marketplaceRegistry.isQuarantinedFromPublicView(): hidden when NOT
+//     publicly listable (catalog_hidden / non-RFB vertical) OR a
+//     self_registered agent that is not vetted. They do NOT look at is_active.
+//   - lokal_info, the MCP producer-detail resource and /api/agents/:id/metrics
+//     check nothing: any id that has a row is served, inactive or hidden.
+//   - The list-shaped surfaces (llms.txt, llms-full.txt, sitemap.xml via
+//     getActiveAgents(); the ACP catalog feeds via publicListableSql) already
+//     filter in SQL; they get their fragment from here too so the rule lives
+//     in one file.
+//
+// The first release preserves today's behaviour. The only new rule —
+// `is_active = 0` is no longer served by id, and the ungated surfaces gain the
+// quarantine rule — sits behind OWNER_VISIBILITY_ENFORCE_BY_ID (default OFF:
+// with the flag unset every call below answers exactly as the surface did
+// before). S2 will teach this predicate to read the owner's visibility choice.
+//
+// Deliberate deviation: lokal_info passes `allowCatalogHidden` because the
+// hidden RFB test fixture (catalog_hidden = 1) must stay orderable by id
+// (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt AC1/AC2 —
+// the order flow resolves product ids through lokal_info). It is still
+// subject to is_active / vertical / vetted.
+
+/** Env flag (read at call time, "1" or "true" = on). Default OFF. */
+export const BY_ID_VISIBILITY_FLAG = "OWNER_VISIBILITY_ENFORCE_BY_ID";
+
+export function byIdVisibilityEnforced(): boolean {
+  const v = process.env[BY_ID_VISIBILITY_FLAG];
+  return v === "1" || v === "true";
+}
+
+/** Raw `agents` row (snake_case columns); a missing column reads like the schema default. */
+export interface AgentVisibilityRow {
+  is_active?: number | null;
+  is_vetted?: number | null;
+  catalog_hidden?: number | null;
+  vertical_id?: string | null;
+  origin?: string | null;
+}
+
+export interface AgentVisibilityOptions {
+  /**
+   * "gated"   — the surface already 404s quarantined agents today (card, info,
+   *             vcard, trust, agent stats): flag off = today's quarantine rule.
+   * "ungated" — the surface serves any existing id today (lokal_info, MCP
+   *             resource, /metrics): flag off = visible.
+   */
+  surface: "gated" | "ungated";
+  /** Keep the catalog_hidden test fixture reachable (lokal_info only). */
+  allowCatalogHidden?: boolean;
+}
+
+/** Today's quarantine rule (what isQuarantinedFromPublicView() has always answered). */
+function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean): boolean {
+  const listable = isPubliclyListable(allowCatalogHidden ? { ...row, catalog_hidden: 0 } : row);
+  if (!listable) return true;
+  return row.origin === "self_registered" && row.is_vetted !== 1;
+}
+
+/**
+ * May this agent be served on a public by-id surface? `null`/`undefined` (no
+ * such row) is false. With the flag off: gated surfaces answer with today's
+ * quarantine rule, ungated ones with true. With the flag on every surface
+ * requires is_active, the quarantine rule (catalog_hidden, vertical, vetted).
+ */
+export function isAgentPubliclyVisible(row: AgentVisibilityRow | null | undefined, opts: AgentVisibilityOptions): boolean {
+  if (!row) return false;
+  if (!byIdVisibilityEnforced()) {
+    return opts.surface === "gated" ? !quarantinedToday(row, false) : true;
+  }
+  if (row.is_active != null && !row.is_active) return false;
+  return !quarantinedToday(row, opts.allowCatalogHidden === true);
+}
+
+/** Row lookup + isAgentPubliclyVisible() for callers that only hold an id. */
+export function isAgentIdPubliclyVisible(
+  db: { prepare(sql: string): { get(...params: unknown[]): unknown } },
+  agentId: string,
+  opts: AgentVisibilityOptions,
+): boolean {
+  // Flag off + ungated: today's answer is "yes" without reading anything.
+  if (opts.surface === "ungated" && !byIdVisibilityEnforced()) return true;
+  const row = db
+    .prepare("SELECT is_active, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?")
+    .get(agentId) as AgentVisibilityRow | undefined;
+  return isAgentPubliclyVisible(row, opts);
+}
+
+/**
+ * SQL twin for the feeds: publicListableSql() plus, with the flag on,
+ * `is_active = 1`. Flag off = exactly publicListableSql(alias). Same
+ * wrap-safe AND-chain.
+ */
+export function publiclyVisibleSql(alias?: string): string {
+  const base = publicListableSql(alias);
+  return byIdVisibilityEnforced() ? `${base} AND COALESCE(${col(alias, "is_active")}, 1) = 1` : base;
+}
+
+/**
+ * The visibility half of getActiveAgents() (llms.txt, llms-full.txt,
+ * sitemap.xml, agents.json …): active + vetted + publicly listable. Unchanged
+ * semantics — only moved here so the rule lives in one file.
+ */
+export function activeVettedListableSql(alias?: string): string {
+  return `${col(alias, "is_active")} = 1 AND ${col(alias, "is_vetted")} = 1 AND ${publicListableSql(alias)}`;
+}

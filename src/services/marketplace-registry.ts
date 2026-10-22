@@ -36,7 +36,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isPubliclyListable } from "./agent-visibility";
+import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -1667,11 +1667,13 @@ class MarketplaceRegistry {
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
   isQuarantinedFromPublicView(agentId: string): boolean {
     const db = getDb();
-    const row = db.prepare("SELECT origin, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
-      { origin: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
+    const row = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
+      { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     if (!row) return false;
-    if (!isPubliclyListable(row)) return true;
-    return row.origin === "self_registered" && row.is_vetted !== 1;
+    // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
+    // flag off = the quarantine rule this method has always applied; flag
+    // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.
+    return !isAgentPubliclyVisible(row, { surface: "gated" });
   }
 
   getAgentByApiKey(apiKey: string): RegisteredAgent | undefined {
@@ -1804,7 +1806,7 @@ class MarketplaceRegistry {
     // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: + the shared
     // public-listability predicate (no catalog_hidden fixture, RFB vertical only)
     // — this one line covers every public list surface built on this method.
-    const rows = db.prepare(`SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
+    const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;

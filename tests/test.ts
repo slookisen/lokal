@@ -49081,6 +49081,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1a points 1+2: owner lock in
+// the write layer (OWNER_LOCK_ENFORCE_WRITES) and the one by-id visibility
+// predicate (OWNER_VISIBILITY_ENFORCE_BY_ID), both flag states, per surface.
+// Swaps the getDb() singleton and the two env flags (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1a: owner lock + by-id visibility ──");
+  try {
+    const { runOwnerVisibilityS1aTests } = require("../src/routes/owner-visibility-s1a.test") as
+      typeof import("../src/routes/owner-visibility-s1a.test");
+    const ov = await runOwnerVisibilityS1aTests({ log: false });
+    passed += ov.passed;
+    failed += ov.failed;
+    for (const f of ov.failures) failures.push("owner-visibility-s1a: " + f);
+    console.log(`  owner-visibility-s1a: ${ov.passed} passed, ${ov.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-visibility-s1a: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // 2026-10-04 view-stats honesty: producer view statistics count humans, not
 // bots or city pages — /:city no longer books a profile view, trackAgentView
 // stamps is_owner + traffic_category (+ Referer-derived view_source),

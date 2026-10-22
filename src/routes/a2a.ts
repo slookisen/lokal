@@ -17,6 +17,7 @@ import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
+import { isAgentIdPubliclyVisible } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
@@ -1134,6 +1135,12 @@ router.post("/api/conversations/:id/complete", (req: Request, res: Response) => 
 
 // GET /api/agents/:id/metrics — Seller dashboard data
 router.get("/api/agents/:id/metrics", (req: Request, res: Response) => {
+  // Shared by-id visibility predicate (agent-visibility.ts; flag-gated — off =
+  // served for any id, as before): an inactive/hidden agent is 404 like an unknown id.
+  if (!isAgentIdPubliclyVisible(getDb(), req.params.id as string, { surface: "ungated" })) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
   const metrics = conversationService.getAgentMetrics(req.params.id as string);
   res.json({ success: true, data: metrics });
 });
