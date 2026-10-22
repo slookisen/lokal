@@ -63,7 +63,7 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
   const ENV_KEYS = [
     "ADMIN_KEY", "ADMIN_NOTIFICATION_EMAIL", "ORDER_BUYER_RECEIPTS_ENABLED", "ORDER_AUTOCOMPLETE_ENABLED",
     "ORDER_AUTOCOMPLETE_GRACE_HOURS", "ORDER_AUTOCOMPLETE_DEFAULT_DAYS", "RFB_DISABLE_ORDER_FOLLOWUPS",
-    "PAYMENTS_ENABLED", "ORDER_REMINDER_HOURS", "ORDER_AUTOCANCEL_HOURS",
+    "PAYMENTS_ENABLED", "ORDER_REMINDER_HOURS", "ORDER_AUTOCANCEL_HOURS", "ORDER_AUTOCOMPLETE_SINCE", "ORDER_NO_SHOW_MIN_HOURS",
   ];
   const prevEnv: Record<string, string | undefined> = {};
   for (const k of ENV_KEYS) prevEnv[k] = process.env[k];
@@ -135,7 +135,18 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
     const row = (id: string) => db.prepare("SELECT status, cancel_reason, completion_source, pickup_time FROM orders WHERE id = ?").get(id) as any;
     const events = (id: string) => db.prepare("SELECT from_status, to_status, actor_role, channel, idempotency_key FROM order_events WHERE order_id = ? ORDER BY created_at, rowid").all(id) as any[];
     const settle = () => new Promise((r) => setTimeout(r, 40));
-    const envOn = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({ ORDER_AUTOCOMPLETE_ENABLED: "1", ...extra });
+    // B2: the tests seed orders confirmed "now"; the real default floor is the A1 deploy, so pin the floor explicitly here.
+    const OLD_FLOOR = "2020-01-01T00:00:00Z";
+    const envOn = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({ ORDER_AUTOCOMPLETE_ENABLED: "1", ORDER_AUTOCOMPLETE_SINCE: OLD_FLOOR, ...extra });
+    /** B1: a pickup time 3 days ahead at 15:30 Oslo time, computed relative to now (never rots). */
+    function futurePickup(): { local: string; utcIso: string; text: string } {
+      const d = new Date(Date.now() + 3 * 86_400_000);
+      const ymd = new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+      const off = /GMT([+-]\d+)/.exec(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", timeZoneName: "longOffset", hour: "2-digit" }).format(new Date(`${ymd}T12:00:00Z`)))?.[1] ?? "+1";
+      const utcIso = new Date(Date.parse(`${ymd}T15:30:00Z`) - Number(off) * 3_600_000).toISOString();
+      const day = new Intl.DateTimeFormat("nb-NO", { timeZone: "Europe/Oslo", day: "numeric", month: "long" }).format(d);
+      return { local: `${ymd}T15:30`, utcIso, text: `${day} kl. 15:30` };
+    }
     const SYS = { role: "system" as const, channel: "system_job" as const, ref: "test" };
     const SELLER = { role: "seller" as const, channel: "producer_page" as const, ref: "test" };
     const BUYER = { role: "buyer" as const, channel: "web" as const, ref: "test" };
@@ -148,11 +159,12 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
       assertEq(lifecycle.isOrderAutocompleteEnabled({ ORDER_AUTOCOMPLETE_ENABLED: "1" }), true, "lc-02: =1 turns it on");
       assertEq(lifecycle.orderAutocompleteGraceHours({}), 24, "lc-03: grace default 24 h");
       assertEq(lifecycle.orderAutocompleteDefaultDays({}), 3, "lc-04: default days 3");
-      const due1 = lifecycle.autoCompleteDueMs({ pickup_time: "2026-10-25T12:00:00.000Z", confirmed_at: "2026-10-20 08:00:00" }, {});
+      const floorOld = { ORDER_AUTOCOMPLETE_SINCE: "2020-01-01T00:00:00Z" };
+      const due1 = lifecycle.autoCompleteDueMs({ pickup_time: "2026-10-25T12:00:00.000Z", confirmed_at: "2026-10-20 08:00:00" }, floorOld);
       assertEq(due1, Date.parse("2026-10-26T12:00:00.000Z"), "lc-05: with a pickup time: pickup + 24 h");
-      const due2 = lifecycle.autoCompleteDueMs({ pickup_time: null, confirmed_at: "2026-10-20 08:00:00" }, {});
+      const due2 = lifecycle.autoCompleteDueMs({ pickup_time: null, confirmed_at: "2026-10-20 08:00:00" }, floorOld);
       assertEq(due2, Date.parse("2026-10-23T08:00:00.000Z"), "lc-06: without: confirmed_at + 3 days");
-      assertEq(lifecycle.autoCompleteDueMs({ pickup_time: null, confirmed_at: null }, {}), null, "lc-07: no time known → never");
+      assertEq(lifecycle.autoCompleteDueMs({ pickup_time: null, confirmed_at: null }, floorOld), null, "lc-07: no time known → never");
       const now = new Date("2026-10-22T10:00:00.000Z");
       // 25 October 2026 is the DST switch day; 14:00 Oslo is then UTC+1.
       assertEq(lifecycle.normalizePickupTime("2026-10-25T14:00", now), "2026-10-25T13:00:00.000Z", "lc-08: datetime-local is Oslo time (winter, UTC+1)");
@@ -301,13 +313,14 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
       assertTrue(page.text.includes('name="pickup_time"') && page.text.includes("Bekreft ordren"), "one-01: the pending page offers «Bekreft» with an optional pickup time");
       receipts.length = 0;
       process.env.ORDER_AUTOCOMPLETE_ENABLED = "1";
-      const r = await req("POST", `/produsent/ordre/${tokenOf(id)}`, { form: { action: "confirm", pickup_time: "2026-12-01T15:30" } });
+      const fp = futurePickup();
+      const r = await req("POST", `/produsent/ordre/${tokenOf(id)}`, { form: { action: "confirm", pickup_time: fp.local } });
       assertTrue(r.status === 303 && (r.location || "").includes("done=confirmed"), "one-02: one POST confirms (303, done=confirmed)");
-      assertEq(row(id).pickup_time, "2026-12-01T14:30:00.000Z", "one-03: the pickup time is stored (Oslo 15:30 = 14:30 UTC)");
+      assertEq(row(id).pickup_time, fp.utcIso, "one-03: the pickup time is stored as UTC (Oslo 15:30)");
       await settle();
       const conf = receipts.find((x) => x.subject.startsWith("Ordrebekreftelse"));
       assertTrue(!!conf && conf.to === BUYER_MAIL, "one-04: the buyer gets the confirmation receipt");
-      assertTrue(!!conf && conf.textContent.includes("Hentetid: 1. desember kl. 15:30"), "one-05: …with the pickup time in Oslo time");
+      assertTrue(!!conf && conf.textContent.includes(`Hentetid: ${fp.text}`), "one-05: …with the pickup time in Oslo time");
       assertTrue(!!conf && conf.textContent.includes("ordren avsluttes av seg selv") && conf.textContent.includes("kontakt@rettfrabonden.com"),
         "one-06: …saying the order closes by itself and how to say something is wrong");
       page = await req("GET", `/produsent/ordre/${tokenOf(id)}`);
@@ -335,7 +348,7 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
     // AC2 — no_show / buyer_cancelled / cannot_deliver + receipts; conflict
     // ════════════════════════════════════════════════════════════════════════
     {
-      const confirmedAt = new Date(Date.now() - 3600_000);
+      const confirmedAt = new Date(Date.now() - 4 * 3600_000); // > ORDER_NO_SHOW_MIN_HOURS (3)
       // no_show straight from `confirmed` (no «Klar» step) via the page.
       const ns = seedOrder({ status: "confirmed", confirmedAt });
       receipts.length = 0;
@@ -479,12 +492,130 @@ export async function runOrderActionsFaseA1Tests(opts: { log?: boolean } = {}): 
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // Fix-up A1b — B2 (cutoff + dry run), S2, S4 (M9, M14), S5, S3, S9
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      const far = new Date(Date.now() + 60 * 86_400_000);
+      const deploy = Date.parse(lifecycle.A1_DEPLOY_ISO);
+
+      // B2 — default floor = the A1 deploy; no env needed to be safe.
+      const preA1 = seedOrder({ status: "confirmed", confirmedAt: new Date(deploy - 10 * 86_400_000) });
+      const postA1 = seedOrder({ status: "confirmed", confirmedAt: new Date(deploy + 60_000) });
+      const noSince = { ORDER_AUTOCOMPLETE_ENABLED: "1" } as NodeJS.ProcessEnv;
+      assertEq(lifecycle.orderAutocompleteSinceMs({}), deploy, "b2-01: default floor is the A1 deploy");
+      assertEq(lifecycle.orderAutocompleteSinceMs({ ORDER_AUTOCOMPLETE_SINCE: "2026-11-01T00:00:00Z" }), Date.parse("2026-11-01T00:00:00Z"), "b2-02: ORDER_AUTOCOMPLETE_SINCE overrides");
+      assertEq(lifecycle.orderAutocompleteSinceMs({ ORDER_AUTOCOMPLETE_SINCE: "i går" }), deploy, "b2-03: an unparseable value falls back to the default");
+      const direct = await actionsSvc.applyOrderAction(preA1, "auto_complete", SYS, { now: far, env: noSince });
+      assertTrue(!direct.success && direct.status === 409 && row(preA1).status === "confirmed", "b2-04: the layer refuses to auto-close an order confirmed before the floor");
+      const dry = await req("GET", "/admin/orders/pilot-status", { headers: { "X-Admin-Key": ADMIN_KEY } });
+      assertEq(dry.body?.auto_complete?.enabled, false, "b2-05: pilot-status reports the switch (off)");
+      assertEq(dry.body?.auto_complete?.since, lifecycle.A1_DEPLOY_ISO, "b2-06: …and the floor in use");
+      const dueIds = followSvc.listAutoCompleteDue(db as any, far, {}).map((o) => o.id);
+      assertTrue(dueIds.includes(postA1) && !dueIds.includes(preA1), "b2-07: the dry-run selection holds post-A1 orders only, with the switch off");
+      assertTrue(typeof dry.body?.auto_complete?.would_auto_complete === "number", "b2-08: pilot-status carries would_auto_complete");
+      const openNow = (db.prepare("SELECT COUNT(*) AS n FROM orders WHERE status IN ('confirmed','ready')").get() as any).n;
+      assertTrue(dry.body.auto_complete.would_auto_complete <= openNow, "b2-09: would_auto_complete counts a subset of the open orders");
+      const before = (db.prepare("SELECT COUNT(*) AS n FROM order_events").get() as any).n;
+      await followSvc.processOrderFollowups({ now: far, env: noSince });
+      assertEq(row(preA1).status, "confirmed", "b2-10: the job leaves the pre-A1 order alone, switch ON and no env floor");
+      assertEq(row(postA1).status, "completed", "b2-11: …and closes the post-A1 one");
+      const after = (db.prepare("SELECT COUNT(*) AS n FROM order_events").get() as any).n;
+      assertTrue(after >= before + 1, "b2-12: the closes wrote order_events");
+      await followSvc.processOrderFollowups({ now: far, env: noSince });
+      assertEq(row(preA1).status, "confirmed", "b2-13: still untouched on a later run");
+      await followSvc.processOrderFollowups({ now: far, env: { ...noSince, ORDER_AUTOCOMPLETE_SINCE: "2020-01-01T00:00:00Z" } });
+      assertEq(row(preA1).status, "completed", "b2-14: an explicit older ORDER_AUTOCOMPLETE_SINCE opts the old order in");
+
+      // S2 — no_show only after the pickup time (seller); admin may correct.
+      const futurePick = seedOrder({ status: "confirmed", pickup: new Date(Date.now() + 2 * 3600_000).toISOString(), confirmedAt: new Date(Date.now() - 5 * 3600_000) });
+      const early = await actionsSvc.applyOrderAction(futurePick, "no_show", SELLER);
+      assertTrue(!early.success && early.status === 409 && row(futurePick).status === "confirmed", "s2-01: no_show before the pickup time → 409, unchanged");
+      const pageEarly = (await req("GET", `/produsent/ordre/${tokenOf(futurePick)}`)).text;
+      assertTrue(!pageEarly.includes('value="no_show"') && pageEarly.includes("Kunden kom ikke» kan registreres fra"), "s2-02: the page hides «Kunden kom ikke» before the pickup time and says when");
+      const postEarly = await req("POST", `/produsent/ordre/${tokenOf(futurePick)}`, { form: { action: "no_show" } });
+      assertTrue((postEarly.location || "").includes("error=ugyldig") && row(futurePick).status === "confirmed", "s2-03: a forged POST before the pickup time is refused");
+      const ok = await actionsSvc.applyOrderAction(futurePick, "no_show", SELLER, { now: new Date(Date.now() + 3 * 3600_000) });
+      assertTrue(ok.success && row(futurePick).cancel_reason === "no_show", "s2-04: after the pickup time → allowed");
+      const noPickEarly = seedOrder({ status: "confirmed", confirmedAt: new Date(Date.now() - 3600_000) });
+      const npe = await actionsSvc.applyOrderAction(noPickEarly, "no_show", SELLER);
+      assertTrue(!npe.success && npe.status === 409, "s2-05: without a pickup time: < 3 h after confirmation → 409");
+      const adminEarly = seedOrder({ status: "confirmed", pickup: new Date(Date.now() + 5 * 3600_000).toISOString(), confirmedAt: new Date() });
+      const ae = await actionsSvc.applyOrderAction(adminEarly, "no_show", { role: "admin", channel: "admin", ref: "t" });
+      assertTrue(ae.success, "s2-06: admin may register a no-show at any time");
+      assertTrue((await req("GET", `/produsent/ordre/${tokenOf(noPickEarly)}`)).text.includes("Kunden kom ikke» kan registreres fra"), "s2-07: the page shows the time for an order without pickup time too");
+
+      // S5 — min on the pickup field
+      const pg = seedOrder({ status: "pending", notifySent: true });
+      const pgHtml = (await req("GET", `/produsent/ordre/${tokenOf(pg)}`)).text;
+      assertTrue(/name="pickup_time" min="\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"/.test(pgHtml), "s5-01: the pickup field has a min attribute (now, Oslo time)");
+
+      // S3 — the producer e-mail no longer mentions «klar for henting»
+      const notifySrc = require("fs").readFileSync(require("path").join(__dirname, "..", "services", "order-notify-service.ts"), "utf8") as string;
+      assertTrue(!/klar for henting/i.test(notifySrc) && !/samme side brukes/.test(notifySrc), "s3-01: no outdated «klar for henting» text in the producer e-mail");
+
+      // S4 / M9 — the automatic close never touches the payment step
+      const pm = seedOrder({ status: "confirmed", confirmedAt: new Date(), paymentMode: "prepay" });
+      db.prepare(`INSERT INTO payments (id, order_id, agent_id, stripe_account_id, amount_ore, status, captured_at)
+                  VALUES ('pay-a1b', ?, 'ag-a1', 'acct_test', 9000, 'captured', datetime('now'))`).run(pm);
+      let stripeTouched = 0;
+      const spyStripe: any = new Proxy({}, { get() { stripeTouched++; return () => { stripeTouched++; throw new Error("stripe must not be called"); }; } });
+      const peBefore = (db.prepare("SELECT COUNT(*) AS n FROM payment_events").get() as any).n;
+      const ac = await actionsSvc.applyOrderAction(pm, "auto_complete", SYS, { payments: spyStripe, now: far, env: envOn() });
+      assertTrue(ac.success && ac.payment_effect === "none" && stripeTouched === 0, "m9-01: auto_complete with a payments client → payment_effect none, Stripe untouched");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM payment_events").get() as any).n, peBefore, "m9-02: …no payment_events");
+      // …and via the admin route (payments client resolved there)
+      const pm2 = seedOrder({ status: "confirmed", confirmedAt: new Date(), paymentMode: "prepay" });
+      const ac2 = await actionsSvc.applyOrderAction(pm2, "auto_complete", { role: "admin", channel: "admin", ref: "t" }, { payments: spyStripe, now: far, env: envOn() });
+      assertTrue(ac2.success && ac2.payment_effect === "none" && stripeTouched === 0, "m9-03: admin auto_complete with a payments client → same");
+
+      // S4 / M14 — the layer's own cancelGate (prepay + payments off)
+      delete process.env.PAYMENTS_ENABLED;
+      for (const [act, role, st] of [["buyer_cancelled", "seller", "confirmed"], ["cannot_deliver", "seller", "confirmed"], ["cancel", "buyer", "confirmed"], ["withdraw", "buyer", "pending"]] as const) {
+        const o = seedOrder({ status: st, confirmedAt: new Date(), paymentMode: "prepay" });
+        const r = await actionsSvc.applyOrderAction(o, act, { role, channel: "web", ref: "t" });
+        assertTrue(!r.success && r.status === 409 && row(o).status === st, `m14-${act}: prepay + payments off → the layer itself refuses ${act} (409)`);
+      }
+      const unknownMode = seedOrder({ status: "confirmed", confirmedAt: new Date() });
+      db.prepare("UPDATE orders SET payment_mode = NULL WHERE id = ?").run(unknownMode);
+      const pay = seedOrder({ status: "confirmed", confirmedAt: new Date(), paymentMode: "pay_at_pickup" });
+      const pr = await actionsSvc.applyOrderAction(pay, "buyer_cancelled", SELLER);
+      assertTrue(pr.success, "m14-05: a pay-at-pickup order is still cancellable");
+      process.env.PAYMENTS_ENABLED = "1";
+      const gp = seedOrder({ status: "confirmed", confirmedAt: new Date(), paymentMode: "prepay" });
+      const gr = await actionsSvc.applyOrderAction(gp, "buyer_cancelled", SELLER);
+      assertTrue(gr.success, "m14-06: …and a prepay order too once PAYMENTS_ENABLED=1");
+      delete process.env.PAYMENTS_ENABLED;
+
+      // S9 — a reused key with a DIFFERENT action is a collision, not a silent success
+      const k1 = seedOrder({ status: "pending" });
+      const a1 = await actionsSvc.applyOrderAction(k1, "confirm", SELLER, { idempotencyKey: "s9-key" });
+      const a2 = await actionsSvc.applyOrderAction(k1, "decline", SELLER, { idempotencyKey: "s9-key" });
+      assertTrue(a1.success && !a2.success && a2.status === 409 && /different action/.test((a2 as any).error), "s9-01: same key, other action → 409 (not a replay)");
+      assertEq(row(k1).status, "confirmed", "s9-02: …status unchanged");
+      const a3 = await actionsSvc.applyOrderAction(k1, "confirm", SELLER, { idempotencyKey: "s9-key" });
+      assertTrue(a3.success && a3.replayed, "s9-03: same key, same action → replay");
+      const k2 = seedOrder({ status: "confirmed", confirmedAt: new Date(Date.now() - 4 * 3600_000) });
+      await actionsSvc.applyOrderAction(k2, "no_show", SELLER, { idempotencyKey: "s9-key2" });
+      const b2 = await actionsSvc.applyOrderAction(k2, "buyer_cancelled", SELLER, { idempotencyKey: "s9-key2" });
+      assertTrue(!b2.success && b2.status === 409, "s9-04: same key, other cancel reason (no_show vs buyer_cancelled) → 409");
+      const k3 = seedOrder({ status: "confirmed", confirmedAt: new Date() });
+      await actionsSvc.applyOrderAction(k3, "complete", SELLER, { idempotencyKey: "s9-key3" });
+      const c3 = await actionsSvc.applyOrderAction(k3, "picked_up", BUYER, { idempotencyKey: "s9-key3" });
+      assertTrue(!c3.success && c3.status === 409, "s9-05: same key, other completion source (seller vs buyer) → 409");
+      const k4 = seedOrder({ status: "pending" });
+      const form = await req("POST", `/produsent/ordre/${tokenOf(k4)}`, { form: { action: "confirm", idem: "abcdef12-0000" } });
+      const form2 = await req("POST", `/produsent/ordre/${tokenOf(k4)}`, { form: { action: "decline", idem: "abcdef12-0000" } });
+      assertTrue((form.location || "").includes("done=confirmed") && (form2.location || "").includes("error=ugyldig") && row(k4).status === "confirmed",
+        "s9-06: producer page: the same form key with another action is refused");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // Statistics + AC5 (every row)
     // ════════════════════════════════════════════════════════════════════════
     {
       const ps = await req("GET", "/admin/orders/pilot-status", { headers: { "X-Admin-Key": ADMIN_KEY } });
-      assertEq(ps.body?.orders_30d?.completed_auto, 5, "stat-01: pilot-status counts completed_auto apart");
-      assertEq(ps.body?.orders_30d?.completed_confirmed, (ps.body?.orders_30d?.by_status?.completed ?? 0) - 5, "stat-02: …and the confirmed completions separately");
+      assertEq(ps.body?.orders_30d?.completed_auto, (db.prepare("SELECT COUNT(*) AS n FROM orders WHERE completion_source = 'auto'").get() as any).n, "stat-01: pilot-status counts completed_auto apart");
+      assertEq(ps.body?.orders_30d?.completed_confirmed, (ps.body?.orders_30d?.by_status?.completed ?? 0) - ps.body.orders_30d.completed_auto, "stat-02: …and the confirmed completions separately");
       const total = (db.prepare("SELECT COUNT(*) AS n FROM order_events").get() as any).n;
       const missing = (db.prepare("SELECT COUNT(*) AS n FROM order_events WHERE actor_role IS NULL OR channel IS NULL").get() as any).n;
       assertTrue(total > 20, "ac5-16: the run wrote many order_events rows");

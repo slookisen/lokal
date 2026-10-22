@@ -22,7 +22,8 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isEligibleForRealOrder } from "../services/cart-service";
-import { orderReminderHours } from "../services/order-followups";
+import { orderReminderHours, listAutoCompleteDue } from "../services/order-followups";
+import { isOrderAutocompleteEnabled, orderAutocompleteSinceMs } from "../services/order-lifecycle";
 
 const router = Router();
 
@@ -193,6 +194,9 @@ router.get("/pilot-status", (req: Request, res: Response) => {
       "SELECT COUNT(*) AS n FROM orders WHERE status = 'completed' AND completion_source = 'auto' AND created_at >= datetime('now', '-30 days')"
     ).get() as { n: number }).n;
 
+    // B2: dry run of the automatic close — how many confirmed/ready orders the
+    // job WOULD close right now (whether or not the switch is on). Ids only.
+    const dueNow = listAutoCompleteDue(db, new Date()).map((o) => o.id);
     const hours = orderReminderHours();
     const unanswered = db.prepare(
       `SELECT o.id AS order_id, o.agent_id, a.name AS producer_name, o.created_at
@@ -211,6 +215,12 @@ router.get("/pilot-status", (req: Request, res: Response) => {
         window_days: 30, by_status: byStatus, total: Object.values(byStatus).reduce((a, b) => a + b, 0),
         completed_auto: completedAuto,
         completed_confirmed: Math.max(0, (byStatus.completed ?? 0) - completedAuto),
+      },
+      auto_complete: {
+        enabled: isOrderAutocompleteEnabled(),
+        since: new Date(orderAutocompleteSinceMs()).toISOString(),
+        would_auto_complete: dueNow.length,
+        order_ids: dueNow.slice(0, 50),
       },
       unanswered: { over_hours: hours, count: unanswered.length, orders: unanswered },
     });

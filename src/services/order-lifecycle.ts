@@ -13,7 +13,20 @@
  *                                    and a seller «kom ikke» count as a conflict.
  *   ORDER_AUTOCOMPLETE_DEFAULT_DAYS  days after confirmation when the order has
  *                                    no pickup time (default 3).
+ *   ORDER_AUTOCOMPLETE_SINCE         ISO timestamp: only orders CONFIRMED at or
+ *                                    after it are ever closed automatically.
+ *                                    Default: the Fase A1 deploy
+ *                                    (A1_DEPLOY_ISO), so switching the feature
+ *                                    on never sweeps up older open orders. An
+ *                                    unparseable value falls back to the default.
+ *   ORDER_NO_SHOW_MIN_HOURS          hours after confirmation before a seller
+ *                                    may report «Kunden kom ikke» on an order
+ *                                    WITHOUT a pickup time (default 3). With a
+ *                                    pickup time, no_show needs now >= pickup.
  */
+
+/** The Fase A1 deploy (lokal#1221 merge, 2026-10-22T12:45:34Z): default floor for the automatic close. */
+export const A1_DEPLOY_ISO = "2026-10-22T12:45:34.000Z";
 
 export function isOrderAutocompleteEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.ORDER_AUTOCOMPLETE_ENABLED === "1";
@@ -41,20 +54,52 @@ export function parseOrderTimestamp(ts: string | null | undefined): number {
   return Date.parse(s.replace(" ", "T") + "Z");
 }
 
+/** Epoch ms from which confirmed orders may be closed automatically (see ORDER_AUTOCOMPLETE_SINCE). */
+export function orderAutocompleteSinceMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.ORDER_AUTOCOMPLETE_SINCE;
+  if (raw != null && String(raw).trim() !== "") {
+    const ms = parseOrderTimestamp(String(raw));
+    if (Number.isFinite(ms)) return ms;
+  }
+  return Date.parse(A1_DEPLOY_ISO);
+}
+
+export function orderNoShowMinHours(env: NodeJS.ProcessEnv = process.env): number {
+  return envPositive("ORDER_NO_SHOW_MIN_HOURS", 3, env);
+}
+
+/**
+ * Earliest instant a seller may report «Kunden kom ikke»: the pickup time, or
+ * without one the confirmation time + ORDER_NO_SHOW_MIN_HOURS. null when
+ * neither is known (no restriction can be computed).
+ */
+export function noShowEarliestMs(
+  o: { pickup_time: string | null | undefined; confirmed_at: string | null | undefined },
+  env: NodeJS.ProcessEnv = process.env,
+): number | null {
+  const pickup = parseOrderTimestamp(o.pickup_time);
+  if (Number.isFinite(pickup)) return pickup;
+  const confirmed = parseOrderTimestamp(o.confirmed_at);
+  if (Number.isFinite(confirmed)) return confirmed + orderNoShowMinHours(env) * 3600_000;
+  return null;
+}
+
 /**
  * When a confirmed order is closed automatically: pickup_time + grace hours,
  * or, without a pickup time, the confirmation time + default days. null when
- * neither time is known (never closed automatically).
+ * neither time is known, or when the order was confirmed before
+ * orderAutocompleteSinceMs() (never closed automatically).
  */
 export function autoCompleteDueMs(
   o: { pickup_time: string | null | undefined; confirmed_at: string | null | undefined },
   env: NodeJS.ProcessEnv = process.env,
 ): number | null {
+  const confirmed = parseOrderTimestamp(o.confirmed_at);
+  // B2: only orders confirmed on/after the cutoff are ever closed automatically.
+  if (!Number.isFinite(confirmed) || confirmed < orderAutocompleteSinceMs(env)) return null;
   const pickup = parseOrderTimestamp(o.pickup_time);
   if (Number.isFinite(pickup)) return pickup + orderAutocompleteGraceHours(env) * 3600_000;
-  const confirmed = parseOrderTimestamp(o.confirmed_at);
-  if (Number.isFinite(confirmed)) return confirmed + orderAutocompleteDefaultDays(env) * 86_400_000;
-  return null;
+  return confirmed + orderAutocompleteDefaultDays(env) * 86_400_000;
 }
 
 /** Europe/Oslo UTC offset (ms) at the given instant. */

@@ -34,7 +34,9 @@
  *      `completed` with completion_source 'auto' at pickup_time +
  *      ORDER_AUTOCOMPLETE_GRACE_HOURS (24), or without a pickup time at the
  *      confirmation + ORDER_AUTOCOMPLETE_DEFAULT_DAYS (3). Only with
- *      ORDER_AUTOCOMPLETE_ENABLED=1 (default off), never while
+ *      ORDER_AUTOCOMPLETE_ENABLED=1 (default off), only for orders confirmed
+ *      on/after ORDER_AUTOCOMPLETE_SINCE (default: the A1 deploy,
+ *      order-lifecycle A1_DEPLOY_ISO), never while
  *      RFB_DISABLE_ORDER_FOLLOWUPS=1. Applies to prepay orders too, and moves
  *      no money for them (no payment step at all).
  *
@@ -79,6 +81,26 @@ function sqliteUtcMs(ts: string): number {
 }
 function sqliteStamp(d: Date): string {
   return d.toISOString().slice(0, 19).replace("T", " ");
+}
+
+/**
+ * Step 4's selection (also the dry run in GET /admin/orders/pilot-status):
+ * confirmed/ready orders that are due for the automatic close at `now`.
+ * Orders confirmed before ORDER_AUTOCOMPLETE_SINCE (default: the A1 deploy)
+ * are never selected. Ignores the on/off switch — callers check that.
+ */
+export function listAutoCompleteDue(db: any, now: Date, env: NodeJS.ProcessEnv = process.env): Array<{ id: string }> {
+  const open = db.prepare(`
+    SELECT o.id, o.pickup_time,
+           COALESCE((SELECT MIN(e.created_at) FROM order_events e WHERE e.order_id = o.id AND e.to_status = 'confirmed'),
+                    o.updated_at) AS confirmed_at
+    FROM orders o
+    WHERE o.status IN ('confirmed', 'ready')
+  `).all() as Array<{ id: string; pickup_time: string | null; confirmed_at: string | null }>;
+  return open.filter((o) => {
+    const due = autoCompleteDueMs(o, env);
+    return due !== null && now.getTime() >= due;
+  });
 }
 
 export async function processOrderFollowups(
@@ -170,17 +192,8 @@ export async function processOrderFollowups(
   // stopped (RFB_DISABLE_ORDER_FOLLOWUPS=1 — checked here as well, so a manual
   // run can never close orders while Daniel has the job stopped).
   if (isOrderAutocompleteEnabled(env) && env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
-    const open = db.prepare(`
-      SELECT o.id, o.pickup_time,
-             COALESCE((SELECT MIN(e.created_at) FROM order_events e WHERE e.order_id = o.id AND e.to_status = 'confirmed'),
-                      o.updated_at) AS confirmed_at
-      FROM orders o
-      WHERE o.status IN ('confirmed', 'ready')
-    `).all() as Array<{ id: string; pickup_time: string | null; confirmed_at: string | null }>;
-    for (const o of open) {
+    for (const o of listAutoCompleteDue(db, now, env)) {
       try {
-        const due = autoCompleteDueMs(o, env);
-        if (due === null || now.getTime() < due) continue;
         const res = await applyOrderAction(
           o.id, "auto_complete",
           { role: "system", channel: "system_job", ref: "order-followups" },

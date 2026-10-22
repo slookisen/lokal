@@ -57,6 +57,7 @@ import { sendAdminOrderAlert } from "./order-notify-service";
 import {
   autoCompleteDueMs,
   isOrderAutocompleteEnabled,
+  noShowEarliestMs,
   normalizePickupTime,
   orderAutocompleteGraceHours,
   parseOrderTimestamp,
@@ -213,16 +214,18 @@ export async function applyOrderAction(
     | undefined;
   if (!order) return { success: false, status: 404, error: "Order not found" };
 
-  // AC5: the same key on the same order → the stored transition, no new one.
-  if (idemKey !== null) {
-    const replay = findReplay(db, orderId, idemKey, action);
-    if (replay) return replay;
-  }
-
   if (action === "message") {
     return { success: false, status: 501, error: "Order messages are not available yet" };
   }
   const spec = ACTION_SPECS[action];
+
+  // AC5: the same key + the same action on the same order → the stored
+  // transition, no new one. The same key with a DIFFERENT action is a key
+  // collision (S9): 409, never a silent «success».
+  if (idemKey !== null) {
+    const replay = findReplay(db, orderId, idemKey, action, actor.role);
+    if (replay) return replay;
+  }
 
   // Conflict (AC2): buyer and seller contradict each other within the grace
   // window. Never decided automatically: admin alert, no status change.
@@ -244,6 +247,15 @@ export async function applyOrderAction(
       status: 409,
       error: `Action '${action}' is not possible for an order in '${order.status}'`,
     };
+  }
+
+  // S2: «Kunden kom ikke» only once the pickup time has passed (without a
+  // pickup time: confirmation + ORDER_NO_SHOW_MIN_HOURS). Admin may correct anytime.
+  if (action === "no_show" && actor.role !== "admin") {
+    const earliest = noShowEarliestMs({ pickup_time: order.pickup_time, confirmed_at: orderConfirmedAt(db, orderId) }, env);
+    if (earliest !== null && now.getTime() < earliest) {
+      return { success: false, status: 409, error: "no_show is only possible after the pickup time" };
+    }
   }
 
   if (spec.cancelGate) {
@@ -292,8 +304,9 @@ export async function applyOrderAction(
   });
   if (!t.success) {
     if (idemKey !== null && t.error === IDEMPOTENCY_KEY_TAKEN) {
-      const replay = findReplay(db, orderId, idemKey, action);
+      const replay = findReplay(db, orderId, idemKey, action, actor.role);
       if (replay) return replay;
+      return { success: false, status: 409, error: IDEM_KEY_CONFLICT };
     }
     return t;
   }
@@ -316,11 +329,30 @@ export async function applyOrderAction(
   return { success: true, order_id: orderId, action, status: spec.to, replayed: false, payment_effect };
 }
 
-function findReplay(db: any, orderId: string, key: string, action: OrderAction): OrderActionResult | null {
+const IDEM_KEY_CONFLICT = "idempotencyKey was already used for a different action on this order";
+
+/**
+ * The stored transition for (order, key), or null when the key is unused.
+ * A key that was used for a different action (other target status, cancel
+ * reason or completion source) is a 409 collision, not a replay.
+ */
+function findReplay(db: any, orderId: string, key: string, action: Exclude<OrderAction, "message">, role: OrderActorRole): OrderActionResult | null {
   const ev = db.prepare(
     "SELECT to_status FROM order_events WHERE order_id = ? AND idempotency_key = ? ORDER BY created_at, rowid LIMIT 1",
   ).get(orderId, key) as { to_status: string } | undefined;
   if (!ev) return null;
+  const spec = ACTION_SPECS[action];
+  let same = ev.to_status === spec.to;
+  if (same && (spec.to === "cancelled" || spec.to === "completed")) {
+    const o = db.prepare("SELECT cancel_reason, completion_source FROM orders WHERE id = ?")
+      .get(orderId) as { cancel_reason: string | null; completion_source: string | null } | undefined;
+    if (spec.to === "cancelled") same = (o?.cancel_reason ?? null) === (spec.cancelReason ?? null);
+    else {
+      const expected = spec.completion === "actor" ? (role === "admin" ? "admin" : role === "buyer" ? "buyer" : "seller") : spec.completion ?? null;
+      same = (o?.completion_source ?? null) === expected;
+    }
+  }
+  if (!same) return { success: false, status: 409, error: IDEM_KEY_CONFLICT };
   return { success: true, order_id: orderId, action, status: ev.to_status, replayed: true, payment_effect: "none" };
 }
 
