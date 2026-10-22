@@ -5153,6 +5153,32 @@ function initSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
 
+  // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // one shared order-action layer (services/order-actions.ts) and the
+  // one-click lifecycle. All additive, NULL on every existing row:
+  //   orders.completion_source       : who closed a completed order —
+  //     'auto' (the follow-ups job, ORDER_AUTOCOMPLETE_ENABLED), 'buyer',
+  //     'seller' or 'admin'. NULL for orders completed before Fase A1.
+  //   order_events.actor_role        : 'seller' | 'buyer' | 'system' | 'admin'.
+  //   order_events.channel           : 'producer_page' | 'owner_portal' |
+  //     'admin' | 'system_job' | 'internal' (later 'mcp' / 'a2a').
+  //   order_events.idempotency_key   : the caller's idempotency key; a repeat
+  //     of the same key on the same order returns the stored transition.
+  //   trust_events.completion_source : copied from the order for
+  //     order_completed, so automatic closes are counted apart.
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN completion_source TEXT`,
+    `ALTER TABLE order_events ADD COLUMN actor_role TEXT`,
+    `ALTER TABLE order_events ADD COLUMN channel TEXT`,
+    `ALTER TABLE order_events ADD COLUMN idempotency_key TEXT`,
+    `ALTER TABLE trust_events ADD COLUMN completion_source TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  } catch { /* best-effort — the lookup before the transition still works */ }
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.

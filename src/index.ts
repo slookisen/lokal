@@ -2390,10 +2390,10 @@ if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
     try {
       const { processOrderFollowups } = await import("./services/order-followups");
       const r = await processOrderFollowups();
-      if (r.retried || r.reminders_sent || r.cancelled || r.errors) {
+      if (r.retried || r.reminders_sent || r.cancelled || r.auto_completed || r.errors) {
         console.log(
           `[order-followups] tick examined=${r.examined} retried=${r.retried} reminders=${r.reminders_sent} ` +
-          `cancelled=${r.cancelled} errors=${r.errors}`
+          `cancelled=${r.cancelled} auto_completed=${r.auto_completed} errors=${r.errors}`
         );
       }
     } catch (err) {
