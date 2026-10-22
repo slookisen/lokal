@@ -227,7 +227,7 @@ export async function runOrderBestillingerSkive4Tests(opts: { log?: boolean } = 
     const AUTH = { "X-Admin-Key": ADMIN_KEY };
     const PATH = "/admin/products/producer-list";
     const productsOf = (agent: string) => db.prepare("SELECT * FROM products WHERE agent_id = ? ORDER BY name").all(agent) as any[];
-    const goodList = [{ name: "Gårdsegg", price_nok: 60, unit: "brett" }];
+    const goodList = [{ name: "Gårdsegg", price_nok: 60, unit: "brett", allergens: ["egg"] }];
 
     const noKey = await req("POST", PATH, { body: { agent_id: "ag-plain", products: goodList } });
     assertEq(noKey.status, 401, "s4-30: no X-Admin-Key -> 401");
@@ -268,7 +268,7 @@ export async function runOrderBestillingerSkive4Tests(opts: { log?: boolean } = 
 
     // 200: a plain good and a packaged food.
     const packagedList = [
-      { name: "Gårdsegg", price_nok: 60, unit: "brett", description: "Frittgående høner" },
+      { name: "Gårdsegg", price_nok: 60, unit: "brett", description: "Frittgående høner", allergens: ["egg"] },
       { name: "Jordbærsyltetøy", price_nok: 85, unit: "glass", packaged: true, ingredients: "Jordbær 60 %, sukker, gelésukker", allergens: [], net_weight: "250 g" },
       { name: "Havrekjeks", price_nok: 45, unit: "pk", packaged: true, ingredients: "Havre, hvete, smør, salt", allergens: ["Gluten", "melk", "gluten"], net_weight: "1,5 kg" },
     ];
@@ -286,11 +286,11 @@ export async function runOrderBestillingerSkive4Tests(opts: { log?: boolean } = 
       assertEq(rows.find((r) => r.name === "Gårdsegg").ingredients, null, "s4-46: a non-packaged row has no food info");
     }
     // Idempotent per name: same name again updates, never duplicates.
-    const again = await req("POST", PATH, { headers: AUTH, body: { agent_id: "ag-plain", products: [{ name: "gårdsegg", price_nok: 65 }] } });
+    const again = await req("POST", PATH, { headers: AUTH, body: { agent_id: "ag-plain", products: [{ name: "gårdsegg", price_nok: 65, allergens: ["egg"] }] } });
     assertTrue(again.status === 200 && again.body.inserted === 0 && again.body.updated === 1, "s4-47: the same name again updates (no duplicate)");
     assertEq(productsOf("ag-plain").filter((r) => r.name_norm === "gårdsegg").length, 1, "s4-48: still one row for the name");
     // A scraped row the admin confirms is converted (source + price).
-    const conv = await req("POST", PATH, { headers: AUTH, body: { agent_id: "ag-plain", products: [{ name: "Vanlig honning", price_nok: 110 }] } });
+    const conv = await req("POST", PATH, { headers: AUTH, body: { agent_id: "ag-plain", products: [{ name: "Vanlig honning", price_nok: 110, allergens: [] }] } });
     assertTrue(conv.status === 200 && conv.body.updated === 1, "s4-49: confirming a scraped row updates it");
     assertEq((db.prepare("SELECT availability_source AS s, price_nok AS p FROM products WHERE id = 'p-plain'").get() as any), { s: "admin_producer_confirmed", p: 110 }, "s4-50: …to admin_producer_confirmed with the confirmed price");
 
@@ -336,7 +336,7 @@ export async function runOrderBestillingerSkive4Tests(opts: { log?: boolean } = 
       assertEq(sItem?.unit_price_snapshot, 85, "s4-72: …and the price");
       assertEq(sItem?.producer_confirmed, true, "s4-73: …and that it is producer-confirmed");
       assertEq(items.find((i) => i.product_name === "Havrekjeks")?.food_info?.allergens, ["gluten", "melk"], "s4-74: declared allergens are listed");
-      assertEq(items.find((i) => i.product_id === egg.id)?.food_info, null, "s4-75: a non-packaged row has food_info null");
+      assertEq(items.find((i) => i.product_id === egg.id)?.food_info, { ingredients: null, allergens: ["egg"], net_weight: null }, "s4-75: a non-packaged row carries its allergens only (skive 4b: allergens are required for all food)");
 
       // MCP: the same service result, with no tool-definition change.
       const mcp = require("./mcp") as typeof import("./mcp");

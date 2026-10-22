@@ -367,6 +367,10 @@ export function isProducerStatedSource(source: string | null | undefined): boole
 export const NOT_PRODUCER_CONFIRMED_ERROR =
   "not_producer_confirmed: denne varen er hentet fra produsentens nettside og er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte. / This item was taken from the producer's website and is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly.";
 
+/** Skive 4b (S11): 409 at submit when a real-order line's price has changed since it was added. */
+export const PRICE_CHANGED_ERROR =
+  "price_changed: prisen på en vare i handlekurven er endret siden den ble lagt til. Fjern varen og legg den til på nytt for å se gjeldende pris. / The price of an item in the cart has changed since it was added. Remove the item and add it again to see the current price.";
+
 function unconfirmedItemError(
   db: any,
   row: { agent_id: string; availability_source: string | null },
@@ -944,6 +948,8 @@ export type SubmitResult =
       banned_items?: Array<{ product_id: string; product_name: string; kind: BannedItemKind | "check_failed" }>;
       /** Skive 4: scraped lines of a producer who would get a real order (422 NOT_PRODUCER_CONFIRMED_ERROR). */
       unconfirmed_items?: Array<{ product_id: string; product_name: string }>;
+      /** Skive 4b (S11): lines whose price changed since they were added (409 PRICE_CHANGED_ERROR). */
+      price_changed_items?: Array<{ product_id: string; product_name: string }>;
     };
 
 const HANDOFF_BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -1210,6 +1216,25 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
       status: 422,
       error: NOT_PRODUCER_CONFIRMED_ERROR,
       unconfirmed_items: unconfirmedLines.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
+    };
+  }
+
+  // Skive 4b (S11): the price in a real order comes from unit_price_snapshot,
+  // taken when the line was added. If the product's price has changed since
+  // (the admin confirmed the item with a new price after a scraped row was
+  // added, or the producer changed it), the snapshot is stale and may be a
+  // scraped price: refuse, no order and no e-mail. The buyer adds the item
+  // again, which takes a fresh snapshot. Only lines of producers who would get
+  // a real order are checked; contact handoffs carry no price.
+  const staleLines = items.filter(
+    (i) => eligibleAgentIds.has(i.agent_id) && (i.unit_price_snapshot ?? null) !== (i.price_nok ?? null),
+  );
+  if (staleLines.length > 0) {
+    return {
+      success: false,
+      status: 409,
+      error: PRICE_CHANGED_ERROR,
+      price_changed_items: staleLines.map((i) => ({ product_id: i.product_id, product_name: i.product_name })),
     };
   }
 

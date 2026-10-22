@@ -106,8 +106,9 @@ adminCatalogRouter.post("/backfill", (req: Request, res: Response) => {
 // Body: { agent_id, products: [{ name, price_nok, unit?, description?,
 //   category?, availability? ('in_stock' default | 'out_of_stock'),
 //   packaged?: boolean, ingredients?, allergens?: string[], net_weight? }] }
-// packaged:true requires ingredients, allergens (an array; [] = the producer
-// states none) and net_weight ('250 g', '1,5 kg', '33 cl'). The whole request
+// allergens (an array; [] = the producer states none) is required for every
+// product (skive 4b). packaged:true also requires ingredients and net_weight
+// ('250 g', '1,5 kg', '33 cl'). The whole request
 // is validated first and written in one transaction: any error = nothing written.
 // Idempotent per (agent_id, name): sending a name again updates that row.
 // Never deletes rows. Producer-set availability on a row is replaced (the admin
@@ -195,9 +196,12 @@ export function validateProducerList(raw: unknown): { ok: true; products: Valida
     }
     const netWeight = optText(o.net_weight, 20, "net_weight", errs);
     if (netWeight !== null && !NET_WEIGHT_RE.test(netWeight)) errs.push("net_weight må være et tall med enhet, f.eks. '250 g' eller '1,5 kg'");
+    // Skive 4b (S3, Daniel's choice): allergens are required for ALL food on the list, not only
+    // pre-packaged food ([] = the producer states none). Ingredients and net weight stay
+    // required for pre-packaged food only.
+    if (allergens === null) errs.push("allergens er påkrevd for all mat (tom liste = ingen allergener oppgitt av produsenten)");
     if (packaged) {
       if (!ingredients) errs.push("ingredients er påkrevd for ferdigpakket mat");
-      if (allergens === null) errs.push("allergens er påkrevd for ferdigpakket mat (tom liste = ingen allergener oppgitt)");
       if (!netWeight) errs.push("net_weight er påkrevd for ferdigpakket mat");
     }
     if (name) {
