@@ -912,7 +912,7 @@ export async function runPaymentFlowTests(opts: { log?: boolean } = {}): Promise
     ok(svc.canProducerTakePrepayment(db, "ag-pay"), "F17-21f: current terms accepted again → prepayment back");
     const payAtPickupReceipt = receiptSvc.renderBuyerReceipt("confirmed", { orderRef: "abcd1234", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "https://rfb.test/produsent/gard" }, traderStatus: null, items: [{ name: "Egg", qty: 1, line_total: 60 }], totalNok: 60, cancelReason: null, payment: null });
     ok(!!payAtPickupReceipt && payAtPickupReceipt.text.includes("Du betaler Gård ved henting"), "F17-22: pay-at-pickup receipt says so");
-    eq(receiptSvc.renderBuyerReceipt("cancelled", { orderRef: "x", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "u" }, traderStatus: null, items: [], totalNok: null, cancelReason: "no_show", payment: null }), null, "F17-23: no receipt for a no-show");
+    eq(receiptSvc.renderBuyerReceipt("cancelled", { orderRef: "x", producerName: "Gård", contact: { phone: null, email: null, address: null, profile_url: "u" }, traderStatus: null, items: [], totalNok: null, cancelReason: "no_show", payment: null })?.subject, "Bestillingen er registrert som ikke hentet (x)", "F17-23: Fase A1 (AC2) — a no-show gets a receipt");
 
     // F5 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
     // an order that is NOT a prepay order has no money to refund, so the

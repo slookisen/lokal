@@ -406,6 +406,8 @@ class TrustScoreService {
     // the attribution note at WEIGHTS). With zero completed events this
     // returns exactly `base`, i.e. the pre-ledger value — existing scores
     // don't move while the ledger is empty.
+    // Fase A1: `completed` excludes automatic closes (completedAuto) — an
+    // order closed by the clock is not a confirmed transaction and does not score.
     const events = getTrustEventCounts(agentId);
     if (events.completed === 0) return base;
 
@@ -482,6 +484,8 @@ class TrustScoreService {
     // Transaction trust-ledger (pilot-ordre-loop): surface real outcomes too.
     const events = getTrustEventCounts(agentId);
     if (events.completed) parts.push(`${events.completed} fullført${events.completed === 1 ? "" : "e"} hentinger`);
+    // Fase A1: orders closed automatically are shown apart — nobody confirmed the pickup.
+    if (events.completedAuto) parts.push(`${events.completedAuto} lukket automatisk (henting ikke bekreftet)`);
     if (events.noShows) parts.push(`${events.noShows} ikke hentet`);
 
     return parts.length > 0 ? parts.join(", ") : "Ingen interaksjoner ennå";

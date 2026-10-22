@@ -29,16 +29,29 @@
  * deadline, a first send that only now succeeds (step 1) must not be followed
  * in the same run by a «not answered» cancellation (review round 2 of skive 1b).
  *
+ *   4. Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-
+ *      kjoperagent): a `confirmed` (or legacy `ready`) order is closed as
+ *      `completed` with completion_source 'auto' at pickup_time +
+ *      ORDER_AUTOCOMPLETE_GRACE_HOURS (24), or without a pickup time at the
+ *      confirmation + ORDER_AUTOCOMPLETE_DEFAULT_DAYS (3). Only with
+ *      ORDER_AUTOCOMPLETE_ENABLED=1 (default off), never while
+ *      RFB_DISABLE_ORDER_FOLLOWUPS=1. Applies to prepay orders too, and moves
+ *      no money for them (no payment step at all).
+ *
+ * Every transition goes through the shared action layer (order-actions.ts,
+ * actor role «system», channel «system_job»).
+ *
  * Prepay orders have their own deadline job (payment-service, payment_expired)
- * and are left alone. Idempotent: every step claims its row with a guarded
+ * and are left alone by steps 1–3. Idempotent: every step claims its row with a guarded
  * UPDATE first, so two overlapping runs (or two instances) do each step once.
  * `now` is injectable so the tests use a fake clock.
  */
 
 import { getDb } from "../database/init";
-import { transitionOrder, buildOrderNotificationInput } from "./cart-service";
+import { buildOrderNotificationInput } from "./cart-service";
 import { sendOrderNotificationForOrder, sendAdminOrderAlert } from "./order-notify-service";
-import { sendBuyerOrderReceipt } from "./order-receipt-service";
+import { applyOrderAction } from "./order-actions";
+import { autoCompleteDueMs, isOrderAutocompleteEnabled } from "./order-lifecycle";
 
 let _followupTestDb: any = null;
 export function __setOrderFollowupsTestDb(db: any): void { _followupTestDb = db; }
@@ -55,6 +68,8 @@ export interface OrderFollowupsResult {
   retried: number;
   reminders_sent: number;
   cancelled: number;
+  /** Fase A1: orders closed automatically (completion_source 'auto'). */
+  auto_completed: number;
   errors: number;
 }
 
@@ -74,7 +89,7 @@ export async function processOrderFollowups(
   const db = opts.db ?? _followupTestDb ?? getDb();
   const reminderMs = orderReminderHours(env) * 3600_000;
   const cancelMs = orderAutocancelHours(env) * 3600_000;
-  const out: OrderFollowupsResult = { examined: 0, retried: 0, reminders_sent: 0, cancelled: 0, errors: 0 };
+  const out: OrderFollowupsResult = { examined: 0, retried: 0, reminders_sent: 0, cancelled: 0, auto_completed: 0, errors: 0 };
   const stamp = sqliteStamp(now);
 
   // 1. one re-send of a producer e-mail that failed
@@ -113,11 +128,15 @@ export async function processOrderFollowups(
       const ageMs = now.getTime() - startMs;
       if (!Number.isFinite(ageMs)) continue;
       if (ageMs >= cancelMs) {
-        const res = transitionOrder(o.id, "cancelled", { actor: "system", cancelReason: "producer_no_response" });
-        if (res.success) {
+        // The action layer sends the buyer's cancellation receipt itself.
+        const res = await applyOrderAction(
+          o.id, "producer_no_response",
+          { role: "system", channel: "system_job", ref: "order-followups" },
+          { idempotencyKey: `followups:producer_no_response:${o.id}`, now, env },
+        );
+        if (res.success && !res.replayed) {
           out.cancelled++;
           console.log(`[order-followups] cancelled order=${o.id} reason=producer_no_response`);
-          void sendBuyerOrderReceipt(o.id, "cancelled").catch(() => { /* never fails the job */ });
         }
         continue;
       }
@@ -143,6 +162,38 @@ export async function processOrderFollowups(
     } catch (err) {
       out.errors++;
       console.error(`[order-followups] step failed order=${o.id}:`, err);
+    }
+  }
+
+  // 4. Fase A1: automatic close of confirmed orders after the pickup.
+  // Off unless ORDER_AUTOCOMPLETE_ENABLED=1; also off while the whole job is
+  // stopped (RFB_DISABLE_ORDER_FOLLOWUPS=1 — checked here as well, so a manual
+  // run can never close orders while Daniel has the job stopped).
+  if (isOrderAutocompleteEnabled(env) && env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
+    const open = db.prepare(`
+      SELECT o.id, o.pickup_time,
+             COALESCE((SELECT MIN(e.created_at) FROM order_events e WHERE e.order_id = o.id AND e.to_status = 'confirmed'),
+                      o.updated_at) AS confirmed_at
+      FROM orders o
+      WHERE o.status IN ('confirmed', 'ready')
+    `).all() as Array<{ id: string; pickup_time: string | null; confirmed_at: string | null }>;
+    for (const o of open) {
+      try {
+        const due = autoCompleteDueMs(o, env);
+        if (due === null || now.getTime() < due) continue;
+        const res = await applyOrderAction(
+          o.id, "auto_complete",
+          { role: "system", channel: "system_job", ref: "order-followups" },
+          { idempotencyKey: `followups:auto_complete:${o.id}`, now, env },
+        );
+        if (res.success && !res.replayed) {
+          out.auto_completed++;
+          console.log(`[order-followups] auto-completed order=${o.id}`);
+        }
+      } catch (err) {
+        out.errors++;
+        console.error(`[order-followups] auto-complete failed order=${o.id}:`, err);
+      }
     }
   }
   return out;

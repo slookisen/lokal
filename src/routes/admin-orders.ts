@@ -168,7 +168,8 @@ router.get("/inbox", (req: Request, res: Response) => {
 //   opt_in           : producers with order_notifications_opt_in = 1
 //   passes_gate      : of those, who pass cart-service.isEligibleForRealOrder()
 //   verified_count   : owner-verified producers (the pool the pilot draws from)
-//   orders_30d       : orders created in the last 30 days, per status
+//   orders_30d       : orders created in the last 30 days, per status; completed
+//                      split into completed_auto / completed_confirmed (Fase A1)
 //   unanswered       : pay-at-pickup orders still pending after ORDER_REMINDER_HOURS (24)
 router.get("/pilot-status", (req: Request, res: Response) => {
   if (!requirePilotAdmin(req, res)) return;
@@ -185,6 +186,12 @@ router.get("/pilot-status", (req: Request, res: Response) => {
       "SELECT status, COUNT(*) AS n FROM orders WHERE created_at >= datetime('now', '-30 days') GROUP BY status"
     ).all() as Array<{ status: string; n: number }>;
     for (const r of rows) byStatus[r.status] = r.n;
+    // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+    // completed orders split by who closed them; 'auto' = closed by the
+    // follow-ups job (henting ikke bekreftet), shown apart from confirmed ones.
+    const completedAuto = (db.prepare(
+      "SELECT COUNT(*) AS n FROM orders WHERE status = 'completed' AND completion_source = 'auto' AND created_at >= datetime('now', '-30 days')"
+    ).get() as { n: number }).n;
 
     const hours = orderReminderHours();
     const unanswered = db.prepare(
@@ -200,7 +207,11 @@ router.get("/pilot-status", (req: Request, res: Response) => {
       opt_in: { count: optIn.length, producers: optIn },
       passes_gate: { count: passes.length, producers: passes },
       verified_count: verified.n,
-      orders_30d: { window_days: 30, by_status: byStatus, total: Object.values(byStatus).reduce((a, b) => a + b, 0) },
+      orders_30d: {
+        window_days: 30, by_status: byStatus, total: Object.values(byStatus).reduce((a, b) => a + b, 0),
+        completed_auto: completedAuto,
+        completed_confirmed: Math.max(0, (byStatus.completed ?? 0) - completedAuto),
+      },
       unanswered: { over_hours: hours, count: unanswered.length, orders: unanswered },
     });
   } catch (err) {
