@@ -6,8 +6,9 @@
  *
  *   S1   findOffers: a scraped row never hides the confirmed item of a producer who passes the gate
  *   S2   /handleliste: a scraped row of such a producer becomes a contact choice (no generic failure)
- *   S3   POST /admin/products/producer-list: allergens required for ALL food
- *   S4/5 the wording the owner approved (pinned; no change in 4b)
+ *   S3   POST /admin/products/producer-list: allergens required for ALL food (4c: omitted/null on non-packaged -> [] + allergens_defaulted)
+ *   S4/5 the buyer-facing wording (pinned; 4c: the refusal text carries no source claim)
+ *   4c   F1 price increase -> 409; F2 /handleliste shows the server text on 409 price_changed; F3 producer_confirmed on every offer of a producer who takes orders
  *   S9   a portal availability change keeps admin_producer_confirmed; the sync keeps price + category
  *   S11  a stale unit_price_snapshot cannot go into a real order
  *   T1   viewCart().producer_confirmed is true only for producer-stated lines
@@ -165,7 +166,7 @@ export async function runOrderBestillingerSkive4bTests(opts: { log?: boolean } =
       addProd("p-s2-scraped", "ag-s2", "Skrapte gulrøtter", 22, "enrichment");
       // Offer objects as the page holds them; producer_confirmed is absent here (no food information on the row).
       const offerOf = (productId: string) => ({ product_id: productId, producer: { agent_id: "ag-s2", name: "S2 Gård", can_order: true, vcard_url: null } });
-      const EXPL_NO = "denne varen er hentet fra produsentens nettside og er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte.";
+      const EXPL_NO = "Denne varen er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte.";
       const runSubmit = async (offer: any, lang: "no" | "en"): Promise<{ result: any; msgs: string[] }> => {
         const state = { items: [{ term: "gulrøtter", qty: 1 }], offers: [[offer]], picks: [0], hasOrders: true };
         const msgs: string[] = [];
@@ -224,7 +225,7 @@ export async function runOrderBestillingerSkive4bTests(opts: { log?: boolean } =
       await settle();
       assertEq(sent.length, 0, "s2-17: no e-mail to the producer");
       const runEn = await runSubmit(offerOf("p-s2-scraped"), "en");
-      assertEq(runEn.result?.notes, ["This item was taken from the producer's website and is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly."], "s2-18: the English page gets the English part");
+      assertEq(runEn.result?.notes, ["This item is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly."], "s2-18: the English page gets the English part");
       // A confirmed row is still ordered normally through the same page code.
       addProd("p-s2-admin", "ag-s2", "Bekreftede gulrøtter", 25, "admin_producer_confirmed");
       const runOk = await runSubmit(offerOf("p-s2-admin"), "no");
@@ -270,15 +271,30 @@ export async function runOrderBestillingerSkive4bTests(opts: { log?: boolean } =
       addAgent("ag-s3", "S3 Gård", false);
       const PATH = "/admin/products/producer-list";
       const count = () => (db.prepare("SELECT COUNT(*) AS n FROM products WHERE agent_id = 'ag-s3'").get() as any).n as number;
-      const noAll = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Poteter", price_nok: 30 }] });
-      assertEq(noAll.status, 400, "s3-01: a NON-packaged product without allergens is refused (400)");
-      assertTrue(Array.isArray(noAll.body?.errors) && noAll.body.errors.some((e: string) => e.startsWith("products[0]") && e.includes("allergens")), "s3-02: …and the error names the product and allergens");
-      assertEq(count(), 0, "s3-03: nothing was written");
-      const mixed = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Gulrøtter", price_nok: 25, allergens: [] }, { name: "Egg", price_nok: 60 }] });
-      assertEq([mixed.status, count()], [400, 0], "s3-04: one product without allergens refuses the whole list");
-      const okEmpty = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Poteter", price_nok: 30, allergens: [] }] });
+      const allergensOf = (norm: string) => (db.prepare("SELECT allergens FROM products WHERE agent_id = 'ag-s3' AND name_norm = ?").get(norm) as any)?.allergens;
+      // 4c (Daniel, 2026-10-22T17:07Z): omitted or null allergens on non-packaged food default to [] and are reported.
+      const omitted = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Poteter", price_nok: 30 }] });
+      assertEq(omitted.status, 200, "s3-01: a NON-packaged product with allergens omitted is accepted (4c)");
+      assertEq(allergensOf("poteter"), "[]", "s3-02: …and stored as []");
+      assertEq(omitted.body?.allergens_defaulted, ["Poteter"], "s3-03: …and listed in allergens_defaulted");
+      const nulled = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Nepe", price_nok: 20, allergens: null }] });
+      assertTrue(nulled.status === 200 && allergensOf("nepe") === "[]" && JSON.stringify(nulled.body?.allergens_defaulted) === JSON.stringify(["Nepe"]), "s3-03b: allergens: null -> [] and listed in allergens_defaulted");
+      const mixed = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Gulrøtter", price_nok: 25, allergens: [] }, { name: "Egg", price_nok: 60 }, { name: "Kålrot", price_nok: 18, allergens: ["Selleri"] }] });
+      assertEq(mixed.status, 200, "s3-04: a mixed list is accepted");
+      assertEq(mixed.body?.allergens_defaulted, ["Egg"], "s3-04b: only the product that got the default is listed (explicit [] and explicit list are not)");
+      assertEq(allergensOf("kålrot"), '["selleri"]', "s3-04c: an explicit list is kept as stated");
+      const noPk = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Syltetøy 2", price_nok: 80, packaged: true, ingredients: "Bær, sukker", net_weight: "250 g" }] });
+      assertEq(noPk.status, 400, "s3-04d: packaged:true without allergens is refused (400)");
+      assertTrue(Array.isArray(noPk.body?.errors) && noPk.body.errors.some((e: string) => e.startsWith("products[0]") && e.includes("allergens")), "s3-04e: …and the error names the product and allergens");
+      const noPkNull = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Syltetøy 3", price_nok: 80, packaged: true, allergens: null, ingredients: "Bær", net_weight: "250 g" }] });
+      assertEq(noPkNull.status, 400, "s3-04f: packaged:true with allergens null is refused (400)");
+      const countBefore = count();
+      const badPack = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Ny vare", price_nok: 10 }, { name: "Syltetøy 4", price_nok: 80, packaged: true }] });
+      assertEq([badPack.status, count()], [400, countBefore], "s3-04g: one invalid packaged product refuses the whole list (nothing written)");
+      const okEmpty = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Kepaløk", price_nok: 30, allergens: [] }] });
       assertTrue(okEmpty.status === 200 && okEmpty.body?.inserted === 1, "s3-05: [] (the producer states none) is accepted for non-packaged food");
-      assertEq((db.prepare("SELECT allergens FROM products WHERE agent_id = 'ag-s3' AND name_norm = 'poteter'").get() as any)?.allergens, "[]", "s3-06: …and stored as []");
+      assertEq(okEmpty.body?.allergens_defaulted, [], "s3-05b: an explicit [] is not reported as defaulted");
+      assertEq((db.prepare("SELECT allergens FROM products WHERE agent_id = 'ag-s3' AND name_norm = 'kepaløk'").get() as any)?.allergens, "[]", "s3-06: …and stored as []");
       const okSome = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Rugbrød", price_nok: 55, allergens: ["Gluten"] }] });
       assertEq(okSome.status, 200, "s3-07: a listed allergen is accepted");
       const pk = await req("POST", PATH, { agent_id: "ag-s3", products: [{ name: "Syltetøy", price_nok: 80, packaged: true, allergens: [], net_weight: "250 g" }] });
@@ -286,14 +302,16 @@ export async function runOrderBestillingerSkive4bTests(opts: { log?: boolean } =
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // S4 / S5 — the approved wording (pinned; 4b changes nothing here)
+    // S4 / S5 — the buyer-facing wording (pinned; 4c: no claim about where the item came from)
     // ════════════════════════════════════════════════════════════════════════
     {
       const page = require("./handleliste-page") as typeof import("./handleliste-page");
       const html = (lang: "no" | "en") => page.buildHandelistePage(lang).content;
       assertTrue(html("no").includes("ingen oppgitt av produsenten"), "s45-01: NO page copy says «ingen oppgitt av produsenten»");
       assertTrue(html("en").includes("none stated by the producer"), "s45-02: EN page copy says «none stated by the producer»");
-      assertTrue(cartSvc.NOT_PRODUCER_CONFIRMED_ERROR.includes("hentet fra produsentens nettside"), "s45-03: the refusal text says «hentet fra produsentens nettside»");
+      assertTrue(cartSvc.NOT_PRODUCER_CONFIRMED_ERROR.includes("Denne varen er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte."), "s45-03: the NO refusal text is the 4c wording");
+      assertTrue(cartSvc.NOT_PRODUCER_CONFIRMED_ERROR.includes("This item is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly."), "s45-04: the EN refusal text is the 4c wording");
+      assertTrue(!/nettside|website/i.test(cartSvc.NOT_PRODUCER_CONFIRMED_ERROR), "s45-05: the refusal text makes no claim about the source of the item");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -379,6 +397,26 @@ export async function runOrderBestillingerSkive4bTests(opts: { log?: boolean } =
       const ok = cartSvc.submitCart(cart.cart_id, BUYER);
       assertTrue(ok.success === true && ok.orders.length === 1, "s11-07: with a current snapshot the cart becomes a real order");
       assertEq(ok.success ? ok.orders[0]!.total_nok : null, 40, "s11-08: …at the confirmed price (2 x 20)");
+      // F1 (4c): a price INCREASE since the snapshot is refused too (not only a drop).
+      addProd("p-s11up", "ag-s11", "Prisøkning-vare", 50, "admin_producer_confirmed");
+      const cartUp = cartSvc.createCart();
+      db.prepare("INSERT INTO cart_items (id, cart_id, product_id, agent_id, qty, unit_price_snapshot) VALUES ('ci-s11up', ?, 'p-s11up', 'ag-s11', 1, 40)").run(cartUp.cart_id);
+      const beforeUp = ordersCount();
+      sent.length = 0;
+      const subUp = cartSvc.submitCart(cartUp.cart_id, BUYER);
+      assertTrue(!subUp.success && subUp.status === 409 && subUp.error.startsWith("price_changed"), "s11-10: the price rose from 40 to 50 after the line was added -> 409 price_changed");
+      assertEq(!subUp.success ? subUp.price_changed_items?.map((i) => i.product_name) : null, ["Prisøkning-vare"], "s11-11: the refusal names the line");
+      assertEq(ordersCount(), beforeUp, "s11-12: no order row after a price increase");
+      await settle();
+      assertEq(sent.length, 0, "s11-13: no e-mail after a price increase");
+      // A drop is still refused (unchanged), and an unchanged price passes.
+      db.prepare("UPDATE products SET price_nok = 30 WHERE id = 'p-s11up'").run();
+      const subDown = cartSvc.submitCart(cartUp.cart_id, BUYER);
+      assertTrue(!subDown.success && subDown.status === 409, "s11-14: a price drop (40 -> 30) is refused too");
+      db.prepare("UPDATE products SET price_nok = 40 WHERE id = 'p-s11up'").run();
+      const subSame = cartSvc.submitCart(cartUp.cart_id, BUYER);
+      assertTrue(subSame.success === true && subSame.orders.length === 1, "s11-15: with the price back at the snapshot the cart becomes a real order");
+
       // A producer who does not pass the gate: a stale snapshot is irrelevant (contact handoff, no price).
       addAgent("ag-s11c", "S11c Gård", false);
       addProd("p-s11c", "ag-s11c", "Kontaktvare", 10, "enrichment");
@@ -386,6 +424,60 @@ export async function runOrderBestillingerSkive4bTests(opts: { log?: boolean } =
       db.prepare("INSERT INTO cart_items (id, cart_id, product_id, agent_id, qty, unit_price_snapshot) VALUES ('ci-s11c', ?, 'p-s11c', 'ag-s11c', 1, 77)").run(cart2.cart_id);
       const sub2 = cartSvc.submitCart(cart2.cart_id);
       assertTrue(sub2.success === true && sub2.orders.length === 0 && sub2.contact_handoffs.length === 1, "s11-09: a producer who does not pass the gate is unchanged (handoff)");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // F2 — /handleliste shows the server's text on 409 price_changed
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      const page = require("./handleliste-page") as typeof import("./handleliste-page");
+      const script = page.HANDELISTE_CLIENT_SCRIPT;
+      const grab = (name: string): string => {
+        const m = script.match(new RegExp(`  function ${name}\\([^)]*\\)\\{[\\s\\S]*?\\n  \\}\\n`));
+        return m ? m[0] : "";
+      };
+      const errSrc = grab("errText"), reasonSrc = grab("serverReason"), msgSrc = grab("msg");
+      assertTrue(errSrc.length > 0 && reasonSrc.length > 0 && msgSrc.length > 0, "f2-00: the page functions were found");
+      const errText = (lang: string) => new Function("C", `${reasonSrc}\n${errSrc}\nreturn errText;`)({ __lang: lang, error_rate: "RATE", error_conflict: "CONFLICT", error_generic: "GENERIC" }) as (r: any) => string;
+      const body409 = { success: false, error: cartSvc.PRICE_CHANGED_ERROR };
+      assertEq(errText("no")({ status: 409, body: body409 }), cartSvc.PRICE_CHANGED_ERROR.slice("price_changed: ".length).split(" / ")[0], "f2-01: NO page shows the server's Norwegian price_changed text");
+      assertEq(errText("en")({ status: 409, body: body409 }), cartSvc.PRICE_CHANGED_ERROR.split(" / ")[1], "f2-02: EN page shows the server's English price_changed text");
+      assertEq(errText("no")({ status: 409, body: { error: "something_else: x / y" } }), "CONFLICT", "f2-03: any other 409 keeps the conflict text");
+      assertEq(errText("no")({ status: 409, body: {} }), "CONFLICT", "f2-04: a 409 without a body keeps the conflict text");
+      assertEq(errText("no")({ status: 500, body: {} }), "GENERIC", "f2-05: other failures stay generic");
+      assertEq(errText("no")({ status: 429, body: {} }), "RATE", "f2-06: 429 unchanged");
+      assertTrue(/\.textContent\s*=\s*text/.test(msgSrc) && !/innerHTML/.test(msgSrc), "f2-07: the message is set via textContent");
+      // The real submit() against the real cart service: a stale snapshot -> the server's 409 text reaches the message line.
+      addAgent("ag-f2", "F2 Gård", true);
+      addProd("p-f2", "ag-f2", "F2-vare", 20, "admin_producer_confirmed");
+      const cartF2 = cartSvc.createCart();
+      db.prepare("INSERT INTO cart_items (id, cart_id, product_id, agent_id, qty, unit_price_snapshot) VALUES ('ci-f2', ?, 'p-f2', 'ag-f2', 1, 10)").run(cartF2.cart_id);
+      const subF2 = cartSvc.submitCart(cartF2.cart_id, BUYER);
+      assertTrue(!subF2.success && subF2.status === 409, "f2-08: setup: the real submit is refused with 409");
+      if (!subF2.success) assertEq(errText("no")({ status: 409, body: { success: false, error: subF2.error } }).startsWith("prisen på en vare"), true, "f2-09: the real 409 text is what the page shows");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // F3 — producer_confirmed on every offer of a producer who takes orders
+    // ════════════════════════════════════════════════════════════════════════
+    {
+      const { findOffers } = require("../services/catalog-offers") as typeof import("../services/catalog-offers");
+      addAgent("ag-f3", "F3 Gård", true);
+      addProd("p-f3-scr", "ag-f3", "Skrapte rødbeter", 25, "enrichment", { category: "vegetables" });
+      const res = await findOffers({ q: "rødbeter", lat: LAT, lng: LNG, radiusKm: 50, limit: 5 }, { db });
+      const o = res.offers.find((x) => x.producer.agent_id === "ag-f3");
+      assertTrue(!!o && o.producer.can_order === true, "f3-00: setup: an offer from a producer who takes orders");
+      assertEq(o?.producer_confirmed, false, "f3-01: a scraped row without food info carries producer_confirmed:false (contact choice already in step 2)");
+      assertEq(o?.food_info, undefined, "f3-02: …and still no food_info");
+      addAgent("ag-f3b", "F3b Gård", true);
+      addProd("p-f3-adm", "ag-f3b", "Bekreftede rødbeter", 28, "admin_producer_confirmed", { category: "vegetables" });
+      const res2 = await findOffers({ q: "rødbeter", lat: LAT, lng: LNG, radiusKm: 50, limit: 10 }, { db });
+      assertEq(res2.offers.find((x) => x.producer.agent_id === "ag-f3b")?.producer_confirmed, true, "f3-03: a producer-stated row without food info carries producer_confirmed:true");
+      addAgent("ag-f3c", "F3c Gård", false);
+      addProd("p-f3-c", "ag-f3c", "Kontakt-rødbeter", 30, "enrichment", { category: "vegetables" });
+      const res3 = await findOffers({ q: "rødbeter", lat: LAT, lng: LNG, radiusKm: 50, limit: 10 }, { db });
+      const c = res3.offers.find((x) => x.producer.agent_id === "ag-f3c");
+      assertTrue(!!c && c.producer.can_order === false && !("producer_confirmed" in c), "f3-04: a producer who does not take orders keeps the old shape (no producer_confirmed)");
     }
 
     // ════════════════════════════════════════════════════════════════════════

@@ -142,8 +142,8 @@ export interface Offer {
   unit: string | null;
   availability: string;
   /**
-   * Skive 4: present only together with food_info (left out for an item without food information,
-   * so such an answer is what it was): the row was stated by the producer, not scraped.
+   * Skive 4 / 4c: present with food_info, and for every offer of a producer who takes orders
+   * (left out otherwise, so such an answer is what it was): the row was stated by the producer, not scraped.
    */
   producer_confirmed?: boolean;
   /** Skive 4: ingredients / allergens / net weight where stated, shown to the buyer before submit; left out when none is stated. */
@@ -471,14 +471,18 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
 
   const offers: Offer[] = offerRows.map(({ r, dist, availability }) => {
     const food_info = foodInfoOf(r);
+    const producer = producerOf(r, dist);
     return {
       product_id: r.product_id ?? null,
       product_name: r.product_name,
       price_nok: r.price_nok ?? null,
       unit: r.unit ?? null,
       availability,
-      ...(food_info ? { producer_confirmed: isProducerStatedSource(r.availability_source), food_info } : {}),
-      producer: producerOf(r, dist),
+      // Skive 4c (F3): producer_confirmed is sent for every offer of a producer who takes orders (so a scraped
+      // row is a contact choice already in step 2), and for any offer that carries food information.
+      ...(food_info || producer.can_order ? { producer_confirmed: isProducerStatedSource(r.availability_source) } : {}),
+      ...(food_info ? { food_info } : {}),
+      producer,
     };
   });
 

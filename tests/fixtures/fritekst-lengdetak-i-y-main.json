@@ -1,5 +1,5 @@
 {
-  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt»)",
+  "captured_on": "main ad67dba6, before I-Y (dev-request 2026-10-17-integrasjonstest-oppfolging); «dental GET /api/tannlege/agents» captured again for A4-D (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt: the public answer has no field_provenance); «dental GET /sok» captured again for F2-S4 and G3-S4 (A2A dev-requests 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon and 2026-10-16-merkevare-entitet-og-connector-pakker: the shell's PNG icon links and og:image, and the footer's link to /guide-tannlege-ai); «rfb a2a message/send» and «rfb GET /sok» captured again for I-AA (same dev-request: A2A reads a text as lokal_search does, with its place, a place abroad and the parser's product, name and unknown words; /sok reads the unknown words and a place abroad), only the answers that changed; «dental GET /sok» captured again for F2-S1 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column lists DENTAL_DATA_SOURCES and links /proveniens); «dental GET /sok» captured again for F2-S5 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the dental footer links /vilkar); «dental GET /sok» captured again for F2-S9 (dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon: the footer's «Datakilder» column also names the one-time directory import of May 2026); «dental GET /sok» captured again for F1-S4e (A2A dev-request 2026-10-16-finn-tannlege-fasettsider: the akutt checkbox on /sok is labelled «Akutthjelp», not «Akuttvakt») Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders.",
   "how": "b1Answers() in src/routes/fritekst-lengdetak-alle-plattformer.test.ts (--print): per free-text entry and search, the sha256 and length of the answer with ids, timestamps, slug suffixes, origins and the footers' copyright year masked (stable())",
   "answers": {
     "rfb mcp lokal_search": {
@@ -448,8 +448,8 @@
     },
     "rfb mcp lokal_find_offers": {
       "honning": {
-        "sha256": "d03f8400d28dfc599ff4c67b782d74a1935ebe77bd8cd49e01154ceee996241a",
-        "chars": 746
+        "sha256": "a381d7197f0bf60e775aaad94e20888ec72b8584a59e2880afff5d9e6a481a70",
+        "chars": 783
       },
       "kransekake": {
         "sha256": "c8e184ea572cd84b348b1be04aea760db407a9592ec5fbf78bb638ebd0e7ab8a",
@@ -460,34 +460,34 @@
         "chars": 47
       },
       "Lynghonning": {
-        "sha256": "fdef6f9584a47286b851e0392d6e1b65e052c2d6378a6d08e26fd2c744afdd3e",
-        "chars": 750
+        "sha256": "8156b1d04dee119cd50f81f78c16860e2638b940266751c5d295ed4830adde8c",
+        "chars": 787
       },
       "grovbrød": {
-        "sha256": "9371c2d844b8fb52fef89d8fc8695221116fb4d49392caf4a79ed834c139b945",
-        "chars": 743
+        "sha256": "16d98af821a04f7277cc516196079c0343a360bc8a65ae926a39125504d3891f",
+        "chars": 780
       }
     },
     "rfb GET /api/marketplace/catalog/offers": {
       "honning": {
-        "sha256": "7f4f731a14809cba4788c619bef5edd07fff50358774cd0b64f365119487849b",
-        "chars": 968
+        "sha256": "2819028e2a5a97a60c76d350f0ab984840925511ca318fe311735aaa08d416c9",
+        "chars": 1022
       },
       "kransekake": {
-        "sha256": "7003c229bbb4d98a7348178a9091a2e265a6221a4ed8663c74b39d75cfd45c7d",
-        "chars": 1020
+        "sha256": "1cdad477257b896a053e8eadbc30abc225890d28be941f6115fb3bf654ab8216",
+        "chars": 1074
       },
       "egg": {
-        "sha256": "d8a0db4bd3b9d0da09ccca2ddde649bb6e73c58981207cc98c6cafed33083f0a",
-        "chars": 488
+        "sha256": "986df4beb362b9900a7c49ad9a5cbd9b66f3c203ea12cac5aa20c5715766cce8",
+        "chars": 515
       },
       "Lynghonning": {
-        "sha256": "44077dfd941284ef3f46b4486dddc22a6a477c59e0f40e8680395fd6a4d92e5c",
-        "chars": 519
+        "sha256": "beb9a3efe4f233bdec1c6600aa6ada50ba0bb09261c8b672cd7d2eecdffa2d36",
+        "chars": 546
       },
       "grovbrød": {
-        "sha256": "89d7d5c44aa8b915bdcdbaad1ef5a60221c10ece1030f92a48383bc574be0ec3",
-        "chars": 512
+        "sha256": "821e08939daa5fc8a037b375e04c0c01551a08749bc9febf7e35f3bcc852a7ad",
+        "chars": 539
       }
     },
     "oa mcp discover_experiences": {

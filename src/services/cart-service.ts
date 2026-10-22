@@ -365,7 +365,7 @@ export function isProducerStatedSource(source: string | null | undefined): boole
 
 /** The 422 error (NO / EN). The code leads the text, like the other cart refusals. */
 export const NOT_PRODUCER_CONFIRMED_ERROR =
-  "not_producer_confirmed: denne varen er hentet fra produsentens nettside og er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte. / This item was taken from the producer's website and is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly.";
+  "not_producer_confirmed: Denne varen er ikke bekreftet av produsenten, så den kan ikke bestilles her. Ta kontakt med produsenten direkte. / This item is not confirmed by the producer, so it cannot be ordered here. Contact the producer directly.";
 
 /** Skive 4b (S11): 409 at submit when a real-order line's price has changed since it was added. */
 export const PRICE_CHANGED_ERROR =
