@@ -143,6 +143,7 @@ interface ValidatedProducerProduct {
   ingredients: string | null;
   allergens: string | null; // JSON array text or null
   net_weight: string | null;
+  allergens_defaulted: boolean;
 }
 
 function optText(v: unknown, max: number, field: string, errs: string[]): string | null {
@@ -197,9 +198,15 @@ export function validateProducerList(raw: unknown): { ok: true; products: Valida
     const netWeight = optText(o.net_weight, 20, "net_weight", errs);
     if (netWeight !== null && !NET_WEIGHT_RE.test(netWeight)) errs.push("net_weight må være et tall med enhet, f.eks. '250 g' eller '1,5 kg'");
     // Skive 4b (S3, Daniel's choice): allergens are required for ALL food on the list, not only
-    // pre-packaged food ([] = the producer states none). Ingredients and net weight stay
-    // required for pre-packaged food only.
-    if (allergens === null) errs.push("allergens er påkrevd for all mat (tom liste = ingen allergener oppgitt av produsenten)");
+    // pre-packaged food ([] = the producer states none). Skive 4c: Daniel decided 2026-10-22T17:07Z
+    // that for food WITHOUT packaged:true an omitted or null `allergens` defaults to [] (reported in
+    // allergens_defaulted); pre-packaged food must still state allergens from the label.
+    // Ingredients and net weight stay required for pre-packaged food only.
+    let defaulted = false;
+    if (allergens === null) {
+      if (packaged) errs.push("allergens er påkrevd for ferdigpakket mat (fra etiketten; tom liste = ingen allergener)");
+      else { allergens = []; defaulted = true; }
+    }
     if (packaged) {
       if (!ingredients) errs.push("ingredients er påkrevd for ferdigpakket mat");
       if (!netWeight) errs.push("net_weight er påkrevd for ferdigpakket mat");
@@ -215,6 +222,7 @@ export function validateProducerList(raw: unknown): { ok: true; products: Valida
       unit, description, category, availability, ingredients,
       allergens: allergens === null ? null : JSON.stringify(allergens),
       net_weight: netWeight,
+      allergens_defaulted: defaulted,
     });
   });
   return errors.length ? { ok: false, errors } : { ok: true, products: out };
@@ -273,7 +281,9 @@ adminCatalogRouter.post("/producer-list", (req: Request, res: Response) => {
       }
     });
     tx();
-    res.json({ success: true, agent_id: agentId, producer_name: agent.name, inserted, updated, availability_source: "admin_producer_confirmed" });
+    res.json({ success: true, agent_id: agentId, producer_name: agent.name, inserted, updated,
+      allergens_defaulted: v.products.filter((p) => p.allergens_defaulted).map((p) => p.name),
+      availability_source: "admin_producer_confirmed" });
   } catch (err) {
     console.error("[admin/products/producer-list] failed:", err instanceof Error ? err.message : String(err));
     res.status(500).json({ success: false, error: "Intern feil" });

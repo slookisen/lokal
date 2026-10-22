@@ -327,6 +327,11 @@ const CLIENT_SCRIPT = `
   }
   function errText(r){
     if (r && r.status === 429) return C.error_rate;
+    // Skive 4c (F2): a 409 price_changed carries the server's own text (shown via textContent in msg()).
+    if (r && r.status === 409 && r.body && typeof r.body.error === 'string' && r.body.error.indexOf('price_changed') === 0) {
+      var why = serverReason(r.body);
+      if (why) return why;
+    }
     if (r && r.status === 409) return C.error_conflict;
     return C.error_generic;
   }
