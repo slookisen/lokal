@@ -369,6 +369,22 @@ const CLIENT_SCRIPT = `
     return out;
   }
 
+  // Skive 4b (S2): an offer can be ordered here only when its producer takes orders, it names a product,
+  // it is no category match and the server has not said the row is unconfirmed (producer_confirmed === false).
+  // A scraped row of a producer who takes orders is a contact choice, not an order line.
+  function isOrderable(o){
+    var p = o && o.producer || {};
+    return !!p.can_order && !!o.product_id && o.match !== 'category' && o.producer_confirmed !== false;
+  }
+  // Skive 4b (S2): the server's own explanation for a not_producer_confirmed refusal, in the page language.
+  function serverReason(body){
+    var e = body && typeof body.error === 'string' ? body.error : '';
+    var i = e.indexOf(': ');
+    if (i < 0) return '';
+    var parts = e.slice(i + 2).split(' / ');
+    return String(C.__lang === 'en' && parts.length > 1 ? parts[1] : parts[0]);
+  }
+
   function offerNode(i, j, o){
     var p = o.producer || {};
     var id = 'hl-o-' + i + '-' + j;
@@ -376,7 +392,7 @@ const CLIENT_SCRIPT = `
     var lbl = mk('label', { cls: 'hl-offer', 'for': id });
     var head = mk('div', null, [radio, mk('span', { cls: 'hl-name', text: String(p.name || '') })]);
     if (p.verifisert_av_eier) head.appendChild(mk('span', { cls: 'hl-badge', text: C.badge_verified }));
-    var isCat = o.match === 'category', orderable = !!p.can_order && !isCat;
+    var isCat = o.match === 'category', orderable = isOrderable(o);
     head.appendChild(mk('span', { cls: 'hl-badge' + (orderable ? '' : ' warn'), text: orderable ? C.can_order : C.contact_only }));
     lbl.appendChild(head);
     var bits = [];
@@ -453,7 +469,7 @@ const CLIENT_SCRIPT = `
     var ch = chosen();
     if (!ch.length) { msg('hl-msg2', C.pick_one); return; }
     var box = el('hl-summary'); clear(box);
-    var orderable = ch.filter(function(c){ return c.offer.producer && c.offer.producer.can_order && c.offer.product_id; });
+    var orderable = ch.filter(function(c){ return isOrderable(c.offer); });
     var contact = ch.filter(function(c){ return orderable.indexOf(c) < 0; });
     function group(title, list){
       if (!list.length) return;
@@ -478,7 +494,7 @@ const CLIENT_SCRIPT = `
     if (state.hasOrders && (!consent || !(email || phone))) { msg('hl-msg3', C.consent_needed); return; }
     var btn = el('hl-submit'); btn.disabled = true; btn.textContent = C.sending; msg('hl-msg3', '');
     var done = function(text){ btn.disabled = false; btn.textContent = C.submit; msg('hl-msg3', text); };
-    var ch = chosen(), cart = null;
+    var ch = chosen(), cart = null, notes = [];
     api('POST', '/api/marketplace/cart').then(function(r){
       if (r.status !== 201 || !r.body || !r.body.buyer_ref) throw r;
       cart = { cart_id: r.body.cart_id, buyer_ref: r.body.buyer_ref };
@@ -490,10 +506,21 @@ const CLIENT_SCRIPT = `
           return api('POST', '/api/marketplace/cart/' + encodeURIComponent(cart.cart_id) + '/wishes', { term: c.item.term, qty: c.item.qty, buyer_ref: cart.buyer_ref }).then(function(w){
             if (w.status !== 201 || !w.body || !w.body.wish) throw w;
             var p = c.offer.producer || {};
-            var body = (p.can_order && c.offer.product_id) ? { product_id: c.offer.product_id, qty: c.item.qty } : { agent_id: p.agent_id, mode: 'contact' };
+            var body = isOrderable(c.offer) ? { product_id: c.offer.product_id, qty: c.item.qty } : { agent_id: p.agent_id, mode: 'contact' };
             body.buyer_ref = cart.buyer_ref;
-            return api('PATCH', '/api/marketplace/cart/' + encodeURIComponent(cart.cart_id) + '/wishes/' + encodeURIComponent(w.body.wish.id), body).then(function(pr){
-              if (pr.status !== 200) throw pr;
+            var wurl = '/api/marketplace/cart/' + encodeURIComponent(cart.cart_id) + '/wishes/' + encodeURIComponent(w.body.wish.id);
+            return api('PATCH', wurl, body).then(function(pr){
+              if (pr.status === 200) return;
+              // Skive 4b (S2): a scraped row of a producer who takes orders is refused with 422 not_producer_confirmed.
+              // The row becomes a contact choice and the server's explanation is shown, instead of a generic failure.
+              if (pr.status === 422 && pr.body && typeof pr.body.error === 'string' && pr.body.error.indexOf('not_producer_confirmed') === 0 && p.agent_id) {
+                var why = serverReason(pr.body);
+                if (why && notes.indexOf(why) < 0) notes.push(why);
+                return api('PATCH', wurl, { agent_id: p.agent_id, mode: 'contact', buyer_ref: cart.buyer_ref }).then(function(cr){
+                  if (cr.status !== 200) throw cr;
+                });
+              }
+              throw pr;
             });
           });
         });
@@ -508,7 +535,7 @@ const CLIENT_SCRIPT = `
       if (r.status !== 201 || !r.body || r.body.success !== true) throw r;
       var vcards = {};
       ch.forEach(function(c){ var p = c.offer.producer || {}; if (p.agent_id) vcards[p.agent_id] = p.vcard_url || null; });
-      var result = { orders: r.body.orders || [], handoffs: r.body.contact_handoffs || [], vcards: vcards, payments: r.body.payments || [] };
+      var result = { orders: r.body.orders || [], handoffs: r.body.contact_handoffs || [], vcards: vcards, payments: r.body.payments || [], notes: notes };
       lsDel(LS_CART); lsSet(LS_RESULT, result);
       el('hl-name').value = ''; el('hl-email').value = ''; el('hl-phone').value = ''; el('hl-note').value = '';
       btn.disabled = false; btn.textContent = C.submit;
@@ -548,6 +575,7 @@ const CLIENT_SCRIPT = `
         box.appendChild(card);
       });
     }
+    if (Array.isArray(res.notes)) res.notes.forEach(function(t){ if (typeof t === 'string' && t) box.appendChild(mk('div', { cls: 'hl-msg' }, [t])); });
     if (res.handoffs && res.handoffs.length) {
       box.appendChild(mk('h3', { text: C.contact_h2 }));
       box.appendChild(mk('p', { cls: 'hl-hint', text: C.contact_p }));
@@ -632,7 +660,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
   const base = COPY[lang === "en" ? "en" : "no"];
   const c: Copy = isPaymentsEnabled() ? { ...base, ...PREPAY_COPY[lang === "en" ? "en" : "no"] } : base;
   const payHow = isPaymentsEnabled() ? { __pay_how_href: localizedPath(BETALING_PATH, lang) } : {};
-  const copy = { ...c, ...payHow, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL };
+  const copy = { ...c, ...payHow, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">

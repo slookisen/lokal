@@ -271,6 +271,28 @@ function compareOfferRows(a: OfferCandidate, b: OfferCandidate): number {
     || compareLabelRows(a.r, b.r);
 }
 
+/**
+ * Skive 4b (S1): for a producer who passes isEligibleForRealOrder() only the
+ * producer-stated rows (availability_source producer_dashboard or
+ * admin_producer_confirmed) can be ordered, so an in-stock stated row goes
+ * before any other row: a scraped row must not hide the confirmed item (and its
+ * food information) just because its name matches the term better. When no
+ * in-stock stated row is involved, or for a producer who does not pass the
+ * gate (every row is a contact row), compareOfferRows alone decides (unchanged).
+ * The gate is only evaluated when the two rows differ in being an in-stock
+ * stated row; a gate that cannot be evaluated counts as «not eligible».
+ */
+function compareOffersForProducer(a: OfferCandidate, b: OfferCandidate, db: any): number {
+  const aOrderable = isProducerStatedSource(a.r.availability_source) && a.availability === "in_stock";
+  const bOrderable = isProducerStatedSource(b.r.availability_source) && b.availability === "in_stock";
+  if (aOrderable !== bOrderable) {
+    let eligible = false;
+    try { eligible = isEligibleForRealOrder(a.r.agent_id, db); } catch { /* not eligible */ }
+    if (eligible) return Number(bOrderable) - Number(aOrderable);
+  }
+  return compareOfferRows(a, b);
+}
+
 /** Nearest first; equal distances (one centroid, say) by agent id. */
 function byDistance(a: OfferCandidate, b: OfferCandidate): number {
   return a.dist - b.dist || a.r.agent_id.localeCompare(b.r.agent_id);
@@ -398,7 +420,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       if (!prev || compareLabelRows(r, prev.r) < 0) firstLabel.set(r.agent_id, x);
     } else {
       const prev = bestOffer.get(r.agent_id);
-      if (!prev || compareOfferRows(x, prev) < 0) bestOffer.set(r.agent_id, x);
+      if (!prev || compareOffersForProducer(x, prev, db) < 0) bestOffer.set(r.agent_id, x);
     }
   }
   const offerRows = [...bestOffer.values()].sort(byDistance).slice(0, limit);

@@ -37136,6 +37136,37 @@ const _orderSkive4Promise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// fix-up skive 4b: tilbudsvalg, /handleliste-kontaktvalg, allergener for all
+// mat, bekreftet pris/kategori etter portalendring, pris-snapshot, testhull.
+// Own in-memory prod-schema DB; runs strictly after skive 4.
+let _orderSkive4bResolve: () => void = () => {};
+const _orderSkive4bPromise: Promise<void> = new Promise<void>(r => {
+  _orderSkive4bResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 4b (fix-up) ──");
+  try {
+    const { runOrderBestillingerSkive4bTests } = require("../src/routes/order-bestillinger-skive4b.test") as
+      typeof import("../src/routes/order-bestillinger-skive4b.test");
+    const bs4b = await runOrderBestillingerSkive4bTests({ log: false });
+    passed += bs4b.passed;
+    failed += bs4b.failed;
+    for (const f of bs4b.failures) failures.push("bestillinger-skive4b: " + f);
+    console.log(`  bestillinger-skive4b: ${bs4b.passed} passed, ${bs4b.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive4b: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive4bResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
 // no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
 // rotasjon-no-yield-backoff) to the experiences vertical's
@@ -37151,7 +37182,7 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise]);
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise, _orderSkive4bPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");
