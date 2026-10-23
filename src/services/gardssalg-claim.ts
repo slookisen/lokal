@@ -2100,6 +2100,65 @@ export interface UpdateProfileOutcome {
   ok: true;
   updatedFields: string[];
   skippedFields: Array<{ field: string; reason: string }>;
+  /** Fields that were in the body but equal to the stored value (after the
+   * same sanitizing) — not written, not audited, not locked. G1 pkt 2. */
+  unchangedFields: string[];
+  /** Fields that got a field_provenance.owner_locks stamp on this save — the
+   * changed fields minus the ones saved as empty. G1 pkt 2. */
+  lockedFields: string[];
+}
+
+// ── G1 pkt 2 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg):
+// lock only fields the owner actually changed ──────────────────────────────
+// The portal form always posts every field, so before this change ONE save
+// stamped owner_locks for all six fields — also the ones the owner never
+// touched and the ones that were empty — which froze them against the
+// content job forever. Now a field is compared with the stored value after
+// running the stored value through the SAME sanitizer (so an untouched
+// over-long or untrimmed stored text is "unchanged", not silently
+// truncated); only changed fields are written, audited and — when the new
+// value is not empty — locked. Saving a field as empty writes it but does
+// not add a lock (an existing lock is left as it is; the owner removes it
+// explicitly with releaseClaimedProviderFieldLock below).
+function sanitizeClaimField(field: ClaimEditableField, value: unknown): unknown {
+  if (field === "products") return sanitizeProducts(value);
+  if (field === "hjemmeside") return sanitizeWebsite(value);
+  if (field === "booking_live") return sanitizeBookingLive(value);
+  return sanitizeTextField(field, value);
+}
+
+function normalizeStoredClaimField(field: ClaimEditableField, stored: unknown): unknown {
+  if (field === "products") {
+    let arr: unknown = [];
+    if (typeof stored === "string" && stored) {
+      try { arr = JSON.parse(stored); } catch { arr = []; }
+    }
+    return sanitizeProducts(Array.isArray(arr) ? arr : []);
+  }
+  if (field === "booking_live") return Number(stored) === 1 ? 1 : 0;
+  if (stored === null || stored === undefined) return null;
+  if (field === "hjemmeside") {
+    const t = String(stored).trim();
+    return t === "" ? null : t;
+  }
+  return sanitizeTextField(field, String(stored));
+}
+
+function isEmptyClaimValue(field: ClaimEditableField, value: unknown): boolean {
+  if (field === "booking_live") return false; // a consent toggle, never "empty"
+  if (value === null || value === undefined) return true;
+  if (field === "products") return value === "[]";
+  return typeof value === "string" && value.trim() === "";
+}
+
+function claimValuesEqual(field: ClaimEditableField, a: unknown, b: unknown): boolean {
+  // null and "" are the same "empty" for the text fields and hjemmeside.
+  if (field !== "booking_live" && field !== "products") {
+    const na = a === null || a === undefined || a === "" ? null : a;
+    const nb = b === null || b === undefined || b === "" ? null : b;
+    return na === nb;
+  }
+  return a === b;
 }
 
 /**
@@ -2118,8 +2177,11 @@ export function updateClaimedProviderProfile(
 ): UpdateProfileOutcome | { ok: false; error: "provider_not_found" } {
   const db = getDb(VERTICAL);
   const row = db
-    .prepare(`SELECT id, content_source FROM experience_providers WHERE id = ?`)
-    .get(providerId) as { id: string; content_source: string | null } | undefined;
+    .prepare(
+      `SELECT id, content_source, about_text, visit_text, opening_hours_text, products, hjemmeside, booking_live
+         FROM experience_providers WHERE id = ?`,
+    )
+    .get(providerId) as ({ id: string; content_source: string | null } & Record<string, unknown>) | undefined;
   if (!row) return { ok: false, error: "provider_not_found" };
 
   const locked = row.content_source === "manual";
@@ -2128,6 +2190,8 @@ export function updateClaimedProviderProfile(
   const params: Record<string, unknown> = { id: providerId };
   const updatedFields: string[] = [];
   const skippedFields: Array<{ field: string; reason: string }> = [];
+  const unchangedFields: string[] = [];
+  const lockedFields: string[] = [];
 
   for (const field of CLAIM_EDITABLE_FIELDS) {
     if (!(field in body)) continue;
@@ -2135,19 +2199,21 @@ export function updateClaimedProviderProfile(
       skippedFields.push({ field, reason: "locked_by_manual" });
       continue;
     }
-    let sanitized: unknown;
-    if (field === "products") sanitized = sanitizeProducts(body[field]);
-    else if (field === "hjemmeside") sanitized = sanitizeWebsite(body[field]);
-    else if (field === "booking_live") sanitized = sanitizeBookingLive(body[field]);
-    else sanitized = sanitizeTextField(field, body[field]);
+    const sanitized = sanitizeClaimField(field, body[field]);
 
     if (sanitized === undefined) {
       skippedFields.push({ field, reason: "invalid_value" });
       continue;
     }
+    // G1 pkt 2: an unchanged field is a no-op — no write, no audit row, no lock.
+    if (claimValuesEqual(field, sanitized, normalizeStoredClaimField(field, row[field]))) {
+      unchangedFields.push(field);
+      continue;
+    }
     sets.push(`${field} = @${field}`);
     params[field] = sanitized;
     updatedFields.push(field);
+    if (!isEmptyClaimValue(field, sanitized)) lockedFields.push(field);
   }
 
   if (sets.length > 0) {
@@ -2202,19 +2268,103 @@ export function updateClaimedProviderProfile(
           ? { ...(existingOwnerLocks as Record<string, unknown>) }
           : {};
       const lockedAt = new Date().toISOString();
-      for (const field of updatedFields) {
+      // G1 pkt 2: only changed, non-empty fields get a stamp (lockedFields).
+      for (const field of lockedFields) {
         ownerLocks[field] = { locked_at: lockedAt };
       }
-      provenance.owner_locks = ownerLocks;
-      db.prepare(`UPDATE experience_providers SET field_provenance = @field_provenance WHERE id = @id`).run({
-        id: providerId,
-        field_provenance: JSON.stringify(provenance),
-      });
+      if (lockedFields.length > 0) {
+        provenance.owner_locks = ownerLocks;
+        db.prepare(`UPDATE experience_providers SET field_provenance = @field_provenance WHERE id = @id`).run({
+          id: providerId,
+          field_provenance: JSON.stringify(provenance),
+        });
+      }
     });
     txn();
   }
 
-  return { ok: true, updatedFields, skippedFields };
+  return { ok: true, updatedFields, skippedFields, unchangedFields, lockedFields };
+}
+
+// ── «Gi tilbake» — owner releases a field lock (G1 pkt 2) ─────────────────
+// The owner lets Opplevagent update one of their fields again: removes
+// field_provenance.owner_locks.<field> and writes ONE gardssalg_content_audit
+// row. field_name is `<field>_lock` — the same synthetic marker
+// applyGardssalgFieldLock (experience-store.ts) uses, so the rollback planner
+// can never read it as a content change. Only the five content fields the
+// portal edits can be released (booking_live is a consent toggle, not
+// content). A lock set by Opplevagent support (`locked_by: "admin"`) and a
+// row curated by Opplevagent (content_source='manual') cannot be released by
+// the owner. Releasing a field that has no lock is a no-op with no log row.
+export const CLAIM_RELEASABLE_FIELDS = [
+  "about_text",
+  "visit_text",
+  "opening_hours_text",
+  "products",
+  "hjemmeside",
+] as const;
+export type ClaimReleasableField = (typeof CLAIM_RELEASABLE_FIELDS)[number];
+
+export type ReleaseFieldLockOutcome =
+  | { ok: true; field: ClaimReleasableField; released: boolean }
+  | { ok: false; error: "provider_not_found" | "unknown_field" | "locked_by_manual" | "locked_by_admin" };
+
+function parseProvenanceObject(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch {
+    /* malformed existing JSON -> treat as empty */
+  }
+  return {};
+}
+
+/** Owner lock entries on this provider, by field (read-only; for the portal). */
+export function getClaimOwnerLocks(providerRow: { field_provenance: string | null }): Record<string, { locked_by?: string }> {
+  const ol = parseProvenanceObject(providerRow.field_provenance).owner_locks;
+  if (!ol || typeof ol !== "object" || Array.isArray(ol)) return {};
+  const out: Record<string, { locked_by?: string }> = {};
+  for (const [k, v] of Object.entries(ol as Record<string, unknown>)) {
+    const lockedBy = v && typeof v === "object" ? (v as Record<string, unknown>).locked_by : undefined;
+    out[k] = typeof lockedBy === "string" ? { locked_by: lockedBy } : {};
+  }
+  return out;
+}
+
+export function releaseClaimedProviderFieldLock(providerId: string, field: string): ReleaseFieldLockOutcome {
+  if (!(CLAIM_RELEASABLE_FIELDS as readonly string[]).includes(field)) return { ok: false, error: "unknown_field" };
+  const releasable = field as ClaimReleasableField;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; content_source: string | null; field_provenance: string | null } | undefined;
+  if (!row) return { ok: false, error: "provider_not_found" };
+  if (row.content_source === "manual") return { ok: false, error: "locked_by_manual" };
+
+  const provenance = parseProvenanceObject(row.field_provenance);
+  const existing = provenance.owner_locks;
+  const ownerLocks: Record<string, unknown> =
+    existing && typeof existing === "object" && !Array.isArray(existing) ? { ...(existing as Record<string, unknown>) } : {};
+  if (!Object.prototype.hasOwnProperty.call(ownerLocks, releasable)) return { ok: true, field: releasable, released: false };
+  const prior = ownerLocks[releasable];
+  if (prior && typeof prior === "object" && (prior as Record<string, unknown>).locked_by === "admin") {
+    return { ok: false, error: "locked_by_admin" };
+  }
+
+  delete ownerLocks[releasable];
+  provenance.owner_locks = ownerLocks;
+  db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`).run({
+      id: providerId,
+      field_provenance: JSON.stringify(provenance),
+    });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (?, ?, ?, ?, NULL, NULL, 'owner-portal-release', 'owner', datetime('now'))`,
+    ).run(uuid(), providerId, `${releasable}_lock`, JSON.stringify(prior ?? null));
+  })();
+  return { ok: true, field: releasable, released: true };
 }
 
 // ─── One-time backfill: owner_locks provenance for pre-existing claim edits ──
@@ -2234,6 +2384,8 @@ export interface OwnerLockBackfillResult {
   stamped: number;
   already_stamped: number;
   skipped_missing_provider: number;
+  /** G1 pkt 2: owner gave the field back after their last edit. */
+  skipped_released: number;
 }
 
 export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockBackfillResult {
@@ -2243,13 +2395,23 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
       `SELECT provider_id, field_name, MAX(changed_at) AS latest_changed_at
        FROM gardssalg_content_audit
        WHERE changed_by = 'owner'
+         AND substr(field_name, -5) != '_lock'
        GROUP BY provider_id, field_name`,
     )
     .all() as Array<{ provider_id: string; field_name: string; latest_changed_at: string }>;
+  // G1 pkt 2: a field the owner has given back («gi tilbake») after their
+  // last edit must not be re-locked by this backfill.
+  const releasedSince = db.prepare(
+    `SELECT 1 FROM gardssalg_content_audit
+      WHERE provider_id = ? AND field_name = ? AND changed_by = 'owner'
+        AND batch_id = 'owner-portal-release' AND changed_at >= ?
+      LIMIT 1`,
+  );
 
   let stamped = 0;
   let alreadyStamped = 0;
   let skippedMissingProvider = 0;
+  let skippedReleased = 0;
 
   // One provider row can appear for multiple field_name groups above — each
   // (provider_id, field_name) group gets its OWN read-modify-write (same
@@ -2289,6 +2451,10 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
       alreadyStamped++;
       return;
     }
+    if (releasedSince.get(row.provider_id, `${row.field_name}_lock`, row.latest_changed_at)) {
+      skippedReleased++;
+      return;
+    }
 
     stamped++;
     if (!apply) return; // dry-run: count what WOULD be stamped, write nothing
@@ -2303,5 +2469,5 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
 
   for (const row of rows) runOne(row);
 
-  return { scanned: rows.length, stamped, already_stamped: alreadyStamped, skipped_missing_provider: skippedMissingProvider };
+  return { scanned: rows.length, stamped, already_stamped: alreadyStamped, skipped_missing_provider: skippedMissingProvider, skipped_released: skippedReleased };
 }

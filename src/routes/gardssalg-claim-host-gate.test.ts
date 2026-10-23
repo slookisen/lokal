@@ -18,7 +18,7 @@
  *     parsers (the I-T pattern).
  *
  * Sections:
- *   w1-w10  wiring, by reference: each claim route is registered once and
+ *   w1-w12  wiring, by reference: each claim route is registered once and
  *           runs the real exported generalLimiter first.
  *   g1-g3   scope: every route on the router carries it, none router-wide,
  *           and every route sits under a gated prefix.
@@ -190,7 +190,7 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
     const claimRouter = claimMod.default as unknown as { stack: RouteLayer[] };
     const { GARDSSALG_CLAIM_HOST, GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } = claimMod;
 
-    // ── w1-w10: wiring, by reference ────────────────────────────────────
+    // ── w1-w12: wiring, by reference ────────────────────────────────────
     const wired: Array<[string, Method, string]> = [
       ["w1", "get", "/kategori/gardssalg/eier/magic-link-verify"],
       ["w2", "get", "/kategori/gardssalg/eier/:providerSlug"],
@@ -202,6 +202,9 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
       ["w8", "post", "/api/opplevelser/gardssalg-claim/:providerId/update-profile"],
       ["w9", "get", "/api/opplevelser/gardssalg-claim/:providerId/stats"],
       ["w10", "get", "/api/opplevelser/gardssalg-claim/:providerId/session-status"],
+      // G1 pkt 2 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg): «gi tilbake».
+      ["w11", "post", "/kategori/gardssalg/eier/:providerSlug/release-field"],
+      ["w12", "post", "/api/opplevelser/gardssalg-claim/:providerId/release-field"],
     ];
     for (const [id, method, routePath] of wired) {
       const label = `${method.toUpperCase()} ${routePath}`;
@@ -217,7 +220,7 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
 
     // ── g1-g3: scope ────────────────────────────────────────────────────
     const all = routeLabels(claimRouter);
-    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w10)`);
+    assertEq(all.length, wired.length, `g1: the claim router has exactly the ${wired.length} routes above (a new one must be added to w1-w12)`);
     assertEq(routeLabels(claimRouter, generalLimiter), all, "g2: every claim route chains generalLimiter, and none is router-wide");
     assertTrue(!claimRouter.stack.some((l) => !l.route && l.handle === generalLimiter),
       "g2b: no router-wide generalLimiter (an unmatched /api/opplevelser/gardssalg-claim/* path is counted once, by the \"/api\" mount)");
@@ -241,8 +244,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
           if (!ac2LimitersFor(sample).includes("general")) uncounted.push(sample);
         }
       }
-      assertTrue(checked === 10 && uncounted.length === 0,
-        `a1: ac2LimitersFor counts all 10 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
+      assertTrue(checked === 12 && uncounted.length === 0,
+        `a1: ac2LimitersFor counts all 12 route-level generalLimiter paths on the claim router as general (checked ${checked}, uncounted ${JSON.stringify(uncounted)})`);
     }
 
     // ── i1-i5: index.ts order (source inspection) ───────────────────────
@@ -319,6 +322,8 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
         ["/kategori/gardssalg/eier/gard-x/save", {}],
         ["/kategori/gardssalg/eier/gard-x/logout", {}],
         ["/api/opplevelser/gardssalg-claim/p1/update-profile", { about_text: "x" }],
+        ["/kategori/gardssalg/eier/gard-x/release-field", {}],
+        ["/api/opplevelser/gardssalg-claim/p1/release-field", { field: "about_text" }],
       ] as const;
       const postOut: Array<[number, string]> = [];
       for (const [p, body] of posts) {
@@ -327,7 +332,7 @@ export async function runGardssalgClaimHostGateTests(opts: { log?: boolean } = {
       }
       const notFound = JSON.stringify({ success: false, error: "not_found" });
       assertEq(postOut, posts.map(() => [404, notFound]),
-        "h7: rettfrabonden.com POST to the link request, save, logout and update-profile → 404, nothing is looked up, harvested or sent");
+        "h7: rettfrabonden.com POST to the link request, save, logout, update-profile and release-field → 404, nothing is looked up, harvested or sent");
     }
     {
       const dental = { ...elsewhere, host: "finn-tannlege.com" };

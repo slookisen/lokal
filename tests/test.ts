@@ -49877,3 +49877,23 @@ runSerial(async () => {
     failures.push("mcp-input-limits: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 2: the
+// gårdssalg owner portal locks only fields the owner actually changed (empty
+// fields are not locked), and the owner can give a field back («la
+// Opplevagent oppdatere dette») — lock removed + one audit row.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 2: lås bare endrede felt ──");
+  try {
+    const { runGardssalgClaimLockChangedFieldsTests } = require("../src/routes/gardssalg-claim-lock-changed-fields.test") as
+      typeof import("../src/routes/gardssalg-claim-lock-changed-fields.test");
+    const r = await runGardssalgClaimLockChangedFieldsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-lock-changed-fields: " + f);
+    console.log(`  gardssalg-claim-lock-changed-fields: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-lock-changed-fields: unexpected error: " + String(err?.message || err));
+  }
+});
