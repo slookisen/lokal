@@ -2060,7 +2060,9 @@ const MAX_PRODUCT_NAME_LEN = 100;
 function sanitizeTextField(field: string, value: unknown): string | null | undefined {
   if (value === null) return null;
   if (typeof value !== "string") return undefined; // reject wrong type — caller skips
-  const trimmed = value.trim();
+  // G1 pkt 2: browsers post textarea line breaks as CRLF; store and compare LF
+  // so an untouched multi-line text is not seen as "changed" (and locked).
+  const trimmed = value.replace(/\r\n?/g, "\n").trim();
   const max = TEXT_FIELD_MAX_LEN[field] ?? 2000;
   return trimmed.slice(0, max);
 }

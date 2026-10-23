@@ -585,8 +585,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     try { const p = JSON.parse(provider.products || "[]"); if (Array.isArray(p)) products = p.filter((x) => typeof x === "string"); } catch { /* ignore */ }
 
     // G1 pkt 2: per-field lock note + «gi tilbake» button. The button submits
-    // the profile form to the release-field route via formaction (no nested
-    // forms); the inline script below lets that submit through natively.
+    // its OWN form (#gc-release-form, outside the profile form) via the
+    // form="" attribute, so Enter in a profile input always hits «Lagre»
+    // (implicit submission picks the profile form's own first submit button).
     const ownerLocks = getClaimOwnerLocks(provider);
     const releaseAction = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/release-field`;
     const lockNote = (field: string): string => {
@@ -595,7 +596,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         return `<div class="gc-lock-note" data-lock-field="${field}">Opplevagent-support har låst dette feltet.</div>`;
       }
       return `<div class="gc-lock-note" data-lock-field="${field}"><span>Du har skrevet dette selv, så Opplevagent endrer det ikke.</span>` +
-        `<button type="submit" class="gc-btn gc-btn-secondary gc-btn-small" formaction="${releaseAction}" formnovalidate name="release_field" value="${field}">La Opplevagent oppdatere dette</button></div>`;
+        `<button type="submit" form="gc-release-form" class="gc-btn gc-btn-secondary gc-btn-small" name="release_field" value="${field}">La Opplevagent oppdatere dette</button></div>`;
     };
 
     const body = `
@@ -643,11 +644,12 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
             <label for="f-booking" style="margin:0;">Aktiver reservasjoner (booking) for besøkende</label>
           </div>
           <div class="gc-form-actions">
-            <button type="submit" class="gc-btn gc-btn-primary" ${locked ? "disabled" : ""}>Lagre alle endringer</button>
+            <button type="submit" id="gc-save-btn" class="gc-btn gc-btn-primary" ${locked ? "disabled" : ""}>Lagre alle endringer</button>
             <a href="/kategori/gardssalg/produsent/${encodeURIComponent(slug)}" class="gc-btn gc-btn-secondary">Se profilen</a>
           </div>
           <div id="gc-save-status" aria-live="polite"></div>
         </form>
+        <form id="gc-release-form" method="post" action="${releaseAction}"></form>
       </div>
       <div class="gc-card">
         <h2>Statistikk</h2>
@@ -684,9 +686,6 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         if (form && window.fetch) {
           var statusEl = document.getElementById("gc-save-status");
           form.addEventListener("submit", function (ev) {
-            // «La Opplevagent oppdatere dette» posts natively to release-field.
-            var sub = ev.submitter || document.activeElement;
-            if (sub && sub.name === "release_field") return;
             ev.preventDefault();
             var fd = new FormData(form);
             var payload = {
@@ -697,7 +696,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
               hjemmeside: fd.get("field_hjemmeside"),
               booking_live: fd.get("field_booking_live") ? 1 : 0,
             };
-            var btn = form.querySelector("button[type=submit]");
+            var btn = document.getElementById("gc-save-btn");
             var settled = false;
             function showReceipt(success, message) {
               if (statusEl) {
@@ -784,7 +783,7 @@ router.post(
 // (G1 pkt 2, dev-request 2026-10-22-opplevagent-mine-valg-gardssalg). The
 // owner lets Opplevagent update one field again: removes the owner lock and
 // logs it (releaseClaimedProviderFieldLock). Posted by the per-field button
-// in the portal form (formaction), so it works with and without JS.
+// in the portal (its own #gc-release-form), so it works with and without JS.
 // ─────────────────────────────────────────────────────────────────
 router.post(
   "/kategori/gardssalg/eier/:providerSlug/release-field",

@@ -172,6 +172,19 @@ export function runGardssalgClaimLockChangedFieldsTests(opts: { log?: boolean } 
       const s5 = claimSvc.updateClaimedProviderProfile("prov-long", { booking_live: 1 });
       if ("ok" in s5 && s5.ok) assertEq(s5.updatedFields, ["booking_live"], "s22: a changed booking_live is written");
 
+      // Round 2 B3: a no-JS form posts textarea line breaks as CRLF.
+      expDb.prepare("UPDATE experience_providers SET visit_text = ? WHERE id = ?").run("Linje 1\nLinje 2", "prov-long");
+      const crlf = claimSvc.updateClaimedProviderProfile("prov-long", { visit_text: "Linje 1\r\nLinje 2\r\n" });
+      if ("ok" in crlf && crlf.ok) {
+        assertEq(crlf.updatedFields, [], "s23: untouched multi-line text posted with CRLF counts as unchanged");
+        assertEq(crlf.lockedFields, [], "s24: ...and is not locked");
+      }
+      const crlf2 = claimSvc.updateClaimedProviderProfile("prov-long", { visit_text: "Linje 1\r\nLinje 3" });
+      if ("ok" in crlf2 && crlf2.ok) assertEq(crlf2.updatedFields, ["visit_text"], "s25: a real edit posted with CRLF is still a change");
+      assertEq(readRow("prov-long").visit_text, "Linje 1\nLinje 3", "s26: stored with LF line breaks");
+      // reset for the B1 block below (which needs visit_text without an owner lock)
+      claimSvc.releaseClaimedProviderFieldLock("prov-long", "visit_text");
+
       // ── (r) «gi tilbake» ─────────────────────────────────────────────
       const r1 = claimSvc.releaseClaimedProviderFieldLock("prov-lc", "visit_text");
       assertEq(r1, { ok: true, field: "visit_text", released: true }, "r1: release of a locked field succeeds");
@@ -276,7 +289,25 @@ export function runGardssalgClaimLockChangedFieldsTests(opts: { log?: boolean } 
       assertTrue(portal.body.includes('name="release_field" value="about_text"'), "h3: portal shows «gi tilbake» for the locked about_text");
       assertTrue(portal.body.includes("La Opplevagent oppdatere dette"), "h4: button text is Norwegian");
       assertTrue(!portal.body.includes('name="release_field" value="visit_text"'), "h5: no «gi tilbake» for an unlocked field");
-      assertTrue(portal.body.includes('sub.name === "release_field"'), "h6: inline script lets the release submit through natively");
+      // Round 2 B1: Enter in a profile input must always save. Implicit
+      // submission uses the profile form's first submit button it OWNS, so
+      // every release button must be owned by #gc-release-form (form=""), the
+      // release form must sit outside the profile form, and the first owned
+      // submit button must be «Lagre».
+      const pStart = portal.body.indexOf('<form id="gc-profile-form"');
+      const pEnd = portal.body.indexOf("</form>", pStart);
+      const profileHtml = portal.body.slice(pStart, pEnd);
+      const buttons = profileHtml.match(/<button\b[^>]*>/g) || [];
+      const owned = buttons.filter((b) => /type="submit"/.test(b) && !/\bform="/.test(b));
+      assertTrue(owned.length === 1 && /id="gc-save-btn"/.test(owned[0]), "h6a: the profile form owns exactly one submit button, «Lagre» (#gc-save-btn), so Enter saves");
+      const releaseButtons = buttons.filter((b) => /name="release_field"/.test(b));
+      assertTrue(releaseButtons.length >= 1 && releaseButtons.every((b) => /form="gc-release-form"/.test(b) && !/formaction=/.test(b)),
+        "h6b: every «gi tilbake» button belongs to #gc-release-form, not the profile form");
+      const rIdx = portal.body.indexOf('<form id="gc-release-form" method="post" action="/kategori/gardssalg/eier/lasetest-gard/release-field"></form>');
+      assertTrue(rIdx > pEnd, "h6c: #gc-release-form is a separate form after (outside) the profile form");
+      // Round 2 B2: the save script targets the save button by id.
+      assertTrue(portal.body.includes('document.getElementById("gc-save-btn")'), "h6d: the save script finds «Lagre» by id");
+      assertTrue(!portal.body.includes('form.querySelector("button[type=submit]")'), "h6e: the save script no longer picks the first submit button");
       assertTrue(!/rett fra bonden/i.test(portal.body), "h7: the portal never mentions Rett fra Bonden");
 
       const noAuth = await req("POST", "/api/opplevelser/gardssalg-claim/prov-lc/release-field", json, JSON.stringify({ field: "about_text" }));
