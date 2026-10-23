@@ -435,6 +435,50 @@ export function runOpplevelserBookingSendGuardTests(
       const fromSmuggled = bookingStore.createBooking((smuggled as any).data, "mcp");
       assertEq(fromSmuggled.is_test, 0, "h3: a booking built from a smuggling payload is NOT a test booking");
 
+      // ── (r) COMMISSION RATE comes from the provider, never the caller ────
+      // dev-request 2026-10-22-opplevagent-booking-provisjonssats-fra-offentlig-kall
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, booking_live, commission_rate,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES ('prov-rate', 'Rate Gård', 'experiences', 'rate@gard.no', 1, 0.15,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run();
+      const rateInput = { ...bookingInput, provider_id: "prov-rate" };
+      const rateSmuggled = bookingStore.BookingInputSchema.safeParse({ ...rateInput, commission_rate: 0 });
+      assertEq(rateSmuggled.success, true, "r1: a payload with commission_rate still parses");
+      assertTrue(
+        rateSmuggled.success && !("commission_rate" in (rateSmuggled.data as any)),
+        "r2: BookingInputSchema STRIPS commission_rate"
+      );
+      assertEq(
+        bookingStore.createBooking((rateSmuggled as any).data, "opplevagent").commission_rate,
+        0.15,
+        "r3: commission_rate:0 in the body → booking stores the provider's 0.15"
+      );
+      assertEq(
+        bookingStore.createBooking((rateSmuggled as any).data, "mcp").commission_rate,
+        0.15,
+        "r4: same through the MCP source"
+      );
+      assertEq(
+        bookingStore.createBooking(rateInput as any, "opplevagent").commission_rate,
+        0.15,
+        "r5: no field → 0.15 (unchanged behaviour)"
+      );
+      const nullRate = bookingStore.BookingInputSchema.safeParse({ ...bookingInput, commission_rate: 0.5 });
+      assertEq(
+        bookingStore.createBooking((nullRate as any).data, "opplevagent").commission_rate,
+        null,
+        "r6: provider without a rate (NULL) → NULL, whatever the caller sends"
+      );
+      assertEq(
+        (expDb.prepare(`SELECT commission_rate FROM gardssalg_bookings WHERE booking_id = ?`)
+          .get(bookingStore.createBooking((rateSmuggled as any).data, "opplevagent").booking_id) as any).commission_rate,
+        0.15,
+        "r7: the persisted row carries the provider's rate"
+      );
+
       // ── (i)+(j) both booking emails redirect; producer email specifically ─
       sent = [];
       await bookingStore.sendBookingConfirmation(testBooking);

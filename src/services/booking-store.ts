@@ -164,7 +164,12 @@ export const BookingInputSchema = z.object({
   guest_name: z.string().min(1).max(200),
   guest_email: z.string().email(),
   guest_phone: z.string().max(30).optional(),
-  commission_rate: z.number().min(0).max(1).optional(),
+  // dev-request 2026-10-22-opplevagent-booking-provisjonssats-fra-offentlig-kall:
+  // there is deliberately NO commission_rate field here. This schema parses the
+  // untrusted body of the public entry points (POST /api/opplevelser/book, the
+  // book_gardssalg MCP tool, the web form), and zod strips unknown keys, so a
+  // caller-supplied rate never reaches createBooking(). The rate always comes
+  // from experience_providers.commission_rate.
   notes: z.string().max(500).optional(),
   // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering"):
   // when a guest resends after the route layer told them their slot falls
@@ -267,14 +272,12 @@ export function createBooking(
 ): GardssalgBooking {
   const db = getDb(VERTICAL);
 
-  // Inherit commission_rate from provider if not explicitly set
-  let commission_rate = input.commission_rate ?? null;
-  if (commission_rate === null) {
-    const prov = db
-      .prepare("SELECT commission_rate FROM experience_providers WHERE id = ?")
-      .get(input.provider_id) as { commission_rate: number | null } | undefined;
-    commission_rate = prov?.commission_rate ?? null;
-  }
+  // The rate is always the provider's own, never the caller's (see the note on
+  // BookingInputSchema). NULL provider rate → NULL on the booking.
+  const prov = db
+    .prepare("SELECT commission_rate FROM experience_providers WHERE id = ?")
+    .get(input.provider_id) as { commission_rate: number | null } | undefined;
+  const commission_rate = prov?.commission_rate ?? null;
 
   const now = new Date();
   const booking: GardssalgBooking = {
