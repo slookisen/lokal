@@ -49908,3 +49908,21 @@ runSerial(async () => {
     failures.push("gardssalg-claim-lock-changed-fields: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
+// eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 4: eid profil pause/fjern/kvalitetsskjul ──");
+  try {
+    const { runGardssalgClaimOwnerVisibilityTests } = require("../src/routes/gardssalg-claim-owner-visibility.test") as
+      typeof import("../src/routes/gardssalg-claim-owner-visibility.test");
+    const r = await runGardssalgClaimOwnerVisibilityTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-owner-visibility: " + f);
+    console.log(`  gardssalg-claim-owner-visibility: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-owner-visibility: unexpected error: " + String(err?.message || err));
+  }
+});
