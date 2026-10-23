@@ -3,9 +3,13 @@
  *
  * GHSA-46jr-4wx8-v453: one oversized tools/call could exhaust memory during
  * validation. All three McpServers now set `maxToolInputElements`, and the
- * list inputs of lokal_discover / lokal_find_offers have `.max()`. Proven over
- * real MCP sessions on the live routers: an oversized call answers with
- * isError: true (no crash, session still usable), a call at the limit does not.
+ * lokal_discover / lokal_find_offers handlers refuse list inputs over their
+ * caps (categories / tags > MCP_MAX_FILTER_LIST, items > MCP_MAX_SHOPPING_ITEMS).
+ * The caps are not `.max()` in the inputSchema: that adds maxItems to
+ * tools/list, and the Rett fra Bonden contract is frozen while OpenAI reviews
+ * the ChatGPT app (rfb-mcp-contract-freeze.test.ts). Proven over real MCP
+ * sessions on the live routers: an oversized call answers with isError: true
+ * (no crash, session still usable), a call at the limit does not.
  *
  * Standalone: npx tsx src/routes/mcp-input-limits.test.ts
  * Wired into the gate via tests/test.ts.
@@ -16,7 +20,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
-import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS } from "../services/mcp-input-limits";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 
 export interface TestSummary { passed: number; failed: number; failures: string[]; }
 
@@ -98,16 +102,44 @@ export async function runMcpInputLimitsTests(opts: { log?: boolean } = {}): Prom
       check(!!after?.result && !after?.error && !/maximum of \d+ elements/.test(JSON.stringify(after.result)), `${t.label}: session still answers a normal call after the rejected one`);
 
       if (t.mod === "./mcp") {
+        const resultText = (r: any) => (r?.result?.content ?? []).map((c: any) => String(c?.text ?? "")).join("\n");
+        // The refusal is the handler's own text (mcpListTooLongResult), not a
+        // schema validation error: the inputSchema has no maxItems.
+        const refusal = (field: string, max: number, sent: number) => mcpListTooLongResult(field, max, sent).content[0].text;
+
         const tooMany = await call({ items: Array.from({ length: MCP_MAX_SHOPPING_ITEMS + 1 }, (_, i) => `v${i}`), near: "Oslo" }, "lokal_find_offers");
-        const tm = JSON.stringify(tooMany?.result?.content ?? "");
-        check(tooMany?.result?.isError === true && /items/.test(tm) && /(<=|at most|too_big|Too big)/i.test(tm),
-          `lokal_find_offers: ${MCP_MAX_SHOPPING_ITEMS + 1} items -> validation error naming items`);
+        const tm = resultText(tooMany);
+        check(tooMany?.result?.isError === true && tm === refusal("items", MCP_MAX_SHOPPING_ITEMS, MCP_MAX_SHOPPING_ITEMS + 1) && /items/.test(tm) && /at most/.test(tm),
+          `lokal_find_offers: ${MCP_MAX_SHOPPING_ITEMS + 1} items -> isError from the handler, naming items and the cap`);
         const atMax = await call({ items: Array.from({ length: MCP_MAX_SHOPPING_ITEMS }, (_, i) => `v${i}`), lat: 59.9, lng: 10.7 }, "lokal_find_offers");
-        check(atMax?.result?.isError !== true && !atMax?.error, `lokal_find_offers: ${MCP_MAX_SHOPPING_ITEMS} items passes validation`);
+        check(atMax?.result?.isError !== true && !atMax?.error && resultText(atMax).includes(`of ${MCP_MAX_SHOPPING_ITEMS} items were looked up`),
+          `lokal_find_offers: ${MCP_MAX_SHOPPING_ITEMS} items is accepted (soft cap note, no refusal)`);
+        const normalItems = await call({ items: ["poteter", "honning", "egg"], lat: 59.9, lng: 10.7 }, "lokal_find_offers");
+        check(normalItems?.result?.isError !== true && !normalItems?.error && !/at most/.test(resultText(normalItems)),
+          "lokal_find_offers: a normal 3-item list is accepted");
+
         const cats = await call({ categories: Array.from({ length: MCP_MAX_FILTER_LIST + 1 }, (_, i) => `c${i}`) }, "lokal_discover");
-        check(cats?.result?.isError === true && /categories/.test(JSON.stringify(cats?.result?.content ?? "")), `lokal_discover: ${MCP_MAX_FILTER_LIST + 1} categories -> validation error`);
+        check(cats?.result?.isError === true && resultText(cats) === refusal("categories", MCP_MAX_FILTER_LIST, MCP_MAX_FILTER_LIST + 1),
+          `lokal_discover: ${MCP_MAX_FILTER_LIST + 1} categories -> isError from the handler, naming categories`);
         const tags = await call({ tags: Array.from({ length: MCP_MAX_FILTER_LIST + 1 }, (_, i) => `t${i}`) }, "lokal_discover");
-        check(tags?.result?.isError === true && /tags/.test(JSON.stringify(tags?.result?.content ?? "")), `lokal_discover: ${MCP_MAX_FILTER_LIST + 1} tags -> validation error`);
+        check(tags?.result?.isError === true && resultText(tags) === refusal("tags", MCP_MAX_FILTER_LIST, MCP_MAX_FILTER_LIST + 1),
+          `lokal_discover: ${MCP_MAX_FILTER_LIST + 1} tags -> isError from the handler, naming tags`);
+        const catsAtMax = await call({ categories: Array.from({ length: MCP_MAX_FILTER_LIST }, (_, i) => `c${i}`), tags: Array.from({ length: MCP_MAX_FILTER_LIST }, (_, i) => `t${i}`) }, "lokal_discover");
+        check(catsAtMax?.result?.isError !== true && !catsAtMax?.error && !/at most/.test(resultText(catsAtMax)),
+          `lokal_discover: ${MCP_MAX_FILTER_LIST} categories and ${MCP_MAX_FILTER_LIST} tags are accepted`);
+        const normalDiscover = await call({ categories: ["honey", "eggs"], tags: ["organic"] }, "lokal_discover");
+        check(normalDiscover?.result?.isError !== true && !normalDiscover?.error && !/at most/.test(resultText(normalDiscover)),
+          "lokal_discover: a normal call (2 categories, 1 tag) is accepted");
+
+        // The contract stays frozen: tools/list carries no maxItems on these lists.
+        const listed = parse((await post(url, JSON.stringify({ jsonrpc: "2.0", id: String(++id), method: "tools/list", params: {} }), h)).text);
+        const toolSchema = (name: string) => (listed?.result?.tools ?? []).find((x: any) => x?.name === name)?.inputSchema?.properties ?? {};
+        const discoverProps = toolSchema("lokal_discover");
+        const offersProps = toolSchema("lokal_find_offers");
+        check(!!discoverProps.categories && !!discoverProps.tags && !("maxItems" in discoverProps.categories) && !("maxItems" in discoverProps.tags),
+          "tools/list: lokal_discover categories/tags have no maxItems (contract unchanged)");
+        check(!!offersProps.items && !("maxItems" in offersProps.items) && offersProps.items.minItems === 1,
+          "tools/list: lokal_find_offers items has minItems 1 and no maxItems (contract unchanged)");
       }
     }
   } catch (err: any) {

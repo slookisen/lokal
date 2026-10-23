@@ -60,7 +60,7 @@ import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
-import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS } from "../services/mcp-input-limits";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 
 const router = Router();
 
@@ -991,12 +991,12 @@ export function registerTools(
         // a real, filterable category — 133 producers carry it — but was
         // missing from this list entirely, so an agent reading only this
         // description had no way to know drink venues were searchable here.
-        categories: z.array(z.string()).max(MCP_MAX_FILTER_LIST).optional().describe(
+        categories: z.array(z.string()).optional().describe(
           "Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs, beverages " +
           "(beverages = all drink venues: breweries, cideries, wineries, distilleries, farm cafés, meaderies — " +
           "use drinkSubcategory below to narrow to exactly one kind)",
         ),
-        tags: z.array(z.string()).max(MCP_MAX_FILTER_LIST).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+        tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
         drinkSubcategory: z.enum(DRINK_SUBCATEGORIES).optional().describe(
           "Narrow 'beverages' results to exactly one drink venue kind: bryggeri (brewery), cideri (cidery), " +
           "vingård (winery), destilleri (distillery), gårdskafé (farm café), mjød (meadery/mead producer). " +
@@ -1019,6 +1019,15 @@ export function registerTools(
       },
     },
     guardToolHandler("lokal_discover", async ({ categories: categoriesAsSent, tags: tagsAsSent, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+      // GHSA-46jr (lokal#1229): a list longer than MCP_MAX_FILTER_LIST is
+      // refused here, not with .max() in the inputSchema, so tools/list stays
+      // the frozen contract (services/mcp-input-limits.ts).
+      if (Array.isArray(categoriesAsSent) && categoriesAsSent.length > MCP_MAX_FILTER_LIST) {
+        return mcpListTooLongResult("categories", MCP_MAX_FILTER_LIST, categoriesAsSent.length);
+      }
+      if (Array.isArray(tagsAsSent) && tagsAsSent.length > MCP_MAX_FILTER_LIST) {
+        return mcpListTooLongResult("tags", MCP_MAX_FILTER_LIST, tagsAsSent.length);
+      }
       // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
       // rfb-discover-lister-uten-tak): discover() compares every category and
       // tag with every producer's, and the schema has no max (it is frozen
@@ -1579,7 +1588,7 @@ export function registerTools(
       title: "Find offers for shopping-list items",
       description: "For each item in a shopping list, find up to 5 nearby producers who sell it (or a matching product), sorted by distance, with contact info and whether an order can be placed through the platform (can_order). Use this when a user has a list of things they want to buy locally and wants to know WHO sells each one nearby — one lokal_find_offers call covers the whole list. Read-only.",
       inputSchema: {
-        items: z.array(z.string()).min(1).max(MCP_MAX_SHOPPING_ITEMS).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
+        items: z.array(z.string()).min(1).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
         near: z.string().optional().describe("Norwegian place name to search near (geocoded automatically). Supply this OR lat/lng."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply together with lng."),
         lng: z.number().min(-180).max(180).optional().describe("User's longitude (WGS84). Must be supplied together with lat."),
@@ -1596,6 +1605,13 @@ export function registerTools(
       },
     },
     guardToolHandler("lokal_find_offers", async ({ items, near: nearAsSent, lat, lng, radius_km }, extra) => {
+      // GHSA-46jr (lokal#1229): more than MCP_MAX_SHOPPING_ITEMS items is
+      // refused here, not with .max() in the inputSchema, so tools/list stays
+      // the frozen contract. 21..MCP_MAX_SHOPPING_ITEMS items keep the
+      // MAX_OFFER_ITEMS cut and its note below.
+      if (Array.isArray(items) && items.length > MCP_MAX_SHOPPING_ITEMS) {
+        return mcpListTooLongResult("items", MCP_MAX_SHOPPING_ITEMS, items.length);
+      }
       // Slice I-Y2: `near` is a place name, cut to MAX_NAME_CHARS at a word
       // boundary (utils/free-text.ts). Each item's lookup used to geocode the
       // whole text again.

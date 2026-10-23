@@ -49872,7 +49872,8 @@ runSerial(async () => {
 });
 
 // dev-request 2026-10-23-mcp-sdk-1-32-sikkerhetsfiks-prod-og-npm (GHSA-46jr):
-// maxToolInputElements on all three McpServers + .max() on list inputs.
+// maxToolInputElements on all three McpServers + list caps in the
+// lokal_discover / lokal_find_offers handlers (not in the frozen inputSchema).
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-23-mcp-sdk-1-32: MCP input limits ──");
   try {

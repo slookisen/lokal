@@ -15,9 +15,12 @@
  *       each string a name cut by capName(); A2A's list cap is the same
  *       (MAX_A2A_DATA_LIST_ITEMS).
  *   L   MCP lokal_discover and POST /api/marketplace/discover: of 175 000
- *       categories or tags, discover() gets MAX_NAME_LIST_ITEMS, and of one
- *       category or tag of 1 MB its first MAX_NAME_CHARS characters (whole
- *       words); the answer is the one for those. POST /discover cuts
+ *       categories or tags, POST /discover's discover() gets
+ *       MAX_NAME_LIST_ITEMS, while lokal_discover refuses more than
+ *       MCP_MAX_FILTER_LIST of either (isError, GHSA-46jr, lokal#1229)
+ *       before discover() runs; of one category or tag of 1 MB, discover()
+ *       gets its first MAX_NAME_CHARS characters (whole words); the answer
+ *       is the one for those. POST /discover cuts
  *       `skills` the same way and `query` to MAX_FREE_TEXT_CHARS, its answer
  *       no longer echoes the list (3.9 MB for 175 000 categories on main),
  *       and an invalid list of 175 000 entries is a 400 with at most
@@ -54,6 +57,8 @@
  *       their goldens, which run unchanged. A change meant to move a row is
  *       captured again with
  *         npx tsx src/routes/strukturerte-lister-tak.test.ts --print
+ *       Moved on purpose (2026-10-23, GHSA-46jr, lokal#1229): lokal_discover
+ *       with 50 categories is now the MCP_MAX_FILTER_LIST refusal.
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the
@@ -76,6 +81,7 @@ import { PLATFORM_CATEGORIES } from "../services/search-enrich";
 import { capA2aData, MAX_A2A_DATA_LIST_ITEMS } from "../utils/a2a-message";
 import { capFreeText, capName, capNameList, MAX_FREE_TEXT_CHARS, MAX_NAME_CHARS, MAX_NAME_LIST_ITEMS } from "../utils/free-text";
 import { textOf } from "./rfb-sok-ukjente-ord-bakeri-sted.test";
+import { MCP_MAX_FILTER_LIST, mcpListTooLongResult } from "../services/mcp-input-limits";
 import {
   enterRfb,
   enterVerticals,
@@ -450,12 +456,26 @@ export async function runStrukturerteListerTakTests(opts: { log?: boolean } = {}
 
       // ── L  lokal_discover ──────────────────────────────────────────────
       {
-        let answer = "";
-        const [q] = await discoverQueries(async () => { answer = await h.lokalDiscover({ categories: many, tags: manyTags }); });
-        assertEq([listShape(q?.categories), listShape(q?.tags)], [[MAX_NAME_LIST_ITEMS, 5], [MAX_NAME_LIST_ITEMS, 7]],
-          "L1 lokal_discover: of 175 000 categories and tags, discover() gets MAX_NAME_LIST_ITEMS of each");
-        assertSameAnswer(stable(answer), stable(await h.lokalDiscover({ categories: many.slice(0, 50), tags: manyTags.slice(0, 50) })),
-          "L1 …and it answers as those");
+        // GHSA-46jr (lokal#1229): the handler refuses more than
+        // MCP_MAX_FILTER_LIST categories or tags before discover() runs (not
+        // .max() in the inputSchema, which is frozen); POST /discover and A2A
+        // keep cutting to MAX_NAME_LIST_ITEMS.
+        const discover = h.tools.get("lokal_discover")!;
+        let refused: any;
+        const refusedQueries = await discoverQueries(async () => { refused = await discover({ limit: 10, categories: many, tags: manyTags }); });
+        assertEq([refusedQueries.length, refused?.isError, textOf(refused)],
+          [0, true, mcpListTooLongResult("categories", MCP_MAX_FILTER_LIST, many.length).content[0].text],
+          "L1 lokal_discover: 175 000 categories and tags are refused (isError) before discover() runs");
+        let refusedTags: any;
+        const refusedTagQueries = await discoverQueries(async () => { refusedTags = await discover({ limit: 10, tags: manyTags }); });
+        assertEq([refusedTagQueries.length, refusedTags?.isError, textOf(refusedTags)],
+          [0, true, mcpListTooLongResult("tags", MCP_MAX_FILTER_LIST, manyTags.length).content[0].text],
+          "L1 …and so are 175 000 tags alone");
+        const atCap = many.slice(0, MCP_MAX_FILTER_LIST);
+        const tagsAtCap = manyTags.slice(0, MCP_MAX_FILTER_LIST);
+        const [qAtCap] = await discoverQueries(() => discover({ limit: 10, categories: atCap, tags: tagsAtCap }));
+        assertTrue(qAtCap?.categories === atCap && qAtCap?.tags === tagsAtCap,
+          "L1 …while MCP_MAX_FILTER_LIST of each reach discover() as sent");
         let bigAnswer = "";
         const [qBig] = await discoverQueries(async () => { bigAnswer = await h.lokalDiscover({ categories: [bigCategory], tags: [bigTag] }); });
         assertEq([qBig?.categories, qBig?.tags], [[capName(bigCategory)], [capName(bigTag)]],
