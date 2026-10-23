@@ -578,7 +578,7 @@ export function computeOutreachCandidates(
       for (const r of db.prepare(`
         SELECT DISTINCT LOWER(TRIM(email)) AS e
         FROM email_bounces
-        WHERE bounce_type IN ('hard', 'complaint')
+        WHERE bounce_type IN ('hard', 'complaint', 'unsubscribe')
       `).all() as Array<{ e: string | null }>) {
         if (r.e !== null) hardBouncedEmails.add(r.e);
       }

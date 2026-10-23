@@ -14,6 +14,7 @@ import {
 } from "../services/profile-translations";
 import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
+import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
 const router = Router();
@@ -427,7 +428,12 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
 
       // Check curated_fields lock
       const curatedFieldInfo = curatedFields[dbField] || {};
-      if (curatedFieldInfo.by && curatedFieldInfo.by !== "owner" && curatedFieldInfo.by !== null) {
+      // S1a point 4 (OWNER_PORTAL_CS_LOCK_OVERRIDE, default off): a customer-
+      // service lock does not stop the owner; the save below stamps by:"owner".
+      if (
+        curatedFieldInfo.by && curatedFieldInfo.by !== "owner" && curatedFieldInfo.by !== null &&
+        !isOverridableCsLock(curatedFieldInfo)
+      ) {
         skippedFields.push({
           field,
           reason: `locked_by_${curatedFieldInfo.by}`,
@@ -615,11 +621,13 @@ router.get("/api/agents/:id/profile", (req: Request, res: Response) => {
       const value = (knowledge as any)[dbField] || null;
       const curatedInfo = curatedFields[dbField] || {};
 
+      const csOverride = isOverridableCsLock(curatedInfo);
       fields[field] = {
         value,
         locked_by: curatedInfo.by || null,
         editable:
-          !curatedInfo.by || curatedInfo.by === "owner" || curatedInfo.by === null,
+          !curatedInfo.by || curatedInfo.by === "owner" || curatedInfo.by === null || csOverride,
+        ...(csOverride ? { locked_note: csLockNote(curatedInfo) } : {}),
       };
     }
 
@@ -1040,10 +1048,13 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     const fieldHtml = fieldDefs.map((fd) => {
       const value = (knowledge as any)[fd.dbField] != null ? String((knowledge as any)[fd.dbField]) : "";
       const lockInfo = curatedFields[fd.dbField] || {};
-      const lockedByOther = lockInfo.by && lockInfo.by !== "owner" && lockInfo.by !== null;
+      const csOverride = isOverridableCsLock(lockInfo);
+      const lockedByOther = lockInfo.by && lockInfo.by !== "owner" && lockInfo.by !== null && !csOverride;
       const lockedHtml = lockedByOther
         ? `<div class="ep-lock">\u{1F512} Låst — kontakt support for å endre (${escapeHtml(String(lockInfo.by))})</div>`
-        : "";
+        : csOverride
+          ? `<div class="ep-lock">${escapeHtml(csLockNote(lockInfo))}. Du kan endre dette feltet selv.</div>`
+          : "";
       const inputName = `field_${fd.key}`;
       if (fd.type === "textarea") {
         return `<div class="ep-field">

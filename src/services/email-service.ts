@@ -551,6 +551,10 @@ export class EmailService {
      * is the discriminator steg 4 sorts on.
      */
     replyTo?: string;
+    /** List-Unsubscribe header value (`<https://…>`); cold outreach only. */
+    listUnsubscribe?: string;
+    /** List-Unsubscribe-Post header value (RFC 8058 one-click); needs listUnsubscribe. */
+    listUnsubscribePost?: string;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
     // See isEmailForceDryRun()'s doc comment above sendEmail() — same rule.
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
@@ -559,6 +563,10 @@ export class EmailService {
     }
     try {
       const headers: Record<string, string> = { 'X-Lokal-Agent': 'crm-system/v1' };
+      if (options.listUnsubscribe) {
+        headers['List-Unsubscribe'] = options.listUnsubscribe;
+        if (options.listUnsubscribePost) headers['List-Unsubscribe-Post'] = options.listUnsubscribePost;
+      }
       if (options.inReplyToMessageId) {
         headers['In-Reply-To'] = options.inReplyToMessageId;
         headers['References'] = options.inReplyToMessageId;

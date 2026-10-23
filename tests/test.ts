@@ -49201,6 +49201,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1a points 3+4: working
+// unsubscribe (/avmeld/:token, suppression, List-Unsubscribe headers; flag
+// OUTREACH_UNSUBSCRIBE_ENABLED) and the customer-service lock visible to the
+// owner (OWNER_PORTAL_CS_LOCK_OVERRIDE). Swaps the getDb() singleton and
+// env flags/ADMIN_KEY (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1a 3+4: avmeld + cs-lock ──");
+  try {
+    const { runAvmeldS1aTests } = require("../src/routes/avmeld-s1a.test") as
+      typeof import("../src/routes/avmeld-s1a.test");
+    const av = await runAvmeldS1aTests({ log: false });
+    passed += av.passed;
+    failed += av.failed;
+    for (const f of av.failures) failures.push("avmeld-s1a: " + f);
+    console.log(`  avmeld-s1a: ${av.passed} passed, ${av.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("avmeld-s1a: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // 2026-10-04 view-stats honesty: producer view statistics count humans, not
 // bots or city pages — /:city no longer books a profile view, trackAgentView
 // stamps is_owner + traffic_category (+ Referer-derived view_source),

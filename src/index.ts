@@ -91,6 +91,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import avmeldRoutes from "./routes/avmeld";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
@@ -326,6 +327,12 @@ app.use(langMiddleware);
 // straight through. Auth = Svix signature (RESEND_WEBHOOK_SECRET; unset → 503).
 // See routes/resend-webhook.ts + services/resend-webhook.ts.
 app.use("/", resendWebhookRoutes);
+
+// ─── /avmeld/:token — working unsubscribe for cold outreach (S1a point 3,
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere). 404 unless
+// OUTREACH_UNSUBSCRIBE_ENABLED. Mounted here so no host gate can swallow the
+// one-click POST. See routes/avmeld.ts.
+app.use("/", avmeldRoutes);
 
 // ─── POST /webhooks/stripe-connect (prepayment, A2A dev-request
 // 2026-10-09-rfb-forhandsbetaling-stripe-connect) ───────────────────────
