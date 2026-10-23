@@ -10245,8 +10245,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json and mcp-server/package.json versions stay in lockstep"
   );
   assertTrue(
-    serverJson.version === "0.5.0" && pkgJson.version === "0.5.0" && mcpbManifest.version === "0.5.0",
-    "phase5.11-a2.5: server.json, package.json and manifest.json are at 0.5.0 (stdio bridge, G1-S2b)"
+    serverJson.version === "0.5.1" && pkgJson.version === "0.5.1" && mcpbManifest.version === "0.5.1",
+    "phase5.11-a2.5: server.json, package.json and manifest.json are at 0.5.1 (SDK 1.32.1 security fix)"
   );
 
   // Test 4.16: server.json description mentions umbrella organizations
@@ -11572,8 +11572,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
   const serverParsed = JSON.parse(serverJsonRoot);
   assertTrue(
-    serverParsed.version === "0.5.0",
-    "pr-56: server.json bumped to v0.5.0 (was 0.3.3, 0.4.0, 0.4.1; stdio bridge in G1-S2b)"
+    serverParsed.version === "0.5.1",
+    "pr-56: server.json at v0.5.1 (SDK 1.32.1 security fix; stdio bridge since 0.5.0)"
   );
   assertTrue(
     Array.isArray(serverParsed.remotes) &&
@@ -49857,5 +49857,23 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("trust-score-uten-google-rating: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-23-mcp-sdk-1-32-sikkerhetsfiks-prod-og-npm (GHSA-46jr):
+// maxToolInputElements on all three McpServers + .max() on list inputs.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-23-mcp-sdk-1-32: MCP input limits ──");
+  try {
+    const { runMcpInputLimitsTests } = require("../src/routes/mcp-input-limits.test") as
+      typeof import("../src/routes/mcp-input-limits.test");
+    const r = await runMcpInputLimitsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("mcp-input-limits: " + f);
+    console.log(`  mcp-input-limits: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-input-limits: unexpected error: " + String(err?.message || err));
   }
 });

@@ -1,6 +1,6 @@
 {
   "name": "opplevagent-mcp",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "mcpName": "io.github.slookisen/opplevagent-mcp",
   "description": "MCP server for opplevagent.no — find Norwegian experiences and activities from Claude Desktop, ChatGPT, and other AI assistants. Curated, Brreg-verified experiences searchable by county, category, weather, season, and group size.",
   "main": "index.js",
@@ -29,7 +29,7 @@
   "author": "Daniel Fredriksen",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.32.1"
   },
   "repository": {
     "type": "git",

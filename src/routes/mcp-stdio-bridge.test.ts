@@ -216,8 +216,8 @@ export async function runMcpStdioBridgeTests(opts: { log?: boolean } = {}): Prom
       shared.equals(fs.readFileSync(path.join(ROOT, sc.pkgDir, "stdio-bridge.js"))));
     const pkg = JSON.parse(read(`${sc.pkgDir}/package.json`));
     const sj = JSON.parse(read(`${sc.pkgDir}/server.json`));
-    // dental 0.2.2: the text of G3-S6d (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker); same bridge as 0.2.1.
-    const version = { dental: "0.2.2", rfb: "0.5.0", experiences: "0.4.0" }[id];
+    // 0.2.3 / 0.5.1 / 0.4.1: SDK ^1.32.1 security fix + README trust-boundary text. dental 0.2.2: the text of G3-S6d (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker); same bridge as 0.2.1.
+    const version = { dental: "0.2.3", rfb: "0.5.1", experiences: "0.4.1" }[id];
     check(`${id}-bridge-2 package.json + server.json are ${version} (both places in server.json)`,
       pkg.version === version && sj.version === version && sj.packages[0].version === version, `${pkg.version}/${sj.version}`);
     check(`${id}-bridge-3 package.json files ships index.js + stdio-bridge.js`,
@@ -228,8 +228,8 @@ export async function runMcpStdioBridgeTests(opts: { log?: boolean } = {}): Prom
     check(`${id}-bridge-3b npm pack --dry-run ships ${sc.packageName}@${version} with exactly ${PACKED_FILES.join(", ")}`,
       packed?.id === `${sc.packageName}@${version}` && JSON.stringify(packed.files) === JSON.stringify(PACKED_FILES),
       packed ? `${packed.id}: ${packed.files.join(", ")}` : packErr);
-    check(`${id}-bridge-4 sdk ^1.29 and no zod dependency`,
-      /^\^1\.29/.test(pkg.dependencies["@modelcontextprotocol/sdk"]) && !pkg.dependencies.zod);
+    check(`${id}-bridge-4 sdk ^1.32 and no zod dependency`,
+      /^\^1\.32/.test(pkg.dependencies["@modelcontextprotocol/sdk"]) && !pkg.dependencies.zod);
     const entry = read(`${sc.pkgDir}/index.js`);
     check(`${id}-bridge-5 index.js is config only (<= 50 lines, no tool definitions)`,
       entry.split("\n").length <= 50 && !/registerTool/.test(entry) && entry.includes(`"${sc.urlEnv}"`) && entry.includes(`"${sc.packageName}"`));
@@ -258,7 +258,7 @@ export async function runMcpStdioBridgeTests(opts: { log?: boolean } = {}): Prom
   check("bridge-6b `sync-mcp-bridge.mjs --check` is clean and covers all three packages", syncOk
     && /"mcp-server",\s*"mcp-server-dental",\s*"mcp-server-opplevagent"/.test(read("scripts/sync-mcp-bridge.mjs")));
   const mcpb = JSON.parse(read("mcp-server/manifest.json"));
-  check("bridge-6c lokal-mcp manifest.json is 0.5.0", mcpb.version === "0.5.0");
+  check("bridge-6c lokal-mcp manifest.json is 0.5.1", mcpb.version === "0.5.1");
 
   const { Client } = require("@modelcontextprotocol/sdk/client/index.js") as typeof import("@modelcontextprotocol/sdk/client/index.js");
   const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js") as typeof import("@modelcontextprotocol/sdk/client/stdio.js");
