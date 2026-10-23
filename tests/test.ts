@@ -33003,6 +33003,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcr.failures) failures.push("opplevelser-gardssalg-claim-revoke: " + f);
     console.log(`  opplevelser-gardssalg-claim-revoke: ${gcr.passed} passed, ${gcr.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8: DELETE
+    // /admin/rfb-seed skips owned rows, merged_into rows are not public.
+    console.log("\n── opplevelser-g1-opprydding: rfb-seed rollback + merged_into visibility ──");
+    const { runOpplevelserG1OppryddingTests } = require("../src/routes/opplevelser-g1-opprydding.test") as
+      typeof import("../src/routes/opplevelser-g1-opprydding.test");
+    const g1o = await runOpplevelserG1OppryddingTests({ log: false });
+    passed += g1o.passed;
+    failed += g1o.failed;
+    for (const f of g1o.failures) failures.push("opplevelser-g1-opprydding: " + f);
+    console.log(`  opplevelser-g1-opprydding: ${g1o.passed} passed, ${g1o.failed} failed`);
+
     // dev-request 2026-07-26-booking-test-send-guard: per-transaction test
     // flag that redirects EVERY outgoing email of that one transaction to
     // TEST_SEND_REDIRECT_EMAIL (services/send-guard.ts, applied inside

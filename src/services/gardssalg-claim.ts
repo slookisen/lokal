@@ -443,7 +443,8 @@ export function getClaimProviderBySlug(slug: string): ClaimProviderRow | null {
       `SELECT ${CLAIM_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE slug = ?
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (merged_into IS NULL OR merged_into = '')`,
     )
     .get(slug) as ClaimProviderRow | undefined;
   return row ?? null;
