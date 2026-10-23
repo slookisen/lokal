@@ -9,6 +9,9 @@
  */
 
 import { EXPERIENCE_TAGS } from "./experience-tags";
+// Example booking note comes from the one shared source (G1 item 7,
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg).
+import { GARDSSALG_BOOKING_NOTE_OPENS_SOON } from "./gardssalg-booking-gate";
 
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
@@ -208,7 +211,7 @@ export function getExperiencesOpenapi(): object {
                             lat: 60.57,
                             lon: 6.9,
                             geocode_confidence: "high",
-                            booking: { live: false, mode: "paused", note: "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch." },
+                            booking: { live: false, mode: "paused", note: GARDSSALG_BOOKING_NOTE_OPENS_SOON },
                             profile_url: "https://opplevagent.no/kategori/gardssalg/produsent/eksempel-sideri--abc123",
                           },
                         ],
@@ -410,7 +413,10 @@ export function getExperiencesOpenapi(): object {
             },
             booking: {
               type: "object",
-              description: "Honest booking status — never claims an active booking flow before the dark-launch gate opens.",
+              description:
+                "Honest booking status — never claims an active booking flow before the dark-launch gate opens. " +
+                "When not live, the note says the producer is not taking requests right now if the profile has an " +
+                "owner, and that bookings open soon only for profiles that have never been claimed.",
               properties: {
                 live: { type: "boolean" },
                 mode: { type: "string", enum: ["request", "paused"] },

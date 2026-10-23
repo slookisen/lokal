@@ -31827,6 +31827,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gba.failures) failures.push("opplevelser-gardssalg-booking-activation: " + f);
     console.log(`  opplevelser-gardssalg-booking-activation: ${gba.passed} passed, ${gba.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 items 3 + 7:
+    // owner booking switch (booking-request address, admin brake wins,
+    // manual rows can toggle booking) and the AI booking note ("tar ikke imot
+    // forespørsler nå" for owned profiles that are off). Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-booking-switch: owner booking switch + admin brake + AI booking note ──");
+    const { runOpplevelserGardssalgBookingSwitchTests } = require("../src/routes/opplevelser-gardssalg-booking-switch.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-booking-switch.test");
+    const gbs = await runOpplevelserGardssalgBookingSwitchTests({ log: false });
+    passed += gbs.passed;
+    failed += gbs.failed;
+    for (const f of gbs.failures) failures.push("opplevelser-gardssalg-booking-switch: " + f);
+    console.log(`  opplevelser-gardssalg-booking-switch: ${gbs.passed} passed, ${gbs.failed} failed`);
+
     // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
     // Slice 2 ("outreach-guard"): pure-function unit tests for
     // dedupeGardssalgOutreachRecipients (no DB) — wired into POST

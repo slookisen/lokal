@@ -906,6 +906,14 @@ import {
 // opening-hours check, also used by experiences-seo.ts's no-JS fallback and
 // experiences-mcp.ts's book_gardssalg tool. Never re-derive this inline.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 items 3 + 7: the
+// shared booking-request-address rule, the admin brake writer and the AI
+// booking note (one source for MCP / A2A / REST).
+import {
+  hasBookingRequestEmail,
+  setGardssalgBookingAdminBrake,
+  gardssalgBookingStatus,
+} from "../services/gardssalg-booking-gate";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
 // provider resolution + requested-weekday guard + the shared honest-outcome
 // payloads, applied to POST /book BEFORE the unchanged BookingInputSchema →
@@ -1367,7 +1375,6 @@ router.get("/discover", (req: Request, res: Response) => {
           // Same shape/construction as discover_gardssalg's own formatting
           // (src/routes/experiences-mcp.ts) — kept byte-identical on purpose
           // so an agent gets the same honest booking status either surface.
-          const live = !isBookingPaused(row.booking_live);
           return {
             // provider_id for POST /book / book_gardssalg — was missing until
             // 2026-09-16 (see the MCP tool's own comment).
@@ -1382,13 +1389,8 @@ router.get("/discover", (req: Request, res: Response) => {
             lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
             lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
             geocode_confidence: row.geocode_confidence ?? null,
-            booking: {
-              live,
-              mode: live ? ("request" as const) : ("paused" as const),
-              note: live
-                ? "Book direkte. / Book directly."
-                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-            },
+            // Shared with discover_gardssalg / A2A (services/gardssalg-booking-gate.ts).
+            booking: gardssalgBookingStatus(row),
             profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
             // Only present when an origin (lat/lng) was given — mirrors the
             // experiences-branch's own ...(hasGeo ? {...} : {}) spread below.
@@ -23087,7 +23089,7 @@ export function planGardssalgBookingActivation(
     }
     const current: 0 | 1 = row.booking_live === 1 ? 1 : 0;
     const target: 0 | 1 = enabled ? 1 : 0;
-    const hasEmail = typeof row.epost === "string" && row.epost.trim() !== "";
+    const hasEmail = hasBookingRequestEmail(row.epost);
     if (enabled && !hasEmail) {
       return { provider_id: id, name: row.navn, ok: false, changed: false, reason: "no_email", from: current };
     }
@@ -23128,7 +23130,7 @@ export function applyGardssalgBookingActivation(
     if (!row) return null;
     const current: 0 | 1 = row.booking_live === 1 ? 1 : 0;
     const target: 0 | 1 = enabled ? 1 : 0;
-    const hasEmail = typeof row.epost === "string" && row.epost.trim() !== "";
+    const hasEmail = hasBookingRequestEmail(row.epost);
     if (enabled && !hasEmail) return null;
     if (current === target) return null;
 
@@ -23201,6 +23203,12 @@ router.post("/admin/gardssalg-booking-activation", requireAdmin, (req: Request, 
 
     const batchId = `booking-activation-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
     const results = plan.map((item) => {
+      // Admin brake (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg,
+      // G1 item 3): enabled:false stamps it, enabled:true lifts it — also for
+      // a row already at the target value, so the admin can stop an owner
+      // whose booking is already off. Only for rows that passed the plan
+      // (never not_found / no_email). See services/gardssalg-booking-gate.ts.
+      if (item.ok) setGardssalgBookingAdminBrake(expDb, item.provider_id, !enabled, enabled ? null : note, batchId);
       if (!item.ok || !item.changed) return item;
       const applied = applyGardssalgBookingActivation(expDb, item.provider_id, enabled, note, batchId);
       if (!applied) {

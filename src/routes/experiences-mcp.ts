@@ -118,6 +118,10 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
 } from "../services/booking-store";
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
+// source for the booking note (discover_gardssalg) and the "not taking
+// requests now" line (book_gardssalg) for owned profiles that are off.
+import { gardssalgBookingStatus, gardssalgNotTakingRequestsText } from "../services/gardssalg-booking-gate";
 // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
@@ -1246,7 +1250,6 @@ export function registerExperienceTools(
           // catalog_hidden is never 1 here — searchGardssalgProviders()'s base
           // WHERE clause already excludes those rows entirely — so this call
           // site never needs to (and never does) pass a catalog_hidden arg.
-          const live = !isBookingPaused(row.booking_live);
           return {
             // `id` is the provider_id book_gardssalg needs. It was MISSING from
             // this row until 2026-09-16 (dev-request …-en-setning-booking-via-
@@ -1264,13 +1267,10 @@ export function registerExperienceTools(
             lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
             lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
             geocode_confidence: row.geocode_confidence ?? null,
-            booking: {
-              live,
-              mode: live ? ("request" as const) : ("paused" as const),
-              note: live
-                ? "Book direkte. / Book directly."
-                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-            },
+            // One source for the note (services/gardssalg-booking-gate.ts):
+            // an owned profile that is off says "tar ikke imot forespørsler
+            // nå"; only never-claimed profiles say "åpner snart".
+            booking: gardssalgBookingStatus(row),
             profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
             // Only present when an origin (lat/lng) was given — mirrors
             // discover_experiences's own ...(hasGeo ? {...} : {}) spread.
@@ -1446,7 +1446,7 @@ export function registerExperienceTools(
         // here. An unknown provider_id falls through the same path (no row
         // -> booking_live undefined -> "not live"), same as the web form.
         const provider = getProviderById(parsed.data.provider_id) as
-          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null }
+          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null }
           | null;
         // Echoed on every outcome below so the assistant can name the producer
         // it acted on (and link the profile when booking is not activated).
@@ -1461,6 +1461,9 @@ export function registerExperienceTools(
           : null;
         const slotLocal = formatSlotOslo(parsed.data.slot_at);
         if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
+          // Owned profile that is off: "tar ikke imot forespørsler nå", not
+          // "ikke aktivert ennå" (G1 item 7). Never-claimed: unchanged copy.
+          const notTaking = gardssalgNotTakingRequestsText(provider?.claimed_at ?? null);
           return {
             content: [{
               type: "text" as const,
@@ -1472,9 +1475,9 @@ export function registerExperienceTools(
                 provider: providerInfo,
                 message:
                   (providerInfo?.navn ? `${providerInfo.navn}: ` : "") +
-                  BOOKING_NOT_ACTIVATED_MSG +
+                  (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
                   (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
-                  " / Booking is not activated for this producer yet." +
+                  (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
                   (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
               }, null, 2),
             }],

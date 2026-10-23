@@ -65,11 +65,12 @@ import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
 import { rpcInternalErrorReply } from "../utils/internal-error";
-// Only isBookingPaused is used here (same import + reasoning as
+// The booking object (isBookingPaused under the hood, same as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
-// base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
-// call site never passes a catalog_hidden arg either.
-import { isBookingPaused } from "../services/booking-store";
+// base WHERE clause already excludes catalog_hidden=1 rows entirely, so no
+// catalog_hidden arg is needed. One shared note source (dev-request
+// 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7).
+import { gardssalgBookingStatus } from "../services/gardssalg-booking-gate";
 
 export { parseExperiencesIntent };
 
@@ -474,11 +475,10 @@ export function handleExperiencesMessageSend(
           : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
 
       // Per-row shape mirrors discover_gardssalg (experiences-mcp.ts)
-      // EXACTLY — same field names, same isBookingPaused()-derived booking
+      // EXACTLY — same field names, same gardssalgBookingStatus()-derived booking
       // object, same bilingual notes, same profile_url template, same
       // hasGeo-gated distance_km.
       const producers = results.map((row) => {
-        const live = !isBookingPaused(row.booking_live);
         return {
           // provider_id for book_gardssalg / POST /api/opplevelser/book (added
           // 2026-09-16, dev-request …-en-setning-booking-via-ai — same
@@ -494,13 +494,7 @@ export function handleExperiencesMessageSend(
           lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
           lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
           geocode_confidence: row.geocode_confidence ?? null,
-          booking: {
-            live,
-            mode: live ? ("request" as const) : ("paused" as const),
-            note: live
-              ? "Book direkte. / Book directly."
-              : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-          },
+          booking: gardssalgBookingStatus(row),
           profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
           ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
         };
