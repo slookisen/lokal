@@ -147,6 +147,7 @@ import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -1689,7 +1690,7 @@ async function getOrCreateExperiencesSession(
       "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
       "searchable by county, category, weather, season, and group size. / " +
       "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
-  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS });
+  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
 
   // Getters read live from the sessions map (by id) rather than closing over
   // a snapshot, so a later request on the same session that resolves a

@@ -57,6 +57,23 @@ hvilke tannlegekjeder finnes i Norge?
 statistikk tannleger per fylke
 ```
 
+## What the bridge sends
+
+Besides the tool arguments of each call, the bridge identifies itself to the remote server
+in two ways: the MCP `clientInfo` (your AI client's name and version, as
+"<client> via finn-tannlege-mcp") and a `User-Agent` header of the form `finn-tannlege-mcp/<version>`. This is
+client statistics, not an identifier of you: no account, credentials or device identifier is
+sent. The server keeps ordinary web-request logs (IP address and request metadata) for
+operations and abuse prevention.
+
+## Trust boundary
+
+The tool list, tool descriptions and server instructions are fetched from the remote
+server (`https://finn-tannlege.com/mcp`) over HTTPS every time the bridge starts. This package does not pin or
+freeze them, so what your AI client sees is whatever the remote service currently serves.
+`FINN_TANNLEGE_URL` overrides the remote URL, and every tool argument you or your AI client supply is
+sent to that host. Only set it from a configuration you trust.
+
 ## Environment
 
 | Variable | Default | Description |

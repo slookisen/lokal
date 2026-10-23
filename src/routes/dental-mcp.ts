@@ -50,6 +50,7 @@ import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/
 import { companyFooterLineHtml } from "../services/company-legal";
 import { BRAND_ENTITIES, brandMcpIcons } from "../config/brand-entities";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
 
 const router = Router();
 
@@ -616,7 +617,7 @@ async function getOrCreateDentalSession(
     description: DENTAL_MCP_SERVER_DESCRIPTION,
     websiteUrl: BRAND_ENTITIES.dental.url,
     icons: DENTAL_MCP_SERVER_ICONS,
-  }, { instructions: DENTAL_MCP_INSTRUCTIONS });
+  }, { instructions: DENTAL_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
 
   registerDentalTools(server);
 

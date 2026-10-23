@@ -135,18 +135,18 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
   const sj = JSON.parse(pkgSj.toString("utf8"));
   check("dist-10 lokal-mcp description", sj.description ===
     "Norwegian local-food MCP: 1,500+ farms, shops, markets + umbrellas (Bondens marked, Hanen, REKO).", sj.description);
-  check("dist-11 lokal-mcp is 0.5.0 (stdio bridge, G1-S2b)", sj.version === "0.5.0" && sj.packages[0].version === "0.5.0"
-    && JSON.parse(read("mcp-server/package.json")).version === "0.5.0" && JSON.parse(read("mcp-server/manifest.json")).version === "0.5.0");
+  check("dist-11 lokal-mcp is 0.5.1 (SDK 1.32.1 security fix)", sj.version === "0.5.1" && sj.packages[0].version === "0.5.1"
+    && JSON.parse(read("mcp-server/package.json")).version === "0.5.1" && JSON.parse(read("mcp-server/manifest.json")).version === "0.5.1");
   check("dist-12 mcp-server/package.json files ships server.json",
     (JSON.parse(read("mcp-server/package.json")).files as string[]).includes("server.json"));
   check("dist-13 dental server.json websiteUrl", JSON.parse(read("mcp-server-dental/server.json")).websiteUrl === "https://finn-tannlege.com");
   check("dist-14 opplevagent server.json websiteUrl", JSON.parse(read("mcp-server-opplevagent/server.json")).websiteUrl === "https://opplevagent.no");
   // 0.2.1 shipped the shared bridge that exits on stdin EOF (G1-S2c); 0.2.2 is the text of G3-S6d (point 12),
   // since npm and the MCP registry do not take a new text under a published version.
-  check("dist-15 finn-tannlege-mcp is 0.2.2 in every place (G3-S6d text)",
-    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.2"
-    && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.2"
-    && JSON.parse(read("mcp-server-dental/server.json")).packages[0].version === "0.2.2");
+  check("dist-15 finn-tannlege-mcp is 0.2.3 in every place (SDK 1.32.1 security fix)",
+    JSON.parse(read("mcp-server-dental/package.json")).version === "0.2.3"
+    && JSON.parse(read("mcp-server-dental/server.json")).version === "0.2.3"
+    && JSON.parse(read("mcp-server-dental/server.json")).packages[0].version === "0.2.3");
   // G3-S6d point 12: the npm text says what the service does after F1-S4c and F2-S10. The registry's
   // server.json schema takes a description of at most 100 characters.
   {
@@ -164,12 +164,12 @@ export async function runDistributionMetadataTests(opts: { log?: boolean } = {})
     const sjDesc = texts[2][1];
     check("dist-17c dental server.json description fits the registry's 100 characters", sjDesc.length > 0 && sjDesc.length <= 100, String(sjDesc.length));
   }
-  check("dist-16 opplevagent-mcp is 0.4.0 in every place (0.3.0 was never published)",
-    JSON.parse(read("mcp-server-opplevagent/package.json")).version === "0.4.0"
-    && JSON.parse(read("mcp-server-opplevagent/server.json")).version === "0.4.0"
-    && JSON.parse(read("mcp-server-opplevagent/server.json")).packages[0].version === "0.4.0"
-    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/manifest.json")).version === "0.4.0"
-    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/server.json")).version === "0.4.0");
+  check("dist-16 opplevagent-mcp is 0.4.1 in every place (SDK 1.32.1 security fix)",
+    JSON.parse(read("mcp-server-opplevagent/package.json")).version === "0.4.1"
+    && JSON.parse(read("mcp-server-opplevagent/server.json")).version === "0.4.1"
+    && JSON.parse(read("mcp-server-opplevagent/server.json")).packages[0].version === "0.4.1"
+    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/manifest.json")).version === "0.4.1"
+    && JSON.parse(read("opplevagent-connectors-prep/claude-desktop/server.json")).version === "0.4.1");
 
   return { passed, failed, failures };
 }

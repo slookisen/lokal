@@ -60,6 +60,7 @@ import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS } from "../services/mcp-input-limits";
 
 const router = Router();
 
@@ -990,12 +991,12 @@ export function registerTools(
         // a real, filterable category — 133 producers carry it — but was
         // missing from this list entirely, so an agent reading only this
         // description had no way to know drink venues were searchable here.
-        categories: z.array(z.string()).optional().describe(
+        categories: z.array(z.string()).max(MCP_MAX_FILTER_LIST).optional().describe(
           "Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs, beverages " +
           "(beverages = all drink venues: breweries, cideries, wineries, distilleries, farm cafés, meaderies — " +
           "use drinkSubcategory below to narrow to exactly one kind)",
         ),
-        tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+        tags: z.array(z.string()).max(MCP_MAX_FILTER_LIST).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
         drinkSubcategory: z.enum(DRINK_SUBCATEGORIES).optional().describe(
           "Narrow 'beverages' results to exactly one drink venue kind: bryggeri (brewery), cideri (cidery), " +
           "vingård (winery), destilleri (distillery), gårdskafé (farm café), mjød (meadery/mead producer). " +
@@ -1578,7 +1579,7 @@ export function registerTools(
       title: "Find offers for shopping-list items",
       description: "For each item in a shopping list, find up to 5 nearby producers who sell it (or a matching product), sorted by distance, with contact info and whether an order can be placed through the platform (can_order). Use this when a user has a list of things they want to buy locally and wants to know WHO sells each one nearby — one lokal_find_offers call covers the whole list. Read-only.",
       inputSchema: {
-        items: z.array(z.string()).min(1).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
+        items: z.array(z.string()).min(1).max(MCP_MAX_SHOPPING_ITEMS).describe("Search terms/item names to find offers for, e.g. ['poteter', 'honning', 'egg']."),
         near: z.string().optional().describe("Norwegian place name to search near (geocoded automatically). Supply this OR lat/lng."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply together with lng."),
         lng: z.number().min(-180).max(180).optional().describe("User's longitude (WGS84). Must be supplied together with lat."),
@@ -2092,7 +2093,7 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions() });
+  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 
