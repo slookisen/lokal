@@ -627,6 +627,21 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE gardssalg_content_audit ADD COLUMN notes TEXT");
   } catch { /* already present */ }
 
+  // ─── experience_providers.booking_admin_brake_at / _note (dev-request
+  // 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 3) ────────────────
+  // Additive, nullable. Set by the admin lever's enabled:false (POST
+  // /admin/gardssalg-booking-activation, routes/opplevelser.ts), cleared by
+  // its enabled:true. While set, the owner portal may switch booking_live off
+  // but not on (services/gardssalg-booking-gate.ts). NULL = no brake, so every
+  // existing row keeps today's behaviour. booking_live stays the only switch
+  // the booking surfaces read.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN booking_admin_brake_at TEXT DEFAULT NULL");
+  } catch { /* already present */ }
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN booking_admin_brake_note TEXT DEFAULT NULL");
+  } catch { /* already present */ }
+
   // ─── gardssalg_orgnr_review_queue (dev-request 2026-07-18-gardssalg-
   // profilkvalitet-foer-outreach, slice 5b) ───────────────────────────────────
   // Every gårdssalg provider whose org_nr the Brreg-name-search backfill

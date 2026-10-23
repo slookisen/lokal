@@ -380,6 +380,7 @@ import { GENERIC_DOMAINS } from "./gardssalg-rfb-enrich";
 import { fetchPage, discoverContentLinks } from "./fetch-page";
 import { extractEmails } from "./search-enrich";
 import { isAcceptableHomepageEmail, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
+import { ownerBookingEnableBlock, type OwnerBookingBlock } from "./gardssalg-booking-gate";
 
 const VERTICAL = "experiences";
 
@@ -411,10 +412,13 @@ export interface ClaimProviderRow {
   products: string | null;
   booking_live: number | null;
   epost: string | null;
+  // Admin brake (G1 item 3, services/gardssalg-booking-gate.ts).
+  booking_admin_brake_at: string | null;
+  booking_admin_brake_note: string | null;
 }
 
 const CLAIM_PROVIDER_COLUMNS =
-  "id, navn, slug, org_nr, brreg_verified, hjemmeside, content_source, field_provenance, about_text, visit_text, opening_hours_text, products, booking_live, epost";
+  "id, navn, slug, org_nr, brreg_verified, hjemmeside, content_source, field_provenance, about_text, visit_text, opening_hours_text, products, booking_live, epost, booking_admin_brake_at, booking_admin_brake_note";
 
 export function getClaimProviderById(providerId: string): ClaimProviderRow | null {
   const db = getDb(VERTICAL);
@@ -2164,28 +2168,59 @@ function claimValuesEqual(field: ClaimEditableField, a: unknown, b: unknown): bo
   return a === b;
 }
 
+/** The owner tried to switch booking ON and the shared gate said no
+ *  (services/gardssalg-booking-gate.ts). Nothing was written. */
+export interface UpdateProfileBookingBlocked {
+  ok: false;
+  error: "booking_blocked";
+  block: OwnerBookingBlock;
+}
+
 /**
  * Owner (session-authenticated) profile write. Unlike the auto-enrichment
  * write-paths in experience-store.ts (fill-only, gated on content_source NOT
  * IN ('manual','claim')), the OWNER is allowed to REPLACE any of their own
  * whitelisted fields freely — that's the entire point of the claim. The only
- * thing that still blocks a write is content_source = 'manual': a row Daniel
- * personally curated takes precedence over the claiming owner, mirroring
- * RFB's "locked_by_X, X != owner" rule in owner-portal.ts (skipped, not
- * silently dropped — same response shape: {field, reason}).
+ * thing that still blocks a CONTENT write is content_source = 'manual': a row
+ * Daniel personally curated takes precedence over the claiming owner,
+ * mirroring RFB's "locked_by_X, X != owner" rule in owner-portal.ts (skipped,
+ * not silently dropped — same response shape: {field, reason}).
+ *
+ * booking_live is the owner's consent switch, not content, so the manual lock
+ * does not apply to it (dev-request 2026-10-22-opplevagent-mine-valg-
+ * gardssalg, G1 item 3). Switching it ON (0 -> 1) goes through the shared
+ * gate instead (ownerBookingEnableBlock): an admin brake wins over the owner,
+ * and an address for booking requests is required — the same rule as the
+ * admin lever. A blocked switch-on rejects the WHOLE request (nothing is
+ * written) so the caller can answer 409 with the Norwegian reason.
  */
 export function updateClaimedProviderProfile(
   providerId: string,
   body: Record<string, unknown>,
-): UpdateProfileOutcome | { ok: false; error: "provider_not_found" } {
+): UpdateProfileOutcome | UpdateProfileBookingBlocked | { ok: false; error: "provider_not_found" } {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, about_text, visit_text, opening_hours_text, products, hjemmeside, booking_live
+      `SELECT id, content_source, about_text, visit_text, opening_hours_text, products, hjemmeside, booking_live,
+              epost, booking_admin_brake_at, booking_admin_brake_note
          FROM experience_providers WHERE id = ?`,
     )
-    .get(providerId) as ({ id: string; content_source: string | null } & Record<string, unknown>) | undefined;
+    .get(providerId) as
+    | ({
+        id: string;
+        content_source: string | null;
+        booking_live: number | null;
+        epost: string | null;
+        booking_admin_brake_at: string | null;
+        booking_admin_brake_note: string | null;
+      } & Record<string, unknown>)
+    | undefined;
   if (!row) return { ok: false, error: "provider_not_found" };
+
+  if ("booking_live" in body && sanitizeBookingLive(body.booking_live) === 1 && row.booking_live !== 1) {
+    const block = ownerBookingEnableBlock(row);
+    if (block) return { ok: false, error: "booking_blocked", block };
+  }
 
   const locked = row.content_source === "manual";
 
@@ -2198,7 +2233,7 @@ export function updateClaimedProviderProfile(
 
   for (const field of CLAIM_EDITABLE_FIELDS) {
     if (!(field in body)) continue;
-    if (locked) {
+    if (locked && field !== "booking_live") {
       skippedFields.push({ field, reason: "locked_by_manual" });
       continue;
     }
