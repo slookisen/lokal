@@ -2270,6 +2270,10 @@ export function updateClaimedProviderProfile(
       const lockedAt = new Date().toISOString();
       // G1 pkt 2: only changed, non-empty fields get a stamp (lockedFields).
       for (const field of lockedFields) {
+        // Keep an Opplevagent-support lock as it is (locked_by:"admin"), so
+        // the owner cannot turn it into a lock they can give back.
+        const prior = ownerLocks[field];
+        if (prior && typeof prior === "object" && (prior as Record<string, unknown>).locked_by === "admin") continue;
         ownerLocks[field] = { locked_at: lockedAt };
       }
       if (lockedFields.length > 0) {
@@ -2386,6 +2390,8 @@ export interface OwnerLockBackfillResult {
   skipped_missing_provider: number;
   /** G1 pkt 2: owner gave the field back after their last edit. */
   skipped_released: number;
+  /** G1 pkt 2: the owner's latest edit saved the field as empty. */
+  skipped_empty: number;
 }
 
 export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockBackfillResult {
@@ -2401,6 +2407,14 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
     .all() as Array<{ provider_id: string; field_name: string; latest_changed_at: string }>;
   // G1 pkt 2: a field the owner has given back («gi tilbake») after their
   // last edit must not be re-locked by this backfill.
+  // A field whose latest owner edit saved it as empty is not locked (same
+  // rule as updateClaimedProviderProfile).
+  const latestOwnerValue = db.prepare(
+    `SELECT new_value FROM gardssalg_content_audit
+      WHERE provider_id = ? AND field_name = ? AND changed_by = 'owner'
+      ORDER BY changed_at DESC, rowid DESC
+      LIMIT 1`,
+  );
   const releasedSince = db.prepare(
     `SELECT 1 FROM gardssalg_content_audit
       WHERE provider_id = ? AND field_name = ? AND changed_by = 'owner'
@@ -2412,6 +2426,7 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
   let alreadyStamped = 0;
   let skippedMissingProvider = 0;
   let skippedReleased = 0;
+  let skippedEmpty = 0;
 
   // One provider row can appear for multiple field_name groups above — each
   // (provider_id, field_name) group gets its OWN read-modify-write (same
@@ -2455,6 +2470,12 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
       skippedReleased++;
       return;
     }
+    const latest = latestOwnerValue.get(row.provider_id, row.field_name) as { new_value: string | null } | undefined;
+    const latestValue = latest?.new_value;
+    if (latestValue === null || latestValue === undefined || ["", "null", "[]"].includes(latestValue.trim())) {
+      skippedEmpty++;
+      return;
+    }
 
     stamped++;
     if (!apply) return; // dry-run: count what WOULD be stamped, write nothing
@@ -2469,5 +2490,5 @@ export function backfillGardssalgOwnerLockProvenance(apply: boolean): OwnerLockB
 
   for (const row of rows) runOne(row);
 
-  return { scanned: rows.length, stamped, already_stamped: alreadyStamped, skipped_missing_provider: skippedMissingProvider, skipped_released: skippedReleased };
+  return { scanned: rows.length, stamped, already_stamped: alreadyStamped, skipped_missing_provider: skippedMissingProvider, skipped_released: skippedReleased, skipped_empty: skippedEmpty };
 }

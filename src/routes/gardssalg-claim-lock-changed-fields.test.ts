@@ -200,11 +200,30 @@ export function runGardssalgClaimLockChangedFieldsTests(opts: { log?: boolean } 
       assertEq(locksOf("prov-lc"), ["products"], "r15: the admin lock is still there");
       store.applyGardssalgFieldLock("prov-lc", "products", false, "test");
 
+      // B2: backfill must not lock a field whose latest owner edit was empty.
+      // prov-lc.about_text was saved as "" in s15 (owner audit row, new_value "")
+      // and never re-locked since. Seed a matching empty-products owner row too.
+      expDb.prepare(
+        `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES ('aud-empty-products', 'prov-long', 'products', NULL, '[]', NULL, 'owner-portal', 'owner', datetime('now'))`,
+      ).run();
       // Backfill must not re-lock a field the owner gave back.
       const bf = claimSvc.backfillGardssalgOwnerLockProvenance(true);
       assertTrue(!locksOf("prov-lc").includes("visit_text"), "r16: owner-lock backfill does not re-lock a released field");
       assertTrue(!locksOf("prov-lc").includes("visit_text_lock"), "r17: backfill ignores the synthetic <field>_lock audit rows");
       assertTrue(bf.skipped_released >= 1, "r18: backfill counts the released field as skipped_released");
+      assertTrue(!locksOf("prov-lc").includes("about_text"), "r19: backfill does not lock about_text, which the owner last saved as empty");
+      assertTrue(!locksOf("prov-long").includes("products"), "r20: backfill does not lock products, last saved as []");
+      assertTrue(bf.skipped_empty >= 2, "r21: backfill counts empty-saved fields as skipped_empty");
+
+      // B1: an Opplevagent-support lock survives an owner save of that field,
+      // so «gi tilbake» is still refused.
+      store.applyGardssalgFieldLock("prov-long", "visit_text", true, "test");
+      const b1 = claimSvc.updateClaimedProviderProfile("prov-long", { visit_text: "Eieren skriver over" });
+      if ("ok" in b1 && b1.ok) assertEq(b1.updatedFields, ["visit_text"], "b1: the owner's change is still written");
+      const b1Lock = JSON.parse(readRow("prov-long").field_provenance).owner_locks.visit_text;
+      assertEq(b1Lock.locked_by, "admin", "b2: the admin lock is not stamped over by the owner's save");
+      assertEq(claimSvc.releaseClaimedProviderFieldLock("prov-long", "visit_text"), { ok: false, error: "locked_by_admin" }, "b3: «gi tilbake» is still refused after the owner's save");
 
       // ── (h) HTTP ─────────────────────────────────────────────────────
       const routerMod = require("./gardssalg-claim") as typeof import("./gardssalg-claim");
@@ -271,6 +290,10 @@ export function runGardssalgClaimLockChangedFieldsTests(opts: { log?: boolean } 
       assertEq(ok.status, 200, "h12: JSON release with the owner's session -> 200");
       assertEq(JSON.parse(ok.body), { success: true, field: "about_text", released: true }, "h13: JSON release body");
       assertEq(locksOf("prov-lc"), [], "h14: lock removed via the JSON endpoint");
+
+      const adminLocked = await req("POST", "/api/opplevelser/gardssalg-claim/prov-long/release-field", { ...json, Cookie: `oa_owner_session=${otherToken}` }, JSON.stringify({ field: "visit_text" }));
+      assertEq(adminLocked.status, 409, "b4: JSON release of a support lock after an owner save -> 409");
+      assertEq(JSON.parse(readRow("prov-long").field_provenance).owner_locks.visit_text.locked_by, "admin", "b5: the support lock is still there");
 
       // No-JS path: the portal form's formaction posts urlencoded.
       claimSvc.updateClaimedProviderProfile("prov-lc", { opening_hours_text: "Lør 11-15" });
