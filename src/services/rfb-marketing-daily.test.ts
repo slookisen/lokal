@@ -435,6 +435,39 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       setEnv({ RFB_MARKETING_PLATFORM_ENABLED: "1", RFB_MARKETING_DAILY_CAP: "1" });
     }
 
+    // ── (c') social-proof count = active RFB producers only (2026-10-23) ───
+    {
+      const before = daily.countRfbProducersForSocialProof(db);
+      assertEq(before, 152, "c11: 150 fillers + 2 seeded producers");
+      const insA = db.prepare(
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, is_active, vertical_id, umbrella_type)
+         VALUES (?, ?, 'sp', 'test', '', 'https://sp-test.no', ?, ?, ?, ?, ?)`,
+      );
+      const insK = db.prepare(`INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, ?)`);
+      const extra: Array<[string, string, number, string, string | null, string | null]> = [
+        ["sp-terminal", "producer", 1, "rfb", null, "terminal_unconfirmable"],
+        ["sp-umbrella", "producer", 1, "rfb", "market_network", "verified"],
+        ["sp-inactive", "producer", 0, "rfb", null, "verified"],
+        ["sp-dental", "producer", 1, "dental", null, "verified"],
+        ["sp-not-producer", "consumer", 1, "rfb", null, "verified"],
+        ["sp-no-knowledge", "producer", 1, "rfb", null, null],
+      ];
+      for (const [id, role, active, vertical, umbrella, status] of extra) {
+        insA.run(id, id, role, `key-${id}`, active, vertical, umbrella);
+        if (status) insK.run(id, status);
+      }
+      assertEq(
+        daily.countRfbProducersForSocialProof(db),
+        before + 1,
+        "c12: terminal, umbrella, inactive, other-vertical and non-producer rows are not counted; a producer without a knowledge row is",
+      );
+      for (const [id] of extra) {
+        db.prepare(`DELETE FROM agent_knowledge WHERE agent_id = ?`).run(id);
+        db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+      }
+      assertEq(daily.countRfbProducersForSocialProof(db), before, "c13: cleanup restores the count");
+    }
+
     // ── (d) G2 — lane switch + routes ──────────────────────────────────────
     {
       const laneRouter = adminRoutes.rfbMarketingLaneRouter as any;
