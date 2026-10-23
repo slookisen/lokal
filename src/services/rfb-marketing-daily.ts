@@ -168,6 +168,7 @@ import {
   type HcrProductNamesExtractor,
 } from "../routes/admin-knowledge";
 import { slugify } from "../utils/slug";
+import { RFB_VERIFIER_SCOPE_SQL } from "../agents/lokal-agent-verifier";
 import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "./recipient-policy";
 import {
   RFB_OUTREACH_TEMPLATE_ID,
@@ -651,17 +652,28 @@ function readOutreachReservedToday(db: Db, day: string): number {
 }
 
 /**
- * The social-proof number, from the same source the routine used: the sum of
- * `by_verification_status_all_knowledge_rows[].c` in GET
- * /admin/outreach-ready-pool/stats (routes/admin-outreach-pool.ts) — i.e. this
- * exact GROUP BY over every agent_knowledge row, summed. (`by_verification_status`
- * itself is producer-scoped since 2026-10-12 and no longer the same number.)
+ * The social-proof number: active RFB producers in the catalogue. Same scope as
+ * `by_verification_status_rfb_producers` in GET /admin/outreach-ready-pool/stats
+ * (routes/admin-outreach-pool.ts: role='producer' + RFB_VERIFIER_SCOPE_SQL, so no
+ * umbrella rows and no other vertical), plus is_active=1, and without
+ * terminal_unconfirmable rows (producers the verifier has given up confirming).
+ *
+ * Until 2026-10-23 this summed EVERY agent_knowledge row — all verticals,
+ * umbrella rows, inactive and terminal rows: 1 776 rows against 1 565 such
+ * producers, so the e-mail claimed «over 1 700» (dev-request
+ * 2026-10-23-rfb-outreach-aerlig-produsenttall, Daniel «Ærlig produsenttall»).
  */
 export function countRfbProducersForSocialProof(db: Db): number {
-  const rows = db
-    .prepare(`SELECT verification_status AS k, COUNT(*) AS c FROM agent_knowledge GROUP BY verification_status`)
-    .all() as Array<{ k: string | null; c: number }>;
-  return rows.reduce((sum, r) => sum + r.c, 0);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS c
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.role = 'producer' AND a.is_active = 1 AND ${RFB_VERIFIER_SCOPE_SQL}
+          AND COALESCE(k.verification_status, '') != 'terminal_unconfirmable'`,
+    )
+    .get() as { c: number };
+  return row.c;
 }
 
 // ─── Per-candidate pre-send checks (read-only) ─────────────────────────────
