@@ -32,8 +32,11 @@ Summary for reviewers and users of this extension:
 - **What is not sent.** No account, no credentials, no payment details, no
   chat history. The service has no user accounts, so there is nothing to log in to.
 - **What is stored.** The server keeps ordinary web-request logs (IP address and
-  request metadata) for operations and abuse prevention. Tool calls from this
-  extension are not tied to a person, because no identifier is transmitted.
+  request metadata) for operations and abuse prevention.
+- **What the bridge sends about itself.** Besides the tool arguments, the bridge sends
+  your AI client's name and version in the MCP `clientInfo` (as "<client> via lokal-mcp")
+  and a `User-Agent` of the form `lokal-mcp/<version>`. This is client statistics and does
+  not identify you: no account, credentials or device identifier is sent.
 - **Who else sees it.** Nobody. Data is not sold, and it is not shared with third
   parties for advertising or profiling.
 - **Third-party contact.** The cart tools (`lokal_cart_*`) are part of this
@@ -41,8 +44,15 @@ Summary for reviewers and users of this extension:
   producer is e-mailed about that pickup order, and only if the producer has opted in
   to orders through the platform. Payment is made to the producer at pickup; the
   platform never takes payment. The other tools are read-only.
+- **Cart and ordering need no login.** `lokal_cart_*` require no sign-in, and
+  submission is rate-limited on the server. Submission only reaches producers that have
+  opted in to orders. Your AI client must get your explicit yes before it calls
+  `lokal_cart_submit`, because that sends an e-mail to the producer.
+- **Trust boundary.** Tools, descriptions and instructions are fetched from the remote
+  server over HTTPS and are not pinned by this package. `LOKAL_URL` must come from a trusted
+  configuration, because every tool argument is sent to that host.
 - **Your control.** Stop sending data by removing the extension. Because no
   account exists, there is no stored profile to delete. Questions and deletion
   requests: hei@rettfrabonden.com.
 - **Optional setting.** `LOKAL_URL` overrides the remote base URL; leave it unset to
-  use `https://rettfrabonden.com`.
+  use `https://rettfrabonden.com` (see Trust boundary above).

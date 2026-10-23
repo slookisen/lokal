@@ -1030,11 +1030,12 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/:providerSlug", generalLimiter, async (req: Request, res: Response) => {',
           'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req: Request, res: Response) => {',
           'routes/gardssalg-claim.ts: router.get("/kategori/gardssalg/eier/magic-link-verify", generalLimiter, (req: Request, res: Response) => {',
+          'routes/gardssalg-claim.ts: router.post("/api/opplevelser/gardssalg-claim/:providerId/release-field", generalLimiter, express.json(), (req: Request, res: Response) => {',
           'routes/gardssalg-claim.ts: router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", generalLimiter, express.json(), (req: Request, res: Response) => {',
           'routes/gardssalg-claim.ts: router.post("/kategori/gardssalg/eier/:providerSlug/logout", generalLimiter, (req: Request, res: Response) => {',
           'routes/seo.ts: router.get("/sok", generalLimiter, async (req: Request, res: Response) => {',
           // POST /kategori/gardssalg/book/:providerSlug (experiences-seo.ts) and POST
-          // /kategori/gardssalg/eier/:providerId/request and …/:providerSlug/save (gardssalg-claim.ts) carry
+          // /kategori/gardssalg/eier/:providerId/request, …/:providerSlug/save and …/:providerSlug/release-field (gardssalg-claim.ts) carry
           // generalLimiter on a line of their own, which the import-list rule above skips;
           // host-gate-rate-limit.test.ts (a1) and gardssalg-claim-host-gate.test.ts (a1) tie every route-level
           // generalLimiter, by reference, to ac2LimitersFor.

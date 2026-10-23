@@ -10320,13 +10320,11 @@ router.post("/admin/gardssalg-claim-grant", requireAdmin, (req: Request, res: Re
 // second producer link claimed the same profile before either was
 // revoked), so ALL of them are revoked, not just the first.
 //
-// NEVER touches claimed_at (the historical "claimed by" badge — see
-// verifyClaimToken()'s own doc comment: "the ONLY place claimed_at is ever
-// set — never on issue/send, only on use") or content_source: this route
-// only sets gardssalg_claims.revoked_at, exactly like revokeClaimToken()
-// itself does. A provider revoked here keeps its public "Bekreftet av
-// eier" badge and whatever content_source lock it already had — only
-// ACCESS is revoked, not history.
+// Resets claimed_at (the "Bekreftet av eier" badge) once no active claim is
+// left (G1 pt 8, 2026-10-22; audited as field_name='claimed_at'), but never
+// touches content_source: the lock keeps owner-written text safe from
+// enrichment. The owner's own logout (revokeClaimToken) is unchanged and
+// keeps the badge.
 //
 // Idempotent: a second apply:true call against the same row finds zero
 // active/non-revoked claims left (revoked_at IS NOT NULL now) and revokes
@@ -10399,6 +10397,7 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 
   const batchId = `claim-revoke-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
   const revoked: Array<{ claim_id: string; email_masked: string; email_source: string }> = [];
+  let claimedAtReset = false;
 
   const txn = expDb.transaction(() => {
     for (const claim of activeClaims) {
@@ -10422,10 +10421,40 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 
       revoked.push({ claim_id: claim.id, email_masked: maskEmail(claim.email), email_source: claim.email_source });
     }
+
+    // A revoked claim resets the owner mark (dev-request 2026-10-22-opplevagent-
+    // mine-valg-gardssalg, G1 pt 8): once NO active claim is left on the
+    // provider, claimed_at ("Bekreftet av eier" badge) is cleared and audited.
+    // content_source is left alone on purpose — it protects the owner-written
+    // text from being overwritten by enrichment. Only this admin lever resets;
+    // the owner's own logout (revokeClaimToken) still keeps the badge.
+    if (revoked.length > 0) {
+      const stillActive = expDb
+        .prepare(`SELECT COUNT(*) AS c FROM gardssalg_claims WHERE provider_id = @provider_id AND used = 1 AND revoked_at IS NULL`)
+        .get({ provider_id: providerId }) as { c: number };
+      if (stillActive.c === 0) {
+        const prev = expDb
+          .prepare(`SELECT claimed_at FROM experience_providers WHERE id = @id`)
+          .get({ id: providerId }) as { claimed_at: string | null } | undefined;
+        if (prev?.claimed_at) {
+          expDb
+            .prepare(`UPDATE experience_providers SET claimed_at = NULL, updated_at = datetime('now') WHERE id = @id`)
+            .run({ id: providerId });
+          expDb
+            .prepare(
+              `INSERT INTO gardssalg_content_audit
+                 (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+               VALUES (@id, @provider_id, 'claimed_at', @old_value, NULL, NULL, @batch_id, 'admin', datetime('now'))`,
+            )
+            .run({ id: crypto.randomUUID(), provider_id: providerId, old_value: prev.claimed_at, batch_id: batchId });
+          claimedAtReset = true;
+        }
+      }
+    }
   });
   txn();
 
-  res.json({ success: true, dry_run: false, provider_id: providerId, revoked });
+  res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────
@@ -15740,12 +15769,30 @@ const DRINKS_NAME_EXCLUSIONS = [
 router.delete("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
   try {
+    // Owned rows are never deleted (dev-request 2026-10-22-opplevagent-mine-valg-
+    // gardssalg, G1 pt 8): an owner claim (claimed_at set, content_source 'claim'
+    // or 'manual', or a live used+non-revoked gardssalg_claims row) is owner/admin
+    // curated data that a seed rollback must not touch.
+    const ownedWhere = `rfb_seed_source = 'rfb-seed' AND (
+          claimed_at IS NOT NULL
+          OR content_source IN ('claim', 'manual')
+          OR id IN (SELECT provider_id FROM gardssalg_claims WHERE used = 1 AND revoked_at IS NULL))`;
+    const skippedOwned = (
+      expDb.prepare(`SELECT COUNT(*) AS c FROM experience_providers WHERE ${ownedWhere}`).get() as { c: number }
+    ).c;
     const result = expDb
-      .prepare("DELETE FROM experience_providers WHERE rfb_seed_source = 'rfb-seed'")
+      .prepare(
+        `DELETE FROM experience_providers
+          WHERE rfb_seed_source = 'rfb-seed'
+            AND claimed_at IS NULL
+            AND (content_source IS NULL OR content_source NOT IN ('claim', 'manual'))
+            AND id NOT IN (SELECT provider_id FROM gardssalg_claims WHERE used = 1 AND revoked_at IS NULL)`,
+      )
       .run();
     res.json({
       deleted: result.changes,
-      note: "Deleted all rfb_seed_source='rfb-seed' providers. Safe: claimed/enriched/manual rows untouched.",
+      skipped_owned: skippedOwned,
+      note: "Deleted rfb_seed_source='rfb-seed' providers that have no owner. Owned rows (claimed_at set, content_source 'claim' or 'manual', or an active claim) are skipped and left untouched.",
     });
   } catch (err) {
     console.error("[rfb-seed rollback] Delete failed:", err);
@@ -16902,7 +16949,8 @@ router.get("/admin/drink-coverage", requireAdmin, (_req: Request, res: Response)
         `SELECT fylke, producer_type
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-            AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
+            AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+            AND (merged_into IS NULL OR merged_into = '')`,
       )
       .all() as GardssalgRow[];
     experienceRows = expDb

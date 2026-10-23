@@ -3,7 +3,7 @@
   "_deprecated": "Not a Claude directory path: the directory no longer accepts local MCP servers packaged as MCPB (https://claude.com/docs/directory/publish, read 2026-10-17). Submit the remote server https://opplevagent.no/mcp at https://claude.ai/directory/manage with the pack in ../claude-directory/. Kept as history; not maintained.",
   "name": "opplevagent-mcp",
   "display_name": "Opplevagent — Norske opplevelser og aktiviteter",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "MCP server for discovering Norwegian local experiences and activities via Opplevagent — search, info, categories.",
   "long_description": "Opplevagent connects you to a curated, Brreg-verified marketplace of Norwegian experiences and activities. Search by county (fylke), category, weather, season, indoor/outdoor, group size, age, price, and duration. Every result includes location, description, and a booking URL where available.\n\nExamples:\n- \"hva kan vi finne på i Troms om vinteren?\"\n- \"utendørsaktiviteter i Oslo for 4 personer\"\n- \"opplevelser som passer i regnvær i Bergen\"\n- \"familievennlige aktiviteter under 500 kr\"",
   "author": {

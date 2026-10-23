@@ -73,6 +73,30 @@ book et besøk hos Fjordgard Bryggeri fredag 23. oktober kl. 10 for 4 personer
 
 Outcomes are always honest and explicit: `provider_not_found`, `provider_ambiguous` (with candidates to put to the guest), `weekday_mismatch` (with suggestions), `paused` (the producer has not activated booking — profile link included), `outside_hours` (retry with `confirm_outside_hours:true`), or a **pending** request with `booking_ref`, the resolved `provider.navn` and `slot_at_local`. The producer is notified by email and confirms, proposes another time, or declines — the tool itself can never confirm a booking.
 
+## What the bridge sends
+
+Besides the tool arguments of each call, the bridge identifies itself to the remote server
+in two ways: the MCP `clientInfo` (your AI client's name and version, as
+"<client> via opplevagent-mcp") and a `User-Agent` header of the form `opplevagent-mcp/<version>`. This is
+client statistics, not an identifier of you: no account, credentials or device identifier is
+sent. The server keeps ordinary web-request logs (IP address and request metadata) for
+operations and abuse prevention.
+
+## Booking (gårdssalg)
+
+`book_gardssalg` requires no login and is rate-limited on the server. The call sends the
+guest's name and e-mail address to opplevagent.no. The request stays pending until the
+producer answers; the tool never confirms a booking. Your AI client should have the guest's
+explicit yes before it calls the tool.
+
+## Trust boundary
+
+The tool list, tool descriptions and server instructions are fetched from the remote
+server (`https://opplevagent.no/mcp`) over HTTPS every time the bridge starts. This package does not pin or
+freeze them, so what your AI client sees is whatever the remote service currently serves.
+`OPPLEVAGENT_URL` overrides the remote URL, and every tool argument you or your AI client supply is
+sent to that host. Only set it from a configuration you trust.
+
 ## Environment
 
 | Variable | Default | Description |

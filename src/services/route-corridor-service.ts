@@ -769,6 +769,7 @@ export function loadGardssalgCandidates(
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (merged_into IS NULL OR merged_into = '')
           AND lat IS NOT NULL AND lon IS NOT NULL
           AND lat BETWEEN ? AND ?
           AND lon BETWEEN ? AND ?`,
