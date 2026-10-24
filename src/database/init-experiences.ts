@@ -1292,6 +1292,25 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN claimed_at TEXT");
   } catch { /* already present */ }
 
+  // ─── owner_email_confirmed_* (dev-request 2026-10-22-opplevagent-takksvar-
+  // eierlenke-og-bekreftet-av-eier) ────────────────────────────────────────
+  // Additive, nullable. The SECOND, separate basis for the "Bekreftet av eier"
+  // badge: the producer confirmed the profile by e-mail from an address the
+  // claim flow accepts for that very producer (set only by POST
+  // /admin/gardssalg-owner-email-confirm). Deliberately NOT claimed_at: that
+  // column keeps meaning "an owner logged in", so the two bases stay
+  // distinguishable in data. _email / _thread record the sender address and the
+  // CRM thread id as evidence; neither is ever rendered publicly.
+  for (const col of [
+    "owner_email_confirmed_at TEXT",
+    "owner_email_confirmed_email TEXT",
+    "owner_email_confirmed_thread TEXT",
+  ]) {
+    try {
+      db.exec(`ALTER TABLE experience_providers ADD COLUMN ${col}`);
+    } catch { /* already present */ }
+  }
+
   // Backfill: any pre-existing experience_providers row that already has a
   // used, non-revoked gardssalg_claims row (i.e. was claimed before this
   // column existed) gets claimed_at set from that claim's earliest used_at.
