@@ -18674,14 +18674,44 @@ function gardssalgOutreachCooldownCutoffIso(): string {
 export function findGardssalgOutreachHardBounce(
   email: string,
 ): { bounce_type: string; bounced_at: string } | null {
+  // 'unsubscribe' (G1 point 6): an /avmeld POST writes that row; cold outreach must
+  // honour it here too, not only the RFB gate and compose. Honouring is never flagged.
   const row = getRfbDb()
     .prepare(
       `SELECT bounce_type, bounced_at FROM email_bounces
-        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint')
+        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint', 'unsubscribe')
         ORDER BY id DESC LIMIT 1`,
     )
     .get(email) as { bounce_type: string; bounced_at: string } | undefined;
   return row ?? null;
+}
+
+/**
+ * G1 point 6 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg): an owned profile
+ * is never a COLD outreach target. Owned = content_source = 'claim', OR claimed_at set
+ * (the permanent «Bekreftet av eier» badge, survives owner logout), OR a live used +
+ * non-revoked gardssalg_claims row. Safety tightening: ON by default; rollback switch
+ * GARDSSALG_OUTREACH_EXCLUDE_OWNED=0|false|off (read at call time).
+ */
+export function gardssalgOutreachExcludeOwnedEnabled(): boolean {
+  const v = String(process.env.GARDSSALG_OUTREACH_EXCLUDE_OWNED ?? "").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "off");
+}
+
+export function isGardssalgOwnedForOutreach(expDb: Database.Database, providerId: string): boolean {
+  if (!gardssalgOutreachExcludeOwnedEnabled()) return false;
+  const row = expDb
+    .prepare(
+      `SELECT 1 FROM experience_providers p
+        WHERE p.id = ?
+          AND (p.content_source = 'claim'
+               OR p.claimed_at IS NOT NULL
+               OR EXISTS (SELECT 1 FROM gardssalg_claims c
+                           WHERE c.provider_id = p.id AND c.used = 1 AND c.revoked_at IS NULL))
+        LIMIT 1`,
+    )
+    .get(providerId);
+  return row !== undefined;
 }
 
 /**
@@ -18735,6 +18765,12 @@ export function computeGardssalgOutreachSendEligibility(
   let rfbSendIndex: ReturnType<typeof getRfbSendIndexForOpplevagent> | null = null;
 
   for (const providerId of providerIds) {
+    // G1 point 6: owned profiles never get cold outreach (checked first, so the reason is
+    // reported as such and not folded into a preflight reason).
+    if (isGardssalgOwnedForOutreach(expDb, providerId)) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "owner_claimed" });
+      continue;
+    }
     const pf = preflightById.get(providerId);
     if (!pf || !pf.go) {
       // Surfaced as a direct top-level reason (mirrors pilot-send's own
@@ -19103,6 +19139,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     const crossPlatformMatches: Array<{ provider_id: string; match: CrossPlatformMatch }> = [];
     let preflightNoGoCount = 0;
     let personalAddressCount = 0;
+    let ownerClaimedCount = 0;
 
     type Candidate = { agent_id: string; name: string; email: string; last_sent_at: string | null };
     const survivors: Candidate[] = [];
@@ -19124,6 +19161,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           cross_platform_cooldown: crossPlatformCooldownCount,
           preflight_no_go: preflightNoGoCount,
           personal_address: personalAddressCount,
+          owner_claimed: ownerClaimedCount,
         },
         recipient_address_types: countRecipientAddressTypes([]),
       });
@@ -19195,7 +19233,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
       const row = rfbDb
         .prepare(
           `SELECT 1 FROM email_bounces
-            WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint')
+            WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint', 'unsubscribe')
             LIMIT 1`,
         )
         .get(email);
@@ -19249,6 +19287,8 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           repliedCount++;
         } else if (e.reason === PERSONAL_ADDRESS_REASON) {
           personalAddressCount++;
+        } else if (e.reason === "owner_claimed") {
+          ownerClaimedCount++;
         } else if (e.reason === "max_touch_reached") {
           contactedOrCooldownCount++;
         } else if (e.reason === "cooldown_suppressed") {
@@ -19277,6 +19317,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
       });
 
       for (const pf of preflightResults) {
+        if (isGardssalgOwnedForOutreach(expDb, pf.provider_id)) {
+          ownerClaimedCount++; // G1 point 6 — owned profiles never get cold outreach
+          continue;
+        }
         if (!pf.go) {
           // readiness tier already filtered to outreach_ready above, so the
           // only reasons possible here are large_company_excluded (size
@@ -19387,6 +19431,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         cross_platform_cooldown: crossPlatformCooldownCount,
         preflight_no_go: preflightNoGoCount,
         personal_address: personalAddressCount,
+        owner_claimed: ownerClaimedCount,
       },
       // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
       // one entry per cross-platform-suppressed provider, with the rule that
@@ -19694,6 +19739,14 @@ export async function sendGardssalgOutreachToEligibleProvider(
   if (!isColdRecipientAllowed(email)) {
     console.warn(`[${opts.source}] recipient address is malformed — NOT sending`, { providerId, email });
     return { provider_id: providerId, status: "skipped", reason: PERSONAL_ADDRESS_REASON };
+  }
+
+  // Send-time owner re-check (G1 point 6): a claim can land between the caller's batch-wide
+  // eligibility pass and this send. A skip, not a batch stop — nothing written. Test sends
+  // (redirected to the operator) are not cold outreach to the producer and pass.
+  if (!isTest && isGardssalgOwnedForOutreach(expDb, providerId)) {
+    console.warn(`[${opts.source}] provider is owned (claimed) — NOT sending cold outreach`, { providerId });
+    return { provider_id: providerId, status: "skipped", reason: "owner_claimed" };
   }
 
   // Send-time bounce re-check (owner decision 2026-09-29 «1B»): the caller's

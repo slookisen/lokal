@@ -53,17 +53,28 @@ export function normalizeRecipient(email: string): string {
   return String(email || "").trim().toLowerCase();
 }
 
-/** Signed token for one recipient address; null when no server secret is configured. */
-export function makeUnsubscribeToken(email: string): string | null {
+/**
+ * Which platform's cold outreach the link belongs to. It only picks the host and the
+ * wording of the /avmeld pages (an Opplevagent mail must never lead to a page that
+ * names Rett fra Bonden); the suppression itself is one email_bounces row per address.
+ */
+export type UnsubscribeVertical = "rfb" | "experiences";
+
+/**
+ * Signed token for one recipient address; null when no server secret is configured.
+ * "rfb" tokens are byte-identical to the original format; an "experiences" token signs
+ * `<email>\nexperiences` (an address never contains a newline).
+ */
+export function makeUnsubscribeToken(email: string, vertical: UnsubscribeVertical = "rfb"): string | null {
   const secret = serverSecret();
   const norm = normalizeRecipient(email);
   if (!secret || !norm) return null;
-  const payload = b64url(Buffer.from(norm, "utf8"));
+  const payload = b64url(Buffer.from(vertical === "experiences" ? `${norm}\nexperiences` : norm, "utf8"));
   return `${payload}.${sign(payload, secret)}`;
 }
 
-/** The recipient address the token was signed for, or null when it is not ours. */
-export function verifyUnsubscribeToken(token: string): { email: string } | null {
+/** The recipient address (and platform) the token was signed for, or null when it is not ours. */
+export function verifyUnsubscribeToken(token: string): { email: string; vertical: UnsubscribeVertical } | null {
   const secret = serverSecret();
   if (!secret || typeof token !== "string" || token.length > 600) return null;
   const dot = token.indexOf(".");
@@ -73,26 +84,38 @@ export function verifyUnsubscribeToken(token: string): { email: string } | null 
   const expected = Buffer.from(sign(payload, secret), "utf8");
   if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
   try {
-    const email = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
-    return email && email === normalizeRecipient(email) ? { email } : null;
+    const decoded = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const nl = decoded.indexOf("\n");
+    const email = nl === -1 ? decoded : decoded.slice(0, nl);
+    const tag = nl === -1 ? "" : decoded.slice(nl + 1);
+    if (nl !== -1 && tag !== "experiences") return null;
+    return email && email === normalizeRecipient(email)
+      ? { email, vertical: nl === -1 ? "rfb" : "experiences" }
+      : null;
   } catch {
     return null;
   }
 }
 
-export function unsubscribeUrl(email: string): string | null {
-  const token = makeUnsubscribeToken(email);
+export function unsubscribeUrl(email: string, vertical: UnsubscribeVertical = "rfb"): string | null {
+  const token = makeUnsubscribeToken(email, vertical);
   if (!token) return null;
-  return `${process.env.APP_URL || "https://rettfrabonden.com"}/avmeld/${token}`;
+  // Opplevagent mails link to opplevagent.no (same host the profile links use); the route is
+  // mounted before the host gates, so the one-click POST works there.
+  const base = vertical === "experiences" ? "https://opplevagent.no" : process.env.APP_URL || "https://rettfrabonden.com";
+  return `${base}/avmeld/${token}`;
 }
 
 /**
  * List-Unsubscribe + List-Unsubscribe-Post headers (RFC 2369 / RFC 8058) for a
  * cold send, or null (flag off, or no server secret → no headers).
  */
-export function unsubscribeHeaderValues(email: string): { listUnsubscribe: string; listUnsubscribePost: string } | null {
+export function unsubscribeHeaderValues(
+  email: string,
+  vertical: UnsubscribeVertical = "rfb",
+): { listUnsubscribe: string; listUnsubscribePost: string } | null {
   if (!outreachUnsubscribeEnabled()) return null;
-  const url = unsubscribeUrl(email);
+  const url = unsubscribeUrl(email, vertical);
   if (!url) return null;
   return { listUnsubscribe: `<${url}>`, listUnsubscribePost: "List-Unsubscribe=One-Click" };
 }

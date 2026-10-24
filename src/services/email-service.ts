@@ -6,6 +6,7 @@ import { getConfig } from "../config/vertical-config";
 // bypass it.
 import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard";
 import { crmFromHeader } from "./crm-platform-identity";
+import { unsubscribeHeaderValues } from "./avmeld-service";
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -39,6 +40,8 @@ export interface EmailOptions {
   textContent: string;
   replyTo?: string;
   listUnsubscribe?: string;
+  /** List-Unsubscribe-Post value (RFC 8058 one-click); only set together with listUnsubscribe. */
+  listUnsubscribePost?: string;
   attachments?: EmailAttachment[];
   /**
    * dev-request 2026-07-26-booking-test-send-guard. When true, this email
@@ -371,6 +374,7 @@ export class EmailService {
         : { 'X-Lokal-Agent': 'outreach-system/v1' };
       if (options.listUnsubscribe) {
         headers['List-Unsubscribe'] = options.listUnsubscribe;
+        if (options.listUnsubscribePost) headers['List-Unsubscribe-Post'] = options.listUnsubscribePost;
       }
 
       const mailOptions: Record<string, unknown> = {
@@ -506,6 +510,11 @@ export class EmailService {
     // SAME for both variants — the draft text is the experiment's only
     // variable.
     const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl);
+    // G1 point 6 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg): signed
+    // List-Unsubscribe + One-Click (RFC 8058) on cold gårdssalg mail. Headers only —
+    // no template text changes. Behind OUTREACH_UNSUBSCRIBE_ENABLED (the /avmeld route's
+    // own flag), so a header never points at a 404; none when off or no server secret.
+    const unsub = unsubscribeHeaderValues(to, "experiences");
     return await this.sendEmail({
       to,
       subject: rendered.subject,
@@ -514,6 +523,7 @@ export class EmailService {
       replyTo: GARDSSALG_OUTREACH_REPLY_TO,
       from: crmFromHeader("experiences"),
       isTestSend: opts.isTestSend,
+      ...(unsub ? { listUnsubscribe: unsub.listUnsubscribe, listUnsubscribePost: unsub.listUnsubscribePost } : {}),
     });
   }
 
