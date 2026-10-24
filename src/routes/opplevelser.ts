@@ -793,6 +793,8 @@ import {
   // dev-request 2026-08-10-gardssalg-eier-flyt-e2e-repeterbar-revoke-og-
   // editable-fixtur — POST /admin/gardssalg-claim-revoke below.
   maskEmail,
+  isGardssalgProviderClaimed,
+  getOwnedVisibilityState,
 } from "../services/gardssalg-claim";
 import {
   emailService,
@@ -30788,6 +30790,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     hidden?: unknown;
     apply?: unknown;
     mode?: unknown;
+    confirm_owned?: unknown;
   };
 
   if (typeof body.hidden !== "boolean") {
@@ -30802,6 +30805,13 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     return;
   }
   const mode: "remove_request" | "quality" = body.mode === "quality" ? "quality" : "remove_request";
+  // G1 pkt 4: owned rows (verified claim / content_source='claim') are only
+  // touched with an explicit strict-boolean confirmation; the change is logged.
+  if (body.confirm_owned !== undefined && typeof body.confirm_owned !== "boolean") {
+    res.status(400).json({ error: "Body field 'confirm_owned' must be a boolean" });
+    return;
+  }
+  const confirmOwned = body.confirm_owned === true;
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -30829,11 +30839,11 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source FROM experience_providers
         WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source FROM experience_providers
         WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     type PvRow = {
@@ -30843,6 +30853,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       hjemmeside: string | null;
       epost: string | null;
       catalog_hidden: number | null;
+      catalog_hidden_reason: string | null;
       content_source: string | null;
     };
 
@@ -30860,6 +30871,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     }
 
     const skippedLocked: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const skippedOwned: Array<{ id: string; navn: string; org_nr: string | null; state: string }> = [];
     const unchanged: Array<{ id: string; navn: string; org_nr: string | null }> = [];
     const changed: Array<{
       id: string;
@@ -30888,18 +30900,43 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     // the blocklist write is a defense-in-depth belt, not the buckle).
     let blocklistInsertedTotal = 0;
     for (const row of matched.values()) {
-      if (row.content_source === "manual" || row.content_source === "claim") {
+      const owned = row.content_source === "claim" || isGardssalgProviderClaimed(row.id);
+      if (owned && !confirmOwned) {
+        skippedOwned.push({
+          id: row.id,
+          navn: row.navn,
+          org_nr: row.org_nr,
+          state: getOwnedVisibilityState(row),
+        });
+        continue;
+      }
+      if (!owned && (row.content_source === "manual" || row.content_source === "claim")) {
         skippedLocked.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
       }
       const currentlyHidden = row.catalog_hidden === 1;
-      if (currentlyHidden === hidden) {
+      const targetReason = hidden ? mode : null;
+      // An owned row that is already hidden for a different reason (e.g. the
+      // owner's pause) is still changed when the admin asks for another mode.
+      if (currentlyHidden === hidden && (!owned || (row.catalog_hidden_reason ?? null) === targetReason)) {
         unchanged.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
       }
       let blocklistInserted: number | undefined;
       if (!dryRun) {
-        upd.run(targetValue, hidden ? mode : null, row.id);
+        upd.run(targetValue, targetReason, row.id);
+        if (owned) {
+          expDb.prepare(
+            `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+             VALUES (?, ?, 'catalog_hidden', ?, ?, NULL, 'admin-visibility-owned', 'admin', datetime('now'), ?)`,
+          ).run(
+            crypto.randomUUID(),
+            row.id,
+            getOwnedVisibilityState(row),
+            hidden ? (mode === "quality" ? "quality_hidden" : "removed") : "visible",
+            JSON.stringify({ confirm_owned: true, mode: hidden ? mode : null }),
+          );
+        }
         if (hidden && mode === "remove_request") {
           try {
             const bl = blocklistAdd({
@@ -30934,6 +30971,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       changed,
       unchanged,
       skipped_locked: skippedLocked,
+      skipped_owned: skippedOwned,
       not_found: notFound,
       ...(!dryRun && hidden ? { blocklist_inserted_total: blocklistInsertedTotal } : {}),
     });
