@@ -76,6 +76,13 @@ export interface EmailOptions {
    * leaves the header exactly as before.
    */
   omitAgentHeader?: boolean;
+  /**
+   * dev-request 2026-10-22-opplevagent-utsending-v4 (endring 7): Message-ID of
+   * the message this one answers (angle brackets included). Sets both
+   * `In-Reply-To` and `References` so the mail lands in the same thread.
+   * Omitted leaves the headers exactly as before.
+   */
+  inReplyToMessageId?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -372,6 +379,10 @@ export class EmailService {
       if (options.listUnsubscribe) {
         headers['List-Unsubscribe'] = options.listUnsubscribe;
       }
+      if (options.inReplyToMessageId) {
+        headers['In-Reply-To'] = options.inReplyToMessageId;
+        headers['References'] = options.inReplyToMessageId;
+      }
 
       const mailOptions: Record<string, unknown> = {
         from: options.from || this.fromAddress,
@@ -497,23 +508,34 @@ export class EmailService {
     to: string,
     providerName: string,
     profileUrl: string,
-    opts: { isTestSend?: boolean; template?: GardssalgOutreachTemplate } = {},
+    opts: {
+      isTestSend?: boolean;
+      template?: GardssalgOutreachTemplate;
+      /** v4 render context (subject arm, {eier_url}, {måned}, first subject). */
+      ctx?: GardssalgOutreachRenderCtx;
+      /** Message-ID of the first mail; set on the v4 follow-up so it threads. */
+      inReplyToMessageId?: string;
+    } = {},
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     // dev-request 2026-08-15-outreach-ab-standard-vs-personlig-drikke:
     // opts.template selects the rendered draft ("standard" HTML template vs
-    // the RFB-style plain-text "personal" variant). Omitted = "standard",
-    // byte-identical to the pre-existing behaviour. Sender identity is the
-    // SAME for both variants — the draft text is the experiment's only
-    // variable.
-    const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl);
+    // the RFB-style plain-text "personal" variant; since 2026-10-22 also the
+    // v4 texts E/F). Omitted = "standard", byte-identical to the pre-existing
+    // behaviour. Sender identity is the SAME for every variant — the draft
+    // text is the experiment's only variable.
+    const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl, opts.ctx);
     return await this.sendEmail({
       to,
       subject: rendered.subject,
       ...(rendered.html !== undefined ? { htmlContent: rendered.html } : {}),
       textContent: rendered.text,
       replyTo: GARDSSALG_OUTREACH_REPLY_TO,
-      from: crmFromHeader("experiences"),
+      // dev-request 2026-10-22-opplevagent-utsending-v4 (endring 5): the
+      // outreach goes out in Daniel's name. Address and Reply-To unchanged;
+      // every other Opplevagent mail keeps crmFromHeader("experiences").
+      from: gardssalgOutreachFromHeader(),
       isTestSend: opts.isTestSend,
+      ...(opts.inReplyToMessageId ? { inReplyToMessageId: opts.inReplyToMessageId } : {}),
     });
   }
 
@@ -1481,7 +1503,7 @@ kontakt@opplevagent.no
 // (kontakt@opplevagent.no), never the personal gmail the RFB template used
 // to carry (removed 2026-08-15, Daniel live) — and never the RFB identity:
 // the draft STYLE is borrowed, the platform separation is not.
-export type GardssalgOutreachTemplate = "standard" | "personal";
+export type GardssalgOutreachTemplate = "standard" | "personal" | "personal-v4" | "personal-v4-followup";
 
 export function renderGardssalgOutreachPersonal(
   providerName: string,
@@ -1513,6 +1535,135 @@ Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen me
   };
 }
 
+// ─── Gårdssalg outreach v4 (dev-request 2026-10-22-opplevagent-utsending-v4) ──
+//
+// Texts E (first) and F (follow-up) from marketing-drafts/2026-10-22-
+// utsendingstekster-v4-opplevagent.md, approved by Daniel 2026-10-22 and used
+// VERBATIM: only the table's fields are substituted. Text-only, one paragraph
+// per line, no «katalog»/«registrert»/«oppføring».
+
+/** Daniel's mobile number as he gave it live 2026-10-22 (fixed value, not a per-recipient field). */
+export const GARDSSALG_OUTREACH_SIGNATURE_PHONE = "905 737 34";
+
+/** Display name for the cold outreach only (the address is the platform's shared one). */
+export const GARDSSALG_OUTREACH_FROM_NAME = "Daniel Fredriksen";
+
+/**
+ * `"Daniel Fredriksen" <kontakt@rettfrabonden.com>`. The ADDRESS is taken from
+ * the platform identity (crmFromHeader) so it can never drift from it; only the
+ * display name differs from the other Opplevagent mail.
+ */
+export function gardssalgOutreachFromHeader(): string {
+  const m = /<([^<>\s]+@[^<>\s]+)>/.exec(crmFromHeader("experiences"));
+  return `"${GARDSSALG_OUTREACH_FROM_NAME}" <${m ? m[1] : "kontakt@rettfrabonden.com"}>`;
+}
+
+/**
+ * Shared producer-name wash (also for the RFB lane later). Cut at the first
+ * « — » or «, » and drop everything from there, then drop ONE trailing « AS»,
+ * « SA», « DA», « ANS» or « ENK». Used in subject and text, never in URLs.
+ */
+export function cleanOutreachProviderName(raw: string): string {
+  const name = (raw ?? "").trim();
+  const cuts = [name.indexOf(" — "), name.indexOf(", ")].filter((i) => i >= 0);
+  let out = cuts.length > 0 ? name.slice(0, Math.min(...cuts)) : name;
+  out = out.trim().replace(/ (AS|SA|DA|ANS|ENK)$/, "").trim();
+  return out === "" ? name : out;
+}
+
+export type GardssalgOutreachSubjectArm = "A" | "B";
+
+export interface GardssalgOutreachRenderCtx {
+  /** Subject arm for text E; alternates every first mail. Default "A". */
+  arm?: GardssalgOutreachSubjectArm;
+  /** `{eier_url}`. Default: derived from the profile URL (same slug). */
+  eierUrl?: string;
+  /** `{måned}` phrase for text F, see gardssalgOutreachMonthPhrase(). Required for F. */
+  monthPhrase?: string;
+  /** Subject of the first mail, when it exists in the CRM: F becomes `Re: <it>`. */
+  firstSubject?: string | null;
+}
+
+const NORWEGIAN_MONTHS = [
+  "januar", "februar", "mars", "april", "mai", "juni",
+  "juli", "august", "september", "oktober", "november", "desember",
+];
+
+function osloYearMonth(d: Date): { year: number; month: number } {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Oslo", year: "numeric", month: "numeric" }).formatToParts(d);
+  return {
+    year: Number(parts.find((p) => p.type === "year")?.value),
+    month: Number(parts.find((p) => p.type === "month")?.value),
+  };
+}
+
+/**
+ * `{måned}` for text F, from the month the first mail was sent (Oslo time):
+ * same month as now -> «tidligere denne måneden»; same year -> «i september»;
+ * last year -> «i desember i fjor»; older -> «i desember 2024».
+ */
+export function gardssalgOutreachMonthPhrase(firstSentAt: Date, now: Date): string {
+  const a = osloYearMonth(firstSentAt);
+  const b = osloYearMonth(now);
+  if (a.year === b.year && a.month === b.month) return "tidligere denne måneden";
+  const name = NORWEGIAN_MONTHS[a.month - 1];
+  if (a.year === b.year) return `i ${name}`;
+  if (a.year === b.year - 1) return `i ${name} i fjor`;
+  return `i ${name} ${a.year}`;
+}
+
+export function gardssalgOutreachSubjectA(providerName: string): string {
+  return `Har vi riktig info om ${cleanOutreachProviderName(providerName)}?`;
+}
+
+export function gardssalgOutreachSubjectB(providerName: string): string {
+  return `Spørsmål om besøk hos ${cleanOutreachProviderName(providerName)}`;
+}
+
+/** Text E — first contact. */
+export function renderGardssalgOutreachV4First(
+  providerName: string,
+  profileUrl: string,
+  ctx: GardssalgOutreachRenderCtx = {},
+): { subject: string; text: string; html?: string } {
+  const navn = cleanOutreachProviderName(providerName);
+  const eierUrl = ctx.eierUrl ?? profileUrl.replace("/kategori/gardssalg/produsent/", "/kategori/gardssalg/eier/");
+  const subject = ctx.arm === "B" ? gardssalgOutreachSubjectB(providerName) : gardssalgOutreachSubjectA(providerName);
+  const paragraphs = [
+    `Hei,`,
+    `Jeg har ett spørsmål om ${navn}: tar dere imot besøk? Jeg heter Daniel Fredriksen og driver Opplevagent, en gratis oversikt over bryggerier, siderier og brennerier i Norge som man kan besøke. Dere står der allerede:`,
+    `${profileUrl}`,
+    `Besøk er det vi oftest tar feil av, så et kort svar hjelper mye. Er noe annet feil, kan dere bare svare på denne e-posten, så retter jeg det.`,
+    `Grunnen til at jeg gjør dette, er at mange nå spør ChatGPT og lignende tjenester om hvor de kan dra på smaking. Små produsenter kommer ofte ikke med i svarene, fordi informasjonen om dem er spredt eller gammel. Opplevagent samler den og setter den opp slik at disse tjenestene kan lese den. Det erstatter ikke nettsiden deres, men gjør at dere blir funnet der folk nå spør.`,
+    `Det koster ingenting å stå der, og dere binder dere ikke til noe. Vil dere styre siden selv, kan dere ta den over her, uten passord: ${eierUrl}`,
+    `Vil dere ikke være med, svarer dere bare «fjern», så tar jeg siden ned innen et døgn.`,
+    `Vennlig hilsen\nDaniel Fredriksen\nOpplevagent\n${GARDSSALG_OUTREACH_SIGNATURE_PHONE}`,
+    `Slik behandler jeg opplysningene: https://opplevagent.no/personvern`,
+  ];
+  return { subject, text: paragraphs.join("\n\n") };
+}
+
+/** Text F — follow-up (threaded as `Re: <first subject>` when the first mail is known). */
+export function renderGardssalgOutreachV4Followup(
+  providerName: string,
+  profileUrl: string,
+  ctx: GardssalgOutreachRenderCtx = {},
+): { subject: string; text: string; html?: string } {
+  if (!ctx.monthPhrase) throw new Error("renderGardssalgOutreachV4Followup: monthPhrase is required");
+  const navn = cleanOutreachProviderName(providerName);
+  const first = ctx.firstSubject?.trim();
+  const subject = first ? (/^Re: /i.test(first) ? first : `Re: ${first}`) : gardssalgOutreachSubjectA(providerName);
+  const paragraphs = [
+    `Hei igjen,`,
+    `Jeg skrev til dere ${ctx.monthPhrase} om ${navn} på Opplevagent. Det holder med ett ord: tar dere imot besøk, ja eller nei?`,
+    `${profileUrl}`,
+    `Det er gratis å stå der. Vil dere ikke være med, svarer dere «fjern». Jeg skriver ikke igjen om dette.`,
+    `Vennlig hilsen\nDaniel Fredriksen`,
+    `Slik behandler jeg opplysningene: https://opplevagent.no/personvern`,
+  ];
+  return { subject, text: paragraphs.join("\n\n") };
+}
+
 /**
  * The one variant dispatcher both the send path and the CRM-filing path go
  * through (same single-source rule as renderGardssalgOutreach itself, per
@@ -1523,7 +1674,10 @@ export function renderGardssalgOutreachVariant(
   template: GardssalgOutreachTemplate,
   providerName: string,
   profileUrl: string,
+  ctx?: GardssalgOutreachRenderCtx,
 ): { subject: string; text: string; html?: string } {
+  if (template === "personal-v4") return renderGardssalgOutreachV4First(providerName, profileUrl, ctx);
+  if (template === "personal-v4-followup") return renderGardssalgOutreachV4Followup(providerName, profileUrl, ctx);
   return template === "personal"
     ? renderGardssalgOutreachPersonal(providerName, profileUrl)
     : renderGardssalgOutreach(providerName, profileUrl);

@@ -216,7 +216,7 @@ Du kan når som helst protestere – svar «fjern», så fjerner jeg profilen me
   );
   check(
     "r3: CRM filing renders via the variant dispatcher (same-copy-filed rule holds for both arms)",
-    pilotBlock.includes("renderGardssalgOutreachVariant(template, providerName, profileUrl)"),
+    pilotBlock.includes("renderGardssalgOutreachVariant(template, providerName, profileUrl, renderCtx)"),
   );
   check(
     "r4: no bare renderGardssalgOutreach( call remains inside the pilot-send block",

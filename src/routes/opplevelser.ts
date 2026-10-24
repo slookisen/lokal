@@ -803,6 +803,9 @@ import {
   // goes through the variant dispatcher so BOTH A/B arms keep that rule.
   renderGardssalgOutreachVariant,
   GardssalgOutreachTemplate,
+  GardssalgOutreachSubjectArm,
+  GardssalgOutreachRenderCtx,
+  gardssalgOutreachMonthPhrase,
   GARDSSALG_OUTREACH_REPLY_TO,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
@@ -19577,6 +19580,13 @@ export type GardssalgOutreachSendResultRow = {
   // false when the mail went out but the CRM write failed. Absent on test
   // sends, which are deliberately not filed.
   crm_recorded?: boolean;
+  // dev-request 2026-10-22-opplevagent-utsending-v4 (AC7): on a `sent` row, the
+  // template that went out and, for the v4 first mail, the subject arm. The
+  // run-ledger claim and the CRM message carry the same values.
+  template?: GardssalgOutreachTemplate;
+  subject_arm?: GardssalgOutreachSubjectArm;
+  // v4 follow-up only: true = sent as a reply in the first mail's thread.
+  threaded?: boolean;
   // Incident 2026-09-27/28 (prod volume full: every sent_log INSERT threw
   // AFTER the mail had already gone out, so no cooldown/budget row existed
   // and the next day's run mailed the same six producers again). The send
@@ -19673,6 +19683,59 @@ export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility,
  * Looping callers stop on db_write_failed / reservation_kept — see
  * gardssalgOutreachBatchStopReason.
  */
+/** CRM thread id for one producer's outreach conversation (first + follow-up). */
+function gardssalgOutreachThreadId(providerId: string): string {
+  return `opplevagent-outreach-${providerId}`;
+}
+
+/** The first outbound message in the producer's outreach thread, or null. */
+export function findGardssalgOutreachFirstMessage(
+  rfbDb: ReturnType<typeof getRfbDb>,
+  providerId: string,
+): { message_id: string; subject: string | null; sent_at: string | null } | null {
+  const row = rfbDb
+    .prepare(
+      `SELECT id, subject, sent_at FROM crm_messages
+        WHERE thread_id = ? AND direction = 'out'
+        ORDER BY sent_at ASC, rowid ASC LIMIT 1`,
+    )
+    .get(gardssalgOutreachThreadId(providerId)) as { id: string; subject: string | null; sent_at: string | null } | undefined;
+  return row ? { message_id: row.id, subject: row.subject, sent_at: row.sent_at } : null;
+}
+
+/**
+ * A stored message id usable in In-Reply-To/References: `<id@host>`. A bare
+ * `id@host` is wrapped; anything else (DRY_RUN, the synthetic `outreach-…`
+ * fallback id) is not a real Message-ID and returns null.
+ */
+export function normaliseGardssalgMessageIdHeader(raw: string | null | undefined): string | null {
+  const v = (raw ?? "").trim();
+  if (/^<[^<>\s@]+@[^<>\s@]+>$/.test(v)) return v;
+  if (/^[^<>\s@]+@[^<>\s@]+$/.test(v)) return `<${v}>`;
+  return null;
+}
+
+/**
+ * Subject arm for the NEXT v4 first mail: A and B alternate, starting at A,
+ * counted over the v4 first mails already filed in the CRM (the closing quote
+ * keeps `personal-v4-followup` out of the count).
+ */
+export function nextGardssalgOutreachSubjectArm(rfbDb: ReturnType<typeof getRfbDb>): GardssalgOutreachSubjectArm {
+  const row = rfbDb
+    .prepare(
+      `SELECT COUNT(*) AS n FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template":"personal-v4"%'`,
+    )
+    .get() as { n: number };
+  return row.n % 2 === 0 ? "A" : "B";
+}
+
+function parseSentLogTimestamp(raw: string): Date {
+  // sent_log default is `YYYY-MM-DD HH:MM:SS` (UTC, no zone); ISO strings pass through.
+  const t = raw.includes("T") ? raw : raw.replace(" ", "T") + "Z";
+  return new Date(t);
+}
+
 export async function sendGardssalgOutreachToEligibleProvider(
   expDb: ReturnType<typeof getExpDb>,
   elig: GardssalgOutreachEligibleRow,
@@ -19711,6 +19774,46 @@ export async function sendGardssalgOutreachToEligibleProvider(
   if (sendTimeBounce) {
     console.warn(`[${opts.source}] recipient hard-bounced/complained since eligibility — NOT sending`, { providerId, email });
     return { provider_id: providerId, status: "skipped", reason: "hard_bounced" };
+  }
+
+  // dev-request 2026-10-22-opplevagent-utsending-v4: render context for the v4
+  // texts, built BEFORE the reservation (the follow-up's {måned} and thread
+  // come from the FIRST send, which the reservation below would otherwise
+  // muddy). Read-only; nothing is written here.
+  let renderCtx: GardssalgOutreachRenderCtx | undefined;
+  let inReplyToMessageId: string | undefined;
+  let subjectArm: GardssalgOutreachSubjectArm | undefined;
+  if (template === "personal-v4") {
+    subjectArm = nextGardssalgOutreachSubjectArm(getRfbDb());
+    renderCtx = {
+      arm: subjectArm,
+      eierUrl: `https://opplevagent.no/kategori/gardssalg/eier/${elig.slug ?? ""}`,
+    };
+  } else if (template === "personal-v4-followup") {
+    let first: ReturnType<typeof findGardssalgOutreachFirstMessage> = null;
+    let firstSentAt: Date | null = null;
+    try {
+      first = findGardssalgOutreachFirstMessage(getRfbDb(), providerId);
+      const sentLogRow = expDb
+        .prepare(`SELECT MIN(sent_at) AS first_at FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0`)
+        .get(providerId) as { first_at: string | null } | undefined;
+      const raw = first?.sent_at ?? sentLogRow?.first_at ?? null;
+      firstSentAt = raw ? parseSentLogTimestamp(raw) : null;
+    } catch (lookupErr) {
+      console.error(`[${opts.source}] first-send lookup failed — NOT sending`, { providerId, error: errMsg(lookupErr) });
+      return { provider_id: providerId, status: "skipped", reason: `first_send_lookup_failed: ${errMsg(lookupErr)}` };
+    }
+    if (!firstSentAt || Number.isNaN(firstSentAt.getTime())) {
+      return { provider_id: providerId, status: "skipped", reason: "followup_without_prior_send" };
+    }
+    const threadId = normaliseGardssalgMessageIdHeader(first?.message_id);
+    const firstSubject = threadId ? (first?.subject ?? null) : null;
+    if (threadId && firstSubject) inReplyToMessageId = threadId;
+    renderCtx = {
+      monthPhrase: gardssalgOutreachMonthPhrase(firstSentAt, new Date()),
+      // No usable first message: a new mail with subject A (spec endring 7).
+      firstSubject: inReplyToMessageId ? firstSubject : null,
+    };
   }
 
   // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
@@ -19766,6 +19869,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
     const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
       isTestSend: isTest,
       template,
+      ctx: renderCtx,
+      ...(inReplyToMessageId ? { inReplyToMessageId } : {}),
     });
     if (!sendResult.success) {
       // Rejected — nothing left the building. Release the reservation so the
@@ -19811,11 +19916,11 @@ export async function sendGardssalgOutreachToEligibleProvider(
     let crmRecorded: boolean | undefined;
     if (!isTest) {
       try {
-        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl);
+        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl, renderCtx);
         crmService.ingestThread(
           {
-            threadId: `opplevagent-outreach-${providerId}`,
-            subject: rendered.subject,
+            threadId: gardssalgOutreachThreadId(providerId),
+            subject: template === "personal-v4-followup" ? (renderCtx?.firstSubject ?? rendered.subject) : rendered.subject,
             category: "marketing",
             messages: [
               {
@@ -19835,6 +19940,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
                   provider_id: providerId,
                   reply_to: GARDSSALG_OUTREACH_REPLY_TO,
                   template,
+                  ...(subjectArm ? { subject_arm: subjectArm } : {}),
+                  ...(inReplyToMessageId ? { in_reply_to: inReplyToMessageId } : {}),
                 },
               },
             ],
@@ -19858,6 +19965,9 @@ export async function sendGardssalgOutreachToEligibleProvider(
       ...(logFailure === undefined ? {} : { reason: logFailure, db_write_failed: true as const }),
       log_recorded: logFailure === undefined,
       ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }),
+      template,
+      ...(subjectArm ? { subject_arm: subjectArm } : {}),
+      ...(template === "personal-v4-followup" ? { threaded: inReplyToMessageId !== undefined } : {}),
     };
   } catch (err) {
     // Every write above has its own catch, so only the send itself lands
@@ -20881,6 +20991,13 @@ const GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS = 48;
 // choice, same spirit as GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT above.
 const GARDSSALG_AUTOSVAR_APPLY_DAILY_BATCH_SIZE = 20;
 
+/** Send days of the cron job (weekday in Europe/Oslo). */
+export const GARDSSALG_OUTREACH_SEND_WEEKDAYS: readonly string[] = ["Tue", "Thu"];
+
+function osloWeekdayShort(d: Date): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", weekday: "short" }).format(d);
+}
+
 /** Pure scheduling guard, same shape as analytics-service's shouldRunAutoPrune. */
 export function shouldRunGardssalgOutreachDaily(opts: {
   now: Date;
@@ -20891,6 +21008,11 @@ export function shouldRunGardssalgOutreachDaily(opts: {
   const windowHourUtc = opts.windowHourUtc ?? GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC;
   const minHoursBetween = opts.minHoursBetween ?? 20;
   if (opts.now.getUTCHours() !== windowHourUtc) return false;
+  // dev-request 2026-10-22-opplevagent-utsending-v4 (endring 8): cron sends only
+  // on Tuesday and Thursday, by the weekday in Europe/Oslo (08Z is 09/10 local,
+  // so the Oslo date equals the UTC date; going through Intl keeps it right
+  // across the 25.10.2026 switch to winter time). Manual admin runs bypass this.
+  if (!GARDSSALG_OUTREACH_SEND_WEEKDAYS.includes(osloWeekdayShort(opts.now))) return false;
   if (opts.lastRunAt) {
     const deltaMs = opts.now.getTime() - opts.lastRunAt.getTime();
     if (deltaMs < minHoursBetween * 3600_000) return false;
@@ -21025,7 +21147,7 @@ let gardssalgOutreachDailyApplyInFlight = false;
 /**
  * The daily send. `apply: false` is a full dry run (guards evaluated, list
  * computed, nothing written, no envelope). `apply: true` sends up to
- * (daily_cap − sent today) emails with the reviewed `personal` template and
+ * (daily_cap − sent today) emails (v4 texts E/F, dev-request 2026-10-22-opplevagent-utsending-v4) and
  * records a run envelope whatever the outcome. Throws only if the selection
  * itself fails (a DB error) — per-provider send failures are rows, not
  * exceptions, so an error on provider 3 never loses providers 1–2.
@@ -21176,6 +21298,16 @@ async function runGardssalgOutreachDailyOnce(
         (c) => c.touch === "second" && sentIds.includes(c.provider_id),
       ).length;
       const firstTouchSent = sentIds.length - secondTouchSent;
+      // dev-request 2026-10-22-opplevagent-utsending-v4 (AC7): which template
+      // (and subject arm) each send used, so ledger and CRM tell old from new.
+      const sentRows = results.filter((r) => r.status === "sent");
+      const templatesSent = Array.from(new Set(sentRows.map((r) => r.template).filter((t): t is GardssalgOutreachTemplate => !!t)));
+      const templateLabel = templatesSent.length === 0 ? "personal-v4" : templatesSent.length === 1 ? templatesSent[0] : "mixed";
+      const sendsMeta = sentRows.map((r) => ({
+        provider_id: r.provider_id,
+        template: r.template ?? null,
+        subject_arm: r.subject_arm ?? null,
+      }));
       // Incident 2026-09-27/28: a stopped run is never `completed`, even with
       // no error row (a delivered send whose sent_log confirm failed) — a
       // routine that reads only the status must notice. Clean runs: unchanged.
@@ -21184,7 +21316,7 @@ async function runGardssalgOutreachDailyOnce(
       const notes =
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
-        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
+        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=${templateLabel}` +
         // Incident 2026-09-27/28 — only on a run that hit a sent_log write
         // failure or a stop, so a clean run's notes are byte-identical to before.
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
@@ -21208,7 +21340,13 @@ async function runGardssalgOutreachDailyOnce(
             {
               type: "emails_sent",
               value: report.summary.sent,
-              meta: { lane: "gardssalg-outreach", table: "experience_outreach_sent_log", template: "personal", provider_ids: sentIds },
+              meta: {
+                lane: "gardssalg-outreach",
+                table: "experience_outreach_sent_log",
+                template: templateLabel,
+                sends: sendsMeta,
+                provider_ids: sentIds,
+              },
             },
             { type: "custom", value: firstTouchSent, meta: { kind: "gardssalg_outreach_first_touch_sent" } },
             { type: "custom", value: secondTouchSent, meta: { kind: "gardssalg_outreach_second_touch_sent" } },
@@ -21335,6 +21473,10 @@ async function runGardssalgOutreachDailyOnce(
     recipient_email: e.epost,
     touch: (hasPriorSend.get(e.provider_id) ? "second" : "first") as "first" | "second",
   }));
+  // dev-request 2026-10-22-opplevagent-utsending-v4: text E for a first touch,
+  // text F for a second.
+  const templateFor = (providerId: string): GardssalgOutreachTemplate =>
+    candidates.find((c) => c.provider_id === providerId)?.touch === "second" ? "personal-v4-followup" : "personal-v4";
 
   const results: GardssalgOutreachSendResultRow[] = [];
   // Incident 2026-09-27/28: stop at the first row that stops the batch, same
@@ -21377,7 +21519,7 @@ async function runGardssalgOutreachDailyOnce(
       continue;
     }
     const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
-      template: "personal",
+      template: templateFor(elig.provider_id),
       isTest: false,
       source: "gardssalg-outreach-daily-run",
     });

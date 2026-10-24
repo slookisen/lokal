@@ -46262,6 +46262,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-utsending-v4, slice 1 (AC1-AC5, AC7): texts
+// E/F byte for byte, name wash, From, threading, send days. Own in-memory DBs and
+// a module-cache swap like the sibling suites, so it runs serially.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-utsending-v4: utsendingstekst E/F, tråding, sendedager ──");
+  try {
+    const { runOpplevelserGardssalgOutreachV4Tests } = require("../src/routes/opplevelser-gardssalg-outreach-v4.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-v4.test");
+    const v4 = await runOpplevelserGardssalgOutreachV4Tests({ log: false });
+    passed += v4.passed;
+    failed += v4.failed;
+    for (const f of v4.failures) failures.push("gardssalg-outreach-v4: " + f);
+    console.log(`  gardssalg-outreach-v4: ${v4.passed} passed, ${v4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-v4: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
 // (slice 6): the homepage .cat-grid no longer shows a gårdssalg entry from
 // ANY source (synthetic injection removed + a defensive filter on a genuine
