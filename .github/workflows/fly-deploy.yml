@@ -24,6 +24,13 @@ on:
   pull_request:
     branches:
       - main                 # build-check runs on PRs to main; deploy is gated below
+  schedule:
+    # Deploy windows for the fleet's merges (dev-request 2026-10-08-deployvinduer-
+    # for-flaatens-merger). Never inside 06:30-09:30 UTC (send window); the
+    # decision script enforces that too. Deploys only if main HEAD != prod.
+    - cron: "0 10 * * *"
+    - cron: "0 14 * * *"
+    - cron: "0 19 * * *"
   workflow_dispatch:       # lets you trigger manually from Actions tab
     inputs:
       force:
@@ -75,6 +82,7 @@ jobs:
   test-determinism:
     name: Test-suite determinism gate (3x same SHA)
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'   # window runs redeploy an already-tested main HEAD
     # Independent of build-check — runs in parallel, does NOT gate/replace it.
     # dev-request 2026-07-25-testsuite-ikke-deterministisk-delte-globaler,
     # kriterium 4: tests/test.ts runs ~90+ test blocks concurrently in one
@@ -120,6 +128,9 @@ jobs:
     needs: [build-check]
     # Only deploy on push to main / manual dispatch — PR runs only the gate.
     if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read      # PR lookup for the deploy-window decision
     concurrency:
       group: fly-deploy-main
       cancel-in-progress: false   # don't abort a running deploy if a new push arrives
@@ -128,6 +139,51 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0   # the freshness check below needs the history to compare commits
+          # push/dispatch: the triggering commit. schedule: default branch HEAD
+          # (github.sha is main HEAD there, so freshness compares main HEAD).
+
+      # Deploy-window decision. Deploy NOW only for: PR merged by Daniel
+      # (slookisen), PR label deploy-nå, a Revert commit, manual dispatch.
+      # Otherwise wait for the 10/14/19 UTC schedule run. The fleet gate
+      # (fleet-auto-approve.yml) merges as github-actions[bot], so fleet merges
+      # wait for the window. PR lookup failure fails OPEN (deploys, with a
+      # warning), like the freshness check. Logic: scripts/deploy-window-decision.sh
+      # (tested by scripts/test-deploy-window-decision.sh).
+      - name: Decide deploy now or wait for window
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          THIS_SHA: ${{ github.sha }}
+        run: |
+          set -u
+          SUBJECT=$(git log -1 --format=%s "$THIS_SHA" 2>/dev/null || true)
+          PR_LOOKUP=ok; PR_COUNT=0; PR_MERGED_BY=""; PR_LABELS=""
+          if [ "$EVENT" = "push" ]; then
+            if PRS=$(gh api "repos/${{ github.repository }}/commits/${THIS_SHA}/pulls" 2>/dev/null) \
+               && PR_DETAIL=$(for n in $(echo "$PRS" | jq -r '.[].number'); do gh api "repos/${{ github.repository }}/pulls/$n"; done | jq -s '.'); then
+              PR_COUNT=$(echo "$PR_DETAIL" | jq 'length')
+              PR_MERGED_BY=$(echo "$PR_DETAIL" | jq -r '.[].merged_by.login // empty')
+              PR_LABELS=$(echo "$PR_DETAIL" | jq -r '.[].labels[].name')
+            else
+              PR_LOOKUP=failed
+            fi
+          fi
+          LIVE_SHA=$(curl -sf --max-time 10 https://rettfrabonden.com/health | jq -r '.git_sha // empty' 2>/dev/null || true)
+          RESULT=$(EVENT="$EVENT" ACTOR="$ACTOR" SUBJECT="$SUBJECT" PR_LOOKUP="$PR_LOOKUP" \
+            PR_COUNT="$PR_COUNT" PR_MERGED_BY="$PR_MERGED_BY" PR_LABELS="$PR_LABELS" \
+            NOW_HHMM="$(date -u +%H%M)" LIVE_SHA="$LIVE_SHA" THIS_SHA="$THIS_SHA" \
+            bash scripts/deploy-window-decision.sh)
+          echo "$RESULT"
+          DEPLOY=$(echo "$RESULT" | sed -E 's/^deploy=([a-z]+).*/\1/')
+          echo "deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
+          if [ "$PR_LOOKUP" = "failed" ]; then
+            echo "::warning::PR lookup via GitHub API failed; deploy decision fell back to fail-open."
+          fi
+          if [ "$DEPLOY" != "true" ]; then
+            echo "Deploy: venter på deployvindu (${RESULT#*reason=}). Neste vindu 10:00, 14:00 eller 19:00 UTC." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Serverheng skive 6 (A2A dev-request 2026-10-08-serverheng-hovedtraad-
       # oppstart-statistikk-samtaler). The concurrency group above runs one
@@ -145,6 +201,7 @@ jobs:
       # workflow dispatched on the older ref with force=true.
       - name: Skip if prod already runs a newer commit that contains this one
         id: freshness
+        if: steps.decide.outputs.deploy == 'true'
         run: |
           set -u
           THIS="${{ github.sha }}"
@@ -166,11 +223,11 @@ jobs:
           fi
 
       - name: Setup flyctl
-        if: steps.freshness.outputs.stale != 'true'
+        if: steps.decide.outputs.deploy == 'true' && steps.freshness.outputs.stale != 'true'
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Deploy
-        if: steps.freshness.outputs.stale != 'true'
+        if: steps.decide.outputs.deploy == 'true' && steps.freshness.outputs.stale != 'true'
         # Pass --build-arg BUILD_REV so the Dockerfile's ARG/LABEL/RUN cache-bust
         # block actually invalidates the COPY src/ layer per commit. Without
         # this, Fly's remote builder reuses the cached layer indefinitely
@@ -180,7 +237,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
       - name: Smoke test
-        if: steps.freshness.outputs.stale != 'true'
+        if: steps.decide.outputs.deploy == 'true' && steps.freshness.outputs.stale != 'true'
         run: |
           sleep 10
           curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/healthz || \
@@ -195,7 +252,7 @@ jobs:
         # (still recorded — dev mode).
         # Failure of this step does NOT fail the deploy — the deploy already
         # succeeded; this is just observability glue.
-        if: success() && steps.freshness.outputs.stale != 'true'
+        if: success() && steps.decide.outputs.deploy == 'true' && steps.freshness.outputs.stale != 'true'
         continue-on-error: true
         env:
           TRIGGER_HMAC_SECRET: ${{ secrets.TRIGGER_HMAC_SECRET }}
