@@ -49245,6 +49245,18 @@ runSerial(async () => {
     failed++;
     failures.push("avmeld-s1a: unexpected error: " + String(err?.message || err));
   }
+  try {
+    const { runAvmeldFixupTests } = require("../src/services/avmeld-fixup.test") as
+      typeof import("../src/services/avmeld-fixup.test");
+    const fx = await runAvmeldFixupTests({ log: false });
+    passed += fx.passed;
+    failed += fx.failed;
+    for (const f of fx.failures) failures.push("avmeld-fixup: " + f);
+    console.log(`  avmeld-fixup: ${fx.passed} passed, ${fx.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("avmeld-fixup: unexpected error: " + String(err?.message || err));
+  }
 });
 
 // 2026-10-04 view-stats honesty: producer view statistics count humans, not

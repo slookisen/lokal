@@ -616,7 +616,7 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
     .get(normalized);
   if (!sentRow) return false;
 
-  const bouncedRow = db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? LIMIT 1`).get(normalized);
+  const bouncedRow = db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND (bounce_type IS NULL OR bounce_type <> 'unsubscribe') LIMIT 1`).get(normalized);
   return !bouncedRow;
 }
 
