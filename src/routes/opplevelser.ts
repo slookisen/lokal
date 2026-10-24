@@ -1366,7 +1366,7 @@ router.get("/discover", (req: Request, res: Response) => {
       if (typeof filter.radius_km === "number") gsFilter.radius_km = filter.radius_km;
       const hasGeo = typeof gsFilter.lat === "number" && typeof gsFilter.lng === "number";
 
-      const gsResults = searchGardssalgProviders(gsFilter, limit);
+      const gsResults = searchGardssalgProviders(gsFilter, limit, { surface: "rest" });
       res.json({
         vertical: "gardssalg",
         query: gsFilter,
@@ -9943,7 +9943,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     if (!rawProviderQuery) {
       return res.status(400).json(providerQueryMissingPayload());
     }
-    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true });
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true, surface: "rest" });
     if (resolution.kind === "none") {
       return res.status(404).json(providerNotFoundPayload(rawProviderQuery));
     }
@@ -31081,7 +31081,7 @@ router.post("/book", async (req: Request, res: Response) => {
       res.status(400).json(providerQueryMissingPayload());
       return;
     }
-    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery);
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { surface: "rest" });
     if (resolution.kind === "none") {
       res.status(200).json(providerNotFoundPayload(rawProviderQuery));
       return;
