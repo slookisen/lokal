@@ -756,6 +756,7 @@
         <div class="hidden" id="ordersContent">
           <div class="card">
             <h2>Bestillinger</h2>
+            <p style="margin-bottom:0.75rem;"><a class="btn btn-primary btn-small" id="ordersMineLink" href="#">Åpne «Mine ordrer» – bekreft og avslå her</a></p>
             <ul class="product-list" id="ordersList"></ul>
           </div>
         </div>
@@ -2119,6 +2120,8 @@
     function loadOwnerOrders() {
       if (!state.agentId || ordersLoading) return;
       ordersLoading = true;
+      var mineLink = document.getElementById('ordersMineLink');
+      if (mineLink) mineLink.href = '/eier/' + encodeURIComponent(state.agentId) + '/ordrer';
       show('ordersLoading');
       hide('ordersLoginRequired');
       hide('ordersContent');

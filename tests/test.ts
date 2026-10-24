@@ -37138,6 +37138,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("order-actions-fase-a1: unexpected error: " + String(err?.message || err));
+  }
+  // Fase A2 («Mine ordrer» i eierportalen) runs strictly after A1 (own in-memory DB).
+  try {
+    const { runOwnerOrdersFaseA2Tests } = require("../src/routes/owner-orders-fase-a2.test") as
+      typeof import("../src/routes/owner-orders-fase-a2.test");
+    const a2 = await runOwnerOrdersFaseA2Tests({ log: false });
+    passed += a2.passed;
+    failed += a2.failed;
+    for (const f of a2.failures) failures.push("owner-orders-fase-a2: " + f);
+    console.log(`  owner-orders-fase-a2: ${a2.passed} passed, ${a2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-orders-fase-a2: unexpected error: " + String(err?.message || err));
   } finally {
     _orderActionsA1Resolve();
   }
