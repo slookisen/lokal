@@ -44461,6 +44461,44 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // A2A dev-request 2026-10-16-siteringspanel, S5a+S5b: the AI citation panel — engine
+  // adapters, questions, own-domain matching, ai_citation_results, the weekly job behind
+  // AI_CITATION_PANEL_ENABLED with its cost caps, GET /admin/analytics/ai-citations[/status].
+  // Fetch stubs only (no network). Pins the main getDb() for the admin-route step and sets
+  // ADMIN_KEY (both restored), and queues on the exclusive boot gate, so serial.
+  console.log("\n── siteringspanel S5a+S5b: AI citation panel ──");
+  try {
+    const { runEnginesTests } = require("../src/services/ai-citation/engines.test") as
+      typeof import("../src/services/ai-citation/engines.test");
+    const en = await runEnginesTests({ log: false });
+    passed += en.passed;
+    failed += en.failed;
+    for (const f of en.failures) failures.push("ai-citation engines: " + f);
+    console.log(`  ai-citation engines: ${en.passed} passed, ${en.failed} failed`);
+
+    const { runPanelRunnerTests } = require("../src/services/ai-citation/panel-runner.test") as
+      typeof import("../src/services/ai-citation/panel-runner.test");
+    const pr = await runPanelRunnerTests({ log: false });
+    passed += pr.passed;
+    failed += pr.failed;
+    for (const f of pr.failures) failures.push("ai-citation panel-runner: " + f);
+    console.log(`  ai-citation panel-runner: ${pr.passed} passed, ${pr.failed} failed`);
+
+    const { runPanelJobTests } = require("../src/services/ai-citation/panel-job.test") as
+      typeof import("../src/services/ai-citation/panel-job.test");
+    const pj = await runPanelJobTests({ log: false });
+    passed += pj.passed;
+    failed += pj.failed;
+    for (const f of pj.failures) failures.push("ai-citation panel-job: " + f);
+    console.log(`  ai-citation panel-job: ${pj.passed} passed, ${pj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ai-citation panel: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ ai-citation panel: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── orchestrator-pr-1: /api/stats host-scoped registry stats (dental/experiences hosts no longer see RFB's numbers) ──");
   try {
     const { runA2aStatsVerticalTests } = require("../src/routes/a2a-stats-vertical.test") as

@@ -5831,6 +5831,35 @@ function initSchema(db: Database.Database): void {
     console.error("Migration search_console_weekly failed:", err);
   }
 
+  // ─── ai_citation_results (A2A dev-request 2026-10-16-siteringspanel, S5a) ───
+  // One row per ISO week (e.g. 2026-W43), engine and panel question: the cited
+  // URLs and domains (JSON arrays), whether one is ours (hit_self), a ≤ 300-char
+  // answer snippet and the cost; status ok | error | skipped_cost_cap. Written
+  // by services/ai-citation/panel-runner.ts (behind AI_CITATION_PANEL_ENABLED).
+  // No personal data, no secrets. Same DDL as AI_CITATION_RESULTS_DDL there (a
+  // test compares them). Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_citation_results (
+        week TEXT NOT NULL,
+        engine TEXT NOT NULL,
+        prompt_id TEXT NOT NULL,
+        vertical TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT,
+        cited_urls TEXT NOT NULL,
+        cited_domains TEXT NOT NULL,
+        hit_self INTEGER NOT NULL DEFAULT 0,
+        answer_snippet TEXT,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE (week, engine, prompt_id)
+      )
+    `);
+  } catch (err) {
+    console.error("Migration ai_citation_results failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …
