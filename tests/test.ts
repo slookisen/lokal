@@ -49141,6 +49141,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
+// bare den ene butikken når produsenten ikke er tatt over.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-utsending-v4 skive 1: /selger?agent= viser én butikk ──");
+  try {
+    const { runRfbSelgerEnButikkTests } = require("../src/routes/rfb-selger-en-butikk.test") as
+      typeof import("../src/routes/rfb-selger-en-butikk.test");
+    const se = await runRfbSelgerEnButikkTests({ log: false });
+    passed += se.passed;
+    failed += se.failed;
+    for (const f of se.failures) failures.push("rfb-selger-en-butikk: " + f);
+    console.log(`  rfb-selger-en-butikk: ${se.passed} passed, ${se.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-selger-en-butikk: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-01-rfb-contact-extraction-laas-henger: run-locks of
 // POST /admin/rfb-contact-extraction and /admin/gardssalg-contact-extraction
 // carry { startedAt, runId } with an upper bound (stale takeover, runId-guarded
