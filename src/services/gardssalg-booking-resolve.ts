@@ -36,6 +36,7 @@ import {
   type GardssalgProviderRow,
 } from "./experience-store";
 import { isBookingPaused } from "./booking-store";
+import type { GardssalgSurface } from "./gardssalg-visibility";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -107,7 +108,7 @@ export function resolveGardssalgProviderByQuery(
   // includeHidden: ADMIN-ONLY (POST /admin/booking-test-send) — lets the
   // hidden, email-pinned test producer be resolved by name. Never set from a
   // public entry point; see GardssalgSearchFilter.include_hidden.
-  opts: { kommune?: string; fylke?: string; includeHidden?: boolean } = {},
+  opts: { kommune?: string; fylke?: string; includeHidden?: boolean; surface?: GardssalgSurface } = {},
 ): ProviderResolution {
   // Same 200-char cap as the MCP input schema, applied here too so the REST
   // path (and any other caller) can never hand the store an unbounded query.
@@ -120,7 +121,7 @@ export function resolveGardssalgProviderByQuery(
   if (opts.fylke && opts.fylke.trim()) filter.fylke = opts.fylke.trim();
   if (opts.includeHidden === true) filter.include_hidden = true;
 
-  const rows = searchGardssalgProviders(filter, PROVIDER_QUERY_MAX_CANDIDATES + 1);
+  const rows = searchGardssalgProviders(filter, PROVIDER_QUERY_MAX_CANDIDATES + 1, { surface: opts.surface ?? "rest" });
   if (rows.length === 0) return { kind: "none", query: q };
   if (rows.length === 1) return { kind: "one", provider: rows[0]!, candidates_considered: 1 };
 

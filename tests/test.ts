@@ -47013,6 +47013,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 5 — one
+// visibility predicate per surface (gardssalg-visibility.ts): equivalence with
+// the old scattered predicates on a rows x surfaces matrix + mutation check
+// that every surface reads the shared rule table.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 5: gardssalg visibility per surface ──");
+  try {
+    const { runGardssalgVisibilityTests } = require("../src/services/gardssalg-visibility.test") as
+      typeof import("../src/services/gardssalg-visibility.test");
+    const gvis = await runGardssalgVisibilityTests({ log: false });
+    passed += gvis.passed;
+    failed += gvis.failed;
+    for (const f of gvis.failures) failures.push("gardssalg-visibility: " + f);
+    console.log(`  gardssalg-visibility: ${gvis.passed} passed, ${gvis.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-visibility: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-29-verifier-claim-kind-katalog-gap — GET
 // /admin/verifier/claim-counts (src/routes/admin-verifier-claim-counts.ts):
 // read-only claim-kind count+sample endpoint (typed allowlist of 7 kinds)

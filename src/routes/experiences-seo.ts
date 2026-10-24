@@ -2728,7 +2728,7 @@ function buildExperiencesSitemapXml(): string {
   // every request (rfb PR #302 fixed the same pattern for city pages).
   let gardssalgProvidersForSitemap: GardssalgProviderRow[] | null = null;
   if (gardssalgVisible()) {
-    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0); } catch { gardssalgProvidersForSitemap = null; }
+    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0, undefined, "sitemap"); } catch { gardssalgProvidersForSitemap = null; }
   }
   try {
     for (const row of listPublishedCategories()) {
