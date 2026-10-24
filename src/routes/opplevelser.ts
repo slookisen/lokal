@@ -13335,7 +13335,9 @@ type GardssalgAutosvarApplyOutcome =
   // classifier or the judge itself) — treated exactly like "nothing to
   // apply" (no epost write, no queue row), but reported under its own
   // label rather than folded into an unrelated bucket.
-  | "contact_gate_rejected";
+  | "contact_gate_rejected"
+  // G1 skive 5: the row's epost is owner-locked — nothing written.
+  | "owner_locked";
 
 interface GardssalgAutosvarApplyResult {
   dry_run: boolean;
@@ -13378,6 +13380,7 @@ async function runGardssalgAutosvarApply(opts: {
       provider_not_found: 0,
       skipped_no_email_found: 0,
       contact_gate_rejected: 0,
+      owner_locked: 0,
     };
 
     for (const c of scan.candidates) {
@@ -13391,11 +13394,20 @@ async function runGardssalgAutosvarApply(opts: {
 
       if (c.classification === "domain_match") {
         const providerRow = expDb
-          .prepare(`SELECT navn, epost FROM experience_providers WHERE id = ?`)
-          .get(c.provider_id) as { navn: string; epost: string | null } | undefined;
+          .prepare(`SELECT navn, epost, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+          .get(c.provider_id) as
+          | { navn: string; epost: string | null; content_source: string | null; field_provenance: string | null }
+          | undefined;
         if (!providerRow) {
           results.push({ ...c, outcome: "provider_not_found" });
           counts.provider_not_found++;
+          continue;
+        }
+        // Owner lock (G1 skive 5): an owner-locked epost is never rewritten by
+        // the automated autosvar path (a human can still use set-contact-email).
+        if (isGardssalgFieldOwnerLocked(providerRow, "epost")) {
+          results.push({ ...c, outcome: "owner_locked" });
+          counts.owner_locked++;
           continue;
         }
         const currentEmail = (providerRow.epost || "").trim().toLowerCase();
@@ -16787,8 +16799,15 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
       // Provenance: mark as rfb-knowledge sourced with the producer's own site
       // as evidence URL (Daniel: "bruk agentens hjemmeside som proof på info").
       const evidenceUrl = r.matched_rfb ? (byDomain.get(r.matched_rfb.domain)?.url ?? null) : null;
-      sets.push("content_source = ?", "content_evidence_url = ?", "content_updated_at = ?");
-      vals.push("rfb-knowledge", evidenceUrl, now);
+      // A claimed row keeps content_source='claim' (G1 skive 5: re-stamping it
+      // would silently unlock the owner's other fields); only per-field locks
+      // inside pickEnrichmentFields decide what may be filled.
+      if (providers.find((p) => p.id === r.provider_id)?.content_source !== "claim") {
+        sets.push("content_source = ?");
+        vals.push("rfb-knowledge");
+      }
+      sets.push("content_evidence_url = ?", "content_updated_at = ?");
+      vals.push(evidenceUrl, now);
       try {
         expDb.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = ?`).run(...vals, r.provider_id);
         enriched++;

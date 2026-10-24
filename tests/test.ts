@@ -33311,6 +33311,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gaa.failures) failures.push("opplevelser-gardssalg-autosvar-apply: " + f);
     console.log(`  opplevelser-gardssalg-autosvar-apply: ${gaa.passed} passed, ${gaa.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 skive 5 punkt 1:
+    // every automated writer respects the owner lock on an owned row.
+    console.log("\n── opplevelser-gardssalg-owner-lock-everywhere: owner lock respected by all automated writers ──");
+    const { runOpplevelserGardssalgOwnerLockEverywhereTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-everywhere.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-everywhere.test");
+    const golw = await runOpplevelserGardssalgOwnerLockEverywhereTests({ log: false });
+    passed += golw.passed;
+    failed += golw.failed;
+    for (const f of golw.failures) failures.push("opplevelser-gardssalg-owner-lock-everywhere: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-everywhere: ${golw.passed} passed, ${golw.failed} failed`);
+
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
     // rfb_seed_source='rfb-seed' rows with no naeringskode have no signal that
