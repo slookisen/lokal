@@ -907,7 +907,8 @@ class KnowledgeService {
         `SELECT LOWER(TRIM(o.recipient_email)) AS email
            FROM outreach_sent_log o
           WHERE o.agent_id = ? AND o.vertical_id = 'rfb' AND o.recipient_email IS NOT NULL
-            AND NOT EXISTS (SELECT 1 FROM email_bounces b WHERE LOWER(TRIM(b.email)) = LOWER(TRIM(o.recipient_email)))
+            AND NOT EXISTS (SELECT 1 FROM email_bounces b WHERE LOWER(TRIM(b.email)) = LOWER(TRIM(o.recipient_email))
+                            AND (b.bounce_type IS NULL OR b.bounce_type <> 'unsubscribe'))
           ORDER BY o.sent_at DESC, o.id DESC`
       ).all(agentId) as Array<{ email: string }>;
       return delivered.map((r) => r.email).find(isSingleEmailAddress) ?? null;
