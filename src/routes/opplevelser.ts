@@ -965,6 +965,7 @@ import { rfbWdPageReferencesOwnHost } from "./admin-rfb-website-discovery";
 // uses, and answers a place outside Norway and a food purchase like it does.
 import { GARDSSALG_CATEGORY, interpretDiscoverQuery, isStockfishPurchase, listCategorySlugs } from "../services/experiences-query-intent";
 import { outsideNorwayPlace } from "../services/outside-norway";
+import { confirmOwnerByEmail, clearOwnerEmailConfirmation } from "../services/gardssalg-owner-email-confirm";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -10455,6 +10456,69 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   txn();
 
   res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-owner-email-confirm (admin) ─────
+//
+// dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+// change 2 + 4. Lets CS stamp "Bekreftet av eier" for ONE producer from ONE
+// inbound message, without the producer logging in.
+//
+// Body: { provider_id, sender_email, thread_id, confirmed_fields?: string[],
+// apply?: true } or { provider_id, clear: true, apply?: true } to reset.
+//
+// The sender must be an address the claim flow accepts for exactly this
+// producer (services/gardssalg-owner-email-confirm.ts: same candidate list
+// issueClaimMagicLink() validates against); anything else is rejected with a
+// reason, also another address on the producer's own domain. Dry-run by
+// default; only the literal boolean `true` writes. claimed_at is never
+// touched. Confirmed fields get the existing admin field lock; an existing
+// manual/claim/owner lock is left as it is. One gardssalg_content_audit row
+// per write.
+router.post("/admin/gardssalg-owner-email-confirm", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+  const apply = body.apply === true;
+
+  try {
+    if (body.clear === true) {
+      const cleared = clearOwnerEmailConfirmation(providerId, { apply });
+      if (!cleared.ok) return res.status(404).json({ success: false, error: cleared.reason });
+      return res.json({ success: true, ...cleared });
+    }
+
+    const senderEmail = typeof body.sender_email === "string" ? body.sender_email.trim() : "";
+    if (!senderEmail) return res.status(400).json({ success: false, error: "sender_email_required" });
+    const threadId = typeof body.thread_id === "string" ? body.thread_id.trim() : "";
+    if (!threadId) return res.status(400).json({ success: false, error: "thread_id_required" });
+
+    const rawFields = body.confirmed_fields === undefined ? [] : body.confirmed_fields;
+    if (
+      !Array.isArray(rawFields) ||
+      !rawFields.every((f) => typeof f === "string" && (GARDSSALG_LOCKABLE_FIELDS as readonly string[]).includes(f))
+    ) {
+      return res.status(400).json({ success: false, error: "invalid_confirmed_fields" });
+    }
+
+    const result = await confirmOwnerByEmail({
+      providerId,
+      senderEmail,
+      threadId,
+      confirmedFields: rawFields as GardssalgLockableField[],
+      apply,
+    });
+    if (!result.ok) {
+      const status = result.reason === "provider_not_found" ? 404 : result.reason === "invalid_sender" ? 400 : 422;
+      return res.status(status).json({ success: false, error: result.reason });
+    }
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-owner-email-confirm failed", err);
+    return res.status(500).json({ success: false, error: "internal_error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────
@@ -30901,6 +30965,14 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       if (!dryRun) {
         upd.run(targetValue, hidden ? mode : null, row.id);
         if (hidden && mode === "remove_request") {
+          // "Fjern oss" also withdraws the e-mail confirmation (dev-request
+          // 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+          // change 4): no "Bekreftet av eier" is left behind on a removed profile.
+          try {
+            clearOwnerEmailConfirmation(row.id, { apply: true, batchPrefix: "owner-email-confirm-remove" });
+          } catch (clearErr) {
+            console.error("[opplevelser] gardssalg-provider-visibility confirmation clear failed (non-critical):", clearErr);
+          }
           try {
             const bl = blocklistAdd({
               orgNr: row.org_nr ?? undefined,
