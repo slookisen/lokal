@@ -77,7 +77,7 @@
 import { getDb } from "../database/init";
 import { knowledgeService } from "./knowledge-service";
 import { geocodingService } from "./geocoding-service";
-import { isEligibleForRealOrder } from "./cart-service";
+import { isEligibleForRealOrder, isProducerStatedSource, foodInfoOf, type FoodInfo } from "./cart-service";
 import { computeEffectiveAvailability } from "./supply-graph";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
@@ -141,6 +141,13 @@ export interface Offer {
   price_nok: number | null;
   unit: string | null;
   availability: string;
+  /**
+   * Skive 4 / 4c: present with food_info, and for every offer of a producer who takes orders
+   * (left out otherwise, so such an answer is what it was): the row was stated by the producer, not scraped.
+   */
+  producer_confirmed?: boolean;
+  /** Skive 4: ingredients / allergens / net weight where stated, shown to the buyer before submit; left out when none is stated. */
+  food_info?: FoodInfo;
   producer: OfferProducer;
 }
 
@@ -193,6 +200,9 @@ interface RawOfferRow {
   product_category: string | null;
   /** agents.categories, a JSON array. */
   agent_categories: string | null;
+  ingredients: string | null;
+  allergens: string | null;
+  net_weight: string | null;
 }
 
 // I-V: every word of the query parser's keyword map, and every platform key,
@@ -259,6 +269,28 @@ function compareOfferRows(a: OfferCandidate, b: OfferCandidate): number {
     || Number(b.availability === "in_stock") - Number(a.availability === "in_stock")
     || Number(b.r.price_nok != null) - Number(a.r.price_nok != null)
     || compareLabelRows(a.r, b.r);
+}
+
+/**
+ * Skive 4b (S1): for a producer who passes isEligibleForRealOrder() only the
+ * producer-stated rows (availability_source producer_dashboard or
+ * admin_producer_confirmed) can be ordered, so an in-stock stated row goes
+ * before any other row: a scraped row must not hide the confirmed item (and its
+ * food information) just because its name matches the term better. When no
+ * in-stock stated row is involved, or for a producer who does not pass the
+ * gate (every row is a contact row), compareOfferRows alone decides (unchanged).
+ * The gate is only evaluated when the two rows differ in being an in-stock
+ * stated row; a gate that cannot be evaluated counts as «not eligible».
+ */
+function compareOffersForProducer(a: OfferCandidate, b: OfferCandidate, db: any): number {
+  const aOrderable = isProducerStatedSource(a.r.availability_source) && a.availability === "in_stock";
+  const bOrderable = isProducerStatedSource(b.r.availability_source) && b.availability === "in_stock";
+  if (aOrderable !== bOrderable) {
+    let eligible = false;
+    try { eligible = isEligibleForRealOrder(a.r.agent_id, db); } catch { /* not eligible */ }
+    if (eligible) return Number(bOrderable) - Number(aOrderable);
+  }
+  return compareOfferRows(a, b);
 }
 
 /** Nearest first; equal distances (one centroid, say) by agent id. */
@@ -342,7 +374,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       a.id AS agent_id, a.name AS agent_name, a.city AS city,
       a.lat AS lat, a.lng AS lng, a.geo_precision AS geo_precision,
       a.is_verified AS is_verified,
-      p.category AS product_category, a.categories AS agent_categories
+      p.category AS product_category, a.categories AS agent_categories,
+      p.ingredients AS ingredients, p.allergens AS allergens, p.net_weight AS net_weight
     FROM products p
     INNER JOIN agents a ON a.id = p.agent_id
     INNER JOIN agent_knowledge k ON k.agent_id = a.id
@@ -387,7 +420,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       if (!prev || compareLabelRows(r, prev.r) < 0) firstLabel.set(r.agent_id, x);
     } else {
       const prev = bestOffer.get(r.agent_id);
-      if (!prev || compareOfferRows(x, prev) < 0) bestOffer.set(r.agent_id, x);
+      if (!prev || compareOffersForProducer(x, prev, db) < 0) bestOffer.set(r.agent_id, x);
     }
   }
   const offerRows = [...bestOffer.values()].sort(byDistance).slice(0, limit);
@@ -436,14 +469,22 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     };
   };
 
-  const offers: Offer[] = offerRows.map(({ r, dist, availability }) => ({
-    product_id: r.product_id ?? null,
-    product_name: r.product_name,
-    price_nok: r.price_nok ?? null,
-    unit: r.unit ?? null,
-    availability,
-    producer: producerOf(r, dist),
-  }));
+  const offers: Offer[] = offerRows.map(({ r, dist, availability }) => {
+    const food_info = foodInfoOf(r);
+    const producer = producerOf(r, dist);
+    return {
+      product_id: r.product_id ?? null,
+      product_name: r.product_name,
+      price_nok: r.price_nok ?? null,
+      unit: r.unit ?? null,
+      availability,
+      // Skive 4c (F3): producer_confirmed is sent for every offer of a producer who takes orders (so a scraped
+      // row is a contact choice already in step 2), and for any offer that carries food information.
+      ...(food_info || producer.can_order ? { producer_confirmed: isProducerStatedSource(r.availability_source) } : {}),
+      ...(food_info ? { food_info } : {}),
+      producer,
+    };
+  });
 
   if (matchRows.length === 0) return { term, offers };
   const note = categoryMatchNote(term);

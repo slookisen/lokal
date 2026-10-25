@@ -120,6 +120,51 @@ export interface CuratedFieldMeta {
   request_summary?: string; // 1-line: "Eirin (daglig leder) ba om ny beskrivelse"
 }
 
+// ─── Owner lock in the write layer ───────────────────────────
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere (S1a point 1). The owner
+// portal stamps curated_fields.<column>.by = "owner" on every owner save, but
+// upsertKnowledge() used to overwrite such a field for any caller (enrichment,
+// admin PUT /agents/:id/knowledge …). With OWNER_LOCK_ENFORCE_WRITES on, a
+// write that does not come from the owner path leaves an owner-locked field
+// as it is and reports it as skipped: owner_locked. Default OFF = the write
+// is byte-identical to before. `products` is lockable like any other column
+// (an owner-asserted product list / its categories live in that one column).
+
+/** Env flag (read at call time, "1" or "true" = on). Default OFF. */
+export const OWNER_LOCK_ENFORCE_FLAG = "OWNER_LOCK_ENFORCE_WRITES";
+
+export function ownerLockEnforcedForWrites(): boolean {
+  const v = process.env[OWNER_LOCK_ENFORCE_FLAG];
+  return v === "1" || v === "true";
+}
+
+/** AgentKnowledge property -> the curated_fields key (the DB column name). */
+const LOCKABLE_FIELD_KEYS: Record<string, string> = {
+  address: "address", postalCode: "postal_code", website: "website", phone: "phone", email: "email",
+  openingHours: "opening_hours", products: "products", about: "about", specialties: "specialties",
+  certifications: "certifications", paymentMethods: "payment_methods", deliveryOptions: "delivery_options",
+  googleRating: "google_rating", googleReviewCount: "google_review_count", tripadvisorRating: "tripadvisor_rating",
+  externalReviews: "external_reviews", externalLinks: "external_links", images: "images", seasonality: "seasonality",
+  deliveryRadius: "delivery_radius", minOrderValue: "min_order_value",
+};
+
+/** A field a knowledge write left alone. */
+export interface SkippedKnowledgeField {
+  field: string;
+  reason: "owner_locked";
+}
+
+/** Result of upsertKnowledge(): fields dropped from the write because of an owner lock. */
+export interface UpsertKnowledgeResult {
+  skipped: SkippedKnowledgeField[];
+}
+
+/** Options of upsertKnowledge(). */
+export interface UpsertKnowledgeOptions {
+  /** True only on the owner path (ownerUpdate()); it may change owner-locked fields. */
+  ownerPath?: boolean;
+}
+
 export interface SeasonalProduct {
   product: string;      // "Jordbær", "Epler", "Honning"
   months: number[];     // [6,7,8] = June-August
@@ -639,8 +684,9 @@ class KnowledgeService {
   }
 
   // ─── Set/update knowledge (used by enrichment + owner) ────
-  upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void {
+  upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>, opts: UpsertKnowledgeOptions = {}): UpsertKnowledgeResult {
     const db = getDb();
+    const skipped: SkippedKnowledgeField[] = [];
     // I-F: the merge base is read strictly. The merge below writes every
     // column back, so a lenient read would replace a column that does not
     // parse with its empty value. Such a row still fails the write, as
@@ -648,6 +694,21 @@ class KnowledgeService {
     const existingRow = this.selectKnowledgeRow(agentId);
     const existing = existingRow ? this.rowToKnowledge(existingRow, "strict") : null;
     const now = new Date().toISOString();
+
+    // Owner lock (OWNER_LOCK_ENFORCE_WRITES, default off): drop owner-locked
+    // fields from a non-owner write before anything below sees them.
+    if (existingRow && !opts.ownerPath && ownerLockEnforcedForWrites()) {
+      const locks = this.parseCuratedFields((existingRow as { curated_fields?: string | null }).curated_fields);
+      const kept: Partial<AgentKnowledge> = { ...data };
+      for (const [prop, key] of Object.entries(LOCKABLE_FIELD_KEYS)) {
+        if ((data as Record<string, unknown>)[prop] === undefined) continue;
+        if (locks[key]?.by === "owner") {
+          delete (kept as Record<string, unknown>)[prop];
+          skipped.push({ field: key, reason: "owner_locked" });
+        }
+      }
+      data = kept;
+    }
 
     // Write-time contact guard (dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon,
     // slice 1). Validate the INCOMING `data` before it participates in either
@@ -774,11 +835,13 @@ class KnowledgeService {
     } catch {
       // Column may not exist yet on older DBs — safe to skip
     }
+    return { skipped };
   }
 
   // ─── Owner update (after claiming) ──────────────────────
+  // The owner path: the only caller that may change owner-locked fields.
   ownerUpdate(agentId: string, data: Partial<AgentKnowledge>): void {
-    this.upsertKnowledge(agentId, { ...data, dataSource: "owner" });
+    this.upsertKnowledge(agentId, { ...data, dataSource: "owner" }, { ownerPath: true });
   }
 
   // ─── Bulk enrich from auto sources ─────────────────────
@@ -1407,6 +1470,17 @@ class KnowledgeService {
     }
     db.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?")
       .run(JSON.stringify(current), agentId);
+  }
+
+  /** curated_fields column text -> locks; unreadable text reads as "no locks" (as getCuratedFields). */
+  private parseCuratedFields(raw: string | null | undefined): Record<string, CuratedFieldMeta> {
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
   }
 
   /** Phase 4.9a — get current curated-field locks (used by enrichment-agent

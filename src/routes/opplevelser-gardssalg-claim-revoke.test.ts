@@ -28,7 +28,7 @@
  *       non-revoked claim -> dry_run:true, would_revoke lists exactly that
  *       claim (masked email), and writes/revokes NOTHING
  *   (e) apply:true -> dry_run:false, the claim's revoked_at is actually set,
- *       claimed_at and content_source are COMPLETELY untouched, and exactly
+ *       claimed_at is reset (no active claim left; audited), content_source is untouched, and exactly
  *       one gardssalg_content_audit row is written
  *   (f) idempotent: a second apply:true call on the same provider finds
  *       zero active/non-revoked claims left and revokes/audits nothing
@@ -255,8 +255,14 @@ export function runOpplevelserGardssalgClaimRevokeTests(
       assertEq(claimAfterRevoke.used, 1, "e6: used is left alone (still 1 — a real historical claim happened)");
 
       const providerAfterRevoke = getProviderRow("revoke-fresh");
-      assertEq(providerAfterRevoke.claimed_at, "2026-08-01 10:00:00", "e7: claimed_at is COMPLETELY untouched by revoke (historical badge survives)");
-      assertEq(providerAfterRevoke.content_source, "claim", "e8: content_source is COMPLETELY untouched by revoke");
+      assertEq(providerAfterRevoke.claimed_at, null, "e7: claimed_at is reset by an admin revoke once no active claim is left (G1 pt 8)");
+      assertEq(applyRes.body.claimed_at_reset, true, "e7b: response reports claimed_at_reset:true");
+      assertEq(
+        (expDb.prepare(`SELECT old_value, new_value FROM gardssalg_content_audit WHERE provider_id = 'revoke-fresh' AND field_name = 'claimed_at'`).all() as any[]),
+        [{ old_value: "2026-08-01 10:00:00", new_value: null }],
+        "e7c: the claimed_at reset is audited",
+      );
+      assertEq(providerAfterRevoke.content_source, "claim", "e8: content_source is left untouched by revoke (protects owner text)");
 
       const auditRows = getAuditRows("revoke-fresh");
       assertEq(auditRows.length, 1, "e9: exactly ONE gardssalg_content_audit row was written for the revoke");
@@ -353,6 +359,7 @@ export function runOpplevelserGardssalgClaimRevokeTests(
       const multiRowsAfter = getClaimRows("revoke-multi");
       assertTrue(multiRowsAfter.every((r: any) => typeof r.revoked_at === "string" && r.revoked_at.length > 0), "j3: both claim rows now have revoked_at set");
       assertEq(getAuditRows("revoke-multi").length, 2, "j4: two separate audit rows were written, one per revoked claim");
+      assertEq(getProviderRow("revoke-multi").claimed_at, null, "j5: claimed_at reset after the LAST active claim was revoked");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-claim-revoke: unexpected error: " + String(err?.stack || err?.message || err));

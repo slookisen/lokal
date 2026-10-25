@@ -39,7 +39,7 @@ import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
-import { DiscoveryQuerySchema } from "../models/marketplace";
+import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
@@ -56,7 +56,7 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
@@ -1774,24 +1774,25 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   }
 
   try {
-    const parsed = marketplaceRegistry.parseNaturalQuery(q);
-    const proximityIntent = !!(parsed as any)._proximityIntent;
     const heleNorge = req.query.heleNorge === "true";
+    // Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): read as
+    // MCP lokal_search reads it (services/rfb-search-reading.ts): a place
+    // outside Norway gets no producers («cheese in Stockholm» listed Norwegian
+    // dairies), and the place in the text is geocoded as before (e.g.
+    // "honning oslo" → Oslo coords), unless the visitor's position or «hele
+    // Norge» decides the area.
+    const { outsideNorway, parsed } = readSearchText(q);
+    const proximityIntent = !outsideNorway && !!(parsed as any)._proximityIntent;
     let geoPlaceLabel: string | undefined;
 
-    // Geocode location from query text (e.g. "honning oslo" → Oslo coords)
-    if (!heleNorge && !parsed.location) {
+    if (!outsideNorway && !heleNorge) {
       if (hasBrowserCoords) {
         parsed.location = { lat: frontendLat, lng: frontendLng };
         parsed.maxDistanceKm = searchRadiusKm;
         geoPlaceLabel = lang === "en" ? "your location" : "din posisjon";
       } else if (q) {
-        const geoResult = await geocodingService.extractAndGeocode(q);
-        if (geoResult) {
-          parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
-          parsed.maxDistanceKm = geoResult.radiusKm;
-          geoPlaceLabel = formatPlaceLabel(geoResult.name);
-        }
+        const place = await geocodeSearchPlace(parsed, q);
+        if (place) geoPlaceLabel = formatPlaceLabel(place.name);
       }
     }
 
@@ -1800,16 +1801,16 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // different question with a nationwide trust-ranked list.
     const needsLocation = proximityIntent && !parsed.location && !heleNorge;
 
-    // Preserve internal fields through Zod parsing (Zod strips unknown keys).
+    // Preserve internal fields through Zod parsing (Zod strips unknown keys):
+    // discoveryQueryOf puts the parser's words back on every query below.
     // _nameQuery is critical: when present, discover() returns name-matched
     // agents anywhere in Norway and skips geo. Without this re-attach, /sok
     // silently fell back to geo-rank fallback and surfaced unrelated nearby
     // producers when the user typed a producer name not present locally.
-    const productTerms = parsed._productTerms;
+    // Slice I-AA: _unknownTerms too, so discover() step 3c looks the words
+    // up in the product names: «kransekake» showed the standard list.
     const nameQuery = (parsed as any)._nameQuery as string | undefined;
-    const query = DiscoveryQuerySchema.parse({ ...parsed, limit: 30, offset: 0 });
-    if (productTerms) (query as any)._productTerms = productTerms;
-    if (nameQuery) (query as any)._nameQuery = nameQuery;
+    const query = discoveryQueryOf(parsed, { limit: 30, offset: 0 });
 
     // REVIEW FOLLOW-UP B1: same out-param as /api/marketplace/search —
     // discover() can widen a NAME search past our radius by itself, and the
@@ -1821,7 +1822,16 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     const requestMeta = buildRequestMeta(req);
     const trafficClass = searchTrafficClass({ meta: requestMeta, text: q });
     const trackDiscovery = trafficClass === "external";
-    let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery });
+    // Slice I-AA: a page whose unknown words match no product name
+    // (meta.unmatchedTerms) is the producers near the place, not results: it
+    // is shown as none, so the ladder below widens as for an empty page, and
+    // it is not counted as discovered. unmatchedTerms is the last step's.
+    const search = (stepQuery: typeof query, meta: DiscoverMeta) => {
+      const found = marketplaceRegistry.discover(stepQuery, meta, { trackDiscovery, countUnmatched: false });
+      return meta.unmatchedTerms ? [] : found;
+    };
+    let results = outsideNorway ? [] : search(query, discoverMeta);
+    let unmatchedTerms = discoverMeta.unmatchedTerms;
 
     // If discover returned name-matched results (relevanceScore≥0.9 +
     // matchReasons starts with "Navnematch"), don't run the geo-fallback —
@@ -1840,7 +1850,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // from the first call, but RE-CAPTURED at every ladder step below — see
     // the matching comment in /api/marketplace/search (marketplace.ts) for
     // why a stale first-call flag is wrong once the ladder actually widens.
-    let tagsDropped = !!discoverMeta.tagsRelaxed;
+    // Slice I-AA: a tag dropped for a page shown as none is no news.
+    let tagsDropped = !unmatchedTerms && !!discoverMeta.tagsRelaxed;
     let appliedRadiusKm = parsed.maxDistanceKm;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       // REVIEW FOLLOW-UP item 6: only ever WIDEN. This ladder is fixed at
@@ -1850,22 +1861,18 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       const steps = [50, 100, 200].filter((r) => r > (parsed.maxDistanceKm ?? 0));
       for (const radius of steps) {
         if (results.length >= MIN_RESULTS) break;
-        const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
-        if (productTerms) (expanded as any)._productTerms = productTerms;
-        if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         const expandedMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(expanded, expandedMeta, { trackDiscovery });
+        results = search(discoveryQueryOf(parsed, { maxDistanceKm: radius, limit: 30, offset: 0 }), expandedMeta);
+        unmatchedTerms = expandedMeta.unmatchedTerms;
         appliedRadiusKm = radius;
-        tagsDropped = !!expandedMeta.tagsRelaxed;
+        tagsDropped = !unmatchedTerms && !!expandedMeta.tagsRelaxed;
       }
       if (results.length < MIN_RESULTS) {
-        const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
-        if (productTerms) (noGeo as any)._productTerms = productTerms;
-        if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         const noGeoMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(noGeo, noGeoMeta, { trackDiscovery });
+        results = search(discoveryQueryOf(parsed, { location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 }), noGeoMeta);
+        unmatchedTerms = noGeoMeta.unmatchedTerms;
         geoDropped = true;
-        tagsDropped = !!noGeoMeta.tagsRelaxed;
+        tagsDropped = !unmatchedTerms && !!noGeoMeta.tagsRelaxed;
       }
     }
     if (geoDropped) appliedRadiusKm = undefined;
@@ -1886,13 +1893,12 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     let totalAtMax = false;
     if (results.length >= 30) {
       try {
-        const countQuery = DiscoveryQuerySchema.parse({
-          ...parsed,
+        // The product words, and slice I-AA's unknown words; no name query, as before.
+        const countQuery = discoveryQueryOf(parsed, {
           location: heleNorge ? undefined : parsed.location,
           maxDistanceKm: heleNorge ? undefined : parsed.maxDistanceKm,
           limit: 100, offset: 0,
-        });
-        if (productTerms) (countQuery as any)._productTerms = productTerms;
+        }, ["_productTerms", "_unknownTerms"]);
         // Count-only: these rows are never shown, so they are not "discovered".
         const countResults = marketplaceRegistry.discover(countQuery, undefined, { trackDiscovery: false });
         totalCount = countResults.length;
@@ -2036,6 +2042,15 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     const queryLabel = q
       ? `\u201c${escapeHtml(q)}\u201d`
       : (lang === "en" ? "your location" : "din posisjon");
+    // Slice I-AA: an empty page says why, in lokal_search's words: a place
+    // outside Norway, or words that no product name matches (also after the
+    // ladder looked in all of Norway). Otherwise as before.
+    const textLang = lang === "en" ? "en" : "no";
+    const nullNote = outsideNorway ? outsideNorwayText(outsideNorway, textLang)
+      : unmatchedTerms ? noProductMatchText(unmatchedTerms, textLang) : null;
+    const emptyLine = nullNote
+      ? `<p id="searchNullNote" style="font-size:1.1rem;">${escapeHtml(nullNote)}</p>`
+      : `<p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>`;
     // REVIEW FOLLOW-UP R2: `heleNorge=true` is the OTHER way a coordinates-only
     // page ends up nationwide, and it was not covered by the geoDropped guard —
     // /sok?lat=..&lng=..&heleNorge=true rendered «Produsenter nær deg (30 km)»
@@ -2076,7 +2091,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       ${results.length > 0
         ? `<div class="results-grid">${resultCards}</div>`
         : `<div style="text-align:center;padding:48px 0;color:var(--g500);">
-            <p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>
+            ${emptyLine}
             <p style="margin-top:8px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Try a different search" : "Pr\u00f8v et annet s\u00f8k"}</a></p>
           </div>`
       }
@@ -3221,7 +3236,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>MCP/A2A tool-call log</td><td>Deleted automatically after 60 days, in the same daily pass as page visits and searches. No daily counts are kept from this log.</td></tr>
         <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
         <tr><td>Buyer contact details (name/email/phone/note)</td><td>Deleted automatically 30 days after the order is finally resolved (completed/declined/cancelled), or 30 days after submission if no order was created.</td></tr>
-        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, with no fixed time limit. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
+        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, and never longer than 30 days. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
         <tr><td>Email correspondence and send log</td><td>No automatic deletion today. We delete it on request.</td></tr>
         <tr><td>Do-not-re-add list</td><td>For as long as the service exists, so a removed profile is not created again.</td></tr>
       </tbody>
@@ -3393,7 +3408,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Fra denne loggen beholdes bare antall søk per dag, uke og måned per kanal (MCP eller A2A), uten klient-streng, IP-hash eller annen kobling til den som kalte.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
         <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
-        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
+        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
         <tr><td>E-postkorrespondanse og utsendingslogg</td><td>Ingen automatisk sletting i dag. Vi sletter på forespørsel.</td></tr>
         <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt.</td></tr>
       </tbody>
@@ -4821,8 +4836,7 @@ export function buildProducerFaqJsonLd(params: {
 //   - category-tag fallback (no real product list)      → "tilbyr"
 //   - real product list, confirmed direct-sale signal    → "selger"
 //   - real product list, no confirmed direct-sale signal → "produserer"
-// "bestill direkte" only appears with a confirmed direct-sale signal;
-// otherwise the closing clause is "finn kontaktinfo".
+// The closing clause is always "finn kontaktinfo" (no "bestill direkte" any more, 2026-10-18).
 //
 // Extracted so the DB-derivation logic used by the /produsent/:slug route
 // handler is directly unit-testable without a DB — round-2 review found two
@@ -4875,8 +4889,11 @@ export function buildProducerAnswerFirstOpening(params: {
 
   const verbNo = !usingRealProducts ? "tilbyr" : hasDirectSaleSignal ? "selger" : "produserer";
   const verbEn = !usingRealProducts ? "offers" : hasDirectSaleSignal ? "sells" : "produces";
-  const closingNo = hasDirectSaleSignal ? "finn kontaktinfo og bestill direkte under" : "finn kontaktinfo under";
-  const closingEn = hasDirectSaleSignal ? "find contact details and order directly below" : "find contact details below";
+  // dev-request 2026-10-08-malsetning-bestill-direkte-ordlyd-produsentside (Daniel, alt. C):
+  // the closing clause no longer urges "bestill direkte" on any page, also with a confirmed
+  // sale signal (a producer owner objected). The signal still picks the verb ("selger").
+  const closingNo = "finn kontaktinfo under";
+  const closingEn = "find contact details below";
 
   if (lang === "en") {
     const whatPartEn = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " and more" : "");
@@ -5070,7 +5087,7 @@ function passesRoleGate(
     console.error("[seo] role-gate umbrella lookup failed:", e);
   }
   const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
-  const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
+  const failsRoleGate = failsProducerRoleGate(agent.role, agentIsUmbrellaForGate);
   if (failsRoleGate || !roleGateIsVetted || !roleGateListable) {
     if (!roleGateListable) {
       console.log(`[seo:listability-gate] suppressed hidden/non-RFB agent ${agent.id} on /produsent/${requestedSlug}`);

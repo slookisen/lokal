@@ -1,5 +1,5 @@
 {
-  "captured_on": "main 58d5974e, before I-X (dev-request 2026-10-17-integrasjonstest-oppfolging)",
+  "captured_on": "main 58d5974e, before I-X (dev-request 2026-10-17-integrasjonstest-oppfolging); the two RFB texts «honning i Oslo» captured again for I-AA (A2A reads the text's place as lokal_search does: the fixture's producers have no position, so none is in the Oslo area)",
   "how": "b1Answers() in src/routes/a2a-datapart-alle-plattformer.test.ts: sha256 of each answer with ids, timestamps and origins masked (stable()), plus a summary",
   "answers": {
     "dental {\"message\":\"tannlege i Oslo\"}": {
@@ -736,9 +736,9 @@
       }
     },
     "rfb {\"message\":\"honning i Oslo\"}": {
-      "sha256": "a048a5af26729c4aa9f3e886b4a3d8fa9d766fcd48b455640dc958af770a8671",
+      "sha256": "d2074ba9c2d8fd2ee68317f0627259292c9956d00b24efcd40e74b3094f0127f",
       "summary": {
-        "count": 2,
+        "count": 0,
         "parsedQuery": {
           "categories": [
             "honey"
@@ -746,15 +746,20 @@
           "_productTerms": [
             "honning"
           ],
-          "role": "producer"
+          "role": "producer",
+          "location": {
+            "lat": 59.9139,
+            "lng": 10.7522
+          },
+          "maxDistanceKm": 25
         },
-        "countable": true
+        "countable": false
       }
     },
     "rfb {\"message\":{\"text\":\"honning i Oslo\"}}": {
-      "sha256": "a048a5af26729c4aa9f3e886b4a3d8fa9d766fcd48b455640dc958af770a8671",
+      "sha256": "d2074ba9c2d8fd2ee68317f0627259292c9956d00b24efcd40e74b3094f0127f",
       "summary": {
-        "count": 2,
+        "count": 0,
         "parsedQuery": {
           "categories": [
             "honey"
@@ -762,9 +767,14 @@
           "_productTerms": [
             "honning"
           ],
-          "role": "producer"
+          "role": "producer",
+          "location": {
+            "lat": 59.9139,
+            "lng": 10.7522
+          },
+          "maxDistanceKm": 25
         },
-        "countable": true
+        "countable": false
       }
     },
     "rfb {\"message\":{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"melk\"}]}}": {

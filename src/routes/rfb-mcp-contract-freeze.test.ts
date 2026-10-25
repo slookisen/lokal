@@ -11,11 +11,19 @@
  * order-status tools and the instructions have a prepayment variant):
  *
  *   - initialize.result.instructions
+ *   - initialize.result.serverInfo (slice I-A2): the whole object as
+ *     canonical JSON. G3-S5 keeps RFB's serverInfo (name, version, title,
+ *     websiteUrl, icons) as it is until OpenAI has decided; a change fails
+ *     with a message that says serverInfo has changed
+ *     (tests/helpers/mcp-serverinfo-freeze.ts)
  *   - tools/list (the whole result, plus one hash per tool so a failure names
  *     the tool that changed)
  *   - resources/list and resources/templates/list
  *
  * resources/read is not pinned: both RFB resources render catalog data.
+ * Negative controls apply each serverInfo change the hold is about to the
+ * live serverInfo (M8 from the lokal#1186 review added `icons`) and check
+ * that it fails, and that the same fields in another key order do not.
  *
  * The hashes live in tests/fixtures/rfb-mcp-contract-freeze.json. Changing
  * them is a deliberate act: only after the review is done, or together with
@@ -38,6 +46,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import Database from "better-sqlite3";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
+import {
+  SERVER_INFO_PART, SERVER_INFO_CHANGES, serverInfoHash, serverInfoFreezeFailure, reversedKeys, type LiveContract,
+} from "../../tests/helpers/mcp-serverinfo-freeze";
 
 export interface TestSummary {
   passed: number;
@@ -83,8 +94,8 @@ function httpRequest(method: string, url: string, body: string, headers: Record<
   });
 }
 
-/** SHA-256 of every frozen part of the contract for one MCP session on the live /mcp router. */
-async function sessionContractHashes(url: string, prefix: string): Promise<Record<string, string>> {
+/** SHA-256 of every frozen part of the contract, and the serverInfo, for one MCP session on the live /mcp router. */
+async function sessionContract(url: string, prefix: string): Promise<LiveContract> {
   const baseHeaders = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
   const initRes = await httpRequest("POST", url, JSON.stringify({
     jsonrpc: "2.0", method: "initialize",
@@ -104,22 +115,24 @@ async function sessionContractHashes(url: string, prefix: string): Promise<Recor
       return body.result;
     };
     const toolsList = await rpc("tools/list");
+    const serverInfoPart = `${prefix} ${SERVER_INFO_PART}`;
     const hashes: Record<string, string> = {
       [`${prefix} initialize.instructions`]: sha256(init?.result?.instructions ?? null),
+      [serverInfoPart]: serverInfoHash(init?.result?.serverInfo),
       [`${prefix} tools/list`]: sha256(toolsList),
     };
     for (const tool of toolsList?.tools ?? []) hashes[`${prefix} tools/list#${tool.name}`] = sha256(tool);
     hashes[`${prefix} resources/list`] = sha256(await rpc("resources/list"));
     hashes[`${prefix} resources/templates/list`] = sha256(await rpc("resources/templates/list"));
-    return hashes;
+    return { hashes, serverInfo: { [serverInfoPart]: init?.result?.serverInfo ?? null } };
   } finally {
     // Leave no session behind in the router's module-level map.
     await httpRequest("DELETE", url, "", sessionHeaders);
   }
 }
 
-/** SHA-256 of every frozen part of the contract, as served by the live /mcp router, per PAYMENTS_ENABLED value. */
-export async function currentRfbContractHashes(): Promise<Record<string, string>> {
+/** SHA-256 of every frozen part of the contract, and the serverInfo, as served by the live /mcp router, per PAYMENTS_ENABLED value. */
+export async function currentRfbContract(): Promise<LiveContract> {
   const prevPayments = process.env.PAYMENTS_ENABLED;
   const prevDb = __peekDbForTesting();
   const db = new Database(":memory:");
@@ -135,15 +148,17 @@ export async function currentRfbContractHashes(): Promise<Record<string, string>
     await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
 
-    const hashes: Record<string, string> = {};
+    const contract: LiveContract = { hashes: {}, serverInfo: {} };
     // A session reads PAYMENTS_ENABLED when it is created (registerTools,
     // rfbMcpInstructions), so each variant gets its own session.
     for (const variant of PAYMENTS_VARIANTS) {
       if (variant.value === undefined) delete process.env.PAYMENTS_ENABLED;
       else process.env.PAYMENTS_ENABLED = variant.value;
-      Object.assign(hashes, await sessionContractHashes(url, variant.label));
+      const session = await sessionContract(url, variant.label);
+      Object.assign(contract.hashes, session.hashes);
+      Object.assign(contract.serverInfo, session.serverInfo);
     }
-    return hashes;
+    return contract;
   } finally {
     if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
     if (prevPayments === undefined) delete process.env.PAYMENTS_ENABLED;
@@ -170,14 +185,53 @@ export function runRfbMcpContractFreezeTests(opts: { log?: boolean } = {}): Prom
     }
   }
 
+  /** Passes on a null failure; otherwise records the failure text under the label. */
+  function check(failure: string | null, label: string): void {
+    if (failure === null) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      const msg = `✗ ${label}\n    ${failure}`;
+      failures.push(msg);
+      if (log) console.log("  " + msg);
+    }
+  }
+
   return (async () => {
     try {
       const frozen = JSON.parse(fs.readFileSync(RFB_CONTRACT_FREEZE_FIXTURE, "utf8")) as { hashes: Record<string, string> };
-      const current = await currentRfbContractHashes();
-      assertEq(Object.keys(current).sort(), Object.keys(frozen.hashes).sort(),
+      const live = await currentRfbContract();
+      assertEq(Object.keys(live.hashes).sort(), Object.keys(frozen.hashes).sort(),
         "rfb-cf-0: the frozen contract has the same parts (tools, PAYMENTS_ENABLED variants) as the live server");
       for (const [part, hash] of Object.entries(frozen.hashes)) {
-        assertEq(current[part], hash, `rfb-cf-1: ${part} is byte-identical to the contract frozen for the OpenAI review`);
+        if (Object.hasOwn(live.serverInfo, part)) {
+          check(serverInfoFreezeFailure(live.serverInfo[part], hash), `rfb-cf-2: ${part} is the serverInfo frozen for the OpenAI review`);
+        } else {
+          assertEq(live.hashes[part], hash, `rfb-cf-1: ${part} is byte-identical to the contract frozen for the OpenAI review`);
+        }
+      }
+
+      // Negative controls: each change G3-S5 holds back, applied to the live
+      // serverInfo, fails with a message that says serverInfo has changed;
+      // the same fields in another key order (also inside icons) are the
+      // same serverInfo. They compare with the live serverInfo's hash (the
+      // frozen one when rfb-cf-2 passes), so a real change fails rfb-cf-2 only.
+      for (const [part, serverInfo] of Object.entries(live.serverInfo)) {
+        const liveInfo = (serverInfo ?? {}) as Record<string, unknown>;
+        const liveHash = live.hashes[part];
+        for (const [change, apply] of SERVER_INFO_CHANGES) {
+          const failure = serverInfoFreezeFailure(apply(liveInfo), liveHash);
+          assertEq(failure?.startsWith("serverInfo has changed") ?? false, true,
+            `rfb-cf-3: ${part} with ${change} fails with a message that serverInfo has changed`);
+        }
+        const withIcons = SERVER_INFO_CHANGES[0][1](liveInfo);
+        assertEq({
+          keyOrderDiffers: JSON.stringify(reversedKeys(liveInfo)) !== JSON.stringify(liveInfo),
+          sameHash: serverInfoHash(reversedKeys(liveInfo)) === liveHash,
+          sameHashWithIcons: serverInfoHash(reversedKeys(withIcons)) === serverInfoHash(withIcons),
+        }, { keyOrderDiffers: true, sameHash: true, sameHashWithIcons: true },
+        `rfb-cf-4: ${part} with its keys in reverse order (also inside icons) is the same serverInfo (canonical JSON)`);
       }
     } catch (err: any) {
       failed++;
@@ -190,7 +244,7 @@ export function runRfbMcpContractFreezeTests(opts: { log?: boolean } = {}): Prom
 // Standalone runner: `npx tsx src/routes/rfb-mcp-contract-freeze.test.ts [--print]`
 if (require.main === module) {
   if (process.argv.includes("--print")) {
-    currentRfbContractHashes().then((hashes) => {
+    currentRfbContract().then(({ hashes }) => {
       console.log(JSON.stringify({ hashes }, null, 2));
       // Explicit exit: requiring the route modules leaves background timers open.
       process.exit(0);

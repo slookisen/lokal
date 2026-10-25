@@ -305,6 +305,11 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
         { success: false, message: "Klarte ikke å lagre. Prøv igjen." },
         "save-04: ok:true but unparsable/null body -> error receipt, not a throw",
       );
+      assertEq(
+        routerMod.describeSaveOutcome(false, { success: false, error: "booking_blocked", message: "Booking er <stanset>." }),
+        { success: false, message: "Booking er &lt;stanset&gt;." },
+        "save-05: 409 booking_blocked -> the server's Norwegian reason, HTML-escaped",
+      );
 
       const expressMod = require("express") as typeof import("express");
       const app = expressMod();
@@ -587,6 +592,64 @@ export function runGardssalgClaimRouteTests(opts: { log?: boolean } = {}): Promi
       assertTrue(statsBody.success === true, "d19: stats API success=true");
       assertEq(typeof statsBody.stats.humanViews, "number", "d20: stats API returns a numeric humanViews");
       assertTrue(Array.isArray(statsBody.stats.notAvailable) && statsBody.stats.notAvailable.length > 0, "d21: stats API honestly lists what's NOT available (never fabricated)");
+
+      // ── (bs) booking switch: admin brake + booking-request address
+      // (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 3).
+      // Uses the same session; restores the row's state at the end so the
+      // sections below see exactly what they saw before. ────────────────
+      {
+        const before = expDb.prepare("SELECT booking_live, epost, about_text FROM experience_providers WHERE id = ?").get("prov-route-eligible") as any;
+        expDb.prepare(
+          "UPDATE experience_providers SET booking_live = 0, booking_admin_brake_at = datetime('now'), booking_admin_brake_note = ? WHERE id = ?",
+        ).run("Klage <b>fra</b> gjest", "prov-route-eligible");
+
+        const portalBraked = await req("GET", "/kategori/gardssalg/eier/route-test-gard/portal", { headers: { Cookie: cookieHeader } });
+        assertEq(portalBraked.status, 200, "bs1: portal renders while braked");
+        assertTrue(portalBraked.body.includes("Booking er stanset av Opplevagent."), "bs2: portal shows 'stanset av Opplevagent'");
+        assertTrue(portalBraked.body.includes("Grunn: Klage &lt;b&gt;fra&lt;/b&gt; gjest."), "bs3: portal shows the brake reason, HTML-escaped");
+        assertTrue(/id="f-booking"[^>]*disabled/.test(portalBraked.body), "bs4: the booking checkbox is disabled while braked");
+
+        const profileBraked = JSON.parse((await req("GET", "/api/opplevelser/gardssalg-claim/prov-route-eligible/profile", { headers: { Cookie: cookieHeader } })).body);
+        assertEq(profileBraked.booking.stopped_by_opplevagent, true, "bs5: profile API reports stopped_by_opplevagent");
+        assertEq(profileBraked.booking.stop_reason, "Klage <b>fra</b> gjest", "bs6: profile API carries the brake reason");
+        assertEq(profileBraked.booking.can_enable, false, "bs7: profile API: can_enable false while braked");
+
+        const onBraked = await req("POST", "/api/opplevelser/gardssalg-claim/prov-route-eligible/update-profile", {
+          headers: { "Content-Type": "application/json", Cookie: cookieHeader },
+          body: JSON.stringify({ about_text: "Skal ikke lagres", booking_live: true }),
+        });
+        assertEq(onBraked.status, 409, "bs8: owner switching booking on while braked -> 409");
+        const onBrakedBody = JSON.parse(onBraked.body);
+        assertEq(onBrakedBody.error, "booking_blocked", "bs9: error booking_blocked");
+        assertEq(onBrakedBody.reason, "admin_brake", "bs10: reason admin_brake");
+        assertTrue(/stanset av Opplevagent/.test(onBrakedBody.message), "bs11: Norwegian reason in the 409 body");
+        const afterBraked = expDb.prepare("SELECT booking_live, about_text FROM experience_providers WHERE id = ?").get("prov-route-eligible") as any;
+        assertEq(afterBraked.booking_live, 0, "bs12: booking_live stays 0");
+        assertEq(afterBraked.about_text, before.about_text, "bs13: nothing in the refused request was written");
+
+        const saveBraked = await req("POST", "/kategori/gardssalg/eier/route-test-gard/save", {
+          headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: cookieHeader },
+          body: "field_about_text=x&field_booking_live=1",
+        });
+        assertEq(saveBraked.status, 303, "bs14: no-JS save while braked -> 303");
+        assertTrue(String(saveBraked.headers.location || "").includes("status=booking_blocked"), "bs15: no-JS save redirects with status=booking_blocked");
+
+        // No brake, but no address for booking requests -> 409 no_booking_email.
+        expDb.prepare(
+          "UPDATE experience_providers SET booking_admin_brake_at = NULL, booking_admin_brake_note = NULL, epost = NULL WHERE id = ?",
+        ).run("prov-route-eligible");
+        const onNoEmail = await req("POST", "/api/opplevelser/gardssalg-claim/prov-route-eligible/update-profile", {
+          headers: { "Content-Type": "application/json", Cookie: cookieHeader },
+          body: JSON.stringify({ booking_live: 1 }),
+        });
+        assertEq(onNoEmail.status, 409, "bs16: switching booking on without an address -> 409");
+        assertEq(JSON.parse(onNoEmail.body).reason, "no_booking_email", "bs17: reason no_booking_email");
+        const portalNoEmail = await req("GET", "/kategori/gardssalg/eier/route-test-gard/portal", { headers: { Cookie: cookieHeader } });
+        assertTrue(portalNoEmail.body.includes('data-booking-state="needs_booking_email"'), "bs18: portal explains the missing address");
+
+        expDb.prepare("UPDATE experience_providers SET booking_live = ?, epost = ?, about_text = ? WHERE id = ?")
+          .run(before.booking_live, before.epost, before.about_text, "prov-route-eligible");
+      }
 
       // ── (f) dev-request 2026-08-06-claim-innlogging-sesjon: the claimed-
       // badge's "Logg inn" link on the public producer page now points

@@ -13,9 +13,9 @@
  *       verticals/rfb/config.yaml display_name (what the front page used),
  *       and the agentplatform.no service list agrees with the entries.
  *   (c) URLs: https, `url` is a bare origin, logo/docs/privacy/terms live on
- *       the entry's own origin, logos are .png; dental's logo is the F2-S4 PNG
- *       and its docs page the G3-S4 guide; pages that do not exist yet are
- *       null (dental terms, company terms/docs).
+ *       the entry's own origin, logos are .png; dental's logo is the F2-S4 PNG,
+ *       its docs page the G3-S4 guide and its terms page /vilkar (F2-S5);
+ *       pages that do not exist yet are null (company terms/docs).
  *   (d) alternateName: each brand carries its bare domain — RFB
  *       «rettfrabonden.com» (FUNN rett-fra-bonden-generisk-frase-forveksling);
  *       no duplicates, nothing equal to the name.
@@ -154,9 +154,10 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     let origin = "";
     try { origin = new URL(e.url).origin; } catch { /* reported below */ }
     assertTrue(e.url.startsWith("https://") && origin === e.url, `c1 ${k}: url is a bare https origin, no trailing slash (${e.url})`);
-    const own = [e.logoPng, e.docsUrl, e.privacyUrl, e.termsUrl].filter((u): u is string => u !== null);
-    assertTrue(own.every((u) => u.startsWith(`${e.url}/`) && !/\s/.test(u)), `c2 ${k}: logo, docs, privacy and terms are https pages on ${e.url}`);
+    const own = [e.logoPng, e.iconPng192, e.docsUrl, e.privacyUrl, e.termsUrl].filter((u): u is string => u !== null);
+    assertTrue(own.every((u) => u.startsWith(`${e.url}/`) && !/\s/.test(u)), `c2 ${k}: logo, 192 icon, docs, privacy and terms are https pages on ${e.url}`);
     if (e.logoPng !== null) assertTrue(/\.png$/.test(e.logoPng), `c3 ${k}: the logo is a PNG (${e.logoPng})`);
+    if (e.iconPng192 !== null) assertTrue(/\.png$/.test(e.iconPng192) && e.logoPng !== null, `c3b ${k}: the 192 icon is a PNG, next to a logo (${e.iconPng192})`);
   }
   assertEq(
     [E.rfb.logoPng, E.experiences.logoPng, E.dental.logoPng, E.company.logoPng],
@@ -165,10 +166,12 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
   );
   assertTrue(!KEYS.some((k) => /\.svg$/i.test(E[k].logoPng ?? "")), "c5: no entry uses an SVG as its logo (Opplevagent's Organization used /favicon.svg)");
   assertEq(
-    [E.dental.termsUrl, E.company.termsUrl, E.company.docsUrl],
-    [null, null, null],
-    "c6: pages that do not exist yet are null, not a guess (dental terms, company terms/docs)",
+    [E.company.termsUrl, E.company.docsUrl],
+    [null, null],
+    "c6: pages that do not exist yet are null, not a guess (company terms/docs)",
   );
+  assertEq(E.dental.termsUrl, "https://finn-tannlege.com/vilkar",
+    "c6b: dental terms is /vilkar (F2-S5, A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon)");
   assertEq(E.dental.docsUrl, "https://finn-tannlege.com/guide-tannlege-ai", "c7: Finn-tannlege's docs page is the AI guide (G3-S4)");
 
   // ── (d) alternateName ───────────────────────────────────────────────────
@@ -250,6 +253,7 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     assertTrue(Array.isArray((org.parentOrganization as any)?.sameAs) && (org.parentOrganization as any).sameAs.includes(COMPANY_INFO.brregUrl), `h7 ${k}: parentOrganization.sameAs holds the Brreg URL`);
     assertTrue(!("legalName" in org) && !("identifier" in org), `h8 ${k}: the brand does not claim the company's legal name or org.nr.`);
     assertTrue(!("sameAs" in org), `h9 ${k}: no empty sameAs on the brand while it has no profiles`);
+    assertTrue(("disambiguatingDescription" in org) === !!e.disambiguation?.nb && (!e.disambiguation?.nb || org.disambiguatingDescription === e.disambiguation.nb), `h10b ${k}: disambiguatingDescription only (and exactly) when the entry has disambiguation`);
     assertTrue(!hasEmptyValue(org), `h10 ${k}: no empty string, empty array or null anywhere`);
     assertTrue(!JSON.stringify(org).includes(COMPANY_INFO.address.street), `h11 ${k}: no street address`);
   }

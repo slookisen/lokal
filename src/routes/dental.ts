@@ -18,6 +18,9 @@ import {
   getDentalAgentById,
   getDentalAgentByOrgnr,
   listDentalAgents,
+  listPublicDentalAgents,
+  countPublicDentalAgents,
+  listPoststeder,
   listSpecialistsForClinic,
   listChains,
   updateDentalAgent,
@@ -39,9 +42,13 @@ import {
   recordStageVFieldObservation,
   type StageVField,
   DENTAL_AGENT_WRITABLE_FIELDS,
+  withoutDentalSideColumns,
   type DentalAgentRow,
 } from "../services/dental-store";
 import { shownDentalAgent, shownDentalFieldProvenance, isPrivateEnkAddress } from "../services/dental-places-display";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// GET /discover gives verification_status as the badge says it.
+import { shownVerificationStatus } from "../services/dental-verified-claim";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -63,6 +70,10 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { findOrgnumberByName } from "../services/brreg-client";
 import { buildProvenanceSummary } from "../services/cross-source-validator";
 import { capFreeText } from "../utils/free-text";
+import { planDentalSearch } from "../services/dental-query-parser";
+import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+import { toDentalClinicCard } from "../services/dental-clinic-card";
+import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
 
 const router = Router();
 
@@ -119,8 +130,12 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 // of a sole proprietorship is hidden from a public answer whether or not the
 // Places rule is on (shownDentalAgent); with the rule off the answer keeps
 // field_provenance, less that address's entries.
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// the side values the «Verifisert» claim reads are left out of both as well,
+// and verification_status stays the stored value here (the raw REST answer
+// is F2-S7's), so both answers are as before.
 function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
-  const { stage_v_pending_correction: _pending, ...row } = withoutGoogleRating(adminView ? agent : shownDentalAgent(agent));
+  const row = withoutDentalSideColumns(withoutGoogleRating(adminView ? agent : shownDentalAgent(agent)));
   if (adminView) return row;
   if (!placesDisplayPolicyEnabled()) return { ...row, field_provenance: shownDentalFieldProvenance(agent) };
   const { field_provenance: _provenance, ...shown } = row;
@@ -348,6 +363,67 @@ router.post("/agents", requireAdmin, (req: Request, res: Response) => {
 // on the exact same reserved ids and per-field literal matches. See that
 // module's doc comment for the full fingerprint definition.
 
+// ─── The «Akuttvakt» quote on the PUT (F1-S4d) ──────────────────────
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d punkt 3.
+// «Akuttvakt» is shown for acute_vakt = 1 when any acute_vakt source stores a
+// quote (resolveAcuteClaim, F1-S4c), and mergeFieldProvenance now keeps the
+// quote. So that only the extraction that writes acute_vakt can give «vakt»:
+//   - when the validated body has acute_vakt, the quote (with its
+//     quote_basis) is removed from every stored acute_vakt source before
+//     the merge, also when the body has no field_provenance (then nothing
+//     else in the column changes);
+//   - an incoming acute_vakt source keeps its quote only when its value is
+//     "1" and the validated body has acute_vakt = 1 (not stripped);
+//     otherwise the quote is removed before the merge.
+// acute_vakt = 1 without a quote is stored and shows «Tar imot
+// akuttpasienter». The answer says acute_vakt_quote: "stored" (this PUT's
+// quote is stored), "dropped" (a quote was sent, none is stored) or
+// "missing" (acute_vakt in the body, no quote sent); the enrichment
+// report counts it (SKILL §4.4).
+
+/** The source without `quote` and `quote_basis`; the source itself when it has neither. */
+function withoutQuote(source: unknown): unknown {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return source;
+  if (!("quote" in source) && !("quote_basis" in source)) return source;
+  const { quote: _quote, quote_basis: _quoteBasis, ...rest } = source as Record<string, unknown>;
+  return rest;
+}
+
+/** The source's value is "1" (value or raw_value, as normaliseSource reads it, trimmed as dedupKey does). */
+function sourceValueIsOne(source: unknown): boolean {
+  if (!source || typeof source !== "object") return false;
+  const s = source as { value?: unknown; raw_value?: unknown };
+  const value = s.value ?? s.raw_value;
+  return value != null && String(value).trim() === "1";
+}
+
+/**
+ * `prov` with `fn` applied to each acute_vakt source, read as
+ * mergeFieldProvenance reads a stored entry: an array, the `sources` array of
+ * an object, or else the object as one source. `prov` itself when no source
+ * changed, so the caller can tell whether anything was removed.
+ */
+function mapAcuteVaktSources(prov: Record<string, unknown>, fn: (source: unknown) => unknown): Record<string, unknown> {
+  const entry = prov.acute_vakt;
+  let next: unknown = entry;
+  const mapAll = (sources: unknown[]) => {
+    const mapped = sources.map(fn);
+    return mapped.some((s, i) => s !== sources[i]) ? mapped : sources;
+  };
+  if (Array.isArray(entry)) {
+    next = mapAll(entry);
+  } else if (entry && typeof entry === "object") {
+    const sources = (entry as { sources?: unknown }).sources;
+    if (Array.isArray(sources)) {
+      const mapped = mapAll(sources);
+      if (mapped !== sources) next = { ...(entry as Record<string, unknown>), sources: mapped };
+    } else {
+      next = fn(entry);
+    }
+  }
+  return next === entry ? prov : { ...prov, acute_vakt: next };
+}
+
 // ─── PUT /api/tannlege/agents/:id (admin) ───────────────────────────
 router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   const id = req.params.id as string;
@@ -412,11 +488,21 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
     // Places homepage-backfill block above (~line 1156): read the row's
     // current field_provenance, tolerate junk/missing JSON, merge via the
     // shared mergeFieldProvenance() helper. Only runs when the body actually
-    // includes field_provenance — no extra DB read otherwise.
-    if (
-      result.data.field_provenance &&
-      typeof result.data.field_provenance === "object"
-    ) {
+    // includes field_provenance or acute_vakt (F1-S4d, above) — no extra DB
+    // read otherwise.
+    const acuteVakt = result.data.acute_vakt;
+    let incomingProv: Record<string, unknown> | null =
+      result.data.field_provenance && typeof result.data.field_provenance === "object"
+        ? (result.data.field_provenance as Record<string, unknown>)
+        : null;
+    const acuteVaktQuoteSent = incomingProv !== null && hasAcuteVaktQuote(incomingProv);
+    if (incomingProv) {
+      incomingProv = mapAcuteVaktSources(incomingProv, (s) =>
+        acuteVakt === 1 && sourceValueIsOne(s) ? s : withoutQuote(s)
+      );
+    }
+    // (field_provenance: null in the body still clears the column, quotes and all.)
+    if (incomingProv || (acuteVakt !== undefined && result.data.field_provenance === undefined)) {
       const existingAgent = getDentalAgentById(id);
       let existingProv: Record<string, unknown> = {};
       if (
@@ -426,11 +512,30 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       ) {
         existingProv = existingAgent.field_provenance as Record<string, unknown>;
       }
-      result.data.field_provenance = mergeFieldProvenance(
-        existingProv,
-        result.data.field_provenance as any
-      ) as any;
+      const storedProv = acuteVakt !== undefined ? mapAcuteVaktSources(existingProv, withoutQuote) : existingProv;
+      if (incomingProv) {
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: the
+        // audit entries other routes write here (`inactive` from
+        // admin-dental-mark-inactive, `hjemmeside` from
+        // admin-dental-hjemmeside-cleanup) are kept as stored, also when
+        // this PUT sends sources for the same field (keepAuditEntries).
+        result.data.field_provenance = mergeFieldProvenance(storedProv, incomingProv as any, { keepAuditEntries: true }) as any;
+      } else if (storedProv !== existingProv) {
+        // No field_provenance to merge: only the quotes go, every other entry
+        // is written back as stored. mergeFieldProvenance would rewrite the
+        // column (PR-28 drops a malformed source, such as one whose value is
+        // not a string, and wraps a single record in a list).
+        result.data.field_provenance = storedProv as any;
+      }
     }
+    const acuteVaktQuote =
+      acuteVakt === 1 && result.data.field_provenance && hasAcuteVaktQuote(result.data.field_provenance)
+        ? "stored"
+        : acuteVaktQuoteSent
+          ? "dropped"
+          : acuteVakt !== undefined
+            ? "missing"
+            : undefined;
 
     const ok = updateDentalAgent(id, result.data);
     if (!ok) {
@@ -448,6 +553,7 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       fields_updated: Object.keys(result.data).filter((k) => DENTAL_AGENT_WRITABLE_FIELDS.includes(k)),
       ...(strippedFields.length ? { stripped_fields: strippedFields } : {}),
       ...(openingHoursDropped ? { opening_hours_dropped: openingHoursDropped } : {}),
+      ...(acuteVaktQuote ? { acute_vakt_quote: acuteVaktQuote } : {}),
     });
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -459,46 +565,69 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   }
 });
 
-// ─── GET /api/tannlege/discover — A2A-style search ──────────────────
-// Lightweight discovery endpoint for AI-agent integration. Same query
-// shape as listDentalAgents but the response envelope mirrors the
-// marketplace discovery contract (so consumer agents have one mental
-// model across verticals).
+// ─── GET /api/tannlege/discover — public search ────────────────────
+// The primary public search (dev-request 2026-10-16-tannlege-mcp-instrukser-og-
+// klinikkort, S7). Same honest set and the same free-text reading as MCP
+// tannlege_search: listPublicDentalAgents/countPublicDentalAgents leave out
+// rejected, permanently closed, non-clinic and synthetic-probe rows, and `q`
+// goes through planDentalSearch (parseDentalQuery). Explicit parameters win
+// over what the text says. The envelope mirrors the marketplace discovery
+// contract (so consumer agents have one mental model across verticals).
+//   ?q=tannlege i Bergen   ?fylke=  ?specialty=  ?poststed=
+//   ?helfo_agreement=true (alias ?helfo=)   ?akutt=1 (alias ?acute_vakt=)
+//   ?chain_brand=  ?verification_status=  ?limit=20 (max 100)  ?offset=0
 router.get("/discover", (req: Request, res: Response) => {
   try {
-    const filter = ListFilterSchema.parse({
-      fylke: req.query.fylke as string | undefined,
-      chain_brand: req.query.chain_brand as string | undefined,
-      specialty: req.query.specialty as string | undefined,
-      verification_status: req.query.verification_status as
-        | string
-        | undefined,
-    });
+    const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v : undefined);
+    const explicit: Record<string, unknown> = {
+      fylke: str(req.query.fylke),
+      chain_brand: str(req.query.chain_brand),
+      specialty: str(req.query.specialty),
+      verification_status: str(req.query.verification_status),
+      poststed: str(req.query.poststed),
+      helfo_agreement: str(req.query.helfo_agreement) ?? str(req.query.helfo),
+    };
+    // akutt is an honest filter: 1/true/ja = the akutt claim (acute_vakt 1, S2b).
+    const akutt = str(req.query.akutt) ?? str(req.query.acute_vakt);
+    if (akutt !== undefined) {
+      const on = ["1", "true", "ja"].includes(akutt.toLowerCase());
+      const off = ["0", "false", "nei"].includes(akutt.toLowerCase());
+      if (!on && !off) {
+        res.status(400).json({ error: "Invalid query", details: [{ path: ["akutt"], message: "akutt must be 1 or 0" }] });
+        return;
+      }
+      if (on) explicit.acute_vakt = 1;
+    }
+    const q = typeof req.query.q === "string" ? capFreeText(req.query.q) : undefined;
     const limit = Math.min(
       100,
       Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20)
     );
-    // dev-request 2026-09-03-dental-catalog-class-public-filter (slice 1b):
-    // opt-in via listDentalAgents's excludeNonClinic (4th param) -- gated
-    // behind DENTAL_PUBLIC_CATALOG_CLASS_FILTER="1" so GET /agents (this
-    // module's OTHER listDentalAgents caller, not one of slice 1b's named
-    // public surfaces) stays byte-identical.
-    const agents = listDentalAgents(filter, limit, 0, {
-      excludeNonClinic: isDentalPublicCatalogClassFilterEnabled(),
+    const offset = Math.max(0, parseInt((req.query.offset as string) || "0", 10) || 0);
+
+    const plan = planDentalSearch({
+      query: q,
+      explicit,
+      gazetteer: () => getDentalSearchGazetteer(listPoststeder),
+      count: (f) => countPublicDentalAgents(f as any),
     });
+    const agents = listPublicDentalAgents(plan.filter as any, limit, offset);
     res.json({
       vertical: "dental",
-      query: filter,
+      query: plan.filter,
       count: agents.length,
+      total: plan.count,
+      ...(plan.tolkning ? { tolkning: plan.tolkning } : {}),
       results: agents.map((a) => ({
+        // The card first (honest phone, akutt, badges, profil_url ...); the
+        // keys /discover has always returned keep their stored values.
+        ...toDentalClinicCard(a, "search"),
         id: a.id,
-        navn: a.navn,
-        org_nr: a.org_nr,
-        fylke: a.fylke,
-        poststed: a.poststed,
         chain_brand: a.chain_brand,
         available_specialties: a.available_specialties,
-        verification_status: a.verification_status,
+        // F2-S8: as A2A gives it ('pending_verify' where the claim hides a
+        // stored 'verified'), so the field and the filter say the same.
+        verification_status: shownVerificationStatus(a),
       })),
     });
   } catch (err) {
@@ -1542,7 +1671,11 @@ router.post(
             /* tolerate junk */
           }
         }
-        patch.field_provenance = mergeFieldProvenance(existingProv, incomingProv);
+        // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: the
+        // audit entries other routes write here (`inactive`, the hjemmeside
+        // cleanup's, the offentlig klinikk correction's `directory_url`) are
+        // kept as stored, as in the dental PUT (keepAuditEntries).
+        patch.field_provenance = mergeFieldProvenance(existingProv, incomingProv, { keepAuditEntries: true });
       }
 
       // ── Apply (single updateDentalAgent call) unless dry-run ─────────

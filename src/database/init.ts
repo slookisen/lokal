@@ -231,6 +231,104 @@ export function isOwnPlatformHomepage(row: {
   return homepageUrl.toLowerCase().includes("rettfrabonden.com");
 }
 
+// ─── Retail-shop gate for the `outreach_ready_pool` VIEW ─────────────────────
+// dev-request 2026-10-01-rfb-butikker-i-outreach-poolen (Daniel live
+// 2026-10-01). `agents.business_type` marks what kind of business a row is
+// ('producer' | 'farm_shop' | 'retail_shop' | 'cafe'; NULL = unmarked =
+// untouched by this gate, exactly like before). Only 'retail_shop' is gated:
+// a producer's own farm shop ('farm_shop') and ordinary producers (NULL /
+// 'producer') are NEVER affected. `agents.retail_focus` ('frukt_gront' |
+// 'fisk' | 'annet') says what a retail_shop sells.
+//
+// A retail_shop is outreach-eligible ONLY when BOTH hold:
+//   (a) retail_focus = 'frukt_gront'. 'fisk' is deliberately NOT allowed: Daniel
+//       has not answered whether fish shops count (open question in the
+//       dev-request) — it must be added here explicitly once he does.
+//   (b) the profile passes the quality gate: about >= 150 chars AND the `about`
+//       field has a 'homepage' provenance record (own site), AND >= 3 products,
+//       AND the about text describes the business as a shop (butikk /
+//       kolonial / dagligvare).
+//
+// Named reasons (pool-blocker-explain): retail_shop_not_eligible (fails a),
+// retail_profile_not_ready (passes a, fails b). `k`/`a` must alias
+// agent_knowledge/agents. WHERE-clause use only; CASE guards make malformed
+// JSON in field_provenance/products fail the gate safely (excluded, no crash).
+export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront"] as const;
+export const RETAIL_SHOP_MIN_ABOUT_CHARS = 150;
+export const RETAIL_SHOP_MIN_PRODUCTS = 3;
+const RETAIL_SHOP_ABOUT_LIKE = [
+  "%butikk%",
+  "%kolonial%",
+  "%dagligvare%",
+];
+
+export const POOL_RETAIL_SHOP_PROFILE_READY_SQL =
+  `(length(COALESCE(k.about,'')) >= ${RETAIL_SHOP_MIN_ABOUT_CHARS}` +
+  ` AND CASE WHEN json_valid(COALESCE(k.field_provenance,'{}')) THEN` +
+  ` (COALESCE(json_extract(k.field_provenance,'$.about'),'') LIKE '%"source_type":"homepage"%'` +
+  ` OR COALESCE(json_extract(k.field_provenance,'$.about'),'') LIKE '%"source":"homepage"%') ELSE 0 END` +
+  ` AND CASE WHEN json_valid(COALESCE(k.products,'[]')) THEN json_array_length(COALESCE(k.products,'[]')) >= ${RETAIL_SHOP_MIN_PRODUCTS} ELSE 0 END` +
+  ` AND (${RETAIL_SHOP_ABOUT_LIKE.map((l) => `LOWER(COALESCE(k.about,'')) LIKE '${l}'`).join(" OR ")}))`;
+
+export const POOL_RETAIL_SHOP_GATE_SQL =
+  `(COALESCE(a.business_type,'') != 'retail_shop'` +
+  ` OR (COALESCE(a.retail_focus,'') IN (${RETAIL_SHOP_FOCUS_ALLOWED.map((f) => `'${f}'`).join(",")})` +
+  ` AND ${POOL_RETAIL_SHOP_PROFILE_READY_SQL}))`;
+
+function provenanceHasHomepageSource(raw: unknown, field: string): boolean {
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try { parsed = JSON.parse(raw); } catch { return false; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const val = (parsed as Record<string, unknown>)[field];
+  let recs: unknown[] = [];
+  if (Array.isArray(val)) recs = val;
+  else if (val && typeof val === "object") {
+    const w = (val as { sources?: unknown }).sources;
+    recs = Array.isArray(w) ? w : [val];
+  }
+  return recs.some((r) => {
+    if (!r || typeof r !== "object") return false;
+    const o = r as Record<string, unknown>;
+    return o.source_type === "homepage" || o.source === "homepage";
+  });
+}
+
+/**
+ * Pure TS mirror of POOL_RETAIL_SHOP_GATE_SQL, returning the NAMED blocker
+ * (empty array = not blocked). MUST stay logically equivalent to the SQL — do
+ * not hand-edit one without the other.
+ */
+export function retailShopPoolBlockers(row: {
+  business_type?: string | null;
+  retail_focus?: string | null;
+  about?: string | null;
+  products?: string | unknown[] | null;
+  field_provenance?: string | null;
+}): string[] {
+  if ((row.business_type ?? "") !== "retail_shop") return [];
+  if (!(RETAIL_SHOP_FOCUS_ALLOWED as readonly string[]).includes(row.retail_focus ?? "")) {
+    return ["retail_shop_not_eligible"];
+  }
+  const about = row.about ?? "";
+  let products: unknown[] = [];
+  if (Array.isArray(row.products)) products = row.products;
+  else if (typeof row.products === "string" && row.products.length > 0) {
+    try {
+      const p = JSON.parse(row.products);
+      if (Array.isArray(p)) products = p;
+    } catch { products = []; }
+  }
+  const lower = about.toLowerCase();
+  const ready =
+    about.length >= RETAIL_SHOP_MIN_ABOUT_CHARS &&
+    provenanceHasHomepageSource(row.field_provenance ?? null, "about") &&
+    products.length >= RETAIL_SHOP_MIN_PRODUCTS &&
+    RETAIL_SHOP_ABOUT_LIKE.some((l) => lower.includes(l.replace(/%/g, "")));
+  return ready ? [] : ["retail_profile_not_ready"];
+}
+
 // ─── Producer-profile view honesty (analytics_agent_views) ──────────────────
 // humanAgentViewSql / LEGACY_AGENT_VIEW_SOURCE live in ./analytics-sql (a pure
 // module the off-thread stats worker can import without this file) and are
@@ -701,6 +799,24 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_agent_view_daily_day ON agent_view_daily(day DESC);
     CREATE INDEX IF NOT EXISTS idx_agent_view_daily_agent ON agent_view_daily(agent_id);
+
+    -- agent_ai_view_daily: the AI-assistant bucket next to agent_view_daily's
+    -- human one — producer-profile views per day×agent fetched by an AI
+    -- assistant for a person (analytics_agent_views.traffic_category =
+    -- 'ai_search', not the owner), rolled up by retention-service.ts
+    -- (rollupAndPruneAgentViews) before the raw rows are deleted after the
+    -- retention window. Counts only: no city, source, session or IP. Kept in a
+    -- table of its own so agent_view_daily stays people only for every reader.
+    -- Same lifetime as agent_view_daily: never pruned, cleared for an agent_id
+    -- by the opt-out path (DELETE /admin/agents/:id, routes/marketplace.ts).
+    -- dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0.
+    CREATE TABLE IF NOT EXISTS agent_ai_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_ai_view_daily_agent ON agent_ai_view_daily(agent_id);
 
     -- sessions_daily: TRUE distinct-session count per day×vertical×bot_type.
     -- Deliberately NOT derivable from page_view_daily: that table's
@@ -2765,6 +2881,19 @@ function initSchema(db: Database.Database): void {
   // sites agree. Daniel, live session 2026-09-02, verbatim: "go på A, og kjør
   // dublettene og skjul-lista" (daniel-responses/2026-09-02-go-a-dubletter-og-
   // skjul-lista.md).
+  // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: business marker +
+  // retail focus on the agent row (nullable, additive; NULL = unmarked = no
+  // effect). Read ONLY by the outreach_ready_pool VIEW's retail gate below and
+  // pool-blocker-explain; written only by POST /admin/agents/business-type.
+  // Added BEFORE the VIEW so a fresh DB resolves it. Rollback: revert the PR —
+  // the columns may stay (nothing else reads them).
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN business_type TEXT`,
+    `ALTER TABLE agents ADD COLUMN retail_focus TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
     // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
@@ -2829,6 +2958,12 @@ function initSchema(db: Database.Database): void {
            site — never eligible for marketing outreach. See
            POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL's own comment above. */
         AND ${POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL}
+        /* dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: a row marked
+           business_type='retail_shop' is out unless it is a fruit/veg shop
+           with an enriched, shop-describing profile. Producers and
+           producer-run farm shops (business_type NULL/'producer'/'farm_shop')
+           are untouched. See POOL_RETAIL_SHOP_GATE_SQL's comment above. */
+        AND ${POOL_RETAIL_SHOP_GATE_SQL}
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200
@@ -3832,6 +3967,21 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE products ADD COLUMN availability_source TEXT NOT NULL DEFAULT 'enrichment'`);
   } catch {
     // Column already exists
+  }
+
+  // dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4:
+  // food information the buyer sees before submitting. Written only by the
+  // admin producer-list endpoint (POST /admin/products/producer-list) for
+  // pre-packaged food: ingredients (free text), allergens (JSON array of
+  // strings; '[]' = the producer states none) and net_weight (text such as
+  // '250 g'). Additive nullable columns; NULL = not stated. Same
+  // try/catch-duplicate-column guard as above.
+  for (const col of ["ingredients TEXT", "allergens TEXT", "net_weight TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists
+    }
   }
 
   // ─── Phase 1 (orch-pr-20260614-6): cart + orders tables ─────────────────
@@ -4997,6 +5147,55 @@ function initSchema(db: Database.Database): void {
   //   every order created before skive 2 and whenever payments are off —
   //   which also means pay at pickup.
   try { db.exec(`ALTER TABLE orders ADD COLUMN payment_mode TEXT`); } catch { /* already exists — expected */ }
+
+  // F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+  // follow-up bookkeeping for orders nobody answers, all additive and NULL on
+  // every existing row:
+  //   orders.reminder_sent_at : when the single producer reminder (pending for
+  //     ORDER_REMINDER_HOURS, default 24) was sent. Non-NULL = never again.
+  //   orders.notify_failed_at : when the first producer e-mail for the order
+  //     FAILED to send (a skip is no failure). Set by order-notify-service.
+  //   orders.notify_retried_at: when the single re-send of that e-mail was
+  //     tried by the order-followups job. Non-NULL = no further retry.
+  //   orders.notify_sent_at   : skive 1b (B1) — when the producer e-mail for
+  //     the order was actually SENT (first send or the retry). Only orders
+  //     with it get the reminder and the producer_no_response cancellation;
+  //     an order the producer never received (the pre-gate backlog, a skipped
+  //     or failed send) is never claimed to be «not answered».
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN reminder_sent_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_failed_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_retried_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_sent_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
+  // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // one shared order-action layer (services/order-actions.ts) and the
+  // one-click lifecycle. All additive, NULL on every existing row:
+  //   orders.completion_source       : who closed a completed order —
+  //     'auto' (the follow-ups job, ORDER_AUTOCOMPLETE_ENABLED), 'buyer',
+  //     'seller' or 'admin'. NULL for orders completed before Fase A1.
+  //   order_events.actor_role        : 'seller' | 'buyer' | 'system' | 'admin'.
+  //   order_events.channel           : 'producer_page' | 'owner_portal' |
+  //     'admin' | 'system_job' | 'internal' (later 'mcp' / 'a2a').
+  //   order_events.idempotency_key   : the caller's idempotency key; a repeat
+  //     of the same key on the same order returns the stored transition.
+  //   trust_events.completion_source : copied from the order for
+  //     order_completed, so automatic closes are counted apart.
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN completion_source TEXT`,
+    `ALTER TABLE order_events ADD COLUMN actor_role TEXT`,
+    `ALTER TABLE order_events ADD COLUMN channel TEXT`,
+    `ALTER TABLE order_events ADD COLUMN idempotency_key TEXT`,
+    `ALTER TABLE trust_events ADD COLUMN completion_source TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  } catch { /* best-effort — the lookup before the transition still works */ }
 
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a

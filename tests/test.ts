@@ -461,6 +461,17 @@ assertTrue(!isAutoReply({ senderRole: "buyer", metadata: undefined as any }),
 
 // Item 2 — classifyAssistant: reuse parseUserAgent, never guess.
 assertEq(classifyAssistant("ChatGPT").label, "ChatGPT", "assistant: ChatGPT client-id classified");
+{
+  // Bot flag = the exact traffic-classifier tokens; a bare app-browser name is a person.
+  const { parseUserAgent: pua } = require("../src/services/human-referrals");
+  assertEq(pua("Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)").isBot, true, "parseUserAgent: ChatGPT-User is a bot");
+  assertEq(pua("Mozilla/5.0 (compatible; GPTBot/1.2)").isBot, true, "parseUserAgent: GPTBot is a bot");
+  assertEq(pua("Mozilla/5.0 (compatible; ClaudeBot/1.0)").isBot, true, "parseUserAgent: ClaudeBot is a bot");
+  assertEq(pua("Claude-SearchBot/1.0").isBot, true, "parseUserAgent: Claude-SearchBot is a bot");
+  assertEq(pua("Claude-User/1.0").isBot, true, "parseUserAgent: Claude-User is a bot");
+  assertEq(pua("Mozilla/5.0 (iPhone) ChatGPT/1.2026 Safari").isBot, false, "parseUserAgent: app-browser UA with 'ChatGPT' is not a bot");
+  assertEq(pua("Mozilla/5.0 (iPhone) Claude/1.0 Safari").isBot, false, "parseUserAgent: app-browser UA with 'Claude' is not a bot");
+}
 assertEq(classifyAssistant("Claude Desktop").label, "Claude", "assistant: Claude Desktop → Claude");
 assertEq(classifyAssistant("Perplexity").label, "Perplexity", "assistant: Perplexity classified");
 assertEq(classifyAssistant("Gemini").label, "Gemini", "assistant: Gemini classified");
@@ -2689,6 +2700,43 @@ console.log("── human-visits strip: referral classification + aggregation �
   assertEq(classifyReferralSource("https://chatgpt.com/").key, "chatgpt", "classify: chatgpt.com");
   assertEq(classifyReferralSource("https://chat.openai.com/").key, "chatgpt", "classify: chat.openai.com");
   assertEq(classifyReferralSource("https://www.perplexity.ai/").key, "perplexity", "classify: perplexity");
+  // AI hosts matched on the parsed host, not a substring (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil).
+  assertEq(classifyReferralSource("https://claude.ai/chat/abc").key, "claude", "classify: claude.ai → AI (claude)");
+  assertEq(classifyReferralSource("https://chat.mistral.ai/").key, "mistral", "classify: chat.mistral.ai");
+  assertEq(classifyReferralSource("https://www.meta.ai/").key, "metaai", "classify: meta.ai");
+  assertEq(classifyReferralSource("https://grok.com/").key, "grok", "classify: grok.com");
+  assertEq(classifyReferralSource("https://chat.deepseek.com/").key, "deepseek", "classify: chat.deepseek.com");
+  assertEq(classifyReferralSource("https://you.com/search?q=x").key, "you", "classify: you.com");
+  assertEq(classifyReferralSource("https://sylteogrokt.no/").key, "annet", "classify: sylteogrokt.no is NOT AI");
+  assertEq(classifyReferralSource("https://thankyou.com/").key, "annet", "classify: thankyou.com is NOT AI");
+  assertEq(classifyReferralSource("https://t.co/abc").key, "sosial", "classify: t.co is social");
+  assertEq(classifyReferralSource("https://evil.example/?u=chatgpt.com").key, "annet", "classify: AI host in a query string is not AI");
+  assertEq(classifyReferralSource("https://kagi.com/search?q=x").key, "annet", "classify: kagi search stays a plain site");
+  assertEq(classifyReferralSource("https://kagi.com/assistant/abc").key, "kagi", "classify: kagi.com/assistant → AI");
+  assertEq(classifyReferralSource(null, { utm_source: "claude", utm_campaign: "ai_search" }).key, "claude", "classify: no referrer + utm_source=claude → AI (claude)");
+  assertEq(classifyReferralSource(null, { utm_source: "chatgpt", utm_campaign: "ai_search" }).key, "chatgpt", "classify: no referrer + utm_source=chatgpt → ChatGPT");
+  assertEq(classifyReferralSource(null, { utm_source: "github_copilot", utm_campaign: "ai_search" }).key, "copilot", "classify: github_copilot → copilot");
+  assertEq(classifyReferralSource(null, { utm_campaign: "ai_search" }).key, "annenai", "classify: ai_search campaign alone → Annen AI, not a named client");
+  assertEq(classifyReferralSource(null, { utm_source: "agentplatform.no" }).key, "direkte", "classify: utm_source outside the whitelist is not AI");
+  assertEq(classifyReferralSource(null, { utm_source: "bondens-nyhetsbrev", utm_campaign: "sommer" }).key, "direkte", "classify: a producer's own campaign is not AI");
+  assertEq(classifyReferralSource("https://www.google.com/", { utm_source: ["rfb", "chatgpt.com"] }).key, "chatgpt", "classify: utm_source array (ours + ChatGPT's) → AI regardless of order");
+  {
+    const { classifyAiClickSource } = require("../src/services/human-referrals");
+    assertEq(classifyAiClickSource({ referrer: "https://claude.ai/" }), "claude", "aiClick: claude.ai referrer");
+    assertEq(classifyAiClickSource({ utm_source: "claude", utm_campaign: "ai_search" }), "claude", "aiClick: utm_source=claude without referrer");
+    assertEq(classifyAiClickSource({ utm_source: "chatgpt.com" }), "chatgpt", "aiClick: utm_source=chatgpt.com");
+    assertEq(classifyAiClickSource({ utm_source: ["chatgpt.com", "claude"] }), "chatgpt", "aiClick: array, first whitelist hit");
+    assertEq(classifyAiClickSource({ utm_source: ["claude", "chatgpt.com"] }), "claude", "aiClick: array, reversed order is still AI");
+    assertEq(classifyAiClickSource({ utm_source: "claudes-gard" }), null, "aiClick: producer campaign containing claude is not AI");
+    assertEq(classifyAiClickSource({ utm_source: "chatgpt", utm_campaign: "ai_search" }), "chatgpt", "aiClick: utm_source=chatgpt without referrer");
+    assertEq(classifyAiClickSource({ utm_source: "geminifarm" }), null, "aiClick: geminifarm is not AI");
+    assertEq(classifyAiClickSource({ utm_source: "perplexity.ai" }), "perplexity", "aiClick: perplexity.ai prefix is AI");
+    assertEq(classifyAiClickSource({ utm_campaign: "ai_search" }), "other", "aiClick: ai_search campaign alone → other");
+    assertEq(classifyAiClickSource({ utm_source: "agentplatform.no" }), null, "aiClick: agentplatform.no is not AI");
+    assertEq(classifyAiClickSource({ referrer: "https://sylteogrokt.no/", utm_source: "sommer" }), null, "aiClick: sylteogrokt.no is not AI");
+    assertEq(classifyAiClickSource({ referrer: "https://chat.mistral.ai/" }), "other", "aiClick: other AI hosts → other");
+    assertEq(classifyAiClickSource({}), null, "aiClick: nothing → null");
+  }
   // Ordering guard: gemini/bard live on *.google.com — must NOT fall through to google.
   assertEq(classifyReferralSource("https://gemini.google.com/app").key, "gemini", "classify: gemini before google");
   assertEq(classifyReferralSource("https://duckduckgo.com/").key, "duckduckgo", "classify: duckduckgo");
@@ -2735,14 +2783,16 @@ console.log("── human-visits strip: referral classification + aggregation �
 
   // Threshold: google (5) and perplexity (3) show; bing (2) suppressed.
   assertTrue(!!byKey.google, "human-visits: google pattern present (≥3)");
-  assertTrue(!!byKey.perplexity, "human-visits: perplexity pattern present (=3)");
+  assertTrue(!!byKey.ai, "human-visits: AI sources grouped in ONE 'AI-assistenter' card (perplexity ×3 ≥ threshold)");
+  assertEq(byKey.ai.sourceLabel, "AI-assistenter", "human-visits: AI card label");
+  assertTrue(!byKey.perplexity, "human-visits: no separate per-AI card");
   assertTrue(!byKey.bing, "human-visits: bing SUPPRESSED (<3 threshold)");
   assertTrue(!byKey.intern, "human-visits: own-domain 'intern' never shown");
   assertTrue(!byKey.direkte, "human-visits: direct visits never shown");
 
   // Internal (owner) + bot rows excluded → google = 5 human sessions, not 7.
   assertEq(byKey.google.visitCount, 5, "human-visits: google visitCount excludes owner + bot");
-  assertEq(byKey.perplexity.visitCount, 3, "human-visits: perplexity visitCount = 3");
+  assertEq(byKey.ai.visitCount, 3, "human-visits: AI card visitCount = 3");
 
   // Producer naming (public names only) + "+N andre" for the unresolved 3rd.
   assertEq(byKey.google.topProducers.length, 2, "human-visits: names up to 2 producers");
@@ -3206,6 +3256,38 @@ console.log("── human-visits strip: referral classification + aggregation �
   assertTrue(!gateEmailMatch.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: matching email (post@gard.no on gard.no) → no flag");
   assertTrue(gateEmailMatch.passes, "orch-pr-20260614-4: matching email still passes gate");
 
+  // Test 5f: cross-TLD same-brand (dev-request 2026-10-01-rfb-verifier-epostdomene-paa-tvers-av-tld)
+  {
+    const base = {
+      http_status: 200,
+      website: "https://www.knattenfrukt.com",
+      about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+      products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+      brreg: null,
+    };
+    const prov = (value: string, url: string, st = "homepage") => ({ email: [{ value, source_type: st, source_url: url, fetched_at: "2026-10-01T16:00:00Z" }] });
+    const okProv = prov("Nils@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/");
+    const g1 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: okProv });
+    assertTrue(g1.passes && !g1.flags.includes("email_domain_mismatch"), "cross-tld: .no email + .com site + homepage provenance → passes");
+    assertEq(g1.email_own_domain_via, "cross_tld_homepage", "cross-tld: via marker set");
+    const g1s = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: JSON.stringify(okProv) });
+    assertTrue(g1s.passes, "cross-tld: provenance as JSON string works");
+    const g2 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no" });
+    assertTrue(g2.flags.includes("email_domain_mismatch") && !g2.passes && g2.email_own_domain_via === undefined, "cross-tld: no provenance → mismatch");
+    const g3 = computeKvalitetsGate({ ...base, email: "nils@knatten-frukt-salg.no", field_provenance: prov("nils@knatten-frukt-salg.no", "https://www.knattenfrukt.com/kontakt/") });
+    assertTrue(g3.flags.includes("email_domain_mismatch") && !g3.passes, "cross-tld: different brand → mismatch even with provenance");
+    const g4 = computeKvalitetsGate({ ...base, email: "post@gmail.com" });
+    assertTrue(g4.passes && g4.email_own_domain_via === undefined, "cross-tld: free-mail unchanged, no via marker");
+    const g5 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("annen@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/") });
+    assertTrue(g5.flags.includes("email_domain_mismatch"), "cross-tld: provenance with wrong email value → mismatch");
+    const g6 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("nils@knattenfrukt.no", "https://annenside.no/kontakt/") });
+    assertTrue(g6.flags.includes("email_domain_mismatch"), "cross-tld: provenance with foreign source_url host → mismatch");
+    const g7 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: prov("nils@knattenfrukt.no", "https://www.knattenfrukt.com/kontakt/", "harvest_contact_email") });
+    assertTrue(g7.flags.includes("email_domain_mismatch"), "cross-tld: non-homepage source_type → mismatch");
+    const g8 = computeKvalitetsGate({ ...base, email: "nils@knattenfrukt.no", field_provenance: "{not json" });
+    assertTrue(g8.flags.includes("email_domain_mismatch"), "cross-tld: unparsable provenance → mismatch (fail-closed)");
+  }
+
   // Test 5e: no-email case unchanged — email_own_domain=false, gate fails
   const gateNoEmail = computeKvalitetsGate({
     http_status: 200,
@@ -3231,7 +3313,7 @@ console.log("── human-visits strip: referral classification + aggregation �
   const sqlite = require("better-sqlite3");
   const wo8db = new sqlite(":memory:");
   wo8db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -3305,7 +3387,7 @@ console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
   const sqlite = require("better-sqlite3");
   const db = new sqlite(":memory:");
   db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -10017,7 +10099,13 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   console.log("\n── Phase 5.11 A2.5: A2A agent-card + MCP discovery ──");
   const fs = require("fs");
   const mp = fs.readFileSync("src/routes/marketplace.ts", "utf8");
-  const mcp = fs.readFileSync("mcp-server/index.js", "utf8");
+  // G1-S2b: mcp-server/index.js is a stdio bridge to the remote /mcp since 0.5.0, so the MCP-tool checks
+  // below run against what registerTools() (the remote's tool list, which the bridge forwards) registers.
+  const { McpServer: _a25McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+  const { registerTools: _a25RegisterTools } = require("../src/routes/mcp");
+  const _a25Server = new _a25McpServer({ name: "a25-rfb", version: "0.0.0" });
+  _a25RegisterTools(_a25Server);
+  const rfbTools: Record<string, any> = (_a25Server as any)._registeredTools;
   const serverJson = JSON.parse(fs.readFileSync("mcp-server/server.json", "utf8"));
   const pkgJson = JSON.parse(fs.readFileSync("mcp-server/package.json", "utf8"));
 
@@ -10111,44 +10199,41 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: agent-card adds top-level umbrella metadata block for umbrellas"
   );
 
-  // ── MCP tools (mcp-server/index.js) ─────────────────────────
-  // Test 4.11: 3 new MCP tools registered
-  for (const tool of ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"]) {
+  // ── MCP tools (registerTools(), forwarded by mcp-server/index.js since 0.5.0) ──
+  const umbrellaToolNames = ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"];
+
+  // Test 4.11: 3 umbrella MCP tools registered and enabled
+  for (const tool of umbrellaToolNames) {
     assertTrue(
-      mcp.includes(`registerTool(\n  "${tool}"`),
+      !!rfbTools[tool] && rfbTools[tool].enabled !== false,
       `phase5.11-a2.5: MCP tool ${tool} registered`
     );
   }
 
-  // Test 4.12: MCP tools all marked read-only + idempotent + open-world
-  const listStart = mcp.indexOf('"lokal_list_umbrellas"');
-  const startSect = mcp.indexOf('"lokal_list_umbrellas"');
-  // All three tool blocks contain the annotation set
-  const allMcpTools = mcp.slice(startSect);
-  const readonlyCount = (allMcpTools.match(/readOnlyHint:\s*true/g) || []).length;
+  // Test 4.12: MCP tools all marked read-only + idempotent
   assertTrue(
-    readonlyCount >= 3,
-    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint: true"
+    umbrellaToolNames.every((t) => rfbTools[t]?.annotations?.readOnlyHint === true && rfbTools[t]?.annotations?.idempotentHint === true),
+    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint + idempotentHint: true"
   );
 
   // Test 4.13: MCP tool descriptions include umbrella concepts
   assertTrue(
-    /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(mcp.slice(listStart)),
+    umbrellaToolNames.some((t) => /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(String(rfbTools[t]?.description || ""))),
     "phase5.11-a2.5: MCP tool descriptions reference real Norwegian umbrella names"
   );
 
-  // Test 4.14: MCP tools call our public discovery endpoints (not admin)
+  // Test 4.14: the stdio package carries no tool definitions or HTTP calls of its own — it is a bridge to the
+  // remote, and its mcpb manifest lists exactly the remote's tools (behaviour is covered by mcp-stdio-bridge.test.ts).
+  const stdioEntry = fs.readFileSync("mcp-server/index.js", "utf8");
   assertTrue(
-    mcp.includes("/api/marketplace/umbrellas?"),
-    "phase5.11-a2.5: lokal_list_umbrellas calls /api/marketplace/umbrellas"
+    /runBridge\(/.test(stdioEntry) && !/registerTool\(|\/api\/marketplace\//.test(stdioEntry),
+    "phase5.11-a2.5: mcp-server/index.js is a thin bridge (no own tools, no /api/marketplace calls)"
   );
-  assertTrue(
-    mcp.includes("/api/marketplace/umbrellas/${umbrellaId}/members"),
-    "phase5.11-a2.5: lokal_get_umbrella_members calls /api/marketplace/umbrellas/:id/members"
-  );
-  assertTrue(
-    mcp.includes("/api/marketplace/producers/${producerId}/affiliations"),
-    "phase5.11-a2.5: lokal_get_producer_affiliations calls /api/marketplace/producers/:id/affiliations"
+  const mcpbManifest = JSON.parse(fs.readFileSync("mcp-server/manifest.json", "utf8"));
+  assertEq(
+    JSON.stringify(mcpbManifest.tools.map((t: any) => t.name)),
+    JSON.stringify(Object.entries(rfbTools).filter(([, t]: [string, any]) => t.enabled !== false).map(([n]) => n)),
+    "phase5.11-a2.5: mcp-server/manifest.json lists exactly the tools registerTools() registers"
   );
 
   // Test 4.15: server.json + package.json versions bumped to 0.4.0, then to
@@ -10160,8 +10245,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json and mcp-server/package.json versions stay in lockstep"
   );
   assertTrue(
-    serverJson.version === "0.4.1",
-    "phase5.11-a2.5: server.json version bumped to 0.4.1 (remotes + websiteUrl + updated description)"
+    serverJson.version === "0.5.1" && pkgJson.version === "0.5.1" && mcpbManifest.version === "0.5.1",
+    "phase5.11-a2.5: server.json, package.json and manifest.json are at 0.5.1 (SDK 1.32.1 security fix)"
   );
 
   // Test 4.16: server.json description mentions umbrella organizations
@@ -10170,10 +10255,14 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
     "phase5.11-a2.5: server.json description updated to mention umbrella organizations"
   );
 
-  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter
+  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter (behaviour, not source text)
+  const umbrellaSchema = rfbTools.lokal_list_umbrellas?.inputSchema;
   assertTrue(
-    mcp.includes('z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"])'),
-    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType uses z.enum allow-list"
+    !!umbrellaSchema &&
+      ["market_network", "venue", "industry_org", "certification", "cooperative"].every(
+        (v) => umbrellaSchema.safeParse({ umbrellaType: v }).success) &&
+      !umbrellaSchema.safeParse({ umbrellaType: "bogus" }).success,
+    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType accepts the 5 allow-listed values and rejects others"
   );
 }
 
@@ -11483,8 +11572,8 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
   const serverParsed = JSON.parse(serverJsonRoot);
   assertTrue(
-    serverParsed.version === "0.4.1",
-    "pr-56: server.json bumped to v0.4.1 (was 0.3.3, then 0.4.0)"
+    serverParsed.version === "0.5.1",
+    "pr-56: server.json at v0.5.1 (SDK 1.32.1 security fix; stdio bridge since 0.5.0)"
   );
   assertTrue(
     Array.isArray(serverParsed.remotes) &&
@@ -15693,7 +15782,6 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   console.log("\n── PR-76: lokal_geocode MCP tool ──");
   const fs = require("fs");
   const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf-8");
-  const stdioSrc = fs.readFileSync("mcp-server/index.js", "utf-8");
   const marketplaceSrc = fs.readFileSync("src/routes/marketplace.ts", "utf-8");
 
   // (1) HTTP-MCP server: lokal_geocode tool is registered
@@ -15727,16 +15815,22 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
     "pr-76: lokal_geocode is read-only + idempotent + openWorldHint:true"
   );
 
-  // (5) Stdio MCP server: lokal_geocode mirrored
-  assertTrue(
-    /registerTool\(\s*"lokal_geocode"/.test(stdioSrc),
-    "pr-76: lokal_geocode tool mirrored in mcp-server/index.js (stdio server)"
-  );
+  // (5) Stdio package: since 0.5.0 a bridge to the remote, so lokal_geocode reaches stdio clients through
+  // the remote tool list (registerTools()) and the mcpb manifest — not through a mirrored handler.
+  {
+    const { registeredMcpTools: _pr76Tools } = require("../src/services/mcp-tool-manifest");
+    const remoteGeocode = _pr76Tools("rfb").some((t: any) => t.name === "lokal_geocode");
+    const mcpbTools = JSON.parse(fs.readFileSync("mcp-server/manifest.json", "utf-8")).tools.map((t: any) => t.name);
+    assertTrue(
+      remoteGeocode && mcpbTools.includes("lokal_geocode"),
+      "pr-76: lokal_geocode is in registerTools() and in the lokal-mcp mcpb manifest (stdio bridge forwards it)"
+    );
+  }
 
-  // (6) Stdio mirror calls public /api/marketplace/geocode endpoint
+  // (6) Stdio package has no own geocode HTTP call any more
   assertTrue(
-    /\/api\/marketplace\/geocode/.test(stdioSrc),
-    "pr-76: stdio mirror calls /api/marketplace/geocode HTTP endpoint"
+    !/\/api\/marketplace\/geocode/.test(fs.readFileSync("mcp-server/index.js", "utf-8")),
+    "pr-76: mcp-server/index.js (bridge) has no own /api/marketplace/geocode call"
   );
 
   // (7) HTTP endpoint registered for stdio mirror to call
@@ -16308,7 +16402,7 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
   function makeDb() {
     const db = new sqlite(":memory:");
     db.exec(`
-      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0, umbrella_type TEXT, vertical_id TEXT NOT NULL DEFAULT 'rfb');
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
         address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -25133,6 +25227,9 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       last_seen_at TEXT DEFAULT (datetime('now')),
       -- + shared public-listability columns (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt)
       catalog_hidden INTEGER NOT NULL DEFAULT 0,
+      -- + retail-shop gate columns (dev-request 2026-10-01-rfb-butikker-i-outreach-poolen)
+      business_type TEXT,
+      retail_focus TEXT,
       vertical_id TEXT NOT NULL DEFAULT 'rfb'
     );
 
@@ -25834,6 +25931,9 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       availability TEXT NOT NULL DEFAULT 'in_stock',
       availability_updated_at TEXT,
       availability_source TEXT NOT NULL DEFAULT 'enrichment',
+      ingredients TEXT,
+      allergens TEXT,
+      net_weight TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -26124,6 +26224,9 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       availability TEXT NOT NULL DEFAULT 'in_stock',
       availability_updated_at TEXT,
       availability_source TEXT NOT NULL DEFAULT 'enrichment',
+      ingredients TEXT,
+      allergens TEXT,
+      net_weight TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -26187,7 +26290,12 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       buyer_email TEXT,
       buyer_phone TEXT,
       delivery_note TEXT,
-      contact_consent_at TEXT
+      contact_consent_at TEXT,
+      -- Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-
+      -- kjoperagent): the shared order-action layer reads notify_sent_at and
+      -- transitionOrder writes completion_source.
+      notify_sent_at TEXT,
+      completion_source TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_orders_cart_id  ON orders(cart_id);
     CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id);
@@ -26210,7 +26318,11 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       from_status TEXT,
       to_status TEXT NOT NULL,
       actor TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- Fase A1: every row carries actor_role + channel (+ idempotency key).
+      actor_role TEXT,
+      channel TEXT,
+      idempotency_key TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_order_events_order_id ON order_events(order_id);
     CREATE TABLE trust_events (
@@ -26220,6 +26332,7 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
         'order_completed','order_no_show','order_declined',
         'booking_attended','booking_no_show')),
       ref TEXT,
+      completion_source TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id);
@@ -26295,13 +26408,15 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   // submit below to still create their two orders.
   cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-carrot", "Gangstad Gård", "Trondheim", "carrot@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // skive 4: an eligible producer's lines must be producer-stated to be orderable.
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?,?,?,?,?,?,?,'admin_producer_confirmed')").run(
     "prod-carrot", "ag-carrot", "Gulrøtter", "gulrøtter", 30.0, "kg", "in_stock"
   );
 
   cartDb.prepare("INSERT INTO agents (id, name, city, contact_email, is_verified, order_notifications_opt_in) VALUES (?, ?, ?, ?, 1, 1)").run("ag-honey", "Biene Honning", "Bergen", "honey@example.no");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-honey");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // skive 4: an eligible producer's lines must be producer-stated to be orderable.
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES (?,?,?,?,?,?,?,'admin_producer_confirmed')").run(
     "prod-honey", "ag-honey", "Honning", "honning", 150.0, "glass", "in_stock"
   );
 
@@ -26488,8 +26603,14 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
   let order1Id = "";
   let order2Id = "";
   {
-    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
+    // F2 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+    // a real order needs contact_consent + e-mail/phone.
+    const noContact = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
       body: { buyer_ref: buyerRef6 },
+    });
+    assertEq(noContact.status, 422, `cart-27b: submit without buyer contact info → 422 (got ${noContact.status})`);
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
+      body: { buyer_ref: buyerRef6, buyer_email: "kjoper@example.com", contact_consent: true },
     });
     assertEq(r.status, 201, `cart-28: submit returns 201 (got ${r.status})`);
     assertEq(r.body.success, true, "cart-29: submit success=true");
@@ -26523,11 +26644,11 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       assertEq(items1[0].line_total, 60, `cart-41: carrot line_total=60 (got ${items1[0].line_total})`);
     }
 
-    // skive 2: no contact fields were sent with this submit → the order's
-    // consent-gated contact copy stays NULL (and so does contact_consent_at).
+    // skive 2 + F2: the consent-gated contact copy is on the order (a real
+    // order always has consent now; non-NULL contact columns ⇒ consent given).
     const o1 = cartDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at FROM orders WHERE id = ?").get(order1Id) as any;
-    assertTrue(!!o1 && o1.buyer_name === null && o1.buyer_email === null && o1.buyer_phone === null && o1.delivery_note === null && o1.contact_consent_at === null,
-      "cart-41b: order carries no buyer contact copy when the submit had no consent (skive 2 invariant)");
+    assertTrue(!!o1 && o1.buyer_email === "kjoper@example.com" && typeof o1.contact_consent_at === "string" && o1.contact_consent_at.length > 0,
+      "cart-41b: order carries the buyer's consented contact copy (skive 2 invariant, F2)");
   }
 
   // ── Test: re-check at submit — mark product OOS after add, then submit ────────
@@ -27270,8 +27391,9 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
       helfo_agreement: "false",
       verification_status: "pending_verify",
     });
+    // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4c): «Akuttvakt» needs the quote from the source.
     db.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?")
-      .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage", value: 1 }] }), akuttId);
+      .run(JSON.stringify({ acute_vakt: [{ source_type: "homepage", value: 1, quote: "Akuttvakt hver kveld og i helgene." }] }), akuttId);
     createDentalAgent({
       navn: "Bergen Uten Kilde Tannlege AS",
       org_nr: "910000003",
@@ -31705,6 +31827,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gba.failures) failures.push("opplevelser-gardssalg-booking-activation: " + f);
     console.log(`  opplevelser-gardssalg-booking-activation: ${gba.passed} passed, ${gba.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 items 3 + 7:
+    // owner booking switch (booking-request address, admin brake wins,
+    // manual rows can toggle booking) and the AI booking note ("tar ikke imot
+    // forespørsler nå" for owned profiles that are off). Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-booking-switch: owner booking switch + admin brake + AI booking note ──");
+    const { runOpplevelserGardssalgBookingSwitchTests } = require("../src/routes/opplevelser-gardssalg-booking-switch.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-booking-switch.test");
+    const gbs = await runOpplevelserGardssalgBookingSwitchTests({ log: false });
+    passed += gbs.passed;
+    failed += gbs.failed;
+    for (const f of gbs.failures) failures.push("opplevelser-gardssalg-booking-switch: " + f);
+    console.log(`  opplevelser-gardssalg-booking-switch: ${gbs.passed} passed, ${gbs.failed} failed`);
+
     // dev-request 2026-07-31-gardssalg-provider-dubletter-på-tvers-av-seeds,
     // Slice 2 ("outreach-guard"): pure-function unit tests for
     // dedupeGardssalgOutreachRecipients (no DB) — wired into POST
@@ -32881,6 +33017,31 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcr.failures) failures.push("opplevelser-gardssalg-claim-revoke: " + f);
     console.log(`  opplevelser-gardssalg-claim-revoke: ${gcr.passed} passed, ${gcr.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+    // slice 1: "Bekreftet av eier" on an e-mail confirmation — admin lever
+    // (sender must pass the claim flow's address rule for that producer),
+    // badge display with the «Ta over profilen» link kept, field locks, and
+    // withdrawal on «fjern». Same in-memory-DB pattern, same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-email-confirm: e-mail confirmation of the owner badge ──");
+    const { runOpplevelserGardssalgOwnerEmailConfirmTests } = require("../src/routes/opplevelser-gardssalg-owner-email-confirm.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-email-confirm.test");
+    const goec = await runOpplevelserGardssalgOwnerEmailConfirmTests({ log: false });
+    passed += goec.passed;
+    failed += goec.failed;
+    for (const f of goec.failures) failures.push("opplevelser-gardssalg-owner-email-confirm: " + f);
+    console.log(`  opplevelser-gardssalg-owner-email-confirm: ${goec.passed} passed, ${goec.failed} failed`);
+
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8: DELETE
+    // /admin/rfb-seed skips owned rows, merged_into rows are not public.
+    console.log("\n── opplevelser-g1-opprydding: rfb-seed rollback + merged_into visibility ──");
+    const { runOpplevelserG1OppryddingTests } = require("../src/routes/opplevelser-g1-opprydding.test") as
+      typeof import("../src/routes/opplevelser-g1-opprydding.test");
+    const g1o = await runOpplevelserG1OppryddingTests({ log: false });
+    passed += g1o.passed;
+    failed += g1o.failed;
+    for (const f of g1o.failures) failures.push("opplevelser-g1-opprydding: " + f);
+    console.log(`  opplevelser-g1-opprydding: ${g1o.passed} passed, ${g1o.failed} failed`);
+
     // dev-request 2026-07-26-booking-test-send-guard: per-transaction test
     // flag that redirects EVERY outgoing email of that one transaction to
     // TEST_SEND_REDIRECT_EMAIL (services/send-guard.ts, applied inside
@@ -33163,6 +33324,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gaa.failed;
     for (const f of gaa.failures) failures.push("opplevelser-gardssalg-autosvar-apply: " + f);
     console.log(`  opplevelser-gardssalg-autosvar-apply: ${gaa.passed} passed, ${gaa.failed} failed`);
+
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 skive 5 punkt 1:
+    // every automated writer respects the owner lock on an owned row.
+    console.log("\n── opplevelser-gardssalg-owner-lock-everywhere: owner lock respected by all automated writers ──");
+    const { runOpplevelserGardssalgOwnerLockEverywhereTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-everywhere.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-everywhere.test");
+    const golw = await runOpplevelserGardssalgOwnerLockEverywhereTests({ log: false });
+    passed += golw.passed;
+    failed += golw.failed;
+    for (const f of golw.failures) failures.push("opplevelser-gardssalg-owner-lock-everywhere: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-everywhere: ${golw.passed} passed, ${golw.failed} failed`);
 
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
@@ -33562,6 +33734,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += esvmt.failed;
     for (const f of esvmt.failures) failures.push("experiences-seo-visning-mcp-tilbyder: " + f);
     console.log(`  experiences-seo-visning-mcp-tilbyder: ${esvmt.passed} passed, ${esvmt.failed} failed`);
+
+    // S2 of the same dev-request (reviewer follow-ups): MCP phone wash,
+    // booking_url validation, /en out of sitemap with the flag off, neutral gsMeta.
+    console.log("\n── experiences-visning-s2: reviewer follow-ups ──");
+    const { runExperiencesVisningS2Tests } = require("../src/routes/experiences-visning-s2.test") as
+      typeof import("../src/routes/experiences-visning-s2.test");
+    const evs2 = await runExperiencesVisningS2Tests({ log: false });
+    passed += evs2.passed;
+    failed += evs2.failed;
+    for (const f of evs2.failures) failures.push("experiences-visning-s2: " + f);
+    console.log(`  experiences-visning-s2: ${evs2.passed} passed, ${evs2.failed} failed`);
 
     // dev-request 2026-07-19-opplevagent-forside-seksjoner-design,
     // arbeidspunkt 5: gårdssalg produsent-profil template render-guards —
@@ -35910,6 +36093,34 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agent-put-field-provenance: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4d): «Akuttvakt»-sitatet i proveniensen og PUT-vakten ──");
+  try {
+    const { runDentalAgentPutAcuteVaktQuoteTests } = require("../src/routes/dental-agent-put-acute-vakt-quote.test") as
+      typeof import("../src/routes/dental-agent-put-acute-vakt-quote.test");
+    const daq = await runDentalAgentPutAcuteVaktQuoteTests({ log: false });
+    passed += daq.passed;
+    failed += daq.failed;
+    for (const f of daq.failures) failures.push("dental-agent-put-acute-vakt-quote: " + f);
+    console.log(`  dental-agent-put-acute-vakt-quote: ${daq.passed} passed, ${daq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agent-put-acute-vakt-quote: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4f): dental-PUT tar vare på revisjonsoppføringene i proveniensen ──");
+  try {
+    const { runDentalAgentPutAuditEntriesTests } = require("../src/routes/dental-agent-put-audit-entries.test") as
+      typeof import("../src/routes/dental-agent-put-audit-entries.test");
+    const dae = await runDentalAgentPutAuditEntriesTests({ log: false });
+    passed += dae.passed;
+    failed += dae.failed;
+    for (const f of dae.failures) failures.push("dental-agent-put-audit-entries: " + f);
+    console.log(`  dental-agent-put-audit-entries: ${dae.passed} passed, ${dae.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agent-put-audit-entries: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dental-schema-probe-writepath-fix: PUT /api/tannlege/agents/:id test-fingerprint guard ──");
   try {
     const { runDentalTests } = require("../src/routes/dental.test") as
@@ -36179,6 +36390,42 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental regionord (D3f): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S-EN): English
+  //    time and filler words («care», «tonight») are stopwords, not a clinic
+  //    name, alike in MCP, A2A and /sok; Norwegian queries parse as before ──
+  console.log("\n── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S-EN): dental engelske fyllord ──");
+  try {
+    const { runDentalSearchEngelskeFyllordTests } = require("../src/routes/dental-search-engelske-fyllord.test") as
+      typeof import("../src/routes/dental-search-engelske-fyllord.test");
+    const dsen = await runDentalSearchEngelskeFyllordTests({ log: false });
+    passed += dsen.passed;
+    failed += dsen.failed;
+    for (const f of dsen.failures) failures.push("dental engelske fyllord (S-EN): " + f);
+    console.log(`  dental engelske fyllord (S-EN): ${dsen.passed} passed, ${dsen.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental engelske fyllord (S-EN): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5,
+  //    Finn-tannlege): /mcp serverInfo has the brand's title, websiteUrl and
+  //    PNG icons (512, then 192) from BRAND_ENTITIES.dental, each icon's src
+  //    answers 200 image/png at its declared size, and the MCP server card's
+  //    icon is the 512 ──
+  console.log("\n── dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S5): dental serverInfo og PNG-ikon ──");
+  try {
+    const { runDentalMcpServerInfoIconsTests } = require("../src/routes/dental-mcp-serverinfo-icons.test") as
+      typeof import("../src/routes/dental-mcp-serverinfo-icons.test");
+    const dsi = await runDentalMcpServerInfoIconsTests({ log: false });
+    passed += dsi.passed;
+    failed += dsi.failed;
+    for (const f of dsi.failures) failures.push("dental serverInfo icons (G3-S5): " + f);
+    console.log(`  dental serverInfo icons (G3-S5): ${dsi.passed} passed, ${dsi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental serverInfo icons (G3-S5): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
   //    places-treffvakt (A4-D): an address, phone, website or opening hours
   //    only Google Places gives (or marked wrong) is shown on no public
@@ -36334,6 +36581,93 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental agent card (D3d): unexpected error: " + String(err?.message || err));
   }
 
+  // ── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3): the shared
+  //    landing gate + answer-first/FAQ helpers, and the /sted and /fylke
+  //    intro, fact table and FAQ built from them ──
+  console.log("\n── dev-request 2026-10-16-finn-tannlege-landingssider (F1-S3): landing facts ──");
+  try {
+    const { runLandingFactsTests } = require("../src/services/landing-facts.test") as
+      typeof import("../src/services/landing-facts.test");
+    const lf = await runLandingFactsTests({ log: false });
+    passed += lf.passed;
+    failed += lf.failed;
+    for (const f of lf.failures) failures.push("landing facts (F1-S3): " + f);
+    console.log(`  landing facts (F1-S3): ${lf.passed} passed, ${lf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("landing facts (F1-S3): unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runDentalAreaLandingTests } = require("../src/routes/dental-area-landing.test") as
+      typeof import("../src/routes/dental-area-landing.test");
+    const dal3 = await runDentalAreaLandingTests({ log: false });
+    passed += dal3.passed;
+    failed += dal3.failed;
+    for (const f of dal3.failures) failures.push("dental area landing (F1-S3): " + f);
+    console.log(`  dental area landing (F1-S3): ${dal3.passed} passed, ${dal3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental area landing (F1-S3): unexpected error: " + String(err?.message || err));
+  }
+
+  // ── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): facet
+  //    pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett> behind one gate,
+  //    the same predicate for route, sitemap and links, and the facet config ──
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): dental facet pages ──");
+  try {
+    const { runDentalLandingConfigTests } = require("../src/config/dental-landing.test") as
+      typeof import("../src/config/dental-landing.test");
+    const dlc = runDentalLandingConfigTests({ log: false });
+    passed += dlc.passed;
+    failed += dlc.failed;
+    for (const f of dlc.failures) failures.push("dental landing config (F1-S4a): " + f);
+    console.log(`  dental landing config (F1-S4a): ${dlc.passed} passed, ${dlc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental landing config (F1-S4a): unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runDentalLandingTests } = require("../src/routes/dental-landing.test") as
+      typeof import("../src/routes/dental-landing.test");
+    const dl4 = await runDentalLandingTests({ log: false });
+    passed += dl4.passed;
+    failed += dl4.failed;
+    for (const f of dl4.failures) failures.push("dental landing (F1-S4a): " + f);
+    console.log(`  dental landing (F1-S4a): ${dl4.passed} passed, ${dl4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental landing (F1-S4a): unexpected error: " + String(err?.message || err));
+  }
+  // Live check after F1-S4a (FUNN aapent-naa-badge-regnes-i-utc): «Åpent nå»
+  // on the clock in Norway (Europe/Oslo), not the server's (UTC).
+  try {
+    const { runDentalAapentNaaOsloTests } = require("../src/routes/dental-aapent-naa-oslo.test") as
+      typeof import("../src/routes/dental-aapent-naa-oslo.test");
+    const dano = await runDentalAapentNaaOsloTests({ log: false });
+    passed += dano.passed;
+    failed += dano.failed;
+    for (const f of dano.failures) failures.push("dental «Åpent nå» in Oslo time: " + f);
+    console.log(`  dental «Åpent nå» in Oslo time: ${dano.passed} passed, ${dano.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental «Åpent nå» in Oslo time: unexpected error: " + String(err?.message || err));
+  }
+  // F1-S4e: the akutt texts (/sok, the homepage banner, /hvordan-det-fungerer,
+  // /proveniens, ai-plugin.json, /guide-tannlege-ai, the agent card) follow
+  // F1-S4c and definition A, and the lock keeps them so.
+  try {
+    const { runDentalAkuttTeksterTests } = require("../src/routes/dental-akutt-tekster.test") as
+      typeof import("../src/routes/dental-akutt-tekster.test");
+    const dat = await runDentalAkuttTeksterTests({ log: false });
+    passed += dat.passed;
+    failed += dat.failed;
+    for (const f of dat.failures) failures.push("dental akutt-tekster (F1-S4e): " + f);
+    console.log(`  dental akutt-tekster (F1-S4e): ${dat.passed} passed, ${dat.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental akutt-tekster (F1-S4e): unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   //    synthetic schema-probe row is hidden from every public read surface
   //    and admin count; its PUT write path + by-id read-back are unchanged ──
@@ -36444,6 +36778,7 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   console.log("\n── dev-request 2026-10-16 (S2b+S6): akutt med proveniens og kjeder fra chain_brand (finn-tannlege) ──");
   for (const [label, load] of [
     ["dental acute filter", () => (require("../src/routes/dental-acute-filter.test") as typeof import("../src/routes/dental-acute-filter.test")).runDentalAcuteFilterTests({ log: false })],
+    ["dental openapi truth", () => (require("../src/routes/dental-openapi-truth.test") as typeof import("../src/routes/dental-openapi-truth.test")).runDentalOpenapiTruthTests({ log: false })],
     ["dental chains", () => (require("../src/routes/dental-chains.test") as typeof import("../src/routes/dental-chains.test")).runDentalChainsTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
@@ -36498,6 +36833,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("admin-dental-mark-inactive: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── dev-request 2026-10-21-dental-brreg-adresse-feil-for-videre-sweep: POST /admin/dental/brreg-address-sweep ──");
+  try {
+    const { runAdminDentalBrregAddressSweepTests } = require("../src/routes/admin-dental-brreg-address-sweep.test") as
+      typeof import("../src/routes/admin-dental-brreg-address-sweep.test");
+    const dbas = await runAdminDentalBrregAddressSweepTests({ log: false });
+    passed += dbas.passed;
+    failed += dbas.failed;
+    for (const f of dbas.failures) failures.push("admin-dental-brreg-address-sweep: " + f);
+    console.log(`  admin-dental-brreg-address-sweep: ${dbas.passed} passed, ${dbas.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-brreg-address-sweep: unexpected error: " + String(err?.message || err));
   }
 
   console.log("\n── dev-request 2026-07-21-dental-schema-probe-writepath-fix (follow-up): POST /admin/dental/schema-probe-sweep ──");
@@ -36695,6 +37044,13 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
     failed += eop.failed;
     for (const f of eop.failures) failures.push("email-ownership-provenance: " + f);
     console.log(`  email-ownership-provenance: ${eop.passed} passed, ${eop.failed} failed`);
+    const { runLokalAgentVerifierEmailCrossTldMarkerTests } = require("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test") as
+      typeof import("../src/agents/lokal-agent-verifier-email-cross-tld-marker.test");
+    const ctm = await runLokalAgentVerifierEmailCrossTldMarkerTests({ log: false });
+    passed += ctm.passed;
+    failed += ctm.failed;
+    for (const f of ctm.failures) failures.push("email-cross-tld-marker: " + f);
+    console.log(`  email-cross-tld-marker: ${ctm.passed} passed, ${ctm.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("email-ownership-provenance: unexpected error: " + String(err?.message || err));
@@ -36745,6 +37101,136 @@ const _pilotOrdreLoopPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// skive 1 (F2–F6, F8–F10): kontaktinfo-krav, kvittering ved innsending,
+// påminnelse/auto-kansellering (falsk klokke), kansellering ved henting,
+// varer uten pris, spamtak, varesperre og pilot-status. Own in-memory
+// prod-schema DB and module-local pins (same idiom as the pilot-ordre-loop
+// block above), so it runs strictly after it; the next block in the chain
+// awaits _orderSkive1Promise.
+let _orderSkive1Resolve: () => void = () => {};
+const _orderSkive1Promise: Promise<void> = new Promise<void>(r => {
+  _orderSkive1Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_pilotOrdreLoopPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 1 (F2–F10) ──");
+  try {
+    const { runOrderBestillingerSkive1Tests } = require("../src/routes/order-bestillinger-skive1.test") as
+      typeof import("../src/routes/order-bestillinger-skive1.test");
+    const bs1 = await runOrderBestillingerSkive1Tests({ log: false });
+    passed += bs1.passed;
+    failed += bs1.failed;
+    for (const f of bs1.failures) failures.push("bestillinger-skive1: " + f);
+    console.log(`  bestillinger-skive1: ${bs1.passed} passed, ${bs1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive1: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive1Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent, Fase A1:
+// shared order-action layer, one-click lifecycle, automatic close (fake
+// clock, switch on/off, prepay without payment events), no_show /
+// buyer_cancelled / cannot_deliver + receipts, buyer/seller conflict → admin
+// alert, actor_role + channel on every order_events row, idempotency. Own
+// in-memory prod-schema DB and module-local pins, strictly after skive 1;
+// the next block in the chain awaits _orderActionsA1Promise.
+let _orderActionsA1Resolve: () => void = () => {};
+const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
+  _orderActionsA1Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: Mine ordrer Fase A1 (handlingslag + livsløp med ett klikk) ──");
+  try {
+    const { runOrderActionsFaseA1Tests } = require("../src/routes/order-actions-fase-a1.test") as
+      typeof import("../src/routes/order-actions-fase-a1.test");
+    const a1 = await runOrderActionsFaseA1Tests({ log: false });
+    passed += a1.passed;
+    failed += a1.failed;
+    for (const f of a1.failures) failures.push("order-actions-fase-a1: " + f);
+    console.log(`  order-actions-fase-a1: ${a1.passed} passed, ${a1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-actions-fase-a1: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderActionsA1Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// skive 4: bare produsentoppgitte varer kan bestilles, admin-vareliste
+// (POST /admin/products/producer-list), matinformasjon i kurvvisningen.
+// Own in-memory prod-schema DB; runs strictly after skive 1 and Fase A1.
+let _orderSkive4Resolve: () => void = () => {};
+const _orderSkive4Promise: Promise<void> = new Promise<void>(r => {
+  _orderSkive4Resolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 4 (matinformasjon) ──");
+  try {
+    const { runOrderBestillingerSkive4Tests } = require("../src/routes/order-bestillinger-skive4.test") as
+      typeof import("../src/routes/order-bestillinger-skive4.test");
+    const bs4 = await runOrderBestillingerSkive4Tests({ log: false });
+    passed += bs4.passed;
+    failed += bs4.failed;
+    for (const f of bs4.failures) failures.push("bestillinger-skive4: " + f);
+    console.log(`  bestillinger-skive4: ${bs4.passed} passed, ${bs4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive4: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive4Resolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// fix-up skive 4b: tilbudsvalg, /handleliste-kontaktvalg, allergener for all
+// mat, bekreftet pris/kategori etter portalendring, pris-snapshot, testhull.
+// Own in-memory prod-schema DB; runs strictly after skive 4.
+let _orderSkive4bResolve: () => void = () => {};
+const _orderSkive4bPromise: Promise<void> = new Promise<void>(r => {
+  _orderSkive4bResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-21: bestillinger skive 4b (fix-up) ──");
+  try {
+    const { runOrderBestillingerSkive4bTests } = require("../src/routes/order-bestillinger-skive4b.test") as
+      typeof import("../src/routes/order-bestillinger-skive4b.test");
+    const bs4b = await runOrderBestillingerSkive4bTests({ log: false });
+    passed += bs4b.passed;
+    failed += bs4b.failed;
+    for (const f of bs4b.failures) failures.push("bestillinger-skive4b: " + f);
+    console.log(`  bestillinger-skive4b: ${bs4b.passed} passed, ${bs4b.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-skive4b: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orderSkive4bResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
 // no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
 // rotasjon-no-yield-backoff) to the experiences vertical's
@@ -36760,7 +37246,7 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
 });
 
 (async () => {
-  await Promise.allSettled([_pilotOrdreLoopPromise]);
+  await Promise.allSettled([_orderSkive1Promise, _orderActionsA1Promise, _orderSkive4Promise, _orderSkive4bPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");
@@ -38857,19 +39343,35 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
     assertEq(statusDp, 200, "prov-dental-01: GET /proveniens -> 200");
     assertTrue(bodyDp.includes('<link rel="canonical" href="https://finn-tannlege.com/proveniens">'),
       "prov-dental-02: canonical URL present");
-    assertTrue(bodyDp.includes("Slik verifiserer vi dataene våre"), "prov-dental-03: NO section renders the expected h1");
-    assertTrue(bodyDp.includes('id="en"') && bodyDp.includes("How we verify our data"),
+    // F2-S2 (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon):
+    // the page is the method page «Metode og kilder», at the same URL.
+    assertTrue(bodyDp.includes("<h1>Metode og kilder</h1>"), "prov-dental-03: NO section renders the expected h1");
+    assertTrue(bodyDp.includes('<h1 id="en">Method and sources</h1>'),
       "prov-dental-04: EN section present in the same page (id=\"en\" anchor)");
     assertTrue(bodyDp.includes("Brønnøysundregistrene"), "prov-dental-05: page names Brønnøysundregistrene as a source");
-    // Scope the "no HPR claim" check to the /proveniens <main> content itself, not the
-    // sitewide footer's pre-existing (out-of-scope) "Datakilder" link to Helsedirektoratet/HPR
-    // — this test only guards against the NEW page/llms.txt copy overclaiming an automated
-    // HPR cross-check, not the unrelated footer link that exists on every page.
+    // The whole page, footer included: since F2-S1 (A2A dev-request
+    // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon) the footer's «Datakilder»
+    // column lists DENTAL_DATA_SOURCES, which has no HPR.
     const mainDp = bodyDp.slice(bodyDp.indexOf("<main>"), bodyDp.indexOf("</main>"));
-    assertTrue(!mainDp.includes("HPR") && !mainDp.includes("Helsepersonellregisteret"),
-      "prov-dental-05b: /proveniens page content does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
-    assertTrue(mainDp.includes("redaksjonelt satt status") && mainDp.includes("editorially-set status"),
-      "prov-dental-05c: 'Verified' badge is described as an editorially-set/admin-reviewed status, not an automated registry cross-check");
+    assertTrue(!bodyDp.includes("HPR") && !bodyDp.includes("Helsepersonellregisteret"),
+      "prov-dental-05b: /proveniens (the whole page, footer included) does NOT claim an HPR cross-check (no HPR client/fetch logic exists anywhere in the codebase — hpr_nr is an unvalidated free-text column)");
+    // As the pages show the badge since F2-S8 (A2A dev-request
+    // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon): only when the
+    // stored results of the rule-based check (computeDentalVerifiedRule, run
+    // by hand in small batches) meet its conditions; no manual way, and no
+    // order the code does not keep.
+    {
+      const { DENTAL_VERIFIED_BADGE_TEXT } = require("../src/services/dental-data-sources") as typeof import("../src/services/dental-data-sources");
+      const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      assertTrue(mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.nb)) && mainDp.includes(esc(DENTAL_VERIFIED_BADGE_TEXT.en)) &&
+        mainDp.includes("«Verifisert»-merket vises bare når den siste kontrollen fant enheten aktiv i Brønnøysundregistrene") &&
+        mainDp.includes(esc("The \"Verified\" badge is shown only when the latest check found the entity active in Brønnøysundregistrene")) &&
+        mainDp.includes("i små partier") && mainDp.includes("in small batches") &&
+        !mainDp.includes("etter at en administrator") && !mainDp.includes("after an administrator") &&
+        !mainDp.includes("sorteres lenger ned enn verifiserte klinikker") && !mainDp.includes("ranked below verified clinics") &&
+        !mainDp.includes("Statusen settes manuelt per klinikk") && !mainDp.includes("The status is set manually per clinic"),
+        "prov-dental-05c: 'Verified' badge is described as shown only when the rule-based check's stored results meet its conditions (run by hand, in small batches), with no manual way and no unkept ranking promise (NO + EN)");
+    }
     assertTrue(bodyDp.includes("badge-verified"), "prov-dental-06: page shows the Verifisert badge example");
     assertTrue(bodyDp.length > 2000, "prov-dental-07: page body has substantial server-rendered content (SSR, no JS)");
     assertNoForbiddenCompliancePhrases(bodyDp, "prov-dental-08");
@@ -38905,6 +39407,49 @@ withMemoryVerticalDb("DENTAL_DB_PATH", () => {
   } catch (err) {
     failed++;
     failures.push(`proveniens-transparens (dental): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S1): every
+// finn-tannlege.com surface (footer, /om, /hvordan-det-fungerer, /proveniens, llms.txt,
+// openapi.json, the directory listing) names its data sources from DENTAL_DATA_SOURCES,
+// none names HPR, NTF or Helsedirektoratet (/personvern exempt, personvern part B), and
+// the «Verifisert» text matches dental-verifier.ts. Swaps DENTAL_DB_PATH (:memory:) and
+// the dental modules (restored in finally) — runSerial, next to prov-dental above.
+runSerial(async () => {
+  console.log("\n── dental-sources-truth: Finn-tannlege data sources from one list (F2-S1) ──");
+  try {
+    const { runDentalSourcesTruthTests } = require("../src/routes/dental-sources-truth.test") as
+      typeof import("../src/routes/dental-sources-truth.test");
+    const dst = await runDentalSourcesTruthTests({ log: false });
+    passed += dst.passed;
+    failed += dst.failed;
+    for (const f of dst.failures) failures.push("dental-sources-truth: " + f);
+    console.log(`  dental-sources-truth: ${dst.passed} passed, ${dst.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-sources-truth: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// «Verifisert» only when the stored fields meet the rule the badge text
+// describes (resolveVerifiedClaim and its SQL twin DENTAL_VERIFIED_CLAIM_SQL,
+// with JSON edge cases). Swaps DENTAL_DB_PATH (:memory:) and the dental store
+// (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dental-verified-claim: «Verifisert» bare med grunnlag (F2-S8) ──");
+  try {
+    const { runDentalVerifiedClaimTests } = require("../src/services/dental-verified-claim.test") as
+      typeof import("../src/services/dental-verified-claim.test");
+    const dvc = await runDentalVerifiedClaimTests({ log: false });
+    passed += dvc.passed;
+    failed += dvc.failed;
+    for (const f of dvc.failures) failures.push("dental-verified-claim: " + f);
+    console.log(`  dental-verified-claim: ${dvc.passed} passed, ${dvc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-verified-claim: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -41725,6 +42270,26 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-10-01-rfb-verifier-paraplyer-og-vertikaler-ut-c6: RFB
+// verifier pickers skip umbrella / other-vertical rows; stats gets
+// by_verification_status_rfb_producers. Own in-memory DB (swaps getDb()) —
+// runSerial like the agentIds suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01 C6: verifier RFB scope (paraplyer og vertikaler ut) ──");
+  try {
+    const { runLokalAgentVerifierRfbScopeTests } = require("../src/agents/lokal-agent-verifier-rfb-scope.test") as
+      typeof import("../src/agents/lokal-agent-verifier-rfb-scope.test");
+    const rs = await runLokalAgentVerifierRfbScopeTests({ log: false });
+    passed += rs.passed;
+    failed += rs.failed;
+    for (const f of rs.failures) failures.push("verifier-rfb-scope: " + f);
+    console.log(`  verifier-rfb-scope: ${rs.passed} passed, ${rs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("verifier-rfb-scope: unexpected error: " + String(err?.stack || err?.message || err));
+  }
+});
+
 // ── orch-pr-20260905-dental-verifier-canary: admin-key-gated canary trigger
 // route for the dental verifier (POST /admin/run-dental-verifier). Mutates
 // process.env.ADMIN_KEY/ANALYTICS_ADMIN_KEY and the route's own
@@ -42757,8 +43322,9 @@ runSerial(async () => {
 // a generic message (detail logged), also a cart-service 5xx result in
 // lokal_cart_submit. AI-3 — a producer whose matched product names are only
 // generic category labels («Honning») is a category match; order unchanged.
-// The RFB MCP contract (tools/list, instructions, resources) is pinned for
-// the OpenAI review. Own in-memory DBs (restored in finally), runSerial.
+// The RFB MCP contract (tools/list, instructions, serverInfo since I-A2,
+// resources) is pinned for the OpenAI review. Own in-memory DBs (restored in
+// finally), runSerial.
 runSerial(async () => {
   console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-A (lokal_info openingHours + category labels + contract freeze) ──");
   type Summary = { passed: number; failed: number; failures: string[] };
@@ -42777,6 +43343,30 @@ runSerial(async () => {
       failed++;
       failures.push(`${name}: unexpected error: ` + String(err?.message || err));
     }
+  }
+});
+
+// dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-AA (integration
+// test round 3: RFB-M-01, RFB-M-02, R3-RS-01): A2A message/send and GET /sok
+// read a search as MCP lokal_search does (services/rfb-search-reading.ts):
+// the place in the text, a place abroad, and the parser's product, name and
+// unknown words reach discover(); /sok shows an honest null text instead of
+// the standard list. lokal_search and /sok's control searches are byte-like
+// main (tests/fixtures/rfb-a2a-sok-paritet-main.json). Own in-memory DB
+// (restored in finally), runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-17-integrasjonstest-oppfolging, I-AA (A2A and /sok read the search as lokal_search) ──");
+  try {
+    const { runRfbA2aSokParitetTests } = require("../src/routes/rfb-a2a-sok-paritet.test") as
+      typeof import("../src/routes/rfb-a2a-sok-paritet.test");
+    const r = await runRfbA2aSokParitetTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-a2a-sok-paritet: " + f);
+    console.log(`  rfb-a2a-sok-paritet: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-a2a-sok-paritet: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -43626,6 +44216,23 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  console.log("\n── dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene: samme produsent, ikke bare samme adresse ──");
+  try {
+    const { runCrossPlatformMatchTests } = require("../src/services/cross-platform-match.test") as
+      typeof import("../src/services/cross-platform-match.test");
+    const cpm = runCrossPlatformMatchTests();
+    passed += cpm.passed;
+    failed += cpm.failed;
+    for (const f of cpm.failures) failures.push("cross-platform-match: " + f);
+    console.log(`  cross-platform-match: ${cpm.passed} passed, ${cpm.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cross-platform-match: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ cross-platform-match: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   console.log("\n── dev-request 2026-07-27-crm-plattformadskillelse: steg 4 (innkommende triage + utriaged-bøtte) ──");
   try {
     const { runCrmTriageTests } = require("../src/services/crm-triage.test") as
@@ -43673,6 +44280,25 @@ runSerial(async () => {
     failed++;
     failures.push("analytics-auth: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ analytics-auth: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // Varies process.env.ADMIN_KEY itself (own restore-in-finally) — runSerial
+  // chain, same exemption reasoning as analytics-adminkey.test.ts above.
+  console.log("\n── dev-request 2026-10-03-partner-effektrapport-per-gaard (slice 1): GET /admin/analytics/partner-report ──");
+  try {
+    const { runAnalyticsPartnerReportTests } = require("../src/routes/analytics-partner-report.test") as
+      typeof import("../src/routes/analytics-partner-report.test");
+    const apr = await runAnalyticsPartnerReportTests({ log: false });
+    passed += apr.passed;
+    failed += apr.failed;
+    for (const f of apr.failures) failures.push("analytics-partner-report: " + f);
+    console.log(`  analytics-partner-report: ${apr.passed} passed, ${apr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("analytics-partner-report: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ analytics-partner-report: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -43812,6 +44438,21 @@ runSerial(async () => {
     failed++;
     failures.push("traffic-history: unexpected error: " + String(err?.message || err));
     console.log(`  ✗ traffic-history: unexpected error: ${String(err?.message || err)}`);
+  }
+
+  console.log("\n── statistikk 12 mnd S0: AI lookups and AI profile views kept before the prune ──");
+  try {
+    const { runStatistikkS0Tests } = require("../src/services/statistikk-s0-store-before-prune.test") as
+      typeof import("../src/services/statistikk-s0-store-before-prune.test");
+    const s0 = await runStatistikkS0Tests({ log: false });
+    passed += s0.passed;
+    failed += s0.failed;
+    for (const f of s0.failures) failures.push("statistikk-s0: " + f);
+    console.log(`  statistikk-s0: ${s0.passed} passed, ${s0.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("statistikk-s0: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ statistikk-s0: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
@@ -45116,6 +45757,25 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("marketplace-quarantine-gates: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-10-06 (Skive A2): agent card / llms-full role gate —
+// no canonicalUrl/links.profile/Profil-link to /produsent/<slug> pages that
+// 404 under the role gate. Own in-memory DB, real handlers off the router stacks.
+runSerial(async () => {
+  console.log("\n── Skive A2: agent-card role gate ──");
+  try {
+    const { runAgentCardRoleGateTests } = require("../src/routes/agent-card-role-gate.test") as
+      typeof import("../src/routes/agent-card-role-gate.test");
+    const acr = await runAgentCardRoleGateTests({ log: false });
+    passed += acr.passed;
+    failed += acr.failed;
+    for (const f of acr.failures) failures.push("agent-card-role-gate: " + f);
+    console.log(`  agent-card-role-gate: ${acr.passed} passed, ${acr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-card-role-gate: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -47861,6 +48521,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop gate in
+// outreach_ready_pool + pool-blocker-explain named reasons + admin
+// business-type lever and classification dry-run. Own in-memory DB (swaps the
+// shared getDb() singleton).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop pool gate ──");
+  try {
+    const { runInitOutreachPoolRetailGateTests } = require("../src/database/init-outreach-pool-retail-gate.test") as
+      typeof import("../src/database/init-outreach-pool-retail-gate.test");
+    const rg = await runInitOutreachPoolRetailGateTests({ log: false });
+    passed += rg.passed;
+    failed += rg.failed;
+    for (const f of rg.failures) failures.push("init-outreach-pool-retail-gate: " + f);
+    console.log(`  init-outreach-pool-retail-gate: ${rg.passed} passed, ${rg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("init-outreach-pool-retail-gate: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-22-telefon-css-js-identifikator-falske-positiver,
 // point 4: POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL / isOwnPlatformHomepage
 // (src/database/init.ts) — an agent whose homepage is our own platform
@@ -48588,6 +49268,68 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1a points 1+2: owner lock in
+// the write layer (OWNER_LOCK_ENFORCE_WRITES) and the one by-id visibility
+// predicate (OWNER_VISIBILITY_ENFORCE_BY_ID), both flag states, per surface.
+// Swaps the getDb() singleton and the two env flags (restored in finally) —
+// runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1a: owner lock + by-id visibility ──");
+  try {
+    const { runOwnerVisibilityS1aTests } = require("../src/routes/owner-visibility-s1a.test") as
+      typeof import("../src/routes/owner-visibility-s1a.test");
+    const ov = await runOwnerVisibilityS1aTests({ log: false });
+    passed += ov.passed;
+    failed += ov.failed;
+    for (const f of ov.failures) failures.push("owner-visibility-s1a: " + f);
+    console.log(`  owner-visibility-s1a: ${ov.passed} passed, ${ov.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-visibility-s1a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1a points 3+4: working
+// unsubscribe (/avmeld/:token, suppression, List-Unsubscribe headers; flag
+// OUTREACH_UNSUBSCRIBE_ENABLED) and the customer-service lock visible to the
+// owner (OWNER_PORTAL_CS_LOCK_OVERRIDE). Swaps the getDb() singleton and
+// env flags/ADMIN_KEY (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1a 3+4: avmeld + cs-lock ──");
+  try {
+    const { runAvmeldS1aTests } = require("../src/routes/avmeld-s1a.test") as
+      typeof import("../src/routes/avmeld-s1a.test");
+    const av = await runAvmeldS1aTests({ log: false });
+    passed += av.passed;
+    failed += av.failed;
+    for (const f of av.failures) failures.push("avmeld-s1a: " + f);
+    console.log(`  avmeld-s1a: ${av.passed} passed, ${av.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("avmeld-s1a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 point 6 / AC 6: owned
+// gårdssalg profiles excluded from cold outreach, signed List-Unsubscribe(+Post) on the
+// gårdssalg mail, /avmeld GET read-only + POST suppression. Swaps the getDb() singleton,
+// module cache and env flags (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 6: eide ute av utsending + avmeld ──");
+  try {
+    const { runGardssalgOutreachEideAvmeldG1s7Tests } = require("../src/routes/gardssalg-outreach-eide-avmeld-g1s7.test") as
+      typeof import("../src/routes/gardssalg-outreach-eide-avmeld-g1s7.test");
+    const r = await runGardssalgOutreachEideAvmeldG1s7Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-outreach-eide-avmeld-g1s7: " + f);
+    console.log(`  gardssalg-outreach-eide-avmeld-g1s7: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-eide-avmeld-g1s7: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // 2026-10-04 view-stats honesty: producer view statistics count humans, not
 // bots or city pages — /:city no longer books a profile view, trackAgentView
 // stamps is_owner + traffic_category (+ Referer-derived view_source),
@@ -48650,7 +49392,7 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
-  console.log("\n── mcp-stdio-bridge: finn-tannlege-mcp stdio bridge vs the real dental /mcp ──");
+  console.log("\n── mcp-stdio-bridge: stdio bridges (finn-tannlege-mcp, lokal-mcp, opplevagent-mcp) vs the real /mcp routers ──");
   try {
     const { runMcpStdioBridgeTests } = require("../src/routes/mcp-stdio-bridge.test") as
       typeof import("../src/routes/mcp-stdio-bridge.test");
@@ -49223,5 +49965,62 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("trust-score-uten-google-rating: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-23-mcp-sdk-1-32-sikkerhetsfiks-prod-og-npm (GHSA-46jr):
+// maxToolInputElements on all three McpServers + list caps in the
+// lokal_discover / lokal_find_offers handlers (not in the frozen inputSchema).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-23-mcp-sdk-1-32: MCP input limits ──");
+  try {
+    const { runMcpInputLimitsTests } = require("../src/routes/mcp-input-limits.test") as
+      typeof import("../src/routes/mcp-input-limits.test");
+    const r = await runMcpInputLimitsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("mcp-input-limits: " + f);
+    console.log(`  mcp-input-limits: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-input-limits: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 2: the
+// gårdssalg owner portal locks only fields the owner actually changed (empty
+// fields are not locked), and the owner can give a field back («la
+// Opplevagent oppdatere dette») — lock removed + one audit row.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 2: lås bare endrede felt ──");
+  try {
+    const { runGardssalgClaimLockChangedFieldsTests } = require("../src/routes/gardssalg-claim-lock-changed-fields.test") as
+      typeof import("../src/routes/gardssalg-claim-lock-changed-fields.test");
+    const r = await runGardssalgClaimLockChangedFieldsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-lock-changed-fields: " + f);
+    console.log(`  gardssalg-claim-lock-changed-fields: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-lock-changed-fields: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
+// eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 4: eid profil pause/fjern/kvalitetsskjul ──");
+  try {
+    const { runGardssalgClaimOwnerVisibilityTests } = require("../src/routes/gardssalg-claim-owner-visibility.test") as
+      typeof import("../src/routes/gardssalg-claim-owner-visibility.test");
+    const r = await runGardssalgClaimOwnerVisibilityTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-owner-visibility: " + f);
+    console.log(`  gardssalg-claim-owner-visibility: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-owner-visibility: unexpected error: " + String(err?.message || err));
   }
 });

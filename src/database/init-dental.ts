@@ -581,9 +581,13 @@ export function initDentalSchema(db: Database.Database): void {
   } catch { /* already present */ }
 
   // ─── dev-request 2026-09-02-dental-verifier-website-ownership ────────────
-  //   Dental has NO automated verifier: verification_status='verified' is
-  //   today only ever set by hand (92 of 6975 rows, all manual). This adds
-  //   the columns src/services/dental-verifier.ts needs. The dev-request
+  //   Dental had NO automated verifier: verification_status='verified' (92
+  //   of 6975 rows then) was set without any rule, mostly by the enrichment
+  //   routine through PUT rather than by hand as this comment first said
+  //   (F2-S8 of A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-
+  //   metode-ikon; the public pages now show the badge only when the
+  //   verifier's rule passes on the stored fields). This adds the columns
+  //   src/services/dental-verifier.ts needs. The dev-request
   //   that filed this claimed website_ownership/website_ownership_checked_at/
   //   brreg_status/brreg_checked_at/last_verified_at already existed on
   //   dental_agents — verified directly against this file before writing a

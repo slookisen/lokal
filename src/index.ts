@@ -67,7 +67,7 @@ import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
-import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
+import adminDbBackupRoutes, { diskUsage, createBackupAgeSweepTick, BACKUP_AGE_SWEEP_TICK_MS } from "./routes/admin-db-backup";
 import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminAiCitationsRoutes from "./routes/admin-ai-citations";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
@@ -93,6 +93,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import avmeldRoutes from "./routes/avmeld";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
@@ -120,6 +121,7 @@ import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
@@ -327,6 +329,12 @@ app.use(langMiddleware);
 // straight through. Auth = Svix signature (RESEND_WEBHOOK_SECRET; unset → 503).
 // See routes/resend-webhook.ts + services/resend-webhook.ts.
 app.use("/", resendWebhookRoutes);
+
+// ─── /avmeld/:token — working unsubscribe for cold outreach (S1a point 3,
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere). 404 unless
+// OUTREACH_UNSUBSCRIBE_ENABLED. Mounted here so no host gate can swallow the
+// one-click POST. See routes/avmeld.ts.
+app.use("/", avmeldRoutes);
 
 // ─── POST /webhooks/stripe-connect (prepayment, A2A dev-request
 // 2026-10-09-rfb-forhandsbetaling-stripe-connect) ───────────────────────
@@ -891,6 +899,9 @@ app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMerge
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/deactivate", adminLimiter, adminAgentsDeactivateRoutes);
+// POST /admin/agents/business-type + GET .../classification-dryrun — shop marker
+// (dev-request 2026-10-01-rfb-butikker-i-outreach-poolen). Mount BEFORE /admin/agents.
+app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRoutes);
 // POST /admin/test-producer — the ONE hidden RFB test producer for real test
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.
@@ -1725,6 +1736,13 @@ if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
   setInterval(trackJob("offsite-backup", createOffsiteBackupTick({ getStateDb: () => getDb() })), OFFSITE_TICK_MS);
 }
 
+// ─── Manual DB copies: nightly age sweep (dev-request 2026-10-12-manuelle-db-kopier-aldersgrense) ──
+// Deletes on-volume copies older than 30 days (DB_BACKUP_MAX_AGE_DAYS) even when no new copy is
+// taken. Runs once per UTC day in the 02 UTC hour (outside 00-01Z and 06:30-09:30Z); async unlink.
+if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
+  setInterval(trackJob("db-backup-age-sweep", createBackupAgeSweepTick()), BACKUP_AGE_SWEEP_TICK_MS);
+}
+
 // ─── PR-95 (2026-06-01): daily Debio verification sync ──────────────
 //
 // Pulls https://finnoko.debio.no/api/acm/companies once per day (target:
@@ -2382,6 +2400,38 @@ if (
       console.error("[booking-followups] tick failed:", err);
     }
   }), 60 * 60_000);
+}
+
+// ─── F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// order follow-ups — one re-send of a failed producer e-mail, one reminder
+// (+ admin alert) after ORDER_REMINDER_HOURS (24), auto-cancel with
+// producer_no_response after ORDER_AUTOCANCEL_HOURS (72) for pay-at-pickup
+// orders nobody answered. Hourly; idempotent (services/order-followups.ts).
+// Rollback: set the hours very high, or RFB_DISABLE_ORDER_FOLLOWUPS=1.
+// Skive 1b (S3): a bare 60-min setInterval restarts its clock on every deploy
+// or machine restart, so with restarts more often than hourly the job never
+// ran. It now also runs once 5 min after boot; the job is idempotent, so the
+// extra run is harmless.
+if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
+  const orderFollowupsTick = trackJob("order-followups", async () => {
+    try {
+      const { processOrderFollowups } = await import("./services/order-followups");
+      const r = await processOrderFollowups();
+      if (r.retried || r.reminders_sent || r.cancelled || r.auto_completed || r.errors) {
+        console.log(
+          `[order-followups] tick examined=${r.examined} retried=${r.retried} reminders=${r.reminders_sent} ` +
+          `cancelled=${r.cancelled} auto_completed=${r.auto_completed} errors=${r.errors}`
+        );
+      }
+    } catch (err) {
+      console.error("[order-followups] tick failed:", err);
+    }
+  });
+  setTimeout(() => {
+    console.log("[order-followups] first run after boot");
+    void orderFollowupsTick();
+  }, 5 * 60_000);
+  setInterval(orderFollowupsTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───

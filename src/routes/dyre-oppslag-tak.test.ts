@@ -20,11 +20,13 @@
  *       Node's 16 kB header limit) does the edit-distance work of its first
  *       MAX_NAME_CHARS characters, bounded by the cap and the producers'
  *       names (__levenshteinCellsForTesting), and answers as that name.
- *   O   MCP lokal_find_offers: of 25 items, or a 1 MB list, the first
- *       MAX_OFFER_ITEMS are looked up (one catalog query each, a spy on
+ *   O   MCP lokal_find_offers: of 25 items, or MCP_MAX_SHOPPING_ITEMS, the
+ *       first MAX_OFFER_ITEMS are looked up (one catalog query each, a spy on
  *       better-sqlite3); the JSON part is the answer for those items, and a
  *       second part says how many were left out and names the first five of
  *       them, each cut as a name. A list within the cap has no second part.
+ *       A 1 MB list (more than MCP_MAX_SHOPPING_ITEMS) is refused (isError,
+ *       GHSA-46jr, lokal#1229) before any lookup.
  *   G   the geocoder: extractAndGeocode() looks up the runs of the first
  *       MAX_GEOCODE_WORDS words only, so a 2000 character search of short
  *       unknown words makes at most 114 outbound requests (a fetch stub
@@ -68,6 +70,13 @@
  *       (a2a-datapart-alle-plattformer.test.ts), which run unchanged. A
  *       change meant to move a row is captured again with
  *         npx tsx src/routes/dyre-oppslag-tak.test.ts --print
+ *       F1-S4c (A2A dev-request 2026-10-16-finn-tannlege-fasettsider) moved
+ *       the two tannlege_akutt rows, captured again: their
+ *       rad_om_kommunal_tannlegevakt is DENTAL_EMERGENCY_NOTICE.text.
+ *       S8 (A2A dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort)
+ *       moved the tannlege_akutt {fylke: "Oslo"} row, captured again: the
+ *       answer ends with `tolkning`, and without it is the row's old hash
+ *       (dental-acute-filter.test.ts U1 checks the same byte for byte).
  *
  * Data: I-Y's fixtures (own in-memory DBs, restored in finally; geocoding
  * offline), the real handlers: MCP tools through a duck-typed server, the
@@ -95,6 +104,7 @@ import {
 import { capA2aData, MAX_A2A_DATA_LIST_ITEMS } from "../utils/a2a-message";
 import { capFreeText, capName, MAX_FREE_TEXT_CHARS, MAX_NAME_CHARS } from "../utils/free-text";
 import { textOf } from "./rfb-sok-ukjente-ord-bakeri-sted.test";
+import { MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 import {
   enterRfb,
   enterVerticals,
@@ -594,10 +604,19 @@ export async function runDyreOppslagTakTests(opts: { log?: boolean } = {}): Prom
         let rMega: any;
         const lookupsMega = await catalogLookups(async () => { rMega = await offers({ items: megaList, near: "Trondheim" }); });
         assertTrue(JSON.stringify(megaList).length >= ONE_MB, "O4 setup: a list whose JSON is 1 MB");
-        assertEq([lookupsMega, JSON.parse(textOf(rMega)).length, rMega.content[1]?.text], [MAX_OFFER_ITEMS, MAX_OFFER_ITEMS, offersItemsOmittedText(megaList)],
-          "O4 a 1 MB list makes MAX_OFFER_ITEMS catalog queries and says the rest were left out");
-        assertTrue(rMega.content[1].text.includes("og 174980 er utelatt. De første av dem er \"egg\", \"egg\", \"egg\", \"egg\", \"egg\". ") &&
-          rMega.content[1].text.length < 400, `O4 …naming five of them (${rMega.content[1].text.length} characters)`);
+        // GHSA-46jr (lokal#1229): more than MCP_MAX_SHOPPING_ITEMS items is
+        // refused by the handler (not .max() in the frozen inputSchema).
+        assertEq([lookupsMega, rMega?.isError, rMega?.content],
+          [0, true, mcpListTooLongResult("items", MCP_MAX_SHOPPING_ITEMS, megaList.length).content],
+          "O4 a 1 MB list is refused (isError) before any catalog query");
+        const atCapList = Array(MCP_MAX_SHOPPING_ITEMS).fill("egg");
+        let rAtCap: any;
+        const lookupsAtCap = await catalogLookups(async () => { rAtCap = await offers({ items: atCapList, near: "Trondheim" }); });
+        assertEq([lookupsAtCap, rAtCap?.isError, JSON.parse(textOf(rAtCap)).length, rAtCap.content[1]?.text],
+          [MAX_OFFER_ITEMS, undefined, MAX_OFFER_ITEMS, offersItemsOmittedText(atCapList)],
+          "O4 MCP_MAX_SHOPPING_ITEMS items make MAX_OFFER_ITEMS catalog queries and say the rest were left out");
+        assertTrue(rAtCap.content[1].text.includes(`og ${MCP_MAX_SHOPPING_ITEMS - MAX_OFFER_ITEMS} er utelatt. De første av dem er "egg", "egg", "egg", "egg", "egg". `) &&
+          rAtCap.content[1].text.length < 400, `O4 …naming five of them (${rAtCap.content[1].text.length} characters)`);
         const ms = await bestOf3(() => offers({ items: megaList, near: "Trondheim" }));
         assertTrue(ms <= LOOSE_LIMIT_MS, `O5 a 1 MB list answers in at most ${LOOSE_LIMIT_MS} ms (${ms.toFixed(1)} ms, best of 3)`);
       }

@@ -60,17 +60,17 @@ export function runRfbEnChromeTests(opts: { log?: boolean } = {}): TestSummary {
   // productsAreSourced+hasDirectSaleSignal: true simulates a producer with a
   // real, sourced catalog and a confirmed sale channel — these two cases are
   // about glossary translation, not the sale-signal feature itself, so they
-  // keep the "selger/sells ... bestill direkte/order directly" wording.
-  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "eplemost" }], productsAreSourced: true, hasDirectSaleSignal: true, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells apple juice — find contact details and order directly below.", "a4: a known product word is translated through the glossary");
-  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Bestemors spesial" }], productsAreSourced: true, hasDirectSaleSignal: true, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Bestemors spesial — find contact details and order directly below.", "a4b: an unknown product name stays exactly as written");
+  // keep the "selger/sells" verb (the closing no longer says "bestill direkte", 2026-10-18).
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "eplemost" }], productsAreSourced: true, hasDirectSaleSignal: true, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells apple juice — find contact details below.", "a4: a known product word is translated through the glossary");
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Bestemors spesial" }], productsAreSourced: true, hasDirectSaleSignal: true, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Bestemors spesial — find contact details below.", "a4b: an unknown product name stays exactly as written");
   eq(buildProducerAnswerFirstOpening({ ...base, cityName: "", lang: "en" }), null, "a5: still null without two real facts");
   // Live 2026-09-03 (Gvarv): products listed as bare category words rendered
   // "sells Kjøtt, Grønnsaker, Frukt" on /en. Same product -> category label.
   // Sourced + direct-sale, same reasoning as a4/a4b above.
   const gvarv = { ...base, productsList: [{ name: "Kjøtt" }, { name: "Grønnsaker" }, { name: "Frukt" }, { name: "eplemost" }], productsAreSourced: true, hasDirectSaleSignal: true };
-  eq(buildProducerAnswerFirstOpening({ ...gvarv, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat, Vegetables, Fruit and more — find contact details and order directly below.", "a6: product names that are category words get the English category label");
-  eq(buildProducerAnswerFirstOpening({ ...gvarv }), "Gvarv Frukt og Bær i Gvarv selger Kjøtt, Grønnsaker, Frukt med mer — finn kontaktinfo og bestill direkte under.", "a7: …and stay exactly as written in Norwegian");
-  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Eplemost" }, { name: "honning" }], productsAreSourced: true, hasDirectSaleSignal: true, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Apple juice, Honey — find contact details and order directly below.", "a8: glossary word keeps its capitalisation; a lower-case category word still maps");
+  eq(buildProducerAnswerFirstOpening({ ...gvarv, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Meat, Vegetables, Fruit and more — find contact details below.", "a6: product names that are category words get the English category label");
+  eq(buildProducerAnswerFirstOpening({ ...gvarv }), "Gvarv Frukt og Bær i Gvarv selger Kjøtt, Grønnsaker, Frukt med mer — finn kontaktinfo under.", "a7: …and stay exactly as written in Norwegian");
+  eq(buildProducerAnswerFirstOpening({ ...base, productsList: [{ name: "Eplemost" }, { name: "honning" }], productsAreSourced: true, hasDirectSaleSignal: true, lang: "en" }), "Gvarv Frukt og Bær in Gvarv sells Apple juice, Honey — find contact details below.", "a8: glossary word keeps its capitalisation; a lower-case category word still maps");
   eq(productLabel("Bakeri", "en"), "Bakery", "a9: badge-only category words map too");
   eq(productLabel("Kjøtt", "no"), "Kjøtt", "a10: productLabel is a no-op in Norwegian");
 

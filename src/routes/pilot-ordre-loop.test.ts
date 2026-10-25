@@ -134,8 +134,8 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       "INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, ?)"
     );
     const insertProduct = testDb.prepare(`
-      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
-      VALUES (?, ?, ?, ?, ?, ?, 'in_stock')
+      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source)
+      VALUES (?, ?, ?, ?, ?, ?, 'in_stock', 'admin_producer_confirmed')
     `);
 
     // Verified producer WITHOUT opt-in (the platform default) — negative case.
@@ -257,7 +257,10 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
         body: { product_id: productId, qty: 2, buyer_ref: buyerRef },
       });
       const s = await req("POST", `/api/marketplace/cart/${cartId}/submit`, {
-        body: { buyer_ref: buyerRef, ...contact },
+        // F2: a real order needs buyer contact info + consent; the helper
+        // supplies a default so existing cases keep ordering. Pass
+        // contact_consent:false (or other fields) to override.
+        body: { buyer_ref: buyerRef, buyer_email: "kjoper@example.com", contact_consent: true, ...contact },
       });
       const orderId = s.body?.orders?.[0]?.order_id as string;
       return {
@@ -458,29 +461,18 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       assertTrue(bogus.status === 303 && (bogus.location || "").includes("error=ugyldig"),
         "prg-13: unknown action → error redirect");
 
-      // Review fix, finding 3: no_show is NOT reachable from 'confirmed' —
-      // an order that was never ready for pickup can't be booked as no-show.
-      const earlyNoShow = await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "no_show" } });
-      assertTrue(earlyNoShow.status === 303 && (earlyNoShow.location || "").includes("error=ugyldig"),
-        "prg-13b: PRG no_show on a confirmed order → rejected (error=ugyldig)");
-      const afterEarly = testDb.prepare("SELECT status, cancel_reason FROM orders WHERE id = ?").get(optinOrderId) as any;
-      assertTrue(afterEarly?.status === "confirmed" && afterEarly?.cancel_reason == null,
-        "prg-13c: rejected early no_show changes nothing (still confirmed, no cancel_reason)");
-      const earlyTrust = testDb.prepare(
-        "SELECT COUNT(*) AS c FROM trust_events WHERE event_type = 'order_no_show' AND ref = ?"
-      ).get(optinOrderId) as any;
-      assertEq(earlyTrust?.c, 0, "prg-13d: rejected early no_show writes no trust event");
-      const adminEarlyNoShow = await req("POST", `/admin/marketplace/orders/${optinOrderId}/no-show`, {
-        headers: { "x-admin-key": ADMIN_KEY },
-      });
-      assertEq(adminEarlyNoShow.status, 409, "prg-13e: admin no-show on a confirmed order → 409 (same central guard)");
-      // Plain confirmed → cancelled (no reason) stays legal — verified in the
-      // 6×6 matrix below; here we only pin that the no_show REASON is gated.
+      // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-
+      // kjoperagent): «Klar for henting» is no longer a step, so no_show is
+      // now legal from 'confirmed' too (until the order closes). That is
+      // covered in order-actions-fase-a1.test.ts; here the legacy
+      // confirmed → ready → no_show path (an existing `ready` row) is kept.
 
       // confirmed → ready → cancelled (no_show)
       await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "ready" } });
       assertEq((testDb.prepare("SELECT status FROM orders WHERE id = ?").get(optinOrderId) as any)?.status,
         "ready", "prg-14: Klar for henting → ready");
+      // A1b (S2): «Kunden kom ikke» is only possible after the pickup time.
+      testDb.prepare("UPDATE orders SET pickup_time = ? WHERE id = ?").run(new Date(Date.now() - 3600_000).toISOString(), optinOrderId);
       const noshow = await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "no_show" } });
       assertTrue((noshow.location || "").includes("done=cancelled"), "prg-15: no_show redirects with done=cancelled");
       const finalRow = testDb.prepare("SELECT status, cancel_reason FROM orders WHERE id = ?").get(optinOrderId) as any;
@@ -524,7 +516,7 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const STATUSES = ["pending", "confirmed", "declined", "ready", "completed", "cancelled"] as const;
       const ALLOWED: Record<string, string[]> = {
         pending:   ["confirmed", "declined"],
-        confirmed: ["ready", "cancelled"],
+        confirmed: ["ready", "completed", "cancelled"], // Fase A1: confirmed → completed directly
         ready:     ["completed", "cancelled"],
         declined:  [],
         completed: [],
@@ -564,16 +556,29 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const after = (testDb.prepare("SELECT updated_at FROM orders WHERE id = 'matrix-upd'").get() as any)?.updated_at;
       assertTrue(String(after) > String(before), "matrix-03: legal transition bumps updated_at");
 
-      // Review fix, finding 3 (unit level): the no_show REASON is gated on
-      // from-status 'ready' even though confirmed → cancelled itself is legal.
+      // Review fix, finding 3 (unit level), as changed by Fase A1: the no_show
+      // REASON is gated on a confirmed from-status (confirmed or ready).
       testDb.prepare(`
         INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
         VALUES ('matrix-ns-conf', 'ag-optout', 'bref_matrix', 'confirmed', 'pickup', 'ctok_nsconf', datetime('now'), datetime('now'))
       `).run();
+      // Fase A1: no_show is legal from 'confirmed' (no «Klar» step any more),
+      // but still never from 'pending' (never confirmed).
       const nsConf = cartSvc.transitionOrder("matrix-ns-conf", "cancelled", { actor: "test", cancelReason: "no_show" });
-      assertTrue(!nsConf.success && nsConf.status === 409,
-        "matrix-04: cancelled with cancelReason='no_show' from 'confirmed' → 409 (never was ready)");
-      const plainCancel = cartSvc.transitionOrder("matrix-ns-conf", "cancelled", { actor: "test" });
+      assertTrue(nsConf.success === true,
+        "matrix-04: Fase A1 — cancelled with cancelReason='no_show' from 'confirmed' is legal");
+      testDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
+        VALUES ('matrix-ns-pend', 'ag-optout', 'bref_matrix', 'pending', 'pickup', 'ctok_nspend', datetime('now'), datetime('now'))
+      `).run();
+      const nsPend = cartSvc.transitionOrder("matrix-ns-pend", "cancelled", { actor: "test", cancelReason: "no_show" });
+      assertTrue(!nsPend.success && nsPend.status === 409,
+        "matrix-04b: cancelled with cancelReason='no_show' from 'pending' → 409 (never confirmed)");
+      testDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
+        VALUES ('matrix-plain-conf', 'ag-optout', 'bref_matrix', 'confirmed', 'pickup', 'ctok_plainconf', datetime('now'), datetime('now'))
+      `).run();
+      const plainCancel = cartSvc.transitionOrder("matrix-plain-conf", "cancelled", { actor: "test" });
       assertTrue(plainCancel.success === true,
         "matrix-05: plain confirmed → cancelled (no reason) remains legal");
       testDb.prepare(`
@@ -806,12 +811,16 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // (l) skive 2 — NO consent: nothing buyer-identifying reaches the producer
-    //     (no «Kunde» block, default Reply-To, NULL order columns, PRG page
-    //     without the block) even though the fields were typed.
+    // (l) skive 2 + F2 — NO consent: since F2 (dev-request 2026-10-21-rfb-
+    //     bestillinger-klar-for-forste-ekte-handel) a real order REQUIRES
+    //     contact_consent=true and an e-mail or phone, so a no-consent submit
+    //     against an eligible producer is refused: clear error, no order row,
+    //     no e-mail, the cart stays open. The consent-gated copy invariant
+    //     (non-NULL contact columns ⇒ consent) therefore always holds.
     // ════════════════════════════════════════════════════════════════════════
     {
       sent.length = 0;
+      const ordersBefore = (testDb.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n;
       const r = await submitCartFor("prod-optin", {
         buyer_name: "Ola Uten Samtykke",
         buyer_email: "ola@example.com",
@@ -819,26 +828,13 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
         delivery_note: "Ring først",
         contact_consent: false,
       });
-      assertEq(r.orders.length, 1, "noconsent-01: the real order is still created");
-      await waitFor(() => sent.length >= 1);
-      assertEq(sent.length, 1, "noconsent-02: exactly one notification sent");
-      const mail = sent[0]!;
-      assertEq(mail.replyTo, notifySvc.DEFAULT_ORDER_NOTIFY_REPLY_TO, "noconsent-03: Reply-To is the platform default, not the buyer");
-      assertTrue(!mail.textContent.includes("Kunde:") && !mail.htmlContent.includes("Kunde:"), "noconsent-04: no «Kunde» block at all (not even empty rows)");
-      assertTrue(!mail.textContent.includes("Ola Uten Samtykke") && !mail.textContent.includes("ola@example.com") && !mail.textContent.includes("99887766") && !mail.textContent.includes("Ring først"),
-        "noconsent-05: none of the typed contact fields appear in the text body");
-      assertTrue(!mail.htmlContent.includes("Ola Uten Samtykke") && !mail.htmlContent.includes("ola@example.com") && !mail.htmlContent.includes("99887766"),
-        "noconsent-06: none of the typed contact fields appear in the HTML body");
-      const o = testDb.prepare("SELECT buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent_at, confirm_token FROM orders WHERE id = ?").get(r.orderId) as any;
-      assertTrue(!!o && o.buyer_name === null && o.buyer_email === null && o.buyer_phone === null && o.delivery_note === null && o.contact_consent_at === null,
-        "noconsent-07: all five contact columns on the order are NULL (non-NULL ⇒ consent invariant)");
-      const c = testDb.prepare("SELECT buyer_name, contact_consent_at FROM carts WHERE id = ?").get(r.cartId) as any;
-      assertEq(c?.buyer_name, "Ola Uten Samtykke", "noconsent-08: the cart still stores the typed name (Slice 1 behaviour unchanged)");
-      assertEq(c?.contact_consent_at, null, "noconsent-09: cart contact_consent_at stays NULL");
-      const page = await req("GET", `/produsent/ordre/${o.confirm_token}`);
-      assertEq(page.status, 200, "noconsent-10: producer PRG page renders");
-      assertTrue(!page.text.includes("Kunde:") && !page.text.includes("Ola Uten Samtykke") && !page.text.includes("ola@example.com"),
-        "noconsent-11: PRG page shows no buyer block and no contact fields");
+      assertEq(r.status, 422, "noconsent-01: a submit without consent against an eligible producer is refused (422)");
+      assertEq(r.orders.length, 0, "noconsent-02: no order in the response");
+      await new Promise((res) => setTimeout(res, 50));
+      assertEq(sent.length, 0, "noconsent-03: no e-mail sent");
+      assertEq((testDb.prepare("SELECT COUNT(*) AS n FROM orders").get() as any).n, ordersBefore, "noconsent-04: no order row written");
+      const c = testDb.prepare("SELECT status FROM carts WHERE id = ?").get(r.cartId) as any;
+      assertEq(c?.status, "open", "noconsent-05: the cart stays open so the buyer can retry with contact details");
     }
 
     // ════════════════════════════════════════════════════════════════════════

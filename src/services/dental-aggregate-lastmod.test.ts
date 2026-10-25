@@ -112,6 +112,12 @@ export async function runDentalAggregateLastmodTests(
     const router = dentalSeo.default as any;
     const base = process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
     const specialtyNames = dentalSeo.SPECIALTY_PAGES.map((sp) => sp.navn);
+    // A static page carries its text date, which is today on the day its text
+    // was written (/om, /hvordan-det-fungerer and /proveniens, F2-S1; /vilkar,
+    // F2-S5). That is the page's own date, not the build day, so the "nothing
+    // else is dated today" checks below leave it out.
+    const isTextDay = (loc: string, day: string | null): boolean =>
+      day !== null && DENTAL_STATIC_PAGE_DATES[loc.slice(base.length)] === day;
 
     // ── fixture ──────────────────────────────────────────────────────────
     // Two places with different dates, a second Vestland place, a second
@@ -208,10 +214,13 @@ export async function runDentalAggregateLastmodTests(
       for (const [p, d] of Object.entries(DENTAL_STATIC_PAGE_DATES)) {
         assertEq(entries.get(`${base}${p}`), d, `B9: ${p} lastmod = its text date`);
       }
-      const statics = ["/hvordan-det-fungerer", "/om", "/personvern", "/proveniens"];
+      const statics = ["/hvordan-det-fungerer", "/om", "/personvern", "/vilkar", "/proveniens"];
       assertEq(statics.filter((p) => !(p in DENTAL_STATIC_PAGE_DATES)), [], "B10: every static page in the sitemap has a text date");
-      assertTrue(statics.every((p) => entries.get(`${base}${p}`) !== today), "B11: no static page has the build day (regression: all had today)");
-      assertEq([...entries.values()].filter((v) => v === today), [], "B12: nothing in the fixture changed today, so no URL carries today's date");
+      assertTrue(statics.every((p) => entries.get(`${base}${p}`) !== today || DENTAL_STATIC_PAGE_DATES[p] === today), "B11: no static page has the build day, unless its text changed that day (regression: all had today)");
+      assertEq([...entries].filter(([loc, v]) => v === today && !isTextDay(loc, v)).map(([loc]) => loc), [], "B12: nothing in the fixture changed today, so no URL carries today's date (a static page's own text date aside)");
+      const omDay = DENTAL_STATIC_PAGE_DATES["/om"] ?? "";
+      assertTrue(isTextDay(`${base}/om`, omDay) && !isTextDay(`${base}/om`, "1999-01-01") && !isTextDay(`${base}/sted/oslo`, "2026-05-02") && !isTextDay(`${base}/om`, null),
+        "B12b: only a static page's own text date is exempt (not another day, not an aggregate page, not a missing date)");
       assertEq([...entries.values()].filter((v) => v !== null && !/^\d{4}-\d{2}-\d{2}$/.test(v)), [], "B13: every <lastmod> is YYYY-MM-DD");
       assertTrue(!entries.has(`${base}/sted/test`), "B14: the probe's poststed is not listed");
       assertEq(entries.get(`${base}/klinikk/${bergen1.slug}`), "2026-04-10", "B15: /klinikk lastmod unchanged (updated_at day)");
@@ -220,6 +229,11 @@ export async function runDentalAggregateLastmodTests(
       const pv = await callRoute(router, "/personvern");
       const shown = (pv.text.match(/Sist oppdatert: (\d{4}-\d{2}-\d{2})/) || [])[1];
       assertEq(entries.get(`${base}/personvern`), shown, "B16: /personvern lastmod = the date the page shows");
+      // … and for /vilkar (F2-S5), in both languages.
+      const vk = (await callRoute(router, "/vilkar")).text;
+      const vkShown = [(vk.match(/Sist oppdatert: (\d{4}-\d{2}-\d{2})/) || [])[1], (vk.match(/Last updated: (\d{4}-\d{2}-\d{2})/) || [])[1]];
+      assertEq(vkShown, [entries.get(`${base}/vilkar`), entries.get(`${base}/vilkar`)], "B16b: /vilkar lastmod = the date the page shows, NO and EN");
+      assertEq(entries.get(`${base}/vilkar`), DENTAL_STATIC_PAGE_DATES["/vilkar"], "B16c: … which is its DENTAL_STATIC_PAGE_DATES entry");
 
       // IDX-3: two spellings of one place give one /sted URL.
       const xml = (await callRoute(router, "/sitemap.xml")).text;
@@ -271,8 +285,8 @@ export async function runDentalAggregateLastmodTests(
       const today = (db.prepare("SELECT substr(updated_at, 1, 10) AS d FROM dental_agents WHERE id = ?").get(bergen2.id) as { d: string }).d;
       dentalSeo.__resetDentalSitemapCacheForTesting();
       entries = sitemapEntries((await callRoute(router, "/sitemap.xml")).text);
-      const todays = [...entries].filter(([, v]) => v === today).map(([k]) => k.slice(base.length) || "/").sort();
-      assertEq(todays, ["/", "/fylke/Vestland", `/klinikk/${bergen2.slug}`, "/sted/bergen"].sort(), "D1: one clinic changed today -> exactly it and the pages that list it carry today's date");
+      const todays = [...entries].filter(([loc, v]) => v === today && !isTextDay(loc, v)).map(([k]) => k.slice(base.length) || "/").sort();
+      assertEq(todays, ["/", "/fylke/Vestland", `/klinikk/${bergen2.slug}`, "/sted/bergen"].sort(), "D1: one clinic changed today -> exactly it and the pages that list it carry today's date (a static page's own text date aside)");
       assertEq(entries.get(`${base}/sted/oslo`), "2026-05-02", "D2: an unrelated place keeps its own date");
     }
 

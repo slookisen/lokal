@@ -155,6 +155,7 @@ import {
   // see listGardssalgProviderMapPoints()'s doc in experience-store.ts).
   listGardssalgProviderMapPoints,
   type GardssalgProviderMapPoint,
+  gardssalgHasOwnerBadge,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
 // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C(b) /
@@ -431,7 +432,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alle opplevelser fra denne tilbyderen →", provUnmatched: "Tilbyder er ikke matchet ennå.",
     gsKicker: "Gårdssalg &amp; smaking", gsCrumb: "Gårdssalg og smaking", gsAbout: "Om produsenten", gsVisit: "Besøket", gsPractical: "Praktisk info",
     gsReserve: "Reserver", gsAddress: "Adresse", gsHours: "Åpningstider", gsSite: "Nettside", gsEmail: "E-post",
-    gsMeta: (navn: string, sted: string) => `Besøk ${navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`,
+    gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — produsentprofil på Opplevagent med fakta om produsenten.`,
   };
   const en: typeof no = {
     skip: "Skip to content", crumbs: "Breadcrumbs", crumbsGs: "Breadcrumbs", home: "Home",
@@ -452,7 +453,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "All experiences from this provider →", provUnmatched: "Provider not matched yet.",
     gsKicker: "Farm sales &amp; tasting", gsCrumb: "Farm sales and tasting", gsAbout: "About the producer", gsVisit: "The visit", gsPractical: "Practical information",
     gsReserve: "Reserve", gsAddress: "Address", gsHours: "Opening hours", gsSite: "Website", gsEmail: "Email",
-    gsMeta: (navn: string, sted: string) => `Visit ${navn}${sted ? " in " + sted : ""} — book a tasting or tour directly with the producer on Opplevagent.`,
+    gsMeta: (navn: string, sted: string) => `${navn}${sted ? " in " + sted : ""} — producer profile on Opplevagent with facts about the producer.`,
   };
   const sv: typeof no = {
     skip: "Hoppa till innehållet", crumbs: "Brödsmulor", crumbsGs: "Brödsmulor", home: "Startsidan",
@@ -473,7 +474,7 @@ function oaProfileLabels(lang: Lang) {
     provAll: "Alla upplevelser från denna arrangör →", provUnmatched: "Arrangören är inte matchad ännu.",
     gsKicker: "Gårdsförsäljning &amp; provsmakning", gsCrumb: "Gårdsförsäljning och provsmakning", gsAbout: "Om producenten", gsVisit: "Besöket", gsPractical: "Praktisk information",
     gsReserve: "Reservera", gsAddress: "Adress", gsHours: "Öppettider", gsSite: "Webbplats", gsEmail: "E-post",
-    gsMeta: (navn: string, sted: string) => `Besök ${navn}${sted ? " i " + sted : ""} — boka en provsmakning eller visning direkt hos producenten på Opplevagent.`,
+    gsMeta: (navn: string, sted: string) => `${navn}${sted ? " i " + sted : ""} — producentprofil på Opplevagent med fakta om producenten.`,
   };
   if (lang === "en") return en;
   if (lang === "sv") return sv;
@@ -2687,7 +2688,8 @@ function buildExperiencesSitemapXml(): string {
   const today = new Date().toISOString().slice(0, 10);
   const paths: Array<{ p: string; freq: string; pri: string }> = [
     { p: "/", freq: "daily", pri: "1.0" },
-    { p: "/en", freq: "daily", pri: "0.9" },
+    // /en only while the EN flag is on (same flag as hreflang / EN toggle).
+    ...(isOpplevagentLangSwitcherEnabled() ? [{ p: "/en", freq: "daily", pri: "0.9" }] : []),
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
     // S4 (dev-request 2026-08-06-opplevagent-ux-loft-drikkested-lansering):
     // the /for-tilbydere provider-onboarding page is indexable and statically
@@ -5797,7 +5799,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     if (!bookingPaused) {
       cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:700;color:#fff;background:#0f5a50;border-radius:4px;padding:2px 8px">Booking tilgjengelig</span>`);
     }
-    if (p.claimed_at != null) {
+    if (gardssalgHasOwnerBadge(p)) {
       cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:600;color:#0f5a50;background:#fff;border:1px solid #0f5a50;border-radius:4px;padding:2px 7px">&#10003; Eier-bekreftet</span>`);
     }
     const markerRow = cardMarkers.length
@@ -6164,6 +6166,10 @@ router.get(
     // doc comment on it). A revoked/expired session must NOT flip this back to
     // "unclaimed" (AC6) — claimed_at means "has been claimed at some point".
     const isClaimed = provider.claimed_at != null;
+    // Badge basis (dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-
+    // bekreftet-av-eier): taken over (claimed_at) OR confirmed by e-mail. Only
+    // isClaimed (a real owner login) drops the "Ta over profilen" links.
+    const hasBadge = gardssalgHasOwnerBadge(provider);
     // 2026-08-12 (arbeidspunkt 5): computed once, reused by both the
     // reserve-notice AND the reserve-CTA's class/label below so they can
     // never disagree about paused state.
@@ -6503,10 +6509,13 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
         <h2>${L.place}</h2>
         ${mapBlock}
       </div>
-      ${isClaimed ? `<div class="aside-card">
+      ${hasBadge ? `<div class="aside-card">
         <h2 style="display:flex;align-items:center;gap:6px"><span style="color:#0f5a50">&#10003;</span> Bekreftet av eier</h2>
-        <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet denne profilen via magisk lenke.</p>
-        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>
+        ${isClaimed
+          ? `<p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet denne profilen via magisk lenke.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>`
+          : `<p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet informasjonen på e-post.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Ta over profilen</a>`}
       </div>` : `<div class="aside-card">
         <h2>Driver du dette stedet?</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
@@ -9679,7 +9688,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Besøks- og søkestatistikk og teknisk MCP/A2A-logg</td><td>Slettes automatisk etter 60 dager. Før sletting summeres de til tall uten kobling til den besøkende (for eksempel antall besøk per dag og antall søk per søketekst), og bare disse tallene beholdes.</td></tr>
 <tr><td>Agent-forespørsler</td><td>Loggen over, uten personopplysninger, slettes ikke automatisk i dag.</td></tr>
 <tr><td>Besøksforespørsler</td><td>Ingen automatisk sletting i dag. De lagres til du ber oss slette dem, og vi sletter dem da innen 30 dager. E-posten som er sendt til produsenten, ligger også i produsentens og din egen innboks; den kan vi ikke slette.</td></tr>
-<tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
+<tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
 </tbody></table>
 <h2>Rettighetene dine</h2><p>Etter personopplysningsloven og personvernforordningen (GDPR) har du rett til å:</p><ul>
 <li><strong>Be om innsyn</strong> — vi kan fortelle deg hva vi har lagret om deg.</li>
@@ -9727,7 +9736,7 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <tr><td>Visit and search statistics and the technical MCP/A2A log</td><td>Deleted automatically after 60 days. Before deletion they are summed into totals with no link to the visitor (for example visits per day and searches per search text), and only those totals are kept.</td></tr>
 <tr><td>Agent requests</td><td>The log above, without personal data, is not deleted automatically today.</td></tr>
 <tr><td>Visit requests</td><td>No automatic deletion today. They are kept until you ask us to delete them, and we then delete them within 30 days. The email already sent to the producer also sits in the producer's and your own inbox, which we cannot delete.</td></tr>
-<tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, with no fixed time limit. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
+<tr><td>Database backups</td><td>Daily copies with Tigris are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we occasionally also take a manual copy on the server; the ten newest are kept, and never longer than 30 days. A deleted detail can therefore remain in a backup for a while after it is deleted.</td></tr>
 </tbody></table>
 <h2>Your rights</h2><p>Under the Norwegian Personal Data Act and the GDPR you have the right to:</p><ul>
 <li><strong>Access</strong> — we can tell you what we have stored about you.</li>
@@ -10005,7 +10014,7 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
   <section class="ft-section" aria-labelledby="ft-merke-h">
     <h2 id="ft-merke-h">«Bekreftet av eier»-merket</h2>
     <span class="ft-badge-sample"><span aria-hidden="true">&#10003;</span> Bekreftet av eier</span>
-    <p>Når du har tatt eierskap, viser profilen din dette merket. Det forteller både besøkende og AI-agenter at informasjonen kommer fra eieren selv — et tillitssignal som skiller profilen din fra rene katalogoppføringer.</p>
+    <p>Når du har tatt eierskap, viser profilen din dette merket. Du får det også når du bekrefter på e-post at informasjonen på profilen stemmer, fra en e-postadresse vi kjenner igjen som din. Merket forteller både besøkende og AI-agenter at informasjonen kommer fra eieren selv — et tillitssignal som skiller profilen din fra rene katalogoppføringer.</p>
   </section>
 
   <section class="ft-section" aria-labelledby="ft-login-h">

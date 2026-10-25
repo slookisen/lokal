@@ -389,9 +389,24 @@ export function runOpplevelserBookingSendGuardTests(
         org_nr: "988888887", catalog_hidden: null,
       });
 
+      // A slot ~20 days ahead at 11:00 Oslo, computed from now (never stale).
+      // Hoisted above bookingInput, whose slot_at takes the same date: (q)
+      // posts bookingInput to the public POST /book, which rejects a passed
+      // slot — the hardcoded "2026-11-01T12:00:00.000Z" it replaces would have
+      // made q1/q2 fail from that instant on (dev-request
+      // 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+      const osloParts = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+      const oget = (t: string): number => +(osloParts.find((x) => x.type === t)?.value ?? "0");
+      const aheadDate = new Date(Date.UTC(oget("year"), oget("month") - 1, oget("day") + 20));
+      const pad = (n: number): string => String(n).padStart(2, "0");
+      const aheadDay = `${aheadDate.getUTCFullYear()}-${pad(aheadDate.getUTCMonth() + 1)}-${pad(aheadDate.getUTCDate())}`;
+      const aheadSlot = `${aheadDay}T11:00`;
+
       const bookingInput = {
         provider_id: "prov-live",
-        slot_at: "2026-11-01T12:00:00.000Z",
+        // Same zone-carrying shape and time of day as before (12:00Z), so
+        // normaliseBookingSlotInput() still passes it through untouched.
+        slot_at: `${aheadDay}T12:00:00.000Z`,
         party_size: 2,
         guest_name: "Kari Nordmann",
         guest_email: "kari@example.no",
@@ -419,6 +434,50 @@ export function runOpplevelserBookingSendGuardTests(
       );
       const fromSmuggled = bookingStore.createBooking((smuggled as any).data, "mcp");
       assertEq(fromSmuggled.is_test, 0, "h3: a booking built from a smuggling payload is NOT a test booking");
+
+      // ── (r) COMMISSION RATE comes from the provider, never the caller ────
+      // dev-request 2026-10-22-opplevagent-booking-provisjonssats-fra-offentlig-kall
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, epost, booking_live, commission_rate,
+            producer_type, enrichment_state, verification_status, source, confidence, created_at)
+         VALUES ('prov-rate', 'Rate Gård', 'experiences', 'rate@gard.no', 1, 0.15,
+                 'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium', datetime('now'))`
+      ).run();
+      const rateInput = { ...bookingInput, provider_id: "prov-rate" };
+      const rateSmuggled = bookingStore.BookingInputSchema.safeParse({ ...rateInput, commission_rate: 0 });
+      assertEq(rateSmuggled.success, true, "r1: a payload with commission_rate still parses");
+      assertTrue(
+        rateSmuggled.success && !("commission_rate" in (rateSmuggled.data as any)),
+        "r2: BookingInputSchema STRIPS commission_rate"
+      );
+      assertEq(
+        bookingStore.createBooking((rateSmuggled as any).data, "opplevagent").commission_rate,
+        0.15,
+        "r3: commission_rate:0 in the body → booking stores the provider's 0.15"
+      );
+      assertEq(
+        bookingStore.createBooking((rateSmuggled as any).data, "mcp").commission_rate,
+        0.15,
+        "r4: same through the MCP source"
+      );
+      assertEq(
+        bookingStore.createBooking(rateInput as any, "opplevagent").commission_rate,
+        0.15,
+        "r5: no field → 0.15 (unchanged behaviour)"
+      );
+      const nullRate = bookingStore.BookingInputSchema.safeParse({ ...bookingInput, commission_rate: 0.5 });
+      assertEq(
+        bookingStore.createBooking((nullRate as any).data, "opplevagent").commission_rate,
+        null,
+        "r6: provider without a rate (NULL) → NULL, whatever the caller sends"
+      );
+      assertEq(
+        (expDb.prepare(`SELECT commission_rate FROM gardssalg_bookings WHERE booking_id = ?`)
+          .get(bookingStore.createBooking((rateSmuggled as any).data, "opplevagent").booking_id) as any).commission_rate,
+        0.15,
+        "r7: the persisted row carries the provider's rate"
+      );
 
       // ── (i)+(j) both booking emails redirect; producer email specifically ─
       sent = [];
@@ -509,12 +568,7 @@ export function runOpplevelserBookingSendGuardTests(
       insertNamed.run({ id: "prov-amb-1", navn: "Ambig Bryggeri Nord", epost: "nord@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-nord" });
       insertNamed.run({ id: "prov-amb-2", navn: "Ambig Bryggeri Sør", epost: "sor@amb.example.no", booking_live: 0, catalog_hidden: null, slug: "ambig-bryggeri-sor" });
 
-      // A slot ~20 days ahead at 11:00 Oslo, computed from now (never stale).
-      const osloParts = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
-      const oget = (t: string): number => +(osloParts.find((x) => x.type === t)?.value ?? "0");
-      const aheadDate = new Date(Date.UTC(oget("year"), oget("month") - 1, oget("day") + 20));
-      const pad = (n: number): string => String(n).padStart(2, "0");
-      const aheadSlot = `${aheadDate.getUTCFullYear()}-${pad(aheadDate.getUTCMonth() + 1)}-${pad(aheadDate.getUTCDate())}T11:00`;
+      // aheadSlot/aheadDate: computed from now above bookingInput.
       const weekdayNb = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"];
       const aheadWeekday = weekdayNb[(aheadDate.getUTCDay() + 6) % 7]!;
       const wrongWeekday = weekdayNb[((aheadDate.getUTCDay() + 6) % 7 + 1) % 7]!;

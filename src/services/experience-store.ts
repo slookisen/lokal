@@ -3891,7 +3891,7 @@ export function countGardssalgProviders(filter?: GardssalgProviderTypeFilter): n
       // hidden booking-flyt-v1 test provider) never bump the count that gates
       // gardssalgVisible() (dev-request 2026-07-14-booking-flyt-v1, slice 0).
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1)" +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')" +
       typeFilter.sql
     )
     .get(...typeFilter.params) as { c: number };
@@ -3914,7 +3914,7 @@ export function countGardssalgProvidersByType(): Array<{ producer_type: string |
     .prepare(
       "SELECT producer_type, COUNT(*) AS count FROM experience_providers " +
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '') " +
       "GROUP BY producer_type"
     )
     .all() as Array<{ producer_type: string | null; count: number }>;
@@ -3938,7 +3938,7 @@ export function countGardssalgProvidersBookable(): number {
     .prepare(
       "SELECT COUNT(*) AS c FROM experience_providers " +
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '') " +
       "AND booking_live = 1"
     )
     .get() as { c: number };
@@ -3984,7 +3984,7 @@ export function getExperiencesMarketplaceStats(): ExperiencesMarketplaceStats {
     `SELECT DISTINCT kommune FROM experience_providers
       WHERE kommune IS NOT NULL
         AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-        AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+        AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')`
   ).all() as Array<{ kommune: string }>;
   const cities = cityRows.map((r) => r.kommune);
 
@@ -4075,6 +4075,12 @@ export type GardssalgProviderRow = {
   // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
   // NULL = never claimed.
   claimed_at: string | null;
+  // Additive (2026-10-24, dev-request 2026-10-22-opplevagent-takksvar-eierlenke-
+  // og-bekreftet-av-eier): second, separate basis for the "Bekreftet av eier"
+  // badge — the producer confirmed the profile by e-mail from an address the
+  // claim flow accepts for them. Never set by verifyClaimToken(); NULL = not
+  // confirmed by e-mail. See gardssalgHasOwnerBadge().
+  owner_email_confirmed_at: string | null;
   // Additive (2026-08-18, dev-request 2026-08-17-kontaktadresse-feilkilde-og-
   // override, Skive C): the row's raw field_provenance JSON blob. Selected
   // here so the RENDER surfaces (routes/experiences-seo.ts's produsent-profil
@@ -4089,7 +4095,17 @@ export type GardssalgProviderRow = {
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, field_provenance";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, owner_email_confirmed_at, field_provenance";
+
+/** The public "Bekreftet av eier" badge shows when the profile has been taken
+ *  over (claimed_at) OR the owner confirmed it by e-mail
+ *  (owner_email_confirmed_at). Only the former is an owner who can log in, so
+ *  callers decide the "Ta over profilen" link on claimed_at alone. */
+export function gardssalgHasOwnerBadge(
+  row: { claimed_at?: string | null; owner_email_confirmed_at?: string | null },
+): boolean {
+  return row.claimed_at != null || row.owner_email_confirmed_at != null;
+}
 
 export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
@@ -4105,7 +4121,7 @@ export function listGardssalgProviders(limit = 100, offset = 0, filter?: Gardssa
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)${typeFilter.sql}
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')${typeFilter.sql}
         ORDER BY navn
         LIMIT ? OFFSET ?`
     )
@@ -4168,7 +4184,7 @@ export function listGardssalgProviderMapPoints(filter?: GardssalgProviderTypeFil
       `SELECT slug, navn, producer_type, fylke, kommune, poststed, lat, lon, geocode_confidence
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')
           AND lat IS NOT NULL AND lon IS NOT NULL
           ${NORWAY_BBOX_SQL("lat", "lon")}
           AND slug IS NOT NULL AND slug != ''${typeFilter.sql}
@@ -4218,7 +4234,7 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
          FROM experience_providers
         WHERE slug = @slug
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')`
     )
     .get({ slug }) as GardssalgProviderRow | undefined;
   return row ?? null;
@@ -4366,6 +4382,9 @@ export function searchGardssalgProviders(
   if (filter.include_hidden !== true) {
     where.push("(catalog_hidden IS NULL OR catalog_hidden != 1)");
   }
+  // A merged-away duplicate (merged_into set) is never public, include_hidden or not
+  // (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8).
+  where.push("(merged_into IS NULL OR merged_into = '')");
   const params: Record<string, unknown> = {};
 
   // Re-review 2026-10-03: fylke now goes through the same fylkeEquivalents()
@@ -4587,7 +4606,7 @@ export function searchGardssalgProvidersByQuery(query: string, limit = 30): Gard
       `SELECT id, navn, slug, fylke, kommune, poststed, producer_type
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')
           AND slug IS NOT NULL AND slug != ''
           AND ${termClauses.join(" AND ")}
         ORDER BY navn
@@ -5668,7 +5687,9 @@ export function applyGardssalgRetroScanNull(
   }
   if (written.length === 0) return [];
 
-  sets.push("content_source = 'provider_site'");
+  // A claimed row keeps content_source='claim' (G1 skive 5), same as
+  // applyGardssalgProviderContent: re-stamping would unlock its other fields.
+  if (row.content_source !== "claim") sets.push("content_source = 'provider_site'");
   sets.push("content_evidence_url = @evidence_url");
   sets.push("content_updated_at = datetime('now')");
   params.evidence_url = evidenceUrl;

@@ -482,7 +482,21 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       // ── (i) AC1: a domain_match autosvar candidate is reflected in the
       // SAME daily run's outcome counts (dry run: would_apply > 0) ───────
       setGardssalgOutreachLanePaused(expDb, { paused: false, by: "test-suite", reason: null });
-      const ac1Now = new Date("2026-10-15T08:10:00Z"); // fresh calendar day -> full budget; far past (g)'s bounce lookback
+      // ac1Now-ac3Now: 08:10Z on three consecutive days a week out, computed
+      // from the real clock. (e)'s sends and (g)'s bounce happened at real
+      // now, so each is a fresh calendar day (full budget) and far past (g)'s
+      // bounce lookback: the 48h window starts after those sends, so Guard 3
+      // has nothing to see even without (g)'s bounce ack. The hardcoded
+      // 2026-10-15/16/17 they replace stopped being "far past" once the real
+      // clock came within 48h of them (dev-request
+      // 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+      const realNow = new Date();
+      const ac1Now = new Date(Date.UTC(realNow.getUTCFullYear(), realNow.getUTCMonth(), realNow.getUTCDate() + 7, 8, 10));
+      assertEq(
+        findGardssalgOutreachRecentBounces(expDb, rfbDb, ac1Now, null),
+        [],
+        "i0: ac1Now is far past (g)'s bounce lookback — no recent bounce at ac1Now even with the bounce ack ignored",
+      );
       mkAutosvarProvider({ id: "prov-ac1-match", navn: "AC1 Match Gård", hjemmeside: "https://ac1match.no", epost: "gammel@ac1match.no" });
       mkAutosvarInboundMessage({
         providerId: "prov-ac1-match",
@@ -501,7 +515,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
 
       // ── (j) AC2: a domain_mismatch candidate lands in the review queue,
       // never auto-written to epost, on an apply:true daily run ──────────
-      const ac2Now = new Date("2026-10-16T08:10:00Z");
+      const ac2Now = new Date(ac1Now.getTime() + 24 * 3600 * 1000);
       mkAutosvarProvider({ id: "prov-ac2-mismatch", navn: "AC2 Mismatch Gård", hjemmeside: "https://ac2mismatch.no", epost: "post@ac2mismatch.no" });
       mkAutosvarInboundMessage({
         providerId: "prov-ac2-mismatch",
@@ -530,7 +544,7 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
       // NOTHING — neither an epost write nor a review-queue row — even
       // though autosvar candidates (domain_match + domain_mismatch from (i)
       // and (j)) already exist ───────────────────────────────────────────
-      const ac3Now = new Date("2026-10-17T08:10:00Z");
+      const ac3Now = new Date(ac1Now.getTime() + 2 * 24 * 3600 * 1000);
       const queueSizeBeforeAc3 = countAutosvarQueueRows();
       const ac1EpostBeforeAc3 = getAutosvarProviderEpost("prov-ac1-match");
       const ac2EpostBeforeAc3 = getAutosvarProviderEpost("prov-ac2-mismatch");
@@ -679,6 +693,78 @@ export function runOpplevelserGardssalgOutreachDailyRunTests(
           indexSrc.includes("tickGardssalgOutreachDaily({ now, lastRunAt: lastGardssalgOutreachRunAt })"),
           "m5: the 08:00Z tick in index.ts goes through tickGardssalgOutreachDaily",
         );
+      }
+
+      // ── (n) dev-request 2026-10-10-gardssalg-outreach-bounce-sjekk-kun-for-sending:
+      // Guard 3 re-checks between every send, so a bounce that lands MID-batch
+      // stops the rest of the SAME run. Real clock; cap raised so budget is no
+      // limit; the lane is still paused + acked (betaComplaintId) from (l) ──
+      {
+        process.env.DAILY_PREP_MAX_CANDIDATES = "20";
+        const mkN = (id: string, n: number): string => {
+          const email = `post@${id}.no`;
+          insertProvider.run({
+            id: `prov-${id}`, navn: id, org_nr: `30000000${n}`, kommune: "Voss", producer_type: "sideri",
+            epost: email, hjemmeside: `https://${id}.no`, about_text: REALISTIC_ABOUT_TEXT, products: "Sider",
+            slug: id, field_provenance: withBrregEmail(VERIFIED_PROVENANCE, email, `30000000${n}`),
+          });
+          return email;
+        };
+        setGardssalgOutreachLanePaused(expDb, { paused: false, by: "test-suite", reason: null });
+        const ackBeforeN = getGardssalgOutreachLaneState(expDb).bounce_ack_max_id;
+        // n1 (+ acked case): no new bounce -> every candidate sent; the acked
+        // (l) bounces inside the 48h lookback do NOT re-trip the mid-batch check.
+        mkN("nord-sideri", 1); mkN("sor-sideri", 2); mkN("ost-sideri", 3);
+        const sentBeforeN1 = sent.length;
+        const n1 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+        assertEq([n1.summary.sent, n1.summary.skipped, n1.auto_paused, n1.recent_bounces], [3, 0, false, []], "n1: no new bounce -> all 3 sent, not paused");
+        assertEq(sent.length - sentBeforeN1, 3, "n2: three mails left the transporter");
+        assertEq(getGardssalgOutreachLaneState(expDb).paused, false, "n3: acked (l) bounces do not re-trip the mid-batch check");
+        assertEq(getGardssalgOutreachLaneState(expDb).bounce_ack_max_id, ackBeforeN, "n4: ack unchanged by a clean run");
+
+        // n5+: a hard bounce on the FIRST recipient arrives right after it is sent.
+        mkN("vest-sideri", 4); mkN("midt-sideri", 5); mkN("fjell-sideri", 6);
+        const realSendMail = emailSvc.transporter.sendMail;
+        let nCalls = 0;
+        let nBounceId = 0;
+        emailSvc.transporter = {
+          sendMail: async (mailOptions: Record<string, any>) => {
+            const r = await realSendMail(mailOptions);
+            nCalls += 1;
+            if (nCalls === 1) {
+              nBounceId = Number(
+                rfbDb
+                  .prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type, reason) VALUES (?, ?, 'hard', 'test')`)
+                  .run(String(mailOptions.to), new Date().toISOString()).lastInsertRowid,
+              );
+            }
+            return r;
+          },
+        };
+        const sentBeforeN2 = sent.length;
+        const n2 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+        emailSvc.transporter = { sendMail: realSendMail };
+        assertEq(nCalls, 1, "n5: only the first send happened before the mid-batch bounce stopped the run");
+        assertEq(sent.length - sentBeforeN2, 1, "n6: exactly one mail left the transporter");
+        assertEq([n2.summary.sent, n2.summary.skipped], [1, 2], "n7: 1 sent, remaining 2 skipped");
+        assertEq(
+          n2.results.filter((r) => r.status === "skipped").map((r) => r.reason),
+          ["not_attempted_after_bounce_recheck", "not_attempted_after_bounce_recheck"],
+          "n8: skipped rows carry the mid-batch bounce reason",
+        );
+        assertEq([n2.auto_paused, n2.skipped_reason], [true, null], "n9: report says auto_paused, run itself not a Guard-3 skip");
+        assertEq(n2.recent_bounces.map((b) => b.bounce_id), [nBounceId], "n10: report names the mid-batch bounce");
+        const laneN = getGardssalgOutreachLaneState(expDb);
+        assertEq([laneN.paused, laneN.changed_by, laneN.bounce_ack_max_id], [true, GARDSSALG_OUTREACH_DAILY_AGENT, nBounceId], "n11: lane paused as Guard 3 does, bounce acked");
+        const nRun = runsFor().filter((r) => r.run_id === n2.run_id)[0];
+        assertTrue(
+          !!nRun && nRun.notes.includes("AUTO-PAUSED") && nRun.notes.includes("mid_batch_bounce_skipped=2"),
+          "n12: envelope notes carry AUTO-PAUSED + mid_batch_bounce_skipped",
+        );
+        // Next run stays paused (a human lifts it).
+        const n3 = await runGardssalgOutreachDaily({ apply: true, trigger: "manual" });
+        assertEq(n3.skipped_reason, "paused", "n13: next run is paused until a human lifts it");
+        delete process.env.DAILY_PREP_MAX_CANDIDATES;
       }
     } catch (err) {
       failed++;

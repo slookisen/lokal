@@ -15,6 +15,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { failsProducerRoleGate } from "../services/agent-visibility";
 import { getConfig } from "../config/vertical-config";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { isJunkDescription } from "../services/description-quality";
@@ -56,7 +57,7 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
       if (city) {
         cities.set(city, (cities.get(city) || 0) + 1);
         const samples = citySamples.get(city) || [];
-        if (samples.length < 2) {
+        if (samples.length < 2 && !failsProducerRoleGate((a as any).role, false)) {
           samples.push(slugify(a.name));
           citySamples.set(city, samples);
         }
@@ -385,7 +386,8 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
         // the external website (Web:) instead of our profile. Adding the slug
         // here is the difference between Perplexity citing hommegaard.no vs.
         // rettfrabonden.com/produsent/homme-gard-ovrebo.
-        parts.push(`Profil: ${BASE_URL}/produsent/${slugify(a.name)}`);
+        // Skive A2: quality/logistics roles have no /produsent page (404) — no link.
+        if (!failsProducerRoleGate((a as any).role, false)) parts.push(`Profil: ${BASE_URL}/produsent/${slugify(a.name)}`);
         // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
         // beskrivelser: this dump bypassed the render-time description guard
         // every other surface consults, so gambling copy from a hijacked

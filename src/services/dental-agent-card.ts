@@ -39,9 +39,13 @@ export function getDentalAgentCard(honestCount?: number | null): object {
     // assume no DB dependency), the stale specific number is simply dropped
     // here; GET /tannlege_stats (dental-mcp.ts) and getDentalStats() give an
     // agent/visitor the real, honestly-filtered count.
+    // A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4e): the akutt
+    // data is the claim on the card, «Akuttvakt» (only with a stored quote from
+    // the source) or «Tar imot akuttpasienter», so the card names neither badge
+    // here, and the skill texts give the quote rule (dental-akutt-tekster.test.ts).
     description:
-      "A2A-markedsplass for norske tannlegeklinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
-      "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-duty data." +
+      "A2A-markedsplass for norske tannlegeklinikker med Helfo-avtale-, spesialitet- og akutthjelp-data. " +
+      "A2A marketplace for Norwegian dental clinics with Helfo-agreement, speciality, and emergency-claim data." +
       (hasCount ? ` Katalog / catalog: ${honestCount} klinikker / clinics.` : ""),
     url: `${url}/a2a`,
     // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
@@ -124,9 +128,9 @@ export function getDentalAgentCard(honestCount?: number | null): object {
           "text with a statistics word gets the statistics. " +
           "For a structured search, send `message.data` without a text part, with one or more of `fylke` " +
           "(a county such as Vestland), `specialty` (such as kjeveortopedi), `helfo_agreement` (\"true\" or " +
-          "\"false\"), `acute_vakt` (1: clinics with an emergency claim, that is a sourced akuttvakt or that they " +
-          "take emergency patients) and `q` (a clinic name or place as written); a data part in `parts` is not " +
-          "read. `metadata.filter` shows the filter that was used. " +
+          "\"false\"), `acute_vakt` (1: clinics with an emergency claim, that is an akuttvakt with a stored " +
+          "quote from the source or that they take emergency patients) and `q` (a clinic name or place as " +
+          "written); a data part in `parts` is not read. `metadata.filter` shows the filter that was used. " +
           "`count` is the number of clinics in the answer (at most 20) and `total` the number of clinics that " +
           "match. `clinics` lists them, each with its name, org.nr, " +
           (placesDisplayPolicyEnabled()
@@ -167,11 +171,12 @@ export function getDentalAgentCard(honestCount?: number | null): object {
         description:
           "Nøkkeltall for det norske tannlegemarkedet: antall tannlege- og spesialistklinikker totalt og per " +
           "fylke, og hvor mange som har Helfo-avtale, hører til en kjede, viser en akuttpåstand (akuttvakt med " +
-          "kilde, eller at klinikken tar imot akuttpasienter) eller oppgir spesialister eller spesialiteter. " +
+          "lagret sitat fra kilden, eller at klinikken tar imot akuttpasienter) eller oppgir spesialister eller " +
+          "spesialiteter. " +
           "En tekst med «statistikk», «totalt» eller «oversikt» gir tallene. " +
           "Key figures for dentist and specialist clinics in Norway: the total, per county (fylke), and how many " +
-          "have a Helfo agreement, belong to a chain, show an emergency claim (a sourced akuttvakt, or that the " +
-          "clinic takes emergency patients) or list specialists or specialties. " +
+          "have a Helfo agreement, belong to a chain, show an emergency claim (an akuttvakt with a stored quote from " +
+          "the source, or that the clinic takes emergency patients) or list specialists or specialties. " +
           "A text part with «stats», «total» or «how many» gets them too. " +
           "The figures are for all of Norway: a place or filter in the text is not applied.",
         inputModes: ["text/plain", "application/json"],

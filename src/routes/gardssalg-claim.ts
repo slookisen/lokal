@@ -8,6 +8,14 @@ import {
   verifyGardssalgOwnerSessionToken,
   revokeClaimToken,
   updateClaimedProviderProfile,
+  releaseClaimedProviderFieldLock,
+  pauseOwnedProvider,
+  resumeOwnedProvider,
+  getOwnedVisibilityStateById,
+  type OwnedVisibilityState,
+  type OwnerVisibilityOutcome,
+  getClaimOwnerLocks,
+  CLAIM_RELEASABLE_FIELDS,
   maskEmail,
   CLAIM_MANUAL_FALLBACK_EMAIL,
   CLAIM_EDITABLE_FIELDS,
@@ -17,6 +25,7 @@ import {
 import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-service";
 import { emailService } from "../services/email-service";
 import { generalLimiter } from "../middleware/security";
+import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -138,7 +147,21 @@ export const gardssalgClaimHostGate: express.RequestHandler = (req, res, next) =
 // driftable duplicate. Must stay dependency-free for that to work.
 export function describeSaveOutcome(ok: boolean, body: any): { success: boolean; message: string } {
   if (ok && body && body.success === true) {
+    // G1 pkt 2: nothing differed from what was stored -> say so honestly.
+    if (Array.isArray(body.updated_fields) && body.updated_fields.length === 0 &&
+        !(Array.isArray(body.skipped_fields) && body.skipped_fields.length > 0)) {
+      return { success: true, message: "Ingen endringer å lagre." };
+    }
     return { success: true, message: "Endringene er lagret." };
+  }
+  // 409 booking_blocked (dev-request 2026-10-22-opplevagent-mine-valg-
+  // gardssalg, G1 item 3): show the server's Norwegian reason, HTML-escaped
+  // here because the receipt is inserted with innerHTML.
+  if (body && body.error === "booking_blocked" && typeof body.message === "string" && body.message) {
+    var safe = body.message.replace(/[&<>"']/g, function (c: string) {
+      return c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#039;";
+    });
+    return { success: false, message: safe };
   }
   return { success: false, message: "Klarte ikke å lagre. Prøv igjen." };
 }
@@ -151,6 +174,25 @@ function escapeHtml(text: string): string {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
   };
   return String(text ?? "").replace(/[&<>"']/g, (char) => map[char]);
+}
+
+// ── Booking switch state for the portal (G1 item 3) ─────────────────────────
+// Why the owner cannot switch booking ON right now, or null. Only relevant
+// while booking is off: the admin brake always sets booking_live=0.
+function portalBookingBlock(provider: ClaimProviderRow): OwnerBookingBlock | null {
+  if (provider.booking_live === 1) return null;
+  return ownerBookingEnableBlock(provider);
+}
+
+function bookingBlockAlertHtml(block: OwnerBookingBlock): string {
+  if (block.reason === "admin_brake") {
+    return `<div class="gc-alert gc-alert-error" role="alert" data-booking-state="stopped_by_opplevagent">
+      <strong>Booking er stanset av Opplevagent.</strong>
+      ${block.note ? `Grunn: ${escapeHtml(block.note)}.` : ""}
+      Du kan ikke slå booking på igjen selv. Ta kontakt med ${CLAIM_MANUAL_FALLBACK_EMAIL}.
+    </div>`;
+  }
+  return `<div class="gc-alert gc-alert-error" role="alert" data-booking-state="needs_booking_email">${escapeHtml(block.message)}</div>`;
 }
 
 // ── Cookie parsing (no new deps — same fallback approach as owner-portal.ts
@@ -232,6 +274,8 @@ const SHELL_CSS = `
   .gc-stat-num { font-size: 1.5rem; font-weight: 700; color: #0f5a50; }
   .gc-stat-label { font-size: 0.78rem; color: #737373; }
   .gc-toggle-row { display: flex; align-items: center; gap: 10px; }
+  .gc-lock-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; font-size: 0.82rem; color: #525252; }
+  .gc-btn-small { padding: 8px 14px; font-size: 0.88rem; }
   @media (max-width: 480px) { .gc-card { padding: 18px 14px; } .gc-card h1 { font-size: 1.25rem; } }
 `;
 
@@ -567,10 +611,36 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     let alert = "";
     if (status === "saved") alert = `<div class="gc-alert gc-alert-ok" role="status">Endringene er lagret.</div>`;
     else if (status === "error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å lagre. Prøv igjen.</div>`;
+    else if (status === "booking_blocked") alert = `<div class="gc-alert gc-alert-error" role="alert">Booking ble ikke slått på. Ingen endringer er lagret.</div>`;
+    else if (status === "released") alert = `<div class="gc-alert gc-alert-ok" role="status">Opplevagent kan nå oppdatere feltet igjen.</div>`;
+    else if (status === "paused") alert = `<div class="gc-alert gc-alert-ok" role="status">Profilen er satt på pause og vises ikke offentlig.</div>`;
+    else if (status === "resumed") alert = `<div class="gc-alert gc-alert-ok" role="status">Profilen er synlig igjen.</div>`;
+    else if (status === "visibility_error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å endre synligheten. Prøv igjen.</div>`;
+    else if (status === "release_error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å gi tilbake feltet. Prøv igjen.</div>`;
 
+    // content_source='manual' locks the content fields only; the booking
+    // switch is the owner's consent and follows the shared gate instead.
     const locked = provider.content_source === "manual";
+    const bookingBlock = portalBookingBlock(provider);
+    const bookingDisabled = !!bookingBlock;
+    const nothingEditable = locked && bookingDisabled;
     let products: string[] = [];
     try { const p = JSON.parse(provider.products || "[]"); if (Array.isArray(p)) products = p.filter((x) => typeof x === "string"); } catch { /* ignore */ }
+
+    // G1 pkt 2: per-field lock note + «gi tilbake» button. The button submits
+    // its OWN form (#gc-release-form, outside the profile form) via the
+    // form="" attribute, so Enter in a profile input always hits «Lagre»
+    // (implicit submission picks the profile form's own first submit button).
+    const ownerLocks = getClaimOwnerLocks(provider);
+    const releaseAction = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/release-field`;
+    const lockNote = (field: string): string => {
+      if (locked || !Object.prototype.hasOwnProperty.call(ownerLocks, field)) return "";
+      if (ownerLocks[field].locked_by === "admin") {
+        return `<div class="gc-lock-note" data-lock-field="${field}">Opplevagent-support har låst dette feltet.</div>`;
+      }
+      return `<div class="gc-lock-note" data-lock-field="${field}"><span>Du har skrevet dette selv, så Opplevagent endrer det ikke.</span>` +
+        `<button type="submit" form="gc-release-form" class="gc-btn gc-btn-secondary gc-btn-small" name="release_field" value="${field}">La Opplevagent oppdatere dette</button></div>`;
+    };
 
     const body = `
       <div class="gc-card">
@@ -582,7 +652,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         </div>
         <p>Rediger profilen din for Gårdssalg og smaking.</p>
         ${alert}
-        ${locked ? `<div class="gc-alert gc-alert-error" role="alert">Denne profilen er låst av Opplevagent-support. Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre.</div>` : ""}
+        ${locked ? `<div class="gc-alert gc-alert-error" role="alert">Teksten i denne profilen er låst av Opplevagent-support. Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre den. Booking kan du fortsatt slå av og på selv.</div>` : ""}
       </div>
       <div class="gc-card">
         <h2>Profilinformasjon</h2>
@@ -590,34 +660,42 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
           <div class="gc-field">
             <label for="f-about">Om produsenten</label>
             <textarea id="f-about" name="field_about_text" ${locked ? "disabled" : ""}>${escapeHtml(provider.about_text || "")}</textarea>
+            ${lockNote("about_text")}
           </div>
           <div class="gc-field">
             <label for="f-visit">Besøket</label>
             <textarea id="f-visit" name="field_visit_text" ${locked ? "disabled" : ""}>${escapeHtml(provider.visit_text || "")}</textarea>
+            ${lockNote("visit_text")}
           </div>
           <div class="gc-field">
             <label for="f-hours">Åpningstider</label>
             <input id="f-hours" name="field_opening_hours_text" type="text" value="${escapeHtml(provider.opening_hours_text || "")}" ${locked ? "disabled" : ""}>
+            ${lockNote("opening_hours_text")}
           </div>
           <div class="gc-field">
             <label for="f-products">Produkter (kommaseparert)</label>
             <input id="f-products" name="field_products" type="text" value="${escapeHtml(products.join(", "))}" ${locked ? "disabled" : ""}>
+            ${lockNote("products")}
           </div>
           <div class="gc-field">
             <label for="f-website">Nettside</label>
             <input id="f-website" name="field_hjemmeside" type="url" value="${escapeHtml(provider.hjemmeside || "")}" ${locked ? "disabled" : ""}>
+            ${lockNote("hjemmeside")}
           </div>
           <div class="gc-field gc-toggle-row">
-            <input id="f-booking" name="field_booking_live" type="checkbox" value="1" style="width:auto;min-height:0;" ${provider.booking_live ? "checked" : ""} ${locked ? "disabled" : ""}>
+            <input id="f-booking" name="field_booking_live" type="checkbox" value="1" style="width:auto;min-height:0;" ${provider.booking_live ? "checked" : ""} ${bookingDisabled ? "disabled" : ""}>
             <label for="f-booking" style="margin:0;">Aktiver reservasjoner (booking) for besøkende</label>
           </div>
+          ${bookingBlock ? bookingBlockAlertHtml(bookingBlock) : ""}
           <div class="gc-form-actions">
-            <button type="submit" class="gc-btn gc-btn-primary" ${locked ? "disabled" : ""}>Lagre alle endringer</button>
+            <button type="submit" id="gc-save-btn" class="gc-btn gc-btn-primary" ${nothingEditable ? "disabled" : ""}>Lagre alle endringer</button>
             <a href="/kategori/gardssalg/produsent/${encodeURIComponent(slug)}" class="gc-btn gc-btn-secondary">Se profilen</a>
           </div>
           <div id="gc-save-status" aria-live="polite"></div>
         </form>
+        <form id="gc-release-form" method="post" action="${releaseAction}"></form>
       </div>
+      ${visibilityCardHtml(slug, getOwnedVisibilityStateById(provider.id) ?? "visible")}
       <div class="gc-card">
         <h2>Statistikk</h2>
         <div id="gc-stats" class="gc-stats"><div class="gc-stat"><div class="gc-stat-num">…</div><div class="gc-stat-label">Laster</div></div></div>
@@ -655,15 +733,15 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
           form.addEventListener("submit", function (ev) {
             ev.preventDefault();
             var fd = new FormData(form);
-            var payload = {
+            var payload = ${locked ? "{}" : `{
               about_text: fd.get("field_about_text"),
               visit_text: fd.get("field_visit_text"),
               opening_hours_text: fd.get("field_opening_hours_text"),
               products: String(fd.get("field_products") || "").split(",").map(function (s) { return s.trim(); }).filter(Boolean),
               hjemmeside: fd.get("field_hjemmeside"),
-              booking_live: fd.get("field_booking_live") ? 1 : 0,
-            };
-            var btn = form.querySelector("button[type=submit]");
+            }`};
+            payload.booking_live = fd.get("field_booking_live") ? 1 : 0;
+            var btn = document.getElementById("gc-save-btn");
             var settled = false;
             function showReceipt(success, message) {
               if (statusEl) {
@@ -731,19 +809,125 @@ router.post(
     }
 
     const b = req.body || {};
-    const payload: Record<string, unknown> = {
-      about_text: b.field_about_text,
-      visit_text: b.field_visit_text,
-      opening_hours_text: b.field_opening_hours_text,
-      products: String(b.field_products || "").split(",").map((s: string) => s.trim()).filter(Boolean),
-      hjemmeside: b.field_hjemmeside,
-      booking_live: b.field_booking_live ? 1 : 0,
-    };
+    // A manual-locked row sends only the booking switch (its content fields
+    // are disabled in the form, so they never reach this body anyway).
+    const payload: Record<string, unknown> = provider.content_source === "manual"
+      ? {}
+      : {
+          about_text: b.field_about_text,
+          visit_text: b.field_visit_text,
+          opening_hours_text: b.field_opening_hours_text,
+          products: String(b.field_products || "").split(",").map((s: string) => s.trim()).filter(Boolean),
+          hjemmeside: b.field_hjemmeside,
+        };
+    payload.booking_live = b.field_booking_live ? 1 : 0;
     const outcome = updateClaimedProviderProfile(provider.id, payload);
-    if (!("ok" in outcome) || !outcome.ok) return res.redirect(303, `${base}?status=error`);
+    if (!outcome.ok && outcome.error === "booking_blocked") return res.redirect(303, `${base}?status=booking_blocked`);
+    if (!outcome.ok) return res.redirect(303, `${base}?status=error`);
     return res.redirect(303, `${base}?status=saved`);
   },
 );
+
+// ─────────────────────────────────────────────────────────────────
+// POST /kategori/gardssalg/eier/:providerSlug/release-field — «gi tilbake»
+// (G1 pkt 2, dev-request 2026-10-22-opplevagent-mine-valg-gardssalg). The
+// owner lets Opplevagent update one field again: removes the owner lock and
+// logs it (releaseClaimedProviderFieldLock). Posted by the per-field button
+// in the portal (its own #gc-release-form), so it works with and without JS.
+// ─────────────────────────────────────────────────────────────────
+router.post(
+  "/kategori/gardssalg/eier/:providerSlug/release-field",
+  generalLimiter,
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response) => {
+    const slug = String((req.params as any).providerSlug || "");
+    const provider = getClaimProviderBySlug(slug);
+    const base = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`;
+    if (!provider) return res.status(404).send(notFoundPage());
+
+    const session = sessionFromRequest(req);
+    if (!session.valid || session.providerId !== provider.id) {
+      return res.redirect(303, `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`);
+    }
+    const field = String((req.body || {}).release_field || "");
+    const outcome = releaseClaimedProviderFieldLock(provider.id, field);
+    return res.redirect(303, `${base}?status=${outcome.ok ? "released" : "release_error"}`);
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────
+// Synlighet (G1 pkt 4, dev-request 2026-10-22-opplevagent-mine-valg-gardssalg):
+// tre tilstander — eierens pause (skjult, ingen sperre, eieren kan slå på
+// igjen), «fjern» (skjult + sperret, bare Opplevagent kan oppheve) og
+// kvalitetsskjul (admin). Pause/gjenoppta krever eier-sesjon for raden på
+// hvert kall; selve tilstandsendringen ligger i services/gardssalg-claim.ts.
+// ─────────────────────────────────────────────────────────────────
+function visibilityCardHtml(slug: string, state: OwnedVisibilityState): string {
+  const base = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`;
+  let text: string;
+  let action = "";
+  if (state === "visible") {
+    text = "Profilen din er synlig.";
+    action = `<form method="post" action="${base}/pause"><button type="submit" class="gc-btn gc-btn-secondary">Sett profilen på pause</button></form>` +
+      `<p style="font-size:0.82rem;color:#737373;">Mens profilen er på pause vises den ikke offentlig. Du kan slå den på igjen når som helst.</p>`;
+  } else if (state === "owner_pause") {
+    text = "Profilen din er på pause og vises ikke offentlig.";
+    action = `<form method="post" action="${base}/resume"><button type="submit" class="gc-btn gc-btn-primary">Gjør profilen synlig igjen</button></form>`;
+  } else if (state === "removed") {
+    text = "Profilen er fjernet etter ditt ønske. Den vises ikke offentlig.";
+    action = `<p style="font-size:0.82rem;color:#737373;">Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} hvis du vil ha den tilbake.</p>`;
+  } else {
+    text = "Profilen er skjult av Opplevagent.";
+    action = `<p style="font-size:0.82rem;color:#737373;">Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å høre hvorfor.</p>`;
+  }
+  return `<div class="gc-card" data-visibility-state="${state}"><h2>Synlighet</h2><p>${text}</p>${action}</div>`;
+}
+
+const VISIBILITY_ERROR_MESSAGES: Record<string, string> = {
+  removed: "Profilen er fjernet etter ditt ønske og kan ikke gjøres synlig herfra.",
+  quality_hidden: "Profilen er skjult av Opplevagent og kan ikke gjøres synlig herfra.",
+};
+
+function visibilityJson(res: Response, outcome: OwnerVisibilityOutcome) {
+  if (outcome.ok) return res.json({ success: true, state: outcome.state, changed: outcome.changed });
+  if (outcome.error === "provider_not_found") return res.status(404).json({ success: false, error: outcome.error });
+  if (outcome.error === "not_owner") return res.status(403).json({ success: false, error: "forbidden" });
+  return res.status(409).json({ success: false, error: outcome.error, message: VISIBILITY_ERROR_MESSAGES[outcome.error] });
+}
+
+for (const action of ["pause", "resume"] as const) {
+  const run = (providerId: string) => (action === "pause" ? pauseOwnedProvider(providerId) : resumeOwnedProvider(providerId));
+
+  // JSON: 401 no session / 403 other producer / 409 refused (norsk melding).
+  router.post(
+    `/api/opplevelser/gardssalg-claim/:providerId/${action}`,
+    generalLimiter,
+    (req: Request, res: Response) => {
+    const { providerId } = req.params as any;
+    const session = sessionFromRequest(req);
+    if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
+    if (session.providerId !== providerId) return res.status(403).json({ success: false, error: "forbidden" });
+    return visibilityJson(res, run(providerId));
+    },
+  );
+
+  // No-JS form on the portal.
+  router.post(
+    `/kategori/gardssalg/eier/:providerSlug/${action}`,
+    generalLimiter,
+    (req: Request, res: Response) => {
+    const slug = String((req.params as any).providerSlug || "");
+    const provider = getClaimProviderBySlug(slug);
+    const base = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`;
+    if (!provider) return res.status(404).send(notFoundPage());
+    const session = sessionFromRequest(req);
+    if (!session.valid || session.providerId !== provider.id) {
+      return res.redirect(303, `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`);
+    }
+    const outcome = run(provider.id);
+    return res.redirect(303, `${base}?status=${outcome.ok ? (action === "pause" ? "paused" : "resumed") : "visibility_error"}`);
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────
 // POST /kategori/gardssalg/eier/:providerSlug/logout — real revoke (see
@@ -773,11 +957,24 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/profile", generalLimite
   let products: string[] = [];
   try { const p = JSON.parse(provider.products || "[]"); if (Array.isArray(p)) products = p; } catch { /* ignore */ }
   const locked = provider.content_source === "manual";
+  const bookingBlock = portalBookingBlock(provider);
 
   return res.json({
     success: true,
     provider: { id: provider.id, navn: provider.navn, slug: provider.slug },
     editable: !locked,
+    // G1 item 3: the booking switch has its own state, independent of the
+    // content lock. stopped_by_opplevagent = admin brake (owner cannot
+    // switch it back on); reason = the operator's note, if any.
+    booking: {
+      can_enable: provider.booking_live === 1 || !bookingBlock,
+      blocked_reason: bookingBlock ? bookingBlock.reason : null,
+      stopped_by_opplevagent: bookingBlock?.reason === "admin_brake",
+      stop_reason: bookingBlock?.reason === "admin_brake" ? bookingBlock.note : null,
+      message: bookingBlock ? bookingBlock.message : null,
+    },
+    // G1 pkt 2: fields the owner has locked (and can give back).
+    owner_locked_fields: CLAIM_RELEASABLE_FIELDS.filter((f) => Object.prototype.hasOwnProperty.call(getClaimOwnerLocks(provider), f)),
     fields: {
       about_text: provider.about_text,
       visit_text: provider.visit_text,
@@ -799,8 +996,36 @@ router.post("/api/opplevelser/gardssalg-claim/:providerId/update-profile", gener
   for (const f of CLAIM_EDITABLE_FIELDS) if (f in (req.body || {})) body[f] = (req.body as any)[f];
 
   const outcome = updateClaimedProviderProfile(providerId, body);
-  if ("error" in outcome) return res.status(404).json({ success: false, error: outcome.error });
+  if (!outcome.ok && outcome.error === "booking_blocked") {
+    // 409 with the Norwegian reason; nothing was written (G1 item 3).
+    return res.status(409).json({
+      success: false,
+      error: "booking_blocked",
+      reason: outcome.block.reason,
+      message: outcome.block.message,
+      stop_reason: outcome.block.note,
+    });
+  }
+  if (!outcome.ok) return res.status(404).json({ success: false, error: outcome.error });
   return res.json({ success: true, updated_fields: outcome.updatedFields, skipped_fields: outcome.skippedFields });
+});
+
+// G1 pkt 2: «gi tilbake» as JSON — {field} -> 200 {released} | 400 unknown_field
+// | 409 locked_by_manual / locked_by_admin (norsk melding) | 404.
+router.post("/api/opplevelser/gardssalg-claim/:providerId/release-field", generalLimiter, express.json(), (req: Request, res: Response) => {
+  const { providerId } = req.params as any;
+  const session = sessionFromRequest(req);
+  if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
+  if (session.providerId !== providerId) return res.status(403).json({ success: false, error: "forbidden" });
+
+  const outcome = releaseClaimedProviderFieldLock(providerId, String((req.body || {}).field || ""));
+  if (outcome.ok) return res.json({ success: true, field: outcome.field, released: outcome.released });
+  if (outcome.error === "provider_not_found") return res.status(404).json({ success: false, error: outcome.error });
+  if (outcome.error === "unknown_field") return res.status(400).json({ success: false, error: outcome.error });
+  const message = outcome.error === "locked_by_admin"
+    ? "Feltet er låst av Opplevagent-support og kan ikke gis tilbake herfra."
+    : "Profilen er låst av Opplevagent-support.";
+  return res.status(409).json({ success: false, error: outcome.error, message });
 });
 
 router.get("/api/opplevelser/gardssalg-claim/:providerId/stats", generalLimiter, (req: Request, res: Response) => {
