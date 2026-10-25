@@ -29,7 +29,7 @@ import {
   shouldRecordPageView,
 } from "./page-view-definition";
 import { computeTrafficReport, TRAFFIC_GROUPS, VISIT_GAP_MS } from "./traffic-report";
-import { computeUmbrellaTraffic } from "./admin-stats-compute";
+import { computeUmbrellaTraffic, summaryFromReport } from "./admin-stats-compute";
 
 export interface TestSummary {
   passed: number;
@@ -165,6 +165,14 @@ export async function runTrafficReportTests(opts: { log?: boolean } = {}): Promi
       "b5: scanners: the probing browser (its probe is not a view) and the session classified 'scanner' at write time, legacy row included", r.classes.scanner);
     ok(eq(r.classes.scraper, { views: 70, visitors: 1, visits: 1 }), "b6: 70 pages in 5 minutes from a browser is a scraper, not a person", r.classes.scraper);
     ok(eq(r.aiVendors, { chatgpt: 5, claude: 1, other: 0 }), "b7: AI views by vendor: ChatGPT-User 2 + GPTBot 3, ClaudeBot 1", r.aiVendors);
+    ok(eq(r.aiAgents.chatgpt, { user: 2, search: 0, training: 3 }) && eq(r.aiAgents.claude, { user: 0, search: 0, training: 1 }),
+      "b7b: aiAgents splits vendor by purpose: ChatGPT-User = user 2, GPTBot = training 3, ClaudeBot = training 1", r.aiAgents);
+    ok(r.aiAgents.chatgpt.user + r.aiAgents.chatgpt.search + r.aiAgents.chatgpt.training === r.aiVendors.chatgpt
+       && r.aiAgents.claude.user + r.aiAgents.claude.search + r.aiAgents.claude.training === r.aiVendors.claude
+       && (["perplexity", "google", "other"] as const).reduce((a, k) => a + r.aiAgents[k].user + r.aiAgents[k].search + r.aiAgents[k].training, 0) === r.aiVendors.other,
+      "b7c: the sum of aiAgents equals aiVendors (perplexity + google + other = aiVendors.other)", { aiAgents: r.aiAgents, aiVendors: r.aiVendors });
+    const summ = summaryFromReport(r, { totalQueries: 0, topSearchTerms: [], byChannel: {}, botQueries: 0, ownerQueries: 0 } as any);
+    ok(eq(summ.aiAgents, r.aiAgents) && eq(summ.agentTraffic, r.aiVendors), "b7d: the summary carries aiAgents next to agentTraffic", summ.aiAgents);
     ok(eq(r.owner, { views: 3, cookieViews: 1, scriptViews: 1, unknownViews: 1 }), "b8: owner traffic split into cookie, script and legacy-unknown, outside every total", r.owner);
     ok(r.human.devices.desktop.visitors === 2 && r.human.devices.mobile.visitors === 1, "b9: human devices from the session's device bucket", r.human.devices);
     const src = Object.fromEntries(r.human.entrySources.map((e) => [e.key, e.visits]));

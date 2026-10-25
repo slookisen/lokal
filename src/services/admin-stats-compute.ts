@@ -33,7 +33,7 @@ import { humanAgentViewSql } from "../database/analytics-sql";
 import { notPubliclyListableAgentIdsSql } from "./agent-visibility";
 import { computeTrafficReport, groupOf, type TrafficReport, type SessionRow } from "./traffic-report";
 import { isPageViewStatus } from "./page-view-definition";
-import { storedClientClass } from "./traffic-classifier";
+import { emptyAiAgents, storedClientClass, type AiAgents } from "./traffic-classifier";
 import { computeAiLookupBreakdown, computeQueryStats, notBotSearchSql, type QueryStats } from "./search-stats-compute";
 import { computeHistoryView } from "./traffic-history-compute";
 import { slugify } from "../utils/slug";
@@ -95,6 +95,8 @@ export interface AdminSummary {
   trafficBySource: Record<string, number>;
   /** Page views by AI vendor over AI search + AI crawlers. */
   agentTraffic: { chatgpt: number; claude: number; other: number };
+  /** agentTraffic split by vendor × purpose (AI_AGENT_REGISTRY). */
+  aiAgents: AiAgents;
   ownerStats: { pageViews: number; queries: number; cookieViews?: number; scriptViews?: number; unknownViews?: number };
   // ── dev-request 2026-10-13-statistikk-riktig-for-investorer, S1 ──
   /** Visits (30 min inactivity rule), every client class. */
@@ -126,6 +128,7 @@ export function emptyAdminSummary(): AdminSummary {
     topSearchTerms: [],
     trafficBySource: {},
     agentTraffic: { chatgpt: 0, claude: 0, other: 0 },
+    aiAgents: emptyAiAgents(),
     ownerStats: { pageViews: 0, queries: 0 },
   };
 }
@@ -173,6 +176,7 @@ export function summaryFromReport(report: TrafficReport, q: QueryStats): AdminSu
     botSearches: q.botQueries,
     trafficBySource,
     agentTraffic: { ...report.aiVendors },
+    aiAgents: report.aiAgents,
     ownerStats: {
       pageViews: report.owner.views,
       queries: q.ownerQueries,

@@ -36,13 +36,17 @@
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
 import {
+  addAiAgentViews,
+  AI_AGENT_TOKEN_ALTERNATION,
   aiVendorBucket,
+  emptyAiAgents,
   isVelocityScraper,
   SCANNER_PATH_PATTERNS,
   SCRAPER_PRODUSENT_PAGES_PER_HOUR,
   SCRAPER_UNIQUE_PAGES_PER_10_MIN,
   storedClientClass,
   uaFromSessionId,
+  type AiAgents,
   type ClientClass,
   type SessionCategory,
 } from "./traffic-classifier";
@@ -107,6 +111,8 @@ export interface TrafficReport {
   classes: Record<SessionCategory, Totals>;
   /** Page views by AI vendor, over ai_search + ai_crawler. */
   aiVendors: { chatgpt: number; claude: number; other: number };
+  /** The same AI page views split by vendor × purpose (AI_AGENT_REGISTRY). chatgpt/claude sum to aiVendors.chatgpt/claude; perplexity + google + other sum to aiVendors.other. */
+  aiAgents: AiAgents;
   /**
    * Owner traffic, excluded from everything above: the _rfb_owner cookie
    * (cookieViews), our own scripts (scriptViews), and older rows that cannot
@@ -212,9 +218,12 @@ export function deviceForSession(sessionId: string): Device {
   return "unknown";
 }
 
+/** AI agents come from AI_AGENT_REGISTRY (one table); the rest are non-AI bots. */
+const KNOWN_BOT_NAME_RE = new RegExp(`(${AI_AGENT_TOKEN_ALTERNATION}|MJ12bot|serpstatbot|Googlebot|DuckDuckBot|Applebot|Chiark|Dataprovider|BingPreview|bingbot|facebookexternalhit|facebookexternal|Twitterbot|YandexBot|PetalBot|SemrushBot|AhrefsBot|DotBot|BLEXBot|MojeekBot|SeekportBot|LinkedInBot|Slackbot|TelegramBot|WhatsApp|ImagesiftBot|Diffbot|Baiduspider|DataForSeoBot|AwarioBot)`, "i");
+
 /** Readable name of a bot UA ("Googlebot", "facebookexternalhit", …). */
 export function botNameForUA(ua: string): string {
-  const known = ua.match(/(ChatGPT-User|Claude-User|Claude-Web|Perplexity-User|DuckAssistBot|OAI-SearchBot|Claude-SearchBot|ClaudeBot|GPTBot|PerplexityBot|ExaSearchBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|Google-Extended|DuckDuckBot|Applebot-Extended|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|bingbot|facebookexternalhit|facebookexternal|Twitterbot|YandexBot|Bytespider|Amazonbot|PetalBot|SemrushBot|AhrefsBot|DotBot|BLEXBot|MojeekBot|SeekportBot|CCBot|meta-externalagent|anthropic-ai|LinkedInBot|Slackbot|TelegramBot|WhatsApp|ImagesiftBot|Diffbot|Baiduspider|DataForSeoBot|AwarioBot|MCPCensus|rokmcp-collector|WellknownBot|Reflectionbot|AgentFitBot|AgenstryBot|cohere-ai|YouBot)/i);
+  const known = ua.match(KNOWN_BOT_NAME_RE);
   if (known) return known[1];
   const generic = ua.match(/([A-Za-z][A-Za-z0-9_-]*(?:Bot|Crawler|Spider|bot|crawler|spider))/);
   if (generic) return generic[1];
@@ -520,6 +529,7 @@ export function computeTrafficReport(
   const groups = Object.fromEntries(TRAFFIC_GROUPS.map((g) => [g, emptyTotals()])) as Record<TrafficGroup, Totals>;
   const totals = emptyTotals();
   const aiVendors = { chatgpt: 0, claude: 0, other: 0 };
+  const aiAgents = emptyAiAgents();
   const devices: Record<Device, Totals> = { mobile: emptyTotals(), tablet: emptyTotals(), desktop: emptyTotals(), unknown: emptyTotals() };
 
   for (let s = 0; s < sessionCount; s++) {
@@ -530,7 +540,10 @@ export function computeTrafficReport(
       t.visitors += 1;
       t.visits += sVisits[s];
     }
-    if (g === "ai_search" || g === "ai_crawler") aiVendors[aiVendorBucket(ua[s])] += sViews[s];
+    if (g === "ai_search" || g === "ai_crawler") {
+      aiVendors[aiVendorBucket(ua[s])] += sViews[s];
+      addAiAgentViews(aiAgents, ua[s], g, sViews[s]);
+    }
     if (c === "human") {
       const d = devices[deviceForSession(sessions.values[s])];
       d.views += sViews[s];
@@ -715,6 +728,7 @@ export function computeTrafficReport(
     groups,
     classes,
     aiVendors,
+    aiAgents,
     owner,
     human: {
       devices,
