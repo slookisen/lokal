@@ -18,6 +18,7 @@ import {
   verifyUnsubscribeToken,
   suppressEmail,
   isUnsubscribed,
+  type UnsubscribeVertical,
 } from "../services/avmeld-service";
 
 const router = Router();
@@ -44,6 +45,13 @@ button{min-height:44px;padding:10px 20px;background:#2D5016;color:#fff;border:0;
 </head><body><main>${body}</main></body></html>`;
 }
 
+// Wording per platform: an Opplevagent link must never lead to a page that names Rett fra Bonden.
+function brandCopy(v: UnsubscribeVertical): { brand: string; contact: string } {
+  return v === "experiences"
+    ? { brand: "Opplevagent", contact: "kontakt@opplevagent.no" }
+    : { brand: "Rett fra Bonden", contact: "kontakt@rettfrabonden.com" };
+}
+
 function noStore(res: Response): void {
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -54,11 +62,14 @@ router.get("/avmeld/:token", avmeldLimiter, (req: Request, res: Response) => {
   noStore(res);
   const parsed = verifyUnsubscribeToken(String(req.params.token || ""));
   if (!parsed) {
-    return res.status(400).send(page("Ugyldig lenke", `<h1>Ugyldig lenke</h1><p>Avmeldingslenken er ugyldig. Skriv til <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>, så hjelper vi deg.</p>`));
+    // Unknown token → no platform known; the host tells which contact address to show.
+    const c = brandCopy(/(^|\.)opplevagent\.no$/.test(req.hostname || "") ? "experiences" : "rfb").contact;
+    return res.status(400).send(page("Ugyldig lenke", `<h1>Ugyldig lenke</h1><p>Avmeldingslenken er ugyldig. Skriv til <a href="mailto:${c}">${c}</a>, så hjelper vi deg.</p>`));
   }
   // Read-only: shows the confirmation form, writes nothing.
+  const { brand } = brandCopy(parsed.vertical);
   return res.status(200).send(page("Avmelding", `<h1>Vil du ikke høre fra oss?</h1>
-<p>Bekreft, så sender vi ikke flere e-poster om Rett fra Bonden til denne adressen. Profilen din blir ikke slettet.</p>
+<p>Bekreft, så sender vi ikke flere e-poster om ${brand} til denne adressen. Profilen din blir ikke slettet.</p>
 <form method="post" action=""><button type="submit">Bekreft avmelding</button></form>`));
 });
 
@@ -73,7 +84,7 @@ router.post("/avmeld/:token", avmeldLimiter, express.urlencoded({ extended: fals
     console.error("[avmeld] suppress failed:", err instanceof Error ? err.message : String(err));
     return res.status(500).send(page("Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`));
   }
-  return res.status(200).send(page("Avmeldt", `<h1>Du er avmeldt</h1><p>Vi sender ikke flere e-poster om Rett fra Bonden til denne adressen. Profilen din er ikke slettet.</p>`));
+  return res.status(200).send(page("Avmeldt", `<h1>Du er avmeldt</h1><p>Vi sender ikke flere e-poster om ${brandCopy(parsed.vertical).brand} til denne adressen. Profilen din er ikke slettet.</p>`));
 });
 
 export default router;

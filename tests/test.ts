@@ -33017,6 +33017,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcr.failures) failures.push("opplevelser-gardssalg-claim-revoke: " + f);
     console.log(`  opplevelser-gardssalg-claim-revoke: ${gcr.passed} passed, ${gcr.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+    // slice 1: "Bekreftet av eier" on an e-mail confirmation — admin lever
+    // (sender must pass the claim flow's address rule for that producer),
+    // badge display with the «Ta over profilen» link kept, field locks, and
+    // withdrawal on «fjern». Same in-memory-DB pattern, same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-email-confirm: e-mail confirmation of the owner badge ──");
+    const { runOpplevelserGardssalgOwnerEmailConfirmTests } = require("../src/routes/opplevelser-gardssalg-owner-email-confirm.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-email-confirm.test");
+    const goec = await runOpplevelserGardssalgOwnerEmailConfirmTests({ log: false });
+    passed += goec.passed;
+    failed += goec.failed;
+    for (const f of goec.failures) failures.push("opplevelser-gardssalg-owner-email-confirm: " + f);
+    console.log(`  opplevelser-gardssalg-owner-email-confirm: ${goec.passed} passed, ${goec.failed} failed`);
+
     // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8: DELETE
     // /admin/rfb-seed skips owned rows, merged_into rows are not public.
     console.log("\n── opplevelser-g1-opprydding: rfb-seed rollback + merged_into visibility ──");
@@ -33310,6 +33324,17 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gaa.failed;
     for (const f of gaa.failures) failures.push("opplevelser-gardssalg-autosvar-apply: " + f);
     console.log(`  opplevelser-gardssalg-autosvar-apply: ${gaa.passed} passed, ${gaa.failed} failed`);
+
+    // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 skive 5 punkt 1:
+    // every automated writer respects the owner lock on an owned row.
+    console.log("\n── opplevelser-gardssalg-owner-lock-everywhere: owner lock respected by all automated writers ──");
+    const { runOpplevelserGardssalgOwnerLockEverywhereTests } = require("../src/routes/opplevelser-gardssalg-owner-lock-everywhere.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-lock-everywhere.test");
+    const golw = await runOpplevelserGardssalgOwnerLockEverywhereTests({ log: false });
+    passed += golw.passed;
+    failed += golw.failed;
+    for (const f of golw.failures) failures.push("opplevelser-gardssalg-owner-lock-everywhere: " + f);
+    console.log(`  opplevelser-gardssalg-owner-lock-everywhere: ${golw.passed} passed, ${golw.failed} failed`);
 
     // Slice 2, Steg C: producer_type is currently set ONLY manually or via the
     // 4-entry GARDSSALG_NACE_PRODUCER_TYPE map keyed off naeringskode. Legacy
@@ -49266,6 +49291,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 point 6 / AC 6: owned
+// gårdssalg profiles excluded from cold outreach, signed List-Unsubscribe(+Post) on the
+// gårdssalg mail, /avmeld GET read-only + POST suppression. Swaps the getDb() singleton,
+// module cache and env flags (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 6: eide ute av utsending + avmeld ──");
+  try {
+    const { runGardssalgOutreachEideAvmeldG1s7Tests } = require("../src/routes/gardssalg-outreach-eide-avmeld-g1s7.test") as
+      typeof import("../src/routes/gardssalg-outreach-eide-avmeld-g1s7.test");
+    const r = await runGardssalgOutreachEideAvmeldG1s7Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-outreach-eide-avmeld-g1s7: " + f);
+    console.log(`  gardssalg-outreach-eide-avmeld-g1s7: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-eide-avmeld-g1s7: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // 2026-10-04 view-stats honesty: producer view statistics count humans, not
 // bots or city pages — /:city no longer books a profile view, trackAgentView
 // stamps is_owner + traffic_category (+ Referer-derived view_source),
@@ -49940,5 +49985,23 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-claim-lock-changed-fields: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4: eid profil —
+// eierens pause / «fjern» / kvalitetsskjul, og admin-spaken på eide rader.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 4: eid profil pause/fjern/kvalitetsskjul ──");
+  try {
+    const { runGardssalgClaimOwnerVisibilityTests } = require("../src/routes/gardssalg-claim-owner-visibility.test") as
+      typeof import("../src/routes/gardssalg-claim-owner-visibility.test");
+    const r = await runGardssalgClaimOwnerVisibilityTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-claim-owner-visibility: " + f);
+    console.log(`  gardssalg-claim-owner-visibility: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-owner-visibility: unexpected error: " + String(err?.message || err));
   }
 });
