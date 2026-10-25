@@ -37,7 +37,7 @@ export function outreachUnsubscribeEnabled(): boolean {
 }
 
 function serverSecret(): string {
-  return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+  return process.env.UNSUBSCRIBE_TOKEN_SECRET || process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
 
 function b64url(buf: Buffer): string {
