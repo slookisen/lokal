@@ -12,17 +12,17 @@ Submission pack for listing the remote MCP server `https://finn-tannlege.com/mcp
 
 ## Prerequisites before submission
 
-**Ready to submit: no** (3 open).
+**Ready to submit: yes.** Every prerequisite is done.
 
 | Prerequisite | Status | Detail | Owner | Source |
 |---|---|---|---|---|
 | Every tool has a title and readOnlyHint/destructiveHint | **DONE** | All 5 tools. | — | code |
 | Tool descriptions describe and never instruct Claude | **DONE** | No directive wording in any tool description. | — | code |
 | Privacy policy page | **DONE** | https://finn-tannlege.com/personvern | — | code |
-| Terms page | **OPEN** | None yet (`termsUrl` is null in src/config/brand-entities.ts). The portal asks only for a privacy URL; a public terms page is still required before submission. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S5; Daniel approves the text) | code |
-| Public documentation page | **OPEN** | None yet (`docsUrl` is null in src/config/brand-entities.ts). The checklist requires public documentation by the publish date. | G3-S4 of this dev-request (`/guide-tannlege-ai`) | code |
-| Square 512×512 PNG icon to upload | **OPEN** | None yet: no icon file in `dental-connectors-prep/assets/`, and `logoPng` is null in src/config/brand-entities.ts. | 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S4) | code |
-| MCP server instructions and serverInfo title, description and websiteUrl | **DONE** | `new McpServer(...)` in `src/routes/dental-mcp.ts` sets serverInfo `name`, `version`, `title`, `description`, `websiteUrl` and instructions. | — | code |
+| Terms page | **DONE** | https://finn-tannlege.com/vilkar | — | code |
+| Public documentation page | **DONE** | https://finn-tannlege.com/guide-tannlege-ai | — | code |
+| Square 512×512 PNG icon to upload | **DONE** | `dental-connectors-prep/assets/finn-tannlege-square-512.png` (512×512, md5 `d699125e1528fb9c818550c1052b0bb3`). | — | code |
+| MCP server instructions and serverInfo title, description and websiteUrl | **DONE** | `new McpServer(...)` in `src/routes/dental-mcp.ts` sets serverInfo `name`, `version`, `title`, `description`, `websiteUrl`, `icons` and instructions. | — | code |
 | Natural-language search in tannlege_search (town, municipality, specialty, Helfo) | **DONE** | lokal#1086, merged and live: the request goes in `query` as written, and `tolkning` shows how it was read. The example prompts must return clinics against production (G3-S4). | 2026-10-16-tannlege-sok-naturlig-sprak | recorded 2026-10-17 |
 | Per-session rate limit on /mcp | **DONE** | lokal#1098: one quota per MCP session, so users behind one shared AI-platform IP do not share a bucket. | 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt | recorded 2026-10-17 |
 | Name decision for Finn-tannlege | **DONE** | Daniel's decision 4=A (2026-10-17, A2A daniel-responses/2026-10-17-live-del-a-gjort-og-beslutninger-1-11.md): the name and the slug stay, and every text says the service is not affiliated with FINN.no (G3-S8). The listing description ends with that sentence. No paid PR with the name before the legal check (G3-J). | Daniel | recorded 2026-10-17 |
@@ -31,6 +31,12 @@ The directory reviews against its connector checklist: https://claude.com/docs/c
 
 Rows with source "code" are computed when the pack is generated. Rows with source "recorded" are kept by hand in `scripts/gen-connector-packs.ts` (`PACKS`), and no test checks them against the code or GitHub: the pull requests they cite (lokal#1086 and lokal#1098) can be merged or closed while the row stays as it is. Update the row there and regenerate when its status changes.
 
+## What the portal fills
+
+Checked against the portal on 2026-10-19 (A2A daniel-responses/2026-10-19-live-svar-token-rotert-og-prompt-11.md). It has these fields: Name, Slug, One-liner, Description, Categories, Icon, Documentation, Support, Privacy policy, Use cases, Prerequisites, Read/write, Company and Test setup instructions. Use cases take at most 3 rows of at most 100 characters, each with an example prompt of at most 500 characters.
+
+It has no field for terms, known caveats, an explanation of authentication, data-handling text, a test account, language or price. The pack's texts for those are marked «Use only if the portal asks»: keep them for a reviewer who asks.
+
 ## Contents
 
 | File | What it is |
@@ -38,6 +44,7 @@ Rows with source "code" are computed when the pack is generated. Rows with sourc
 | `claude-directory/portal-answers.md` | Every portal step, answered. |
 | `claude-directory/listing.md` | The Listing step: name, one-liner, description, categories, links, icon and slug. |
 | `claude-directory/test-instructions.md` | The Test & launch step: reviewer instructions and prompts. |
+| `assets/finn-tannlege-square-512.png` | The icon to upload: the «Søket» mark (a tooth in a magnifier, white on teal), square, full-bleed, no rounded corners. The same file as the site's /favicon-512.png. |
 
 ## How this pack is made
 

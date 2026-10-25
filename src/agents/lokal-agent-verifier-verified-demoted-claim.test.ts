@@ -172,6 +172,24 @@ export function runLokalAgentVerifierVerifiedDemotedClaimTests(
     assertEq(noOriginClaim?.value, 0,
       `vd-06: value is 0 (not omitted) when no result started as verified (got ${noOriginClaim?.value})`);
 
+    // ── C5: newly_verified vs reverified split; agents_verified unchanged. ──
+    const mixed: VerifierResult[] = [
+      ...["n1", "n2"].map((id) =>
+        makeResult({ agent_id: id, prior_verification_status: "pending_verify", new_verification_status: "verified" })),
+      ...["r1", "r2", "r3"].map((id) =>
+        makeResult({ agent_id: id, prior_verification_status: "verified", new_verification_status: "verified" })),
+      makeResult({ agent_id: "p1", prior_verification_status: "pending_verify", new_verification_status: "pending_verify" }),
+    ];
+    const mixedEnvelope = buildRunEnvelope({
+      run_id: "run-c5",
+      started_at: "2026-10-17T00:00:00.000Z",
+      finished_at: "2026-10-17T00:01:00.000Z",
+      results: mixed,
+    });
+    assertEq(findClaim(mixedEnvelope, "agents_newly_verified")?.value, 2, "c5-e1: agents_newly_verified = 2");
+    assertEq(findClaim(mixedEnvelope, "agents_reverified")?.value, 3, "c5-e2: agents_reverified = 3");
+    assertEq(findClaim(mixedEnvelope, "agents_verified")?.value, 5, "c5-e3: agents_verified stays 5");
+
     return { passed, failed, failures };
   })();
 }

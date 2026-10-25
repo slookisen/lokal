@@ -63,6 +63,13 @@
  *       person_enk/lab_leverandor/holding (unchanged behavior).
  *   (i) flag="1" -> /discover excludes those 3 non-clinic rows but still
  *       returns the catalog_class NULL/klinikk/offentlig_klinikk/ukjent rows.
+ *
+ * A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+ *   (j) GET /discover gives verification_status as the badge says it
+ *       ('pending_verify' for a stored 'verified' without the verifier's
+ *       basis), its ?verification_status filter and `total` say the same,
+ *       and the results have the same keys either way; GET /agents/:id, with
+ *       and without X-Admin-Key, keeps the stored status and gets no new key.
  */
 
 export interface TestSummary {
@@ -83,6 +90,7 @@ function callRoute(
     path: string;
     headers?: Record<string, string>;
     body?: any;
+    query?: Record<string, string>;
   },
 ): Promise<RouteResult> {
   return new Promise((resolve) => {
@@ -92,7 +100,7 @@ function callRoute(
       originalUrl: opts.path,
       path: opts.path,
       params: {},
-      query: {},
+      query: opts.query || {},
       headers: opts.headers || {},
       body: opts.body,
       get() {
@@ -103,6 +111,12 @@ function callRoute(
       statusCode: 200,
       status(code: number) {
         this.statusCode = code;
+        return this;
+      },
+      set() {
+        return this;
+      },
+      vary() {
         return this;
       },
       json(payload: any) {
@@ -518,15 +532,15 @@ export function runDentalTests(
         );
       }
 
-      // ── (h) GET /discover, flag unset -> unchanged (all 7 seeded rows) ──
+      // ── (h) GET /discover, flag unset -> non-clinic rows already excluded (S7: the public store, no exceptions) ──
       {
         delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
         const resp = await callRoute(dentalRouter, { method: "GET", path: "/discover?limit=100", headers: {} });
         assertEq(resp.status, 200, "h1: GET /discover -> 200");
         const navnSet = new Set((resp.body?.results ?? []).map((r: any) => r.navn));
-        assertTrue(navnSet.has("KARI DISCOVER"), "h2: flag unset -- /discover includes the person_enk row (unchanged behavior)");
-        assertTrue(navnSet.has("Discover Dental Lab AS"), "h3: flag unset -- /discover includes the lab_leverandor row");
-        assertTrue(navnSet.has("Discover Holding AS"), "h4: flag unset -- /discover includes the holding row");
+        assertTrue(!navnSet.has("KARI DISCOVER"), "h2: flag unset -- /discover excludes the person_enk row (S7: public set, no flag needed)");
+        assertTrue(!navnSet.has("Discover Dental Lab AS"), "h3: flag unset -- /discover excludes the lab_leverandor row");
+        assertTrue(!navnSet.has("Discover Holding AS"), "h4: flag unset -- /discover excludes the holding row");
         assertTrue(navnSet.has("Discover Klinikk AS"), "h5: flag unset -- /discover includes the klinikk row");
       }
 
@@ -544,6 +558,33 @@ export function runDentalTests(
         assertTrue(navnSet.has("Discover Ukjent AS"), "i7: flag=1 -- /discover still includes the explicit ukjent row");
         assertTrue(navnSet.has("Discover Uklassifisert AS"), "i8: flag=1 -- /discover still includes the catalog_class NULL row");
         delete process.env.DENTAL_PUBLIC_CATALOG_CLASS_FILTER;
+      }
+
+      // ── (j) F2-S8: «verified» on /discover is the badge; REST keeps the stored status ──
+      {
+        const insert = dentalDb.prepare(
+          "INSERT INTO dental_agents (id, navn, catalog_class, verification_status, brreg_status, website_ownership, om_oss, payment_options, social_media)" +
+          " VALUES (@id, @navn, 'klinikk', 'verified', @brreg, @ownership, @om, @pay, @social)"
+        );
+        insert.run({ id: "verified-basis", navn: "Grunnlag Tann AS", brreg: "active", ownership: "verified", om: "Om klinikken.", pay: '["kort"]', social: '{"facebook":"https://example.test"}' });
+        insert.run({ id: "verified-nobasis", navn: "Uten Grunnlag Tann AS", brreg: null, ownership: null, om: "Om klinikken.", pay: null, social: null });
+        const discover = async (query: Record<string, string>) => (await callRoute(dentalRouter, { method: "GET", path: "/discover", headers: {}, query })).body;
+        const all = await discover({ limit: "100" });
+        const byId = (id: string) => (all?.results ?? []).find((r: any) => r.id === id);
+        assertEq([byId("verified-basis")?.verification_status, byId("verified-nobasis")?.verification_status], ["verified", "pending_verify"],
+          "j1: /discover: 'verified' with the verifier's basis, 'pending_verify' for a stored 'verified' without one");
+        assertEq([byId("verified-basis")?.badges.includes("Verifisert"), byId("verified-nobasis")?.badges.includes("Verifisert")], [true, false], "j2: … as the badges say");
+        assertEq(Object.keys(byId("verified-nobasis") ?? {}), Object.keys(byId("verified-basis") ?? {}), "j3: … with the same keys either way");
+        const verified = await discover({ verification_status: "verified", limit: "100" });
+        assertEq([verified?.total, (verified?.results ?? []).map((r: any) => r.id)], [1, ["verified-basis"]], "j4: ?verification_status=verified: total and results are the clinics with the badge");
+        const pending = await discover({ verification_status: "pending_verify", limit: "100" });
+        assertTrue((pending?.results ?? []).some((r: any) => r.id === "verified-nobasis") &&
+          (pending?.results ?? []).every((r: any) => r.verification_status === "pending_verify"), "j5: ?verification_status=pending_verify lists it too, and every result says 'pending_verify'");
+        for (const [label, headers] of [["public", {}], ["admin", { "x-admin-key": testKey }]] as const) {
+          const agent = (await callRoute(dentalRouter, { method: "GET", path: "/agents/verified-nobasis", headers })).body?.agent ?? {};
+          assertEq([agent.verification_status, ["brreg_status", "website_ownership", "rich_field_count"].filter((k) => k in agent)], ["verified", []],
+            `j6 ${label}: GET /agents/:id keeps the stored status (F2-S7 decides it) and gets none of the claim's side values`);
+        }
       }
     } catch (err: any) {
       failed++;

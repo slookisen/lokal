@@ -49,6 +49,7 @@
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
 import { outsideNorwayPlace } from "../services/outside-norway";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -117,6 +118,10 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
 } from "../services/booking-store";
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
+// source for the booking note (discover_gardssalg) and the "not taking
+// requests now" line (book_gardssalg) for owned profiles that are off.
+import { gardssalgBookingStatus, gardssalgNotTakingRequestsText } from "../services/gardssalg-booking-gate";
 // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
@@ -145,6 +150,8 @@ import { conversationService, buildRequestMeta, type RequestMeta } from "../serv
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { capName } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
 // dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
 // (S1, moved from this file) and the free-text `query` interpreter (S2).
 import {
@@ -203,7 +210,7 @@ export function buildExperienceVisibilityFields(e: {
           name: cleanStr(p.navn),
           org_nr: cleanStr(p.org_nr),
           website: cleanHttpUrl(p.hjemmeside),
-          phone: cleanStr(p.telefon),
+          phone: isDisplayablePhone(cleanStr(p.telefon)) ? cleanStr(p.telefon) : null,
         };
       }
     } catch { /* provider lookup is best-effort; the experience is still returned */ }
@@ -624,6 +631,22 @@ function registerWidgetResource(
   );
 }
 
+/**
+ * The whole text of a tool result when the tool fails inside. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
+ * client («Sokefeil: …», «Feil: …», «Bookingfeil: …»), SQLite's for one. The
+ * wording is Rett fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts), from
+ * the same template (utils/internal-error.ts). A database that is not open
+ * still answers that no data is available.
+ */
+export const EXPERIENCES_MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Opplevagent");
+
+/** A failed tool's isError result with EXPERIENCES_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
+function toolInternalError(tool: string, err: unknown) {
+  return mcpToolInternalErrorResult("experiences-mcp", EXPERIENCES_MCP_INTERNAL_ERROR_TEXT, tool, err);
+}
+
 export function registerExperienceTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -915,7 +938,7 @@ export function registerExperienceTools(
           description: e.description
             ? e.description.slice(0, 300) + (e.description.length > 300 ? "…" : "")
             : null,
-          booking_url: e.booking_url ?? null,
+          booking_url: cleanHttpUrl(e.booking_url),
           booking_type: e.booking_type ?? null,
           ...buildExperienceVisibilityFields(e),
           tags: e.tags ?? [],
@@ -950,10 +973,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_experiences", err);
       }
     }
   );
@@ -1011,10 +1031,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen kategorier tilgjengelig for oyeblikket. / No category data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("list_experience_categories", err);
       }
     }
   );
@@ -1119,7 +1136,7 @@ export function registerExperienceTools(
           price_unit: experience.price_unit ?? null,
           languages: experience.languages ?? [],
           accessibility: experience.accessibility ?? [],
-          booking_url: experience.booking_url ?? null,
+          booking_url: cleanHttpUrl(experience.booking_url),
           booking_type: experience.booking_type ?? null,
           ...buildExperienceVisibilityFields(experience),
           meeting_point: experience.meeting_point ?? null,
@@ -1150,10 +1167,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("get_experience", err);
       }
     }
   );
@@ -1237,7 +1251,6 @@ export function registerExperienceTools(
           // catalog_hidden is never 1 here — searchGardssalgProviders()'s base
           // WHERE clause already excludes those rows entirely — so this call
           // site never needs to (and never does) pass a catalog_hidden arg.
-          const live = !isBookingPaused(row.booking_live);
           return {
             // `id` is the provider_id book_gardssalg needs. It was MISSING from
             // this row until 2026-09-16 (dev-request …-en-setning-booking-via-
@@ -1255,13 +1268,10 @@ export function registerExperienceTools(
             lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
             lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
             geocode_confidence: row.geocode_confidence ?? null,
-            booking: {
-              live,
-              mode: live ? ("request" as const) : ("paused" as const),
-              note: live
-                ? "Book direkte. / Book directly."
-                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-            },
+            // One source for the note (services/gardssalg-booking-gate.ts):
+            // an owned profile that is off says "tar ikke imot forespørsler
+            // nå"; only never-claimed profiles say "åpner snart".
+            booking: gardssalgBookingStatus(row),
             profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
             // Only present when an origin (lat/lng) was given — mirrors
             // discover_experiences's own ...(hasGeo ? {...} : {}) spread.
@@ -1296,10 +1306,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_gardssalg", err);
       }
     }
   );
@@ -1440,7 +1447,7 @@ export function registerExperienceTools(
         // here. An unknown provider_id falls through the same path (no row
         // -> booking_live undefined -> "not live"), same as the web form.
         const provider = getProviderById(parsed.data.provider_id) as
-          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null }
+          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null }
           | null;
         // Echoed on every outcome below so the assistant can name the producer
         // it acted on (and link the profile when booking is not activated).
@@ -1455,6 +1462,9 @@ export function registerExperienceTools(
           : null;
         const slotLocal = formatSlotOslo(parsed.data.slot_at);
         if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
+          // Owned profile that is off: "tar ikke imot forespørsler nå", not
+          // "ikke aktivert ennå" (G1 item 7). Never-claimed: unchanged copy.
+          const notTaking = gardssalgNotTakingRequestsText(provider?.claimed_at ?? null);
           return {
             content: [{
               type: "text" as const,
@@ -1466,9 +1476,9 @@ export function registerExperienceTools(
                 provider: providerInfo,
                 message:
                   (providerInfo?.navn ? `${providerInfo.navn}: ` : "") +
-                  BOOKING_NOT_ACTIVATED_MSG +
+                  (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
                   (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
-                  " / Booking is not activated for this producer yet." +
+                  (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
                   (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
               }, null, 2),
             }],
@@ -1604,10 +1614,7 @@ export function registerExperienceTools(
           }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Bookingfeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("book_gardssalg", err);
       }
     }
   );
@@ -1686,7 +1693,7 @@ async function getOrCreateExperiencesSession(
       "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
       "searchable by county, category, weather, season, and group size. / " +
       "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
-  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS });
+  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
 
   // Getters read live from the sessions map (by id) rather than closing over
   // a snapshot, so a later request on the same session that resolves a

@@ -793,6 +793,8 @@ import {
   // dev-request 2026-08-10-gardssalg-eier-flyt-e2e-repeterbar-revoke-og-
   // editable-fixtur — POST /admin/gardssalg-claim-revoke below.
   maskEmail,
+  isGardssalgProviderClaimed,
+  getOwnedVisibilityState,
 } from "../services/gardssalg-claim";
 import {
   emailService,
@@ -907,6 +909,14 @@ import {
 // opening-hours check, also used by experiences-seo.ts's no-JS fallback and
 // experiences-mcp.ts's book_gardssalg tool. Never re-derive this inline.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 items 3 + 7: the
+// shared booking-request-address rule, the admin brake writer and the AI
+// booking note (one source for MCP / A2A / REST).
+import {
+  hasBookingRequestEmail,
+  setGardssalgBookingAdminBrake,
+  gardssalgBookingStatus,
+} from "../services/gardssalg-booking-gate";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
 // provider resolution + requested-weekday guard + the shared honest-outcome
 // payloads, applied to POST /book BEFORE the unchanged BookingInputSchema →
@@ -958,6 +968,7 @@ import { rfbWdPageReferencesOwnHost } from "./admin-rfb-website-discovery";
 // uses, and answers a place outside Norway and a food purchase like it does.
 import { GARDSSALG_CATEGORY, interpretDiscoverQuery, isStockfishPurchase, listCategorySlugs } from "../services/experiences-query-intent";
 import { outsideNorwayPlace } from "../services/outside-norway";
+import { confirmOwnerByEmail, clearOwnerEmailConfirmation } from "../services/gardssalg-owner-email-confirm";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -1368,7 +1379,6 @@ router.get("/discover", (req: Request, res: Response) => {
           // Same shape/construction as discover_gardssalg's own formatting
           // (src/routes/experiences-mcp.ts) — kept byte-identical on purpose
           // so an agent gets the same honest booking status either surface.
-          const live = !isBookingPaused(row.booking_live);
           return {
             // provider_id for POST /book / book_gardssalg — was missing until
             // 2026-09-16 (see the MCP tool's own comment).
@@ -1383,13 +1393,8 @@ router.get("/discover", (req: Request, res: Response) => {
             lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
             lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
             geocode_confidence: row.geocode_confidence ?? null,
-            booking: {
-              live,
-              mode: live ? ("request" as const) : ("paused" as const),
-              note: live
-                ? "Book direkte. / Book directly."
-                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-            },
+            // Shared with discover_gardssalg / A2A (services/gardssalg-booking-gate.ts).
+            booking: gardssalgBookingStatus(row),
             profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
             // Only present when an origin (lat/lng) was given — mirrors the
             // experiences-branch's own ...(hasGeo ? {...} : {}) spread below.
@@ -10319,13 +10324,11 @@ router.post("/admin/gardssalg-claim-grant", requireAdmin, (req: Request, res: Re
 // second producer link claimed the same profile before either was
 // revoked), so ALL of them are revoked, not just the first.
 //
-// NEVER touches claimed_at (the historical "claimed by" badge — see
-// verifyClaimToken()'s own doc comment: "the ONLY place claimed_at is ever
-// set — never on issue/send, only on use") or content_source: this route
-// only sets gardssalg_claims.revoked_at, exactly like revokeClaimToken()
-// itself does. A provider revoked here keeps its public "Bekreftet av
-// eier" badge and whatever content_source lock it already had — only
-// ACCESS is revoked, not history.
+// Resets claimed_at (the "Bekreftet av eier" badge) once no active claim is
+// left (G1 pt 8, 2026-10-22; audited as field_name='claimed_at'), but never
+// touches content_source: the lock keeps owner-written text safe from
+// enrichment. The owner's own logout (revokeClaimToken) is unchanged and
+// keeps the badge.
 //
 // Idempotent: a second apply:true call against the same row finds zero
 // active/non-revoked claims left (revoked_at IS NOT NULL now) and revokes
@@ -10398,6 +10401,7 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 
   const batchId = `claim-revoke-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
   const revoked: Array<{ claim_id: string; email_masked: string; email_source: string }> = [];
+  let claimedAtReset = false;
 
   const txn = expDb.transaction(() => {
     for (const claim of activeClaims) {
@@ -10421,10 +10425,103 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
 
       revoked.push({ claim_id: claim.id, email_masked: maskEmail(claim.email), email_source: claim.email_source });
     }
+
+    // A revoked claim resets the owner mark (dev-request 2026-10-22-opplevagent-
+    // mine-valg-gardssalg, G1 pt 8): once NO active claim is left on the
+    // provider, claimed_at ("Bekreftet av eier" badge) is cleared and audited.
+    // content_source is left alone on purpose — it protects the owner-written
+    // text from being overwritten by enrichment. Only this admin lever resets;
+    // the owner's own logout (revokeClaimToken) still keeps the badge.
+    if (revoked.length > 0) {
+      const stillActive = expDb
+        .prepare(`SELECT COUNT(*) AS c FROM gardssalg_claims WHERE provider_id = @provider_id AND used = 1 AND revoked_at IS NULL`)
+        .get({ provider_id: providerId }) as { c: number };
+      if (stillActive.c === 0) {
+        const prev = expDb
+          .prepare(`SELECT claimed_at FROM experience_providers WHERE id = @id`)
+          .get({ id: providerId }) as { claimed_at: string | null } | undefined;
+        if (prev?.claimed_at) {
+          expDb
+            .prepare(`UPDATE experience_providers SET claimed_at = NULL, updated_at = datetime('now') WHERE id = @id`)
+            .run({ id: providerId });
+          expDb
+            .prepare(
+              `INSERT INTO gardssalg_content_audit
+                 (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+               VALUES (@id, @provider_id, 'claimed_at', @old_value, NULL, NULL, @batch_id, 'admin', datetime('now'))`,
+            )
+            .run({ id: crypto.randomUUID(), provider_id: providerId, old_value: prev.claimed_at, batch_id: batchId });
+          claimedAtReset = true;
+        }
+      }
+    }
   });
   txn();
 
-  res.json({ success: true, dry_run: false, provider_id: providerId, revoked });
+  res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-owner-email-confirm (admin) ─────
+//
+// dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+// change 2 + 4. Lets CS stamp "Bekreftet av eier" for ONE producer from ONE
+// inbound message, without the producer logging in.
+//
+// Body: { provider_id, sender_email, thread_id, confirmed_fields?: string[],
+// apply?: true } or { provider_id, clear: true, apply?: true } to reset.
+//
+// The sender must be an address the claim flow accepts for exactly this
+// producer (services/gardssalg-owner-email-confirm.ts: same candidate list
+// issueClaimMagicLink() validates against); anything else is rejected with a
+// reason, also another address on the producer's own domain. Dry-run by
+// default; only the literal boolean `true` writes. claimed_at is never
+// touched. Confirmed fields get the existing admin field lock; an existing
+// manual/claim/owner lock is left as it is. One gardssalg_content_audit row
+// per write.
+router.post("/admin/gardssalg-owner-email-confirm", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const providerId = typeof body.provider_id === "string" ? body.provider_id.trim() : "";
+  if (!providerId) {
+    return res.status(400).json({ success: false, error: "provider_id_required" });
+  }
+  const apply = body.apply === true;
+
+  try {
+    if (body.clear === true) {
+      const cleared = clearOwnerEmailConfirmation(providerId, { apply });
+      if (!cleared.ok) return res.status(404).json({ success: false, error: cleared.reason });
+      return res.json({ success: true, ...cleared });
+    }
+
+    const senderEmail = typeof body.sender_email === "string" ? body.sender_email.trim() : "";
+    if (!senderEmail) return res.status(400).json({ success: false, error: "sender_email_required" });
+    const threadId = typeof body.thread_id === "string" ? body.thread_id.trim() : "";
+    if (!threadId) return res.status(400).json({ success: false, error: "thread_id_required" });
+
+    const rawFields = body.confirmed_fields === undefined ? [] : body.confirmed_fields;
+    if (
+      !Array.isArray(rawFields) ||
+      !rawFields.every((f) => typeof f === "string" && (GARDSSALG_LOCKABLE_FIELDS as readonly string[]).includes(f))
+    ) {
+      return res.status(400).json({ success: false, error: "invalid_confirmed_fields" });
+    }
+
+    const result = await confirmOwnerByEmail({
+      providerId,
+      senderEmail,
+      threadId,
+      confirmedFields: rawFields as GardssalgLockableField[],
+      apply,
+    });
+    if (!result.ok) {
+      const status = result.reason === "provider_not_found" ? 404 : result.reason === "invalid_sender" ? 400 : 422;
+      return res.status(status).json({ success: false, error: result.reason });
+    }
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-owner-email-confirm failed", err);
+    return res.status(500).json({ success: false, error: "internal_error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-contact-backfill (admin) ─────────
@@ -13305,7 +13402,9 @@ type GardssalgAutosvarApplyOutcome =
   // classifier or the judge itself) — treated exactly like "nothing to
   // apply" (no epost write, no queue row), but reported under its own
   // label rather than folded into an unrelated bucket.
-  | "contact_gate_rejected";
+  | "contact_gate_rejected"
+  // G1 skive 5: the row's epost is owner-locked — nothing written.
+  | "owner_locked";
 
 interface GardssalgAutosvarApplyResult {
   dry_run: boolean;
@@ -13348,6 +13447,7 @@ async function runGardssalgAutosvarApply(opts: {
       provider_not_found: 0,
       skipped_no_email_found: 0,
       contact_gate_rejected: 0,
+      owner_locked: 0,
     };
 
     for (const c of scan.candidates) {
@@ -13361,11 +13461,20 @@ async function runGardssalgAutosvarApply(opts: {
 
       if (c.classification === "domain_match") {
         const providerRow = expDb
-          .prepare(`SELECT navn, epost FROM experience_providers WHERE id = ?`)
-          .get(c.provider_id) as { navn: string; epost: string | null } | undefined;
+          .prepare(`SELECT navn, epost, content_source, field_provenance FROM experience_providers WHERE id = ?`)
+          .get(c.provider_id) as
+          | { navn: string; epost: string | null; content_source: string | null; field_provenance: string | null }
+          | undefined;
         if (!providerRow) {
           results.push({ ...c, outcome: "provider_not_found" });
           counts.provider_not_found++;
+          continue;
+        }
+        // Owner lock (G1 skive 5): an owner-locked epost is never rewritten by
+        // the automated autosvar path (a human can still use set-contact-email).
+        if (isGardssalgFieldOwnerLocked(providerRow, "epost")) {
+          results.push({ ...c, outcome: "owner_locked" });
+          counts.owner_locked++;
           continue;
         }
         const currentEmail = (providerRow.epost || "").trim().toLowerCase();
@@ -15703,6 +15812,8 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
+import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
+import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
 import { recordRun } from "../services/run-ledger";
 import { markJobCompleted, resolveDailyJobLastRunAt } from "../services/boot-job-gate";
 import {
@@ -15737,12 +15848,30 @@ const DRINKS_NAME_EXCLUSIONS = [
 router.delete("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
   const expDb = getExpDb("experiences");
   try {
+    // Owned rows are never deleted (dev-request 2026-10-22-opplevagent-mine-valg-
+    // gardssalg, G1 pt 8): an owner claim (claimed_at set, content_source 'claim'
+    // or 'manual', or a live used+non-revoked gardssalg_claims row) is owner/admin
+    // curated data that a seed rollback must not touch.
+    const ownedWhere = `rfb_seed_source = 'rfb-seed' AND (
+          claimed_at IS NOT NULL
+          OR content_source IN ('claim', 'manual')
+          OR id IN (SELECT provider_id FROM gardssalg_claims WHERE used = 1 AND revoked_at IS NULL))`;
+    const skippedOwned = (
+      expDb.prepare(`SELECT COUNT(*) AS c FROM experience_providers WHERE ${ownedWhere}`).get() as { c: number }
+    ).c;
     const result = expDb
-      .prepare("DELETE FROM experience_providers WHERE rfb_seed_source = 'rfb-seed'")
+      .prepare(
+        `DELETE FROM experience_providers
+          WHERE rfb_seed_source = 'rfb-seed'
+            AND claimed_at IS NULL
+            AND (content_source IS NULL OR content_source NOT IN ('claim', 'manual'))
+            AND id NOT IN (SELECT provider_id FROM gardssalg_claims WHERE used = 1 AND revoked_at IS NULL)`,
+      )
       .run();
     res.json({
       deleted: result.changes,
-      note: "Deleted all rfb_seed_source='rfb-seed' providers. Safe: claimed/enriched/manual rows untouched.",
+      skipped_owned: skippedOwned,
+      note: "Deleted rfb_seed_source='rfb-seed' providers that have no owner. Owned rows (claimed_at set, content_source 'claim' or 'manual', or an active claim) are skipped and left untouched.",
     });
   } catch (err) {
     console.error("[rfb-seed rollback] Delete failed:", err);
@@ -16737,8 +16866,15 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
       // Provenance: mark as rfb-knowledge sourced with the producer's own site
       // as evidence URL (Daniel: "bruk agentens hjemmeside som proof på info").
       const evidenceUrl = r.matched_rfb ? (byDomain.get(r.matched_rfb.domain)?.url ?? null) : null;
-      sets.push("content_source = ?", "content_evidence_url = ?", "content_updated_at = ?");
-      vals.push("rfb-knowledge", evidenceUrl, now);
+      // A claimed row keeps content_source='claim' (G1 skive 5: re-stamping it
+      // would silently unlock the owner's other fields); only per-field locks
+      // inside pickEnrichmentFields decide what may be filled.
+      if (providers.find((p) => p.id === r.provider_id)?.content_source !== "claim") {
+        sets.push("content_source = ?");
+        vals.push("rfb-knowledge");
+      }
+      sets.push("content_evidence_url = ?", "content_updated_at = ?");
+      vals.push(evidenceUrl, now);
       try {
         expDb.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = ?`).run(...vals, r.provider_id);
         enriched++;
@@ -16899,7 +17035,8 @@ router.get("/admin/drink-coverage", requireAdmin, (_req: Request, res: Response)
         `SELECT fylke, producer_type
            FROM experience_providers
           WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-            AND (catalog_hidden IS NULL OR catalog_hidden != 1)`,
+            AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+            AND (merged_into IS NULL OR merged_into = '')`,
       )
       .all() as GardssalgRow[];
     experienceRows = expDb
@@ -18609,6 +18746,8 @@ export type GardssalgOutreachEligibility =
       last_sent_at?: string;
       suppressed_by?: string;
       cross_platform?: boolean;
+      // cross-platform suppression only: which rule matched the same producer.
+      match?: CrossPlatformMatch;
       // reason "hard_bounced" only: the email_bounces row that suppressed it.
       bounce_type?: string;
       bounced_at?: string;
@@ -18650,14 +18789,44 @@ function gardssalgOutreachCooldownCutoffIso(): string {
 export function findGardssalgOutreachHardBounce(
   email: string,
 ): { bounce_type: string; bounced_at: string } | null {
+  // 'unsubscribe' (G1 point 6): an /avmeld POST writes that row; cold outreach must
+  // honour it here too, not only the RFB gate and compose. Honouring is never flagged.
   const row = getRfbDb()
     .prepare(
       `SELECT bounce_type, bounced_at FROM email_bounces
-        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint')
+        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint', 'unsubscribe')
         ORDER BY id DESC LIMIT 1`,
     )
     .get(email) as { bounce_type: string; bounced_at: string } | undefined;
   return row ?? null;
+}
+
+/**
+ * G1 point 6 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg): an owned profile
+ * is never a COLD outreach target. Owned = content_source = 'claim', OR claimed_at set
+ * (the permanent «Bekreftet av eier» badge, survives owner logout), OR a live used +
+ * non-revoked gardssalg_claims row. Safety tightening: ON by default; rollback switch
+ * GARDSSALG_OUTREACH_EXCLUDE_OWNED=0|false|off (read at call time).
+ */
+export function gardssalgOutreachExcludeOwnedEnabled(): boolean {
+  const v = String(process.env.GARDSSALG_OUTREACH_EXCLUDE_OWNED ?? "").trim().toLowerCase();
+  return !(v === "0" || v === "false" || v === "off");
+}
+
+export function isGardssalgOwnedForOutreach(expDb: Database.Database, providerId: string): boolean {
+  if (!gardssalgOutreachExcludeOwnedEnabled()) return false;
+  const row = expDb
+    .prepare(
+      `SELECT 1 FROM experience_providers p
+        WHERE p.id = ?
+          AND (p.content_source = 'claim'
+               OR p.claimed_at IS NOT NULL
+               OR EXISTS (SELECT 1 FROM gardssalg_claims c
+                           WHERE c.provider_id = p.id AND c.used = 1 AND c.revoked_at IS NULL))
+        LIMIT 1`,
+    )
+    .get(providerId);
+  return row !== undefined;
 }
 
 /**
@@ -18707,8 +18876,16 @@ export function computeGardssalgOutreachSendEligibility(
   const cooldownCutoff = gardssalgOutreachCooldownCutoffIso();
 
   const out: GardssalgOutreachEligibility[] = [];
+  // Built on first use, once per call (not per provider).
+  let rfbSendIndex: ReturnType<typeof getRfbSendIndexForOpplevagent> | null = null;
 
   for (const providerId of providerIds) {
+    // G1 point 6: owned profiles never get cold outreach (checked first, so the reason is
+    // reported as such and not folded into a preflight reason).
+    if (isGardssalgOwnedForOutreach(expDb, providerId)) {
+      out.push({ provider_id: providerId, eligible: false, status: "skipped", reason: "owner_claimed" });
+      continue;
+    }
     const pf = preflightById.get(providerId);
     if (!pf || !pf.go) {
       // Surfaced as a direct top-level reason (mirrors pilot-send's own
@@ -18729,8 +18906,16 @@ export function computeGardssalgOutreachSendEligibility(
     }
 
     const providerRow = expDb
-      .prepare(`SELECT navn, slug, epost FROM experience_providers WHERE id = ?`)
-      .get(providerId) as { navn: string | null; slug: string | null; epost: string | null } | undefined;
+      .prepare(`SELECT navn, slug, epost, org_nr, hjemmeside FROM experience_providers WHERE id = ?`)
+      .get(providerId) as
+      | {
+          navn: string | null;
+          slug: string | null;
+          epost: string | null;
+          org_nr: string | null;
+          hjemmeside: string | null;
+        }
+      | undefined;
 
     const email = providerRow?.epost?.trim();
     if (!email) {
@@ -18830,16 +19015,37 @@ export function computeGardssalgOutreachSendEligibility(
     // lookup stays, and a recent cross-platform send is surfaced on the
     // ELIGIBLE row as cross_platform_recent so daily-prep and run reports can
     // show the overlap if reply/complaint rates ever diverge.
-    const rfbDb = getRfbDb();
-    const crossPrior = rfbDb
-      .prepare(
-        `SELECT sent_at, vertical_id FROM outreach_sent_log
-          WHERE recipient_email IS NOT NULL
-            AND LOWER(recipient_email) = LOWER(?)
-            AND sent_at >= ?
-          ORDER BY sent_at DESC LIMIT 1`,
-      )
-      .get(email, cooldownCutoff) as { sent_at: string; vertical_id: string } | undefined;
+    //
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // the lookup now recognises the same PRODUCER, not only the same address
+    // (cross-platform-match.ts: e-mail domain unless free-mail, website, org.nr).
+    // The exact-address hit keeps its informational behaviour above (Daniel
+    // 2026-08-20); a hit on domain / website / org_nr is the Druehagen case —
+    // two addresses, one producer — and BLOCKS, reported with `match`.
+    if (!rfbSendIndex) rfbSendIndex = getRfbSendIndexForOpplevagent(getRfbDb(), cooldownCutoff);
+    const crossIdentity = buildCrossPlatformIdentity({ email, website: providerRow?.hjemmeside, orgNr: providerRow?.org_nr });
+    const crossFound = rfbSendIndex.find(crossIdentity);
+    // The producer-level lookup skips the exact-address key, so a same-address row (e.g. our own
+    // mirrored send) cannot shadow a domain / website / org.nr hit from a different row.
+    const crossBlock = rfbSendIndex.findProducerMatch(crossIdentity);
+    // A producer hit from the SAME row as the exact-address hit is still just the informational
+    // address overlap (Daniel 2026-08-20); only a different row proves a second address.
+    if (crossBlock && !(crossFound && crossFound.match === "email" && crossBlock.hit === crossFound.hit)) {
+      out.push({
+        provider_id: providerId,
+        eligible: false,
+        status: "skipped",
+        reason: "cooldown_suppressed",
+        last_sent_at: crossBlock.hit.last_sent_at,
+        suppressed_by: crossBlock.hit.vertical_id,
+        cross_platform: true,
+        match: crossBlock.match,
+      });
+      continue;
+    }
+    const crossPrior = crossFound
+      ? { sent_at: crossFound.hit.last_sent_at, vertical_id: crossFound.hit.vertical_id }
+      : undefined;
 
     out.push({
       provider_id: providerId,
@@ -19043,8 +19249,12 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     let hardBouncedCount = 0;
     let blocklistedCount = 0;
     let crossPlatformCooldownCount = 0;
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // which rule suppressed each cross-platform row (dry-run visibility).
+    const crossPlatformMatches: Array<{ provider_id: string; match: CrossPlatformMatch }> = [];
     let preflightNoGoCount = 0;
     let personalAddressCount = 0;
+    let ownerClaimedCount = 0;
 
     type Candidate = { agent_id: string; name: string; email: string; last_sent_at: string | null };
     const survivors: Candidate[] = [];
@@ -19066,6 +19276,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           cross_platform_cooldown: crossPlatformCooldownCount,
           preflight_no_go: preflightNoGoCount,
           personal_address: personalAddressCount,
+          owner_claimed: ownerClaimedCount,
         },
         recipient_address_types: countRecipientAddressTypes([]),
       });
@@ -19082,14 +19293,19 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     // beyond the shared readiness/preflight machinery.
     const idPlaceholders = outreachReadyIds.map(() => "?").join(", ");
     const baseRows = expDb
-      .prepare(`SELECT id, navn, epost, created_at FROM experience_providers WHERE id IN (${idPlaceholders})`)
+      .prepare(
+        `SELECT id, navn, epost, created_at, org_nr, hjemmeside FROM experience_providers WHERE id IN (${idPlaceholders})`,
+      )
       .all(...outreachReadyIds) as Array<{
       id: string;
       navn: string;
       epost: string | null;
       created_at: string | null;
+      org_nr: string | null;
+      hjemmeside: string | null;
     }>;
     const baseById = new Map(baseRows.map((r) => [r.id, r]));
+    const providerWebById = baseById;
 
     // Own-table send history for the outreach_ready cohort — fetched once,
     // grouped by LOWER(email), most-recent REAL (is_test = 0) send only.
@@ -19113,18 +19329,11 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
     // Cross-platform (RFB) 60-day cooldown — read-only, same query pattern as
     // computeGardssalgOutreachSendEligibility (~L9568-9591) above. Scoped to
     // OUTREACH_COOLDOWN_DAYS, NOT GARDSSALG_SECOND_TOUCH_COOLDOWN_DAYS.
-    const crossPlatformByEmail = new Map<string, { sent_at: string; vertical_id: string }>();
-    for (const r of rfbDb
-      .prepare(
-        `SELECT LOWER(recipient_email) AS email, vertical_id, MAX(sent_at) AS last_sent_at
-           FROM outreach_sent_log
-          WHERE recipient_email IS NOT NULL AND recipient_email != ''
-            AND sent_at >= ?
-          GROUP BY LOWER(recipient_email)`,
-      )
-      .all(crossPlatformCutoff) as Array<{ email: string; vertical_id: string; last_sent_at: string }>) {
-      crossPlatformByEmail.set(r.email, { sent_at: r.last_sent_at, vertical_id: r.vertical_id });
-    }
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // the same shared index computeGardssalgOutreachSendEligibility uses —
+    // matches the same producer (domain / website / org.nr), not only the
+    // exact address.
+    const crossPlatformIndex = getRfbSendIndexForOpplevagent(rfbDb, crossPlatformCutoff);
 
     // ── replied: mirrors admin-outreach-candidates.ts's has_replied subquery
     // (~L242-250), agent_id -> provider_id + vertical_id = 'experiences'
@@ -19139,7 +19348,7 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
       const row = rfbDb
         .prepare(
           `SELECT 1 FROM email_bounces
-            WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint')
+            WHERE LOWER(email) = LOWER(?) AND bounce_type IN ('hard', 'complaint', 'unsubscribe')
             LIMIT 1`,
         )
         .get(email);
@@ -19193,11 +19402,15 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           repliedCount++;
         } else if (e.reason === PERSONAL_ADDRESS_REASON) {
           personalAddressCount++;
+        } else if (e.reason === "owner_claimed") {
+          ownerClaimedCount++;
         } else if (e.reason === "max_touch_reached") {
           contactedOrCooldownCount++;
         } else if (e.reason === "cooldown_suppressed") {
-          if (e.cross_platform) crossPlatformCooldownCount++;
-          else contactedOrCooldownCount++;
+          if (e.cross_platform) {
+            crossPlatformCooldownCount++;
+            if (e.match) crossPlatformMatches.push({ provider_id: e.provider_id, match: e.match });
+          } else contactedOrCooldownCount++;
         } else {
           // preflight_no_go / large_company_excluded / no_email — folded
           // into preflight_no_go; none of the three has a dedicated bucket
@@ -19219,6 +19432,10 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
       });
 
       for (const pf of preflightResults) {
+        if (isGardssalgOwnedForOutreach(expDb, pf.provider_id)) {
+          ownerClaimedCount++; // G1 point 6 — owned profiles never get cold outreach
+          continue;
+        }
         if (!pf.go) {
           // readiness tier already filtered to outreach_ready above, so the
           // only reasons possible here are large_company_excluded (size
@@ -19254,9 +19471,16 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
           blocklistedCount++;
           continue;
         }
-        const crossHit = crossPlatformByEmail.get(email.toLowerCase());
+        const crossHit = crossPlatformIndex.find(
+          buildCrossPlatformIdentity({
+            email,
+            website: providerWebById.get(pf.provider_id)?.hjemmeside,
+            orgNr: providerWebById.get(pf.provider_id)?.org_nr,
+          }),
+        );
         if (crossHit) {
           crossPlatformCooldownCount++;
+          crossPlatformMatches.push({ provider_id: pf.provider_id, match: crossHit.match });
           continue;
         }
         if (hasCrmReply(pf.provider_id)) {
@@ -19322,7 +19546,12 @@ router.get("/admin/gardssalg-outreach-candidates", requireAdmin, (req: Request, 
         cross_platform_cooldown: crossPlatformCooldownCount,
         preflight_no_go: preflightNoGoCount,
         personal_address: personalAddressCount,
+        owner_claimed: ownerClaimedCount,
       },
+      // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+      // one entry per cross-platform-suppressed provider, with the rule that
+      // matched (email | domain | website | org_nr). Bounded at 100.
+      cross_platform_cooldown_matches: crossPlatformMatches.slice(0, 100),
       // dev-request 2026-10-08-mottakerpolicy-alle-adresser: what kind of
       // address each selected candidate has (reporting only, not a filter).
       recipient_address_types: countRecipientAddressTypes(capped.map((c) => c.email)),
@@ -19442,6 +19671,7 @@ router.post("/admin/gardssalg-outreach-pilot-send", requireAdmin, async (req: Re
           last_sent_at: elig.last_sent_at,
           suppressed_by: elig.suppressed_by,
           cross_platform: elig.cross_platform,
+          match: elig.match,
         });
         continue;
       }
@@ -19494,6 +19724,7 @@ export type GardssalgOutreachSendResultRow = {
   last_sent_at?: string;
   suppressed_by?: string;
   cross_platform?: boolean;
+  match?: CrossPlatformMatch;
   // Grep 7 (2026-08-19-kursjustering-drikkefunnel-llm-og-supply): the
   // cross-platform cooldown no longer blocks; on ELIGIBLE rows a recent
   // RFB send to the same address is surfaced through these informational
@@ -19547,6 +19778,10 @@ export const GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE = "reserved";
 // db_write_failed row, and after a send that threw (reservation_kept).
 export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_REASON = "not_attempted_after_db_write_failure";
 export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_UNKNOWN_OUTCOME_REASON = "not_attempted_after_send_outcome_unknown";
+// Dev-request 2026-10-10-gardssalg-outreach-bounce-sjekk-kun-for-sending: en ny
+// hard bounce/klage midt i batchen (Vakt 3 re-sjekket mellom to utsendelser)
+// stopper resten av SAMME kjøring; hver igjenværende kandidat blir en skipped-rad.
+export const GARDSSALG_OUTREACH_NOT_ATTEMPTED_BOUNCE_REASON = "not_attempted_after_bounce_recheck";
 
 /**
  * The one stop rule both looping callers (POST /admin/gardssalg-outreach-
@@ -19619,6 +19854,14 @@ export async function sendGardssalgOutreachToEligibleProvider(
   if (!isColdRecipientAllowed(email)) {
     console.warn(`[${opts.source}] recipient address is malformed — NOT sending`, { providerId, email });
     return { provider_id: providerId, status: "skipped", reason: PERSONAL_ADDRESS_REASON };
+  }
+
+  // Send-time owner re-check (G1 point 6): a claim can land between the caller's batch-wide
+  // eligibility pass and this send. A skip, not a batch stop — nothing written. Test sends
+  // (redirected to the operator) are not cold outreach to the producer and pass.
+  if (!isTest && isGardssalgOwnedForOutreach(expDb, providerId)) {
+    console.warn(`[${opts.source}] provider is owned (claimed) — NOT sending cold outreach`, { providerId });
+    return { provider_id: providerId, status: "skipped", reason: "owner_claimed" };
   }
 
   // Send-time bounce re-check (owner decision 2026-09-29 «1B»): the caller's
@@ -21069,6 +21312,7 @@ async function runGardssalgOutreachDailyOnce(
       : report.stopped_on_send_outcome_unknown
         ? "send outcome unknown"
         : null;
+    const midBatchBounceSkipped = results.filter((r) => r.reason === GARDSSALG_OUTREACH_NOT_ATTEMPTED_BOUNCE_REASON).length;
     const notAttempted = results
       .filter(
         (r) =>
@@ -21114,6 +21358,7 @@ async function runGardssalgOutreachDailyOnce(
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
         (stopCause ? ` STOPPED (${stopCause}): not_attempted=${notAttempted.length}` : "") +
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
+        (midBatchBounceSkipped > 0 ? ` mid_batch_bounce_skipped=${midBatchBounceSkipped}` : "") +
         (report.autosvar_apply
           ? ` autosvar: applied=${report.autosvar_apply.counts.applied} queued=${report.autosvar_apply.counts.queued} ` +
             `already_set=${report.autosvar_apply.counts.already_set} queue_size=${report.autosvar_apply.queue_size}`
@@ -21265,10 +21510,35 @@ async function runGardssalgOutreachDailyOnce(
   // gardssalgOutreachBatchStopReason) — no further candidate is tried; each
   // one left is a skipped row carrying that reason (see finish()).
   let notAttemptedReason: string | null = null;
+  // Vakt 3 re-sjekkes mellom hver utsendelse: en bounce/klage som lander midt i
+  // batchen (f.eks. 08:00:31Z, mens 08:00:25-08:00:34Z-batchen pågår) pauser lanen
+  // og stopper resten av DENNE kjøringen, ikke først neste. Samme pause og
+  // kvitteringsmekanisme (bounce_ack_max_id) som førsjekken over.
+  let midBatchBounces: GardssalgOutreachBounceHit[] = [];
   for (const elig of selected) {
     if (!opts.apply) {
       results.push({ provider_id: elig.provider_id, status: "would_send" });
       continue;
+    }
+    if (!notAttemptedReason && results.length > 0) {
+      midBatchBounces = findGardssalgOutreachRecentBounces(
+        expDb,
+        getRfbDb(),
+        now,
+        getGardssalgOutreachLaneState(expDb).bounce_ack_max_id,
+      );
+      if (midBatchBounces.length > 0) {
+        setGardssalgOutreachLanePaused(expDb, {
+          paused: true,
+          by: GARDSSALG_OUTREACH_DAILY_AGENT,
+          reason:
+            `auto-pause (mid-batch): hard bounce/complaint on ${midBatchBounces.length} recipient(s) contacted in the last ` +
+            `${GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS}h (${midBatchBounces.map((b) => b.recipient_email).join(", ")}). ` +
+            `Clearing the pause is Daniel's call: POST /api/opplevelser/admin/gardssalg-outreach-lane {"paused": false}.`,
+          bounceAckMaxId: Math.max(...midBatchBounces.map((b) => b.bounce_id)),
+        });
+        notAttemptedReason = GARDSSALG_OUTREACH_NOT_ATTEMPTED_BOUNCE_REASON;
+      }
     }
     if (notAttemptedReason) {
       results.push({ provider_id: elig.provider_id, status: "skipped", reason: notAttemptedReason });
@@ -21286,6 +21556,8 @@ async function runGardssalgOutreachDailyOnce(
     skipped_reason: null,
     sent_today_before: sentToday,
     budget,
+    auto_paused: midBatchBounces.length > 0,
+    recent_bounces: midBatchBounces,
     candidates,
     results,
     autosvar_apply: autosvarApply,
@@ -23033,7 +23305,7 @@ export function planGardssalgBookingActivation(
     }
     const current: 0 | 1 = row.booking_live === 1 ? 1 : 0;
     const target: 0 | 1 = enabled ? 1 : 0;
-    const hasEmail = typeof row.epost === "string" && row.epost.trim() !== "";
+    const hasEmail = hasBookingRequestEmail(row.epost);
     if (enabled && !hasEmail) {
       return { provider_id: id, name: row.navn, ok: false, changed: false, reason: "no_email", from: current };
     }
@@ -23074,7 +23346,7 @@ export function applyGardssalgBookingActivation(
     if (!row) return null;
     const current: 0 | 1 = row.booking_live === 1 ? 1 : 0;
     const target: 0 | 1 = enabled ? 1 : 0;
-    const hasEmail = typeof row.epost === "string" && row.epost.trim() !== "";
+    const hasEmail = hasBookingRequestEmail(row.epost);
     if (enabled && !hasEmail) return null;
     if (current === target) return null;
 
@@ -23147,6 +23419,12 @@ router.post("/admin/gardssalg-booking-activation", requireAdmin, (req: Request, 
 
     const batchId = `booking-activation-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}`;
     const results = plan.map((item) => {
+      // Admin brake (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg,
+      // G1 item 3): enabled:false stamps it, enabled:true lifts it — also for
+      // a row already at the target value, so the admin can stop an owner
+      // whose booking is already off. Only for rows that passed the plan
+      // (never not_found / no_email). See services/gardssalg-booking-gate.ts.
+      if (item.ok) setGardssalgBookingAdminBrake(expDb, item.provider_id, !enabled, enabled ? null : note, batchId);
       if (!item.ok || !item.changed) return item;
       const applied = applyGardssalgBookingActivation(expDb, item.provider_id, enabled, note, batchId);
       if (!applied) {
@@ -30678,6 +30956,8 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     hidden?: unknown;
     apply?: unknown;
     override_owner_removed?: unknown;
+    mode?: unknown;
+    confirm_owned?: unknown;
   };
 
   if (typeof body.hidden !== "boolean") {
@@ -30685,6 +30965,20 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     return;
   }
   const hidden = body.hidden;
+  // mode (dev-request 2026-10-01-opplevagent-skjul-uten-sperre): "remove_request"
+  // (default, "fjern oss" → blocklist) or "quality" (hide only, no blocklist).
+  if (body.mode !== undefined && body.mode !== "remove_request" && body.mode !== "quality") {
+    res.status(400).json({ error: "Body field 'mode' must be 'remove_request' or 'quality'" });
+    return;
+  }
+  const mode: "remove_request" | "quality" = body.mode === "quality" ? "quality" : "remove_request";
+  // G1 pkt 4: owned rows (verified claim / content_source='claim') are only
+  // touched with an explicit strict-boolean confirmation; the change is logged.
+  if (body.confirm_owned !== undefined && typeof body.confirm_owned !== "boolean") {
+    res.status(400).json({ error: "Body field 'confirm_owned' must be a boolean" });
+    return;
+  }
+  const confirmOwned = body.confirm_owned === true;
   const apply =
     body.apply === true ||
     body.apply === 1 ||
@@ -30715,11 +31009,11 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source, terminal_status FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source, terminal_status FROM experience_providers
         WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, content_source, terminal_status FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source, terminal_status FROM experience_providers
         WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     type PvRow = {
@@ -30729,6 +31023,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       hjemmeside: string | null;
       epost: string | null;
       catalog_hidden: number | null;
+      catalog_hidden_reason: string | null;
       content_source: string | null;
       terminal_status: string | null;
     };
@@ -30750,6 +31045,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     const skippedOwnerRemoved: Array<{ id: string; navn: string; org_nr: string | null; outcome: "skipped_owner_removed" }> = [];
     const overriddenOwnerRemoved: Array<{ id: string; navn: string; org_nr: string | null }> = [];
     const ownerRemovedMatcher = hidden ? null : loadOwnerRemovedMatcher();
+    const skippedOwned: Array<{ id: string; navn: string; org_nr: string | null; state: string }> = [];
     const unchanged: Array<{ id: string; navn: string; org_nr: string | null }> = [];
     const changed: Array<{
       id: string;
@@ -30761,7 +31057,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     const targetValue = hidden ? 1 : null;
 
     const upd = expDb.prepare(
-      `UPDATE experience_providers SET catalog_hidden = ?, updated_at = datetime('now') WHERE id = ?`
+      `UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ?, updated_at = datetime('now') WHERE id = ?`
     );
     // Skive D (dev-request 2026-08-17-cs-plattformparitet-og-verifisert-
     // utfoerelse): this lever is the CS "fjern oss" delist mechanism for real
@@ -30778,19 +31074,33 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
     // the blocklist write is a defense-in-depth belt, not the buckle).
     let blocklistInsertedTotal = 0;
     for (const row of matched.values()) {
-      if (row.content_source === "manual" || row.content_source === "claim") {
+      const owned = row.content_source === "claim" || isGardssalgProviderClaimed(row.id);
+      if (owned && !confirmOwned) {
+        skippedOwned.push({
+          id: row.id,
+          navn: row.navn,
+          org_nr: row.org_nr,
+          state: getOwnedVisibilityState(row),
+        });
+        continue;
+      }
+      if (!owned && (row.content_source === "manual" || row.content_source === "claim")) {
         skippedLocked.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
       }
       const currentlyHidden = row.catalog_hidden === 1;
-      if (currentlyHidden === hidden) {
+      const targetReason = hidden ? mode : null;
+      // An owned row that is already hidden for a different reason (e.g. the
+      // owner's pause) is still changed when the admin asks for another mode.
+      if (currentlyHidden === hidden && (!owned || (row.catalog_hidden_reason ?? null) === targetReason)) {
         unchanged.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
         continue;
       }
       // Owner-removed guard: a producer that asked for removal (explicit
       // terminal_status, or org.nr/domain/e-post on the blocklist with a
-      // "fjern oss" reason) must not be unhidden by accident. (The
-      // hidden_reason `remove_request` source is not available on main.)
+      // "fjern oss" reason) must not be unhidden by accident. (Not yet derived
+      // from catalog_hidden_reason='remove_request' — follow-up now that main
+      // carries that reason.)
       if (!hidden && ownerRemovedMatcher && deriveGardssalgTerminalStatus(row.terminal_status, row, ownerRemovedMatcher) === "eier_fjernet") {
         if (!overrideOwnerRemoved) {
           skippedOwnerRemoved.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, outcome: "skipped_owner_removed" });
@@ -30800,8 +31110,28 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       }
       let blocklistInserted: number | undefined;
       if (!dryRun) {
-        upd.run(targetValue, row.id);
-        if (hidden) {
+        upd.run(targetValue, targetReason, row.id);
+        if (owned) {
+          expDb.prepare(
+            `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+             VALUES (?, ?, 'catalog_hidden', ?, ?, NULL, 'admin-visibility-owned', 'admin', datetime('now'), ?)`,
+          ).run(
+            crypto.randomUUID(),
+            row.id,
+            getOwnedVisibilityState(row),
+            hidden ? (mode === "quality" ? "quality_hidden" : "removed") : "visible",
+            JSON.stringify({ confirm_owned: true, mode: hidden ? mode : null }),
+          );
+        }
+        if (hidden && mode === "remove_request") {
+          // "Fjern oss" also withdraws the e-mail confirmation (dev-request
+          // 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+          // change 4): no "Bekreftet av eier" is left behind on a removed profile.
+          try {
+            clearOwnerEmailConfirmation(row.id, { apply: true, batchPrefix: "owner-email-confirm-remove" });
+          } catch (clearErr) {
+            console.error("[opplevelser] gardssalg-provider-visibility confirmation clear failed (non-critical):", clearErr);
+          }
           try {
             const bl = blocklistAdd({
               orgNr: row.org_nr ?? undefined,
@@ -30829,6 +31159,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       success: true,
       dry_run: dryRun,
       hidden,
+      mode,
       matched_count: matched.size,
       changed_count: changed.length,
       changed,
@@ -30836,6 +31167,7 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       skipped_locked: skippedLocked,
       skipped_owner_removed: skippedOwnerRemoved,
       ...(overrideOwnerRemoved ? { override_owner_removed: true, overridden_owner_removed: overriddenOwnerRemoved } : {}),
+      skipped_owned: skippedOwned,
       not_found: notFound,
       ...(!dryRun && hidden ? { blocklist_inserted_total: blocklistInsertedTotal } : {}),
     });

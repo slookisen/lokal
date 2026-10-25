@@ -233,6 +233,9 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
       track({ "user-agent": CHROME_UA, referer: "https://chatgpt.com/" });
       assertEq(last().view_source, "ai", "b7: ChatGPT Referer → ai");
       assertEq(agentViewSourceFor("https://www.facebook.com/x"), "social", "b8: social Referer → social");
+      assertEq(agentViewSourceFor("https://claude.ai/chat/1"), "ai", "b8b: claude.ai Referer → ai");
+      assertEq(agentViewSourceFor("https://grok.com/"), "ai", "b8c: grok.com Referer → ai");
+      assertEq(agentViewSourceFor("https://sylteogrokt.no/"), "referral", "b8d: sylteogrokt.no is not ai");
       assertEq(agentViewSourceFor("https://example.org/blog"), "referral", "b9: other site → referral");
 
       // Velocity: 61 distinct pages from this exact session in the last

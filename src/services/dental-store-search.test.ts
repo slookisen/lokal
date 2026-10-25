@@ -18,9 +18,19 @@
  *   P   count/list parity for every field, public and admin; countDentalAgents
  *       now applies poststed.
  *   Z   schema bounds for the new fields.
+ *   V   (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+ *       F2-S8) on public surfaces «verified» is the read-time claim: a stored
+ *       'verified' without a basis is ranked and filtered as not verified
+ *       (and as 'pending_verify'), a free-text query's legacy matches still
+ *       come first, related clinics rank the same way, the admin listing
+ *       keeps the stored column, and with the switch off the order is the
+ *       old one. R keeps its verbatim comparison because the fixture's
+ *       verified clinic has a basis.
  *   T   timing on a 10,000-row fixture: each query under 20 ms, or under 3x
  *       the old whole-text q scan on the same machine when that is slower
  *       (a loaded CI runner), so the check tracks the cost, not the runner.
+ *       Some rows are stored 'verified', with and without a basis, so the
+ *       claim's rich-field count runs in the order and the filter.
  *
  * Standalone: npx tsx src/services/dental-store-search.test.ts
  * Wired into tests/test.ts via runDentalStoreSearchTests().
@@ -70,6 +80,8 @@ function callRoute(router: any, path: string, query: Record<string, string>): Pr
       statusCode: 200,
       status(code: number) { this.statusCode = code; return this; },
       setHeader() { return this; },
+      set() { return this; },
+      vary() { return this; },
       json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
     };
@@ -130,7 +142,12 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
     for (let i = 0; i < 20; i++) {
       soloIds.push(add({ navn: `Sok Solo Tannlege ${i}`, poststed: "OSLO", fylke: "Oslo", postnummer: "0150", helfo_agreement: i % 2 === 0 ? "true" : "false" }));
     }
-    const bergenUpper = add({ navn: "Bergen Sentrum Tann", poststed: "BERGEN", fylke: "Vestland", postnummer: "5003", helfo_agreement: "true", telefon: "55000000" }, { verification_status: "verified" });
+    // F2-S8: what the verifier stores when the «Verifisert» rule passes
+    // (Brreg active, the website the clinic's own, 3 of 10 rich fields), so
+    // a stored 'verified' with this shows the badge, and R compares like
+    // with like.
+    const BASIS = { brreg_status: "active", website_ownership: "verified", om_oss: "Om klinikken.", payment_options: '["kort"]', social_media: '{"facebook":"https://example.test"}' };
+    const bergenUpper = add({ navn: "Bergen Sentrum Tann", poststed: "BERGEN", fylke: "Vestland", postnummer: "5003", helfo_agreement: "true", telefon: "55000000" }, { verification_status: "verified", ...BASIS });
     const bergenMixed = add({ navn: "Bryggen Tann", poststed: "Bergen", fylke: "Vestland", postnummer: "5003" }, { enrichment_state: "enriched", acute_vakt: 1 });
     const kristiansand = add({ navn: "Sørlandet Tann", poststed: "Kristiansand", fylke: "Agder", postnummer: "4611" });
     const sandvika = add({ navn: "Sandvika Tannklinikk", poststed: "SANDVIKA", fylke: "Akershus", postnummer: "1337", chain_brand: "Kjede A" });
@@ -189,11 +206,29 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
       // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
       // places-treffvakt, S4-A1b: the route leaves the stored Google rating
       // (rating, rating_count, rating_source) out, so the snapshot does too.
+      // Same dev-request, A4-D: a public answer also leaves out
+      // field_provenance (it holds the Places values) and Stage V's pending
+      // map (a read-only side column of the hydrated row). No fixture value
+      // comes from Places, so every other value is as stored.
       const snapshot = ids.map((id) => {
-        const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...a } = store.getDentalAgentById(id)!;
+        const {
+          rating: _rating,
+          rating_count: _ratingCount,
+          rating_source: _ratingSource,
+          field_provenance: _provenance,
+          stage_v_pending_correction: _pending,
+          // F2-S8: the side values the «Verifisert» claim reads, also left out.
+          brreg_status: _brreg,
+          website_ownership: _ownership,
+          rich_field_count: _rich,
+          ...a
+        } = store.getDentalAgentById(id)!;
         return { ...a, telefon: isDisplayablePhone(a.telefon) ? a.telefon : null, mobil: isDisplayablePhone(a.mobil) ? a.mobil : null };
       });
-      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot, less the three Google rating keys");
+      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot, less the three Google rating keys, field_provenance, the pending map (A4-D) and the claim's side values (F2-S8)");
+      assertTrue(r.body.agents.some((a: any) => a.id === bergenUpper && a.verification_status === "verified") &&
+        r.body.agents.every((a: any) => !("brreg_status" in a) && !("website_ownership" in a) && !("rich_field_count" in a)),
+        "R8b: (the verified clinic is in it, with its stored status, and no answer has a side value)");
       const q = await callRoute(route, "/agents", { limit: "200", name_terms: "solo", postnummer_in: "0150" });
       assertEq(q.body.count, ids.length, "R9: the new fields are not read from GET /agents query params");
     }
@@ -359,17 +394,59 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
     assertTrue(throws({ poststed_in: [] }), "Z6: an empty poststed_in list is rejected");
     assertTrue(!throws({ name_terms: ["x'); DROP TABLE dental_agents; --"] }) && store.countDentalAgents({}) > 0, "Z7: name words are bound parameters");
 
+    // ── V: «verified» on public surfaces is the read-time claim (F2-S8) ──
+    {
+      const { dentalVerifiedClaimSql } = require("./dental-verified-claim") as typeof import("./dental-verified-claim");
+      const at = { poststed: "RANGSTED", fylke: "Finnmark" };
+      const unbased = add({ navn: "Aaa Rang Uten Grunnlag", ...at }, { verification_status: "verified" });
+      const based = add({ navn: "Bbb Rang Med Grunnlag", ...at }, { verification_status: "verified", ...BASIS });
+      const enriched = add({ navn: "Ccc Rang Beriket", ...at }, { enrichment_state: "enriched" });
+      const closed = add({ navn: "Ddd Rang Nedlagt", ...at }, { verification_status: "verified", ...BASIS, is_inactive: 1 });
+      try {
+        const place = { poststed: "RANGSTED" };
+        assertEq(legacyIds(place, "public"), [unbased, based, enriched], "V0 control: the old order puts the stored 'verified' first, basis or not");
+        assertEq(pubIds(place), [based, enriched, unbased], "V1: the clinic with the badge first, then enriched, then by name: a 'verified' without a basis ranks as not verified");
+        assertEq([pubIds({ ...place, verification_status: "verified" }), store.countPublicDentalAgents({ ...place, verification_status: "verified" })], [[based], 1],
+          "V2: verification_status verified lists and counts only the clinic with the badge");
+        assertEq([pubIds({ ...place, verification_status: "pending_verify" }), store.countPublicDentalAgents({ ...place, verification_status: "pending_verify" })], [[enriched, unbased], 2],
+          "V3: verification_status pending_verify also lists the 'verified' without a basis, which answers 'pending_verify'");
+        assertEq(store.countPublicDentalAgents({ ...place, verification_status: "needs_review" }), 0, "V3b: needs_review is the stored column, as before");
+        assertEq(admIds({ ...place, verification_status: "verified" }), [unbased, based, closed], "V4: the admin listing (GET /agents) keeps the stored column");
+        const related = store.listRelatedClinics(store.getDentalAgentById(enriched)!, 6).map((a) => a.id);
+        assertEq(related, [based, unbased], "V5: related clinics rank the same way (the closed one is left out, as before)");
+        const natural = { natural: { parsed: { poststed_in: ["RANGSTED"] }, legacy: { q: "aaa rang" } } };
+        assertEq(pubIds(natural), [unbased, based, enriched], "V6: a free-text query's legacy matches still come first, then the badge");
+        const oldOrder = (db.prepare(
+          `SELECT id FROM dental_agents WHERE poststed = 'RANGSTED' AND (is_inactive IS NULL OR is_inactive = 0) ORDER BY CASE WHEN ${dentalVerifiedClaimSql(false)} THEN 0 ELSE 1 END ASC,` +
+          " CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC, CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC, navn ASC"
+        ).all() as Array<{ id: string }>).map((r) => r.id);
+        assertEq([dentalVerifiedClaimSql(false), oldOrder], ["verification_status = 'verified'", legacyIds(place, "public")], "V7: with the switch off the claim is the stored status, and the order is the old one");
+      } finally {
+        db.prepare("DELETE FROM dental_agents WHERE id IN (?, ?, ?, ?)").run(unbased, based, enriched, closed);
+      }
+    }
+
     // ── T: timing on 10,000 rows ──────────────────────────────────────────
     dbFactory.__resetDbFactoryForTesting();
     const big = dbFactory.getDb("dental");
-    const ins = big.prepare("INSERT INTO dental_agents (id, navn, poststed, postnummer, fylke, helfo_agreement, specialists) VALUES (?,?,?,?,?,?,?)");
+    const ins = big.prepare(
+      "INSERT INTO dental_agents (id, navn, poststed, postnummer, fylke, helfo_agreement, specialists, verification_status, brreg_status, website_ownership, om_oss, payment_options)" +
+      " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+    );
     const steder = ["OSLO", "BERGEN", "Bergen", "TRONDHEIM", "STAVANGER", "TROMSØ", "SANDVIKA", "DRAMMEN"];
     const fylker = ["Oslo", "Vestland", "Vestland", "Trøndelag", "Rogaland", "Troms", "Akershus", "Buskerud"];
     big.transaction(() => {
       for (let i = 0; i < 10_000; i++) {
         const k = i % steder.length;
+        // F2-S8: one in 50 stored 'verified' (as in production, about 100 of
+        // 5 400), half of them with the verifier's basis, so the claim reads
+        // the rich fields in the order and the filter.
+        const verified = i % 50 === 0;
+        const basis = verified && i % 100 === 0;
         ins.run(`perf-${i}`, `Klinikk ${i} ${i % 7 === 0 ? "Solo Tannlege" : "Tannhelse"}`, steder[k], String(1000 + (i % 3000)), fylker[k],
-          i % 2 ? "true" : "false", JSON.stringify([{ name: "Dr", title: i % 13 === 0 ? "Kjeveortoped" : "Tannlege" }]));
+          i % 2 ? "true" : "false", JSON.stringify([{ name: "Dr", title: i % 13 === 0 ? "Kjeveortoped" : "Tannlege" }]),
+          verified ? "verified" : "pending_verify", basis ? "active" : null, basis ? "verified" : null,
+          verified ? "Om klinikken." : null, verified ? '["kort"]' : null);
       }
     })();
     const timed = (fn: () => unknown) => {
@@ -398,8 +475,13 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
       // S3b: a poststed OR its kommune's postnumre (Bergen kommune has 144).
       ["poststed_or_postnummer (144)", { poststed_or_postnummer: { poststed_in: ["BERGEN", "Bergen"], postnummer_in: Array.from({ length: 144 }, (_, i) => String(1000 + i)) } }],
       ["natural, poststed_or_postnummer", { natural: { parsed: { poststed_or_postnummer: { poststed_in: ["BERGEN", "Bergen"], postnummer_in: Array.from({ length: 144 }, (_, i) => String(1000 + i)) } }, legacy: { q: "tannlege i bergen" } } }],
+      // F2-S8: the claim as the filter (and in the order of every query above).
+      ["verification_status verified", { verification_status: "verified" }],
+      ["verification_status pending_verify", { verification_status: "pending_verify" }],
     ];
     assertEq(store.countPublicDentalAgents({}), 10_000, "T0: the timing fixture has 10,000 public rows");
+    assertEq([store.countPublicDentalAgents({ verification_status: "verified" }), store.countPublicDentalAgents({ verification_status: "pending_verify" })], [100, 9_900],
+      "T0b: 200 stored 'verified', 100 with a basis: the claim counts 100, and pending_verify the other 9,900");
     for (const [label, f] of perfFilters) {
       const c = timed(() => store.countPublicDentalAgents(f as any));
       const l = timed(() => store.listPublicDentalAgents(f as any, 50, 0));

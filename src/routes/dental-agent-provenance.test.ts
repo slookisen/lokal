@@ -66,6 +66,12 @@ function callRoute(
         this.statusCode = code;
         return this;
       },
+      set() {
+        return this;
+      },
+      vary() {
+        return this;
+      },
       json(payload: any) {
         resolve({ status: this.statusCode, body: payload });
         return this;
@@ -201,9 +207,26 @@ export function runDentalAgentProvenanceTests(
         // places-treffvakt, S4-A1b: the route also leaves out the stored Google
         // rating (rating, rating_count, rating_source), so those three are
         // taken off the direct read before comparing.
-        const { rating: _rating, rating_count: _ratingCount, rating_source: _ratingSource, ...directWithoutRating } = direct;
+        // Same dev-request, A4-D: a public answer (no X-Admin-Key) leaves out
+        // field_provenance, which holds the Places values, and Stage V's
+        // pending map (a read-only side column of the hydrated row), so both
+        // are taken off too. Nothing in this fixture comes from Places, so
+        // every other value is as stored. A2A dev-request
+        // 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8): so are
+        // the side values the «Verifisert» claim reads.
+        const {
+          rating: _rating,
+          rating_count: _ratingCount,
+          rating_source: _ratingSource,
+          field_provenance: _fieldProvenance,
+          stage_v_pending_correction: _pending,
+          brreg_status: _brreg,
+          website_ownership: _ownership,
+          rich_field_count: _rich,
+          ...directWithoutRating
+        } = direct;
         assertTrue(!!direct, "d1: setup — getDentalAgentById returns a value for clinic-no-prov");
-        assertEq(rest, directWithoutRating, "d2: additive regression — every non-provenance field of the route response matches a direct getDentalAgentById() read exactly, less the three Google rating keys");
+        assertEq(rest, directWithoutRating, "d2: additive regression — every non-provenance field of the route response matches a direct getDentalAgentById() read exactly, less the three Google rating keys, field_provenance, the pending map (A4-D) and the claim's side values (F2-S8)");
       }
     } catch (err: any) {
       failed++;

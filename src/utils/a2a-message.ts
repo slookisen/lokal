@@ -1,4 +1,4 @@
-import { capFreeText, capName } from "./free-text";
+import { capFreeText, capNameList, MAX_NAME_LIST_ITEMS } from "./free-text";
 
 /**
  * The structured data of an A2A message, shared by the three message/send
@@ -40,12 +40,11 @@ export function a2aMessageData(message: unknown): unknown {
 
 /**
  * The most entries of a list in the data that are read (slice I-Y2). The
- * lists the handlers read are RFB's `categories`, `tags` and `skills`, and
- * each entry is compared with every producer's categories, tags or skills.
- * The platform has 12 categories (PLATFORM_CATEGORIES in
- * services/search-enrich.ts).
+ * lists the handlers read are RFB's `categories`, `tags` and `skills`. Since
+ * slice I-Y3 the cut is utils/free-text.ts's capNameList, which MCP
+ * lokal_discover and POST /api/marketplace/discover use too.
  */
-export const MAX_A2A_DATA_LIST_ITEMS = 50;
+export const MAX_A2A_DATA_LIST_ITEMS = MAX_NAME_LIST_ITEMS;
 
 /** A string cut to MAX_FREE_TEXT_CHARS (utils/free-text.ts); any other value as it is. */
 function capString(v: unknown): unknown {
@@ -53,31 +52,23 @@ function capString(v: unknown): unknown {
 }
 
 /**
- * A list's first MAX_A2A_DATA_LIST_ITEMS entries, each string a name cut to
- * MAX_NAME_CHARS (utils/free-text.ts): a category, tag or skill. The list
- * itself when that changes nothing.
- */
-function capList(list: unknown[]): unknown[] {
-  const kept = list.length > MAX_A2A_DATA_LIST_ITEMS ? list.slice(0, MAX_A2A_DATA_LIST_ITEMS) : list;
-  const cut = kept.map((v) => (typeof v === "string" ? capName(v) : v));
-  return kept === list && cut.every((v, i) => v === list[i]) ? list : cut;
-}
-
-/**
  * The data with its strings cut (slice I-Y2): a string, the string values of
- * an object and the lists among them (capList). The handlers read no string
- * deeper than that, so a nested object is kept as it is. Data within the
- * caps is returned as the same value, so every such message answers as
- * before. This bounds each field; the message as a whole is bounded by the
- * body limit (express.json, 1 MB), as before.
+ * an object and the lists among them (capNameList: the first
+ * MAX_A2A_DATA_LIST_ITEMS entries, each string a name cut to MAX_NAME_CHARS).
+ * The handlers read no string deeper than that, so a nested object is kept
+ * as it is. Data within the caps is returned as the same value, so every
+ * such message answers as before. This bounds each field; the message as a
+ * whole is bounded by the body limit (express.json, 1 MB), and what RFB A2A
+ * logs, stores and echoes of it by boundedA2aQuery() in routes/a2a.ts
+ * (slice I-Y3).
  */
 export function capA2aData(data: unknown): unknown {
   if (typeof data === "string") return capFreeText(data);
-  if (Array.isArray(data)) return capList(data);
+  if (Array.isArray(data)) return capNameList(data);
   if (!data || typeof data !== "object") return data;
   let changed = false;
   const entries = Object.entries(data as Record<string, unknown>).map(([key, value]) => {
-    const capped = Array.isArray(value) ? capList(value) : capString(value);
+    const capped = Array.isArray(value) ? capNameList(value) : capString(value);
     if (capped !== value) changed = true;
     return [key, capped] as const;
   });

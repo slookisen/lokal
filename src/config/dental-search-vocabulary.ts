@@ -71,6 +71,29 @@ export const DENTAL_SEARCH_VOCABULARY: SearchVocabulary = {
     "barn", "barna", "children", "child", "kids", "kid", "voksne", "adults", "familie", "family",
     // words that read like places but are not meant as one here ("en time", Time kommune)
     "time", "timer", "dag", "today", "idag", "nå", "now", "avtale", "agreement", "område", "area",
+    // English words in a request an assistant passes on as it was written (S-EN, dev-request
+    // 2026-10-16-tannlege-sok-naturlig-sprak): «I need emergency dental care in Rogaland tonight» read
+    // «care, tonight» as a clinic name and found nothing. Chosen from data: none is a place in the
+    // register, and in the clinic names (dump 2026-10-18) only «care» (2 public clinics) and
+    // «dentistry» (1) stand as a whole word; both are the subject, like «dental» above, and the
+    // search still finds those clinics first by their name. Left out: words that are also
+    // Norwegian words (be, so, hi, ve, re, just, like, late, later, must, same) and words in a
+    // clinic or person name (am, may, asap, walk, fast, even, one, said, service).
+    // the subject
+    "care", "dentistry", "treatment", "services", "office", "practice",
+    // time
+    "tonight", "tomorrow", "morning", "evening", "afternoon", "night", "day", "days", "week", "next",
+    "weekend", "weekends", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "soon", "possible", "immediately", "currently", "right", "after", "before", "within", "out", "hours",
+    "hour", "pm", "opening", "during", "until", "early", "already", "availability",
+    // question words, pronouns and what is left of a contraction («don't», «I'll»: the apostrophe splits)
+    "how", "when", "why", "they", "them", "their", "ll", "don", "doesn", "didn", "isn", "aren",
+    // request and filler words
+    "someone", "somebody", "anyone", "anybody", "something", "place", "places", "know", "look",
+    "searching", "seeking", "go", "going", "got", "needs", "needed", "choose", "visit", "see", "able",
+    "was", "were", "been", "should", "might", "also", "only", "really", "very", "if", "but", "then",
+    "than", "here", "located", "based", "local", "closest", "top", "rated", "highly", "great",
+    "urgently", "quickly", "maybe", "perhaps", "kindly", "hello", "hey", "thanks", "thank",
   ]),
   specialties: [
     {
@@ -190,9 +213,22 @@ export function clinicSpecialties(
   for (const person of specialists) add(person?.specialty);
   const titles = specialists.flatMap((person) => (typeof person?.title === "string" ? [person.title.toLowerCase()] : []));
   if (titles.length === 0) return out;
-  for (const entry of vocabulary.specialties) {
-    const words = specialtyTitleWords([entry.canonical], entry);
-    if (titles.some((title) => words.some((w) => title.includes(w)))) add(entry.canonical);
+  for (const { canonical, words } of titleWordsOf(vocabulary)) {
+    if (titles.some((title) => words.some((w) => title.includes(w)))) add(canonical);
   }
   return out;
+}
+
+// Each vocabulary specialty's title words (specialtyTitleWords of its
+// canonical name), worked out once per vocabulary object: clinicSpecialties
+// runs per clinic card and, for the /sted and /fylke specialist count
+// (dental-area-facts.ts, F1-S3), per row with a staff list.
+const titleWordsByVocabulary = new WeakMap<SearchVocabulary, ReadonlyArray<{ canonical: string; words: string[] }>>();
+function titleWordsOf(vocabulary: SearchVocabulary): ReadonlyArray<{ canonical: string; words: string[] }> {
+  let list = titleWordsByVocabulary.get(vocabulary);
+  if (!list) {
+    list = vocabulary.specialties.map((entry) => ({ canonical: entry.canonical, words: specialtyTitleWords([entry.canonical], entry) }));
+    titleWordsByVocabulary.set(vocabulary, list);
+  }
+  return list;
 }

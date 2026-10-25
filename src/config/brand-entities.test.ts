@@ -13,8 +13,9 @@
  *       verticals/rfb/config.yaml display_name (what the front page used),
  *       and the agentplatform.no service list agrees with the entries.
  *   (c) URLs: https, `url` is a bare origin, logo/docs/privacy/terms live on
- *       the entry's own origin, logos are .png; pages that do not exist yet
- *       are null (dental logo/terms/docs, company terms/docs).
+ *       the entry's own origin, logos are .png; dental's logo is the F2-S4 PNG,
+ *       its docs page the G3-S4 guide and its terms page /vilkar (F2-S5);
+ *       pages that do not exist yet are null (company terms/docs).
  *   (d) alternateName: each brand carries its bare domain — RFB
  *       «rettfrabonden.com» (FUNN rett-fra-bonden-generisk-frase-forveksling);
  *       no duplicates, nothing equal to the name.
@@ -25,8 +26,8 @@
  *   (g) brandSameAs()/wikidataUrl(): a Q-ID becomes one extra sameAs URL
  *       (the one-line follow-up in A2A protocols/wikidata-utkast-2026-10-17.md §9);
  *       the result is a copy.
- *   (h) organizationJsonLd(): the exact RFB node; per brand: PNG logo (none
- *       for dental until F2-S4), alternateName, no empty values, no street
+ *   (h) organizationJsonLd(): the exact RFB node; per brand: PNG logo,
+ *       alternateName, no empty values, no street
  *       address, no legal name or org.nr. of its own; parentOrganization is
  *       parentOrganizationJsonLd() — the same node for all three — and its
  *       sameAs holds the Brreg URL. The company node has no parent.
@@ -153,21 +154,25 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     let origin = "";
     try { origin = new URL(e.url).origin; } catch { /* reported below */ }
     assertTrue(e.url.startsWith("https://") && origin === e.url, `c1 ${k}: url is a bare https origin, no trailing slash (${e.url})`);
-    const own = [e.logoPng, e.docsUrl, e.privacyUrl, e.termsUrl].filter((u): u is string => u !== null);
-    assertTrue(own.every((u) => u.startsWith(`${e.url}/`) && !/\s/.test(u)), `c2 ${k}: logo, docs, privacy and terms are https pages on ${e.url}`);
+    const own = [e.logoPng, e.iconPng192, e.docsUrl, e.privacyUrl, e.termsUrl].filter((u): u is string => u !== null);
+    assertTrue(own.every((u) => u.startsWith(`${e.url}/`) && !/\s/.test(u)), `c2 ${k}: logo, 192 icon, docs, privacy and terms are https pages on ${e.url}`);
     if (e.logoPng !== null) assertTrue(/\.png$/.test(e.logoPng), `c3 ${k}: the logo is a PNG (${e.logoPng})`);
+    if (e.iconPng192 !== null) assertTrue(/\.png$/.test(e.iconPng192) && e.logoPng !== null, `c3b ${k}: the 192 icon is a PNG, next to a logo (${e.iconPng192})`);
   }
   assertEq(
-    [E.rfb.logoPng, E.experiences.logoPng, E.company.logoPng],
-    ["https://rettfrabonden.com/logo-512.png", "https://opplevagent.no/favicon-512.png", "https://agentplatform.no/favicon-512.png"],
-    "c4: the logos: RFB /logo-512.png, Opplevagent /favicon-512.png, the company /favicon-512.png",
+    [E.rfb.logoPng, E.experiences.logoPng, E.dental.logoPng, E.company.logoPng],
+    ["https://rettfrabonden.com/logo-512.png", "https://opplevagent.no/favicon-512.png", "https://finn-tannlege.com/favicon-512.png", "https://agentplatform.no/favicon-512.png"],
+    "c4: the logos: RFB /logo-512.png, Opplevagent, Finn-tannlege (F2-S4) and the company /favicon-512.png",
   );
   assertTrue(!KEYS.some((k) => /\.svg$/i.test(E[k].logoPng ?? "")), "c5: no entry uses an SVG as its logo (Opplevagent's Organization used /favicon.svg)");
   assertEq(
-    [E.dental.logoPng, E.dental.termsUrl, E.dental.docsUrl, E.company.termsUrl, E.company.docsUrl],
-    [null, null, null, null, null],
-    "c6: pages that do not exist yet are null, not a guess (dental logo/terms/docs, company terms/docs)",
+    [E.company.termsUrl, E.company.docsUrl],
+    [null, null],
+    "c6: pages that do not exist yet are null, not a guess (company terms/docs)",
   );
+  assertEq(E.dental.termsUrl, "https://finn-tannlege.com/vilkar",
+    "c6b: dental terms is /vilkar (F2-S5, A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon)");
+  assertEq(E.dental.docsUrl, "https://finn-tannlege.com/guide-tannlege-ai", "c7: Finn-tannlege's docs page is the AI guide (G3-S4)");
 
   // ── (d) alternateName ───────────────────────────────────────────────────
   assertTrue(E.rfb.alternateName.includes("rettfrabonden.com"), "d1: RFB's alternateName holds «rettfrabonden.com» (the phrase alone is generic Norwegian)");
@@ -243,11 +248,12 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
     assertTrue(org["@type"] === "Organization" && org.name === e.name && org.url === e.url && org["@id"] === `${e.url}/#organization`, `h3 ${k}: Organization with the brand's name, url and @id`);
     assertEq(org.alternateName, e.alternateName, `h4 ${k}: alternateName from the entry`);
     if (e.logoPng) assertTrue(org.logo === e.logoPng && /\.png$/.test(String(org.logo)), `h5 ${k}: logo is the entry's PNG`);
-    else assertTrue(!("logo" in org), `h5 ${k}: no logo key while the entry has no PNG (dental until F2-S4)`);
+    else assertTrue(!("logo" in org), `h5 ${k}: no logo key while the entry has no PNG`);
     assertEq(org.parentOrganization, parent, `h6 ${k}: parentOrganization is parentOrganizationJsonLd()`);
     assertTrue(Array.isArray((org.parentOrganization as any)?.sameAs) && (org.parentOrganization as any).sameAs.includes(COMPANY_INFO.brregUrl), `h7 ${k}: parentOrganization.sameAs holds the Brreg URL`);
     assertTrue(!("legalName" in org) && !("identifier" in org), `h8 ${k}: the brand does not claim the company's legal name or org.nr.`);
     assertTrue(!("sameAs" in org), `h9 ${k}: no empty sameAs on the brand while it has no profiles`);
+    assertTrue(("disambiguatingDescription" in org) === !!e.disambiguation?.nb && (!e.disambiguation?.nb || org.disambiguatingDescription === e.disambiguation.nb), `h10b ${k}: disambiguatingDescription only (and exactly) when the entry has disambiguation`);
     assertTrue(!hasEmptyValue(org), `h10 ${k}: no empty string, empty array or null anywhere`);
     assertTrue(!JSON.stringify(org).includes(COMPANY_INFO.address.street), `h11 ${k}: no street address`);
   }
@@ -304,12 +310,14 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
 
   // ── (j) logo files ──────────────────────────────────────────────────────
   // The file behind each logo URL: RFB via express.static, Opplevagent via
-  // experiences-seo.ts GET /favicon-512.png, the company via
-  // agentplatform-site.ts GET /favicon-512.png (their route tests check 200 image/png).
+  // experiences-seo.ts GET /favicon-512.png, Finn-tannlege via dental-seo.ts
+  // GET /favicon-512.png, the company via agentplatform-site.ts GET
+  // /favicon-512.png (their route tests check 200 image/png).
   {
     const files: Array<[BrandKey, string]> = [
       ["rfb", "logo-512.png"],
       ["experiences", "opplevagent-favicon-512.png"],
+      ["dental", "dental-favicon-512.png"],
       ["company", "agentplatform-icon-512.png"],
     ];
     const hashes: string[] = [];
@@ -321,7 +329,7 @@ export function runBrandEntitiesTests(opts: { log?: boolean } = {}): TestSummary
       hashes.push(md5(buf));
     }
     assertTrue(new Set(hashes).size === hashes.length, "j2: no two entries share a logo file (each brand shows its own mark)");
-    assertTrue(hashes[1] !== RFB_SPROUT_MD5 && hashes[2] !== RFB_SPROUT_MD5, "j3: neither Opplevagent's nor the company's logo is the RFB sprout icon");
+    assertTrue(hashes.slice(1).every((h) => h !== RFB_SPROUT_MD5), "j3: no logo but RFB's own is the RFB sprout icon (Opplevagent, Finn-tannlege, the company)");
   }
 
   // ── (k) G3-S2: the mislabelled Opplevagent connector icon ───────────────

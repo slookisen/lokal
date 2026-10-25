@@ -41,6 +41,8 @@ interface Row {
   name: string;
   priceNok?: number;
   ownerSet?: boolean;
+  /** skive 4: confirmed with the producer by the admin (orderable for an eligible producer). */
+  confirmed?: boolean;
   availability?: string;
 }
 
@@ -48,8 +50,8 @@ const ROWS: Row[] = [
   { id: "ks-honning", agent: BAKERI, name: "Honning" },
   { id: "ks-bakervarer", agent: BAKERI, name: "BAKERVARER" },
   { id: "ks-kjott-oos", agent: BAKERI, name: "Kjøtt", availability: "out_of_stock" },
-  { id: "ks-brod", agent: BAKERI, name: "Surdeigsbrød" },
-  { id: "ks-egg-pris", agent: BAKERI, name: "Egg", priceNok: 60 },
+  { id: "ks-brod", agent: BAKERI, name: "Surdeigsbrød", confirmed: true },
+  { id: "ks-egg-pris", agent: BAKERI, name: "Egg", priceNok: 60, confirmed: true },
   { id: "ks-egg-eier", agent: EIER, name: "Egg", ownerSet: true },
   { id: "ks-honning-eier", agent: EIER, name: "Honning", ownerSet: true, availability: "out_of_stock" },
 ];
@@ -130,7 +132,7 @@ export async function runRfbKurvvaktKategorietiketterTests(opts: { log?: boolean
         INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source, availability_updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(r.id, r.agent, r.name, r.name.toLowerCase(), r.priceNok ?? null, r.priceNok ? "brett" : null, r.availability ?? "in_stock",
-        r.ownerSet ? "producer_dashboard" : "enrichment", r.ownerSet ? ownerSetAt : null);
+        r.ownerSet ? "producer_dashboard" : r.confirmed ? "admin_producer_confirmed" : "enrichment", r.ownerSet ? ownerSetAt : null);
     }
 
     const { CATEGORY_LABEL_CART_ERROR } = cartSvc;
@@ -220,14 +222,14 @@ export async function runRfbKurvvaktKategorietiketterTests(opts: { log?: boolean
 
       const line = db.prepare("SELECT id FROM cart_items WHERE cart_id = ? AND product_id = 'ks-honning'").get(cart_id) as { id: string };
       assertTrue(cartSvc.deleteCartItem(cart_id, line.id).success, "submitCart: the buyer removes the label line");
-      const ok = cartSvc.submitCart(cart_id, { contact_consent: false });
+      const ok = cartSvc.submitCart(cart_id, { contact_consent: true, buyer_email: "kjoper@example.com" }); // F2: a real order needs contact info
       assertTrue(ok.success === true && ok.orders.length === 1 && ok.orders[0]!.agent_id === BAKERI && ok.contact_handoffs.length === 1,
         "submitCart: without the label the same cart is sent (one order for the real product, one contact handoff)");
 
       const owner = cartSvc.createCart();
       assertTrue(cartSvc.addCartItem(owner.cart_id, "ks-egg-eier", 1).success && cartSvc.addCartItem(owner.cart_id, "ks-egg-pris", 1).success,
         "submitCart setup: an owner-set row and a priced category name in a cart");
-      const sent = cartSvc.submitCart(owner.cart_id, { contact_consent: false });
+      const sent = cartSvc.submitCart(owner.cart_id, { contact_consent: true, buyer_email: "kjoper2@example.com" });
       assertTrue(sent.success === true && sent.orders.length === 2, "submitCart: an owner-set row and a priced category name are sent as orders");
     }
 

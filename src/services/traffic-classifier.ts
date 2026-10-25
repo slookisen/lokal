@@ -64,6 +64,11 @@ export const AI_SEARCH_PATTERNS = [
 export const AI_CRAWLER_PATTERNS = [
   "GPTBot",
   "OAI-SearchBot",
+  // Claude-SearchBot is Anthropic's search INDEXER (like OAI-SearchBot above):
+  // autonomous, not user-initiated, so ai_crawler, NOT ai_search. Claude-User /
+  // Claude-Web stay in AI_SEARCH_PATTERNS, which is checked first; neither of
+  // those strings occurs in "Claude-SearchBot", so it cannot match them.
+  "Claude-SearchBot",
   "ClaudeBot",
   "anthropic-ai",
   "PerplexityBot",
@@ -302,13 +307,25 @@ export function clientClassForUA(userAgent: string): ClientClass {
   return category;
 }
 
+/** True when a session_id's UA part is a browser's device bucket + hash (sessionIdFor), not a raw UA. */
+function isBucketedSessionUa(ua: string): boolean {
+  return /^(mobile|tablet|desktop):[0-9a-z]+$/i.test(ua);
+}
+
 /**
- * A stored row's client class: the write-time `client_class` when present and
- * valid, else the class recovered from its session_id (legacy rows).
+ * A stored row's client class. The write-time `client_class` is used when
+ * valid for bucketed (human-looking) sessions, whose session_id no longer
+ * carries the UA (or has none at all), and for the owner override `dev`. Bot sessions keep the raw
+ * UA in session_id, so they are classified with today's rules: new patterns
+ * (e.g. Claude-SearchBot) then apply retroactively to stored rows. Legacy rows
+ * without a stored class also fall back to the session_id.
  */
 export function storedClientClass(sessionId: string, clientClass: string | null | undefined): ClientClass {
-  if (clientClass && CLIENT_CLASSES.includes(clientClass)) return clientClass as ClientClass;
-  return clientClassForUA(uaFromSessionId(sessionId || ""));
+  const ua = uaFromSessionId(sessionId || "");
+  if (clientClass && CLIENT_CLASSES.includes(clientClass)) {
+    if (clientClass === "dev" || !ua || isBucketedSessionUa(ua)) return clientClass as ClientClass;
+  }
+  return clientClassForUA(ua);
 }
 
 /**

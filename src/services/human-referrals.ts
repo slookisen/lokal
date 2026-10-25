@@ -27,12 +27,20 @@ export function parseUserAgent(ua: string): UAParseResult {
   // "GPTBot" and its browsing agent is "ChatGPT-User"; likewise ClaudeBot and
   // Claude-User for Anthropic. Match the full real-world fleet so agentTraffic
   // actually reflects crawler hits.
-  if (lower.includes("gptbot") || lower.includes("chatgpt") || lower.includes("oai-searchbot")) {
+  // The BOT flag uses the exact tokens of traffic-classifier.ts (AI_SEARCH_PATTERNS / AI_CRAWLER_PATTERNS).
+  // A bare "chatgpt"/"claude" substring still names the client (clientName is also read from MCP
+  // client ids, e.g. "ChatGPT", "Claude Desktop") but is NOT proof of a bot: a real person's
+  // app-browser UA would otherwise be stamped contact_clicks.is_bot = 1.
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, punkt 9. Bot tokens stay strict: these
+  // exact ones are what real fetchers send; unverified app-browser UAs are treated as people.
+  if (lower.includes("gptbot") || lower.includes("chatgpt-user") || lower.includes("oai-searchbot")) {
     return { isBot: true, clientType: "chatgpt", clientName: "ChatGPT" };
   }
-  if (lower.includes("claudebot") || lower.includes("claude-user") || lower.includes("claude")) {
+  if (lower.includes("chatgpt")) return { isBot: false, clientType: "chatgpt", clientName: "ChatGPT" };
+  if (lower.includes("claudebot") || lower.includes("claude-searchbot") || lower.includes("claude-user") || lower.includes("claude-web") || lower.includes("anthropic-ai")) {
     return { isBot: true, clientType: "claude", clientName: "Claude" };
   }
+  if (lower.includes("claude")) return { isBot: false, clientType: "claude", clientName: "Claude" };
   if (lower.includes("gpt-4") || lower.includes("gpt-3")) return { isBot: true, clientType: "chatgpt", clientName: "GPT" };
   if (lower.includes("gemini") || lower.includes("google-extended")) return { isBot: true, clientType: "gemini", clientName: "Gemini" };
   if (lower.includes("perplexitybot") || lower.includes("perplexity")) return { isBot: true, clientType: "a2a-agent", clientName: "Perplexity", botSource: "ai_search" };
@@ -83,33 +91,117 @@ export interface ReferralSourceClass {
 // pure, no guessing: an unrecognized host is "annet", no referrer is "direkte",
 // own-domain navigation is "intern" (excluded from the public strip upstream).
 //
-// Ordering matters: Gemini/Bard live on *.google.com and ChatGPT on openai.com,
-// so the AI-assistant checks MUST run before the generic google/bing checks
-// below or those assistants would be miscounted as plain search.
-export function classifyReferralSource(referrer: string | null | undefined): ReferralSourceClass {
-  if (!referrer || !String(referrer).trim()) return { key: "direkte", label: "Direkte" };
+// AI assistants are matched on the parsed HOST (exact or subdomain), never as a
+// substring of the whole URL: "grok" would hit sylteogrokt.no, "you.com" would
+// hit thankyou.com and "t.co" would hit chatgpt.com. They also run BEFORE the
+// search/social checks below (Gemini/Bard live on *.google.com).
+
+/** Keys classifyReferralSource returns for an AI assistant. */
+export const AI_REFERRAL_KEYS = ["chatgpt", "claude", "perplexity", "gemini", "copilot", "mistral", "metaai", "grok", "deepseek", "you", "kagi", "annenai"] as const;
+export function isAiReferralKey(key: string): boolean {
+  return (AI_REFERRAL_KEYS as readonly string[]).includes(key);
+}
+
+// [host, key, label] — a host matches when it equals the entry or ends with ".<entry>".
+const AI_REFERRAL_HOSTS: Array<[string, string, string]> = [
+  ["chat.openai.com", "chatgpt", "ChatGPT"], ["chatgpt.com", "chatgpt", "ChatGPT"], ["openai.com", "chatgpt", "ChatGPT"],
+  ["claude.ai", "claude", "Claude"],
+  ["perplexity.ai", "perplexity", "Perplexity"], ["perplexity.com", "perplexity", "Perplexity"],
+  ["gemini.google.com", "gemini", "Gemini"], ["bard.google.com", "gemini", "Gemini"],
+  ["copilot.microsoft.com", "copilot", "Copilot"], ["copilot.com", "copilot", "Copilot"],
+  ["chat.mistral.ai", "mistral", "Mistral"],
+  ["meta.ai", "metaai", "Meta AI"],
+  ["grok.com", "grok", "Grok"],
+  ["chat.deepseek.com", "deepseek", "DeepSeek"],
+  ["you.com", "you", "You.com"],
+];
+
+const AI_LABELS: Record<string, string> = {
+  chatgpt: "ChatGPT", claude: "Claude", perplexity: "Perplexity", gemini: "Gemini", copilot: "Copilot",
+  mistral: "Mistral", metaai: "Meta AI", grok: "Grok", deepseek: "DeepSeek", you: "You.com", kagi: "Kagi Assistant", annenai: "Annen AI",
+};
+
+/** Lower-cased host of a referrer URL; null when it does not parse. */
+function referrerHost(ref: string): string | null {
+  try {
+    return new URL(/^[a-z][a-z0-9+.-]*:/i.test(ref) ? ref : `https://${ref}`).hostname.toLowerCase().replace(/\.$/, "") || null;
+  } catch { return null; }
+}
+const hostIs = (host: string, domain: string) => host === domain || host.endsWith(`.${domain}`);
+
+function aiKeyFromReferrer(ref: string): string | null {
+  const host = referrerHost(ref);
+  if (!host) return null;
+  for (const [domain, key] of AI_REFERRAL_HOSTS) if (hostIs(host, domain)) return key;
+  // Kagi is a search engine; only its Assistant is an AI answer.
+  if (hostIs(host, "kagi.com") && /^https?:\/\/[^/]+\/assistant(?:[/?#]|$)/i.test(ref.trim())) return "kagi";
+  return null;
+}
+
+// UTM fallback, whitelist ONLY (our own addAiUtmParams utm_source=<client> plus what
+// ChatGPT & co. append themselves). Not agentplatform.no, not producers' own campaigns.
+const AI_UTM_SOURCES: Array<[string, string]> = [
+  ["chatgpt.com", "chatgpt"], ["chatgpt", "chatgpt"], ["copilot.com", "copilot"], ["github_copilot", "copilot"], ["perplexity", "perplexity"], ["claude", "claude"], ["gemini", "gemini"],
+];
+
+export interface AiClickInput {
+  referrer?: string | null;
+  /** First or any value; Express gives an array when the param appears twice (ours + ChatGPT's). */
+  utm_source?: string | string[] | null;
+  utm_campaign?: string | string[] | null;
+}
+
+function utmValues(v: string | string[] | null | undefined): string[] {
+  return (Array.isArray(v) ? v : [v]).map((x) => String(x ?? "").trim().toLowerCase()).filter(Boolean);
+}
+
+function aiKeyFromUtmSource(v: string | string[] | null | undefined): string | null {
+  // First whitelist hit wins, so an array classifies as AI regardless of order.
+  // Exact value or the token as a domain prefix (perplexity.ai) — never a substring, so a producer's own
+  // campaign («claudes-gard», «geminifarm») is not counted as an AI click.
+  for (const val of utmValues(v)) for (const [token, key] of AI_UTM_SOURCES) if (val === token || val.startsWith(token + ".")) return key;
+  return null;
+}
+
+/**
+ * Which AI assistant a click came from, or null when it is not a click from an AI answer.
+ * Pure; slice 1 of 2026-10-14-klikk-fra-ai-svar-per-profil (later slices store it per profile).
+ * Our own utm_source wins over the referrer; a referrer wins over utm_campaign=ai_search alone.
+ */
+export function classifyAiClickSource(i: AiClickInput): "chatgpt" | "claude" | "perplexity" | "gemini" | "copilot" | "other" | null {
+  const key = aiKeyFromUtmSource(i.utm_source) ?? (i.referrer ? aiKeyFromReferrer(String(i.referrer)) : null);
+  if (key) return (key === "chatgpt" || key === "claude" || key === "perplexity" || key === "gemini" || key === "copilot") ? key : "other";
+  if (utmValues(i.utm_campaign).includes("ai_search")) return "other";
+  return null;
+}
+
+export function classifyReferralSource(
+  referrer: string | null | undefined,
+  utm?: { utm_source?: string | string[] | null; utm_campaign?: string | string[] | null },
+): ReferralSourceClass {
+  const hasRef = !!referrer && !!String(referrer).trim();
+  if (!hasRef) {
+    // No referrer (Referrer-Policy: no-referrer in AI apps): the UTM mark is all there is.
+    const k = utm ? aiKeyFromUtmSource(utm.utm_source) : null;
+    if (k) return { key: k, label: AI_LABELS[k]! };
+    if (utm && utmValues(utm.utm_campaign).includes("ai_search")) return { key: "annenai", label: AI_LABELS.annenai! };
+    return { key: "direkte", label: "Direkte" };
+  }
   const ref = String(referrer).toLowerCase();
 
   // AI assistants first (see ordering note above).
-  if (ref.includes("chat.openai.com") || ref.includes("chatgpt.com") || ref.includes("openai.com")) {
-    return { key: "chatgpt", label: "ChatGPT" };
-  }
-  if (ref.includes("perplexity")) return { key: "perplexity", label: "Perplexity" };
-  if (ref.includes("gemini.google") || ref.includes("bard.google") || ref.includes("gemini.")) {
-    return { key: "gemini", label: "Gemini" };
-  }
-  if (ref.includes("copilot.microsoft") || ref.includes("copilot.")) {
-    return { key: "copilot", label: "Copilot" };
-  }
+  const ai = aiKeyFromReferrer(String(referrer).trim()) ?? (utm ? aiKeyFromUtmSource(utm.utm_source) : null);
+  if (ai) return { key: ai, label: AI_LABELS[ai]! };
 
   // Search engines (human click-through from a SERP) — same tokens as inferReferrerSource.
   if (ref.includes("google")) return { key: "google", label: "Google-søk" };
   if (ref.includes("bing")) return { key: "bing", label: "Bing" };
   if (ref.includes("duckduckgo")) return { key: "duckduckgo", label: "DuckDuckGo" };
 
-  // Social platforms — same tokens as inferReferrerSource's social bucket.
+  // Social platforms — same tokens as inferReferrerSource's social bucket ("t.co" on the host only).
+  const host = referrerHost(String(referrer).trim());
   if (ref.includes("facebook") || ref.includes("instagram") || ref.includes("linkedin") ||
-      ref.includes("twitter") || ref.includes("t.co") || ref.includes("reddit") ||
+      ref.includes("twitter") || (host !== null && hostIs(host, "t.co")) || ref.includes("reddit") ||
       ref.includes("tiktok") || ref.includes("bsky.app") || ref.includes("bluesky")) {
     return { key: "sosial", label: "Sosiale medier" };
   }
@@ -127,6 +219,9 @@ export interface HumanReferralRow {
   path: string | null | undefined;
   session_id: string | null | undefined;
   is_owner?: number | null;
+  /** UTM marks of the landing (AI-click fallback when there is no referrer). */
+  utm_source?: string | null;
+  utm_campaign?: string | null;
 }
 
 export interface HumanReferralPattern {
@@ -163,7 +258,9 @@ export function aggregateHumanReferrals(
 
   for (const r of rows) {
     if (r.is_owner === 1) continue;                                  // internal/owner traffic excluded
-    if (!r.referrer || !String(r.referrer).trim()) continue;        // direct visit → no journey to tell
+    const utm = { utm_source: r.utm_source, utm_campaign: r.utm_campaign };
+    // direct visit → no journey to tell, unless the landing carries an AI UTM mark
+    if ((!r.referrer || !String(r.referrer).trim()) && classifyReferralSource(null, utm).key === "direkte") continue;
 
     const sid = r.session_id ? String(r.session_id) : "";
     // Bot/crawler exclusion — reuse the canonical parseUserAgent heuristic on
@@ -172,8 +269,10 @@ export function aggregateHumanReferrals(
     const ua = sid.includes(":") ? sid.slice(sid.indexOf(":") + 1) : "";
     if (ua && parseUserAgent(ua).isBot) continue;
 
-    const src = classifyReferralSource(r.referrer);
-    if (src.key === "intern" || src.key === "direkte") continue;     // not an external referral
+    const cls = classifyReferralSource(r.referrer, utm);
+    if (cls.key === "intern" || cls.key === "direkte") continue;     // not an external referral
+    // All AI assistants form ONE card, so they do not fall under the minimum individually.
+    const src = isAiReferralKey(cls.key) ? { key: "ai", label: "AI-assistenter" } : cls;
 
     let g = groups.get(src.key);
     if (!g) { g = { sessions: new Set(), producerViews: 0, slugCounts: new Map(), label: src.label }; groups.set(src.key, g); }
@@ -217,8 +316,11 @@ export function aggregateHumanReferrals(
 // classifier; human-referrals.test.ts asserts SQL and classifier agree.
 export const OWN_DOMAIN_REFERRER_TOKENS = ["rettfrabonden.com", "finn-tannlege.com", "opplevagent"] as const;
 export const REFERRER_TOKENS_BEFORE_OWN_DOMAIN = [
+  // Superset of what the classifier tests (it matches AI hosts exactly, the SQL only by substring):
+  // the SQL may keep a row the classifier then calls intern, never the other way round.
   "chat.openai.com", "chatgpt.com", "openai.com", "perplexity",
   "gemini.google", "bard.google", "gemini.", "copilot.microsoft", "copilot.",
+  "claude.ai", "mistral.ai", "meta.ai", "grok.com", "deepseek.com", "you.com", "kagi.com/assistant",
   "google", "bing", "duckduckgo",
   "facebook", "instagram", "linkedin", "twitter", "t.co", "reddit", "tiktok", "bsky.app", "bluesky",
 ] as const;

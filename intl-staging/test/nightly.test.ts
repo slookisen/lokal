@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { REGISTER_SEARCH_DAILY_MAX, REGISTER_SEARCH_MAX, REGISTER_SEARCH_WINDOW_MS } from "../src/app";
 import { quotePhoneDigits } from "../src/checks";
 import { runSeImport } from "../src/se-import";
-import { MAX_EXCERPT_CHARS } from "../src/store";
+import { EXCERPT_TTL_MS, MAX_EXCERPT_CHARS } from "../src/store";
 import { bvFile, call, makeTestApp, scbFile, sourcesFrom, withServer } from "./helpers";
 
 const ORG = "5561000011";
@@ -274,9 +274,13 @@ test("purge drops excerpts that no waiting draft needs (left by an older version
     await call(base, "POST", "/candidates/lease", { run_id: "build-n10", n: 5 });
     assert.equal((await call(base, "POST", `/candidates/${encodeURIComponent(CID)}/draft`, draft("build-n10"))).status, 200);
   });
-  // An orphan, as an older version would have left after a verdict.
+  // An orphan, as an older version would have left after a verdict: fetched a day ago and not
+  // expired, so only the orphan rule can drop it. With the hardcoded expires_at 2026-11-13T09:00Z
+  // it replaces, the expiry rule would drop it from then on and the test would stop testing the
+  // orphan rule (dev-request 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+  const fetchedAt = new Date(Date.now() - 24 * 3600 * 1000);
   db.prepare("INSERT INTO excerpts (candidate_id, url, text, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?)").run(
-    CID2, PAGE2, PAGE2_TEXT, "2026-10-14T09:00:00.000Z", "2026-11-13T09:00:00.000Z",
+    CID2, PAGE2, PAGE2_TEXT, fetchedAt.toISOString(), new Date(fetchedAt.getTime() + EXCERPT_TTL_MS).toISOString(),
   );
   await withServer(app, async (base) => {
     assert.equal((await call(base, "POST", "/purge")).status, 200);

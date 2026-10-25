@@ -46,6 +46,7 @@
 import { getDb } from "../database/init";
 import { isBlocked } from "./blocklist-service";
 import { emailService, EmailOptions } from "./email-service";
+import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL } from "./order-pricing";
 
 const APP_URL = process.env.APP_URL || "https://rettfrabonden.com";
 
@@ -110,8 +111,15 @@ export interface OrderNotificationInput {
   buyer_ref: string;
   confirm_token: string;
   pickup_time: string | null;
+  /**
+   * The sum over the lines that have a price; null = no line has a price (no
+   * sum row is rendered — F6, never «0 kr»).
+   */
   total_nok: number | null;
-  items: Array<{ name: string; qty: number; unit: string | null }>;
+  /** F6: at least one line has no price, so the sum is labelled «Sum for varer med pris». */
+  total_is_partial?: boolean;
+  /** `line_total: null` (explicit) = the line has no price → «Pris avtales med produsenten». */
+  items: Array<{ name: string; qty: number; unit: string | null; line_total?: number | null }>;
   // skive 2 (hybrid utsending): optional buyer contact fields. cart-service's
   // submitCart() only ever passes them when the buyer explicitly consented
   // (contact_consent=true) — a null/absent field is simply left out of the
@@ -127,6 +135,8 @@ export interface OrderNotificationInput {
   // authorized ("authorized") or when a prepay order fell back to paying at
   // pickup ("not_prepaid"); it replaces the «Ingen betaling skjer via
   // plattformen» line, which would be false for a prepaid order (also in v1).
+  /** F4: the single reminder for an order the producer has not answered (same link). */
+  reminder?: boolean;
   payment?:
     | { status: "authorized"; amount_nok: number; confirm_by: string | null }
     | { status: "not_prepaid" }
@@ -184,13 +194,18 @@ function renderItemRowsHtml(items: OrderNotificationInput["items"]): string {
   return items
     .map(
       (i) =>
-        `<tr><td style="padding:4px 12px 4px 0">${escHtml(i.name)}</td><td>${i.qty}${i.unit ? " " + escHtml(i.unit) : ""}</td></tr>`
+        `<tr><td style="padding:4px 12px 4px 0">${escHtml(i.name)}</td><td>${i.qty}${i.unit ? " " + escHtml(i.unit) : ""}</td>${i.line_total === null ? `<td style="padding-left:12px">${escHtml(PRICE_BY_AGREEMENT)}</td>` : ""}</tr>`
     )
     .join("\n  ");
 }
 
 function renderItemLinesText(items: OrderNotificationInput["items"]): string {
-  return items.map((i) => `- ${i.name}: ${i.qty}${i.unit ? " " + i.unit : ""}`).join("\n");
+  return items.map((i) => `- ${i.name}: ${i.qty}${i.unit ? " " + i.unit : ""}${i.line_total === null ? ` — ${PRICE_BY_AGREEMENT}` : ""}`).join("\n");
+}
+
+/** F6: the sum row label (partial sums say so); the row is omitted when total_nok is null. */
+function sumLabelOf(order: OrderNotificationInput): string {
+  return order.total_is_partial ? PARTIAL_SUM_LABEL : "Sum";
 }
 
 const NO_PAYMENT_HTML = "<p>Ingen betaling skjer via plattformen; oppgjør ved henting som vanlig.</p>";
@@ -206,7 +221,15 @@ const DEFAULT_INTRO = "Du har fått en ny henteordre via Rett fra Bonden";
 const DEFAULT_LINK = "Bekreft eller avslå ordren her";
 function paymentCopy(order: OrderNotificationInput, orderRef: string): Required<PaymentCopy> {
   const c = paymentCopyInner(order, orderRef);
-  return { intro: DEFAULT_INTRO, link: DEFAULT_LINK, ...c };
+  const merged = { intro: DEFAULT_INTRO, link: DEFAULT_LINK, ...c };
+  if (order.reminder) {
+    return {
+      ...merged,
+      subject: `Påminnelse: henteordre venter på svar — ${orderRef}`,
+      intro: "Påminnelse: du har en henteordre via Rett fra Bonden som ikke er besvart ennå. Kunden venter på bekreftelse eller avslag",
+    };
+  }
+  return merged;
 }
 function paymentCopyInner(order: OrderNotificationInput, orderRef: string): PaymentCopy {
   const p = order.payment;
@@ -258,19 +281,19 @@ export function renderOrderNotificationEmailV1(order: OrderNotificationInput): R
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Ordre-ref:</td><td>${escHtml(orderRef)}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kjøper-ref:</td><td>${escHtml(maskBuyerRef(order.buyer_ref))}</td></tr>
   ${order.pickup_time ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Hentetid:</td><td>${escHtml(order.pickup_time)}</td></tr>` : ""}
-  ${order.total_nok != null ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Sum:</td><td>${order.total_nok} kr</td></tr>` : ""}
+  ${order.total_nok != null ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${sumLabelOf(order)}:</td><td>${order.total_nok} kr</td></tr>` : ""}
 </table>
 <p style="font-weight:bold;margin-bottom:4px">Varer:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — samme side brukes for «klar for henting» og «hentet».<br>
+<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — her bekrefter eller avslår du ordren.<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return { subject: pay.subject, htmlContent, textContent, replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO };
 }
@@ -321,19 +344,19 @@ export function renderOrderNotificationEmailV2(order: OrderNotificationInput): R
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Ordre-ref:</td><td>${escHtml(orderRef)}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kjøper-ref:</td><td>${escHtml(maskBuyerRef(order.buyer_ref))}</td></tr>
   ${order.pickup_time ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Hentetid:</td><td>${escHtml(order.pickup_time)}</td></tr>` : ""}
-  ${order.total_nok != null ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Sum:</td><td>${order.total_nok} kr</td></tr>` : ""}
+  ${order.total_nok != null ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">${sumLabelOf(order)}:</td><td>${order.total_nok} kr</td></tr>` : ""}
 </table>
 ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — samme side brukes for «klar for henting» og «hentet».<br>
+<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — her bekrefter eller avslår du ordren.<br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\nSum: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return {
     subject: pay.subject,
@@ -353,21 +376,107 @@ export function renderOrderNotificationEmail(
 
 // ─── Notification send ──────────────────────────────────────────────────────
 
+export type OrderNotifyOutcome = "sent" | "skipped" | "failed";
+
+/**
+ * F4: records that the producer e-mail for an order FAILED (a skip because the
+ * producer is not eligible is no failure). Best-effort: a DB without the
+ * column (minimal test schema) is tolerated.
+ */
+function markNotifyFailed(orderId: string): void {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    db.prepare("UPDATE orders SET notify_failed_at = COALESCE(notify_failed_at, datetime('now')) WHERE id = ?").run(orderId);
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Skive 1b (B1): records that the producer e-mail for an order was actually
+ * SENT (the first send or the follow-ups retry, never the reminder). The
+ * follow-ups job only reminds about and auto-cancels orders carrying this
+ * stamp. Best-effort like markNotifyFailed: a DB without the column is
+ * tolerated (the order then simply gets no follow-ups, the safe side).
+ */
+function markNotifySent(orderId: string): void {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    db.prepare("UPDATE orders SET notify_sent_at = COALESCE(notify_sent_at, datetime('now')) WHERE id = ?").run(orderId);
+  } catch { /* best-effort */ }
+}
+
+/**
+ * F4: the admin alert («den eksisterende varselkanalen» = the admin
+ * notification e-mail, ADMIN_NOTIFICATION_EMAIL, same as the claim
+ * notifications). No address configured → logged only. Never throws.
+ */
+export async function sendAdminOrderAlert(subject: string, text: string): Promise<boolean> {
+  const to = (process.env.ADMIN_NOTIFICATION_EMAIL || "").trim();
+  console.error(`[order-followup] ALERT ${subject}`);
+  if (!to) return false;
+  try {
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({ to, subject, textContent: text, omitAgentHeader: true });
+    return !!res?.success;
+  } catch (err) {
+    console.error("[order-followup] admin alert send failed:", err);
+    return false;
+  }
+}
+
 /**
  * Fire-and-forget seller notification for one freshly created order.
  * Resolves the gated recipient, sends via emailService, and logs
  * `[order-notify] sent <ms>` on success so the <1 min SLA is measurable.
  * Never throws.
+ *
+ * F4: a FAILED send (transport error, not a skip) marks the order
+ * (orders.notify_failed_at) and alerts the admin once; the followups job then
+ * retries once (`opts.retry`). A failed retry alerts again.
  */
-export async function sendOrderNotificationForOrder(order: OrderNotificationInput): Promise<void> {
+export async function sendOrderNotificationForOrder(order: OrderNotificationInput, opts: { retry?: boolean; reminder?: boolean } = {}): Promise<OrderNotifyOutcome> {
   const started = Date.now();
+  const fail = async (why: string): Promise<OrderNotifyOutcome> => {
+    // The reminder is its own single send: it neither re-arms the retry of
+    // the original e-mail nor gets retried itself.
+    if (!opts.retry && !opts.reminder) markNotifyFailed(order.order_id);
+    const what = opts.reminder ? "påminnelsen til produsenten" : "produsent-e-posten";
+    await sendAdminOrderAlert(
+      opts.retry ? `Ordre ${order.order_id.slice(0, 8)}: nytt forsøk på produsent-e-post feilet` : `Ordre ${order.order_id.slice(0, 8)}: ${what} feilet`,
+      `${what[0]!.toUpperCase()}${what.slice(1)} for ordre ${order.order_id} (produsent ${order.producer_name}, ${order.agent_id}) kunne ikke sendes${opts.retry ? " heller ved nytt forsøk" : ""}.\nÅrsak: ${why}\n` +
+      (opts.retry || opts.reminder ? "Ingen flere forsøk. Kontakt produsenten direkte." : "Systemet prøver én gang til."),
+    );
+    return "failed";
+  };
   try {
     const recipient = resolveOrderNotificationRecipient(order.agent_id);
     if (!recipient.eligible) {
       console.log(
         `[order-notify] skipped order=${order.order_id} agent=${order.agent_id} reason=${recipient.reason}`
       );
-      return;
+      // Skive 1b (B1): an order that exists but never reached the producer
+      // (they turned orders off, or the address was blocklisted, between the
+      // submit and this send) gets no notify_sent_at, so the follow-ups never
+      // call it «not answered». The admin is told once, here, instead. The
+      // reminder reports its own outcome (order-followups), and a retry only
+      // follows a failure, so neither alerts again.
+      if (!opts.retry && !opts.reminder) {
+        // Review round 2 (S4): an order that already reached the producer
+        // once (e.g. a prepay order notified at authorization whose later
+        // fallback notice is skipped) is still followed up as usual.
+        let sentBefore: string | null = null;
+        try {
+          const db = _notifyTestDb ?? getDb();
+          sentBefore = (db.prepare("SELECT notify_sent_at FROM orders WHERE id = ?").get(order.order_id) as { notify_sent_at: string | null } | undefined)?.notify_sent_at ?? null;
+        } catch { /* best-effort */ }
+        await sendAdminOrderAlert(
+          `Ordre ${order.order_id.slice(0, 8)}: produsent-e-posten ble ikke sendt`,
+          `Ordre ${order.order_id} (produsent ${order.producer_name}, ${order.agent_id}) ble ikke sendt til produsenten (${recipient.reason}).\n` +
+          (sentBefore
+            ? `Produsenten fikk ordren tidligere (${sentBefore} UTC), så den følges opp som vanlig.`
+            : "Ordren står som «venter på bekreftelse», men får verken påminnelse eller automatisk kansellering. Kontakt produsenten eller kjøperen direkte."),
+        );
+      }
+      return "skipped";
     }
 
     const rendered = renderOrderNotificationEmail(resolveOrderNotifyEmailVersion(), order);
@@ -379,18 +488,23 @@ export async function sendOrderNotificationForOrder(order: OrderNotificationInpu
       htmlContent: rendered.htmlContent,
       textContent: rendered.textContent,
       replyTo: rendered.replyTo,
+      // F8: an order mail is transactional, not outreach.
+      omitAgentHeader: true,
     });
 
     const ms = Date.now() - started;
     if (result && result.success) {
       // Latency log line — the <1 min notification SLA is measured off this.
       console.log(`[order-notify] sent ${ms}ms order=${order.order_id} agent=${order.agent_id} via=${recipient.via}`);
-    } else {
-      console.error(
-        `[order-notify] send FAILED order=${order.order_id} agent=${order.agent_id}: ${result?.error || "unknown error"}`
-      );
+      if (!opts.reminder) markNotifySent(order.order_id);
+      return "sent";
     }
+    console.error(
+      `[order-notify] send FAILED order=${order.order_id} agent=${order.agent_id}: ${result?.error || "unknown error"}`
+    );
+    return await fail(String(result?.error || "unknown error").slice(0, 200));
   } catch (err) {
     console.error(`[order-notify] send FAILED order=${order.order_id} agent=${order.agent_id}:`, err);
+    return await fail(String((err as any)?.message || err).slice(0, 200));
   }
 }

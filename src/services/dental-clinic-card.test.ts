@@ -15,13 +15,19 @@
  *   T   phones only when isDisplayablePhone passes;
  *   A   A2A message/send (search list and single clinic): the row's keys and
  *       id kept, rating fields and field_provenance gone, acute_vakt only
- *       with provenance, phones displayable, every search-card key with the
- *       card's value (a row key the card leaves out is null); the clinic ids
- *       are read as before;
+ *       with a stored quote («Akuttvakt»), phones displayable, every
+ *       search-card key with the card's value (a row key the card leaves out
+ *       is null); the clinic ids are read as before;
  *   D   tannlege_info (the detail card) keeps exactly its keys; e-mail only
  *       there;
  *   M   MCP tannlege_search / tannlege_akutt over a real server + client,
  *       and the same card values as the A2A clinic with the same id;
+ *   Q   (A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4c) a
+ *       clinic whose acute_vakt source is a stamp without a quote: akutt
+ *       «accepts» and «Tar imot akuttpasienter» on the search card, and
+ *       acute_vakt null on the detail card and in A2A (the row has 1), over
+ *       the card functions, MCP and A2A message/send; tannlege_akutt's advice
+ *       is DENTAL_EMERGENCY_NOTICE.text;
  *   S   (dev-request 2026-10-17-dental-d3-rettelser, D3d) spesialiteter and
  *       «Spesialist» are the specialties the filter finds a clinic by,
  *       specialist titles included, once each, the same over MCP and A2A;
@@ -30,6 +36,13 @@
  *       Bærum) in the search, detail and A2A card, from the stored value
  *       only; other values unchanged;
  *   N   (D3d) postnummer «0000» is null in every variant, the key kept;
+ *   VB  (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+ *       F2-S8) «Verifisert» only with a basis: a stored 'verified' without
+ *       the verifier's basis has no badge on the search and detail cards and
+ *       answers 'pending_verify' over A2A, with the same keys as its twin with
+ *       a basis; a public clinic's directory listing stands in for the website
+ *       but not for Brreg; a closed clinic has no badge; MCP and A2A say the
+ *       same for every clinic, as resolveVerifiedClaim does;
  *   Z   size: 25 clinics per call stay under 12 KB for a live-like mix, and
  *       under 16 KB when every clinic has every optional field, specialist
  *       titles included; a kommune search (Bergen, whose tolkning names 144
@@ -55,9 +68,21 @@ const DETAIL_KEYS = [
   "acute_vakt", "chain_brand", "is_chain_member", "available_specialties", "treatments", "opening_hours", "payment_options", "om_oss",
   "online_booking_url", "specialists", "badges", "profil_url",
 ];
-const A2A_REMOVED = ["rating", "rating_count", "rating_source", "field_provenance"];
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A4-D): the hydrated row also carries Stage V's pending map, a
+// read-only side column the display rule reads; A2A passes it on no more than
+// field_provenance.
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// so do the side values the «Verifisert» claim reads.
+const A2A_REMOVED = ["rating", "rating_count", "rating_source", "field_provenance", "stage_v_pending_correction", "brreg_status", "website_ownership", "rich_field_count"];
+// What the verifier stores when the «Verifisert» rule passes (F2-S8): Brreg
+// active, the website the clinic's own, and two rich fields (a third comes
+// with the row).
+const VERIFIED_BASIS = { brreg_status: "active", website_ownership: "verified", social_media: { facebook: "https://example.test" }, treatment_tech: ["digital røntgen"] };
 
-const PROVENANCE = { acute_vakt: [{ source_type: "homepage", value: 1 }], telefon: [{ source_type: "brreg" }] };
+// F1-S4c: «Akuttvakt» needs the quote from the source; STAMP is the same source without it.
+const PROVENANCE = { acute_vakt: [{ source_type: "homepage", value: 1, quote: "Akuttvakt hver kveld og i helgene." }], telefon: [{ source_type: "brreg" }] };
+const STAMP = { acute_vakt: [{ value: "1", source_type: "homepage", source_url: "https://example.no/akutt", fetched_at: "2026-05-01T10:00:00Z" }] };
 const UNDISPLAYABLE_PHONE = "+47 19 09 49";
 const WEEKDAYS_8_16 = ["mon", "tue", "wed", "thu", "fri"].map((day) => ({ day, open: "08:00", close: "16:00" }));
 
@@ -99,7 +124,8 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
     const mcp = require("../routes/dental-mcp") as typeof import("../routes/dental-mcp");
     const a2a = require("../routes/dental-a2a") as typeof import("../routes/dental-a2a");
     const { isDisplayablePhone } = require("./contact-normalizer") as typeof import("./contact-normalizer");
-    const { hasAcuteVaktProvenance } = require("./dental-acute-claim") as typeof import("./dental-acute-claim");
+    const { hasAcuteVaktQuote } = require("./dental-acute-claim") as typeof import("./dental-acute-claim");
+    const { DENTAL_EMERGENCY_NOTICE } = require("../config/dental-landing") as typeof import("../config/dental-landing");
 
     // ── Fixture ───────────────────────────────────────────────────────────
     // Columns createDentalAgent does not write (booking link, hours, price
@@ -124,6 +150,8 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
         opening_hours: [...WEEKDAYS_8_16.slice(0, 3), { day: "thu", open: "08:00", close: "19:00" }, { day: "fri", open: "08:00", close: "15:00" }],
         price_band: "standard", price_band_source: "homepage", acute_vakt: 1, field_provenance: PROVENANCE,
         rating: 4.7, rating_count: 120, rating_source: "google_places",
+        // The booking link is its third rich field.
+        ...VERIFIED_BASIS,
       },
     );
     const bare = add(
@@ -163,7 +191,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       eq([c.adresse, c.postnummer, c.online_booking_url], ["Strandgaten 12", "5013", "https://tannlegenordmann.no/bestill-time"], "V1: address, postcode and booking link");
       eq(c.apningstider, ["Man–Ons 08:00–16:00", "Tor 08:00–19:00", "Fre 08:00–15:00"], "V2: opening hours as compact lines");
       eq([c.spesialiteter, c.chain_brand], [["kjeveortopedi"], "Colosseum Tannlege"], "V3: specialties, and the chain name trimmed (display only)");
-      eq([c.akutt, c.badges], ["vakt", ["Helfo-avtale", "Akuttvakt", "Verifisert", "Spesialist"]], "V4: akutt «vakt» with provenance, badges as before");
+      eq([c.akutt, c.badges], ["vakt", ["Helfo-avtale", "Akuttvakt", "Verifisert", "Spesialist"]], "V4: akutt «vakt» with a quote in the provenance, badges as before");
       eq([c.telefon, c.profil_url], ["55 30 40 50", seo.clinicProfileUrl(row(full))], "V5: displayable phone, profile URL from clinicProfileUrl");
     }
     {
@@ -239,7 +267,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
         ok(Object.keys(c).every((k) => !/rating/i.test(k)), `${label}: no key contains «rating»`);
         ok(c.telefon === null || isDisplayablePhone(c.telefon), `${label}: telefon is displayable or null`);
         ok(c.mobil === null || isDisplayablePhone(c.mobil), `${label}: mobil is displayable or null`);
-        ok(c.acute_vakt === null || (c.acute_vakt === 1 && hasAcuteVaktProvenance(stored.field_provenance)), `${label}: acute_vakt is 1 only with provenance`);
+        ok(c.acute_vakt === null || (c.acute_vakt === 1 && hasAcuteVaktQuote(stored.field_provenance)), `${label}: acute_vakt is 1 only with a quote («Akuttvakt»)`);
         eq(Object.keys(stored).filter((k) => !A2A_REMOVED.includes(k) && !(k in c)), [], `${label}: every other key of the stored row is kept (today's form)`);
         // The values MCP shows: an A2A-only override of a card key (akutt from the raw
         // acute_vakt flag, the untrimmed chain name, …) fails here.
@@ -255,7 +283,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       ok(JSON.stringify(a2a.dentalAnswerProfileIds(resp).sort()) === JSON.stringify(clinics.map((c) => c.id).sort()), "A2: dentalAnswerProfileIds reads the clinic ids as before");
       const fullA2a = clinics.find((c) => c.id === full)!;
       const bareA2a = clinics.find((c) => c.id === bare)!;
-      eq([fullA2a.acute_vakt, bareA2a.acute_vakt, row(bare).acute_vakt], [1, null, 1], "A3: acute_vakt 1 with provenance stays; without it becomes null (the row has 1)");
+      eq([fullA2a.acute_vakt, bareA2a.acute_vakt, row(bare).acute_vakt], [1, null, 1], "A3: acute_vakt 1 with a quote stays; without provenance it becomes null (the row has 1)");
       eq([fullA2a.telefon, bareA2a.telefon], ["55 30 40 50", null], "A4: a displayable phone stays; an undisplayable one becomes null");
 
       const info = a2a.handleDentalMessageSend({ message: { text: "info om 918750001" } }, "a2a-info") as any;
@@ -294,7 +322,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       eq(res.count, 5, "M3: count is unchanged (the five Vestland fixture clinics)");
       const akutt = JSON.parse(await callText("tannlege_akutt", { fylke: "Vestland" }));
       const a = akutt.klinikker.find((k: any) => k.org_nr === "918750001");
-      ok(a?.akutt === "vakt" && typeof akutt.rad_om_kommunal_tannlegevakt === "string", "M4: tannlege_akutt gives the same card, akutt «vakt», and the tannlegevakt advice");
+      ok(a?.akutt === "vakt" && akutt.rad_om_kommunal_tannlegevakt === DENTAL_EMERGENCY_NOTICE.text, "M4: tannlege_akutt gives the same card, akutt «vakt», and the emergency notice as its tannlegevakt advice");
       // The same clinic over MCP and A2A message/send: one card, the same values.
       const a2aWire = a2aWireOf(full);
       ok(a2aWire.id === full && a2aWire.org_nr === "918750001", "M5: (the A2A list's clinic is the same clinic, by id)");
@@ -304,6 +332,33 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       const oslo = JSON.parse(await callText("tannlege_search", { fylke: "Oslo", limit: 25 }));
       const b = oslo.klinikker.find((k: any) => k.navn === "Tann Uten Data AS");
       eq([b?.akutt, differingKeys(b ?? { missing: true }, a2aWireOf(bare))], [null, []], "M8: the unsourced acute_vakt clinic has akutt null and the same values over MCP and A2A");
+    }
+
+    // ── Q: F1-S4c, a stamp without a quote ────────────────────────────────
+    // Added after A and M so the counts there stay, and removed again.
+    {
+      const stamped = add(
+        { navn: "Stempel Akutt Tann AS", org_nr: "918750201", postnummer: "6413", poststed: "MOLDE", fylke: "Møre og Romsdal", telefon: "71 20 30 40" },
+        { acute_vakt: 1, field_provenance: STAMP },
+      );
+      try {
+        const r = row(stamped);
+        const c = search(stamped);
+        eq([r.acute_vakt, c.akutt, c.badges], [1, "accepts", ["Tar imot akuttpasienter"]], "Q1: the stored flag is 1, the search card says akutt «accepts» with «Tar imot akuttpasienter», no «Akuttvakt»");
+        eq([card.toDentalClinicCard(r, "detail", { specialists: [] }).acute_vakt, card.toDentalA2aClinic(r).acute_vakt], [null, null], "Q2: acute_vakt is null on the detail card and the A2A clinic");
+        const a2aStamped = ((a2a.handleDentalMessageSend({ message: { data: { fylke: "Møre og Romsdal" } } }, "a2a-q") as any)
+          .result.artifacts[1].parts[0].data.clinics as any[]).find((x) => x.id === stamped);
+        eq([a2aStamped?.acute_vakt, a2aStamped?.akutt, a2aStamped?.badges], [null, "accepts", ["Tar imot akuttpasienter"]], "Q3: A2A message/send gives acute_vakt null and akutt «accepts»");
+        const info = JSON.parse(await callText("tannlege_info", { org_nr: "918750201" }));
+        eq([info.acute_vakt, info.badges.includes("Akuttvakt"), info.badges.includes("Tar imot akuttpasienter")], [null, false, true], "Q4: tannlege_info: acute_vakt null, «Tar imot akuttpasienter»");
+        const akutt = JSON.parse(await callText("tannlege_akutt", { fylke: "Møre og Romsdal" }));
+        const k = akutt.klinikker.find((x: any) => x.org_nr === "918750201");
+        eq([akutt.count, k?.akutt, k?.badges, akutt.rad_om_kommunal_tannlegevakt], [1, "accepts", ["Tar imot akuttpasienter"], DENTAL_EMERGENCY_NOTICE.text],
+          "Q5: tannlege_akutt still lists it (the akutt rows are unchanged), as «accepts», with the emergency notice as advice");
+        eq(differingKeys(k ?? { missing: true }, JSON.parse(JSON.stringify(a2aStamped ?? {}))), [], "Q6: the same card values over MCP and A2A");
+      } finally {
+        db.prepare("DELETE FROM dental_agents WHERE id = ?").run(stamped);
+      }
     }
 
     // ── S, F, N: D3d (specialties, official spelling, postnummer 0000) ────
@@ -410,6 +465,49 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       const info = JSON.parse(await callText("tannlege_info", { org_nr: "918750112" }));
       eq([info.poststed, info.postnummer, Object.keys(info)], ["Karlsøy", null, DETAIL_KEYS], "F8/N4: tannlege_info shows Karlsøy and postnummer null, with the same keys");
       eq(row(a2a.find((c: any) => c.org_nr === "918750112").id).postnummer, "0000", "N5: the stored row keeps 0000 (display only)");
+    }
+
+    // ── VB: «Verifisert» only with a basis (F2-S8) ───────────────────────
+    // Rows in Finnmark, added after A and M so the counts there stay.
+    {
+      const { resolveVerifiedClaim } = require("./dental-verified-claim") as typeof import("./dental-verified-claim");
+      const alta = (navn: string, org_nr: string | null, extra: Record<string, unknown>) =>
+        add({ navn, ...(org_nr ? { org_nr } : {}), postnummer: "9510", poststed: "ALTA", fylke: "Finnmark", telefon: "78440000", verification_status: "verified" },
+          { om_oss: "Om klinikken.", ...extra });
+      const unbased = alta("Uten Grunnlag Tann AS", "918750201", {});
+      const based = alta("Med Grunnlag Tann AS", "918750202", VERIFIED_BASIS);
+      const listed = alta("Alta Tannklinikk", "918750203", { ...VERIFIED_BASIS, website_ownership: "n/a", catalog_class: "offentlig_klinikk", directory_url: "https://example.test/alta" });
+      // As ed71a821 in production: a public clinic with no org.nr., so no Brreg status.
+      const noOrgNr = alta("Talvik Tannklinikk", null, { ...VERIFIED_BASIS, brreg_status: null, website_ownership: "n/a", catalog_class: "offentlig_klinikk", directory_url: "https://example.test/talvik" });
+      const closed = alta("Nedlagt Med Grunnlag Tann AS", "918750205", { ...VERIFIED_BASIS, is_inactive: 1 });
+      const verifiedBadge = (badges: string[]) => badges.includes("Verifisert");
+      const detail = (id: string) => card.toDentalClinicCard(row(id), "detail", { specialists: [] });
+
+      eq([unbased, based, listed, noOrgNr].map((id) => verifiedBadge(search(id).badges)), [false, true, true, false],
+        "VB1: search card: no badge without a basis, the badge with one, a directory listing for the website, but not without Brreg (no org.nr.)");
+      eq(Object.keys(search(unbased)), Object.keys(search(based)), "VB2: … and the card has the same keys either way (K)");
+      eq([unbased, based, listed, noOrgNr, closed].map((id) => verifiedBadge(detail(id).badges)), [false, true, true, false, false],
+        "VB3: detail card (tannlege_info): the same, and a closed clinic has no badge although its fields pass");
+      eq([Object.keys(detail(unbased)), Object.keys(detail(closed))], [DETAIL_KEYS, DETAIL_KEYS], "VB4: … with exactly its keys (D)");
+      const a2aOf = (id: string) => card.toDentalA2aClinic(row(id)) as Record<string, any>;
+      eq([unbased, based, listed, noOrgNr, closed].map((id) => [row(id).verification_status, a2aOf(id).verification_status]),
+        [["verified", "pending_verify"], ["verified", "verified"], ["verified", "verified"], ["verified", "pending_verify"], ["verified", "pending_verify"]],
+        "VB5: A2A: the stored 'verified' answers 'pending_verify' where the badge is hidden (no new value), 'verified' where it shows");
+      eq(Object.keys(a2aOf(unbased)), Object.keys(a2aOf(based)), "VB6: … and the A2A clinic has the same keys, in the same order, either way (A)");
+      eq(A2A_REMOVED.filter((k) => k in a2aOf(based)), [], "VB6b: … none of them a side value");
+      const rowKeys = Object.keys(row(based)).filter((k) => !A2A_REMOVED.includes(k));
+      eq(Object.keys(a2aOf(based)).slice(0, rowKeys.length), rowKeys, "VB6c: … and the row's keys, verification_status among them, keep their order");
+      // MCP and A2A over the same search, every clinic: the badge, the status and the claim agree.
+      const mcpCards = JSON.parse(await callText("tannlege_search", { fylke: "Finnmark", limit: 25 })).klinikker as any[];
+      const a2aCards = a2aSearch({ fylke: "Finnmark" });
+      const byOrgOrName = (c: any) => c.org_nr ?? c.navn;
+      const verdict = (cards: any[], read: (c: any) => boolean) => Object.fromEntries(cards.map((c) => [byOrgOrName(c), read(c)]));
+      const expected = Object.fromEntries([unbased, based, listed, noOrgNr].map((id) => [row(id).org_nr ?? row(id).navn, resolveVerifiedClaim(row(id))]));
+      eq([verdict(mcpCards, (c) => verifiedBadge(c.badges)), verdict(a2aCards, (c) => c.verification_status === "verified" && verifiedBadge(c.badges))], [expected, expected],
+        "VB7: tannlege_search badges and A2A verification_status say what resolveVerifiedClaim says, for every clinic (the closed one is not listed)");
+      const infoBadges = async (args: Record<string, unknown>) => verifiedBadge(JSON.parse(await callText("tannlege_info", args)).badges);
+      eq([await infoBadges({ org_nr: "918750201" }), await infoBadges({ org_nr: "918750202" }), await infoBadges({ id: noOrgNr })], [false, true, false],
+        "VB8: tannlege_info over MCP: no badge without a basis, the badge with one, none for the public clinic without an org.nr.");
     }
 
     // ── Z: size of a 25-clinic answer ─────────────────────────────────────

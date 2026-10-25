@@ -1,0 +1,212 @@
+{
+  "answers": {
+    "rfb mcp lokal_discover": {
+      "{}": {
+        "sha256": "9da4e90c45df3787b8c5a0ad598e06bcfd02c70e512f55b9d558c123ddf6edc5",
+        "chars": 4607
+      },
+      "{\"categories\":[\"honey\"]}": {
+        "sha256": "baaab5f8ea6799e40b1018f024437abcb2c4c1b498a8ca360bcdded1a4a7d5a9",
+        "chars": 939
+      },
+      "{\"categories\":[\"honey\",\"eggs\"]}": {
+        "sha256": "dea1a0934032215e1b901a59a7e028e60a6f69094932235b5665c2413bba8a70",
+        "chars": 1361
+      },
+      "{\"categories\":[\"bakery\"]}": {
+        "sha256": "320a1748916bbfe106fd76dee978e9ee9993ea30175e7b1d1f7a5c314dedb1f5",
+        "chars": 1462
+      },
+      "{\"categories\":[\"bread\"]}": {
+        "sha256": "320a1748916bbfe106fd76dee978e9ee9993ea30175e7b1d1f7a5c314dedb1f5",
+        "chars": 1462
+      },
+      "{\"tags\":[\"organic\"]}": {
+        "sha256": "1c657ac9165c947882b3aec516d1a6f12759353fa06666912a3b72d8416eff03",
+        "chars": 4937
+      },
+      "{\"tags\":[\"budget\"]}": {
+        "sha256": "1c657ac9165c947882b3aec516d1a6f12759353fa06666912a3b72d8416eff03",
+        "chars": 4937
+      },
+      "{\"categories\":[\"meat\"],\"tags\":[\"organic\"]}": {
+        "sha256": "2b4242b45eb85b9d9950b86eb426579bbf94a6ce49199c00ac9e693c4286de6f",
+        "chars": 1304
+      },
+      "{\"categories\":[\"honey\"],\"lat\":63.4305,\"lng\":10.3951,\"maxDistanceKm\":50}": {
+        "sha256": "e57bd5e3edbaf56c83d77133871d4ac208c755ae915a73b1734e619da3c1cba2",
+        "chars": 505
+      },
+      "{\"categories\":[\"beverages\"],\"drinkSubcategory\":\"bryggeri\"}": {
+        "sha256": "0b22982cbca122df7c6242ca911e7ae3ed82432fc2b2a38faf220b05f56de32a",
+        "chars": 44
+      },
+      "{\"categories\":[\"meat\",\"dairy\",\"vegetables\",\"fruit\",\"bakery\",\"beverages\",\"honey\",\"eggs\",\"fish\",\"preserves\",\"herbs\",\"other\"]}": {
+        "sha256": "9da4e90c45df3787b8c5a0ad598e06bcfd02c70e512f55b9d558c123ddf6edc5",
+        "chars": 4607
+      },
+      "{\"categories\":[\"meat\",\"dairy\",\"vegetables\",\"fruit\",\"bakery\",\"beverages\",\"honey\",\"eggs\",\"fish\",\"preserves\",\"herbs\",\"other\",\"kategori-0\",\"kategori-1\",\"kategori-2\",\"kategori-3\",\"kategori-4\",\"kategori-5\",\"kategori-6\",\"kategori-7\",\"kategori-8\",\"kategori-9\",\"kategori-10\",\"kategori-11\",\"kategori-12\",\"kategori-13\",\"kategori-14\",\"kategori-15\",\"kategori-16\",\"kategori-17\",\"kategori-18\",\"kategori-19\",\"kategori-20\",\"kategori-21\",\"kategori-22\",\"kategori-23\",\"kategori-24\",\"kategori-25\",\"kategori-26\",\"kategori-27\",\"kategori-28\",\"kategori-29\",\"kategori-30\",\"kategori-31\",\"kategori-32\",\"kategori-33\",\"kategori-34\",\"kategori-35\",\"kategori-36\",\"kategori-37\"]}": {
+        "sha256": "69c21d9855ee10254401a1be9443d267caad5748c617fabc421c5a8cbddb024b",
+        "chars": 102
+      },
+      "{\"categories\":[\"honey kategori kategori kategori kategori kategori kategori kategori kategori ka\"]}": {
+        "sha256": "0b22982cbca122df7c6242ca911e7ae3ed82432fc2b2a38faf220b05f56de32a",
+        "chars": 44
+      },
+      "{\"categories\":[\"honey\"],\"limit\":1}": {
+        "sha256": "89bd7bfbca36aa772af5987f8cac9c48edf38350b98e7f7c4845bcd3bc142df8",
+        "chars": 496
+      },
+      "{\"categories\":[\"zzzqqx\"]}": {
+        "sha256": "0b22982cbca122df7c6242ca911e7ae3ed82432fc2b2a38faf220b05f56de32a",
+        "chars": 44
+      }
+    },
+    "rfb POST /api/marketplace/discover": {
+      "{}": {
+        "sha256": "95eee6c4103f8b6c7888bc2c14fe96c7c5da35eb18f54f217c891a4c7ccdf464",
+        "chars": 6176
+      },
+      "{\"categories\":[\"honey\"]}": {
+        "sha256": "f88525f4e4cd7bb48b4b7b69849966db03efa7db0839217ea2847bd214191f16",
+        "chars": 1260
+      },
+      "{\"categories\":[\"honey\",\"eggs\"],\"limit\":5}": {
+        "sha256": "ad80984ac22a5288bef9823316e422c717ef158f62763b3bff3aa4531ca8e193",
+        "chars": 1817
+      },
+      "{\"tags\":[\"organic\"]}": {
+        "sha256": "abaa82b8d2f785e7bc68fd16d72e7647d3bc39351d37fd8af105edb5322cba02",
+        "chars": 6565
+      },
+      "{\"categories\":[\"meat\"],\"tags\":[\"organic\"]}": {
+        "sha256": "ea733019b267b03099391b8d4fc0bc8f6ec9b2aae59f85940cf7d83758c9708f",
+        "chars": 1653
+      },
+      "{\"categories\":[\"honey\"],\"location\":{\"lat\":63.4305,\"lng\":10.3951},\"maxDistanceKm\":50}": {
+        "sha256": "2222b71df56a2ef8f548847500966bfcdb67f6d1f55d2eec204a5e5b5bf13d97",
+        "chars": 767
+      },
+      "{\"role\":\"producer\",\"categories\":[\"dairy\"]}": {
+        "sha256": "25b031aef72acdb9a795938e9b259f84167c93d3de53e8bfc4de03918f494874",
+        "chars": 694
+      },
+      "{\"query\":\"honning\",\"categories\":[\"honey\"]}": {
+        "sha256": "f88525f4e4cd7bb48b4b7b69849966db03efa7db0839217ea2847bd214191f16",
+        "chars": 1260
+      },
+      "{\"skills\":[\"delivery\"]}": {
+        "sha256": "a3343e231dd4655837fbaf313178e20c0a0d17b24b23c85dcbd6f7cc2077da38",
+        "chars": 91
+      },
+      "{\"categories\":[\"beverages\"],\"drinkSubcategory\":\"cideri\"}": {
+        "sha256": "cbf13d967de33f9cc246ccef727dd1cbc1f4de19f4adfeffb841fbb90b9b1d5b",
+        "chars": 117
+      },
+      "{\"categories\":[\"meat\",\"dairy\",\"vegetables\",\"fruit\",\"bakery\",\"beverages\",\"honey\",\"eggs\",\"fish\",\"preserves\",\"herbs\",\"other\"]}": {
+        "sha256": "0ab60105a1f69f14e7ee0cffc39eb84732fb994357c015bada07437cafb0b6dd",
+        "chars": 6674
+      },
+      "{\"categories\":[\"meat\",\"dairy\",\"vegetables\",\"fruit\",\"bakery\",\"beverages\",\"honey\",\"eggs\",\"fish\",\"preserves\",\"herbs\",\"other\",\"kategori-0\",\"kategori-1\",\"kategori-2\",\"kategori-3\",\"kategori-4\",\"kategori-5\",\"kategori-6\",\"kategori-7\",\"kategori-8\",\"kategori-9\",\"kategori-10\",\"kategori-11\",\"kategori-12\",\"kategori-13\",\"kategori-14\",\"kategori-15\",\"kategori-16\",\"kategori-17\",\"kategori-18\",\"kategori-19\",\"kategori-20\",\"kategori-21\",\"kategori-22\",\"kategori-23\",\"kategori-24\",\"kategori-25\",\"kategori-26\",\"kategori-27\",\"kategori-28\",\"kategori-29\",\"kategori-30\",\"kategori-31\",\"kategori-32\",\"kategori-33\",\"kategori-34\",\"kategori-35\",\"kategori-36\",\"kategori-37\"]}": {
+        "sha256": "b3bc5240730c9f090e33c38e4b393b729be53acf21b0cca60a0acb726f619b46",
+        "chars": 7031
+      },
+      "{\"categories\":[\"honey kategori kategori kategori kategori kategori kategori kategori kategori ka\"]}": {
+        "sha256": "4abf45ae30bc592fd313f3af0e804850180ee91182191d14702eec2d4a50f5f8",
+        "chars": 188
+      },
+      "{\"categories\":[\"zzzqqx\"]}": {
+        "sha256": "80bc58727aba0d2c2fb00b67ebe5d86862c654e0a9d8130aebb6152b0d5c04dc",
+        "chars": 114
+      },
+      "{\"categories\":[1]}": {
+        "sha256": "64a3b3e1f1b64496f76e8c4965e6341f93b80e1613025e61b3a9ed6a1976f167",
+        "chars": 201
+      },
+      "{\"categories\":\"honey\"}": {
+        "sha256": "9ec4fb369d20e37c6465b1410a3332220366a32165b74494ef229b44fc96592a",
+        "chars": 197
+      },
+      "{\"role\":\"farmer\"}": {
+        "sha256": "7e2b5d64a4194fd7b6046dc007d5396e89fb2304ff38f3b11b8ebb318bced3b5",
+        "chars": 295
+      },
+      "{\"location\":{\"lat\":\"x\",\"lng\":10}}": {
+        "sha256": "79ed22e119b43d161186e6866f8445eeaba2a769900f68f340d5a3fdb37ad5d0",
+        "chars": 203
+      },
+      "{\"limit\":500}": {
+        "sha256": "95eee6c4103f8b6c7888bc2c14fe96c7c5da35eb18f54f217c891a4c7ccdf464",
+        "chars": 6176
+      },
+      "[]": {
+        "sha256": "12f79dccf100572d4da703e120a9387f9cd2e0367132bbc8aed55a8e2c6037ab",
+        "chars": 186
+      }
+    },
+    "rfb a2a data": {
+      "{\"categories\":[\"honey\"],\"note\":\"hei\"}": {
+        "sha256": "9bded8b00e6be8943e9cc2666ad6c62f174b3cb0853f4ea1e4d5a4f36a542ca6",
+        "chars": 1393
+      },
+      "{\"categories\":[\"honey\"],\"configuration\":{\"acceptedOutputModes\":[\"application/json\"]}}": {
+        "sha256": "20e3d5a42d67be062bd8b2d5eeac8a5901ae4d47f467c2fc81f24540f94b8296",
+        "chars": 1441
+      },
+      "{\"categories\":[\"meat\",\"dairy\",\"vegetables\",\"fruit\",\"bakery\",\"beverages\",\"honey\",\"eggs\",\"fish\",\"preserves\",\"herbs\",\"other\",\"kategori-0\",\"kategori-1\",\"kategori-2\",\"kategori-3\",\"kategori-4\",\"kategori-5\",\"kategori-6\",\"kategori-7\",\"kategori-8\",\"kategori-9\",\"kategori-10\",\"kategori-11\",\"kategori-12\",\"kategori-13\",\"kategori-14\",\"kategori-15\",\"kategori-16\",\"kategori-17\",\"kategori-18\",\"kategori-19\",\"kategori-20\",\"kategori-21\",\"kategori-22\",\"kategori-23\",\"kategori-24\",\"kategori-25\",\"kategori-26\",\"kategori-27\",\"kategori-28\",\"kategori-29\",\"kategori-30\",\"kategori-31\",\"kategori-32\",\"kategori-33\",\"kategori-34\",\"kategori-35\",\"kategori-36\",\"kategori-37\"]}": {
+        "sha256": "fe658372e3b4ebf76944b2010705cca27faf4ce54594dc559859ad8035ed9b68",
+        "chars": 5401
+      },
+      "{\"categories\":[\"honey kategori kategori kategori kategori kategori kategori kategori kategori ka\"],\"tags\":[\"organic\"]}": {
+        "sha256": "3f3ec7b3d5dc22794fe3c43c45ed40c1b65757ec46db2643eb3977da902c85e0",
+        "chars": 410
+      },
+      "{\"query\":\"honning\",\"categories\":[\"honey\"],\"extra\":{\"nested\":true}}": {
+        "sha256": "ae69d13f69fee18d755d133f1a6b5315ed89f3489d2cbd070e4322126af6816e",
+        "chars": 1422
+      },
+      "{\"categories\":[1]}": {
+        "sha256": "d77a59f9701ff843b9babae47c78eab801ec38681d3da28330c8657391f3fbaa",
+        "chars": 323
+      },
+      "{\"categories\":\"honey\"}": {
+        "sha256": "0899c38b2454aba899c83805f4082f4b495bcc2342b4abb50cfa3c452bca8ffb",
+        "chars": 311
+      },
+      "{\"role\":\"farmer\"}": {
+        "sha256": "3748a7faa11b6c9503f089f89e6ce0e0769055ed279cb3aaf2ac494588e42b45",
+        "chars": 483
+      },
+      "{\"location\":{\"lat\":\"x\",\"lng\":10}}": {
+        "sha256": "086c580fbd036706f221b4ba3cc9b0bdbe9793766ac4c544ea3726727502d517",
+        "chars": 327
+      }
+    },
+    "rfb a2a params (mode 3)": {
+      "{\"message\":{},\"categories\":[\"honey\"],\"configuration\":{\"blocking\":true}}": {
+        "sha256": "f592e1e3a936ddc7ced8444407f445ef1fcbcaa295f1771478962545e58b29c8",
+        "chars": 1427
+      },
+      "{\"message\":{\"role\":\"user\"},\"tags\":[\"organic\"],\"metadata\":{\"ref\":\"x\"}}": {
+        "sha256": "c1042beb297625ba50c7d454357fb548edeb9b8620a62ab0ccfb9a954503cfee",
+        "chars": 4984
+      },
+      "{\"message\":{},\"categories\":[1]}": {
+        "sha256": "d77a59f9701ff843b9babae47c78eab801ec38681d3da28330c8657391f3fbaa",
+        "chars": 323
+      }
+    },
+    "rfb GET /a2a": {
+      "{}": {
+        "sha256": "bb3513c3ed1982980eae55213d082cf9becb374c5bd9b4f74af343d4f734cab8",
+        "chars": 3888
+      }
+    },
+    "oa GET /a2a": {
+      "{}": {
+        "sha256": "58869010b04ecf20ed795d8828e741ac8333378e0a24b26eac4295aafb2d93c7",
+        "chars": 6831
+      }
+    }
+  }
+}

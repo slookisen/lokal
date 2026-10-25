@@ -14,48 +14,47 @@ Finn-tannlege
 ## One-liner (limit 200)
 
 ```
-Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency duty.
+Search dental clinics across Norway by place, specialty, Helfo direct billing and emergency care.
 ```
 97 characters.
 
 ## Description (limit 2,000)
 
 ```
-Finn-tannlege is an independent directory of dental clinics in Norway: more than 5,400 clinics, from single-dentist practices to large clinics, in every county. It is not affiliated with any clinic chain, insurer or booking portal.
+Finn-tannlege is an independent directory of dental clinics in Norway: more than 4,500 clinics, from single-dentist practices to large clinics, in every county. It is not affiliated with any clinic chain, insurer or booking portal.
 
-Search by place, by specialty, or by the two things that change what a visit costs and how soon you get one: a Helfo direct-billing agreement and emergency duty (akuttvakt). Every record carries the clinic's address, contact details and a profile page.
+Search by place or specialty, and filter for clinics with a Helfo direct-billing agreement or emergency care. With direct billing, Helfo's share of a treatment that qualifies for support is settled with the clinic and you pay the rest; the agreement is read from the clinic's own website, not from a list kept by Helfo. Emergency care means that the clinic says it takes emergency patients. It is not a promise of out-of-hours care. Every clinic has a profile page with its address and, where known, its contact details.
 
-The data comes from public sources: Brønnøysundregistrene, the Norwegian health personnel register (HPR) and the clinics' own websites.
+The data comes from Brønnøysundregistrene, the clinics' own websites (AI-assisted extraction), Google Places, Kartverket and a one-time import from an online directory (May 2026). How each field is sourced is described at finn-tannlege.com/proveniens.
 
 The connector is read-only and gives no dental advice. It tells you which clinics exist, what they offer and how to reach them; the clinical conversation belongs with the dentist.
 
 Finn-tannlege.com is an independent service from Agentplatform.no AS and is not affiliated with FINN.no.
 ```
-909 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
+1,293 characters, blank lines between paragraphs included. Each paragraph is one line, so it pastes as it is.
 
 The last paragraph is `BRAND_ENTITIES.dental.disambiguation.en` (src/config/brand-entities.ts). Keep it when the text is edited in the portal.
 
-The catalog size is the floor in distribution/catalog-claims.json (5,400), not a live figure: listing text is only changed by hand in the portal, and the floor stays true while the catalog grows.
+The catalog size is the floor in distribution/catalog-claims.json (4,500), not a live figure: listing text is only changed by hand in the portal, and the floor stays true while the catalog grows.
 
 ## Categories (one to five)
 
-- Health
-- Reference
+- Consumer Health
 
-Pick the closest names the portal offers.
+The portal's own category name (checked 2026-10-19).
 
 ## Links and contact
 
 | Field | Answer |
 |---|---|
-| Documentation URL | **Not yet** — see the prerequisites in ../README.md |
+| Documentation URL | `https://finn-tannlege.com/guide-tannlege-ai` |
 | Privacy policy URL | `https://finn-tannlege.com/personvern` |
 | Support contact | `kontakt@finn-tannlege.com` |
 | Website | `https://finn-tannlege.com` |
 
 ## Icon
 
-**Not yet.** There is no square PNG for this brand; see the prerequisites in ../README.md.
+Upload `dental-connectors-prep/assets/finn-tannlege-square-512.png`: 512×512 PNG, md5 `d699125e1528fb9c818550c1052b0bb3`. Square and full-bleed with no rounded corners; clients crop it themselves.
 
 ## Slug — permanent once published
 
@@ -66,5 +65,7 @@ finn-tannlege
 The slug cannot be changed after publication. Type it exactly.
 
 ## Language
+
+**Use only if the portal asks.** It has no field for this.
 
 The listing text is English because the directory audience is. The server answers in Norwegian and English, whichever the user writes in.

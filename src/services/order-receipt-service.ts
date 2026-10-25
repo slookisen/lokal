@@ -27,6 +27,8 @@ import { emailService, maskEmails, type EmailOptions } from "./email-service";
 import { isBlocked } from "./blocklist-service";
 import { producerContact, producerTraderStatus, TERMS_OF_PURCHASE_URL, type ProducerContact } from "./cart-service";
 import { companyOperatorSentence } from "./company-legal";
+import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL, summarizePricing } from "./order-pricing";
+import { formatPickupTimeOslo, isOrderAutocompleteEnabled } from "./order-lifecycle";
 
 export function isBuyerReceiptsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.ORDER_BUYER_RECEIPTS_ENABLED === "1";
@@ -38,7 +40,11 @@ export function __setBuyerReceiptSendForTesting(fn: SendFn | null): void { _send
 let _testDb: any = null;
 export function __setBuyerReceiptTestDb(db: any): void { _testDb = db; }
 
-export type ReceiptEvent = "confirmed" | "declined" | "cancelled";
+/**
+ * "submitted" (F3) is the receipt at submit: the order is a request to the
+ * producer, which is not binding until the producer confirms.
+ */
+export type ReceiptEvent = "submitted" | "confirmed" | "declined" | "cancelled";
 
 const EMAIL_RE = /^[^\s@<>,;"'()\\\x00-\x1f\x7f]+@[^\s@<>,;"'()\\\x00-\x1f\x7f]+\.[A-Za-z0-9-]{2,}$/;
 function plausibleEmail(e: string | null | undefined): string | null {
@@ -78,7 +84,13 @@ export interface ReceiptData {
   totalNok: number | null;
   cancelReason: string | null;
   payment: ReceiptPayment | null;
+  /** Fase A1: the pickup time the producer set when confirming (ISO / SQLite UTC); null = none. */
+  pickupTime?: string | null;
+  /** Fase A1: ORDER_AUTOCOMPLETE_ENABLED — the confirmation then says the order closes by itself. */
+  autoCloseOn?: boolean;
 }
+
+const PLATFORM_CONTACT = "kontakt@rettfrabonden.com";
 
 const RELEASED = " Reservasjonen på betalingskortet ditt blir frigjort, og du belastes ikke.";
 const NOT_CHARGED = " Du er ikke belastet.";
@@ -111,12 +123,34 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
     d.contact.email ? `E-post: ${d.contact.email}` : "",
     `Profil: ${d.contact.profile_url}`,
   ].filter(Boolean).join("\n");
-  const itemLines = d.items.map((i) => `- ${i.qty} × ${i.name}${i.line_total != null ? ` — ${krNok(i.line_total)}` : ""}`).join("\n");
+  // F6: a line without a price says so, never «0 kr»; the sum only covers the
+  // lines with a price and is labelled when some line has none.
+  const itemLines = d.items.map((i) => `- ${i.qty} × ${i.name} — ${i.line_total != null ? krNok(i.line_total) : PRICE_BY_AGREEMENT}`).join("\n");
+  const pricing = summarizePricing(d.items);
+  const sumLine = d.items.length === 0
+    ? `Sum: ${krNok(d.totalNok)}`
+    : !pricing.any_priced
+      ? `Pris: ${PRICE_BY_AGREEMENT}`
+      : pricing.is_partial
+        ? `${PARTIAL_SUM_LABEL}: ${krNok(pricing.priced_total)}`
+        : `Sum: ${krNok(d.totalNok ?? pricing.priced_total)}`;
   const p = d.payment;
   const nonTrader = d.traderStatus === "non_trader";
   const footer =
     `Kjøpsvilkår: ${TERMS_OF_PURCHASE_URL}\n\n` +
     `Rett fra Bonden formidler bestillingen; ${d.producerName} er selger. ${companyOperatorSentence("nb").replace(/^Operatør: /, "Rett fra Bonden drives av ")}`;
+
+  if (event === "submitted") {
+    const text =
+      `Hei!\n\nVi har sendt bestillingen din til ${d.producerName}. Dette er en forespørsel: bestillingen gjelder ikke før ${d.producerName} har bekreftet den, og du får en ny e-post når produsenten svarer.\n\n` +
+      `Ordre: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
+      `Varer:\n${itemLines}\n${sumLine}\n\n` +
+      `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n` +
+      `Betaling: Du betaler ${d.producerName} ved henting. Ingenting er belastet nå.\n\n` +
+      `Hører du ikke fra produsenten, kan du kontakte dem direkte (kontaktinformasjon over). Bestillingen blir kansellert hvis produsenten ikke svarer innen kort tid.\n\n` +
+      footer;
+    return { subject: `Bestillingen din er sendt til ${d.producerName} (${d.orderRef})`, text };
+  }
 
   if (event === "confirmed") {
     let pay: string;
@@ -137,9 +171,17 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
       `Hei!\n\n${d.producerName} har bekreftet bestillingen din via Rett fra Bonden. Kjøpet er dermed bindende. ` +
       `Denne e-posten er bekreftelsen din – ta vare på den.\n\n` +
       `Ordre: ${d.orderRef}\nSelger: ${d.producerName}\n${contactLines}\n\n` +
-      `Varer:\n${itemLines}\nSum: ${krNok(d.totalNok)}\n\n` +
-      `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n` +
+      `Varer:\n${itemLines}\n${sumLine}\n\n` +
+      (d.pickupTime
+        ? `Henting: Du henter varene hos ${d.producerName}. Hentetid: ${formatPickupTimeOslo(d.pickupTime)}.\n`
+        : `Henting: Du henter varene hos ${d.producerName}. Avtal tid og sted med produsenten.\n`) +
       `Betaling: ${pay}\n\n` +
+      // Fase A1: only promised while the automatic close is actually on.
+      (d.autoCloseOn
+        ? `Du trenger ikke gjøre noe mer etter hentingen: ordren avsluttes av seg selv etter hentetiden. ` +
+          `Stemmer ikke noe – for eksempel hvis du ikke fikk hentet varene – sier du fra til ${d.producerName} (kontaktinformasjon over) ` +
+          `eller til Rett fra Bonden på ${PLATFORM_CONTACT}, så retter vi det.\n\n`
+        : "") +
       rights +
       footer;
     return { subject: `Ordrebekreftelse fra ${d.producerName} (${d.orderRef})`, text };
@@ -161,6 +203,12 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
       why = `${d.producerName} bekreftet ikke bestillingen innen fristen, så den er kansellert.`;
       pay = notChargedLine(p);
       break;
+    case "producer_no_response":
+      // F4: nobody answered within the deadline. Neutral about the producer
+      // (no blame) and gives the contact details so the buyer can ask directly.
+      why = `${d.producerName} har ikke svart på bestillingen din innen fristen, så den er kansellert.`;
+      pay = notChargedLine(p);
+      break;
     case "producer_cancelled":
       why = `${d.producerName} har kansellert bestillingen fordi den ikke kan leveres.`;
       // A captured payment is refunded automatically (and retried by the
@@ -177,10 +225,20 @@ export function renderBuyerReceipt(event: ReceiptEvent, d: ReceiptData): Rendere
         pay = notChargedLine(p);
       }
       break;
+    case "no_show": {
+      // Fase A1 (AC2): the producer recorded that the order was not picked
+      // up. The buyer gets a receipt so a wrong registration can be corrected.
+      why = `${d.producerName} har registrert at bestillingen ikke ble hentet. ` +
+        `Har du hentet varene, eller stemmer ikke dette, sier du fra til ${d.producerName} eller til Rett fra Bonden på ${PLATFORM_CONTACT}.`;
+      const settled = !!p && (p.status === "captured" || p.status === "authorized");
+      pay = settled ? ` Betalingen for en bestilling som ikke hentes, behandles etter kjøpsvilkårene (${TERMS_OF_PURCHASE_URL}).` : "";
+      break;
+    }
     default:
-      return null; // no_show and other reasons: no receipt
+      return null; // other reasons: no receipt
   }
   const text = `Hei!\n\n${why}${pay} (Ordre ${d.orderRef}.)\n\nKontakt produsenten:\n${contactLines}\n\n` + footer;
+  if (d.cancelReason === "no_show") return { subject: `Bestillingen er registrert som ikke hentet (${d.orderRef})`, text };
   return { subject: `Bestillingen er kansellert (${d.orderRef})`, text };
 }
 
@@ -190,12 +248,12 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
   try {
     const db = _testDb ?? getDb();
     const o = db.prepare(`
-      SELECT o.id, o.agent_id, o.total_nok, o.cancel_reason, o.buyer_email AS order_email, c.buyer_email AS cart_email,
+      SELECT o.id, o.agent_id, o.total_nok, o.cancel_reason, o.pickup_time, o.buyer_email AS order_email, c.buyer_email AS cart_email,
              a.name AS producer_name
       FROM orders o INNER JOIN agents a ON a.id = o.agent_id LEFT JOIN carts c ON c.id = o.cart_id
       WHERE o.id = ?
     `).get(orderId) as
-      | { id: string; agent_id: string; total_nok: number | null; cancel_reason: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
+      | { id: string; agent_id: string; total_nok: number | null; cancel_reason: string | null; pickup_time: string | null; order_email: string | null; cart_email: string | null; producer_name: string }
       | undefined;
     if (!o) return;
     const to = plausibleEmail(o.order_email) ?? plausibleEmail(o.cart_email);
@@ -223,11 +281,14 @@ export async function sendBuyerOrderReceipt(orderId: string, event: ReceiptEvent
       totalNok: o.total_nok,
       cancelReason: o.cancel_reason,
       payment,
+      pickupTime: o.pickup_time,
+      autoCloseOn: isOrderAutocompleteEnabled(),
     });
     if (!rendered) return;
     const replyTo = plausibleEmail(contact.email) ?? "kontakt@rettfrabonden.com";
     const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
-    const res = await send({ to, subject: rendered.subject, textContent: rendered.text, replyTo, redactRecipientInLogs: true });
+    // F8: a receipt is transactional mail, not outreach: no outreach header.
+    const res = await send({ to, subject: rendered.subject, textContent: rendered.text, replyTo, redactRecipientInLogs: true, omitAgentHeader: true });
     if (res?.success) console.log(`[buyer-receipt] sent order=${orderId} event=${event}`);
     else console.error(`[buyer-receipt] send FAILED order=${orderId} event=${event}: ${maskEmails(String(res?.error || "unknown error"))}`);
   } catch (err: any) {

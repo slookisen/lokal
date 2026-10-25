@@ -45,7 +45,9 @@ jobs:
         env:
           ONLY: ${{ github.event.inputs.only }}
         run: |
-          # No `set -e`: every server must be tried, failures are collected in FAILED.
+          # GitHub runs this step with `bash -e`. Turn errexit off so every server is tried and a
+          # failed or duplicate publish is handled below instead of ending the step.
+          set +e
           set -u
           SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
           FAILED=0

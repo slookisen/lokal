@@ -64,11 +64,13 @@ import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
-// Only isBookingPaused is used here (same import + reasoning as
+import { rpcInternalErrorReply } from "../utils/internal-error";
+// The booking object (isBookingPaused under the hood, same as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
-// base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
-// call site never passes a catalog_hidden arg either.
-import { isBookingPaused } from "../services/booking-store";
+// base WHERE clause already excludes catalog_hidden=1 rows entirely, so no
+// catalog_hidden arg is needed. One shared note source (dev-request
+// 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7).
+import { gardssalgBookingStatus } from "../services/gardssalg-booking-gate";
 
 export { parseExperiencesIntent };
 
@@ -123,6 +125,19 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
   const err: Record<string, unknown> = { code, message };
   if (data !== undefined) err.data = data;
   return { jsonrpc: "2.0", error: err, id };
+}
+
+/**
+ * The answer to a request that failed inside the handler: JSON-RPC's generic
+ * -32603 "Internal error", without the detail. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the caller
+ * as `data`, as Finn-tannlege A2A's did until slice I-Y2. The detail is
+ * logged instead, without the request (`where` says which step failed;
+ * utils/internal-error.ts).
+ */
+function rpcInternalError(id: unknown, where: string, err: unknown) {
+  return rpcInternalErrorReply("experiences-a2a", id, where, err);
 }
 
 // ─── Zod envelope schema ─────────────────────────────────────
@@ -357,8 +372,7 @@ export function handleExperiencesMessageSend(
         metadata: { skill: "opplevelser_categories" },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (opplevelser_categories)", err);
     }
   }
 
@@ -400,8 +414,7 @@ export function handleExperiencesMessageSend(
         metadata: { skill: "opplevelser_info", id: idMatch[1] },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (opplevelser_info)", err);
     }
   }
 
@@ -462,11 +475,10 @@ export function handleExperiencesMessageSend(
           : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
 
       // Per-row shape mirrors discover_gardssalg (experiences-mcp.ts)
-      // EXACTLY — same field names, same isBookingPaused()-derived booking
+      // EXACTLY — same field names, same gardssalgBookingStatus()-derived booking
       // object, same bilingual notes, same profile_url template, same
       // hasGeo-gated distance_km.
       const producers = results.map((row) => {
-        const live = !isBookingPaused(row.booking_live);
         return {
           // provider_id for book_gardssalg / POST /api/opplevelser/book (added
           // 2026-09-16, dev-request …-en-setning-booking-via-ai — same
@@ -482,13 +494,7 @@ export function handleExperiencesMessageSend(
           lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
           lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
           geocode_confidence: row.geocode_confidence ?? null,
-          booking: {
-            live,
-            mode: live ? ("request" as const) : ("paused" as const),
-            note: live
-              ? "Book direkte. / Book directly."
-              : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-          },
+          booking: gardssalgBookingStatus(row),
           profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
           ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
         };
@@ -518,8 +524,7 @@ export function handleExperiencesMessageSend(
         },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (gardssalg_discover)", err);
     }
   }
 
@@ -712,8 +717,7 @@ export function handleExperiencesMessageSend(
       },
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return rpcErr(id, -32603, "Internal error", msg);
+    return rpcInternalError(id, "message/send (opplevelser_discover)", err);
   }
 }
 
@@ -778,8 +782,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         res.json(rpcErr(id, -32601, `Method not found: ${method}`));
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.json(rpcErr(id, -32603, "Internal error", msg));
+    res.json(rpcInternalError(id, "POST /a2a", err));
   }
 });
 

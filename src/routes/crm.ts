@@ -21,6 +21,7 @@ import { emailService } from "../services/email-service";
 import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
+import { unsubscribeHeaderValues } from "../services/avmeld-service";
 import { getOutreachMaxTouchVernConfig, getMaxTouchStatusForEmail } from "../services/outreach-max-touch-vern";
 
 // ─── Admin auth (matches the fleet-wide admin-route pattern, e.g.
@@ -619,6 +620,11 @@ function todayUTC(): string {
 // bookkeeping write then threw still answers 500 here (unchanged route
 // behaviour), but it WAS sent, and a caller that must never re-send has to
 // know that.
+function coldUnsubscribeOptions(to: string): { listUnsubscribe?: string; listUnsubscribePost?: string } {
+  const h = unsubscribeHeaderValues(to);
+  return h ? { listUnsubscribe: h.listUnsubscribe, listUnsubscribePost: h.listUnsubscribePost } : {};
+}
+
 export type ComposeRequest = z.infer<typeof composeSchema>;
 
 export type ComposeSendRaw = (
@@ -718,7 +724,7 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
     if (intent === "resend_send" && !(createdBy === "daniel" && force)) {
       const bounced = getDb().prepare(`
         SELECT bounce_type, bounced_at FROM email_bounces
-        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint')
+        WHERE LOWER(TRIM(email)) = LOWER(TRIM(?)) AND bounce_type IN ('hard', 'complaint', 'unsubscribe')
         ORDER BY id DESC LIMIT 1
       `).get(to) as { bounce_type: string; bounced_at: string } | undefined;
       if (bounced) {
@@ -726,7 +732,7 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
           success: false,
           error: "recipient_bounced",
           reason:
-            `refusing to send to ${to}: email_bounces has a ${bounced.bounce_type === "complaint" ? "spam complaint" : "hard bounce"} ` +
+            `refusing to send to ${to}: email_bounces has ${bounced.bounce_type === "complaint" ? "a spam complaint" : bounced.bounce_type === "unsubscribe" ? "an unsubscribe" : "a hard bounce"} ` +
             `for this address (${bounced.bounced_at}). Mailing it again hurts sender reputation for every platform.`,
           to,
           bounce_type: bounced.bounce_type,
@@ -1015,6 +1021,12 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
               htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
               from: crmFromHeader(vertical),
               replyTo: composeIdentity.replyTo,
+              // S1a point 3 (OUTREACH_UNSUBSCRIBE_ENABLED, default off): cold RFB
+              // outreach carries List-Unsubscribe + One-Click. Spread, so the
+              // options are identical to before when off / not cold outreach.
+              ...(vertical === "rfb" && category === "marketing" && createdBy === "claude"
+                ? coldUnsubscribeOptions(to)
+                : {}),
             };
             transportAttempted = true;
             const result = await sendRaw(sendOptions);

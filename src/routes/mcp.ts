@@ -30,7 +30,8 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
-import { capFreeText, capName } from "../utils/free-text";
+import { capFreeText, capName, capNameList } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -54,11 +55,12 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 
 const router = Router();
 
@@ -365,9 +367,7 @@ export function formatOpeningHoursForMcp(openingHours: unknown): string {
  * SDK returns the raw exception message (createToolError), which is how a
  * JavaScript TypeError reached ChatGPT. The detail is logged instead.
  */
-export const MCP_INTERNAL_ERROR_TEXT =
-  "Beklager, det oppstod en intern feil hos Rett fra Bonden, og forespørselen kunne ikke fullføres. Prøv igjen senere. / " +
-  "Sorry, an internal error at Rett fra Bonden stopped this request. Please try again later.";
+export const MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Rett fra Bonden");
 
 /**
  * Wraps a tool handler: an uncaught error is logged with the tool name and
@@ -379,8 +379,7 @@ export function guardToolHandler<H extends (...args: any[]) => unknown>(tool: st
     try {
       return await handler(...args);
     } catch (err) {
-      console.error(`[mcp] ${tool} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-      return { content: [{ type: "text" as const, text: MCP_INTERNAL_ERROR_TEXT }], isError: true };
+      return mcpToolInternalErrorResult("mcp", MCP_INTERNAL_ERROR_TEXT, tool, err);
     }
   };
   return guarded as unknown as H;
@@ -949,8 +948,11 @@ export function registerTools(
           }));
 
           // Profile link
-          const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
-          sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+          // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+          if (!failsProducerRoleGate((agent as any).role, false)) {
+            const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
+            sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+          }
 
           return sections.join("\n");
         } else {
@@ -1016,7 +1018,27 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    guardToolHandler("lokal_discover", async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+    guardToolHandler("lokal_discover", async ({ categories: categoriesAsSent, tags: tagsAsSent, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+      // GHSA-46jr (lokal#1229): a list longer than MCP_MAX_FILTER_LIST is
+      // refused here, not with .max() in the inputSchema, so tools/list stays
+      // the frozen contract (services/mcp-input-limits.ts).
+      if (Array.isArray(categoriesAsSent) && categoriesAsSent.length > MCP_MAX_FILTER_LIST) {
+        return mcpListTooLongResult("categories", MCP_MAX_FILTER_LIST, categoriesAsSent.length);
+      }
+      if (Array.isArray(tagsAsSent) && tagsAsSent.length > MCP_MAX_FILTER_LIST) {
+        return mcpListTooLongResult("tags", MCP_MAX_FILTER_LIST, tagsAsSent.length);
+      }
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+      // rfb-discover-lister-uten-tak): discover() compares every category and
+      // tag with every producer's, and the schema has no max (it is frozen
+      // while OpenAI reviews the app). 175 000 categories took 45 s on
+      // live-like data, one category of 1 MB 6.1 s. The lists are cut to
+      // their first MAX_NAME_LIST_ITEMS names of at most MAX_NAME_CHARS
+      // (utils/free-text.ts), as A2A's are, before the search, the traffic
+      // class and the delivery log read them. Lists within the caps are the
+      // same lists, so a real call answers as before.
+      const categories = capNameList(categoriesAsSent);
+      const tags = capNameList(tagsAsSent);
       // ChatGPT app re-review 2026-10-03: lat/lng/maxDistanceKm used to be
       // passed top-level, but discover() reads `location: {lat, lng}` — so the
       // distance filter never ran and every call returned a nationwide list
@@ -1095,7 +1117,10 @@ export function registerTools(
     },
     guardToolHandler("lokal_info", async ({ agentId }, extra) => {
       const info = knowledgeService.getAgentInfo(agentId);
-      if (!info) {
+      // Shared by-id visibility predicate (agent-visibility.ts; flag-gated —
+      // off = served as before). allowCatalogHidden: the hidden test fixture
+      // stays orderable by id.
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
@@ -1312,7 +1337,7 @@ export function registerTools(
 
       const lim = Math.min(limit || 100, 500);
       const rows = db.prepare(`
-        SELECT p.id, p.name, p.city, aff.labels
+        SELECT p.id, p.name, p.city, p.role, p.umbrella_type AS member_umbrella_type, aff.labels
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
@@ -1333,7 +1358,10 @@ export function registerTools(
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const where = m.city ? ` — ${m.city}` : "";
         sections.push(`- **${m.name}**${where}${labelStr}`);
-        sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
+        // Skive A2: no link for roles whose /produsent/<slug> page 404s.
+        if (!failsProducerRoleGate(m.role, !!m.member_umbrella_type)) {
+          sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
+        }
       }
       deliver("lokal_get_umbrella_members", { umbrellaId, limit }, extra, rows.map((m: any) => m.id));
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
@@ -1577,6 +1605,13 @@ export function registerTools(
       },
     },
     guardToolHandler("lokal_find_offers", async ({ items, near: nearAsSent, lat, lng, radius_km }, extra) => {
+      // GHSA-46jr (lokal#1229): more than MCP_MAX_SHOPPING_ITEMS items is
+      // refused here, not with .max() in the inputSchema, so tools/list stays
+      // the frozen contract. 21..MCP_MAX_SHOPPING_ITEMS items keep the
+      // MAX_OFFER_ITEMS cut and its note below.
+      if (Array.isArray(items) && items.length > MCP_MAX_SHOPPING_ITEMS) {
+        return mcpListTooLongResult("items", MCP_MAX_SHOPPING_ITEMS, items.length);
+      }
       // Slice I-Y2: `near` is a place name, cut to MAX_NAME_CHARS at a word
       // boundary (utils/free-text.ts). Each item's lookup used to geocode the
       // whole text again.
@@ -1865,7 +1900,8 @@ export function registerTools(
     async (uri) => {
       const agentId = uri.pathname?.split("/").pop() || "";
       const info = knowledgeService.getAgentInfo(agentId);
-      if (!info) {
+      // Shared by-id visibility predicate (flag-gated, see lokal_info).
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
       return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };
@@ -1924,7 +1960,10 @@ function formatAgentCompact(agent: any, idx: number, contact?: any,
 
   // Profile link
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
-  lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
+  // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+  if (!failsProducerRoleGate((agent as any).role, false)) {
+    lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
+  }
 
   return lines.join("\n");
 }
@@ -2070,7 +2109,7 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions() });
+  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

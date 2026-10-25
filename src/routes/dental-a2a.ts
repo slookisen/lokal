@@ -38,6 +38,7 @@ import {
   type DentalSearchTolkning,
 } from "../services/dental-query-parser";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+import { tokenize } from "../services/search-intent/norwegian-query";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { dentalLimiter } from "../middleware/security";
@@ -48,6 +49,7 @@ import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
+import { rpcInternalErrorReply } from "../utils/internal-error";
 
 const router = Router();
 
@@ -69,11 +71,10 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
  * dental-a2a-intern-feiltekst-i-svar): the error's own message went to the
  * caller as `data`, for example SQLite's «LIKE or GLOB pattern too complex».
  * The detail is logged instead, without the request (`where` says which step
- * failed).
+ * failed; utils/internal-error.ts since slice I-Y3).
  */
 function rpcInternalError(id: unknown, where: string, err: unknown) {
-  console.error(`[dental-a2a] ${where} failed:`, err instanceof Error ? err.stack || err.message : String(err));
-  return rpcErr(id, -32603, "Internal error");
+  return rpcInternalErrorReply("dental-a2a", id, where, err);
 }
 
 // ─── Zod envelope schema ─────────────────────────────────────
@@ -120,13 +121,27 @@ function extractText(msg: unknown): string | null {
 // MCP tannlege_search and /sok use. The keyword matcher below
 // (legacyParseIntent) stays as the rollback (DENTAL_QUERY_PARSER_DISABLED=1)
 // and as the old reading planDentalSearch keeps next to the parsed one: its
-// hits stay in the result and come first, so no message finds fewer clinics.
+// hits stay in the result and come first, so no message finds fewer clinics
+// than the matcher does (since D3c2 it reads a fylke only from whole words).
 
 const FYLKER = [
   "oslo", "akershus", "østfold", "buskerud", "innlandet", "vestfold",
   "telemark", "agder", "rogaland", "vestland", "møre og romsdal",
   "trøndelag", "nordland", "troms", "finnmark",
 ];
+
+// D3c2 (dev-request 2026-10-17-dental-d3-rettelser): a fylke counts only
+// when its words stand as whole words in the text, so «Tromsø», «Tromso»
+// and «Tromsdalen» are no longer fylke Troms (they go to q), while «Troms»,
+// «Nord-Troms» and «Vest-Agder» still are. Whole words by the parser's
+// tokenize (hyphen and punctuation split), not a \b regex: JS doesn't count
+// ø as a word character, so /\btroms\b/ would still match inside «Tromsø».
+const FYLKE_WORDS = FYLKER.map((f) => ({ f, words: tokenize(f) }));
+
+/** Whether `words` stand in `tokens` as one run of whole tokens. */
+function hasWords(tokens: readonly string[], words: readonly string[]): boolean {
+  return tokens.some((_, i) => words.every((w, j) => tokens[i + j] === w));
+}
 
 const SPECIALTIES = [
   "kjeveortopedi", "oral kirurgi", "oral medisin", "periodonti",
@@ -147,9 +162,10 @@ function legacyParseIntent(text: string): DentalSearchParams {
   const lower = text.toLowerCase();
   const params: DentalSearchParams = {};
 
-  // Fylke detection
-  for (const f of FYLKER) {
-    if (lower.includes(f)) {
+  // Fylke detection (whole words, see FYLKE_WORDS)
+  const tokens = tokenize(text);
+  for (const { f, words } of FYLKE_WORDS) {
+    if (hasWords(tokens, words)) {
       params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
       break;
     }
@@ -177,7 +193,12 @@ function legacyParseIntent(text: string): DentalSearchParams {
     params.acute_vakt = 1;
   }
 
-  // Residual free-text (words not yet captured, for name/city matching)
+  // Residual free-text (words not yet captured, for name/city matching).
+  // This list belongs to the old reading and stays as it was: it is the
+  // rollback, and planDentalSearch only adds its hits to the parsed ones, so
+  // a filler word it keeps («care») never empties an answer. The parsed
+  // reading uses the shared list (DENTAL_SEARCH_VOCABULARY.stopwords), as
+  // MCP and /sok do (S-EN, 2026-10-19).
   const stopwords = new Set([
     "finn", "find", "søk", "search", "tannlege", "dental", "klinikk", "clinic",
     "i", "in", "med", "with", "og", "and", "en", "a", "på", "at",
@@ -421,7 +442,7 @@ export function handleDentalMessageSend(
           name: "dental-search-results",
           // dev-request 2026-10-16-tannlege-mcp-instrukser-og-klinikkort (S4b):
           // the stored row with untrue values made honest (displayable phones,
-          // acute_vakt only with provenance), no rating fields or
+          // acute_vakt only with «Akuttvakt», F1-S4c), no rating fields or
           // field_provenance, plus the search card shared with MCP. count is
           // the clinics in this answer; total (D3c) every clinic that matches.
           parts: [{ kind: "data", data: { count: results.length, total, clinics: results.map(toDentalA2aClinic) } }],

@@ -36,7 +36,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isPubliclyListable } from "./agent-visibility";
+import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -52,8 +52,10 @@ import {
 // bundled file read once), no DB and no network, so the same isolation rule
 // as above holds.
 import {
-  buildNorwegianGazetteer, detectPlaces, escapeLike, placeKey, QUERY_STOPWORDS, tokenize, type PlaceGazetteer,
+  buildNorwegianGazetteer, detectPlaces, escapeLike, placeKey, PLACE_PREPOSITIONS, QUERY_STOPWORDS, tokenize, type PlaceGazetteer,
 } from "./search-intent/norwegian-query";
+// Slice I-W4: the search's own filler words, shared with the geocoder. Pure, same rule.
+import { FILLER_WORDS, isFillerNoPlaceAt, NO_PRODUCT_WORDS, QUALIFIER_WORDS } from "./search-intent/rfb-filler-words";
 import { officialPoststedFylker } from "./norway-postnummer";
 import { productNameMatch, type ProductNameMatch } from "../utils/product-name-match";
 import { isCategoryLabel } from "../utils/category-label";
@@ -123,6 +125,13 @@ export interface DiscoverMeta {
  */
 export interface DiscoverOptions {
   trackDiscovery?: boolean;
+  /**
+   * Slice I-AA: false counts no discovery for a page of producers near a
+   * place whose products match none of the unknown words (meta.unmatchedTerms):
+   * A2A and /sok show no such page. Default true: lokal_search lists it,
+   * marked as no matches.
+   */
+  countUnmatched?: boolean;
 }
 
 class MarketplaceRegistry {
@@ -454,12 +463,14 @@ class MarketplaceRegistry {
     // and the ones whose products match the words rank first (step 7).
     const unknownTerms = ((query as any)._unknownTerms as string[] | undefined) ?? [];
     let termMatches: Map<string, CatalogTermMatch> | null = null;
+    let unmatched = false;
     if (unknownTerms.length > 0 && !((query as any)._productTerms as string[] | undefined)?.length) {
       termMatches = catalogTermMatches(db, unknownTerms, new Set(candidates.map(c => c.id)));
       if (termMatches && !query.categories?.length) {
         if (termMatches.size > 0) {
           candidates = candidates.filter(a => termMatches!.has(a.id));
         } else {
+          unmatched = true;
           if (meta) meta.unmatchedTerms = unknownTerms;
           if (!query.location) return [];
         }
@@ -646,7 +657,8 @@ class MarketplaceRegistry {
     const page = results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
     // Count a discovery only for what is actually returned (a2a spam guard:
     // this used to bump every CANDIDATE — ~5k row writes per unfiltered call).
-    if (trackDiscovery) this.incrementDiscovery(page.map(r => r.agent.id));
+    // Slice I-AA: and not for a page of no matches the caller does not show.
+    if (trackDiscovery && !(unmatched && opts.countUnmatched === false)) this.incrementDiscovery(page.map(r => r.agent.id));
     return page;
   }
 
@@ -1137,15 +1149,28 @@ class MarketplaceRegistry {
       // "farm Vestfold raw honey" — and the fuzzy fallback then answered with
       // every producer that merely has "Vestfold" in its name, discarding the
       // honey category that had been detected correctly one block above.
+      // Slice I-W4: next to a category word, a place right after a place
+      // preposition (PLACE_PREPOSITIONS) is where to search, not part of a
+      // producer name. «Finnes det noen bakeri med kransekake i Bærum» was the
+      // name query «kransekake Bærum», which found the producers named after
+      // Bærum and not Grini; «bakeri i Bærum» found only them. Without a
+      // category word the place stays, as before («gård i Valen»), and so does
+      // a word of a place of several words («bakeri i Mo i Rana» finds
+      // «Bakeriet Mo i Rana» by name): the geocoder leaves out «i» and never
+      // looks such a name up whole.
+      const lowAt = (i: number) => (queryWords[i] ?? "").replace(/[.,!?]/g, "").toLowerCase();
+      let phraseWords: Set<string> | null = null;
+      const placeOfOneWord = (w: string) => isPlace(w) && !(phraseWords ??= multiWordPlaceWordsIn(query)).has(w);
       const nameParts: string[] = [];
-      for (const word of queryWords) {
-        const clean = word.replace(/[.,!?]/g, "");
+      for (let i = 0; i < queryWords.length; i++) {
+        const clean = queryWords[i].replace(/[.,!?]/g, "");
         if (clean.length < 2) continue;
         const low = clean.toLowerCase();
         if (skipWords.has(low)) continue;
         if (NAME_PASS_PLACE_WORDS.has(low)) continue;
         if (detectedCategories.length > 0
             && (isCategoryOrTagWord(low, categoryMap, tagMap) || isEnglishFoodWord(low))) continue;
+        if (detectedCategories.length > 0 && i > 0 && PLACE_PREPOSITIONS.has(lowAt(i - 1)) && placeOfOneWord(low)) continue;
         nameParts.push(clean);
       }
       // Slice I-W3 (FUNN rfb-sok-pass1-fyllord): Pass 1 read neither
@@ -1642,11 +1667,13 @@ class MarketplaceRegistry {
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
   isQuarantinedFromPublicView(agentId: string): boolean {
     const db = getDb();
-    const row = db.prepare("SELECT origin, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
-      { origin: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
+    const row = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
+      { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     if (!row) return false;
-    if (!isPubliclyListable(row)) return true;
-    return row.origin === "self_registered" && row.is_vetted !== 1;
+    // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
+    // flag off = the quarantine rule this method has always applied; flag
+    // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.
+    return !isAgentPubliclyVisible(row, { surface: "gated" });
   }
 
   getAgentByApiKey(apiKey: string): RegisteredAgent | undefined {
@@ -1779,7 +1806,7 @@ class MarketplaceRegistry {
     // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: + the shared
     // public-listability predicate (no catalog_hidden fixture, RFB vertical only)
     // — this one line covers every public list surface built on this method.
-    const rows = db.prepare(`SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
+    const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
@@ -2710,15 +2737,8 @@ function rfbPlaceGazetteer(): PlaceGazetteer {
   return (placeGazetteerCache ??= buildNorwegianGazetteer(officialPoststedFylker().keys()));
 }
 
-/**
- * True when one word, in any case or spelling the gazetteer folds («Bærum»,
- * «baerum», «Aurskog-Høland»), is a poststed, kommune, region or fylke, or one
- * of PLACE_WORDS_OUTSIDE_GAZETTEER.
- */
-export function isPlaceWord(word: string): boolean {
-  const w = String(word ?? "").trim().toLowerCase();
-  if (!w) return false;
-  if (PLACE_WORDS_OUTSIDE_GAZETTEER.has(w)) return true;
+/** True when the gazetteer has the lower-case word `w` as a poststed, kommune, region or fylke. */
+function inPlaceGazetteer(w: string): boolean {
   const k = placeKey(w);
   if (!k) return false;
   const g = rfbPlaceGazetteer();
@@ -2726,15 +2746,45 @@ export function isPlaceWord(word: string): boolean {
 }
 
 /**
+ * True when one word, in any case or spelling the gazetteer folds («Bærum»,
+ * «baerum», «Aurskog-Høland»), is a poststed, kommune, region or fylke, or one
+ * of PLACE_WORDS_OUTSIDE_GAZETTEER.
+ * Slice I-W4: a filler word (search-intent/rfb-filler-words.ts) is none on its
+ * own, though the gazetteer has «nå», «time» and «feiring»; placeWordsIn()
+ * reads one as a place where the search says so («i Time», «Time» alone).
+ * «more» stays one, as a word of PLACE_WORDS_OUTSIDE_GAZETTEER.
+ */
+export function isPlaceWord(word: string): boolean {
+  const w = String(word ?? "").trim().toLowerCase();
+  if (!w) return false;
+  if (PLACE_WORDS_OUTSIDE_GAZETTEER.has(w)) return true;
+  return !FILLER_WORDS.has(w) && inPlaceGazetteer(w);
+}
+
+/**
  * The words of `query` (lower case, as tokenize() splits them) that are
  * place words: each word isPlaceWord accepts, and every word of a multi-word
  * place in the query («møre», «og», «romsdal» in «honning i Møre og Romsdal»).
+ * Slice I-W4: a filler word the gazetteer has is a place word only right after
+ * a place preposition or as the whole search (isFillerNoPlaceAt), so «Hvem
+ * selger kransekake nå» names no place and «kransekake i Time» does. A phrase
+ * of filler words only is none (the gazetteer has no such phrase today).
  */
 export function placeWordsIn(query: string): Set<string> {
   const tokens = tokenize(query);
-  const out = new Set(tokens.filter(isPlaceWord));
-  for (const m of detectPlaces(tokens, rfbPlaceGazetteer())) {
+  const out = new Set(tokens.filter((t, i) => isPlaceWord(t) || (!isFillerNoPlaceAt(tokens, i) && inPlaceGazetteer(t))));
+  for (const m of detectPlaces(tokens, rfbPlaceGazetteer(), { notAlone: FILLER_WORDS })) {
     for (const t of tokens.slice(m.start, m.start + m.length)) out.add(t);
+  }
+  return out;
+}
+
+/** The words of `query` (as tokenize() splits them) that belong to a place of two or more words in it («mo», «i», «rana»). */
+function multiWordPlaceWordsIn(query: string): Set<string> {
+  const tokens = tokenize(query);
+  const out = new Set<string>();
+  for (const m of detectPlaces(tokens, rfbPlaceGazetteer(), { notAlone: FILLER_WORDS })) {
+    if (m.length > 1) for (const t of tokens.slice(m.start, m.start + m.length)) out.add(t);
   }
   return out;
 }
@@ -2780,120 +2830,9 @@ const GENERIC_NAME_WORDS = new Set([
 
 // ── Words the parser could not read (slice I-W) ─────────────────────────
 
-/**
- * Words of a food search that name no product, in addition to the shared
- * QUERY_STOPWORDS (search-intent/norwegian-query.ts: question words,
- * pronouns, request verbs, praise and time words). Review round 1 of slice
- * I-W: a word step 3c looks up only has to start a word of a product name,
- * so a filler word let in every producer whose products start with it, shown
- * as a product match: in the live catalogue (2026-10-18) «vil» («jeg vil ha
- * kransekake») starts a product name at 37 producers («Villsau…»,
- * «Villblåbær…»), «dag» at 11 («Dagssuppe»), «hjemmelaget» at 7. Pass 2 of
- * parseNaturalQuery skips them too, so they make no name search either.
- * Lower case; Norwegian (bokmål and nynorsk) and English.
- */
-const NO_PRODUCT_WORDS: ReadonlySet<string> = new Set([
-  // who is searched among («produsenter i Trondheim»), and «hvem», which the shared list lacks
-  "produsent", "produsenter", "matprodusent", "matprodusenter", "bonde", "bonden", "bondens",
-  "bønder", "gårder", "butikker", "utsalg", "hvem",
-  // buying, ordering and needing
-  "kjøp", "kjøper", "kjøpes", "kjøpt", "handle", "handler", "bestill", "bestilling", "bestiller",
-  "trenger", "trengs", "skaffe", "purchase", "buying",
-  // delivery, pickup and the web shop
-  "levering", "levere", "leverer", "leveres", "levert", "hjemlevering", "frakt", "sende", "sendes",
-  "hente", "henting", "hentes", "nett", "nettet", "nettbutikk", "nettbutikken", "online", "delivery",
-  "deliver", "shipping",
-  // how or where it is made, and how good, not what it is («hjemmelaget kransekake»)
-  "hjemmelaget", "hjemmelagd", "hjemmelagde", "hjemmelagede", "hjemmelaga", "heimelaga", "heimelaget",
-  "heimelagd", "hjemmebakt", "hjemmebakte", "håndlaget", "håndlagde", "handlaga", "homemade", "handmade",
-  "norsk", "norske", "norskprodusert", "norwegian", "ekte", "egen", "egne", "eget", "eige", "eigne",
-  "deilig", "deilige", "nydelig", "nydelige", "kvalitet", "tradisjonell", "tradisjonelle", "tradisjonelt",
-  "traditional", "authentic", "quality",
-  // amounts and the word «product» itself
-  "kilo", "gram", "liter", "stk", "produkt", "produktet", "vare", "matvarer", "product", "products",
-  // Slice I-W2 (S4): looking for it, and who makes it. Inside a producer name
-  // they made a name search of the whole question: «ser» («Hvasser») in «Jeg
-  // ser etter kransekake», «lager» («Fruktlager», «Lager 11») in «Hvem lager
-  // spekepølse», «make» («Ostemakeri») in «Which bakeries make kransekake».
-  // «leter» ends «Fiskefileter». Slice I-W3, review round 1 (S1): «finner»,
-  // which «Finnerud Gård» begins, made «Hvor finner jeg kortreist mat i
-  // Oslo?» the name search «finner mat» («finne» and «finn» are skipWords).
-  "ser", "leter", "lete", "søker", "finner", "lager", "lage", "lages", "produserer", "produsere",
-  "make", "makes", "making",
-  // «hvor får jeg tak i kransekake», «… i nærheten av Bergen»
-  "tak", "nærheten",
-  // Slice I-W2, review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag):
-  // «kortreist», the platform's own word for what every producer here sells.
-  // Next to a category word it ranked the one producer with it in a product
-  // name first and labelled the rest «Kategoritreff: «kortreist» ikke
-  // oppført» («egg kortreist»: Lofseik Gård first, the farms with eggs
-  // labelled). No product name in the live catalogue (2026-10-17) starts
-  // with it; one has it as a label, «Rotgrønnsaker (kortreist)». It is a
-  // whole word of the producer name «Osteverkstedet — Kortreist Italiener»,
-  // so Pass 2 made «kortreist kransekake» and «kortreist i Trondheim» name
-  // searches for that producer alone (main too). As a filler word Pass 2
-  // skips it, and alone it still makes that name search (a search of filler
-  // words only is read by main's rule). «kortreiste» is in QUALIFIER_WORDS.
-  "kortreist",
-]);
-
-/**
- * Slice I-W2 (S1): words for the occasion, the meal, the time of year, the
- * size, the packaging or the price of what is sought, not the product. Next
- * to a product word they only brought in producers that match them alone,
- * as product matches: in the live catalogue (2026-10-17) a product name
- * starts with «stor» at 47 producers («Storfekjøtt»), «gave» at 17, «lunsj»
- * at 17 and «selskap» at 11, and «kransekake til lunsj» gave Lillehammer
- * Bakeri («Frukost og lunsj») first. Such a word counts only when nothing
- * else in the search names a product («lunsj» alone still finds lunch). Not
- * here: «bryllup» and «konfirmasjon», which name a product («Kransekake
- * bryllup», «Bryllupskaker»). Lower case; bokmål, nynorsk and English.
- * A list, not «the word with the fewest producers is the product»: «frokost»
- * starts a product name at 4 live producers and «syltetøy» at 48, so that
- * rule would answer «syltetøy til frokost» with breakfast and no jam.
- * Review round 3: also how fresh, near, natural or wholesome it is (the
- * last group below).
- */
-const QUALIFIER_WORDS: ReadonlySet<string> = new Set([
-  // occasion
-  "selskap", "selskaper", "selskapet", "gave", "gaver", "gaven", "presang", "fest", "festen", "bursdag",
-  "bursdagen", "jubileum", "feiring", "anledning", "party", "gift", "gifts", "present", "birthday", "wedding",
-  // holidays and the time of year («17. mai»)
-  "jul", "julen", "jula", "julaften", "påske", "påsken", "påska", "mai", "sommer", "sommeren", "vinter",
-  "vinteren", "høst", "høsten", "christmas", "easter", "summer", "winter", "autumn",
-  // meal
-  "frokost", "frukost", "lunsj", "lunch", "middag", "middagen", "kveldsmat", "brunsj", "brunch", "breakfast",
-  "dinner",
-  // size
-  "liten", "lite", "lita", "lille", "små", "stor", "store", "stort", "større", "størst", "small", "large", "big",
-  // packaging
-  "boks", "bokser", "pakke", "pakker", "pakning", "eske", "esker", "pose", "poser", "box", "pack", "package",
-  // price and offer
-  "tilbud", "tilbudet", "rabatt", "salg", "offer", "discount",
-  // Review round 3 (FUNN rfb-sok-kategori-pluss-ord-etikettgrunnlag): how
-  // fresh, near, natural or wholesome it is. Next to a category word such a
-  // word ranked the producers with it in a product name first and labelled
-  // the rest «Kategoritreff: «…» ikke oppført» («nybakt brød»: the bakeries
-  // without «Nybakt brød»). Here, not in NO_PRODUCT_WORDS: in the live
-  // catalogue (2026-10-17) product names start with «nybakt» («Nybakt
-  // brød», 3 producers), «frisk» («Friske urter», 2) and «naturlig»
-  // («Naturlige såper», «Naturlig kosmetikk», 3), and a search of one such
-  // word keeps main's answer: those products, a name search («ren», «sunn»
-  // sit inside many names) or the honest no-match answer («kortreiste»,
-  // «sunt»), where a NO_PRODUCT_WORDS word alone gives the standard list.
-  // Not here: «rein» (reindeer, «Reinkjøtt»); «lokal», «fersk», «økologisk»,
-  // «local», «fresh», «organic» and their forms, which are tag words
-  // (tagMap) and never unknown words; and «kortreist», in NO_PRODUCT_WORDS.
-  "nybakt", "nybakte", "frisk", "friske", "kortreiste", "gårdsprodusert", "gårdsproduserte", "småskala",
-  "homegrown", "naturlig", "naturlige", "natural", "ren", "rene", "pure", "sunn", "sunne", "sunt", "healthy",
-  // Slice I-W3 (FUNN rfb-sok-egenskapsord-hale): next to a category word
-  // «gourmet» and «artisan» still labelled its producers «Kategoritreff:
-  // «…» ikke oppført» («gourmet brød», «artisan bread»). Alone each is read
-  // as before: «gourmet» names «Frøya Gourmet», and «artisan» finds
-  // «Syltetøy artisan» (live catalogue 2026-10-17). Review round 1 (S2):
-  // «artisanal» too, which no live producer or product name holds.
-  "gourmet", "artisan", "artisanal",
-]);
+// NO_PRODUCT_WORDS and QUALIFIER_WORDS moved, unchanged, to
+// search-intent/rfb-filler-words.ts (slice I-W4), so the geocoder reads the
+// same lists as this parser; imported above.
 
 /** At most this many words of one query are looked up in the catalog. */
 const UNKNOWN_TERMS_MAX = 4;

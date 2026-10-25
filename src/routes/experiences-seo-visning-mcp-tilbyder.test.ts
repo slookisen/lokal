@@ -252,7 +252,7 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
           for (const k of ["name", "org_nr", "website", "phone"]) if (!(k in sc.provider) || sc.provider[k] === "") nullClean = false;
         }
         if (sc && (sc.source_url === "" || !("source_url" in sc))) nullClean = false;
-        if (i === 0) assertTrue(sc.booking_info_only === true && sc.booking_url === "javascript:alert(1)", "ac2-3: a non-http booking_url is flagged booking_info_only");
+        if (i === 0) assertTrue(sc.booking_info_only === true && sc.booking_url === null, "ac2-3: a non-http booking_url is flagged booking_info_only and not returned");
         if (i === 1) assertTrue(sc.booking_info_only === false, "ac2-4: an http(s) booking_url is not info-only");
         if (i === 1) assertTrue(sc.source_url === "https://kilde.example.no/a", "ac2-5: source_url passes through");
         if (i === 2) assertTrue(sc.source_url === null && sc.provider.website === null && sc.provider.phone === null, "ac2-6: unknown fields are null, not empty strings");

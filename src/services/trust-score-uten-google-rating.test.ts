@@ -71,6 +71,8 @@ function callRoute(router: any, url: string): Promise<RouteResult> {
       status(code: number) { this.statusCode = code; return this; },
       setHeader() { return this; },
       header() { return this; },
+      set() { return this; },
+      vary() { return this; },
       json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       send(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
       end() { resolve({ status: this.statusCode, body: undefined }); return this; },
@@ -374,9 +376,27 @@ export async function runTrustScoreUtenGoogleRatingTests(opts: { log?: boolean }
       const unrated = clinic("Løten Tannklinikk A1b AS", "918800203", null, null);
       const ids = [rated, ratedZero, unrated];
 
-      /** What the route answered before S4-A1b, less the three rating keys. */
+      /**
+       * What the route answered before S4-A1b, less the three rating keys.
+       * Same dev-request, A4-D: a public answer also leaves out field_provenance
+       * (it holds the Places values) and Stage V's pending map (a read-only
+       * side column of the hydrated row). Nothing here comes from Places, so
+       * every other value is as stored. A2A dev-request
+       * 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8): nor the
+       * side values the «Verifisert» claim reads.
+       */
       const expectedRow = (id: string): Record<string, unknown> => {
-        const { rating: _r, rating_count: _c, rating_source: _s, ...row } = dstore.getDentalAgentById(id) as Record<string, unknown>;
+        const {
+          rating: _r,
+          rating_count: _c,
+          rating_source: _s,
+          field_provenance: _p,
+          stage_v_pending_correction: _v,
+          brreg_status: _b,
+          website_ownership: _w,
+          rich_field_count: _n,
+          ...row
+        } = dstore.getDentalAgentById(id) as Record<string, unknown>;
         return {
           ...row,
           telefon: isDisplayablePhone(row.telefon as string | null) ? row.telefon : null,

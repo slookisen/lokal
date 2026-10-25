@@ -3,16 +3,17 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type ClaimRateLimitScope } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
+import { deleteAgentProfileTranslations } from "../services/profile-translations";
 import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -48,6 +49,7 @@ import { maskEmail } from "../services/gardssalg-claim";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
+import { capA2aData } from "../utils/a2a-message";
 import { searchCountable, searchTrafficClass } from "../services/search-tracking";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
@@ -578,7 +580,18 @@ router.post("/register", (req: Request, res: Response) => {
 router.post("/discover", (req: Request, res: Response) => {
   const startTime = Date.now();
   try {
-    const query = DiscoveryQuerySchema.parse(req.body);
+    // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+    // rfb-discover-lister-uten-tak): the body is cut as RFB A2A's structured
+    // data is (capA2aData, utils/a2a-message.ts), whose query this route
+    // shares: `categories`, `tags` and `skills` to their first
+    // MAX_NAME_LIST_ITEMS names of at most MAX_NAME_CHARS, and the strings
+    // (`query`, `drinkSubcategory`) to MAX_FREE_TEXT_CHARS. discover()
+    // compares every entry with every producer's, so 175 000 categories took
+    // 45 s on live-like data. The cut comes before the validation, which
+    // then reads and reports at most those entries (each invalid entry of a
+    // 1 MB list was an issue in the 400 answer). A body within the caps is
+    // the same object, so a real search answers as before.
+    const query = DiscoveryQuerySchema.parse(capA2aData(req.body));
     // Slice I-Z: our own traffic and probes get the same answer but raise no
     // discovery counter, stay off the interactions feed and start no
     // countable conversation (searchTrafficClass).
@@ -901,7 +914,10 @@ router.get("/search", async (req: Request, res: Response) => {
 
   const enrichedResults = results.map((r: any) => {
     const contact = buildContactBlock(r.agent.id);
-    const profileUrl = `${BASE_URL}/produsent/${slug(r.agent.name)}`;
+    // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+    const profileUrl = failsProducerRoleGate(r.agent.role, false)
+      ? undefined
+      : `${BASE_URL}/produsent/${slug(r.agent.name)}`;
 
     // Include products with prices for all results (essential for AI agents)
     const info = knowledgeService.getAgentInfo(r.agent.id);
@@ -1153,9 +1169,19 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
 
     // Top-level canonical URL — explicit so AI agents reading the
     // card don't have to dig into links.profile or invent one from name.
-    card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
+    // Skive A2: /produsent/:slug 404s for non-producer, non-umbrella roles
+    // (quality/logistics) — omit canonicalUrl + links.profile for those so AI
+    // agents never follow a link to a 404. Same predicate as seo.ts.
+    let cardHasProfilePage = true;
+    try {
+      const gateRow = getDb()
+        .prepare("SELECT role, umbrella_type, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?")
+        .get(agentId) as any;
+      if (gateRow) cardHasProfilePage = hasProducerPage(gateRow);
+    } catch { /* fail-open: keep the link, as before */ }
+    if (cardHasProfilePage) card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
     card.links = {
-      profile: `https://rettfrabonden.com/produsent/${slug}`,
+      ...(cardHasProfilePage ? { profile: `https://rettfrabonden.com/produsent/${slug}` } : {}),
       googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
       vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
     };
@@ -1171,7 +1197,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
       const a = (agent as any);
       if (a.umbrella_type) {
         const members = db.prepare(`
-          SELECT p.id, p.name, p.city, aff.labels, aff.status
+          SELECT p.id, p.name, p.city, p.role, p.umbrella_type AS member_umbrella_type, aff.labels, aff.status
           FROM agent_affiliations aff
           INNER JOIN agents p ON p.id = aff.producer_id
           WHERE aff.umbrella_id = ?
@@ -1193,7 +1219,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
               city: m.city,
               labels: m.labels ? (() => { try { return JSON.parse(m.labels); } catch { return []; } })() : [],
               card_url: `${getBaseUrl(req)}/api/marketplace/agents/${m.id}/card`,
-              profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}`,
+              ...(failsProducerRoleGate(m.role, !!m.member_umbrella_type)
+                ? {}
+                : { profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}` }),
             })),
           }]);
         }
@@ -2259,12 +2287,15 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
     // searches in the wrong county). Compared before/after the write so a
     // re-sent identical address never resets a good geocode.
     const placeBefore = knowledgeService.getKnowledge(agentId);
+    let ownerLockSkipped: SkippedKnowledgeField[] = [];
     if (isAdmin) {
-      // Admin enrichment — preserve dataSource as "auto" (or what's in body)
-      knowledgeService.upsertKnowledge(agentId, {
+      // Admin enrichment — preserve dataSource as "auto" (or what's in body).
+      // Not the owner path: with OWNER_LOCK_ENFORCE_WRITES on, owner-locked
+      // fields are left alone and listed in the response as skipped.
+      ownerLockSkipped = knowledgeService.upsertKnowledge(agentId, {
         ...(body as any),
         dataSource: (body.dataSource as any) || "auto",
-      });
+      }).skipped;
     } else {
       // Owner update — sets dataSource to "owner"
       knowledgeService.ownerUpdate(agentId, req.body);
@@ -2291,6 +2322,8 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       data: { ...updated, trustScore: newTrustScore },
       // Same flag PUT /admin/knowledge reports; absent when nothing moved.
       ...(addressMoved ? { geocode_invalidated: true } : {}),
+      // Owner lock: present only when a field was left alone (flag on).
+      ...(ownerLockSkipped.length ? { skipped: ownerLockSkipped } : {}),
       // W40 write guards: present only on an admin call that carried `phone`.
       ...(phoneWrite ? { phone_write: phoneWrite } : {}),
       ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
@@ -3817,6 +3850,12 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       // admin-outreach-candidates.ts sum rollup + remaining raw) would reappear
       // out of the rollup remainder if the same agent_id were ever reused.
       db.prepare("DELETE FROM agent_view_daily WHERE agent_id = ?").run(agentId);
+      // Its AI-assistant bucket (agent_ai_view_daily, dev-request
+      // 2026-10-22-statistikk-samme-tall-12-mnd S0) goes with it, same reason.
+      db.prepare("DELETE FROM agent_ai_view_daily WHERE agent_id = ?").run(agentId);
+      // EN/SV profile translations + their audit rows are derived from the
+      // agent's own prose, so they go with it (slettefrist slice B).
+      deleteAgentProfileTranslations(db, agentId);
       db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
     });
     deleteAll();
@@ -4111,7 +4150,10 @@ router.post("/admin/deduplicate", (req: Request, res: Response) => {
   if (!dryRun && duplicates.length > 0) {
     const deleteStmt = db.prepare("DELETE FROM agents WHERE id = ?");
     const deleteMany = db.transaction((ids: string[]) => {
-      for (const id of ids) deleteStmt.run(id);
+      for (const id of ids) {
+        deleteAgentProfileTranslations(db, id);
+        deleteStmt.run(id);
+      }
     });
     deleteMany(duplicates.map(d => d.id));
   }
@@ -5473,7 +5515,7 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
 
     const rows = db.prepare(`
       SELECT
-        p.id, p.name, p.city, p.trust_score, p.is_verified,
+        p.id, p.name, p.city, p.trust_score, p.is_verified, p.role, p.umbrella_type AS member_umbrella_type,
         aff.id AS affiliation_id, aff.status, aff.labels, aff.joined_at
       FROM agent_affiliations aff
       INNER JOIN agents p ON p.id = aff.producer_id
@@ -5487,7 +5529,9 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
       name: r.name,
       city: r.city,
       slug: slugify(r.name),
-      profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+      ...(failsProducerRoleGate(r.role, !!r.member_umbrella_type)
+        ? {}
+        : { profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}` }),
       card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
       trust_score: r.trust_score,
       is_verified: r.is_verified === 1,
@@ -5664,7 +5708,9 @@ router.get("/salgskanal/:slug", (req: Request, res: Response) => {
         categories: a.categories || [],
         trustScore: a.trustScore ?? null,
         isVerified: !!a.isVerified,
-        profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}`,
+        ...(failsProducerRoleGate((a as any).role, false)
+          ? {}
+          : { profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}` }),
         card_url: `${getBaseUrl(req)}/api/marketplace/agents/${a.id}/card`,
         evidence: evidence || null,
       })),

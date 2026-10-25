@@ -8,16 +8,22 @@
     "source": "github",
     "subfolder": "mcp-server"
   },
-  "version": "0.4.1",
+  "version": "0.5.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "lokal-mcp",
-      "version": "0.4.1",
+      "version": "0.5.1",
       "transport": {
         "type": "stdio"
       },
-      "environmentVariables": []
+      "environmentVariables": [
+        {
+          "name": "LOKAL_URL",
+          "description": "Override API base URL (default: https://rettfrabonden.com)",
+          "required": false
+        }
+      ]
     }
   ],
   "remotes": [
