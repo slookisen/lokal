@@ -381,6 +381,7 @@ import { fetchPage, discoverContentLinks } from "./fetch-page";
 import { extractEmails } from "./search-enrich";
 import { isAcceptableHomepageEmail, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "./gardssalg-booking-gate";
+import { gardssalgVisibleSql } from "./gardssalg-visibility";
 
 const VERTICAL = "experiences";
 
@@ -447,8 +448,7 @@ export function getClaimProviderBySlug(slug: string): ClaimProviderRow | null {
       `SELECT ${CLAIM_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE slug = ?
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = 'owner_pause')
-          AND (merged_into IS NULL OR merged_into = '')`,
+          AND ${gardssalgVisibleSql("claim")}`,
     )
     .get(slug) as ClaimProviderRow | undefined;
   return row ?? null;

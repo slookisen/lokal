@@ -20,6 +20,7 @@ import { getDb } from "../database/db-factory";
 import { fylkeEquivalents, normaliseFylke } from "./norway-fylke";
 import { drinkWordProducerTypes } from "./drink-taxonomy";
 import { fillFylkeFromKommune } from "./gardssalg-fylke-from-kommune";
+import { gardssalgVisibleSql, type GardssalgSurface } from "./gardssalg-visibility";
 // dev-request 2026-08-18-gardssalg-set-contact-phone: reuse the SAME write-time
 // phone guard the rfb `agent_knowledge` write path already uses (dev-request
 // 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) instead of inventing a
@@ -3880,7 +3881,7 @@ function gardssalgTypeFilterSql(filter?: GardssalgProviderTypeFilter): { sql: st
   };
 }
 
-export function countGardssalgProviders(filter?: GardssalgProviderTypeFilter): number {
+export function countGardssalgProviders(filter?: GardssalgProviderTypeFilter, surface: GardssalgSurface = "web"): number {
   const db = getDb(VERTICAL);
   const typeFilter = gardssalgTypeFilterSql(filter);
   const row = db
@@ -3890,8 +3891,7 @@ export function countGardssalgProviders(filter?: GardssalgProviderTypeFilter): n
       // tighter than the OR and change the set. catalog_hidden=1 rows (the
       // hidden booking-flyt-v1 test provider) never bump the count that gates
       // gardssalgVisible() (dev-request 2026-07-14-booking-flyt-v1, slice 0).
-      "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')" +
+      "WHERE " + gardssalgVisibleSql(surface) +
       typeFilter.sql
     )
     .get(...typeFilter.params) as { c: number };
@@ -3913,8 +3913,7 @@ export function countGardssalgProvidersByType(): Array<{ producer_type: string |
   return db
     .prepare(
       "SELECT producer_type, COUNT(*) AS count FROM experience_providers " +
-      "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '') " +
+      "WHERE " + gardssalgVisibleSql("web") + " " +
       "GROUP BY producer_type"
     )
     .all() as Array<{ producer_type: string | null; count: number }>;
@@ -3937,8 +3936,7 @@ export function countGardssalgProvidersBookable(): number {
   const row = db
     .prepare(
       "SELECT COUNT(*) AS c FROM experience_providers " +
-      "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '') " +
+      "WHERE " + gardssalgVisibleSql("web") + " " +
       "AND booking_live = 1"
     )
     .get() as { c: number };
@@ -3983,8 +3981,7 @@ export function getExperiencesMarketplaceStats(): ExperiencesMarketplaceStats {
   const cityRows = db.prepare(
     `SELECT DISTINCT kommune FROM experience_providers
       WHERE kommune IS NOT NULL
-        AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-        AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')`
+        AND ${gardssalgVisibleSql("web")}`
   ).all() as Array<{ kommune: string }>;
   const cities = cityRows.map((r) => r.kommune);
 
@@ -4107,7 +4104,14 @@ export function gardssalgHasOwnerBadge(
   return row.claimed_at != null || row.owner_email_confirmed_at != null;
 }
 
-export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
+// `surface`: "web" (category grid, default) or "sitemap" (sitemap.xml producer
+// URLs) — both carry the same rule today, see gardssalg-visibility.ts.
+export function listGardssalgProviders(
+  limit = 100,
+  offset = 0,
+  filter?: GardssalgProviderTypeFilter,
+  surface: GardssalgSurface = "web",
+): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
   // Optional S3 type filter — see countGardssalgProviders()'s doc comment;
   // omitted/empty filter builds the exact pre-S3 SQL string.
@@ -4120,8 +4124,7 @@ export function listGardssalgProviders(limit = 100, offset = 0, filter?: Gardssa
       // load-bearing (dev-request 2026-07-14-booking-flyt-v1, slice 0).
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
-        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')${typeFilter.sql}
+        WHERE ${gardssalgVisibleSql(surface)}${typeFilter.sql}
         ORDER BY navn
         LIMIT ? OFFSET ?`
     )
@@ -4183,8 +4186,7 @@ export function listGardssalgProviderMapPoints(filter?: GardssalgProviderTypeFil
     .prepare(
       `SELECT slug, navn, producer_type, fylke, kommune, poststed, lat, lon, geocode_confidence
          FROM experience_providers
-        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')
+        WHERE ${gardssalgVisibleSql("map")}
           AND lat IS NOT NULL AND lon IS NOT NULL
           ${NORWAY_BBOX_SQL("lat", "lon")}
           AND slug IS NOT NULL AND slug != ''${typeFilter.sql}
@@ -4233,8 +4235,7 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE slug = @slug
-          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')`
+          AND ${gardssalgVisibleSql("web")}`
     )
     .get({ slug }) as GardssalgProviderRow | undefined;
   return row ?? null;
@@ -4367,24 +4368,22 @@ export function gardssalgQueryRank(
 export function searchGardssalgProviders(
   filter: GardssalgSearchFilter = {},
   limit = 20,
-  opts: { expandDrinkWords?: boolean } = {},
+  // `surface`: which AI/API door is asking ("mcp" | "a2a" | "rest", default
+  // "rest") — all three carry the same rule today, see gardssalg-visibility.ts.
+  opts: { expandDrinkWords?: boolean; surface?: GardssalgSurface } = {},
 ): Array<GardssalgProviderRow & { distance_km?: number }> {
   const db = getDb(VERTICAL);
 
   // Same base gate as listGardssalgProviders()/countGardssalgProviders() —
   // parens are load-bearing (see those functions' comments). catalog_hidden=1
   // rows must never surface here, regardless of what else is filtered.
-  const where: string[] = [
-    "(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')",
-  ];
   // See GardssalgSearchFilter.include_hidden — only the admin test-send route
   // ever sets it; the public default keeps hidden rows out unconditionally.
-  if (filter.include_hidden !== true) {
-    where.push("(catalog_hidden IS NULL OR catalog_hidden != 1)");
-  }
-  // A merged-away duplicate (merged_into set) is never public, include_hidden or not
-  // (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8).
-  where.push("(merged_into IS NULL OR merged_into = '')");
+  // A merged-away duplicate (merged_into set) is never public, include_hidden
+  // or not (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8).
+  const where: string[] = [
+    gardssalgVisibleSql(opts.surface ?? "rest", { includeHidden: filter.include_hidden === true }),
+  ];
   const params: Record<string, unknown> = {};
 
   // Re-review 2026-10-03: fylke now goes through the same fylkeEquivalents()
@@ -4605,8 +4604,7 @@ export function searchGardssalgProvidersByQuery(query: string, limit = 30): Gard
     .prepare(
       `SELECT id, navn, slug, fylke, kommune, poststed, producer_type
          FROM experience_providers
-        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')
+        WHERE ${gardssalgVisibleSql("search")}
           AND slug IS NOT NULL AND slug != ''
           AND ${termClauses.join(" AND ")}
         ORDER BY navn
