@@ -15813,6 +15813,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 
 import { getDb as getRfbDb } from "../database/init";
+import { storedClientClass } from "../services/traffic-classifier";
 import { getDb as getExpDb } from "../database/db-factory";
 import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
 import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
@@ -20937,6 +20938,158 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
     return;
   }
   res.json(prep.response);
+});
+
+// ─── GET /admin/gardssalg-outreach-v4-measurement (admin, read-only) ───────
+//
+// dev-request 2026-10-22-opplevagent-utsending-v4, endring 10 / AC8: per v4
+// send (CRM crm_messages, direction 'out', template personal-v4 or
+// personal-v4-followup), the numbers the 4-week evaluation needs: human page
+// views of the profile page and of /eier/<slug> in the 72 hours after the send,
+// whether a login link was requested (gardssalg_claims row), whether the
+// profile was taken over (claimed_at), reply and «fjern». Reads existing
+// tables only (analytics_page_views keeps path without query string and no
+// IP/UA, raw retention 60 days) — no schema change, no write path.
+const GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS = 72;
+const GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS = 28;
+const GARDSSALG_V4_MEASUREMENT_MAX_DAYS = 60;
+
+/** `YYYY-MM-DD HH:MM:SS` (UTC) — the format SQLite's datetime('now') columns hold. */
+function toSqliteUtc(d: Date): string {
+  return d.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
+/** Human page views (shared definition, see profile-activity-service getViews30) of one exact path in [from, to). */
+function countGardssalgHumanViews(rfbDb: ReturnType<typeof getRfbDb>, path: string, from: Date, to: Date): number {
+  const sessions = rfbDb
+    .prepare(
+      `SELECT session_id, MAX(client_class) AS client_class, COUNT(*) AS views
+         FROM analytics_page_views
+        WHERE path = ?
+          AND (is_owner IS NULL OR is_owner = 0)
+          AND created_at >= ? AND created_at < ?
+          AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)
+          AND session_id IS NOT NULL
+        GROUP BY session_id`,
+    )
+    .all(path, toSqliteUtc(from), toSqliteUtc(to)) as Array<{ session_id: string; client_class: string | null; views: number }>;
+  let human = 0;
+  for (const s of sessions) {
+    if (storedClientClass(s.session_id, s.client_class) === "human") human += s.views;
+  }
+  return human;
+}
+
+interface GardssalgV4MeasurementRow {
+  slug: string | null;
+  provider_id: string;
+  sent_at: string;
+  arm: string | null;
+  template: string;
+  window_complete: boolean;
+  views_profile_72h: number | null;
+  views_eier_72h: number | null;
+  claim_link_requested: boolean;
+  claimed: boolean;
+  replied: boolean;
+  unsubscribed: boolean;
+}
+
+export function computeGardssalgV4Measurement(
+  expDb: ReturnType<typeof getExpDb>,
+  rfbDb: ReturnType<typeof getRfbDb>,
+  opts: { days: number; now?: Date },
+) {
+  const now = opts.now ?? new Date();
+  const cutoff = new Date(now.getTime() - opts.days * 24 * 60 * 60 * 1000);
+  // LIKE (not json_extract): raw_metadata may hold malformed JSON on old rows.
+  const msgs = rfbDb
+    .prepare(
+      `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template":"personal-v4%' AND sent_at >= ?
+        ORDER BY sent_at ASC, rowid ASC`,
+    )
+    .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
+
+  const providerStmt = expDb.prepare(`SELECT slug, claimed_at FROM experience_providers WHERE id = ?`);
+  const claimStmt = expDb.prepare(
+    `SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ? AND is_test = 0 AND created_at >= ?`,
+  );
+  const replyStmt = rfbDb.prepare(
+    `SELECT body_text FROM crm_messages
+      WHERE direction = 'in' AND (thread_id = ? OR LOWER(from_email) = ?)
+        AND COALESCE(sent_at, received_at) >= ?`,
+  );
+  const unsubStmt = rfbDb.prepare(
+    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND bounced_at >= ?`,
+  );
+
+  const sends: GardssalgV4MeasurementRow[] = [];
+  for (const m of msgs) {
+    let meta: Record<string, unknown> = {};
+    try { meta = JSON.parse(m.raw_metadata || "{}"); } catch { /* skipped below */ }
+    const template = typeof meta.template === "string" ? meta.template : null;
+    const providerId = typeof meta.provider_id === "string" ? meta.provider_id : null;
+    if ((template !== "personal-v4" && template !== "personal-v4-followup") || !providerId) continue;
+    const provider = providerStmt.get(providerId) as { slug: string | null; claimed_at: string | null } | undefined;
+    const slug = provider?.slug ?? null;
+    const sentAt = new Date(m.sent_at);
+    const windowEnd = new Date(sentAt.getTime() + GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS * 60 * 60 * 1000);
+    const sinceSql = toSqliteUtc(sentAt);
+    let recipient = "";
+    try { recipient = String((JSON.parse(m.to_emails || "[]") as unknown[])[0] ?? "").trim().toLowerCase(); } catch { /* none */ }
+
+    const replies = replyStmt.all(gardssalgOutreachThreadId(providerId), recipient, m.sent_at) as Array<{ body_text: string | null }>;
+    const fjernReply = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
+    const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, sinceSql) as { n: number }).n > 0);
+
+    sends.push({
+      slug,
+      provider_id: providerId,
+      sent_at: m.sent_at,
+      arm: typeof meta.subject_arm === "string" ? meta.subject_arm : null,
+      template,
+      window_complete: windowEnd.getTime() <= now.getTime(),
+      views_profile_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/produsent/${slug}`, sentAt, windowEnd) : null,
+      views_eier_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/eier/${slug}`, sentAt, windowEnd) : null,
+      claim_link_requested: (claimStmt.get(providerId, sinceSql) as { n: number }).n > 0,
+      claimed: !!provider?.claimed_at,
+      replied: replies.length > 0,
+      unsubscribed,
+    });
+  }
+
+  const summarise = (t: string) => {
+    const rows = sends.filter((s) => s.template === t);
+    return {
+      sends: rows.length,
+      replied: rows.filter((s) => s.replied).length,
+      unsubscribed: rows.filter((s) => s.unsubscribed).length,
+      claim_link_requested: rows.filter((s) => s.claim_link_requested).length,
+      claimed: rows.filter((s) => s.claimed).length,
+      with_views_72h: rows.filter((s) => (s.views_profile_72h ?? 0) + (s.views_eier_72h ?? 0) > 0).length,
+    };
+  };
+  return {
+    success: true,
+    window_hours: GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS,
+    days: opts.days,
+    summary: { first: summarise("personal-v4"), followup: summarise("personal-v4-followup"), total_sends: sends.length },
+    sends,
+  };
+}
+
+router.get("/admin/gardssalg-outreach-v4-measurement", requireAdmin, (req: Request, res: Response) => {
+  const raw = Number(req.query.days);
+  const days = Number.isFinite(raw) && raw >= 1
+    ? Math.min(Math.floor(raw), GARDSSALG_V4_MEASUREMENT_MAX_DAYS)
+    : GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS;
+  try {
+    res.json(computeGardssalgV4Measurement(getExpDb("experiences"), getRfbDb(), { days }));
+  } catch (err) {
+    console.error("[gardssalg-outreach-v4-measurement] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── GET  /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────

@@ -46319,6 +46319,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-utsending-v4, endring 10 / AC8: read-only
+// measurement endpoint per v4 send (72 h views, claim link, takeover, reply, «fjern»).
+// Own in-memory DBs + module-cache swap, so it runs serially.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-utsending-v4: måling per v4-sending ──");
+  try {
+    const { runOpplevelserGardssalgOutreachV4MeasurementTests } = require("../src/routes/opplevelser-gardssalg-outreach-v4-measurement.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-v4-measurement.test");
+    const m = await runOpplevelserGardssalgOutreachV4MeasurementTests({ log: false });
+    passed += m.passed;
+    failed += m.failed;
+    for (const f of m.failures) failures.push("gardssalg-outreach-v4-measurement: " + f);
+    console.log(`  gardssalg-outreach-v4-measurement: ${m.passed} passed, ${m.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-v4-measurement: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
 // (slice 6): the homepage .cat-grid no longer shows a gårdssalg entry from
 // ANY source (synthetic injection removed + a defensive filter on a genuine
