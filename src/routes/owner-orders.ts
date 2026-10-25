@@ -19,7 +19,7 @@
 import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { getDb } from "../database/init";
-import { verifyOwnerSession } from "./owner-portal";
+import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
 import { applyOrderAction, type OrderAction } from "../services/order-actions";
 import { isPaymentsLifecycleActive, resolvePaymentsStripeClient } from "../services/payment-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
@@ -77,8 +77,14 @@ function noStore(res: Response): void {
   res.setHeader("Cache-Control", "no-store");
 }
 
-function forbiddenPage(res: Response, loginHref: string): void {
+function forbiddenPage(res: Response, loginHref: string, ownershipNotVerified = false): void {
   noStore(res);
+  if (ownershipNotVerified) {
+    // S1b punkt 5 (OWNER_VERIFIED_OWNER_GATE_ENABLED): session for this
+    // agent, but the profile has no verified owner.
+    res.status(403).send(ordersShell("Ingen tilgang", `<h1>Eierskapet er ikke bekreftet</h1><p>Bekreft eierskap av profilen først. <a href="/selger">Bekreft eierskap</a>.</p>`));
+    return;
+  }
   res.status(403).send(ordersShell("Ingen tilgang", `<h1>Ingen tilgang</h1><p>Sesjonen din er knyttet til en annen produsent. <a href="${esc(loginHref)}">Logg inn på nytt</a>.</p>`));
 }
 
@@ -103,7 +109,7 @@ router.get("/eier/:agentId/ordrer", ownerOrdersLimiter, (req: Request, res: Resp
   try {
     const session = verifyOwnerSession(req);
     if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
-    if (session.agentId !== agentId) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`);
+    if (!ownerSessionAllows(agentId, session)) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`, session.agentId === agentId);
 
     const agent = getDb().prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as { id: string; name: string } | undefined;
     if (!agent) return notFoundPage(res);
@@ -133,7 +139,7 @@ router.post("/eier/:agentId/ordrer/:orderId", ownerOrdersLimiter, express.urlenc
   try {
     const session = verifyOwnerSession(req);
     if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
-    if (session.agentId !== agentId) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`);
+    if (!ownerSessionAllows(agentId, session)) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`, session.agentId === agentId);
     if (crossSite(req)) { noStore(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
 
     const order = getOwnerOrder(agentId, orderId);

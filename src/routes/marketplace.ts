@@ -56,6 +56,7 @@ import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
+import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423,
@@ -2032,6 +2033,15 @@ router.get("/auth/magic-verify", (req: Request, res: Response) => {
   if (!result.success) {
     res.status(401).json({ success: false, error: result.error });
     return;
+  }
+
+  // S1b punkt 5 (OWNER_UNIFIED_SESSION_ENABLED, default off): the same login
+  // also opens the /eier owner session (HttpOnly cookie), so statistics,
+  // orders and the owner portal need no second login. Never fails the login.
+  try {
+    if (result.agentId && result.email) issueOwnerSessionForSelgerLogin(req, res, result.agentId, result.email);
+  } catch (e) {
+    console.error("[marketplace] unified owner session failed:", e instanceof Error ? e.message : "error");
   }
 
   res.json({

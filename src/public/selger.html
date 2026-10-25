@@ -1439,6 +1439,13 @@
 
     // ── Logout ──
     document.getElementById('btnLogout').addEventListener('click', function() {
+      // S1b punkt 5: one owner login — logging out here also revokes the
+      // /eier owner session (rfb_owner_session cookie) server-side.
+      if (state.agentId && window.fetch) {
+        try {
+          fetch(API_BASE + '/eier/' + encodeURIComponent(state.agentId) + '/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual' }).catch(function() {});
+        } catch (e) { /* best-effort */ }
+      }
       clearSession();
       state.claimToken = null;
       state.agentId = null;

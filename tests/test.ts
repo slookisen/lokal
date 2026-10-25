@@ -50087,3 +50087,24 @@ runSerial(async () => {
     failures.push("gardssalg-claim-owner-visibility: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 5: one owner
+// login (OWNER_UNIFIED_SESSION_ENABLED), isVerifiedOwner gate on every owner
+// endpoint (OWNER_VERIFIED_OWNER_GATE_ENABLED), logout revocation, ISO
+// expires_at comparisons. Swaps the getDb() singleton and env flags (restored
+// in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 5: one owner login ──");
+  try {
+    const { runOwnerUnifiedSessionS1b5Tests } = require("../src/routes/owner-unified-session-s1b5.test") as
+      typeof import("../src/routes/owner-unified-session-s1b5.test");
+    const r = await runOwnerUnifiedSessionS1b5Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-unified-session-s1b5: " + f);
+    console.log(`  owner-unified-session-s1b5: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-unified-session-s1b5: unexpected error: " + String(err?.message || err));
+  }
+});
