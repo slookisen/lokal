@@ -4075,6 +4075,12 @@ export type GardssalgProviderRow = {
   // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
   // NULL = never claimed.
   claimed_at: string | null;
+  // Additive (2026-10-24, dev-request 2026-10-22-opplevagent-takksvar-eierlenke-
+  // og-bekreftet-av-eier): second, separate basis for the "Bekreftet av eier"
+  // badge — the producer confirmed the profile by e-mail from an address the
+  // claim flow accepts for them. Never set by verifyClaimToken(); NULL = not
+  // confirmed by e-mail. See gardssalgHasOwnerBadge().
+  owner_email_confirmed_at: string | null;
   // Additive (2026-08-18, dev-request 2026-08-17-kontaktadresse-feilkilde-og-
   // override, Skive C): the row's raw field_provenance JSON blob. Selected
   // here so the RENDER surfaces (routes/experiences-seo.ts's produsent-profil
@@ -4089,7 +4095,17 @@ export type GardssalgProviderRow = {
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, field_provenance";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, owner_email_confirmed_at, field_provenance";
+
+/** The public "Bekreftet av eier" badge shows when the profile has been taken
+ *  over (claimed_at) OR the owner confirmed it by e-mail
+ *  (owner_email_confirmed_at). Only the former is an owner who can log in, so
+ *  callers decide the "Ta over profilen" link on claimed_at alone. */
+export function gardssalgHasOwnerBadge(
+  row: { claimed_at?: string | null; owner_email_confirmed_at?: string | null },
+): boolean {
+  return row.claimed_at != null || row.owner_email_confirmed_at != null;
+}
 
 export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);

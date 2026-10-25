@@ -33017,6 +33017,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcr.failures) failures.push("opplevelser-gardssalg-claim-revoke: " + f);
     console.log(`  opplevelser-gardssalg-claim-revoke: ${gcr.passed} passed, ${gcr.failed} failed`);
 
+    // dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
+    // slice 1: "Bekreftet av eier" on an e-mail confirmation — admin lever
+    // (sender must pass the claim flow's address rule for that producer),
+    // badge display with the «Ta over profilen» link kept, field locks, and
+    // withdrawal on «fjern». Same in-memory-DB pattern, same gated block.
+    console.log("\n── opplevelser-gardssalg-owner-email-confirm: e-mail confirmation of the owner badge ──");
+    const { runOpplevelserGardssalgOwnerEmailConfirmTests } = require("../src/routes/opplevelser-gardssalg-owner-email-confirm.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-owner-email-confirm.test");
+    const goec = await runOpplevelserGardssalgOwnerEmailConfirmTests({ log: false });
+    passed += goec.passed;
+    failed += goec.failed;
+    for (const f of goec.failures) failures.push("opplevelser-gardssalg-owner-email-confirm: " + f);
+    console.log(`  opplevelser-gardssalg-owner-email-confirm: ${goec.passed} passed, ${goec.failed} failed`);
+
     // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8: DELETE
     // /admin/rfb-seed skips owned rows, merged_into rows are not public.
     console.log("\n── opplevelser-g1-opprydding: rfb-seed rollback + merged_into visibility ──");
