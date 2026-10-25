@@ -297,7 +297,7 @@ export function registerDentalTools(server: McpServer): void {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async ({ query, fylke: fylkeAsSent, spesialitet, helfo, akutt, limit }, extra) => {
@@ -364,7 +364,7 @@ export function registerDentalTools(server: McpServer): void {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async ({ org_nr, id }, extra) => {
@@ -469,7 +469,7 @@ export function registerDentalTools(server: McpServer): void {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async ({ fylke: fylkeAsSent }) => {
