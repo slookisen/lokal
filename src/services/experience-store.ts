@@ -5671,7 +5671,9 @@ export function applyGardssalgRetroScanNull(
   }
   if (written.length === 0) return [];
 
-  sets.push("content_source = 'provider_site'");
+  // A claimed row keeps content_source='claim' (G1 skive 5), same as
+  // applyGardssalgProviderContent: re-stamping would unlock its other fields.
+  if (row.content_source !== "claim") sets.push("content_source = 'provider_site'");
   sets.push("content_evidence_url = @evidence_url");
   sets.push("content_updated_at = datetime('now')");
   params.evidence_url = evidenceUrl;
