@@ -32,7 +32,7 @@
 
 import type Database from "better-sqlite3";
 import type { VerticalId } from "./analytics-service";
-import type { SessionCategory } from "./traffic-classifier";
+import { emptyAiAgents, mergeAiAgents, type AiAgents, type SessionCategory } from "./traffic-classifier";
 import {
   computeTrafficReport,
   groupOf,
@@ -51,8 +51,10 @@ type Db = Database.Database;
  * recomputed while their raw days exist (planHistoryItems, and the prune's
  * ensureTrafficHistoryForDaySync), and kept as they are once those are gone.
  * 4: aiLookups (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0).
+ * 5: aiAgents (vendor × purpose, G2-S2). Rows stored at version 4 have no
+ *    aiAgents, so they are recomputed while their raw days exist.
  */
-export const TRAFFIC_HISTORY_VERSION = 4;
+export const TRAFFIC_HISTORY_VERSION = 5;
 
 export type HistoryPeriod = "day" | "week" | "month";
 export type HistoryVertical = VerticalId | "all";
@@ -88,6 +90,8 @@ export interface HistorySummary extends HistoryItem {
   groups: Record<TrafficGroup, Totals>;
   classes: Record<SessionCategory, Totals>;
   aiVendors: { chatgpt: number; claude: number; other: number };
+  /** aiVendors split by vendor × purpose (user / search / training); see AI_AGENT_REGISTRY. */
+  aiAgents: AiAgents;
   owner: { views: number; cookieViews: number; scriptViews: number; unknownViews: number };
   human: {
     devices: Record<Device, Totals>;
@@ -241,6 +245,7 @@ function computeHistorySummaryInTx(db: Db, item: HistoryItem, nowMs: number, opt
     groups: report.groups,
     classes: report.classes,
     aiVendors: report.aiVendors,
+    aiAgents: report.aiAgents,
     owner: report.owner,
     human: {
       devices: report.human.devices,
@@ -332,6 +337,7 @@ export interface HistoryView {
   groups: Record<TrafficGroup, { views: number; visits: number }>;
   classes: Record<SessionCategory, { views: number; visits: number }>;
   aiVendors: { chatgpt: number; claude: number; other: number };
+  aiAgents: AiAgents;
   owner: { views: number; cookieViews: number; scriptViews: number; unknownViews: number };
   human: {
     devices: Record<Device, { views: number; visits: number }>;
@@ -405,7 +411,7 @@ function liveSummary(db: Db, period: "week" | "month", vertical: HistoryVertical
   return {
     period, start, end: periodEnd(period, start), vertical, version: TRAFFIC_HISTORY_VERSION,
     partialFrom: from > start ? from : null,
-    totals: report.totals, groups: report.groups, classes: report.classes, aiVendors: report.aiVendors, owner: report.owner,
+    totals: report.totals, groups: report.groups, classes: report.classes, aiVendors: report.aiVendors, aiAgents: report.aiAgents, owner: report.owner,
     human: { devices: report.human.devices, entrySources: [], referrers: [], visitSeconds: report.human.visitSeconds, singleViewVisits: report.human.singleViewVisits },
     topPages: [], bots: [],
     searches: { total: q.totalQueries, byChannel: { web: 0, api: 0, mcp: 0, a2a: 0, ai: 0, ...q.byChannel }, botQueries: q.botQueries ?? 0, ownerQueries: q.ownerQueries, topTerms: [] },
@@ -447,6 +453,7 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
   const devices = { mobile: zero(), tablet: zero(), desktop: zero(), unknown: zero() } as Record<Device, { views: number; visits: number }>;
   const totals = zero();
   const aiVendors = { chatgpt: 0, claude: 0, other: 0 };
+  const aiAgents = emptyAiAgents();
   const owner = { views: 0, cookieViews: 0, scriptViews: 0, unknownViews: 0 };
   const searches: SearchCounts = { total: 0, byChannel: { web: 0, api: 0, mcp: 0, a2a: 0, ai: 0 }, botQueries: 0, ownerQueries: 0 };
   const entry = new Map<string, { key: string; label: string; visits: number }>();
@@ -487,6 +494,7 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
     addInto(classes, s.classes);
     addInto(devices, s.human.devices);
     aiVendors.chatgpt += s.aiVendors.chatgpt; aiVendors.claude += s.aiVendors.claude; aiVendors.other += s.aiVendors.other;
+    mergeAiAgents(aiAgents, s.aiAgents);
     owner.views += s.owner.views; owner.cookieViews += s.owner.cookieViews; owner.scriptViews += s.owner.scriptViews; owner.unknownViews += s.owner.unknownViews;
     searches.total += s.searches.total;
     for (const ch of ["web", "api", "mcp", "a2a", "ai"] as const) searches.byChannel[ch] += s.searches.byChannel[ch] ?? 0;
@@ -549,6 +557,7 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
     groups,
     classes,
     aiVendors,
+    aiAgents,
     owner,
     human: {
       devices,

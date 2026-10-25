@@ -48,55 +48,88 @@ export type SessionCategory = TrafficCategory | "scanner" | "scraper";
 // generic Claude/ClaudeBot check; Perplexity-User before PerplexityBot), and
 // every named list before the generic bot/spider/crawl fallback.
 
-/** Human-initiated AI retrieval — ONLY the `*-User` class. */
-export const AI_SEARCH_PATTERNS = [
-  "ChatGPT-User",
-  "Claude-User",
-  "Claude-Web",
-  "Perplexity-User",
-  "DuckAssistBot",
-] as const;
+/** Vendor bucket of an AI agent (aiAgents keys). */
+export type AiAgentVendor = "chatgpt" | "claude" | "perplexity" | "google" | "other";
 
 /**
- * Autonomous AI crawlers. Daniel explicitly: OAI-SearchBot, Amazonbot and
- * Bytespider are NOT human-initiated search — they belong here.
+ * Why the agent fetches: `user_fetch` = a person's request triggered it (the
+ * `*-User` class, ai_search), `search_index` = building a search index,
+ * `training` = collecting model-training data. user_fetch rows are the
+ * ai_search group; every other row is ai_crawler.
  */
-export const AI_CRAWLER_PATTERNS = [
-  "GPTBot",
-  "OAI-SearchBot",
+export type AiAgentPurpose = "user_fetch" | "search_index" | "training";
+
+export interface AiAgentEntry {
+  token: string;
+  vendor: AiAgentVendor;
+  purpose: AiAgentPurpose;
+}
+
+/**
+ * ONE table for every known AI agent: it drives classification
+ * (AI_SEARCH_PATTERNS / AI_CRAWLER_PATTERNS are derived below), the vendor
+ * bucket (aiAssistantVendor / aiVendorBucket), the aiAgents split and the bot
+ * display name (botNameForUA). A new AI bot is one row.
+ *
+ * ORDER MATTERS (same rules as the derived lists): user_fetch rows come first
+ * so ai_search is checked before ai_crawler (Claude-User must not be swallowed
+ * by a generic Claude/ClaudeBot check; Perplexity-User before PerplexityBot),
+ * and the order within each purpose group is the order the lists had before.
+ */
+export const AI_AGENT_REGISTRY: readonly AiAgentEntry[] = [
+  // Human-initiated AI retrieval — ONLY the `*-User` class (ai_search).
+  { token: "ChatGPT-User", vendor: "chatgpt", purpose: "user_fetch" },
+  { token: "Claude-User", vendor: "claude", purpose: "user_fetch" },
+  { token: "Claude-Web", vendor: "claude", purpose: "user_fetch" },
+  { token: "Perplexity-User", vendor: "perplexity", purpose: "user_fetch" },
+  { token: "DuckAssistBot", vendor: "other", purpose: "user_fetch" },
+  // Autonomous AI crawlers (ai_crawler). Daniel explicitly: OAI-SearchBot,
+  // Amazonbot and Bytespider are NOT human-initiated search — they belong here.
+  { token: "GPTBot", vendor: "chatgpt", purpose: "training" },
+  { token: "OAI-SearchBot", vendor: "chatgpt", purpose: "search_index" },
   // Claude-SearchBot is Anthropic's search INDEXER (like OAI-SearchBot above):
   // autonomous, not user-initiated, so ai_crawler, NOT ai_search. Claude-User /
-  // Claude-Web stay in AI_SEARCH_PATTERNS, which is checked first; neither of
+  // Claude-Web are user_fetch rows above, which are checked first; neither of
   // those strings occurs in "Claude-SearchBot", so it cannot match them.
-  "Claude-SearchBot",
-  "ClaudeBot",
-  "anthropic-ai",
-  "PerplexityBot",
-  "Google-Extended",
-  "GoogleOther",
+  { token: "Claude-SearchBot", vendor: "claude", purpose: "search_index" },
+  { token: "ClaudeBot", vendor: "claude", purpose: "training" },
+  { token: "anthropic-ai", vendor: "claude", purpose: "training" },
+  { token: "PerplexityBot", vendor: "perplexity", purpose: "search_index" },
+  { token: "Google-Extended", vendor: "google", purpose: "training" },
+  { token: "GoogleOther", vendor: "google", purpose: "training" },
   // NOTE: no bare "Gemini" pattern — Google's AI crawlers use Google-Extended/GoogleOther,
   // and "Gemini" appears in real human UAs (e.g. Planet Computers Gemini PDA).
-  "Amazonbot",
-  "Bytespider",
-  "CCBot",
-  "meta-externalagent",
-  "meta-external",
-  "Applebot-Extended",
-  "cohere-ai",
-  "YouBot",
-  "cloud-crawler",
-  "NotHumanSearch",
+  { token: "Amazonbot", vendor: "other", purpose: "training" },
+  { token: "Bytespider", vendor: "other", purpose: "training" },
+  { token: "CCBot", vendor: "other", purpose: "training" },
+  { token: "meta-externalagent", vendor: "other", purpose: "training" },
+  // Meta-ExternalFetcher is a fetcher, but it has always been ai_crawler here;
+  // a user_fetch purpose would move it to ai_search, so it is labelled as index.
+  { token: "meta-external", vendor: "other", purpose: "search_index" },
+  { token: "Applebot-Extended", vendor: "other", purpose: "training" },
+  { token: "cohere-ai", vendor: "other", purpose: "training" },
+  { token: "YouBot", vendor: "other", purpose: "search_index" },
+  { token: "cloud-crawler", vendor: "other", purpose: "search_index" },
+  { token: "NotHumanSearch", vendor: "other", purpose: "search_index" },
   // 2026-10-04 (view-stats honesty): AI/agent-index crawlers seen on prod
   // that previously fell into other_bot — or, for MCPCensus and
   // rokmcp-collector (no bot/spider/crawl substring), straight into human.
-  "ExaSearchBot",
-  "Reflectionbot",
-  "AgentFitBot",
-  "AgenstryBot",
-  "MCPCensus",
-  "rokmcp-collector",
-  "WellknownBot",
-] as const;
+  { token: "ExaSearchBot", vendor: "other", purpose: "search_index" },
+  { token: "Reflectionbot", vendor: "other", purpose: "search_index" },
+  { token: "AgentFitBot", vendor: "other", purpose: "search_index" },
+  { token: "AgenstryBot", vendor: "other", purpose: "search_index" },
+  { token: "MCPCensus", vendor: "other", purpose: "search_index" },
+  { token: "rokmcp-collector", vendor: "other", purpose: "search_index" },
+  { token: "WellknownBot", vendor: "other", purpose: "search_index" },
+];
+
+/** Human-initiated AI retrieval — derived from AI_AGENT_REGISTRY (user_fetch rows). */
+export const AI_SEARCH_PATTERNS: readonly string[] =
+  AI_AGENT_REGISTRY.filter((e) => e.purpose === "user_fetch").map((e) => e.token);
+
+/** Autonomous AI crawlers — derived from AI_AGENT_REGISTRY (all other rows, same order). */
+export const AI_CRAWLER_PATTERNS: readonly string[] =
+  AI_AGENT_REGISTRY.filter((e) => e.purpose !== "user_fetch").map((e) => e.token);
 
 export const SEARCH_ENGINE_PATTERNS = [
   "Googlebot",
@@ -254,11 +287,63 @@ export function aiVendorBucket(userAgent: string): "chatgpt" | "claude" | "other
  */
 export function aiAssistantVendor(userAgent: string): "chatgpt" | "claude" | "perplexity" | "other" {
   const ua = userAgent || "";
+  const hit = aiAgentEntryOf(ua);
+  if (hit) return hit.vendor === "google" ? "other" : hit.vendor;
+  // Not a registry token (e.g. a bucketed stored row, or a vendor string we
+  // have no row for): fall back to the vendor name anywhere in the UA.
   if (/GPTBot|ChatGPT|OAI-SearchBot/i.test(ua)) return "chatgpt";
   if (/Claude|anthropic/i.test(ua)) return "claude";
   if (/Perplexity/i.test(ua)) return "perplexity";
   return "other";
 }
+
+/** First registry row whose token occurs in the UA (registry order, like classifyUA). */
+export function aiAgentEntryOf(userAgent: string): AiAgentEntry | null {
+  const ua = userAgent || "";
+  return AI_AGENT_REGISTRY.find((e) => ua.includes(e.token)) ?? null;
+}
+
+/** aiAgents: page views per vendor and purpose. Sums to aiVendors (google/perplexity/other fold into `other` there). */
+export interface AiAgentCounts { user: number; search: number; training: number }
+export type AiAgents = Record<AiAgentVendor, AiAgentCounts>;
+export const AI_AGENT_VENDORS: readonly AiAgentVendor[] = ["chatgpt", "claude", "perplexity", "google", "other"];
+const PURPOSE_FIELD: Record<AiAgentPurpose, keyof AiAgentCounts> = { user_fetch: "user", search_index: "search", training: "training" };
+
+export function emptyAiAgents(): AiAgents {
+  return Object.fromEntries(
+    AI_AGENT_VENDORS.map((v) => [v, { user: 0, search: 0, training: 0 }]),
+  ) as AiAgents;
+}
+
+/**
+ * Add `views` of one AI UA to `agents`. `group` is the UA's traffic group and
+ * only decides the purpose of a UA with no registry row (a bucketed stored
+ * ai_search / ai_crawler class): ai_search → user, otherwise training.
+ */
+export function addAiAgentViews(agents: AiAgents, userAgent: string, group: "ai_search" | "ai_crawler", views: number): void {
+  const hit = aiAgentEntryOf(userAgent);
+  if (hit) {
+    agents[hit.vendor][PURPOSE_FIELD[hit.purpose]] += views;
+    return;
+  }
+  agents[aiAssistantVendor(userAgent)][group === "ai_search" ? "user" : "training"] += views;
+}
+
+/** Add one aiAgents block into another (history aggregation). Tolerates a missing/partial source (old stored rows). */
+export function mergeAiAgents(into: AiAgents, from: Partial<Record<AiAgentVendor, Partial<AiAgentCounts>>> | null | undefined): void {
+  if (!from) return;
+  for (const v of AI_AGENT_VENDORS) {
+    const f = from[v];
+    if (!f) continue;
+    into[v].user += f.user ?? 0;
+    into[v].search += f.search ?? 0;
+    into[v].training += f.training ?? 0;
+  }
+}
+
+/** Regex source matching any registry token (for botNameForUA); tokens escaped, registry order. */
+export const AI_AGENT_TOKEN_ALTERNATION = AI_AGENT_REGISTRY
+  .map((e) => e.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
 
 // ── Velocity heuristic ──────────────────────────────────────────────────────
 // A browser UA proves nothing: on 2026-10-03 one session with an ordinary
