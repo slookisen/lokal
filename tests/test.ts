@@ -50106,6 +50106,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
+// one-time order activation link (AC8). Swaps the getDb() singleton and env
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-21 skive 2: order activation link (AC8) ──");
+  try {
+    const { runOrderActivationLinkTests } = require("../src/routes/order-activation-link.test") as
+      typeof import("../src/routes/order-activation-link.test");
+    const r = await runOrderActivationLinkTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("order-activation-link: " + f);
+    console.log(`  order-activation-link: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-activation-link: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 5: one owner
 // login (OWNER_UNIFIED_SESSION_ENABLED), isVerifiedOwner gate on every owner
 // endpoint (OWNER_VERIFIED_OWNER_GATE_ENABLED), logout revocation, ISO

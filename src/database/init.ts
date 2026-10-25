@@ -5831,6 +5831,36 @@ function initSchema(db: Database.Database): void {
     console.error("Migration search_console_weekly failed:", err);
   }
 
+  // ─── order_activation_links (dev-request 2026-10-21 live-go handlevogn-pilot,
+  // skive 2 — aktiveringslenke) ─────────────────────────────────────────────
+  // One row per admin-generated, HMAC-signed one-time activation link
+  // (services/order-activation-link.ts). The token itself is never stored:
+  // `id` is sha256(nonce) hex, `email_hash` the keyed hash of the registered
+  // address the link was bound to. `used_at` is the single-use guard (a
+  // conditional UPDATE … WHERE used_at IS NULL) and, with used_outcome /
+  // used_ip_hash / used_user_agent / session_link_id, the usage log.
+  // Additive; brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_activation_links (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        email_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        used_at TEXT,
+        used_outcome TEXT,
+        used_ip_hash TEXT,
+        used_user_agent TEXT,
+        session_link_id TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_order_activation_links_agent ON order_activation_links(agent_id)`);
+  } catch (err) {
+    console.error("Migration order_activation_links failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …
