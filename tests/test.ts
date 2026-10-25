@@ -46644,6 +46644,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 3 (AC9):
+// «Bestill for henting» on /produsent/:slug + /handleliste?produsent=<id> preselect.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel (skive 3): bestillingsknapp ──");
+  try {
+    const { runHandelisteBestillingsknappTests } = require("../src/routes/handleliste-bestillingsknapp.test") as
+      typeof import("../src/routes/handleliste-bestillingsknapp.test");
+    const bk = await runHandelisteBestillingsknappTests({ log: false });
+    passed += bk.passed;
+    failed += bk.failed;
+    for (const f of bk.failures) failures.push("handleliste-bestillingsknapp: " + f);
+    console.log(`  handleliste-bestillingsknapp: ${bk.passed} passed, ${bk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("handleliste-bestillingsknapp: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Same dev-request, Slice 4: owner opt-in toggle, claim-mail sentence, handoff-stats.
 runSerial(async () => {
   console.log("\n── dev-request 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt (Slice 4): owner opt-in toggle + handoff-stats ──");

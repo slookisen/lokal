@@ -61,7 +61,9 @@ import { publicListableSql, isPubliclyListable, failsProducerRoleGate } from "..
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
 import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay, producerPageProductNodes } from "../services/structured-data-policy";
-import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
+import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN, HANDELISTE_MAX_ITEMS, handelisteOrderHref, ORDER_BUTTON_LABEL } from "./handleliste-page";
+import { findProducerOrderables } from "../services/catalog-offers";
+import { isEligibleForRealOrder } from "../services/cart-service";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
 import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
@@ -4127,7 +4129,15 @@ router.get([HANDELISTE_PATH_NO, HANDELISTE_PATH_EN], (req: Request, res: Respons
   if ((lang === "en") !== isEnPath) return next();
 
   try {
-    const page = buildHandelistePage(lang);
+    // Skive 3: ?produsent=<agent_id> (from «Bestill for henting» on
+    // /produsent/:slug) pre-fills the producer's orderable products. A
+    // missing, malformed, unknown or ineligible id is ignored silently:
+    // findProducerOrderables() returns null and the page is as before.
+    const rawProducer = req.query.produsent;
+    const orderables = typeof rawProducer === "string" && rawProducer
+      ? findProducerOrderables(rawProducer, { limit: HANDELISTE_MAX_ITEMS })
+      : null;
+    const page = buildHandelistePage(lang, orderables ? { producer_name: orderables.producer.name, offers: orderables.offers } : null);
     const noPath = HANDELISTE_PATH_NO;
     const localized = lang === "en" ? "/en" + HANDELISTE_PATH_EN : noPath;
     res.setHeader("Cache-Control", "no-store");
@@ -6387,6 +6397,27 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] profile-activity query failed:", e);
     }
 
+    // Skive 3 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-
+    // handel): «Bestill for henting» → /handleliste?produsent=<id>, only when
+    // HANDLELISTE_ENABLED is on AND the producer passes the ONE real-order gate
+    // (cart-service.isEligibleForRealOrder, the same one submit uses). Both are
+    // evaluated per request (the page sets no shared-cache header; Express's
+    // ETag is over the body, so it follows the button). Empty string otherwise,
+    // so every other producer's contact CTA is byte-identical; a gate error
+    // counts as «not eligible» and never breaks the page.
+    let orderButtonHtml = "";
+    if (isHandelisteEnabled()) {
+      let canOrder = false;
+      try {
+        canOrder = isEligibleForRealOrder(agent.id, getDb());
+      } catch (e) {
+        console.error(`[seo] /produsent/${slug} real-order gate failed:`, e);
+      }
+      if (canOrder) {
+        orderButtonHtml = `<a href="${escapeHtml(handelisteOrderHref(agent.id, lang))}" class="btn-p" data-order-cta="1">&#128722; ${escapeHtml(ORDER_BUTTON_LABEL[lang === "en" ? "en" : "no"])}</a>`;
+      }
+    }
+
     // Window of the views tiles below: the raw retention (agent-stats-compute.ts).
     const statsDays = getRetentionWindowDays();
     const content = `
@@ -6438,7 +6469,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       <div class="ct-card">
         <h3>${lang === "en" ? "Contact information" : "Kontaktinformasjon"}</h3>
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">${lang === "en" ? "No contact info available yet." : "Ingen kontaktinfo tilgjengelig enn\u00e5."}</p>`}
-        <div class="ct-actions">
+        <div class="ct-actions">${orderButtonHtml}
           ${k.website ? `<a href="/ut/${encodeURIComponent(agent.id)}/website" class="btn-p" target="_blank" rel="noopener">&#127760; ${escapeHtml(t(lang, "producer.visit_website"))}</a>` : ""}
           <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; ${escapeHtml(t(lang, "producer.show_on_map"))}</a>
           <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; ${escapeHtml(t(lang, "producer.download_vcard"))}</a>

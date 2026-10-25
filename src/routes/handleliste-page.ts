@@ -37,6 +37,7 @@ import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { serializeJsonForScript } from "../services/safe-script-json";
+import type { Offer } from "../services/catalog-offers";
 
 export function isHandelisteEnabled(): boolean {
   const v = (process.env.HANDLELISTE_ENABLED || "").trim().toLowerCase();
@@ -249,6 +250,7 @@ const CLIENT_SCRIPT = `
 (function(){
   var C = JSON.parse(document.getElementById('hl-copy').textContent);
   var MAX_ITEMS = C.__max_items, INITIAL = C.__initial;
+  var PRE = (C.__preselect && Array.isArray(C.__preselect.offers) && C.__preselect.offers.length) ? C.__preselect : null;
   var LS_CART = 'rfb_handleliste_cart', LS_RESULT = 'rfb_handleliste_result';
   var el = function(id){ return document.getElementById(id); };
   var state = { items: [], place: '', offers: [], picks: [], nearLat: null };
@@ -291,7 +293,8 @@ const CLIENT_SCRIPT = `
   }
 
   // ── step 1: item rows ──
-  function addRow(term, qty){
+  // Skive 3: \`pre\` is the index of a pre-selected offer (?produsent=); it is dropped once the term is edited.
+  function addRow(term, qty, pre){
     var rows = el('hl-rows');
     if (rows.children.length >= MAX_ITEMS) return;
     var t = mk('input', { type: 'text', maxlength: '80', placeholder: C.item_ph, 'aria-label': C.item_label });
@@ -303,6 +306,10 @@ const CLIENT_SCRIPT = `
       mk('label', { cls: 'hl-qty' }, [C.qty_label, q]),
       rm
     ]);
+    if (typeof pre === 'number') {
+      row.hlPre = pre;
+      t.addEventListener('input', function(){ if (t.value !== term) row.hlPre = null; });
+    }
     rm.addEventListener('click', function(){ if (rows.children.length > 1) rows.removeChild(row); el('hl-add').hidden = rows.children.length >= MAX_ITEMS; });
     rows.appendChild(row);
     el('hl-add').hidden = rows.children.length >= MAX_ITEMS;
@@ -313,7 +320,9 @@ const CLIENT_SCRIPT = `
       var ins = row.getElementsByTagName('input');
       var term = (ins[0].value || '').trim();
       var qty = parseInt(ins[1].value, 10);
-      if (term) out.push({ term: term.slice(0, 80), qty: (qty > 0 && qty < 100) ? qty : 1 });
+      var it = { term: term.slice(0, 80), qty: (qty > 0 && qty < 100) ? qty : 1 };
+      if (typeof row.hlPre === 'number' && PRE && PRE.offers[row.hlPre]) it.pre = row.hlPre;
+      if (term) out.push(it);
     });
     return out;
   }
@@ -339,11 +348,14 @@ const CLIENT_SCRIPT = `
   // ── step 2: offers ──
   function fetchOffers(){
     var items = readRows(), place = (el('hl-place').value || '').trim();
-    if (!items.length || !place) { msg('hl-msg1', C.err_fields); return; }
+    // Skive 3: a pre-selected item needs no place; only typed items are searched.
+    var needPlace = items.some(function(it){ return it.pre == null; });
+    if (!items.length || (needPlace && !place)) { msg('hl-msg1', C.err_fields); return; }
     msg('hl-msg1', '');
     state.items = items; state.place = place; state.offers = []; state.picks = [];
     el('hl-find').disabled = true;
     Promise.all(items.map(function(it){
+      if (it.pre != null) return Promise.resolve({ status: 200, body: { offers: [PRE.offers[it.pre]] } });
       return api('GET', '/api/marketplace/catalog/offers?q=' + encodeURIComponent(it.term) + '&near=' + encodeURIComponent(place) + '&radius_km=50&limit=5');
     })).then(function(rs){
       el('hl-find').disabled = false;
@@ -353,7 +365,8 @@ const CLIENT_SCRIPT = `
         // I-S2: category matches fill the free places, as contact rows (no product id).
         var cats = (r.status === 200 && r.body && Array.isArray(r.body.category_matches)) ? r.body.category_matches : [];
         if (r.status === 200) anyOk = true;
-        state.offers[i] = offers.concat(cats).slice(0, 5); state.picks[i] = null;
+        state.offers[i] = offers.concat(cats).slice(0, 5);
+        state.picks[i] = (items[i].pre != null && state.offers[i].length) ? 0 : null;
       });
       if (!anyOk) { msg('hl-msg1', C.error_generic); return; }
       renderOffers(); show('hl-s2');
@@ -395,6 +408,7 @@ const CLIENT_SCRIPT = `
     var id = 'hl-o-' + i + '-' + j;
     var radio = mk('input', { type: 'radio', name: 'hl-pick-' + i, id: id });
     var lbl = mk('label', { cls: 'hl-offer', 'for': id });
+    if (state.picks[i] === j) { radio.checked = true; lbl.classList.add('sel'); }
     var head = mk('div', null, [radio, mk('span', { cls: 'hl-name', text: String(p.name || '') })]);
     if (p.verifisert_av_eier) head.appendChild(mk('span', { cls: 'hl-badge', text: C.badge_verified }));
     var isCat = o.match === 'category', orderable = isOrderable(o);
@@ -615,13 +629,20 @@ const CLIENT_SCRIPT = `
   el('hl-next2').addEventListener('click', toSummary);
   el('hl-back2').addEventListener('click', function(){ show('hl-s2'); });
   el('hl-submit').addEventListener('click', submit);
-  el('hl-new').addEventListener('click', function(){ lsDel(LS_RESULT); lsDel(LS_CART); clear(el('hl-rows')); addRow('', 1); show('hl-s1'); });
+  el('hl-new').addEventListener('click', function(){ lsDel(LS_RESULT); lsDel(LS_CART); clear(el('hl-rows')); if (el('hl-pre')) el('hl-pre').hidden = true; addRow('', 1); show('hl-s1'); });
   el('hl-form').addEventListener('submit', function(e){ e.preventDefault(); });
   el('hl-js').hidden = false;
 
   var saved = lsGet(LS_RESULT);
-  addRow('', 1);
-  if (saved && (saved.orders || saved.handoffs)) { renderResult(saved); show('hl-s4'); } else { show('hl-s1'); }
+  if (PRE) {
+    // Skive 3 (?produsent=): the producer's orderable products, its offer pre-selected per item.
+    el('hl-s1').insertBefore(mk('div', { cls: 'hl-msg hl-ok', id: 'hl-pre', text: C.__preselect_note + ' ' + String(PRE.producer_name || '') }), el('hl-rows'));
+    PRE.offers.slice(0, MAX_ITEMS).forEach(function(o, j){ addRow(String(o.product_name || '').slice(0, 80), 1, j); });
+    show('hl-s1');
+  } else {
+    addRow('', 1);
+    if (saved && (saved.orders || saved.handoffs)) { renderResult(saved); show('hl-s4'); } else { show('hl-s1'); }
+  }
 })();
 `;
 
@@ -661,11 +682,44 @@ const PREPAY_COPY: Record<"no" | "en", Record<string, string>> = {
   },
 };
 
-export function buildHandelistePage(lang: Lang): HandelistePage {
+/**
+ * Skive 3 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+ * «Bestill for henting» on /produsent/:slug links here with ?produsent=<agent_id>.
+ * The route resolves it server-side (catalog-offers.ts findProducerOrderables:
+ * read-only, the existing real-order gates) and passes the result in; it then
+ * rides along in the copy JSON (serializeJsonForScript) and the client renders
+ * every producer string via textContent. null/undefined = the page as before.
+ */
+export interface HandelistePreselect {
+  producer_name: string;
+  offers: Offer[];
+}
+
+const PRESELECT_NOTE: Record<"no" | "en", string> = {
+  no: "Bestill for henting fra",
+  en: "Order for pickup from",
+};
+
+/** Button copy on /produsent/:slug (skive 3). */
+export const ORDER_BUTTON_LABEL: Record<"no" | "en", string> = {
+  no: "Bestill for henting",
+  en: "Order for pickup",
+};
+
+/** The localized /handleliste link for one producer (agent id is URL-encoded). */
+export function handelisteOrderHref(agentId: string, lang: Lang): string {
+  const path = lang === "en" ? localizedPath(HANDELISTE_PATH_EN, lang) : localizedPath(HANDELISTE_PATH_NO, lang);
+  return `${path}?produsent=${encodeURIComponent(agentId)}`;
+}
+
+export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect | null): HandelistePage {
   const base = COPY[lang === "en" ? "en" : "no"];
   const c: Copy = isPaymentsEnabled() ? { ...base, ...PREPAY_COPY[lang === "en" ? "en" : "no"] } : base;
   const payHow = isPaymentsEnabled() ? { __pay_how_href: localizedPath(BETALING_PATH, lang) } : {};
-  const copy = { ...c, ...payHow, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL };
+  const pre = preselect && preselect.offers.length > 0
+    ? { __preselect: { producer_name: preselect.producer_name, offers: preselect.offers.slice(0, HANDELISTE_MAX_ITEMS) }, __preselect_note: PRESELECT_NOTE[lang === "en" ? "en" : "no"] }
+    : {};
+  const copy = { ...c, ...payHow, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">
