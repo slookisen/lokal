@@ -91,6 +91,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import ownerOrdersRoutes from "./routes/owner-orders";
 import avmeldRoutes from "./routes/avmeld";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
@@ -523,6 +524,9 @@ app.use("/", agentReadinessRoutes);
 // Magic-link auth + 7-field profile management for producers.
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
+// dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
+// (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
+app.use("/", ownerOrdersRoutes);
 
 // (gardssalgClaimRoutes is mounted earlier — before the opplevagent.no
 // host-gate above — see the comment there for why.)

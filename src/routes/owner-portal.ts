@@ -15,6 +15,7 @@ import {
 import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
+import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
 const router = Router();
@@ -1034,6 +1035,13 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       if (shouldRenderPaymentCard(paymentStatus)) paymentCardHtml = renderPaymentCard(agentId, paymentStatus);
     } catch { paymentCardHtml = ""; }
 
+    // Fase A2: number of orders waiting for an answer (tolerant: a DB without orders shows 0).
+    let pendingOrderCount = 0;
+    try {
+      const pc = db.prepare("SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending'").get(agentId) as any;
+      pendingOrderCount = Number(pc?.n) || 0;
+    } catch { pendingOrderCount = 0; }
+
     // Editable fields with display labels (Norwegian Bokmål)
     const fieldDefs: Array<{ key: string; dbField: string; label: string; type: "text" | "textarea" | "email" | "url" }> = [
       { key: "email",        dbField: "email",         label: "E-post",            type: "email" },
@@ -1109,7 +1117,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ordersCardHtml(agent)}${paymentCardHtml}
+      ${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent)}${paymentCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>

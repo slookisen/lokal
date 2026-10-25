@@ -46,6 +46,7 @@
 import { getDb } from "../database/init";
 import { isBlocked } from "./blocklist-service";
 import { emailService, EmailOptions } from "./email-service";
+import { isOrderAutocompleteEnabled } from "./order-lifecycle";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL } from "./order-pricing";
 
 const APP_URL = process.env.APP_URL || "https://rettfrabonden.com";
@@ -307,10 +308,17 @@ ${pay.html}
  */
 export function renderOrderNotificationEmailV2(order: OrderNotificationInput): RenderedOrderNotificationEmail {
   const orderRef = order.order_id.slice(0, 8);
-  const confirmUrl = `${APP_URL}/produsent/ordre/${encodeURIComponent(order.confirm_token)}`;
+  // Fase A2: the main button opens THIS order in the compact «Mine ordrer» view
+  // (per-order token, no login); «Se alle ordrene dine» needs a login.
+  const confirmUrl = `${APP_URL}/produsent/ordre/${encodeURIComponent(order.confirm_token)}/kompakt`;
+  const allOrdersUrl = `${APP_URL}/eier/${encodeURIComponent(order.agent_id)}/ordrer`;
   const itemRows = renderItemRowsHtml(order.items);
   const itemLines = renderItemLinesText(order.items);
   const pay = paymentCopy(order, orderRef);
+  const linkLabel = pay.link === DEFAULT_LINK ? "Se og bekreft bestillingen" : pay.link;
+  // Only the new-order mail promises the automatic close, and only while it is switched on (never a promise the platform does not keep).
+  const autoCloseLine = !order.reminder && !order.payment?.status?.startsWith("payment_") && isOrderAutocompleteEnabled()
+    ? "Du trenger bare å bekrefte eller avslå. Ordren avsluttes av seg selv etter henting." : "";
 
   const buyerName = (order.buyer_name || "").trim() || null;
   const buyerEmail = (order.buyer_email || "").trim() || null;
@@ -350,13 +358,14 @@ ${buyerBlockHtml}<p style="font-weight:bold;margin-bottom:4px">Varer:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   ${itemRows}
 </table>
-<p><a href="${confirmUrl}">${escHtml(pay.link)}</a> — her bekrefter eller avslår du ordren.<br>
+<p><a href="${confirmUrl}" style="display:inline-block;background:#2c5b3f;color:#ffffff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold">${escHtml(linkLabel)}</a><br>
 Lenken er personlig for denne ordren — ikke del den videre.</p>
+${autoCloseLine ? `<p>${escHtml(autoCloseLine)}</p>\n` : ""}<p><a href="${allOrdersUrl}">Se alle ordrene dine</a> (krever innlogging)</p>
 ${pay.html}
 <p>Hilsen<br>Rett fra Bonden</p>
     `.trim();
 
-  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${pay.link} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
+  const textContent = `Hei,\n\n${pay.intro}.\nOrdre-ref: ${orderRef}\nKjøper-ref: ${maskBuyerRef(order.buyer_ref)}${order.pickup_time ? `\nHentetid: ${order.pickup_time}` : ""}${order.total_nok != null ? `\n${sumLabelOf(order)}: ${order.total_nok} kr` : ""}\n${buyerBlockText}\nVarer:\n${itemLines}\n\n${linkLabel} (personlig lenke, ikke del videre):\n${confirmUrl}\n\n${autoCloseLine ? autoCloseLine + "\n\n" : ""}Se alle ordrene dine (krever innlogging): ${allOrdersUrl}\n\n${pay.text}\n\nHilsen\nRett fra Bonden`;
 
   return {
     subject: pay.subject,
