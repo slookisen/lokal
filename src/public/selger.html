@@ -239,6 +239,15 @@
           <div class="step"><span class="step-num">2</span> <span>Registrer / ta eierskap</span></div>
           <div class="step"><span class="step-num">3</span> <span>Dashboard</span></div>
         </div>
+        <div id="singleStore" style="display: none;">
+          <h2 style="color: var(--forest); font-size: 1.2rem;">Ta over siden til butikken din</h2>
+          <div style="padding: 1rem; background: var(--gray-50); border-radius: 12px; border: 1px solid var(--gray-200); margin-bottom: 1rem;">
+            <strong id="singleStoreName"></strong><br>
+            <span id="singleStoreCity" style="color: var(--gray-500); font-size: 0.9rem;"></span>
+          </div>
+          <button class="btn btn-primary" id="btnSingleStoreClaim" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Dette er min butikk</button>
+        </div>
+        <div id="findDefault">
         <h2 style="color: var(--forest); font-size: 1.2rem;">Finn butikken din</h2>
         <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1.25rem;">Vi sjekker om butikken din allerede finnes i registeret. Da kan du ta eierskap med en gang, i stedet for å opprette en duplikat.</p>
 
@@ -253,6 +262,7 @@
           </div>
         </div>
         <button class="btn btn-primary" id="btnFind" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Sjekk registeret</button>
+        </div>
         <div id="findAlert"></div>
 
         <!-- Match results appear here -->
@@ -910,6 +920,27 @@
     // carries ?agent=<id>. We detect that here, fetch the agent info, and pre-fill the
     // "Finn butikken" search field so the user can confirm with one click instead of
     // typing the same name they just clicked.
+    // Samme regler som washStoreName i src/utils/rfb-store-name.ts.
+    function washStoreName(raw) {
+      var name = String(raw == null ? '' : raw).trim();
+      var cuts = [name.indexOf(' \u2014 '), name.indexOf(', ')].filter(function(i) { return i >= 0; });
+      if (cuts.length) name = name.slice(0, Math.min.apply(null, cuts));
+      return name.replace(/\s+(AS|SA|DA|ANS|ENK)$/i, '').trim();
+    }
+    function showSingleStore(agentId, rawName, city) {
+      var cleanName = washStoreName(rawName) || String(rawName);
+      document.getElementById('singleStoreName').textContent = cleanName;
+      document.getElementById('singleStoreCity').textContent = city || '';
+      document.getElementById('findDefault').style.display = 'none';
+      document.getElementById('findResults').style.display = 'none';
+      var alertEl = document.getElementById('findAlert');
+      if (alertEl) alertEl.innerHTML = '';
+      document.getElementById('singleStore').style.display = '';
+      document.getElementById('btnSingleStoreClaim').addEventListener('click', function() {
+        startClaimFlow(agentId, cleanName);
+      });
+    }
+
     (function preselectFromQuery() {
       try {
         const params = new URLSearchParams(window.location.search);
@@ -931,6 +962,14 @@
             if (!resolvedName) {
               // Invalid id — fall back to default UI
               if (findAlertEl) findAlertEl.innerHTML = "";
+              return;
+            }
+            // Utsending v4: en produsent som ikke er tatt over vises som én
+            // butikk (uten søkefelt og trefliste). Overtatt/verifisert, eller
+            // manglende id, gir siden som før.
+            const infoAgent = info.agent || {};
+            if (infoAgent.id && !infoAgent.isClaimed && !infoAgent.isVerified) {
+              showSingleStore(infoAgent.id, resolvedName, infoAgent.city);
               return;
             }
             const findNameEl = document.getElementById("findName");
