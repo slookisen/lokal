@@ -6,7 +6,8 @@
  * Covers the acceptance criteria:
  *   (a) profile_ai_deliveries exists with the unique key, and the batch upsert
  *       adds to an existing day row (schema vs. the flush query).
- *   (b) list pages: an ai_search fetch of the front page / a city page counts
+ *   (b) list pages: (S1, 2026-10-25) an ai_search fetch of the front page
+ *       counts nothing any more; one of a city page counts
  *       each rendered profile once in ai_page_list; the same fetch from a
  *       crawler, a search engine, a person, a script or our own traffic counts
  *       nothing; a 4xx answer counts nothing.
@@ -22,7 +23,9 @@
  *       sum in computeTrafficStats, the owner stats (60 d + whole period) and
  *       the admin top list.
  *   (h) aiAssistantVendor has Perplexity; aiVendorBucket keeps three buckets.
- *   (i) owner portal and admin dashboard wording: «sendt til AI-en», never
+ *   (g2) S1: rows before countingSince (PROFILE_AI_DELIVERIES_COUNTING_SINCE,
+ *       default 2026-10-26) stay in the table but are not counted anywhere.
+ *   (i) owner portal and admin dashboard wording: «Med i AI-søk», never
  *       «vist i ChatGPT»; «Oppdaget» is marked as the old lifetime counter.
  *
  * Exported runProfileAiDeliveriesTests({log}) -> Promise<TestSummary>; wired into
@@ -70,6 +73,11 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
 
   const prevLog = console.log;
   if (!log) console.log = () => { /* silence registry chatter */ };
+  // «Med i AI-søk» (S1): counting starts on a configured day; a year back here
+  // so the rows written today count whatever the clock says.
+  const prevCountingSince = process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
+  const yearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
 
   try {
     initMod.__setDbForTesting(db as any);
@@ -157,11 +165,20 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
 
     // ── (b) list pages ─────────────────────────────────────────────────
     {
-      const r = invoke("/", "/", CHATGPT_USER);
-      assertEq(r.status, 200, "(b) front page renders 200");
+      // S1 (2026-10-25): the front page's featured list answers no search, so it no longer counts.
+      const home = invoke("/", "/", CHATGPT_USER, { ip: "203.0.113.200" });
+      assertEq(home.status, 200, "(b) front page renders 200");
+      assertTrue(home.body.includes("Aker Gaard En"), "(b) the front page lists the featured producers");
+      flush();
+      assertEq(total(), 0, "(b) S1: ChatGPT-User on the front page counts nothing (featured list not counted)");
+      const seoSrc = fs.readFileSync(path.join(__dirname, "../routes/seo.ts"), "utf8");
+      assertTrue(!/recordAiPageDelivery\([^)]*featured/.test(seoSrc), "(b) S1: seo.ts records no delivery for the featured list");
+
+      const r = invoke("/:city", "/oslo", CHATGPT_USER, { params: { city: "oslo" } });
+      assertEq(r.status, 200, "(b) city page renders 200");
       flush();
       const rows = rowsFor("ai_page_list");
-      assertEq(rows.map((x) => x.profile_id).join(","), "p-1,p-2,p-3", "(b) ChatGPT-User on the front page: each featured profile counted");
+      assertEq(rows.map((x) => x.profile_id).join(","), "p-1,p-2,p-3", "(b) ChatGPT-User on a city page: each listed profile counted");
       assertTrue(rows.every((x) => x.n === 1 && x.ai_vendor === "chatgpt"), "(b) once each, under chatgpt");
 
       for (const [label, ua, cookie] of [
@@ -169,9 +186,9 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
         ["a script / scraper", CURL, undefined], ["ChatGPT-User with the owner cookie", CHATGPT_USER, "_rfb_owner=1"],
       ] as Array<[string, string, string | undefined]>) {
         const before = total();
-        invoke("/", "/", ua, { ip: "198.51.100.9", cookie });
+        invoke("/:city", "/oslo", ua, { ip: "198.51.100.9", cookie, params: { city: "oslo" } });
         flush();
-        assertEq(total(), before, `(b) the same front-page fetch from ${label} counts nothing`);
+        assertEq(total(), before, `(b) the same city-page fetch from ${label} counts nothing`);
       }
 
       const fakeRes: any = Object.assign(new EventEmitter(), { statusCode: 404, locals: {} });
@@ -181,7 +198,7 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       flush();
       assertEq(total(), before, "(b) an ai_search fetch answered 404 counts nothing");
 
-      const city = invoke("/:city", "/oslo", CLAUDE_USER, { params: { city: "oslo" } });
+      const city = invoke("/:city", "/oslo", CLAUDE_USER, { params: { city: "oslo" }, ip: "203.0.113.8" });
       assertEq(city.status, 200, "(b) city page renders 200");
       flush();
       const claude = rowsFor("ai_page_list").filter((x) => x.ai_vendor === "claude");
@@ -191,13 +208,13 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
     // ── (c) repeat within the window ───────────────────────────────────
     {
       const before = total();
-      invoke("/", "/", CHATGPT_USER); // same ip + UA as the first fetch in (b)
+      invoke("/:city", "/oslo", CHATGPT_USER, { params: { city: "oslo" } }); // same ip + UA as the first city fetch in (b)
       flush();
       assertEq(total(), before, "(c) the same AI session fetching the same list again within 30 min counts nothing more");
-      invoke("/", "/?utm_source=chatgpt.com", CHATGPT_USER);
+      invoke("/:city", "/oslo?utm_source=chatgpt.com", CHATGPT_USER, { params: { city: "oslo" } });
       flush();
       assertEq(total(), before, "(c) a tracking parameter does not make it a new list");
-      invoke("/", "/", CHATGPT_USER, { ip: "203.0.113.99" });
+      invoke("/:city", "/oslo", CHATGPT_USER, { ip: "203.0.113.99", params: { city: "oslo" } });
       flush();
       assertEq(total(), before + 3, "(c) another AI session counts each profile again");
 
@@ -224,18 +241,28 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       const human = invoke("/produsent/:slug", "/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, ip: "198.51.100.20" });
       flush();
       assertEq(rowsFor("ai_page_profile").length, before + 1, "(d) a person on the profile page counts nothing");
-      assertTrue(human.body.includes('data-stat="aiDeliveries"'), "(d) the page has the «Med i AI-svar» tile");
-      assertTrue(human.body.includes("Med i AI-svar"), "(d) tile label «Med i AI-svar»");
-      assertTrue(human.body.includes("sendt til AI-en &middot; 60d"), "(d) tile meta «sendt til AI-en · 60d»");
+      assertTrue(human.body.includes('data-stat="aiDeliveries"'), "(d) the page has the «Med i AI-søk» tile");
+      assertTrue(human.body.includes("<small>Med i AI-søk<br>"), "(d) tile label «Med i AI-søk»");
+      assertTrue(!human.body.includes("Med i AI-svar"), "(d) the old name «Med i AI-svar» is gone");
+      assertTrue(human.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 60 d"), "(d) tile subtitle, a full window after the counting started");
       assertTrue(human.body.includes("Tallet viser ikke hvor mange som så den."), "(d) help text: it does not show how many saw it");
       assertTrue(human.body.includes("s.aiDeliveries"), "(d) the tile is filled from /api/agents/:id/stats aiDeliveries");
       assertTrue(human.body.includes("d.total > 0 || partial"), "(d) the tile also shows at 0 while the counting is younger than the window");
-      assertTrue(human.body.includes('"Fra "') && human.body.includes('"sendt til AI-en · siden "'), "(d) at 0 it shows «Fra <dato>»; in the first window «siden <dato>»");
+      assertTrue(human.body.includes('"Fra "') && human.body.includes('"ganger profilen var blant treffene en AI-assistent hentet · siden "'), "(d) at 0 it shows «Fra <dato>»; in the first window «siden <dato>»");
       assertTrue(human.body.includes('"nb-NO"'), "(d) Norwegian date format on the Norwegian page");
       assertTrue(!human.body.includes("${"), "(d) rendered HTML has no literal ${");
       assertTrue(!/vist i ChatGPT/i.test(human.body), "(d) never «vist i ChatGPT»");
       const en = invoke("/produsent/:slug", "/en/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, lang: "en", ip: "198.51.100.21" });
-      assertTrue(en.body.includes("In AI answers") && !en.body.includes("${"), "(d) English tile renders without ${");
+      assertTrue(en.body.includes("<small>In AI searches<br>") && !en.body.includes("${"), "(d) English tile «In AI searches» renders without ${");
+      assertTrue(en.body.includes("times the profile was among the results an AI assistant fetched &middot; last 60 d"), "(d) English subtitle");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = compute.utcDay(Date.now());
+      const freshNb = invoke("/produsent/:slug", "/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, ip: "198.51.100.22" });
+      const freshEn = invoke("/produsent/:slug", "/en/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, lang: "en", ip: "198.51.100.23" });
+      const nbSince = new Date().toLocaleDateString("nb-NO", { day: "numeric", month: "short", timeZone: "UTC" });
+      const enSince = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+      assertTrue(freshNb.body.includes(`ganger profilen var blant treffene en AI-assistent hentet &middot; siden ${nbSince}`), "(d) S1: «siden <dato>» shows the configured start day");
+      assertTrue(freshEn.body.includes(`times the profile was among the results an AI assistant fetched &middot; since ${enSince}`), "(d) S1: English «since <date>»");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
       assertTrue(en.body.includes('"Since "') && en.body.includes('"en-GB"'), "(d) English: «Since <date>», English date format");
       // Every inline script on the page must compile: a "\n" written without the
       // template-literal escape becomes a raw newline inside a JS string.
@@ -355,15 +382,36 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       const topAll = compute.computeAiDeliveryTopProfiles(db as any, "rfb", null, now, 1);
       assertEq(topAll.map((t) => `${t.profileId}:${t.total}`).join(","), "p-1:11", "(g) admin top list (whole period, limit)");
 
-      // The start date of the counting (Daniel 2026-10-15: show «fra <dato>» instead of 0).
-      assertEq(s.aiDeliveries.countingSince, old, "(g) countingSince: the vertical's first day, also when the window leaves it out");
-      assertEq(compute.computeAiDeliveries(db as any, "rfb", "p-unseen", 60, now).countingSince, old, "(g) a profile with 0 deliveries still gets the vertical's start date");
+      // The start date of the counting (Daniel 2026-10-15: show «fra <dato>» instead of 0);
+      // S1: the configured day, the same for every vertical and profile.
+      assertEq(s.aiDeliveries.countingSince, yearAgo, "(g) countingSince: the configured start day");
+      assertEq(compute.computeAiDeliveries(db as any, "rfb", "p-unseen", 60, now).countingSince, yearAgo, "(g) a profile with 0 deliveries still gets the start date");
       assertEq(compute.computeAiDeliveries(db as any, "rfb", "p-unseen", 60, now).total, 0, "(g) …and total 0");
-      assertEq(compute.computeAiDeliveries(db as any, "dental", undefined, 60, now).countingSince, today, "(g) countingSince per vertical");
-      assertEq(compute.computeAiDeliveries(db as any, undefined, undefined, null, now).countingSince, old, "(g) countingSince across verticals");
-      assertEq(compute.computeAiDeliveries(db as any, "experiences", undefined, 60, now).countingSince, null, "(g) a vertical with no deliveries: countingSince null");
-      assertEq(o.aiDeliveries.window.countingSince, old, "(g) owner stats carry countingSince");
+      assertEq(compute.computeAiDeliveries(db as any, "experiences", undefined, 60, now).countingSince, yearAgo, "(g) a vertical with no deliveries: still the start date");
+      assertEq(o.aiDeliveries.window.countingSince, yearAgo, "(g) owner stats carry countingSince");
       assertEq(compute.emptyAiDeliveries(60).countingSince, null, "(g) empty payload: countingSince null");
+
+      // ── (g2) S1: rows before countingSince are kept but not counted ──
+      const mid = compute.utcDay(now - 30 * 24 * 60 * 60 * 1000);
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = mid;
+      const o2 = getOwnerStats(db as any, "p-1", "/produsent/aker-gaard-en");
+      assertEq(o2.aiDeliveries.allTime.total, 7, "(g2) owner stats whole period: the row before countingSince is left out");
+      assertEq(o2.aiDeliveries.allTime.byChannel.a2a, 0, "(g2) …also per channel");
+      assertEq(o2.aiDeliveries.allTime.countingSince, mid, "(g2) countingSince is the configured day");
+      assertEq(compute.computeAiDeliveryTopProfiles(db as any, "rfb", null, now, 1).map((t) => `${t.profileId}:${t.total}`).join(","), "p-1:7", "(g2) admin top list (whole period) leaves it out");
+      assertEq(compute.computeAiDeliveries(db as any, undefined, undefined, null, now).total, 17, "(g2) all verticals, whole period: 21 - 4");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = today;
+      assertEq(computeAgentStats(db as any, "p-1", "/produsent/aker-gaard-en", now).aiDeliveries.total, 7, "(g2) start day today: today's rows count");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = compute.utcDay(now + 24 * 60 * 60 * 1000);
+      assertEq(computeAgentStats(db as any, "p-1", "/produsent/aker-gaard-en", now).aiDeliveries.total, 0, "(g2) start day tomorrow: nothing counts yet, even in the 60-day window");
+      assertEq(computeTrafficStats(db as any, undefined, 60, now).aiDeliveries, 0, "(g2) …and the platform sum is 0");
+      assertEq((db.prepare("SELECT COALESCE(SUM(count), 0) AS n FROM profile_ai_deliveries").get() as { n: number }).n, 21, "(g2) no row was deleted");
+      delete process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
+      assertEq(compute.aiDeliveriesCountingSince(), "2026-10-26", "(g2) default start day 2026-10-26");
+      assertEq(compute.DEFAULT_AI_DELIVERIES_COUNTING_SINCE, "2026-10-26", "(g2) default constant");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = "2026-13-45";
+      assertEq(compute.aiDeliveriesCountingSince(), "2026-10-26", "(g2) an invalid override falls back to the default");
+      process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
     }
 
     // ── (h) vendor buckets ─────────────────────────────────────────────
@@ -379,12 +427,14 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
     {
       const selger = fs.readFileSync(path.join(__dirname, "../public/selger.html"), "utf8");
       const admin = fs.readFileSync(path.join(__dirname, "../public/admin-dashboard.html"), "utf8");
-      assertTrue(selger.includes("<h2>Med i AI-svar</h2>") && selger.includes("statsAiDeliveries"), "(i) selger.html has the «Med i AI-svar» card");
-      assertTrue(selger.includes("Sendt til AI-en (") && selger.includes("'hele perioden'"), "(i) selger.html: 60 d and whole period");
-      assertTrue(selger.includes("'siden ' + dlSince") && selger.includes("'fra ' + dlSince"), "(i) selger.html: «siden <dato>» in the first window, whole period «fra <dato>»");
-      assertTrue(admin.includes("tellingen startet "), "(i) admin: shows when the counting started");
+      assertTrue(selger.includes("<h2>Med i AI-s&oslash;k</h2>") && selger.includes("statsAiDeliveries"), "(i) selger.html has the «Med i AI-søk» card");
+      assertTrue(!selger.includes("Med i AI-svar") && !admin.includes("Med i AI-svar"), "(i) the old name «Med i AI-svar» is gone from selger.html and admin");
+      assertTrue(selger.includes("Ganger profilen var blant treffene en AI-assistent hentet (") && selger.includes("'hele perioden'"), "(i) selger.html: 60 d and whole period, new subtitle");
+      assertTrue(selger.includes("'siden ' + dlSince") && !selger.includes("'fra ' + dlSince"), "(i) selger.html: «siden <dato>» in the first window and for the whole period");
+      assertTrue(admin.includes("📤 Med i AI-søk (ganger profilen var blant treffene en AI-assistent hentet)"), "(i) admin panel title «Med i AI-søk»");
+      assertTrue(admin.includes("'siden ' + escHtml(sinceTxt)"), "(i) admin: shows since when it is counted");
       assertTrue(selger.includes("statsAiDeliveriesVendor") && selger.includes("statsAiDeliveriesChannel"), "(i) selger.html: per AI and per channel");
-      assertTrue(selger.includes("ikke hvor mange som s&aring; den"), "(i) selger.html help text: not how many saw it");
+      assertTrue(selger.includes("ikke hvor mange som s&aring; profilen"), "(i) selger.html help text: not how many saw it");
       assertTrue(selger.includes("Oppdaget (gammel livstidsteller)"), "(i) selger.html marks «Oppdaget» as the old lifetime counter");
       assertTrue(admin.includes("aiDeliveriesPanel") && admin.includes("/ai-deliveries?limit=10"), "(i) admin dashboard has the panel and reads /ai-deliveries");
       for (const [name, src] of [["selger.html", selger], ["admin-dashboard.html", admin]]) {
@@ -396,6 +446,7 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
     failures.push(`unexpected error: ${String(err?.stack || err)}`);
   } finally {
     console.log = prevLog;
+    if (prevCountingSince === undefined) delete process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE; else process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = prevCountingSince;
     (require("./profile-ai-deliveries") as typeof import("./profile-ai-deliveries")).__resetAiDeliveriesForTesting();
     const regMod = require("./marketplace-registry");
     regMod.marketplaceRegistry._agentsCache = null;

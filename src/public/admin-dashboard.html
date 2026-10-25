@@ -404,7 +404,7 @@
                 <div id="producerTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel panel-full" data-rfb-only>
-                <div class="panel-title" title="Antall ganger profiler er sendt til AI-assistenter (ChatGPT, Claude m.fl.) som svar på spørsmål: liste- og søkesider og profilsider AI-en hentet, MCP-verktøy og A2A-svar. Viser ikke hvor mange som så profilen. Egen trafikk, prober, crawlere og mennesker telles ikke. Faste perioder, uavhengig av tidsvalget over.">📤 Med i AI-svar (sendt til AI-en)</div>
+                <div class="panel-title" title="Antall ganger profiler var blant treffene en AI-assistent (ChatGPT, Claude m.fl.) hentet: lister som svarer på et søk, et sted, en kategori eller et markedsnettverk, profilsider, MCP-verktøy og A2A-svar. Forsiden telles ikke. Viser ikke hvor mange som så profilen. Egen trafikk, prober, crawlere og mennesker telles ikke. Faste perioder, uavhengig av tidsvalget over.">📤 Med i AI-søk (ganger profilen var blant treffene en AI-assistent hentet)</div>
                 <div id="aiDeliveriesPanel"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel panel-full">
@@ -688,7 +688,7 @@
             console.error("Dashboard load failed:", err);
         });
 
-        // «Med i AI-svar»: fixed 60 days + whole period, loaded on its own so a
+        // «Med i AI-søk»: fixed 60 days + whole period, loaded on its own so a
         // failure here never blanks the rest of the dashboard.
         if (rfbOnly) {
             api("/ai-deliveries?limit=10").then(renderAiDeliveries).catch(function(err) {
@@ -1180,7 +1180,7 @@
         el.innerHTML = '<table class="data-table"><thead><tr><th>Produsent</th><th>By</th><th>Visninger</th><th>Kilde</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
 
-    // ─── Med i AI-svar (profiles sent to AI assistants) ──
+    // ─── Med i AI-søk (profiles among the results an AI assistant fetched) ──
     function renderAiDeliveries(d) {
         var el = document.getElementById("aiDeliveriesPanel");
         if (!d || !d.window) { el.innerHTML = '<div class="empty-state">Ingen tall enda</div>'; return; }
@@ -1194,16 +1194,15 @@
         }
         var since = w.countingSince ? Date.parse(w.countingSince + "T00:00:00Z") : NaN;
         var sinceTxt = isNaN(since) ? "" : new Date(since).toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
-        var html = '<div style="margin-bottom:8px"><strong>' + fmtNum(w.total) + '</strong> ganger sendt til AI-en siste ' + fmtNum(d.windowDays) + ' dager · <strong>' + fmtNum(a.total) + '</strong> i hele perioden'
-            + (sinceTxt ? ' · tellingen startet ' + escHtml(sinceTxt) : '') + '</div>';
+        var html = '<div style="margin-bottom:8px"><strong>' + fmtNum(w.total) + '</strong> ganger blant treffene en AI-assistent hentet siste ' + fmtNum(d.windowDays) + ' dager · <strong>' + fmtNum(a.total) + '</strong> ' + (sinceTxt ? 'siden ' + escHtml(sinceTxt) : 'i hele perioden') + '</div>';
         html += '<table class="data-table"><thead><tr><th>Per AI / kanal</th><th>' + fmtNum(d.windowDays) + ' d</th><th>Hele perioden</th></tr></thead><tbody>'
             + split(VENDORS, "byVendor") + split(CHANNELS, "byChannel") + '</tbody></table>';
         var top = d.top || [];
         html += top.length
-            ? '<table class="data-table" style="margin-top:8px"><thead><tr><th>Topp profiler (' + fmtNum(d.windowDays) + ' d)</th><th>Sendt til AI-en</th></tr></thead><tbody>'
+            ? '<table class="data-table" style="margin-top:8px"><thead><tr><th>Topp profiler (' + fmtNum(d.windowDays) + ' d)</th><th>Med i AI-søk</th></tr></thead><tbody>'
                 + top.map(function(p) { return '<tr><td><strong>' + escHtml(p.name || p.profileId) + '</strong></td><td>' + fmtNum(p.total) + '</td></tr>'; }).join("")
                 + '</tbody></table>'
-            : '<div class="empty-state">Ingen profiler sendt til AI-en enda</div>';
+            : '<div class="empty-state">Ingen profiler med i AI-søk enda</div>';
         el.innerHTML = html;
     }
 

@@ -414,18 +414,19 @@ export async function runRfbSeoFeiltypedeKnowledgeFeltTests(opts: { log?: boolea
     {
       // The whole inline script as on main, held as its SHA-256 (it is ~4 KB):
       // a legitimate edit of the script's JavaScript changes these hashes too,
-      // so take new ones from main then. The server-written lines are spelled
+      // so take new ones from main then (S1 2026-10-25: «Med i AI-søk» strings).
+      // The server-written lines are spelled
       // out below so a failure shows which value moved.
       const scriptOf = (body: string): string => scriptElements(body).find((e) => e.content.includes("var agentId"))?.content ?? "";
       const sha256 = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
       const no = scriptOf(producer("uuid-gard").body);
       const en = scriptOf(producer("uuid-gard", "en").body);
-      assertEq(sha256(no), "433fc6c9b78c12a8689fcf212ec260f353b17d874e3fd7284551947178b82b3f", "b inline script no: byte-identical to main for a UUID id (sha256)");
-      assertEq(sha256(en), "c79f21ae36fa102c816ee4a2e0b58b10961ec3c5a953c08d902d0a73477ace50", "b inline script en: byte-identical to main, language strings included (sha256)");
+      assertEq(sha256(no), "d825f73bb4061d9a2ebb308056c25c5205a054a406374eb45fc625fabc7056c3", "b inline script no: byte-identical to main for a UUID id (sha256)");
+      assertEq(sha256(en), "d2a83c1ef8d0cb531d0dc7d6d20f4a50d1920497752c55a4b70c2a0dde945601", "b inline script en: byte-identical to main, language strings included (sha256)");
       assertTrue(no.includes(`var agentId = "${UUID}";`) && en.includes(`var agentId = "${UUID}";`), "b inline script: agentId is the plain JSON string for a UUID");
-      assertTrue(no.includes('toLocaleString("nb-NO")') && no.includes('parts.push("Annet" + " " + b.other)') && no.includes('"sendt til AI-en · siden "'),
+      assertTrue(no.includes('toLocaleString("nb-NO")') && no.includes('parts.push("Annet" + " " + b.other)') && no.includes('"ganger profilen var blant treffene en AI-assistent hentet · siden "'),
         "b inline script no: Norwegian language strings as before");
-      assertTrue(en.includes('toLocaleString("en-GB")') && en.includes('parts.push("Other" + " " + b.other)') && en.includes('"sent to the AI · since "'),
+      assertTrue(en.includes('toLocaleString("en-GB")') && en.includes('parts.push("Other" + " " + b.other)') && en.includes('"times the profile was among the results an AI assistant fetched · since "'),
         "b inline script en: English language strings as before");
     }
 

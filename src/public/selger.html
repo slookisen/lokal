@@ -688,7 +688,7 @@
           <div class="card">
             <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">
-              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-svar&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
+              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-s&oslash;k&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
             </p>
             <div class="stats-grid" id="statsFunnel"></div>
           </div>
@@ -707,8 +707,8 @@
           </div>
 
           <div class="card">
-            <h2>Med i AI-svar</h2>
-            <p class="section-hint" style="margin-bottom:0.75rem;">Antall ganger profilen din er sendt til AI-assistenter som ChatGPT og Claude som svar p&aring; sp&oslash;rsm&aring;l: p&aring; en liste- eller s&oslash;keside AI-en hentet, p&aring; profilsiden din, eller i svar via MCP og A2A. Tallet viser at profilen ble sendt til AI-en, ikke hvor mange som s&aring; den. Svar AI-en gir fra sin egen hukommelse ser vi ikke, s&aring; tallet er et minimum.</p>
+            <h2>Med i AI-s&oslash;k</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">Antall ganger profilen din var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte: et s&oslash;k, et sted, en kategori eller et markedsnettverk AI-en hentet, profilsiden din, eller svar via MCP og A2A. Forsiden telles ikke. Tallet viser ikke hvor mange som s&aring; profilen. Svar AI-en gir fra sin egen hukommelse ser vi ikke, s&aring; tallet er et minimum.</p>
             <div class="stats-grid" id="statsAiDeliveries"></div>
             <h3>Per AI</h3>
             <ul class="product-list" id="statsAiDeliveriesVendor"></ul>
@@ -2042,7 +2042,7 @@
       aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.other || 0) + '</div><div class="stat-label">Andre AI</div></div>';
       document.getElementById('statsAiPlatforms').innerHTML = aiHtml;
 
-      // Med i AI-svar: last 60 days and since counting started, per AI and per channel
+      // Med i AI-søk: last 60 days and since counting started, per AI and per channel
       var dl = data.aiDeliveries || {};
       var dw = dl.window || {};
       var da = dl.allTime || {};
@@ -2054,8 +2054,8 @@
       var dlPartial = !!dlSince && (Date.now() - dlSinceMs) < (dwDays - 1) * 86400000;
       var dlWinLabel = dlPartial ? 'siden ' + dlSince : dwDays + 'd';
       var dlHtml = '';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + dlWinLabel + ')</div></div>';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + (dlSince ? 'fra ' + dlSince : 'hele perioden') + ')</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + dlWinLabel + ')</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + (dlSince ? 'siden ' + dlSince : 'hele perioden') + ')</div></div>';
       document.getElementById('statsAiDeliveries').innerHTML = dlHtml;
       var DL_VENDOR_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Andre AI', unknown: 'Ukjent AI' };
       var DL_CHANNEL_LABELS = { ai_page_list: 'Liste- og s&oslash;kesider', ai_page_profile: 'Profilsiden', mcp: 'MCP', a2a: 'A2A' };

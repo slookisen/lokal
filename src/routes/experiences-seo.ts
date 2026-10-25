@@ -5094,7 +5094,8 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
-  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
+  // «Med i AI-søk» (S1, 2026-10-25): the generic «Alle opplevelser» list answers
+  // no search, place or category, so it is not counted.
   res.send(html);
 });
 

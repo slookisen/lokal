@@ -51,7 +51,9 @@ import { isJunkDescription, stripInternalNotes, normalizeProse } from "../servic
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { searchTrafficClass } from "../services/search-tracking";
-import { AI_DELIVERY_WINDOW_DAYS } from "../services/profile-ai-deliveries-compute";
+import {
+  AI_DELIVERIES_LABEL, AI_DELIVERIES_SUBTITLE, AI_DELIVERY_WINDOW_DAYS, aiDeliveriesCountingSince, aiDeliveriesPeriodLabel,
+} from "../services/profile-ai-deliveries-compute";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
@@ -1234,7 +1236,7 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     // crawlers shown on their own, the rest is otherBotViews.
     aiLookups: s.aiLookups,
     aiSearchTotal: s.aiSearchTotal,
-    // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
+    // «Med i AI-søk» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
     // profiles were sent to AI assistants in the window, all profiles summed.
     aiDeliveries: s.aiDeliveries,
     otherBotViews: s.otherBotViews,
@@ -1699,8 +1701,8 @@ ${umbrellaSectionHtml}
       </div>
     </section>`;
 
-    // «Med i AI-svar»: the featured producers on the page, for an AI assistant's fetch.
-    recordAiPageDelivery(req, res, "ai_page_list", featured.map((a: any) => a.id));
+    // «Med i AI-søk» (S1, 2026-10-25): the front page's featured list answers no
+    // search, city, category or umbrella, so it is not counted.
     res.send(shell(
       t(lang, "home.title"),
       t(lang, "home.description", { count: totalAgents }),
@@ -6462,7 +6464,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
           <div class="pf-stat" data-stat="human" title="${lang === "en" ? `Page views from humans, last ${statsDays} days` : `Sidevisninger fra mennesker, siste ${statsDays} dager`}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `humans &middot; ${statsDays}d` : `mennesker &middot; ${statsDays}d`}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last ${statsDays} days.` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager.`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `AI agents &middot; ${statsDays}d` : `AI-agenter &middot; ${statsDays}d`}</span></small></div></div>
-          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was sent to AI assistants such as ChatGPT and Claude as part of an answer, last ${AI_DELIVERY_WINDOW_DAYS} days. It does not show how many people saw it.` : `Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål, siste ${AI_DELIVERY_WINDOW_DAYS} dager. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? "In AI answers" : "Med i AI-svar"}<br><span class="pf-stat-meta">${lang === "en" ? `sent to the AI &middot; ${AI_DELIVERY_WINDOW_DAYS}d` : `sendt til AI-en &middot; ${AI_DELIVERY_WINDOW_DAYS}d`}</span></small></div></div>
+          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), last ${AI_DELIVERY_WINDOW_DAYS} days. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), siste ${AI_DELIVERY_WINDOW_DAYS} dager. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesPeriodLabel(aiDeliveriesCountingSince(), AI_DELIVERY_WINDOW_DAYS, Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>
         </div>
       </div>
 
@@ -6621,7 +6623,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 if (parts.length) a.setAttribute("title", (a.getAttribute("title") || "") + "\\n" + parts.join(" · "));
               }
             }
-            // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times the
+            // «Med i AI-søk» (dev-request 2026-10-14-med-i-ai-svar-per-profil, renamed in S1 2026-10-25): times the
             // profile was sent to an AI, split per AI in the tooltip. Until the counting
             // has run a full window the tile says «siden <dato>», and at 0 it shows the
             // date the counting started instead of 0 (Daniel 2026-10-15).
@@ -6637,10 +6639,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 var meta = tile.querySelector(".pf-stat-meta");
                 if (d.total > 0) {
                   tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
-                  if (partial && meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
+                  if (partial && meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? AI_DELIVERIES_SUBTITLE.en + " · since " : AI_DELIVERIES_SUBTITLE.nb + " · siden ")} + sinceTxt;
                 } else {
                   tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${serializeJsonForScript(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
-                  if (meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
+                  if (meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb)};
                 }
                 if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${serializeJsonForScript(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
                 tile.style.display = "flex";
