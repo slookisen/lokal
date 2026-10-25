@@ -49258,6 +49258,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 point 6 / AC 6: owned
+// gårdssalg profiles excluded from cold outreach, signed List-Unsubscribe(+Post) on the
+// gårdssalg mail, /avmeld GET read-only + POST suppression. Swaps the getDb() singleton,
+// module cache and env flags (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 6: eide ute av utsending + avmeld ──");
+  try {
+    const { runGardssalgOutreachEideAvmeldG1s7Tests } = require("../src/routes/gardssalg-outreach-eide-avmeld-g1s7.test") as
+      typeof import("../src/routes/gardssalg-outreach-eide-avmeld-g1s7.test");
+    const r = await runGardssalgOutreachEideAvmeldG1s7Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-outreach-eide-avmeld-g1s7: " + f);
+    console.log(`  gardssalg-outreach-eide-avmeld-g1s7: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-eide-avmeld-g1s7: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // 2026-10-04 view-stats honesty: producer view statistics count humans, not
 // bots or city pages — /:city no longer books a profile view, trackAgentView
 // stamps is_owner + traffic_category (+ Referer-derived view_source),
