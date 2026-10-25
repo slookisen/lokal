@@ -15,6 +15,7 @@ import {
 import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
+import { customerRuleSql } from "../services/customer-rule";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
@@ -42,6 +43,17 @@ const router = Router();
 // ─────────────────────────────────────────────────────────────────
 
 const MAGIC_LINK_VALID_HOURS = 7 * 24; // 7 days
+
+// expires_at is written as an ISO-8601 string (Date#toISOString(), e.g.
+// "2026-10-25T13:20:00.000Z" — see the INSERTs below and knowledge-service
+// createMagicLink), while datetime('now') is SQLite's native
+// "2026-10-25 16:41:17". A bare TEXT comparison of the two is wrong: on the
+// expiry day 'T' (0x54) > ' ' (0x20), so an expired token stayed valid until
+// the end of that UTC day. datetime(expires_at) normalises BOTH formats (the
+// ISO rows and the native-format rows some tests/legacy writers use), same
+// fix as the rate-limit query below. dev-request
+// 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 5. Pure bug fix → unflagged.
+const OWNER_TOKEN_NOT_EXPIRED_SQL = "datetime(expires_at) > datetime('now')";
 const RATE_LIMIT_WINDOW_HOURS = 1;
 const RATE_LIMIT_MAX_PER_WINDOW = 3;
 
@@ -145,7 +157,8 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     const recentCount = db
       .prepare(
         `SELECT COUNT(*) as count FROM magic_links
-         WHERE agent_id = ? AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
+         WHERE agent_id = ? AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')
+           AND id NOT LIKE '${OWNER_SESSION_ID_PREFIX}%' AND id NOT LIKE '${OWNER_BRIDGE_ID_PREFIX}%'`
       )
       .get(id, RATE_LIMIT_WINDOW_HOURS) as any;
 
@@ -232,7 +245,7 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
     const magicLink = db
       .prepare(
         `SELECT * FROM magic_links
-         WHERE token = ? AND expires_at > datetime('now')`
+         WHERE token = ? AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
 
@@ -311,7 +324,7 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const link = db
       .prepare(
         `SELECT agent_id FROM magic_links
-         WHERE token = ? AND used = 1 AND expires_at > datetime('now')`
+         WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(cookieToken) as any;
     if (link) {
@@ -327,7 +340,7 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const link = db
       .prepare(
         `SELECT agent_id FROM magic_links
-         WHERE token = ? AND used = 1 AND expires_at > datetime('now')`
+         WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
     if (link) {
@@ -336,6 +349,158 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
   }
 
   return { valid: false };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// S1b punkt 5 — one owner login (dev-request 2026-10-22-rfb-mine-valg-eierbrytere)
+// ─────────────────────────────────────────────────────────────────
+// Two env flags, both read at call time ("1"/"true" = on), both DEFAULT OFF so
+// prod behaviour is unchanged until switched on:
+//
+//   OWNER_VERIFIED_OWNER_GATE_ENABLED — every owner endpoint (this file,
+//     owner-orders.ts, payments.ts) requires isVerifiedOwner(agentId, session).
+//     Off = today's check (the session belongs to the agent).
+//   OWNER_UNIFIED_SESSION_ENABLED — the /selger login (GET
+//     /api/marketplace/auth/magic-verify) also opens the /eier session cookie,
+//     and the /eier portal gets a «Produkter og åpningstider» button
+//     (POST /eier/:id/selger) that logs the same owner into /selger without a
+//     new e-mail. One login → profile, products, statistics, orders.
+//
+// Logout revocation and the expires_at comparison are bug fixes and unflagged.
+
+export const OWNER_VERIFIED_OWNER_GATE_FLAG = "OWNER_VERIFIED_OWNER_GATE_ENABLED";
+export const OWNER_UNIFIED_SESSION_FLAG = "OWNER_UNIFIED_SESSION_ENABLED";
+
+function envFlagOn(name: string): boolean {
+  const v = process.env[name];
+  return v === "1" || v === "true";
+}
+
+export function ownerVerifiedOwnerGateEnabled(): boolean {
+  return envFlagOn(OWNER_VERIFIED_OWNER_GATE_FLAG);
+}
+
+export function ownerUnifiedSessionEnabled(): boolean {
+  return envFlagOn(OWNER_UNIFIED_SESSION_FLAG);
+}
+
+/**
+ * THE ownership predicate for owner endpoints: the session is valid, belongs
+ * to exactly this agent, AND the agent has a verified owner by the shared
+ * customer rule (customerRuleSql: agents.claimed_at set OR a verified
+ * agent_claims row). A session opened by an e-mail match alone (the /eier
+ * magic link only checks agent_knowledge.email) on a profile with no verified
+ * owner is NOT a verified owner. Self-registered owners (verified claim,
+ * is_verified = 0) are verified owners here — the strict is_verified gate for
+ * real orders is separate and unchanged.
+ */
+export function isVerifiedOwner(
+  agentIdParam: unknown,
+  session: { valid: boolean; agentId?: string } | null | undefined,
+): boolean {
+  const agentId = typeof agentIdParam === "string" ? agentIdParam : "";
+  if (!session || !session.valid || !session.agentId || !agentId) return false;
+  if (session.agentId !== agentId) return false;
+  const row = getDb()
+    .prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+    .get(agentId) as { owned?: number } | undefined;
+  return !!row && row.owned === 1;
+}
+
+/**
+ * Access check every owner endpoint uses after its "no session → 401/login"
+ * branch. Gate on: isVerifiedOwner. Gate off: today's check (session agent ===
+ * requested agent). false → the caller answers 403.
+ */
+export function ownerSessionAllows(
+  agentIdParam: unknown,
+  session: { valid: boolean; agentId?: string } | null | undefined,
+): agentIdParam is string {
+  const agentId = typeof agentIdParam === "string" ? agentIdParam : "";
+  if (ownerVerifiedOwnerGateEnabled()) return isVerifiedOwner(agentId, session);
+  return !!session && session.valid && !!session.agentId && session.agentId === agentId;
+}
+
+/** 403 body/page text when the session is valid but ownership is not verified. */
+export const OWNER_NOT_VERIFIED_MESSAGE =
+  "Eierskapet til profilen er ikke bekreftet. Bekreft eierskap først.";
+
+function ownerForbiddenJson(agentId: unknown, session: { valid: boolean; agentId?: string }) {
+  const sameAgent = session.agentId === agentId;
+  return sameAgent
+    ? { success: false, error: "ownership_not_verified", message: OWNER_NOT_VERIFIED_MESSAGE }
+    : { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." };
+}
+
+// magic_links rows that are sessions / one-time bridges, not e-mailed links.
+// Kept out of the request-magic-link rate limit (that limit counts e-mails).
+const OWNER_SESSION_ID_PREFIX = "mlsess_";
+const OWNER_BRIDGE_ID_PREFIX = "mlbridge_";
+const OWNER_SESSION_VALID_MS = MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000;
+const OWNER_BRIDGE_VALID_MS = 15 * 60 * 1000; // same as knowledge-service createMagicLink
+
+function setOwnerSessionCookie(res: Response, token: string): void {
+  res.cookie("rfb_owner_session", token, {
+    path: "/",
+    maxAge: OWNER_SESSION_VALID_MS,
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+  });
+}
+
+/**
+ * OWNER_UNIFIED_SESSION_ENABLED: called by the /selger login after a verified
+ * claimant redeemed their magic link. Opens the /eier session (a fresh
+ * magic_links row, used = 1, ISO timestamps, 7 days) and sets the cookie, so
+ * statistics, orders and the /eier portal need no second login. No-op (false)
+ * when the flag is off or the request already carries a live session for this
+ * agent.
+ */
+export function issueOwnerSessionForSelgerLogin(
+  req: Request,
+  res: Response,
+  agentId: string,
+  email: string,
+): boolean {
+  if (!ownerUnifiedSessionEnabled() || !agentId || !email) return false;
+  const existing = verifyOwnerSession(req);
+  if (existing.valid && existing.agentId === agentId) return false;
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
+  getDb().prepare(
+    `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+  ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
+    now.toISOString(), now.toISOString(), expiresAt.toISOString());
+  setOwnerSessionCookie(res, token);
+  console.log(`[owner-portal] unified session opened for ${agentId} from /selger login`);
+  return true;
+}
+
+/**
+ * Logout: make the presented session token unusable server-side (cookie AND
+ * Bearer — the cookie value is the same token). Implemented as immediate
+ * expiry so no schema change is needed: every reader checks expires_at
+ * (verifyOwnerSession, /magic-link-verify, knowledge-service verifyMagicLink).
+ */
+export function revokeOwnerSessionToken(token: string | undefined): boolean {
+  if (!token) return false;
+  const past = new Date(Date.now() - 1000).toISOString();
+  const info = getDb()
+    .prepare(`UPDATE magic_links SET expires_at = ? WHERE token = ?`)
+    .run(past, token);
+  return info.changes > 0;
+}
+
+function presentedOwnerTokens(req: Request): string[] {
+  const out: string[] = [];
+  const c = readSessionCookie(req);
+  if (c) out.push(c);
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith("Bearer ")) out.push(auth.substring(7));
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -363,15 +528,11 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       });
     }
 
-    if (sessionData.agentId !== id) {
+    if (!ownerSessionAllows(id, sessionData)) {
       console.log(
-        `[owner-portal] Session agent ${sessionData.agentId} != requested ${id}`
+        `[owner-portal] Session agent ${sessionData.agentId} not allowed for ${id}`
       );
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
 
     const db = getDb();
@@ -572,12 +733,8 @@ router.get("/api/agents/:id/profile", (req: Request, res: Response) => {
       });
     }
 
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
 
     const db = getDb();
@@ -946,6 +1103,19 @@ export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?:
       </div>`;
 }
 
+/** 403 page: valid session for this agent, but no verified owner (S1b punkt 5). */
+export function ownerNotVerifiedPage(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return portalShell(
+    "Ingen tilgang",
+    `<div class="ep-card">
+          <h1>Eierskapet er ikke bekreftet</h1>
+          <p>${escapeHtml(OWNER_NOT_VERIFIED_MESSAGE)}</p>
+          <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>
+        </div>`
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────
 // GET /eier/:agentId/portal — authenticated edit page (requires session)
 // ─────────────────────────────────────────────────────────────────
@@ -957,6 +1127,11 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     if (!session.valid) {
       // Not logged in → bounce to email-entry form for this agent.
       return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
+    }
+    if (session.agentId === agentId && !ownerSessionAllows(agentId, session)) {
+      // S1b punkt 5 (OWNER_VERIFIED_OWNER_GATE_ENABLED): an e-mail match
+      // without verified ownership → 403 with the way to confirm ownership.
+      return res.status(403).send(ownerNotVerifiedPage(agentId));
     }
     if (session.agentId !== agentId) {
       // Logged in to a different agent → 403.
@@ -1117,7 +1292,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent)}${paymentCardHtml}
+      ${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent)}${paymentCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -1222,8 +1397,8 @@ function applyOwnerOrderOptIn(
   if (!session.valid) {
     return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
   }
-  if (session.agentId !== agentId) {
-    return { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  if (!ownerSessionAllows(agentId, session)) {
+    return { status: 403, body: ownerForbiddenJson(agentId, session) };
   }
   let optIn: 0 | 1;
   if (rawOptIn === true || rawOptIn === 1 || rawOptIn === "1" || rawOptIn === "true") optIn = 1;
@@ -1283,8 +1458,13 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
   const agentId = String((req.params as any).agentId || "");
   const session = verifyOwnerSession(req);
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
-  if (!session.valid || session.agentId !== agentId) {
+  if (!session.valid) {
     return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+  }
+  if (!ownerSessionAllows(agentId, session)) {
+    return session.agentId === agentId
+      ? res.status(403).send(ownerNotVerifiedPage(agentId))
+      : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
   }
   try {
     // Build whitelisted JSON payload from form fields
@@ -1318,6 +1498,9 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
 router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
   const agentId = String((req.params as any).agentId || "");
   const db = getDb();
+  // S1b punkt 5: revoke the token itself, not only the browser cookie — a
+  // copied cookie value / Bearer token is unusable after logout.
+  for (const t of presentedOwnerTokens(req)) revokeOwnerSessionToken(t);
   const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as any;
   if (agent) (agent as any).slug = slugify(String(agent.name || ""));
   // Clear cookie (matching attributes used at set time so browsers honour it)
@@ -1330,6 +1513,86 @@ router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
   const target = agent && agent.slug ? `/produsent/${encodeURIComponent(agent.slug)}` : "/";
   return res.redirect(303, target);
 });
+
+// ─────────────────────────────────────────────────────────────────
+// POST /eier/:agentId/selger — products / opening hours / availability with
+// the SAME login (S1b punkt 5, OWNER_UNIFIED_SESSION_ENABLED, default off)
+// ─────────────────────────────────────────────────────────────────
+// The /selger editor authenticates with the verified claimant's claim token.
+// Instead of a second e-mail, a logged-in verified owner gets a one-time,
+// 15-minute /selger login (the same magic_links row knowledge-service
+// createMagicLink writes, used = 0) and is redirected straight into the
+// existing /selger?magic= auto-login. Only for the verified claimant whose
+// e-mail opened this session — an e-mail-match session never receives a
+// claim token. POST + SameSite=Lax cookie + Origin check: no cross-site
+// trigger.
+function crossSiteRequest(req: Request): boolean {
+  const origin = req.headers.origin;
+  if (!origin || typeof origin !== "string") return false;
+  try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }
+}
+
+router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
+  const agentId = String((req.params as any).agentId || "");
+  if (!ownerUnifiedSessionEnabled()) {
+    return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
+  }
+  try {
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (crossSiteRequest(req)) return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+    // Always the strict predicate here (independent of the gate flag): this
+    // hands out the products editor.
+    if (!isVerifiedOwner(agentId, session)) {
+      return session.agentId === agentId
+        ? res.status(403).send(ownerNotVerifiedPage(agentId))
+        : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    }
+    const db = getDb();
+    const link = db
+      .prepare(`SELECT email FROM magic_links WHERE token = ?`)
+      .get(session.token) as { email?: string } | undefined;
+    const sessionEmail = String(link?.email || "").trim().toLowerCase();
+    const claim = sessionEmail
+      ? (db.prepare(
+          `SELECT claimant_email FROM agent_claims
+           WHERE agent_id = ? AND status = 'verified' AND LOWER(TRIM(claimant_email)) = ?
+           ORDER BY verified_at DESC LIMIT 1`
+        ).get(agentId, sessionEmail) as { claimant_email?: string } | undefined)
+      : undefined;
+    if (!claim || !claim.claimant_email) {
+      // Verified owner, but this session was not opened by the claimant's
+      // own address: the /selger editor needs its own login.
+      return res.redirect(303, `/selger?agent=${encodeURIComponent(agentId)}`);
+    }
+    const token = crypto.randomBytes(32).toString("hex");
+    const now = new Date();
+    db.prepare(
+      `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+       VALUES (?, ?, ?, ?, 0, ?, ?)`
+    ).run(`${OWNER_BRIDGE_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, claim.claimant_email, token, agentId,
+      now.toISOString(), new Date(now.getTime() + OWNER_BRIDGE_VALID_MS).toISOString());
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    return res.redirect(303, `/selger?magic=${encodeURIComponent(token)}`);
+  } catch (err) {
+    console.error("[owner-portal] POST /eier/:agentId/selger error:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal?status=error`);
+  }
+});
+
+/** Portal card (flag on only): products, opening hours, availability via /selger. */
+export function ownerSelgerCardHtml(agentId: string): string {
+  if (!ownerUnifiedSessionEnabled()) return "";
+  const id = encodeURIComponent(agentId);
+  return `<div class="ep-card" id="produkter">
+        <h2>Produkter og åpningstider</h2>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Rediger produkter, åpningstider og tilgjengelighet. Du er allerede logget inn.</p>
+        <form method="post" action="/eier/${id}/selger" style="margin:0;">
+          <button type="submit" class="ep-btn ep-btn-primary">Rediger produkter og åpningstider</button>
+        </form>
+      </div>`;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
@@ -1348,12 +1611,8 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
         message: "Din sesjon er utløpt. Logg inn på nytt.",
       });
     }
-    if (session.agentId !== agentId) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(agentId, session)) {
+      return res.status(403).json(ownerForbiddenJson(agentId, session));
     }
 
     const limitNum = Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200);
@@ -1419,12 +1678,8 @@ router.get("/api/agents/:id/owner-stats", (req: Request, res: Response) => {
       });
     }
 
-    if (session.agentId !== id) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(id, session)) {
+      return res.status(403).json(ownerForbiddenJson(id, session));
     }
 
     const db = getDb();
@@ -1485,12 +1740,8 @@ router.get("/api/agents/:id/orders", (req: Request, res: Response) => {
       });
     }
 
-    if (session.agentId !== id) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(id, session)) {
+      return res.status(403).json(ownerForbiddenJson(id, session));
     }
 
     const db = getDb();
@@ -1575,8 +1826,8 @@ router.get("/api/agents/:id/translations", (req: Request, res: Response) => {
     if (!sessionData.valid) {
       return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
     }
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
     const lang = parseOwnerLang(req.query.lang);
     if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
@@ -1617,8 +1868,8 @@ router.post("/api/agents/:id/translations", (req: Request, res: Response) => {
     if (!sessionData.valid) {
       return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
     }
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
     const lang = parseOwnerLang(req.body?.lang);
     if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
@@ -1664,8 +1915,8 @@ router.delete("/api/agents/:id/translations", (req: Request, res: Response) => {
     if (!sessionData.valid) {
       return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
     }
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
     const lang = parseOwnerLang(req.body?.lang ?? req.query?.lang);
     if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });

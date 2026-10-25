@@ -30,7 +30,7 @@
 import express, { Router, Request, Response } from "express";
 import type { Application } from "express";
 import { getDb } from "../database/init";
-import { verifyOwnerSession } from "./owner-portal";
+import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
 import { shell } from "./seo";
 import {
   assertPaymentsKeyAllowed,
@@ -112,8 +112,8 @@ function requireOwner(req: Request, res: Response, agentId: string): boolean {
     res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
     return false;
   }
-  if (session.agentId !== agentId) {
-    res.status(403).json({ success: false, error: "forbidden" });
+  if (!ownerSessionAllows(agentId, session)) {
+    res.status(403).json({ success: false, error: session.agentId === agentId ? "ownership_not_verified" : "forbidden" });
     return false;
   }
   return true;

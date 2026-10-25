@@ -1288,7 +1288,7 @@ class KnowledgeService {
     return { success: true, token, agentId: claim.agent_id, agentName: claim.agent_name };
   }
 
-  verifyMagicLink(token: string): { success: boolean; agentId?: string; claimToken?: string; claimantName?: string; error?: string } {
+  verifyMagicLink(token: string): { success: boolean; agentId?: string; claimToken?: string; claimantName?: string; email?: string; error?: string } {
     const db = getDb();
 
     const link = db.prepare(
@@ -1310,7 +1310,9 @@ class KnowledgeService {
     db.prepare(`UPDATE magic_links SET used = 1 WHERE token = ?`).run(token);
 
     // Clean up old magic links (older than 1 hour)
-    db.prepare(`DELETE FROM magic_links WHERE expires_at < datetime('now', '-1 hour')`).run();
+    // datetime(expires_at): expires_at is ISO (toISOString) — compare as dates,
+    // not as strings against SQLite's space-separated format (S1b punkt 5).
+    db.prepare(`DELETE FROM magic_links WHERE datetime(expires_at) < datetime('now', '-1 hour')`).run();
 
     // Refresh the claim token — extend expiry by 30 days on each successful login
     const crypto = require("crypto");
@@ -1325,6 +1327,7 @@ class KnowledgeService {
       agentId: link.agent_id,
       claimToken: newToken,
       claimantName: link.claimant_name,
+      email: link.email,
     };
   }
 
