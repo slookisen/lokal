@@ -2120,6 +2120,9 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
   try {
     const db = getDb();
     db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+    // Ownership given by the order activation link (skive 2) is revoked here
+    // too; other claimed_via stamps are left as before.
+    db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
     db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
     db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
     trustScoreService.update(agentId);

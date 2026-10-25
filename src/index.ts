@@ -35,6 +35,7 @@ import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from ".
 import { runProductCatalogSync } from "./services/product-catalog-sync";
 import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
 import adminOrdersRoutes from "./routes/admin-orders";
+import orderActivationRoutes, { orderActivationAdminRouter } from "./routes/order-activation-link";
 import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
@@ -527,6 +528,9 @@ app.use("/", ownerPortalRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
+// dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
+// link landing page (GET/POST /aktiver-bestillinger?t=…).
+app.use("/", orderActivationRoutes);
 
 // (gardssalgClaimRoutes is mounted earlier — before the opplevagent.no
 // host-gate above — see the comment there for why.)
@@ -1180,6 +1184,8 @@ app.use("/admin/products", adminLimiter, adminCatalogRouter);
 app.use("/admin/marketplace", adminLimiter, adminOrderRouter);
 // dev-request 2026-07-13-pilot-ordre-loop: notification opt-in + seller order inbox
 app.use("/admin/orders", adminLimiter, adminOrdersRoutes);
+// skive 2: POST /admin/orders/activation-link — signed one-time link, returned to admin only.
+app.use("/admin/orders", adminLimiter, orderActivationAdminRouter);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.
