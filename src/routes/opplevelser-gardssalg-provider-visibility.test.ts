@@ -188,7 +188,7 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
           body: { hidden: true, orgNrs: ["966000002"], apply: true },
         });
         assertEq(r.body.changed_count, 0, "pv-4a: locked row not changed");
-        assertEq((r.body.skipped_locked as any[])?.[0]?.id, "pv-c", "pv-4b: locked row reported as skipped");
+        assertEq((r.body.skipped_owned as any[])?.[0]?.id, "pv-c", "pv-4b: owned row reported as skipped_owned (needs confirm_owned, G1 pkt 4)");
         assertEq(hiddenFlag("pv-c"), null, "pv-4c: claimed provider stays visible");
       }
 

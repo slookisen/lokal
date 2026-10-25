@@ -155,6 +155,7 @@ import {
   // see listGardssalgProviderMapPoints()'s doc in experience-store.ts).
   listGardssalgProviderMapPoints,
   type GardssalgProviderMapPoint,
+  gardssalgHasOwnerBadge,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
 // dev-request 2026-08-17-kontaktadresse-feilkilde-og-override, Skive C(b) /
@@ -5798,7 +5799,7 @@ function renderGardssalgCatalogPage(opts: { typeSlug?: string | null; page: numb
     if (!bookingPaused) {
       cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:700;color:#fff;background:#0f5a50;border-radius:4px;padding:2px 8px">Booking tilgjengelig</span>`);
     }
-    if (p.claimed_at != null) {
+    if (gardssalgHasOwnerBadge(p)) {
       cardMarkers.push(`<span style="display:inline-block;font-size:.7rem;font-weight:600;color:#0f5a50;background:#fff;border:1px solid #0f5a50;border-radius:4px;padding:2px 7px">&#10003; Eier-bekreftet</span>`);
     }
     const markerRow = cardMarkers.length
@@ -6165,6 +6166,10 @@ router.get(
     // doc comment on it). A revoked/expired session must NOT flip this back to
     // "unclaimed" (AC6) — claimed_at means "has been claimed at some point".
     const isClaimed = provider.claimed_at != null;
+    // Badge basis (dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-
+    // bekreftet-av-eier): taken over (claimed_at) OR confirmed by e-mail. Only
+    // isClaimed (a real owner login) drops the "Ta over profilen" links.
+    const hasBadge = gardssalgHasOwnerBadge(provider);
     // 2026-08-12 (arbeidspunkt 5): computed once, reused by both the
     // reserve-notice AND the reserve-CTA's class/label below so they can
     // never disagree about paused state.
@@ -6504,10 +6509,13 @@ ${switcherOn ? oaSiteNav({ active: "gardssalg", lang, path: noPath, switcher: tr
         <h2>${L.place}</h2>
         ${mapBlock}
       </div>
-      ${isClaimed ? `<div class="aside-card">
+      ${hasBadge ? `<div class="aside-card">
         <h2 style="display:flex;align-items:center;gap:6px"><span style="color:#0f5a50">&#10003;</span> Bekreftet av eier</h2>
-        <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet denne profilen via magisk lenke.</p>
-        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>
+        ${isClaimed
+          ? `<p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet denne profilen via magisk lenke.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal" style="display:block;text-align:center;background:transparent;color:#0f5a50;font-weight:600;padding:8px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.86rem">Logg inn</a>`
+          : `<p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Eieren har bekreftet informasjonen på e-post.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Ta over profilen</a>`}
       </div>` : `<div class="aside-card">
         <h2>Driver du dette stedet?</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
@@ -10006,7 +10014,7 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
   <section class="ft-section" aria-labelledby="ft-merke-h">
     <h2 id="ft-merke-h">«Bekreftet av eier»-merket</h2>
     <span class="ft-badge-sample"><span aria-hidden="true">&#10003;</span> Bekreftet av eier</span>
-    <p>Når du har tatt eierskap, viser profilen din dette merket. Det forteller både besøkende og AI-agenter at informasjonen kommer fra eieren selv — et tillitssignal som skiller profilen din fra rene katalogoppføringer.</p>
+    <p>Når du har tatt eierskap, viser profilen din dette merket. Du får det også når du bekrefter på e-post at informasjonen på profilen stemmer, fra en e-postadresse vi kjenner igjen som din. Merket forteller både besøkende og AI-agenter at informasjonen kommer fra eieren selv — et tillitssignal som skiller profilen din fra rene katalogoppføringer.</p>
   </section>
 
   <section class="ft-section" aria-labelledby="ft-login-h">

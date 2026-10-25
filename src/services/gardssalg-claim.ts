@@ -2328,6 +2328,77 @@ export function updateClaimedProviderProfile(
   return { ok: true, updatedFields, skippedFields, unchangedFields, lockedFields };
 }
 
+// ── Eid profil: tre synlighetstilstander (G1 pkt 4) ──────────────────────
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 4. No new
+// columns: the existing experience_providers.catalog_hidden (the single flag
+// every public surface already filters on, so a paused row is hidden by the
+// SAME predicate as any other hidden row) plus catalog_hidden_reason says
+// which of the states applies:
+//   visible         catalog_hidden NULL/0
+//   owner_pause     catalog_hidden=1, reason 'owner_pause' — hidden, NOT
+//                   blocklisted, the owner can switch it back on
+//   removed         catalog_hidden=1, reason 'remove_request' (or NULL =
+//                   legacy hide) — «fjern»: hidden + blocklisted, the owner
+//                   cannot resume
+//   quality_hidden  catalog_hidden=1, reason 'quality' — admin hide, the
+//                   owner cannot resume
+export const CATALOG_HIDDEN_REASON_OWNER_PAUSE = "owner_pause";
+export type OwnedVisibilityState = "visible" | "owner_pause" | "removed" | "quality_hidden";
+
+export function getOwnedVisibilityState(row: { catalog_hidden: number | null; catalog_hidden_reason: string | null }): OwnedVisibilityState {
+  if (Number(row.catalog_hidden) !== 1) return "visible";
+  if (row.catalog_hidden_reason === CATALOG_HIDDEN_REASON_OWNER_PAUSE) return "owner_pause";
+  if (row.catalog_hidden_reason === "quality") return "quality_hidden";
+  return "removed";
+}
+
+/** Current visibility state of a provider row (null when the row is missing). */
+export function getOwnedVisibilityStateById(providerId: string): OwnedVisibilityState | null {
+  const row = getDb(VERTICAL)
+    .prepare(`SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { catalog_hidden: number | null; catalog_hidden_reason: string | null } | undefined;
+  return row ? getOwnedVisibilityState(row) : null;
+}
+
+export type OwnerVisibilityOutcome =
+  | { ok: true; state: OwnedVisibilityState; changed: boolean }
+  | { ok: false; error: "provider_not_found" | "not_owner" | "removed" | "quality_hidden" };
+
+function setOwnerPauseState(providerId: string, pause: boolean): OwnerVisibilityOutcome {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { id: string; catalog_hidden: number | null; catalog_hidden_reason: string | null } | undefined;
+  if (!row) return { ok: false, error: "provider_not_found" };
+  // Defence in depth: the routes already require an owner session, but the
+  // state change itself also requires a live verified claim for the row.
+  if (!isGardssalgProviderClaimed(providerId)) return { ok: false, error: "not_owner" };
+  const current = getOwnedVisibilityState(row);
+  if (current === "removed") return { ok: false, error: "removed" };
+  if (current === "quality_hidden") return { ok: false, error: "quality_hidden" };
+  const target: OwnedVisibilityState = pause ? "owner_pause" : "visible";
+  if (current === target) return { ok: true, state: current, changed: false };
+  db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(pause ? 1 : null, pause ? CATALOG_HIDDEN_REASON_OWNER_PAUSE : null, providerId);
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (?, ?, 'catalog_hidden', ?, ?, NULL, ?, 'owner', datetime('now'))`,
+    ).run(uuid(), providerId, current, target, pause ? "owner-portal-pause" : "owner-portal-resume");
+  })();
+  return { ok: true, state: target, changed: true };
+}
+
+/** Owner pauses the profile: hidden everywhere, no blocklist, reversible. */
+export function pauseOwnedProvider(providerId: string): OwnerVisibilityOutcome {
+  return setOwnerPauseState(providerId, true);
+}
+
+/** Owner resumes a paused profile. Refused after «fjern» and admin quality-hide. */
+export function resumeOwnedProvider(providerId: string): OwnerVisibilityOutcome {
+  return setOwnerPauseState(providerId, false);
+}
+
 // ── «Gi tilbake» — owner releases a field lock (G1 pkt 2) ─────────────────
 // The owner lets Opplevagent update one of their fields again: removes
 // field_provenance.owner_locks.<field> and writes ONE gardssalg_content_audit

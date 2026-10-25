@@ -74,10 +74,12 @@ export function runGardssalgVisibilityTests(opts: { log?: boolean } = {}): Promi
       // ── Legacy reference: the predicates exactly as they were scattered ──
       const LEGACY_GROUP = "(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')";
       const LEGACY_HIDDEN = "(catalog_hidden IS NULL OR catalog_hidden != 1)";
+      // claim: lokal#1235 lets the owner's own pause (reason 'owner_pause') through.
+      const LEGACY_HIDDEN_CLAIM = "(catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = 'owner_pause')";
       const LEGACY_MERGED = "(merged_into IS NULL OR merged_into = '')";
       const legacySql = (surface: string, includeHidden = false): string =>
         surface === "claim"
-          ? `${LEGACY_HIDDEN} AND ${LEGACY_MERGED}` // getClaimProviderBySlug: no group clause
+          ? `${LEGACY_HIDDEN_CLAIM} AND ${LEGACY_MERGED}` // getClaimProviderBySlug: no group clause
           : includeHidden
             ? `${LEGACY_GROUP} AND ${LEGACY_MERGED}` // searchGardssalgProviders include_hidden
             : `${LEGACY_GROUP} AND ${LEGACY_HIDDEN} AND ${LEGACY_MERGED}`;
@@ -114,6 +116,16 @@ export function runGardssalgVisibilityTests(opts: { log?: boolean } = {}): Promi
       }
       assertEq(idsWhere(gardssalgVisibleSql("rest", { includeHidden: true })), idsWhere(legacySql("rest", true)), "a1 includeHidden sql == legacy");
       assertEq(gardssalgVisibleSql("rest", { includeHidden: true }), legacySql("rest", true), "a1 includeHidden text == legacy");
+
+      // (a1b) owner_pause (lokal#1235): hidden row stays reachable on `claim` only.
+      {
+        const paused = { producer_type: "bryggeri", catalog_hidden: 1, catalog_hidden_reason: "owner_pause", merged_into: null };
+        const removed = { ...paused, catalog_hidden_reason: "remove_request" };
+        for (const s of GARDSSALG_SURFACES) {
+          assertEq(isGardssalgVisibleOnSurface(paused, s), s === "claim", `a1b owner_pause visible only on claim [${s}]`);
+          assertEq(isGardssalgVisibleOnSurface(removed, s), false, `a1b other reason stays hidden [${s}]`);
+        }
+      }
 
       // (a2) row-level function == SQL result, every row x every surface.
       for (const s of GARDSSALG_SURFACES) {

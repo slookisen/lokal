@@ -103,7 +103,7 @@
 
 import type Database from "better-sqlite3";
 import { v4 as uuid } from "uuid";
-import { gardssalgProductsEligible } from "./experience-store";
+import { gardssalgProductsEligible, isGardssalgFieldOwnerLocked } from "./experience-store";
 
 /** Hard cap per call — mirrors MAX_GARDSSALG_PREFLIGHT_BATCH's convention (routes/opplevelser.ts). */
 export const GARDSSALG_PROVIDER_MERGE_MAX_PAIRS = 200;
@@ -133,6 +133,7 @@ interface GardssalgProviderMergeSnapshot {
   id: string;
   content_source: string | null;
   merged_into: string | null;
+  field_provenance: string | null;
   org_nr: string | null;
   epost: string | null;
   telefon: string | null;
@@ -145,7 +146,7 @@ interface GardssalgProviderMergeSnapshot {
 }
 
 const SNAPSHOT_COLUMNS =
-  "id, content_source, merged_into, org_nr, epost, telefon, mobil, hjemmeside, about_text, visit_text, opening_hours_text, products";
+  "id, content_source, merged_into, field_provenance, org_nr, epost, telefon, mobil, hjemmeside, about_text, visit_text, opening_hours_text, products";
 
 function readSnapshot(db: Database.Database, id: string): GardssalgProviderMergeSnapshot | null {
   const row = db.prepare(`SELECT ${SNAPSHOT_COLUMNS} FROM experience_providers WHERE id = ?`).get(id) as
@@ -183,11 +184,14 @@ function computeFillPlan(
 ): GardssalgProviderMergeFillPlan {
   const fillableFields: GardssalgProviderMergeFillField[] = [];
   for (const field of GARDSSALG_PROVIDER_MERGE_FILL_FIELDS) {
+    // Owner lock (G1 skive 5): the kept row's locked fields are never filled.
+    if (isGardssalgFieldOwnerLocked(keep, field)) continue;
     if (isFieldBlank(field, keep[field]) && !isFieldBlank(field, remove[field])) {
       fillableFields.push(field);
     }
   }
-  const orgNrMigrate = isBlank(keep.org_nr) && !isBlank(remove.org_nr);
+  const orgNrMigrate =
+    !isGardssalgFieldOwnerLocked(keep, "org_nr") && isBlank(keep.org_nr) && !isBlank(remove.org_nr);
   return { fillableFields, orgNrMigrate };
 }
 

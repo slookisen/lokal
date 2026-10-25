@@ -31,7 +31,8 @@
  *   mcp      | discover_gardssalg / book_gardssalg / category counts  | yes   | yes    | yes
  *   a2a      | gardssalg_discover / opplevelser_info                  | yes   | yes    | yes
  *   rest     | /api/opplevelser/discover, POST /book                  | yes   | yes    | yes
- *   claim    | «Er dette din bedrift?» entry + portal slug lookup     | NO    | yes    | yes
+ *   claim    | «Er dette din bedrift?» entry + portal slug lookup     | NO    | yes*   | yes
+ *            | (* except catalog_hidden_reason='owner_pause', lokal#1235)
  *
  * The one deliberate difference: `claim` never required the gårdssalg group
  * (getClaimProviderBySlug has always looked up any provider by slug — see
@@ -58,6 +59,10 @@ export interface GardssalgSurfaceRule {
   requireGroup: boolean;
   hideCatalogHidden: boolean;
   hideMerged: boolean;
+  /** catalog_hidden=1 rows with exactly this catalog_hidden_reason stay visible
+   *  on the surface (claim: the owner's own pause, lokal#1235 — the owner must
+   *  still reach the portal to resume). */
+  hiddenExceptReason?: string;
 }
 
 const PUBLIC_RULE = (): GardssalgSurfaceRule => ({ requireGroup: true, hideCatalogHidden: true, hideMerged: true });
@@ -72,7 +77,7 @@ export const GARDSSALG_SURFACE_RULES: Record<GardssalgSurface, GardssalgSurfaceR
   mcp: PUBLIC_RULE(),
   a2a: PUBLIC_RULE(),
   rest: PUBLIC_RULE(),
-  claim: { requireGroup: false, hideCatalogHidden: true, hideMerged: true },
+  claim: { requireGroup: false, hideCatalogHidden: true, hideMerged: true, hiddenExceptReason: "owner_pause" },
 };
 
 export interface GardssalgVisibilityOpts {
@@ -84,6 +89,7 @@ export interface GardssalgVisibilityRow {
   producer_type?: string | null;
   rfb_seed_source?: string | null;
   catalog_hidden?: number | null;
+  catalog_hidden_reason?: string | null;
   merged_into?: string | null;
 }
 
@@ -100,7 +106,11 @@ export function gardssalgVisibleSql(surface: GardssalgSurface, opts: GardssalgVi
   const rule = GARDSSALG_SURFACE_RULES[surface];
   const parts: string[] = [];
   if (rule.requireGroup) parts.push(SQL_GROUP);
-  if (rule.hideCatalogHidden && opts.includeHidden !== true) parts.push(SQL_HIDDEN);
+  if (rule.hideCatalogHidden && opts.includeHidden !== true) {
+    parts.push(rule.hiddenExceptReason
+      ? `(catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = '${rule.hiddenExceptReason}')`
+      : SQL_HIDDEN);
+  }
   if (rule.hideMerged) parts.push(SQL_MERGED);
   // Never empty: a SQL fragment is spliced after WHERE. (Only reachable if a
   // rule is weakened, which production code never does.)
@@ -115,7 +125,8 @@ export function isGardssalgVisibleOnSurface(
 ): boolean {
   const rule = GARDSSALG_SURFACE_RULES[surface];
   if (rule.requireGroup && !(row.producer_type != null || row.rfb_seed_source === "rfb-seed")) return false;
-  if (rule.hideCatalogHidden && opts.includeHidden !== true && row.catalog_hidden != null && Number(row.catalog_hidden) === 1) return false;
+  if (rule.hideCatalogHidden && opts.includeHidden !== true && row.catalog_hidden != null && Number(row.catalog_hidden) === 1
+      && !(rule.hiddenExceptReason && row.catalog_hidden_reason === rule.hiddenExceptReason)) return false;
   if (rule.hideMerged && !(row.merged_into == null || row.merged_into === "")) return false;
   return true;
 }

@@ -9,6 +9,11 @@ import {
   revokeClaimToken,
   updateClaimedProviderProfile,
   releaseClaimedProviderFieldLock,
+  pauseOwnedProvider,
+  resumeOwnedProvider,
+  getOwnedVisibilityStateById,
+  type OwnedVisibilityState,
+  type OwnerVisibilityOutcome,
   getClaimOwnerLocks,
   CLAIM_RELEASABLE_FIELDS,
   maskEmail,
@@ -608,6 +613,9 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     else if (status === "error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å lagre. Prøv igjen.</div>`;
     else if (status === "booking_blocked") alert = `<div class="gc-alert gc-alert-error" role="alert">Booking ble ikke slått på. Ingen endringer er lagret.</div>`;
     else if (status === "released") alert = `<div class="gc-alert gc-alert-ok" role="status">Opplevagent kan nå oppdatere feltet igjen.</div>`;
+    else if (status === "paused") alert = `<div class="gc-alert gc-alert-ok" role="status">Profilen er satt på pause og vises ikke offentlig.</div>`;
+    else if (status === "resumed") alert = `<div class="gc-alert gc-alert-ok" role="status">Profilen er synlig igjen.</div>`;
+    else if (status === "visibility_error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å endre synligheten. Prøv igjen.</div>`;
     else if (status === "release_error") alert = `<div class="gc-alert gc-alert-error" role="alert">Klarte ikke å gi tilbake feltet. Prøv igjen.</div>`;
 
     // content_source='manual' locks the content fields only; the booking
@@ -687,6 +695,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         </form>
         <form id="gc-release-form" method="post" action="${releaseAction}"></form>
       </div>
+      ${visibilityCardHtml(slug, getOwnedVisibilityStateById(provider.id) ?? "visible")}
       <div class="gc-card">
         <h2>Statistikk</h2>
         <div id="gc-stats" class="gc-stats"><div class="gc-stat"><div class="gc-stat-num">…</div><div class="gc-stat-label">Laster</div></div></div>
@@ -845,6 +854,80 @@ router.post(
     return res.redirect(303, `${base}?status=${outcome.ok ? "released" : "release_error"}`);
   },
 );
+
+// ─────────────────────────────────────────────────────────────────
+// Synlighet (G1 pkt 4, dev-request 2026-10-22-opplevagent-mine-valg-gardssalg):
+// tre tilstander — eierens pause (skjult, ingen sperre, eieren kan slå på
+// igjen), «fjern» (skjult + sperret, bare Opplevagent kan oppheve) og
+// kvalitetsskjul (admin). Pause/gjenoppta krever eier-sesjon for raden på
+// hvert kall; selve tilstandsendringen ligger i services/gardssalg-claim.ts.
+// ─────────────────────────────────────────────────────────────────
+function visibilityCardHtml(slug: string, state: OwnedVisibilityState): string {
+  const base = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`;
+  let text: string;
+  let action = "";
+  if (state === "visible") {
+    text = "Profilen din er synlig.";
+    action = `<form method="post" action="${base}/pause"><button type="submit" class="gc-btn gc-btn-secondary">Sett profilen på pause</button></form>` +
+      `<p style="font-size:0.82rem;color:#737373;">Mens profilen er på pause vises den ikke offentlig. Du kan slå den på igjen når som helst.</p>`;
+  } else if (state === "owner_pause") {
+    text = "Profilen din er på pause og vises ikke offentlig.";
+    action = `<form method="post" action="${base}/resume"><button type="submit" class="gc-btn gc-btn-primary">Gjør profilen synlig igjen</button></form>`;
+  } else if (state === "removed") {
+    text = "Profilen er fjernet etter ditt ønske. Den vises ikke offentlig.";
+    action = `<p style="font-size:0.82rem;color:#737373;">Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} hvis du vil ha den tilbake.</p>`;
+  } else {
+    text = "Profilen er skjult av Opplevagent.";
+    action = `<p style="font-size:0.82rem;color:#737373;">Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å høre hvorfor.</p>`;
+  }
+  return `<div class="gc-card" data-visibility-state="${state}"><h2>Synlighet</h2><p>${text}</p>${action}</div>`;
+}
+
+const VISIBILITY_ERROR_MESSAGES: Record<string, string> = {
+  removed: "Profilen er fjernet etter ditt ønske og kan ikke gjøres synlig herfra.",
+  quality_hidden: "Profilen er skjult av Opplevagent og kan ikke gjøres synlig herfra.",
+};
+
+function visibilityJson(res: Response, outcome: OwnerVisibilityOutcome) {
+  if (outcome.ok) return res.json({ success: true, state: outcome.state, changed: outcome.changed });
+  if (outcome.error === "provider_not_found") return res.status(404).json({ success: false, error: outcome.error });
+  if (outcome.error === "not_owner") return res.status(403).json({ success: false, error: "forbidden" });
+  return res.status(409).json({ success: false, error: outcome.error, message: VISIBILITY_ERROR_MESSAGES[outcome.error] });
+}
+
+for (const action of ["pause", "resume"] as const) {
+  const run = (providerId: string) => (action === "pause" ? pauseOwnedProvider(providerId) : resumeOwnedProvider(providerId));
+
+  // JSON: 401 no session / 403 other producer / 409 refused (norsk melding).
+  router.post(
+    `/api/opplevelser/gardssalg-claim/:providerId/${action}`,
+    generalLimiter,
+    (req: Request, res: Response) => {
+    const { providerId } = req.params as any;
+    const session = sessionFromRequest(req);
+    if (!session.valid) return res.status(401).json({ success: false, error: "session_invalid" });
+    if (session.providerId !== providerId) return res.status(403).json({ success: false, error: "forbidden" });
+    return visibilityJson(res, run(providerId));
+    },
+  );
+
+  // No-JS form on the portal.
+  router.post(
+    `/kategori/gardssalg/eier/:providerSlug/${action}`,
+    generalLimiter,
+    (req: Request, res: Response) => {
+    const slug = String((req.params as any).providerSlug || "");
+    const provider = getClaimProviderBySlug(slug);
+    const base = `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/portal`;
+    if (!provider) return res.status(404).send(notFoundPage());
+    const session = sessionFromRequest(req);
+    if (!session.valid || session.providerId !== provider.id) {
+      return res.redirect(303, `/kategori/gardssalg/eier/${encodeURIComponent(slug)}`);
+    }
+    const outcome = run(provider.id);
+    return res.redirect(303, `${base}?status=${outcome.ok ? (action === "pause" ? "paused" : "resumed") : "visibility_error"}`);
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────
 // POST /kategori/gardssalg/eier/:providerSlug/logout — real revoke (see
