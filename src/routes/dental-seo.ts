@@ -1615,7 +1615,9 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
+  // «Med i AI-søk» (S1, 2026-10-25): only a page that answers a search or a
+  // filter counts; /sok with neither is the generic «all clinics» list.
+  if (q || Object.keys(explicit).length > 0) recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
     title: q ? `${q} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
     description: `Søk blant ${total} tannlegeklinikker i Norge. Filtrer på Helfo-avtale, spesialitet og fylke.`,
