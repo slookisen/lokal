@@ -32,11 +32,29 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Longest line that still counts as part of a short line block (signature, address). */
+export const LINE_BLOCK_MAX_CHARS = 40;
+
+function renderParagraph(para: string): string {
+  const lines = para.split("\n");
+  if (lines.length === 1) return escapeHtml(para);
+  const isLineBlock = lines.every((l) => l.trim().length <= LINE_BLOCK_MAX_CHARS);
+  return isLineBlock
+    ? lines.map(escapeHtml).join("<br>")
+    : lines.map((l) => escapeHtml(l.trim())).join(" ");
+}
+
 /**
  * Convert a plain-text body to HTML.
  *
  * - Blank line(s) separate paragraphs -> <p>…</p>
- * - A single newline inside a paragraph is a hard break -> <br>
+ * - A single newline inside a paragraph is a hard break -> <br> ONLY when the
+ *   paragraph is a short line block (every line at most LINE_BLOCK_MAX_CHARS
+ *   characters: a signature, an address). In a paragraph with a longer line
+ *   the newlines are source wrapping, not meaning, and are joined with a
+ *   space, so the recipient's client wraps the sentence to its own width
+ *   (dev-request 2026-10-22-rfb-utsending-v4, endring 2: hard <br> broke
+ *   sentences mid-line on a phone).
  * - &, < and > are escaped
  * - Empty/whitespace-only input returns "" so a caller can treat it as absent
  */
@@ -49,6 +67,6 @@ export function plainTextToEmailHtml(text: string): string {
     .split(/\n[ \t]*\n+/)
     .map((para) => para.replace(/^\n+|\n+$/g, ""))
     .filter((para) => para.trim().length > 0)
-    .map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br>")}</p>`)
+    .map((para) => `<p>${renderParagraph(para)}</p>`)
     .join("\n");
 }
