@@ -26995,6 +26995,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orgnrIdentityJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _deleteBlocklistEmailSurvivorPromise; } catch { /* errors already pushed to failures */ }
   try { await _deleteBlocklistNameSurvivorPromise; } catch { /* errors already pushed to failures */ }
+  try { await _deleteWebsiteDomainKnowledgePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Env hygiene: `process.env.X = prev` with prev undefined stores the STRING
@@ -37946,6 +37947,35 @@ const _deleteBlocklistNameSurvivorPromise: Promise<void> = new Promise<void>(r =
   }
 })();
 
+// dev-request 2026-10-23-admin-delete-website-domain-ikke-alltid-auto: website_domain
+// blocklisting from agent_knowledge.website on admin DELETE. Same DB-swapping
+// convention; runs after the name-survivor block.
+let _deleteWebsiteDomainKnowledgeResolve: () => void = () => {};
+const _deleteWebsiteDomainKnowledgePromise: Promise<void> = new Promise<void>(r => {
+  _deleteWebsiteDomainKnowledgeResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_deleteBlocklistNameSurvivorPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-23: admin DELETE blocklists website_domain from agent_knowledge.website ──");
+  try {
+    const { runMarketplaceAgentDeleteWebsiteDomainKnowledgeTests } = require("../src/routes/marketplace-agent-delete-website-domain-knowledge.test") as
+      typeof import("../src/routes/marketplace-agent-delete-website-domain-knowledge.test");
+    const dwk = await runMarketplaceAgentDeleteWebsiteDomainKnowledgeTests({ log: false });
+    passed += dwk.passed;
+    failed += dwk.failed;
+    for (const f of dwk.failures) failures.push("marketplace-agent-delete-website-domain-knowledge: " + f);
+    console.log(`  marketplace-agent-delete-website-domain-knowledge: ${dwk.passed} passed, ${dwk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-delete-website-domain-knowledge: unexpected error: " + String(err?.message || err));
+  } finally {
+    _deleteWebsiteDomainKnowledgeResolve();
+  }
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
@@ -38005,6 +38035,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
   _rfbContactJudgePromise, _contactCandidateJudgePromise, _orgnrIdentityJudgePromise,
   _deleteBlocklistEmailSurvivorPromise, _deleteBlocklistNameSurvivorPromise,
+  _deleteWebsiteDomainKnowledgePromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);

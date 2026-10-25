@@ -23,7 +23,7 @@ import { addUtmParams } from "../utils/url-utm";
 // normalizeName is aliased: this file already has its own local
 // normalizeName() (fuzzy-match helper for /find-match, further down) with
 // DIFFERENT rules — the blocklist guard below must use the blocklist's own.
-import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName } from "../services/blocklist-service";
+import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName, normalizeDomain as blocklistNormalizeDomain, PROTECTED_DOMAINS as BLOCKLIST_PROTECTED_DOMAINS } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth, getPlacesRatingFieldCallsThisMonth } from "../services/places-usage-tracker";
@@ -3841,6 +3841,17 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     // claim-request email lookup elsewhere in this file.
     const fromRegistry = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId) as any;
 
+    // dev-request 2026-10-23-admin-delete-website-domain-ikke-alltid-auto:
+    // agents.url is often empty while agent_knowledge.website holds the real
+    // site, so the website_domain blocklist row was silently skipped. deleteAll()
+    // below removes the agent_knowledge row, so capture the website HERE.
+    // Defensive: a failed read must never break the delete.
+    let knowledgeWebsite: string | undefined;
+    try {
+      const kRow = db.prepare("SELECT website FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
+      if (kRow && typeof kRow.website === "string" && kRow.website.trim()) knowledgeWebsite = kRow.website.trim();
+    } catch { /* treat as no value */ }
+
     // Delete agent and all related data in one transaction
     // Must clear all FK references before deleting the agent itself.
     // conversations.seller_agent_id lacks ON DELETE CASCADE, so we clean manually.
@@ -3961,15 +3972,37 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
           );
         }
 
+        // Website sources: agents.url (primary, unchanged) else the captured
+        // agent_knowledge.website. A knowledge-sourced domain that is a shared
+        // free-mail/ISP/vipps host (PROTECTED_DOMAINS) is never blocklisted.
+        // OWN_DOMAINS is still enforced inside blocklistAdd().
+        const registryUrl: string | undefined = fromRegistry?.url || undefined;
+        const knowledgeDomain = blocklistNormalizeDomain(knowledgeWebsite);
+        const knowledgeUsable = !!knowledgeDomain && !BLOCKLIST_PROTECTED_DOMAINS.has(knowledgeDomain);
+        const primaryWebsite: string | undefined = registryUrl || (knowledgeUsable ? knowledgeWebsite : undefined);
         blocklistResult = blocklistAdd({
           agentId,
           name: nameHasActiveSurvivor ? undefined : agent.name,
-          website: fromRegistry?.url,
+          website: primaryWebsite,
           email: emailHasActiveSurvivor ? undefined : fromRegistry?.contactEmail,
           reason: req.body?.reason || "auto-blocklisted on admin DELETE",
           sourceEmail: req.body?.sourceEmail,
           agentNameForAudit: agent.name,
         });
+        // Second website_domain row when both sources are set and differ.
+        if (registryUrl && knowledgeUsable && knowledgeDomain !== blocklistNormalizeDomain(registryUrl)) {
+          const extra = blocklistAdd({
+            agentId,
+            website: knowledgeWebsite,
+            reason: req.body?.reason || "auto-blocklisted on admin DELETE",
+            sourceEmail: req.body?.sourceEmail,
+            agentNameForAudit: agent.name,
+          });
+          blocklistResult = {
+            inserted: blocklistResult.inserted + extra.inserted,
+            rows: [...blocklistResult.rows, ...extra.rows.filter((r: any) => !blocklistResult!.rows.some((x: any) => x.id === r.id))],
+          };
+        }
       } catch (blockErr) {
         console.error("[delete] blocklist auto-add failed (non-critical):", blockErr);
       }
