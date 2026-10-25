@@ -64,6 +64,8 @@ import {
   PROPOSAL_QUEUE_REQUEST_TIMEOUT_MS,
   __resetProposalQueueDroppedLogForTesting,
   getProposalQueueStatus,
+  getProposalQueueExtras,
+  type ProposalQueueExtras,
   proposalDateIsRecent,
   runProposalFileQueueTick,
   type ProposalApplyFn,
@@ -172,14 +174,18 @@ export async function tickExperienceDescriptionProposals(
 export function getExperienceDescriptionProposalsStatus(
   expDb: Database.Database,
   env: Record<string, string | undefined> = process.env,
+  opts: { mainDb?: () => Database.Database; now?: Date } = {},
 ): {
   enabled: boolean;
   token_present: boolean;
   files: Array<{ path: string; sha: string; processed_at: string; status: string | null; error: string | null; totals: unknown }>;
-} {
+} & ProposalQueueExtras {
+  const enabled = experienceProposalsJobEnabled(env);
+  const token_present = (env.A2A_READ_PAT ?? "").trim() !== "";
   return {
-    enabled: experienceProposalsJobEnabled(env),
-    token_present: (env.A2A_READ_PAT ?? "").trim() !== "",
+    enabled,
+    token_present,
+    ...getProposalQueueExtras(expDb, { filesTable: "experience_description_proposal_files", failuresTable: "experience_description_proposal_failures", agent: EXPERIENCE_PROPOSALS_AGENT, enabled, tokenPresent: token_present }, opts),
     files: getProposalQueueStatus(expDb, "experience_description_proposal_files"),
   };
 }
