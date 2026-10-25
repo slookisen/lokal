@@ -83,6 +83,16 @@ export function runCrmOutboundHtmlBodyTests(opts: { log?: boolean } = {}): Promi
         assertEq((hardBreak.match(/<br>/g) || []).length, 2,
           "hb3b: …they become <br>, so a three-line signature still renders on three lines rather than one");
 
+        // dev-request 2026-10-22-rfb-utsending-v4 (endring 2): hard-wrapped prose is joined, short line blocks keep <br>.
+        const wrapped = plainTextToEmailHtml("Dette er en lang setning som er brutt midt i\nsetningen av kilden og skal gli sammen igjen.\n\nNeste avsnitt.");
+        assertEq(countP(wrapped), 2, "hb9: two paragraphs stay two <p>");
+        assertTrue(!wrapped.includes("<br>"), "hb9b: a paragraph with a long line gets no <br> — the wrapped source lines are joined");
+        assertTrue(wrapped.includes("brutt midt i setningen av kilden"), "hb9c: …joined with ONE space, not glued or doubled");
+        const sig4 = plainTextToEmailHtml("Vennlig hilsen\nDaniel Fredriksen\nRett fra Bonden\n905 737 34");
+        assertEq(sig4, "<p>Vennlig hilsen<br>Daniel Fredriksen<br>Rett fra Bonden<br>905 737 34</p>", "hb9d: a four-line signature block keeps its line breaks");
+        const oneLong = plainTextToEmailHtml("Én lang linje uten linjeskift som aldri skal få noen br inni seg, uansett hvor lang den er.");
+        assertEq(oneLong, "<p>Én lang linje uten linjeskift som aldri skal få noen br inni seg, uansett hvor lang den er.</p>", "hb9e: a single-line paragraph is unchanged");
+
         const escaped = plainTextToEmailHtml("Bær & Brygg <post@baer.no> sa 5 > 3");
         assertTrue(escaped.includes("&amp;"), "hb4: & is escaped");
         assertTrue(escaped.includes("&lt;post@baer.no&gt;"),

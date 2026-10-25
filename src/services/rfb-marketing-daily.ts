@@ -170,11 +170,13 @@ import {
 import { slugify } from "../utils/slug";
 import { RFB_VERIFIER_SCOPE_SQL } from "../agents/lokal-agent-verifier";
 import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "./recipient-policy";
+import { GARDSSALG_OUTREACH_FROM_NAME, gardssalgOutreachMonthPhrase } from "./email-service";
 import {
   RFB_OUTREACH_TEMPLATE_ID,
   isValidRfbProfileUrl,
   renderRfbOutreachEmail,
-  rfbOutreachSocialProofLine,
+  renderRfbOutreachFollowup,
+  rfbOutreachProducerCountLabel,
   roundProducerCountDown,
   type RfbOutreachRendered,
   type RfbOutreachSubjectVariant,
@@ -1289,6 +1291,63 @@ export type RfbMarketingResultStatus = "sent" | "unknown" | "would_send" | "skip
 
 export type RfbMarketingLedgerStatus = "reserved" | "sent" | "unknown" | "refused" | "failed";
 
+/** First RFB mail to an agent+address, as the CRM/ledger knows it. */
+export interface RfbFirstTouch {
+  /** `<id@host>` Message-ID header of the first mail, or null when unusable. */
+  messageIdHeader: string | null;
+  /** Subject of the first mail (CRM thread subject), or null. */
+  subject: string | null;
+  /** When the first mail went out. */
+  sentAt: Date | null;
+}
+
+/** `id@host` or `<id@host>` -> `<id@host>`; anything else (DRY_RUN, empty) -> null. */
+export function normaliseRfbMessageIdHeader(raw: string | null | undefined): string | null {
+  const v = (raw ?? "").trim();
+  if (/^<[^<>\s@]+@[^<>\s@]+>$/.test(v)) return v;
+  if (/^[^<>\s@]+@[^<>\s@]+$/.test(v)) return `<${v}>`;
+  return null;
+}
+
+function parseSentAt(raw: string | null | undefined): Date | null {
+  const v = (raw ?? "").trim();
+  if (!v) return null;
+  const d = new Date(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v) ? v.replace(" ", "T") + "Z" : v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * The first mail the RFB job sent to this agent+address (rfb_marketing_send_ledger
+ * touch='first', status 'sent'): its Message-ID and subject, for threading the
+ * follow-up. The send time falls back to outreach_sent_log (also covers first
+ * mails from before the job existed, which have no Message-ID: the follow-up is
+ * then a NEW mail with subject A). Read-only; parametrised.
+ */
+export function findRfbFirstTouch(db: Db, agentId: string, email: string): RfbFirstTouch | null {
+  const ledger = db
+    .prepare(
+      `SELECT l.message_id AS message_id, l.reserved_at AS reserved_at, t.subject AS subject
+         FROM rfb_marketing_send_ledger l
+         LEFT JOIN crm_threads t ON t.id = l.thread_id
+        WHERE l.agent_id = ? AND LOWER(l.recipient_email) = LOWER(?) AND l.touch = 'first' AND l.status = 'sent'
+        ORDER BY l.id ASC LIMIT 1`,
+    )
+    .get(agentId, email) as { message_id: string | null; reserved_at: string | null; subject: string | null } | undefined;
+  const log = db
+    .prepare(
+      `SELECT MIN(sent_at) AS first_at FROM outreach_sent_log
+        WHERE agent_id = ? OR LOWER(recipient_email) = LOWER(?)`,
+    )
+    .get(agentId, email) as { first_at: string | null } | undefined;
+  const sentAt = parseSentAt(log?.first_at) ?? parseSentAt(ledger?.reserved_at);
+  if (!ledger && !sentAt) return null;
+  return {
+    messageIdHeader: normaliseRfbMessageIdHeader(ledger?.message_id),
+    subject: ledger?.subject ? ledger.subject : null,
+    sentAt,
+  };
+}
+
 export interface RfbMarketingResultRow {
   agent_id: string;
   name: string;
@@ -1298,6 +1357,10 @@ export interface RfbMarketingResultRow {
   reason?: string;
   subject_variant?: RfbOutreachSubjectVariant;
   subject?: string;
+  /** Template id of this send: rfb-outreach-v4 (first) / rfb-outreach-v4-followup (second). */
+  template?: string;
+  /** Follow-up only: true when sent as a reply in the first mail's thread. */
+  threaded?: boolean;
   profile_url?: string;
   http_status?: number;
   thread_id?: string;
@@ -1896,7 +1959,7 @@ async function runRfbMarketingDailyGuarded(opts: {
 
   // The social-proof sentence is shared by every e-mail in the run.
   const producerCount = countRfbProducersForSocialProof(db);
-  const socialProofLine = rfbOutreachSocialProofLine(producerCount);
+  const socialProofLine = rfbOutreachProducerCountLabel(producerCount);
   const socialProof = {
     producer_count: producerCount,
     producer_count_rounded: roundProducerCountDown(producerCount),
@@ -2014,7 +2077,7 @@ async function runRfbMarketingDailyGuarded(opts: {
   type Examined =
     | { kind: "held"; row: RfbMarketingResultRow; entry: RfbMarketingHeldEntry }
     | { kind: "render_failed"; row: RfbMarketingResultRow }
-    | { kind: "ready"; row: RfbMarketingResultRow; rendered: RfbOutreachRendered };
+    | { kind: "ready"; row: RfbMarketingResultRow; rendered: RfbOutreachRendered; inReplyTo?: string };
 
   // Read-only checks that need no fresh content — run BEFORE the refresh, so
   // only a candidate that is really next in line is crawled. A thrown error
@@ -2045,7 +2108,12 @@ async function runRfbMarketingDailyGuarded(opts: {
   // Content check + render — AFTER the refresh, so both read what the
   // homepage says today. A thrown error is a database problem; render
   // failures come back as a value.
-  const examine = (cand: OutreachCandidate, row: RfbMarketingResultRow, profileUrl: string): Examined => {
+  const examine = (
+    cand: OutreachCandidate,
+    row: RfbMarketingResultRow,
+    profileUrl: string,
+    touch: "first" | "second",
+  ): Examined => {
     const content = checkRfbProfileContent(db, cand.agent_id);
     if (!content.ok) {
       return {
@@ -2055,19 +2123,40 @@ async function runRfbMarketingDailyGuarded(opts: {
       };
     }
     let rendered: RfbOutreachRendered;
+    let inReplyTo: string | undefined;
     try {
-      rendered = renderRfbOutreachEmail({
-        agentId: cand.agent_id,
-        producerName: cand.name,
-        profileUrl,
-        producerCountTotal: producerCount,
-      });
+      if (touch === "second") {
+        // Text I: threads on the first mail (In-Reply-To/References, Re: <first
+        // subject>) when it is known; otherwise a new mail with subject A.
+        const first = findRfbFirstTouch(db, cand.agent_id, String(cand.email ?? "").trim());
+        if (!first || !first.sentAt) {
+          return { kind: "render_failed", row: { ...row, status: "error", reason: "render_failed: followup_without_prior_send" } };
+        }
+        if (first.messageIdHeader && first.subject) inReplyTo = first.messageIdHeader;
+        rendered = renderRfbOutreachFollowup({
+          agentId: cand.agent_id,
+          producerName: cand.name,
+          profileUrl,
+          producerCountTotal: producerCount,
+          monthPhrase: gardssalgOutreachMonthPhrase(first.sentAt, now),
+          firstSubject: inReplyTo ? first.subject : null,
+        });
+        row.threaded = inReplyTo !== undefined;
+      } else {
+        rendered = renderRfbOutreachEmail({
+          agentId: cand.agent_id,
+          producerName: cand.name,
+          profileUrl,
+          producerCountTotal: producerCount,
+        });
+      }
     } catch (err) {
       return { kind: "render_failed", row: { ...row, status: "error", reason: `render_failed: ${errMessage(err)}` } };
     }
     row.subject_variant = rendered.variant;
     row.subject = rendered.subject;
-    return { kind: "ready", row, rendered };
+    row.template = rendered.template;
+    return { kind: "ready", row, rendered, ...(inReplyTo ? { inReplyTo } : {}) };
   };
 
   // A possible contact the ledger knows about but outreach_sent_log may not
@@ -2151,7 +2240,7 @@ async function runRfbMarketingDailyGuarded(opts: {
 
       let exam: Examined;
       try {
-        exam = examine(cand, pre.row, pre.profileUrl);
+        exam = examine(cand, pre.row, pre.profileUrl, touch);
       } catch (err) {
         stopOnDbError(cand, touch, err);
         return;
@@ -2168,7 +2257,7 @@ async function runRfbMarketingDailyGuarded(opts: {
         stoppedReason = "render_failed";
         return;
       }
-      const { row, rendered } = exam;
+      const { row, rendered, inReplyTo } = exam;
 
       if (!opts.apply) {
         results.push({ ...row, status: "would_send", preview_text: rendered.text });
@@ -2236,7 +2325,20 @@ async function runRfbMarketingDailyGuarded(opts: {
             createdBy: "claude",
             vertical: "rfb",
           },
-          { sendRaw: deps.sendRaw },
+          {
+            sendRaw: deps.sendRaw,
+            // dev-request 2026-10-22-rfb-utsending-v4 (endring 4, 6): sent in
+            // Daniel's name (address and Reply-To unchanged); the follow-up
+            // replies in the first mail's thread; the CRM row records the
+            // template and subject arm (AC6).
+            fromDisplayName: GARDSSALG_OUTREACH_FROM_NAME,
+            ...(inReplyTo ? { inReplyToMessageId: inReplyTo } : {}),
+            messageMetadata: {
+              template: rendered.template,
+              subject_arm: rendered.variant,
+              ...(inReplyTo ? { in_reply_to: inReplyTo } : {}),
+            },
+          },
         );
       } catch (err) {
         // executeCompose catches everything itself, so this should be

@@ -810,6 +810,12 @@ class CrmService {
     deliveryStatus?: "sent" | "queued" | "draft_in_gmail" | "failed";
     /** Which platform this thread belongs to. Required — see assertVertical. */
     vertical: CrmVertical;
+    /**
+     * Extra raw_metadata keys for the outbound message (e.g. template and
+     * subject_arm for the RFB v4 outreach). Merged AFTER the defaults'
+     * source/createdBy, which it cannot override.
+     */
+    extraMetadata?: Record<string, unknown>;
   }): { threadId: string; contactId: string; messageId: string } {
     const db = getDb();
     const v = assertVertical(input.vertical, "composeNewThread");
@@ -858,7 +864,7 @@ class CrmService {
       input.bodyHtml ?? null,
       (input.bodyText || "").slice(0, 200),
       recordedSentAt,
-      JSON.stringify({ source: "crm-compose", createdBy: input.createdBy }),
+      JSON.stringify({ ...(input.extraMetadata ?? {}), source: "crm-compose", createdBy: input.createdBy }),
       deliveryStatus,
       v,
     );
