@@ -21006,7 +21006,7 @@ export function computeGardssalgV4Measurement(
   const msgs = rfbDb
     .prepare(
       `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
-        WHERE direction = 'out' AND raw_metadata LIKE '%"template":"personal-v4%' AND sent_at >= ?
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template"%personal-v4%' AND datetime(sent_at) >= datetime(?)
         ORDER BY sent_at ASC, rowid ASC`,
     )
     .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
@@ -21015,13 +21015,22 @@ export function computeGardssalgV4Measurement(
   const claimStmt = expDb.prepare(
     `SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ? AND is_test = 0 AND created_at >= ?`,
   );
-  const replyStmt = rfbDb.prepare(
-    `SELECT body_text FROM crm_messages
-      WHERE direction = 'in' AND (thread_id = ? OR LOWER(from_email) = ?)
-        AND COALESCE(sent_at, received_at) >= ?`,
+  // Two statements instead of one OR: thread_id is indexed (idx_crm_messages_thread);
+  // from_email has no index on crm_messages, so that lookup is a scan, run once per
+  // send (a handful of v4 sends per week). datetime() normalises ISO ('T…Z') and
+  // space-format timestamps so same-day replies compare correctly.
+  const replyByThreadStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND thread_id = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const replyByAddressStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND LOWER(from_email) = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
   );
   const unsubStmt = rfbDb.prepare(
-    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND bounced_at >= ?`,
+    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND datetime(bounced_at) >= datetime(?)`,
   );
 
   const sends: GardssalgV4MeasurementRow[] = [];
@@ -21039,9 +21048,13 @@ export function computeGardssalgV4Measurement(
     let recipient = "";
     try { recipient = String((JSON.parse(m.to_emails || "[]") as unknown[])[0] ?? "").trim().toLowerCase(); } catch { /* none */ }
 
-    const replies = replyStmt.all(gardssalgOutreachThreadId(providerId), recipient, m.sent_at) as Array<{ body_text: string | null }>;
+    const replyRows = [
+      ...(replyByThreadStmt.all(gardssalgOutreachThreadId(providerId), m.sent_at) as Array<{ id: string; body_text: string | null }>),
+      ...(recipient ? (replyByAddressStmt.all(recipient, m.sent_at) as Array<{ id: string; body_text: string | null }>) : []),
+    ];
+    const replies = replyRows.filter((r, i) => replyRows.findIndex((x) => x.id === r.id) === i);
     const fjernReply = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
-    const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, sinceSql) as { n: number }).n > 0);
+    const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, m.sent_at) as { n: number }).n > 0);
 
     sends.push({
       slug,

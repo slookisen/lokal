@@ -125,6 +125,19 @@ export function runOpplevelserGardssalgOutreachV4MeasurementTests(opts: { log?: 
       rfbDb.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email, subject, body_text, sent_at)
         VALUES ('in1', 'opplevagent-outreach-p-alfa', 'in', 'post@alfa.example.no', 'Re: Emne', 'Ja, fjern siden takk', ?)`).run(new Date(sentAt.getTime() + 20 * HOUR).toISOString());
 
+      // Same-calendar-day replies stored in space format with NULL sent_at (received_at only).
+      const sameDay = new Date(Date.now() - 2 * HOUR);
+      const sameDayThen = new Date(sameDay.getTime() - 10 * 60 * 1000);
+      mkProvider("p-eps", "eps");
+      mkOut("p-eps", "post@eps.example.no", "personal-v4", "A", sameDayThen);
+      rfbDb.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email, subject, body_text, sent_at, received_at)
+        VALUES ('in-eps', 'opplevagent-outreach-p-eps', 'in', 'post@eps.example.no', 'Re', 'Takk, ingen interesse', NULL, ?)`).run(sqlTs(sameDay));
+      mkProvider("p-zeta", "zeta");
+      mkOut("p-zeta", "post@zeta.example.no", "personal-v4", "B", sameDayThen);
+      mkThread("other-gmail-thread", "post@zeta.example.no");
+      rfbDb.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email, subject, body_text, sent_at, received_at)
+        VALUES ('in-zeta', 'other-gmail-thread', 'in', 'Post@Zeta.example.no', 'Re', 'Fjern meg', NULL, ?)`).run(sqlTs(sameDay));
+
       // Provider "beta" (v4 follow-up) — no activity at all.
       mkProvider("p-beta", "beta");
       mkOut("p-beta", "post@beta.example.no", "personal-v4-followup", null, sentAt);
@@ -151,7 +164,7 @@ export function runOpplevelserGardssalgOutreachV4MeasurementTests(opts: { log?: 
       const r = await callRoute(router, {}, auth);
       assertEq(r.status, 200, "ok: status 200 with admin key");
       const bySlug = Object.fromEntries((r.body.sends as any[]).map((s) => [s.slug, s]));
-      assertEq(Object.keys(bySlug).sort(), ["alfa", "beta", "delta"], "template: only personal-v4 / -followup rows (older `personal` excluded)");
+      assertEq(Object.keys(bySlug).sort(), ["alfa", "beta", "delta", "eps", "zeta"], "template: only personal-v4 / -followup rows (older `personal` excluded)");
 
       const a = bySlug.alfa;
       assertEq([a.template, a.arm, a.window_complete], ["personal-v4", "A", true], "alfa: template, arm, window_complete");
@@ -166,12 +179,14 @@ export function runOpplevelserGardssalgOutreachV4MeasurementTests(opts: { log?: 
       const d = bySlug.delta;
       assertEq([d.arm, d.claim_link_requested, d.replied, d.unsubscribed], ["B", false, false, true], "delta: test claim ignored, avmeld counts as unsubscribed");
 
-      assertEq(r.body.summary.first, { sends: 2, replied: 1, unsubscribed: 2, claim_link_requested: 1, claimed: 1, with_views_72h: 1 }, "summary: first sends");
+      assertEq([bySlug.eps.replied, bySlug.eps.unsubscribed], [true, false], "same-day reply (NULL sent_at, space-format received_at) counts");
+      assertEq([bySlug.zeta.replied, bySlug.zeta.unsubscribed], [true, true], "same-day fjern reply from the address in another thread counts");
+      assertEq(r.body.summary.first, { sends: 4, replied: 3, unsubscribed: 3, claim_link_requested: 1, claimed: 1, with_views_72h: 1 }, "summary: first sends");
       assertEq(r.body.summary.followup.sends, 1, "summary: follow-up sends");
-      assertEq(r.body.summary.total_sends, 3, "summary: total");
+      assertEq(r.body.summary.total_sends, 5, "summary: total");
 
       const short = await callRoute(router, { days: "5" }, auth);
-      assertEq(short.body.sends.length, 0, "days=5: sends older than the window are left out");
+      assertEq((short.body.sends as any[]).map((x) => x.slug).sort(), ["eps", "zeta"], "days=5: sends older than the window are left out");
 
       const after = {
         views: (rfbDb.prepare(`SELECT COUNT(*) AS c FROM analytics_page_views`).get() as any).c,
