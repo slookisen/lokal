@@ -32,7 +32,7 @@ import type Database from "better-sqlite3";
 import { getDb as getExpDbDefault } from "../database/db-factory";
 import { getDb as getMainDbDefault } from "../database/init";
 import { enrichmentWritePauseBlock } from "./enrichment-write-pause";
-import { recordRun } from "./run-ledger";
+import { listRecentRuns, recordRun } from "./run-ledger";
 
 export const PROPOSAL_QUEUE_REPO = "slookisen/A2A";
 export const PROPOSAL_QUEUE_MAX_AGE_DAYS = 14;
@@ -561,4 +561,98 @@ export function getProposalQueueStatus(
     try { parsed = r.result_json ? JSON.parse(r.result_json) : null; } catch { parsed = null; }
     return { path: r.path, sha: r.sha, processed_at: r.processed_at, status: parsed?.status ?? null, error: parsed?.error ?? null, totals: parsed?.totals ?? null };
   });
+}
+
+export const PROPOSAL_QUEUE_STALL_HOURS = 48;
+const STATUS_ERROR_MAX_CHARS = 200;
+const STATUS_RUN_LOOKBACK_HOURS = 24 * 30;
+
+export type ProposalQueueHealth = "disabled" | "no_token" | "github_error" | "file_errors" | "ok";
+
+export interface ProposalQueueExtras {
+  last_tick: {
+    run_id: string;
+    started_at: string;
+    finished_at: string;
+    status: string;
+    skipped_reason?: string;
+    error?: string;
+  } | null;
+  last_applied_at: string | null;
+  failures: Array<{ path: string; fail_count: number; last_error: string | null; last_failed_at: string | null }>;
+  health: ProposalQueueHealth;
+  stalled: boolean;
+}
+
+const truncStatus = (v: unknown): string => String(v ?? "").slice(0, STATUS_ERROR_MAX_CHARS);
+
+/**
+ * Additive observability for one queue (dev-request 2026-10-25-forslagsko-
+ * status-eksponerer-github-feil). Read-only. Never includes a token: the only
+ * free text surfaced is the ledger's first error message / a failures row's
+ * last_error, both truncated to 200 chars (GithubFetchError messages are
+ * `GET <path> -> HTTP <status>` and carry no credentials).
+ */
+export function getProposalQueueExtras(
+  expDb: Database.Database,
+  cfg: { filesTable: string; failuresTable: string; agent: string; enabled: boolean; tokenPresent: boolean },
+  opts: { mainDb?: () => Database.Database; now?: Date } = {},
+): ProposalQueueExtras {
+  const now = opts.now ?? new Date();
+
+  let last_tick: ProposalQueueExtras["last_tick"] = null;
+  let tickErrorHasNonFilePath = false;
+  try {
+    const db = (opts.mainDb ?? getMainDbDefault)();
+    const rec = listRecentRuns({ agent: cfg.agent, limit: 1, sinceHours: STATUS_RUN_LOOKBACK_HOURS, db })[0];
+    if (rec) {
+      const firstErr = rec.errors?.[0];
+      last_tick = {
+        run_id: rec.run_id,
+        started_at: rec.started_at,
+        finished_at: rec.finished_at,
+        status: rec.status,
+        ...(rec.status === "failed" ? { skipped_reason: "github_error" } : {}),
+        ...(firstErr ? { error: truncStatus(firstErr.message) } : {}),
+      };
+      // A github-level error entry is the one pushed without a path in meta.
+      tickErrorHasNonFilePath = (rec.errors ?? []).some((e) => !(e.meta && (e.meta as any).path));
+    }
+  } catch { last_tick = null; }
+
+  const fileRows = expDb
+    .prepare(`SELECT processed_at, result_json FROM ${cfg.filesTable} ORDER BY processed_at DESC`)
+    .all() as Array<{ processed_at: string; result_json: string | null }>;
+  let last_applied_at: string | null = null;
+  for (const r of fileRows) {
+    let parsed: any = null;
+    try { parsed = r.result_json ? JSON.parse(r.result_json) : null; } catch { parsed = null; }
+    if (parsed?.status === "applied") { last_applied_at = r.processed_at; break; }
+  }
+  const newestProcessedAt = fileRows[0]?.processed_at ?? null;
+
+  const failures = (expDb
+    .prepare(`SELECT path, fail_count, last_error, last_failed_at FROM ${cfg.failuresTable} ORDER BY last_failed_at DESC, path ASC LIMIT 20`)
+    .all() as Array<{ path: string; fail_count: number; last_error: string | null; last_failed_at: string | null }>)
+    .map((f) => ({ path: f.path, fail_count: f.fail_count, last_error: f.last_error == null ? null : truncStatus(f.last_error), last_failed_at: f.last_failed_at }));
+
+  // A github failure is only current when no file was processed after it
+  // (a later successful tick that processed something proves recovery).
+  const tickIsGithubFailure =
+    !!last_tick &&
+    (last_tick.status === "failed" || (last_tick.status === "partial" && tickErrorHasNonFilePath)) &&
+    !(newestProcessedAt && newestProcessedAt > last_tick.finished_at);
+
+  let health: ProposalQueueHealth;
+  if (!cfg.enabled) health = "disabled";
+  else if (!cfg.tokenPresent) health = "no_token";
+  else if (tickIsGithubFailure) health = "github_error";
+  else if (failures.length > 0) health = "file_errors";
+  else health = "ok";
+
+  const appliedMs = last_applied_at ? Date.parse(last_applied_at) : NaN;
+  const old = Number.isNaN(appliedMs) || now.getTime() - appliedMs > PROPOSAL_QUEUE_STALL_HOURS * 3600_000;
+  const stalled = cfg.enabled && cfg.tokenPresent && health !== "ok" && old;
+
+  return { last_tick, last_applied_at, failures, health, stalled };
 }
