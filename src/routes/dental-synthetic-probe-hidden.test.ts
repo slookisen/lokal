@@ -79,6 +79,12 @@ function callRoute(
       setHeader() {
         return this;
       },
+      set() {
+        return this;
+      },
+      vary() {
+        return this;
+      },
       send(payload: any) {
         const text = String(payload ?? "");
         resolve({ status: this.statusCode, body: text, text });

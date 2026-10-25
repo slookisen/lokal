@@ -163,7 +163,10 @@
     "show_on_google_maps": "Visa på Google Maps",
     "disclaimer_public": "Informationen bygger på offentligt tillgängliga källor och kan vara inaktuell. Kontakta säljaren direkt för aktuell information.",
     "disclaimer_owner": "Informationen är verifierad av ägaren.",
-    "season_note_nb": "Anteckning på norska"
+    "season_note_nb": "Anteckning på norska",
+    "rating_on_source": "på {source}",
+    "rating_count_on_source": "{count} recensioner på {source}",
+    "rating_count_on_source_one": "{count} recension på {source}"
   },
   "common": {
     "see_profile": "Visa profil →",

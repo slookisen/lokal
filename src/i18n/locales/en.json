@@ -163,7 +163,10 @@
     "show_on_google_maps": "Show on Google Maps",
     "disclaimer_public": "This information is based on publicly available sources and may be out of date. Contact the seller directly for up-to-date information.",
     "disclaimer_owner": "This information has been verified by the owner.",
-    "season_note_nb": "Note in Norwegian"
+    "season_note_nb": "Note in Norwegian",
+    "rating_on_source": "on {source}",
+    "rating_count_on_source": "{count} reviews on {source}",
+    "rating_count_on_source_one": "{count} review on {source}"
   },
   "common": {
     "see_profile": "View profile →",

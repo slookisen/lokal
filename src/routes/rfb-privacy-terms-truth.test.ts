@@ -166,7 +166,12 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
   );
   assertTrue(
     /pruneBackups\(dir, 10, config\.filenameRe\)/.test(dbBackupRouteSrc),
-    "ground truth: manual on-volume backups keep the 10 newest, with no age limit"
+    "ground truth: manual on-volume backups keep the 10 newest"
+  );
+  assertTrue(
+    /DEFAULT_BACKUP_MAX_AGE_DAYS = 30;/.test(dbBackupRouteSrc) && /createBackupAgeSweepTick/.test(dbBackupRouteSrc) &&
+      /createBackupAgeSweepTick/.test(fs.readFileSync(path.join(__dirname, "..", "index.ts"), "utf8")),
+    "ground truth: manual on-volume backups are deleted after at most 30 days (default age limit, nightly sweep wired in index.ts)"
   );
   assertTrue(
     /SET is_active = 0/.test(deactivateSrc) && !/DELETE FROM agents/.test(deactivateSrc),
@@ -175,8 +180,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
   const translationsSrc = fs.readFileSync(path.join(__dirname, "..", "services", "profile-translations.ts"), "utf8");
   const marketplaceSrc = fs.readFileSync(path.join(__dirname, "marketplace.ts"), "utf8");
   assertTrue(
-    !/DELETE FROM profile_translations/.test(translationsSrc) && !/DELETE FROM profile_translations/.test(marketplaceSrc),
-    "ground truth: deleting a profile leaves its translations in profile_translations (no DELETE anywhere)"
+    /DELETE FROM profile_translations/.test(translationsSrc) && /deleteAgentProfileTranslations\(db, agentId\)/.test(marketplaceSrc),
+    "ground truth: permanently deleting a profile also deletes its profile_translations + audit rows (slettefrist slice B)"
   );
   assertTrue(
     /CREATE TABLE IF NOT EXISTS crm_contacts[\s\S]{0,300}agent_id TEXT REFERENCES agents\(id\) ON DELETE SET NULL/.test(dbInitSrc) &&
@@ -305,8 +310,8 @@ export async function runRfbPrivacyTermsTruthTests(opts: { log?: boolean } = {})
     // Review of lokal#1039: deletion and retention claims match the code.
     assertTrue(
       !/inntil ca\. 5 uker/.test(body) && !/up to about 5 weeks/.test(body) &&
-        (lang === "no" ? /de ti nyeste beholdes, uten fast tidsgrense/.test(body) : /the ten newest are kept, with no fixed time limit/.test(body)),
-      `/personvern (${lang}): backups disclose the manual on-volume copies with no fixed time limit`
+        (lang === "no" ? /de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager/.test(body) : /the ten newest are kept, and never longer than 30 days/.test(body)),
+      `/personvern (${lang}): backups disclose the manual on-volume copies with the 30-day limit`
     );
     assertTrue(
       !/profilen og tilknyttet data/.test(body) && !/your profile and associated data removed/.test(body) &&

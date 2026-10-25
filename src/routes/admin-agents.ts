@@ -110,7 +110,13 @@ import { gateContactCandidates } from "../services/contact-candidate-judge";
 // text is LLM-generated, not raw scraped markup, so this is defense-in-depth
 // rather than the primary gate for this write path).
 import { looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
+// The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
+import { knowledgeService } from "../services/knowledge-service";
+import { emailService } from "../services/email-service";
+import { trustScoreService } from "../services/trust-score-service";
+import { maskEmail } from "../services/gardssalg-claim";
 
+import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
 
 // ─── Slice 2 of dev-request 2026-06-30-brreg-verification-gate ─────────
@@ -787,7 +793,10 @@ router.delete("/:id", (req: Request, res: Response) => {
       return;
     }
 
-    db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+    db.transaction(() => {
+      deleteAgentProfileTranslations(db, String(id));
+      db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+    })();
 
     res.json({
       success: true,
@@ -2185,6 +2194,86 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
   pingIndexNow([`${getAdminBaseUrl(req)}/produsent/${slugify(agent.name)}`], "rettfrabonden.com");
 
   res.json({ success: true, agentId, isVetted: true });
+});
+
+// ─── GET /admin/agents/claim-review-queue + ──────────────────────────────────
+//     POST /admin/agents/claim-review-approve + POST /claim-review-reject ────
+//     (decision 11=A, dev-request 2026-10-17-rfb-claim-verifisering-mot-
+//     kjent-kontakt) ──────────────────────────────────────────────────────────
+//
+// Same shape as the self-registered queue above. A claim lands here (status
+// 'pending_review', knowledge-service.ts requestClaim) when the profile has
+// no farm e-mail, the claimant says the listed one is wrong, or the profile
+// already has an owner. Until approved it has no code, no token, no badge
+// and no write access. GET lists oldest first: profile, the claimant's name
+// and address, the reason and the time — at most CLAIM_REVIEW_QUEUE_LIST_MAX
+// entries (knowledge-service.ts); `count` is how many wait in all.
+router.get("/claim-review-queue", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const { total, entries } = knowledgeService.listClaimReviewQueue();
+  res.json({ count: total, entries });
+});
+
+// Approve: the claim becomes an owner bound to the approved address (body
+// `email`; else the farm address the claimant proved with the right code,
+// proven_email; else the address the claimant gave), the badge follows the
+// quarantine gate (self_registered rows still get none), claimed_at/
+// claimed_via are stamped 'admin_approval' (fill-only), and the owner gets
+// "X er nå ditt" with a one-time login link to that address — the claim token
+// itself is never mailed. An existing owner keeps its claim and token and is
+// not mailed. Body: { claimId, email? }.
+router.post("/claim-review-approve", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body ?? {}) as { claimId?: unknown; email?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  if (!claimId || (body.email !== undefined && typeof body.email !== "string")) {
+    res.status(400).json({ error: "Requires { claimId, email? }" });
+    return;
+  }
+
+  const approved = knowledgeService.approveClaimReview(claimId, body.email as string | undefined);
+  if (!approved.ok) {
+    const status = approved.error === "not_found" ? 404 : approved.error === "not_pending_review" ? 409 : 400;
+    res.status(status).json({ error: approved.error });
+    return;
+  }
+  trustScoreService.update(approved.agentId);
+
+  // Same one-time login link as POST /api/marketplace/auth/magic-link.
+  let loginLinkSent = false;
+  const link = knowledgeService.createMagicLink(approved.email);
+  if (link.success && link.token) {
+    const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
+    const sent = await emailService.sendClaimConfirmation(approved.email, link.agentName || "din agent", `${baseUrl}/api/marketplace/auth/m/${link.token}`, approved.agentId);
+    loginLinkSent = sent.success && sent.messageId !== "DRY_RUN";
+  }
+
+  res.json({
+    success: true,
+    claimId,
+    agentId: approved.agentId,
+    isVerified: approved.isVerified,
+    loginLinkSent,
+    sentTo: maskEmail(approved.email),
+  });
+});
+
+// Reject: the claim gets status 'rejected' (optional `note` kept in notes);
+// the profile is not changed. Body: { claimId, note? }.
+router.post("/claim-review-reject", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const body = (req.body ?? {}) as { claimId?: unknown; note?: unknown };
+  const claimId = typeof body.claimId === "string" ? body.claimId.trim() : "";
+  if (!claimId || (body.note !== undefined && typeof body.note !== "string")) {
+    res.status(400).json({ error: "Requires { claimId, note? }" });
+    return;
+  }
+  const rejected = knowledgeService.rejectClaimReview(claimId, body.note as string | undefined);
+  if (!rejected.ok) {
+    res.status(rejected.error === "not_found" ? 404 : 409).json({ error: rejected.error });
+    return;
+  }
+  res.json({ success: true, claimId, agentId: rejected.agentId, status: "rejected" });
 });
 
 // ─── POST /admin/agents/brreg-contact-backfill ──────────────────────────────

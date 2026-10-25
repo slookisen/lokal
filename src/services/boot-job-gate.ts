@@ -30,7 +30,7 @@ export const URL_BACKFILL_BOOT_DELAY_MS = 5 * 60 * 1000;
 export const TRUST_RECALC_JOB = "boot-trust-recalc";
 /** boot-trust-recalc starts this long after listen (was 2 s). Before url-backfill (5 min). */
 export const TRUST_RECALC_BOOT_DELAY_MS = 4 * 60 * 1000;
-/** boot-trust-recalc is skipped when it completed within this many hours (persisted in boot_job_state). */
+/** boot-trust-recalc is skipped when the same formula version completed within this many hours (persisted in boot_job_state). */
 export const TRUST_RECALC_MIN_INTERVAL_HOURS = 24;
 /** First prewarm of the three off-thread traffic-stats scans (was immediately). */
 export const TRAFFIC_PREWARM_BOOT_DELAY_MS = 60 * 1000;
@@ -38,6 +38,10 @@ export const TRAFFIC_PREWARM_BOOT_DELAY_MS = 60 * 1000;
 // owns its +9 min constant (AGENTS_GEOCODE_BOOT_DELAY_MS). */
 export const DENTAL_GEOCODE_BOOT_DELAY_MS = 3 * 60 * 1000;
 export const EXPERIENCES_GEOCODE_BOOT_DELAY_MS = 6 * 60 * 1000;
+/** First GSC/Bing connectivity check (services/search-console-fetch.ts, A2A 2026-10-16-gsc-bing-ai-rapporter):
+ *  a few small HTTPS calls in the free slot before the 3 min geocode. It waits for runExclusiveBootJob,
+ *  then makes the calls outside the gate (network waits, almost no CPU). */
+export const SEARCH_CONSOLE_BOOT_DELAY_MS = 2 * 60 * 1000;
 
 /** Resolve on the next macrotask so queued I/O and timers can run. */
 export function yieldToEventLoop(): Promise<void> {
@@ -148,13 +152,26 @@ export function shouldSkipRecentRun(opts: { lastCompletedAt: Date | null; now: D
 }
 
 /**
+ * boot_job_state key of boot-trust-recalc for one trust formula version
+ * (TRUST_SCORE_FORMULA_VERSION in trust-score-service.ts). A new version has
+ * no stamp yet, so the first boot after it is deployed recalculates every
+ * score even when the previous version completed within the skip window.
+ */
+export function trustRecalcJobKey(formulaVersion: string): string {
+  return `${TRUST_RECALC_JOB}@${formulaVersion}`;
+}
+
+/**
  * Schedule boot-trust-recalc: runs after `delayMs`, inside the exclusive boot
- * gate, and is skipped when the persisted last completion is younger than
- * `minIntervalHours`. Completion is stamped only after a successful run, so a
- * failed recalculation is retried on the next boot. Returns the timer handle.
+ * gate, and is skipped when the persisted last completion of the same
+ * `formulaVersion` is younger than `minIntervalHours`. Completion is stamped
+ * only after a successful run, so a failed recalculation is retried on the
+ * next boot. Returns the timer handle.
  */
 export function scheduleBootTrustRecalc(deps: {
   getDb: () => any;
+  /** trust-score-service's TRUST_SCORE_FORMULA_VERSION; part of the stamp key (trustRecalcJobKey). */
+  formulaVersion: string;
   recalc: () => Promise<unknown>;
   log?: (msg: string) => void;
   now?: () => Date;
@@ -166,15 +183,16 @@ export function scheduleBootTrustRecalc(deps: {
   const now = deps.now ?? (() => new Date());
   const st = deps.setTimeoutFn ?? setTimeout;
   const minHours = deps.minIntervalHours ?? TRUST_RECALC_MIN_INTERVAL_HOURS;
+  const job = trustRecalcJobKey(deps.formulaVersion);
   return st(() => {
     void runExclusiveBootJob(async () => {
-      const last = getJobLastCompletedAt(deps.getDb(), TRUST_RECALC_JOB);
+      const last = getJobLastCompletedAt(deps.getDb(), job);
       if (shouldSkipRecentRun({ lastCompletedAt: last, now: now(), minIntervalHours: minHours })) {
-        log(`[boot-trust-recalc] skipped — last completed run ${last!.toISOString()} is < ${minHours}h old`);
+        log(`[boot-trust-recalc] skipped — last completed run ${last!.toISOString()} of formula ${deps.formulaVersion} is < ${minHours}h old`);
         return;
       }
       await deps.recalc();
-      markJobCompleted(deps.getDb(), TRUST_RECALC_JOB, now());
+      markJobCompleted(deps.getDb(), job, now());
     }).catch((err: unknown) => {
       console.error("Trust recalc failed (non-fatal):", err);
     });

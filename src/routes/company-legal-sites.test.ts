@@ -16,9 +16,20 @@
  *   AC3       /personvern names the company as data controller; no public
  *             legal page says «Daniel Fredriksen», «uavhengig prosjekt»,
  *             «independent project» or «Finn-tannlege.com er behandlingsansvarlig».
- *   AC4       /vilkar + /terms (rfb, opplevagent) name the company as operator;
- *             «Daniels alminnelige verneting» is gone. finn-tannlege.com still
- *             has no terms page (non-goal).
+ *   AC4       /vilkar + /terms (rfb, opplevagent, finn-tannlege) name the
+ *             company as operator; «Daniels alminnelige verneting» is gone.
+ *   F2-S5     finn-tannlege.com /vilkar (+ /terms, /terms-of-service, /tos;
+ *             A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+ *             Daniel approves the text): one canonical, NO + EN, the health
+ *             wording (no medical advice, 113 / 116 117, «som de er», clinics'
+ *             corrections), the FINN.no sentence, no HPR/NTF claim, the
+ *             footer link, the sitemap and ai-plugin.json legal_info_url;
+ *             the effective date 2026-10-19, the day Daniel approved the
+ *             text (NO, EN and the sitemap <lastmod>).
+ *   S12       the text Daniel approved, pinned whole: SHA-256 of the visible
+ *             text per language (links with their targets, the date masked),
+ *             on /vilkar, its aliases and its English addresses (FUNN
+ *             dental-vilkar-tekst-ikke-laast, code review round 4 of lokal#1178).
  *   T2        site Organization JSON-LD carries parentOrganization.
  *   T3        agent-card provider (+ MCP server-card vendor, agent-skills
  *             provider) is Agentplatform.no AS; the cards keep their brand name.
@@ -33,10 +44,12 @@
  */
 
 import Database from "better-sqlite3";
+import { createHash } from "crypto";
 import express from "express";
 import * as fs from "fs";
 import * as http from "http";
 import * as path from "path";
+import { decode } from "../../tests/helpers/html-injection";
 
 export interface TestSummary {
   passed: number;
@@ -86,6 +99,44 @@ function walk(dir: string, out: string[] = []): string[] {
     else out.push(p);
   }
   return out;
+}
+
+/**
+ * The terms in an HTML fragment as a reader gets them (S12 text lock): one
+ * line per block (heading, paragraph, list item), inline tags dropped,
+ * entities decoded, whitespace collapsed (a line break in the markup is not a
+ * new line). A link is written [text](href), because where it points is part
+ * of the terms. Attributes such as style, and the indentation of the markup,
+ * are not.
+ */
+function termsLines(html: string): string[] {
+  return html
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, "")
+    .replace(/\s+/g, " ")
+    .replace(/<a\s[^>]*?href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href: string, text: string) => `[${text}](${href})`)
+    .replace(/<\/?(?:main|div|p|h[1-6]|ul|ol|li|hr|br)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]*>/g, "")
+    .split("\n")
+    .map((l) => decode(l).replace(/\s+/g, " ").trim())
+    .filter((l) => l !== "");
+}
+
+/**
+ * SHA-256 of the terms per language of the /vilkar <main>: the NO section,
+ * then the EN one from <h1 id="en"> to the end, so every line of <main> is
+ * in one of them. The «Sist oppdatert» / «Last updated» date is masked, and
+ * `masked` counts the masked date lines.
+ */
+function termsFingerprint(mainHtml: string): Record<"nb" | "en", { sha256: string; lines: number; masked: number }> {
+  const one = (section: string) => {
+    let masked = 0;
+    const lines = termsLines(section).map((l) =>
+      l.replace(/^(Sist oppdatert|Last updated): \d{4}-\d{2}-\d{2}$/, (_m, label: string) => (masked++, `${label}: <date>`)),
+    );
+    return { sha256: createHash("sha256").update(lines.join("\n")).digest("hex"), lines: lines.length, masked };
+  };
+  const at = mainHtml.indexOf('<h1 id="en">');
+  return at < 0 ? { nb: one(mainHtml), en: one("") } : { nb: one(mainHtml.slice(0, at)), en: one(mainHtml.slice(at)) };
 }
 
 export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
@@ -205,10 +256,10 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     server = http.createServer(app);
     await new Promise<void>((r) => server!.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as any).port;
-    const get = (p: string, host: string, accept = "text/html"): Promise<Resp> =>
+    const get = (p: string, host: string, accept = "text/html", extra: http.OutgoingHttpHeaders = {}): Promise<Resp> =>
       new Promise((resolve, reject) => {
         http
-          .get({ host: "127.0.0.1", port, path: p, headers: { host, accept } }, (resp) => {
+          .get({ host: "127.0.0.1", port, path: p, headers: { host, accept, ...extra } }, (resp) => {
             const chunks: Buffer[] = [];
             resp.on("data", (c) => chunks.push(c as Buffer));
             resp.on("end", () => resolve({ status: resp.statusCode || 0, headers: resp.headers, body: Buffer.concat(chunks).toString("utf8") }));
@@ -218,8 +269,8 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
 
     // Pages collected for the cross-cutting checks at the end.
     const seen: { label: string; host: string; path: string; body: string }[] = [];
-    const page = async (host: string, p: string, accept?: string): Promise<Resp> => {
-      const r = await get(p, host, accept);
+    const page = async (host: string, p: string, accept?: string, extra?: http.OutgoingHttpHeaders): Promise<Resp> => {
+      const r = await get(p, host, accept, extra);
       seen.push({ label: `${host}${p}`, host, path: p, body: r.body });
       return r;
     };
@@ -255,13 +306,17 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       { host: OA, path: "/for-tilbydere", expect: NB_LINE },
       { host: OA, path: "/finnes-ikke-404", expect: NB_LINE },
       { host: OA, path: "/mcp", expect: NB_LINE, accept: "text/html,application/xhtml+xml" },
-      // finn-tannlege.com — dentalShell footer (Norwegian-only site: /en/ serves
-      // the same Norwegian page, footer included), /mcp browser page
+      // finn-tannlege.com — dentalShell footer (Norwegian site: /en/ serves the
+      // same Norwegian page, footer included; the AI guide is the one English
+      // page, G3-S4), /mcp browser page
       { host: FT, path: "/", expect: NB_LINE },
       { host: FT, path: "/en/", expect: NB_LINE },
+      { host: FT, path: "/en/guide-tannlege-ai", expect: EN_LINE_EN_KONTAKT },
       { host: FT, path: "/om", expect: NB_LINE },
       { host: FT, path: "/personvern", expect: NB_LINE },
       { host: FT, path: "/kontakt", expect: NB_LINE },
+      { host: FT, path: "/vilkar", expect: NB_LINE },
+      { host: FT, path: "/terms", expect: NB_LINE },
       { host: FT, path: "/finnes-ikke-404", expect: NB_LINE },
       { host: FT, path: "/mcp", expect: NB_LINE, accept: "text/html,application/xhtml+xml" },
     ];
@@ -331,7 +386,7 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     }
 
     // ═══════════════ AC4 — /vilkar + /terms name the company as operator ═══════════════
-    for (const host of [RFB, OA]) {
+    for (const host of [RFB, OA, FT]) {
       for (const p of ["/vilkar", "/terms"]) {
         const r = await page(host, p);
         const label = `AC4 ${host}${p}`;
@@ -343,9 +398,171 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
         check(!r.body.includes(STREET), `${label}: no street address on the terms page`);
       }
     }
+
+    // ═══════════════ F2-S5 — finn-tannlege.com /vilkar ═══════════════
+    // A 404 until this slice: new terms were a non-goal of the 2026-10-08
+    // legal-info dev-request, because Daniel approves the text first.
     {
-      const r = await page(FT, "/vilkar");
-      check(r.status === 404, "AC4 finn-tannlege.com/vilkar: still no terms page (non-goal — new terms need Daniel's approval)", String(r.status));
+      const { BRAND_ENTITIES } = require("../config/brand-entities") as typeof import("../config/brand-entities");
+      const FINN_NB = BRAND_ENTITIES.dental.disambiguation?.nb ?? "";
+      const FINN_EN = BRAND_ENTITIES.dental.disambiguation?.en ?? "";
+      const CANONICAL = '<link rel="canonical" href="https://finn-tannlege.com/vilkar">';
+      const vilkar = await page(FT, "/vilkar");
+      for (const p of ["/vilkar", "/terms", "/terms-of-service", "/tos"]) {
+        const r = p === "/vilkar" ? vilkar : await page(FT, p);
+        const label = `F2-S5 ${FT}${p}`;
+        check(r.status === 200 && String(r.headers["content-type"]).startsWith("text/html"), `${label}: 200 text/html`, `${r.status} ${r.headers["content-type"]}`);
+        check(r.body.split(CANONICAL).length === 2, `${label}: one canonical, https://finn-tannlege.com/vilkar`);
+        check(r.body === vilkar.body, `${label}: the same page as /vilkar`);
+      }
+      const main = vilkar.body.match(/<main>[\s\S]*?<\/main>/)?.[0] ?? "";
+      const [nb, en = ""] = main.split('<h1 id="en">');
+      check(nb.includes("<h1>Vilkår for bruk</h1>") && en.startsWith("Terms of Service</h1>"), "F2-S5 /vilkar: Norwegian section, then the English one under #en");
+      check(/<div lang="en">\s*$/.test(nb) && nb.includes('<a href="#en">English</a>'), "F2-S5 /vilkar: the English section is marked lang=\"en\" and linked from the top");
+      check(nb.includes(legal.companyOperatorSentence("nb")) && en.includes(legal.companyOperatorSentence("en")), "F2-S5 /vilkar: each language has its operator line");
+      check(FINN_NB !== "" && nb.includes(FINN_NB) && FINN_EN !== "" && en.includes(FINN_EN), "F2-S5 /vilkar: each language says Finn-tannlege.com is not affiliated with FINN.no (BRAND_ENTITIES.dental)");
+      // The health wording the spec asks for, in both languages.
+      const wording: Array<[string, string, string]> = [
+        ["bestiller ikke timer og tar ikke imot betaling", "do not book appointments and we do not take payments", "no booking, no payment"],
+        ["ikke medisinsk eller odontologisk rådgivning", "not medical or dental advice", "not medical advice"],
+        ["<strong>Ved akutt fare for liv eller helse: ring 113.</strong>", "<strong>If life or health is in immediate danger: call 113.</strong>", "113 first"],
+        ["legevakten på 116 117 eller tannlegevakten der du bor", "(legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live", "legevakt 116 117 or tannlegevakt"],
+        ["betyr ikke at den kan ta imot deg nå", "may still be unable to see you now", "an emergency badge is no promise"],
+        ["<strong>Opplysningene vises «som de er».</strong>", "<strong>The information is provided \"as is\".</strong>", "as is"],
+        ['står på <a href="/proveniens">siden om kilder og metode</a>', 'are explained on <a href="/proveniens">the sources and method page</a>', "sources and method on /proveniens"],
+        ["er ingen vurdering av kvaliteten på behandlingen", "are not an assessment of the quality of treatment", "the order and the badges are no quality assessment"],
+        ["kan klinikken be om at de rettes, eller at oppføringen fjernes", "the clinic can ask for it to be corrected, or for the listing to be removed", "clinics' corrections and removal"],
+        ['href="mailto:kontakt@finn-tannlege.com"', 'href="mailto:kontakt@finn-tannlege.com"', "the site's own e-mail"],
+        ['href="/personvern"', 'href="/personvern"', "the privacy policy"],
+        ["Norsk rett gjelder.", "Norwegian law applies.", "Norwegian law"],
+      ];
+      for (const [no, eng, what] of wording) {
+        check(nb.includes(no), `F2-S5 /vilkar NO: ${what}`, no);
+        check(en.includes(eng), `F2-S5 /vilkar EN: ${what}`, eng);
+      }
+      check(!["kontakt@rettfrabonden.com", "kontakt@opplevagent.no"].some((e) => vilkar.body.includes(e)), "F2-S5 /vilkar: no other site's contact e-mail");
+      // Pkt. 7 and 11 in each language link the site's own address, read from
+      // BRAND_ENTITIES.dental.supportEmail (not a second copy in the handler).
+      const MAILTO = `href="mailto:${BRAND_ENTITIES.dental.supportEmail}"`;
+      for (const [lang, section] of [["NO", nb], ["EN", en]] as const) {
+        const links = section.match(/href="mailto:[^"]*"/g) || [];
+        check(links.length === 2 && links.every((l) => l === MAILTO), `F2-S5 /vilkar ${lang}: both e-mail links are BRAND_ENTITIES.dental.supportEmail`, links.join(", "));
+      }
+      // F2-S1's acceptance grep, on the page content: none of the sources the
+      // code does not use (the footer's «Datakilder» column is F2-S1's).
+      const unused = main.match(/HPR|Helsepersonellregister|helsedirektoratet|ntf\.no|tannlegeforening/gi) || [];
+      check(unused.length === 0, "F2-S5 /vilkar: names no HPR, Helsedirektoratet or NTF source", unused.join(", "));
+      const compliance = ["sertifisert", "certified", "compliance", "compliant"].filter((w) => main.toLowerCase().includes(w));
+      check(compliance.length === 0, "F2-S5 /vilkar: claims no certification or compliance", compliance.join(", "));
+
+      // Footer link on every dental shell page fetched above, once per path
+      // (not the /mcp browser page, which has only the company line).
+      const shellPages = [...new Map(seen.filter((s) => s.host === FT && s.path !== "/mcp").map((s) => [s.path, s])).values()];
+      check(shellPages.length >= 8, `F2-S5 control: dental shell pages fetched (${shellPages.length})`);
+      for (const s of shellPages) {
+        check(footersOf(s.body).includes('<a href="/vilkar">Vilkår</a>'), `F2-S5 ${s.label}: the footer links /vilkar`);
+      }
+
+      const plug = await get("/.well-known/ai-plugin.json", FT, "application/json");
+      let manifest: any = null;
+      try { manifest = JSON.parse(plug.body); } catch { /* reported below */ }
+      check(manifest?.legal_info_url === "https://finn-tannlege.com/vilkar", "F2-S5 ai-plugin.json: legal_info_url is /vilkar (regression: /om)", String(manifest?.legal_info_url));
+      check(manifest?.contact_url === "https://finn-tannlege.com/kontakt", "F2-S5 ai-plugin.json: contact_url unchanged");
+      const sitemap = await get("/sitemap.xml", FT, "application/xml");
+      check(sitemap.body.split("<loc>https://finn-tannlege.com/vilkar</loc>").length === 2, "F2-S5 sitemap.xml: lists /vilkar once");
+      check(!/<loc>https:\/\/finn-tannlege\.com\/(terms|terms-of-service|tos)<\/loc>/.test(sitemap.body), "F2-S5 sitemap.xml: the aliases are not listed");
+      check(BRAND_ENTITIES.dental.termsUrl === "https://finn-tannlege.com/vilkar", "F2-S5 brand-entities: BRAND_ENTITIES.dental.termsUrl is /vilkar", String(BRAND_ENTITIES.dental.termsUrl));
+
+      // The terms take effect the day Daniel approved the text, 2026-10-19
+      // (A2A daniel-responses/2026-10-19-live-svar-steg-a-og-vilkar.md). Pinned
+      // here as a literal: a new date means new terms, and Daniel's approval.
+      const EFFECTIVE = "2026-10-19";
+      const { DENTAL_STATIC_PAGE_DATES } = require("../config/dental-landing") as typeof import("../config/dental-landing");
+      check(DENTAL_STATIC_PAGE_DATES["/vilkar"] === EFFECTIVE, `F2-S5 DENTAL_STATIC_PAGE_DATES["/vilkar"] is ${EFFECTIVE}`, String(DENTAL_STATIC_PAGE_DATES["/vilkar"]));
+      const shownNb = Array.from(nb.matchAll(/Sist oppdatert: ([^<]*)<\/p>/g), (m) => m[1]);
+      const shownEn = Array.from(en.matchAll(/Last updated: ([^<]*)<\/p>/g), (m) => m[1]);
+      check(JSON.stringify(shownNb) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar NO: «Sist oppdatert: ${EFFECTIVE}», once`, shownNb.join(", "));
+      check(JSON.stringify(shownEn) === JSON.stringify([EFFECTIVE]), `F2-S5 /vilkar EN: «Last updated: ${EFFECTIVE}», once`, shownEn.join(", "));
+      const vilkarLastmod = sitemap.body.match(/<loc>https:\/\/finn-tannlege\.com\/vilkar<\/loc><lastmod>([^<]*)<\/lastmod>/)?.[1];
+      check(vilkarLastmod === EFFECTIVE, `F2-S5 sitemap.xml: /vilkar <lastmod> is ${EFFECTIVE}`, String(vilkarLastmod));
+
+      // ── S12: the approved text, pinned whole ──
+      // FUNN dental-vilkar-tekst-ikke-laast (code review round 4 of lokal#1178,
+      // mutation M8): the phrases above pin parts of the terms, so a changed
+      // sentence elsewhere passed every test. This pins the whole text Daniel
+      // approved on 2026-10-19 (quoted word for word under «### Norsk» and
+      // «### English» in lokal#1178) as SHA-256 of termsLines() per language.
+      // A new hash means new terms: Daniel approves the new text before it is
+      // merged, and the same PR gives the terms a new date (EFFECTIVE above and
+      // DENTAL_STATIC_PAGE_DATES["/vilkar"]) and the new hashes here. The
+      // operator line, the FINN.no sentence and the e-mail address come from
+      // shared config (company-info.ts, brand-entities.ts), so a change there
+      // changes these terms too. The date lines are masked, because the date
+      // has its own checks above.
+      const APPROVED_TERMS_SHA256 = {
+        nb: "12ef9055e0f4ece225443598270ac0790d345341c50a345896567f07bf340ae2",
+        en: "10d980ed44ea11fbfdd389c8a0724388c1a5a29235ae9c18ec011cc74de4e3c6",
+      };
+      const approved = termsFingerprint(main);
+      check(approved.nb.masked === 1 && approved.en.masked === 1, "S12 /vilkar: one date line masked per language (control: the mask is not vacuous)", `NO ${approved.nb.masked}, EN ${approved.en.masked}`);
+      for (const lang of ["nb", "en"] as const) {
+        const got = approved[lang];
+        check(
+          got.sha256 === APPROVED_TERMS_SHA256[lang],
+          `S12 /vilkar ${lang === "nb" ? "NO" : "EN"}: the text is the one Daniel approved (SHA-256, date masked)`,
+          `sha256 ${got.sha256} over ${got.lines} lines; new terms need Daniel's approval, a new date and the new hash (see the comment)`,
+        );
+      }
+      // Every address that serves the terms serves that text: the aliases, and
+      // the English ways in (/en/, ?lang=en, Accept-Language).
+      const addresses: Array<[string, http.OutgoingHttpHeaders | undefined]> = [
+        ["/terms", undefined],
+        ["/terms-of-service", undefined],
+        ["/tos", undefined],
+        ["/en/vilkar", undefined],
+        ["/vilkar?lang=en", undefined],
+        ["/vilkar", { "accept-language": "en" }],
+      ];
+      for (const [p, extra] of addresses) {
+        const r = await page(FT, p, undefined, extra);
+        const fp = termsFingerprint(r.body.match(/<main>[\s\S]*?<\/main>/)?.[0] ?? "");
+        check(
+          r.status === 200 && fp.nb.sha256 === APPROVED_TERMS_SHA256.nb && fp.en.sha256 === APPROVED_TERMS_SHA256.en,
+          `S12 ${FT}${p}${extra ? " (Accept-Language: en)" : ""}: serves the approved text`,
+          `${r.status}, NO ${fp.nb.sha256}, EN ${fp.en.sha256}`,
+        );
+      }
+      // Control on this page's own HTML: the hash of a language moves when its
+      // wording or a link target moves, and stays put when only the date, the
+      // style attributes or the line breaks of the markup move. Each edit must
+      // apply exactly once, so no case passes on an edit that missed.
+      const edited = (from: string, to: string): string => (main.split(from).length === 2 ? main.replace(from, to) : "");
+      const moves: Array<[string, string, "nb" | "en", string]> = [
+        ["We may change these terms.", "We can change these terms at any time.", "en", "a changed sentence in EN pkt. 9 (M8, round 4)"],
+        ["Vi kan endre disse vilkårene.", "Vi kan endre disse vilkårene når som helst.", "nb", "a changed sentence in NO pkt. 9"],
+        ['<a href="/personvern">personvernerklæringen</a>', '<a href="/om">personvernerklæringen</a>', "nb", "a link with the same text pointing elsewhere"],
+        ["<li>Respect robots.txt.</li>", "", "en", "a removed list item"],
+      ];
+      for (const [from, to, lang, what] of moves) {
+        const html = edited(from, to);
+        const other = lang === "nb" ? "en" : "nb";
+        const fp = html ? termsFingerprint(html) : null;
+        check(
+          !!fp && fp[lang].sha256 !== approved[lang].sha256 && fp[other].sha256 === approved[other].sha256,
+          `S12 control: ${what} changes the ${lang === "nb" ? "NO" : "EN"} hash, and only that one`,
+          html ? "" : `edit not applied: ${from}`,
+        );
+      }
+      const redated = main.split(EFFECTIVE).join("2027-01-01");
+      const restyled = edited("Ved å bruke tjenesten", "Ved å bruke\n      tjenesten").replace(/ style="[^"]*"/g, "").replace(/\n[ \t]+/g, "\n");
+      const stays: Array<[string, boolean, string]> = [
+        [redated, main.split(EFFECTIVE).length === 3, "a new date alone (the date checks above catch that)"],
+        [restyled, restyled !== "" && !restyled.includes(" style=") && restyled !== main, "style attributes, indentation and a line break inside a paragraph"],
+      ];
+      for (const [html, applied, what] of stays) {
+        const fp = termsFingerprint(html);
+        check(applied && fp.nb.sha256 === approved.nb.sha256 && fp.en.sha256 === approved.en.sha256, `S12 control: ${what} leaves both hashes as they are`);
+      }
     }
 
     // ═══════════════ AC3 / AC4 — forbidden phrases on every page fetched ═══════════════
@@ -377,7 +594,13 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
     }
 
     // ═══════════════ T2 — parentOrganization in each site's Organization JSON-LD ═══════════════
+    // G3-S1 (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker):
+    // the parent carries sameAs with the Brreg page on every site, and the
+    // rettfrabonden.com and opplevagent.no front pages publish
+    // organizationJsonLd(<vertical>) (PNG logo, the domain as alternateName).
+    // finn-tannlege.com does too (G3-S1-dental).
     const parent = legal.parentOrganizationJsonLd();
+    const builtFor: Record<string, "rfb" | "experiences" | "dental" | null> = { [RFB]: "rfb", [OA]: "experiences", [FT]: "dental" };
     for (const [host, p] of [[RFB, "/"], [RFB, "/en"], [OA, "/"], [OA, "/en"], [FT, "/"]] as const) {
       const r = await get(p, host);
       const lds = jsonLdOf(r.body);
@@ -385,9 +608,17 @@ export async function runCompanyLegalSitesTests(opts: { log?: boolean } = {}): P
       check(!!org, `T2 ${host}${p}: the site's Organization JSON-LD has parentOrganization`);
       check(!!org && JSON.stringify(org.parentOrganization) === JSON.stringify(parent), `T2 ${host}${p}: parentOrganization is parentOrganizationJsonLd() (Agentplatform.no AS, url https://agentplatform.no)`, org ? JSON.stringify(org.parentOrganization) : "");
       check(!!org && org.parentOrganization.url === "https://agentplatform.no", `T2 ${host}${p}: parentOrganization.url = https://agentplatform.no`);
+      check(!!org && Array.isArray(org.parentOrganization.sameAs) && org.parentOrganization.sameAs.includes(COMPANY_INFO.brregUrl), `G3-S1 ${host}${p}: parentOrganization.sameAs holds the Brreg URL`, org ? JSON.stringify(org.parentOrganization.sameAs) : "");
       check(!!org && org.name !== NAME && org.name !== COMPANY_INFO.displayName, `T2 ${host}${p}: the site's Organization keeps its brand name (${org?.name})`);
       check(!JSON.stringify(lds).includes(STREET), `T2 ${host}${p}: no street address in JSON-LD`);
       check(lds.some((o) => o && o["@type"] === "WebSite"), `T2 ${host}${p}: WebSite JSON-LD still present`);
+      const vertical = builtFor[host];
+      if (vertical) {
+        const built = legal.organizationJsonLd(vertical);
+        check(!!org && Object.entries(built).every(([k, v]) => JSON.stringify(org[k]) === JSON.stringify(v)), `G3-S1 ${host}${p}: the front-page Organization is organizationJsonLd("${vertical}")`, org ? JSON.stringify(org) : "");
+        check(!!org && typeof org.logo === "string" && /^https:\/\/\S+\.png$/.test(org.logo), `G3-S1 ${host}${p}: Organization.logo is a PNG`, String(org?.logo));
+        check(lds.filter((o) => o && o["@type"] === "Organization").length === 1, `G3-S1 ${host}${p}: exactly one site Organization on the front page`);
+      }
     }
 
     // ═══════════════ T3 — agent-card provider (+ server-card vendor) ═══════════════

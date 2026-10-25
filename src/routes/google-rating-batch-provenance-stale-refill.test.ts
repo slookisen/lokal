@@ -62,8 +62,10 @@
  *      worked before the fix (dedupKey differs by source_type) — kept as
  *      a regression guard so the fix doesn't accidentally change it.
  *   D. AC3 sanity: a genuine first-ever fill (no prior provenance at all)
- *      still reports *Written:true / correct googleRating/reviewCount
- *      fields exactly as before — the fix doesn't alter that shape.
+ *      still reports *Written:true exactly as before — the fix doesn't alter
+ *      that shape. Since S4-A2 of dev-request 2026-10-16-rfb-strukturerte-
+ *      data-tredjepartsrating-og-places-treffvakt the route fetches no Google
+ *      rating, so the row carries none and none is stored.
  *
  * Exercises the real POST /admin/google-rating-batch handler AND the real
  * GET /admin/pool-blocker-explain handler via router.handle directly (no
@@ -181,12 +183,19 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
   const ADMIN_KEY = process.env.ADMIN_KEY || "grb-provenance-stale-refill-test-key";
   const GADDR = "Storgata 1, 1400 Ski";
   const GPHONE = "+4712345678";
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (S3): the batch now writes only a Places candidate whose name
+  // and town match the agent. Every agent here is the same producer in Ski,
+  // and the stubbed Places answer is that producer (displayName +
+  // addressComponents), so each scenario still reaches the PR-82 block.
+  const PRODUCER_NAME = "Kafferøst AS";
+  const PRODUCER_CITY = "Ski";
 
   function insertAgent(id: string, url: string): void {
     db.prepare(
-      `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, created_at)
-       VALUES (?, ?, 't', 't', '', ?, 'producer', ?, 'rfb', '2026-01-01 00:00:00')`,
-    ).run(id, id, url, `key-${id}`);
+      `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, city, created_at)
+       VALUES (?, ?, 't', 't', '', ?, 'producer', ?, 'rfb', ?, '2026-01-01 00:00:00')`,
+    ).run(id, PRODUCER_NAME, url, `key-${id}`, PRODUCER_CITY);
   }
 
   function fieldSourceCount(explainBody: any, field: string): number {
@@ -211,7 +220,18 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
           ok: true,
           status: 200,
           json: async () => ({
-            places: [{ id: "place-1", rating: 4.5, userRatingCount: 10, formattedAddress: GADDR, internationalPhoneNumber: GPHONE }],
+            places: [{
+              id: "place-1",
+              displayName: { text: "Kafferøst" },
+              rating: 4.5,
+              userRatingCount: 10,
+              formattedAddress: GADDR,
+              internationalPhoneNumber: GPHONE,
+              addressComponents: [
+                { longText: "1400", shortText: "1400", types: ["postal_code"] },
+                { longText: "Ski", shortText: "Ski", types: ["postal_town"] },
+              ],
+            }],
           }),
         } as any;
       }
@@ -359,11 +379,14 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
 
     // ════════════════════════════════════════════════════════════════════
     // D. AC3 sanity — a genuine first-ever fill (no prior provenance at
-    // all) still reports *Written:true / correct rating fields exactly as
-    // before; the fix doesn't alter this shape (only the PHONE/ADDRESS
-    // written flags feed the GOOGLE_RATINGS_ADDED envelope counter, per
-    // the enrichment SKILL PHASE 6 — unaffected by this fix, which only
-    // touches what gets merged into field_provenance).
+    // all) still reports *Written:true exactly as before; the fix doesn't
+    // alter this shape (only the PHONE/ADDRESS written flags feed the
+    // GOOGLE_RATINGS_ADDED envelope counter, per the enrichment SKILL
+    // PHASE 6 — unaffected by this fix, which only touches what gets merged
+    // into field_provenance). S4-A2 (dev-request 2026-10-16-rfb-
+    // strukturerte-data-tredjepartsrating-og-places-treffvakt): Google's
+    // rating is no longer fetched, so the row carries none and none is
+    // stored, although the stubbed answer above still has 4.5/10.
     // ════════════════════════════════════════════════════════════════════
     {
       const id = "d-ac3-fresh-fill-sanity";
@@ -376,8 +399,10 @@ export async function runGoogleRatingBatchProvenanceStaleRefillTests(
       const result = batchResult.body?.data?.results?.[0];
       assertEq(result?.addressWritten, true, "Da: fresh fill still reports addressWritten:true");
       assertEq(result?.phoneWritten, true, "Db: fresh fill still reports phoneWritten:true");
-      assertEq(result?.googleRating, 4.5, "Dc: googleRating unaffected by the fix");
-      assertEq(result?.googleReviewCount, 10, "Dd: googleReviewCount unaffected by the fix");
+      assertTrue(!!result && !("googleRating" in result) && !("googleReviewCount" in result),
+        "Dc: no Google rating on the row (S4-A2: the rating is no longer fetched)");
+      const ratingRow = db.prepare(`SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?`).get(id) as any;
+      assertEq([ratingRow.google_rating, ratingRow.google_review_count], [null, null], "Dd: …and none stored");
 
       const after = await explain(id);
       assertEq(fieldSourceCount(after, "address"), 1, "De: a genuine first-ever fill correctly yields exactly 1 source (not fabricated to 2)");

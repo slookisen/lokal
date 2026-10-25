@@ -1824,11 +1824,13 @@ Track these numbers between runs. They are the enrichment pipeline's primary KPI
 
 ### 11.7 Google Places Rating — Server-Side Admin Endpoint
 
+> **Since S4-A2 (2026-10, dev-request `2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt`, Daniel's decision 2=A): no Google rating is fetched or written.** Google's Places terms allow caching `place_id` (and lat/lng for 30 days), not `rating`/`userRatingCount`. The lever is `GOOGLE_RATING_FETCH_ENABLED` (`src/services/places-match.ts`, default `false`). With it off, the single route answers `status: "rating_fetch_disabled"` without a Places call; the batch sends no agent to Google without `include_address_phone`, and with it uses the Pro mask for every agent (address via `formattedAddress`, phone only via the Details fallback the caller caps with `max_details_calls`), so it makes no Enterprise-tier call. Stored ratings stay untouched. A call whose FieldMask asks for a rating field is logged with the endpoint suffix `+rating`; `GET /admin/places-usage` reports them as `rating_field_calls_this_month`. The rest of this section describes the routes with the lever on.
+
 Enrichment agents running in sandboxes don't have the `GOOGLE_PLACES_API_KEY` — and you don't want to pass it around. Instead, expose two thin admin endpoints on the main server that use the server-side key, search Google Places by name + city, persist the rating, and recalculate the trust score:
 
 ```
-POST /admin/google-rating/:id       — single agent
-POST /admin/google-rating-batch     — up to 50 agents
+POST /admin/google-rating/:id       — single agent (no Places call since S4-A2)
+POST /admin/google-rating-batch     — up to 50 agents (no rating since S4-A2)
 POST /admin/knowledge/:agentId/provenance/cleanup  — remove provenance entries by {field, source_type, value_regex?}
 POST /admin/knowledge/provenance/cleanup           — bulk variant (supports dry_run)
 GET  /admin/knowledge/:agentId/field-provenance    — read field_provenance JSON + sources_summary

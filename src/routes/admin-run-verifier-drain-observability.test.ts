@@ -494,6 +494,32 @@ export function runAdminRunVerifierDrainObservabilityTests(
         { success: true, skipped: true, reason: `already ran this hour (locked by ${lockRowBefore?.run_id} at ${lockRowBefore?.started_at})` },
         "skip-lock-9: round 6 (plain force=1, no skip_tick_lock) is still correctly blocked by the still-held lock — unaffected by round 5's bypass",
       );
+
+      // ── Round 7 (dev-request 2026-10-14-verifier-tick-lock-ignorerer-skip-
+      // tick-lock-regresjon): the enrichment SKILL's held-list re-verify posts
+      // a JSON body built by python — {"agentIds":[...],"force":true,
+      // "skip_tick_lock":1} — so skip_tick_lock arrives as the NUMBER 1. It
+      // used to be ignored (only true / "1" matched), so the lock blocked the
+      // call. Numeric 1 must bypass the lock; 0 and 2 must not.
+      const round7 = await callRoute(router, {
+        method: "POST",
+        url: "/",
+        headers: { "x-admin-key": ADMIN_KEY },
+        query: {},
+        body: { force: true, skip_tick_lock: 1, reprocess_review_queue: 0, batchSize: 5, bias_growth: 0 },
+      });
+      assertEq(round7.body.skipped, undefined, "skip-lock-10: body skip_tick_lock=1 (number) bypasses the held lock");
+      assertEq(round7.body.tick_lock_skipped, true, "skip-lock-11: round 7 reports tick_lock_skipped=true");
+      for (const bad of [0, 2]) {
+        const r = await callRoute(router, {
+          method: "POST",
+          url: "/",
+          headers: { "x-admin-key": ADMIN_KEY },
+          query: {},
+          body: { force: true, skip_tick_lock: bad, reprocess_review_queue: 0, batchSize: 5, bias_growth: 0 },
+        });
+        assertEq(r.body.skipped, true, `skip-lock-12: body skip_tick_lock=${bad} does NOT bypass the lock`);
+      }
       // ── by_transition / pending_verify_processed / pending_verify_outcomes
       // — mixed-outcome coverage (2026-09-15, verified-regression
       // observability). Fresh, isolated in-memory DB so the batch selector

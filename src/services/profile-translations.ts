@@ -442,6 +442,22 @@ function setStatus(
   return getTranslationById(db, row.id)!;
 }
 
+/**
+ * Permanent-delete cleanup (dev-request 2026-10-12-slettefrist-korrespondanse-
+ * og-oversettelser, slice B): remove every rfb translation row for an agent
+ * plus its audit trail. Call inside the same transaction as `DELETE FROM agents`.
+ * Audit rows have no entity_id, so they are found through translation_id.
+ */
+export function deleteAgentProfileTranslations(db: Database.Database, agentId: string): void {
+  db.prepare(
+    `DELETE FROM profile_translation_audit
+      WHERE translation_id IN (
+        SELECT id FROM profile_translations WHERE platform = 'rfb' AND entity_id = ?
+      )`,
+  ).run(agentId);
+  db.prepare(`DELETE FROM profile_translations WHERE platform = 'rfb' AND entity_id = ?`).run(agentId);
+}
+
 export type PlanDecision =
   | { action: "new" }
   | { action: "retry"; attempts: number }

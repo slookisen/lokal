@@ -25,7 +25,10 @@
   `opplevagent-square-{green,blue}-512.png` were the WRONG brand for Opplevagent
   (generated from the shared favicon.svg, which serves the RFB sprout on all hosts —
   itself a brand bug, now covered by dev-request
-  `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`); kept only as history.
+  `2026-08-24-pwa-ikoner-alle-vertikaler-og-verifisering`). The green one was
+  byte-identical to the RFB icon and was removed 2026-10-17 (dev-request
+  `2026-10-16-merkevare-entitet-og-connector-pakker`, G3-S2); the blue one, the
+  same sprout recoloured, was removed in G3-S6 (git history keeps both).
   `favicon-192.png` still 404s (re-verified 2026-08-24; same dev-request).
 - **Policy URLs (both 200, re-verified 2026-08-24):**
   - Privacy: `https://opplevagent.no/personvern`

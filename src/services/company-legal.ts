@@ -10,8 +10,12 @@
 //
 // The street address (likely the owner's home) belongs on /kontakt and
 // /personvern only — companyFooterLineHtml() deliberately never prints it.
+//
+// The sites' own Organization JSON-LD is built here too (organizationJsonLd(),
+// G3-S1), from the entries in config/brand-entities.ts.
 
 import { COMPANY_INFO } from "../config/company-info";
+import { BRAND_ENTITIES, brandSameAs, type BrandKey } from "../config/brand-entities";
 
 export type SiteLang = "nb" | "en";
 
@@ -119,7 +123,15 @@ export function companyOperatorSentence(lang: SiteLang): string {
     : `Operatør: ${C.legalName} (org.nr. ${C.orgNrDisplay}), ${C.headOffice}.`;
 }
 
-/** T2: schema.org parentOrganization for each site's Organization / WebSite JSON-LD. No street address. */
+function orgNrIdentifier(): Record<string, unknown> {
+  return { "@type": "PropertyValue", propertyID: "Organisasjonsnummer", value: C.orgNr };
+}
+
+/**
+ * T2: schema.org parentOrganization for each site's Organization / WebSite
+ * JSON-LD. No street address. G3-S1: sameAs ties the company to its Brreg
+ * entry (and to its Wikidata item once BRAND_ENTITIES.company has one).
+ */
 export function parentOrganizationJsonLd(): Record<string, unknown> {
   return {
     "@type": "Organization",
@@ -127,7 +139,37 @@ export function parentOrganizationJsonLd(): Record<string, unknown> {
     name: C.displayName,
     legalName: C.legalName,
     url: C.website,
-    identifier: { "@type": "PropertyValue", propertyID: "Organisasjonsnummer", value: C.orgNr },
+    identifier: orgNrIdentifier(),
+    sameAs: brandSameAs(BRAND_ENTITIES.company),
+  };
+}
+
+/**
+ * G3-S1 (A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker):
+ * the Organization a site's front page publishes, built from
+ * config/brand-entities.ts so name, logo and sameAs read the same wherever
+ * they appear. A brand carries the company as parentOrganization (the same
+ * node on every site); the company itself carries its legal name and org.nr.
+ * instead. A field with no value yet (no PNG logo, no sameAs) is left out,
+ * never sent empty.
+ */
+export function organizationJsonLd(key: BrandKey): Record<string, unknown> {
+  const b = BRAND_ENTITIES[key];
+  const sameAs = brandSameAs(b);
+  return {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "@id": `${b.url}/#organization`,
+    name: b.name,
+    ...(b.alternateName.length > 0 ? { alternateName: [...b.alternateName] } : {}),
+    url: b.url,
+    ...(b.logoPng ? { logo: b.logoPng } : {}),
+    ...(sameAs.length > 0 ? { sameAs } : {}),
+    // G3-S8: only a brand that sets `disambiguation` (dental: not FINN.no) emits it.
+    ...(b.disambiguation?.nb ? { disambiguatingDescription: b.disambiguation.nb } : {}),
+    ...(key === "company"
+      ? { legalName: C.legalName, identifier: orgNrIdentifier() }
+      : { parentOrganization: parentOrganizationJsonLd() }),
   };
 }
 

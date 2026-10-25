@@ -20,14 +20,17 @@ import {
 } from "../services/admin-stats-compute";
 import { computeTrafficReport, deviceForSession, type TrafficReport } from "../services/traffic-report";
 import { computeHistoryView, type HistoryView } from "../services/traffic-history-compute";
+import { computeTrafficAlertsFromDb } from "../services/traffic-alerts";
 import { getTrafficHistoryJobState } from "../services/traffic-history";
 import { getRetentionWindowDays } from "../services/traffic-stats-compute";
 import { computeAiLookupBreakdown, type AiLookupBreakdown } from "../services/search-stats-compute";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, computeAiDeliveryTopProfiles } from "../services/profile-ai-deliveries-compute";
+import { computePartnerReport, partnerReportToCsv, PartnerReportInputError } from "../services/partner-report-service";
 import { adminStatsReaderFor } from "../services/admin-stats";
 import { getEventLoopReport } from "../services/event-loop-monitor";
 import { readPersistedEventLoopEvents, getEventLoopPersistStats, MAX_SINCE_HOURS } from "../services/event-loop-persist";
 import { getOffThreadStatsState } from "../services/offthread-stats";
+import { getInstalledClientIpSnapshot } from "../middleware/client-ip";
 import { MEMORY_LIMIT_MB } from "../services/memory-thresholds";
 import {
   isRollupTableName,
@@ -762,6 +765,8 @@ router.get("/visitors", async (req: Request, res: Response) => {
  * stored week and month plus the current one so far. Raw rows only live 60
  * days; this is what the dashboard shows for longer windows and in its
  * month-by-month table. Definitions: services/traffic-history-compute.ts.
+ * `alerts[]` (additive, [] when none): yesterday vs. the median of the 7 days
+ * before, per group; vertical=all also covers each vertical. services/traffic-alerts.ts.
  */
 router.get("/history", async (req: Request, res: Response) => {
   const raw = String(req.query.days ?? "all");
@@ -774,7 +779,7 @@ router.get("/history", async (req: Request, res: Response) => {
     sendAdminStatsUnavailable(res, (r as { error: string }).error);
     return;
   }
-  res.json({ ...r.value, job: getTrafficHistoryJobState(), rawRetentionDays: rawRetentionDays() });
+  res.json({ ...r.value, job: getTrafficHistoryJobState(), rawRetentionDays: rawRetentionDays(), alerts: computeTrafficAlertsFromDb(getDb(), vertical ?? "all", Date.now()) });
 });
 
 /**
@@ -1428,6 +1433,9 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
  * the slowest requests/jobs, and what is in flight right now.
  * The ring buffers are in-memory (reset on restart); add ?since_hours=N to also get
  * the persisted rows (14-day retention). Source: src/services/event-loop-monitor.ts.
+ * Also `clientIp`: the client-IP choke point's AC2 read-out (mode, breaker,
+ * since-boot counters, the open stats window; hashed keys only), null when
+ * the middleware is not installed. Source: src/middleware/client-ip.ts.
  */
 router.get("/ops/event-loop", (req: Request, res: Response) => {
   // ?since_hours=N (1..336): ALSO return the persisted rows (event_loop_events)
@@ -1454,6 +1462,9 @@ router.get("/ops/event-loop", (req: Request, res: Response) => {
     // Off-thread stats worker (traffic strips + /health counts): broken=true
     // means it fell back to the synchronous path (src/services/offthread-stats.ts).
     offThreadStats: getOffThreadStatsState(),
+    // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1b: what the
+    // shadow gate (AC2) is read from, beside the client_ip_stats log line.
+    clientIp: getInstalledClientIpSnapshot(),
   });
 });
 
@@ -1667,6 +1678,38 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 //   since_hours=24 (default, min 1, max 87600 = 10y)
 //
 // Response shape — see PR-74 spec in repo notes.
+/**
+ * GET /admin/analytics/partner-report — effect report for a group of producers
+ * (dev-request 2026-10-03-partner-effektrapport-per-gaard, slice 1: contact
+ * clicks, is_bot = 0, by kind and utm_source). Query: agentIds=<csv> XOR
+ * umbrella=<id>; days (default 30, max 365) XOR from+to (YYYY-MM-DD);
+ * format=csv. Aggregates only. views_by_class / discoveries_by_channel are
+ * slices 2/3 and not yet built (omitted).
+ */
+router.get("/partner-report", requireAdminAuth, (req: Request, res: Response) => {
+  const format = req.query.format === undefined ? "json" : String(req.query.format);
+  if (format !== "json" && format !== "csv") {
+    res.status(400).json({ error: "Invalid format — must be json or csv" });
+    return;
+  }
+  try {
+    const report = computePartnerReport(getDb(), req.query as any);
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", 'attachment; filename="partner-report.csv"');
+      res.send(partnerReportToCsv(report));
+      return;
+    }
+    res.json(report);
+  } catch (err: any) {
+    if (err instanceof PartnerReportInputError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    res.status(500).json({ error: "Query failed", detail: err.message });
+  }
+});
+
 router.get("/umbrella-traffic", async (req: Request, res: Response) => {
   // Markedsnettverk (umbrellas) are an rfb-only concept. Never expose on a
   // locked secondary host even though the dashboard hides the panel there.

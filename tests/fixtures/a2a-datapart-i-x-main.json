@@ -1,0 +1,939 @@
+{
+  "captured_on": "main 58d5974e, before I-X (dev-request 2026-10-17-integrasjonstest-oppfolging); the two RFB texts «honning i Oslo» captured again for I-AA (A2A reads the text's place as lokal_search does: the fixture's producers have no position, so none is in the Oslo area)",
+  "how": "b1Answers() in src/routes/a2a-datapart-alle-plattformer.test.ts: sha256 of each answer with ids, timestamps and origins masked (stable()), plus a summary",
+  "answers": {
+    "dental {\"message\":\"tannlege i Oslo\"}": {
+      "sha256": "e7dc640ed11a642d738dfa10b24bf0dbf790ece392cc620b85cd0ad64dcb8f22",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "poststed_in": [
+                "OSLO"
+              ]
+            },
+            "legacy": {
+              "fylke": "Oslo"
+            }
+          }
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"text\":\"tannlege i Oslo\"}}": {
+      "sha256": "e7dc640ed11a642d738dfa10b24bf0dbf790ece392cc620b85cd0ad64dcb8f22",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "poststed_in": [
+                "OSLO"
+              ]
+            },
+            "legacy": {
+              "fylke": "Oslo"
+            }
+          }
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"tannlege i Bergen\"}]}}": {
+      "sha256": "0ba7da91c59107a36426791e1a078663d4135330024b2dec0149d0694925a4d9",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "poststed_or_postnummer": {
+                "poststed_in": [
+                  "BERGEN"
+                ],
+                "postnummer_in": [
+                  "5003",
+                  "5004",
+                  "5005",
+                  "5006",
+                  "5007",
+                  "5008",
+                  "5009",
+                  "5010",
+                  "5011",
+                  "5012",
+                  "5013",
+                  "5014",
+                  "5015",
+                  "5016",
+                  "5017",
+                  "5018",
+                  "5019",
+                  "5021",
+                  "5022",
+                  "5031",
+                  "5032",
+                  "5033",
+                  "5034",
+                  "5035",
+                  "5036",
+                  "5037",
+                  "5038",
+                  "5039",
+                  "5041",
+                  "5042",
+                  "5043",
+                  "5045",
+                  "5052",
+                  "5053",
+                  "5054",
+                  "5055",
+                  "5056",
+                  "5057",
+                  "5058",
+                  "5059",
+                  "5063",
+                  "5067",
+                  "5068",
+                  "5072",
+                  "5073",
+                  "5075",
+                  "5081",
+                  "5082",
+                  "5089",
+                  "5093",
+                  "5094",
+                  "5096",
+                  "5097",
+                  "5098",
+                  "5099",
+                  "5101",
+                  "5104",
+                  "5105",
+                  "5106",
+                  "5107",
+                  "5108",
+                  "5109",
+                  "5111",
+                  "5113",
+                  "5114",
+                  "5115",
+                  "5116",
+                  "5117",
+                  "5118",
+                  "5119",
+                  "5121",
+                  "5122",
+                  "5124",
+                  "5130",
+                  "5131",
+                  "5132",
+                  "5134",
+                  "5135",
+                  "5136",
+                  "5137",
+                  "5141",
+                  "5142",
+                  "5143",
+                  "5144",
+                  "5145",
+                  "5146",
+                  "5147",
+                  "5148",
+                  "5151",
+                  "5152",
+                  "5153",
+                  "5154",
+                  "5155",
+                  "5160",
+                  "5161",
+                  "5162",
+                  "5163",
+                  "5164",
+                  "5165",
+                  "5170",
+                  "5171",
+                  "5172",
+                  "5173",
+                  "5174",
+                  "5176",
+                  "5178",
+                  "5179",
+                  "5183",
+                  "5184",
+                  "5221",
+                  "5222",
+                  "5223",
+                  "5224",
+                  "5225",
+                  "5226",
+                  "5227",
+                  "5228",
+                  "5229",
+                  "5230",
+                  "5231",
+                  "5232",
+                  "5235",
+                  "5236",
+                  "5237",
+                  "5238",
+                  "5239",
+                  "5243",
+                  "5244",
+                  "5245",
+                  "5251",
+                  "5252",
+                  "5253",
+                  "5254",
+                  "5257",
+                  "5258",
+                  "5259",
+                  "5260",
+                  "5261",
+                  "5262",
+                  "5263",
+                  "5264",
+                  "5265",
+                  "5267",
+                  "5268"
+                ]
+              }
+            },
+            "legacy": {
+              "q": "bergen"
+            }
+          }
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"statistikk\"}]}}": {
+      "sha256": "9ca103d7c6aa3856ff23e697ddd95112490f59b0c2f3ef4f3155fab0e291a117",
+      "summary": {
+        "skill": "tannlege_stats",
+        "filter": null,
+        "count": null,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"Finn klinikk 912345678\"}]}}": {
+      "sha256": "d3d64cfbd20693b53a2050bad49585d23e99af0f00c07296f26234d159d349bb",
+      "summary": {
+        "skill": "tannlege_info",
+        "filter": null,
+        "count": null,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"Finn klinikk 912345678 eller 923 456 789\"}]}}": {
+      "sha256": "d3d64cfbd20693b53a2050bad49585d23e99af0f00c07296f26234d159d349bb",
+      "summary": {
+        "skill": "tannlege_info",
+        "filter": null,
+        "count": null,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"ring 22334455\"}]}}": {
+      "sha256": "7697c3d7e76aba6e6bd756aab44f8310887f24c3212c5de777ba24ecd37d1399",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "name_terms": [
+                "ring",
+                "22334455"
+              ]
+            },
+            "legacy": {
+              "q": "ring 22334455"
+            }
+          }
+        },
+        "count": 0,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"ring 22 33 44 55\"}]}}": {
+      "sha256": "06c807444a16bd259aa48a8661a946dcd4d1549b06aa10c887e813fbbc2aeadc",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "name_terms": [
+                "ring",
+                "22",
+                "33",
+                "44",
+                "55"
+              ]
+            },
+            "legacy": {
+              "q": "ring"
+            }
+          }
+        },
+        "count": 0,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"tannlege 0150 Oslo\"}]}}": {
+      "sha256": "a033b2b07eb68ea80a4e4c3718bc5f2beb8deb3c8e6ad7658ec6530b736cf349",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "poststed_in": [
+                "OSLO"
+              ],
+              "name_terms": [
+                "0150"
+              ]
+            },
+            "legacy": {
+              "fylke": "Oslo"
+            }
+          }
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"data\":{\"fylke\":\"Oslo\"}}}": {
+      "sha256": "a4ab4f5ec565b1189aa188a189b1d3a5860f888188b24a6d8bdc62f2ba0e143c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "fylke": "Oslo"
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"data\":{\"helfo_agreement\":\"true\"}}}": {
+      "sha256": "0a3d29f180409a1f9bfff8da3889d22f9c48afaa7c433ac7f7908481ee94e58f",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "helfo_agreement": "true"
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"data\":{}}}": {
+      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {},
+        "count": 4,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"data\":null}}": {
+      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {},
+        "count": 4,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"role\":\"user\"}}": {
+      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {},
+        "count": 4,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"parts\":[]}}": {
+      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {},
+        "count": 4,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"tannlege i Bergen\"},{\"kind\":\"data\",\"data\":{\"fylke\":\"Oslo\"}}]}}": {
+      "sha256": "0ba7da91c59107a36426791e1a078663d4135330024b2dec0149d0694925a4d9",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "natural": {
+            "parsed": {
+              "poststed_or_postnummer": {
+                "poststed_in": [
+                  "BERGEN"
+                ],
+                "postnummer_in": [
+                  "5003",
+                  "5004",
+                  "5005",
+                  "5006",
+                  "5007",
+                  "5008",
+                  "5009",
+                  "5010",
+                  "5011",
+                  "5012",
+                  "5013",
+                  "5014",
+                  "5015",
+                  "5016",
+                  "5017",
+                  "5018",
+                  "5019",
+                  "5021",
+                  "5022",
+                  "5031",
+                  "5032",
+                  "5033",
+                  "5034",
+                  "5035",
+                  "5036",
+                  "5037",
+                  "5038",
+                  "5039",
+                  "5041",
+                  "5042",
+                  "5043",
+                  "5045",
+                  "5052",
+                  "5053",
+                  "5054",
+                  "5055",
+                  "5056",
+                  "5057",
+                  "5058",
+                  "5059",
+                  "5063",
+                  "5067",
+                  "5068",
+                  "5072",
+                  "5073",
+                  "5075",
+                  "5081",
+                  "5082",
+                  "5089",
+                  "5093",
+                  "5094",
+                  "5096",
+                  "5097",
+                  "5098",
+                  "5099",
+                  "5101",
+                  "5104",
+                  "5105",
+                  "5106",
+                  "5107",
+                  "5108",
+                  "5109",
+                  "5111",
+                  "5113",
+                  "5114",
+                  "5115",
+                  "5116",
+                  "5117",
+                  "5118",
+                  "5119",
+                  "5121",
+                  "5122",
+                  "5124",
+                  "5130",
+                  "5131",
+                  "5132",
+                  "5134",
+                  "5135",
+                  "5136",
+                  "5137",
+                  "5141",
+                  "5142",
+                  "5143",
+                  "5144",
+                  "5145",
+                  "5146",
+                  "5147",
+                  "5148",
+                  "5151",
+                  "5152",
+                  "5153",
+                  "5154",
+                  "5155",
+                  "5160",
+                  "5161",
+                  "5162",
+                  "5163",
+                  "5164",
+                  "5165",
+                  "5170",
+                  "5171",
+                  "5172",
+                  "5173",
+                  "5174",
+                  "5176",
+                  "5178",
+                  "5179",
+                  "5183",
+                  "5184",
+                  "5221",
+                  "5222",
+                  "5223",
+                  "5224",
+                  "5225",
+                  "5226",
+                  "5227",
+                  "5228",
+                  "5229",
+                  "5230",
+                  "5231",
+                  "5232",
+                  "5235",
+                  "5236",
+                  "5237",
+                  "5238",
+                  "5239",
+                  "5243",
+                  "5244",
+                  "5245",
+                  "5251",
+                  "5252",
+                  "5253",
+                  "5254",
+                  "5257",
+                  "5258",
+                  "5259",
+                  "5260",
+                  "5261",
+                  "5262",
+                  "5263",
+                  "5264",
+                  "5265",
+                  "5267",
+                  "5268"
+                ]
+              }
+            },
+            "legacy": {
+              "q": "bergen"
+            }
+          }
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"data\":{\"fylke\":\"Vestland\"},\"parts\":[{\"kind\":\"data\",\"data\":{\"fylke\":\"Oslo\"}}]}}": {
+      "sha256": "aa60887b61adfdf94bce45d43a25e25c952f892a4f16479f63ed7b30081f7d1e",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {
+          "fylke": "Vestland"
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"data\",\"data\":\"Oslo\"}]}}": {
+      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {},
+        "count": 4,
+        "countable": false
+      }
+    },
+    "dental {\"message\":{\"parts\":[{\"kind\":\"data\",\"data\":[\"Oslo\"]}]}}": {
+      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "summary": {
+        "skill": "tannlege_search",
+        "filter": {},
+        "count": 4,
+        "countable": false
+      }
+    },
+    "dental {}": {
+      "sha256": "c19015633a46f8509c31331bd73f44037611f0c9c33e85ea9e7960e8816cdb00",
+      "summary": {
+        "error": -32602
+      }
+    },
+    "experiences {\"message\":\"hva kan vi finne på i Tromsø om vinteren?\"}": {
+      "sha256": "cc630b99e0b8b1f4dfbf12fbe0d76caca57c6fc9f06ce3370a9e710e6ba1e404",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "kommune": "Tromsø",
+          "season": "winter"
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"text\":\"nordlys i Tromsø\"}}": {
+      "sha256": "819bbf5ca002b982ee88b458ff72c9cb26381b08d68f0cae721f067cb976bb4c",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "kommune": "Tromsø"
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"kategorier\"}]}}": {
+      "sha256": "86743bb7c1d7c51481a4a0c8e63ef60e4d4915fe00ffe7c2ef663b9a602cdd8d",
+      "summary": {
+        "skill": "opplevelser_categories",
+        "filter": null,
+        "count": null,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"sidersmaking i Bergen\"}]}}": {
+      "sha256": "1ba50712527fbf76bf7aba3478829d7384731d8f83c693389fe60d89af60a21b",
+      "summary": {
+        "skill": "gardssalg_discover",
+        "filter": {
+          "kommune": "Bergen",
+          "producer_type": "cideri"
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"text\":\"sidersmaking i Bergen\",\"data\":{\"lat\":60.39,\"lng\":5.32}}}": {
+      "sha256": "cc29a3f818e0f9ad5d3913e640c0ff280c96da97e5309b4126d44cd07dfde6ba",
+      "summary": {
+        "skill": "gardssalg_discover",
+        "filter": {
+          "kommune": "Bergen",
+          "producer_type": "cideri",
+          "lat": 60.39,
+          "lng": 5.32
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"zzzqqq ingen treff\"}]}}": {
+      "sha256": "5a80bdd8649c6c31ce60e8391a600eee518c74928315df4c91cd17e43b78bd66",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {},
+        "count": 0,
+        "countable": false
+      }
+    },
+    "experiences {\"message\":{\"data\":{\"kommune\":\"Tromsø\"}}}": {
+      "sha256": "6cd8f1266a5fcd4515314355d535a365636928326fc8a4804e6135e28d2b502e",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "kommune": "Tromsø"
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"data\":{\"fylke\":\"Vestland\"}}}": {
+      "sha256": "ad10e06dac4cebfe1489db4525ac8686959993b8565699f11cd4863ab1db654b",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "fylke": "Vestland"
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"data\":{\"lat\":69.65,\"lng\":18.95,\"sort\":\"distance\"}}}": {
+      "sha256": "9021659446a04dc306f50ed5786a74192ef73385a3bbf6e51fc59b11ca84126b",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "lat": 69.65,
+          "lng": 18.95,
+          "sort": "distance"
+        },
+        "count": 0,
+        "countable": false
+      }
+    },
+    "experiences {\"message\":{\"data\":{}}}": {
+      "sha256": "b1ffaaf469ec6d9aec157c0ab9ff5d57e273be0571b180e8e929174dd7f25eb6",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {},
+        "count": 3,
+        "countable": false
+      }
+    },
+    "experiences {\"message\":{\"data\":null}}": {
+      "sha256": "b1ffaaf469ec6d9aec157c0ab9ff5d57e273be0571b180e8e929174dd7f25eb6",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {},
+        "count": 3,
+        "countable": false
+      }
+    },
+    "experiences {\"message\":{\"role\":\"user\"}}": {
+      "sha256": "b1ffaaf469ec6d9aec157c0ab9ff5d57e273be0571b180e8e929174dd7f25eb6",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {},
+        "count": 3,
+        "countable": false
+      }
+    },
+    "experiences {\"message\":{\"parts\":[]}}": {
+      "sha256": "b1ffaaf469ec6d9aec157c0ab9ff5d57e273be0571b180e8e929174dd7f25eb6",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {},
+        "count": 3,
+        "countable": false
+      }
+    },
+    "experiences {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"nordlys i Tromsø\"},{\"kind\":\"data\",\"data\":{\"kommune\":\"Bergen\"}}]}}": {
+      "sha256": "819bbf5ca002b982ee88b458ff72c9cb26381b08d68f0cae721f067cb976bb4c",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "kommune": "Tromsø"
+        },
+        "count": 2,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"data\":{\"kommune\":\"Bergen\"},\"parts\":[{\"kind\":\"data\",\"data\":{\"kommune\":\"Tromsø\"}}]}}": {
+      "sha256": "27038adaf999717ada4c94e9be1d46e5691e54bc07fc4dfbc935a0fe1060eef0",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {
+          "kommune": "Bergen"
+        },
+        "count": 1,
+        "countable": true
+      }
+    },
+    "experiences {\"message\":{\"parts\":[{\"kind\":\"data\",\"data\":\"Tromsø\"}]}}": {
+      "sha256": "b1ffaaf469ec6d9aec157c0ab9ff5d57e273be0571b180e8e929174dd7f25eb6",
+      "summary": {
+        "skill": "opplevelser_discover",
+        "filter": {},
+        "count": 3,
+        "countable": false
+      }
+    },
+    "rfb {\"message\":\"honning i Oslo\"}": {
+      "sha256": "d2074ba9c2d8fd2ee68317f0627259292c9956d00b24efcd40e74b3094f0127f",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {
+          "categories": [
+            "honey"
+          ],
+          "_productTerms": [
+            "honning"
+          ],
+          "role": "producer",
+          "location": {
+            "lat": 59.9139,
+            "lng": 10.7522
+          },
+          "maxDistanceKm": 25
+        },
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"text\":\"honning i Oslo\"}}": {
+      "sha256": "d2074ba9c2d8fd2ee68317f0627259292c9956d00b24efcd40e74b3094f0127f",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {
+          "categories": [
+            "honey"
+          ],
+          "_productTerms": [
+            "honning"
+          ],
+          "role": "producer",
+          "location": {
+            "lat": 59.9139,
+            "lng": 10.7522
+          },
+          "maxDistanceKm": 25
+        },
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"melk\"}]}}": {
+      "sha256": "e52387ecceea8d405468a4d9f16fc1c60d205d07fc661703aa72de9540f86f9a",
+      "summary": {
+        "count": 1,
+        "parsedQuery": {
+          "categories": [
+            "dairy"
+          ],
+          "_productTerms": [
+            "melk"
+          ],
+          "role": "producer"
+        },
+        "countable": true
+      }
+    },
+    "rfb {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"hello there\"}]}}": {
+      "sha256": "e7358386ac0770f522daa19ba8dd9e5bf2bce4c453a5ddfbcda2c6cc153f6310",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {
+          "role": "producer"
+        },
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"data\":{\"categories\":[\"honey\"]}}}": {
+      "sha256": "4ba9a54c42ddfa276d70bbf17d1a797de43c2458965f20a2d129f027b5b1dc27",
+      "summary": {
+        "count": 2,
+        "parsedQuery": {
+          "categories": [
+            "honey"
+          ]
+        },
+        "countable": true
+      }
+    },
+    "rfb {\"message\":{\"data\":{\"categories\":[\"dairy\"],\"limit\":1}}}": {
+      "sha256": "1c5f3316aebd2c7e20b0c08afe3416ff0e706b242444d35ee1d17fee311e89ae",
+      "summary": {
+        "count": 1,
+        "parsedQuery": {
+          "categories": [
+            "dairy"
+          ],
+          "limit": 1
+        },
+        "countable": true
+      }
+    },
+    "rfb {\"message\":{\"data\":{}}}": {
+      "sha256": "a8640841d0647fcf9d38d01232b44501ee82d5a0c335c77551f17926d400401e",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {},
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"data\":null}}": {
+      "sha256": "d5b7d8625815edcd34c33c186f8d7f803623ed4839a6fad3e0237b582720fd1a",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {
+          "message": {
+            "data": null
+          }
+        },
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"role\":\"user\"}}": {
+      "sha256": "a82d4cc1c3697e3121ec9e60dc9fd8546bce7563ccd5fcceecb9f87e98a0c39f",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {
+          "message": {
+            "role": "user"
+          }
+        },
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"parts\":[]}}": {
+      "sha256": "ac8e430be3af978ca2540abccfbfe710179c2653249480ee5cdba9545b40d870",
+      "summary": {
+        "count": 0,
+        "parsedQuery": {
+          "message": {
+            "parts": []
+          }
+        },
+        "countable": false
+      }
+    },
+    "rfb {\"message\":{\"role\":\"user\"},\"categories\":[\"honey\"]}": {
+      "sha256": "9ada19411a53b146e93f89d7182dda13eac991feca7ab3f60f17428859fb2a43",
+      "summary": {
+        "count": 2,
+        "parsedQuery": {
+          "message": {
+            "role": "user"
+          },
+          "categories": [
+            "honey"
+          ]
+        },
+        "countable": true
+      }
+    },
+    "rfb {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"melk\"},{\"kind\":\"data\",\"data\":{\"categories\":[\"honey\"]}}]}}": {
+      "sha256": "e52387ecceea8d405468a4d9f16fc1c60d205d07fc661703aa72de9540f86f9a",
+      "summary": {
+        "count": 1,
+        "parsedQuery": {
+          "categories": [
+            "dairy"
+          ],
+          "_productTerms": [
+            "melk"
+          ],
+          "role": "producer"
+        },
+        "countable": true
+      }
+    },
+    "rfb {\"message\":{\"data\":{\"categories\":[\"dairy\"]},\"parts\":[{\"kind\":\"data\",\"data\":{\"categories\":[\"honey\"]}}]}}": {
+      "sha256": "64e313e1506ab980bfb3647324d536fa085f14b9ab5a1f691ca651b2ff174ce1",
+      "summary": {
+        "count": 1,
+        "parsedQuery": {
+          "categories": [
+            "dairy"
+          ]
+        },
+        "countable": true
+      }
+    },
+    "rfb {\"message\":{\"parts\":[{\"kind\":\"data\",\"data\":\"honey\"}]},\"categories\":[\"honey\"]}": {
+      "sha256": "4e4b0325cb77c82dbc8d239c3c02c5a61a3201b341afa7ecd7fe42029bafced5",
+      "summary": {
+        "count": 2,
+        "parsedQuery": {
+          "message": {
+            "parts": [
+              {
+                "kind": "data",
+                "data": "honey"
+              }
+            ]
+          },
+          "categories": [
+            "honey"
+          ]
+        },
+        "countable": true
+      }
+    }
+  }
+}

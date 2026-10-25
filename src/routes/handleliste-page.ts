@@ -36,6 +36,7 @@ import { localizedPath, type Lang } from "../i18n/t";
 import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
+import { serializeJsonForScript } from "../services/safe-script-json";
 
 export function isHandelisteEnabled(): boolean {
   const v = (process.env.HANDLELISTE_ENABLED || "").trim().toLowerCase();
@@ -83,10 +84,16 @@ const COPY: Record<"no" | "en", Copy> = {
     badge_verified: "Verifisert av eier",
     can_order: "Kan bestilles her",
     contact_only: "Kontakt selv",
+    category_match: "Kategoritreff: profilen nevner bare kategorien, ikke varen. Spør produsenten om de har den.",
     km: "km",
     producer_says: "Produsenten oppgir:",
     channels: "Salgskanaler:",
     availability: "Tilgjengelighet:",
+    producer_confirmed: "Oppgitt av produsenten",
+    food_ingredients: "Ingredienser:",
+    food_allergens: "Allergener:",
+    food_allergens_none: "ingen oppgitt av produsenten",
+    food_net_weight: "Nettovekt:",
     back: "Tilbake",
     next_summary: "Videre til oppsummering",
     pick_one: "Velg minst én produsent for å gå videre.",
@@ -149,10 +156,16 @@ const COPY: Record<"no" | "en", Copy> = {
     badge_verified: "Verified by owner",
     can_order: "Can be ordered here",
     contact_only: "Contact directly",
+    category_match: "Category match: the profile only names the category, not the item. Ask the producer whether they have it.",
     km: "km",
     producer_says: "The producer states:",
     channels: "Sales channels:",
     availability: "Availability:",
+    producer_confirmed: "Stated by the producer",
+    food_ingredients: "Ingredients:",
+    food_allergens: "Allergens:",
+    food_allergens_none: "none stated by the producer",
+    food_net_weight: "Net weight:",
     back: "Back",
     next_summary: "Continue to summary",
     pick_one: "Choose at least one producer to continue.",
@@ -314,6 +327,11 @@ const CLIENT_SCRIPT = `
   }
   function errText(r){
     if (r && r.status === 429) return C.error_rate;
+    // Skive 4c (F2): a 409 price_changed carries the server's own text (shown via textContent in msg()).
+    if (r && r.status === 409 && r.body && typeof r.body.error === 'string' && r.body.error.indexOf('price_changed') === 0) {
+      var why = serverReason(r.body);
+      if (why) return why;
+    }
     if (r && r.status === 409) return C.error_conflict;
     return C.error_generic;
   }
@@ -332,12 +350,44 @@ const CLIENT_SCRIPT = `
       var anyOk = false;
       rs.forEach(function(r, i){
         var offers = (r.status === 200 && r.body && Array.isArray(r.body.offers)) ? r.body.offers.slice(0, 5) : [];
+        // I-S2: category matches fill the free places, as contact rows (no product id).
+        var cats = (r.status === 200 && r.body && Array.isArray(r.body.category_matches)) ? r.body.category_matches : [];
         if (r.status === 200) anyOk = true;
-        state.offers[i] = offers; state.picks[i] = null;
+        state.offers[i] = offers.concat(cats).slice(0, 5); state.picks[i] = null;
       });
       if (!anyOk) { msg('hl-msg1', C.error_generic); return; }
       renderOffers(); show('hl-s2');
     }).catch(function(){ el('hl-find').disabled = false; msg('hl-msg1', C.error_generic); });
+  }
+
+  // Skive 4: food information (ingredients / allergens / net weight) and the producer-confirmed
+  // mark, shown before submit. Text only (textContent), whatever the data holds.
+  function foodNodes(o){
+    var out = [];
+    if (o.producer_confirmed === true) out.push(mk('div', { cls: 'hl-meta', text: C.producer_confirmed }));
+    var f = o.food_info;
+    if (f && typeof f === 'object') {
+      if (typeof f.ingredients === 'string' && f.ingredients) out.push(mk('div', { cls: 'hl-meta', text: C.food_ingredients + ' ' + f.ingredients }));
+      if (Array.isArray(f.allergens)) out.push(mk('div', { cls: 'hl-meta', text: C.food_allergens + ' ' + (f.allergens.length ? f.allergens.join(', ') : C.food_allergens_none) }));
+      if (typeof f.net_weight === 'string' && f.net_weight) out.push(mk('div', { cls: 'hl-meta', text: C.food_net_weight + ' ' + f.net_weight }));
+    }
+    return out;
+  }
+
+  // Skive 4b (S2): an offer can be ordered here only when its producer takes orders, it names a product,
+  // it is no category match and the server has not said the row is unconfirmed (producer_confirmed === false).
+  // A scraped row of a producer who takes orders is a contact choice, not an order line.
+  function isOrderable(o){
+    var p = o && o.producer || {};
+    return !!p.can_order && !!o.product_id && o.match !== 'category' && o.producer_confirmed !== false;
+  }
+  // Skive 4b (S2): the server's own explanation for a not_producer_confirmed refusal, in the page language.
+  function serverReason(body){
+    var e = body && typeof body.error === 'string' ? body.error : '';
+    var i = e.indexOf(': ');
+    if (i < 0) return '';
+    var parts = e.slice(i + 2).split(' / ');
+    return String(C.__lang === 'en' && parts.length > 1 ? parts[1] : parts[0]);
   }
 
   function offerNode(i, j, o){
@@ -347,14 +397,22 @@ const CLIENT_SCRIPT = `
     var lbl = mk('label', { cls: 'hl-offer', 'for': id });
     var head = mk('div', null, [radio, mk('span', { cls: 'hl-name', text: String(p.name || '') })]);
     if (p.verifisert_av_eier) head.appendChild(mk('span', { cls: 'hl-badge', text: C.badge_verified }));
-    head.appendChild(mk('span', { cls: 'hl-badge' + (p.can_order ? '' : ' warn'), text: p.can_order ? C.can_order : C.contact_only }));
+    var isCat = o.match === 'category', orderable = isOrderable(o);
+    head.appendChild(mk('span', { cls: 'hl-badge' + (orderable ? '' : ' warn'), text: orderable ? C.can_order : C.contact_only }));
     lbl.appendChild(head);
     var bits = [];
-    if (p.city) bits.push(String(p.city));
-    if (typeof p.distance_km === 'number') bits.push(p.distance_km + ' ' + C.km);
+    // I-V: a producer placed at a centroid has no km figure, and its distance_label («i Ski-området») names the place.
+    var approx = typeof p.distance_km !== 'number' && p.distance_label ? String(p.distance_label) : '';
+    if (approx) bits.push(approx);
+    else {
+      if (p.city) bits.push(String(p.city));
+      if (typeof p.distance_km === 'number') bits.push(p.distance_km + ' ' + C.km);
+    }
     if (o.product_name) bits.push(String(o.product_name));
     if (typeof o.price_nok === 'number') bits.push(o.price_nok + ' kr' + (o.unit ? '/' + o.unit : ''));
     lbl.appendChild(mk('div', { cls: 'hl-meta', text: bits.join(' · ') }));
+    if (isCat) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.category_match }));
+    foodNodes(o).forEach(function(n){ lbl.appendChild(n); });
     if (o.availability) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.availability + ' ' + String(o.availability) }));
     if (Array.isArray(p.salgskanaler) && p.salgskanaler.length) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.channels + ' ' + p.salgskanaler.join(', ') }));
     if (p.delivery_text) lbl.appendChild(mk('div', { cls: 'hl-meta', text: C.producer_says + ' ' + String(p.delivery_text) }));
@@ -416,13 +474,14 @@ const CLIENT_SCRIPT = `
     var ch = chosen();
     if (!ch.length) { msg('hl-msg2', C.pick_one); return; }
     var box = el('hl-summary'); clear(box);
-    var orderable = ch.filter(function(c){ return c.offer.producer && c.offer.producer.can_order && c.offer.product_id; });
+    var orderable = ch.filter(function(c){ return isOrderable(c.offer); });
     var contact = ch.filter(function(c){ return orderable.indexOf(c) < 0; });
     function group(title, list){
       if (!list.length) return;
       box.appendChild(mk('h3', { text: title }));
       list.forEach(function(c){
-        box.appendChild(mk('div', { cls: 'hl-meta', text: c.item.qty + ' × ' + c.item.term + ' — ' + String((c.offer.producer || {}).name || '') }));
+        box.appendChild(mk('div', { cls: 'hl-meta', text: c.item.qty + ' × ' + c.item.term + ' — ' + String((c.offer.producer || {}).name || '') + (typeof c.offer.price_nok === 'number' ? ' · ' + c.offer.price_nok + ' kr' + (c.offer.unit ? '/' + c.offer.unit : '') : '') }));
+        foodNodes(c.offer).forEach(function(n){ box.appendChild(n); });
       });
     }
     group(C.summary_order, orderable);
@@ -440,7 +499,7 @@ const CLIENT_SCRIPT = `
     if (state.hasOrders && (!consent || !(email || phone))) { msg('hl-msg3', C.consent_needed); return; }
     var btn = el('hl-submit'); btn.disabled = true; btn.textContent = C.sending; msg('hl-msg3', '');
     var done = function(text){ btn.disabled = false; btn.textContent = C.submit; msg('hl-msg3', text); };
-    var ch = chosen(), cart = null;
+    var ch = chosen(), cart = null, notes = [];
     api('POST', '/api/marketplace/cart').then(function(r){
       if (r.status !== 201 || !r.body || !r.body.buyer_ref) throw r;
       cart = { cart_id: r.body.cart_id, buyer_ref: r.body.buyer_ref };
@@ -452,10 +511,21 @@ const CLIENT_SCRIPT = `
           return api('POST', '/api/marketplace/cart/' + encodeURIComponent(cart.cart_id) + '/wishes', { term: c.item.term, qty: c.item.qty, buyer_ref: cart.buyer_ref }).then(function(w){
             if (w.status !== 201 || !w.body || !w.body.wish) throw w;
             var p = c.offer.producer || {};
-            var body = (p.can_order && c.offer.product_id) ? { product_id: c.offer.product_id, qty: c.item.qty } : { agent_id: p.agent_id, mode: 'contact' };
+            var body = isOrderable(c.offer) ? { product_id: c.offer.product_id, qty: c.item.qty } : { agent_id: p.agent_id, mode: 'contact' };
             body.buyer_ref = cart.buyer_ref;
-            return api('PATCH', '/api/marketplace/cart/' + encodeURIComponent(cart.cart_id) + '/wishes/' + encodeURIComponent(w.body.wish.id), body).then(function(pr){
-              if (pr.status !== 200) throw pr;
+            var wurl = '/api/marketplace/cart/' + encodeURIComponent(cart.cart_id) + '/wishes/' + encodeURIComponent(w.body.wish.id);
+            return api('PATCH', wurl, body).then(function(pr){
+              if (pr.status === 200) return;
+              // Skive 4b (S2): a scraped row of a producer who takes orders is refused with 422 not_producer_confirmed.
+              // The row becomes a contact choice and the server's explanation is shown, instead of a generic failure.
+              if (pr.status === 422 && pr.body && typeof pr.body.error === 'string' && pr.body.error.indexOf('not_producer_confirmed') === 0 && p.agent_id) {
+                var why = serverReason(pr.body);
+                if (why && notes.indexOf(why) < 0) notes.push(why);
+                return api('PATCH', wurl, { agent_id: p.agent_id, mode: 'contact', buyer_ref: cart.buyer_ref }).then(function(cr){
+                  if (cr.status !== 200) throw cr;
+                });
+              }
+              throw pr;
             });
           });
         });
@@ -470,7 +540,7 @@ const CLIENT_SCRIPT = `
       if (r.status !== 201 || !r.body || r.body.success !== true) throw r;
       var vcards = {};
       ch.forEach(function(c){ var p = c.offer.producer || {}; if (p.agent_id) vcards[p.agent_id] = p.vcard_url || null; });
-      var result = { orders: r.body.orders || [], handoffs: r.body.contact_handoffs || [], vcards: vcards, payments: r.body.payments || [] };
+      var result = { orders: r.body.orders || [], handoffs: r.body.contact_handoffs || [], vcards: vcards, payments: r.body.payments || [], notes: notes };
       lsDel(LS_CART); lsSet(LS_RESULT, result);
       el('hl-name').value = ''; el('hl-email').value = ''; el('hl-phone').value = ''; el('hl-note').value = '';
       btn.disabled = false; btn.textContent = C.submit;
@@ -510,6 +580,7 @@ const CLIENT_SCRIPT = `
         box.appendChild(card);
       });
     }
+    if (Array.isArray(res.notes)) res.notes.forEach(function(t){ if (typeof t === 'string' && t) box.appendChild(mk('div', { cls: 'hl-msg' }, [t])); });
     if (res.handoffs && res.handoffs.length) {
       box.appendChild(mk('h3', { text: C.contact_h2 }));
       box.appendChild(mk('p', { cls: 'hl-hint', text: C.contact_p }));
@@ -594,10 +665,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
   const base = COPY[lang === "en" ? "en" : "no"];
   const c: Copy = isPaymentsEnabled() ? { ...base, ...PREPAY_COPY[lang === "en" ? "en" : "no"] } : base;
   const payHow = isPaymentsEnabled() ? { __pay_how_href: localizedPath(BETALING_PATH, lang) } : {};
-  const copyJson = JSON.stringify({ ...c, ...payHow, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL })
-    .replace(/</g, "\\u003c")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
+  const copy = { ...c, ...payHow, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">
@@ -649,7 +717,7 @@ export function buildHandelistePage(lang: Lang): HandelistePage {
         <div class="hl-actions"><button type="button" class="hl-btn" id="hl-new">${e(c.new_list)}</button></div>
       </section>
     </form>
-    <script type="application/json" id="hl-copy">${copyJson}</script>
+    <script type="application/json" id="hl-copy">${serializeJsonForScript(copy)}</script>
     <script>${CLIENT_SCRIPT}</script>
   </main>`;
   return { title: c.title, description: c.description, content, extraCss: HANDELISTE_CSS };

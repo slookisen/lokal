@@ -6,6 +6,7 @@ import { getConfig } from "../config/vertical-config";
 // bypass it.
 import { applyTestSendRedirect, TestSendNotConfiguredError } from "./send-guard";
 import { crmFromHeader } from "./crm-platform-identity";
+import { unsubscribeHeaderValues } from "./avmeld-service";
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -39,6 +40,8 @@ export interface EmailOptions {
   textContent: string;
   replyTo?: string;
   listUnsubscribe?: string;
+  /** List-Unsubscribe-Post value (RFC 8058 one-click); only set together with listUnsubscribe. */
+  listUnsubscribePost?: string;
   attachments?: EmailAttachment[];
   /**
    * dev-request 2026-07-26-booking-test-send-guard. When true, this email
@@ -67,6 +70,15 @@ export interface EmailOptions {
    * Opplevagent content. Omitted keeps the previous behaviour exactly.
    */
   from?: string;
+  /**
+   * F8 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+   * transactional mail about a buyer's own order (producer order e-mail,
+   * buyer receipts) must not carry the outreach header
+   * `X-Lokal-Agent: outreach-system/v1`: it is not outreach, and the header
+   * makes it look like it. true = send without that header. Omitted/false
+   * leaves the header exactly as before.
+   */
+  omitAgentHeader?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -276,13 +288,14 @@ export class EmailService {
   async sendClaimConfirmation(
     email: string,
     agentName: string,
-    dashboardUrl: string
+    dashboardUrl: string,
+    agentId?: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
       const subject = `Gratulerer! ${agentName} er nå ditt på ${this.brand}`;
 
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl);
-      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl);
+      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl, agentId);
+      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -356,11 +369,12 @@ export class EmailService {
     }
 
     try {
-      const headers: Record<string, string> = {
-        'X-Lokal-Agent': 'outreach-system/v1',
-      };
+      const headers: Record<string, string> = options.omitAgentHeader
+        ? {}
+        : { 'X-Lokal-Agent': 'outreach-system/v1' };
       if (options.listUnsubscribe) {
         headers['List-Unsubscribe'] = options.listUnsubscribe;
+        if (options.listUnsubscribePost) headers['List-Unsubscribe-Post'] = options.listUnsubscribePost;
       }
 
       const mailOptions: Record<string, unknown> = {
@@ -496,6 +510,11 @@ export class EmailService {
     // SAME for both variants — the draft text is the experiment's only
     // variable.
     const rendered = renderGardssalgOutreachVariant(opts.template ?? "standard", providerName, profileUrl);
+    // G1 point 6 (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg): signed
+    // List-Unsubscribe + One-Click (RFC 8058) on cold gårdssalg mail. Headers only —
+    // no template text changes. Behind OUTREACH_UNSUBSCRIBE_ENABLED (the /avmeld route's
+    // own flag), so a header never points at a 404; none when off or no server secret.
+    const unsub = unsubscribeHeaderValues(to, "experiences");
     return await this.sendEmail({
       to,
       subject: rendered.subject,
@@ -504,6 +523,7 @@ export class EmailService {
       replyTo: GARDSSALG_OUTREACH_REPLY_TO,
       from: crmFromHeader("experiences"),
       isTestSend: opts.isTestSend,
+      ...(unsub ? { listUnsubscribe: unsub.listUnsubscribe, listUnsubscribePost: unsub.listUnsubscribePost } : {}),
     });
   }
 
@@ -541,6 +561,10 @@ export class EmailService {
      * is the discriminator steg 4 sorts on.
      */
     replyTo?: string;
+    /** List-Unsubscribe header value (`<https://…>`); cold outreach only. */
+    listUnsubscribe?: string;
+    /** List-Unsubscribe-Post header value (RFC 8058 one-click); needs listUnsubscribe. */
+    listUnsubscribePost?: string;
   }): Promise<{ success: boolean; messageId?: string; error?: string }> {
     // See isEmailForceDryRun()'s doc comment above sendEmail() — same rule.
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
@@ -549,6 +573,10 @@ export class EmailService {
     }
     try {
       const headers: Record<string, string> = { 'X-Lokal-Agent': 'crm-system/v1' };
+      if (options.listUnsubscribe) {
+        headers['List-Unsubscribe'] = options.listUnsubscribe;
+        if (options.listUnsubscribePost) headers['List-Unsubscribe-Post'] = options.listUnsubscribePost;
+      }
       if (options.inReplyToMessageId) {
         headers['In-Reply-To'] = options.inReplyToMessageId;
         headers['References'] = options.inReplyToMessageId;
@@ -779,12 +807,13 @@ ${this.brand} bygger nettverk hvor norske ${this.entityPluralLong} møter mennes
   <div class="container">
     <div class="logo">🌾 ${this.brand}</div>
     <h1>Din bekreftelseskode</h1>
-    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på ${this.brand}.</p>
+    <p>Noen har bedt om å bekrefte eierskap til <strong>${this.escapeHtml(agentName)}</strong> på ${this.brand}. Koden sendes bare til gårdens egen e-postadresse.</p>
     <p>Din bekreftelseskode er:</p>
     <div class="code-box">
       <div class="code">${code}</div>
     </div>
     <p>Koden er gyldig i 24 timer.</p>
+    <p>Del aldri koden med andre. Vi spør aldri etter den på telefon eller e-post.</p>
     <p>Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.</p>
   </div>
 </body>
@@ -796,7 +825,7 @@ ${this.brand} bygger nettverk hvor norske ${this.entityPluralLong} møter mennes
     return `
 Din bekreftelseskode
 
-Du ba om å bekrefte at du eier ${agentName} på ${this.brand}.
+Noen har bedt om å bekrefte eierskap til ${agentName} på ${this.brand}. Koden sendes bare til gårdens egen e-postadresse.
 
 Din bekreftelseskode er:
 
@@ -804,15 +833,31 @@ ${code}
 
 Koden er gyldig i 24 timer.
 
+Del aldri koden med andre. Vi spør aldri etter den på telefon eller e-post.
+
 Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     `;
   }
 
-  private orderToggleUrl(dashboardUrl: string): string {
+  /**
+   * The «slå på bestillinger» link in the claim confirmation. F7 (dev-request
+   * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): with the agent
+   * id it points at the portal card, /eier/<id>/portal#bestillinger, where
+   * the switch is. The login link (dashboardUrl) goes through /selger, a page
+   * with no such switch, so appending #bestillinger to it led nowhere. The
+   * portal sends a not-yet-logged-in owner to the login page for that agent.
+   * Without an agent id the old behaviour stays (callers that only have a
+   * dashboard URL).
+   */
+  private orderToggleUrl(dashboardUrl: string, agentId?: string): string {
+    if (agentId) {
+      const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
+      return `${base}/eier/${encodeURIComponent(agentId)}/portal#bestillinger`;
+    }
     return dashboardUrl.includes('#') ? dashboardUrl : `${dashboardUrl}#bestillinger`;
   }
 
-  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string): string {
+  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string, agentId?: string): string {
     return `
 <!DOCTYPE html>
 <html lang="no">
@@ -868,7 +913,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       <li>Følge med på interaksjoner og preferanser</li>
     </ul>
     <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">Gå til dashboarden din</a>
-    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl))}">dashboarden din</a>.</p>
+    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl, agentId))}">dashboarden din</a>.</p>
     <p>Lykke til!</p>
   </div>
 </body>
@@ -876,7 +921,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     `;
   }
 
-  private generateClaimConfirmationText(agentName: string, dashboardUrl: string): string {
+  private generateClaimConfirmationText(agentName: string, dashboardUrl: string, agentId?: string): string {
     return `
 Gratulerer!
 
@@ -891,7 +936,7 @@ Gå til dashboarden din:
 ${dashboardUrl}
 
 Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk her:
-${this.orderToggleUrl(dashboardUrl)}
+${this.orderToggleUrl(dashboardUrl, agentId)}
 
 Lykke til!
     `;
@@ -1039,6 +1084,61 @@ ${this.brand} | ${getConfig().domain}`;
     } catch (error) {
       logger.error('Error sending admin claim notification', {
         agentName, claimantEmail,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Tells the admin that a claim waits in the admin queue (decision 11=A,
+   * dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt): no
+   * code was sent and nothing happens until it is approved or rejected.
+   * Same recipient and skip rule as sendAdminClaimNotification above.
+   */
+  async sendAdminClaimReviewNotification(
+    agentName: string,
+    agentId: string,
+    claimantName: string,
+    claimantEmail: string,
+    reason: string
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping claim-review notification');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const queuePath = '/admin/agents/claim-review-queue';
+      const subject = `Eierkrav venter på godkjenning: ${agentName}`;
+      const row = (label: string, value: string) =>
+        `<tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">${label}:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(value)}</td></tr>`;
+      const htmlContent = `
+        <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #2d5016;">Eierkrav venter på godkjenning på ${this.brand}</h2>
+          <p>Ingen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.</p>
+          <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+            ${row('Produsent', `${agentName} (${agentId})`)}
+            ${row('Navn', claimantName)}
+            ${row('E-post', claimantEmail)}
+            ${row('Grunn', reason)}
+            ${row('Tidspunkt', new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' }))}
+          </table>
+          <p>Køen: GET ${this.escapeHtml(queuePath)} (X-Admin-Key)</p>
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
+        </div>`;
+      const textContent = `Eierkrav venter på godkjenning på ${this.brand}\n\nIngen kode er sendt. Kravet gir verken tilgang eller merke før det er godkjent.\n\nProdusent: ${agentName} (${agentId})\nNavn: ${claimantName}\nE-post: ${claimantEmail}\nGrunn: ${reason}\nTidspunkt: ${new Date().toISOString()}\n\nKøen: GET ${queuePath} (X-Admin-Key)`;
+
+      return await this.sendEmail({
+        to: adminEmail,
+        subject,
+        htmlContent,
+        textContent,
+      });
+    } catch (error) {
+      logger.error('Error sending admin claim-review notification', {
+        agentId,
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };

@@ -20,7 +20,7 @@ import { runChunked } from "./boot-job-gate";
 //   Data Completeness       20%      agent_knowledge fields filled
 //   Activity / Freshness    20%      last_seen_at / owner_updated_at decay
 //   Interaction Volume      20%      agent_metrics discovery+contact counts
-//   Community Signal        10%      Future: ratings, repeat buyers
+//   Community Signal        10%      First-party reviews only (none yet → 0.3)
 //
 // Phase 1 (now):   verification + completeness only (50% of weight)
 // Phase 2 (May):   + freshness decay
@@ -69,6 +69,18 @@ const WEIGHTS = {
   interaction:  0.20,
   community:    0.10,
 } as const;
+
+/** Community signal for every agent until the platform collects its own reviews. */
+const COMMUNITY_NEUTRAL = 0.3;
+
+// ─── Formula version ─────────────────────────────────────────
+// Bump whenever calculate() changes what it computes. The boot recalculation
+// (scheduleBootTrustRecalc in boot-job-gate.ts, src/index.ts) stamps
+// boot_job_state per version, so the first boot after a deploy with a new
+// version recalculates every stored trust_score, also inside the 24 h skip
+// window. "2026-10-17-community-first-party": S4-A1b, community no longer
+// reads Google ratings.
+export const TRUST_SCORE_FORMULA_VERSION = "2026-10-17-community-first-party";
 
 // ─── Knowledge fields that count toward completeness ─────────
 // Each field is worth equal share of the completeness score.
@@ -128,7 +140,7 @@ class TrustScoreService {
     const completeness = this.completenessSignal(agentId);
     const freshness    = this.freshnessSignal(agentId);
     const interaction  = this.interactionSignal(agentId);
-    const community    = this.communitySignal(agentId);
+    const community    = this.communitySignal();
 
     const score =
       verification * WEIGHTS.verification +
@@ -242,7 +254,7 @@ class TrustScoreService {
     const completeness = this.completenessSignal(agentId);
     const freshness = this.freshnessSignal(agentId);
     const interaction = this.interactionSignal(agentId);
-    const community = this.communitySignal(agentId);
+    const community = this.communitySignal();
 
     const score = this.calculate(agentId);
 
@@ -268,7 +280,7 @@ class TrustScoreService {
         completeness: { value: completeness, weight: WEIGHTS.completeness, detail: `${Math.round(completeness * 100)}% av felter fylt ut` },
         freshness: { value: freshness, weight: WEIGHTS.freshness, detail: `Siste aktivitet: ${this.getLastActivityLabel(agentId)}` },
         interaction: { value: interaction, weight: WEIGHTS.interaction, detail: this.getInteractionDetail(agentId) },
-        community: { value: community, weight: WEIGHTS.community, detail: this.getCommunityDetail(agentId) },
+        community: { value: community, weight: WEIGHTS.community, detail: this.getCommunityDetail() },
       },
       tips,
     };
@@ -394,6 +406,8 @@ class TrustScoreService {
     // the attribution note at WEIGHTS). With zero completed events this
     // returns exactly `base`, i.e. the pre-ledger value — existing scores
     // don't move while the ledger is empty.
+    // Fase A1: `completed` excludes automatic closes (completedAuto) — an
+    // order closed by the clock is not a confirmed transaction and does not score.
     const events = getTrustEventCounts(agentId);
     if (events.completed === 0) return base;
 
@@ -404,32 +418,23 @@ class TrustScoreService {
     return Math.max(base, base * 0.6 + txVolume * 0.4);
   }
 
-  private communitySignal(agentId: string): number {
-    // ── Community signal v2 (2026-04-26) ────────────────────────
-    // Reads agent_knowledge.google_rating + google_review_count.
-    // No rating in DB → 0.3 (neutral baseline; no penalty for new agents).
-    // Otherwise: rating normalized to 0..1, blended with a 0.5 prior
-    // when review-count is low (Bayesian-ish — protects against
-    // 1-review cherry-picks while letting well-rated agents reach 1.0).
-    const db = getDb();
-    const k = this.stmt(db, 
-      "SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?"
-    ).get(agentId) as any;
-
-    const rating: number | null = k?.google_rating ?? null;
-    const reviewCount: number = k?.google_review_count ?? 0;
-
-    if (rating == null || rating <= 0) return 0.3;
-
-    // Normalize 1.0–5.0 → 0.0–1.0 (a 1-star rating still beats no rating because
-    // it's evidence of activity; a 0/1 input is treated defensively).
-    const ratingNorm = Math.max(0, Math.min(1, (rating - 1) / 4));
-
-    // Volume weight: 20+ reviews = full weight, fewer reviews shrink toward
-    // a 0.5 prior so a single 5-star review can't max the score.
-    const volumeWeight = Math.min(1, Math.log10(reviewCount + 1) / Math.log10(20));
-
-    return ratingNorm * volumeWeight + 0.5 * (1 - volumeWeight);
+  private communitySignal(): number {
+    // ── Community signal v3 (S4-A1b, 2026-10-17) ────────────────
+    // Built on first-party data only: reviews the platform collects itself
+    // (source 'first_party', RATING_MARKUP_SOURCES_ALLOWED in
+    // structured-data-policy.ts). No such flow exists yet, so every agent
+    // gets the neutral 0.3 that an agent without a rating had under v2.
+    // v2 read the stored Google rating (agent_knowledge.google_rating /
+    // google_review_count). It is no longer read: storing it is not allowed,
+    // and ranking on it is not an allowed use under the EEA terms
+    // (protocols/juridisk-sjekk-google-ratinger-2026-10-17.md; Daniel's
+    // decision 2=A, dev-request 2026-10-16-rfb-strukturerte-data-
+    // tredjepartsrating-og-places-treffvakt). Nothing else stands in for
+    // it: completed orders and claims are already the interaction and
+    // verification signals, and repeat buyers come from the same completed
+    // conversations as times_chosen. An own-review flow is read here, with
+    // TRUST_SCORE_FORMULA_VERSION bumped, when it exists.
+    return COMMUNITY_NEUTRAL;
   }
 
   // ─── Helpers ───────────────────────────────────────────────
@@ -479,20 +484,17 @@ class TrustScoreService {
     // Transaction trust-ledger (pilot-ordre-loop): surface real outcomes too.
     const events = getTrustEventCounts(agentId);
     if (events.completed) parts.push(`${events.completed} fullført${events.completed === 1 ? "" : "e"} hentinger`);
+    // Fase A1: orders closed automatically are shown apart — nobody confirmed the pickup.
+    if (events.completedAuto) parts.push(`${events.completedAuto} lukket automatisk (henting ikke bekreftet)`);
     if (events.noShows) parts.push(`${events.noShows} ikke hentet`);
 
     return parts.length > 0 ? parts.join(", ") : "Ingen interaksjoner ennå";
   }
 
-  private getCommunityDetail(agentId: string): string {
-    const db = getDb();
-    const k = db.prepare(
-      "SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?"
-    ).get(agentId) as any;
-    const rating = k?.google_rating;
-    const reviews = k?.google_review_count ?? 0;
-    if (!rating) return "Ingen Google-vurdering enn\u00e5";
-    return `Google: ${rating}/5 (${reviews} anmeldelse${reviews === 1 ? "" : "r"})`;
+  // Shown on GET /agents/:id/trust (public) and the seller dashboard. No
+  // stored Google rating here either: passing it on is «reshare» (S4-A1b).
+  private getCommunityDetail(): string {
+    return "Ingen egne omtaler på Rett fra Bonden ennå – samme nøytrale verdi for alle";
   }
 }
 

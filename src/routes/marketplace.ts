@@ -3,16 +3,17 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
+import { deleteAgentProfileTranslations } from "../services/profile-translations";
 import { handleInboundEmailWebhook } from "../services/inbound-email-webhook";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -25,10 +26,11 @@ import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
-import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
+import { logPlacesCall, getPlacesUsageThisMonth, getPlacesRatingFieldCallsThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { checkBrregNameHitAddress } from "../services/brreg-address-guard";
+import { rfbPlaceMatchEntity, pickRfbPlace, rfbPlacesTextQuery, formatPlacesMatchGuardLog, placesFieldMask, googleRatingFetchEnabled } from "../services/places-match";
 import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
 // W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
 import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
@@ -41,11 +43,19 @@ import {
 import { randomUUID } from "crypto";
 import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+// Decision 11=A: the claim response shows the farm address masked, the same
+// helper the Opplevagent claim page uses; per-IP limit on claim requests.
+import { maskEmail } from "../services/gardssalg-claim";
+import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
+import { capFreeText, capName } from "../utils/free-text";
+import { capA2aData } from "../utils/a2a-message";
+import { searchCountable, searchTrafficClass } from "../services/search-tracking";
 import { resolveRouteIntent, reiseUrlFor } from "../services/route-intent";
 import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
+import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423,
@@ -310,11 +320,16 @@ function buildVCard(agentId: string): string | null {
   if (k.products && Array.isArray(k.products) && k.products.length > 0) {
     const productList = k.products
       .map((p: any) => {
-        // Handle object products and plain strings; skip empty/unknown
-        const name = typeof p === "string" ? p : (p.name || p.product || "");
+        // Handle object products and plain strings; skip empty/unknown.
+        // I-G: the fields are DB JSON — a `product` that is not text reached
+        // `.toLowerCase()`, and a boolean or object price was shown as
+        // "(true)"; the price is read as parseProductPrice reads it.
+        const rawName = typeof p === "string" ? p : (p.name || p.product);
+        const name = typeof rawName === "string" ? rawName : "";
         if (!name || name.toLowerCase() === "ukjent") return null;
         let item = name;
-        if (p.price) item += ` (${p.price})`;
+        const price = productPriceText(p.price);
+        if (price) item += ` (${price})`;
         if (p.seasonal && p.months?.length) item += ` [sesong]`;
         return item;
       })
@@ -565,24 +580,43 @@ router.post("/register", (req: Request, res: Response) => {
 router.post("/discover", (req: Request, res: Response) => {
   const startTime = Date.now();
   try {
-    const query = DiscoveryQuerySchema.parse(req.body);
+    // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+    // rfb-discover-lister-uten-tak): the body is cut as RFB A2A's structured
+    // data is (capA2aData, utils/a2a-message.ts), whose query this route
+    // shares: `categories`, `tags` and `skills` to their first
+    // MAX_NAME_LIST_ITEMS names of at most MAX_NAME_CHARS, and the strings
+    // (`query`, `drinkSubcategory`) to MAX_FREE_TEXT_CHARS. discover()
+    // compares every entry with every producer's, so 175 000 categories took
+    // 45 s on live-like data. The cut comes before the validation, which
+    // then reads and reports at most those entries (each invalid entry of a
+    // 1 MB list was an issue in the 400 answer). A body within the caps is
+    // the same object, so a real search answers as before.
+    const query = DiscoveryQuerySchema.parse(capA2aData(req.body));
+    // Slice I-Z: our own traffic and probes get the same answer but raise no
+    // discovery counter, stay off the interactions feed and start no
+    // countable conversation (searchTrafficClass).
+    const requestMeta = buildRequestMeta(req);
+    const trafficClass = searchTrafficClass({ meta: requestMeta, text: JSON.stringify(query), structured: true });
+    const countable = trafficClass === "external";
     // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
     // review finding: this route's own docstring documents `tags` as caller
     // input, but it never read discoverMeta.tagsRelaxed — a dropped tag
     // filter (step 4 of discover()) went unreported here, unlike every other
     // discover() caller. See DiscoverMeta for why the drop happens.
     const discoverMeta: DiscoverMeta = {};
-    const results = marketplaceRegistry.discover(query, discoverMeta);
+    const results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable });
     const tagsDropped = !!discoverMeta.tagsRelaxed;
 
-    interactionLogger.log("discover", {
-      query: JSON.stringify({ categories: query.categories, tags: query.tags }),
-      resultCount: results.length,
-      matchedAgentIds: results.map(r => r.agent.id),
-      metadata: { query },
-      ipAddress: req.ip,
-      durationMs: Date.now() - startTime,
-    });
+    if (countable) {
+      interactionLogger.log("discover", {
+        query: JSON.stringify({ categories: query.categories, tags: query.tags }),
+        resultCount: results.length,
+        matchedAgentIds: results.map(r => r.agent.id),
+        metadata: { query },
+        ipAddress: req.ip,
+        durationMs: Date.now() - startTime,
+      });
+    }
 
     const enrichedResults = results.map((r: any) => ({
       ...r,
@@ -603,7 +637,11 @@ router.post("/discover", (req: Request, res: Response) => {
             sellerAgentId: r.agent.id,
             queryText: queryDesc,
             source: "api",
-            requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+            requestMeta, // (item 3) internal-traffic classification
+            // Slice I-Z: a probe or spam is no countable conversation. The
+            // answer lists only the ids, so it is the same either way (GET
+            // /search's lists messageCount, which the class would change).
+            trafficClass,
             autoRespond: true,
           });
           conversations.push({ conversationId: conv.id, sellerAgentId: r.agent.id });
@@ -651,7 +689,9 @@ router.get("/search", async (req: Request, res: Response) => {
   // Coordinates alone ("what is near me?") is a complete, valid search — this
   // endpoint used to hard-400 without ?q=, so proximity search was impossible
   // without first typing a place name.
-  const q = typeof req.query.q === "string" ? req.query.q : "";
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read, cut at a word
+  // boundary (utils/free-text.ts), before route intent, parser and geocoder.
+  const q = capFreeText(typeof req.query.q === "string" ? req.query.q : "");
   if (!q && !hasBrowserCoords) {
     res.status(400).json({
       success: false,
@@ -750,7 +790,11 @@ router.get("/search", async (req: Request, res: Response) => {
   // short-circuits it), so without this out-param the response would keep
   // claiming geoFiltered:true for results hundreds of km outside the radius.
   const discoverMeta: DiscoverMeta = {};
-  let results = marketplaceRegistry.discover(query, discoverMeta);
+  // Slice I-Z: our own traffic and probes get the same answer but raise no
+  // discovery counter and stay off the interactions feed (searchCountable),
+  // as POST /a2a already did with its `countable`.
+  const countable = searchCountable({ meta: buildRequestMeta(req), text: q });
+  let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable });
 
   // ── Auto-expanding radius ──
   // If geo-filtered and too few results, widen the search automatically.
@@ -826,7 +870,7 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
       const expandedMeta: DiscoverMeta = {};
-      results = marketplaceRegistry.discover(expandedQuery, expandedMeta);
+      results = marketplaceRegistry.discover(expandedQuery, expandedMeta, { trackDiscovery: countable });
       appliedRadiusKm = expandedRadius;
       tagsDropped = !!expandedMeta.tagsRelaxed;
     }
@@ -842,21 +886,23 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
       const noGeoMeta: DiscoverMeta = {};
-      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta);
+      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta, { trackDiscovery: countable });
       tagsDropped = !!noGeoMeta.tagsRelaxed;
       geoDropped = true;
       appliedRadiusKm = undefined;
     }
   }
 
-  interactionLogger.log("search", {
-    query: q,
-    resultCount: results.length,
-    matchedAgentIds: results.map(r => r.agent.id),
-    metadata: { parsed, geoSource },
-    ipAddress: req.ip,
-    durationMs: Date.now() - startTime,
-  });
+  if (countable) {
+    interactionLogger.log("search", {
+      query: q,
+      resultCount: results.length,
+      matchedAgentIds: results.map(r => r.agent.id),
+      metadata: { parsed, geoSource },
+      ipAddress: req.ip,
+      durationMs: Date.now() - startTime,
+    });
+  }
 
   // Slugify for profile links
   const slug = (text: string) => text.normalize("NFC").toLowerCase()
@@ -868,7 +914,10 @@ router.get("/search", async (req: Request, res: Response) => {
 
   const enrichedResults = results.map((r: any) => {
     const contact = buildContactBlock(r.agent.id);
-    const profileUrl = `${BASE_URL}/produsent/${slug(r.agent.name)}`;
+    // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+    const profileUrl = failsProducerRoleGate(r.agent.role, false)
+      ? undefined
+      : `${BASE_URL}/produsent/${slug(r.agent.name)}`;
 
     // Include products with prices for all results (essential for AI agents)
     const info = knowledgeService.getAgentInfo(r.agent.id);
@@ -1006,11 +1055,14 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
   const info = knowledgeService.getAgentInfo(agentId);
   const contentDisposition = vcardContentDisposition(info?.agent.name || "agent");
 
-  interactionLogger.log("view", {
-    agentId: agentId,
-    metadata: { type: "vcard_download", buyerAgent: req.headers["x-agent-id"] as string },
-    ipAddress: req.ip,
-  });
+  // Slice I-Z: not for our own traffic or a probe (searchCountable).
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId: agentId,
+      metadata: { type: "vcard_download", buyerAgent: req.headers["x-agent-id"] as string },
+      ipAddress: req.ip,
+    });
+  }
 
   res.setHeader("Content-Type", "text/vcard; charset=utf-8");
   res.setHeader("Content-Disposition", contentDisposition);
@@ -1096,11 +1148,10 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (k.deliveryRadius != null) card.deliveryRadius = k.deliveryRadius;
     if (k.minOrderValue != null) card.minOrderValue = k.minOrderValue;
 
-    // Google rating
-    if (k.ratings?.google?.score) {
-      card.googleRating = k.ratings.google.score;
-      card.googleReviewCount = k.ratings.google.reviews || 0;
-    }
+    // No Google rating (googleRating, googleReviewCount and its invented 0):
+    // getAgentInfo no longer carries it, because passing it on is "reshare"
+    // under Google's Places terms (dev-request 2026-10-16-rfb-strukturerte-
+    // data-tredjepartsrating-og-places-treffvakt, S4-A1a).
 
     // About text (richer than description)
     if (k.about) card["x-lokal"].about = k.about;
@@ -1118,9 +1169,19 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
 
     // Top-level canonical URL — explicit so AI agents reading the
     // card don't have to dig into links.profile or invent one from name.
-    card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
+    // Skive A2: /produsent/:slug 404s for non-producer, non-umbrella roles
+    // (quality/logistics) — omit canonicalUrl + links.profile for those so AI
+    // agents never follow a link to a 404. Same predicate as seo.ts.
+    let cardHasProfilePage = true;
+    try {
+      const gateRow = getDb()
+        .prepare("SELECT role, umbrella_type, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?")
+        .get(agentId) as any;
+      if (gateRow) cardHasProfilePage = hasProducerPage(gateRow);
+    } catch { /* fail-open: keep the link, as before */ }
+    if (cardHasProfilePage) card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
     card.links = {
-      profile: `https://rettfrabonden.com/produsent/${slug}`,
+      ...(cardHasProfilePage ? { profile: `https://rettfrabonden.com/produsent/${slug}` } : {}),
       googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
       vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
     };
@@ -1136,7 +1197,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
       const a = (agent as any);
       if (a.umbrella_type) {
         const members = db.prepare(`
-          SELECT p.id, p.name, p.city, aff.labels, aff.status
+          SELECT p.id, p.name, p.city, p.role, p.umbrella_type AS member_umbrella_type, aff.labels, aff.status
           FROM agent_affiliations aff
           INNER JOIN agents p ON p.id = aff.producer_id
           WHERE aff.umbrella_id = ?
@@ -1158,7 +1219,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
               city: m.city,
               labels: m.labels ? (() => { try { return JSON.parse(m.labels); } catch { return []; } })() : [],
               card_url: `${getBaseUrl(req)}/api/marketplace/agents/${m.id}/card`,
-              profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}`,
+              ...(failsProducerRoleGate(m.role, !!m.member_umbrella_type)
+                ? {}
+                : { profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}` }),
             })),
           }]);
         }
@@ -1207,6 +1270,16 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     // to summarize.
     const provenance = getAgentProvenanceSummary(agentId);
     if (provenance) card.provenance = provenance;
+
+    // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-O (MCP2-03):
+    // the additive `openingHoursDisplay` rows of GET /agents/:id/info
+    // (openingHoursDisplayRows), so an agent reading the card gets the hours
+    // in one shape whatever form they are stored in (a list, text such as
+    // "Man-Fre 07-22, Lor 08-22", schema.org's form), with the same text as
+    // the producer page. `openingHours` above is unchanged, the stored value.
+    // After every existing field and omitted when there are none, as in /info.
+    const openingHoursDisplay = openingHoursDisplayRows(k.openingHours);
+    if (openingHoursDisplay.length) card.openingHoursDisplay = openingHoursDisplay;
   }
 
   res.json(card);
@@ -1381,7 +1454,10 @@ router.get("/stats", (_req: Request, res: Response) => {
 // this endpoint over HTTP. The HTTP-MCP server (src/routes/mcp.ts) calls
 // the geocodingService directly without going through this endpoint.
 router.get("/geocode", async (req: Request, res: Response) => {
-  const place = (req.query.place || req.query.q || "").toString().trim();
+  // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): a place name,
+  // cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts), as
+  // lokal_geocode does; the answer echoes it.
+  const place = capName((req.query.place || req.query.q || "").toString().trim());
   if (!place) {
     res.status(400).json({ success: false, error: "Missing 'place' query parameter" });
     return;
@@ -1462,7 +1538,44 @@ router.get("/agents", (req: Request, res: Response) => {
 // Example response:
 //   { agent: { name, city, trustScore, isClaimed },
 //     knowledge: { address, products, openingHours, ... },
-//     meta: { dataSource: "auto", disclaimer: "..." } }
+//     meta: { dataSource: "auto", disclaimer: "..." },
+//     openingHoursDisplay: [{ days: "Mandag–Fredag", hours: "10:00 – 17:00", note: "" }, ...] }
+
+/**
+ * One row of a producer's opening hours as the RFB pages show them: the day
+ * column and the time column of the hours card on /produsent/:slug. Every
+ * field is text, "" when there is nothing.
+ */
+export interface OpeningHoursDisplayRow {
+  /** The weekdays in Norwegian ("Mandag–Fredag"), the day label as stored when it names none ("Påske"), or "" (a text entry). */
+  days: string;
+  /** The opening and closing time ("10:00 – 17:00"), or "" when the entry has none. */
+  hours: string;
+  /** The period and the note ("April; Kun i sesong"), or "". Shown after the times in brackets, or alone when there are none. */
+  note: string;
+}
+
+/**
+ * The `openingHoursDisplay` rows of GET /agents/:id/info. Dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-I (FUNN
+ * rfb-app-modal-apningstider-og-escaping): the producer modal on /app and
+ * /dashboard and the /agent page read the raw `knowledge.openingHours` with a
+ * day table of their own, so {day, hours}, {day, from, to}, Norwegian day
+ * names, ranges and text showed as "undefined – undefined", as the stored
+ * key, or not at all. The rows come from the shared normalizer
+ * (utils/opening-hours.ts, I-H) and hold the same text as the hours card on
+ * the producer page (openingHoursCardHtml in seo.ts), so the pages show the
+ * same hours. Built here, not in knowledgeService.getAgentInfo, so lokal_info
+ * and the RFB MCP contract are unchanged; `knowledge.openingHours` stays as
+ * stored (selger.html edits it).
+ */
+export function openingHoursDisplayRows(openingHours: unknown): OpeningHoursDisplayRow[] {
+  return normalizeOpeningHours(openingHours).map((entry) => ({
+    days: entryDaysLabel(entry, "no"),
+    hours: entry.open !== undefined && entry.close !== undefined ? `${entry.open} \u2013 ${entry.close}` : "",
+    note: [entry.period, entry.note].filter(Boolean).join("; "),
+  }));
+}
 
 router.get("/agents/:id/info", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
@@ -1480,18 +1593,28 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
     return;
   }
 
-  // Log the view
-  interactionLogger.log("view", {
-    agentId: agentId,
-    metadata: { type: "agent_info_request", buyerAgent: req.headers["x-agent-id"] as string },
-    ipAddress: req.ip,
-  });
+  // Log the view: not for our own traffic or a probe (slice I-Z, searchCountable).
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId: agentId,
+      metadata: { type: "agent_info_request", buyerAgent: req.headers["x-agent-id"] as string },
+      ipAddress: req.ip,
+    });
+  }
 
   // dev-request 2026-07-13-proveniens-transparens-side, slice 2: additive
   // entity-level provenance summary — omitted entirely when there's nothing
   // to summarize (never emitted as null/empty).
   const provenance = getAgentProvenanceSummary(agentId);
-  const data = provenance ? { ...info, provenance } : info;
+  // I-I: additive display rows for the opening hours (openingHoursDisplayRows
+  // above), after every existing field and, like `provenance`, omitted when
+  // there are none; the existing fields are byte-identical.
+  const openingHoursDisplay = openingHoursDisplayRows(info.knowledge.openingHours);
+  const data = {
+    ...info,
+    ...(provenance ? { provenance } : {}),
+    ...(openingHoursDisplay.length ? { openingHoursDisplay } : {}),
+  };
 
   res.json({ success: true, data });
 });
@@ -1602,19 +1725,99 @@ router.get("/knowledge/stats", (_req: Request, res: Response) => {
 
 // ═══════════════════════════════════════════════════════════════
 // CLAIM SYSTEM — Sellers take ownership of their agent
-// Flow:
-//   1. POST /agents/:id/claim         → Request claim (get verification code)
+// Flow (decision 11=A, dev-request 2026-10-17-rfb-claim-verifisering-mot-
+// kjent-kontakt; the rule is documented in knowledge-service.ts):
+//   1. POST /agents/:id/claim         → code to the FARM's own e-mail, or the
+//                                        claim waits in the admin queue
 //   2. POST /agents/:id/claim/verify  → Submit code → get claim token
 //   3. PUT  /agents/:id/knowledge     → Update info (with claim token)
+// A queued claim gets its token only through POST /admin/agents/claim-review-
+// approve (routes/admin-agents.ts).
 // ═══════════════════════════════════════════════════════════════
+
+/**
+ * May a DRY_RUN claim code be put in the response? Only off production:
+ * never with NODE_ENV=production and never on Fly (FLY_APP_NAME), whatever
+ * else is set — a production deploy without SMTP must not hand out codes
+ * (finding rfb-claim-kode-i-svaret-ved-dry-run).
+ */
+export function mayReturnDevClaimCode(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.NODE_ENV !== "production" && !(env.FLY_APP_NAME ?? "").trim();
+}
+
+const CLAIM_QUEUED_MESSAGES: Record<ClaimReviewReason, string> = {
+  no_known_email: "Profilen har ingen kjent e-postadresse vi kan sende koden til. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+  listed_email_wrong: "Takk for beskjeden om e-postadressen. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+  has_owner: "Profilen har allerede en eier. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+};
+
+// The claimId of a sent code lives only in the requester's browser, so the
+// per-profile answer points to the queue, never to "use the code".
+const CLAIM_RATE_LIMITED_MESSAGES: Record<ClaimRateLimitScope, string> = {
+  profile: "Det er nylig sendt en kode til gårdens e-post, og en ny kode kan ikke sendes ennå. Har du ikke tilgang til den e-posten, eller er adressen på profilen feil? Kryss av for «E-postadressen som står på profilen er feil eller utdatert», så går kravet til manuell godkjenning.",
+  platform: "Det er sendt mange koder akkurat nå. Prøv igjen om en time.",
+  review_profile: "Det ligger allerede flere krav på denne profilen til manuell godkjenning. Vi går gjennom dem og tar kontakt. Prøv igjen senere.",
+  review_platform: "Det har kommet mange krav til manuell godkjenning akkurat nå. Prøv igjen om en time.",
+};
+
+const CLAIM_REVIEW_REASON_LABELS: Record<ClaimReviewReason, string> = {
+  no_known_email: "profilen har ingen kjent e-postadresse",
+  listed_email_wrong: "den som krever, sier at e-postadressen på profilen er feil",
+  has_owner: "profilen har allerede en eier",
+};
+
+/** Caps on what the public claim form may store — an unauthenticated write,
+ *  so no field may grow agent_claims without bound. */
+const CLAIM_FIELD_MAX_LENGTH = { name: 200, email: EMAIL_ADDRESS_MAX_LENGTH, phone: 40, source: 64 } as const;
+
+/** Why a POST /agents/:id/claim body is refused (400), or null. The lengths
+ *  are checked before the address shape, so that check only sees a short
+ *  string. phone and source are optional strings. */
+function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unknown; source: unknown }): string | null {
+  const max = CLAIM_FIELD_MAX_LENGTH;
+  const optional = (v: unknown, limit: number) => v === undefined || v === null || (typeof v === "string" && v.length <= limit);
+  if (typeof b.name !== "string" || b.name.length > max.name) return `Ugyldig navn (maks ${max.name} tegn)`;
+  if (typeof b.email !== "string" || b.email.length > max.email || !isSingleEmailAddress(normalizeEmail(b.email))) {
+    return "Ugyldig e-postadresse";
+  }
+  if (!optional(b.phone, max.phone)) return `Ugyldig telefonnummer (maks ${max.phone} tegn)`;
+  if (!optional(b.source, max.source)) return `Ugyldig kilde (maks ${max.source} tegn)`;
+  return null;
+}
+
+/** Tells the admin (ADMIN_NOTIFICATION_EMAIL) that a claim entered the admin
+ *  queue. Fire-and-forget, like the verified-claim notice below; the queue's
+ *  own caps bound how often it fires. */
+function notifyAdminClaimQueued(claimId: string): void {
+  try {
+    const row = getDb().prepare(
+      `SELECT c.agent_id, c.claimant_name, c.claimant_email, c.review_reason, a.name AS agent_name
+         FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
+    ).get(claimId) as { agent_id: string; claimant_name: string; claimant_email: string; review_reason: ClaimReviewReason | null; agent_name: string } | undefined;
+    if (!row) return;
+    const reason = row.review_reason ? CLAIM_REVIEW_REASON_LABELS[row.review_reason] ?? row.review_reason : "ukjent";
+    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason)
+      .catch((err: any) => console.error("[Admin notify] claim-review notice failed:", err?.message));
+  } catch (err: any) {
+    console.error("[Admin notify] claim-review notice error:", err?.message);
+  }
+}
 
 // ─── POST /agents/:id/claim — Request to claim an agent ─────
 
-router.post("/agents/:id/claim", async (req: Request, res: Response) => {
-  const { name, email, phone, source } = req.body;
+router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, res: Response) => {
+  const { name, email, phone, source, listedEmailWrong } = req.body ?? {};
   const agentId = req.params.id as string;
   if (!name || !email) {
     res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
+    return;
+  }
+  // Every field is capped (an unauthenticated write). The address is stored
+  // and, after an admin approval, receives the login link — so it has to be
+  // one address.
+  const fieldError = claimRequestFieldError({ name, email, phone, source });
+  if (fieldError) {
+    res.status(400).json({ success: false, error: fieldError });
     return;
   }
 
@@ -1630,7 +1833,28 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
       claimantEmail: email,
       claimantPhone: phone,
       source: source || 'organic',
+      listedEmailWrong: listedEmailWrong === true,
     });
+
+    if (result.kind === "already_owner") {
+      res.status(400).json({ success: false, error: "Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post." });
+      return;
+    }
+    if (result.kind === "rate_limited") {
+      res.status(429).json({ success: false, error: CLAIM_RATE_LIMITED_MESSAGES[result.scope] });
+      return;
+    }
+    if (result.kind === "queued") {
+      // No code and no token: Daniel decides in the admin queue, and is told
+      // once per new entry (not on a repeat of the same claimant).
+      if (result.created) notifyAdminClaimQueued(result.claimId);
+      res.status(202).json({
+        success: true,
+        message: CLAIM_QUEUED_MESSAGES[result.reason],
+        data: { claimId: result.claimId, status: "pending_review", reason: result.reason },
+      });
+      return;
+    }
 
     // Get agent name for the email
     // dev-request 2026-08-03-mikhailo-quarantine-gates: claim-email bookkeeping,
@@ -1642,41 +1866,61 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
     const agent = agents.find((a: any) => a.id === agentId);
     const agentName = agent?.name || "Ukjent produsent";
 
-    // Send verification code via email (graceful fallback if SMTP not configured)
-    const emailResult = await emailService.sendVerificationCode(email, result.verificationCode, agentName);
+    // The code goes to the farm's own address, never to the typed `email`
+    // (unless that IS the farm's address).
+    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agentName);
+    const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
+    const returnDevCode = dryRun && mayReturnDevClaimCode();
+    if (!emailResult.success || (dryRun && !returnDevCode)) {
+      // Nothing reached the farm (a send error, or SMTP not set up in
+      // production): the claim is expired and the farm may ask again.
+      knowledgeService.markClaimCodeUnsent(result.claimId);
+      res.status(502).json({ success: false, error: "Vi fikk ikke sendt koden nå. Prøv igjen senere, eller kontakt oss." });
+      return;
+    }
 
-    // Build response — include code in dev/dry-run mode, hide in production
-    const responseData: any = { claimId: result.claimId };
-    if (emailResult.messageId === "DRY_RUN") {
-      // SMTP not configured — return code in response so dev/testing still works
+    // The recipient is shown masked, never in full.
+    const sentTo = maskEmail(result.recipient);
+    const responseData: any = { claimId: result.claimId, status: "code_sent", sentTo, expiresInHours: CLAIM_CODE_VALID_HOURS };
+    if (returnDevCode) {
+      // SMTP not configured off production — return code in response so dev/testing still works
       responseData.verificationCode = result.verificationCode;
       responseData._note = "E-post ikke konfigurert. Koden vises kun i testmodus.";
     }
 
     res.json({
       success: true,
-      message: emailResult.messageId === "DRY_RUN"
+      message: returnDevCode
         ? "Verifiseringskode generert (e-post ikke aktiv ennå)."
-        : `Verifiseringskode sendt til ${email}.`,
+        : `Verifiseringskode sendt til gårdens e-post ${sentTo}.`,
       data: responseData,
     });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: err.message });
+    // The detail (e.g. an SQLite constraint message) is logged, not returned:
+    // it says nothing a claimant can act on.
+    console.error(`[claim] request for agent ${agentId} failed:`, err?.message ?? err);
+    res.status(500).json({ success: false, error: "Noe gikk galt med kravet. Prøv igjen senere, eller kontakt oss." });
   }
 });
 
 // ─── POST /agents/:id/claim/verify — Verify claim ──────────
 
 router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
-  const { claimId, code } = req.body;
+  const { claimId, code } = req.body ?? {};
   const agentId = req.params.id as string;
-  if (!claimId || !code) {
+  if (!claimId || !code || typeof claimId !== "string") {
     res.status(400).json({ success: false, error: "claimId og code er påkrevd" });
     return;
   }
 
-  const result = knowledgeService.verifyClaim(claimId, code);
+  // Bound to :id — a claim on another profile is not found (decision 11=A hardening).
+  const result = knowledgeService.verifyClaim(claimId, code, agentId);
   if (!result.success) {
+    if (result.status === "pending_review") {
+      if (result.queued) notifyAdminClaimQueued(claimId);
+      res.status(409).json({ success: false, error: result.error, data: { claimId, status: "pending_review" } });
+      return;
+    }
     res.status(400).json({ success: false, error: result.error });
     return;
   }
@@ -1966,6 +2210,16 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
     res.status(400).json({ success: false, error: "about contains an internal pipeline note — rejected" });
     return;
   }
+  // Integration test 2026-10-17 (I-G): products the write path cannot store
+  // (text, a null product, a product whose name is not text) used to throw a
+  // TypeError in normalizeProducts, answered below as 400 with the raw
+  // JavaScript text. Refused here with the field's path, before the phone
+  // guard fetches anything; upsertKnowledge applies the same check.
+  const productsError = productsWriteError(req.body?.products);
+  if (productsError) {
+    res.status(400).json({ success: false, error: productsError.message, field: productsError.field });
+    return;
+  }
 
   // ── Phone write guard (W40 RFB spot-check, Aalan Gård) ─────────────────
   // ADMIN lane only — the claim-token / API-key lanes are the producer
@@ -2033,12 +2287,15 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
     // searches in the wrong county). Compared before/after the write so a
     // re-sent identical address never resets a good geocode.
     const placeBefore = knowledgeService.getKnowledge(agentId);
+    let ownerLockSkipped: SkippedKnowledgeField[] = [];
     if (isAdmin) {
-      // Admin enrichment — preserve dataSource as "auto" (or what's in body)
-      knowledgeService.upsertKnowledge(agentId, {
+      // Admin enrichment — preserve dataSource as "auto" (or what's in body).
+      // Not the owner path: with OWNER_LOCK_ENFORCE_WRITES on, owner-locked
+      // fields are left alone and listed in the response as skipped.
+      ownerLockSkipped = knowledgeService.upsertKnowledge(agentId, {
         ...(body as any),
         dataSource: (body.dataSource as any) || "auto",
-      });
+      }).skipped;
     } else {
       // Owner update — sets dataSource to "owner"
       knowledgeService.ownerUpdate(agentId, req.body);
@@ -2065,6 +2322,8 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
       data: { ...updated, trustScore: newTrustScore },
       // Same flag PUT /admin/knowledge reports; absent when nothing moved.
       ...(addressMoved ? { geocode_invalidated: true } : {}),
+      // Owner lock: present only when a field was left alone (flag on).
+      ...(ownerLockSkipped.length ? { skipped: ownerLockSkipped } : {}),
       // W40 write guards: present only on an admin call that carried `phone`.
       ...(phoneWrite ? { phone_write: phoneWrite } : {}),
       ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
@@ -2521,11 +2780,13 @@ router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
   }
 });
 
-// ─── POST /admin/google-rating/:id — Fetch Google Places rating ──
-// Uses the server-side GOOGLE_PLACES_API_KEY to look up a producer's
-// Google rating and review count, then persists it to knowledge.
-// This lets enrichment agents (running in sandbox without the key)
-// trigger Google rating lookups via our own API.
+// ─── POST /admin/google-rating/:id — Google Places rating (off since S4-A2) ──
+// Since S4-A2 (rating fetch off, services/places-match.ts) it answers
+// status "rating_fetch_disabled" without calling Google, and writes nothing.
+// With the lever set back on, it uses the server-side Places key to look up
+// a producer's Google rating and review count and persists it to knowledge,
+// so enrichment agents (running in sandbox without the key) can trigger the
+// lookup via our own API.
 
 router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
@@ -2562,18 +2823,42 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
     return;
   }
 
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+  // places-treffvakt (S4-A2, Daniel's decision 2=A): Google's rating is no
+  // longer fetched (services/places-match.ts, GOOGLE_RATING_FETCH_ENABLED).
+  // A rating is all this route fetches and writes, so it answers without a
+  // Places call. A rating already on file stays untouched. No `found`: no
+  // lookup was made, so the answer says nothing about Google.
+  if (!googleRatingFetchEnabled()) {
+    res.json({
+      success: true,
+      status: "rating_fetch_disabled",
+      message: "Google-ratinger hentes ikke lenger (vilkårene for Google Places tillater ikke lagring). Ingenting er skrevet.",
+    });
+    return;
+  }
+
   const { agent, knowledge: k } = info;
   const city = (agent as any).city || "";
-  const searchQuery = `${agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+  const searchQuery = rfbPlacesTextQuery(agent.name, city);
+
+  // places.addressComponents (Pro tier; the call is Enterprise already
+  // through rating) feeds the places-match guard below. placesFieldMask
+  // (S4-A2) keeps the rating fields out whenever rating fetch is off.
+  const fieldMask = placesFieldMask(["places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.addressComponents"]);
 
   try {
+    // Durable Places call log (S4-A2 review): this route made unlogged calls
+    // before. Enterprise through the rating fields; the mask marks the row
+    // as a rating call (places-usage-tracker.ts).
+    logPlacesCall(getDb(), "rfb", "google-rating", "text_search_enterprise", fieldMask);
     // Google Places Text Search (New API)
     const placesResp = await fetch("https://places.googleapis.com/v1/places:searchText", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": placesKey,
-        "X-Goog-FieldMask": "places.rating,places.userRatingCount,places.displayName,places.formattedAddress",
+        "X-Goog-FieldMask": fieldMask,
       },
       body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
     });
@@ -2592,8 +2877,26 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
       return;
     }
 
-    // Take the first result — verify it's a reasonable match
-    const place = places[0];
+    // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+    // places-treffvakt (S3): the best-named CONFIDENT candidate (name +
+    // postal code / town, services/places-match.ts), never places[0]
+    // unchecked. No confident or no unambiguous candidate → nothing is written.
+    const entity = rfbPlaceMatchEntity({ name: agent.name, postalCode: k.postalCode, city });
+    const pick = pickRfbPlace(entity, places as any[]);
+    if (!pick.place) {
+      console.warn(formatPlacesMatchGuardLog(agentId, pick, places.length, entity));
+      res.json({
+        success: true,
+        found: false,
+        status: "place_mismatch",
+        mismatchReason: pick.reason,
+        placeName: pick.placeName,
+        nameSim: Math.round(pick.nameSim * 100) / 100,
+        message: `Ingen sikker Google Places-treff for "${searchQuery}" (navn og sted stemmer ikke)`,
+      });
+      return;
+    }
+    const place = pick.place;
     const rating = place.rating;
     const reviewCount = place.userRatingCount || 0;
     const placeName = place.displayName?.text || "";
@@ -2671,9 +2974,12 @@ router.post("/admin/agents/:id/geocode-reset", (req: Request, res: Response) => 
   res.json({ success: true, data: { agent_id: agentId, before } });
 });
 
-// ─── POST /admin/google-rating-batch — Batch fetch ratings ──
-// Accepts { agentIds: string[] }, fetches Google rating for each.
-// Max 50 per request to respect API limits.
+// ─── POST /admin/google-rating-batch — Places batch (no rating since S4-A2) ──
+// Accepts { agentIds: string[] }, max 50 per request to respect API limits.
+// Since S4-A2 (rating fetch off, services/places-match.ts) no rating is
+// fetched or written: only the include_address_phone pass (PR-82) runs, on
+// the Pro mask. With the lever set back on it fetches Google's rating for
+// each agent as before.
 
 router.post("/admin/google-rating-batch", async (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
@@ -2724,16 +3030,43 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // Google call entirely when there's nothing left to fetch (no
   // address/phone backfill requested either).
   //
-  // Full/first-time field masks — UNCHANGED from pre-existing behavior.
-  const enterpriseFieldMask = wantAddrPhone
-    ? "places.id,places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
-    : "places.rating,places.userRatingCount,places.displayName";
+  // Full/first-time field masks. dev-request 2026-10-16-rfb-strukturerte-
+  // data-tredjepartsrating-og-places-treffvakt (S3) added
+  // places.addressComponents to all three masks: the places-match guard below
+  // reads its postal_code / postal_town. It is a Pro-tier field, so no mask
+  // changes SKU tier.
+  //
+  // Same dev-request, S4-A2 (Daniel's decision 2=A): Google's rating is no
+  // longer fetched or written (services/places-match.ts,
+  // GOOGLE_RATING_FETCH_ENABLED). While that is off, no agent gets the
+  // Enterprise-tier first-time call at all (requestEnterprise below), and
+  // placesFieldMask keeps places.rating and places.userRatingCount out of
+  // these masks as a second guard. On main that call's PR-82 address/phone
+  // pass ran only for a place WITH a rating (no rating → no_rating, nothing
+  // written), so keeping the call without the rating would write Places
+  // address and phone for agents main never wrote them for, and A2 leaves
+  // that logic alone (S4-A non-goal; Places address/phone is Daniel's own
+  // open question, Confirm point 6(b)). Every call is the repeat-run Pro mask
+  // instead, as main already sends from an agent's second run on: address via
+  // formattedAddress, phone only through the PR-29 Details fallback the
+  // caller caps (max_details_calls). The cost: a place with a rating no
+  // longer gets its phone from the first Text Search. Without
+  // include_address_phone nothing is left to fetch, so no agent is sent to
+  // Google. Rows report no rating at all, fetched or on file, and the stored
+  // values stay untouched.
+  const fetchRating = googleRatingFetchEnabled();
+  const enterpriseFieldMask = placesFieldMask(
+    wantAddrPhone
+      ? ["places.id", "places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.internationalPhoneNumber", "places.addressComponents"]
+      : ["places.rating", "places.userRatingCount", "places.displayName", "places.addressComponents"],
+    fetchRating,
+  );
   // Repeat-run field mask — Essentials/Pro tier only (no rating,
   // userRatingCount, or internationalPhoneNumber). formattedAddress is
   // Pro-tier and still useful for the PR-82 address backfill below; phone
   // backfill for these agents runs through the PR-29 Place Details (New)
   // fallback instead, which is a separate (non-Enterprise) SKU.
-  const proFieldMask = "places.id,places.displayName,places.formattedAddress";
+  const proFieldMask = "places.id,places.displayName,places.formattedAddress,places.addressComponents";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
 
@@ -2742,13 +3075,15 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // `lokal-agent-enrichment` calls this in PHASE 2F with
   // include_address_phone:true, which writes address/phone (+ their
   // field_provenance) onto agent_knowledge. The gate covers the WHOLE handler,
-  // not just that branch, because the flag-less path still writes
-  // google_rating/google_review_count through upsertKnowledge and stamps
-  // google_enterprise_fetched_at — all agent_knowledge mutations, all covered
-  // by the same pause. Gated per-REQUEST on the whole batch (any paused
-  // vertical among the ids blocks everything), identical policy and identical
-  // 423 body to every other gated surface — and placed before the first
-  // Google Places call, so a paused run also spends no API quota.
+  // not just that branch, because with rating fetch on (the S4-A2 lever set
+  // back) the flag-less path writes google_rating/google_review_count through
+  // upsertKnowledge and stamps google_enterprise_fetched_at — all
+  // agent_knowledge mutations, all covered by the same pause (with the lever
+  // off, the default, that path makes no call and writes nothing). Gated
+  // per-REQUEST on the whole batch (any paused vertical among the ids blocks
+  // everything), identical policy and identical 423 body to every other gated
+  // surface — and placed before the first Google Places call, so a paused run
+  // also spends no API quota.
   {
     const pauseBlock = enrichmentWritePauseBlockForAgents(
       getDb,
@@ -2764,6 +3099,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   let enriched = 0;
   let enterpriseCalls = 0; // Text Search calls made with the Enterprise-tier mask
   let proCalls = 0;        // Text Search calls made with the Essentials/Pro-only mask
+  let ratingCalls = 0;     // Text Search calls whose mask asked for the rating (0 while rating fetch is off, S4-A2)
 
   // Look up existing Enterprise-tier state for the whole batch in one query
   // (rather than per-agent) so we know, before making any call, which agents
@@ -2842,19 +3178,27 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
     const state = enterpriseState.get(agentId);
     const hasEnterpriseData = state?.hasEnterpriseData === true;
-    const requestEnterprise = !hasEnterpriseData;
+    // S4-A2: never with rating fetch off — every call then uses the Pro mask
+    // (see the masks above), and no Enterprise attempt is recorded.
+    const requestEnterprise = !hasEnterpriseData && fetchRating;
+    // The rating a result row reports: the one this call fetched, else the
+    // one on file. None while rating fetch is off (S4-A2).
+    const ratingOnRow = (fetched?: { rating?: number; userRatingCount?: number } | null): Record<string, unknown> => {
+      if (!fetchRating) return {};
+      if (fetched) return { googleRating: fetched.rating, googleReviewCount: fetched.userRatingCount || 0 };
+      return { googleRating: state?.existingRating ?? undefined, googleReviewCount: state?.existingReviewCount ?? undefined };
+    };
 
     // Nothing left to do for this agent this run: its Enterprise-tier fetch
-    // is still fresh (within ENTERPRISE_REFRESH_DAYS), and the caller isn't
-    // asking for address/phone backfill either — skip the Google call
-    // entirely.
+    // is still fresh (within ENTERPRISE_REFRESH_DAYS), or no rating is
+    // fetched at all (S4-A2), and the caller isn't asking for address/phone
+    // backfill either — skip the Google call entirely.
     if (!requestEnterprise && !wantAddrPhone) {
       results.push({
         agentId,
         name: info.agent.name,
-        status: "skipped_has_rating",
-        googleRating: state?.existingRating ?? undefined,
-        googleReviewCount: state?.existingReviewCount ?? undefined,
+        status: fetchRating ? "skipped_has_rating" : "skipped_rating_fetch_disabled",
+        ...ratingOnRow(),
       });
       continue;
     }
@@ -2862,18 +3206,21 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
     const fieldMask = requestEnterprise ? enterpriseFieldMask : proFieldMask;
 
     const city = (info.agent as any).city || "";
-    const searchQuery = `${info.agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+    const searchQuery = rfbPlacesTextQuery(info.agent.name, city);
 
     try {
       if (requestEnterprise) enterpriseCalls++; else proCalls++;
+      if (requestEnterprise) ratingCalls++; // the Enterprise mask carries the rating fields
       // Durable cross-run log (places_api_call_log) for the monthly-projection
       // guardrail — complements the per-run enterpriseCalls/proCalls counters
-      // above, which only live for the duration of this response.
+      // above, which only live for the duration of this response. The mask
+      // marks a rating call in the log (S4-A2, places-usage-tracker.ts).
       logPlacesCall(
         getDb(),
         "rfb",
         "google-rating-batch",
-        requestEnterprise ? "text_search_enterprise" : "text_search_pro"
+        requestEnterprise ? "text_search_enterprise" : "text_search_pro",
+        fieldMask
       );
       const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
         method: "POST",
@@ -2888,7 +3235,39 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       if (!resp.ok) { results.push({ agentId, status: "api_error", code: resp.status }); continue; }
 
       const data = await resp.json() as any;
-      const place = (data.places || [])[0];
+      const candidates: any[] = Array.isArray(data.places) ? data.places : [];
+
+      // ── places-match guard (dev-request 2026-10-16-rfb-strukturerte-data-
+      // tredjepartsrating-og-places-treffvakt, S3) ─────────────────────────
+      // Google's answer is a candidate list for a free-text query. Of the
+      // candidates whose name AND postal code / town match this agent
+      // (services/places-match.ts, the guard dental uses), take the
+      // best-named one — never places[0] unchecked, which is how Bergen
+      // Mathall got Mathallen Oslo's rating (2026-07-16). Candidates but none
+      // confident (or two differently named ones nearly tie) → place_mismatch:
+      // no rating upsert, no address/phone write, no google_places
+      // provenance, no Brreg lookup or Details call. The Enterprise attempt
+      // is still recorded (the call was spent), exactly like a no_rating answer.
+      const entity = rfbPlaceMatchEntity({ name: info.agent.name, postalCode: info.knowledge.postalCode, city });
+      const pick = pickRfbPlace(entity, candidates);
+      if (candidates.length > 0 && !pick.place) {
+        console.warn(formatPlacesMatchGuardLog(agentId, pick, candidates.length, entity));
+        results.push({
+          agentId,
+          name: info.agent.name,
+          status: "place_mismatch",
+          mismatchReason: pick.reason,
+          placeName: pick.placeName,
+          nameSim: Math.round(pick.nameSim * 100) / 100,
+          ...ratingOnRow(),
+        });
+        if (requestEnterprise) markEnterpriseFetched(agentId);
+        continue;
+      }
+      // null only when Google returned no candidates at all (handled below
+      // exactly as before: no_rating / skipped_has_rating; no_place with
+      // rating fetch off, S4-A2).
+      const place = pick.place;
 
       if (requestEnterprise) {
         if (!place?.rating) {
@@ -2901,8 +3280,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             agentId,
             name: info.agent.name,
             status: "no_rating",
-            googleRating: state?.existingRating ?? undefined,
-            googleReviewCount: state?.existingReviewCount ?? undefined,
+            ...ratingOnRow(),
           });
           // A completed (resp.ok) request with a genuine no-match/no-rating
           // result — record the Enterprise-tier attempt so this agent isn't
@@ -2926,17 +3304,17 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         // Record the Enterprise-tier fetch for this refresh window (best-effort, non-blocking).
         markEnterpriseFetched(agentId);
       } else {
-        // Repeat run, agent already has Enterprise-tier data: no rating
-        // fields were requested, so `place.rating`/`place.userRatingCount`
-        // are never populated here. Only address (Pro-tier, via
-        // formattedAddress) may have come back for the PR-82 backfill below.
+        // Pro mask: no rating fields were requested, so `place.rating`/
+        // `place.userRatingCount` are never read here. Only address (Pro-tier,
+        // via formattedAddress) may have come back for the PR-82 backfill
+        // below. A repeat run (the agent already has Enterprise-tier data),
+        // or, with rating fetch off (S4-A2), any run.
         if (!place) {
           results.push({
             agentId,
             name: info.agent.name,
-            status: "skipped_has_rating",
-            googleRating: state?.existingRating ?? undefined,
-            googleReviewCount: state?.existingReviewCount ?? undefined,
+            status: fetchRating ? "skipped_has_rating" : "no_place",
+            ...ratingOnRow(),
           });
           continue;
         }
@@ -3003,12 +3381,12 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         const needPhone = typeof place.internationalPhoneNumber !== "string" || place.internationalPhoneNumber.trim() === "";
         if ((needAddr || needPhone) && detailsCalls < effectiveCap) {
           detailsCalls++;
-          logPlacesCall(getDb(), "rfb", "google-rating-batch-details", "place_details");
+          const { url: detailsUrl, fieldMask: detailsMask } = buildPlaceDetailsRequest(
+            place.id,
+            { addr: needAddr, phone: needPhone },
+          );
+          logPlacesCall(getDb(), "rfb", "google-rating-batch-details", "place_details", detailsMask);
           try {
-            const { url: detailsUrl, fieldMask: detailsMask } = buildPlaceDetailsRequest(
-              place.id,
-              { addr: needAddr, phone: needPhone },
-            );
             const detResp = await fetch(detailsUrl, {
               headers: {
                 "X-Goog-FieldMask": detailsMask,
@@ -3232,6 +3610,12 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                 sets.push("data_enriched_at = ?"); params.push(nowIso);
               }
               if (sets.length > 0) {
+                // S4-A2: with rating fetch off a first-time agent reaches this
+                // pass without an agent_knowledge row (no rating upsert, no
+                // Enterprise marker created one), and an UPDATE alone would
+                // write nothing while the row reports addressWritten. A
+                // minimal row, as markEnterpriseFetched inserts one.
+                if (!row) db.prepare("INSERT INTO agent_knowledge (agent_id) VALUES (?) ON CONFLICT(agent_id) DO NOTHING").run(agentId);
                 params.push(agentId);
                 db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
               }
@@ -3249,8 +3633,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             agentId,
             name: info.agent.name,
             status: "enriched_provenance_error",
-            googleRating: requestEnterprise ? place.rating : (state?.existingRating ?? undefined),
-            googleReviewCount: requestEnterprise ? (place.userRatingCount || 0) : (state?.existingReviewCount ?? undefined),
+            ...ratingOnRow(requestEnterprise ? place : null),
             addressWritten: false,
             phoneWritten: false,
             provenanceError: provErr?.message ?? String(provErr),
@@ -3265,8 +3648,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         agentId,
         name: info.agent.name,
         status: requestEnterprise ? "enriched" : "enriched_addr_phone_only",
-        googleRating: requestEnterprise ? place.rating : (state?.existingRating ?? undefined),
-        googleReviewCount: requestEnterprise ? (place.userRatingCount || 0) : (state?.existingReviewCount ?? undefined),
+        ...ratingOnRow(requestEnterprise ? place : null),
         ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
         // W40 write guards: present only when they fired.
         ...(addressCorrected ? { addressCorrected: true } : {}),
@@ -3282,7 +3664,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
   res.json({
     success: true,
-    message: `Google-rating hentet for ${enriched} av ${batch.length} agenter`,
+    message: fetchRating
+      ? `Google-rating hentet for ${enriched} av ${batch.length} agenter`
+      : `Google-ratinger hentes ikke lenger; ${batch.length} agenter behandlet${wantAddrPhone ? " for adresse og telefon" : " uten Places-kall"}`,
     data: {
       enriched,
       total: batch.length,
@@ -3295,6 +3679,10 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       enterprise_calls: enterpriseCalls,
       pro_calls: proCalls,
       details_calls: detailsCalls,
+      // S4-A2: Text Search calls that asked Google for the rating. 0 while
+      // rating fetch is off, and enterprise_calls with it (Pro mask only);
+      // with the lever on, every Enterprise-tier call asks for the rating.
+      rating_calls: ratingCalls,
     },
   });
 });
@@ -3305,7 +3693,11 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 // aggregated here at read-time) and returns this-calendar-month call counts
 // per SKU, so the daily orchestrator brief can flag when the Enterprise-SKU
 // free-tier cap (1,000 calls/month) is at risk. Observability only — never
-// touches enrichment state.
+// touches enrichment state. rating_field_calls_this_month (dev-request
+// 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
+// S4-A2) counts the calls whose FieldMask asked Google for its rating: 0
+// while rating fetch is off (S4-A's acceptance); rows logged before S4-A2
+// carry no mark and are not counted.
 router.get("/admin/places-usage", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = getAdminKey();
@@ -3316,6 +3708,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
 
   const byVerticalSku: Array<{ vertical: string; sku: string; calls_this_month: number }> = [];
   byVerticalSku.push(...getPlacesUsageThisMonth(getDb(), "rfb"));
+  let ratingFieldCallsThisMonth = getPlacesRatingFieldCallsThisMonth(getDb());
   // Only reach into the dental vertical DB when it's explicitly enabled —
   // db-factory.ts's getDb("dental") lazily CREATES /app/data/dental.db (and
   // runs the full dental schema-init) on first call, so an unconditional
@@ -3325,6 +3718,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
   if (process.env.ENABLE_DENTAL === "1") {
     try {
       byVerticalSku.push(...getPlacesUsageThisMonth(getVerticalDb("dental"), "dental"));
+      ratingFieldCallsThisMonth += getPlacesRatingFieldCallsThisMonth(getVerticalDb("dental"));
     } catch {
       // dental vertical enabled but unavailable for some other reason — rfb-only summary
     }
@@ -3344,6 +3738,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
       enterprise_free_cap: ENTERPRISE_FREE_CAP,
       soft_guardrail_threshold: SOFT_GUARDRAIL_THRESHOLD,
       over_soft_guardrail: enterpriseCallsThisMonth > SOFT_GUARDRAIL_THRESHOLD,
+      rating_field_calls_this_month: ratingFieldCallsThisMonth,
     },
   });
 });
@@ -3455,6 +3850,12 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       // admin-outreach-candidates.ts sum rollup + remaining raw) would reappear
       // out of the rollup remainder if the same agent_id were ever reused.
       db.prepare("DELETE FROM agent_view_daily WHERE agent_id = ?").run(agentId);
+      // Its AI-assistant bucket (agent_ai_view_daily, dev-request
+      // 2026-10-22-statistikk-samme-tall-12-mnd S0) goes with it, same reason.
+      db.prepare("DELETE FROM agent_ai_view_daily WHERE agent_id = ?").run(agentId);
+      // EN/SV profile translations + their audit rows are derived from the
+      // agent's own prose, so they go with it (slettefrist slice B).
+      deleteAgentProfileTranslations(db, agentId);
       db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
     });
     deleteAll();
@@ -3749,7 +4150,10 @@ router.post("/admin/deduplicate", (req: Request, res: Response) => {
   if (!dryRun && duplicates.length > 0) {
     const deleteStmt = db.prepare("DELETE FROM agents WHERE id = ?");
     const deleteMany = db.transaction((ids: string[]) => {
-      for (const id of ids) deleteStmt.run(id);
+      for (const id of ids) {
+        deleteAgentProfileTranslations(db, id);
+        deleteStmt.run(id);
+      }
     });
     deleteMany(duplicates.map(d => d.id));
   }
@@ -3836,9 +4240,21 @@ function normalizeName(name: string): string {
     .replace(/\s+/g, " ");
 }
 
+/**
+ * The matrix cells levenshtein() has filled since the process started (slice
+ * I-Y2): the test reads the work of one /find-match call from it, not the
+ * clock.
+ */
+let levenshteinCells = 0;
+/** Test-only: levenshteinCells (see there). */
+export function __levenshteinCellsForTesting(): number {
+  return levenshteinCells;
+}
+
 // Simple Levenshtein distance for name similarity
 function levenshtein(a: string, b: string): number {
   const m = a.length, n = b.length;
+  levenshteinCells += m * n;
   const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
   for (let i = 0; i <= m; i++) dp[i][0] = i;
   for (let j = 0; j <= n; j++) dp[0][j] = j;
@@ -3862,8 +4278,15 @@ function similarityScore(a: string, b: string): number {
 // Used by the seller registration page to show "Is this you?"
 
 router.get("/find-match", (req: Request, res: Response) => {
-  const name = (req.query.name as string || "").trim();
-  const city = (req.query.city as string || "").trim();
+  // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+  // rfb-find-match-levenshtein-uten-tak): the name is cut to MAX_NAME_CHARS at
+  // a word boundary (utils/free-text.ts) before any matching. The edit
+  // distance below runs over the whole name for every producer, so a 2000
+  // character name took about 4 s and a 15 000 one, within the 16 kB header
+  // limit, about 30 s. Every real name is shorter than the cap. The city is
+  // a place field and is cut the same way; the answer echoes both as read.
+  const name = capName((req.query.name as string || "").trim());
+  const city = capName((req.query.city as string || "").trim());
 
   if (!name || name.length < 2) {
     res.json({ success: true, matches: [] });
@@ -5092,7 +5515,7 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
 
     const rows = db.prepare(`
       SELECT
-        p.id, p.name, p.city, p.trust_score, p.is_verified,
+        p.id, p.name, p.city, p.trust_score, p.is_verified, p.role, p.umbrella_type AS member_umbrella_type,
         aff.id AS affiliation_id, aff.status, aff.labels, aff.joined_at
       FROM agent_affiliations aff
       INNER JOIN agents p ON p.id = aff.producer_id
@@ -5106,7 +5529,9 @@ router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
       name: r.name,
       city: r.city,
       slug: slugify(r.name),
-      profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+      ...(failsProducerRoleGate(r.role, !!r.member_umbrella_type)
+        ? {}
+        : { profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}` }),
       card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
       trust_score: r.trust_score,
       is_verified: r.is_verified === 1,
@@ -5283,7 +5708,9 @@ router.get("/salgskanal/:slug", (req: Request, res: Response) => {
         categories: a.categories || [],
         trustScore: a.trustScore ?? null,
         isVerified: !!a.isVerified,
-        profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}`,
+        ...(failsProducerRoleGate((a as any).role, false)
+          ? {}
+          : { profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}` }),
         card_url: `${getBaseUrl(req)}/api/marketplace/agents/${a.id}/card`,
         evidence: evidence || null,
       })),

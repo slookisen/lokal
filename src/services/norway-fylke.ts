@@ -604,7 +604,7 @@ export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
   "Romsdal",      // Møre og Romsdal — spans Molde/Rauma etc.; substring-collides with the fylke name itself
   "Vesterålen",   // Nordland — spans Sortland/Andøy/Øksnes/Bø/Hadsel
   "Lofoten",      // Nordland — spans Vågan/Vestvågøy/Flakstad/Moskenes/Røst/Værøy
-  "Hardanger",    // Vestland — spans Odda/Ulvik/Jondal/Eidfjord/Kvinnherad etc.
+  "Hardanger",    // Vestland — spans Ullensvang/Ulvik/Eidfjord/Kvam/Kvinnherad
   "Valdres",      // Innlandet — spans Nord-Aurdal/Vestre Slidre/Øystre Slidre/Vang/Etnedal/Sør-Aurdal
   "Helgeland",    // Nordland — spans Mo i Rana/Mosjøen/Brønnøysund/Sandnessjøen etc.
 ]);
@@ -627,50 +627,56 @@ export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
 // @kommune` swap, and it is intentionally NOT added as a fake 1:1 kommune
 // synonym.
 //
-// Deliberately curated + narrow: every kommune name below is a display name
-// ALREADY present as a key of CITY_TO_FYLKE_RAW above (verified directly in
-// experiences-a2a.test.ts) — no invented/unverified kommune name is added
-// here — EXCEPT "Senja" itself (see that entry's own comment below): it is
-// the real DB kommune value post-2020-reform, not a CITY_TO_FYLKE_RAW-listed
-// stand-in town, so it's intentionally absent from CITY_TO_FYLKE_RAW/
-// KOMMUNE_NAMES (detectKommune() must not treat every region label as also a
-// standalone kommune) while still being correct as a REGION_TO_KOMMUNER
-// expansion target, which only feeds the `kommune IN (...)` SQL clause.
+// Deliberately curated + narrow: every name below is a kommune in the
+// vendored SSB table (src/data/kommune-fylke-2024.json, the 2024 kommune list
+// fylke-2024-migration.ts reads), in the same fylke as the rest of its region
+// — checked in opplevagent-sok-oppfolging.test.ts. Until 2026-10-17 the table
+// held only CITY_TO_FYLKE_RAW keys, so Lofoten and Hardanger expanded to towns
+// (Leknes, Reine) and pre-2020 kommuner (Odda, Jondal) the catalogue does not
+// use: «Lofoten» found 1 row where Vågan and Vestvågøy alone have 23 (dev-
+// request 2026-10-17-integrasjonstest-oppfolging, AI-2). A region's kommune
+// need not be in CITY_TO_FYLKE_RAW/KOMMUNE_NAMES: this table only feeds the
+// `kommune IN (...)` clause, and detectKommune() must not read every one of
+// these as a standalone kommune.
 // A tourist-region name NOT in this table intentionally still resolves
 // to count:0 (no fuzzy/fallback matching) — see the closed dev-request
 // 2026-09-06-opplevagent-discovery-nulltreff-standardliste, whose "no false
 // standard list" guarantee this preserves.
 //
-// Where the district's OFFICIAL kommune name isn't itself a CITY_TO_FYLKE_RAW
-// entry (e.g. Lofoten's real kommuner are Vågan/Vestvågøy/Flakstad/Moskenes/
-// Røst/Værøy — see the Lofoten entry's own comment in
-// NON_KOMMUNE_REGION_LABELS above — and none of those six is in
-// CITY_TO_FYLKE_RAW), the district's well-known town name is used instead
-// (e.g. "Svolvær" standing in for Vågan) — consistent with this module's
-// existing city/kommune convention, where several CITY_TO_FYLKE_RAW entries
-// are already a town name doing duty as its kommune's catalog-matching value
-// rather than the town's strict official kommune name.
+// Two exceptions to "all the kommuner of the region":
+//   - A town is listed only while the live catalogue files rows under it.
+//     Svolvær (a town in Vågan) had one such row on 2026-10-17; Leknes,
+//     Reine, Henningsvær, Odda, Jondal, Finnsnes, Fagernes and Beitostølen
+//     had none and were dropped.
+//   - A name two SSB kommuner share is left out: the IN clause matches the
+//     name alone, so "Herøy" under Sunnmøre would also bring in Herøy in
+//     Nordland. A missed row is better than one from the wrong part of the
+//     country (the same "no false list" principle as above).
+// A region is the kommuner in the fylke the gazetteer files it under, so
+// Nordmøre stops at the Møre og Romsdal border: Rindal and Heim, in
+// Trøndelag since 2019/2020, are not listed.
 //
 // The Geiranger bug (a bygd wrongly present in CITY_TO_FYLKE_RAW as if it
 // were its own kommune) is a SEPARATE, already-flagged issue and explicitly
 // out of scope here — "Geiranger" is deliberately never referenced below,
 // even though it sits inside the Sunnmøre district.
 export const REGION_TO_KOMMUNER: Readonly<Record<string, readonly string[]>> = {
-  "Lofoten": ["Svolvær", "Leknes", "Reine", "Henningsvær"],
-  "Hardanger": ["Odda", "Ulvik", "Jondal", "Eidfjord", "Kvinnherad"],
+  "Lofoten": ["Vågan", "Vestvågøy", "Flakstad", "Moskenes", "Værøy", "Røst", "Svolvær"],
+  "Hardanger": ["Ullensvang", "Ulvik", "Eidfjord", "Kvam", "Kvinnherad"],
   // "Senja" is BOTH the curated tourist-region label AND, since the 2020
   // municipal reform merged Lenvik/Berg/Torsken/Tranøy into one new kommune
   // literally named "Senja", the real, current `experiences.kommune` value
   // itself (verified live: 20 real rows tagged kommune:"Senja" directly) —
   // unlike every other region here, whose district name isn't itself a DB
   // kommune value. "Finnsnes" (the merged kommune's administrative center)
-  // is kept too since it's harmless as an IN(...) member, but it alone
-  // produced 0 live hits (2026-09-22 fix-up to PR #907, dev-request 2026-
-  // 09-21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke AC2).
-  "Senja": ["Senja", "Finnsnes"],
-  "Sunnmøre": ["Ålesund", "Volda", "Ørsta", "Stranda", "Sykkylven"],
-  "Nordmøre": ["Kristiansund", "Surnadal"],
-  "Valdres": ["Fagernes", "Beitostølen"],
+  // was listed too until 2026-10-17, but never had a live row (2026-09-22
+  // fix-up to PR #907, dev-request 2026-09-21-opplevagent-discovery-
+  // regionnavn-utenfor-kommune-fylke AC2).
+  "Senja": ["Senja"],
+  // No "Herøy": see the shared-name rule above.
+  "Sunnmøre": ["Ålesund", "Volda", "Ørsta", "Stranda", "Sykkylven", "Haram", "Giske", "Sula", "Hareid", "Ulstein", "Sande", "Vanylven", "Fjord"],
+  "Nordmøre": ["Kristiansund", "Surnadal", "Averøy", "Gjemnes", "Tingvoll", "Sunndal", "Smøla", "Aure"],
+  "Valdres": ["Nord-Aurdal", "Øystre Slidre", "Vestre Slidre", "Vang", "Sør-Aurdal", "Etnedal"],
 };
 
 // Exported for tests + admin-UI sanity checks.

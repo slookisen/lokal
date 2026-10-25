@@ -3,6 +3,9 @@ import crypto from "crypto";
 import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
 import { isJunkDescription, normalizeProse } from "./description-quality";
+import { textEntries } from "../utils/text-entries";
+import { normalizeEmail } from "./blocklist-service";
+import { customerRuleSql } from "./customer-rule";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -27,18 +30,21 @@ import { isJunkDescription, normalizeProse } from "./description-quality";
 //                        without dropping the relevance signal for search.
 //
 // Pure function — does not mutate the input array.
+//
+// Integration test 2026-10-17 (I-F): `raw` is DB JSON, so it is read with
+// textEntries — text entries, trimmed; a list stored as one string is one
+// entry. A number or an object among the entries used to reach `.trim()` and
+// throw out of every reader (lokal_info, lokal_search, /agents/:id/info).
 export function relabelCertifications(
-  raw: string[] | undefined | null,
+  raw: unknown,
   debioVerified: boolean,
 ): string[] {
-  const list = Array.isArray(raw) ? raw.slice() : [];
-  const isDebioClaim = (s: string) => /^debio(\b|[-_\s])|debio[-_ ]?sertifisert/i.test(s.trim());
-  const isOrganicClaim = (s: string) =>
-    /^øk(o(logisk)?)?\b/i.test(s.trim()) || /^organic\b/i.test(s.trim());
+  const list = textEntries(raw);
+  const isDebioClaim = (s: string) => /^debio(\b|[-_\s])|debio[-_ ]?sertifisert/i.test(s);
+  const isOrganicClaim = (s: string) => /^øk(o(logisk)?)?\b/i.test(s) || /^organic\b/i.test(s);
   const out: string[] = [];
   let hadDebioOrOrganicSeed = false;
   for (const item of list) {
-    if (!item) continue;
     if (isDebioClaim(item) || isOrganicClaim(item)) {
       hadDebioOrOrganicSeed = true;
       continue; // dropped — re-emitted below per verification status
@@ -114,6 +120,51 @@ export interface CuratedFieldMeta {
   request_summary?: string; // 1-line: "Eirin (daglig leder) ba om ny beskrivelse"
 }
 
+// ─── Owner lock in the write layer ───────────────────────────
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere (S1a point 1). The owner
+// portal stamps curated_fields.<column>.by = "owner" on every owner save, but
+// upsertKnowledge() used to overwrite such a field for any caller (enrichment,
+// admin PUT /agents/:id/knowledge …). With OWNER_LOCK_ENFORCE_WRITES on, a
+// write that does not come from the owner path leaves an owner-locked field
+// as it is and reports it as skipped: owner_locked. Default OFF = the write
+// is byte-identical to before. `products` is lockable like any other column
+// (an owner-asserted product list / its categories live in that one column).
+
+/** Env flag (read at call time, "1" or "true" = on). Default OFF. */
+export const OWNER_LOCK_ENFORCE_FLAG = "OWNER_LOCK_ENFORCE_WRITES";
+
+export function ownerLockEnforcedForWrites(): boolean {
+  const v = process.env[OWNER_LOCK_ENFORCE_FLAG];
+  return v === "1" || v === "true";
+}
+
+/** AgentKnowledge property -> the curated_fields key (the DB column name). */
+const LOCKABLE_FIELD_KEYS: Record<string, string> = {
+  address: "address", postalCode: "postal_code", website: "website", phone: "phone", email: "email",
+  openingHours: "opening_hours", products: "products", about: "about", specialties: "specialties",
+  certifications: "certifications", paymentMethods: "payment_methods", deliveryOptions: "delivery_options",
+  googleRating: "google_rating", googleReviewCount: "google_review_count", tripadvisorRating: "tripadvisor_rating",
+  externalReviews: "external_reviews", externalLinks: "external_links", images: "images", seasonality: "seasonality",
+  deliveryRadius: "delivery_radius", minOrderValue: "min_order_value",
+};
+
+/** A field a knowledge write left alone. */
+export interface SkippedKnowledgeField {
+  field: string;
+  reason: "owner_locked";
+}
+
+/** Result of upsertKnowledge(): fields dropped from the write because of an owner lock. */
+export interface UpsertKnowledgeResult {
+  skipped: SkippedKnowledgeField[];
+}
+
+/** Options of upsertKnowledge(). */
+export interface UpsertKnowledgeOptions {
+  /** True only on the owner path (ownerUpdate()); it may change owner-locked fields. */
+  ownerPath?: boolean;
+}
+
 export interface SeasonalProduct {
   product: string;      // "Jordbær", "Epler", "Honning"
   months: number[];     // [6,7,8] = June-August
@@ -158,14 +209,32 @@ export function isProductNoise(name: string): boolean {
   return false;
 }
 
+/**
+ * A product's price field as text. Integration test 2026-10-17 (I-F): the
+ * products column is DB JSON, and a price is stored as a number (150) as well
+ * as text ("275/kg"); a number reached `.trim()` in parseProductPrice and
+ * threw out of lokal_info and lokal_search. Text is returned as it is (the
+ * callers trim it), a positive number as its digits, and anything else is no
+ * price — 0 included, which the old `p.price || ""` read as no price too.
+ */
+export function productPriceText(price: unknown): string {
+  if (typeof price === "string") return price;
+  return typeof price === "number" && Number.isFinite(price) && price > 0 ? String(price) : "";
+}
+
 /** Parse price from a product name like "Lammelår – kr 275/kg" → { cleanName, price } */
 export function parseProductPrice(p: ProductInfo): { cleanName: string; price: string | null; section: string | null } {
-  const name = (p.name || "").trim();
+  // I-F: `p` is one entry of the products DB JSON, so each field is read by
+  // its type: a name that is not text is no name, and the price goes through
+  // productPriceText. Text values give exactly the result they gave before.
+  const entry: Partial<Record<keyof ProductInfo, unknown>> = p && typeof p === "object" ? p : {};
+  const name = typeof entry.name === "string" ? entry.name.trim() : "";
+  const priceText = productPriceText(entry.price);
 
   // Section header?
   if (isProductHeader(name)) {
     const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
-    const subInfo = p.price && !/^\d/.test(p.price) ? p.price : null;
+    const subInfo = priceText && !/^\d/.test(priceText) ? priceText : null;
     return { cleanName: headerText, price: null, section: subInfo || headerText };
   }
 
@@ -173,7 +242,7 @@ export function parseProductPrice(p: ProductInfo): { cleanName: string; price: s
   if (isProductNoise(name)) return { cleanName: name, price: null, section: null };
 
   // Use existing price field if it has a numeric value
-  let price = (p.price || "").trim();
+  let price = priceText.trim();
   if (price && !/\d/.test(price)) price = ""; // non-numeric price field = descriptor, not price
 
   let cleanName = name;
@@ -242,10 +311,11 @@ export interface AgentInfoResponse {
     seasonality: SeasonalProduct[];
     deliveryRadius?: number;
     minOrderValue?: number;
+    /** Never a Google rating (S4-A1a, see getAgentInfo). */
     ratings?: {
-      google?: { score: number; reviews: number };
       tripadvisor?: { score: number };
     };
+    /** Only with getAgentInfo(id, { withGoogleRating: true }): the site's own pages. */
     googleRating?: number;
     googleReviewCount?: number;
   };
@@ -257,24 +327,245 @@ export interface AgentInfoResponse {
   };
 }
 
+// ─── Integration test 2026-10-17 (I-F): field shapes of getAgentInfo ──────
+// The knowledge columns are JSON whose shape nothing enforces: a list stored
+// as one string, null, numbers or objects among its entries, a product with
+// no text name. getAgentInfo feeds lokal_info, lokal_search, the producer
+// pages and GET /agents/:id/info, so it hands each field over in the shape
+// its type declares: list-of-text fields go through textEntries, and the
+// lists of records keep the entries a reader can use. Values that already
+// have that shape come through unchanged, apart from trimmed text entries.
+// The fields inside a product (price, category …) are typed where they are
+// read, e.g. parseProductPrice.
+
+/** The entries of a list of records a reader can use: objects, and text (a free-text entry). */
+function recordEntries(value: unknown): unknown[] {
+  return Array.isArray(value)
+    ? value.filter((e) => typeof e === "string" || (e !== null && typeof e === "object" && !Array.isArray(e)))
+    : [];
+}
+
+/**
+ * products: text entries, and product objects with a text name, the field
+ * every reader keys on. Exported for the readers that take the products
+ * column from getKnowledge (the A2A agent.json, slice I-G).
+ */
+export function productEntries(value: unknown): ProductInfo[] {
+  return recordEntries(value)
+    .filter((e) => typeof e === "string" || typeof (e as { name?: unknown }).name === "string") as ProductInfo[];
+}
+
+/**
+ * openingHours: an array (today's format), or free text such as
+ * "Man–fre 10–17", which lokal_info, the producer page and the agent card
+ * show as text (slice I-A). The declared type has no text variant, but those
+ * readers check for it. Anything else is no opening hours.
+ */
+function openingHoursField(value: unknown): OpeningHour[] {
+  if (typeof value === "string") return value.trim() ? (value as unknown as OpeningHour[]) : [];
+  return recordEntries(value) as OpeningHour[];
+}
+
+/** A JSON object, or {} for anything else (text, a list, null). */
+function plainObjectOrEmpty(value: unknown): Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : {};
+}
+
+// ─── Integration test 2026-10-17 (I-G): refused knowledge writes ──────────
+// normalizeProducts threw a JavaScript TypeError on products stored as text
+// (`products.map`), on a null product (`p.name`) and on a product whose name
+// is not text (`.trim`), and PUT /agents/:id/knowledge answered 400 with that
+// raw text. Those inputs, and only those, are now refused with a field error
+// before anything is written; every value the write path accepted before is
+// accepted and stored exactly as before.
+
+/** A knowledge write refused because of one field: `field` is its path, e.g. "products[2].name". */
+export class KnowledgeFieldError extends Error {
+  constructor(readonly field: string, message: string) {
+    super(message);
+    this.name = "KnowledgeFieldError";
+  }
+}
+
+/** The products value a knowledge write cannot store, as a field error; null when it can. */
+export function productsWriteError(products: unknown): KnowledgeFieldError | null {
+  if (!Array.isArray(products)) {
+    // A value with a length reached `.map`; any other value is passed on as before.
+    if (!(products as { length?: unknown } | null | undefined)?.length) return null;
+    return new KnowledgeFieldError("products", typeof products === "string"
+      ? "products må være en liste med produkter, ikke tekst."
+      : "products må være en liste med produkter.");
+  }
+  for (let i = 0; i < products.length; i++) {
+    const p: unknown = products[i];
+    if (p === null || p === undefined) {
+      return new KnowledgeFieldError(`products[${i}]`, `products[${i}] må være et produkt, ikke null.`);
+    }
+    const name = typeof p === "object" ? (p as { name?: unknown }).name : undefined;
+    if (name && typeof name !== "string") {
+      return new KnowledgeFieldError(`products[${i}].name`, `products[${i}].name må være tekst.`);
+    }
+  }
+  return null;
+}
+
+// ─── Claim rule: decision 11=A ───────────────────────────────────────────
+// Daniel 2026-10-17 (daniel-responses/2026-10-17-live-del-a-gjort-og-
+// beslutninger-1-11.md, decision 11), dev-request 2026-10-17-rfb-claim-
+// verifisering-mot-kjent-kontakt. Before this rule the code went to whatever
+// `email` the claimant typed, so anyone could become a farm's "owner", get
+// the "Verifisert av eier" badge and change its contact fields.
+//   1. The code goes ONLY to the farm's own e-mail (resolveFarmContactEmail).
+//      The address the claimant types gets it only when it IS that address.
+//   2. No farm e-mail, or the claimant says the listed one is wrong → the
+//      claim waits in the admin queue (status 'pending_review'): no code, no
+//      token, no badge, no write access until Daniel approves it.
+//   3. The profile already has an owner (customerRuleSql) → always the admin
+//      queue, also when the e-mail matches. The owner keeps token and access;
+//      no claim row is deleted any more.
+//   4. At most ONE code per profile per rolling 24 h, whoever asks.
+// Hardening A needs, now that guessing the code sent to the farm's inbox is
+// the way in: a crypto code that lives 24 h (was Math.random(), 7 days), 5
+// wrong tries expire the claim, verify is bound to the profile id, and a
+// platform-wide hourly cap on code sends — one code per profile alone would
+// still let the form mail hundreds of producers. The admin queue is bounded
+// the same way, not by IP: a few open entries per profile and a platform-wide
+// hourly cap on new entries, so the public form can neither grow agent_claims
+// without limit nor bury real claims in Daniel's queue. The per-IP limit is
+// rfbClaimRequestLimiter (middleware/security.ts).
+export const CLAIM_CODE_VALID_HOURS = 24;
+const CLAIM_TOKEN_VALID_MS = 30 * 24 * 60 * 60 * 1000;
+/** RFC 5321's limit on an address; isSingleEmailAddress refuses longer. */
+export const EMAIL_ADDRESS_MAX_LENGTH = 254;
+// Defaults of claimLimits(); each is also the name of the env var that sets it.
+/** Wrong codes per claim; the last one expires the claim. */
+export const CLAIM_CODE_MAX_FAILED_ATTEMPTS = 5;
+/** Rolling window in which one profile gets at most one code (rule 4). */
+export const CLAIM_CODE_PROFILE_WINDOW_HOURS = 24;
+/** Code sends across all profiles per rolling hour. */
+export const CLAIM_CODE_SENDS_PER_HOUR_MAX = 10;
+/** Open admin-queue entries per profile. */
+export const CLAIM_REVIEW_OPEN_PER_PROFILE_MAX = 3;
+/** New admin-queue entries across all profiles per rolling hour. */
+export const CLAIM_REVIEW_INSERTS_PER_HOUR_MAX = 20;
+/** Most entries GET /admin/agents/claim-review-queue returns (oldest first). */
+export const CLAIM_REVIEW_QUEUE_LIST_MAX = 200;
+
+export interface ClaimLimits {
+  maxFailedAttempts: number;
+  profileWindowHours: number;
+  codeSendsPerHourMax: number;
+  reviewOpenPerProfileMax: number;
+  reviewInsertsPerHourMax: number;
+}
+
+function intEnv(env: NodeJS.ProcessEnv, name: string, dflt: number, min: number, max: number): number {
+  const raw = String(env[name] ?? "").trim();
+  if (!/^\d+$/.test(raw)) return dflt;
+  return Math.min(max, Math.max(min, Number.parseInt(raw, 10)));
+}
+
+/**
+ * The claim limits, read from env on every call (unset or junk → the
+ * default). The two decision 11=A sets — one code per profile per 24 h and 5
+ * wrong codes — are clamped so env can only make them stricter.
+ */
+export function claimLimits(env: NodeJS.ProcessEnv = process.env): ClaimLimits {
+  return {
+    maxFailedAttempts: intEnv(env, "CLAIM_CODE_MAX_FAILED_ATTEMPTS", CLAIM_CODE_MAX_FAILED_ATTEMPTS, 1, CLAIM_CODE_MAX_FAILED_ATTEMPTS),
+    profileWindowHours: intEnv(env, "CLAIM_CODE_PROFILE_WINDOW_HOURS", CLAIM_CODE_PROFILE_WINDOW_HOURS, CLAIM_CODE_PROFILE_WINDOW_HOURS, 7 * 24),
+    codeSendsPerHourMax: intEnv(env, "CLAIM_CODE_SENDS_PER_HOUR_MAX", CLAIM_CODE_SENDS_PER_HOUR_MAX, 1, 100),
+    reviewOpenPerProfileMax: intEnv(env, "CLAIM_REVIEW_OPEN_PER_PROFILE_MAX", CLAIM_REVIEW_OPEN_PER_PROFILE_MAX, 1, 20),
+    reviewInsertsPerHourMax: intEnv(env, "CLAIM_REVIEW_INSERTS_PER_HOUR_MAX", CLAIM_REVIEW_INSERTS_PER_HOUR_MAX, 1, 200),
+  };
+}
+
+/** Why a claim waits in the admin queue (agent_claims.review_reason). */
+export type ClaimReviewReason = "no_known_email" | "listed_email_wrong" | "has_owner";
+
+/** Which limit refused a request: a code send (rule 4 / the platform cap) or
+ *  a new admin-queue entry (per profile / the platform cap). */
+export type ClaimRateLimitScope = "profile" | "platform" | "review_profile" | "review_platform";
+
+export type ClaimRequestResult =
+  | { kind: "code_sent"; claimId: string; verificationCode: string; recipient: string }
+  /** `created` is false when the claimant's own open entry is returned. */
+  | { kind: "queued"; claimId: string; reason: ClaimReviewReason; created: boolean }
+  | { kind: "rate_limited"; scope: ClaimRateLimitScope }
+  /** The address is this profile's owner's own: log in by e-mail instead. */
+  | { kind: "already_owner" };
+
+export interface ClaimReviewEntry {
+  claim_id: string;
+  agent_id: string;
+  agent_name: string | null;
+  /** The profile's listed contact e-mail now (public). */
+  listed_email: string | null;
+  claimant_name: string;
+  claimant_email: string;
+  claimant_phone: string | null;
+  reason: ClaimReviewReason;
+  /** Set only when the claimant entered the right code sent to this farm address
+   *  and the claim was queued because the profile got an owner meanwhile. */
+  proven_email: string | null;
+  /** 1 when the profile has an owner now (customer rule). */
+  has_owner: number;
+  source: string | null;
+  created_at: string;
+}
+
+/** One plausible address and nothing else (a listed field can hold two
+ *  addresses or prose). A shape check, not RFC validation: delivery is what
+ *  proves an address. Linear on any input: the length is checked first, and
+ *  the domain labels exclude the dot, so each character has one place in the
+ *  pattern (a domain class that also took '.' backtracked quadratically —
+ *  "a@" + "."×200k held the event loop for ~24 s). */
+export function isSingleEmailAddress(value: string): boolean {
+  return value.length <= EMAIL_ADDRESS_MAX_LENGTH &&
+    /^[^\s@,;:<>()]+@[^\s@,;:<>().]+(?:\.[^\s@,;:<>().]+)+$/.test(value);
+}
+
+/** Constant-time compare of the stored code with the one entered. */
+function claimCodeMatches(stored: unknown, entered: unknown): boolean {
+  const given = typeof entered === "number" ? String(entered) : entered;
+  if (typeof stored !== "string" || typeof given !== "string") return false;
+  const a = Buffer.from(stored);
+  const b = Buffer.from(given.trim());
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 class KnowledgeService {
 
   // ─── Get knowledge for an agent ──────────────────────────
+  // Integration test 2026-10-17 (I-F): a JSON column that does not parse is
+  // read as empty and logged (jsonColumn), so one bad row no longer throws out
+  // of lokal_info, a whole lokal_search answer or llms-full.txt.
   getKnowledge(agentId: string): AgentKnowledge | null {
-    const db = getDb();
-    const row = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
+    const row = this.selectKnowledgeRow(agentId);
+    return row ? this.rowToKnowledge(row, "lenient") : null;
+  }
+
+  private selectKnowledgeRow(agentId: string): any {
+    return getDb().prepare(`SELECT agent_id, address, postal_code, website, phone, email,
       opening_hours, products, about, specialties, certifications, payment_methods,
       delivery_options, google_rating, google_review_count, tripadvisor_rating,
       external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
       data_source, auto_sources, last_enriched_at,
-      owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
-    if (!row) return null;
-    return this.rowToKnowledge(row);
+      owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId);
   }
 
   // ─── Get structured info response for buyer agents ────────
   // This is the main endpoint buyers use: "tell me about this seller"
-  getAgentInfo(agentId: string): AgentInfoResponse | null {
+  //
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (S4-A1a): A2A agent/info, GET /agents/:id/info, the MCP resource
+  // lokal://producers/{id} and the knowledge PUT hand this object on as it
+  // is, so it carries no Google rating. Google's Places terms call passing a
+  // stored rating on "reshare" (protocols/juridisk-sjekk-google-ratinger-
+  // 2026-10-17.md §4.2). Only the site's own pages ask for it with
+  // withGoogleRating, and RATING_DISPLAY_MODE (structured-data-policy.ts)
+  // decides whether they show it.
+  getAgentInfo(agentId: string, opts: { withGoogleRating?: boolean } = {}): AgentInfoResponse | null {
     const db = getDb();
     const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as any;
     if (!agent) return null;
@@ -300,7 +591,7 @@ class KnowledgeService {
         trustScore: agent.trust_score,
         isVerified: agent.is_verified === 1,
         isClaimed,
-        languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
+        languages: textEntries(this.jsonColumn(agentId, "agents.languages", agent.languages, ["no"], "lenient")),
         schemaVersion: agent.schema_version || "urn:a2a:1.0",
         agentVersion: agent.agent_version || 1,
         debioVerified,
@@ -313,8 +604,10 @@ class KnowledgeService {
         // "tell me about this seller" endpoint — never return an invalid phone.
         phone: isDisplayablePhone(knowledge?.phone) ? knowledge?.phone : undefined,
         email: knowledge?.email,
-        openingHours: knowledge?.openingHours || [],
-        products: knowledge?.products || [],
+        // I-F: each JSON field in the shape its type declares — see
+        // openingHoursField and the helpers above the class.
+        openingHours: openingHoursField(knowledge?.openingHours),
+        products: productEntries(knowledge?.products),
         // dev-request 2026-07-04-rfb-datakvalitet item 1 (description
         // sanitizer, render-guard-only slice): mirrors the isDisplayablePhone
         // guard above — this feeds the public buyer-facing "tell me about
@@ -323,22 +616,23 @@ class KnowledgeService {
         // must never be returned as if it were a real description/about text.
         about: this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
         description: this.guardedDescriptionField(agentId, agent.name, "agent.description", agent.description),
-        specialties: knowledge?.specialties || [],
+        specialties: textEntries(knowledge?.specialties),
         // PR-95: rewrite certifications to reflect debio_verified flag.
         certifications: relabelCertifications(knowledge?.certifications, debioVerified),
-        paymentMethods: knowledge?.paymentMethods || [],
-        deliveryOptions: knowledge?.deliveryOptions || [],
-        images: knowledge?.images || [],
-        seasonality: knowledge?.seasonality || [],
+        paymentMethods: textEntries(knowledge?.paymentMethods),
+        deliveryOptions: textEntries(knowledge?.deliveryOptions),
+        images: textEntries(knowledge?.images),
+        seasonality: recordEntries(knowledge?.seasonality) as SeasonalProduct[],
         deliveryRadius: knowledge?.deliveryRadius,
         minOrderValue: knowledge?.minOrderValue,
         ratings: this.buildRatings(knowledge),
-        googleRating: knowledge?.googleRating,
-        googleReviewCount: knowledge?.googleReviewCount,
+        ...(opts.withGoogleRating
+          ? { googleRating: knowledge?.googleRating, googleReviewCount: knowledge?.googleReviewCount }
+          : {}),
       },
       meta: {
         dataSource,
-        autoSources: knowledge?.autoSources || [],
+        autoSources: textEntries(knowledge?.autoSources),
         lastUpdated,
         disclaimer: dataSource === "owner"
           ? "Denne informasjonen er verifisert av eieren."
@@ -369,6 +663,10 @@ class KnowledgeService {
   // This handles data from sellers who paste AI-extracted product lists.
   private normalizeProducts(products: ProductInfo[]): ProductInfo[] {
     if (!products?.length) return products;
+    // I-G: what the map below cannot read is refused with a field error
+    // (productsWriteError) instead of a TypeError, before anything is written.
+    const fieldError = productsWriteError(products);
+    if (fieldError) throw fieldError;
     return products.map(p => {
       const name = (p.name || "").trim();
       if (!name) return p;
@@ -386,10 +684,31 @@ class KnowledgeService {
   }
 
   // ─── Set/update knowledge (used by enrichment + owner) ────
-  upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void {
+  upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>, opts: UpsertKnowledgeOptions = {}): UpsertKnowledgeResult {
     const db = getDb();
-    const existing = this.getKnowledge(agentId);
+    const skipped: SkippedKnowledgeField[] = [];
+    // I-F: the merge base is read strictly. The merge below writes every
+    // column back, so a lenient read would replace a column that does not
+    // parse with its empty value. Such a row still fails the write, as
+    // before — this change repairs no data.
+    const existingRow = this.selectKnowledgeRow(agentId);
+    const existing = existingRow ? this.rowToKnowledge(existingRow, "strict") : null;
     const now = new Date().toISOString();
+
+    // Owner lock (OWNER_LOCK_ENFORCE_WRITES, default off): drop owner-locked
+    // fields from a non-owner write before anything below sees them.
+    if (existingRow && !opts.ownerPath && ownerLockEnforcedForWrites()) {
+      const locks = this.parseCuratedFields((existingRow as { curated_fields?: string | null }).curated_fields);
+      const kept: Partial<AgentKnowledge> = { ...data };
+      for (const [prop, key] of Object.entries(LOCKABLE_FIELD_KEYS)) {
+        if ((data as Record<string, unknown>)[prop] === undefined) continue;
+        if (locks[key]?.by === "owner") {
+          delete (kept as Record<string, unknown>)[prop];
+          skipped.push({ field: key, reason: "owner_locked" });
+        }
+      }
+      data = kept;
+    }
 
     // Write-time contact guard (dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon,
     // slice 1). Validate the INCOMING `data` before it participates in either
@@ -516,11 +835,13 @@ class KnowledgeService {
     } catch {
       // Column may not exist yet on older DBs — safe to skip
     }
+    return { skipped };
   }
 
   // ─── Owner update (after claiming) ──────────────────────
+  // The owner path: the only caller that may change owner-locked fields.
   ownerUpdate(agentId: string, data: Partial<AgentKnowledge>): void {
-    this.upsertKnowledge(agentId, { ...data, dataSource: "owner" });
+    this.upsertKnowledge(agentId, { ...data, dataSource: "owner" }, { ownerPath: true });
   }
 
   // ─── Bulk enrich from auto sources ─────────────────────
@@ -542,6 +863,8 @@ class KnowledgeService {
   }
 
   // ─── Claim system ──────────────────────────────────────
+  // Who may become a profile's owner: decision 11=A, see the block above the
+  // class (CLAIM_CODE_* constants).
 
   isAgentClaimed(agentId: string): boolean {
     const db = getDb();
@@ -551,48 +874,167 @@ class KnowledgeService {
     return row.c > 0;
   }
 
+  /** Rule 3's "already has an owner": the shared customer rule (claimed_at
+   *  set, or a verified claim) — one definition, services/customer-rule.ts. */
+  private agentHasOwner(agentId: string): boolean {
+    const row = getDb().prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+      .get(agentId) as { owned: number } | undefined;
+    return !!row?.owned;
+  }
+
+  /**
+   * The farm's own e-mail — the only address a claim code may go to (rule 1).
+   * In this order:
+   *   (a) the contact e-mail listed on the profile (agent_knowledge.email, the
+   *       one shown publicly);
+   *   (b) else an address the platform delivered e-mail to for this profile
+   *       without a bounce: outreach_sent_log for the agent_id and no
+   *       email_bounces row — the RFB twin of wasEpostDeliveredOutreachNoBounce()
+   *       in gardssalg-claim.ts.
+   * Never an address derived from a domain (Daniel 2026-08-06: never guess an
+   * e-mail address). null → the claim goes to the admin queue. Returned
+   * normalized (trim + lower case) like createMagicLink's lookup, so the
+   * owner's e-mail login reaches the same inbox.
+   */
+  resolveFarmContactEmail(agentId: string): string | null {
+    const db = getDb();
+    const listed = db.prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as
+      { email: string | null } | undefined;
+    const listedEmail = normalizeEmail(listed?.email);
+    if (isSingleEmailAddress(listedEmail)) return listedEmail;
+    try {
+      const delivered = db.prepare(
+        `SELECT LOWER(TRIM(o.recipient_email)) AS email
+           FROM outreach_sent_log o
+          WHERE o.agent_id = ? AND o.vertical_id = 'rfb' AND o.recipient_email IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM email_bounces b WHERE LOWER(TRIM(b.email)) = LOWER(TRIM(o.recipient_email)))
+          ORDER BY o.sent_at DESC, o.id DESC`
+      ).all(agentId) as Array<{ email: string }>;
+      return delivered.map((r) => r.email).find(isSingleEmailAddress) ?? null;
+    } catch (err) {
+      // Fails closed: no farm address proven → admin queue, never a code.
+      console.warn(`[claim] delivered-outreach lookup failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * A claim request under decision 11=A:
+   *   - "already_owner": the address is the owner's own (as before): that
+   *     owner logs in by e-mail instead;
+   *   - "queued": the claim waits in the admin queue (rule 2 or 3); one open
+   *     entry per claimant and profile, a repeat returns it;
+   *   - "rate_limited": nothing is written — a code went to this profile in
+   *     the window (rule 4) or the platform's hourly code cap is reached, or,
+   *     for a new queue entry, the profile's open entries or the platform's
+   *     hourly entries are at their cap (claimLimits);
+   *   - "code_sent": a new code for `recipient`, the farm's own address. The
+   *     caller sends it; if that fails it calls markClaimCodeUnsent().
+   */
   requestClaim(agentId: string, opts: {
     claimantName: string;
     claimantEmail: string;
     claimantPhone?: string;
     source?: string;
-  }): { claimId: string; verificationCode: string } {
+    /** The claimant says the profile's listed address is wrong or outdated. */
+    listedEmailWrong?: boolean;
+  }): ClaimRequestResult {
     const db = getDb();
-    const id = uuid();
-    const code = this.generateVerificationCode();
-    const now = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+    const claimantEmail = normalizeEmail(opts.claimantEmail);
+    const limits = claimLimits();
+    // Claims matching `where` created in the last `hours`. created_at is
+    // ISO-8601 ("…T…Z") while datetime('now', …) is "… …", so both go through
+    // datetime() — a bare string compare would count the whole UTC day (see
+    // isClaimRateLimited in gardssalg-claim.ts). Each `where` is its own
+    // prepared statement, so the per-profile ones use the agent_id index.
+    const createdSince = (where: string, hours: number, ...params: unknown[]): number => (db.prepare(
+      `SELECT COUNT(*) AS n FROM agent_claims
+        WHERE ${where} AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
+    ).get(...params, hours) as { n: number }).n;
+    return db.transaction((): ClaimRequestResult => {
+      // Check if this specific email already has a verified claim on this agent
+      const existingClaim = db.prepare(
+        "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'verified'"
+      ).get(agentId, claimantEmail) as any;
+      if (existingClaim.c > 0) return { kind: "already_owner" };
 
-    // Check if this specific email already has a verified claim on this agent
-    const existingClaim = db.prepare(
-      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND claimant_email = ? AND status = 'verified'"
-    ).get(agentId, opts.claimantEmail) as any;
-    if (existingClaim.c > 0) {
-      throw new Error("Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post.");
-    }
+      const farmEmail = this.resolveFarmContactEmail(agentId);
+      const hasOwner = this.agentHasOwner(agentId);
+      const now = new Date().toISOString();
 
-    // Clear any stale pending claims (since email isn't implemented yet,
-    // users can't complete old claims — let them try again)
-    db.prepare(
-      "DELETE FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')"
-    ).run(agentId);
+      if (hasOwner || !farmEmail || opts.listedEmailWrong) {
+        const reason: ClaimReviewReason = hasOwner ? "has_owner" : !farmEmail ? "no_known_email" : "listed_email_wrong";
+        const open = db.prepare(
+          "SELECT id, review_reason FROM agent_claims WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'pending_review' LIMIT 1"
+        ).get(agentId, claimantEmail) as { id: string; review_reason: ClaimReviewReason } | undefined;
+        if (open) return { kind: "queued", claimId: open.id, reason: open.review_reason, created: false };
+        // Bounds that do not depend on the client's IP: open entries on this
+        // profile, and new entries platform-wide in the last hour (every
+        // entry has review_reason, also one queued at verify time).
+        const openOnProfile = (db.prepare(
+          "SELECT COUNT(*) AS n FROM agent_claims WHERE agent_id = ? AND status = 'pending_review'"
+        ).get(agentId) as { n: number }).n;
+        if (openOnProfile >= limits.reviewOpenPerProfileMax) return { kind: "rate_limited", scope: "review_profile" };
+        if (createdSince("review_reason IS NOT NULL", 1) >= limits.reviewInsertsPerHourMax) {
+          return { kind: "rate_limited", scope: "review_platform" };
+        }
+        const id = uuid();
+        db.prepare(`
+          INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, status, review_reason, source, created_at)
+          VALUES (?, ?, ?, ?, ?, 'manual', 'pending_review', ?, ?, ?)
+        `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, reason, opts.source || 'organic', now);
+        return { kind: "queued", claimId: id, reason, created: true };
+      }
 
-    db.prepare(`
-      INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, source, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'code_sent', ?, ?, ?)
-    `).run(id, agentId, opts.claimantName, opts.claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now);
+      // Rule 4 and the platform cap count code sends (code_sent_to set).
+      if (createdSince("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) >= 1) {
+        return { kind: "rate_limited", scope: "profile" };
+      }
+      if (createdSince("code_sent_to IS NOT NULL", 1) >= limits.codeSendsPerHourMax) return { kind: "rate_limited", scope: "platform" };
 
-    return { claimId: id, verificationCode: code };
+      // A new code replaces the previous one. Open codes used to be DELETEd
+      // here; now they are marked. Rows from before this rule (no
+      // code_sent_to) are left as they are — verifyClaim refuses them.
+      db.prepare(
+        "UPDATE agent_claims SET status = 'superseded' WHERE agent_id = ? AND status = 'code_sent' AND code_sent_to IS NOT NULL"
+      ).run(agentId);
+
+      const id = uuid();
+      const code = this.generateVerificationCode();
+      const expiresAt = new Date(Date.now() + CLAIM_CODE_VALID_HOURS * 60 * 60 * 1000).toISOString();
+      db.prepare(`
+        INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, verification_code, status, source, expires_at, created_at, code_sent_to, failed_attempts)
+        VALUES (?, ?, ?, ?, ?, 'email', ?, 'code_sent', ?, ?, ?, ?, 0)
+      `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now, farmEmail);
+      return { kind: "code_sent", claimId: id, verificationCode: code, recipient: farmEmail };
+    })();
   }
 
-  verifyClaim(claimId: string, code: string): { success: boolean; claimToken?: string; error?: string } {
+  /** The code e-mail was not sent: the claim is expired and gives its place
+   *  in the per-profile and platform counts back (no code reached anyone). */
+  markClaimCodeUnsent(claimId: string): void {
+    getDb().prepare(
+      "UPDATE agent_claims SET status = 'expired', code_sent_to = NULL WHERE id = ? AND status = 'code_sent'"
+    ).run(claimId);
+  }
+
+  verifyClaim(claimId: string, code: unknown, agentId: string): { success: boolean; claimToken?: string; error?: string; status?: string; queued?: boolean } {
     const db = getDb();
     const claim = db.prepare("SELECT * FROM agent_claims WHERE id = ?").get(claimId) as any;
 
-    if (!claim) return { success: false, error: "Claim not found" };
+    // A claim on another profile is answered exactly like an unknown one.
+    if (!claim || claim.agent_id !== agentId) return { success: false, error: "Claim not found" };
     if (claim.status === "verified") return { success: false, error: "Already verified" };
-    if (claim.status === "expired" || claim.status === "rejected") {
+    if (claim.status === "pending_review") {
+      return { success: false, status: "pending_review", error: "Kravet venter på manuell godkjenning." };
+    }
+    if (claim.status === "expired" || claim.status === "rejected" || claim.status === "superseded") {
       return { success: false, error: `Claim is ${claim.status}` };
+    }
+    // A code from before decision 11=A went to whatever address the claimant
+    // typed, so it is not accepted (the row itself is left as it is).
+    if (!claim.code_sent_to) {
+      return { success: false, error: "Koden er ikke lenger gyldig. Be om en ny kode." };
     }
 
     // Check expiry
@@ -601,20 +1043,56 @@ class KnowledgeService {
       return { success: false, error: "Claim has expired" };
     }
 
-    // Verify code
-    if (claim.verification_code !== code) {
-      return { success: false, error: "Invalid verification code" };
+    // Verify code — the last allowed wrong one (claimLimits, 5) expires the
+    // claim, so even the right code no longer works after that. The count is
+    // raised in SQL, never from the value read above.
+    if (!claimCodeMatches(claim.verification_code, code)) {
+      db.prepare(
+        `UPDATE agent_claims
+            SET failed_attempts = COALESCE(failed_attempts, 0) + 1,
+                status = CASE WHEN COALESCE(failed_attempts, 0) + 1 >= ? THEN 'expired' ELSE status END
+          WHERE id = ? AND status = 'code_sent'`
+      ).run(claimLimits().maxFailedAttempts, claimId);
+      const after = db.prepare("SELECT status FROM agent_claims WHERE id = ?").get(claimId) as { status: string } | undefined;
+      return after?.status === "expired"
+        ? { success: false, error: "For mange feil koder. Kravet er utløpt – be om en ny kode." }
+        : { success: false, error: "Invalid verification code" };
     }
 
+    // Rule 3 holds at verify time too: if the profile got an owner after the
+    // code was sent (an admin approval), the claim goes to the admin queue.
+    // `queued` marks the move, so the caller tells the admin once.
+    if (this.agentHasOwner(agentId)) {
+      db.prepare("UPDATE agent_claims SET status = 'pending_review', review_reason = 'has_owner' WHERE id = ?").run(claimId);
+      return { success: false, status: "pending_review", queued: true, error: "Profilen har fått en eier i mellomtiden. Kravet er sendt til manuell godkjenning." };
+    }
+
+    const claimToken = db.transaction(() => this.grantClaimOwnership(claim, claim.code_sent_to, "claim"))();
+    return { success: true, claimToken };
+  }
+
+  /**
+   * Makes a claim the profile's owner: status 'verified', a new 30-day claim
+   * token, and claimant_email = `ownerEmail` — the farm address the code went
+   * to, or the address Daniel approved — so e-mail login (createMagicLink)
+   * reaches that inbox. The address the claimant typed is kept for audit in
+   * claimant_email_typed. Shared by verifyClaim and approveClaimReview, so the
+   * badge gate and the owner stamp below are the same on both paths.
+   */
+  private grantClaimOwnership(claim: { id: string; agent_id: string }, ownerEmail: string, claimedVia: "claim" | "admin_approval"): string {
+    const db = getDb();
+    const claimId = claim.id;
     // Success — generate claim token for future management (expires in 30 days)
     const claimToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
     const now = new Date().toISOString();
-    const tokenExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const tokenExpiry = new Date(Date.now() + CLAIM_TOKEN_VALID_MS).toISOString();
 
+    // SET reads the row as it was, so claimant_email_typed gets the typed address.
     db.prepare(`
-      UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?
+      UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?,
+             claimant_email_typed = COALESCE(claimant_email_typed, claimant_email), claimant_email = ?
       WHERE id = ?
-    `).run(claimToken, tokenExpiry, now, claimId);
+    `).run(claimToken, tokenExpiry, now, ownerEmail, claimId);
 
     // ─── dev-request 2026-08-03-mikhailo-quarantine-gates (Gate 2) ──────────
     // Mark agent as verified — EXCEPT when the agent's own registration is
@@ -642,6 +1120,9 @@ class KnowledgeService {
     // A discovery-origin (or any legacy/NULL-defaulted, pre-migration) row is
     // BYTE-IDENTICAL to pre-gate behaviour: the UPDATE below fires
     // unconditionally whenever origin !== 'self_registered'.
+    //
+    // Decision 11=A: an admin-approved claim (approveClaimReview) passes this
+    // same gate — approving a claim does not give a self_registered row the badge.
     const claimedAgent = db.prepare("SELECT origin FROM agents WHERE id = ?").get(claim.agent_id) as
       { origin: string | null } | undefined;
     if (claimedAgent?.origin !== "self_registered") {
@@ -657,11 +1138,13 @@ class KnowledgeService {
     // set by an earlier claim). Applies to self_registered rows too — the
     // ownership is real even though the public badge is withheld above.
     // agent_claims carries no user id, so claimed_by_user_id is left alone.
+    // claimed_via is 'claim' for the code path, 'admin_approval' for a claim
+    // Daniel approved from the admin queue (decision 11=A).
     db.prepare(`
       UPDATE agents
-         SET claimed_at = ?, claimed_via = COALESCE(claimed_via, 'claim')
+         SET claimed_at = ?, claimed_via = COALESCE(claimed_via, ?)
        WHERE id = ? AND claimed_at IS NULL
-    `).run(now, claim.agent_id);
+    `).run(now, claimedVia, claim.agent_id);
 
     // Update knowledge data_source
     const knowledge = this.getKnowledge(claim.agent_id);
@@ -670,7 +1153,75 @@ class KnowledgeService {
         .run(claim.agent_id);
     }
 
-    return { success: true, claimToken };
+    return claimToken;
+  }
+
+  // ─── Admin queue (decision 11=A, rules 2 and 3) ─────────────────────────
+  // Read and decided through GET /admin/agents/claim-review-queue and POST
+  // /admin/agents/claim-review-approve|-reject (routes/admin-agents.ts).
+
+  /** Claims waiting for Daniel, oldest first: at most `limit` entries, and
+   *  `total` waiting in all. */
+  listClaimReviewQueue(limit: number = CLAIM_REVIEW_QUEUE_LIST_MAX): { total: number; entries: ClaimReviewEntry[] } {
+    const db = getDb();
+    const total = (db.prepare(
+      "SELECT COUNT(*) AS n FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.status = 'pending_review'"
+    ).get() as { n: number }).n;
+    const entries = db.prepare(`
+      SELECT c.id AS claim_id, c.agent_id, a.name AS agent_name, k.email AS listed_email,
+             c.claimant_name, c.claimant_email, c.claimant_phone, c.review_reason AS reason,
+             c.code_sent_to AS proven_email, ${customerRuleSql("a")} AS has_owner,
+             c.source, c.created_at
+        FROM agent_claims c
+        JOIN agents a ON a.id = c.agent_id
+        LEFT JOIN agent_knowledge k ON k.agent_id = c.agent_id
+       WHERE c.status = 'pending_review'
+       ORDER BY c.created_at ASC, c.id ASC
+       LIMIT ?
+    `).all(limit) as ClaimReviewEntry[];
+    return { total, entries };
+  }
+
+  /**
+   * Approves a queued claim: it becomes an owner (grantClaimOwnership — the
+   * badge follows the quarantine gate, claimed_via = 'admin_approval') bound
+   * to `approvedEmail`. When none is passed: the farm address the claimant
+   * proved with the right code (proven_email — a claim queued at verify time
+   * because the profile got an owner meanwhile), else the address the
+   * claimant gave. An existing owner keeps its own claim and token. The
+   * caller sends the login link to `email`.
+   */
+  approveClaimReview(claimId: string, approvedEmail?: string):
+    | { ok: true; agentId: string; email: string; isVerified: boolean }
+    | { ok: false; error: "not_found" | "not_pending_review" | "invalid_email" } {
+    const db = getDb();
+    const claim = db.prepare("SELECT id, agent_id, status, claimant_email, code_sent_to FROM agent_claims WHERE id = ?").get(claimId) as
+      { id: string; agent_id: string; status: string; claimant_email: string; code_sent_to: string | null } | undefined;
+    if (!claim || !db.prepare("SELECT 1 FROM agents WHERE id = ?").get(claim.agent_id)) return { ok: false, error: "not_found" };
+    if (claim.status !== "pending_review") return { ok: false, error: "not_pending_review" };
+    const email = normalizeEmail(approvedEmail ?? claim.code_sent_to ?? claim.claimant_email);
+    if (!isSingleEmailAddress(email)) return { ok: false, error: "invalid_email" };
+    db.transaction(() => {
+      db.prepare("UPDATE agent_claims SET verification_method = 'manual' WHERE id = ?").run(claimId);
+      this.grantClaimOwnership(claim, email, "admin_approval");
+    })();
+    const agent = db.prepare("SELECT is_verified FROM agents WHERE id = ?").get(claim.agent_id) as { is_verified: number } | undefined;
+    return { ok: true, agentId: claim.agent_id, email, isVerified: agent?.is_verified === 1 };
+  }
+
+  /** Rejects a queued claim: status 'rejected' (with Daniel's note); the
+   *  profile is not touched. */
+  rejectClaimReview(claimId: string, note?: string):
+    | { ok: true; agentId: string }
+    | { ok: false; error: "not_found" | "not_pending_review" } {
+    const db = getDb();
+    const claim = db.prepare("SELECT agent_id, status FROM agent_claims WHERE id = ?").get(claimId) as
+      { agent_id: string; status: string } | undefined;
+    if (!claim) return { ok: false, error: "not_found" };
+    if (claim.status !== "pending_review") return { ok: false, error: "not_pending_review" };
+    db.prepare("UPDATE agent_claims SET status = 'rejected', notes = COALESCE(?, notes) WHERE id = ? AND status = 'pending_review'")
+      .run(note ?? null, claimId);
+    return { ok: true, agentId: claim.agent_id };
   }
 
   getClaimByToken(token: string): { agentId: string; claimantName: string; claimantEmail: string } | null {
@@ -791,8 +1342,10 @@ class KnowledgeService {
 
   // ─── Private helpers ─────────────────────────────────────
 
+  // Six digits from the crypto RNG (was Math.random(), finding
+  // rfb-claim-kode-kan-gjettes).
   private generateVerificationCode(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    return crypto.randomInt(100000, 1000000).toString();
   }
 
   private mergeKnowledge(existing: AgentKnowledge, update: Partial<AgentKnowledge>): AgentKnowledge {
@@ -823,26 +1376,48 @@ class KnowledgeService {
       deliveryRadius: update.deliveryRadius ?? existing.deliveryRadius,
       minOrderValue: update.minOrderValue ?? existing.minOrderValue,
       dataSource: update.dataSource || existing.dataSource,
-      autoSources: [...new Set([...(existing.autoSources || []), ...(update.autoSources || [])])],
+      // I-F: spreading a list stored as one string gave one source per letter,
+      // and spreading a string or an array into preferences gave one key per
+      // character or entry. Only text entries and plain objects are merged.
+      autoSources: [...new Set([...textEntries(existing.autoSources), ...textEntries(update.autoSources)])],
       lastEnrichedAt: update.lastEnrichedAt ?? existing.lastEnrichedAt,
       ownerUpdatedAt: update.ownerUpdatedAt ?? existing.ownerUpdatedAt,
-      preferences: { ...(existing.preferences || {}), ...(update.preferences || {}) },
+      preferences: { ...plainObjectOrEmpty(existing.preferences), ...plainObjectOrEmpty(update.preferences) },
     };
   }
 
+  // S4-A1a: no `google` entry (getAgentInfo above), and with it no invented
+  // `reviews: 0` when the count is unknown; the REST card read it from here.
   private buildRatings(knowledge: AgentKnowledge | null): AgentInfoResponse["knowledge"]["ratings"] {
     if (!knowledge) return undefined;
     const ratings: any = {};
-    if (knowledge.googleRating) {
-      ratings.google = { score: knowledge.googleRating, reviews: knowledge.googleReviewCount || 0 };
-    }
     if (knowledge.tripadvisorRating) {
       ratings.tripadvisor = { score: knowledge.tripadvisorRating };
     }
     return Object.keys(ratings).length > 0 ? ratings : undefined;
   }
 
-  private rowToKnowledge(row: any): AgentKnowledge {
+  /**
+   * One JSON column of a read. Integration test 2026-10-17 (I-F): text that
+   * does not parse threw out of every reader. A lenient read gives the
+   * fallback instead and logs `[knowledge-guard]` with the agent id and the
+   * column, never the value: it can hold contact details, and JSON.parse's
+   * own message quotes it. A strict read throws, as every read did before.
+   */
+  private jsonColumn<T>(agentId: string, column: string, text: unknown, fallback: T, mode: "strict" | "lenient"): T {
+    if (!text) return fallback;
+    if (mode === "strict") return JSON.parse(text as string);
+    try {
+      return JSON.parse(text as string);
+    } catch {
+      console.error(`[knowledge-guard] agent ${agentId}: ${column} is not valid JSON, read as empty`);
+      return fallback;
+    }
+  }
+
+  private rowToKnowledge(row: any, mode: "strict" | "lenient"): AgentKnowledge {
+    const json = <T>(column: string, fallback: T): T =>
+      this.jsonColumn(row.agent_id, `agent_knowledge.${column}`, row[column], fallback, mode);
     return {
       agentId: row.agent_id,
       address: row.address,
@@ -850,28 +1425,28 @@ class KnowledgeService {
       website: row.website,
       phone: row.phone,
       email: row.email,
-      openingHours: row.opening_hours ? JSON.parse(row.opening_hours) : [],
-      products: row.products ? JSON.parse(row.products) : [],
+      openingHours: json("opening_hours", []),
+      products: json("products", []),
       about: row.about,
-      specialties: row.specialties ? JSON.parse(row.specialties) : [],
-      certifications: row.certifications ? JSON.parse(row.certifications) : [],
-      paymentMethods: row.payment_methods ? JSON.parse(row.payment_methods) : [],
-      deliveryOptions: row.delivery_options ? JSON.parse(row.delivery_options) : [],
+      specialties: json("specialties", []),
+      certifications: json("certifications", []),
+      paymentMethods: json("payment_methods", []),
+      deliveryOptions: json("delivery_options", []),
       googleRating: row.google_rating,
       googleReviewCount: row.google_review_count,
       tripadvisorRating: row.tripadvisor_rating,
-      externalReviews: row.external_reviews ? JSON.parse(row.external_reviews) : [],
-      externalLinks: row.external_links ? JSON.parse(row.external_links) : [],
-      images: row.images ? JSON.parse(row.images) : [],
-      seasonality: row.seasonality ? JSON.parse(row.seasonality) : [],
+      externalReviews: json("external_reviews", []),
+      externalLinks: json("external_links", []),
+      images: json("images", []),
+      seasonality: json("seasonality", []),
       deliveryRadius: row.delivery_radius || undefined,
       minOrderValue: row.min_order_value || undefined,
       dataSource: row.data_source || "auto",
-      autoSources: row.auto_sources ? JSON.parse(row.auto_sources) : [],
+      autoSources: json("auto_sources", []),
       lastEnrichedAt: row.last_enriched_at,
       ownerUpdatedAt: row.owner_updated_at,
-      preferences: row.preferences ? JSON.parse(row.preferences) : {},
-      curatedFields: row.curated_fields ? JSON.parse(row.curated_fields) : {},
+      preferences: json("preferences", {}),
+      curatedFields: json("curated_fields", {}),
     };
   }
 
@@ -895,6 +1470,17 @@ class KnowledgeService {
     }
     db.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?")
       .run(JSON.stringify(current), agentId);
+  }
+
+  /** curated_fields column text -> locks; unreadable text reads as "no locks" (as getCuratedFields). */
+  private parseCuratedFields(raw: string | null | undefined): Record<string, CuratedFieldMeta> {
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
   }
 
   /** Phase 4.9a — get current curated-field locks (used by enrichment-agent

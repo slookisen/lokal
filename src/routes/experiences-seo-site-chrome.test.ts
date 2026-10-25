@@ -153,7 +153,9 @@ function siteNavBlock(body: string): string {
 // experiences-seo-kategorimotiver.test.ts's seedPublishedExperience() already
 // proved renders live /fylke, /kommune and /kategori/:category/:kommune
 // pages. Returns the provider's row id (caller backfills + reads its slug
-// for the /tilbyder/<slug> URL).
+// for the /tilbyder/<slug> URL). The row has a real description: the combo
+// page counts indexable experiences only (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, IDX-1).
 function seedPublishedExperience(store: any, opts: { fylke: string; kommune: string; category: string; title: string }): string {
   const providerId = store.createProvider({
     navn: `${opts.title} AS`, fylke: opts.fylke, kommune: opts.kommune,
@@ -162,6 +164,7 @@ function seedPublishedExperience(store: any, opts: { fylke: string; kommune: str
   store.createExperience({
     title: opts.title, provider_id: providerId, provider_match_status: "matched",
     kommune: opts.kommune, fylke: opts.fylke,
+    description: `${opts.title} — guidet tur med lokal tilbyder og utstyr inkludert.`,
     category: opts.category, verification_status: "verified", confidence: "high",
   });
   return providerId;
@@ -212,13 +215,20 @@ export function runExperiencesSeoSiteChromeTests(opts: { log?: boolean } = {}): 
             'high', 'chromegard-sideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
       ).run();
 
-      // Fixture for (i): one published experience in Vestland/Bergen/
+      // Fixture for (i): published experiences in Vestland/Bergen/
       // natur_friluft so /fylke/Vestland, /kommune/Bergen and
       // /kategori/natur_friluft/Bergen all render live (non-404) pages, plus
-      // its provider's slug for /tilbyder/<slug>.
+      // the first provider's slug for /tilbyder/<slug>. Two rows, because the
+      // combo page needs ≥2 experiences to be served rather than redirected
+      // to /kommune/Bergen (dev-request 2026-10-16-opplevagent-stedssider-
+      // kvalitet, E4-S1).
       const iProviderId = seedPublishedExperience(store, {
         fylke: "Vestland", kommune: "Bergen", category: "natur_friluft",
         title: "Fjellvandring i Bergen (chrome-regresjon)",
+      });
+      seedPublishedExperience(store, {
+        fylke: "Vestland", kommune: "Bergen", category: "natur_friluft",
+        title: "Fløyen på ski (chrome-regresjon)",
       });
       store.backfillProviderSlugs();
       const iProviderSlug = (db.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(iProviderId) as { slug: string }).slug;

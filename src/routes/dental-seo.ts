@@ -1,5 +1,6 @@
 
 import { Router, Request, Response } from "express";
+import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import {
   listPublicDentalAgents,
   countPublicDentalAgents,
@@ -9,10 +10,12 @@ import {
   getDentalAgentById,
   listPoststeder,
   listRelatedClinics,
+  listDentalNamesakes,
   getDentalAgentsForSitemap,
+  getDentalAggregateLastmods,
   isThinDentalProfile,
 } from "../services/dental-store";
-import type { DentalAgent, PoststedRow } from "../services/dental-store";
+import type { DentalAgent, DentalAgentRow, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
@@ -20,15 +23,30 @@ import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-st
 import { analyticsService } from "../services/analytics-service";
 import { filterQueryText } from "../services/search-tracking";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+// dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): the
+// clinic's own «Hjemmeside» link carries UTM; booking and directory_url links
+// and the JSON-LD sameAs stay as stored.
+import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
+// «Verifisert» on the cards and the profile only when the stored fields meet
+// the rule the badge text describes.
+import { resolveVerifiedClaim } from "../services/dental-verified-claim";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
+// dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: the
+// shell's JSON-LD goes through the serializer that escapes < > & U+2028 U+2029.
+import { jsonLdScriptTag } from "../services/safe-script-json";
+import { formatRatingDisplay } from "../services/structured-data-policy";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { buildRobotsGroups } from "../services/robots-policy";
-import { registeredMcpTools } from "../services/mcp-tool-manifest";
+import { registeredMcpCapabilities, registeredMcpTools, type McpToolEntry } from "../services/mcp-tool-manifest";
+import { generalLimiter } from "../middleware/security";
+import { servePublicFile } from "./public-file";
 // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b/5d): reuse
 // the existing pure classifiers rather than reinventing name-word / host
 // checks. DENTAL_NAME_WORDS is the SAME "does this name read as a dental
@@ -38,6 +56,37 @@ import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { shownDentalAgent } from "../services/dental-places-display";
+import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
+import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
+import { capFreeText } from "../utils/free-text";
+import { osloWeekdayAndMinutes } from "../utils/opening-hours";
+import { DENTAL_STATS_TTL_MS, getCachedDentalPoststeder, getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
+// dev-request 2026-10-17-dental-d3-rettelser (D3d punkt 2, trinn 3): the
+// clinic page names its place in the official spelling, by the same lookup as
+// the MCP/A2A cards.
+import { officialPlaceSpelling } from "../services/search-intent/norwegian-query";
+// dev-request 2026-10-17-dental-d3-rettelser (D3d): the web card's chips are
+// the specialties the filter finds a clinic by, and the placeholder postnummer
+// "0000" is never shown, as on the MCP/A2A cards.
+import { clinicSpecialties } from "../config/dental-search-vocabulary";
+import { shownPostnummer } from "../services/norway-postnummer";
+// dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1/F1-S2): page size,
+// page-nav window and the static pages' text dates.
+import { DENTAL_EMERGENCY_NOTICE, DENTAL_LANDING_CONFIG, DENTAL_LANDING_FACETS, DENTAL_STATIC_PAGE_DATES, type DentalLandingFacet } from "../config/dental-landing";
+import { getDentalAreaFacts, sumAreaCounts, buildDentalAreaLanding, type DentalAreaLanding, type DentalAreaCounts, type DentalAreaScope } from "../services/dental-area-facts";
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider (F1-S4a): the facet
+// pages /sted/<sted>/<fasett> and /fylke/<fylke>/<fasett>, their sitemap URLs
+// and the links to them from /sted and /fylke; F1-S4e: the emergency notice
+// box on /hvordan-det-fungerer.
+import {
+  registerDentalLandingRoutes,
+  sitemapDentalFacets,
+  dentalFacetPath,
+  dentalFacetLinksHtml,
+  dentalEmergencyNoticeHtml,
+  type DentalLandingPlace,
+} from "./dental-landing";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // footer line, /kontakt facts, /personvern controller, JSON-LD parentOrganization
 // and the MCP server-card vendor all come from COMPANY_INFO via these helpers.
@@ -46,9 +95,37 @@ import {
   companyContactBlockHtml,
   companyControllerSentenceHtml,
   companyFooterLineHtml,
-  parentOrganizationJsonLd,
+  companyOperatorSentence,
+  organizationJsonLd,
   toSiteLang,
+  type SiteLang,
 } from "../services/company-legal";
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker (G3-S8,
+// Daniel's decision 4=A): the sentence that sets Finn-tannlege.com apart from
+// FINN.no is written once, in brand-entities.ts. Footer, /om, llms.txt,
+// ai-plugin.json and the Organization JSON-LD print it; nowhere else names
+// FINN.no (dental-finn-disambiguation.test.ts).
+import { BRAND_ENTITIES } from "../config/brand-entities";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S1):
+// the data sources and the «Verifisert» text, written once. The footer, /om,
+// /hvordan-det-fungerer, /proveniens and llms.txt print them; no handler names
+// a source of its own (dental-sources-truth.test.ts).
+import {
+  DENTAL_DATA_SOURCES,
+  DENTAL_VERIFIED_BADGE_TEXT,
+  dentalFieldLabel,
+  dentalLicensedSources,
+  dentalSourceDate,
+  dentalSourceFields,
+  dentalSourceLabel,
+  dentalSourceMethod,
+  dentalSourceNameLabels,
+  dentalSourceNamesSentence,
+  type DentalDataSource,
+} from "../services/dental-data-sources";
+// F2-S2: the method page names Daniel as its responsible editor (Daniel
+// 2026-10-18, question 14), from the one record of who runs the company.
+import { COMPANY_INFO } from "../config/company-info";
 
 const router = Router();
 
@@ -57,6 +134,9 @@ const DENTAL_AI_EXPLAIN = "AI-søk: sider en AI-assistent (ChatGPT, Claude, Perp
 
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
+
+const FINN_DISAMBIGUATION_NB = BRAND_ENTITIES.dental.disambiguation?.nb ?? "";
+const FINN_DISAMBIGUATION_EN = BRAND_ENTITIES.dental.disambiguation?.en ?? "";
 
 // PR-111: Canonical Norwegian fylker (15, post-2024 reform). The dental DB
 // contains a few non-canonical fylke values ("Ukjent", "TEST", legacy names)
@@ -75,6 +155,19 @@ export function canonicalFylker(perFylke: Array<{ fylke: string; count: number }
 // ─── Brand / Logo constants (PR-112) ────────────────────────
 // Tooth SVG path — reused in nav logo, favicon, and future assets.
 const TOOTH_PATH = "M18 0 C8 0 2 7 2 16 C2 23 5 26 6 32 C7 39 9 46 12 46 C15 46 14 36 18 36 C22 36 21 46 24 46 C27 46 29 39 30 32 C31 26 34 23 34 16 C34 7 28 0 18 0 Z";
+
+// ─── PNG icons (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S4)
+// Square raster copies of the «Søket» mark (dentalMarkSvg(), served as
+// /favicon.svg): the share image, the Organization logo and ai-plugin.json's
+// logo_url use the 512, since most share scrapers show no SVG; the 192 and
+// the 180 are for browsers and home screens. The files are in src/public and
+// are served by the routes next to /favicon.svg.
+export const DENTAL_ICONS = {
+  png192: { path: "/favicon-192.png", file: "dental-favicon-192.png", size: 192 },
+  png512: { path: "/favicon-512.png", file: "dental-favicon-512.png", size: 512 },
+  appleTouch: { path: "/apple-touch-icon.png", file: "dental-apple-touch-icon-180.png", size: 180 },
+} as const;
+const DENTAL_LOGO_PNG_URL = `${DENTAL_BASE_URL}${DENTAL_ICONS.png512.path}`;
 
 // ─── Specialty pages (PR-112) ────────────────────────────────
 // 7 godkjente tannlegespesialiteter i Norge (Helsedirektoratets liste).
@@ -129,7 +222,6 @@ export function findSpecialtyBySlug(slug: string): SpecialtyPage | undefined {
 // Cache getDentalStats() results in this module. dental-store has no cache
 // so API consumers always get fresh data; only SSR pages use the cache.
 let _dentalStatsCache: { value: ReturnType<typeof getDentalStats>; expires: number } | null = null;
-const DENTAL_STATS_TTL_MS = 60_000;
 
 function getCachedDentalStats(): ReturnType<typeof getDentalStats> {
   const now = Date.now();
@@ -286,13 +378,42 @@ export function slugifyText(text: string): string {
 
 /** Title-case a DB poststed value (stored uppercase, e.g. "OSLO" → "Oslo",
  *  "MO I RANA" → "Mo i Rana"). Small Norwegian conjunctions stay lowercase
- *  when not first word. */
+ *  when not first word. Each part of a hyphenated name is capitalised
+ *  ("SØR-FRON" → "Sør-Fron", not "Sør-fron"; D3d trinn 3). */
 export function titleCasePoststed(s: string): string {
   const SMALL = new Set(["i", "og", "på", "av", "ved", "for"]);
   return s.toLowerCase().split(" ").map((word, idx) => {
     if (idx > 0 && SMALL.has(word)) return word;
-    return word.charAt(0).toUpperCase() + word.slice(1);
+    return word.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("-");
   }).join(" ");
+}
+
+/**
+ * A stored poststed as the clinic page names it (dev-request
+ * 2026-10-17-dental-d3-rettelser, D3d punkt 2 trinn 3): title-cased like
+ * titleCasePoststed, in the official spelling where the stored value is a
+ * fold of one ("Tromsoe" → "Tromsø", "Baerum" → "Bærum", "Nord Aurdal" →
+ * "Nord-Aurdal"), by officialPlaceSpelling, the lookup the MCP/A2A cards use.
+ * A value qualified with « i …» that is no official name as a whole gets the
+ * official spelling of the place before the qualifier ("Heroey I M Og R" →
+ * "Herøy i M og R"). The official spelling is taken only when it slugs like
+ * the stored value: /sted groups spellings by slugifyText (D3b) and the
+ * lookup goes by placeKey, so the name the page shows and its /sted/<slug>
+ * link are always the same place. Anything else is title-cased as stored.
+ */
+export function officialPlaceLabel(stored: string): string {
+  const asStored = titleCasePoststed(stored);
+  const words = asStored.split(" ");
+  const qualifierAt = words.indexOf("i", 1);
+  const candidates: Array<[place: string, qualifier: string]> = [[stored, ""]];
+  if (qualifierAt > 0) candidates.push([words.slice(0, qualifierAt).join(" "), ` ${words.slice(qualifierAt).join(" ")}`]);
+  for (const [place, qualifier] of candidates) {
+    const official = officialPlaceSpelling(place);
+    if (!official) continue;
+    const label = (official.kind === "poststed" ? titleCasePoststed(official.name) : official.name) + qualifier;
+    return slugifyText(label) === slugifyText(stored) ? label : asStored;
+  }
+  return asStored;
 }
 
 // ─── orch-PR-20260613 finn-tannlege clinic content differentiation ──────────────
@@ -334,6 +455,40 @@ export function isValidLocality(s: string | null | undefined): boolean {
   return true;
 }
 
+// ─── dev-request 2026-10-17-dental-d3-rettelser (D3e): namesakes ──────────
+/**
+ * What tells a clinic's page apart from the page of another clinic with the
+ * same name in the same place (listDentalNamesakes). Without it the two have
+ * the same <title> and meta description.
+ *   { place }  "<postnummer> <Poststed>", when the clinic's own postnummer is
+ *              a real one (not empty, not the placeholder 0000) that none of
+ *              the namesakes has; the place named by officialPlaceLabel, as
+ *              everywhere else on the page (D3d trinn 3);
+ *   { orgnr }  otherwise the org.nr, which no other row has;
+ *   null       no namesake, or no org.nr either: the page is as before.
+ * The street address is never used, because it can hold a c/o address.
+ */
+export type NamesakeDisambiguator = { place: string } | { orgnr: string };
+
+/** A stored postnummer that may be shown and is four digits, trimmed; else null. */
+function realPostnummer(pnr: string | null | undefined): string | null {
+  const value = shownPostnummer(pnr)?.trim();
+  return value && /^\d{4}$/.test(value) ? value : null;
+}
+
+export function namesakeDisambiguator(
+  agent: Pick<DentalAgent, "org_nr" | "postnummer" | "poststed">,
+  namesakes: ReadonlyArray<Pick<DentalNamesake, "postnummer">>
+): NamesakeDisambiguator | null {
+  if (namesakes.length === 0) return null;
+  const own = realPostnummer(agent.postnummer);
+  if (own && isValidLocality(agent.poststed) && namesakes.every((n) => realPostnummer(n.postnummer) !== own)) {
+    return { place: `${own} ${officialPlaceLabel(agent.poststed!)}` };
+  }
+  const orgnr = agent.org_nr?.trim();
+  return orgnr ? { orgnr } : null;
+}
+
 /**
  * Build a unique, natural-Norwegian clinic description from structured fields.
  * Only states facts that are present in the data; omits clauses when the field
@@ -341,40 +496,52 @@ export function isValidLocality(s: string | null | undefined): boolean {
  * fields so no two clinics with different data produce the same output.
  * Cap: ~155 chars for the short (meta) variant; uncapped for the full variant.
  *
- * @param agent       The DentalAgent record.
- * @param nearbyCount Optional count of other clinics in the same poststed
- *                    (used to add a differentiating locality clause).
- * @param short       If true, produce a meta-description-length string (≤160 chars).
+ * @param agent         The DentalAgent record.
+ * @param localityCount Optional number of clinics in the agent's poststed, as
+ *                      /sted/<poststed> shows it (see findStedGroup). Adds a
+ *                      differentiating locality clause to the short variant
+ *                      when it is at least 2.
+ * @param short         If true, produce a meta-description-length string (≤160 chars).
+ * @param namesake      Optional (D3e): what tells the page apart from a
+ *                      namesake's (namesakeDisambiguator). The opening sentence
+ *                      then names the place with its postnummer, or ends with
+ *                      «Org.nr N.», and the short variant never cuts it.
  */
 export function buildClinicDescription(
   agent: DentalAgent,
-  nearbyCount?: number,
-  short?: boolean
+  localityCount?: number,
+  short?: boolean,
+  namesake?: NamesakeDisambiguator | null
 ): string {
   const parts: string[] = [];
 
-  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values
-  const validPoststed = isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : null;
+  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values;
+  // the official spelling ("i Tromsø", not "i Tromsoe"; D3d trinn 3)
+  const validPoststed = isValidLocality(agent.poststed) ? officialPlaceLabel(agent.poststed!) : null;
   const validFylke = isValidLocality(agent.fylke) ? agent.fylke! : null;
+  // "i 0190 Oslo" on a namesake's page (D3e); { place } implies a valid poststed.
+  const localityLabel = namesake && "place" in namesake ? namesake.place : validPoststed;
 
   const locPart = validPoststed
     ? validFylke && validFylke.toLowerCase() !== validPoststed.toLowerCase()
-      ? `i ${validPoststed}, ${validFylke}`
-      : `i ${validPoststed}`
+      ? `i ${localityLabel}, ${validFylke}`
+      : `i ${localityLabel}`
     : validFylke
     ? `i ${validFylke}`
     : null;
 
   // Opening sentence
+  const orgnrLabel = namesake && "orgnr" in namesake ? ` Org.nr ${namesake.orgnr}.` : "";
   if (locPart) {
-    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.`);
+    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.${orgnrLabel}`);
   } else {
-    parts.push(`${agent.navn} er en tannlegeklinikk.`);
+    parts.push(`${agent.navn} er en tannlegeklinikk.${orgnrLabel}`);
   }
 
   // Address
   if (!short && agent.adresse && isValidLocality(agent.poststed)) {
-    parts.push(`Adresse: ${agent.adresse}, ${agent.postnummer ? agent.postnummer + " " : ""}${titleCasePoststed(agent.poststed!)}.`);
+    const postnummer = shownPostnummer(agent.postnummer);
+    parts.push(`Adresse: ${agent.adresse}, ${postnummer ? postnummer + " " : ""}${validPoststed}.`);
   }
 
   // Helfo
@@ -415,9 +582,13 @@ export function buildClinicDescription(
     parts.push(`Åpent ${ohDays} dag${ohDays === 1 ? "" : "er"} i uken.`);
   }
 
-  // Nearby clinics (only in short/meta to add differentiation)
-  if (short && nearbyCount && nearbyCount > 0 && validPoststed) {
-    parts.push(`Det finnes ${nearbyCount + 1} klinikker i ${validPoststed}.`);
+  // Nearby clinics (only in short/meta to add differentiation). The number is
+  // the /sted count itself (integrasjonstest IDX2-02, dev-request
+  // 2026-10-17-integrasjonstest-oppfolging I-Q); it used to be the length of
+  // a related-clinics list capped at 20, plus one, so every place with more
+  // than 20 clinics read «Det finnes 21 klinikker».
+  if (short && localityCount && localityCount > 1 && validPoststed) {
+    parts.push(`Det finnes ${localityCount} klinikker i ${validPoststed}.`);
   }
 
   // Chain
@@ -430,6 +601,10 @@ export function buildClinicDescription(
   if (short) {
     // Trim to ≤ 160 chars at sentence boundary
     if (full.length <= 160) return full;
+    // D3e: on a namesake's page the opening sentence tells the two pages
+    // apart, so it is kept whole. Only a very long name makes it longer than
+    // the cut, which would leave the two descriptions alike or end on «Org.».
+    if (namesake && parts[0]!.length > 157) return parts[0]!;
     let truncated = full.slice(0, 157);
     const lastDot = truncated.lastIndexOf(".");
     if (lastDot > 60) truncated = truncated.slice(0, lastDot + 1);
@@ -441,36 +616,42 @@ export function buildClinicDescription(
 }
 
 // ─── Poststed cache (60 s, same TTL as stats) ────────────────
-let _poststedCache: { value: PoststedRow[]; expires: number } | null = null;
-
+// dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S3): one shared cache
+// (services/dental-search-gazetteer.ts) also feeds the search parser on /sok,
+// MCP and A2A, so listPoststeder(1) still runs at most once per TTL.
 function getCachedPoststeder(): PoststedRow[] {
-  const now = Date.now();
-  if (_poststedCache && now < _poststedCache.expires) return _poststedCache.value;
-  let value: PoststedRow[] = [];
-  try { value = listPoststeder(1); } catch { /* db not ready */ }
-  _poststedCache = { value, expires: now + DENTAL_STATS_TTL_MS };
-  return value;
+  return getCachedDentalPoststeder(listPoststeder);
 }
 
 // ─── "Åpent nå" helper ───────────────────────────────────────
 
-const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+// Monday first: the index is osloWeekdayAndMinutes().day (Monday = 0).
+const DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
 const DAY_NAMES_NO: Record<string, string> = {
   mon: "Mandag", tue: "Tirsdag", wed: "Onsdag", thu: "Torsdag",
   fri: "Fredag", sat: "Lørdag", sun: "Søndag",
 };
 
-function isOpenNow(
-  opening_hours: DentalAgent["opening_hours"]
+/**
+ * Whether the clinic is open at `at` by its hours, on the clock in Norway
+ * (Europe/Oslo). The weekday and the time used to come from the server's
+ * clock, which runs in UTC, one or two hours behind Norway: at 20:03 in Oslo
+ * (18:03 UTC) a clinic that closes at 20:00 still said «Åpent nå» (dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, live check after F1-S4a, 2026-10-19).
+ * Exported for the tests.
+ */
+export function isOpenNow(
+  opening_hours: DentalAgent["opening_hours"],
+  at: Date = new Date()
 ): boolean {
   if (!opening_hours || opening_hours.length === 0) return false;
-  const now = new Date();
-  const dayKey = DAY_KEYS[now.getDay()];
+  const now = osloWeekdayAndMinutes(at);
+  const dayKey = DAY_KEYS[now.day];
   const entry = opening_hours.find((h) => h.day === dayKey);
   if (!entry) return false;
   const [oh, om] = entry.open.split(":").map(Number);
   const [ch, cm] = entry.close.split(":").map(Number);
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowMin = now.minutes;
   const openMin = (oh ?? 0) * 60 + (om ?? 0);
   const closeMin = (ch ?? 0) * 60 + (cm ?? 0);
   // Handle overnight spans (e.g. 22:00–02:00)
@@ -620,6 +801,7 @@ a:hover{text-decoration:underline}
 .page-btn{padding:7px 14px;border:1px solid var(--g200);border-radius:var(--r-sm);font-size:.88rem;color:var(--g700);text-decoration:none;background:var(--white)}
 .page-btn:hover{border-color:var(--teal-700);color:var(--teal-700);text-decoration:none}
 .page-btn.active{background:var(--teal-700);color:var(--white);border-color:var(--teal-700)}
+.page-gap{padding:7px 2px;color:var(--g500)}
 
 /* PROFILE */
 .profile-header{background:linear-gradient(135deg,var(--navy) 0%,var(--teal-700) 100%);padding:40px 24px;color:var(--white)}
@@ -660,6 +842,7 @@ a:hover{text-decoration:underline}
 .footer-bottom{max-width:1100px;margin:24px auto 0;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);font-size:.78rem;color:rgba(255,255,255,.4)}
 .footer-company{margin-top:6px}
 .footer-company a{color:rgba(255,255,255,.65);text-decoration:underline}
+.footer-disambiguation{margin-top:4px}
 
 /* SPECIALTY CHIPS */
 .spec-chip{display:inline-block;padding:7px 18px;border-radius:20px;background:var(--section-bg);border:1px solid var(--g200);color:var(--navy);font-size:.83rem;font-weight:500;text-decoration:none;transition:all .15s}
@@ -681,8 +864,14 @@ a:hover{text-decoration:underline}
 
 // ─── Shared nav / footer ─────────────────────────────────────
 
-function dentalNav(): string {
-  return `<nav class="nav" role="navigation" aria-label="Hovednavigasjon">
+// The nav and the footer are Norwegian on every page. On an English page
+// (pageLang "en", G3-S4) they say so with lang="nb", and the footer's
+// operator line and FINN.no sentence are the English ones, marked lang="en"
+// (G3-S8: English where the page is English; as /en/guide-opplevelser-mcp).
+const chromeLangAttr = (pageLang: SiteLang): string => (pageLang === "en" ? ' lang="nb"' : "");
+
+function dentalNav(pageLang: SiteLang = "nb"): string {
+  return `<nav class="nav" role="navigation" aria-label="Hovednavigasjon"${chromeLangAttr(pageLang)}>
   <a href="/" class="nav-logo"><svg width="26" height="26" viewBox="0 0 72 72" aria-hidden="true"><circle cx="30" cy="30" r="24" fill="none" stroke="#0F766E" stroke-width="7"/><line x1="48" y1="48" x2="64" y2="64" stroke="#0F766E" stroke-width="9" stroke-linecap="round"/><g transform="translate(16,11) scale(0.78)"><path d="${TOOTH_PATH}" fill="#0F766E"/></g></svg> Finn-tannlege</a>
   <div class="nav-links">
     <a href="/sok">Søk</a>
@@ -694,26 +883,59 @@ function dentalNav(): string {
 </nav>`;
 }
 
-function dentalFooter(): string {
-  return `<footer class="footer" role="contentinfo">
+// ─── Data sources (F2-S1) ─────────────────────────────────────
+// Read from DENTAL_DATA_SOURCES on each call: a new entry shows on every page
+// that lists the sources. The footer's «Datakilder» column names them and
+// links /proveniens; the lists below are on /om and /hvordan-det-fungerer,
+// and /proveniens has them as the field table (F2-S2).
+
+/** The source's name as a list label, linked to the source when it has one address. */
+function dentalSourceNameHtml(s: DentalDataSource, lang: SiteLang): string {
+  const label = escapeHtml(dentalSourceLabel(s, lang));
+  return s.url ? `<a href="${escapeHtml(s.url)}" rel="nofollow noopener" target="_blank">${label}</a>` : label;
+}
+
+/** One <li> per source: its name and what it gives a profile. */
+function dentalSourcesListHtml(lang: SiteLang): string {
+  return DENTAL_DATA_SOURCES.map((s) =>
+    `<li><strong>${dentalSourceNameHtml(s, lang)}</strong> &mdash; ${escapeHtml(dentalSourceFields(s, lang))}</li>`
+  ).join("\n      ");
+}
+
+/** The credit line each licence asks for (NLOD 2.0 §5, CC BY 4.0), with a link to the licence. */
+function dentalSourceLicencesHtml(): string {
+  return dentalLicensedSources().map((s) =>
+    `<li>${escapeHtml(s.attribution ?? `Data fra ${dentalSourceLabel(s, "nb")}`)}. Lisens: <a href="${escapeHtml(s.license.url)}" rel="license noopener" target="_blank">${escapeHtml(s.license.name)}</a>.</li>`
+  ).join("\n      ");
+}
+
+function dentalFooter(pageLang: SiteLang = "nb"): string {
+  const en = pageLang === "en";
+  const companyLine = en
+    ? `<div class="footer-company" lang="en">${companyFooterLineHtml("en", { contactHref: "/en/kontakt" })}</div>`
+    : `<div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>`;
+  const disambiguation = en
+    ? `<div class="footer-disambiguation" lang="en">${escapeHtml(FINN_DISAMBIGUATION_EN)}</div>`
+    : `<div class="footer-disambiguation">${escapeHtml(FINN_DISAMBIGUATION_NB)}</div>`;
+  return `<footer class="footer" role="contentinfo"${chromeLangAttr(pageLang)}>
   <div class="footer-inner">
     <div class="footer-col">
       <h4>Tjeneste</h4>
       <a href="/om">Om finn-tannlege.com</a>
       <a href="/hvordan-det-fungerer">Slik fungerer det</a>
       <a href="/personvern">Personvern</a>
+      <a href="/vilkar">Vilkår</a>
       <a href="/sok">Søk etter tannlege</a>
       <a href="/kontakt">Kontakt oss</a>
     </div>
     <div class="footer-col">
       <h4>Datakilder</h4>
-      <a href="https://www.brreg.no/" rel="nofollow noopener" target="_blank">Brønnøysundregistrene</a>
-      <a href="https://www.helsedirektoratet.no/" rel="nofollow noopener" target="_blank">Helsedirektoratet / HPR</a>
-      <a href="https://www.ntf.no/" rel="nofollow noopener" target="_blank">NTF</a>
+      ${dentalSourceNameLabels("nb").map((label) => `<a href="/proveniens">${escapeHtml(label)}</a>`).join("\n      ")}
     </div>
     <div class="footer-col">
       <h4>For agenter</h4>
       <a href="/llms.txt">llms.txt</a>
+      <a href="/guide-tannlege-ai">AI-assistenter (MCP)</a>
       <a href="/api/tannlege/agents">/api/tannlege</a>
       <a href="https://rettfrabonden.com" rel="noopener" target="_blank">Søsterplattform: rettfrabonden.com</a>
     </div>
@@ -721,7 +943,8 @@ function dentalFooter(): string {
   <div class="footer-bottom">
     &copy; ${new Date().getFullYear()} Finn-tannlege.com &mdash; AI-agenter: <a href="/llms.txt">llms.txt</a> &middot; API: <a href="/api/tannlege/agents">/api/tannlege</a><br>
     En del av A2A-nettverket: <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot; <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a> &mdash; Bygget for både mennesker og AI-agenter
-    <div class="footer-company">${companyFooterLineHtml("nb", { contactHref: "/kontakt" })}</div>
+    ${companyLine}
+    ${disambiguation}
   </div>
 </footer>`;
 }
@@ -729,9 +952,13 @@ function dentalFooter(): string {
 // ─── Shell layout ─────────────────────────────────────────────
 
 interface ShellOptions {
+  // Plain text: dentalShell escapes it, once, for <title>, og:title and
+  // twitter:title. An escaped title came out as «A&amp;amp;B» (D3b).
   title: string;
   description?: string;
-  canonical?: string;
+  // Left out = the homepage. null = no canonical link and no og:url at all,
+  // for a page that is a copy of no other page (the 404s, sendDentalNotFound).
+  canonical?: string | null;
   jsonLd?: object | object[];
   ogImage?: string;
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): thin
@@ -739,66 +966,107 @@ interface ShellOptions {
   // "noindex,follow" — still crawled (follow) so its outbound links keep
   // being discovered, just not itself indexed/ranked.
   robots?: string;
+  // G3-S4 (/guide-tannlege-ai): the page's language (default "nb"), and its
+  // language versions for hreflang (nb is also x-default).
+  lang?: SiteLang;
+  alternates?: { nb: string; en: string };
+  // CSS for this page only, after DENTAL_CSS.
+  extraCss?: string;
 }
 
 function dentalShell(content: string, opts: ShellOptions): string {
+  const lang = opts.lang ?? "nb";
   const desc = opts.description || "Finn riktig tannlege i Norge. Søk etter klinikk, spesialitet, Helfo-avtale og tannlegevakt.";
-  const canonical = opts.canonical || DENTAL_BASE_URL;
+  const canonical = opts.canonical === null ? null : opts.canonical || DENTAL_BASE_URL;
+  const canonicalLink = canonical ? `\n<link rel="canonical" href="${escapeHtml(canonical)}">` : "";
+  const ogUrlMeta = canonical ? `\n<meta property="og:url" content="${escapeHtml(canonical)}">` : "";
   const robots = opts.robots || "index, follow, max-snippet:-1, max-image-preview:large";
   const ldArr = opts.jsonLd
     ? (Array.isArray(opts.jsonLd) ? opts.jsonLd : [opts.jsonLd])
     : [];
   const ldScripts = ldArr
-    .map((ld) => `<script type="application/ld+json">${JSON.stringify(ld).replace(/<\//g, "<\\/")}</script>`)
+    .map((ld) => jsonLdScriptTag(ld))
     .join("\n");
-  // OG/Twitter share image. SVG favicon is the only platform-owned visual asset
-  // we ship, so it doubles as the default share image (overridable via opts.ogImage).
-  const ogImage = opts.ogImage || `${DENTAL_BASE_URL}/favicon.svg`;
+  // OG/Twitter share image: the 512×512 PNG of the mark (F2-S4). It was the
+  // SVG favicon, which most share scrapers do not show. A page's own image
+  // (opts.ogImage) gets no size tags here.
+  const ogImage = opts.ogImage || DENTAL_LOGO_PNG_URL;
+  const ogImageSize = opts.ogImage
+    ? ""
+    : `\n<meta property="og:image:type" content="image/png">` +
+      `\n<meta property="og:image:width" content="${DENTAL_ICONS.png512.size}">` +
+      `\n<meta property="og:image:height" content="${DENTAL_ICONS.png512.size}">`;
+  const ogImageAlt = lang === "en"
+    ? "Finn-tannlege.com — an independent directory of dentists in Norway"
+    : "Finn-tannlege.com — uavhengig oversikt over tannleger i Norge";
+  const alternates = opts.alternates
+    ? `\n<link rel="alternate" hreflang="nb" href="${escapeHtml(opts.alternates.nb)}">` +
+      `\n<link rel="alternate" hreflang="en" href="${escapeHtml(opts.alternates.en)}">` +
+      `\n<link rel="alternate" hreflang="x-default" href="${escapeHtml(opts.alternates.nb)}">`
+    : "";
   return `<!DOCTYPE html>
-<html lang="nb">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
-<meta name="robots" content="${escapeHtml(robots)}">
-<link rel="canonical" href="${escapeHtml(canonical)}">
+<meta name="robots" content="${escapeHtml(robots)}">${canonicalLink}${alternates}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="192x192" href="${DENTAL_ICONS.png192.path}">
+<link rel="apple-touch-icon" sizes="180x180" href="${DENTAL_ICONS.appleTouch.path}">
 <meta property="og:title" content="${escapeHtml(opts.title)}">
-<meta property="og:description" content="${escapeHtml(desc)}">
-<meta property="og:url" content="${escapeHtml(canonical)}">
+<meta property="og:description" content="${escapeHtml(desc)}">${ogUrlMeta}
 <meta property="og:type" content="website">
-<meta property="og:locale" content="nb_NO">
+<meta property="og:locale" content="${lang === "en" ? "en_US" : "nb_NO"}">
 <meta property="og:site_name" content="Finn-tannlege.com">
-<meta property="og:image" content="${escapeHtml(ogImage)}">
-<meta property="og:image:alt" content="Finn-tannlege.com — uavhengig oversikt over tannleger i Norge">
+<meta property="og:image" content="${escapeHtml(ogImage)}">${ogImageSize}
+<meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="${escapeHtml(opts.title)}">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <meta name="twitter:image" content="${escapeHtml(ogImage)}">
 ${ldScripts}
-${DENTAL_CSS}
+${DENTAL_CSS}${opts.extraCss ? `\n<style>${opts.extraCss}</style>` : ""}
 </head>
 <body>
-${dentalNav()}
+${dentalNav(lang)}
 ${content}
-${dentalFooter()}
+${dentalFooter(lang)}
 </body>
 </html>`;
 }
 
+// Every HTML 404 on finn-tannlege.com goes through here, so none of them asks
+// to be indexed: "noindex, follow", like the Opplevagent and RFB 404 pages,
+// instead of the shell's default "index, follow" (integrasjonstest RYS-1,
+// dev-request 2026-10-17-integrasjonstest-oppfolging I-Q). Nor do they carry a
+// canonical link or og:url: they used to fall back to the homepage, so every
+// 404 claimed to be a copy of https://finn-tannlege.com (FUNN
+// dental-404-canonical-til-forsiden, dev-request
+// 2026-10-16-finn-tannlege-landingssider F1-S1).
+const NOT_FOUND_ROBOTS = "noindex, follow";
+
+function sendDentalNotFound(res: Response, content: string, opts: Omit<ShellOptions, "robots" | "canonical">): void {
+  res.status(404).send(dentalShell(content, { ...opts, robots: NOT_FOUND_ROBOTS, canonical: null }));
+}
+
 // ─── Clinic card (used in /sok and /fylke) ───────────────────
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A4-D): the card, like the profile below, shows the clinic
+// through shownDentalAgent (no phone or hours that only Google Places gives).
 
 function clinicCard(
-  agent: DentalAgent & { id: string }
+  stored: DentalAgentRow
 ): string {
+  const agent = shownDentalAgent(stored);
   const slug = slugifyClinic(agent.navn, agent.org_nr ?? undefined);
   const href = agent.org_nr
     ? `/klinikk/${escapeHtml(slug)}`
     : `/klinikk/id/${escapeHtml(agent.id)}`;
 
   const badges: string[] = [];
-  if (agent.verification_status === "verified")
+  if (resolveVerifiedClaim(agent))
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
   if (agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-avtale</span>`);
@@ -817,8 +1085,9 @@ function clinicCard(
     : "";
 
   const specialties = (() => {
-    if (!agent.available_specialties || agent.available_specialties.length === 0) return "";
-    const links = agent.available_specialties.map((s) => {
+    const names = clinicSpecialties(agent);
+    if (names.length === 0) return "";
+    const links = names.map((s) => {
       const sp = SPECIALTY_PAGES.find((p) => p.navn === s.toLowerCase());
       return sp
         ? `<a href="/spesialitet/${escapeHtml(sp.slug)}" class="spec-chip" style="padding:3px 10px;font-size:.75rem">${escapeHtml(s)}</a>`
@@ -848,31 +1117,123 @@ function clinicCard(
 </article>`;
 }
 
-// ─── Pagination helper ───────────────────────────────────────
+// ─── Pagination + ItemList (shared by every dental list page) ──
+// dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1): /fylke, /sted
+// and /spesialitet page the same way, so every clinic on them can be crawled.
+// Page 1 is the bare path; page N ≥ 2 is <path>?side=N and is its own
+// canonical. The facet pages (2026-10-16-finn-tannlege-fasettsider) are meant
+// to use these as they are.
 
-function paginationHtml(
+/** Relative URL of page `n` of the list at `baseUrl` (which may carry a query). */
+export function listPageHref(baseUrl: string, n: number): string {
+  const base = baseUrl.replace(/[?&]$/, "");
+  if (n <= 1) return base;
+  return `${base}${base.includes("?") ? "&" : "?"}side=${n}`;
+}
+
+/**
+ * What page N ≥ 2 of a list adds to its <title> (« – side N») and description
+ * (« Side N av M.»): it is its own canonical, so it must not repeat page 1's
+ * title and description word for word. Page 1 adds nothing.
+ */
+export function listPageMeta(page: number, totalPages: number): { title: string; description: string } {
+  return page > 1
+    ? { title: ` – side ${page}`, description: ` Side ${page} av ${totalPages}.` }
+    : { title: "", description: "" };
+}
+
+/**
+ * The page a list request is on, for `total` rows in pages of listPageSize:
+ * ?side= parsed as before; missing, invalid, below 1 or past the last page =
+ * page 1.
+ */
+export function resolveListPage(
+  side: unknown,
+  total: number
+): { page: number; offset: number; totalPages: number } {
+  const pageSize = DENTAL_LANDING_CONFIG.listPageSize;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const raw = parseInt(String(side || "1"), 10);
+  const page = Number.isFinite(raw) && raw > 0 && raw <= totalPages ? raw : 1;
+  return { page, offset: (page - 1) * pageSize, totalPages };
+}
+
+/**
+ * Page nav: previous, first, the current page ± paginationWindow, last and
+ * next, each a real link (rel="prev"/"next", aria-current on the current
+ * page). The gap mark between non-adjacent numbers is decoration and stands
+ * for no page: every page is reachable through links, and the last page is
+ * linked from every page. It used to link pages 1–10 only, with «... N» as
+ * plain text, so page 11 and on could not be crawled. Every list route,
+ * /sok included (D3b), resolves ?side= with resolveListPage, so it never
+ * asks for a page past the last one; if a caller does, the window sits at
+ * the end and «Forrige» goes to the last page, never to a page that does not
+ * exist.
+ */
+export function paginationHtml(
   currentPage: number,
   totalPages: number,
   baseUrl: string
 ): string {
   if (totalPages <= 1) return "";
-  const pages: string[] = [];
-  const sep = baseUrl.includes("?") ? "&" : "?";
-  for (let i = 1; i <= Math.min(totalPages, 10); i++) {
-    const active = i === currentPage ? " active" : "";
-    pages.push(
-      `<a href="${escapeHtml(baseUrl + sep + "side=" + i)}" class="page-btn${active}">${i}</a>`
-    );
-  }
-  if (totalPages > 10) {
-    pages.push(`<span class="page-btn" style="cursor:default">... ${totalPages}</span>`);
-  }
-  return `<nav class="pagination" aria-label="Sidebladering">${pages.join("")}</nav>`;
+  const win = DENTAL_LANDING_CONFIG.paginationWindow;
+  const a = (n: number, label: string, attrs: string): string =>
+    `<a href="${escapeHtml(listPageHref(baseUrl, n))}"${attrs}>${label}</a>`;
+
+  const at = Math.min(currentPage, totalPages);
+  const shown = new Set<number>([1, totalPages]);
+  for (let n = Math.max(1, at - win); n <= Math.min(totalPages, at + win); n++) shown.add(n);
+  const numbers = [...shown].sort((x, y) => x - y);
+
+  const parts: string[] = [];
+  if (currentPage > 1) parts.push(a(Math.min(currentPage - 1, totalPages), "&lsaquo; Forrige", ` class="page-btn" rel="prev"`));
+  numbers.forEach((n, i) => {
+    if (i > 0 && n - numbers[i - 1]! > 1) parts.push(`<span class="page-gap" aria-hidden="true">&hellip;</span>`);
+    parts.push(a(n, String(n), n === currentPage ? ` class="page-btn active" aria-current="page"` : ` class="page-btn"`));
+  });
+  if (currentPage < totalPages) parts.push(a(currentPage + 1, "Neste &rsaquo;", ` class="page-btn" rel="next"`));
+  return `<nav class="pagination" aria-label="Sidebladering">${parts.join("")}</nav>`;
+}
+
+/**
+ * ItemList JSON-LD for one rendered list page: exactly the cards on it, in
+ * order, positions counted on from `offset` (page 2 starts at 51). It used to
+ * stop at 25 while 50 cards were rendered. Profile URLs via clinicProfileUrl,
+ * no query string (UTM stays in the transport layer, lokal#1077).
+ */
+export function dentalItemListJsonLd(
+  name: string,
+  url: string,
+  agents: Array<{ id: string; navn: string; org_nr?: string | null }>,
+  offset: number
+): object {
+  return {
+    "@context": "https://schema.org",
+    "@type": "ItemList",
+    name,
+    url,
+    numberOfItems: agents.length,
+    itemListElement: agents.map((a, i) => ({
+      "@type": "ListItem",
+      position: offset + i + 1,
+      url: clinicProfileUrl(a),
+      name: a.navn,
+    })),
+  };
 }
 
 // ═══════════════════════════════════════════════════════════
 // GET / — Forside
 // ═══════════════════════════════════════════════════════════
+
+// dev-request 2026-10-16-finn-tannlege-landingssider (F1-S1): the hero chips
+// (DENTAL_LANDING_CONFIG.heroPlaces) link the indexable /sted/<slug> page
+// when the place has one in the cached poststed list (findStedRow, the lookup
+// /sted itself uses), and /sok?q= (noindex) only when it has none.
+function heroPlaceHref(place: string): string {
+  const slug = slugifyText(place);
+  return findStedRow(slug) ? `/sted/${slug}` : `/sok?q=${encodeURIComponent(place)}`;
+}
 
 router.get("/", (_req: Request, res: Response) => {
   let stats = { total: 0, per_fylke: [] as Array<{ fylke: string; count: number }>, helfo_count: 0, chain_count: 0, acute_count: 0, specialist_clinic_count: 0 };
@@ -912,15 +1273,9 @@ router.get("/", (_req: Request, res: Response) => {
         "query-input": "required name=search_term_string",
       },
     },
-    {
-      "@context": "https://schema.org",
-      "@type": "Organization",
-      name: "Finn-tannlege",
-      url: DENTAL_BASE_URL,
-      logo: DENTAL_BASE_URL + "/favicon.svg",
-      // T2: the company that owns and operates finn-tannlege.com.
-      parentOrganization: parentOrganizationJsonLd(),
-    },
+    // G3-S1-dental: the shared brand builder (@id, alternateName, PNG logo,
+    // G3-S8 disambiguatingDescription, T2 parentOrganization).
+    organizationJsonLd("dental"),
   ];
 
   const html = `
@@ -934,10 +1289,7 @@ router.get("/", (_req: Request, res: Response) => {
       <button type="submit">Søk</button>
     </form>
     <div class="chips" role="list" aria-label="Snarvei-søk">
-      <a href="/sok?q=Oslo" class="chip" role="listitem">Oslo</a>
-      <a href="/sok?q=Bergen" class="chip" role="listitem">Bergen</a>
-      <a href="/sok?q=Trondheim" class="chip" role="listitem">Trondheim</a>
-      <a href="/sok?q=Stavanger" class="chip" role="listitem">Stavanger</a>
+      ${DENTAL_LANDING_CONFIG.heroPlaces.map((place) => `<a href="${escapeHtml(heroPlaceHref(place))}" class="chip" role="listitem">${escapeHtml(place)}</a>`).join("\n      ")}
       <a href="/sok?akutt=1" class="chip" role="listitem" style="background:rgba(251,191,36,.25)">Akutt</a>
     </div>
   </section>
@@ -1015,16 +1367,17 @@ router.get("/", (_req: Request, res: Response) => {
     <div class="container">
       <div class="akutt-banner" role="region" aria-label="Tannlegevakt">
         <h3>Tannlegevakt og akuttbehandling</h3>
-        <p>Tannlegevakttilbudet i Norge er fragmentert og varierer mye fra kommune til kommune. Mange fylker har kommunal tannlegevakt for akutte smerter og skader, men åpningstidene er begrenset. <a href="/sok?akutt=1">Se klinikker med akuttvakt-tilbud</a> &rarr;</p>
+        <p>Tannlegevakttilbudet i Norge er fragmentert og varierer mye fra kommune til kommune. Mange fylker har kommunal tannlegevakt for akutte smerter og skader, men åpningstidene er begrenset. <a href="/sok?akutt=1">Se klinikker som oppgir akutthjelp</a> &rarr;</p>
       </div>
     </div>
   </section>
 
   ${(() => {
-    const topSteder = getCachedPoststeder().slice(0, 20);
+    // The 20 largest /sted groups, one chip per slug (D3b).
+    const topSteder = stedGroups().bySize.slice(0, 20);
     if (topSteder.length === 0) return "";
-    const chips = topSteder.map((p) =>
-      `<a href="/sted/${escapeHtml(slugifyText(p.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(p.poststed))}</a>`
+    const chips = topSteder.map((g) =>
+      `<a href="/sted/${escapeHtml(slugifyText(g.row.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(g.row.poststed))}</a>`
     ).join("");
     return `<section class="section">
     <div class="container">
@@ -1095,44 +1448,76 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
   });
 });
 
-router.get("/sok", (req: Request, res: Response) => {
+/**
+ * The /sok checkbox for `akutt=1` (A2A dev-request
+ * 2026-10-16-finn-tannlege-fasettsider, F1-S4e): the filter is the akutt claim
+ * on the card (DENTAL_ACUTE_CLAIM_SQL), «Akuttvakt» and «Tar imot
+ * akuttpasienter» both, so its label names neither badge.
+ * /hvordan-det-fungerer names the filter with the same word. Both pages print
+ * it through escapeHtml, as every other label.
+ */
+export const DENTAL_ACUTE_FILTER_LABEL = "Akutthjelp";
+
+// generalLimiter on the route, like /sok in seo.ts and experiences-seo.ts
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, I-T revision). The
+// finn-tannlege.com host gate in src/index.ts hands every non-API path to this
+// router before any limiter mount, so this free-text search — a count, a page
+// of rows and the specialty list per request, any ?side= — had none. Same
+// shared instance and quota as the other /sok pages; dentalLimiter stays the
+// /api/tannlege quota for the enrichment workers.
+router.get("/sok", generalLimiter, (req: Request, res: Response) => {
   const searchStarted = Date.now();
-  const PAGE_SIZE = 50;
-  const q = String(req.query.q || "").trim();
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read (search, log, the
+  // search box), cut at a word boundary (utils/free-text.ts).
+  const q = capFreeText(String(req.query.q || "").trim());
   const fylke = String(req.query.fylke || "").trim();
   const spesialitet = String(req.query.spesialitet || "").trim();
   const helfo = req.query.helfo === "1";
   const akutt = req.query.akutt === "1";
   const kjede = String(req.query.kjede || "").trim();
-  const sideRaw = parseInt(String(req.query.side || "1"), 10);
-  const page = Number.isFinite(sideRaw) && sideRaw > 0 ? sideRaw : 1;
-  const offset = (page - 1) * PAGE_SIZE;
 
-  const filter: Record<string, unknown> = {};
-  if (q) filter.q = q;
-  if (fylke) filter.fylke = fylke;
-  if (spesialitet) filter.specialty = spesialitet;
-  if (helfo) filter.helfo_agreement = "true";
-  if (akutt) filter.acute_vakt = 1;
-  if (kjede) filter.chain_brand = kjede;
+  // The form's own fields win over what the parser reads out of `q`
+  // (dev-request 2026-10-16-tannlege-sok-naturlig-sprak, S3).
+  const explicit: Record<string, unknown> = {};
+  if (fylke) explicit.fylke = fylke;
+  if (spesialitet) explicit.specialty = spesialitet;
+  if (helfo) explicit.helfo_agreement = "true";
+  if (akutt) explicit.acute_vakt = 1; // the public store reads this as the akutt claim on the card (S2b)
+  if (kjede) explicit.chain_brand = kjede;
 
-  let agents: Array<DentalAgent & { id: string }> = [];
+  let agents: DentalAgentRow[] = [];
   let total = 0;
+  let tolkning: DentalSearchTolkning | null = null;
+  let filter: DentalSearchPlan["filter"] | null = null;
   try {
-    agents = listPublicDentalAgents(filter as any, PAGE_SIZE, offset);
-    total = countPublicDentalAgents(filter as any);
+    const plan = planDentalSearch({
+      query: q,
+      explicit,
+      gazetteer: () => getDentalSearchGazetteer(listPoststeder),
+      count: (f) => countPublicDentalAgents(f as any),
+    });
+    tolkning = plan.tolkning;
+    total = plan.count;
+    filter = plan.filter;
   } catch { /* db not ready */ }
+  // Count first, then the page, as on /fylke, /sted and /spesialitet: a
+  // ?side= past the last page is page 1 (D3b). It used to have no upper
+  // bound, so ?side=999 rendered «Ingen klinikker funnet — side 999 av 22».
+  const { page, offset, totalPages } = resolveListPage(req.query.side, total);
+  if (filter) {
+    try {
+      agents = listPublicDentalAgents(filter as any, DENTAL_LANDING_CONFIG.listPageSize, offset);
+    } catch { /* db not ready */ }
+  }
 
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: a search is
   // the first result page of a query or filter set (paging is not a new one).
-  if (page === 1 && Object.keys(filter).length > 0) {
+  if (page === 1 && (q || Object.keys(explicit).length > 0)) {
     analyticsService.logWebSearch(req, Date.now() - searchStarted, {
       query: q || filterQueryText({ fylke, spesialitet, helfo: helfo || undefined, akutt: akutt || undefined, kjede }),
       resultCount: total,
     });
   }
-
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   // Build query string for pagination (preserve all filters)
   const filterParams = new URLSearchParams();
@@ -1206,7 +1591,7 @@ router.get("/sok", (req: Request, res: Response) => {
               <input type="checkbox" name="helfo" value="1"${helfo ? " checked" : ""}> Helfo-avtale
             </label>
             <label class="filter-check">
-              <input type="checkbox" name="akutt" value="1"${akutt ? " checked" : ""}> Akuttvakt
+              <input type="checkbox" name="akutt" value="1"${akutt ? " checked" : ""}> ${escapeHtml(DENTAL_ACUTE_FILTER_LABEL)}
             </label>
           </div>
           <div class="filter-group" style="padding-bottom:2px">
@@ -1219,6 +1604,9 @@ router.get("/sok", (req: Request, res: Response) => {
 
   <div class="container" style="padding-top:28px;padding-bottom:48px">
     <p class="result-meta">${total.toLocaleString("nb")} klinikker funnet${q ? ` for «${escapeHtml(q)}»` : ""}${fylke ? ` i ${escapeHtml(fylke)}` : ""} &mdash; viser side ${page} av ${totalPages}</p>
+    ${tolkning && tolkning.tolket_som.length > 0
+      ? `<p class="result-meta">${tolkning.fallback ? "Ingen treff med tolkningen (" + escapeHtml(tolkning.tolket_som.join(" · ")) + ") &mdash; viser treff på hele søketeksten." : "Tolket som: " + escapeHtml(tolkning.tolket_som.join(" · "))}</p>`
+      : ""}
     <div class="clinic-list" role="list" aria-label="Søkeresultater">
       ${resultCards}
     </div>
@@ -1229,9 +1617,15 @@ router.get("/sok", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: q ? `${escapeHtml(q)} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
+    title: q ? `${q} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
     description: `Søk blant ${total} tannlegeklinikker i Norge. Filtrer på Helfo-avtale, spesialitet og fylke.`,
     canonical: `${DENTAL_BASE_URL}/sok`,
+    // noindex on every /sok variant, with or without q (dev-request
+    // 2026-10-16-finn-tannlege-landingssider, F1-S1), as on rettfrabonden.com:
+    // /sok?q= is an unbounded query space. follow keeps link equity flowing
+    // to the clinic pages listed in the results; /sted, /fylke and
+    // /spesialitet are the indexable lists.
+    robots: "noindex, follow",
   }));
 });
 
@@ -1255,18 +1649,25 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
 }
 
 function renderClinicProfile(
-  agent: DentalAgent & { id: string },
+  stored: DentalAgentRow,
   req: Request,
   res: Response
 ): void {
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the page, its JSON-LD, its descriptions and its
+  // thin-profile check read the values the Places display rule shows
+  // (dental-places-display.ts). A hidden address, phone, website or opening
+  // hours is left out as if unknown; postnummer, place, map and coordinates
+  // stay (Daniel 2026-10-18T17:01Z).
+  const agent = shownDentalAgent(stored);
   // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   // synthetic schema-probe row 404s exactly like a rejected clinic, on both
   // /klinikk/id/:id and /klinikk/:slug (both render through here).
   if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
 
@@ -1281,7 +1682,7 @@ function renderClinicProfile(
   const badges: string[] = [];
   if (inactive)
     badges.push(`<span class="badge" style="background:#FEE2E2;color:#7F1D1D;border:1px solid #FECACA">Nedlagt</span>`);
-  if (!inactive && agent.verification_status === "verified")
+  if (!inactive && resolveVerifiedClaim(agent))
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
   if (!inactive && agent.helfo_agreement === "true")
     badges.push(`<span class="badge badge-helfo">Helfo-direkteoppgjør</span>`);
@@ -1294,13 +1695,14 @@ function renderClinicProfile(
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
   // ── Rating badge (Google Places)
-  // Only render when rating is non-null; never show "0 anmeldelser" noise.
-  if ((agent as any).rating != null) {
-    const ratingVal: number = (agent as any).rating;
-    const ratingCount: number | null = (agent as any).rating_count ?? null;
-    const stars = "★".repeat(Math.round(ratingVal)) + "☆".repeat(Math.max(0, 5 - Math.round(ratingVal)));
-    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
-    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${stars} ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</span>`);
+  // The stored rating (PR-130) goes through the same policy as on RFB
+  // (structured-data-policy.ts), here and in the info row below: nothing in
+  // RATING_DISPLAY_MODE 'hidden', the mode since S4-A1a (dev-request
+  // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt);
+  // otherwise Google named as the source and never "0 anmeldelser".
+  const ratingDisplay = formatRatingDisplay({ rating: agent.rating, count: agent.rating_count, source: "google" }, "no");
+  if (ratingDisplay) {
+    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${escapeHtml(ratingDisplay.text)}</span>`);
   }
 
   // ── Price band badge
@@ -1341,11 +1743,17 @@ function renderClinicProfile(
 
   // ── Key info grid
   const infoItems: string[] = [];
-  if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${agent.postnummer ? `, ${escapeHtml(agent.postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
+  const postnummer = shownPostnummer(agent.postnummer);
+  // A4-D: when the Places display rule hides the address, the postnummer and
+  // place the Adresse line carried stay visible on a line of their own (Daniel
+  // 17:01Z: postnummer stays). Only then: a shown address, or none stored, is
+  // as before.
+  if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${postnummer ? `, ${escapeHtml(postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
+  else if (stored.adresse && (postnummer || agent.poststed)) infoItems.push(`<div class="info-item"><div class="info-label">Postnummer og sted</div><div class="info-value">${[postnummer, agent.poststed].filter(Boolean).map((v) => escapeHtml(v!)).join(" ")}</div></div>`);
   { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
   { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
   if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
-  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
+  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(addUtmParams(u, CLINIC_SITE_UTM.source, "referral", CLINIC_SITE_UTM.campaign))}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5d):
   // directory_url is NEVER the clinic's own homepage (that's `hjemmeside`
   // above) -- it's a county-directory listing, a Facebook page, or similar.
@@ -1355,12 +1763,9 @@ function renderClinicProfile(
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
   if (agent.chain_brand) infoItems.push(`<div class="info-item"><div class="info-label">Kjede</div><div class="info-value">${escapeHtml(agent.chain_brand)}</div></div>`);
-  // Rating info item — only if rating is present
-  if ((agent as any).rating != null) {
-    const ratingVal: number = (agent as any).rating;
-    const ratingCount: number | null = (agent as any).rating_count ?? null;
-    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
-    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering (Google)</div><div class="info-value">★ ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</div></div>`);
+  // Rating info item — the badge's text, under the same policy (S4-A1a)
+  if (ratingDisplay) {
+    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering</div><div class="info-value">${escapeHtml(ratingDisplay.text)}</div></div>`);
   }
   // Price band info item — only if present and not 'ukjent'
   if ((agent as any).price_band && (agent as any).price_band !== "ukjent") {
@@ -1442,12 +1847,17 @@ function renderClinicProfile(
   // ── JSON-LD Dentist
   // orch-PR-20260613: guard placeholder/empty om_oss; fall back to structured summary.
   const richDesc = !isPlaceholderDescription(agent.om_oss) ? agent.om_oss! : null;
-  let nearbyCount = 0;
-  try {
-    const related = listRelatedClinics(agent, 20);
-    nearbyCount = related.length;
-  } catch { /* db not ready */ }
-  const clinicJsonLdDesc = richDesc ?? buildClinicDescription(agent, nearbyCount, false);
+  // «Det finnes N klinikker i X» (structured meta only): N is what
+  // /sted/<poststed> shows — same slug group, same filter, every spelling
+  // (D3b) — so a place with 978 clinics no longer reads «21» (integrasjonstest
+  // IDX2-02, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q). No /sted
+  // page, or no DB, = 0 and the sentence is left out.
+  let localityCount = 0;
+  const stedGroup = !richDesc && isValidLocality(agent.poststed) ? findStedGroup(slugifyText(agent.poststed!)) : undefined;
+  if (stedGroup) {
+    try { localityCount = countPublicDentalAgents(stedFilter(stedGroup)); } catch { /* db not ready */ }
+  }
+  const clinicJsonLdDesc = richDesc ?? buildClinicDescription(agent, localityCount, false);
   const jsonLd: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "Dentist",
@@ -1458,7 +1868,7 @@ function renderClinicProfile(
     url: canonical,
     // orch-PR-20260613: favicon-as-image is a quality negative for Google rich results.
     // Only emit image if a real clinic image/logo URL exists; otherwise omit the field.
-    // (The ogImage on the page shell still falls back to favicon.svg for social sharing.)
+    // (The page shell's share image is the 512×512 PNG of the mark, F2-S4.)
     // orch-PR-20260613: no real image field in DentalAgent; image is omitted
     // rather than falling back to favicon.svg which is a quality negative.
     ...(isDisplayablePhone(agent.telefon) ? { telephone: agent.telefon } : {}),
@@ -1467,14 +1877,15 @@ function renderClinicProfile(
     address: {
       "@type": "PostalAddress",
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
-      ...(agent.postnummer ? { postalCode: agent.postnummer } : {}),
+      ...(postnummer ? { postalCode: postnummer } : {}),
       // orch-PR-20260613: guard malformed/foreign locality values (e.g. "Se-44338 Lerum", "Ukjent")
-      ...(isValidLocality(agent.poststed) ? { addressLocality: titleCasePoststed(agent.poststed!) } : {}),
+      // D3d trinn 3: the official spelling, as in the title ("Tromsø", not "Tromsoe")
+      ...(isValidLocality(agent.poststed) ? { addressLocality: officialPlaceLabel(agent.poststed!) } : {}),
       ...(isValidLocality(agent.fylke) ? { addressRegion: agent.fylke } : {}),
       addressCountry: "NO",
     },
     ...((isValidLocality(agent.poststed) || isValidLocality(agent.fylke))
-      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : agent.fylke } }
+      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? officialPlaceLabel(agent.poststed!) : agent.fylke } }
       : {}),
     ...(agent.lat && agent.lng
       ? { geo: { "@type": "GeoCoordinates", latitude: agent.lat, longitude: agent.lng } }
@@ -1508,11 +1919,11 @@ function renderClinicProfile(
   // ── PR-116: Related clinics (same poststed)
   let relatedSection = "";
   if (agent.poststed) {
-    let related: Array<DentalAgent & { id: string }> = [];
+    let related: DentalAgentRow[] = [];
     try { related = listRelatedClinics(agent, 6); } catch { /* db not ready */ }
     if (related.length > 0) {
       const stedSlug = slugifyText(agent.poststed);
-      const titledSted = titleCasePoststed(agent.poststed);
+      const titledSted = officialPlaceLabel(agent.poststed);
       const relatedCards = related.map(clinicCard).join("");
       relatedSection = `<div class="section-box" style="margin-top:20px">
   <h2>Flere tannleger i ${escapeHtml(titledSted)}</h2>
@@ -1533,15 +1944,29 @@ function renderClinicProfile(
 
   // ── PR-116: BreadcrumbList for profile
   // orch-PR-20260613: guard malformed locality in breadcrumb
+  // D3d trinn 3: the official name; the /sted URL keeps the stored value's slug,
+  // which officialPlaceLabel's name always shares.
   const profileBreadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
   if (isValidLocality(agent.fylke)) profileBreadcrumbItems.push({ name: agent.fylke!, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke!)}` });
-  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
+  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: officialPlaceLabel(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
   profileBreadcrumbItems.push({ name: agent.navn, url: canonical });
   // skive C: a non-clinic must not claim to be a schema.org Dentist.
   const nonClinic = isNonClinicProfile(agent);
   const jsonLdArr = nonClinic
     ? [breadcrumbJsonLd(profileBreadcrumbItems)]
     : [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
+
+  // ── dev-request 2026-10-17-dental-d3-rettelser (D3e): another clinic with
+  // the same name in the same place (any spelling of it) would share this
+  // page's title and meta description. The title then reads «i 0190 Oslo» or
+  // ends «(org.nr N)», and the meta's opening sentence says the same. H1 and
+  // the JSON-LD name stay the registered name. No namesake = no change.
+  let namesakes: DentalNamesake[] = [];
+  try {
+    const spellings = agent.poststed ? findStedGroup(slugifyText(agent.poststed))?.spellings : undefined;
+    namesakes = listDentalNamesakes(agent, spellings);
+  } catch { /* db not ready */ }
+  const namesake = namesakeDisambiguator(agent, namesakes);
 
   // ── orch-PR-20260613: unique meta description
   // Use rich om_oss (when not a placeholder) or a structured-field summary.
@@ -1556,9 +1981,9 @@ function renderClinicProfile(
       return dot > 60 ? t.slice(0, dot + 1) : t + "…";
     }
     if (nonClinic) {
-      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${titleCasePoststed(agent.poststed!)}` : ""}. Registeroppføring.`;
+      return `${agent.navn}${isValidLocality(agent.poststed) ? ` i ${officialPlaceLabel(agent.poststed!)}` : ""}. Registeroppføring.`;
     }
-    return buildClinicDescription(agent, nearbyCount, true);
+    return buildClinicDescription(agent, localityCount, true, namesake);
   })();
 
   // dev-request 2026-09-02-dental-profilkvalitet-finn-tannlege (5b): a
@@ -1589,11 +2014,17 @@ function renderClinicProfile(
   // byte-identical to before this dev-request.
   // skive C: lab/holding get a neutral title; person_enk keeps the
   // sole-proprietor wording (display-name decision for ENK is a separate item).
+  // D3e: a namesake's page names its place with the postnummer or adds the
+  // org.nr, in all three templates; otherwise the place reads as before.
+  // D3d trinn 3: both labels (here and in namesakeDisambiguator) name the
+  // place by officialPlaceLabel, so a title never mixes «Tromsoe» and «Tromsø».
+  const titlePlace = namesake && "place" in namesake ? namesake.place : agent.poststed ? officialPlaceLabel(agent.poststed) : null;
+  const titleLocality = `${titlePlace ? ` i ${titlePlace}` : ""}${namesake && "orgnr" in namesake ? ` (org.nr ${namesake.orgnr})` : ""}`;
   const profileTitleCore = nonClinic && agent.catalog_class !== "person_enk"
-    ? `${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
+    ? `${agent.navn}${titleLocality}`
     : isSoleProprietorProfile(agent)
-    ? `Tannlege ${agent.navn}${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`
-    : `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}`;
+    ? `Tannlege ${agent.navn}${titleLocality}`
+    : `${agent.navn} — Tannlegeklinikk${titleLocality}`;
 
   const html = `
 <main>
@@ -1601,7 +2032,7 @@ function renderClinicProfile(
     <div class="container">
       <div class="clinic-badges" style="margin-bottom:12px">${badges.join("")}</div>
       <h1 class="profile-name">${escapeHtml(agent.navn)}</h1>
-      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(titleCasePoststed(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
+      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(officialPlaceLabel(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
       <div class="profile-actions">${callBtn}${bookBtn}</div>
     </div>
   </div>
@@ -1636,10 +2067,10 @@ function renderClinicProfile(
 router.get("/klinikk/id/:id", (req: Request, res: Response) => {
   const agent = getDentalAgentById(String(req.params.id));
   if (!agent) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
   renderClinicProfile(agent, req, res);
@@ -1648,84 +2079,97 @@ router.get("/klinikk/id/:id", (req: Request, res: Response) => {
 router.get("/klinikk/:slug", (req: Request, res: Response) => {
   const parsed = parseClinicSlug(String(req.params.slug));
   if (!parsed) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
   const agent = getDentalAgentByOrgnr(parsed.orgNr);
   if (!agent) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
   renderClinicProfile(agent, req, res);
 });
 
 // ═══════════════════════════════════════════════════════════
+// F1-S3 (decision 7=A): a /sted page is indexable whenever it lists a clinic.
+// The /sted route (robots) and the sitemap both ask this, so they cannot
+// drift apart. No clinic-count threshold, no env switch: a threshold above 0
+// is a new decision from Daniel. The FAQ gate (DENTAL_LANDING_CONFIG.faq)
+// never decides indexing.
+export function isDentalStedIndexable(total: number): boolean {
+  return total > 0;
+}
+
+const NO_LANDING: DentalAreaLanding = { introHtml: "", tableHtml: "", faqHtml: "", faqJsonLd: null };
+
+// The intro, table and FAQ for a /sted or /fylke page, or nothing: when the
+// aggregate is missing (page 2+, db not ready) or does not agree with the
+// page's own count (cache a little behind the data), no number is stated.
+// `scope` says what the numbers count: a /sted page counts its poststed
+// spellings (not the whole kommune /sok?q= reads), a /fylke page the fylke.
+function areaLandingFor(counts: DentalAreaCounts | undefined, total: number, name: string, url: string, scope: DentalAreaScope): DentalAreaLanding {
+  if (!counts || total <= 0 || counts.total !== total) return NO_LANDING;
+  return buildDentalAreaLanding(counts, { name, url, scope });
+}
+
 // GET /fylke/:fylke
 // ═══════════════════════════════════════════════════════════
 
-router.get("/fylke/:fylke", (req: Request, res: Response) => {
-  const PAGE_SIZE = 50;
-  const fylkeParam = String(req.params.fylke);
-
+// The canonical fylke a /fylke URL segment names, case-insensitive
+// (canonical fylker only, PR-111). /fylke/:fylke and its facet pages (F1-S4a)
+// both read it.
+function findCanonicalFylke(fylkeParam: string): { fylke: string; count: number } | undefined {
   let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
   try { stats = getCachedDentalStats(); } catch { /* ok */ }
+  return canonicalFylker(stats.per_fylke).find((f) => f.fylke.toLowerCase() === fylkeParam.toLowerCase());
+}
 
-  // Case-insensitive match — canonical fylker only (PR-111)
-  const matchedFylke = canonicalFylker(stats.per_fylke).find(
-    (f) => f.fylke.toLowerCase() === fylkeParam.toLowerCase()
-  );
+router.get("/fylke/:fylke", (req: Request, res: Response) => {
+  const fylkeParam = String(req.params.fylke);
+
+  const matchedFylke = findCanonicalFylke(fylkeParam);
   if (!matchedFylke) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Ukjent fylke</h3><p>Vi fant ikke «${escapeHtml(fylkeParam)}» i registeret.</p><a href="/#fylker" class="btn-secondary" style="margin-top:16px">Se alle fylker</a></div></div>`,
-      { title: `${escapeHtml(fylkeParam)} — Fylke ikke funnet | Finn-tannlege.com` }
-    ));
+      { title: `${fylkeParam} — Fylke ikke funnet | Finn-tannlege.com` }
+    );
     return;
   }
 
-  const sideRaw = parseInt(String(req.query.side || "1"), 10);
-  const page = Number.isFinite(sideRaw) && sideRaw > 0 ? sideRaw : 1;
-  const offset = (page - 1) * PAGE_SIZE;
-
-  let agents: Array<DentalAgent & { id: string }> = [];
+  // Count first, so a ?side= past the last page falls back to page 1 (F1-S1).
   let total = 0;
+  try { total = countPublicDentalAgents({ fylke: matchedFylke.fylke }); } catch { /* ok */ }
+  const { page, offset, totalPages } = resolveListPage(req.query.side, total);
+  let agents: DentalAgentRow[] = [];
   try {
-    agents = listPublicDentalAgents({ fylke: matchedFylke.fylke }, PAGE_SIZE, offset);
-    total = countPublicDentalAgents({ fylke: matchedFylke.fylke });
+    agents = listPublicDentalAgents({ fylke: matchedFylke.fylke }, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* ok */ }
 
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const baseUrl = `/fylke/${encodeURIComponent(matchedFylke.fylke)}`;
+  // Page 1 keeps the bare canonical; page N ≥ 2 is its own (F1-S1).
+  const pageUrl = `${DENTAL_BASE_URL}${listPageHref(baseUrl, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
+  const itemList = dentalItemListJsonLd(`Tannleger i ${matchedFylke.fylke}`, pageUrl, agents, offset);
+  // F1-S3: intro, fact table and FAQ from the cached aggregate, page 1 only.
+  const fylkePlace = fylkeLandingPlace(matchedFylke.fylke);
+  const landing = areaLandingFor(page === 1 ? fylkePlace.counts : undefined, total, matchedFylke.fylke, pageUrl, "fylke");
 
-  // JSON-LD ItemList (max 25)
-  const itemList = {
-    "@context": "https://schema.org",
-    "@type": "ItemList",
-    name: `Tannleger i ${matchedFylke.fylke}`,
-    url: `${DENTAL_BASE_URL}${baseUrl}`,
-    numberOfItems: Math.min(total, 25),
-    itemListElement: agents.slice(0, 25).map((a, i) => ({
-      "@type": "ListItem",
-      position: offset + i + 1,
-      url: clinicProfileUrl(a),
-      name: a.navn,
-    })),
-  };
-
-  // PR-116: Poststed chips for this fylke (≥2 clinics, max 30)
-  const fylkePoststeder = getCachedPoststeder()
-    .filter((p) => p.fylke && p.fylke.toLowerCase() === matchedFylke.fylke.toLowerCase() && p.count >= 2)
+  // PR-116: Poststed chips for this fylke (≥2 clinics, max 30). One chip per
+  // /sted group, with the group's count, in the fylke of its main row (D3b).
+  const fylkePoststeder = stedGroups().bySize
+    .filter((g) => g.row.fylke && g.row.fylke.toLowerCase() === matchedFylke.fylke.toLowerCase() && g.count >= 2)
     .slice(0, 30);
   const poststedChips = fylkePoststeder.length > 0
     ? `<div style="margin-top:40px">
   <div class="section-title" style="font-size:1rem;margin-bottom:10px">Steder i ${escapeHtml(matchedFylke.fylke)}</div>
   <div style="display:flex;flex-wrap:wrap;gap:8px">
-    ${fylkePoststeder.map((p) => `<a href="/sted/${escapeHtml(slugifyText(p.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(p.poststed))} <span style="font-size:.75em;opacity:.7">(${p.count})</span></a>`).join("")}
+    ${fylkePoststeder.map((g) => `<a href="/sted/${escapeHtml(slugifyText(g.row.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(g.row.poststed))} <span style="font-size:.75em;opacity:.7">(${g.count})</span></a>`).join("")}
   </div>
 </div>` : "";
 
@@ -1745,11 +2189,14 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     </div>
   </div>
   <div class="container" style="padding-top:28px;padding-bottom:48px">
+    ${landing.introHtml}${landing.tableHtml}
     <p class="result-meta">Side ${page} av ${totalPages}</p>
     <div class="clinic-list" role="list" aria-label="Tannleger i ${escapeHtml(matchedFylke.fylke)}">
       ${agents.length > 0 ? agents.map(clinicCard).join("") : `<div class="empty-state"><h3>Ingen klinikker funnet</h3></div>`}
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
+    ${landing.faqHtml}
+    ${dentalFacetLinksHtml(fylkePlace)}
     ${poststedChips}
   </div>
 </main>`;
@@ -1757,10 +2204,10 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `Tannleger i ${escapeHtml(matchedFylke.fylke)} — Finn-tannlege.com`,
-    description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
-    canonical: `${DENTAL_BASE_URL}${baseUrl}`,
-    jsonLd: [itemList, fylkeBreadcrumb],
+    title: `Tannleger i ${matchedFylke.fylke}${pageMeta.title} — Finn-tannlege.com`,
+    description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
+    canonical: pageUrl,
+    jsonLd: [itemList, fylkeBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
   }));
 });
 
@@ -1769,28 +2216,37 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.get("/om", (_req: Request, res: Response) => {
+  // F2-S2: «Om plattformen» says what the code does, as the «Verifisert» text
+  // on /proveniens: no continuous verification and no «uverifisert» marking
+  // (neither exists), and no claim of how often anything runs. A clinic
+  // without the badge gets no note about the check, but a closed one shows
+  // «Nedlagt» (the profile's header badges), so the text does not say «no
+  // other marking». F2-S8: no manual way to the badge either; it shows only
+  // when the stored fields meet the check's rule (resolveVerifiedClaim).
   const html = `
 <main>
   <div class="content-page">
     <h1>Om Finn-tannlege.com</h1>
-    <p>Finn-tannlege.com er en uavhengig oversikt over tannlegeklinikker i Norge. Vi er ikke tilknyttet noen klinikkjede, forsikringsselskap eller bestillingsportal.</p>
+    <p>Finn-tannlege.com er en uavhengig oversikt over tannlegeklinikker i Norge. Vi er ikke tilknyttet noen klinikkjede, forsikringsselskap eller bestillingsportal. ${escapeHtml(FINN_DISAMBIGUATION_NB)}</p>
 
     <h2>Hva vi tilbyr</h2>
     <p>Vi samler informasjon om tannlegeklinikker fra offentlig tilgjengelige kilder og gjør den søkbar og lettleselig for alle. Du kan søke på by, fylke, spesialitet, Helfo-avtale og akuttilbud.</p>
 
     <h2>Datakilder</h2>
     <ul>
-      <li><strong>Brønnøysundregistrene</strong> — Enhetsregisteret, organisasjonsdata og kontaktinformasjon</li>
-      <li><strong>Helsedirektoratet / HPR</strong> — Helsepersonellregisteret, spesialistdata</li>
-      <li><strong>Den norske tannlegeforening (NTF)</strong> — Spesialistlister og fagdata</li>
-      <li><strong>Klinikkenes egne nettsider</strong> — Åpningstider, behandlingstilbud og kontaktinformasjon</li>
+      ${dentalSourcesListHtml("nb")}
     </ul>
+    <p>Lisenser og kildeangivelse:</p>
+    <ul>
+      ${dentalSourceLicencesHtml()}
+    </ul>
+    <p>Hvilket felt som kommer fra hvilken kilde, hvordan det hentes og hvilken dato vi lagrer, står på <a href="/proveniens">Metode og kilder</a>.</p>
 
     <h2>Oppdatering av klinikkprofil</h2>
     <p>Klinikker kan be om oppdatering eller fjerning av sin profil ved å sende e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 5 virkedager.</p>
 
     <h2>Om plattformen</h2>
-    <p>Finn-tannlege.com er del av A2A-agentplattformen — et system der AI-agenter jobber kontinuerlig med å hente, verifisere og oppdatere klinikkdata fra offentlige registre og åpne nettsider. Data av lavere kvalitet er tydelig merket som uverifisert.</p>
+    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket får ingen merknad om kontrollen. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
 
     <p>Søsterplattform: <a href="https://rettfrabonden.com" rel="noopener" target="_blank">rettfrabonden.com</a> — lokal mat direkte fra bønder i Norge.</p>
   </div>
@@ -1810,43 +2266,86 @@ router.get("/om", (_req: Request, res: Response) => {
 // GET /sitemap.xml
 // ═══════════════════════════════════════════════════════════
 
-router.get("/sitemap.xml", (_req: Request, res: Response) => {
-  try {
-    const today = new Date().toISOString().split("T")[0];
+function buildDentalSitemapXml(): string {
+  {
     let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
     try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`;
 
-    // Static pages
+    // dev-request 2026-10-16-finn-tannlege-landingssider (F1-S2): <lastmod> is
+    // the day a page's content last changed, not the build day. Every static,
+    // specialty, fylke and sted URL used to carry today's date on every build
+    // (876 of 5 189 URLs), so the signal was worthless. Aggregate pages get
+    // the newest updated_at among the clinics they list; static pages the day
+    // their text changed (DENTAL_STATIC_PAGE_DATES). No known day = no
+    // <lastmod>. This build is cached (createSitemapCache), so the aggregate
+    // queries never run per request.
+    let lastmods: DentalAggregateLastmods | null = null;
+    try { lastmods = getDentalAggregateLastmods({ specialties: SPECIALTY_PAGES.map((sp) => sp.navn) }); } catch { /* db not ready */ }
+    const lastmodTag = (d: string | null | undefined): string => (d ? `<lastmod>${d}</lastmod>` : "");
+    // One <url> in the order the sitemaps.org 0.9 XSD requires: loc, lastmod
+    // (optional), changefreq, priority (dev-request
+    // 2026-10-17-dental-d3-rettelser, D3b). <lastmod> used to come last,
+    // which made every <url> in the file fail the schema.
+    const urlTag = (loc: string, freq: string, pri: string, day?: string | null): string =>
+      `<url><loc>${loc}</loc>${lastmodTag(day)}<changefreq>${freq}</changefreq><priority>${pri}</priority></url>`;
+
+    // Static pages. /sok is left out: it is noindex (F1-S1).
     const statics: Array<[string, string, string]> = [
       ["/", "daily", "1.0"],
-      ["/sok", "daily", "0.9"],
       ["/hvordan-det-fungerer", "monthly", "0.7"],
       ["/om", "monthly", "0.6"],
       ["/personvern", "monthly", "0.4"],
+      ["/vilkar", "monthly", "0.4"],
       ["/proveniens", "monthly", "0.5"],
     ];
     for (const [p, freq, pri] of statics) {
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority><lastmod>${today}</lastmod></url>`;
+      const day = p === "/" ? lastmods?.all : DENTAL_STATIC_PAGE_DATES[p];
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}${p === "/" ? "" : p}`, freq, pri, day)}`;
+    }
+
+    // The AI guide (G3-S4), Norwegian and English. No <lastmod>: the page
+    // lists the registered MCP tools, so its text changes with them, and no
+    // date in DENTAL_STATIC_PAGE_DATES would stay true.
+    for (const lang of ["nb", "en"] as const) {
+      xml += `\n  ${urlTag(dentalAiGuideUrl(lang), "monthly", "0.6")}`;
     }
 
     // Specialty pages (PR-112)
     for (const sp of SPECIALTY_PAGES) {
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}/spesialitet/${sp.slug}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/spesialitet/${sp.slug}`, "weekly", "0.8", lastmods?.forSpecialty(sp.navn))}`;
     }
 
     // Fylke pages (canonical only — PR-111)
     for (const f of canonicalFylker(stats.per_fylke)) {
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}/fylke/${encodeURIComponent(f.fylke)}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/fylke/${encodeURIComponent(f.fylke)}`, "weekly", "0.8", lastmods?.forFylke(f.fylke))}`;
     }
 
-    // Sted pages (PR-116) — all poststeder with ≥1 clinic
-    const sitemapSteder = getCachedPoststeder();
-    for (const p of sitemapSteder) {
-      xml += `\n  <url><loc>${DENTAL_BASE_URL}/sted/${slugifyText(p.poststed)}</loc><changefreq>weekly</changefreq><priority>0.75</priority><lastmod>${today}</lastmod></url>`;
+    // Sted pages (PR-116) — all poststeder with ≥1 clinic. One URL per slug:
+    // two spellings of one place ("BERGEN", "Bergen") slug alike and used to
+    // be listed twice (integrasjonstest IDX-3). The /sted groups keep the
+    // list's order, and the lastmod covers every spelling the page lists (D3b).
+    for (const [slug, group] of stedGroups().bySlug) {
+      if (!isDentalStedIndexable(group.count)) continue;
+      xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/sted/${slug}`, "weekly", "0.75", lastmods?.forPoststed(stedSpellings(group)))}`;
     }
+
+    // Facet pages (A2A dev-request 2026-10-16-finn-tannlege-fasettsider,
+    // F1-S4a): the ones over the facet gate, of the places the facet routes
+    // look up (findStedLandingPlace, findFylkeLandingPlace), so each URL here
+    // answers 200, less a fylke's that has a /sted facet page with the same
+    // clinics as its canonical. lastmod: the newest clinic in the facet, from
+    // the cached aggregate the gate and the page's «Sist oppdatert» read.
+    const facetUrls = (place: DentalLandingPlace | undefined): void => {
+      if (!place) return;
+      for (const { facet, counts } of sitemapDentalFacets(place)) {
+        xml += `\n  ${urlTag(`${DENTAL_BASE_URL}${dentalFacetPath(place, facet)}`, "weekly", "0.6", counts.max_updated_at?.slice(0, 10))}`;
+      }
+    };
+    for (const slug of stedGroups().bySlug.keys()) facetUrls(findStedLandingPlace(slug));
+    for (const f of canonicalFylker(stats.per_fylke)) facetUrls(findFylkeLandingPlace(f.fylke));
 
     // Clinic pages — getDentalAgentsForSitemap for lastmod support (PR-116)
     let clinicRows: Array<{ org_nr: string; navn: string; updated_at: string | null }> = [];
@@ -1855,8 +2354,14 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     if (clinicRows.length > 0) {
       for (const a of clinicRows) {
         const slug = slugifyClinic(a.navn, a.org_nr);
-        const lastmod = a.updated_at ? (a.updated_at.split("T")[0] || a.updated_at) : today;
-        xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${escapeHtml(lastmod)}</lastmod></url>`;
+        // W3C date (YYYY-MM-DD) like the Opplevagent and RFB sitemaps. updated_at
+        // is SQLite datetime('now'), "2026-07-21 11:39:18" (space, no time zone),
+        // which split("T") left whole on every /klinikk URL (integrasjonstest
+        // IDX2-01, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q).
+        // A missing value, or one that is not a date, gives no <lastmod>
+        // rather than the build day (F1-S2, D3b).
+        const day = (a.updated_at || "").slice(0, 10);
+        xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/klinikk/${slug}`, "monthly", "0.7", /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : null)}`;
       }
     } else {
       // Fallback: batch from listPublicDentalAgents
@@ -1869,7 +2374,8 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
         for (const a of batch) {
           if (!a.org_nr) continue;
           const slug = slugifyClinic(a.navn, a.org_nr);
-          xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+          // No <lastmod> here rather than the build day (F1-S2).
+          xml += `\n  ${urlTag(`${DENTAL_BASE_URL}/klinikk/${slug}`, "monthly", "0.7")}`;
         }
         batchOffset += BATCH;
         if (batch.length < BATCH) break;
@@ -1877,12 +2383,32 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
 
     xml += "\n</urlset>";
+    return xml;
+  }
+}
+
+// Slice C (dev-request 2026-09-29-gsc-strukturerte-data-og-5xx): short-TTL in-memory
+// cache (same SITEMAP_CACHE_TTL_MS as rfb). Single domain per router -> one entry.
+const dentalSitemapCache = createSitemapCache("dental", buildDentalSitemapXml);
+export function getDentalSitemapXml(now?: number, build?: () => string): string {
+  return dentalSitemapCache.get(now, build);
+}
+export function __resetDentalSitemapCacheForTesting(): void {
+  dentalSitemapCache.reset();
+}
+
+router.get("/sitemap.xml", (_req: Request, res: Response) => {
+  const startedAt = Date.now();
+  try {
+    const xml = getDentalSitemapXml();
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
   } catch (err) {
     console.error("[dental-sitemap] error:", err);
     res.status(500).send("Error generating sitemap");
   }
+  logSlowSitemap("dental", startedAt);
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -1926,6 +2452,10 @@ Sitemap: ${DENTAL_BASE_URL}/sitemap.xml
 router.get("/llms.txt", (_req: Request, res: Response) => {
   // ONE catalog number (services/honest-count.ts), read live — not via the 60 s SSR stats cache.
   const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
+  // The tannlegevakt facet is described only while it is on (off since F1-S4c).
+  const vaktFacetLine = DENTAL_LANDING_FACETS.some((f) => f.kind === "tannlegevakt" && f.enabled)
+    ? "Fasetten tannlegevakt lister bare klinikker som oppgir akuttvakt med kilde.\n"
+    : "";
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -1936,8 +2466,11 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
 ## Hva er dette?
 
 Finn-tannlege.com er en uavhengig søketjeneste for tannlegeklinikker i Norge.
-Databasen inneholder omtrent ${stats.total.toLocaleString("nb")} klinikker hentet fra
-Brønnøysundregistrene, HPR og klinikkenes egne nettsider.
+Databasen inneholder omtrent ${stats.total.toLocaleString("nb")} klinikker, med opplysninger fra
+${dentalSourceNamesSentence("nb")}.
+
+${FINN_DISAMBIGUATION_NB}
+${FINN_DISAMBIGUATION_EN}
 
 ## A2A AI-discovery
 
@@ -1963,6 +2496,7 @@ ChatGPT Custom GPT — Finn tannlege i Norge: https://chatgpt.com/g/g-6a21e79241
 HTTP Streamable MCP:  ${DENTAL_BASE_URL}/mcp
 MCP Server Card:      ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 npm-pakke (stdio):    npx finn-tannlege-mcp
+Oppsettsguide:        ${dentalAiGuideUrl("nb")} (English: ${dentalAiGuideUrl("en")})
 
 Tilgjengelige MCP-tools:
 ${registeredMcpTools("dental").map((t) => `- ${t.name} — ${t.description}`).join("\n")}
@@ -2009,13 +2543,22 @@ ${DENTAL_BASE_URL}/spesialitet/pedodonti
 ${DENTAL_BASE_URL}/spesialitet/oral-protetikk
 ${DENTAL_BASE_URL}/spesialitet/kjeve-og-ansiktsradiologi
 
+## Fasettsider
+
+Klinikkene på ett sted eller i ett fylke med ett bestemt tilbud:
+${DENTAL_BASE_URL}/sted/{sted}/{fasett}
+${DENTAL_BASE_URL}/fylke/{fylke}/{fasett}
+
+Fasetter: ${DENTAL_LANDING_FACETS.filter((f) => f.enabled).map((f) => f.slug).join(", ")}
+${vaktFacetLine}En fasettside finnes bare når minst ${DENTAL_LANDING_CONFIG.facets.minListings} klinikker på stedet har tilbudet. Sidene står i ${DENTAL_BASE_URL}/sitemap.xml. Har en fylkesside nøyaktig de samme klinikkene som én stedsside, står bare stedssiden der.
+
 ## Slik fungerer det
 
 ${DENTAL_BASE_URL}/hvordan-det-fungerer
 
 ## Lisens
 
-Data fra Brønnøysundregistrene er CC0 (fri bruk). HPR-data er offentlig.
+${dentalLicensedSources().map((s) => `- ${dentalSourceLabel(s, "nb")}: ${s.license.name}, ${s.license.url}${s.attribution ? `\n  ${s.attribution}.` : ""}`).join("\n")}
 Klinikkdata fra nettsider gjengis som faktaoppsummering.
 
 ## Frivillig API-nøkkel (forbruker-identitet)
@@ -2028,9 +2571,10 @@ IKKE en pålogging eller et krav for å bruke tjenesten.
   \`key\` — vis den KUN denne ene gangen, den kan ikke hentes igjen.
 - Bruk den: send nøkkelen som \`X-API-Key\`-header på ethvert MCP-/A2A-/REST-kall.
 - Fordel: kallene dine telles i en aggregert forbrukslogg (kun endepunkt/verktøynavn og dato —
-  aldri innhold eller argumenter). Merk: rate-grensen på finn-tannlege.com er i dag en flat
-  IP-kvote (1000/15 min) som IKKE er høyere med nøkkel — den høyere rate-grensen som nøkkelen
-  gir på enkelte andre vertikaler på plattformen er ikke koblet på her ennå.
+  aldri innhold eller argumenter). Merk: rate-grensen på finn-tannlege.com (1000 kall per
+  15 min — per MCP-økt på \`/mcp\`, ellers per IP) er IKKE høyere med nøkkel — den høyere
+  rate-grensen som nøkkelen gir på enkelte andre vertikaler på plattformen er ikke koblet på
+  her ennå.
 - Tilbakekall/slett: \`POST ${DENTAL_BASE_URL}/api/keys/revoke\` (stanser nøkkelen, historikk
   beholdes) eller \`POST ${DENTAL_BASE_URL}/api/keys/erase\` (GDPR-sletting av label/e-post).
   Begge tar \`{ "key": "..." }\` i body, eller nøkkelen som \`X-API-Key\`-header.
@@ -2044,29 +2588,24 @@ Voluntary — every search/read endpoint above already works with no key, and th
 login or a requirement to use the service. Get a free key via \`POST /api/keys\`
 (optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call, and
 revoke/erase it any time via \`POST /api/keys/revoke\` or \`POST /api/keys/erase\`. Note: unlike
-some other verticals on this platform, finn-tannlege.com's rate limit is currently a flat
-per-IP quota not yet raised by a key — the key still gets your calls counted in the usage
-ledger.
+some other verticals on this platform, finn-tannlege.com's rate limit (1000 calls per 15
+minutes — per MCP session on \`/mcp\`, otherwise per IP) is not yet raised by a key — the key
+still gets your calls counted in the usage ledger.
 
 ## Datakvalitet og verifisering
 
 ${DENTAL_BASE_URL}/proveniens
 
-Hvert felt i en klinikkprofil (adresse, organisasjonsnummer, spesialisttitler, m.m.) lagres med
-hvilken kilde som ga oss verdien og når den sist ble bekreftet. En klinikk får «Verifisert»-
-merket når en administrator har gått gjennom profilen og vurdert at navn, organisasjonsnummer og
-eventuelle spesialisttitler stemmer med tilgjengelig offentlig informasjon, blant annet fra
-Brønnøysundregistrene — det er en redaksjonelt satt status, ikke en fullautomatisk registersjekk.
-Klinikker der denne gjennomgangen ennå ikke er gjort forblir synlige i katalogen — de skjules
-ikke — men uten merket. Se ${DENTAL_BASE_URL}/proveniens for hele forklaringen.
+Der vi har registrert det, lagres kilden og tidspunktet for hver verdi i en klinikkprofil.
+${DENTAL_VERIFIED_BADGE_TEXT.nb}
+Klinikker uten merket er fortsatt synlige i katalogen; de skjules ikke.
+Se ${DENTAL_BASE_URL}/proveniens for hele forklaringen.
 
-Every field in a clinic profile (address, organisation number, specialist titles, etc.) is
-stored with which source supplied that value and when it was last confirmed. A clinic earns the
-"Verified" badge once an administrator has reviewed the profile and judged that its name,
-organisation number and any specialist titles match publicly available information, including
-from Brønnøysundregistrene — this is an editorially-set status, not a fully automated registry
-check. Clinics for which this review hasn't happened yet remain fully listed — they are not
-hidden — just without the badge. See ${DENTAL_BASE_URL}/proveniens for the full explanation.
+Where we have recorded it, each value in a clinic profile is stored with its source and the
+time it was fetched.
+${DENTAL_VERIFIED_BADGE_TEXT.en}
+Clinics without the badge remain fully listed; they are not hidden.
+See ${DENTAL_BASE_URL}/proveniens for the full explanation.
 `);
 });
 
@@ -2074,18 +2613,343 @@ hidden — just without the badge. See ${DENTAL_BASE_URL}/proveniens for the ful
 // GET /favicon.svg  (PR-112)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/favicon.svg", (_req: Request, res: Response) => {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
-  <rect width="96" height="96" rx="19.2" fill="#0F766E"/>
+// The «Søket» mark: a tooth in a magnifier, white on teal #0F766E, no text.
+// /favicon.svg serves it with rounded corners. The PNG icons (DENTAL_ICONS,
+// F2-S4) were rasterised once from dentalMarkSvg(0), full-bleed: clients that
+// round an icon (iOS home screens, the Claude directory, Android) crop the
+// square themselves, and a transparent corner shows black on iOS. With
+// ImageMagick and its rsvg delegate (librsvg2-bin), for each icon size N:
+//   DENTAL_DB_PATH=:memory: npx tsx -e 'process.stdout.write(require("./src/routes/dental-seo").dentalMarkSvg(0), () => process.exit(0))' \
+//     | sed 's/viewBox="0 0 96 96"/& width="N" height="N"/' > /tmp/mark-N.svg
+//   convert /tmp/mark-N.svg -strip -define png:color-type=2 -define png:bit-depth=8 src/public/<file>
+// dental-icons.test.ts pins the full-bleed SVG text and each PNG's md5, so a
+// change to the mark fails until the PNGs are rasterised again. Name check
+// (G3-J §6.2): the teal palette stays, never FINN's blue/cyan.
+export function dentalMarkSvg(cornerRadius = 19.2): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <rect width="96" height="96"${cornerRadius ? ` rx="${cornerRadius}"` : ""} fill="#0F766E"/>
   <circle cx="40" cy="40" r="20" fill="none" stroke="#fff" stroke-width="6"/>
   <line x1="54" y1="54" x2="70" y2="70" stroke="#fff" stroke-width="8" stroke-linecap="round"/>
   <g transform="translate(27,18) scale(0.72)">
     <path d="${TOOTH_PATH}" fill="#fff"/>
   </g>
 </svg>`;
+}
+
+router.get("/favicon.svg", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "image/svg+xml");
   res.setHeader("Cache-Control", "public, max-age=86400");
-  res.send(svg);
+  res.send(dentalMarkSvg());
+});
+
+// GET /favicon-192.png, /favicon-512.png, /apple-touch-icon.png (F2-S4). A
+// file missing on disk falls through to the 404 page.
+for (const icon of Object.values(DENTAL_ICONS)) {
+  router.get(icon.path, servePublicFile(icon.file, "image/png"));
+}
+
+// ═══════════════════════════════════════════════════════════
+// GET /guide-tannlege-ai (+ /en/guide-tannlege-ai) — the AI guide
+// ═══════════════════════════════════════════════════════════
+// A2A dev-request 2026-10-16-merkevare-entitet-og-connector-pakker, G3-S4.
+//
+// How to use Finn-tannlege from an AI assistant over MCP, in Norwegian and
+// English (langMiddleware strips /en and sets req.lang), on a par with RFB's
+// /guide-mat-ai and Opplevagent's /guide-opplevelser-mcp. It is the page
+// BRAND_ENTITIES.dental.docsUrl names. Read, not typed:
+//   - the tools and the tools FAQ answer: registeredMcpTools("dental"), what
+//     the live /mcp registers, in registration order (dentalMcpGuideTools());
+//   - the example prompts: BRAND_ENTITIES.dental.exampleQueries, the ones the
+//     Claude directory pack gives its reviewers.
+// The remote URL is the /mcp the dental host gate mounts; the npm package
+// (mcp-server-dental/) is a stdio bridge to it since 0.2.0. The page
+// promises no booking: the service books nothing, and booking is named only
+// in the FAQ answer that says so (dental-guide-tannlege-ai.test.ts).
+
+const DENTAL_AI_GUIDE_PATH = "/guide-tannlege-ai";
+const DENTAL_MCP_URL = `${DENTAL_BASE_URL}/mcp`;
+const DENTAL_MCP_NPM_PACKAGE = "finn-tannlege-mcp";
+const DENTAL_MCP_SOURCE_URL = "https://github.com/slookisen/lokal/tree/main/mcp-server-dental";
+
+/** The guide's canonical URL in a language. */
+export function dentalAiGuideUrl(lang: SiteLang): string {
+  return `${DENTAL_BASE_URL}${lang === "en" ? "/en" : ""}${DENTAL_AI_GUIDE_PATH}`;
+}
+
+// The text per tool, as OA_MCP_GUIDE_TOOL_COPY in experiences-seo.ts: `card`
+// is trusted HTML for the tool card (<code> marks an input parameter), `faq`
+// plain text for the tools FAQ answer. A registered tool with no entry is
+// still listed, with its registered description (English); the test fails
+// until it gets one, and checks every <code> against the tool's input schema.
+// The akutt claim reads as in the tool texts (G3-S6d, A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider F1-S4e): an «akuttpåstand» / «emergency
+// claim», «Akuttvakt» only with a stored quote from the source
+// (dental-akutt-tekster.test.ts).
+interface DentalGuideToolCopy { card: string; faq: string }
+
+const GUIDE_ACCEPTS_NB = escapeHtml(ACUTE_ACCEPTS_LABEL);
+const GUIDE_ACCEPTS_EN = `<span lang="nb">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span>`;
+
+const DENTAL_MCP_GUIDE_TOOL_COPY: Record<string, Record<SiteLang, DentalGuideToolCopy>> = {
+  tannlege_search: {
+    nb: {
+      card: "Søker etter tannlege, kjeveortoped eller akutt tannlege etter sted, fylke, spesialitet, Helfo-direkteoppgjør eller akuttilbud. Skriv ønsket med egne ord i <code>query</code>, f.eks. «kjeveortoped i Bergen med Helfo-avtale», eller bruk filtrene <code>fylke</code>, <code>spesialitet</code>, <code>helfo</code> og <code>akutt</code>. Svaret viser hvordan forespørselen ble tolket, og hver klinikk har navn, adresse, kontaktinformasjon, Helfo-status, akuttstatus og lenke til profilsiden.",
+      faq: "tannlege_search finner klinikker etter sted, fylke, spesialitet, Helfo-avtale og akuttilbud, med forespørselen i fritekst (query) eller som filtre",
+    },
+    en: {
+      card: "Searches for a dentist, orthodontist or emergency dentist by place, county (fylke), specialty, Helfo direct billing or emergency care. Put the request in your own words in <code>query</code>, e.g. \"orthodontist in Bergen with a Helfo agreement\", or use the filters <code>fylke</code>, <code>spesialitet</code>, <code>helfo</code> and <code>akutt</code>. The answer shows how the request was read, and each clinic has its name, address, contact details, Helfo status, emergency status and a link to its profile page.",
+      faq: "tannlege_search finds clinics by place, county, specialty, Helfo agreement and emergency care, with the request in free text (query) or as filters",
+    },
+  },
+  tannlege_info: {
+    nb: {
+      card: "Henter hele oppføringen for én klinikk via organisasjonsnummer (<code>org_nr</code>) eller <code>id</code>: adresse, kontaktinformasjon, nettside, Helfo-status, akuttpåstand, spesialiteter, spesialister, behandlinger, åpningstider, klinikkens egen beskrivelse og profilside. " +
+        `Akuttpåstanden er «Akuttvakt» bare når vi har lagret et sitat fra kilden om akuttvakten, og «${GUIDE_ACCEPTS_NB}» når klinikken sier at den tar imot akuttpasienter.`,
+      faq: "tannlege_info henter hele oppføringen for én klinikk via organisasjonsnummer eller id",
+    },
+    en: {
+      card: "Fetches the full record of one clinic by organisation number (<code>org_nr</code>) or <code>id</code>: address, contact details, website, Helfo status, emergency claim, specialties, specialists, treatments, opening hours, the clinic's own description and its profile page. " +
+        `The emergency claim is «<span lang="nb">Akuttvakt</span>» only when an emergency duty has a stored quote from the source, and «${GUIDE_ACCEPTS_EN}» when the clinic says it takes emergency patients.`,
+      faq: "tannlege_info fetches the full record of one clinic by organisation number or id",
+    },
+  },
+  tannlege_stats: {
+    nb: {
+      card: "Antall tannlegeklinikker i Norge: totalt, per fylke, og hvor mange som har Helfo-direkteoppgjør, hører til en kjede, viser en akuttpåstand eller har en spesialist. " +
+        `En akuttpåstand er «Akuttvakt», som krever et lagret sitat fra kilden, eller «${GUIDE_ACCEPTS_NB}», som betyr at klinikken sier at den tar imot akuttpasienter.`,
+      faq: "tannlege_stats teller klinikkene totalt og per fylke, og hvor mange som har Helfo-avtale, akuttpåstand eller spesialist",
+    },
+    en: {
+      card: "Counts of dental clinics in Norway: the total, per county (fylke), and how many have Helfo direct billing, belong to a chain, show an emergency claim or list a specialist. " +
+        `An emergency claim is «<span lang="nb">Akuttvakt</span>», an emergency duty backed by a stored quote from the source, or «${GUIDE_ACCEPTS_EN}», that the clinic says it takes emergency patients.`,
+      faq: "tannlege_stats counts the clinics in total and per county, and how many have a Helfo agreement, an emergency claim or a specialist",
+    },
+  },
+  tannlege_akutt: {
+    nb: {
+      card: "Finner akutt tannlege: klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke (<code>fylke</code>). " +
+        `Akuttpåstanden er «Akuttvakt» bare når vi har lagret et sitat fra kilden om akuttvakten, og ellers «${GUIDE_ACCEPTS_NB}». Svaret har også råd om kommunal tannlegevakt.`,
+      faq: "tannlege_akutt finner klinikker som sier at de tar imot akuttpasienter, eventuelt i ett fylke",
+    },
+    en: {
+      card: "Finds an emergency dentist: clinics that say they take emergency patients, optionally in one county (<code>fylke</code>). " +
+        `The emergency claim is «<span lang="nb">Akuttvakt</span>» only when an emergency duty has a stored quote from the source, and otherwise «${GUIDE_ACCEPTS_EN}». The answer also has advice on the municipal out-of-hours dental service.`,
+      faq: "tannlege_akutt finds clinics that say they take emergency patients, optionally in one county",
+    },
+  },
+  tannlege_kjeder: {
+    nb: {
+      card: "Lister tannlegekjedene som er registrert i katalogen, med antall klinikker i hver kjede.",
+      faq: "tannlege_kjeder lister tannlegekjedene med antall klinikker",
+    },
+    en: {
+      card: "Lists the dental chains registered in the directory, each with its number of clinics.",
+      faq: "tannlege_kjeder lists the dental chains with their number of clinics",
+    },
+  },
+};
+
+export interface DentalMcpGuideTool {
+  name: string;
+  /** The card body: the curated HTML, or the registered description escaped. */
+  cardHtml: string;
+  /** Plain text for the tools FAQ answer. */
+  faq: string;
+  /** False when the tool has no entry in DENTAL_MCP_GUIDE_TOOL_COPY. */
+  curated: boolean;
+}
+
+/** The guide's tools: one per registered tool, in registration order. `tools` is for tests. */
+export function dentalMcpGuideTools(lang: SiteLang, tools: McpToolEntry[] = registeredMcpTools("dental")): DentalMcpGuideTool[] {
+  return tools.map((t) => {
+    const copy = Object.prototype.hasOwnProperty.call(DENTAL_MCP_GUIDE_TOOL_COPY, t.name) ? DENTAL_MCP_GUIDE_TOOL_COPY[t.name][lang] : undefined;
+    if (copy) return { name: t.name, cardHtml: copy.card, faq: copy.faq, curated: true };
+    return { name: t.name, cardHtml: escapeHtml(t.description), faq: `${t.name}: ${t.description.replace(/[.!?]+$/, "")}`, curated: false };
+  });
+}
+
+/**
+ * The guide's FAQ as FAQPage JSON-LD; the page shows the same questions. The
+ * tools answer comes from dentalMcpGuideTools(), so it names the same tools as
+ * the list. Exported for tests; `tools` is for tests.
+ */
+export function buildDentalMcpGuideFaqJsonLd(lang: SiteLang, url: string, tools: McpToolEntry[] = registeredMcpTools("dental")) {
+  const toolsAnswer = dentalMcpGuideTools(lang, tools).map((t) => t.faq).join("; ") + ".";
+  const qas: Array<{ q: string; a: string }> = lang === "en" ? [
+    {
+      q: "Which AI assistants work with Finn-tannlege?",
+      a: `Any assistant that supports MCP (Model Context Protocol), such as Claude, ChatGPT (custom connectors in developer mode), Cursor and other MCP clients. Connect to the remote endpoint ${DENTAL_MCP_URL}, or use the npm package ${DENTAL_MCP_NPM_PACKAGE}.`,
+    },
+    { q: "What tools does the Finn-tannlege MCP server have?", a: toolsAnswer },
+    { q: "Does it cost anything?", a: "No. The server is free to use, and you need no account and no API key." },
+    {
+      q: "Can the assistant book an appointment with the dentist?",
+      a: "No. Finn-tannlege does not book appointments and takes no payment. The assistant shows the clinic's contact details and profile page, and you make the appointment with the clinic yourself.",
+    },
+    {
+      q: "Does Finn-tannlege give dental advice?",
+      a: "No. The tools tell you which clinics exist, what they offer and how to reach them. Questions about treatment belong with the dentist.",
+    },
+    {
+      q: "How do I connect my assistant?",
+      a: `See "Get started" further up this page: add ${DENTAL_MCP_URL} as a custom connector, or add the npm package ${DENTAL_MCP_NPM_PACKAGE} to your MCP client's configuration.`,
+    },
+  ] : [
+    {
+      q: "Hvilke AI-assistenter fungerer med Finn-tannlege?",
+      a: `Alle assistenter som støtter MCP (Model Context Protocol), for eksempel Claude, ChatGPT (egendefinerte connectorer i utviklermodus), Cursor og andre MCP-klienter. Koble til det eksterne endepunktet ${DENTAL_MCP_URL}, eller bruk npm-pakken ${DENTAL_MCP_NPM_PACKAGE}.`,
+    },
+    { q: "Hvilke verktøy har MCP-serveren til Finn-tannlege?", a: toolsAnswer },
+    { q: "Koster det noe?", a: "Nei. Serveren er gratis å bruke, og du trenger verken konto eller API-nøkkel." },
+    {
+      q: "Kan assistenten bestille time hos tannlegen?",
+      a: "Nei. Finn-tannlege bestiller ikke time og tar ikke imot betaling. Assistenten viser klinikkens kontaktinformasjon og profilside, og timen avtaler du med klinikken selv.",
+    },
+    {
+      q: "Gir Finn-tannlege råd om tannhelse?",
+      a: "Nei. Verktøyene forteller hvilke klinikker som finnes, hva de tilbyr og hvordan du når dem. Spørsmål om behandling hører hjemme hos tannlegen.",
+    },
+    {
+      q: "Hvordan kobler jeg til assistenten min?",
+      a: `Se «Kom i gang» lenger opp på siden: legg til ${DENTAL_MCP_URL} som en egendefinert connector, eller legg npm-pakken ${DENTAL_MCP_NPM_PACKAGE} til i MCP-klientens konfigurasjon.`,
+    },
+  ];
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${url}#faq`,
+    mainEntity: qas.map(({ q, a }) => ({
+      "@type": "Question",
+      name: q,
+      acceptedAnswer: { "@type": "Answer", text: a },
+    })),
+  };
+}
+
+const DENTAL_AI_GUIDE_CSS = `
+.gta-lang{text-align:right;font-size:.85rem;margin-bottom:4px}
+.content-page code{font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:.85em;background:var(--section-bg);padding:1px 6px;border-radius:4px}
+.gta-tools{display:grid;gap:12px;margin:8px 0 20px}
+.gta-tool{background:var(--white);border:1px solid var(--g200);border-radius:var(--r-lg);padding:16px 20px}
+.gta-tool>code{color:var(--teal-700);font-weight:700}
+.content-page .gta-tool p{margin:8px 0 0;font-size:.9rem}
+.gta-examples li{font-style:italic}
+.gta-setup{background:var(--section-bg);border-radius:var(--r-lg);padding:18px 22px;margin:14px 0}
+.gta-setup h3{font-size:1rem;font-weight:700;color:var(--navy);margin-bottom:8px}
+.gta-setup code{background:var(--white)}
+.gta-code{background:var(--navy);color:#E2E8F0;border-radius:var(--r-md);padding:14px 18px;font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:.8rem;line-height:1.6;overflow-x:auto;margin:8px 0 12px}
+.gta-faq-item h3{font-size:.98rem;font-weight:700;color:var(--navy);margin:16px 0 4px}
+.content-page .gta-faq-item p{margin:0}
+`;
+
+router.get(DENTAL_AI_GUIDE_PATH, (req: Request, res: Response) => {
+  const lang = toSiteLang(req.lang);
+  const canonical = dentalAiGuideUrl(lang);
+  const tools = registeredMcpTools("dental");
+  const faq = buildDentalMcpGuideFaqJsonLd(lang, canonical, tools);
+  const toolsHtml = dentalMcpGuideTools(lang, tools)
+    .map((t) => `\n      <div class="gta-tool"><code>${escapeHtml(t.name)}</code><p>${t.cardHtml}</p></div>`)
+    .join("");
+  const examplesHtml = BRAND_ENTITIES.dental.exampleQueries
+    .map((q) => `\n      <li>${lang === "en" ? `"${escapeHtml(q)}"` : `«${escapeHtml(q)}»`}</li>`)
+    .join("");
+  const faqHtml = faq.mainEntity
+    .map((qa) => `\n      <div class="gta-faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`)
+    .join("");
+  const desktopConfig = escapeHtml(JSON.stringify({ mcpServers: { "finn-tannlege": { command: "npx", args: [DENTAL_MCP_NPM_PACKAGE] } } }, null, 2));
+
+  const content = lang === "en" ? `
+<main>
+  <div class="content-page">
+    <p class="gta-lang"><a href="${DENTAL_AI_GUIDE_PATH}" hreflang="nb" lang="nb">Norsk</a></p>
+    <h1>Find a dentist in Norway with your AI assistant</h1>
+    <p>Ask Claude, ChatGPT or another AI assistant that supports MCP to find dental clinics in Norway: by place, specialty, Helfo agreement and emergency care.</p>
+
+    <h2>What is this?</h2>
+    <p>Finn-tannlege runs a remote MCP (Model Context Protocol) server at <code>${escapeHtml(DENTAL_MCP_URL)}</code>. Once your assistant is connected, it can search the same directory as <a href="/sok">the search page</a> with the tools below, and show you the clinics it finds with a link to each profile page.</p>
+
+    <h2>The tools, exactly as registered</h2>
+    <div class="gta-tools">${toolsHtml}
+    </div>
+
+    <h2>Try asking your assistant</h2>
+    <p>Ask in English or Norwegian, for example:</p>
+    <ul class="gta-examples">${examplesHtml}
+    </ul>
+
+    <h2>Get started</h2>
+    <div class="gta-setup">
+      <h3>Remote MCP server (easiest)</h3>
+      <p>Add a custom connector in your assistant's settings and paste the address <code>${escapeHtml(DENTAL_MCP_URL)}</code>. In Claude: Settings → Connectors → Add custom connector. No sign-in and no API key are needed.</p>
+    </div>
+    <div class="gta-setup">
+      <h3>Local npm package (Claude Desktop, Claude Code, Cursor)</h3>
+      <p>The npm package <code>${DENTAL_MCP_NPM_PACKAGE}</code> is a thin stdio bridge to the same server, so the tools are the same. Add it to your MCP client's configuration:</p>
+      <pre class="gta-code">${desktopConfig}</pre>
+      <p>Or run it directly: <code>npx ${DENTAL_MCP_NPM_PACKAGE}</code></p>
+    </div>
+    <p>Source and README: <a href="${DENTAL_MCP_SOURCE_URL}" rel="noopener" target="_blank">${DENTAL_MCP_NPM_PACKAGE} on GitHub</a>. More for AI agents: <a href="/llms.txt">llms.txt</a>.</p>
+
+    <h2>Frequently asked questions</h2>
+    <div class="gta-faq">${faqHtml}
+    </div>
+  </div>
+</main>` : `
+<main>
+  <div class="content-page">
+    <p class="gta-lang"><a href="/en${DENTAL_AI_GUIDE_PATH}" hreflang="en" lang="en">English</a></p>
+    <h1>Søk etter tannlege med AI-assistenten din</h1>
+    <p>Be Claude, ChatGPT eller en annen AI-assistent som støtter MCP, om å finne tannlegeklinikker i Norge: etter sted, spesialitet, Helfo-avtale og akuttilbud.</p>
+
+    <h2>Hva er dette?</h2>
+    <p>Finn-tannlege kjører en ekstern MCP-server (Model Context Protocol) på <code>${escapeHtml(DENTAL_MCP_URL)}</code>. Når assistenten din er koblet til, kan den søke i den samme katalogen som <a href="/sok">søkesiden</a> med verktøyene under, og vise deg klinikkene den finner med lenke til profilsiden.</p>
+
+    <h2>Verktøyene, slik de faktisk er registrert</h2>
+    <div class="gta-tools">${toolsHtml}
+    </div>
+
+    <h2>Prøv å spørre assistenten din</h2>
+    <p>Spør på norsk eller engelsk, for eksempel:</p>
+    <ul class="gta-examples">${examplesHtml}
+    </ul>
+
+    <h2>Kom i gang</h2>
+    <div class="gta-setup">
+      <h3>Ekstern MCP-server (enklest)</h3>
+      <p>Legg til en egendefinert connector i assistentens innstillinger, og lim inn adressen <code>${escapeHtml(DENTAL_MCP_URL)}</code>. I Claude: Settings → Connectors → Add custom connector. Du trenger verken innlogging eller API-nøkkel.</p>
+    </div>
+    <div class="gta-setup">
+      <h3>Lokal npm-pakke (Claude Desktop, Claude Code, Cursor)</h3>
+      <p>npm-pakken <code>${DENTAL_MCP_NPM_PACKAGE}</code> er en tynn stdio-bro til den samme serveren, så verktøyene er de samme. Legg den til i MCP-klientens konfigurasjon:</p>
+      <pre class="gta-code">${desktopConfig}</pre>
+      <p>Eller kjør den direkte: <code>npx ${DENTAL_MCP_NPM_PACKAGE}</code></p>
+    </div>
+    <p>Kildekode og README: <a href="${DENTAL_MCP_SOURCE_URL}" rel="noopener" target="_blank">${DENTAL_MCP_NPM_PACKAGE} på GitHub</a>. Mer for AI-agenter: <a href="/llms.txt">llms.txt</a>.</p>
+
+    <h2>Ofte stilte spørsmål</h2>
+    <div class="gta-faq">${faqHtml}
+    </div>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(content, lang === "en" ? {
+    title: "Find a dentist in Norway with an AI assistant (MCP) — Finn-tannlege.com",
+    description: "How to use Claude, ChatGPT and other AI assistants with the Finn-tannlege MCP server to find dental clinics in Norway — every tool explained.",
+    canonical,
+    lang,
+    alternates: { nb: dentalAiGuideUrl("nb"), en: dentalAiGuideUrl("en") },
+    jsonLd: [faq],
+    extraCss: DENTAL_AI_GUIDE_CSS,
+  } : {
+    title: "Søk etter tannlege med AI-assistent (MCP) — Finn-tannlege.com",
+    description: "Slik bruker du Claude, ChatGPT og andre AI-assistenter med MCP-serveren til Finn-tannlege for å finne tannlegeklinikker i Norge — alle verktøyene forklart.",
+    canonical,
+    lang,
+    alternates: { nb: dentalAiGuideUrl("nb"), en: dentalAiGuideUrl("en") },
+    jsonLd: [faq],
+    extraCss: DENTAL_AI_GUIDE_CSS,
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -2126,7 +2990,8 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
           name: "Hva gjør jeg ved akutt tannverk?",
           acceptedAnswer: {
             "@type": "Answer",
-            text: "Søk etter klinikker med Akuttvakt-merke på Finn-tannlege.com. Mange kommuner har kommunal tannlegevakt — ring klinikken for informasjon om åpningstider.",
+            // F1-S4e: the reviewed emergency notice, as in «Akutt tannverk» below.
+            text: DENTAL_EMERGENCY_NOTICE.text,
           },
         },
         {
@@ -2151,16 +3016,17 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Tre steg til riktig tannlege</h3>
     <ol style="padding-left:20px;margin-bottom:16px">
-      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og akuttvakt.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og ${escapeHtml(DENTAL_ACUTE_FILTER_LABEL.toLowerCase())}.</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Sammenlign</strong> &mdash; se Helfo-avtale, spesialiteter, åpningstider og kontaktinformasjon side om side for de klinikkene som passer deg.</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Kontakt</strong> &mdash; ring klinikken direkte eller bruk online-booking der det finnes. Ingen mellomledd, ingen gebyrer fra vår side.</li>
     </ol>
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Hva betyr merkene?</h3>
     <ul style="padding-left:0;list-style:none;margin-bottom:16px">
-      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-verified" style="margin-right:8px">Verifisert</span> Data er kryssjekket mot offentlige registre (Brønnøysundregistrene + HPR). Klinikkens navn, organisasjonsnummer og eventuelle spesialisttitler er bekreftet.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-verified" style="margin-right:8px">Verifisert</span> ${escapeHtml(DENTAL_VERIFIED_BADGE_TEXT.nb)}</li>
       <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-helfo" style="margin-right:8px">Helfo-avtale</span> Klinikken har direkteoppgjørsavtale med Helfo. Du betaler kun egenandelen for stønadspliktige behandlinger &mdash; ikke full pris.</li>
-      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">Akuttvakt</span> Klinikken tilbyr akuttbehandling utenom ordinær arbeidstid. Ring alltid for å bekrefte åpningstider.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">Akuttvakt</span> Klinikken sier på egne sider at den tar imot nye pasienter for akutt behandling utenom vanlig åpningstid (kveld, helg eller natt), og vi har lagret setningen som sitat. Ring alltid klinikken først.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span> Klinikken nevner akutt behandling på egne sider, uten et lagret sitat om akuttvakt. Ring alltid klinikken først.</li>
     </ul>
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Helfo og tannhelsestønad</h3>
@@ -2174,14 +3040,13 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
     <p style="margin-top:12px">Dette er ikke en uttømmende juridisk liste. Se <a href="https://www.helfo.no/tannlege" rel="nofollow noopener" target="_blank">helfo.no/tannlege</a> for fullstendig oversikt og vilkår.</p>
 
     <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Akutt tannverk</h3>
-    <p>Tilbudet om kommunal tannlegevakt varierer mye fra kommune til kommune, og åpningstidene er som regel begrenset til kvelder og helger. Det beste rådet er å søke på klinikker med <span class="badge badge-akutt">Akuttvakt</span>-merke og ringe direkte. Mange klinikker setter av tid til akuttpasienter på kort varsel i ordinær åpningstid.</p>
+    <p>Tilbudet om kommunal tannlegevakt varierer mye fra kommune til kommune, og åpningstidene er som regel begrenset til kvelder og helger. Mange klinikker setter av tid til akuttpasienter på kort varsel i ordinær åpningstid.</p>
+    ${dentalEmergencyNoticeHtml()}
 
     <h2>For klinikker</h2>
-    <p>Finn-tannlege.com henter klinikkdata fra tre offentlige kilder:</p>
+    <p>Finn-tannlege.com henter klinikkdata fra disse kildene:</p>
     <ul>
-      <li><strong>Brønnøysundregistrene</strong> &mdash; grunnleggende foretaksopplysninger, adresse og kontaktinfo</li>
-      <li><strong>Offentlige helseregistre (HPR)</strong> &mdash; autorisasjons- og spesialistopplysninger</li>
-      <li><strong>Klinikkenes egne nettsider</strong> &mdash; åpningstider, behandlingstilbud og presentasjon</li>
+      ${dentalSourcesListHtml("nb")}
     </ul>
     <p><strong>Oppføring er gratis.</strong> Vi tar ikke betalt for å vises i søkeresultatene.</p>
     <p>For å rette feil, oppdatere kontaktinformasjon eller be om fjerning: send e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> med klinikkens navn og organisasjonsnummer. Vi svarer innen 5 virkedager. En selvbetjeningsportal for klinikker er under utvikling &mdash; vi varsler registrerte klinikker når den lanseres.</p>
@@ -2288,76 +3153,340 @@ router.get("/personvern", (_req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// GET /proveniens — Slik verifiserer vi dataene våre (transparency page)
+// GET /vilkar (+ /terms, /terms-of-service, /tos) — terms of use
 //
-// Public, SSR, bilingual (NO primary, EN section in the same page — this
-// file has no per-request lang switching, so we follow the sibling
-// experiences-seo.ts "NO section, <hr>, EN section with #en anchor"
-// convention instead of inventing new i18n plumbing here) explainer for the
-// field_provenance mechanism that already backs every clinic profile (see
-// dental-store.ts's mergeFieldProvenance()/field_provenance column and the
-// "Verifisert" badge already described on /om and /hvordan-det-fungerer).
-// Purely descriptive — no new behavior.
-//
-// IMPORTANT: must never claim regulatory compliance/certification of any
-// kind — see tests/test.ts for the assertion guarding this.
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S5:
+// new legal text, merged by Daniel only after he has read it (merge_guard
+// needs_daniel). Bilingual in one page like /proveniens (NO section, then the
+// EN section under #en). Every alias carries the one canonical, /vilkar.
+// The operator line is companyOperatorSentence(), the FINN.no sentence is
+// BRAND_ENTITIES.dental.disambiguation and the e-mail address is
+// BRAND_ENTITIES.dental.supportEmail, so none of them is written here. No street
+// address (company-legal.ts: /kontakt and /personvern only). The page names
+// no data source of its own: /proveniens says which sources are used.
+// «Sist oppdatert» is the page's sitemap text date, so the two cannot drift.
 // ═══════════════════════════════════════════════════════════
 
-router.get("/proveniens", (_req: Request, res: Response) => {
+router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, res: Response) => {
+  const updatedDate = DENTAL_STATIC_PAGE_DATES["/vilkar"];
+  const email = escapeHtml(BRAND_ENTITIES.dental.supportEmail);
   const html = `
 <main>
   <div class="content-page">
-    <h1>Slik verifiserer vi dataene våre</h1>
-    <p>Finn-tannlege.com skraper ikke bare en nettside og publiserer det vi finner. Hvert felt i en klinikkprofil &mdash; adresse, organisasjonsnummer, spesialisttitler, kontaktinfo &mdash; lagres sammen med hvilken kilde som ga oss verdien og når den sist ble bekreftet. Denne siden forklarer hvordan.</p>
+    <p style="text-align:right;font-size:.9rem"><a href="#en">English</a></p>
+    <h1>Vilkår for bruk</h1>
+    <p style="font-size:.85rem;color:var(--g500)">Sist oppdatert: ${updatedDate}</p>
+    <p>Disse vilkårene gjelder for alle som bruker Finn-tannlege.com &mdash; på nettsiden, gjennom REST-API-et, MCP-serveren eller A2A-endepunktet, også når en AI-assistent eller AI-agent bruker tjenesten for deg. Ved å bruke tjenesten godtar du vilkårene.</p>
+    <p>${companyOperatorSentence("nb")} ${escapeHtml(FINN_DISAMBIGUATION_NB)}</p>
 
-    <h2>Kildene vi kryssjekker mot</h2>
+    <h2>1. Hva tjenesten er</h2>
+    <p>Finn-tannlege.com er en gratis, søkbar oversikt over tannlegeklinikker i Norge, med opplysninger som adresse, kontaktinformasjon, spesialiteter, Helfo-avtale og akuttilbud. Vi bestiller ikke timer og tar ikke imot betaling. Time avtaler du direkte med klinikken.</p>
+
+    <h2>2. Ikke medisinsk rådgivning</h2>
+    <p>Innholdet er generell informasjon som skal hjelpe deg å finne en klinikk. Det er ikke medisinsk eller odontologisk rådgivning, og det erstatter ikke undersøkelse, diagnose eller råd fra tannlege eller annet helsepersonell. Spørsmål om din egen tannhelse eller behandling tar du med klinikken.</p>
+
+    <h2>3. Akutt hjelp</h2>
+    <p><strong>Ved akutt fare for liv eller helse: ring 113.</strong></p>
+    <p>Trenger du akutt tannbehandling når klinikken din er stengt, kontakter du legevakten på 116 117 eller tannlegevakten der du bor. At en klinikk er merket med akuttilbud her, betyr ikke at den kan ta imot deg nå. Ring klinikken før du drar dit.</p>
+
+    <h2>4. Opplysningene i katalogen</h2>
+    <p>Opplysningene er samlet inn fra offentlige registre, klinikkenes egne nettsider og andre offentlig tilgjengelige kilder, delvis automatisk og med hjelp av KI. Hvilke kilder vi bruker, og hva merkene i katalogen betyr, står på <a href="/proveniens">siden om kilder og metode</a>.</p>
+    <p><strong>Opplysningene vises «som de er».</strong> De kan være utdaterte, ufullstendige eller feil, og vi garanterer ikke at de stemmer. Sjekk åpningstider, Helfo-avtale og akuttilbud med klinikken før du bestiller time eller drar dit. Rekkefølgen i søkeresultatene og merkene på profilene er ingen vurdering av kvaliteten på behandlingen.</p>
+
+    <h2>5. Akseptabel bruk</h2>
     <ul>
-      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, registrert adresse og næringsgruppekode</li>
-      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google</li>
-      <li><strong>Klinikkens egen nettside</strong> &mdash; behandlingstilbud, presentasjonstekst og praktisk informasjon</li>
+      <li>Bruk nettsiden, API-et, MCP-serveren og A2A-endepunktet til å finne og sammenligne tannlegeklinikker.</li>
+      <li>Bygg tjenesten inn i egne agenter og verktøy innenfor rate-grensene vi oppgir i <a href="/llms.txt">llms.txt</a>.</li>
+      <li>Følg robots.txt.</li>
     </ul>
 
-    <h2>Hva "Verifisert"-merket betyr</h2>
-    <p>Verifisert-merket er en redaksjonelt satt status: en administrator hos Finn-tannlege.com har gått gjennom klinikkens profil og vurdert at navn, organisasjonsnummer og eventuelle spesialisttitler stemmer med tilgjengelig offentlig informasjon, blant annet fra Brønnøysundregistrene. Statusen settes manuelt per klinikk &mdash; det er foreløpig ingen fullautomatisk, sanntids registersjekk som setter merket alene. Hvert enkelt felt i profilen lagres uansett med egen kilde og dato, uavhengig av denne overordnede statusen.</p>
-    <p>Klinikker der denne gjennomgangen ennå ikke er gjort forblir synlige i katalogen &mdash; de skjules ikke &mdash; men uten merket, og sorteres lenger ned enn verifiserte klinikker i søkeresultatene. Kun klinikker markert som varig avviklet eller ugyldige oppføringer holdes utenfor det offentlige søket.</p>
+    <h2>6. Forbudt bruk</h2>
+    <ul>
+      <li>Å laste ned hele eller store deler av katalogen for å publisere den som et konkurrerende register uten skriftlig tillatelse.</li>
+      <li>Å bruke kontaktinformasjon herfra til markedsføring, masseutsendelser eller spam til klinikker eller tannleger.</li>
+      <li>Å omgå sikkerhetstiltak, rate-grenser eller tilgangskontroll.</li>
+    </ul>
 
-    <h2>Hva vi ikke gjør</h2>
-    <p>Vi gjetter ikke oss fram til fakta om en klinikk og presenterer det som bekreftet. Informasjon hentet fra en klinikks egen nettside vises som faktaoppsummering med kildehenvisning &mdash; ikke som en bekreftelse fra en offentlig myndighet.</p>
+    <h2>7. For klinikker: retting og fjerning</h2>
+    <p>Er opplysningene om en klinikk feil, kan klinikken be om at de rettes, eller at oppføringen fjernes, ved å skrive til <a href="mailto:${email}">${email}</a> eller bruke <a href="/kontakt">kontaktskjemaet</a>. Rettighetene etter personvernreglene står i <a href="/personvern">personvernerklæringen</a>.</p>
 
-    <div style="background:var(--bg2,#f7f9fc);border-left:4px solid var(--navy,#1a3a5c);border-radius:0 10px 10px 0;padding:18px 22px;margin:24px 0">
-      <p style="margin-bottom:0">Etter hvert som forventningene til åpenhet rundt KI og datagrunnlag øker i Europa, mener vi at å vise selve verifiseringsarbeidet vårt er god praksis. Denne siden beskriver hva vi faktisk gjør i dag &mdash; det er ikke en påstand om sertifisering eller samsvar med noe bestemt regelverk.</p>
-    </div>
+    <h2>8. Ansvar</h2>
+    <p>Finn-tannlege.com er ikke part i avtaler mellom deg og klinikken, og er ikke ansvarlig for behandling, timebestilling, priser eller annet mellom deg og klinikken. Så langt loven tillater det, er vi ikke ansvarlige for tap som følge av feil, mangler eller forsinkelser i opplysningene eller i tjenesten.</p>
 
-    <p>Se også <a href="/om">om Finn-tannlege.com</a> og <a href="/hvordan-det-fungerer">slik fungerer det</a>.</p>
+    <h2>9. Endringer</h2>
+    <p>Vi kan endre disse vilkårene. Datoen øverst viser når de sist ble endret.</p>
+
+    <h2>10. Gjeldende rett</h2>
+    <p>Norsk rett gjelder. Tvister løses ved selskapets alminnelige verneting, med mindre ufravikelig lov gir deg rett til å bringe saken inn et annet sted.</p>
+
+    <h2>11. Kontakt</h2>
+    <p>Spørsmål om vilkårene sender du til <a href="mailto:${email}">${email}</a>. Selskapsopplysningene står på <a href="/kontakt">kontaktsiden</a>.</p>
 
     <hr style="margin:36px 0;border:none;border-top:1px solid var(--g100,#e5e7eb)">
 
-    <h1 id="en">How we verify our data</h1>
-    <p>Finn-tannlege.com doesn't just scrape a website and publish whatever it finds. Every field in a clinic profile &mdash; address, organisation number, specialist titles, contact info &mdash; is stored together with which source supplied that value and when it was last confirmed. This section explains how, in English.</p>
+    <div lang="en">
+    <h1 id="en">Terms of Service</h1>
+    <p style="font-size:.85rem;color:var(--g500)">Last updated: ${updatedDate}</p>
+    <p>These terms apply to everyone who uses Finn-tannlege.com &mdash; on the website, through the REST API, the MCP server or the A2A endpoint, including when an AI assistant or AI agent uses the service for you. By using the service you accept these terms.</p>
+    <p>${companyOperatorSentence("en")} ${escapeHtml(FINN_DISAMBIGUATION_EN)}</p>
 
-    <h2>The sources we cross-check against</h2>
+    <h2>1. What the service is</h2>
+    <p>Finn-tannlege.com is a free, searchable directory of dental clinics in Norway, with details such as address, contact information, specialties, Helfo agreement and emergency care. We do not book appointments and we do not take payments. You make appointments directly with the clinic.</p>
+
+    <h2>2. Not medical advice</h2>
+    <p>The content is general information to help you find a clinic. It is not medical or dental advice, and it does not replace an examination, diagnosis or advice from a dentist or other health professional. Take questions about your own dental health or treatment to the clinic.</p>
+
+    <h2>3. Emergencies</h2>
+    <p><strong>If life or health is in immediate danger: call 113.</strong></p>
+    <p>If you need emergency dental treatment while your clinic is closed, contact the out-of-hours medical service (legevakt) on 116 117 or the emergency dental service (tannlegevakt) where you live. A clinic marked with emergency care here may still be unable to see you now. Call the clinic before you go there.</p>
+
+    <h2>4. The information in the directory</h2>
+    <p>The information is collected from public registers, the clinics' own websites and other publicly available sources, partly automatically and with the help of AI. Which sources we use, and what the badges in the directory mean, are explained on <a href="/proveniens">the sources and method page</a>.</p>
+    <p><strong>The information is provided "as is".</strong> It may be out of date, incomplete or wrong, and we do not guarantee that it is correct. Check opening hours, Helfo agreement and emergency care with the clinic before you book or go there. The order of search results and the badges on profiles are not an assessment of the quality of treatment.</p>
+
+    <h2>5. Acceptable use</h2>
     <ul>
-      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; Norway's business register: company name, organisation number, registered address and industry code</li>
-      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google</li>
-      <li><strong>The clinic's own website</strong> &mdash; treatment offerings, presentation text and practical information</li>
+      <li>Use the website, the API, the MCP server and the A2A endpoint to find and compare dental clinics.</li>
+      <li>Build the service into your own agents and tools within the rate limits given in <a href="/llms.txt">llms.txt</a>.</li>
+      <li>Respect robots.txt.</li>
     </ul>
 
-    <h2>What the "Verified" badge means</h2>
-    <p>The "Verified" badge is an editorially-set status: an administrator at Finn-tannlege.com has reviewed the clinic's profile and judged that its name, organisation number and any specialist titles match publicly available information, including from Brønnøysundregistrene. The status is set manually per clinic &mdash; there is currently no fully automated, real-time registry check that sets the badge on its own. Each individual field in the profile is still stored with its own source and date, independent of this overall status.</p>
-    <p>Clinics where this review hasn't happened yet remain fully listed in the directory &mdash; they are not hidden &mdash; just without the badge, and ranked below verified clinics in search results. Only permanently closed clinics or invalid listings are excluded from public search.</p>
+    <h2>6. Prohibited use</h2>
+    <ul>
+      <li>Downloading all or large parts of the directory to republish it as a competing register without written permission.</li>
+      <li>Using contact details from here for marketing, bulk messages or spam to clinics or dentists.</li>
+      <li>Circumventing security measures, rate limits or access control.</li>
+    </ul>
 
-    <h2>What we don't do</h2>
-    <p>We don't guess facts about a clinic and present the guess as confirmed. Information pulled from a clinic's own website is shown as a factual summary with source attribution &mdash; not as confirmation from a public authority.</p>
+    <h2>7. For clinics: corrections and removal</h2>
+    <p>If the information about a clinic is wrong, the clinic can ask for it to be corrected, or for the listing to be removed, by writing to <a href="mailto:${email}">${email}</a> or using <a href="/kontakt">the contact form</a>. Rights under data protection law are set out in <a href="/personvern">the privacy policy</a>.</p>
 
-    <p>This page describes what our verification pipeline genuinely does today; it is not a claim that we meet any particular law or regulatory standard.</p>
+    <h2>8. Liability</h2>
+    <p>Finn-tannlege.com is not a party to agreements between you and the clinic, and is not responsible for treatment, appointments, prices or anything else between you and the clinic. To the extent the law allows, we are not liable for loss caused by errors, omissions or delays in the information or in the service.</p>
+
+    <h2>9. Changes</h2>
+    <p>We may change these terms. The date at the top shows when they last changed.</p>
+
+    <h2>10. Governing law</h2>
+    <p>Norwegian law applies. Disputes are resolved at the company's ordinary venue, unless mandatory law gives you the right to bring the case elsewhere.</p>
+
+    <h2>11. Contact</h2>
+    <p>Send questions about these terms to <a href="mailto:${email}">${email}</a>. The company details are on <a href="/en/kontakt">the contact page</a>.</p>
+    </div>
   </div>
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(dentalShell(html, {
-    title: "Slik verifiserer vi dataene våre — Finn-tannlege.com",
-    description: "Hvordan Finn-tannlege.com sporer kilde og dato per felt i klinikkdata, og hva 'Verifisert'-merket faktisk betyr og ikke betyr.",
+    title: "Vilkår for bruk — Finn-tannlege.com",
+    description: "Vilkår for bruk av Finn-tannlege.com: hva tjenesten er, akutt hjelp, hvor opplysningene kommer fra, akseptabel bruk, ansvar og gjeldende rett. Også på engelsk.",
+    canonical: `${DENTAL_BASE_URL}/vilkar`,
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /proveniens — Metode og kilder (the method page)
+//
+// Public, SSR, bilingual (NO primary, EN section in the same page — this
+// file has no per-request lang switching, so we follow the sibling
+// experiences-seo.ts "NO section, <hr>, EN section with #en anchor"
+// convention instead of inventing new i18n plumbing here).
+//
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S2:
+// the canonical method page, at the same URL. The field table is
+// DENTAL_DATA_SOURCES (field, source, method, which date is stored), so a new
+// integration is one entry there. The live numbers come from the caches only
+// (dentalMethodCounts). The texts say what the code does: «Akuttvakt» needs
+// a stored quote from the clinic's own page (resolveAcuteClaim and
+// hasAcuteVaktQuote since F1-S4c; the text gives definition A since F1-S4e,
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider); the Helfo badge is shown from
+// helfo_agreement alone until F2-S6 (resolveHelfoClaim) changes that rule,
+// and the text with it. Daniel is the responsible editor (Daniel 2026-10-18,
+// question 14). No claim of how often anything is fetched or checked.
+//
+// IMPORTANT: must never claim regulatory compliance/certification of any
+// kind — see tests/test.ts for the assertion guarding this.
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * The field table, from DENTAL_DATA_SOURCES: one row per field, a <tbody>
+ * per source, and the source (with its licence), how its values are obtained
+ * and which date is stored spanning the source's rows. extra[id] is a
+ * sentence after the method (the Places display rule). `id` names the
+ * heading that labels the table.
+ */
+function dentalMethodTableHtml(lang: SiteLang, id: string, extra: Readonly<Record<string, string>>): string {
+  const en = lang === "en";
+  const head = en ? ["Field", "Source", "How it is obtained", "Date"] : ["Felt", "Kilde", "Slik hentes det", "Dato"];
+  const groups = DENTAL_DATA_SOURCES.map((s) => {
+    const licence = s.license
+      ? `<br><span class="method-licence">${en ? "Licence" : "Lisens"}: <a href="${escapeHtml(s.license.url)}" rel="license noopener" target="_blank">${escapeHtml(s.license.name)}</a></span>`
+      : "";
+    const method = [dentalSourceMethod(s, lang), extra[s.id] ?? ""].filter(Boolean).join(" ");
+    const span = s.fields.length > 1 ? ` rowspan="${s.fields.length}"` : "";
+    const rows = s.fields.map((f, i) => {
+      const field = `<th scope="row">${escapeHtml(dentalFieldLabel(f, lang))}</th>`;
+      return i > 0
+        ? `<tr>${field}</tr>`
+        : `<tr>${field}<td${span}>${dentalSourceNameHtml(s, lang)}${licence}</td><td${span}>${escapeHtml(method)}</td><td${span}>${escapeHtml(dentalSourceDate(s, lang))}</td></tr>`;
+    });
+    return `<tbody data-source="${escapeHtml(s.id)}">\n        ${rows.join("\n        ")}\n      </tbody>`;
+  });
+  return `<div class="method-table-wrap" role="region" aria-labelledby="${id}" tabindex="0">
+    <table class="method-table" aria-labelledby="${id}">
+      <thead><tr>${head.map((h) => `<th scope="col">${h}</th>`).join("")}</tr></thead>
+      ${groups.join("\n      ")}
+    </table>
+  </div>`;
+}
+
+const DENTAL_METHOD_CSS = `
+.method-counts{font-size:.95rem}
+.method-table-wrap{overflow-x:auto;margin:8px 0 20px;border:1px solid var(--g200);border-radius:var(--r-md)}
+.method-table{border-collapse:collapse;width:100%;min-width:640px;font-size:.88rem;line-height:1.55}
+.method-table th,.method-table td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--g200);color:var(--g700)}
+.method-table thead th{background:var(--section-bg);color:var(--navy);font-weight:700}
+.method-table tbody th{font-weight:600}
+.method-table td{border-left:1px solid var(--g200)}
+.method-table tbody tr:last-child th,.method-table tbody tr:last-child td,.method-table td[rowspan]{border-bottom:2px solid var(--g200)}
+.method-licence{font-size:.8rem;color:var(--g500)}
+`;
+
+/**
+ * The live numbers on /proveniens (F2-S2) as [label, value] pairs: the
+ * catalogue total (getCachedDentalStats) and the clinics with the
+ * «Verifisert» badge, summed over the cached area aggregate
+ * (getDentalAreaFacts().byFylke, F1-S3), so the page runs no query of its
+ * own. A clinic without a stored fylke is in the total but in no fylke; when
+ * the fylke counts do not add up to the total, the sum is a lower bound and
+ * says so («minst»), and a lower bound of 0 is left out. Nothing while the
+ * dental DB is not ready (total 0).
+ */
+export function dentalMethodCounts(
+  counts: { total: number; verified: number; verifiedComplete: boolean },
+  lang: SiteLang
+): Array<[string, string]> {
+  if (counts.total <= 0) return [];
+  const en = lang === "en";
+  const fmt = (n: number): string => n.toLocaleString(en ? "en" : "nb");
+  const rows: Array<[string, string]> = [[en ? "Clinics in the directory" : "Klinikker i katalogen", fmt(counts.total)]];
+  if (counts.verifiedComplete || counts.verified > 0) {
+    const atLeast = counts.verifiedComplete ? "" : en ? "at least " : "minst ";
+    rows.push([en ? "With the \"Verified\" badge" : "Med «Verifisert»-merket", `${atLeast}${fmt(counts.verified)}`]);
+  }
+  return rows;
+}
+
+router.get("/proveniens", (_req: Request, res: Response) => {
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A4-D): the Google Places method says what the display rule
+  // (dental-places-display.ts) hides, while it is on; with it off the page is
+  // as before.
+  const placesRule: { no: Record<string, string>; en: Record<string, string> } = placesDisplayPolicyEnabled()
+    ? {
+        no: { google_places: "En adresse, et telefonnummer, åpningstider eller en nettside som bare Google Places oppgir, viser vi ikke. Vi viser verdien når en annen kilde, som klinikkens egen nettside eller Brønnøysundregistrene, oppgir det samme." },
+        en: { google_places: "An address, phone number, opening hours or website that only Google Places gives is not shown. We show the value when another source, such as the clinic's own website or Brønnøysundregistrene, gives the same." },
+      }
+    : { no: {}, en: {} };
+  let total = 0;
+  try { total = getCachedDentalStats().total; } catch { /* dental db may not be ready */ }
+  const inFylke = sumAreaCounts([...getDentalAreaFacts().byFylke.values()]);
+  const counts = { total, verified: inFylke.verified, verifiedComplete: inFylke.total === total };
+  const countsHtml = (lang: SiteLang): string => {
+    const rows = dentalMethodCounts(counts, lang);
+    return rows.length
+      ? `<p class="method-counts">${rows.map(([k, v]) => `${escapeHtml(k)}: <strong>${escapeHtml(v)}</strong>`).join(" &middot; ")}</p>`
+      : "";
+  };
+  // dental-store.ts sends a repeat park to needs_review only behind this flag
+  // (recordDentalHomepageFetchResult, recordDentalExtractionResult and
+  // parkDentalWrongEntity: DENTAL_PARK_AFTER_ATTEMPTS failures, parked, then
+  // again once DENTAL_PARK_BACKOFF_MS has passed). The page names the rule
+  // only while it is on.
+  const repeatParkToReview = process.env.DENTAL_REPEAT_PARK_TO_REVIEW === "true";
+  const editor = escapeHtml(COMPANY_INFO.founder.name);
+
+  const html = `
+<main>
+  <div class="content-page">
+    <h1>Metode og kilder</h1>
+    <p>Denne siden forklarer hvor opplysningene i en klinikkprofil på Finn-tannlege.com kommer fra, hvordan de hentes, hvilken dato vi lagrer for dem, og hva merkene på profilen betyr. Der vi har det, lagres kilden og hentedatoen sammen med verdien, men ikke for alle felt: det som kom med den første importen fra Brønnøysundregistrene, har for eksempel ingen egen dato.</p>
+    ${countsHtml("nb")}
+
+    <h2 id="felt-for-felt">Felt for felt</h2>
+    ${dentalMethodTableHtml("nb", "felt-for-felt", placesRule.no)}
+
+    <h2>Helfo, akutt og spesialiteter</h2>
+    <p><strong>Helfo-direkteoppgjør</strong> er tolket automatisk fra klinikkens nettside: KI-modellen leser om klinikken skriver at den har direkteoppgjør med Helfo, og merket vises når uttrekket har registrert det. Vi har ingen liste fra Helfo, så merket er ikke en bekreftelse fra Helfo. Spør klinikken før du bestiller time.</p>
+    <p><strong>Akuttvakt</strong> vises bare med et lagret sitat fra klinikkens egen nettside, der klinikken sier at den tar imot nye pasienter for akutt behandling utenom vanlig åpningstid (kveld, helg eller natt). Det holder ikke at kilden til opplysningen er lagret. Uten et slikt sitat viser vi «${escapeHtml(ACUTE_ACCEPTS_LABEL)}» når uttrekket fra klinikkens nettside nevner akutt, og ellers ingen akuttopplysning. Ring alltid klinikken først.</p>
+    <p><strong>Spesialiteter</strong> vises når klinikkens nettside oppgir dem, enten som noe klinikken tilbyr eller som tittelen til en behandler der (for eksempel «kjeveortoped»). Vi har ikke kontrollert at behandlerne har spesialistgodkjenning.</p>
+
+    <h2>Hva «Verifisert»-merket betyr</h2>
+    <p>${escapeHtml(DENTAL_VERIFIED_BADGE_TEXT.nb)}</p>
+    <p>I disse tilfellene settes klinikken til ny vurdering, og den har ikke merket før den er kontrollert på nytt. Er enheten slettet, konkurs eller under avvikling, markeres klinikken i tillegg som nedlagt.</p>${repeatParkToReview ? `
+    <p>En klinikk settes også til ny vurdering når hjemmesiden ikke kan nås, når opplysningene ikke kan hentes fra den, eller når nettstedet ser ut til å høre til en annen virksomhet, tre ganger på rad og så igjen etter minst 30 dager.</p>` : ""}
+    <p>Klinikker uten merket forblir synlige i katalogen &mdash; de skjules ikke. I lister og søkeresultater kommer klinikker med merket foran klinikker uten, men ved et fritekstsøk kommer først klinikkene som treffer søketeksten slik det tidligere søket leste den, for eksempel der navnet eller stedet inneholder hele teksten. Kun klinikker markert som varig avviklet eller ugyldige oppføringer holdes utenfor det offentlige søket.</p>
+
+    <h2>Sist kontrollert og sist oppdatert</h2>
+    <p>Datoen for siste kontroll («sist kontrollert») lagres for hver klinikk kontrollen har gått gjennom. En klinikk som ikke er kontrollert, har ingen slik dato.</p>
+    <p>«Sist oppdatert» på en klinikkprofil er datoen profilen sist ble endret, for eksempel av et uttrekk, av kontrollen eller av en retting. Den betyr ikke at alle opplysningene ble kontrollert den dagen.</p>
+
+    <h2>Feil i en profil</h2>
+    <p>Ser du noe som er feil? Send e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> med klinikkens navn, organisasjonsnummer og hva som er feil, eller bruk <a href="/kontakt">kontaktskjemaet</a>. Klinikker kan også be om at profilen rettes eller fjernes.</p>
+
+    <h2>Hva vi ikke gjør</h2>
+    <p>Vi gjetter ikke oss fram til fakta om en klinikk og presenterer det som bekreftet. Opplysninger fra en klinikks egen nettside er klinikkens egne opplysninger slik KI-modellen har lest dem, ikke en bekreftelse fra en offentlig myndighet.</p>
+
+    <div style="background:var(--bg2,#f7f9fc);border-left:4px solid var(--navy,#1a3a5c);border-radius:0 10px 10px 0;padding:18px 22px;margin:24px 0">
+      <p style="margin-bottom:0">Etter hvert som forventningene til åpenhet rundt KI og datagrunnlag øker i Europa, mener vi at å vise selve verifiseringsarbeidet vårt er god praksis. Denne siden beskriver hva vi faktisk gjør i dag &mdash; det er ikke en påstand om sertifisering eller samsvar med noe bestemt regelverk.</p>
+    </div>
+
+    <p>Ansvarlig redaktør: ${editor}.</p>
+    <p>Se også <a href="/om">om Finn-tannlege.com</a> og <a href="/hvordan-det-fungerer">slik fungerer det</a>.</p>
+
+    <hr style="margin:36px 0;border:none;border-top:1px solid var(--g100,#e5e7eb)">
+
+    <div lang="en">
+    <h1 id="en">Method and sources</h1>
+    <p>This section explains, in English, where the details in a clinic profile on Finn-tannlege.com come from, how they are obtained, which date we store for them and what the badges on a profile mean. Where we have them, the source and the date fetched are stored with the value, but not for every field: what came with the first import from Brønnøysundregistrene, for example, has no date of its own.</p>
+    ${countsHtml("en")}
+
+    <h2 id="field-by-field">Field by field</h2>
+    ${dentalMethodTableHtml("en", "field-by-field", placesRule.en)}
+
+    <h2>Helfo, emergency claims and specialties</h2>
+    <p><strong>Helfo direct billing</strong> is read automatically from the clinic's website: the AI model reads whether the clinic says it has direct billing with Helfo, and the badge is shown when the extraction has recorded that. We have no list from Helfo, so the badge is not a confirmation from Helfo. Ask the clinic before you book.</p>
+    <p><strong>Emergency duty</strong> (the "<span lang="nb">Akuttvakt</span>" badge) is shown only with a stored quote from the clinic's own website, in which the clinic says it takes new patients for emergency treatment outside regular opening hours (evening, weekend or night). A stored source for the detail is not enough. Without such a quote we show "<span lang="nb">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span>" (accepts emergency patients) when the extraction from the clinic's website mentions emergencies, and otherwise no emergency detail. Always call the clinic first.</p>
+    <p><strong>Specialties</strong> are shown when the clinic's website gives them, either as something the clinic offers or as the title of a practitioner there (for example "<span lang="nb">kjeveortoped</span>", orthodontist). We have not checked that the practitioners are approved specialists.</p>
+
+    <h2>What the "Verified" badge means</h2>
+    <p>${escapeHtml(DENTAL_VERIFIED_BADGE_TEXT.en)}</p>
+    <p>In these cases the clinic is set for review, and it has no badge until it has been checked again. If the entity is dissolved, bankrupt or being wound up, the clinic is also marked as closed.</p>${repeatParkToReview ? `
+    <p>A clinic is also set for review when its website cannot be reached, when no details can be extracted from it, or when the website appears to belong to another business, three times in a row and then again after at least 30 days.</p>` : ""}
+    <p>Clinics without the badge remain fully listed in the directory &mdash; they are not hidden. In lists and search results, clinics with the badge come before clinics without it, but in a free-text search the clinics that match the search text as the earlier search read it come first, for example those whose name or place contains the whole text. Only permanently closed clinics or invalid listings are excluded from public search.</p>
+
+    <h2>Last checked and last updated</h2>
+    <p>The date of the last check ("last checked") is stored for each clinic the check has gone through. A clinic that has not been checked has no such date.</p>
+    <p>"<span lang="nb">Sist oppdatert</span>" (last updated) on a clinic profile is the date the profile last changed, for example through an extraction, the check or a correction. It does not mean that every detail was checked that day.</p>
+
+    <h2>Errors in a profile</h2>
+    <p>Spotted something wrong? Email <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> with the clinic's name, organisation number and what is wrong, or use the <a href="/kontakt">contact form</a> (in Norwegian). Clinics can also ask for their profile to be corrected or removed.</p>
+
+    <h2>What we don't do</h2>
+    <p>We don't guess facts about a clinic and present the guess as confirmed. Details from a clinic's own website are the clinic's own details as the AI model has read them, not confirmation from a public authority.</p>
+
+    <p>This page describes what our verification pipeline genuinely does today; it is not a claim that we meet any particular law or regulatory standard.</p>
+    <p>Responsible editor: ${editor}.</p>
+    </div>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: "Metode og kilder — Finn-tannlege.com",
+    description: "Metode og kilder for Finn-tannlege.com: hvor hvert felt i en klinikkprofil kommer fra, hvordan det hentes, hvilken dato vi lagrer, og hva «Verifisert»-merket betyr.",
     canonical: `${DENTAL_BASE_URL}/proveniens`,
+    extraCss: DENTAL_METHOD_CSS,
   }));
 });
 
@@ -2369,37 +3498,29 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   const slugParam = String(req.params.slug).toLowerCase();
   const sp = findSpecialtyBySlug(slugParam);
   if (!sp) {
-    res.status(404).send(dentalShell(
+    sendDentalNotFound(res,
       `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Spesialitet ikke funnet</h3><p>Vi kjenner ikke til spesialiteten «${escapeHtml(slugParam)}». <a href="/">Gå til forsiden</a>.</p></div></div></main>`,
       { title: "Spesialitet ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
 
-  const PAGE_SIZE = 50;
-  let agents: Array<DentalAgent & { id: string }> = [];
+  // Paged like /fylke (F1-S1): it listed the first 50 clinics only.
   let total = 0;
+  try { total = countPublicDentalAgents({ specialty: sp.navn } as any); } catch { /* db not ready */ }
+  const { page, offset, totalPages } = resolveListPage(req.query.side, total);
+  let agents: DentalAgentRow[] = [];
   try {
-    agents = listPublicDentalAgents({ specialty: sp.navn } as any, PAGE_SIZE, 0);
-    total = countPublicDentalAgents({ specialty: sp.navn } as any);
+    agents = listPublicDentalAgents({ specialty: sp.navn } as any, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* db not ready */ }
 
-  const canonicalUrl = `${DENTAL_BASE_URL}/spesialitet/${sp.slug}`;
+  const basePath = `/spesialitet/${sp.slug}`;
+  const canonicalUrl = `${DENTAL_BASE_URL}${basePath}`;
+  const pageUrl = `${DENTAL_BASE_URL}${listPageHref(basePath, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
   const displayNavn = sp.navn.charAt(0).toUpperCase() + sp.navn.slice(1);
 
-  const itemList = {
-    "@context": "https://schema.org",
-    "@type": "ItemList",
-    name: `Tannlegespesialister: ${displayNavn}`,
-    url: canonicalUrl,
-    numberOfItems: Math.min(total, 50),
-    itemListElement: agents.slice(0, 50).map((a, i) => ({
-      "@type": "ListItem",
-      position: i + 1,
-      url: clinicProfileUrl(a),
-      name: a.navn,
-    })),
-  };
+  const itemList = dentalItemListJsonLd(`Tannlegespesialister: ${displayNavn}`, pageUrl, agents, offset);
 
   const resultCards =
     agents.length > 0
@@ -2426,8 +3547,9 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
       <p style="font-size:.95rem;color:var(--g700);line-height:1.7">${escapeHtml(sp.beskrivelse)}</p>
       <p style="margin-top:12px;font-size:.9rem"><a href="/sok?spesialitet=${encodeURIComponent(sp.navn)}">Se alle klinikker med ${escapeHtml(sp.navn)} i søket &rarr;</a></p>
     </div>
-    <p class="result-meta" style="margin-bottom:20px">${total.toLocaleString("nb")} klinikker funnet</p>
+    <p class="result-meta" style="margin-bottom:20px">${total.toLocaleString("nb")} klinikker funnet${totalPages > 1 ? ` &mdash; side ${page} av ${totalPages}` : ""}</p>
     ${resultCards}
+    ${paginationHtml(page, totalPages, basePath)}
     <div style="margin-top:40px">
       <div class="section-title" style="font-size:1.1rem;margin-bottom:12px">Andre spesialiteter</div>
       <div style="display:flex;flex-wrap:wrap;gap:8px">${otherChips}</div>
@@ -2443,9 +3565,9 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `${displayNavn} — Tannlegespesialister i Norge | Finn-tannlege.com`,
-    description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.`,
-    canonical: canonicalUrl,
+    title: `${displayNavn}${pageMeta.title} — Tannlegespesialister i Norge | Finn-tannlege.com`,
+    description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.${pageMeta.description}`,
+    canonical: pageUrl,
     jsonLd: [itemList, specBreadcrumb],
   }));
 });
@@ -2454,57 +3576,109 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
 // GET /sted/:stedSlug  (PR-116 — bysider)
 // ═══════════════════════════════════════════════════════════
 
+// The place behind /sted/<slug>, from the cached poststed list. Every stored
+// spelling of a place slugs alike ("BERGEN" and "Bergen" are both
+// /sted/bergen), so a slug is a group (dev-request
+// 2026-10-17-dental-d3-rettelser, D3b / IDX-3):
+//   row        the first row with the slug. The list is ordered by count, so
+//              that is the highest-count spelling; the page's title,
+//              breadcrumb and fylke come from it, as before.
+//   spellings  every stored spelling with the slug, most clinics first.
+//   count      the clinics of all the spellings together.
+// The /sted page, its sitemap lastmod, the clinic page's «Det finnes N
+// klinikker i X» and the place chips on / and /fylke all read the group, so
+// they name the same place and count. They used to read the row alone, so
+// /sted/bergen listed 164 of Bergen's 207 clinics and /fylke/Vestland had a
+// chip per spelling. Different slugs are never merged (OS is not OSLO). The
+// groups are rebuilt only when the cache hands out a new list (once per TTL),
+// not on every /, /fylke, /sted and /klinikk request.
+export interface StedGroup {
+  row: PoststedRow;
+  spellings: string[];
+  count: number;
+}
+let _stedGroups: { rows: PoststedRow[]; bySlug: Map<string, StedGroup>; bySize: StedGroup[] } | null = null;
+
+function stedGroups(): { bySlug: Map<string, StedGroup>; bySize: StedGroup[] } {
+  const rows = getCachedPoststeder();
+  if (!_stedGroups || _stedGroups.rows !== rows) {
+    const bySlug = new Map<string, StedGroup>();
+    for (const p of rows) {
+      const slug = slugifyText(p.poststed);
+      const group = bySlug.get(slug);
+      if (group) {
+        group.spellings.push(p.poststed);
+        group.count += p.count;
+      } else {
+        bySlug.set(slug, { row: p, spellings: [p.poststed], count: p.count });
+      }
+    }
+    // Largest group first, for the chips; a tie keeps the list's order (sort is stable).
+    const bySize = [...bySlug.values()].sort((a, b) => b.count - a.count);
+    _stedGroups = { rows, bySlug, bySize };
+  }
+  return _stedGroups;
+}
+
+export function findStedGroup(stedSlug: string): StedGroup | undefined {
+  return stedGroups().bySlug.get(stedSlug);
+}
+
+function findStedRow(stedSlug: string): PoststedRow | undefined {
+  return findStedGroup(stedSlug)?.row;
+}
+
+// The spellings a /sted page lists: as many as the store's poststed_in takes,
+// each within its length limit, the way the search parser builds poststed_in.
+// A place with one spelling (or one usable spelling) keeps its row's.
+function stedSpellings(group: StedGroup): string[] {
+  const values = group.spellings.filter((v) => v.length <= MAX_TERM_CHARS).slice(0, MAX_POSTSTED_IN);
+  return values.length > 1 ? values : [group.row.poststed];
+}
+
+// The store filter for a /sted page's clinics. One spelling gives the same
+// { poststed } filter as before, so the SQL for such a place is unchanged.
+export function stedFilter(group: StedGroup): ListFilter {
+  const spellings = stedSpellings(group);
+  return spellings.length > 1 ? { poststed_in: spellings } : { poststed: spellings[0]! };
+}
+
 router.get("/sted/:stedSlug", (req: Request, res: Response) => {
-  const PAGE_SIZE = 50;
   const stedSlugParam = String(req.params.stedSlug).toLowerCase().trim();
 
-  // Build poststed lookup map from cache (slug → PoststedRow)
-  const poststeder = getCachedPoststeder();
-  const stedMap = new Map<string, PoststedRow>();
-  for (const p of poststeder) {
-    // first-write-wins: keeps the highest-count row when two poststeder slug to the same value
-    if (!stedMap.has(slugifyText(p.poststed))) stedMap.set(slugifyText(p.poststed), p);
-  }
-
-  const stedRow = stedMap.get(stedSlugParam);
-  if (!stedRow) {
-    res.status(404).send(dentalShell(
+  const stedGroup = findStedGroup(stedSlugParam);
+  if (!stedGroup) {
+    sendDentalNotFound(res,
       `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Sted ikke funnet</h3><p>Vi fant ikke tannleger for «${escapeHtml(stedSlugParam)}».</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div></main>`,
       { title: "Sted ikke funnet — Finn-tannlege.com" }
-    ));
+    );
     return;
   }
 
+  const stedRow = stedGroup.row;
   const titledSted = titleCasePoststed(stedRow.poststed);
-  const sideRaw = parseInt(String(req.query.side || "1"), 10);
-  const page = Number.isFinite(sideRaw) && sideRaw > 0 ? sideRaw : 1;
-  const offset = (page - 1) * PAGE_SIZE;
-
-  let agents: Array<DentalAgent & { id: string }> = [];
+  // Every spelling of the place (D3b). Count first, so a ?side= past the
+  // last page falls back to page 1 (F1-S1).
+  const filter = stedFilter(stedGroup);
   let total = 0;
+  try { total = countPublicDentalAgents(filter); } catch { /* db not ready */ }
+  const { page, offset, totalPages } = resolveListPage(req.query.side, total);
+  let agents: DentalAgentRow[] = [];
   try {
-    agents = listPublicDentalAgents({ poststed: stedRow.poststed } as any, PAGE_SIZE, offset);
-    total = countPublicDentalAgents({ poststed: stedRow.poststed } as any);
+    agents = listPublicDentalAgents(filter, DENTAL_LANDING_CONFIG.listPageSize, offset);
   } catch { /* db not ready */ }
 
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const canonicalUrl = `${DENTAL_BASE_URL}/sted/${stedSlugParam}`;
   const baseUrl = `/sted/${stedSlugParam}`;
+  // Page 1 keeps the bare canonical; page N ≥ 2 is its own (F1-S1).
+  const pageUrl = `${DENTAL_BASE_URL}${listPageHref(baseUrl, page)}`;
+  const pageMeta = listPageMeta(page, totalPages);
 
-  // JSON-LD ItemList
-  const itemList = {
-    "@context": "https://schema.org",
-    "@type": "ItemList",
-    name: `Tannlege i ${titledSted}`,
-    url: canonicalUrl,
-    numberOfItems: Math.min(total, 25),
-    itemListElement: agents.slice(0, 25).map((a, i) => ({
-      "@type": "ListItem",
-      position: offset + i + 1,
-      url: clinicProfileUrl(a),
-      name: a.navn,
-    })),
-  };
+  const itemList = dentalItemListJsonLd(`Tannlege i ${titledSted}`, pageUrl, agents, offset);
+  // F1-S3: intro, fact table and FAQ from the cached aggregate (the same
+  // spellings the page lists), page 1 only.
+  const stedPlace = stedLandingPlace(stedSlugParam, stedGroup);
+  const landing = areaLandingFor(page === 1 ? stedPlace.counts : undefined, total, titledSted, pageUrl, "poststed");
 
   // BreadcrumbList
   const breadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
@@ -2530,11 +3704,14 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
     </div>
   </div>
   <div class="container" style="padding-top:28px;padding-bottom:48px">
+    ${landing.introHtml}${landing.tableHtml}
     <p class="result-meta">Side ${page} av ${totalPages}</p>
     <div class="clinic-list" role="list" aria-label="Tannleger i ${escapeHtml(titledSted)}">
       ${resultCards}
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
+    ${landing.faqHtml}
+    ${dentalFacetLinksHtml(stedPlace)}
     ${fylkeLink}
   </div>
 </main>`;
@@ -2542,13 +3719,96 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
-    title: `Tannlege i ${escapeHtml(titledSted)} — Finn-tannlege.com`,
-    description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
-    canonical: canonicalUrl,
+    title: `Tannlege i ${titledSted}${pageMeta.title} — Finn-tannlege.com`,
+    description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.${pageMeta.description}`,
+    canonical: pageUrl,
     // skive A: a /sted page with 0 active clinics must never be indexable.
-    ...(total === 0 ? { robots: "noindex,follow" } : {}),
-    jsonLd: [itemList, stedBreadcrumb],
+    ...(isDentalStedIndexable(total) ? {} : { robots: "noindex,follow" }),
+    jsonLd: [itemList, stedBreadcrumb, ...(landing.faqJsonLd ? [landing.faqJsonLd] : [])],
   }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /sted/:stedSlug/:facet + GET /fylke/:fylke/:facet (A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider, F1-S4a; routes/dental-landing.ts)
+// ═══════════════════════════════════════════════════════════
+
+// The places the facet routes, the sitemap and the facet links on /sted and
+// /fylke are about, built one way for all three: a facet URL is in the
+// sitemap exactly when its route answers 200.
+
+/** A /sted group as a facet place: the counts of the spellings it lists, summed. */
+function stedLandingPlace(slug: string, group: StedGroup): DentalLandingPlace {
+  const facts = getDentalAreaFacts();
+  return {
+    scope: "poststed",
+    name: titleCasePoststed(group.row.poststed),
+    path: `/sted/${slug}`,
+    filter: stedFilter(group),
+    counts: sumAreaCounts(stedSpellings(group).map((sp) => facts.byPoststed.get(sp))),
+  };
+}
+
+/** The facet place of a /sted slug whose /sted page is indexable (decision 7=A), else undefined. */
+function findStedLandingPlace(slug: string): DentalLandingPlace | undefined {
+  const group = findStedGroup(slug);
+  return group && isDentalStedIndexable(group.count) ? stedLandingPlace(slug, group) : undefined;
+}
+
+/** A canonical fylke as a facet place. */
+function fylkeLandingPlace(fylke: string): DentalLandingPlace {
+  const counts = getDentalAreaFacts().byFylke.get(fylke);
+  return {
+    scope: "fylke", name: fylke, path: `/fylke/${encodeURIComponent(fylke)}`, filter: { fylke }, counts,
+    sameClinicsAs: (facet) => stedWithSameFacetClinics(counts, facet),
+  };
+}
+
+/**
+ * The /sted place whose page for `facet` lists exactly the clinics a fylke's
+ * page for it lists, from the fylke's facet counts in the cached aggregate
+ * (no query). Every clinic of the fylke's facet has a poststed the /sted
+ * page lists (so the fylke's clinics are among the place's), and the place
+ * has as many clinics in the facet (so it has none the fylke lacks). A
+ * clinic without a poststed is in the fylke's total but no /sted page's.
+ */
+function stedWithSameFacetClinics(fylkeCounts: DentalAreaCounts | undefined, facet: DentalLandingFacet): DentalLandingPlace | undefined {
+  const inFylke = fylkeCounts?.facets?.[facet.slug];
+  const first = inFylke?.poststeder?.keys().next().value;
+  if (!inFylke?.poststeder || first === undefined) return undefined;
+  const slug = slugifyText(first);
+  const group = findStedGroup(slug);
+  if (!group || !isDentalStedIndexable(group.count)) return undefined;
+  const listed = new Set(stedSpellings(group));
+  let withListedPoststed = 0;
+  for (const [poststed, n] of inFylke.poststeder) {
+    if (!listed.has(poststed)) return undefined;
+    withListedPoststed += n;
+  }
+  const sted = stedLandingPlace(slug, group);
+  return withListedPoststed === inFylke.total && sted.counts?.facets?.[facet.slug]?.total === inFylke.total ? sted : undefined;
+}
+
+/** The facet place of a /fylke URL segment that names a canonical fylke, else undefined. */
+function findFylkeLandingPlace(param: string): DentalLandingPlace | undefined {
+  const matched = findCanonicalFylke(param);
+  return matched ? fylkeLandingPlace(matched.fylke) : undefined;
+}
+
+// Before the catch-all 404, which answers for every facet URL these leave to next().
+registerDentalLandingRoutes(router, {
+  baseUrl: DENTAL_BASE_URL,
+  shell: dentalShell,
+  clinicCard,
+  breadcrumbJsonLd,
+  itemListJsonLd: dentalItemListJsonLd,
+  paginationHtml,
+  listPageHref,
+  listPageMeta,
+  resolveListPage,
+  listAgents: listPublicDentalAgents,
+  findSted: findStedLandingPlace,
+  findFylke: findFylkeLandingPlace,
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -2576,6 +3836,9 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
 // item 1). There is NO booking capability on finn-tannlege.com: none of the five
 // MCP tools books anything (clinics are contacted directly), so the file must not
 // claim it — the description/categories used to say "book"/"booking".
+// API-base is the REST mount in index.ts (/api/tannlege, the prefix of every
+// REST path in openapi.json); it said /api/tannleger, which is a 404
+// (integrasjonstest MCP-02, dev-request 2026-10-17-integrasjonstest-oppfolging I-Q).
 function serveDentalAgentsTxt(_req: Request, res: Response): void {
   res.header("Content-Type", "text/plain; charset=utf-8");
   res.header("Cache-Control", "public, max-age=3600");
@@ -2589,13 +3852,13 @@ Agent-card: ${DENTAL_BASE_URL}/.well-known/agent-card.json
 MCP-endpoint: ${DENTAL_BASE_URL}/mcp
 MCP-server-card: ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 A2A-endpoint: ${DENTAL_BASE_URL}/a2a
-API-base: ${DENTAL_BASE_URL}/api/tannleger
-Name: Finn Tannlege
+API-base: ${DENTAL_BASE_URL}/api/tannlege
+Name: Finn-tannlege
 Description: Norwegian dental practice directory — find and compare dental clinics (read-only; no online booking, contact the clinic directly)
 Languages: no, en
 Categories: dental, healthcare, directory, norway
 Region: NO
-Rate-limit: 300 requests per 15 minutes (general)
+Rate-limit: 1000 requests per 15 minutes (REST and A2A per IP, MCP per session)
 Rate-limit: 500 requests per hour (admin)
 Contact: https://github.com/slookisen/lokal/issues
 `);
@@ -2624,7 +3887,10 @@ router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) 
 // GET /.well-known/ai-plugin.json — ChatGPT plugin manifest (parity with rfb
 // discovery.ts). OpenAI no longer loads plugins, but AI-discovery indexes still
 // scan the file as a machine-readable API-contract signal and it points at the
-// OpenAPI spec the Custom GPT's Actions use.
+// OpenAPI spec the Custom GPT's Actions use. The akutt filter is the claim on
+// the card, «Akuttvakt» (with a stored quote) or «Tar imot akuttpasienter», so
+// the descriptions name both (F1-S4e, A2A dev-request
+// 2026-10-16-finn-tannlege-fasettsider).
 router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
   const total = safeHonestCatalogCount("dental");
   res.header("Content-Type", "application/json");
@@ -2635,20 +3901,21 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
     name_for_human: "Finn-tannlege",
     name_for_model: "finn_tannlege",
     description_for_human:
-      "Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akuttvakt.",
+      `Finn og sammenlign tannlegeklinikker i Norge — Helfo-avtale, spesialitet og akutthjelp. ${FINN_DISAMBIGUATION_NB}`.trim(),
     description_for_model:
       "Plugin for searching and comparing Norwegian dental clinics. " +
       (total ? `Provides access to ${total.toLocaleString("nb")} clinics ` : "Provides access to clinics ") +
-      "with filters for county (fylke), specialty, Helfo direct-billing agreement and emergency-duty " +
-      "(akuttvakt). Read-only: it does not book appointments — users contact the clinic directly.",
+      "with filters for county (fylke), specialty, Helfo direct-billing agreement and emergency claims " +
+      "(an emergency duty backed by a stored quote from the source, or that the clinic says it takes emergency patients). " +
+      `Read-only: it does not book appointments — users contact the clinic directly. ${FINN_DISAMBIGUATION_EN}`.trim(),
     auth: { type: "none" },
     api: {
       type: "openapi",
       url: `${DENTAL_BASE_URL}/openapi.json`,
     },
-    logo_url: `${DENTAL_BASE_URL}/favicon.svg`,
+    logo_url: DENTAL_LOGO_PNG_URL, // F2-S4: PNG (was favicon.svg)
     contact_url: `${DENTAL_BASE_URL}/kontakt`,
-    legal_info_url: `${DENTAL_BASE_URL}/om`,
+    legal_info_url: `${DENTAL_BASE_URL}/vilkar`,
   });
 });
 
@@ -2678,6 +3945,9 @@ function dentalMcpServerCard() {
   // ONE catalog number (services/honest-count.ts): same as llms.txt, agent card, /api/stats, /health.
   const stats = { total: safeHonestCatalogCount("dental") ?? 0 };
   const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "thousands of";
+  // Title, description (S4a) and icon (G3-S5) as the live /mcp sends them in serverInfo (dental-mcp.ts).
+  // Required lazily, as mcp-tool-manifest.ts does for `tools` below: dental-mcp imports this file.
+  const { DENTAL_MCP_SERVER_TITLE, DENTAL_MCP_SERVER_DESCRIPTION, DENTAL_MCP_SERVER_ICONS } = require("./dental-mcp") as typeof import("./dental-mcp");
 
   return {
     // $schema deliberately omitted: the URL previously advertised here
@@ -2692,19 +3962,16 @@ function dentalMcpServerCard() {
     // never written down. See services/mcp-protocol-version.ts.
     ...mcpProtocolDeclaration(),
     name: "finn-tannlege",
-    title: "Finn-tannlege — Norwegian dental clinic search",
+    title: DENTAL_MCP_SERVER_TITLE,
     version: "0.1.0",
-    description:
-      `Search and compare ${totalLabel} Norwegian dental clinics. Filter by county (fylke), specialty, ` +
-      "Helfo direct-billing agreement, and emergency-duty (akuttvakt) availability. Supports " +
-      "natural-language queries in Norwegian and English.",
+    description: `Search and compare ${totalLabel} Norwegian dental clinics. ${DENTAL_MCP_SERVER_DESCRIPTION}`,
     homepage: DENTAL_BASE_URL,
     repository: {
       type: "git",
       url: "https://github.com/slookisen/lokal",
     },
     documentation: `${DENTAL_BASE_URL}/llms.txt`,
-    icon: `${DENTAL_BASE_URL}/favicon.svg`,
+    icon: DENTAL_MCP_SERVER_ICONS?.[0]?.src, // the 512 PNG logo (was favicon.svg); no `icon` while BRAND_ENTITIES.dental.logoPng is null
     // T3: the organisation behind the server is the company (same as the agent
     // card's provider); `name`/`title` above keep the brand.
     vendor: {
@@ -2720,11 +3987,9 @@ function dentalMcpServerCard() {
       },
     ],
     transports: ["http", "streamable-http"],
-    capabilities: {
-      tools: { listChanged: false },
-      resources: { listChanged: false, subscribe: false },
-      prompts: { listChanged: false },
-    },
+    // What the live /mcp sends in initialize, read from the same registration as `tools`
+    // (A2A dev-request 2026-10-17-dental-d3-rettelser, D3a): tools only, no resources or prompts.
+    capabilities: registeredMcpCapabilities("dental"),
     // Generated from the tools the live /mcp server registers (services/mcp-tool-manifest.ts);
     // locked by src/routes/discovery-truth.test.ts against a real tools/list.
     tools: registeredMcpTools("dental"),
@@ -2896,7 +4161,7 @@ router.get("/kontakt", (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 router.use((_req: Request, res: Response) => {
-  res.status(404).send(dentalShell(
+  sendDentalNotFound(res,
     `<main><div class="container"><div class="empty-state" style="padding:80px 0">
       <h3>Siden finnes ikke</h3>
       <p>Vi fant ikke siden du leter etter. Prøv å søke etter tannlege, eller gå til forsiden.</p>
@@ -2906,7 +4171,7 @@ router.use((_req: Request, res: Response) => {
       </div>
     </div></div></main>`,
     { title: "Side ikke funnet (404) — Finn-tannlege.com" }
-  ));
+  );
 });
 
 export default router;

@@ -14,15 +14,16 @@
 import { signAgentCard } from "./agent-card-signing";
 import { registeredMcpTools } from "./mcp-tool-manifest";
 import { agentCardProvider } from "./company-legal";
+import { distributionFor, OPPLEVAGENT_CUSTOM_GPT_URL } from "../config/distribution-channels";
 
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
 
 // Single source of truth for Opplevagent's ChatGPT Custom GPT — referenced
 // both by the agent card's x-distribution entry and by the "For AI-agenter"
-// human-facing link on the homepage (src/routes/experiences-seo.ts).
-export const OPPLEVAGENT_CUSTOM_GPT_URL =
-  "https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge";
+// human-facing link on the homepage (src/routes/experiences-seo.ts). Defined in
+// config/distribution-channels.ts and re-exported here.
+export { OPPLEVAGENT_CUSTOM_GPT_URL };
 
 // Ensure URL never has a trailing slash (A2A spec requirement).
 function baseUrl(): string {
@@ -175,51 +176,8 @@ export function getExperiencesAgentCard(honestCount?: number | null): object {
     // registered tools, services/mcp-tool-manifest.ts; locked by discovery-truth.test.ts).
     ...(hasCount ? { "x-catalog": { vertical: "experiences", honestCount } } : {}),
     "x-mcp-tools": registeredMcpTools("experiences").map((t) => t.name),
-    // Channels verified live on 2026-10-07 (HTTP 200 / registry lookup).
-    "x-distribution": [
-      {
-        channel: "custom-gpt",
-        url: OPPLEVAGENT_CUSTOM_GPT_URL,
-        install: OPPLEVAGENT_CUSTOM_GPT_URL,
-        status: "live",
-        description: "ChatGPT Custom GPT — Opplevagent experiences discovery; 3 Actions on opplevagent.no/openapi.json (discover/categories/get).",
-      },
-      {
-        channel: "npm",
-        url: "https://www.npmjs.com/package/opplevagent-mcp",
-        install: "npx opplevagent-mcp",
-        status: "live",
-        description: "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.",
-      },
-      {
-        channel: "official-mcp-registry",
-        url: "https://registry.modelcontextprotocol.io/v0/servers?search=opplevagent",
-        install: "npx opplevagent-mcp",
-        status: "live",
-        description: "Official Model Context Protocol Registry — io.github.slookisen/opplevagent-mcp.",
-      },
-      {
-        channel: "mcp-so",
-        url: "https://mcp.so/servers/opplevagent-mcp",
-        install: "npx opplevagent-mcp",
-        status: "live",
-        description: "mcp.so MCP servers directory listing.",
-      },
-      {
-        channel: "a2a-registry",
-        url: "https://a2aregistry.org/agents/38eee4e2-cb59-4562-90d1-416ce91ca2bd",
-        install: `${url}/.well-known/agent-card.json`,
-        status: "live",
-        description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
-      },
-      {
-        channel: "agenstry",
-        url: "https://agenstry.com/agents/opplevagent.no",
-        install: `${url}/.well-known/agent-card.json`,
-        status: "live",
-        description: "Agenstry A2A agent directory — auto-indexed from agent-card.json.",
-      },
-    ],
+    // Channels come from config/distribution-channels.ts (one source, each with a probe URL).
+    "x-distribution": distributionFor("experiences", `${url}/.well-known/agent-card.json`),
   };
   // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
   // sign the card exactly as assembled above (no `signatures` key present

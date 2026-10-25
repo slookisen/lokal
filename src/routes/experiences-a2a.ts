@@ -32,6 +32,7 @@ import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import {
+  discoverExperiences,
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
@@ -47,7 +48,13 @@ import {
   type DiscoverFilter,
   type GardssalgSearchFilter,
 } from "../services/experience-store";
-import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS, REGION_TO_KOMMUNER } from "../services/norway-fylke";
+import {
+  interpretDiscoverQuery,
+  isStockfishPurchase,
+  matchesAsWordPrefix,
+  parseExperiencesIntent,
+} from "../services/experiences-query-intent";
+import { foreignPlaceIn } from "../services/outside-norway";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
@@ -55,11 +62,17 @@ import { conversationService, buildRequestMeta, isInternalTraffic, type RequestM
 import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
-// Only isBookingPaused is used here (same import + reasoning as
+import { a2aMessageData } from "../utils/a2a-message";
+import { capFreeText, capName } from "../utils/free-text";
+import { rpcInternalErrorReply } from "../utils/internal-error";
+// The booking object (isBookingPaused under the hood, same as
 // experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
-// base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
-// call site never passes a catalog_hidden arg either.
-import { isBookingPaused } from "../services/booking-store";
+// base WHERE clause already excludes catalog_hidden=1 rows entirely, so no
+// catalog_hidden arg is needed. One shared note source (dev-request
+// 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7).
+import { gardssalgBookingStatus } from "../services/gardssalg-booking-gate";
+
+export { parseExperiencesIntent };
 
 const router = Router();
 
@@ -114,6 +127,19 @@ function rpcErr(id: unknown, code: number, message: string, data?: unknown) {
   return { jsonrpc: "2.0", error: err, id };
 }
 
+/**
+ * The answer to a request that failed inside the handler: JSON-RPC's generic
+ * -32603 "Internal error", without the detail. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the caller
+ * as `data`, as Finn-tannlege A2A's did until slice I-Y2. The detail is
+ * logged instead, without the request (`where` says which step failed;
+ * utils/internal-error.ts).
+ */
+function rpcInternalError(id: unknown, where: string, err: unknown) {
+  return rpcInternalErrorReply("experiences-a2a", id, where, err);
+}
+
 // ─── Zod envelope schema ─────────────────────────────────────
 
 const RpcEnvelopeSchema = z.object({
@@ -125,13 +151,18 @@ const RpcEnvelopeSchema = z.object({
 
 // ─── Text extractor (mirrors dental a2a.ts approach) ─────────
 
-const MAX_MESSAGE_TEXT = 2000; // cap free-text length (DoS hygiene)
+// The text is cut to MAX_FREE_TEXT_CHARS (2000) by the helper the three
+// platforms share (utils/free-text.ts, dev-request 2026-10-17-integrasjonstest-
+// oppfolging, slice I-Y), at a word boundary. This file used to cut at 2000
+// itself, in the middle of a word, and the piece before the cut was read
+// («Bergen» of «Bergensbanen» as the kommune). A word the cut splits is now
+// dropped whole.
 
 function extractText(msg: unknown): string | null {
-  if (typeof msg === "string") return msg.slice(0, MAX_MESSAGE_TEXT);
+  if (typeof msg === "string") return capFreeText(msg);
   if (msg && typeof msg === "object") {
     const m = msg as Record<string, unknown>;
-    if (typeof m.text === "string" && m.text) return m.text.slice(0, MAX_MESSAGE_TEXT);
+    if (typeof m.text === "string" && m.text) return capFreeText(m.text);
     if (Array.isArray(m.parts)) {
       for (const p of m.parts) {
         if (!p || typeof p !== "object") continue;
@@ -139,7 +170,7 @@ function extractText(msg: unknown): string | null {
         if (typeof part.text === "string" && part.text) {
           if (part.type !== undefined && part.type !== "text") continue;
           if (part.kind !== undefined && part.kind !== "text") continue;
-          return part.text.slice(0, MAX_MESSAGE_TEXT);
+          return capFreeText(part.text);
         }
       }
     }
@@ -148,152 +179,32 @@ function extractText(msg: unknown): string | null {
 }
 
 // ─── Intent parser ───────────────────────────────────────────
-// Extracts discovery parameters from a Norwegian/English natural-language
-// query. Keeps it simple: keyword matching on known fylker + signals.
+// parseExperiencesIntent() and its helpers (FYLKER, matchesAsWordPrefix,
+// detectKommune, detectRegion) live in services/experiences-query-intent.ts
+// (dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S1), shared with the
+// MCP tool. Re-exported here so existing callers keep importing it from this
+// router.
 
-const FYLKER = [
-  "oslo", "akershus", "østfold", "buskerud", "innlandet", "vestfold",
-  "telemark", "agder", "rogaland", "vestland", "møre og romsdal",
-  "trøndelag", "nordland", "troms", "finnmark", "svalbard",
-];
-
-// The indoor/outdoor keywords are short Norwegian substrings ("inne", "ute")
-// that collide with unrelated words — e.g. "finne" (to find) contains "inne",
-// which previously forced indoor_outdoor="indoor" on any query using the verb
-// "finne" (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering:
-// "hva kan vi finne på i Tromsø om vinteren?" wrongly excluded outdoor results).
-// JS's \b doesn't treat æøå as word characters, so a plain regex \b boundary
-// can't be used here. This checks the actual preceding character is not a
-// Unicode letter/digit, while leaving the keyword's own end open so inflected
-// continuations ("inne" + "ndørs" → "innendørs") still match.
-function matchesAsWordPrefix(haystack: string, keyword: string): boolean {
-  let from = 0;
-  for (;;) {
-    const idx = haystack.indexOf(keyword, from);
-    if (idx === -1) return false;
-    const precedingChar = idx > 0 ? haystack[idx - 1] : "";
-    if (!/[\p{L}\p{N}]/u.test(precedingChar)) return true;
-    from = idx + 1;
-  }
-}
-
-// Known kommune (city/municipality) display names, reused from
-// norway-fylke.ts rather than hand-rolling a second list. Checked BEFORE
-// the FYLKER substring loop below: a kommune name is the more specific
-// signal, and several kommune names substring-match into FYLKER (e.g.
-// "Tromsø" contains "troms"), which previously produced a wrong/
-// over-broad fylke instead of the intended kommune (the flagship demo
-// query "hva kan vi finne på i Tromsø om vinteren?" — dev-request
-// 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1).
-// Excludes traditional region/valley/district labels (Romsdal, Sunnmøre, …)
-// that appear in CITY_TO_FYLKE_RAW for fylke-resolution purposes but are
-// NOT themselves a literal DB `kommune` value — see NON_KOMMUNE_REGION_LABELS
-// in norway-fylke.ts for why (caught in PR #146 review: "Møre og Romsdal"
-// queries were regressing to a nonexistent `kommune: "Romsdal"` match).
-const KOMMUNE_NAMES: string[] = Object.keys(__FYLKE_INTERNAL.CITY_TO_FYLKE_RAW)
-  .filter(name => !NON_KOMMUNE_REGION_LABELS.has(name));
-
-// Detect a kommune name in `lower` (already-lowercased text) using the same
-// word-boundary-aware matching as the indoor/outdoor keywords. When several
-// kommune names match (e.g. short kommune "Os" is a substring-prefix of
-// "Oslo"), the LONGEST match wins — this resolves the common
-// short-name-inside-longer-name case without needing a full tokeniser.
-// NOTE: this does not fully solve general false positives from very short
-// kommune names that happen to be substring-prefixes of unrelated Norwegian
-// words with no longer kommune name present (e.g. "Os" inside "oster"/
-// "ost", or "Time" ["hour"] inside an unrelated "en time i ..." phrase) —
-// left out of scope per the dev-request (word-boundary matching already
-// eliminates the worse substring-inside-a-word bug class; full NLP
-// disambiguation of short ambiguous place names is a separate concern).
-function detectKommune(lower: string): string | null {
-  let best: string | null = null;
-  for (const display of KOMMUNE_NAMES) {
-    if (matchesAsWordPrefix(lower, display.toLowerCase())) {
-      if (!best || display.length > best.length) best = display;
-    }
-  }
-  return best;
-}
-
-// Curated tourist-region names (dev-request 2026-09-21-opplevagent-
-// discovery-regionnavn-utenfor-kommune-fylke) — see REGION_TO_KOMMUNER in
-// norway-fylke.ts for the region -> kommune-list mapping itself, and that
-// export's own doc comment for why this is a SEPARATE list from
-// KOMMUNE_NAMES rather than more fake 1:1 kommune synonyms. Checked with the
-// exact same word-boundary-aware technique as detectKommune() above (longest
-// match wins on the rare chance two region names both match).
-const REGION_NAMES: string[] = Object.keys(REGION_TO_KOMMUNER);
-
-function detectRegion(lower: string): string | null {
-  let best: string | null = null;
-  for (const display of REGION_NAMES) {
-    if (matchesAsWordPrefix(lower, display.toLowerCase())) {
-      if (!best || display.length > best.length) best = display;
-    }
-  }
-  return best;
-}
-
-export function parseExperiencesIntent(text: string): DiscoverFilter {
-  const lower = text.toLowerCase();
-  const params: DiscoverFilter = {};
-
-  // Kommune detection takes priority over fylke AND over a curated region
-  // match (see detectKommune above) — a caller who named an exact kommune
-  // shouldn't have it shadowed by a broader region/fylke constraint. Only
-  // when no kommune matched do we check for a curated multi-kommune region
-  // name (e.g. "Lofoten" -> its constituent kommuner, dev-request 2026-09-
-  // 21-opplevagent-discovery-regionnavn-utenfor-kommune-fylke); only when
-  // NEITHER a kommune NOR a region matched do we fall back to fylke
-  // detection, exactly as before this region-detection feature existed —
-  // so an existing kommune/fylke-only query (e.g. "Tromsø", "Finnmark")
-  // produces a byte-identical filter to before.
-  const kommune = detectKommune(lower);
-  if (kommune) {
-    params.kommune = kommune;
-  } else {
-    const region = detectRegion(lower);
-    if (region) {
-      params.kommuner = [...REGION_TO_KOMMUNER[region]];
-    } else {
-      // Fylke detection — only when no kommune or curated region matched.
-      for (const f of FYLKER) {
-        if (lower.includes(f)) {
-          params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
-          break;
-        }
-      }
-    }
-  }
-
-  // Weather detection
-  if (lower.includes("regn") || lower.includes("rain")) {
-    params.weather = "rain";
-  } else if (lower.includes("snø") || lower.includes("snow")) {
-    params.weather = "snow";
-  } else if (lower.includes("sol") || lower.includes("clear") || lower.includes("fint vær")) {
-    params.weather = "clear";
-  }
-
-  // Indoor / outdoor detection (word-prefix-aware — see matchesAsWordPrefix)
-  if (matchesAsWordPrefix(lower, "inne") || matchesAsWordPrefix(lower, "indoor")) {
-    params.indoor_outdoor = "indoor";
-  } else if (matchesAsWordPrefix(lower, "ute") || matchesAsWordPrefix(lower, "outdoor") || matchesAsWordPrefix(lower, "friluft")) {
-    params.indoor_outdoor = "outdoor";
-  }
-
-  // Season detection
-  if (lower.includes("vinter") || lower.includes("winter")) {
-    params.season = "winter";
-  } else if (lower.includes("sommer") || lower.includes("summer")) {
-    params.season = "summer";
-  } else if (lower.includes("vår") || lower.includes("spring")) {
-    params.season = "spring";
-  } else if (lower.includes("høst") || lower.includes("autumn") || lower.includes("fall")) {
-    params.season = "autumn";
-  }
-
-  return params;
+/**
+ * The search words of a message in which parseExperiencesIntent() found
+ * nothing ("hvalsafari"), read by interpretDiscoverQuery() — the interpreter
+ * discover_experiences and REST /discover?q= use (dev-request 2026-10-16-
+ * opplevagent-mcp-fritekst-query, S5). parseExperiencesIntent() itself is
+ * unchanged. Undefined, so the message keeps its count:0 answer:
+ *   - when it names a place outside Norway ("kongekrabbe i Russland") or asks
+ *     to buy food ("kjøpe tørrfisk"): the early returns of discover_experiences
+ *     and REST run before the interpreter (felles regel 3), and a Norwegian
+ *     row that mentions Russia must not answer a question about Russia;
+ *   - when the interpreter reads a place that parseExperiencesIntent() does
+ *     not know ("hvalsafari i Nord-Norge", "i Lyngen", "Hordaland"): the place
+ *     words are no search words there, so the rest alone would answer a place
+ *     question with rows from the whole country.
+ */
+function messageSearchTerms(text: string): string[] | undefined {
+  if (foreignPlaceIn(text) || isStockfishPurchase(text)) return undefined;
+  const read = interpretDiscoverQuery(text);
+  if (read.kommune || read.kommuner || read.fylke || read.fylker) return undefined;
+  return read.terms;
 }
 
 // ─── Gårdssalg intent detection (dev-request 2026-07-25-gardssalg-a2a-nl-
@@ -370,7 +281,8 @@ export function experiencesAskedSomething(result: object): boolean {
 function a2aRequestCountable(ipHash: string, meta: RequestMeta, params: unknown, result: object): boolean {
   const message = params && typeof params === "object" ? (params as Record<string, unknown>).message : undefined;
   const text = extractText(message);
-  const data = message && typeof message === "object" ? (message as Record<string, unknown>).data : undefined;
+  // A DataPart counts as message.data (I-X, utils/a2a-message.ts).
+  const data = a2aMessageData(message);
   return a2aLookupCountable({
     vertical: "experiences",
     ipHash,
@@ -404,11 +316,15 @@ export function handleExperiencesMessageSend(
   if (messageText) {
     filter = parseExperiencesIntent(messageText);
   } else if (message && typeof message === "object") {
-    const m = message as Record<string, unknown>;
-    if (m.data && typeof m.data === "object") {
-      const d = m.data as Record<string, unknown>;
-      if (typeof d.fylke === "string") filter.fylke = d.fylke;
-      if (typeof d.kommune === "string") filter.kommune = d.kommune;
+    // message.data, or the first standard DataPart (I-X, utils/a2a-message.ts).
+    const data = a2aMessageData(message);
+    if (data && typeof data === "object") {
+      const d = data as Record<string, unknown>;
+      // Slice I-Y2: the data's strings are cut to MAX_FREE_TEXT_CHARS
+      // (utils/a2a-message.ts), and the place names to MAX_NAME_CHARS
+      // (utils/free-text.ts), as in discover_experiences.
+      if (typeof d.fylke === "string") filter.fylke = capName(d.fylke);
+      if (typeof d.kommune === "string") filter.kommune = capName(d.kommune);
       if (typeof d.category === "string") filter.category = d.category;
       if (d.indoor_outdoor === "indoor" || d.indoor_outdoor === "outdoor" || d.indoor_outdoor === "both") {
         filter.indoor_outdoor = d.indoor_outdoor;
@@ -456,8 +372,7 @@ export function handleExperiencesMessageSend(
         metadata: { skill: "opplevelser_categories" },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (opplevelser_categories)", err);
     }
   }
 
@@ -499,8 +414,7 @@ export function handleExperiencesMessageSend(
         metadata: { skill: "opplevelser_info", id: idMatch[1] },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (opplevelser_info)", err);
     }
   }
 
@@ -536,9 +450,10 @@ export function handleExperiencesMessageSend(
       let gLng = typeof filter.lng === "number" ? filter.lng : undefined;
       let gRadiusKm = typeof filter.radius_km === "number" ? filter.radius_km : undefined;
       if ((gLat === undefined || gLng === undefined) && message && typeof message === "object") {
-        const m = message as Record<string, unknown>;
-        if (m.data && typeof m.data === "object") {
-          const d = m.data as Record<string, unknown>;
+        // message.data, or the first standard DataPart (I-X, utils/a2a-message.ts).
+        const data = a2aMessageData(message);
+        if (data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
           if (typeof d.lat === "number") gLat = d.lat;
           if (typeof d.lng === "number") gLng = d.lng;
           if (typeof d.radius_km === "number") gRadiusKm = d.radius_km;
@@ -560,11 +475,10 @@ export function handleExperiencesMessageSend(
           : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
 
       // Per-row shape mirrors discover_gardssalg (experiences-mcp.ts)
-      // EXACTLY — same field names, same isBookingPaused()-derived booking
+      // EXACTLY — same field names, same gardssalgBookingStatus()-derived booking
       // object, same bilingual notes, same profile_url template, same
       // hasGeo-gated distance_km.
       const producers = results.map((row) => {
-        const live = !isBookingPaused(row.booking_live);
         return {
           // provider_id for book_gardssalg / POST /api/opplevelser/book (added
           // 2026-09-16, dev-request …-en-setning-booking-via-ai — same
@@ -580,13 +494,7 @@ export function handleExperiencesMessageSend(
           lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
           lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
           geocode_confidence: row.geocode_confidence ?? null,
-          booking: {
-            live,
-            mode: live ? ("request" as const) : ("paused" as const),
-            note: live
-              ? "Book direkte. / Book directly."
-              : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-          },
+          booking: gardssalgBookingStatus(row),
           profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
           ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
         };
@@ -616,8 +524,7 @@ export function handleExperiencesMessageSend(
         },
       });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return rpcErr(id, -32603, "Internal error", msg);
+      return rpcInternalError(id, "message/send (gardssalg_discover)", err);
     }
   }
 
@@ -634,11 +541,60 @@ export function handleExperiencesMessageSend(
     // reaches here with non-empty messageText, so it is unaffected — see the
     // messageText/filter construction above.
     if (messageText && messageText.trim().length > 0 && Object.keys(filter).length === 0) {
-      const summaryText =
-        "Fant ingen gjenkjennelige søkekriterier i spørringen (kommune/fylke, sesong, vær, inne/ute) — ingen treff. " +
-        "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
-        "No recognisable search criteria in the query (kommune/fylke, season, weather, indoor/outdoor) — no matches. " +
-        'Try e.g. "what can we do in Tromsø in winter?".';
+      // dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S5: first the
+      // message's search words (messageSearchTerms). Every word must be in
+      // the row (discoverExperiences, not the relaxed search): dropping words
+      // until something matches would turn "zzzqqq ingen treff xyzzy" into
+      // the rows that happen to say "ingen".
+      const textTerms = messageSearchTerms(messageText);
+      const keywordHits = textTerms ? discoverExperiences({ text_terms: textTerms }, 20) : [];
+      if (textTerms && keywordHits.length > 0) {
+        const termList = textTerms.join(", ");
+        const keywordSummary =
+          `Fant ${keywordHits.length} opplevelse(r) som inneholder søkeordene (${termList}). ` +
+          "Spørringen nevner verken kommune/fylke, sesong, vær eller inne/ute. / " +
+          `Found ${keywordHits.length} experience(s) containing the search words (${termList}). ` +
+          "The query names no kommune/fylke, season, weather or indoor/outdoor.";
+
+        try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText, ctx }); } catch { /* fail-open: never affects the response */ }
+
+        return rpcOk(id, {
+          taskId: `experiences-discover-${Date.now()}`,
+          status: { state: "completed", timestamp: new Date().toISOString() },
+          artifacts: [
+            {
+              artifactId: "discover-summary",
+              name: "experience-discover-summary",
+              parts: [{ kind: "text", text: keywordSummary }],
+            },
+            {
+              artifactId: "discover-results",
+              name: "experience-discover-results",
+              parts: [{
+                kind: "data",
+                // A text message has no origin: no distance fields (as hasGeo below).
+                data: { count: keywordHits.length, experiences: keywordHits.map(({ distance_km, geo_precision, ...rest }) => rest) },
+              }],
+            },
+          ],
+          metadata: {
+            skill: "opplevelser_discover",
+            filter: { text_terms: textTerms },
+            parsedFrom: messageText,
+          },
+        });
+      }
+
+      // Search words that were tried and matched nothing get their own text.
+      const summaryText = textTerms
+        ? "Spørringen nevner verken kommune/fylke, sesong, vær eller inne/ute, og ingen opplevelse inneholder alle søkeordene i den — ingen treff. " +
+          "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
+          "The query names no kommune/fylke, season, weather or indoor/outdoor, and no experience contains all of its search words — no matches. " +
+          'Try e.g. "what can we do in Tromsø in winter?".'
+        : "Fant ingen gjenkjennelige søkekriterier i spørringen (kommune/fylke, sesong, vær, inne/ute) — ingen treff. " +
+          "Prøv f.eks. «hva kan vi finne på i Tromsø om vinteren?». / " +
+          "No recognisable search criteria in the query (kommune/fylke, season, weather, indoor/outdoor) — no matches. " +
+          'Try e.g. "what can we do in Tromsø in winter?".';
 
       try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
 
@@ -761,8 +717,7 @@ export function handleExperiencesMessageSend(
       },
     });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return rpcErr(id, -32603, "Internal error", msg);
+    return rpcInternalError(id, "message/send (opplevelser_discover)", err);
   }
 }
 
@@ -827,8 +782,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         res.json(rpcErr(id, -32601, `Method not found: ${method}`));
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    res.json(rpcErr(id, -32603, "Internal error", msg));
+    res.json(rpcInternalError(id, "POST /a2a", err));
   }
 });
 

@@ -188,6 +188,14 @@ export async function runSearchTrackingTests(opts: { log?: boolean } = {}): Prom
     const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
     dbFactory.__resetDbFactoryForTesting();
     dbFactory.getDb("dental");
+    // One more «implantat» clinic than a page holds, so /sok?q=implantat&side=2
+    // below is a real page 2: a page past the last one is page 1 (dev-request
+    // 2026-10-17-dental-d3-rettelser, D3b) and would be logged as a search.
+    const dentalStore = require("./dental-store") as typeof import("./dental-store");
+    const { DENTAL_LANDING_CONFIG } = require("../config/dental-landing") as typeof import("../config/dental-landing");
+    for (let i = 0; i <= DENTAL_LANDING_CONFIG.listPageSize; i++) {
+      dentalStore.createDentalAgent({ navn: `Implantat Klinikk ${i} AS`, org_nr: String(918980000 + i), poststed: "OSLO", fylke: "Oslo" } as any);
+    }
     // The rfb search page reads the vertical config (src/index.ts loads it at boot).
     const cfgMod = require("../config/vertical-config") as typeof import("../config/vertical-config");
     cfgMod._resetConfigCacheForTests();

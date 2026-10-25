@@ -75,6 +75,26 @@
  *       the cohort: through the real in-process route a stored e-mail/phone
  *       is never replaced, a blank one is filled, and a matched producer
  *       outside the cohort (already contacted) is left alone
+ *   (hc) held pool rows: a content-qualified row whose stored categories lack
+ *       homepage corroboration is routed to content_refresh (not on a social/
+ *       directory host, not on our own domain, site answers); through the
+ *       real executor the stored list is corroborated (provenance only, list
+ *       unchanged) or left alone when the page does not support it — never
+ *       replaced, also on thin rows the old rule takes; a thin row on a
+ *       social host is refused (directory/social host); both outcomes are
+ *       tallied in the step's envelope claim
+ *   (pn) generic products (dev-request 2026-10-15-rfb-generiske-produktnavn-
+ *       ekte-navn-fra-nettsted): a generic-products row reserves ONE model
+ *       call; with a stubbed extractor real names found verbatim on the page
+ *       replace the generic list (products_replaced, website_homepage
+ *       provenance), off-page names are dropped, an all-category-names result
+ *       is rejected, a facebook homepage is refused before any call, a row
+ *       with real products makes none; calls are counted (by_source
+ *       product-list-extractor), the cap holds (the row that does not fit
+ *       waits unstamped, the step goes on), no API key → no call; the real
+ *       extractor's mapping (stubbed model API: sentinel / [] → none,
+ *       unparseable / API error → failed); an empty answer is stamped
+ *       products_not_supported_by_homepage, a failed call stays transient
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-enrichment-nightly.test.ts
@@ -138,6 +158,8 @@ const ENV_KEYS = [
   "RFB_ENRICHMENT_LLM_USD_PER_CALL",
   "RFB_ENRICHMENT_NIGHTLY_HOURS_UTC",
   "RFB_SECOND_LINE_VERIFICATION_ENABLED",
+  // Cleared for every block (restored after): no block may reach a real model.
+  "ANTHROPIC_API_KEY",
 ] as const;
 type EnvKey = (typeof ENV_KEYS)[number];
 
@@ -223,6 +245,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       city?: string;
       vertical_id?: string;
       catalog_hidden?: number;
+      categories?: string | null;
       k?:
         | false
         | {
@@ -238,6 +261,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
             curated_fields?: string | null;
             enrichment_status?: string;
             phone?: string | null;
+            field_provenance?: string;
           };
     } = {},
   ): void {
@@ -261,6 +285,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
     if (o.vertical_id !== undefined) cols.vertical_id = o.vertical_id;
     if (o.catalog_hidden !== undefined) cols.catalog_hidden = o.catalog_hidden;
     if (o.city !== undefined) cols.city = o.city;
+    if (o.categories !== undefined) cols.categories = o.categories;
     const names = Object.keys(cols);
     db.prepare(`INSERT INTO agents (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`).run(
       ...names.map((n) => cols[n]),
@@ -280,6 +305,7 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       "curated_fields",
       "enrichment_status",
       "phone",
+      "field_provenance",
     ] as const) {
       if ((k as any)[key] !== undefined) kc[key] = (k as any)[key];
     }
@@ -385,8 +411,8 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       );
       assertEq(
         job.RFB_ENRICHMENT_STEP_ORDER.map((s) => job.rfbEnrichmentLlmCallsPerRowMax(s)),
-        [0, 0, 1, 0, 1, 0, 0],
-        "a7: per-row LLM worst case: Brreg + contact extraction 1, verify 0 with the second line off",
+        [0, 0, 1, 0, 1, 1, 0],
+        "a7: per-row LLM worst case: Brreg + contact extraction 1, content refresh 1 (the product-name call, generic-products rows only — dev-request 2026-10-15-rfb-generiske-produktnavn), verify 0 with the second line off",
       );
       setEnv({ RFB_SECOND_LINE_VERIFICATION_ENABLED: "true" });
       assertEq(job.rfbEnrichmentLlmCallsPerRowMax("reverify"), 1, "a7: verify 1 when the second line is on");
@@ -1337,6 +1363,379 @@ export async function runRfbEnrichmentNightlyTests(opts: { log?: boolean } = {})
       const bs = rb.steps.find((x) => x.step === "brreg_contact")!;
       assertEq([bs.selected, calls.length, bs.attempted, bs.stopped_reason], [6, 3, 3, "brreg_unavailable"], "z5 (R3-NB1): three consecutive fetch failures stop the Brreg step; nothing after them runs");
       assertEq(count("rfb_enrichment_nightly_attempts"), 0, "z5: and none of the three is parked");
+    });
+
+    // ── (hc) held pool rows: uncorroborated categories → content_refresh ──
+    await withDb("hc", async () => {
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10" });
+      const cvs = require("./cross-source-validator") as typeof import("./cross-source-validator");
+      const REAL3 = JSON.stringify([{ name: "Lammepølse" }, { name: "Spekeskinke" }, { name: "Eplemost" }]);
+      // about/description already homepage-sourced, so the refresh writes
+      // nothing but (possibly) the categories provenance on these rows.
+      const hp = (v: string) => [{ source_type: "website_homepage", value: v, fetched_at: "2026-01-01T00:00:00.000Z" }];
+      const TEXT_HP = { about: hp(LONG_ABOUT), description: hp(LONG_ABOUT) };
+      const NO_CATS = JSON.stringify(TEXT_HP);
+      const HP = JSON.stringify({ ...TEXT_HP, categories: hp("vegetables") });
+      const pool = (id: string, o: { site?: string; cats?: string; prov?: string; about?: string; products?: string; status?: number } = {}) =>
+        seedAgent(id, {
+          categories: o.cats ?? JSON.stringify(["vegetables"]),
+          k: {
+            website: o.site ?? `https://${id}.no`,
+            email: `post@${id}.no`,
+            about: o.about ?? LONG_ABOUT,
+            products: o.products ?? REAL3,
+            url_last_status: o.status ?? 200,
+            url_last_probed: "2026-10-11T00:00:00Z",
+            field_provenance: o.prov ?? NO_CATS,
+          },
+        });
+      pool("hc-pool");
+      pool("hc-fruit", { cats: JSON.stringify(["fruit", "berries"]) });
+      pool("hc-fb", { site: "https://www.facebook.com/hc-gard" });
+      pool("hc-dir", { site: "https://www.1881.no/hc-gard" });
+      pool("hc-corr", { prov: HP });
+      pool("hc-thin", { prov: HP, about: "", products: "[]" });
+      pool("hc-own", { site: "https://rettfrabonden.com/produsent/hc-own" });
+      pool("hc-dead", { status: 404 });
+      pool("hc-nocats", { cats: "[]" });
+      pool("hc-mixed", { cats: JSON.stringify(["fruit"]), prov: "{}" }); // about text not homepage-sourced yet
+      // Thin rows (taken by the OLD rule, before any host check): one on a
+      // social-media host, one whose stored categories the page contradicts.
+      pool("hc-thin-fb", { site: "https://www.facebook.com/hc-thin-gard", about: "", products: "[]" });
+      pool("hc-thin-uncorr", { cats: JSON.stringify(["fruit"]), about: "", products: "[]" });
+      const p = await job.buildRfbEnrichmentPreview(db, NIGHT);
+      const pc = p.steps.find((x) => x.step === "content_refresh")!;
+      assertEq(
+        pc.selected_ids,
+        ["hc-pool", "hc-fruit", "hc-thin", "hc-mixed", "hc-thin-fb", "hc-thin-uncorr"],
+        "hc1: content-qualified rows with uncorroborated categories are eligible; corroborated / no categories / own domain / dead site are not; the old condition (thin content) still applies",
+      );
+      assertEq(pc.skipped, { skipped_directory_or_social_host: 2 }, "hc1: a social / directory homepage is counted as skipped_directory_or_social_host, never selected");
+
+      const PAGE =
+        `<html><head><title>Grønt Gård</title></head><body><h1>Grønt Gård</h1>` +
+        `<p>Vi selger grønnsaker, honning og lammekjøtt rett fra gården.</p></body></html>`;
+      const fetched: string[] = [];
+      (globalThis as any).fetch = async (url: any) => {
+        fetched.push(String(url));
+        return new Response(PAGE, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      };
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT });
+      const st = r.steps.find((x) => x.step === "content_refresh")!;
+      const cats = (id: string) => (db.prepare(`SELECT categories FROM agents WHERE id = ?`).get(id) as { categories: string }).categories;
+      const prov = (id: string) => (db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(id) as { field_provenance: string }).field_provenance;
+      assertEq(
+        st.outcomes,
+        { categories_corroborated: 1, categories_not_supported_by_homepage: 3, unchanged: 1, refreshed: 1 },
+        "hc2: the real executor reports categories_corroborated and categories_not_supported_by_homepage as their own outcomes (hc-thin: corroborated already, unchanged; hc-mixed: about written → refreshed)",
+      );
+      assertEq(
+        st.extra?.categories_corroboration,
+        { corroborated: 1, categories_not_supported_by_homepage: 4 },
+        "hc2: extra.categories_corroboration tallies every row, also the refreshed one whose categories the page did not support",
+      );
+      assertEq(
+        [JSON.parse(cats("hc-mixed")), JSON.parse(prov("hc-mixed")).categories, typeof JSON.parse(prov("hc-mixed")).about],
+        [["fruit"], undefined, "object"],
+        "hc2: hc-mixed — about written as today, categories left alone",
+      );
+      assertTrue(
+        !fetched.some((u) => u.includes("facebook.com/hc-gard") || u.includes("1881.no") || u.includes("rettfrabonden.com")),
+        "hc2: no social / directory / own-domain page was fetched for the new routing",
+      );
+      assertEq(JSON.parse(cats("hc-pool")), ["vegetables"], "hc3: corroborated — stored [vegetables] unchanged (the page's meat/honey are not added)");
+      assertEq(
+        (JSON.parse(prov("hc-pool")).categories as any[]).map((x: any) => [x.source_type, x.value, x.source_url]),
+        [["website_homepage", "vegetables", "https://hc-pool.no"]],
+        "hc3: a website_homepage source with the page URL was recorded",
+      );
+      assertEq(cvs.categoriesLackWebsiteCorroboration(cats("hc-pool"), prov("hc-pool")), false, "hc3: the row now passes categoriesLackWebsiteCorroboration");
+      assertEq(
+        [JSON.parse(cats("hc-fruit")), JSON.parse(prov("hc-fruit")).categories, cvs.categoriesLackWebsiteCorroboration(cats("hc-fruit"), prov("hc-fruit"))],
+        [["fruit", "berries"], undefined, true],
+        "hc4: not supported — nothing written for categories and the gate still holds the row",
+      );
+      assertTrue(st.changed_agent_ids.includes("hc-pool") && !st.changed_agent_ids.includes("hc-fruit"), "hc5: only the corroborated row counts as changed (goes on to re-verification)");
+      const stamped = db
+        .prepare(`SELECT agent_id, last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'content_refresh' AND agent_id IN ('hc-pool', 'hc-fruit') ORDER BY agent_id`)
+        .all();
+      assertEq(
+        stamped,
+        [
+          { agent_id: "hc-fruit", last_outcome: "categories_not_supported_by_homepage" },
+          { agent_id: "hc-pool", last_outcome: "categories_corroborated" },
+        ],
+        "hc6: both are real per-row outcomes (stamped — the retry window applies)",
+      );
+      const env = db.prepare(`SELECT claims FROM runs WHERE run_id = ?`).get(r.run_id) as { claims: string };
+      const claim = JSON.parse(env.claims).find((c: any) => c.meta?.kind === "rfb_enrichment_step_content_refresh");
+      assertEq(
+        [claim?.meta?.outcomes?.categories_corroborated, claim?.meta?.rejected_reasons?.categories_not_supported_by_homepage, "categories_corroborated" in (claim?.meta?.rejected_reasons ?? {}), claim?.meta?.extra?.categories_corroboration],
+        [1, 3, false, { corroborated: 1, categories_not_supported_by_homepage: 4 }],
+        "hc7: the envelope claim shows both (corroborated counts as written, not supported as a rejected reason)",
+      );
+      // B1: a thin row on a social host is still taken by the old rule and
+      // fetched, but its page never corroborates anything.
+      const rowOf = (id: string) => st.rows.find((x) => x.agent_id === id);
+      assertEq(
+        [rowOf("hc-thin-fb")?.outcome, rowOf("hc-thin-fb")?.detail, JSON.parse(cats("hc-thin-fb")), JSON.parse(prov("hc-thin-fb")).categories],
+        ["categories_not_supported_by_homepage", "categories_not_supported_by_homepage (directory/social host)", ["vegetables"], undefined],
+        "hc8 (B1): thin row on facebook.com — no website_homepage source for its categories, refused as directory/social host",
+      );
+      // Deliberate narrowing: R6 no longer REPLACES uncorroborated categories on
+      // thin rows (the route without the option would write [meat, vegetables, honey]).
+      assertEq(
+        [rowOf("hc-thin-uncorr")?.outcome, JSON.parse(cats("hc-thin-uncorr")), JSON.parse(prov("hc-thin-uncorr")).categories],
+        ["categories_not_supported_by_homepage", ["fruit"], undefined],
+        "hc9: thin uncorroborated row — R6 corroborates or leaves alone, never replaces (stored [fruit] kept, page's [meat, vegetables, honey] not written)",
+      );
+    });
+
+    // ── (pn) generic products → real names from the producer's own page ──
+    // dev-request 2026-10-15-rfb-generiske-produktnavn-ekte-navn-fra-nettsted.
+    // The model call is a stub injected through deps.productNameExtractor; it
+    // notes one product-list-extractor call on the run's meter, exactly where
+    // the real helper does (right before its request).
+    await withDb("pn", async () => {
+      const hp = (v: string) => [{ source_type: "website_homepage", value: v, fetched_at: "2026-01-01T00:00:00.000Z" }];
+      // about/description/categories already homepage-sourced: only products can change.
+      const PROV = JSON.stringify({ about: hp(LONG_ABOUT), description: hp(LONG_ABOUT), categories: hp("dairy") });
+      const GEN_DAIRY = JSON.stringify([{ name: "Meieri", category: "dairy", seasonal: false }]);
+      const GEN_EGGS = JSON.stringify([{ name: "Egg", category: "eggs", seasonal: false }]);
+      const REAL3 = JSON.stringify([{ name: "Lammepølse" }, { name: "Spekeskinke" }, { name: "Eplemost" }]);
+      const pnRow = (id: string, o: { products: string; site?: string; cats?: string; prov?: string }) =>
+        seedAgent(id, {
+          categories: o.cats ?? JSON.stringify(["dairy"]),
+          k: {
+            website: o.site ?? `https://${id}.no`,
+            email: `post@${id}.no`,
+            about: LONG_ABOUT,
+            products: o.products,
+            url_last_status: 200,
+            url_last_probed: "2026-10-11T00:00:00Z",
+            field_provenance: o.prov ?? PROV,
+          },
+        });
+      const page = (body: string) =>
+        `<html><head><title>Gård</title></head><body><h1>Gården</h1><p>${body}</p></body></html>`;
+      const PAGES: Record<string, string> = {
+        "pn-hag.no": page("Fra fjøset: Helmelk, Skummamelk og Sjokolademelk. [hag]"),
+        "pn-genres.no": page("Vi selger egg og honning. [genres]"),
+        "www.facebook.com": page("Helmelk og Skummamelk på Facebook. [fb]"),
+        "pn-real.no": page("Lammepølse og spekeskinke. [real]"),
+        "pn-c1.no": page("Gårdsegg og honning fra egne bikuber. [c1]"),
+        "pn-c2.no": page("Gårdsegg og honning fra egne bikuber. [c2]"),
+        "pn-real2.no": page("Lammepølse. [real2]"),
+        "pn-nokey.no": page("Helmelk. [nokey]"),
+      };
+      const fetched: string[] = [];
+      (globalThis as any).fetch = async (url: any) => {
+        const u = new URL(String(url));
+        fetched.push(u.host);
+        if (u.host.includes("anthropic")) throw new Error("a real model API must never be called from this test");
+        return new Response(PAGES[u.host] ?? page("Velkommen."), { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      };
+      const llmCalls: string[] = [];
+      const ANSWERS: Record<string, any> = {
+        "[hag]": { outcome: "names", names: ["Helmelk", "Skummamelk", "Sjokolademelk", "Kakao"] }, // Kakao is not on the page
+        "[genres]": { outcome: "names", names: ["Egg", "Honning"] }, // only category names
+        "[c1]": { outcome: "names", names: ["Gårdsegg"] },
+        "[c2]": { outcome: "names", names: ["Gårdsegg"] },
+        "[fb]": { outcome: "names", names: ["Helmelk"] },
+        "[nokey]": { outcome: "names", names: ["Helmelk"] },
+      };
+      const stubExtractor = async (text: string) => {
+        meterMod.noteLlmCall("product-list-extractor");
+        const key = Object.keys(ANSWERS).find((k) => text.includes(k));
+        llmCalls.push(key ?? "?");
+        return key ? ANSWERS[key] : { outcome: "none" as const };
+      };
+      const products = (id: string) => (db.prepare(`SELECT products FROM agent_knowledge WHERE agent_id = ?`).get(id) as { products: string }).products;
+      const provOf = (id: string) => JSON.parse((db.prepare(`SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?`).get(id) as { field_provenance: string }).field_provenance);
+      const stampOf = (id: string) =>
+        (db.prepare(`SELECT last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'content_refresh' AND agent_id = ?`).get(id) as { last_outcome: string } | undefined)?.last_outcome ?? null;
+
+      // per-row reservation (pure)
+      setEnv({ ANTHROPIC_API_KEY: "test-key-never-sent" });
+      const cohortRow = (products: string) => ({ products } as any);
+      assertEq(
+        [
+          job.rfbEnrichmentRowLlmCallsMax("content_refresh", cohortRow(GEN_DAIRY)),
+          job.rfbEnrichmentRowLlmCallsMax("content_refresh", cohortRow(REAL3)),
+          job.rfbEnrichmentRowLlmCallsMax("content_refresh", cohortRow("[]")),
+          job.rfbEnrichmentRowLlmCallsMax("brreg_contact", cohortRow(GEN_DAIRY)),
+        ],
+        [1, 0, 0, 1],
+        "pn0: content_refresh reserves ONE model call only for a generic-products row",
+      );
+      setEnv({});
+      assertEq(job.rfbEnrichmentRowLlmCallsMax("content_refresh", cohortRow(GEN_DAIRY)), 0, "pn0: no ANTHROPIC_API_KEY → no reservation (the row runs without the call)");
+
+      // Night 1: budget enough.
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10", ANTHROPIC_API_KEY: "test-key-never-sent" });
+      pnRow("pn-hag", { products: GEN_DAIRY });
+      pnRow("pn-genres", { products: GEN_EGGS });
+      pnRow("pn-fb", { products: GEN_DAIRY, site: "https://www.facebook.com/pn-fb" });
+      // non-generic products; held only on uncorroborated categories
+      pnRow("pn-real", { products: REAL3, prov: JSON.stringify({ about: hp(LONG_ABOUT), description: hp(LONG_ABOUT) }) });
+      const r1 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT, deps: { productNameExtractor: stubExtractor } });
+      const st1 = r1.steps.find((x) => x.step === "content_refresh")!;
+      const rowOf = (st: any, id: string) => st.rows.find((x: any) => x.agent_id === id);
+      assertEq(llmCalls.slice().sort(), ["[genres]", "[hag]"], "pn1: the model is called for the two generic rows on their own sites — not for the facebook homepage, not for the row with real products");
+      assertEq(
+        JSON.parse(products("pn-hag")),
+        [
+          { name: "Helmelk", category: "dairy", seasonal: false },
+          { name: "Skummamelk", category: "dairy", seasonal: false },
+          { name: "Sjokolademelk", category: "dairy", seasonal: false },
+        ],
+        "pn2: real names found verbatim on the page replace the generic [Meieri] (Kakao, not on the page, filtered out); category from the generic list",
+      );
+      assertEq(
+        (provOf("pn-hag").products as any[]).map((x: any) => [x.source_type, x.value, x.source_url]),
+        [["website_homepage", "Helmelk, Skummamelk, Sjokolademelk", "https://pn-hag.no"]],
+        "pn2: products provenance: website_homepage with the page source_url",
+      );
+      assertEq([rowOf(st1, "pn-hag")?.outcome, stampOf("pn-hag"), st1.changed_agent_ids.includes("pn-hag")], ["products_replaced", "products_replaced", true], "pn3: outcome products_replaced, stamped, row goes on to re-verification");
+      assertEq(
+        [rowOf(st1, "pn-genres")?.outcome, products("pn-genres"), stampOf("pn-genres")],
+        ["products_not_supported_by_homepage", GEN_EGGS, "products_not_supported_by_homepage"],
+        "pn4: a result that is itself only category names (Egg, Honning) is rejected — nothing written, stamped (14-day retry)",
+      );
+      assertEq(
+        [rowOf(st1, "pn-fb")?.outcome, String(rowOf(st1, "pn-fb")?.detail ?? "").includes("directory/social host"), products("pn-fb")],
+        ["products_not_supported_by_homepage", true, GEN_DAIRY],
+        "pn5: a facebook homepage is refused before any model call (directory/social host)",
+      );
+      assertTrue(rowOf(st1, "pn-real") !== undefined && !String(rowOf(st1, "pn-real")?.outcome).startsWith("products_"), "pn6: the row with real products runs as before, no product step");
+      assertEq(
+        st1.extra?.product_names,
+        { products_replaced: 1, products_not_supported_by_homepage: 2 },
+        "pn7: extra.product_names tallies the product outcomes",
+      );
+      assertEq(
+        [r1.llm.calls, r1.llm.by_source, st1.llm_calls, job.readRfbEnrichmentNightLlmCounter(db, NIGHT)],
+        [2, { "product-list-extractor": 2 }, 2, 2],
+        "pn8: the calls are counted (by_source product-list-extractor, step llm_calls) and the durable counter settles to the real calls (the refused row's reservation released)",
+      );
+      const env1 = db.prepare(`SELECT claims FROM runs WHERE run_id = ?`).get(r1.run_id) as { claims: string };
+      const claims1 = JSON.parse(env1.claims);
+      const llmClaim = claims1.find((c: any) => c.meta?.kind === "rfb_enrichment_llm_calls");
+      const crClaim = claims1.find((c: any) => c.meta?.kind === "rfb_enrichment_step_content_refresh");
+      assertEq(
+        [llmClaim?.value, llmClaim?.meta?.by_source, crClaim?.meta?.outcomes?.products_replaced, "products_replaced" in (crClaim?.meta?.rejected_reasons ?? {}), crClaim?.meta?.extra?.product_names],
+        [2, { "product-list-extractor": 2 }, 1, false, { products_replaced: 1, products_not_supported_by_homepage: 2 }],
+        "pn9: the envelope: rfb_enrichment_llm_calls by_source, products_replaced counts as written, the tally in extra",
+      );
+      assertTrue(!fetched.some((h) => h.includes("anthropic")), "pn9: no model API request left the process");
+
+      // Night 2: LLM cap 1 — the second generic row waits, the others go on.
+      llmCalls.length = 0;
+      const NIGHT2 = new Date("2026-10-13T00:10:00Z");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10", RFB_ENRICHMENT_LLM_CAP: "1", ANTHROPIC_API_KEY: "test-key-never-sent" });
+      pnRow("pn-c1", { products: GEN_EGGS });
+      pnRow("pn-c2", { products: GEN_EGGS });
+      pnRow("pn-real2", { products: REAL3, prov: JSON.stringify({ about: hp(LONG_ABOUT), description: hp(LONG_ABOUT) }) });
+      const r2 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT2, deps: { productNameExtractor: stubExtractor } });
+      const st2 = r2.steps.find((x) => x.step === "content_refresh")!;
+      const capped = ["pn-c1", "pn-c2"].filter((id) => !rowOf(st2, id));
+      assertEq([llmCalls.length, r2.llm.calls, r2.llm.cap, r2.llm.cap_reached], [1, 1, 1, true], "pn10: the cap holds — exactly one model call with a cap of 1");
+      assertEq(
+        [capped.length, capped.map(stampOf), st2.extra?.product_names?.skipped_llm_cap],
+        [1, [null], 1],
+        "pn10: the generic row that no longer fits is not attempted and not stamped (retried another night); counted as skipped_llm_cap",
+      );
+      assertTrue(rowOf(st2, "pn-real2") !== undefined && st2.skipped_reason === null, "pn10: the step still runs the row that needs no model call");
+      const done2 = ["pn-c1", "pn-c2"].find((id) => rowOf(st2, id))!;
+      assertEq(
+        JSON.parse(products(done2)).map((p: any) => [p.name, p.category]),
+        [["Gårdsegg", "eggs"]],
+        "pn11: «Gårdsegg» is found on the page (same folding: å) and written; category eggs from the generic list's single category [Egg] (the fallback — «gårdsegg» has no keyword of its own)",
+      );
+
+      // Night 3: no API key — no call, the row runs without it.
+      llmCalls.length = 0;
+      const NIGHT3 = new Date("2026-10-14T00:10:00Z");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10" });
+      pnRow("pn-nokey", { products: GEN_DAIRY });
+      const r3 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT3, deps: { productNameExtractor: stubExtractor } });
+      const st3 = r3.steps.find((x) => x.step === "content_refresh")!;
+      assertEq(
+        [llmCalls.length, r3.llm.calls, products("pn-nokey"), rowOf(st3, "pn-nokey") !== undefined, rowOf(st3, capped[0]) !== undefined, (st3.extra?.product_names as any)?.skipped_no_api_key],
+        [0, 0, GEN_DAIRY, true, true, 2],
+        "pn12: without ANTHROPIC_API_KEY no model call is made; the rows still run (skipped_no_api_key: pn-nokey and the row that waited for budget on night 2)",
+      );
+
+      // pn13 — the real extractor's mapping (review round: (b) + N1). The
+      // model API is a stub on the global fetch — no request leaves the process.
+      setEnv({ ANTHROPIC_API_KEY: "test-key-never-sent" });
+      let modelAnswer: () => Promise<Response> = async () => new Response("{}", { status: 500 });
+      let modelRequests = 0;
+      const pageFetch = (globalThis as any).fetch;
+      (globalThis as any).fetch = async (url: any, init?: any) => {
+        if (new URL(String(url)).host === "api.anthropic.com") {
+          modelRequests++;
+          return modelAnswer();
+        }
+        return pageFetch(url, init);
+      };
+      const textAnswer = (text: string) => async () =>
+        new Response(JSON.stringify({ content: [{ type: "text", text }], stop_reason: "end_turn" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      const mapping: Array<[string, () => Promise<Response>, unknown]> = [
+        ["names", textAnswer(JSON.stringify(["Helmelk", "Skummamelk"])), { outcome: "names", names: ["Helmelk", "Skummamelk"] }],
+        ["sentinel", textAnswer("INGEN_PRODUKTER_FUNNET"), { outcome: "none" }],
+        ["literal []", textAnswer("[]"), { outcome: "none", detail: "empty_after_filter" }],
+        ["array of blanks", textAnswer(JSON.stringify(["", " ", 7])), { outcome: "none", detail: "empty_after_filter" }],
+        ["prose (not JSON)", textAnswer("Produktene er Helmelk og Skummamelk."), { outcome: "failed", detail: "invalid_unparseable:not_json" }],
+        ["an object (not an array)", textAnswer(JSON.stringify({ products: ["Helmelk"] })), { outcome: "failed", detail: "invalid_unparseable:not_array" }],
+        ["HTTP 529", async () => new Response("overloaded", { status: 529 }), { outcome: "failed", detail: "infra_failure" }],
+        ["network error", async () => { throw new Error("ECONNRESET"); }, { outcome: "failed", detail: "infra_failure" }],
+      ];
+      for (const [label, answer, want] of mapping) {
+        modelAnswer = answer;
+        modelRequests = 0;
+        const got = await job.rfbEnrichmentProductNameExtractor("Fra fjøset: Helmelk og Skummamelk.", {});
+        assertEq([got, modelRequests], [want, 1], `pn13: real extractor, model answer ${label} → ${JSON.stringify(want)} (exactly one request: the retry is off)`);
+      }
+
+      // pn14 — N1 through the step: an answer with nothing usable on the page
+      // (names not on it, or the model's literal []) is deterministic for that
+      // page → products_not_supported_by_homepage, stamped (14-day retry); a
+      // genuine failure stays transient (not stamped, retried next night).
+      llmCalls.length = 0;
+      const NIGHT4 = new Date("2026-10-15T00:10:00Z");
+      setEnv({ ...ALL_CAPS_ZERO, RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", RFB_ENRICHMENT_CAP_CONTENT: "10", ANTHROPIC_API_KEY: "test-key-never-sent" });
+      PAGES["pn-off.no"] = page("Helmelk og Skummamelk. [off]");
+      PAGES["pn-fail.no"] = page("Helmelk og Skummamelk. [fail]");
+      PAGES["pn-empty.no"] = page("Velkommen til gården. [empty]");
+      ANSWERS["[off]"] = { outcome: "names", names: ["Kakao", "Iskrem"] };
+      ANSWERS["[fail]"] = { outcome: "failed", detail: "infra_failure" };
+      modelAnswer = textAnswer("[]");
+      modelRequests = 0;
+      pnRow("pn-off", { products: GEN_DAIRY });
+      pnRow("pn-fail", { products: GEN_DAIRY });
+      pnRow("pn-empty", { products: GEN_DAIRY });
+      const night4Extractor = async (text: string, io: { signal?: AbortSignal }) =>
+        text.includes("[empty]") ? job.rfbEnrichmentProductNameExtractor(text, io) : stubExtractor(text);
+      const r4 = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT4, deps: { productNameExtractor: night4Extractor } });
+      const st4 = r4.steps.find((x) => x.step === "content_refresh")!;
+      assertEq(
+        ["pn-off", "pn-empty", "pn-fail"].map((id) => [id, rowOf(st4, id)?.outcome, stampOf(id), products(id) === GEN_DAIRY]),
+        [
+          ["pn-off", "products_not_supported_by_homepage", "products_not_supported_by_homepage", true],
+          ["pn-empty", "products_not_supported_by_homepage", "products_not_supported_by_homepage", true],
+          ["pn-fail", "products_extraction_failed", null, true],
+        ],
+        "pn14: names not on the page / the model's [] → products_not_supported_by_homepage, stamped; a failed call → products_extraction_failed, unstamped (retried next night)",
+      );
+      assertEq(
+        [modelRequests, String(rowOf(st4, "pn-empty")?.detail ?? "").includes("no product names on the page: empty_after_filter")],
+        [1, true],
+        "pn14: the [] row made its one (stubbed) model request; the reason names empty_after_filter",
+      );
     });
   } catch (err) {
     failed++;

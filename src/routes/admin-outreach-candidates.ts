@@ -38,15 +38,18 @@
 //      Idempotent: rows with the same message_id are skipped.
 
 import { Router, Request, Response } from "express";
-import { getDb, isContentQualified, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE } from "../database/init";
+import { getDb, isContentQualified, humanAgentViewSql, LEGACY_AGENT_VIEW_SOURCE, POOL_RETAIL_SHOP_GATE_SQL, retailShopPoolBlockers } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
 import { customerRuleSql } from "../services/customer-rule";
 import { publicListableSql } from "../services/agent-visibility";
 import {
   getRecentlyEmailedAddresses,
   getCrossPlatformSuppressors,
+  getOpenExperiencesDb,
+  agentsHasOrgNrColumn,
   outreachSentLogHasVerticalColumn,
 } from "../services/outreach-suppression-signals";
+import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
 import { dedupeByEmail } from "../services/marketing-dedupe";
 import { countRecipientAddressTypes, isColdRecipientAllowed } from "../services/recipient-policy";
 import { categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
@@ -230,6 +233,11 @@ export interface CoreEligibilityRow {
   // them entirely.
   about?: string | null | undefined;
   products?: string | unknown[] | null | undefined;
+  // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: retail-shop gate
+  // inputs (see retailShopPoolBlockers, database/init.ts). Omitted = unmarked.
+  business_type?: string | null | undefined;
+  retail_focus?: string | null | undefined;
+  field_provenance?: string | null | undefined;
 }
 
 export function coreEligibilityCheck(
@@ -270,6 +278,10 @@ export function coreEligibilityCheck(
   }
   if (row.umbrella_type !== null && row.umbrella_type !== undefined) {
     return { ok: false, failedCondition: "umbrella_type_not_null" };
+  }
+  const retailBlockers = retailShopPoolBlockers(row);
+  if (retailBlockers.length > 0) {
+    return { ok: false, failedCondition: retailBlockers[0] };
   }
   return { ok: true, failedCondition: null };
 }
@@ -431,7 +443,11 @@ export function computeOutreachCandidates(
       -- dev-request 2026-09-09-rfb-kategori-og-beskrivelse-provenance-audit:
       -- raw column read by categoriesLackWebsiteCorroboration below.
       a.categories AS categories,
-      k.products AS products
+      k.products AS products,
+      -- dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+      -- website + org number feed the cross-platform "same producer" match.
+      a.url AS agent_url,
+      ${agentsHasOrgNrColumn(db) ? "a.org_nr" : "NULL"} AS org_nr
     `;
 
     type PoolRow = {
@@ -449,6 +465,8 @@ export function computeOutreachCandidates(
       verification_review_reason: string | null;
       categories: string | null;
       products: string | null;
+      agent_url: string | null;
+      org_nr: string | null;
       // Fix 1 (gate-integrity dedupe tiebreak parity, 2026-07-15): these three
       // mirror admin-outreach-pool.ts exactly so dedupeByEmail()'s tiebreak sees
       // real engagement/rating data here too, instead of silently defaulting to
@@ -520,6 +538,9 @@ export function computeOutreachCandidates(
           -- dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt:
           -- mirrors the VIEW's shared public-listability predicate too.
           AND ${publicListableSql("a")}
+          -- dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: mirrors the
+          -- VIEW's retail-shop gate (a re-touch must not reach a shop either).
+          AND ${POOL_RETAIL_SHOP_GATE_SQL}
           AND k.verification_status = 'verified'
           AND k.enrichment_status = 'rich'
           AND k.url_last_status IS NOT NULL
@@ -557,7 +578,7 @@ export function computeOutreachCandidates(
       for (const r of db.prepare(`
         SELECT DISTINCT LOWER(TRIM(email)) AS e
         FROM email_bounces
-        WHERE bounce_type IN ('hard', 'complaint')
+        WHERE bounce_type IN ('hard', 'complaint', 'unsubscribe')
       `).all() as Array<{ e: string | null }>) {
         if (r.e !== null) hardBouncedEmails.add(r.e);
       }
@@ -635,13 +656,18 @@ export function computeOutreachCandidates(
     // (getCrossPlatformSuppressors) so /admin/pool-blocker-explain can reuse
     // the identical check instead of a parallel reimplementation. Pure
     // extraction — same SQL, same cutoff, same shape.
-    const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays);
+    // dev-request 2026-10-08-kryssplattform-karantene-produsent-og-domene:
+    // the index now matches the same producer (e-mail domain, website, org.nr)
+    // and not only the exact address; Opplevagent's provider data is passed so
+    // website / org.nr of its sends can match. Best effort — see the helper.
+    const crossPlatformSuppressors = getCrossPlatformSuppressors(db, cooldownDays, { expDb: getOpenExperiencesDb() });
     const oslHasVertical = outreachSentLogHasVerticalColumn(db);
     const crossPlatformSkipped: Array<{
       agent_id: string;
       email: string;
       suppressed_by_vertical: string;
       last_sent_at: string;
+      match: CrossPlatformMatch;
     }> = [];
     // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
     // rows stopped by a data-quality reason (generic_products_only /
@@ -841,14 +867,22 @@ export function computeOutreachCandidates(
       // here. See services/recipient-policy.ts. Applies in both modes.
       const suppressedForPersonalAddress = !isColdRecipientAllowed(row.email);
       // steg 4 / 4e — see the map construction above.
-      const crossPlatformHit = crossPlatformSuppressors.get(row.email.trim().toLowerCase());
-      const suppressedForCrossPlatform = crossPlatformHit !== undefined;
-      if (crossPlatformHit) {
+      const crossPlatformFound = crossPlatformSuppressors.find(
+        buildCrossPlatformIdentity({
+          email: row.email,
+          // RFB website of record: COALESCE(agent_knowledge.website, agents.url)
+          website: (row.website ?? "").trim() || row.agent_url,
+          orgNr: row.org_nr,
+        }),
+      );
+      const suppressedForCrossPlatform = crossPlatformFound !== undefined;
+      if (crossPlatformFound) {
         crossPlatformSkipped.push({
           agent_id: row.agent_id,
           email: row.email,
-          suppressed_by_vertical: crossPlatformHit.vertical,
-          last_sent_at: crossPlatformHit.last_sent_at,
+          suppressed_by_vertical: crossPlatformFound.hit.vertical,
+          last_sent_at: crossPlatformFound.hit.last_sent_at,
+          match: crossPlatformFound.match,
         });
       }
 
@@ -985,7 +1019,10 @@ export function computeOutreachCandidates(
           k.email,
           a.umbrella_type,
           k.about,
-          k.products
+          k.products,
+          a.business_type,
+          a.retail_focus,
+          k.field_provenance
         FROM agents a
         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id IN (${placeholders})
@@ -997,6 +1034,9 @@ export function computeOutreachCandidates(
         umbrella_type: string | null;
         about: string | null;
         products: string | null;
+        business_type: string | null;
+        retail_focus: string | null;
+        field_provenance: string | null;
       }>;
       const recheckById = new Map(recheckRows.map((r) => [r.agent_id, r]));
 
@@ -1072,6 +1112,10 @@ export function computeOutreachCandidates(
                 "so the cross-platform breakdown could not be computed. This is NOT a measured zero.",
             }),
         count: crossPlatformSkipped.length,
+        by_match: crossPlatformSkipped.reduce<Record<string, number>>((acc, s) => {
+          acc[s.match] = (acc[s.match] ?? 0) + 1;
+          return acc;
+        }, {}),
         by_vertical: crossPlatformSkipped.reduce<Record<string, number>>((acc, s) => {
           acc[s.suppressed_by_vertical] = (acc[s.suppressed_by_vertical] ?? 0) + 1;
           return acc;
@@ -1079,7 +1123,8 @@ export function computeOutreachCandidates(
         truncated: crossPlatformSkipped.length > 100,
         producers: crossPlatformSkipped.slice(0, 100),
         note:
-          "Skipped because another platform cold-mailed this address inside the cooldown window. " +
+          "Skipped because another platform cold-mailed this producer inside the cooldown window " +
+          "(same address, same non-free-mail e-mail domain, same website or same org.nr — see `match`). " +
           "The cooldown is cross-platform on purpose: both platforms send from the same address, so " +
           "the recipient sees one sender. These are not lost — they become eligible when the window passes.",
       },

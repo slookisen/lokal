@@ -231,6 +231,104 @@ export function isOwnPlatformHomepage(row: {
   return homepageUrl.toLowerCase().includes("rettfrabonden.com");
 }
 
+// ─── Retail-shop gate for the `outreach_ready_pool` VIEW ─────────────────────
+// dev-request 2026-10-01-rfb-butikker-i-outreach-poolen (Daniel live
+// 2026-10-01). `agents.business_type` marks what kind of business a row is
+// ('producer' | 'farm_shop' | 'retail_shop' | 'cafe'; NULL = unmarked =
+// untouched by this gate, exactly like before). Only 'retail_shop' is gated:
+// a producer's own farm shop ('farm_shop') and ordinary producers (NULL /
+// 'producer') are NEVER affected. `agents.retail_focus` ('frukt_gront' |
+// 'fisk' | 'annet') says what a retail_shop sells.
+//
+// A retail_shop is outreach-eligible ONLY when BOTH hold:
+//   (a) retail_focus = 'frukt_gront'. 'fisk' is deliberately NOT allowed: Daniel
+//       has not answered whether fish shops count (open question in the
+//       dev-request) — it must be added here explicitly once he does.
+//   (b) the profile passes the quality gate: about >= 150 chars AND the `about`
+//       field has a 'homepage' provenance record (own site), AND >= 3 products,
+//       AND the about text describes the business as a shop (butikk /
+//       kolonial / dagligvare).
+//
+// Named reasons (pool-blocker-explain): retail_shop_not_eligible (fails a),
+// retail_profile_not_ready (passes a, fails b). `k`/`a` must alias
+// agent_knowledge/agents. WHERE-clause use only; CASE guards make malformed
+// JSON in field_provenance/products fail the gate safely (excluded, no crash).
+export const RETAIL_SHOP_FOCUS_ALLOWED = ["frukt_gront"] as const;
+export const RETAIL_SHOP_MIN_ABOUT_CHARS = 150;
+export const RETAIL_SHOP_MIN_PRODUCTS = 3;
+const RETAIL_SHOP_ABOUT_LIKE = [
+  "%butikk%",
+  "%kolonial%",
+  "%dagligvare%",
+];
+
+export const POOL_RETAIL_SHOP_PROFILE_READY_SQL =
+  `(length(COALESCE(k.about,'')) >= ${RETAIL_SHOP_MIN_ABOUT_CHARS}` +
+  ` AND CASE WHEN json_valid(COALESCE(k.field_provenance,'{}')) THEN` +
+  ` (COALESCE(json_extract(k.field_provenance,'$.about'),'') LIKE '%"source_type":"homepage"%'` +
+  ` OR COALESCE(json_extract(k.field_provenance,'$.about'),'') LIKE '%"source":"homepage"%') ELSE 0 END` +
+  ` AND CASE WHEN json_valid(COALESCE(k.products,'[]')) THEN json_array_length(COALESCE(k.products,'[]')) >= ${RETAIL_SHOP_MIN_PRODUCTS} ELSE 0 END` +
+  ` AND (${RETAIL_SHOP_ABOUT_LIKE.map((l) => `LOWER(COALESCE(k.about,'')) LIKE '${l}'`).join(" OR ")}))`;
+
+export const POOL_RETAIL_SHOP_GATE_SQL =
+  `(COALESCE(a.business_type,'') != 'retail_shop'` +
+  ` OR (COALESCE(a.retail_focus,'') IN (${RETAIL_SHOP_FOCUS_ALLOWED.map((f) => `'${f}'`).join(",")})` +
+  ` AND ${POOL_RETAIL_SHOP_PROFILE_READY_SQL}))`;
+
+function provenanceHasHomepageSource(raw: unknown, field: string): boolean {
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try { parsed = JSON.parse(raw); } catch { return false; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const val = (parsed as Record<string, unknown>)[field];
+  let recs: unknown[] = [];
+  if (Array.isArray(val)) recs = val;
+  else if (val && typeof val === "object") {
+    const w = (val as { sources?: unknown }).sources;
+    recs = Array.isArray(w) ? w : [val];
+  }
+  return recs.some((r) => {
+    if (!r || typeof r !== "object") return false;
+    const o = r as Record<string, unknown>;
+    return o.source_type === "homepage" || o.source === "homepage";
+  });
+}
+
+/**
+ * Pure TS mirror of POOL_RETAIL_SHOP_GATE_SQL, returning the NAMED blocker
+ * (empty array = not blocked). MUST stay logically equivalent to the SQL — do
+ * not hand-edit one without the other.
+ */
+export function retailShopPoolBlockers(row: {
+  business_type?: string | null;
+  retail_focus?: string | null;
+  about?: string | null;
+  products?: string | unknown[] | null;
+  field_provenance?: string | null;
+}): string[] {
+  if ((row.business_type ?? "") !== "retail_shop") return [];
+  if (!(RETAIL_SHOP_FOCUS_ALLOWED as readonly string[]).includes(row.retail_focus ?? "")) {
+    return ["retail_shop_not_eligible"];
+  }
+  const about = row.about ?? "";
+  let products: unknown[] = [];
+  if (Array.isArray(row.products)) products = row.products;
+  else if (typeof row.products === "string" && row.products.length > 0) {
+    try {
+      const p = JSON.parse(row.products);
+      if (Array.isArray(p)) products = p;
+    } catch { products = []; }
+  }
+  const lower = about.toLowerCase();
+  const ready =
+    about.length >= RETAIL_SHOP_MIN_ABOUT_CHARS &&
+    provenanceHasHomepageSource(row.field_provenance ?? null, "about") &&
+    products.length >= RETAIL_SHOP_MIN_PRODUCTS &&
+    RETAIL_SHOP_ABOUT_LIKE.some((l) => lower.includes(l.replace(/%/g, "")));
+  return ready ? [] : ["retail_profile_not_ready"];
+}
+
 // ─── Producer-profile view honesty (analytics_agent_views) ──────────────────
 // humanAgentViewSql / LEGACY_AGENT_VIEW_SOURCE live in ./analytics-sql (a pure
 // module the off-thread stats worker can import without this file) and are
@@ -464,7 +562,10 @@ function initSchema(db: Database.Database): void {
 
     -- ════════════════════════════════════════════════════════════
     -- AGENT_CLAIMS: Seller ownership of their agent
-    -- Flow: request → verify (email/phone) → approved → owner
+    -- Flow: request → code to the farm's own e-mail → verified → owner,
+    --       or request → pending_review (admin queue) → verified/rejected
+    --       (decision 11=A, dev-request 2026-10-17-rfb-claim-verifisering-
+    --       mot-kjent-kontakt; see knowledge-service.ts requestClaim)
     -- ════════════════════════════════════════════════════════════
     CREATE TABLE IF NOT EXISTS agent_claims (
       id TEXT PRIMARY KEY,
@@ -474,14 +575,18 @@ function initSchema(db: Database.Database): void {
       claimant_phone TEXT,
       verification_method TEXT DEFAULT 'email',  -- 'email' | 'phone' | 'manual'
       verification_code TEXT,                     -- 6-digit code sent to verify
-      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded')),
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
       source TEXT DEFAULT 'organic',              -- 'organic' | 'email-apr26' | 'test' | campaign tag
       created_at TEXT DEFAULT (datetime('now')),
       verified_at TEXT,
-      expires_at TEXT                             -- Claims expire after 7 days if unverified
+      expires_at TEXT,                            -- Code expiry: 24 h (rows from before 2026-10-17: 7 days)
+      code_sent_to TEXT,                          -- The farm's own address the code went to (NULL: no code sent)
+      failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
+      review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
+      claimant_email_typed TEXT                   -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -694,6 +799,24 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_agent_view_daily_day ON agent_view_daily(day DESC);
     CREATE INDEX IF NOT EXISTS idx_agent_view_daily_agent ON agent_view_daily(agent_id);
+
+    -- agent_ai_view_daily: the AI-assistant bucket next to agent_view_daily's
+    -- human one — producer-profile views per day×agent fetched by an AI
+    -- assistant for a person (analytics_agent_views.traffic_category =
+    -- 'ai_search', not the owner), rolled up by retention-service.ts
+    -- (rollupAndPruneAgentViews) before the raw rows are deleted after the
+    -- retention window. Counts only: no city, source, session or IP. Kept in a
+    -- table of its own so agent_view_daily stays people only for every reader.
+    -- Same lifetime as agent_view_daily: never pruned, cleared for an agent_id
+    -- by the opt-out path (DELETE /admin/agents/:id, routes/marketplace.ts).
+    -- dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0.
+    CREATE TABLE IF NOT EXISTS agent_ai_view_daily (
+      day TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      view_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_ai_view_daily_agent ON agent_ai_view_daily(agent_id);
 
     -- sessions_daily: TRUE distinct-session count per day×vertical×bot_type.
     -- Deliberately NOT derivable from page_view_daily: that table's
@@ -1386,6 +1509,66 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agent_claims ADD COLUMN source TEXT DEFAULT 'organic'`);
   } catch {
     // Column already exists — expected after first migration
+  }
+
+  // ─── agent_claims: the claim rule of decision 11=A ──────────────────────
+  // dev-request 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt. Four
+  // additive columns (the farm address the code went to, wrong-code count,
+  // admin-queue reason, the typed address kept for audit once the claim is
+  // bound to the owner's address) and two new statuses: 'pending_review'
+  // (the admin queue) and 'superseded' (a code replaced by a newer one; such
+  // rows used to be DELETEd). Existing rows are not changed: the columns
+  // start NULL/0 and the status rebuild below copies every row as it is.
+  for (const col of ["code_sent_to TEXT", "failed_attempts INTEGER DEFAULT 0", "review_reason TEXT", "claimant_email_typed TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+  // SQLite cannot ALTER a CHECK, so widening the status list rebuilds the
+  // table (same pattern as crm_threads above). The new table is the stored
+  // CREATE text with only the CHECK clause swapped, so every column — also
+  // ones added later by ALTER, such as vertical_id — keeps its definition and
+  // order, and INSERT … SELECT * copies the rows unchanged. Its indexes are
+  // read from sqlite_master and recreated. Nothing references agent_claims by
+  // FK, trigger or view. If the stored text does not hold the exact old CHECK,
+  // nothing is rebuilt: the new statuses then fail at write time (the claim is
+  // refused), never silently.
+  try {
+    const OLD_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired'))";
+    const NEW_CLAIM_STATUS_CHECK = "CHECK(status IN ('pending','code_sent','verified','rejected','expired','pending_review','superseded'))";
+    const claimsRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_claims'"
+    ).get() as { sql: string } | undefined;
+    if (claimsRow && !/'pending_review'/.test(claimsRow.sql)) {
+      const createNew = claimsRow.sql.replace(/^CREATE TABLE\s+"?agent_claims"?/, "CREATE TABLE agent_claims__claim11a_new");
+      if (createNew === claimsRow.sql || !createNew.includes(OLD_CLAIM_STATUS_CHECK)) {
+        console.warn("[init][agent-claims-11a] status CHECK not in the expected form — rebuild skipped");
+      } else {
+        const indexSql = (db.prepare(
+          "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='agent_claims' AND sql IS NOT NULL"
+        ).all() as Array<{ sql: string }>).map((r) => r.sql);
+        // OFF so a row whose agent is gone is copied too, not refused; set
+        // outside the transaction (a no-op inside one) and restored as it was.
+        const fkWasOn = db.pragma("foreign_keys", { simple: true }) === 1;
+        db.pragma("foreign_keys = OFF");
+        try {
+          db.transaction(() => {
+            db.exec(createNew.replace(OLD_CLAIM_STATUS_CHECK, NEW_CLAIM_STATUS_CHECK));
+            db.exec(`INSERT INTO agent_claims__claim11a_new SELECT * FROM agent_claims`);
+            db.exec(`DROP TABLE agent_claims`);
+            db.exec(`ALTER TABLE agent_claims__claim11a_new RENAME TO agent_claims`);
+            for (const sql of indexSql) db.exec(sql);
+          })();
+          console.log("[init][agent-claims-11a] agent_claims.status CHECK widened to include 'pending_review'/'superseded'");
+        } finally {
+          if (fkWasOn) db.pragma("foreign_keys = ON");
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[init][agent-claims-11a] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──
@@ -2698,6 +2881,19 @@ function initSchema(db: Database.Database): void {
   // sites agree. Daniel, live session 2026-09-02, verbatim: "go på A, og kjør
   // dublettene og skjul-lista" (daniel-responses/2026-09-02-go-a-dubletter-og-
   // skjul-lista.md).
+  // dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: business marker +
+  // retail focus on the agent row (nullable, additive; NULL = unmarked = no
+  // effect). Read ONLY by the outreach_ready_pool VIEW's retail gate below and
+  // pool-blocker-explain; written only by POST /admin/agents/business-type.
+  // Added BEFORE the VIEW so a fresh DB resolves it. Rollback: revert the PR —
+  // the columns may stay (nothing else reads them).
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN business_type TEXT`,
+    `ALTER TABLE agents ADD COLUMN retail_focus TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
     // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
@@ -2762,6 +2958,12 @@ function initSchema(db: Database.Database): void {
            site — never eligible for marketing outreach. See
            POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL's own comment above. */
         AND ${POOL_OWN_PLATFORM_DOMAIN_EXCLUSION_SQL}
+        /* dev-request 2026-10-01-rfb-butikker-i-outreach-poolen: a row marked
+           business_type='retail_shop' is out unless it is a fruit/veg shop
+           with an enriched, shop-describing profile. Producers and
+           producer-run farm shops (business_type NULL/'producer'/'farm_shop')
+           are untouched. See POOL_RETAIL_SHOP_GATE_SQL's comment above. */
+        AND ${POOL_RETAIL_SHOP_GATE_SQL}
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
         AND k.url_last_status IS NOT NULL
         AND k.url_last_status >= 200
@@ -3765,6 +3967,21 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE products ADD COLUMN availability_source TEXT NOT NULL DEFAULT 'enrichment'`);
   } catch {
     // Column already exists
+  }
+
+  // dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 4:
+  // food information the buyer sees before submitting. Written only by the
+  // admin producer-list endpoint (POST /admin/products/producer-list) for
+  // pre-packaged food: ingredients (free text), allergens (JSON array of
+  // strings; '[]' = the producer states none) and net_weight (text such as
+  // '250 g'). Additive nullable columns; NULL = not stated. Same
+  // try/catch-duplicate-column guard as above.
+  for (const col of ["ingredients TEXT", "allergens TEXT", "net_weight TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists
+    }
   }
 
   // ─── Phase 1 (orch-pr-20260614-6): cart + orders tables ─────────────────
@@ -4931,6 +5148,55 @@ function initSchema(db: Database.Database): void {
   //   which also means pay at pickup.
   try { db.exec(`ALTER TABLE orders ADD COLUMN payment_mode TEXT`); } catch { /* already exists — expected */ }
 
+  // F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+  // follow-up bookkeeping for orders nobody answers, all additive and NULL on
+  // every existing row:
+  //   orders.reminder_sent_at : when the single producer reminder (pending for
+  //     ORDER_REMINDER_HOURS, default 24) was sent. Non-NULL = never again.
+  //   orders.notify_failed_at : when the first producer e-mail for the order
+  //     FAILED to send (a skip is no failure). Set by order-notify-service.
+  //   orders.notify_retried_at: when the single re-send of that e-mail was
+  //     tried by the order-followups job. Non-NULL = no further retry.
+  //   orders.notify_sent_at   : skive 1b (B1) — when the producer e-mail for
+  //     the order was actually SENT (first send or the retry). Only orders
+  //     with it get the reminder and the producer_no_response cancellation;
+  //     an order the producer never received (the pre-gate backlog, a skipped
+  //     or failed send) is never claimed to be «not answered».
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN reminder_sent_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_failed_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_retried_at TEXT`,
+    `ALTER TABLE orders ADD COLUMN notify_sent_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
+  // Fase A1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // one shared order-action layer (services/order-actions.ts) and the
+  // one-click lifecycle. All additive, NULL on every existing row:
+  //   orders.completion_source       : who closed a completed order —
+  //     'auto' (the follow-ups job, ORDER_AUTOCOMPLETE_ENABLED), 'buyer',
+  //     'seller' or 'admin'. NULL for orders completed before Fase A1.
+  //   order_events.actor_role        : 'seller' | 'buyer' | 'system' | 'admin'.
+  //   order_events.channel           : 'producer_page' | 'owner_portal' |
+  //     'admin' | 'system_job' | 'internal' (later 'mcp' / 'a2a').
+  //   order_events.idempotency_key   : the caller's idempotency key; a repeat
+  //     of the same key on the same order returns the stored transition.
+  //   trust_events.completion_source : copied from the order for
+  //     order_completed, so automatic closes are counted apart.
+  for (const stmt of [
+    `ALTER TABLE orders ADD COLUMN completion_source TEXT`,
+    `ALTER TABLE order_events ADD COLUMN actor_role TEXT`,
+    `ALTER TABLE order_events ADD COLUMN channel TEXT`,
+    `ALTER TABLE order_events ADD COLUMN idempotency_key TEXT`,
+    `ALTER TABLE trust_events ADD COLUMN completion_source TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+  } catch { /* best-effort — the lookup before the transition still works */ }
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.
@@ -5286,6 +5552,31 @@ function initSchema(db: Database.Database): void {
     console.error("Migration boot_job_state failed:", err);
   }
 
+  // dev-request 2026-10-16-indexnow-alle-verter (S2): state for the IndexNow sitemap-diff job
+  // (services/indexnow-sync.ts). Additive and inert while INDEXNOW_SYNC_ENABLED is off.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS indexnow_submissions (
+        host TEXT NOT NULL,
+        url TEXT NOT NULL,
+        lastmod TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_submitted_at TEXT,
+        last_status TEXT,
+        removed_at TEXT,
+        PRIMARY KEY (host, url)
+      );
+      CREATE TABLE IF NOT EXISTS indexnow_host_state (
+        host TEXT PRIMARY KEY,
+        baseline_at TEXT,
+        backoff_until TEXT,
+        last_error TEXT
+      );
+    `);
+  } catch (err) {
+    console.error("Migration indexnow_submissions failed:", err);
+  }
+
   // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6): two small state
   // tables for the nightly RFB enrichment job (services/rfb-enrichment-
   // nightly.ts). Created in-module too (ensureRfbEnrichmentNightlyTables), so
@@ -5338,6 +5629,56 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration event_loop_events failed:", err);
+  }
+
+  // dev-request 2026-10-16-klient-ip-fra-fly-client-ip, trinn 1c: the
+  // client-IP shadow counters per closed 5-min window, one row per machine
+  // per window, so the AC2 gate (≥48 h) survives deploys
+  // (services/client-ip-shadow-store.ts). Counters only: no IP, no key.
+  // window_start is ISO-8601 UTC; 14-day retention, pruned by the writer.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS client_ip_shadow_windows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_start TEXT NOT NULL,
+        machine TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        n INTEGER NOT NULL,
+        fci_valid INTEGER NOT NULL,
+        fallback_missing INTEGER NOT NULL,
+        fallback_invalid INTEGER NOT NULL,
+        fallback_non_public INTEGER NOT NULL,
+        fallback_hc INTEGER NOT NULL,
+        errors INTEGER NOT NULL,
+        xff_client_supplied INTEGER NOT NULL,
+        agree_fci_edge_n INTEGER NOT NULL,
+        agree_fci_edge_agree INTEGER NOT NULL,
+        agree_legacy_eq_fci_n INTEGER NOT NULL,
+        agree_legacy_eq_fci_agree INTEGER NOT NULL,
+        would_trip INTEGER NOT NULL,
+        top_overflow INTEGER NOT NULL,
+        fanin_ratio REAL,
+        fanin_class TEXT,
+        fanin_fan_in INTEGER,
+        fanin_ua TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (machine, window_start)
+      );
+      CREATE INDEX IF NOT EXISTS idx_client_ip_shadow_windows_start ON client_ip_shadow_windows(window_start);
+    `);
+  } catch (err) {
+    console.error("Migration client_ip_shadow_windows failed:", err);
+  }
+  // Trinn 1d: how much of each window was measured (a process's first window
+  // only from its first request), so hours_covered does not count a restart's
+  // partial window as 5 min. Additive; rows from before keep the default, a
+  // full window, as they were counted. Idempotent on "duplicate column name".
+  try {
+    db.exec(`ALTER TABLE client_ip_shadow_windows ADD COLUMN covered_ms INTEGER NOT NULL DEFAULT 300000`);
+  } catch (err: any) {
+    if (!String(err?.message || "").includes("duplicate column name")) {
+      console.error("Migration client_ip_shadow_windows.covered_ms failed:", err);
+    }
   }
 
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
@@ -5464,6 +5805,30 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_deliveries_vertical_day ON profile_ai_deliveries(vertical_id, day)`);
   } catch (err) {
     console.error("Migration profile_ai_deliveries failed:", err);
+  }
+
+  // ─── search_console_weekly (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c) ───
+  // Weekly numbers from Google Search Console and Bing Webmaster Tools per
+  // domain (source gsc | bing; week = Monday YYYY-MM-DD; metric e.g. clicks,
+  // impressions, sitemaps; dimension e.g. total, country:nor), upserted by
+  // services/search-console-fetch.ts. Aggregates only, no secrets. Same DDL as
+  // SEARCH_CONSOLE_WEEKLY_DDL there (a test compares them). Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS search_console_weekly (
+        domain TEXT NOT NULL,
+        source TEXT NOT NULL,
+        week TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        dimension TEXT NOT NULL,
+        value REAL NOT NULL,
+        fetched_at TEXT NOT NULL,
+        UNIQUE (domain, source, week, metric, dimension)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_console_weekly_week ON search_console_weekly(week)`);
+  } catch (err) {
+    console.error("Migration search_console_weekly failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

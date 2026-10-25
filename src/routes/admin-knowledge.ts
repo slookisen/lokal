@@ -20,7 +20,7 @@
 //   field_provenance = {
 //     <field>: ProvenanceRecord[]
 //   }
-//   ProvenanceRecord = { value, source_type, source_url?, fetched_at }
+//   ProvenanceRecord = { value, source_type, source_url?, fetched_at, quote?, quote_basis? }
 //
 // Wire-shape this endpoint accepts (two flavours, both normalised in):
 //   1. Wrapped:
@@ -33,6 +33,13 @@
 // Merge semantics:
 //   - For each tracked field, append new sources to the existing array.
 //   - Dedupe by {source_type, normalised value}: same pair = no-op.
+//   - A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d: an
+//     incoming source with a `quote` replaces the stored sources with the
+//     same pair instead (see mergeFieldProvenance).
+//   - Same dev-request, F1-S4f: with `keepAuditEntries` (the dental writers:
+//     the PUT, the Places batch and Stage V's correction), an entry other
+//     routes write on purpose that is not a source (`inactive`, the
+//     hjemmeside cleanup's) is kept as stored (see mergeFieldProvenance).
 //   - Untouched fields preserve existing provenance.
 //   - Untouched columns (about, products, ...) preserve existing values.
 //
@@ -87,7 +94,7 @@
 //     (A2A repo) — SKILL update that makes use of this endpoint.
 
 import { Router, Request, Response } from "express";
-import { getDb } from "../database/init";
+import { getDb, isOwnPlatformHomepage } from "../database/init";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423 with
@@ -97,7 +104,11 @@ import {
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
   enrichmentWritePauseBlockForAgents,
 } from "../services/enrichment-write-pause";
-import { isDirectoryOrAggregatorHost, categoriesLackWebsiteCorroboration } from "../services/cross-source-validator";
+import {
+  isDirectoryOrAggregatorHost,
+  categoriesLackWebsiteCorroboration,
+  hostFromUrlLike,
+} from "../services/cross-source-validator";
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
 // see the truncation-sweep router at the bottom of this file.
@@ -115,7 +126,10 @@ import {
   mapToPlatformCategories,
   meetsAboutQualityBar,
   pageLooksLikeThemeSpam,
+  PLATFORM_CATEGORIES,
+  stripNorwegianAccents,
 } from "../services/search-enrich";
+import { GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP } from "../services/gardssalg-product-list";
 import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersistence } from "../services/fetch-page";
 // dev-request 2026-08-22-rfbweb-about-guard: the shared website-candidate
 // junk-shape backstop (see admin-agents-url-write.ts's own import comment
@@ -166,12 +180,25 @@ function requireAdmin(req: Request, res: Response): boolean {
 
 // ─── Shape & merge logic for field_provenance ──────────────────────────
 
-// On-disk shape (matches cross-source-validator.ProvenanceRecord)
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d: a source may
+// carry `quote`, the sentence from the source page that the value rests on
+// (dental «Akuttvakt» is shown only with one, dental-acute-claim.ts), and
+// with it `quote_basis`, where in the source the time rule of Daniel's
+// definition A is met: in the quoted sentence itself, or in the opening hours
+// on the clinic's page.
+export const PROVENANCE_QUOTE_MAX_CODE_POINTS = 300;
+export const PROVENANCE_QUOTE_BASES = ["tider_i_sitatet", "aapningstider_paa_siden"] as const;
+type ProvenanceQuoteBasis = (typeof PROVENANCE_QUOTE_BASES)[number];
+
+// On-disk shape (matches cross-source-validator.ProvenanceRecord, plus the
+// optional quote above)
 type ProvenanceRecord = {
   value: string;
   source_type: string;
   source_url?: string;
   fetched_at: string;
+  quote?: string;
+  quote_basis?: ProvenanceQuoteBasis;
 };
 
 // Wire-shape — the enrichment SKILL may emit either flat array or wrapped
@@ -185,6 +212,8 @@ type IncomingSource = {
   fetched_at?: string;
   captured_at?: string;
   source_url?: string;
+  quote?: string;
+  quote_basis?: string;
 };
 type IncomingFieldEntry = IncomingSource[] | { sources?: IncomingSource[] };
 type IncomingProvenance = Record<string, IncomingFieldEntry>;
@@ -199,6 +228,23 @@ function normaliseSource(s: IncomingSource): ProvenanceRecord | null {
   const fetched_at = (s.fetched_at ?? s.captured_at ?? new Date().toISOString()).toString();
   const rec: ProvenanceRecord = { value, source_type, fetched_at };
   if (s.source_url) rec.source_url = String(s.source_url);
+  // F1-S4d: the quote is kept only as a string with more than whitespace in
+  // it, trimmed and cut to 300 code points (Array.from, so a surrogate pair
+  // is never split), and trimmed at the end again, as the cut may end on
+  // whitespace; anything else is dropped, as is quote_basis without a quote
+  // or with a value outside PROVENANCE_QUOTE_BASES. Array.from reads only the
+  // first 2 × 300 UTF-16 units, so the cost does not grow with the quote: a
+  // code point is one or two units, so those units hold the first 300 code
+  // points whole, and a pair the slice splits starts after them and is cut.
+  const quote = typeof s.quote === "string" ? s.quote.trim() : "";
+  if (quote) {
+    rec.quote = Array.from(quote.slice(0, 2 * PROVENANCE_QUOTE_MAX_CODE_POINTS))
+      .slice(0, PROVENANCE_QUOTE_MAX_CODE_POINTS)
+      .join("")
+      .trimEnd();
+    const basis = PROVENANCE_QUOTE_BASES.find((b) => b === s.quote_basis);
+    if (basis) rec.quote_basis = basis;
+  }
   return rec;
 }
 
@@ -240,6 +286,28 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
   return true;
 }
 
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4f: an audit
+// entry is one another route writes into dental field_provenance on purpose
+// and that is not a source: `inactive: {reason, marked_inactive_at}`
+// (admin-dental-mark-inactive.ts), `hjemmeside: {cleaned_reason,
+// previous_value, cleaned_at}` (admin-dental-hjemmeside-cleanup.ts, the only
+// record of why the address was moved) and `directory_url: {moved_reason,
+// previous_field, moved_at}` (admin-dental-offentlig-klinikk-hjemmeside-
+// korrigering.ts). A plain object with at least one key and none of the keys
+// of a source (source_type, value, and quote and quote_basis, which the akutt
+// readers and the dental PUT's quote guard act on) that is not the {sources}
+// wrapper. An object with one of them is a source record, malformed if PR-28
+// says so; an empty object records nothing and is dropped as before.
+const SOURCE_RECORD_KEYS = ["source_type", "value", "quote", "quote_basis", "sources"] as const;
+export type ProvenanceAuditEntry = Record<string, unknown>;
+export function isProvenanceAuditEntry(v: unknown): v is ProvenanceAuditEntry {
+  if (!v || typeof v !== "object" || Array.isArray(v) || Object.keys(v).length === 0) return false;
+  return SOURCE_RECORD_KEYS.every((key) => !(key in v));
+}
+
+/** A field's entry from mergeFieldProvenance with keepAuditEntries. */
+export type MergedProvenanceEntry = Array<ProvenanceRecord | ProvenanceAuditEntry> | ProvenanceAuditEntry;
+
 /**
  * Merge an incoming field_provenance payload into an existing on-disk
  * field_provenance object. Pure function — exported for unit-testing.
@@ -249,6 +317,32 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
  * of being carried forward. The route handler will overwrite the column
  * with the cleaned shape on the next provenance write.
  *
+ * F1-S4d (A2A dev-request 2026-10-16-finn-tannlege-fasettsider): an incoming
+ * source with a quote is not a duplicate of the stored sources with the same
+ * dedupKey (the stamp `own_homepage::1` an earlier run stored, or an older
+ * quote). It takes the place of the first of them and the others are
+ * removed, so the list does not grow and only the newest source for a key
+ * has a quote. An incoming source without a quote is a duplicate as before.
+ *
+ * F1-S4f (same dev-request): with `keepAuditEntries` (the dental writers:
+ * the PUT and the Places batch in dental.ts and Stage V's correction in
+ * dental-store.ts; every other caller leaves it out and gets the merge above
+ * unchanged, the RFB/knowledge ones and the dental legacy-shape normalize in
+ * admin-agent-audit.ts among them, which only rewrites a {sources} wrapper
+ * and never sees an audit entry), an audit
+ * entry (isProvenanceAuditEntry) is kept as stored, as a field's entry or as
+ * an element of its list, where the merge above would make it `[]` or drop
+ * it. When sources come in for a field whose entry is an audit entry (in
+ * practice `hjemmeside` after the cleanup), the field becomes a list with
+ * the audit entry, unchanged, first and the sources after it. The readers
+ * take a list element as a source only with a source_type and a string value
+ * (fieldProvenanceRecords, buildProvenanceSummary) or with a quote
+ * (hasAcuteVaktQuote), and hasAcuteVaktProvenance only asks whether the list
+ * is empty, which a list the audit entry is put in never is. So they see the
+ * same sources as without the audit entry; nothing is dropped and the
+ * field's provenance is not lost either. PR-28 still drops a source record
+ * that is malformed, also with the option.
+ *
  * @param existing parsed JSON from agent_knowledge.field_provenance (may be {})
  * @param incoming wire-shape payload (wrapped or flat per field)
  * @returns merged on-disk shape
@@ -256,12 +350,30 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
 export function mergeFieldProvenance(
   existing: Record<string, unknown>,
   incoming: IncomingProvenance,
-): Record<string, ProvenanceRecord[]> {
+): Record<string, ProvenanceRecord[]>;
+export function mergeFieldProvenance(
+  existing: Record<string, unknown>,
+  incoming: IncomingProvenance,
+  options: { keepAuditEntries: true },
+): Record<string, MergedProvenanceEntry>;
+export function mergeFieldProvenance(
+  existing: Record<string, unknown>,
+  incoming: IncomingProvenance,
+  options: { keepAuditEntries?: boolean } = {},
+): Record<string, MergedProvenanceEntry> {
+  const keepAuditEntries = options.keepAuditEntries === true;
+  const keep = (r: unknown): r is ProvenanceRecord | ProvenanceAuditEntry =>
+    isWellFormedRecord(r) || (keepAuditEntries && isProvenanceAuditEntry(r));
   // Start from a shallow copy of existing — coerce legacy single-record
   // shape into arrays, then drop malformed entries (PR-28 defensive
   // coding for back-catalogue rows from phase51 backfill).
-  const out: Record<string, ProvenanceRecord[]> = {};
+  const out: Record<string, MergedProvenanceEntry> = {};
   for (const [field, val] of Object.entries(existing)) {
+    if (keepAuditEntries && isProvenanceAuditEntry(val)) {
+      // F1-S4f: an audit entry is kept as stored, not wrapped and filtered.
+      out[field] = val;
+      continue;
+    }
     let arr: unknown[];
     if (Array.isArray(val)) {
       arr = val.slice();
@@ -279,20 +391,30 @@ export function mergeFieldProvenance(
       // null / primitives → drop (mirrors validator behaviour).
       continue;
     }
-    // PR-28: filter out malformed records before they reach dedupKey.
-    out[field] = arr.filter(isWellFormedRecord);
+    // PR-28: filter out malformed records before they reach dedupKey
+    // (F1-S4f: with keepAuditEntries, an audit entry in the list stays).
+    out[field] = arr.filter(keep);
   }
 
   for (const [field, entry] of Object.entries(incoming)) {
     const incomingSources = extractSources(entry);
     if (incomingSources.length === 0) continue;
-    const existingForField = out[field] ?? [];
+    // F1-S4f: a field whose entry is an audit entry (only with
+    // keepAuditEntries) takes the sources in a list after it.
+    const stored = out[field];
+    const auditEntry = stored === undefined || Array.isArray(stored) ? undefined : stored;
+    const existingForField: Array<ProvenanceRecord | ProvenanceAuditEntry> = Array.isArray(stored)
+      ? stored
+      : auditEntry
+        ? [auditEntry]
+        : [];
     // Seed seen-set from well-formed existing records. dedupKey now
     // returns null on malformed inputs — they were already filtered
-    // above, but the null-guard keeps belt-and-braces.
+    // above, but the null-guard keeps belt-and-braces (and an audit
+    // entry, F1-S4f, has no key: it is never a duplicate or replaced).
     const seen = new Set<string>();
     for (const r of existingForField) {
-      const k = dedupKey(r);
+      const k = dedupKey(r as ProvenanceRecord);
       if (k !== null) seen.add(k);
     }
     for (const s of incomingSources) {
@@ -300,10 +422,21 @@ export function mergeFieldProvenance(
       if (!rec) continue;
       const key = dedupKey(rec);
       if (key === null) continue;
+      // F1-S4d: a source with a quote replaces the sources with its key.
+      const first = rec.quote === undefined ? -1 : existingForField.findIndex((r) => dedupKey(r as ProvenanceRecord) === key);
+      if (first !== -1) {
+        existingForField[first] = rec;
+        for (let i = existingForField.length - 1; i > first; i--) {
+          if (dedupKey(existingForField[i] as ProvenanceRecord) === key) existingForField.splice(i, 1);
+        }
+        continue;
+      }
       if (seen.has(key)) continue;
       seen.add(key);
       existingForField.push(rec);
     }
+    // F1-S4f: no source was added, so the audit entry stays as stored.
+    if (auditEntry && existingForField.length === 1) continue;
     out[field] = existingForField;
   }
 
@@ -1803,7 +1936,7 @@ async function hcrFetchHtml(url: string, io?: HcrFetchIo): Promise<string | null
  * null only if the primary homepage cannot be fetched.
  */
 type HcrFetchOutcome =
-  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string }
+  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string; finalUrl: string }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
 async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Promise<HcrFetchOutcome> {
@@ -1832,7 +1965,7 @@ async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Pr
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, finalUrl: primary.finalUrl || fetchUrl };
 }
 
 type HcrTargetRow = {
@@ -1841,7 +1974,22 @@ type HcrTargetRow = {
   homepage_url: string | null;
 };
 
-type HcrFieldWrite = { field: string; value: string; columnVal: unknown; onAgents: boolean };
+type HcrFieldWrite = {
+  field: string;
+  value: string;
+  columnVal: unknown;
+  onAgents: boolean;
+  /** Provenance record only — the column itself is left as stored (categoriesCorroborateOnly). */
+  provenanceOnly?: boolean;
+  /** source_url for this candidate's provenance record; default the requested homepage URL. */
+  sourceUrl?: string;
+  /**
+   * extractProductNames only: real product names replacing generic stored
+   * ones — the gate gets the stored and the new value (canCorrectFactualField's
+   * ok_existing_generic_category_names rule).
+   */
+  productNames?: boolean;
+};
 
 /**
  * The route's explicit-`agentIds` target selection, extracted unchanged
@@ -1914,6 +2062,335 @@ export interface HomepageContentRefreshOptions {
    * it, unchanged). Unset = the global fetch, as the route always used.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * NEVER set by the morning send or for the route's explicit agentIds (unset =
+   * byte-identical behaviour). Set by the nightly RFB enrichment job (R6,
+   * services/rfb-enrichment-nightly.ts) through refreshRfbCandidateHomepage,
+   * and by the route for its AUTO-selected targets (dev-request 2026-10-15-
+   * homepage-refresh-autoutvalg-erstatter-ikke-ubekreftede-kategorier).
+   *
+   * When set, and the stored agents.categories is a non-empty list that is not
+   * yet corroborated (categoriesLackWebsiteCorroboration — the outreach gate's
+   * own test), the page's keyword-extracted categories never REPLACE the
+   * stored ones (that extraction is too noisy to be written as the truth):
+   *   - every stored category is among the page's categories → the stored
+   *     list stays exactly as it is and only a website_homepage provenance
+   *     record for it is added (through canCorrectFactualField, so the curated
+   *     lock still wins); reported as HCR_CATEGORIES_CORROBORATED in
+   *     `changed[].fields`;
+   *   - otherwise nothing is written for categories, reported in
+   *     `skipped_unsubstantiated` with a reason starting with
+   *     HCR_CATEGORIES_NOT_SUPPORTED. Refused outright (same reason prefix,
+   *     the cause in brackets): a homepage — requested or final after a
+   *     redirect — on a directory/social/aggregator host or on our own
+   *     platform domain, unreadable field_provenance, website_ownership
+   *     "unverified" (wrong-entity site), an about summary rejected as theme
+   *     spam, and a stored category that maps to no platform category.
+   * Stored values are compared lower-cased: a platform key against the page's
+   * platform categories, a key that only maps to one (berries, bread) against
+   * the page's own product keywords (the same lexicon key must be there); the
+   * stored list itself is never rewritten. The provenance source_url is the
+   * final URL after redirects.
+   * Empty/malformed or already corroborated stored categories: unchanged
+   * behaviour. Every other field and guard is unchanged.
+   */
+  categoriesCorroborateOnly?: boolean;
+  /**
+   * NEVER set by the route or the morning send (unset = byte-identical
+   * behaviour). Set only by the nightly RFB enrichment job (R6) through
+   * refreshRfbCandidateHomepage, for a row whose stored products are only
+   * platform category names (productsAreGenericCategoryNames — the outreach
+   * gate's generic_products_only) — dev-request 2026-10-15-rfb-generiske-
+   * produktnavn-ekte-navn-fra-nettsted.
+   *
+   * When set and the stored products (read after the fetch) are generic, the
+   * page text the model sees (the first GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP
+   * characters of the visible text) is handed to this extractor ONCE — never
+   * in a dry run, never with less than HCR_PRODUCT_NAMES_MIN_REMAINING_MS left
+   * before deadlineAt, and never on a page the categoriesCorroborateOnly
+   * rules refuse (our own domain, a directory/social/aggregator or hijacked
+   * host — requested or final URL —, website_ownership unverified or
+   * unreadable field_provenance, an about summary rejected as theme spam) or
+   * when `products` is curated-locked. Only names found VERBATIM on that text
+   * (hcrProductNamesOnPage: same lowercase + stripNorwegianAccents fold, whole
+   * words) are kept, written as the PAGE spells them, at most
+   * HCR_PRODUCT_NAMES_MAX; addresses, sentences and over-long strings are
+   * rejected even when on the page; an empty result (the model's own "no
+   * products" included — products_not_supported_by_homepage, not a failure)
+   * or one that is itself only category names writes nothing. The rest replaces the
+   * stored products through canCorrectFactualField (stored and new value
+   * passed: ok_existing_generic_category_names; the curated lock wins) with a
+   * website_homepage provenance record whose source_url is the final page
+   * URL; reported as `products` in changed[].fields. Nothing written →
+   * skipped_unsubstantiated reason starting with HCR_PRODUCTS_NOT_SUPPORTED
+   * (or HCR_PRODUCTS_EXTRACTION_FAILED / HCR_PRODUCTS_EXTRACTION_SKIPPED).
+   * The extractor call is awaited: when it returns after deadlineAt the
+   * agent writes nothing at all (refresh_deadline_exceeded), as for a late
+   * fetch.
+   */
+  extractProductNames?: HcrProductNamesExtractor;
+}
+
+/** What a product-name extractor made of a page (R6: the gårdssalg LLM helper). */
+export type HcrProductNamesExtraction =
+  | { outcome: "names"; names: readonly unknown[] }
+  | { outcome: "none"; detail?: string }
+  | { outcome: "failed"; detail?: string };
+/** Page text → product names; at most one model call. Never expected to throw (a throw counts as failed). */
+export type HcrProductNamesExtractor = (pageText: string, io: { signal?: AbortSignal }) => Promise<HcrProductNamesExtraction>;
+
+/** `skipped_unsubstantiated` reason prefix: no usable product names on the homepage (nothing written). */
+export const HCR_PRODUCTS_NOT_SUPPORTED = "products_not_supported_by_homepage";
+/** `skipped_unsubstantiated` reason prefix: the extractor failed (API/network/unparseable) — nothing written. */
+export const HCR_PRODUCTS_EXTRACTION_FAILED = "products_extraction_failed";
+/** `skipped_unsubstantiated` reason prefix: the extractor was not called (dry run / too close to the deadline). */
+export const HCR_PRODUCTS_EXTRACTION_SKIPPED = "products_extraction_skipped";
+/** At most this many product names are written. */
+export const HCR_PRODUCT_NAMES_MAX = 20;
+/** The extractor is not started with less time than this left before deadlineAt. */
+export const HCR_PRODUCT_NAMES_MIN_REMAINING_MS = 5_000;
+
+/** A product name longer than this is not a name (the gårdssalg helper's own item cap). */
+export const HCR_PRODUCT_NAME_MAX_CHARS = 60;
+/** A product name with more words than this is a sentence, not a name. */
+export const HCR_PRODUCT_NAME_MAX_WORDS = 6;
+
+/** Lowercase + stripNorwegianAccents + collapsed whitespace — search-enrich's own matching fold. */
+function hcrFoldText(s: string): string {
+  return stripNorwegianAccents(s.toLowerCase()).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * A candidate that is not a product name even when it is on the page: an
+ * e-mail or web address ("@", "://", "www."), a sentence (more than
+ * HCR_PRODUCT_NAME_MAX_WORDS words, or ending in sentence punctuation) or
+ * longer than HCR_PRODUCT_NAME_MAX_CHARS. `name` is whitespace-collapsed.
+ */
+function hcrNotProductShaped(name: string): boolean {
+  return (
+    name.length > HCR_PRODUCT_NAME_MAX_CHARS ||
+    /@|:\/\/|www\./i.test(name) ||
+    // a bare host name ("hagvoll.no") or a phone number / long digit run
+    // ("Tlf: 99887766", "998 87 766") is contact data, never a product name
+    /[a-z0-9]\.[a-z]{2,}\b/i.test(name) ||
+    /\d(?:[\s.-]?\d){6,}/.test(name) ||
+    name.split(" ").length > HCR_PRODUCT_NAME_MAX_WORDS ||
+    /[.!?:;…]$/.test(name)
+  );
+}
+
+/**
+ * hcrFoldText's fold of `text` (without the trim), plus for every folded
+ * UTF-16 unit the [start, end) range of the original characters it came
+ * from, so a match in the folded text maps back to the page's own spelling.
+ */
+function hcrFoldWithMap(text: string): { folded: string; start: number[]; end: number[] } {
+  let folded = "";
+  const start: number[] = [];
+  const end: number[] = [];
+  let i = 0;
+  for (const ch of text) {
+    const j = i + ch.length;
+    if (/\s/.test(ch)) {
+      if (folded.endsWith(" ")) end[end.length - 1] = j;
+      else {
+        folded += " ";
+        start.push(i);
+        end.push(j);
+      }
+    } else {
+      const f = stripNorwegianAccents(ch.toLowerCase());
+      if (f === "" && end.length > 0) end[end.length - 1] = j; // a combining mark joins its base letter
+      for (let k = 0; k < f.length; k++) {
+        start.push(i);
+        end.push(j);
+      }
+      folded += f;
+    }
+    i = j;
+  }
+  return { folded, start, end };
+}
+
+/**
+ * The extractor's names that appear VERBATIM in `pageText` (both folded the
+ * same way, matched as whole words), deduped on the folded form, in the
+ * extractor's order, capped at `max` — each written as the PAGE spells it
+ * («Smør», not the model's "Smor"): the occurrence identical to the model's
+ * string if there is one, else the first that is not all upper case (a
+ * heading), else the first. `dropped`: names not on the page. `rejected`:
+ * names that are not product-shaped (hcrNotProductShaped — never echoed in a
+ * reason, they may be addresses). Non-strings, blanks and one-letter names
+ * are ignored. PURE.
+ */
+export function hcrProductNamesOnPage(
+  names: readonly unknown[],
+  pageText: string,
+  max: number = HCR_PRODUCT_NAMES_MAX,
+): { kept: string[]; dropped: string[]; rejected: string[] } {
+  const page = hcrFoldWithMap(pageText);
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  const rejected: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of names) {
+    if (typeof raw !== "string") continue;
+    const name = raw.replace(/\s+/g, " ").trim();
+    const folded = hcrFoldText(name);
+    if (folded.length < 2 || seen.has(folded)) continue;
+    if (hcrNotProductShaped(name)) {
+      rejected.push(name);
+      continue;
+    }
+    const esc = folded.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const onPage = Array.from(page.folded.matchAll(new RegExp(`(?<![\\p{L}\\p{N}])${esc}(?![\\p{L}\\p{N}])`, "gu")), (m) =>
+      pageText
+        .slice(page.start[m.index!]!, page.end[m.index! + m[0].length - 1]!)
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+    if (onPage.length === 0) {
+      dropped.push(name);
+      continue;
+    }
+    seen.add(folded);
+    const allCaps = (x: string) => x === x.toLocaleUpperCase("nb-NO") && x !== x.toLocaleLowerCase("nb-NO");
+    const asOnPage = onPage.find((x) => x === name) ?? onPage.find((x) => !allCaps(x)) ?? onPage[0]!;
+    if (kept.length < max) kept.push(asOnPage);
+  }
+  return { kept, dropped, rejected };
+}
+
+/** Platform category key per CATEGORY_LABEL_NO label, lower-cased ("bakervarer" → "bakery"). */
+const HCR_CATEGORY_KEY_BY_LABEL: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.entries(CATEGORY_LABEL_NO).map(([k, label]) => [label.toLowerCase(), k]),
+);
+
+/**
+ * products[] entries ({name, category, seasonal}) for real names replacing a
+ * generic list: a name's own category keyword when it has one (extractProduct-
+ * Mentions on the name), else the single category the generic list stood for
+ * ("Meieri" → dairy), else "other". PURE.
+ */
+function hcrProductInfosFor(names: readonly string[], storedProductsJson: string | null | undefined): Array<{ name: string; category: string; seasonal: boolean }> {
+  const storedCats = new Set<string>();
+  try {
+    const parsed = JSON.parse(storedProductsJson ?? "[]");
+    if (Array.isArray(parsed)) {
+      for (const p of parsed) {
+        const name = typeof p === "string" ? p : p && typeof p.name === "string" ? p.name : "";
+        const rawCat = p && typeof p === "object" && typeof p.category === "string" ? p.category.trim().toLowerCase() : "";
+        const own = PLATFORM_CATEGORIES.includes(rawCat) ? rawCat : mapToPlatformCategories([rawCat])[0];
+        const cat = own ?? HCR_CATEGORY_KEY_BY_LABEL[name.trim().toLowerCase()];
+        if (cat && cat !== "other") storedCats.add(cat);
+      }
+    }
+  } catch {
+    /* fallback below */
+  }
+  const fallback = storedCats.size === 1 ? Array.from(storedCats)[0]! : "other";
+  return names.map((name) => ({
+    name,
+    category: mapToPlatformCategories(extractProductMentions(name))[0] ?? fallback,
+    seasonal: false,
+  }));
+}
+
+/** `changed[].fields` token: stored categories corroborated (provenance only, column untouched). */
+export const HCR_CATEGORIES_CORROBORATED = "categories_corroborated";
+/** `skipped_unsubstantiated` reason prefix: a stored category the homepage does not support. */
+export const HCR_CATEGORIES_NOT_SUPPORTED = "categories_not_supported_by_homepage";
+
+/**
+ * categoriesCorroborateOnly: why field_provenance rules out corroboration —
+ * website_ownership "unverified" (wrong-entity site), or a column that cannot
+ * be read (fail closed: a provenance write would otherwise replace the junk
+ * wholesale). Absent column (no knowledge row yet) → null.
+ */
+function hcrProvenanceCorroborationRefusal(fieldProvenanceJson: string | null | undefined): string | null {
+  if (fieldProvenanceJson === null || fieldProvenanceJson === undefined) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fieldProvenanceJson);
+  } catch {
+    return "unreadable field_provenance";
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unreadable field_provenance";
+  const wo = (parsed as Record<string, unknown>).website_ownership;
+  return !!wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified"
+    ? "website ownership unverified"
+    : null;
+}
+
+/**
+ * categoriesCorroborateOnly: why a homepage URL may never corroborate
+ * anything — our own platform domain (isOwnPlatformHomepage, the pool view's
+ * rule), or a directory/social/aggregator host: the cross-source list
+ * (isDirectoryOrAggregatorHost) plus the website-discovery exclusion R6 uses
+ * (rfbWebsiteHostExclusionReason: social, directory and known-hijacked hosts).
+ * An unparseable host fails closed.
+ */
+function hcrCorroborationHostRefusal(url: string): string | null {
+  if (isOwnPlatformHomepage({ website: url })) return "own platform domain";
+  const host = hostFromUrlLike(url);
+  if (!host) return "unparseable host";
+  if (isDirectoryOrAggregatorHost(host)) return "directory/social host";
+  // Lazy: admin-rfb-website-discovery imports this module (mergeFieldProvenance),
+  // so a top-level import would be circular. Same idiom as productsAreGenericCategoryNames.
+  const wd = require("./admin-rfb-website-discovery") as typeof import("./admin-rfb-website-discovery");
+  const why = wd.rfbWebsiteHostExclusionReason(host);
+  if (why === "known_hijacked_domain") return "known hijacked host";
+  if (why) return "directory/social host";
+  return null;
+}
+
+/**
+ * A stored category value as the platform key it stands for, lower-cased: a
+ * platform key stays itself ("other" excepted — the extraction never infers
+ * it); otherwise the extraction's own product-key mapping (berries → fruit,
+ * bread → bakery). null = maps to nothing the page could ever show. Used to
+ * find unmappable values; the page comparison itself is
+ * hcrStoredCategoryOnPage.
+ */
+function hcrStoredCategoryPlatformKey(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const k = v.trim().toLowerCase();
+  if (!k || k === "other") return null;
+  if (PLATFORM_CATEGORIES.includes(k)) return k;
+  const mapped = mapToPlatformCategories([k]);
+  return mapped.length === 1 ? mapped[0]! : null;
+}
+
+/**
+ * Does the page show this stored category? A platform key (fruit, meat, …)
+ * compares against the page's platform categories. A key that only maps to
+ * one (berries, bread) needs that SAME lexicon key among the page's product
+ * mentions: "epler" puts fruit on the page but says nothing about berries.
+ */
+function hcrStoredCategoryOnPage(
+  v: unknown,
+  pagePlatformCategories: ReadonlySet<string>,
+  pageProductKeys: readonly string[],
+): boolean {
+  const key = hcrStoredCategoryPlatformKey(v);
+  if (key === null) return false;
+  const raw = String(v).trim().toLowerCase();
+  return raw === key ? pagePlatformCategories.has(key) : pageProductKeys.includes(raw);
+}
+
+/**
+ * The stored agents.categories as a list when it is a non-empty JSON array
+ * (the same "has a value" test categoriesLackWebsiteCorroboration uses);
+ * null for empty, absent or malformed. Elements are returned as stored.
+ */
+function hcrStoredCategoryList(categoriesJson: string | null | undefined): unknown[] | null {
+  if (!categoriesJson) return null;
+  try {
+    const parsed = JSON.parse(categoriesJson);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Error text for an agent whose fetch outlived HomepageContentRefreshOptions.deadlineAt. */
@@ -1942,7 +2419,10 @@ export const HCR_THEME_SPAM_CANDIDATE_REASON =
  * (categories only: the refresh writes categories, never products, so a
  * category-name-only products list with corroborated categories is not
  * selectable). Those rows were never picked before, so categories_not_corroborated
- * stood forever. The extension group is ordered by
+ * stood forever. (Since dev-request 2026-10-15-homepage-refresh-autoutvalg-
+ * erstatter-ikke-ubekreftede-kategorier the route refreshes these targets
+ * with categoriesCorroborateOnly: a non-empty stored list is corroborated or
+ * left alone, never replaced.) The extension group is ordered by
  * homepage_content_checked_at (NULL first, stamped on every apply attempt),
  * then updated_at, so a row the refresh cannot fix moves to the back. At least half of `limit` is reserved
  * for this group when it has that many rows, so a long first group cannot
@@ -2198,7 +2678,7 @@ export async function refreshHomepageContent(
       return;
     }
     if (!dryRun) recordHcrFetchSuccess(agentId);
-    const { primaryHtml, combinedHtml, fetchUrl } = fetched;
+    const { primaryHtml, combinedHtml, fetchUrl, finalUrl } = fetched;
     // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
     // beskrivelser: THIS loop is the path that wrote the live casino copy
     // (provenance last_verified 2026-09-11..16 on all four hijacked
@@ -2288,6 +2768,105 @@ export async function refreshHomepageContent(
       }
     }
 
+    // dev-request 2026-10-15-rfb-generiske-produktnavn-ekte-navn-fra-nettsted
+    // (R6 only — see HomepageContentRefreshOptions.extractProductNames): real
+    // product names from the producer's own page replace a generic stored
+    // list. This is the one await between the fetch and the write; every DB
+    // read the write depends on happens after it (the categories read below
+    // and the kRow read), and a late answer writes nothing.
+    let productsCuratedLocked = false;
+    if (opts.extractProductNames) {
+      const cur = db
+        .prepare(
+          `SELECT k.products AS products, k.field_provenance AS field_provenance, k.curated_fields AS curated_fields
+             FROM agent_knowledge k WHERE k.agent_id = ?`,
+        )
+        .get(agentId) as { products: string | null; field_provenance: string | null; curated_fields: string | null } | undefined;
+      if (cur && productsAreGenericCategoryNames(cur.products)) {
+        let curatedProducts = false;
+        try {
+          const c = JSON.parse(cur.curated_fields || "{}");
+          curatedProducts = !!(c && typeof c === "object" && (c as Record<string, unknown>).products);
+        } catch {
+          curatedProducts = true; // unreadable lock column: fail closed
+        }
+        const refusal =
+          hcrCorroborationHostRefusal(fetchUrl) ??
+          hcrCorroborationHostRefusal(finalUrl) ??
+          hcrProvenanceCorroborationRefusal(cur.field_provenance) ??
+          (skippedUnsubstantiated.some((x) => x.agent_id === agentId && x.reason === HCR_THEME_SPAM_CANDIDATE_REASON)
+            ? "homepage summary reads as theme spam"
+            : null);
+        const remainingMs = opts.deadlineAt === undefined ? Infinity : opts.deadlineAt - Date.now();
+        if (curatedProducts) {
+          productsCuratedLocked = true;
+        } else if (refusal) {
+          skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (${refusal})` });
+        } else if (dryRun) {
+          skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_EXTRACTION_SKIPPED} (dry run)` });
+        } else if (remainingMs < HCR_PRODUCT_NAMES_MIN_REMAINING_MS) {
+          skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_EXTRACTION_SKIPPED} (refresh deadline too close)` });
+        } else {
+          const productSource = contentText.slice(0, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP);
+          let extraction: HcrProductNamesExtraction;
+          try {
+            extraction = await opts.extractProductNames(productSource, {
+              ...(opts.deadlineAt !== undefined ? { signal: AbortSignal.timeout(Math.max(1, Math.floor(remainingMs))) } : {}),
+            });
+          } catch (e: any) {
+            extraction = { outcome: "failed", detail: `threw: ${e?.message ?? String(e)}` };
+          }
+          // Same rule as a late fetch: an answer after the deadline writes nothing.
+          if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt - HCR_DEADLINE_SLACK_MS) {
+            errors.push({ agent_id: agentId, error: `${HCR_DEADLINE_EXCEEDED} for ${t.homepage_url}` });
+            return;
+          }
+          if (extraction.outcome === "failed") {
+            skippedUnsubstantiated.push({
+              agent_id: agentId,
+              reason: `${HCR_PRODUCTS_EXTRACTION_FAILED}${extraction.detail ? ` (${extraction.detail})` : ""}`,
+            });
+          } else {
+            const { kept, dropped, rejected } =
+              extraction.outcome === "names"
+                ? hcrProductNamesOnPage(extraction.names, productSource)
+                : { kept: [], dropped: [], rejected: [] };
+            const infos = hcrProductInfosFor(kept, cur.products);
+            const infosJson = JSON.stringify(infos);
+            if (kept.length === 0) {
+              // Deterministic for this page (the model's own "no products",
+              // or nothing usable on it): stamped by R6, retried in 14 days.
+              const why =
+                extraction.outcome === "none"
+                  ? `no product names on the page${extraction.detail ? `: ${extraction.detail}` : ""}`
+                  : [
+                      ...(dropped.length > 0 || rejected.length === 0
+                        ? [`no name found verbatim on the page${dropped.length > 0 ? `: ${dropped.slice(0, 5).join(", ")}` : ""}`]
+                        : []),
+                      // counted, never echoed (an e-mail/web address may be among them)
+                      ...(rejected.length > 0 ? [`${rejected.length} rejected as not product-shaped`] : []),
+                    ].join("; ");
+              skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (${why})` });
+            } else if (productsAreGenericCategoryNames(infosJson)) {
+              skippedUnsubstantiated.push({
+                agent_id: agentId,
+                reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (only category names: ${kept.join(", ")})`,
+              });
+            } else {
+              candidates.push({
+                field: "products",
+                value: kept.join(", "),
+                columnVal: infosJson,
+                onAgents: false,
+                sourceUrl: finalUrl,
+                productNames: true,
+              });
+            }
+          }
+        }
+      }
+    }
+
     // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
     // the detected platform categories are written as `categories` ONLY. They
     // used to be turned into products [{name:"Frukt"}, …] as well — a list of
@@ -2295,7 +2874,75 @@ export async function refreshHomepageContent(
     // (generic_products_only) and which locked the field against later fixes.
     // extractProductMentions yields category keys, not product names, so there
     // is no real product list to write from this page.
-    if (platformCategories.length > 0) {
+    //
+    // categoriesCorroborateOnly (R6 only — see HomepageContentRefreshOptions):
+    // a non-empty, uncorroborated stored list is never replaced. Read here,
+    // after the fetch, so this read and the write below stay in one
+    // synchronous stretch (nothing can change the column in between).
+    let corroborateStored: unknown[] | null = null;
+    let corroborateRefusal: string | null = null;
+    if (opts.categoriesCorroborateOnly) {
+      const cur = db
+        .prepare(
+          `SELECT a.categories AS categories, k.field_provenance AS field_provenance
+             FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id = ?`,
+        )
+        .get(agentId) as { categories: string | null; field_provenance: string | null } | undefined;
+      const stored = hcrStoredCategoryList(cur?.categories);
+      if (stored && categoriesLackWebsiteCorroboration(cur?.categories, cur?.field_provenance)) {
+        corroborateStored = stored;
+        // Only the producer's OWN site may corroborate (requested URL and the
+        // final one after redirects), never a wrong-entity or unreadable
+        // record, never a page whose summary reads as gambling copy, and never
+        // a stored value the page's extraction could not even express.
+        const unmapped = stored.find((c) => hcrStoredCategoryPlatformKey(c) === null);
+        corroborateRefusal =
+          hcrCorroborationHostRefusal(fetchUrl) ??
+          hcrCorroborationHostRefusal(finalUrl) ??
+          hcrProvenanceCorroborationRefusal(cur?.field_provenance) ??
+          (skippedUnsubstantiated.some((s) => s.agent_id === agentId && s.reason === HCR_THEME_SPAM_CANDIDATE_REASON)
+            ? "homepage summary reads as theme spam"
+            : null) ??
+          (unmapped !== undefined ? `unmapped stored category: ${String(unmapped).trim()}` : null);
+      }
+    }
+    if (corroborateStored) {
+      const onPage = new Set(platformCategories);
+      // EVERY stored category must be on the page (hcrStoredCategoryOnPage).
+      const supported =
+        corroborateRefusal === null && corroborateStored.every((c) => hcrStoredCategoryOnPage(c, onPage, productCats));
+      const storedText = corroborateStored.map((c) => String(c).trim()).join(",");
+      // A stored lexicon-only key (berries, bread) is judged on the page's
+      // keywords, so name them in the reason too.
+      const lexiconOnly = corroborateStored.some(
+        (c) => typeof c === "string" && !PLATFORM_CATEGORIES.includes(c.trim().toLowerCase()),
+      );
+      if (supported) {
+        // The page supports every stored category: keep the list exactly as
+        // stored (the page's extra keywords are not added) and record the
+        // homepage (final URL) as its source. Still decided by
+        // canCorrectFactualField below.
+        candidates.push({
+          field: "categories",
+          value: storedText,
+          columnVal: null,
+          onAgents: true,
+          provenanceOnly: true,
+          sourceUrl: finalUrl,
+        });
+      } else {
+        skippedUnsubstantiated.push({
+          agent_id: agentId,
+          reason: `${HCR_CATEGORIES_NOT_SUPPORTED} (${
+            corroborateRefusal ??
+            `stored: ${storedText}; homepage: ${platformCategories.join(",") || "none"}${
+              lexiconOnly ? `; page keywords: ${productCats.join(",") || "none"}` : ""
+            }`
+          })`,
+        });
+      }
+    } else if (platformCategories.length > 0) {
       // categories (agents table) — JSON array of platform category keys.
       candidates.push({
         field: "categories",
@@ -2306,7 +2953,10 @@ export async function refreshHomepageContent(
     }
 
     scanned++;
-    if (candidates.length === 0) return; // nothing extractable — leave as-is.
+    if (candidates.length === 0) {
+      if (productsCuratedLocked) skippedCurated.push({ agent_id: agentId, fields: ["products"] });
+      return; // nothing extractable — leave as-is.
+    }
 
     // Load existing provenance + curated locks + current column values.
     const kRow = db
@@ -2351,14 +3001,20 @@ export async function refreshHomepageContent(
       string,
       { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }
     > = {};
-    const curatedSkipped: string[] = [];
+    const curatedSkipped: string[] = productsCuratedLocked ? ["products"] : [];
 
     for (const cand of candidates) {
+      // extractProductNames: only a list that is STILL generic is replaced
+      // (this read and the write are one synchronous stretch).
+      if (cand.productNames && !productsAreGenericCategoryNames(kRow?.products)) {
+        skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (stored products changed during the refresh)` });
+        continue;
+      }
       // Incoming provenance for THIS field carries a single website_homepage
       // source — that is what makes canCorrectFactualField allow overwriting a
       // google_places value (and a pure-add when the field is empty).
       const incomingFieldProv = [
-        { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: fetchUrl },
+        { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: cand.sourceUrl ?? fetchUrl },
       ];
       const decision = canCorrectFactualField({
         field: cand.field,
@@ -2366,12 +3022,17 @@ export async function refreshHomepageContent(
         websiteOwnershipUnverified: woUnverified,
         incomingFieldProvenance: incomingFieldProv,
         isCurated: !!curated[cand.field],
+        // Real names over a generic stored list: the gate's
+        // ok_existing_generic_category_names rule needs both values.
+        ...(cand.productNames ? { existingValue: kRow?.products ?? null, incomingValue: String(cand.columnVal) } : {}),
       });
       if (decision.allowed) {
         fieldsToWrite.push(cand);
         incomingProvForMerge[cand.field] = { sources: incomingFieldProv };
       } else if (decision.reason === "curated_locked") {
         curatedSkipped.push(cand.field);
+      } else if (cand.productNames) {
+        skippedUnsubstantiated.push({ agent_id: agentId, reason: `${HCR_PRODUCTS_NOT_SUPPORTED} (write refused: ${decision.reason})` });
       }
       // Other refusals (e.g. existing already homepage-sourced) are silently
       // skipped — we never overwrite a non-google_places content value.
@@ -2382,7 +3043,9 @@ export async function refreshHomepageContent(
     }
     if (fieldsToWrite.length === 0) return;
 
-    const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
+    const writtenFields = Array.from(
+      new Set(fieldsToWrite.map((f) => (f.provenanceOnly ? HCR_CATEGORIES_CORROBORATED : f.field))),
+    );
     for (const f of writtenFields) {
       if (f in byField) byField[f] = (byField[f] ?? 0) + 1;
     }
@@ -2400,8 +3063,9 @@ export async function refreshHomepageContent(
     }
     const provJson = JSON.stringify(mergedProv);
 
-    const akUpdates = fieldsToWrite.filter((f) => !f.onAgents); // about / products
-    const agentUpdates = fieldsToWrite.filter((f) => f.onAgents); // description / categories
+    // A provenance-only candidate (categoriesCorroborateOnly) writes no column.
+    const akUpdates = fieldsToWrite.filter((f) => !f.onAgents && !f.provenanceOnly); // about / products
+    const agentUpdates = fieldsToWrite.filter((f) => f.onAgents && !f.provenanceOnly); // description / categories
 
     try {
       const tx = db.transaction(() => {
@@ -2507,9 +3171,13 @@ homepageContentRefreshRouter.post(
 
     // ── Target selection ─────────────────────────────────────────────────────
     let targets: HcrTargetRow[];
+    // Auto-selected targets corroborate stored categories, never replace them
+    // (see the refresh call below); explicit agentIds keep today's behaviour.
+    let autoSelected = false;
     if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
       targets = selectHomepageContentRefreshTargetsByIds(db, body.agentIds as unknown[], limit);
     } else {
+      autoSelected = true;
       // Auto-select: producers (non-umbrella) WITH a website AND existing
       // about/products, whose CONTENT provenance does NOT yet carry a
       // website_homepage source for about/products/description/categories — i.e.
@@ -2563,10 +3231,54 @@ homepageContentRefreshRouter.post(
     // ── Per-agent processing: refreshHomepageContent() above (extracted
     // verbatim, dev-request 2026-09-19-rfb-marketing-utsending-inn-i-
     // plattformjobben) — same response shape, same key order. ──────────────
-    const result = await refreshHomepageContent(db, targets, { dryRun });
-    res.json({ dry_run: dryRun, ...result });
+    //
+    // dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
+    // ubekreftede-kategorier: an AUTO-selected target (no agentIds — the
+    // routine lokal-agent-enrichment's Phase 4c) is refreshed with
+    // categoriesCorroborateOnly, the rule R6 uses: a non-empty, uncorroborated
+    // stored category list is never REPLACED by the page's keyword extraction
+    // (Holm Gård: stored [vegetables] → extracted [meat, vegetables, honey,
+    // fish, herbs]); it only gains a website_homepage source when the
+    // producer's own page supports every stored category, else nothing is
+    // written for categories. Dry run and apply alike. Empty stored categories
+    // and every other field: unchanged. Explicit agentIds (a deliberate
+    // operator action, already behind canCorrectFactualField and the curated
+    // lock) keep the replacing behaviour, byte for byte. Deviation from R2
+    // (2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter), which
+    // had the auto-select replace them.
+    const result = await refreshHomepageContent(db, targets, {
+      dryRun,
+      ...(autoSelected ? { categoriesCorroborateOnly: true } : {}),
+    });
+    res.json({
+      dry_run: dryRun,
+      ...result,
+      // Auto-select only (last key; the explicit-ids response is unchanged):
+      // the corroboration tally, keyed like R6's extra.categories_corroboration.
+      ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
+    });
   },
 );
+
+/**
+ * Per-agent tally of a categoriesCorroborateOnly refresh, keyed like R6's
+ * step extra.categories_corroboration: `corroborated` (stored list unchanged,
+ * website_homepage source added — or, in a dry run, would be) and
+ * `categories_not_supported_by_homepage` (nothing written for categories).
+ */
+export function homepageContentRefreshCorroborationTally(
+  result: HomepageContentRefreshResult,
+): { corroborated: number; categories_not_supported_by_homepage: number } {
+  const corroborated = new Set(
+    result.changed.filter((c) => c.fields.includes(HCR_CATEGORIES_CORROBORATED)).map((c) => c.agent_id),
+  );
+  const notSupported = new Set(
+    result.skipped_unsubstantiated
+      .filter((s) => s.reason.startsWith(HCR_CATEGORIES_NOT_SUPPORTED))
+      .map((s) => s.agent_id),
+  );
+  return { corroborated: corroborated.size, categories_not_supported_by_homepage: notSupported.size };
+}
 
 // ─── GET/POST /admin/description-truncation-sweep (dev-request ──────────────
 //     2026-07-01-cs-corrections-profile-quality, item C) ────────────────────

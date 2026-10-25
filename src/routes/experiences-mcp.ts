@@ -38,14 +38,18 @@
  * every tool returns a graceful "ingen data / not available" text result —
  * never throws (mirrors safeCategories() in experiences-seo.ts).
  *
- * Rate limiting: uses jsonRpcLimiter (same limiter as experiences-a2a.ts).
- * The host-gate in index.ts inserts /mcp BEFORE /a2a, so the global
+ * Rate limiting: this router's own chain from middleware/mcp-rate-limit.ts
+ * (profile `experiences`): IP brake, a quota per MCP session, and a stricter
+ * quota on book_gardssalg (EXPERIENCES_MCP_SIDE_EFFECT_TOOLS). It shares no
+ * bucket with /a2a, which keeps jsonRpcLimiter (experiences-a2a.ts). The
+ * host-gate in index.ts inserts /mcp BEFORE /a2a, so the global
  * app.use('/a2a', jsonRpcLimiter) mount is never reached for MCP requests.
  */
 
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { fylkeEquivalents, normaliseFylke } from "../services/norway-fylke";
-import { foreignPlaceIn } from "../services/outside-norway";
+import { outsideNorwayPlace } from "../services/outside-norway";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { resolveGardssalgProducerTypeFilter } from "../services/drink-taxonomy";
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -58,6 +62,8 @@ import {
   discoverExperiencesRelaxed,
   buildRelaxationNote,
   buildNarrowingSuggestions,
+  formatFilterLabels,
+  KOMMUNE_TO_FYLKE_STEP,
   listCategories,
   // dev-request 2026-06-23-experiences-richer-profiles, faithfulness-
   // inflow slice (2026-08-25): get_experience reads through the PUBLISH-
@@ -112,6 +118,10 @@ import {
   // checkBookingSlotAllowed() — see that call site's own comment.
   normaliseBookingSlotInput,
 } from "../services/booking-store";
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
+// source for the booking note (discover_gardssalg) and the "not taking
+// requests now" line (book_gardssalg) for owned profiles that are off.
+import { gardssalgBookingStatus, gardssalgNotTakingRequestsText } from "../services/gardssalg-booking-gate";
 // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
@@ -135,10 +145,24 @@ import {
 } from "../services/gardssalg-booking-resolve";
 
 import { EXPERIENCES_LIST_HTML, EXPERIENCE_DETAIL_HTML } from "./opplevagent-widgets";
-import { jsonRpcLimiter } from "../middleware/security";
+import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mcp-rate-limit";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { capName } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
+// dev-request 2026-10-16-opplevagent-mcp-fritekst-query: the category aliases
+// (S1, moved from this file) and the free-text `query` interpreter (S2).
+import {
+  GARDSSALG_CATEGORY,
+  interpretDiscoverQuery,
+  isStockfishPurchase,
+  listCategorySlugs,
+  normalizeExperienceCategory,
+} from "../services/experiences-query-intent";
+
+export { normalizeExperienceCategory, outsideNorwayPlace };
 
 const router = Router();
 
@@ -186,7 +210,7 @@ export function buildExperienceVisibilityFields(e: {
           name: cleanStr(p.navn),
           org_nr: cleanStr(p.org_nr),
           website: cleanHttpUrl(p.hjemmeside),
-          phone: cleanStr(p.telefon),
+          phone: isDisplayablePhone(cleanStr(p.telefon)) ? cleanStr(p.telefon) : null,
         };
       }
     } catch { /* provider lookup is best-effort; the experience is still returned */ }
@@ -201,8 +225,18 @@ export function buildExperienceVisibilityFields(e: {
   };
 }
 
-// Apply rate limiting to all routes on this router (same pattern as dental-mcp.ts)
-router.use(jsonRpcLimiter);
+// The tools with a real outbound effect (producer + guest e-mails), metered
+// by the profile's stricter side-effect quota. The list lives in the profile
+// (middleware/mcp-rate-limit.ts); every tool registered with
+// readOnlyHint: false must be in it (mcp-rate-limit-verticals.test.ts).
+export const EXPERIENCES_MCP_SIDE_EFFECT_TOOLS: ReadonlySet<string> = MCP_RATE_LIMIT_PROFILES.experiences.sideEffect.tools;
+
+// Rate limiting for all routes on this router (dev-request
+// 2026-10-16-mcp-rate-limit-dental-opplevagent-per-okt): this router's own
+// buckets — IP brake, then a quota per MCP session (else per recognized
+// consumer key, else per IP), then the book_gardssalg quota. Not
+// jsonRpcLimiter, which /a2a keeps. See middleware/mcp-rate-limit.ts.
+router.use(createMcpRateLimiters({ ...MCP_RATE_LIMIT_PROFILES.experiences, isKnownSession: hasExperiencesMcpSession }).chain);
 
 // ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
 // Deliberate, narrow exception to this module's content-isolation from the rfb DB:
@@ -252,9 +286,6 @@ export function detectExperiencesMcpClient(req: Request): string | undefined {
 }
 
 // ─── Zod input schemas (exported for testing) ─────────────────
-
-/** list_experience_categories' synthetic entry for the discover_gardssalg vertical. */
-const GARDSSALG_CATEGORY = "gardssalg_smaking";
 
 export const DiscoverExperiencesInputSchema = {
   query: z.string().optional().describe(
@@ -319,70 +350,17 @@ export const DiscoverExperiencesInputSchema = {
   ),
 };
 
-// ChatGPT app review 2026-09-24: this tool's own description used to offer
-// 'vinter' as a category example — not a slug that exists (the real one is
-// 'vinter_sno'), so a model copying it got the category silently relaxed
-// away. The description now lists the real slugs; this maps the obvious
-// plain-word guesses (Norwegian or English) onto them.
-//
-// Re-review 2026-10-03: a model also passes the human label it showed the
-// user ("wildlife & safari", "Food and drink") or an invented slug
-// ("wildlife_safari"). Those missed the table above, the filter was relaxed
-// away and the list mixed every category — test case 4 promises wildlife
-// only. Multi-word values are now split into words and the first word with
-// an alias wins; anything still unrecognised is reported back by
-// discover_experiences instead of being silently dropped.
-const CATEGORY_ALIASES: Record<string, string> = {
-  kultur: "kultur_historie", historie: "kultur_historie", culture: "kultur_historie", cultural: "kultur_historie", history: "kultur_historie", museum: "kultur_historie", museums: "kultur_historie",
-  natur: "natur_friluft", friluft: "natur_friluft", friluftsliv: "natur_friluft", nature: "natur_friluft", outdoors: "natur_friluft", outdoor: "natur_friluft",
-  adrenalin: "adrenalin_action", adrenaline: "adrenalin_action", action: "adrenalin_action", adventure: "adrenalin_action",
-  sightseeing: "sightseeing_transport", transport: "sightseeing_transport",
-  overnatting: "overnatting_opplevelse", accommodation: "overnatting_opplevelse", stay: "overnatting_opplevelse", stays: "overnatting_opplevelse",
-  dyreliv: "dyreliv_safari", safari: "dyreliv_safari", safaris: "dyreliv_safari", wildlife: "dyreliv_safari", animals: "dyreliv_safari", animal: "dyreliv_safari", dyr: "dyreliv_safari",
-  vinter: "vinter_sno", winter: "vinter_sno", "snø": "vinter_sno", sno: "vinter_sno", snow: "vinter_sno",
-  mat: "mat_drikke", drikke: "mat_drikke", food: "mat_drikke", "food_drink": "mat_drikke",
-  "velvære": "velvaere_spa", velvaere: "velvaere_spa", spa: "velvaere_spa", wellness: "velvaere_spa",
-  // Not an experience category: list_experience_categories appends this
-  // synthetic entry for the separate discover_gardssalg tool.
-  gardssalg: GARDSSALG_CATEGORY, "gårdssalg": GARDSSALG_CATEGORY, "farm-sale": GARDSSALG_CATEGORY, "farm_sale": GARDSSALG_CATEGORY,
-};
+// CATEGORY_ALIASES / normalizeExperienceCategory() / listCategorySlugs() live in
+// services/experiences-query-intent.ts (dev-request 2026-10-16-opplevagent-mcp-
+// fritekst-query, S1), shared with the free-text interpreter; normalizeExperienceCategory
+// is re-exported above for existing callers.
 
-export function normalizeExperienceCategory(category: string): string {
-  const key = category.trim().toLowerCase();
-  if (CATEGORY_ALIASES[key]) return CATEGORY_ALIASES[key];
-  if (listCategorySlugs().includes(key)) return key;
-  for (const word of key.split(/[^a-z0-9æøå]+/)) {
-    if (CATEGORY_ALIASES[word]) return CATEGORY_ALIASES[word];
-  }
-  return category.trim();
-}
-
-/** The experience category slugs that currently have published listings. */
-function listCategorySlugs(): string[] {
-  try {
-    return listCategories().map((c) => c.category);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * The place a discover call names outside Norway — a foreign county/kommune/
- * query word, or an origin outside Norway's bounding box — or null. Without
- * this check "Kenya" was relaxed away like an over-narrow filter and the
- * caller got a nationwide Norwegian list, the opposite of the submission's
- * negative test case (ChatGPT app re-review 2026-10-03).
- */
-export function outsideNorwayPlace(args: {
-  fylke?: string; kommune?: string; query?: string; lat?: number; lng?: number;
-}): string | null {
-  const named = foreignPlaceIn(args.fylke) ?? foreignPlaceIn(args.kommune) ?? foreignPlaceIn(args.query);
-  if (named) return named;
-  if (typeof args.lat === "number" && typeof args.lng === "number" && !isPlausibleNorwayCoord(args.lat, args.lng)) {
-    return `${args.lat}, ${args.lng}`;
-  }
-  return null;
-}
+// outsideNorwayPlace() (the Norway-only check of discover_experiences and
+// discover_gardssalg) and isStockfishPurchase() (the food-purchase early
+// return) live in services/outside-norway.ts and services/experiences-query-
+// intent.ts (dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S4/S5),
+// unchanged, so REST /discover?q= and A2A apply the same checks;
+// outsideNorwayPlace is re-exported above for existing callers.
 
 /**
  * Server-wide guidance returned from `initialize`. ChatGPT reads these
@@ -433,18 +411,6 @@ function outsideNorwayResult(rawPlace: string, listKey: "experiences" | "gardssa
     ...(listKey === "experiences" ? { structuredContent: result } : {}),
     content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
   };
-}
-
-/** Refuse the observed retail request without excluding food experiences. */
-function isStockfishPurchase(query: string | undefined): boolean {
-  if (!query) return false;
-  const request = query.normalize("NFKC").toLowerCase().replace(/ø/g, "o");
-  if (!/\b(?:stock[ -]?fish|torrfisk)\b/.test(request)) return false;
-  // Buying the food itself takes precedence over incidental museum/tour words.
-  if (/\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:some|fresh|dried|local|the|litt|fersk|lokal)\s+)*(?:stock[ -]?fish|torrfisk)\b(?!\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?))/i.test(request)) return true;
-  // Only an actual experience object qualifies, not a museum/tour mentioned elsewhere.
-  if (/\b(?:stock[ -]?fish|torrfisk)\s+(?:tickets?|tours?|tastings?|museums?|workshops?|experiences?|cooking\s+class(?:es)?)\b|\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille)\s+(?:(?:a|an|the|some|en|et)\s+)?(?:tickets?|tours?|tastings?|workshops?|experiences?|cooking\s+class(?:es)?|billett(?:er)?|omvisning|smaking|matkurs|opplevelser?|turer?)\b/.test(request)) return false;
-  return /\b(?:buy|buying|purchase|purchasing|order|ordering|kjope|kjop|bestille|shops?|stores?|sellers?|butikker?|utsalg)\b/.test(request);
 }
 
 function stockfishPurchaseResult(filter: object) {
@@ -665,6 +631,22 @@ function registerWidgetResource(
   );
 }
 
+/**
+ * The whole text of a tool result when the tool fails inside. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the
+ * client («Sokefeil: …», «Feil: …», «Bookingfeil: …»), SQLite's for one. The
+ * wording is Rett fra Bonden's MCP_INTERNAL_ERROR_TEXT (routes/mcp.ts), from
+ * the same template (utils/internal-error.ts). A database that is not open
+ * still answers that no data is available.
+ */
+export const EXPERIENCES_MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Opplevagent");
+
+/** A failed tool's isError result with EXPERIENCES_MCP_INTERNAL_ERROR_TEXT. The detail is logged with the tool's name, not its arguments. */
+function toolInternalError(tool: string, err: unknown) {
+  return mcpToolInternalErrorResult("experiences-mcp", EXPERIENCES_MCP_INTERNAL_ERROR_TEXT, tool, err);
+}
+
 export function registerExperienceTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -728,7 +710,13 @@ export function registerExperienceTools(
         "openai/toolInvocation/invoked": "Found experiences",
       },
     },
-    async ({ query, fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
+    async ({ query, fylke: fylkeAsSent, kommune: kommuneAsSent, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }, extra) => {
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y2 (FUNN
+      // strukturerte-stedsfelt-uten-lengdetak): `fylke` and `kommune` are place
+      // names, cut to MAX_NAME_CHARS at a word boundary (utils/free-text.ts)
+      // before the filter, the free-text reading and the answer use them.
+      const fylke = capName(fylkeAsSent);
+      const kommune = capName(kommuneAsSent);
       try {
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
@@ -763,8 +751,10 @@ export function registerExperienceTools(
         // be relaxed away like an over-narrow filter, so the caller silently
         // got every category. Say so instead and name the valid slugs; the
         // gårdssalg entry from list_experience_categories points at its own
-        // tool. (ChatGPT app re-review 2026-10-03.)
-        if (filter.category) {
+        // tool. (ChatGPT app re-review 2026-10-03.) Also run for a category
+        // read from `query` below ("gårdssalg i Hardanger").
+        const categoryPointer = (extraFields: Record<string, unknown> = {}) => {
+          if (!filter.category) return null;
           const slugs = listCategorySlugs();
           const pointer =
             filter.category === GARDSSALG_CATEGORY
@@ -772,16 +762,148 @@ export function registerExperienceTools(
               : slugs.length > 0 && !slugs.includes(filter.category)
                 ? `Ukjent kategori «${filter.category}». Gyldige kategorier: ${slugs.join(", ")}. / Unknown category "${filter.category}". Valid categories: ${slugs.join(", ")}.`
                 : null;
-          if (pointer) {
-            const result = { summary: pointer, count: 0, filter_applied: filter, valid_categories: slugs, experiences: [] };
-            return {
-              structuredContent: result,
-              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-            };
+          if (!pointer) return null;
+          const result = { summary: pointer, count: 0, filter_applied: filter, ...extraFields, valid_categories: slugs, experiences: [] };
+          return {
+            structuredContent: result,
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          };
+        };
+        const explicitCategoryPointer = categoryPointer();
+        if (explicitCategoryPointer) return explicitCategoryPointer;
+
+        // ── Free-text `query` (dev-request 2026-10-16-opplevagent-mcp-fritekst-
+        // query, S2). It used to be read only by the two checks above, so a
+        // query-only call ("hvalsafari i Tromsø") searched with an empty filter
+        // and got the first rows of the whole country. The query now fills the
+        // keys the caller left empty; explicit arguments always win (see
+        // interpretDiscoverQuery for the place and search-word rules).
+        const explicitKeyCount = Object.keys(filter).length;
+        const fromQuery: Array<keyof DiscoverFilter> = [];
+        let queryInterpretation: Record<string, unknown> | undefined;
+        let queryHasContent = false;
+        if (queryText) {
+          const read = interpretDiscoverQuery(queryText, { fylke, kommune, lat, lng, category: filter.category, season, weather, indoor_outdoor });
+          queryHasContent = read.hasContent;
+          const fill = <K extends keyof DiscoverFilter>(key: K, value: DiscoverFilter[K] | undefined) => {
+            if (value === undefined || filter[key] !== undefined) return;
+            filter[key] = value;
+            fromQuery.push(key);
+          };
+          fill("kommune", read.kommune);
+          fill("kommuner", read.kommuner);
+          fill("fylke", read.fylke);
+          fill("fylker", read.fylker);
+          fill("category", read.category);
+          fill("season", read.season);
+          fill("weather", read.weather);
+          fill("indoor_outdoor", read.indoor_outdoor);
+          fill("text_terms", read.terms);
+          if (fromQuery.length > 0) {
+            const { hasContent: _hasContent, ...values } = read;
+            queryInterpretation = { source: "query", ...values };
           }
         }
+        // "gårdssalg i Hardanger" gets the same pointer as category='gardssalg'.
+        if (filter.category === GARDSSALG_CATEGORY && fromQuery.includes("category")) {
+          const pointer = categoryPointer({ query_interpretation: queryInterpretation });
+          if (pointer) return pointer;
+        }
 
-        const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit ?? 20);
+        // Every answer below is logged and counted the same way. Logged as
+        // structured keys only: never the raw query, and of the search words
+        // only how many there were (felles regel 5).
+        const finish = (result: Record<string, unknown>, deliveredIds: string[]) => {
+          const { text_terms: loggedTerms, ...loggedFilter } = filter;
+          const logged = loggedTerms ? { ...loggedFilter, text_terms_count: loggedTerms.length } : loggedFilter;
+          try {
+            logExperiencesInteraction({
+              skill: "discover_experiences",
+              queryText: Object.keys(logged).length ? JSON.stringify(logged) : undefined,
+              ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+            });
+          } catch { /* fail-open: never affects the tool result */ }
+
+          deliver("discover_experiences", filter, extra, deliveredIds);
+          // structuredContent is what the experiences-list widget reads
+          // (window.openai.toolOutput); the text block keeps the same JSON for
+          // MCP clients without widget support.
+          return {
+            structuredContent: result,
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+          };
+        };
+
+        // Zero answers instead of a list that only looks like a match (the A2A
+        // guard of lokal#824, mirrored): the query had words but nothing to
+        // search by; the place has nothing; or every filter read from the
+        // query was relaxed away, leaving the unfiltered catalogue. The place,
+        // given or read from the query, is never relaxed away (S2, S3): a
+        // kommune without hits is widened once to its fylke, then it is zero.
+        // Search words are relaxed gradually before they are dropped
+        // (discoverExperiencesRelaxed), so this zero means no row has any of them.
+        let zeroHitReason: "unrecognized_query" | "place_no_match" | "relaxation_exhausted" | undefined =
+          queryHasContent && fromQuery.length === 0 && explicitKeyCount === 0 ? "unrecognized_query" : undefined;
+        let termsMatchedNothing = false;
+        const placeKeys = (["kommune", "kommuner", "fylke", "fylker"] as const).filter((k) => filter[k] !== undefined);
+        const relaxed = zeroHitReason
+          ? null
+          : discoverExperiencesRelaxed(filter, limit ?? 20, { protectKeys: placeKeys, widenKommuneToFylke: true });
+        const results = relaxed?.results ?? [];
+        const relaxedKeys = relaxed?.relaxedKeys ?? [];
+        if (relaxed && results.length === 0 && placeKeys.length > 0) {
+          zeroHitReason = "place_no_match";
+        } else if (relaxed && fromQuery.length > 0 && relaxedKeys.length > 0 && Object.values(relaxed.appliedFilter).every((v) => v === undefined)) {
+          termsMatchedNothing = fromQuery.every((k) => k === "text_terms") && explicitKeyCount === 0;
+          zeroHitReason = termsMatchedNothing ? "unrecognized_query" : "relaxation_exhausted";
+        }
+        if (zeroHitReason) {
+          let summary: string;
+          let suggestions: string[] = [];
+          if (zeroHitReason === "place_no_match") {
+            const place = filter.kommune ?? filter.kommuner?.join(", ") ?? filter.fylke ?? filter.fylker?.join(", ");
+            const widenedTo = relaxedKeys.includes(KOMMUNE_TO_FYLKE_STEP) ? relaxed?.appliedFilter.fylke : undefined;
+            summary =
+              `Ingen opplevelser funnet i ${place}${widenedTo ? ` eller ellers i ${widenedTo}` : ""}. ` +
+              "Opplevagent viser ikke treff fra resten av landet i stedet. / " +
+              `No experiences found in ${place}${widenedTo ? ` or elsewhere in ${widenedTo}` : ""}. ` +
+              "Opplevagent does not fall back to results from the rest of the country.";
+            // Places that do have experiences for the rest of the request; each
+            // suggestion returns hits.
+            const { kommune: _k, kommuner: _ks, fylke: _f, fylker: _fs, ...rest } = filter;
+            suggestions = buildNarrowingSuggestions(discoverExperiencesRelaxed(rest, limit ?? 20).results, ["kommune", "fylke"]);
+          } else if (termsMatchedNothing) {
+            summary =
+              "Søket nevner verken sted, kategori, sesong eller vær, og ingen opplevelse inneholder søkeordene i det — ingen treff. " +
+              "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+              "The query names no place, category, season or weather, and no experience contains its search words — no matches. " +
+              'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
+          } else if (zeroHitReason === "unrecognized_query") {
+            summary =
+              "Fant ingen gjenkjennelige søkekriterier eller treff i søket (sted, kategori, sesong, vær eller søkeord) — ingen treff. " +
+              "Prøv f.eks. «hvalsafari i Tromsø», eller oppgi fylke, kommune eller category. / " +
+              "No recognisable criteria or matches in the query (place, category, season, weather or keywords) — no matches. " +
+              'Try e.g. "whale safari in Tromsø", or pass fylke, kommune or category.';
+          } else {
+            const labels = formatFilterLabels(relaxedKeys);
+            summary =
+              `Ingen opplevelser funnet med filtrene fra søket — heller ikke etter å ha løsnet: ${labels}. / ` +
+              `No experiences found for the filters read from the query — not even after relaxing: ${labels}.`;
+            suggestions = buildNarrowingSuggestions(results, relaxedKeys);
+          }
+          return finish({
+            summary,
+            count: 0,
+            filter_applied: filter,
+            query_interpretation: queryInterpretation,
+            relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+            suggestions: suggestions.length > 0 ? suggestions : undefined,
+            zero_hit_reason: zeroHitReason,
+            valid_categories: zeroHitReason === "unrecognized_query" ? listCategorySlugs() : undefined,
+            experiences: [],
+          }, []);
+        }
+
         const relaxationNote = buildRelaxationNote(relaxedKeys);
 
         let summary =
@@ -789,6 +911,12 @@ export function registerExperienceTools(
             ? "Ingen opplevelser funnet med de angitte filtrene. / No experiences found matching the given filters."
             : `Fant ${results.length} opplevelse(r). / Found ${results.length} experience(s).`;
         if (relaxationNote) summary += ` ${relaxationNote}`;
+        if (relaxed?.textTermsMatched !== undefined) {
+          const termCount = filter.text_terms?.length ?? 0;
+          summary +=
+            ` Ingen opplevelse inneholder alle ${termCount} søkeordene; disse inneholder ${relaxed.textTermsMatched} av dem. /` +
+            ` No experience contains all ${termCount} search words; these contain ${relaxed.textTermsMatched} of them.`;
+        }
 
         const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
 
@@ -810,7 +938,7 @@ export function registerExperienceTools(
           description: e.description
             ? e.description.slice(0, 300) + (e.description.length > 300 ? "…" : "")
             : null,
-          booking_url: e.booking_url ?? null,
+          booking_url: cleanHttpUrl(e.booking_url),
           booking_type: e.booking_type ?? null,
           ...buildExperienceVisibilityFields(e),
           tags: e.tags ?? [],
@@ -830,28 +958,14 @@ export function registerExperienceTools(
           summary,
           count: results.length,
           filter_applied: filter,
+          query_interpretation: queryInterpretation,
           unfilterable_fields: unfilterable.length > 0 ? unfilterable : undefined,
           relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
           suggestions: suggestions.length > 0 ? suggestions : undefined,
           experiences: formatted,
         };
 
-        try {
-          logExperiencesInteraction({
-            skill: "discover_experiences",
-            queryText: Object.keys(filter).length ? JSON.stringify(filter) : undefined,
-            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
-          });
-        } catch { /* fail-open: never affects the tool result */ }
-
-        deliver("discover_experiences", filter, extra, results.map((e) => e.id));
-        // structuredContent is what the experiences-list widget reads
-        // (window.openai.toolOutput); the text block keeps the same JSON for
-        // MCP clients without widget support.
-        return {
-          structuredContent: result,
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-        };
+        return finish(result, results.map((e) => e.id));
       } catch (err: any) {
         // Defensive: DB not open or other failure -> graceful degradation
         if (err.message?.includes("database") || err.message?.includes("no such table") || err.message?.includes("getDb")) {
@@ -859,10 +973,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_experiences", err);
       }
     }
   );
@@ -920,10 +1031,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen kategorier tilgjengelig for oyeblikket. / No category data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("list_experience_categories", err);
       }
     }
   );
@@ -1028,7 +1136,7 @@ export function registerExperienceTools(
           price_unit: experience.price_unit ?? null,
           languages: experience.languages ?? [],
           accessibility: experience.accessibility ?? [],
-          booking_url: experience.booking_url ?? null,
+          booking_url: cleanHttpUrl(experience.booking_url),
           booking_type: experience.booking_type ?? null,
           ...buildExperienceVisibilityFields(experience),
           meeting_point: experience.meeting_point ?? null,
@@ -1059,10 +1167,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Feil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("get_experience", err);
       }
     }
   );
@@ -1106,7 +1211,10 @@ export function registerExperienceTools(
         openWorldHint: false,
       },
     },
-    async ({ fylke, kommune, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+    async ({ fylke: fylkeAsSent, kommune: kommuneAsSent, producer_type, query, booking_live, lat, lng, radius_km, limit }, extra) => {
+      // Slice I-Y2: place names, cut as in discover_experiences.
+      const fylke = capName(fylkeAsSent);
+      const kommune = capName(kommuneAsSent);
       try {
         const foreign = outsideNorwayPlace({ fylke, kommune, query, lat, lng });
         if (foreign) return outsideNorwayResult(foreign, "gardssalg_producers", { fylke, kommune, query });
@@ -1129,7 +1237,10 @@ export function registerExperienceTools(
         if (typeof radius_km === "number") filter.radius_km = radius_km;
         const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
 
-        const results = searchGardssalgProviders(filter, limit ?? 20);
+        // expandDrinkWords: a drink word in `query` («cider», «sider», «øl»)
+        // also finds producers of that kind, as producer_type does (dev-request
+        // 2026-10-17-integrasjonstest-oppfolging, AI-5).
+        const results = searchGardssalgProviders(filter, limit ?? 20, { expandDrinkWords: true });
 
         const summary =
           results.length === 0
@@ -1140,7 +1251,6 @@ export function registerExperienceTools(
           // catalog_hidden is never 1 here — searchGardssalgProviders()'s base
           // WHERE clause already excludes those rows entirely — so this call
           // site never needs to (and never does) pass a catalog_hidden arg.
-          const live = !isBookingPaused(row.booking_live);
           return {
             // `id` is the provider_id book_gardssalg needs. It was MISSING from
             // this row until 2026-09-16 (dev-request …-en-setning-booking-via-
@@ -1158,13 +1268,10 @@ export function registerExperienceTools(
             lat: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lat : null,
             lon: isPlausibleNorwayCoord(row.lat, row.lon) ? row.lon : null,
             geocode_confidence: row.geocode_confidence ?? null,
-            booking: {
-              live,
-              mode: live ? ("request" as const) : ("paused" as const),
-              note: live
-                ? "Book direkte. / Book directly."
-                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
-            },
+            // One source for the note (services/gardssalg-booking-gate.ts):
+            // an owned profile that is off says "tar ikke imot forespørsler
+            // nå"; only never-claimed profiles say "åpner snart".
+            booking: gardssalgBookingStatus(row),
             profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
             // Only present when an origin (lat/lng) was given — mirrors
             // discover_experiences's own ...(hasGeo ? {...} : {}) spread.
@@ -1199,10 +1306,7 @@ export function registerExperienceTools(
             content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
           };
         }
-        return {
-          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("discover_gardssalg", err);
       }
     }
   );
@@ -1343,7 +1447,7 @@ export function registerExperienceTools(
         // here. An unknown provider_id falls through the same path (no row
         // -> booking_live undefined -> "not live"), same as the web form.
         const provider = getProviderById(parsed.data.provider_id) as
-          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null }
+          | { navn?: string | null; slug?: string | null; booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null; is_test_provider?: number | null; opening_hours_text?: string | null; claimed_at?: string | null }
           | null;
         // Echoed on every outcome below so the assistant can name the producer
         // it acted on (and link the profile when booking is not activated).
@@ -1358,6 +1462,9 @@ export function registerExperienceTools(
           : null;
         const slotLocal = formatSlotOslo(parsed.data.slot_at);
         if (isBookingPaused(provider?.booking_live ?? null, provider?.catalog_hidden ?? null, provider?.is_test_provider ?? null)) {
+          // Owned profile that is off: "tar ikke imot forespørsler nå", not
+          // "ikke aktivert ennå" (G1 item 7). Never-claimed: unchanged copy.
+          const notTaking = gardssalgNotTakingRequestsText(provider?.claimed_at ?? null);
           return {
             content: [{
               type: "text" as const,
@@ -1369,9 +1476,9 @@ export function registerExperienceTools(
                 provider: providerInfo,
                 message:
                   (providerInfo?.navn ? `${providerInfo.navn}: ` : "") +
-                  BOOKING_NOT_ACTIVATED_MSG +
+                  (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
                   (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
-                  " / Booking is not activated for this producer yet." +
+                  (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
                   (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
               }, null, 2),
             }],
@@ -1507,10 +1614,7 @@ export function registerExperienceTools(
           }],
         };
       } catch (err: any) {
-        return {
-          content: [{ type: "text" as const, text: `Bookingfeil: ${err.message}` }],
-          isError: true,
-        };
+        return toolInternalError("book_gardssalg", err);
       }
     }
   );
@@ -1530,6 +1634,12 @@ interface ExperiencesMcpSession {
 
 const experiencesSessions = new Map<string, ExperiencesMcpSession>();
 const EXPERIENCES_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// The rate limiter's "is this a live session?" check (router.use near the
+// top of this file): only a session this router minted gets its own bucket.
+export function hasExperiencesMcpSession(sessionId: string): boolean {
+  return experiencesSessions.has(sessionId);
+}
 
 // Cleanup stale sessions every 5 minutes (mirrors dental-mcp.ts)
 setInterval(() => {
@@ -1583,7 +1693,7 @@ async function getOrCreateExperiencesSession(
       "AI-discoverable marketplace of Norwegian experiences — curated, Brreg-verified activities " +
       "searchable by county, category, weather, season, and group size. / " +
       "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
-  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS });
+  }, { instructions: OPPLEVAGENT_MCP_INSTRUCTIONS, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
 
   // Getters read live from the sessions map (by id) rather than closing over
   // a snapshot, so a later request on the same session that resolves a

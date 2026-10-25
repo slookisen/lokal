@@ -68,9 +68,12 @@ export function runMapboxBudgetTests(opts: { log?: boolean } = {}): Promise<Test
     const budget = require("./mapbox-budget") as typeof import("./mapbox-budget");
     const corridor = require("./route-corridor-service") as typeof import("./route-corridor-service");
 
-    // Fixed instants. Date.now() is never consulted by the code under test —
-    // `now` is a parameter — so these tests cannot drift with the wall clock,
-    // and the month-boundary case below is reachable at all.
+    // Fixed instants, passed as `now`, so these blocks cannot drift with the
+    // wall clock and the month-boundary case below is reachable at all. The
+    // exception is mb19-mb24 and mb31: they drive the REAL factory, whose
+    // default consume closure calls tryConsumeMapboxCall() without `now`, so
+    // they run on the real clock. They clear the table first and assert
+    // counts only, and mb27d uses a month that can never be the current one.
     const JULY = Date.parse("2026-07-15T12:00:00Z");
     const AUGUST = Date.parse("2026-08-01T00:00:01Z");
     // A month no test has touched, so the kill-switch assertion below can
@@ -217,7 +220,6 @@ export function runMapboxBudgetTests(opts: { log?: boolean } = {}): Promise<Test
       {
         process.env.MAPBOX_MONTHLY_CALL_CAP = "2";
         budget.__resetMapboxBudgetSchemaForTesting();
-        const NOV = Date.parse("2026-11-05T08:00:00Z");
         db.prepare(`DELETE FROM mapbox_monthly_usage`).run();
 
         let outbound = 0;
@@ -298,7 +300,13 @@ export function runMapboxBudgetTests(opts: { log?: boolean } = {}): Promise<Test
       // so nothing slows the traffic down.
       {
         process.env.MAPBOX_MONTHLY_CALL_CAP = "1";
-        const FEB = Date.parse("2027-02-04T10:00:00Z");
+        // A month that can never be the current one. The warn-once memo
+        // (lastWarnedMonth in mapbox-budget.ts) is module state that
+        // __resetMapboxBudgetSchemaForTesting() does not clear, and mb22's
+        // refusal leaves it at the REAL month — so the old "2027-02-04" would
+        // have seen 0 warnings all through February 2027 (dev-request
+        // 2026-10-20-ci-tidsbombe-hardkodede-testdatoer).
+        const FEB = Date.parse("2020-02-04T10:00:00Z");
         db.prepare(`DELETE FROM mapbox_monthly_usage`).run();
         const realWarn = console.warn;
         let warns = 0;

@@ -36,7 +36,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, type ExternalLink } from "../services/knowledge-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { addUtmParams } from "../utils/url-utm";
 import { extractUtmFromQuery, extractUtmFromUrl } from "../utils/utm-capture";
@@ -91,10 +91,14 @@ function resolveRedirectUrl(agentId: string, kind: string): string | null {
     const m = EXTERNAL_KIND_RE.exec(kind);
     if (!m) return null;
     const type = kind.slice("external:".length).toLowerCase();
-    const link = knowledge.externalLinks.find(
-      (l) => (l.type || "").toLowerCase() === type,
+    // Integration test 2026-10-17 (I-G): external_links is DB JSON. Stored
+    // as text, or with a null entry or a type that is not text, `.find` /
+    // `.toLowerCase` threw and this answered 500 instead of 404.
+    const links: unknown[] = Array.isArray(knowledge.externalLinks) ? knowledge.externalLinks : [];
+    const link = links.find((l): l is ExternalLink =>
+      !!l && typeof (l as ExternalLink).type === "string" && (l as ExternalLink).type.toLowerCase() === type,
     );
-    candidate = link?.url;
+    candidate = typeof link?.url === "string" ? link.url : undefined;
   }
 
   if (!candidate) return null;

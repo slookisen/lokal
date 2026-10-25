@@ -21,7 +21,8 @@
 //     catalog_hidden=1, is_active=1, is_verified=1, order_notifications_opt_in=1,
 //     order_notification_email=<email>; agent_knowledge.verification_status=
 //     'verified', verified_second_line=0; and the product «Testpoteter (kun
-//     test)» in_stock with a fresh availability timestamp (re-armed on every
+//     test)» (availability_source 'admin_producer_confirmed' since skive 4, so
+//     the fixture stays orderable for the rehearsal) in_stock with a fresh availability timestamp (re-armed on every
 //     call). is_verified=1 is written for the same reason as the cross-check
 //     status: isEligibleForRealOrder() requires an owner-confirmed profile, and
 //     a newly created fixture has no owner claim of its own (the legacy row
@@ -306,12 +307,13 @@ function applyPlan(
       }
       db.prepare(
         `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, currency, availability, category,
-                               source, availability_updated_at, created_at, updated_at)
-         SELECT ?, a.id, ?, ?, 'kg', 30, 'NOK', 'in_stock', 'Grønnsaker', 'enrichment', ?, datetime('now'), datetime('now')
+                               source, availability_updated_at, availability_source, created_at, updated_at)
+         SELECT ?, a.id, ?, ?, 'kg', 30, 'NOK', 'in_stock', 'Grønnsaker', 'enrichment', ?, 'admin_producer_confirmed', datetime('now'), datetime('now')
            FROM agents a WHERE a.id = ? AND ${fixturePin("a")}
          ON CONFLICT(agent_id, name_norm) DO UPDATE SET
            availability = 'in_stock',
            availability_updated_at = excluded.availability_updated_at,
+           availability_source = 'admin_producer_confirmed',
            updated_at = datetime('now')`,
       ).run(randomUUID(), TEST_FIXTURE_PRODUCT_NAME, TEST_FIXTURE_PRODUCT_NAME_NORM, new Date().toISOString(), id);
     } else {

@@ -14,6 +14,7 @@ import {
 import { shouldRecordPageView } from "./page-view-definition";
 import { apiSearchQueryText, clampQueryText, isApiSearchRequest, type SearchChannel } from "./search-tracking";
 import { readSessionVelocity } from "./agent-stats-compute";
+import { buildRequestMeta, isInternalTraffic } from "./internal-traffic";
 import {
   computeAdminSummary,
   computePageViewCount,
@@ -24,6 +25,7 @@ import {
 import {
   parseUserAgent,
   classifyReferralSource,
+  isAiReferralKey,
   aggregateHumanReferrals,
   MIN_HUMAN_REFERRAL_COUNT,
   type HumanReferralRow,
@@ -79,10 +81,15 @@ const OWNER_UA_MARKERS_LC = [
 export function isOwnerRequest(req: Request): boolean {
   const cookieHeader = req.headers?.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
-  return isOwnerScriptUA(req.headers?.["user-agent"] || "");
+  if (isOwnerScriptUA(req.headers?.["user-agent"] || "")) return true;
+  // Slice I-Z (A2A dev-request 2026-10-17-integrasjonstest-oppfolging): also
+  // our own traffic by the conversation rules (internal-traffic.ts: a valid
+  // X-Admin-Key, internal UA markers such as «session-lane-verify»), whose
+  // page views and searches were counted as people's.
+  return isInternalTraffic(buildRequestMeta(req));
 }
 
-/** True for our own scripts' UAs (the UA half of isOwnerRequest). */
+/** True for our own scripts' UAs (OWNER_UA_MARKERS_LC; isOwnerRequest adds internal-traffic.ts's rules). */
 export function isOwnerScriptUA(userAgent: string): boolean {
   const ua = (userAgent || "").toLowerCase();
   return OWNER_UA_MARKERS_LC.some(m => ua.includes(m));
@@ -313,11 +320,12 @@ setInterval(() => sessionManager.cleanup(), 5 * 60 * 1000);
  */
 export type AgentViewSource = "direct" | "discovery" | "search" | "ai" | "social" | "referral";
 export function agentViewSourceFor(referrer: string | null | undefined): AgentViewSource {
-  switch (classifyReferralSource(referrer).key) {
+  const key = classifyReferralSource(referrer).key;
+  if (isAiReferralKey(key)) return "ai";
+  switch (key) {
     case "direkte": return "direct";
     case "intern": return "discovery";
     case "google": case "bing": case "duckduckgo": return "search";
-    case "chatgpt": case "perplexity": case "gemini": case "copilot": return "ai";
     case "sosial": return "social";
     default: return "referral";
   }
@@ -752,11 +760,12 @@ export class AnalyticsService {
       // of slice-4's is_internal on conversations. Bot exclusion + classification
       // + threshold happen in aggregateHumanReferrals().
       const rows = db.prepare(`
-        SELECT referrer, path, session_id, is_owner
+        SELECT referrer, path, session_id, is_owner, utm_source, utm_campaign
         FROM analytics_page_views
         WHERE created_at > ?
           AND (is_owner IS NULL OR is_owner = 0)
-          AND referrer IS NOT NULL AND TRIM(referrer) != ''${V}
+          AND ((referrer IS NOT NULL AND TRIM(referrer) != '')
+               OR (utm_source IS NOT NULL AND utm_source != '') OR utm_campaign = 'ai_search')${V}
       `).all(cutoff, ...vp) as HumanReferralRow[];
 
       if (rows.length === 0) return [];

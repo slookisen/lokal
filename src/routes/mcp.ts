@@ -19,14 +19,19 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { textEntries } from "../utils/text-entries";
+import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
+import { openingHoursText } from "../utils/opening-hours";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
+import { capFreeText, capName, capNameList } from "../utils/free-text";
+import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import { findOffers, resolveOffersRadiusKm, resolveOffersLimit } from "../services/catalog-offers";
 import { formatAddressLine } from "../utils/address-format";
@@ -48,11 +53,14 @@ import { buildRequestMeta } from "../services/conversation-service";
 import { isMcpInitializeRequestBody, sendMcpSessionNotFound } from "../services/mcp-session-protocol";
 import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
+import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
+import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 
 const router = Router();
 
@@ -91,6 +99,14 @@ export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, s
   return map;
 }
 
+/** One catalog row's availability, as lokal_info annotates a product with it. */
+export interface CatalogAvailability {
+  availability: string;
+  availabilityUpdatedAt: string | null;
+  /** products.availability_source ('producer_dashboard' when the producer set it). */
+  availabilitySource?: string | null;
+}
+
 // dev-request 2026-07-13-supply-graph-v1 (Slice 1): per-agent name_norm →
 // effective-availability lookup, built the same way getCatalogProductIdMap()
 // builds its id map. Deliberately NOT filtered to availability='in_stock' —
@@ -98,11 +114,13 @@ export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, s
 // SURFACE the current effective availability (including 'unknown' for a
 // stale producer_dashboard row, or 'out_of_stock' etc.) for every catalog
 // row, so callers can annotate products regardless of stock state.
+// Slice I-S (F2): the row's availability_source is carried along, so
+// formatProductsForMcp keeps a row the producer set as a product.
 export function getCatalogAvailabilityMap(
   agentId: string,
   db?: any
-): Map<string, { availability: string; availabilityUpdatedAt: string | null }> {
-  const map = new Map<string, { availability: string; availabilityUpdatedAt: string | null }>();
+): Map<string, CatalogAvailability> {
+  const map = new Map<string, CatalogAvailability>();
   try {
     const conn = db ?? getDb();
     const rows = conn
@@ -122,6 +140,7 @@ export function getCatalogAvailabilityMap(
         map.set(r.name_norm, {
           availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
           availabilityUpdatedAt: r.availability_updated_at ?? null,
+          availabilitySource: r.availability_source,
         });
       }
     }
@@ -131,34 +150,69 @@ export function getCatalogAvailabilityMap(
   return map;
 }
 
+// Integration test 2026-10-17 (AI-1): the knowledge fields are JSON columns
+// (knowledge-service rowToKnowledge) whose shape the type does not guarantee,
+// so `products` may hold a string, an object or null entries. A product only
+// counts when it is an object with a string name.
+function productNameOf(p: unknown): string {
+  const name = p && typeof p === "object" ? (p as { name?: unknown }).name : undefined;
+  return typeof name === "string" ? name.trim() : "";
+}
+
+/** The note under lokal_info's «Kategorier:» line (I-N). */
+export const MCP_CATEGORY_LABELS_NOTE =
+  "_Dette er kategorinavn, ikke oppførte produkter — spør produsenten hva som selges. / " +
+  "These are category names, not listed products; ask the producer what they sell._";
+
+/**
+ * The product list of lokal_info (and of lokal_search's detailed view).
+ * Integration test 2026-10-17, slice I-N (AI2-02): an entry that is only a
+ * generic category label (isCategoryLabelProduct, e.g. «Honning» or «Kjøtt»
+ * written by the enrichment's category inference) is listed under
+ * «Kategorier:» instead, without a catalog id or availability: it is no
+ * product a cart could take or a stock status could be claimed for. Every
+ * other entry is rendered exactly as before. Slice I-S (F2): an entry whose
+ * catalog row the producer set (availabilitySource 'producer_dashboard') is
+ * a product, with its id and availability.
+ */
 export function formatProductsForMcp(
-  products: any[],
+  products: unknown,
   productIdByNorm?: Map<string, string>,
-  availabilityByNorm?: Map<string, { availability: string; availabilityUpdatedAt: string | null }>
+  availabilityByNorm?: Map<string, CatalogAvailability>
 ): string {
-  if (!products?.length) return "";
+  if (!Array.isArray(products) || !products.length) return "";
 
   const lines: string[] = [];
   let productCount = 0;
+  // I-N: the category labels, once each (case-insensitive), as first written.
+  const categoryLabels = new Map<string, string>();
 
   for (const p of products) {
-    const name = (p.name || "").trim();
+    const name = productNameOf(p);
     if (!name) continue;
 
     const { cleanName, price, section } = parseProductPrice(p);
 
-    // Section header
+    // Section header. I-F: the price and category are DB JSON too — an object
+    // used to render as "[object Object]", so only text is shown.
+    const priceText = productPriceText(p.price);
     if (section && isProductHeader(name)) {
       lines.push(`\n**${section}**`);
-      if (p.price && !/^\d/.test(p.price)) lines.push(`_${p.price}_`);
+      if (priceText && !/^\d/.test(priceText)) lines.push(`_${priceText}_`);
       continue;
     }
 
     // Skip noise
     if (isProductNoise(name)) continue;
 
+    if (isCategoryLabelProduct(p, availabilityByNorm?.get(normalizeProductName(cleanName))?.availabilitySource)) {
+      const key = cleanName.toLowerCase();
+      if (!categoryLabels.has(key)) categoryLabels.set(key, cleanName);
+      continue;
+    }
+
     // Product line
-    const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
+    const cat = typeof p.category === "string" && p.category && p.category !== "other" ? ` [${p.category}]` : "";
     const priceStr = price ? ` — ${price}` : "";
     const seasonal = p.seasonal ? " 🌿sesong" : "";
     // orch-pr-14: append the catalog product_id when this product exists in the
@@ -180,11 +234,81 @@ export function formatProductsForMcp(
     productCount++;
   }
 
-  return productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
+  const productSection = productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
+  const categorySection = categoryLabels.size
+    ? `\n**Kategorier:** ${[...categoryLabels.values()].join(", ")}\n${MCP_CATEGORY_LABELS_NOTE}`
+    : "";
+  // A blank line between the two, so the line is not read as part of the last list item.
+  return [productSection, categorySection].filter(Boolean).join("\n");
 }
 
-// Build contact + product summary for a given agent ID, used by search results
-function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
+/**
+ * Integration test 2026-10-17 (I-F): the knowledge part of one row of a
+ * result list (lokal_search, lokal_discover). An error there leaves that
+ * row's knowledge out — the producer is still listed — instead of failing the
+ * whole list. It is logged as `[knowledge-guard]` with the tool, the agent id,
+ * the error class and where it was thrown, never the message: it can quote
+ * the stored value (JSON.parse's does), and the row holds contact details.
+ */
+export function knowledgeRowOrSkip<T>(tool: string, agentId: string, skipped: T, read: () => T): T {
+  try {
+    return read();
+  } catch (err) {
+    console.error(`[knowledge-guard] ${tool}: knowledge of agent ${agentId} skipped (${errorKindAndSite(err)})`);
+    return skipped;
+  }
+}
+
+/** "TypeError at fn (file:line:col)": the error class and its first stack frame, no message. */
+function errorKindAndSite(err: unknown): string {
+  if (!(err instanceof Error)) return typeof err;
+  // A V8 stack starts with String(err), the name and the message (which can
+  // span lines); the frames come after it.
+  const stack = err.stack ?? "";
+  const header = String(err);
+  const site = stack.startsWith(header)
+    ? stack.slice(header.length).split("\n").map((l) => l.trim()).find((l) => l.startsWith("at "))
+    : undefined;
+  return site ? `${err.name} ${site}` : err.name;
+}
+
+/**
+ * Contact + product summary of one search result. `products` is the
+ * producer's product list without section headers and noise (I-N reads it
+ * to tell a listed product from a category label); it is absent when the
+ * summary could not be built (no such agent, or a knowledge row that fails).
+ */
+interface AgentKnowledgeSummary {
+  contact?: any;
+  productSummary?: string;
+  productsCount: number;
+  products?: readonly unknown[];
+}
+
+// Build contact + product summary for a given agent ID, used by search results.
+// I-F: one row's error leaves its summary out (knowledgeRowOrSkip).
+function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledgeSummary {
+  return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId));
+}
+
+/**
+ * The «🛒 …» line of a search result: the first five products with prices,
+ * and how many more there are. Slice I-S (F5): category labels are no
+ * products here either (isCategoryLabelProduct), so a producer with only
+ * labels has no line.
+ */
+function productSummaryText(realProducts: readonly unknown[]): string | undefined {
+  const listed = realProducts.filter((p) => !isCategoryLabelProduct(p));
+  const topItems = listed.slice(0, 5).map((p: any) => {
+    const { cleanName, price } = parseProductPrice(p);
+    return price ? `${cleanName} (${price})` : cleanName;
+  });
+  return topItems.length
+    ? `🛒 ${topItems.join(", ")}${listed.length > 5 ? ` +${listed.length - 5} flere` : ""}`
+    : undefined;
+}
+
+function buildAgentKnowledgeSummary(agentId: string): AgentKnowledgeSummary {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return { productsCount: 0 };
 
@@ -195,27 +319,310 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
   if (k.email) contact.email = k.email;
   if (k.website) contact.website = k.website;
 
-  const products = k.products || [];
-  const realProducts = products.filter((p: any) => {
-    const n = (p.name || "").trim();
+  const products: unknown[] = Array.isArray(k.products) ? k.products : [];
+  const realProducts = products.filter((p) => {
+    const n = productNameOf(p);
     return n && !isProductHeader(n) && !isProductNoise(n);
   });
 
-  // Compact view: top 5 product names with prices
-  const topItems = realProducts.slice(0, 5).map((p: any) => {
-    const { cleanName, price } = parseProductPrice(p);
-    return price ? `${cleanName} (${price})` : cleanName;
-  });
-
-  const productSummary = topItems.length
-    ? `🛒 ${topItems.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
-    : undefined;
-
   return {
     contact: Object.keys(contact).length ? contact : undefined,
-    productSummary,
+    // Compact view: top 5 product names with prices
+    productSummary: productSummaryText(realProducts),
     productsCount: realProducts.length,
+    products: realProducts,
   };
+}
+
+// ─── Integration test 2026-10-17 (AI-1): tolerant fields, no leaked errors ──
+// lokal_info answered `k.openingHours.map is not a function` for producers
+// whose openingHours is stored as text: `?.length` is true for a string too,
+// and the SDK puts an uncaught handler error's message into the tool result.
+
+// textEntries — the text entries of a list-valued DB JSON field — lives in
+// utils/text-entries.ts since slice I-F (knowledge-service.ts uses it too);
+// it is re-exported here so this module's exports stay as they were.
+export { textEntries };
+
+/**
+ * The «Åpningstider» section of lokal_info. Slice I-H: the entries and their
+ * text come from utils/opening-hours.ts (openingHoursText), the reading the
+ * producer page and the A2A auto-reply use too, so every stored form shows
+ * the same hours on all three: {day, open, close} renders as before ("Man
+ * 10:00–17:00"), {day, hours}, {day, from, to}, {days, …}, a period, a note
+ * without times and day names such as "monday", "Lørdag" or "Man-fre" are
+ * shown, a text entry or free text for the whole field is shown as it is,
+ * and anything else is left out (I-A: it used to render as "undefined").
+ * Slice I-O: text in the day-and-time form ("Man-Fre 07-22, Lor 08-22") is
+ * read as its days and times ("Man–Fre 07:00–22:00, Lør 08:00–22:00"), and a
+ * season note is shown with the times it limits.
+ */
+export function formatOpeningHoursForMcp(openingHours: unknown): string {
+  const text = openingHoursText(openingHours);
+  return text ? `\n## Åpningstider\n${text}` : "";
+}
+
+/**
+ * The whole text of a tool result when its handler throws. Without it the
+ * SDK returns the raw exception message (createToolError), which is how a
+ * JavaScript TypeError reached ChatGPT. The detail is logged instead.
+ */
+export const MCP_INTERNAL_ERROR_TEXT = mcpInternalErrorText("Rett fra Bonden");
+
+/**
+ * Wraps a tool handler: an uncaught error is logged with the tool name and
+ * becomes an isError result with MCP_INTERNAL_ERROR_TEXT. The arguments are
+ * not logged (lokal_cart_* carry buyer contact details and the buyer_ref token).
+ */
+export function guardToolHandler<H extends (...args: any[]) => unknown>(tool: string, handler: H): H {
+  const guarded = async (...args: Parameters<H>) => {
+    try {
+      return await handler(...args);
+    } catch (err) {
+      return mcpToolInternalErrorResult("mcp", MCP_INTERNAL_ERROR_TEXT, tool, err);
+    }
+  };
+  return guarded as unknown as H;
+}
+
+/**
+ * The text of a tool result that returns a cart-service result as JSON.
+ * A 5xx result carries internal error text: submitCart answers a failed
+ * transaction with `Submit failed: ${err.message}`, which is the database's
+ * own message. Such a result keeps its JSON shape and status, its error
+ * becomes MCP_INTERNAL_ERROR_TEXT, and the detail is logged without the
+ * arguments (they carry buyer data). A 4xx error is a fixed text meant for
+ * the buyer ("Cart is empty", "1 item(s) are no longer available") and is
+ * returned as it is.
+ */
+export function cartResultText(tool: string, result: { success: boolean; status?: unknown; error?: unknown }): string {
+  if (result.success === false && typeof result.status === "number" && result.status >= 500) {
+    console.error(`[mcp] ${tool} failed: status ${result.status}:`, String(result.error));
+    return JSON.stringify({ ...result, error: MCP_INTERNAL_ERROR_TEXT }, null, 2);
+  }
+  return JSON.stringify(result, null, 2);
+}
+
+/**
+ * The most items one lokal_find_offers call looks up (dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y2, FUNN
+ * rfb-find-offers-items-uten-antallstak). Each item is a catalog lookup and
+ * the schema has no max (it is frozen while OpenAI reviews the app), so 5000
+ * items took about 5 s on live-like data, and a 1 MB list tens of seconds.
+ * A shopping list is far shorter. The items past the cap are left out, and
+ * the answer says so (offersItemsOmittedText).
+ */
+export const MAX_OFFER_ITEMS = 20;
+
+/** How many of the items left out the note names (offersItemsOmittedText). */
+const OMITTED_OFFER_ITEMS_NAMED = 5;
+
+/**
+ * The note of a lokal_find_offers answer that left items out (NO / EN): the
+ * first MAX_OFFER_ITEMS of `items` were looked up. It names the first
+ * OMITTED_OFFER_ITEMS_NAMED items left out, each cut as a name (capName), so
+ * the client can ask for exactly those.
+ */
+export function offersItemsOmittedText(items: readonly string[]): string {
+  const asked = items.length;
+  const left = asked - MAX_OFFER_ITEMS;
+  const named = items.slice(MAX_OFFER_ITEMS, MAX_OFFER_ITEMS + OMITTED_OFFER_ITEMS_NAMED)
+    .map((item) => JSON.stringify(capName(item))).join(", ");
+  const no = `Bare de ${MAX_OFFER_ITEMS} første av ${asked} varene er slått opp, og ${left} er utelatt`;
+  const en = `Only the first ${MAX_OFFER_ITEMS} of ${asked} items were looked up, and ${left} ${left === 1 ? "was" : "were"} left out`;
+  if (left <= OMITTED_OFFER_ITEMS_NAMED) {
+    return `${no}: ${named}. Spør etter ${left === 1 ? "den" : "dem"} i et nytt kall. / ` +
+      `${en}: ${named}. Ask for ${left === 1 ? "it" : "them"} in another call.`;
+  }
+  return `${no}. De første av dem er ${named}. Spør etter resten i et nytt kall. / ` +
+    `${en}, the first of them ${named}. Ask for the rest in another call.`;
+}
+
+// ─── Integration test 2026-10-17 (AI-3): generic category labels ───────────
+
+// isGenericCategoryName — I-A's name rule — lives in utils/category-label.ts
+// since slice I-S (catalog-offers.ts uses the same rule); it is re-exported
+// here so this module's exports stay as they were.
+export { isGenericCategoryName };
+
+/**
+ * Slice I-N (AI2-02): a product entry that is only a generic category label,
+ * the kind the enrichment's category inference writes as product names
+ * («Honning», «Kjøtt», «Egg»): a category name without a numeric price. A
+ * category name with a price («Egg» at «60 kr/brett») is something the
+ * producer listed, and stays a product; category inference never writes a
+ * price. Slice I-S: the rule is utils/category-label.ts (isCategoryLabel),
+ * and `availabilitySource` is that of the entry's catalog row, when known —
+ * a row the producer set is a product (F2).
+ */
+export function isCategoryLabelProduct(p: unknown, availabilitySource?: string | null): boolean {
+  const name = productNameOf(p);
+  return !!name && isCategoryLabel({ name, hasPrice: !!parseProductPrice(p as any).price, availabilitySource });
+}
+
+/**
+ * True when the product names a producer matched a search with
+ * (DiscoverMeta.productMatches) include a real product. The registry's
+ * product match also hits the generic category labels the enrichment writes
+ * as product names («Honning», «Egg», «Bakervarer»); a producer that matched
+ * only such labels is a category match.
+ */
+export function documentsListedProduct(matchedNames: readonly string[]): boolean {
+  return matchedNames.length > 0 && !areGenericCategoryNames(matchedNames);
+}
+
+/**
+ * documentsListedProduct, plus slice I-N: a matched category name that has a
+ * price in the producer's product list is a listed product too
+ * (isCategoryLabelProduct), as lokal_info lists it.
+ */
+function matchedListedProduct(matchedNames: readonly string[], products: readonly unknown[] | undefined): boolean {
+  if (documentsListedProduct(matchedNames)) return true;
+  if (!matchedNames.length || !products) return false;
+  const matched = new Set(matchedNames.map((n) => n.trim().toLowerCase()));
+  return products.some((p) => matched.has(productNameOf(p).toLowerCase()) && !isCategoryLabelProduct(p));
+}
+
+/**
+ * Slice I-N (AI-3a): the category words of a search that a match is labelled
+ * against. parseNaturalQuery turns each of them into a category but never
+ * into a product term (PRODUCT_TERM_EXCLUSIONS in marketplace-registry.ts,
+ * unchanged), so for «egg i Bergen» discover() has no product match that
+ * tells «Ferske egg fra Fana» from a bakery's label «Egg». This list only
+ * drives the labelling; the matching is untouched. Each word maps to the
+ * product categories whose products count for it; the first is the category
+ * parseNaturalQuery gives the word (slice I-W: `bakery` for "brød", which
+ * also counts the old `bread`). The words are Norwegian, as the product
+ * names are: an English query is read with the parser's own glossary
+ * («meat» → «kjøtt»). Drink
+ * words are not here: drink venues are found by category (Fase 5), and
+ * «Drikke» is no product word.
+ */
+const CATEGORY_LABEL_WORDS: Readonly<Record<string, readonly string[]>> = {
+  "grønnsaker": ["vegetables"], "grønt": ["vegetables"],
+  "frukt": ["fruit"],
+  "bær": ["berries"],
+  "meieri": ["dairy"],
+  "kjøtt": ["meat"],
+  "fisk": ["fish"], "sjømat": ["fish"],
+  "brød": ["bakery", "bread"], "bakervarer": ["bakery", "bread"],
+  "urter": ["herbs"],
+  "egg": ["eggs"],
+};
+
+/**
+ * The category words (CATEGORY_LABEL_WORDS) of `query`, and of the Norwegian
+ * terms parseNaturalQuery adds for its English food words
+ * (norwegianTermsForEnglishQuery), whose category the parser detected; in
+ * that order, once each. Words are whole tokens of the lower-cased text, with
+ * the letter class of the registry's norwegianWordBoundary, so «egg» is found
+ * in «egg i Bergen» and not in «eggerøre».
+ */
+export function categoryLabelWordsOf(query: string, categories: readonly string[] | undefined): string[] {
+  if (!categories?.length) return [];
+  const words: string[] = [];
+  const text = [query, ...norwegianTermsForEnglishQuery(query)].join(" ").toLowerCase();
+  for (const token of text.split(/[^0-9a-zà-öø-ÿ_]+/)) {
+    const productCategories = Object.prototype.hasOwnProperty.call(CATEGORY_LABEL_WORDS, token) ? CATEGORY_LABEL_WORDS[token] : undefined;
+    if (productCategories && categories.includes(productCategories[0]) && !words.includes(token)) words.push(token);
+  }
+  return words;
+}
+
+/** True when a product entry belongs to a category word: its name contains the word, or its category is one of the word's. */
+function productBelongsToWord(p: unknown, word: string): boolean {
+  if (productNameOf(p).toLowerCase().includes(word)) return true;
+  const category = (p as { category?: unknown }).category;
+  return typeof category === "string" && CATEGORY_LABEL_WORDS[word].includes(category.trim().toLowerCase());
+}
+
+/** A product without a category of its own (none, not text, or `other`), which could belong to any word. */
+function hasNoOwnCategory(p: unknown): boolean {
+  const category = (p as { category?: unknown }).category;
+  return typeof category !== "string" || !category.trim() || category.trim().toLowerCase() === "other";
+}
+
+/**
+ * How a producer's product list answers the category words of a search
+ * (slice I-N, AI-3a):
+ * - "listed": a product that is not a category label belongs to a word;
+ * - "label": only category labels do («Egg»);
+ * - "none": no product does, and every product that is not a label has a
+ *   category of its own, so none of them is a word's product unseen;
+ * - null: unknown — the list could not be read, or a product without a
+ *   category of its own («Poteter» for «grønnsaker») could be one.
+ */
+export function categoryWordEvidence(
+  products: readonly unknown[] | undefined,
+  words: readonly string[],
+): "listed" | "label" | "none" | null {
+  if (!products) return null;
+  let label = false;
+  let unknown = false;
+  for (const p of products) {
+    if (!productNameOf(p)) continue;
+    const isLabel = isCategoryLabelProduct(p);
+    if (words.some((w) => productBelongsToWord(p, w))) {
+      if (!isLabel) return "listed";
+      label = true;
+    } else if (!isLabel && hasNoOwnCategory(p)) {
+      unknown = true;
+    }
+  }
+  return label ? "label" : unknown ? null : "none";
+}
+
+/**
+ * The products a search matched, among the producer's products (slice I-N):
+ * a product term match is a name discover() matched (DiscoverMeta.productMatches),
+ * a category word match is productBelongsToWord. Category labels never count.
+ */
+function isListedMatch(p: unknown, matchedNames: ReadonlySet<string>, words: readonly string[]): boolean {
+  if (isCategoryLabelProduct(p)) return false;
+  return matchedNames.has(productNameOf(p).toLowerCase()) || words.some((w) => productBelongsToWord(p, w));
+}
+
+/**
+ * The products in the order their «🛒 …» summary shows them (slice I-N, AI-3a):
+ * unchanged when every listed match is among the first five shown (category
+ * labels are not shown, slice I-S); otherwise the listed matches come first,
+ * so the product that made the match is shown (Bønes Gårdsmat's «Ferske egg
+ * fra Fana» was its 7th product).
+ */
+function productsWithMatchesShown(products: readonly unknown[], isMatch: (p: unknown) => boolean): readonly unknown[] {
+  if (!products.filter((p) => !isCategoryLabelProduct(p)).slice(5).some(isMatch)) return products;
+  return [...products.filter(isMatch), ...products.filter((p) => !isMatch(p))];
+}
+
+/**
+ * Slice I-N (AI2-08): stored prose for MCP text. normalizeProse (entities
+ * decoded, internal notes dropped), then the HTML tags scraped text can carry
+ * («Liamyrane 6<br />5132 Nyborg»): a line break tag and the end of a block
+ * (</p>, </div>, </li>, </h1>…) become `lineBreak`, other tags are removed,
+ * and the lines are trimmed, with empty ones dropped. Only tag-shaped text
+ * counts as a tag («<b>», «</p>», «<a href=…>»), so «a < b» and «<3» stay;
+ * each pattern is linear in the text. Text without a tag is returned exactly
+ * as normalizeProse gives it.
+ * Slice I-V: a stored description can end inside a tag, cut off before its
+ * «>» («<div data-…», «<link rel='stylesheet' …»). A «<» (or «</») and a
+ * letter with no «<» or «>» after it, to the end of the text, is such a
+ * fragment and is removed too. The trade-off: a tag left unclosed in the
+ * middle of the text looks the same, so the text after it goes with it
+ * («Velkommen <img src="x" Vi selger lam» keeps «Velkommen»). Showing less is
+ * the safer side; a tag's attributes never reach the text.
+ */
+export function mcpProse(text: string | null | undefined, lineBreak = "\n"): string {
+  const prose = normalizeProse(text);
+  const withBreaks = prose
+    .replace(/<br\s*\/?>|<\/(?:p|div|li|h[1-6]|tr)\s*>/gi, "\n")
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*)?\/?>/g, "")
+    .replace(/<\/?[a-zA-Z][^<>]*$/, "");
+  if (withBreaks === prose) return prose;
+  return withBreaks
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(lineBreak);
 }
 
 // ─── Tool definitions (shared logic) ────────────────────────
@@ -266,6 +673,25 @@ function outsideNorwayAnswer(place: string) {
   };
 }
 
+/**
+ * Slice I-W: lokal_search's answer to a search without a place when no product
+ * name matches the words the parser could not read (`words`, quoted).
+ */
+function noProductMatchText(words: string): string {
+  return `🔎 Ingen produsent har ${words} i produktlista eller i navnet, så søket gir ingen treff. ` +
+    "Prøv et annet ord, en kategori (for eksempel «bakervarer» eller «honning») eller et produsentnavn. / " +
+    `No producer lists ${words} as a product or has it in its name, so there are no matches. ` +
+    "Try another word, a category (for example «bakery» or «honey») or a producer name.";
+}
+
+/** Slice I-W: the line above a list of the producers near a place when no product there matches `words`. */
+function areaListText(words: string): string {
+  return `🔎 Ingen produsent i området har ${words} i produktlista. Listen under er produsentene i området, ikke treff på ${words}; ` +
+    "søk uten sted for hele landet. / " +
+    `No producer in the area lists ${words}. The list below is the producers in the area, not matches for ${words}; ` +
+    "search without a place to cover all of Norway.\n\n";
+}
+
 export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
@@ -290,6 +716,20 @@ export function registerTools(
       sessionId: extra?.sessionId,
     });
   };
+  // Slice I-Z: whether a search raises the producers' discovery counters.
+  // Not for our own traffic or a probe (search-tracking.ts searchCountable),
+  // read off the same headers and client name as deliver() above.
+  const countable = (extra: ToolExtra, text: string, structured = false) => searchCountable({
+    meta: buildRequestMeta({ headers: extra?.requestInfo?.headers }),
+    clientName: (server as any).server?.getClientVersion?.()?.name ?? null,
+    text,
+    structured,
+  });
+
+  // Every tool handler below runs inside guardToolHandler (integration test
+  // 2026-10-17, AI-1): an internal error is logged and never returned. The
+  // tools that return a cart-service result as JSON go through cartResultText,
+  // which does the same for a 5xx result.
 
   // Tool 1: Natural language search
   server.registerTool(
@@ -322,8 +762,10 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ query, lat, lng, radius_km, limit }, extra) => {
-      const q = query || "";
+    guardToolHandler("lokal_search", async ({ query, lat, lng, radius_km, limit }, extra) => {
+      // Slice I-Y: at most MAX_FREE_TEXT_CHARS of the text are read, cut at a
+      // word boundary (utils/free-text.ts). The schema keeps no max (frozen).
+      const q = capFreeText(query || "");
       const foreign = foreignPlaceIn(q);
       if (foreign) return outsideNorwayAnswer(foreign);
       const parsed = marketplaceRegistry.parseNaturalQuery(q);
@@ -368,9 +810,17 @@ export function registerTools(
       // directly), so it needs the same honest-drop signal as the REST/web
       // search surfaces — not just the underlying filter fix.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta);
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q) });
+
+      // Integration test 2026-10-17, slice I-W: the words the parser could not
+      // read are looked up in the product names (discover() step 3c). When no
+      // product matches, the answer says so: «zzzqqx» used to get the standard
+      // list as «fant 50 produsenter», with no mark that none of them matched.
+      const unknownTerms = (parsed as any)._unknownTerms as string[] | undefined;
+      const unmatched = discoverMeta.unmatchedTerms?.length ? `«${discoverMeta.unmatchedTerms.join(" ")}»` : null;
 
       if (!results?.length) {
+        if (unmatched && !parsed.location) return { content: [{ type: "text" as const, text: noProductMatchText(unmatched) }] };
         const where = hasCoords ? `innenfor ${parsed.maxDistanceKm} km` : `"${q}"`;
         return { content: [{ type: "text" as const, text: `Ingen resultater for ${where}. Prøv et bredere søk.` }] };
       }
@@ -391,15 +841,74 @@ export function registerTools(
       // were only rendered into the assistant's prose.
       const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
 
+      // I-W: near a place, the producers there are listed when no product
+      // matches, and the header says they are no matches.
+      const unmatchedLine = unmatched ? areaListText(unmatched) : "";
+      const found = unmatched
+        ? `${results.length} produsenter i området, ikke treff på ${unmatched}`
+        : `fant ${results.length} produsenter`;
       const header = hasCoords
-        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — fant ${results.length} produsenter:\n`
-        : `🥬 **Lokal mat-søk: "${q}"** — fant ${results.length} produsenter:\n`;
+        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — ${found}:\n`
+        : `🥬 **Lokal mat-søk: "${q}"** — ${found}:\n`;
 
       // If name match (1-3 results from specific query), include full product list
       // so AI can answer product/price questions directly without a second tool call
       const isSpecificQuery = results.length <= 3 && (parsed as any)._nameQuery;
 
-      const lines = results.map((r: any, i: number) => {
+      // Compact view for broader searches. ChatGPT app re-review 2026-10-03:
+      // a producer kept only for its broad category (`meat` for "lamb") says
+      // so, instead of reading like a documented match.
+      // I-W: the words step 3c matched in product names count as product terms.
+      // I-W2: next to a category word the words only rank its producers, so
+      // they count only when a product name matched them («Which bakeries
+      // make kransekake»); otherwise the category words label as before.
+      const unknownTermsCount = !!unknownTerms && !unmatched
+        && (!parsed.categories?.length || !!discoverMeta.productMatches?.size);
+      const productTerms = ((parsed as any)._productTerms as string[] | undefined)
+        ?? (unknownTermsCount ? unknownTerms : undefined) ?? [];
+      // Slice I-N (AI-3a): a search with no product term, only category words
+      // («egg i Bergen», «meat»), is labelled against those words. A product
+      // term («honning», «reinsdyr») is the more specific evidence and keeps
+      // I-A's rule alone.
+      const labelWords = isSpecificQuery || productTerms.length ? [] : categoryLabelWordsOf(q, parsed.categories);
+      const terms = [...productTerms, ...labelWords].join("/");
+      const compactMatch = (r: any, summary: AgentKnowledgeSummary) => {
+        const reasons = (r.matchReasons as string[] | undefined) ?? [];
+        // Integration test 2026-10-17 (AI-3): a producer whose matched
+        // product names are only generic category labels («Honning», «Egg»)
+        // has no listed product. discover() hands over every matched name;
+        // its «Produkter: …» reason names at most three.
+        const matchedNames = discoverMeta.productMatches?.get(r.agent.id) ?? [];
+        const wordEvidence = labelWords.length ? categoryWordEvidence(summary.products, labelWords) : null;
+        const documented = matchedListedProduct(matchedNames, summary.products) || wordEvidence === "listed";
+        // Name matches bypass product scoring; absent product evidence in
+        // that branch must not turn a named lookup into a category match.
+        const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
+        // I-N: unknown evidence for category words (a product without a
+        // category of its own, such as «Poteter» for «grønnsaker») is no
+        // ground for a label.
+        const categoryOnly = (productTerms.length > 0 || wordEvidence !== null) && !documented && !nameMatch;
+        const categoryLabelOnly = matchedNames.length > 0 || wordEvidence === "label";
+        // I-N: the summary shows the product that made a listed match.
+        let productSummary = summary.productSummary;
+        if (documented && summary.products) {
+          const names = new Set(matchedNames.map((n) => n.trim().toLowerCase()));
+          const shown = productsWithMatchesShown(summary.products, (p) => isListedMatch(p, names, labelWords));
+          if (shown !== summary.products) productSummary = productSummaryText(shown);
+        }
+        return { categoryOnly, categoryLabelOnly, productSummary };
+      };
+
+      // Slice I-N (AI-3b): explicit matches come before category matches, as
+      // the server instructions ask; discover()'s order (relevance, distance)
+      // is kept within each group, and the numbering follows the new order.
+      const rows = results.map((r: any) => {
+        const summary = getAgentKnowledgeSummary("lokal_search", r.agent.id);
+        return { r, summary, match: isSpecificQuery ? undefined : compactMatch(r, summary) };
+      });
+      const ordered = [...rows.filter((row) => !row.match?.categoryOnly), ...rows.filter((row) => row.match?.categoryOnly)];
+
+      const lines = ordered.map(({ r, summary, match }, i: number) => {
         const agent = r.agent;
         // dev-request 2026-07-25 Fase 1c (honesty rule): distanceKm is only
         // present for address-precision producers. A centroid-precision row
@@ -410,54 +919,63 @@ export function registerTools(
           : agent.location?.distanceLabel
             ? ` — ${agent.location.distanceLabel} (omtrentlig posisjon)`
             : "";
-        const summary = getAgentKnowledgeSummary(agent.id);
 
-        if (isSpecificQuery) {
+        if (!match) {
           // Detailed view: include full product list with prices
-          const info = knowledgeService.getAgentInfo(agent.id);
-          const k = info?.knowledge || {} as any;
           const sections = [formatAgentCompact(agent, i + 1, summary.contact, undefined, getClientIdentity?.()) + dist];
 
-          // Full product list — orch-pr-14: pass catalog id map so each
-          // priced/in-stock product line carries its product_id for cart use.
-          if (k.products?.length) {
-            sections.push(formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id)));
-          }
+          // I-F: products and details come from the same knowledge row as
+          // the summary; an error there leaves them out of this result only.
+          sections.push(...knowledgeRowOrSkip("lokal_search", agent.id, [] as string[], () => {
+            const details: string[] = [];
+            const k = knowledgeService.getAgentInfo(agent.id)?.knowledge || {} as any;
 
-          // Extra details
-          if (k.specialties?.length) sections.push(`\n**Spesialiteter:** ${k.specialties.join(", ")}`);
-          if (k.paymentMethods?.length) sections.push(`💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
-          if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+            // Full product list — orch-pr-14: pass catalog id map so each
+            // priced/in-stock product line carries its product_id for cart use.
+            if (k.products?.length) {
+              const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+              if (productSection) details.push(productSection);
+            }
+
+            // Extra details
+            const specialties = textEntries(k.specialties);
+            const paymentMethods = textEntries(k.paymentMethods);
+            const deliveryOptions = textEntries(k.deliveryOptions);
+            if (specialties.length) details.push(`\n**Spesialiteter:** ${specialties.join(", ")}`);
+            if (paymentMethods.length) details.push(`💳 **Betaling:** ${paymentMethods.join(", ")}`);
+            if (deliveryOptions.length) details.push(`🚚 **Levering:** ${deliveryOptions.join(", ")}`);
+            return details;
+          }));
 
           // Profile link
-          const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
-          sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+          // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+          if (!failsProducerRoleGate((agent as any).role, false)) {
+            const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
+            sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+          }
 
           return sections.join("\n");
         } else {
-          // Compact view for broader searches. ChatGPT app re-review
-          // 2026-10-03: a producer kept only for its broad category (`meat`
-          // for "lamb") says so, instead of reading like a documented match.
-          const productTerms = ((parsed as any)._productTerms as string[] | undefined) ?? [];
-          const reasons = (r.matchReasons as string[] | undefined) ?? [];
-          const documented = reasons.some((m) => m.startsWith("Produkter:"));
-          // Name matches bypass product scoring; absent product evidence in
-          // that branch must not turn a named lookup into a category match.
-          const nameMatch = reasons.some((m) => m.startsWith("Navnematch:") || m.startsWith("Mulig navnematch:"));
-          const categoryOnly = productTerms.length > 0 && !documented && !nameMatch;
-          const categoryOnlyNote = categoryOnly
-            ? `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${productTerms.join("/")}» — spør produsenten. / Category match only: the listed products don't mention «${productTerms.join("/")}»; ask the producer.`
-            : "";
-          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.(), categoryOnly ? {
-            headingSuffix: ` — Kategoritreff / category-only: «${productTerms.join("/")}» ikke oppført / not listed`,
+          // Compact view (compactMatch above).
+          const { categoryOnly, categoryLabelOnly, productSummary } = match;
+          const categoryOnlyNote = !categoryOnly ? ""
+            : categoryLabelOnly
+              ? `\n   ⚠️ Kategoritreff: produktlista har «${terms}» bare som kategorinavn, ikke som et bestemt produkt — spør produsenten. / Category match only: the product list has «${terms}» only as a category name, not as a specific product; ask the producer.`
+              : `\n   ⚠️ Kategoritreff: produktlista nevner ikke «${terms}» — spør produsenten. / Category match only: the listed products don't mention «${terms}»; ask the producer.`;
+          return formatAgentCompact(agent, i + 1, summary.contact, { ...summary, productSummary }, getClientIdentity?.(), categoryOnly ? {
+            headingSuffix: categoryLabelOnly
+              ? ` — Kategoritreff / category-only: «${terms}» bare som kategorinavn / category name only`
+              : ` — Kategoritreff / category-only: «${terms}» ikke oppført / not listed`,
             hideDescription: true,
           } : undefined) + dist + categoryOnlyNote;
         }
       });
 
-      deliver("lokal_search", { query, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
-      return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
-    }
+      // Slice I-Y: the cut text, as tannlege_search and lokal_find_offers
+      // log it. An absent query stays absent, so that call's key is as before.
+      deliver("lokal_search", { query: query === undefined ? undefined : q, lat, lng, radius_km, limit }, extra, results.map((r: any) => r.agent.id));
+      return { content: [{ type: "text" as const, text: tagsRelaxedLine + unmatchedLine + header + "\n" + lines.join("\n\n") }] };
+    })
   );
 
   // Tool 2: Structured discovery
@@ -500,7 +1018,27 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+    guardToolHandler("lokal_discover", async ({ categories: categoriesAsSent, tags: tagsAsSent, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra) => {
+      // GHSA-46jr (lokal#1229): a list longer than MCP_MAX_FILTER_LIST is
+      // refused here, not with .max() in the inputSchema, so tools/list stays
+      // the frozen contract (services/mcp-input-limits.ts).
+      if (Array.isArray(categoriesAsSent) && categoriesAsSent.length > MCP_MAX_FILTER_LIST) {
+        return mcpListTooLongResult("categories", MCP_MAX_FILTER_LIST, categoriesAsSent.length);
+      }
+      if (Array.isArray(tagsAsSent) && tagsAsSent.length > MCP_MAX_FILTER_LIST) {
+        return mcpListTooLongResult("tags", MCP_MAX_FILTER_LIST, tagsAsSent.length);
+      }
+      // dev-request 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+      // rfb-discover-lister-uten-tak): discover() compares every category and
+      // tag with every producer's, and the schema has no max (it is frozen
+      // while OpenAI reviews the app). 175 000 categories took 45 s on
+      // live-like data, one category of 1 MB 6.1 s. The lists are cut to
+      // their first MAX_NAME_LIST_ITEMS names of at most MAX_NAME_CHARS
+      // (utils/free-text.ts), as A2A's are, before the search, the traffic
+      // class and the delivery log read them. Lists within the caps are the
+      // same lists, so a real call answers as before.
+      const categories = capNameList(categoriesAsSent);
+      const tags = capNameList(tagsAsSent);
       // ChatGPT app re-review 2026-10-03: lat/lng/maxDistanceKm used to be
       // passed top-level, but discover() reads `location: {lat, lng}` — so the
       // distance filter never ran and every call returned a nationwide list
@@ -530,7 +1068,7 @@ export function registerTools(
       // gets back non-budget producers with no indication the filter was
       // silently dropped.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover(body, discoverMeta);
+      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true) });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
@@ -551,13 +1089,13 @@ export function registerTools(
           : r.agent.location?.distanceLabel
             ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
             : "";
-        const summary = getAgentKnowledgeSummary(r.agent.id);
-        return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
+        const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id);
+        return formatAgentCompact(r.agent, i + 1, summary.contact, summary, getClientIdentity?.()) + dist;
       });
 
       deliver("lokal_discover", { categories, tags, drinkSubcategory, lat, lng, maxDistanceKm, limit }, extra, results.map((r: any) => r.agent.id));
       return { content: [{ type: "text" as const, text: tagsRelaxedLine + header + "\n" + lines.join("\n\n") }] };
-    }
+    })
   );
 
   // Tool 3: Producer details
@@ -577,9 +1115,12 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ agentId }, extra) => {
+    guardToolHandler("lokal_info", async ({ agentId }, extra) => {
       const info = knowledgeService.getAgentInfo(agentId);
-      if (!info) {
+      // Shared by-id visibility predicate (agent-visibility.ts; flag-gated —
+      // off = served as before). allowCatalogHidden: the hidden test fixture
+      // stays orderable by id.
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
@@ -597,7 +1138,10 @@ export function registerTools(
         } else {
           // Strip an appended internal pipeline note (Daniel 2026-09-03) —
           // an AI agent must not relay the fleet's own working notes either.
-          sections.push(`\n${normalizeProse(k.about)}`);
+          // I-N (AI2-08): scraped HTML tags («<br />») are no text either.
+          // I-S (F1): an about of only tags gives no section.
+          const about = mcpProse(k.about);
+          if (about) sections.push(`\n${about}`);
         }
       }
 
@@ -612,12 +1156,9 @@ export function registerTools(
       // vCard
       sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
 
-      // Opening hours
-      if (k.openingHours?.length) {
-        const dayNames: Record<string, string> = { mon: "Man", tue: "Tir", wed: "Ons", thu: "Tor", fri: "Fre", sat: "Lør", sun: "Søn" };
-        const hours = k.openingHours.map((h: any) => `${dayNames[h.day] || h.day} ${h.open}–${h.close}`).join(", ");
-        sections.push(`\n## Åpningstider\n${hours}`);
-      }
+      // Opening hours (an array, or free text — see formatOpeningHoursForMcp)
+      const hoursSection = formatOpeningHoursForMcp(k.openingHours);
+      if (hoursSection) sections.push(hoursSection);
 
       // Products — structured with parsed prices.
       // orch-pr-14: attach catalog product_id (products.id) to each in-stock
@@ -627,19 +1168,24 @@ export function registerTools(
         if (productSection) sections.push(productSection);
       }
 
-      if (k.specialties?.length) sections.push(`\n## Spesialiteter\n${k.specialties.map((s: string) => `- ${s}`).join("\n")}`);
-      if (k.certifications?.length) sections.push(`\n## Sertifiseringer\n${k.certifications.map((c: string) => `- ${c}`).join("\n")}`);
-      if (k.paymentMethods?.length) sections.push(`\n💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
-      if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+      const specialties = textEntries(k.specialties);
+      const certifications = textEntries(k.certifications);
+      const paymentMethods = textEntries(k.paymentMethods);
+      const deliveryOptions = textEntries(k.deliveryOptions);
+      if (specialties.length) sections.push(`\n## Spesialiteter\n${specialties.map((s) => `- ${s}`).join("\n")}`);
+      if (certifications.length) sections.push(`\n## Sertifiseringer\n${certifications.map((c) => `- ${c}`).join("\n")}`);
+      if (paymentMethods.length) sections.push(`\n💳 **Betaling:** ${paymentMethods.join(", ")}`);
+      if (deliveryOptions.length) sections.push(`🚚 **Levering:** ${deliveryOptions.join(", ")}`);
 
       if (meta.disclaimer) {
-        const src = meta.autoSources?.length ? ` (kilder: ${meta.autoSources.join(", ")})` : "";
+        const autoSources = textEntries(meta.autoSources);
+        const src = autoSources.length ? ` (kilder: ${autoSources.join(", ")})` : "";
         sections.push(`\n---\n_${meta.disclaimer}${src}_`);
       }
 
       deliver("lokal_info", { agentId }, extra, [agent.id]);
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 4: Platform stats
@@ -657,7 +1203,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async () => {
+    guardToolHandler("lokal_stats", async () => {
       // Same three figures as the rettfrabonden.com front page: the honest
       // catalog count, and distinct cities and categories among the producers
       // a visitor can find. getStats().totalAgents also counts inactive,
@@ -669,7 +1215,7 @@ export function registerTools(
       for (const a of agents as any[]) {
         const city = a.city || a.location?.city;
         if (city) cities.add(city);
-        for (const c of a.categories || []) categories.add(c);
+        for (const c of textEntries(a.categories)) categories.add(c);
       }
       const text = [
         "📊 **Rett fra Bonden — Plattformstatistikk**",
@@ -678,7 +1224,7 @@ export function registerTools(
         `Kategorier: ${categories.size}`,
       ].join("\n");
       return { content: [{ type: "text" as const, text }] };
-    }
+    })
   );
 
   // ─── Phase 5.11 A2.5 tools — umbrella discovery ────────────
@@ -702,7 +1248,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ umbrellaType, limit }) => {
+    guardToolHandler("lokal_list_umbrellas", async ({ umbrellaType, limit }) => {
       const db = getDb();
       const wheres: string[] = ["umbrella_type IS NOT NULL", "is_active = 1"];
       const params: any[] = [];
@@ -759,7 +1305,7 @@ export function registerTools(
         }
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 6: Producers in an umbrella's network
@@ -780,7 +1326,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ umbrellaId, limit }, extra) => {
+    guardToolHandler("lokal_get_umbrella_members", async ({ umbrellaId, limit }, extra) => {
       const db = getDb();
       const umbrella = db.prepare(
         "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND umbrella_type IS NOT NULL AND is_active = 1"
@@ -791,7 +1337,7 @@ export function registerTools(
 
       const lim = Math.min(limit || 100, 500);
       const rows = db.prepare(`
-        SELECT p.id, p.name, p.city, aff.labels
+        SELECT p.id, p.name, p.city, p.role, p.umbrella_type AS member_umbrella_type, aff.labels
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
@@ -808,15 +1354,18 @@ export function registerTools(
       const sections = [`🤝 **${umbrella.name}** — ${rows.length} produsenter:\n`];
       for (const m of rows) {
         let labels: string[] = [];
-        if (m.labels) { try { labels = JSON.parse(m.labels); } catch { /* ignore */ } }
+        if (m.labels) { try { labels = textEntries(JSON.parse(m.labels)); } catch { /* ignore */ } }
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const where = m.city ? ` — ${m.city}` : "";
         sections.push(`- **${m.name}**${where}${labelStr}`);
-        sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
+        // Skive A2: no link for roles whose /produsent/<slug> page 404s.
+        if (!failsProducerRoleGate(m.role, !!m.member_umbrella_type)) {
+          sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
+        }
       }
       deliver("lokal_get_umbrella_members", { umbrellaId, limit }, extra, rows.map((m: any) => m.id));
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 7: Umbrellas a producer belongs to
@@ -836,7 +1385,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ producerId }) => {
+    guardToolHandler("lokal_get_producer_affiliations", async ({ producerId }) => {
       const db = getDb();
       const producer = db.prepare(
         "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
@@ -869,14 +1418,14 @@ export function registerTools(
       const sections = [`🔗 **${producer.name}** — ${rows.length} tilknytninger:\n`];
       for (const a of rows) {
         let labels: string[] = [];
-        if (a.labels) { try { labels = JSON.parse(a.labels); } catch { /* ignore */ } }
+        if (a.labels) { try { labels = textEntries(JSON.parse(a.labels)); } catch { /* ignore */ } }
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const type = typeLabels[a.umbrella_type] || a.umbrella_type;
         sections.push(`- **${a.name}** (${type})${labelStr}`);
         sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(a.name)}`, getClientIdentity?.())}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 8: Upcoming Bondens marked events (PR-56, 2026-05-16)
@@ -901,7 +1450,12 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ region, lokallag_slug, days }) => {
+    guardToolHandler("lokal_bm_next_markets", async ({ region: regionAsSent, lokallag_slug, days }) => {
+      // Slice I-Y2 (FUNN strukturerte-stedsfelt-uten-lengdetak): `region` is a
+      // place name, cut to MAX_NAME_CHARS at a word boundary
+      // (utils/free-text.ts). It is a LIKE over each event's place, and an
+      // empty answer echoes it.
+      const region = capName(regionAsSent);
       const db = getDb();
       const lookahead = Math.max(1, Math.min(days || 30, 90));
       const fromIso = new Date().toISOString();
@@ -969,7 +1523,7 @@ export function registerTools(
         sections.push(`  Kilde: ${r.source_url}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
+    })
   );
 
   // Tool 9: Geocode Norwegian place names (PR-76)
@@ -997,7 +1551,10 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ place }) => {
+    guardToolHandler("lokal_geocode", async ({ place: placeAsSent }) => {
+      // Slice I-Y2: a place name, cut to MAX_NAME_CHARS at a word boundary
+      // (utils/free-text.ts); the answer echoes it when nothing is found.
+      const place = capName(placeAsSent);
       const result = await geocodingService.geocode(place);
       if (!result) {
         return {
@@ -1014,7 +1571,7 @@ export function registerTools(
           text: `📍 ${result.name}\nlat: ${result.lat}\nlng: ${result.lng}\nradius_km: ${result.radiusKm}\nsource: ${result.source}`,
         }],
       };
-    }
+    })
   );
 
   // Tool: lokal_find_offers — dev-request 2026-09-16-handleliste-med-
@@ -1047,7 +1604,18 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ items, near, lat, lng, radius_km }, extra) => {
+    guardToolHandler("lokal_find_offers", async ({ items, near: nearAsSent, lat, lng, radius_km }, extra) => {
+      // GHSA-46jr (lokal#1229): more than MCP_MAX_SHOPPING_ITEMS items is
+      // refused here, not with .max() in the inputSchema, so tools/list stays
+      // the frozen contract. 21..MCP_MAX_SHOPPING_ITEMS items keep the
+      // MAX_OFFER_ITEMS cut and its note below.
+      if (Array.isArray(items) && items.length > MCP_MAX_SHOPPING_ITEMS) {
+        return mcpListTooLongResult("items", MCP_MAX_SHOPPING_ITEMS, items.length);
+      }
+      // Slice I-Y2: `near` is a place name, cut to MAX_NAME_CHARS at a word
+      // boundary (utils/free-text.ts). Each item's lookup used to geocode the
+      // whole text again.
+      const near = capName(nearAsSent);
       const foreign = foreignPlaceIn(near);
       if (foreign) return outsideNorwayAnswer(foreign);
       const hasCoords = isValidLatLng(lat as number, lng as number);
@@ -1061,8 +1629,13 @@ export function registerTools(
       }
 
       const radiusKm = resolveOffersRadiusKm(radius_km);
+      // Slice I-Y: each item is a catalog lookup, so each is cut like the
+      // search text (utils/free-text.ts). An item past SQLite's LIKE pattern
+      // limit (50 000 bytes) used to fail the whole call.
+      // Slice I-Y2: and only the first MAX_OFFER_ITEMS items are looked up.
+      const terms = items.slice(0, MAX_OFFER_ITEMS).map((item) => capFreeText(item));
       const results = [];
-      for (const q of items) {
+      for (const q of terms) {
         const result = await findOffers({
           q,
           near: hasCoords ? undefined : near,
@@ -1074,9 +1647,14 @@ export function registerTools(
         results.push(result);
       }
 
-      deliver("lokal_find_offers", { items, near, lat, lng, radius_km }, extra, results.flatMap((r) => r.offers.map((o) => o.producer.agent_id)));
-      return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
-    }
+      // I-S2: a category match hands its producer to the caller too.
+      deliver("lokal_find_offers", { items: terms, near, lat, lng, radius_km }, extra,
+        results.flatMap((r) => [...r.offers, ...(r.category_matches ?? [])].map((o) => o.producer.agent_id)));
+      const content = [{ type: "text" as const, text: JSON.stringify(results, null, 2) }];
+      // I-Y2: the JSON stays the list of results; the note is its own part.
+      if (items.length > MAX_OFFER_ITEMS) content.push({ type: "text" as const, text: offersItemsOmittedText(items) });
+      return { content };
+    })
   );
 
   // ─── Cart tools (Phase 1) ────────────────────────────────────
@@ -1101,7 +1679,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async () => {
+    guardToolHandler("lokal_cart_create", async () => {
       try {
         const result = svcCreateCart();
         return {
@@ -1111,10 +1689,11 @@ export function registerTools(
           }],
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: msg }) }] };
+        // Same rule as guardToolHandler: the detail is logged, never returned.
+        console.error("[mcp] lokal_cart_create failed:", err instanceof Error ? err.stack || err.message : String(err));
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: MCP_INTERNAL_ERROR_TEXT }) }] };
       }
-    }
+    })
   );
 
   // Tool 11: Add item to cart
@@ -1143,7 +1722,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ cart_id, buyer_ref, product_id, qty, note }) => {
+    guardToolHandler("lokal_cart_add_item", async ({ cart_id, buyer_ref, product_id, qty, note }) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
@@ -1159,7 +1738,7 @@ export function registerTools(
           text: JSON.stringify({ success: true, item: result.item, cart }, null, 2),
         }],
       };
-    }
+    })
   );
 
   // Tool 12: View cart
@@ -1180,7 +1759,7 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ cart_id, buyer_ref }) => {
+    guardToolHandler("lokal_cart_view", async ({ cart_id, buyer_ref }) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
@@ -1190,7 +1769,7 @@ export function registerTools(
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Cart not found" }) }] };
       }
       return { content: [{ type: "text" as const, text: JSON.stringify(cart, null, 2) }] };
-    }
+    })
   );
 
   // Tool 13: Submit cart → place pickup orders
@@ -1235,7 +1814,7 @@ export function registerTools(
         openWorldHint: true,
       },
     },
-    async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent, ...rest }: any) => {
+    guardToolHandler("lokal_cart_submit", async ({ cart_id, buyer_ref, buyer_name, buyer_email, buyer_phone, delivery_note, contact_consent, ...rest }: any) => {
       const check = svcCheckCartToken(cart_id, buyer_ref);
       if (!check.ok) {
         return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
@@ -1258,8 +1837,8 @@ export function registerTools(
             baseUrl: process.env.BASE_URL || "https://rettfrabonden.com",
           })
         : svcSubmitCart(cart_id, contact);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    }
+      return { content: [{ type: "text" as const, text: cartResultText("lokal_cart_submit", result) }] };
+    })
   );
 
   // Tool 14: Order status
@@ -1282,10 +1861,10 @@ export function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ order_id, buyer_ref }) => {
+    guardToolHandler("lokal_order_status", async ({ order_id, buyer_ref }) => {
       const result = svcGetOrder(order_id, buyer_ref);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    }
+      return { content: [{ type: "text" as const, text: cartResultText("lokal_order_status", result) }] };
+    })
   );
 
   // ─── MCP Resources ──────────────────────────────────────────
@@ -1321,7 +1900,8 @@ export function registerTools(
     async (uri) => {
       const agentId = uri.pathname?.split("/").pop() || "";
       const info = knowledgeService.getAgentInfo(agentId);
-      if (!info) {
+      // Shared by-id visibility predicate (flag-gated, see lokal_info).
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
       return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };
@@ -1331,20 +1911,28 @@ export function registerTools(
 
 // ─── Compact agent formatter ────────────────────────────────
 
-function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string, clientIdentity?: string,
+// `products` is the producer's AgentKnowledgeSummary: its «🛒 …» line, and the
+// lokal_info pointer when it has products (I-S: also when they are only
+// category labels, which have no 🛒 line).
+function formatAgentCompact(agent: any, idx: number, contact?: any,
+  products?: Pick<AgentKnowledgeSummary, "productSummary" | "productsCount">, clientIdentity?: string,
   display?: { headingSuffix?: string; hideDescription?: boolean }): string {
   const lines = [`**${idx}. ${agent.name}${display?.headingSuffix ?? ""}**`];
   if (agent.description && !display?.hideDescription) {
     if (isJunkDescription(agent.description)) {
       console.log(`[description-guard] suppressed junk description (lokal_search) for ${agent.id} (${agent.name})`);
     } else {
-      lines.push(`   ${normalizeProse(agent.description)}`);
+      // I-N (AI2-08): a line break in scraped HTML keeps the result's indent.
+      // I-S (F1): a description of only tags gives no line.
+      const description = mcpProse(agent.description, "\n   ");
+      if (description) lines.push(`   ${description}`);
     }
   }
 
   const meta: string[] = [];
   if ((agent as any).city || agent.location?.city) meta.push(`📍 ${(agent as any).city || agent.location?.city}`);
-  if (agent.categories?.length) meta.push(`🏷️ ${agent.categories.join(", ")}`);
+  const categories = textEntries(agent.categories);
+  if (categories.length) meta.push(`🏷️ ${categories.join(", ")}`);
   if (meta.length) lines.push(`   ${meta.join("  ·  ")}`);
 
   if (contact) {
@@ -1357,8 +1945,8 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
   }
 
   // Product summary: top products with "get details" hint
-  if (productSummary) {
-    lines.push(`   ${productSummary}`);
+  if (products?.productSummary) lines.push(`   ${products.productSummary}`);
+  if (products?.productsCount) {
     // dev-request 2026-09-05-rfb-mcp-engelsk-sok-kategorifeil: this line used
     // to promise "full prisliste". lokal_info's own tool description was
     // corrected in 2026-08-24-rfb-mcp-verktoybeskrivelser-vs-virkelighet
@@ -1372,7 +1960,10 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
 
   // Profile link
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
-  lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
+  // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
+  if (!failsProducerRoleGate((agent as any).role, false)) {
+    lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
+  }
 
   return lines.join("\n");
 }
@@ -1411,6 +2002,13 @@ function detectMcpClient(req: Request): string | undefined {
 
 const sessions = new Map<string, McpSession>();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// The /mcp rate limiter's "is this a live session?" check (mcpPrimaryKey in
+// middleware/mcp-rate-limit.ts): only a session this router minted gets its
+// own bucket. Read-only; nothing here changes session handling.
+export function hasMcpSession(sessionId: string): boolean {
+  return sessions.has(sessionId);
+}
 
 // Cleanup stale sessions every 5 minutes
 setInterval(() => {
@@ -1511,7 +2109,7 @@ async function getOrCreateSession(
   const clientIdentity = req ? detectMcpClient(req) : undefined;
   const requestMeta = req ? buildRequestMeta(req) : undefined;
 
-  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions() });
+  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" }, { instructions: rfbMcpInstructions(), maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS });
   const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
   registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 

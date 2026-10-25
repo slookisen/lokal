@@ -7,6 +7,7 @@ import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
+import { getSearchConsolesHealth, startSearchConsoleScheduler } from "./services/search-console-fetch";
 import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
   securityHeaders,
@@ -38,6 +39,7 @@ import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
 import { mcpIpEmergencyBrakeLimiter, mcpPrimaryLimiter, mcpCartToolLimiter } from "./middleware/mcp-rate-limit";
+import { installClientIp, resolveClientIpConfig } from "./middleware/client-ip";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
 import conversationUiRoutes from "./routes/conversation-ui";
@@ -64,7 +66,8 @@ import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
-import adminDbBackupRoutes, { diskUsage } from "./routes/admin-db-backup";
+import adminDbBackupRoutes, { diskUsage, createBackupAgeSweepTick, BACKUP_AGE_SWEEP_TICK_MS } from "./routes/admin-db-backup";
+import adminSearchConsolesRoutes from "./routes/admin-search-consoles";
 import adminConversationsTrafficClassRoutes from "./routes/admin-conversations-traffic-class";
 import adminCrossVerticalContactLookupRoutes from "./routes/admin-cross-vertical-contact-lookup";
 import adminAgentsRoutes from "./routes/admin-agents";
@@ -88,7 +91,8 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
-import gardssalgClaimRoutes from "./routes/gardssalg-claim";
+import avmeldRoutes from "./routes/avmeld";
+import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
@@ -115,6 +119,7 @@ import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
+import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
@@ -158,7 +163,7 @@ import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
-import { trustScoreService } from "./services/trust-score-service";
+import { trustScoreService, TRUST_SCORE_FORMULA_VERSION } from "./services/trust-score-service";
 import {
   runExclusiveBootJob, getJobLastCompletedAt, markJobCompleted, shouldSkipRecentRun,
   resolveMinIntervalHours, URL_BACKFILL_JOB, URL_BACKFILL_BOOT_DELAY_MS,
@@ -195,22 +200,32 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Proxy trust ─────────────────────────────────────────────
-// Fly.io (and most PaaS) terminates TLS and forwards requests
-// via a reverse proxy that sets X-Forwarded-For.  Without this
-// setting Express ignores that header, which:
-//   1. Breaks express-rate-limit (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR)
-//   2. Makes req.ip return the internal proxy IP, not the client
-//   3. Breaks req.protocol (always "http" instead of "https")
-// "true" = trust the first proxy hop, which is Fly's edge.
-app.set("trust proxy", true);
+// ─── Proxy trust + client IP (dev-request 2026-10-16-klient-ip-fra-fly-client-ip) ───
+// Fly.io terminates TLS and forwards requests via its proxy, which appends
+// to X-Forwarded-For. installClientIp() sets `trust proxy` = true — trust
+// EVERY hop, NOT "the first hop": req.ip is the left-most X-Forwarded-For
+// entry, and req.protocol/req.secure follow the proxy — and mounts
+// middleware/client-ip.ts, which in mode `enforce` rewrites X-Forwarded-For
+// to Fly's own Fly-Client-IP, so a client can no longer pick its own req.ip
+// (and a fresh bucket on every IP-keyed limiter) by sending that header.
+// Mode: CLIENT_IP_MODE (legacy | shadow | enforce), default
+// CLIENT_IP_MODE_DEFAULT; always legacy, i.e. today's behaviour, off Fly.
+// Mounted FIRST — before requestTrackerMiddleware, the www redirect, the host
+// gates and every limiter — so everything that reads req.ip sees the
+// normalized value (pinned by client-ip.test.ts). Never set `trust proxy`
+// anywhere else, and never to 1, 2 or a subnet (see installClientIp).
+// A CDN or another proxy in front of Fly breaks this design's premise
+// (Fly-Client-IP would be the CDN's address): revise middleware/client-ip.ts
+// BEFORE any such DNS switch.
+installClientIp(app, resolveClientIpConfig(process.env));
 
 // ─── Event-loop stall monitor (dev-request 2026-09-19-prod-event-loop-stall-
 // mcp-unhealthy) ────────────────────────────────────────────────
 // Observability only: records when the single event loop every host shares is
 // blocked, together with the requests in flight and the background jobs
-// running at that moment. Mounted FIRST so every request on every host is in
-// the in-flight set. Details: src/services/event-loop-monitor.ts.
+// running at that moment. Mounted right after installClientIp (whose
+// middleware is synchronous and only reads/rewrites headers), so every request
+// on every host is in the in-flight set. Details: src/services/event-loop-monitor.ts.
 // Report: GET /admin/analytics/ops/event-loop. Kill switch: EVENT_LOOP_MONITOR_DISABLED=1.
 startEventLoopMonitor();
 // Slice 1 of 2026-10-08-serverheng…: persist stalls/slow requests/slow jobs to
@@ -313,6 +328,12 @@ app.use(langMiddleware);
 // See routes/resend-webhook.ts + services/resend-webhook.ts.
 app.use("/", resendWebhookRoutes);
 
+// ─── /avmeld/:token — working unsubscribe for cold outreach (S1a point 3,
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere). 404 unless
+// OUTREACH_UNSUBSCRIBE_ENABLED. Mounted here so no host gate can swallow the
+// one-click POST. See routes/avmeld.ts.
+app.use("/", avmeldRoutes);
+
 // ─── POST /webhooks/stripe-connect (prepayment, A2A dev-request
 // 2026-10-09-rfb-forhandsbetaling-stripe-connect) ───────────────────────
 // Stripe Connect events (accounts, payments on producers' own accounts).
@@ -321,6 +342,21 @@ app.use("/", resendWebhookRoutes);
 // Stripe signature (STRIPE_CONNECT_WEBHOOK_SECRET; unset → 503). Mounts
 // nothing unless PAYMENTS_ENABLED=1 (routes/payments.ts).
 mountPaymentWebhook(app);
+
+// ─── Gårdssalg owner-claim host gate (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, I-U) ───────────────────────────────────────
+// gardssalgClaimRoutes (mounted below, between the two host gates) used to
+// answer on every host, ahead of every limiter: rettfrabonden.com served the
+// claim pages. This gate runs first on the claim paths. They are served on
+// opplevagent.no only; on any other host GET/HEAD get a 301 to the same path
+// and query on https://opplevagent.no, every other method a 404, and the
+// router is not reached. Mounted above the finn-tannlege.com gate, which hands
+// /kategori/* to dental-seo and passes /api/* through, so that host answers
+// like the others; agentplatform.no's own gate runs earlier and keeps its 404.
+// Rate limiting is on the claim routes themselves (generalLimiter first on
+// each, see routes/gardssalg-claim.ts), so a served claim request is counted
+// once and never reaches the "/api" generalLimiter mount further down.
+app.use(GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate);
 
 // ─── PR-109: finn-tannlege.com host routing ───────────────────────────
 // Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
@@ -365,7 +401,9 @@ if (process.env.ENABLE_DENTAL === "1") {
     }
 
     // /mcp endpoint → dental Streamable HTTP MCP router (PR-114)
-    // dentalMcpRouter applies its own rate limiting (dentalLimiter).
+    // dentalMcpRouter applies its own rate limiting: its own per-session
+    // chain from middleware/mcp-rate-limit.ts, not dentalLimiter. It runs
+    // after mcpUsageLogger, so its 429s are logged.
     if (p === "/mcp" || p.startsWith("/mcp/")) {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const dentalMcpRouter = require("./routes/dental-mcp").default;
@@ -398,9 +436,11 @@ if (process.env.ENABLE_DENTAL === "1") {
 // (2026-07-25) via curl against the deployed claim-entry page. Its path
 // prefixes are unique to the experiences vertical and never collide with
 // any RFB/dental route (same reasoning as before — see
-// src/routes/gardssalg-claim.ts's module doc), so mounting it earlier, on
-// every host, is still correct: it simply calls next() for every non-
-// matching path, same as any other router.
+// src/routes/gardssalg-claim.ts's module doc), so mounting it earlier is
+// still correct: it simply calls next() for every non-matching path, same as
+// any other router. It still sees every host's requests, but on the claim
+// paths only opplevagent.no's get past gardssalgClaimHostGate (above the
+// finn-tannlege.com gate, I-U).
 app.use("/", gardssalgClaimRoutes);
 
 // ─── orchestrator-pr-19: opplevagent.no host routing (experiences) ─────
@@ -448,7 +488,9 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
     }
 
     // /mcp endpoint → experiences Streamable HTTP MCP router (orchestrator-pr-33)
-    // experiencesMcpRouter applies its own rate limiting (jsonRpcLimiter).
+    // experiencesMcpRouter applies its own rate limiting: its own per-session
+    // chain from middleware/mcp-rate-limit.ts, not the /a2a jsonRpcLimiter. It
+    // runs after mcpUsageLogger, so its 429s are logged.
     // Mounted BEFORE /a2a so a dental-style host-dispatch ordering is preserved
     // and opplevagent /mcp requests never fall through to rfb's /mcp router.
     if (p === "/mcp" || p.startsWith("/mcp/")) {
@@ -754,6 +796,9 @@ app.get("/health", (_req, res) => {
       // Numbers only here (public endpoint); per-stall request/job detail is
       // admin-only at GET /admin/analytics/ops/event-loop.
       eventLoop: getEventLoopSummary(),
+      // GSC / Bing connection (A2A 2026-10-16-gsc-bing-ai-rapporter): status codes,
+      // counts and check time only, read from memory — never a network call here.
+      searchConsoles: getSearchConsolesHealth(),
       responseMs,
     });
   } catch (err) {
@@ -766,6 +811,10 @@ app.get("/health", (_req, res) => {
   }
 });
 
+// GET /admin/analytics/search-consoles — weekly GSC/Bing numbers per domain
+// (A2A 2026-10-16-gsc-bing-ai-rapporter, S6c). Own router, mounted before the
+// analytics router below.
+app.use("/admin/analytics/search-consoles", adminLimiter, adminSearchConsolesRoutes);
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
@@ -845,6 +894,9 @@ app.use("/admin/agents/duplicate-merge", adminLimiter, adminAgentsDuplicateMerge
 // lever (dev-request 2026-08-10-rfb-hjemmesidejakt-full-loype, Skive 8).
 // Same ordering rule as the siblings above — mount BEFORE /admin/agents.
 app.use("/admin/agents/deactivate", adminLimiter, adminAgentsDeactivateRoutes);
+// POST /admin/agents/business-type + GET .../classification-dryrun — shop marker
+// (dev-request 2026-10-01-rfb-butikker-i-outreach-poolen). Mount BEFORE /admin/agents.
+app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRoutes);
 // POST /admin/test-producer — the ONE hidden RFB test producer for real test
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.
@@ -1398,9 +1450,13 @@ app.listen(Number(PORT), HOST, async () => {
   // boot-job gate, so it never blocks >500 ms nor overlaps url-backfill.
   // Slice 2 of dev-request 2026-10-08-serverheng-...: starts 4 min after listen
   // (was 2 s) and is skipped when it completed within the last 24 h
-  // (boot_job_state, same pattern as url-backfill).
+  // (boot_job_state, same pattern as url-backfill). The stamp is per formula
+  // version (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-
+  // og-places-treffvakt, S4-A1b), so the first boot after a formula change
+  // recalculates every score.
   scheduleBootTrustRecalc({
     getDb: () => getDb(),
+    formulaVersion: TRUST_SCORE_FORMULA_VERSION,
     recalc: trackJob("boot-trust-recalc", async () => {
       console.log("📊 Recalculating trust scores (background, chunked)...");
       const trustResult = await trustScoreService.recalculateAllChunked({ chunkSize: 20, pauseMs: 5 });
@@ -1461,6 +1517,14 @@ app.listen(Number(PORT), HOST, async () => {
   // boot prewarm and trust recalc), then hourly; the nightly prune below also
   // awaits one run before deleting. Disable with TRAFFIC_HISTORY_DISABLED=1.
   startTrafficHistoryScheduler({ getDb: () => getDb(), bootDelayMs: 6 * 60_000 });
+
+  // ─── GSC and Bing Webmaster (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c)
+  // Read-only connectivity check 2 min after boot (after the boot-job gate),
+  // then every 24 h; the same run fetches the latest complete week into
+  // search_console_weekly. Runs when GSC_SERVICE_ACCOUNT_JSON and/or
+  // BING_WEBMASTER_API_KEY is set; SEARCH_CONSOLE_FETCH_ENABLED=0 turns it off.
+  // Status in /health (searchConsoles), numbers at /admin/analytics/search-consoles.
+  startSearchConsoleScheduler({ getDb: () => getDb() });
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // in-memory delivery counts are written as daily sums every minute and on
@@ -1657,6 +1721,13 @@ app.listen(Number(PORT), HOST, async () => {
 // Disable by setting RFB_DISABLE_OFFSITE_BACKUP=1 (e.g. on local dev / CI).
 if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
   setInterval(trackJob("offsite-backup", createOffsiteBackupTick({ getStateDb: () => getDb() })), OFFSITE_TICK_MS);
+}
+
+// ─── Manual DB copies: nightly age sweep (dev-request 2026-10-12-manuelle-db-kopier-aldersgrense) ──
+// Deletes on-volume copies older than 30 days (DB_BACKUP_MAX_AGE_DAYS) even when no new copy is
+// taken. Runs once per UTC day in the 02 UTC hour (outside 00-01Z and 06:30-09:30Z); async unlink.
+if (process.env.RFB_DISABLE_OFFSITE_BACKUP !== "1") {
+  setInterval(trackJob("db-backup-age-sweep", createBackupAgeSweepTick()), BACKUP_AGE_SWEEP_TICK_MS);
 }
 
 // ─── PR-95 (2026-06-01): daily Debio verification sync ──────────────
@@ -1874,6 +1945,22 @@ if (
   }), 60 * 60_000);
 }
 
+// ─── dev-request 2026-10-16-indexnow-alle-verter (S2): IndexNow sitemap-diff sync ───
+// Default OFF. First tick at boot + 10 min (after the geocode ticks), then hourly. The tick
+// itself skips 06:30-09:30 UTC and a run younger than 30 min (boot_job_state).
+if (process.env.INDEXNOW_SYNC_ENABLED === "true") {
+  const indexNowSyncTick = trackJob("indexnow-sync", async () => {
+    try {
+      const { indexNowSyncTick: tick } = await import("./services/indexnow-sync");
+      await tick();
+    } catch (err) {
+      console.error("[indexnow-sync] tick failed:", err);
+    }
+  });
+  setTimeout(indexNowSyncTick, 10 * 60_000);
+  setInterval(indexNowSyncTick, 60 * 60_000);
+}
+
 // ─── dev-request 2026-07-04-opplevagent-naer-meg-geosok (item 1, 2026-07-10):
 // Backend experiences geocoding worker ───────────────────────────────
 //
@@ -1967,6 +2054,39 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   });
   setTimeout(() => { void experienceProposalsTick(); }, 5 * 60_000);
   setInterval(() => { void experienceProposalsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, tillegg 2026-10-15 «4b-forslag»: gårdssalg
+// visit-text proposals — same file-queue mechanics as the description
+// proposals job above (services/proposal-file-queue.ts), reading
+// `gardssalg-visit-proposals/` in slookisen/A2A and storing through
+// applyGardssalgVisitProposals() with the server re-fetching every source.
+// Never calls an LLM. OFF by default: GARDSSALG_VISIT_PROPOSALS_JOB_ENABLED
+// === "true" turns it on; flipping it back is the rollback. First tick 6
+// minutes after boot, hourly after that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let gardssalgVisitProposalsRunning = false;
+  const gardssalgVisitProposalsTick = trackJob("gardssalg-visit-proposals", async () => {
+    if (gardssalgVisitProposalsRunning) return;
+    gardssalgVisitProposalsRunning = true;
+    try {
+      const { tickGardssalgVisitProposals } = await import("./services/gardssalg-visit-proposals-job");
+      const r = await tickGardssalgVisitProposals();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[gardssalg-visit-proposals] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-visit-proposals] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgVisitProposalsRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgVisitProposalsTick(); }, 6 * 60_000);
+  setInterval(() => { void gardssalgVisitProposalsTick(); }, 60 * 60_000);
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
@@ -2267,6 +2387,38 @@ if (
       console.error("[booking-followups] tick failed:", err);
     }
   }), 60 * 60_000);
+}
+
+// ─── F4 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// order follow-ups — one re-send of a failed producer e-mail, one reminder
+// (+ admin alert) after ORDER_REMINDER_HOURS (24), auto-cancel with
+// producer_no_response after ORDER_AUTOCANCEL_HOURS (72) for pay-at-pickup
+// orders nobody answered. Hourly; idempotent (services/order-followups.ts).
+// Rollback: set the hours very high, or RFB_DISABLE_ORDER_FOLLOWUPS=1.
+// Skive 1b (S3): a bare 60-min setInterval restarts its clock on every deploy
+// or machine restart, so with restarts more often than hourly the job never
+// ran. It now also runs once 5 min after boot; the job is idempotent, so the
+// extra run is harmless.
+if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
+  const orderFollowupsTick = trackJob("order-followups", async () => {
+    try {
+      const { processOrderFollowups } = await import("./services/order-followups");
+      const r = await processOrderFollowups();
+      if (r.retried || r.reminders_sent || r.cancelled || r.auto_completed || r.errors) {
+        console.log(
+          `[order-followups] tick examined=${r.examined} retried=${r.retried} reminders=${r.reminders_sent} ` +
+          `cancelled=${r.cancelled} auto_completed=${r.auto_completed} errors=${r.errors}`
+        );
+      }
+    } catch (err) {
+      console.error("[order-followups] tick failed:", err);
+    }
+  });
+  setTimeout(() => {
+    console.log("[order-followups] first run after boot");
+    void orderFollowupsTick();
+  }, 5 * 60_000);
+  setInterval(orderFollowupsTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───

@@ -17,7 +17,9 @@
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
-import { fylkeEquivalents } from "./norway-fylke";
+import { fylkeEquivalents, normaliseFylke } from "./norway-fylke";
+import { drinkWordProducerTypes } from "./drink-taxonomy";
+import { fillFylkeFromKommune } from "./gardssalg-fylke-from-kommune";
 // dev-request 2026-08-18-gardssalg-set-contact-phone: reuse the SAME write-time
 // phone guard the rfb `agent_knowledge` write path already uses (dev-request
 // 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon) instead of inventing a
@@ -141,6 +143,7 @@ export {
   type DedupCandidateRow,
   type DedupPassResult,
 } from "./experience-dedup";
+import { shouldNoindexExperience, type ProduktByCellStats } from "./experience-indexability";
 
 const VERTICAL = "experiences";
 
@@ -262,6 +265,11 @@ export type Experience = z.infer<typeof ExperienceSchema>;
 // sort `sort:"distance"` can mean — it is accepted as an explicit, documented
 // request for that same behavior, which is otherwise already the default the
 // moment an origin is given).
+/** At most this many DiscoverFilter.text_terms (interpretDiscoverQuery keeps the first ones). */
+export const MAX_TEXT_TERMS = 6;
+/** Longest DiscoverFilter.text_terms word, in characters; a longer token is no search word. */
+export const MAX_TEXT_TERM_LENGTH = 40;
+
 const DiscoverFilterBaseSchema = z.object({
   fylke: z.string().optional(),
   kommune: z.string().optional(),
@@ -273,6 +281,12 @@ const DiscoverFilterBaseSchema = z.object({
   // single-kommune filter is entirely unaffected. See buildKommuneInClause()
   // below for how this drives the SQL WHERE-builder.
   kommuner: z.array(z.string()).optional(),
+  // Several fylker at once: a landsdel ("Nord-Norge") read from
+  // discover_experiences' free-text `query` (LANDSDEL_TO_FYLKER in
+  // experiences-query-intent.ts, dev-request 2026-10-16-opplevagent-mcp-
+  // fritekst-query). Each fylke matches with its reform-era spellings, as
+  // `fylke` does. Additive: no transport takes it as an argument.
+  fylker: z.array(z.string()).optional(),
   category: z.string().optional(),
   indoor_outdoor: IndoorOutdoorSchema.optional(),
   weather: z.enum(["rain", "snow", "clear", "any"]).optional(),
@@ -286,6 +300,15 @@ const DiscoverFilterBaseSchema = z.object({
   lng: z.number().min(-180).max(180).optional(),
   radius_km: z.number().positive().max(5000).optional(),
   sort: z.enum(["distance"]).optional(),
+  // Free-text search words (dev-request 2026-10-16-opplevagent-mcp-fritekst-
+  // query, S2): the words of discover_experiences' `query` that are no place,
+  // category, season, weather or stopword — set by interpretDiscoverQuery()
+  // (experiences-query-intent.ts). Every term must hit title, title_no,
+  // description or subcategory (SEARCH_SYNONYMS-expanded); rows with the
+  // terms in the title rank first. Relaxed first, and gradually: rows with
+  // fewer of the terms before none (discoverExperiencesRelaxed). Additive:
+  // omitted, the query is byte-identical to before.
+  text_terms: z.array(z.string().min(1).max(MAX_TEXT_TERM_LENGTH)).max(MAX_TEXT_TERMS).optional(),
 });
 export const DiscoverFilterSchema = DiscoverFilterBaseSchema.refine(
   (f) => (f.lat === undefined) === (f.lng === undefined),
@@ -390,7 +413,11 @@ export function createProvider(input: Provider): string {
     )
   `).run({
     id, org_nr: p.org_nr ?? null, navn: p.navn,
-    postnummer: p.postnummer ?? null, poststed: p.poststed ?? null, fylke: p.fylke ?? null,
+    postnummer: p.postnummer ?? null, poststed: p.poststed ?? null,
+    // dev-request 2026-10-01-opplevagent-fylke-fra-kommune: fill-only — a set
+    // fylke is kept as-is; a blank one is filled from kommune/kommunenummer
+    // via resolveFylke2024 (needs_review => stays null, never guessed).
+    fylke: fillFylkeFromKommune({ fylke: p.fylke, kommune: p.kommune, kommunenummer: p.kommunenummer }),
     kommune: p.kommune ?? null, kommunenummer: p.kommunenummer ?? null, adresse: p.adresse ?? null,
     lat: p.lat ?? null, lon: p.lon ?? null, telefon: p.telefon ?? null, mobil: p.mobil ?? null,
     epost: p.epost ?? null, hjemmeside: p.hjemmeside ?? null,
@@ -767,7 +794,7 @@ export const PUBLISH_GATE_SQL_EXCEPT_STATUS = PUBLISH_GATE_OTHER_CLAUSES.join(" 
 
 export function getPublishedExperienceBySlug(
   slug: string
-): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null }) | null {
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; updated_at: string | null }) | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
   const row = db
@@ -779,7 +806,11 @@ export function getPublishedExperienceBySlug(
     .get({ slug }) as Record<string, unknown> | undefined;
   if (!row) return null;
   const hydrated = hydrateExperience(row);
-  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id) };
+  // updated_at: the detail page's «Sist oppdatert» (dev-request 2026-10-16-
+  // opplevagent-indekserbarhet-og-strukturdata, E2-S1), the same value as its
+  // sitemap lastmod. Only here, not in hydrateExperience(): MCP outputs that
+  // hydrate rows stay byte-identical.
+  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id), updated_at: (row.updated_at as string | null) ?? null };
 }
 
 export function getProviderById(id: string): Record<string, unknown> | null {
@@ -792,12 +823,16 @@ export function getProviderById(id: string): Record<string, unknown> | null {
   );
 }
 
-export type PublishedSlugRow = { slug: string; updated_at: string | null };
+// `description` (dev-request 2026-10-16-opplevagent-indekserbarhet-og-
+// strukturdata, lokal#1092 review S3): the sitemap needs it for
+// shouldNoindexExperience() and reads it here, behind the publish gate, instead
+// of in a second unfiltered query.
+export type PublishedSlugRow = { slug: string; updated_at: string | null; description: string | null };
 export function listPublishedExperienceSlugs(): PublishedSlugRow[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT e.slug AS slug, e.updated_at AS updated_at
+      `SELECT e.slug AS slug, e.updated_at AS updated_at, e.description AS description
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
@@ -927,8 +962,9 @@ function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
   };
 }
 
-// Confidence-then-title ordering, identical to /discover, so listings rank the
-// same way the agent surface does.
+// Confidence-then-title ordering, as /discover, so listings rank the way the
+// agent surface does — except /discover's data-completeness tie-break between
+// the two (DISCOVER_DATA_COMPLETE_ORDER), which the listings do not use.
 const CARD_ORDER =
   "ORDER BY CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC";
 
@@ -1196,27 +1232,115 @@ export function getCategoryFaqStats(category: string): {
 
 /** Aggregate stats for one kommune's FAQPage JSON-LD: how many distinct
  *  categories have a published experience there, and the lowest listed
- *  starting price (null if no row states one — never guessed). Mirrors
- *  getCategoryFaqStats() but grouped by kommune instead of category. */
+ *  starting price (null if no row states one — never guessed). Thin wrapper
+ *  over getPlaceFaqStats({ kommune }) since E4-S2. */
 export function getKommuneFaqStats(kommune: string): {
   categoryCount: number;
   minPriceFrom: number | null;
 } {
+  const { categoryCount, minPriceFrom } = getPlaceFaqStats({ kommune });
+  return { categoryCount, minPriceFrom };
+}
+
+/** The place a /fylke/<x> or /kommune/<x> page lists: exactly one of the two. */
+export type PlaceFilter = { fylke: string; kommune?: never } | { kommune: string; fylke?: never };
+
+/** The facts a place page's answer-first opening and FAQPage are built from. */
+export type PlaceFaqStats = {
+  total: number;
+  categoryCount: number;
+  kommuneCount: number;
+  providerCount: number;
+  minPriceFrom: number | null;
+};
+
+/** Aggregate stats for one fylke's or kommune's answer-first opening and
+ *  FAQPage JSON-LD (dev-request 2026-10-16-opplevagent-stedssider-kvalitet,
+ *  E4-S2): how many published experiences the place has, across how many
+ *  distinct categories, kommuner and providers, and the lowest listed
+ *  starting price (null if no row states one — never guessed). Same
+ *  browseWhere() filter as the listing, so the facts match what the page
+ *  lists. A blank place name returns zeros: browseWhere() would drop the
+ *  filter and count the whole catalog instead. */
+export function getPlaceFaqStats(place: PlaceFilter): PlaceFaqStats {
+  const filter: BrowseFilter = place.fylke !== undefined ? { fylke: place.fylke } : { kommune: place.kommune };
+  if (!filter.fylke && !filter.kommune) {
+    return { total: 0, categoryCount: 0, kommuneCount: 0, providerCount: 0, minPriceFrom: null };
+  }
   const db = getDb(VERTICAL);
-  const { sql, params } = browseWhere({ kommune });
+  const { sql, params } = browseWhere(filter);
   const row = db
     .prepare(
-      `SELECT COUNT(DISTINCT e.category) AS categoryCount,
+      `SELECT COUNT(*) AS total,
+              COUNT(DISTINCT e.category) AS categoryCount,
+              COUNT(DISTINCT e.kommune) AS kommuneCount,
+              COUNT(DISTINCT e.provider_id) AS providerCount,
               MIN(e.price_from) AS minPriceFrom
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
        WHERE ${sql}`
     )
-    .get(params) as { categoryCount: number; minPriceFrom: number | null } | undefined;
+    .get(params) as PlaceFaqStats | undefined;
   return {
+    total: row?.total || 0,
     categoryCount: row?.categoryCount || 0,
+    kommuneCount: row?.kommuneCount || 0,
+    providerCount: row?.providerCount || 0,
     minPriceFrom: row?.minPriceFrom ?? null,
   };
+}
+
+// Indexable counts for the aggregate pages (dev-request 2026-10-17-
+// integrasjonstest-oppfolging, IDX-1/IDX-2): a combo, kommune or provider
+// page counts the experiences it lists that are indexable, i.e. that
+// shouldNoindexExperience() (experience-indexability.ts) lets through — the
+// same verdict the detail page and its sitemap entry use. The rule runs in
+// memory over the rows' descriptions: isJunkDescription() has no SQL form,
+// and a second copy of it in SQL could drift. Same browseWhere() filter as
+// the listing, so the count covers exactly the rows the page lists. The kill
+// switch is read per call, like the detail page's.
+
+/** How many published experiences matching `filter` are indexable. An empty
+ *  filter, or one with a blank value, counts 0, as in getPlaceFaqStats():
+ *  browseWhere() would drop the blank value and count more than the page
+ *  lists. */
+export function countIndexablePublishedExperiences(filter: BrowseFilter): number {
+  const values = Object.values(filter);
+  if (values.length === 0 || values.some((v) => !v)) return 0;
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere(filter);
+  const rows = db
+    .prepare(
+      `SELECT e.description AS description FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .all(params) as Array<{ description: string | null }>;
+  return rows.filter((r) => !shouldNoindexExperience(r)).length;
+}
+
+/** Indexable published experiences per kommune and per provider id, in one
+ *  query — what the sitemap reads to leave out a /kommune or /tilbyder page
+ *  with none (IDX-2). A key with no indexable row is absent (count 0). */
+export function listIndexableCountsByPlace(): { byKommune: Map<string, number>; byProvider: Map<string, number> } {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere({});
+  const rows = db
+    .prepare(
+      `SELECT e.kommune AS kommune, e.provider_id AS provider_id, e.description AS description
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .all(params) as Array<{ kommune: string | null; provider_id: string | null; description: string | null }>;
+  const byKommune = new Map<string, number>();
+  const byProvider = new Map<string, number>();
+  for (const r of rows) {
+    if (shouldNoindexExperience(r)) continue;
+    if (r.kommune) byKommune.set(r.kommune, (byKommune.get(r.kommune) ?? 0) + 1);
+    if (r.provider_id) byProvider.set(r.provider_id, (byProvider.get(r.provider_id) ?? 0) + 1);
+  }
+  return { byKommune, byProvider };
 }
 
 // GEO: category×kommune cross-tab aggregate + candidate list for the
@@ -1229,15 +1353,12 @@ export function getKommuneFaqStats(kommune: string): {
 
 /** Aggregate stats for one category×kommune combo's FAQPage JSON-LD +
  *  quality gate: how many published experiences of this category exist in
- *  this kommune, how many distinct providers offer them, and the lowest
- *  listed starting price (null if none stated — never guessed). Mirrors
- *  getCategoryFaqStats()/getKommuneFaqStats() but for the intersection of
- *  both dimensions. */
-export function getProduktByStats(category: string, kommune: string): {
-  total: number;
-  providerCount: number;
-  minPriceFrom: number | null;
-} {
+ *  this kommune, how many of them are indexable (IDX-1, see
+ *  countIndexablePublishedExperiences()), how many distinct providers offer
+ *  them, and the lowest listed starting price (null if none stated — never
+ *  guessed). Mirrors getCategoryFaqStats()/getKommuneFaqStats() but for the
+ *  intersection of both dimensions. */
+export function getProduktByStats(category: string, kommune: string): ProduktByCellStats {
   const db = getDb(VERTICAL);
   const { sql, params } = browseWhere({ category, kommune });
   const row = db
@@ -1252,32 +1373,38 @@ export function getProduktByStats(category: string, kommune: string): {
     .get(params) as { total: number; providerCount: number; minPriceFrom: number | null } | undefined;
   return {
     total: row?.total || 0,
+    indexableTotal: countIndexablePublishedExperiences({ category, kommune }),
     providerCount: row?.providerCount || 0,
     minPriceFrom: row?.minPriceFrom ?? null,
   };
 }
 
 /** Every (category, kommune) combo that has ≥1 PUBLISHED experience, with
- *  the same three facts getProduktByStats() returns — the DB-driven
+ *  the same stats getProduktByStats() returns — the DB-driven
  *  candidate list for the query-landing-pages sitemap loop. Deliberately NOT
  *  a full category × kommune cross-product (most cells of that grid are
  *  empty): one GROUP BY query returns exactly the combos that exist in the
- *  catalog, with the quality-gate facts already attached, so the sitemap
- *  builder can apply the ≥2-real-facts gate in-memory over this one result
- *  set instead of issuing a query per candidate combo. */
-export type ProduktByComboRow = {
+ *  catalog, with the quality-gate facts already attached (indexableTotal
+ *  from one more query over the same rows), so the sitemap builder can apply
+ *  the gate in-memory over this one result set instead of issuing a query
+ *  per candidate combo. Rows without a slug
+ *  are left out, as browseWhere() leaves them out of getProduktByStats() and
+ *  the listing (E4-S2), so a listed or linked cell has the facts the route
+ *  sees. */
+export type ProduktByComboRow = ProduktByCellStats & {
   category: string;
   kommune: string;
-  total: number;
-  providerCount: number;
-  minPriceFrom: number | null;
   // MAX(updated_at) of the underlying published rows in this combo — real
   // per-aggregate freshness for the sitemap (see listPublishedCategories() doc).
   lastmod: string | null;
 };
 export function listProduktByCombos(): ProduktByComboRow[] {
   const db = getDb(VERTICAL);
-  return db
+  const cellWhere = `e.slug IS NOT NULL
+         AND e.category IS NOT NULL AND e.category != ''
+         AND e.kommune IS NOT NULL AND e.kommune != ''
+         AND ${PUBLISH_GATE_SQL}`;
+  const rows = db
     .prepare(
       `SELECT e.category AS category, e.kommune AS kommune,
               COUNT(*) AS total,
@@ -1286,13 +1413,28 @@ export function listProduktByCombos(): ProduktByComboRow[] {
               MAX(e.updated_at) AS lastmod
        FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
-       WHERE e.category IS NOT NULL AND e.category != ''
-         AND e.kommune IS NOT NULL AND e.kommune != ''
-         AND ${PUBLISH_GATE_SQL}
+       WHERE ${cellWhere}
        GROUP BY e.category, e.kommune
        ORDER BY total DESC, e.category ASC, e.kommune ASC`
     )
-    .all() as ProduktByComboRow[];
+    .all() as Array<Omit<ProduktByComboRow, "indexableTotal">>;
+  // indexableTotal per cell (IDX-1): the same rows, judged in memory like
+  // countIndexablePublishedExperiences() does for one cell.
+  const descriptions = db
+    .prepare(
+      `SELECT e.category AS category, e.kommune AS kommune, e.description AS description
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${cellWhere}`
+    )
+    .all() as Array<{ category: string; kommune: string; description: string | null }>;
+  const indexable = new Map<string, number>();
+  for (const d of descriptions) {
+    if (shouldNoindexExperience(d)) continue;
+    const key = `${d.category}\u0000${d.kommune}`;
+    indexable.set(key, (indexable.get(key) ?? 0) + 1);
+  }
+  return rows.map((r) => ({ ...r, indexableTotal: indexable.get(`${r.category}\u0000${r.kommune}`) ?? 0 }));
 }
 
 /** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts).
@@ -1435,6 +1577,7 @@ const SEARCH_SYNONYMS: Record<string, string[]> = {
   hval:        ["whale"],
   hvalsafari:  ["whale"],
   nordlys:     ["aurora", "northern lights"],
+  nordlyset:   ["aurora", "northern lights"],
   brevandring: ["glacier"],
   isbre:       ["glacier"],
   hundespann:  ["dog"],
@@ -1454,10 +1597,36 @@ const SEARCH_SYNONYMS: Record<string, string[]> = {
 };
 
 /** Expand one query token with Norwegian→English synonyms (returns ≥1 term). */
-function expandSearchTerm(term: string): string[] {
+export function expandSearchTerm(term: string): string[] {
   const lower = term.toLowerCase();
-  const synonyms = SEARCH_SYNONYMS[lower] ?? [];
+  // Own entries only: "constructor" is a word, not Object.prototype's.
+  const synonyms = Object.prototype.hasOwnProperty.call(SEARCH_SYNONYMS, lower) ? SEARCH_SYNONYMS[lower] : [];
   return synonyms.length > 0 ? [lower, ...synonyms] : [lower];
+}
+
+/**
+ * Word endings stripped from a DiscoverFilter.text_terms word for one more,
+ * shorter variant, so a plural or definite form also finds the base form in
+ * the text: "fjords" → fjord, "whales" → whale, "nordlyset" → nordlys,
+ * "hvalsafarier" → hvalsafari, "fjordene" → fjord. The longest ending that
+ * leaves at least MIN_TEXT_TERM_STEM_LENGTH letters goes ("market" keeps its
+ * "et": "mark" would also hit Finnmark and Telemark). A stem only adds
+ * matches: it is a prefix of the word, and the text is LIKE-searched for
+ * substrings. Used by buildDiscoverWhere() (textTermVariants) only; web /sok
+ * (searchPublishedExperiences → expandSearchTerm) is unchanged.
+ */
+export const TEXT_TERM_STEM_SUFFIXES: readonly string[] = ["ene", "ane", "ies", "er", "ar", "en", "et", "es", "s"];
+export const MIN_TEXT_TERM_STEM_LENGTH = 5;
+
+/** The LIKE variants of one text_terms word: itself, its stem, and the SEARCH_SYNONYMS of both. */
+export function textTermVariants(term: string): string[] {
+  const lower = term.toLowerCase();
+  const suffix = TEXT_TERM_STEM_SUFFIXES
+    .filter((s) => lower.endsWith(s) && lower.length - s.length >= MIN_TEXT_TERM_STEM_LENGTH)
+    .sort((a, b) => b.length - a.length)[0];
+  const variants = expandSearchTerm(lower);
+  if (suffix) variants.push(...expandSearchTerm(lower.slice(0, -suffix.length)));
+  return [...new Set(variants)];
 }
 
 /** Free-text search over PUBLISHED experiences (title/description/category/place).
@@ -1519,11 +1688,14 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
  * future-proofing costs nothing) bind non-colliding placeholder names.
  */
 export function buildFylkeInClause(
-  fylke: string,
+  fylke: string | readonly string[],
   column = "fylke",
   paramPrefix = "fylke"
 ): { sql: string; params: Record<string, string> } {
-  const equivalents = fylkeEquivalents(fylke);
+  // Several fylker (DiscoverFilter.fylker): any of them, each with its equivalents.
+  const equivalents = typeof fylke === "string"
+    ? fylkeEquivalents(fylke)
+    : [...new Set(fylke.flatMap((f) => fylkeEquivalents(f)))];
   const params: Record<string, string> = {};
   const placeholders = equivalents.map((v, i) => {
     const key = `${paramPrefix}${i}`;
@@ -1622,13 +1794,21 @@ export function seasonFilterSpellings(season: string): string[] {
  * why that guarantee matters). `f` must already be DiscoverFilterSchema-parsed.
  * Pure — no DB access, no LIMIT/params.limit (that's caller-specific: a page
  * query needs it, a COUNT(*) doesn't).
+ *
+ * `textTermsAny` (discoverExperiencesRelaxed only): a row needs at least one
+ * of several f.text_terms instead of all of them; textMatchedSql then counts
+ * how many it has.
  */
-function buildDiscoverWhere(f: DiscoverFilter): {
+function buildDiscoverWhere(f: DiscoverFilter, textTermsAny = false): {
   where: string[];
   params: Record<string, unknown>;
   hasGeo: boolean;
   originLat: number | undefined;
   originLng: number | undefined;
+  /** ORDER BY prefix for text_terms (rows with more of the terms, then more in the title, first); "" without text_terms. */
+  textOrderSql: string;
+  /** With textTermsAny: the SQL expression for how many of f.text_terms a row has. */
+  textMatchedSql?: string;
 } {
   // The publish gate is PUBLISH_GATE_SQL itself — verified + confidence
   // high/medium + provider brreg_active + canonical (never a dedup-merged
@@ -1685,6 +1865,11 @@ function buildDiscoverWhere(f: DiscoverFilter): {
     where.push(sql);
     Object.assign(params, kommunerParams);
   }
+  if (f.fylker && f.fylker.length > 0) {
+    const { sql, params: fylkerParams } = buildFylkeInClause(f.fylker, "e.fylke", "fylker");
+    where.push(sql);
+    Object.assign(params, fylkerParams);
+  }
   if (f.category) { where.push("e.category = @category"); params.category = f.category; }
   if (f.indoor_outdoor) { where.push("e.indoor_outdoor IN (@io, 'both')"); params.io = f.indoor_outdoor; }
   // Rain/snow → prefer indoor + weather-independent.
@@ -1710,7 +1895,40 @@ function buildDiscoverWhere(f: DiscoverFilter): {
   if (typeof f.duration_max === "number") { where.push("(e.duration_min IS NULL OR e.duration_min <= @dmax)"); params.dmax = f.duration_max; }
   if (f.language) { where.push("(e.languages IS NULL OR e.languages LIKE @lang)"); params.lang = `%"${f.language}"%`; }
 
-  return { where, params, hasGeo, originLat, originLng };
+  // text_terms: AND over the terms, each an OR over its variants
+  // (textTermVariants: stem and SEARCH_SYNONYMS) and the four text columns.
+  // gardssalgLikePattern() escapes LIKE metacharacters and turns æ/ø/å into
+  // `_`, because SQLite's lower() folds ASCII only ("Ørnesafari" must still
+  // match "ørnesafari"). With textTermsAny, one term is enough and the
+  // per-term matches are counted.
+  let textOrderSql = "";
+  let textMatchedSql: string | undefined;
+  if (f.text_terms && f.text_terms.length > 0) {
+    const termHits: string[] = [];
+    const titleHits: string[] = [];
+    f.text_terms.forEach((term, i) => {
+      const keys = textTermVariants(term).map((variant, vi) => {
+        const k = `tt${i}_${vi}`;
+        params[k] = `%${gardssalgLikePattern(variant)}%`;
+        return k;
+      });
+      const like = (cols: string[]) =>
+        keys.flatMap((k) => cols.map((c) => `lower(COALESCE(${c},'')) LIKE @${k} ESCAPE '\\'`)).join(" OR ");
+      termHits.push(`(${like(["e.title", "e.title_no", "e.description", "e.subcategory"])})`);
+      titleHits.push(`(CASE WHEN ${like(["e.title", "e.title_no"])} THEN 1 ELSE 0 END)`);
+    });
+    const titleRank = `(${titleHits.join(" + ")}) DESC, `;
+    if (textTermsAny && termHits.length > 1) {
+      textMatchedSql = `(${termHits.map((h) => `(CASE WHEN ${h} THEN 1 ELSE 0 END)`).join(" + ")})`;
+      where.push(`(${termHits.join(" OR ")})`);
+      textOrderSql = `${textMatchedSql} DESC, ${titleRank}`;
+    } else {
+      where.push(...termHits);
+      textOrderSql = titleRank;
+    }
+  }
+
+  return { where, params, hasGeo, originLat, originLng, textOrderSql, textMatchedSql };
 }
 
 /**
@@ -1739,11 +1957,22 @@ function buildDiscoverWhere(f: DiscoverFilter): {
  * uses before its exact in-JS haversine cut), so it can slightly overcount at
  * the box's corners for that one filter combination. Every other filter
  * combination — including the fylke/category case this fix targets — is exact.
+ *
+ * `opts.textTermsMatched`: a discoverExperiencesRelaxed() result's
+ * textTermsMatched. Its rows have that many of filter.text_terms, not all of
+ * them, so this counts the rows with at least that many instead (REST
+ * /discover?q=, dev-request 2026-10-16-opplevagent-mcp-fritekst-query S4);
+ * without it the total of such a page would be 0.
  */
-export function countDiscoverExperiences(filter: DiscoverFilter = {}): number {
+export function countDiscoverExperiences(filter: DiscoverFilter = {}, opts: { textTermsMatched?: number } = {}): number {
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
-  const { where, params } = buildDiscoverWhere(f);
+  const atLeast = opts.textTermsMatched;
+  const { where, params, textMatchedSql } = buildDiscoverWhere(f, atLeast !== undefined);
+  if (textMatchedSql && atLeast !== undefined) {
+    where.push(`${textMatchedSql} >= @textTermsAtLeast`);
+    params.textTermsAtLeast = atLeast;
+  }
   const row = db
     .prepare(
       `SELECT COUNT(*) AS total FROM experiences e
@@ -1752,6 +1981,40 @@ export function countDiscoverExperiences(filter: DiscoverFilter = {}): number {
     )
     .get(params) as { total: number } | undefined;
   return row?.total ?? 0;
+}
+
+// How long publishedKommuneSet() reuses its answer. New kommuner appear only
+// when a bulk load publishes rows; five minutes late is harmless there.
+const PUBLISHED_KOMMUNE_SET_TTL_MS = 5 * 60_000;
+let publishedKommuneCache: { db: unknown; at: number; set: ReadonlySet<string> } | null = null;
+
+/**
+ * The kommune values that have at least one experience /discover can return
+ * (PUBLISH_GATE_SQL). interpretDiscoverQuery() (experiences-query-intent.ts)
+ * checks a kommune read from free text against it: a gazetteer name with
+ * nothing published under it (a bygd such as Geiranger, or a town the
+ * catalogue files under its kommune) is searched as its fylke instead of
+ * returning nothing. It also reads the kommuner listed here that the gazetteer
+ * lacks (Lyngen, Sirdal) as places (dev-request 2026-10-16-opplevagent-mcp-
+ * fritekst-query, S2). Cached for PUBLISHED_KOMMUNE_SET_TTL_MS per DB handle;
+ * the same Set object while cached. Read-only.
+ */
+export function publishedKommuneSet(): ReadonlySet<string> {
+  const db = getDb(VERTICAL);
+  const now = Date.now();
+  if (publishedKommuneCache && publishedKommuneCache.db === db && now - publishedKommuneCache.at < PUBLISHED_KOMMUNE_SET_TTL_MS) {
+    return publishedKommuneCache.set;
+  }
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT e.kommune AS kommune FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${PUBLISH_GATE_SQL} AND e.kommune IS NOT NULL AND TRIM(e.kommune) != ''`
+    )
+    .all() as Array<{ kommune: string }>;
+  const set: ReadonlySet<string> = new Set(rows.map((r) => r.kommune));
+  publishedKommuneCache = { db, at: now, set };
+  return set;
 }
 
 /**
@@ -1800,10 +2063,33 @@ export function discoverExperiences(
   filter: DiscoverFilter = {},
   limit = 20
 ): Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }> {
+  return queryDiscoverExperiences(filter, limit).results;
+}
+
+// Discover's tie-break within the same text rank and confidence (dev-request
+// 2026-10-17-integrasjonstest-oppfolging, AI-7): rows a guest can act on come
+// first — a price and a booking link, then one of the two, then neither — and
+// the title only after that. «hvalsafari i Tromsø» used to open with a row
+// that has neither, only because its title sorts first. A price of 0 (free)
+// is a price.
+const DISCOVER_DATA_COMPLETE_ORDER =
+  "((e.price_from IS NOT NULL) + (NULLIF(TRIM(e.booking_url), '') IS NOT NULL)) DESC";
+
+/**
+ * discoverExperiences(), plus the text_terms step of
+ * discoverExperiencesRelaxed() with `textTermsAny`: the rows with the most
+ * of several f.text_terms (at least one), and how many that is. One query,
+ * where trying "all but one, all but two, …" took up to n-1 scans.
+ */
+function queryDiscoverExperiences(
+  filter: DiscoverFilter,
+  limit: number,
+  textTermsAny = false
+): { results: Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }>; textTermsMatched?: number } {
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
-  const { where, params, hasGeo, originLat, originLng } = buildDiscoverWhere(f);
+  const { where, params, hasGeo, originLat, originLng, textOrderSql, textMatchedSql } = buildDiscoverWhere(f, textTermsAny);
 
   // When a geo origin is given, the true top-N-by-distance can't be decided
   // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
@@ -1814,16 +2100,26 @@ export function discoverExperiences(
   params.limit = hasGeo ? GEO_CANDIDATE_CAP : Math.max(1, Math.min(100, limit));
 
   const sql = `
-    SELECT e.* FROM experiences e
+    SELECT e.*${textMatchedSql ? `, ${textMatchedSql} AS text_terms_matched` : ""} FROM experiences e
     LEFT JOIN experience_providers p ON p.id = e.provider_id
     WHERE ${where.join(" AND ")}
-    ORDER BY CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC
+    ORDER BY ${textOrderSql}CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, ${DISCOVER_DATA_COMPLETE_ORDER}, e.title ASC
     LIMIT @limit
   `;
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
   const hydrated = rows.map(hydrateExperience);
 
-  if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") return hydrated;
+  // textTermsAny: keep the rows with the most terms. SQL orders by that
+  // count, but the radius cut below can remove the first rows, so the top
+  // is taken from what is left.
+  const matchedById = textMatchedSql ? new Map(rows.map((r) => [r.id as string, Number(r.text_terms_matched)])) : null;
+  const withMostTerms = <T extends { id: string }>(list: T[]): { results: T[]; textTermsMatched?: number } => {
+    if (!matchedById || list.length === 0) return { results: list };
+    const top = Math.max(...list.map((e) => matchedById.get(e.id) ?? 0));
+    return { results: list.filter((e) => matchedById.get(e.id) === top), textTermsMatched: top };
+  };
+
+  if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") return withMostTerms(hydrated);
 
   // Exact haversine distance + radius cut + ascending-distance sort. The
   // WHERE clause above already guarantees loc_lat/loc_lon/geo_precision are
@@ -1837,8 +2133,9 @@ export function discoverExperiences(
     const radiusKm = f.radius_km;
     withDistance = withDistance.filter((e) => e.distance_km <= radiusKm);
   }
-  withDistance.sort((a, b) => a.distance_km - b.distance_km);
-  return withDistance.slice(0, Math.max(1, Math.min(100, limit)));
+  const { results, textTermsMatched } = withMostTerms(withDistance);
+  results.sort((a, b) => a.distance_km - b.distance_km);
+  return { results: results.slice(0, Math.max(1, Math.min(100, limit))), textTermsMatched };
 }
 
 // ─── Distance/precision label (dev-request 2026-07-04-opplevagent-naer-meg-
@@ -1873,7 +2170,9 @@ export function formatDistanceLabel(
 // almost certainly over-constrained. On zero hits we relax filters one at a
 // time, weakest/most-peripheral constraint first, until results appear.
 // Location is the user's core intent, so fylke/kommune are relaxed last.
+// text_terms (free-text search words, the least certain signal) go first.
 const RELAX_ORDER: Array<keyof DiscoverFilter> = [
+  "text_terms",
   "duration_max",
   "max_price",
   "language",
@@ -1886,12 +2185,14 @@ const RELAX_ORDER: Array<keyof DiscoverFilter> = [
   "kommune",
   "kommuner",
   "fylke",
+  "fylker",
 ];
 
 const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
   fylke: "fylke",
   kommune: "kommune",
   kommuner: "kommuner",
+  fylker: "fylker",
   category: "kategori",
   indoor_outdoor: "innendørs/utendørs",
   weather: "vær",
@@ -1905,13 +2206,49 @@ const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
   lng: "lengdegrad",
   radius_km: "søkeradius",
   sort: "sortering",
+  text_terms: "fritekst",
 };
+
+/**
+ * The one-time widening of a kommune without hits to its fylke
+ * (discoverExperiencesRelaxed's widenKommuneToFylke, dev-request
+ * 2026-10-16-opplevagent-mcp-fritekst-query S3). Reported in relaxed_filters
+ * next to the dropped filter keys.
+ */
+export const KOMMUNE_TO_FYLKE_STEP = "kommune→fylke" as const;
+
+/** One relaxation step: a dropped filter key, or the kommune→fylke widening. */
+export type RelaxStep = keyof DiscoverFilter | typeof KOMMUNE_TO_FYLKE_STEP;
 
 export interface RelaxedDiscoverResult {
   results: Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }>;
   originalFilter: DiscoverFilter;
   appliedFilter: DiscoverFilter;
-  relaxedKeys: Array<keyof DiscoverFilter>;
+  relaxedKeys: RelaxStep[];
+  /**
+   * Set when no row has every one of appliedFilter.text_terms: how many of
+   * them each result has (relaxedKeys then holds "text_terms" although the
+   * terms are still in appliedFilter).
+   */
+  textTermsMatched?: number;
+}
+
+/**
+ * Opt-in limits on the relaxation (dev-request 2026-10-16-opplevagent-mcp-
+ * fritekst-query, S2/S3 — used by discover_experiences and, with a free-text
+ * `q`, by REST /discover (S4); REST without `q` and A2A pass none and keep the
+ * old behaviour).
+ */
+export interface DiscoverRelaxOptions {
+  /** Keys never dropped: the place, so a place search never turns into a nationwide list. */
+  protectKeys?: ReadonlyArray<keyof DiscoverFilter>;
+  /**
+   * When a kommune finds nothing even with every other relaxable filter
+   * dropped, search once more with its fylke instead (from the caller's fylke,
+   * or the kommune's fylke via normaliseFylke / CITY_TO_FYLKE_RAW), keeping
+   * the fylke too. relaxedKeys then starts with KOMMUNE_TO_FYLKE_STEP.
+   */
+  widenKommuneToFylke?: boolean;
 }
 
 /**
@@ -1919,27 +2256,59 @@ export interface RelaxedDiscoverResult {
  * (weakest first, per RELAX_ORDER) and retries until results appear or every
  * filter is exhausted. Always returns whichever result set it landed on,
  * plus which keys were dropped so the caller can surface a relaxation note.
+ * Several text_terms are relaxed gradually before they are dropped: when no
+ * row has all of them, the rows with the most of them (at least one;
+ * textTermsMatched), so one word that no row has ("tonight", "credit") does
+ * not throw away the others. See DiscoverRelaxOptions for the
+ * protected-place variant.
  */
 export function discoverExperiencesRelaxed(
   filter: DiscoverFilter = {},
-  limit = 20
+  limit = 20,
+  opts: DiscoverRelaxOptions = {}
 ): RelaxedDiscoverResult {
   const original = DiscoverFilterSchema.parse(filter);
-  let results = discoverExperiences(original, limit);
-  if (results.length > 0) {
-    return { results, originalFilter: original, appliedFilter: original, relaxedKeys: [] };
+  const protect = new Set<keyof DiscoverFilter>(opts.protectKeys ?? []);
+  const first = relaxUntilHits(original, limit, protect);
+  const fylke = opts.widenKommuneToFylke && original.kommune && first.results.length === 0
+    ? original.fylke ?? normaliseFylke(original.kommune)
+    : null;
+  if (!fylke) {
+    return { results: first.results, originalFilter: original, appliedFilter: first.applied, relaxedKeys: first.relaxedKeys, textTermsMatched: first.textTermsMatched };
   }
+  const { kommune: _kommune, ...withoutKommune } = original;
+  const second = relaxUntilHits({ ...withoutKommune, fylke }, limit, new Set([...protect, "fylke"]));
+  return {
+    results: second.results,
+    originalFilter: original,
+    appliedFilter: second.applied,
+    relaxedKeys: [KOMMUNE_TO_FYLKE_STEP, ...second.relaxedKeys],
+    textTermsMatched: second.textTermsMatched,
+  };
+}
 
-  const working: DiscoverFilter = { ...original };
-  const relaxedKeys: Array<keyof DiscoverFilter> = [];
+function relaxUntilHits(
+  start: DiscoverFilter,
+  limit: number,
+  protect: ReadonlySet<keyof DiscoverFilter>
+): { results: RelaxedDiscoverResult["results"]; applied: DiscoverFilter; relaxedKeys: RelaxStep[]; textTermsMatched?: number } {
+  let results = discoverExperiences(start, limit);
+  if (results.length > 0) return { results, applied: start, relaxedKeys: [] };
+
+  const working: DiscoverFilter = { ...start };
+  const relaxedKeys: RelaxStep[] = [];
   for (const key of RELAX_ORDER) {
-    if (working[key] === undefined) continue;
+    if (working[key] === undefined || protect.has(key)) continue;
+    if (key === "text_terms" && working.text_terms && working.text_terms.length > 1) {
+      const most = queryDiscoverExperiences(working, limit, true);
+      if (most.results.length > 0) return { results: most.results, applied: working, relaxedKeys: [...relaxedKeys, key], textTermsMatched: most.textTermsMatched };
+    }
     delete working[key];
     relaxedKeys.push(key);
     results = discoverExperiences(working, limit);
     if (results.length > 0) break;
   }
-  return { results, originalFilter: original, appliedFilter: working, relaxedKeys };
+  return { results, applied: working, relaxedKeys };
 }
 
 /**
@@ -1949,12 +2318,12 @@ export function discoverExperiencesRelaxed(
  * relaxation-exhausted zero-hit message in experiences-a2a.ts) never
  * hand-duplicate the label table.
  */
-export function formatFilterLabels(keys: Array<keyof DiscoverFilter>): string {
-  return keys.map((k) => FILTER_LABELS[k]).join(", ");
+export function formatFilterLabels(keys: ReadonlyArray<RelaxStep>): string {
+  return keys.map((k) => (k === KOMMUNE_TO_FYLKE_STEP ? k : FILTER_LABELS[k])).join(", ");
 }
 
 /** Bilingual note describing which filters were relaxed to produce results. Null if none were. */
-export function buildRelaxationNote(relaxedKeys: Array<keyof DiscoverFilter>): string | null {
+export function buildRelaxationNote(relaxedKeys: ReadonlyArray<RelaxStep>): string | null {
   if (relaxedKeys.length === 0) return null;
   const labels = formatFilterLabels(relaxedKeys);
   return (
@@ -1970,7 +2339,7 @@ export function buildRelaxationNote(relaxedKeys: Array<keyof DiscoverFilter>): s
  */
 export function buildNarrowingSuggestions(
   results: Array<Pick<Experience, "category" | "kommune" | "fylke">>,
-  relaxedKeys: Array<keyof DiscoverFilter>,
+  relaxedKeys: ReadonlyArray<RelaxStep>,
   limit = 3
 ): string[] {
   if (relaxedKeys.length === 0) return [];
@@ -1978,13 +2347,15 @@ export function buildNarrowingSuggestions(
   const distinct = (vals: Array<string | null | undefined>) =>
     Array.from(new Set(vals.filter((v): v is string => !!v)));
 
-  if (relaxedKeys.includes("category")) {
+  // Dropped search words are answered like a dropped category: name the
+  // categories the remaining results do have.
+  if (relaxedKeys.includes("category") || relaxedKeys.includes("text_terms")) {
     for (const c of distinct(results.map((r) => r.category))) {
       if (suggestions.length >= limit) break;
       suggestions.push(`Prøv kategori=${c} / Try category=${c}`);
     }
   }
-  if (suggestions.length < limit && relaxedKeys.includes("kommune")) {
+  if (suggestions.length < limit && (relaxedKeys.includes("kommune") || relaxedKeys.includes(KOMMUNE_TO_FYLKE_STEP))) {
     for (const k of distinct(results.map((r) => r.kommune))) {
       if (suggestions.length >= limit) break;
       suggestions.push(`Prøv kommune=${k} / Try kommune=${k}`);
@@ -3520,7 +3891,7 @@ export function countGardssalgProviders(filter?: GardssalgProviderTypeFilter): n
       // hidden booking-flyt-v1 test provider) never bump the count that gates
       // gardssalgVisible() (dev-request 2026-07-14-booking-flyt-v1, slice 0).
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1)" +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')" +
       typeFilter.sql
     )
     .get(...typeFilter.params) as { c: number };
@@ -3543,7 +3914,7 @@ export function countGardssalgProvidersByType(): Array<{ producer_type: string |
     .prepare(
       "SELECT producer_type, COUNT(*) AS count FROM experience_providers " +
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '') " +
       "GROUP BY producer_type"
     )
     .all() as Array<{ producer_type: string | null; count: number }>;
@@ -3567,7 +3938,7 @@ export function countGardssalgProvidersBookable(): number {
     .prepare(
       "SELECT COUNT(*) AS c FROM experience_providers " +
       "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
-      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '') " +
       "AND booking_live = 1"
     )
     .get() as { c: number };
@@ -3613,7 +3984,7 @@ export function getExperiencesMarketplaceStats(): ExperiencesMarketplaceStats {
     `SELECT DISTINCT kommune FROM experience_providers
       WHERE kommune IS NOT NULL
         AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-        AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+        AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')`
   ).all() as Array<{ kommune: string }>;
   const cities = cityRows.map((r) => r.kommune);
 
@@ -3704,6 +4075,12 @@ export type GardssalgProviderRow = {
   // "Bekreftet av eier" badge vs. the "Er dette din bedrift?" claim CTA.
   // NULL = never claimed.
   claimed_at: string | null;
+  // Additive (2026-10-24, dev-request 2026-10-22-opplevagent-takksvar-eierlenke-
+  // og-bekreftet-av-eier): second, separate basis for the "Bekreftet av eier"
+  // badge — the producer confirmed the profile by e-mail from an address the
+  // claim flow accepts for them. Never set by verifyClaimToken(); NULL = not
+  // confirmed by e-mail. See gardssalgHasOwnerBadge().
+  owner_email_confirmed_at: string | null;
   // Additive (2026-08-18, dev-request 2026-08-17-kontaktadresse-feilkilde-og-
   // override, Skive C): the row's raw field_provenance JSON blob. Selected
   // here so the RENDER surfaces (routes/experiences-seo.ts's produsent-profil
@@ -3718,7 +4095,17 @@ export type GardssalgProviderRow = {
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, field_provenance";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden, is_test_provider, updated_at, claimed_at, owner_email_confirmed_at, field_provenance";
+
+/** The public "Bekreftet av eier" badge shows when the profile has been taken
+ *  over (claimed_at) OR the owner confirmed it by e-mail
+ *  (owner_email_confirmed_at). Only the former is an owner who can log in, so
+ *  callers decide the "Ta over profilen" link on claimed_at alone. */
+export function gardssalgHasOwnerBadge(
+  row: { claimed_at?: string | null; owner_email_confirmed_at?: string | null },
+): boolean {
+  return row.claimed_at != null || row.owner_email_confirmed_at != null;
+}
 
 export function listGardssalgProviders(limit = 100, offset = 0, filter?: GardssalgProviderTypeFilter): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
@@ -3734,7 +4121,7 @@ export function listGardssalgProviders(limit = 100, offset = 0, filter?: Gardssa
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)${typeFilter.sql}
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')${typeFilter.sql}
         ORDER BY navn
         LIMIT ? OFFSET ?`
     )
@@ -3797,7 +4184,7 @@ export function listGardssalgProviderMapPoints(filter?: GardssalgProviderTypeFil
       `SELECT slug, navn, producer_type, fylke, kommune, poststed, lat, lon, geocode_confidence
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')
           AND lat IS NOT NULL AND lon IS NOT NULL
           ${NORWAY_BBOX_SQL("lat", "lon")}
           AND slug IS NOT NULL AND slug != ''${typeFilter.sql}
@@ -3847,7 +4234,7 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
          FROM experience_providers
         WHERE slug = @slug
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')`
     )
     .get({ slug }) as GardssalgProviderRow | undefined;
   return row ?? null;
@@ -3896,8 +4283,10 @@ export type GardssalgSearchFilter = {
   // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: free-text
   // name/place query («Fjordgard», «Egge gård», «bryggeri Bergen»). Every
   // whitespace-separated term (max 8) must match navn, slug, poststed or
-  // kommune (case-insensitive LIKE). Results are ranked exact-name match →
-  // name-prefix match → everything else (then navn), so a one-shot booking
+  // kommune (case-insensitive LIKE) — or, with searchGardssalgProviders'
+  // expandDrinkWords, a drink word may match the producer's own kind.
+  // Results are ranked exact-name match → name-prefix match → everything
+  // else (then navn), so a one-shot booking
   // request that names a producer resolves to the obvious row first. This is
   // what lets an AI assistant go from «book et møte hos X» straight to X
   // without paging through a fylke — before this, discover_gardssalg had no
@@ -3941,16 +4330,22 @@ export function gardssalgLikePattern(term: string): string {
 // Precision match + rank for the q filter (JS side, Unicode-aware). Returns
 // null when the row does not actually contain every term; otherwise a rank
 // (0 = exact whole-name match, 1 = name starts with the query, 2 = other).
+// `termProducerTypes[i]`, when set, are producer_type values that also meet
+// qTerms[i] (searchGardssalgProviders' expandDrinkWords); the rank stays the
+// name rank either way.
 export function gardssalgQueryRank(
-  row: { navn: string; slug: string | null; poststed: string | null; kommune: string | null },
+  row: { navn: string; slug: string | null; poststed: string | null; kommune: string | null; producer_type?: string | null },
   qTerms: string[],
+  termProducerTypes: ReadonlyArray<readonly string[] | null> = [],
 ): number | null {
   if (qTerms.length === 0) return 2;
   const navn = (row.navn ?? "").toLocaleLowerCase("nb-NO");
   const hay = [navn, row.slug ?? "", row.poststed ?? "", row.kommune ?? ""]
     .map((v) => String(v).toLocaleLowerCase("nb-NO"));
-  for (const t of qTerms) {
-    if (!hay.some((h) => h.includes(t))) return null;
+  for (const [i, t] of qTerms.entries()) {
+    if (hay.some((h) => h.includes(t))) continue;
+    if (row.producer_type && termProducerTypes[i]?.includes(row.producer_type)) continue;
+    return null;
   }
   const whole = qTerms.join(" ");
   if (navn === whole) return 0;
@@ -3958,9 +4353,21 @@ export function gardssalgQueryRank(
   return 2;
 }
 
+/**
+ * `opts.expandDrinkWords` (discover_gardssalg only — dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, AI-5): a q word that names a drink
+ * kind ("cider", "sider", "øl") is also met by a producer of that kind, i.e.
+ * producer_type in drinkWordProducerTypes(word) — the same spellings
+ * `producer_type: "cideri"` expands to — not only by the word in the name or
+ * place. That only adds rows, and the rank is still the name rank, so a
+ * producer named in the query still comes first. The booking resolver
+ * (gardssalg-booking-resolve.ts) leaves it off: it resolves one NAME and
+ * must never be widened into a guess.
+ */
 export function searchGardssalgProviders(
   filter: GardssalgSearchFilter = {},
-  limit = 20
+  limit = 20,
+  opts: { expandDrinkWords?: boolean } = {},
 ): Array<GardssalgProviderRow & { distance_km?: number }> {
   const db = getDb(VERTICAL);
 
@@ -3975,6 +4382,9 @@ export function searchGardssalgProviders(
   if (filter.include_hidden !== true) {
     where.push("(catalog_hidden IS NULL OR catalog_hidden != 1)");
   }
+  // A merged-away duplicate (merged_into set) is never public, include_hidden or not
+  // (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pt 8).
+  where.push("(merged_into IS NULL OR merged_into = '')");
   const params: Record<string, unknown> = {};
 
   // Re-review 2026-10-03: fylke now goes through the same fylkeEquivalents()
@@ -4020,14 +4430,22 @@ export function searchGardssalgProviders(
   //      includes() on the same four fields removes the rare wildcard over-
   //      match, then ranks exact whole-name match → name-prefix → rest.
   // A whitespace-only q is a no-op (no filter), exactly like an omitted one.
+  // With opts.expandDrinkWords, a drink word's term also accepts the
+  // producer_type spellings of its kind (see this function's doc comment).
   const qTerms = gardssalgQueryTerms(filter.q);
+  const termProducerTypes = opts.expandDrinkWords ? qTerms.map((t) => drinkWordProducerTypes(t)) : [];
   if (qTerms.length > 0) {
     qTerms.forEach((t, i) => {
       const key = `q${i}`;
       params[key] = `%${gardssalgLikePattern(t)}%`;
+      const typeKeys = (termProducerTypes[i] ?? []).map((v, j) => {
+        params[`${key}_type${j}`] = v;
+        return `@${key}_type${j}`;
+      });
       where.push(
         `(lower(navn) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(slug,'')) LIKE @${key} ESCAPE '\\'` +
-        ` OR lower(COALESCE(poststed,'')) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(kommune,'')) LIKE @${key} ESCAPE '\\')`,
+        ` OR lower(COALESCE(poststed,'')) LIKE @${key} ESCAPE '\\' OR lower(COALESCE(kommune,'')) LIKE @${key} ESCAPE '\\'` +
+        (typeKeys.length > 0 ? ` OR producer_type IN (${typeKeys.join(", ")})` : "") + ")",
       );
     });
   }
@@ -4080,7 +4498,7 @@ export function searchGardssalgProviders(
   if (qTerms.length > 0) {
     // Precision pass + rank (stable: ties keep the SQL navn order).
     const ranked = rows
-      .map((r, i) => ({ r, i, rank: gardssalgQueryRank(r, qTerms) }))
+      .map((r, i) => ({ r, i, rank: gardssalgQueryRank(r, qTerms, termProducerTypes) }))
       .filter((x): x is { r: GardssalgProviderRow; i: number; rank: number } => x.rank !== null)
       .sort((a, b) => a.rank - b.rank || a.i - b.i);
     rows = ranked.map((x) => x.r);
@@ -4188,7 +4606,7 @@ export function searchGardssalgProvidersByQuery(query: string, limit = 30): Gard
       `SELECT id, navn, slug, fylke, kommune, poststed, producer_type
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1) AND (merged_into IS NULL OR merged_into = '')
           AND slug IS NOT NULL AND slug != ''
           AND ${termClauses.join(" AND ")}
         ORDER BY navn
@@ -5269,7 +5687,9 @@ export function applyGardssalgRetroScanNull(
   }
   if (written.length === 0) return [];
 
-  sets.push("content_source = 'provider_site'");
+  // A claimed row keeps content_source='claim' (G1 skive 5), same as
+  // applyGardssalgProviderContent: re-stamping would unlock its other fields.
+  if (row.content_source !== "claim") sets.push("content_source = 'provider_site'");
   sets.push("content_evidence_url = @evidence_url");
   sets.push("content_updated_at = datetime('now')");
   params.evidence_url = evidenceUrl;
@@ -10304,6 +10724,10 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // shape as every other field here, so the existing rollback lever covers
   // it with zero other changes.
   "navn",
+  // dev-request 2026-10-01-opplevagent-fylke-fra-kommune — fill-only fylke
+  // from kommune (POST /admin/gardssalg-provider-fylke-from-kommune) writes
+  // one audit row per fill; this lets the standard rollback restore it.
+  "fylke",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets

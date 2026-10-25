@@ -1,13 +1,18 @@
 // ─── dental-verifier ────────────────────────────────────────────────────
 // dev-request 2026-09-02-dental-verifier-website-ownership.
 //
-// WHY: dental has NO automated verifier. `verification_status='verified'`
-// on dental_agents is today only ever set BY HAND (92 of 6975 rows, all
-// manual). RFB/opplevagent's outreach flow requires `verified` PLUS proof
-// the platform found the CORRECT business's website (never wrong-company
-// outreach) before a producer/experience can be contacted -- dental needs
-// the same discipline before outreach on dental clinics can even be
-// considered. This mirrors the mature, working RFB twin
+// WHY: dental had NO automated verifier. `verification_status='verified'`
+// on dental_agents (92 of 6975 rows when this was written) was set without
+// any rule: not by hand, as this comment first said, but mostly by the
+// enrichment routine through PUT (Stage D up to 2026-06-03, Stage V in June;
+// A2A dental-enrichment-runs reports, F2-S8 of A2A dev-request
+// 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon). The public pages
+// therefore show the badge only when the rule below passes on the stored
+// fields (dental-verified-claim.ts). RFB/opplevagent's outreach flow
+// requires `verified` PLUS proof the platform found the CORRECT business's
+// website (never wrong-company outreach) before a producer/experience can
+// be contacted -- dental needs the same discipline before outreach on
+// dental clinics can even be considered. This mirrors the mature, working RFB twin
 // (src/agents/lokal-agent-verifier.ts) at the CONCEPT level -- Brreg
 // liveness gate, a website-ownership check that quarantines a mismatched
 // site, "any success resets the strike counter" -- but is a fresh,
@@ -37,6 +42,21 @@ import { fetchPage, type FetchPageResult } from "./fetch-page";
 import { DENTAL_CLINIC_CLASS_SQL, type DentalCatalogClass } from "./dental-catalog-class";
 import { DENTAL_NOT_SYNTHETIC_PROBE_SQL } from "./dental-contamination";
 import { listSpecialistsForClinic } from "./dental-store";
+// The Verified rule and what it reads live in dental-verified-claim.ts (A2A
+// dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon, F2-S8): the
+// public pages show «Verifisert» only when it passes on the stored fields, and
+// dental-store reads it there, which it could not do from here (this file
+// imports dental-store). Re-exported, so callers keep importing it from here.
+import { countRichFields, computeDentalVerifiedRule, type DentalBrregStatus, type DentalWebsiteOwnership } from "./dental-verified-claim";
+export {
+  DENTAL_VERIFIER_MIN_RICH_FIELDS,
+  DENTAL_RICH_FIELDS,
+  countRichFields,
+  computeDentalVerifiedRule,
+  type DentalBrregStatus,
+  type DentalWebsiteOwnership,
+  type DentalVerifiedRuleInput,
+} from "./dental-verified-claim";
 
 // ── Tunables ─────────────────────────────────────────────────────────────
 
@@ -69,9 +89,6 @@ export const DENTAL_VERIFIER_REVERIFY_CYCLE_MS = 30 * 86_400_000;
 // column-addition comment for why this counter is independently owned).
 export const DENTAL_VERIFIER_STREAK_DOWNGRADE_AT = 3;
 
-// "at least 3 rich fields populated" (dev-request spec, Verified rule).
-export const DENTAL_VERIFIER_MIN_RICH_FIELDS = 3;
-
 export const DEFAULT_DENTAL_VERIFIER_BATCH_SIZE = 200;
 
 // The dental NACE codes this codebase already treats as "clinic NACE"
@@ -85,28 +102,6 @@ export const DEFAULT_DENTAL_VERIFIER_BATCH_SIZE = 200;
 // callers may set [it] themselves after inspecting the result." This is
 // that caller-side computation.
 export const DENTAL_VERIFIER_NACE_ALLOWLIST: readonly string[] = ["86.230", "86.221", "86.220"];
-
-// The 10 PR-100 "deep-scrape" columns (init-dental.ts, PR-100 comment
-// block: "Deep-scrape (10)") -- the codebase's own existing definition of
-// what makes a dental_agents row substantively enriched beyond the raw
-// Brreg-sweep import. No prior "richness" concept exists anywhere else in
-// the dental code for this file to ground itself in (grepped
-// enrichment_state's own values -- raw/enriched/thin_site -- and found no
-// numeric field-count threshold anywhere), so this is the most directly
-// grounded definition available: the exact column set another PR already
-// singled out, by name, as "deepen[ing] enrichment beyond the raw import".
-export const DENTAL_RICH_FIELDS: readonly string[] = [
-  "om_oss",
-  "specialists",
-  "treatment_tech",
-  "equipment_brands",
-  "patient_focus",
-  "accessibility",
-  "payment_options",
-  "online_booking_url",
-  "social_media",
-  "treatments_subtypes",
-];
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -136,22 +131,6 @@ export interface DentalVerifierCandidateRow {
   treatments_subtypes: string | null;
 }
 
-export type DentalWebsiteOwnership = "verified" | "unverified" | "n/a";
-export type DentalBrregStatus =
-  | "active"
-  | "dissolved"
-  | "bankrupt"
-  // Brreg's own `active` boolean (verifyOrgNumber, brreg-client.ts) also
-  // folds in `underAvvikling`/`underTvangsavviklingEllerTvangsopplosning`
-  // (under voluntary/forced liquidation), but its `flag` field only ever
-  // surfaces "dissolved"/"bankrupt"/null for those two -- a CONFIRMED
-  // (200-response, exists:true) entity that is inactive for one of those
-  // two OTHER reasons would otherwise be silently misbucketed as the
-  // ambiguous not-found-or-unreachable case below. Kept as its own bucket
-  // so a genuine, confirmed inactive-but-unflagged Brreg answer is never
-  // conflated with "we don't actually know".
-  | "inactive_other"
-  | "orgnr_not_found_or_unreachable";
 
 export interface DentalVerifierResult {
   id: string;
@@ -179,43 +158,6 @@ export interface DentalVerifierResult {
 
 // ── Pure helpers ─────────────────────────────────────────────────────────
 
-/**
- * How many of DENTAL_RICH_FIELDS are genuinely populated on this row. JSON
- * array/object columns are parsed so a stored '[]'/'{}' (never written by
- * dental-store.ts's own jsonOrNull(), but defensively guarded the same way
- * dental-claim-service.ts's own completion-mode completeness check already
- * guards these exact columns) does not count as populated. Pure, never
- * throws.
- */
-export function countRichFields(row: Partial<DentalVerifierCandidateRow>): number {
-  let count = 0;
-  const raw = (name: string): string | null | undefined => (row as Record<string, unknown>)[name] as string | null | undefined;
-
-  // om_oss: plain text.
-  if ((raw("om_oss") ?? "").trim() !== "") count++;
-
-  // The remaining 9 fields are all JSON-array or JSON-object TEXT columns.
-  const jsonFields = DENTAL_RICH_FIELDS.filter((f) => f !== "om_oss");
-  for (const field of jsonFields) {
-    const value = raw(field);
-    if (!value || value.trim() === "") continue;
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) {
-        if (parsed.length > 0) count++;
-      } else if (parsed && typeof parsed === "object") {
-        if (Object.keys(parsed).length > 0) count++;
-      } else if (parsed !== null && parsed !== "") {
-        count++;
-      }
-    } catch {
-      // Malformed JSON but non-empty text -- still counts as "something is
-      // there" rather than silently treating a write bug as "not rich".
-      count++;
-    }
-  }
-  return count;
-}
 
 /** Lower-case, diacritic-preserving (Norwegian æøå fold correctly via JS's
  * own Unicode-aware toLowerCase()), punctuation-stripped normalisation for
@@ -346,27 +288,6 @@ export function interpretBrregResult(verified: BrregVerifyResult): DentalBrregOu
   return { status: verified.active ? "active" : "inactive_other", naceMismatch };
 }
 
-export interface DentalVerifiedRuleInput {
-  brregStatus: DentalBrregStatus | null;
-  websiteOwnership: DentalWebsiteOwnership | null;
-  catalogClass: DentalCatalogClass | null;
-  directoryUrl: string | null;
-  richFieldCount: number;
-}
-
-/**
- * The Verified rule (dev-request spec): Brreg active AND (website_ownership
- * verified OR it's an offentlig_klinikk with a directory_url present) AND
- * at least DENTAL_VERIFIER_MIN_RICH_FIELDS rich fields populated. Pure.
- */
-export function computeDentalVerifiedRule(input: DentalVerifiedRuleInput): boolean {
-  if (input.brregStatus !== "active") return false;
-  const ownershipOk =
-    input.websiteOwnership === "verified" ||
-    (input.catalogClass === "offentlig_klinikk" && !!input.directoryUrl && input.directoryUrl.trim() !== "");
-  if (!ownershipOk) return false;
-  return input.richFieldCount >= DENTAL_VERIFIER_MIN_RICH_FIELDS;
-}
 
 // ── Batch picker ─────────────────────────────────────────────────────────
 

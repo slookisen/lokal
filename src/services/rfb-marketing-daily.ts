@@ -155,13 +155,20 @@ import { knowledgeService } from "./knowledge-service";
 import { classifyAboutCheapBar, meetsAboutQualityBar } from "./search-enrich";
 import { enrichmentWritePauseBlockForAgents } from "./enrichment-write-pause";
 import {
+  HCR_CATEGORIES_CORROBORATED,
+  HCR_CATEGORIES_NOT_SUPPORTED,
   HCR_DEADLINE_EXCEEDED,
+  HCR_PRODUCTS_EXTRACTION_FAILED,
+  HCR_PRODUCTS_EXTRACTION_SKIPPED,
+  HCR_PRODUCTS_NOT_SUPPORTED,
   HCR_THEME_SPAM_CANDIDATE_REASON,
   HCR_THEME_SPAM_PAGE_ERROR,
   refreshHomepageContent,
   selectHomepageContentRefreshTargetsByIds,
+  type HcrProductNamesExtractor,
 } from "../routes/admin-knowledge";
 import { slugify } from "../utils/slug";
+import { RFB_VERIFIER_SCOPE_SQL } from "../agents/lokal-agent-verifier";
 import { isColdRecipientAllowed, PERSONAL_ADDRESS_REASON } from "./recipient-policy";
 import {
   RFB_OUTREACH_TEMPLATE_ID,
@@ -433,6 +440,106 @@ export function findRfbMarketingRecentBounces(db: Db, now: Date, ackMaxId: numbe
   return hits;
 }
 
+/**
+ * marketing-comms-agent charter guardrails `hard_bounce_rate` (max 0.05) and
+ * `opt_out_honored_pct` (min 1.0), measured from real events over the same
+ * RFB_MARKETING_BOUNCE_LOOKBACK_HOURS window G3 uses (bounces arrive after the
+ * send, so a per-run-only window would nearly always read 0). Measurement
+ * only: nothing here blocks, pauses or sends.
+ *
+ *   contacted        = distinct recipients RFB outreach mailed in the window
+ *                      (outreach_sent_log vertical 'rfb' + this job's ledger),
+ *                      each with the time of their FIRST contact in the window.
+ *   hard_bounce_rate = contacted recipients with an email_bounces row of
+ *                      bounce_type 'hard' and bounced_at in the window,
+ *                      divided by contacted. No sends → 0 (defined, nothing
+ *                      bounced).
+ *   opt_out_honored_pct = 1 - violations / contacted, where a violation is a
+ *                      contacted recipient whose opt-out was ALREADY on file
+ *                      when we mailed them: an agent_blocklist 'email' row
+ *                      created strictly before that first contact, or an
+ *                      email_bounces 'complaint' row bounced_at strictly
+ *                      before it. Opt-outs arriving after the send do not
+ *                      count against us. No sends → 1 (nothing violated).
+ */
+export interface RfbMarketingGuardrailMetrics {
+  window_hours: number;
+  window_since: string;
+  contacted: number;
+  hard_bounced: number;
+  hard_bounce_rate: number;
+  opt_out_violations: number;
+  opt_out_honored_pct: number;
+  hard_bounced_emails: string[];
+  opt_out_violation_emails: string[];
+}
+
+export function computeRfbMarketingGuardrailMetrics(db: Db, now: Date): RfbMarketingGuardrailMetrics {
+  const since = new Date(now.getTime() - RFB_MARKETING_BOUNCE_LOOKBACK_HOURS * 3600_000);
+  const sinceSql = sqliteTimestamp(since);
+  const firstContact = new Map<string, string>();
+  const note = (email: string, ts: string) => {
+    if (!email) return;
+    const prev = firstContact.get(email);
+    if (prev === undefined || ts < prev) firstContact.set(email, ts);
+  };
+  const oslRows = db
+    .prepare(
+      `SELECT LOWER(TRIM(recipient_email)) AS email, replace(substr(sent_at, 1, 19), 'T', ' ') AS ts
+         FROM outreach_sent_log
+        WHERE vertical_id = 'rfb'
+          AND recipient_email IS NOT NULL AND TRIM(recipient_email) != ''
+          AND replace(substr(sent_at, 1, 19), 'T', ' ') >= ?`,
+    )
+    .all(sinceSql) as Array<{ email: string; ts: string }>;
+  for (const r of oslRows) note(r.email, r.ts);
+  const ledgerRows = db
+    .prepare(
+      `SELECT LOWER(TRIM(recipient_email)) AS email, replace(substr(reserved_at, 1, 19), 'T', ' ') AS ts
+         FROM rfb_marketing_send_ledger
+        WHERE status IN ${CONTACTED_LEDGER_STATUSES_SQL} AND reserved_at >= ?`,
+    )
+    .all(since.toISOString()) as Array<{ email: string; ts: string }>;
+  for (const r of ledgerRows) note(r.email, r.ts);
+
+  const hardStmt = db.prepare(
+    `SELECT 1 FROM email_bounces
+      WHERE LOWER(email) = ? AND bounce_type = 'hard'
+        AND replace(substr(bounced_at, 1, 19), 'T', ' ') >= ?
+      LIMIT 1`,
+  );
+  const blockStmt = db.prepare(
+    `SELECT 1 FROM agent_blocklist
+      WHERE identifier_type = 'email' AND LOWER(identifier_value) = ?
+        AND created_at IS NOT NULL AND replace(substr(created_at, 1, 19), 'T', ' ') < ?
+      LIMIT 1`,
+  );
+  const complaintStmt = db.prepare(
+    `SELECT 1 FROM email_bounces
+      WHERE LOWER(email) = ? AND bounce_type = 'complaint'
+        AND replace(substr(bounced_at, 1, 19), 'T', ' ') < ?
+      LIMIT 1`,
+  );
+  const hardBounced: string[] = [];
+  const violations: string[] = [];
+  for (const [email, firstTs] of [...firstContact.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    if (hardStmt.get(email, sinceSql)) hardBounced.push(email);
+    if (blockStmt.get(email, firstTs) || complaintStmt.get(email, firstTs)) violations.push(email);
+  }
+  const contacted = firstContact.size;
+  return {
+    window_hours: RFB_MARKETING_BOUNCE_LOOKBACK_HOURS,
+    window_since: since.toISOString(),
+    contacted,
+    hard_bounced: hardBounced.length,
+    hard_bounce_rate: contacted > 0 ? hardBounced.length / contacted : 0,
+    opt_out_violations: violations.length,
+    opt_out_honored_pct: contacted > 0 ? 1 - violations.length / contacted : 1,
+    hard_bounced_emails: hardBounced.slice(0, 50),
+    opt_out_violation_emails: violations.slice(0, 50),
+  };
+}
+
 export interface RfbMarketingHealthSignal {
   red: boolean;
   reasons: string[];
@@ -545,17 +652,28 @@ function readOutreachReservedToday(db: Db, day: string): number {
 }
 
 /**
- * The social-proof number, from the same source the routine used: the sum of
- * `by_verification_status_all_knowledge_rows[].c` in GET
- * /admin/outreach-ready-pool/stats (routes/admin-outreach-pool.ts) — i.e. this
- * exact GROUP BY over every agent_knowledge row, summed. (`by_verification_status`
- * itself is producer-scoped since 2026-10-12 and no longer the same number.)
+ * The social-proof number: active RFB producers in the catalogue. Same scope as
+ * `by_verification_status_rfb_producers` in GET /admin/outreach-ready-pool/stats
+ * (routes/admin-outreach-pool.ts: role='producer' + RFB_VERIFIER_SCOPE_SQL, so no
+ * umbrella rows and no other vertical), plus is_active=1, and without
+ * terminal_unconfirmable rows (producers the verifier has given up confirming).
+ *
+ * Until 2026-10-23 this summed EVERY agent_knowledge row — all verticals,
+ * umbrella rows, inactive and terminal rows: 1 776 rows against 1 565 such
+ * producers, so the e-mail claimed «over 1 700» (dev-request
+ * 2026-10-23-rfb-outreach-aerlig-produsenttall, Daniel «Ærlig produsenttall»).
  */
 export function countRfbProducersForSocialProof(db: Db): number {
-  const rows = db
-    .prepare(`SELECT verification_status AS k, COUNT(*) AS c FROM agent_knowledge GROUP BY verification_status`)
-    .all() as Array<{ k: string | null; c: number }>;
-  return rows.reduce((sum, r) => sum + r.c, 0);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS c
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.role = 'producer' AND a.is_active = 1 AND ${RFB_VERIFIER_SCOPE_SQL}
+          AND COALESCE(k.verification_status, '') != 'terminal_unconfirmable'`,
+    )
+    .get() as { c: number };
+  return row.c;
 }
 
 // ─── Per-candidate pre-send checks (read-only) ─────────────────────────────
@@ -673,6 +791,27 @@ export interface RfbHomepageRefreshRow {
   /** About/description candidate dropped (the route's skipped_unsubstantiated). */
   rejected?: string;
   error?: string;
+  /**
+   * Only with opts.categoriesCorroborateOnly (the nightly R6 job; never the
+   * morning send): the stored categories were corroborated by the homepage
+   * (provenance added, list unchanged), or not supported by it (nothing
+   * written for categories). Absent when the option did not apply.
+   */
+  categories_corroboration?: "corroborated" | "categories_not_supported_by_homepage";
+  /**
+   * Only with opts.extractProductNames (the nightly R6 job; never the morning
+   * send) and a row whose stored products were generic category names:
+   * replaced (real names from the page written), not supported (nothing
+   * usable on the page, or refused), extraction failed / skipped (not
+   * called or no answer), curated_locked. Absent when the option did not
+   * apply (e.g. the stored products were not generic).
+   */
+  product_names?:
+    | "products_replaced"
+    | "products_not_supported_by_homepage"
+    | "products_extraction_failed"
+    | "products_extraction_skipped"
+    | "products_curated_locked";
   ms: number;
 }
 
@@ -680,7 +819,14 @@ export interface RfbHomepageRefreshRow {
 export type RfbHomepageRefreshFn = (
   db: Db,
   agentId: string,
-  opts: { deadlineAt: number; fetchImpl?: typeof fetch },
+  opts: {
+    deadlineAt: number;
+    fetchImpl?: typeof fetch;
+    /** refreshHomepageContent's categoriesCorroborateOnly — R6 only, never the morning send. */
+    categoriesCorroborateOnly?: boolean;
+    /** refreshHomepageContent's extractProductNames — R6 only, never the morning send. */
+    extractProductNames?: HcrProductNamesExtractor;
+  },
 ) => Promise<RfbHomepageRefreshRow>;
 
 /**
@@ -707,15 +853,52 @@ export const refreshRfbCandidateHomepage: RfbHomepageRefreshFn = async (db, agen
       timer = setTimeout(() => resolve("timed_out"), Math.max(0, opts.deadlineAt - Date.now()) + 250);
     });
     const raced = await Promise.race([
-      refreshHomepageContent(db, targets, { dryRun: false, deadlineAt: opts.deadlineAt, fetchImpl: opts.fetchImpl }),
+      refreshHomepageContent(db, targets, {
+        dryRun: false,
+        deadlineAt: opts.deadlineAt,
+        fetchImpl: opts.fetchImpl,
+        ...(opts.categoriesCorroborateOnly ? { categoriesCorroborateOnly: true } : {}),
+        ...(opts.extractProductNames ? { extractProductNames: opts.extractProductNames } : {}),
+      }),
       timedOut,
     ]).finally(() => clearTimeout(timer));
     if (raced === "timed_out") return done({ outcome: "timeout", error: HCR_DEADLINE_EXCEEDED });
     const curated = raced.skipped_curated.find((c) => c.agent_id === agentId)?.fields;
     const rejected = raced.skipped_unsubstantiated.find((c) => c.agent_id === agentId)?.reason;
-    const extra = { ...(curated ? { curated_locked: curated } : {}), ...(rejected ? { rejected } : {}) };
     const err = raced.errors.find((e) => e.agent_id === agentId)?.error;
     const changed = raced.changed.find((c) => c.agent_id === agentId);
+    // categoriesCorroborateOnly only (never set by the morning send).
+    const corroboration: RfbHomepageRefreshRow["categories_corroboration"] = !opts.categoriesCorroborateOnly
+      ? undefined
+      : changed?.fields.includes(HCR_CATEGORIES_CORROBORATED)
+        ? "corroborated"
+        : raced.skipped_unsubstantiated.some(
+              (c) => c.agent_id === agentId && c.reason.startsWith(HCR_CATEGORIES_NOT_SUPPORTED),
+            )
+          ? "categories_not_supported_by_homepage"
+          : undefined;
+    // extractProductNames only (never set by the morning send).
+    const productReason = (prefix: string) =>
+      raced.skipped_unsubstantiated.some((c) => c.agent_id === agentId && c.reason.startsWith(prefix));
+    const productNames: RfbHomepageRefreshRow["product_names"] = !opts.extractProductNames
+      ? undefined
+      : changed?.fields.includes("products")
+        ? "products_replaced"
+        : productReason(HCR_PRODUCTS_NOT_SUPPORTED)
+          ? "products_not_supported_by_homepage"
+          : productReason(HCR_PRODUCTS_EXTRACTION_FAILED)
+            ? "products_extraction_failed"
+            : productReason(HCR_PRODUCTS_EXTRACTION_SKIPPED)
+              ? "products_extraction_skipped"
+              : curated?.includes("products")
+                ? "products_curated_locked"
+                : undefined;
+    const extra = {
+      ...(curated ? { curated_locked: curated } : {}),
+      ...(rejected ? { rejected } : {}),
+      ...(corroboration ? { categories_corroboration: corroboration } : {}),
+      ...(productNames ? { product_names: productNames } : {}),
+    };
     // Hijacked domain: the page-level skip (nothing written) or the
     // candidate-level rejection (other fields may still have been written).
     if (err?.startsWith(HCR_THEME_SPAM_PAGE_ERROR) || rejected === HCR_THEME_SPAM_CANDIDATE_REASON) {
@@ -1482,6 +1665,31 @@ async function runRfbMarketingDailyGuarded(opts: {
         (report.auto_paused ? ` AUTO-PAUSED (${report.recent_bounces.map((b) => b.recipient_email).join(", ")})` : "") +
         (report.health?.red ? ` health: ${report.health.reasons.join("; ")}` : "")
       ).slice(0, 490);
+      // Charter guardrails hard_bounce_rate / opt_out_honored_pct as numeric
+      // claims. Additive measurement: a failure here never affects the run.
+      const guardrailClaims: Array<{ type: "custom"; value: number; meta: Record<string, unknown> }> = [];
+      try {
+        const g = computeRfbMarketingGuardrailMetrics(db, new Date(report.finished_at));
+        const common = {
+          window_hours: g.window_hours,
+          window_since: g.window_since,
+          contacted: g.contacted,
+        };
+        guardrailClaims.push(
+          {
+            type: "custom",
+            value: g.hard_bounce_rate,
+            meta: { kind: "hard_bounce_rate", ...common, hard_bounced: g.hard_bounced, emails: g.hard_bounced_emails },
+          },
+          {
+            type: "custom",
+            value: g.opt_out_honored_pct,
+            meta: { kind: "opt_out_honored_pct", ...common, violations: g.opt_out_violations, emails: g.opt_out_violation_emails },
+          },
+        );
+      } catch (err) {
+        console.error("[rfb-marketing-daily] guardrail metrics not computed (non-fatal):", err);
+      }
       try {
         recordRun({
           run_id: report.run_id,
@@ -1563,6 +1771,7 @@ async function runRfbMarketingDailyGuarded(opts: {
               value: report.gate?.first?.count ?? 0,
               meta: { kind: "rfb_marketing_gate_summary", gate: report.gate },
             },
+            ...guardrailClaims,
           ],
           evidence: [
             {

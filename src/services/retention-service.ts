@@ -388,9 +388,24 @@ const QUERIES_SPEC: PruneSpec = {
   ],
 };
 
+/**
+ * True iff the AI-assistant bucket can be rolled up: agent_ai_view_daily exists
+ * (init.ts) and analytics_agent_views has traffic_category. Hand-rolled older
+ * schemas without either keep the human-only rollup.
+ */
+function hasAgentAiViewRollupSchema(db: Db): boolean {
+  try {
+    const cols = db.prepare("PRAGMA table_info(analytics_agent_views)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "traffic_category")) return false;
+    return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_ai_view_daily'").get();
+  } catch {
+    return false;
+  }
+}
+
 const AGENT_VIEWS_SPEC: PruneSpec = {
   table: "analytics_agent_views",
-  rollupSql: () => [
+  rollupSql: (db) => [
     // 1. Rollup: agent_view_daily (upsert to handle re-runs)
     // 2026-10-04 (view-stats honesty): only human rows enter permanent
     // history; classified non-human rows (bots, scanners, scrapers) are
@@ -416,6 +431,27 @@ const AGENT_VIEWS_SPEC: PruneSpec = {
      GROUP BY 1, 2, 3, 4
      ON CONFLICT(day, agent_id, view_source, city) DO UPDATE SET
        view_count = view_count + excluded.view_count`,
+    // 2. Rollup: agent_ai_view_daily, the AI-assistant bucket (dev-request
+    // 2026-10-22-statistikk-samme-tall-12-mnd, S0). Views an AI assistant
+    // fetched for a person (traffic_category 'ai_search', the same class the
+    // traffic report counts as AI-søk), not the owner, per day × profile, so
+    // the per-profile tiles can show a year. The human rollup above is
+    // unchanged; crawlers, bots, scanners and scrapers still go unrolled.
+    ...(hasAgentAiViewRollupSchema(db) ? [
+      `INSERT INTO agent_ai_view_daily (day, agent_id, view_count)
+       SELECT
+         substr(created_at, 1, 10) as day,
+         agent_id,
+         COUNT(*) as view_count
+       FROM analytics_agent_views
+       WHERE created_at >= ? AND created_at < ?
+         AND (is_owner IS NULL OR is_owner = 0)
+         AND traffic_category = 'ai_search'
+         AND agent_id IS NOT NULL
+       GROUP BY 1, 2
+       ON CONFLICT(day, agent_id) DO UPDATE SET
+         view_count = view_count + excluded.view_count`,
+    ] : []),
   ],
 };
 
@@ -506,6 +542,10 @@ export function rollupAndPruneQueriesAsync(
  * above). The unused .recordAgentView wrapper still writes neither, so its rows
  * would land in that legacy bucket too. Rows are still DELETED regardless of
  * is_owner / traffic_category, matching the precedent of the other rollups.
+ *
+ * dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S0: AI-assistant views
+ * (traffic_category 'ai_search') are additionally rolled up into their own
+ * bucket, agent_ai_view_daily (day × agent), in the same transaction.
  */
 export function rollupAndPruneAgentViews(
   windowDays: number = 90,

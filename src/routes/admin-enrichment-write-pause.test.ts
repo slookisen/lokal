@@ -675,7 +675,14 @@ export async function runAdminEnrichmentWritePauseTests(
         // the experiences pause before fetching/applying; its test file sets
         // the pause via the service to prove that.
         "services/experience-description-proposals-job.test.ts",
-        "services/experience-description-proposals-job.ts",
+        // The description proposals job itself no longer imports the guard:
+        // its mechanics moved VERBATIM into services/proposal-file-queue.ts
+        // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences
+        // pause before any GitHub fetch for BOTH proposal lanes (descriptions
+        // and gårdssalg visit texts). The visit lane's test file sets the
+        // pause via the service to prove it, same convention as the others.
+        "services/proposal-file-queue.ts",
+        "services/gardssalg-visit-proposals-job.test.ts",
         // gardssalg-content-refresh-job («4b-det», A2A dev-request 2026-10-06-
         // experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
         // tillegg 2026-10-15): the daily job drives the SAME shared core as
@@ -691,6 +698,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // the pause via the service to prove the writing steps stop.
         "services/rfb-enrichment-nightly.test.ts",
         "services/rfb-enrichment-nightly.ts",
+        // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
+        // places-treffvakt (S3): the Places match guard's test file sets the
+        // rfb pause via the service to prove both google-rating routes still
+        // answer 423 before any Places call (acceptance h).
+        "routes/rfb-places-match-guard.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

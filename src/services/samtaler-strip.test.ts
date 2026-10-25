@@ -92,6 +92,9 @@ const REFERRERS = [
   "https://www.perplexity.ai/search/x", "https://gemini.google.com/app", "https://copilot.microsoft.com/",
   "https://www.facebook.com/", "https://l.instagram.com/?u=x", "https://t.co/abc", "https://bsky.app/profile/x",
   "https://example.org/blogg", "https://nyheter.no/artikkel",
+  // AI hosts (matched on host) and look-alikes that must not be
+  "https://claude.ai/chat/1", "https://chat.mistral.ai/", "https://www.meta.ai/", "https://grok.com/", "https://chat.deepseek.com/",
+  "https://you.com/search", "https://kagi.com/assistant/x", "https://sylteogrokt.no/", "https://thankyou.com/",
   // own domains: dropped as "intern" ...
   "https://rettfrabonden.com/sok", "https://www.rettfrabonden.com/produsent/hanen", "https://finn-tannlege.com/",
   "https://opplevagent.no/opplevelser", "HTTPS://RettFraBonden.COM/Om",
@@ -193,6 +196,17 @@ export async function runSamtalerStripTests(opts: { log?: boolean } = {}): Promi
     }
     probe.close();
     ok(mismatch === null, "E5: SQL excludes exactly the referrers classifyReferralSource calls intern", mismatch);
+
+    // E6: landings with an AI UTM mark and NO referrer count in the grouped AI card; a
+    // non-whitelisted utm_source does not. (SQL reads utm_source/utm_campaign.)
+    const aiCount = () => computeHumanReferralPatterns(sdb, 24 * 30, "experiences", nowMs).find((p) => p.sourceKey === "ai")?.visitCount ?? 0;
+    const before = aiCount();
+    const insU = sdb.prepare(
+      "INSERT INTO analytics_page_views (path, source, referrer, session_id, is_owner, vertical_id, created_at, utm_source, utm_campaign) VALUES (?,?,?,?,0,'experiences',?,?,?)"
+    );
+    for (let i = 0; i < 3; i++) insU.run("/", "direct", null, `utm${i}:Mozilla/5.0 (iPhone) Safari`, sqliteTs(nowMs - 3600_000), "claude", "ai_search");
+    for (let i = 0; i < 3; i++) insU.run("/", "direct", null, `own${i}:Mozilla/5.0 (iPhone) Safari`, sqliteTs(nowMs - 3600_000), "agentplatform.no", null);
+    ok(aiCount() === before + 3, "E6: referrer-less utm_source=claude landings join the AI card; agentplatform.no does not", { before, after: aiCount() });
   } catch (e) {
     ok(false, "E: equivalence tests threw", (e as Error).stack);
   } finally {

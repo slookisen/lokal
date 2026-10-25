@@ -51,8 +51,10 @@ const NAME_STOPWORDS: ReadonlySet<string> = new Set([
 
 // Strip Norwegian accents / diacritics to their ASCII base so "Nalums" and
 // "Nålums" stem identically and so email local-parts (always ASCII) can be
-// compared against name stems.
-function stripNorwegianAccents(s: string): string {
+// compared against name stems. Exported for the homepage refresh's
+// product-name check (routes/admin-knowledge.ts), which must fold names and
+// page text exactly like this module's own matchers do.
+export function stripNorwegianAccents(s: string): string {
   return s
     .replace(/å/g, "a")
     .replace(/æ/g, "ae")
@@ -950,11 +952,22 @@ export function extractProseText(html: string): string {
 
 // Norwegian → category vocabulary, mirroring the platform's canonical map in
 // services/marketplace-registry.ts (categoryMap) and routes/seo.ts
-// (CATEGORY_MAP). Kept local (dependency-free, accent-stripped at match time)
-// so this module stays a leaf importer of cross-source-validator only. The 10
-// category keys MUST match the platform set: vegetables, fruit, berries, dairy,
-// eggs, meat, fish, bread, honey, herbs.
-const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = [
+// (CATEGORY_MAP). Kept local (dependency-free) so this module stays a leaf
+// importer of cross-source-validator only. The 11 category keys MUST map onto
+// the platform set (PRODUCT_KEY_TO_PLATFORM below): vegetables, fruit,
+// berries, dairy, eggs, meat, fish, bread, honey, herbs, beverages.
+//
+// Keywords may be written in normal Norwegian spelling: the list is folded at
+// load (CONTENT_CATEGORY_LEXICON below) through the SAME lowercase +
+// stripNorwegianAccents the page text gets in extractProductMentions, so both
+// sides always compare in one form. dev-request 2026-10-15-kategori-
+// nokkelord-ae-og-drikke: the berry/pear words used to be written "bar",
+// "jordbar", "pare" — but the folding turns æ into "ae" ("bær" → "baer"), so
+// they never matched Norwegian text, and the bare "bar" only ever matched the
+// English/Norwegian "bar" (kaffebar, bar). The accent-less compounds stay as
+// a fallback where they mean nothing else ("bringebar"); "bar", "pare" and
+// "parer" (also the verb "pare", to mate) are gone.
+const CONTENT_CATEGORY_LEXICON_SOURCE: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["vegetables", [
     "gronnsaker", "gronnsak", "gront", "vegetables", "poteter", "potet",
     "gulrotter", "gulrot", "lok", "kal", "tomat", "tomater", "agurk",
@@ -963,12 +976,14 @@ const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[
     "nepe", "pastinakk", "andelslandbruk",
   ]],
   ["fruit", [
-    "frukt", "fruit", "epler", "eple", "parer", "pare", "plommer", "plomme",
-    "kirsebar", "moreller", "rips", "stikkelsbar", "druer",
+    "frukt", "fruit", "epler", "eple", "pærer", "pære", "plommer", "plomme",
+    "kirsebær", "kirsebar", "moreller", "rips", "stikkelsbær", "stikkelsbar", "druer",
   ]],
   ["berries", [
-    "bar", "berries", "jordbar", "blabar", "bringebar", "tyttebar",
-    "solbar", "multe", "multer", "markjordbar",
+    "bær", "berries", "jordbær", "blåbær", "bringebær", "tyttebær", "solbær",
+    "markjordbær", "multe", "multer",
+    // accent-less spellings (no other meaning)
+    "jordbar", "blabar", "bringebar", "tyttebar", "solbar", "markjordbar",
   ]],
   ["dairy", [
     "meieri", "dairy", "melk", "ost", "smor", "yoghurt", "flote", "romme",
@@ -992,7 +1007,35 @@ const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[
   ]],
   ["honey", ["honning", "honey", "birokt"]],
   ["herbs", ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"]],
+  // Drinks a farm sells. Only words that mean nothing else: NOT the bare
+  // "sider" (also the plural of "side", a web page — the WordPress "Sider"
+  // widget, "andre sider"), NOT the bare "most" (English "most": "is most
+  // famous", "what we love most", "most visitors" — the refresh also reads
+  // English /about pages) and NOT the bare "saft" (café noise: "kaffe og saft
+  // i kafeen"). The cidery itself ("sideri") and the Norwegian compounds
+  // carry it.
+  ["beverages", [
+    "sideri", "eplesider", "pæresider", "cider", "eplecider",
+    "eplemost", "pæremost", "juice", "eplejuice",
+    "eplesaft", "bringebærsaft", "solbærsaft", "rabarbrasaft", "hyllebærsaft", "hylleblomstsaft",
+  ]],
 ];
+
+/** Same fold as the page text in extractProductMentions. */
+function foldContentKeyword(kw: string): string {
+  return stripNorwegianAccents(kw.toLowerCase());
+}
+
+const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = CONTENT_CATEGORY_LEXICON_SOURCE.map(
+  ([category, keywords]) => [category, Array.from(new Set(keywords.map(foldContentKeyword)))] as const,
+);
+
+/** Whole-word pattern per (folded) keyword, built once. */
+const CONTENT_KEYWORD_PATTERNS: ReadonlyMap<string, RegExp> = new Map(
+  CONTENT_CATEGORY_LEXICON.flatMap(([, keywords]) =>
+    keywords.map((kw): [string, RegExp] => [kw, new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`)]),
+  ),
+);
 
 /**
  * Detect distinctive Norwegian BUSINESS-TYPE tokens that appear in the page
@@ -1041,8 +1084,7 @@ export function extractProductMentions(text: string): string[] {
   const out: string[] = [];
   for (const [category, keywords] of CONTENT_CATEGORY_LEXICON) {
     for (const kw of keywords) {
-      const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
-      if (re.test(hay)) {
+      if (CONTENT_KEYWORD_PATTERNS.get(kw)!.test(hay)) {
         if (!out.includes(category)) out.push(category);
         break; // one hit is enough to include the category
       }
@@ -1592,6 +1634,11 @@ export function extractJsonLdOpeningHours(html: string): string | null {
  * The platform's category vocabulary — the canonical keys the `agents.categories`
  * column stores and the /sok category filter understands. MUST stay aligned with
  * routes/seo.ts CATEGORY_LABELS_NO + services/marketplace-registry.ts categoryMap.
+ * Integration test 2026-10-17, slice I-W: the search's keys (marketplace-
+ * registry.ts PRODUCT_CATEGORY_KEYWORDS) are these keys, and a test pins it
+ * (src/routes/rfb-sok-ukjente-ord-bakeri-sted.test.ts); the search's
+ * «bread» left out every «bakery» producer. Its one other key is «berries»,
+ * which the platform sells under fruit (PRODUCT_KEY_TO_PLATFORM below).
  * `other` is the catch-all when a producer is clearly a food producer but no
  * specific category matched (kept last; only used as a fallback, never mixed in).
  */
@@ -1604,8 +1651,10 @@ export const PLATFORM_CATEGORIES: readonly string[] = [
 // keys (which include "bread" and "berries"); map those onto the platform
 // vocabulary above. "bread" → "bakery"; "berries" → "fruit" (the platform set
 // has no separate berries key — berries are sold under fruit). Everything else
-// is already a platform key and passes through unchanged.
-const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
+// is already a platform key and passes through unchanged. Exported for the
+// offers' short-term category check (catalog-offers.ts, slice I-V), whose
+// keyword map (marketplace-registry.ts) has the same keys.
+export const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
   vegetables: "vegetables",
   fruit: "fruit",
   berries: "fruit",
@@ -1616,6 +1665,7 @@ const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
   bread: "bakery",
   honey: "honey",
   herbs: "herbs",
+  beverages: "beverages",
 };
 
 // Distinctive business-type tokens (from extractBusinessTypeTokens) → the

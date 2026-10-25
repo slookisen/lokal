@@ -16,11 +16,22 @@
  *   GET /robots.txt           → Crawl instructions
  */
 
+import { resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, productPriceText } from "../services/knowledge-service";
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
+// fields read by type (see "knowledge fields read by type" below).
+import { textEntries } from "../utils/text-entries";
+// Server values written into the producer page's inline <script> (agentId and
+// its language strings) go through serializeJsonForScript(), so a value with
+// "</script>" or "<!--<script>" cannot end or swallow the element; for the
+// UUIDs and fixed texts they hold today the bytes are unchanged (FUNN
+// rfb-seo-ra-json-stringify-inline, lokal#1105 review). The JSON-LD in
+// shell() keeps its own `<` escape: moving it would change bytes (`&`).
+import { serializeJsonForScript } from "../services/safe-script-json";
 import { getConfig } from "../config/vertical-config";
 import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
@@ -28,8 +39,9 @@ import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
-import { DiscoveryQuerySchema } from "../models/marketplace";
+import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
+import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
@@ -38,12 +50,17 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { searchTrafficClass } from "../services/search-tracking";
 import { AI_DELIVERY_WINDOW_DAYS } from "../services/profile-ai-deliveries-compute";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate } from "../services/agent-visibility";
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
+// rating markup, Offer return/shipping terms, the visible rating text and
+// whether the producer page has Product nodes (S6 del B).
+import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay, producerPageProductNodes } from "../services/structured-data-policy";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
@@ -54,6 +71,19 @@ import {
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
+import {
+  normalizeOpeningHours,
+  parseOpeningHoursText,
+  parseDayLabel,
+  weekdaysLabel,
+  entryDaysLabel,
+  osloWeekdayAndMinutes,
+  openingStatusAt,
+  isSeasonalEntry,
+  clockTime,
+  WEEKDAY_NAMES,
+  type OpeningHoursEntry,
+} from "../utils/opening-hours";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang, isLangCookieRedirectEnabled } from "../i18n/t";
 import { rfbLangSessionMiddleware } from "../i18n/middleware";
@@ -61,6 +91,13 @@ import { translateProductName, translateDeliveryTerm } from "../i18n/product-glo
 import { getPublishedProfileTranslationsBulk } from "../services/profile-translations";
 import { fieldHasOnlyInferenceSources } from "../services/cross-source-validator";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-E: visible FAQ from the
+// FAQPage object (SD-01) and fylke-named place pages (SD-02).
+import { faqPairsFromJsonLd, renderFaqSection } from "../services/faq-section";
+import { cityToFylke, normaliseFylke, EQUIVALENCE_CLASSES } from "../services/norway-fylke";
+import { resolveFylke2024 } from "../services/fylke-2024-migration";
+import { FYLKE_BOUNDS, inBounds, sharedKommuneNameBounds, type Bounds } from "../services/fylke-bounds";
+import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import {
   parseIsoOrSqlite,
   formatUpdatedPrettyNo,
@@ -120,12 +157,13 @@ export { formatAddressLine };
 import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
 // A2A dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as (+T1–T3):
 // the operator facts (footer line, /kontakt facts, /personvern controller,
-// JSON-LD parentOrganization) all come from COMPANY_INFO via these helpers.
+// JSON-LD parentOrganization) all come from COMPANY_INFO via these helpers;
+// the front page's Organization from config/brand-entities.ts (G3-S1).
 import {
   companyContactBlockHtml,
   companyControllerSentenceHtml,
   companyFooterLineHtml,
-  parentOrganizationJsonLd,
+  organizationJsonLd,
   toSiteLang,
 } from "../services/company-legal";
 
@@ -144,45 +182,24 @@ const CITY_COORDS: Record<string, { lat: number; lng: number }> = {
   alesund: { lat: 62.47, lng: 6.15 },
 };
 
-const DAY_NAMES: Record<string, string> = {
-  mon: "Mandag", tue: "Tirsdag", wed: "Onsdag", thu: "Torsdag",
-  fri: "Fredag", sat: "L\u00f8rdag", sun: "S\u00f8ndag",
-  monday: "Mandag", tuesday: "Tirsdag", wednesday: "Onsdag",
-  thursday: "Torsdag", friday: "Fredag", saturday: "L\u00f8rdag", sunday: "S\u00f8ndag"
-};
-
 const MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Des"];
-// Daniel 2026-09-03 (screenshot: "Mandag … Søndag", "I dag" on /en).
-const DAY_NAMES_EN: Record<string, string> = {
-  mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday", fri: "Friday", sat: "Saturday", sun: "Sunday",
-  monday: "Monday", tuesday: "Tuesday", wednesday: "Wednesday", thursday: "Thursday", friday: "Friday", saturday: "Saturday", sunday: "Sunday",
-};
-const DAY_NAMES_SV: Record<string, string> = {
-  mon: "M\u00e5ndag", tue: "Tisdag", wed: "Onsdag", thu: "Torsdag", fri: "Fredag", sat: "L\u00f6rdag", sun: "S\u00f6ndag",
-  monday: "M\u00e5ndag", tuesday: "Tisdag", wednesday: "Onsdag", thursday: "Torsdag", friday: "Fredag", saturday: "L\u00f6rdag", sunday: "S\u00f6ndag",
-};
 const MONTH_NAMES_EN = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const MONTH_NAMES_SV = ["", "Jan", "Feb", "Mar", "Apr", "Maj", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dec"];
+/**
+ * A day key in the page language: "sat", "saturday" and "Lørdag" are
+ * "Saturday" on /en. Enrichment stores ranges as one row ("mon-sun",
+ * "mon-fri", "man-fre"): live on Gvarv 2026-09-03 the raw key rendered in
+ * BOTH languages, so a range of known days renders "Monday–Sunday" /
+ * "Mandag–Søndag". Anything else is shown as written. The day tables
+ * and the range rule live in utils/opening-hours.ts since slice I-H, shared
+ * with lokal_info, the A2A auto-reply and "open now". The hours card no
+ * longer calls this (it uses entryDaysLabel); kept, as a thin wrapper, for
+ * backwards compatibility with callers and tests that import it.
+ */
 export function dayName(key: string, lang: Lang): string {
-  const k = (key || "").toLowerCase().trim();
-  const m = lang === "en" ? DAY_NAMES_EN : lang === "sv" ? DAY_NAMES_SV : DAY_NAMES;
-  if (m[k] || DAY_NAMES[k]) return m[k] || DAY_NAMES[k];
-  // Enrichment stores ranges as one row ("mon-sun", "mon-fri", "man-fre"):
-  // live on Gvarv 2026-09-03 the raw key rendered in BOTH languages. Render
-  // "Monday–Sunday" / "Mandag–Søndag" when both ends are known days.
-  const range = /^([a-zæøå]+)\s*[-–]\s*([a-zæøå]+)$/.exec(k);
-  if (range) {
-    const norm = (d: string) => NO_DAY_ALIASES[d] || d;
-    const a = norm(range[1]), b = norm(range[2]);
-    if ((m[a] || DAY_NAMES[a]) && (m[b] || DAY_NAMES[b])) return `${m[a] || DAY_NAMES[a]}\u2013${m[b] || DAY_NAMES[b]}`;
-  }
-  return key;
+  const days = parseDayLabel(key || "");
+  return days ? weekdaysLabel(days, WEEKDAY_NAMES[lang]) : key;
 }
-/** Norwegian day abbreviations the enrichment may emit inside a range key. */
-const NO_DAY_ALIASES: Record<string, string> = {
-  man: "mon", tir: "tue", ons: "wed", tor: "thu", fre: "fri", lør: "sat", lor: "sat", søn: "sun", son: "sun",
-  mandag: "mon", tirsdag: "tue", onsdag: "wed", torsdag: "thu", fredag: "fri", lørdag: "sat", søndag: "sun",
-};
 export function monthAbbr(m: number, lang: Lang): string {
   const arr = lang === "en" ? MONTH_NAMES_EN : lang === "sv" ? MONTH_NAMES_SV : MONTH_NAMES;
   return arr[m] || String(m);
@@ -532,6 +549,45 @@ export function productLabel(name: string, lang: Lang): string {
 export function isCategoryWord(name: string): boolean {
   return !!CATEGORY_NAME_TO_KEY[(name || "").trim().toLowerCase()];
 }
+
+/**
+ * dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+ * (S6 del A): the producer-page JSON-LD name and price of a product whose
+ * price field holds no price, read from its name ("Lammelår – kr 275/kg" →
+ * "Lammelår", 275). A price it gives is always a "kr" price the visible name
+ * shows.
+ * - "kr" must come right before the number. Before, any dash before a digit
+ *   split the name: "Sesonggrønnsaker (40-50 sorter)" became
+ *   «Sesonggrønnsaker (40» at an invented 50, "Gardsmjølk – 2 liter/veke
+ *   abonnement" «Gardsmjølk» at 2, and "Poteter 5-10 kg" the Thing «Poteter 5».
+ * - A multi-buy ("Gave - 2 for kr 100", "2 x kr 100", "pr kr 50") and a name
+ *   with more than one kr price ("Kake – kr 50 (liten), kr 90 (stor)") give
+ *   no price: no single number is the product's price.
+ * - The name is cut only when a price was found, and a parenthesis the price
+ *   part closes is closed: "Selvplukk bringebær (kurv 300g - kr 50)" →
+ *   "Selvplukk bringebær (kurv 300g)", not "(kurv 300g".
+ * - The cut name goes through productLabel like a whole name, so EN pages
+ *   translate it ("Honning - kr. 150" → "Honey").
+ * - A price after the number ("Egg – 60 kr") gives none: the 2026-10-17
+ *   feed had no name of that form, and parseNokPrice stays the one judge of
+ *   the number.
+ * Without a price: the whole name (through productLabel) and null.
+ */
+export function splitNamePrice(rawName: string, lang: Lang): { name: string; price: number | null } {
+  const whole = { name: productLabel(rawName, lang), price: null };
+  const m = rawName.match(/^(.+?)\s*[–\-—]\s*(kr\.?\s*\d.*)$/i)
+    || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
+  if (!m) return whole;
+  const head = m[1].trim();
+  if (/(?:\b(?:for|per|pr)\.?|(?:^|[\s\d])[x×])\s*$/i.test(head)) return whole;
+  if ((rawName.match(/\bkr\.?\s*\d/gi) || []).length > 1) return whole;
+  const price = parseNokPrice(m[2]);
+  if (price === null) return whole;
+  const depth = (s: string): number => (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
+  const closes = Math.max(0, Math.min(depth(head), -depth(m[2])));
+  return { name: productLabel(head + ")".repeat(closes), lang), price };
+}
+
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
 }
@@ -862,30 +918,72 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
   </a>`;
 }
 
+// ─── Integration test 2026-10-17 (I-G): knowledge fields read by type ─────
+// The knowledge columns are JSON whose shape nothing enforces. getAgentInfo
+// (I-F) hands each list over in its declared shape, but the fields inside a
+// product or an opening-hours entry are typed where they are read. Before
+// this, the producer page showed a price stored as an object as
+// "[object Object]" and hours without times as "undefined – undefined", and
+// answered 500 on a day that is a number, a month list stored as text or a
+// seasonality entry whose months are not a list; the front page answered 500
+// when a featured producer's hours held a number. Well-formed values give
+// exactly the text they gave before.
+
+/** A product entry's name: a text entry is its own name, an object its text `name`; anything else has none. */
+function productNameText(p: unknown): string {
+  if (typeof p === "string") return p;
+  const name = p !== null && typeof p === "object" ? (p as { name?: unknown }).name : undefined;
+  return typeof name === "string" ? name : "";
+}
+
+/**
+ * The rows of the producer page's hours card ("Åpningstider"), from the
+ * entries of utils/opening-hours.ts (slice I-H). An entry with times is
+ * "<days> | <open> – <close> (<period; note>)"; an entry without times is
+ * "<days> | <note>", or the note alone in the time column when it has no day
+ * (a text entry, {note}, or a marker day such as "by-appointment"). Days are
+ * in the page language ("Lørdag" is "Saturday" on /en); a label that names no
+ * weekday ("Varierer", "Påske") is shown as written. `today` (Monday = 0, in
+ * Norway) highlights every entry that covers it, ranges too, except an entry
+ * that holds only in part of the year: a period ("Mai–September") or, slice
+ * I-O, a season note ("Sesongåpent til ca. 20. september"; isSeasonalEntry).
+ * It may not hold today. For the declared form ({day, open, close, note}) the
+ * rows are the ones I-G gave.
+ */
+export function openingHoursCardHtml(entries: readonly OpeningHoursEntry[], lang: Lang, today: number): string {
+  return entries.map((h) => {
+    const label = entryDaysLabel(h, lang);
+    const qualifier = [h.period, h.note].filter(Boolean).join("; ");
+    const time = h.open !== undefined && h.close !== undefined
+      ? `${escapeHtml(h.open)} \u2013 ${escapeHtml(h.close)}${qualifier ? ` (${escapeHtml(qualifier)})` : ""}`
+      : escapeHtml(qualifier);
+    if (!label) return `<div class="hrs-day"></div><div class="hrs-time">${time}</div>`;
+    const isToday = !isSeasonalEntry(h) && h.days.includes(today as OpeningHoursEntry["days"][number]);
+    const cls = isToday ? " hrs-today" : "";
+    const todayBadge = isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : "";
+    return `<div class="hrs-day${cls}">${escapeHtml(label)}${todayBadge}</div><div class="hrs-time${cls}">${time}</div>`;
+  }).join("");
+}
+
 // ─── PR-84: "Open now" computation from openingHours ───────
 
-function isOpenNow(openingHours: Array<{ day: string; open: string; close: string }> | undefined): { isOpen: boolean; todayLabel?: string } | null {
-  if (!Array.isArray(openingHours) || !openingHours.length) return null;
-
-  // Get current Norway day + time
-  const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Oslo", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
-  const parts = fmt.formatToParts(new Date());
-  const dayLong = parts.find(p => p.type === "weekday")?.value.toLowerCase() || "";
-  const dayKey = dayLong.slice(0, 3); // "mon", "tue", etc
-  const hourStr = parts.find(p => p.type === "hour")?.value || "00";
-  const minStr = parts.find(p => p.type === "minute")?.value || "00";
-  const nowMins = parseInt(hourStr) * 60 + parseInt(minStr);
-
-  const today = openingHours.find(h => h.day?.toLowerCase() === dayKey);
-  if (!today) return { isOpen: false };
-
-  const [oh, om] = (today.open || "00:00").split(":").map(Number);
-  const [ch, cm] = (today.close || "00:00").split(":").map(Number);
-  const openMins = oh * 60 + om;
-  const closeMins = ch * 60 + cm;
-
-  const isOpen = nowMins >= openMins && nowMins < closeMins;
-  return { isOpen, todayLabel: `${today.open}–${today.close}` };
+/**
+ * The front-page card's "Åpent nå" / "Stengt" line. Slice I-H: the day and
+ * interval rule of utils/opening-hours.ts (openingStatusAt, Europe/Oslo), so
+ * "monday", "Lørdag", "mon-sun" and "Man-fre" count as well as "mon" (they
+ * never matched before, and the card said "Stengt" in opening hours), and
+ * hours past midnight ("12:00–01:30") are open until the closing time on the
+ * next day. null (no line) when no entry says which days and times it is open.
+ * Slice I-O: free text for the whole field in the day-and-time form ("Man-Fre
+ * 07-22, Lor 08-22") counts as its day rows, as on the producer page; other
+ * text still says nothing. An entry with a season note counts for nothing,
+ * as one with a period.
+ */
+export function isOpenNow(openingHours: unknown, at: Date = new Date()): { isOpen: boolean; todayLabel?: string } | null {
+  const status = openingStatusAt(normalizeOpeningHours(openingHours), at);
+  if (!status) return null;
+  const today = status.today;
+  return today ? { isOpen: status.isOpen, todayLabel: `${today.open}–${today.close}` } : { isOpen: false };
 }
 
 // ─── PR-84: Ultra-rich card for positions 1-3 (claimed top producers) ───
@@ -906,16 +1004,19 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
 
-  // Rating: ★ 4.7 (159)
-  const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
-    ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}${knowledge.googleReviewCount ? ` (${knowledge.googleReviewCount})` : ""}</span>`
-    : "";
+  // Rating: "★ 4.7 · 159 anmeldelser på Google". The stored rating is Google's,
+  // so the source is always named (dev-request 2026-10-16-rfb-strukturerte-data-
+  // tredjepartsrating-og-places-treffvakt, S2). Nothing in RATING_DISPLAY_MODE
+  // 'hidden', the mode since S4-A1a.
+  const ratingDisplay = formatRatingDisplay({ rating: knowledge?.googleRating, count: knowledge?.googleReviewCount, source: "google" }, lang);
+  const rating = ratingDisplay ? `<span class="pc-rating">${escapeHtml(ratingDisplay.text)}</span>` : "";
 
   // Product summary line: top 3 product names with category-emoji + "+N produkter"
   const products = Array.isArray(knowledge?.products) ? knowledge.products : [];
   let productLine = "";
   if (products.length) {
-    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(p.name || "", lang))}`).join(", ");
+    // I-G: a text entry is its own name (it used to show as the emoji alone).
+    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(productNameText(p), lang))}`).join(", ");
     const more = products.length > 3 ? ` <span class="pc-more">+${products.length - 3} ${escapeHtml(lang === "en" ? "products" : "produkter")}</span>` : "";
     productLine = `<div class="pc-products">${top}${more}</div>`;
   }
@@ -987,9 +1088,9 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
 
-  const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
-    ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}</span>`
-    : "";
+  // Same attributed rating text as the ultra-rich card (S2).
+  const ratingDisplay = formatRatingDisplay({ rating: knowledge?.googleRating, count: knowledge?.googleReviewCount, source: "google" }, lang);
+  const rating = ratingDisplay ? `<span class="pc-rating">${escapeHtml(ratingDisplay.text)}</span>` : "";
 
   // Address line: full address, or fall back to city
   const addressVal = knowledge?.address || city;
@@ -1343,10 +1444,11 @@ router.get("/", (req: Request, res: Response) => {
       }).join("");
 
     // Published translations for the whole featured list in one query
-    // (description on the row, about on the knowledge object).
+    // (description on the row, about on the knowledge object). The rich cards
+    // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
     featured.forEach((a: any, i: number) => {
-      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id)?.knowledge || {});
+      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {});
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
@@ -1436,14 +1538,10 @@ router.get("/", (req: Request, res: Response) => {
     // T2 (dev-request 2026-10-08-juridisk-info-nettsteder-agentplatform-as):
     // the site's own Organization, owned by Agentplatform.no AS — the same
     // WebSite + Organization pair opplevagent.no and finn-tannlege.com publish.
-    const orgJsonLd = {
-      "@context": "https://schema.org",
-      "@type": "Organization",
-      "name": `${getConfig().display_name}`,
-      "url": BASE_URL,
-      "logo": `${BASE_URL}/logo-512.png`,
-      "parentOrganization": parentOrganizationJsonLd(),
-    };
+    // G3-S1 (2026-10-16-merkevare-entitet-og-connector-pakker): built from the
+    // brand entry — PNG logo, the domain as alternateName, and the company's
+    // Brreg sameAs on parentOrganization.
+    const orgJsonLd = organizationJsonLd("rfb");
 
     const numFmt = lang === "en" ? "en-US" : "nb-NO";
 
@@ -1632,7 +1730,9 @@ const SEARCH_CSS = `
 router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   const searchStarted = Date.now();
   const lang = req.lang;
-  const q = typeof req.query.q === "string" ? req.query.q : "";
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of `q` are read, cut at a word
+  // boundary (utils/free-text.ts), before route intent, parser and geocoder.
+  const q = capFreeText(typeof req.query.q === "string" ? req.query.q : "");
   const frontendLat = parseFloat(req.query.lat as string);
   const frontendLng = parseFloat(req.query.lng as string);
   const hasBrowserCoords = isValidLatLng(frontendLat, frontendLng);
@@ -1674,24 +1774,25 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
   }
 
   try {
-    const parsed = marketplaceRegistry.parseNaturalQuery(q);
-    const proximityIntent = !!(parsed as any)._proximityIntent;
     const heleNorge = req.query.heleNorge === "true";
+    // Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): read as
+    // MCP lokal_search reads it (services/rfb-search-reading.ts): a place
+    // outside Norway gets no producers («cheese in Stockholm» listed Norwegian
+    // dairies), and the place in the text is geocoded as before (e.g.
+    // "honning oslo" → Oslo coords), unless the visitor's position or «hele
+    // Norge» decides the area.
+    const { outsideNorway, parsed } = readSearchText(q);
+    const proximityIntent = !outsideNorway && !!(parsed as any)._proximityIntent;
     let geoPlaceLabel: string | undefined;
 
-    // Geocode location from query text (e.g. "honning oslo" → Oslo coords)
-    if (!heleNorge && !parsed.location) {
+    if (!outsideNorway && !heleNorge) {
       if (hasBrowserCoords) {
         parsed.location = { lat: frontendLat, lng: frontendLng };
         parsed.maxDistanceKm = searchRadiusKm;
         geoPlaceLabel = lang === "en" ? "your location" : "din posisjon";
       } else if (q) {
-        const geoResult = await geocodingService.extractAndGeocode(q);
-        if (geoResult) {
-          parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
-          parsed.maxDistanceKm = geoResult.radiusKm;
-          geoPlaceLabel = formatPlaceLabel(geoResult.name);
-        }
+        const place = await geocodeSearchPlace(parsed, q);
+        if (place) geoPlaceLabel = formatPlaceLabel(place.name);
       }
     }
 
@@ -1700,22 +1801,37 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // different question with a nationwide trust-ranked list.
     const needsLocation = proximityIntent && !parsed.location && !heleNorge;
 
-    // Preserve internal fields through Zod parsing (Zod strips unknown keys).
+    // Preserve internal fields through Zod parsing (Zod strips unknown keys):
+    // discoveryQueryOf puts the parser's words back on every query below.
     // _nameQuery is critical: when present, discover() returns name-matched
     // agents anywhere in Norway and skips geo. Without this re-attach, /sok
     // silently fell back to geo-rank fallback and surfaced unrelated nearby
     // producers when the user typed a producer name not present locally.
-    const productTerms = parsed._productTerms;
+    // Slice I-AA: _unknownTerms too, so discover() step 3c looks the words
+    // up in the product names: «kransekake» showed the standard list.
     const nameQuery = (parsed as any)._nameQuery as string | undefined;
-    const query = DiscoveryQuerySchema.parse({ ...parsed, limit: 30, offset: 0 });
-    if (productTerms) (query as any)._productTerms = productTerms;
-    if (nameQuery) (query as any)._nameQuery = nameQuery;
+    const query = discoveryQueryOf(parsed, { limit: 30, offset: 0 });
 
     // REVIEW FOLLOW-UP B1: same out-param as /api/marketplace/search —
     // discover() can widen a NAME search past our radius by itself, and the
     // ladder below never runs in that case (wasNameMatch short-circuits it).
     const discoverMeta: DiscoverMeta = {};
-    let results = marketplaceRegistry.discover(query, discoverMeta);
+    // Slice I-Z: our own traffic, probes and spam see the same page but raise
+    // no discovery counter, and the conversation below is stored as theirs
+    // (search-tracking.ts searchTrafficClass).
+    const requestMeta = buildRequestMeta(req);
+    const trafficClass = searchTrafficClass({ meta: requestMeta, text: q });
+    const trackDiscovery = trafficClass === "external";
+    // Slice I-AA: a page whose unknown words match no product name
+    // (meta.unmatchedTerms) is the producers near the place, not results: it
+    // is shown as none, so the ladder below widens as for an empty page, and
+    // it is not counted as discovered. unmatchedTerms is the last step's.
+    const search = (stepQuery: typeof query, meta: DiscoverMeta) => {
+      const found = marketplaceRegistry.discover(stepQuery, meta, { trackDiscovery, countUnmatched: false });
+      return meta.unmatchedTerms ? [] : found;
+    };
+    let results = outsideNorway ? [] : search(query, discoverMeta);
+    let unmatchedTerms = discoverMeta.unmatchedTerms;
 
     // If discover returned name-matched results (relevanceScore≥0.9 +
     // matchReasons starts with "Navnematch"), don't run the geo-fallback —
@@ -1734,7 +1850,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     // from the first call, but RE-CAPTURED at every ladder step below — see
     // the matching comment in /api/marketplace/search (marketplace.ts) for
     // why a stale first-call flag is wrong once the ladder actually widens.
-    let tagsDropped = !!discoverMeta.tagsRelaxed;
+    // Slice I-AA: a tag dropped for a page shown as none is no news.
+    let tagsDropped = !unmatchedTerms && !!discoverMeta.tagsRelaxed;
     let appliedRadiusKm = parsed.maxDistanceKm;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       // REVIEW FOLLOW-UP item 6: only ever WIDEN. This ladder is fixed at
@@ -1744,22 +1861,18 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       const steps = [50, 100, 200].filter((r) => r > (parsed.maxDistanceKm ?? 0));
       for (const radius of steps) {
         if (results.length >= MIN_RESULTS) break;
-        const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
-        if (productTerms) (expanded as any)._productTerms = productTerms;
-        if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         const expandedMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(expanded, expandedMeta);
+        results = search(discoveryQueryOf(parsed, { maxDistanceKm: radius, limit: 30, offset: 0 }), expandedMeta);
+        unmatchedTerms = expandedMeta.unmatchedTerms;
         appliedRadiusKm = radius;
-        tagsDropped = !!expandedMeta.tagsRelaxed;
+        tagsDropped = !unmatchedTerms && !!expandedMeta.tagsRelaxed;
       }
       if (results.length < MIN_RESULTS) {
-        const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
-        if (productTerms) (noGeo as any)._productTerms = productTerms;
-        if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         const noGeoMeta: DiscoverMeta = {};
-        results = marketplaceRegistry.discover(noGeo, noGeoMeta);
+        results = search(discoveryQueryOf(parsed, { location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 }), noGeoMeta);
+        unmatchedTerms = noGeoMeta.unmatchedTerms;
         geoDropped = true;
-        tagsDropped = !!noGeoMeta.tagsRelaxed;
+        tagsDropped = !unmatchedTerms && !!noGeoMeta.tagsRelaxed;
       }
     }
     if (geoDropped) appliedRadiusKm = undefined;
@@ -1780,13 +1893,12 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     let totalAtMax = false;
     if (results.length >= 30) {
       try {
-        const countQuery = DiscoveryQuerySchema.parse({
-          ...parsed,
+        // The product words, and slice I-AA's unknown words; no name query, as before.
+        const countQuery = discoveryQueryOf(parsed, {
           location: heleNorge ? undefined : parsed.location,
           maxDistanceKm: heleNorge ? undefined : parsed.maxDistanceKm,
           limit: 100, offset: 0,
-        });
-        if (productTerms) (countQuery as any)._productTerms = productTerms;
+        }, ["_productTerms", "_unknownTerms"]);
         // Count-only: these rows are never shown, so they are not "discovered".
         const countResults = marketplaceRegistry.discover(countQuery, undefined, { trackDiscovery: false });
         totalCount = countResults.length;
@@ -1840,7 +1952,8 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
           queryText: q || "nærhetssøk",
           source: "web",
           buyerAgentName: "Besøkende",
-          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
+          requestMeta, // (item 3) internal-traffic classification
+          trafficClass, // slice I-Z: a probe or spam is no countable conversation
           autoRespond: true,
         });
       } catch { /* non-critical — don't break search if logging fails */ }
@@ -1929,6 +2042,15 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
     const queryLabel = q
       ? `\u201c${escapeHtml(q)}\u201d`
       : (lang === "en" ? "your location" : "din posisjon");
+    // Slice I-AA: an empty page says why, in lokal_search's words: a place
+    // outside Norway, or words that no product name matches (also after the
+    // ladder looked in all of Norway). Otherwise as before.
+    const textLang = lang === "en" ? "en" : "no";
+    const nullNote = outsideNorway ? outsideNorwayText(outsideNorway, textLang)
+      : unmatchedTerms ? noProductMatchText(unmatchedTerms, textLang) : null;
+    const emptyLine = nullNote
+      ? `<p id="searchNullNote" style="font-size:1.1rem;">${escapeHtml(nullNote)}</p>`
+      : `<p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>`;
     // REVIEW FOLLOW-UP R2: `heleNorge=true` is the OTHER way a coordinates-only
     // page ends up nationwide, and it was not covered by the geoDropped guard —
     // /sok?lat=..&lng=..&heleNorge=true rendered «Produsenter nær deg (30 km)»
@@ -1969,7 +2091,7 @@ router.get("/sok", generalLimiter, async (req: Request, res: Response) => {
       ${results.length > 0
         ? `<div class="results-grid">${resultCards}</div>`
         : `<div style="text-align:center;padding:48px 0;color:var(--g500);">
-            <p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>
+            ${emptyLine}
             <p style="margin-top:8px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Try a different search" : "Pr\u00f8v et annet s\u00f8k"}</a></p>
           </div>`
       }
@@ -2519,6 +2641,11 @@ const GUIDE_MAT_AI_CSS = `
 // content is fixed/curated editorial copy, not derived from a possibly-thin
 // DB row, so there is no 2-real-facts quality gate here — the page always
 // emits its FAQPage block. Exported for tests.
+// Prices, here and in the tool cards on the page, are worded the way
+// lokal_search and lokal_info describe them: products «med pris der
+// produsenten har oppgitt den» / "with a price where the producer has stated
+// one", never a full price list, since most producers list no prices
+// (dev-request 2026-10-17-integrasjonstest-oppfolging, I-P / MCP2-02).
 export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
   const en = lang === "en";
   const qas: Array<{ q: string; a: string }> = en ? [
@@ -2528,7 +2655,7 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "What tools does the lokal MCP server expose?",
-      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's full price list and contact details; lokal_find_offers looks up, per shopping-list item, which nearby producers sell it and whether an order can be placed with them; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
+      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's listed products, with a price where the producer has stated one, and contact details; lokal_find_offers looks up, per shopping-list item, which nearby producers sell it and whether an order can be placed with them; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
     },
     {
       q: "Does it cost anything to use the MCP server?",
@@ -2551,7 +2678,7 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
     },
     {
       q: "Hvilke verktøy har lokal MCP-serveren?",
-      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer full prisliste og kontaktinfo for én produsent; lokal_find_offers finner, for hver vare på en handleliste, hvilke produsenter i nærheten som selger den og om du kan bestille hos dem; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
+      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer produktene og kontaktinfo for én produsent, med pris der produsenten har oppgitt den; lokal_find_offers finner, for hver vare på en handleliste, hvilke produsenter i nærheten som selger den og om du kan bestille hos dem; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
     },
     {
       q: "Koster det noe å bruke MCP-serveren?",
@@ -2813,14 +2940,14 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>The tools, exactly as registered</h2>
     <p class="gma-group-label">Search &amp; discovery</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "organic honey Trondheim"). Returns contact info and the full priced product list for specific matches.</p></div>
+      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "organic honey Trondheim"). Returns contact info and the listed products for specific matches, with a price where the producer has stated one.</p></div>
       <div class="gma-tool"><code>lokal_discover</code><p>Structured search filtered by category, tags, and geographic distance.</p></div>
       <div class="gma-tool"><code>lokal_geocode</code><p>Resolves a Norwegian place name (city, kommune, fylke) to lat/lng coordinates for use with <code>lokal_discover</code>'s distance filter.</p></div>
       <div class="gma-tool"><code>lokal_stats</code><p>Platform statistics — total producers and cities covered.</p></div>
     </div>
     <p class="gma-group-label">Producer detail</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_info</code><p>A single producer's complete product catalog with prices, contact details, opening hours, and delivery options.</p></div>
+      <div class="gma-tool"><code>lokal_info</code><p>A single producer's listed products, with a price where the producer has stated one, plus contact details, opening hours, and delivery options.</p></div>
     </div>
     <p class="gma-group-label">Markets, venues &amp; certifications</p>
     <div class="gma-tools">
@@ -2831,7 +2958,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
     <p class="gma-group-label">Shopping cart (pickup${isPaymentsEnabled() ? "" : ", no online payment"})</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from priced products, submit it as a pickup order per producer, and check order status. ${isPaymentsEnabled() ? "Producers that take prepayment send a Stripe payment link you approve yourself; everyone else is paid directly on pickup." : "No payment happens in the AI flow — you pay the producer directly on pickup."}</p></div>
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from listed products, submit it as a pickup order per producer, and check order status. ${isPaymentsEnabled() ? "Producers that take prepayment send a Stripe payment link you approve yourself; everyone else is paid directly on pickup." : "No payment happens in the AI flow — you pay the producer directly on pickup."}</p></div>
     </div>
 
     <h2>Try asking your assistant</h2>
@@ -2871,14 +2998,14 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>Verktøyene, slik de faktisk er registrert</h2>
     <p class="gma-group-label">Søk og oppdagelse</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «økologisk honning Trondheim»). Returnerer kontaktinfo og full priset produktliste for spesifikke treff.</p></div>
+      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «økologisk honning Trondheim»). Returnerer kontaktinfo og produktene for spesifikke treff, med pris der produsenten har oppgitt den.</p></div>
       <div class="gma-tool"><code>lokal_discover</code><p>Strukturert søk filtrert på kategori, tags og geografisk avstand.</p></div>
       <div class="gma-tool"><code>lokal_geocode</code><p>Slår opp et norsk stedsnavn (by, kommune, fylke) som lat/lng-koordinater for bruk med avstandsfilteret i <code>lokal_discover</code>.</p></div>
       <div class="gma-tool"><code>lokal_stats</code><p>Plattformstatistikk — totalt antall produsenter og byer dekket.</p></div>
     </div>
     <p class="gma-group-label">Produsentdetaljer</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_info</code><p>Én produsents komplette produktkatalog med priser, kontaktdetaljer, åpningstider og leveringsalternativer.</p></div>
+      <div class="gma-tool"><code>lokal_info</code><p>Én produsents produkter, med pris der produsenten har oppgitt den, og kontaktdetaljer, åpningstider og leveringsalternativer.</p></div>
     </div>
     <p class="gma-group-label">Markeder, salgssteder og sertifiseringer</p>
     <div class="gma-tools">
@@ -2889,7 +3016,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
     <p class="gma-group-label">Handlekurv (henting${isPaymentsEnabled() ? "" : ", ingen nettbetaling"})</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra prisede produkter, send den som en henteordre per produsent, og sjekk ordrestatus. ${isPaymentsEnabled() ? "Produsenter som tar imot forhåndsbetaling, sender en betalingslenke fra Stripe som du godkjenner selv. Alle andre betaler du direkte ved henting." : "Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting."}</p></div>
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra produktene, send den som en henteordre per produsent, og sjekk ordrestatus. ${isPaymentsEnabled() ? "Produsenter som tar imot forhåndsbetaling, sender en betalingslenke fra Stripe som du godkjenner selv. Alle andre betaler du direkte ved henting." : "Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting."}</p></div>
     </div>
 
     <h2>Prøv å spørre assistenten din</h2>
@@ -3109,7 +3236,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>MCP/A2A tool-call log</td><td>Deleted automatically after 60 days, in the same daily pass as page visits and searches. No daily counts are kept from this log.</td></tr>
         <tr><td>Shopping cart (no contact details yet)</td><td>Valid 7 days, then rejected on use.</td></tr>
         <tr><td>Buyer contact details (name/email/phone/note)</td><td>Deleted automatically 30 days after the order is finally resolved (completed/declined/cancelled), or 30 days after submission if no order was created.</td></tr>
-        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, with no fixed time limit. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
+        <tr><td>Database backups</td><td>Daily copies at <span translate="no">Tigris</span> are kept for 7 days, and one copy per week for 4 more weeks. Before larger changes we also sometimes take a manual copy on the server; the ten newest are kept, and never longer than 30 days. Deleted information can therefore remain in a backup for a while after it is deleted.</td></tr>
         <tr><td>Email correspondence and send log</td><td>No automatic deletion today. We delete it on request.</td></tr>
         <tr><td>Do-not-re-add list</td><td>For as long as the service exists, so a removed profile is not created again.</td></tr>
       </tbody>
@@ -3281,7 +3408,7 @@ ${pp ? `        ${pp.legalBasisRow}\n` : ""}      </tbody>
         <tr><td>MCP/A2A-verktøykall-logg</td><td>Slettes automatisk etter 60 dager, i samme daglige kjøring som sidebesøk og søk. Fra denne loggen beholdes bare antall søk per dag, uke og måned per kanal (MCP eller A2A), uten klient-streng, IP-hash eller annen kobling til den som kalte.</td></tr>
         <tr><td>Handlekurv (uten kontaktinfo ennå)</td><td>Gyldig i 7 dager, deretter avvist ved bruk.</td></tr>
         <tr><td>Kjøperkontaktinfo (navn/e-post/telefon/merknad)</td><td>Slettes automatisk 30 dager etter bestillingen er endelig avgjort (levert/avvist/kansellert), eller 30 dager etter innsending hvis ingen bestilling ble opprettet.</td></tr>
-        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, uten fast tidsgrense. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
+        <tr><td>Sikkerhetskopier av databasen</td><td>Daglige kopier hos Tigris beholdes i 7 dager, og én kopi per uke i 4 uker til. Før større endringer tar vi i tillegg av og til en manuell kopi på serveren; de ti nyeste beholdes, og ingen kopi lever lenger enn 30 dager. En slettet opplysning kan derfor ligge i en sikkerhetskopi en stund etter at den er slettet.</td></tr>
         <tr><td>E-postkorrespondanse og utsendingslogg</td><td>Ingen automatisk sletting i dag. Vi sletter på forespørsel.</td></tr>
         <tr><td>Sperreliste</td><td>Så lenge tjenesten finnes, slik at en fjernet profil ikke opprettes på nytt.</td></tr>
       </tbody>
@@ -3537,6 +3664,163 @@ const CITY_CSS = `
   .city-hero p { font-size: 1rem; color: var(--g500); }
   .city-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
   @media (max-width: 768px) { .city-grid { grid-template-columns: 1fr; } }
+`;
+
+// ─── Fylke-named place pages ────────────────────────────────────────────────
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-E (SD-02). The place
+// route lists the producers whose `city` slugs to the requested slug. Some
+// `agents.city` values are a fylke name (live: Vestland, Akershus, Vestfold,
+// Agder, Troms; city-normalizer.ts documents this pollution), so /vestland was
+// a "city" page holding the one producer whose city reads "Vestland" (Aarvik
+// Gård, whose address is in Fredrikstad), and its FAQPage stated "Det er 1
+// lokale produsenter registrert i Vestland-området" as fact.
+//
+// A slug that names a current fylke now renders a fylke page: the producers
+// whose own place lies in that fylke. A place resolves through the SSB kommune
+// table (resolveFylke2024) and the curated town table (cityToFylke). When the
+// two disagree (Bø, Os: the same name in two fylker) or neither knows the
+// name, the producer is not placed; it is never guessed. A city value that is
+// itself a fylke name says nothing about where in the fylke the producer is
+// (and was wrong for Aarvik), so it places no one. Oslo is both a fylke and a
+// city and keeps its city page.
+//
+// A name match alone is not enough either (review B1 on lokal#1109):
+// `agents.city` is a place, not a kommune. A read-only check of every live
+// place page against Kartverket's point lookup found "Sande" (every live
+// producer is in Sande i Vestfold) placed in Møre og Romsdal, "Nes" (Nes på
+// Hedmark, Nes i Ådal) in Akershus, and producers whose coordinate lies far
+// from their city (a "Hamar" producer in Rana). So the producer's own
+// coordinate vetoes a placement outside the fylke's bounding box
+// (services/fylke-bounds.ts). For a name that is also a place in another
+// fylke (Nes, Sande, Hemnes, Osen, Åmot) the coordinate must lie in that
+// kommune's own box, and without one the producer is not placed. A missing or
+// implausible coordinate (0/0) says nothing, so the name decides as before.
+//
+// placeSlugsForCity() is the one predicate for the route and the sitemap, so
+// the sitemap lists exactly the place pages that have producers.
+
+// The 2020-2023 merged names (Viken, Vestfold og Telemark, Troms og Finnmark)
+// are no longer fylker. EQUIVALENCE_CLASSES lists each merged name first.
+const LEGACY_MERGED_FYLKER: ReadonlySet<string> = new Set(EQUIVALENCE_CLASSES.map((cls) => cls[0]));
+
+interface PlaceByName {
+  fylke: string | null;
+  kommuneBounds: Bounds | undefined;
+}
+
+/** A producer's coordinate as the registry carries it (`agent.location`). */
+type PlaceCoord = { lat?: number | null; lng?: number | null } | null | undefined;
+
+// The caches are keyed by `agents.city` values or fylke names, bounded sets,
+// and the lookup tables behind them are static. The coordinate check is not
+// cached; it is a few comparisons.
+const placeByNameCache = new Map<string, PlaceByName>();
+const ownPlaceSlugCache = new Map<string, string | null>();
+const fylkePageSlugCache = new Map<string, string | null>();
+
+/**
+ * What a `city` value says by itself: the fylke the two lookup tables give
+ * it (null when they disagree or neither knows it), and the kommune's box
+ * when the name is also a place in another fylke (fylke-bounds.ts). A
+ * trailing " kommune" is not part of the name ("Lier kommune" -> "Lier").
+ */
+function placeByName(city: string): PlaceByName {
+  const cached = placeByNameCache.get(city);
+  if (cached) return cached;
+  const name = city.trim().replace(/\s+kommune$/i, "");
+  let fylke: string | null = null;
+  if (name) {
+    const kommune = resolveFylke2024({ kommune: name });
+    const fromKommune = "fylke" in kommune ? kommune.fylke : null;
+    const fromTown = cityToFylke(name);
+    fylke = fromKommune && fromTown && fromKommune !== fromTown ? null : (fromKommune ?? fromTown);
+  }
+  const place = { fylke, kommuneBounds: name ? sharedKommuneNameBounds(name) : undefined };
+  placeByNameCache.set(city, place);
+  return place;
+}
+
+/**
+ * The fylke a producer lies in, from its `city` value and its own coordinate,
+ * or null when it cannot be placed without guessing: an unknown name, a name
+ * the two tables put in different fylker, a fylke name rather than a place, a
+ * coordinate outside the fylke's box, or a name that is also a place in
+ * another fylke (fylke-bounds.ts) without a coordinate in that kommune's box.
+ * Without a plausible coordinate the name decides.
+ */
+export function producerPlaceFylke(city: string | null | undefined, coord?: PlaceCoord): string | null {
+  const { fylke, kommuneBounds } = placeByName(typeof city === "string" ? city : "");
+  if (!fylke) return null;
+  const lat = coord?.lat;
+  const lng = coord?.lng;
+  const located = isPlausibleNorwayCoord(lat, lng);
+  if (kommuneBounds) return located && inBounds(kommuneBounds, lat as number, lng as number) ? fylke : null;
+  return !located || inBounds(FYLKE_BOUNDS[fylke], lat as number, lng as number) ? fylke : null;
+}
+
+/**
+ * The current fylke a place slug names ("vestland" -> "Vestland",
+ * "more-og-romsdal" -> "Møre og Romsdal"), or null for every other slug:
+ * a city, an old name ("hordaland", "viken"), a spelling that is not the
+ * fylke's own slug, and "oslo", which stays a city page.
+ */
+export function fylkeForPlaceSlug(slug: string): string | null {
+  const fylke = normaliseFylke(slug);
+  if (!fylke || slugify(fylke) !== slug || LEGACY_MERGED_FYLKER.has(fylke)) return null;
+  return placeByName(fylke).fylke ? null : fylke;
+}
+
+/** The page slug of a fylke ("Møre og Romsdal" -> "more-og-romsdal"), or null for Oslo, which has none. */
+function fylkePageSlug(fylke: string): string | null {
+  let slug = fylkePageSlugCache.get(fylke);
+  if (slug === undefined) {
+    slug = fylkeForPlaceSlug(slugify(fylke)) === fylke ? slugify(fylke) : null;
+    fylkePageSlugCache.set(fylke, slug);
+  }
+  return slug;
+}
+
+/**
+ * The place pages a producer is listed on: the city page of its `city` value,
+ * unless the value is a fylke name, and the page of the fylke it is placed in
+ * (producerPlaceFylke(), with its coordinate).
+ */
+export function placeSlugsForCity(city: string | null | undefined, coord?: PlaceCoord): readonly string[] {
+  const raw = typeof city === "string" ? city : "";
+  let own = ownPlaceSlugCache.get(raw);
+  if (own === undefined) {
+    const slug = slugify(raw);
+    own = slug && !fylkeForPlaceSlug(slug) ? slug : null;
+    ownPlaceSlugCache.set(raw, own);
+  }
+  const slugs: string[] = own ? [own] : [];
+  const fylke = producerPlaceFylke(raw, coord);
+  const fylkeSlug = fylke ? fylkePageSlug(fylke) : null;
+  if (fylkeSlug) slugs.push(fylkeSlug);
+  return slugs;
+}
+
+// ─── Visible FAQ on producer and place pages ────────────────────────────────
+// dev-request 2026-10-17-integrasjonstest-oppfolging, I-E (SD-01): the FAQPage
+// JSON-LD had no visible counterpart. The section is rendered from the same
+// FAQPage object the page serialises. buildProducerFaqJsonLd() and
+// buildCityFaqJsonLd() write Norwegian on every page (no language parameter;
+// SD-10 is a separate finding), so on /en and /sv the section says lang="nb".
+function rfbFaqSectionHtml(faqJsonLd: unknown, lang: Lang): string {
+  return renderFaqSection(faqPairsFromJsonLd(faqJsonLd), {
+    heading: "Ofte stilte spørsmål",
+    lang: lang === "no" ? undefined : "nb",
+  });
+}
+
+// Styles for rfbFaqSectionHtml(), added only to a page that renders it.
+const FAQ_SECTION_CSS = `
+  .faq { max-width: 1080px; margin: 0 auto; padding: 32px 24px 48px; }
+  .faq h2 { font-size: 1.2rem; font-weight: 700; color: var(--green-700); margin-bottom: 14px; letter-spacing: -0.2px; }
+  .faq-item { max-width: 760px; margin-bottom: 16px; }
+  .faq-item h3 { font-size: 1rem; font-weight: 700; color: var(--charcoal); margin-bottom: 4px; }
+  .faq-item p { font-size: 0.92rem; color: var(--g700); line-height: 1.6; margin: 0; }
+  @media (max-width: 560px) { .faq { padding: 24px 16px 40px; } }
 `;
 
 // ═══════════════════════════════════════════════════════════════
@@ -3900,9 +4184,13 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
 
   try {
     const agents = marketplaceRegistry.getActiveAgents();
+    // A fylke slug lists the producers placed in that fylke, by their city
+    // and their own coordinate; see placeSlugsForCity() (SD-02). Every other
+    // slug works as before.
+    const fylke = fylkeForPlaceSlug(citySlug);
     const cityAgents = agents.filter((a: any) => {
       const city = a.city || a.location?.city || "";
-      return slugify(city) === citySlug;
+      return placeSlugsForCity(city, a.location).includes(citySlug);
     });
 
     if (cityAgents.length === 0) {
@@ -3927,7 +4215,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       ));
     }
 
-    const cityName = (cityAgents[0] as any).city || (cityAgents[0] as any).location?.city || citySlug;
+    const cityName = fylke ?? ((cityAgents[0] as any).city || (cityAgents[0] as any).location?.city || citySlug);
 
     // NO trackAgentView here (2026-10-04, view-stats honesty): this used to
     // book every city-page visit as a PROFILE view of cityAgents[0] — the
@@ -3995,7 +4283,9 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         "name": a.name, "description": itemDesc,
         "url": `${BASE_URL}/produsent/${slugify(a.name)}`,
       };
-      if (k.address) item.address = { "@type": "PostalAddress", "streetAddress": k.address, "addressLocality": cityName, "addressCountry": "NO" };
+      // On a fylke page the locality is the producer's own place, not the fylke.
+      const locality = fylke ? (a.city || a.location?.city) : cityName;
+      if (k.address) item.address = { "@type": "PostalAddress", "streetAddress": k.address, "addressLocality": locality, "addressCountry": "NO" };
       if (isDisplayablePhone(k.phone)) item.telephone = k.phone;
       if (a.location?.lat && a.location?.lng) item.geo = { "@type": "GeoCoordinates", "latitude": a.location.lat, "longitude": a.location.lng };
       return item;
@@ -4008,8 +4298,10 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       producerCount: cityAgents.length,
       topCategories,
       verifiedCount,
+      isFylke: !!fylke,
     });
     if (cityFaqJsonLd) jsonLdItems.push(cityFaqJsonLd);
+    const faqSectionHtml = rfbFaqSectionHtml(cityFaqJsonLd, lang);
 
     // GEO: BreadcrumbList JSON-LD (dev-request 2026-09-24-ai-sok-bli-svaret-rfb,
     // slice B3) — mirrors the visible .bc nav rendered just below exactly:
@@ -4021,25 +4313,36 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       { name: cityName, url: cityCanonicalUrl },
     ]));
 
+    // A fylke page holds the producers placed in the fylke's kommuner, not an
+    // "område" around one place (SD-02).
+    const placeHtml = `<span translate="no">${escapeHtml(cityName)}</span>`;
+    const countLine = lang === "en"
+      ? (fylke
+        ? `${cityAgents.length} local producers in the municipalities of ${placeHtml}.`
+        : `${cityAgents.length} local producers in and around ${placeHtml}.`)
+      : (fylke
+        ? `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i kommunene i ${placeHtml}.`
+        : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${placeHtml}-omr\u00e5det.`);
+
     const content = `
     <section class="city-hero">
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.home"))}</a><span>/</span>${escapeHtml(cityName)}</div>
-        <h1>${lang === "en" ? `Local food in <span translate="no">${escapeHtml(cityName)}</span>` : `Lokal mat i <span translate="no">${escapeHtml(cityName)}</span>`}</h1>
-        <p>${lang === "en" ? `${cityAgents.length} local producers in and around <span translate="no">${escapeHtml(cityName)}</span>.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i <span translate="no">${escapeHtml(cityName)}</span>-omr\u00e5det.`}</p>
+        <h1>${lang === "en" ? `Local food in ${placeHtml}` : `Lokal mat i ${placeHtml}`}</h1>
+        <p>${countLine}</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
     <section class="sec">
       <div class="city-grid">${producerCards}</div>
-    </section>`;
+    </section>${faqSectionHtml ? `\n    ${faqSectionHtml}` : ""}`;
 
     recordAiPageDelivery(req, res, "ai_page_list", cityAgents.map((a: any) => a.id));
     res.send(shell(
       t(lang, "city.title", { city: cityName }),
       t(lang, "city.description", { count: cityAgents.length, city: cityName }),
       content,
-      { canonical: cityCanonicalUrl, jsonLd: jsonLdItems, extraCss: CITY_CSS, lang, pathForAlternate: "/" + citySlug }
+      { canonical: cityCanonicalUrl, jsonLd: jsonLdItems, extraCss: CITY_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""), lang, pathForAlternate: "/" + citySlug }
     ));
   } catch (err) {
     console.error(`SEO /${citySlug} error:`, err);
@@ -4461,7 +4764,7 @@ export function buildProducerFaqJsonLd(params: {
   const qas: Array<{ q: string; a: string }> = [];
 
   const productNames = (params.productsList || [])
-    .map((p: any) => (typeof p === "string" ? p : p?.name))
+    .map((p: unknown) => productNameText(p))
     .filter(Boolean)
     .slice(0, 8);
   // Cap at 3 to match buildProducerAnswerFirstOpening's fallback cap — same
@@ -4533,8 +4836,7 @@ export function buildProducerFaqJsonLd(params: {
 //   - category-tag fallback (no real product list)      → "tilbyr"
 //   - real product list, confirmed direct-sale signal    → "selger"
 //   - real product list, no confirmed direct-sale signal → "produserer"
-// "bestill direkte" only appears with a confirmed direct-sale signal;
-// otherwise the closing clause is "finn kontaktinfo".
+// The closing clause is always "finn kontaktinfo" (no "bestill direkte" any more, 2026-10-18).
 //
 // Extracted so the DB-derivation logic used by the /produsent/:slug route
 // handler is directly unit-testable without a DB — round-2 review found two
@@ -4567,7 +4869,7 @@ export function buildProducerAnswerFirstOpening(params: {
   const productsAreSourced = params.productsAreSourced ?? false;
   const hasDirectSaleSignal = params.hasDirectSaleSignal ?? false;
   const productNames = (params.productsList || [])
-    .map((p: any) => (typeof p === "string" ? p : p?.name))
+    .map((p: unknown) => productNameText(p))
     .filter(Boolean)
     .map((n: string) => productLabel(n, lang))
     .slice(0, 4);
@@ -4587,8 +4889,11 @@ export function buildProducerAnswerFirstOpening(params: {
 
   const verbNo = !usingRealProducts ? "tilbyr" : hasDirectSaleSignal ? "selger" : "produserer";
   const verbEn = !usingRealProducts ? "offers" : hasDirectSaleSignal ? "sells" : "produces";
-  const closingNo = hasDirectSaleSignal ? "finn kontaktinfo og bestill direkte under" : "finn kontaktinfo under";
-  const closingEn = hasDirectSaleSignal ? "find contact details and order directly below" : "find contact details below";
+  // dev-request 2026-10-08-malsetning-bestill-direkte-ordlyd-produsentside (Daniel, alt. C):
+  // the closing clause no longer urges "bestill direkte" on any page, also with a confirmed
+  // sale signal (a producer owner objected). The signal still picks the verb ("selger").
+  const closingNo = "finn kontaktinfo under";
+  const closingEn = "find contact details below";
 
   if (lang === "en") {
     const whatPartEn = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " and more" : "");
@@ -4602,19 +4907,28 @@ export function buildProducerAnswerFirstOpening(params: {
 // city/category slice). Same quality gate as buildProducerFaqJsonLd: only real, catalog-derived
 // facts, never fabricated, and null unless at least 2 questions have an answer — a city page with
 // no distinguishing catalog data (no category signal, nobody verified) stays without FAQ schema.
+//
+// isFylke (dev-request 2026-10-17-integrasjonstest-oppfolging, I-E / SD-02): on a fylke page
+// the count is the producers whose registered place lies in the fylke (placeSlugsForCity), so
+// the answer says exactly that instead of claiming every producer in the "område". City pages
+// are unchanged.
 export function buildCityFaqJsonLd(params: {
   cityName: string;
   url: string;
   producerCount: number;
   topCategories: string[];
   verifiedCount: number;
+  isFylke?: boolean;
 }): any | null {
   const qas: Array<{ q: string; a: string }> = [];
 
   if (params.producerCount > 0) {
+    const producers = params.producerCount === 1 ? "lokal produsent" : "lokale produsenter";
     qas.push({
       q: `Hvor mange lokale produsenter finnes i ${params.cityName}?`,
-      a: `Det er ${params.producerCount} lokale produsenter registrert i ${params.cityName}-området.`,
+      a: params.isFylke
+        ? `Rett fra Bonden har ${params.producerCount} ${producers} med registrert sted i ${params.cityName}.`
+        : `Det er ${params.producerCount} lokale produsenter registrert i ${params.cityName}-området.`,
     });
   }
 
@@ -4773,7 +5087,7 @@ function passesRoleGate(
     console.error("[seo] role-gate umbrella lookup failed:", e);
   }
   const agentIsUmbrellaForGate = !!roleGateUmbrellaType;
-  const failsRoleGate = !agentIsUmbrellaForGate && !!agent.role && agent.role !== "producer";
+  const failsRoleGate = failsProducerRoleGate(agent.role, agentIsUmbrellaForGate);
   if (failsRoleGate || !roleGateIsVetted || !roleGateListable) {
     if (!roleGateListable) {
       console.log(`[seo:listability-gate] suppressed hidden/non-RFB agent ${agent.id} on /produsent/${requestedSlug}`);
@@ -4966,7 +5280,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] claim status query failed:", e);
     }
 
-    const info = knowledgeService.getAgentInfo(agent.id);
+    // withGoogleRating: the profile stat reads it, RATING_DISPLAY_MODE decides (S4-A1a).
+    const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true });
     const k = (info?.knowledge || {}) as any;
     const meta = (info?.meta || {}) as any;
 
@@ -5437,7 +5752,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // separate public badge. Distinct from `isVerified` (manual/legacy
     // verification) — an agent can have one, both, or neither.
     if (agent.brregVerified) badges.push(`<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.badge_brreg"))}</span>`);
-    const certs = k.certifications || [];
+    // I-G: the list fields are read with textEntries (text entries only), as
+    // getAgentInfo hands them over; for that shape this is the list itself.
+    const certs = textEntries(k.certifications);
     if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(catLabel(c, lang))}</span>`));
 
@@ -5475,28 +5792,40 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const productsList = Array.isArray(k.products) ? k.products : [];
     const productsHtml = productsList.length
       ? productsList.map((p: any) => {
-          // Handle both object products ({name, category, price}) and plain strings ("brød")
-          const name = typeof p === "string" ? p : (p.name || "");
+          // Handle both object products ({name, category, price}) and plain strings ("brød").
+          // I-G: each field is read by its type. A price that is not text or a
+          // positive number (an object showed as "[object Object]") is no price,
+          // the unit counts only as text, and the months only as a list of
+          // month numbers (or their text, which MONTH_NAMES also indexes).
+          const name = productNameText(p);
           if (!name) return "";
-          const months = (typeof p === "object" && (p.months || p.seasonMonths)) || [];
-          const seasonal = typeof p === "object" && p.seasonal && months.length
-            ? `<span class="prod-season">${months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
-          const org = typeof p === "object" && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
-          const price = typeof p === "object" && p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
+          const isObject = typeof p === "object";
+          const rawMonths = isObject ? (p.months || p.seasonMonths) : undefined;
+          const months: Array<number | string> = Array.isArray(rawMonths)
+            ? rawMonths.filter((m: unknown) => typeof m === "number" || typeof m === "string")
+            : [];
+          const seasonal = isObject && p.seasonal && months.length
+            ? `<span class="prod-season">${escapeHtml(months.map((m) => MONTH_NAMES[m as number] || m).join("\u2013"))}</span>` : "";
+          const org = isObject && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
+          const priceText = isObject ? productPriceText(p.price) : "";
+          const priceUnit = isObject && typeof p.priceUnit === "string" ? p.priceUnit : "";
+          const price = priceText ? `<span class="prod-price">${escapeHtml(priceText)}${priceUnit && priceUnit !== 'kr' ? ' ' + escapeHtml(priceUnit) : ''}</span>` : "";
           return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).filter(Boolean).join("") : "";
 
     // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
-    const today = new Date().toLocaleDateString("en-US", { weekday: "long" }).toLowerCase();
-    const todayShort = today.slice(0, 3);
-    const hoursList = Array.isArray(k.openingHours) ? k.openingHours : [];
+    // I-H: one reading of every stored form (utils/opening-hours.ts), shared
+    // with lokal_info and the A2A auto-reply; "today" is the day in Norway
+    // (it was the server's day, UTC on Fly) and covers ranges too.
+    // I-O: free text in the day-and-time form ("Man-Fre 07-22, Lor 08-22,
+    // Son 09-18", Hevd) is its day rows, card and JSON-LD; other free text
+    // keeps its own row (hoursText), byte for byte as before.
+    const hoursList = Array.isArray(k.openingHours)
+      ? normalizeOpeningHours(k.openingHours)
+      : typeof k.openingHours === "string" ? parseOpeningHoursText(k.openingHours) ?? [] : [];
     const hoursText = !Array.isArray(k.openingHours) && typeof k.openingHours === "string" && k.openingHours ? k.openingHours : "";
     const hoursHtml = hoursList.length
-      ? hoursList.map((h: any) => {
-          const isToday = h.day === todayShort || h.day === today;
-          const cls = isToday ? " hrs-today" : "";
-          return `<div class="hrs-day${cls}">${escapeHtml(dayName(h.day, lang))}${isToday ? `<span class="hrs-open"><span class="hrs-dot"></span> ${escapeHtml(t(lang, "producer.today"))}</span>` : ""}</div><div class="hrs-time${cls}">${h.open} \u2013 ${h.close}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
-        }).join("")
+      ? openingHoursCardHtml(hoursList, lang, osloWeekdayAndMinutes(new Date()).day)
       : hoursText ? `<div class="hrs-day">${escapeHtml(hoursText)}</div>` : "";
 
     // Certifications
@@ -5533,7 +5862,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const currentMonth = new Date().getMonth() + 1; // 1-12
     const seasonHtml = seasonList.length
       ? seasonList.map((s: any) => {
-          const months = s.months || [];
+          // I-G: a text entry is the product; in an object the product and the
+          // note count only as text and the months only as a list.
+          const product = typeof s === "string" ? s : typeof s?.product === "string" ? s.product : "";
+          const note = typeof s?.note === "string" ? s.note : "";
+          const months: unknown[] = Array.isArray(s?.months) ? s.months : [];
           const inSeason = months.includes(currentMonth);
           const monthDots = Array.from({ length: 12 }, (_, i) => {
             const m = i + 1;
@@ -5542,9 +5875,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             return `<span class="${cls}" title="${monthAbbr(m, lang)}">${monthAbbr(m, lang).charAt(0)}</span>`;
           }).join("");
           return `<div class="season-row">
-            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(s.product || "", lang))}</div>
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(product, lang))}</div>
             <div class="season-bar">${monthDots}</div>
-            ${s.note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(s.note)}</div>` : ""}
+            ${note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(note)}</div>` : ""}
           </div>`;
         }).join("")
       : "";
@@ -5553,8 +5886,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const deliveryParts: string[] = [];
     if (k.deliveryRadius) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_radius"))}</strong> ${escapeHtml(String(k.deliveryRadius))} km</div>`);
     if (k.minOrderValue) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.min_order"))}</strong> ${escapeHtml(String(k.minOrderValue))} kr</div>`);
-    if ((k.deliveryOptions || []).length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_methods"))}</strong> ${escapeHtml((k.deliveryOptions as string[]).map((v) => translateDeliveryTerm(String(v), lang)).join(", "))}</div>`);
-    if ((k.paymentMethods || []).length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.payment"))}</strong> ${escapeHtml((k.paymentMethods as string[]).map((v) => translateDeliveryTerm(String(v), lang)).join(", "))}</div>`);
+    const deliveryOptions = textEntries(k.deliveryOptions);
+    const paymentMethods = textEntries(k.paymentMethods);
+    if (deliveryOptions.length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.delivery_methods"))}</strong> ${escapeHtml(deliveryOptions.map((v) => translateDeliveryTerm(v, lang)).join(", "))}</div>`);
+    if (paymentMethods.length) deliveryParts.push(`<div class="del-item"><strong>${escapeHtml(t(lang, "producer.payment"))}</strong> ${escapeHtml(paymentMethods.map((v) => translateDeliveryTerm(v, lang)).join(", "))}</div>`);
     const deliveryHtml = deliveryParts.join("");
 
     // ─── Phase 5.11 A2: affiliations card (producer view) ───────────
@@ -5671,47 +6006,59 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     linksList.forEach((l: any) => { if (l.url) sameAsUrls.push(l.url); });
     if (sameAsUrls.length) jsonLd.sameAs = sameAsUrls.length === 1 ? sameAsUrls[0] : sameAsUrls;
 
-    // Opening hours — Schema.org format
-    if (hoursList.length) {
-      const dayMap: Record<string, string> = {
-        mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday",
-        fri: "Friday", sat: "Saturday", sun: "Sunday",
-      };
-      jsonLd.openingHoursSpecification = hoursList.map((h: any) => ({
+    // Opening hours — Schema.org format. I-G: only entries with a day and both
+    // times; a text entry used to give "https://schema.org/undefined". I-H:
+    // dayOfWeek is a schema.org DayOfWeek for every weekday spelling ("mon",
+    // "saturday", "Lørdag"; one entry for a range such as "mon-fri" lists
+    // each day). An entry whose label names no weekday ("Varierer", "Påske")
+    // or that holds only in a period ("Mai–September") has no valid
+    // OpeningHoursSpecification without validity dates and is left out; it
+    // used to give "https://schema.org/Varierer" or a range key as the day.
+    // opens/closes are clock times as "HH:MM" ("12.00" and the number 10 are
+    // "12:00" and "10:00"; stored "HH:MM" is unchanged); an entry whose times
+    // are not clock times is left out (it gave "opens": "closed").
+    // I-J: an entry in schema.org's own form whose period is two ISO dates in
+    // order (validFrom/validThrough of utils/opening-hours.ts; Hovdneset Gård,
+    // Fridays 1.7.–31.10.2026) has the validity dates, so it is stated with
+    // them: schema.org's way to give seasonal hours, and the source's own
+    // values. Any other period (text, one end, or dates that are not ISO
+    // dates or out of order) is still left out, as I-H decided.
+    // I-O (SD2-01): so is an entry with a season note ("Sesongåpent til ca.
+    // 20. september", Bjørke Gård; "Åkerbutikk i sommarsesongen", Hima Grønt;
+    // isSeasonalEntry): it gave year-round hours after the season had ended.
+    // With validity dates it is stated with them, as above (Hovdneset Gård).
+    const specHours = hoursList.flatMap((h) => {
+      const validity = h.validFrom && h.validThrough ? { validFrom: h.validFrom, validThrough: h.validThrough } : null;
+      if (!h.days.length || (isSeasonalEntry(h) && !validity) || h.open === undefined || h.close === undefined) return [];
+      const opens = clockTime(h.open);
+      const closes = clockTime(h.close);
+      return opens && closes ? [{ days: h.days, opens, closes, validity }] : [];
+    });
+    if (specHours.length) {
+      const schemaDay = (d: number) => `https://schema.org/${WEEKDAY_NAMES.en[d]}`;
+      jsonLd.openingHoursSpecification = specHours.map((h) => ({
         "@type": "OpeningHoursSpecification",
-        "dayOfWeek": `https://schema.org/${dayMap[h.day] || h.day}`,
-        "opens": h.open,
-        "closes": h.close,
+        "dayOfWeek": h.days.length === 1 ? schemaDay(h.days[0]!) : h.days.map(schemaDay),
+        "opens": h.opens,
+        "closes": h.closes,
+        ...(h.validity ?? {}),
       }));
     }
 
-    // Aggregate rating from Google
-    if (k.googleRating) {
-      jsonLd.aggregateRating = {
-        "@type": "AggregateRating",
-        "ratingValue": k.googleRating,
-        "bestRating": 5,
-        "worstRating": 1,
-        "reviewCount": k.googleReviewCount || 1,
-      };
-    }
+    // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+    // (S1): the stored rating and externalReviews come from third parties
+    // (Google Places), and Google's review-snippet guidelines only accept
+    // ratings a site collects itself, so neither becomes rating/review
+    // markup (the policy module returns null for any non-first-party
+    // source). The rating could be shown as text naming Google (S2), but not
+    // in RATING_DISPLAY_MODE 'hidden', the mode since S4-A1a; reviewsHtml
+    // below is unchanged.
+    const ratingJsonLd = buildRatingJsonLd({ source: "google", rating: k.googleRating, count: k.googleReviewCount });
+    if (ratingJsonLd) jsonLd.aggregateRating = ratingJsonLd;
+    const profileRating = formatRatingDisplay({ rating: k.googleRating, count: k.googleReviewCount, source: "google" }, lang);
 
-    // Reviews from external sources (JSON-LD + visible HTML)
-    const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
-    if (reviewsList.length) {
-      jsonLd.review = reviewsList.slice(0, 5).map((r: any) => ({
-        "@type": "Review",
-        "reviewBody": r.text || "",
-        "reviewRating": r.rating ? {
-          "@type": "Rating",
-          "ratingValue": r.rating,
-          "bestRating": 5,
-        } : undefined,
-        "author": { "@type": "Person", "name": r.author || "Kunde" },
-        ...(r.date ? { "datePublished": r.date } : {}),
-      }));
-    }
     // Build visible reviews HTML
+    const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
     const reviewsHtml = reviewsList.length
       ? reviewsList.slice(0, 5).map((r: any) => {
           const stars = r.rating ? "&#11088;".repeat(Math.min(Math.round(r.rating), 5)) : "";
@@ -5726,11 +6073,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         }).join("")
       : "";
 
-    // Products as makesOffer — Google requires price + priceCurrency in every Offer
+    // Products as makesOffer — Google requires price + priceCurrency in every
+    // Offer. Since S6 del B a priced product is a plain Offer from the farm
+    // (name, price, priceCurrency), not a Product: structured-data-policy.ts
+    // rule 7.
     if (productsList.length) {
       const unpricedItems: any[] = [];
       const pricedOffers = productsList.slice(0, 20).map((p: any) => {
-        const rawName = typeof p === "string" ? p : (p.name || "");
+        const rawName = productNameText(p);
         if (!rawName) return null;
 
         // Parse price from name if not in price field (e.g. "Lammelår – kr 275/kg")
@@ -5740,12 +6090,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
         let priceNum = parseNokPrice(priceValue);
         if (priceNum === null) {
-          const m = rawName.match(/^(.+?)\s*[–\-—]\s*((?:kr\.?\s*)?\d.*)$/i)
-            || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
-          if (m) {
-            productName = m[1].trim();
-            priceNum = parseNokPrice(m[2]);
-          }
+          // S6 del A: only a "kr" price the name shows, and the name is cut
+          // only when it has one (splitNamePrice).
+          const fromName = splitNamePrice(rawName, lang);
+          productName = fromName.name;
+          priceNum = fromName.price;
         }
 
         // dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): Google
@@ -5757,6 +6106,17 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           return null;
         }
 
+        // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+        // (S6 del B): no Product node on a producer page (policy rule 7). The
+        // Offer sits in the farm's own makesOffer, so it needs no seller; it
+        // claims no stock status (no product data holds one), brand or
+        // description.
+        if (!producerPageProductNodes()) {
+          return { "@type": "Offer", "name": productName, "price": priceNum, "priceCurrency": "NOK" };
+        }
+
+        // Rollback mode only (PRODUCER_PAGE_PRODUCT_NODES = true): the Product
+        // form as before S6 del B, with del A's names and prices.
         const product: any = {
           "@type": "Product",
           "name": productName,
@@ -5773,34 +6133,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             "priceCurrency": "NOK",
             "availability": "https://schema.org/InStock",
             "seller": { "@type": "LocalBusiness", "name": agent.name },
-            // WO-17: 14-day Norwegian angrerett (distance-sale law default).
-            "hasMerchantReturnPolicy": {
-              "@type": "MerchantReturnPolicy",
-              "applicableCountry": "NO",
-              "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
-              "merchantReturnDays": 14,
-              "returnMethod": "https://schema.org/ReturnByMail",
-              "returnFees": "https://schema.org/FreeReturn",
-            },
-            // WO-17: local-pickup is the realistic default for rettfrabonden
-            // producers. Per-producer overrides are out of scope for this WO.
-            "shippingDetails": {
-              "@type": "OfferShippingDetails",
-              "shippingRate": {
-                "@type": "MonetaryAmount",
-                "value": 0,
-                "currency": "NOK",
-              },
-              "shippingDestination": {
-                "@type": "DefinedRegion",
-                "addressCountry": "NO",
-              },
-              "deliveryTime": {
-                "@type": "ShippingDeliveryTime",
-                "handlingTime": { "@type": "QuantitativeValue", "minValue": 0, "maxValue": 1, "unitCode": "DAY" },
-                "transitTime":  { "@type": "QuantitativeValue", "minValue": 0, "maxValue": 2, "unitCode": "DAY" },
-              },
-            },
+            // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt
+            // (S1): return and shipping terms only from the producer's own
+            // policy. WO-17's fixed "14 days free return by post, 0 kr
+            // shipping" was a claim the platform cannot back (pickup sale of
+            // fresh goods). No per-producer policy is stored, so this adds
+            // nothing.
+            ...buildOfferPolicyJsonLd(null),
           },
         };
 
@@ -5809,14 +6148,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           product.image = imagesList[0];
         }
 
-        // WO-17: propagate parent rating/review to inner Product so Google's
-        // "Product snippets" report sees them on the right entity.
-        if (jsonLd.aggregateRating) {
-          product.aggregateRating = jsonLd.aggregateRating;
-        }
-        if (Array.isArray(jsonLd.review) && jsonLd.review.length) {
-          product.review = jsonLd.review.slice(0, 3); // cap to keep payload small
-        }
+        // No rating/review on the Product: a producer's rating is not a
+        // rating of this product (WO-17's copy is gone with the source, S1).
 
         return {
           "@type": "Offer",
@@ -5860,8 +6193,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     // Payment methods
-    if ((k.paymentMethods || []).length) {
-      jsonLd.paymentAccepted = (k.paymentMethods as string[]).join(", ");
+    if (paymentMethods.length) {
+      jsonLd.paymentAccepted = paymentMethods.join(", ");
     }
 
     // Categories as additionalType
@@ -5881,6 +6214,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       website: k.website,
       address: k.address,
     });
+    // Visible half of the same FAQPage (SD-01), below the related producers.
+    const faqSectionHtml = rfbFaqSectionHtml(faqJsonLd, lang);
 
     // GEO: BreadcrumbList JSON-LD (dev-request 2026-09-24-ai-sok-bli-svaret-rfb,
     // slice B3) — mirrors the visible .bc nav rendered further below exactly:
@@ -6093,7 +6428,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         })()}
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
-          ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
+          ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
           <div class="pf-stat" data-stat="human" title="${lang === "en" ? `Page views from humans, last ${statsDays} days` : `Sidevisninger fra mennesker, siste ${statsDays} dager`}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `humans &middot; ${statsDays}d` : `mennesker &middot; ${statsDays}d`}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last ${statsDays} days.` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager.`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `AI agents &middot; ${statsDays}d` : `AI-agenter &middot; ${statsDays}d`}</span></small></div></div>
           <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was sent to AI assistants such as ChatGPT and Claude as part of an answer, last ${AI_DELIVERY_WINDOW_DAYS} days. It does not show how many people saw it.` : `Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål, siste ${AI_DELIVERY_WINDOW_DAYS} dager. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? "In AI answers" : "Med i AI-svar"}<br><span class="pf-stat-meta">${lang === "en" ? `sent to the AI &middot; ${AI_DELIVERY_WINDOW_DAYS}d` : `sendt til AI-en &middot; ${AI_DELIVERY_WINDOW_DAYS}d`}</span></small></div></div>
@@ -6212,6 +6547,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
          scripts; PR-30 freshness work targets head/body areas elsewhere). -->
     ${relCitySection}
     ${relCategorySection}
+    ${faqSectionHtml}
 
     <script>
       // Per-agent stats hydration. Server keeps the page cacheable; this
@@ -6229,13 +6565,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // proceeds identically whether the beacon succeeds, fails, or
       // (JS-disabled) never runs at all.
       (function () {
-        var agentId = ${JSON.stringify(agent.id)};
+        var agentId = ${serializeJsonForScript(agent.id)};
         var url = "/api/agents/" + encodeURIComponent(agentId) + "/stats";
         fetch(url, { credentials: "same-origin" })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (s) {
             if (!s) return;
-            var fmt = function (n) { return (n || 0).toLocaleString(${JSON.stringify(lang === "en" ? "en-GB" : "nb-NO")}); };
+            var fmt = function (n) { return (n || 0).toLocaleString(${serializeJsonForScript(lang === "en" ? "en-GB" : "nb-NO")}); };
             if (s.humanViews > 0) {
               var h = document.querySelector('[data-stat="human"]');
               if (h) { h.querySelector('[data-fill="human"]').textContent = fmt(s.humanViews); h.style.display = "flex"; }
@@ -6249,7 +6585,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 var parts = [];
                 if (b.chatgpt) parts.push("ChatGPT " + b.chatgpt);
                 if (b.claude) parts.push("Claude " + b.claude);
-                if (b.other) parts.push(${JSON.stringify(lang === "en" ? "Other" : "Annet")} + " " + b.other);
+                if (b.other) parts.push(${serializeJsonForScript(lang === "en" ? "Other" : "Annet")} + " " + b.other);
                 // The approved tooltip text stays; the split is added under it (Daniel 2026-10-13: «behold teksten»).
                 if (parts.length) a.setAttribute("title", (a.getAttribute("title") || "") + "\\n" + parts.join(" · "));
               }
@@ -6260,7 +6596,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             // date the counting started instead of 0 (Daniel 2026-10-15).
             var d = s.aiDeliveries;
             var sinceMs = d && d.countingSince ? Date.parse(d.countingSince + "T00:00:00Z") : NaN;
-            var sinceTxt = isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString(${JSON.stringify(lang === "en" ? "en-GB" : "nb-NO")}, { day: "numeric", month: "short", timeZone: "UTC" });
+            var sinceTxt = isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString(${serializeJsonForScript(lang === "en" ? "en-GB" : "nb-NO")}, { day: "numeric", month: "short", timeZone: "UTC" });
             var partial = !!sinceTxt && d.windowDays && (Date.now() - sinceMs) < (d.windowDays - 1) * 86400000;
             // Shown with deliveries, or at 0 while the counting is younger than the window;
             // a 0 over a full window stays hidden, as before.
@@ -6270,20 +6606,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 var meta = tile.querySelector(".pf-stat-meta");
                 if (d.total > 0) {
                   tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
-                  if (partial && meta) meta.textContent = ${JSON.stringify(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
+                  if (partial && meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
                 } else {
-                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${JSON.stringify(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
-                  if (meta) meta.textContent = ${JSON.stringify(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
+                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${serializeJsonForScript(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
+                  if (meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
                 }
-                if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${JSON.stringify(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
+                if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${serializeJsonForScript(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
                 tile.style.display = "flex";
                 var v = d.byVendor || {};
                 var vp = [];
                 if (v.chatgpt) vp.push("ChatGPT " + v.chatgpt);
                 if (v.claude) vp.push("Claude " + v.claude);
                 if (v.perplexity) vp.push("Perplexity " + v.perplexity);
-                if (v.other) vp.push(${JSON.stringify(lang === "en" ? "Other" : "Annet")} + " " + v.other);
-                if (v.unknown) vp.push(${JSON.stringify(lang === "en" ? "Unknown" : "Ukjent")} + " " + v.unknown);
+                if (v.other) vp.push(${serializeJsonForScript(lang === "en" ? "Other" : "Annet")} + " " + v.other);
+                if (v.unknown) vp.push(${serializeJsonForScript(lang === "en" ? "Unknown" : "Ukjent")} + " " + v.unknown);
                 if (vp.length) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + vp.join(" · "));
               }
             }
@@ -6321,7 +6657,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       pageTitle,
       pageMetaDescription,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd, breadcrumbJsonLd] : [jsonLd, breadcrumbJsonLd], extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd, breadcrumbJsonLd] : [jsonLd, breadcrumbJsonLd], extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""), lang, pathForAlternate: "/produsent/" + slug }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
@@ -6339,15 +6675,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 // SITEMAP_CACHE_TTL_MS, default 30 min, clamped to 10–60 min. The agent list is
 // itself cached ~60 s and has no public invalidation hook, so TTL alone bounds
 // staleness (sitemap freshness is not time-critical).
-const SITEMAP_TTL_MIN_MS = 10 * 60_000;
-const SITEMAP_TTL_DEFAULT_MS = 30 * 60_000;
-const SITEMAP_TTL_MAX_MS = 60 * 60_000;
-
-export function resolveSitemapCacheTtlMs(raw: string | undefined = process.env.SITEMAP_CACHE_TTL_MS): number {
-  const n = Number(raw);
-  if (raw === undefined || raw.trim() === "" || !Number.isFinite(n)) return SITEMAP_TTL_DEFAULT_MS;
-  return Math.min(SITEMAP_TTL_MAX_MS, Math.max(SITEMAP_TTL_MIN_MS, Math.floor(n)));
-}
+export { resolveSitemapCacheTtlMs };
 
 let sitemapCache: { xml: string; builtAt: number } | null = null;
 
@@ -6389,10 +6717,12 @@ export function buildSitemapXml(): string {
   {
     const agents = marketplaceRegistry.getActiveAgents();
     const today = new Date().toISOString().split("T")[0];
+    // Place pages: the same placeSlugsForCity() the /:city route lists by, so a
+    // fylke page is here exactly when it has producers (SD-02).
     const cities = new Set<string>();
     agents.forEach((a: any) => {
       const city = a.city || a.location?.city;
-      if (city) cities.add(slugify(city));
+      if (city) for (const placeSlug of placeSlugsForCity(city, a.location)) cities.add(placeSlug);
     });
 
     // ── PR-30: per-agent freshness + enrichment-status hints ──────────
@@ -6456,9 +6786,10 @@ export function buildSitemapXml(): string {
       const updatedAt = parseIsoOrSqlite(knowledgeByAgent.get(a.id)?.updatedAt);
       if (!updatedAt) continue;
       const lm = lastmodForDate(updatedAt);
-      const citySlug = slugify(city);
-      const prev = cityLastmod.get(citySlug);
-      if (!prev || lm > prev) cityLastmod.set(citySlug, lm);
+      for (const citySlug of placeSlugsForCity(city, (a as any).location)) {
+        const prev = cityLastmod.get(citySlug);
+        if (!prev || lm > prev) cityLastmod.set(citySlug, lm);
+      }
     }
     for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", cityLastmod.get(city) || today);
 
@@ -6505,14 +6836,17 @@ export function buildSitemapXml(): string {
 }
 
 router.get("/sitemap.xml", (_req: Request, res: Response) => {
+  const startedAt = Date.now();
   try {
     const xml = getSitemapXml();
     res.header("Content-Type", "application/xml");
     res.header("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);
+    logSlowSitemap("rfb", startedAt);
   } catch (err) {
     console.error("Sitemap error:", err);
     res.status(500).send("Error generating sitemap");
+    logSlowSitemap("rfb", startedAt);
   }
 });
 

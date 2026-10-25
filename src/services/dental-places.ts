@@ -12,10 +12,12 @@
 //                                 our dental opening_hours schema shape
 //                                 ({day:"mon".."sun", open/close "HH:MM"}[])
 //   isConfidentPlaceMatch       — the match-validation guard that prevents
-//                                 pulling another clinic's data
+//                                 pulling another clinic's data (the rule
+//                                 itself lives in places-match.ts, shared
+//                                 with RFB; this keeps the clinic-shaped API)
 //   normalizePlacePhone         — strip "tel:" + internal whitespace, keep +
 
-import { nameSimilarity } from "./name-matcher";
+import { isConfidentPlaceMatch as isConfidentSharedPlaceMatch } from "./places-match";
 
 // ─── Places API response shapes (the subset of fields we request) ──────
 // FieldMask we send:
@@ -134,22 +136,15 @@ export function placesPeriodsToOpeningHours(
 
 // ─── isConfidentPlaceMatch ─────────────────────────────────────────────
 // The match-validation guard. Core protection against pulling a DIFFERENT
-// clinic's data (the rfb google-rating-batch flaw: it blindly took
-// data.places[0] with no validation). Returns true ONLY if the name is
-// similar enough AND the location is corroborated by EXACT key equality:
-//   - clinic HAS postnummer → require exact equality with the place's
-//     postal_code component (mismatch or missing component → hard-fail).
-//     This rejects same-city sibling chain branches (e.g. Oris Storo vs
-//     Oris Lambertseter, both "Oslo") that share a name and town.
-//   - clinic has NO postnummer → require a higher name bar
-//     (NAME_SIM_THRESHOLD_POSTSTED_ONLY) AND exact, case-insensitive
-//     equality of the place's postal_town/locality component vs the
-//     clinic's poststed (NOT a formattedAddress substring, which
-//     false-positives on short names like "Mo" in "Moss").
-export const NAME_SIM_THRESHOLD = 0.55;
-// When the clinic has no postnummer we can only cross-check on town name, which
-// is weaker — require a higher name similarity on that path.
-export const NAME_SIM_THRESHOLD_POSTSTED_ONLY = 0.65;
+// clinic's data (the rfb google-rating-batch flaw before dev-request
+// 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt S3:
+// it blindly took data.places[0] with no validation). Name similar enough AND
+// location corroborated by EXACT key equality — postnummer against the place's
+// postal_code, or (no postnummer) a higher name bar plus poststed against
+// postal_town/locality. The rule and its thresholds moved verbatim to
+// places-match.ts (S3) so RFB uses the same guard; this wrapper only maps the
+// clinic fields onto the neutral input, so dental behaviour is unchanged.
+export { NAME_SIM_THRESHOLD, NAME_SIM_THRESHOLD_POSTSTED_ONLY } from "./places-match";
 
 export interface MatchClinic {
   navn: string;
@@ -157,49 +152,14 @@ export interface MatchClinic {
   poststed?: string | null;
 }
 
-interface AddrComp { types?: string[]; longText?: string; shortText?: string; }
-
-function componentByType(place: PlacesPlace, t: string): AddrComp | undefined {
-  const comps = Array.isArray(place.addressComponents) ? place.addressComponents : [];
-  return comps.find((c) => Array.isArray((c as AddrComp)?.types) && (c as AddrComp).types!.includes(t)) as AddrComp | undefined;
-}
-
-/**
- * Confident-match guard (anti-contamination). A place is accepted ONLY if the
- * name is similar enough AND the location is corroborated:
- *  - If the clinic has a postnummer: REQUIRE an exact match against the place's
- *    postal_code component. A mismatch (or missing component) hard-fails — this
- *    is what stops a same-city sibling branch (e.g. Oris Storo vs Oris
- *    Lambertseter, both "Oslo") from being mistaken for this clinic.
- *  - If the clinic has NO postnummer: require a higher name threshold AND an
- *    exact (case-insensitive) match of the place's postal_town/locality against
- *    the clinic's poststed (equality, not a formattedAddress substring — the
- *    latter false-positives on short names like "Mo" ⊂ "Moss").
- */
 export function isConfidentPlaceMatch(
   clinic: MatchClinic,
   place: PlacesPlace | null | undefined
 ): boolean {
-  if (!place) return false;
-  const placeName = place.displayName?.text ?? "";
-  const sim = nameSimilarity(clinic.navn ?? "", placeName);
-  if (sim < NAME_SIM_THRESHOLD) return false;
-
-  const postnummer = (clinic.postnummer ?? "").toString().trim();
-  if (postnummer) {
-    // Strongest branch-specific key: exact postal_code equality, else hard-fail.
-    const pc = componentByType(place, "postal_code");
-    const pcVal = ((pc?.longText ?? pc?.shortText ?? "") as string).trim();
-    return pcVal !== "" && pcVal === postnummer;
-  }
-
-  // No postnummer on the clinic → stricter name bar + town equality.
-  if (sim < NAME_SIM_THRESHOLD_POSTSTED_ONLY) return false;
-  const poststed = (clinic.poststed ?? "").toString().trim().toLowerCase();
-  if (!poststed) return false;
-  const loc = componentByType(place, "postal_town") ?? componentByType(place, "locality");
-  const locVal = ((loc?.longText ?? loc?.shortText ?? "") as string).trim().toLowerCase();
-  return locVal !== "" && locVal === poststed;
+  return isConfidentSharedPlaceMatch(
+    { name: clinic.navn, postalCode: clinic.postnummer, postalTown: clinic.poststed },
+    place
+  );
 }
 
 // ─── isValidHttpUrl ────────────────────────────────────────────────────

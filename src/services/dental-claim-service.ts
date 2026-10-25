@@ -86,7 +86,21 @@ export type ClaimFilter = {
   // already-attempted record (FUNN repeated in six consecutive reports,
   // 2026-08-25..09-02) cannot happen. Capped at 500 like the batch size.
   exclude_ids?: string[];
+  // A2A dev-request 2026-10-16-finn-tannlege-fasettsider, F1-S4d punkt 4b:
+  // claim only these ids -- the SKILL's akutt round (§4.1c) claims a snapshot
+  // of the akutt clinics in pools of 12, each id once. Validated and capped
+  // at 500 as exclude_ids is. With ids, the completion-mode exclusion of
+  // fully populated rows does not apply (those clinics are claimed for
+  // acute_vakt, not for a missing rich field); every other exclusion does.
+  // An ids list with no valid id selects nothing.
+  ids?: string[];
 };
+
+// exclude_ids and ids: strings of 1..64 characters, at most 500.
+function validClaimIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((v): v is string => typeof v === "string" && v.length > 0 && v.length <= 64).slice(0, 500);
+}
 
 export type ClaimedRecord = {
   id: string;
@@ -157,7 +171,8 @@ export function buildWhereClause(
   // Only applied in completion-mode (enrichment_state === "enriched"); no
   // other filter combination is affected, so raw/thin_site pools and any
   // future explicit enrichment_state values are untouched.
-  if (filter.enrichment_state === "enriched") {
+  // F1-S4d punkt 4b: not applied when the caller names the ids (filter.ids).
+  if (filter.enrichment_state === "enriched" && filter.ids === undefined) {
     conditions.push(`
       NOT (
         om_oss IS NOT NULL AND om_oss <> ''
@@ -278,14 +293,19 @@ export function buildWhereClause(
 
   // dev-request 2026-09-02-dental-permanent-triage (steg 3): per-call id
   // exclusion (same-cycle round-2 dedup). Validated, capped, parameterised.
-  if (Array.isArray(filter.exclude_ids) && filter.exclude_ids.length > 0) {
-    const ids = filter.exclude_ids
-      .filter((v): v is string => typeof v === "string" && v.length > 0 && v.length <= 64)
-      .slice(0, 500);
-    if (ids.length > 0) {
-      conditions.push(`id NOT IN (${ids.map(() => "?").join(",")})`);
-      params.push(...ids);
-    }
+  const excludeIds = validClaimIds(filter.exclude_ids);
+  if (excludeIds.length > 0) {
+    conditions.push(`id NOT IN (${excludeIds.map(() => "?").join(",")})`);
+    params.push(...excludeIds);
+  }
+
+  // F1-S4d punkt 4b: only the named ids, validated and capped the same way.
+  // Passed but with no valid id, the clause is false: a malformed list never
+  // falls back to the whole pool.
+  if (filter.ids !== undefined) {
+    const ids = validClaimIds(filter.ids);
+    conditions.push(ids.length > 0 ? `id IN (${ids.map(() => "?").join(",")})` : "0");
+    params.push(...ids);
   }
 
   return { clause: conditions.join(" AND "), params };

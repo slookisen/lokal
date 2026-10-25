@@ -40,6 +40,16 @@
  *     no text, categories/UUID/gårdssalg intents) is byte-identical to
  *     before.
  *
+ * dev-request 2026-10-16-opplevagent-mcp-fritekst-query, S5 (section 9):
+ * before case 1 answers count:0, the message's search words from the shared
+ * interpreter (interpretDiscoverQuery) are tried — every word must be in the
+ * row. "hvalsafari" now finds the whale safari; "zzzqqq ingen treff xyzzy"
+ * and a place parseExperiencesIntent() does not know ("hvalsafari i
+ * Nord-Norge") still answer count:0 / unrecognized_query. So do a place
+ * outside Norway ("kongekrabbe i Russland", 9m) and a food purchase ("kjøpe
+ * tørrfisk", 9n), even though a Norwegian row contains every word: the early
+ * returns of discover_experiences and REST run before the interpreter.
+ *
  * Follows the exact precedent of experiences-a2a.test.ts / opplevelser-
  * discover-relax.test.ts: exported runExperiencesA2aZeroHitTests(opts),
  * standalone-runnable via `npx tsx <file>`, own in-memory DB seeding via the
@@ -119,6 +129,35 @@ export function runExperiencesA2aZeroHitTests(opts: { log?: boolean } = {}): Pro
         category: "natur", verification_status: "verified", confidence: "high",
         price_from: 500, duration_min: 90, indoor_outdoor: "outdoor",
         weather_dependent: 1, season: ["winter"],
+      });
+      // S5 (section 9): a whale safari outside Tromsø, outdoor and weather-
+      // dependent like the row above, so cases 4-6 answer as before.
+      expStore.createExperience({
+        title: "Hvalsafari fra Andenes", provider_id: providerId,
+        provider_match_status: "matched", kommune: "Andøy", fylke: "Nordland",
+        category: "dyreliv_safari", verification_status: "verified", confidence: "high",
+        price_from: 1300, duration_min: 240, indoor_outdoor: "outdoor",
+        weather_dependent: 1, season: ["winter"],
+        description: "Se spermhval og spekkhoggere fra båt.",
+      });
+      // S5 (9m, 9n): Norwegian rows whose text names a foreign country or
+      // buying stockfish, so a search-word hit is possible for those messages.
+      const borderRow = {
+        provider_id: providerId, provider_match_status: "matched", kommune: "Sør-Varanger", fylke: "Finnmark",
+        category: "dyreliv_safari", verification_status: "verified", confidence: "high",
+        price_from: 1900, duration_min: 180, indoor_outdoor: "outdoor", weather_dependent: 1, season: ["winter"],
+      } as const;
+      expStore.createExperience({
+        ...borderRow, title: "King Crab Safari Kirkenes",
+        description: "Kongekrabbe fra Barentshavet, like ved grensen til Russland. A king crab safari by the border with Russia.",
+      });
+      expStore.createExperience({
+        ...borderRow, title: "Husky safari Pasvik",
+        description: "Hundekjøring i Pasvikdalen, mellom Finland og Russland.",
+      });
+      expStore.createExperience({
+        ...borderRow, kommune: "Moskenes", fylke: "Nordland", category: "kultur_historie", title: "Lofoten Tørrfiskmuseum",
+        description: "Om tørrfisk fra Lofoten. I butikken kan du kjøpe tørrfisk; you can buy stockfish in the shop.",
       });
 
       // ── 1. Nonsense text -> count:0, unrecognized_query ───────────────
@@ -214,6 +253,68 @@ export function runExperiencesA2aZeroHitTests(opts: { log?: boolean } = {}): Pro
       // ── 8. Categories intent still works (unaffected by this change) ──
       const r8: any = handleExperiencesMessageSend({ message: "vis meg kategorier" }, "z8");
       assertEq(r8.result?.metadata?.skill, "opplevelser_categories", "8a: categories intent still routes to opplevelser_categories");
+
+      // ── 9. S5: search words before count:0 ─────────────────────────────
+      const titlesOf = (r: any) => ((r.result?.artifacts?.[1]?.parts?.[0]?.data?.experiences ?? []) as any[]).map((e) => e.title);
+      assertEq(a2a.parseExperiencesIntent("hvalsafari"), {}, "9a: parseExperiencesIntent finds nothing in «hvalsafari» (it is unchanged)");
+      const r9: any = handleExperiencesMessageSend({ message: "hvalsafari" }, "z9");
+      assertEq(titlesOf(r9), ["Hvalsafari fra Andenes"], "9b: «hvalsafari» finds the whale safari instead of count:0");
+      assertEq([r9.result?.metadata?.skill, r9.result?.metadata?.filter, r9.result?.metadata?.zero_hit_reason, r9.result?.artifacts?.[1]?.parts?.[0]?.data?.count],
+        ["opplevelser_discover", { text_terms: ["hvalsafari"] }, undefined, 1], "9c: … as a discover answer whose filter is the search words");
+      const summary9 = r9.result?.artifacts?.[0]?.parts?.[0]?.text as string;
+      assertTrue(/søkeordene \(hvalsafari\)/.test(summary9) && /search words \(hvalsafari\)/.test(summary9), "9d: … and the summary says the rows matched the search words");
+      const row9 = r9.result?.artifacts?.[1]?.parts?.[0]?.data?.experiences?.[0] ?? {};
+      assertTrue(!("distance_km" in row9) && !("geo_precision" in row9), "9e: … rows without distance fields (a text message has no origin)");
+      assertTrue(a2a.experiencesAskedSomething(r9), "9f: … and it counts as a lookup that asked something");
+      const r9sentence: any = handleExperiencesMessageSend({ message: "Hvor kan jeg se hvalsafari?" }, "z9s");
+      assertEq(titlesOf(r9sentence), ["Hvalsafari fra Andenes"], "9g: question words are no search words");
+
+      // Every word must be in the row: one word that matches nothing gives count:0.
+      for (const text of ["hvalsafari zzzqqq", "zzzqqq ingen treff xyzzy"]) {
+        const r: any = handleExperiencesMessageSend({ message: text }, "z9z");
+        assertEq([r.result?.metadata?.zero_hit_reason, r.result?.artifacts?.[1]?.parts?.[0]?.data?.count, r.result?.metadata?.filter],
+          ["unrecognized_query", 0, {}], `9h: «${text}» → count:0, unrecognized_query, metadata.filter unchanged`);
+        assertTrue(!a2a.experiencesAskedSomething(r), `9i: «${text}» is not counted as a lookup`);
+        assertTrue(/ingen opplevelse inneholder alle søkeordene/.test(r.result?.artifacts?.[0]?.parts?.[0]?.text ?? ""),
+          `9j: «${text}»: the summary says no experience has all the search words`);
+      }
+      // A place only the interpreter reads: never answered with rows from the whole country.
+      for (const text of ["hvalsafari i Nord-Norge", "hvalsafari i Hordaland"]) {
+        const r: any = handleExperiencesMessageSend({ message: text }, "z9p");
+        assertEq([r.result?.metadata?.zero_hit_reason, r.result?.artifacts?.[1]?.parts?.[0]?.data?.count], ["unrecognized_query", 0],
+          `9k: «${text}» stays count:0 — the search word alone would be nationwide`);
+      }
+      // No search words at all: the old text.
+      const r9hei: any = handleExperiencesMessageSend({ message: "hei" }, "z9h");
+      assertTrue(r9hei.result?.metadata?.zero_hit_reason === "unrecognized_query" &&
+        (r9hei.result?.artifacts?.[0]?.parts?.[0]?.text as string).startsWith("Fant ingen gjenkjennelige søkekriterier"),
+        "9l: a greeting has no search words and keeps the old summary");
+
+      // A place outside Norway (B1 of the PR #1093 review) and a food purchase:
+      // the old count:0 answer, although a Norwegian row has every search word.
+      const oldZero = (r: any) => [r.result?.metadata?.skill, r.result?.metadata?.zero_hit_reason, r.result?.artifacts?.[1]?.parts?.[0]?.data?.count,
+        r.result?.metadata?.filter, (r.result?.artifacts?.[0]?.parts?.[0]?.text as string).startsWith("Fant ingen gjenkjennelige søkekriterier")];
+      const guarded: Array<[string, string, string]> = [
+        ["9m", "kongekrabbe i Russland", "King Crab Safari Kirkenes"],
+        ["9m", "king crab safari in Russia", "King Crab Safari Kirkenes"],
+        ["9m", "husky safari Finland", "Husky safari Pasvik"],
+        ["9n", "kjøpe tørrfisk", "Lofoten Tørrfiskmuseum"],
+        ["9n", "Where can I buy stockfish?", "Lofoten Tørrfiskmuseum"],
+      ];
+      const { interpretDiscoverQuery } = require("../services/experiences-query-intent") as typeof import("../services/experiences-query-intent");
+      for (const [label, text, row] of guarded) {
+        const terms = interpretDiscoverQuery(text).terms ?? [];
+        assertTrue(Object.keys(a2a.parseExperiencesIntent(text)).length === 0 &&
+          expStore.discoverExperiences({ text_terms: terms }, 20).some((e) => e.title === row),
+          `${label}: «${text}» reaches the search-word step, and «${row}» has every search word (${terms.join(", ")})`);
+        const r: any = handleExperiencesMessageSend({ message: text }, "z9g");
+        assertEq(oldZero(r), ["opplevelser_discover", "unrecognized_query", 0, {}, true], `${label}: «${text}» → the old count:0 answer, no Norwegian rows`);
+        assertTrue(!a2a.experiencesAskedSomething(r), `${label}: «${text}» is not counted as a lookup`);
+      }
+      // The same words without the foreign place or the purchase still find the rows.
+      for (const [text, row] of [["kongekrabbe", "King Crab Safari Kirkenes"], ["husky", "Husky safari Pasvik"], ["tørrfisk", "Lofoten Tørrfiskmuseum"]]) {
+        assertEq(titlesOf(handleExperiencesMessageSend({ message: text }, "z9o")), [row], `9o: «${text}» alone finds «${row}»`);
+      }
     } catch (err: any) {
       failed++;
       failures.push("experiences-a2a-zero-hit: unexpected error: " + String(err?.stack || err?.message || err));

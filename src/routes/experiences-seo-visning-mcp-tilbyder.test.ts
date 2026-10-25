@@ -4,7 +4,10 @@
  *
  * Covers:
  *   AC1 — gårdssalg pages carry no InStock Offer while booking is paused
- *         (and keep it when booking is live).
+ *         (and no ReserveAction either). A live-booking page signals the
+ *         visit request as a ReserveAction, not as a price-less Offer
+ *         (dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-
+ *         og-places-treffvakt, S5).
  *   AC2 — get_experience returns provider{name,org_nr,website,phone},
  *         profile_url and source_url (null, never "", when unknown) for 10/10.
  *   AC3 — discover_experiences with group_size/age/language returns
@@ -153,7 +156,8 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
         const adult = await callHtmlRoute(seoRouter, "/opplevelse/vm-exp-0");
         assertTrue(adult.status === 200 && adult.body.includes("990 kr per voksen"), "adult-seo: detail shows adult basis");
         assertTrue(!adult.body.includes("fra 990 kr"), "adult-seo: adult price is not claimed as cheapest age price");
-        assertTrue(ldBlocks(adult.body).some((b) => b.offers?.price === 990 && b.offers?.name === "Adult price"), "adult-seo: structured offer labels adult basis");
+        // Offer.name in the page language (lokal#1097 review S4, landed with E2-S3).
+        assertTrue(ldBlocks(adult.body).some((b) => b.offers?.price === 990 && b.offers?.name === "Voksenpris"), "adult-seo: structured offer labels adult basis");
         const listing = await callHtmlRoute(seoRouter, "/kategori/mat_drikke");
         assertTrue(listing.status === 200 && listing.body.includes("Voksenpris 990 kr"), "adult-seo: list card labels adult price");
         db.prepare("UPDATE experiences SET price_unit = 'unknown' WHERE id = ?").run(expIds[0]);
@@ -167,6 +171,8 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
         assertTrue(r.handled && r.status === 200, `ac1-0: paused page renders (status ${r.status})`);
         assertTrue(!r.body.includes("InStock"), "ac1-1: paused gårdssalg page has no InStock");
         assertTrue(!ldBlocks(r.body).some((b) => b.offers), "ac1-2: paused gårdssalg page has no offers node");
+        assertTrue(!ldBlocks(r.body).some((b) => b.potentialAction) && !r.body.includes("ReserveAction"),
+          "ac1-2b: paused gårdssalg page has no potentialAction (ReserveAction) either");
         assertTrue(!r.body.includes("inkluderer typisk"), "ac6-1: no 'inkluderer typisk' without visit_text");
         assertTrue(!r.body.includes("Book et besøk"), "ac6-2: no 'Book et besøk' without visit_text");
         assertTrue(r.body.includes("Spør Pauset Bryggeri direkte om det går an å komme på besøk."), "ac6-3: neutral visit text");
@@ -179,7 +185,14 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
       {
         const r = await callHtmlRoute(seoRouter, "/kategori/gardssalg/produsent/aktivt-bryggeri");
         assertTrue(r.handled && r.status === 200, `ac1-3: live page renders (status ${r.status})`);
-        assertTrue(ldBlocks(r.body).some((b) => b.offers?.availability === "https://schema.org/InStock"), "ac1-4: live-booking page keeps its Offer");
+        // S5 rewrote ac1-4 («live-booking page keeps its Offer»): the visit has
+        // no price, so the live page carries a ReserveAction to /book instead.
+        const biz = ldBlocks(r.body).find((b) => b["@type"] === "LocalBusiness");
+        assertTrue(biz?.potentialAction?.["@type"] === "ReserveAction"
+          && biz.potentialAction.target?.["@type"] === "EntryPoint"
+          && biz.potentialAction.target.urlTemplate === "https://opplevagent.no/kategori/gardssalg/book/aktivt-bryggeri",
+          `ac1-4: live-booking page signals a ReserveAction to /book (got ${JSON.stringify(biz?.potentialAction)})`);
+        assertTrue(!ldBlocks(r.body).some((b) => b.offers) && !r.body.includes("InStock"), "ac1-5: … and no Offer / InStock");
       }
 
       // ── AC5: no EN signals while the flag is off ──
@@ -239,7 +252,7 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
           for (const k of ["name", "org_nr", "website", "phone"]) if (!(k in sc.provider) || sc.provider[k] === "") nullClean = false;
         }
         if (sc && (sc.source_url === "" || !("source_url" in sc))) nullClean = false;
-        if (i === 0) assertTrue(sc.booking_info_only === true && sc.booking_url === "javascript:alert(1)", "ac2-3: a non-http booking_url is flagged booking_info_only");
+        if (i === 0) assertTrue(sc.booking_info_only === true && sc.booking_url === null, "ac2-3: a non-http booking_url is flagged booking_info_only and not returned");
         if (i === 1) assertTrue(sc.booking_info_only === false, "ac2-4: an http(s) booking_url is not info-only");
         if (i === 1) assertTrue(sc.source_url === "https://kilde.example.no/a", "ac2-5: source_url passes through");
         if (i === 2) assertTrue(sc.source_url === null && sc.provider.website === null && sc.provider.phone === null, "ac2-6: unknown fields are null, not empty strings");

@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 import { agentCardService, store } from "../services";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { buildSearchNote } from "../utils/geo-query";
-import { DiscoveryQuerySchema } from "../models/marketplace";
+import { DiscoveryQuerySchema, type DiscoveryQuery } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
 import { conversationService, buildRequestMeta, isInternalTraffic, type MessageType } from "../services/conversation-service";
 import {
@@ -14,9 +14,10 @@ import {
 } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService, relabelCertifications } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
+import { isAgentIdPubliclyVisible } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
@@ -24,6 +25,11 @@ import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
+import { a2aMessageData, capA2aData } from "../utils/a2a-message";
+import { capFreeText } from "../utils/free-text";
+import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
+import { searchCountable } from "../services/search-tracking";
+import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -60,6 +66,19 @@ export function toA2ADataArtifact(opts: { artifactId: string; name: string; data
     name: opts.name,
     parts: [{ kind: "data", data: opts.data }],
   };
+}
+
+/**
+ * The answer to a request that failed inside the handler: JSON-RPC's generic
+ * -32603 "Internal error", without the detail. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * a2a-mcp-intern-feiltekst-rest): the error's own message went to the caller
+ * as `data`, as Finn-tannlege A2A's did until slice I-Y2. The detail is
+ * logged instead, without the request (`where` says which step failed;
+ * utils/internal-error.ts).
+ */
+function rpcInternalError(id: unknown, where: string, err: unknown) {
+  return rpcInternalErrorReply("a2a", id, where, err);
 }
 
 
@@ -157,7 +176,9 @@ router.get("/a2a", (_req: Request, res: Response) => {
     if (signatures.length > 0) (card as any).signatures = signatures;
     res.json(card);
   } catch (err: any) {
-    res.status(500).json({ error: "Failed to generate agent card", detail: err.message });
+    // Slice I-Y3: the error's own message is logged, not sent (as rpcInternalError).
+    logInternalError("a2a", "GET /a2a agent card", err);
+    res.status(500).json({ error: "Failed to generate agent card" });
   }
 });
 
@@ -195,7 +216,11 @@ router.post("/a2a", (req: Request, res: Response) => {
       case "message/send":
       case "tasks/send": // Backward-compat alias for older A2A clients (<0.3)
       case "SendMessage": // A2A v1.0
-        handleMessageSend(params, id, req, res);
+        // Slice I-AA: a text is read with its place looked up (async); a
+        // failure outside the handler's own try gets this catch's answer.
+        handleMessageSend(params, id, req, res).catch((err) => {
+          if (!res.headersSent) res.json(rpcInternalError(id, "POST /a2a", err));
+        });
         break;
       case "tasks/get":
       case "GetTask": // A2A v1.0
@@ -209,7 +234,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         handleExtendedCard(params, id, req, res);
         break;
       case "agent/info":
-        handleAgentInfo(params, id, res);
+        handleAgentInfo(params, id, req, res);
         break;
       default:
         res.json({
@@ -219,11 +244,7 @@ router.post("/a2a", (req: Request, res: Response) => {
         });
     }
   } catch (err: any) {
-    res.json({
-      jsonrpc: "2.0",
-      error: { code: -32603, message: "Internal error", data: err.message },
-      id,
-    });
+    res.json(rpcInternalError(id, "POST /a2a", err));
   }
 });
 
@@ -233,7 +254,8 @@ router.post("/a2a", (req: Request, res: Response) => {
 //
 // Two modes:
 //   1. Natural language: { message: { text: "finn grønnsaker..." } }
-//   2. Structured:       { message: { data: { categories: [...] } } }
+//   2. Structured:       { message: { data: { categories: [...] } } }, or the
+//      standard DataPart { message: { parts: [{ kind: "data", data: {...} }] } }
 //
 // Returns a task with results (or "working" status for async).
 
@@ -241,7 +263,53 @@ const NO_INTENT_NOTE =
   "Fant ingen matforespørsel i meldingen — prøv f.eks. «honning i Oslo». " +
   "No food query detected in the message — try e.g. \"honey in Oslo\".";
 
-function handleMessageSend(params: any, id: any, req: Request, res: Response) {
+/**
+ * Slice I-AA: the note to a text with a place whose words the parser could
+ * not read match no product of the producers there (DiscoverMeta.unmatchedTerms).
+ * lokal_search lists those producers, marked as no matches; this answer has
+ * none, since a client reads `agents` as matches and the top three would get
+ * a conversation.
+ */
+function areaNoProductMatchNote(terms: readonly string[]): string {
+  const words = `«${terms.join(" ")}»`;
+  return `🔎 Ingen produsent i området har ${words} i produktlista, så søket gir ingen treff der. Søk uten sted for hele landet. / ` +
+    `No producer in the area lists ${words}, so there are no matches there. Search without a place to cover all of Norway.`;
+}
+
+/**
+ * The most characters of a structured query's JSON that RFB A2A logs, stores
+ * and echoes as it was sent. dev-request
+ * 2026-10-17-integrasjonstest-oppfolging, slice I-Y3 (FUNN
+ * rfb-a2a-strukturert-melding-totalstorrelse): capA2aData bounds each field,
+ * but a message that spread 1 MB over many keys, or nested it in an object,
+ * went whole to the interactions log, to the query_text of each conversation
+ * it started and back in the answer (`parsedQuery`). A real structured query
+ * is a few hundred characters. The fields a discovery reads take at most
+ * about 16 500 within their caps (`query` and `drinkSubcategory` of 2000,
+ * and three lists of 50 names of 80), and past the bound they are kept with
+ * their values (boundedA2aQuery), so the bound drops only what the
+ * discovery never reads.
+ */
+export const MAX_A2A_QUERY_JSON_CHARS = 16_384;
+
+/**
+ * A structured query (modes 2 and 3) as RFB A2A logs, stores and echoes it:
+ * `sent` itself when its JSON is within MAX_A2A_QUERY_JSON_CHARS, so a real
+ * query is the same object as before. A longer one is the fields of it the
+ * discovery read, with the values it read (`read`, the query the handler
+ * parsed for the search, so a `limit` of 0 is the 20 the search used), and
+ * only those that were sent. The search reads `read` either way, and the
+ * traffic class the query as sent (handleMessageSend). A query the schema
+ * rejects is answered as invalid before this, so nothing of it is logged or
+ * echoed.
+ */
+export function boundedA2aQuery(sent: unknown, read: DiscoveryQuery): unknown {
+  if (!sent || typeof sent !== "object" || Array.isArray(sent)) return sent;
+  if (JSON.stringify(sent).length <= MAX_A2A_QUERY_JSON_CHARS) return sent;
+  return Object.fromEntries(Object.entries(read).filter(([key]) => Object.hasOwn(sent, key)));
+}
+
+async function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   const message = params?.message;
   if (!message) {
     res.json({
@@ -284,19 +352,39 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     return null;
   };
 
-  const messageText = extractText(message);
+  // Slice I-Y: at most MAX_FREE_TEXT_CHARS of the text are read, cut at a
+  // word boundary (utils/free-text.ts); it used to reach the parser whole. A
+  // `text` that is no string (a client bug) is passed on as before.
+  const rawText = extractText(message);
+  const messageText = typeof rawText === "string" ? capFreeText(rawText) : rawText;
+  // message.data, or the first standard DataPart (dev-request 2026-10-17-
+  // integrasjonstest-oppfolging, I-X: utils/a2a-message.ts).
+  const messageData = a2aMessageData(message);
 
   // Mode 1: Natural language search (flat text, parts array, or string)
+  // Slice I-AA (dev-request 2026-10-17-integrasjonstest-oppfolging): read as
+  // MCP lokal_search reads it (services/rfb-search-reading.ts): a place
+  // outside Norway gets no producers, and the place in the text is looked
+  // up below, once the traffic class is known. «honning Trondheim» used to
+  // be answered with honey producers in Tønsberg, Hurum and Stathelle, and
+  // «cheese in Stockholm» with Norwegian dairies.
+  let outsideNorway: string | null = null;
   if (messageText) {
-    discoveryQuery = marketplaceRegistry.parseNaturalQuery(messageText);
+    const read = readSearchText(messageText);
+    discoveryQuery = read.parsed;
+    outsideNorway = read.outsideNorway;
   }
   // Mode 2: Structured discovery query
-  else if (message.data) {
-    discoveryQuery = message.data;
+  else if (messageData) {
+    discoveryQuery = messageData;
   }
   // Mode 3: Treat entire params as query
+  // Slice I-Y2: cut as the data of Mode 2 is (capA2aData). These fields went
+  // whole to discover(): 100 000 categories, within the 1 MB body limit,
+  // blocked the process for about 46 s with 1500 producers. Params within
+  // the caps are the same object, so such a message answers as before.
   else {
-    discoveryQuery = params;
+    discoveryQuery = capA2aData(params);
   }
 
   // ─── Spam guard (2026-10-04) ──────────────────────────────
@@ -306,15 +394,34 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   // counters. Everything else still gets a valid completed task (results for
   // intent queries, an empty result + note for no-intent text) but leaves no
   // public trace. Real buyer queries take exactly the old path.
-  const queryText = messageText || JSON.stringify(discoveryQuery);
+  // Slice I-Y3: the class reads the query as sent (each field cut by
+  // capA2aData, every key kept), not the bounded one that is logged below:
+  // a spam marker in a key the discovery never reads, such as implant_id,
+  // still counts past MAX_A2A_QUERY_JSON_CHARS (review of lokal#1171).
+  const classifiedText = messageText || JSON.stringify(discoveryQuery);
   const requestMeta = buildRequestMeta(req);
   const trafficClass = classifyA2aTraffic({
-    text: queryText,
+    text: classifiedText,
     ua: requestMeta.userAgent,
     hasStructuredData: !messageText,
     isInternal: isInternalTraffic(requestMeta),
   });
-  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText });
+  // Slice I-AA: only external and internal traffic has its text read as a
+  // search the way lokal_search reads it. Spam and probe traffic is read as
+  // before: the words the parser cannot read, which nearly every such payload
+  // has, are no search (so it gets no discover() at all), and no place is
+  // looked up. Looking up a text's place is up to 114 sequential requests to
+  // Kartverket (MAX_GEOCODE_WORDS), and the misses would fill the geocode
+  // cache that lokal_search and /sok share (review of lokal#1193, B1). A
+  // place is looked up only for a text that asks for something
+  // (hasDiscoveryIntent): a place alone, or a greeting the geocoder may know
+  // as a place («hei»), stays no search, as before, so it starts no
+  // conversations.
+  const readAsSearch = trafficClass === "external" || trafficClass === "internal";
+  if (messageText && readAsSearch && !outsideNorway && hasDiscoveryIntent(discoveryQuery)) {
+    await geocodeSearchPlace(discoveryQuery, messageText);
+  }
+  const hasIntent = hasDiscoveryIntent(discoveryQuery, { structured: !messageText, unknownTerms: readAsSearch });
   const capKey = req.ip ? hashIP(req.ip) : "unknown";
   const rateCapped = trafficClass === "external" && hasIntent && a2aConversationCap.isOver(capKey);
   const countable = trafficClass === "external" && hasIntent && !rateCapped;
@@ -327,11 +434,18 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
   // Execute discovery
   const startTime = Date.now();
   try {
-    const query = DiscoveryQuerySchema.parse({
-      ...discoveryQuery,
-      limit: discoveryQuery.limit || 20,
-      offset: discoveryQuery.offset || 0,
-    });
+    // Slice I-AA: a text's product, name and unknown words reach discover(),
+    // as lokal_search's do (discoveryQueryOf); the parse dropped them, so
+    // «Which farms in Innlandet sell lamb?» was a search for any meat. A
+    // structured query is parsed as before.
+    const page = { limit: discoveryQuery.limit || 20, offset: discoveryQuery.offset || 0 };
+    const query = messageText
+      ? discoveryQueryOf(discoveryQuery, page)
+      : DiscoveryQuerySchema.parse({ ...discoveryQuery, ...page });
+    // Slice I-Y3: what is logged, stored and echoed of a structured query is
+    // bounded in total (boundedA2aQuery); a real query is the same object.
+    const loggedQuery = messageText ? discoveryQuery : boundedA2aQuery(discoveryQuery, query);
+    const queryText = messageText || JSON.stringify(loggedQuery);
 
     // dev-request 2026-09-06-rfb-sok-adjektiv-tags-er-hardt-filter, round-3
     // review finding: this A2A discovery flow (Mode 1 via parseNaturalQuery's
@@ -341,11 +455,18 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     // No intent → no discover() at all: an empty query used to fall back to
     // the nationwide trust ranking (full-table scan + ~1.2 s event-loop block
     // per spam call) and hand the same three producers every payload.
+    // Slice I-AA: a text naming a place outside Norway gets no producers.
+    // When the words the parser could not read match no product name
+    // (discover() step 3c, meta.unmatchedTerms), the answer has no
+    // producers either: nationwide discover() gives none, and near a place
+    // the producers there are no matches, nor counted as discovered.
     const discoverMeta: DiscoverMeta = {};
-    const results = hasIntent
-      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable })
+    const found = hasIntent && !outsideNorway
+      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false })
       : [];
-    const tagsRelaxed = !!discoverMeta.tagsRelaxed;
+    const unmatchedTerms = discoverMeta.unmatchedTerms;
+    const results = unmatchedTerms ? [] : found;
+    const tagsRelaxed = !unmatchedTerms && !!discoverMeta.tagsRelaxed;
     res.locals.a2aCountable = countable && results.length > 0;
     // «Med i AI-svar»: the producers in a countable answer, once per profile.
     recordA2aDelivery(req, res, results.map((r) => r.agent.id), queryText);
@@ -367,7 +488,7 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
         matchedAgentIds: results.map(r => r.agent.id),
         metadata: {
           taskId: task.id,
-          parsedQuery: discoveryQuery,
+          parsedQuery: loggedQuery,
           method: "message/send",
         },
         ipAddress: req.ip,
@@ -416,7 +537,11 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
     // present only when the tag filter was actually dropped, so a
     // tagsRelaxed:false result is byte-identical to before this change.
     const relaxedFilters = tagsRelaxed ? ["tags"] : undefined;
-    const note = hasIntent ? buildSearchNote({ tagsDropped: tagsRelaxed }) : NO_INTENT_NOTE;
+    // Slice I-AA: lokal_search's texts for a place outside Norway and for
+    // words that match no product nationwide (services/rfb-search-reading.ts).
+    const note = outsideNorway ? outsideNorwayText(outsideNorway)
+      : unmatchedTerms ? (query.location ? areaNoProductMatchNote(unmatchedTerms) : noProductMatchText(unmatchedTerms))
+      : hasIntent ? buildSearchNote({ tagsDropped: tagsRelaxed }) : NO_INTENT_NOTE;
 
     // A2A response format — now includes conversation links
     res.json({
@@ -434,7 +559,7 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
               count: results.length,
               agents: results,
               conversations,
-              parsedQuery: discoveryQuery,
+              parsedQuery: loggedQuery,
               relaxed_filters: relaxedFilters,
               note,
             },
@@ -444,12 +569,24 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       id,
     });
   } catch (err: any) {
-    marketplaceRegistry.updateTask(task.id, "failed", null, err.message);
-    res.json({
-      jsonrpc: "2.0",
-      error: { code: -32602, message: "Invalid discovery query", data: err.message },
-      id,
-    });
+    // Slice I-Y3 (FUNN a2a-mcp-intern-feiltekst-rest): an invalid query is
+    // the caller's to read, as before: Zod's issues, which name the fields
+    // and the expected types (of at most the capped entries, capA2aData).
+    // Any other failure here is ours, a database error for one, and it went
+    // to the caller as "Invalid discovery query" with its own message, also
+    // through tasks/get (the task's error). It is now a generic -32603, and
+    // the detail is logged (rpcInternalError).
+    if (err?.name === "ZodError") {
+      marketplaceRegistry.updateTask(task.id, "failed", null, err.message);
+      res.json({
+        jsonrpc: "2.0",
+        error: { code: -32602, message: "Invalid discovery query", data: err.message },
+        id,
+      });
+      return;
+    }
+    marketplaceRegistry.updateTask(task.id, "failed", null, "Internal error");
+    res.json(rpcInternalError(id, "message/send", err));
   }
 }
 
@@ -523,7 +660,7 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
 // This is the core of the dummy-agent system: every seller has
 // an agent that can answer based on what we know about them.
 
-function handleAgentInfo(params: any, id: any, res: Response) {
+function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   const agentId = params?.agentId;
   if (!agentId) {
     res.json({
@@ -544,11 +681,14 @@ function handleAgentInfo(params: any, id: any, res: Response) {
     return;
   }
 
-  // Log the interaction
-  interactionLogger.log("view", {
-    agentId,
-    metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
-  });
+  // Log the interaction: not for our own traffic or a probe (slice I-Z,
+  // searchCountable), as its REST twin GET /api/marketplace/agents/:id/info.
+  if (searchCountable({ meta: buildRequestMeta(req) })) {
+    interactionLogger.log("view", {
+      agentId,
+      metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
+    });
+  }
 
   res.json({
     jsonrpc: "2.0",
@@ -617,6 +757,22 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
 });
 
 // GET /agents/:id/agent.json — Individual producer Agent Card (enriched with knowledge)
+//
+// SEED STORE ONLY. agentCardService.generateCard() reads the legacy in-memory
+// store (services/store.ts), not the marketplace registry, and that store is
+// filled only by seedData() on an empty database (index.ts). In production it
+// is empty, so this route answers 404 for every marketplace producer (the
+// lokal#1114 review measured 500 of 500), and the `producers` list of
+// /.well-known/agent-card.json above, built from the same store, is empty too.
+// Integration test 2026-10-17, slice I-H (FUNN a2a-produsent-agent-json-404)
+// checked that no discovery surface points here: llms.txt, llms-full.txt,
+// openapi.json and /.well-known/agent-card.json do not, and the search and
+// discover answers give /api/marketplace/agents/:id/card as card_url /
+// agentCardUrl. That route already builds the per-producer card from
+// marketplaceRegistry.getAgentCard() with the knowledge fields, so this one
+// is left as it is. Before linking this path from a discovery surface, build
+// it the same way. (rfb-apningstider-normaliserer.test.ts fails if a
+// non-test source file links it.)
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   // Same public by-id gate as /api/marketplace/agents/:id/card (dev-request
   // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt): 404 like an unknown id
@@ -656,7 +812,10 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       email: knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,
-      products: knowledge.products?.map((p: any) => ({
+      // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
+      // text, `products?.map` threw, and so did `p.name` on a null product;
+      // it is read in getAgentInfo's fixed shape (productEntries).
+      products: productEntries(knowledge.products).map((p: any) => ({
         name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
         price: p.price, priceUnit: p.priceUnit,
       })),
@@ -665,8 +824,9 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,
       deliveryRadius: knowledge.deliveryRadius,
-      googleRating: knowledge.googleRating,
-      googleReviewCount: knowledge.googleReviewCount,
+      // No googleRating/googleReviewCount: passing Google's rating on is
+      // "reshare" under its Places terms (dev-request 2026-10-16-rfb-
+      // strukturerte-data-tredjepartsrating-og-places-treffvakt, S4-A1a).
       externalLinks: knowledge.externalLinks,
       seasonality: knowledge.seasonality,
       about: safeAbout,
@@ -975,6 +1135,12 @@ router.post("/api/conversations/:id/complete", (req: Request, res: Response) => 
 
 // GET /api/agents/:id/metrics — Seller dashboard data
 router.get("/api/agents/:id/metrics", (req: Request, res: Response) => {
+  // Shared by-id visibility predicate (agent-visibility.ts; flag-gated — off =
+  // served for any id, as before): an inactive/hidden agent is 404 like an unknown id.
+  if (!isAgentIdPubliclyVisible(getDb(), req.params.id as string, { surface: "ungated" })) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
   const metrics = conversationService.getAgentMetrics(req.params.id as string);
   res.json({ success: true, data: metrics });
 });

@@ -1,10 +1,22 @@
 name: Publish to MCP Registry
 
 # Triggers:
-#   1. workflow_dispatch — manual one-shot re-publish without bumping version (e.g. after description fix)
+#   1. workflow_dispatch — manual one-shot re-publish without bumping version (e.g. after description fix).
+#      Optional input `only` limits the run to some servers (comma-separated: directory, npm package or registry name).
 #   2. push to tags matching v* — auto-publish on every npm-style version tag (v0.4.1, v0.5.0, ...)
+#
+# Servers come from the glob mcp-server*/server.json, so a new vertical needs no change here.
+# Per server: if the npm version named in server.json is not on npm yet, the server is skipped
+# with a notice (the registry validates that the npm package exists). One failing server never
+# stops the others; the summary lists each as published, skipped or failed, and the job ends red
+# only if at least one server failed.
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: 'Only these servers (comma-separated: directory, npm package or registry name). Empty = all.'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -26,69 +38,124 @@ jobs:
             | tar -xz mcp-publisher
           chmod +x mcp-publisher
 
-      # Servers published by this workflow: local dir <-> registry search name, in lockstep.
-      # Add a dir to SERVER_DIRS and its search name at the same index in SERVER_NAMES
-      # to onboard another server.json.
-      - name: Validate all server.json manifests
-        run: |
-          set -e
-          SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
-          for dir in "${SERVER_DIRS[@]}"; do
-            echo "== Validating $dir/server.json =="
-            ./mcp-publisher validate "./$dir/server.json"
-          done
-
       - name: Authenticate via GitHub OIDC
         run: ./mcp-publisher login github-oidc
 
-      - name: Publish all servers to MCP Registry
+      - name: Publish servers to MCP Registry
+        env:
+          ONLY: ${{ github.event.inputs.only }}
         run: |
-          set -e
-          SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
-          for dir in "${SERVER_DIRS[@]}"; do
-            echo "== Publishing $dir/server.json =="
-            set +e
-            OUTPUT=$(./mcp-publisher publish "./$dir/server.json" 2>&1)
+          # GitHub runs this step with `bash -e`. Turn errexit off so every server is tried and a
+          # failed or duplicate publish is handled below instead of ending the step.
+          set +e
+          set -u
+          SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          FAILED=0
+          {
+            echo "## MCP Registry publish"
+            echo
+            echo "| Server | Version | Result |"
+            echo "|---|---|---|"
+          } >> "$SUMMARY"
+
+          row() { echo "| $1 | $2 | $3 |" >> "$SUMMARY"; }
+
+          selected() {
+            # $1 dir, $2 npm package, $3 registry name
+            [ -z "${ONLY// /}" ] && return 0
+            local item
+            IFS=',' read -ra ITEMS <<< "$ONLY"
+            for item in "${ITEMS[@]}"; do
+              item="$(echo "$item" | xargs)"
+              [ -n "$item" ] || continue
+              if [ "$item" = "$1" ] || [ "$item" = "$2" ] || [ "$item" = "$3" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          verify() {
+            # $1 registry name, $2 expected version. 200 with an empty list is a retry, not a failure.
+            local name="$1" expected="$2" attempt body latest
+            for attempt in 1 2 3; do
+              body="$(curl -fsS "https://registry.modelcontextprotocol.io/v0.1/servers?search=${name}&version=latest" 2>/dev/null || true)"
+              latest="$(printf '%s' "$body" | jq -r --arg n "$name" '[.servers[]? | select(.server.name == $n and ._meta["io.modelcontextprotocol.registry/official"].isLatest == true)] | first | .server.version // empty' 2>/dev/null || true)"
+              if [ -n "$latest" ]; then
+                if [ "$latest" = "$expected" ]; then
+                  echo "OK: registry latest for $name is v$latest"
+                  return 0
+                fi
+                echo "Attempt $attempt: registry latest is v$latest, expected v$expected"
+              else
+                echo "Attempt $attempt: no isLatest entry for $name yet"
+              fi
+              sleep 5
+            done
+            return 1
+          }
+
+          shopt -s nullglob
+          MANIFESTS=(mcp-server*/server.json)
+          if [ "${#MANIFESTS[@]}" -eq 0 ]; then
+            echo "::error::No mcp-server*/server.json found"
+            exit 1
+          fi
+
+          for manifest in "${MANIFESTS[@]}"; do
+            dir="$(dirname "$manifest")"
+            name="$(jq -r '.name' "$manifest")"
+            version="$(jq -r '.version' "$manifest")"
+            pkg="$(jq -r '[.packages[]? | select(.registryType == "npm")] | first | .identifier // empty' "$manifest")"
+            pkgver="$(jq -r '[.packages[]? | select(.registryType == "npm")] | first | .version // empty' "$manifest")"
+            echo "== $dir ($name $version, npm ${pkg:-none}@${pkgver:-none}) =="
+
+            if ! selected "$dir" "$pkg" "$name"; then
+              echo "Not selected by input 'only', skipping"
+              row "$name" "$version" "skipped (not selected)"
+              continue
+            fi
+
+            if [ -n "$pkg" ]; then
+              if ! npm view "${pkg}@${pkgver}" version >/dev/null 2>&1; then
+                echo "::notice::${pkg}@${pkgver} is not on npm yet, skipping $name"
+                row "$name" "$version" "skipped (${pkg}@${pkgver} not on npm)"
+                continue
+              fi
+            fi
+
+            if ! ./mcp-publisher validate "./$manifest"; then
+              echo "::error::server.json validation failed for $dir"
+              row "$name" "$version" "FAILED (validate)"
+              FAILED=1
+              continue
+            fi
+
+            OUTPUT="$(./mcp-publisher publish "./$manifest" 2>&1)"
             STATUS=$?
-            set -e
             echo "$OUTPUT"
             if [ "$STATUS" -ne 0 ]; then
               if echo "$OUTPUT" | grep -q "cannot publish duplicate version"; then
-                echo "== $dir/server.json already published at this version, skipping =="
-              else
-                echo "== ERROR: publish failed for $dir/server.json (exit $STATUS) =="
-                exit 1
+                echo "$name v$version already published, skipping"
+                row "$name" "$version" "skipped (already published)"
+                continue
               fi
+              echo "::error::publish failed for $dir (exit $STATUS)"
+              row "$name" "$version" "FAILED (publish)"
+              FAILED=1
+              continue
+            fi
+
+            if verify "$name" "$version"; then
+              row "$name" "$version" "published"
+            else
+              echo "::error::published $name but the registry does not show v$version as latest"
+              row "$name" "$version" "FAILED (verify)"
+              FAILED=1
             fi
           done
 
-      - name: Verify publication (all servers)
-        run: |
-          set -e
-          SERVER_DIRS=(mcp-server mcp-server-opplevagent mcp-server-dental)
-          SERVER_NAMES=(io.github.slookisen/lokal-mcp io.github.slookisen/opplevagent-mcp io.github.slookisen/finn-tannlege-mcp)
-          sleep 5
-          for i in "${!SERVER_DIRS[@]}"; do
-            dir="${SERVER_DIRS[$i]}"
-            name="${SERVER_NAMES[$i]}"
-            echo "== Verifying $name ($dir/server.json) =="
-            curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=${name}" \
-              | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          latest = next((s for s in data.get('servers', []) if s['_meta']['io.modelcontextprotocol.registry/official'].get('isLatest')), None)
-          if latest:
-              v = latest['server']['version']
-              print(f'Latest in registry: v{v}')
-              with open('${dir}/server.json') as f:
-                  expected = json.load(f)['version']
-              if v == expected:
-                  print('✅ Registry matches local server.json version')
-              else:
-                  print(f'⚠️  Mismatch: registry={v}, expected={expected}')
-                  sys.exit(1)
-          else:
-              print('❌ No isLatest entry found')
-              sys.exit(1)
-          "
-          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "One or more servers failed, see the summary"
+            exit 1
+          fi

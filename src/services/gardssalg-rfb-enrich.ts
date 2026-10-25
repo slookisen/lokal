@@ -416,8 +416,7 @@ export function pickEnrichmentFields(
   // already-shipped, already-reviewed isGardssalgFieldOwnerLocked helper the
   // other gårdssalg writers (3a-3j) gate on; no new policy logic, only wiring.
   // Always false for any content_source other than 'claim'.
-  const isFieldOwnerLocked = (fieldName: string): boolean =>
-    provider.content_source === "claim" && isGardssalgFieldOwnerLocked(provider, fieldName);
+  const isFieldOwnerLocked = (fieldName: string): boolean => isGardssalgFieldOwnerLocked(provider, fieldName);
 
   // 1) Strict website-domain match (strongest signal).
   const providerDomain = normalizeDomain(provider.hjemmeside);
