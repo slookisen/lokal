@@ -33,6 +33,7 @@ import { COMPANY_INFO } from "../config/company-info";
 import { BRAND_ENTITIES } from "../config/brand-entities";
 import { companyVatStatus, organizationJsonLd } from "../services/company-legal";
 import { getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { TRAFFIC_YEAR_KEYS, trafficYearPeriodLabel, type TrafficYearCount, type TrafficYearKey } from "../services/traffic-year-compute";
 import { getAgentToolCallsSnapshot } from "../services/agent-usage";
 import { jsonLdScriptTag } from "../services/safe-script-json";
 
@@ -167,14 +168,12 @@ export type ServiceCounts = Record<CatalogVertical, number | null>;
 
 export interface TrafficReading {
   /**
-   * Visits by people: a new visit after 30 minutes without a page view
-   * (traffic-report.ts). The tile used to sum realVisitors — unique IP +
-   * browser pairs — under the label «besøk» (dev-request
-   * 2026-10-13-statistikk-riktig-for-investorer, S5).
+   * The service's 12-month block: the five numbers of its strip with their
+   * start dates (traffic-year-compute.ts, dev-request
+   * 2026-10-22-statistikk-samme-tall-12-mnd, S2). null while not computed.
+   * The tiles used to show 60-day humanVisits / aiCrawlerViews.
    */
-  humanVisits: number;
-  aiCrawlerViews: number;
-  windowDays: number;
+  year: Record<TrafficYearKey, TrafficYearCount> | null;
   /** When the figures were computed (epoch ms). */
   computedAt?: number;
 }
@@ -199,10 +198,9 @@ function defaultReadTraffic(v: CatalogVertical): TrafficReading | null {
   try {
     const snap = getTrafficStatsSnapshot(v);
     if (!snap.ready) return null;
+    const y = snap.stats.year;
     return {
-      humanVisits: snap.stats.humanVisits,
-      aiCrawlerViews: snap.stats.aiCrawlerViews,
-      windowDays: snap.stats.windowDays,
+      year: y ? { humanVisits: y.humanVisits, humanViews: y.humanViews, aiSearch: y.aiSearch, aiCrawlerViews: y.aiCrawlerViews, aiDeliveries: y.aiDeliveries } : null,
       computedAt: snap.computedAt,
     };
   } catch {
@@ -225,9 +223,13 @@ function defaultReadAgentCalls(): AgentCallReading | null {
 // and 0 is treated as "no data", never printed.
 export interface PlatformMetrics {
   catalogTotal: number | null;
-  humanVisits: number | null;
-  aiCrawlerViews: number | null;
-  trafficWindowDays: number | null;
+  /**
+   * The strips' five numbers over the last 12 months, summed over the three
+   * services; null per number unless all three report it and the sum is > 0.
+   * since: the latest of the three start dates (the first day every service
+   * has data for), null when all three cover the whole 12 months.
+   */
+  year: Record<TrafficYearKey, TrafficYearCount | null>;
   agentToolCalls: number | null;
   agentWindowDays: number | null;
   /**
@@ -247,24 +249,26 @@ export function collectPlatformMetrics(
   const catalog = verticals.map((v) => counts[v]);
   const catalogTotal = catalog.every((n) => n != null) ? catalog.reduce((a: number, n) => a + (n as number), 0) : null;
   const traffic = verticals.map((v) => deps.readTraffic(v));
-  const allTraffic = traffic.every((t) => t != null) ? (traffic as TrafficReading[]) : null;
-  const humanVisits = allTraffic ? allTraffic.reduce((a, t) => a + t.humanVisits, 0) : null;
-  const aiCrawlerViews = allTraffic ? allTraffic.reduce((a, t) => a + t.aiCrawlerViews, 0) : null;
-  const windows = allTraffic ? new Set(allTraffic.map((t) => t.windowDays)) : null;
-  const trafficWindowDays = windows && windows.size === 1 ? [...windows][0] : null;
+  const allTraffic = traffic.every((t) => t != null && t.year != null) ? (traffic as TrafficReading[]) : null;
   const agent = deps.readAgentCalls();
   const positive = (n: number | null) => (n != null && Number.isFinite(n) && n > 0 ? n : null);
+  const year = {} as Record<TrafficYearKey, TrafficYearCount | null>;
+  for (const key of TRAFFIC_YEAR_KEYS) {
+    const parts = allTraffic ? allTraffic.map((t) => t.year![key]) : null;
+    const ok = parts && parts.every((c) => c && typeof c.value === "number" && Number.isFinite(c.value));
+    const value = ok ? positive(parts!.reduce((a, c) => a + c.value, 0)) : null;
+    const sinces = ok ? parts!.map((c) => c.since).filter((s): s is string => typeof s === "string") : [];
+    year[key] = value == null ? null : { value, since: sinces.length ? sinces.reduce((a, b) => (b > a ? b : a)) : null };
+  }
   const metrics: PlatformMetrics = {
     catalogTotal: positive(catalogTotal),
-    humanVisits: trafficWindowDays ? positive(humanVisits) : null,
-    aiCrawlerViews: trafficWindowDays ? positive(aiCrawlerViews) : null,
-    trafficWindowDays,
+    year,
     agentToolCalls: agent ? positive(agent.toolCalls) : null,
     agentWindowDays: agent ? agent.windowDays : null,
   };
   const stamps: Array<number | null | undefined> = [];
   if (metrics.catalogTotal != null) stamps.push(countsComputedAt);
-  if (metrics.humanVisits != null || metrics.aiCrawlerViews != null) stamps.push(...(allTraffic ?? []).map((t) => t.computedAt));
+  if (TRAFFIC_YEAR_KEYS.some((k) => metrics.year[k] != null)) stamps.push(...(allTraffic ?? []).map((t) => t.computedAt));
   if (metrics.agentToolCalls != null) stamps.push(agent?.computedAt);
   const known = stamps.every((t) => typeof t === "number" && Number.isFinite(t));
   metrics.updatedAt = stamps.length && known ? Math.min(...(stamps as number[])) : null;
@@ -375,13 +379,16 @@ const T = {
     pMetricsKicker: "Plattformen i tall",
     pMetricsTitle: "Bruk vi kan dokumentere",
     pMetricsLead:
-      "Tallene hentes automatisk fra plattformens egen statistikk og gjelder Rett fra Bonden, Opplevagent og Finn-tannlege samlet. Besøk, sidevisninger og kall er rundet ned.",
+      "Tallene hentes automatisk fra plattformens egen statistikk og gjelder Rett fra Bonden, Opplevagent og Finn-tannlege samlet. Det er de samme tallene som nederst på forsidene, for de siste 12 månedene eller fra datoen under tallet når tellingen er yngre. Alle tall unntatt katalogen er rundet ned.",
     mCatalogLabel: "oppføringer i katalogene",
     mCatalogDef: "Aktive, publiserte oppføringer akkurat nå.",
-    mHumanLabel: (d: number) => `besøk fra mennesker siste ${d} dager`,
-    mHumanDef: "Besøk fra mennesker: et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. Roboter, crawlere, søkemotorer og AI er ikke med.",
-    mCrawlerLabel: (d: number) => `sidevisninger fra AI-crawlere siste ${d} dager`,
-    mCrawlerDef: "Sidevisninger fra kjente KI-crawlere, som GPTBot og ClaudeBot.",
+    mYear: {
+      humanVisits: { label: "Besøk fra mennesker", def: "Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. Roboter, crawlere, søkemotorer og AI er ikke med." },
+      humanViews: { label: "Sidevisninger fra mennesker", def: "Sider som ble vist for mennesker. Roboter, crawlere, søkemotorer og AI er ikke med." },
+      aiSearch: { label: "AI-søk", def: "Sider AI-assistenter som ChatGPT og Claude hentet for noen, pluss AI-agenters oppslag via MCP og A2A." },
+      aiCrawlerViews: { label: "AI-crawlere", def: "Sidevisninger fra kjente KI-crawlere, som GPTBot og ClaudeBot." },
+      aiDeliveries: { label: "Med i AI-søk", def: "Ganger en produsent, klinikk eller tilbyder var blant treffene en AI-assistent hentet, summert over alle profiler." },
+    } as Record<TrafficYearKey, { label: string; def: string }>,
     mAgentLabel: (d: number) => `verktøykall fra AI-agenter siste ${d} dager`,
     mAgentDef: "Kall til verktøyene våre via MCP: søk, oppslag, handlekurv og bestilling. Oppkobling, verktøylister, egne agenter og kjente register- og overvåkingsprober er holdt utenfor.",
     pStepsKicker: "Slik samarbeider vi",
@@ -533,13 +540,16 @@ const T = {
     pMetricsKicker: "The platform in figures",
     pMetricsTitle: "Usage we can document",
     pMetricsLead:
-      "The figures come automatically from the platform's own statistics and cover Rett fra Bonden, Opplevagent and Finn-tannlege together. Visits, page views and calls are rounded down.",
+      "The figures come automatically from the platform's own statistics and cover Rett fra Bonden, Opplevagent and Finn-tannlege together. They are the same figures as at the bottom of the front pages, for the last 12 months or from the date under the figure when the count is younger. All figures except the catalogue are rounded down.",
     mCatalogLabel: "listings in the directories",
     mCatalogDef: "Active, published listings right now.",
-    mHumanLabel: (d: number) => `visits from people in the last ${d} days`,
-    mHumanDef: "Visits by people: a visit is a series of page views by one visitor with no break longer than 30 minutes. Bots, crawlers, search engines and AI are not included.",
-    mCrawlerLabel: (d: number) => `page views by AI crawlers in the last ${d} days`,
-    mCrawlerDef: "Page views by known AI crawlers, such as GPTBot and ClaudeBot.",
+    mYear: {
+      humanVisits: { label: "Visits by people", def: "A visit is a series of page views by one visitor with no break longer than 30 minutes. Bots, crawlers, search engines and AI are not included." },
+      humanViews: { label: "Page views by people", def: "Pages shown to people. Bots, crawlers, search engines and AI are not included." },
+      aiSearch: { label: "AI search", def: "Pages AI assistants such as ChatGPT and Claude fetched for someone, plus AI agents' lookups over MCP and A2A." },
+      aiCrawlerViews: { label: "AI crawlers", def: "Page views by known AI crawlers, such as GPTBot and ClaudeBot." },
+      aiDeliveries: { label: "In AI searches", def: "Times a producer, clinic or provider was among the results an AI assistant fetched, summed over all profiles." },
+    } as Record<TrafficYearKey, { label: string; def: string }>,
     mAgentLabel: (d: number) => `tool calls from AI agents in the last ${d} days`,
     mAgentDef: "Calls to our tools over MCP: search, lookup, cart and ordering. Connection set-up, tool listings, our own agents and known registry and monitoring probes are excluded.",
     pStepsKicker: "How we work",
@@ -890,6 +900,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",mo
 .metric{display:flex;flex-direction:column;gap:6px;padding:24px;border:1px solid var(--band-line);border-radius:var(--radius);background:rgba(255,255,255,.03)}
 .metric strong{font-size:34px;letter-spacing:-.03em;font-weight:650;color:#fff;font-variant-numeric:tabular-nums}
 .metric .m-label{color:var(--band-ink);font-weight:550}
+.metric .m-period{color:var(--band-muted);font-size:13px;margin-top:-4px}
 .metric .m-def{color:var(--band-muted);font-size:14px;line-height:1.5}
 .m-updated{margin-top:20px;color:var(--band-muted);font-size:14px}
 .steps{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);gap:20px;counter-reset:none}
@@ -1187,13 +1198,15 @@ function mailtoHref(subject: string): string {
 export function renderPartners(lang: Lang, metrics: PlatformMetrics): string {
   const t = T[lang];
   const tiles: string[] = [];
-  const tile = (value: string, label: string, def: string) =>
-    `<div class="metric"><strong>${value}</strong><span class="m-label">${esc(label)}</span><span class="m-def">${esc(def)}</span></div>`;
+  const tile = (value: string, label: string, def: string, period?: string) =>
+    `<div class="metric"><strong>${value}</strong><span class="m-label">${esc(label)}</span>${period ? `<span class="m-period">${esc(period)}</span>` : ""}<span class="m-def">${esc(def)}</span></div>`;
   if (metrics.catalogTotal != null) tiles.push(tile(formatCount(metrics.catalogTotal), t.mCatalogLabel, t.mCatalogDef));
-  if (metrics.humanVisits != null && metrics.trafficWindowDays != null)
-    tiles.push(tile(`${formatCount(floorForTile(metrics.humanVisits))}+`, t.mHumanLabel(metrics.trafficWindowDays), t.mHumanDef));
-  if (metrics.aiCrawlerViews != null && metrics.trafficWindowDays != null)
-    tiles.push(tile(`${formatCount(floorForTile(metrics.aiCrawlerViews))}+`, t.mCrawlerLabel(metrics.trafficWindowDays), t.mCrawlerDef));
+  // The strips' five numbers and names, each with «siste 12 måneder» or «siden <dato>».
+  for (const key of TRAFFIC_YEAR_KEYS) {
+    const c = metrics.year[key];
+    if (c == null) continue;
+    tiles.push(tile(`${formatCount(floorForTile(c.value))}+`, t.mYear[key].label, t.mYear[key].def, trafficYearPeriodLabel(c.since, lang === "en" ? "en" : "nb")));
+  }
   if (metrics.agentToolCalls != null && metrics.agentWindowDays != null)
     tiles.push(tile(`${formatCount(floorForTile(metrics.agentToolCalls))}+`, t.mAgentLabel(metrics.agentWindowDays), t.mAgentDef));
 

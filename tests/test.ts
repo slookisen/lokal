@@ -44480,6 +44480,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2b (admin part): the
+  // dashboard's five cards with one site + «Siste år» are the strip's numbers
+  // from the same snapshot; no «AI-visninger»; «Søk (nettsider og API)»; «Alle»
+  // is not a sum. Swaps getDb() and the dental / experiences handles, so serial.
+  console.log("\n── admin-year: admin and the strips, same numbers ──");
+  try {
+    const { runAdminYearSameNumbersTests } = require("../src/services/admin-year-same-numbers.test") as
+      typeof import("../src/services/admin-year-same-numbers.test");
+    const r = await runAdminYearSameNumbersTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-year: " + f);
+    console.log(`  admin-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`admin-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ admin-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-14-med-i-ai-svar-per-profil, S2: the same counting for
   // finn-tannlege and opplevagent (incl. gårdssalg). Swaps getDb() and the
   // dental / experiences db handles (restored in finally), so serial.
