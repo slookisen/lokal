@@ -143,11 +143,14 @@ jobs:
           # (github.sha is main HEAD there, so freshness compares main HEAD).
 
       # Deploy-window decision. Deploy NOW only for: PR merged by Daniel
-      # (slookisen), PR label deploy-nå, a Revert commit, manual dispatch.
-      # Otherwise wait for the 10/14/19 UTC schedule run. The fleet gate
-      # (fleet-auto-approve.yml) merges as github-actions[bot], so fleet merges
-      # wait for the window. PR lookup failure fails OPEN (deploys, with a
-      # warning), like the freshness check. Logic: scripts/deploy-window-decision.sh
+      # (slookisen), PR label deploy-nå, a Revert commit, manual dispatch by a
+      # human. Otherwise wait for the 10/14/19 UTC schedule run. The fleet gate
+      # (fleet-auto-approve.yml) merges under GITHUB_TOKEN (no push event) and
+      # then dispatches this workflow; that dispatch has actor
+      # github-actions[bot] and is NOT manual: the PR lookup runs for it too and
+      # it is judged like a push of the same commit, so fleet merges wait for
+      # the window. PR lookup failure fails OPEN (deploys, with a warning), like
+      # the freshness check. Logic: scripts/deploy-window-decision.sh
       # (tested by scripts/test-deploy-window-decision.sh).
       - name: Decide deploy now or wait for window
         id: decide
@@ -160,7 +163,7 @@ jobs:
           set -u
           SUBJECT=$(git log -1 --format=%s "$THIS_SHA" 2>/dev/null || true)
           PR_LOOKUP=ok; PR_COUNT=0; PR_MERGED_BY=""; PR_LABELS=""
-          if [ "$EVENT" = "push" ]; then
+          if [ "$EVENT" = "push" ] || { [ "$EVENT" = "workflow_dispatch" ] && [ "$ACTOR" = "github-actions[bot]" ]; }; then
             if PRS=$(gh api "repos/${{ github.repository }}/commits/${THIS_SHA}/pulls" 2>/dev/null) \
                && PR_DETAIL=$(for n in $(echo "$PRS" | jq -r '.[].number'); do gh api "repos/${{ github.repository }}/pulls/$n"; done | jq -s '.'); then
               PR_COUNT=$(echo "$PR_DETAIL" | jq 'length')

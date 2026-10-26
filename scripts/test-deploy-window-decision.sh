@@ -18,9 +18,20 @@ t "direct push other noPR"  false EVENT=push PR_LOOKUP=ok PR_COUNT=0 ACTOR=someo
 t "Daniel pushes but PR by bot" false $P ACTOR=slookisen PR_MERGED_BY=github-actions[bot]
 t "API failure fail-open"   true  EVENT=push PR_LOOKUP=failed SUBJECT=x
 t "manual dispatch"         true  EVENT=workflow_dispatch
+B="EVENT=workflow_dispatch ACTOR=github-actions[bot] PR_LOOKUP=ok PR_COUNT=1 SUBJECT=feat:x"
+t "bot dispatch fleet waits"   false $B PR_MERGED_BY=github-actions[bot] PR_LABELS=fleet
+t "bot dispatch revert"        true  EVENT=workflow_dispatch ACTOR=github-actions[bot] PR_LOOKUP=ok PR_COUNT=1 'SUBJECT=Revert "x"' PR_MERGED_BY=github-actions[bot]
+t "bot dispatch Daniel-merged" true  $B PR_MERGED_BY=slookisen
+t "bot dispatch deploy-nå"     true  $B PR_MERGED_BY=github-actions[bot] PR_LABELS=deploy-nå
+t "bot dispatch lookup failed" true  EVENT=workflow_dispatch ACTOR=github-actions[bot] PR_LOOKUP=failed SUBJECT=x
+t "bot dispatch no PR waits"   false EVENT=workflow_dispatch ACTOR=github-actions[bot] PR_LOOKUP=ok PR_COUNT=0 SUBJECT=x
+t "human dispatch (Daniel)"    true  EVENT=workflow_dispatch ACTOR=slookisen
+t "dispatch empty actor"       true  EVENT=workflow_dispatch ACTOR=
 t "schedule equal SHA"      false EVENT=schedule NOW_HHMM=1400 LIVE_SHA=abc THIS_SHA=abc
 t "schedule unequal SHA"    true  EVENT=schedule NOW_HHMM=1400 LIVE_SHA=abc THIS_SHA=def
 t "schedule live unknown"   true  EVENT=schedule NOW_HHMM=1900 LIVE_SHA= THIS_SHA=def
 t "schedule in send window" false EVENT=schedule NOW_HHMM=0800 LIVE_SHA=abc THIS_SHA=def
 t "schedule 10:00 ok"       true  EVENT=schedule NOW_HHMM=1000 LIVE_SHA=abc THIS_SHA=def
+t "schedule NOW_HHMM junk"  true  EVENT=schedule NOW_HHMM=xx LIVE_SHA=abc THIS_SHA=abc
+t "schedule NOW_HHMM empty" true  EVENT=schedule LIVE_SHA=abc THIS_SHA=abc
 exit $fail
