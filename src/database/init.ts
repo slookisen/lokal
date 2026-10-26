@@ -4062,9 +4062,12 @@ function initSchema(db: Database.Database): void {
   //   agents.order_notifications_opt_in : send-gate. 0 (default) = NEVER
   //       notify this producer about orders. Only an explicit admin action
   //       (POST /admin/orders/notification-optin) flips it to 1.
-  //   agents.order_notification_email   : admin-set override recipient. When
-  //       set, it wins over contact_email AND counts as "verified contact"
-  //       (an admin explicitly chose it — this is how Daniel points a test
+  //   agents.order_notification_email   : override recipient, admin-set OR
+  //       owner-confirmed (S1b punkt 7: a verified owner requests it and it
+  //       is written only after the link mailed to the new address is used —
+  //       routes/owner-portal.ts). When set, it wins over contact_email AND
+  //       counts as "verified contact" (an admin explicitly chose it, or the
+  //       owner proved control of it — this is also how Daniel points a test
   //       agent at his own inbox, mirroring the booking test-provider
   //       pattern). When NULL, contact_email is used and the agent must be
   //       verification_status='verified' in agent_knowledge.
@@ -5371,6 +5374,37 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration owner_profile_pause failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 7 ───────
+  // Owner-requested change of agents.order_notification_email, pending until
+  // the confirmation link sent to the NEW address is clicked. Only the sha256
+  // of the token is stored. requested_at / expires_at / consumed_at are all
+  // ISO-8601 (Date#toISOString) and compared only against ISO strings.
+  // outcome: NULL = pending; 'confirmed' | 'superseded' | 'send_failed'.
+  // owner_basis: fingerprint of the ownership basis at request time
+  // (claimed_at/claimed_via + verified claim ids); confirm requires it to be
+  // unchanged, so a token never survives an ownership reset or re-claim.
+  // Read/written only by routes/owner-portal.ts while OWNER_ORDER_EMAIL_ENABLED
+  // is on. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_order_email_change (
+        token_hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        new_email TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        outcome TEXT,
+        requested_by TEXT,
+        owner_basis TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_order_email_change_agent
+        ON owner_order_email_change(agent_id, requested_at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_order_email_change failed:", err);
   }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
