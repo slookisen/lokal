@@ -86,6 +86,7 @@ import {
 } from "./services/rfb-enrichment-nightly";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
+import adminSecondLineJudgePreviewRoutes from "./routes/admin-second-line-judge-preview";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { parseRoutines, runDispatchTick } from "./routes/admin-loop-dispatch";
 import { resolveTickIntervalMin } from "./services/loop-dispatch";
@@ -952,6 +953,9 @@ app.use("/admin/rfb-marketing-daily-run", adminLimiter, rfbMarketingDailyRunRout
 // services/rfb-enrichment-nightly.ts; the night tick is further down.
 app.use("/admin/rfb-enrichment-nightly", adminLimiter, rfbEnrichmentNightlyRouter);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
+// dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-kontaktuttrekk
+// (skive 1): read-only shadow preview of the second-line judge WITH own-website evidence.
+app.use("/admin/second-line-judge-preview", adminLimiter, adminSecondLineJudgePreviewRoutes);
 app.use("/admin/run-dental-verifier", adminLimiter, adminRunDentalVerifierRoutes);
 // P1 server-migration: deterministic loop watchdog — liveness from the
 // run-ledger; ?alert=1 emails when a watcher is silent.
