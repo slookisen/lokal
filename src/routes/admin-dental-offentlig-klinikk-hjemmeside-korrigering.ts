@@ -87,12 +87,12 @@ function requireAdmin(req: Request, res: Response): boolean {
 }
 
 // Hard per-call cap on how many candidate rows are actually run through
-// discovery in a single POST. Deliberately mirrors DENTAL_WD_BATCH_CAP (25,
-// admin-dental-hjemmeside-discovery.ts) rather than HJEMMESIDE_CLEANUP_
+// discovery in a single POST. Deliberately kept at 25, the value DENTAL_WD_BATCH_CAP
+// (admin-dental-hjemmeside-discovery.ts) had before A6-K, rather than HJEMMESIDE_CLEANUP_
 // BATCH_CAP (200, admin-dental-hjemmeside-cleanup.ts): like that route (and
 // unlike the pure-SQL cleanup sweep), each candidate here can trigger a real
 // Brreg lookup, a page fetch, and possibly a Brave search call — the same
-// per-row network cost the discovery batch route already caps at 25/call
+// per-row network cost the discovery batch route caps per call
 // for exactly this wall-clock reason.
 export const OFFENTLIG_KLINIKK_KORRIGERING_BATCH_CAP = 25;
 

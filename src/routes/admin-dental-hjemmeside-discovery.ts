@@ -134,10 +134,11 @@ export function ensureDentalWebsiteReviewQueueTable(db: ReturnType<typeof getDb>
 }
 
 // Single cap used both as the auto-select LIMIT and as the max length of an
-// explicit agentIds override array — mirrors the dev-request's own "batch
-// cap of 25/call" framing (a single number, unlike RFB's separate default/
-// hard-cap pair).
-export const DENTAL_WD_BATCH_CAP = 25;
+// explicit agentIds override array (a single number, unlike RFB's separate
+// default/hard-cap pair). Raised from 25 to 40 in A6-K so the name search gets
+// a larger per-run quota; clinics are processed sequentially, so keep this
+// moderate (see the A6-K commit message for the wall-clock/Brave reasoning).
+export const DENTAL_WD_BATCH_CAP = 40;
 
 // Approve route's own cap — mirrors RFB's rfb-website-review-approve (200
 // approvals/call) and the dev-request's explicit instruction.
@@ -147,7 +148,7 @@ const DENTAL_WD_USER_AGENT = "Lokal-Dental-WebsiteDiscovery/1.0";
 
 // Deliberately below render-page.ts's DEFAULT_RENDER_TIMEOUT_MS (20s), same
 // reasoning as RFB_WD_RENDER_TIMEOUT_MS (admin-rfb-website-discovery.ts): a
-// single discovery call can walk up to DENTAL_WD_BATCH_CAP (25) candidates,
+// single discovery call can walk up to DENTAL_WD_BATCH_CAP candidates,
 // each potentially triggering one render escalation — a smaller per-render
 // bound caps that worst-case wall-clock without touching render-page.ts's
 // own tested default for other, non-batched callers.
