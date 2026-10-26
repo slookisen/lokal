@@ -58,7 +58,8 @@ import { isPlausibleNorwayCoord } from "../services/geo-distance";
 import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
-import { isPaymentsEnabled, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
+import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
+import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExtras } from "../services/buyer-order-actions";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 
@@ -700,6 +701,10 @@ export function registerTools(
   // Read once per server build (one per MCP session): decides the
   // lokal_cart_submit description/schema below (prepayment, skive 2).
   const paymentsOn = isPaymentsEnabled();
+  // Fase B1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // the buyer's order tools and the extra lokal_order_status fields, read once
+  // per session like paymentsOn. Off (default): the contract is unchanged.
+  const agentActionsOn = isOrderAgentActionsEnabled();
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // producers a data tool hands the caller, counted per profile with the
@@ -1863,9 +1868,82 @@ export function registerTools(
     },
     guardToolHandler("lokal_order_status", async ({ order_id, buyer_ref }) => {
       const result = svcGetOrder(order_id, buyer_ref);
-      return { content: [{ type: "text" as const, text: cartResultText("lokal_order_status", result) }] };
+      // Fase B1: additive fields, only while ORDER_AGENT_ACTIONS_ENABLED is on.
+      const out = agentActionsOn && result.success ? { ...result, ...buyerOrderStatusExtras(order_id) } : result;
+      return { content: [{ type: "text" as const, text: cartResultText("lokal_order_status", out) }] };
     })
   );
+
+  // Tools 15–16 (Fase B1): the buyer's own actions on an order. Registered
+  // ONLY with ORDER_AGENT_ACTIONS_ENABLED on — off, tools/list is unchanged.
+  if (agentActionsOn) {
+    const buyerOrderInput = {
+      order_id:        z.string().describe("Order ID from lokal_cart_submit"),
+      buyer_ref:       z.string().describe("Buyer capability token (same as used for the cart)"),
+      idempotency_key: z.string().max(120).optional().describe("Optional key (A-Z, a-z, 0-9, ':', '_', '.', '-'). Repeating a call with the same key returns the first result without a second change."),
+    };
+    const buyerPayments = () => (isPaymentsLifecycleActive() ? resolvePaymentsStripeClient() : null);
+    const actionsOffResult = () => ({
+      content: [{ type: "text" as const, text: JSON.stringify({ success: false, status: 404, error: "This tool is not available" }) }],
+    });
+
+    // Tool 15: Cancel an order (the buyer's withdraw / cancel)
+    server.registerTool(
+      "lokal_order_cancel",
+      {
+        title: "Cancel a pickup order",
+        description: "Cancel a pickup order placed with lokal_cart_submit, on the buyer's behalf. Requires the order_id and the buyer_ref token. While the order is pending (the producer has not confirmed it yet), this withdraws it at no cost: status becomes cancelled with cancel_reason='buyer_cancelled', nothing counts against the producer, and the producer is told by e-mail. Once the producer has confirmed the order, the purchase is binding: cancelling it is a cancellation under the Norwegian Consumer Purchases Act § 41, and the producer may claim documented loss the cancellation causes. The response's consumer_law_note says what applies; show it to the user. Only call this tool when the user has explicitly told you to cancel this order. For a confirmed order, first tell the user this consequence and get their explicit instruction. A cancellation cannot be undone. lokal_order_status lists what is possible for an order in available_actions ('withdraw' or 'cancel' = this tool): pass the one you showed the user as expected_action, so a producer confirmation in the meantime never turns a free withdrawal into a binding cancellation. On error expected_action_mismatch nothing was changed: check the status again and ask the user. Wrong buyer_ref or unknown order: error 403.",
+        inputSchema: {
+          ...buyerOrderInput,
+          expected_action: z.enum(["withdraw", "cancel"]).optional().describe("The cancel action lokal_order_status listed in available_actions when the user decided ('withdraw' = free, before confirmation; 'cancel' = after confirmation, § 41). If the order has changed since, nothing happens and the tool returns error expected_action_mismatch."),
+        },
+        annotations: {
+          title: "Cancel order",
+          readOnlyHint: false,
+          // Destructive: the order is cancelled for good and the producer is e-mailed.
+          destructiveHint: true,
+          // The same call again changes nothing more (a repeat key replays, a
+          // repeat without a key is refused because the order is closed).
+          idempotentHint: true,
+          // Reaches a third party: the producer gets an e-mail (as lokal_cart_submit).
+          openWorldHint: true,
+        },
+      },
+      guardToolHandler("lokal_order_cancel", async ({ order_id, buyer_ref, idempotency_key, expected_action }) => {
+        if (!isOrderAgentActionsEnabled()) return actionsOffResult();
+        const result = await applyBuyerOrderCommand(order_id, buyer_ref, "cancel", "mcp", {
+          idempotencyKey: idempotency_key ?? null, expectedAction: expected_action ?? null, payments: buyerPayments(),
+        });
+        return { content: [{ type: "text" as const, text: cartResultText("lokal_order_cancel", result) }] };
+      })
+    );
+
+    // Tool 16: Report pickup
+    server.registerTool(
+      "lokal_order_picked_up",
+      {
+        title: "Report that an order was picked up",
+        description: "Report that the buyer has picked up a confirmed pickup order. Requires the order_id and the buyer_ref token. The order becomes completed with completion_source='buyer' and is closed: it can no longer be cancelled through Rett fra Bonden, and the completed order counts in the producer's order record. Only call this tool when the user has explicitly told you that they have picked up the goods. Never assume it from a pickup time that has passed. Reporting pickup cannot be undone. Possible when lokal_order_status lists 'picked_up' in available_actions. Wrong buyer_ref or unknown order: error 403.",
+        inputSchema: buyerOrderInput,
+        annotations: {
+          title: "Report pickup",
+          readOnlyHint: false,
+          // Destructive: closes the order for good.
+          destructiveHint: true,
+          idempotentHint: true,
+          // No e-mail or other third party: the order is closed in this app only.
+          openWorldHint: false,
+        },
+      },
+      guardToolHandler("lokal_order_picked_up", async ({ order_id, buyer_ref, idempotency_key }) => {
+        if (!isOrderAgentActionsEnabled()) return actionsOffResult();
+        const result = await applyBuyerOrderCommand(order_id, buyer_ref, "picked_up", "mcp", {
+          idempotencyKey: idempotency_key ?? null, payments: buyerPayments(),
+        });
+        return { content: [{ type: "text" as const, text: cartResultText("lokal_order_picked_up", result) }] };
+      })
+    );
+  }
 
   // ─── MCP Resources ──────────────────────────────────────────
   // Resources let agents READ data directly (vs tools which are actions).
