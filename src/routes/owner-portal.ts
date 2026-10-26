@@ -1299,7 +1299,13 @@ export function ownerPauseCardHtml(agent: { id: string; name?: string }, verifie
 //      orders keep going to the old recipient.
 //   3. The new address must pass isBlocked() both at request and at confirm
 //      time (the notify gate's clause 4 also re-checks it at send time).
-//   4. Ownership is re-checked at confirm time (customer rule on the agent).
+//   4. The token is bound to the requester's ownership: at request time a
+//      fingerprint of the ownership basis (claimed_at/claimed_via + the ids
+//      of the verified agent_claims rows) is stored; confirm requires the
+//      agent to still be owned AND that fingerprint to be unchanged. An
+//      admin reset-claim followed by a re-claim by someone else therefore
+//      kills every link issued before it (reset-claim also supersedes
+//      pending rows directly — routes/marketplace.ts).
 // It never touches who gets a real order at all: cart-service's
 // isEligibleForRealOrder() (cross-check, is_verified, opt-in, not blocklisted)
 // is unchanged and stays stricter than the notify gate — the owner only
@@ -1328,6 +1334,26 @@ function hashOrderEmailToken(token: string): string {
 
 function isPlausibleOrderEmail(v: string): boolean {
   return v.length <= 254 && /^[^\s@<>"',;:()\[\]\\]+@[^\s@<>"',;:()\[\]\\]+\.[^\s@<>"',;:()\[\]\\]{2,}$/.test(v);
+}
+
+/**
+ * Fingerprint of who owns the agent right now (customer rule basis). Any
+ * reset-claim, re-claim, new or removed verified claim changes it. null when
+ * the agent is not verified-owned at all.
+ */
+export function ownerBasisFingerprint(agentId: string): string | null {
+  const db = getDb();
+  const a = db
+    .prepare(`SELECT a.claimed_at AS claimed_at, a.claimed_via AS claimed_via, ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+    .get(agentId) as { claimed_at: string | null; claimed_via: string | null; owned: number } | undefined;
+  if (!a || a.owned !== 1) return null;
+  const claims = (db
+    .prepare("SELECT id FROM agent_claims WHERE agent_id = ? AND status = 'verified' ORDER BY id")
+    .all(agentId) as Array<{ id: string }>).map((c) => c.id);
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([a.claimed_at ?? null, a.claimed_via ?? null, claims]))
+    .digest("hex");
 }
 
 /** The address an order mail goes to right now — same resolution as the notify gate's clause 2. */
@@ -1407,9 +1433,9 @@ export async function requestOwnerOrderEmailChange(
        WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL`
     ).run(nowIso, agentId);
     db.prepare(
-      `INSERT INTO owner_order_email_change (token_hash, agent_id, new_email, requested_at, expires_at, requested_by)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(tokenHash, agentId, email, nowIso, expiresAt, requestedBy);
+      `INSERT INTO owner_order_email_change (token_hash, agent_id, new_email, requested_at, expires_at, requested_by, owner_basis)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(tokenHash, agentId, email, nowIso, expiresAt, requestedBy, ownerBasisFingerprint(agentId));
   })();
 
   const agentRow = db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId) as { name?: string } | undefined;
@@ -1446,9 +1472,9 @@ export function inspectOrderEmailToken(rawToken: string, now: Date = new Date())
   if (!/^[0-9a-f]{64}$/.test(rawToken)) return { ok: false, reason: "invalid" };
   const db = getDb();
   const row = db
-    .prepare("SELECT agent_id, new_email, expires_at, consumed_at, outcome FROM owner_order_email_change WHERE token_hash = ?")
+    .prepare("SELECT agent_id, new_email, expires_at, consumed_at, outcome, owner_basis FROM owner_order_email_change WHERE token_hash = ?")
     .get(hashOrderEmailToken(rawToken)) as
-    | { agent_id: string; new_email: string; expires_at: string; consumed_at: string | null; outcome: string | null }
+    | { agent_id: string; new_email: string; expires_at: string; consumed_at: string | null; outcome: string | null; owner_basis: string | null }
     | undefined;
   if (!row) return { ok: false, reason: "invalid" };
   if (row.outcome != null || row.consumed_at != null) return { ok: false, reason: "used" };
@@ -1457,6 +1483,10 @@ export function inspectOrderEmailToken(rawToken: string, now: Date = new Date())
     .prepare(`SELECT a.name AS name, ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
     .get(row.agent_id) as { name?: string; owned?: number } | undefined;
   if (!agent || agent.owned !== 1) return { ok: false, reason: "not_owned" };
+  // Bound to the requester's ownership: reject if the ownership basis
+  // changed after the request (reset-claim / re-claim / other claimant).
+  const basis = ownerBasisFingerprint(row.agent_id);
+  if (!row.owner_basis || basis !== row.owner_basis) return { ok: false, reason: "not_owned" };
   if (isBlocked({ email: row.new_email }).blocked) return { ok: false, reason: "blocked" };
   return { ok: true, agentId: row.agent_id, newEmail: row.new_email, agentName: String(agent.name || "") };
 }
@@ -1991,8 +2021,11 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     if (out.status === 200) return res.redirect(303, `${base}?status=order_email_sent#bestillinger`);
     const mapped = ORDER_EMAIL_ERROR_STATUS[String(out.body?.error || "")];
     if (mapped) return res.redirect(303, `${base}?status=${mapped}#bestillinger`);
-    if (out.status === 502) return res.redirect(303, `${base}?status=order_email_error#bestillinger`);
-    return res.status(out.status).json(out.body);
+    if (out.status === 403 && out.body?.error === "ownership_not_verified") return res.status(403).send(ownerNotVerifiedPage(agentId));
+    if (out.status === 403) {
+      return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1><p>Du har ikke tilgang til denne produsenten.</p></div>`));
+    }
+    return res.redirect(303, `${base}?status=order_email_error#bestillinger`);
   } catch (e: any) {
     console.error("[owner-portal] POST /eier order-email failed:", e);
     return res.redirect(303, `${base}?status=order_email_error#bestillinger`);

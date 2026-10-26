@@ -2148,6 +2148,14 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
     db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
     db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
     db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+    // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
+    // pending owner change of the order e-mail belongs to the old owner —
+    // kill it. Best-effort: a DB without the table never breaks reset-claim.
+    try {
+      db.prepare(
+        "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
+      ).run(new Date().toISOString(), agentId);
+    } catch { /* table missing — nothing pending */ }
     trustScoreService.update(agentId);
     res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {

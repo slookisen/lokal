@@ -346,10 +346,75 @@ export async function runOwnerOrderEmailS1b7Tests(opts: { log?: boolean } = {}):
       db.prepare("UPDATE agents SET claimed_at = NULL WHERE id = ?").run(OWNED_ID);
       const n = await confirmPost(tf);
       assertEq([n.status, overrideCol()], [400, NEW_EMAIL], "chk-4: profile no longer verified-owned → rejected, nothing written");
-      db.prepare("UPDATE agents SET claimed_at = ? WHERE id = ?").run("2026-10-01T00:00:00.000Z", OWNED_ID);
-      const ok = await confirmPost(tf);
-      assertEq([ok.status, overrideCol()], [200, F], "chk-5: same token works once ownership is back (still unconsumed)");
-      assertEq(auditRows().map((a) => [a.old_value, a.new_value]), [[OLD_EMAIL, NEW_EMAIL], [NEW_EMAIL, F]], "chk-6: second audit row old → new");
+      // Someone re-claims the profile (new ownership basis) → the link issued
+      // under the old ownership must stay dead.
+      db.prepare("UPDATE agents SET claimed_at = ? WHERE id = ?").run("2026-10-26T09:00:00.000Z", OWNED_ID);
+      const re = await confirmPost(tf);
+      assertEq([re.status, overrideCol(), auditRows().length], [400, NEW_EMAIL, 1], "chk-5: token issued before an ownership reset/re-claim → 400, nothing written");
+      db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
+        .run("claim-s1b7-second", OWNED_ID, "andre@s1b7.example.no", "Andre", "s1b7-second-claim", new Date(Date.now() + 86_400_000).toISOString());
+      const G = "etter-nytt-krav@s1b7.example.no";
+      assertEq((await request(OWNED_ID, G)).status, 200, "chk-6: request under the current ownership");
+      const tg = tokenOf(sentConfirms[2].confirmUrl);
+      db.prepare("DELETE FROM agent_claims WHERE id = ?").run("claim-s1b7-second");
+      db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
+        .run("claim-s1b7-third", OWNED_ID, "tredje@s1b7.example.no", "Tredje", "s1b7-third-claim", new Date(Date.now() + 86_400_000).toISOString());
+      const swapped = await confirmPost(tg);
+      assertEq([swapped.status, overrideCol()], [400, NEW_EMAIL], "chk-7: verified claim replaced by another claimant → old token rejected");
+      ageRequests();
+      assertEq((await request(OWNED_ID, F)).status, 200, "chk-8: a fresh request under the new ownership");
+      const ok = await confirmPost(tokenOf(sentConfirms[3].confirmUrl));
+      assertEq([ok.status, overrideCol()], [200, F], "chk-9: …is confirmed normally");
+      assertEq(auditRows().map((a) => [a.old_value, a.new_value]), [[OLD_EMAIL, NEW_EMAIL], [NEW_EMAIL, F]], "chk-10: second audit row old → new");
+    }
+
+    // ═══ Admin reset-claim kills pending changes ══════════════════════════
+    {
+      ageRequests();
+      sentConfirms.length = 0;
+      const prevAdminKey = process.env.ADMIN_KEY;
+      process.env.ADMIN_KEY = "s1b7-admin-key";
+      try {
+        try { delete require.cache[require.resolve("./marketplace")]; } catch { /* not loaded */ }
+        const marketplaceRouter = require("./marketplace").default as any;
+        const reset = findRouteHandler(marketplaceRouter, "/admin/agents/:id/reset-claim", "post");
+        const H2 = "angriper@s1b7.example.no";
+        assertEq((await request(OWNED_ID, H2)).status, 200, "reset-1: owner A requests a change");
+        const th = tokenOf(sentConfirms[0].confirmUrl);
+        const r = await invoke(reset, makeReq({ params: { id: OWNED_ID }, headers: { "x-admin-key": "s1b7-admin-key" } }));
+        assertEq(r.status, 200, "reset-2: admin reset-claim → 200");
+        assertEq(changeRows().pop()?.outcome, "superseded", "reset-3: reset-claim supersedes the pending change");
+        // Rightful owner B claims and is verified again within 48 h.
+        db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
+          .run("claim-s1b7-b", OWNED_ID, "eier-b@s1b7.example.no", "Eier B", "s1b7-b-claim", new Date(Date.now() + 86_400_000).toISOString());
+        db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(OWNED_ID);
+        const n0 = auditRows().length;
+        const late = await confirmPost(th);
+        assertEq([late.status, overrideCol(), auditRows().length], [400, "eier-borte@s1b7.example.no", n0], "reset-4: A's old link after reset + re-claim → 400, nothing written");
+        // Even if the row had not been superseded, the ownership binding alone rejects it.
+        db.prepare("UPDATE owner_order_email_change SET outcome = NULL, consumed_at = NULL WHERE token_hash = ?")
+          .run(crypto.createHash("sha256").update(th).digest("hex"));
+        const late2 = await confirmPost(th);
+        assertEq([late2.status, overrideCol()], [400, "eier-borte@s1b7.example.no"], "reset-5: ownership binding rejects it on its own too");
+      } finally {
+        if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
+      }
+    }
+
+    // ═══ Escaping ═════════════════════════════════════════════════════════
+    {
+      const evilName = `Gård <script>alert("x")</script> & 'co'`;
+      db.prepare("UPDATE agents SET name = ? WHERE id = ?").run(evilName, OTHER_ID);
+      sentConfirms.length = 0;
+      assertEq((await request(OTHER_ID, "ny@s1b7-other.example.no")).status, 200, "esc-1: request for the agent with an HTML name");
+      const page = String((await confirmGet(tokenOf(sentConfirms[0].confirmUrl))).body ?? "");
+      assertTrue(!page.includes("<script>alert") && page.includes("Gård &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &#039;co&#039;"), "esc-2: confirm page escapes the agent name");
+      db.prepare("UPDATE agents SET order_notification_email = ? WHERE id = ?").run(`"><script>x</script>@evil.no`, OTHER_ID);
+      const html = await portalHtml(OTHER_ID);
+      assertTrue(!html.includes("<script>x</script>") && html.includes("Ordre sendes til: <strong>&quot;&gt;&lt;script&gt;x&lt;/script&gt;@evil.no</strong>"), "esc-3: portal section escapes the current recipient");
+      const sec = portalMod.ownerOrderEmailSectionHtml(OTHER_ID, `<b>a</b>@x.no`, `<i>p</i>@x.no`);
+      assertTrue(!sec.includes("<b>a</b>") && !sec.includes("<i>p</i>") && sec.includes("&lt;b&gt;a&lt;/b&gt;@x.no") && sec.includes("&lt;i&gt;p&lt;/i&gt;@x.no"), "esc-4: section escapes current and pending addresses");
+      db.prepare("UPDATE agents SET order_notification_email = NULL WHERE id = ?").run(OTHER_ID);
     }
 
     // ═══ No-JS form + send failure ════════════════════════════════════════
@@ -365,6 +430,10 @@ export async function runOwnerOrderEmailS1b7Tests(opts: { log?: boolean } = {}):
       assertEq(inv.body?.__redirect, `/eier/${OWNED_ID}/portal?status=order_email_invalid#bestillinger`, "form-3: invalid address → error status redirect");
       const xs = await form({ email: "x@s1b7.example.no" }, { origin: "https://evil.example", host: "rettfrabonden.com" });
       assertEq([xs.status, sentConfirms.length], [403, 1], "form-4: cross-site form POST → 403, no mail");
+      const unv = await invoke(H.form, makeReq({ params: { agentId: UNVERIFIED_ID }, body: { email: "z@s1b7.example.no" }, token: tokens[UNVERIFIED_ID] }));
+      assertTrue(unv.status === 403 && typeof unv.body === "string" && unv.body.includes("<!DOCTYPE html>"), "form-4b: unverified owner via form → 403 HTML page, not JSON");
+      const crossForm = await invoke(H.form, makeReq({ params: { agentId: OWNED_ID }, body: { email: "z@s1b7.example.no" }, token: tokens[OTHER_ID] }));
+      assertTrue(crossForm.status === 403 && typeof crossForm.body === "string" && crossForm.body.includes("Ingen tilgang"), "form-4c: other agent's session via form → 403 HTML page");
       const noSession = await invoke(H.form, makeReq({ params: { agentId: OWNED_ID }, body: { email: "y@s1b7.example.no" } }));
       assertEq(noSession.body?.__redirect, `/eier/${OWNED_ID}`, "form-5: no session → redirect to login");
       const alertHtml = String((await invoke(H.portal, makeReq({ params: { agentId: OWNED_ID }, token: tokens[OWNED_ID], query: { status: "order_email_sent" } }))).body ?? "");
