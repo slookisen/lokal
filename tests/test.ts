@@ -50196,3 +50196,23 @@ runSerial(async () => {
     failures.push("owner-unified-session-s1b5: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: «Pause som
+// virker» (OWNER_PAUSE_ENABLED) — pause/unpause per surface, resume date,
+// verified-owner gate, audit rows, flag off unchanged. Swaps the getDb()
+// singleton and the env flag (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: owner pause ──");
+  try {
+    const { runOwnerPauseS1b6Tests } = require("../src/routes/owner-pause-s1b6.test") as
+      typeof import("../src/routes/owner-pause-s1b6.test");
+    const r = await runOwnerPauseS1b6Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-pause-s1b6: " + f);
+    console.log(`  owner-pause-s1b6: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-pause-s1b6: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -13,7 +13,7 @@ import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql, hasProducerPage, failsProducerRoleGate } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate, ownerPauseEnabled } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -1585,8 +1585,18 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // agent — same "tell me about this seller" surface, same rule as
   // /produsent/:slug and /agents/:id/card.
   if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
-    res.status(404).json({ success: false, error: "Agent ikke funnet" });
-    return;
+    // S1b punkt 6 (OWNER_PAUSE_ENABLED): the owner of a paused profile still
+    // loads their own /selger editor. A valid X-Claim-Token for exactly this
+    // agent skips the pause check only (is_active / catalog_hidden / vetting
+    // still apply). Flag off = never reached differently.
+    const claimToken = (req.headers["x-claim-token"] as string) || "";
+    const ownerRead = ownerPauseEnabled() && !!claimToken &&
+      knowledgeService.getClaimByToken(claimToken)?.agentId === agentId &&
+      !marketplaceRegistry.isQuarantinedFromPublicView(agentId, { ignoreOwnerPause: true });
+    if (!ownerRead) {
+      res.status(404).json({ success: false, error: "Agent ikke funnet" });
+      return;
+    }
   }
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) {
@@ -1981,6 +1991,9 @@ router.post("/auth/login", (req: Request, res: Response) => {
     data: {
       agentId: claim.agentId,
       claimantName: claim.claimantName,
+      // S1b punkt 6: tells /selger to swap «Meld nedlagt» for pause + «be om
+      // sletting». Only present with OWNER_PAUSE_ENABLED on (off = unchanged body).
+      ...(ownerPauseEnabled() ? { ownerPauseEnabled: true } : {}),
     },
   });
 });

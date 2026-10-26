@@ -16,6 +16,7 @@ import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
+import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
@@ -1103,6 +1104,175 @@ export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?:
       </div>`;
 }
 
+// ─────────────────────────────────────────────────────────────────
+// S1b punkt 6 — «Pause som virker» (dev-request 2026-10-22-rfb-mine-valg-eierbrytere)
+// ─────────────────────────────────────────────────────────────────
+// Behind OWNER_PAUSE_ENABLED (services/agent-visibility.ts, default OFF):
+// with the flag off the card is not rendered and both routes answer 404.
+// Only a verified owner (isVerifiedOwner — independent of the S1b punkt 5
+// gate flag) may pause or resume. A session without verified ownership sees
+// the card locked with the reason. Each real change writes ONE
+// agent_knowledge_audit row (field_name 'visibility.profile'); a request that
+// does not change the state writes nothing. «Be om sletting» is an e-mail to
+// kundeservice (kontakt@), the existing route for removal requests.
+
+const OWNER_PAUSE_AUDIT_FIELD = "visibility.profile";
+const OWNER_PAUSE_MAX_DAYS = 366;
+const CS_EMAIL = "kontakt@rettfrabonden.com";
+
+interface OwnerPauseState { paused: boolean; until: string | null }
+
+function readOwnerPause(agentId: string): OwnerPauseState {
+  const row = readOwnerPauseRow(getDb(), agentId);
+  const paused = isOwnerPaused(row);
+  return { paused, until: paused ? (row.owner_pause_until ?? null) : null };
+}
+
+function pauseAuditValue(state: OwnerPauseState): string {
+  return state.paused ? (state.until ? `off (pause til ${state.until})` : "off (pause)") : "on";
+}
+
+/** 'YYYY-MM-DD' strictly after today (UTC) and within a year, or null when invalid. */
+function parseResumeDate(raw: unknown, now: Date = new Date()): string | null {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
+  const d = new Date(`${v}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== v) return null;
+  const today = now.toISOString().slice(0, 10);
+  if (v <= today) return null;
+  const max = new Date(now.getTime() + OWNER_PAUSE_MAX_DAYS * 86400000).toISOString().slice(0, 10);
+  if (v > max) return null;
+  return v;
+}
+
+export const OWNER_PAUSE_LOCKED_MESSAGE =
+  "Pause kan bare brukes når eierskapet til profilen er bekreftet. Bekreft eierskap først.";
+
+export function applyOwnerPause(
+  req: Request,
+  agentId: string,
+  rawPaused: unknown,
+  rawUntil: unknown,
+): { status: number; body: any } {
+  if (!ownerPauseEnabled()) return { status: 404, body: { success: false, error: "not_found" } };
+  const session = verifyOwnerSession(req);
+  if (!session.valid) {
+    return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
+  }
+  if (!isVerifiedOwner(agentId, session)) {
+    return session.agentId === agentId
+      ? { status: 403, body: { success: false, error: "ownership_not_verified", message: OWNER_PAUSE_LOCKED_MESSAGE } }
+      : { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  }
+  let wantPaused: boolean;
+  if (rawPaused === true || rawPaused === 1 || rawPaused === "1" || rawPaused === "true") wantPaused = true;
+  else if (rawPaused === false || rawPaused === 0 || rawPaused === "0" || rawPaused === "false") wantPaused = false;
+  else return { status: 400, body: { success: false, error: "bad_paused", message: "paused må være true eller false." } };
+
+  let until: string | null = null;
+  const untilGiven = typeof rawUntil === "string" ? rawUntil.trim() !== "" : rawUntil != null;
+  if (wantPaused && untilGiven) {
+    until = parseResumeDate(rawUntil);
+    if (!until) {
+      return { status: 400, body: { success: false, error: "bad_until", message: "Tilbakedato må være en dato fram i tid (innen ett år), på formen ÅÅÅÅ-MM-DD." } };
+    }
+  }
+
+  const db = getDb();
+  const result = db.transaction(() => {
+    const before = readOwnerPause(agentId);
+    const after: OwnerPauseState = { paused: wantPaused, until: wantPaused ? until : null };
+    if (before.paused === after.paused && before.until === after.until) {
+      return { changed: false, state: after };
+    }
+    const now = new Date().toISOString();
+    if (wantPaused) {
+      db.prepare(
+        `INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until, set_by) VALUES (?, ?, ?, 'owner')
+         ON CONFLICT(agent_id) DO UPDATE SET paused_at = excluded.paused_at, pause_until = excluded.pause_until, set_by = excluded.set_by`
+      ).run(agentId, now, after.until);
+    } else {
+      db.prepare("DELETE FROM owner_profile_pause WHERE agent_id = ?").run(agentId);
+    }
+    const email = (db.prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { email?: string } | undefined)?.email ?? null;
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+       (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      `audit_${crypto.randomBytes(8).toString("hex")}`,
+      agentId,
+      OWNER_PAUSE_AUDIT_FIELD,
+      pauseAuditValue({ paused: before.paused, until: before.until }),
+      pauseAuditValue(after),
+      "owner",
+      email,
+      now,
+      wantPaused ? "owner paused profile (S1b punkt 6)" : "owner resumed profile (S1b punkt 6)",
+    );
+    return { changed: true, state: after };
+  })();
+  if (result.changed) {
+    // Public list caches (registry agents/stats, sitemap) must not keep
+    // serving the old state for a TTL. Lazy require: seo.ts is a big module.
+    try {
+      const { marketplaceRegistry } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
+      marketplaceRegistry._agentsCache = null;
+      marketplaceRegistry._statsCache = null;
+      marketplaceRegistry._agentsCacheTime = 0;
+      marketplaceRegistry._statsCacheTime = 0;
+      (require("./seo") as typeof import("./seo")).invalidateSitemapCache();
+    } catch (e) {
+      console.error("[owner-portal] pause cache invalidation failed:", e);
+    }
+  }
+  console.log(`[owner-portal] owner ${wantPaused ? "paused" : "resumed"} agent ${agentId} (changed=${result.changed})`);
+  return { status: 200, body: { success: true, agent_id: agentId, paused: result.state.paused, until: result.state.until, changed: result.changed } };
+}
+
+/** The «Pause og sletting» card (rendered only with OWNER_PAUSE_ENABLED on). */
+export function ownerPauseCardHtml(agent: { id: string; name?: string }, verifiedOwner: boolean, state: OwnerPauseState): string {
+  const id = encodeURIComponent(agent.id);
+  const subject = encodeURIComponent(`Be om sletting av profil: ${agent.name || agent.id} (${agent.id})`);
+  const mailBody = encodeURIComponent(`Hei,\n\nJeg ber om at profilen ${agent.name || ""} (${agent.id}) slettes fra Rett fra Bonden.\n\nHilsen`);
+  const deletion = `<p style="margin-top:16px;color:#737373;font-size:0.88rem;">Vil du heller at profilen slettes for godt? Kundeservice hjelper deg.</p>
+        <a class="ep-btn ep-btn-secondary" href="mailto:${CS_EMAIL}?subject=${subject}&amp;body=${mailBody}">Be om sletting</a>`;
+  if (!verifiedOwner) {
+    return `<div class="ep-card" id="pause">
+        <h2>Pause og sletting</h2>
+        <p>Profilen er synlig.</p>
+        <div class="ep-lock">\u{1F512} ${escapeHtml(OWNER_PAUSE_LOCKED_MESSAGE)}</div>
+        <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>
+        ${deletion}
+      </div>`;
+  }
+  if (state.paused) {
+    return `<div class="ep-card" id="pause">
+        <h2>Pause og sletting</h2>
+        <p>Profilen er på <strong>midlertidig pause</strong>${state.until ? ` til ${escapeHtml(state.until)}` : ""}. Den vises ikke i søk, lister, AI-tjenester eller kart.</p>
+        <form method="post" action="/eier/${id}/pause" style="margin:0;">
+          <input type="hidden" name="paused" value="0">
+          <button type="submit" class="ep-btn ep-btn-primary">Vis profilen igjen</button>
+        </form>
+        ${deletion}
+      </div>`;
+  }
+  return `<div class="ep-card" id="pause">
+        <h2>Pause og sletting</h2>
+        <p>Profilen er synlig.</p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Tar du pause, forsvinner profilen fra søk, lister og AI-tjenester. Profilsiden viser «Midlertidig pause». Du kan slå den på igjen når som helst, eller velge en dato da den kommer tilbake av seg selv.</p>
+        <form method="post" action="/eier/${id}/pause" style="margin:0;">
+          <input type="hidden" name="paused" value="1">
+          <div class="ep-field">
+            <label for="pause_until">Kommer tilbake (valgfritt)</label>
+            <input id="pause_until" name="until" type="date" aria-label="Dato profilen kommer tilbake">
+          </div>
+          <button type="submit" class="ep-btn ep-btn-primary">Sett profilen på pause</button>
+        </form>
+        ${deletion}
+      </div>`;
+}
+
 /** 403 page: valid session for this agent, but no verified owner (S1b punkt 5). */
 export function ownerNotVerifiedPage(agentId: string): string {
   const id = encodeURIComponent(agentId);
@@ -1193,6 +1363,12 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar nå bestillinger på e-post.</div>`;
     } else if (status === "orders_off") {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar ikke lenger bestillinger på e-post.</div>`;
+    } else if (status === "paused" && ownerPauseEnabled()) {
+      alert = `<div class="ep-alert ep-alert-ok" role="status">Profilen er satt på pause.</div>`;
+    } else if (status === "resumed" && ownerPauseEnabled()) {
+      alert = `<div class="ep-alert ep-alert-ok" role="status">Profilen er synlig igjen.</div>`;
+    } else if (status === "pause_error" && ownerPauseEnabled()) {
+      alert = `<div class="ep-alert ep-alert-error" role="alert">Klarte ikke å endre pausen. Sjekk datoen og prøv igjen.</div>`;
     } else if (paymentPortalAlert(status)) {
       const pa = paymentPortalAlert(status)!;
       alert = pa.ok
@@ -1209,6 +1385,15 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       const paymentStatus = getProducerPaymentStatus(db, agentId);
       if (shouldRenderPaymentCard(paymentStatus)) paymentCardHtml = renderPaymentCard(agentId, paymentStatus);
     } catch { paymentCardHtml = ""; }
+
+    // S1b punkt 6: «Pause og sletting» card — only with OWNER_PAUSE_ENABLED on
+    // (flag off = the portal is byte-identical to before).
+    let pauseCardHtml = "";
+    if (ownerPauseEnabled()) {
+      try {
+        pauseCardHtml = ownerPauseCardHtml(agent, isVerifiedOwner(agentId, session), readOwnerPause(agentId));
+      } catch { pauseCardHtml = ""; }
+    }
 
     // Fase A2: number of orders waiting for an answer (tolerant: a DB without orders shows 0).
     let pendingOrderCount = 0;
@@ -1292,7 +1477,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent)}${paymentCardHtml}
+      ${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent)}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -1446,6 +1631,40 @@ router.post("/eier/:agentId/order-notifications", express.urlencoded({ extended:
   } catch (e: any) {
     console.error("[owner-portal] POST /eier order-notifications failed:", e);
     return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal?status=error`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/agents/:id/pause  { paused: boolean, until?: "YYYY-MM-DD" }
+// POST /eier/:agentId/pause   (form, no-JS fallback)
+// S1b punkt 6 — see applyOwnerPause(). Flag off → 404.
+// ─────────────────────────────────────────────────────────────────
+router.post("/api/agents/:id/pause", (req: Request, res: Response) => {
+  try {
+    const out = applyOwnerPause(req, String(req.params.id || ""), req.body?.paused, req.body?.until);
+    return res.status(out.status).json(out.body);
+  } catch (e: any) {
+    console.error("[owner-portal] POST pause failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  // Same Origin check as POST /eier/:id/selger: no cross-site trigger.
+  if (crossSiteRequest(req)) {
+    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  }
+  try {
+    const out = applyOwnerPause(req, agentId, req.body?.paused, req.body?.until);
+    if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (out.status === 400) return res.redirect(303, `${base}?status=pause_error#pause`);
+    if (out.status !== 200) return res.status(out.status).json(out.body);
+    return res.redirect(303, `${base}?status=${out.body.paused ? "paused" : "resumed"}#pause`);
+  } catch (e: any) {
+    console.error("[owner-portal] POST /eier pause failed:", e);
+    return res.redirect(303, `${base}?status=pause_error#pause`);
   }
 });
 
