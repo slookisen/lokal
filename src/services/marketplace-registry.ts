@@ -1665,13 +1665,15 @@ class MarketplaceRegistry {
   // public by-id lookups (card/info/vcard/trust, /api/agents/:id/stats, the
   // marketing lane). The order flow never goes through here — it uses
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
-  isQuarantinedFromPublicView(agentId: string): boolean {
+  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean } = {}): boolean {
     const db = getDb();
     const found = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
       { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     if (!found) return false;
     // S1b punkt 6: the owner-pause table is read only with OWNER_PAUSE_ENABLED on.
-    const row = ownerPauseEnabled() ? { ...found, ...readOwnerPauseRow(db, agentId) } : found;
+    // ignoreOwnerPause: the owner's own authenticated read (/selger editor via
+    // /agents/:id/info + X-Claim-Token) skips ONLY the pause, nothing else.
+    const row = ownerPauseEnabled() && !opts.ignoreOwnerPause ? { ...found, ...readOwnerPauseRow(db, agentId) } : found;
     // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
     // flag off = the quarantine rule this method has always applied; flag
     // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.

@@ -113,8 +113,8 @@ export async function runOwnerPauseS1b6Tests(opts: { log?: boolean } = {}): Prom
     if (!layer) throw new Error(`route not found: ${method.toUpperCase()} ${path}`);
     return layer.route.stack[layer.route.stack.length - 1].handle;
   }
-  function makeReq(o: { params?: Record<string, string>; body?: any; query?: Record<string, string>; token?: string }): any {
-    const headers: Record<string, string> = {};
+  function makeReq(o: { params?: Record<string, string>; body?: any; query?: Record<string, string>; token?: string; headers?: Record<string, string> }): any {
+    const headers: Record<string, string> = { ...(o.headers || {}) };
     if (o.token) headers.authorization = `Bearer ${o.token}`;
     return {
       method: "GET", url: "/", path: "/", originalUrl: "/",
@@ -195,6 +195,7 @@ export async function runOwnerPauseS1b6Tests(opts: { log?: boolean } = {}): Prom
     const H = {
       search: findRouteHandler(marketplaceRouter, "/search", "get"),
       card: findRouteHandler(marketplaceRouter, "/agents/:id/card", "get"),
+      info: findRouteHandler(marketplaceRouter, "/agents/:id/info", "get"),
       login: findRouteHandler(marketplaceRouter, "/auth/login", "post"),
       feed: findRouteHandler(catalogRouter, "/feed", "get"),
       acp: findRouteHandler(catalogRouter, "/acp-feed.csv", "get"),
@@ -214,6 +215,14 @@ export async function runOwnerPauseS1b6Tests(opts: { log?: boolean } = {}): Prom
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${id}`, `post@${id}.example.no`, tokens[id], id, new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
     }
+    const OWNER_CLAIM = "s1b6-owner-claim";
+    const OTHER_CLAIM = "s1b6-other-claim";
+    for (const [cid, aid, tok] of [["claim-s1b6-owner", OWNED_ID, OWNER_CLAIM], ["claim-s1b6-other", OTHER_ID, OTHER_CLAIM]]) {
+      db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
+        .run(cid, aid, `post@${aid}.example.no`, "Eier", tok, new Date(Date.now() + 86_400_000).toISOString());
+    }
+    const infoStatus = async (id: string, claim?: string) =>
+      (await invoke(H.info, makeReq({ params: { id }, headers: claim ? { "x-claim-token": claim } : {} }))).status;
     const auditRows = (id: string) =>
       db.prepare("SELECT old_value, new_value, changed_by FROM agent_knowledge_audit WHERE agent_id = ? AND field_name = 'visibility.profile' ORDER BY changed_at, rowid").all(id) as Array<{ old_value: string; new_value: string; changed_by: string }>;
     const pause = (id: string, body: any, token = tokens[id]) => invoke(H.apiPause, makeReq({ params: { id }, body, token }));
@@ -228,7 +237,7 @@ export async function runOwnerPauseS1b6Tests(opts: { log?: boolean } = {}): Prom
     assertTrue(visibility.isPubliclyListable(pausedRow), "pred-3: flag off → paused row still listable (columns ignored)");
     assertTrue(visibility.isAgentPubliclyVisible(pausedRow, { surface: "gated" }), "pred-4: flag off → paused row visible on by-id surfaces");
     setFlag(true);
-    assertEq(visibility.publicListableSql("a"), `${offSql} AND a.id NOT IN (SELECT agent_id FROM owner_profile_pause WHERE COALESCE(pause_until, '9999-12-31') > date('now'))`, "pred-5: flag on → pause clause appended (wrap-safe)");
+    assertEq(visibility.publicListableSql("a"), `${offSql} AND a.id NOT IN (SELECT agent_id FROM owner_profile_pause WHERE agent_id IS NOT NULL AND COALESCE(pause_until, '9999-12-31') > date('now'))`, "pred-5: flag on → pause clause appended (wrap-safe)");
     assertTrue(!visibility.isPubliclyListable(pausedRow), "pred-6: flag on → paused row not listable");
     assertTrue(!visibility.isAgentPubliclyVisible(pausedRow, { surface: "ungated", allowCatalogHidden: true }), "pred-7: flag on → paused row hidden on ungated by-id surfaces too");
     const now = new Date("2026-10-26T12:00:00Z");
@@ -313,6 +322,21 @@ export async function runOwnerPauseS1b6Tests(opts: { log?: boolean } = {}): Prom
       assertTrue(portal1.includes("midlertidig pause") && portal1.includes("Vis profilen igjen"), "pause-10: portal shows the paused state and the resume button");
       const login = await invoke(H.login, makeReq({ body: { token: "no-such-token" } }));
       assertEq(login.status, 401, "pause-11: /auth/login unchanged for bad tokens");
+      // B1: the owner's own /selger editor still loads /agents/:id/info.
+      assertEq(await infoStatus(OWNED_ID), 404, "info-1: paused → anonymous /agents/:id/info is 404");
+      assertEq(await infoStatus(OWNED_ID, OWNER_CLAIM), 200, "info-2: paused → the owner's X-Claim-Token still gets 200 (selger editor)");
+      assertEq(await infoStatus(OWNED_ID, OTHER_CLAIM), 404, "info-3: paused → another agent's claim token gets 404");
+      assertEq(await infoStatus(OWNED_ID, "no-such-claim"), 404, "info-4: paused → an invalid claim token gets 404");
+      db.prepare("UPDATE agents SET catalog_hidden = 1 WHERE id = ?").run(OWNED_ID);
+      assertEq(await infoStatus(OWNED_ID, OWNER_CLAIM), 404, "info-5: the owner bypass skips only the pause (catalog_hidden still 404)");
+      db.prepare("UPDATE agents SET catalog_hidden = 0 WHERE id = ?").run(OWNED_ID);
+      // Origin check on the no-JS form.
+      const n0 = auditRows(OWNED_ID).length;
+      const xs = await invoke(H.formPause, makeReq({ params: { agentId: OWNED_ID }, body: { paused: "0" }, token: tokens[OWNED_ID], headers: { origin: "https://evil.example", host: "rettfrabonden.com" } }));
+      assertEq([xs.status, auditRows(OWNED_ID).length], [403, n0], "origin-1: cross-site POST /eier/:id/pause → 403, nothing written");
+      assertEq((await surfaces()).search, [UNVERIFIED_ID, OTHER_ID], "origin-2: …and the profile stays paused");
+      const same = await invoke(H.formPause, makeReq({ params: { agentId: OWNED_ID }, body: { paused: "1" }, token: tokens[OWNED_ID], headers: { origin: "https://rettfrabonden.com", host: "rettfrabonden.com" } }));
+      assertEq([same.status, auditRows(OWNED_ID).length], [303, n0], "origin-3: same-origin form POST passes (no-op, no row)");
     }
 
     // ── Resume ──
@@ -346,6 +370,16 @@ export async function runOwnerPauseS1b6Tests(opts: { log?: boolean } = {}): Prom
       const portal = String((await invoke(H.portal, makeReq({ params: { agentId: OWNED_ID }, token: tokens[OWNED_ID] }))).body ?? "");
       assertTrue(portal.includes("Sett profilen på pause"), "date-6: portal shows the profile as visible again");
       assertEq(auditRows(OWNED_ID).length, n, "date-7: reading the state writes nothing");
+      // Boundary: pause_until = today (UTC) is no longer applied by the SQL list predicate.
+      db.prepare("UPDATE owner_profile_pause SET pause_until = ? WHERE agent_id = ?").run(isoDay(0), OWNED_ID);
+      const today = await surfaces();
+      for (const k of ["search", "lokal_search", "catalog_feed", "acp_feed_csv", "llms_full_txt", "sitemap"]) {
+        assertEq(today[k], ALL, `date-8: ${k}: pause_until = today → restored (SQL predicate)`);
+      }
+      assertEq(await infoStatus(OWNED_ID), 200, "date-9: pause_until = today → /agents/:id/info 200 again");
+      db.prepare("UPDATE owner_profile_pause SET pause_until = ? WHERE agent_id = ?").run(isoDay(1), OWNED_ID);
+      assertEq((await surfaces()).search, [UNVERIFIED_ID, OTHER_ID], "date-10: pause_until = tomorrow → still paused (SQL predicate)");
+      db.prepare("DELETE FROM owner_profile_pause WHERE agent_id = ?").run(OWNED_ID);
     }
 
     // ── Flag off: no change ──

@@ -102,7 +102,7 @@ export const OWNER_PAUSE_TABLE = "owner_profile_pause";
 
 /** Wrap-safe SQL: the `agents` row is NOT currently owner-paused. */
 export function notOwnerPausedSql(alias?: string): string {
-  return `${col(alias, "id")} NOT IN (SELECT agent_id FROM ${OWNER_PAUSE_TABLE} WHERE COALESCE(pause_until, '9999-12-31') > date('now'))`;
+  return `${col(alias, "id")} NOT IN (SELECT agent_id FROM ${OWNER_PAUSE_TABLE} WHERE agent_id IS NOT NULL AND COALESCE(pause_until, '9999-12-31') > date('now'))`;
 }
 
 export interface OwnerPauseRow {

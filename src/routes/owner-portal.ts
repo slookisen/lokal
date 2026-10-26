@@ -1652,6 +1652,10 @@ router.post("/api/agents/:id/pause", (req: Request, res: Response) => {
 router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const agentId = String(req.params.agentId || "");
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  // Same Origin check as POST /eier/:id/selger: no cross-site trigger.
+  if (crossSiteRequest(req)) {
+    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  }
   try {
     const out = applyOwnerPause(req, agentId, req.body?.paused, req.body?.until);
     if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);

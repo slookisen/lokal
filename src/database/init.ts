@@ -5339,7 +5339,7 @@ function initSchema(db: Database.Database): void {
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS owner_profile_pause (
-        agent_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL PRIMARY KEY,
         paused_at TEXT NOT NULL,
         pause_until TEXT,
         set_by TEXT NOT NULL DEFAULT 'owner'
