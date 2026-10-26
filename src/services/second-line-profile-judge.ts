@@ -213,11 +213,18 @@ Ved minste tvil, svar ${SECOND_LINE_JUDGE_REJECT_TOKEN}.`;
 export const SECOND_LINE_EVIDENCE_FENCE_BEGIN = "<<<KILDEINNHOLD-START>>>";
 export const SECOND_LINE_EVIDENCE_FENCE_END = "<<<KILDEINNHOLD-SLUTT>>>";
 
+// Guarantee (function level): the result contains NO angle bracket of any
+// kind (ASCII, fullwidth, single/double guillemet-like, CJK/math angle
+// brackets), so neither fence marker — which needs `<<<`/`>>>` — can ever
+// appear in it, however the input is crafted (one pass is enough because
+// nothing is glued back together: brackets are removed first, and the later
+// replacements never introduce one). The marker-word replacement after it
+// is belt-and-braces only.
 function neutraliseFencedText(t: string): string {
   return t
-    .replace(/<<<\s*KILDEINNHOLD-(START|SLUTT)\s*>>>/gi, "[markør fjernet]")
-    .replace(/<<<|>>>/g, "")
-    .replace(/["\u201C\u201D\u201E\u00AB\u00BB]/g, "'");
+    .replace(/[<>\uFF1C\uFF1E\u2039\u203A\u3008\u3009\u27E8\u27E9\u2329\u232A\uFE64\uFE65]/g, "")
+    .replace(/KILDEINNHOLD-(START|SLUTT)/gi, "[markør fjernet]")
+    .replace(/["\u201C\u201D\u201E\u00AB\u00BB\uFF02]/g, "'");
 }
 
 function fencedEvidenceBlockFor(items: readonly { source_url: string; content_excerpt: string }[]): string {
