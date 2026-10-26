@@ -50322,3 +50322,29 @@ runSerial(async () => {
     failures.push("owner-order-email-s1b7: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
+// per host, default off; CCBot never; shared counter per host) and its wiring
+// into Finn-tannlege REST (/api/tannlege/agents[/:id]) and A2A message/send.
+// Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
+// flags and swaps the dental db-factory (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 1: e-post-grense per IP (finn-tannlege REST + A2A) ──");
+  for (const [label, load] of [
+    ["email reveal guard", () => (require("../src/services/email-reveal-guard.test") as typeof import("../src/services/email-reveal-guard.test")).runEmailRevealGuardTests({ log: false })],
+    ["dental email reveal guard", () => (require("../src/routes/dental-email-reveal-guard.test") as typeof import("../src/routes/dental-email-reveal-guard.test")).runDentalEmailRevealGuardTests({ log: false })],
+  ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
+    try {
+      const r = await load();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ${f}`);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});

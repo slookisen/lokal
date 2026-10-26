@@ -74,6 +74,7 @@ import { planDentalSearch } from "../services/dental-query-parser";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { toDentalClinicCard } from "../services/dental-clinic-card";
 import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
+import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
 
 const router = Router();
 
@@ -166,6 +167,46 @@ function restAdminView(req: Request, res: Response, agents: readonly DentalAgent
   return hasAdminKey(req);
 }
 
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// slice 1 (S-A1/S-A3/S-A5): the two public answers below give a clinic's
+// e-mail only within the per-IP limit of services/email-reveal-guard.ts
+// (switch EMAIL_REVEAL_GUARD_DENTAL, default off). Over the limit, or for
+// CCBot, `epost` is null — what a clinic without an e-mail has — and the
+// field_provenance entries of the e-mail (when the answer has
+// field_provenance) go too. The X-Admin-Key view (the enrichment routine's
+// read-back) is not limited. With the switch on, the answer depends on the
+// client, so it is Cache-Control: private. Switch off: nothing changes.
+const EMAIL_PROVENANCE_KEYS: ReadonlySet<string> = new Set(["email", "epost"]);
+
+function withoutEmailProvenance(prov: unknown): unknown {
+  if (!prov || typeof prov !== "object" || Array.isArray(prov)) return prov;
+  if (!Object.keys(prov).some((key) => EMAIL_PROVENANCE_KEYS.has(key))) return prov;
+  return Object.fromEntries(Object.entries(prov).filter(([key]) => !EMAIL_PROVENANCE_KEYS.has(key)));
+}
+
+/** The ids among `agents` whose e-mail this request may not see; null = switch off (change nothing). */
+function restEmailWithheld(
+  req: Request,
+  res: Response,
+  agents: ReadonlyArray<{ id: string; epost?: string | null }>,
+  adminView: boolean
+): ReadonlySet<string> | null {
+  if (!emailRevealGuardEnabled("dental")) return null;
+  res.set("Cache-Control", "private");
+  if (adminView) return null;
+  const withEmail = agents.filter((a) => !!a.epost).map((a) => a.id);
+  const allowed = revealEmailFor(req, "dental", withEmail);
+  return allowed === null ? null : new Set(withEmail.filter((id) => !allowed.has(id)));
+}
+
+function withoutEmail<T extends { epost?: string | null }>(agent: T): T {
+  const shown: T = { ...agent, epost: null };
+  if ("field_provenance" in shown) {
+    (shown as { field_provenance?: unknown }).field_provenance = withoutEmailProvenance((shown as { field_provenance?: unknown }).field_provenance);
+  }
+  return shown;
+}
+
 // ─── GET /api/tannlege/agents — list with filters ───────────────────
 //   ?fylke=Oslo
 //   ?chain_brand=Volvat
@@ -235,8 +276,10 @@ router.get("/agents", (req: Request, res: Response) => {
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
     const rows = listDentalAgents(filter, limit, offset, { excludeParked });
     const adminView = restAdminView(req, res, rows);
-    const agents = rows.map((stored) => {
-      const a = restDentalAgent(stored, adminView);
+    const shownRows = rows.map((stored) => restDentalAgent(stored, adminView));
+    const emailWithheld = restEmailWithheld(req, res, shownRows, adminView);
+    const agents = shownRows.map((shown) => {
+      const a = emailWithheld?.has(shown.id) ? withoutEmail(shown) : shown;
       return {
         ...a,
         telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
@@ -282,12 +325,15 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
     .get(agent.id) as { last_verified_at: string | null } | undefined;
   const adminView = restAdminView(req, res, [agent]);
+  const stored = restDentalAgent(agent, adminView);
+  const emailWithheld = restEmailWithheld(req, res, [stored], adminView)?.has(stored.id) === true;
+  const summaryProvenance = restSummaryProvenance(agent, adminView);
   const provenance = buildProvenanceSummary(
-    (restSummaryProvenance(agent, adminView) as Record<string, unknown> | null) ?? null,
+    ((emailWithheld ? withoutEmailProvenance(summaryProvenance) : summaryProvenance) as Record<string, unknown> | null) ?? null,
     verifiedRow?.last_verified_at ?? null
   );
 
-  const shown = restDentalAgent(agent, adminView);
+  const shown = emailWithheld ? withoutEmail(stored) : stored;
   res.json({
     agent: {
       ...shown,
