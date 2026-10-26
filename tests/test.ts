@@ -11546,9 +11546,12 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   // Updated from 14 → 15: dev-request
   // 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt, Slice 0 adds
   // lokal_find_offers.
+  // Updated from 15 → 17: dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-
+  // og-kjoperagent, Fase B1 adds lokal_order_cancel and lokal_order_picked_up,
+  // registered only with ORDER_AGENT_ACTIONS_ENABLED on (default off: 15 listed).
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 15,
-    "phase5.11-a7: src/routes/mcp.ts registers exactly 15 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0)");
+  assertEq(toolCount, 17,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 17 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0 + 2 buyer order tools behind ORDER_AGENT_ACTIONS_ENABLED from Fase B1)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
   assertTrue(
@@ -37177,6 +37180,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("owner-orders-fase-a2: unexpected error: " + String(err?.message || err));
+  }
+  // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
+  try {
+    const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
+      typeof import("../src/routes/buyer-order-actions-fase-b1.test");
+    const b1 = await runBuyerOrderActionsFaseB1Tests({ log: false });
+    passed += b1.passed;
+    failed += b1.failed;
+    for (const f of b1.failures) failures.push("buyer-order-actions-fase-b1: " + f);
+    console.log(`  buyer-order-actions-fase-b1: ${b1.passed} passed, ${b1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("buyer-order-actions-fase-b1: unexpected error: " + String(err?.message || err));
   } finally {
     _orderActionsA1Resolve();
   }

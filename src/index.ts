@@ -93,6 +93,7 @@ import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
 import ownerOrdersRoutes from "./routes/owner-orders";
+import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
@@ -528,6 +529,8 @@ app.use("/", ownerPortalRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
+// Fase B1: the buyer's order card (/ordre/:id?ref=<buyer_ref>), linked from the buyer receipts.
+app.use("/", buyerOrderCardRoutes);
 // dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
 // link landing page (GET/POST /aktiver-bestillinger?t=…).
 app.use("/", orderActivationRoutes);

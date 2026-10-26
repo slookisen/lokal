@@ -14,8 +14,9 @@
  *            cannot_deliver — plus the existing page buttons «Hentet»
  *            (complete) and the legacy «Klar for henting» (mark_ready).
  *   buyer  : withdraw (pending), cancel (after confirmation), picked_up,
- *            message — types and service-level rules only; no buyer channel
- *            exists yet, and `message` is answered 501 until Fase B2.
+ *            message — the buyer channels are MCP (lokal_order_cancel /
+ *            lokal_order_picked_up) and the order card /ordre/:id (Fase B1,
+ *            buyer-order-actions.ts); `message` is answered 501 until Fase B2.
  *   system : auto_complete, producer_no_response (only for an order whose
  *            producer e-mail was sent, notify_sent_at), payment_expired.
  *   admin  : everything.
@@ -53,7 +54,7 @@ import {
 import { isPaymentsLifecycleActive, onOrderTransitioned, type OrderPaymentEffect } from "./payment-service";
 import type { PaymentsStripeClient } from "./payment-provider";
 import { sendBuyerOrderReceipt, type ReceiptEvent } from "./order-receipt-service";
-import { sendAdminOrderAlert } from "./order-notify-service";
+import { sendAdminOrderAlert, sendProducerBuyerCancelNotice } from "./order-notify-service";
 import {
   autoCompleteDueMs,
   isOrderAutocompleteEnabled,
@@ -325,6 +326,11 @@ export async function applyOrderAction(
 
   const receipt = receiptEventFor(spec.to);
   if (receipt) void sendBuyerOrderReceipt(orderId, receipt).catch(() => { /* never fails the action */ });
+  // Fase B1: the buyer's own withdraw / cancel (MCP, order card) is told to
+  // the producer by e-mail. Not for a replay (returned above) or an admin.
+  if (actor.role === "buyer" && (action === "withdraw" || action === "cancel")) {
+    void sendProducerBuyerCancelNotice(orderId, action).catch(() => { /* never fails the action */ });
+  }
 
   return { success: true, order_id: orderId, action, status: spec.to, replayed: false, payment_effect };
 }
