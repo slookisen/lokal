@@ -9151,15 +9151,16 @@ console.log("\n── pf-stat ai: tooltip wording (Daniel-confirmed) ──");
   assertTrue(
     seoSrcTip.includes(
       // 2026-10-13 (statistikk-riktig-for-investorer, S5): Daniel's wording
-      // kept word for word; the number follows the real window (statsDays,
-      // the 60-day raw retention), not a fixed 90.
-      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager."
-    ),
+      // kept word for word. Since statistikk S2c (2026-10-26) the period is
+      // the tile's own («, siste 12 måneder.» / «, siden <dato>.»), appended
+      // by the stats script (setMeta(a, …, "aiViews", ".")).
+      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester`"
+    ) && seoSrcTip.includes('(el.getAttribute("title") || "") + ", " + lb[key] + end') && seoSrcTip.includes('"aiViews", ".");'),
     "ai-tooltip: Norwegian branch uses the exact Daniel-confirmed wording"
   );
   assertTrue(
     seoSrcTip.includes("Every profile has this statistic.") &&
-      /It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last \$\{statsDays\} days\./.test(seoSrcTip),
+      seoSrcTip.includes("It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services`"),
     "ai-tooltip: English branch carries the equivalent wording"
   );
   assertTrue(
@@ -44490,6 +44491,26 @@ runSerial(async () => {
     failed++;
     failures.push(`traffic-year: unexpected error: ${String(err?.message || err)}`);
     console.log(`  ✗ traffic-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2c: the per-profile
+  // tiles show 12 months or «siden <dato>», never «· 60d». Swaps getDb()
+  // (restored in finally), so serial.
+  console.log("\n── profile-year: per-profile tiles over 12 months ──");
+  try {
+    const { runProfileYearTests } = require("../src/services/profile-year.test") as
+      typeof import("../src/services/profile-year.test");
+    const r = await runProfileYearTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-year: " + f);
+    console.log(`  profile-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-year: unexpected error: ${String(err?.message || err)}`);
   }
 });
 
