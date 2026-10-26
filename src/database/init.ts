@@ -5197,6 +5197,30 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
   } catch { /* best-effort — the lookup before the transition still works */ }
 
+  // Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // the message thread per order (services/order-messages.ts). Additive; no
+  // existing table changes. One row per message:
+  //   author_role     : 'buyer' (MCP lokal_order_message / the order card) or
+  //                     'seller' (Mine ordrer).
+  //   body            : the trimmed text, at most 1000 characters.
+  //   channel         : 'mcp' | 'web' | 'owner_portal'.
+  //   idempotency_key : the caller's key, namespaced per role ('b:' / 's:');
+  //                     a repeat of the same key returns the stored message.
+  //   created_at      : ISO-8601 UTC (the per-order rate limit compares it).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_messages (
+      id              TEXT PRIMARY KEY,
+      order_id        TEXT NOT NULL,
+      author_role     TEXT NOT NULL CHECK(author_role IN ('buyer','seller')),
+      body            TEXT NOT NULL,
+      channel         TEXT NOT NULL,
+      idempotency_key TEXT,
+      created_at      TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_order_messages_order_id ON order_messages(order_id, created_at)`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_messages_idem ON order_messages(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.

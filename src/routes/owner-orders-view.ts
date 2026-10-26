@@ -15,6 +15,7 @@ import { cancelActionsEnabled } from "../services/order-actions";
 import { formatPickupTimeOslo, noShowEarliestMs, isOrderAutocompleteEnabled } from "../services/order-lifecycle";
 import { PRICE_BY_AGREEMENT } from "../services/order-pricing";
 import { randomUUID } from "crypto";
+import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS, type OrderMessageRow } from "../services/order-messages";
 
 export type OwnerOrdersTab = "venter" | "kommende" | "avsluttet";
 export const OWNER_ORDERS_TABS: ReadonlyArray<{ key: OwnerOrdersTab; label: string }> = [
@@ -196,6 +197,12 @@ export interface RowContext {
   /** Row starts unfolded. */
   open: boolean;
   now?: Date;
+  /**
+   * Fase B2: the form target for the seller's message (the owner-session
+   * page only). Absent: the thread is shown read-only (the e-mail token
+   * view). Ignored while ORDER_MESSAGES_ENABLED is off.
+   */
+  messagePostTo?: string;
 }
 
 const ACTION_LABEL = {
@@ -253,8 +260,66 @@ function detailHtml(o: OwnerOrder, ctx: RowContext): string {
   return `<div class="mo-detail">
     <div class="mo-block"><strong>Varer</strong><ul class="mo-items">${itemRows}</ul>${sum}</div>
     ${contact ? `<div class="mo-block"><strong>Kunde</strong>${contact}</div>` : ""}
-    ${wish}${tl}${actionsHtml(o, ctx)}
+    ${wish}${tl}${messagesHtml(o, ctx)}${actionsHtml(o, ctx)}
   </div>`;
+}
+
+// ─── Fase B2: the message thread ───────────────────────────────────────────
+
+function msgTime(ts: string): string {
+  return formatPickupTimeOslo(ts);
+}
+
+/**
+ * The thread of one order, oldest first, every text HTML-escaped (it is
+ * written by the other party). `viewer` decides the labels («Du» for the
+ * viewer's own messages). Shared with the buyer's order card. Inline styles
+ * only, so the shared page CSS is unchanged.
+ */
+export function messageThreadHtml(rows: OrderMessageRow[], viewer: "buyer" | "seller", producerName: string, anchorId?: string): string {
+  const who = (role: string) => role === viewer ? "Du" : role === "buyer" ? "Kunden" : producerName;
+  const items = rows.map((m) =>
+    `<li style="margin:6px 0;padding:8px 10px;border-radius:8px;background:${m.author_role === viewer ? "#eef0ea" : "#fdf8ef"}">` +
+    `<span class="mo-hint">${esc(who(m.author_role))} · ${esc(msgTime(m.created_at))}</span>` +
+    `<p style="margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere">${esc(m.body)}</p></li>`,
+  ).join("");
+  return `<div class="mo-block"${anchorId ? ` id="${esc(anchorId)}"` : ""}><strong>Meldinger</strong>` +
+    (rows.length ? `<ul style="list-style:none;margin:6px 0 0;padding:0">${items}</ul>` : `<p class="mo-hint">Ingen meldinger ennå.</p>`) +
+    `</div>`;
+}
+
+/** The PRG error code of a refused message (the pages map it to a banner). */
+export function messageErrorCode(r: { status: number; code?: string }): string {
+  if (r.code === "empty") return "melding-tom";
+  if (r.code === "too_long") return "melding-lang";
+  if (r.code === "rate_limited" || r.status === 429) return "melding-grense";
+  if (r.code === "closed") return "melding-stengt";
+  return "melding-feil";
+}
+
+/** The banner after a message post; "" when done/error is not about a message. */
+export function messageBannerHtml(done: string, error: string, okText: string): string {
+  switch (error) {
+    case "melding-tom": return `<div class="mo-banner warn" role="alert">Meldingen er tom. Skriv noe før du sender.</div>`;
+    case "melding-lang": return `<div class="mo-banner warn" role="alert">Meldingen er for lang. Den kan ha høyst ${ORDER_MESSAGE_MAX_CHARS} tegn.</div>`;
+    case "melding-grense": return `<div class="mo-banner warn" role="alert">Du har sendt mange meldinger på denne ordren den siste timen. Prøv igjen senere.</div>`;
+    case "melding-stengt": return `<div class="mo-banner warn" role="alert">Ordren er avsluttet og tar ikke imot flere meldinger.</div>`;
+    case "melding-feil": return `<div class="mo-banner warn" role="alert">Kunne ikke sende meldingen. Prøv igjen.</div>`;
+  }
+  return done === "melding" && !error ? `<div class="mo-banner ok" role="status">${esc(okText)}</div>` : "";
+}
+
+function messagesHtml(o: OwnerOrder, ctx: RowContext): string {
+  if (!isOrderMessagesEnabled()) return "";
+  const thread = messageThreadHtml(listOrderMessages(o.id), "seller", o.producer_name);
+  if (!ctx.messagePostTo) {
+    return thread + `<p class="mo-hint">Svar kunden i Mine ordrer (krever innlogging).</p>`;
+  }
+  if (!orderTakesMessages(o, ctx.now)) return thread;
+  return thread +
+    `<form method="post" action="${esc(ctx.messagePostTo)}" class="mo-form"><input type="hidden" name="idem" value="${randomUUID()}">` +
+    `<label class="mo-pick">Skriv til kunden<textarea name="message" rows="3" maxlength="${ORDER_MESSAGE_MAX_CHARS}" required style="display:block;width:100%;margin-top:4px;padding:10px;font-size:1rem;border:1px solid #d8dbd2;border-radius:8px"></textarea></label>` +
+    `<button type="submit" class="mo-btn mo-secondary">Send melding</button></form>`;
 }
 
 export function renderOrderRow(o: OwnerOrder, ctx: RowContext): string {
@@ -336,6 +401,11 @@ ${body}
 }
 
 export function bannerHtml(done: string, error: string): string {
+  // Fase B2: the message banners exist only while the thread is switched on.
+  if (isOrderMessagesEnabled()) {
+    const m = messageBannerHtml(done, error, "Meldingen er sendt til kunden.");
+    if (m) return m;
+  }
   if (error === "hentetid") return `<div class="mo-banner warn" role="alert">Hentetiden er ikke gyldig. Velg et tidspunkt fra i dag og fram i tid, eller la feltet stå tomt.</div>`;
   if (error === "ugyldig") return `<div class="mo-banner warn" role="alert">Handlingen er ikke gyldig for ordrens status akkurat nå.</div>`;
   if (error) return `<div class="mo-banner warn" role="alert">Kunne ikke oppdatere ordren. Prøv igjen.</div>`;
@@ -361,7 +431,10 @@ export function renderOrdersPage(opts: {
     `<a class="mo-tab" href="${base}?tab=${t.key}"${t.key === opts.tab ? ` aria-current="page"` : ""}>${esc(t.label)}<span class="mo-count">${opts.counts[t.key]}</span></a>`,
   ).join("");
   const rows = opts.orders.map((o) =>
-    renderOrderRow(o, { postTo: `${base}/${encodeURIComponent(o.id)}`, open: o.id === opts.openId, now: opts.now }),
+    renderOrderRow(o, {
+      postTo: `${base}/${encodeURIComponent(o.id)}`, open: o.id === opts.openId, now: opts.now,
+      messagePostTo: `${base}/${encodeURIComponent(o.id)}/melding`,
+    }),
   ).join("\n");
   const empty = opts.orders.length ? "" : `<p class="mo-empty">${opts.tab === "venter" ? "Ingen ordrer venter på svar." : opts.tab === "kommende" ? "Ingen kommende henting." : "Ingen avsluttede ordrer ennå."}</p>`;
   return ordersShell(`Mine ordrer · ${opts.producerName}`, `

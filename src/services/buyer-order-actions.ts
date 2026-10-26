@@ -31,6 +31,10 @@ import {
 import { applyOrderAction, cancelActionsEnabled, type OrderChannel } from "./order-actions";
 import { buyerCancelAfterConfirmationText } from "./order-receipt-service";
 import type { PaymentsStripeClient } from "./payment-provider";
+import {
+  isOrderMessagesEnabled, orderMessagesForAgent, orderTakesMessages, postOrderMessage,
+  ORDER_MESSAGES_UNTRUSTED_NOTE, type OrderMessageView, type PostOrderMessageResult,
+} from "./order-messages";
 
 /** Default off. On: the MCP tools are listed and callable, and lokal_order_status carries the B1 fields. */
 export const ORDER_AGENT_ACTIONS_FLAG = "ORDER_AGENT_ACTIONS_ENABLED";
@@ -40,7 +44,7 @@ export function isOrderAgentActionsEnabled(env: NodeJS.ProcessEnv = process.env)
   return v === "1" || v === "true";
 }
 
-export type BuyerAvailableAction = "withdraw" | "cancel" | "picked_up";
+export type BuyerAvailableAction = "withdraw" | "cancel" | "picked_up" | "message";
 export type BuyerOrderCommand = "cancel" | "picked_up";
 
 /** The answer for an unknown order and for a wrong buyer_ref alike. */
@@ -83,7 +87,8 @@ export function getBuyerOrderRow(orderId: string, buyerRef: unknown, db: any = c
 /**
  * The buyer actions open for an order in its current state. A cancellation of
  * an order that is (or may be) prepaid follows the same gate as every other
- * channel (cancelActionsEnabled). `message` comes with Fase B2.
+ * channel (cancelActionsEnabled). `message` (Fase B2) is added by
+ * buyerOrderStatusExtras while ORDER_MESSAGES_ENABLED is on.
  */
 export function buyerAvailableActions(status: string, paymentMode: string | null): BuyerAvailableAction[] {
   const cancels = cancelActionsEnabled(paymentMode);
@@ -96,21 +101,64 @@ function paymentModeOf(db: any, orderId: string): string | null {
   try { return orderPaymentMode(db, orderId); } catch { return PAYMENT_MODE_UNKNOWN; }
 }
 
-/** The fields Fase B1 adds to lokal_order_status (only while ORDER_AGENT_ACTIONS_ENABLED is on). */
-export function buyerOrderStatusExtras(orderId: string, db: any = cartServiceDb()): {
+/**
+ * The fields Fase B1 adds to lokal_order_status (only while
+ * ORDER_AGENT_ACTIONS_ENABLED is on). Fase B2: with ORDER_MESSAGES_ENABLED
+ * also on, messages[] is the order's thread as quoted data ({from, text,
+ * created_at}), messages_notice says that the text is untrusted, and
+ * available_actions carries 'message' while the order takes messages.
+ * Off: messages stays [] and nothing else changes.
+ */
+export function buyerOrderStatusExtras(orderId: string, db: any = cartServiceDb(), env: NodeJS.ProcessEnv = process.env): {
   available_actions: BuyerAvailableAction[];
   completion_source: string | null;
-  messages: unknown[];
+  messages: OrderMessageView[];
+  messages_notice?: string;
 } {
-  const r = db.prepare("SELECT status, completion_source FROM orders WHERE id = ?").get(orderId) as
-    | { status: string; completion_source: string | null }
+  const r = db.prepare("SELECT status, completion_source, updated_at FROM orders WHERE id = ?").get(orderId) as
+    | { status: string; completion_source: string | null; updated_at: string | null }
     | undefined;
+  const actions: BuyerAvailableAction[] = r ? buyerAvailableActions(r.status, paymentModeOf(db, orderId)) : [];
+  if (!isOrderMessagesEnabled(env)) {
+    return { available_actions: actions, completion_source: r?.completion_source ?? null, messages: [] };
+  }
+  if (r && orderTakesMessages(r)) actions.push("message");
   return {
-    available_actions: r ? buyerAvailableActions(r.status, paymentModeOf(db, orderId)) : [],
+    available_actions: actions,
     completion_source: r?.completion_source ?? null,
-    // The message thread is Fase B2; always empty until then.
-    messages: [],
+    messages: r ? orderMessagesForAgent(orderId, db) : [],
+    messages_notice: ORDER_MESSAGES_UNTRUSTED_NOTE,
   };
+}
+
+export type BuyerOrderMessageResult =
+  | Extract<PostOrderMessageResult, { success: true }>
+  | { success: false; status: number; error: string; code?: string };
+
+/**
+ * Fase B2: the buyer writes one message on one order (MCP lokal_order_message,
+ * the order card), authenticated with the buyer_ref like the B1 commands
+ * (wrong ref and unknown order → the same 403). The key is namespaced "b:".
+ */
+export async function postBuyerOrderMessage(
+  orderId: string,
+  buyerRef: unknown,
+  message: unknown,
+  channel: "mcp" | "web",
+  opts: { idempotencyKey?: string | null; now?: Date; env?: NodeJS.ProcessEnv } = {},
+): Promise<BuyerOrderMessageResult> {
+  if (!isOrderMessagesEnabled(opts.env)) return { success: false, status: 404, code: "disabled", error: "Order messages are not available" };
+  const order = getBuyerOrderRow(orderId, buyerRef);
+  if (!order) return { success: false, status: 403, error: BUYER_ORDER_ACCESS_DENIED };
+  let key: string | null = null;
+  if (opts.idempotencyKey != null && String(opts.idempotencyKey) !== "") {
+    const raw = String(opts.idempotencyKey);
+    if (!BUYER_IDEM_RE.test(raw)) {
+      return { success: false, status: 400, error: "idempotency_key must be 1–120 characters [A-Za-z0-9:_.-]" };
+    }
+    key = `b:${raw}`;
+  }
+  return postOrderMessage(order.id, "buyer", message, channel, { idempotencyKey: key, now: opts.now, env: opts.env });
 }
 
 export type BuyerOrderCommandResult =

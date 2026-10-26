@@ -11549,9 +11549,10 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   // Updated from 15 → 17: dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-
   // og-kjoperagent, Fase B1 adds lokal_order_cancel and lokal_order_picked_up,
   // registered only with ORDER_AGENT_ACTIONS_ENABLED on (default off: 15 listed).
+  // Updated from 17 → 18: Fase B2 adds lokal_order_message, behind the same switch.
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 17,
-    "phase5.11-a7: src/routes/mcp.ts registers exactly 17 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0 + 2 buyer order tools behind ORDER_AGENT_ACTIONS_ENABLED from Fase B1)");
+  assertEq(toolCount, 18,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 18 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0 + 2 buyer order tools behind ORDER_AGENT_ACTIONS_ENABLED from Fase B1 + lokal_order_message from Fase B2)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
   assertTrue(
@@ -37193,6 +37194,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("buyer-order-actions-fase-b1: unexpected error: " + String(err?.message || err));
+  }
+  // Fase B2 (meldingstråd per ordre) runs strictly after B1 (own in-memory DB).
+  try {
+    const { runOrderMessagesFaseB2Tests } = require("../src/routes/order-messages-fase-b2.test") as
+      typeof import("../src/routes/order-messages-fase-b2.test");
+    const b2 = await runOrderMessagesFaseB2Tests({ log: false });
+    passed += b2.passed;
+    failed += b2.failed;
+    for (const f of b2.failures) failures.push("order-messages-fase-b2: " + f);
+    console.log(`  order-messages-fase-b2: ${b2.passed} passed, ${b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-messages-fase-b2: unexpected error: " + String(err?.message || err));
   } finally {
     _orderActionsA1Resolve();
   }

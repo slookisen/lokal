@@ -59,14 +59,19 @@ export interface TestSummary {
 export const RFB_CONTRACT_FREEZE_FIXTURE = path.join(__dirname, "../../tests/fixtures/rfb-mcp-contract-freeze.json");
 /**
  * Fase B1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent,
- * AC10): the contract with ORDER_AGENT_ACTIONS_ENABLED=1 — the two buyer
- * order tools added. Only the tools/list hash and the two new tools are
+ * AC10): the contract with ORDER_AGENT_ACTIONS_ENABLED=1 — the buyer order
+ * tools added (B1: lokal_order_cancel, lokal_order_picked_up; B2:
+ * lokal_order_message). Only the tools/list hash and the new tools are
  * pinned here; every other part must equal the default freeze above.
+ * ORDER_MESSAGES_ENABLED is held off here (it changes the lokal_order_status
+ * description only together with ORDER_AGENT_ACTIONS_ENABLED; that variant is
+ * checked by order-messages-fase-b2.test.ts).
  */
 export const RFB_ORDER_ACTIONS_FREEZE_FIXTURE = path.join(__dirname, "../../tests/fixtures/rfb-mcp-contract-freeze-order-actions.json");
 const ORDER_ACTIONS_FLAG = "ORDER_AGENT_ACTIONS_ENABLED";
 const ORDER_ACTIONS_PREFIX = "ORDER_AGENT_ACTIONS_ENABLED=1";
-const ORDER_ACTION_TOOLS = ["lokal_order_cancel", "lokal_order_picked_up"];
+const ORDER_ACTION_TOOLS = ["lokal_order_cancel", "lokal_order_picked_up", "lokal_order_message"];
+const ORDER_MESSAGES_FLAG = "ORDER_MESSAGES_ENABLED";
 
 /** The PAYMENTS_ENABLED values the contract is pinned for (unset = off, as in production today). */
 const PAYMENTS_VARIANTS: ReadonlyArray<{ label: string; value: string | undefined }> = [
@@ -150,6 +155,8 @@ async function sessionContract(url: string, prefix: string): Promise<LiveContrac
 export async function currentRfbContract(opts: { orderAgentActions?: boolean } = {}): Promise<LiveContract> {
   const prevPayments = process.env.PAYMENTS_ENABLED;
   const prevActions = process.env[ORDER_ACTIONS_FLAG];
+  const prevMessages = process.env[ORDER_MESSAGES_FLAG];
+  delete process.env[ORDER_MESSAGES_FLAG];
   if (opts.orderAgentActions) process.env[ORDER_ACTIONS_FLAG] = "1";
   else delete process.env[ORDER_ACTIONS_FLAG];
   const prevDb = __peekDbForTesting();
@@ -183,6 +190,8 @@ export async function currentRfbContract(opts: { orderAgentActions?: boolean } =
     else process.env.PAYMENTS_ENABLED = prevPayments;
     if (prevActions === undefined) delete process.env[ORDER_ACTIONS_FLAG];
     else process.env[ORDER_ACTIONS_FLAG] = prevActions;
+    if (prevMessages === undefined) delete process.env[ORDER_MESSAGES_FLAG];
+    else process.env[ORDER_MESSAGES_FLAG] = prevMessages;
     if (prevDb) __setDbForTesting(prevDb as any);
   }
 }
@@ -254,8 +263,8 @@ export function runRfbMcpContractFreezeTests(opts: { log?: boolean } = {}): Prom
         `rfb-cf-4: ${part} with its keys in reverse order (also inside icons) is the same serverInfo (canonical JSON)`);
       }
 
-      // Fase B1 (AC10): ORDER_AGENT_ACTIONS_ENABLED=1 adds exactly the two
-      // buyer order tools. Every other part (instructions, serverInfo, each
+      // Fase B1/B2 (AC10): ORDER_AGENT_ACTIONS_ENABLED=1 adds exactly the
+      // three buyer order tools. Every other part (instructions, serverInfo, each
       // existing tool, resources) is byte-identical to the default freeze;
       // tools/list and the new tools have their own pinned hashes.
       const frozenOn = JSON.parse(fs.readFileSync(RFB_ORDER_ACTIONS_FREEZE_FIXTURE, "utf8")) as { hashes: Record<string, string> };
@@ -267,14 +276,14 @@ export function runRfbMcpContractFreezeTests(opts: { log?: boolean } = {}): Prom
         ...PAYMENTS_VARIANTS.flatMap((v) => ORDER_ACTION_TOOLS.map((t) => `${v.label} tools/list#${t}`)),
       ].sort();
       assertEq(Object.keys(liveOn.hashes).map(strip).sort(), expectedOnParts,
-        "rfb-cf-5: with ORDER_AGENT_ACTIONS_ENABLED=1 the contract has exactly the default parts plus lokal_order_cancel and lokal_order_picked_up");
+        "rfb-cf-5: with ORDER_AGENT_ACTIONS_ENABLED=1 the contract has exactly the default parts plus lokal_order_cancel, lokal_order_picked_up and lokal_order_message");
       for (const [part, hash] of Object.entries(liveOn.hashes)) {
         const base = strip(part);
         if (isNewPart(base)) continue;
         assertEq(hash, frozen.hashes[base], `rfb-cf-6: ${part} is unchanged from the default freeze`);
       }
       assertEq(Object.keys(frozenOn.hashes).sort(), Object.keys(liveOn.hashes).filter((k) => isNewPart(strip(k))).sort(),
-        "rfb-cf-7: the order-actions freeze pins tools/list and the two new tools per PAYMENTS_ENABLED value");
+        "rfb-cf-7: the order-actions freeze pins tools/list and the three new tools per PAYMENTS_ENABLED value");
       for (const [part, hash] of Object.entries(frozenOn.hashes)) {
         assertEq(liveOn.hashes[part], hash, `rfb-cf-8: ${part} is byte-identical to the pinned order-actions contract`);
       }

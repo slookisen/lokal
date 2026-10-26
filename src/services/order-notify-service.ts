@@ -576,3 +576,71 @@ export async function sendProducerBuyerCancelNotice(orderId: string, kind: "with
     return "failed";
   }
 }
+
+/**
+ * Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+ * the producer is told that the BUYER wrote a message on an order (MCP
+ * lokal_order_message or the order card). Same gated recipient
+ * (resolveOrderNotificationRecipient) and the same send path as the order
+ * e-mail, and like sendProducerBuyerCancelNotice only for an order whose
+ * order e-mail reached the producer (notify_sent_at). The mail carries the
+ * message text (escaped) and links to the order: the per-order view of the
+ * order e-mail (no login) and «Mine ordrer» (login), where the producer
+ * answers. No buyer contact data in it: the Reply-To is the platform
+ * address, so a reply never reveals anything new to either side.
+ * Fire-and-forget; never throws; the text is never logged.
+ */
+export async function sendProducerOrderMessageNotice(orderId: string, messageText: string): Promise<OrderNotifyOutcome> {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    const o = db.prepare(`
+      SELECT o.id, o.agent_id, o.notify_sent_at, o.confirm_token, a.name AS producer_name
+      FROM orders o INNER JOIN agents a ON a.id = o.agent_id
+      WHERE o.id = ?
+    `).get(orderId) as { id: string; agent_id: string; notify_sent_at: string | null; confirm_token: string | null; producer_name: string } | undefined;
+    if (!o) return "skipped";
+    if (!o.notify_sent_at) {
+      console.log(`[order-notify] message notice skipped order=${orderId} reason=order_not_sent`);
+      return "skipped";
+    }
+    const recipient = resolveOrderNotificationRecipient(o.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] message notice skipped order=${orderId} agent=${o.agent_id} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const orderRef = o.id.slice(0, 8);
+    const orderUrl = o.confirm_token ? `${APP_URL}/produsent/ordre/${encodeURIComponent(o.confirm_token)}/kompakt` : null;
+    const mineUrl = `${APP_URL}/eier/${encodeURIComponent(o.agent_id)}/ordrer?o=${encodeURIComponent(o.id)}#o-${encodeURIComponent(o.id)}`;
+    const quoted = messageText.split("\n").map((l) => `> ${l}`).join("\n");
+    const textContent =
+      `Hei,\n\nKunden har skrevet en melding om bestillingen ${orderRef}:\n\n${quoted}\n\n` +
+      (orderUrl ? `Se bestillingen: ${orderUrl}\n` : "") +
+      `Svar kunden i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+      `Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det i Mine ordrer.\n\nHilsen\nRett fra Bonden`;
+    const htmlContent =
+      `<p>Hei,</p>\n<p>Kunden har skrevet en melding om bestillingen ${escHtml(orderRef)}:</p>\n` +
+      `<blockquote style="margin:0 0 12px;padding:8px 12px;border-left:3px solid #ccc;white-space:pre-wrap">${escHtml(messageText)}</blockquote>\n` +
+      (orderUrl ? `<p><a href="${escHtml(orderUrl)}">Se bestillingen</a></p>\n` : "") +
+      `<p><a href="${escHtml(mineUrl)}">Svar kunden i Mine ordrer</a> (krever innlogging)</p>\n` +
+      `<p>Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det i Mine ordrer.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`;
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject: `Ny melding fra kunden (${orderRef})`,
+      htmlContent,
+      textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // F8: transactional, not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] message notice sent order=${orderId} agent=${o.agent_id}`);
+      return "sent";
+    }
+    console.error(`[order-notify] message notice FAILED order=${orderId} agent=${o.agent_id}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] message notice FAILED order=${orderId}:`, (err as any)?.message ?? "error");
+    return "failed";
+  }
+}

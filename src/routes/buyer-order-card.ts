@@ -23,13 +23,14 @@ import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { cartServiceDb, getOrderTimeline, orderPaymentMode, PAYMENT_MODE_UNKNOWN, producerContact, producerTraderStatus } from "../services/cart-service";
-import { applyBuyerOrderCommand, buyerAvailableActions, EXPECTED_ACTION_MISMATCH, getBuyerOrderRow, type BuyerOrderCommand } from "../services/buyer-order-actions";
+import { applyBuyerOrderCommand, buyerAvailableActions, EXPECTED_ACTION_MISMATCH, getBuyerOrderRow, postBuyerOrderMessage, type BuyerOrderCommand } from "../services/buyer-order-actions";
+import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS } from "../services/order-messages";
 import { CONSUMER_CANCEL_LOSS_SENTENCE } from "../services/order-receipt-service";
 import { isPaymentsLifecycleActive, resolvePaymentsStripeClient } from "../services/payment-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
 import { formatPickupTimeOslo } from "../services/order-lifecycle";
 import { PRICE_BY_AGREEMENT } from "../services/order-pricing";
-import { ordersShell, esc, itemsSummary } from "./owner-orders-view";
+import { ordersShell, esc, itemsSummary, messageThreadHtml, messageErrorCode, messageBannerHtml } from "./owner-orders-view";
 
 const router = Router();
 
@@ -112,6 +113,11 @@ function buyerStatusLabel(status: string, cancelReason: string | null, completio
 }
 
 function bannerHtml(done: string, error: string): string {
+  // Fase B2: the message banners exist only while the thread is switched on.
+  if (isOrderMessagesEnabled()) {
+    const m = messageBannerHtml(done, error, "Meldingen er sendt til produsenten.");
+    if (m) return m;
+  }
   if (error === "endret") return `<div class="mo-banner warn" role="alert">Bestillingen er endret siden du åpnet siden, så ingenting ble gjort. Se status under før du velger på nytt.</div>`;
   if (error === "ugyldig") return `<div class="mo-banner warn" role="alert">Handlingen er ikke mulig for bestillingens status akkurat nå.</div>`;
   if (error) return `<div class="mo-banner warn" role="alert">Kunne ikke oppdatere bestillingen. Prøv igjen.</div>`;
@@ -166,6 +172,21 @@ export function renderBuyerOrderCard(orderId: string, ref: string, done: string,
   }
   const actionsHtml = parts.length ? `<div class="mo-actions">${parts.join("")}</div>` : "";
 
+  // Fase B2: the message thread and the buyer's form (ORDER_MESSAGES_ENABLED only).
+  let threadHtml = "";
+  if (isOrderMessagesEnabled()) {
+    const st0 = db.prepare("SELECT updated_at FROM orders WHERE id = ?").get(o.id) as { updated_at: string | null } | undefined;
+    const canWrite = orderTakesMessages({ status: o.status, updated_at: st0?.updated_at ?? null });
+    const msgForm = canWrite
+      ? `<form method="post" action="/ordre/${esc(encodeURIComponent(o.id))}" class="mo-form">` +
+        `<input type="hidden" name="ref" value="${esc(ref)}"><input type="hidden" name="action" value="message">` +
+        `<input type="hidden" name="idem" value="${randomUUID()}">` +
+        `<label class="mo-pick">Skriv til ${esc(o.producer_name)}<textarea name="message" rows="3" maxlength="${ORDER_MESSAGE_MAX_CHARS}" required style="display:block;width:100%;margin-top:4px;padding:10px;font-size:1rem;border:1px solid #d8dbd2;border-radius:8px"></textarea></label>` +
+        `<button type="submit" class="mo-btn mo-secondary">Send melding</button></form>`
+      : "";
+    threadHtml = messageThreadHtml(listOrderMessages(o.id, db), "buyer", o.producer_name, "meldinger") + msgForm;
+  }
+
   const itemRows = items.map((i) =>
     `<li><span>${esc(i.qty ?? "?")} × ${esc(i.name_snapshot || "Vare")}</span><span>${i.line_total != null ? `${esc(i.line_total)} kr` : esc(PRICE_BY_AGREEMENT)}</span></li>`,
   ).join("");
@@ -190,7 +211,7 @@ ${bannerHtml(done, error)}
   <div class="mo-detail" style="border-top:none">
     <p class="mo-top"><span class="mo-who">${esc(itemsSummary(items))}</span><span class="mo-badge mo-${st.cls}">${esc(st.text)}</span></p>
     <p class="mo-pick-line">${esc(pick)}</p>
-    ${actionsHtml}
+    ${actionsHtml}${threadHtml}
   </div>
   <details class="mo-row" style="border:none;margin:0">
     <summary>Vis varer og kontaktinfo</summary>
@@ -227,6 +248,13 @@ router.post("/ordre/:id", buyerOrderCardLimiter, express.urlencoded({ extended: 
     const back = cardPath(orderId, ref);
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("Cache-Control", "no-store");
+    // Fase B2: a message to the producer (ORDER_MESSAGES_ENABLED only; off,
+    // "message" is an unknown action as before).
+    if (String(body["action"] || "") === "message" && isOrderMessagesEnabled()) {
+      const m = await postBuyerOrderMessage(orderId, ref, body["message"], "web", { idempotencyKey: idemFrom(body) });
+      if (!m.success) return res.redirect(303, `${back}&error=${messageErrorCode(m)}#meldinger`);
+      return res.redirect(303, `${back}&done=melding#meldinger`);
+    }
     const command = COMMANDS[String(body["action"] || "")];
     if (!command) return res.redirect(303, `${back}&error=ugyldig`);
     // Review B1: a cancel from the card must say which cancel the buyer saw.
