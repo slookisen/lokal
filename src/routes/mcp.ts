@@ -1892,8 +1892,11 @@ export function registerTools(
       "lokal_order_cancel",
       {
         title: "Cancel a pickup order",
-        description: "Cancel a pickup order placed with lokal_cart_submit, on the buyer's behalf. Requires the order_id and the buyer_ref token. While the order is pending (the producer has not confirmed it yet), this withdraws it at no cost: status becomes cancelled with cancel_reason='buyer_cancelled', nothing counts against the producer, and the producer is told by e-mail. Once the producer has confirmed the order, the purchase is binding: cancelling it is a cancellation under the Norwegian Consumer Purchases Act § 41, and the producer may claim documented loss the cancellation causes. The response's consumer_law_note says what applies; show it to the user. Only call this tool when the user has explicitly told you to cancel this order. For a confirmed order, first tell the user this consequence and get their explicit instruction. A cancellation cannot be undone. lokal_order_status lists what is possible for an order in available_actions ('withdraw' or 'cancel' = this tool). Wrong buyer_ref or unknown order: error 403.",
-        inputSchema: buyerOrderInput,
+        description: "Cancel a pickup order placed with lokal_cart_submit, on the buyer's behalf. Requires the order_id and the buyer_ref token. While the order is pending (the producer has not confirmed it yet), this withdraws it at no cost: status becomes cancelled with cancel_reason='buyer_cancelled', nothing counts against the producer, and the producer is told by e-mail. Once the producer has confirmed the order, the purchase is binding: cancelling it is a cancellation under the Norwegian Consumer Purchases Act § 41, and the producer may claim documented loss the cancellation causes. The response's consumer_law_note says what applies; show it to the user. Only call this tool when the user has explicitly told you to cancel this order. For a confirmed order, first tell the user this consequence and get their explicit instruction. A cancellation cannot be undone. lokal_order_status lists what is possible for an order in available_actions ('withdraw' or 'cancel' = this tool): pass the one you showed the user as expected_action, so a producer confirmation in the meantime never turns a free withdrawal into a binding cancellation. On error expected_action_mismatch nothing was changed: check the status again and ask the user. Wrong buyer_ref or unknown order: error 403.",
+        inputSchema: {
+          ...buyerOrderInput,
+          expected_action: z.enum(["withdraw", "cancel"]).optional().describe("The cancel action lokal_order_status listed in available_actions when the user decided ('withdraw' = free, before confirmation; 'cancel' = after confirmation, § 41). If the order has changed since, nothing happens and the tool returns error expected_action_mismatch."),
+        },
         annotations: {
           title: "Cancel order",
           readOnlyHint: false,
@@ -1906,10 +1909,10 @@ export function registerTools(
           openWorldHint: true,
         },
       },
-      guardToolHandler("lokal_order_cancel", async ({ order_id, buyer_ref, idempotency_key }) => {
+      guardToolHandler("lokal_order_cancel", async ({ order_id, buyer_ref, idempotency_key, expected_action }) => {
         if (!isOrderAgentActionsEnabled()) return actionsOffResult();
         const result = await applyBuyerOrderCommand(order_id, buyer_ref, "cancel", "mcp", {
-          idempotencyKey: idempotency_key ?? null, payments: buyerPayments(),
+          idempotencyKey: idempotency_key ?? null, expectedAction: expected_action ?? null, payments: buyerPayments(),
         });
         return { content: [{ type: "text" as const, text: cartResultText("lokal_order_cancel", result) }] };
       })

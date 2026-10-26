@@ -1,11 +1,11 @@
 {
   "_doc": "SHA-256 of the Rett fra Bonden MCP tools/list and the two buyer order tools (lokal_order_cancel, lokal_order_picked_up) with ORDER_AGENT_ACTIONS_ENABLED=1, once per PAYMENTS_ENABLED value. Dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent, Fase B1 (AC10). Every other part of the contract with the switch on must equal rfb-mcp-contract-freeze.json (checked by rfb-cf-6). The switch is off by default, so the default contract is unchanged. Print current hashes with: npx tsx src/routes/rfb-mcp-contract-freeze.test.ts --print",
   "hashes": {
-    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=0 tools/list": "8f0f4a603af4764cf670bcac6604a9babfc45e365beccc3b08b05c05786dc281",
-    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=0 tools/list#lokal_order_cancel": "ab239de920c7cf189a11727f4e520d826a7ce36007a22beef5399c18f9aa18a7",
+    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=0 tools/list": "928fe12f076875fdc571f9ed3a9839e28f2173ff51ef20e424036c641af460ab",
+    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=0 tools/list#lokal_order_cancel": "2dbdcfe49f46e8f9fce3a9c4c1446fbc033dbf5192e5ba138d3fbd4c7e1e502b",
     "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=0 tools/list#lokal_order_picked_up": "52a3f0b60684b0c9c8b73eadb08fe8e09497d657b8c90fa8372ba23d2cda1513",
-    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=1 tools/list": "fe03e904931caf5ff14c9583a884ed116cf52f1e9dc172dbb21ac382e58b41ab",
-    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=1 tools/list#lokal_order_cancel": "ab239de920c7cf189a11727f4e520d826a7ce36007a22beef5399c18f9aa18a7",
+    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=1 tools/list": "c3324d838d1de6ec47822d58f7e1f3c050f05dd80575e6568701fb157ed378c9",
+    "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=1 tools/list#lokal_order_cancel": "2dbdcfe49f46e8f9fce3a9c4c1446fbc033dbf5192e5ba138d3fbd4c7e1e502b",
     "ORDER_AGENT_ACTIONS_ENABLED=1 PAYMENTS_ENABLED=1 tools/list#lokal_order_picked_up": "52a3f0b60684b0c9c8b73eadb08fe8e09497d657b8c90fa8372ba23d2cda1513"
   }
 }

@@ -187,7 +187,9 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
         assertTrue(/explicitly told you to cancel/.test(cancel?.description ?? "") && /§ 41/.test(cancel?.description ?? "") &&
           /explicitly told you that they have picked up/.test(picked?.description ?? ""),
           "flag-09: descriptions require the user's explicit instruction and state the consequence");
-        assertEq(Object.keys(cancel?.inputSchema?.properties ?? {}).sort(), ["buyer_ref", "idempotency_key", "order_id"], "flag-10: input order_id, buyer_ref, optional idempotency_key");
+        assertEq(Object.keys(cancel?.inputSchema?.properties ?? {}).sort(), ["buyer_ref", "expected_action", "idempotency_key", "order_id"], "flag-10: input order_id, buyer_ref, optional idempotency_key and expected_action");
+        assertEq(cancel?.inputSchema?.properties?.expected_action?.enum, ["withdraw", "cancel"], "flag-10b: expected_action is withdraw | cancel");
+        assertTrue(/expected_action/.test(cancel?.description ?? "") && /available_actions/.test(cancel?.description ?? ""), "flag-10c: the description tells the assistant to pass expected_action from available_actions");
         assertEq([...(cancel?.inputSchema?.required ?? [])].sort(), ["buyer_ref", "order_id"], "flag-11: idempotency_key is optional");
         // Same session, switch turned off at run time: calls are refused.
         delete process.env.ORDER_AGENT_ACTIONS_ENABLED;
@@ -302,6 +304,33 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
       assertEq(bad.body?.status, 400, "idem-09: an invalid idempotency_key → 400");
 
       // ════════════════════════════════════════════════════════════════════
+      // Review B1: expected_action (a stale decision never becomes a § 41 cancel)
+      // ════════════════════════════════════════════════════════════════════
+      const SELLER = { role: "seller" as const, channel: "producer_page" as const, ref: "test" };
+      const x1 = seedOrder({ status: "pending" });
+      await actionsSvc.applyOrderAction(x1.id, "confirm", SELLER); // the producer confirms after the buyer saw «withdraw»
+      await settle();
+      const mailsBefore = mailsFor(x1.id).length;
+      const rx1 = await call(client, "lokal_order_cancel", { order_id: x1.id, buyer_ref: x1.ref, expected_action: "withdraw" });
+      await settle();
+      assertTrue(rx1.body?.success === false && rx1.body.status === 409 && String(rx1.body.error).startsWith("expected_action_mismatch"),
+        `xa-01: expected withdraw on a now-confirmed order → 409 expected_action_mismatch (got ${JSON.stringify(rx1.body).slice(0, 200)})`);
+      assertEq([row(x1.id).status, buyerEvents(x1.id).length, mailsFor(x1.id).length - mailsBefore], ["confirmed", 0, 0],
+        "xa-02: the mismatch changes nothing: still confirmed, no buyer event, no producer e-mail");
+      const x2 = seedOrder({ status: "pending" });
+      const rx2 = await call(client, "lokal_order_cancel", { order_id: x2.id, buyer_ref: x2.ref, expected_action: "cancel" });
+      assertTrue(rx2.body?.status === 409 && row(x2.id).status === "pending" && buyerEvents(x2.id).length === 0, "xa-03: expected cancel on a pending order → 409, no change");
+      const rx3 = await call(client, "lokal_order_cancel", { order_id: x2.id, buyer_ref: x2.ref, expected_action: "withdraw", idempotency_key: "xa-k1" });
+      assertTrue(rx3.body?.success === true && rx3.body.action === "withdraw" && row(x2.id).status === "cancelled", "xa-04: matching expected withdraw → withdrawn");
+      const rx4 = await call(client, "lokal_order_cancel", { order_id: x1.id, buyer_ref: x1.ref, expected_action: "cancel" });
+      assertTrue(rx4.body?.success === true && rx4.body.action === "cancel" && rx4.body.consumer_law_note, "xa-05: matching expected cancel → cancelled with the § 41 note");
+      const rx5 = await call(client, "lokal_order_cancel", { order_id: x2.id, buyer_ref: x2.ref, expected_action: "withdraw", idempotency_key: "xa-k1" });
+      assertTrue(rx5.body?.success === true && rx5.body.replayed === true && rx5.body.action === "withdraw", "xa-06: replay with the same key and expected withdraw → the stored withdraw");
+      const rx6 = await call(client, "lokal_order_cancel", { order_id: x2.id, buyer_ref: x2.ref, expected_action: "cancel", idempotency_key: "xa-k1" });
+      assertTrue(rx6.body?.status === 409 && String(rx6.body.error).startsWith("expected_action_mismatch") && buyerEvents(x2.id).length === 1,
+        "xa-07: replay with the same key but expected cancel → mismatch against the stored action, still one transition");
+
+      // ════════════════════════════════════════════════════════════════════
       // lokal_order_status with the switch on
       // ════════════════════════════════════════════════════════════════════
       const sp = seedOrder({ status: "pending" });
@@ -377,13 +406,13 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
         "card-08: confirmed → «Jeg har hentet», «Avbestill» with the § 41 text, and the pickup time");
 
       // POST: PRG
-      const post = await req("POST", `/ordre/${encodeURIComponent(p.id)}`, { form: { ref: p.ref, action: "cancel", idem: "11111111-aaaa-bbbb-cccc-000000000001" } });
+      const post = await req("POST", `/ordre/${encodeURIComponent(p.id)}`, { form: { ref: p.ref, action: "cancel", expect: "withdraw", idem: "11111111-aaaa-bbbb-cccc-000000000001" } });
       await settle();
       assertEq([post.status, post.headers["location"]], [303, `${cardUrl(p)}&done=cancelled`], "card-09: «Avbestill» → 303 back to the card (PRG)");
       assertEq([row(p.id).status, row(p.id).cancel_reason], ["cancelled", "buyer_cancelled"], "card-10: the order is withdrawn");
       assertEq(buyerEvents(p.id).map((e) => [e.to_status, e.channel]), [["cancelled", "web"]], "card-11: the event has channel web");
       assertEq(mailsFor(p.id).length, 1, "card-12: the producer is told");
-      const again = await req("POST", `/ordre/${encodeURIComponent(p.id)}`, { form: { ref: p.ref, action: "cancel", idem: "11111111-aaaa-bbbb-cccc-000000000001" } });
+      const again = await req("POST", `/ordre/${encodeURIComponent(p.id)}`, { form: { ref: p.ref, action: "cancel", expect: "withdraw", idem: "11111111-aaaa-bbbb-cccc-000000000001" } });
       assertTrue(again.status === 303 && buyerEvents(p.id).length === 1 && mailsFor(p.id).length === 1, "card-13: a repeated form post (same idem) → one transition");
       const after = await req("GET", `${cardUrl(p)}&done=cancelled`);
       assertTrue(after.text.includes("Bestillingen er avbestilt") && !after.text.includes('value="cancel"'), "card-14: after the PRG the card shows the result and no more buttons");
@@ -393,16 +422,37 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
         "card-15: «Jeg har hentet» → 303, completed / buyer");
 
       const w = seedOrder({ status: "pending" });
-      const pw = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { form: { ref: "bref_wrong", action: "cancel" } });
+      const pw = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { form: { ref: "bref_wrong", action: "cancel", expect: "withdraw" } });
       assertEq([pw.status, row(w.id).status], [404, "pending"], "card-16: POST with a wrong ref → 404, no change");
-      const px = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { Origin: "https://evil.example" }, form: { ref: w.ref, action: "cancel" } });
+      const px = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { Origin: "https://evil.example" }, form: { ref: w.ref, action: "cancel", expect: "withdraw" } });
       assertEq([px.status, row(w.id).status], [403, "pending"], "card-17: a cross-site form post (foreign Origin) → 403, no change");
       const pv = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { form: { ref: w.ref, action: "confirm" } });
       assertEq([pv.status, pv.headers["location"], row(w.id).status], [303, `${cardUrl(w)}&error=ugyldig`, "pending"], "card-18: a seller action from the card → refused (PRG with error)");
       const pp = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { form: { ref: w.ref, action: "picked_up" } });
       assertEq([pp.headers["location"], row(w.id).status], [`${cardUrl(w)}&error=ugyldig`, "pending"], "card-19: «Jeg har hentet» on a pending order → refused");
-      const same = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { Origin: `http://127.0.0.1:${port}` }, form: { ref: w.ref, action: "cancel" } });
+      const same = await req("POST", `/ordre/${encodeURIComponent(w.id)}`, { headers: { Origin: `http://127.0.0.1:${port}` }, form: { ref: w.ref, action: "cancel", expect: "withdraw" } });
       assertEq([same.status, row(w.id).status], [303, "cancelled"], "card-20: a same-origin form post is accepted");
+
+      // Review B1: the stale tab. The card was opened while pending (free
+      // withdraw), the producer confirmed, then the buyer clicks «Avbestill».
+      const st = seedOrder({ status: "pending" });
+      const stale = await req("GET", cardUrl(st));
+      assertTrue(stale.text.includes('name="expect" value="withdraw"'), "card-21: the pending card's «Avbestill» form says expect=withdraw");
+      await actionsSvc.applyOrderAction(st.id, "confirm", { role: "seller", channel: "producer_page", ref: "test" });
+      await settle();
+      const stMails = mailsFor(st.id).length;
+      const sp = await req("POST", `/ordre/${encodeURIComponent(st.id)}`, { form: { ref: st.ref, action: "cancel", expect: "withdraw", idem: "11111111-aaaa-bbbb-cccc-000000000003" } });
+      await settle();
+      assertEq([sp.status, sp.headers["location"]], [303, `${cardUrl(st)}&error=endret`], "card-22: stale «Avbestill» (expect withdraw, order now confirmed) → PRG with error=endret");
+      assertEq([row(st.id).status, buyerEvents(st.id).length, mailsFor(st.id).length - stMails], ["confirmed", 0, 0],
+        "card-23: the stale post changes nothing: still confirmed, no buyer event, no producer e-mail");
+      const re = await req("GET", `${cardUrl(st)}&error=endret`);
+      assertTrue(re.text.includes("Bestillingen er endret siden du åpnet siden") && re.text.includes("forbrukerkjøpsloven § 41") && re.text.includes('name="expect" value="cancel"'),
+        "card-24: the re-rendered card explains the change and shows the current state with the § 41 warning");
+      const ne = await req("POST", `/ordre/${encodeURIComponent(st.id)}`, { form: { ref: st.ref, action: "cancel" } });
+      assertEq([ne.headers["location"], row(st.id).status], [`${cardUrl(st)}&error=ugyldig`, "confirmed"], "card-25: «Avbestill» without expect → refused, no change");
+      const ok = await req("POST", `/ordre/${encodeURIComponent(st.id)}`, { form: { ref: st.ref, action: "cancel", expect: "cancel" } });
+      assertEq([ok.headers["location"], row(st.id).status], [`${cardUrl(st)}&done=cancelled`, "cancelled"], "card-26: «Avbestill» with expect=cancel on the confirmed order → cancelled");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -425,6 +475,16 @@ export async function runBuyerOrderActionsFaseB1Tests(opts: { log?: boolean } = 
       assertTrue(r.success && rc.length === 1 && rc[0]!.textContent.includes(`/ordre/${o.id}?ref=${encodeURIComponent(o.ref)}`),
         "rcpt-03: the confirmation receipt links the buyer's order card");
       assertEq(mailsFor(o.id).length, 0, "rcpt-04: a seller action sends no buyer-cancel notice to the producer");
+
+      // Review N1: only the BUYER's withdraw / cancel tells the producer.
+      const ADMIN = { role: "admin" as const, channel: "admin" as const, ref: "test" };
+      const aw = seedOrder({ status: "pending" });
+      const ac = seedOrder({ status: "confirmed" });
+      const raw = await actionsSvc.applyOrderAction(aw.id, "withdraw", ADMIN);
+      const rac = await actionsSvc.applyOrderAction(ac.id, "cancel", ADMIN);
+      await settle();
+      assertTrue(raw.success && rac.success && row(aw.id).status === "cancelled" && row(ac.id).status === "cancelled", "n1-01: admin withdraw / cancel go through");
+      assertEq([mailsFor(aw.id).length, mailsFor(ac.id).length], [0, 0], "n1-02: an admin withdraw / cancel sends no buyer-cancel notice to the producer");
     }
   } catch (err: any) {
     failed++;

@@ -46,6 +46,9 @@ export type BuyerOrderCommand = "cancel" | "picked_up";
 /** The answer for an unknown order and for a wrong buyer_ref alike. */
 export const BUYER_ORDER_ACCESS_DENIED = "Order not found or buyer_ref does not match";
 
+/** The error prefix when the expected cancel action no longer matches the order (review B1). */
+export const EXPECTED_ACTION_MISMATCH = "expected_action_mismatch";
+
 const BUYER_IDEM_RE = /^[A-Za-z0-9:_.-]{1,120}$/;
 
 interface BuyerOrderRow {
@@ -135,7 +138,19 @@ export async function applyBuyerOrderCommand(
   buyerRef: unknown,
   command: BuyerOrderCommand,
   channel: Extract<OrderChannel, "mcp" | "web" | "a2a">,
-  opts: { idempotencyKey?: string | null; payments?: PaymentsStripeClient | null; now?: Date; env?: NodeJS.ProcessEnv } = {},
+  opts: {
+    idempotencyKey?: string | null;
+    /**
+     * cancel only: the action the buyer saw offered (lokal_order_status
+     * available_actions, or the card's form). When the order has moved on
+     * since (e.g. the producer confirmed a pending order, so a free withdraw
+     * would now be a binding § 41 cancel), nothing happens: 409.
+     */
+    expectedAction?: "withdraw" | "cancel" | null;
+    payments?: PaymentsStripeClient | null;
+    now?: Date;
+    env?: NodeJS.ProcessEnv;
+  } = {},
 ): Promise<BuyerOrderCommandResult> {
   const db = cartServiceDb();
   const order = getBuyerOrderRow(orderId, buyerRef, db);
@@ -161,6 +176,16 @@ export async function applyBuyerOrderCommand(
     ).get(order.id, key) as { from_status: string | null } | undefined;
     const from = prev ? prev.from_status : order.status;
     action = from === "pending" ? "withdraw" : "cancel";
+    // Review B1 (stale tab): never turn a free withdraw into a binding cancel
+    // (or the reverse) behind the buyer's back. For a replay, `action` is the
+    // stored event's action, so the check compares against what was done.
+    if (opts.expectedAction != null && opts.expectedAction !== action) {
+      return {
+        success: false,
+        status: 409,
+        error: `${EXPECTED_ACTION_MISMATCH}: expected '${opts.expectedAction}', but the order now allows '${action}' (status '${order.status}'). Nothing was changed; check lokal_order_status and ask the user again.`,
+      };
+    }
   }
 
   const r = await applyOrderAction(

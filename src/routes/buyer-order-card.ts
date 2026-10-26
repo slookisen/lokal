@@ -23,7 +23,7 @@ import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { randomUUID } from "crypto";
 import { cartServiceDb, getOrderTimeline, orderPaymentMode, PAYMENT_MODE_UNKNOWN, producerContact, producerTraderStatus } from "../services/cart-service";
-import { applyBuyerOrderCommand, buyerAvailableActions, getBuyerOrderRow, type BuyerOrderCommand } from "../services/buyer-order-actions";
+import { applyBuyerOrderCommand, buyerAvailableActions, EXPECTED_ACTION_MISMATCH, getBuyerOrderRow, type BuyerOrderCommand } from "../services/buyer-order-actions";
 import { CONSUMER_CANCEL_LOSS_SENTENCE } from "../services/order-receipt-service";
 import { isPaymentsLifecycleActive, resolvePaymentsStripeClient } from "../services/payment-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
@@ -112,6 +112,7 @@ function buyerStatusLabel(status: string, cancelReason: string | null, completio
 }
 
 function bannerHtml(done: string, error: string): string {
+  if (error === "endret") return `<div class="mo-banner warn" role="alert">Bestillingen er endret siden du åpnet siden, så ingenting ble gjort. Se status under før du velger på nytt.</div>`;
   if (error === "ugyldig") return `<div class="mo-banner warn" role="alert">Handlingen er ikke mulig for bestillingens status akkurat nå.</div>`;
   if (error) return `<div class="mo-banner warn" role="alert">Kunne ikke oppdatere bestillingen. Prøv igjen.</div>`;
   if (done === "cancelled") return `<div class="mo-banner ok" role="status">Bestillingen er avbestilt. Produsenten får beskjed.</div>`;
@@ -146,19 +147,22 @@ export function renderBuyerOrderCard(orderId: string, ref: string, done: string,
   const st = buyerStatusLabel(o.status, o.cancel_reason, o.completion_source);
   const pick = o.pickup_time ? `Henting ${formatPickupTimeOslo(o.pickup_time)}` : "Hentetid ikke satt ennå. Avtal med produsenten.";
 
-  const form = (cmd: BuyerOrderCommand, label: string, cls: string) =>
+  // Review B1: each «Avbestill» form says which cancel it offers (expect), so a
+  // stale tab never turns a free withdraw into a binding § 41 cancel.
+  const form = (cmd: BuyerOrderCommand, label: string, cls: string, expect?: "withdraw" | "cancel") =>
     `<form method="post" action="/ordre/${esc(encodeURIComponent(o.id))}" class="mo-form">` +
     `<input type="hidden" name="ref" value="${esc(ref)}"><input type="hidden" name="action" value="${cmd}">` +
+    (expect ? `<input type="hidden" name="expect" value="${expect}">` : "") +
     `<input type="hidden" name="idem" value="${randomUUID()}"><button type="submit" class="mo-btn ${cls}">${esc(label)}</button></form>`;
   const parts: string[] = [];
   if (actions.includes("picked_up")) parts.push(form("picked_up", "Jeg har hentet", "mo-primary"));
   if (actions.includes("withdraw")) {
     parts.push(`<p class="mo-hint">Produsenten har ikke bekreftet ennå, så du kan avbestille gratis.</p>`);
-    parts.push(form("cancel", "Avbestill", "mo-secondary"));
+    parts.push(form("cancel", "Avbestill", "mo-secondary", "withdraw"));
   }
   if (actions.includes("cancel")) {
     parts.push(`<p class="mo-hint">${esc(cancelWarningText(o.producer_name, producerTraderStatus(db, o.agent_id)))}</p>`);
-    parts.push(form("cancel", "Avbestill", "mo-secondary"));
+    parts.push(form("cancel", "Avbestill", "mo-secondary", "cancel"));
   }
   const actionsHtml = parts.length ? `<div class="mo-actions">${parts.join("")}</div>` : "";
 
@@ -225,10 +229,17 @@ router.post("/ordre/:id", buyerOrderCardLimiter, express.urlencoded({ extended: 
     res.setHeader("Cache-Control", "no-store");
     const command = COMMANDS[String(body["action"] || "")];
     if (!command) return res.redirect(303, `${back}&error=ugyldig`);
+    // Review B1: a cancel from the card must say which cancel the buyer saw.
+    const rawExpect = String(body["expect"] || "");
+    const expect = rawExpect === "withdraw" || rawExpect === "cancel" ? rawExpect : null;
+    if (command === "cancel" && !expect) return res.redirect(303, `${back}&error=ugyldig`);
     const result = await applyBuyerOrderCommand(orderId, ref, command, "web", {
-      idempotencyKey: idemFrom(body), payments: paymentsClientFor(req),
+      idempotencyKey: idemFrom(body), expectedAction: expect, payments: paymentsClientFor(req),
     });
-    if (!result.success) return res.redirect(303, `${back}&error=${result.status === 409 ? "ugyldig" : "feil"}`);
+    if (!result.success) {
+      const code = result.error.startsWith(EXPECTED_ACTION_MISMATCH) ? "endret" : result.status === 409 ? "ugyldig" : "feil";
+      return res.redirect(303, `${back}&error=${code}`);
+    }
     return res.redirect(303, `${back}&done=${encodeURIComponent(result.status)}`);
   } catch (err) {
     console.error("[buyer-order-card] POST failed:", err instanceof Error ? err.message : "error");
