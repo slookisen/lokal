@@ -63,7 +63,7 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
-import { placesFieldMask } from "../services/places-match";
+import { placesFieldMask, dentalPlacesContactFieldsFetchEnabled, PLACES_DENTAL_CONTACT_FIELDS } from "../services/places-match";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -1206,6 +1206,13 @@ const PLACES_PRO_FIELD_MASK = placesFieldMask(
   ["places.displayName", "places.formattedAddress", "places.regularOpeningHours", "places.businessStatus", "places.addressComponents"],
   false
 );
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A6): the same masks without phone, website and opening hours,
+// used while DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED (places-match.ts) is
+// off. Only one tier is left: nothing in it is Enterprise-priced.
+const withoutContactFields = (mask: string): string =>
+  mask.split(",").filter((f) => !PLACES_DENTAL_CONTACT_FIELDS.includes(f)).join(",");
+const PLACES_PRO_FIELD_MASK_NO_CONTACT = withoutContactFields(PLACES_PRO_FIELD_MASK);
 
 interface PlacesAgentRow {
   id: string;
@@ -1256,6 +1263,8 @@ router.post(
     }
 
     const write = body.write !== false; // default true
+    // A6: phone, website and opening hours from Places (see places-match.ts).
+    const contactFetch = dentalPlacesContactFieldsFetchEnabled();
     // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
     // item 1: raise the homepage-backfill default/cap 20/50 -> 100/cycle (the
     // universe-growth lever — at 20/day a full sweep of the ~5,670 homepage-
@@ -1333,6 +1342,21 @@ router.post(
       // so an expired no-retry window cannot put old A-names ahead of them.
       // Restricted to the enrichment states that can still benefit and
       // never rejected.
+      // A6: with the contact fields off, only a missing address makes a row
+      // worth a Places call (the fields below are the pre-A6 text verbatim).
+      const missingFieldsSql = contactFetch
+        ? `hjemmeside IS NULL OR hjemmeside = ''
+                 OR adresse    IS NULL OR adresse    = ''
+                 OR telefon    IS NULL OR telefon    = ''
+                 OR opening_hours IS NULL OR opening_hours = ''`
+        : `adresse IS NULL OR adresse = ''`;
+      const missingOrderSql = contactFetch
+        ? `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
+              CASE WHEN (adresse IS NULL OR adresse = '')
+                     OR (telefon IS NULL OR telefon = '')
+                     OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
+              `
+        : "";
       rows = db
         .prepare(
           `SELECT id, navn, postnummer, poststed, adresse, telefon, hjemmeside,
@@ -1342,23 +1366,14 @@ router.post(
               AND verification_status != 'rejected'
               AND (is_inactive IS NULL OR is_inactive = 0)
               AND ${DENTAL_CLINIC_CLASS_SQL}
-              AND (
-                    hjemmeside IS NULL OR hjemmeside = ''
-                 OR adresse    IS NULL OR adresse    = ''
-                 OR telefon    IS NULL OR telefon    = ''
-                 OR opening_hours IS NULL OR opening_hours = ''
-              )
+              AND (${missingFieldsSql})
               AND (
                     places_attempted_at IS NULL
                  OR places_attempted_at < datetime('now', '-${PLACES_NO_RETRY_DAYS} days')
               )
             ORDER BY
               CASE WHEN places_attempted_at IS NULL THEN 0 ELSE 1 END ASC,
-              CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
-              CASE WHEN (adresse IS NULL OR adresse = '')
-                     OR (telefon IS NULL OR telefon = '')
-                     OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
-              COALESCE(places_attempted_at, '') ASC,
+              ${missingOrderSql}              COALESCE(places_attempted_at, '') ASC,
               navn ASC
             LIMIT ?`
         )
@@ -1395,7 +1410,7 @@ router.post(
     const results: Array<{
       agentId: string;
       navn: string;
-      status: "matched" | "no_confident_match" | "no_place" | "api_error";
+      status: "matched" | "no_confident_match" | "no_place" | "api_error" | "skipped_places_fields_disabled";
       nameSim: number;
       fields_written: string[];
       homepage_backfilled: boolean;
@@ -1416,6 +1431,22 @@ router.post(
       if (!row) continue;
       processed++;
 
+      // A6: with phone, website and opening hours off, a row whose address is
+      // filled has nothing left to fetch from Places. It is not sent to
+      // Google (no fetch, no logPlacesCall) and gets no no-retry marker.
+      // Only reachable through agentIds: auto-select picks missing addresses.
+      if (!contactFetch && !isEmptyCol(row.adresse)) {
+        results.push({
+          agentId: row.id,
+          navn: row.navn,
+          status: "skipped_places_fields_disabled",
+          nameSim: 0,
+          fields_written: [],
+          homepage_backfilled: false,
+        });
+        continue;
+      }
+
       // Rate-limit politely between Places calls (~150ms), not before first.
       if (i > 0) await new Promise((r) => setTimeout(r, 150));
 
@@ -1430,7 +1461,7 @@ router.post(
       // budget too — a row that wants Enterprise fields but the platform
       // has hit ENTERPRISE_MONTHLY_HARD_STOP this month still gets looked
       // up, just with the cheaper Pro-tier mask (see shouldUseEnterpriseFieldMask).
-      const wantsEnterprise = isEmptyCol(row.hjemmeside) || isEmptyCol(row.telefon);
+      const wantsEnterprise = contactFetch && (isEmptyCol(row.hjemmeside) || isEmptyCol(row.telefon));
       const needsEnterprise = shouldUseEnterpriseFieldMask(
         wantsEnterprise,
         enterpriseCallsThisMonth + enterpriseCalls,
@@ -1439,7 +1470,9 @@ router.post(
       if (wantsEnterprise && !needsEnterprise) enterpriseCapped = true;
       const fieldMask = needsEnterprise
         ? PLACES_ENTERPRISE_FIELD_MASK
-        : PLACES_PRO_FIELD_MASK;
+        : contactFetch
+          ? PLACES_PRO_FIELD_MASK
+          : PLACES_PRO_FIELD_MASK_NO_CONTACT;
       if (needsEnterprise) enterpriseCalls++; else proCalls++;
 
       // ── measure 3 of dev-request 2026-07-03-places-api-cost-reduction ──
@@ -1566,9 +1599,11 @@ router.post(
           : "";
       const gAddr = brregAddr || placesAddr;
       const gAddrSource: "brreg" | "google_places" = brregAddr ? "brreg" : "google_places";
-      const gPhone = normalizePlacePhone(place.internationalPhoneNumber);
+      // A6: with the contact fields off, nothing of them is used even if a
+      // place carries them.
+      const gPhone = contactFetch ? normalizePlacePhone(place.internationalPhoneNumber) : "";
       const gWebsite =
-        typeof place.websiteUri === "string" ? place.websiteUri.trim() : "";
+        contactFetch && typeof place.websiteUri === "string" ? place.websiteUri.trim() : "";
       // dev-request 2026-09-02-dental-hjemmeside-hygiene-og-brreg-gjenfinning
       // (steg 2): a Places websiteUri that is itself a directory / booking
       // portal / social page (dental-hjemmeside-classifier) or a
@@ -1583,9 +1618,9 @@ router.post(
         isValidHttpUrl(gWebsite) &&
         !classifyHjemmeside(gWebsite).isBad &&
         !isPublicDentalServiceHost(gWebsite);
-      const ohConverted = placesPeriodsToOpeningHours(
-        place.regularOpeningHours?.periods
-      );
+      const ohConverted = contactFetch
+        ? placesPeriodsToOpeningHours(place.regularOpeningHours?.periods)
+        : [];
       let ohValid = false;
       if (ohConverted.length > 0) {
         ohValid = OpeningHoursArraySchema.safeParse(ohConverted).success;

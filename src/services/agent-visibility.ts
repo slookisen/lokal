@@ -65,7 +65,75 @@ export function catalogHiddenIdExclusionSql(
  * can be appended as `AND ${publicListableSql("a")}` anywhere.
  */
 export function publicListableSql(alias?: string): string {
-  return `${notCatalogHiddenSql(alias)} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
+  const base = `${notCatalogHiddenSql(alias)} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
+  // S1b punkt 6: with OWNER_PAUSE_ENABLED on, an owner-paused profile is not
+  // listable either. Flag off = the exact string above (byte-identical SQL).
+  return ownerPauseEnabled() ? `${base} AND ${notOwnerPausedSql(alias)}` : base;
+}
+
+// ─── Owner pause — S1b punkt 6 «Pause som virker» (dev-request ─────────────
+// 2026-10-22-rfb-mine-valg-eierbrytere) ──────────────────────────────────────
+// A verified owner can pause their profile from /eier (visibility.profile =
+// false), optionally with a resume date. Stored in its own additive table
+// (NOT as columns on `agents`: extra agents columns shift SQLite's plan
+// choice for the unordered public scans and so the row order of today's
+// answers, which the MCP/API golden tests pin byte for byte):
+//   owner_profile_pause(agent_id PK, paused_at, pause_until, set_by)
+//   pause_until NULL = until the owner resumes; 'YYYY-MM-DD' = the pause ends
+//   at the start of that UTC day. No row = not paused.
+// While paused, the profile drops out of every surface that reads this file's
+// predicates: publicListableSql() (search, lokal_search, lists, feeds,
+// sitemap, llms*.txt, stats …) and isAgentPubliclyVisible() / the by-id
+// lookups (lokal_info, MCP resource, card/info/vcard/trust, metrics). The
+// resume date is evaluated at read time, so passing it restores everything
+// with no job. Behind OWNER_PAUSE_ENABLED (default OFF): with the flag off no
+// SQL or answer changes, and the table is never read.
+
+/** Env flag (read at call time, "1" or "true" = on). Default OFF. */
+export const OWNER_PAUSE_FLAG = "OWNER_PAUSE_ENABLED";
+
+export function ownerPauseEnabled(): boolean {
+  const v = process.env[OWNER_PAUSE_FLAG];
+  return v === "1" || v === "true";
+}
+
+/** The pause table (created in database/init.ts). Has no `id` column, so an unaliased outer `id` stays the agent's. */
+export const OWNER_PAUSE_TABLE = "owner_profile_pause";
+
+/** Wrap-safe SQL: the `agents` row is NOT currently owner-paused. */
+export function notOwnerPausedSql(alias?: string): string {
+  return `${col(alias, "id")} NOT IN (SELECT agent_id FROM ${OWNER_PAUSE_TABLE} WHERE agent_id IS NOT NULL AND COALESCE(pause_until, '9999-12-31') > date('now'))`;
+}
+
+export interface OwnerPauseRow {
+  owner_paused_at?: string | null;
+  owner_pause_until?: string | null;
+}
+
+/**
+ * The pause state of one agent as an OwnerPauseRow ({} when not paused or the
+ * table is missing — fail-open, exactly today's visibility).
+ */
+export function readOwnerPauseRow(
+  db: { prepare(sql: string): { get(...params: unknown[]): unknown } },
+  agentId: string,
+): OwnerPauseRow {
+  try {
+    const r = db
+      .prepare(`SELECT paused_at, pause_until FROM ${OWNER_PAUSE_TABLE} WHERE agent_id = ?`)
+      .get(agentId) as { paused_at: string | null; pause_until: string | null } | undefined;
+    return r ? { owner_paused_at: r.paused_at, owner_pause_until: r.pause_until } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** In-memory twin of NOT notOwnerPausedSql(). `now` is injectable for tests. */
+export function isOwnerPaused(row: OwnerPauseRow | null | undefined, now: Date = new Date()): boolean {
+  if (!row || !row.owner_paused_at) return false;
+  if (!row.owner_pause_until) return true;
+  const today = now.toISOString().slice(0, 10);
+  return String(row.owner_pause_until).slice(0, 10) > today;
 }
 
 /**
@@ -81,9 +149,10 @@ export function notPubliclyListableAgentIdsSql(): string {
  * In-memory twin of publicListableSql() for a raw `agents` row (snake_case
  * columns). Missing/NULL columns read exactly like the SQL COALESCE defaults.
  */
-export function isPubliclyListable(row: { catalog_hidden?: number | null; vertical_id?: string | null } | null | undefined): boolean {
+export function isPubliclyListable(row: ({ catalog_hidden?: number | null; vertical_id?: string | null } & OwnerPauseRow) | null | undefined): boolean {
   if (!row) return false;
   if ((row.catalog_hidden ?? 0) !== 0) return false;
+  if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
   return (row.vertical_id ?? RFB_VERTICAL_ID) === RFB_VERTICAL_ID;
 }
 
@@ -162,7 +231,7 @@ export function byIdVisibilityEnforced(): boolean {
 }
 
 /** Raw `agents` row (snake_case columns); a missing column reads like the schema default. */
-export interface AgentVisibilityRow {
+export interface AgentVisibilityRow extends OwnerPauseRow {
   is_active?: number | null;
   is_vetted?: number | null;
   catalog_hidden?: number | null;
@@ -197,6 +266,9 @@ function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean):
  */
 export function isAgentPubliclyVisible(row: AgentVisibilityRow | null | undefined, opts: AgentVisibilityOptions): boolean {
   if (!row) return false;
+  // S1b punkt 6: an owner-paused profile is served on no by-id surface
+  // (independent of OWNER_VISIBILITY_ENFORCE_BY_ID). Flag off = skipped.
+  if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
   if (!byIdVisibilityEnforced()) {
     return opts.surface === "gated" ? !quarantinedToday(row, false) : true;
   }
@@ -211,10 +283,14 @@ export function isAgentIdPubliclyVisible(
   opts: AgentVisibilityOptions,
 ): boolean {
   // Flag off + ungated: today's answer is "yes" without reading anything.
-  if (opts.surface === "ungated" && !byIdVisibilityEnforced()) return true;
-  const row = db
+  const pause = ownerPauseEnabled();
+  if (opts.surface === "ungated" && !byIdVisibilityEnforced() && !pause) return true;
+  const found = db
     .prepare("SELECT is_active, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?")
     .get(agentId) as AgentVisibilityRow | undefined;
+  if (!found && opts.surface === "ungated" && !byIdVisibilityEnforced()) return true;
+  // The pause table is only read with OWNER_PAUSE_ENABLED on.
+  const row = found && pause ? { ...found, ...readOwnerPauseRow(db, agentId) } : found;
   return isAgentPubliclyVisible(row, opts);
 }
 

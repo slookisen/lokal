@@ -381,6 +381,38 @@ export function formatPlacesMatchGuardLog(
 // batch's Enterprise-tier first-time call, rating writes).
 export const GOOGLE_RATING_FETCH_ENABLED = false;
 
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A6, Daniel's answer to question 26): finn-tannlege's Phase 2G
+// (POST /api/tannlege/admin/google-places-batch) no longer asks Google Places
+// for phone, website or opening hours and stores none of them from Places.
+// While this is false the three fields are out of both dental masks, rows are
+// not selected merely because one of them is empty, no Enterprise mask is
+// chosen for them, and no google_places provenance is written for them. A row
+// with no field left to fetch (address already filled) is not sent to Google.
+// Values already stored stay untouched. The match guard is unchanged.
+// Rollback without a revert: a one-line PR setting this to true, which
+// restores the pre-A6 behaviour byte for byte.
+export const DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED = false;
+
+/** The Places (New) FieldMask entries for phone, website and opening hours. */
+export const PLACES_DENTAL_CONTACT_FIELDS: readonly string[] = [
+  "places.internationalPhoneNumber",
+  "places.websiteUri",
+  "places.regularOpeningHours",
+];
+
+let dentalContactFieldsFetchForTesting: boolean | null = null;
+
+/** Test-only: act as if DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED were `on`; null restores it. */
+export function __setDentalPlacesContactFieldsFetchForTesting(on: boolean | null): void {
+  dentalContactFieldsFetchForTesting = on;
+}
+
+/** DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED, or the test override. Phase 2G reads it per request. */
+export function dentalPlacesContactFieldsFetchEnabled(): boolean {
+  return dentalContactFieldsFetchForTesting ?? DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED;
+}
+
 /** The Places (New) FieldMask entries that carry Google's rating. */
 export const PLACES_RATING_FIELDS: readonly string[] = ["places.rating", "places.userRatingCount"];
 

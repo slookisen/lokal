@@ -384,6 +384,44 @@ function unconfirmedItemError(
   }
 }
 
+/**
+ * Skive 3 (bestillingsknapp, dev-request
+ * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): whether a product
+ * row can become a line of a REAL order right now. Read-only; the same
+ * per-row gates addCartItem() and submitCart() apply, so what the producer
+ * page's «Bestill for henting» pre-selects is, by construction, what add +
+ * submit turn into an order — no new rule:
+ *   - no category label (I-S2), no alcohol / service (F9, fail-closed);
+ *   - effective availability (staleness-checked) is 'in_stock';
+ *   - a producer-stated row (skive 4) of a producer who passes
+ *     isEligibleForRealOrder() (skive 2; a gate that cannot be evaluated
+ *     counts as «no», as in catalog-offers.ts compareOffersForProducer).
+ */
+export function isRowOrderableForRealOrder(
+  db: any,
+  row: {
+    agent_id: string;
+    name: string;
+    description?: string | null;
+    category?: string | null;
+    price_nok: number | null;
+    availability: string;
+    availability_updated_at: string | null;
+    availability_source: string | null;
+  },
+  now: Date = new Date(),
+): boolean {
+  if (isCategoryLabelRow(row)) return false;
+  if (bannedItemError(db, row)) return false;
+  if (computeEffectiveAvailability(row.availability, row.availability_updated_at, row.availability_source ?? "", now) !== "in_stock") return false;
+  if (!isProducerStatedSource(row.availability_source)) return false;
+  try {
+    return isEligibleForRealOrder(row.agent_id, db);
+  } catch {
+    return false;
+  }
+}
+
 // ─── Add / upsert item ───────────────────────────────────────────────────────
 
 export type AddItemResult =

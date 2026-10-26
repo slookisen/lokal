@@ -5328,6 +5328,27 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 6 ───────
+  // Owner pause (visibility.profile = false). One row = paused; pause_until
+  // 'YYYY-MM-DD' (optional) = the pause ends that UTC day. Its own table, not
+  // agents columns (extra agents columns change SQLite's plan for the public
+  // scans and so the row order the golden tests pin). No `id` column on
+  // purpose (services/agent-visibility.ts notOwnerPausedSql). Read only by
+  // agent-visibility.ts while OWNER_PAUSE_ENABLED is on; written only by
+  // POST /eier/:id/pause and /api/agents/:id/pause. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_profile_pause (
+        agent_id TEXT NOT NULL PRIMARY KEY,
+        paused_at TEXT NOT NULL,
+        pause_until TEXT,
+        set_by TEXT NOT NULL DEFAULT 'owner'
+      )
+    `);
+  } catch (err) {
+    console.error("Migration owner_profile_pause failed:", err);
+  }
+
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
   // outreach_daily_send_cap: one row per UTC calendar day, holding an
@@ -5829,6 +5850,36 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_search_console_weekly_week ON search_console_weekly(week)`);
   } catch (err) {
     console.error("Migration search_console_weekly failed:", err);
+  }
+
+  // ─── order_activation_links (dev-request 2026-10-21 live-go handlevogn-pilot,
+  // skive 2 — aktiveringslenke) ─────────────────────────────────────────────
+  // One row per admin-generated, HMAC-signed one-time activation link
+  // (services/order-activation-link.ts). The token itself is never stored:
+  // `id` is sha256(nonce) hex, `email_hash` the keyed hash of the registered
+  // address the link was bound to. `used_at` is the single-use guard (a
+  // conditional UPDATE … WHERE used_at IS NULL) and, with used_outcome /
+  // used_ip_hash / used_user_agent / session_link_id, the usage log.
+  // Additive; brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_activation_links (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        email_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        used_at TEXT,
+        used_outcome TEXT,
+        used_ip_hash TEXT,
+        used_user_agent TEXT,
+        session_link_id TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_order_activation_links_agent ON order_activation_links(agent_id)`);
+  } catch (err) {
+    console.error("Migration order_activation_links failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

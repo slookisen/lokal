@@ -20,6 +20,7 @@ import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, type TrafficYearKey } from "../services/traffic-year-compute";
 import { analyticsService } from "../services/analytics-service";
 import { filterQueryText } from "../services/search-tracking";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -130,6 +131,7 @@ import { COMPANY_INFO } from "../config/company-info";
 const router = Router();
 
 // The homepage strip's AI explanation (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
+const DENTAL_DELIVERIES_EXPLAIN = "Med i AI-søk: ganger en klinikk var blant treffene en AI-assistent (ChatGPT, Claude …) hentet for noen som spurte (søk, sted, profilsiden, MCP eller A2A), summert over alle klinikker. Tallet viser ikke hvor mange som så det.";
 const DENTAL_AI_EXPLAIN = "AI-søk: sider en AI-assistent (ChatGPT, Claude, Perplexity …) hentet fra nettsiden i sanntid fordi noen spurte den, pluss oppslag AI-agenter gjorde i dataene våre via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.";
 
 const DENTAL_BASE_URL =
@@ -1239,6 +1241,25 @@ router.get("/", (_req: Request, res: Response) => {
   let stats = { total: 0, per_fylke: [] as Array<{ fylke: string; count: number }>, helfo_count: 0, chain_count: 0, acute_count: 0, specialist_clinic_count: 0 };
   try { stats = getCachedDentalStats(); } catch { /* dental db may not be ready */ }
   const traffic = getTrafficStats("dental");
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip shows
+  // five equal numbers over the last 12 months, each with «siste 12 måneder»
+  // or «siden <dato>» (traffic-year-compute.ts); the 60-day fields are no
+  // longer shown here.
+  const dentalYear = traffic.year;
+  const dentalYearCell = (key: TrafficYearKey) => trafficYearCell(dentalYear, key, "nb", "nb");
+  const dentalYearNum = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString("nb"));
+  const dentalProofLabels: Record<TrafficYearKey, string> = {
+    humanVisits: "Besøk fra mennesker",
+    humanViews: "Sidevisninger fra mennesker",
+    aiSearch: "AI-søk",
+    aiCrawlerViews: "AI-crawlere",
+    aiDeliveries: "Med i AI-søk",
+  };
+  const dentalProofItems = TRAFFIC_YEAR_KEYS.map((key) => {
+    const c = dentalYearCell(key);
+    const title = key === "aiDeliveries" ? DENTAL_DELIVERIES_EXPLAIN : key === "aiSearch" || key === "aiCrawlerViews" ? DENTAL_AI_EXPLAIN : "";
+    return `      <div data-stat="${key}"${title ? ` title="${title}"` : ""}><div class="proof-val${key === "aiSearch" ? " proof-val-muted" : ""}">${c.value}</div><div class="proof-lbl">${dentalProofLabels[key]}</div>${c.period ? `<div class="proof-period">${c.period}</div>` : ""}</div>`;
+  }).join("\n");
 
   const totalRounded = stats.total > 6000
     ? `over ${Math.floor(stats.total / 100) * 100}`
@@ -1304,13 +1325,11 @@ router.get("/", (_req: Request, res: Response) => {
   </div>
 
   <div class="proof-bar" aria-label="Trafikk">
+    <style>.proof-bar .proof-inner{grid-template-columns:repeat(5,1fr)}@media(max-width:640px){.proof-bar .proof-inner{grid-template-columns:repeat(2,1fr)}}.proof-period{font-size:.7rem;color:var(--g500);margin-top:2px}</style>
     <div class="proof-inner">
-      <div><div class="proof-val">${traffic.humanVisits.toLocaleString("nb")}</div><div class="proof-lbl">Besøk fra mennesker</div></div>
-      <div><div class="proof-val">${traffic.humanViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger fra mennesker</div></div>
-      <div title="${DENTAL_AI_EXPLAIN}"><div class="proof-val proof-val-muted">${traffic.aiSearchTotal.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
-      <div title="${DENTAL_AI_EXPLAIN}"><div class="proof-val">${traffic.aiCrawlerViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-crawlere</div></div>
+${dentalProofItems}
     </div>
-    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker ${traffic.humanViews.toLocaleString("nb")} + AI-assistenter ${traffic.aiSearchViews.toLocaleString("nb")} + AI-crawlere ${traffic.aiCrawlerViews.toLocaleString("nb")} + andre roboter og skript ${traffic.otherBotViews.toLocaleString("nb")}. AI-søk = ${traffic.aiSearchViews.toLocaleString("nb")} sider hentet av AI-assistenter + ${traffic.aiLookups.toLocaleString("nb")} oppslag via MCP/A2A. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. ${DENTAL_AI_EXPLAIN}</div>
+    ${dentalYear ? `<div class="proof-note">Sidevisninger ${dentalYearCell("humanViews").period}: ${dentalYearNum(dentalYear?.pageViews.value)} = mennesker ${dentalYearNum(dentalYear?.humanViews.value)} + AI-assistenter ${dentalYearNum(dentalYear?.aiSearchViews.value)} + AI-crawlere ${dentalYearNum(dentalYear?.aiCrawlerViews.value)} + andre roboter og skript ${dentalYearNum(dentalYear?.otherBotViews.value)}. AI-søk ${dentalYearCell("aiSearch").period} = ${dentalYearNum(dentalYear?.aiSearch.pages)} sider hentet av AI-assistenter + ${dentalYearNum(dentalYear?.aiSearch.lookups)} oppslag via MCP/A2A. Med i AI-søk ${dentalYearCell("aiDeliveries").period}: ganger en klinikk var blant treffene en AI-assistent hentet, summert over alle klinikker. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. Tallene er summer per dag over de siste 12 månedene, eller fra datoen under tallet når tellingen er yngre. ${DENTAL_AI_EXPLAIN}</div>` : ""}
   </div>
 
   <section class="section section-alt">
@@ -1445,6 +1464,10 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     realHumans: s.realHumans,
     botAndAi: s.botAndAi,
     aiQueries: s.aiQueries,
+    // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip's
+    // five numbers over the last 12 months, each with its start date
+    // (since: null = the whole window). The fields above stay 60-day numbers.
+    year: publicTrafficYearBlock(s.year),
   });
 });
 
@@ -1615,7 +1638,9 @@ router.get("/sok", generalLimiter, (req: Request, res: Response) => {
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
+  // «Med i AI-søk» (S1, 2026-10-25): only a page that answers a search or a
+  // filter counts; /sok with neither is the generic «all clinics» list.
+  if (q || Object.keys(explicit).length > 0) recordAiPageDelivery(req, res, "ai_page_list", agents.map((a) => a.id), "dental");
   res.send(dentalShell(html, {
     title: q ? `${q} — Tannlege søk` : "Søk etter tannlege — Finn-tannlege.com",
     description: `Søk blant ${total} tannlegeklinikker i Norge. Filtrer på Helfo-avtale, spesialitet og fylke.`,

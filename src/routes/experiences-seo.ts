@@ -36,6 +36,7 @@ import * as path from "path";
 import { analyticsService } from "../services/analytics-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
+import { TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYear, type TrafficYearKey } from "../services/traffic-year-compute";
 import { filterQueryText } from "../services/search-tracking";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
@@ -1662,6 +1663,35 @@ export const GARDSSALG_TYPE_SLUG_ALIASES: Record<string, string> = {
 // Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
 // is genuinely bilingual; browse/detail stay NO-canonical for now.
 // ─────────────────────────────────────────────────────────────
+/**
+ * The 12-month strip's own strings (dev-request 2026-10-22-statistikk-samme-tall-12-mnd,
+ * S2). Kept outside homeStrings(), whose en/sv copy is frozen by
+ * experiences-seo-forside-copy.test.ts.
+ */
+export function counterYearStrings(lang: Lang) {
+  if (lang === "en") return {
+    pageViews: "Page views,",
+    deliveries: "In AI searches",
+    deliveriesNote: "times a provider was among the results an AI assistant fetched, summed over all providers",
+    deliveriesExplain: "In AI searches: times a provider was among the results an AI assistant (ChatGPT, Claude …) fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), summed over all providers. It does not show how many people saw it.",
+    dailySums: "The numbers are daily sums over the last 12 months, or from the date under the number when the count is younger.",
+  };
+  if ((lang as string) === "sv") return {
+    pageViews: "Sidvisningar",
+    deliveries: "Med i AI-sökningar",
+    deliveriesNote: "gånger en arrangör fanns bland träffarna en AI-assistent hämtade, summerat över alla arrangörer",
+    deliveriesExplain: "Med i AI-sökningar: gånger en arrangör fanns bland träffarna en AI-assistent (ChatGPT, Claude …) hämtade åt någon som frågade (sökning, plats, kategori, profilsidan, MCP eller A2A), summerat över alla arrangörer. Siffran visar inte hur många som såg den.",
+    dailySums: "Siffrorna är summor per dag för de senaste 12 månaderna, eller från datumet under siffran när räkningen är yngre.",
+  };
+  return {
+    pageViews: "Sidevisninger",
+    deliveries: "Med i AI-søk",
+    deliveriesNote: "ganger en tilbyder var blant treffene en AI-assistent hentet, summert over alle tilbydere",
+    deliveriesExplain: "Med i AI-søk: ganger en tilbyder var blant treffene en AI-assistent (ChatGPT, Claude …) hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), summert over alle tilbydere. Tallet viser ikke hvor mange som så det.",
+    dailySums: "Tallene er summer per dag over de siste 12 månedene, eller fra datoen under tallet når tellingen er yngre.",
+  };
+}
+
 export function homeStrings(lang: Lang) {
   const no = {
     // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S3: Daniel's
@@ -1977,43 +2007,47 @@ router.get("/", (req: Request, res: Response) => {
   // for the exact scoping/exclusion rules this reuses from the RFB homepage
   // pattern). Read defensively — must never break the homepage.
   const numFmt = lang === "en" ? "en-US" : "nb-NO";
-  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, humanVisits: 0, humanViews: 0, aiSearchViews: 0, aiLookups: 0, aiSearchTotal: 0, aiCrawlerViews: 0, otherBotViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null };
+  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, humanVisits: 0, humanViews: 0, aiSearchViews: 0, aiLookups: 0, aiSearchTotal: 0, aiCrawlerViews: 0, otherBotViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0, sinceDate: null as string | null, year: null as TrafficYear | null };
   try {
     counters = getOaHomeCounters();
   } catch {
     // Analytics/catalog DB not open — render the strip with 0s rather than
     // failing the whole homepage.
   }
-  // Since-date: the oldest analytics datapoint the counters above are drawn
-  // from (counters.sinceDate, from oa-home-counters.ts). Omit entirely when
-  // null (no analytics rows yet) or unparseable — never render
-  // "since Invalid Date".
-  let sinceDateFragment = "";
-  if (counters.sinceDate) {
-    const sinceD = new Date(counters.sinceDate);
-    if (!isNaN(sinceD.getTime())) {
-      const formattedSinceDate = sinceD.toLocaleDateString(numFmt, { day: "numeric", month: "short", year: "numeric" });
-      sinceDateFragment = ` &middot; ${S.counterSincePre} ${formattedSinceDate}`;
-    }
-  }
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: five equal
+  // numbers over the last 12 months, each with «siste 12 måneder» or
+  // «siden <dato>» (traffic-year-compute.ts). That per-number start date
+  // replaces the old «Tall siden <oldest raw row>» fragment, which described
+  // the 60-day raw window (counters.sinceDate is still computed).
+  const year = counters.year;
+  const Y = counterYearStrings(lang);
+  const yearLang = trafficYearLangOf(lang);
+  const yearCell = (key: TrafficYearKey) => trafficYearCell(year, key, yearLang, numFmt);
+  const yearNum = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString(numFmt));
+  const yearLabels: Record<TrafficYearKey, string> = {
+    humanVisits: S.counterHumanVisits,
+    humanViews: S.counterHumanViews,
+    aiSearch: S.counterAiSearch,
+    aiCrawlerViews: S.counterCrawlers,
+    aiDeliveries: Y.deliveries,
+  };
+  const yearItemsHtml = TRAFFIC_YEAR_KEYS.map((key) => {
+    const c = yearCell(key);
+    const title = key === "aiDeliveries" ? Y.deliveriesExplain : key === "aiSearch" || key === "aiCrawlerViews" ? S.counterAiExplain : "";
+    return `      <div class="counter-item" data-stat="${key}"${title ? ` title="${title}"` : ""}><div class="counter-val${key === "aiSearch" ? " counter-val-accent" : ""}">${c.value}</div><div class="counter-lbl">${yearLabels[key]}</div>${c.period ? `<div class="counter-period">${c.period}</div>` : ""}</div>
+      <div class="counter-sep" aria-hidden="true"></div>`;
+  }).join("\n");
   const counterStripHtml = `
   <div class="counters" aria-label="${S.counterAria}">
     <div class="counters-inner">
-      <div class="counter-item"><div class="counter-val">${counters.humanVisits.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumanVisits}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item"><div class="counter-val">${counters.humanViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumanViews}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item" title="${S.counterAiExplain}"><div class="counter-val counter-val-accent">${counters.aiSearchTotal.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterAiSearch}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item" title="${S.counterAiExplain}"><div class="counter-val">${counters.aiCrawlerViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterCrawlers}</div></div>
-      <div class="counter-sep" aria-hidden="true"></div>
+${yearItemsHtml}
       <div class="counter-item"><div class="counter-val">${counters.opplevelser.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterExperiences}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.tilbydere.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterProviders}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
     </div>
-    <div class="counter-note">${S.counterTotalPre} ${counters.windowDays} ${S.counterWindowPost}: ${counters.pageViews.toLocaleString(numFmt)} = ${S.counterPeople} ${counters.humanViews.toLocaleString(numFmt)} + ${S.counterAiPages} ${counters.aiSearchViews.toLocaleString(numFmt)} + ${S.counterAiCrawlersLc} ${counters.aiCrawlerViews.toLocaleString(numFmt)} + ${S.counterOtherBots} ${counters.otherBotViews.toLocaleString(numFmt)}. ${S.counterAiSearch} = ${counters.aiSearchViews.toLocaleString(numFmt)} ${S.counterAiPagesNote} + ${counters.aiLookups.toLocaleString(numFmt)} ${S.counterAiLookupsNote}. ${S.counterVisitDef} ${S.counterAiExplain}${sinceDateFragment}</div>
+    ${year ? `<div class="counter-note">${Y.pageViews} ${yearCell("humanViews").period}: ${yearNum(year?.pageViews.value)} = ${S.counterPeople} ${yearNum(year?.humanViews.value)} + ${S.counterAiPages} ${yearNum(year?.aiSearchViews.value)} + ${S.counterAiCrawlersLc} ${yearNum(year?.aiCrawlerViews.value)} + ${S.counterOtherBots} ${yearNum(year?.otherBotViews.value)}. ${S.counterAiSearch} ${yearCell("aiSearch").period} = ${yearNum(year?.aiSearch.pages)} ${S.counterAiPagesNote} + ${yearNum(year?.aiSearch.lookups)} ${S.counterAiLookupsNote}. ${Y.deliveries} ${yearCell("aiDeliveries").period}: ${Y.deliveriesNote}. ${S.counterVisitDef} ${Y.dailySums} ${S.counterAiExplain}</div>` : ""}
     <div class="network-strip">${S.networkLabel}
       <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
       <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>
@@ -2300,6 +2334,7 @@ ${ldScripts}
   .counter-val{font-size:1.25rem;font-weight:800;color:var(--fjord-700);letter-spacing:-.02em;line-height:1}
   .counter-val.counter-val-accent{color:var(--coral-500)}
   .counter-lbl{margin-top:3px;font-size:.68rem;font-weight:600;color:var(--mist);text-transform:uppercase;letter-spacing:.04em}
+  .counter-period{margin-top:2px;font-size:.64rem;color:var(--mist)}
   .counter-sep{width:1px;height:26px;background:var(--line)}
   @media(max-width:640px){.counter-sep{display:none}}
 
@@ -2729,7 +2764,7 @@ function buildExperiencesSitemapXml(): string {
   // every request (rfb PR #302 fixed the same pattern for city pages).
   let gardssalgProvidersForSitemap: GardssalgProviderRow[] | null = null;
   if (gardssalgVisible()) {
-    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0); } catch { gardssalgProvidersForSitemap = null; }
+    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0, undefined, "sitemap"); } catch { gardssalgProvidersForSitemap = null; }
   }
   try {
     for (const row of listPublishedCategories()) {
@@ -5094,7 +5129,8 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
-  recordAiPageDelivery(req, res, "ai_page_list", rows.map((r) => r.id).filter((i): i is string => !!i), "experiences");
+  // «Med i AI-søk» (S1, 2026-10-25): the generic «Alle opplevelser» list answers
+  // no search, place or category, so it is not counted.
   res.send(html);
 });
 

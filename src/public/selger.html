@@ -239,6 +239,15 @@
           <div class="step"><span class="step-num">2</span> <span>Registrer / ta eierskap</span></div>
           <div class="step"><span class="step-num">3</span> <span>Dashboard</span></div>
         </div>
+        <div id="singleStore" style="display: none;">
+          <h2 style="color: var(--forest); font-size: 1.2rem;">Ta over siden til butikken din</h2>
+          <div style="padding: 1rem; background: var(--gray-50); border-radius: 12px; border: 1px solid var(--gray-200); margin-bottom: 1rem;">
+            <strong id="singleStoreName"></strong><br>
+            <span id="singleStoreCity" style="color: var(--gray-500); font-size: 0.9rem;"></span>
+          </div>
+          <button class="btn btn-primary" id="btnSingleStoreClaim" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Dette er min butikk</button>
+        </div>
+        <div id="findDefault">
         <h2 style="color: var(--forest); font-size: 1.2rem;">Finn butikken din</h2>
         <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1.25rem;">Vi sjekker om butikken din allerede finnes i registeret. Da kan du ta eierskap med en gang, i stedet for å opprette en duplikat.</p>
 
@@ -253,6 +262,7 @@
           </div>
         </div>
         <button class="btn btn-primary" id="btnFind" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Sjekk registeret</button>
+        </div>
         <div id="findAlert"></div>
 
         <!-- Match results appear here -->
@@ -678,7 +688,7 @@
           <div class="card">
             <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">
-              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-svar&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
+              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-s&oslash;k&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
             </p>
             <div class="stats-grid" id="statsFunnel"></div>
           </div>
@@ -697,8 +707,8 @@
           </div>
 
           <div class="card">
-            <h2>Med i AI-svar</h2>
-            <p class="section-hint" style="margin-bottom:0.75rem;">Antall ganger profilen din er sendt til AI-assistenter som ChatGPT og Claude som svar p&aring; sp&oslash;rsm&aring;l: p&aring; en liste- eller s&oslash;keside AI-en hentet, p&aring; profilsiden din, eller i svar via MCP og A2A. Tallet viser at profilen ble sendt til AI-en, ikke hvor mange som s&aring; den. Svar AI-en gir fra sin egen hukommelse ser vi ikke, s&aring; tallet er et minimum.</p>
+            <h2>Med i AI-s&oslash;k</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">Antall ganger profilen din var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte: et s&oslash;k, et sted, en kategori eller et markedsnettverk AI-en hentet, profilsiden din, eller svar via MCP og A2A. Forsiden telles ikke. Tallet viser ikke hvor mange som s&aring; profilen. Svar AI-en gir fra sin egen hukommelse ser vi ikke, s&aring; tallet er et minimum.</p>
             <div class="stats-grid" id="statsAiDeliveries"></div>
             <h3>Per AI</h3>
             <ul class="product-list" id="statsAiDeliveriesVendor"></ul>
@@ -756,6 +766,7 @@
         <div class="hidden" id="ordersContent">
           <div class="card">
             <h2>Bestillinger</h2>
+            <p style="margin-bottom:0.75rem;"><a class="btn btn-primary btn-small" id="ordersMineLink" href="#">Åpne «Mine ordrer» – bekreft og avslå her</a></p>
             <ul class="product-list" id="ordersList"></ul>
           </div>
         </div>
@@ -799,7 +810,14 @@
               </div>
               <button class="btn btn-secondary btn-small" id="btnUnclaim" style="border-color: #b91c1c; color: #b91c1c; white-space: nowrap;">Frasig eierskap</button>
             </div>
-            <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+            <div id="rowPauseOrDelete" class="hidden" style="justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+              <div>
+                <strong style="font-size: 0.9rem;">Ta pause eller be om sletting</strong>
+                <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Sett profilen på pause i eierportalen, eller be kundeservice slette den.</p>
+              </div>
+              <a class="btn btn-secondary btn-small" id="linkPauseOrDelete" href="/eier" style="white-space: nowrap;">Pause og sletting</a>
+            </div>
+            <div id="rowDeactivate" style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
               <div>
                 <strong style="font-size: 0.9rem;">Meld butikk som nedlagt</strong>
                 <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Agenten merkes som inaktiv og fjernes fra søkeresultater.</p>
@@ -909,6 +927,27 @@
     // carries ?agent=<id>. We detect that here, fetch the agent info, and pre-fill the
     // "Finn butikken" search field so the user can confirm with one click instead of
     // typing the same name they just clicked.
+    // Samme regler som washStoreName i src/utils/rfb-store-name.ts.
+    function washStoreName(raw) {
+      var name = String(raw == null ? '' : raw).trim();
+      var cuts = [name.indexOf(' \u2014 '), name.indexOf(', ')].filter(function(i) { return i >= 0; });
+      if (cuts.length) name = name.slice(0, Math.min.apply(null, cuts));
+      return name.replace(/\s+(AS|SA|DA|ANS|ENK)$/i, '').trim();
+    }
+    function showSingleStore(agentId, rawName, city) {
+      var cleanName = washStoreName(rawName) || String(rawName);
+      document.getElementById('singleStoreName').textContent = cleanName;
+      document.getElementById('singleStoreCity').textContent = city || '';
+      document.getElementById('findDefault').style.display = 'none';
+      document.getElementById('findResults').style.display = 'none';
+      var alertEl = document.getElementById('findAlert');
+      if (alertEl) alertEl.innerHTML = '';
+      document.getElementById('singleStore').style.display = '';
+      document.getElementById('btnSingleStoreClaim').addEventListener('click', function() {
+        startClaimFlow(agentId, cleanName);
+      });
+    }
+
     (function preselectFromQuery() {
       try {
         const params = new URLSearchParams(window.location.search);
@@ -930,6 +969,14 @@
             if (!resolvedName) {
               // Invalid id — fall back to default UI
               if (findAlertEl) findAlertEl.innerHTML = "";
+              return;
+            }
+            // Utsending v4: en produsent som ikke er tatt over vises som én
+            // butikk (uten søkefelt og trefliste). Overtatt/verifisert, eller
+            // manglende id, gir siden som før.
+            const infoAgent = info.agent || {};
+            if (infoAgent.id && !infoAgent.isClaimed && !infoAgent.isVerified) {
+              showSingleStore(infoAgent.id, resolvedName, infoAgent.city);
               return;
             }
             const findNameEl = document.getElementById("findName");
@@ -1399,6 +1446,13 @@
 
     // ── Logout ──
     document.getElementById('btnLogout').addEventListener('click', function() {
+      // S1b punkt 5: one owner login — logging out here also revokes the
+      // /eier owner session (rfb_owner_session cookie) server-side.
+      if (state.agentId && window.fetch) {
+        try {
+          fetch(API_BASE + '/eier/' + encodeURIComponent(state.agentId) + '/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual' }).catch(function() {});
+        } catch (e) { /* best-effort */ }
+      }
       clearSession();
       state.claimToken = null;
       state.agentId = null;
@@ -1470,6 +1524,16 @@
             method: 'POST',
             body: JSON.stringify({ token: state.claimToken })
           });
+          // S1b punkt 6 (OWNER_PAUSE_ENABLED): «Meld nedlagt» is replaced by
+          // pause + «be om sletting» in the owner portal. Absent flag = unchanged.
+          if (authCheck && authCheck.success && authCheck.data && authCheck.data.ownerPauseEnabled === true) {
+            var rowDeact = document.getElementById('rowDeactivate');
+            var rowPause = document.getElementById('rowPauseOrDelete');
+            var linkPause = document.getElementById('linkPauseOrDelete');
+            if (rowDeact) rowDeact.style.display = 'none';
+            if (linkPause) linkPause.setAttribute('href', '/eier/' + encodeURIComponent(state.agentId) + '/portal#pause');
+            if (rowPause) { rowPause.classList.remove('hidden'); rowPause.style.display = 'flex'; }
+          }
           if (!authCheck.success || authCheck.data.agentId !== state.agentId) {
             // Token expired, invalid, or belongs to a different agent
             var staleToken = state.claimToken;
@@ -1995,7 +2059,7 @@
       aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.other || 0) + '</div><div class="stat-label">Andre AI</div></div>';
       document.getElementById('statsAiPlatforms').innerHTML = aiHtml;
 
-      // Med i AI-svar: last 60 days and since counting started, per AI and per channel
+      // Med i AI-søk: last 60 days and since counting started, per AI and per channel
       var dl = data.aiDeliveries || {};
       var dw = dl.window || {};
       var da = dl.allTime || {};
@@ -2007,8 +2071,8 @@
       var dlPartial = !!dlSince && (Date.now() - dlSinceMs) < (dwDays - 1) * 86400000;
       var dlWinLabel = dlPartial ? 'siden ' + dlSince : dwDays + 'd';
       var dlHtml = '';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + dlWinLabel + ')</div></div>';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Sendt til AI-en (' + (dlSince ? 'fra ' + dlSince : 'hele perioden') + ')</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + dlWinLabel + ')</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + (dlSince ? 'siden ' + dlSince : 'hele perioden') + ')</div></div>';
       document.getElementById('statsAiDeliveries').innerHTML = dlHtml;
       var DL_VENDOR_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Andre AI', unknown: 'Ukjent AI' };
       var DL_CHANNEL_LABELS = { ai_page_list: 'Liste- og s&oslash;kesider', ai_page_profile: 'Profilsiden', mcp: 'MCP', a2a: 'A2A' };
@@ -2119,6 +2183,8 @@
     function loadOwnerOrders() {
       if (!state.agentId || ordersLoading) return;
       ordersLoading = true;
+      var mineLink = document.getElementById('ordersMineLink');
+      if (mineLink) mineLink.href = '/eier/' + encodeURIComponent(state.agentId) + '/ordrer';
       show('ordersLoading');
       hide('ordersLoginRequired');
       hide('ordersContent');

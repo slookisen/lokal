@@ -2,7 +2,7 @@
 # Uses tsx for TypeScript execution (same as dev).
 # SQLite data persists via a mounted volume at /app/data.
 
-FROM node:20-alpine
+FROM node:24.22.1-alpine
 WORKDIR /app
 
 # better-sqlite3 needs build tools for native compilation

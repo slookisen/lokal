@@ -381,6 +381,7 @@ import { fetchPage, discoverContentLinks } from "./fetch-page";
 import { extractEmails } from "./search-enrich";
 import { isAcceptableHomepageEmail, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "./gardssalg-booking-gate";
+import { gardssalgVisibleSql } from "./gardssalg-visibility";
 
 const VERTICAL = "experiences";
 
@@ -447,8 +448,7 @@ export function getClaimProviderBySlug(slug: string): ClaimProviderRow | null {
       `SELECT ${CLAIM_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE slug = ?
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = 'owner_pause')
-          AND (merged_into IS NULL OR merged_into = '')`,
+          AND ${gardssalgVisibleSql("claim")}`,
     )
     .get(slug) as ClaimProviderRow | undefined;
   return row ?? null;
@@ -616,7 +616,7 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
     .get(normalized);
   if (!sentRow) return false;
 
-  const bouncedRow = db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? LIMIT 1`).get(normalized);
+  const bouncedRow = db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND (bounce_type IS NULL OR bounce_type <> 'unsubscribe') LIMIT 1`).get(normalized);
   return !bouncedRow;
 }
 

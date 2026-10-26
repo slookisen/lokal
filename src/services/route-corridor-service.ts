@@ -73,6 +73,7 @@ import { formatRfbDistanceLabel } from "./geo-precision";
 import { formatDistanceLabel } from "./experience-store";
 import { slugify } from "../utils/slug";
 import { publicListableSql } from "./agent-visibility";
+import { gardssalgVisibleSql } from "./gardssalg-visibility";
 import {
   prepareRoute,
   corridorBoundingBox,
@@ -767,9 +768,7 @@ export function loadGardssalgCandidates(
       `SELECT id, navn, slug, fylke, kommune, poststed, producer_type,
               lat, lon, geocode_confidence
          FROM experience_providers
-        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
-          AND (merged_into IS NULL OR merged_into = '')
+        WHERE ${gardssalgVisibleSql("map")}
           AND lat IS NOT NULL AND lon IS NOT NULL
           AND lat BETWEEN ? AND ?
           AND lon BETWEEN ? AND ?`,

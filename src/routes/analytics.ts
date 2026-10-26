@@ -949,6 +949,7 @@ router.get("/traffic-classification", async (req: Request, res: Response) => {
     classification,
     classes: rep.classes,
     coverage: rep.coverage,
+    aiAgents: rep.aiAgents,
     bots: rep.bots,
     otherUaSamples: rep.otherUaSamples,
     humanSessions: rep.human.topSessions,

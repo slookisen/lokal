@@ -634,6 +634,16 @@ export type ComposeSendRaw = (
 export interface ComposeDeps {
   /** Transport seam — defaults to emailService.sendRaw (the route always uses the default). */
   sendRaw?: ComposeSendRaw;
+  /**
+   * Display name for From (address and Reply-To unchanged). Only a trusted
+   * in-process caller can set it — it is deliberately NOT part of composeSchema,
+   * so the HTTP route cannot. dev-request 2026-10-22-rfb-utsending-v4.
+   */
+  fromDisplayName?: string;
+  /** Message-ID of the first mail: sent as In-Reply-To/References so the follow-up threads. */
+  inReplyToMessageId?: string;
+  /** Extra raw_metadata on the CRM message row (template, subject_arm, …). */
+  messageMetadata?: Record<string, unknown>;
 }
 
 export interface ComposeOutcome {
@@ -984,6 +994,7 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
       createdBy,
       deliveryStatus: "queued",
       vertical,
+      ...(deps.messageMetadata ? { extraMetadata: deps.messageMetadata } : {}),
     });
 
     const queued = crmService.enqueueOutbox({
@@ -1019,8 +1030,9 @@ export function executeCompose(rawBody: unknown, deps: ComposeDeps = {}): Compos
               subject,
               textContent: bodyText,
               htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
-              from: crmFromHeader(vertical),
+              from: crmFromHeader(vertical, deps.fromDisplayName),
               replyTo: composeIdentity.replyTo,
+              ...(deps.inReplyToMessageId ? { inReplyToMessageId: deps.inReplyToMessageId } : {}),
               // S1a point 3 (OUTREACH_UNSUBSCRIBE_ENABLED, default off): cold RFB
               // outreach carries List-Unsubscribe + One-Click. Spread, so the
               // options are identical to before when off / not cold outreach.
