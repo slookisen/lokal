@@ -46632,6 +46632,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
+// kontaktuttrekk (skive 1): own-website evidence for the RFB second-line judge
+// behind RFB_SECOND_LINE_EVIDENCE_ENABLED (default OFF) + the read-only
+// POST /admin/second-line-judge-preview. Same in-memory DB seam as the
+// sibling second-line suite above, restored in `finally`.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-23 skive 1: RFB second-line judge evidence + preview ──");
+  try {
+    const { runLokalAgentVerifierSecondLineEvidenceTests } = require("../src/agents/lokal-agent-verifier-second-line-evidence.test") as
+      typeof import("../src/agents/lokal-agent-verifier-second-line-evidence.test");
+    const sle = await runLokalAgentVerifierSecondLineEvidenceTests({ log: false });
+    passed += sle.passed;
+    failed += sle.failed;
+    for (const f of sle.failures) failures.push("lokal-agent-verifier-second-line-evidence: " + f);
+    console.log(`  lokal-agent-verifier-second-line-evidence: ${sle.passed} passed, ${sle.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-second-line-evidence: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-23-terminal-unconfirmable: new `terminal_unconfirmable`
 // verification status so demonstrably unconfirmable agents (Brreg-dead, or
 // zero identity sources on the second line) stop looping in the hourly

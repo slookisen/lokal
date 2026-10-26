@@ -107,7 +107,7 @@ function stringifyProducts(products: unknown[]): string {
  *  defense-in-depth mirroring the route's own sanitizeEvidenceForId, since
  *  this is a module boundary other callers could reach directly. Returns []
  *  for missing/empty input. */
-function sanitizedEvidenceItems(
+export function sanitizedEvidenceItems(
   evidence?: readonly { source_url: string; content_excerpt: string }[],
 ): { source_url: string; content_excerpt: string }[] {
   if (!evidence || evidence.length === 0) return [];
@@ -133,14 +133,7 @@ function evidenceBlockFor(items: readonly { source_url: string; content_excerpt:
   return `\nFremlagt kildeinnhold (hentet av kalleren fra kilden(e) over, til direkte kontroll):\n${lines}\n`;
 }
 
-/**
- * judgeSecondLineProfile — the whole-profile LLM judge behind RFB's second
- * verification line. Direct fetch to https://api.anthropic.com/v1/messages,
- * ANTHROPIC_API_KEY from env, model claude-haiku-4-5 — same call shape as
- * judgeContactCandidate. ANY doubt or failure resolves to "does not pass
- * second line"; never throws, never silently approves.
- */
-export async function judgeSecondLineProfile(params: {
+export interface SecondLineProfileJudgeParams {
   businessName: string;
   city: string | null;
   about: string | null;
@@ -149,12 +142,16 @@ export async function judgeSecondLineProfile(params: {
   acceptedSources: readonly string[];
   brregName?: string | null;
   evidence?: readonly { source_url: string; content_excerpt: string }[];
-}): Promise<SecondLineProfileJudgeVerdict> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
-  }
+}
 
+/**
+ * buildSecondLineJudgePrompt — the exact prompt text judgeSecondLineProfile
+ * sends. Factored out (dev-request 2026-10-23-rfb-flere-forstehenvendelser-
+ * dommer-bevis-og-kontaktuttrekk, skive 1) purely so tests can pin the
+ * no-evidence prompt byte-for-byte without a mocked network call. PURE —
+ * the text is unchanged from the inline version it replaced.
+ */
+export function buildSecondLineJudgePrompt(params: SecondLineProfileJudgeParams): string {
   const aboutCapped = (params.about || "").trim().slice(0, SECOND_LINE_JUDGE_ABOUT_CHAR_CAP);
   const productsText = stringifyProducts(params.products);
   const sourceText = sourceLabelsFor(params.acceptedSources);
@@ -198,6 +195,23 @@ ${SECOND_LINE_JUDGE_REJECT_TOKEN}
 <kort begrunnelse>
 
 Ved minste tvil, svar ${SECOND_LINE_JUDGE_REJECT_TOKEN}.`;
+  return prompt;
+}
+
+/**
+ * judgeSecondLineProfile — the whole-profile LLM judge behind RFB's second
+ * verification line. Direct fetch to https://api.anthropic.com/v1/messages,
+ * ANTHROPIC_API_KEY from env, model claude-haiku-4-5 — same call shape as
+ * judgeContactCandidate. ANY doubt or failure resolves to "does not pass
+ * second line"; never throws, never silently approves.
+ */
+export async function judgeSecondLineProfile(params: SecondLineProfileJudgeParams): Promise<SecondLineProfileJudgeVerdict> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reason: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const prompt = buildSecondLineJudgePrompt(params);
 
   let response: Awaited<ReturnType<typeof fetch>>;
   noteLlmCall("second-line-profile-judge");

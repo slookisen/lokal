@@ -54,7 +54,11 @@ import { isPlatformOwnedEmailDomain, isSyntacticallyValidEmail } from "../routes
 // parts / icon-extension TLDs / basic structural parsing) — see the "Guard
 // #4" block in runVerifierBatch — rather than re-deriving that detection.
 import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
-import { judgeSecondLineProfile, type SecondLineProfileJudgeVerdict } from "../services/second-line-profile-judge";
+import {
+  judgeSecondLineProfile,
+  sanitizedEvidenceItems,
+  type SecondLineProfileJudgeVerdict,
+} from "../services/second-line-profile-judge";
 import { scoreNameMatch, normaliseName, findOrgnumberByName, verifyOrgNumber, type BrregHit } from "../services/brreg-client";
 // dev-request 2026-08-25-terminal-sweep-false-positives: the fresh-lookup
 // death-check (checkFreshBrregDeathEvidence, below) reuses the SAME
@@ -163,7 +167,7 @@ const NACE_BLACKLIST: readonly string[] = [
 ];
 
 // Parse agent_knowledge.products which may be JSON or a plain array
-function parseProducts(raw: unknown): unknown[] {
+export function parseProducts(raw: unknown): unknown[] {
   if (!raw) return [];
   if (Array.isArray(raw)) return raw;
   try {
@@ -1467,6 +1471,71 @@ export interface SecondLineGateResult {
   judge_reason?: string;
 }
 
+// ─── dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
+//     kontaktuttrekk (skive 1, "port A"): own-website evidence for the judge ─
+//
+// The second-line judge used to be called with NO source content, so it often
+// rejected with "has not been given access to the website content". The
+// judge module already renders an optional evidence block (+ criterion 5);
+// this builds that evidence for an RFB agent from its OWN homepage — the same
+// URL computeKvalitetsGate's website_ok was based on (agent_knowledge.website,
+// probed by headProbe). Gated by RFB_SECOND_LINE_EVIDENCE_ENABLED (default
+// OFF) in runVerifierBatch; the read-only preview route uses it regardless.
+
+export interface SecondLineEvidenceItem {
+  source_url: string;
+  content_excerpt: string;
+}
+
+/** Same timeout as headProbe's default (the website_ok probe). */
+export const SECOND_LINE_EVIDENCE_FETCH_TIMEOUT_MS = 8000;
+
+/** Only the literal "1" or "true" enables; anything else (incl. unset) is OFF.
+ *  Read at call time, like RFB_SECOND_LINE_VERIFICATION_ENABLED. */
+export function isRfbSecondLineEvidenceEnabled(): boolean {
+  const v = process.env.RFB_SECOND_LINE_EVIDENCE_ENABLED;
+  return v === "1" || v === "true";
+}
+
+/**
+ * buildSecondLineEvidence — at most ONE evidence item: the visible text of
+ * the producer's homepage, capped by the judge module's own sanitizer.
+ * Returns [] (⇒ today's no-evidence judge call) when:
+ *   - `sources` does not include "own_website" (website_ok was false),
+ *   - there is no homepage URL,
+ *   - the fetch fails / the body is unusable,
+ *   - the page's FINAL URL (after redirects) is on a different hostname
+ *     (leading www. stripped, via hostnameFromUrl) than the homepage that
+ *     website_ok approved — content from another site is never sent,
+ *   - the visible text is empty.
+ * Never throws. `deps.fetchImpl` is the test seam (mirrors opts.headProbe /
+ * opts.brregLookup); production uses the global fetch via fetchPage.
+ */
+export async function buildSecondLineEvidence(
+  input: { sources: readonly string[]; website: string | null | undefined },
+  deps: { fetchImpl?: typeof fetch } = {},
+): Promise<SecondLineEvidenceItem[]> {
+  try {
+    if (!input.sources.includes("own_website")) return [];
+    const website = (input.website ?? "").trim();
+    if (!website) return [];
+    const homepage = withDefaultScheme(website);
+    const homeHost = hostnameFromUrl(homepage);
+    if (!homeHost) return [];
+    const page = await fetchPage(homepage, {
+      userAgent: "Lokal-SecondLineEvidence/1.0",
+      timeoutMs: SECOND_LINE_EVIDENCE_FETCH_TIMEOUT_MS,
+      fetchImpl: deps.fetchImpl,
+    });
+    if (!page.ok) return [];
+    const finalUrl = page.finalUrl || homepage;
+    if (hostnameFromUrl(finalUrl) !== homeHost) return [];
+    return sanitizedEvidenceItems([{ source_url: finalUrl, content_excerpt: visibleTextOf(page.html) }]);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * computeSecondLineVerification — the composed second-line gate. ALL of
  * the following must hold for `passes: true`:
@@ -1497,6 +1566,15 @@ export async function computeSecondLineVerification(input: {
   brreg: BrregLookupResult | null;
   gate_reasons: { website_ok: boolean; no_wrong_fit: boolean; brreg_active: boolean };
   affiliated_umbrella_domains?: readonly string[];
+  // dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
+  // kontaktuttrekk (skive 1): OPTIONAL caller-fetched source content for the
+  // judge's "criterion 5". Either pass it ready-made (`evidence`) or lazily
+  // (`evidenceFn`, called with the computed sources ONLY once the
+  // deterministic checks already hold — so no fetch is spent on a profile
+  // the judge would never see). Both absent/empty ⇒ the judge is called
+  // exactly as before (no `evidence` key at all ⇒ byte-identical prompt).
+  evidence?: readonly SecondLineEvidenceItem[];
+  evidenceFn?: (sources: readonly string[]) => Promise<readonly SecondLineEvidenceItem[]>;
   judgeFn?: (params: {
     businessName: string;
     city: string | null;
@@ -1505,6 +1583,7 @@ export async function computeSecondLineVerification(input: {
     email: string;
     acceptedSources: readonly string[];
     brregName?: string | null;
+    evidence?: readonly SecondLineEvidenceItem[];
   }) => Promise<SecondLineProfileJudgeVerdict>;
 }): Promise<SecondLineGateResult> {
   const nace_brreg_ok = input.gate_reasons.no_wrong_fit && input.gate_reasons.brreg_active;
@@ -1528,6 +1607,10 @@ export async function computeSecondLineVerification(input: {
   let judge_reason: string | undefined;
   if (deterministicOk) {
     const judgeFn = input.judgeFn ?? judgeSecondLineProfile;
+    let evidence: readonly SecondLineEvidenceItem[] = input.evidence ?? [];
+    if (evidence.length === 0 && input.evidenceFn) {
+      evidence = await input.evidenceFn(sources).catch(() => []);
+    }
     const verdict = await judgeFn({
       businessName: input.producer_name || "Ukjent produsent",
       city: input.city,
@@ -1536,6 +1619,9 @@ export async function computeSecondLineVerification(input: {
       email: email!,
       acceptedSources: sources,
       brregName: input.brreg?.navn ?? null,
+      // Only present when there is real evidence — keeps the no-evidence
+      // call (and therefore the prompt) exactly as it was.
+      ...(evidence.length > 0 ? { evidence } : {}),
     });
     judge_approved = verdict.approved;
     judge_reason = verdict.reason;
@@ -2318,6 +2404,11 @@ export async function runVerifierBatch(opts: {
   // Without it a test that seeds a real-looking homepage made a live HTTP
   // request (intg-3 / polsemakeri.no turned red when that site went down).
   urlProbeFetch?: FetchLike;
+  // dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
+  // kontaktuttrekk (skive 1): test seam ONLY — the fetch used by
+  // buildSecondLineEvidence when RFB_SECOND_LINE_EVIDENCE_ENABLED is on.
+  // Production leaves it undefined → global fetch. Never called flag-off.
+  secondLineEvidenceFetch?: typeof fetch;
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -2339,6 +2430,10 @@ export async function runVerifierBatch(opts: {
   // what first-line + the existing guards already compute — i.e. BYTE-
   // IDENTICAL to pre-this-PR behaviour.
   const secondLineEnabled = process.env.RFB_SECOND_LINE_VERIFICATION_ENABLED === "true";
+  // dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
+  // kontaktuttrekk (skive 1): default OFF. Off ⇒ no evidence, no extra fetch,
+  // judge called exactly as before.
+  const secondLineEvidenceEnabled = isRfbSecondLineEvidenceEnabled();
 
   const hasExplicitAgentIds = !!(opts.agentIds && opts.agentIds.length > 0);
   const pickFn = opts.pickFn ?? pickBatch;
@@ -2794,6 +2889,15 @@ export async function runVerifierBatch(opts: {
           },
           affiliated_umbrella_domains: affiliatedUmbrellaDomains,
           judgeFn: opts.secondLineJudgeFn,
+          ...(secondLineEvidenceEnabled
+            ? {
+                evidenceFn: (sources: readonly string[]) =>
+                  buildSecondLineEvidence(
+                    { sources, website: agent.website ?? null },
+                    { fetchImpl: opts.secondLineEvidenceFetch },
+                  ),
+              }
+            : {}),
         });
         (crossSourceResults as Record<string, unknown>).second_line = {
           attempted: true,
