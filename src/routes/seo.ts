@@ -45,6 +45,7 @@ import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
 import { getRetentionWindowDays } from "../services/retention-window";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
@@ -1246,6 +1247,10 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     realHumans: s.realHumans,
     botAndAi: s.botAndAi,
     aiQueries: s.aiQueries,
+    // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip's
+    // five numbers over the last 12 months, each with its start date
+    // (since: null = the whole window). The fields above stay 60-day numbers.
+    year: publicTrafficYearBlock(s.year),
   });
 });
 
@@ -1328,6 +1333,7 @@ const LANDING_CSS = `
   .proof-val-purple { color: #7c3aed; }
   .proof-lbl { font-size: 0.68rem; color: var(--g500); margin-top: 3px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
   .proof-sep { width: 1px; height: 28px; background: var(--g200); }
+  .proof-period { font-size: 0.64rem; color: var(--g400); margin-top: 2px; }
   .proof-note { max-width: 900px; margin: 10px auto 0; text-align: center; font-size: 0.7rem; color: var(--g500); line-height: 1.5; }
   .network-strip { max-width: 900px; margin: 12px auto 0; text-align: center; font-size: 0.75rem; color: var(--g500); }
   .network-strip a { color: var(--green-700); font-weight: 600; text-decoration: none; }
@@ -1549,6 +1555,32 @@ router.get("/", (req: Request, res: Response) => {
 
     const numFmt = lang === "en" ? "en-US" : "nb-NO";
 
+    // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: five equal
+    // numbers over the last 12 months, each with «siste 12 måneder» or
+    // «siden <dato>» (traffic-year-compute.ts), from the same off-thread
+    // snapshot as before; the 60-day fields are no longer shown here.
+    const trafficYear = traffic.year;
+    const yearLang = trafficYearLangOf(lang);
+    const yearCell = (key: TrafficYearKey) => trafficYearCell(trafficYear, key, yearLang, numFmt);
+    const yearNum = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString(numFmt));
+    const proofLabels: Record<TrafficYearKey, string> = {
+      humanVisits: t(lang, "home.proof_human_visits"),
+      humanViews: t(lang, "home.proof_human_views"),
+      aiSearch: t(lang, "home.proof_ai_search"),
+      aiCrawlerViews: t(lang, "home.proof_ai_crawlers"),
+      aiDeliveries: t(lang, "home.proof_ai_deliveries"),
+    };
+    const proofItemsHtml = TRAFFIC_YEAR_KEYS.map((key, i) => {
+      const c = yearCell(key);
+      const title = key === "aiDeliveries" ? t(lang, "home.proof_ai_deliveries_explain")
+        : key === "aiSearch" || key === "aiCrawlerViews" ? t(lang, "home.proof_ai_explain") : "";
+      return `${i > 0 ? '        <div class="proof-sep"></div>\n' : ""}        <div class="proof-item" data-stat="${key}"${title ? ` title="${escapeHtml(title)}"` : ""}>
+          <div class="proof-val${key === "aiSearch" ? " proof-val-purple" : ""}">${escapeHtml(c.value)}</div>
+          <div class="proof-lbl">${escapeHtml(proofLabels[key])}</div>
+          ${c.period ? `<div class="proof-period">${escapeHtml(c.period)}</div>` : ""}
+        </div>`;
+    }).join("\n");
+
     const content = `
     <section class="hero">
       <div class="hero-inner">
@@ -1615,35 +1647,20 @@ router.get("/", (req: Request, res: Response) => {
 
     <div class="proof-bar">
       <div class="proof-inner">
-        <div class="proof-item">
-          <div class="proof-val">${traffic.humanVisits.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_human_visits"))}</div>
-        </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item">
-          <div class="proof-val">${traffic.humanViews.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_human_views"))}</div>
-        </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
-          <div class="proof-val proof-val-purple">${traffic.aiSearchTotal.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_search"))}</div>
-        </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
-          <div class="proof-val">${traffic.aiCrawlerViews.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_crawlers"))}</div>
-        </div>
+${proofItemsHtml}
       </div>
-      <div class="proof-note">${escapeHtml(t(lang, "home.proof_total", {
-        days: traffic.windowDays,
-        total: traffic.pageViews.toLocaleString(numFmt),
-        human: traffic.humanViews.toLocaleString(numFmt),
-        aiPages: traffic.aiSearchViews.toLocaleString(numFmt),
-        aiCrawlers: traffic.aiCrawlerViews.toLocaleString(numFmt),
-        otherBots: traffic.otherBotViews.toLocaleString(numFmt),
-        aiLookups: traffic.aiLookups.toLocaleString(numFmt),
-      }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>
+      ${trafficYear ? `<div class="proof-note">${escapeHtml(t(lang, "home.proof_total", {
+        period: yearCell("humanViews").period,
+        total: yearNum(trafficYear?.pageViews.value),
+        human: yearNum(trafficYear?.humanViews.value),
+        aiPages: yearNum(trafficYear?.aiSearchViews.value),
+        aiCrawlers: yearNum(trafficYear?.aiCrawlerViews.value),
+        otherBots: yearNum(trafficYear?.otherBotViews.value),
+        aiPeriod: yearCell("aiSearch").period,
+        aiSearchPages: yearNum(trafficYear?.aiSearch.pages),
+        aiLookups: yearNum(trafficYear?.aiSearch.lookups),
+        deliveriesPeriod: yearCell("aiDeliveries").period,
+      }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>` : ""}
       <div class="network-strip">${escapeHtml(t(lang, "home.network_label"))}
         <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a> &middot;
         <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a>
