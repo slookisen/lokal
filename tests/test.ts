@@ -36718,6 +36718,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S3): profilen viser hva som er kontrollert og når ──");
+  try {
+    const { runDentalProfileVerificationLineTests } = require("../src/routes/dental-profile-verification-line.test") as
+      typeof import("../src/routes/dental-profile-verification-line.test");
+    const dpv = await runDentalProfileVerificationLineTests({ log: false });
+    passed += dpv.passed;
+    failed += dpv.failed;
+    for (const f of dpv.failures) failures.push("dental profile verification line: " + f);
+    console.log(`  dental profile verification line: ${dpv.passed} passed, ${dpv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental profile verification line: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S1+S2+S3): shared
   //    query parser + postnummer->kommune helper, one WHERE builder in
   //    dental-store, parser wired into MCP tannlege_search, /sok and A2A ──

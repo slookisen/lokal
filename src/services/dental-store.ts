@@ -558,6 +558,31 @@ export function getDentalAgentById(
   return row ? hydrateAgent(row) : null;
 }
 
+/**
+ * A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S3):
+ * the stored check dates and results the profile page shows, read with one
+ * scoped single-row read (as routes/dental.ts reads last_verified_at for
+ * GET /agents/:id) rather than widening hydrateAgent for every caller. Read
+ * only; null when no row has the id.
+ */
+export interface DentalVerificationMeta {
+  last_verified_at: string | null;
+  brreg_status: string | null;
+  brreg_checked_at: string | null;
+  website_ownership: string | null;
+  website_ownership_checked_at: string | null;
+  last_enriched_at: string | null;
+}
+
+export function getDentalVerificationMeta(id: string): DentalVerificationMeta | null {
+  const row = getDb("dental")
+    .prepare(
+      "SELECT last_verified_at, brreg_status, brreg_checked_at, website_ownership, website_ownership_checked_at, last_enriched_at FROM dental_agents WHERE id = ?"
+    )
+    .get(id) as DentalVerificationMeta | undefined;
+  return row ?? null;
+}
+
 // ─── Specialty filter helper (PR: finn-tannlege search) ─────────────
 // Specialty data is sparse on dental_agents.available_specialties (the
 // clinic-level JSON array is populated for only ~2% of rows). The same
