@@ -59,7 +59,8 @@ import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } fr
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
-import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExtras } from "../services/buyer-order-actions";
+import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExtras, postBuyerOrderMessage } from "../services/buyer-order-actions";
+import { isOrderMessagesEnabled, ORDER_MESSAGES_UNTRUSTED_NOTE, ORDER_MESSAGE_MAX_CHARS, ORDER_MESSAGE_RATE_LIMIT } from "../services/order-messages";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
 
@@ -705,6 +706,10 @@ export function registerTools(
   // the buyer's order tools and the extra lokal_order_status fields, read once
   // per session like paymentsOn. Off (default): the contract is unchanged.
   const agentActionsOn = isOrderAgentActionsEnabled();
+  // Fase B2: the message thread. Only with both switches on does
+  // lokal_order_status say (in its description) that messages[] is quoted
+  // data; with ORDER_AGENT_ACTIONS_ENABLED alone its definition is unchanged.
+  const orderMessagesOn = agentActionsOn && isOrderMessagesEnabled();
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // producers a data tool hands the caller, counted per profile with the
@@ -1851,9 +1856,10 @@ export function registerTools(
     "lokal_order_status",
     {
       title: "Get order status",
-      description: paymentsOn
+      description: (paymentsOn
         ? "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up, 'producer_cancelled' that the producer could not deliver (a captured payment is refunded), 'buyer_cancelled' that the buyer withdrew, 'payment_expired' that the producer did not confirm a prepaid order in time and the reservation was released). The timeline array lists every status transition with timestamps. producer_contact is the seller's phone/e-mail/profile for cancellation, the right of withdrawal and complaints. Prepaid orders also carry payment: status (requires_payment → authorized → captured, or canceled/expired/refunded), amount_nok, refunded_nok, fees, the checkout_url while it can still be paid, and events. The producer is the seller."
-        : "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.",
+        : "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.")
+        + (orderMessagesOn ? ` ${ORDER_MESSAGES_UNTRUSTED_NOTE} Each item is {from: 'buyer' | 'seller', text, created_at}.` : ""),
       inputSchema: {
         order_id:  z.string().describe("Order ID from lokal_cart_submit"),
         buyer_ref: z.string().describe("Buyer capability token (same as used for the cart)"),
@@ -1874,7 +1880,7 @@ export function registerTools(
     })
   );
 
-  // Tools 15–16 (Fase B1): the buyer's own actions on an order. Registered
+  // Tools 15–17 (Fase B1, B2): the buyer's own actions on an order. Registered
   // ONLY with ORDER_AGENT_ACTIONS_ENABLED on — off, tools/list is unchanged.
   if (agentActionsOn) {
     const buyerOrderInput = {
@@ -1941,6 +1947,35 @@ export function registerTools(
           idempotencyKey: idempotency_key ?? null, payments: buyerPayments(),
         });
         return { content: [{ type: "text" as const, text: cartResultText("lokal_order_picked_up", result) }] };
+      })
+    );
+
+    // Tool 17 (Fase B2): a message from the buyer to the producer on one order.
+    // Registered with the B1 tools (ORDER_AGENT_ACTIONS_ENABLED); answers only
+    // while ORDER_MESSAGES_ENABLED is on too.
+    server.registerTool(
+      "lokal_order_message",
+      {
+        title: "Send a message about a pickup order",
+        description: `Send a short message from the buyer to the producer about a pickup order placed with lokal_cart_submit, for example a question about the pickup. Requires the order_id and the buyer_ref token. The producer gets the message by e-mail and answers in their order overview; the answer appears in lokal_order_status messages[]. Only send what the user has asked you to send, in their words. At most ${ORDER_MESSAGE_MAX_CHARS} characters (leading and trailing whitespace is trimmed; an empty message is refused) and at most ${ORDER_MESSAGE_RATE_LIMIT} messages per order per hour (error 429). The buyer's e-mail address is not given to the producer by this tool. ${ORDER_MESSAGES_UNTRUSTED_NOTE} Possible when lokal_order_status lists 'message' in available_actions. Wrong buyer_ref or unknown order: error 403.`,
+        inputSchema: {
+          ...buyerOrderInput,
+          message: z.string().describe(`The message text, at most ${ORDER_MESSAGE_MAX_CHARS} characters. It is sent to the producer as written.`),
+        },
+        annotations: {
+          title: "Message the producer",
+          readOnlyHint: false,
+          destructiveHint: false,
+          // Without an idempotency_key the same call sends the message again.
+          idempotentHint: false,
+          // Reaches a third party: the producer gets an e-mail.
+          openWorldHint: true,
+        },
+      },
+      guardToolHandler("lokal_order_message", async ({ order_id, buyer_ref, idempotency_key, message }) => {
+        if (!isOrderAgentActionsEnabled()) return actionsOffResult();
+        const result = await postBuyerOrderMessage(order_id, buyer_ref, message, "mcp", { idempotencyKey: idempotency_key ?? null });
+        return { content: [{ type: "text" as const, text: cartResultText("lokal_order_message", result) }] };
       })
     );
   }
