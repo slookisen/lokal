@@ -44430,6 +44430,26 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2 (public part): the
+  // 12-month block of the three strips and /api/traffic-stats. Swaps getDb()
+  // and the dental / experiences db handles (restored in finally), so serial.
+  console.log("\n── traffic-year: 12-month strip numbers + start dates ──");
+  try {
+    const { runTrafficYearTests } = require("../src/services/traffic-year.test") as
+      typeof import("../src/services/traffic-year.test");
+    const r = await runTrafficYearTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("traffic-year: " + f);
+    console.log(`  traffic-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`traffic-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ traffic-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-14-med-i-ai-svar-per-profil, S2: the same counting for
   // finn-tannlege and opplevagent (incl. gårdssalg). Swaps getDb() and the
   // dental / experiences db handles (restored in finally), so serial.

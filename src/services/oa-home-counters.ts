@@ -45,6 +45,7 @@
 
 import { getDb } from "../database/init";
 import { getTrafficStatsSnapshot } from "./traffic-stats";
+import type { TrafficYear } from "./traffic-year-compute";
 import {
   countPublishedExperiences,
   countPublishedProviders,
@@ -90,6 +91,12 @@ export interface OaHomeCounters {
    * yet (fresh/catalog-only environment) or the query errors.
    */
   sinceDate: string | null;
+  /**
+   * The strip's five numbers over the last 12 months with their start dates
+   * (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2), from the same
+   * traffic snapshot. null while not available.
+   */
+  year: TrafficYear | null;
 }
 
 /**
@@ -165,6 +172,7 @@ export function getOaHomeCounters(): OaHomeCounters {
     tilbydere,
     kommuner,
     sinceDate: getOaSinceDate(),
+    year: trafficReady ? traffic.year : null,
   };
   // Right after boot the traffic stats are computed off-thread
   // (traffic-stats.ts) and are placeholder zeros until the first refresh

@@ -331,7 +331,7 @@ export function runOaHomeCountersTests(opts: { log?: boolean } = {}): Promise<Te
       const homeEmpty = await callRoute(expSeoRouter, "/");
       assertTrue(homeEmpty.handled && homeEmpty.status === 200, "h2: GET / still renders 200 with zero analytics rows");
       assertTrue(!homeEmpty.body.includes("Tall siden"),
-        "h3: homepage HTML omits the since-date fragment entirely when sinceDate is null");
+        "h3: homepage HTML has no raw-window «Tall siden» fragment when sinceDate is null");
 
       // Restore rfbDb (with the g-section fixtures) and re-render the
       // homepage to prove the non-null path renders the formatted date.
@@ -339,9 +339,15 @@ export function runOaHomeCountersTests(opts: { log?: boolean } = {}): Promise<Te
       oaHomeCounters.__resetOaHomeCountersCacheForTesting();
       const homeWithSince = await callRoute(expSeoRouter, "/");
       assertTrue(homeWithSince.handled && homeWithSince.status === 200, "h4: GET / renders 200 with analytics rows present");
-      const expectedSinceLabel = new Date("2026-01-10 08:30:00").toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric" });
-      assertTrue(homeWithSince.body.includes("Tall siden") && homeWithSince.body.includes(expectedSinceLabel),
-        `h5: homepage HTML includes the since-date fragment with the formatted MIN date (${expectedSinceLabel})`);
+      // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip's
+      // numbers are 12-month numbers, each with its own «siste 12 måneder» /
+      // «siden <dato>» label (traffic-year.test.ts), so the old fragment that
+      // dated the 60-day raw window is no longer rendered; sinceDate itself is
+      // still computed (g1).
+      assertTrue(!homeWithSince.body.includes("Tall siden"),
+        "h5: homepage HTML no longer renders the raw-window «Tall siden» fragment (per-number start dates instead)");
+      assertTrue(/class="counter-period">(siste 12 måneder|siden [^<]+)</.test(homeWithSince.body),
+        "h6: each traffic number carries its own period label");
     } catch (err: any) {
       failed++;
       failures.push("oa-home-counters: unexpected error: " + String(err?.stack || err?.message || err));
