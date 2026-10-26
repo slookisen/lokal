@@ -50232,3 +50232,23 @@ runSerial(async () => {
     failures.push("owner-pause-s1b6: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 7: «Eieren styrer
+// ordre-e-posten» (OWNER_ORDER_EMAIL_ENABLED) — confirm-by-link change of
+// agents.order_notification_email. Swaps the getDb() singleton, the env flag
+// and two send seams (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 7: owner order e-mail ──");
+  try {
+    const { runOwnerOrderEmailS1b7Tests } = require("../src/routes/owner-order-email-s1b7.test") as
+      typeof import("../src/routes/owner-order-email-s1b7.test");
+    const r = await runOwnerOrderEmailS1b7Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-order-email-s1b7: " + f);
+    console.log(`  owner-order-email-s1b7: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-order-email-s1b7: unexpected error: " + String(err?.message || err));
+  }
+});

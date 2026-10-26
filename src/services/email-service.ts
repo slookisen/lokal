@@ -459,6 +459,59 @@ export class EmailService {
   }
 
   /**
+   * dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 7: the owner
+   * asked for orders to go to a new address. Sent to that NEW address; the
+   * link opens a confirm page (GET changes nothing). A new mail of its own —
+   * no existing template is touched.
+   */
+  async sendOwnerOrderEmailConfirm(opts: {
+    to: string;
+    agentName: string;
+    confirmUrl: string;
+    validHours: number;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { to, agentName, confirmUrl, validHours } = opts;
+    const safeName = epEscape(agentName);
+    const safeUrl = epEscape(confirmUrl);
+    const html = `<!DOCTYPE html>
+<html lang="nb">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',sans-serif;line-height:1.6;color:#333;max-width:600px;margin:0 auto;padding:40px 20px;">
+  <div style="font-size:22px;font-weight:700;color:#2D5016;border-bottom:3px solid #2D5016;padding-bottom:16px;margin-bottom:24px;">Rett fra <span style="color:#D4A373;">Bonden</span></div>
+  <h1 style="font-size:20px;color:#1a1a1a;">Bekreft ny adresse for bestillinger</h1>
+  <p>Eieren av <strong>${safeName}</strong> har bedt om at bestillinger fra kunder på Rett fra Bonden skal sendes til denne e-postadressen.</p>
+  <p>Klikk knappen under for å bekrefte. Til du har bekreftet, går bestillingene til den gamle adressen.</p>
+  <p style="text-align:center;"><a href="${safeUrl}" style="display:inline-block;background:#2D5016;color:#ffffff;padding:14px 32px;text-decoration:none;border-radius:8px;font-weight:700;">Bekreft adressen</a></p>
+  <p style="font-size:14px;color:#666;">Eller kopier og lim inn denne lenken i nettleseren:<br><code style="word-break:break-all;">${safeUrl}</code></p>
+  <p>Lenken er gyldig i ${validHours} timer.</p>
+  <p>Hvis du ikke kjenner til dette, kan du trygt ignorere e-posten. Da endres ingenting.</p>
+  <p style="margin-top:36px;padding-top:18px;border-top:1px solid #eee;font-size:13px;color:#666;">Mvh,<br>Rett fra Bonden — kontakt@rettfrabonden.com<br>https://rettfrabonden.com</p>
+</body>
+</html>`;
+    const text = `Bekreft ny adresse for bestillinger
+
+Eieren av ${agentName} har bedt om at bestillinger fra kunder på Rett fra Bonden skal sendes til denne e-postadressen.
+
+Åpne lenken under for å bekrefte. Til du har bekreftet, går bestillingene til den gamle adressen.
+
+${confirmUrl}
+
+Lenken er gyldig i ${validHours} timer.
+
+Hvis du ikke kjenner til dette, kan du trygt ignorere e-posten. Da endres ingenting.
+
+Mvh,
+Rett fra Bonden — kontakt@rettfrabonden.com
+https://rettfrabonden.com`;
+    return await this.sendEmail({
+      to,
+      subject: `Bekreft ny adresse for bestillinger — ${agentName}`,
+      htmlContent: html,
+      textContent: text,
+    });
+  }
+
+  /**
    * dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter — the
    * gårdssalg/opplevagent producer-claim magic-link email. REUSES the shape
    * of sendOwnerMagicLink() above (same one-button, 7-day-expiry template

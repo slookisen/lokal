@@ -5349,6 +5349,33 @@ function initSchema(db: Database.Database): void {
     console.error("Migration owner_profile_pause failed:", err);
   }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 7 ───────
+  // Owner-requested change of agents.order_notification_email, pending until
+  // the confirmation link sent to the NEW address is clicked. Only the sha256
+  // of the token is stored. requested_at / expires_at / consumed_at are all
+  // ISO-8601 (Date#toISOString) and compared only against ISO strings.
+  // outcome: NULL = pending; 'confirmed' | 'superseded' | 'send_failed'.
+  // Read/written only by routes/owner-portal.ts while OWNER_ORDER_EMAIL_ENABLED
+  // is on. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_order_email_change (
+        token_hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        new_email TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        outcome TEXT,
+        requested_by TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_order_email_change_agent
+        ON owner_order_email_change(agent_id, requested_at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_order_email_change failed:", err);
+  }
+
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
   // outreach_daily_send_cap: one row per UTC calendar day, holding an
