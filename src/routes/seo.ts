@@ -58,7 +58,7 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, failsProducerRoleGate } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate, ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
@@ -5162,6 +5162,28 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // alike, though umbrellas are never self-registered in practice).
     if (agent && !passesRoleGate(agent, slug)) {
       agent = undefined;
+    }
+
+    // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: an
+    // owner-paused profile is not a 404 — the page says «Midlertidig pause»
+    // and asks not to be indexed. OWNER_PAUSE_ENABLED off = never reached.
+    if (agent && ownerPauseEnabled()) {
+      if (isOwnerPaused(readOwnerPauseRow(getDb(), agent.id))) {
+        const en = lang === "en";
+        const name = String(agent.name || "");
+        res.setHeader("X-Robots-Tag", "noindex");
+        return res.status(200).send(shell(
+          en ? `Temporarily paused — ${name}` : `Midlertidig pause — ${name}`,
+          en ? `${name} has temporarily paused their profile.` : `${name} har satt profilen sin på midlertidig pause.`,
+          `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
+            <h1 style="font-size:2rem;margin-bottom:12px;">${escapeHtml(name)}</h1>
+            <p style="font-size:1.2rem;margin-bottom:12px;"><strong>${en ? "Temporarily paused" : "Midlertidig pause"}</strong></p>
+            <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">${en ? "The producer has paused this profile for now." : "Produsenten har satt profilen på pause en periode."}</p>
+            <a href="${localizedPath("/sok", lang)}" class="city-pill">${en ? "Find other producers →" : "Finn andre produsenter →"}</a>
+          </div>`,
+          { lang, robots: "noindex", canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, pathForAlternate: `/produsent/${encodeURIComponent(slug)}` },
+        ));
+      }
     }
 
     if (!agent) {

@@ -36,7 +36,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql } from "./agent-visibility";
+import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, ownerPauseEnabled, readOwnerPauseRow } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -1667,9 +1667,11 @@ class MarketplaceRegistry {
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
   isQuarantinedFromPublicView(agentId: string): boolean {
     const db = getDb();
-    const row = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
+    const found = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
       { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
-    if (!row) return false;
+    if (!found) return false;
+    // S1b punkt 6: the owner-pause table is read only with OWNER_PAUSE_ENABLED on.
+    const row = ownerPauseEnabled() ? { ...found, ...readOwnerPauseRow(db, agentId) } : found;
     // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
     // flag off = the quarantine rule this method has always applied; flag
     // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.

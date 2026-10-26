@@ -5328,6 +5328,27 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 6 ───────
+  // Owner pause (visibility.profile = false). One row = paused; pause_until
+  // 'YYYY-MM-DD' (optional) = the pause ends that UTC day. Its own table, not
+  // agents columns (extra agents columns change SQLite's plan for the public
+  // scans and so the row order the golden tests pin). No `id` column on
+  // purpose (services/agent-visibility.ts notOwnerPausedSql). Read only by
+  // agent-visibility.ts while OWNER_PAUSE_ENABLED is on; written only by
+  // POST /eier/:id/pause and /api/agents/:id/pause. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_profile_pause (
+        agent_id TEXT PRIMARY KEY,
+        paused_at TEXT NOT NULL,
+        pause_until TEXT,
+        set_by TEXT NOT NULL DEFAULT 'owner'
+      )
+    `);
+  } catch (err) {
+    console.error("Migration owner_profile_pause failed:", err);
+  }
+
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
   // outreach_daily_send_cap: one row per UTC calendar day, holding an

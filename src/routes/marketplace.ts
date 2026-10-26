@@ -13,7 +13,7 @@ import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql, hasProducerPage, failsProducerRoleGate } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate, ownerPauseEnabled } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -1981,6 +1981,9 @@ router.post("/auth/login", (req: Request, res: Response) => {
     data: {
       agentId: claim.agentId,
       claimantName: claim.claimantName,
+      // S1b punkt 6: tells /selger to swap «Meld nedlagt» for pause + «be om
+      // sletting». Only present with OWNER_PAUSE_ENABLED on (off = unchanged body).
+      ...(ownerPauseEnabled() ? { ownerPauseEnabled: true } : {}),
     },
   });
 });
