@@ -192,9 +192,9 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       assertTrue(withTile.body.includes('data-stat="aiDeliveries"'), "(b) the clinic page has the «Med i AI-søk» tile");
       assertTrue(withTile.body.includes("<span>Med i AI-søk</span>"), "(b) tile label «Med i AI-søk»");
       assertTrue(!withTile.body.includes("Med i AI-svar"), "(b) the old name «Med i AI-svar» is gone");
-      assertTrue(withTile.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 60 d"), "(b) tile subtitle, a full window after the counting started");
+      assertTrue(withTile.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(b) tile subtitle, a full window after the counting started");
       process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = new Date().toISOString().slice(0, 10);
-      const sinceTxt = new Date().toLocaleDateString("nb-NO", { day: "numeric", month: "short", timeZone: "UTC" });
+      const sinceTxt = new Date().toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
       const fresh = await invoke(dentalRouter, clinic, HUMAN, { ip: "198.51.100.33" });
       assertTrue(fresh.body.includes(`ganger profilen var blant treffene en AI-assistent hentet &middot; siden ${sinceTxt}`), "(b) tile subtitle «siden <dato>» in the first window");
       process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
@@ -274,7 +274,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       flush();
       assertTrue(rowsFor("experiences", "ai_page_profile").some((x) => x.profile_id === expId && x.ai_vendor === "chatgpt" && x.n === 1), "(c) an AI fetch of the experience page counts ai_page_profile");
       const detail = await invoke(expRouter, `/opplevelse/${expSlug}`, HUMAN, { ip: "198.51.100.41" });
-      assertTrue(detail.body.includes('data-stat="aiDeliveries"') && detail.body.includes("<span>Med i AI-søk</span>") && detail.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 60 d"), "(c) the experience page has the «Med i AI-søk» tile");
+      assertTrue(detail.body.includes('data-stat="aiDeliveries"') && detail.body.includes("<span>Med i AI-søk</span>") && detail.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(c) the experience page has the «Med i AI-søk» tile");
       assertTrue(detail.body.includes("Tallet viser ikke hvor mange som så den."), "(c) experience tile help text");
       assertTrue(!detail.body.includes("${"), "(c) the experience page has no literal ${");
 
@@ -289,7 +289,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
       flush();
       assertTrue(rowsFor("experiences", "ai_page_profile").some((x) => x.profile_id === "gs-fossmoen" && x.ai_vendor === "claude" && x.n === 1), "(c) an AI fetch of the producer page counts ai_page_profile under the provider id");
       const gs = await invoke(expRouter, gsPath, HUMAN, { ip: "198.51.100.43" });
-      assertTrue(gs.body.includes('data-stat="aiDeliveries"') && gs.body.includes("<span>Med i AI-søk</span>") && gs.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 60 d"), "(c) the producer page has the «Med i AI-søk» tile");
+      assertTrue(gs.body.includes('data-stat="aiDeliveries"') && gs.body.includes("<span>Med i AI-søk</span>") && gs.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(c) the producer page has the «Med i AI-søk» tile");
       assertTrue(gs.body.includes("Tallet viser ikke hvor mange som så den.") && gs.body.includes("Claude 1"), "(c) producer tile help text and per-AI split");
       assertTrue(!gs.body.includes("${"), "(c) the producer page has no literal ${");
 
