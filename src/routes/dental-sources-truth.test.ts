@@ -64,9 +64,10 @@
  *       DENTAL_REPEAT_PARK_TO_REVIEW is on; no claim of how often anything
  *       runs.
  *   (m) /om links the method page, and «Om plattformen» no longer claims
- *       continuous verification or an «uverifisert» marking; it says a clinic
- *       without the badge gets no note about the check, as the profile shows
- *       it (not «no other marking»: a closed clinic shows «Nedlagt»).
+ *       continuous verification or an «uverifisert» marking; it says the
+ *       profile shows what was checked and when, or «Ikke kontrollert ennå»
+ *       (F2-S3), as the profile shows it (not «no other marking»: a closed
+ *       clinic shows «Nedlagt»).
  *   (n) F2-S9, as the pages show it: the import's rows in the field table
  *       (nb and en), its item on /om and /hvordan-det-fungerer, the footer,
  *       llms.txt and openapi.json, with no link and no licence; Brreg's
@@ -973,11 +974,12 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       assertTrue(platform.includes("«Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll") && platform.includes("kontrollen kjøres i dag manuelt, i små partier") &&
         !/settes enten manuelt|manuelt eller/.test(platform),
         "m4: «Om plattformen» says when the badge shows, as the «Verifisert» text does, with no manual way (F2-S8)");
-      assertTrue(platform.includes("Klinikker uten merket får ingen merknad om kontrollen.") && !platform.includes("uten noen annen markering"),
-        "m4b: … and that a clinic without the badge gets no note about the check (not «no other marking»: a closed clinic shows «Nedlagt»)", platform);
+      assertTrue(platform.includes("Profilsiden viser hva som er kontrollert og når, eller «Ikke kontrollert ennå».") && !platform.includes("ingen merknad om kontrollen") && !platform.includes("uten noen annen markering"),
+        "m4b: … and that the profile shows what was checked and when, or «Ikke kontrollert ennå» (F2-S3; not «no other marking»: a closed clinic shows «Nedlagt»)", platform);
       assertTrue(platform.includes('<a href="/proveniens">'), "m5: … and points to the method page");
-      // As the profile shows it: no header badge and no note about the check
-      // for a clinic without the badge (the fixture's second clinic),
+      // As the profile shows it: no header badge for a clinic without the
+      // badge (the fixture's second clinic), and its only note about the
+      // check is F2-S3's «Kontroll og kilder» box (no «uverifisert» marking),
       // «Nedlagt» for a closed one (a throwaway row, removed again). Only the
       // header row is read: the page also lists other clinics, with theirs.
       const profile = async (navn: string, orgNr: string): Promise<{ badges: string | null; main: string }> => {
@@ -986,8 +988,10 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       };
       const NOT_CHECKED = /uverifisert|ikke verifisert|ikke kontrollert|unverified|not verified|not checked/i;
       const plain = await profile("Majorstuen Tann AS", "918960002");
-      assertTrue(plain.main.includes("<h1 class=\"profile-name\">Majorstuen Tann AS</h1>") && plain.badges === "" && !NOT_CHECKED.test(plain.main),
-        "m4c control: a profile without the badge has no header badge and no note that it is not checked", `${plain.badges} ${plain.main.match(NOT_CHECKED)?.[0] ?? ""}`);
+      const outsideBox = plain.main.replace(/<div class="section-box verification-meta">[\s\S]*?<\/ul><\/div>/, "");
+      assertTrue(plain.main.includes("<h1 class=\"profile-name\">Majorstuen Tann AS</h1>") && plain.badges === "" && !NOT_CHECKED.test(outsideBox) &&
+        /<div class="section-box verification-meta">[\s\S]*?<\/div>/.test(plain.main),
+        "m4c control: a profile without the badge has no header badge, and its only note about the check is the F2-S3 box", `${plain.badges} ${outsideBox.match(NOT_CHECKED)?.[0] ?? ""}`);
       const closedId = store.createDentalAgent({ navn: "Nedlagt Fjord Tann AS", org_nr: "918960094", poststed: "OSLO", fylke: "Oslo" } as any);
       try {
         db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = 'needs_review', is_inactive = 1 WHERE id = ?").run(closedId);

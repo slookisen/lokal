@@ -14,7 +14,9 @@ import {
   getDentalAgentsForSitemap,
   getDentalAggregateLastmods,
   isThinDentalProfile,
+  getDentalVerificationMeta,
 } from "../services/dental-store";
+import type { DentalVerificationMeta } from "../services/dental-store";
 import type { DentalAgent, DentalAgentRow, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
@@ -30,6 +32,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
 const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
+import { coerceProvenanceToArrayShape } from "../services/cross-source-validator";
 // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
 // «Verifisert» on the cards and the profile only when the stored fields meet
 // the rule the badge text describes.
@@ -1673,6 +1676,94 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
   };
 }
 
+// ── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+// F2-S3: what was checked, against what and when, from the columns the
+// verifier and the enrichment write (getDentalVerificationMeta) and the
+// stored field_provenance. Page text only: no JSON-LD claim, no JSON field,
+// no DB write. No line for a closed clinic.
+
+/** «dd.mm.åååå» from the date part of a stored ISO timestamp; null if none. */
+export function formatDentalCheckDate(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value.trim());
+  if (!m) return null;
+  const [, y, mo, d] = m;
+  if (Number(mo) < 1 || Number(mo) > 12 || Number(d) < 1 || Number(d) > 31) return null;
+  return `${d}.${mo}.${y}`;
+}
+
+/**
+ * The sources stored for one field of field_provenance, in either shape: an
+ * array of records, a legacy single record (coerceProvenanceToArrayShape
+ * wraps it), or an object with a `sources` array (stage_v_correction), the
+ * same rule as the akutt claim (dental-acute-claim.ts). [] for anything else.
+ */
+export function dentalFieldSources(
+  fieldProvenance: Record<string, unknown> | null | undefined,
+  field: string
+): Array<Record<string, unknown>> {
+  if (!fieldProvenance || typeof fieldProvenance !== "object" || Array.isArray(fieldProvenance)) return [];
+  const entry = (fieldProvenance as Record<string, unknown>)[field];
+  let list: unknown[];
+  if (entry && typeof entry === "object" && !Array.isArray(entry) && "sources" in entry) {
+    const sources = (entry as { sources?: unknown }).sources;
+    list = Array.isArray(sources) ? sources : [];
+  } else {
+    list = coerceProvenanceToArrayShape({ [field]: entry })[field] ?? [];
+  }
+  return list.filter((r): r is Record<string, unknown> => !!r && typeof r === "object" && !Array.isArray(r));
+}
+
+/** The newest fetched_at among a field's sources, as «dd.mm.åååå»; null if none has one. */
+function newestSourceDate(sources: Array<Record<string, unknown>>): string | null {
+  let best: string | null = null;
+  for (const s of sources) {
+    const raw = typeof s.fetched_at === "string" ? s.fetched_at.trim() : "";
+    if (formatDentalCheckDate(raw) && (best === null || raw.slice(0, 10) > best.slice(0, 10))) best = raw;
+  }
+  return best === null ? null : formatDentalCheckDate(best);
+}
+
+/**
+ * The «Kontroll og kilder» box of a clinic profile: the Brønnøysund check,
+ * the website ownership (only 'verified'), «Sist kontrollert», or «Ikke
+ * kontrollert ennå» when none of them is there; then the source of the Helfo
+ * text (only with a stored source, until F2-S6's resolveHelfoClaim) and of
+ * the akutt claim (as resolveAcuteClaim decides). "" for a closed clinic.
+ */
+export function dentalVerificationSection(
+  agent: Pick<DentalAgent, "helfo_agreement" | "acute_vakt" | "field_provenance" | "patient_focus"> & { is_inactive?: number | null },
+  meta: DentalVerificationMeta | null
+): string {
+  if (agent.is_inactive === 1) return "";
+  const lines: string[] = [];
+  const brreg = formatDentalCheckDate(meta?.brreg_checked_at);
+  if (brreg) lines.push(`Brønnøysundregistrene kontrollert: ${brreg}`);
+  if (meta?.website_ownership === "verified") {
+    const owned = formatDentalCheckDate(meta.website_ownership_checked_at);
+    lines.push(owned ? `Nettstedet bekreftet som klinikkens eget: ${owned}` : "Nettstedet bekreftet som klinikkens eget");
+  }
+  const verified = formatDentalCheckDate(meta?.last_verified_at);
+  if (verified) lines.push(`Sist kontrollert: ${verified}`);
+  if (lines.length === 0) lines.push("Ikke kontrollert ennå");
+
+  const fp = (agent.field_provenance ?? null) as Record<string, unknown> | null;
+  const helfoSources = agent.helfo_agreement === "true" ? dentalFieldSources(fp, "helfo_agreement") : [];
+  if (helfoSources.length > 0) {
+    const fetched = newestSourceDate(helfoSources);
+    lines.push(`Helfo-direkteoppgjør: tolket automatisk fra klinikkens nettside${fetched ? `, hentet ${fetched}` : ""}`);
+  }
+  const acute = resolveAcuteClaim(agent);
+  if (acute) {
+    const acuteSources = agent.acute_vakt === 1 ? dentalFieldSources(fp, "acute_vakt") : [];
+    const fetched = newestSourceDate(acuteSources.length > 0 ? acuteSources : dentalFieldSources(fp, "patient_focus"));
+    const label = acute === "vakt" ? "Akuttvakt" : ACUTE_ACCEPTS_LABEL;
+    lines.push(`${label}: tolket automatisk fra klinikkens nettside${fetched ? `, hentet ${fetched}` : ""}`);
+  }
+
+  return `<div class="section-box verification-meta"><h2>Kontroll og kilder</h2><ul style="list-style:none;padding:0;font-size:.9rem;color:var(--g700);line-height:1.7">${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul></div>`;
+}
+
 function renderClinicProfile(
   stored: DentalAgentRow,
   req: Request,
@@ -1961,6 +2052,13 @@ function renderClinicProfile(
     }
   }
 
+  // ── F2-S3: what was checked and when (no line for a closed clinic)
+  let verificationMeta: DentalVerificationMeta | null = null;
+  if (!inactive) {
+    try { verificationMeta = getDentalVerificationMeta(agent.id); } catch { /* db not ready */ }
+  }
+  const verificationSection = dentalVerificationSection(agent, verificationMeta);
+
   // ── Updated_at disclaimer
   const updatedAt = (agent as any).updated_at;
   const disclaimer = updatedAt
@@ -2074,6 +2172,7 @@ function renderClinicProfile(
     ${mapSection}
     ${relatedSection}
     ${fylkeLink}
+    ${verificationSection}
     ${disclaimer}
   </div>
 </main>`;
@@ -2243,10 +2342,11 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
 router.get("/om", (_req: Request, res: Response) => {
   // F2-S2: «Om plattformen» says what the code does, as the «Verifisert» text
   // on /proveniens: no continuous verification and no «uverifisert» marking
-  // (neither exists), and no claim of how often anything runs. A clinic
-  // without the badge gets no note about the check, but a closed one shows
-  // «Nedlagt» (the profile's header badges), so the text does not say «no
-  // other marking». F2-S8: no manual way to the badge either; it shows only
+  // (neither exists), and no claim of how often anything runs. Since F2-S3
+  // the profile shows what was checked and when, or «Ikke kontrollert ennå»
+  // (dentalVerificationSection), and a closed one shows «Nedlagt» (the
+  // profile's header badges), so the text does not say «no other marking».
+  // F2-S8: no manual way to the badge either; it shows only
   // when the stored fields meet the check's rule (resolveVerifiedClaim).
   const html = `
 <main>
@@ -2271,7 +2371,7 @@ router.get("/om", (_req: Request, res: Response) => {
     <p>Klinikker kan be om oppdatering eller fjerning av sin profil ved å sende e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 5 virkedager.</p>
 
     <h2>Om plattformen</h2>
-    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket får ingen merknad om kontrollen. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
+    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Profilsiden viser hva som er kontrollert og når, eller «Ikke kontrollert ennå». Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
 
     <p>Søsterplattform: <a href="https://rettfrabonden.com" rel="noopener" target="_blank">rettfrabonden.com</a> — lokal mat direkte fra bønder i Norge.</p>
   </div>
