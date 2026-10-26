@@ -164,6 +164,7 @@ export async function previewSecondLineJudge(
       fieldProv = {};
     }
 
+    const umbrellaDomains = getAffiliatedUmbrellaDomains(db, agent.id);
     let evidenceUsed: readonly SecondLineEvidenceItem[] = [];
     const secondLine = await computeSecondLineVerification({
       producer_name: agent.name ?? null,
@@ -178,11 +179,11 @@ export async function previewSecondLineJudge(
         no_wrong_fit: gate.reasons.no_wrong_fit,
         brreg_active: gate.reasons.brreg_active,
       },
-      affiliated_umbrella_domains: getAffiliatedUmbrellaDomains(db, agent.id),
+      affiliated_umbrella_domains: umbrellaDomains,
       judgeFn: deps.judgeFn,
       evidenceFn: async (sources) => {
         evidenceUsed = await buildSecondLineEvidence(
-          { sources, website: agent.website ?? null },
+          { sources, website: agent.website ?? null, affiliated_umbrella_domains: umbrellaDomains },
           { fetchImpl: deps.evidenceFetch },
         );
         return evidenceUsed;

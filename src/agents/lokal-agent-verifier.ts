@@ -1507,12 +1507,20 @@ export function isRfbSecondLineEvidenceEnabled(): boolean {
  *   - the page's FINAL URL (after redirects) is on a different hostname
  *     (leading www. stripped, via hostnameFromUrl) than the homepage that
  *     website_ok approved — content from another site is never sent,
+ *   - the homepage host is (a subdomain of) an affiliated umbrella domain,
  *   - the visible text is empty.
  * Never throws. `deps.fetchImpl` is the test seam (mirrors opts.headProbe /
  * opts.brregLookup); production uses the global fetch via fetchPage.
  */
 export async function buildSecondLineEvidence(
-  input: { sources: readonly string[]; website: string | null | undefined },
+  input: {
+    sources: readonly string[];
+    website: string | null | undefined;
+    // The agent's affiliated umbrella registrable domains
+    // (getAffiliatedUmbrellaDomains). A homepage on — or under — one of them
+    // is the umbrella's site, not the producer's own: nothing is fetched.
+    affiliated_umbrella_domains?: readonly string[];
+  },
   deps: { fetchImpl?: typeof fetch } = {},
 ): Promise<SecondLineEvidenceItem[]> {
   try {
@@ -1522,6 +1530,10 @@ export async function buildSecondLineEvidence(
     const homepage = withDefaultScheme(website);
     const homeHost = hostnameFromUrl(homepage);
     if (!homeHost) return [];
+    for (const d of input.affiliated_umbrella_domains ?? []) {
+      const ud = (d || "").trim().toLowerCase().replace(/^www\./, "");
+      if (ud && (homeHost === ud || homeHost.endsWith("." + ud))) return [];
+    }
     const page = await fetchPage(homepage, {
       userAgent: "Lokal-SecondLineEvidence/1.0",
       timeoutMs: SECOND_LINE_EVIDENCE_FETCH_TIMEOUT_MS,
@@ -1584,6 +1596,7 @@ export async function computeSecondLineVerification(input: {
     acceptedSources: readonly string[];
     brregName?: string | null;
     evidence?: readonly SecondLineEvidenceItem[];
+    fenceEvidence?: boolean;
   }) => Promise<SecondLineProfileJudgeVerdict>;
 }): Promise<SecondLineGateResult> {
   const nace_brreg_ok = input.gate_reasons.no_wrong_fit && input.gate_reasons.brreg_active;
@@ -1621,7 +1634,8 @@ export async function computeSecondLineVerification(input: {
       brregName: input.brreg?.navn ?? null,
       // Only present when there is real evidence — keeps the no-evidence
       // call (and therefore the prompt) exactly as it was.
-      ...(evidence.length > 0 ? { evidence } : {}),
+      // Evidence here is raw homepage text ⇒ always the fenced renderer.
+      ...(evidence.length > 0 ? { evidence, fenceEvidence: true } : {}),
     });
     judge_approved = verdict.approved;
     judge_reason = verdict.reason;
@@ -2893,7 +2907,7 @@ export async function runVerifierBatch(opts: {
             ? {
                 evidenceFn: (sources: readonly string[]) =>
                   buildSecondLineEvidence(
-                    { sources, website: agent.website ?? null },
+                    { sources, website: agent.website ?? null, affiliated_umbrella_domains: affiliatedUmbrellaDomains },
                     { fetchImpl: opts.secondLineEvidenceFetch },
                   ),
               }
