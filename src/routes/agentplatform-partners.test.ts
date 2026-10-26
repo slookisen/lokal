@@ -58,10 +58,15 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
   };
 
   const counts: Record<string, number> = { rfb: 1560, experiences: 563, dental: 5446 };
+  // The 12-month block per service (dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2).
+  const yr = (visits: number, views: number, ai: number, crawler: number, deliv: number, since: string | null, delivSince: string | null): TrafficReading["year"] => ({
+    humanVisits: { value: visits, since }, humanViews: { value: views, since }, aiSearch: { value: ai, since },
+    aiCrawlerViews: { value: crawler, since }, aiDeliveries: { value: deliv, since: delivSince },
+  });
   const traffic: Record<string, TrafficReading> = {
-    rfb: { humanVisits: 61_234, aiCrawlerViews: 140_999, windowDays: 60 },
-    experiences: { humanVisits: 9_100, aiCrawlerViews: 13_400, windowDays: 60 },
-    dental: { humanVisits: 7_050, aiCrawlerViews: 7_700, windowDays: 60 },
+    rfb: { year: yr(61_234, 80_000, 6_805, 140_999, 12_490, "2026-08-14", "2026-10-26") },
+    experiences: { year: yr(9_100, 12_000, 900, 13_400, 300, "2026-08-14", "2026-10-26") },
+    dental: { year: yr(7_050, 9_000, 500, 7_700, 210, "2026-08-14", "2026-10-26") },
   };
   const agent: AgentCallReading = { toolCalls: 5_527, windowDays: 30 };
 
@@ -106,10 +111,16 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
 
     // ── (b) figures ───────────────────────────────────────────────────────
     check("b1: catalog total (exact) 7 569", nb.body.includes("<strong>7 569</strong>"));
-    check("b2: human visits 77 384 → 77 000+ with 60-day label", nb.body.includes("<strong>77 000+</strong><span class=\"m-label\">besøk fra mennesker siste 60 dager</span>"));
-    check("b3: AI-crawler views 162 099 → 162 000+", nb.body.includes("<strong>162 000+</strong><span class=\"m-label\">sidevisninger fra AI-crawlere siste 60 dager</span>"));
+    check("b2: human visits 77 384 → 77 000+ with the strip's name and «siden <dato>»", nb.body.includes("<strong>77 000+</strong><span class=\"m-label\">Besøk fra mennesker</span><span class=\"m-period\">siden 14. aug. 2026</span>"));
+    check("b3: AI-crawler views 162 099 → 162 000+, 12-month block", nb.body.includes("<strong>162 000+</strong><span class=\"m-label\">AI-crawlere</span><span class=\"m-period\">siden 14. aug. 2026</span>"));
+    check("b3b: «Med i AI-søk» platform number 13 000+ from its own start date; AI-søk and human page views too",
+      nb.body.includes("<strong>13 000+</strong><span class=\"m-label\">Med i AI-søk</span><span class=\"m-period\">siden 26. okt. 2026</span>") &&
+      nb.body.includes("<strong>8 200+</strong><span class=\"m-label\">AI-søk</span>") &&
+      nb.body.includes("<strong>101 000+</strong><span class=\"m-label\">Sidevisninger fra mennesker</span>"));
+    check("b3c: English names and periods", en.body.includes("<span class=\"m-label\">In AI searches</span><span class=\"m-period\">since 26 Oct 2026</span>") && en.body.includes("<span class=\"m-label\">Visits by people</span>"));
+    check("b3d: no 60-day traffic label left, no «Med i AI-svar»", !/siste 60 dager|last 60 days|Med i AI-svar/.test(nb.body + en.body));
     check("b4: agent tool calls 5 527 → 5 500+ with 30-day label", nb.body.includes("<strong>5 500+</strong><span class=\"m-label\">verktøykall fra AI-agenter siste 30 dager</span>"));
-    check("b5: every tile has a definition", (nb.body.match(/class="m-def"/g) || []).length === 4);
+    check("b5: every tile has a definition", (nb.body.match(/class="m-def"/g) || []).length === 7);
     check("b5b: the tool-call definition names what is counted (incl. cart and ordering)", nb.body.includes("søk, oppslag, handlekurv og bestilling") && en.body.includes("search, lookup, cart and ordering"));
     check("b6: floorForTile rounds down", floorForTile(162_099) === 162_000 && floorForTile(5_527) === 5_500 && floorForTile(812) === 812 && floorForTile(10_999) === 10_000);
     check("b7: never 'AI-brukere' / 'AI users'", !/AI-brukere|AI users/i.test(nb.body + en.body));
@@ -118,21 +129,26 @@ export async function runAgentplatformPartnersTests(opts: { log?: boolean } = {}
       { readTraffic: (v) => (v === "dental" ? null : traffic[v]), readAgentCalls: () => null },
       { rfb: 1560, experiences: 563, dental: 5446 },
     );
-    check("b8: a service without traffic data hides both traffic sums", partial.humanVisits === null && partial.aiCrawlerViews === null && partial.trafficWindowDays === null);
+    check("b8: a service without traffic data hides every traffic sum", Object.values(partial.year).every((c) => c === null));
     check("b9: no agent reading → no agent figure", partial.agentToolCalls === null);
     const partialHtml = renderPartners("nb", partial);
-    check("b10: hidden figures render no tile (only the catalog)", (partialHtml.match(/class="metric"/g) || []).length === 1 && !partialHtml.includes("besøk fra mennesker"));
+    check("b10: hidden figures render no tile (only the catalog)", (partialHtml.match(/class="metric"/g) || []).length === 1 && !partialHtml.includes("Besøk fra mennesker"));
     const zero = collectPlatformMetrics(
-      { readTraffic: () => ({ humanVisits: 0, aiCrawlerViews: 0, windowDays: 60 }), readAgentCalls: () => ({ toolCalls: 0, windowDays: 30 }) },
+      { readTraffic: () => ({ year: yr(0, 0, 0, 0, 0, null, null) }), readAgentCalls: () => ({ toolCalls: 0, windowDays: 30 }) },
       { rfb: null, experiences: 563, dental: 5446 },
     );
     const zeroHtml = renderPartners("nb", zero);
     check("b11: zeros and a missing catalog count hide the whole figures band", !zeroHtml.includes('id="tall"') && !zeroHtml.includes('href="#tall"'));
-    const mixedWindows = collectPlatformMetrics(
-      { readTraffic: (v) => ({ ...traffic[v], windowDays: v === "rfb" ? 60 : 30 }), readAgentCalls: () => agent },
+    const mixedSince = collectPlatformMetrics(
+      { readTraffic: (v) => ({ year: v === "rfb" ? yr(10, 10, 10, 10, 10, null, null) : yr(5, 5, 5, 5, 5, "2026-09-01", "2026-10-26") }), readAgentCalls: () => agent },
       { rfb: 1, experiences: 1, dental: 1 },
     );
-    check("b12: traffic windows that disagree hide the sums (no mislabelled period)", mixedWindows.humanVisits === null && mixedWindows.trafficWindowDays === null);
+    check("b12: start dates that differ: the sum is labelled with the latest one (the first day all three have data)",
+      mixedSince.year.humanVisits?.value === 20 && mixedSince.year.humanVisits?.since === "2026-09-01" && mixedSince.year.aiDeliveries?.since === "2026-10-26");
+    const fullYear = collectPlatformMetrics({ readTraffic: () => ({ year: yr(1, 1, 1, 1, 1, null, null) }), readAgentCalls: () => null }, { rfb: 1, experiences: 1, dental: 1 });
+    check("b12b: all three over the whole year → «siste 12 måneder»", fullYear.year.humanViews?.since === null && renderPartners("nb", fullYear).includes("<span class=\"m-period\">siste 12 måneder</span>"));
+    const noYear = collectPlatformMetrics({ readTraffic: (v) => (v === "dental" ? { year: null } : traffic[v]), readAgentCalls: () => null }, { rfb: 1, experiences: 1, dental: 1 });
+    check("b12c: a service whose 12-month block is missing hides the sums (never a partial sum)", Object.values(noYear.year).every((c) => c === null));
 
     // ── (c) investor section ─────────────────────────────────────────────
     check("c1: disclaimer (nb)", nb.body.includes("ikke et tilbud om kjøp eller tegning av aksjer"));

@@ -140,7 +140,8 @@ export interface TrafficReport {
     /** UTC bucket starts, 'YYYY-MM-DD HH:00' or 'YYYY-MM-DD', zero-filled over the window. */
     points: Array<{ t: string; views: number; humanViews: number; aiViews: number; botViews: number; visitors: number; humanVisitors: number }>;
   };
-  topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; botViews: number; visitors: number; humanVisitors: number }>;
+  /** aiViews = aiSearchViews + aiCrawlerViews (kept for older readers). */
+  topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; aiSearchViews: number; aiCrawlerViews: number; botViews: number; visitors: number; humanVisitors: number }>;
   /** Named non-human clients (AI and bots), by views. */
   bots: Array<{ name: string; group: TrafficGroup; cls: SessionCategory; views: number; visitors: number; sampleUa: string | null }>;
   /** Raw UA samples of bots with no recognisable name. */
@@ -573,7 +574,7 @@ export function computeTrafficReport(
   });
   const bucketSeen: Array<Set<number>> = series.map(() => new Set<number>());
 
-  const pageViews = new Map<number, { views: number; humanViews: number; aiViews: number; botViews: number }>();
+  const pageViews = new Map<number, { views: number; humanViews: number; aiViews: number; aiSearchViews: number; aiCrawlerViews: number; botViews: number }>();
   const entry = new Map<string, { label: string; visits: number; visitors: Set<number> }>();
   const refHosts = new Map<string, { key: string; label: string; visits: number; visitors: Set<number> }>();
 
@@ -593,10 +594,11 @@ export function computeTrafficReport(
     }
 
     let pv = pageViews.get(pIdx[i]);
-    if (!pv) { pv = { views: 0, humanViews: 0, aiViews: 0, botViews: 0 }; pageViews.set(pIdx[i], pv); }
+    if (!pv) { pv = { views: 0, humanViews: 0, aiViews: 0, aiSearchViews: 0, aiCrawlerViews: 0, botViews: 0 }; pageViews.set(pIdx[i], pv); }
     pv.views += 1;
     if (g === "human") pv.humanViews += 1;
-    else if (g === "ai_search" || g === "ai_crawler") pv.aiViews += 1;
+    else if (g === "ai_search") { pv.aiViews += 1; pv.aiSearchViews += 1; }
+    else if (g === "ai_crawler") { pv.aiViews += 1; pv.aiCrawlerViews += 1; }
     else pv.botViews += 1;
 
     if (g === "human" && visitStart[i]) {

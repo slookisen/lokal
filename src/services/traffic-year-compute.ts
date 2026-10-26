@@ -267,3 +267,23 @@ export function trafficYearCell(
   const c = year[key];
   return { value: c.value.toLocaleString(numFmt), period: trafficYearPeriodLabel(c.since, lang) };
 }
+
+// ── Admin (same snapshot as the strips) ─────────────────────────────────
+
+/**
+ * Body of GET /admin/analytics/year (dev-request
+ * 2026-10-22-statistikk-samme-tall-12-mnd, S2): the admin dashboard's five
+ * cards for one site and «Siste år». Built from the very snapshot the site's
+ * strip and /api/traffic-stats read (getTrafficStatsSnapshot(vertical), the
+ * off-thread cache), through the same publicTrafficYearBlock, so admin and
+ * the strip cannot drift apart. computedAt: when that snapshot was computed
+ * («oppdatert kl. HH:MM»); null while the first computation is running.
+ */
+export function adminTrafficYearBody(
+  vertical: string,
+  snap: { stats: { year: TrafficYear | null }; ready: boolean; computedAt?: number },
+): { vertical: string; ready: boolean; computedAt: string | null; year: ReturnType<typeof publicTrafficYearBlock> } {
+  const ready = snap.ready === true;
+  const at = ready && typeof snap.computedAt === "number" && Number.isFinite(snap.computedAt) ? new Date(snap.computedAt).toISOString() : null;
+  return { vertical, ready, computedAt: at, year: publicTrafficYearBlock(ready ? snap.stats.year : null) };
+}
