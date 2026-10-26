@@ -37221,6 +37221,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("order-messages-fase-b2: unexpected error: " + String(err?.message || err));
+  }
+  // Fase B3 (ordren som A2A-task) runs strictly after B2 (own in-memory DB).
+  try {
+    const { runOrderA2aTaskFaseB3Tests } = require("../src/routes/order-a2a-task-fase-b3.test") as
+      typeof import("../src/routes/order-a2a-task-fase-b3.test");
+    const b3 = await runOrderA2aTaskFaseB3Tests({ log: false });
+    passed += b3.passed;
+    failed += b3.failed;
+    for (const f of b3.failures) failures.push("order-a2a-task-fase-b3: " + f);
+    console.log(`  order-a2a-task-fase-b3: ${b3.passed} passed, ${b3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-a2a-task-fase-b3: unexpected error: " + String(err?.message || err));
   } finally {
     _orderActionsA1Resolve();
   }

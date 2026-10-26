@@ -36,13 +36,8 @@ import {
   ORDER_MESSAGES_UNTRUSTED_NOTE, type OrderMessageView, type PostOrderMessageResult,
 } from "./order-messages";
 
-/** Default off. On: the MCP tools are listed and callable, and lokal_order_status carries the B1 fields. */
-export const ORDER_AGENT_ACTIONS_FLAG = "ORDER_AGENT_ACTIONS_ENABLED";
-
-export function isOrderAgentActionsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = env[ORDER_AGENT_ACTIONS_FLAG];
-  return v === "1" || v === "true";
-}
+// The switch lives in a zero-import module (Fase B3: the A2A cards read it too).
+export { ORDER_AGENT_ACTIONS_FLAG, isOrderAgentActionsEnabled } from "./order-agent-actions-flag";
 
 export type BuyerAvailableAction = "withdraw" | "cancel" | "picked_up" | "message";
 export type BuyerOrderCommand = "cancel" | "picked_up";
