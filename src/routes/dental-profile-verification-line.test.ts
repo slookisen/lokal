@@ -223,6 +223,21 @@ export async function runDentalProfileVerificationLineTests(
       assertEq(dentalSeo.formatDentalCheckDate("2026-10-01T08:00:00.000Z"), "01.10.2026", "A3: dates read dd.mm.åååå");
       assertEq([dentalSeo.formatDentalCheckDate(null), dentalSeo.formatDentalCheckDate(""), dentalSeo.formatDentalCheckDate("igår"), dentalSeo.formatDentalCheckDate("2026-13-01")],
         [null, null, null, null], "A4: no date, or no ISO date, gives no date");
+      assertEq([
+        dentalSeo.formatDentalCheckDate("2026-10-01T22:30:00.000Z"),
+        dentalSeo.formatDentalCheckDate("2026-12-31T23:30:00Z"),
+        dentalSeo.formatDentalCheckDate("2026-10-01 23:00:00"),
+        dentalSeo.formatDentalCheckDate("2026-10-02T00:30:00+02:00"),
+        dentalSeo.formatDentalCheckDate("2026-10-01T21:59:59Z"),
+      ], ["02.10.2026", "01.01.2027", "02.10.2026", "02.10.2026", "01.10.2026"],
+        "A5: a timestamp near midnight UTC is the day in Europe/Oslo (summer and winter, SQLite's format, an offset)");
+      assertEq([
+        dentalSeo.formatDentalCheckDate("2026-02-31T10:00:00.000Z"),
+        dentalSeo.formatDentalCheckDate("2026-02-29"),
+        dentalSeo.formatDentalCheckDate("2026-04-31"),
+        dentalSeo.formatDentalCheckDate("2026-10-01T25:00:00Z"),
+        dentalSeo.formatDentalCheckDate("2024-02-29"),
+      ], [null, null, null, null, "29.02.2024"], "A6: an impossible date or time gives no date, not a wrong one (a leap day is kept)");
     }
 
     // ── B. the check lines, with and without each date ─────────────────
@@ -233,6 +248,7 @@ export async function runDentalProfileVerificationLineTests(
       assertEq(none.lines, ["Ikke kontrollert ennå"], "B3: no date set -> only «Ikke kontrollert ennå»");
 
       const all = await page(mk("Kontrollert Tannklinikk AS", {
+        brreg_status: "active",
         brreg_checked_at: "2026-10-01T08:00:00.000Z",
         website_ownership: "verified",
         website_ownership_checked_at: "2026-10-02T07:00:00.000Z",
@@ -244,8 +260,16 @@ export async function runDentalProfileVerificationLineTests(
         "Sist kontrollert: 03.10.2026",
       ], "B4: every date set -> the three lines, in order, no «Ikke kontrollert ennå»");
 
-      const brregOnly = await page(mk("Brreg Tannklinikk AS", { brreg_checked_at: "2026-10-01T08:00:00.000Z" }));
-      assertEq(brregOnly.lines, ["Brønnøysundregistrene kontrollert: 01.10.2026"], "B5: only brreg_checked_at -> only the Brønnøysund line");
+      const brregOnly = await page(mk("Brreg Tannklinikk AS", { brreg_status: "active", brreg_checked_at: "2026-10-01T08:00:00.000Z" }));
+      assertEq(brregOnly.lines, ["Brønnøysundregistrene kontrollert: 01.10.2026"], "B5: only an active Brreg check -> only the Brønnøysund line");
+      for (const status of ["orgnr_not_found_or_unreachable", "dissolved", null]) {
+        const failedLookup = await page(mk(`Brreg ${status} Tannklinikk AS`, { brreg_status: status, brreg_checked_at: "2026-10-01T08:00:00.000Z" }));
+        assertEq(failedLookup.lines, ["Ikke kontrollert ennå"], `B5b: brreg_status = ${JSON.stringify(status)} with brreg_checked_at -> no Brønnøysund line, «Ikke kontrollert ennå»`);
+      }
+      const nearMidnight = await page(mk("Midnatt Tannklinikk AS", { last_verified_at: "2026-10-01T22:30:00.000Z" }));
+      assertEq(nearMidnight.lines, ["Sist kontrollert: 02.10.2026"], "B5c: a check at 00:30 Oslo time shows that day, not the day before");
+      const impossible = await page(mk("Umulig Dato Tannklinikk AS", { last_verified_at: "2026-02-31T10:00:00.000Z" }));
+      assertEq(impossible.lines, ["Ikke kontrollert ennå"], "B5d: an impossible stored date shows no date");
 
       const verifiedOnly = await page(mk("Sjekket Tannklinikk AS", { last_verified_at: "2026-10-03T09:00:00.000Z" }));
       assertEq(verifiedOnly.lines, ["Sist kontrollert: 03.10.2026"], "B6: only last_verified_at -> only «Sist kontrollert»");
@@ -295,6 +319,15 @@ export async function runDentalProfileVerificationLineTests(
       assertEq(helfoLine(noSource.lines), null, "D5: helfo_agreement = 'true' without a source -> no Helfo line (spm. 24)");
       const emptySources = await page(mk("Helfo Tom Kilde Tannklinikk AS", { helfo_agreement: "true", field_provenance: { helfo_agreement: { sources: [] } } }));
       assertEq(helfoLine(emptySources.lines), null, "D6: an empty sources list is no source -> no Helfo line");
+      for (const [label, prov] of [
+        ["{}", { helfo_agreement: {} }],
+        ["[{}]", { helfo_agreement: [{}] }],
+        ["blank fields", { helfo_agreement: [{ value: "true", source_type: " ", source_url: "", fetched_at: "" }] }],
+        ["{sources: [{}]}", { helfo_agreement: { sources: [{}] } }],
+      ] as Array<[string, Record<string, unknown>]>) {
+        const empty = await page(mk(`Helfo Tom ${label} Tannklinikk AS`, { helfo_agreement: "true", field_provenance: prov }));
+        assertEq(helfoLine(empty.lines), null, `D6b: an entry naming no source (${label}) is no source -> no Helfo line`);
+      }
       const notTrue = await page(mk("Helfo Nei Tannklinikk AS", { helfo_agreement: "false", field_provenance: { helfo_agreement: [src] } }));
       assertEq(helfoLine(notTrue.lines), null, "D7: helfo_agreement other than 'true' -> no Helfo line, even with a source");
     }
@@ -333,6 +366,7 @@ export async function runDentalProfileVerificationLineTests(
     {
       const evil = "2026-10-01<script>alert(1)</script>";
       const p = await page(mk("Escape Tannklinikk AS", {
+        brreg_status: "active",
         brreg_checked_at: evil,
         website_ownership: "verified",
         website_ownership_checked_at: "<img src=x onerror=alert(2)>",
@@ -416,6 +450,27 @@ export async function runDentalProfileVerificationLineTests(
       // No new JSON-LD claim: the page's JSON-LD names none of it.
       const ld = Array.from(profile.html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)).map((m) => m[1]).join("\n");
       assertTrue(ld.length > 0 && !newWords.test(ld) && !/03\.10\.2026|2026-10-03|2026-10-01T08/.test(ld), "H10: the JSON-LD carries no check date or line");
+    }
+
+    // ── I. a failed read of the check columns omits the box ────────────
+    {
+      const id = mk("Lesefeil Tannklinikk AS", { last_verified_at: "2026-10-03T09:00:00.000Z" });
+      const handle = db as unknown as { prepare: (sql: string) => unknown };
+      const realPrepare = handle.prepare;
+      handle.prepare = function (this: unknown, sql: string) {
+        if (/website_ownership_checked_at, last_enriched_at FROM dental_agents WHERE id/.test(sql)) throw new Error("no such column: brreg_checked_at");
+        return realPrepare.call(this, sql);
+      } as typeof realPrepare;
+      let broken: { status: number; html: string; box: string } | null = null;
+      try {
+        broken = await page(id);
+      } finally {
+        handle.prepare = realPrepare;
+      }
+      assertEq(broken?.status, 200, "I1: the profile still renders when the check columns cannot be read");
+      assertEq(broken?.box, "", "I2: … without the «Kontroll og kilder» box");
+      assertTrue(!!broken && !/Ikke kontrollert ennå|Sist kontrollert/.test(broken.html), "I3: … and never claims «Ikke kontrollert ennå»");
+      assertEq((await page(id)).lines, ["Sist kontrollert: 03.10.2026"], "I4 control: with the read back, the box is there");
     }
   } catch (err: any) {
     failed++;

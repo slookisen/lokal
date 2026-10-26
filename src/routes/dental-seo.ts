@@ -1682,14 +1682,39 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
 // stored field_provenance. Page text only: no JSON-LD claim, no JSON field,
 // no DB write. No line for a closed clinic.
 
-/** «dd.mm.åååå» from the date part of a stored ISO timestamp; null if none. */
-export function formatDentalCheckDate(value: unknown): string | null {
+const OSLO_DATE = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" });
+
+/**
+ * A stored check date as a calendar day in Norway: a timestamp with a time
+ * is read as UTC unless it names its offset (SQLite's datetime('now') has
+ * none) and is given as the day in Europe/Oslo; a bare date is that day.
+ * null for no date, an impossible one (31.02) or one with a bad time, so
+ * the page shows no date rather than a wrong one. `ms` orders the instants.
+ */
+function dentalCheckDay(value: unknown): { day: string; ms: number } | null {
   if (typeof value !== "string") return null;
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value.trim());
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?/.exec(value.trim());
   if (!m) return null;
-  const [, y, mo, d] = m;
-  if (Number(mo) < 1 || Number(mo) > 12 || Number(d) < 1 || Number(d) > 31) return null;
-  return `${d}.${mo}.${y}`;
+  const [, ys, mos, ds, hs, mis, ss, zone] = m;
+  const y = Number(ys), mo = Number(mos), d = Number(ds);
+  const calendar = new Date(Date.UTC(y, mo - 1, d));
+  if (calendar.getUTCFullYear() !== y || calendar.getUTCMonth() !== mo - 1 || calendar.getUTCDate() !== d) return null;
+  if (hs === undefined) return { day: `${ds}.${mos}.${ys}`, ms: calendar.getTime() };
+  const h = Number(hs), mi = Number(mis), sec = ss === undefined ? 0 : Number(ss);
+  if (h > 23 || mi > 59 || sec > 59) return null;
+  let offsetMin = 0;
+  if (zone && zone !== "Z") {
+    const z = /^([+-])(\d{2}):?(\d{2})$/.exec(zone)!;
+    offsetMin = (z[1] === "-" ? -1 : 1) * (Number(z[2]) * 60 + Number(z[3]));
+  }
+  const ms = Date.UTC(y, mo - 1, d, h, mi, sec) - offsetMin * 60_000;
+  const parts = Object.fromEntries(OSLO_DATE.formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
+  return { day: `${parts.day}.${parts.month}.${parts.year}`, ms };
+}
+
+/** «dd.mm.åååå» in Europe/Oslo from a stored timestamp; null if none or invalid. */
+export function formatDentalCheckDate(value: unknown): string | null {
+  return dentalCheckDay(value)?.day ?? null;
 }
 
 /**
@@ -1711,22 +1736,28 @@ export function dentalFieldSources(
   } else {
     list = coerceProvenanceToArrayShape({ [field]: entry })[field] ?? [];
   }
-  return list.filter((r): r is Record<string, unknown> => !!r && typeof r === "object" && !Array.isArray(r));
+  // An entry that names no source type, URL or fetch date ({} or blanks) is
+  // no source.
+  const named = (v: unknown) => typeof v === "string" && v.trim() !== "";
+  return list.filter((r): r is Record<string, unknown> =>
+    !!r && typeof r === "object" && !Array.isArray(r) &&
+    (named((r as Record<string, unknown>).source_type) || named((r as Record<string, unknown>).source_url) || named((r as Record<string, unknown>).fetched_at)));
 }
 
 /** The newest fetched_at among a field's sources, as «dd.mm.åååå»; null if none has one. */
 function newestSourceDate(sources: Array<Record<string, unknown>>): string | null {
-  let best: string | null = null;
+  let best: { day: string; ms: number } | null = null;
   for (const s of sources) {
-    const raw = typeof s.fetched_at === "string" ? s.fetched_at.trim() : "";
-    if (formatDentalCheckDate(raw) && (best === null || raw.slice(0, 10) > best.slice(0, 10))) best = raw;
+    const at = dentalCheckDay(s.fetched_at);
+    if (at && (best === null || at.ms > best.ms)) best = at;
   }
-  return best === null ? null : formatDentalCheckDate(best);
+  return best?.day ?? null;
 }
 
 /**
- * The «Kontroll og kilder» box of a clinic profile: the Brønnøysund check,
- * the website ownership (only 'verified'), «Sist kontrollert», or «Ikke
+ * The «Kontroll og kilder» box of a clinic profile: the Brønnøysund check
+ * (only brreg_status 'active': the verifier also stamps brreg_checked_at
+ * when the lookup failed, orgnr_not_found_or_unreachable), the website ownership (only 'verified'), «Sist kontrollert», or «Ikke
  * kontrollert ennå» when none of them is there; then the source of the Helfo
  * text (only with a stored source, until F2-S6's resolveHelfoClaim) and of
  * the akutt claim (as resolveAcuteClaim decides). "" for a closed clinic.
@@ -1737,7 +1768,7 @@ export function dentalVerificationSection(
 ): string {
   if (agent.is_inactive === 1) return "";
   const lines: string[] = [];
-  const brreg = formatDentalCheckDate(meta?.brreg_checked_at);
+  const brreg = meta?.brreg_status === "active" ? formatDentalCheckDate(meta.brreg_checked_at) : null;
   if (brreg) lines.push(`Brønnøysundregistrene kontrollert: ${brreg}`);
   if (meta?.website_ownership === "verified") {
     const owned = formatDentalCheckDate(meta.website_ownership_checked_at);
@@ -2053,11 +2084,13 @@ function renderClinicProfile(
   }
 
   // ── F2-S3: what was checked and when (no line for a closed clinic)
-  let verificationMeta: DentalVerificationMeta | null = null;
+  // A failed read omits the box: no «Ikke kontrollert ennå» we cannot back.
+  let verificationSection = "";
   if (!inactive) {
-    try { verificationMeta = getDentalVerificationMeta(agent.id); } catch { /* db not ready */ }
+    try {
+      verificationSection = dentalVerificationSection(agent, getDentalVerificationMeta(agent.id));
+    } catch { /* db not ready: no box */ }
   }
-  const verificationSection = dentalVerificationSection(agent, verificationMeta);
 
   // ── Updated_at disclaimer
   const updatedAt = (agent as any).updated_at;

@@ -990,8 +990,8 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
       const plain = await profile("Majorstuen Tann AS", "918960002");
       const outsideBox = plain.main.replace(/<div class="section-box verification-meta">[\s\S]*?<\/ul><\/div>/, "");
       assertTrue(plain.main.includes("<h1 class=\"profile-name\">Majorstuen Tann AS</h1>") && plain.badges === "" && !NOT_CHECKED.test(outsideBox) &&
-        /<div class="section-box verification-meta">[\s\S]*?<\/div>/.test(plain.main),
-        "m4c control: a profile without the badge has no header badge, and its only note about the check is the F2-S3 box", `${plain.badges} ${outsideBox.match(NOT_CHECKED)?.[0] ?? ""}`);
+        /<div class="section-box verification-meta">[\s\S]*?<li>Ikke kontrollert ennå<\/li>[\s\S]*?<\/div>/.test(plain.main),
+        "m4c control: a profile without the badge has no header badge, and its only note about the check is the F2-S3 box, «Ikke kontrollert ennå»", `${plain.badges} ${outsideBox.match(NOT_CHECKED)?.[0] ?? ""}`);
       const closedId = store.createDentalAgent({ navn: "Nedlagt Fjord Tann AS", org_nr: "918960094", poststed: "OSLO", fylke: "Oslo" } as any);
       try {
         db.prepare("UPDATE dental_agents SET catalog_class = 'klinikk', verification_status = 'needs_review', is_inactive = 1 WHERE id = ?").run(closedId);
