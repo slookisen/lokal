@@ -456,7 +456,9 @@ export async function runDentalAgentPutAuditEntriesTests(opts: { log?: boolean }
     }
 
     // P0–P7: the Places batch (write:true, mocked Places answer, no network).
+    // Run with the A6 switch on: the fixture asserts the pre-A6 website/phone writes.
     {
+      (require("../services/places-match") as typeof import("../services/places-match")).__setDentalPlacesContactFieldsFetchForTesting(true);
       process.env.GOOGLE_PLACES_API_KEY = "test-places-key";
       const placesSite = "https://revisjon-places.example.no";
       (globalThis as any).fetch = async (url: unknown, init?: any) => {
@@ -493,6 +495,7 @@ export async function runDentalAgentPutAuditEntriesTests(opts: { log?: boolean }
         "P6: ... and the rest of the column is the one the batch writes on a row without audit entries");
       ok(JSON.stringify(prov(conflict).hjemmeside) === conflictBefore && JSON.stringify(prov(conflict).inactive) === JSON.stringify(inactive),
         `P7: the PUT's list with the cleanup's entry first survives the Places batch byte for byte (${JSON.stringify(prov(conflict).hjemmeside)})`);
+      (require("../services/places-match") as typeof import("../services/places-match")).__setDentalPlacesContactFieldsFetchForTesting(null);
     }
 
     // N1–N2 (lock): the legacy-shape normalize takes no option and needs none.
