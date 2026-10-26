@@ -516,8 +516,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
 // and each row must pass cart-service.isRowOrderableForRealOrder() (the
 // add/submit per-row gates). Reached by id, like cart add/submit and
 // /catalog/agents/:id/products, so — per agent-visibility.ts — no
-// public-listability filter here; the listing surfaces that link to it
-// (the producer page) carry their own.
+// public-listability filter here; the callers carry their own (the producer
+// page; /handleliste?produsent= checks isAgentIdPubliclyVisible first).
 
 /** agents.id shape accepted from a URL (UUIDs and the older slug-like ids). */
 const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
