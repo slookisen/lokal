@@ -20,6 +20,9 @@ import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision"
 // geocoding-service.ts (→ database/init) would have. Aliased to the old local
 // name so every call site below reads exactly as it did.
 import { haversineDistanceKm as haversine, toRadians as toRad } from "./geo-distance";
+// Fase B3 (mine ordrer): the order-task skill and method list for the card,
+// behind ORDER_AGENT_ACTIONS_ENABLED. Pure apart from the env switch.
+import { managePickupOrderSkill, rfbJsonRpcMethods, isOrderAgentActionsEnabled } from "./order-a2a-card";
 import {
   assertEnrichmentWriteAllowedOrThrow,
   normalizeEnrichmentVertical,
@@ -1467,7 +1470,7 @@ class MarketplaceRegistry {
         {
           type: "json-rpc",
           url: `${baseUrl}/a2a`,
-          methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"],
+          methods: rfbJsonRpcMethods(),
           description: "A2A JSON-RPC 2.0 endpoint for agent-to-agent communication",
         },
         {
@@ -1547,6 +1550,8 @@ class MarketplaceRegistry {
             "finn billig honning nær Trondheim",
           ],
         },
+        // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
+        ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
       ],
 
       // ─── Security ──────────────────────────────────────────
