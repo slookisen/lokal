@@ -23,3 +23,31 @@ export function writeOrderNotificationsOptIn(db: any, agentId: string, optIn: bo
     .run(optIn ? 1 : 0, agentId);
   return info.changes > 0;
 }
+
+/**
+ * dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b (review note N1 from
+ * S2a): the old «Bestillinger» card / POST order-notifications routes write
+ * the column through here, so a real change also gets its
+ * owner_feature_audit row for `orders.enabled` (vertical 'rfb') in the same
+ * transaction — the same row PUT /api/owner/:id/features/orders.enabled
+ * writes. A write that does not change the value writes no audit row; the
+ * column UPDATE itself is unchanged. Returns false when no agent row exists.
+ */
+export function writeOrderNotificationsOptInWithAudit(
+  db: any,
+  agentId: string,
+  optIn: boolean,
+  actor: { actor: "owner" | "admin" | "cs" | "system"; detail?: string | null },
+): boolean {
+  return db.transaction((): boolean => {
+    const before = readOrderNotificationsOptIn(db, agentId);
+    if (!writeOrderNotificationsOptIn(db, agentId, optIn)) return false;
+    if (before !== null && before !== optIn) {
+      db.prepare(
+        `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at)
+         VALUES ('rfb', ?, 'orders.enabled', ?, ?, ?, ?, ?)`,
+      ).run(agentId, JSON.stringify(before), JSON.stringify(optIn), actor.actor, actor.detail ?? null, new Date().toISOString());
+    }
+    return true;
+  })();
+}
