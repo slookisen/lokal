@@ -26903,7 +26903,8 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     // that trailing arg too.
     const fs = require("fs");
     const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf8");
-    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)\)/g) || []).length;
+    // S2c-1 (owner choices) adds an optional trailing { hidePrices } argument.
+    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)(,\s*\{ hidePrices: [^}]+\})?\)/g) || []).length;
     assertEq(wiredCalls, 2, `pid-17: both MCP product call sites (lokal_info + lokal_search) wire the catalog id map AND the supply-graph availability map (got ${wiredCalls})`);
   } catch (err) {
     failed++;
@@ -50415,6 +50416,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("owner-features-s2b: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's contact /
+// price / stats choices on the public surfaces (OWNER_FEATURES_ENFORCE + the
+// allowlist; byte-identical while off), matrix per key × declared surface.
+// Swaps the getDb() singleton and env vars (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: håndheving på flatene ──");
+  try {
+    const { runOwnerFeaturesS2cTests } = require("../src/routes/owner-features-s2c.test") as
+      typeof import("../src/routes/owner-features-s2c.test");
+    const r = await runOwnerFeaturesS2cTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2c: " + f);
+    console.log(`  owner-features-s2c: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2c: unexpected error: " + String(err?.message || err));
   }
 });
 
