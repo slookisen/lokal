@@ -369,7 +369,7 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
 
       const { getOwnerStats } = require("./owner-stats-service") as typeof import("./owner-stats-service");
       const o = getOwnerStats(db as any, "p-1", "/produsent/aker-gaard-en");
-      assertEq(o.aiDeliveries.window.total, 7, "(g) owner stats: 60 d");
+      assertEq(`${o.aiDeliveries.window.windowDays}:${o.aiDeliveries.window.total}`, "365:11", "(g) owner stats: 12 months since statistikk S2d (the 90-day-old row counts)");
       assertEq(o.aiDeliveries.allTime.total, 11, "(g) owner stats: whole period");
       assertEq(o.aiDeliveries.allTime.byChannel.a2a, 4, "(g) owner stats: whole period per channel");
 

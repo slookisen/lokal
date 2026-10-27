@@ -31,7 +31,7 @@
 
 import type Database from "better-sqlite3";
 import { LEGACY_AGENT_VIEW_SOURCE } from "../database/analytics-sql";
-import { isAnalyticsRollupReadEnabled } from "./analytics-rollup-boundary";
+import { isAnalyticsRollupReadEnabled, rollupBoundaryDateOn } from "./analytics-rollup-boundary";
 import { computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { addDays, dayOf } from "./traffic-history-compute";
 import { TRAFFIC_YEAR_DAYS, trafficYearPeriodLabel, type TrafficYearCount } from "./traffic-year-compute";
@@ -73,6 +73,23 @@ export interface ProfileYearRaw {
 /** First day ('YYYY-MM-DD', UTC) of the 12-month window ending today. */
 export function profileYearFrom(nowMs: number): string {
   return addDays(dayOf(nowMs), -(TRAFFIC_YEAR_DAYS - 1));
+}
+
+/**
+ * Where the raw part starts: the raw floor of analytics_agent_views
+ * (rollupBoundaryDateOn; tomorrow when the table is empty or missing), never
+ * before the window's first day (a raw table that was not pruned). The
+ * caller counts raw page views from `${rawFrom} 00:00:00` on and passes this
+ * same value as ProfileYearRaw.rawFrom, so the stored and raw parts stay
+ * disjoint. Shared by the public tiles (agent-stats-compute.ts) and the RFB
+ * owner portal (owner-stats-service.ts, S2d).
+ */
+export function profileYearRawFrom(db: Db, nowMs: number): string {
+  const rawFloor = tableExists(db, "analytics_agent_views")
+    ? rollupBoundaryDateOn(db, "analytics_agent_views")
+    : addDays(dayOf(nowMs), 1);
+  const from = profileYearFrom(nowMs);
+  return rawFloor > from ? rawFloor : from;
 }
 
 function tableExists(db: Db, name: string): boolean {

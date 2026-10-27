@@ -407,7 +407,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
         ins.run("experiences", "gs-fossmoen", old, "a2a", "unknown", 4);
         const { getGardssalgOwnerStats } = require("./gardssalg-owner-stats-service") as typeof import("./gardssalg-owner-stats-service");
         const o = getGardssalgOwnerStats("/kategori/gardssalg/produsent/fossmoen-frukt", "gs-fossmoen");
-        assertEq(o.aiDeliveries?.window.total, 7, "(f) gårdssalg owner stats: 60 d");
+        assertEq(`${o.aiDeliveries?.window.windowDays}:${o.aiDeliveries?.window.total}`, "365:11", "(f) gårdssalg owner stats: 12 months since statistikk S2d (the 90-day-old row counts)");
         assertEq(o.aiDeliveries?.allTime.total, 11, "(f) gårdssalg owner stats: whole period");
         assertEq(o.aiDeliveries?.allTime.byChannel.a2a, 4, "(f) whole period per channel");
         // S1: rows before the configured start day stay in the table but are not counted.
@@ -419,7 +419,7 @@ export async function runProfileAiDeliveriesS2Tests(opts: { log?: boolean } = {}
         process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
         assertEq(getGardssalgOwnerStats("/x").aiDeliveries, undefined, "(f) without a provider id the payload is unchanged");
         const claimSrc = fs.readFileSync(path.join(__dirname, "../routes/gardssalg-claim.ts"), "utf8");
-        assertTrue(claimSrc.includes("getGardssalgOwnerStats(path, providerId)") && claimSrc.includes("Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (") && !claimSrc.includes("Med i AI-svar, sendt"), "(f) the gårdssalg portal shows 60 d and the whole period");
+        assertTrue(claimSrc.includes("getGardssalgOwnerStats(path, providerId)") && claimSrc.includes("Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (") && !claimSrc.includes("Med i AI-svar, sendt"), "(f) the gårdssalg portal shows 12 months and the whole period");
         assertTrue(!/vist i ChatGPT/i.test(claimSrc), "(f) portal wording: never «vist i ChatGPT»");
       }
   } catch (err: any) {

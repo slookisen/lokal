@@ -713,14 +713,14 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
               '<div class="gc-stat"><div class="gc-stat-num">' + j.stats.humanViews + '</div><div class="gc-stat-label">Sidevisninger fra mennesker (' + j.stats.windowDays + ' dager)</div></div>' +
               '<div class="gc-stat" title="Ganger en AI-assistent (ChatGPT, Claude, Perplexity …) hentet siden din for noen som spurte"><div class="gc-stat-num">' + j.stats.aiSearchViews + '</div><div class="gc-stat-label">AI-søk (' + j.stats.windowDays + ' dager)</div></div>';
             // «Med i AI-søk»: among the results an AI fetched, not seen by a person; a minimum.
+            // The window is the last 12 months with the public tile's label (statistikk S2d).
             var dl = j.stats.aiDeliveries;
             if (dl && dl.window && dl.allTime) {
               var dlTip = "Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte. Forsiden telles ikke. Tallet viser ikke hvor mange som så den.";
               var dlSinceMs = dl.allTime.countingSince ? Date.parse(dl.allTime.countingSince + "T00:00:00Z") : NaN;
               var dlSince = isNaN(dlSinceMs) ? "" : new Date(dlSinceMs).toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
-              var dlPartial = !!dlSince && (Date.now() - dlSinceMs) < (dl.window.windowDays - 1) * 86400000;
               el.innerHTML +=
-                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.window.total + '</div><div class="gc-stat-label">Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (' + (dlPartial ? 'siden ' + dlSince : dl.window.windowDays + ' dager') + ')</div></div>' +
+                '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.window.total + '</div><div class="gc-stat-label">Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (' + dl.windowLabel + ')</div></div>' +
                 '<div class="gc-stat" title="' + dlTip + '"><div class="gc-stat-num">' + dl.allTime.total + '</div><div class="gc-stat-label">Med i AI-søk: ganger profilen var blant treffene en AI-assistent hentet (' + (dlSince ? 'siden ' + dlSince : 'hele perioden') + ')</div></div>';
             }
             if (note && j.stats.notAvailable && j.stats.notAvailable.length) {
