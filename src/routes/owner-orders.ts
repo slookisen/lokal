@@ -21,11 +21,12 @@ import { rateLimit } from "express-rate-limit";
 import { getDb } from "../database/init";
 import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
 import { applyOrderAction, type OrderAction } from "../services/order-actions";
+import { isOrderMessagesEnabled, postOrderMessage } from "../services/order-messages";
 import { isPaymentsLifecycleActive, resolvePaymentsStripeClient } from "../services/payment-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
 import {
   countOwnerOrders, listOwnerOrders, getOwnerOrder, getOwnerOrderByToken, parseTab, tabForStatus,
-  renderOrdersPage, renderTokenOrderPage, ordersShell, esc, ROW_ANCHOR,
+  renderOrdersPage, renderTokenOrderPage, ordersShell, esc, ROW_ANCHOR, messageErrorCode,
 } from "./owner-orders-view";
 
 const router = Router();
@@ -162,6 +163,40 @@ router.post("/eier/:agentId/ordrer/:orderId", ownerOrdersLimiter, express.urlenc
     return res.redirect(303, back(tabForStatus(result.status), `&done=${encodeURIComponent(result.status)}`));
   } catch (err) {
     console.error("[owner-orders] POST action failed:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, `${base}?error=feil`);
+  }
+});
+
+// ── Owner session: a message to the buyer (Fase B2) ────────────────────────
+//
+// Behind ORDER_MESSAGES_ENABLED (off → 404, the route does not exist). The
+// same owner-session checks as the actions above; the order must belong to
+// the producer. The buyer is e-mailed (order-messages.ts); the seller never
+// sees the buyer's address through this.
+
+const messagesGate = (_req: Request, _res: Response, next: express.NextFunction) => (isOrderMessagesEnabled() ? next() : next("route"));
+
+router.post("/eier/:agentId/ordrer/:orderId/melding", messagesGate, ownerOrdersLimiter, express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+  const agentId = param(req, "agentId");
+  const orderId = param(req, "orderId");
+  const base = `/eier/${encodeURIComponent(agentId)}/ordrer`;
+  try {
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
+    if (!ownerSessionAllows(agentId, session)) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`, session.agentId === agentId);
+    if (crossSite(req)) { noStore(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
+
+    const order = getOwnerOrder(agentId, orderId);
+    if (!order) return notFoundPage(res);
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const idem = typeof body["idem"] === "string" && /^[A-Za-z0-9-]{8,64}$/.test(body["idem"] as string) ? `s:mo:${body["idem"]}` : null;
+    const back = (extra: string) => `${base}?tab=${tabForStatus(order.status)}&o=${encodeURIComponent(orderId)}${extra}#${ROW_ANCHOR(orderId)}`;
+    const result = await postOrderMessage(order.id, "seller", body["message"], "owner_portal", { idempotencyKey: idem });
+    if (!result.success) return res.redirect(303, back(`&error=${messageErrorCode(result)}`));
+    return res.redirect(303, back("&done=melding"));
+  } catch (err) {
+    console.error("[owner-orders] POST message failed:", err instanceof Error ? err.message : "error");
     return res.redirect(303, `${base}?error=feil`);
   }
 });

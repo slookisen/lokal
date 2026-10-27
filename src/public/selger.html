@@ -688,7 +688,7 @@
           <div class="card">
             <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">
-              &laquo;Sett&raquo; (sidevisninger fra mennesker) og &laquo;kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-s&oslash;k&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
+              &laquo;Sett&raquo; (sidevisninger fra mennesker) gjelder perioden p&aring; kortet, som p&aring; profilsiden din. &laquo;Kontakt-klikk&raquo; er siste <span class="statsWindowDays">60</span> dager. &laquo;Oppdaget&raquo; er en gammel livstidsteller (vises i s&oslash;keresultater) som blander folk, roboter og AI; se &laquo;Med i AI-s&oslash;k&raquo; under for AI. Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
             </p>
             <div class="stats-grid" id="statsFunnel"></div>
           </div>
@@ -701,8 +701,8 @@
           </div>
 
           <div class="card">
-            <h2>AI-søk (siste <span class="statsWindowDays">60</span> dager)</h2>
-            <p class="section-hint" style="margin-bottom:0.75rem;">Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din for noen som spurte. AI-roboter som bare leser og indekserer sider, telles ikke her.</p>
+            <h2>AI-søk</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din for noen som spurte. AI-roboter som bare leser og indekserer sider, telles ikke her. Fordelingen per AI er siste <span class="statsWindowDays">60</span> dager.</p>
             <div class="stats-grid" id="statsAiPlatforms"></div>
           </div>
 
@@ -810,7 +810,14 @@
               </div>
               <button class="btn btn-secondary btn-small" id="btnUnclaim" style="border-color: #b91c1c; color: #b91c1c; white-space: nowrap;">Frasig eierskap</button>
             </div>
-            <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+            <div id="rowPauseOrDelete" class="hidden" style="justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+              <div>
+                <strong style="font-size: 0.9rem;">Ta pause eller be om sletting</strong>
+                <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Sett profilen på pause i eierportalen, eller be kundeservice slette den.</p>
+              </div>
+              <a class="btn btn-secondary btn-small" id="linkPauseOrDelete" href="/eier" style="white-space: nowrap;">Pause og sletting</a>
+            </div>
+            <div id="rowDeactivate" style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
               <div>
                 <strong style="font-size: 0.9rem;">Meld butikk som nedlagt</strong>
                 <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Agenten merkes som inaktiv og fjernes fra søkeresultater.</p>
@@ -1517,6 +1524,16 @@
             method: 'POST',
             body: JSON.stringify({ token: state.claimToken })
           });
+          // S1b punkt 6 (OWNER_PAUSE_ENABLED): «Meld nedlagt» is replaced by
+          // pause + «be om sletting» in the owner portal. Absent flag = unchanged.
+          if (authCheck && authCheck.success && authCheck.data && authCheck.data.ownerPauseEnabled === true) {
+            var rowDeact = document.getElementById('rowDeactivate');
+            var rowPause = document.getElementById('rowPauseOrDelete');
+            var linkPause = document.getElementById('linkPauseOrDelete');
+            if (rowDeact) rowDeact.style.display = 'none';
+            if (linkPause) linkPause.setAttribute('href', '/eier/' + encodeURIComponent(state.agentId) + '/portal#pause');
+            if (rowPause) { rowPause.classList.remove('hidden'); rowPause.style.display = 'flex'; }
+          }
           if (!authCheck.success || authCheck.data.agentId !== state.agentId) {
             // Token expired, invalid, or belongs to a different agent
             var staleToken = state.claimToken;
@@ -1982,7 +1999,12 @@
       funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.discovered || 0) + '</div><div class="stat-label">Oppdaget (gammel livstidsteller)</div></div>';
       var wd = data.windowDays || 60;
       Array.prototype.forEach.call(document.querySelectorAll('.statsWindowDays'), function(el) { el.textContent = wd; });
-      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.viewed || 0) + '</div><div class="stat-label">Sett (' + wd + 'd)</div></div>';
+      // «Sett» and all AI search: the public producer tiles' numbers and labels,
+      // 12 months or «siden <dato>» (statistikk S2d); the rest stays at wd days.
+      var yr = data.year || null;
+      var yrLabel = function(key) { return (yr && yr.labels && yr.labels.nb && yr.labels.nb[key]) || ''; };
+      var seen = yr && yr.humanViews ? { n: yr.humanViews.value || 0, label: yrLabel('humanViews') } : { n: f.viewed || 0, label: wd + 'd' };
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + seen.n + '</div><div class="stat-label">Sett (' + escHtml(seen.label) + ')</div></div>';
       funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.contactClicked || 0) + '</div><div class="stat-label">Kontakt-klikk (' + wd + 'd)</div></div>';
       document.getElementById('statsFunnel').innerHTML = funnelHtml;
 
@@ -2037,24 +2059,26 @@
       // AI platforms
       var ai = data.aiPlatforms || { chatgpt: 0, claude: 0, other: 0 };
       var aiHtml = '';
-      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.chatgpt || 0) + '</div><div class="stat-label">ChatGPT</div></div>';
-      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.claude || 0) + '</div><div class="stat-label">Claude</div></div>';
-      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.other || 0) + '</div><div class="stat-label">Andre AI</div></div>';
+      if (yr && yr.aiViews) {
+        aiHtml += '<div class="stat-card"><div class="stat-number">' + (yr.aiViews.value || 0) + '</div><div class="stat-label">Alle AI-assistenter (' + escHtml(yrLabel('aiViews')) + ')</div></div>';
+      }
+      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.chatgpt || 0) + '</div><div class="stat-label">ChatGPT (' + wd + 'd)</div></div>';
+      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.claude || 0) + '</div><div class="stat-label">Claude (' + wd + 'd)</div></div>';
+      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.other || 0) + '</div><div class="stat-label">Andre AI (' + wd + 'd)</div></div>';
       document.getElementById('statsAiPlatforms').innerHTML = aiHtml;
 
-      // Med i AI-søk: last 60 days and since counting started, per AI and per channel
+      // Med i AI-søk: last 12 months (the public tile's window and label,
+      // statistikk S2d) and since counting started, per AI and per channel
       var dl = data.aiDeliveries || {};
       var dw = dl.window || {};
       var da = dl.allTime || {};
-      var dwDays = dw.windowDays || 60;
-      // Counting started on dw.countingSince: until a full window has passed the label
-      // says «siden <dato>», and the whole period «fra <dato>» (Daniel 2026-10-15).
+      var dwDays = dw.windowDays || 365;
       var dlSinceMs = dw.countingSince ? Date.parse(dw.countingSince + 'T00:00:00Z') : NaN;
       var dlSince = isNaN(dlSinceMs) ? '' : new Date(dlSinceMs).toLocaleDateString('nb-NO', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
       var dlPartial = !!dlSince && (Date.now() - dlSinceMs) < (dwDays - 1) * 86400000;
-      var dlWinLabel = dlPartial ? 'siden ' + dlSince : dwDays + 'd';
+      var dlWinLabel = yrLabel('aiDeliveries') || (dlPartial ? 'siden ' + dlSince : dwDays + 'd');
       var dlHtml = '';
-      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + dlWinLabel + ')</div></div>';
+      dlHtml += '<div class="stat-card"><div class="stat-number">' + (dw.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + escHtml(dlWinLabel) + ')</div></div>';
       dlHtml += '<div class="stat-card"><div class="stat-number">' + (da.total || 0) + '</div><div class="stat-label">Ganger profilen var blant treffene en AI-assistent hentet (' + (dlSince ? 'siden ' + dlSince : 'hele perioden') + ')</div></div>';
       document.getElementById('statsAiDeliveries').innerHTML = dlHtml;
       var DL_VENDOR_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', perplexity: 'Perplexity', other: 'Andre AI', unknown: 'Ukjent AI' };
@@ -2062,7 +2086,7 @@
       function dlRows(labels, w, a) {
         w = w || {}; a = a || {};
         return Object.keys(labels).map(function(k) {
-          return '<li class="product-item"><span class="product-name">' + labels[k] + '</span><span class="product-meta">' + (w[k] || 0) + ' (' + dlWinLabel + ') &middot; ' + (a[k] || 0) + ' totalt</span></li>';
+          return '<li class="product-item"><span class="product-name">' + labels[k] + '</span><span class="product-meta">' + (w[k] || 0) + ' (' + escHtml(dlWinLabel) + ') &middot; ' + (a[k] || 0) + ' totalt</span></li>';
         }).join('');
       }
       document.getElementById('statsAiDeliveriesVendor').innerHTML = dlRows(DL_VENDOR_LABELS, dw.byVendor, da.byVendor);

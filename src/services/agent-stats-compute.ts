@@ -21,6 +21,7 @@ import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { classifySession, storedClientClass, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
+import { computeProfileYear, profileYearRawFrom, type ProfileYear } from "./profile-year-compute";
 
 /**
  * A session is velocity-checked around its first view of this page. One
@@ -46,6 +47,13 @@ export interface AgentStatsPayload {
    * (profile-ai-deliveries-compute.ts). Sent to the AI, not seen by a person.
    */
   aiDeliveries: AiDeliveries;
+  /**
+   * The tiles' numbers over the last 12 months, or since the first day with
+   * data, with their «siste 12 måneder» / «siden <dato>» labels
+   * (profile-year-compute.ts; dev-request 2026-10-22-statistikk-samme-tall-
+   * 12-mnd, S2c). The 60-day fields above keep their meaning.
+   */
+  year: ProfileYear;
 }
 
 // SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated); the
@@ -119,14 +127,28 @@ export function computeAgentStats(
   // identifies the producer page. is_owner filter excludes our own ops
   // traffic (RFB-ContactVerifier etc.) so the count reflects real
   // public visits.
-  const sessions = db.prepare(`
-    SELECT session_id, ${clientClass} as client_class, COUNT(*) as views, MIN(created_at) as first_seen
+  //
+  // The same read also counts the 12-month tiles' raw part (S2c): every view
+  // from the raw floor of analytics_agent_views on (`yearViews`), the days
+  // before it come from the stored daily sums (profile-year-compute.ts).
+  // `views` and `first_seen` stay those of the 60-day window. The raw part
+  // never starts before the 12-month window (a raw table that was not pruned).
+  const rawFrom = profileYearRawFrom(db, nowMs);
+  const rawFromIso = `${rawFrom} 00:00:00`;
+  const readFromIso = rawFromIso < cutoffIso ? rawFromIso : cutoffIso;
+  const sessions = (db.prepare(`
+    SELECT session_id, ${clientClass} as client_class,
+      SUM(CASE WHEN created_at > ? THEN 1 ELSE 0 END) as views,
+      SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) as yearViews,
+      MIN(CASE WHEN created_at > ? THEN created_at END) as first_seen,
+      MIN(created_at) as first_any
     FROM analytics_page_views
     WHERE path = ?
       AND (is_owner IS NULL OR is_owner = 0)
-      AND created_at > ?${statusOk}
+      AND created_at >= ?${statusOk}
     GROUP BY session_id
-  `).all(path, cutoffIso) as Array<{ session_id: string | null; client_class: string | null; views: number; first_seen: string }>;
+  `).all(cutoffIso, rawFromIso, cutoffIso, path, readFromIso) as Array<{ session_id: string | null; client_class: string | null; views: number; yearViews: number; first_seen: string | null; first_any: string }>)
+    .filter((s) => s.views > 0 || s.yearViews > 0);
 
   // The AI tile counts AI search only: an assistant fetching the page for a
   // person (ChatGPT-User, Claude-User, Perplexity-User …), which is what its
@@ -134,26 +156,34 @@ export function computeAgentStats(
   // pages and are not counted (Daniel 2026-10-13: «Tell bare AI-søk, behold
   // teksten»).
   const aiRaw = { chatgpt: 0, claude: 0, other: 0 };
+  let aiYearRaw = 0;
   const humanLooking: typeof sessions = [];
   for (const s of sessions) {
     const sessionId = s.session_id || "";
     const category = storedClientClass(sessionId, s.client_class);
     if (category === "human") humanLooking.push(s);
-    else if (category === "ai_search") aiRaw[aiVendorBucket(uaFromSessionId(sessionId))] += s.views;
+    else if (category === "ai_search") {
+      aiRaw[aiVendorBucket(uaFromSessionId(sessionId))] += s.views;
+      aiYearRaw += s.yearViews;
+    }
   }
 
   // Velocity: a browser UA proves nothing (see traffic-classifier.ts
   // isVelocityScraper). Largest sessions first, so the cap never lets the
-  // sessions that move the number most go unchecked.
+  // sessions that move the number most go unchecked. The sort is stable, so
+  // sessions with views only before the 60-day cutoff come last and the
+  // 60-day sessions are checked exactly as before.
   humanLooking.sort((a, b) => b.views - a.views);
   let humanViews = 0;
+  let humanYearRaw = 0;
   humanLooking.forEach((s, i) => {
     if (i < MAX_VELOCITY_CHECKS) {
-      const anchor = Date.parse(s.first_seen.replace(" ", "T") + "Z");
+      const anchor = Date.parse((s.first_seen ?? s.first_any).replace(" ", "T") + "Z");
       const velocity = Number.isFinite(anchor) ? readSessionVelocity(db, s.session_id || "", anchor, "centered") : null;
       if (classifySession(s.session_id || "", { velocity }) !== "human") return;
     }
     humanViews += s.views;
+    humanYearRaw += s.yearViews;
   });
 
   const aiChatgpt = aiRaw.chatgpt;
@@ -221,5 +251,6 @@ export function computeAgentStats(
     lastConversations,
     windowDays,
     aiDeliveries: computeAiDeliveries(db, "rfb", agentId, AI_DELIVERY_WINDOW_DAYS, nowMs),
+    year: computeProfileYear(db, agentId, { rawFrom, humanViews: humanYearRaw, aiViews: aiYearRaw }, nowMs),
   };
 }

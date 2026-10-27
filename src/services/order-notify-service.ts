@@ -517,3 +517,130 @@ export async function sendOrderNotificationForOrder(order: OrderNotificationInpu
     return await fail(String((err as any)?.message || err).slice(0, 200));
   }
 }
+
+/**
+ * Fase B1 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+ * the producer is told when the BUYER withdraws (pending) or cancels (after
+ * confirmation) through a buyer channel (MCP, the order card). Same gated
+ * recipient (resolveOrderNotificationRecipient) and the same send path as the
+ * order e-mail; no buyer contact data in it. Only for an order whose order
+ * e-mail actually reached the producer (notify_sent_at): a producer who never
+ * got the order has nothing to stop. Fire-and-forget; never throws.
+ */
+export async function sendProducerBuyerCancelNotice(orderId: string, kind: "withdraw" | "cancel"): Promise<OrderNotifyOutcome> {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    const o = db.prepare(`
+      SELECT o.id, o.agent_id, o.notify_sent_at, a.name AS producer_name
+      FROM orders o INNER JOIN agents a ON a.id = o.agent_id
+      WHERE o.id = ?
+    `).get(orderId) as { id: string; agent_id: string; notify_sent_at: string | null; producer_name: string } | undefined;
+    if (!o) return "skipped";
+    if (!o.notify_sent_at) {
+      console.log(`[order-notify] buyer-cancel notice skipped order=${orderId} reason=order_not_sent`);
+      return "skipped";
+    }
+    const recipient = resolveOrderNotificationRecipient(o.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] buyer-cancel notice skipped order=${orderId} agent=${o.agent_id} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const items = db.prepare("SELECT name_snapshot, qty FROM order_items WHERE order_id = ? ORDER BY rowid").all(orderId) as
+      Array<{ name_snapshot: string | null; qty: number | null }>;
+    const orderRef = o.id.slice(0, 8);
+    const allOrdersUrl = `${APP_URL}/eier/${encodeURIComponent(o.agent_id)}/ordrer`;
+    const what = kind === "withdraw"
+      ? `Kunden har trukket bestillingen ${orderRef} før du bekreftet den. Ordren er kansellert, og den teller ikke mot deg. Du trenger ikke gjøre noe.`
+      : `Kunden har avbestilt bestillingen ${orderRef} etter at du bekreftet den. Ordren er kansellert, så du trenger ikke holde av varene.`;
+    const itemLines = items.map((i) => `- ${i.qty ?? "?"} × ${i.name_snapshot || "Vare"}`).join("\n");
+    const textContent = `Hei,\n\n${what}\n\nVarer:\n${itemLines}\n\nSe alle ordrene dine (krever innlogging): ${allOrdersUrl}\n\nHilsen\nRett fra Bonden`;
+    const subject = kind === "withdraw" ? `Kunden har trukket bestillingen (${orderRef})` : `Kunden har avbestilt (${orderRef})`;
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject,
+      htmlContent: `<p>Hei,</p>\n<p>${escHtml(what)}</p>\n<p><a href="${allOrdersUrl}">Se alle ordrene dine</a> (krever innlogging)</p>\n<p>Hilsen<br>Rett fra Bonden</p>`,
+      textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // F8: transactional, not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] buyer-cancel notice sent order=${orderId} agent=${o.agent_id} kind=${kind}`);
+      return "sent";
+    }
+    console.error(`[order-notify] buyer-cancel notice FAILED order=${orderId} agent=${o.agent_id}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] buyer-cancel notice FAILED order=${orderId}:`, err);
+    return "failed";
+  }
+}
+
+/**
+ * Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+ * the producer is told that the BUYER wrote a message on an order (MCP
+ * lokal_order_message or the order card). Same gated recipient
+ * (resolveOrderNotificationRecipient) and the same send path as the order
+ * e-mail, and like sendProducerBuyerCancelNotice only for an order whose
+ * order e-mail reached the producer (notify_sent_at). The mail carries the
+ * message text (escaped) and links to the order: the per-order view of the
+ * order e-mail (no login) and «Mine ordrer» (login), where the producer
+ * answers. No buyer contact data in it: the Reply-To is the platform
+ * address, so a reply never reveals anything new to either side.
+ * Fire-and-forget; never throws; the text is never logged.
+ */
+export async function sendProducerOrderMessageNotice(orderId: string, messageText: string): Promise<OrderNotifyOutcome> {
+  try {
+    const db = _notifyTestDb ?? getDb();
+    const o = db.prepare(`
+      SELECT o.id, o.agent_id, o.notify_sent_at, o.confirm_token, a.name AS producer_name
+      FROM orders o INNER JOIN agents a ON a.id = o.agent_id
+      WHERE o.id = ?
+    `).get(orderId) as { id: string; agent_id: string; notify_sent_at: string | null; confirm_token: string | null; producer_name: string } | undefined;
+    if (!o) return "skipped";
+    if (!o.notify_sent_at) {
+      console.log(`[order-notify] message notice skipped order=${orderId} reason=order_not_sent`);
+      return "skipped";
+    }
+    const recipient = resolveOrderNotificationRecipient(o.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] message notice skipped order=${orderId} agent=${o.agent_id} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const orderRef = o.id.slice(0, 8);
+    const orderUrl = o.confirm_token ? `${APP_URL}/produsent/ordre/${encodeURIComponent(o.confirm_token)}/kompakt` : null;
+    const mineUrl = `${APP_URL}/eier/${encodeURIComponent(o.agent_id)}/ordrer?o=${encodeURIComponent(o.id)}#o-${encodeURIComponent(o.id)}`;
+    const quoted = messageText.split("\n").map((l) => `> ${l}`).join("\n");
+    const textContent =
+      `Hei,\n\nKunden har skrevet en melding om bestillingen ${orderRef}:\n\n${quoted}\n\n` +
+      (orderUrl ? `Se bestillingen: ${orderUrl}\n` : "") +
+      `Svar kunden i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+      `Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det i Mine ordrer.\n\nHilsen\nRett fra Bonden`;
+    const htmlContent =
+      `<p>Hei,</p>\n<p>Kunden har skrevet en melding om bestillingen ${escHtml(orderRef)}:</p>\n` +
+      `<blockquote style="margin:0 0 12px;padding:8px 12px;border-left:3px solid #ccc;white-space:pre-wrap">${escHtml(messageText)}</blockquote>\n` +
+      (orderUrl ? `<p><a href="${escHtml(orderUrl)}">Se bestillingen</a></p>\n` : "") +
+      `<p><a href="${escHtml(mineUrl)}">Svar kunden i Mine ordrer</a> (krever innlogging)</p>\n` +
+      `<p>Ikke svar på denne e-posten. Svaret ditt kommer fram når du skriver det i Mine ordrer.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`;
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject: `Ny melding fra kunden (${orderRef})`,
+      htmlContent,
+      textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // F8: transactional, not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] message notice sent order=${orderId} agent=${o.agent_id}`);
+      return "sent";
+    }
+    console.error(`[order-notify] message notice FAILED order=${orderId} agent=${o.agent_id}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] message notice FAILED order=${orderId}:`, (err as any)?.message ?? "error");
+    return "failed";
+  }
+}

@@ -27,7 +27,13 @@
  *     (traffic-classifier storedClientClass, the session_id for legacy rows),
  *     over the raw retention window (60 days). People are 'human'; the AI
  *     split is AI search only (an assistant fetching the page for a person),
- *     not AI crawlers. No page_view_daily top-up: it counted crawlers and
+ *     not AI crawlers. Since statistikk S2d (dev-request 2026-10-22-
+ *     statistikk-samme-tall-12-mnd) the tiles that match the public producer
+ *     tiles («Sett», all AI search, «Med i AI-søk») also carry a `year` block
+ *     over 12 months / «siden <dato>»: profile-year-compute.ts's stored daily
+ *     sums for the days already pruned + the raw page views read here from
+ *     the raw floor on. Views by source, the AI vendor split and contact
+ *     clicks have no stored per-profile daily sums and stay at 60 days. No page_view_daily top-up: it counted crawlers and
  *     files. Before that, LIKE marker lists counted bingbot/curl/scanners as
  *     people and Googlebot/GPTBot as AI, over 90 days.
  *
@@ -83,16 +89,18 @@
 import type Database from "better-sqlite3";
 import { COUNTABLE_CONV_SQL } from "./a2a-traffic-classifier";
 import { aiVendorBucket, storedClientClass, uaFromSessionId } from "./traffic-classifier";
-import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
+import { computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
+import { computeProfileYear, profileYearRawFrom, type ProfileYear } from "./profile-year-compute";
 import { getRetentionWindowDays } from "./retention-window";
+import { TRAFFIC_YEAR_DAYS } from "./traffic-year-compute";
 
 /** The portal's window: the raw retention (RFB_AUTO_PRUNE_DAYS, 60), as on the public producer page. */
 export function ownerStatsWindowDays(): number {
   return getRetentionWindowDays();
 }
 
-export function cutoffIsoFor(days: number): string {
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+export function cutoffIsoFor(days: number, nowMs: number = Date.now()): string {
+  return new Date(nowMs - days * 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 }
 
 export interface PathViewGroup {
@@ -102,7 +110,10 @@ export interface PathViewGroup {
   source: string | null;
   /** UTC day, YYYY-MM-DD. */
   day: string;
+  /** Page views after `cutoffIso` (the 60-day window). */
   views: number;
+  /** Page views from `opts.yearFromIso` on (the 12-month tiles' raw part); only set when it was asked for. */
+  yearViews?: number;
 }
 
 /**
@@ -114,30 +125,53 @@ export interface PathViewGroup {
  * class recovered from its session_id. Shared by the RFB and gårdssalg owner
  * portals. No per-session velocity check (scrapers): the public producer tile
  * (agent-stats-compute.ts) runs that off-thread.
+ *
+ * With `opts.yearFromIso` the same read also counts each group's views from
+ * that instant on (`yearViews`: the raw part of the 12-month tiles, statistikk
+ * S2d), as agent-stats-compute.ts does for the public tiles. `views` stays
+ * the count after `cutoffIso`; groups with neither are left out.
  */
 export function readPathViewGroups(
   db: Database.Database,
   path: string,
   cutoffIso: string,
-  opts: { vertical?: string } = {},
+  opts: { vertical?: string; yearFromIso?: string } = {},
 ): PathViewGroup[] {
   const cols = new Set((db.prepare("PRAGMA table_info(analytics_page_views)").all() as Array<{ name: string }>).map((c) => c.name));
   const statusOk = cols.has("status_code") ? " AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)" : "";
   const clientClass = cols.has("client_class") ? "MAX(client_class)" : "NULL";
   const source = cols.has("source") ? "source" : "NULL";
   const vertical = opts.vertical ? " AND vertical_id = ?" : "";
-  const rows = db.prepare(`
-    SELECT session_id, ${source} AS source, substr(created_at, 1, 10) AS day,
-           ${clientClass} AS client_class, COUNT(*) AS views
-    FROM analytics_page_views
-    WHERE path = ?${vertical}
-      AND (is_owner IS NULL OR is_owner = 0)
-      AND created_at > ?${statusOk}
-      AND session_id IS NOT NULL
-    GROUP BY session_id, ${source}, day
-  `).all(...(opts.vertical ? [path, opts.vertical] : [path]), cutoffIso) as Array<{
-    session_id: string; source: string | null; day: string; client_class: string | null; views: number;
-  }>;
+  const filterParams = opts.vertical ? [path, opts.vertical] : [path];
+  type Row = { session_id: string; source: string | null; day: string; client_class: string | null; views: number; yearViews?: number };
+  let rows: Row[];
+  if (opts.yearFromIso === undefined) {
+    rows = db.prepare(`
+      SELECT session_id, ${source} AS source, substr(created_at, 1, 10) AS day,
+             ${clientClass} AS client_class, COUNT(*) AS views
+      FROM analytics_page_views
+      WHERE path = ?${vertical}
+        AND (is_owner IS NULL OR is_owner = 0)
+        AND created_at > ?${statusOk}
+        AND session_id IS NOT NULL
+      GROUP BY session_id, ${source}, day
+    `).all(...filterParams, cutoffIso) as Row[];
+  } else {
+    const readFromIso = opts.yearFromIso < cutoffIso ? opts.yearFromIso : cutoffIso;
+    rows = (db.prepare(`
+      SELECT session_id, ${source} AS source, substr(created_at, 1, 10) AS day,
+             ${clientClass} AS client_class,
+             SUM(CASE WHEN created_at > ? THEN 1 ELSE 0 END) AS views,
+             SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS yearViews
+      FROM analytics_page_views
+      WHERE path = ?${vertical}
+        AND (is_owner IS NULL OR is_owner = 0)
+        AND created_at >= ?${statusOk}
+        AND session_id IS NOT NULL
+      GROUP BY session_id, ${source}, day
+    `).all(cutoffIso, opts.yearFromIso, ...filterParams, readFromIso) as Row[])
+      .filter((r) => r.views > 0 || (r.yearViews ?? 0) > 0);
+  }
   const stored = new Map<string, string>();
   for (const r of rows) {
     if (r.client_class && (!stored.has(r.session_id) || r.client_class > stored.get(r.session_id)!)) stored.set(r.session_id, r.client_class);
@@ -148,6 +182,7 @@ export function readPathViewGroups(
     source: r.source,
     day: r.day,
     views: r.views,
+    ...(r.yearViews !== undefined ? { yearViews: r.yearViews } : {}),
   }));
 }
 
@@ -191,11 +226,21 @@ export interface OwnerStats {
   contactClicksByKind: OwnerStatsClickKindCount[];
   funnel: OwnerStatsFunnel;
   /**
-   * «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
-   * the profile was sent to an AI assistant, last AI_DELIVERY_WINDOW_DAYS days
-   * and since counting started, per AI and per channel.
+   * «Med i AI-søk» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
+   * the profile was among the results an AI assistant fetched, per AI and per
+   * channel. `window` is the last 12 months (TRAFFIC_YEAR_DAYS, as the public
+   * tile since statistikk S2c/S2d; it was 60 days), `allTime` since counting
+   * started. The window's label is `year.labels.nb.aiDeliveries`.
    */
   aiDeliveries: { window: AiDeliveries; allTime: AiDeliveries };
+  /**
+   * The tiles that match the public producer tiles over the last 12 months,
+   * or since the first day with data, with their «siste 12 måneder» /
+   * «siden <dato>» labels (profile-year-compute.ts; statistikk S2d). The raw
+   * part is the portal's own read (no velocity check, as the 60-day numbers
+   * here). The 60-day fields above keep their meaning.
+   */
+  year: ProfileYear;
 }
 
 /**
@@ -203,18 +248,27 @@ export interface OwnerStats {
  * views over the window: views by source (total and per day) and the
  * funnel count are people's page views; the AI split is AI search only.
  */
-function getPathViews(db: Database.Database, path: string, windowDays: number): {
+function getPathViews(db: Database.Database, path: string, windowDays: number, nowMs: number, yearFromIso: string): {
   viewsBySource: OwnerStatsViewsBySource;
   aiPlatforms: OwnerStatsAiPlatforms;
   humanViews: number;
+  /** People's page views from `yearFromIso` on (the 12-month raw part). */
+  humanYearRaw: number;
+  /** AI-search page views from `yearFromIso` on (the 12-month raw part). */
+  aiYearRaw: number;
 } {
   const totals: Record<string, number> = {};
   for (const source of PAGE_VIEW_SOURCES) totals[source] = 0;
   const daily = new Map<string, number>();
   const ai = { chatgpt: 0, claude: 0, other: 0 };
   let humanViews = 0;
-  for (const g of readPathViewGroups(db, path, cutoffIsoFor(windowDays))) {
+  let humanYearRaw = 0;
+  let aiYearRaw = 0;
+  for (const g of readPathViewGroups(db, path, cutoffIsoFor(windowDays, nowMs), { yearFromIso })) {
     if (g.cls === "human") {
+      humanYearRaw += g.yearViews ?? 0;
+      // A group with views only before the 60-day cutoff counts in the year only.
+      if (g.views === 0) continue;
       humanViews += g.views;
       // Rows without a known source (legacy) still count, under «unknown», so
       // the totals add up to the funnel's «Sett».
@@ -224,6 +278,7 @@ function getPathViews(db: Database.Database, path: string, windowDays: number): 
       daily.set(key, (daily.get(key) ?? 0) + g.views);
     } else if (g.cls === "ai_search") {
       ai[aiVendorBucket(uaFromSessionId(g.sessionId))] += g.views;
+      aiYearRaw += g.yearViews ?? 0;
     }
   }
   return {
@@ -235,6 +290,8 @@ function getPathViews(db: Database.Database, path: string, windowDays: number): 
     },
     aiPlatforms: { ...ai, total: ai.chatgpt + ai.claude + ai.other },
     humanViews,
+    humanYearRaw,
+    aiYearRaw,
   };
 }
 
@@ -377,9 +434,13 @@ function getFunnel(
  * (see agent-stats.ts's slugify(agent.name) convention — callers must use
  * the same slug derivation).
  */
-export function getOwnerStats(db: Database.Database, agentId: string, path: string): OwnerStats {
+export function getOwnerStats(db: Database.Database, agentId: string, path: string, nowMs: number = Date.now()): OwnerStats {
   const windowDays = ownerStatsWindowDays();
-  const { viewsBySource, aiPlatforms, humanViews } = getPathViews(db, path, windowDays);
+  // The 12-month tiles' raw part starts at the same raw floor as the public
+  // tiles' (profileYearRawFrom); the days before it come from the stored sums.
+  const rawFrom = profileYearRawFrom(db, nowMs);
+  const { viewsBySource, aiPlatforms, humanViews, humanYearRaw, aiYearRaw } =
+    getPathViews(db, path, windowDays, nowMs, `${rawFrom} 00:00:00`);
   const matchingSearchQueries = getMatchingSearchQueries(db, agentId);
   const conversationsByChannel = getConversationsByChannel(db, agentId);
   const contactClicksByKind = getContactClicksByKind(db, agentId, windowDays);
@@ -395,8 +456,9 @@ export function getOwnerStats(db: Database.Database, agentId: string, path: stri
     contactClicksByKind,
     funnel,
     aiDeliveries: {
-      window: computeAiDeliveries(db, "rfb", agentId, AI_DELIVERY_WINDOW_DAYS, Date.now()),
-      allTime: computeAiDeliveries(db, "rfb", agentId, null, Date.now()),
+      window: computeAiDeliveries(db, "rfb", agentId, TRAFFIC_YEAR_DAYS, nowMs),
+      allTime: computeAiDeliveries(db, "rfb", agentId, null, nowMs),
     },
+    year: computeProfileYear(db, agentId, { rawFrom, humanViews: humanYearRaw, aiViews: aiYearRaw }, nowMs),
   };
 }

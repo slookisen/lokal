@@ -86,13 +86,16 @@ import {
 } from "./services/rfb-enrichment-nightly";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
+import adminSecondLineJudgePreviewRoutes from "./routes/admin-second-line-judge-preview";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { parseRoutines, runDispatchTick } from "./routes/admin-loop-dispatch";
 import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
+import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
@@ -525,9 +528,15 @@ app.use("/", agentReadinessRoutes);
 // Magic-link auth + 7-field profile management for producers.
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a: «Mine valg» owner API
+// (GET/PUT /api/owner/:id/features). Same owner session + isVerifiedOwner;
+// 404 for every subject not in OWNER_FEATURES_ALLOWED_SUBJECTS (default empty).
+app.use("/", ownerFeaturesRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
+// Fase B1: the buyer's order card (/ordre/:id?ref=<buyer_ref>), linked from the buyer receipts.
+app.use("/", buyerOrderCardRoutes);
 // dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
 // link landing page (GET/POST /aktiver-bestillinger?t=…).
 app.use("/", orderActivationRoutes);
@@ -949,6 +958,9 @@ app.use("/admin/rfb-marketing-daily-run", adminLimiter, rfbMarketingDailyRunRout
 // services/rfb-enrichment-nightly.ts; the night tick is further down.
 app.use("/admin/rfb-enrichment-nightly", adminLimiter, rfbEnrichmentNightlyRouter);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
+// dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-kontaktuttrekk
+// (skive 1): read-only shadow preview of the second-line judge WITH own-website evidence.
+app.use("/admin/second-line-judge-preview", adminLimiter, adminSecondLineJudgePreviewRoutes);
 app.use("/admin/run-dental-verifier", adminLimiter, adminRunDentalVerifierRoutes);
 // P1 server-migration: deterministic loop watchdog — liveness from the
 // run-ledger; ?alert=1 emails when a watcher is silent.

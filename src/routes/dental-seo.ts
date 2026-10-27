@@ -14,12 +14,15 @@ import {
   getDentalAgentsForSitemap,
   getDentalAggregateLastmods,
   isThinDentalProfile,
+  getDentalVerificationMeta,
 } from "../services/dental-store";
+import type { DentalVerificationMeta } from "../services/dental-store";
 import type { DentalAgent, DentalAgentRow, DentalNamesake, PoststedRow, DentalAggregateLastmods, ListFilter } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
+import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, type TrafficYearKey } from "../services/traffic-year-compute";
 import { analyticsService } from "../services/analytics-service";
 import { filterQueryText } from "../services/search-tracking";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -29,6 +32,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
 const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
+import { coerceProvenanceToArrayShape } from "../services/cross-source-validator";
 // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
 // «Verifisert» on the cards and the profile only when the stored fields meet
 // the rule the badge text describes.
@@ -130,6 +134,7 @@ import { COMPANY_INFO } from "../config/company-info";
 const router = Router();
 
 // The homepage strip's AI explanation (dev-request 2026-10-13-statistikk-riktig-for-investorer, S7).
+const DENTAL_DELIVERIES_EXPLAIN = "Med i AI-søk: ganger en klinikk var blant treffene en AI-assistent (ChatGPT, Claude …) hentet for noen som spurte (søk, sted, profilsiden, MCP eller A2A), summert over alle klinikker. Tallet viser ikke hvor mange som så det.";
 const DENTAL_AI_EXPLAIN = "AI-søk: sider en AI-assistent (ChatGPT, Claude, Perplexity …) hentet fra nettsiden i sanntid fordi noen spurte den, pluss oppslag AI-agenter gjorde i dataene våre via MCP/A2A. AI-crawlere: AI-tjenester som leser og indekserer sidene.";
 
 const DENTAL_BASE_URL =
@@ -1239,6 +1244,25 @@ router.get("/", (_req: Request, res: Response) => {
   let stats = { total: 0, per_fylke: [] as Array<{ fylke: string; count: number }>, helfo_count: 0, chain_count: 0, acute_count: 0, specialist_clinic_count: 0 };
   try { stats = getCachedDentalStats(); } catch { /* dental db may not be ready */ }
   const traffic = getTrafficStats("dental");
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip shows
+  // five equal numbers over the last 12 months, each with «siste 12 måneder»
+  // or «siden <dato>» (traffic-year-compute.ts); the 60-day fields are no
+  // longer shown here.
+  const dentalYear = traffic.year;
+  const dentalYearCell = (key: TrafficYearKey) => trafficYearCell(dentalYear, key, "nb", "nb");
+  const dentalYearNum = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString("nb"));
+  const dentalProofLabels: Record<TrafficYearKey, string> = {
+    humanVisits: "Besøk fra mennesker",
+    humanViews: "Sidevisninger fra mennesker",
+    aiSearch: "AI-søk",
+    aiCrawlerViews: "AI-crawlere",
+    aiDeliveries: "Med i AI-søk",
+  };
+  const dentalProofItems = TRAFFIC_YEAR_KEYS.map((key) => {
+    const c = dentalYearCell(key);
+    const title = key === "aiDeliveries" ? DENTAL_DELIVERIES_EXPLAIN : key === "aiSearch" || key === "aiCrawlerViews" ? DENTAL_AI_EXPLAIN : "";
+    return `      <div data-stat="${key}"${title ? ` title="${title}"` : ""}><div class="proof-val${key === "aiSearch" ? " proof-val-muted" : ""}">${c.value}</div><div class="proof-lbl">${dentalProofLabels[key]}</div>${c.period ? `<div class="proof-period">${c.period}</div>` : ""}</div>`;
+  }).join("\n");
 
   const totalRounded = stats.total > 6000
     ? `over ${Math.floor(stats.total / 100) * 100}`
@@ -1304,13 +1328,11 @@ router.get("/", (_req: Request, res: Response) => {
   </div>
 
   <div class="proof-bar" aria-label="Trafikk">
+    <style>.proof-bar .proof-inner{grid-template-columns:repeat(5,1fr)}@media(max-width:640px){.proof-bar .proof-inner{grid-template-columns:repeat(2,1fr)}}.proof-period{font-size:.7rem;color:var(--g500);margin-top:2px}</style>
     <div class="proof-inner">
-      <div><div class="proof-val">${traffic.humanVisits.toLocaleString("nb")}</div><div class="proof-lbl">Besøk fra mennesker</div></div>
-      <div><div class="proof-val">${traffic.humanViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger fra mennesker</div></div>
-      <div title="${DENTAL_AI_EXPLAIN}"><div class="proof-val proof-val-muted">${traffic.aiSearchTotal.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
-      <div title="${DENTAL_AI_EXPLAIN}"><div class="proof-val">${traffic.aiCrawlerViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-crawlere</div></div>
+${dentalProofItems}
     </div>
-    <div class="proof-note">Sidevisninger siste ${traffic.windowDays} dager: ${traffic.pageViews.toLocaleString("nb")} = mennesker ${traffic.humanViews.toLocaleString("nb")} + AI-assistenter ${traffic.aiSearchViews.toLocaleString("nb")} + AI-crawlere ${traffic.aiCrawlerViews.toLocaleString("nb")} + andre roboter og skript ${traffic.otherBotViews.toLocaleString("nb")}. AI-søk = ${traffic.aiSearchViews.toLocaleString("nb")} sider hentet av AI-assistenter + ${traffic.aiLookups.toLocaleString("nb")} oppslag via MCP/A2A. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. ${DENTAL_AI_EXPLAIN}</div>
+    ${dentalYear ? `<div class="proof-note">Sidevisninger ${dentalYearCell("humanViews").period}: ${dentalYearNum(dentalYear?.pageViews.value)} = mennesker ${dentalYearNum(dentalYear?.humanViews.value)} + AI-assistenter ${dentalYearNum(dentalYear?.aiSearchViews.value)} + AI-crawlere ${dentalYearNum(dentalYear?.aiCrawlerViews.value)} + andre roboter og skript ${dentalYearNum(dentalYear?.otherBotViews.value)}. AI-søk ${dentalYearCell("aiSearch").period} = ${dentalYearNum(dentalYear?.aiSearch.pages)} sider hentet av AI-assistenter + ${dentalYearNum(dentalYear?.aiSearch.lookups)} oppslag via MCP/A2A. Med i AI-søk ${dentalYearCell("aiDeliveries").period}: ganger en klinikk var blant treffene en AI-assistent hentet, summert over alle klinikker. Et besøk er en rekke sidevisninger fra én besøkende uten mer enn 30 minutters pause. Tallene er summer per dag over de siste 12 månedene, eller fra datoen under tallet når tellingen er yngre. ${DENTAL_AI_EXPLAIN}</div>` : ""}
   </div>
 
   <section class="section section-alt">
@@ -1445,6 +1467,10 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     realHumans: s.realHumans,
     botAndAi: s.botAndAi,
     aiQueries: s.aiQueries,
+    // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip's
+    // five numbers over the last 12 months, each with its start date
+    // (since: null = the whole window). The fields above stay 60-day numbers.
+    year: publicTrafficYearBlock(s.year),
   });
 });
 
@@ -1648,6 +1674,125 @@ function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
       item: item.url,
     })),
   };
+}
+
+// ── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon,
+// F2-S3: what was checked, against what and when, from the columns the
+// verifier and the enrichment write (getDentalVerificationMeta) and the
+// stored field_provenance. Page text only: no JSON-LD claim, no JSON field,
+// no DB write. No line for a closed clinic.
+
+const OSLO_DATE = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Oslo", year: "numeric", month: "2-digit", day: "2-digit" });
+
+/**
+ * A stored check date as a calendar day in Norway: a timestamp with a time
+ * is read as UTC unless it names its offset (SQLite's datetime('now') has
+ * none) and is given as the day in Europe/Oslo; a bare date is that day.
+ * null for no date, an impossible one (31.02) or one with a bad time, so
+ * the page shows no date rather than a wrong one. `ms` orders the instants.
+ */
+function dentalCheckDay(value: unknown): { day: string; ms: number } | null {
+  if (typeof value !== "string") return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?/.exec(value.trim());
+  if (!m) return null;
+  const [, ys, mos, ds, hs, mis, ss, zone] = m;
+  const y = Number(ys), mo = Number(mos), d = Number(ds);
+  const calendar = new Date(Date.UTC(y, mo - 1, d));
+  if (calendar.getUTCFullYear() !== y || calendar.getUTCMonth() !== mo - 1 || calendar.getUTCDate() !== d) return null;
+  if (hs === undefined) return { day: `${ds}.${mos}.${ys}`, ms: calendar.getTime() };
+  const h = Number(hs), mi = Number(mis), sec = ss === undefined ? 0 : Number(ss);
+  if (h > 23 || mi > 59 || sec > 59) return null;
+  let offsetMin = 0;
+  if (zone && zone !== "Z") {
+    const z = /^([+-])(\d{2}):?(\d{2})$/.exec(zone)!;
+    offsetMin = (z[1] === "-" ? -1 : 1) * (Number(z[2]) * 60 + Number(z[3]));
+  }
+  const ms = Date.UTC(y, mo - 1, d, h, mi, sec) - offsetMin * 60_000;
+  const parts = Object.fromEntries(OSLO_DATE.formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
+  return { day: `${parts.day}.${parts.month}.${parts.year}`, ms };
+}
+
+/** «dd.mm.åååå» in Europe/Oslo from a stored timestamp; null if none or invalid. */
+export function formatDentalCheckDate(value: unknown): string | null {
+  return dentalCheckDay(value)?.day ?? null;
+}
+
+/**
+ * The sources stored for one field of field_provenance, in either shape: an
+ * array of records, a legacy single record (coerceProvenanceToArrayShape
+ * wraps it), or an object with a `sources` array (stage_v_correction), the
+ * same rule as the akutt claim (dental-acute-claim.ts). [] for anything else.
+ */
+export function dentalFieldSources(
+  fieldProvenance: Record<string, unknown> | null | undefined,
+  field: string
+): Array<Record<string, unknown>> {
+  if (!fieldProvenance || typeof fieldProvenance !== "object" || Array.isArray(fieldProvenance)) return [];
+  const entry = (fieldProvenance as Record<string, unknown>)[field];
+  let list: unknown[];
+  if (entry && typeof entry === "object" && !Array.isArray(entry) && "sources" in entry) {
+    const sources = (entry as { sources?: unknown }).sources;
+    list = Array.isArray(sources) ? sources : [];
+  } else {
+    list = coerceProvenanceToArrayShape({ [field]: entry })[field] ?? [];
+  }
+  // An entry that names no source type, URL or fetch date ({} or blanks) is
+  // no source.
+  const named = (v: unknown) => typeof v === "string" && v.trim() !== "";
+  return list.filter((r): r is Record<string, unknown> =>
+    !!r && typeof r === "object" && !Array.isArray(r) &&
+    (named((r as Record<string, unknown>).source_type) || named((r as Record<string, unknown>).source_url) || named((r as Record<string, unknown>).fetched_at)));
+}
+
+/** The newest fetched_at among a field's sources, as «dd.mm.åååå»; null if none has one. */
+function newestSourceDate(sources: Array<Record<string, unknown>>): string | null {
+  let best: { day: string; ms: number } | null = null;
+  for (const s of sources) {
+    const at = dentalCheckDay(s.fetched_at);
+    if (at && (best === null || at.ms > best.ms)) best = at;
+  }
+  return best?.day ?? null;
+}
+
+/**
+ * The «Kontroll og kilder» box of a clinic profile: the Brønnøysund check
+ * (only brreg_status 'active': the verifier also stamps brreg_checked_at
+ * when the lookup failed, orgnr_not_found_or_unreachable), the website ownership (only 'verified'), «Sist kontrollert», or «Ikke
+ * kontrollert ennå» when none of them is there; then the source of the Helfo
+ * text (only with a stored source, until F2-S6's resolveHelfoClaim) and of
+ * the akutt claim (as resolveAcuteClaim decides). "" for a closed clinic.
+ */
+export function dentalVerificationSection(
+  agent: Pick<DentalAgent, "helfo_agreement" | "acute_vakt" | "field_provenance" | "patient_focus"> & { is_inactive?: number | null },
+  meta: DentalVerificationMeta | null
+): string {
+  if (agent.is_inactive === 1) return "";
+  const lines: string[] = [];
+  const brreg = meta?.brreg_status === "active" ? formatDentalCheckDate(meta.brreg_checked_at) : null;
+  if (brreg) lines.push(`Brønnøysundregistrene kontrollert: ${brreg}`);
+  if (meta?.website_ownership === "verified") {
+    const owned = formatDentalCheckDate(meta.website_ownership_checked_at);
+    lines.push(owned ? `Nettstedet bekreftet som klinikkens eget: ${owned}` : "Nettstedet bekreftet som klinikkens eget");
+  }
+  const verified = formatDentalCheckDate(meta?.last_verified_at);
+  if (verified) lines.push(`Sist kontrollert: ${verified}`);
+  if (lines.length === 0) lines.push("Ikke kontrollert ennå");
+
+  const fp = (agent.field_provenance ?? null) as Record<string, unknown> | null;
+  const helfoSources = agent.helfo_agreement === "true" ? dentalFieldSources(fp, "helfo_agreement") : [];
+  if (helfoSources.length > 0) {
+    const fetched = newestSourceDate(helfoSources);
+    lines.push(`Helfo-direkteoppgjør: tolket automatisk fra klinikkens nettside${fetched ? `, hentet ${fetched}` : ""}`);
+  }
+  const acute = resolveAcuteClaim(agent);
+  if (acute) {
+    const acuteSources = agent.acute_vakt === 1 ? dentalFieldSources(fp, "acute_vakt") : [];
+    const fetched = newestSourceDate(acuteSources.length > 0 ? acuteSources : dentalFieldSources(fp, "patient_focus"));
+    const label = acute === "vakt" ? "Akuttvakt" : ACUTE_ACCEPTS_LABEL;
+    lines.push(`${label}: tolket automatisk fra klinikkens nettside${fetched ? `, hentet ${fetched}` : ""}`);
+  }
+
+  return `<div class="section-box verification-meta"><h2>Kontroll og kilder</h2><ul style="list-style:none;padding:0;font-size:.9rem;color:var(--g700);line-height:1.7">${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul></div>`;
 }
 
 function renderClinicProfile(
@@ -1938,6 +2083,15 @@ function renderClinicProfile(
     }
   }
 
+  // ── F2-S3: what was checked and when (no line for a closed clinic)
+  // A failed read omits the box: no «Ikke kontrollert ennå» we cannot back.
+  let verificationSection = "";
+  if (!inactive) {
+    try {
+      verificationSection = dentalVerificationSection(agent, getDentalVerificationMeta(agent.id));
+    } catch { /* db not ready: no box */ }
+  }
+
   // ── Updated_at disclaimer
   const updatedAt = (agent as any).updated_at;
   const disclaimer = updatedAt
@@ -2051,6 +2205,7 @@ function renderClinicProfile(
     ${mapSection}
     ${relatedSection}
     ${fylkeLink}
+    ${verificationSection}
     ${disclaimer}
   </div>
 </main>`;
@@ -2220,10 +2375,11 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
 router.get("/om", (_req: Request, res: Response) => {
   // F2-S2: «Om plattformen» says what the code does, as the «Verifisert» text
   // on /proveniens: no continuous verification and no «uverifisert» marking
-  // (neither exists), and no claim of how often anything runs. A clinic
-  // without the badge gets no note about the check, but a closed one shows
-  // «Nedlagt» (the profile's header badges), so the text does not say «no
-  // other marking». F2-S8: no manual way to the badge either; it shows only
+  // (neither exists), and no claim of how often anything runs. Since F2-S3
+  // the profile shows what was checked and when, or «Ikke kontrollert ennå»
+  // (dentalVerificationSection), and a closed one shows «Nedlagt» (the
+  // profile's header badges), so the text does not say «no other marking».
+  // F2-S8: no manual way to the badge either; it shows only
   // when the stored fields meet the check's rule (resolveVerifiedClaim).
   const html = `
 <main>
@@ -2248,7 +2404,7 @@ router.get("/om", (_req: Request, res: Response) => {
     <p>Klinikker kan be om oppdatering eller fjerning av sin profil ved å sende e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 5 virkedager.</p>
 
     <h2>Om plattformen</h2>
-    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Klinikker uten merket får ingen merknad om kontrollen. Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
+    <p>Finn-tannlege.com er en del av A2A-agentplattformen. Klinikkdataene hentes fra kildene over av programvare, blant annet KI-modeller som leser klinikkenes nettsider. «Verifisert»-merket vises bare når klinikken oppfyller vilkårene til en regelstyrt kontroll, og kontrollen kjøres i dag manuelt, i små partier. De fleste klinikker er derfor ikke kontrollert ennå. Profilsiden viser hva som er kontrollert og når, eller «Ikke kontrollert ennå». Hvordan kontrollen virker, står på <a href="/proveniens">Metode og kilder</a>.</p>
 
     <p>Søsterplattform: <a href="https://rettfrabonden.com" rel="noopener" target="_blank">rettfrabonden.com</a> — lokal mat direkte fra bønder i Norge.</p>
   </div>

@@ -42,7 +42,7 @@ import {
   type Totals,
   type TrafficGroup,
 } from "./traffic-report";
-import { computeQueryStats, type AiLookups } from "./search-stats-compute";
+import { computeQueryStats, siteSearchCount, type AiLookups } from "./search-stats-compute";
 
 type Db = Database.Database;
 
@@ -100,7 +100,8 @@ export interface HistorySummary extends HistoryItem {
     visitSeconds: number;
     singleViewVisits: number;
   };
-  topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; botViews: number; visitors: number; humanVisitors: number }>;
+  /** aiSearchViews / aiCrawlerViews: absent in rows stored before 2026-10-26 (only aiViews, both summed). */
+  topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; aiSearchViews?: number; aiCrawlerViews?: number; botViews: number; visitors: number; humanVisitors: number }>;
   bots: Array<{ name: string; group: TrafficGroup; cls: SessionCategory; views: number; visitors: number }>;
   searches: SearchCounts & { topTerms: Array<{ query: string; count: number }> };
   /**
@@ -320,10 +321,22 @@ export interface HistoryPeriodRow {
   humanVisits: number;
   humanViews: number;
   views: number;
+  /** @deprecated ai_search + ai_crawler views; admin shows aiSearch and aiCrawlerViews instead. */
   aiViews: number;
+  /** Page views by AI assistants fetching for someone (ai_search). */
+  aiSearchViews: number;
+  /** AI lookups over MCP/A2A in the period; null when not stored (before S0, or raw calls gone). */
+  aiLookups: number | null;
+  /** «AI-søk» = aiSearchViews + aiLookups (lookups counted as 0 when null; see aiLookups). */
+  aiSearch: number;
+  /** Page views by autonomous AI crawlers (ai_crawler). */
+  aiCrawlerViews: number;
   botViews: number;
   visitors: number;
+  /** Every channel, AI assistants included (older readers). */
   searches: number;
+  /** «Søk (nettsider og API)»: web + api only (siteSearchCount). */
+  siteSearches: number;
 }
 
 export interface HistoryView {
@@ -349,12 +362,20 @@ export interface HistoryView {
   /** Mean of the exact monthly unique human visitors over the whole months inside the window; null when none. */
   monthlyHumanVisitors: { average: number; months: string[] } | null;
   searches: SearchCounts;
+  /** «Søk (nettsider og API)» over the window: searches.byChannel web + api (siteSearchCount). */
+  siteSearches: number;
+  /**
+   * AI lookups over MCP/A2A summed over the window's stored days that have
+   * them (S0); firstDay = the first such day, null when none.
+   */
+  aiLookups: { total: number; daysWithData: number; firstDay: string | null };
   /**
    * Lists summed from each day's top list: a page, host, bot or term outside a
    * day's top list is missing from that day, so the sums are lower bounds.
    */
   approximate: {
-    topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; botViews: number }>;
+    /** aiSearchViews / aiCrawlerViews: null when a day in the window has only the summed aiViews. */
+    topPages: Array<{ path: string; views: number; humanViews: number; aiViews: number; aiSearchViews: number | null; aiCrawlerViews: number | null; botViews: number }>;
     referrers: Array<{ host: string; label: string; visits: number }>;
     bots: Array<{ name: string; group: TrafficGroup; cls: SessionCategory; views: number }>;
     topTerms: Array<{ query: string; count: number }>;
@@ -380,6 +401,7 @@ function readSummaries(db: Db, period: HistoryPeriod, vertical: HistoryVertical,
 }
 
 function periodRow(s: HistorySummary, inProgress: boolean): HistoryPeriodRow {
+  const lookups = s.aiLookups && typeof s.aiLookups.total === "number" ? s.aiLookups.total : null;
   return {
     period: s.period,
     start: s.start,
@@ -391,9 +413,14 @@ function periodRow(s: HistorySummary, inProgress: boolean): HistoryPeriodRow {
     humanViews: s.groups.human.views,
     views: s.totals.views,
     aiViews: s.groups.ai_search.views + s.groups.ai_crawler.views,
+    aiSearchViews: s.groups.ai_search.views,
+    aiLookups: lookups,
+    aiSearch: s.groups.ai_search.views + (lookups ?? 0),
+    aiCrawlerViews: s.groups.ai_crawler.views,
     botViews: s.groups.bot.views + s.groups.dev.views,
     visitors: s.totals.visitors,
     searches: s.searches.total,
+    siteSearches: siteSearchCount(s.searches.byChannel),
   };
 }
 
@@ -457,7 +484,8 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
   const owner = { views: 0, cookieViews: 0, scriptViews: 0, unknownViews: 0 };
   const searches: SearchCounts = { total: 0, byChannel: { web: 0, api: 0, mcp: 0, a2a: 0, ai: 0 }, botQueries: 0, ownerQueries: 0 };
   const entry = new Map<string, { key: string; label: string; visits: number }>();
-  const pages = new Map<string, { path: string; views: number; humanViews: number; aiViews: number; botViews: number }>();
+  const pages = new Map<string, { path: string; views: number; humanViews: number; aiViews: number; aiSearchViews: number | null; aiCrawlerViews: number | null; botViews: number }>();
+  const lookups = { total: 0, daysWithData: 0, firstDay: null as string | null };
   const refs = new Map<string, { host: string; label: string; visits: number }>();
   const bots = new Map<string, { name: string; group: TrafficGroup; cls: SessionCategory; views: number }>();
   const terms = new Map<string, { query: string; count: number }>();
@@ -507,9 +535,18 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
       x.visits += e.visits; entry.set(e.key, x);
     }
     for (const p of s.topPages) {
-      const x = pages.get(p.path) ?? { path: p.path, views: 0, humanViews: 0, aiViews: 0, botViews: 0 };
+      const x = pages.get(p.path) ?? { path: p.path, views: 0, humanViews: 0, aiViews: 0, aiSearchViews: 0, aiCrawlerViews: 0, botViews: 0 };
       x.views += p.views; x.humanViews += p.humanViews; x.aiViews += p.aiViews; x.botViews += p.botViews;
+      // Rows stored before the split only have the sum: the split becomes unknown.
+      const split = typeof p.aiSearchViews === "number" && typeof p.aiCrawlerViews === "number";
+      x.aiSearchViews = split && x.aiSearchViews !== null ? x.aiSearchViews + (p.aiSearchViews as number) : null;
+      x.aiCrawlerViews = split && x.aiCrawlerViews !== null ? x.aiCrawlerViews + (p.aiCrawlerViews as number) : null;
       pages.set(p.path, x);
+    }
+    if (s.aiLookups && typeof s.aiLookups.total === "number") {
+      lookups.total += s.aiLookups.total;
+      lookups.daysWithData += 1;
+      if (lookups.firstDay === null || s.start < lookups.firstDay) lookups.firstDay = s.start;
     }
     for (const r of s.human.referrers) {
       const x = refs.get(r.host) ?? { host: r.host, label: r.label, visits: 0 };
@@ -568,6 +605,8 @@ export function computeHistoryView(db: Db, days: number | null, vertical: Histor
     },
     monthlyHumanVisitors,
     searches,
+    siteSearches: siteSearchCount(searches.byChannel),
+    aiLookups: lookups,
     approximate: {
       topPages: topN(pages, (p) => p.views, 50),
       referrers: topN(refs, (r) => r.visits, 30),

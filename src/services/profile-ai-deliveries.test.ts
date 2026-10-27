@@ -244,26 +244,26 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
       assertTrue(human.body.includes('data-stat="aiDeliveries"'), "(d) the page has the «Med i AI-søk» tile");
       assertTrue(human.body.includes("<small>Med i AI-søk<br>"), "(d) tile label «Med i AI-søk»");
       assertTrue(!human.body.includes("Med i AI-svar"), "(d) the old name «Med i AI-svar» is gone");
-      assertTrue(human.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 60 d"), "(d) tile subtitle, a full window after the counting started");
+      assertTrue(human.body.includes("ganger profilen var blant treffene en AI-assistent hentet &middot; siste 12 måneder"), "(d) tile subtitle, a full window after the counting started (statistikk S2c: 12 months)");
       assertTrue(human.body.includes("Tallet viser ikke hvor mange som så den."), "(d) help text: it does not show how many saw it");
-      assertTrue(human.body.includes("s.aiDeliveries"), "(d) the tile is filled from /api/agents/:id/stats aiDeliveries");
-      assertTrue(human.body.includes("d.total > 0 || partial"), "(d) the tile also shows at 0 while the counting is younger than the window");
-      assertTrue(human.body.includes('"Fra "') && human.body.includes('"ganger profilen var blant treffene en AI-assistent hentet · siden "'), "(d) at 0 it shows «Fra <dato>»; in the first window «siden <dato>»");
+      assertTrue(human.body.includes("var d = y.aiDeliveries;"), "(d) the tile is filled from /api/agents/:id/stats year.aiDeliveries (S2c)");
+      assertTrue(human.body.includes("d.value > 0 || partial"), "(d) the tile also shows at 0 while the counting is younger than the window");
+      assertTrue(human.body.includes("textContent = cap(lb.aiDeliveries)") && human.body.includes('"ganger profilen var blant treffene en AI-assistent hentet · " + lb.aiDeliveries'), "(d) at 0 it shows «Siden <dato>»; in the first window «siden <dato>»");
       assertTrue(human.body.includes('"nb-NO"'), "(d) Norwegian date format on the Norwegian page");
       assertTrue(!human.body.includes("${"), "(d) rendered HTML has no literal ${");
       assertTrue(!/vist i ChatGPT/i.test(human.body), "(d) never «vist i ChatGPT»");
       const en = invoke("/produsent/:slug", "/en/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, lang: "en", ip: "198.51.100.21" });
       assertTrue(en.body.includes("<small>In AI searches<br>") && !en.body.includes("${"), "(d) English tile «In AI searches» renders without ${");
-      assertTrue(en.body.includes("times the profile was among the results an AI assistant fetched &middot; last 60 d"), "(d) English subtitle");
+      assertTrue(en.body.includes("times the profile was among the results an AI assistant fetched &middot; last 12 months"), "(d) English subtitle");
       process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = compute.utcDay(Date.now());
       const freshNb = invoke("/produsent/:slug", "/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, ip: "198.51.100.22" });
       const freshEn = invoke("/produsent/:slug", "/en/produsent/aker-gaard-en", HUMAN, { params: { slug: "aker-gaard-en" }, lang: "en", ip: "198.51.100.23" });
-      const nbSince = new Date().toLocaleDateString("nb-NO", { day: "numeric", month: "short", timeZone: "UTC" });
-      const enSince = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+      const nbSince = new Date().toLocaleDateString("nb-NO", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+      const enSince = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
       assertTrue(freshNb.body.includes(`ganger profilen var blant treffene en AI-assistent hentet &middot; siden ${nbSince}`), "(d) S1: «siden <dato>» shows the configured start day");
       assertTrue(freshEn.body.includes(`times the profile was among the results an AI assistant fetched &middot; since ${enSince}`), "(d) S1: English «since <date>»");
       process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
-      assertTrue(en.body.includes('"Since "') && en.body.includes('"en-GB"'), "(d) English: «Since <date>», English date format");
+      assertTrue(en.body.includes('y.labels["en"]') && en.body.includes('"en-GB"'), "(d) English: the English labels, English number format");
       // Every inline script on the page must compile: a "\n" written without the
       // template-literal escape becomes a raw newline inside a JS string.
       for (const [lang, body] of [["no", human.body], ["en", en.body]] as const) {
@@ -369,7 +369,7 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
 
       const { getOwnerStats } = require("./owner-stats-service") as typeof import("./owner-stats-service");
       const o = getOwnerStats(db as any, "p-1", "/produsent/aker-gaard-en");
-      assertEq(o.aiDeliveries.window.total, 7, "(g) owner stats: 60 d");
+      assertEq(`${o.aiDeliveries.window.windowDays}:${o.aiDeliveries.window.total}`, "365:11", "(g) owner stats: 12 months since statistikk S2d (the 90-day-old row counts)");
       assertEq(o.aiDeliveries.allTime.total, 11, "(g) owner stats: whole period");
       assertEq(o.aiDeliveries.allTime.byChannel.a2a, 4, "(g) owner stats: whole period per channel");
 

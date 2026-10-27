@@ -20,6 +20,9 @@ import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision"
 // geocoding-service.ts (→ database/init) would have. Aliased to the old local
 // name so every call site below reads exactly as it did.
 import { haversineDistanceKm as haversine, toRadians as toRad } from "./geo-distance";
+// Fase B3 (mine ordrer): the order-task skill and method list for the card,
+// behind ORDER_AGENT_ACTIONS_ENABLED. Pure apart from the env switch.
+import { managePickupOrderSkill, rfbJsonRpcMethods, isOrderAgentActionsEnabled } from "./order-a2a-card";
 import {
   assertEnrichmentWriteAllowedOrThrow,
   normalizeEnrichmentVertical,
@@ -36,7 +39,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql } from "./agent-visibility";
+import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, ownerPauseEnabled, readOwnerPauseRow } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -1467,7 +1470,7 @@ class MarketplaceRegistry {
         {
           type: "json-rpc",
           url: `${baseUrl}/a2a`,
-          methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"],
+          methods: rfbJsonRpcMethods(),
           description: "A2A JSON-RPC 2.0 endpoint for agent-to-agent communication",
         },
         {
@@ -1547,6 +1550,8 @@ class MarketplaceRegistry {
             "finn billig honning nær Trondheim",
           ],
         },
+        // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
+        ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
       ],
 
       // ─── Security ──────────────────────────────────────────
@@ -1665,11 +1670,15 @@ class MarketplaceRegistry {
   // public by-id lookups (card/info/vcard/trust, /api/agents/:id/stats, the
   // marketing lane). The order flow never goes through here — it uses
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
-  isQuarantinedFromPublicView(agentId: string): boolean {
+  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean } = {}): boolean {
     const db = getDb();
-    const row = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
+    const found = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
       { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
-    if (!row) return false;
+    if (!found) return false;
+    // S1b punkt 6: the owner-pause table is read only with OWNER_PAUSE_ENABLED on.
+    // ignoreOwnerPause: the owner's own authenticated read (/selger editor via
+    // /agents/:id/info + X-Claim-Token) skips ONLY the pause, nothing else.
+    const row = ownerPauseEnabled() && !opts.ignoreOwnerPause ? { ...found, ...readOwnerPauseRow(db, agentId) } : found;
     // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
     // flag off = the quarantine rule this method has always applied; flag
     // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.
