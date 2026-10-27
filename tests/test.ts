@@ -26903,7 +26903,8 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     // that trailing arg too.
     const fs = require("fs");
     const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf8");
-    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)\)/g) || []).length;
+    // S2c-1 (owner choices) adds an optional trailing { hidePrices } argument.
+    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)(,\s*\{ hidePrices: [^}]+\})?\)/g) || []).length;
     assertEq(wiredCalls, 2, `pid-17: both MCP product call sites (lokal_info + lokal_search) wire the catalog id map AND the supply-graph availability map (got ${wiredCalls})`);
   } catch (err) {
     failed++;
