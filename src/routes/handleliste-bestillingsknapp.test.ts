@@ -259,6 +259,17 @@ export async function runHandelisteBestillingsknappTests(opts: { log?: boolean }
     addProd("bk-p-n2", "bk-noclaim", "Poteter");
     addAgent("bk-many", "Mangevaregarden");
     for (let i = 0; i < 11; i++) addProd(`bk-m-${String(i).padStart(2, "0")}`, "bk-many", `Vare ${String(i).padStart(2, "0")}`);
+    // Eligible, but nothing orderable (sold out / unconfirmed / label only).
+    addAgent("bk-empty", "Tomhyllegarden");
+    addProd("bk-e-out", "bk-empty", "Utsolgte poteter", { availability: "out_of_stock" });
+    addProd("bk-e-scr", "bk-empty", "Skrapte gulrøtter", { source: "enrichment" });
+    // Eligible with orderable rows, but not publicly visible by id.
+    addAgent("bk-hidden", "Skjultgarden");
+    addProd("bk-h-pot", "bk-hidden", "Poteter");
+    db.prepare("UPDATE agents SET catalog_hidden = 1 WHERE id = 'bk-hidden'").run();
+    addAgent("bk-unvetted", "Uvettetgarden");
+    addProd("bk-u-pot", "bk-unvetted", "Poteter");
+    db.prepare("UPDATE agents SET origin = 'self_registered', is_vetted = 0 WHERE id = 'bk-unvetted'").run();
     clearRegistryCaches();
 
     const ELIG_SLUG = slugify("Bestillingsgarden");
@@ -274,6 +285,11 @@ export async function runHandelisteBestillingsknappTests(opts: { log?: boolean }
     assertTrue(cartSvc.isEligibleForRealOrder("bk-elig", db), "fixture: bk-elig passes isEligibleForRealOrder");
     assertTrue(!cartSvc.isEligibleForRealOrder("bk-noopt", db), "fixture: bk-noopt (not opted in) fails the gate");
     assertTrue(!cartSvc.isEligibleForRealOrder("bk-noclaim", db), "fixture: bk-noclaim (not owner-claimed) fails the gate");
+    assertTrue(cartSvc.isEligibleForRealOrder("bk-empty", db), "fixture: bk-empty passes isEligibleForRealOrder");
+    assertEq(offersSvc.findProducerOrderables("bk-empty", { db, limit: 8 }), null, "fixture: bk-empty has no orderable product");
+    for (const id of ["bk-hidden", "bk-unvetted"]) {
+      assertTrue((offersSvc.findProducerOrderables(id, { db, limit: 8 })?.offers || []).length === 1, `fixture: ${id} has an orderable product (only visibility hides it)`);
+    }
 
     // ═══════════ producer page: flag off → no button, CTA unchanged ═══════════
     delete process.env.HANDLELISTE_ENABLED;
@@ -312,6 +328,12 @@ export async function runHandelisteBestillingsknappTests(opts: { log?: boolean }
         assertTrue(!q.html.includes("Bestill for henting") && !q.html.includes("?produsent=") && !q.html.includes("data-order-cta"), `page/flag-on: no button for a ${label} producer`);
         assertTrue((ctActions(q.html) || "").startsWith("\n"), `page/flag-on: ${label} producer keeps the unchanged contact CTA`);
       }
+
+      // Eligible but zero orderable products: the button would pre-fill nothing.
+      const empty = await producerPage(slugify("Tomhyllegarden"));
+      assertEq(empty.status, 200, "page/flag-on: eligible producer without orderable products renders");
+      assertTrue(!empty.html.includes("data-order-cta") && !empty.html.includes("?produsent="), "page/flag-on: no button when no product is orderable");
+      assertTrue((ctActions(empty.html) || "").startsWith("\n"), "page/flag-on: no-orderables producer keeps the unchanged contact CTA");
 
       // Per request: the producer leaves the gate → the very next render has no button.
       db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'bk-elig'").run();
@@ -387,6 +409,17 @@ export async function runHandelisteBestillingsknappTests(opts: { log?: boolean }
         assertEq(g.status, 200, `${label}: 200`);
         assertTrue(g.html === plain.html, `${label}: byte-identical to plain /handleliste`);
         if (query && typeof query.produsent === "string") assertTrue(!g.html.includes(query.produsent), `${label}: value not reflected`);
+      }
+
+      // Not publicly visible by id (hidden test fixture, unvetted self-registered):
+      // ignored exactly like an unknown id — no preselect, no note, no name.
+      for (const [id, name] of [["bk-hidden", "Skjultgarden"], ["bk-unvetted", "Uvettetgarden"]] as const) {
+        const g = await hl(`/handleliste?produsent=${id}`);
+        assertEq(g.status, 200, `hl/not-visible ${id}: 200`);
+        const cg = copyOf(g.html);
+        assertTrue(!("__preselect" in cg) && !("__preselect_note" in cg), `hl/not-visible ${id}: no preselect, no note`);
+        assertTrue(!g.html.includes(name), `hl/not-visible ${id}: producer name not in the page`);
+        assertTrue(g.html === plain.html, `hl/not-visible ${id}: byte-identical to plain /handleliste`);
       }
 
       // Flag off: still the normal 404, with or without the parameter.

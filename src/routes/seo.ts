@@ -59,14 +59,13 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, failsProducerRoleGate, ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
 import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay, producerPageProductNodes } from "../services/structured-data-policy";
 import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN, HANDELISTE_MAX_ITEMS, handelisteOrderHref, ORDER_BUTTON_LABEL } from "./handleliste-page";
 import { findProducerOrderables } from "../services/catalog-offers";
-import { isEligibleForRealOrder } from "../services/cart-service";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
 import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
@@ -4150,10 +4149,13 @@ router.get([HANDELISTE_PATH_NO, HANDELISTE_PATH_EN], (req: Request, res: Respons
   try {
     // Skive 3: ?produsent=<agent_id> (from «Bestill for henting» on
     // /produsent/:slug) pre-fills the producer's orderable products. A
-    // missing, malformed, unknown or ineligible id is ignored silently:
-    // findProducerOrderables() returns null and the page is as before.
+    // missing, malformed, unknown, ineligible or not publicly visible id is
+    // ignored silently: no preselect and the page is as before. The
+    // visibility check («gated», like /agents/:id/card) keeps the hidden test
+    // fixture and unvetted self-registered rows out of anyone's reach by UUID.
     const rawProducer = req.query.produsent;
     const orderables = typeof rawProducer === "string" && rawProducer
+      && isAgentIdPubliclyVisible(getDb(), rawProducer, { surface: "gated" })
       ? findProducerOrderables(rawProducer, { limit: HANDELISTE_MAX_ITEMS })
       : null;
     const page = buildHandelistePage(lang, orderables ? { producer_name: orderables.producer.name, offers: orderables.offers } : null);
@@ -6441,7 +6443,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Skive 3 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-
     // handel): «Bestill for henting» → /handleliste?produsent=<id>, only when
     // HANDLELISTE_ENABLED is on AND the producer passes the ONE real-order gate
-    // (cart-service.isEligibleForRealOrder, the same one submit uses). Both are
+    // (cart-service.isEligibleForRealOrder, the same one submit uses) AND has at
+    // least one orderable product — the very list the link pre-fills
+    // (findProducerOrderables, which applies that gate itself). Both are
     // evaluated per request (the page sets no shared-cache header; Express's
     // ETag is over the body, so it follows the button). Empty string otherwise,
     // so every other producer's contact CTA is byte-identical; a gate error
@@ -6450,7 +6454,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (isHandelisteEnabled()) {
       let canOrder = false;
       try {
-        canOrder = isEligibleForRealOrder(agent.id, getDb());
+        canOrder = findProducerOrderables(agent.id, { limit: 1 }) !== null;
       } catch (e) {
         console.error(`[seo] /produsent/${slug} real-order gate failed:`, e);
       }
