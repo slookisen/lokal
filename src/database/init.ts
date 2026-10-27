@@ -5407,6 +5407,48 @@ function initSchema(db: Database.Database): void {
     console.error("Migration owner_order_email_change failed:", err);
   }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2a ───────────────
+  // «Mine valg» owner feature settings + change log (owner-features/).
+  // owner_feature_settings holds ONLY explicit choices; everything else falls
+  // back to the registry default, so a changed default never changes a stored
+  // choice. Keyed on (vertical, subject_id): vertical 'rfb' → subject_id =
+  // agents.id (gårdssalg reuses it with experience_providers.id). Entries with
+  // a storage adapter (orders.enabled ↔ agents.order_notifications_opt_in)
+  // never get a row here — the column stays the source of truth.
+  // admin_locked = 1 (set_by 'admin') overrides the owner. value_json /
+  // old_json / new_json are JSON; set_at / at are ISO-8601
+  // (Date#toISOString). owner_feature_audit gets exactly one row per change,
+  // adapter writes included. Additive, brand-new tables.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_settings (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        set_by TEXT NOT NULL CHECK (set_by IN ('owner','admin','cs','system')),
+        admin_locked INTEGER NOT NULL DEFAULT 0,
+        set_at TEXT NOT NULL,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+      CREATE TABLE IF NOT EXISTS owner_feature_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        old_json TEXT,
+        new_json TEXT,
+        actor TEXT NOT NULL,
+        actor_detail TEXT,
+        at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_audit_subject
+        ON owner_feature_audit(vertical, subject_id, at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_settings/owner_feature_audit failed:", err);
+  }
+
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
   // outreach_daily_send_cap: one row per UTC calendar day, holding an

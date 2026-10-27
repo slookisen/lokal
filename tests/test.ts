@@ -50357,6 +50357,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a: «Mine valg» registry,
+// owner_feature_settings/_audit, resolveOwnerFeatures/featureOn and the owner
+// API (GET/PUT /api/owner/:id/features) behind OWNER_FEATURES_ALLOWED_SUBJECTS.
+// Swaps the getDb() singleton and env vars (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a: Mine valg register + API ──");
+  try {
+    const { runOwnerFeaturesS2aTests } = require("../src/routes/owner-features-s2a.test") as
+      typeof import("../src/routes/owner-features-s2a.test");
+    const r = await runOwnerFeaturesS2aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2a: " + f);
+    console.log(`  owner-features-s2a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2a: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
