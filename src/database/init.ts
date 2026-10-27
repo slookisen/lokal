@@ -5457,7 +5457,8 @@ function initSchema(db: Database.Database): void {
   // 'undo'). The audit rows it wrote are the contiguous id range
   // first_audit_id..last_audit_id (written in one transaction). «Angre»
   // reverts the newest batch as one unit and stamps undone_at /
-  // undone_by_batch. owner_feature_intro: the first-login card («Nyheter og
+  // undone_by_batch; new_row_keys (JSON array) lists the settings rows the
+  // batch created, which an undo removes again. owner_feature_intro: the first-login card («Nyheter og
   // tips», ja/nei) — one row once answered, so the card shows only until then.
   // Times are ISO-8601 (Date#toISOString).
   try {
@@ -5473,7 +5474,8 @@ function initSchema(db: Database.Database): void {
         actor_detail TEXT,
         created_at TEXT NOT NULL,
         undone_at TEXT,
-        undone_by_batch INTEGER
+        undone_by_batch INTEGER,
+        new_row_keys TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_owner_feature_change_batch_subject
         ON owner_feature_change_batch(vertical, subject_id, id);

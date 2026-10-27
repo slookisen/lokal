@@ -126,7 +126,16 @@ export interface OwnerLevelPreview {
   skipped: Array<{ key: string; reason: LocalizedText }>;
 }
 
-/** What choosing a level would change (read-only; the confirm panel). */
+class PreviewRollback extends Error {
+  constructor(readonly out: ApplyOwnerLevelResult) { super("preview rollback"); }
+}
+
+/**
+ * What choosing a level would change (the confirm panel). Runs the real
+ * applyOwnerLevel inside a transaction that is always rolled back, so the
+ * preview equals what a confirmed apply does (requirements switched on
+ * earlier in the same preset included). Nothing is kept.
+ */
 export function previewOwnerLevel(
   vertical: OwnerFeatureVertical,
   subjectId: string,
@@ -136,21 +145,25 @@ export function previewOwnerLevel(
   const level = findOwnerLevel(levelKey);
   if (!level) return null;
   const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
-  const resolved = resolveOwnerFeatures(vertical, subjectId, { ...opts, registry });
-  const changes: OwnerLevelPreview["changes"] = [];
-  const skipped: OwnerLevelPreview["skipped"] = [];
-  for (const [e, to] of liveLevelValues(level, registry)) {
-    const r = resolved.byKey[e.key];
-    if (!r || sameValue(r.value, to)) continue;
-    if (!r.changeable && r.block !== "requirement_not_met") {
-      skipped.push({ key: e.key, reason: r.reason ?? { no: "Kan ikke endres nå.", en: "Cannot be changed now." } });
-    } else if (r.block === "requirement_not_met" && to !== false) {
-      skipped.push({ key: e.key, reason: r.reason ?? { no: "Et krav er ikke oppfylt.", en: "A requirement is not met." } });
-    } else {
-      changes.push({ key: e.key, from: r.value, to });
-    }
+  const db = opts.db ?? getDb();
+  const o = { ...opts, db, registry };
+  const before = resolveOwnerFeatures(vertical, subjectId, o);
+  let out: ApplyOwnerLevelResult | null = null;
+  try {
+    db.transaction(() => {
+      throw new PreviewRollback(applyOwnerLevel(vertical, subjectId, level.key, { actor: "system", detail: "preview" }, o));
+    })();
+  } catch (e) {
+    if (!(e instanceof PreviewRollback)) throw e;
+    out = e.out;
   }
-  return { level, changes, skipped };
+  if (!out || out.kind !== "ok") return { level, changes: [], skipped: [] };
+  const target = new Map(level.values);
+  return {
+    level,
+    changes: out.changed.map((key) => ({ key, from: before.byKey[key]?.value ?? null, to: target.get(key) ?? null })),
+    skipped: out.skipped,
+  };
 }
 
 /**
@@ -199,6 +212,8 @@ export interface OwnerChangeBatch {
   created_at: string;
   undone_at: string | null;
   undone_by_batch: number | null;
+  /** JSON array: keys that had no owner_feature_settings row before this batch. */
+  new_row_keys: string | null;
 }
 
 function maxAuditId(db: any): number {
@@ -206,7 +221,19 @@ function maxAuditId(db: any): number {
   return Number(row.m) || 0;
 }
 
-/** Records the audit rows written for this subject after `beforeId` as one batch. */
+/** Keys that have an owner_feature_settings row for this subject now. */
+function explicitRowKeys(db: any, vertical: string, subjectId: string): Set<string> {
+  const rows = db
+    .prepare(`SELECT key FROM owner_feature_settings WHERE vertical = ? AND subject_id = ?`)
+    .all(vertical, subjectId) as Array<{ key: string }>;
+  return new Set(rows.map((r) => r.key));
+}
+
+/**
+ * Records the audit rows written for this subject after `beforeId` as one
+ * batch. `priorRows` (the settings rows before the change) lets «Angre»
+ * remove a row the change created instead of storing the default explicitly.
+ */
 function recordBatch(
   db: any,
   vertical: string,
@@ -215,6 +242,7 @@ function recordBatch(
   kind: OwnerChangeBatch["kind"],
   level: string | null,
   actor: OwnerActor,
+  priorRows: Set<string> | null = null,
 ): number | null {
   const range = db
     .prepare(
@@ -223,13 +251,19 @@ function recordBatch(
     )
     .get(vertical, subjectId, beforeId) as { lo: number | null; hi: number | null; n: number };
   if (!range.n || range.lo == null || range.hi == null) return null;
+  let newRowKeys: string | null = null;
+  if (priorRows) {
+    const now = explicitRowKeys(db, vertical, subjectId);
+    const created = [...now].filter((k) => !priorRows.has(k));
+    newRowKeys = JSON.stringify(created);
+  }
   const info = db
     .prepare(
       `INSERT INTO owner_feature_change_batch
-         (vertical, subject_id, kind, level, first_audit_id, last_audit_id, actor_detail, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (vertical, subject_id, kind, level, first_audit_id, last_audit_id, actor_detail, created_at, new_row_keys)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(vertical, subjectId, kind, level, range.lo, range.hi, actor.detail ?? null, new Date().toISOString());
+    .run(vertical, subjectId, kind, level, range.lo, range.hi, actor.detail ?? null, new Date().toISOString(), newRowKeys);
   return Number(info.lastInsertRowid);
 }
 
@@ -274,8 +308,9 @@ export function applyOwnerSingleChange(
   const o = { ...opts, db };
   return db.transaction(() => {
     const before = maxAuditId(db);
+    const prior = explicitRowKeys(db, vertical, subjectId);
     const result = setOwnerFeatureValue(vertical, subjectId, key, value, actor, o);
-    const batchId = result.kind === "ok" && result.changed ? recordBatch(db, vertical, subjectId, before, "single", null, actor) : null;
+    const batchId = result.kind === "ok" && result.changed ? recordBatch(db, vertical, subjectId, before, "single", null, actor, prior) : null;
     return { result, batchId };
   })();
 }
@@ -313,9 +348,15 @@ export function applyOwnerLevel(
   const o = { ...opts, db, registry };
   return db.transaction((): ApplyOwnerLevelResult => {
     const before = maxAuditId(db);
+    const prior = explicitRowKeys(db, vertical, subjectId);
     const changed: string[] = [];
     const skipped: Array<{ key: string; reason: LocalizedText }> = [];
     for (const [e, value] of liveLevelValues(level, registry)) {
+      // Locked at the level's value already: nothing to do, nothing to report.
+      // (A key that is off only because a requirement is off still gets the
+      // explicit off, so it stays off when the requirement comes back.)
+      const now = resolveOwnerFeatures(vertical, subjectId, o).byKey[e.key];
+      if (now && sameValue(now.value, value) && !now.changeable && now.block !== "requirement_not_met") continue;
       const out = setOwnerFeatureValue(vertical, subjectId, e.key, value, actor, o);
       if (out.kind === "not_found") return { kind: "not_found" };
       if (out.kind === "ok") {
@@ -324,7 +365,7 @@ export function applyOwnerLevel(
         skipped.push({ key: e.key, reason: out.reason });
       }
     }
-    const batchId = changed.length ? recordBatch(db, vertical, subjectId, before, "level", level.key, actor) : null;
+    const batchId = changed.length ? recordBatch(db, vertical, subjectId, before, "level", level.key, actor, prior) : null;
     return { kind: "ok", level, batchId, changed, skipped };
   })();
 }
@@ -342,8 +383,11 @@ class UndoAbort extends Error {
 }
 
 /**
- * Reverts batch `batchId` as one unit, newest audit row first, through
- * setOwnerFeatureValue (so each revert writes its own audit row). Only the
+ * Reverts batch `batchId` as one unit through setOwnerFeatureValue (so each
+ * revert writes its own audit row). Reverts run newest first and are retried
+ * until no more succeed, so a key whose requirement is restored later in the
+ * same batch is reverted after it (in either direction). A settings row the
+ * batch created is removed again (only explicit choices are stored). Only the
  * newest batch can be undone, and only while none of its keys has changed
  * since (a later audit row, or a column changed outside the page) — then
  * nothing is written. All or nothing: one transaction.
@@ -385,12 +429,32 @@ export function undoOwnerChange(
       }
 
       const before = maxAuditId(db);
-      for (const r of rows) {
-        let oldValue: OwnerFeatureValue = null;
-        try { oldValue = r.old_json == null ? null : JSON.parse(r.old_json); } catch { throw new UndoAbort({ kind: "changed_since", key: r.key }); }
-        const out = setOwnerFeatureValue(vertical, subjectId, r.key, oldValue, actor, o);
-        if (out.kind === "blocked" || out.kind === "invalid_value") throw new UndoAbort({ kind: "blocked", key: r.key, reason: out.reason });
-        if (out.kind !== "ok") throw new UndoAbort({ kind: "not_undoable" });
+      let pending = rows;
+      while (pending.length) {
+        const next: typeof rows = [];
+        let lastBlock: UndoOwnerChangeResult | null = null;
+        for (const r of pending) {
+          let oldValue: OwnerFeatureValue = null;
+          try { oldValue = r.old_json == null ? null : JSON.parse(r.old_json); } catch { throw new UndoAbort({ kind: "changed_since", key: r.key }); }
+          const out = setOwnerFeatureValue(vertical, subjectId, r.key, oldValue, actor, o);
+          if (out.kind === "ok") continue;
+          if (out.kind === "blocked" || out.kind === "invalid_value") {
+            next.push(r);
+            lastBlock = { kind: "blocked", key: r.key, reason: out.reason };
+            continue;
+          }
+          throw new UndoAbort({ kind: "not_undoable" });
+        }
+        if (next.length === pending.length) throw new UndoAbort(lastBlock ?? { kind: "not_undoable" });
+        pending = next;
+      }
+      // Rows this batch created go away again (owner rows only, never an admin lock).
+      let created: string[] = [];
+      try { created = batch.new_row_keys ? JSON.parse(batch.new_row_keys) : []; } catch { created = []; }
+      for (const k of Array.isArray(created) ? created : []) {
+        if (!seen.has(k)) continue;
+        db.prepare(`DELETE FROM owner_feature_settings WHERE vertical = ? AND subject_id = ? AND key = ? AND admin_locked = 0 AND set_by = 'owner'`)
+          .run(vertical, subjectId, k);
       }
       const undoBatch = recordBatch(db, vertical, subjectId, before, "undo", batch.level, actor);
       db.prepare(`UPDATE owner_feature_change_batch SET undone_at = ?, undone_by_batch = ? WHERE id = ?`)
@@ -499,9 +563,10 @@ export function answerOwnerIntro(
     const e = findOwnerFeature(OWNER_INTRO_KEY, registry);
     if (!e || e.status !== "live") return { kind: "ok" as const, stored: true, applied: false, batchId: null };
     const before = maxAuditId(db);
+    const prior = explicitRowKeys(db, vertical, subjectId);
     const out = setOwnerFeatureValue(vertical, subjectId, OWNER_INTRO_KEY, answer === "yes", actor, o);
     const applied = out.kind === "ok" && out.changed;
-    const batchId = applied ? recordBatch(db, vertical, subjectId, before, "single", null, actor) : null;
+    const batchId = applied ? recordBatch(db, vertical, subjectId, before, "single", null, actor, prior) : null;
     return { kind: "ok" as const, stored: true, applied, batchId };
   })();
 }

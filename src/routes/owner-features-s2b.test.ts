@@ -256,6 +256,9 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     // ── Portal card with allowlist on ────────────────────────────────────────
     const portalOn = html(await portal(OWNED_ID));
     assertTrue(portalOn.includes(`href="/eier/${OWNED_ID}/valg"`) && portalOn.includes("Mine valg"), "allowlist on: portal links to «Mine valg»");
+    const portalEm = await portal(EMAILMATCH_ID);
+    assertEq([portalEm.status, html(portalEm).includes(`id="mine-valg"`), html(portalEm).includes(`/eier/${EMAILMATCH_ID}/valg`)], [200, false, false],
+      "allowlist on: e-mail-match session (portal reachable, gate flag off) gets no «Mine valg» card — needs isVerifiedOwner");
 
     // ── Page structure (real registry) ───────────────────────────────────────
     const p0 = await page(OWNED_ID);
@@ -395,9 +398,56 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       assertEq([u.kind, optInCol(LOG_ID), audits(LOG_ID).length - a0], ["ok", 0, 4], "undo (fixture): both keys reverted, two more audit rows");
       const res2 = rs.resolveOwnerFeatures("rfb", LOG_ID, { registry: R, db });
       assertEq([res2.byKey["comms.beta"].value, ch.currentOwnerLevel("rfb", LOG_ID, res2, { registry: R, db })], [false, "bare_synlig"], "undo (fixture): back to «Bare synlig»");
+      assertEq(settingsRows(LOG_ID), 0, "undo (fixture): the settings row the level created is removed, not stored as default");
       db.prepare("DELETE FROM owner_feature_settings WHERE subject_id = ?").run(LOG_ID);
       db.prepare("DELETE FROM owner_feature_audit WHERE subject_id = ?").run(LOG_ID);
       db.prepare("DELETE FROM owner_feature_change_batch WHERE subject_id = ?").run(LOG_ID);
+    }
+
+    // Dependent live keys (fixture): preview == apply, and undo works both ways.
+    {
+      const live = new Set(["comms.beta", "notify.order_sms"]);
+      const R = reg.OWNER_FEATURE_REGISTRY.map((e) => (live.has(e.key) ? { ...e, status: "live" as const } : e));
+      const o = { registry: R, db };
+      const val = (k: string) => rs.resolveOwnerFeatures("rfb", LOG_ID, o).byKey[k].value;
+      const actor = { actor: "owner" as const, detail: "t" };
+      const pv = ch.previewOwnerLevel("rfb", LOG_ID, "full_fart", o)!;
+      assertEq([audits(LOG_ID).length, batches(LOG_ID).length, optInCol(LOG_ID), settingsRows(LOG_ID)], [0, 0, 0, 0], "preview (fixture): nothing kept");
+      const ap = ch.applyOwnerLevel("rfb", LOG_ID, "full_fart", actor, o) as any;
+      assertEq(pv.changes.map((c) => c.key), ap.changed, "preview (fixture): preview.changes == apply.changed");
+      assertTrue(ap.changed.includes("notify.order_sms") && pv.skipped.length === 0, "preview (fixture): key whose requirement is switched on earlier in the preset is listed as a change");
+      assertEq(pv.changes.find((c) => c.key === "notify.order_sms"), { key: "notify.order_sms", from: false, to: true }, "preview (fixture): from/to for the dependent key");
+      assertEq([val("orders.enabled"), val("notify.order_sms"), val("comms.beta")], [true, true, true], "apply (fixture): «Full fart» on");
+      const u1 = ch.undoOwnerChange("rfb", LOG_ID, ap.batchId, actor, o);
+      assertEq([u1.kind, val("orders.enabled"), val("notify.order_sms"), val("comms.beta"), settingsRows(LOG_ID)], ["ok", false, false, false, 0], "undo (fixture): «Full fart» batch reverted, created rows removed");
+      const ap2 = ch.applyOwnerLevel("rfb", LOG_ID, "full_fart", actor, o) as any;
+      assertEq(ap2.changed.length, 3, "apply (fixture): «Full fart» again");
+      const pvb = ch.previewOwnerLevel("rfb", LOG_ID, "bare_synlig", o)!;
+      const apb = ch.applyOwnerLevel("rfb", LOG_ID, "bare_synlig", actor, o) as any;
+      assertEq(pvb.changes.map((c) => c.key), apb.changed, "preview (fixture): «Bare synlig» preview == apply");
+      assertEq([val("orders.enabled"), val("notify.order_sms"), val("comms.beta")], [false, false, false], "apply (fixture): «Bare synlig» off");
+      const a1 = audits(LOG_ID).length;
+      const u2 = ch.undoOwnerChange("rfb", LOG_ID, apb.batchId, actor, o);
+      assertEq([u2.kind, val("orders.enabled"), val("notify.order_sms"), val("comms.beta"), audits(LOG_ID).length - a1], ["ok", true, true, true, 3],
+        "undo (fixture): «Bare synlig» batch reverted (dependent key after its requirement), one audit row each");
+      assertEq(settingsRows(LOG_ID), 2, "undo (fixture): rows that existed before the batch are kept");
+      // A row that existed before the change is kept (value restored), not deleted.
+      const s1 = ch.applyOwnerSingleChange("rfb", LOG_ID, "comms.beta", false, actor, o);
+      const u3 = ch.undoOwnerChange("rfb", LOG_ID, s1.batchId!, actor, o);
+      const rowBeta = db.prepare("SELECT value_json FROM owner_feature_settings WHERE subject_id = ? AND key = 'comms.beta'").get(LOG_ID) as any;
+      assertEq([u3.kind, rowBeta?.value_json], ["ok", "true"], "undo: pre-existing explicit row restored, not deleted");
+      // A→B→A elsewhere after the change blocks undo (later audit rows).
+      const s2 = ch.applyOwnerSingleChange("rfb", LOG_ID, "orders.enabled", false, actor, o);
+      await invoke(H.optInApi, makeReq({ params: { id: LOG_ID }, body: { opt_in: true }, token: tokens[LOG_ID] }));
+      await invoke(H.optInApi, makeReq({ params: { id: LOG_ID }, body: { opt_in: false }, token: tokens[LOG_ID] }));
+      const a2 = audits(LOG_ID).length;
+      assertEq(val("orders.enabled"), false, "undo-guard: value back to what the batch set");
+      const u4 = ch.undoOwnerChange("rfb", LOG_ID, s2.batchId!, actor, o);
+      assertEq([u4.kind, val("orders.enabled"), audits(LOG_ID).length - a2], ["changed_since", false, 0], "undo-guard: A→B→A elsewhere blocks undo, nothing written");
+      db.prepare("DELETE FROM owner_feature_settings WHERE subject_id = ?").run(LOG_ID);
+      db.prepare("DELETE FROM owner_feature_audit WHERE subject_id = ?").run(LOG_ID);
+      db.prepare("DELETE FROM owner_feature_change_batch WHERE subject_id = ?").run(LOG_ID);
+      db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = ?").run(LOG_ID);
     }
 
     // ── Undo refused when the key changed since (old route) ─────────────────
