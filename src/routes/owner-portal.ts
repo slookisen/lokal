@@ -16,6 +16,7 @@ import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
+import { writeOrderNotificationsOptIn } from "../services/order-opt-in";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -1895,10 +1896,7 @@ function applyOwnerOrderOptIn(
       return { status: 409, body: { success: false, error: "ownership_not_verified", message: "Bestillinger kan bare slås på for profiler der eierskapet er bekreftet. Bekreft eierskap først." } };
     }
   }
-  const info = getDb()
-    .prepare("UPDATE agents SET order_notifications_opt_in = ? WHERE id = ?")
-    .run(optIn, agentId);
-  if (!info.changes) {
+  if (!writeOrderNotificationsOptIn(getDb(), agentId, optIn === 1)) {
     return { status: 404, body: { success: false, error: "agent_not_found" } };
   }
   console.log(`[owner-portal] owner set order_notifications_opt_in=${optIn} for agent ${agentId}`);
@@ -2177,7 +2175,7 @@ router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
 // e-mail opened this session — an e-mail-match session never receives a
 // claim token. POST + SameSite=Lax cookie + Origin check: no cross-site
 // trigger.
-function crossSiteRequest(req: Request): boolean {
+export function crossSiteRequest(req: Request): boolean {
   const origin = req.headers.origin;
   if (!origin || typeof origin !== "string") return false;
   try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }

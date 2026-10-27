@@ -93,6 +93,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
@@ -527,6 +528,10 @@ app.use("/", agentReadinessRoutes);
 // Magic-link auth + 7-field profile management for producers.
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a: «Mine valg» owner API
+// (GET/PUT /api/owner/:id/features). Same owner session + isVerifiedOwner;
+// 404 for every subject not in OWNER_FEATURES_ALLOWED_SUBJECTS (default empty).
+app.use("/", ownerFeaturesRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
