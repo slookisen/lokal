@@ -50398,6 +50398,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b: the «Mine valg» page
+// (/eier/:id/valg) — levels, undo, change log, first-login card, N1 audit from
+// the old Bestillinger routes. Same allowlist; swaps the getDb() singleton and
+// env vars (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b: Mine valg-siden ──");
+  try {
+    const { runOwnerFeaturesS2bTests } = require("../src/routes/owner-features-s2b.test") as
+      typeof import("../src/routes/owner-features-s2b.test");
+    const r = await runOwnerFeaturesS2bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2b: " + f);
+    console.log(`  owner-features-s2b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2b: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring

@@ -16,7 +16,8 @@ import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
-import { writeOrderNotificationsOptIn } from "../services/order-opt-in";
+import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -910,7 +911,7 @@ const PORTAL_PALETTE_CSS = `
   }
 `;
 
-function portalShell(title: string, body: string): string {
+export function portalShell(title: string, body: string): string {
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
@@ -1552,6 +1553,16 @@ export function ownerOrderEmailSectionHtml(agentId: string, current: string | nu
 }
 
 /** 403 page: valid session for this agent, but no verified owner (S1b punkt 5). */
+/** S2b: the portal card that links to «Mine valg» (/eier/:id/valg). */
+export function ownerFeaturesEntryCardHtml(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return `<div class="ep-card" id="mine-valg">
+        <h2>Mine valg</h2>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Bestem hvem som finner deg, om du tar imot bestillinger og hva vi sender deg. Alt på ett sted.</p>
+        <a class="ep-btn ep-btn-primary" href="/eier/${id}/valg">Gå til Mine valg</a>
+      </div>`;
+}
+
 export function ownerNotVerifiedPage(agentId: string): string {
   const id = encodeURIComponent(agentId);
   return portalShell(
@@ -1690,6 +1701,16 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       } catch { orderEmailHtml = ""; }
     }
 
+    // S2b: «Mine valg» entry card — only for a subject in
+    // OWNER_FEATURES_ALLOWED_SUBJECTS and a verified owner (empty/unset
+    // allowlist = "" = the portal is byte-identical to before).
+    let ownerFeaturesCardHtml = "";
+    try {
+      if (isSubjectAllowedForOwnerFeatures("rfb", agentId) && isVerifiedOwner(agentId, session)) {
+        ownerFeaturesCardHtml = ownerFeaturesEntryCardHtml(agentId);
+      }
+    } catch { ownerFeaturesCardHtml = ""; }
+
     // Fase A2: number of orders waiting for an answer (tolerant: a DB without orders shows 0).
     let pendingOrderCount = 0;
     try {
@@ -1772,7 +1793,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent, orderEmailHtml)}${paymentCardHtml}${pauseCardHtml}
+      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent, orderEmailHtml)}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -1896,11 +1917,24 @@ function applyOwnerOrderOptIn(
       return { status: 409, body: { success: false, error: "ownership_not_verified", message: "Bestillinger kan bare slås på for profiler der eierskapet er bekreftet. Bekreft eierskap først." } };
     }
   }
-  if (!writeOrderNotificationsOptIn(getDb(), agentId, optIn === 1)) {
+  // S2b (N1): same UPDATE, plus the owner_feature_audit row for
+  // `orders.enabled` in the same transaction when the value changes.
+  if (!writeOrderNotificationsOptInWithAudit(getDb(), agentId, optIn === 1, { actor: "owner", detail: ownerSessionEmail(session.token) })) {
     return { status: 404, body: { success: false, error: "agent_not_found" } };
   }
   console.log(`[owner-portal] owner set order_notifications_opt_in=${optIn} for agent ${agentId}`);
   return { status: 200, body: { success: true, agent_id: agentId, order_notifications_opt_in: optIn === 1 } };
+}
+
+/** The e-mail the owner session was opened with (audit actor_detail). */
+function ownerSessionEmail(token: string | undefined): string | null {
+  if (!token) return null;
+  try {
+    const row = getDb().prepare("SELECT email FROM magic_links WHERE token = ?").get(token) as { email?: string } | undefined;
+    return row?.email ?? null;
+  } catch {
+    return null;
+  }
 }
 
 router.post("/api/agents/:id/order-notifications", (req: Request, res: Response) => {
@@ -2442,7 +2476,7 @@ router.get("/api/agents/:id/orders", (req: Request, res: Response) => {
 // Helper: Escape HTML
 // ─────────────────────────────────────────────────────────────────
 
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
   const map: { [key: string]: string } = {
     "&": "&amp;",
     "<": "&lt;",

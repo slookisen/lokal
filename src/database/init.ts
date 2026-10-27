@@ -5449,6 +5449,49 @@ function initSchema(db: Database.Database): void {
     console.error("Migration owner_feature_settings/owner_feature_audit failed:", err);
   }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2b ───────────────
+  // The «Mine valg» page (owner-features/page.ts). Two additive, brand-new
+  // tables; owner_feature_audit is unchanged.
+  // owner_feature_change_batch: one row per change the owner made on the page
+  // (one switch = kind 'single', one level = kind 'level', an undo = kind
+  // 'undo'). The audit rows it wrote are the contiguous id range
+  // first_audit_id..last_audit_id (written in one transaction). «Angre»
+  // reverts the newest batch as one unit and stamps undone_at /
+  // undone_by_batch; new_row_keys (JSON array) lists the settings rows the
+  // batch created, which an undo removes again. owner_feature_intro: the first-login card («Nyheter og
+  // tips», ja/nei) — one row once answered, so the card shows only until then.
+  // Times are ISO-8601 (Date#toISOString).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_change_batch (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('single','level','undo')),
+        level TEXT,
+        first_audit_id INTEGER NOT NULL,
+        last_audit_id INTEGER NOT NULL,
+        actor_detail TEXT,
+        created_at TEXT NOT NULL,
+        undone_at TEXT,
+        undone_by_batch INTEGER,
+        new_row_keys TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_change_batch_subject
+        ON owner_feature_change_batch(vertical, subject_id, id);
+      CREATE TABLE IF NOT EXISTS owner_feature_intro (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        answer TEXT NOT NULL CHECK (answer IN ('yes','no')),
+        answered_at TEXT NOT NULL,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_change_batch/owner_feature_intro failed:", err);
+  }
+
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
   // outreach_daily_send_cap: one row per UTC calendar day, holding an
