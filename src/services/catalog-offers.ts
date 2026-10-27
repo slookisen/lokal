@@ -75,6 +75,7 @@
 //   Ranking still uses the real haversine, as discover() does.
 
 import { getDb } from "../database/init";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, type PublicFieldChoices } from "../owner-features/enforce";
 import { knowledgeService } from "./knowledge-service";
 import { geocodingService } from "./geocoding-service";
 import { isEligibleForRealOrder, isProducerStatedSource, isRowOrderableForRealOrder, foodInfoOf, type FoodInfo } from "./cart-service";
@@ -341,9 +342,11 @@ function offerProducerOf(
   db: any,
   r: { agent_id: string; agent_name: string; city: string | null; geo_precision: string | null; is_verified: number },
   dist: number | null,
+  choices?: PublicFieldChoices | null,
 ): OfferProducer {
   const info = knowledgeService.getAgentInfo(r.agent_id);
-  const k = info?.knowledge;
+  // S2c-1: no phone when the owner hid it (contact.phone).
+  const k = withoutHiddenContact(info?.knowledge, choices);
 
   const salgskanaler = (db.prepare(`
     SELECT sc.name AS name
@@ -476,7 +479,8 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     .slice(0, limit - offerRows.length);
 
   // One producer shape for offers and category matches.
-  const producerOf = (r: RawOfferRow, dist: number): OfferProducer => offerProducerOf(db, r, dist);
+  const ownerChoices = publicFieldChoicesForMany([...offerRows, ...matchRows].map((x) => x.r.agent_id), { db });
+  const producerOf = (r: RawOfferRow, dist: number): OfferProducer => offerProducerOf(db, r, dist, ownerChoices.get(r.agent_id));
 
   const offers: Offer[] = offerRows.map(({ r, dist, availability }) => {
     const food_info = foodInfoOf(r);
@@ -583,7 +587,7 @@ export function findProducerOrderables(
       .sort((a, b) => a.product_name.trim().localeCompare(b.product_name.trim(), "nb") || a.product_id.localeCompare(b.product_id))
       .slice(0, Math.max(0, opts.limit));
     if (orderable.length === 0) return null;
-    const producer = offerProducerOf(db, orderable[0]!, null);
+    const producer = offerProducerOf(db, orderable[0]!, null, publicFieldChoices(agentId, { db }));
     const offers: Offer[] = orderable.map((r) => {
       const food_info = foodInfoOf(r);
       return {

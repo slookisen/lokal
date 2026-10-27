@@ -171,3 +171,17 @@ export function withoutHiddenCoordinates<T>(agent: T, c: PublicFieldChoices | nu
   const { lat: _lat, lng: _lng, ...location } = a.location;
   return { ...a, location } as T;
 }
+
+/**
+ * A getAgentInfo() response for a public by-id read (REST /info, the MCP
+ * producer resource, A2A agent/info): knowledge without the hidden fields,
+ * agent without coordinates (address hidden) and trust score (trust hidden).
+ * The same object when not enforced.
+ */
+export function publicAgentInfo<T extends { agent: any; knowledge: any }>(info: T, c: PublicFieldChoices | null | undefined): T {
+  if (!c || !info) return info;
+  const agent: any = withoutHiddenCoordinates({ ...info.agent }, c);
+  if (hidesTrust(c)) delete agent.trustScore;
+  return { ...info, agent, knowledge: withoutHiddenFields(info.knowledge, c) };
+}
+

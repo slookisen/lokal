@@ -58,8 +58,8 @@ import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
 import {
-  publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields,
-  hidesAddress, hidesPrices, hidesTrust, type PublicFieldChoices,
+  publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
+  withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
 } from "../owner-features/enforce";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
@@ -308,7 +308,7 @@ function buildVCard(agentId: string): string | null {
   const ownerChoices = publicFieldChoices(agentId);
   const { agent: _agent } = info;
   const k = withoutHiddenFields(info.knowledge, ownerChoices);
-  const agent = _agent as any; // Cast for flexibility — agent shape varies
+  const agent = withoutHiddenCoordinates(_agent as any, ownerChoices); // Cast for flexibility — agent shape varies
   const lines: string[] = [];
   lines.push("BEGIN:VCARD");
   lines.push("VERSION:3.0");
@@ -355,7 +355,7 @@ function buildVCard(agentId: string): string | null {
     }
   }
   // GEO field — helps contact apps show location
-  if (agent.location?.lat && agent.location?.lng && agent.location.lat !== 0 && !hidesAddress(ownerChoices)) {
+  if (agent.location?.lat && agent.location?.lng && agent.location.lat !== 0) {
     lines.push(`GEO:${agent.location.lat};${agent.location.lng}`);
   }
   // Google Maps search URL as custom field — AI agents and contact apps can use this
@@ -1642,9 +1642,7 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   const ownerChoices = publicFieldChoices(agentId);
   const claimToken = (req.headers["x-claim-token"] as string) || "";
   if (ownerChoices && !(claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId)) {
-    const agentOut: any = { ...info.agent };
-    if (hidesTrust(ownerChoices)) delete agentOut.trustScore;
-    info = { ...info, agent: agentOut, knowledge: withoutHiddenFields(info.knowledge, ownerChoices) };
+    info = publicAgentInfo(info, ownerChoices);
   }
   const data = {
     ...info,

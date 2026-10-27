@@ -199,7 +199,7 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
       assertTrue(reg.OWNER_FEATURE_GROUPS.every((g) => !!g.label.no && !!g.label.en), "registry: every group has NO+EN label");
       const types = ["switch", "choice", "number", "date", "email", "action", "guarantee", "locked"];
       const surfaceOk = (s: string) =>
-        /^(profile_html|json_ld|mcp_search|mcp_info|rest_card|vcard|acp_feed|sitemap|llms|a2a|leaderboard|order_gate)$/.test(s) || /^(email|job):[a-z_]+$/.test(s);
+        /^(profile_html|json_ld|listing_html|mcp_search|mcp_info|rest_card|vcard|acp_feed|sitemap|llms|a2a|leaderboard|order_gate)$/.test(s) || /^(email|job):[a-z_]+$/.test(s);
       for (const e of reg.OWNER_FEATURE_REGISTRY) {
         const ok =
           !!e.label?.no && !!e.label?.en && !!e.description?.no && !!e.description?.en &&

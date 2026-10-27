@@ -29,6 +29,7 @@ import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
+import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
 import {
   isOrderAgentActionsEnabled,
@@ -767,7 +768,8 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
         toA2ADataArtifact({
           artifactId: `info-${agentId}`,
           name: "agent-info",
-          data: info,
+          // S2c-1: without what the owner hid (not enforced = as before).
+          data: publicAgentInfo(info, publicFieldChoices(agentId)),
         }),
       ],
     },

@@ -63,7 +63,7 @@ import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExt
 import { isOrderMessagesEnabled, ORDER_MESSAGES_UNTRUSTED_NOTE, ORDER_MESSAGE_MAX_CHARS, ORDER_MESSAGE_RATE_LIMIT } from "../services/order-messages";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
-import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, hidesPrices, type PublicFieldChoices } from "../owner-features/enforce";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, hidesPrices, publicAgentInfo, type PublicFieldChoices } from "../owner-features/enforce";
 
 const router = Router();
 
@@ -2030,7 +2030,9 @@ export function registerTools(
       if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
-      return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };
+      // S2c-1: without what the owner hid (not enforced = as before).
+      const shown = publicAgentInfo(info, publicFieldChoices(agentId));
+      return { contents: [{ uri: uri.href, text: JSON.stringify(shown, null, 2), mimeType: "application/json" }] };
     }
   );
 }

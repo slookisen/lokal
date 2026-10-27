@@ -22,7 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
-import { publicFieldChoices, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -1458,8 +1458,12 @@ router.get("/", (req: Request, res: Response) => {
     // (description on the row, about on the knowledge object). The rich cards
     // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
+    // S2c-1: the owners' contact / price choices, one lookup for the page.
+    const featuredChoices = publicFieldChoicesForMany(featured.slice(0, 11).filter((a: any) => a.isClaimed).map((a: any) => a.id));
     featured.forEach((a: any, i: number) => {
-      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {});
+      if (i < 11 && a.isClaimed) {
+        featuredKnowledge.set(a.id, withoutHiddenFields(knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {}, featuredChoices.get(a.id)));
+      }
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
@@ -4300,9 +4304,12 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     const contextPara = contextSentences.join(" ");
 
     // Schema.org
+    // S2c-1: the owners' contact choices, one lookup for the page.
+    const cityChoices = publicFieldChoicesForMany(cityAgents.slice(0, 50).map((a: any) => a.id));
     const jsonLdItems = cityAgents.slice(0, 50).map((a: any) => {
       const info = knowledgeService.getAgentInfo(a.id);
-      const k = info?.knowledge || {} as any;
+      const choices = cityChoices.get(a.id);
+      const k = withoutHiddenFields(info?.knowledge || {} as any, choices);
       let itemDesc = a.description || "";
       if (isJunkDescription(itemDesc)) {
         console.log(`[description-guard] suppressed junk description (city JSON-LD) for ${a.id} (${a.name})`);
@@ -4317,7 +4324,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       const locality = fylke ? (a.city || a.location?.city) : cityName;
       if (k.address) item.address = { "@type": "PostalAddress", "streetAddress": k.address, "addressLocality": locality, "addressCountry": "NO" };
       if (isDisplayablePhone(k.phone)) item.telephone = k.phone;
-      if (a.location?.lat && a.location?.lng) item.geo = { "@type": "GeoCoordinates", "latitude": a.location.lat, "longitude": a.location.lng };
+      if (a.location?.lat && a.location?.lng && !hidesAddress(choices)) item.geo = { "@type": "GeoCoordinates", "latitude": a.location.lat, "longitude": a.location.lng };
       return item;
     });
 

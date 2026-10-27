@@ -133,11 +133,11 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
     if (!layer) throw new Error(`route not found: ${method.toUpperCase()} ${path}`);
     return layer.route.stack[layer.route.stack.length - 1].handle;
   }
-  function makeReq(o: { params?: Record<string, string>; query?: Record<string, string>; headers?: Record<string, string> }): any {
+  function makeReq(o: { params?: Record<string, string>; query?: Record<string, string>; headers?: Record<string, string>; body?: any }): any {
     const headers: Record<string, string> = { ...(o.headers || {}) };
     return {
       method: "GET", url: "/", path: "/", originalUrl: "/",
-      params: o.params || {}, body: undefined, query: o.query || {}, headers, cookies: {},
+      params: o.params || {}, body: o.body, query: o.query || {}, headers, cookies: {},
       ip: "127.0.0.1", lang: "no", protocol: "https", hostname: "rettfrabonden.com",
       get(name: string) { return name.toLowerCase() === "host" ? "rettfrabonden.com" : headers[name.toLowerCase()]; },
     };
@@ -174,7 +174,7 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
     marketplaceRegistry._agentsCacheTime = 0;
     marketplaceRegistry._statsCacheTime = 0;
   };
-  const routeModules = ["./marketplace", "./marketplace-catalog", "./seo", "./mcp"];
+  const routeModules = ["./marketplace", "./marketplace-catalog", "./seo", "./mcp", "./a2a"];
 
   const db = new Database(":memory:");
   db.pragma("journal_mode = DELETE");
@@ -200,14 +200,16 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
     const marketplaceRouter = require("./marketplace").default as any;
     const { catalogRouter } = require("./marketplace-catalog") as typeof import("./marketplace-catalog");
     const seoRouter = (require("./seo") as typeof import("./seo")).default as any;
+    const a2aRouter = require("./a2a").default as any;
     const reg = require("../owner-features/registry") as typeof import("../owner-features/registry");
     const rs = require("../owner-features/resolve") as typeof import("../owner-features/resolve");
 
     const tools = new Map<string, (args: any) => Promise<any>>();
+    const resources = new Map<string, (uri: URL) => Promise<any>>();
     const { registerTools } = require("./mcp") as typeof import("./mcp");
     registerTools({
       registerTool(name: string, _config: any, handler: any) { tools.set(name, handler); },
-      resource() { /* no-op */ },
+      resource(name: string, _uri: any, _meta: any, handler: any) { resources.set(name, handler); },
       prompt() { /* no-op */ },
       registerResource() { /* no-op */ },
       registerPrompt() { /* no-op */ },
@@ -222,6 +224,10 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       feed: findRouteHandler(catalogRouter, "/feed", "get"),
       acp: findRouteHandler(catalogRouter, "/acp-feed.csv", "get"),
       produsent: findRouteHandler(seoRouter, "/produsent/:slug", "get"),
+      home: findRouteHandler(seoRouter, "/", "get"),
+      city: findRouteHandler(seoRouter, "/:city", "get"),
+      discover: findRouteHandler(marketplaceRouter, "/discover", "post"),
+      a2a: findRouteHandler(a2aRouter, "/a2a", "post"),
     };
 
     seedProducer(db, ENF_ID);
@@ -229,6 +235,9 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
     const OWNER_CLAIM = "s2c-owner-claim";
     db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
       .run("claim-s2c", ENF_ID, `post@${ENF_ID}.example.no`, "Eier", OWNER_CLAIM, new Date(Date.now() + 86_400_000).toISOString());
+    const TWIN_CLAIM = "s2c-twin-claim";
+    db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
+      .run("claim-s2c-twin", TWIN_ID, `post@${TWIN_ID}.example.no`, "Eier", TWIN_CLAIM, new Date(Date.now() + 86_400_000).toISOString());
 
     // ── Surface readers ───────────────────────────────────────────────────
     const LD_RE = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/g;
@@ -248,71 +257,172 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
     const acpCsv = async () => String((await invoke(H.acp, makeReq({}))).body ?? "");
     // A name query returns that producer only (detailed view).
     const searchBlock = (text: string, id: string) => text.includes(`**1. ${NAMES[id]}**`) ? text : "";
+    // One producer's block of a compact result list («**N. Name**» … up to the next blank line).
+    const listBlock = (text: string, id: string) => text.split("\n\n").find((b) => b.includes(`. ${NAMES[id]}`)) ?? "";
+    const compactSearch = async (id: string) => listBlock(await toolText("lokal_search", { query: "poteter" }), id);
+    const lokalDiscover = async (id: string) => listBlock(await toolText("lokal_discover", { categories: ["vegetables"] }), id);
+    const restDiscover = async (id: string) =>
+      ((await invoke(H.discover, makeReq({ body: { categories: ["vegetables"] } }))).body?.results ?? []).find((r: any) => r.agent?.id === id);
+    const findOffer = async (id: string) => {
+      const t = await toolText("lokal_find_offers", { items: ["listepoteter"], lat: 59.9139, lng: 10.7522 });
+      let parsed: any;
+      try { parsed = JSON.parse(t); } catch { return undefined; }
+      const offers = (Array.isArray(parsed) ? parsed : [parsed]).flatMap((x: any) => x?.offers ?? []);
+      return offers.find((o: any) => o?.producer?.agent_id === id);
+    };
+    const resource = async (id: string) => {
+      const r = await resources.get("producer-detail")!(new URL(`lokal://producers/${id}`));
+      try { return JSON.parse(String(r?.contents?.[0]?.text ?? "")); } catch { return undefined; }
+    };
+    const a2aInfo = async (id: string) =>
+      (await invoke(H.a2a, makeReq({ body: { jsonrpc: "2.0", method: "agent/info", params: { agentId: id }, id: 1 } }))).body?.result?.artifacts?.[0];
+    const a2aData = async (id: string) => {
+      const a = await a2aInfo(id);
+      return a?.parts?.find((p: any) => p?.data)?.data ?? a?.data ?? a;
+    };
+    const home = async () => String((await invoke(H.home, makeReq({}))).body ?? "");
+    // One producer's card on the front page (<a … class="pc …">…</a>).
+    const homeCard = async (id: string) => {
+      const h = await home();
+      const at = h.indexOf(`<a href="/produsent/${slugify(NAMES[id])}" class="pc pc-`);
+      return at < 0 ? "" : h.slice(at, h.indexOf("</a>", at));
+    };
+    // One producer's LocalBusiness node on the city page.
+    const cityNode = async (id: string) => {
+      const html = String((await invoke(H.city, makeReq({ params: { city: "oslo" } }))).body ?? "");
+      const found: any[] = [];
+      const walk = (x: any) => {
+        if (Array.isArray(x)) x.forEach(walk);
+        else if (x && typeof x === "object") {
+          if (x["@type"] === "LocalBusiness" && x.name === NAMES[id]) found.push(x);
+          Object.values(x).forEach(walk);
+        }
+      };
+      for (const m of html.matchAll(LD_RE)) { try { walk(JSON.parse(m[1])); } catch { /* not JSON */ } }
+      return found[0];
+    };
+    const json = (x: unknown) => JSON.stringify(x ?? null);
 
-    // ── The matrix: key → surface → probe (true = field shown) ─────────────
-    // `today: false` marks a declared surface that does not render the field
-    // at all today: the probe must then stay false in every state.
-    interface MatrixCase { probe: Probe; today?: boolean }
-    const MATRIX: Record<string, { off: unknown; on: unknown; surfaces: Record<string, MatrixCase> }> = {
+    // ── The matrix: key → surface → endpoint → probe ──────────────────────
+    // A probe returns markers of the field; "shown" = all there, "absent" =
+    // none. `today: false`: the endpoint never renders the field (must stay
+    // absent). `kept: true`: the endpoint keeps the field by design (order
+    // path) and must stay shown.
+    interface EndpointCase { probe: Probe; today?: boolean; kept?: boolean }
+    // Every endpoint that renders each surface class; the coverage check
+    // requires a case for each of them under every key that declares it.
+    const SURFACE_ENDPOINTS: Record<string, string[]> = {
+      profile_html: ["produsent"],
+      json_ld: ["produsent"],
+      listing_html: ["home_cards", "city_jsonld"],
+      mcp_search: ["lokal_search_detail", "lokal_search_compact", "lokal_discover", "rest_search", "rest_discover", "lokal_find_offers"],
+      mcp_info: ["lokal_info", "mcp_resource"],
+      rest_card: ["card", "info"],
+      vcard: ["vcard"],
+      acp_feed: ["feed", "acp_csv"],
+      a2a: ["agent_info"],
+    };
+    const MATRIX: Record<string, { off: unknown; on: unknown; surfaces: Record<string, Record<string, EndpointCase>> }> = {
       "contact.phone": {
         off: false, on: true,
         surfaces: {
-          profile_html: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes("912 34 567"), h.includes("tel:+4791234567")]; } },
-          json_ld: { probe: async (id) => [(await jsonLd(id)).includes('"telephone"')] },
-          mcp_search: { probe: async (id) => [searchBlock(await lokalSearch(id), id).includes("📞"), (await restSearch(id))?.contact?.phone === PHONE] },
-          mcp_info: { probe: async (id) => [(await lokalInfo(id)).includes("📞")] },
-          rest_card: { probe: async (id) => [(await card(id))?.contact?.phone === PHONE, (await restInfo(id))?.data?.knowledge?.phone === PHONE] },
-          vcard: { probe: async (id) => [(await vcard(id)).includes("\r\nTEL;")] },
+          profile_html: { produsent: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes("912 34 567"), h.includes("tel:+4791234567")]; } } },
+          json_ld: { produsent: { probe: async (id) => [(await jsonLd(id)).includes('"telephone"')] } },
+          listing_html: {
+            home_cards: { probe: async (id) => [(await homeCard(id)).includes("912 34 567")] },
+            city_jsonld: { probe: async (id) => [(await cityNode(id))?.telephone === PHONE] },
+          },
+          mcp_search: {
+            lokal_search_detail: { probe: async (id) => [searchBlock(await lokalSearch(id), id).includes("📞")] },
+            lokal_search_compact: { probe: async (id) => [(await compactSearch(id)).includes("📞")] },
+            lokal_discover: { probe: async (id) => [(await lokalDiscover(id)).includes("📞")] },
+            rest_search: { probe: async (id) => [(await restSearch(id))?.contact?.phone === PHONE] },
+            rest_discover: { probe: async (id) => [(await restDiscover(id))?.contact?.phone === PHONE] },
+            lokal_find_offers: { probe: async (id) => [(await findOffer(id))?.producer?.phone === PHONE] },
+          },
+          mcp_info: {
+            lokal_info: { probe: async (id) => [(await lokalInfo(id)).includes("📞")] },
+            mcp_resource: { probe: async (id) => [(await resource(id))?.knowledge?.phone === PHONE] },
+          },
+          rest_card: {
+            card: { probe: async (id) => [(await card(id))?.contact?.phone === PHONE] },
+            info: { probe: async (id) => [(await restInfo(id))?.data?.knowledge?.phone === PHONE] },
+          },
+          vcard: { vcard: { probe: async (id) => [(await vcard(id)).includes("\r\nTEL;")] } },
+          a2a: { agent_info: { probe: async (id) => [json(await a2aInfo(id)).includes(PHONE)] } },
         },
       },
       "contact.address": {
         off: "place", on: "full",
         surfaces: {
-          profile_html: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes(STREET), h.includes("0150")]; } },
-          json_ld: { probe: async (id) => { const ld = await jsonLd(id); return [ld.includes('"streetAddress"'), ld.includes('"GeoCoordinates"'), ld.includes(STREET)]; } },
-          mcp_search: { probe: async (id) => [searchBlock(await lokalSearch(id), id).includes(STREET), (await restSearch(id))?.contact?.address === STREET] },
-          mcp_info: { probe: async (id) => [(await lokalInfo(id)).includes(STREET)] },
-          rest_card: {
-            probe: async (id) => {
-              const c = await card(id);
-              const k = (await restInfo(id))?.data?.knowledge;
-              return [c?.contact?.address === STREET, c?.contact?.postalCode === "0150", String(c?.links?.googleMaps).includes("Gardsvegen"), k?.address === STREET, k?.postalCode === "0150"];
-            },
+          profile_html: { produsent: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes(STREET), h.includes("0150")]; } } },
+          json_ld: { produsent: { probe: async (id) => { const ld = await jsonLd(id); return [ld.includes('"streetAddress"'), ld.includes('"GeoCoordinates"'), ld.includes(STREET)]; } } },
+          listing_html: {
+            home_cards: { probe: async (id) => { const c = await homeCard(id); return [c.includes(STREET), c.includes("0150")]; } },
+            city_jsonld: { probe: async (id) => { const n = await cityNode(id); return [n?.address?.streetAddress === STREET, !!n?.geo]; } },
           },
-          vcard: { probe: async (id) => { const v = await vcard(id); return [v.includes(STREET), v.includes("0150")]; } },
+          mcp_search: {
+            lokal_search_detail: { probe: async (id) => [searchBlock(await lokalSearch(id), id).includes(STREET)] },
+            lokal_search_compact: { probe: async (id) => [(await compactSearch(id)).includes(STREET)] },
+            lokal_discover: { probe: async (id) => [(await lokalDiscover(id)).includes(STREET)] },
+            rest_search: { probe: async (id) => [(await restSearch(id))?.contact?.address === STREET] },
+            rest_discover: { probe: async (id) => { const c = (await restDiscover(id))?.contact; return [c?.address === STREET, c?.postalCode === "0150"]; } },
+            lokal_find_offers: { probe: async (id) => [json(await findOffer(id)).includes(STREET)], today: false },
+          },
+          mcp_info: {
+            lokal_info: { probe: async (id) => [(await lokalInfo(id)).includes(STREET)] },
+            mcp_resource: { probe: async (id) => { const k = (await resource(id))?.knowledge; return [k?.address === STREET, k?.postalCode === "0150"]; } },
+          },
+          rest_card: {
+            card: { probe: async (id) => { const c = await card(id); return [c?.contact?.address === STREET, c?.contact?.postalCode === "0150", String(c?.links?.googleMaps).includes("Gardsvegen")]; } },
+            info: { probe: async (id) => { const k = (await restInfo(id))?.data?.knowledge; return [k?.address === STREET, k?.postalCode === "0150"]; } },
+          },
+          vcard: { vcard: { probe: async (id) => { const v = await vcard(id); return [v.includes(STREET), v.includes("0150")]; } } },
+          a2a: { agent_info: { probe: async (id) => { const t = json(await a2aInfo(id)); return [t.includes(STREET), t.includes("0150")]; } } },
         },
       },
       "products.show_prices": {
         off: false, on: true,
         surfaces: {
-          profile_html: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes('class="prod-price"'), h.includes(PRICE), h.includes(NAME_PRICE)]; } },
-          json_ld: { probe: async (id) => { const ld = await jsonLd(id); return [ld.includes('"price"'), ld.includes('"makesOffer"')]; } },
+          profile_html: { produsent: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes('class="prod-price"'), h.includes(PRICE), h.includes(NAME_PRICE)]; } } },
+          json_ld: { produsent: { probe: async (id) => { const ld = await jsonLd(id); return [ld.includes('"price"'), ld.includes('"makesOffer"')]; } } },
+          listing_html: {
+            home_cards: { probe: async (id) => [(await homeCard(id)).includes(NAME_PRICE)] },
+            city_jsonld: { probe: async (id) => [/price|kr \d/i.test(json(await cityNode(id)))], today: false },
+          },
           mcp_search: {
-            probe: async (id) => {
-              const t = searchBlock(await lokalSearch(id), id);
-              const r = await restSearch(id);
-              return [t.includes(PRICE), t.includes(NAME_PRICE), !!r?.products?.some((p: any) => p.price === PRICE)];
-            },
+            lokal_search_detail: { probe: async (id) => { const t = searchBlock(await lokalSearch(id), id); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } },
+            lokal_search_compact: { probe: async (id) => { const t = await compactSearch(id); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } },
+            lokal_discover: { probe: async (id) => { const t = await lokalDiscover(id); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } },
+            rest_search: { probe: async (id) => { const p = (await restSearch(id))?.products; return [!!p?.some((x: any) => x.price === PRICE), !!p?.some((x: any) => x.price === NAME_PRICE)]; } },
+            rest_discover: { probe: async (id) => [/kr\/kg|kr 85/.test(json(await restDiscover(id)))], today: false },
+            lokal_find_offers: { probe: async (id) => [(await findOffer(id))?.price_nok === 30], kept: true },
           },
-          mcp_info: { probe: async (id) => { const t = await lokalInfo(id); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } },
+          mcp_info: {
+            lokal_info: { probe: async (id) => { const t = await lokalInfo(id); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } },
+            mcp_resource: { probe: async (id) => { const t = json((await resource(id))?.knowledge?.products); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } },
+          },
           rest_card: {
-            probe: async (id) => {
-              const c = JSON.stringify((await card(id))?.products);
-              const k = JSON.stringify((await restInfo(id))?.data?.knowledge?.products);
-              return [c.includes(PRICE), c.includes(NAME_PRICE), k.includes(PRICE), k.includes(NAME_PRICE)];
-            },
+            card: { probe: async (id) => { const c = json((await card(id))?.products); return [c.includes(PRICE), c.includes(NAME_PRICE)]; } },
+            info: { probe: async (id) => { const k = json((await restInfo(id))?.data?.knowledge?.products); return [k.includes(PRICE), k.includes(NAME_PRICE)]; } },
           },
-          vcard: { probe: async (id) => { const v = await vcard(id); return [v.includes(`(${PRICE})`), v.includes(NAME_PRICE)]; } },
-          acp_feed: { probe: async (id) => [(await feedItem(id))?.price?.amount === 30, (await acpCsv()).includes(`prod-${id}`)] },
+          vcard: { vcard: { probe: async (id) => { const v = await vcard(id); return [v.includes(`(${PRICE})`), v.includes(NAME_PRICE)]; } } },
+          acp_feed: {
+            feed: { probe: async (id) => [(await feedItem(id))?.price?.amount === 30] },
+            acp_csv: { probe: async (id) => [(await acpCsv()).includes(`prod-${id}`)] },
+          },
+          a2a: { agent_info: { probe: async (id) => { const t = json(await a2aInfo(id)); return [t.includes(PRICE), t.includes(NAME_PRICE)]; } } },
         },
       },
       "stats.public_counts": {
         off: false, on: true,
         surfaces: {
           profile_html: {
-            probe: async (id) => {
-              const h = await visibleHtml(id);
-              return [h.includes('class="pf-stat" data-stat="human"'), h.includes('class="pf-stat" data-stat="ai"'), h.includes('class="pf-stat" data-stat="aiDeliveries"'), h.includes("Profilvisninger")];
+            produsent: {
+              probe: async (id) => {
+                const h = await visibleHtml(id);
+                return [h.includes('class="pf-stat" data-stat="human"'), h.includes('class="pf-stat" data-stat="ai"'), h.includes('class="pf-stat" data-stat="aiDeliveries"'), h.includes("Profilvisninger")];
+              },
             },
           },
         },
@@ -320,24 +430,34 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       "stats.public_search_terms": {
         off: false, on: true,
         surfaces: {
-          profile_html: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes(TERM), h.includes("Hva folk søker etter")]; } },
+          profile_html: { produsent: { probe: async (id) => { const h = await visibleHtml(id); return [h.includes(TERM), h.includes("Hva folk søker etter")]; } } },
         },
       },
       "stats.public_trust": {
         off: false, on: true,
         surfaces: {
-          profile_html: { probe: async (id) => [/tillitsscore|trust ?score/i.test((await visibleHtml(id)).replace(/<!--[\s\S]*?-->/g, ""))], today: false },
-          rest_card: { probe: async (id) => [typeof (await card(id))?.["x-lokal"]?.trustScore === "number", typeof (await restInfo(id))?.data?.agent?.trustScore === "number"] },
-          vcard: { probe: async (id) => [(await vcard(id)).includes("X-LOKAL-TRUST-SCORE")] },
-          mcp_info: { probe: async (id) => [/tillit|trust/i.test(await lokalInfo(id))], today: false },
+          profile_html: { produsent: { probe: async (id) => [/tillitsscore|trust ?score/i.test((await visibleHtml(id)).replace(/<!--[\s\S]*?-->/g, ""))], today: false } },
+          rest_card: {
+            card: { probe: async (id) => [typeof (await card(id))?.["x-lokal"]?.trustScore === "number"] },
+            info: { probe: async (id) => [typeof (await restInfo(id))?.data?.agent?.trustScore === "number"] },
+          },
+          vcard: { vcard: { probe: async (id) => [(await vcard(id)).includes("X-LOKAL-TRUST-SCORE")] } },
+          mcp_info: {
+            lokal_info: { probe: async (id) => [/tillit|trust/i.test(await lokalInfo(id))], today: false },
+            mcp_resource: { probe: async (id) => [typeof (await resource(id))?.agent?.trustScore === "number"] },
+          },
+          a2a: { agent_info: { probe: async (id) => [json(await a2aInfo(id)).includes('"trustScore"')] } },
         },
       },
     };
     /** "shown" when every marker is there, "absent" when none is, else "mixed". */
-    const state = async (c: MatrixCase, id: string): Promise<string> => {
+    const state = async (c: EndpointCase, id: string): Promise<string> => {
       const m = await c.probe(id);
       return m.every(Boolean) ? "shown" : m.some(Boolean) ? "mixed" : "absent";
     };
+    const todayState = (c: EndpointCase) => c.today === false ? "absent" : "shown";
+    const cases = (m: { surfaces: Record<string, Record<string, EndpointCase>> }) =>
+      Object.entries(m.surfaces).flatMap(([surface, eps]) => Object.entries(eps).map(([ep, c]) => ({ label: `${surface}/${ep}`, c })));
 
     // ── Coverage (AC23) ───────────────────────────────────────────────────
     const missingMatrixCoverage = (keys: readonly string[], registry: import("../owner-features/registry").OwnerFeatureEntry[]): string[] => {
@@ -345,7 +465,11 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       for (const key of keys) {
         const e = registry.find((x) => x.key === key);
         if (!e) { missing.push(`${key}: not in registry`); continue; }
-        for (const s of e.surfaces) if (!MATRIX[key]?.surfaces[s]) missing.push(`${key} × ${s}`);
+        for (const s of e.surfaces) {
+          const eps = MATRIX[key]?.surfaces[s];
+          if (!eps || Object.keys(eps).length === 0) { missing.push(`${key} × ${s}`); continue; }
+          for (const ep of SURFACE_ENDPOINTS[s] ?? []) if (!eps[ep]) missing.push(`${key} × ${s}/${ep}`);
+        }
       }
       return missing;
     };
@@ -357,6 +481,11 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
         "coverage-2: a fixture key with an uncovered surface is reported");
       assertEq(missingMatrixCoverage([...enforce.ENFORCED_OWNER_FEATURE_KEYS, "visibility.leaderboard"], reg.OWNER_FEATURE_REGISTRY), ["visibility.leaderboard × leaderboard"],
         "coverage-3: a newly enforced key without probes is reported");
+      const removed = MATRIX["contact.phone"].surfaces.mcp_search.lokal_find_offers;
+      delete MATRIX["contact.phone"].surfaces.mcp_search.lokal_find_offers;
+      assertEq(missingMatrixCoverage(enforce.ENFORCED_OWNER_FEATURE_KEYS, reg.OWNER_FEATURE_REGISTRY), ["contact.phone × mcp_search/lokal_find_offers"],
+        "coverage-4: a surface endpoint without a probe is reported");
+      MATRIX["contact.phone"].surfaces.mcp_search.lokal_find_offers = removed;
       for (const key of enforce.ENFORCED_OWNER_FEATURE_KEYS) {
         const e = reg.getOwnerFeature(key);
         assertEq(e.status, "coming_soon", `status-1: ${key} stays coming_soon until the S2d switch probe`);
@@ -377,6 +506,13 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
         vcard: strip(await vcard(id)),
         info: JSON.stringify(await restInfo(id)),
         rest_search: JSON.stringify(await restSearch(id)),
+        rest_discover: JSON.stringify(await restDiscover(id)),
+        lokal_search_compact: await toolText("lokal_search", { query: "poteter" }),
+        lokal_find_offers: await toolText("lokal_find_offers", { items: ["listepoteter"], lat: 59.9139, lng: 10.7522 }),
+        mcp_resource: json(await resource(id)),
+        a2a_agent_info: json(await a2aInfo(id)),
+        home: await home(),
+        city: String((await invoke(H.city, makeReq({ params: { city: "oslo" } }))).body ?? ""),
         feed: JSON.stringify(await feedItem(id)),
         acp_csv: await acpCsv(),
       };
@@ -400,9 +536,9 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       const again = await snapshot(ENF_ID);
       sameSnapshot(baseline, again, "base-0: two runs without choices");
       for (const [key, m] of Object.entries(MATRIX)) {
-        for (const [surface, c] of Object.entries(m.surfaces)) {
+        for (const { label, c } of cases(m)) {
           clearRegistryCaches();
-          assertEq(await state(c, ENF_ID), c.today === false ? "absent" : "shown", `base-1: ${key} × ${surface} shown today`);
+          assertEq(await state(c, ENF_ID), todayState(c), `base-1: ${key} × ${label} as today`);
         }
       }
     }
@@ -429,7 +565,7 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       assertTrue(hidden.profile_html !== baseline.profile_html && hidden.lokal_info !== baseline.lokal_info,
         "gate-6: enforce on + allowlisted + live keys → the surfaces change");
       const twin = await snapshot(TWIN_ID);
-      for (const k of ["lokal_discover", "acp_csv"]) { delete twin[k]; delete baselineTwin[k]; }
+      for (const k of ["lokal_discover", "acp_csv", "lokal_search_compact", "lokal_find_offers", "home", "city"]) { delete twin[k]; delete baselineTwin[k]; }
       sameSnapshot(baselineTwin, twin, "gate-7: a neighbour outside the allowlist stays as before");
 
       // No lookup query at all while not enforced.
@@ -463,7 +599,7 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       clearChoices();
       db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at)
                   VALUES ('rfb', ?, 'contact.phone', 'false', 'admin', 1, ?)`).run(ENF_ID, new Date().toISOString());
-      assertEq(await state(MATRIX["contact.phone"].surfaces.mcp_info, ENF_ID), "absent", "admin-1: an admin lock hides the phone with the real registry");
+      assertEq(await state(MATRIX["contact.phone"].surfaces.mcp_info.lokal_info, ENF_ID), "absent", "admin-1: an admin lock hides the phone with the real registry");
       clearChoices();
       enforce.__setEnforceRegistryForTesting(LIVE);
     }
@@ -476,11 +612,11 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       const steps: Array<[string, unknown | undefined, boolean]> = [["default", undefined, true], ["off", m.off, false], ["on", m.on, true]];
       for (const [step, value, shown] of steps) {
         if (value !== undefined) setChoice(key, value);
-        for (const [surface, c] of Object.entries(m.surfaces)) {
+        for (const { label, c } of cases(m)) {
           clearRegistryCaches();
-          const expected = c.today === false || !shown ? "absent" : "shown";
-          assertEq(await state(c, ENF_ID), expected, `matrix: ${key} × ${surface} ${step} → ${expected}`);
-          if (step === "off") assertEq(await state(c, TWIN_ID), c.today === false ? "absent" : "shown", `matrix: ${key} × ${surface} off leaves the neighbour as before`);
+          const expected = c.kept ? "shown" : c.today === false || !shown ? "absent" : "shown";
+          assertEq(await state(c, ENF_ID), expected, `matrix: ${key} × ${label} ${step} → ${expected}`);
+          if (step === "off") assertEq(await state(c, TWIN_ID), todayState(c), `matrix: ${key} × ${label} off leaves the neighbour as before`);
         }
       }
     }
@@ -505,6 +641,12 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
         "detail-6: the owner's /selger read (X-Claim-Token) still gets the full record");
       const wrongClaim = await restInfo(ENF_ID, "not-a-claim");
       assertTrue(wrongClaim?.data?.knowledge?.phone === undefined, "detail-7: an unknown claim token gets the public read");
+      const otherClaim = await restInfo(ENF_ID, TWIN_CLAIM);
+      assertTrue(otherClaim?.data?.knowledge?.phone === undefined && otherClaim?.data?.knowledge?.address === undefined &&
+        otherClaim?.data?.agent?.trustScore === undefined,
+        "detail-7b: a valid verified claim token for another agent gets the public read");
+      assertTrue(!(await vcard(ENF_ID)).includes("\r\nGEO:") && !(await vcard(TWIN_ID)).includes("\r\nGEO:"),
+        "detail-9: vCard carries no GEO line (getAgentInfo's agent has no coordinates); the address guard covers it if that changes");
       const csv = await acpCsv();
       assertTrue(!csv.includes(`prod-${ENF_ID}`) && csv.includes(`prod-${TWIN_ID}`), "detail-8: ACP CSV leaves out the hidden-price producer's rows only");
       clearChoices();
@@ -526,6 +668,27 @@ export async function runOwnerFeaturesS2cTests(opts: { log?: boolean } = {}): Pr
       assertEq(enforce.withoutHiddenContact(k, { phone: false, address: false, prices: true, publicCounts: true, publicSearchTerms: true, publicTrust: true }), { email: "a@b.no" },
         "helper-7: phone, address and postal code removed");
       assertEq(k.phone, PHONE, "helper-8: the input is not mutated");
+      const hideAddr = { phone: true, address: false, prices: true, publicCounts: true, publicSearchTerms: true, publicTrust: false };
+      assertEq(enforce.withoutHiddenCoordinates({ name: "x", location: { city: "Oslo", lat: 1, lng: 2 } }, hideAddr), { name: "x", location: { city: "Oslo" } },
+        "helper-9: coordinates removed when the address is hidden");
+      const infoIn = { agent: { id: "a", trustScore: 0.7, location: { city: "Oslo", lat: 1, lng: 2 } }, knowledge: { address: STREET, phone: PHONE } };
+      assertEq(enforce.publicAgentInfo(infoIn, hideAddr), { agent: { id: "a", location: { city: "Oslo" } }, knowledge: { phone: PHONE } },
+        "helper-10: publicAgentInfo drops coordinates, trust score and address");
+      assertTrue(enforce.publicAgentInfo(infoIn, null) === infoIn, "helper-11: not enforced → the same object");
+
+      // Fail closed: a lookup that throws hides every enforced field for allowlisted subjects only.
+      const throwingDb = { prepare() { throw new Error("boom"); } };
+      const env = { [ENFORCE_ENV]: "1", [ALLOW_ENV]: `rfb:${ENF_ID}` } as NodeJS.ProcessEnv;
+      const prevErr = console.error;
+      console.error = () => { /* expected */ };
+      try {
+        const fc = enforce.publicFieldChoicesForMany([ENF_ID, TWIN_ID], { db: throwingDb, env });
+        assertEq([...fc.keys()], [ENF_ID], "fail-1: only the allowlisted subject is affected");
+        assertEq(fc.get(ENF_ID), { phone: false, address: false, prices: false, publicCounts: false, publicSearchTerms: false, publicTrust: false },
+          "fail-2: a failed lookup hides every enforced field");
+      } finally {
+        console.error = prevErr;
+      }
     }
   } catch (err: any) {
     failed++;
