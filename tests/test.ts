@@ -44528,6 +44528,26 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2d: the owner
+  // portals' tiles (RFB selger.html, gårdssalg) show 12 months or «siden
+  // <dato>», like the public tiles. Swaps getDb() (restored in finally), so serial.
+  console.log("\n── owner-stats-year: owner portal tiles over 12 months ──");
+  try {
+    const { runOwnerStatsYearTests } = require("../src/services/owner-stats-year.test") as
+      typeof import("../src/services/owner-stats-year.test");
+    const r = await runOwnerStatsYearTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-stats-year: " + f);
+    console.log(`  owner-stats-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`owner-stats-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ owner-stats-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2b (admin part): the
   // dashboard's five cards with one site + «Siste år» are the strip's numbers
   // from the same snapshot; no «AI-visninger»; «Søk (nettsider og API)»; «Alle»

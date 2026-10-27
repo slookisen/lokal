@@ -21,8 +21,7 @@ import { redactPII } from "../utils/pii-redact";
 import { COUNTABLE_CONV_SQL, countableConvSql, isPublicQueryTerm } from "./a2a-traffic-classifier";
 import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { classifySession, storedClientClass, uaFromSessionId, aiVendorBucket, type SessionVelocity } from "./traffic-classifier";
-import { rollupBoundaryDateOn } from "./analytics-rollup-boundary";
-import { computeProfileYear, profileYearFrom, type ProfileYear } from "./profile-year-compute";
+import { computeProfileYear, profileYearRawFrom, type ProfileYear } from "./profile-year-compute";
 
 /**
  * A session is velocity-checked around its first view of this page. One
@@ -94,11 +93,6 @@ export function readSessionVelocity(
   }
 }
 
-/** 'YYYY-MM-DD' of the UTC day after `nowMs` (rollupBoundaryDateOn's value for an empty raw table). */
-function utcTomorrow(nowMs: number): string {
-  return new Date(nowMs + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-
 /**
  * The public stats payload for one producer page (`path` = /produsent/<slug>).
  * The caller has already resolved the agent and applied the quarantine gate.
@@ -139,10 +133,7 @@ export function computeAgentStats(
   // before it come from the stored daily sums (profile-year-compute.ts).
   // `views` and `first_seen` stay those of the 60-day window. The raw part
   // never starts before the 12-month window (a raw table that was not pruned).
-  const yearFrom = profileYearFrom(nowMs);
-  const hasAgentViews = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'analytics_agent_views'").get();
-  const rawFloor = hasAgentViews ? rollupBoundaryDateOn(db, "analytics_agent_views") : utcTomorrow(nowMs);
-  const rawFrom = rawFloor > yearFrom ? rawFloor : yearFrom;
+  const rawFrom = profileYearRawFrom(db, nowMs);
   const rawFromIso = `${rawFrom} 00:00:00`;
   const readFromIso = rawFromIso < cutoffIso ? rawFromIso : cutoffIso;
   const sessions = (db.prepare(`
