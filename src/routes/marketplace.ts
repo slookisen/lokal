@@ -57,6 +57,10 @@ import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
+import {
+  publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields,
+  hidesAddress, hidesPrices, hidesTrust, type PublicFieldChoices,
+} from "../owner-features/enforce";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423,
@@ -224,7 +228,7 @@ function ensureAgentInDb(agentId: string): boolean {
 // Used by /search, /discover (via enrichment) and /vcard endpoint.
 // Keeping these inline to avoid a new util module just yet.
 
-function buildContactBlock(agentId: string): {
+function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null): {
   address?: string;
   postalCode?: string;
   phone?: string;
@@ -237,7 +241,8 @@ function buildContactBlock(agentId: string): {
 } | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
-  const k = info.knowledge;
+  // S2c-1: without the phone / address the owner hid (choices null = as before).
+  const k = withoutHiddenContact(info.knowledge, choices);
   const displayablePhone = isDisplayablePhone(k.phone);
   const hasAnyContact = !!(k.address || displayablePhone || k.email || k.website);
   if (!hasAnyContact) {
@@ -299,7 +304,10 @@ const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`;
 function buildVCard(agentId: string): string | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
-  const { agent: _agent, knowledge: k } = info;
+  // S2c-1: the owner's contact / price / trust choices (null = as before).
+  const ownerChoices = publicFieldChoices(agentId);
+  const { agent: _agent } = info;
+  const k = withoutHiddenFields(info.knowledge, ownerChoices);
   const agent = _agent as any; // Cast for flexibility — agent shape varies
   const lines: string[] = [];
   lines.push("BEGIN:VCARD");
@@ -347,7 +355,7 @@ function buildVCard(agentId: string): string | null {
     }
   }
   // GEO field — helps contact apps show location
-  if (agent.location?.lat && agent.location?.lng && agent.location.lat !== 0) {
+  if (agent.location?.lat && agent.location?.lng && agent.location.lat !== 0 && !hidesAddress(ownerChoices)) {
     lines.push(`GEO:${agent.location.lat};${agent.location.lng}`);
   }
   // Google Maps search URL as custom field — AI agents and contact apps can use this
@@ -363,7 +371,7 @@ function buildVCard(agentId: string): string | null {
   const profileSlug = slugify(agent.name);
   lines.push(`X-LOKAL-PROFILE:https://rettfrabonden.com/produsent/${profileSlug}`);
   lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
-  if (agent.trustScore !== undefined && agent.trustScore !== null) {
+  if (agent.trustScore !== undefined && agent.trustScore !== null && !hidesTrust(ownerChoices)) {
     lines.push(`X-LOKAL-TRUST-SCORE:${Math.round(agent.trustScore * 100)}`);
   }
   lines.push(`REV:${new Date().toISOString()}`);
@@ -619,10 +627,11 @@ router.post("/discover", (req: Request, res: Response) => {
       });
     }
 
+    const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
     const enrichedResults = results.map((r: any) => ({
       ...r,
       agent: withSanitizedDescription(r.agent),
-      contact: buildContactBlock(r.agent.id),
+      contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
     }));
 
     // dev-request 2026-07-25 fix 0g(ii): structured discovery is a read-only
@@ -913,8 +922,10 @@ router.get("/search", async (req: Request, res: Response) => {
 
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
+  const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
   const enrichedResults = results.map((r: any) => {
-    const contact = buildContactBlock(r.agent.id);
+    const choices = ownerChoices.get(r.agent.id);
+    const contact = buildContactBlock(r.agent.id, choices);
     // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
     const profileUrl = failsProducerRoleGate(r.agent.role, false)
       ? undefined
@@ -935,7 +946,7 @@ router.get("/search", async (req: Request, res: Response) => {
           return {
             name: cleanName,
             category: p.category !== "other" ? p.category : undefined,
-            price: price || p.price || undefined,
+            price: hidesPrices(choices) ? undefined : price || p.price || undefined,
             seasonal: p.seasonal || undefined,
             organic: p.organic || undefined,
           };
@@ -1091,10 +1102,14 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     return;
   }
 
+  // S2c-1: the owner's contact / price / trust choices (null = as before).
+  const ownerChoices = publicFieldChoices(agentId);
+  if (hidesTrust(ownerChoices) && card["x-lokal"]) delete card["x-lokal"].trustScore;
+
   // Enrich with knowledge data so AI agents get the full picture
   const info = knowledgeService.getAgentInfo(agentId);
   if (info) {
-    const k = info.knowledge as any;
+    const k = withoutHiddenFields(info.knowledge as any, ownerChoices);
     const agent = info.agent as any;
     const cityName = agent.city || agent.location?.city || "";
 
@@ -1598,7 +1613,7 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
       return;
     }
   }
-  const info = knowledgeService.getAgentInfo(agentId);
+  let info = knowledgeService.getAgentInfo(agentId);
   if (!info) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
@@ -1621,6 +1636,16 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // above), after every existing field and, like `provenance`, omitted when
   // there are none; the existing fields are byte-identical.
   const openingHoursDisplay = openingHoursDisplayRows(info.knowledge.openingHours);
+  // S2c-1: the public read without what the owner hid. The owner's own
+  // /selger editor (X-Claim-Token for this agent) reads the full record, so
+  // a save from there never drops a hidden field.
+  const ownerChoices = publicFieldChoices(agentId);
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  if (ownerChoices && !(claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId)) {
+    const agentOut: any = { ...info.agent };
+    if (hidesTrust(ownerChoices)) delete agentOut.trustScore;
+    info = { ...info, agent: agentOut, knowledge: withoutHiddenFields(info.knowledge, ownerChoices) };
+  }
   const data = {
     ...info,
     ...(provenance ? { provenance } : {}),

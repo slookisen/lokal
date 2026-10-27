@@ -41,6 +41,7 @@ import { capFreeText, capName } from "../utils/free-text";
 // public LIST surfaces below (/feed, /acp-feed.csv). The direct-id order-flow
 // path /agents/:id/products deliberately does NOT use it.
 import { publiclyVisibleSql } from "../services/agent-visibility";
+import { publicFieldChoicesForMany, hidesPrices } from "../owner-features/enforce";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
 export const catalogRouter = Router();
@@ -378,12 +379,14 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
   // replaced with the effective (post supply-graph staleness check) value;
   // `availability_updated_at` is additive — new field, raw timestamp or null.
   const now = new Date();
+  // S2c-1 (products.show_prices): no amount for a producer who hid prices.
+  const ownerChoices = publicFieldChoicesForMany(rows.map(r => r.agent_id));
   const items = rows.map(r => ({
     id: r.id,
     title: r.name,
     description: r.description ?? null,
     price: {
-      amount: r.price_nok ?? null,
+      amount: hidesPrices(ownerChoices.get(r.agent_id)) ? null : r.price_nok ?? null,
       currency: r.currency,
     },
     availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
@@ -438,6 +441,7 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
       p.availability_source,
       p.category,
       p.image_url,
+      a.id AS agent_id,
       a.name AS agent_name
     FROM products p
     INNER JOIN agents a ON a.id = p.agent_id
@@ -459,8 +463,12 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
     availability_source: string;
     category: string | null;
     image_url: string | null;
+    agent_id: string;
     agent_name: string;
   }>;
+  // S2c-1 (products.show_prices): price is a required field, so a producer
+  // who hid prices is left out like a row without one.
+  const ownerChoices = publicFieldChoicesForMany(rows.map(r => r.agent_id));
 
   const header = [
     "item_id", "title", "description", "brand", "url", "image_url",
@@ -476,7 +484,7 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
     // Required-field skip guard: image_url and price_nok are nullable
     // columns. A row missing either is excluded entirely (telemetry-only,
     // not an error).
-    if (!r.image_url || r.price_nok == null) {
+    if (!r.image_url || r.price_nok == null || hidesPrices(ownerChoices.get(r.agent_id))) {
       skippedMissingRequired++;
       continue;
     }

@@ -215,7 +215,7 @@ const ORDERS_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
 };
 
 /** Public profile, structured data and AI read surfaces of a profile field. */
-const PROFILE_FIELD_SURFACES: OwnerFeatureSurface[] = ["profile_html", "json_ld", "mcp_info", "rest_card", "vcard"];
+const PROFILE_FIELD_SURFACES: OwnerFeatureSurface[] = ["profile_html", "json_ld", "mcp_search", "mcp_info", "rest_card", "vcard"];
 
 export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Hvem kan finne deg ──────────────────────────────────────────────────
@@ -329,7 +329,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     label: t("Vis priser", "Show prices"),
     description: t("Prisene dine vises på profilen, for AI-assistenter og i produktfeeder.", "Your prices are shown on your profile, to AI assistants and in product feeds."),
     default: { owner: true, unclaimed: true },
-    surfaces: ["profile_html", "json_ld", "mcp_search", "mcp_info", "acp_feed"],
+    surfaces: ["profile_html", "json_ld", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed"],
   }),
   entry({
     key: "products.stock_check", group: "products", type: "switch",
@@ -639,7 +639,7 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     advanced: true,
     devRequest: "2026-09-03-rfb-trust-score-offentlig-visning",
-    surfaces: ["profile_html", "rest_card", "mcp_info"],
+    surfaces: ["profile_html", "rest_card", "vcard", "mcp_info"],
   }),
   entry({
     key: "stats.share_partner", group: "stats", type: "switch",

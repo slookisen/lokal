@@ -307,6 +307,66 @@ export function resolveOwnerFeatures(
   return { subject: r.subject, features, byKey };
 }
 
+/**
+ * Some keys, resolved for several subjects with one query (agents LEFT JOIN
+ * owner_feature_settings) — for list surfaces. Subjects that do not exist
+ * are left out of the map. Adapter entries among `keys` (or their
+ * dependencies) still read their column per subject.
+ */
+export function resolveOwnerFeatureKeysForSubjects(
+  vertical: OwnerFeatureVertical,
+  subjectIds: Iterable<string>,
+  keys: readonly OwnerFeatureKey[],
+  opts: OwnerFeatureOptions = {},
+): Map<string, Record<string, ResolvedOwnerFeature>> {
+  assertVertical(vertical);
+  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  for (const key of keys) getOwnerFeature(key, registry);
+  const ids = [...new Set(subjectIds)].filter((id) => typeof id === "string" && id.length > 0);
+  const out = new Map<string, Record<string, ResolvedOwnerFeature>>();
+  if (ids.length === 0) return out;
+  const db = opts.db ?? getDb();
+  const rows = db
+    .prepare(
+      `SELECT a.id AS id, a.is_verified AS is_verified, ${customerRuleSql("a")} AS owned,
+              s.key AS key, s.value_json AS value_json, s.set_by AS set_by, s.admin_locked AS admin_locked
+         FROM agents a
+         LEFT JOIN owner_feature_settings s ON s.vertical = ? AND s.subject_id = a.id
+        WHERE a.id IN (${ids.map(() => "?").join(",")})`,
+    )
+    .all(vertical, ...ids) as Array<{
+      id: string; is_verified: number | null; owned: number;
+      key: string | null; value_json: string | null; set_by: string | null; admin_locked: number | null;
+    }>;
+  const subjects = new Map<string, { subject: OwnerFeatureSubject; stored: Map<string, StoredSetting> }>();
+  for (const r of rows) {
+    let s = subjects.get(r.id);
+    if (!s) {
+      const verifiedOwner = r.owned === 1;
+      s = {
+        subject: {
+          vertical, subjectId: r.id, exists: true, verifiedOwner,
+          isVerifiedBadge: r.is_verified === 1, segment: verifiedOwner ? "owner" : "unclaimed",
+        },
+        stored: new Map(),
+      };
+      subjects.set(r.id, s);
+    }
+    if (r.key === null || r.value_json === null) continue;
+    try {
+      s.stored.set(r.key, { value: JSON.parse(r.value_json), set_by: r.set_by || "", admin_locked: r.admin_locked === 1 });
+    } catch { /* unreadable row → registry default */ }
+  }
+  const env = opts.env ?? process.env;
+  for (const [id, s] of subjects) {
+    const resolver = new Resolver(s.subject, s.stored, registry, env, db);
+    const byKey: Record<string, ResolvedOwnerFeature> = {};
+    for (const key of keys) byKey[key] = resolver.resolve(key);
+    out.set(id, byKey);
+  }
+  return out;
+}
+
 /** One key, resolved. Unknown key → UnknownOwnerFeatureError. */
 export function resolveOwnerFeature(
   vertical: OwnerFeatureVertical,

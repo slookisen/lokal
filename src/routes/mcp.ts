@@ -63,6 +63,7 @@ import { isOrderAgentActionsEnabled, applyBuyerOrderCommand, buyerOrderStatusExt
 import { isOrderMessagesEnabled, ORDER_MESSAGES_UNTRUSTED_NOTE, ORDER_MESSAGE_MAX_CHARS, ORDER_MESSAGE_RATE_LIMIT } from "../services/order-messages";
 import { norwegianTermsForEnglishQuery } from "../i18n/product-glossary";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS, MCP_MAX_FILTER_LIST, MCP_MAX_SHOPPING_ITEMS, mcpListTooLongResult } from "../services/mcp-input-limits";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, hidesPrices, type PublicFieldChoices } from "../owner-features/enforce";
 
 const router = Router();
 
@@ -180,7 +181,8 @@ export const MCP_CATEGORY_LABELS_NOTE =
 export function formatProductsForMcp(
   products: unknown,
   productIdByNorm?: Map<string, string>,
-  availabilityByNorm?: Map<string, CatalogAvailability>
+  availabilityByNorm?: Map<string, CatalogAvailability>,
+  opts: { hidePrices?: boolean } = {}
 ): string {
   if (!Array.isArray(products) || !products.length) return "";
 
@@ -215,7 +217,7 @@ export function formatProductsForMcp(
 
     // Product line
     const cat = typeof p.category === "string" && p.category && p.category !== "other" ? ` [${p.category}]` : "";
-    const priceStr = price ? ` — ${price}` : "";
+    const priceStr = price && !opts.hidePrices ? ` — ${price}` : "";
     const seasonal = p.seasonal ? " 🌿sesong" : "";
     // orch-pr-14: append the catalog product_id when this product exists in the
     // products table (in_stock). This is the id an MCP-only agent passes to
@@ -285,12 +287,14 @@ interface AgentKnowledgeSummary {
   productSummary?: string;
   productsCount: number;
   products?: readonly unknown[];
+  /** S2c-1: the owner hid prices (products.show_prices). */
+  hidePrices?: boolean;
 }
 
 // Build contact + product summary for a given agent ID, used by search results.
 // I-F: one row's error leaves its summary out (knowledgeRowOrSkip).
-function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledgeSummary {
-  return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId));
+function getAgentKnowledgeSummary(tool: string, agentId: string, choices?: PublicFieldChoices | null): AgentKnowledgeSummary {
+  return knowledgeRowOrSkip(tool, agentId, { productsCount: 0 }, () => buildAgentKnowledgeSummary(agentId, choices));
 }
 
 /**
@@ -299,22 +303,23 @@ function getAgentKnowledgeSummary(tool: string, agentId: string): AgentKnowledge
  * products here either (isCategoryLabelProduct), so a producer with only
  * labels has no line.
  */
-function productSummaryText(realProducts: readonly unknown[]): string | undefined {
+function productSummaryText(realProducts: readonly unknown[], hidePrices = false): string | undefined {
   const listed = realProducts.filter((p) => !isCategoryLabelProduct(p));
   const topItems = listed.slice(0, 5).map((p: any) => {
     const { cleanName, price } = parseProductPrice(p);
-    return price ? `${cleanName} (${price})` : cleanName;
+    return price && !hidePrices ? `${cleanName} (${price})` : cleanName;
   });
   return topItems.length
     ? `🛒 ${topItems.join(", ")}${listed.length > 5 ? ` +${listed.length - 5} flere` : ""}`
     : undefined;
 }
 
-function buildAgentKnowledgeSummary(agentId: string): AgentKnowledgeSummary {
+function buildAgentKnowledgeSummary(agentId: string, choices?: PublicFieldChoices | null): AgentKnowledgeSummary {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return { productsCount: 0 };
 
-  const k = info.knowledge || {} as any;
+  const k = withoutHiddenContact(info.knowledge || {} as any, choices);
+  const hidePrices = hidesPrices(choices);
   const contact: any = {};
   if (k.address) contact.address = k.address;
   if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
@@ -330,9 +335,10 @@ function buildAgentKnowledgeSummary(agentId: string): AgentKnowledgeSummary {
   return {
     contact: Object.keys(contact).length ? contact : undefined,
     // Compact view: top 5 product names with prices
-    productSummary: productSummaryText(realProducts),
+    productSummary: productSummaryText(realProducts, hidePrices),
     productsCount: realProducts.length,
     products: realProducts,
+    ...(hidePrices ? { hidePrices } : {}),
   };
 }
 
@@ -904,7 +910,7 @@ export function registerTools(
         if (documented && summary.products) {
           const names = new Set(matchedNames.map((n) => n.trim().toLowerCase()));
           const shown = productsWithMatchesShown(summary.products, (p) => isListedMatch(p, names, labelWords));
-          if (shown !== summary.products) productSummary = productSummaryText(shown);
+          if (shown !== summary.products) productSummary = productSummaryText(shown, summary.hidePrices);
         }
         return { categoryOnly, categoryLabelOnly, productSummary };
       };
@@ -912,8 +918,9 @@ export function registerTools(
       // Slice I-N (AI-3b): explicit matches come before category matches, as
       // the server instructions ask; discover()'s order (relevance, distance)
       // is kept within each group, and the numbering follows the new order.
+      const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
       const rows = results.map((r: any) => {
-        const summary = getAgentKnowledgeSummary("lokal_search", r.agent.id);
+        const summary = getAgentKnowledgeSummary("lokal_search", r.agent.id, ownerChoices.get(r.agent.id));
         return { r, summary, match: isSpecificQuery ? undefined : compactMatch(r, summary) };
       });
       const ordered = [...rows.filter((row) => !row.match?.categoryOnly), ...rows.filter((row) => row.match?.categoryOnly)];
@@ -943,7 +950,8 @@ export function registerTools(
             // Full product list — orch-pr-14: pass catalog id map so each
             // priced/in-stock product line carries its product_id for cart use.
             if (k.products?.length) {
-              const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+              const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id),
+                { hidePrices: hidesPrices(ownerChoices.get(agent.id)) });
               if (productSection) details.push(productSection);
             }
 
@@ -1092,6 +1100,7 @@ export function registerTools(
       // the same note on lokal_search above. No conversation is started here.
 
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
+      const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
       const lines = results.map((r: any, i: number) => {
         // Fase 1c honesty rule — see the same note in lokal_search above.
         const dist = r.agent.location?.distanceKm
@@ -1099,7 +1108,7 @@ export function registerTools(
           : r.agent.location?.distanceLabel
             ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
             : "";
-        const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id);
+        const summary = getAgentKnowledgeSummary("lokal_discover", r.agent.id, ownerChoices.get(r.agent.id));
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary, getClientIdentity?.()) + dist;
       });
 
@@ -1134,7 +1143,10 @@ export function registerTools(
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
-      const { agent, knowledge: k = {} as any, meta = {} as any } = info;
+      const { agent, knowledge: rawKnowledge = {} as any, meta = {} as any } = info;
+      // S2c-1: the owner's contact / price choices (null = not enforced).
+      const ownerChoices = publicFieldChoices(agent.id);
+      const k = withoutHiddenContact(rawKnowledge, ownerChoices);
       const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
       const sections: string[] = [`# ${agent.name}`];
 
@@ -1174,7 +1186,8 @@ export function registerTools(
       // orch-pr-14: attach catalog product_id (products.id) to each in-stock
       // product so an MCP-only agent can pass it straight to lokal_cart_add_item.
       if (k.products?.length) {
-        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
+        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id),
+          { hidePrices: hidesPrices(ownerChoices) });
         if (productSection) sections.push(productSection);
       }
 

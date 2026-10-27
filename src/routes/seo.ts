@@ -22,6 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
+import { publicFieldChoices, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -5333,7 +5334,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // withGoogleRating: the profile stat reads it, RATING_DISPLAY_MODE decides (S4-A1a).
     const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true });
-    const k = (info?.knowledge || {}) as any;
+    // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's
+    // contact / price / stats choices (null = not enforced, page as before).
+    const ownerChoices = publicFieldChoices(agent.id);
+    const k = withoutHiddenFields((info?.knowledge || {}) as any, ownerChoices);
     const meta = (info?.meta || {}) as any;
 
     // Render-time guard: nav/boilerplate scraped text masquerading as a real
@@ -6035,7 +6039,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.website) jsonLd.url = k.website;
 
     // Geo coordinates
-    if (agent.location?.lat && agent.location?.lng) {
+    if (agent.location?.lat && agent.location?.lng && !hidesAddress(ownerChoices)) {
       jsonLd.geo = {
         "@type": "GeoCoordinates",
         "latitude": agent.location.lat,
@@ -6139,13 +6143,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         let priceValue = typeof p === "object" ? (p.price || "") : "";
 
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
-        let priceNum = parseNokPrice(priceValue);
+        let priceNum = hidesPrices(ownerChoices) ? null : parseNokPrice(priceValue);
         if (priceNum === null) {
           // S6 del A: only a "kr" price the name shows, and the name is cut
           // only when it has one (splitNamePrice).
           const fromName = splitNamePrice(rawName, lang);
           productName = fromName.name;
-          priceNum = fromName.price;
+          priceNum = hidesPrices(ownerChoices) ? null : fromName.price;
         }
 
         // dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): Google
@@ -6407,11 +6411,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     let activityHtml = "";
     try {
       const activity = getProfileActivity(getDb(), agent.id, `/produsent/${slug}`);
-      const { views30, topQueryTerms, platforms } = activity;
-      const hasAnyActivity = views30.human > 0 || views30.ai > 0 || topQueryTerms.length > 0 || platforms.length > 0;
+      const showCounts = !ownerChoices || ownerChoices.publicCounts;
+      const { views30, platforms } = activity;
+      const topQueryTerms = !ownerChoices || ownerChoices.publicSearchTerms ? activity.topQueryTerms : [];
+      const hasAnyActivity = (showCounts && (views30.human > 0 || views30.ai > 0)) || topQueryTerms.length > 0 || platforms.length > 0;
 
       if (hasAnyActivity) {
-        const statsHtml = `<div class="act-grid">
+        const statsHtml = !showCounts ? "" : `<div class="act-grid">
           <div class="act-stat"><strong>${views30.human.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? `Profile views · ${views30.days}d` : `Profilvisninger · ${views30.days}d`}</small></div>
           <div class="act-stat"><strong>${views30.ai.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? `AI-agent lookups · ${views30.days}d` : `AI-agent-oppslag · ${views30.days}d`}</small></div>
         </div>`;
@@ -6499,9 +6505,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
           ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
-          <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans" : "Sidevisninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans" : "mennesker"}</span></small></div></div>
+          ${ownerChoices && !ownerChoices.publicCounts ? "" : `<div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans" : "Sidevisninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans" : "mennesker"}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents" : "AI-agenter"}</span></small></div></div>
-          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "en"))}. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "nb"))}. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>
+          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "en"))}. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "nb"))}. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>`}
         </div>
       </div>
 
