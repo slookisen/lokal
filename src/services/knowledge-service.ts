@@ -8,7 +8,7 @@ import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
 import {
   type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
-  getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, websiteHost,
+  getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, isRootWebsite, websiteHost,
 } from "./claim-domain-rule";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
@@ -957,7 +957,10 @@ class KnowledgeService {
    *   - field_provenance parses and website_ownership is not 'unverified'
    *     (the homepage crawl found the page does not name the producer);
    *   - the value parses to a public host that is not a hosting/social
-   *     platform (gard.wixsite.com, facebook.com/…).
+   *     platform, umbrella body, aggregator or public-sector host
+   *     (gard.wixsite.com, facebook.com/…, x.kommune.no, tine.no/…);
+   *   - the value is the domain's front page ("/", or /no, /en, /wp …),
+   *     never a deep page (isRootWebsite).
    * agents.url is not used: it is what a registration or discovery row was
    * created with, with no record of who supplied it.
    */
@@ -988,6 +991,9 @@ class KnowledgeService {
     if (wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified") return null;
     const host = websiteHost(row.website);
     if (!host || isHostedPlatformHost(host)) return null;
+    // Only the domain's front page: a deep page is someone's page ABOUT the
+    // farm (a municipality, a dairy, an umbrella body), not the farm's site.
+    if (!isRootWebsite(row.website)) return null;
     return host;
   }
 

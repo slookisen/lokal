@@ -74,7 +74,23 @@ export const FREE_MAIL_DOMAINS: ReadonlySet<string> = new Set([
   "getmail.no", "epost.no", "c2i.net", "altibox.no", "lyse.net", "telia.no", "telia.com", "netcom.no",
   "chello.no", "sol.no", "tele2.no", "nextgentel.com", "nextgentel.no", "bluecom.no", "ice.no", "kpnqwest.no",
   "loqal.no", "tdcadsl.no", "tiscali.no", "eunet.no", "frisurf.com", "haugnett.no", "enivest.net", "nkn.no",
-  "vikenfiber.no", "tussa.com", "kvinnherad.net", "online.com",
+  "vikenfiber.no", "tussa.com", "kvinnherad.net", "online.com", "msn.no", "icloud.no", "gmx.no",
+  // the same brands under other TLDs (review B1, 2026-10-28); FREE_MAIL_BRANDS
+  // below catches any TLD, this list just names the common ones
+  "hotmail.se", "hotmail.dk", "hotmail.de", "hotmail.fr", "live.se", "live.dk", "live.co.uk", "outlook.dk",
+  "yahoo.se", "yahoo.dk", "yahoo.de", "protonmail.ch", "web.de", "t-online.de",
+]);
+
+/**
+ * Free-mail brands: a domain whose registrable domain's first label is one of
+ * these (hotmail.se, yahoo.fr, gmx.at, t-online.de …) is free-mail whatever
+ * its TLD — anyone can get an account there, so it proves nothing (review B1).
+ */
+export const FREE_MAIL_BRANDS: ReadonlySet<string> = new Set([
+  "hotmail", "outlook", "live", "msn", "yahoo", "ymail", "gmail", "googlemail", "gmx", "icloud", "me", "mac",
+  "aol", "proton", "protonmail", "pm", "yandex", "mail", "web", "t-online", "orange", "free", "laposte",
+  "libero", "seznam", "wp", "tutanota", "tuta", "zoho", "fastmail", "hushmail", "inbox", "online", "start",
+  "frisurf", "epost",
 ]);
 
 /**
@@ -90,7 +106,26 @@ export const HOSTED_PLATFORM_DOMAINS: ReadonlySet<string> = new Set([
   "hjemmeside.no", "123hjemmeside.no", "bondensmarked.no", "rettfrabonden.com", "rekoringen.no", "mattilsynet.no",
   "brreg.no", "proff.no", "gulesider.no", "1881.no", "tripadvisor.com", "tripadvisor.no", "visitnorway.com",
   "visitnorway.no",
+  // more subdomain-based hosting (review N1, 2026-10-28)
+  "herokuapp.com", "pages.dev", "web.app", "firebaseapp.com", "azurewebsites.net", "webflow.io", "carrd.co",
+  "one.com", "onepage.website", "strikingly.com", "mystrikingly.com", "godaddysites.com", "ueniweb.com",
+  "wordpress.org", "wpcomstaging.com", "sites.google.com", "notion.site", "framer.website", "framer.app",
+  // umbrella organisations and aggregators: a farm's page there is theirs, not the farm's
+  "hanen.no", "lokalmat.no", "matmerk.no", "tine.no", "nortura.no", "bondelaget.no", "smabrukarlaget.no",
+  "norsk-landbruk.no", "landbruk.no", "debio.no", "reko.no", "bygdeturisme.no", "norgesvel.no",
+  // public sector and research: a page about a farm on their site is theirs
+  "kommune.no", "fylkeskommune.no", "regjeringen.no", "statsforvalteren.no", "landbruksdirektoratet.no",
+  "innovasjonnorge.no", "nibio.no", "nmbu.no", "uio.no", "uib.no", "ntnu.no", "uit.no", "inn.no", "hvl.no",
+  "nav.no", "altinn.no", "norge.no", "stortinget.no", "fylkesmannen.no",
 ]);
+
+/** TLDs and name patterns that are never one farm's own site (review N1). */
+const PLATFORM_TLDS: ReadonlySet<string> = new Set(["gov", "edu", "mil", "int"]);
+const PLATFORM_DOMAIN_PATTERNS: readonly RegExp[] = [
+  /^visit[a-z0-9-]*\.(?:no|com)$/,   // visitnorway.com, visitoslo.no, visithelgeland.com …
+  /^jimdo[a-z0-9-]*\.com$/,          // jimdo.com, jimdofree.com, jimdosite.com …
+  /^(?:[a-z0-9-]+\.)?gov\.[a-z]{2}$/, // gov.uk-style government suffixes
+];
 
 /**
  * Second-level public suffixes, so a "registrable domain" is one label more
@@ -183,11 +218,44 @@ function inDomainSet(host: string, set: ReadonlySet<string>): boolean {
 }
 
 export function isFreeMailDomain(domain: string): boolean {
-  return inDomainSet(domain, FREE_MAIL_DOMAINS);
+  if (inDomainSet(domain, FREE_MAIL_DOMAINS)) return true;
+  const reg = registrableDomain(domain);
+  return reg !== null && FREE_MAIL_BRANDS.has(reg.split(".")[0]!);
 }
 
+/** A hosting/social platform, umbrella organisation, aggregator or public-
+ *  sector host: never an independent website for P1. */
 export function isHostedPlatformHost(host: string): boolean {
-  return inDomainSet(host, HOSTED_PLATFORM_DOMAINS);
+  if (inDomainSet(host, HOSTED_PLATFORM_DOMAINS)) return true;
+  const labels = host.split(".");
+  if (PLATFORM_TLDS.has(labels[labels.length - 1]!)) return true;
+  const reg = registrableDomain(host);
+  const last2 = labels.slice(-2).join(".");
+  return PLATFORM_DOMAIN_PATTERNS.some((re) => re.test(last2) || (reg !== null && re.test(reg)));
+}
+
+/** Paths that still count as the site's front page (language or CMS roots). */
+const ROOT_PATHS: ReadonlySet<string> = new Set([
+  "", "/no", "/nb", "/nn", "/en", "/wp", "/home", "/hjem", "/forside", "/index.html", "/index.htm", "/index.php",
+]);
+
+/**
+ * Is the website value the domain's front page (empty path, "/", or one
+ * index-ish segment such as /no, /en, /wp, /home)? A deep page
+ * (kommune.no/naering/gard) is someone's page ABOUT the farm, so P1 only
+ * trusts a front page (review N1). Query and fragment are ignored.
+ */
+export function isRootWebsite(website: unknown): boolean {
+  if (typeof website !== "string" || !website.trim()) return false;
+  const raw = website.trim();
+  let u: URL;
+  try {
+    u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+  } catch {
+    return false;
+  }
+  const path = u.pathname.replace(/\/+$/, "").toLowerCase();
+  return ROOT_PATHS.has(path);
 }
 
 /**
@@ -234,14 +302,43 @@ export function isPublicIp(addr: string): boolean {
     return true;
   }
   if (kind === 6) {
-    const v = addr.toLowerCase();
-    const mapped = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isPublicIp(mapped[1]!);
-    if (v === "::" || v === "::1" || v.startsWith("::ffff:") || v.startsWith("64:ff9b:")) return false;
-    if (/^f[cd]/.test(v) || /^fe[89ab]/.test(v) || v.startsWith("ff")) return false;
+    const g = expandIpv6(addr);
+    if (!g) return false;
+    // ::/8 — unspecified, loopback, IPv4-compatible (::/96) and IPv4-mapped
+    // (::ffff:0:0/96) all start with a zero group: refused outright, whatever
+    // IPv4 address they carry (review N4).
+    if (g[0] === 0) return false;
+    if (g[0] === 0x2002) return false;                  // 6to4 2002::/16
+    if (g[0] === 0x2001 && g[1] === 0) return false;    // Teredo 2001::/32
+    if (g[0] === 0x2001 && g[1] === 0xdb8) return false; // documentation
+    if (g[0] === 0x64 && g[1] === 0xff9b) return false; // NAT64 64:ff9b::/96 (and /48)
+    if ((g[0]! & 0xfe00) === 0xfc00) return false;      // unique-local fc00::/7
+    if ((g[0]! & 0xffc0) === 0xfe80) return false;      // link-local fe80::/10
+    if ((g[0]! & 0xffc0) === 0xfec0) return false;      // site-local fec0::/10
+    if ((g[0]! & 0xff00) === 0xff00) return false;      // multicast ff00::/8
     return true;
   }
   return false;
+}
+
+/** An IPv6 address as its 8 16-bit groups (also "::" and an IPv4 tail), or null. */
+function expandIpv6(addr: string): number[] | null {
+  let v = addr.toLowerCase().replace(/%.*$/, "");
+  const v4 = v.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4) {
+    if (net.isIP(v4[2]!) !== 4) return null;
+    const o = v4[2]!.split(".").map(Number);
+    v = `${v4[1]}${((o[0]! << 8) | o[1]!).toString(16)}:${((o[2]! << 8) | o[3]!).toString(16)}`;
+  }
+  const halves = v.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  const groups = [...head, ...Array(fill).fill("0"), ...tail];
+  if (groups.length !== 8 || groups.some((x) => !/^[0-9a-f]{1,4}$/.test(x))) return null;
+  return groups.map((x) => parseInt(x, 16));
 }
 
 /** The HTTPS probe: does `https://<domain>/` give any HTTP answer below 500? */

@@ -190,7 +190,7 @@ export async function runRfbClaimDomeneregelTests(opts: { log?: boolean } = {}):
     // ══ (ac1) P1: independent website + same domain → code to the claimant ══
     flagOn();
     {
-      agent("p1", { website: "https://www.gardp1.no/om-oss" });
+      agent("p1", { website: "https://www.gardp1.no/" });
       eq(knowledgeService.independentWebsiteHost("p1"), "www.gardp1.no", "ac1: an enrichment-written website (data_source auto) is independent");
       const m0 = mails.length;
       const p0 = probed.length;
@@ -252,6 +252,18 @@ export async function runRfbClaimDomeneregelTests(opts: { log?: boolean } = {}):
         ["np-curbad", { website: "https://np-curbad.no", curated: "{not json" }, "curated_fields unreadable"],
         ["np-wo", { website: "https://np-wo.no", provenance: JSON.stringify({ website_ownership: { status: "unverified" } }) }, "website_ownership unverified"],
         ["np-host", { website: "https://np-host.wixsite.com/gard" }, "a hosting platform"],
+        // review N1: platforms, umbrella bodies, public sector, deep pages
+        ["np-kommune", { website: "https://www.oyer.kommune.no/" }, "a municipality (kommune.no)"],
+        ["np-fylke", { website: "https://innlandetfylke.fylkeskommune.no" }, "a county (fylkeskommune.no)"],
+        ["np-tine", { website: "https://www.tine.no/" }, "an umbrella body (tine.no)"],
+        ["np-heroku", { website: "https://np-heroku.herokuapp.com" }, "herokuapp.com"],
+        ["np-pages", { website: "https://np-pages.pages.dev/" }, "pages.dev"],
+        ["np-webapp", { website: "https://np.web.app" }, "web.app"],
+        ["np-jimdo", { website: "https://np.jimdosite.com" }, "jimdo* hosting"],
+        ["np-visit", { website: "https://www.visitoslo.no/" }, "a visit*.no portal"],
+        ["np-gov", { website: "https://www.usda.gov/" }, "a .gov host"],
+        ["np-deep", { website: "https://np-deep.no/naering/gard" }, "a deep path"],
+        ["np-deep2", { website: "https://np-deep2.no/produkter/" }, "a one-segment non-index path"],
       ];
       for (const [id, o, why] of notIndependent) {
         agent(id, o);
@@ -267,6 +279,18 @@ export async function runRfbClaimDomeneregelTests(opts: { log?: boolean } = {}):
       }
       eq(mails.length, m0, "ac2: no mail sent");
       eq(knowledgeService.assessClaimDomain("np-host", "x@wixsite.com").route, "p2_candidate", "ac2: a hosting-platform website never gives P1");
+      eq(knowledgeService.assessClaimDomain("np-kommune", "ola@oyer.kommune.no").route, "p2_candidate", "ac2(N1): a kommune address on a kommune website is not P1");
+      eq(knowledgeService.assessClaimDomain("np-tine", "x@tine.no").route, "p2_candidate", "ac2(N1): a tine.no address on a tine page is not P1");
+      eq(knowledgeService.assessClaimDomain("np-heroku", "x@herokuapp.com").route, "p2_candidate", "ac2(N1): herokuapp.com is not P1");
+      eq(knowledgeService.assessClaimDomain("np-pages", "x@np-pages.pages.dev").route, "p2_candidate", "ac2(N1): pages.dev is not P1");
+      eq(knowledgeService.assessClaimDomain("np-deep", "post@np-deep.no").route, "p2_candidate", "ac2(N1): a deep-path website falls to P2/queue logic");
+      // Root-ish paths still count (Hafjell's site is hafjellysteri.no/wp/).
+      for (const [id, w] of [["root-wp", "https://root-wp.no/wp/"], ["root-en", "root-en.no/en"], ["root-q", "https://root-q.no/?lang=no"], ["root-idx", "https://root-idx.no/index.php"]] as const) {
+        agent(id, { website: w });
+        eq(knowledgeService.assessClaimDomain(id, `post@${id}.no`).route, "p1", `ac2(N1): ${w} counts as the front page → P1`);
+      }
+      eq([rule.isRootWebsite("gard.no"), rule.isRootWebsite("https://gard.no/"), rule.isRootWebsite("https://gard.no/nb/"), rule.isRootWebsite("https://gard.no/a/b")],
+        [true, true, true, false], "ac2(N1): isRootWebsite");
       probeAnswer = async () => true;
       // With a working domain, the self-registered profile goes P2 instead (ac5 checks the outcome).
       const r2 = await claim("np-hybrid", { name: "X", email: "x@np-hybrid.no" });
@@ -287,6 +311,23 @@ export async function runRfbClaimDomeneregelTests(opts: { log?: boolean } = {}):
       eq([mails.length, probed.length], [m0, p0], "ac3: no mail and no HTTPS probe for free-mail");
       ok(rule.FREE_MAIL_DOMAINS.has("gmail.com") && rule.FREE_MAIL_DOMAINS.has("online.no") && rule.FREE_MAIL_DOMAINS.has("altibox.no"),
         "ac3: the list is one exported constant");
+      // Review B1: the same brands under other TLDs are free-mail too.
+      for (const d of ["hotmail.se", "hotmail.dk", "hotmail.de", "hotmail.fr", "live.se", "live.dk", "live.co.uk", "outlook.dk",
+        "yahoo.se", "yahoo.dk", "yahoo.de", "msn.no", "icloud.no", "gmx.no", "protonmail.ch", "web.de", "t-online.de",
+        "gmx.at", "yahoo.fr", "outlook.com.au", "mail.ru", "orange.fr", "free.fr", "laposte.net", "libero.it", "seznam.cz",
+        "wp.pl", "inbox.lv", "hushmail.com", "pm.me", "proton.me", "tuta.com", "zoho.eu", "fastmail.fm", "me.com", "mac.com", "epost.no"]) {
+        eq(rule.isFreeMailDomain(d), true, `ac3(B1): ${d} is free-mail`);
+      }
+      for (const d of ["gard.no", "hotmailgard.no", "gardlive.no", "post.gard.co.uk"]) {
+        eq(rule.isFreeMailDomain(d), false, `ac3(B1): ${d} is not free-mail`);
+      }
+      probeAnswer = async () => true;
+      const pb = probed.length;
+      const mb = mails.length;
+      agent("fm-b1", { origin: "self_registered" });
+      const rb = await claim("fm-b1", { name: "Anon", email: "anon@hotmail.se" });
+      eq([rb.status, claimRow(rb.body.data.claimId)?.recommendation, mails.length - mb, probed.length - pb], [202, "free_mail_needs_extra", 0, 0],
+        "ac3(B1): hotmail.se on a self-registered profile → queue, no probe, no P2 code");
     }
 
     // ══ (ac4) owner → has_owner, unchanged ═══════════════════════════════
@@ -415,7 +456,14 @@ export async function runRfbClaimDomeneregelTests(opts: { log?: boolean } = {}):
       for (const ip of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "224.0.0.1"]) {
         eq(rule.isPublicIp(ip), false, `ac8: not a public address: ${ip}`);
       }
-      eq([rule.isPublicIp("195.88.54.16"), rule.isPublicIp("2a02:c7f::1")], [true, true], "ac8: public v4/v6 addresses pass");
+      // review N4: IPv6 forms that carry or translate IPv4 are refused outright.
+      for (const ip of ["::", "::8.8.8.8", "::c0a8:101", "::ffff:8.8.8.8", "::ffff:10.0.0.1", "0:0:0:0:0:ffff:7f00:1", "::ffff:0:a00:1",
+        "2002:c0a8:101::1", "2002:808:808::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001::1", "64:ff9b::8.8.8.8", "64:ff9b::a00:1",
+        "64:ff9b:1::1", "fec0::1", "2001:db8::1", "fe80::1%eth0"]) {
+        eq(rule.isPublicIp(ip), false, `ac8(N4): not a public address: ${ip}`);
+      }
+      eq([rule.isPublicIp("195.88.54.16"), rule.isPublicIp("2a02:c7f::1"), rule.isPublicIp("2001:4860:4860::8888"), rule.isPublicIp("2606:4700::1111")],
+        [true, true, true, true], "ac8: public v4/v6 addresses pass");
       // The default probe refuses unsafe names before any network call.
       for (const d of ["localhost", "127.0.0.1", "gard.internal", "gard.test"]) {
         eq(await rule.defaultDomainAnswersHttps(d), false, `ac8: default probe answers false for ${d} without a request`);
