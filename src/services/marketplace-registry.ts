@@ -37,9 +37,10 @@ import { norwegianTermsForEnglishQuery, isEnglishFoodWord } from "../i18n/produc
 // isolation rule as geo-distance.ts and product-glossary.ts above.
 import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink-taxonomy";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
-// public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
-// imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
+// public-listability predicate (catalog_hidden + RFB vertical). PURE (no
+// project imports; only node:async_hooks for the S2d-2 as-public view), same
+// isolation rule as geo-distance.ts above.
+import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, isAsPublicView, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -1814,6 +1815,12 @@ class MarketplaceRegistry {
       const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC").all() as any[];
       return rows.map(r => this.rowToAgent(r)!);
     }
+    // S2d-2 «Vis som offentlig»: an as-public view (admin key + ?as_public=1)
+    // sees the test fixture, so it neither reads nor fills the shared cache.
+    if (isAsPublicView()) {
+      return (db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[])
+        .map(r => this.rowToAgent(r)!);
+    }
     const now = Date.now();
     if (this._agentsCache && (now - this._agentsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
       return this._agentsCache;
@@ -1958,7 +1965,9 @@ class MarketplaceRegistry {
 
   getStats(): { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } {
     const now = Date.now();
-    if (this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
+    // S2d-2: an as-public view (it counts the test fixture) neither reads nor fills the cache.
+    const asPublic = isAsPublicView();
+    if (!asPublic && this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
       return this._statsCache;
     }
     const db = getDb();
@@ -1994,12 +2003,14 @@ class MarketplaceRegistry {
       if (normalized) normalizedCities.add(normalized);
     }
 
-    this._statsCache = {
+    const stats = {
       totalAgents: total,
       activeProducers,
       cities: Array.from(normalizedCities),
       totalListings,
     };
+    if (asPublic) return stats;
+    this._statsCache = stats;
     this._statsCacheTime = now;
     return this._statsCache;
   }

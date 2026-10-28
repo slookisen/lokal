@@ -1195,7 +1195,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     let cardHasProfilePage = true;
     try {
       const gateRow = getDb()
-        .prepare("SELECT role, umbrella_type, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?")
+        .prepare("SELECT role, umbrella_type, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?")
         .get(agentId) as any;
       if (gateRow) cardHasProfilePage = hasProducerPage(gateRow);
     } catch { /* fail-open: keep the link, as before */ }

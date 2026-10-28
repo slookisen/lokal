@@ -60,7 +60,7 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, isAsPublicView, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
@@ -5113,8 +5113,8 @@ function passesRoleGate(
   let roleGateListable = true;
   try {
     const row = getDb()
-      .prepare("SELECT umbrella_type, is_vetted, catalog_hidden, vertical_id FROM agents WHERE id = ?")
-      .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
+      .prepare("SELECT umbrella_type, is_vetted, catalog_hidden, vertical_id, origin FROM agents WHERE id = ?")
+      .get(agent.id) as { umbrella_type: string | null; is_vetted: number | null; catalog_hidden: number | null; vertical_id: string | null; origin: string | null } | undefined;
     roleGateUmbrellaType = row ? row.umbrella_type : null;
     // is_vetted defaults to 1 in the schema (see database/init.ts) — a
     // NULL/undefined read (shouldn't happen post-migration, but this
@@ -6829,6 +6829,9 @@ export function invalidateSitemapCache(): void {
  * so the handler answers 500 exactly as before.
  */
 export function getSitemapXml(now: number = Date.now(), build: () => string = buildSitemapXml): string {
+  // S2d-2 «Vis som offentlig»: an as-public view lists the test fixture, so it
+  // is built fresh and never served from or written to the shared cache.
+  if (isAsPublicView()) return build();
   if (sitemapCache && now - sitemapCache.builtAt < resolveSitemapCacheTtlMs()) return sitemapCache.xml;
   try {
     sitemapCache = { xml: build(), builtAt: now };

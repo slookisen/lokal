@@ -19,8 +19,11 @@
 // submit, /produsent/ordre/:token, admin inbox) deliberately do NOT use it:
 // the fixture must stay orderable by id while invisible in every list.
 //
-// PURE (no imports), so marketplace-registry.ts can use it without breaching
-// its rfb-vertical isolation (same rule as geo-distance.ts).
+// PURE (no project imports — only Node's async_hooks for the as-public view
+// below), so marketplace-registry.ts can use it without breaching its
+// rfb-vertical isolation (same rule as geo-distance.ts).
+
+import { AsyncLocalStorage } from "node:async_hooks";
 
 /** The only vertical whose `agents` rows are RFB food producers. */
 export const RFB_VERTICAL_ID = "rfb";
@@ -29,9 +32,50 @@ function col(alias: string | undefined, name: string): string {
   return alias ? `${alias}.${name}` : name;
 }
 
+// ─── «Vis som offentlig» — the as-public view (dev-request ─────────────────
+// 2026-10-22-rfb-mine-valg-eierbrytere, slice S2d-2, AC22) ───────────────────
+// The hidden RFB test fixture (origin = 'test_fixture' AND catalog_hidden = 1,
+// POST /admin/test-producer) is invisible everywhere, so an owner switch on it
+// («Mine valg», visibility.*) cannot be observed. A request that carries a
+// valid admin key AND the explicit opt-in `?as_public=1` (on one of the public
+// surfaces listed in middleware/as-public-view.ts) runs inside this
+// request-scoped context: the helpers in this file then read catalog_hidden as
+// 0 for rows with origin = 'test_fixture' ONLY. Every other gate (is_active,
+// vertical, vetting, role, owner pause, the owner's visibility choices) still
+// applies, so toggling a switch on the fixture is observable. A real hidden
+// row is never affected. Outside the context (every normal request, every
+// boot/background job) every helper answers byte-identically to before.
+
+/** The `agents.origin` the test fixture carries (routes/admin-test-producer.ts). */
+export const TEST_FIXTURE_ORIGIN = "test_fixture";
+
+const asPublicViewStore = new AsyncLocalStorage<true>();
+
+/** Is the current request an admin's «Vis som offentlig» view? */
+export function isAsPublicView(): boolean {
+  return asPublicViewStore.getStore() === true;
+}
+
+/** Run `fn` (and everything it awaits) as an as-public view. */
+export function runAsPublicView<T>(fn: () => T): T {
+  return asPublicViewStore.run(true, fn);
+}
+
 /** The catalog_hidden half of the predicate on its own. */
-export function notCatalogHiddenSql(alias?: string): string {
-  return `COALESCE(${col(alias, "catalog_hidden")}, 0) = 0`;
+export function notCatalogHiddenSql(alias?: string, opts: { asPublic?: boolean } = {}): string {
+  const base = `COALESCE(${col(alias, "catalog_hidden")}, 0) = 0`;
+  // As-public view: the fixture reads as not hidden. COALESCE keeps the OR
+  // two-valued, so NOT (…) (notPubliclyListableAgentIdsSql) stays exact.
+  if (opts.asPublic !== false && isAsPublicView()) {
+    return `(${base} OR COALESCE(${col(alias, "origin")}, '') = '${TEST_FIXTURE_ORIGIN}')`;
+  }
+  return base;
+}
+
+/** In-memory twin of notCatalogHiddenSql() for a raw `agents` row. */
+function catalogHiddenForView(row: { catalog_hidden?: number | null; origin?: string | null }): boolean {
+  if ((row.catalog_hidden ?? 0) === 0) return false;
+  return !(isAsPublicView() && row.origin === TEST_FIXTURE_ORIGIN);
 }
 
 /**
@@ -43,6 +87,7 @@ export function notCatalogHiddenSql(alias?: string): string {
  * without a fixture (including the minimal hand-built schemas older tests
  * use). Ids come from our own table and are quote-escaped. A failed read
  * (no column) also yields "" — fail-open, the fixture is merely re-verified.
+ * Deliberately NOT affected by the as-public view: not a public surface.
  */
 export function catalogHiddenIdExclusionSql(
   db: { prepare(sql: string): { all(...params: unknown[]): unknown[] } },
@@ -61,11 +106,13 @@ export function catalogHiddenIdExclusionSql(
 /**
  * SQL fragment for "publicly listable on an RFB surface". `alias` is the
  * table alias the caller's query uses for `agents` (omit for an unaliased
- * `FROM agents`). Always wrap-safe: it is a plain AND-chain with no OR, so it
- * can be appended as `AND ${publicListableSql("a")}` anywhere.
+ * `FROM agents`). Always wrap-safe: it is a plain AND-chain (the as-public
+ * view's OR is parenthesised), so it can be appended as `AND ${publicListableSql("a")}` anywhere.
  */
 export function publicListableSql(alias?: string, opts: { ownerChoices?: boolean } = {}): string {
-  const base = `${notCatalogHiddenSql(alias)} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
+  // `ownerChoices: false` (SQL that outlives the request) never carries the
+  // request-scoped as-public exception either.
+  const base = `${notCatalogHiddenSql(alias, { asPublic: opts.ownerChoices !== false })} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
   // S1b punkt 6: with OWNER_PAUSE_ENABLED on, an owner-paused profile is not
   // listable either. Flag off = the exact string above (byte-identical SQL).
   const paused = ownerPauseEnabled() ? `${base} AND ${notOwnerPausedSql(alias)}` : base;
@@ -156,9 +203,9 @@ export function notPubliclyListableAgentIdsSql(): string {
  * In-memory twin of publicListableSql() for a raw `agents` row (snake_case
  * columns). Missing/NULL columns read exactly like the SQL COALESCE defaults.
  */
-export function isPubliclyListable(row: ({ catalog_hidden?: number | null; vertical_id?: string | null } & OwnerPauseRow) | null | undefined): boolean {
+export function isPubliclyListable(row: ({ catalog_hidden?: number | null; vertical_id?: string | null; origin?: string | null } & OwnerPauseRow) | null | undefined): boolean {
   if (!row) return false;
-  if ((row.catalog_hidden ?? 0) !== 0) return false;
+  if (catalogHiddenForView(row)) return false;
   if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
   return (row.vertical_id ?? RFB_VERTICAL_ID) === RFB_VERTICAL_ID;
 }
@@ -193,6 +240,7 @@ export function hasProducerPage(
         is_vetted?: number | null;
         catalog_hidden?: number | null;
         vertical_id?: string | null;
+        origin?: string | null;
       }
     | null
     | undefined,
