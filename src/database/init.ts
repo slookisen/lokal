@@ -586,7 +586,8 @@ function initSchema(db: Database.Database): void {
       code_sent_to TEXT,                          -- The farm's own address the code went to (NULL: no code sent)
       failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
       review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
-      claimant_email_typed TEXT                   -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
+      claimant_email_typed TEXT,                  -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
+      recommendation TEXT                         -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review'
     );
 
     -- ════════════════════════════════════════════════════════════
@@ -1525,6 +1526,14 @@ function initSchema(db: Database.Database): void {
     } catch {
       // Column already exists — expected after first migration
     }
+  }
+  // dev-request 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste: the rule
+  // a claim matched (knowledge-service.ts assessClaimDomain). Additive and
+  // idempotent; existing rows keep NULL.
+  try {
+    db.exec(`ALTER TABLE agent_claims ADD COLUMN recommendation TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
   }
   // SQLite cannot ALTER a CHECK, so widening the status list rebuilds the
   // table (same pattern as crm_threads above). The new table is the stored

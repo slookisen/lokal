@@ -46,6 +46,7 @@ import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // Decision 11=A: the claim response shows the farm address masked, the same
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
 import { maskEmail } from "../services/gardssalg-claim";
+import { CLAIM_RECOMMENDATION_LABELS, type ClaimRecommendation } from "../services/claim-domain-rule";
 import { rfbClaimRequestLimiter } from "../middleware/security";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 import { capFreeText, capName } from "../utils/free-text";
@@ -1825,12 +1826,17 @@ function claimRequestFieldError(b: { name: unknown; email: unknown; phone: unkno
 function notifyAdminClaimQueued(claimId: string): void {
   try {
     const row = getDb().prepare(
-      `SELECT c.agent_id, c.claimant_name, c.claimant_email, c.review_reason, a.name AS agent_name
+      `SELECT c.agent_id, c.claimant_name, c.claimant_email, c.review_reason, c.recommendation, a.name AS agent_name
          FROM agent_claims c JOIN agents a ON a.id = c.agent_id WHERE c.id = ?`
-    ).get(claimId) as { agent_id: string; claimant_name: string; claimant_email: string; review_reason: ClaimReviewReason | null; agent_name: string } | undefined;
+    ).get(claimId) as { agent_id: string; claimant_name: string; claimant_email: string; review_reason: ClaimReviewReason | null; recommendation: ClaimRecommendation | null; agent_name: string } | undefined;
     if (!row) return;
     const reason = row.review_reason ? CLAIM_REVIEW_REASON_LABELS[row.review_reason] ?? row.review_reason : "ukjent";
-    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason)
+    // The claim domain rule's advice (dev-request 2026-10-27-rfb-eierkrav-
+    // domeneregel-og-cs-sjekkliste): the rule and what Daniel can do.
+    const recommendation = row.recommendation
+      ? `${row.recommendation} — ${CLAIM_RECOMMENDATION_LABELS[row.recommendation] ?? ""}`.replace(/ — $/, "")
+      : undefined;
+    emailService.sendAdminClaimReviewNotification(row.agent_name, row.agent_id, row.claimant_name, row.claimant_email, reason, recommendation)
       .catch((err: any) => console.error("[Admin notify] claim-review notice failed:", err?.message));
   } catch (err: any) {
     console.error("[Admin notify] claim-review notice error:", err?.message);
@@ -1862,7 +1868,9 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
   }
 
   try {
-    const result = knowledgeService.requestClaim(agentId, {
+    // The claim domain rule (CLAIM_DOMAIN_RULE_ENABLED, default off) may run
+    // an HTTPS probe of the claimant's domain first; off = requestClaim as before.
+    const result = await knowledgeService.requestClaimWithDomainRule(agentId, {
       claimantName: name,
       claimantEmail: email,
       claimantPhone: phone,
@@ -1900,8 +1908,9 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
     const agent = agents.find((a: any) => a.id === agentId);
     const agentName = agent?.name || "Ukjent produsent";
 
-    // The code goes to the farm's own address, never to the typed `email`
-    // (unless that IS the farm's address).
+    // Rule 1: the code goes to the farm's own address, never to the typed
+    // `email` (unless that IS the farm's address). Domain rule P1/P2 (flag
+    // on): to the claimant's own address, whose domain qualified.
     const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agentName);
     const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
     const returnDevCode = dryRun && mayReturnDevClaimCode();
@@ -1926,7 +1935,9 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
       success: true,
       message: returnDevCode
         ? "Verifiseringskode generert (e-post ikke aktiv ennå)."
-        : `Verifiseringskode sendt til gårdens e-post ${sentTo}.`,
+        : result.via === "farm_email"
+          ? `Verifiseringskode sendt til gårdens e-post ${sentTo}.`
+          : `Verifiseringskode sendt til ${sentTo}. E-postdomenet ditt er godkjent for å be om eierskap til profilen.`,
       data: responseData,
     });
   } catch (err: any) {
