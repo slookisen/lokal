@@ -15,7 +15,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
-import { failsProducerRoleGate } from "../services/agent-visibility";
+import { failsProducerRoleGate, withoutOwnerHidden } from "../services/agent-visibility";
 import { getConfig } from "../config/vertical-config";
 import { mcpProtocolDeclaration } from "../services/mcp-protocol-version";
 import { isJunkDescription } from "../services/description-quality";
@@ -44,7 +44,9 @@ const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
 router.get("/llms.txt", (_req: Request, res: Response) => {
   try {
-    const agents = marketplaceRegistry.getActiveAgents();
+    // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): without the
+    // profiles hidden from AI assistants (same array when nobody is).
+    const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
 
     // Count categories and cities (city counts also drive the per-city
     // produsent-page links and the category x city matrix examples below).
@@ -351,7 +353,8 @@ themselves has confirmed their profile. See ${BASE_URL}/proveniens for the full 
 
 router.get("/llms-full.txt", (_req: Request, res: Response) => {
   try {
-    const agents = marketplaceRegistry.getActiveAgents();
+    // S2c-2: without the profiles hidden from AI assistants (see /llms.txt).
+    const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
     const lines: string[] = [
       `# ${getConfig().display_name} — Komplett produsentoversikt`,
       ``,

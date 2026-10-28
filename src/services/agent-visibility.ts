@@ -64,11 +64,18 @@ export function catalogHiddenIdExclusionSql(
  * `FROM agents`). Always wrap-safe: it is a plain AND-chain with no OR, so it
  * can be appended as `AND ${publicListableSql("a")}` anywhere.
  */
-export function publicListableSql(alias?: string): string {
+export function publicListableSql(alias?: string, opts: { ownerChoices?: boolean } = {}): string {
   const base = `${notCatalogHiddenSql(alias)} AND COALESCE(${col(alias, "vertical_id")}, '${RFB_VERTICAL_ID}') = '${RFB_VERTICAL_ID}'`;
   // S1b punkt 6: with OWNER_PAUSE_ENABLED on, an owner-paused profile is not
   // listable either. Flag off = the exact string above (byte-identical SQL).
-  return ownerPauseEnabled() ? `${base} AND ${notOwnerPausedSql(alias)}` : base;
+  const paused = ownerPauseEnabled() ? `${base} AND ${notOwnerPausedSql(alias)}` : base;
+  // S2c-2: a profile whose owner switched «Profilen er synlig»
+  // (visibility.profile) off is not listable either — same effect as the
+  // pause. "" (the exact string above) unless OWNER_FEATURES_ENFORCE is on and
+  // an allowlisted profile resolves hidden. `ownerChoices: false` is for SQL
+  // that outlives the request (the outreach VIEW built at boot): a baked-in
+  // id list would go stale.
+  return opts.ownerChoices === false ? paused : paused + notOwnerHiddenSql("profile", alias);
 }
 
 // ─── Owner pause — S1b punkt 6 «Pause som virker» (dev-request ─────────────
@@ -214,7 +221,7 @@ export function hasProducerPage(
 // `is_active = 0` is no longer served by id, and the ungated surfaces gain the
 // quarantine rule — sits behind OWNER_VISIBILITY_ENFORCE_BY_ID (default OFF:
 // with the flag unset every call below answers exactly as the surface did
-// before). S2 will teach this predicate to read the owner's visibility choice.
+// before). S2c-2 adds the owner's visibility choice (see the end of this file).
 //
 // Deliberate deviation: lokal_info passes `allowCatalogHidden` because the
 // hidden RFB test fixture (catalog_hidden = 1) must stay orderable by id
@@ -249,6 +256,14 @@ export interface AgentVisibilityOptions {
   surface: "gated" | "ungated";
   /** Keep the catalog_hidden test fixture reachable (lokal_info only). */
   allowCatalogHidden?: boolean;
+  /**
+   * S2c-2: "ai" = an AI-facing surface (MCP, A2A): the owner's «Synlig for
+   * AI-assistenter» (visibility.ai_assistants) applies on top of
+   * visibility.profile. Default: only visibility.profile.
+   */
+  audience?: OwnerVisibilityAudience;
+  /** S2c-2: the row's id, so the owner's visibility choice can be read (isAgentPubliclyVisible). */
+  agentId?: string;
 }
 
 /** Today's quarantine rule (what isQuarantinedFromPublicView() has always answered). */
@@ -269,6 +284,8 @@ export function isAgentPubliclyVisible(row: AgentVisibilityRow | null | undefine
   // S1b punkt 6: an owner-paused profile is served on no by-id surface
   // (independent of OWNER_VISIBILITY_ENFORCE_BY_ID). Flag off = skipped.
   if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
+  // S2c-2: the owner's visibility choice (no query unless enforced + allowlisted).
+  if (opts.agentId && ownerHidesAgent(opts.agentId, audienceChoice(opts.audience))) return false;
   if (!byIdVisibilityEnforced()) {
     return opts.surface === "gated" ? !quarantinedToday(row, false) : true;
   }
@@ -282,6 +299,9 @@ export function isAgentIdPubliclyVisible(
   agentId: string,
   opts: AgentVisibilityOptions,
 ): boolean {
+  // S2c-2: the owner's visibility choice first (no query unless
+  // OWNER_FEATURES_ENFORCE is on and the id is allowlisted).
+  if (ownerHidesAgent(agentId, audienceChoice(opts.audience))) return false;
   // Flag off + ungated: today's answer is "yes" without reading anything.
   const pause = ownerPauseEnabled();
   if (opts.surface === "ungated" && !byIdVisibilityEnforced() && !pause) return true;
@@ -311,4 +331,113 @@ export function publiclyVisibleSql(alias?: string): string {
  */
 export function activeVettedListableSql(alias?: string): string {
   return `${col(alias, "is_active")} = 1 AND ${col(alias, "is_vetted")} = 1 AND ${publicListableSql(alias)}`;
+}
+
+// ─── «Mine valg» — the owner's visibility choices (dev-request ──────────────
+// 2026-10-22-rfb-mine-valg-eierbrytere, slice S2c-2) ─────────────────────────
+// The six «Hvem kan finne deg» keys, enforced through THIS file so every
+// surface asks the same predicate:
+//   profile         visibility.profile — same effect as the owner pause:
+//                   publicListableSql() (search, lists, feeds, sitemap,
+//                   llms*.txt …) and every by-id check above; the profile page
+//                   shows «Midlertidig pause» (isProfileOwnerHidden).
+//   ai_assistants   visibility.ai_assistants — AI-facing surfaces only
+//                   (audience "ai": MCP tools + resource, A2A, the REST
+//                   search/discover API, llms*.txt).
+//   search_engines  visibility.search_engines — noindex on the profile page,
+//                   left out of sitemap.xml (and so of IndexNow).
+//   shopping_feeds  visibility.shopping_feeds — the ACP feed and CSV.
+//   english         visibility.english — no /en profile page, no EN hreflang,
+//                   no EN sitemap entry.
+//   leaderboard     visibility.leaderboard — /api/leaderboard.
+// A key is hidden for a profile when it OR visibility.profile resolves off
+// (the registry's `requires: visibility.profile`).
+//
+// Gate: OWNER_FEATURES_ENFORCE ("1"/"true") — read here without any import —
+// AND the profile in OWNER_FEATURES_ALLOWED_SUBJECTS (checked by the lazily
+// required owner-features/visibility.ts, which holds the lookup). Gate off:
+// every helper below answers "nothing hidden" without a query or a require,
+// and every SQL fragment is "" (byte-identical SQL). List surfaces get ONE
+// id-set per call (one query for all allowlisted profiles), never a lookup
+// per row. The lazy require keeps this file import-free (marketplace-registry
+// isolation) and avoids an import cycle (database/init imports this file).
+
+export type OwnerVisibilityChoice =
+  | "profile" | "ai_assistants" | "search_engines" | "shopping_feeds" | "english" | "leaderboard";
+
+export const OWNER_VISIBILITY_CHOICES: readonly OwnerVisibilityChoice[] = [
+  "profile", "ai_assistants", "search_engines", "shopping_feeds", "english", "leaderboard",
+];
+
+export type OwnerVisibilityAudience = "all" | "ai";
+
+function audienceChoice(audience: OwnerVisibilityAudience | undefined): OwnerVisibilityChoice {
+  return audience === "ai" ? "ai_assistants" : "profile";
+}
+
+const OWNER_FEATURES_ENFORCE_FLAG = "OWNER_FEATURES_ENFORCE";
+
+/** Is the owner-choice enforcement switched on at all (env only, no DB)? */
+export function ownerVisibilityEnforced(): boolean {
+  const v = process.env[OWNER_FEATURES_ENFORCE_FLAG];
+  return v === "1" || v === "true";
+}
+
+interface OwnerVisibilityModule {
+  ownerHiddenIdsFor(choice: OwnerVisibilityChoice): ReadonlySet<string>;
+  ownerHiddenChoicesFor(agentId: string): ReadonlySet<OwnerVisibilityChoice>;
+}
+
+function ownerVisibilityModule(): OwnerVisibilityModule {
+  return require("../owner-features/visibility") as OwnerVisibilityModule;
+}
+
+const NONE_HIDDEN: ReadonlySet<never> = new Set<never>();
+
+/** Ids of the profiles hidden for `choice` (empty, without a query, when not enforced). */
+export function ownerHiddenAgentIds(choice: OwnerVisibilityChoice): ReadonlySet<string> {
+  if (!ownerVisibilityEnforced()) return NONE_HIDDEN;
+  return ownerVisibilityModule().ownerHiddenIdsFor(choice);
+}
+
+/** The choices that hide this profile (empty, without a query, when not enforced or not allowlisted). */
+export function ownerHiddenChoices(agentId: string): ReadonlySet<OwnerVisibilityChoice> {
+  if (!agentId || !ownerVisibilityEnforced()) return NONE_HIDDEN;
+  return ownerVisibilityModule().ownerHiddenChoicesFor(agentId);
+}
+
+/** Does the owner's choice hide this profile on a `choice` surface? */
+export function ownerHidesAgent(agentId: string, choice: OwnerVisibilityChoice): boolean {
+  return ownerHiddenChoices(agentId).has(choice);
+}
+
+/**
+ * ` AND <alias>.id NOT IN ('…')` for the profiles hidden for `choice`, or ""
+ * when none is (always "" with the gate off). Ids come from our own table
+ * and are quote-escaped. Append it after an existing condition.
+ */
+export function notOwnerHiddenSql(choice: OwnerVisibilityChoice, alias?: string): string {
+  const ids = ownerHiddenAgentIds(choice);
+  if (ids.size === 0) return "";
+  return ` AND ${col(alias, "id")} NOT IN (${[...ids].sort().map((id) => `'${id.replace(/'/g, "''")}'`).join(", ")})`;
+}
+
+/** `list` without the profiles hidden for `choice` — the same array when none is. */
+export function withoutOwnerHidden<T extends { id: string }>(list: T[], choice: OwnerVisibilityChoice): T[] {
+  const ids = ownerHiddenAgentIds(choice);
+  if (ids.size === 0) return list;
+  return list.filter((x) => !ids.has(x.id));
+}
+
+/**
+ * Should /produsent/:slug show «Midlertidig pause» for this profile: owner
+ * pause (OWNER_PAUSE_ENABLED) or visibility.profile off (enforced)? No query
+ * with both gates off.
+ */
+export function isProfileOwnerHidden(
+  db: { prepare(sql: string): { get(...params: unknown[]): unknown } },
+  agentId: string,
+): boolean {
+  if (ownerPauseEnabled() && isOwnerPaused(readOwnerPauseRow(db, agentId))) return true;
+  return ownerHidesAgent(agentId, "profile");
 }

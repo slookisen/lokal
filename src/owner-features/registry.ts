@@ -20,6 +20,7 @@
 // entry is `coming_soon`; the slice that builds its enforcement flips it.
 
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
+import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -215,6 +216,16 @@ const ORDERS_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
   write: (db, subjectId, value) => writeOrderNotificationsOptIn(db, subjectId, value === true),
 };
 
+/**
+ * S2c-2: «Profilen er synlig» is the owner pause (S1b punkt 6) — one truth,
+ * the owner_profile_pause row (services/owner-pause-store.ts).
+ */
+const PROFILE_VISIBLE_ADAPTER: OwnerFeatureStorageAdapter = {
+  column: "owner_profile_pause",
+  read: (db, subjectId) => readOwnerProfileVisible(db, subjectId),
+  write: (db, subjectId, value) => writeOwnerProfileVisible(db, subjectId, value === true),
+};
+
 /** Public profile, structured data and AI read surfaces of a profile field. */
 const PROFILE_FIELD_SURFACES: OwnerFeatureSurface[] = ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"];
 
@@ -229,7 +240,10 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     ),
     default: { owner: true, unclaimed: true },
     confirmOff: t("Profilen blir borte fra søk og AI-assistenter til du slår den på igjen.", "Your profile disappears from search and AI assistants until you switch it back on."),
-    surfaces: ["profile_html", "json_ld", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "sitemap", "llms"],
+    // S2c-2: + listing_html (front page / city pages), a2a (agent/info, A2A
+    // search) and leaderboard — the shared predicate removes it there too.
+    surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "sitemap", "llms", "a2a", "leaderboard"],
+    storage: PROFILE_VISIBLE_ADAPTER,
   }),
   entry({
     key: "visibility.ai_assistants", group: "visibility", type: "switch",

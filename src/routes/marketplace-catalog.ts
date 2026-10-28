@@ -40,7 +40,7 @@ import { capFreeText, capName } from "../utils/free-text";
 // public-listability predicate (catalog_hidden fixture + RFB vertical) for the
 // public LIST surfaces below (/feed, /acp-feed.csv). The direct-id order-flow
 // path /agents/:id/products deliberately does NOT use it.
-import { publiclyVisibleSql } from "../services/agent-visibility";
+import { publiclyVisibleSql, notOwnerHiddenSql } from "../services/agent-visibility";
 import { publicFieldChoicesForMany, hidesPrices } from "../owner-features/enforce";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
@@ -306,6 +306,10 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
   const city = typeof req.query.city === "string" ? req.query.city.trim() : null;
 
   const params: any[] = [];
+  // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): producers whose
+  // owner switched off «Produktene mine i AI-handel» (visibility.shopping_feeds,
+  // or the profile) are left out. One id list per request; "" when nobody is.
+  const ownerFeedSql = notOwnerHiddenSql("shopping_feeds", "a");
   let cityFilter = "";
   if (city) {
     cityFilter = "AND LOWER(a.city) = LOWER(?)";
@@ -322,7 +326,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publiclyVisibleSql("a")}
+      AND ${publiclyVisibleSql("a")}${ownerFeedSql}
       ${cityFilter}
   `).get(...params) as { total: number };
 
@@ -352,7 +356,7 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publiclyVisibleSql("a")}
+      AND ${publiclyVisibleSql("a")}${ownerFeedSql}
       ${cityFilter}
     ORDER BY p.updated_at DESC, p.id
     LIMIT ? OFFSET ?
@@ -450,7 +454,7 @@ catalogRouter.get("/acp-feed.csv", (_req: Request, res: Response) => {
       AND a.umbrella_type IS NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publiclyVisibleSql("a")}
+      AND ${publiclyVisibleSql("a")}${notOwnerHiddenSql("shopping_feeds", "a")}
     ORDER BY p.updated_at DESC, p.id
   `).all() as Array<{
     id: string;

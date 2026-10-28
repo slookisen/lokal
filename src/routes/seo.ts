@@ -60,7 +60,7 @@ import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, ownerVisibilityEnforced, isProfileOwnerHidden, ownerHiddenChoices, ownerHiddenAgentIds } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
@@ -701,7 +701,9 @@ export function shell(
   title: string,
   description: string,
   content: string,
-  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string; robots?: string; alternateUrls?: { no: string; en: string } }
+  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string; robots?: string; alternateUrls?: { no: string; en: string };
+    /** S2c-2 (visibility.english off): no EN hreflang alternate and no EN switcher link. */
+    noEnglish?: boolean }
 ): string {
   const lang: Lang = extra?.lang || "no";
   const canonicalUrl = extra?.canonical || BASE_URL;
@@ -763,7 +765,7 @@ export function shell(
       </button>
       <div class="ls-menu" role="menu">
         <a href="${withSetlang(noUrl, "no")}" hreflang="nb" class="${lang === "no" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇳🇴</span> ${escapeHtml(t(lang, "nav.lang_no"))}</a>
-        <a href="${withSetlang(enUrl, "en")}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>${svEnabled ? `
+        ${extra?.noEnglish ? "" : `<a href="${withSetlang(enUrl, "en")}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>`}${svEnabled ? `
         <a href="${withSetlang(svUrl, "sv")}" hreflang="sv" class="${lang === "sv" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇸🇪</span> ${escapeHtml(t(lang, "nav.lang_sv"))}</a>` : ""}
       </div>
     </div>`;
@@ -821,7 +823,7 @@ export function shell(
   <meta name="twitter:image:alt" content="${getConfig().display_name} — lokal mat rett fra bonden i Norge">
   <meta name="robots" content="${extra?.robots || "index, follow, max-snippet:-1, max-image-preview:large"}">
   <link rel="alternate" hreflang="nb" href="${noUrl}">
-  <link rel="alternate" hreflang="en" href="${enUrl}">${svEnabled ? `
+  ${extra?.noEnglish ? "" : `<link rel="alternate" hreflang="en" href="${enUrl}">`}${svEnabled ? `
   <link rel="alternate" hreflang="sv" href="${svUrl}">` : ""}
   <link rel="alternate" hreflang="x-default" href="${noUrl}">
   ${jsonLdScript}
@@ -5194,8 +5196,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: an
     // owner-paused profile is not a 404 — the page says «Midlertidig pause»
     // and asks not to be indexed. OWNER_PAUSE_ENABLED off = never reached.
-    if (agent && ownerPauseEnabled()) {
-      if (isOwnerPaused(readOwnerPauseRow(getDb(), agent.id))) {
+    // S2c-2: the same page for visibility.profile off (isProfileOwnerHidden;
+    // no query unless OWNER_PAUSE_ENABLED or OWNER_FEATURES_ENFORCE is on).
+    if (agent && (ownerPauseEnabled() || ownerVisibilityEnforced())) {
+      if (isProfileOwnerHidden(getDb(), agent.id)) {
         const en = lang === "en";
         const name = String(agent.name || "");
         res.setHeader("X-Robots-Tag", "noindex");
@@ -5212,6 +5216,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ));
       }
     }
+
+    // S2c-2: the owner's other visibility choices for this page — empty,
+    // without a query, unless OWNER_FEATURES_ENFORCE is on and the profile is
+    // allowlisted.
+    //   english off        → no /en page: 302 to the Norwegian page (with
+    //                        ?setlang=no while the language session is on, so
+    //                        the session cannot bounce it back to /en), and
+    //                        no EN hreflang / switcher link on the NO page.
+    //   search_engines off → noindex (meta + X-Robots-Tag).
+    const ownerHidden = agent ? ownerHiddenChoices(agent.id) : null;
+    if (agent && lang === "en" && ownerHidden?.has("english")) {
+      const noUrl = "/produsent/" + encodeURIComponent(slug);
+      return res.redirect(302, isLangCookieRedirectEnabled() ? `${noUrl}?setlang=no` : noUrl);
+    }
+    const ownerNoIndex = !!ownerHidden?.has("search_engines");
+    if (agent && ownerNoIndex) res.setHeader("X-Robots-Tag", "noindex");
 
     if (!agent) {
       // ─── Slug-alias check (dev-request 2026-09-03-rfb-korrigering-navn-
@@ -6764,7 +6784,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       pageTitle,
       pageMetaDescription,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd, breadcrumbJsonLd] : [jsonLd, breadcrumbJsonLd], extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""), lang, pathForAlternate: "/produsent/" + slug }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd, breadcrumbJsonLd] : [jsonLd, breadcrumbJsonLd], extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""), lang, pathForAlternate: "/produsent/" + slug,
+        // S2c-2: only set when the owner chose so (byte-identical otherwise).
+        ...(ownerNoIndex ? { robots: "noindex" } : {}),
+        ...(ownerHidden?.has("english") ? { noEnglish: true } : {}) }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
@@ -6860,9 +6883,14 @@ export function buildSitemapXml(): string {
     const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/guide-mat-ai": "0.6", "/personvern": "0.5", "/kjopsvilkar": "0.5", "/proveniens": "0.6" };
     const coreFreq: Record<string, string> = { "/": "daily" };
 
-    function addEntry(path: string, freq: string, priority: string, lastmod: string) {
+    function addEntry(path: string, freq: string, priority: string, lastmod: string, noEnglish = false) {
       const noLoc = `${BASE_URL}${path === "/" ? "" : path}`;
       const enLoc = `${BASE_URL}/en${path === "/" ? "" : path}`;
+      if (noEnglish) {
+        // S2c-2 (visibility.english off): the Norwegian URL only, no EN alternate.
+        xml += `\n  <url>\n    <loc>${noLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${lastmod}</lastmod>\n  </url>`;
+        return;
+      }
       xml += `\n  <url>\n    <loc>${noLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${lastmod}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
       xml += `\n  <url>\n    <loc>${enLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${lastmod}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
     }
@@ -6918,10 +6946,16 @@ export function buildSitemapXml(): string {
     } catch (e) {
       console.error("[sitemap] role-gate query failed:", e);
     }
+    // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): the owner's
+    // visibility.search_engines (left out) and visibility.english (no EN URL).
+    // One id list each per build; empty, without a query, unless enforced.
+    const ownerNoSearch = ownerHiddenAgentIds("search_engines");
+    const ownerNoEnglish = ownerHiddenAgentIds("english");
     let skippedCount = 0;
     for (const a of agents) {
       const slug = slugify(a.name);
       if (!slug || slug.length < 2) { skippedCount++; continue; }
+      if (ownerNoSearch.has(a.id)) { skippedCount++; continue; }
       if (roleGateOk && !roleGateOk.has(a.id)) { skippedCount++; continue; }
       if (SITEMAP_EXCLUDED_PRODUCER_SLUGS.has(slug)) { skippedCount++; continue; }
       const k = knowledgeByAgent.get(a.id);
@@ -6933,7 +6967,7 @@ export function buildSitemapXml(): string {
       const updatedAt = parseIsoOrSqlite(k?.updatedAt);
       const lastmod = updatedAt ? lastmodForDate(updatedAt) : today;
       const hints = sitemapHintsForStatus(k?.status);
-      addEntry(`/produsent/${slug}`, hints.changefreq, hints.priority, lastmod);
+      addEntry(`/produsent/${slug}`, hints.changefreq, hints.priority, lastmod, ownerNoEnglish.has(a.id));
     }
     console.log(`[sitemap] producer-entry filtering: ${skippedCount}/${agents.length} excluded by WO-17 gate`);
 

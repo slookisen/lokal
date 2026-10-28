@@ -2948,7 +2948,7 @@ function initSchema(db: Database.Database): void {
            a dental/experiences row that sits in agents (this is the RFB
            pool). catalog_hidden is added further down this function; SQLite
            resolves VIEW columns at query time, so the order is harmless. */
-        AND ${publicListableSql("a")}
+        AND ${publicListableSql("a", { ownerChoices: false })}
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('rich','partial')
         AND ${POOL_CONTENT_THRESHOLD_SQL}

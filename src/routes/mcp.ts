@@ -55,7 +55,7 @@ import { foreignPlaceIn } from "../services/outside-norway";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
 import { searchCountable } from "../services/search-tracking";
 import { isPlausibleNorwayCoord } from "../services/geo-distance";
-import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible } from "../services/agent-visibility";
+import { publicListableSql, failsProducerRoleGate, isAgentIdPubliclyVisible, notOwnerHiddenSql, ownerHidesAgent, withoutOwnerHidden } from "../services/agent-visibility";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { isPaymentsEnabled, isPaymentsLifecycleActive, submitCartWithPayments, resolvePaymentsStripeClient } from "../services/payment-service";
@@ -826,7 +826,8 @@ export function registerTools(
       // directly), so it needs the same honest-drop signal as the REST/web
       // search surfaces — not just the underlying filter fix.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q) });
+      // S2c-2: audience "ai" — a profile hidden from AI assistants is left out.
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 }, discoverMeta, { trackDiscovery: countable(extra, q), audience: "ai" });
 
       // Integration test 2026-10-17, slice I-W: the words the parser could not
       // read are looked up in the product names (discover() step 3c). When no
@@ -1086,7 +1087,7 @@ export function registerTools(
       // gets back non-budget producers with no indication the filter was
       // silently dropped.
       const discoverMeta: DiscoverMeta = {};
-      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true) });
+      const results = marketplaceRegistry.discover(body, discoverMeta, { trackDiscovery: countable(extra, JSON.stringify(body), true), audience: "ai" });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
@@ -1139,7 +1140,8 @@ export function registerTools(
       // Shared by-id visibility predicate (agent-visibility.ts; flag-gated —
       // off = served as before). allowCatalogHidden: the hidden test fixture
       // stays orderable by id.
-      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })) {
+      // S2c-2: audience "ai" — the owner's visibility.profile / ai_assistants.
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true, audience: "ai" })) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
       }
 
@@ -1364,7 +1366,7 @@ export function registerTools(
         FROM agent_affiliations aff
         INNER JOIN agents p ON p.id = aff.producer_id
         WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
-          AND ${publicListableSql("p")}
+          AND ${publicListableSql("p")}${notOwnerHiddenSql("ai_assistants", "p")}
         ORDER BY p.name ASC
         LIMIT ?
       `).all(umbrellaId, lim) as any[];
@@ -1413,7 +1415,8 @@ export function registerTools(
       const producer = db.prepare(
         "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
       ).get(producerId) as any;
-      if (!producer) {
+      // S2c-2: a profile hidden from AI assistants reads like an unknown id.
+      if (!producer || ownerHidesAgent(producerId, "ai_assistants")) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${producerId}.` }] };
       }
 
@@ -1666,6 +1669,7 @@ export function registerTools(
           lng: hasCoords ? (lng as number) : undefined,
           radiusKm,
           limit: resolveOffersLimit(undefined),
+          audience: "ai",
         });
         results.push(result);
       }
@@ -2002,7 +2006,8 @@ export function registerTools(
     "lokal://producers/overview",
     { description: "Overview of all local food producers — count, cities, and categories", mimeType: "text/plain" },
     async () => {
-      const agents = marketplaceRegistry.getActiveAgents();
+      // S2c-2: counts without the profiles hidden from AI assistants.
+      const agents = withoutOwnerHidden(marketplaceRegistry.getActiveAgents(), "ai_assistants");
       const cities = new Map<string, number>();
       for (const a of agents) {
         const city = (a as any).city || a.location?.city || "Ukjent";
@@ -2027,7 +2032,7 @@ export function registerTools(
       const agentId = uri.pathname?.split("/").pop() || "";
       const info = knowledgeService.getAgentInfo(agentId);
       // Shared by-id visibility predicate (flag-gated, see lokal_info).
-      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })) {
+      if (!info || !isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", audience: "ai" })) {
         return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
       }
       // S2c-1: without what the owner hid (not enforced = as before).
