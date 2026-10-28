@@ -22,6 +22,15 @@
  *   debio     «Debio Sertifisering» (41fde168-…) is not in /agents nor
  *             discover, /info 404, lokal_info and A2A not found.
  *   stored    agents + agent_knowledge rows byte-identical after every read.
+ *   S0b       categories: «organic» in the fixture's categories is not shown
+ *             without status (chip badge-c, JSON-LD additionalType, answer-
+ *             first opening, /agents, card, /find-match, MCP, A2A metrics/
+ *             leaderboard), the opening stays grammatical, an «organic»-only
+ *             producer gets no category list, chip or additionalType at all;
+ *             category filter/ranking for «organic» only finds the verified
+ *             producer. The «Hva folk søker etter» panel drops «økologisk
+ *             kjøtt» without status and renders as with no data when every
+ *             term is gone.
  *
  * Real routers/services on the production schema in an in-memory DB; handlers
  * pulled off the router stacks (same harness as owner-features-s2c.test.ts).
@@ -50,27 +59,31 @@ interface HandlerResult {
 const UNVERIFIED_ID = "s0-uten-status";
 const VERIFIED_ID = "s0-med-status";
 const CLEAN_ID = "s0-ren-tvilling";
+const ONLY_ORGANIC_CAT_ID = "s0b-kun-en-kategori";
 const DEBIO_ID = "41fde168-d82b-4b1b-a173-ed72df8c944e";
 const NAMES: Record<string, string> = {
   [UNVERIFIED_ID]: "Kvernstua Gard Prove",
   [VERIFIED_ID]: "Lysbakken Gard Prove",
   [CLEAN_ID]: "Nordtun Gard Prove",
+  [ONLY_ORGANIC_CAT_ID]: "Vestli Gard Prove",
   [DEBIO_ID]: "Debio Sertifisering",
 };
 
-function seedProducer(db: Database.Database, id: string, o: { verified: boolean; organic: boolean; role?: string; url?: string }): void {
+function seedProducer(db: Database.Database, id: string, o: { verified: boolean; organic: boolean; role?: string; url?: string; categories?: string[] }): void {
+  // S0b: an organic producer's categories carry «organic» too.
+  const categories = o.categories ?? (o.organic ? ["vegetables", "organic"] : ["vegetables"]);
   const tags = o.organic ? ["organic", "økologisk", "debio", "gårdsutsalg", "local/organic"] : ["gårdsutsalg", "local"];
   const skills = [{ id: "sell", name: "Gårdsutsalg", description: "Salg fra gården", tags: o.organic ? ["økologisk", "grønnsaker"] : ["grønnsaker"] }];
   db.prepare(
     `INSERT INTO agents
        (id, name, description, provider, contact_email, url, role, api_key, lat, lng, city,
         categories, tags, skills, trust_score, is_active, is_verified, origin, vertical_id, catalog_hidden, debio_verified)
-     VALUES (?, ?, ?, 'test', ?, ?, ?, ?, 59.9139, 10.7522, 'Oslo', '["vegetables"]', ?, ?, 0.7, 1, 1, 'discovery', 'rfb', 0, ?)`,
+     VALUES (?, ?, ?, 'test', ?, ?, ?, ?, 59.9139, 10.7522, 'Oslo', ?, ?, ?, 0.7, 1, 1, 'discovery', 'rfb', 0, ?)`,
   ).run(
     id, NAMES[id],
     "Familiegård i Oslo-området som dyrker gulrøtter og poteter, med gårdsutsalg hver lørdag.",
     `post@${id}.example.no`, o.url ?? `https://${id}.example.no`, o.role ?? "producer", `key-${id}`,
-    JSON.stringify(tags), JSON.stringify(skills), o.verified ? 1 : 0,
+    JSON.stringify(categories), JSON.stringify(tags), JSON.stringify(skills), o.verified ? 1 : 0,
   );
   db.prepare(
     `INSERT INTO agent_knowledge
@@ -273,6 +286,19 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     seedProducer(db, VERIFIED_ID, { verified: true, organic: true });
     seedProducer(db, CLEAN_ID, { verified: false, organic: false });
     seedProducer(db, DEBIO_ID, { verified: false, organic: true, role: "quality", url: "https://debio.no" });
+    // S0b: «organic» is this unverified producer's ONLY category.
+    seedProducer(db, ONLY_ORGANIC_CAT_ID, { verified: false, organic: false, categories: ["organic"] });
+
+    // S0b: visitor search terms («Hva folk søker etter», conversations.query_text).
+    const conv = db.prepare("INSERT INTO conversations (id, seller_agent_id, query_text) VALUES (?, ?, ?)");
+    let convN = 0;
+    for (const [pid, terms] of [
+      [UNVERIFIED_ID, ["økologisk kjøtt", "økologisk kjøtt", "gulrøtter oslo"]],
+      [VERIFIED_ID, ["økologisk kjøtt", "gulrøtter oslo"]],
+      [ONLY_ORGANIC_CAT_ID, ["økologisk kjøtt", "Organic eggs"]],
+    ] as Array<[string, string[]]>) {
+      for (const t of terms) conv.run(`s0b-conv-${++convN}`, pid, t);
+    }
 
     // Fix-up round 1 (review B2): umbrellas + affiliations. The real Debio
     // umbrella is inactive since 2026-07-06 but its affiliation rows remain.
@@ -295,7 +321,8 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
       .run("claim-s0", UNVERIFIED_ID, `post@${UNVERIFIED_ID}.example.no`, "Eier", OWNER_CLAIM, new Date(Date.now() + 86_400_000).toISOString());
 
     const snapshot = () => JSON.stringify([
-      db.prepare("SELECT id, tags, skills, debio_verified, is_active FROM agents ORDER BY id").all(),
+      db.prepare("SELECT id, categories, tags, skills, debio_verified, is_active FROM agents ORDER BY id").all(),
+      db.prepare("SELECT id, seller_agent_id, query_text FROM conversations ORDER BY id").all(),
       db.prepare("SELECT agent_id, products, specialties, certifications, about FROM agent_knowledge ORDER BY agent_id").all(),
     ]);
     const before = snapshot();
@@ -369,6 +396,7 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     const listed = (await agentsList()).find((a: any) => a.id === UNVERIFIED_ID);
     assertTrue(!!listed, "agents-0: unverified producer listed");
     noClaim("agents-1: /agents tags + skill tags carry no organic word", json([listed?.tags, listed?.skills]));
+    assertEq(listed?.categories, ["vegetables"], "s0b-agents-1: /agents categories without «organic»");
     assertTrue((listed?.tags ?? []).includes("local") && !(listed?.tags ?? []).some((t: string) => t.toLowerCase().includes("organic")), "agents-1b: «local/organic» → «local», no substring left for discover's tag match", listed?.tags);
     const listedVerified = (await agentsList()).find((a: any) => a.id === VERIFIED_ID);
     assertTrue((listedVerified?.tags ?? []).includes("organic"), "agents-2: verified producer keeps its organic tag");
@@ -427,6 +455,90 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     assertTrue(!allDiscover.some((r: any) => r.agent?.id === DEBIO_ID), "debio-5: not in discover");
     const debioSearch = await toolText("lokal_search", { query: "Debio Sertifisering" });
     assertTrue(!debioSearch.includes(`. ${NAMES[DEBIO_ID]}**`), "debio-6: not found by name in lokal_search", debioSearch.slice(0, 300));
+
+    // ── S0b: categories + «Hva folk søker etter» ──────────────────────────
+    const ANSWER_RE = /<p class="pf-answer">([\s\S]*?)<\/p>/;
+    const chipsC = (html: string) => (html.match(/<span class="badge badge-c">[^<]*<\/span>/g) ?? []);
+    const additionalTypes = (html: string) => [...jsonLd(html).matchAll(/"additionalType":\s*"([^"]*)"/g)].map((m) => m[1]);
+    const termsBlock = (html: string) => (html.match(/<div class="act-terms">[\s\S]*?<\/div>/) ?? [""])[0];
+    for (const lang of ["no", "en", "sv"]) {
+      const html = await page(UNVERIFIED_ID, lang);
+      const chips = chipsC(html);
+      assertTrue(chips.length === 1 && !chips.some((c) => /organic|økolog|ekolog/i.test(c)), `s0b-chip-${lang}-1: one category chip, not «organic»`, chips);
+      assertTrue(additionalTypes(html).every((t) => t.trim() !== "" && !containsOrganicClaim(t) && plainHits(t).length === 0), `s0b-ld-${lang}-1: JSON-LD additionalType without organic word`, additionalTypes(html));
+      const answer = (html.match(ANSWER_RE) ?? [])[1] ?? "";
+      assertTrue(answer.length > 0, `s0b-answer-${lang}-0: answer-first opening rendered`);
+      noClaim(`s0b-answer-${lang}-1: answer-first opening carries no organic word`, answer);
+      assertTrue(!/,\s*(—|&mdash;|\.)|,\s*$|(tilbyr|offers)\s+(—|&mdash;)/.test(answer), `s0b-answer-${lang}-2: opening grammatical (no «, —», no trailing comma, no empty list)`, answer);
+      const terms = termsBlock(html);
+      assertTrue(terms.includes("gulrøtter oslo"), `s0b-terms-${lang}-1: a non-organic search term stays in the panel`, terms);
+      noClaim(`s0b-terms-${lang}-2: «Hva folk søker etter» shows no organic term`, terms);
+    }
+    assertEq(((await page(UNVERIFIED_ID)).match(ANSWER_RE) ?? [])[1], "Kvernstua Gard Prove i Oslo tilbyr Grønnsaker — finn kontaktinfo under.", "s0b-answer-no-3: «tilbyr Grønnsaker — finn kontaktinfo under.»");
+    assertEq(((await page(UNVERIFIED_ID, "en")).match(ANSWER_RE) ?? [])[1], "Kvernstua Gard Prove in Oslo offers Vegetables — find contact details below.", "s0b-answer-en-3: «offers Vegetables — find contact details below.»");
+
+    // «organic» as the ONLY category: normal template, no chip, no additionalType.
+    for (const lang of ["no", "en", "sv"]) {
+      const html = await page(ONLY_ORGANIC_CAT_ID, lang);
+      const twin = await page(CLEAN_ID, lang);
+      assertTrue(html.includes(NAMES[ONLY_ORGANIC_CAT_ID]), `s0b-only-${lang}-0: the profile page renders`);
+      assertEq(chipsC(html), [], `s0b-only-${lang}-1: no category chip (and no empty one)`);
+      assertEq(additionalTypes(html), [], `s0b-only-${lang}-2: no JSON-LD additionalType (and no empty one)`);
+      assertTrue(!ANSWER_RE.test(html), `s0b-only-${lang}-3: no answer-first opening without a category list (normal template)`, (html.match(ANSWER_RE) ?? [])[1]);
+      assertEq(plainHits(html).length, plainHits(twin).length, `s0b-only-${lang}-4: plain-regex hits equal the clean twin's`);
+      assertEq(organicHits(html).length, organicHits(twin).length, `s0b-only-${lang}-5: organic-word hits equal the clean twin's`);
+      // Every visitor term was organic → the panel renders as with no data.
+      assertTrue(!html.includes('class="act-terms"') && !html.includes(lang === "en" ? "What people search for" : "Hva folk søker etter"), `s0b-only-${lang}-6: no search-term block when every term was organic`);
+      assertEq(html.includes('class="act-sub"'), twin.includes('class="act-sub"'), `s0b-only-${lang}-7: activity panel as the no-data twin's`);
+    }
+
+    // Verified fixture keeps its organic category and organic search term.
+    const vHtmlNo = await page(VERIFIED_ID);
+    assertTrue(chipsC(vHtmlNo).some((c) => /organic/i.test(c)), "s0b-verified-1: verified producer keeps its «organic» category chip", chipsC(vHtmlNo));
+    assertTrue(additionalTypes(vHtmlNo).some((t) => /organic/i.test(t)), "s0b-verified-2: verified JSON-LD additionalType keeps «organic»", additionalTypes(vHtmlNo));
+    assertTrue(termsBlock(vHtmlNo).includes("økologisk kjøtt"), "s0b-verified-3: verified producer's panel keeps «økologisk kjøtt»", termsBlock(vHtmlNo));
+    assertEq(((await agentsList()).find((a: any) => a.id === VERIFIED_ID))?.categories, ["vegetables", "organic"], "s0b-verified-4: /agents keeps the verified producer's categories");
+
+    // /card, /find-match, MCP, A2A.
+    const cUnv = await card(UNVERIFIED_ID);
+    noClaim("s0b-card-1: card carries no organic category", json(cUnv));
+    const cOnly = await card(ONLY_ORGANIC_CAT_ID);
+    noClaim("s0b-card-2: card of the «organic»-only producer carries no organic word", json(cOnly));
+    const findMatch = findRouteHandler(marketplaceRouter, "/find-match", "get");
+    const fm = ((await invoke(findMatch, makeReq({ query: { name: "Gard Prove" } }))).body?.matches ?? []) as any[];
+    assertEq(fm.find((m: any) => m.id === UNVERIFIED_ID)?.categories, ["vegetables"], "s0b-findmatch-1: /find-match categories without «organic»");
+    assertEq(fm.find((m: any) => m.id === ONLY_ORGANIC_CAT_ID)?.categories, [], "s0b-findmatch-2: «organic»-only → no categories");
+    assertEq(fm.find((m: any) => m.id === VERIFIED_ID)?.categories, ["vegetables", "organic"], "s0b-findmatch-3: verified keeps «organic»");
+    for (const id of [UNVERIFIED_ID, ONLY_ORGANIC_CAT_ID]) {
+      const liS0b = await lokalInfo(id);
+      assertTrue(liS0b.includes(NAMES[id]), `s0b-mcp-info-0 ${id}: lokal_info answers`);
+      noClaim(`s0b-mcp-info-1 ${id}: lokal_info («Kategorier») carries no organic word`, liS0b);
+      const lsS0b = await toolText("lokal_search", { query: NAMES[id] });
+      noClaim(`s0b-mcp-search-1 ${id}: lokal_search carries no organic word`, listBlock(lsS0b, id));
+      const a2aS0b = json(await a2aInfo(id));
+      assertTrue(a2aS0b.includes(NAMES[id]), `s0b-a2a-0 ${id}: A2A agent/info answers`);
+      noClaim(`s0b-a2a-1 ${id}: A2A agent/info carries no organic word`, a2aS0b);
+    }
+    const ldAll = await toolText("lokal_discover", { categories: ["vegetables"] });
+    noClaim("s0b-mcp-discover-1: lokal_discover block carries no organic category", listBlock(ldAll, UNVERIFIED_ID));
+    const { conversationService } = require("../services/conversation-service") as typeof import("../services/conversation-service");
+    assertEq(conversationService.getAgentMetrics(UNVERIFIED_ID)?.categories, ["vegetables"], "s0b-a2a-metrics-1: A2A metrics categories without «organic»");
+    assertEq(conversationService.getAgentMetrics(VERIFIED_ID)?.categories, ["vegetables", "organic"], "s0b-a2a-metrics-2: verified keeps «organic»");
+    const board = conversationService.getLeaderboard(50);
+    assertEq(board.find((r: any) => r.agentId === ONLY_ORGANIC_CAT_ID)?.categories, [], "s0b-a2a-leaderboard-1: leaderboard «organic»-only → no categories");
+
+    // Category filter + ranking: «organic» only finds the verified producer.
+    const { getRelatedBySameCategory } = require("./seo") as typeof import("./seo");
+    const relOrganic = getRelatedBySameCategory(db, CLEAN_ID, "organic", null, 10).map((r) => r.id).sort();
+    assertEq(relOrganic, [VERIFIED_ID], "s0b-related-1: «Andre organic-produsenter» links only the verified producer");
+    assertTrue(getRelatedBySameCategory(db, CLEAN_ID, "vegetables", null, 10).some((r) => r.id === UNVERIFIED_ID), "s0b-related-2: a non-organic category still links the unverified producer");
+    const byOrganicCat = await discover({ categories: ["organic"] });
+    assertEq(byOrganicCat.map((r: any) => r.agent?.id).sort(), [VERIFIED_ID], "s0b-search-1: categories:[organic] filters to the verified producer only");
+    const mcpOrganicCat = await toolText("lokal_discover", { categories: ["organic"] });
+    assertTrue(!mcpOrganicCat.includes(NAMES[UNVERIFIED_ID]) && !mcpOrganicCat.includes(NAMES[ONLY_ORGANIC_CAT_ID]), "s0b-search-2: lokal_discover categories:[organic] lists no unverified producer", mcpOrganicCat.slice(0, 400));
+    const rankedVeg = await discover({ categories: ["vegetables", "organic"] });
+    const vegScore = (id: string) => rankedVeg.find((r: any) => r.agent?.id === id)?.relevanceScore;
+    assertTrue(vegScore(UNVERIFIED_ID) === vegScore(CLEAN_ID), "s0b-search-3: «organic» category gives the unverified producer no ranking edge over its clean twin", [vegScore(UNVERIFIED_ID), vegScore(CLEAN_ID)]);
 
     // ── stored values unchanged (AC0.4) ───────────────────────────────────
     assertEq(snapshot(), before, "stored-1: agents + agent_knowledge byte-identical after all reads");

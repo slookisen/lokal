@@ -198,6 +198,16 @@ export function stripOrganicTags(tags: readonly unknown[] | null | undefined): s
 }
 
 /**
+ * Økologi S0b: an unverified producer's categories without the organic ones.
+ * A category is a key («vegetables», «organic»), so a value carrying an
+ * organic word is dropped whole rather than trimmed; the others keep their
+ * order.
+ */
+export function stripOrganicCategories(categories: readonly string[]): string[] {
+  return categories.filter((c) => !containsOrganicClaim(c));
+}
+
+/**
  * Fix-up round 1 (review B2): is this umbrella membership an organic claim?
  * A certification-type umbrella (Debio, Demeter …), or an umbrella / label
  * carrying an organic word. Shown only for a producer with a valid Debio
