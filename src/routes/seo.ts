@@ -22,6 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
+import { isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
@@ -5442,16 +5443,26 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (!isUmbrella) {
       try {
         const rows = umbDb.prepare(`
-          SELECT a.id AS umbrella_id, a.name AS umbrella_name, aff.labels,
+          SELECT a.id AS umbrella_id, a.name AS umbrella_name, a.umbrella_type, aff.labels,
                  aff.status, aff.source
           FROM agent_affiliations aff
           INNER JOIN agents a ON a.id = aff.umbrella_id
           WHERE aff.producer_id = ?
+            AND a.is_active = 1
             AND (aff.status = 'active'
               OR (aff.status = 'pending_confirmation' AND aff.source = 'inferred'))
           ORDER BY a.name ASC
         `).all(agent.id) as any[];
-        affiliations = rows.map(r => ({
+        // Økologi S0 fix-up (review B2): an inactive umbrella (the Debio
+        // umbrella was set is_active = 0 on 2026-07-06, its affiliation rows
+        // kept) is no chip — same rule as MCP lokal_get_producer_affiliations.
+        // Without a valid Debio status no certification-type umbrella and no
+        // umbrella or label carrying an organic word (organic-claims.ts) is
+        // shown either: «Debio (antatt — ikke bekreftet)» is an organic claim.
+        const organicShown = info?.agent.debioVerified === true;
+        const shownRows = organicShown ? rows : rows.filter((r) =>
+          !isOrganicClaimUmbrella({ umbrella_type: r.umbrella_type, name: r.umbrella_name, labels: r.labels }));
+        affiliations = shownRows.map(r => ({
           umbrella_id: r.umbrella_id,
           umbrella_name: r.umbrella_name,
           umbrella_slug: slugify(r.umbrella_name),
@@ -5839,7 +5850,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // I-G: the list fields are read with textEntries (text entries only), as
     // getAgentInfo hands them over; for that shape this is the list itself.
     const certs = textEntries(k.certifications);
-    if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
+    // Økologi S0 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+    // register-og-tekstrevisjon): «🌱 Økologisk» only for a valid Debio
+    // status (until S1: agents.debio_verified = 1) — never from a substring
+    // of the certification texts, which made «Hevder økologisk» show it.
+    if (info?.agent.debioVerified === true) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(catLabel(c, lang))}</span>`));
 
     // Contact items

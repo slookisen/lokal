@@ -17156,8 +17156,10 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
 
   // (2) relabelCertifications behaviour.
   const r1 = relabelCertifications(["Debio-sertifisert", "Nyt Norge"], false);
-  assertEq(JSON.stringify(r1), JSON.stringify(["Nyt Norge", "Hevder økologisk"]),
-    "pr95: relabel drops Debio-sertifisert when debio_verified=0, appends 'Hevder økologisk'");
+  // Økologi S0 (dev-request 2026-10-28-rfb-okologisk-merking-…): no
+  // «Hevder økologisk» any more — an unverified producer gets no organic label.
+  assertEq(JSON.stringify(r1), JSON.stringify(["Nyt Norge"]),
+    "pr95: relabel drops Debio-sertifisert when debio_verified=0, no organic label (økologi S0)");
 
   const r2 = relabelCertifications(["Debio-sertifisert", "Nyt Norge"], true);
   assertEq(JSON.stringify(r2), JSON.stringify(["✓ Debio-verifisert", "Nyt Norge"]),
@@ -17176,8 +17178,9 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
     "pr95: relabel leaves empty list empty when debio_verified=0");
 
   const r6 = relabelCertifications(["debio", "DEBIO-SERTIFISERT", "Demeter-sertifisert"], false);
-  assertEq(JSON.stringify(r6), JSON.stringify(["Demeter-sertifisert", "Hevder økologisk"]),
-    "pr95: relabel handles case-insensitive Debio variants");
+  // Økologi S0: «Demeter» is on the organic word list too (regelbok §2).
+  assertEq(JSON.stringify(r6), JSON.stringify([]),
+    "pr95: relabel handles case-insensitive Debio variants (and Demeter, økologi S0)");
 
   // (3) seed-knowledge no longer auto-tags "Debio-sertifisert".
   const seedSrc = fs.readFileSync("src/_seeds/seed-knowledge.ts", "utf-8");
@@ -50619,5 +50622,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-enrichment-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S0 (P0, Debio complaint): no organic claim on any public read
+// surface without a valid Debio status (debio_verified = 1 until S1) — profile
+// HTML NO/EN/SV, JSON-LD, /info, /card, /agents, MCP, A2A, the organic search
+// tag family; «Debio Sertifisering» delisted; stored rows unchanged. Swaps the
+// getDb() singleton (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S0: økologi-påstander bare med Debio-status ──");
+  try {
+    const { runOrganicClaimsS0Tests } = require("../src/routes/organic-claims-s0.test") as
+      typeof import("../src/routes/organic-claims-s0.test");
+    const r = await runOrganicClaimsS0Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-claims-s0: " + f);
+    console.log(`  organic-claims-s0: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-claims-s0: unexpected error: " + String(err?.message || err));
   }
 });

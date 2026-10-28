@@ -4,6 +4,7 @@ import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
 import { isJunkDescription, normalizeProse } from "./description-quality";
 import { textEntries } from "../utils/text-entries";
+import { isDebioVerifiedValue, productsWithoutOrganicFlag, stripOrganicEntries } from "./organic-claims";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
 import {
@@ -28,10 +29,13 @@ import {
 // This helper rewrites the OUTGOING API representation so:
 //   - debio_verified=1 → ensure "✓ Debio-verifisert" appears in the list
 //                        (drop any stale "Debio-sertifisert" / "Debio")
-//   - debio_verified=0 → drop "Debio-sertifisert" / "Debio" and replace
-//                        with "Hevder økologisk" if the seed had marked
-//                        them organic. This downgrades the trust signal
-//                        without dropping the relevance signal for search.
+//   - debio_verified=0 → no organic label at all. Økologi S0 (A2A
+//                        dev-request 2026-10-28-rfb-okologisk-merking-debio-
+//                        register-og-tekstrevisjon): «økologisk» is a legally
+//                        protected term, so the old «Hevder økologisk» label
+//                        is gone, and every organic claim word (shared list
+//                        in organic-claims.ts) is filtered out of the entries;
+//                        an entry that was only organic words is dropped.
 //
 // Pure function — does not mutate the input array.
 //
@@ -44,22 +48,15 @@ export function relabelCertifications(
   debioVerified: boolean,
 ): string[] {
   const list = textEntries(raw);
+  if (!debioVerified) return stripOrganicEntries(list);
   const isDebioClaim = (s: string) => /^debio(\b|[-_\s])|debio[-_ ]?sertifisert/i.test(s);
   const isOrganicClaim = (s: string) => /^øk(o(logisk)?)?\b/i.test(s) || /^organic\b/i.test(s);
   const out: string[] = [];
-  let hadDebioOrOrganicSeed = false;
   for (const item of list) {
-    if (isDebioClaim(item) || isOrganicClaim(item)) {
-      hadDebioOrOrganicSeed = true;
-      continue; // dropped — re-emitted below per verification status
-    }
+    if (isDebioClaim(item) || isOrganicClaim(item)) continue; // re-emitted below
     out.push(item);
   }
-  if (debioVerified) {
-    out.unshift("✓ Debio-verifisert");
-  } else if (hadDebioOrOrganicSeed) {
-    out.push("Hevder økologisk");
-  }
+  out.unshift("✓ Debio-verifisert");
   return out;
 }
 
@@ -586,7 +583,7 @@ class KnowledgeService {
   // 2026-10-17.md §4.2). Only the site's own pages ask for it with
   // withGoogleRating, and RATING_DISPLAY_MODE (structured-data-policy.ts)
   // decides whether they show it.
-  getAgentInfo(agentId: string, opts: { withGoogleRating?: boolean } = {}): AgentInfoResponse | null {
+  getAgentInfo(agentId: string, opts: { withGoogleRating?: boolean; ownerView?: boolean } = {}): AgentInfoResponse | null {
     const db = getDb();
     const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as any;
     if (!agent) return null;
@@ -600,8 +597,15 @@ class KnowledgeService {
     // PR-95: debio_verified is set by the daily finnoko.debio.no sync
     // service. Older databases pre-migration may not have the column —
     // treat absence/NULL as 0.
-    const debioVerified =
-      agent.debio_verified === 1 || agent.debio_verified === "1";
+    const debioVerified = isDebioVerifiedValue(agent.debio_verified);
+    // Økologi S0: without a valid Debio status no organic claim reaches a
+    // public reader — organic words out of certifications/specialties,
+    // products[].organic read as false (organic-claims.ts). Read-side only;
+    // the stored row is unchanged. `ownerView`: the owner's own /selger editor
+    // (X-Claim-Token for this agent) reads the stored lists unchanged, so a
+    // save from there never drops what the public view filters.
+    const filterOrganic = !debioVerified && !opts.ownerView;
+    const storedProducts = productEntries(knowledge?.products);
 
     return {
       agent: {
@@ -628,7 +632,7 @@ class KnowledgeService {
         // I-F: each JSON field in the shape its type declares — see
         // openingHoursField and the helpers above the class.
         openingHours: openingHoursField(knowledge?.openingHours),
-        products: productEntries(knowledge?.products),
+        products: filterOrganic ? productsWithoutOrganicFlag(storedProducts) : storedProducts,
         // dev-request 2026-07-04-rfb-datakvalitet item 1 (description
         // sanitizer, render-guard-only slice): mirrors the isDisplayablePhone
         // guard above — this feeds the public buyer-facing "tell me about
@@ -637,9 +641,9 @@ class KnowledgeService {
         // must never be returned as if it were a real description/about text.
         about: this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
         description: this.guardedDescriptionField(agentId, agent.name, "agent.description", agent.description),
-        specialties: textEntries(knowledge?.specialties),
+        specialties: filterOrganic ? stripOrganicEntries(textEntries(knowledge?.specialties)) : textEntries(knowledge?.specialties),
         // PR-95: rewrite certifications to reflect debio_verified flag.
-        certifications: relabelCertifications(knowledge?.certifications, debioVerified),
+        certifications: opts.ownerView ? textEntries(knowledge?.certifications) : relabelCertifications(knowledge?.certifications, debioVerified),
         paymentMethods: textEntries(knowledge?.paymentMethods),
         deliveryOptions: textEntries(knowledge?.deliveryOptions),
         images: textEntries(knowledge?.images),

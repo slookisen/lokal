@@ -4,6 +4,7 @@ import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope } from "../services/knowledge-service";
+import { isDebioVerifiedValue, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
@@ -1253,7 +1254,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
         };
       } else {
         // Producer view: list affiliations
-        const affs = db.prepare(`
+        const affRows = db.prepare(`
           SELECT u.id, u.name, u.umbrella_type, aff.labels, aff.status
           FROM agent_affiliations aff
           INNER JOIN agents u ON u.id = aff.umbrella_id
@@ -1262,6 +1263,10 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
             AND u.is_active = 1
           ORDER BY u.name ASC
         `).all(agentId) as any[];
+        // Økologi S0 fix-up (review B2): no certification / organic umbrella
+        // without a valid Debio status (organic-claims.ts).
+        const organicShown = isDebioVerifiedValue((db.prepare("SELECT debio_verified FROM agents WHERE id = ?").get(agentId) as any)?.debio_verified);
+        const affs = organicShown ? affRows : affRows.filter((u: any) => !isOrganicClaimUmbrella(u));
         if (affs.length) {
           card.skills = (card.skills || []).concat([{
             id: "affiliations",
@@ -1618,7 +1623,12 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
       return;
     }
   }
-  let info = knowledgeService.getAgentInfo(agentId);
+  // The owner's own /selger editor (X-Claim-Token for exactly this agent)
+  // reads the full stored record — see S2c-1 below; økologi S0 likewise
+  // (ownerView: the stored certifications/specialties/products unfiltered).
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const isOwnerRead = !!claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId;
+  let info = knowledgeService.getAgentInfo(agentId, { ownerView: isOwnerRead });
   if (!info) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
@@ -1645,8 +1655,7 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // /selger editor (X-Claim-Token for this agent) reads the full record, so
   // a save from there never drops a hidden field.
   const ownerChoices = publicFieldChoices(agentId);
-  const claimToken = (req.headers["x-claim-token"] as string) || "";
-  if (ownerChoices && !(claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId)) {
+  if (ownerChoices && !isOwnerRead) {
     info = publicAgentInfo(info, ownerChoices);
   }
   const data = {
@@ -5707,7 +5716,7 @@ router.get("/producers/:id/affiliations", (req: Request, res: Response) => {
     const db = getDb();
 
     const producer = db.prepare(
-      "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
+      "SELECT id, name, umbrella_type, debio_verified FROM agents WHERE id = ? AND is_active = 1"
     ).get(producerId) as any;
     if (!producer) {
       res.status(404).json({ success: false, error: "Produsent ikke funnet" });
@@ -5740,7 +5749,10 @@ router.get("/producers/:id/affiliations", (req: Request, res: Response) => {
       ORDER BY u.name ASC
     `).all(...params) as any[];
 
-    const affiliations = rows.map(r => ({
+    // Økologi S0 fix-up (review B2): no certification / organic umbrella
+    // without a valid Debio status (organic-claims.ts).
+    const shownRows = isDebioVerifiedValue(producer.debio_verified) ? rows : rows.filter((r) => !isOrganicClaimUmbrella(r));
+    const affiliations = shownRows.map(r => ({
       umbrella: {
         id: r.id,
         name: r.name,
