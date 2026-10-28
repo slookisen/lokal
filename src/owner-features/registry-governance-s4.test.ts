@@ -12,9 +12,15 @@
  *              is not in OWNER_FEATURE_KEYS to a key-taking lookup
  *              (featureOn, rfbFeatureOn, featureValue, resolveOwnerFeature,
  *              setOwnerFeatureValue, getOwnerFeature, findOwnerFeature).
+ *   matrix     (S4-2a) every surface of every `live` entry has a case in
+ *              OWNER_FEATURE_MATRIX_CASES (owner-feature-matrix.test.ts, the
+ *              suite that runs default → on → off → on again per case), and
+ *              no case names a key that is not a live registry entry or a
+ *              surface the entry does not declare (stale case), no duplicates.
  *   self-check the checkers run on a small synthetic registry + source fixture
  *              (missing EN label, live key without reader, unknown featureOn
- *              key) and must report each — proves the gate can fail.
+ *              key, live surface without matrix case, stale matrix case) and
+ *              must report each — proves the gate can fail.
  *
  * READER DEFINITION. Live entries today are read through storage adapters and
  * enforcement lists rather than a literal featureOn('<key>'), so a «reader» is
@@ -39,7 +45,8 @@
  * Every live entry that passes only via (d) or (e) is printed in the log so
  * the exemption stays visible.
  *
- * Pure static check: no DB, no env, no globals. Exported
+ * Pure static check: no DB, no env, no globals (importing the matrix suite
+ * only reads its coverage map; the suite itself runs separately). Exported
  * runRegistryGovernanceS4Tests({log}) -> TestSummary; wired into tests/test.ts.
  * Standalone: npx tsx src/owner-features/registry-governance-s4.test.ts
  */
@@ -53,6 +60,7 @@ import {
   OWNER_FEATURE_REGISTRY,
   type OwnerFeatureEntry,
 } from "./registry";
+import { OWNER_FEATURE_MATRIX_CASES, matrixCaseId, type OwnerFeatureMatrixCase } from "./owner-feature-matrix.test";
 
 export interface TestSummary {
   passed: number;
@@ -273,6 +281,35 @@ export function checkUnknownLookupKeys(calls: readonly LookupCall[], keys: reado
     .map((c) => `${c.file}:${c.line}: ${c.fn}(…${JSON.stringify(c.key)}…) — key not in OWNER_FEATURE_KEYS`);
 }
 
+/**
+ * Rule 4 (S4-2a): the CI matrix covers every surface of every live entry, and
+ * names nothing the registry does not have.
+ */
+export function checkMatrixCoverage(
+  registry: readonly OwnerFeatureEntry[],
+  cases: readonly Pick<OwnerFeatureMatrixCase, "key" | "surface">[],
+): string[] {
+  const problems: string[] = [];
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  const caseIds = new Set<string>();
+  for (const c of cases) {
+    const id = matrixCaseId(c);
+    if (caseIds.has(id)) problems.push(`${id}: duplicate matrix case`);
+    caseIds.add(id);
+    const e = byKey.get(c.key);
+    if (!e) problems.push(`${id}: stale matrix case — key not in the registry`);
+    else if (e.status !== "live") problems.push(`${id}: stale matrix case — ${c.key} is ${e.status}, not live`);
+    else if (!(e.surfaces as readonly string[]).includes(c.surface)) problems.push(`${id}: stale matrix case — ${c.key} does not declare surface ${c.surface}`);
+  }
+  for (const e of registry) {
+    if (e.status !== "live") continue;
+    for (const s of e.surfaces) {
+      if (!caseIds.has(matrixCaseId({ key: e.key, surface: s }))) problems.push(`${e.key} × ${s}: live surface has no matrix case in OWNER_FEATURE_MATRIX_CASES`);
+    }
+  }
+  return problems;
+}
+
 export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
   let passed = 0;
@@ -343,6 +380,25 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
     assertTrue(unknownFx.some((u) => u.includes(`featureOn(…"nope.key"…)`)), "self-check: unknown featureOn key behind `as` cast is reported", unknownFx);
     assertTrue(unknownFx.length === 2, "self-check: exactly the two unknown keys are reported (cast known key is fine)", unknownFx);
 
+    const fxMatrixReg: OwnerFeatureEntry[] = [
+      fx({ key: "fx.mx_live", status: "live", surfaces: ["order_gate", "email:fx_mail"] }),
+      fx({ key: "fx.mx_soon", status: "coming_soon", surfaces: ["profile_html"] }),
+    ];
+    const matrixFx = checkMatrixCoverage(fxMatrixReg, [
+      { key: "fx.mx_live", surface: "order_gate" },
+      { key: "fx.mx_live", surface: "order_gate" },
+      { key: "fx.mx_live", surface: "job:fx_gone" },
+      { key: "fx.mx_gone", surface: "order_gate" },
+      { key: "fx.mx_soon", surface: "profile_html" },
+    ]);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_live × email:fx_mail: live surface has no matrix case")), "self-check: live surface without matrix case is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_live × job:fx_gone: stale matrix case")), "self-check: matrix case for an undeclared surface is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_gone × order_gate: stale matrix case — key not in the registry")), "self-check: matrix case for an unknown key is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p.startsWith("fx.mx_soon × profile_html: stale matrix case")), "self-check: matrix case for a non-live key is reported", matrixFx);
+    assertTrue(matrixFx.some((p) => p === "fx.mx_live × order_gate: duplicate matrix case"), "self-check: duplicate matrix case is reported", matrixFx);
+    assertTrue(!matrixFx.some((p) => p.startsWith("fx.mx_soon ×") && p.includes("no matrix case")), "self-check: a coming_soon entry needs no matrix case", matrixFx);
+    assertTrue(matrixFx.length === 5, "self-check: exactly the five matrix problems are reported", matrixFx);
+
     // ── Rule 1: registry shape.
     const shape = checkEntryShape(OWNER_FEATURE_REGISTRY, keys, groups);
     assertTrue(OWNER_FEATURE_REGISTRY.length > 0, "registry is not empty");
@@ -362,6 +418,11 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
 
     const unknown = checkUnknownLookupKeys(scan.calls, keys);
     assertTrue(unknown.length === 0, `rule 3: no lookup with an unknown string-literal key (${scan.calls.length} literal-key calls checked)`, unknown);
+
+    // ── Rule 4: CI matrix per live key × surface.
+    const liveSurfaces = live.reduce((n, e) => n + e.surfaces.length, 0);
+    const matrix = checkMatrixCoverage(OWNER_FEATURE_REGISTRY, OWNER_FEATURE_MATRIX_CASES);
+    assertTrue(matrix.length === 0, `rule 4: every live surface (${liveSurfaces}) has a matrix case, no stale case (${OWNER_FEATURE_MATRIX_CASES.length} cases)`, matrix);
   } catch (err: any) {
     failed++;
     failures.push("unexpected error: " + String(err?.stack || err));

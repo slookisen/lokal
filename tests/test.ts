@@ -50451,6 +50451,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S4-2a: the CI matrix per
+// live key × declared surface (default → on → off → on again, observed effect
+// each step; unmet requirement → 409 no effect; locked/guarantee refused).
+// The S4 governance rule above fails if a live surface has no case here.
+// Swaps the getDb() singleton, service test pins and env (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S4-2a: testmatrise per live-nøkkel og flate ──");
+  try {
+    const { runOwnerFeatureMatrixTests } = require("../src/owner-features/owner-feature-matrix.test") as
+      typeof import("../src/owner-features/owner-feature-matrix.test");
+    const r = await runOwnerFeatureMatrixTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-feature-matrix: " + f);
+    console.log(`  owner-feature-matrix: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-feature-matrix: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b: the «Mine valg» page
 // (/eier/:id/valg) — levels, undo, change log, first-login card, N1 audit from
 // the old Bestillinger routes. Same allowlist; swaps the getDb() singleton and
