@@ -15,9 +15,10 @@ import {
 import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
+import { stripOrganicEntries } from "../services/organic-claims";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
-import { isAgentIdPubliclyVisible, ownerHidesAgent } from "../services/agent-visibility";
+import { isAgentIdPubliclyVisible, isDelistedAgentId, ownerHidesAgent } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
@@ -746,7 +747,7 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   // owner hid it (visibility.profile) or hid it from AI assistants
   // (visibility.ai_assistants) reads like an unknown id. No query unless
   // OWNER_FEATURES_ENFORCE is on and the id is allowlisted.
-  if (!info || ownerHidesAgent(String(agentId), "ai_assistants")) {
+  if (!info || ownerHidesAgent(String(agentId), "ai_assistants") || isDelistedAgentId(String(agentId))) {
     res.json({
       jsonrpc: "2.0",
       error: { code: -32602, message: `Agent not found: ${agentId}` },
@@ -891,11 +892,14 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       // Integration test 2026-10-17 (I-G): products is DB JSON. Stored as
       // text, `products?.map` threw, and so did `p.name` on a null product;
       // it is read in getAgentInfo's fixed shape (productEntries).
+      // Økologi S0: no organic claim without a valid Debio status
+      // (organic-claims.ts) — organic:false, organic words out of specialties.
       products: productEntries(knowledge.products).map((p: any) => ({
-        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
+        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months,
+        organic: isDebioVerified ? p.organic : (p.organic === undefined ? undefined : false),
         price: p.price, priceUnit: p.priceUnit,
       })),
-      specialties: knowledge.specialties,
+      specialties: isDebioVerified || !Array.isArray(knowledge.specialties) ? knowledge.specialties : stripOrganicEntries(knowledge.specialties),
       certifications: relabelCertifications(knowledge.certifications, isDebioVerified),
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,

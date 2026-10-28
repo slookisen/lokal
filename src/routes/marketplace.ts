@@ -1618,7 +1618,12 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
       return;
     }
   }
-  let info = knowledgeService.getAgentInfo(agentId);
+  // The owner's own /selger editor (X-Claim-Token for exactly this agent)
+  // reads the full stored record — see S2c-1 below; økologi S0 likewise
+  // (ownerView: the stored certifications/specialties/products unfiltered).
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const isOwnerRead = !!claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId;
+  let info = knowledgeService.getAgentInfo(agentId, { ownerView: isOwnerRead });
   if (!info) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
@@ -1645,8 +1650,7 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // /selger editor (X-Claim-Token for this agent) reads the full record, so
   // a save from there never drops a hidden field.
   const ownerChoices = publicFieldChoices(agentId);
-  const claimToken = (req.headers["x-claim-token"] as string) || "";
-  if (ownerChoices && !(claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId)) {
+  if (ownerChoices && !isOwnerRead) {
     info = publicAgentInfo(info, ownerChoices);
   }
   const data = {

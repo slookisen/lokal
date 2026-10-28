@@ -325,16 +325,18 @@ export async function runKnowledgeServiceTypeGuardsTests(opts: { log?: boolean }
     // ══════════════════════════════════════════════════════════════
     // Certifications: text entries only
     // ══════════════════════════════════════════════════════════════
+    // Økologi S0 (dev-request 2026-10-28-rfb-okologisk-merking-…): no
+    // «Hevder økologisk» — an unverified producer gets no organic label.
     assertEq(relabelCertifications([7, null, { x: 1 }, ["Debio"], " Nyt Norge ", "", "Debio-sertifisert"], false),
-      ["Nyt Norge", "Hevder økologisk"],
+      ["Nyt Norge"],
       "relabelCertifications: numbers, null, objects and lists are skipped (used to throw on `.trim()`)");
     assertEq(relabelCertifications([7, " Nyt Norge "], true), ["✓ Debio-verifisert", "Nyt Norge"],
       "relabelCertifications: the verified label is still prepended");
-    assertEq(relabelCertifications("Debio-sertifisert", false), ["Hevder økologisk"],
+    assertEq(relabelCertifications("Debio-sertifisert", false), [],
       "relabelCertifications: a list stored as one string is one entry (it used to be dropped)");
     assertEq([42, { a: "b" }, null, undefined].map((raw) => relabelCertifications(raw, false)), [[], [], [], []],
       "relabelCertifications: a number, an object, null or nothing is no certification");
-    assertEq(relabelCertifications(["Debio-sertifisert", "Nyt Norge"], false), ["Nyt Norge", "Hevder økologisk"],
+    assertEq(relabelCertifications(["Debio-sertifisert", "Nyt Norge"], false), ["Nyt Norge"],
       "relabelCertifications: a list of text is relabelled as before (PR-95)");
 
     // ══════════════════════════════════════════════════════════════
@@ -358,7 +360,7 @@ export async function runKnowledgeServiceTypeGuardsTests(opts: { log?: boolean }
         ["Lynghonning", "Løvetannhonning", "Sommerhonning – kr 99", "Bivoks", "🍯 HONNING", "Kremhonning"],
         "getAgentInfo products: null, a number and a product without a text name are left out; text entries and named products stay");
       assertEq((k.products[0] as any).price, 150, "getAgentInfo products: a product's own fields are not rewritten (the reader types them)");
-      assertEq(k.certifications, ["Nyt Norge", "Hevder økologisk"], "getAgentInfo certifications: text entries, relabelled");
+      assertEq(k.certifications, ["Nyt Norge"], "getAgentInfo certifications: text entries, relabelled");
       assertEq([k.specialties, k.paymentMethods, k.deliveryOptions, k.images, info.meta.autoSources],
         [["Lynghonning"], ["Vipps"], ["Henting på gården"], ["https://example.no/kaldvik.jpg"], ["website"]],
         "getAgentInfo: list-of-text fields keep their text entries; one string is one entry");
@@ -468,7 +470,7 @@ export async function runKnowledgeServiceTypeGuardsTests(opts: { log?: boolean }
         `lokal_info: a producer with a numeric price gets its profile (got: ${t.slice(0, 160)})`);
       assertTrue(t.includes("## Produkter (4 stk)\n- Lynghonning [honey] — 150\n- Løvetannhonning [honey] — 120/glass\n- Sommerhonning [honey] — kr 99\n- Bivoks\n\n**HONNING**"),
         `lokal_info: the numeric price is shown; an object category and an object price under a header are left out (got: ${(t.match(/## Produkter[\s\S]*?\*\*HONNING\*\*/) || [""])[0]})`);
-      assertTrue(t.includes("\n## Sertifiseringer\n- Nyt Norge\n- Hevder økologisk") && t.includes("\n## Åpningstider\nLør 10:00–14:00"),
+      assertTrue(t.includes("\n## Sertifiseringer\n- Nyt Norge\n") && !t.includes("Hevder økologisk") && t.includes("\n## Åpningstider\nLør 10:00–14:00"),
         "lokal_info: certifications with non-text entries and opening hours with null entries are shown");
       assertTrue(!leaksJsError(t), "lokal_info: no JavaScript error text and no [object Object]");
     }

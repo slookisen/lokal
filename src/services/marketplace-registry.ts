@@ -40,7 +40,8 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (no
 // project imports; only node:async_hooks for the S2d-2 as-public view), same
 // isolation rule as geo-distance.ts above.
-import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, isAsPublicView, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
+import { isDebioVerifiedValue, stripOrganicTags } from "./organic-claims";
+import { isDelistedAgentId, publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, isAsPublicView, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -325,7 +326,7 @@ class MarketplaceRegistry {
 
       if (nameRows.length > 0) {
         // Found by name — return these as top results, skip geo filtering
-        let nameCandidates = nameRows.map(r => this.rowToAgent(r)!);
+        let nameCandidates = nameRows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
         if (query.role) {
           nameCandidates = nameCandidates.filter(a => a.role === query.role);
         }
@@ -386,7 +387,7 @@ class MarketplaceRegistry {
           // The geo filter now runs FIRST (on the full matchedCount/trust-
           // ordered list), and the top-10 cut applies to what survives it.
           // With no location in the query, this is the original code path.
-          let fuzzyCandidates = fuzzyRows.map(x => this.rowToAgent(x.row)!);
+          let fuzzyCandidates = fuzzyRows.filter(x => !isDelistedAgentId(x.row.id)).map(x => this.rowToAgent(x.row)!);
           if (query.role) fuzzyCandidates = fuzzyCandidates.filter(a => a.role === query.role);
           fuzzyCandidates = this.filterNameCandidatesByGeo(fuzzyCandidates, query, meta).slice(0, 10);
           if (fuzzyCandidates.length > 0) {
@@ -430,7 +431,7 @@ class MarketplaceRegistry {
     }
 
     const rows = db.prepare(sql).all(...params) as any[];
-    let candidates = rows.map(r => this.rowToAgent(r)!);
+    let candidates = rows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
 
     // 3. Filter by categories (in-app â€" JSON array matching)
     // Slice I-W: through categoryValueMatches, so «bakery» and the old «bread» find each other.
@@ -1686,6 +1687,8 @@ class MarketplaceRegistry {
   // it like the pause — the owner's own read is not a public view.
   isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean; audience?: OwnerVisibilityAudience } = {}): boolean {
     const db = getDb();
+    // Økologi S0: a delisted id (agent-visibility.ts) is never a public view.
+    if (isDelistedAgentId(agentId)) return true;
     const found = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
       { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
     if (!found) return false;
@@ -1819,6 +1822,7 @@ class MarketplaceRegistry {
     // sees the test fixture, so it neither reads nor fills the shared cache.
     if (isAsPublicView()) {
       return (db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[])
+        .filter(r => !isDelistedAgentId(r.id))
         .map(r => this.rowToAgent(r)!);
     }
     const now = Date.now();
@@ -1837,7 +1841,8 @@ class MarketplaceRegistry {
     // public-listability predicate (no catalog_hidden fixture, RFB vertical only)
     // — this one line covers every public list surface built on this method.
     const rows = db.prepare(`SELECT * FROM agents WHERE umbrella_type IS NULL AND ${activeVettedListableSql()} ORDER BY trust_score DESC, created_at DESC`).all() as any[];
-    this._agentsCache = rows.map(r => this.rowToAgent(r)!);
+    // Økologi S0: a delisted id (agent-visibility.ts) is on no public list.
+    this._agentsCache = rows.filter(r => !isDelistedAgentId(r.id)).map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
   }
@@ -2200,6 +2205,17 @@ class MarketplaceRegistry {
   private rowToAgent(row: any): RegisteredAgent | undefined {
     if (!row) return undefined;
 
+    // Økologi S0 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+    // register-og-tekstrevisjon): without a valid Debio status (until S1:
+    // debio_verified = 1) a producer's organic tags («organic», «økologisk»,
+    // «debio» …, shared list in organic-claims.ts) are not part of the agent
+    // any public reader sees — the /agents list, cards, MCP, A2A — and so the
+    // «organic» tag family in discover() (tag filter + ranking) only matches
+    // verified producers. Read-side only: agents.tags is unchanged.
+    const organicAllowed = isDebioVerifiedValue(row.debio_verified);
+    const rawTags = row.tags ? JSON.parse(row.tags) : [];
+    const rawSkills = row.skills ? JSON.parse(row.skills) : [];
+
     return {
       id: row.id,
       name: row.name,
@@ -2222,9 +2238,10 @@ class MarketplaceRegistry {
       discoveryCount: row.discovery_count || 0,
       interactionCount: row.interaction_count || 0,
       capabilities: row.capabilities ? JSON.parse(row.capabilities) : {},
-      skills: row.skills ? JSON.parse(row.skills) : [],
+      skills: organicAllowed || !Array.isArray(rawSkills) ? rawSkills : rawSkills.map((sk: any) =>
+        sk && typeof sk === "object" && Array.isArray(sk.tags) ? { ...sk, tags: stripOrganicTags(sk.tags) } : sk),
       categories: row.categories ? JSON.parse(row.categories) : [],
-      tags: row.tags ? JSON.parse(row.tags) : [],
+      tags: organicAllowed || !Array.isArray(rawTags) ? rawTags : stripOrganicTags(rawTags),
       languages: row.languages ? JSON.parse(row.languages) : ["no"],
       location: row.lat != null && row.lng != null ? {
         lat: row.lat,

@@ -5839,7 +5839,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // I-G: the list fields are read with textEntries (text entries only), as
     // getAgentInfo hands them over; for that shape this is the list itself.
     const certs = textEntries(k.certifications);
-    if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
+    // Økologi S0 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+    // register-og-tekstrevisjon): «🌱 Økologisk» only for a valid Debio
+    // status (until S1: agents.debio_verified = 1) — never from a substring
+    // of the certification texts, which made «Hevder økologisk» show it.
+    if (info?.agent.debioVerified === true) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(catLabel(c, lang))}</span>`));
 
     // Contact items

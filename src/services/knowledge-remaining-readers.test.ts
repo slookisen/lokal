@@ -413,10 +413,12 @@ export async function runKnowledgeRemainingReadersTests(opts: { log?: boolean } 
         { name: "🐑 LAM", category: "meat", seasonal: false },
         { name: "Lammelår – kr 275/kg", category: "meat", seasonal: true, months: [9, 10] },
         { name: "Lammeskank", category: "meat", seasonal: false, price: "189/kg", priceUnit: "kr" },
-        { name: "Honning", category: "honey", seasonal: false, organic: true, price: "150" },
+        // Økologi S0 (dev-request 2026-10-28-rfb-okologisk-merking-…): the
+        // fixture has no Debio status, so organic reads as false.
+        { name: "Honning", category: "honey", seasonal: false, organic: false, price: "150" },
         { name: "❌ Tomt for egg", category: "eggs", seasonal: false },
         { name: "Poteter", category: "other", seasonal: false, price: "Spør om pris" },
-      ], "agent.json: well-formed products are the same as before (golden from main)");
+      ], "agent.json: well-formed products are the same as before (golden from main; organic:false without Debio status)");
       assertEq(Object.keys(wf.body?.["x-knowledge"] ?? {}), [
         "address", "postalCode", "phone", "email", "website", "openingHours", "products", "specialties", "certifications",
         "paymentMethods", "deliveryOptions", "deliveryRadius", "externalLinks", "seasonality", "dataSource",

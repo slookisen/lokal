@@ -28,6 +28,24 @@ import { AsyncLocalStorage } from "node:async_hooks";
 /** The only vertical whose `agents` rows are RFB food producers. */
 export const RFB_VERTICAL_ID = "rfb";
 
+// ─── Delisted by id (økologi S0) ────────────────────────────────────────────
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S0 point 5: «Debio Sertifisering» is Debio itself, not a
+// producer; Debio was told 2026-08-02 the profile was gone, yet it still
+// showed in /api/marketplace/agents and /agents/:id/info. Read-side exclusion
+// until ops sets agents.is_active = 0 on the row (no migration here): never
+// listed (getActiveAgents, discover), and 404 / "not found" on every public
+// by-id surface that asks isAgentIdPubliclyVisible / isAgentPubliclyVisible /
+// isQuarantinedFromPublicView. The stored row is not changed.
+const DELISTED_AGENT_IDS: ReadonlySet<string> = new Set([
+  "41fde168-d82b-4b1b-a173-ed72df8c944e", // «Debio Sertifisering» (debio.no)
+]);
+
+/** Is this agent id delisted from every public surface (see above)? */
+export function isDelistedAgentId(agentId: unknown): boolean {
+  return typeof agentId === "string" && DELISTED_AGENT_IDS.has(agentId);
+}
+
 function col(alias: string | undefined, name: string): string {
   return alias ? `${alias}.${name}` : name;
 }
@@ -329,6 +347,7 @@ function quarantinedToday(row: AgentVisibilityRow, allowCatalogHidden: boolean):
  */
 export function isAgentPubliclyVisible(row: AgentVisibilityRow | null | undefined, opts: AgentVisibilityOptions): boolean {
   if (!row) return false;
+  if (opts.agentId && isDelistedAgentId(opts.agentId)) return false;
   // S1b punkt 6: an owner-paused profile is served on no by-id surface
   // (independent of OWNER_VISIBILITY_ENFORCE_BY_ID). Flag off = skipped.
   if (ownerPauseEnabled() && isOwnerPaused(row)) return false;
@@ -347,6 +366,7 @@ export function isAgentIdPubliclyVisible(
   agentId: string,
   opts: AgentVisibilityOptions,
 ): boolean {
+  if (isDelistedAgentId(agentId)) return false;
   // S2c-2: the owner's visibility choice first (no query unless
   // OWNER_FEATURES_ENFORCE is on and the id is allowlisted).
   if (ownerHidesAgent(agentId, audienceChoice(opts.audience))) return false;
