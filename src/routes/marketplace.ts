@@ -13,7 +13,7 @@ import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql, hasProducerPage, failsProducerRoleGate } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate, ownerPauseEnabled } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -23,7 +23,7 @@ import { addUtmParams } from "../utils/url-utm";
 // normalizeName is aliased: this file already has its own local
 // normalizeName() (fuzzy-match helper for /find-match, further down) with
 // DIFFERENT rules — the blocklist guard below must use the blocklist's own.
-import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName } from "../services/blocklist-service";
+import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName, normalizeDomain as blocklistNormalizeDomain, PROTECTED_DOMAINS as BLOCKLIST_PROTECTED_DOMAINS } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth, getPlacesRatingFieldCallsThisMonth } from "../services/places-usage-tracker";
@@ -56,6 +56,11 @@ import { buildReiseApiRouter } from "./reise-api";
 import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
+import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
+import {
+  publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
+  withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
+} from "../owner-features/enforce";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws is caught by the guard and fails closed as a 423,
@@ -223,7 +228,7 @@ function ensureAgentInDb(agentId: string): boolean {
 // Used by /search, /discover (via enrichment) and /vcard endpoint.
 // Keeping these inline to avoid a new util module just yet.
 
-function buildContactBlock(agentId: string): {
+function buildContactBlock(agentId: string, choices?: PublicFieldChoices | null): {
   address?: string;
   postalCode?: string;
   phone?: string;
@@ -236,7 +241,8 @@ function buildContactBlock(agentId: string): {
 } | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
-  const k = info.knowledge;
+  // S2c-1: without the phone / address the owner hid (choices null = as before).
+  const k = withoutHiddenContact(info.knowledge, choices);
   const displayablePhone = isDisplayablePhone(k.phone);
   const hasAnyContact = !!(k.address || displayablePhone || k.email || k.website);
   if (!hasAnyContact) {
@@ -298,8 +304,11 @@ const VCARD_NOTE_PREFIX = `NOTE;${VCARD_CHARSET}:`;
 function buildVCard(agentId: string): string | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
-  const { agent: _agent, knowledge: k } = info;
-  const agent = _agent as any; // Cast for flexibility — agent shape varies
+  // S2c-1: the owner's contact / price / trust choices (null = as before).
+  const ownerChoices = publicFieldChoices(agentId);
+  const { agent: _agent } = info;
+  const k = withoutHiddenFields(info.knowledge, ownerChoices);
+  const agent = withoutHiddenCoordinates(_agent as any, ownerChoices); // Cast for flexibility — agent shape varies
   const lines: string[] = [];
   lines.push("BEGIN:VCARD");
   lines.push("VERSION:3.0");
@@ -362,7 +371,7 @@ function buildVCard(agentId: string): string | null {
   const profileSlug = slugify(agent.name);
   lines.push(`X-LOKAL-PROFILE:https://rettfrabonden.com/produsent/${profileSlug}`);
   lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
-  if (agent.trustScore !== undefined && agent.trustScore !== null) {
+  if (agent.trustScore !== undefined && agent.trustScore !== null && !hidesTrust(ownerChoices)) {
     lines.push(`X-LOKAL-TRUST-SCORE:${Math.round(agent.trustScore * 100)}`);
   }
   lines.push(`REV:${new Date().toISOString()}`);
@@ -618,10 +627,11 @@ router.post("/discover", (req: Request, res: Response) => {
       });
     }
 
+    const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
     const enrichedResults = results.map((r: any) => ({
       ...r,
       agent: withSanitizedDescription(r.agent),
-      contact: buildContactBlock(r.agent.id),
+      contact: buildContactBlock(r.agent.id, ownerChoices.get(r.agent.id)),
     }));
 
     // dev-request 2026-07-25 fix 0g(ii): structured discovery is a read-only
@@ -912,8 +922,10 @@ router.get("/search", async (req: Request, res: Response) => {
 
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
+  const ownerChoices = publicFieldChoicesForMany(results.map((r: any) => r.agent.id));
   const enrichedResults = results.map((r: any) => {
-    const contact = buildContactBlock(r.agent.id);
+    const choices = ownerChoices.get(r.agent.id);
+    const contact = buildContactBlock(r.agent.id, choices);
     // Skive A2: no profile link for roles whose /produsent/<slug> 404s.
     const profileUrl = failsProducerRoleGate(r.agent.role, false)
       ? undefined
@@ -934,7 +946,7 @@ router.get("/search", async (req: Request, res: Response) => {
           return {
             name: cleanName,
             category: p.category !== "other" ? p.category : undefined,
-            price: price || p.price || undefined,
+            price: hidesPrices(choices) ? undefined : price || p.price || undefined,
             seasonal: p.seasonal || undefined,
             organic: p.organic || undefined,
           };
@@ -1090,10 +1102,14 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     return;
   }
 
+  // S2c-1: the owner's contact / price / trust choices (null = as before).
+  const ownerChoices = publicFieldChoices(agentId);
+  if (hidesTrust(ownerChoices) && card["x-lokal"]) delete card["x-lokal"].trustScore;
+
   // Enrich with knowledge data so AI agents get the full picture
   const info = knowledgeService.getAgentInfo(agentId);
   if (info) {
-    const k = info.knowledge as any;
+    const k = withoutHiddenFields(info.knowledge as any, ownerChoices);
     const agent = info.agent as any;
     const cityName = agent.city || agent.location?.city || "";
 
@@ -1584,10 +1600,20 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // agent — same "tell me about this seller" surface, same rule as
   // /produsent/:slug and /agents/:id/card.
   if (marketplaceRegistry.isQuarantinedFromPublicView(agentId)) {
-    res.status(404).json({ success: false, error: "Agent ikke funnet" });
-    return;
+    // S1b punkt 6 (OWNER_PAUSE_ENABLED): the owner of a paused profile still
+    // loads their own /selger editor. A valid X-Claim-Token for exactly this
+    // agent skips the pause check only (is_active / catalog_hidden / vetting
+    // still apply). Flag off = never reached differently.
+    const claimToken = (req.headers["x-claim-token"] as string) || "";
+    const ownerRead = ownerPauseEnabled() && !!claimToken &&
+      knowledgeService.getClaimByToken(claimToken)?.agentId === agentId &&
+      !marketplaceRegistry.isQuarantinedFromPublicView(agentId, { ignoreOwnerPause: true });
+    if (!ownerRead) {
+      res.status(404).json({ success: false, error: "Agent ikke funnet" });
+      return;
+    }
   }
-  const info = knowledgeService.getAgentInfo(agentId);
+  let info = knowledgeService.getAgentInfo(agentId);
   if (!info) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
@@ -1610,6 +1636,14 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
   // above), after every existing field and, like `provenance`, omitted when
   // there are none; the existing fields are byte-identical.
   const openingHoursDisplay = openingHoursDisplayRows(info.knowledge.openingHours);
+  // S2c-1: the public read without what the owner hid. The owner's own
+  // /selger editor (X-Claim-Token for this agent) reads the full record, so
+  // a save from there never drops a hidden field.
+  const ownerChoices = publicFieldChoices(agentId);
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  if (ownerChoices && !(claimToken && knowledgeService.getClaimByToken(claimToken)?.agentId === agentId)) {
+    info = publicAgentInfo(info, ownerChoices);
+  }
   const data = {
     ...info,
     ...(provenance ? { provenance } : {}),
@@ -1980,6 +2014,9 @@ router.post("/auth/login", (req: Request, res: Response) => {
     data: {
       agentId: claim.agentId,
       claimantName: claim.claimantName,
+      // S1b punkt 6: tells /selger to swap «Meld nedlagt» for pause + «be om
+      // sletting». Only present with OWNER_PAUSE_ENABLED on (off = unchanged body).
+      ...(ownerPauseEnabled() ? { ownerPauseEnabled: true } : {}),
     },
   });
 });
@@ -2032,6 +2069,15 @@ router.get("/auth/magic-verify", (req: Request, res: Response) => {
   if (!result.success) {
     res.status(401).json({ success: false, error: result.error });
     return;
+  }
+
+  // S1b punkt 5 (OWNER_UNIFIED_SESSION_ENABLED, default off): the same login
+  // also opens the /eier owner session (HttpOnly cookie), so statistics,
+  // orders and the owner portal need no second login. Never fails the login.
+  try {
+    if (result.agentId && result.email) issueOwnerSessionForSelgerLogin(req, res, result.agentId, result.email);
+  } catch (e) {
+    console.error("[marketplace] unified owner session failed:", e instanceof Error ? e.message : "error");
   }
 
   res.json({
@@ -2120,8 +2166,19 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
   try {
     const db = getDb();
     db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+    // Ownership given by the order activation link (skive 2) is revoked here
+    // too; other claimed_via stamps are left as before.
+    db.prepare("UPDATE agents SET claimed_at = NULL, claimed_via = NULL WHERE id = ? AND claimed_via = 'activation_link'").run(agentId);
     db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
     db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+    // S1b punkt 7 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a
+    // pending owner change of the order e-mail belongs to the old owner —
+    // kill it. Best-effort: a DB without the table never breaks reset-claim.
+    try {
+      db.prepare(
+        "UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ? WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL"
+      ).run(new Date().toISOString(), agentId);
+    } catch { /* table missing — nothing pending */ }
     trustScoreService.update(agentId);
     res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {
@@ -3828,6 +3885,17 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     // claim-request email lookup elsewhere in this file.
     const fromRegistry = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId) as any;
 
+    // dev-request 2026-10-23-admin-delete-website-domain-ikke-alltid-auto:
+    // agents.url is often empty while agent_knowledge.website holds the real
+    // site, so the website_domain blocklist row was silently skipped. deleteAll()
+    // below removes the agent_knowledge row, so capture the website HERE.
+    // Defensive: a failed read must never break the delete.
+    let knowledgeWebsite: string | undefined;
+    try {
+      const kRow = db.prepare("SELECT website FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
+      if (kRow && typeof kRow.website === "string" && kRow.website.trim()) knowledgeWebsite = kRow.website.trim();
+    } catch { /* treat as no value */ }
+
     // Delete agent and all related data in one transaction
     // Must clear all FK references before deleting the agent itself.
     // conversations.seller_agent_id lacks ON DELETE CASCADE, so we clean manually.
@@ -3948,15 +4016,37 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
           );
         }
 
+        // Website sources: agents.url (primary, unchanged) else the captured
+        // agent_knowledge.website. A knowledge-sourced domain that is a shared
+        // free-mail/ISP/vipps host (PROTECTED_DOMAINS) is never blocklisted.
+        // OWN_DOMAINS is still enforced inside blocklistAdd().
+        const registryUrl: string | undefined = fromRegistry?.url || undefined;
+        const knowledgeDomain = blocklistNormalizeDomain(knowledgeWebsite);
+        const knowledgeUsable = !!knowledgeDomain && !BLOCKLIST_PROTECTED_DOMAINS.has(knowledgeDomain);
+        const primaryWebsite: string | undefined = registryUrl || (knowledgeUsable ? knowledgeWebsite : undefined);
         blocklistResult = blocklistAdd({
           agentId,
           name: nameHasActiveSurvivor ? undefined : agent.name,
-          website: fromRegistry?.url,
+          website: primaryWebsite,
           email: emailHasActiveSurvivor ? undefined : fromRegistry?.contactEmail,
           reason: req.body?.reason || "auto-blocklisted on admin DELETE",
           sourceEmail: req.body?.sourceEmail,
           agentNameForAudit: agent.name,
         });
+        // Second website_domain row when both sources are set and differ.
+        if (registryUrl && knowledgeUsable && knowledgeDomain !== blocklistNormalizeDomain(registryUrl)) {
+          const extra = blocklistAdd({
+            agentId,
+            website: knowledgeWebsite,
+            reason: req.body?.reason || "auto-blocklisted on admin DELETE",
+            sourceEmail: req.body?.sourceEmail,
+            agentNameForAudit: agent.name,
+          });
+          blocklistResult = {
+            inserted: blocklistResult.inserted + extra.inserted,
+            rows: [...blocklistResult.rows, ...extra.rows.filter((r: any) => !blocklistResult!.rows.some((x: any) => x.id === r.id))],
+          };
+        }
       } catch (blockErr) {
         console.error("[delete] blocklist auto-add failed (non-critical):", blockErr);
       }

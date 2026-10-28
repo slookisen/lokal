@@ -46,6 +46,21 @@
 // same Brreg address and clears lat/lng/geocode_* so the geocode worker
 // redoes them.
 //
+// Correction mode, runde 5 (Daniel's answer of 2026-10-26 on the review):
+//   - correct_mixed runs chooseAddress (rule 1) first. A row is corrected
+//     only when the address rule 1 picks is the same Brreg sub-object the
+//     stored street came from. When an active sub-unit's
+//     beliggenhetsadresse is preferred and its street (or postnummer) is
+//     not the stored one, the row gets flag_sub_unit_preferred; several
+//     active sub-unit addresses that the stored postnummer does not narrow
+//     to one give flag_ambiguous_sub_units. Neither writes, even on apply.
+//   - The UPDATE also sets fylke from resolveKommuneFromPostnummer(<new
+//     postnummer>) (2024 fylke names, as the search filters expect); a
+//     postnummer the register does not resolve leaves fylke alone and adds
+//     the flag fylke_not_resolved. Results report fylke_change {from, to}
+//     and the summary counts fylke_changes.
+//   - Every results[] entry carries org_form (Brreg organisasjonsform code).
+//
 // Other guard rails (unchanged):
 //   - fill-only (sweep mode): never overwrites a non-empty adresse/
 //     postnummer/poststed; the UPDATE re-checks all three at write time.
@@ -68,6 +83,7 @@ import {
 import { DENTAL_CLINIC_CLASS_SQL } from "../services/dental-catalog-class";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS } from "../services/fetch-page";
+import { resolveKommuneFromPostnummer } from "../services/norway-postnummer";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -522,6 +538,8 @@ export type CorrectionOutcome =
   | "incomplete_address"       // the matching Brreg address lacks postnummer/poststed (flagged)
   | "foreign_address"          // forretningsadresse or the matching address outside Norway (flagged)
   | "poststed_only_mismatch"   // postnummer fits, only poststed differs: reported, never written (flagged)
+  | "flag_sub_unit_preferred"  // rule 1a picks an active sub-unit address that is not the stored street's (flagged, never written)
+  | "flag_ambiguous_sub_units" // several active sub-unit addresses, none singled out (flagged, never written)
   | "under_liquidation" | "bankrupt" | "deleted" | "not_found" // (flagged, not corrected)
   | "changed_meanwhile"
   | "api_error";
@@ -531,6 +549,12 @@ export interface CorrectionResult {
   outcome: CorrectionOutcome;
   fields: string[];
   address_source?: BrregAddressSource;
+  /** Brreg organisasjonsform code (ENK, AS, ...); null when Brreg gave none. */
+  org_form: string | null;
+  /** The fylke the correction sets (dry run: would set); only when it differs. */
+  fylke_change?: { from: string | null; to: string };
+  /** Extra flags, e.g. "fylke_not_resolved". */
+  flags?: string[];
   flagged: boolean;
 }
 
@@ -540,6 +564,7 @@ interface CorrectionRow {
   adresse: string;
   postnummer: string | null;
   poststed: string | null;
+  fylke: string | null;
   field_provenance: string | null;
   brreg_address_attempted_at: string | null;
 }
@@ -562,7 +587,7 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
     const db = getDb("dental");
     const rows = db
       .prepare(
-        `SELECT id, org_nr, adresse, postnummer, poststed, field_provenance, brreg_address_attempted_at FROM dental_agents
+        `SELECT id, org_nr, adresse, postnummer, poststed, fylke, field_provenance, brreg_address_attempted_at FROM dental_agents
           WHERE org_nr IS NOT NULL AND org_nr <> '' AND adresse IS NOT NULL AND adresse <> ''
             AND field_provenance LIKE '%"brreg"%'
             AND brreg_address_attempted_at IS NOT NULL
@@ -576,9 +601,14 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
 
     const nowIso = new Date().toISOString();
     const results: CorrectionResult[] = [];
-    const counts = { checked: 0, consistent: 0, not_from_brreg_write: 0, would_correct: 0, corrected: 0, flagged: 0, api_error: 0 };
+    const counts = {
+      checked: 0, consistent: 0, not_from_brreg_write: 0, would_correct: 0, corrected: 0, flagged: 0, api_error: 0,
+      flag_sub_unit_preferred: 0, flag_ambiguous_sub_units: 0, fylke_changes: 0,
+    };
     const push = (r: CorrectionResult) => {
       if (r.flagged) counts.flagged++;
+      if (r.outcome === "flag_sub_unit_preferred") counts.flag_sub_unit_preferred++;
+      if (r.outcome === "flag_ambiguous_sub_units") counts.flag_ambiguous_sub_units++;
       results.push(r);
     };
 
@@ -601,45 +631,68 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
       const ev = await fetchBrregAddressEvidence(row.org_nr, sweepFetchImpl);
       if (ev.kind === "error") {
         counts.api_error++;
-        push({ id: row.id, outcome: "api_error", fields: [], flagged: false });
+        push({ id: row.id, outcome: "api_error", fields: [], org_form: null, flagged: false });
         continue;
       }
-      if (ev.kind === "not_found" || ev.slettet || ev.konkurs || ev.underAvvikling) {
-        const outcome: CorrectionOutcome =
-          ev.kind === "not_found" ? "not_found" : ev.slettet ? "deleted" : ev.konkurs ? "bankrupt" : "under_liquidation";
-        push({ id: row.id, outcome, fields: [], flagged: true });
+      if (ev.kind === "not_found") {
+        push({ id: row.id, outcome: "not_found", fields: [], org_form: null, flagged: true });
         continue;
       }
-
-      // A unit registered abroad is never corrected (same rule as
-      // chooseAddress): a foreign forretningsadresse flags the row.
-      if (ev.forretningsadresse && !isNorwegian(ev.forretningsadresse)) {
-        push({ id: row.id, outcome: "foreign_address", fields: [], flagged: true });
+      const org_form = ev.orgForm;
+      if (ev.slettet || ev.konkurs || ev.underAvvikling) {
+        const outcome: CorrectionOutcome = ev.slettet ? "deleted" : ev.konkurs ? "bankrupt" : "under_liquidation";
+        push({ id: row.id, outcome, fields: [], org_form, flagged: true });
         continue;
       }
 
-      // The Brreg address carrying the stored street; the one the write
-      // recorded as its source first.
-      const all: Candidate[] = [
-        ...ev.activeSubUnits.map((s) => ({ address: s.address, source: "beliggenhetsadresse" as const })),
-        ...(ev.forretningsadresse ? [{ address: ev.forretningsadresse, source: "forretningsadresse" as const }] : []),
-        ...(ev.postadresse ? [{ address: ev.postadresse, source: "postadresse" as const }] : []),
-      ];
+      // Rule 1 first, as in sweep mode. A unit registered abroad is never
+      // corrected: a foreign forretningsadresse (or a chosen sub-unit
+      // abroad) flags the row.
+      const choice = chooseAddress(ev, row.postnummer);
+      if (choice.kind === "foreign") {
+        push({ id: row.id, outcome: "foreign_address", fields: [], org_form, flagged: true });
+        continue;
+      }
+      if (choice.kind === "ambiguous") {
+        push({ id: row.id, outcome: "flag_ambiguous_sub_units", fields: [], org_form, flagged: true });
+        continue;
+      }
       const street = normaliseStreet(streetPart(row.adresse));
-      const matching = all.filter((c) => c.address.adresse && normaliseStreet(c.address.adresse) === street);
-      const recorded = typeof last.address_source === "string" ? last.address_source : "forretningsadresse";
-      const match = matching.find((c) => c.source === recorded) ?? matching[0];
+      if (choice.kind === "sub_unit" && normaliseStreet(choice.candidate.address.adresse) !== street) {
+        // Rule 1a prefers the practice location over the address the stored
+        // street came from: moving the postnummer would mix two places.
+        push({ id: row.id, outcome: "flag_sub_unit_preferred", fields: [], org_form, address_source: "beliggenhetsadresse", flagged: true });
+        continue;
+      }
+
+      // The Brreg address carrying the stored street. With an active
+      // sub-unit chosen, that is the sub-unit itself (same sub-object, its
+      // street checked above); otherwise the registered address with the
+      // stored street, the one the write recorded as its source first.
+      let match: Candidate | undefined;
+      if (choice.kind === "sub_unit") {
+        match = choice.candidate;
+      } else {
+        const registered: Candidate[] = [
+          ...(ev.forretningsadresse ? [{ address: ev.forretningsadresse, source: "forretningsadresse" as const }] : []),
+          ...(ev.postadresse ? [{ address: ev.postadresse, source: "postadresse" as const }] : []),
+        ];
+        const matching = registered.filter((c) => c.address.adresse && normaliseStreet(c.address.adresse) === street);
+        const recorded = typeof last.address_source === "string" ? last.address_source : "forretningsadresse";
+        match = matching.find((c) => c.source === recorded) ?? matching[0];
+      }
       if (!match) {
-        push({ id: row.id, outcome: "street_not_in_brreg", fields: [], flagged: true });
+        push({ id: row.id, outcome: "street_not_in_brreg", fields: [], org_form, flagged: true });
         continue;
       }
       const a = match.address;
+      const source = match.source;
       if (!isNorwegian(a)) {
-        push({ id: row.id, outcome: "foreign_address", fields: [], address_source: match.source, flagged: true });
+        push({ id: row.id, outcome: "foreign_address", fields: [], org_form, address_source: source, flagged: true });
         continue;
       }
       if (!a.postnummer || !a.poststed) {
-        push({ id: row.id, outcome: "incomplete_address", fields: [], address_source: match.source, flagged: true });
+        push({ id: row.id, outcome: "incomplete_address", fields: [], org_form, address_source: source, flagged: true });
         continue;
       }
       const pnOk = (row.postnummer || "").trim() === a.postnummer;
@@ -651,39 +704,59 @@ async function correctMixed(body: Record<string, unknown>, res: Response): Promi
       // Only a postnummer that does not fit is corrected (Daniel's limit);
       // a poststed-only difference (e.g. an old spelling) is reported.
       if (pnOk) {
-        push({ id: row.id, outcome: "poststed_only_mismatch", fields: [], address_source: match.source, flagged: true });
+        push({ id: row.id, outcome: "poststed_only_mismatch", fields: [], org_form, address_source: source, flagged: true });
         continue;
       }
-      const fields = ["postnummer", ...(psOk ? [] : ["poststed"]), "lat", "lng"];
+      // fylke follows the new postnummer (the search and /fylke pages filter
+      // on the fylke column). An unresolved postnummer leaves fylke alone.
+      const resolved = resolveKommuneFromPostnummer(a.postnummer);
+      const newFylke = "fylke" in resolved ? resolved.fylke : null;
+      const fylkeChange = newFylke !== null && newFylke !== (row.fylke ?? null) ? { from: row.fylke ?? null, to: newFylke } : undefined;
+      const extra: Pick<CorrectionResult, "fylke_change" | "flags"> = {
+        ...(fylkeChange ? { fylke_change: fylkeChange } : {}),
+        ...(newFylke === null ? { flags: ["fylke_not_resolved"] } : {}),
+      };
+      const fylkeFlag = newFylke === null;
+      const fields = ["postnummer", ...(psOk ? [] : ["poststed"]), ...(fylkeChange ? ["fylke"] : []), "lat", "lng"];
       if (!apply) {
         counts.would_correct++;
-        push({ id: row.id, outcome: "would_correct", fields, address_source: match.source, flagged: false });
+        if (fylkeChange) counts.fylke_changes++;
+        push({ id: row.id, outcome: "would_correct", fields, org_form, address_source: source, ...extra, flagged: fylkeFlag });
         continue;
       }
       const rec = (value: string) => ({
-        value, source_type: "brreg", address_source: match.source, correction: "mixed_address", fetched_at: nowIso,
+        value, source_type: "brreg", address_source: source, correction: "mixed_address", fetched_at: nowIso,
       });
       appendProv(prov, "postnummer", rec(a.postnummer));
       if (!psOk) appendProv(prov, "poststed", rec(a.poststed));
+      if (fylkeChange) {
+        appendProv(prov, "fylke", {
+          value: fylkeChange.to, source_type: "postnummer_register", derived_from_postnummer: a.postnummer,
+          correction: "mixed_address", fetched_at: nowIso,
+        });
+      }
       beforeWriteHookForTesting?.(row.id);
       const r = db
         .prepare(
           `UPDATE dental_agents
-              SET postnummer = @pn,${psOk ? "" : " poststed = @ps,"} field_provenance = @prov,
+              SET postnummer = @pn,${psOk ? "" : " poststed = @ps,"}${fylkeChange ? " fylke = @fylke," : ""} field_provenance = @prov,
                   lat = NULL, lng = NULL, geocode_confidence = NULL, geocode_source = NULL,
                   updated_at = datetime('now')
             WHERE id = @id AND adresse = @adresse
-              AND IFNULL(postnummer, '') = @pn_before AND IFNULL(poststed, '') = @ps_before`,
+              AND IFNULL(postnummer, '') = @pn_before AND IFNULL(poststed, '') = @ps_before
+              AND IFNULL(fylke, '') = @fy_before`,
         )
         .run({
-          id: row.id, adresse: row.adresse, pn: a.postnummer, ...(psOk ? {} : { ps: a.poststed }), prov: JSON.stringify(prov),
-          pn_before: row.postnummer ?? "", ps_before: row.poststed ?? "",
+          id: row.id, adresse: row.adresse, pn: a.postnummer, ...(psOk ? {} : { ps: a.poststed }),
+          ...(fylkeChange ? { fylke: fylkeChange.to } : {}), prov: JSON.stringify(prov),
+          pn_before: row.postnummer ?? "", ps_before: row.poststed ?? "", fy_before: row.fylke ?? "",
         });
       if (r.changes > 0) {
         counts.corrected++;
-        push({ id: row.id, outcome: "corrected", fields, address_source: match.source, flagged: false });
+        if (fylkeChange) counts.fylke_changes++;
+        push({ id: row.id, outcome: "corrected", fields, org_form, address_source: source, ...extra, flagged: fylkeFlag });
       } else {
-        push({ id: row.id, outcome: "changed_meanwhile", fields: [], address_source: match.source, flagged: false });
+        push({ id: row.id, outcome: "changed_meanwhile", fields: [], org_form, address_source: source, flagged: false });
       }
     }
 

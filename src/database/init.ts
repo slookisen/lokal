@@ -4062,9 +4062,12 @@ function initSchema(db: Database.Database): void {
   //   agents.order_notifications_opt_in : send-gate. 0 (default) = NEVER
   //       notify this producer about orders. Only an explicit admin action
   //       (POST /admin/orders/notification-optin) flips it to 1.
-  //   agents.order_notification_email   : admin-set override recipient. When
-  //       set, it wins over contact_email AND counts as "verified contact"
-  //       (an admin explicitly chose it — this is how Daniel points a test
+  //   agents.order_notification_email   : override recipient, admin-set OR
+  //       owner-confirmed (S1b punkt 7: a verified owner requests it and it
+  //       is written only after the link mailed to the new address is used —
+  //       routes/owner-portal.ts). When set, it wins over contact_email AND
+  //       counts as "verified contact" (an admin explicitly chose it, or the
+  //       owner proved control of it — this is also how Daniel points a test
   //       agent at his own inbox, mirroring the booking test-provider
   //       pattern). When NULL, contact_email is used and the agent must be
   //       verification_status='verified' in agent_knowledge.
@@ -5197,6 +5200,30 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_events_idem ON order_events(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
   } catch { /* best-effort — the lookup before the transition still works */ }
 
+  // Fase B2 (dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-og-kjoperagent):
+  // the message thread per order (services/order-messages.ts). Additive; no
+  // existing table changes. One row per message:
+  //   author_role     : 'buyer' (MCP lokal_order_message / the order card) or
+  //                     'seller' (Mine ordrer).
+  //   body            : the trimmed text, at most 1000 characters.
+  //   channel         : 'mcp' | 'web' | 'owner_portal'.
+  //   idempotency_key : the caller's key, namespaced per role ('b:' / 's:');
+  //                     a repeat of the same key returns the stored message.
+  //   created_at      : ISO-8601 UTC (the per-order rate limit compares it).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_messages (
+      id              TEXT PRIMARY KEY,
+      order_id        TEXT NOT NULL,
+      author_role     TEXT NOT NULL CHECK(author_role IN ('buyer','seller')),
+      body            TEXT NOT NULL,
+      channel         TEXT NOT NULL,
+      idempotency_key TEXT,
+      created_at      TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_order_messages_order_id ON order_messages(order_id, created_at)`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_messages_idem ON order_messages(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.
@@ -5327,6 +5354,143 @@ function initSchema(db: Database.Database): void {
   try {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 6 ───────
+  // Owner pause (visibility.profile = false). One row = paused; pause_until
+  // 'YYYY-MM-DD' (optional) = the pause ends that UTC day. Its own table, not
+  // agents columns (extra agents columns change SQLite's plan for the public
+  // scans and so the row order the golden tests pin). No `id` column on
+  // purpose (services/agent-visibility.ts notOwnerPausedSql). Read only by
+  // agent-visibility.ts while OWNER_PAUSE_ENABLED is on; written only by
+  // POST /eier/:id/pause and /api/agents/:id/pause. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_profile_pause (
+        agent_id TEXT NOT NULL PRIMARY KEY,
+        paused_at TEXT NOT NULL,
+        pause_until TEXT,
+        set_by TEXT NOT NULL DEFAULT 'owner'
+      )
+    `);
+  } catch (err) {
+    console.error("Migration owner_profile_pause failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 7 ───────
+  // Owner-requested change of agents.order_notification_email, pending until
+  // the confirmation link sent to the NEW address is clicked. Only the sha256
+  // of the token is stored. requested_at / expires_at / consumed_at are all
+  // ISO-8601 (Date#toISOString) and compared only against ISO strings.
+  // outcome: NULL = pending; 'confirmed' | 'superseded' | 'send_failed'.
+  // owner_basis: fingerprint of the ownership basis at request time
+  // (claimed_at/claimed_via + verified claim ids); confirm requires it to be
+  // unchanged, so a token never survives an ownership reset or re-claim.
+  // Read/written only by routes/owner-portal.ts while OWNER_ORDER_EMAIL_ENABLED
+  // is on. Additive, brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_order_email_change (
+        token_hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        new_email TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        outcome TEXT,
+        requested_by TEXT,
+        owner_basis TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_order_email_change_agent
+        ON owner_order_email_change(agent_id, requested_at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_order_email_change failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2a ───────────────
+  // «Mine valg» owner feature settings + change log (owner-features/).
+  // owner_feature_settings holds ONLY explicit choices; everything else falls
+  // back to the registry default, so a changed default never changes a stored
+  // choice. Keyed on (vertical, subject_id): vertical 'rfb' → subject_id =
+  // agents.id (gårdssalg reuses it with experience_providers.id). Entries with
+  // a storage adapter (orders.enabled ↔ agents.order_notifications_opt_in)
+  // never get a row here — the column stays the source of truth.
+  // admin_locked = 1 (set_by 'admin') overrides the owner. value_json /
+  // old_json / new_json are JSON; set_at / at are ISO-8601
+  // (Date#toISOString). owner_feature_audit gets exactly one row per change,
+  // adapter writes included. Additive, brand-new tables.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_settings (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        set_by TEXT NOT NULL CHECK (set_by IN ('owner','admin','cs','system')),
+        admin_locked INTEGER NOT NULL DEFAULT 0,
+        set_at TEXT NOT NULL,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+      CREATE TABLE IF NOT EXISTS owner_feature_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        old_json TEXT,
+        new_json TEXT,
+        actor TEXT NOT NULL,
+        actor_detail TEXT,
+        at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_audit_subject
+        ON owner_feature_audit(vertical, subject_id, at);
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_settings/owner_feature_audit failed:", err);
+  }
+
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2b ───────────────
+  // The «Mine valg» page (owner-features/page.ts). Two additive, brand-new
+  // tables; owner_feature_audit is unchanged.
+  // owner_feature_change_batch: one row per change the owner made on the page
+  // (one switch = kind 'single', one level = kind 'level', an undo = kind
+  // 'undo'). The audit rows it wrote are the contiguous id range
+  // first_audit_id..last_audit_id (written in one transaction). «Angre»
+  // reverts the newest batch as one unit and stamps undone_at /
+  // undone_by_batch; new_row_keys (JSON array) lists the settings rows the
+  // batch created, which an undo removes again. owner_feature_intro: the first-login card («Nyheter og
+  // tips», ja/nei) — one row once answered, so the card shows only until then.
+  // Times are ISO-8601 (Date#toISOString).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_change_batch (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('single','level','undo')),
+        level TEXT,
+        first_audit_id INTEGER NOT NULL,
+        last_audit_id INTEGER NOT NULL,
+        actor_detail TEXT,
+        created_at TEXT NOT NULL,
+        undone_at TEXT,
+        undone_by_batch INTEGER,
+        new_row_keys TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_change_batch_subject
+        ON owner_feature_change_batch(vertical, subject_id, id);
+      CREATE TABLE IF NOT EXISTS owner_feature_intro (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        answer TEXT NOT NULL CHECK (answer IN ('yes','no')),
+        answered_at TEXT NOT NULL,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_change_batch/owner_feature_intro failed:", err);
+  }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
@@ -5829,6 +5993,36 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_search_console_weekly_week ON search_console_weekly(week)`);
   } catch (err) {
     console.error("Migration search_console_weekly failed:", err);
+  }
+
+  // ─── order_activation_links (dev-request 2026-10-21 live-go handlevogn-pilot,
+  // skive 2 — aktiveringslenke) ─────────────────────────────────────────────
+  // One row per admin-generated, HMAC-signed one-time activation link
+  // (services/order-activation-link.ts). The token itself is never stored:
+  // `id` is sha256(nonce) hex, `email_hash` the keyed hash of the registered
+  // address the link was bound to. `used_at` is the single-use guard (a
+  // conditional UPDATE … WHERE used_at IS NULL) and, with used_outcome /
+  // used_ip_hash / used_user_agent / session_link_id, the usage log.
+  // Additive; brand-new table.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_activation_links (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        email_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        used_at TEXT,
+        used_outcome TEXT,
+        used_ip_hash TEXT,
+        used_user_agent TEXT,
+        session_link_id TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_order_activation_links_agent ON order_activation_links(agent_id)`);
+  } catch (err) {
+    console.error("Migration order_activation_links failed:", err);
   }
 
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────

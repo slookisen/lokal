@@ -75,9 +75,10 @@
 //   Ranking still uses the real haversine, as discover() does.
 
 import { getDb } from "../database/init";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, type PublicFieldChoices } from "../owner-features/enforce";
 import { knowledgeService } from "./knowledge-service";
 import { geocodingService } from "./geocoding-service";
-import { isEligibleForRealOrder, isProducerStatedSource, foodInfoOf, type FoodInfo } from "./cart-service";
+import { isEligibleForRealOrder, isProducerStatedSource, isRowOrderableForRealOrder, foodInfoOf, type FoodInfo } from "./cart-service";
 import { computeEffectiveAvailability } from "./supply-graph";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
@@ -333,6 +334,54 @@ async function resolvePosition(
 }
 
 /**
+ * The producer object of an offer (findOffers) or of a pre-selected order
+ * line (findProducerOrderables). `dist` null: no position was given, so
+ * neither a km figure nor a distance label is sent.
+ */
+function offerProducerOf(
+  db: any,
+  r: { agent_id: string; agent_name: string; city: string | null; geo_precision: string | null; is_verified: number },
+  dist: number | null,
+  choices?: PublicFieldChoices | null,
+): OfferProducer {
+  const info = knowledgeService.getAgentInfo(r.agent_id);
+  // S2c-1: no phone when the owner hid it (contact.phone).
+  const k = withoutHiddenContact(info?.knowledge, choices);
+
+  const salgskanaler = (db.prepare(`
+    SELECT sc.name AS name
+    FROM agent_salgskanal asg
+    INNER JOIN salgskanal_categories sc ON sc.slug = asg.category_slug
+    WHERE asg.agent_id = ?
+    ORDER BY sc.sort_order
+  `).all(r.agent_id) as Array<{ name: string }>).map((s) => s.name);
+
+  const isVerified = r.is_verified === 1;
+  // skive 2: one shared gate with submitCart() — see the module doc comment.
+  const canOrder = isEligibleForRealOrder(r.agent_id, db);
+
+  // I-V: no km figure for a centroid; the label says where it is instead.
+  const km = dist == null ? null : Math.round(dist * 10) / 10;
+  const distanceLabel = km == null ? null : formatRfbDistanceLabel(km, r.geo_precision, r.city);
+
+  return {
+    agent_id: r.agent_id,
+    name: r.agent_name,
+    city: r.city ?? null,
+    distance_km: km == null || shouldSuppressDistance(r.geo_precision) ? null : km,
+    ...(distanceLabel ? { distance_label: distanceLabel } : {}),
+    verifisert_av_eier: isVerified,
+    can_order: canOrder,
+    salgskanaler,
+    delivery_text: k?.deliveryOptions?.length ? k.deliveryOptions.join(", ") : null,
+    phone: k?.phone ?? null,
+    email: k?.email ?? null,
+    profile_url: `${BASE_URL}/produsent/${slugify(r.agent_name)}`,
+    vcard_url: `${BASE_URL}/api/marketplace/agents/${r.agent_id}/vcard`,
+  };
+}
+
+/**
  * Finds the product offers matching `q` of up to `limit` (max 5) eligible
  * producers within `radiusKm` of the resolved position, one offer per
  * producer (I-V), nearest first, and fills the rest of the `limit` with
@@ -429,45 +478,9 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     .sort(byDistance)
     .slice(0, limit - offerRows.length);
 
-  const salgskanalStmt = db.prepare(`
-    SELECT sc.name AS name
-    FROM agent_salgskanal asg
-    INNER JOIN salgskanal_categories sc ON sc.slug = asg.category_slug
-    WHERE asg.agent_id = ?
-    ORDER BY sc.sort_order
-  `);
-
   // One producer shape for offers and category matches.
-  const producerOf = (r: RawOfferRow, dist: number): OfferProducer => {
-    const info = knowledgeService.getAgentInfo(r.agent_id);
-    const k = info?.knowledge;
-
-    const salgskanaler = (salgskanalStmt.all(r.agent_id) as Array<{ name: string }>).map((s) => s.name);
-
-    const isVerified = r.is_verified === 1;
-    // skive 2: one shared gate with submitCart() — see the module doc comment.
-    const canOrder = isEligibleForRealOrder(r.agent_id, db);
-
-    // I-V: no km figure for a centroid; the label says where it is instead.
-    const km = Math.round(dist * 10) / 10;
-    const distanceLabel = formatRfbDistanceLabel(km, r.geo_precision, r.city);
-
-    return {
-      agent_id: r.agent_id,
-      name: r.agent_name,
-      city: r.city ?? null,
-      distance_km: shouldSuppressDistance(r.geo_precision) ? null : km,
-      ...(distanceLabel ? { distance_label: distanceLabel } : {}),
-      verifisert_av_eier: isVerified,
-      can_order: canOrder,
-      salgskanaler,
-      delivery_text: k?.deliveryOptions?.length ? k.deliveryOptions.join(", ") : null,
-      phone: k?.phone ?? null,
-      email: k?.email ?? null,
-      profile_url: `${BASE_URL}/produsent/${slugify(r.agent_name)}`,
-      vcard_url: `${BASE_URL}/api/marketplace/agents/${r.agent_id}/vcard`,
-    };
-  };
+  const ownerChoices = publicFieldChoicesForMany([...offerRows, ...matchRows].map((x) => x.r.agent_id), { db });
+  const producerOf = (r: RawOfferRow, dist: number): OfferProducer => offerProducerOf(db, r, dist, ownerChoices.get(r.agent_id));
 
   const offers: Offer[] = offerRows.map(({ r, dist, availability }) => {
     const food_info = foodInfoOf(r);
@@ -496,4 +509,101 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
     producer: producerOf(r, dist),
   }));
   return { term, offers, category_matches };
+}
+
+// ─── Skive 3: one producer's orderable products (bestillingsknapp) ───────
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel,
+// skive 3: «Bestill for henting» on /produsent/:slug links to
+// /handleliste?produsent=<agent_id>, which pre-fills the list with this
+// producer's orderable products and pre-selects its offer per item. Read-only;
+// no new rule: a producer that fails isEligibleForRealOrder() gets nothing,
+// and each row must pass cart-service.isRowOrderableForRealOrder() (the
+// add/submit per-row gates). Reached by id, like cart add/submit and
+// /catalog/agents/:id/products, so — per agent-visibility.ts — no
+// public-listability filter here; the callers carry their own (the producer
+// page; /handleliste?produsent= checks isAgentIdPubliclyVisible first).
+
+/** agents.id shape accepted from a URL (UUIDs and the older slug-like ids). */
+const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+export function isWellFormedAgentId(raw: unknown): raw is string {
+  return typeof raw === "string" && AGENT_ID_RE.test(raw);
+}
+
+export interface ProducerOrderables {
+  producer: OfferProducer;
+  offers: Offer[];
+}
+
+interface RawProducerRow {
+  product_id: string;
+  product_name: string;
+  description: string | null;
+  price_nok: number | null;
+  unit: string | null;
+  availability: string;
+  availability_updated_at: string | null;
+  availability_source: string;
+  product_category: string | null;
+  ingredients: string | null;
+  allergens: string | null;
+  net_weight: string | null;
+  agent_id: string;
+  agent_name: string;
+  city: string | null;
+  geo_precision: string | null;
+  is_verified: number;
+}
+
+/**
+ * The orderable products of one producer, as offers of the shape findOffers
+ * returns (distance_km null: no position), sorted by name (nb), then id, and
+ * at most `limit`. null when the id is malformed, the producer does not pass
+ * isEligibleForRealOrder(), or none of its rows is orderable. Never throws.
+ */
+export function findProducerOrderables(
+  agentId: unknown,
+  opts: { db?: any; now?: Date; limit: number },
+): ProducerOrderables | null {
+  if (!isWellFormedAgentId(agentId)) return null;
+  try {
+    const db = opts.db ?? getDb();
+    const now = opts.now ?? new Date();
+    if (!isEligibleForRealOrder(agentId, db)) return null;
+    const rows = db.prepare(`
+      SELECT
+        p.id AS product_id, p.name AS product_name, p.description AS description,
+        p.price_nok, p.unit, p.availability, p.availability_updated_at, p.availability_source,
+        p.category AS product_category,
+        p.ingredients AS ingredients, p.allergens AS allergens, p.net_weight AS net_weight,
+        a.id AS agent_id, a.name AS agent_name, a.city AS city,
+        a.geo_precision AS geo_precision, a.is_verified AS is_verified
+      FROM products p
+      INNER JOIN agents a ON a.id = p.agent_id
+      WHERE a.id = ?
+    `).all(agentId) as RawProducerRow[];
+    const orderable = rows
+      .filter((r) => isRowOrderableForRealOrder(db, { ...r, name: r.product_name, category: r.product_category }, now))
+      .sort((a, b) => a.product_name.trim().localeCompare(b.product_name.trim(), "nb") || a.product_id.localeCompare(b.product_id))
+      .slice(0, Math.max(0, opts.limit));
+    if (orderable.length === 0) return null;
+    const producer = offerProducerOf(db, orderable[0]!, null, publicFieldChoices(agentId, { db }));
+    const offers: Offer[] = orderable.map((r) => {
+      const food_info = foodInfoOf(r);
+      return {
+        product_id: r.product_id,
+        product_name: r.product_name,
+        price_nok: r.price_nok ?? null,
+        unit: r.unit ?? null,
+        availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+        producer_confirmed: true,
+        ...(food_info ? { food_info } : {}),
+        producer,
+      };
+    });
+    return { producer, offers };
+  } catch (e) {
+    console.error("[catalog-offers] findProducerOrderables failed:", e);
+    return null;
+  }
 }

@@ -22,6 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -45,23 +46,27 @@ import { capFreeText } from "../utils/free-text";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats, getTrafficStatsSnapshot } from "../services/traffic-stats";
-import { getRetentionWindowDays } from "../services/retention-window";
+import { publicTrafficYearBlock, TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYearKey } from "../services/traffic-year-compute";
+import { aiDeliveriesYearPeriodLabel } from "../services/profile-year-compute";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
 import { searchTrafficClass } from "../services/search-tracking";
-import { AI_DELIVERY_WINDOW_DAYS } from "../services/profile-ai-deliveries-compute";
+import {
+  AI_DELIVERIES_LABEL, AI_DELIVERIES_SUBTITLE, aiDeliveriesCountingSince,
+} from "../services/profile-ai-deliveries-compute";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
-import { publicListableSql, isPubliclyListable, failsProducerRoleGate } from "../services/agent-visibility";
+import { publicListableSql, isPubliclyListable, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
 import { buildRatingJsonLd, buildOfferPolicyJsonLd, formatRatingDisplay, producerPageProductNodes } from "../services/structured-data-policy";
-import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN } from "./handleliste-page";
+import { isHandelisteEnabled, buildHandelistePage, HANDELISTE_PATH_NO, HANDELISTE_PATH_EN, HANDELISTE_MAX_ITEMS, handelisteOrderHref, ORDER_BUTTON_LABEL } from "./handleliste-page";
+import { findProducerOrderables } from "../services/catalog-offers";
 import { isPaymentsEnabled, isPaymentsLifecycleActive } from "../services/payment-service";
 import { renderBetalingContent, renderPrepaymentPrivacy, BETALING_PATH } from "./rfb-betaling";
 import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
@@ -1232,7 +1237,7 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     // crawlers shown on their own, the rest is otherBotViews.
     aiLookups: s.aiLookups,
     aiSearchTotal: s.aiSearchTotal,
-    // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
+    // «Med i AI-søk» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times
     // profiles were sent to AI assistants in the window, all profiles summed.
     aiDeliveries: s.aiDeliveries,
     otherBotViews: s.otherBotViews,
@@ -1242,6 +1247,10 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
     realHumans: s.realHumans,
     botAndAi: s.botAndAi,
     aiQueries: s.aiQueries,
+    // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: the strip's
+    // five numbers over the last 12 months, each with its start date
+    // (since: null = the whole window). The fields above stay 60-day numbers.
+    year: publicTrafficYearBlock(s.year),
   });
 });
 
@@ -1324,6 +1333,7 @@ const LANDING_CSS = `
   .proof-val-purple { color: #7c3aed; }
   .proof-lbl { font-size: 0.68rem; color: var(--g500); margin-top: 3px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
   .proof-sep { width: 1px; height: 28px; background: var(--g200); }
+  .proof-period { font-size: 0.64rem; color: var(--g400); margin-top: 2px; }
   .proof-note { max-width: 900px; margin: 10px auto 0; text-align: center; font-size: 0.7rem; color: var(--g500); line-height: 1.5; }
   .network-strip { max-width: 900px; margin: 12px auto 0; text-align: center; font-size: 0.75rem; color: var(--g500); }
   .network-strip a { color: var(--green-700); font-weight: 600; text-decoration: none; }
@@ -1447,8 +1457,12 @@ router.get("/", (req: Request, res: Response) => {
     // (description on the row, about on the knowledge object). The rich cards
     // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
+    // S2c-1: the owners' contact / price choices, one lookup for the page.
+    const featuredChoices = publicFieldChoicesForMany(featured.slice(0, 11).filter((a: any) => a.isClaimed).map((a: any) => a.id));
     featured.forEach((a: any, i: number) => {
-      if (i < 11 && a.isClaimed) featuredKnowledge.set(a.id, knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {});
+      if (i < 11 && a.isClaimed) {
+        featuredKnowledge.set(a.id, withoutHiddenFields(knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {}, featuredChoices.get(a.id)));
+      }
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
@@ -1545,6 +1559,32 @@ router.get("/", (req: Request, res: Response) => {
 
     const numFmt = lang === "en" ? "en-US" : "nb-NO";
 
+    // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2: five equal
+    // numbers over the last 12 months, each with «siste 12 måneder» or
+    // «siden <dato>» (traffic-year-compute.ts), from the same off-thread
+    // snapshot as before; the 60-day fields are no longer shown here.
+    const trafficYear = traffic.year;
+    const yearLang = trafficYearLangOf(lang);
+    const yearCell = (key: TrafficYearKey) => trafficYearCell(trafficYear, key, yearLang, numFmt);
+    const yearNum = (n: number | undefined) => (n === undefined ? "–" : n.toLocaleString(numFmt));
+    const proofLabels: Record<TrafficYearKey, string> = {
+      humanVisits: t(lang, "home.proof_human_visits"),
+      humanViews: t(lang, "home.proof_human_views"),
+      aiSearch: t(lang, "home.proof_ai_search"),
+      aiCrawlerViews: t(lang, "home.proof_ai_crawlers"),
+      aiDeliveries: t(lang, "home.proof_ai_deliveries"),
+    };
+    const proofItemsHtml = TRAFFIC_YEAR_KEYS.map((key, i) => {
+      const c = yearCell(key);
+      const title = key === "aiDeliveries" ? t(lang, "home.proof_ai_deliveries_explain")
+        : key === "aiSearch" || key === "aiCrawlerViews" ? t(lang, "home.proof_ai_explain") : "";
+      return `${i > 0 ? '        <div class="proof-sep"></div>\n' : ""}        <div class="proof-item" data-stat="${key}"${title ? ` title="${escapeHtml(title)}"` : ""}>
+          <div class="proof-val${key === "aiSearch" ? " proof-val-purple" : ""}">${escapeHtml(c.value)}</div>
+          <div class="proof-lbl">${escapeHtml(proofLabels[key])}</div>
+          ${c.period ? `<div class="proof-period">${escapeHtml(c.period)}</div>` : ""}
+        </div>`;
+    }).join("\n");
+
     const content = `
     <section class="hero">
       <div class="hero-inner">
@@ -1611,35 +1651,20 @@ router.get("/", (req: Request, res: Response) => {
 
     <div class="proof-bar">
       <div class="proof-inner">
-        <div class="proof-item">
-          <div class="proof-val">${traffic.humanVisits.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_human_visits"))}</div>
-        </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item">
-          <div class="proof-val">${traffic.humanViews.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_human_views"))}</div>
-        </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
-          <div class="proof-val proof-val-purple">${traffic.aiSearchTotal.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_search"))}</div>
-        </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
-          <div class="proof-val">${traffic.aiCrawlerViews.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_crawlers"))}</div>
-        </div>
+${proofItemsHtml}
       </div>
-      <div class="proof-note">${escapeHtml(t(lang, "home.proof_total", {
-        days: traffic.windowDays,
-        total: traffic.pageViews.toLocaleString(numFmt),
-        human: traffic.humanViews.toLocaleString(numFmt),
-        aiPages: traffic.aiSearchViews.toLocaleString(numFmt),
-        aiCrawlers: traffic.aiCrawlerViews.toLocaleString(numFmt),
-        otherBots: traffic.otherBotViews.toLocaleString(numFmt),
-        aiLookups: traffic.aiLookups.toLocaleString(numFmt),
-      }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>
+      ${trafficYear ? `<div class="proof-note">${escapeHtml(t(lang, "home.proof_total", {
+        period: yearCell("humanViews").period,
+        total: yearNum(trafficYear?.pageViews.value),
+        human: yearNum(trafficYear?.humanViews.value),
+        aiPages: yearNum(trafficYear?.aiSearchViews.value),
+        aiCrawlers: yearNum(trafficYear?.aiCrawlerViews.value),
+        otherBots: yearNum(trafficYear?.otherBotViews.value),
+        aiPeriod: yearCell("aiSearch").period,
+        aiSearchPages: yearNum(trafficYear?.aiSearch.pages),
+        aiLookups: yearNum(trafficYear?.aiSearch.lookups),
+        deliveriesPeriod: yearCell("aiDeliveries").period,
+      }))} ${escapeHtml(t(lang, "home.proof_ai_explain"))}</div>` : ""}
       <div class="network-strip">${escapeHtml(t(lang, "home.network_label"))}
         <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a> &middot;
         <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a>
@@ -1697,8 +1722,8 @@ ${umbrellaSectionHtml}
       </div>
     </section>`;
 
-    // «Med i AI-svar»: the featured producers on the page, for an AI assistant's fetch.
-    recordAiPageDelivery(req, res, "ai_page_list", featured.map((a: any) => a.id));
+    // «Med i AI-søk» (S1, 2026-10-25): the front page's featured list answers no
+    // search, city, category or umbrella, so it is not counted.
     res.send(shell(
       t(lang, "home.title"),
       t(lang, "home.description", { count: totalAgents }),
@@ -4127,7 +4152,18 @@ router.get([HANDELISTE_PATH_NO, HANDELISTE_PATH_EN], (req: Request, res: Respons
   if ((lang === "en") !== isEnPath) return next();
 
   try {
-    const page = buildHandelistePage(lang);
+    // Skive 3: ?produsent=<agent_id> (from «Bestill for henting» on
+    // /produsent/:slug) pre-fills the producer's orderable products. A
+    // missing, malformed, unknown, ineligible or not publicly visible id is
+    // ignored silently: no preselect and the page is as before. The
+    // visibility check («gated», like /agents/:id/card) keeps the hidden test
+    // fixture and unvetted self-registered rows out of anyone's reach by UUID.
+    const rawProducer = req.query.produsent;
+    const orderables = typeof rawProducer === "string" && rawProducer
+      && isAgentIdPubliclyVisible(getDb(), rawProducer, { surface: "gated" })
+      ? findProducerOrderables(rawProducer, { limit: HANDELISTE_MAX_ITEMS })
+      : null;
+    const page = buildHandelistePage(lang, orderables ? { producer_name: orderables.producer.name, offers: orderables.offers } : null);
     const noPath = HANDELISTE_PATH_NO;
     const localized = lang === "en" ? "/en" + HANDELISTE_PATH_EN : noPath;
     res.setHeader("Cache-Control", "no-store");
@@ -4270,9 +4306,12 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     const contextPara = contextSentences.join(" ");
 
     // Schema.org
+    // S2c-1: the owners' contact choices, one lookup for the page.
+    const cityChoices = publicFieldChoicesForMany(cityAgents.slice(0, 50).map((a: any) => a.id));
     const jsonLdItems = cityAgents.slice(0, 50).map((a: any) => {
       const info = knowledgeService.getAgentInfo(a.id);
-      const k = info?.knowledge || {} as any;
+      const choices = cityChoices.get(a.id);
+      const k = withoutHiddenFields(info?.knowledge || {} as any, choices);
       let itemDesc = a.description || "";
       if (isJunkDescription(itemDesc)) {
         console.log(`[description-guard] suppressed junk description (city JSON-LD) for ${a.id} (${a.name})`);
@@ -4287,7 +4326,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       const locality = fylke ? (a.city || a.location?.city) : cityName;
       if (k.address) item.address = { "@type": "PostalAddress", "streetAddress": k.address, "addressLocality": locality, "addressCountry": "NO" };
       if (isDisplayablePhone(k.phone)) item.telephone = k.phone;
-      if (a.location?.lat && a.location?.lng) item.geo = { "@type": "GeoCoordinates", "latitude": a.location.lat, "longitude": a.location.lng };
+      if (a.location?.lat && a.location?.lng && !hidesAddress(choices)) item.geo = { "@type": "GeoCoordinates", "latitude": a.location.lat, "longitude": a.location.lng };
       return item;
     });
 
@@ -5152,6 +5191,28 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       agent = undefined;
     }
 
+    // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: an
+    // owner-paused profile is not a 404 — the page says «Midlertidig pause»
+    // and asks not to be indexed. OWNER_PAUSE_ENABLED off = never reached.
+    if (agent && ownerPauseEnabled()) {
+      if (isOwnerPaused(readOwnerPauseRow(getDb(), agent.id))) {
+        const en = lang === "en";
+        const name = String(agent.name || "");
+        res.setHeader("X-Robots-Tag", "noindex");
+        return res.status(200).send(shell(
+          en ? `Temporarily paused — ${name}` : `Midlertidig pause — ${name}`,
+          en ? `${name} has temporarily paused their profile.` : `${name} har satt profilen sin på midlertidig pause.`,
+          `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
+            <h1 style="font-size:2rem;margin-bottom:12px;">${escapeHtml(name)}</h1>
+            <p style="font-size:1.2rem;margin-bottom:12px;"><strong>${en ? "Temporarily paused" : "Midlertidig pause"}</strong></p>
+            <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">${en ? "The producer has paused this profile for now." : "Produsenten har satt profilen på pause en periode."}</p>
+            <a href="${localizedPath("/sok", lang)}" class="city-pill">${en ? "Find other producers →" : "Finn andre produsenter →"}</a>
+          </div>`,
+          { lang, robots: "noindex", canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, pathForAlternate: `/produsent/${encodeURIComponent(slug)}` },
+        ));
+      }
+    }
+
     if (!agent) {
       // ─── Slug-alias check (dev-request 2026-09-03-rfb-korrigering-navn-
       // sted-kategorier, Mål 1) ───────────────────────────────────────────
@@ -5282,7 +5343,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // withGoogleRating: the profile stat reads it, RATING_DISPLAY_MODE decides (S4-A1a).
     const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true });
-    const k = (info?.knowledge || {}) as any;
+    // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's
+    // contact / price / stats choices (null = not enforced, page as before).
+    const ownerChoices = publicFieldChoices(agent.id);
+    const k = withoutHiddenFields((info?.knowledge || {}) as any, ownerChoices);
     const meta = (info?.meta || {}) as any;
 
     // Render-time guard: nav/boilerplate scraped text masquerading as a real
@@ -5984,7 +6048,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.website) jsonLd.url = k.website;
 
     // Geo coordinates
-    if (agent.location?.lat && agent.location?.lng) {
+    if (agent.location?.lat && agent.location?.lng && !hidesAddress(ownerChoices)) {
       jsonLd.geo = {
         "@type": "GeoCoordinates",
         "latitude": agent.location.lat,
@@ -6088,13 +6152,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         let priceValue = typeof p === "object" ? (p.price || "") : "";
 
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
-        let priceNum = parseNokPrice(priceValue);
+        let priceNum = hidesPrices(ownerChoices) ? null : parseNokPrice(priceValue);
         if (priceNum === null) {
           // S6 del A: only a "kr" price the name shows, and the name is cut
           // only when it has one (splitNamePrice).
           const fromName = splitNamePrice(rawName, lang);
           productName = fromName.name;
-          priceNum = fromName.price;
+          priceNum = hidesPrices(ownerChoices) ? null : fromName.price;
         }
 
         // dev-request 2026-09-29-gsc-strukturerte-data-og-5xx (A): Google
@@ -6356,11 +6420,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     let activityHtml = "";
     try {
       const activity = getProfileActivity(getDb(), agent.id, `/produsent/${slug}`);
-      const { views30, topQueryTerms, platforms } = activity;
-      const hasAnyActivity = views30.human > 0 || views30.ai > 0 || topQueryTerms.length > 0 || platforms.length > 0;
+      const showCounts = !ownerChoices || ownerChoices.publicCounts;
+      const { views30, platforms } = activity;
+      const topQueryTerms = !ownerChoices || ownerChoices.publicSearchTerms ? activity.topQueryTerms : [];
+      const hasAnyActivity = (showCounts && (views30.human > 0 || views30.ai > 0)) || topQueryTerms.length > 0 || platforms.length > 0;
 
       if (hasAnyActivity) {
-        const statsHtml = `<div class="act-grid">
+        const statsHtml = !showCounts ? "" : `<div class="act-grid">
           <div class="act-stat"><strong>${views30.human.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? `Profile views · ${views30.days}d` : `Profilvisninger · ${views30.days}d`}</small></div>
           <div class="act-stat"><strong>${views30.ai.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? `AI-agent lookups · ${views30.days}d` : `AI-agent-oppslag · ${views30.days}d`}</small></div>
         </div>`;
@@ -6387,8 +6453,29 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] profile-activity query failed:", e);
     }
 
-    // Window of the views tiles below: the raw retention (agent-stats-compute.ts).
-    const statsDays = getRetentionWindowDays();
+    // Skive 3 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-
+    // handel): «Bestill for henting» → /handleliste?produsent=<id>, only when
+    // HANDLELISTE_ENABLED is on AND the producer passes the ONE real-order gate
+    // (cart-service.isEligibleForRealOrder, the same one submit uses) AND has at
+    // least one orderable product — the very list the link pre-fills
+    // (findProducerOrderables, which applies that gate itself). Both are
+    // evaluated per request (the page sets no shared-cache header; Express's
+    // ETag is over the body, so it follows the button). Empty string otherwise,
+    // so every other producer's contact CTA is byte-identical; a gate error
+    // counts as «not eligible» and never breaks the page.
+    let orderButtonHtml = "";
+    if (isHandelisteEnabled()) {
+      let canOrder = false;
+      try {
+        canOrder = findProducerOrderables(agent.id, { limit: 1 }) !== null;
+      } catch (e) {
+        console.error(`[seo] /produsent/${slug} real-order gate failed:`, e);
+      }
+      if (canOrder) {
+        orderButtonHtml = `<a href="${escapeHtml(handelisteOrderHref(agent.id, lang))}" class="btn-p" data-order-cta="1">&#128722; ${escapeHtml(ORDER_BUTTON_LABEL[lang === "en" ? "en" : "no"])}</a>`;
+      }
+    }
+
     const content = `
     <div class="bc"><a href="${localizedPath("/", lang)}">${escapeHtml(t(lang, "nav.home"))}</a>${cityName ? `<span>/</span><a href="${localizedPath("/" + slugify(cityName), lang)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 
@@ -6429,16 +6516,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
           ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
-          <div class="pf-stat" data-stat="human" title="${lang === "en" ? `Page views from humans, last ${statsDays} days` : `Sidevisninger fra mennesker, siste ${statsDays} dager`}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `humans &middot; ${statsDays}d` : `mennesker &middot; ${statsDays}d`}</span></small></div></div>
-          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last ${statsDays} days.` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager.`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? `AI agents &middot; ${statsDays}d` : `AI-agenter &middot; ${statsDays}d`}</span></small></div></div>
-          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was sent to AI assistants such as ChatGPT and Claude as part of an answer, last ${AI_DELIVERY_WINDOW_DAYS} days. It does not show how many people saw it.` : `Antall ganger profilen er sendt til AI-assistenter som ChatGPT og Claude som svar på spørsmål, siste ${AI_DELIVERY_WINDOW_DAYS} dager. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? "In AI answers" : "Med i AI-svar"}<br><span class="pf-stat-meta">${lang === "en" ? `sent to the AI &middot; ${AI_DELIVERY_WINDOW_DAYS}d` : `sendt til AI-en &middot; ${AI_DELIVERY_WINDOW_DAYS}d`}</span></small></div></div>
+          ${ownerChoices && !ownerChoices.publicCounts ? "" : `<div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans" : "Sidevisninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans" : "mennesker"}</span></small></div></div>
+          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents" : "AI-agenter"}</span></small></div></div>
+          <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "en"))}. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "nb"))}. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>`}
         </div>
       </div>
 
       <div class="ct-card">
         <h3>${lang === "en" ? "Contact information" : "Kontaktinformasjon"}</h3>
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">${lang === "en" ? "No contact info available yet." : "Ingen kontaktinfo tilgjengelig enn\u00e5."}</p>`}
-        <div class="ct-actions">
+        <div class="ct-actions">${orderButtonHtml}
           ${k.website ? `<a href="/ut/${encodeURIComponent(agent.id)}/website" class="btn-p" target="_blank" rel="noopener">&#127760; ${escapeHtml(t(lang, "producer.visit_website"))}</a>` : ""}
           <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; ${escapeHtml(t(lang, "producer.show_on_map"))}</a>
           <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; ${escapeHtml(t(lang, "producer.download_vcard"))}</a>
@@ -6572,46 +6659,66 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           .then(function (s) {
             if (!s) return;
             var fmt = function (n) { return (n || 0).toLocaleString(${serializeJsonForScript(lang === "en" ? "en-GB" : "nb-NO")}); };
-            if (s.humanViews > 0) {
+            // The tiles show the last 12 months, or «siden <dato>» while a number
+            // has data for less than that (dev-request 2026-10-22-statistikk-samme-
+            // tall-12-mnd, S2c): s.year, read from the stored daily sums plus the raw
+            // days (profile-year-compute.ts). The period labels are the site strip's
+            // own (trafficYearPeriodLabel), formatted on the server.
+            var y = s.year;
+            if (!y || !y.labels) return;
+            var lb = y.labels[${serializeJsonForScript(lang === "en" ? "en" : "nb")}] || {};
+            var cap = function (t) { return t ? t.charAt(0).toUpperCase() + t.slice(1) : ""; };
+            // The approved tooltip text stays word for word; the period follows it
+            // («…, siste 12 måneder.»), as the window did before.
+            var setMeta = function (el, prefix, key, end) {
+              var meta = el.querySelector(".pf-stat-meta");
+              if (meta && lb[key]) meta.textContent = prefix + " · " + lb[key];
+              if (lb[key]) el.setAttribute("title", (el.getAttribute("title") || "") + ", " + lb[key] + end);
+            };
+            // A count at 0 stays hidden, never a 0 that reads as a measured year.
+            if (y.humanViews && y.humanViews.value > 0) {
               var h = document.querySelector('[data-stat="human"]');
-              if (h) { h.querySelector('[data-fill="human"]').textContent = fmt(s.humanViews); h.style.display = "flex"; }
+              if (h) {
+                h.querySelector('[data-fill="human"]').textContent = fmt(y.humanViews.value);
+                setMeta(h, ${serializeJsonForScript(lang === "en" ? "humans" : "mennesker")}, "humanViews", "");
+                h.style.display = "flex";
+              }
             }
-            if (s.aiViews > 0) {
+            if (y.aiViews && y.aiViews.value > 0) {
               var a = document.querySelector('[data-stat="ai"]');
               if (a) {
-                a.querySelector('[data-fill="ai"]').textContent = fmt(s.aiViews);
+                a.querySelector('[data-fill="ai"]').textContent = fmt(y.aiViews.value);
+                setMeta(a, ${serializeJsonForScript(lang === "en" ? "AI agents" : "AI-agenter")}, "aiViews", ".");
                 a.style.display = "flex";
+                // The split per AI exists for the raw days only; it says so.
                 var b = s.aiBreakdown || {};
                 var parts = [];
                 if (b.chatgpt) parts.push("ChatGPT " + b.chatgpt);
                 if (b.claude) parts.push("Claude " + b.claude);
                 if (b.other) parts.push(${serializeJsonForScript(lang === "en" ? "Other" : "Annet")} + " " + b.other);
                 // The approved tooltip text stays; the split is added under it (Daniel 2026-10-13: «behold teksten»).
-                if (parts.length) a.setAttribute("title", (a.getAttribute("title") || "") + "\\n" + parts.join(" · "));
+                if (parts.length && s.windowDays) a.setAttribute("title", (a.getAttribute("title") || "") + "\\n" + ${serializeJsonForScript(lang === "en" ? "Of which in the last " : "Av dem de siste ")} + s.windowDays + ${serializeJsonForScript(lang === "en" ? " days: " : " dagene: ")} + parts.join(" · "));
               }
             }
-            // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): times the
-            // profile was sent to an AI, split per AI in the tooltip. Until the counting
-            // has run a full window the tile says «siden <dato>», and at 0 it shows the
-            // date the counting started instead of 0 (Daniel 2026-10-15).
-            var d = s.aiDeliveries;
-            var sinceMs = d && d.countingSince ? Date.parse(d.countingSince + "T00:00:00Z") : NaN;
-            var sinceTxt = isNaN(sinceMs) ? "" : new Date(sinceMs).toLocaleDateString(${serializeJsonForScript(lang === "en" ? "en-GB" : "nb-NO")}, { day: "numeric", month: "short", timeZone: "UTC" });
-            var partial = !!sinceTxt && d.windowDays && (Date.now() - sinceMs) < (d.windowDays - 1) * 86400000;
+            // «Med i AI-søk» (dev-request 2026-10-14-med-i-ai-svar-per-profil, renamed in S1 2026-10-25): times the
+            // profile was sent to an AI, split per AI in the tooltip. While the counting is
+            // younger than the window the subtitle says «siden <dato>», and at 0 the tile
+            // shows that date instead of 0 (Daniel 2026-10-15).
+            var d = y.aiDeliveries;
+            var partial = !!(d && d.since && lb.aiDeliveries);
             // Shown with deliveries, or at 0 while the counting is younger than the window;
             // a 0 over a full window stays hidden, as before.
-            if (d && (d.total > 0 || partial)) {
+            if (d && (d.value > 0 || partial)) {
               var tile = document.querySelector('[data-stat="aiDeliveries"]');
               if (tile) {
                 var meta = tile.querySelector(".pf-stat-meta");
-                if (d.total > 0) {
-                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.total);
-                  if (partial && meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI · since " : "sendt til AI-en · siden ")} + sinceTxt;
+                if (d.value > 0) {
+                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = fmt(d.value);
+                  if (meta && lb.aiDeliveries) meta.textContent = ${serializeJsonForScript(lang === "en" ? AI_DELIVERIES_SUBTITLE.en + " · " : AI_DELIVERIES_SUBTITLE.nb + " · ")} + lb.aiDeliveries;
                 } else {
-                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = ${serializeJsonForScript(lang === "en" ? "Since " : "Fra ")} + sinceTxt;
-                  if (meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? "sent to the AI" : "sendt til AI-en")};
+                  tile.querySelector('[data-fill="aiDeliveries"]').textContent = cap(lb.aiDeliveries);
+                  if (meta) meta.textContent = ${serializeJsonForScript(lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb)};
                 }
-                if (sinceTxt) tile.setAttribute("title", (tile.getAttribute("title") || "") + "\\n" + ${serializeJsonForScript(lang === "en" ? "Counting started " : "Tellingen startet ")} + sinceTxt + (/\\.$/.test(sinceTxt) ? "" : "."));
                 tile.style.display = "flex";
                 var v = d.byVendor || {};
                 var vp = [];

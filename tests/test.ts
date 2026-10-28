@@ -9151,15 +9151,16 @@ console.log("\n── pf-stat ai: tooltip wording (Daniel-confirmed) ──");
   assertTrue(
     seoSrcTip.includes(
       // 2026-10-13 (statistikk-riktig-for-investorer, S5): Daniel's wording
-      // kept word for word; the number follows the real window (statsDays,
-      // the 60-day raw retention), not a fixed 90.
-      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${statsDays} dager."
-    ),
+      // kept word for word. Since statistikk S2c (2026-10-26) the period is
+      // the tile's own («, siste 12 måneder.» / «, siden <dato>.»), appended
+      // by the stats script (setMeta(a, …, "aiViews", ".")).
+      "Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester`"
+    ) && seoSrcTip.includes('(el.getAttribute("title") || "") + ", " + lb[key] + end') && seoSrcTip.includes('"aiViews", ".");'),
     "ai-tooltip: Norwegian branch uses the exact Daniel-confirmed wording"
   );
   assertTrue(
     seoSrcTip.includes("Every profile has this statistic.") &&
-      /It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services, last \$\{statsDays\} days\./.test(seoSrcTip),
+      seoSrcTip.includes("It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services`"),
     "ai-tooltip: English branch carries the equivalent wording"
   );
   assertTrue(
@@ -11546,9 +11547,13 @@ console.log("\n── vcard: CHARSET params + RFC 6266 Content-Disposition ─�
   // Updated from 14 → 15: dev-request
   // 2026-09-16-handleliste-med-produsentvalg-og-bestillingsflyt, Slice 0 adds
   // lokal_find_offers.
+  // Updated from 15 → 17: dev-request 2026-10-21-rfb-mine-ordrer-ett-klikk-
+  // og-kjoperagent, Fase B1 adds lokal_order_cancel and lokal_order_picked_up,
+  // registered only with ORDER_AGENT_ACTIONS_ENABLED on (default off: 15 listed).
+  // Updated from 17 → 18: Fase B2 adds lokal_order_message, behind the same switch.
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 15,
-    "phase5.11-a7: src/routes/mcp.ts registers exactly 15 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0)");
+  assertEq(toolCount, 18,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 18 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76 + 5 cart + 1 lokal_find_offers from Slice 0 + 2 buyer order tools behind ORDER_AGENT_ACTIONS_ENABLED from Fase B1 + lokal_order_message from Fase B2)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
   assertTrue(
@@ -26898,7 +26903,8 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     // that trailing arg too.
     const fs = require("fs");
     const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf8");
-    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)\)/g) || []).length;
+    // S2c-1 (owner choices) adds an optional trailing { hidePrices } argument.
+    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)(,\s*\{ hidePrices: [^}]+\})?\)/g) || []).length;
     assertEq(wiredCalls, 2, `pid-17: both MCP product call sites (lokal_info + lokal_search) wire the catalog id map AND the supply-graph availability map (got ${wiredCalls})`);
   } catch (err) {
     failed++;
@@ -26995,6 +27001,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orgnrIdentityJudgePromise; } catch { /* errors already pushed to failures */ }
   try { await _deleteBlocklistEmailSurvivorPromise; } catch { /* errors already pushed to failures */ }
   try { await _deleteBlocklistNameSurvivorPromise; } catch { /* errors already pushed to failures */ }
+  try { await _deleteWebsiteDomainKnowledgePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Env hygiene: `process.env.X = prev` with prev undefined stores the STRING
@@ -36724,6 +36731,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S3): profilen viser hva som er kontrollert og når ──");
+  try {
+    const { runDentalProfileVerificationLineTests } = require("../src/routes/dental-profile-verification-line.test") as
+      typeof import("../src/routes/dental-profile-verification-line.test");
+    const dpv = await runDentalProfileVerificationLineTests({ log: false });
+    passed += dpv.passed;
+    failed += dpv.failed;
+    for (const f of dpv.failures) failures.push("dental profile verification line: " + f);
+    console.log(`  dental profile verification line: ${dpv.passed} passed, ${dpv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental profile verification line: unexpected error: " + String(err?.message || err));
+  }
+
   // ── dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S1+S2+S3): shared
   //    query parser + postnummer->kommune helper, one WHERE builder in
   //    dental-store, parser wired into MCP tannlege_search, /sok and A2A ──
@@ -37174,6 +37195,58 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("order-actions-fase-a1: unexpected error: " + String(err?.message || err));
+  }
+  // Fase A2 («Mine ordrer» i eierportalen) runs strictly after A1 (own in-memory DB).
+  try {
+    const { runOwnerOrdersFaseA2Tests } = require("../src/routes/owner-orders-fase-a2.test") as
+      typeof import("../src/routes/owner-orders-fase-a2.test");
+    const a2 = await runOwnerOrdersFaseA2Tests({ log: false });
+    passed += a2.passed;
+    failed += a2.failed;
+    for (const f of a2.failures) failures.push("owner-orders-fase-a2: " + f);
+    console.log(`  owner-orders-fase-a2: ${a2.passed} passed, ${a2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-orders-fase-a2: unexpected error: " + String(err?.message || err));
+  }
+  // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
+  try {
+    const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
+      typeof import("../src/routes/buyer-order-actions-fase-b1.test");
+    const b1 = await runBuyerOrderActionsFaseB1Tests({ log: false });
+    passed += b1.passed;
+    failed += b1.failed;
+    for (const f of b1.failures) failures.push("buyer-order-actions-fase-b1: " + f);
+    console.log(`  buyer-order-actions-fase-b1: ${b1.passed} passed, ${b1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("buyer-order-actions-fase-b1: unexpected error: " + String(err?.message || err));
+  }
+  // Fase B2 (meldingstråd per ordre) runs strictly after B1 (own in-memory DB).
+  try {
+    const { runOrderMessagesFaseB2Tests } = require("../src/routes/order-messages-fase-b2.test") as
+      typeof import("../src/routes/order-messages-fase-b2.test");
+    const b2 = await runOrderMessagesFaseB2Tests({ log: false });
+    passed += b2.passed;
+    failed += b2.failed;
+    for (const f of b2.failures) failures.push("order-messages-fase-b2: " + f);
+    console.log(`  order-messages-fase-b2: ${b2.passed} passed, ${b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-messages-fase-b2: unexpected error: " + String(err?.message || err));
+  }
+  // Fase B3 (ordren som A2A-task) runs strictly after B2 (own in-memory DB).
+  try {
+    const { runOrderA2aTaskFaseB3Tests } = require("../src/routes/order-a2a-task-fase-b3.test") as
+      typeof import("../src/routes/order-a2a-task-fase-b3.test");
+    const b3 = await runOrderA2aTaskFaseB3Tests({ log: false });
+    passed += b3.passed;
+    failed += b3.failed;
+    for (const f of b3.failures) failures.push("order-a2a-task-fase-b3: " + f);
+    console.log(`  order-a2a-task-fase-b3: ${b3.passed} passed, ${b3.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-a2a-task-fase-b3: unexpected error: " + String(err?.message || err));
   } finally {
     _orderActionsA1Resolve();
   }
@@ -37944,6 +38017,35 @@ const _deleteBlocklistNameSurvivorPromise: Promise<void> = new Promise<void>(r =
   }
 })();
 
+// dev-request 2026-10-23-admin-delete-website-domain-ikke-alltid-auto: website_domain
+// blocklisting from agent_knowledge.website on admin DELETE. Same DB-swapping
+// convention; runs after the name-survivor block.
+let _deleteWebsiteDomainKnowledgeResolve: () => void = () => {};
+const _deleteWebsiteDomainKnowledgePromise: Promise<void> = new Promise<void>(r => {
+  _deleteWebsiteDomainKnowledgeResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_deleteBlocklistNameSurvivorPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-10-23: admin DELETE blocklists website_domain from agent_knowledge.website ──");
+  try {
+    const { runMarketplaceAgentDeleteWebsiteDomainKnowledgeTests } = require("../src/routes/marketplace-agent-delete-website-domain-knowledge.test") as
+      typeof import("../src/routes/marketplace-agent-delete-website-domain-knowledge.test");
+    const dwk = await runMarketplaceAgentDeleteWebsiteDomainKnowledgeTests({ log: false });
+    passed += dwk.passed;
+    failed += dwk.failed;
+    for (const f of dwk.failures) failures.push("marketplace-agent-delete-website-domain-knowledge: " + f);
+    console.log(`  marketplace-agent-delete-website-domain-knowledge: ${dwk.passed} passed, ${dwk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-delete-website-domain-knowledge: unexpected error: " + String(err?.message || err));
+  } finally {
+    _deleteWebsiteDomainKnowledgeResolve();
+  }
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // BARRIERE — forén de to serialiseringsfamiliene (2026-08-02).
 //
@@ -38003,6 +38105,7 @@ const _adHocFamilyBarrier: Promise<unknown>[] = [
   _homepageProvenanceHeadlessFallbackPromise, _tynneProfilerImprovePromise,
   _rfbContactJudgePromise, _contactCandidateJudgePromise, _orgnrIdentityJudgePromise,
   _deleteBlocklistEmailSurvivorPromise, _deleteBlocklistNameSurvivorPromise,
+  _deleteWebsiteDomainKnowledgePromise,
 ];
 runSerial(async () => {
   await Promise.allSettled(_adHocFamilyBarrier);
@@ -44397,6 +44500,87 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2 (public part): the
+  // 12-month block of the three strips and /api/traffic-stats. Swaps getDb()
+  // and the dental / experiences db handles (restored in finally), so serial.
+  console.log("\n── traffic-year: 12-month strip numbers + start dates ──");
+  try {
+    const { runTrafficYearTests } = require("../src/services/traffic-year.test") as
+      typeof import("../src/services/traffic-year.test");
+    const r = await runTrafficYearTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("traffic-year: " + f);
+    console.log(`  traffic-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`traffic-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ traffic-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2c: the per-profile
+  // tiles show 12 months or «siden <dato>», never «· 60d». Swaps getDb()
+  // (restored in finally), so serial.
+  console.log("\n── profile-year: per-profile tiles over 12 months ──");
+  try {
+    const { runProfileYearTests } = require("../src/services/profile-year.test") as
+      typeof import("../src/services/profile-year.test");
+    const r = await runProfileYearTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-year: " + f);
+    console.log(`  profile-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2d: the owner
+  // portals' tiles (RFB selger.html, gårdssalg) show 12 months or «siden
+  // <dato>», like the public tiles. Swaps getDb() (restored in finally), so serial.
+  console.log("\n── owner-stats-year: owner portal tiles over 12 months ──");
+  try {
+    const { runOwnerStatsYearTests } = require("../src/services/owner-stats-year.test") as
+      typeof import("../src/services/owner-stats-year.test");
+    const r = await runOwnerStatsYearTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-stats-year: " + f);
+    console.log(`  owner-stats-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`owner-stats-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ owner-stats-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // dev-request 2026-10-22-statistikk-samme-tall-12-mnd, S2b (admin part): the
+  // dashboard's five cards with one site + «Siste år» are the strip's numbers
+  // from the same snapshot; no «AI-visninger»; «Søk (nettsider og API)»; «Alle»
+  // is not a sum. Swaps getDb() and the dental / experiences handles, so serial.
+  console.log("\n── admin-year: admin and the strips, same numbers ──");
+  try {
+    const { runAdminYearSameNumbersTests } = require("../src/services/admin-year-same-numbers.test") as
+      typeof import("../src/services/admin-year-same-numbers.test");
+    const r = await runAdminYearSameNumbersTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-year: " + f);
+    console.log(`  admin-year: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`admin-year: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ admin-year: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-14-med-i-ai-svar-per-profil, S2: the same counting for
   // finn-tannlege and opplevagent (incl. gårdssalg). Swaps getDb() and the
   // dental / experiences db handles (restored in finally), so serial.
@@ -46298,6 +46482,44 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-utsending-v4, slice 1 (AC1-AC5, AC7): texts
+// E/F byte for byte, name wash, From, threading, send days. Own in-memory DBs and
+// a module-cache swap like the sibling suites, so it runs serially.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-utsending-v4: utsendingstekst E/F, tråding, sendedager ──");
+  try {
+    const { runOpplevelserGardssalgOutreachV4Tests } = require("../src/routes/opplevelser-gardssalg-outreach-v4.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-v4.test");
+    const v4 = await runOpplevelserGardssalgOutreachV4Tests({ log: false });
+    passed += v4.passed;
+    failed += v4.failed;
+    for (const f of v4.failures) failures.push("gardssalg-outreach-v4: " + f);
+    console.log(`  gardssalg-outreach-v4: ${v4.passed} passed, ${v4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-v4: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-opplevagent-utsending-v4, endring 10 / AC8: read-only
+// measurement endpoint per v4 send (72 h views, claim link, takeover, reply, «fjern»).
+// Own in-memory DBs + module-cache swap, so it runs serially.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-utsending-v4: måling per v4-sending ──");
+  try {
+    const { runOpplevelserGardssalgOutreachV4MeasurementTests } = require("../src/routes/opplevelser-gardssalg-outreach-v4-measurement.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-v4-measurement.test");
+    const m = await runOpplevelserGardssalgOutreachV4MeasurementTests({ log: false });
+    passed += m.passed;
+    failed += m.failed;
+    for (const f of m.failures) failures.push("gardssalg-outreach-v4-measurement: " + f);
+    console.log(`  gardssalg-outreach-v4-measurement: ${m.passed} passed, ${m.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-outreach-v4-measurement: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-19-opplevagent-forside-seksjoner-design, arbeidspunkt 1
 // (slice 6): the homepage .cat-grid no longer shows a gårdssalg entry from
 // ANY source (synthetic injection removed + a defensive filter on a genuine
@@ -46476,6 +46698,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-23-rfb-flere-forstehenvendelser-dommer-bevis-og-
+// kontaktuttrekk (skive 1): own-website evidence for the RFB second-line judge
+// behind RFB_SECOND_LINE_EVIDENCE_ENABLED (default OFF) + the read-only
+// POST /admin/second-line-judge-preview. Same in-memory DB seam as the
+// sibling second-line suite above, restored in `finally`.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-23 skive 1: RFB second-line judge evidence + preview ──");
+  try {
+    const { runLokalAgentVerifierSecondLineEvidenceTests } = require("../src/agents/lokal-agent-verifier-second-line-evidence.test") as
+      typeof import("../src/agents/lokal-agent-verifier-second-line-evidence.test");
+    const sle = await runLokalAgentVerifierSecondLineEvidenceTests({ log: false });
+    passed += sle.passed;
+    failed += sle.failed;
+    for (const f of sle.failures) failures.push("lokal-agent-verifier-second-line-evidence: " + f);
+    console.log(`  lokal-agent-verifier-second-line-evidence: ${sle.passed} passed, ${sle.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("lokal-agent-verifier-second-line-evidence: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-23-terminal-unconfirmable: new `terminal_unconfirmable`
 // verification status so demonstrably unconfirmable agents (Brreg-dead, or
 // zero identity sources on the second line) stop looping in the hourly
@@ -46601,6 +46844,24 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("handleliste-page: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel, skive 3 (AC9):
+// «Bestill for henting» on /produsent/:slug + /handleliste?produsent=<id> preselect.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel (skive 3): bestillingsknapp ──");
+  try {
+    const { runHandelisteBestillingsknappTests } = require("../src/routes/handleliste-bestillingsknapp.test") as
+      typeof import("../src/routes/handleliste-bestillingsknapp.test");
+    const bk = await runHandelisteBestillingsknappTests({ log: false });
+    passed += bk.passed;
+    failed += bk.failed;
+    for (const f of bk.failures) failures.push("handleliste-bestillingsknapp: " + f);
+    console.log(`  handleliste-bestillingsknapp: ${bk.passed} passed, ${bk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("handleliste-bestillingsknapp: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -47046,6 +47307,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-owner-lock-broadening: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 pkt 5 — one
+// visibility predicate per surface (gardssalg-visibility.ts): equivalence with
+// the old scattered predicates on a rows x surfaces matrix + mutation check
+// that every surface reads the shared rule table.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg G1 pkt 5: gardssalg visibility per surface ──");
+  try {
+    const { runGardssalgVisibilityTests } = require("../src/services/gardssalg-visibility.test") as
+      typeof import("../src/services/gardssalg-visibility.test");
+    const gvis = await runGardssalgVisibilityTests({ log: false });
+    passed += gvis.passed;
+    failed += gvis.failed;
+    for (const f of gvis.failures) failures.push("gardssalg-visibility: " + f);
+    console.log(`  gardssalg-visibility: ${gvis.passed} passed, ${gvis.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-visibility: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -49177,6 +49458,24 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
+// bare den ene butikken når produsenten ikke er tatt over.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-utsending-v4 skive 1: /selger?agent= viser én butikk ──");
+  try {
+    const { runRfbSelgerEnButikkTests } = require("../src/routes/rfb-selger-en-butikk.test") as
+      typeof import("../src/routes/rfb-selger-en-butikk.test");
+    const se = await runRfbSelgerEnButikkTests({ log: false });
+    passed += se.passed;
+    failed += se.failed;
+    for (const f of se.failures) failures.push("rfb-selger-en-butikk: " + f);
+    console.log(`  rfb-selger-en-butikk: ${se.passed} passed, ${se.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-selger-en-butikk: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-01-rfb-contact-extraction-laas-henger: run-locks of
 // POST /admin/rfb-contact-extraction and /admin/gardssalg-contact-extraction
 // carry { startedAt, runId } with an upper bound (stale takeover, runId-guarded
@@ -49280,6 +49579,18 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("avmeld-s1a: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runAvmeldFixupTests } = require("../src/services/avmeld-fixup.test") as
+      typeof import("../src/services/avmeld-fixup.test");
+    const fx = await runAvmeldFixupTests({ log: false });
+    passed += fx.passed;
+    failed += fx.failed;
+    for (const f of fx.failures) failures.push("avmeld-fixup: " + f);
+    console.log(`  avmeld-fixup: ${fx.passed} passed, ${fx.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("avmeld-fixup: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -49995,5 +50306,195 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-claim-owner-visibility: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
+// one-time order activation link (AC8). Swaps the getDb() singleton and env
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-21 skive 2: order activation link (AC8) ──");
+  try {
+    const { runOrderActivationLinkTests } = require("../src/routes/order-activation-link.test") as
+      typeof import("../src/routes/order-activation-link.test");
+    const r = await runOrderActivationLinkTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("order-activation-link: " + f);
+    console.log(`  order-activation-link: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-activation-link: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S1b punkt 5: one owner
+// login (OWNER_UNIFIED_SESSION_ENABLED), isVerifiedOwner gate on every owner
+// endpoint (OWNER_VERIFIED_OWNER_GATE_ENABLED), logout revocation, ISO
+// expires_at comparisons. Swaps the getDb() singleton and env flags (restored
+// in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 5: one owner login ──");
+  try {
+    const { runOwnerUnifiedSessionS1b5Tests } = require("../src/routes/owner-unified-session-s1b5.test") as
+      typeof import("../src/routes/owner-unified-session-s1b5.test");
+    const r = await runOwnerUnifiedSessionS1b5Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-unified-session-s1b5: " + f);
+    console.log(`  owner-unified-session-s1b5: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-unified-session-s1b5: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: «Pause som
+// virker» (OWNER_PAUSE_ENABLED) — pause/unpause per surface, resume date,
+// verified-owner gate, audit rows, flag off unchanged. Swaps the getDb()
+// singleton and the env flag (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 6: owner pause ──");
+  try {
+    const { runOwnerPauseS1b6Tests } = require("../src/routes/owner-pause-s1b6.test") as
+      typeof import("../src/routes/owner-pause-s1b6.test");
+    const r = await runOwnerPauseS1b6Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-pause-s1b6: " + f);
+    console.log(`  owner-pause-s1b6: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-pause-s1b6: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 7: «Eieren styrer
+// ordre-e-posten» (OWNER_ORDER_EMAIL_ENABLED) — confirm-by-link change of
+// agents.order_notification_email. Swaps the getDb() singleton, the env flag
+// and two send seams (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 7: owner order e-mail ──");
+  try {
+    const { runOwnerOrderEmailS1b7Tests } = require("../src/routes/owner-order-email-s1b7.test") as
+      typeof import("../src/routes/owner-order-email-s1b7.test");
+    const r = await runOwnerOrderEmailS1b7Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-order-email-s1b7: " + f);
+    console.log(`  owner-order-email-s1b7: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-order-email-s1b7: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a: «Mine valg» registry,
+// owner_feature_settings/_audit, resolveOwnerFeatures/featureOn and the owner
+// API (GET/PUT /api/owner/:id/features) behind OWNER_FEATURES_ALLOWED_SUBJECTS.
+// Swaps the getDb() singleton and env vars (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a: Mine valg register + API ──");
+  try {
+    const { runOwnerFeaturesS2aTests } = require("../src/routes/owner-features-s2a.test") as
+      typeof import("../src/routes/owner-features-s2a.test");
+    const r = await runOwnerFeaturesS2aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2a: " + f);
+    console.log(`  owner-features-s2a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b: the «Mine valg» page
+// (/eier/:id/valg) — levels, undo, change log, first-login card, N1 audit from
+// the old Bestillinger routes. Same allowlist; swaps the getDb() singleton and
+// env vars (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b: Mine valg-siden ──");
+  try {
+    const { runOwnerFeaturesS2bTests } = require("../src/routes/owner-features-s2b.test") as
+      typeof import("../src/routes/owner-features-s2b.test");
+    const r = await runOwnerFeaturesS2bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2b: " + f);
+    console.log(`  owner-features-s2b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2b: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's contact /
+// price / stats choices on the public surfaces (OWNER_FEATURES_ENFORCE + the
+// allowlist; byte-identical while off), matrix per key × declared surface.
+// Swaps the getDb() singleton and env vars (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: håndheving på flatene ──");
+  try {
+    const { runOwnerFeaturesS2cTests } = require("../src/routes/owner-features-s2c.test") as
+      typeof import("../src/routes/owner-features-s2c.test");
+    const r = await runOwnerFeaturesS2cTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2c: " + f);
+    console.log(`  owner-features-s2c: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2c: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
+// slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
+// per host, default off; CCBot never; shared counter per host) and its wiring
+// into Finn-tannlege REST (/api/tannlege/agents[/:id]) and A2A message/send.
+// Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
+// flags and swaps the dental db-factory (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting, slice 1: e-post-grense per IP (finn-tannlege REST + A2A) ──");
+  for (const [label, load] of [
+    ["email reveal guard", () => (require("../src/services/email-reveal-guard.test") as typeof import("../src/services/email-reveal-guard.test")).runEmailRevealGuardTests({ log: false })],
+    ["dental email reveal guard", () => (require("../src/routes/dental-email-reveal-guard.test") as typeof import("../src/routes/dental-email-reveal-guard.test")).runDentalEmailRevealGuardTests({ log: false })],
+  ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
+    try {
+      const r = await load();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ${f}`);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});
+
+// A2A dev-request 2026-10-27-dental-skrivepause-gjerde-mangler-paa-tannlege-put
+// (P0): the enrichment write-pause fence on the dental router — PUT
+// /api/tannlege/agents/:id 423 + zero changes under pause, claim-batch hands
+// out an empty batch with the reason, stage-v-drift-result and
+// google-places-batch (write) 423, release-batch stays open, fail-closed on a
+// missing pause table / throwing getDb(). Pins the main-db singleton and swaps
+// the dental db-factory (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-27-dental-skrivepause-gjerde: skrivepause-gjerdet på dental-rutene ──");
+  try {
+    const { runDentalEnrichmentWritePauseTests } = require("../src/routes/dental-enrichment-write-pause.test") as
+      typeof import("../src/routes/dental-enrichment-write-pause.test");
+    const r = await runDentalEnrichmentWritePauseTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("dental-enrichment-write-pause: " + f);
+    console.log(`  dental-enrichment-write-pause: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-enrichment-write-pause: unexpected error: " + String(err?.message || err));
   }
 });

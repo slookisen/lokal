@@ -209,6 +209,8 @@ export async function runTrafficHistoryTests(opts: { log?: boolean } = {}): Prom
       "e1: 'all' = every stored day up to yesterday, one point per day", v.coverage);
     ok(v.totals.views === 43 * 2 + 3 + 3 && v.groups.human.views === 89 && v.groups.human.visits === 46 && v.groups.ai_crawler.views === 3,
       "e2: views and visits add up over the days", { totals: v.totals, human: v.groups.human });
+    ok(v.aiAgents.chatgpt.training === 3 && v.aiAgents.chatgpt.user === 0 && v.aiAgents.chatgpt.search === 0 && eq(sum.aiAgents, rep.aiAgents) && sum.aiAgents.chatgpt.training === 3,
+      "e2b: aiAgents (vendor × purpose) comes from the stored days: GPTBot = chatgpt training 3", { view: v.aiAgents.chatgpt, day: sum.aiAgents.chatgpt });
     ok(v.searches.total === 4 && v.searches.byChannel.web === 2 && v.approximate.topTerms[0]?.query === "honning",
       "e3: searches add up over the days", v.searches);
     const months = v.months.map((m) => [m.start, m.humanVisitors, m.partialFrom, m.inProgress]);

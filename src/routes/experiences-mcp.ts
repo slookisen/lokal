@@ -1010,7 +1010,7 @@ export function registerExperienceTools(
         // .all() call each time, but never mutate a store function's return
         // value on principle.
         const categories = [...listCategories()];
-        categories.push({ category: GARDSSALG_CATEGORY, count: countGardssalgProviders() });
+        categories.push({ category: GARDSSALG_CATEGORY, count: countGardssalgProviders(undefined, "mcp") });
         const result = {
           count: categories.length,
           categories,
@@ -1240,7 +1240,7 @@ export function registerExperienceTools(
         // expandDrinkWords: a drink word in `query` («cider», «sider», «øl»)
         // also finds producers of that kind, as producer_type does (dev-request
         // 2026-10-17-integrasjonstest-oppfolging, AI-5).
-        const results = searchGardssalgProviders(filter, limit ?? 20, { expandDrinkWords: true });
+        const results = searchGardssalgProviders(filter, limit ?? 20, { expandDrinkWords: true, surface: "mcp" });
 
         const summary =
           results.length === 0
@@ -1386,7 +1386,7 @@ export function registerExperienceTools(
         if (!resolvedProviderId) {
           const pq = typeof provider_query === "string" ? provider_query.trim() : "";
           if (!pq) return jsonToolResult(providerQueryMissingPayload(), true);
-          const resolution = resolveGardssalgProviderByQuery(pq);
+          const resolution = resolveGardssalgProviderByQuery(pq, { surface: "mcp" });
           if (resolution.kind === "none") return jsonToolResult(providerNotFoundPayload(pq));
           if (resolution.kind === "ambiguous") return jsonToolResult(providerAmbiguousPayload(pq, resolution.candidates));
           resolvedProviderId = resolution.provider.id;

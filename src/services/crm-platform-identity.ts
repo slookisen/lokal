@@ -199,8 +199,11 @@ export function lintOutboundBodyForForeignBranding(
  * that a future name like `Bonde "Ola" Nordmann` would silently corrupt — and a
  * malformed From is a deliverability problem, not a cosmetic one.
  */
-export function crmFromHeader(vertical: unknown): string {
-  const { displayName } = resolveCrmIdentity(vertical);
+export function crmFromHeader(vertical: unknown, displayNameOverride?: string): string {
+  // The override changes the display name only (dev-request
+  // 2026-10-22-rfb-utsending-v4: the cold RFB outreach goes out as
+  // "Daniel Fredriksen"); the ADDRESS always comes from the platform identity.
+  const displayName = displayNameOverride ?? resolveCrmIdentity(vertical).displayName;
   const escaped = displayName.replace(/([\\"])/g, "\\$1");
   return `"${escaped}" <${CRM_SENDER_ADDRESS}>`;
 }

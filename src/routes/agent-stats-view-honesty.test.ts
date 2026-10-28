@@ -197,15 +197,17 @@ export async function runAgentStatsViewHonestyTests(opts: { log?: boolean } = {}
         [{ agent_id: "low-trust", view_source: "discovery", is_owner: 0, traffic_category: "human" }],
         "a5: a profile visit books exactly one row: own-domain Referer → 'discovery', human, not owner",
       );
-      // The rendered tiles carry the real window, not template text (2026-10-13:
-      // S5 put ${statsDays} inside plain quotes, so the page showed it literally).
-      const days = require("../services/retention-window").getRetentionWindowDays();
+      // The rendered tiles carry no template text (2026-10-13: S5 put
+      // ${statsDays} inside plain quotes, so the page showed it literally).
+      // Since statistikk S2c the period («siste 12 måneder» / «siden <dato>»)
+      // comes from the stats payload's labels, never «· 60d».
       assertTrue(
         !profile.body.includes("${") &&
-          profile.body.includes(`Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester, siste ${days} dager.`) &&
-          profile.body.includes(`Sidevisninger fra mennesker, siste ${days} dager`) &&
-          profile.body.includes(`mennesker &middot; ${days}d`) && profile.body.includes(`AI-agenter &middot; ${days}d`),
-        `a6: the rendered stat tiles and the approved AI tooltip show the window (${days} days), no raw \${…}`,
+          profile.body.includes("Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester\"") &&
+          profile.body.includes('title="Sidevisninger fra mennesker"') &&
+          profile.body.includes('<span class="pf-stat-meta">mennesker</span>') && profile.body.includes('<span class="pf-stat-meta">AI-agenter</span>') &&
+          !/&middot; \d+d\b/.test(profile.body),
+        "a6: the rendered stat tiles and the approved AI tooltip carry no fixed window and no raw ${…}",
       );
     }
 

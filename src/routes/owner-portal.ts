@@ -15,6 +15,13 @@ import {
 import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
+import { customerRuleSql } from "../services/customer-rule";
+import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
+import { isBlocked, normalizeEmail } from "../services/blocklist-service";
+import { rateLimit } from "express-rate-limit";
+import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 
 const router = Router();
@@ -41,6 +48,17 @@ const router = Router();
 // ─────────────────────────────────────────────────────────────────
 
 const MAGIC_LINK_VALID_HOURS = 7 * 24; // 7 days
+
+// expires_at is written as an ISO-8601 string (Date#toISOString(), e.g.
+// "2026-10-25T13:20:00.000Z" — see the INSERTs below and knowledge-service
+// createMagicLink), while datetime('now') is SQLite's native
+// "2026-10-25 16:41:17". A bare TEXT comparison of the two is wrong: on the
+// expiry day 'T' (0x54) > ' ' (0x20), so an expired token stayed valid until
+// the end of that UTC day. datetime(expires_at) normalises BOTH formats (the
+// ISO rows and the native-format rows some tests/legacy writers use), same
+// fix as the rate-limit query below. dev-request
+// 2026-10-22-rfb-mine-valg-eierbrytere S1b punkt 5. Pure bug fix → unflagged.
+const OWNER_TOKEN_NOT_EXPIRED_SQL = "datetime(expires_at) > datetime('now')";
 const RATE_LIMIT_WINDOW_HOURS = 1;
 const RATE_LIMIT_MAX_PER_WINDOW = 3;
 
@@ -144,7 +162,8 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     const recentCount = db
       .prepare(
         `SELECT COUNT(*) as count FROM magic_links
-         WHERE agent_id = ? AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
+         WHERE agent_id = ? AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')
+           AND id NOT LIKE '${OWNER_SESSION_ID_PREFIX}%' AND id NOT LIKE '${OWNER_BRIDGE_ID_PREFIX}%'`
       )
       .get(id, RATE_LIMIT_WINDOW_HOURS) as any;
 
@@ -231,7 +250,7 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
     const magicLink = db
       .prepare(
         `SELECT * FROM magic_links
-         WHERE token = ? AND expires_at > datetime('now')`
+         WHERE token = ? AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
 
@@ -310,7 +329,7 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const link = db
       .prepare(
         `SELECT agent_id FROM magic_links
-         WHERE token = ? AND used = 1 AND expires_at > datetime('now')`
+         WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(cookieToken) as any;
     if (link) {
@@ -326,7 +345,7 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const link = db
       .prepare(
         `SELECT agent_id FROM magic_links
-         WHERE token = ? AND used = 1 AND expires_at > datetime('now')`
+         WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
     if (link) {
@@ -335,6 +354,158 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
   }
 
   return { valid: false };
+}
+
+// ─────────────────────────────────────────────────────────────────
+// S1b punkt 5 — one owner login (dev-request 2026-10-22-rfb-mine-valg-eierbrytere)
+// ─────────────────────────────────────────────────────────────────
+// Two env flags, both read at call time ("1"/"true" = on), both DEFAULT OFF so
+// prod behaviour is unchanged until switched on:
+//
+//   OWNER_VERIFIED_OWNER_GATE_ENABLED — every owner endpoint (this file,
+//     owner-orders.ts, payments.ts) requires isVerifiedOwner(agentId, session).
+//     Off = today's check (the session belongs to the agent).
+//   OWNER_UNIFIED_SESSION_ENABLED — the /selger login (GET
+//     /api/marketplace/auth/magic-verify) also opens the /eier session cookie,
+//     and the /eier portal gets a «Produkter og åpningstider» button
+//     (POST /eier/:id/selger) that logs the same owner into /selger without a
+//     new e-mail. One login → profile, products, statistics, orders.
+//
+// Logout revocation and the expires_at comparison are bug fixes and unflagged.
+
+export const OWNER_VERIFIED_OWNER_GATE_FLAG = "OWNER_VERIFIED_OWNER_GATE_ENABLED";
+export const OWNER_UNIFIED_SESSION_FLAG = "OWNER_UNIFIED_SESSION_ENABLED";
+
+function envFlagOn(name: string): boolean {
+  const v = process.env[name];
+  return v === "1" || v === "true";
+}
+
+export function ownerVerifiedOwnerGateEnabled(): boolean {
+  return envFlagOn(OWNER_VERIFIED_OWNER_GATE_FLAG);
+}
+
+export function ownerUnifiedSessionEnabled(): boolean {
+  return envFlagOn(OWNER_UNIFIED_SESSION_FLAG);
+}
+
+/**
+ * THE ownership predicate for owner endpoints: the session is valid, belongs
+ * to exactly this agent, AND the agent has a verified owner by the shared
+ * customer rule (customerRuleSql: agents.claimed_at set OR a verified
+ * agent_claims row). A session opened by an e-mail match alone (the /eier
+ * magic link only checks agent_knowledge.email) on a profile with no verified
+ * owner is NOT a verified owner. Self-registered owners (verified claim,
+ * is_verified = 0) are verified owners here — the strict is_verified gate for
+ * real orders is separate and unchanged.
+ */
+export function isVerifiedOwner(
+  agentIdParam: unknown,
+  session: { valid: boolean; agentId?: string } | null | undefined,
+): boolean {
+  const agentId = typeof agentIdParam === "string" ? agentIdParam : "";
+  if (!session || !session.valid || !session.agentId || !agentId) return false;
+  if (session.agentId !== agentId) return false;
+  const row = getDb()
+    .prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+    .get(agentId) as { owned?: number } | undefined;
+  return !!row && row.owned === 1;
+}
+
+/**
+ * Access check every owner endpoint uses after its "no session → 401/login"
+ * branch. Gate on: isVerifiedOwner. Gate off: today's check (session agent ===
+ * requested agent). false → the caller answers 403.
+ */
+export function ownerSessionAllows(
+  agentIdParam: unknown,
+  session: { valid: boolean; agentId?: string } | null | undefined,
+): agentIdParam is string {
+  const agentId = typeof agentIdParam === "string" ? agentIdParam : "";
+  if (ownerVerifiedOwnerGateEnabled()) return isVerifiedOwner(agentId, session);
+  return !!session && session.valid && !!session.agentId && session.agentId === agentId;
+}
+
+/** 403 body/page text when the session is valid but ownership is not verified. */
+export const OWNER_NOT_VERIFIED_MESSAGE =
+  "Eierskapet til profilen er ikke bekreftet. Bekreft eierskap først.";
+
+function ownerForbiddenJson(agentId: unknown, session: { valid: boolean; agentId?: string }) {
+  const sameAgent = session.agentId === agentId;
+  return sameAgent
+    ? { success: false, error: "ownership_not_verified", message: OWNER_NOT_VERIFIED_MESSAGE }
+    : { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." };
+}
+
+// magic_links rows that are sessions / one-time bridges, not e-mailed links.
+// Kept out of the request-magic-link rate limit (that limit counts e-mails).
+const OWNER_SESSION_ID_PREFIX = "mlsess_";
+const OWNER_BRIDGE_ID_PREFIX = "mlbridge_";
+const OWNER_SESSION_VALID_MS = MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000;
+const OWNER_BRIDGE_VALID_MS = 15 * 60 * 1000; // same as knowledge-service createMagicLink
+
+function setOwnerSessionCookie(res: Response, token: string): void {
+  res.cookie("rfb_owner_session", token, {
+    path: "/",
+    maxAge: OWNER_SESSION_VALID_MS,
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+  });
+}
+
+/**
+ * OWNER_UNIFIED_SESSION_ENABLED: called by the /selger login after a verified
+ * claimant redeemed their magic link. Opens the /eier session (a fresh
+ * magic_links row, used = 1, ISO timestamps, 7 days) and sets the cookie, so
+ * statistics, orders and the /eier portal need no second login. No-op (false)
+ * when the flag is off or the request already carries a live session for this
+ * agent.
+ */
+export function issueOwnerSessionForSelgerLogin(
+  req: Request,
+  res: Response,
+  agentId: string,
+  email: string,
+): boolean {
+  if (!ownerUnifiedSessionEnabled() || !agentId || !email) return false;
+  const existing = verifyOwnerSession(req);
+  if (existing.valid && existing.agentId === agentId) return false;
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
+  getDb().prepare(
+    `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+  ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
+    now.toISOString(), now.toISOString(), expiresAt.toISOString());
+  setOwnerSessionCookie(res, token);
+  console.log(`[owner-portal] unified session opened for ${agentId} from /selger login`);
+  return true;
+}
+
+/**
+ * Logout: make the presented session token unusable server-side (cookie AND
+ * Bearer — the cookie value is the same token). Implemented as immediate
+ * expiry so no schema change is needed: every reader checks expires_at
+ * (verifyOwnerSession, /magic-link-verify, knowledge-service verifyMagicLink).
+ */
+export function revokeOwnerSessionToken(token: string | undefined): boolean {
+  if (!token) return false;
+  const past = new Date(Date.now() - 1000).toISOString();
+  const info = getDb()
+    .prepare(`UPDATE magic_links SET expires_at = ? WHERE token = ?`)
+    .run(past, token);
+  return info.changes > 0;
+}
+
+function presentedOwnerTokens(req: Request): string[] {
+  const out: string[] = [];
+  const c = readSessionCookie(req);
+  if (c) out.push(c);
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith("Bearer ")) out.push(auth.substring(7));
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -362,15 +533,11 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       });
     }
 
-    if (sessionData.agentId !== id) {
+    if (!ownerSessionAllows(id, sessionData)) {
       console.log(
-        `[owner-portal] Session agent ${sessionData.agentId} != requested ${id}`
+        `[owner-portal] Session agent ${sessionData.agentId} not allowed for ${id}`
       );
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
 
     const db = getDb();
@@ -571,12 +738,8 @@ router.get("/api/agents/:id/profile", (req: Request, res: Response) => {
       });
     }
 
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
 
     const db = getDb();
@@ -748,7 +911,7 @@ const PORTAL_PALETTE_CSS = `
   }
 `;
 
-function portalShell(title: string, body: string): string {
+export function portalShell(title: string, body: string): string {
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
@@ -922,7 +1085,9 @@ router.post("/eier/:agentId/request", express.urlencoded({ extended: false }), a
 // orders on would get a switch that does nothing. Without verification the
 // card explains why and links to the ownership claim instead. A profile that
 // already has the opt-in on keeps its «turn off» button.
-export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?: number; is_verified?: number }): string {
+// `extraHtml` (S1b punkt 7, only non-empty with OWNER_ORDER_EMAIL_ENABLED on)
+// is appended inside the card; "" keeps the card byte-identical.
+export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?: number; is_verified?: number }, extraHtml = ""): string {
   const optIn = agent.order_notifications_opt_in ? 1 : 0;
   const verified = agent.is_verified === 1;
   const id = encodeURIComponent(agent.id);
@@ -931,7 +1096,7 @@ export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?:
         <h2>Bestillinger</h2>
         <p>Motta bestillinger på e-post: <strong>Av</strong></p>
         <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Bestillinger fra kunder kan bare slås på for profiler der eierskapet er bekreftet. Bekreft først at du eier profilen, så kan du slå på bestillinger her.</p>
-        <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>
+        <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>${extraHtml}
       </div>`;
   }
   return `<div class="ep-card" id="bestillinger">
@@ -941,8 +1106,473 @@ export function ordersCardHtml(agent: { id: string; order_notifications_opt_in?:
         <form method="post" action="/eier/${id}/order-notifications" style="margin:0;">
           <input type="hidden" name="opt_in" value="${optIn ? "0" : "1"}">
           <button type="submit" class="ep-btn ep-btn-primary">${optIn ? "Slå av bestillinger på e-post" : "Slå på bestillinger på e-post"}</button>
-        </form>
+        </form>${extraHtml}
       </div>`;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// S1b punkt 6 — «Pause som virker» (dev-request 2026-10-22-rfb-mine-valg-eierbrytere)
+// ─────────────────────────────────────────────────────────────────
+// Behind OWNER_PAUSE_ENABLED (services/agent-visibility.ts, default OFF):
+// with the flag off the card is not rendered and both routes answer 404.
+// Only a verified owner (isVerifiedOwner — independent of the S1b punkt 5
+// gate flag) may pause or resume. A session without verified ownership sees
+// the card locked with the reason. Each real change writes ONE
+// agent_knowledge_audit row (field_name 'visibility.profile'); a request that
+// does not change the state writes nothing. «Be om sletting» is an e-mail to
+// kundeservice (kontakt@), the existing route for removal requests.
+
+const OWNER_PAUSE_AUDIT_FIELD = "visibility.profile";
+const OWNER_PAUSE_MAX_DAYS = 366;
+const CS_EMAIL = "kontakt@rettfrabonden.com";
+
+interface OwnerPauseState { paused: boolean; until: string | null }
+
+function readOwnerPause(agentId: string): OwnerPauseState {
+  const row = readOwnerPauseRow(getDb(), agentId);
+  const paused = isOwnerPaused(row);
+  return { paused, until: paused ? (row.owner_pause_until ?? null) : null };
+}
+
+function pauseAuditValue(state: OwnerPauseState): string {
+  return state.paused ? (state.until ? `off (pause til ${state.until})` : "off (pause)") : "on";
+}
+
+/** 'YYYY-MM-DD' strictly after today (UTC) and within a year, or null when invalid. */
+function parseResumeDate(raw: unknown, now: Date = new Date()): string | null {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
+  const d = new Date(`${v}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== v) return null;
+  const today = now.toISOString().slice(0, 10);
+  if (v <= today) return null;
+  const max = new Date(now.getTime() + OWNER_PAUSE_MAX_DAYS * 86400000).toISOString().slice(0, 10);
+  if (v > max) return null;
+  return v;
+}
+
+export const OWNER_PAUSE_LOCKED_MESSAGE =
+  "Pause kan bare brukes når eierskapet til profilen er bekreftet. Bekreft eierskap først.";
+
+export function applyOwnerPause(
+  req: Request,
+  agentId: string,
+  rawPaused: unknown,
+  rawUntil: unknown,
+): { status: number; body: any } {
+  if (!ownerPauseEnabled()) return { status: 404, body: { success: false, error: "not_found" } };
+  const session = verifyOwnerSession(req);
+  if (!session.valid) {
+    return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
+  }
+  if (!isVerifiedOwner(agentId, session)) {
+    return session.agentId === agentId
+      ? { status: 403, body: { success: false, error: "ownership_not_verified", message: OWNER_PAUSE_LOCKED_MESSAGE } }
+      : { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  }
+  let wantPaused: boolean;
+  if (rawPaused === true || rawPaused === 1 || rawPaused === "1" || rawPaused === "true") wantPaused = true;
+  else if (rawPaused === false || rawPaused === 0 || rawPaused === "0" || rawPaused === "false") wantPaused = false;
+  else return { status: 400, body: { success: false, error: "bad_paused", message: "paused må være true eller false." } };
+
+  let until: string | null = null;
+  const untilGiven = typeof rawUntil === "string" ? rawUntil.trim() !== "" : rawUntil != null;
+  if (wantPaused && untilGiven) {
+    until = parseResumeDate(rawUntil);
+    if (!until) {
+      return { status: 400, body: { success: false, error: "bad_until", message: "Tilbakedato må være en dato fram i tid (innen ett år), på formen ÅÅÅÅ-MM-DD." } };
+    }
+  }
+
+  const db = getDb();
+  const result = db.transaction(() => {
+    const before = readOwnerPause(agentId);
+    const after: OwnerPauseState = { paused: wantPaused, until: wantPaused ? until : null };
+    if (before.paused === after.paused && before.until === after.until) {
+      return { changed: false, state: after };
+    }
+    const now = new Date().toISOString();
+    if (wantPaused) {
+      db.prepare(
+        `INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until, set_by) VALUES (?, ?, ?, 'owner')
+         ON CONFLICT(agent_id) DO UPDATE SET paused_at = excluded.paused_at, pause_until = excluded.pause_until, set_by = excluded.set_by`
+      ).run(agentId, now, after.until);
+    } else {
+      db.prepare("DELETE FROM owner_profile_pause WHERE agent_id = ?").run(agentId);
+    }
+    const email = (db.prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { email?: string } | undefined)?.email ?? null;
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+       (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      `audit_${crypto.randomBytes(8).toString("hex")}`,
+      agentId,
+      OWNER_PAUSE_AUDIT_FIELD,
+      pauseAuditValue({ paused: before.paused, until: before.until }),
+      pauseAuditValue(after),
+      "owner",
+      email,
+      now,
+      wantPaused ? "owner paused profile (S1b punkt 6)" : "owner resumed profile (S1b punkt 6)",
+    );
+    return { changed: true, state: after };
+  })();
+  if (result.changed) {
+    // Public list caches (registry agents/stats, sitemap) must not keep
+    // serving the old state for a TTL. Lazy require: seo.ts is a big module.
+    try {
+      const { marketplaceRegistry } = require("../services/marketplace-registry") as typeof import("../services/marketplace-registry");
+      marketplaceRegistry._agentsCache = null;
+      marketplaceRegistry._statsCache = null;
+      marketplaceRegistry._agentsCacheTime = 0;
+      marketplaceRegistry._statsCacheTime = 0;
+      (require("./seo") as typeof import("./seo")).invalidateSitemapCache();
+    } catch (e) {
+      console.error("[owner-portal] pause cache invalidation failed:", e);
+    }
+  }
+  console.log(`[owner-portal] owner ${wantPaused ? "paused" : "resumed"} agent ${agentId} (changed=${result.changed})`);
+  return { status: 200, body: { success: true, agent_id: agentId, paused: result.state.paused, until: result.state.until, changed: result.changed } };
+}
+
+/** The «Pause og sletting» card (rendered only with OWNER_PAUSE_ENABLED on). */
+export function ownerPauseCardHtml(agent: { id: string; name?: string }, verifiedOwner: boolean, state: OwnerPauseState): string {
+  const id = encodeURIComponent(agent.id);
+  const subject = encodeURIComponent(`Be om sletting av profil: ${agent.name || agent.id} (${agent.id})`);
+  const mailBody = encodeURIComponent(`Hei,\n\nJeg ber om at profilen ${agent.name || ""} (${agent.id}) slettes fra Rett fra Bonden.\n\nHilsen`);
+  const deletion = `<p style="margin-top:16px;color:#737373;font-size:0.88rem;">Vil du heller at profilen slettes for godt? Kundeservice hjelper deg.</p>
+        <a class="ep-btn ep-btn-secondary" href="mailto:${CS_EMAIL}?subject=${subject}&amp;body=${mailBody}">Be om sletting</a>`;
+  if (!verifiedOwner) {
+    return `<div class="ep-card" id="pause">
+        <h2>Pause og sletting</h2>
+        <p>Profilen er synlig.</p>
+        <div class="ep-lock">\u{1F512} ${escapeHtml(OWNER_PAUSE_LOCKED_MESSAGE)}</div>
+        <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>
+        ${deletion}
+      </div>`;
+  }
+  if (state.paused) {
+    return `<div class="ep-card" id="pause">
+        <h2>Pause og sletting</h2>
+        <p>Profilen er på <strong>midlertidig pause</strong>${state.until ? ` til ${escapeHtml(state.until)}` : ""}. Den vises ikke i søk, lister, AI-tjenester eller kart.</p>
+        <form method="post" action="/eier/${id}/pause" style="margin:0;">
+          <input type="hidden" name="paused" value="0">
+          <button type="submit" class="ep-btn ep-btn-primary">Vis profilen igjen</button>
+        </form>
+        ${deletion}
+      </div>`;
+  }
+  return `<div class="ep-card" id="pause">
+        <h2>Pause og sletting</h2>
+        <p>Profilen er synlig.</p>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Tar du pause, forsvinner profilen fra søk, lister og AI-tjenester. Profilsiden viser «Midlertidig pause». Du kan slå den på igjen når som helst, eller velge en dato da den kommer tilbake av seg selv.</p>
+        <form method="post" action="/eier/${id}/pause" style="margin:0;">
+          <input type="hidden" name="paused" value="1">
+          <div class="ep-field">
+            <label for="pause_until">Kommer tilbake (valgfritt)</label>
+            <input id="pause_until" name="until" type="date" aria-label="Dato profilen kommer tilbake">
+          </div>
+          <button type="submit" class="ep-btn ep-btn-primary">Sett profilen på pause</button>
+        </form>
+        ${deletion}
+      </div>`;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// S1b punkt 7 — «Eieren styrer ordre-e-posten» (dev-request 2026-10-22-rfb-mine-valg-eierbrytere)
+// ─────────────────────────────────────────────────────────────────
+// Behind OWNER_ORDER_EMAIL_ENABLED (default OFF): flag off = no card section,
+// all four routes answer 404, nothing is written.
+//
+// Why an owner may write agents.order_notification_email at all — and why it
+// stays safe. The order-notify send-guard (services/order-notify-service.ts)
+// is NOT changed: its clause 3 lets an explicit order_notification_email stand
+// in for the "verified contact" clause, because until now only an admin ever
+// set it. This route keeps that premise:
+//   1. Only a verified owner (isVerifiedOwner: session for exactly this agent
+//      AND the customer rule — claimed_at or a verified agent_claims row) may
+//      START a change. An e-mail-match session without verified ownership
+//      gets 403.
+//   2. The column is written ONLY after the confirmation link mailed to the
+//      NEW address is used (POST; a GET only shows the confirm page — mail
+//      scanners prefetch links). That proves control of the new address, so
+//      the address is as "verified" as the contact clause demands. Until then
+//      orders keep going to the old recipient.
+//   3. The new address must pass isBlocked() both at request and at confirm
+//      time (the notify gate's clause 4 also re-checks it at send time).
+//   4. The token is bound to the requester's ownership: at request time a
+//      fingerprint of the ownership basis (claimed_at/claimed_via + the ids
+//      of the verified agent_claims rows) is stored; confirm requires the
+//      agent to still be owned AND that fingerprint to be unchanged. An
+//      admin reset-claim followed by a re-claim by someone else therefore
+//      kills every link issued before it (reset-claim also supersedes
+//      pending rows directly — routes/marketplace.ts).
+// It never touches who gets a real order at all: cart-service's
+// isEligibleForRealOrder() (cross-check, is_verified, opt-in, not blocklisted)
+// is unchanged and stays stricter than the notify gate — the owner only
+// chooses the DESTINATION, exactly what the admin override already was.
+//
+// Tokens: 32 random bytes, only the sha256 is stored, valid 48 h, single use.
+// A new request supersedes every earlier pending one for the agent. Max 3
+// requests per agent per rolling hour (no mail-bombing an arbitrary address).
+// All times are ISO-8601 strings (toISOString) compared with ISO strings —
+// never against SQLite datetime('now') (the format pitfall noted at
+// OWNER_TOKEN_NOT_EXPIRED_SQL above).
+
+export const OWNER_ORDER_EMAIL_FLAG = "OWNER_ORDER_EMAIL_ENABLED";
+export const ORDER_EMAIL_CONFIRM_VALID_HOURS = 48;
+const ORDER_EMAIL_MAX_REQUESTS_PER_HOUR = 3;
+const ORDER_EMAIL_AUDIT_FIELD = "order_notification_email";
+const ORDER_EMAIL_CONFIRM_PATH = "/eier/ordre-epost/bekreft";
+
+export function ownerOrderEmailEnabled(): boolean {
+  return envFlagOn(OWNER_ORDER_EMAIL_FLAG);
+}
+
+function hashOrderEmailToken(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function isPlausibleOrderEmail(v: string): boolean {
+  return v.length <= 254 && /^[^\s@<>"',;:()\[\]\\]+@[^\s@<>"',;:()\[\]\\]+\.[^\s@<>"',;:()\[\]\\]{2,}$/.test(v);
+}
+
+/**
+ * Fingerprint of who owns the agent right now (customer rule basis). Any
+ * reset-claim, re-claim, new or removed verified claim changes it. null when
+ * the agent is not verified-owned at all.
+ */
+export function ownerBasisFingerprint(agentId: string): string | null {
+  const db = getDb();
+  const a = db
+    .prepare(`SELECT a.claimed_at AS claimed_at, a.claimed_via AS claimed_via, ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+    .get(agentId) as { claimed_at: string | null; claimed_via: string | null; owned: number } | undefined;
+  if (!a || a.owned !== 1) return null;
+  const claims = (db
+    .prepare("SELECT id FROM agent_claims WHERE agent_id = ? AND status = 'verified' ORDER BY id")
+    .all(agentId) as Array<{ id: string }>).map((c) => c.id);
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([a.claimed_at ?? null, a.claimed_via ?? null, claims]))
+    .digest("hex");
+}
+
+/** The address an order mail goes to right now — same resolution as the notify gate's clause 2. */
+export function currentOrderRecipient(agentId: string): string | null {
+  const row = getDb()
+    .prepare("SELECT order_notification_email AS override_email, contact_email FROM agents WHERE id = ?")
+    .get(agentId) as { override_email: string | null; contact_email: string | null } | undefined;
+  if (!row) return null;
+  return (row.override_email || "").trim() || (row.contact_email || "").trim() || null;
+}
+
+/** The newest pending (unconsumed, unexpired) change for the agent, or null. */
+export function pendingOrderEmailChange(agentId: string, now: Date = new Date()): { new_email: string; expires_at: string } | null {
+  const row = getDb()
+    .prepare(
+      `SELECT new_email, expires_at FROM owner_order_email_change
+       WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL AND expires_at > ?
+       ORDER BY requested_at DESC, rowid DESC LIMIT 1`
+    )
+    .get(agentId, now.toISOString()) as { new_email: string; expires_at: string } | undefined;
+  return row ?? null;
+}
+
+export const OWNER_ORDER_EMAIL_LOCKED_MESSAGE =
+  "Adressen for bestillinger kan bare endres når eierskapet til profilen er bekreftet. Bekreft eierskap først.";
+
+export async function requestOwnerOrderEmailChange(
+  req: Request,
+  agentId: string,
+  rawEmail: unknown,
+): Promise<{ status: number; body: any }> {
+  if (!ownerOrderEmailEnabled()) return { status: 404, body: { success: false, error: "not_found" } };
+  const session = verifyOwnerSession(req);
+  if (!session.valid) {
+    return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
+  }
+  if (!isVerifiedOwner(agentId, session)) {
+    return session.agentId === agentId
+      ? { status: 403, body: { success: false, error: "ownership_not_verified", message: OWNER_ORDER_EMAIL_LOCKED_MESSAGE } }
+      : { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  }
+  const email = normalizeEmail(typeof rawEmail === "string" ? rawEmail : "");
+  if (!email || !isPlausibleOrderEmail(email)) {
+    return { status: 400, body: { success: false, error: "invalid_email", message: "Skriv inn en gyldig e-postadresse." } };
+  }
+  const current = currentOrderRecipient(agentId);
+  if (current && normalizeEmail(current) === email) {
+    return { status: 400, body: { success: false, error: "same_email", message: "Bestillinger sendes allerede til denne adressen." } };
+  }
+  if (isBlocked({ email }).blocked) {
+    return { status: 400, body: { success: false, error: "email_blocked", message: "Vi kan ikke sende bestillinger til denne adressen. Kontakt kontakt@rettfrabonden.com." } };
+  }
+
+  const db = getDb();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const hourAgoIso = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+  const recent = db
+    .prepare("SELECT COUNT(*) AS n FROM owner_order_email_change WHERE agent_id = ? AND requested_at > ?")
+    .get(agentId, hourAgoIso) as { n: number };
+  if ((Number(recent?.n) || 0) >= ORDER_EMAIL_MAX_REQUESTS_PER_HOUR) {
+    return { status: 429, body: { success: false, error: "rate_limited", message: "For mange forsøk. Prøv igjen om en time." } };
+  }
+
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = hashOrderEmailToken(token);
+  const expiresAt = new Date(now.getTime() + ORDER_EMAIL_CONFIRM_VALID_HOURS * 60 * 60 * 1000).toISOString();
+  let requestedBy = "owner";
+  try {
+    const ml = db.prepare("SELECT email FROM magic_links WHERE token = ?").get(session.token ?? "") as { email?: string } | undefined;
+    if (ml?.email) requestedBy = `owner:${normalizeEmail(ml.email)}`;
+  } catch { /* keep 'owner' */ }
+
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE owner_order_email_change SET outcome = 'superseded', consumed_at = ?
+       WHERE agent_id = ? AND outcome IS NULL AND consumed_at IS NULL`
+    ).run(nowIso, agentId);
+    db.prepare(
+      `INSERT INTO owner_order_email_change (token_hash, agent_id, new_email, requested_at, expires_at, requested_by, owner_basis)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(tokenHash, agentId, email, nowIso, expiresAt, requestedBy, ownerBasisFingerprint(agentId));
+  })();
+
+  const agentRow = db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId) as { name?: string } | undefined;
+  const confirmUrl = `https://rettfrabonden.com${ORDER_EMAIL_CONFIRM_PATH}/${token}`;
+  let sent = false;
+  try {
+    const r = await emailService.sendOwnerOrderEmailConfirm({
+      to: email,
+      agentName: agentRow?.name ? String(agentRow.name) : "profilen din",
+      confirmUrl,
+      validHours: ORDER_EMAIL_CONFIRM_VALID_HOURS,
+    });
+    sent = !!r?.success;
+  } catch (e) {
+    console.error("[owner-portal] order-email confirm mail threw:", e instanceof Error ? e.message : String(e));
+  }
+  if (!sent) {
+    db.prepare("UPDATE owner_order_email_change SET outcome = 'send_failed', consumed_at = ? WHERE token_hash = ?").run(new Date().toISOString(), tokenHash);
+    return { status: 502, body: { success: false, error: "email_send_failed", message: "Klarte ikke å sende bekreftelsen. Prøv igjen senere." } };
+  }
+  console.log(`[owner-portal] order-email change requested for agent ${agentId} (pending confirmation)`);
+  return {
+    status: 200,
+    body: { success: true, agent_id: agentId, order_email: current, pending_email: email, expires_at: expiresAt },
+  };
+}
+
+export type OrderEmailTokenState =
+  | { ok: true; agentId: string; newEmail: string; agentName: string }
+  | { ok: false; reason: "invalid" | "used" | "expired" | "not_owned" | "blocked" };
+
+/** Read-only check of a confirmation token (GET page and the first step of POST). */
+export function inspectOrderEmailToken(rawToken: string, now: Date = new Date()): OrderEmailTokenState {
+  if (!/^[0-9a-f]{64}$/.test(rawToken)) return { ok: false, reason: "invalid" };
+  const db = getDb();
+  const row = db
+    .prepare("SELECT agent_id, new_email, expires_at, consumed_at, outcome, owner_basis FROM owner_order_email_change WHERE token_hash = ?")
+    .get(hashOrderEmailToken(rawToken)) as
+    | { agent_id: string; new_email: string; expires_at: string; consumed_at: string | null; outcome: string | null; owner_basis: string | null }
+    | undefined;
+  if (!row) return { ok: false, reason: "invalid" };
+  if (row.outcome != null || row.consumed_at != null) return { ok: false, reason: "used" };
+  if (!(row.expires_at > now.toISOString())) return { ok: false, reason: "expired" };
+  const agent = db
+    .prepare(`SELECT a.name AS name, ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
+    .get(row.agent_id) as { name?: string; owned?: number } | undefined;
+  if (!agent || agent.owned !== 1) return { ok: false, reason: "not_owned" };
+  // Bound to the requester's ownership: reject if the ownership basis
+  // changed after the request (reset-claim / re-claim / other claimant).
+  const basis = ownerBasisFingerprint(row.agent_id);
+  if (!row.owner_basis || basis !== row.owner_basis) return { ok: false, reason: "not_owned" };
+  if (isBlocked({ email: row.new_email }).blocked) return { ok: false, reason: "blocked" };
+  return { ok: true, agentId: row.agent_id, newEmail: row.new_email, agentName: String(agent.name || "") };
+}
+
+/** POST confirm: writes agents.order_notification_email + one audit row, or nothing. */
+export function confirmOwnerOrderEmailChange(rawToken: string): OrderEmailTokenState {
+  const db = getDb();
+  return db.transaction((): OrderEmailTokenState => {
+    const state = inspectOrderEmailToken(rawToken);
+    if (!state.ok) return state;
+    const nowIso = new Date().toISOString();
+    const claimed = db
+      .prepare(
+        `UPDATE owner_order_email_change SET consumed_at = ?, outcome = 'confirmed'
+         WHERE token_hash = ? AND outcome IS NULL AND consumed_at IS NULL`
+      )
+      .run(nowIso, hashOrderEmailToken(rawToken));
+    if (claimed.changes !== 1) return { ok: false, reason: "used" };
+    const before = db
+      .prepare("SELECT order_notification_email AS override_email, contact_email FROM agents WHERE id = ?")
+      .get(state.agentId) as { override_email: string | null; contact_email: string | null };
+    const oldOverride = (before.override_email || "").trim();
+    const oldEffective = oldOverride || (before.contact_email || "").trim() || "";
+    db.prepare("UPDATE agents SET order_notification_email = ? WHERE id = ?").run(state.newEmail, state.agentId);
+    const ownerEmail = (db.prepare("SELECT email FROM agent_knowledge WHERE agent_id = ?").get(state.agentId) as { email?: string } | undefined)?.email ?? null;
+    db.prepare(
+      `INSERT INTO agent_knowledge_audit
+       (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      `audit_${crypto.randomBytes(8).toString("hex")}`,
+      state.agentId,
+      ORDER_EMAIL_AUDIT_FIELD,
+      oldEffective || null,
+      state.newEmail,
+      "owner",
+      ownerEmail,
+      nowIso,
+      `owner confirmed new order e-mail from the new address (S1b punkt 7); previous recipient was ${oldOverride ? "order_notification_email" : "contact_email"}`,
+    );
+    console.log(`[owner-portal] order-email confirmed for agent ${state.agentId}`);
+    return state;
+  })();
+}
+
+/** The «Ordre sendes til» section inside the Bestillinger card (flag on, verified owner). */
+export function ownerOrderEmailSectionHtml(agentId: string, current: string | null, pending: string | null): string {
+  const id = encodeURIComponent(agentId);
+  return `
+        <div id="ordre-epost" style="margin-top:16px;padding-top:12px;border-top:1px solid #e5e5e5;">
+          <p>Ordre sendes til: <strong>${current ? escapeHtml(current) : "ingen adresse"}</strong></p>
+          ${pending ? `<p class="ep-alert ep-alert-ok" role="status">Venter på bekreftelse fra <strong>${escapeHtml(pending)}</strong>. Klikk lenken vi sendte dit.</p>` : ""}
+          <form method="post" action="/eier/${id}/order-email" style="margin:0;">
+            <div class="ep-field">
+              <label for="order_email">Ny adresse for bestillinger</label>
+              <input id="order_email" name="email" type="email" required autocomplete="email">
+            </div>
+            <button type="submit" class="ep-btn ep-btn-secondary">Send bekreftelse til ny adresse</button>
+          </form>
+          <p style="margin-top:8px;color:#737373;font-size:0.88rem;">Vi sender en lenke til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt.</p>
+        </div>`;
+}
+
+/** 403 page: valid session for this agent, but no verified owner (S1b punkt 5). */
+/** S2b: the portal card that links to «Mine valg» (/eier/:id/valg). */
+export function ownerFeaturesEntryCardHtml(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return `<div class="ep-card" id="mine-valg">
+        <h2>Mine valg</h2>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Bestem hvem som finner deg, om du tar imot bestillinger og hva vi sender deg. Alt på ett sted.</p>
+        <a class="ep-btn ep-btn-primary" href="/eier/${id}/valg">Gå til Mine valg</a>
+      </div>`;
+}
+
+export function ownerNotVerifiedPage(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return portalShell(
+    "Ingen tilgang",
+    `<div class="ep-card">
+          <h1>Eierskapet er ikke bekreftet</h1>
+          <p>${escapeHtml(OWNER_NOT_VERIFIED_MESSAGE)}</p>
+          <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Bekreft eierskap av profilen</a>
+        </div>`
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -956,6 +1586,11 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     if (!session.valid) {
       // Not logged in → bounce to email-entry form for this agent.
       return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
+    }
+    if (session.agentId === agentId && !ownerSessionAllows(agentId, session)) {
+      // S1b punkt 5 (OWNER_VERIFIED_OWNER_GATE_ENABLED): an e-mail match
+      // without verified ownership → 403 with the way to confirm ownership.
+      return res.status(403).send(ownerNotVerifiedPage(agentId));
     }
     if (session.agentId !== agentId) {
       // Logged in to a different agent → 403.
@@ -1017,6 +1652,17 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar nå bestillinger på e-post.</div>`;
     } else if (status === "orders_off") {
       alert = `<div class="ep-alert ep-alert-ok" role="status">Du mottar ikke lenger bestillinger på e-post.</div>`;
+    } else if (status === "paused" && ownerPauseEnabled()) {
+      alert = `<div class="ep-alert ep-alert-ok" role="status">Profilen er satt på pause.</div>`;
+    } else if (status === "resumed" && ownerPauseEnabled()) {
+      alert = `<div class="ep-alert ep-alert-ok" role="status">Profilen er synlig igjen.</div>`;
+    } else if (status === "pause_error" && ownerPauseEnabled()) {
+      alert = `<div class="ep-alert ep-alert-error" role="alert">Klarte ikke å endre pausen. Sjekk datoen og prøv igjen.</div>`;
+    } else if (status.startsWith("order_email_") && ownerOrderEmailEnabled() && ORDER_EMAIL_STATUS_ALERTS[status]) {
+      const oa = ORDER_EMAIL_STATUS_ALERTS[status];
+      alert = oa.ok
+        ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
+        : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(oa.text)}</div>`;
     } else if (paymentPortalAlert(status)) {
       const pa = paymentPortalAlert(status)!;
       alert = pa.ok
@@ -1033,6 +1679,44 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       const paymentStatus = getProducerPaymentStatus(db, agentId);
       if (shouldRenderPaymentCard(paymentStatus)) paymentCardHtml = renderPaymentCard(agentId, paymentStatus);
     } catch { paymentCardHtml = ""; }
+
+    // S1b punkt 6: «Pause og sletting» card — only with OWNER_PAUSE_ENABLED on
+    // (flag off = the portal is byte-identical to before).
+    let pauseCardHtml = "";
+    if (ownerPauseEnabled()) {
+      try {
+        pauseCardHtml = ownerPauseCardHtml(agent, isVerifiedOwner(agentId, session), readOwnerPause(agentId));
+      } catch { pauseCardHtml = ""; }
+    }
+
+    // S1b punkt 7: «Ordre sendes til» + change form inside the Bestillinger
+    // card — only with OWNER_ORDER_EMAIL_ENABLED on and a verified owner
+    // (flag off = the portal is byte-identical to before).
+    let orderEmailHtml = "";
+    if (ownerOrderEmailEnabled()) {
+      try {
+        if (isVerifiedOwner(agentId, session)) {
+          orderEmailHtml = ownerOrderEmailSectionHtml(agentId, currentOrderRecipient(agentId), pendingOrderEmailChange(agentId)?.new_email ?? null);
+        }
+      } catch { orderEmailHtml = ""; }
+    }
+
+    // S2b: «Mine valg» entry card — only for a subject in
+    // OWNER_FEATURES_ALLOWED_SUBJECTS and a verified owner (empty/unset
+    // allowlist = "" = the portal is byte-identical to before).
+    let ownerFeaturesCardHtml = "";
+    try {
+      if (isSubjectAllowedForOwnerFeatures("rfb", agentId) && isVerifiedOwner(agentId, session)) {
+        ownerFeaturesCardHtml = ownerFeaturesEntryCardHtml(agentId);
+      }
+    } catch { ownerFeaturesCardHtml = ""; }
+
+    // Fase A2: number of orders waiting for an answer (tolerant: a DB without orders shows 0).
+    let pendingOrderCount = 0;
+    try {
+      const pc = db.prepare("SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending'").get(agentId) as any;
+      pendingOrderCount = Number(pc?.n) || 0;
+    } catch { pendingOrderCount = 0; }
 
     // Editable fields with display labels (Norwegian Bokmål)
     const fieldDefs: Array<{ key: string; dbField: string; label: string; type: "text" | "textarea" | "email" | "url" }> = [
@@ -1109,7 +1793,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ordersCardHtml(agent)}${paymentCardHtml}
+      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent, orderEmailHtml)}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -1214,8 +1898,8 @@ function applyOwnerOrderOptIn(
   if (!session.valid) {
     return { status: 401, body: { success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." } };
   }
-  if (session.agentId !== agentId) {
-    return { status: 403, body: { success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." } };
+  if (!ownerSessionAllows(agentId, session)) {
+    return { status: 403, body: ownerForbiddenJson(agentId, session) };
   }
   let optIn: 0 | 1;
   if (rawOptIn === true || rawOptIn === 1 || rawOptIn === "1" || rawOptIn === "true") optIn = 1;
@@ -1233,14 +1917,24 @@ function applyOwnerOrderOptIn(
       return { status: 409, body: { success: false, error: "ownership_not_verified", message: "Bestillinger kan bare slås på for profiler der eierskapet er bekreftet. Bekreft eierskap først." } };
     }
   }
-  const info = getDb()
-    .prepare("UPDATE agents SET order_notifications_opt_in = ? WHERE id = ?")
-    .run(optIn, agentId);
-  if (!info.changes) {
+  // S2b (N1): same UPDATE, plus the owner_feature_audit row for
+  // `orders.enabled` in the same transaction when the value changes.
+  if (!writeOrderNotificationsOptInWithAudit(getDb(), agentId, optIn === 1, { actor: "owner", detail: ownerSessionEmail(session.token) })) {
     return { status: 404, body: { success: false, error: "agent_not_found" } };
   }
   console.log(`[owner-portal] owner set order_notifications_opt_in=${optIn} for agent ${agentId}`);
   return { status: 200, body: { success: true, agent_id: agentId, order_notifications_opt_in: optIn === 1 } };
+}
+
+/** The e-mail the owner session was opened with (audit actor_detail). */
+function ownerSessionEmail(token: string | undefined): string | null {
+  if (!token) return null;
+  try {
+    const row = getDb().prepare("SELECT email FROM magic_links WHERE token = ?").get(token) as { email?: string } | undefined;
+    return row?.email ?? null;
+  } catch {
+    return null;
+  }
 }
 
 router.post("/api/agents/:id/order-notifications", (req: Request, res: Response) => {
@@ -1267,6 +1961,178 @@ router.post("/eier/:agentId/order-notifications", express.urlencoded({ extended:
 });
 
 // ─────────────────────────────────────────────────────────────────
+// POST /api/agents/:id/pause  { paused: boolean, until?: "YYYY-MM-DD" }
+// POST /eier/:agentId/pause   (form, no-JS fallback)
+// S1b punkt 6 — see applyOwnerPause(). Flag off → 404.
+// ─────────────────────────────────────────────────────────────────
+router.post("/api/agents/:id/pause", (req: Request, res: Response) => {
+  try {
+    const out = applyOwnerPause(req, String(req.params.id || ""), req.body?.paused, req.body?.until);
+    return res.status(out.status).json(out.body);
+  } catch (e: any) {
+    console.error("[owner-portal] POST pause failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  // Same Origin check as POST /eier/:id/selger: no cross-site trigger.
+  if (crossSiteRequest(req)) {
+    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  }
+  try {
+    const out = applyOwnerPause(req, agentId, req.body?.paused, req.body?.until);
+    if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (out.status === 400) return res.redirect(303, `${base}?status=pause_error#pause`);
+    if (out.status !== 200) return res.status(out.status).json(out.body);
+    return res.redirect(303, `${base}?status=${out.body.paused ? "paused" : "resumed"}#pause`);
+  } catch (e: any) {
+    console.error("[owner-portal] POST /eier pause failed:", e);
+    return res.redirect(303, `${base}?status=pause_error#pause`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/agents/:id/order-email      { email }   (JSON)
+// POST /eier/:agentId/order-email       (form, no-JS fallback)
+// GET  /eier/ordre-epost/bekreft/:token (confirm page — changes nothing)
+// POST /eier/ordre-epost/bekreft/:token (writes the new recipient)
+// S1b punkt 7 — see requestOwnerOrderEmailChange() /
+// confirmOwnerOrderEmailChange(). Flag off → 404.
+// ─────────────────────────────────────────────────────────────────
+const ORDER_EMAIL_STATUS_ALERTS: Record<string, { ok: boolean; text: string }> = {
+  order_email_sent: { ok: true, text: "Vi har sendt en bekreftelse til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt." },
+  order_email_invalid: { ok: false, text: "Skriv inn en gyldig e-postadresse." },
+  order_email_same: { ok: false, text: "Bestillinger sendes allerede til denne adressen." },
+  order_email_blocked: { ok: false, text: "Vi kan ikke sende bestillinger til denne adressen. Kontakt kontakt@rettfrabonden.com." },
+  order_email_rate: { ok: false, text: "For mange forsøk. Prøv igjen om en time." },
+  order_email_error: { ok: false, text: "Klarte ikke å sende bekreftelsen. Prøv igjen senere." },
+};
+
+const ORDER_EMAIL_ERROR_STATUS: Record<string, string> = {
+  invalid_email: "order_email_invalid",
+  same_email: "order_email_same",
+  email_blocked: "order_email_blocked",
+  rate_limited: "order_email_rate",
+};
+
+const orderEmailConfirmLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { trustProxy: false },
+  message: "For mange forsøk. Prøv igjen om litt.",
+});
+
+router.post("/api/agents/:id/order-email", async (req: Request, res: Response) => {
+  try {
+    const out = await requestOwnerOrderEmailChange(req, String(req.params.id || ""), req.body?.email);
+    return res.status(out.status).json(out.body);
+  } catch (e: any) {
+    console.error("[owner-portal] POST order-email failed:", e);
+    return res.status(500).json({ success: false, error: "server_error" });
+  }
+});
+
+router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  if (!ownerOrderEmailEnabled()) {
+    return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
+  }
+  // Same Origin check as POST /eier/:id/pause and /selger: no cross-site trigger.
+  if (crossSiteRequest(req)) {
+    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  }
+  try {
+    const out = await requestOwnerOrderEmailChange(req, agentId, req.body?.email);
+    if (out.status === 401) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (out.status === 200) return res.redirect(303, `${base}?status=order_email_sent#bestillinger`);
+    const mapped = ORDER_EMAIL_ERROR_STATUS[String(out.body?.error || "")];
+    if (mapped) return res.redirect(303, `${base}?status=${mapped}#bestillinger`);
+    if (out.status === 403 && out.body?.error === "ownership_not_verified") return res.status(403).send(ownerNotVerifiedPage(agentId));
+    if (out.status === 403) {
+      return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1><p>Du har ikke tilgang til denne produsenten.</p></div>`));
+    }
+    return res.redirect(303, `${base}?status=order_email_error#bestillinger`);
+  } catch (e: any) {
+    console.error("[owner-portal] POST /eier order-email failed:", e);
+    return res.redirect(303, `${base}?status=order_email_error#bestillinger`);
+  }
+});
+
+function orderEmailNoStore(res: Response): void {
+  // The token is in the URL: never cache the page, never leak it as Referer.
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Referrer-Policy", "no-referrer");
+}
+
+const ORDER_EMAIL_TOKEN_ERRORS: Record<string, string> = {
+  invalid: "Lenken er ugyldig.",
+  used: "Lenken er allerede brukt, eller en nyere endring er bestilt.",
+  expired: "Lenken er utløpt. Be om en ny bekreftelse fra eierportalen.",
+  not_owned: "Adressen kan ikke endres for denne profilen nå.",
+  blocked: "Vi kan ikke sende bestillinger til denne adressen.",
+};
+
+function orderEmailTokenErrorPage(reason: string): string {
+  const text = ORDER_EMAIL_TOKEN_ERRORS[reason] || ORDER_EMAIL_TOKEN_ERRORS.invalid;
+  return portalShell("Kunne ikke bekrefte", `<div class="ep-card">
+        <h1>Kunne ikke bekrefte adressen</h1>
+        <p>${escapeHtml(text)} Ingenting er endret, og bestillinger går fortsatt til den gamle adressen.</p>
+        <p>Trenger du hjelp? Skriv til <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>.</p>
+      </div>`);
+}
+
+router.get(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, (req: Request, res: Response) => {
+  if (!ownerOrderEmailEnabled()) {
+    return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
+  }
+  orderEmailNoStore(res);
+  try {
+    // Read-only: shows the confirmation form, writes nothing.
+    const state = inspectOrderEmailToken(String(req.params.token || ""));
+    if (!state.ok) return res.status(400).send(orderEmailTokenErrorPage(state.reason));
+    return res.status(200).send(portalShell("Bekreft adresse for bestillinger", `<div class="ep-card">
+        <h1>Bekreft adresse for bestillinger</h1>
+        <p>Bestillinger fra kunder til <strong>${escapeHtml(state.agentName || "profilen")}</strong> sendes da til <strong>${escapeHtml(state.newEmail)}</strong>.</p>
+        <form method="post" action="" style="margin:0;">
+          <button type="submit" class="ep-btn ep-btn-primary">Bekreft adressen</button>
+        </form>
+        <p style="margin-top:12px;color:#737373;font-size:0.88rem;">Kjenner du ikke til dette? Lukk siden, så endres ingenting.</p>
+      </div>`));
+  } catch (e: any) {
+    console.error("[owner-portal] GET order-email confirm failed:", e instanceof Error ? e.message : String(e));
+    return res.status(500).send(orderEmailTokenErrorPage("invalid"));
+  }
+});
+
+router.post(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  if (!ownerOrderEmailEnabled()) {
+    return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
+  }
+  orderEmailNoStore(res);
+  if (crossSiteRequest(req)) {
+    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  }
+  try {
+    const state = confirmOwnerOrderEmailChange(String(req.params.token || ""));
+    if (!state.ok) return res.status(400).send(orderEmailTokenErrorPage(state.reason));
+    return res.status(200).send(portalShell("Adressen er bekreftet", `<div class="ep-card">
+        <h1>Adressen er bekreftet</h1>
+        <p>Nye bestillinger til <strong>${escapeHtml(state.agentName || "profilen")}</strong> sendes nå til <strong>${escapeHtml(state.newEmail)}</strong>.</p>
+        <a class="ep-btn ep-btn-primary" href="/eier/${encodeURIComponent(state.agentId)}/portal#bestillinger">Til eierportalen</a>
+      </div>`));
+  } catch (e: any) {
+    console.error("[owner-portal] POST order-email confirm failed:", e instanceof Error ? e.message : String(e));
+    return res.status(500).send(orderEmailTokenErrorPage("invalid"));
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
 // POST /eier/:agentId/save — graceful-degradation save (forwards to
 // JSON update-profile endpoint with cookie-bearing session). Re-renders
 // the portal with status query string.
@@ -1275,8 +2141,13 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
   const agentId = String((req.params as any).agentId || "");
   const session = verifyOwnerSession(req);
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
-  if (!session.valid || session.agentId !== agentId) {
+  if (!session.valid) {
     return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+  }
+  if (!ownerSessionAllows(agentId, session)) {
+    return session.agentId === agentId
+      ? res.status(403).send(ownerNotVerifiedPage(agentId))
+      : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
   }
   try {
     // Build whitelisted JSON payload from form fields
@@ -1310,6 +2181,9 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
 router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
   const agentId = String((req.params as any).agentId || "");
   const db = getDb();
+  // S1b punkt 5: revoke the token itself, not only the browser cookie — a
+  // copied cookie value / Bearer token is unusable after logout.
+  for (const t of presentedOwnerTokens(req)) revokeOwnerSessionToken(t);
   const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as any;
   if (agent) (agent as any).slug = slugify(String(agent.name || ""));
   // Clear cookie (matching attributes used at set time so browsers honour it)
@@ -1322,6 +2196,86 @@ router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
   const target = agent && agent.slug ? `/produsent/${encodeURIComponent(agent.slug)}` : "/";
   return res.redirect(303, target);
 });
+
+// ─────────────────────────────────────────────────────────────────
+// POST /eier/:agentId/selger — products / opening hours / availability with
+// the SAME login (S1b punkt 5, OWNER_UNIFIED_SESSION_ENABLED, default off)
+// ─────────────────────────────────────────────────────────────────
+// The /selger editor authenticates with the verified claimant's claim token.
+// Instead of a second e-mail, a logged-in verified owner gets a one-time,
+// 15-minute /selger login (the same magic_links row knowledge-service
+// createMagicLink writes, used = 0) and is redirected straight into the
+// existing /selger?magic= auto-login. Only for the verified claimant whose
+// e-mail opened this session — an e-mail-match session never receives a
+// claim token. POST + SameSite=Lax cookie + Origin check: no cross-site
+// trigger.
+export function crossSiteRequest(req: Request): boolean {
+  const origin = req.headers.origin;
+  if (!origin || typeof origin !== "string") return false;
+  try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }
+}
+
+router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
+  const agentId = String((req.params as any).agentId || "");
+  if (!ownerUnifiedSessionEnabled()) {
+    return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
+  }
+  try {
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (crossSiteRequest(req)) return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+    // Always the strict predicate here (independent of the gate flag): this
+    // hands out the products editor.
+    if (!isVerifiedOwner(agentId, session)) {
+      return session.agentId === agentId
+        ? res.status(403).send(ownerNotVerifiedPage(agentId))
+        : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    }
+    const db = getDb();
+    const link = db
+      .prepare(`SELECT email FROM magic_links WHERE token = ?`)
+      .get(session.token) as { email?: string } | undefined;
+    const sessionEmail = String(link?.email || "").trim().toLowerCase();
+    const claim = sessionEmail
+      ? (db.prepare(
+          `SELECT claimant_email FROM agent_claims
+           WHERE agent_id = ? AND status = 'verified' AND LOWER(TRIM(claimant_email)) = ?
+           ORDER BY verified_at DESC LIMIT 1`
+        ).get(agentId, sessionEmail) as { claimant_email?: string } | undefined)
+      : undefined;
+    if (!claim || !claim.claimant_email) {
+      // Verified owner, but this session was not opened by the claimant's
+      // own address: the /selger editor needs its own login.
+      return res.redirect(303, `/selger?agent=${encodeURIComponent(agentId)}`);
+    }
+    const token = crypto.randomBytes(32).toString("hex");
+    const now = new Date();
+    db.prepare(
+      `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+       VALUES (?, ?, ?, ?, 0, ?, ?)`
+    ).run(`${OWNER_BRIDGE_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, claim.claimant_email, token, agentId,
+      now.toISOString(), new Date(now.getTime() + OWNER_BRIDGE_VALID_MS).toISOString());
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    return res.redirect(303, `/selger?magic=${encodeURIComponent(token)}`);
+  } catch (err) {
+    console.error("[owner-portal] POST /eier/:agentId/selger error:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, `/eier/${encodeURIComponent(agentId)}/portal?status=error`);
+  }
+});
+
+/** Portal card (flag on only): products, opening hours, availability via /selger. */
+export function ownerSelgerCardHtml(agentId: string): string {
+  if (!ownerUnifiedSessionEnabled()) return "";
+  const id = encodeURIComponent(agentId);
+  return `<div class="ep-card" id="produkter">
+        <h2>Produkter og åpningstider</h2>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Rediger produkter, åpningstider og tilgjengelighet. Du er allerede logget inn.</p>
+        <form method="post" action="/eier/${id}/selger" style="margin:0;">
+          <button type="submit" class="ep-btn ep-btn-primary">Rediger produkter og åpningstider</button>
+        </form>
+      </div>`;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
@@ -1340,12 +2294,8 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
         message: "Din sesjon er utløpt. Logg inn på nytt.",
       });
     }
-    if (session.agentId !== agentId) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(agentId, session)) {
+      return res.status(403).json(ownerForbiddenJson(agentId, session));
     }
 
     const limitNum = Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200);
@@ -1411,12 +2361,8 @@ router.get("/api/agents/:id/owner-stats", (req: Request, res: Response) => {
       });
     }
 
-    if (session.agentId !== id) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(id, session)) {
+      return res.status(403).json(ownerForbiddenJson(id, session));
     }
 
     const db = getDb();
@@ -1477,12 +2423,8 @@ router.get("/api/agents/:id/orders", (req: Request, res: Response) => {
       });
     }
 
-    if (session.agentId !== id) {
-      return res.status(403).json({
-        success: false,
-        error: "forbidden",
-        message: "Du har ikke tilgang til denne agenten.",
-      });
+    if (!ownerSessionAllows(id, session)) {
+      return res.status(403).json(ownerForbiddenJson(id, session));
     }
 
     const db = getDb();
@@ -1534,7 +2476,7 @@ router.get("/api/agents/:id/orders", (req: Request, res: Response) => {
 // Helper: Escape HTML
 // ─────────────────────────────────────────────────────────────────
 
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
   const map: { [key: string]: string } = {
     "&": "&amp;",
     "<": "&lt;",
@@ -1567,8 +2509,8 @@ router.get("/api/agents/:id/translations", (req: Request, res: Response) => {
     if (!sessionData.valid) {
       return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
     }
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
     const lang = parseOwnerLang(req.query.lang);
     if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
@@ -1609,8 +2551,8 @@ router.post("/api/agents/:id/translations", (req: Request, res: Response) => {
     if (!sessionData.valid) {
       return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
     }
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
     const lang = parseOwnerLang(req.body?.lang);
     if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });
@@ -1656,8 +2598,8 @@ router.delete("/api/agents/:id/translations", (req: Request, res: Response) => {
     if (!sessionData.valid) {
       return res.status(401).json({ success: false, error: "session_invalid", message: "Din sesjon er utløpt. Logg inn på nytt." });
     }
-    if (sessionData.agentId !== id) {
-      return res.status(403).json({ success: false, error: "forbidden", message: "Du har ikke tilgang til denne agenten." });
+    if (!ownerSessionAllows(id, sessionData)) {
+      return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
     const lang = parseOwnerLang(req.body?.lang ?? req.query?.lang);
     if (!lang) return res.status(400).json({ success: false, error: "bad_lang", message: "lang må være en eller sv." });

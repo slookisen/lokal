@@ -805,6 +805,9 @@ import {
   // goes through the variant dispatcher so BOTH A/B arms keep that rule.
   renderGardssalgOutreachVariant,
   GardssalgOutreachTemplate,
+  GardssalgOutreachSubjectArm,
+  GardssalgOutreachRenderCtx,
+  gardssalgOutreachMonthPhrase,
   GARDSSALG_OUTREACH_REPLY_TO,
 } from "../services/email-service";
 import { crmService } from "../services/crm-service";
@@ -1370,7 +1373,7 @@ router.get("/discover", (req: Request, res: Response) => {
       if (typeof filter.radius_km === "number") gsFilter.radius_km = filter.radius_km;
       const hasGeo = typeof gsFilter.lat === "number" && typeof gsFilter.lng === "number";
 
-      const gsResults = searchGardssalgProviders(gsFilter, limit);
+      const gsResults = searchGardssalgProviders(gsFilter, limit, { surface: "rest" });
       res.json({
         vertical: "gardssalg",
         query: gsFilter,
@@ -9947,7 +9950,7 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
     if (!rawProviderQuery) {
       return res.status(400).json(providerQueryMissingPayload());
     }
-    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true });
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { includeHidden: true, surface: "rest" });
     if (resolution.kind === "none") {
       return res.status(404).json(providerNotFoundPayload(rawProviderQuery));
     }
@@ -15811,6 +15814,7 @@ router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Requ
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 
 import { getDb as getRfbDb } from "../database/init";
+import { storedClientClass } from "../services/traffic-classifier";
 import { getDb as getExpDb } from "../database/db-factory";
 import { buildCrossPlatformIdentity, type CrossPlatformMatch } from "../services/cross-platform-match";
 import { getRfbSendIndexForOpplevagent } from "../services/outreach-suppression-signals";
@@ -19737,6 +19741,13 @@ export type GardssalgOutreachSendResultRow = {
   // false when the mail went out but the CRM write failed. Absent on test
   // sends, which are deliberately not filed.
   crm_recorded?: boolean;
+  // dev-request 2026-10-22-opplevagent-utsending-v4 (AC7): on a `sent` row, the
+  // template that went out and, for the v4 first mail, the subject arm. The
+  // run-ledger claim and the CRM message carry the same values.
+  template?: GardssalgOutreachTemplate;
+  subject_arm?: GardssalgOutreachSubjectArm;
+  // v4 follow-up only: true = sent as a reply in the first mail's thread.
+  threaded?: boolean;
   // Incident 2026-09-27/28 (prod volume full: every sent_log INSERT threw
   // AFTER the mail had already gone out, so no cooldown/budget row existed
   // and the next day's run mailed the same six producers again). The send
@@ -19833,6 +19844,59 @@ export type GardssalgOutreachEligibleRow = Extract<GardssalgOutreachEligibility,
  * Looping callers stop on db_write_failed / reservation_kept — see
  * gardssalgOutreachBatchStopReason.
  */
+/** CRM thread id for one producer's outreach conversation (first + follow-up). */
+function gardssalgOutreachThreadId(providerId: string): string {
+  return `opplevagent-outreach-${providerId}`;
+}
+
+/** The first outbound message in the producer's outreach thread, or null. */
+export function findGardssalgOutreachFirstMessage(
+  rfbDb: ReturnType<typeof getRfbDb>,
+  providerId: string,
+): { message_id: string; subject: string | null; sent_at: string | null } | null {
+  const row = rfbDb
+    .prepare(
+      `SELECT id, subject, sent_at FROM crm_messages
+        WHERE thread_id = ? AND direction = 'out'
+        ORDER BY sent_at ASC, rowid ASC LIMIT 1`,
+    )
+    .get(gardssalgOutreachThreadId(providerId)) as { id: string; subject: string | null; sent_at: string | null } | undefined;
+  return row ? { message_id: row.id, subject: row.subject, sent_at: row.sent_at } : null;
+}
+
+/**
+ * A stored message id usable in In-Reply-To/References: `<id@host>`. A bare
+ * `id@host` is wrapped; anything else (DRY_RUN, the synthetic `outreach-…`
+ * fallback id) is not a real Message-ID and returns null.
+ */
+export function normaliseGardssalgMessageIdHeader(raw: string | null | undefined): string | null {
+  const v = (raw ?? "").trim();
+  if (/^<[^<>\s@]+@[^<>\s@]+>$/.test(v)) return v;
+  if (/^[^<>\s@]+@[^<>\s@]+$/.test(v)) return `<${v}>`;
+  return null;
+}
+
+/**
+ * Subject arm for the NEXT v4 first mail: A and B alternate, starting at A,
+ * counted over the v4 first mails already filed in the CRM (the closing quote
+ * keeps `personal-v4-followup` out of the count).
+ */
+export function nextGardssalgOutreachSubjectArm(rfbDb: ReturnType<typeof getRfbDb>): GardssalgOutreachSubjectArm {
+  const row = rfbDb
+    .prepare(
+      `SELECT COUNT(*) AS n FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template":"personal-v4"%'`,
+    )
+    .get() as { n: number };
+  return row.n % 2 === 0 ? "A" : "B";
+}
+
+function parseSentLogTimestamp(raw: string): Date {
+  // sent_log default is `YYYY-MM-DD HH:MM:SS` (UTC, no zone); ISO strings pass through.
+  const t = raw.includes("T") ? raw : raw.replace(" ", "T") + "Z";
+  return new Date(t);
+}
+
 export async function sendGardssalgOutreachToEligibleProvider(
   expDb: ReturnType<typeof getExpDb>,
   elig: GardssalgOutreachEligibleRow,
@@ -19879,6 +19943,46 @@ export async function sendGardssalgOutreachToEligibleProvider(
   if (sendTimeBounce) {
     console.warn(`[${opts.source}] recipient hard-bounced/complained since eligibility — NOT sending`, { providerId, email });
     return { provider_id: providerId, status: "skipped", reason: "hard_bounced" };
+  }
+
+  // dev-request 2026-10-22-opplevagent-utsending-v4: render context for the v4
+  // texts, built BEFORE the reservation (the follow-up's {måned} and thread
+  // come from the FIRST send, which the reservation below would otherwise
+  // muddy). Read-only; nothing is written here.
+  let renderCtx: GardssalgOutreachRenderCtx | undefined;
+  let inReplyToMessageId: string | undefined;
+  let subjectArm: GardssalgOutreachSubjectArm | undefined;
+  if (template === "personal-v4") {
+    subjectArm = nextGardssalgOutreachSubjectArm(getRfbDb());
+    renderCtx = {
+      arm: subjectArm,
+      eierUrl: `https://opplevagent.no/kategori/gardssalg/eier/${elig.slug ?? ""}`,
+    };
+  } else if (template === "personal-v4-followup") {
+    let first: ReturnType<typeof findGardssalgOutreachFirstMessage> = null;
+    let firstSentAt: Date | null = null;
+    try {
+      first = findGardssalgOutreachFirstMessage(getRfbDb(), providerId);
+      const sentLogRow = expDb
+        .prepare(`SELECT MIN(sent_at) AS first_at FROM experience_outreach_sent_log WHERE provider_id = ? AND is_test = 0`)
+        .get(providerId) as { first_at: string | null } | undefined;
+      const raw = first?.sent_at ?? sentLogRow?.first_at ?? null;
+      firstSentAt = raw ? parseSentLogTimestamp(raw) : null;
+    } catch (lookupErr) {
+      console.error(`[${opts.source}] first-send lookup failed — NOT sending`, { providerId, error: errMsg(lookupErr) });
+      return { provider_id: providerId, status: "skipped", reason: `first_send_lookup_failed: ${errMsg(lookupErr)}` };
+    }
+    if (!firstSentAt || Number.isNaN(firstSentAt.getTime())) {
+      return { provider_id: providerId, status: "skipped", reason: "followup_without_prior_send" };
+    }
+    const threadId = normaliseGardssalgMessageIdHeader(first?.message_id);
+    const firstSubject = threadId ? (first?.subject ?? null) : null;
+    if (threadId && firstSubject) inReplyToMessageId = threadId;
+    renderCtx = {
+      monthPhrase: gardssalgOutreachMonthPhrase(firstSentAt, new Date()),
+      // No usable first message: a new mail with subject A (spec endring 7).
+      firstSubject: inReplyToMessageId ? firstSubject : null,
+    };
   }
 
   // Reserve BEFORE sending. sent_at takes the column DEFAULT exactly as the
@@ -19934,6 +20038,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
     const sendResult = await emailService.sendGardssalgOutreach(email, providerName, profileUrl, {
       isTestSend: isTest,
       template,
+      ctx: renderCtx,
+      ...(inReplyToMessageId ? { inReplyToMessageId } : {}),
     });
     if (!sendResult.success) {
       // Rejected — nothing left the building. Release the reservation so the
@@ -19979,11 +20085,11 @@ export async function sendGardssalgOutreachToEligibleProvider(
     let crmRecorded: boolean | undefined;
     if (!isTest) {
       try {
-        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl);
+        const rendered = renderGardssalgOutreachVariant(template, providerName, profileUrl, renderCtx);
         crmService.ingestThread(
           {
-            threadId: `opplevagent-outreach-${providerId}`,
-            subject: rendered.subject,
+            threadId: gardssalgOutreachThreadId(providerId),
+            subject: template === "personal-v4-followup" ? (renderCtx?.firstSubject ?? rendered.subject) : rendered.subject,
             category: "marketing",
             messages: [
               {
@@ -20003,6 +20109,8 @@ export async function sendGardssalgOutreachToEligibleProvider(
                   provider_id: providerId,
                   reply_to: GARDSSALG_OUTREACH_REPLY_TO,
                   template,
+                  ...(subjectArm ? { subject_arm: subjectArm } : {}),
+                  ...(inReplyToMessageId ? { in_reply_to: inReplyToMessageId } : {}),
                 },
               },
             ],
@@ -20026,6 +20134,9 @@ export async function sendGardssalgOutreachToEligibleProvider(
       ...(logFailure === undefined ? {} : { reason: logFailure, db_write_failed: true as const }),
       log_recorded: logFailure === undefined,
       ...(crmRecorded === undefined ? {} : { crm_recorded: crmRecorded }),
+      template,
+      ...(subjectArm ? { subject_arm: subjectArm } : {}),
+      ...(template === "personal-v4-followup" ? { threaded: inReplyToMessageId !== undefined } : {}),
     };
   } catch (err) {
     // Every write above has its own catch, so only the send itself lands
@@ -20859,6 +20970,171 @@ router.get("/admin/gardssalg-outreach-daily-prep", requireAdmin, (_req: Request,
   res.json(prep.response);
 });
 
+// ─── GET /admin/gardssalg-outreach-v4-measurement (admin, read-only) ───────
+//
+// dev-request 2026-10-22-opplevagent-utsending-v4, endring 10 / AC8: per v4
+// send (CRM crm_messages, direction 'out', template personal-v4 or
+// personal-v4-followup), the numbers the 4-week evaluation needs: human page
+// views of the profile page and of /eier/<slug> in the 72 hours after the send,
+// whether a login link was requested (gardssalg_claims row), whether the
+// profile was taken over (claimed_at), reply and «fjern». Reads existing
+// tables only (analytics_page_views keeps path without query string and no
+// IP/UA, raw retention 60 days) — no schema change, no write path.
+const GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS = 72;
+const GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS = 28;
+const GARDSSALG_V4_MEASUREMENT_MAX_DAYS = 60;
+
+/** `YYYY-MM-DD HH:MM:SS` (UTC) — the format SQLite's datetime('now') columns hold. */
+function toSqliteUtc(d: Date): string {
+  return d.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
+/** Human page views (shared definition, see profile-activity-service getViews30) of one exact path in [from, to). */
+function countGardssalgHumanViews(rfbDb: ReturnType<typeof getRfbDb>, path: string, from: Date, to: Date): number {
+  const sessions = rfbDb
+    .prepare(
+      `SELECT session_id, MAX(client_class) AS client_class, COUNT(*) AS views
+         FROM analytics_page_views
+        WHERE path = ?
+          AND (is_owner IS NULL OR is_owner = 0)
+          AND created_at >= ? AND created_at < ?
+          AND (status_code IS NULL OR (status_code >= 200 AND status_code < 300) OR status_code = 304)
+          AND session_id IS NOT NULL
+        GROUP BY session_id`,
+    )
+    .all(path, toSqliteUtc(from), toSqliteUtc(to)) as Array<{ session_id: string; client_class: string | null; views: number }>;
+  let human = 0;
+  for (const s of sessions) {
+    if (storedClientClass(s.session_id, s.client_class) === "human") human += s.views;
+  }
+  return human;
+}
+
+interface GardssalgV4MeasurementRow {
+  slug: string | null;
+  provider_id: string;
+  sent_at: string;
+  arm: string | null;
+  template: string;
+  window_complete: boolean;
+  views_profile_72h: number | null;
+  views_eier_72h: number | null;
+  claim_link_requested: boolean;
+  claimed: boolean;
+  replied: boolean;
+  unsubscribed: boolean;
+}
+
+export function computeGardssalgV4Measurement(
+  expDb: ReturnType<typeof getExpDb>,
+  rfbDb: ReturnType<typeof getRfbDb>,
+  opts: { days: number; now?: Date },
+) {
+  const now = opts.now ?? new Date();
+  const cutoff = new Date(now.getTime() - opts.days * 24 * 60 * 60 * 1000);
+  // LIKE (not json_extract): raw_metadata may hold malformed JSON on old rows.
+  const msgs = rfbDb
+    .prepare(
+      `SELECT sent_at, to_emails, raw_metadata FROM crm_messages
+        WHERE direction = 'out' AND raw_metadata LIKE '%"template"%personal-v4%' AND datetime(sent_at) >= datetime(?)
+        ORDER BY sent_at ASC, rowid ASC`,
+    )
+    .all(cutoff.toISOString()) as Array<{ sent_at: string; to_emails: string | null; raw_metadata: string | null }>;
+
+  const providerStmt = expDb.prepare(`SELECT slug, claimed_at FROM experience_providers WHERE id = ?`);
+  const claimStmt = expDb.prepare(
+    `SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ? AND is_test = 0 AND created_at >= ?`,
+  );
+  // Two statements instead of one OR: thread_id is indexed (idx_crm_messages_thread);
+  // from_email has no index on crm_messages, so that lookup is a scan, run once per
+  // send (a handful of v4 sends per week). datetime() normalises ISO ('T…Z') and
+  // space-format timestamps so same-day replies compare correctly.
+  const replyByThreadStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND thread_id = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const replyByAddressStmt = rfbDb.prepare(
+    `SELECT id, body_text FROM crm_messages
+      WHERE direction = 'in' AND LOWER(from_email) = ?
+        AND datetime(COALESCE(sent_at, received_at)) >= datetime(?)`,
+  );
+  const unsubStmt = rfbDb.prepare(
+    `SELECT COUNT(*) AS n FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND bounce_type = 'unsubscribe' AND datetime(bounced_at) >= datetime(?)`,
+  );
+
+  const sends: GardssalgV4MeasurementRow[] = [];
+  for (const m of msgs) {
+    let meta: Record<string, unknown> = {};
+    try { meta = JSON.parse(m.raw_metadata || "{}"); } catch { /* skipped below */ }
+    const template = typeof meta.template === "string" ? meta.template : null;
+    const providerId = typeof meta.provider_id === "string" ? meta.provider_id : null;
+    if ((template !== "personal-v4" && template !== "personal-v4-followup") || !providerId) continue;
+    const provider = providerStmt.get(providerId) as { slug: string | null; claimed_at: string | null } | undefined;
+    const slug = provider?.slug ?? null;
+    const sentAt = new Date(m.sent_at);
+    const windowEnd = new Date(sentAt.getTime() + GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS * 60 * 60 * 1000);
+    const sinceSql = toSqliteUtc(sentAt);
+    let recipient = "";
+    try { recipient = String((JSON.parse(m.to_emails || "[]") as unknown[])[0] ?? "").trim().toLowerCase(); } catch { /* none */ }
+
+    const replyRows = [
+      ...(replyByThreadStmt.all(gardssalgOutreachThreadId(providerId), m.sent_at) as Array<{ id: string; body_text: string | null }>),
+      ...(recipient ? (replyByAddressStmt.all(recipient, m.sent_at) as Array<{ id: string; body_text: string | null }>) : []),
+    ];
+    const replies = replyRows.filter((r, i) => replyRows.findIndex((x) => x.id === r.id) === i);
+    const fjernReply = replies.some((r) => /\bfjern\b/i.test(r.body_text ?? ""));
+    const unsubscribed = fjernReply || (recipient !== "" && (unsubStmt.get(recipient, m.sent_at) as { n: number }).n > 0);
+
+    sends.push({
+      slug,
+      provider_id: providerId,
+      sent_at: m.sent_at,
+      arm: typeof meta.subject_arm === "string" ? meta.subject_arm : null,
+      template,
+      window_complete: windowEnd.getTime() <= now.getTime(),
+      views_profile_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/produsent/${slug}`, sentAt, windowEnd) : null,
+      views_eier_72h: slug ? countGardssalgHumanViews(rfbDb, `/kategori/gardssalg/eier/${slug}`, sentAt, windowEnd) : null,
+      claim_link_requested: (claimStmt.get(providerId, sinceSql) as { n: number }).n > 0,
+      claimed: !!provider?.claimed_at,
+      replied: replies.length > 0,
+      unsubscribed,
+    });
+  }
+
+  const summarise = (t: string) => {
+    const rows = sends.filter((s) => s.template === t);
+    return {
+      sends: rows.length,
+      replied: rows.filter((s) => s.replied).length,
+      unsubscribed: rows.filter((s) => s.unsubscribed).length,
+      claim_link_requested: rows.filter((s) => s.claim_link_requested).length,
+      claimed: rows.filter((s) => s.claimed).length,
+      with_views_72h: rows.filter((s) => (s.views_profile_72h ?? 0) + (s.views_eier_72h ?? 0) > 0).length,
+    };
+  };
+  return {
+    success: true,
+    window_hours: GARDSSALG_V4_MEASUREMENT_WINDOW_HOURS,
+    days: opts.days,
+    summary: { first: summarise("personal-v4"), followup: summarise("personal-v4-followup"), total_sends: sends.length },
+    sends,
+  };
+}
+
+router.get("/admin/gardssalg-outreach-v4-measurement", requireAdmin, (req: Request, res: Response) => {
+  const raw = Number(req.query.days);
+  const days = Number.isFinite(raw) && raw >= 1
+    ? Math.min(Math.floor(raw), GARDSSALG_V4_MEASUREMENT_MAX_DAYS)
+    : GARDSSALG_V4_MEASUREMENT_DEFAULT_DAYS;
+  try {
+    res.json(computeGardssalgV4Measurement(getExpDb("experiences"), getRfbDb(), { days }));
+  } catch (err) {
+    console.error("[gardssalg-outreach-v4-measurement] failed:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET  /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
 // ─── POST /api/opplevelser/admin/gardssalg-outreach-size-gate (admin) ──────
 //
@@ -21049,6 +21325,13 @@ const GARDSSALG_OUTREACH_BOUNCE_LOOKBACK_HOURS = 48;
 // choice, same spirit as GARDSSALG_AUTOSVAR_SCAN_MAX_LIMIT above.
 const GARDSSALG_AUTOSVAR_APPLY_DAILY_BATCH_SIZE = 20;
 
+/** Send days of the cron job (weekday in Europe/Oslo). */
+export const GARDSSALG_OUTREACH_SEND_WEEKDAYS: readonly string[] = ["Tue", "Thu"];
+
+function osloWeekdayShort(d: Date): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Oslo", weekday: "short" }).format(d);
+}
+
 /** Pure scheduling guard, same shape as analytics-service's shouldRunAutoPrune. */
 export function shouldRunGardssalgOutreachDaily(opts: {
   now: Date;
@@ -21059,6 +21342,11 @@ export function shouldRunGardssalgOutreachDaily(opts: {
   const windowHourUtc = opts.windowHourUtc ?? GARDSSALG_OUTREACH_DAILY_WINDOW_HOUR_UTC;
   const minHoursBetween = opts.minHoursBetween ?? 20;
   if (opts.now.getUTCHours() !== windowHourUtc) return false;
+  // dev-request 2026-10-22-opplevagent-utsending-v4 (endring 8): cron sends only
+  // on Tuesday and Thursday, by the weekday in Europe/Oslo (08Z is 09/10 local,
+  // so the Oslo date equals the UTC date; going through Intl keeps it right
+  // across the 25.10.2026 switch to winter time). Manual admin runs bypass this.
+  if (!GARDSSALG_OUTREACH_SEND_WEEKDAYS.includes(osloWeekdayShort(opts.now))) return false;
   if (opts.lastRunAt) {
     const deltaMs = opts.now.getTime() - opts.lastRunAt.getTime();
     if (deltaMs < minHoursBetween * 3600_000) return false;
@@ -21193,7 +21481,7 @@ let gardssalgOutreachDailyApplyInFlight = false;
 /**
  * The daily send. `apply: false` is a full dry run (guards evaluated, list
  * computed, nothing written, no envelope). `apply: true` sends up to
- * (daily_cap − sent today) emails with the reviewed `personal` template and
+ * (daily_cap − sent today) emails (v4 texts E/F, dev-request 2026-10-22-opplevagent-utsending-v4) and
  * records a run envelope whatever the outcome. Throws only if the selection
  * itself fails (a DB error) — per-provider send failures are rows, not
  * exceptions, so an error on provider 3 never loses providers 1–2.
@@ -21344,6 +21632,16 @@ async function runGardssalgOutreachDailyOnce(
         (c) => c.touch === "second" && sentIds.includes(c.provider_id),
       ).length;
       const firstTouchSent = sentIds.length - secondTouchSent;
+      // dev-request 2026-10-22-opplevagent-utsending-v4 (AC7): which template
+      // (and subject arm) each send used, so ledger and CRM tell old from new.
+      const sentRows = results.filter((r) => r.status === "sent");
+      const templatesSent = Array.from(new Set(sentRows.map((r) => r.template).filter((t): t is GardssalgOutreachTemplate => !!t)));
+      const templateLabel = templatesSent.length === 0 ? "personal-v4" : templatesSent.length === 1 ? templatesSent[0] : "mixed";
+      const sendsMeta = sentRows.map((r) => ({
+        provider_id: r.provider_id,
+        template: r.template ?? null,
+        subject_arm: r.subject_arm ?? null,
+      }));
       // Incident 2026-09-27/28: a stopped run is never `completed`, even with
       // no error row (a delivered send whose sent_log confirm failed) — a
       // routine that reads only the status must notice. Clean runs: unchanged.
@@ -21352,7 +21650,7 @@ async function runGardssalgOutreachDailyOnce(
       const notes =
         (report.skipped_reason ? `skipped: ${report.skipped_reason}. ` : "") +
         `sent=${report.summary.sent} errors=${report.summary.error} budget=${report.budget} ` +
-        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=personal` +
+        `daily_cap=${report.daily_cap} sent_today_before=${report.sent_today_before} template=${templateLabel}` +
         // Incident 2026-09-27/28 — only on a run that hit a sent_log write
         // failure or a stop, so a clean run's notes are byte-identical to before.
         (report.log_not_recorded > 0 ? ` log_not_recorded=${report.log_not_recorded}` : "") +
@@ -21376,7 +21674,13 @@ async function runGardssalgOutreachDailyOnce(
             {
               type: "emails_sent",
               value: report.summary.sent,
-              meta: { lane: "gardssalg-outreach", table: "experience_outreach_sent_log", template: "personal", provider_ids: sentIds },
+              meta: {
+                lane: "gardssalg-outreach",
+                table: "experience_outreach_sent_log",
+                template: templateLabel,
+                sends: sendsMeta,
+                provider_ids: sentIds,
+              },
             },
             { type: "custom", value: firstTouchSent, meta: { kind: "gardssalg_outreach_first_touch_sent" } },
             { type: "custom", value: secondTouchSent, meta: { kind: "gardssalg_outreach_second_touch_sent" } },
@@ -21503,6 +21807,10 @@ async function runGardssalgOutreachDailyOnce(
     recipient_email: e.epost,
     touch: (hasPriorSend.get(e.provider_id) ? "second" : "first") as "first" | "second",
   }));
+  // dev-request 2026-10-22-opplevagent-utsending-v4: text E for a first touch,
+  // text F for a second.
+  const templateFor = (providerId: string): GardssalgOutreachTemplate =>
+    candidates.find((c) => c.provider_id === providerId)?.touch === "second" ? "personal-v4-followup" : "personal-v4";
 
   const results: GardssalgOutreachSendResultRow[] = [];
   // Incident 2026-09-27/28: stop at the first row that stops the batch, same
@@ -21545,7 +21853,7 @@ async function runGardssalgOutreachDailyOnce(
       continue;
     }
     const row = await sendGardssalgOutreachToEligibleProvider(expDb, elig, {
-      template: "personal",
+      template: templateFor(elig.provider_id),
       isTest: false,
       source: "gardssalg-outreach-daily-run",
     });
@@ -31315,7 +31623,7 @@ router.post("/book", async (req: Request, res: Response) => {
       res.status(400).json(providerQueryMissingPayload());
       return;
     }
-    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery);
+    const resolution = resolveGardssalgProviderByQuery(rawProviderQuery, { surface: "rest" });
     if (resolution.kind === "none") {
       res.status(200).json(providerNotFoundPayload(rawProviderQuery));
       return;

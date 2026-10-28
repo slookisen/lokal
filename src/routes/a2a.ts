@@ -29,7 +29,19 @@ import { a2aMessageData, capA2aData } from "../utils/a2a-message";
 import { capFreeText } from "../utils/free-text";
 import { logInternalError, rpcInternalErrorReply } from "../utils/internal-error";
 import { searchCountable } from "../services/search-tracking";
+import { publicAgentInfo, publicFieldChoices } from "../owner-features/enforce";
 import { readSearchText, geocodeSearchPlace, discoveryQueryOf, outsideNorwayText, noProductMatchText } from "../services/rfb-search-reading";
+import {
+  isOrderAgentActionsEnabled,
+  orderIdForTaskRequest,
+  getOrderTask,
+  cancelOrderTask,
+  managePickupOrderSkill,
+  rfbJsonRpcMethods,
+  A2A_TASK_NOT_FOUND,
+  A2A_TASK_NOT_CANCELABLE,
+  type OrderTaskRpcResult,
+} from "../services/order-a2a-task";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -159,13 +171,15 @@ router.get("/a2a", (_req: Request, res: Response) => {
       },
       security: [],
       interfaces: [
-        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"], description: "A2A JSON-RPC 2.0 endpoint" },
+        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: rfbJsonRpcMethods(), description: "A2A JSON-RPC 2.0 endpoint" },
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
       ],
       skills: [
         { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "organic", "farm direct", "Norway"], examples: ["Find organic farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
         { id: "build-shopping-cart", name: "Build a shopping cart", description: `Cart and order flow is available via the MCP server (POST /mcp): find offers with lokal_find_offers, then lokal_cart_create, lokal_cart_add_item, lokal_cart_view and lokal_cart_submit (${isPaymentsEnabled() ? "pickup order; producers that take prepayment return a Stripe payment link the buyer approves themselves, the others are paid at pickup" : "pickup order, no payment"}). Not available through message/send on /a2a.`, tags: ["cart", "order", "local food", "pickup", "mcp"], examples: ["MCP tools/call lokal_find_offers {items: [\"potet\"], near: \"Oslo\"}", "MCP tools/call lokal_cart_create"] },
+        // Fase B3 (mine ordrer): only with ORDER_AGENT_ACTIONS_ENABLED on; off, the card is unchanged.
+        ...(isOrderAgentActionsEnabled() ? [managePickupOrderSkill()] : []),
       ],
       "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
     };
@@ -229,6 +243,18 @@ router.post("/a2a", (req: Request, res: Response) => {
       case "tasks/list":
       case "ListTasks": // A2A v1.0
         handleTasksList(params, id, res);
+        break;
+      case "tasks/cancel":
+      case "CancelTask": // A2A v1.0
+        // Fase B3: only the buyer's pickup order can be cancelled, and only
+        // with ORDER_AGENT_ACTIONS_ENABLED on. Off: "Method not found" as before.
+        if (!isOrderAgentActionsEnabled()) {
+          res.json({ jsonrpc: "2.0", error: { code: -32601, message: `Method not found: ${method}` }, id });
+          break;
+        }
+        handleTasksCancel(params, id, res).catch((err) => {
+          if (!res.headersSent) res.json(rpcInternalError(id, "POST /a2a tasks/cancel", err));
+        });
         break;
       case "agent/authenticatedExtendedCard":
         handleExtendedCard(params, id, req, res);
@@ -594,10 +620,32 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
 // Check the status of a previously submitted task.
 // Part of the A2A task lifecycle (Gap 7 fix).
 
-function handleTasksGet(params: any, id: any, res: Response) {
+function taskIdOf(params: any): any {
   // v1.0 GetTask may address the task by resource name "tasks/<id>".
-  const taskId = params?.taskId || params?.id
+  return params?.taskId || params?.id
     || (typeof params?.name === "string" ? params.name.replace(/^tasks\//, "") : undefined);
+}
+
+function marketplaceTaskExists(taskId: string): boolean {
+  return !!marketplaceRegistry.getTask(taskId);
+}
+
+function sendOrderTaskReply(r: OrderTaskRpcResult, id: any, res: Response): void {
+  res.json("error" in r ? { jsonrpc: "2.0", error: r.error, id } : { jsonrpc: "2.0", result: r.result, id });
+}
+
+function handleTasksGet(params: any, id: any, res: Response) {
+  const taskId = taskIdOf(params);
+  // Fase B3: with ORDER_AGENT_ACTIONS_ENABLED on, an order id ("order:<id>",
+  // or the bare id with metadata.buyer_ref and no marketplace task of that id)
+  // is the buyer's pickup order. Off, or any other id: unchanged.
+  if (typeof taskId === "string" && taskId && isOrderAgentActionsEnabled()) {
+    const orderId = orderIdForTaskRequest(taskId, params, marketplaceTaskExists);
+    if (orderId !== null) {
+      sendOrderTaskReply(getOrderTask(orderId, params), id, res);
+      return;
+    }
+  }
   if (!taskId) {
     res.json({
       jsonrpc: "2.0",
@@ -622,6 +670,28 @@ function handleTasksGet(params: any, id: any, res: Response) {
     result: { task: toA2ATask(task) },
     id,
   });
+}
+
+// ─── tasks/cancel (Fase B3) ──────────────────────────────────
+// Only reached with ORDER_AGENT_ACTIONS_ENABLED on. A pickup order: the
+// buyer's withdraw / cancel through the shared order-action layer (channel
+// 'a2a'). A marketplace task finishes inside message/send, so it cannot be
+// cancelled.
+
+async function handleTasksCancel(params: any, id: any, res: Response) {
+  const taskId = taskIdOf(params);
+  if (typeof taskId !== "string" || !taskId) {
+    res.json({ jsonrpc: "2.0", error: { code: -32602, message: "Invalid params: 'taskId' required" }, id });
+    return;
+  }
+  const orderId = orderIdForTaskRequest(taskId, params, marketplaceTaskExists);
+  if (orderId === null) {
+    res.json(marketplaceTaskExists(taskId)
+      ? { jsonrpc: "2.0", error: { code: A2A_TASK_NOT_CANCELABLE, message: `Task cannot be canceled: ${taskId}` }, id }
+      : { jsonrpc: "2.0", error: { code: A2A_TASK_NOT_FOUND, message: `Task not found: ${taskId}` }, id });
+    return;
+  }
+  sendOrderTaskReply(await cancelOrderTask(orderId, params), id, res);
 }
 
 // ─── tasks/list ──────────────────────────────────────────────
@@ -698,7 +768,8 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
         toA2ADataArtifact({
           artifactId: `info-${agentId}`,
           name: "agent-info",
-          data: info,
+          // S2c-1: without what the owner hid (not enforced = as before).
+          data: publicAgentInfo(info, publicFieldChoices(agentId)),
         }),
       ],
     },

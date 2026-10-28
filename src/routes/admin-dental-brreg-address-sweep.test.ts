@@ -37,6 +37,14 @@
  *       sets postnummer/poststed from the Brreg address with the stored
  *       street and clears lat/lng; rows whose street is not from a Brreg
  *       write, consistent rows and a street Brreg no longer has are handled.
+ *   (i) correct_mixed runde 5: rule 1 first -- an active sub-unit address
+ *       that is not the stored street's -> flag_sub_unit_preferred, and
+ *       ambiguous sub-units -> flag_ambiguous_sub_units, neither written even
+ *       on apply; a sub-unit that IS the stored street is corrected from it;
+ *       fylke follows the new postnummer (fylke_change, fylke_changes) and a
+ *       second apply corrects nothing; an unresolvable postnummer leaves fylke
+ *       alone and flags fylke_not_resolved; org_form in every result; a
+ *       non-clinic catalog_class row is never reported or corrected.
  *
  * Two ways to run:
  *   1. Standalone: npx tsx src/routes/admin-dental-brreg-address-sweep.test.ts
@@ -266,10 +274,11 @@ export function runAdminDentalBrregAddressSweepTests(
       row({ id: "cm-sweep", org_nr: "500000002" });
       enhet("500000002", "AS", { forretningsadresse: no("Raceveien 1", "0300", "OSLO") });
 
-      const POSTSTED_TEXTS = ["BYGD", "OSLO", "Oslo", "BERGEN", "TRONDHEIM", "STAVANGER", "STOCKHOLM"];
+      const POSTSTED_TEXTS = ["BYGD", "OSLO", "Oslo", "BERGEN", "TRONDHEIM", "STAVANGER", "STOCKHOLM", "TROMSØ", "SANDVIKA"];
       const ADDRESS_TEXTS = [
         "Heimveien", "Storgata", "Bryggen", "Kontorbygg", "Fjordveien", "Postboks", "Postgata", "Hjemmegata", "Klinikkgata",
         "Karl Johans", "Torget", "Drottninggatan", "Kontorveien", "Klinikkveien", "Avdeling", "Raceveien", "Elvegata", "Kungsgatan", "Norgegata", "Postvei", "Bryggeveien", "Christiania", "Lukkegata", "Flyttegata",
+        "Heimgata", "Praksisveien", "Kontorgata", "Filialveien", "Sandviksveien", "Ukjentveien", "Holdingveien", "Samegata",
       ];
       const post = (body: any, key: string | false = testKey) =>
         callRoute(router, { headers: key === false ? {} : { "x-admin-key": key }, body });
@@ -426,8 +435,37 @@ export function runAdminDentalBrregAddressSweepTests(
         postadresse: no("Bryggeveien 2", "0155", "OSLO"),
       });
 
+      // (i) runde 5
+      // A: ENK whose street came from the forretningsadresse, while an active
+      // sub-unit (the practice) is in Tromsø, where the stored postnummer is.
+      row({ id: "mix-sub-pref", org_nr: "600000030", adresse: "Heimgata 5", postnummer: "9007", poststed: "TROMSØ", field_provenance: brregProv("Heimgata 5") });
+      enhet("600000030", "ENK", { forretningsadresse: no("Heimgata 5", "7066", "TRONDHEIM") });
+      underenheter["600000030"] = [{ organisasjonsnummer: "900000030", beliggenhetsadresse: no("Praksisveien 2", "9007", "TROMSØ") }];
+      // B: two active sub-unit addresses, the stored postnummer narrows neither.
+      row({ id: "mix-sub-ambig", org_nr: "600000031", adresse: "Kontorgata 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Kontorgata 1") });
+      enhet("600000031", "AS", { forretningsadresse: no("Kontorgata 1", "0155", "OSLO") });
+      underenheter["600000031"] = [
+        { organisasjonsnummer: "900000031", beliggenhetsadresse: no("Filialveien 1", "0252", "OSLO") },
+        { organisasjonsnummer: "900000032", beliggenhetsadresse: no("Filialveien 2", "0253", "OSLO") },
+      ];
+      // The chosen sub-unit is the stored street's own sub-object: corrected from it.
+      row({ id: "mix-sub-same", org_nr: "600000033", adresse: "Samegata 3", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Samegata 3", "beliggenhetsadresse") });
+      enhet("600000033", "AS", { forretningsadresse: no("Kontorgata 9", "0160", "OSLO") });
+      underenheter["600000033"] = [{ organisasjonsnummer: "900000033", beliggenhetsadresse: no("Samegata 3", "0157", "OSLO") }];
+      // C: clean mixed row whose right postnummer is in another fylke.
+      row({ id: "mix-fylke", org_nr: "600000034", adresse: "Sandviksveien 3", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Sandviksveien 3") });
+      enhet("600000034", "AS", { forretningsadresse: no("Sandviksveien 3", "1337", "SANDVIKA") });
+      // Brreg postnummer the register does not know: fylke left alone, flagged.
+      row({ id: "mix-fylke-unres", org_nr: "600000035", adresse: "Ukjentveien 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Ukjentveien 1") });
+      enhet("600000035", "AS", { forretningsadresse: no("Ukjentveien 1", "9999", "OSLO") });
+      // Not a clinic (catalog_class outside DENTAL_CLINIC_CLASS_SQL).
+      row({ id: "mix-holding", org_nr: "600000036", adresse: "Holdingveien 1", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Holdingveien 1") });
+      enhet("600000036", "AS", { forretningsadresse: no("Holdingveien 1", "0155", "OSLO") });
+
       // Rows the sweep wrote carry the stamp; the Places-shaped and other rows below do not match it.
-      db.prepare("UPDATE dental_agents SET brreg_address_attempted_at = ? WHERE id LIKE 'mix-%'").run(SWEEP_AT);
+      db.prepare("UPDATE dental_agents SET brreg_address_attempted_at = ?, fylke = 'Oslo' WHERE id LIKE 'mix-%'").run(SWEEP_AT);
+      db.prepare("UPDATE dental_agents SET fylke = 'Troms' WHERE id = 'mix-sub-pref'").run();
+      db.prepare("UPDATE dental_agents SET catalog_class = 'holding' WHERE id = 'mix-holding'").run();
       row({ id: "mix-places", org_nr: "600000020", adresse: "Elvegata 20", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Elvegata 20", "forretningsadresse", null) });
       enhet("600000020", "AS", { forretningsadresse: no("Elvegata 20", "0155", "OSLO") });
       row({ id: "mix-stale-stamp", org_nr: "600000021", adresse: "Elvegata 21", postnummer: "0150", poststed: "OSLO", field_provenance: brregProv("Elvegata 21", "forretningsadresse", "2026-09-01T08:00:00.000Z") });
@@ -452,7 +490,8 @@ export function runAdminDentalBrregAddressSweepTests(
       assertTrue(!cd["mix-not-brreg"], "h7: street not from a Brreg write is not reported");
       assertTrue(cdry.body.data.not_from_brreg_write >= 1, "h8: counted as not_from_brreg_write");
       assertTrue(!cd["as-ok"] && cdry.body.data.consistent >= 1, "h9: rows the sweep wrote whole are consistent, not reported");
-      const cdJson = JSON.stringify(cdry.body.data.results);
+      // fylke names in fylke_change are allowed; nothing else may name a place.
+      const cdJson = JSON.stringify(cdry.body.data.results.map(({ fylke_change, ...r }: any) => r));
       assertTrue(ADDRESS_TEXTS.every((t) => !cdJson.includes(t)) && !cdJson.includes("Gammelgata"), "h10: correction results have no address");
       assertEq([get("mix-1").postnummer, get("mix-1").lat], ["0150", 59.9], "h11: dry run writes nothing");
       assertTrue(POSTSTED_TEXTS.every((t) => !cdJson.includes(t)) && !cdJson.includes("Navnesen") && !cdJson.includes("Tandv"), "h11b: correction results have no poststed or name");
@@ -461,6 +500,20 @@ export function runAdminDentalBrregAddressSweepTests(
       for (const [id, outcome] of [["mix-avvikling", "under_liquidation"], ["mix-konkurs", "bankrupt"], ["mix-slettet", "deleted"]] as const) {
         assertEq([cd[id]?.outcome, cd[id]?.flagged], [outcome, true], `h11e: ${id} -> ${outcome}, flagged`);
       }
+
+      // (i) dry run
+      assertEq([cd["mix-sub-pref"]?.outcome, cd["mix-sub-pref"]?.flagged, cd["mix-sub-pref"]?.fields], ["flag_sub_unit_preferred", true, []], "i1: active sub-unit preferred over the stored street's address -> flag, no fields");
+      assertEq([cd["mix-sub-ambig"]?.outcome, cd["mix-sub-ambig"]?.flagged, cd["mix-sub-ambig"]?.fields], ["flag_ambiguous_sub_units", true, []], "i2: ambiguous sub-units -> flag, no fields");
+      assertEq([cdry.body.data.flag_sub_unit_preferred, cdry.body.data.flag_ambiguous_sub_units], [1, 1], "i3: flag counts in the dry-run summary");
+      assertEq([cd["mix-sub-same"]?.outcome, cd["mix-sub-same"]?.address_source], ["would_correct", "beliggenhetsadresse"], "i4: chosen sub-unit is the stored street's -> would_correct from it");
+      assertEq([cd["mix-fylke"]?.outcome, cd["mix-fylke"]?.fields, cd["mix-fylke"]?.fylke_change], ["would_correct", ["postnummer", "poststed", "fylke", "lat", "lng"], { from: "Oslo", to: "Akershus" }], "i5: dry run reports the fylke change");
+      assertEq(cdry.body.data.fylke_changes, 1, "i6: fylke_changes counted in the dry run");
+      assertEq(get("mix-fylke").fylke, "Oslo", "i7: dry run does not write fylke");
+      assertEq([cd["mix-fylke-unres"]?.outcome, cd["mix-fylke-unres"]?.flags, cd["mix-fylke-unres"]?.flagged, "fylke_change" in (cd["mix-fylke-unres"] ?? {})], ["would_correct", ["fylke_not_resolved"], true, false], "i8: unresolvable postnummer -> fylke_not_resolved flag, no fylke change");
+      assertEq([cd["mix-sub-pref"]?.org_form, cd["mix-fylke"]?.org_form], ["ENK", "AS"], "i9: org_form in results");
+      assertTrue(cdry.body.data.results.every((x: any) => "org_form" in x), "i10: every correction result has org_form");
+      assertTrue(cdry.body.data.results.every((x: any) => !x.fylke_change || JSON.stringify(Object.keys(x.fylke_change)) === '["from","to"]'), "i11: fylke_change carries only from/to");
+      assertTrue(!cd["mix-holding"], "i12: non-clinic catalog_class row not reported");
 
       routeMod.__setBrregAddressSweepBeforeWriteForTesting((id) => {
         if (id === "mix-cm") db.prepare("UPDATE dental_agents SET poststed = 'Annet' WHERE id = 'mix-cm'").run();
@@ -497,6 +550,24 @@ export function runAdminDentalBrregAddressSweepTests(
         assertTrue(!cd[id] && !ca[id], `h33: ${id} is never reported or corrected`);
         assertEq(get(id).postnummer, "0150", `h34: ${id} postnummer untouched by apply`);
       }
+
+      // (i) apply
+      assertEq([ca["mix-sub-pref"]?.outcome, get("mix-sub-pref").postnummer, get("mix-sub-pref").poststed, get("mix-sub-pref").fylke], ["flag_sub_unit_preferred", "9007", "TROMSØ", "Troms"], "i13: sub-unit preferred -> nothing written on apply");
+      assertEq([ca["mix-sub-ambig"]?.outcome, get("mix-sub-ambig").postnummer], ["flag_ambiguous_sub_units", "0150"], "i14: ambiguous sub-units -> nothing written on apply");
+      assertEq([capply.body.data.flag_sub_unit_preferred, capply.body.data.flag_ambiguous_sub_units], [1, 1], "i15: flag counts in the apply summary");
+      assertEq([ca["mix-sub-same"]?.outcome, get("mix-sub-same").postnummer], ["corrected", "0157"], "i16: postnummer from the stored street's own sub-unit");
+      const mf = get("mix-fylke");
+      assertEq([ca["mix-fylke"]?.outcome, mf.postnummer, mf.poststed, mf.fylke, mf.lat], ["corrected", "1337", "SANDVIKA", "Akershus", null], "i17: postnummer, poststed and fylke corrected together");
+      assertEq([ca["mix-fylke"]?.fylke_change, capply.body.data.fylke_changes], [{ from: "Oslo", to: "Akershus" }, 1], "i18: fylke_changes reported on apply");
+      assertEq([lastProv("mix-fylke", "fylke")?.value, lastProv("mix-fylke", "fylke")?.derived_from_postnummer], ["Akershus", "1337"], "i19: fylke provenance names the postnummer");
+      assertEq([ca["mix-fylke-unres"]?.outcome, get("mix-fylke-unres").postnummer, get("mix-fylke-unres").fylke, ca["mix-fylke-unres"]?.flags], ["corrected", "9999", "Oslo", ["fylke_not_resolved"]], "i20: unresolvable postnummer -> fylke untouched, flagged");
+      assertEq([!ca["mix-holding"], get("mix-holding").postnummer], [true, "0150"], "i21: non-clinic catalog_class row not corrected");
+      // Second apply: mix-cm (left mixed by the concurrent writer above) is
+      // taken out of the pool so the run shows idempotence on its own.
+      db.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = 'mix-cm'").run();
+      const capply2 = await post({ mode: "correct_mixed", apply: true, limit: 100 });
+      assertEq([capply2.body.data.corrected, capply2.body.data.fylke_changes], [0, 0], "i22: second apply corrects nothing (idempotent)");
+      assertTrue(!byId(capply2)["mix-fylke"] && get("mix-fylke").fylke === "Akershus", "i23: corrected row is consistent on the second run");
     } finally {
       try {
         routeMod?.__setBrregAddressSweepFetchForTesting();

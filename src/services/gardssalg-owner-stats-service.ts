@@ -35,14 +35,23 @@
 // LIKE marker lists counted bingbot/curl/scanners as people and Googlebot as
 // AI, every status, over 90 days, with a page_view_daily top-up.
 //
+// Since statistikk S2d (dev-request 2026-10-22-statistikk-samme-tall-12-mnd)
+// «Med i AI-søk» covers the last 12 months with the public tile's label
+// (aiDeliveriesYearPeriodLabel: «siste 12 måneder» / «siden <dato>»). The two
+// page-view numbers stay at the raw window (60 days): a gårdssalg page view
+// is never written to analytics_agent_views (RFB producers only), so it has
+// no stored per-profile daily sums to reach further back.
+//
 // Reads analytics_page_views from the RFB/shared lokal.db (via
 // src/database/init.ts's getDb(), NOT db-factory's experiences.db handle) —
 // same cross-DB read oa-home-counters.ts's getTrafficStats() already does.
 // Read-only; never writes.
 
 import { getDb as getRfbDb } from "../database/init";
-import { AI_DELIVERY_WINDOW_DAYS, computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
+import { computeAiDeliveries, type AiDeliveries } from "./profile-ai-deliveries-compute";
 import { cutoffIsoFor, ownerStatsWindowDays, readPathViewGroups } from "./owner-stats-service";
+import { aiDeliveriesYearPeriodLabel } from "./profile-year-compute";
+import { TRAFFIC_YEAR_DAYS } from "./traffic-year-compute";
 
 export interface GardssalgOwnerStats {
   windowDays: number;
@@ -54,11 +63,14 @@ export interface GardssalgOwnerStats {
   /** Same value as aiSearchViews, kept for older clients of this endpoint. */
   aiBotViews: number;
   /**
-   * «Med i AI-svar»: times the producer was sent to an AI assistant (list and
-   * profile pages, MCP, A2A), last AI_DELIVERY_WINDOW_DAYS days and since the
-   * counting started, per AI and per channel. Present when the provider id is given.
+   * «Med i AI-søk»: times the producer was among the results an AI assistant
+   * fetched (list and profile pages, MCP, A2A), per AI and per channel.
+   * `window` is the last 12 months (TRAFFIC_YEAR_DAYS since statistikk S2d;
+   * it was 60 days) with its label `windowLabel` («siste 12 måneder» /
+   * «siden <dato>», the public tile's), `allTime` since the counting started.
+   * Present when the provider id is given.
    */
-  aiDeliveries?: { window: AiDeliveries; allTime: AiDeliveries };
+  aiDeliveries?: { window: AiDeliveries; allTime: AiDeliveries; windowLabel: string };
   /** Honest, explicit acknowledgment of what this tab does NOT show — the
    * portal UI renders this list so an owner never wonders why a number is
    * "missing" (never silently omitted). */
@@ -72,10 +84,20 @@ const NOT_AVAILABLE = [
   "Søk som traff profilen din",
 ];
 
-export function getGardssalgOwnerStats(path: string, providerId?: string): GardssalgOwnerStats {
+function gardssalgAiDeliveries(providerId: string, nowMs: number): NonNullable<GardssalgOwnerStats["aiDeliveries"]> {
+  const db = getRfbDb();
+  const window = computeAiDeliveries(db, "experiences", providerId, TRAFFIC_YEAR_DAYS, nowMs);
+  return {
+    window,
+    allTime: computeAiDeliveries(db, "experiences", providerId, null, nowMs),
+    windowLabel: aiDeliveriesYearPeriodLabel(window.countingSince, nowMs, "nb"),
+  };
+}
+
+export function getGardssalgOwnerStats(path: string, providerId?: string, nowMs: number = Date.now()): GardssalgOwnerStats {
   const db = getRfbDb();
   const windowDays = ownerStatsWindowDays();
-  const cutoffIso = cutoffIsoFor(windowDays);
+  const cutoffIso = cutoffIsoFor(windowDays, nowMs);
   let humanViews = 0;
   let aiSearchViews = 0;
   for (const g of readPathViewGroups(db, path, cutoffIso, { vertical: "experiences" })) {
@@ -88,12 +110,7 @@ export function getGardssalgOwnerStats(path: string, providerId?: string): Gards
     humanViews,
     aiSearchViews,
     aiBotViews: aiSearchViews,
-    ...(providerId ? {
-      aiDeliveries: {
-        window: computeAiDeliveries(db, "experiences", providerId, AI_DELIVERY_WINDOW_DAYS, Date.now()),
-        allTime: computeAiDeliveries(db, "experiences", providerId, null, Date.now()),
-      },
-    } : {}),
+    ...(providerId ? { aiDeliveries: gardssalgAiDeliveries(providerId, nowMs) } : {}),
     notAvailable: NOT_AVAILABLE,
   };
 }

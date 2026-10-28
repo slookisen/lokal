@@ -47,6 +47,7 @@ import { a2aLookupCountable } from "../services/a2a-traffic-classifier";
 import { hashIP } from "../services/analytics-service";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
 import { toDentalA2aClinic } from "../services/dental-clinic-card";
+import { revealEmailFor } from "../services/email-reveal-guard";
 import { a2aMessageData } from "../utils/a2a-message";
 import { capFreeText, capName } from "../utils/free-text";
 import { rpcInternalErrorReply } from "../utils/internal-error";
@@ -460,6 +461,69 @@ export function handleDentalMessageSend(
   }
 }
 
+// ─── E-mail guard (dev-request 2026-09-09-epost-eksponering-skjerming-
+//     mot-masseinnhosting, slice 1: S-A1/S-A3/S-A5) ───────────────────────
+/**
+ * A message/send answer with each clinic's `epost` set to null — what a
+ * clinic without an e-mail has — where `withheld(ids)` says so: the single
+ * clinic (tannlege_info) and every clinic of the search list, which count one
+ * by one against the per-IP limit (services/email-reveal-guard.ts). Only the
+ * clinics that have an e-mail are asked about. `withheld` returns null when
+ * the switch is off: the answer is then returned as it is (same object). The
+ * handler above stays pure (the unit tests and MCP never see the guard).
+ */
+export function withDentalA2aEmailGuard(
+  answer: object,
+  withheld: (idsWithEmail: string[]) => ReadonlySet<string> | null
+): object {
+  const artifacts = (answer as { result?: { artifacts?: unknown } }).result?.artifacts;
+  if (!Array.isArray(artifacts)) return answer;
+  const hasEmail = (c: any): c is { id: string; epost: string } => !!c && typeof c.id === "string" && !!c.epost;
+  const clinicsOf = (a: any): any[] => {
+    const out: any[] = [];
+    for (const part of Array.isArray(a?.parts) ? a.parts : []) {
+      const d = part?.data;
+      if (!d || typeof d !== "object") continue;
+      if (a.name === "dental-clinic") out.push(d);
+      else if (Array.isArray(d.clinics)) out.push(...d.clinics);
+    }
+    return out;
+  };
+  const ids = artifacts.flatMap(clinicsOf).filter(hasEmail).map((c) => c.id);
+  const hidden = withheld(ids);
+  if (hidden === null || hidden.size === 0) return answer;
+  const strip = (c: any) => (hasEmail(c) && hidden.has(c.id) ? { ...c, epost: null } : c);
+  const result = (answer as { result: Record<string, unknown> }).result;
+  return {
+    ...answer,
+    result: {
+      ...result,
+      artifacts: artifacts.map((a: any) => ({
+        ...a,
+        parts: Array.isArray(a?.parts)
+          ? a.parts.map((part: any) => {
+              const d = part?.data;
+              if (!d || typeof d !== "object") return part;
+              if (a.name === "dental-clinic") return { ...part, data: strip(d) };
+              if (Array.isArray(d.clinics)) return { ...part, data: { ...d, clinics: d.clinics.map(strip) } };
+              return part;
+            })
+          : a?.parts,
+      })),
+    },
+  };
+}
+
+/** The guard for one request: null when the switch is off; else the withheld ids, and Cache-Control: private. */
+function dentalA2aEmailWithheld(req: Request, res: Response): (ids: string[]) => ReadonlySet<string> | null {
+  return (ids) => {
+    const allowed = revealEmailFor(req, "dental", ids);
+    if (allowed === null) return null;
+    res.set("Cache-Control", "private");
+    return new Set(ids.filter((id) => !allowed.has(id)));
+  };
+}
+
 // ─── Apply dentalLimiter to /a2a on this router ───────────────
 // See module docstring for why this is done here rather than in index.ts.
 router.use(dentalLimiter);
@@ -490,7 +554,7 @@ router.post("/a2a", (req: Request, res: Response) => {
   try {
     switch (method) {
       case "message/send": {
-        const result = handleDentalMessageSend(params, id);
+        const result = withDentalA2aEmailGuard(handleDentalMessageSend(params, id), dentalA2aEmailWithheld(req, res));
         (res.locals ||= {}).a2aCountable = a2aRequestCountable(req, params, result);
         // «Med i AI-svar»: the clinics in a countable answer, once per profile.
         recordA2aDelivery(req, res, dentalAnswerProfileIds(result), JSON.stringify(params ?? null), "dental");
