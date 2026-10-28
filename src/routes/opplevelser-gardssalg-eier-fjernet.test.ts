@@ -15,6 +15,9 @@
  *   (d) a row hidden via the lever with mode "quality" (no removal evidence)
  *       stays `skjult` and is unhidden normally
  *   (e) summary carries eier_fjernet as its own bucket
+ *   (f) no quality exemption: quality-hidden + "fjern oss" blocklist match
+ *       is still eier_fjernet and guarded
+ *   (g) second-line-verify disqualifies a remove_request row (source (a))
  *
  * Same harness as the other gårdssalg route tests (:memory: DBs, fresh
  * requires, router.handle()).
@@ -249,6 +252,60 @@ export function runOpplevelserGardssalgEierFjernetTests(log = false): Promise<Te
         assertEq(r.body.changed_count, 0, "ef-a2-4: unhide without override changes nothing");
         assertEq(r.body.skipped_owner_removed?.[0]?.id, "ef-rr", "ef-a2-5: skipped_owner_removed");
         assertEq(hiddenFlag("ef-rr"), 1, "ef-a2-6: row stays hidden");
+
+        // AC3: the guard also applies to a dry-run, so the preview matches
+        // what apply would do.
+        const dry = await visibility({ hidden: false, providerIds: ["ef-rr"] });
+        assertEq(dry.body.dry_run, true, "ef-a2-7: dry-run (no apply)");
+        assertEq(dry.body.changed_count, 0, "ef-a2-8: dry-run without override reports no change");
+        assertEq(dry.body.skipped_owner_removed?.[0]?.id, "ef-rr", "ef-a2-9: dry-run reports skipped_owner_removed");
+
+        // The override is strictly boolean true: truthy look-alikes do not
+        // unlock the guard.
+        for (const v of ["true", 1] as const) {
+          const t = await visibility({ hidden: false, providerIds: ["ef-rr"], apply: true, override_owner_removed: v });
+          assertEq(t.body.changed_count, 0, `ef-a2-10-${typeof v}: override_owner_removed=${JSON.stringify(v)} does not unhide`);
+          assertEq(t.body.skipped_owner_removed?.[0]?.id, "ef-rr", `ef-a2-11-${typeof v}: still skipped_owner_removed`);
+          assertEq(hiddenFlag("ef-rr"), 1, `ef-a2-12-${typeof v}: row stays hidden`);
+        }
+      }
+
+      // ── (f) no quality exemption: a quality-hidden row whose org.nr has a
+      //    "fjern oss" blocklist row is still eier_fjernet and guarded. ────
+      {
+        mk("ef-qfo", { org_nr: "977000011" });
+        blocklistSvc.add({ orgNr: "977000011", reason: "manuell (fjern oss)" });
+        const h = await visibility({ hidden: true, providerIds: ["ef-qfo"], mode: "quality", apply: true });
+        assertEq(h.body.changed_count, 1, "ef-f1: quality hide via the lever");
+        assertEq(await tierOf("ef-qfo"), "eier_fjernet", "ef-f2: quality reason does not override the blocklist match");
+        const r = await visibility({ hidden: false, providerIds: ["ef-qfo"], apply: true });
+        assertEq(r.body.changed_count, 0, "ef-f3: unhide without override changes nothing");
+        assertEq(r.body.skipped_owner_removed?.[0]?.id, "ef-qfo", "ef-f4: skipped_owner_removed");
+        assertEq(hiddenFlag("ef-qfo"), 1, "ef-f5: row stays hidden");
+      }
+
+      // ── (g) second-line-verify honours source (a): a remove_request row
+      //    with no blocklist rows is disqualified_terminal / eier_fjernet. ──
+      {
+        const prevFlag = process.env.GS_SECOND_LINE_VERIFICATION_ENABLED;
+        const prevAnthropic = process.env.ANTHROPIC_API_KEY;
+        process.env.GS_SECOND_LINE_VERIFICATION_ENABLED = "true";
+        // No key: if the guard were missed, the judge fails closed offline.
+        delete process.env.ANTHROPIC_API_KEY;
+        try {
+          mk("ef-slv", { org_nr: null, hjemmeside: null, epost: null, fp: "{}" });
+          const h = await visibility({ hidden: true, providerIds: ["ef-slv"], mode: "remove_request", apply: true });
+          assertEq(h.body.blocklist_inserted_total, 0, "ef-g1: no identifiers -> 0 blocklist rows");
+          const r = await callRoute(router, { url: "/admin/gardssalg-second-line-verify", headers: auth, body: { providerIds: ["ef-slv"] } });
+          const item = (r.body.results as any[] | undefined)?.find((x) => x.provider_id === "ef-slv");
+          assertEq(item?.outcome, "disqualified_terminal", "ef-g2: remove_request row -> disqualified_terminal");
+          assertEq(item?.detail, "eier_fjernet", "ef-g3: detail eier_fjernet");
+        } finally {
+          if (prevFlag === undefined) delete process.env.GS_SECOND_LINE_VERIFICATION_ENABLED;
+          else process.env.GS_SECOND_LINE_VERIFICATION_ENABLED = prevFlag;
+          if (prevAnthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
+          else process.env.ANTHROPIC_API_KEY = prevAnthropic;
+        }
       }
     } catch (err: any) {
       failed++;
