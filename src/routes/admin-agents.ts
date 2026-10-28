@@ -2207,7 +2207,9 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
 // already has an owner. Until approved it has no code, no token, no badge
 // and no write access. GET lists oldest first: profile, the claimant's name
 // and address, the reason and the time — at most CLAIM_REVIEW_QUEUE_LIST_MAX
-// entries (knowledge-service.ts); `count` is how many wait in all.
+// entries (knowledge-service.ts); `count` is how many wait in all. Each entry
+// carries `recommendation`, the claim domain rule's advice (dev-request
+// 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste, claim-domain-rule.ts).
 router.get("/claim-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const { total, entries } = knowledgeService.listClaimReviewQueue();

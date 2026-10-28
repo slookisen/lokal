@@ -49447,6 +49447,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste, slice 1:
+// the claim domain rule (P1 independent-website domain match, P2 working
+// domain, P3 free-mail, P4 owner) behind CLAIM_DOMAIN_RULE_ENABLED, the queue
+// row's `recommendation`. Pins getDb() to its own in-memory DB, stubs the
+// e-mail transporter and the HTTPS probe (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-27-rfb-eierkrav-domeneregel: RFB claim domain rule ──");
+  try {
+    const { runRfbClaimDomeneregelTests } = require("../src/routes/rfb-claim-domeneregel.test") as
+      typeof import("../src/routes/rfb-claim-domeneregel.test");
+    const dr = await runRfbClaimDomeneregelTests({ log: false });
+    passed += dr.passed;
+    failed += dr.failed;
+    for (const f of dr.failures) failures.push("rfb-claim-domeneregel: " + f);
+    console.log(`  rfb-claim-domeneregel: ${dr.passed} passed, ${dr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-domeneregel: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {

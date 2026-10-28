@@ -6,6 +6,10 @@ import { isJunkDescription, normalizeProse } from "./description-quality";
 import { textEntries } from "../utils/text-entries";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
+import {
+  type ClaimRecommendation, type DomainHttpsCheck, claimDomainRuleEnabled, emailDomain, emailDomainMatchesWebsite,
+  getDomainHttpsCheck, isFreeMailDomain, isHostedPlatformHost, websiteHost,
+} from "./claim-domain-rule";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -487,8 +491,22 @@ export type ClaimReviewReason = "no_known_email" | "listed_email_wrong" | "has_o
  *  a new admin-queue entry (per profile / the platform cap). */
 export type ClaimRateLimitScope = "profile" | "platform" | "review_profile" | "review_platform";
 
+/** Which rule sent a code: rule 1 (the farm's own e-mail) or the domain
+ *  rule's P1/P2 (the claimant's own address; claim-domain-rule.ts). */
+export type ClaimCodeRoute = "farm_email" | "domain_match_independent" | "domain_code_sent";
+
+/** What the claim domain rule (claim-domain-rule.ts) makes of a claim:
+ *  the recommendation for a queue row, and whether P1 applies or P2 could
+ *  (P2 still needs the HTTPS probe). */
+export interface ClaimDomainAssessment {
+  recommendation: ClaimRecommendation;
+  route: "p1" | "p2_candidate" | null;
+  /** The claimant's e-mail domain, normalized (null: invalid). */
+  domain: string | null;
+}
+
 export type ClaimRequestResult =
-  | { kind: "code_sent"; claimId: string; verificationCode: string; recipient: string }
+  | { kind: "code_sent"; claimId: string; verificationCode: string; recipient: string; via: ClaimCodeRoute }
   /** `created` is false when the claimant's own open entry is returned. */
   | { kind: "queued"; claimId: string; reason: ClaimReviewReason; created: boolean }
   | { kind: "rate_limited"; scope: ClaimRateLimitScope }
@@ -505,6 +523,9 @@ export interface ClaimReviewEntry {
   claimant_email: string;
   claimant_phone: string | null;
   reason: ClaimReviewReason;
+  /** The claim domain rule's advice (claim-domain-rule.ts); null on rows
+   *  queued before the rule existed. */
+  recommendation: ClaimRecommendation | null;
   /** Set only when the claimant entered the right code sent to this farm address
    *  and the claim was queued because the profile got an owner meanwhile. */
   proven_email: string | null;
@@ -920,6 +941,126 @@ class KnowledgeService {
   }
 
   /**
+   * The host of the profile's website when it comes from an INDEPENDENT
+   * source — the only website the domain rule's P1 trusts (dev-request
+   * 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste). agent_knowledge has
+   * no per-field provenance for `website`, so independence is read from what
+   * the row does record, and every doubt answers null (→ not P1):
+   *   - agents.origin is not 'self_registered' (a self-registration's website
+   *     and e-mail come from the same person who claims);
+   *   - agent_knowledge.data_source = 'auto' and owner_updated_at IS NULL: no
+   *     owner-path write ever touched the row (ownerUpdate, an API-key/claim-
+   *     token PUT, or an admin PUT relaying the owner with dataSource "owner"
+   *     all set 'owner'/'hybrid' and owner_updated_at);
+   *   - no curated_fields.website lock (a customer-requested value is the
+   *     owner's word, relayed by CS), and curated_fields parses;
+   *   - field_provenance parses and website_ownership is not 'unverified'
+   *     (the homepage crawl found the page does not name the producer);
+   *   - the value parses to a public host that is not a hosting/social
+   *     platform (gard.wixsite.com, facebook.com/…).
+   * agents.url is not used: it is what a registration or discovery row was
+   * created with, with no record of who supplied it.
+   */
+  independentWebsiteHost(agentId: string): string | null {
+    const row = getDb().prepare(
+      `SELECT a.origin, k.website, k.data_source, k.owner_updated_at, k.curated_fields, k.field_provenance
+         FROM agents a JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`
+    ).get(agentId) as {
+      origin: string | null; website: string | null; data_source: string | null; owner_updated_at: string | null;
+      curated_fields: string | null; field_provenance: string | null;
+    } | undefined;
+    if (!row || row.origin === "self_registered") return null;
+    if (row.data_source !== "auto" || row.owner_updated_at) return null;
+    const parseObj = (raw: string | null): Record<string, unknown> | null => {
+      if (raw === null || raw === undefined || raw === "") return {};
+      try {
+        const v = JSON.parse(raw);
+        return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+      } catch {
+        return null;
+      }
+    };
+    const curated = parseObj(row.curated_fields);
+    if (!curated || curated.website !== undefined) return null;
+    const prov = parseObj(row.field_provenance);
+    if (!prov) return null;
+    const wo = prov.website_ownership;
+    if (wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified") return null;
+    const host = websiteHost(row.website);
+    if (!host || isHostedPlatformHost(host)) return null;
+    return host;
+  }
+
+  /**
+   * What the claim domain rule makes of a claim (claim-domain-rule.ts). Pure
+   * reading, no network: P2 is only a candidate here — the HTTPS probe is
+   * the caller's (requestClaimWithDomainRule).
+   *   has_owner              the profile has an owner (P4);
+   *   free_mail_needs_extra  the address's domain is free-mail or invalid (P3);
+   *   domain_match_independent  the domain is the independent website's (P1);
+   *   needs_review           the profile has an independent website on
+   *                          another domain — no P2 then;
+   *   otherwise a P2 candidate (no independent website).
+   */
+  assessClaimDomain(agentId: string, claimantEmail: string, hasOwner = this.agentHasOwner(agentId)): ClaimDomainAssessment {
+    const domain = emailDomain(normalizeEmail(claimantEmail));
+    if (hasOwner) return { recommendation: "has_owner", route: null, domain };
+    if (!domain || isFreeMailDomain(domain)) return { recommendation: "free_mail_needs_extra", route: null, domain };
+    const site = this.independentWebsiteHost(agentId);
+    if (site) {
+      return emailDomainMatchesWebsite(domain, site)
+        ? { recommendation: "domain_match_independent", route: "p1", domain }
+        : { recommendation: "needs_review", route: null, domain };
+    }
+    return { recommendation: "needs_review", route: "p2_candidate", domain };
+  }
+
+  /**
+   * requestClaim behind the claim domain rule's kill switch
+   * (CLAIM_DOMAIN_RULE_ENABLED, default off). Off: requestClaim as before —
+   * no probe, only the queue row's `recommendation`. On: when the profile has
+   * no known farm e-mail and no owner and the claim is a P2 candidate, the
+   * HTTPS probe runs first (outside the DB transaction); a false, a throw or
+   * a timeout leaves the claim on its way to the queue. requestClaim checks
+   * everything else again inside its transaction.
+   */
+  async requestClaimWithDomainRule(
+    agentId: string,
+    opts: Parameters<KnowledgeService["requestClaim"]>[1],
+    deps: { env?: NodeJS.ProcessEnv; httpsCheck?: DomainHttpsCheck } = {},
+  ): Promise<ClaimRequestResult> {
+    if (!claimDomainRuleEnabled(deps.env ?? process.env)) return this.requestClaim(agentId, opts);
+    let httpsAnswered = false;
+    const hasOwner = this.agentHasOwner(agentId);
+    if (!hasOwner && !this.resolveFarmContactEmail(agentId)) {
+      const pre = this.assessClaimDomain(agentId, opts.claimantEmail, hasOwner);
+      if (pre.route === "p2_candidate" && pre.domain && this.claimCodeSlotFree(agentId)) {
+        try {
+          httpsAnswered = (await (deps.httpsCheck ?? getDomainHttpsCheck())(pre.domain)) === true;
+        } catch (err) {
+          console.warn(`[claim-domain-rule] HTTPS check failed for ${pre.domain}: ${err instanceof Error ? err.message : String(err)}`);
+          httpsAnswered = false;
+        }
+      }
+    }
+    return this.requestClaim(agentId, { ...opts, domainRule: { httpsAnswered } });
+  }
+
+  /** Would a code send on this profile pass rule 4 and the platform cap now?
+   *  Only spares the HTTPS probe when it would be refused anyway; requestClaim
+   *  decides. */
+  private claimCodeSlotFree(agentId: string): boolean {
+    const db = getDb();
+    const limits = claimLimits();
+    const since = (where: string, hours: number, ...params: unknown[]): number => (db.prepare(
+      `SELECT COUNT(*) AS n FROM agent_claims
+        WHERE ${where} AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
+    ).get(...params, hours) as { n: number }).n;
+    return since("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) < 1 &&
+      since("code_sent_to IS NOT NULL", 1) < limits.codeSendsPerHourMax;
+  }
+
+  /**
    * A claim request under decision 11=A:
    *   - "already_owner": the address is the owner's own (as before): that
    *     owner logs in by e-mail instead;
@@ -939,6 +1080,10 @@ class KnowledgeService {
     source?: string;
     /** The claimant says the profile's listed address is wrong or outdated. */
     listedEmailWrong?: boolean;
+    /** Set only with CLAIM_DOMAIN_RULE_ENABLED on (requestClaimWithDomainRule):
+     *  P1/P2 may send the code to the claimant's own address. `httpsAnswered`
+     *  is the HTTPS probe's answer for the claimant's domain (P2). */
+    domainRule?: { httpsAnswered: boolean };
   }): ClaimRequestResult {
     const db = getDb();
     const claimantEmail = normalizeEmail(opts.claimantEmail);
@@ -963,8 +1108,18 @@ class KnowledgeService {
       const hasOwner = this.agentHasOwner(agentId);
       const now = new Date().toISOString();
 
-      if (hasOwner || !farmEmail || opts.listedEmailWrong) {
+      // The claim domain rule (claim-domain-rule.ts): only where the claim
+      // would otherwise wait as no_known_email, and only with the flag on.
+      const assessment = this.assessClaimDomain(agentId, claimantEmail, hasOwner);
+      let domainRoute: "domain_match_independent" | "domain_code_sent" | null = null;
+      if (opts.domainRule && !hasOwner && !farmEmail) {
+        if (assessment.route === "p1") domainRoute = "domain_match_independent";
+        else if (assessment.route === "p2_candidate" && opts.domainRule.httpsAnswered === true) domainRoute = "domain_code_sent";
+      }
+
+      if (!domainRoute && (hasOwner || !farmEmail || opts.listedEmailWrong)) {
         const reason: ClaimReviewReason = hasOwner ? "has_owner" : !farmEmail ? "no_known_email" : "listed_email_wrong";
+        const recommendation: ClaimRecommendation = assessment.recommendation;
         const open = db.prepare(
           "SELECT id, review_reason FROM agent_claims WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'pending_review' LIMIT 1"
         ).get(agentId, claimantEmail) as { id: string; review_reason: ClaimReviewReason } | undefined;
@@ -981,9 +1136,9 @@ class KnowledgeService {
         }
         const id = uuid();
         db.prepare(`
-          INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, status, review_reason, source, created_at)
-          VALUES (?, ?, ?, ?, ?, 'manual', 'pending_review', ?, ?, ?)
-        `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, reason, opts.source || 'organic', now);
+          INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, status, review_reason, source, created_at, recommendation)
+          VALUES (?, ?, ?, ?, ?, 'manual', 'pending_review', ?, ?, ?, ?)
+        `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, reason, opts.source || 'organic', now, recommendation);
         return { kind: "queued", claimId: id, reason, created: true };
       }
 
@@ -1000,14 +1155,18 @@ class KnowledgeService {
         "UPDATE agent_claims SET status = 'superseded' WHERE agent_id = ? AND status = 'code_sent' AND code_sent_to IS NOT NULL"
       ).run(agentId);
 
+      // Rule 1: the farm's own address. P1/P2: the claimant's own address —
+      // whoever enters the code proves that mailbox (recommendation records
+      // which rule sent it; grantClaimOwnership reads it for P2).
+      const recipient = domainRoute ? claimantEmail : farmEmail!;
       const id = uuid();
       const code = this.generateVerificationCode();
       const expiresAt = new Date(Date.now() + CLAIM_CODE_VALID_HOURS * 60 * 60 * 1000).toISOString();
       db.prepare(`
-        INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, verification_code, status, source, expires_at, created_at, code_sent_to, failed_attempts)
-        VALUES (?, ?, ?, ?, ?, 'email', ?, 'code_sent', ?, ?, ?, ?, 0)
-      `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now, farmEmail);
-      return { kind: "code_sent", claimId: id, verificationCode: code, recipient: farmEmail };
+        INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, verification_code, status, source, expires_at, created_at, code_sent_to, failed_attempts, recommendation)
+        VALUES (?, ?, ?, ?, ?, 'email', ?, 'code_sent', ?, ?, ?, ?, 0, ?)
+      `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now, recipient, domainRoute);
+      return { kind: "code_sent", claimId: id, verificationCode: code, recipient, via: domainRoute ?? "farm_email" };
     })();
   }
 
@@ -1126,7 +1285,17 @@ class KnowledgeService {
     // same gate — approving a claim does not give a self_registered row the badge.
     const claimedAgent = db.prepare("SELECT origin FROM agents WHERE id = ?").get(claim.agent_id) as
       { origin: string | null } | undefined;
-    if (claimedAgent?.origin !== "self_registered") {
+    // Claim domain rule P2 (dev-request 2026-10-27-rfb-eierkrav-domeneregel-
+    // og-cs-sjekkliste): the code proved a mailbox on a domain that answers
+    // on HTTPS, nothing that ties that domain to this farm — so a P2 owner
+    // never gets the badge, whatever the origin (a self_registered row would
+    // not get it anyway). is_vetted is not touched here on any path.
+    const viaRow = db.prepare("SELECT recommendation FROM agent_claims WHERE id = ?").get(claimId) as
+      { recommendation: string | null } | undefined;
+    const domainCodeOnly = claimedVia === "claim" && viaRow?.recommendation === "domain_code_sent";
+    if (domainCodeOnly) {
+      console.log(`[claim-verify:domain-rule] withheld is_verified badge for ${claim.agent_id}: P2 claim ${claimId} (domain answers on HTTPS, not tied to the profile)`);
+    } else if (claimedAgent?.origin !== "self_registered") {
       db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(claim.agent_id);
     } else {
       console.log(`[claim-verify:quarantine-gate] withheld is_verified badge for self_registered agent ${claim.agent_id} (claim ${claimId} still succeeded)`);
@@ -1171,7 +1340,7 @@ class KnowledgeService {
     const entries = db.prepare(`
       SELECT c.id AS claim_id, c.agent_id, a.name AS agent_name, k.email AS listed_email,
              c.claimant_name, c.claimant_email, c.claimant_phone, c.review_reason AS reason,
-             c.code_sent_to AS proven_email, ${customerRuleSql("a")} AS has_owner,
+             c.recommendation, c.code_sent_to AS proven_email, ${customerRuleSql("a")} AS has_owner,
              c.source, c.created_at
         FROM agent_claims c
         JOIN agents a ON a.id = c.agent_id
