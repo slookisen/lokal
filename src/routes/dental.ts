@@ -75,8 +75,41 @@ import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { toDentalClinicCard } from "../services/dental-clinic-card";
 import { hasAcuteVaktQuote } from "../services/dental-acute-claim";
 import { emailRevealGuardEnabled, revealEmailFor } from "../services/email-reveal-guard";
+import {
+  enrichmentWritePauseBlock,
+  ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
+  type EnrichmentWritePausedBody,
+} from "../services/enrichment-write-pause";
 
 const router = Router();
+
+// ─── Enrichment write-pause fence (dental) ──────────────────────────
+// dev-request 2026-10-27-dental-skrivepause-gjerde-mangler-paa-tannlege-put
+// (A2A, P0). The fence from lokal#667 (services/enrichment-write-pause.ts)
+// was wired into the RFB and experiences write surfaces but never into this
+// router, so the `dental` pause was enforced only by the enrichment SKILL's
+// own prose check — which failed twice (2026-10-16, 2026-10-27: 57 field PUTs
+// through PUT /agents/:id while the pause was on).
+//
+// Which DB: the `enrichment_write_pause` table lives on the MAIN database
+// (database/init.ts), the same row GET/POST /admin/enrichment-write-pause
+// ?vertical=dental reads and writes — NOT on dental.db. db-factory's
+// getDb("rfb") delegates to that singleton. The THUNK is passed (not the
+// handle) so a getDb() that throws fails CLOSED inside the fence as a 423
+// `fail_closed:true` instead of escaping as a 500 (see EnrichmentWriteDb).
+//
+// Fenced here: PUT /agents/:id, POST /admin/claim-batch (empty batch, see
+// there), POST /admin/stage-v-drift-result, POST /admin/google-places-batch
+// (write mode). Left open on purpose: POST /admin/release-batch (releasing
+// claims must keep working so nothing is stranded), POST
+// /admin/homepage-fetch-result and /admin/extraction-result (strike counters,
+// parking timestamps and needs_review — claim-pool bookkeeping and
+// assessment, no clinic content; same reasoning as the /admin/run-verifier
+// exemption in the service), and the non-enrichment admin writes (POST
+// /agents, /exclusions, /agents/bulk-import).
+function dentalEnrichmentWritePauseBlock(): EnrichmentWritePausedBody | null {
+  return enrichmentWritePauseBlock(() => getDb("rfb"), "dental");
+}
 
 // ─── Admin auth ─────────────────────────────────────────────────────
 // Same shape as marketplace.ts:getAdminKey() — accept either env var
@@ -474,6 +507,21 @@ function mapAcuteVaktSources(prov: Record<string, unknown>, fn: (source: unknown
 router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   const id = req.params.id as string;
   try {
+    // Enrichment write-pause fence (see dentalEnrichmentWritePauseBlock). This
+    // is the route Stage X writes every field through, and the one that marks
+    // a clinic enriched (`enrichment_state`). It is also the only generic
+    // admin-key edit route for a dental clinic, so a manual (owner /
+    // customer-service) correction sent through it is blocked too while the
+    // pause is on: the two callers cannot be told apart here, and the pause
+    // exists precisely because callers could not be trusted to say which
+    // lane they are. Checked first, before any read or normalisation, so a
+    // rejection changes nothing.
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
+    }
+
     // Partial schema — every field optional. Casts to Partial<DentalAgent>.
     const PartialSchema = DentalAgentSchema.partial();
     const body: Record<string, unknown> =
@@ -784,6 +832,21 @@ router.post("/admin/claim-batch", requireAdmin, (req: Request, res: Response) =>
       res.status(400).json({ error: "Invalid body: need {worker_id, size, filter}" });
       return;
     }
+    // Enrichment write-pause fence. Answered as an EMPTY batch (HTTP 200,
+    // `claimed: []`, `count: 0`) carrying the standard pause body under
+    // `enrichment_write_pause`, not as a 423: the dental enrichment worker
+    // (A2A scheduled-agents/dental-agent-enrichment.md §4.1/§4.1b) reads
+    // `.count` with jq and branches on `-eq 0`. A 423 body has no `count`, so
+    // the worker's shell would compare `null` and fall through to processing
+    // `.claimed[]`; an empty batch takes its existing "pool empty" path and
+    // claims nothing. No row is claimed, so nothing is stranded either. The
+    // RFB lane has no claim-batch equivalent (its batch routes write in the
+    // same call and answer 423 — PUT /agents/:id here does the same).
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.json({ claimed: [], count: 0, paused: true, enrichment_write_pause: pauseBlock });
+      return;
+    }
     const claimed = claimBatch(worker_id, size, filter ?? {});
     res.json({ claimed, count: claimed.length });
   } catch (err: any) {
@@ -984,6 +1047,16 @@ router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Res
         return;
       }
       observedValue = parsed.data;
+    }
+
+    // Enrichment write-pause fence: two matching observations auto-correct
+    // helfo_agreement / treatments / opening_hours (+ field_provenance) on the
+    // clinic, i.e. clinic content. Placed after the pure body validation and
+    // before the only DB write, so a rejection changes nothing.
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+      return;
     }
 
     const r = recordStageVFieldObservation(agentId.trim(), field as StageVField, observedValue);
@@ -1309,6 +1382,18 @@ router.post(
     }
 
     const write = body.write !== false; // default true
+
+    // Enrichment write-pause fence: write mode backfills hjemmeside / telefon /
+    // adresse / opening_hours + field_provenance from Google Places into
+    // dental_agents. Checked before any Places call or DB read. A dry run
+    // (`write: false`) writes no clinic data and stays allowed.
+    if (write) {
+      const pauseBlock = dentalEnrichmentWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
     // A6: phone, website and opening hours from Places (see places-match.ts).
     const contactFetch = dentalPlacesContactFieldsFetchEnabled();
     // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
