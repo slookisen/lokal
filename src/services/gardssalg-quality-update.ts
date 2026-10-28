@@ -202,12 +202,25 @@ function looksLikeCssOrJsLeakage(trimmed: string): boolean {
 // indistinguishable from a real link or address and passes. Deliberately
 // not recognised (still flagged, as before this exception): a "mailto:"
 // prefix, an upper-case scheme ("HTTPS://…") and a ":port".
+//
+// Clock-time exception (2026-10-28, Apal Sideri), opening_hours_text ONLY:
+// a value whose trimmed end is a clock time with minutes ("18:00", "18.00",
+// so also ranges like "10:00–18:00" / "10.00 - 18.00") is a complete hours
+// line, not a cut sentence — e.g. extractJsonLdOpeningHours()'s
+// "Mandag, Tirsdag, …, Lørdag 10:00–18:00". about_text/visit_text keep the
+// plain rule above, and an hours value ending in a word or a stray letter
+// ("… 18.00 – 20.00. D", "… så ikke nøl med å ringe oss") is still flagged.
+// The time must be a valid hour 0–24 and minute 00–59 with no digit, "." or
+// ":" right before it, so a trailing price or year ("129.00", "2024.10") is
+// not mistaken for one.
 const GARDSSALG_TRUNCATION_MIN_LEN = 50;
+const GARDSSALG_TRAILING_CLOCK_TIME_RE = /(?:^|[^\d.:])(?:[01]?\d|2[0-4])[:.][0-5]\d$/;
 const GARDSSALG_TRAILING_EMAIL_RE = /^[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}$/u;
 const GARDSSALG_TRAILING_URL_RE =
   /^(?:(?:https?:\/\/|www\.)(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}|(?:[\p{L}\p{N}-]+\.)+(?:no|com|net|org|eu|se|dk|info))(?:[\/?#](?:\S*[\p{L}\p{N}\/])?)?$/u;
-function looksTruncatedMidSentence(trimmed: string): boolean {
+function looksTruncatedMidSentence(fieldName: GardssalgQualityFieldName, trimmed: string): boolean {
   if (trimmed.length < GARDSSALG_TRUNCATION_MIN_LEN) return false;
+  if (fieldName === "opening_hours_text" && GARDSSALG_TRAILING_CLOCK_TIME_RE.test(trimmed)) return false;
   const lastToken = trimmed.split(/\s+/).pop() ?? "";
   if (GARDSSALG_TRAILING_EMAIL_RE.test(lastToken) || GARDSSALG_TRAILING_URL_RE.test(lastToken)) return false;
   return !/[.!?…»"'”\)\]]$/.test(trimmed);
@@ -282,7 +295,7 @@ export function classifyGardssalgFieldDefect(
   const floor = GARDSSALG_QUALITY_MIN_CHARS[fieldName];
   if (trimmed.length < floor) return { defective: true, type: "too_short" };
 
-  if (looksTruncatedMidSentence(trimmed)) return { defective: true, type: "truncated_mid_sentence" };
+  if (looksTruncatedMidSentence(fieldName, trimmed)) return { defective: true, type: "truncated_mid_sentence" };
 
   // Cheap-bar backstop, prose fields only (about_text/visit_text):
   // opening_hours_text is legitimately non-prose (day/time notation with no
