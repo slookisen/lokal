@@ -16822,7 +16822,8 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
               a.org_nr AS org_nr, a.city AS city,
               k.about AS about, k.address AS address, k.phone AS phone,
               k.email AS email, k.products AS products,
-              k.verification_review_reason AS verification_review_reason
+              k.verification_review_reason AS verification_review_reason,
+              k.field_provenance AS field_provenance
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.is_active = 1`

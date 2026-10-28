@@ -32,6 +32,12 @@
 //                                          (S4-A2); RFB and dental
 //   fieldMaskRequestsRating(mask)        — does a sent mask ask for one?
 //                                          (the Places call log, S4-A2)
+//   withoutPlacesAddressField(mask)      — a FieldMask without
+//                                          formattedAddress while
+//                                          PLACES_ADDRESS_FETCH_ENABLED is
+//                                          off (A5); RFB and dental
+//   fieldMaskRequestsAddress(mask)       — does a sent mask ask for it?
+//                                          (the Places call log, A5)
 //
 // PURE: no DB, no network. The routes do the I/O.
 
@@ -411,6 +417,67 @@ export function __setDentalPlacesContactFieldsFetchForTesting(on: boolean | null
 /** DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED, or the test override. Phase 2G reads it per request. */
 export function dentalPlacesContactFieldsFetchEnabled(): boolean {
   return dentalContactFieldsFetchForTesting ?? DENTAL_PLACES_CONTACT_FIELDS_FETCH_ENABLED;
+}
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A5, Daniel's answer to question 25): neither vertical asks Google
+// Places for the formatted address any more, and no address or address part
+// from Places is stored for new profiles. While this is false
+// places.formattedAddress is out of every Places mask (RFB Text Search and
+// Place Details, both dental masks), the RFB Place Details fallback is off,
+// the RFB batch sends no agent to Google when nothing else is left to fetch
+// (its Brreg-first address still runs), and dental's Phase 2G no longer
+// selects a clinic because its address is empty. places.addressComponents
+// stays in the masks for the match guard (S3; Daniel, question 28) and is
+// read in memory only. Values already stored and their provenance stay
+// untouched; the display rule (places-display-policy.ts) is unchanged.
+// Rollback without a revert: a one-line PR setting this to true, which
+// restores the pre-A5 fetching and writing.
+export const PLACES_ADDRESS_FETCH_ENABLED = false;
+
+/** The Places (New) FieldMask entry for the formatted address, Text Search spelling. */
+export const PLACES_ADDRESS_FIELDS: readonly string[] = ["places.formattedAddress"];
+
+let placesAddressFetchForTesting: boolean | null = null;
+
+/** Test-only: act as if PLACES_ADDRESS_FETCH_ENABLED were `on`; null restores it. */
+export function __setPlacesAddressFetchForTesting(on: boolean | null): void {
+  placesAddressFetchForTesting = on;
+}
+
+/** PLACES_ADDRESS_FETCH_ENABLED, or the test override. The RFB and dental routes read it per request. */
+export function placesAddressFetchEnabled(): boolean {
+  return placesAddressFetchForTesting ?? PLACES_ADDRESS_FETCH_ENABLED;
+}
+
+/**
+ * The comma-separated FieldMask `mask` without PLACES_ADDRESS_FIELDS unless
+ * `addressFetch` (default: placesAddressFetchEnabled()). Reads both the Text
+ * Search ("places.formattedAddress") and the Place Details
+ * ("formattedAddress") spelling; the other fields keep their order.
+ */
+export function withoutPlacesAddressField(
+  mask: string,
+  addressFetch: boolean = placesAddressFetchEnabled()
+): string {
+  if (addressFetch) return mask;
+  return mask
+    .split(",")
+    .filter((f) => !PLACES_ADDRESS_FIELDS.includes(f.trim()) && !PLACES_ADDRESS_FIELDS.includes(`places.${f.trim()}`))
+    .join(",");
+}
+
+/**
+ * True when the comma-separated FieldMask `mask` asks Google for a
+ * PLACES_ADDRESS_FIELDS entry, in either spelling, for the Places call log
+ * (services/places-usage-tracker.ts, A5). addressComponents does not count:
+ * the match guard reads it in memory only.
+ */
+export function fieldMaskRequestsAddress(mask: string): boolean {
+  return mask
+    .split(",")
+    .map((f) => f.trim())
+    .some((f) => PLACES_ADDRESS_FIELDS.includes(f) || PLACES_ADDRESS_FIELDS.includes(`places.${f}`));
 }
 
 /** The Places (New) FieldMask entries that carry Google's rating. */

@@ -304,6 +304,48 @@ export function runGardssalgRfbEnrichTests(opts: { log?: boolean } = {}): TestSu
     failures.push("gardssalg-rfb-enrich (section B): unexpected error: " + String(err?.stack || err?.message || err));
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // Section C — dev-request 2026-10-16-rfb-strukturerte-data-tredjeparts-
+  // rating-og-places-treffvakt (A5): while PLACES_ADDRESS_FETCH_ENABLED is
+  // off, an RFB address that only Google Places gave is not copied.
+  // ═══════════════════════════════════════════════════════════════════════
+  const pm = require("./places-match") as typeof import("./places-match");
+  try {
+    const { isPlacesOnlyRfbAddress } = require("./gardssalg-rfb-enrich") as typeof import("./gardssalg-rfb-enrich");
+    const ADDR = "Solbakkveien 3, 2400 Elverum";
+    const prov = (sources: Array<[string, string]>) =>
+      JSON.stringify({ address: { sources: sources.map(([source_type, value]) => ({ source_type, value, fetched_at: "2026-10-01T00:00:00.000Z" })) } });
+    const provider = {
+      id: "prov-a5", navn: "Solbakken Gård", hjemmeside: "https://solbakken.no", adresse: null, telefon: null, epost: null,
+      lat: null, lon: null, about_text: null, products: null, content_source: null, field_provenance: null,
+    } as import("./gardssalg-rfb-enrich").EnrichProviderRow;
+    const source = (field_provenance: string | null): import("./gardssalg-rfb-enrich").RfbSource => ({
+      agent_id: "agent-a5", name: "Solbakken Gård", url: "https://solbakken.no", lat: null, lng: null, about: null,
+      address: ADDR, phone: null, email: null, products: null, verification_review_reason: null, field_provenance,
+    });
+    const pick = (fp: string | null) => pickEnrichmentFields(provider, indexRfbByDomain([source(fp)]));
+
+    assertEq(
+      [prov([["google_places", ADDR]]), prov([["google_places", ADDR], ["own_homepage", ADDR]]), prov([["brreg", ADDR]]), null]
+        .map((fp) => isPlacesOnlyRfbAddress({ address: ADDR, field_provenance: fp })),
+      [true, false, false, false],
+      "c-1: Places-only = a google_places record and no other source with the same address; no provenance is not Places-only",
+    );
+    const placesOnly = pick(prov([["google_places", ADDR]]));
+    assertEq([placesOnly.copy.adresse, placesOnly.skipped.find((x) => x.field === "adresse")?.reason], [undefined, "places_only"],
+      "c-2: switch off → an address only Places gave is not copied (skipped: places_only)");
+    assertEq(pick(prov([["google_places", ADDR], ["own_homepage", ADDR]])).copy.adresse, ADDR, "c-3: …a Places address the homepage corroborates is copied");
+    assertEq(pick(prov([["brreg", ADDR]])).copy.adresse, ADDR, "c-4: …a Brreg address is copied");
+    assertEq(pick(null).copy.adresse, ADDR, "c-5: …and an address without provenance is copied as before");
+    pm.__setPlacesAddressFetchForTesting(true);
+    assertEq(pick(prov([["google_places", ADDR]])).copy.adresse, ADDR, "c-6: switch on → copied as on main");
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-rfb-enrich (section C): unexpected error: " + String(err?.stack || err?.message || err));
+  } finally {
+    pm.__setPlacesAddressFetchForTesting(null);
+  }
+
   return { passed, failed, failures };
 }
 
