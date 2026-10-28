@@ -527,6 +527,16 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     const board = conversationService.getLeaderboard(50);
     assertEq(board.find((r: any) => r.agentId === ONLY_ORGANIC_CAT_ID)?.categories, [], "s0b-a2a-leaderboard-1: leaderboard «organic»-only → no categories");
 
+    // /reise + GET /api/marketplace/reise: stops come from loadRfbCandidates
+    // (own SQL on agents.categories, not rowToAgent).
+    const { loadRfbCandidates } = require("../services/route-corridor-service") as typeof import("../services/route-corridor-service");
+    const reise = loadRfbCandidates({ minLat: 59, maxLat: 61, minLng: 10, maxLng: 11.5 }, db);
+    const reiseCats = (id: string) => reise.find((c) => c.id === id)?.categories;
+    assertEq(reiseCats(UNVERIFIED_ID), ["vegetables"], "s0b-reise-1: /reise stop categories without «organic»");
+    assertEq(reiseCats(ONLY_ORGANIC_CAT_ID), [], "s0b-reise-2: «organic»-only → no categories on /reise");
+    assertEq(reiseCats(VERIFIED_ID), ["vegetables", "organic"], "s0b-reise-3: verified keeps «organic» on /reise");
+    assertTrue(reise.filter((c) => c.id === UNVERIFIED_ID || c.id === VERIFIED_ID).every((c) => c.isDrink === false), "s0b-reise-4: isDrink unaffected");
+
     // Category filter + ranking: «organic» only finds the verified producer.
     const { getRelatedBySameCategory } = require("./seo") as typeof import("./seo");
     const relOrganic = getRelatedBySameCategory(db, CLEAN_ID, "organic", null, 10).map((r) => r.id).sort();

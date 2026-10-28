@@ -73,6 +73,8 @@ import { formatRfbDistanceLabel } from "./geo-precision";
 import { formatDistanceLabel } from "./experience-store";
 import { slugify } from "../utils/slug";
 import { publicListableSql } from "./agent-visibility";
+import { isDebioVerifiedValue, stripOrganicCategories } from "./organic-claims";
+import { textEntries } from "../utils/text-entries";
 import { gardssalgVisibleSql } from "./gardssalg-visibility";
 import {
   prepareRoute,
@@ -667,7 +669,7 @@ export function loadRfbCandidates(
 ): CorridorCandidate[] {
   const rows = db
     .prepare(
-      `SELECT id, name, description, city, lat, lng, geo_precision, categories, url
+      `SELECT id, name, description, city, lat, lng, geo_precision, categories, url, debio_verified
          FROM agents
         WHERE is_active = 1
           AND umbrella_type IS NULL
@@ -687,6 +689,11 @@ export function loadRfbCandidates(
     } catch {
       categories = [];
     }
+    // Økologi S0b: an organic category only with a valid Debio status
+    // (organic-claims.ts) — /reise and GET /api/marketplace/reise show these.
+    // isDrink reads the stored list, as before.
+    const storedCategories = categories;
+    if (!isDebioVerifiedValue(r.debio_verified)) categories = stripOrganicCategories(textEntries(categories));
     return {
       id: String(r.id),
       source: "rfb" as const,
@@ -698,7 +705,7 @@ export function loadRfbCandidates(
       categories,
       description: r.description ?? null,
       url: `${RFB_BASE_URL}/produsent/${slugify(String(r.name || ""))}`,
-      isDrink: isDrinkRow("rfb", categories),
+      isDrink: isDrinkRow("rfb", storedCategories),
     };
   });
 }
