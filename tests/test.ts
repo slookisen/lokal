@@ -49866,6 +49866,24 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-10-06 (Skive B): umbrella pages self-canonical, empty
+// umbrellas noindex, indexable umbrellas in the sitemap. Own in-memory DB.
+runSerial(async () => {
+  console.log("\n── Skive B: umbrella canonical + sitemap ──");
+  try {
+    const { runSeoParaplyCanonicalSitemapTests } = require("../src/routes/seo-paraply-canonical-sitemap.test") as
+      typeof import("../src/routes/seo-paraply-canonical-sitemap.test");
+    const pc = await runSeoParaplyCanonicalSitemapTests({ log: false });
+    passed += pc.passed;
+    failed += pc.failed;
+    for (const f of pc.failures) failures.push("seo-paraply-canonical-sitemap: " + f);
+    console.log(`  seo-paraply-canonical-sitemap: ${pc.passed} passed, ${pc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("seo-paraply-canonical-sitemap: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-berikelse-nattjobb (R6; Daniel live 2026-10-11):
 // GET /admin/bm-producer-harvest gained an optional `offset` (both branches,
 // default unchanged, echoed in the response). Pins its own in-memory DB and a
