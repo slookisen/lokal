@@ -50431,6 +50431,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S4: registry governance —
+// NO+EN/group/default-per-segment/status per entry, a reader in src/ for every
+// live entry, no lookup with an unknown literal key. Pure static scan of src/
+// (no DB, env or globals).
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S4: registerstyring ──");
+  try {
+    const { runRegistryGovernanceS4Tests } = require("../src/owner-features/registry-governance-s4.test") as
+      typeof import("../src/owner-features/registry-governance-s4.test");
+    const r = await runRegistryGovernanceS4Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("registry-governance-s4: " + f);
+    console.log(`  registry-governance-s4: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("registry-governance-s4: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2b: the «Mine valg» page
 // (/eier/:id/valg) — levels, undo, change log, first-login card, N1 audit from
 // the old Bestillinger routes. Same allowlist; swaps the getDb() singleton and
