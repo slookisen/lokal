@@ -59,7 +59,7 @@ const NAMES: Record<string, string> = {
 };
 
 function seedProducer(db: Database.Database, id: string, o: { verified: boolean; organic: boolean; role?: string; url?: string }): void {
-  const tags = o.organic ? ["organic", "økologisk", "debio", "gårdsutsalg"] : ["gårdsutsalg"];
+  const tags = o.organic ? ["organic", "økologisk", "debio", "gårdsutsalg", "local/organic"] : ["gårdsutsalg", "local"];
   const skills = [{ id: "sell", name: "Gårdsutsalg", description: "Salg fra gården", tags: o.organic ? ["økologisk", "grønnsaker"] : ["grønnsaker"] }];
   db.prepare(
     `INSERT INTO agents
@@ -85,11 +85,23 @@ function seedProducer(db: Database.Database, id: string, o: { verified: boolean;
       { name: "Poteter", category: "vegetables" },
     ]),
     JSON.stringify(o.organic ? ["Økologisk produksjon", "Økologiske grønnsaker", "Gårdsost"] : ["Grønnsaker", "Gårdsost"]),
-    JSON.stringify(o.organic ? ["Økologisk", "Debio-sertifisert", "Nyt Norge"] : ["Nyt Norge"]),
+    JSON.stringify(o.organic ? ["Økologisk", "Debio-sertifisert", "Nyt Norge", "Kortreist/økologisk"] : ["Nyt Norge", "Kortreist"]),
   );
 }
 
 /** Organic-word hits in a text (one per token), for comparing against the clean twin. */
+/**
+ * Fix-up round 1 (review B1): an independent probe that does NOT use the
+ * module under test — a plain case-insensitive regex over the output. The
+ * fixtures avoid the other-meaning words (økonomi, økosystem, økologisk
+ * mangfold), so every hit here is a leak.
+ */
+const PLAIN_ORGANIC_RE = /øko|organic|organisk|ekologisk|debio|biodynam|demeter|ø-merk/gi;
+function plainHits(text: string): string[] {
+  // JSON field NAMES («"debioVerified":», «"organic": false») are not claims.
+  return text.replace(/"(debioVerified|organic)"\s*:/g, "").match(PLAIN_ORGANIC_RE) ?? [];
+}
+
 function organicHits(text: string): string[] {
   return text.split(/[\s<>"'(),.;:!?=]+/).filter((t) => t && isOrganicWord(t) && !/^økonom|^økosystem/i.test(t));
 }
@@ -140,6 +152,26 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
   assertEq(stripOrganicFromEntry("Nyt Norge"), "Nyt Norge", "entry-7: entry without organic words unchanged");
   assertEq(stripOrganicEntries(["Økologisk", "Økologiske grønnsaker", "Grønnsaker", "Gårdsost"]), ["Grønnsaker", "Gårdsost"], "entry-8: list filtered, duplicates collapsed");
   assertEq(stripOrganicTags(["organic", "økologisk", "debio", "gårdsutsalg"]), ["gårdsutsalg"], "entry-9: tags filtered");
+  // Fix-up round 1 (review B1): organic words glued to other words.
+  for (const [input, expected] of [
+    ["Kortreist/økologisk", "Kortreist"],
+    ["Lokal,økologisk", "Lokal"],
+    ["100%økologisk", null],
+    ["Halvøko", null],
+    ["Honning (økologisk)", "Honning"],
+    ["Gulrøtter; Ø-merket", "Gulrøtter"],
+    ["bio-dynamisk dyrking", null],
+    ["Lokal|organic|kortreist", "Lokal|kortreist"],
+    ["øko-egg", "egg"],
+    ["Øko-egg", "Egg"],
+  ] as Array<[string, string | null]>) {
+    assertEq(stripOrganicFromEntry(input), expected, `glued: «${input}» → ${JSON.stringify(expected)}`);
+    assertTrue(containsOrganicClaim(input), `glued: «${input}» is a claim`);
+  }
+  assertEq(stripOrganicTags(["local/organic", "fresh+organic"]), ["local", "fresh"], "glued: tags «local/organic», «fresh+organic» → «local», «fresh»");
+  for (const w of ["sjøkort", "Samfunnsøkonomi", "kystøkosystem", "organisasjon"]) {
+    assertTrue(!containsOrganicClaim(w), `glued-miss: «${w}» is not a claim`);
+  }
 
   // ── route harness ─────────────────────────────────────────────────────────
   const initMod = require("../database/init") as typeof import("../database/init");
@@ -241,6 +273,23 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     seedProducer(db, VERIFIED_ID, { verified: true, organic: true });
     seedProducer(db, CLEAN_ID, { verified: false, organic: false });
     seedProducer(db, DEBIO_ID, { verified: false, organic: true, role: "quality", url: "https://debio.no" });
+
+    // Fix-up round 1 (review B2): umbrellas + affiliations. The real Debio
+    // umbrella is inactive since 2026-07-06 but its affiliation rows remain.
+    const umbrella = db.prepare(
+      `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, categories, tags,
+         trust_score, is_active, is_verified, origin, vertical_id, catalog_hidden, umbrella_type)
+       VALUES (?, ?, 'Paraply', 'test', ?, ?, 'producer', ?, 'Oslo', '[]', '[]', 0.5, ?, 1, 'discovery', 'rfb', 0, ?)`,
+    );
+    umbrella.run("2a10c855-00c5-4ba3-a34e-315e930f95a5", "Debio", "post@debio.example.no", "https://debio.example.no", "key-debio-umb", 0, "certification");
+    umbrella.run("s0-umb-demeter", "Demeter Norge", "post@demeter.example.no", "https://demeter.example.no", "key-demeter-umb", 1, "certification");
+    umbrella.run("s0-umb-bm", "Bondens marked Oslo", "post@bm.example.no", "https://bm.example.no", "key-bm-umb", 1, "market_network");
+    const aff = db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES (?, ?, ?, ?)");
+    for (const pid of [UNVERIFIED_ID, VERIFIED_ID]) {
+      aff.run(pid, "2a10c855-00c5-4ba3-a34e-315e930f95a5", "pending_confirmation", "inferred");
+      aff.run(pid, "s0-umb-demeter", "active", "admin");
+      aff.run(pid, "s0-umb-bm", "active", "admin");
+    }
     const OWNER_CLAIM = "s0-owner-claim";
     db.prepare("INSERT INTO agent_claims (id, agent_id, claimant_email, claimant_name, status, claim_token, claim_token_expires_at) VALUES (?, ?, ?, ?, 'verified', ?, ?)")
       .run("claim-s0", UNVERIFIED_ID, `post@${UNVERIFIED_ID}.example.no`, "Eier", OWNER_CLAIM, new Date(Date.now() + 86_400_000).toISOString());
@@ -264,7 +313,15 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     const a2aInfo = async (id: string) =>
       (await invoke(H.a2a, makeReq({ body: { jsonrpc: "2.0", method: "agent/info", params: { agentId: id }, id: 1 } }))).body;
     const json = (x: unknown) => JSON.stringify(x ?? null);
-    const noClaim = (label: string, text: string) => assertTrue(!containsOrganicClaim(text), label, organicHits(text));
+    // The affiliation chips («Tilknytninger» card) of a profile page.
+    const affChips = (html: string) => (html.match(/<a [^>]*class="aff-item[^"]*"[^>]*>[\s\S]*?<\/a>/g) ?? []).join("\n");
+    // JSON field NAMES («"debioVerified":», «"organic": false») are not claims.
+    const withoutJsonKeys = (text: string) => text.replace(/"(debioVerified|organic)"\s*:/g, "");
+    // Two independent probes: the module's own matcher AND a plain regex (B1).
+    const noClaim = (label: string, text: string) => {
+      assertTrue(!containsOrganicClaim(withoutJsonKeys(text)), label, organicHits(withoutJsonKeys(text)));
+      assertEq(plainHits(text), [], `${label} [plain regex]`);
+    };
 
     // ── unverified: profile HTML NO/EN/SV + JSON-LD ───────────────────────
     for (const lang of ["no", "en", "sv"]) {
@@ -280,11 +337,18 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
       assertTrue(keywords.includes("Nyt Norge"), `ld-${lang}-1: JSON-LD keywords keep the non-organic certification`);
       noClaim(`ld-${lang}-2: JSON-LD keywords carry no organic word`, keywords);
       assertEq(organicHits(ld).length, organicHits(jsonLd(twin)).length, `ld-${lang}-3: JSON-LD organic hits equal the clean twin's`);
+      assertEq(plainHits(html).length, plainHits(twin).length, `html-${lang}-5: plain-regex hits equal the clean twin's (page chrome only)`);
+      assertEq(plainHits(ld).length, plainHits(jsonLd(twin)).length, `ld-${lang}-4: JSON-LD plain-regex hits equal the clean twin's`);
+      // B2: affiliation chips.
+      const chips = affChips(html);
+      assertTrue(!chips.includes("antatt — ikke bekreftet") && !/>Debio</.test(chips), `aff-${lang}-1: no inactive Debio umbrella chip`, chips);
+      assertTrue(!chips.includes("Demeter Norge"), `aff-${lang}-2: no certification-umbrella chip without Debio status`, chips);
+      assertTrue(chips.includes("Bondens marked Oslo"), `aff-${lang}-3: a non-organic umbrella chip stays`, chips);
     }
 
     // ── unverified: /info ─────────────────────────────────────────────────
     const info = (await restInfo(UNVERIFIED_ID)).body?.data;
-    assertEq(info?.knowledge?.certifications, ["Nyt Norge"], "info-1: certifications without organic words, no «Hevder økologisk»");
+    assertEq(info?.knowledge?.certifications, ["Nyt Norge", "Kortreist"], "info-1: certifications without organic words, no «Hevder økologisk»");
     assertEq(info?.knowledge?.specialties, ["Grønnsaker", "Gårdsost"], "info-2: specialties without organic words (organic-only entry dropped)");
     assertTrue((info?.knowledge?.products ?? []).every((p: any) => p?.organic !== true), "info-3: products[].organic never true");
     assertEq(info?.knowledge?.products?.[0]?.name, "Gulrøtter", "info-4: product names untouched");
@@ -293,7 +357,7 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
 
     // ── owner's own /info read sees the stored lists ──────────────────────
     const ownerInfo = (await restInfo(UNVERIFIED_ID, OWNER_CLAIM)).body?.data;
-    assertEq(ownerInfo?.knowledge?.certifications, ["Økologisk", "Debio-sertifisert", "Nyt Norge"], "owner-1: owner read keeps stored certifications (no save-back loss)");
+    assertEq(ownerInfo?.knowledge?.certifications, ["Økologisk", "Debio-sertifisert", "Nyt Norge", "Kortreist/økologisk"], "owner-1: owner read keeps stored certifications (no save-back loss)");
     assertEq(ownerInfo?.knowledge?.specialties, ["Økologisk produksjon", "Økologiske grønnsaker", "Gårdsost"], "owner-2: owner read keeps stored specialties");
     assertEq(ownerInfo?.knowledge?.products?.[0]?.organic, true, "owner-3: owner read keeps the stored organic flag");
 
@@ -305,6 +369,7 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     const listed = (await agentsList()).find((a: any) => a.id === UNVERIFIED_ID);
     assertTrue(!!listed, "agents-0: unverified producer listed");
     noClaim("agents-1: /agents tags + skill tags carry no organic word", json([listed?.tags, listed?.skills]));
+    assertTrue((listed?.tags ?? []).includes("local") && !(listed?.tags ?? []).some((t: string) => t.toLowerCase().includes("organic")), "agents-1b: «local/organic» → «local», no substring left for discover's tag match", listed?.tags);
     const listedVerified = (await agentsList()).find((a: any) => a.id === VERIFIED_ID);
     assertTrue((listedVerified?.tags ?? []).includes("organic"), "agents-2: verified producer keeps its organic tag");
 
@@ -319,6 +384,12 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     const block = listBlock(ld, UNVERIFIED_ID);
     assertTrue(block.length > 0, "mcp-discover-0: lokal_discover lists the producer");
     noClaim("mcp-discover-1: lokal_discover block carries no organic word", block);
+
+    // B2: the producer's affiliations on the AI surfaces (MCP tool).
+    const affText = await toolText("lokal_get_producer_affiliations", { producerId: UNVERIFIED_ID });
+    assertTrue(affText.includes("Bondens marked Oslo"), "aff-mcp-0: lokal_get_producer_affiliations lists the market umbrella", affText);
+    noClaim("aff-mcp-1: lokal_get_producer_affiliations shows no certification/organic umbrella without status", affText);
+    assertTrue((await toolText("lokal_get_producer_affiliations", { producerId: VERIFIED_ID })).includes("Demeter Norge"), "aff-mcp-2: verified producer keeps its certification umbrella");
 
     // ── unverified: A2A ───────────────────────────────────────────────────
     const a2a = await a2aInfo(UNVERIFIED_ID);
@@ -335,6 +406,8 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     assertEq(vInfo?.knowledge?.certifications?.[0], "✓ Debio-verifisert", "verified-3: «✓ Debio-verifisert» kept");
     assertEq(vInfo?.knowledge?.products?.[0]?.organic, true, "verified-4: organic:true kept");
     assertTrue((vInfo?.knowledge?.specialties ?? []).includes("Økologiske grønnsaker"), "verified-5: specialties untouched");
+    assertTrue(affChips(vHtml).includes("Demeter Norge"), "verified-6: certification-umbrella chip kept with Debio status");
+    assertTrue(!affChips(vHtml).includes("antatt — ikke bekreftet") && !/>Debio</.test(affChips(vHtml)), "verified-7: inactive Debio umbrella chip gone for verified too (is_active filter)");
 
     // ── search: the organic tag family only matches the verified producer ─
     const discover = async (body: any) => ((await invoke(H.discover, makeReq({ body }))).body?.results ?? []) as any[];

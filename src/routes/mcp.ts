@@ -20,6 +20,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { isDebioVerifiedValue, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
 import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
@@ -1413,20 +1414,23 @@ export function registerTools(
     guardToolHandler("lokal_get_producer_affiliations", async ({ producerId }) => {
       const db = getDb();
       const producer = db.prepare(
-        "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
+        "SELECT id, name, umbrella_type, debio_verified FROM agents WHERE id = ? AND is_active = 1"
       ).get(producerId) as any;
       // S2c-2: a profile hidden from AI assistants reads like an unknown id.
       if (!producer || ownerHidesAgent(producerId, "ai_assistants")) {
         return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${producerId}.` }] };
       }
 
-      const rows = db.prepare(`
+      const allRows = db.prepare(`
         SELECT u.id, u.name, u.umbrella_type, aff.labels
         FROM agent_affiliations aff
         INNER JOIN agents u ON u.id = aff.umbrella_id
         WHERE aff.producer_id = ? AND aff.status = 'active' AND u.is_active = 1
         ORDER BY u.name ASC
       `).all(producerId) as any[];
+      // Økologi S0 fix-up (review B2): no certification / organic umbrella
+      // without a valid Debio status (organic-claims.ts).
+      const rows = isDebioVerifiedValue(producer.debio_verified) ? allRows : allRows.filter((u) => !isOrganicClaimUmbrella(u));
 
       if (!rows.length) {
         return { content: [{ type: "text" as const, text: `${producer.name} har ingen registrerte paraplyer-tilknytninger.` }] };

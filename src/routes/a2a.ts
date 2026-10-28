@@ -16,6 +16,7 @@ import { hashIP } from "../services/analytics-service";
 import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
 import { stripOrganicEntries } from "../services/organic-claims";
+import { textEntries } from "../utils/text-entries";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
 import { isAgentIdPubliclyVisible, isDelistedAgentId, ownerHidesAgent } from "../services/agent-visibility";
@@ -899,7 +900,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
         organic: isDebioVerified ? p.organic : (p.organic === undefined ? undefined : false),
         price: p.price, priceUnit: p.priceUnit,
       })),
-      specialties: isDebioVerified || !Array.isArray(knowledge.specialties) ? knowledge.specialties : stripOrganicEntries(knowledge.specialties),
+      specialties: isDebioVerified ? knowledge.specialties : stripOrganicEntries(textEntries(knowledge.specialties)),
       certifications: relabelCertifications(knowledge.certifications, isDebioVerified),
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,

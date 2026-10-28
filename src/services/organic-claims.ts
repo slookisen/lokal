@@ -21,21 +21,41 @@
 //
 // PURE (no project imports).
 
-/** A single token (lower-cased, edge punctuation stripped) that is an organic claim word. */
+/**
+ * Separators between words. Fix-up round 1 (review B1): not only whitespace —
+ * «Kortreist/økologisk», «Lokal,økologisk», «100%økologisk», «local/organic»
+ * and hyphenated compounds («Debio-sertifisert», «øko-egg») are split too, so
+ * an organic word glued to another word is still found, and only it is
+ * removed. Captured, so the remainder keeps its own punctuation.
+ */
+const SEPARATORS = /([\s/,;:|+()%&*·•–—-]+)/u;
+
+/**
+ * Two organic words carry a hyphen of their own; they are joined before
+ * splitting so the hyphen split above does not cut them in two.
+ */
+function joinOrganicHyphens(text: string): string {
+  return text.replace(/(ø)-(merk)/giu, "$1$2").replace(/(bio)-(dynami)/giu, "$1$2");
+}
+
+/** One word part (lower-cased, edge punctuation stripped): is it an organic claim word? */
 function isOrganicToken(token: string): boolean {
   const t = token.toLowerCase();
   if (!t) return false;
-  // Other meanings first (regelbok §2, «Ikke treff»).
-  if (/^økonom/.test(t) || /^økosystem/.test(t)) return false;
+  // Other meanings first (regelbok §2, «Ikke treff»): økonomi, økosystem —
+  // also inside compounds («samfunnsøkonomi», «kystøkosystem»).
+  if (/økonom|økosystem/.test(t)) return false;
   return (
-    /^øko/.test(t) ||                 // økologisk/økologiske/økologi-, øko, øko-, økogård, økomerket …
-    /^ø-merk/.test(t) ||              // Ø-merket, Ø-merke
-    /^organic/.test(t) ||             // organic, organically
-    /^organisk/.test(t) ||            // organisk, organiske
-    /^ekologi/.test(t) ||             // ekologisk (sv)
-    /^bio-?dynami/.test(t) ||         // biodynamisk, bio-dynamisk, biodynamic
-    /^demeter/.test(t) ||             // Demeter
-    /^debio/.test(t)                  // Debio, Debio-sertifisert, Debio-godkjent, DEBIO
+    /^øko/.test(t) ||                 // økologisk/økologiske/økologi, øko, økogård, økomerket …
+    /øko$/.test(t) ||                 // «Halvøko», «Heløko»
+    /økolog/.test(t) ||               // «landbruksøkologisk», «Halvøkologisk»
+    /ømerk/.test(t) ||                // Ø-merket, Ø-merke (joined above)
+    /organic/.test(t) ||              // organic, organically, «localorganic»
+    /organisk/.test(t) ||             // organisk, organiske
+    /ekologi/.test(t) ||              // ekologisk (sv)
+    /biodynami/.test(t) ||            // biodynamisk, bio-dynamisk, biodynamic
+    /demeter/.test(t) ||              // Demeter
+    /debio/.test(t)                   // Debio, Debio-sertifisert, Debio-godkjent, DEBIO
   );
 }
 
@@ -46,9 +66,25 @@ function cleanToken(raw: string): string {
   return raw.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
 }
 
+/** The word parts of `text` (even indexes) and the separators between them (odd indexes). */
+function splitWords(text: string): string[] {
+  return joinOrganicHyphens(text).split(SEPARATORS);
+}
+
+/** Is word i of `parts` an organic claim (and not «økologisk mangfold» etc.)? */
+function isClaimAt(parts: string[], i: number): boolean {
+  const t = cleanToken(parts[i]);
+  if (!isOrganicToken(t)) return false;
+  // The next WORD is two steps on (a separator sits between).
+  if (/økolog/i.test(t) && OTHER_MEANING_NEXT.test(cleanToken(parts[i + 2] || ""))) return false;
+  return true;
+}
+
 /** Is this single word an organic claim word (regelbok §2)? */
 export function isOrganicWord(word: string): boolean {
-  return isOrganicToken(cleanToken(word));
+  const parts = splitWords(word);
+  for (let i = 0; i < parts.length; i += 2) if (isOrganicToken(cleanToken(parts[i]))) return true;
+  return false;
 }
 
 /**
@@ -57,13 +93,8 @@ export function isOrganicWord(word: string): boolean {
  */
 export function containsOrganicClaim(text: unknown): boolean {
   if (typeof text !== "string" || !text) return false;
-  const tokens = text.split(/\s+/);
-  for (let i = 0; i < tokens.length; i++) {
-    const t = cleanToken(tokens[i]);
-    if (!isOrganicToken(t)) continue;
-    if (/^økolog/i.test(t) && OTHER_MEANING_NEXT.test(cleanToken(tokens[i + 1] || ""))) continue;
-    return true;
-  }
+  const parts = splitWords(text);
+  for (let i = 0; i < parts.length; i += 2) if (isClaimAt(parts, i)) return true;
   return false;
 }
 
@@ -82,36 +113,37 @@ const LEFTOVER_FILLER = new Set([
   "hevder", "claims",
 ]);
 
+const isFillerWord = (w: string) => { const c = cleanToken(w).toLowerCase(); return !c || LEFTOVER_FILLER.has(c); };
+
 /**
  * One list entry with the organic claim words taken out. Returns null when
  * nothing meaningful is left (the entry consisted only of organic words, or of
- * organic words plus filler), otherwise the remaining words with the first
- * letter's case kept from the original entry. An entry without organic words
- * is returned unchanged (same string).
+ * organic words plus filler), otherwise the remaining words — joined by the
+ * separators that stood before them — with the first letter's case kept from
+ * the original entry («Kortreist/økologisk» → «Kortreist»). An entry without
+ * organic words is returned unchanged (same string).
  */
 export function stripOrganicFromEntry(entry: string): string | null {
-  const tokens = entry.split(/\s+/).filter(Boolean);
+  const parts = splitWords(entry);
   let hit = false;
-  const kept: string[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const t = cleanToken(tokens[i]);
-    const otherMeaning = /^økolog/i.test(t) && OTHER_MEANING_NEXT.test(cleanToken(tokens[i + 1] || ""));
-    if (isOrganicToken(t) && !otherMeaning) {
-      hit = true;
-      continue;
-    }
-    kept.push(tokens[i]);
+  // Kept words, each with the separator that stood before it.
+  const kept: Array<{ sep: string; word: string }> = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    if (!parts[i]) continue;
+    if (isClaimAt(parts, i)) { hit = true; continue; }
+    kept.push({ sep: i > 0 ? parts[i - 1] : "", word: parts[i] });
   }
   if (!hit) return entry;
-  const meaningful = kept.filter((w) => {
-    const c = cleanToken(w).toLowerCase();
+  const meaningful = kept.filter(({ word }) => {
+    const c = cleanToken(word).toLowerCase();
     return c.length >= 2 && /\p{L}/u.test(c) && !LEFTOVER_FILLER.has(c);
   });
   if (meaningful.length === 0) return null;
-  // Trim connectors/punctuation left dangling at either end («og kortreist» → «kortreist»).
-  while (kept.length && (LEFTOVER_FILLER.has(cleanToken(kept[0]).toLowerCase()) || !cleanToken(kept[0]))) kept.shift();
-  while (kept.length && (LEFTOVER_FILLER.has(cleanToken(kept[kept.length - 1]).toLowerCase()) || !cleanToken(kept[kept.length - 1]))) kept.pop();
-  let out = kept.join(" ").replace(/^[\s,;:/&+–-]+|[\s,;:/&+–-]+$/g, "").trim();
+  // Trim connectors left dangling at either end («og kortreist» → «kortreist»).
+  while (kept.length && isFillerWord(kept[0].word)) kept.shift();
+  while (kept.length && isFillerWord(kept[kept.length - 1].word)) kept.pop();
+  let out = kept.map((k, idx) => (idx === 0 ? "" : k.sep) + k.word).join("")
+    .replace(/^[\s,;:/&+|()%–—-]+|[\s,;:/&+|(%–—-]+$/gu, "").trim();
   if (!out) return null;
   const firstUpper = /^\p{Lu}/u.test(entry.trim());
   if (firstUpper) out = out.charAt(0).toUpperCase() + out.slice(1);
@@ -163,4 +195,15 @@ export function stripOrganicTags(tags: readonly unknown[] | null | undefined): s
     if (cleaned !== null) out.push(cleaned);
   }
   return out;
+}
+
+/**
+ * Fix-up round 1 (review B2): is this umbrella membership an organic claim?
+ * A certification-type umbrella (Debio, Demeter …), or an umbrella / label
+ * carrying an organic word. Shown only for a producer with a valid Debio
+ * status; inactive umbrellas are filtered by the callers' SQL.
+ */
+export function isOrganicClaimUmbrella(u: { umbrella_type?: unknown; name?: unknown; labels?: unknown }): boolean {
+  if (u.umbrella_type === "certification") return true;
+  return containsOrganicClaim(String(u.name ?? "")) || containsOrganicClaim(String(u.labels ?? ""));
 }

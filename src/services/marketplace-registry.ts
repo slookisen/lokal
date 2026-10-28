@@ -41,6 +41,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // project imports; only node:async_hooks for the S2d-2 as-public view), same
 // isolation rule as geo-distance.ts above.
 import { isDebioVerifiedValue, stripOrganicTags } from "./organic-claims";
+import { textEntries } from "../utils/text-entries";
 import { isDelistedAgentId, publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, isAsPublicView, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
@@ -2238,10 +2239,12 @@ class MarketplaceRegistry {
       discoveryCount: row.discovery_count || 0,
       interactionCount: row.interaction_count || 0,
       capabilities: row.capabilities ? JSON.parse(row.capabilities) : {},
-      skills: organicAllowed || !Array.isArray(rawSkills) ? rawSkills : rawSkills.map((sk: any) =>
-        sk && typeof sk === "object" && Array.isArray(sk.tags) ? { ...sk, tags: stripOrganicTags(sk.tags) } : sk),
+      // Unverified: tags read as text entries (a non-list value is one entry or
+      // none, like getAgentInfo's lists) and filtered; a skill's tags likewise.
+      skills: organicAllowed ? rawSkills : (Array.isArray(rawSkills) ? rawSkills : []).map((sk: any) =>
+        sk && typeof sk === "object" && sk.tags !== undefined ? { ...sk, tags: stripOrganicTags(textEntries(sk.tags)) } : sk),
       categories: row.categories ? JSON.parse(row.categories) : [],
-      tags: organicAllowed || !Array.isArray(rawTags) ? rawTags : stripOrganicTags(rawTags),
+      tags: organicAllowed ? rawTags : stripOrganicTags(textEntries(rawTags)),
       languages: row.languages ? JSON.parse(row.languages) : ["no"],
       location: row.lat != null && row.lng != null ? {
         lat: row.lat,
