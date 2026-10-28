@@ -1346,6 +1346,17 @@ export async function runRfbPlacesMatchGuardTests(opts: { log?: boolean } = {}):
         assertEq(maskFields(lastMask()).includes("places.formattedAddress"), false, "A5-R17: the single-route mask has no places.formattedAddress");
         assertEq([s.body?.hasRating, s.body?.placeAddress], [true, ""], "A5-R18: the single route reports no Places address");
         assertEq(row("a5-s").address, null, "A5-R19: …and stores none");
+
+        // Google honours the mask, so the Text Search answer has no address: only the
+        // code gate keeps the Details fallback from firing at max_details_calls 5
+        insertAgent("a5-d", "Haugen Gård — Ski", "Ski", { postal_code: "1400" });
+        placesAnswer = [HAUGEN_SKI];
+        placesHonorMask = true;
+        const callsBefore = placesCalls.length;
+        const d = await runBatch("a5-d", true, 5);
+        assertEq([d.row?.addressWritten, d.body?.data?.details_calls, placesCalls.length - callsBefore], [false, 0, 1],
+          "A5-R12b: mask honoured, no Places address → still no Details call although max_details_calls is 5");
+        assertEq(row("a5-d").address, null, "A5-R12c: …and no address stored from Places");
       } finally {
         pm.__setGoogleRatingFetchForTesting(null);
         placesHonorMask = true;
