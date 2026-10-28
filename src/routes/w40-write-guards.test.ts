@@ -639,6 +639,9 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
       assertEq(knowledge("bulk-3")?.phone ?? null, null, "E07: bulk-3 phone NOT written");
 
       // ── POST /admin/google-rating-batch (Kvestad) ───────────────────────
+      // Run with the A5 switch on: the fixture asserts the pre-A5 Places
+      // address writes (PLACES_ADDRESS_FETCH_ENABLED, places-match.ts).
+      (require("../services/places-match") as typeof import("../services/places-match")).__setPlacesAddressFetchForTesting(true);
       let brregAdresse: string[] | null = null;
       (globalThis as any).fetch = async (url: string) => {
         const u = String(url);
@@ -785,6 +788,7 @@ export async function runW40WriteGuardsTests(opts: { log?: boolean } = {}): Prom
       assertEq(knowledge("kv-b3")?.address, KVESTAD_ROAD, "H04: Brreg backfill with a 'Postboks 45' postadresse does not correct Fv109");
     } finally {
       (globalThis as any).fetch = prevFetch;
+      (require("../services/places-match") as typeof import("../services/places-match")).__setPlacesAddressFetchForTesting(null);
       initMod.__setDbForTesting(prevDb as any);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
       else process.env.ADMIN_KEY = prevAdminKey;

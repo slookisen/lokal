@@ -19,13 +19,22 @@
 // PLACES_RATING_ENDPOINT_SUFFIX on its endpoint. That needs no schema
 // change: getPlacesUsageThisMonth groups by SKU, not endpoint, so its sums
 // are unchanged. Rows written before this change carry no suffix.
+//
+// Same dev-request, A5: the formatted address is no longer fetched, and the
+// acceptance is "/admin/places-usage shows 0 address calls". A call whose
+// mask asked for places.formattedAddress (either spelling) is logged with
+// PLACES_ADDRESS_ENDPOINT_SUFFIX, placed before the rating suffix so a
+// rating call still ends with PLACES_RATING_ENDPOINT_SUFFIX.
 import type Database from "better-sqlite3";
-import { fieldMaskRequestsRating } from "./places-match";
+import { fieldMaskRequestsRating, fieldMaskRequestsAddress } from "./places-match";
 
 export type PlacesSku = "text_search_enterprise" | "text_search_pro" | "place_details";
 
 /** Endpoint suffix of a logged call whose FieldMask asked for Google's rating (S4-A2). */
 export const PLACES_RATING_ENDPOINT_SUFFIX = "+rating";
+
+/** Endpoint suffix of a logged call whose FieldMask asked for the formatted address (A5). */
+export const PLACES_ADDRESS_ENDPOINT_SUFFIX = "+address";
 
 export function logPlacesCall(
   db: Database.Database,
@@ -35,9 +44,13 @@ export function logPlacesCall(
   fieldMask?: string
 ): void {
   try {
-    const logged = fieldMask !== undefined && fieldMaskRequestsRating(fieldMask)
-      ? endpoint + PLACES_RATING_ENDPOINT_SUFFIX
-      : endpoint;
+    const address = fieldMask !== undefined && fieldMaskRequestsAddress(fieldMask)
+      ? PLACES_ADDRESS_ENDPOINT_SUFFIX
+      : "";
+    const rating = fieldMask !== undefined && fieldMaskRequestsRating(fieldMask)
+      ? PLACES_RATING_ENDPOINT_SUFFIX
+      : "";
+    const logged = endpoint + address + rating;
     db.prepare(
       `INSERT INTO places_api_call_log (vertical, endpoint, sku, called_at) VALUES (?, ?, ?, ?)`
     ).run(vertical, logged, sku, new Date().toISOString());
@@ -94,6 +107,24 @@ export function getPlacesRatingFieldCallsThisMonth(db: Database.Database): numbe
           WHERE called_at >= ? AND endpoint LIKE ?`
       )
       .get(monthStartIso(), `%${PLACES_RATING_ENDPOINT_SUFFIX}`) as { n: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+// This-calendar-month (UTC) calls from one DB handle whose FieldMask asked
+// for the formatted address (A5, PLACES_ADDRESS_ENDPOINT_SUFFIX). 0 while
+// PLACES_ADDRESS_FETCH_ENABLED is off, and when the log cannot be read.
+export function getPlacesAddressFieldCallsThisMonth(db: Database.Database): number {
+  try {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS n
+           FROM places_api_call_log
+          WHERE called_at >= ? AND endpoint LIKE ?`
+      )
+      .get(monthStartIso(), `%${PLACES_ADDRESS_ENDPOINT_SUFFIX}%`) as { n: number } | undefined;
     return row?.n ?? 0;
   } catch {
     return 0;

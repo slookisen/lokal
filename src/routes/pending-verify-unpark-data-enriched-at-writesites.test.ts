@@ -353,6 +353,9 @@ export async function runPendingVerifyUnparkWriteSitesTests(opts: { log?: boolea
       const router = marketplaceMod.default;
 
       process.env.GOOGLE_PLACES_API_KEY = "test-places-key-noop-suite";
+      // Run with the A5 switch on: (f) asserts the pre-A5 Places address
+      // write (PLACES_ADDRESS_FETCH_ENABLED, places-match.ts).
+      (require("../services/places-match") as typeof import("../services/places-match")).__setPlacesAddressFetchForTesting(true);
 
       const id = "f-writesite-agent";
       insertAgent(id, { url: "https://f-writesite.example.com" });
@@ -527,6 +530,7 @@ export async function runPendingVerifyUnparkWriteSitesTests(opts: { log?: boolea
     failures.push("pending-verify-unpark-data-enriched-at-writesites: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     (globalThis as any).fetch = prevFetch;
+    (require("../services/places-match") as typeof import("../services/places-match")).__setPlacesAddressFetchForTesting(null);
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
     else process.env.ADMIN_KEY = prevAdminKey;
     if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;

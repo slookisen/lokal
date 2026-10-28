@@ -41,6 +41,8 @@ import { normalizeDomain, normalizeName, normalizeOrgNr } from "./blocklist-serv
 import { isDisplayablePhone } from "./contact-normalizer";
 import { isJunkDescription } from "./description-quality";
 import { isGardssalgFieldOwnerLocked } from "./experience-store";
+import { placesAddressFetchEnabled } from "./places-match";
+import { fieldProvenanceRecords, placesFieldVerdict } from "./places-display-policy";
 
 /** Minimal shape of the seeded gårdssalg provider row we may enrich. */
 export interface EnrichProviderRow {
@@ -90,6 +92,11 @@ export interface RfbSource {
   // on EnrichProviderRow above. Optional for the same additive reason.
   org_nr?: string | null;
   city?: string | null;
+  // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+  // treffvakt (A5): agent_knowledge.field_provenance, read only to tell an
+  // address that only Google Places gave (isPlacesOnlyRfbAddress). Optional:
+  // absent means no provenance, and the address is copied as before.
+  field_provenance?: string | null;
 }
 
 export interface EnrichResult {
@@ -223,6 +230,21 @@ export function isJunkAddress(addr: string | null | undefined): boolean {
   const low = a.toLowerCase();
   const junkPhrases = ["se hjemmeside", "se nettside", "ukjent", "n/a", "norge", "ikke oppgitt", "kommer snart"];
   return junkPhrases.some((p) => low === p || low.includes(p));
+}
+
+// dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
+// treffvakt (A5): while PLACES_ADDRESS_FETCH_ENABLED (places-match.ts) is off,
+// an RFB address that only Google Places gave is not copied to a gårdssalg
+// provider: the copy would lose its provenance. "Only Places" is the A4 rule
+// (places-display-policy.ts placesFieldVerdict, evaluated as if on): a
+// google_places record holds the stored value and no other non-inference
+// source has the same address. No provenance → not Places-only.
+export function isPlacesOnlyRfbAddress(src: Pick<RfbSource, "address" | "field_provenance">): boolean {
+  if (!src.field_provenance) return false;
+  return placesFieldVerdict(
+    { field: "address", value: src.address, records: fieldProvenanceRecords(src.field_provenance, ["address"]) },
+    true,
+  ) === "places_only";
 }
 
 // Which factual fields did the RFB verifier flag as inference-only (fabricated
@@ -485,6 +507,7 @@ export function pickEnrichmentFields(
   if (provider.content_source !== "claim" && isEmpty(provider.adresse) && src.address && src.address.trim()) {
     if (inference.has("address")) skipped.push({ field: "adresse", reason: "inference_only" });
     else if (isJunkAddress(src.address)) skipped.push({ field: "adresse", reason: "junk_address" });
+    else if (!placesAddressFetchEnabled() && isPlacesOnlyRfbAddress(src)) skipped.push({ field: "adresse", reason: "places_only" });
     else copy.adresse = src.address.trim();
   }
   // telefon ← phone (skip non-displayable / inference-only). Same

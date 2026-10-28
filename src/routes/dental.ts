@@ -63,7 +63,7 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
-import { placesFieldMask, dentalPlacesContactFieldsFetchEnabled, PLACES_DENTAL_CONTACT_FIELDS } from "../services/places-match";
+import { placesFieldMask, dentalPlacesContactFieldsFetchEnabled, PLACES_DENTAL_CONTACT_FIELDS, placesAddressFetchEnabled, withoutPlacesAddressField } from "../services/places-match";
 import { classifyHjemmeside } from "../services/dental-hjemmeside-classifier";
 import { isPublicDentalServiceHost, DENTAL_CLINIC_CLASS_SQL, isDentalPublicCatalogClassFilterEnabled } from "../services/dental-catalog-class";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -1332,6 +1332,10 @@ const PLACES_PRO_FIELD_MASK = placesFieldMask(
 const withoutContactFields = (mask: string): string =>
   mask.split(",").filter((f) => !PLACES_DENTAL_CONTACT_FIELDS.includes(f)).join(",");
 const PLACES_PRO_FIELD_MASK_NO_CONTACT = withoutContactFields(PLACES_PRO_FIELD_MASK);
+// Same dev-request, A5: the request picks one of the masks above and drops
+// places.formattedAddress from it (withoutPlacesAddressField) while
+// PLACES_ADDRESS_FETCH_ENABLED (places-match.ts) is off. addressComponents
+// stays for the match guard, read in memory only.
 
 interface PlacesAgentRow {
   id: string;
@@ -1396,6 +1400,11 @@ router.post(
     }
     // A6: phone, website and opening hours from Places (see places-match.ts).
     const contactFetch = dentalPlacesContactFieldsFetchEnabled();
+    // A5: the address from Places (see places-match.ts). While it is off no
+    // row is selected for its empty address, no address is looked up or
+    // written here (Brreg's included: by_field.adresse is 0), and the masks
+    // carry no places.formattedAddress.
+    const addressFetch = placesAddressFetchEnabled();
     // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
     // item 1: raise the homepage-backfill default/cap 20/50 -> 100/cycle (the
     // universe-growth lever — at 20/day a full sweep of the ~5,670 homepage-
@@ -1475,16 +1484,29 @@ router.post(
       // never rejected.
       // A6: with the contact fields off, only a missing address makes a row
       // worth a Places call (the fields below are the pre-A6 text verbatim).
-      const missingFieldsSql = contactFetch
-        ? `hjemmeside IS NULL OR hjemmeside = ''
+      // A5: with the address off too, no field is left and no row is
+      // selected (`0`); with only the address off, the contact fields alone.
+      const missingFieldsSql = addressFetch
+        ? contactFetch
+          ? `hjemmeside IS NULL OR hjemmeside = ''
                  OR adresse    IS NULL OR adresse    = ''
                  OR telefon    IS NULL OR telefon    = ''
                  OR opening_hours IS NULL OR opening_hours = ''`
-        : `adresse IS NULL OR adresse = ''`;
+          : `adresse IS NULL OR adresse = ''`
+        : contactFetch
+          ? `hjemmeside IS NULL OR hjemmeside = ''
+                 OR telefon    IS NULL OR telefon    = ''
+                 OR opening_hours IS NULL OR opening_hours = ''`
+          : `0`;
       const missingOrderSql = contactFetch
-        ? `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
+        ? addressFetch
+          ? `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
               CASE WHEN (adresse IS NULL OR adresse = '')
                      OR (telefon IS NULL OR telefon = '')
+                     OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
+              `
+          : `CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
+              CASE WHEN (telefon IS NULL OR telefon = '')
                      OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
               `
         : "";
@@ -1566,7 +1588,8 @@ router.post(
       // filled has nothing left to fetch from Places. It is not sent to
       // Google (no fetch, no logPlacesCall) and gets no no-retry marker.
       // Only reachable through agentIds: auto-select picks missing addresses.
-      if (!contactFetch && !isEmptyCol(row.adresse)) {
+      // A5: with the address off too, no row has anything left to fetch.
+      if (!contactFetch && !(addressFetch && isEmptyCol(row.adresse))) {
         results.push({
           agentId: row.id,
           navn: row.navn,
@@ -1599,11 +1622,14 @@ router.post(
         ENTERPRISE_MONTHLY_HARD_STOP
       );
       if (wantsEnterprise && !needsEnterprise) enterpriseCapped = true;
-      const fieldMask = needsEnterprise
-        ? PLACES_ENTERPRISE_FIELD_MASK
-        : contactFetch
-          ? PLACES_PRO_FIELD_MASK
-          : PLACES_PRO_FIELD_MASK_NO_CONTACT;
+      const fieldMask = withoutPlacesAddressField(
+        needsEnterprise
+          ? PLACES_ENTERPRISE_FIELD_MASK
+          : contactFetch
+            ? PLACES_PRO_FIELD_MASK
+            : PLACES_PRO_FIELD_MASK_NO_CONTACT,
+        addressFetch
+      );
       if (needsEnterprise) enterpriseCalls++; else proCalls++;
 
       // ── measure 3 of dev-request 2026-07-03-places-api-cost-reduction ──
@@ -1615,8 +1641,9 @@ router.post(
       // source, unchanged from before. Phone is NOT looked up here: Brreg's
       // Enhetsregisteret API has no phone-number field, so telefon stays
       // Google-only exactly as before.
+      // A5: not while address fetch is off (Phase 2G writes no address then).
       let brregAddr: string | null = null;
-      if (isEmptyCol(row.adresse)) {
+      if (addressFetch && isEmptyCol(row.adresse)) {
         try {
           const brregHit = await findOrgnumberByName(row.navn, row.postnummer);
           if (brregHit?.address) brregAddr = brregHit.address;
@@ -1724,8 +1751,10 @@ router.post(
       // measure 3: prefer the BRREG address looked up above when we have
       // one — Google's formattedAddress is only used as the fallback when
       // BRREG had nothing usable for this clinic.
+      // A5: nothing of it is used while address fetch is off, also if
+      // Google sends one it was not asked for.
       const placesAddr =
-        typeof place.formattedAddress === "string"
+        addressFetch && typeof place.formattedAddress === "string"
           ? place.formattedAddress.trim()
           : "";
       const gAddr = brregAddr || placesAddr;

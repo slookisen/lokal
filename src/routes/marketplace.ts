@@ -26,11 +26,11 @@ import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError, normalizeEmail, normalizeName as blocklistNormalizeName, normalizeDomain as blocklistNormalizeDomain, PROTECTED_DOMAINS as BLOCKLIST_PROTECTED_DOMAINS } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
-import { logPlacesCall, getPlacesUsageThisMonth, getPlacesRatingFieldCallsThisMonth } from "../services/places-usage-tracker";
+import { logPlacesCall, getPlacesUsageThisMonth, getPlacesRatingFieldCallsThisMonth, getPlacesAddressFieldCallsThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { checkBrregNameHitAddress } from "../services/brreg-address-guard";
-import { rfbPlaceMatchEntity, pickRfbPlace, rfbPlacesTextQuery, formatPlacesMatchGuardLog, placesFieldMask, googleRatingFetchEnabled } from "../services/places-match";
+import { rfbPlaceMatchEntity, pickRfbPlace, rfbPlacesTextQuery, formatPlacesMatchGuardLog, placesFieldMask, googleRatingFetchEnabled, placesAddressFetchEnabled, withoutPlacesAddressField } from "../services/places-match";
 import { isDisplayablePhone, national8, stripLeadingContactLabel, stripAddressLeadingNoise, looksLikeDateText } from "../services/contact-normalizer";
 // W40 RFB spot-check write guards (Kvestad Sideri address, Aalan Gård phone).
 import { guardAutoPhoneWrite, recordOwnerRelayPhoneAudit, type PhoneWriteVerdict } from "../services/phone-source-write-guard";
@@ -2916,8 +2916,14 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
 
   // places.addressComponents (Pro tier; the call is Enterprise already
   // through rating) feeds the places-match guard below. placesFieldMask
-  // (S4-A2) keeps the rating fields out whenever rating fetch is off.
-  const fieldMask = placesFieldMask(["places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.addressComponents"]);
+  // (S4-A2) keeps the rating fields out whenever rating fetch is off, and
+  // withoutPlacesAddressField (A5) the formatted address while address fetch
+  // is off: the answer then reports no placeAddress.
+  const addressFetch = placesAddressFetchEnabled();
+  const fieldMask = withoutPlacesAddressField(
+    placesFieldMask(["places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.addressComponents"]),
+    addressFetch,
+  );
 
   try {
     // Durable Places call log (S4-A2 review): this route made unlogged calls
@@ -2972,7 +2978,7 @@ router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
     const rating = place.rating;
     const reviewCount = place.userRatingCount || 0;
     const placeName = place.displayName?.text || "";
-    const placeAddr = place.formattedAddress || "";
+    const placeAddr = addressFetch ? place.formattedAddress || "" : "";
 
     if (!rating) {
       res.json({ success: true, found: true, hasRating: false, placeName, message: "Funnet på Google Maps men ingen rating" });
@@ -3127,18 +3133,35 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // Google. Rows report no rating at all, fetched or on file, and the stored
   // values stay untouched.
   const fetchRating = googleRatingFetchEnabled();
-  const enterpriseFieldMask = placesFieldMask(
-    wantAddrPhone
-      ? ["places.id", "places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.internationalPhoneNumber", "places.addressComponents"]
-      : ["places.rating", "places.userRatingCount", "places.displayName", "places.addressComponents"],
-    fetchRating,
+  // Same dev-request, A5 (Daniel's answer to question 25): Google's formatted
+  // address is no longer fetched or written (services/places-match.ts,
+  // PLACES_ADDRESS_FETCH_ENABLED). While that is off, withoutPlacesAddressField
+  // keeps places.formattedAddress out of both masks below, the PR-29 Place
+  // Details fallback is off whatever max_details_calls says, and an agent
+  // with nothing else to fetch (no rating call) is not sent to Google at all:
+  // with rating, phone and address off the PR-82 pass only runs its
+  // Brreg-first address, without a Places call (placesCall below), and the
+  // row reports skipped_places_contact_disabled. places.addressComponents
+  // stays for the match guard (S3; Daniel, question 28), read in memory only.
+  const addressFetch = placesAddressFetchEnabled();
+  const enterpriseFieldMask = withoutPlacesAddressField(
+    placesFieldMask(
+      wantAddrPhone
+        ? ["places.id", "places.rating", "places.userRatingCount", "places.displayName", "places.formattedAddress", "places.internationalPhoneNumber", "places.addressComponents"]
+        : ["places.rating", "places.userRatingCount", "places.displayName", "places.addressComponents"],
+      fetchRating,
+    ),
+    addressFetch,
   );
   // Repeat-run field mask — Essentials/Pro tier only (no rating,
   // userRatingCount, or internationalPhoneNumber). formattedAddress is
   // Pro-tier and still useful for the PR-82 address backfill below; phone
   // backfill for these agents runs through the PR-29 Place Details (New)
   // fallback instead, which is a separate (non-Enterprise) SKU.
-  const proFieldMask = "places.id,places.displayName,places.formattedAddress,places.addressComponents";
+  const proFieldMask = withoutPlacesAddressField(
+    "places.id,places.displayName,places.formattedAddress,places.addressComponents",
+    addressFetch,
+  );
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
 
@@ -3275,120 +3298,129 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       continue;
     }
 
+    // A5: a Places call only for the rating (lever on) or, with address
+    // fetch on, the PR-82 address. Otherwise the PR-82 pass below runs on an
+    // empty place: Brreg's address only, no Google call.
+    const placesCall = requestEnterprise || addressFetch;
     const fieldMask = requestEnterprise ? enterpriseFieldMask : proFieldMask;
 
     const city = (info.agent as any).city || "";
     const searchQuery = rfbPlacesTextQuery(info.agent.name, city);
 
     try {
-      if (requestEnterprise) enterpriseCalls++; else proCalls++;
-      if (requestEnterprise) ratingCalls++; // the Enterprise mask carries the rating fields
-      // Durable cross-run log (places_api_call_log) for the monthly-projection
-      // guardrail — complements the per-run enterpriseCalls/proCalls counters
-      // above, which only live for the duration of this response. The mask
-      // marks a rating call in the log (S4-A2, places-usage-tracker.ts).
-      logPlacesCall(
-        getDb(),
-        "rfb",
-        "google-rating-batch",
-        requestEnterprise ? "text_search_enterprise" : "text_search_pro",
-        fieldMask
-      );
-      const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": placesKey,
-          "X-Goog-FieldMask": fieldMask,
-        },
-        body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
-      });
-
-      if (!resp.ok) { results.push({ agentId, status: "api_error", code: resp.status }); continue; }
-
-      const data = await resp.json() as any;
-      const candidates: any[] = Array.isArray(data.places) ? data.places : [];
-
-      // ── places-match guard (dev-request 2026-10-16-rfb-strukturerte-data-
-      // tredjepartsrating-og-places-treffvakt, S3) ─────────────────────────
-      // Google's answer is a candidate list for a free-text query. Of the
-      // candidates whose name AND postal code / town match this agent
-      // (services/places-match.ts, the guard dental uses), take the
-      // best-named one — never places[0] unchecked, which is how Bergen
-      // Mathall got Mathallen Oslo's rating (2026-07-16). Candidates but none
-      // confident (or two differently named ones nearly tie) → place_mismatch:
-      // no rating upsert, no address/phone write, no google_places
-      // provenance, no Brreg lookup or Details call. The Enterprise attempt
-      // is still recorded (the call was spent), exactly like a no_rating answer.
-      const entity = rfbPlaceMatchEntity({ name: info.agent.name, postalCode: info.knowledge.postalCode, city });
-      const pick = pickRfbPlace(entity, candidates);
-      if (candidates.length > 0 && !pick.place) {
-        console.warn(formatPlacesMatchGuardLog(agentId, pick, candidates.length, entity));
-        results.push({
-          agentId,
-          name: info.agent.name,
-          status: "place_mismatch",
-          mismatchReason: pick.reason,
-          placeName: pick.placeName,
-          nameSim: Math.round(pick.nameSim * 100) / 100,
-          ...ratingOnRow(),
+      // A5: without a Places call `place` stays empty, so the PR-82 pass
+      // below sees no Google address, phone or place id.
+      let place: any = {};
+      if (placesCall) {
+        if (requestEnterprise) enterpriseCalls++; else proCalls++;
+        if (requestEnterprise) ratingCalls++; // the Enterprise mask carries the rating fields
+        // Durable cross-run log (places_api_call_log) for the monthly-projection
+        // guardrail — complements the per-run enterpriseCalls/proCalls counters
+        // above, which only live for the duration of this response. The mask
+        // marks a rating call in the log (S4-A2, places-usage-tracker.ts).
+        logPlacesCall(
+          getDb(),
+          "rfb",
+          "google-rating-batch",
+          requestEnterprise ? "text_search_enterprise" : "text_search_pro",
+          fieldMask
+        );
+        const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": placesKey,
+            "X-Goog-FieldMask": fieldMask,
+          },
+          body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
         });
-        if (requestEnterprise) markEnterpriseFetched(agentId);
-        continue;
-      }
-      // null only when Google returned no candidates at all (handled below
-      // exactly as before: no_rating / skipped_has_rating; no_place with
-      // rating fetch off, S4-A2).
-      const place = pick.place;
 
-      if (requestEnterprise) {
-        if (!place?.rating) {
-          // Include any prior rating this agent already held — a refresh
-          // attempt that finds no rating this time must not read as "this
-          // agent has no rating" when the DB still holds the old value
-          // (upsertKnowledge below is never reached on this path, so the
-          // existing columns are untouched).
+        if (!resp.ok) { results.push({ agentId, status: "api_error", code: resp.status }); continue; }
+
+        const data = await resp.json() as any;
+        const candidates: any[] = Array.isArray(data.places) ? data.places : [];
+
+        // ── places-match guard (dev-request 2026-10-16-rfb-strukturerte-data-
+        // tredjepartsrating-og-places-treffvakt, S3) ─────────────────────────
+        // Google's answer is a candidate list for a free-text query. Of the
+        // candidates whose name AND postal code / town match this agent
+        // (services/places-match.ts, the guard dental uses), take the
+        // best-named one — never places[0] unchecked, which is how Bergen
+        // Mathall got Mathallen Oslo's rating (2026-07-16). Candidates but none
+        // confident (or two differently named ones nearly tie) → place_mismatch:
+        // no rating upsert, no address/phone write, no google_places
+        // provenance, no Brreg lookup or Details call. The Enterprise attempt
+        // is still recorded (the call was spent), exactly like a no_rating answer.
+        const entity = rfbPlaceMatchEntity({ name: info.agent.name, postalCode: info.knowledge.postalCode, city });
+        const pick = pickRfbPlace(entity, candidates);
+        if (candidates.length > 0 && !pick.place) {
+          console.warn(formatPlacesMatchGuardLog(agentId, pick, candidates.length, entity));
           results.push({
             agentId,
             name: info.agent.name,
-            status: "no_rating",
+            status: "place_mismatch",
+            mismatchReason: pick.reason,
+            placeName: pick.placeName,
+            nameSim: Math.round(pick.nameSim * 100) / 100,
             ...ratingOnRow(),
           });
-          // A completed (resp.ok) request with a genuine no-match/no-rating
-          // result — record the Enterprise-tier attempt so this agent isn't
-          // re-sent with the Enterprise mask again until the next
-          // ENTERPRISE_REFRESH_DAYS window. Never marked on transport
-          // errors (handled by the `!resp.ok` branch above, which continues
-          // before reaching here) — only on an actual completed answer from
-          // Google.
-          markEnterpriseFetched(agentId);
+          if (requestEnterprise) markEnterpriseFetched(agentId);
           continue;
         }
+        // null only when Google returned no candidates at all (handled below
+        // exactly as before: no_rating / skipped_has_rating; no_place with
+        // rating fetch off, S4-A2).
+        place = pick.place;
 
-        knowledgeService.upsertKnowledge(agentId, {
-          googleRating: place.rating,
-          googleReviewCount: place.userRatingCount || 0,
-          dataSource: "auto",
-        } as any);
-        trustScoreService.update(agentId);
-        enriched++;
+        if (requestEnterprise) {
+          if (!place?.rating) {
+            // Include any prior rating this agent already held — a refresh
+            // attempt that finds no rating this time must not read as "this
+            // agent has no rating" when the DB still holds the old value
+            // (upsertKnowledge below is never reached on this path, so the
+            // existing columns are untouched).
+            results.push({
+              agentId,
+              name: info.agent.name,
+              status: "no_rating",
+              ...ratingOnRow(),
+            });
+            // A completed (resp.ok) request with a genuine no-match/no-rating
+            // result — record the Enterprise-tier attempt so this agent isn't
+            // re-sent with the Enterprise mask again until the next
+            // ENTERPRISE_REFRESH_DAYS window. Never marked on transport
+            // errors (handled by the `!resp.ok` branch above, which continues
+            // before reaching here) — only on an actual completed answer from
+            // Google.
+            markEnterpriseFetched(agentId);
+            continue;
+          }
 
-        // Record the Enterprise-tier fetch for this refresh window (best-effort, non-blocking).
-        markEnterpriseFetched(agentId);
-      } else {
-        // Pro mask: no rating fields were requested, so `place.rating`/
-        // `place.userRatingCount` are never read here. Only address (Pro-tier,
-        // via formattedAddress) may have come back for the PR-82 backfill
-        // below. A repeat run (the agent already has Enterprise-tier data),
-        // or, with rating fetch off (S4-A2), any run.
-        if (!place) {
-          results.push({
-            agentId,
-            name: info.agent.name,
-            status: fetchRating ? "skipped_has_rating" : "no_place",
-            ...ratingOnRow(),
-          });
-          continue;
+          knowledgeService.upsertKnowledge(agentId, {
+            googleRating: place.rating,
+            googleReviewCount: place.userRatingCount || 0,
+            dataSource: "auto",
+          } as any);
+          trustScoreService.update(agentId);
+          enriched++;
+
+          // Record the Enterprise-tier fetch for this refresh window (best-effort, non-blocking).
+          markEnterpriseFetched(agentId);
+        } else {
+          // Pro mask: no rating fields were requested, so `place.rating`/
+          // `place.userRatingCount` are never read here. Only address (Pro-tier,
+          // via formattedAddress) may have come back for the PR-82 backfill
+          // below. A repeat run (the agent already has Enterprise-tier data),
+          // or, with rating fetch off (S4-A2), any run.
+          if (!place) {
+            results.push({
+              agentId,
+              name: info.agent.name,
+              status: fetchRating ? "skipped_has_rating" : "no_place",
+              ...ratingOnRow(),
+            });
+            continue;
+          }
         }
       }
 
@@ -3446,7 +3478,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       // Proto3 omits empty scalars, so Text Search may return no formattedAddress
       // / internationalPhoneNumber even when the place has them. We do ONE
       // Details call per agent (bounded by effectiveCap) to back-fill the gaps.
-      if (wantAddrPhone && place.id) {
+      // A5: off in code while address fetch is off, whatever max_details_calls
+      // says (the Details mask would ask for the address or the phone only).
+      if (wantAddrPhone && addressFetch && place.id) {
         // measure 3: no need to spend a Details call chasing an address BRREG
         // already gave us above.
         const needAddr = !brregAddr && (typeof place.formattedAddress !== "string" || place.formattedAddress.trim() === "");
@@ -3491,8 +3525,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         try {
           // measure 3: prefer the BRREG address looked up above — Google's
           // formattedAddress is only used as the fallback when BRREG had
-          // nothing usable for this agent.
-          const gAddrRaw = brregAddr || (typeof place.formattedAddress === "string" ? place.formattedAddress.trim() : "");
+          // nothing usable for this agent. A5: never while address fetch is
+          // off, also if Google sends one it was not asked for.
+          const gAddrRaw = brregAddr || (addressFetch && typeof place.formattedAddress === "string" ? place.formattedAddress.trim() : "");
           const gAddrSource: "brreg" | "google_places" = brregAddr ? "brreg" : "google_places";
           const gPhoneRaw = typeof place.internationalPhoneNumber === "string" ? place.internationalPhoneNumber : "";
           // Normalise phone: strip whitespace (and any leading "tel:"), keep the leading "+".
@@ -3711,7 +3746,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             provenanceError: provErr?.message ?? String(provErr),
           });
           // Skip the success-push below.
-          await new Promise(r => setTimeout(r, 200));
+          if (placesCall) await new Promise(r => setTimeout(r, 200));
           continue;
         }
       }
@@ -3719,7 +3754,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       results.push({
         agentId,
         name: info.agent.name,
-        status: requestEnterprise ? "enriched" : "enriched_addr_phone_only",
+        status: !placesCall ? "skipped_places_contact_disabled" : requestEnterprise ? "enriched" : "enriched_addr_phone_only",
         ...ratingOnRow(requestEnterprise ? place : null),
         ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
         // W40 write guards: present only when they fired.
@@ -3727,8 +3762,8 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         ...(addressSkippedReason ? { addressSkippedReason } : {}),
       });
 
-      // Small delay to be nice to Google
-      await new Promise(r => setTimeout(r, 200));
+      // Small delay to be nice to Google (none when it was not called, A5)
+      if (placesCall) await new Promise(r => setTimeout(r, 200));
     } catch (err: any) {
       results.push({ agentId, status: "error", message: err.message });
     }
@@ -3769,7 +3804,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 // 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt,
 // S4-A2) counts the calls whose FieldMask asked Google for its rating: 0
 // while rating fetch is off (S4-A's acceptance); rows logged before S4-A2
-// carry no mark and are not counted.
+// carry no mark and are not counted. address_field_calls_this_month (same
+// dev-request, A5) counts the calls whose FieldMask asked for Google's
+// formatted address the same way: 0 while PLACES_ADDRESS_FETCH_ENABLED is off.
 router.get("/admin/places-usage", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = getAdminKey();
@@ -3781,6 +3818,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
   const byVerticalSku: Array<{ vertical: string; sku: string; calls_this_month: number }> = [];
   byVerticalSku.push(...getPlacesUsageThisMonth(getDb(), "rfb"));
   let ratingFieldCallsThisMonth = getPlacesRatingFieldCallsThisMonth(getDb());
+  let addressFieldCallsThisMonth = getPlacesAddressFieldCallsThisMonth(getDb());
   // Only reach into the dental vertical DB when it's explicitly enabled —
   // db-factory.ts's getDb("dental") lazily CREATES /app/data/dental.db (and
   // runs the full dental schema-init) on first call, so an unconditional
@@ -3791,6 +3829,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
     try {
       byVerticalSku.push(...getPlacesUsageThisMonth(getVerticalDb("dental"), "dental"));
       ratingFieldCallsThisMonth += getPlacesRatingFieldCallsThisMonth(getVerticalDb("dental"));
+      addressFieldCallsThisMonth += getPlacesAddressFieldCallsThisMonth(getVerticalDb("dental"));
     } catch {
       // dental vertical enabled but unavailable for some other reason — rfb-only summary
     }
@@ -3811,6 +3850,7 @@ router.get("/admin/places-usage", (req: Request, res: Response) => {
       soft_guardrail_threshold: SOFT_GUARDRAIL_THRESHOLD,
       over_soft_guardrail: enterpriseCallsThisMonth > SOFT_GUARDRAIL_THRESHOLD,
       rating_field_calls_this_month: ratingFieldCallsThisMonth,
+      address_field_calls_this_month: addressFieldCallsThisMonth,
     },
   });
 });
