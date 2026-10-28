@@ -17445,14 +17445,26 @@ export type GardssalgReadinessTier =
   | "eier_fjernet";
 
 // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: effective
-// terminal status of a provider row. (c) explicit column value, else (b) a
+// terminal status of a provider row. (c) explicit column value, else (a) the
+// row is hidden with catalog_hidden_reason='remove_request' (written by
+// POST /admin/gardssalg-provider-visibility mode remove_request), else (b) a
 // "fjern oss" blocklist match on org_nr / hjemmeside / epost -> eier_fjernet.
+// (a) covers remove_request rows the blocklist cannot match (no org.nr /
+// website / e-post, or the best-effort blocklist write failed). Rows with
+// reason NULL or 'quality' fall through to (b) unchanged.
 export function deriveGardssalgTerminalStatus(
   stored: string | null | undefined,
-  ids: { org_nr?: string | null; hjemmeside?: string | null; epost?: string | null },
+  ids: {
+    org_nr?: string | null;
+    hjemmeside?: string | null;
+    epost?: string | null;
+    catalog_hidden?: number | null;
+    catalog_hidden_reason?: string | null;
+  },
   ownerRemovedMatcher: (ids: { orgNr?: string | null; website?: string | null; email?: string | null }) => boolean,
 ): GardssalgTerminalStatus | null {
   if (stored === "krever_eier" || stored === "dod_kilde" || stored === "eier_fjernet") return stored;
+  if (ids.catalog_hidden === 1 && ids.catalog_hidden_reason === "remove_request") return "eier_fjernet";
   if (ownerRemovedMatcher({ orgNr: ids.org_nr, website: ids.hjemmeside, email: ids.epost })) return "eier_fjernet";
   return null;
 }
@@ -17681,6 +17693,7 @@ export function computeGardssalgReadinessRows(
     content_source: string | null;
     booking_live: number | null;
     catalog_hidden: number | null;
+    catalog_hidden_reason: string | null;
     is_test_provider: number | null;
     slug: string | null;
     field_provenance: string | null;
@@ -17697,7 +17710,7 @@ export function computeGardssalgReadinessRows(
   // every row must appear exactly once here.
   let sql = `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
                 about_text, visit_text, opening_hours_text, products,
-                content_source, booking_live, catalog_hidden, is_test_provider, slug,
+                content_source, booking_live, catalog_hidden, catalog_hidden_reason, is_test_provider, slug,
                 field_provenance, brreg_verified, antall_ansatte, terminal_status,
                 geocode_confidence, name_collision
            FROM experience_providers
@@ -17817,11 +17830,9 @@ export function computeGardssalgReadinessRows(
     const size_flag = computeGardssalgSizeFlag(p.antall_ansatte, sizeGateThreshold, antallAnsatteBrregConsulted);
     const size_flag_reason: GardssalgSizeFlagReason = antallAnsatteBrregConsulted ? "no_registered_figure" : null;
     // dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal: an explicit
-    // terminal_status wins; otherwise a row whose org.nr / domain / e-post sits
-    // on the blocklist with a "fjern oss" reason is derived as eier_fjernet.
-    // (The hidden_reason `remove_request` source is NOT wired: that value does
-    // not exist in EXP_DC_HIDE_REASONS on main, and hidden_reason lives on
-    // experiences, not providers.)
+    // terminal_status wins; otherwise a row hidden with
+    // catalog_hidden_reason='remove_request', or whose org.nr / domain / e-post
+    // sits on the blocklist with a "fjern oss" reason, is derived as eier_fjernet.
     const terminal_status = deriveGardssalgTerminalStatus(p.terminal_status, p, ownerRemovedMatcher);
     // dev-request 2026-09-09-navnekollisjon-feil-enhet-ved-harvest-og-bridge,
     // AC3: see computeGardssalgReadinessTier's own `name_collision` doc
@@ -18143,7 +18154,7 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
     const row = expDb
       .prepare(
         `SELECT id, navn, kommune, epost, hjemmeside, about_text, products, field_provenance,
-                brreg_verified, terminal_status, org_nr
+                brreg_verified, terminal_status, org_nr, catalog_hidden, catalog_hidden_reason
            FROM experience_providers WHERE id = ?`,
       )
       .get(id) as
@@ -18159,6 +18170,8 @@ router.post("/admin/gardssalg-second-line-verify", requireAdmin, async (req: Req
           brreg_verified: number | null;
           terminal_status: string | null;
           org_nr: string | null;
+          catalog_hidden: number | null;
+          catalog_hidden_reason: string | null;
         }
       | undefined;
 
@@ -31405,10 +31418,9 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
         continue;
       }
       // Owner-removed guard: a producer that asked for removal (explicit
-      // terminal_status, or org.nr/domain/e-post on the blocklist with a
-      // "fjern oss" reason) must not be unhidden by accident. (Not yet derived
-      // from catalog_hidden_reason='remove_request' — follow-up now that main
-      // carries that reason.)
+      // terminal_status, hidden with catalog_hidden_reason='remove_request',
+      // or org.nr/domain/e-post on the blocklist with a "fjern oss" reason)
+      // must not be unhidden by accident.
       if (!hidden && ownerRemovedMatcher && deriveGardssalgTerminalStatus(row.terminal_status, row, ownerRemovedMatcher) === "eier_fjernet") {
         if (!overrideOwnerRemoved) {
           skippedOwnerRemoved.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, outcome: "skipped_owner_removed" });

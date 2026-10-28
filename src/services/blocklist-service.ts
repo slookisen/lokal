@@ -219,8 +219,10 @@ export function isBlocked(opts: {
 
 // ─── Owner-removed matcher (dev-request 2026-10-01-opplevagent-eier-fjernet-som-terminal) ──
 // A blocklist row whose reason contains "fjern oss" means the producer itself
-// asked to be removed (gardssalg-provider-visibility writes
-// "... hide (fjern oss)"; the CS flow uses the same wording). The readiness
+// asked to be removed. Only gardssalg-provider-visibility's own rows count:
+// it writes "... hide (fjern oss)" (mode remove_request). The CS flow does NOT
+// use this wording (it writes "customer-opt-out (opplevagent)"), so CS
+// blocklist rows never match here. The readiness
 // tier and the unhide guard treat such a producer as terminal `eier_fjernet`.
 // ONE query per call builds in-memory sets, so a readiness pass over the whole
 // corpus does not issue per-row blocklist lookups. Fail-open on a DB error

@@ -216,10 +216,13 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
       }
 
       // ── pv-7: unhide (hidden=false) clears the flag → NULL, back on grid. ─
+      //    pv-a was hidden in pv-3 with the default mode remove_request, so it
+      //    is eier_fjernet (catalog_hidden_reason='remove_request', lokal#1173)
+      //    and the unhide needs override_owner_removed.
       {
         const r = await callRoute(opplevelserRouter, {
           headers: adminHeaders,
-          body: { hidden: false, providerIds: ["pv-a"], apply: true },
+          body: { hidden: false, providerIds: ["pv-a"], apply: true, override_owner_removed: true },
         });
         assertEq(r.body.changed_count, 1, "pv-7a: unhide changed the row");
         assertEq(hiddenFlag("pv-a"), null, "pv-7b: catalog_hidden cleared to NULL (grid filter semantics)");
@@ -381,11 +384,19 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         assertEq(rr.body.blocklist_inserted_total, 3, "pv-13p: remove_request blocklists all 3 identifiers");
         assertEq(reasonOf("pv-r"), "remove_request", "pv-13q: reason stored as remove_request");
         assertEq(blCount(), before + 3, "pv-13r: 3 blocklist rows added");
+        // A remove_request row is eier_fjernet (lokal#1173): unhide without
+        // override_owner_removed is refused and keeps the flag and reason.
+        const guarded = await callRoute(opplevelserRouter, {
+          headers: adminHeaders, body: { hidden: false, providerIds: ["pv-r"], apply: true },
+        });
+        assertEq((guarded.body.skipped_owner_removed as any[])?.[0]?.id, "pv-r", "pv-13s0: unhide of remove_request row without override → skipped_owner_removed");
+        assertEq(hiddenFlag("pv-r"), 1, "pv-13s1: guarded row stays hidden");
+        assertEq(reasonOf("pv-r"), "remove_request", "pv-13s2: guarded row keeps its reason");
         const def = await callRoute(opplevelserRouter, {
-          headers: adminHeaders, body: { hidden: false, providerIds: ["pv-r"], apply: true, override_owner_removed: true }, // remove_request blocklists «fjern oss» → eier_fjernet-vakten (lokal#1173) krever override
+          headers: adminHeaders, body: { hidden: false, providerIds: ["pv-r"], apply: true, override_owner_removed: true },
         });
         assertEq(def.body.mode, "remove_request", "pv-13s: default mode is remove_request");
-        assertEq(reasonOf("pv-r"), null, "pv-13t: unhide clears the reason");
+        assertEq(reasonOf("pv-r"), null, "pv-13t: override unhide clears the reason");
       }
     } catch (err: any) {
       failed++;

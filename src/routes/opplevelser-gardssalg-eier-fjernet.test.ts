@@ -5,12 +5,15 @@
  * accident.
  *
  *   (a) terminal_status='eier_fjernet' via POST /admin/gardssalg-set-terminal-status
+ *   (a2) catalog_hidden_reason='remove_request' (hidden via the lever with
+ *       mode remove_request), even with no org.nr / website / e-post to
+ *       blocklist
  *   (b) org.nr / domain / e-post on the blocklist with a "fjern oss" reason
  *       (a blocklist row with another reason does NOT count)
  *   (c) POST /admin/gardssalg-provider-visibility hidden:false without
  *       override_owner_removed -> skipped_owner_removed; with override -> shown
- *   (d) a quality-hidden row (no removal evidence) stays `skjult` and is
- *       unhidden normally
+ *   (d) a row hidden via the lever with mode "quality" (no removal evidence)
+ *       stays `skjult` and is unhidden normally
  *   (e) summary carries eier_fjernet as its own bucket
  *
  * Same harness as the other gårdssalg route tests (:memory: DBs, fresh
@@ -221,12 +224,31 @@ export function runOpplevelserGardssalgEierFjernetTests(log = false): Promise<Te
 
       // ── (d) quality-hidden row (no removal evidence) stays skjult ────────
       {
-        mk("ef-quality", { catalog_hidden: 1 });
+        mk("ef-quality", { org_nr: "977000010" });
+        const h = await visibility({ hidden: true, providerIds: ["ef-quality"], mode: "quality", apply: true });
+        assertEq(h.body.changed_count, 1, "ef-d0: quality hide via the lever");
+        assertEq(hiddenFlag("ef-quality"), 1, "ef-d0b: row hidden");
         assertEq(await tierOf("ef-quality"), "skjult", "ef-d1: quality-hidden row is still skjult");
         const r = await visibility({ hidden: false, providerIds: ["ef-quality"], apply: true });
         assertEq(r.body.changed_count, 1, "ef-d2: unhide works without override");
         assertEq(r.body.skipped_owner_removed?.length, 0, "ef-d3: not flagged owner-removed");
         assertEq(r.body.overridden_owner_removed, undefined, "ef-d4: no override block when flag absent");
+        assertEq(hiddenFlag("ef-quality"), null, "ef-d5: row visible again");
+      }
+
+      // ── (a2) remove_request via the lever on a row with no org.nr /
+      //    website / e-post: nothing reaches the blocklist, but
+      //    catalog_hidden_reason='remove_request' alone makes it eier_fjernet.
+      {
+        mk("ef-rr", { org_nr: null, hjemmeside: null, epost: null });
+        const h = await visibility({ hidden: true, providerIds: ["ef-rr"], mode: "remove_request", apply: true });
+        assertEq(h.body.changed_count, 1, "ef-a2-1: remove_request hide via the lever");
+        assertEq(h.body.blocklist_inserted_total, 0, "ef-a2-2: no identifiers -> 0 blocklist rows");
+        assertEq(await tierOf("ef-rr"), "eier_fjernet", "ef-a2-3: hidden_reason remove_request -> eier_fjernet");
+        const r = await visibility({ hidden: false, providerIds: ["ef-rr"], apply: true });
+        assertEq(r.body.changed_count, 0, "ef-a2-4: unhide without override changes nothing");
+        assertEq(r.body.skipped_owner_removed?.[0]?.id, "ef-rr", "ef-a2-5: skipped_owner_removed");
+        assertEq(hiddenFlag("ef-rr"), 1, "ef-a2-6: row stays hidden");
       }
     } catch (err: any) {
       failed++;
