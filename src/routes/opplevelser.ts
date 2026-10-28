@@ -4888,8 +4888,14 @@ export async function runGardssalgContentRefresh(
     // LLM trigger above — a hit here means generateGardssalgOpeningHours
     // FromSource is never even called (see candidateHours below). Scanned
     // over combinedHtml (homepage + every fetched sub-page), same scope as
-    // the regex trigger.
-    const jsonLdHours = extractJsonLdOpeningHours(combinedHtml);
+    // the regex trigger. Spec B: like the LLM path's output, the JSON-LD
+    // value must pass classifyGardssalgFieldDefect (fail-closed) — a
+    // defective one is treated as if JSON-LD had found nothing.
+    const jsonLdHoursRaw = extractJsonLdOpeningHours(combinedHtml);
+    const jsonLdHours =
+      jsonLdHoursRaw && !classifyGardssalgFieldDefect("opening_hours_text", jsonLdHoursRaw).defective
+        ? jsonLdHoursRaw
+        : null;
 
     // Kvalitetsgate-redesign (dev-request 2026-07-20-gardssalg-kvalitetsgate-
     // redesign, slice 2/3/4): about_text/visit_text candidates are judged by

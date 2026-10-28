@@ -387,6 +387,36 @@ export function runGardssalgQualityUpdateTests(opts: { log?: boolean } = {}): Te
     "49: an e-mail address cut inside its TLD ('booking@7fjell.c') is STILL flagged — the TLD needs >= 2 letters"
   );
 
+  // ── truncated_mid_sentence: trailing clock-time exception, ────────────
+  // ── opening_hours_text only (2026-10-28, Apal Sideri) ─────────────────
+  assertEq(
+    classifyGardssalgFieldDefect("opening_hours_text", "Mandag, Tirsdag, Onsdag, Torsdag, Fredag, Lørdag 10:00–18:00"),
+    OK,
+    "50 (2026-10-28, Apal Sideri): JSON-LD-shaped hours ending in '10:00–18:00' are NOT truncated_mid_sentence"
+  );
+  const RESTAURANT_HOURS = "Gårdsbutikk og kafé, sommersesongen. Restaurant: mandag – søndag 11.00 – 18.00";
+  assertEq(RESTAURANT_HOURS.length >= 50, true, "51a: fixture is long enough for the truncation check to run");
+  assertEq(
+    classifyGardssalgFieldDefect("opening_hours_text", RESTAURANT_HOURS),
+    OK,
+    "51: hours ending in a dotted clock-time range ('11.00 – 18.00') are NOT truncated_mid_sentence"
+  );
+  for (const cut of [
+    "Gårdsbutikken holder åpent hver torsdag fra klokken 18.00 – 20.00. D",
+    "Åpningstidene varierer gjennom sesongen, så ikke nøl med å ringe oss",
+  ]) {
+    assertEq(
+      classifyGardssalgFieldDefect("opening_hours_text", cut),
+      TRUNCATED,
+      `52: hours ending in a word or a stray letter ('${cut.slice(-12)}') are STILL flagged truncated_mid_sentence`
+    );
+  }
+  assertEq(
+    classifyGardssalgFieldDefect("about_text", "Vi er en liten gård med sideri og gårdsbutikk, åpent hver dag 10:00–18:00"),
+    TRUNCATED,
+    "53: the clock-time exception is field-scoped — about_text ending in '10:00–18:00' is STILL flagged truncated_mid_sentence"
+  );
+
   return { passed, failed, failures };
 }
 
