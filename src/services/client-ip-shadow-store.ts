@@ -25,6 +25,10 @@
 // first window only from its first request), so hours_covered no longer
 // counts a restart's partial window as a full 5 min. Rows stored before 1d
 // keep the column's default, a full window, as they were counted then.
+// From trinn 1e, non_public_by_json: the window's non_public fallbacks per
+// range code, path class and UA class (counters.non_public_by), as compact
+// JSON of the non-zero counts. Rows stored before 1e have NULL there and are
+// summed as `unknown` (see nonPublicByFromRows).
 // No IP, no key, no hash.
 //
 // The timer's flush runs inside trackJob, as every other periodic DB job
@@ -34,7 +38,16 @@ import os from "os";
 import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
 import { trackJob } from "./event-loop-monitor";
-import type { ClientIpCounters, ClientIpMode, ClientIpWindowFanIn } from "../middleware/client-ip";
+// client-ip.ts imports this module too: NON_PUBLIC_RANGE_CODES is only read
+// inside functions (never at load), so the require cycle is harmless.
+import {
+  NON_PUBLIC_RANGE_CODES,
+  type ClientIpCounters,
+  type ClientIpMode,
+  type ClientIpNonPublicBy,
+  type ClientIpWindowFanIn,
+  type PathClass,
+} from "../middleware/client-ip";
 
 export const CLIENT_IP_WINDOW_RETENTION_DAYS = 14;
 const FLUSH_EVERY_MS = 30_000;
@@ -145,6 +158,7 @@ const INSERT_COLUMNS = [
   "fanin_ua",
   "created_at",
   "covered_ms",
+  "non_public_by_json",
 ];
 const INSERT_SQL = `INSERT OR IGNORE INTO client_ip_shadow_windows (${INSERT_COLUMNS.join(", ")}) VALUES (${INSERT_COLUMNS.map(() => "?").join(", ")})`;
 
@@ -165,15 +179,96 @@ const TOTALS_SQL = `SELECT COUNT(*) AS rows_, COUNT(DISTINCT window_start) AS wi
 const COVERED_SQL = `SELECT COALESCE(SUM(covered), 0) AS covered_ms FROM
   (SELECT MAX(covered_ms) AS covered FROM client_ip_shadow_windows WHERE mode = ? GROUP BY window_start)`;
 
+// Trinn 1e: only rows with a non_public to explain (a few per day in prod).
+const NON_PUBLIC_BY_SQL = `SELECT fallback_non_public AS np, non_public_by_json AS j FROM client_ip_shadow_windows
+  WHERE mode = ? AND fallback_non_public > 0`;
+
+const ROUTES: readonly PathClass[] = ["api", "a2a", "mcp", "other"];
+// A uaFamily class: a traffic-classifier category, AI ones with ":<vendor>".
+const UA_CLASS = /^[a-z_]{1,32}(:[a-z_]{1,32})?$/;
+
+/** A row's breakdown as stored: only the non-zero counts, so a quiet window costs a few bytes. */
+function nonPublicByJson(by: ClientIpNonPublicBy | undefined): string | null {
+  if (!by) return null;
+  const nonzero = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).filter(([, n]) => n > 0));
+  return JSON.stringify({ range: nonzero(by.range), route: nonzero(by.route), ua: nonzero(by.ua) });
+}
+
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+/**
+ * One stored breakdown, or null when it cannot be trusted: not JSON, a key
+ * outside the codes / path classes / UA classes, a count that is not a
+ * whole number ≥ 0, or a split that does not sum to the row's non_public.
+ */
+function parseNonPublicBy(json: unknown, np: number): { range: Record<string, number>; route: Record<string, number>; ua: Record<string, number> } | null {
+  if (typeof json !== "string") return null;
+  let v: any;
+  try {
+    v = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!v || typeof v !== "object") return null;
+  const part = (o: unknown, ok: (k: string) => boolean): Record<string, number> | null => {
+    if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+    const out: Record<string, number> = {};
+    let sum = 0;
+    for (const [k, n] of Object.entries(o)) {
+      if (!ok(k) || !isCount(n)) return null;
+      out[k] = n;
+      sum += n;
+    }
+    return sum === np ? out : null;
+  };
+  const range = part(v.range, (k) => (NON_PUBLIC_RANGE_CODES as readonly string[]).includes(k));
+  const route = part(v.route, (k) => (ROUTES as readonly string[]).includes(k));
+  const ua = part(v.ua, (k) => UA_CLASS.test(k));
+  return range && route && ua ? { range, route, ua } : null;
+}
+
+/**
+ * cumulative.counters.non_public_by over the rows with non_public > 0: their
+ * breakdowns summed; a row without one (NULL: stored before trinn 1e) or with
+ * one parseNonPublicBy rejects adds its non_public to `unknown` in range,
+ * route and ua alike, and counts once in unknown_rows. So range, route and
+ * ua each sum to counters.fallback.non_public, and unknown_rows says how
+ * many windows' non_public stays unexplained. Rows with non_public = 0 are
+ * not read: they have nothing to explain.
+ */
+function nonPublicByFromRows(rows: Array<{ np: number; j: unknown }>): ClientIpNonPublicBy {
+  const range = Object.fromEntries(NON_PUBLIC_RANGE_CODES.map((c) => [c, 0])) as ClientIpNonPublicBy["range"];
+  const route: ClientIpNonPublicBy["route"] = { api: 0, a2a: 0, mcp: 0, other: 0 };
+  const ua: Record<string, number> = {};
+  let unknown = 0;
+  let unknownRows = 0;
+  for (const r of rows) {
+    const by = parseNonPublicBy(r.j, r.np);
+    if (!by) {
+      unknown += r.np;
+      unknownRows++;
+      continue;
+    }
+    for (const [k, n] of Object.entries(by.range)) range[k as keyof typeof range] += n;
+    for (const [k, n] of Object.entries(by.route)) route[k as PathClass] += n;
+    for (const [k, n] of Object.entries(by.ua)) ua[k] = (ua[k] ?? 0) + n;
+  }
+  range.unknown = unknown;
+  route.unknown = unknown;
+  ua.unknown = unknown;
+  return { range, route, ua, unknown_rows: unknownRows };
+}
+
 const FANIN_MAX_SQL = `SELECT window_start, fanin_ratio, fanin_class, fanin_fan_in, fanin_ua FROM client_ip_shadow_windows
   WHERE mode = ? AND fanin_ratio IS NOT NULL ORDER BY fanin_ratio DESC, window_start DESC LIMIT 1`;
 
-function countersFromRow(r: Record<string, number>): ClientIpCounters {
+function countersFromRow(r: Record<string, number>, nonPublicBy: ClientIpNonPublicBy): ClientIpCounters {
   return {
     n: r.n,
     fci_valid: r.fci_valid,
     fallback: { missing: r.fallback_missing, invalid: r.fallback_invalid, non_public: r.fallback_non_public },
     fallback_hc: r.fallback_hc,
+    non_public_by: nonPublicBy,
     errors: r.errors,
     xff_client_supplied: r.xff_client_supplied,
     agree_fci_edge: { n: r.agree_fci_edge_n, agree: r.agree_fci_edge_agree },
@@ -255,7 +350,8 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
               f ? f.fanIn : null,
               f ? f.ua : null,
               createdAt,
-              Math.round(r.coveredMs)
+              Math.round(r.coveredMs),
+              nonPublicByJson(r.counters.non_public_by)
             ).changes;
           }
         })();
@@ -281,6 +377,7 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
     const db = resolveDb();
     const r = db.prepare(TOTALS_SQL).get(mode) as Record<string, any>;
     const covered = db.prepare(COVERED_SQL).get(mode) as { covered_ms: number };
+    const nonPublicBy = nonPublicByFromRows(db.prepare(NON_PUBLIC_BY_SQL).all(mode) as Array<{ np: number; j: unknown }>);
     const m = db.prepare(FANIN_MAX_SQL).get(mode) as
       | { window_start: string; fanin_ratio: number; fanin_class: ClientIpWindowFanIn["class"]; fanin_fan_in: number; fanin_ua: string }
       | undefined;
@@ -291,7 +388,7 @@ export function createClientIpShadowStore(deps: ClientIpShadowStoreDeps = {}): C
       machines: r.machines_,
       first: r.first_ ?? null,
       last: r.last_ ?? null,
-      counters: countersFromRow(r),
+      counters: countersFromRow(r, nonPublicBy),
       fanInMax: m
         ? { ratio: m.fanin_ratio, class: m.fanin_class, fanIn: m.fanin_fan_in, ua: m.fanin_ua, window_start: m.window_start }
         : null,
