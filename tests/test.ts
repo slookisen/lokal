@@ -50496,6 +50496,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
+// «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
+// (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,
+// the orders explanation + orderable-items check, the portal cards moved into
+// «Mine valg», the first-login answer in its row. Swaps the getDb() singleton,
+// env vars and the confirm-mail sender (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: Mine valg side v2 ──");
+  try {
+    const { runOwnerFeaturesS2eTests } = require("../src/routes/owner-features-s2e.test") as
+      typeof import("../src/routes/owner-features-s2e.test");
+    const r = await runOwnerFeaturesS2eTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2e: " + f);
+    console.log(`  owner-features-s2e: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2e: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's contact /
 // price / stats choices on the public surfaces (OWNER_FEATURES_ENFORCE + the
 // allowlist; byte-identical while off), matrix per key × declared surface.

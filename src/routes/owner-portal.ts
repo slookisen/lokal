@@ -1139,7 +1139,7 @@ function pauseAuditValue(state: OwnerPauseState): string {
 }
 
 /** 'YYYY-MM-DD' strictly after today (UTC) and within a year, or null when invalid. */
-function parseResumeDate(raw: unknown, now: Date = new Date()): string | null {
+export function parseResumeDate(raw: unknown, now: Date = new Date()): string | null {
   const v = typeof raw === "string" ? raw.trim() : "";
   if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
   const d = new Date(`${v}T00:00:00Z`);
@@ -1552,6 +1552,23 @@ export function ownerOrderEmailSectionHtml(agentId: string, current: string | nu
         </div>`;
 }
 
+/**
+ * S2e («Én bryter, ett sted», v2 principle 6): for a profile that has «Mine
+ * valg», the «Bestillinger» card (orders on/off + the order address) and the
+ * «Pause og sletting» card are replaced by this one link — the choices
+ * themselves live only in «Mine valg» (orders.enabled, orders.email,
+ * visibility.profile), with the same effect as the old cards.
+ */
+export function ownerFeaturesMovedCardHtml(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return `<div class="ep-card" id="bestillinger">
+        <h2>Bestillinger og pause</h2>
+        <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">Om du tar imot bestillinger, hvilken adresse de sendes til, og pause av profilen, velger du nå i «Mine valg».</p>
+        <a class="ep-btn ep-btn-secondary" href="/eier/${id}/valg#gruppe-orders">Gå til bestillinger i Mine valg</a>
+        <a class="ep-btn ep-btn-secondary" href="/eier/${id}/valg#gruppe-visibility">Gå til pause i Mine valg</a>
+      </div>`;
+}
+
 /** 403 page: valid session for this agent, but no verified owner (S1b punkt 5). */
 /** S2b: the portal card that links to «Mine valg» (/eier/:id/valg). */
 export function ownerFeaturesEntryCardHtml(agentId: string): string {
@@ -1680,10 +1697,19 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       if (shouldRenderPaymentCard(paymentStatus)) paymentCardHtml = renderPaymentCard(agentId, paymentStatus);
     } catch { paymentCardHtml = ""; }
 
+    // S2b: «Mine valg» entry card — only for a subject in
+    // OWNER_FEATURES_ALLOWED_SUBJECTS and a verified owner (empty/unset
+    // allowlist = "" = the portal is byte-identical to before).
+    let hasOwnerFeatures = false;
+    try {
+      hasOwnerFeatures = isSubjectAllowedForOwnerFeatures("rfb", agentId) && isVerifiedOwner(agentId, session);
+    } catch { hasOwnerFeatures = false; }
+
     // S1b punkt 6: «Pause og sletting» card — only with OWNER_PAUSE_ENABLED on
-    // (flag off = the portal is byte-identical to before).
+    // (flag off = the portal is byte-identical to before). S2e: not for a
+    // profile with «Mine valg» (the pause lives there).
     let pauseCardHtml = "";
-    if (ownerPauseEnabled()) {
+    if (ownerPauseEnabled() && !hasOwnerFeatures) {
       try {
         pauseCardHtml = ownerPauseCardHtml(agent, isVerifiedOwner(agentId, session), readOwnerPause(agentId));
       } catch { pauseCardHtml = ""; }
@@ -1693,7 +1719,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     // card — only with OWNER_ORDER_EMAIL_ENABLED on and a verified owner
     // (flag off = the portal is byte-identical to before).
     let orderEmailHtml = "";
-    if (ownerOrderEmailEnabled()) {
+    if (ownerOrderEmailEnabled() && !hasOwnerFeatures) {
       try {
         if (isVerifiedOwner(agentId, session)) {
           orderEmailHtml = ownerOrderEmailSectionHtml(agentId, currentOrderRecipient(agentId), pendingOrderEmailChange(agentId)?.new_email ?? null);
@@ -1701,15 +1727,10 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       } catch { orderEmailHtml = ""; }
     }
 
-    // S2b: «Mine valg» entry card — only for a subject in
-    // OWNER_FEATURES_ALLOWED_SUBJECTS and a verified owner (empty/unset
-    // allowlist = "" = the portal is byte-identical to before).
-    let ownerFeaturesCardHtml = "";
-    try {
-      if (isSubjectAllowedForOwnerFeatures("rfb", agentId) && isVerifiedOwner(agentId, session)) {
-        ownerFeaturesCardHtml = ownerFeaturesEntryCardHtml(agentId);
-      }
-    } catch { ownerFeaturesCardHtml = ""; }
+    const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
+    // S2e: with «Mine valg», the «Bestillinger» card (and its order-address
+    // section) is replaced by a link there; otherwise unchanged.
+    const ordersOrMovedCardHtml = hasOwnerFeatures ? ownerFeaturesMovedCardHtml(agentId) : ordersCardHtml(agent, orderEmailHtml);
 
     // Fase A2: number of orders waiting for an answer (tolerant: a DB without orders shows 0).
     let pendingOrderCount = 0;
@@ -1793,7 +1814,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersCardHtml(agent, orderEmailHtml)}${paymentCardHtml}${pauseCardHtml}
+      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>

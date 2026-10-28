@@ -4,6 +4,8 @@ import { getDb } from "../database/init";
 import {
   verifyOwnerSession, isVerifiedOwner, crossSiteRequest, OWNER_NOT_VERIFIED_MESSAGE,
   portalShell, ownerNotVerifiedPage,
+  ownerOrderEmailEnabled, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
+  parseResumeDate, ownerUnifiedSessionEnabled,
 } from "./owner-portal";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, type OwnerFeatureEntry } from "../owner-features/registry";
@@ -29,6 +31,11 @@ import {
 } from "../owner-features/changes";
 import { formatOwnerFeatureValue, renderOwnerFeaturesPageBody, type OwnerPageNotice } from "../owner-features/page";
 import { findOwnerFeature } from "../owner-features/registry";
+import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
+import { isRowOrderableForRealOrder } from "../services/cart-service";
+import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
+import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
+import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» owner API — dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a
@@ -268,7 +275,88 @@ const PAGE_MESSAGES: Record<string, { ok: boolean; text: string }> = {
   intro_nei: { ok: true, text: "Takk! Svaret ditt er lagret: ingen nyheter og tips." },
   ugyldig: { ok: false, text: "Verdien er ikke gyldig." },
   feil: { ok: false, text: "Klarte ikke å lagre. Prøv igjen." },
+  // S2e
+  niva_valgt: { ok: true, text: "Nivået er valgt. Valgene dine var allerede slik, så ingenting annet er endret." },
+  interesse: { ok: true, text: "Takk! Vi har notert at du vil ha dette. Ingenting er endret, og vi sender ingen e-post nå." },
+  interesse_finnes: { ok: true, text: "Du har allerede sagt fra om dette." },
+  ugyldig_dato: { ok: false, text: "Tilbakedato må være en dato fram i tid (innen ett år). Ingenting er endret." },
+  ordre_epost_sendt: { ok: true, text: "Vi har sendt en bekreftelse til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt." },
+  ordre_epost_ugyldig: { ok: false, text: "Skriv inn en gyldig e-postadresse." },
+  ordre_epost_samme: { ok: false, text: "Bestillinger sendes allerede til denne adressen." },
+  ordre_epost_sperret: { ok: false, text: "Vi kan ikke sende bestillinger til denne adressen. Kontakt kontakt@rettfrabonden.com." },
+  ordre_epost_grense: { ok: false, text: "For mange forsøk. Prøv igjen om en time." },
+  ordre_epost_feil: { ok: false, text: "Klarte ikke å sende bekreftelsen. Prøv igjen senere." },
+  ordre_epost_av: { ok: false, text: "Adressen for bestillinger kan ikke endres her nå." },
 };
+
+/** S2e: requestOwnerOrderEmailChange error → page message. */
+const ORDER_EMAIL_MESSAGES: Record<string, string> = {
+  invalid_email: "ordre_epost_ugyldig",
+  same_email: "ordre_epost_samme",
+  email_blocked: "ordre_epost_sperret",
+  rate_limited: "ordre_epost_grense",
+  not_found: "ordre_epost_av",
+};
+
+class OrderableRollback extends Error {
+  constructor() { super("orderable count rollback"); }
+}
+
+/**
+ * S2e (v2 principle 4, AC28): how many of the producer's items can be ordered
+ * — rows that pass cart-service isRowOrderableForRealOrder() (the same check
+ * the order flow uses). The check stands above the orders switch, so while
+ * orders are off it is evaluated as if they were on: the opt-in column is set
+ * inside a transaction that is always rolled back (nothing is kept, the same
+ * pattern as the level preview). isEligibleForRealOrder() is not changed.
+ */
+export function countOwnerOrderableItems(agentId: string, db: any = getDb(), now: Date = new Date()): number {
+  const count = (): number => {
+    const rows = db
+      .prepare(
+        `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
+           FROM products WHERE agent_id = ?`,
+      )
+      .all(agentId) as Array<Parameters<typeof isRowOrderableForRealOrder>[1]>;
+    return rows.filter((r) => isRowOrderableForRealOrder(db, r, now)).length;
+  };
+  const optIn = readOrderNotificationsOptIn(db, agentId);
+  if (optIn === null) return 0;
+  if (optIn) return count();
+  let n = 0;
+  try {
+    db.transaction(() => {
+      writeOrderNotificationsOptIn(db, agentId, true);
+      n = count();
+      throw new OrderableRollback();
+    })();
+  } catch (e) {
+    if (!(e instanceof OrderableRollback)) throw e;
+  }
+  return n;
+}
+
+/** Where the owner edits the items (the unified session's portal card, else /selger). */
+function itemsHref(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
+}
+
+/**
+ * FAQ anchor for the orders explanation («Les mer»). The page
+ * /for-produsenter#bestillinger is not published yet, so this is null and the
+ * row shows only the inline text (v2 principle 4). Set it when the page ships.
+ */
+export const ORDERS_FAQ_URL: string | null = null;
+
+function currentPauseUntil(agentId: string): string | null {
+  try {
+    const row = getDb().prepare(`SELECT pause_until FROM ${OWNER_PAUSE_TABLE} WHERE agent_id = ?`).get(agentId) as { pause_until?: string | null } | undefined;
+    return row?.pause_until ?? null;
+  } catch {
+    return null;
+  }
+}
 
 function batchNotice(agentId: string, batchId: number): OwnerPageNotice | null {
   const batch = getOwnerChangeBatch(VERTICAL, agentId, batchId);
@@ -334,15 +422,37 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
 
     const page = Number.parseInt(qs("side"), 10);
     const log = ownerFeatureChangeLog(VERTICAL, agentId, Number.isFinite(page) ? page : 1);
+    // v2 principle 8: the first-login card asks only while «Nyheter og tips»
+    // has no answer — neither on the card nor set in its row.
+    const newsAnswered = resolvedKey("comms.news")?.source === "owner";
+    let orderable: { count: number; itemsHref: string } | null = null;
+    try { orderable = { count: countOwnerOrderableItems(agentId, db), itemsHref: itemsHref(agentId) }; } catch (e) {
+      console.error("[owner-features] orderable count failed:", e);
+      orderable = null;
+    }
+    let orderEmail: { enabled: boolean; current: string | null; pending: string | null } | null = null;
+    try {
+      orderEmail = {
+        enabled: ownerOrderEmailEnabled(),
+        current: currentOrderRecipient(agentId),
+        pending: pendingOrderEmailChange(agentId)?.new_email ?? null,
+      };
+    } catch { orderEmail = null; }
     const body = renderOwnerFeaturesPageBody({
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
-      showIntro: !readOwnerIntro(VERTICAL, agentId),
+      showIntro: !readOwnerIntro(VERTICAL, agentId) && !newsAnswered,
       notice,
       confirm,
       levelPreview,
       log,
+      interest: readOwnerFeatureInterest(VERTICAL, agentId, db),
+      orderable,
+      orderEmail,
+      pauseUntil: resolvedKey("visibility.profile")?.value === false ? currentPauseUntil(agentId) : null,
+      ordersReadMoreUrl: ORDERS_FAQ_URL,
+      orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours() },
     });
     res.setHeader("Cache-Control", "no-store");
     return res.send(portalShell(`Mine valg · ${agent.name}`, body));
@@ -369,7 +479,21 @@ router.post("/eier/:agentId/valg/sett", express.urlencoded({ extended: false }),
         && canAttempt(resolveOwnerFeatures(VERTICAL, agentId).byKey[key])) {
       return res.redirect(303, pagePath(agentId, `?bekreft=${encodeURIComponent(key)}&verdi=${value ? "1" : "0"}#bekreft`));
     }
-    const out = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token) });
+    // S2e: the pause keeps the /eier card's optional resume date.
+    let until: string | null = null;
+    const rawUntil = typeof body.until === "string" ? body.until.trim() : "";
+    if (e.key === "visibility.profile" && value === false && rawUntil !== "") {
+      until = parseResumeDate(rawUntil);
+      if (!until) return res.redirect(303, pagePath(agentId, "?melding=ugyldig_dato"));
+    }
+    const db = getDb();
+    const out = db.transaction(() => {
+      const o = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token) });
+      if (until && o.result.kind === "ok" && o.result.changed) {
+        db.prepare(`UPDATE ${OWNER_PAUSE_TABLE} SET pause_until = ? WHERE agent_id = ?`).run(until, agentId);
+      }
+      return o;
+    })();
     const r = out.result;
     if (r.kind === "ok") {
       if (!r.changed) return res.redirect(303, pagePath(agentId, "?melding=ingen_endring"));
@@ -405,7 +529,7 @@ router.post("/eier/:agentId/valg/niva", express.urlencoded({ extended: false }),
     if (out.skipped.length) {
       return res.redirect(303, pagePath(agentId, `?melding=hoppet&nokkel=${encodeURIComponent(out.skipped.map((s) => s.key).join(","))}#niva`));
     }
-    return res.redirect(303, pagePath(agentId, "?melding=ingen_endring#niva"));
+    return res.redirect(303, pagePath(agentId, "?melding=niva_valgt#niva"));
   } catch (e: any) {
     console.error("[owner-features] POST valg/niva failed:", e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
@@ -451,6 +575,61 @@ router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false })
     return res.redirect(303, pagePath(agentId, `?melding=${answer === "yes" ? "intro_ja" : "intro_nei"}`));
   } catch (e: any) {
     console.error("[owner-features] POST valg/intro failed:", e);
+    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// S2e — «Gi meg beskjed» and the order address in «Mine valg»
+// ─────────────────────────────────────────────────────────────────
+//   POST /eier/:agentId/valg/interesse    { key } a planned (coming_soon)
+//        entry: one interest row per (subject, key), idempotent; no effect,
+//        nothing e-mailed. Any other key → «ugyldig», nothing written.
+//   POST /eier/:agentId/valg/ordre-epost  { email } the S1b punkt 7 flow
+//        (requestOwnerOrderEmailChange: confirmation link to the NEW address;
+//        the column changes only when it is used). Off with
+//        OWNER_ORDER_EMAIL_ENABLED unset, as on the old /eier card.
+// Same checks as the other page POSTs: allowlist → session → isVerifiedOwner
+// → Origin → per-session write limit.
+
+router.post("/eier/:agentId/valg/interesse", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  try {
+    const g = pageGate(req);
+    if (!g.ok) return g.send(res);
+    const guard = pageWriteGuard(req, g.token);
+    if (guard) return guard(res);
+    const agentId = g.agentId;
+    const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+    const key = typeof body.key === "string" ? body.key : "";
+    const out = recordOwnerFeatureInterest(VERTICAL, agentId, key, sessionEmail(g.token));
+    if (out.kind !== "ok") return res.redirect(303, pagePath(agentId, "?melding=ugyldig#planlagt"));
+    if (out.created) console.log(`[owner-features] owner interest in ${key} for agent ${agentId}`);
+    return res.redirect(303, pagePath(agentId, `?melding=${out.created ? "interesse" : "interesse_finnes"}#planlagt-${encodeURIComponent(key)}`));
+  } catch (e: any) {
+    console.error("[owner-features] POST valg/interesse failed:", e);
+    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+  }
+});
+
+router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+  try {
+    const g = pageGate(req);
+    if (!g.ok) return g.send(res);
+    const guard = pageWriteGuard(req, g.token);
+    if (guard) return guard(res);
+    const agentId = g.agentId;
+    const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+    const back = (melding: string) => res.redirect(303, pagePath(agentId, `?melding=${melding}#valg-orders.email`));
+    const out = await requestOwnerOrderEmailChange(req, agentId, body.email);
+    if (out.status === 200) {
+      console.log(`[owner-features] owner requested a new order address for agent ${agentId} (page)`);
+      return back("ordre_epost_sendt");
+    }
+    const mapped = ORDER_EMAIL_MESSAGES[String(out.body?.error || "")];
+    if (mapped) return back(mapped);
+    return back("ordre_epost_feil");
+  } catch (e: any) {
+    console.error("[owner-features] POST valg/ordre-epost failed:", e);
     return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
   }
 });

@@ -1,11 +1,29 @@
 // ─── «Mine valg» — the owner page (HTML) ────────────────────────────────────
-// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, slice S2b. Pure
-// rendering: the route (routes/owner-features.ts) gathers the data and wraps
-// the body in the owner portal shell. Groups, order and rows come from the
-// registry only — a new registry entry gets a row in its group with no UI
-// change (AC10). Plain forms (POST → 303), no client framework, no script;
-// mobile first (375 px, tap targets ≥ 44 px), light and dark (AC13).
-// Every piece of text and every attribute value goes through escapeHtml.
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere, slice S2b, redesigned in
+// S2e («v2 — ny utforming», Daniel 2026-10-28). Pure rendering: the route
+// (routes/owner-features.ts) gathers the data and wraps the body in the owner
+// portal shell. Groups, order and rows come from the registry only — a new
+// registry entry gets a row in its group with no UI change (AC10).
+//
+// v2 principles this file carries:
+//   2. Only real choices in the main view: a `coming_soon` entry is never a
+//      (grey) switch; all of them sit in one closed «Planlagt — si fra hvis du
+//      vil ha dette (N)» box at the bottom, each with «Gi meg beskjed».
+//   3. Two honest levels; a level is marked only after the owner chose it.
+//   4. orders.enabled explains itself where it is taken (fold-out) and shows
+//      the prerequisite check (orderable items) above the switch.
+//   5. No fake values: an unbuilt entry shows no value and is not in «Slik er
+//      du nå».
+//   6. One switch, one place: the profile pause and the order address live
+//      here (the /eier cards link here instead).
+//   7. Words: no «Gjelder ikke» for something the owner can get later; «Nytt»
+//      only on live entries; «Alltid» / «Låst på» explained the first time.
+//   8. The first-login answer is the comms.news row's value at once.
+//   9. Foldable cards, jump links on mobile; a save updates only its card
+//      when JavaScript runs (progressive enhancement), and every form works
+//      as a plain POST → 303 without it.
+// Mobile first (375 px, tap targets ≥ 44 px), light and dark (AC13). Every
+// piece of text and every attribute value goes through escapeHtml.
 
 import { escapeHtml } from "../routes/owner-portal";
 import {
@@ -28,11 +46,21 @@ import {
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
 /** «Nytt» badge for this many days after `since` (spec principle 6). */
 export const OWNER_PAGE_NEW_DAYS = 30;
-/** «Slik er du nå» status line. */
+/** «Slik er du nå» status line — only the `live` ones are shown (v2 principle 5). */
 export const OWNER_PAGE_STATUS_KEYS = [
   "visibility.profile", "visibility.ai_assistants", "orders.enabled",
   "payments.prepay", "products.weekly_sync", "notify.report",
 ];
+/** The key whose row carries the order explanation and the prerequisite check. */
+export const OWNER_PAGE_ORDERS_KEY = "orders.enabled";
+/** The pause row (the old /eier «Pause og sletting» card). */
+export const OWNER_PAGE_PAUSE_KEY = "visibility.profile";
+/** The order-address row (the old form inside the /eier «Bestillinger» card). */
+export const OWNER_PAGE_ORDER_EMAIL_KEY = "orders.email";
+/** Heading of the planned box; the count is appended as « (N)». */
+export const OWNER_PAGE_PLANNED_TITLE = "Planlagt — si fra hvis du vil ha dette";
+
+const CS_EMAIL = "kontakt@rettfrabonden.com";
 
 export interface OwnerPageNotice {
   ok: boolean;
@@ -41,11 +69,28 @@ export interface OwnerPageNotice {
   undoBatchId?: number | null;
 }
 
+export interface OwnerPageOrderable {
+  /** Items that pass isRowOrderableForRealOrder (with orders switched on). */
+  count: number;
+  /** Where the owner edits the items. */
+  itemsHref: string;
+}
+
+export interface OwnerPageOrderEmail {
+  /** OWNER_ORDER_EMAIL_ENABLED: the change form is offered. */
+  enabled: boolean;
+  /** The address order mail goes to now (override or the profile e-mail). */
+  current: string | null;
+  /** A change waiting for the click from the new address. */
+  pending: string | null;
+}
+
 export interface OwnerPageModel {
   agent: { id: string; name: string };
   resolved: ResolvedOwnerFeatures;
   registry?: OwnerFeatureEntry[];
-  level: OwnerLevelKey | "custom";
+  /** The owner's own level choice; null = none made (no level marked). */
+  level: OwnerLevelKey | "custom" | null;
   showIntro: boolean;
   notice: OwnerPageNotice | null;
   /** In-page confirm panel for one switch (confirmOn / confirmOff). */
@@ -53,10 +98,31 @@ export interface OwnerPageModel {
   levelPreview: OwnerLevelPreview | null;
   log: { rows: OwnerChangeLogRow[]; page: number; pages: number; total: number };
   now?: Date;
+  /** Planned keys this owner already asked to hear about. */
+  interest?: ReadonlySet<string>;
+  /** Prerequisite check on the orders.enabled row. */
+  orderable?: OwnerPageOrderable | null;
+  /** The orders.email row. */
+  orderEmail?: OwnerPageOrderEmail | null;
+  /** Resume date of a current profile pause (visibility.profile off). */
+  pauseUntil?: string | null;
+  /** FAQ anchor for «Les mer» — only when that page is published (else null: inline text only). */
+  ordersReadMoreUrl?: string | null;
+  /** Real follow-up timings for the explanation (ORDER_REMINDER_HOURS / ORDER_AUTOCANCEL_HOURS). */
+  orderTimings?: { reminderHours: number; autocancelHours: number };
 }
 
 const esc = (v: unknown): string => escapeHtml(String(v ?? ""));
 
+/** Is the entry built (shown in the main view with its value)? */
+export function isOwnerFeatureBuilt(e: OwnerFeatureEntry): boolean {
+  return e.status !== "coming_soon";
+}
+
+/**
+ * The value as text (rows, change log, notices). Never «Gjelder ikke»
+ * (v2 principle 7): null reads «Ikke valgt» unless the type names it.
+ */
 export function formatOwnerFeatureValue(e: OwnerFeatureEntry | undefined, v: OwnerFeatureValue): string {
   if (e && e.type === "guarantee") return "Alltid";
   if (v === true) return e && e.type === "locked" ? "Låst på" : "På";
@@ -64,13 +130,19 @@ export function formatOwnerFeatureValue(e: OwnerFeatureEntry | undefined, v: Own
   if (v === null || v === undefined) {
     if (e && e.type === "number") return "Ingen";
     if (e && e.type === "email") return "Profilens e-post";
-    return "Gjelder ikke";
+    return "Ikke valgt";
   }
   if (e && e.type === "choice") {
     const o = (e.options || []).find((x) => x.value === v);
     if (o) return o.label.no;
   }
   return String(v);
+}
+
+/** The value shown in a row: none at all for an unbuilt entry (v2 principle 5). */
+export function ownerFeatureRowValue(e: OwnerFeatureEntry, r: ResolvedOwnerFeature | undefined): string | null {
+  if (!isOwnerFeatureBuilt(e) || !r) return null;
+  return formatOwnerFeatureValue(e, r.value);
 }
 
 function formatWhen(iso: string): string {
@@ -81,6 +153,11 @@ function formatWhen(iso: string): string {
   } catch {
     return d.toISOString().replace("T", " ").slice(0, 16) + " UTC";
   }
+}
+
+function formatDay(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : ymd;
 }
 
 const ACTOR_LABELS: Record<string, string> = {
@@ -102,17 +179,28 @@ function actionPath(agentId: string, tail: string): string {
   return `/eier/${encodeURIComponent(agentId)}/valg${tail}`;
 }
 
+/** Per-render state: «Alltid» / «Låst på» are explained the first time only. */
+interface RenderCtx {
+  m: OwnerPageModel;
+  now: Date;
+  explainedAlways: boolean;
+  explainedLocked: boolean;
+}
+
+/** `data-mv-row` names the element the enhancement script swaps after a save. */
+function rowForm(agentId: string, tail: string, swap: string, inner: string): string {
+  return `<form method="post" action="${esc(actionPath(agentId, tail))}" class="mv-ctl-form" data-mv-row="${esc(swap)}">${inner}</form>`;
+}
+
 /** The control for one row. */
-function controlHtml(agentId: string, e: OwnerFeatureEntry, r: ResolvedOwnerFeature): string {
-  const state = `<span class="mv-state">${esc(formatOwnerFeatureValue(e, r.value))}</span>`;
-  if (e.status === "coming_soon") {
-    return `${state}<button type="button" class="ep-btn mv-btn-off" disabled aria-disabled="true">Kommer snart</button>`;
-  }
+function controlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
+  const agentId = ctx.m.agent.id;
+  const valueText = ownerFeatureRowValue(e, r) ?? "";
   if (e.type === "guarantee") return `<span class="mv-state mv-always">Alltid</span>`;
+  if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) return orderEmailControlHtml(ctx, e, r, swap);
+  const state = `<span class="mv-state">${esc(valueText)}</span>`;
   if (!r.changeable || e.type === "locked" || e.type === "action") return state;
-  const form = (inner: string) =>
-    `<form method="post" action="${esc(actionPath(agentId, "/sett"))}" class="mv-ctl-form">` +
-    `<input type="hidden" name="key" value="${esc(e.key)}">${inner}</form>`;
+  const form = (inner: string) => rowForm(agentId, "/sett", swap, `<input type="hidden" name="key" value="${esc(e.key)}">${inner}`);
   const fieldId = `mv-f-${e.key.replace(/[^a-z0-9]/gi, "-")}`;
   switch (e.type) {
     case "switch": {
@@ -149,40 +237,162 @@ function controlHtml(agentId: string, e: OwnerFeatureEntry, r: ResolvedOwnerFeat
   }
 }
 
-function rowHtml(agentId: string, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, now: Date): string {
+/** orders.email: the address now, a pending change, and the confirmation form (S1b punkt 7). */
+function orderEmailControlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
+  const oe = ctx.m.orderEmail;
+  const current = oe?.current ?? null;
+  const shown = current ?? (r.value == null ? "" : String(r.value));
+  const state = `<span class="mv-state">${shown ? esc(shown) : "Ingen adresse"}</span>`;
+  if (!oe || !oe.enabled) return state;
+  const fieldId = "mv-f-orders-email";
+  return state + rowForm(
+    ctx.m.agent.id, "/ordre-epost", swap,
+    `<label class="mv-sr" for="${fieldId}">Ny adresse for bestillinger</label>` +
+    `<input id="${fieldId}" name="email" type="email" required autocomplete="email" placeholder="Ny adresse">` +
+    `<button type="submit" class="ep-btn ep-btn-secondary">Send bekreftelse</button>`,
+  );
+}
+
+/** Text under the label for the special rows (prerequisite check, explanation, pause, order address). */
+function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature): string {
+  const m = ctx.m;
+  if (e.key === OWNER_PAGE_ORDERS_KEY) return ordersCheckHtml(m) + ordersExplainHtml(m);
+  if (e.key === OWNER_PAGE_PAUSE_KEY) {
+    const paused = r.value === false;
+    const subject = encodeURIComponent(`Be om sletting av profil: ${m.agent.name || m.agent.id} (${m.agent.id})`);
+    const body = encodeURIComponent(`Hei,\n\nJeg ber om at profilen ${m.agent.name || ""} (${m.agent.id}) slettes fra Rett fra Bonden.\n\nHilsen`);
+    return (paused
+      ? `<p class="mv-check" role="status">Profilen er på midlertidig pause${m.pauseUntil ? ` til ${esc(formatDay(m.pauseUntil))}` : ""}. Den vises ikke i søk, lister, AI-tjenester eller kart.</p>`
+      : "") +
+      `<p class="mv-desc">Vil du heller at profilen slettes for godt? <a href="mailto:${CS_EMAIL}?subject=${subject}&amp;body=${body}">Be om sletting</a> — kundeservice hjelper deg.</p>`;
+  }
+  if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) {
+    const oe = m.orderEmail;
+    if (!oe) return "";
+    return (oe.pending
+      ? `<p class="mv-check" role="status">Venter på bekreftelse fra <strong>${esc(oe.pending)}</strong>. Klikk lenken vi sendte dit. Til da går bestillinger til den gamle adressen.</p>`
+      : "") +
+      (oe.enabled ? `<p class="mv-desc">Vi sender en lenke til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt.</p>` : "");
+  }
+  return "";
+}
+
+/** v2 principle 4: the prerequisite check stands above the orders switch. */
+function ordersCheckHtml(m: OwnerPageModel): string {
+  const o = m.orderable;
+  if (!o) return "";
+  const link = `<a href="${esc(o.itemsHref)}">Gå til varene dine</a>`;
+  if (o.count <= 0) {
+    return `<p class="mv-check mv-check-missing" data-orderable="0">Du har 0 varer som kan bestilles. Legg inn varer eller hent dem fra nettsiden din. ${link}</p>`;
+  }
+  const n = Math.floor(o.count);
+  return `<p class="mv-check" data-orderable="${n}">Du har ${n} ${n === 1 ? "vare" : "varer"} som kan bestilles. ${link}</p>`;
+}
+
+/** v2 principle 4: the fold-out explanation, from the flow as it is built. */
+function ordersExplainHtml(m: OwnerPageModel): string {
+  const t = m.orderTimings ?? { reminderHours: 24, autocancelHours: 72 };
+  const readMore = m.ordersReadMoreUrl
+    ? `<p><a href="${esc(m.ordersReadMoreUrl)}">Les mer</a></p>` : "";
+  return `<details class="mv-explain-box">
+            <summary>Slik fungerer bestillinger</summary>
+            <h3>Slik fungerer det</h3>
+            <ul>
+              <li>Kunder og AI-assistenter kan sende deg en bestilling på varer du har merket som på lager.</li>
+              <li>Du får en e-post med emnet «Ny henteordre» til adressen under «Bestillinger sendes til».</li>
+              <li>I e-posten bekrefter eller avslår du bestillingen med ett klikk. Du trenger ikke logge inn.</li>
+              <li>Kunden henter varene hos deg og betaler når varene hentes. Rett fra Bonden tar ikke betalt.</li>
+            </ul>
+            <h3>Dette må du gjøre</h3>
+            <ul>
+              <li>Svar på hver bestilling: bekreft eller avslå.</li>
+              <li>Svarer du ikke, får du en påminnelse etter ${esc(t.reminderHours)} timer.</li>
+              <li>Er bestillingen fortsatt ubesvart etter ${esc(t.autocancelHours)} timer, blir den kansellert, og kunden får beskjed.</li>
+              <li>Hold varene oppdatert, så kunden bare kan bestille det du har.</li>
+            </ul>
+            <h3>Slik slår du av</h3>
+            <ul>
+              <li>Trykk «Slå av» på denne raden. Da får kunden kontaktinformasjonen din i stedet.</li>
+              <li>Bestillinger du allerede har fått, må du fortsatt svare på.</li>
+            </ul>
+            ${readMore}
+          </details>`;
+}
+
+function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
   const badges =
-    (isNew(e, now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
-    (e.status === "coming_soon" ? ` <span class="mv-badge">Kommer snart</span>` : "") +
+    (isNew(e, ctx.now) ? ` <span class="mv-badge mv-badge-new">Nytt</span>` : "") +
     (e.consent ? ` <span class="mv-badge">Samtykke</span>` : "");
-  // A lock / requirement reason (coming_soon has its badge instead).
-  const reason = r.reason && e.status !== "coming_soon" && e.type !== "guarantee"
+  const reason = r.reason && e.type !== "guarantee" && r.block !== "confirm_by_email"
     ? `<p class="mv-reason">${esc(r.reason.no)}</p>` : "";
-  return `<li class="mv-item${e.status === "coming_soon" ? " mv-item-soon" : ""}" id="valg-${esc(e.key)}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(e.description.no)}</p>${reason}</div>
-          <div class="mv-item-ctl">${controlHtml(agentId, e, r)}</div>
+  let explain = "";
+  if (e.type === "guarantee" && !ctx.explainedAlways) {
+    ctx.explainedAlways = true;
+    explain = `<p class="mv-explain">«Alltid» betyr et løfte fra Rett fra Bonden. Det gjelder hele tiden og kan ikke slås av.</p>`;
+  } else if (e.type === "locked" && r.value === true && !ctx.explainedLocked) {
+    ctx.explainedLocked = true;
+    explain = `<p class="mv-explain">«Låst på» betyr at dette hører til noe du har slått på. Det følger det valget og kan ikke slås av alene.</p>`;
+  }
+  return `<li class="mv-item" id="valg-${esc(e.key)}" data-key="${esc(e.key)}">
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(e.description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>
         </li>`;
 }
 
-function groupsHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[], now: Date): string {
+/** The built entries of one group, split as the page shows them. */
+function groupEntries(m: OwnerPageModel, registry: OwnerFeatureEntry[], group: string) {
   const reveal = findOwnerFeature(OWNER_PAGE_REVEAL_KEY, registry);
   const revealOn = !!reveal && m.resolved.byKey[reveal.key]?.value === true;
+  const entries = registry.filter((e) => e.group === group && isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key]);
+  const hidden = entries.filter((e) => !!reveal && !revealOn && e.requires.includes(reveal.key as any));
+  const shown = entries.filter((e) => !hidden.includes(e));
+  return { reveal, shown, hidden };
+}
+
+function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
+  const m = ctx.m;
   return OWNER_FEATURE_GROUPS.map((g) => {
-    const entries = registry.filter((e) => e.group === g.key && m.resolved.byKey[e.key]);
-    if (entries.length === 0) return "";
-    const hidden = entries.filter((e) => !!reveal && !revealOn && e.requires.includes(reveal.key as any));
-    const shown = entries.filter((e) => !hidden.includes(e));
-    const basic = shown.filter((e) => !e.advanced).map((e) => rowHtml(m.agent.id, e, m.resolved.byKey[e.key], now)).join("");
-    const adv = shown.filter((e) => e.advanced).map((e) => rowHtml(m.agent.id, e, m.resolved.byKey[e.key], now)).join("");
+    const { reveal, shown, hidden } = groupEntries(m, registry, g.key);
+    if (shown.length === 0 && hidden.length === 0) return "";
+    const swap = `gruppe-${g.key}`;
+    const basic = shown.filter((e) => !e.advanced).map((e) => rowHtml(ctx, e, m.resolved.byKey[e.key], swap)).join("");
+    const adv = shown.filter((e) => e.advanced).map((e) => rowHtml(ctx, e, m.resolved.byKey[e.key], swap)).join("");
     const hiddenNote = hidden.length && reveal
       ? `<p class="mv-note">${hidden.length} valg til vises når du slår på «${esc(reveal.label.no)}».</p>`
       : "";
-    return `<section class="ep-card mv-group" id="gruppe-${esc(g.key)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
-        <h2 id="mv-h-${esc(g.key)}">${esc(g.label.no)}</h2>
-        ${basic ? `<ul class="mv-list">${basic}</ul>` : ""}
-        ${adv ? `<details class="mv-more"><summary>Flere valg</summary><ul class="mv-list">${adv}</ul></details>` : ""}
-        ${hiddenNote}
+    return `<section class="ep-card mv-group" id="${esc(swap)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
+        <details class="mv-fold" open>
+          <summary class="mv-fold-summary"><h2 id="mv-h-${esc(g.key)}">${esc(g.label.no)}</h2></summary>
+          ${basic ? `<ul class="mv-list">${basic}</ul>` : ""}
+          ${adv ? `<details class="mv-more"><summary>Flere valg</summary><ul class="mv-list">${adv}</ul></details>` : ""}
+          ${hiddenNote}
+        </details>
       </section>`;
   }).join("\n");
+}
+
+/** v2 principle 2: every planned entry, closed by default, «Gi meg beskjed» per row, no value. */
+function plannedHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
+  const planned = registry.filter((e) => !isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key]);
+  if (planned.length === 0) return "";
+  const groupLabel = new Map(OWNER_FEATURE_GROUPS.map((g) => [g.key as string, g.label.no] as const));
+  const interest = m.interest ?? new Set<string>();
+  const rows = planned.map((e) => {
+    const asked = interest.has(e.key);
+    const ctl = asked
+      ? `<span class="mv-state mv-asked">Du har sagt fra</span>`
+      : rowForm(m.agent.id, "/interesse", "planlagt",
+          `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
+    return `<li class="mv-item mv-item-planned" id="planlagt-${esc(e.key)}" data-planned-key="${esc(e.key)}">
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(e.description.no)}</p></div>
+          <div class="mv-item-ctl">${ctl}</div>
+        </li>`;
+  }).join("");
+  return `<details class="ep-card mv-planned" id="planlagt">
+        <summary class="mv-fold-summary"><h2 id="mv-h-planlagt">${esc(OWNER_PAGE_PLANNED_TITLE)} (${planned.length})</h2></summary>
+        <p class="mv-desc">Dette er ikke bygget ennå. Trykk «Gi meg beskjed» på det du vil ha. Vi lagrer bare at du har sagt fra: ingenting på profilen endres, og vi sender ingen e-post nå.</p>
+        <ul class="mv-list">${rows}</ul>
+      </details>`;
 }
 
 function levelsHtml(m: OwnerPageModel): string {
@@ -196,12 +406,14 @@ function levelsHtml(m: OwnerPageModel): string {
             : `<form method="get" action="${esc(actionPath(m.agent.id, ""))}" class="mv-ctl-form"><input type="hidden" name="niva" value="${esc(l.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Velg «${esc(l.label.no)}»</button></form>`}
         </li>`;
   }).join("");
-  const customNote = m.level === "custom"
-    ? `<p class="mv-note">Nå: <strong>${esc(OWNER_LEVEL_CUSTOM_LABEL.no)}</strong> — du har valgt noe annet enn nivåene under.</p>`
-    : "";
+  const note = m.level === "custom"
+    ? `<p class="mv-note">Nå: <strong>${esc(OWNER_LEVEL_CUSTOM_LABEL.no)}</strong> — du har endret noe etter at du valgte nivå.</p>`
+    : m.level === null
+      ? `<p class="mv-note">Du har ikke valgt nivå ennå. Valgene dine står under.</p>`
+      : "";
   return `<section class="ep-card" id="niva" aria-labelledby="mv-h-niva">
         <h2 id="mv-h-niva">Hvor aktiv vil du være?</h2>
-        ${customNote}
+        ${note}
         <ul class="mv-levels">${cards}</ul>
         ${statusLineHtml(m)}
       </section>`;
@@ -212,8 +424,9 @@ function statusLineHtml(m: OwnerPageModel): string {
   const items = OWNER_PAGE_STATUS_KEYS.map((k) => {
     const e = findOwnerFeature(k, registry);
     const r = m.resolved.byKey[k];
-    if (!e || !r) return "";
-    return `<li><span>${esc(e.label.no)}:</span> <strong>${esc(formatOwnerFeatureValue(e, r.value))}</strong></li>`;
+    const v = e ? ownerFeatureRowValue(e, r) : null;
+    if (!e || v === null) return "";
+    return `<li data-status-key="${esc(k)}"><span>${esc(e.label.no)}:</span> <strong>${esc(v)}</strong></li>`;
   }).join("");
   return items ? `<div class="mv-status"><h3>Slik er du nå</h3><ul>${items}</ul></div>` : "";
 }
@@ -230,18 +443,19 @@ function levelPreviewHtml(m: OwnerPageModel): string {
   }).join("");
   const skipped = p.skipped.map((s) => `<li><strong>${esc(label(s.key))}</strong> endres ikke: ${esc(s.reason.no)}</li>`).join("");
   const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, "#niva"))}">Avbryt</a>`;
-  const body = p.changes.length
-    ? `<p>Dette endres:</p><ul>${changes}</ul>${skipped ? `<ul>${skipped}</ul>` : ""}
-        <div class="ep-form-actions">
-          <form method="post" action="${esc(actionPath(m.agent.id, "/niva"))}" class="mv-ctl-form">
+  const confirmForm = `<form method="post" action="${esc(actionPath(m.agent.id, "/niva"))}" class="mv-ctl-form">
             <input type="hidden" name="level" value="${esc(p.level.key)}">
             <input type="hidden" name="confirmed" value="1">
             <button type="submit" class="ep-btn ep-btn-primary">Bekreft «${esc(p.level.label.no)}»</button>
-          </form>
+          </form>`;
+  const body = p.changes.length
+    ? `<p>Dette endres:</p><ul>${changes}</ul>${skipped ? `<ul>${skipped}</ul>` : ""}
+        <div class="ep-form-actions">
+          ${confirmForm}
           ${cancel}
         </div>`
-    : `<p>Ingenting endres nå. Valgene i dette nivået som ikke er i gang ennå, kommer snart.</p>${skipped ? `<ul>${skipped}</ul>` : ""}
-        <div class="ep-form-actions">${cancel}</div>`;
+    : `<p>Valgene dine er allerede slik. Bekreft for å velge nivået.</p>${skipped ? `<ul>${skipped}</ul>` : ""}
+        <div class="ep-form-actions">${skipped ? "" : confirmForm}${cancel}</div>`;
   return `<section class="ep-card mv-confirm" id="bekreft" role="region" aria-labelledby="mv-h-bekreft">
         <h2 id="mv-h-bekreft">Bytte til «${esc(p.level.label.no)}»?</h2>
         ${body}
@@ -255,18 +469,23 @@ function confirmHtml(m: OwnerPageModel): string {
   const e = findOwnerFeature(c.key, registry);
   const text = e ? (c.value ? e.confirmOn : e.confirmOff) : undefined;
   if (!e || !text) return "";
+  // The pause keeps the optional resume date the /eier pause card had.
+  const until = e.key === OWNER_PAGE_PAUSE_KEY && !c.value
+    ? `<div class="ep-field"><label for="mv-pause-until">Kommer tilbake (valgfritt)</label><input id="mv-pause-until" name="until" type="date" aria-label="Dato profilen kommer tilbake"></div>`
+    : "";
   return `<section class="ep-card mv-confirm" id="bekreft" role="region" aria-labelledby="mv-h-bekreft">
         <h2 id="mv-h-bekreft">${esc(c.value ? "Slå på" : "Slå av")} «${esc(e.label.no)}»?</h2>
         <p>${esc(text.no)}</p>
-        <div class="ep-form-actions">
-          <form method="post" action="${esc(actionPath(m.agent.id, "/sett"))}" class="mv-ctl-form">
-            <input type="hidden" name="key" value="${esc(e.key)}">
-            <input type="hidden" name="value" value="${c.value ? "true" : "false"}">
-            <input type="hidden" name="confirmed" value="1">
+        <form method="post" action="${esc(actionPath(m.agent.id, "/sett"))}" class="mv-confirm-form">
+          <input type="hidden" name="key" value="${esc(e.key)}">
+          <input type="hidden" name="value" value="${c.value ? "true" : "false"}">
+          <input type="hidden" name="confirmed" value="1">
+          ${until}
+          <div class="ep-form-actions">
             <button type="submit" class="ep-btn ep-btn-primary">Ja, ${esc(c.value ? "slå på" : "slå av")}</button>
-          </form>
-          <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `#valg-${e.key}`))}">Avbryt</a>
-        </div>
+            <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `#valg-${e.key}`))}">Avbryt</a>
+          </div>
+        </form>
       </section>`;
 }
 
@@ -276,7 +495,7 @@ function introHtml(m: OwnerPageModel): string {
     `<form method="post" action="${esc(actionPath(m.agent.id, "/intro"))}" class="mv-ctl-form"><input type="hidden" name="answer" value="${answer}"><button type="submit" class="ep-btn ${cls}">${label}</button></form>`;
   return `<section class="ep-card mv-intro" id="velkommen" aria-labelledby="mv-h-intro">
         <h2 id="mv-h-intro">Nyheter og tips</h2>
-        <p>Vil du ha nyheter og tips fra Rett fra Bonden på e-post? Det er frivillig, og du kan endre svaret når som helst under «Kontakt fra Rett fra Bonden».</p>
+        <p>Vil du ha nyheter og tips fra Rett fra Bonden på e-post? Det er frivillig. Svaret ditt blir valget «Nyheter og tips» under «Kontakt fra Rett fra Bonden», og der kan du endre det når som helst.</p>
         <div class="ep-form-actions">${form("yes", "Ja takk", "ep-btn-primary")}${form("no", "Nei takk", "ep-btn-secondary")}</div>
       </section>`;
 }
@@ -294,10 +513,12 @@ function logHtml(m: OwnerPageModel): string {
   if (m.log.page > 1) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `?side=${m.log.page - 1}#endringslogg`))}">Nyere</a>`);
   if (m.log.page < m.log.pages) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `?side=${m.log.page + 1}#endringslogg`))}">Eldre</a>`);
   return `<section class="ep-card" id="endringslogg" aria-labelledby="mv-h-logg">
-        <h2 id="mv-h-logg">Endringslogg</h2>
-        <p class="mv-desc">Hva som er endret, når og av hvem. Nyeste først.</p>
-        ${items ? `<ul class="ep-audit-list">${items}</ul>` : `<p class="mv-desc">Ingen endringer ennå.</p>`}
-        ${nav.length ? `<div class="ep-form-actions mv-pager">${nav.join("")}<span class="mv-desc">Side ${m.log.page} av ${m.log.pages}</span></div>` : ""}
+        <details class="mv-fold" open>
+          <summary class="mv-fold-summary"><h2 id="mv-h-logg">Endringslogg</h2></summary>
+          <p class="mv-desc">Hva som er endret, når og av hvem. Nyeste først.</p>
+          ${items ? `<ul class="ep-audit-list">${items}</ul>` : `<p class="mv-desc">Ingen endringer ennå.</p>`}
+          ${nav.length ? `<div class="ep-form-actions mv-pager">${nav.join("")}<span class="mv-desc">Side ${m.log.page} av ${m.log.pages}</span></div>` : ""}
+        </details>
       </section>`;
 }
 
@@ -310,6 +531,64 @@ function noticeHtml(m: OwnerPageModel): string {
   return `<div class="mv-toast ${n.ok ? "mv-toast-ok" : "mv-toast-error"}" role="${n.ok ? "status" : "alert"}"><span>${esc(n.text)}</span>${undo}</div>`;
 }
 
+/** v2 principle 9: jump links (shown on narrow screens). */
+function jumpNavHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
+  const links: Array<[string, string]> = [["niva", "Nivå"]];
+  for (const g of OWNER_FEATURE_GROUPS) {
+    const { shown, hidden } = groupEntries(m, registry, g.key);
+    if (shown.length || hidden.length) links.push([`gruppe-${g.key}`, g.label.no]);
+  }
+  if (registry.some((e) => !isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key])) links.push(["planlagt", "Planlagt"]);
+  links.push(["endringslogg", "Endringslogg"]);
+  return `<nav class="mv-jump" aria-label="Hopp til">${links.map(([id, label]) => `<a href="#${esc(id)}">${esc(label)}</a>`).join("")}</nav>`;
+}
+
+/**
+ * v2 principle 9: a save updates only its card. Progressive enhancement over
+ * the plain forms (which keep working without JavaScript): a form marked
+ * data-mv-row is POSTed with fetch, the 303 is followed, and the named card,
+ * the levels card, the message and the change log are swapped in from the
+ * returned page. A confirm panel, an error or anything unexpected → the
+ * normal page load.
+ */
+export const OWNER_PAGE_SCRIPT = `
+(function () {
+  if (!window.fetch || !window.DOMParser || !window.FormData || !window.URLSearchParams) return;
+  var page = document.querySelector(".mv-page");
+  if (!page) return;
+  function swap(doc, id) {
+    var cur = document.getElementById(id), next = doc.getElementById(id);
+    if (!cur || !next) return;
+    if (cur.tagName === "DETAILS" && cur.open) next.setAttribute("open", "");
+    var curFold = cur.querySelector("details.mv-fold"), nextFold = next.querySelector("details.mv-fold");
+    if (curFold && nextFold && !curFold.open) nextFold.removeAttribute("open");
+    cur.parentNode.replaceChild(document.importNode(next, true), cur);
+  }
+  page.addEventListener("submit", function (ev) {
+    var f = ev.target;
+    if (!f || f.tagName !== "FORM" || !f.getAttribute("data-mv-row") || String(f.method).toLowerCase() !== "post") return;
+    ev.preventDefault();
+    var btn = f.querySelector("button[type=submit]");
+    if (btn) btn.disabled = true;
+    fetch(f.action, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(new FormData(f)).toString()
+    }).then(function (r) {
+      return r.text().then(function (t) { return { ok: r.ok, url: r.url, html: t }; });
+    }).then(function (out) {
+      var doc = new DOMParser().parseFromString(out.html, "text/html");
+      if (!out.ok || !doc.querySelector(".mv-page") || doc.getElementById("bekreft")) {
+        window.location.href = out.url || f.action;
+        return;
+      }
+      [f.getAttribute("data-mv-row"), "niva", "mv-toast-slot", "endringslogg"].forEach(function (id) { swap(doc, id); });
+    }).catch(function () { f.submit(); });
+  });
+})();
+`;
+
 /** Page-only CSS on top of PORTAL_PALETTE_CSS: layout, ≥ 44 px targets, dark mode. */
 export const OWNER_PAGE_CSS = `
   :root { color-scheme: light dark; }
@@ -318,28 +597,42 @@ export const OWNER_PAGE_CSS = `
   .mv-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .mv-desc { margin: 4px 0 0; font-size: 0.88rem; color: #595959; }
   .mv-reason { margin: 4px 0 0; font-size: 0.85rem; color: #92400e; }
+  .mv-explain { margin: 4px 0 0; font-size: 0.85rem; color: #404040; font-style: italic; }
   .mv-note { font-size: 0.88rem; color: #595959; margin: 12px 0 0; }
+  .mv-check { margin: 8px 0 0; font-size: 0.9rem; font-weight: 600; color: #2D5016; }
+  .mv-check-missing { color: #92400e; }
   .mv-list { list-style: none; margin: 0; padding: 0; }
   .mv-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 0; border-bottom: 1px solid #f0f0e8; }
   .mv-item:last-child { border-bottom: none; }
   .mv-item-text { flex: 1 1 220px; min-width: 0; }
   .mv-item-ctl { flex: 0 1 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
-  .mv-item-soon .mv-item-text strong { color: #595959; }
-  .mv-ctl-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; max-width: 100%; }
-  .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]) { min-height: 44px; max-width: 100%; padding: 8px 10px; font-size: 1rem; font-family: inherit; border: 1px solid #d4d4d4; border-radius: 8px; background: #fff; color: #1a1a1a; }
+  .mv-ctl-form, .mv-confirm-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; max-width: 100%; }
+  .mv-confirm-form { flex-direction: column; align-items: stretch; }
+  .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { min-height: 44px; max-width: 100%; padding: 8px 10px; font-size: 1rem; font-family: inherit; border: 1px solid #d4d4d4; border-radius: 8px; background: #fff; color: #1a1a1a; }
   .mv-state { display: inline-flex; align-items: center; min-height: 44px; font-weight: 600; }
   .mv-always { color: #2D5016; }
-  .mv-btn-off { background: #f0f0e8; color: #595959; cursor: not-allowed; }
+  .mv-asked { color: #2D5016; }
   .mv-badge { display: inline-block; font-size: 0.72rem; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: #f0f0e8; color: #404040; vertical-align: middle; }
   .mv-badge-new { background: #e7f2dc; color: #2D5016; }
   .mv-levels { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 12px; }
   .mv-level { border: 1px solid #e5e5e5; border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 6px; }
   .mv-level[aria-current="true"] { border-color: #2D5016; box-shadow: inset 0 0 0 1px #2D5016; }
-  @media (min-width: 640px) { .mv-levels { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (min-width: 640px) { .mv-levels { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .mv-status { margin-top: 16px; }
   .mv-status h3 { font-size: 0.95rem; margin: 0 0 6px; }
   .mv-status ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 0.88rem; }
-  .mv-more summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: #2D5016; }
+  .mv-fold-summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; list-style: none; }
+  .mv-fold-summary::-webkit-details-marker { display: none; }
+  .mv-fold-summary h2 { margin: 0; flex: 1 1 auto; }
+  .mv-fold-summary::after { content: "▾"; margin-left: 8px; color: #2D5016; }
+  details:not([open]) > .mv-fold-summary::after { content: "▸"; }
+  .mv-more summary, .mv-explain-box summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 600; color: #2D5016; }
+  .mv-explain-box { margin-top: 8px; font-size: 0.9rem; }
+  .mv-explain-box h3 { font-size: 0.92rem; margin: 10px 0 4px; }
+  .mv-explain-box ul { margin: 0; padding-left: 18px; }
+  .mv-jump { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 12px; }
+  .mv-jump a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 10px; border: 1px solid #e5e5e5; border-radius: 999px; font-size: 0.88rem; text-decoration: none; }
+  @media (min-width: 900px) { .mv-jump { display: none; } }
   .mv-confirm { border-color: #2D5016; }
   .mv-toast { position: sticky; bottom: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-top: 16px; padding: 10px 14px; border-radius: 10px; font-size: 0.95rem; box-shadow: 0 -2px 8px rgba(0,0,0,0.08); }
   .mv-toast-ok { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
@@ -350,21 +643,21 @@ export const OWNER_PAGE_CSS = `
     a, .ep-logo { color: #b9d99a; }
     .ep-logo span { color: #e2bf97; }
     .ep-card { background: #1c2116; border-color: #313b27; box-shadow: none; }
-    .ep-card h1, .ep-card h2, .mv-always, .mv-more summary { color: #b9d99a; }
+    .ep-card h1, .ep-card h2, .mv-always, .mv-asked, .mv-more summary, .mv-explain-box summary, .mv-check { color: #b9d99a; }
+    .mv-fold-summary::after { color: #b9d99a; }
     .ep-card h2, .mv-item, .ep-audit-item { border-color: #313b27; }
     .ep-btn-primary { background: #4c7d2c; color: #fff; }
     .ep-btn-primary:hover, .ep-btn-primary:focus { background: #5a9134; }
     .ep-btn-secondary { background: transparent; color: #cfe6b8; border-color: #8fb86e; }
     .ep-btn-secondary:hover { background: #26301d; }
     .ep-btn-ghost { color: #b5b0a0; }
-    .mv-desc, .mv-note, .ep-audit-meta, .mv-item-soon .mv-item-text strong { color: #b5b0a0; }
-    .mv-reason { color: #f5c27a; }
-    .mv-btn-off { background: #2a3022; color: #a3a091; }
+    .mv-desc, .mv-note, .ep-audit-meta, .mv-explain { color: #b5b0a0; }
+    .mv-reason, .mv-check-missing { color: #f5c27a; }
     .mv-badge { background: #2a3022; color: #d8d4c4; }
     .mv-badge-new { background: #2f4a1c; color: #cfe6b8; }
-    .mv-level { border-color: #313b27; }
+    .mv-level, .mv-jump a { border-color: #313b27; }
     .mv-level[aria-current="true"] { border-color: #8fb86e; box-shadow: inset 0 0 0 1px #8fb86e; }
-    .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]) { background: #12150e; color: #ebe8dc; border-color: #4a5640; }
+    .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { background: #12150e; color: #ebe8dc; border-color: #4a5640; }
     .mv-toast-ok { background: #15301d; color: #bbf7d0; border-color: #24543a; }
     .mv-toast-error { background: #3a1616; color: #fecaca; border-color: #6b2525; }
   }
@@ -373,7 +666,7 @@ export const OWNER_PAGE_CSS = `
 /** The page body (inside portalShell). */
 export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
   const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
-  const now = m.now ?? new Date();
+  const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false };
   const back = `/eier/${encodeURIComponent(m.agent.id)}/portal`;
   return `<style>${OWNER_PAGE_CSS}</style>
     <div class="mv-page">
@@ -381,13 +674,16 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
         <h1>Mine valg</h1>
         <p><strong>${esc(m.agent.name)}</strong>. Endringer lagres med en gang, og du kan angre den siste.</p>
         <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
+        ${jumpNavHtml(m, registry)}
       </div>
       ${introHtml(m)}
       ${confirmHtml(m)}
       ${levelPreviewHtml(m)}
       ${levelsHtml(m)}
-      ${groupsHtml(m, registry, now)}
+      ${groupsHtml(ctx, registry)}
+      ${plannedHtml(m, registry)}
       ${logHtml(m)}
-      ${noticeHtml(m)}
-    </div>`;
+      <div id="mv-toast-slot">${noticeHtml(m)}</div>
+    </div>
+    <script>${OWNER_PAGE_SCRIPT}</script>`;
 }
