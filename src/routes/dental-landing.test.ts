@@ -212,6 +212,10 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
       helfo?: boolean; acuteVakt?: 0 | 1; provenance?: string | null; focus?: string | null;
       specialists?: string | null; specialties?: string | null;
     }
+    // F2-S6: a Helfo row carries the source its claim needs (resolveHelfoClaim).
+    const HELFO_SOURCE = { value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" };
+    const provenanceOf = (x: Extra): string | null =>
+      x.helfo ? JSON.stringify({ ...(x.provenance ? JSON.parse(x.provenance) : {}), helfo_agreement: [HELFO_SOURCE] }) : x.provenance ?? null;
     const mk = (navn: string, poststed: string, fylke: string, x: Extra = {}): string => {
       const org_nr = String(++orgSeq);
       const id = store.createDentalAgent({ ...(x.id ? { id: x.id } : {}), navn, org_nr, poststed, fylke, adresse: "Storgata 1", telefon: "22110099" } as any);
@@ -223,7 +227,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
         x.klass ?? "klinikk", x.inactive ? 1 : 0,
         x.rejected ? "rejected" : x.verified ? "verified" : "unverified",
         x.helfo ? "true" : "unknown", x.acuteVakt ?? 0,
-        x.provenance ?? null, x.focus ?? null, x.specialists ?? null, x.specialties ?? null, x.updatedAt ?? null, id
+        provenanceOf(x), x.focus ?? null, x.specialists ?? null, x.specialties ?? null, x.updatedAt ?? null, id
       );
       return id;
     };
@@ -460,7 +464,7 @@ export async function runDentalLandingTests(opts: { log?: boolean } = {}): Promi
         ["/sted/oslo/pedodonti", "2 clinics < minListings (Helfo and akutt notwithstanding)"],
         ["/sted/oslo/endodonti", "3 clinics but one fact (their own) < minFacts"],
         ["/sted/paritet/tannlegevakt", "2 vakt < minListings"],
-        ["/sted/bergen/helfo", "the Helfo facet is off (7 rows say Helfo, none with a source)"],
+        ["/sted/bergen/helfo", "the Helfo facet is off (7 rows show Helfo, with a source)"],
         ["/fylke/Vestland/helfo", "the Helfo facet is off on /fylke too"],
         ["/sted/oslo/ukjent", "an unknown facet"],
         ["/sted/oslo/constructor", "a prototype key is no facet"],

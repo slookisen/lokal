@@ -32,6 +32,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
 const CLINIC_SITE_UTM = OUTBOUND_UTM.dental.clinic_profile;
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL } from "../services/dental-acute-claim";
+import { resolveHelfoClaim, HELFO_CLAIM_REQUIRES_SOURCE } from "../services/dental-helfo-claim";
 import { coerceProvenanceToArrayShape } from "../services/cross-source-validator";
 // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8):
 // «Verifisert» on the cards and the profile only when the stored fields meet
@@ -549,8 +550,8 @@ export function buildClinicDescription(
     parts.push(`Adresse: ${agent.adresse}, ${postnummer ? postnummer + " " : ""}${validPoststed}.`);
   }
 
-  // Helfo
-  if (agent.helfo_agreement === "true") {
+  // Helfo (F2-S6): only with a stored source (resolveHelfoClaim).
+  if (resolveHelfoClaim(agent)) {
     parts.push("Klinikken har Helfo-direkteoppgjørsavtale.");
   }
 
@@ -1073,7 +1074,7 @@ function clinicCard(
   const badges: string[] = [];
   if (resolveVerifiedClaim(agent))
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
-  if (agent.helfo_agreement === "true")
+  if (resolveHelfoClaim(agent))
     badges.push(`<span class="badge badge-helfo">Helfo-avtale</span>`);
   {
     const acute = resolveAcuteClaim(agent);
@@ -1759,8 +1760,8 @@ function newestSourceDate(sources: Array<Record<string, unknown>>): string | nul
  * (only brreg_status 'active': the verifier also stamps brreg_checked_at
  * when the lookup failed, orgnr_not_found_or_unreachable), the website ownership (only 'verified'), «Sist kontrollert», or «Ikke
  * kontrollert ennå» when none of them is there; then the source of the Helfo
- * text (only with a stored source, until F2-S6's resolveHelfoClaim) and of
- * the akutt claim (as resolveAcuteClaim decides). "" for a closed clinic.
+ * claim (resolveHelfoClaim, F2-S6: only with a stored source) and of the
+ * akutt claim (as resolveAcuteClaim decides). "" for a closed clinic.
  */
 export function dentalVerificationSection(
   agent: Pick<DentalAgent, "helfo_agreement" | "acute_vakt" | "field_provenance" | "patient_focus"> & { is_inactive?: number | null },
@@ -1779,7 +1780,10 @@ export function dentalVerificationSection(
   if (lines.length === 0) lines.push("Ikke kontrollert ennå");
 
   const fp = (agent.field_provenance ?? null) as Record<string, unknown> | null;
-  const helfoSources = agent.helfo_agreement === "true" ? dentalFieldSources(fp, "helfo_agreement") : [];
+  // With F2-S6's switch off, the line is read as F2-S3 read it.
+  const helfoSources = HELFO_CLAIM_REQUIRES_SOURCE
+    ? resolveHelfoClaim(agent)?.sources ?? []
+    : agent.helfo_agreement === "true" ? dentalFieldSources(fp, "helfo_agreement") : [];
   if (helfoSources.length > 0) {
     const fetched = newestSourceDate(helfoSources);
     lines.push(`Helfo-direkteoppgjør: tolket automatisk fra klinikkens nettside${fetched ? `, hentet ${fetched}` : ""}`);
@@ -1831,7 +1835,7 @@ function renderClinicProfile(
     badges.push(`<span class="badge" style="background:#FEE2E2;color:#7F1D1D;border:1px solid #FECACA">Nedlagt</span>`);
   if (!inactive && resolveVerifiedClaim(agent))
     badges.push(`<span class="badge badge-verified">Verifisert</span>`);
-  if (!inactive && agent.helfo_agreement === "true")
+  if (!inactive && resolveHelfoClaim(agent))
     badges.push(`<span class="badge badge-helfo">Helfo-direkteoppgjør</span>`);
   if (!inactive) {
     const acute = resolveAcuteClaim(agent);
@@ -3457,14 +3461,30 @@ router.get(["/vilkar", "/terms", "/terms-of-service", "/tos"], (_req: Request, r
 // (dentalMethodCounts). The texts say what the code does: «Akuttvakt» needs
 // a stored quote from the clinic's own page (resolveAcuteClaim and
 // hasAcuteVaktQuote since F1-S4c; the text gives definition A since F1-S4e,
-// A2A dev-request 2026-10-16-finn-tannlege-fasettsider); the Helfo badge is shown from
-// helfo_agreement alone until F2-S6 (resolveHelfoClaim) changes that rule,
-// and the text with it. Daniel is the responsible editor (Daniel 2026-10-18,
-// question 14). No claim of how often anything is fetched or checked.
+// A2A dev-request 2026-10-16-finn-tannlege-fasettsider); the Helfo badge needs
+// a stored source since F2-S6 (resolveHelfoClaim), and the text says so
+// (HELFO_METHOD_RULE, the old text with the switch off). Daniel is the
+// responsible editor (Daniel 2026-10-18, question 14). No claim of how often
+// anything is fetched or checked.
 //
 // IMPORTANT: must never claim regulatory compliance/certification of any
 // kind — see tests/test.ts for the assertion guarding this.
 // ═══════════════════════════════════════════════════════════
+
+/**
+ * When the Helfo badge is shown, as the method page says it (the end of the
+ * Helfo paragraph's first sentence): with a stored source since F2-S6
+ * (resolveHelfoClaim), the text before it with the switch off.
+ */
+const HELFO_METHOD_RULE: Readonly<Record<SiteLang, string>> = HELFO_CLAIM_REQUIRES_SOURCE
+  ? {
+      nb: "og merket vises bare når uttrekket har lagret kilden sammen med opplysningen. Uten lagret kilde viser vi ingen Helfo-opplysning.",
+      en: "and the badge is shown only when the extraction has stored its source with the detail. Without a stored source we show no Helfo detail.",
+    }
+  : {
+      nb: "og merket vises når uttrekket har registrert det.",
+      en: "and the badge is shown when the extraction has recorded that.",
+    };
 
 /**
  * The field table, from DENTAL_DATA_SOURCES: one row per field, a <tbody>
@@ -3575,7 +3595,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     ${dentalMethodTableHtml("nb", "felt-for-felt", placesRule.no)}
 
     <h2>Helfo, akutt og spesialiteter</h2>
-    <p><strong>Helfo-direkteoppgjør</strong> er tolket automatisk fra klinikkens nettside: KI-modellen leser om klinikken skriver at den har direkteoppgjør med Helfo, og merket vises når uttrekket har registrert det. Vi har ingen liste fra Helfo, så merket er ikke en bekreftelse fra Helfo. Spør klinikken før du bestiller time.</p>
+    <p><strong>Helfo-direkteoppgjør</strong> er tolket automatisk fra klinikkens nettside: KI-modellen leser om klinikken skriver at den har direkteoppgjør med Helfo, ${HELFO_METHOD_RULE.nb} Vi har ingen liste fra Helfo, så merket er ikke en bekreftelse fra Helfo. Spør klinikken før du bestiller time.</p>
     <p><strong>Akuttvakt</strong> vises bare med et lagret sitat fra klinikkens egen nettside, der klinikken sier at den tar imot nye pasienter for akutt behandling utenom vanlig åpningstid (kveld, helg eller natt). Det holder ikke at kilden til opplysningen er lagret. Uten et slikt sitat viser vi «${escapeHtml(ACUTE_ACCEPTS_LABEL)}» når uttrekket fra klinikkens nettside nevner akutt, og ellers ingen akuttopplysning. Ring alltid klinikken først.</p>
     <p><strong>Spesialiteter</strong> vises når klinikkens nettside oppgir dem, enten som noe klinikken tilbyr eller som tittelen til en behandler der (for eksempel «kjeveortoped»). Vi har ikke kontrollert at behandlerne har spesialistgodkjenning.</p>
 
@@ -3613,7 +3633,7 @@ router.get("/proveniens", (_req: Request, res: Response) => {
     ${dentalMethodTableHtml("en", "field-by-field", placesRule.en)}
 
     <h2>Helfo, emergency claims and specialties</h2>
-    <p><strong>Helfo direct billing</strong> is read automatically from the clinic's website: the AI model reads whether the clinic says it has direct billing with Helfo, and the badge is shown when the extraction has recorded that. We have no list from Helfo, so the badge is not a confirmation from Helfo. Ask the clinic before you book.</p>
+    <p><strong>Helfo direct billing</strong> is read automatically from the clinic's website: the AI model reads whether the clinic says it has direct billing with Helfo, ${HELFO_METHOD_RULE.en} We have no list from Helfo, so the badge is not a confirmation from Helfo. Ask the clinic before you book.</p>
     <p><strong>Emergency duty</strong> (the "<span lang="nb">Akuttvakt</span>" badge) is shown only with a stored quote from the clinic's own website, in which the clinic says it takes new patients for emergency treatment outside regular opening hours (evening, weekend or night). A stored source for the detail is not enough. Without such a quote we show "<span lang="nb">${escapeHtml(ACUTE_ACCEPTS_LABEL)}</span>" (accepts emergency patients) when the extraction from the clinic's website mentions emergencies, and otherwise no emergency detail. Always call the clinic first.</p>
     <p><strong>Specialties</strong> are shown when the clinic's website gives them, either as something the clinic offers or as the title of a practitioner there (for example "<span lang="nb">kjeveortoped</span>", orthodontist). We have not checked that the practitioners are approved specialists.</p>
 

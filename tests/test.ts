@@ -310,6 +310,17 @@ const failures: string[] = [];
 let _serialChain: Promise<void> = Promise.resolve();
 // Read by the env-hygiene check before the summary.
 const _suiteStartedAtMs = Date.now();
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S6):
+// the Helfo claim needs a stored source (resolveHelfoClaim). Gives every
+// dental row stored with helfo_agreement 'true' a homepage source for it,
+// merged into its field_provenance, for fixtures written before the rule.
+function giveDentalHelfoSources(db: { prepare(sql: string): { run(...args: unknown[]): unknown } }): void {
+  db.prepare(
+    "UPDATE dental_agents SET field_provenance = json_set(CASE WHEN json_valid(field_provenance) THEN field_provenance ELSE '{}' END," +
+    " '$.helfo_agreement', json(?)) WHERE helfo_agreement = 'true'"
+  ).run(JSON.stringify([{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }]));
+}
+
 function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
   _serialChain = next.then(() => {}, () => {});
@@ -17879,7 +17890,8 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
   assertTrue(countPublicDentalAgents({ fylke: "Oslo" }) === 22, "sok-fix: fylke filter applies");
   assertTrue(countPublicDentalAgents({ fylke: "Vestland" }) === 1, "sok-fix: fylke filter Vestland");
 
-  // 6. Helfo filter.
+  // 6. Helfo filter (F2-S6: the rows with a Helfo source).
+  giveDentalHelfoSources(dbFactory.getDb("dental"));
   assertTrue(countPublicDentalAgents({ helfo_agreement: "true" }) === 11, "sok-fix: helfo filter applies (10 even solos + Bergen)");
 
   // 7. CORE FIX — specialty filter matches BOTH available_specialties AND
@@ -23460,6 +23472,7 @@ withFreshModules([
 
   // ── pr109-09: getDentalStats counts correctly (excludes rejected)
   {
+    giveDentalHelfoSources(dbFactory109.getDb("dental"));
     const stats = getDentalStats();
     assertEq(stats.total, 5, "pr109-09a: getDentalStats.total = 5 (excludes rejected)");
     assertTrue(stats.per_fylke.length >= 1, "pr109-09b: per_fylke has at least 1 entry");
@@ -23642,6 +23655,7 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
 
   // ── getDentalStats excludes the inactive fixture row from every count ──
   {
+    giveDentalHelfoSources(dbInactive);
     const stats = getDentalStatsInactive();
     assertEq(stats.total, 2, "inactive-09: getDentalStats.total excludes is_inactive=1 rows (2 active fixture rows, not counting the extra solo-closed one)");
     assertEq(stats.helfo_count, 1, "inactive-10: getDentalStats.helfo_count excludes the inactive fixture row (only activeId1 has helfo=true)");
@@ -27429,7 +27443,8 @@ withFreshModules(["../src/database/db-factory", "../src/services/dental-store"],
       "pr114-04f: profil_url inkluderer org_nr i slug"
     );
 
-    // buildSearchResults for klinikk med Helfo: badge settes
+    // buildSearchResults for klinikk med Helfo: badge settes (F2-S6: med kilde)
+    giveDentalHelfoSources(db);
     const helfoAgents = listPublicDentalAgents({ helfo_agreement: "true" } as any, 10);
     assertTrue(helfoAgents.length >= 1, "pr114-04g: minst 1 Helfo-klinikk funnet");
     const helfoResults = buildSearchResults(helfoAgents);
@@ -36729,6 +36744,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("dental acute claim: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S6): Helfo-merket bare med kilde ──");
+  try {
+    const { runDentalHelfoClaimTests } = require("../src/routes/dental-helfo-claim.test") as
+      typeof import("../src/routes/dental-helfo-claim.test");
+    const dhc = await runDentalHelfoClaimTests({ log: false });
+    passed += dhc.passed;
+    failed += dhc.failed;
+    for (const f of dhc.failures) failures.push("dental helfo claim: " + f);
+    console.log(`  dental helfo claim: ${dhc.passed} passed, ${dhc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental helfo claim: unexpected error: " + String(err?.message || err));
   }
 
   console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S3): profilen viser hva som er kontrollert og når ──");

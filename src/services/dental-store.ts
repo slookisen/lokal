@@ -44,6 +44,7 @@ import { findSearchSpecialty, specialtyTitleWords } from "../config/dental-searc
 // dev-request 2026-10-16-tannlege-sok-naturlig-sprak (S2b): on public surfaces
 // the akutt filter is the claim the card shows, not the raw acute_vakt flag.
 import { DENTAL_ACUTE_CLAIM_SQL, DENTAL_ACUTE_VAKT_SQL } from "./dental-acute-claim";
+import { DENTAL_HELFO_CLAIM_SQL, HELFO_CLAIM_REQUIRES_SOURCE, dentalHelfoClaimSql } from "./dental-helfo-claim";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-
 // treffvakt (A4-D): the sitemap's thin-profile check reads the values the
 // clinic page shows. dental-places-display.ts imports only types from here.
@@ -684,8 +685,9 @@ function pushFreeTextClause(
 //   publicOnly        visitor-facing surfaces: no rejected or closed clinics,
 //                     no proven non-clinic (DENTAL_CLINIC_CLASS_SQL), a
 //                     verification_status filter of 'rejected' is ignored,
-//                     'verified' means the «Verifisert» claim (F2-S8, below)
-//                     and acute_vakt 1 means the akutt claim (S2b, below).
+//                     'verified' means the «Verifisert» claim (F2-S8, below),
+//                     acute_vakt 1 means the akutt claim (S2b, below) and
+//                     helfo_agreement 'true' the Helfo claim (F2-S6, below).
 //   excludeParked     GET /agents?exclude_parked=1 (enrichment candidates).
 //   excludeNonClinic  GET /discover's opt-in catalog_class filter.
 // The synthetic probe row is skipped for every caller.
@@ -807,8 +809,21 @@ function pushFieldClauses(
     pushFreeTextClause(where, params, f.q, `${p}q`);
   }
   if (f.helfo_agreement !== undefined) {
-    where.push(`helfo_agreement = @${p}helfo_agreement`);
-    params[`${p}helfo_agreement`] = f.helfo_agreement;
+    // F2-S6: on a public surface the filter lists the clinics whose card
+    // gives the value asked for (shownHelfoAgreement): «true» is the Helfo
+    // claim (a stored 'true' with a source), and a 'true' without a source
+    // answers 'unknown'. GET /agents (admin, enrichment) keeps the column,
+    // as does every surface with the switch off.
+    const sourced = opts.publicOnly && HELFO_CLAIM_REQUIRES_SOURCE;
+    if (sourced && f.helfo_agreement === "true") {
+      where.push(DENTAL_HELFO_CLAIM_SQL);
+    } else if (sourced && f.helfo_agreement === "unknown") {
+      where.push(`(helfo_agreement = @${p}helfo_agreement OR (helfo_agreement = 'true' AND NOT ${DENTAL_HELFO_CLAIM_SQL}))`);
+      params[`${p}helfo_agreement`] = f.helfo_agreement;
+    } else {
+      where.push(`helfo_agreement = @${p}helfo_agreement`);
+      params[`${p}helfo_agreement`] = f.helfo_agreement;
+    }
   }
   if (f.acute_vakt === 1 && opts.publicOnly) {
     // S2b: a visitor-facing akutt filter lists the clinics whose card shows
@@ -1757,8 +1772,11 @@ export function getDentalStats(): DentalStats {
   ).all() as Array<{ fylke: string; n: number }>;
   const per_fylke = perFylkeRows.map((r) => ({ fylke: r.fylke, count: r.n }));
 
+  // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+  // (F2-S6): the Helfo claim (dentalHelfoClaimSql: 'true' with a source),
+  // the same rows /sok?helfo=1 and MCP `helfo` list.
   const helfo_count = (db.prepare(
-    `SELECT COUNT(*) AS n ${base} AND helfo_agreement = 'true'`
+    `SELECT COUNT(*) AS n ${base} AND ${dentalHelfoClaimSql()}`
   ).get() as { n: number }).n;
 
   const chain_count = (db.prepare(
