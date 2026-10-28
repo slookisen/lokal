@@ -48,6 +48,7 @@ import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
+import { asPublicViewMiddleware } from "./middleware/as-public-view";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import { startEventLoopMonitor, requestTrackerMiddleware, trackJob, getEventLoopSummary } from "./services/event-loop-monitor";
@@ -322,6 +323,12 @@ app.use(markdownNegotiation);
 
 // Detect /en prefix → req.lang. Must run before any HTML route.
 app.use(langMiddleware);
+
+// «Vis som offentlig» (dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-2):
+// X-Admin-Key + ?as_public=1 on a public RFB surface → the hidden test fixture
+// is evaluated as public (no-store, noindex). After langMiddleware so /en paths
+// are matched stripped; anything else passes through untouched.
+app.use(asPublicViewMiddleware);
 
 // ─── POST /webhooks/resend (owner decision 2026-09-29 «Blacklist bounces») ──
 // Svix-signed Resend events → email_bounces only (hard bounce / spam

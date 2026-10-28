@@ -50511,6 +50511,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-2 (AC22): «Vis som
+// offentlig» — X-Admin-Key + ?as_public=1 evaluates the hidden test fixture as
+// public on the covered surfaces (no-store, noindex, no shared cache), owner
+// switches observable; everything else byte-identical. Swaps getDb() and env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-2: «Vis som offentlig» for testprodusenten ──");
+  try {
+    const { runAsPublicViewS2d2Tests } = require("../src/routes/as-public-view-s2d2.test") as
+      typeof import("../src/routes/as-public-view-s2d2.test");
+    const r = await runAsPublicViewS2d2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("as-public-view-s2d2: " + f);
+    console.log(`  as-public-view-s2d2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("as-public-view-s2d2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
