@@ -210,8 +210,11 @@ function looksLikeCssOrJsLeakage(trimmed: string): boolean {
 // "Mandag, Tirsdag, …, Lørdag 10:00–18:00". about_text/visit_text keep the
 // plain rule above, and an hours value ending in a word or a stray letter
 // ("… 18.00 – 20.00. D", "… så ikke nøl med å ringe oss") is still flagged.
+// The time must be a valid hour 0–24 and minute 00–59 with no digit, "." or
+// ":" right before it, so a trailing price or year ("129.00", "2024.10") is
+// not mistaken for one.
 const GARDSSALG_TRUNCATION_MIN_LEN = 50;
-const GARDSSALG_TRAILING_CLOCK_TIME_RE = /\d{1,2}[:.]\d{2}$/;
+const GARDSSALG_TRAILING_CLOCK_TIME_RE = /(?:^|[^\d.:])(?:[01]?\d|2[0-4])[:.][0-5]\d$/;
 const GARDSSALG_TRAILING_EMAIL_RE = /^[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}$/u;
 const GARDSSALG_TRAILING_URL_RE =
   /^(?:(?:https?:\/\/|www\.)(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}|(?:[\p{L}\p{N}-]+\.)+(?:no|com|net|org|eu|se|dk|info))(?:[\/?#](?:\S*[\p{L}\p{N}\/])?)?$/u;

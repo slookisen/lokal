@@ -416,6 +416,16 @@ export function runGardssalgQualityUpdateTests(opts: { log?: boolean } = {}): Te
     TRUNCATED,
     "53: the clock-time exception is field-scoped — about_text ending in '10:00–18:00' is STILL flagged truncated_mid_sentence"
   );
+  for (const notATime of [
+    "Gårdsbutikken selger egg og kjøtt, pris per kg storfe er nå kr 129.00",
+    "Åpningstider og priser finner du i nyhetsbrevet vårt fra oktober 2024.10",
+  ]) {
+    assertEq(
+      classifyGardssalgFieldDefect("opening_hours_text", notATime),
+      TRUNCATED,
+      `54: a trailing price or year ('${notATime.slice(-8)}') is not a clock time — STILL flagged truncated_mid_sentence`
+    );
+  }
 
   return { passed, failed, failures };
 }
