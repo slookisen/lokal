@@ -18,8 +18,13 @@
 // agents.order_notifications_opt_in), orders.reminder + notify.order_email
 // (locked on while orders.enabled is on) and the two guarantees. Every other
 // entry is `coming_soon`; the slice that builds its enforcement flips it.
+// S2e (side v2, «Én bryter, ett sted»): the /eier «Bestillinger» and pause
+// cards move into «Mine valg», so visibility.profile (the owner pause),
+// orders.email (the confirmed order address) and comms.news (the first-login
+// consent, shown in its row) are `live` too. A `coming_soon` entry is shown
+// only in the page's «Planlagt» box, with no value.
 
-import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
+import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
 
 export const OWNER_FEATURE_KEYS = [
@@ -171,6 +176,13 @@ export interface OwnerFeatureEntry {
   devRequest: string;
   surfaces: OwnerFeatureSurface[];
   storage?: OwnerFeatureStorageAdapter;
+  /**
+   * S2e: the value is changed only through a confirmation link mailed to the
+   * new value (orders.email, S1b punkt 7) — never by a direct owner write.
+   * The resolver reports it as not directly changeable (block
+   * `confirm_by_email`); the page offers the confirmation form instead.
+   */
+  confirmByEmail?: boolean;
 }
 
 export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: LocalizedText }> = [
@@ -226,6 +238,18 @@ const PROFILE_VISIBLE_ADAPTER: OwnerFeatureStorageAdapter = {
   write: (db, subjectId, value) => writeOwnerProfileVisible(db, subjectId, value === true),
 };
 
+/**
+ * S2e: orders.email reads the confirmed order address
+ * (agents.order_notification_email; null = the profile e-mail). It is only
+ * ever written by the confirmation flow in routes/owner-portal.ts
+ * (confirmOwnerOrderEmailChange), so the adapter's write refuses.
+ */
+const ORDER_EMAIL_ADAPTER: OwnerFeatureStorageAdapter = {
+  column: "agents.order_notification_email",
+  read: (db, subjectId) => readOrderNotificationEmailOverride(db, subjectId),
+  write: () => false,
+};
+
 /** Public profile, structured data and AI read surfaces of a profile field. */
 const PROFILE_FIELD_SURFACES: OwnerFeatureSurface[] = ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "a2a"];
 
@@ -244,6 +268,9 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     // search) and leaderboard — the shared predicate removes it there too.
     surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "sitemap", "llms", "a2a", "leaderboard"],
     storage: PROFILE_VISIBLE_ADAPTER,
+    // S2e: the /eier pause card moved here («Én bryter, ett sted»).
+    status: "live",
+    since: "2026-10-28",
   }),
   entry({
     key: "visibility.ai_assistants", group: "visibility", type: "switch",
@@ -378,11 +405,20 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "orders.email", group: "orders", type: "email",
     label: t("Bestillinger sendes til", "Orders are sent to"),
-    description: t("E-postadressen bestillingene går til. Standard er profilens e-post.", "The e-mail address orders go to. Default is the profile e-mail."),
+    description: t(
+      "E-postadressen bestillingene går til. Standard er profilens e-post. En ny adresse gjelder når du har klikket lenken vi sender dit.",
+      "The e-mail address orders go to. Default is the profile e-mail. A new address applies once you have clicked the link we send there.",
+    ),
     nullable: true,
     default: { owner: null, unclaimed: null },
     requires: ["orders.enabled"],
+    // S2e: the order-address form from the /eier «Bestillinger» card (S1b punkt 7).
+    status: "live",
+    since: "2026-10-28",
+    outward: true,
     surfaces: ["email:order_notification"],
+    storage: ORDER_EMAIL_ADAPTER,
+    confirmByEmail: true,
   }),
   entry({
     key: "orders.pause", group: "orders", type: "switch",
@@ -679,11 +715,21 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "comms.news", group: "comms", type: "switch",
     label: t("Nyheter og tips", "News and tips"),
-    description: t("Nyheter og tips fra Rett fra Bonden på e-post. Du blir spurt ved første innlogging.", "News and tips from Rett fra Bonden by e-mail. You are asked at first login."),
+    description: t(
+      "Om du vil ha nyheter og tips fra Rett fra Bonden på e-post. Vi lagrer svaret ditt med tidspunkt. Vi sender ingen nyhetsbrev automatisk.",
+      "Whether you want news and tips from Rett fra Bonden by e-mail. We store your answer with the time. We send no newsletter automatically.",
+    ),
     default: { owner: false, unclaimed: false },
     consent: true,
     outward: true,
-    surfaces: ["email:newsletter"],
+    // S2e (principle 8): the first-login answer is this row's value. It is a
+    // stored consent only: no code path sends a newsletter, so the entry
+    // declares no surface (nothing for the matrix or the switch probe to
+    // observe). The slice that builds a news mailing must declare
+    // `email:newsletter` here and read featureOn(…, "comms.news") before sending.
+    status: "live",
+    since: "2026-10-28",
+    surfaces: [],
   }),
   entry({
     key: "comms.beta", group: "comms", type: "switch",

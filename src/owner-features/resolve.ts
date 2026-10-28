@@ -35,7 +35,7 @@ export type OwnerFeatureSource = "default" | "owner" | "admin" | "locked" | "kil
 /** Why a key cannot be changed right now (null = changeable). */
 export type OwnerFeatureBlock =
   | "killswitch" | "admin_locked" | "coming_soon" | "guarantee" | "locked"
-  | "not_applicable" | "requirement_not_met";
+  | "not_applicable" | "requirement_not_met" | "confirm_by_email";
 
 export interface ResolvedOwnerFeature {
   key: string;
@@ -89,6 +89,10 @@ const REASON_GUARANTEE: LocalizedText = {
 const REASON_NOT_APPLICABLE: LocalizedText = {
   no: "Gjelder bare profiler med bekreftet eier.",
   en: "Only applies to profiles with a verified owner.",
+};
+const REASON_CONFIRM_BY_EMAIL: LocalizedText = {
+  no: "Endres med en bekreftelse: vi sender en lenke til den nye adressen, og den gjelder når lenken er brukt.",
+  en: "Changed with a confirmation: we send a link to the new address, and it applies once the link is used.",
 };
 const CONDITION_REASONS: Record<OwnerFeatureCondition, LocalizedText> = {
   verifiedOwner: {
@@ -274,6 +278,11 @@ class Resolver {
     if (unmet) return fixed(offValue(e, d), "locked", "requirement_not_met", unmet);
     if (e.lockOnUnless && this.resolve(e.lockOnUnless).value !== true) {
       return fixed(true, "locked", "locked", lockedOnUnlessReason(getOwnerFeature(e.lockOnUnless, this.registry).label));
+    }
+    // S2e: changed only through the e-mail confirmation flow (orders.email).
+    if (e.confirmByEmail) {
+      const cx = this.explicitValue(e);
+      return { key: e.key, value: cx ? cx.value : d, source: cx ? cx.source : "default", changeable: false, block: "confirm_by_email", reason: REASON_CONFIRM_BY_EMAIL };
     }
     // 4. explicit owner value, 5. segment default
     const x = this.explicitValue(e);
@@ -488,6 +497,12 @@ export function setOwnerFeatureValue(
   if (!e) return { kind: "unknown_key" };
   const db = opts.db ?? getDb();
   const ropts: OwnerFeatureOptions = { ...opts, db, registry };
+  // S2e: never a direct write, not even to the off value (the confirmation
+  // flow owns the column).
+  if (e.confirmByEmail) {
+    const exists = !!db.prepare("SELECT 1 AS x FROM agents WHERE id = ?").get(subjectId);
+    return exists ? { kind: "blocked", block: "confirm_by_email", reason: REASON_CONFIRM_BY_EMAIL } : { kind: "not_found" };
+  }
 
   return db.transaction((): SetOwnerFeatureResult => {
     const r = makeResolver(vertical, subjectId, ropts);

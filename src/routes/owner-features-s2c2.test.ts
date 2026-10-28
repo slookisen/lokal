@@ -371,8 +371,11 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
         }
       }
       assertEq(missing, [], "coverage-1: every visibility key has a probe for each declared surface");
+      // S2e (side v2): visibility.profile is the /eier pause card moved into
+      // «Mine valg», so it is live; the other five stay coming_soon.
+      assertEq(reg.getOwnerFeature("visibility.profile").status, "live", "status-0: visibility.profile is live (S2e, the pause)");
       for (const key of VIS_KEYS) {
-        assertEq(reg.getOwnerFeature(key).status, "coming_soon", `status-1: ${key} stays coming_soon until the S2d switch probe`);
+        if (key !== "visibility.profile") assertEq(reg.getOwnerFeature(key).status, "coming_soon", `status-1: ${key} stays coming_soon until the S2d switch probe`);
         assertEq(reg.getOwnerFeature(key).default, { owner: true, unclaimed: true }, `status-2: ${key} defaults to shown for both segments`);
       }
       assertEq(reg.getOwnerFeature("visibility.profile").storage?.column, "owner_profile_pause", "registry-1: visibility.profile is stored as the owner pause");
@@ -425,6 +428,10 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
 
     const LIVE = reg.OWNER_FEATURE_REGISTRY.map((e) =>
       (VIS_KEYS as readonly string[]).includes(e.key) ? { ...e, status: "live" as const } : e);
+    // Every visibility key still coming_soon (the registry as S2c-2 shipped it,
+    // before S2e made visibility.profile live): stored choices have no effect.
+    const SOON = reg.OWNER_FEATURE_REGISTRY.map((e) =>
+      (VIS_KEYS as readonly string[]).includes(e.key) ? { ...e, status: "coming_soon" as const } : e);
     const setChoice = (id: string, key: string, value: unknown) => {
       const r = rs.setOwnerFeatureValue("rfb", id, key, value, { actor: "owner" }, { db, registry: LIVE });
       if (r.kind !== "ok") throw new Error(`setOwnerFeatureValue(${key}) → ${r.kind}`);
@@ -477,8 +484,8 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
       setEnv(ALLOW_ENV, `rfb:${TWIN_ID}x`);
       sameSnapshot(baseline, await snapshot(ENF_ID), "gate-4: enforce on, another subject allowlisted");
       setEnv(ALLOW_ENV, `rfb:${ENF_ID}`);
-      vis.__setVisibilityRegistryForTesting(null);
-      sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5: enforce on + allowlisted, real registry (coming_soon) → owner choices have no effect yet");
+      vis.__setVisibilityRegistryForTesting(SOON);
+      sameSnapshot(baseline, await snapshot(ENF_ID), "gate-5: enforce on + allowlisted, keys coming_soon → owner choices have no effect yet");
       vis.__setVisibilityRegistryForTesting(LIVE);
       const hidden = await snapshot(ENF_ID);
       assertTrue(hidden.page_no !== baseline.page_no && hidden.lokal_info !== baseline.lokal_info && hidden.sitemap !== baseline.sitemap,
@@ -539,14 +546,18 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
         av.ownerHidesAgent(TWIN_ID, "profile");
         assertEq(queries, 0, "gate-11: a profile outside the allowlist → no lookup query");
         // One lookup per call, whatever the surface lists (the allowlist, not the rows, sets the cost).
-        vis.__setVisibilityRegistryForTesting(null);
+        vis.__setVisibilityRegistryForTesting(SOON);
         queries = 0;
         av.notOwnerHiddenSql("shopping_feeds", "a");
-        assertEq(queries, 1, "batch-1: a list fragment costs one query (real registry)");
+        assertEq(queries, 1, "batch-1: a list fragment costs one query (keys coming_soon)");
         setEnv(ALLOW_ENV, `rfb:${ENF_ID},rfb:${TWIN_ID}`);
         queries = 0;
         av.notOwnerHiddenSql("shopping_feeds", "a");
         assertEq(queries, 1, "batch-2: two allowlisted profiles → still one query");
+        vis.__setVisibilityRegistryForTesting(null);
+        queries = 0;
+        av.notOwnerHiddenSql("shopping_feeds", "a");
+        assertEq(queries, 3, "batch-2b: real registry (S2e: visibility.profile live) → one query + the pause adapter per allowlisted profile");
         vis.__setVisibilityRegistryForTesting(LIVE);
         queries = 0;
         const ids = av.ownerHiddenAgentIds("profile");
@@ -570,7 +581,7 @@ export async function runOwnerFeaturesS2c2Tests(opts: { log?: boolean } = {}): P
 
     // Admin lock takes effect even while the keys are coming_soon.
     {
-      vis.__setVisibilityRegistryForTesting(null);
+      vis.__setVisibilityRegistryForTesting(SOON);
       clearChoices(ENF_ID);
       db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at)
                   VALUES ('rfb', ?, 'visibility.ai_assistants', 'false', 'admin', 1, ?)`).run(ENF_ID, new Date().toISOString());

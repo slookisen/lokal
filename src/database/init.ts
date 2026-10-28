@@ -5501,6 +5501,52 @@ function initSchema(db: Database.Database): void {
     console.error("Migration owner_feature_change_batch/owner_feature_intro failed:", err);
   }
 
+  // ─── dev-request 2026-10-22-rfb-mine-valg-eierbrytere, S2e ───────────────
+  // «Planlagt — si fra hvis du vil ha dette»: one row per (subject, key) when
+  // the owner presses «Gi meg beskjed» on a `coming_soon` entry. Additive,
+  // brand-new table; idempotent (PRIMARY KEY, INSERT … ON CONFLICT DO
+  // NOTHING). It has no effect on any surface and nothing is e-mailed;
+  // admins read the counts per key (GET /admin/owner-features/interest).
+  // registered_at is ISO-8601 (Date#toISOString).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_interest (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_owner_feature_interest_key
+        ON owner_feature_interest(vertical, key);
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_interest failed:", err);
+  }
+
+  // S2e (v2 principle 3): the level the owner chose themselves («Bare synlig» /
+  // «Ta imot bestillinger»), one row per subject, so the page marks a level
+  // only after the owner's own choice — also when choosing it changed no
+  // switch (no batch is written then). batch_id = the level batch it wrote
+  // (NULL when nothing changed); undoing that batch removes the row.
+  // chosen_at is ISO-8601.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_level_choice (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        level TEXT NOT NULL,
+        chosen_at TEXT NOT NULL,
+        actor_detail TEXT,
+        batch_id INTEGER,
+        PRIMARY KEY (vertical, subject_id)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_level_choice failed:", err);
+  }
+
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet
   // (Steg C2) — server-side daily send cap on the cold-outreach send point ─
   // outreach_daily_send_cap: one row per UTC calendar day, holding an
