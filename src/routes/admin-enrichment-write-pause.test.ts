@@ -703,6 +703,13 @@ export async function runAdminEnrichmentWritePauseTests(
         // rfb pause via the service to prove both google-rating routes still
         // answer 423 before any Places call (acceptance h).
         "routes/rfb-places-match-guard.test.ts",
+        // dev-request 2026-10-27-dental-skrivepause-gjerde-mangler-paa-
+        // tannlege-put (P0): the dental router (PUT /agents/:id, claim-batch,
+        // stage-v-drift-result, google-places-batch write mode) checks the
+        // dental pause through one shared helper; its test file sets/clears
+        // the pause via the service to prove the wiring.
+        "routes/dental.ts",
+        "routes/dental-enrichment-write-pause.test.ts",
       ].sort(),
       "ewp-125: the guard is imported by exactly the gated surfaces, the shared write primitives, its own admin route, and the test files",
     );

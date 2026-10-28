@@ -50464,3 +50464,26 @@ runSerial(async () => {
     }
   }
 });
+
+// A2A dev-request 2026-10-27-dental-skrivepause-gjerde-mangler-paa-tannlege-put
+// (P0): the enrichment write-pause fence on the dental router — PUT
+// /api/tannlege/agents/:id 423 + zero changes under pause, claim-batch hands
+// out an empty batch with the reason, stage-v-drift-result and
+// google-places-batch (write) 423, release-batch stays open, fail-closed on a
+// missing pause table / throwing getDb(). Pins the main-db singleton and swaps
+// the dental db-factory (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-27-dental-skrivepause-gjerde: skrivepause-gjerdet på dental-rutene ──");
+  try {
+    const { runDentalEnrichmentWritePauseTests } = require("../src/routes/dental-enrichment-write-pause.test") as
+      typeof import("../src/routes/dental-enrichment-write-pause.test");
+    const r = await runDentalEnrichmentWritePauseTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("dental-enrichment-write-pause: " + f);
+    console.log(`  dental-enrichment-write-pause: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-enrichment-write-pause: unexpected error: " + String(err?.message || err));
+  }
+});
