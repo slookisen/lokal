@@ -5844,6 +5844,17 @@ function initSchema(db: Database.Database): void {
       console.error("Migration client_ip_shadow_windows.covered_ms failed:", err);
     }
   }
+  // Trinn 1e: the window's non_public fallbacks per range code, path class and
+  // UA class, as compact JSON of counts (codes only: no IP, no hash, no host
+  // name). Additive; rows from before stay NULL and are read as unknown.
+  // Idempotent on "duplicate column name".
+  try {
+    db.exec(`ALTER TABLE client_ip_shadow_windows ADD COLUMN non_public_by_json TEXT`);
+  } catch (err: any) {
+    if (!String(err?.message || "").includes("duplicate column name")) {
+      console.error("Migration client_ip_shadow_windows.non_public_by_json failed:", err);
+    }
+  }
 
   // ─── dev-request 2026-09-09-outreach-profilkvalitet: agents-city-backfill ──
   // columns (services/agents-city-backfill.ts). `agents.city` itself already

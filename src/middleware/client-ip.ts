@@ -43,7 +43,10 @@
  * the fanIn ratio over 20 min (FANIN_WINDOWS), /mcp rated the way the MCP
  * limiters key it, with the routers' own session check (ac2LimitersFor,
  * mcpSessionKeyed), and hours_covered from the time each window was actually
- * measured (coveredMs).
+ * measured (coveredMs). Trinn 1e explains `non_public` before trinn 2:
+ * deriveFlyClientIp names the range (NonPublicRange), and non_public_by
+ * splits those fallbacks per range, route and UA class in the window, the
+ * log line, since_boot and cumulative — codes and counts only.
  *
  * The failure mode guarded hardest is "every client in one bucket" (a 429
  * wave on all three sites):
@@ -122,51 +125,111 @@ export function resolveClientIpConfig(
 // ─── Fly-Client-IP derivation ───────────────────────────────────────────
 
 export type FlyClientIpFallback = "missing" | "invalid" | "non_public";
-export type FlyClientIp = { ok: true; ip: string } | { ok: false; fallback: FlyClientIpFallback };
+
+/**
+ * Trinn 1e: which non-public range a `non_public` Fly-Client-IP fell in, as a
+ * fixed code (never the address): v4_other is 0.0.0.0/8, multicast 224/4 and
+ * reserved 240/4; v6_reserved is ::/8 (unspecified, loopback and every
+ * IPv4-embedding form). NON_PUBLIC_RANGE_CODES lists every code once.
+ */
+export type NonPublicRange =
+  | "v4_10"
+  | "v4_172_16"
+  | "v4_192_168"
+  | "v4_cgnat"
+  | "v4_loopback"
+  | "v4_link_local"
+  | "v4_other"
+  | "v6_ula"
+  | "v6_reserved"
+  | "v6_link_local"
+  | "v6_multicast";
+
+export type FlyClientIp =
+  | { ok: true; ip: string }
+  | { ok: false; fallback: "missing" | "invalid" }
+  | { ok: false; fallback: "non_public"; range: NonPublicRange };
 
 // Longest textual IP: an IPv6 address with an embedded IPv4 tail (45 chars).
 const MAX_IP_TEXT_LEN = 45;
 const IPV4_MAPPED_DOTTED = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i;
 
-function blockList(family: "ipv4" | "ipv6", subnets: ReadonlyArray<[string, number]>): net.BlockList {
+type Subnet = readonly [address: string, prefix: number, range: NonPublicRange];
+
+function blockList(family: "ipv4" | "ipv6", subnets: ReadonlyArray<Subnet>): net.BlockList {
   const list = new net.BlockList();
   for (const [address, prefix] of subnets) list.addSubnet(address, prefix, family);
   return list;
 }
 
+/** Trinn 1e: one single-subnet list per entry, so a non_public address can be told by range. */
+function rangeLists(family: "ipv4" | "ipv6", subnets: ReadonlyArray<Subnet>): Array<readonly [NonPublicRange, net.BlockList]> {
+  return subnets.map((s) => [s[2], blockList(family, [s])] as const);
+}
+
 // One list per family, each only ever checked against its own family:
 // net.BlockList also matches an IPv4 address against IPv4-mapped IPv6 rules,
 // so a mixed list holding ::/8 would block every IPv4 address.
-const NON_PUBLIC_V4 = blockList("ipv4", [
-  ["0.0.0.0", 8], // "this network", incl. unspecified
-  ["10.0.0.0", 8],
-  ["100.64.0.0", 10], // CGNAT
-  ["127.0.0.0", 8],
-  ["169.254.0.0", 16], // link-local
-  ["172.16.0.0", 12], // where Fly's proxy socket address has been seen
-  ["192.168.0.0", 16],
-  ["224.0.0.0", 4], // multicast
-  ["240.0.0.0", 4], // reserved, incl. broadcast
-]);
-const NON_PUBLIC_V6 = blockList("ipv6", [
+// Trinn 1e: each subnet carries its NonPublicRange code; the lists' content
+// (address, prefix) is what it was before the codes.
+const NON_PUBLIC_V4_SUBNETS: ReadonlyArray<Subnet> = [
+  ["0.0.0.0", 8, "v4_other"], // "this network", incl. unspecified
+  ["10.0.0.0", 8, "v4_10"],
+  ["100.64.0.0", 10, "v4_cgnat"], // CGNAT
+  ["127.0.0.0", 8, "v4_loopback"],
+  ["169.254.0.0", 16, "v4_link_local"], // link-local
+  ["172.16.0.0", 12, "v4_172_16"], // where Fly's proxy socket address has been seen
+  ["192.168.0.0", 16, "v4_192_168"],
+  ["224.0.0.0", 4, "v4_other"], // multicast
+  ["240.0.0.0", 4, "v4_other"], // reserved, incl. broadcast
+];
+const NON_PUBLIC_V6_SUBNETS: ReadonlyArray<Subnet> = [
   // IETF-reserved 0000::/8: unspecified (::), loopback (::1) and every
   // IPv4-embedding form left after the dotted ::ffff: normalization below —
   // IPv4-mapped/-compatible (::ffff:0:0/96, ::/96) and NAT64 (64:ff9b::/96).
   // None is a real client source address, and ipKeyGenerator's /56 grouping
   // puts every IPv4 client written in hex in one of these forms into ONE
   // bucket (::ffff:7b7b:7b7b → "::/56", 64:ff9b::cb00:7109 → "64:ff9b::/56").
-  ["::", 8],
-  ["fc00::", 7], // ULA, incl. Fly's 6PN/Flycast fdaa::/16
-  ["fe80::", 10], // link-local
-  ["ff00::", 8], // multicast
-]);
+  ["::", 8, "v6_reserved"],
+  ["fc00::", 7, "v6_ula"], // ULA, incl. Fly's 6PN/Flycast fdaa::/16
+  ["fe80::", 10, "v6_link_local"], // link-local
+  ["ff00::", 8, "v6_multicast"], // multicast
+];
+const NON_PUBLIC_V4 = blockList("ipv4", NON_PUBLIC_V4_SUBNETS);
+const NON_PUBLIC_V6 = blockList("ipv6", NON_PUBLIC_V6_SUBNETS);
+const NON_PUBLIC_V4_BY_RANGE = rangeLists("ipv4", NON_PUBLIC_V4_SUBNETS);
+const NON_PUBLIC_V6_BY_RANGE = rangeLists("ipv6", NON_PUBLIC_V6_SUBNETS);
+
+/** Every NonPublicRange code once (the since_boot/window/cumulative keys, in this order); client-ip.test.ts pins it against the subnets. */
+export const NON_PUBLIC_RANGE_CODES: readonly NonPublicRange[] = [
+  "v4_10",
+  "v4_172_16",
+  "v4_192_168",
+  "v4_cgnat",
+  "v4_loopback",
+  "v4_link_local",
+  "v4_other",
+  "v6_ula",
+  "v6_reserved",
+  "v6_link_local",
+  "v6_multicast",
+];
+
+/** The code of the subnet a non-public address is in (the subnets do not overlap); the family's catch-all if none, which cannot happen. */
+function nonPublicRange(ip: string, family: number): NonPublicRange {
+  const lists = family === 4 ? NON_PUBLIC_V4_BY_RANGE : NON_PUBLIC_V6_BY_RANGE;
+  const kind = family === 4 ? "ipv4" : "ipv6";
+  for (const [range, list] of lists) if (list.check(ip, kind)) return range;
+  return family === 4 ? "v4_other" : "v6_reserved";
+}
 
 const INVALID: FlyClientIp = { ok: false, fallback: "invalid" };
 
 /**
  * The client IP Fly's edge accepted the connection from, or why there is
  * none to use. Anything but `{ ok: true }` means: leave the request exactly
- * as it is today (G1).
+ * as it is today (G1). `non_public` also names its range (trinn 1e), a code,
+ * never the address.
  */
 export function deriveFlyClientIp(headers: Readonly<Record<string, unknown>> | null | undefined): FlyClientIp {
   const value = headers ? headers["fly-client-ip"] : undefined;
@@ -182,7 +245,7 @@ export function deriveFlyClientIp(headers: Readonly<Record<string, unknown>> | n
   const family = net.isIP(ip);
   if (family === 0) return INVALID;
   const nonPublic = family === 4 ? NON_PUBLIC_V4.check(ip, "ipv4") : NON_PUBLIC_V6.check(ip, "ipv6");
-  if (nonPublic) return { ok: false, fallback: "non_public" };
+  if (nonPublic) return { ok: false, fallback: "non_public", range: nonPublicRange(ip, family) };
   return { ok: true, ip };
 }
 
@@ -328,7 +391,7 @@ const DISTINCT_CAP = 4096;
 // Fly's http_service check (fly.toml) and the Dockerfile HEALTHCHECK (via localhost).
 const HEALTH_CHECK_PATHS: ReadonlySet<string> = new Set(["/.well-known/agent-card.json", "/health"]);
 
-type PathClass = "api" | "a2a" | "mcp" | "other";
+export type PathClass = "api" | "a2a" | "mcp" | "other";
 
 interface TopEntry {
   n: number;
@@ -340,12 +403,21 @@ interface TopEntry {
   ua: Map<string, number>;
 }
 
+/** Trinn 1e: the non_public fallbacks split three ways; each split sums to fallback.non_public. */
+interface NonPublicBy {
+  range: Record<NonPublicRange, number>;
+  route: Record<PathClass, number>;
+  /** uaFamily classes (as ClientIpTopKey.ua), only those seen. */
+  ua: Record<string, number>;
+}
+
 /** A window's additive counters: what sums across windows into since-boot totals. */
 interface StatsCounters {
   n: number;
   fciValid: number;
   fallback: Record<FlyClientIpFallback, number>;
   fallbackHc: number;
+  nonPublicBy: NonPublicBy;
   errors: number;
   xffClientSupplied: number;
   agreeFciEdge: { n: number; agree: number };
@@ -390,6 +462,13 @@ export interface ClientIpCounters {
    * (missing + invalid + non_public − fallback_hc) ≤ 1 % of n.
    */
   fallback_hc: number;
+  /**
+   * Trinn 1e: of fallback.non_public, per range code (NonPublicRange), per
+   * path class (as top15m's api/a2a/mcp/other) and per UA class (as
+   * top15m's ua). Codes and counts only: no address, hash or host name.
+   * Each of range, route and ua sums to fallback.non_public.
+   */
+  non_public_by: ClientIpNonPublicBy;
   errors: number;
   /** X-Forwarded-For had ≥3 entries: the client sent its own before Fly appended two. */
   xff_client_supplied: number;
@@ -401,6 +480,22 @@ export interface ClientIpCounters {
   would_trip: number;
   /** Requests whose Fly-Client-IP got no top-list entry (TOP_CAP reached): > 0 means the top list is incomplete. */
   top_overflow: number;
+}
+
+/**
+ * `non_public_by` (trinn 1e). In since_boot and the stats line: range and
+ * route with every key, ua with the classes seen. In cumulative.counters
+ * also `unknown` in range, route and ua — the non_public of stored rows
+ * without a breakdown (stored before trinn 1e, or unreadable) — so each
+ * still sums to fallback.non_public, and `unknown_rows`, how many such rows
+ * had non_public > 0 (rows without any non_public have nothing to explain,
+ * so they are not counted).
+ */
+export interface ClientIpNonPublicBy {
+  range: Record<NonPublicRange, number> & { unknown?: number };
+  route: Record<PathClass, number> & { unknown?: number };
+  ua: Record<string, number>;
+  unknown_rows?: number;
 }
 
 export interface ClientIpStatsLine extends ClientIpCounters {
@@ -735,12 +830,21 @@ export interface ClientIpOpsSnapshot {
   ac2: ClientIpAc2 | null;
 }
 
+function newNonPublicBy(): NonPublicBy {
+  return {
+    range: Object.fromEntries(NON_PUBLIC_RANGE_CODES.map((c) => [c, 0])) as Record<NonPublicRange, number>,
+    route: { api: 0, a2a: 0, mcp: 0, other: 0 },
+    ua: {},
+  };
+}
+
 function newCounters(): StatsCounters {
   return {
     n: 0,
     fciValid: 0,
     fallback: { missing: 0, invalid: 0, non_public: 0 },
     fallbackHc: 0,
+    nonPublicBy: newNonPublicBy(),
     errors: 0,
     xffClientSupplied: 0,
     agreeFciEdge: { n: 0, agree: 0 },
@@ -755,6 +859,9 @@ function addCounters(into: StatsCounters, from: StatsCounters): void {
   into.fciValid += from.fciValid;
   for (const f of ["missing", "invalid", "non_public"] as const) into.fallback[f] += from.fallback[f];
   into.fallbackHc += from.fallbackHc;
+  for (const c of NON_PUBLIC_RANGE_CODES) into.nonPublicBy.range[c] += from.nonPublicBy.range[c];
+  for (const p of ["api", "a2a", "mcp", "other"] as const) into.nonPublicBy.route[p] += from.nonPublicBy.route[p];
+  for (const [u, n] of Object.entries(from.nonPublicBy.ua)) into.nonPublicBy.ua[u] = (into.nonPublicBy.ua[u] ?? 0) + n;
   into.errors += from.errors;
   into.xffClientSupplied += from.xffClientSupplied;
   into.agreeFciEdge.n += from.agreeFciEdge.n;
@@ -772,6 +879,7 @@ function countersOut(c: StatsCounters): ClientIpCounters {
     fci_valid: c.fciValid,
     fallback: { ...c.fallback },
     fallback_hc: c.fallbackHc,
+    non_public_by: { range: { ...c.nonPublicBy.range }, route: { ...c.nonPublicBy.route }, ua: { ...c.nonPublicBy.ua } },
     errors: c.errors,
     xff_client_supplied: c.xffClientSupplied,
     agree_fci_edge: { ...c.agreeFciEdge },
@@ -1073,6 +1181,14 @@ export function createClientIpMiddleware(cfg: ClientIpConfig, opts: ClientIpMidd
     if (!d.ok) {
       w.fallback[d.fallback]++;
       if (d.fallback === "missing" && HEALTH_CHECK_PATHS.has(req.path)) w.fallbackHc++;
+      if (d.fallback === "non_public") {
+        // Trinn 1e: which range, route and UA class — codes only, never the address.
+        const by = w.nonPublicBy;
+        by.range[d.range]++;
+        by.route[pathClass(typeof req.path === "string" ? req.path : "")]++;
+        const family = uaFamily(req.headers["user-agent"]);
+        by.ua[family] = (by.ua[family] ?? 0) + 1;
+      }
     } else {
       w.fciValid++;
       const xff = xffEntries(req.headers["x-forwarded-for"]);

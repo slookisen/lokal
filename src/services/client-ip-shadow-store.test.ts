@@ -45,6 +45,11 @@
  *      starting mid-window covers the rest of it only, two machines in one
  *      window count it once, the migration keeps old rows as full windows;
  *      the store's timer flush runs inside trackJob.
+ *   J  trinn 1e: non_public_by per range code, route and UA class is stored
+ *      per row (non_public_by_json, compact) and summed in cumulative across
+ *      a restart; rows from before the column (NULL) or with an untrusted
+ *      breakdown read as `unknown`, counted in unknown_rows; each split sums
+ *      to fallback.non_public; codes and counts only, no IP.
  *
  * Own in-memory / temp-file DBs, injected clocks, no timers except B's one
  * short unref'd timer (stopped). The DB-accessor failure hook and the
@@ -119,7 +124,7 @@ const COLUMNS = [
   "n", "fci_valid", "fallback_missing", "fallback_invalid", "fallback_non_public", "fallback_hc", "errors",
   "xff_client_supplied", "agree_fci_edge_n", "agree_fci_edge_agree", "agree_legacy_eq_fci_n", "agree_legacy_eq_fci_agree",
   "would_trip", "top_overflow", "fanin_ratio", "fanin_class", "fanin_fan_in", "fanin_ua", "created_at",
-  "covered_ms",
+  "covered_ms", "non_public_by_json",
 ];
 const NO_NONZERO_WINDOWS = { top_overflow: { windows: 0, last: null }, invalid_non_public: { windows: 0, last: null } };
 const CRITERIA = [
@@ -161,12 +166,31 @@ function counters(k = 1): ClientIpCounters {
     fci_valid: 900 * k,
     fallback: { missing: 11 * k, invalid: 2 * k, non_public: 3 * k },
     fallback_hc: 10 * k,
+    // Trinn 1e: each split of the 3k non_public different, so a swapped or dropped split shows.
+    non_public_by: {
+      range: { v4_10: 0, v4_172_16: 2 * k, v4_192_168: 0, v4_cgnat: 0, v4_loopback: 0, v4_link_local: 0, v4_other: 0, v6_ula: k, v6_reserved: 0, v6_link_local: 0, v6_multicast: 0 },
+      route: { api: k, a2a: 0, mcp: 2 * k, other: 0 },
+      ua: { none: 2 * k, "ai_search:claude": k },
+    },
     errors: 4 * k,
     xff_client_supplied: 5 * k,
     agree_fci_edge: { n: 800 * k, agree: 799 * k },
     agree_legacy_eq_fci: { n: 700 * k, agree: 698 * k },
     would_trip: 6 * k,
     top_overflow: 7 * k,
+  };
+}
+
+/**
+ * Trinn 1e: counters as cumulative reads them back — non_public_by with
+ * `unknown` (non_public of rows without a breakdown) in range, route and ua,
+ * and unknown_rows.
+ */
+function stored(c: ClientIpCounters, unknown = 0, unknownRows = 0): ClientIpCounters {
+  const by = c.non_public_by;
+  return {
+    ...c,
+    non_public_by: { range: { ...by.range, unknown }, route: { ...by.route, unknown }, ua: { ...by.ua, unknown }, unknown_rows: unknownRows },
   };
 }
 
@@ -346,7 +370,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       const t = s.store.totals("shadow");
       assertEq(
         [t.rows, t.windows, t.machines, t.first, t.last, t.counters, t.fanInMax],
-        [2, 2, 1, iso(T0), iso(T0 + W), counters(3), { ratio: 0.25, class: "a2a", fanIn: 3, ua: "ai_search:claude", window_start: iso(T0 + W) }],
+        [2, 2, 1, iso(T0), iso(T0 + W), stored(counters(3)), { ratio: 0.25, class: "a2a", fanIn: 3, ua: "ai_search:claude", window_start: iso(T0 + W) }],
         "B2: totals sum every counter field by field (1× + 2× = 3×) and give the largest fanIn row"
       );
       assertEq(
@@ -510,12 +534,14 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       const row = db.prepare("SELECT * FROM client_ip_shadow_windows").get() as any;
       const fromRow = s.store.totals("shadow").counters;
       const fromLine: ClientIpCounters = {
-        n: line.n, fci_valid: line.fci_valid, fallback: line.fallback, fallback_hc: line.fallback_hc, errors: line.errors,
+        n: line.n, fci_valid: line.fci_valid, fallback: line.fallback, fallback_hc: line.fallback_hc,
+        non_public_by: stored({ non_public_by: line.non_public_by } as ClientIpCounters).non_public_by, errors: line.errors,
         xff_client_supplied: line.xff_client_supplied, agree_fci_edge: line.agree_fci_edge, agree_legacy_eq_fci: line.agree_legacy_eq_fci,
         would_trip: line.would_trip, top_overflow: line.top_overflow,
       };
       const leaves = (o: any): number[] => (typeof o === "number" ? [o] : Object.values(o ?? {}).flatMap(leaves));
-      assertTrue(r.lines.length === 1 && leaves(fromLine).every((v) => v > 0), "C2: (setup) the logged window has every counter non-zero");
+      // non_public_by splits the one non_public over its keys (the rest 0; section J pins it).
+      assertTrue(r.lines.length === 1 && leaves({ ...fromLine, non_public_by: undefined }).every((v) => v > 0), "C2: (setup) the logged window has every counter non-zero");
       assertEq([row?.window_start, row?.mode, fromRow], [line.window_start, "shadow", fromLine], "C2: the stored row is the logged line's window, field by field");
       db.close();
     }
@@ -806,6 +832,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
           fci_valid: 4941,
           fallback: { missing: 59, invalid: 0, non_public: 0 },
           fallback_hc: 10,
+          non_public_by: counters(0).non_public_by,
           errors: 0,
           xff_client_supplied: 3,
           agree_fci_edge: { n: 1000, agree: 995 },
@@ -858,7 +885,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       assertEq(evaluateClientIpAc2(noFanIn).criteria.fanin_limit_ratio, { value: 0, threshold: 0.8, op: "<", pass: true }, "D: no key ever had fanIn > 1 → 0, passes");
       const empty = evaluateClientIpAc2({
         since: null, until: null, windows: 0, machines: 0, hours_covered: 0,
-        counters: { n: 0, fci_valid: 0, fallback: { missing: 0, invalid: 0, non_public: 0 }, fallback_hc: 0, errors: 0, xff_client_supplied: 0, agree_fci_edge: { n: 0, agree: 0 }, agree_legacy_eq_fci: { n: 0, agree: 0 }, would_trip: 0, top_overflow: 0 },
+        counters: { n: 0, fci_valid: 0, fallback: { missing: 0, invalid: 0, non_public: 0 }, fallback_hc: 0, non_public_by: counters(0).non_public_by, errors: 0, xff_client_supplied: 0, agree_fci_edge: { n: 0, agree: 0 }, agree_legacy_eq_fci: { n: 0, agree: 0 }, would_trip: 0, top_overflow: 0 },
         fanin_max: null,
         nonzero_windows: NO_NONZERO_WINDOWS,
         writer: { persisted: 0, queued: 0, dropped: 0, out_of_order: 0, errors: 0, pruned: 0 },
@@ -924,7 +951,7 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         const ok = call();
         assertEq(
           [ok.code, ok.body?.clientIp?.cumulative?.windows, ok.body?.clientIp?.cumulative?.counters, ok.body?.clientIp?.ac2?.ready, Object.keys(ok.body?.clientIp?.ac2?.criteria ?? {})],
-          [200, 1, counters(1), false, CRITERIA],
+          [200, 1, stored(counters(1)), false, CRITERIA],
           "F: clientIp.cumulative and clientIp.ac2 in the existing ops response"
         );
         assertTrue(["timestamp", "summary", "stalls", "offThreadStats"].every((k) => k in (ok.body ?? {})) && "since_boot" in (ok.body?.clientIp ?? {}), "F: the existing fields (and trinn 1b's since_boot) are all still there");
@@ -1571,7 +1598,14 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       // I3: the migration on a table trinn 1c created, with rows: covered_ms is added NOT NULL DEFAULT 300 000, so a row
       // stored before 1d counts as the full window it counted as then; re-running it changes nothing.
       const ddl = loadDdl();
-      assertEq(ddl.alters, ["ALTER TABLE client_ip_shadow_windows ADD COLUMN covered_ms INTEGER NOT NULL DEFAULT 300000"], "I3: the one ALTER on the table, additive with a default");
+      assertEq(
+        ddl.alters,
+        [
+          "ALTER TABLE client_ip_shadow_windows ADD COLUMN covered_ms INTEGER NOT NULL DEFAULT 300000",
+          "ALTER TABLE client_ip_shadow_windows ADD COLUMN non_public_by_json TEXT",
+        ],
+        "I3: the ALTERs on the table (trinn 1d, 1e), each additive"
+      );
       const db = new Database(":memory:");
       db.exec(ddl.create);
       db.prepare(
@@ -1604,6 +1638,129 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
         "I4: while the timer's flush touches the DB it is an active job named client-ip-shadow-flush"
       );
       assertTrue(!getEventLoopReport().activeJobsNow.some((j) => j.name === FLUSH_JOB_NAME), "I4: … and no longer once it returns");
+      db.close();
+    }
+
+    // ── J. Trinn 1e: non_public_by survives a deploy, and old rows read as unknown ──
+    const total = (o: Record<string, number> | undefined) => Object.values(o ?? {}).reduce((a, b) => a + b, 0);
+    const splits = (c: ClientIpCounters) => [c.fallback.non_public, total(c.non_public_by.range), total(c.non_public_by.route), total(c.non_public_by.ua)];
+    {
+      // J1: through the middleware, two windows of non_public, flushed, then read by a new process (new store, same DB).
+      const db = freshDb();
+      const s = storeOn(db);
+      const r = rig(SHADOW, s.store);
+      const np = (fci: string, path: string, at: number, ua?: string) => r.send({ fci, xff: flyXff("198.51.100.5"), ip: "198.51.100.5", path, ua }, at);
+      np("::ffff:172.16.3.4", "/api/x", T0 + 1000);
+      np("::ffff:172.16.3.5", "/api/x", T0 + 2000);
+      np("fdaa:0:1::2", "/mcp", T0 + 3000, CHATGPT_UA);
+      r.ordinary("198.51.100.1", T0 + 4000);
+      np("fdaa::9", "/a2a", T0 + W + 1000);
+      np("127.0.0.1", "/", T0 + W + 2000);
+      r.ordinary("198.51.100.1", T0 + 2 * W); // closes window T0 + W
+      s.store.flush();
+      const json = (db.prepare("SELECT non_public_by_json AS j FROM client_ip_shadow_windows ORDER BY window_start").all() as any[]).map((x) => JSON.parse(x.j));
+      assertEq(
+        json,
+        [
+          { range: { v4_172_16: 2, v6_ula: 1 }, route: { api: 2, mcp: 1 }, ua: { none: 2, "ai_search:chatgpt": 1 } },
+          { range: { v4_loopback: 1, v6_ula: 1 }, route: { a2a: 1, other: 1 }, ua: { none: 2 } },
+        ],
+        "J1: each row stores its window's non_public_by as compact JSON of the non-zero counts"
+      );
+      const fresh = rig(SHADOW, storeOn(db).store); // a restart: nothing in since_boot, everything in cumulative
+      const c = cum(fresh.mw.opsSnapshot()).counters;
+      const zeroRange = counters(0).non_public_by.range;
+      assertEq(
+        c.non_public_by,
+        {
+          range: { ...zeroRange, v4_172_16: 2, v4_loopback: 1, v6_ula: 2, unknown: 0 },
+          route: { api: 2, a2a: 1, mcp: 1, other: 1, unknown: 0 },
+          ua: { none: 4, "ai_search:chatgpt": 1, unknown: 0 },
+          unknown_rows: 0,
+        },
+        "J1: cumulative.counters.non_public_by sums the stored rows per range, route and UA class, across a restart"
+      );
+      assertEq(splits(c), [5, 5, 5, 5], "J1: cumulative — range, route and ua each sum to fallback.non_public");
+      assertEq(fresh.mw.opsSnapshot().since_boot.non_public_by.range, zeroRange, "J1: … while the new process's since_boot starts at 0");
+      db.close();
+    }
+    {
+      // J2: a table from before trinn 1e, with rows: the column is added nullable, old rows stay NULL and read as unknown.
+      const ddl = loadDdl();
+      const db = new Database(":memory:");
+      db.exec(ddl.create);
+      db.exec(ddl.alters[0]); // trinn 1d's covered_ms
+      const old = db.prepare(
+        "INSERT INTO client_ip_shadow_windows (window_start, machine, mode, n, fci_valid, fallback_missing, fallback_invalid, fallback_non_public, fallback_hc, errors, xff_client_supplied, agree_fci_edge_n, agree_fci_edge_agree, agree_legacy_eq_fci_n, agree_legacy_eq_fci_agree, would_trip, top_overflow, created_at) VALUES (?, 'm0', 'shadow', 50, 40, 0, 0, ?, 0, 0, 0, 40, 40, 40, 40, 0, 0, ?)"
+      );
+      old.run(iso(T0 - 3 * W), 4, iso(T0));
+      old.run(iso(T0 - 2 * W), 0, iso(T0)); // nothing to explain: not an unknown row
+      old.run(iso(T0 - W), 7, iso(T0));
+      migrate(db);
+      migrate(db);
+      const col = (db.prepare("PRAGMA table_info(client_ip_shadow_windows)").all() as any[]).find((x) => x.name === "non_public_by_json");
+      assertEq([col?.type, col?.notnull, col?.dflt_value], ["TEXT", 0, null], "J2: non_public_by_json is added as nullable TEXT, no default");
+      const s = storeOn(db);
+      s.store.enqueue(rec(T0, 1));
+      s.store.flush();
+      const t = s.store.totals("shadow");
+      assertEq(
+        [t.counters.fallback.non_public, t.counters.non_public_by],
+        [11 + 3, stored(counters(1), 11, 2).non_public_by],
+        "J2: old rows' non_public (4 + 7) is unknown in range, route and ua; unknown_rows = the 2 old rows with non_public > 0"
+      );
+      assertEq(splits(t.counters), [14, 14, 14, 14], "J2: with old rows too, each split sums to fallback.non_public");
+      db.close();
+    }
+    {
+      // J3: a breakdown that cannot be trusted reads as unknown, never surfaces: not JSON, a key that is no code
+      // (an IP-shaped one included), a split not summing to the row's non_public, a negative count.
+      const db = freshDb();
+      const s = storeOn(db);
+      for (let i = 0; i < 5; i++) s.store.enqueue(rec(T0 + i * W, 1));
+      s.store.flush();
+      const set = db.prepare("UPDATE client_ip_shadow_windows SET non_public_by_json = ? WHERE window_start = ?");
+      set.run("not json", iso(T0));
+      set.run(JSON.stringify({ range: { "10.1.2.3": 3 }, route: { api: 3 }, ua: { none: 3 } }), iso(T0 + W));
+      set.run(JSON.stringify({ range: { v4_10: 2 }, route: { api: 3 }, ua: { none: 3 } }), iso(T0 + 2 * W));
+      set.run(JSON.stringify({ range: { v4_10: 4, v6_ula: -1 }, route: { api: 3 }, ua: { none: 3 } }), iso(T0 + 3 * W));
+      const t = s.store.totals("shadow");
+      assertEq(t.counters.non_public_by, stored(counters(1), 12, 4).non_public_by, "J3: the four untrusted rows are unknown (4 × 3), only the good row is split");
+      assertTrue(!JSON.stringify(t.counters.non_public_by).includes("10.1.2.3"), "J3: an IP-shaped key in a stored row never reaches cumulative");
+      db.close();
+    }
+    {
+      // J3b: a ua key that is one of Object.prototype's own names ("__proto__", "constructor") matches the UA
+      // class pattern, but out["__proto__"] = n stores nothing: the row must read as unknown, not pass with its
+      // ua count lost (review finding on trinn 1e).
+      const db = freshDb();
+      const s = storeOn(db);
+      for (let i = 0; i < 3; i++) s.store.enqueue(rec(T0 + i * W, 1));
+      s.store.flush();
+      const good = JSON.parse((db.prepare("SELECT non_public_by_json AS j FROM client_ip_shadow_windows WHERE window_start = ?").get(iso(T0)) as any).j);
+      const withUa = (key: string) => JSON.stringify({ range: good.range, route: good.route }).slice(0, -1) + `,"ua":{"${key}":3}}`;
+      const set = db.prepare("UPDATE client_ip_shadow_windows SET non_public_by_json = ? WHERE window_start = ?");
+      set.run(withUa("__proto__"), iso(T0));
+      set.run(withUa("constructor"), iso(T0 + W));
+      const t = s.store.totals("shadow");
+      assertEq(t.counters.non_public_by, stored(counters(1), 6, 2).non_public_by, "J3b: rows with a __proto__ / constructor ua key are unknown (2 × 3), only the good row is split");
+      assertEq(splits(t.counters), [9, 9, 9, 9], "J3b: … and each split still sums to fallback.non_public");
+      db.close();
+    }
+    {
+      // J4: codes and counts only, in the column and in cumulative: no IP-like string, hash or host name.
+      const db = freshDb();
+      const s = storeOn(db);
+      const r = rig(SHADOW, s.store);
+      const addrs = ["10.9.8.7", "::ffff:172.16.0.9", "192.168.4.4", "100.64.9.9", "169.254.169.254", "224.0.0.9", "fdaa:0:2::7", "::1", "fe80::77", "ff02::9"];
+      addrs.forEach((fci, i) => r.send({ fci, xff: flyXff("198.51.100.5"), ip: "198.51.100.5", path: ["/api/x", "/a2a", "/mcp", "/"][i % 4], ua: i % 2 ? CHATGPT_UA : undefined }, T0 + i * 1000));
+      r.ordinary("198.51.100.1", T0 + W);
+      s.store.flush();
+      const col = (db.prepare("SELECT non_public_by_json AS j FROM client_ip_shadow_windows").all() as any[]).map((x) => x.j).join("\n");
+      const out = JSON.stringify(cum(r.mw.opsSnapshot()).counters.non_public_by);
+      const ipLike = /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::|[0-9a-f]{1,4}:[0-9a-f]{1,4}|[0-9a-f]{12}|fdaa|fe80|ff02|\.com|\.no\b/i;
+      assertTrue(col.length > 0 && !ipLike.test(col) && !ipLike.test(out), "J4: no IP-like string, hash or host name in non_public_by_json or cumulative non_public_by");
+      assertEq(splits(cum(r.mw.opsSnapshot()).counters), [10, 10, 10, 10], "J4: … and each split sums to fallback.non_public");
       db.close();
     }
   } finally {

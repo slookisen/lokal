@@ -24,6 +24,10 @@
  *   T14  nothing else in src/ reads X-Forwarded-For or Fly-Client-IP.
  *   T15  `trust proxy` === true after installClientIp, in every mode.
  *   T16  no raw IP in any logged line or snapshot.
+ *   T4e  trinn 1e: every non_public reports its range code (T4/T5 pin one
+ *        per subnet edge), and non_public_by counts them per range, route
+ *        and UA class in the window, the log line and since_boot, each
+ *        split summing to fallback.non_public, with codes only (no IP).
  * Plus the stats line itself (the AC2/AC4 instrument): its counters, the
  * 5-min cadence, the 15-min top list and fallback_hc; and the stats keys
  * (createStatsKey): fixed size whatever the input, one per limiter bucket,
@@ -62,6 +66,8 @@ import {
   type ClientIpMiddleware,
   type ClientIpMiddlewareOptions,
   type ClientIpOpsSnapshot,
+  NON_PUBLIC_RANGE_CODES,
+  type NonPublicRange,
 } from "./client-ip";
 
 export interface TestSummary {
@@ -272,15 +278,20 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
 
   // ── T4: non-public ranges (G2) and their public neighbours ──
   {
-    const nonPublic = [
-      "0.0.0.0", "0.255.255.255", "10.0.0.0", "10.255.255.255", "100.64.0.0", "100.64.1.1", "100.127.255.255",
-      "127.0.0.1", "127.255.255.255", "169.254.0.1", "169.254.255.255", "172.16.0.0", "172.16.5.4", "172.31.255.255",
-      "192.168.0.1", "192.168.255.255", "224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255",
-      "::", "::1", "fc00::", "fdaa::1", "fdaa:0:1::2", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe80::1",
-      "febf:ffff::1", "ff02::1", "ff00::",
+    // Trinn 1e: each with the range code it must report (both edges of every subnet).
+    const nonPublic: Array<[string, NonPublicRange]> = [
+      ["0.0.0.0", "v4_other"], ["0.255.255.255", "v4_other"], ["10.0.0.0", "v4_10"], ["10.255.255.255", "v4_10"],
+      ["100.64.0.0", "v4_cgnat"], ["100.64.1.1", "v4_cgnat"], ["100.127.255.255", "v4_cgnat"],
+      ["127.0.0.1", "v4_loopback"], ["127.255.255.255", "v4_loopback"], ["169.254.0.1", "v4_link_local"],
+      ["169.254.255.255", "v4_link_local"], ["172.16.0.0", "v4_172_16"], ["172.16.5.4", "v4_172_16"],
+      ["172.31.255.255", "v4_172_16"], ["192.168.0.1", "v4_192_168"], ["192.168.255.255", "v4_192_168"],
+      ["224.0.0.1", "v4_other"], ["239.255.255.255", "v4_other"], ["240.0.0.1", "v4_other"], ["255.255.255.255", "v4_other"],
+      ["::", "v6_reserved"], ["::1", "v6_reserved"], ["fc00::", "v6_ula"], ["fdaa::1", "v6_ula"], ["fdaa:0:1::2", "v6_ula"],
+      ["fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "v6_ula"], ["fe80::1", "v6_link_local"], ["febf:ffff::1", "v6_link_local"],
+      ["ff02::1", "v6_multicast"], ["ff00::", "v6_multicast"],
     ];
-    for (const ip of nonPublic) {
-      assertEq(deriveFlyClientIp({ "fly-client-ip": ip }), { ok: false, fallback: "non_public" }, `T4: ${ip} → non_public`);
+    for (const [ip, range] of nonPublic) {
+      assertEq(deriveFlyClientIp({ "fly-client-ip": ip }), { ok: false, fallback: "non_public", range }, `T4: ${ip} → non_public (${range})`);
     }
     const publicNeighbours = [
       "1.0.0.0", "9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0", "126.255.255.255", "128.0.0.0",
@@ -297,7 +308,7 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
   {
     assertEq(deriveFlyClientIp({ "fly-client-ip": "::ffff:203.0.113.9" }), { ok: true, ip: "203.0.113.9" }, "T5: ::ffff:203.0.113.9 → 203.0.113.9");
     assertEq(deriveFlyClientIp({ "fly-client-ip": "::FFFF:203.0.113.9" }), { ok: true, ip: "203.0.113.9" }, "T5: ::FFFF: (upper case) normalized too");
-    assertEq(deriveFlyClientIp({ "fly-client-ip": "::ffff:10.0.0.1" }), { ok: false, fallback: "non_public" }, "T5: a mapped private IPv4 is non_public after normalization");
+    assertEq(deriveFlyClientIp({ "fly-client-ip": "::ffff:10.0.0.1" }), { ok: false, fallback: "non_public", range: "v4_10" }, "T5: a mapped private IPv4 is non_public after normalization");
     // Why the rest of ::/8 is non_public: ipKeyGenerator puts every IPv4
     // client written in hex in these forms into ONE /56 bucket.
     assertEq(
@@ -306,7 +317,7 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
       "T5: (why) ipKeyGenerator collapses hex-mapped and hex NAT64 IPv4 forms to one bucket each"
     );
     for (const ip of ["::ffff:7b7b:7b7b", "0:0:0:0:0:ffff:cb00:7109", "::1.2.3.4", "64:ff9b::203.0.113.9", "64:ff9b::cb00:7109"]) {
-      assertEq(deriveFlyClientIp({ "fly-client-ip": ip }), { ok: false, fallback: "non_public" }, `T5: IPv4-embedding ${ip} → non_public (never a shared /56 bucket)`);
+      assertEq(deriveFlyClientIp({ "fly-client-ip": ip }), { ok: false, fallback: "non_public", range: "v6_reserved" }, `T5: IPv4-embedding ${ip} → non_public (never a shared /56 bucket)`);
     }
     const s = await startProbe(ENFORCE);
     try {
@@ -738,6 +749,92 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
     assertEq(lines.length, 5, "stats: windows without traffic produce no line");
   }
 
+  // ── T4e (trinn 1e): non_public_by — which range, route and UA class the non_public fallbacks came from ──
+  {
+    assertEq(
+      NON_PUBLIC_RANGE_CODES,
+      ["v4_10", "v4_172_16", "v4_192_168", "v4_cgnat", "v4_loopback", "v4_link_local", "v4_other", "v6_ula", "v6_reserved", "v6_link_local", "v6_multicast"],
+      "T4e: the eleven range codes, each once, in the dev-request's order"
+    );
+    // One address per code; 172.16 written ::ffff:-mapped (normalized first), 6PN as fdaa::.
+    const onePerCode: Array<[string, NonPublicRange]> = [
+      ["10.20.30.40", "v4_10"], ["::ffff:172.16.9.9", "v4_172_16"], ["192.168.1.1", "v4_192_168"], ["100.100.1.1", "v4_cgnat"],
+      ["127.0.0.2", "v4_loopback"], ["169.254.169.254", "v4_link_local"], ["224.0.0.251", "v4_other"], ["fdaa::1", "v6_ula"],
+      ["::1", "v6_reserved"], ["fe80::abcd", "v6_link_local"], ["ff02::fb", "v6_multicast"],
+    ];
+    assertEq(
+      [...new Set(onePerCode.map(([, c]) => c))].sort(),
+      [...NON_PUBLIC_RANGE_CODES].sort(),
+      "T4e: (setup) the probe covers every code"
+    );
+    for (const [ip, range] of onePerCode) {
+      assertEq(deriveFlyClientIp({ "fly-client-ip": ip }), { ok: false, fallback: "non_public", range }, `T4e: ${ip} → ${range}`);
+    }
+
+    let clock = T0;
+    const lines: string[] = [];
+    const mw = createClientIpMiddleware(SHADOW, { now: () => clock, log: (l) => lines.push(l), logError: () => {} });
+    const send = (o: Parameters<typeof fakeReq>[0]) => mw(fakeReq(o), {} as any, () => {});
+    const routes = [["/api/products", "api"], ["/a2a", "a2a"], ["/mcp", "mcp"], ["/kategori/x", "other"]] as const;
+    const range: Record<string, number> = Object.fromEntries(NON_PUBLIC_RANGE_CODES.map((c) => [c, 0]));
+    const route: Record<string, number> = { api: 0, a2a: 0, mcp: 0, other: 0 };
+    const ua: Record<string, number> = {};
+    const expectNp = (code: NonPublicRange, r: (typeof routes)[number], chatgpt: boolean) => {
+      range[code]++;
+      route[r[1]]++;
+      const u = chatgpt ? "ai_search:chatgpt" : "none";
+      ua[u] = (ua[u] ?? 0) + 1;
+    };
+    // Code i gets i + 1 requests (a swapped code or a dropped increment shows), spread over routes and UAs.
+    let k = 0;
+    onePerCode.forEach(([ip, code], i) => {
+      for (let j = 0; j <= i; j++, k++) {
+        const r = routes[k % 4];
+        const chatgpt = k % 3 === 0;
+        send({ fci: ip, xff: flyXff("198.51.100.5"), ip: "198.51.100.5", path: r[0], ua: chatgpt ? CHATGPT_UA : undefined });
+        expectNp(code, r, chatgpt);
+      }
+    });
+    // Not non_public: counted nowhere in non_public_by.
+    send({ fci: "198.51.100.1", xff: flyXff("198.51.100.1"), ip: "198.51.100.1", path: "/a2a" });
+    send({ xff: flyXff("198.51.100.3"), ip: "198.51.100.3", path: "/mcp" });
+    send({ fci: "garbage", xff: flyXff("198.51.100.4"), ip: "198.51.100.4", path: "/api/x" });
+    const total = (o: Record<string, number> | undefined) => Object.values(o ?? {}).reduce((a, b) => a + b, 0);
+    const splits = (c: any) => [c?.fallback?.non_public, total(c?.non_public_by?.range), total(c?.non_public_by?.route), total(c?.non_public_by?.ua)];
+    const w0 = mw.snapshot();
+    assertEq(w0.non_public_by, { range: { ...range }, route: { ...route }, ua: { ...ua } }, "T4e: the open window counts each non_public by its range, route and UA class");
+    assertEq(splits(w0), [66, 66, 66, 66], "T4e: window — range, route and ua each sum to fallback.non_public (66)");
+    assertEq(Object.keys(w0.non_public_by.range), [...NON_PUBLIC_RANGE_CODES], "T4e: range carries every code, zero or not, in order");
+
+    // The next window logs this one; one more non_public in the new window.
+    clock = T0 + 5 * MIN;
+    send({ fci: "fdaa:0:2::3", xff: flyXff("198.51.100.5"), ip: "198.51.100.5", path: "/mcp", ua: CHATGPT_UA });
+    const line0 = JSON.parse(lines[0] ?? "{}");
+    assertEq(line0.non_public_by, w0.non_public_by, "T4e: the client_ip_stats line carries the window's non_public_by");
+    assertEq(splits(line0), [66, 66, 66, 66], "T4e: log line — each split sums to fallback.non_public");
+    expectNp("v6_ula", routes[2], true);
+    const snap = mw.opsSnapshot();
+    assertEq(snap.since_boot.non_public_by, { range, route, ua }, "T4e: since_boot sums the logged window and the open one");
+    assertEq(splits(snap.since_boot), [67, 67, 67, 67], "T4e: since_boot — each split sums to fallback.non_public (67)");
+    assertEq(splits(snap.window), [1, 1, 1, 1], "T4e: the new open window — each split sums to its own fallback.non_public");
+    assertEq([snap.window?.non_public_by.range.v6_ula, snap.window?.non_public_by.route.mcp, snap.window?.non_public_by.ua["ai_search:chatgpt"]], [1, 1, 1], "T4e: … and counts the new one where it belongs");
+
+    // Codes and counts only: no address, hash or host name.
+    const outs = [line0.non_public_by, snap.since_boot.non_public_by, snap.window?.non_public_by];
+    const keysOk = outs.every(
+      (o) =>
+        Object.keys(o).join() === "range,route,ua" &&
+        Object.keys(o.range).every((c) => (NON_PUBLIC_RANGE_CODES as readonly string[]).includes(c)) &&
+        Object.keys(o.route).every((c) => ["api", "a2a", "mcp", "other"].includes(c)) &&
+        Object.keys(o.ua).every((c) => /^[a-z_]+(:[a-z_]+)?$/.test(c)) &&
+        [...Object.values(o.range), ...Object.values(o.route), ...Object.values(o.ua)].every((n) => Number.isInteger(n) && (n as number) >= 0)
+    );
+    assertTrue(keysOk, "T4e: non_public_by holds only range codes, path classes and UA classes, with whole counts");
+    const json = JSON.stringify(outs);
+    const ipLike = /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|::|[0-9a-f]{1,4}:[0-9a-f]{1,4}|[0-9a-f]{12}|fdaa|fe80|ff02|\.com|\.no\b/i;
+    assertTrue(!ipLike.test(json), `T4e: no IP-like string, hash or host name in non_public_by (${json.length} B)`);
+  }
+
   // ── fallback_hc: the health-check share of the fallbacks (AC2 allowance) ──
   {
     const mw = createClientIpMiddleware(SHADOW, { now: () => T0, log: () => {}, logError: () => {} });
@@ -891,10 +988,13 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
   // ── AC2 read-out (trinn 1b): getInstalledClientIpSnapshot → `clientIp` in GET /admin/analytics/ops/event-loop ──
   {
     // The stats line's additive counters, under their logged names.
-    const COUNTERS = ["n", "fci_valid", "fallback", "fallback_hc", "errors", "xff_client_supplied", "agree_fci_edge", "agree_legacy_eq_fci", "would_trip", "top_overflow"];
+    const COUNTERS = ["n", "fci_valid", "fallback", "fallback_hc", "non_public_by", "errors", "xff_client_supplied", "agree_fci_edge", "agree_legacy_eq_fci", "would_trip", "top_overflow"];
     const pick = (o: any) => Object.fromEntries(COUNTERS.map((k) => [k, o?.[k]]));
+    // Field by field over the union of keys (non_public_by.ua holds only the classes seen; absent = 0).
     const sum = (a: any, b: any): any =>
-      typeof a === "number" ? a + b : Object.fromEntries(Object.keys(a).map((k) => [k, sum(a[k], b?.[k])]));
+      typeof a === "number" || typeof b === "number"
+        ? (a ?? 0) + (b ?? 0)
+        : Object.fromEntries([...new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})])].map((k) => [k, sum(a?.[k], b?.[k])]));
     const leaves = (o: any): number[] => (typeof o === "number" ? [o] : Object.values(o ?? {}).flatMap(leaves));
     const iso = (t: number) => new Date(t).toISOString();
     // store: null — installClientIp's default store (on Fly) is the main DB; these tests run without one.
@@ -950,7 +1050,8 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
       send({ path: "/.well-known/agent-card.json" });
       const lineA = JSON.parse(lines[0] ?? "{}");
       const b = snapshot();
-      assertTrue(lines.length === 1 && leaves(pick(lineA)).every((v) => v > 0), "AC2 read-out: (setup) window A is logged with every counter non-zero");
+      // non_public_by splits the one non_public over its keys: the others stay 0 (pinned in T4e).
+      assertTrue(lines.length === 1 && leaves({ ...pick(lineA), non_public_by: undefined }).every((v) => v > 0), "AC2 read-out: (setup) window A is logged with every counter non-zero");
       assertEq(Object.keys(b?.since_boot ?? {}), COUNTERS, "AC2 read-out: since_boot holds exactly the stats line's additive counters, under the logged names");
       assertEq(b?.since_boot, sum(pick(lineA), pick(b?.window)), "AC2 read-out: since_boot = logged window A + open window B, field by field");
       assertEq(
