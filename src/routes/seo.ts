@@ -61,6 +61,7 @@ import { normalizeBmEventTime } from "../utils/bm-event-time";
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: ONE shared
 // public-listability predicate (catalog_hidden fixture + RFB vertical).
 import { publicListableSql, isPubliclyListable, failsProducerRoleGate, isAgentIdPubliclyVisible, ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
+import { umbrellaHasContent, indexableUmbrellas } from "../services/umbrella-indexability";
 // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-places-treffvakt:
 // rating markup, Offer return/shipping terms, the visible rating text and
 // whether the producer page has Product nodes (S6 del B).
@@ -5789,6 +5790,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       </div>
     </div>`;
 
+      // dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical
+      // (Skive B, option A): the umbrella page is its own canonical (it used
+      // to fall through to shell()'s BASE_URL default, i.e. the front page),
+      // and an EMPTY umbrella — no members and no upcoming market days — is
+      // noindex. Same predicate as the sitemap (umbrella-indexability.ts),
+      // so a noindex umbrella is never listed there. null (query failed) =
+      // fail-open, indexable as before.
+      const umbIsEmpty = umbrellaHasContent(umbDb, agent.id) === false;
       return res.send(shell(
         `${agent.name} — ${getConfig().display_name}`,
         aboutText || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaChildren.length} medlemsprodusenter`,
@@ -5796,6 +5805,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         {
           extraCss: PROFILE_CSS,
           lang,
+          canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`,
+          ...(umbIsEmpty ? { robots: "noindex" } : {}),
           // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B2: only
           // widen to an array when there's at least one upcoming BM event —
           // zero events keeps emitting exactly today's single Organization
@@ -6919,6 +6930,7 @@ export function buildSitemapXml(): string {
       console.error("[sitemap] role-gate query failed:", e);
     }
     let skippedCount = 0;
+    const emittedProducerSlugs = new Set<string>();
     for (const a of agents) {
       const slug = slugify(a.name);
       if (!slug || slug.length < 2) { skippedCount++; continue; }
@@ -6934,8 +6946,32 @@ export function buildSitemapXml(): string {
       const lastmod = updatedAt ? lastmodForDate(updatedAt) : today;
       const hints = sitemapHintsForStatus(k?.status);
       addEntry(`/produsent/${slug}`, hints.changefreq, hints.priority, lastmod);
+      emittedProducerSlugs.add(slug);
     }
     console.log(`[sitemap] producer-entry filtering: ${skippedCount}/${agents.length} excluded by WO-17 gate`);
+
+    // dev-request 2026-10-06-rfb-sitemap-rollesperre-bm-event-og-paraply-canonical
+    // (Skive B): umbrella pages (market networks, lokallag, venues, orgs) are
+    // self-canonical now, so the indexable ones are listed too. ONE batch
+    // query (never one SELECT per umbrella) with the route's gates (active,
+    // vetted, publicly listable) and the same "not empty" predicate the page
+    // uses for its noindex. lastmod/priority/changefreq as for producers; a slug already emitted
+    // (a producer with the same slug wins the route's lookup scan) is skipped.
+    // A failed query lists no umbrellas (sitemap stays a subset of 200 pages).
+    const umbrellas = indexableUmbrellas(getDb()) || [];
+    let umbrellaCount = 0;
+    for (const u of umbrellas) {
+      const slug = slugify(u.name);
+      if (!slug || slug.length < 2) continue;
+      if (SITEMAP_EXCLUDED_PRODUCER_SLUGS.has(slug) || emittedProducerSlugs.has(slug)) continue;
+      emittedProducerSlugs.add(slug);
+      const uk = knowledgeByAgent.get(u.id);
+      const updatedAt = parseIsoOrSqlite(uk?.updatedAt);
+      const hints = sitemapHintsForStatus(uk?.status);
+      addEntry(`/produsent/${slug}`, hints.changefreq, hints.priority, updatedAt ? lastmodForDate(updatedAt) : today);
+      umbrellaCount++;
+    }
+    console.log(`[sitemap] umbrella entries: ${umbrellaCount}/${umbrellas.length} indexable umbrellas listed`);
 
     xml += "\n</urlset>";
     return xml;

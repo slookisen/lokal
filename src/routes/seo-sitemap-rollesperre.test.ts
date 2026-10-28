@@ -93,6 +93,11 @@ export async function runSeoSitemapRollesperreTests(opts: { log?: boolean } = {}
     add("rg-i1", "Prisintel Konto", "price-intel");
     add("rg-u1", "Hanen Bygdeturisme Gardsmat", "producer");
     add("rg-u2", "Debio Sertifisering", "producer");
+    // Skive B: a non-empty umbrella (one active member) is in the sitemap
+    // now, so the invariant below covers umbrella pages too.
+    add("rg-m1", "Rollesperre Marked", "quality");
+    testDb.prepare("UPDATE agents SET umbrella_type = 'market_network' WHERE id = ?").run("rg-m1");
+    testDb.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES (?, ?, 'active', 'admin')").run("rg-p1", "rg-m1");
     (marketplaceRegistry as any).invalidateCache();
     seo.__resetSitemapCacheForTesting();
 
@@ -129,6 +134,7 @@ export async function runSeoSitemapRollesperreTests(opts: { log?: boolean } = {}
       assertTrue(!locs.some((l) => l.endsWith(`/produsent/${s}`)), `sitemap: non-producer ${s} excluded`);
     }
     assertTrue(locs.some((l) => l.endsWith("/produsent/ekte-gard-en")), "sitemap: producer ekte-gard-en present");
+    assertTrue(locs.some((l) => l.endsWith("/produsent/rollesperre-marked")), "sitemap: non-empty umbrella present (invariant covers it)");
 
     // ── (c) the two 404 umbrella slugs ───────────────────────────────────
     for (const s of ["hanen-bygdeturisme-gardsmat", "debio-sertifisering"]) {
