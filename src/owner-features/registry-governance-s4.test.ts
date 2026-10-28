@@ -21,10 +21,13 @@
  * any of:
  *   (a) a key-taking lookup call (list above) with the key as a string literal
  *       in a non-test src file;
- *   (b) the key as a string literal anywhere in a non-test src file other than
- *       src/owner-features/registry.ts (enforcement lists such as
- *       ENFORCED_OWNER_FEATURE_KEYS / OWNER_VISIBILITY_KEYS, adapters writing
- *       owner_feature_settings, the page/changes code);
+ *   (b) the key as a string literal in a non-test src file outside
+ *       NON_READER_FILES (enforcement lists such as ENFORCED_OWNER_FEATURE_KEYS
+ *       / OWNER_VISIBILITY_KEYS, adapters writing owner_feature_settings).
+ *       NON_READER_FILES only define, set or display values and never enforce
+ *       them: registry.ts (the definitions), changes.ts (OWNER_LEVELS presets
+ *       write values) and page.ts (OWNER_PAGE_STATUS_KEYS only show them). A
+ *       key named only there has no enforcement, so it does not count;
  *   (c) a storage adapter declared on the entry (`storage`) — the adapter's
  *       column stays the source of truth and is read by existing code.
  * Two structural cases count as read without a reader of their own, because
@@ -58,7 +61,17 @@ export interface TestSummary {
 }
 
 const SRC_ROOT = path.resolve(__dirname, "..");
-const REGISTRY_FILE = path.join(SRC_ROOT, "owner-features", "registry.ts");
+
+/**
+ * Files whose key literals never count as a reader (rule 2b): they define,
+ * write (level presets) or display values but do not enforce them. Paths are
+ * relative to src/, '/'-separated.
+ */
+export const NON_READER_FILES = [
+  "owner-features/registry.ts",
+  "owner-features/changes.ts",
+  "owner-features/page.ts",
+];
 
 const VALID_STATUSES = ["live", "beta", "coming_soon"] as const;
 const SEGMENTS = ["owner", "unclaimed"] as const;
@@ -82,7 +95,7 @@ export interface LookupCall {
 }
 
 export interface SourceScan {
-  /** String literals per file (registry.ts excluded by the caller). */
+  /** String literals per file (relative to src/). */
   literals: Map<string, Set<string>>;
   /** Key-taking lookup calls whose key argument is a string literal. */
   calls: LookupCall[];
@@ -94,13 +107,24 @@ function calleeName(expr: ts.Expression): string | null {
   return null;
 }
 
+/**
+ * The string literal behind `node`, after unwrapping casts and parentheses
+ * (`"k" as OwnerFeatureKey`, `<any>"k"`, `"k" satisfies …`, `("k")`, `"k"!`),
+ * so a cast cannot hide an unknown key from rule 3 (or a reader from rule 2a).
+ */
 function literalText(node: ts.Node): string | null {
+  while (
+    ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node) ||
+    ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node)
+  ) {
+    node = node.expression;
+  }
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
   return null;
 }
 
-/** Scans one source text into `scan`. Literals are skipped for registry.ts. */
-export function scanSourceText(file: string, text: string, scan: SourceScan, opts: { collectLiterals?: boolean } = {}): void {
+/** Scans one source text into `scan` (`file` relative to src/, '/'-separated). */
+export function scanSourceText(file: string, text: string, scan: SourceScan): void {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.ES2022, false, ts.ScriptKind.TS);
   const lits = new Set<string>();
   const visit = (node: ts.Node): void => {
@@ -120,7 +144,7 @@ export function scanSourceText(file: string, text: string, scan: SourceScan, opt
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  if (opts.collectLiterals !== false) scan.literals.set(file, lits);
+  scan.literals.set(file, lits);
 }
 
 function listSourceFiles(dir: string, out: string[] = []): string[] {
@@ -137,11 +161,11 @@ function listSourceFiles(dir: string, out: string[] = []): string[] {
 }
 
 /** Scans every non-test .ts file under src/. */
-export function scanSrc(root: string = SRC_ROOT, registryFile: string = REGISTRY_FILE): SourceScan {
+export function scanSrc(root: string = SRC_ROOT): SourceScan {
   const scan: SourceScan = { literals: new Map(), calls: [] };
   for (const file of listSourceFiles(root)) {
-    const rel = path.relative(root, file);
-    scanSourceText(rel, fs.readFileSync(file, "utf8"), scan, { collectLiterals: file !== registryFile });
+    const rel = path.relative(root, file).split(path.sep).join("/");
+    scanSourceText(rel, fs.readFileSync(file, "utf8"), scan);
   }
   return scan;
 }
@@ -173,6 +197,8 @@ export function checkEntryShape(
     problems.push(...localizedProblems(`${k}.label`, e.label));
     problems.push(...localizedProblems(`${k}.description`, e.description));
     for (const o of e.options ?? []) problems.push(...localizedProblems(`${k}.options[${o.value}].label`, o.label));
+    if (e.confirmOn) problems.push(...localizedProblems(`${k}.confirmOn`, e.confirmOn));
+    if (e.confirmOff) problems.push(...localizedProblems(`${k}.confirmOff`, e.confirmOff));
     if (!groups.includes(e.group)) problems.push(`${k}: unknown group ${JSON.stringify(e.group)}`);
     if (!(VALID_STATUSES as readonly string[]).includes(e.status)) problems.push(`${k}: invalid status ${JSON.stringify(e.status)}`);
     const d = e.default as Record<string, unknown> | undefined;
@@ -198,12 +224,18 @@ export interface ReaderReport {
 }
 
 /** Rule 2: every live entry has a reader (see READER DEFINITION). */
-export function checkLiveReaders(registry: readonly OwnerFeatureEntry[], scan: SourceScan): ReaderReport {
+export function checkLiveReaders(
+  registry: readonly OwnerFeatureEntry[],
+  scan: SourceScan,
+  nonReaderFiles: readonly string[] = NON_READER_FILES,
+): ReaderReport {
   const byKey = new Map(registry.map((e) => [e.key, e] as const));
   const callKeys = new Set(scan.calls.map((c) => c.key));
   const directReader = (key: string): string | null => {
     if (callKeys.has(key)) return "lookup call";
-    for (const [file, lits] of scan.literals) if (lits.has(key)) return `literal in ${file}`;
+    for (const [file, lits] of scan.literals) {
+      if (!nonReaderFiles.includes(file) && lits.has(key)) return `literal in ${file}`;
+    }
     if (byKey.get(key)?.storage) return "storage adapter";
     return null;
   };
@@ -229,7 +261,7 @@ export function checkLiveReaders(registry: readonly OwnerFeatureEntry[], scan: S
       problems.push(`${e.key}: live guarantee must default to ON for owners`);
       continue;
     }
-    problems.push(`${e.key}: live entry has no reader in src/ (no lookup call, no key literal outside registry.ts, no storage adapter)`);
+    problems.push(`${e.key}: live entry has no reader in src/ (no lookup call, no key literal outside ${NON_READER_FILES.join(", ")}, no storage adapter)`);
   }
   return { problems, structural };
 }
@@ -266,7 +298,7 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
     // ── Self-check: the checkers must report a synthetic violation of each rule.
     const base = OWNER_FEATURE_REGISTRY.find((e) => e.key === "contact.phone")!;
     const fx = (over: Partial<OwnerFeatureEntry>): OwnerFeatureEntry => ({ ...base, storage: undefined, ...over });
-    const fixtureKeys = ["fx.no_en", "fx.live_no_reader", "fx.live_read", "fx.lock_orphan", "fx.bad_guarantee"];
+    const fixtureKeys = ["fx.no_en", "fx.live_no_reader", "fx.live_read", "fx.lock_orphan", "fx.bad_guarantee", "fx.preset_only", "fx.cast_read"];
     const fixture: OwnerFeatureEntry[] = [
       fx({ key: "fx.no_en", label: { no: "Bare norsk", en: "" } }),
       fx({ key: "fx.live_no_reader", status: "live" }),
@@ -274,6 +306,8 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
       fx({ key: "fx.lock_orphan", type: "locked", status: "live", lockedWhen: "fx.live_no_reader" as any }),
       fx({ key: "fx.bad_guarantee", type: "guarantee", status: "live", default: { owner: false, unclaimed: null } }),
       fx({ key: "fx.bad_status", status: "shipped" as any, default: { owner: true } as any }),
+      fx({ key: "fx.preset_only", status: "live" }),
+      fx({ key: "fx.cast_read", status: "live", confirmOn: { no: "Sikker?", en: "" } }),
     ];
     const fxScan: SourceScan = { literals: new Map(), calls: [] };
     scanSourceText(
@@ -283,21 +317,31 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
         `// "fx.live_no_reader" in a comment is not a reader`,
         `export const a = featureOn("rfb", id, "fx.live_read");`,
         `export const b = rfbFeatureOn(id, "fx.typo_key");`,
+        `export const c = featureOn("rfb", "a", "nope.key" as OwnerFeatureKey, { db });`,
+        `export const d = rfbFeatureOn(id, (<any>"fx.cast_read")!);`,
       ].join("\n"),
       fxScan,
     );
+    // Preset / display files: their literals must not count as readers.
+    scanSourceText("owner-features/changes.ts", `export const L = [{ values: { "fx.preset_only": true } }];`, fxScan);
+    scanSourceText("owner-features/page.ts", `export const K = ["fx.preset_only"];`, fxScan);
     const shapeFx = checkEntryShape(fixture, fixtureKeys, groups);
     assertTrue(shapeFx.some((p) => p.startsWith("fx.no_en.label: missing English")), "self-check: missing EN label is reported", shapeFx);
     assertTrue(shapeFx.some((p) => p.startsWith("fx.bad_status: invalid status")), "self-check: invalid status is reported", shapeFx);
     assertTrue(shapeFx.some((p) => p === "fx.bad_status: no default for segment unclaimed"), "self-check: missing segment default is reported", shapeFx);
     assertTrue(shapeFx.some((p) => p.startsWith("fx.bad_status: not in OWNER_FEATURE_KEYS")), "self-check: entry outside OWNER_FEATURE_KEYS is reported", shapeFx);
+    assertTrue(shapeFx.some((p) => p === "fx.cast_read.confirmOn: missing English text"), "self-check: confirmOn without EN is reported", shapeFx);
     const readersFx = checkLiveReaders(fixture, fxScan);
     assertTrue(readersFx.problems.some((p) => p.startsWith("fx.live_no_reader:")), "self-check: live key without reader is reported (comment does not count)", readersFx.problems);
     assertTrue(!readersFx.problems.some((p) => p.startsWith("fx.live_read:")), "self-check: featureOn literal counts as reader", readersFx.problems);
+    assertTrue(readersFx.problems.some((p) => p.startsWith("fx.preset_only:")), "self-check: key named only in changes.ts presets / page.ts display is reported", readersFx.problems);
+    assertTrue(!readersFx.problems.some((p) => p.startsWith("fx.cast_read:")), "self-check: cast featureOn literal counts as reader", readersFx.problems);
     assertTrue(readersFx.problems.some((p) => p.startsWith("fx.lock_orphan:")), "self-check: locked entry whose parent has no reader is reported", readersFx.problems);
     assertTrue(readersFx.problems.some((p) => p.startsWith("fx.bad_guarantee:")), "self-check: guarantee defaulting off is reported", readersFx.problems);
     const unknownFx = checkUnknownLookupKeys(fxScan.calls, fixtureKeys);
-    assertTrue(unknownFx.length === 1 && unknownFx[0].includes(`rfbFeatureOn(…"fx.typo_key"…)`), "self-check: unknown featureOn key is reported", unknownFx);
+    assertTrue(unknownFx.some((u) => u.includes(`rfbFeatureOn(…"fx.typo_key"…)`)), "self-check: unknown featureOn key is reported", unknownFx);
+    assertTrue(unknownFx.some((u) => u.includes(`featureOn(…"nope.key"…)`)), "self-check: unknown featureOn key behind `as` cast is reported", unknownFx);
+    assertTrue(unknownFx.length === 2, "self-check: exactly the two unknown keys are reported (cast known key is fine)", unknownFx);
 
     // ── Rule 1: registry shape.
     const shape = checkEntryShape(OWNER_FEATURE_REGISTRY, keys, groups);
@@ -307,12 +351,12 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
     // ── Rule 2 + 3 against the real src/ tree.
     const scan = scanSrc();
     assertTrue(scan.literals.size > 50, `src/ scan found non-test source files (${scan.literals.size})`);
-    assertTrue(!scan.literals.has(path.relative(SRC_ROOT, REGISTRY_FILE)), "registry.ts literals are excluded from the reader scan");
+    assertTrue(NON_READER_FILES.every((f) => scan.literals.has(f)), "every NON_READER_FILES path exists in the src/ scan (no stale exclusion)");
 
     const live = OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
     const readers = checkLiveReaders(OWNER_FEATURE_REGISTRY, scan);
     assertTrue(readers.problems.length === 0, `rule 2: every live entry (${live.length}) has a reader in src/`, readers.problems);
-    if (log && readers.structural.length) {
+    if (readers.structural.length) {
       console.info(`  note: live entries read only structurally (d/e): ${readers.structural.join(", ")}`);
     }
 
