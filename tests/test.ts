@@ -50491,6 +50491,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-1 (AC21): optional
+// owner_email on POST /admin/test-producer arms the fixture's owner login
+// (agent_knowledge.email + claimed_at, fixture-pinned); magic link → «Mine
+// valg» end to end. Swaps getDb(), env and the magic-link mailer — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-1: testprodusentens eier-innlogging ──");
+  try {
+    const { runAdminTestProducerOwnerLoginTests } = require("../src/routes/admin-test-producer-owner-login.test") as
+      typeof import("../src/routes/admin-test-producer-owner-login.test");
+    const r = await runAdminTestProducerOwnerLoginTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-test-producer-owner-login: " + f);
+    console.log(`  admin-test-producer-owner-login: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-test-producer-owner-login: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
