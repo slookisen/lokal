@@ -12,7 +12,7 @@
 // The fixture passes them because its DATA is set here, never because a gate
 // exempts it.
 //
-// Body: { apply?: true, mode?: "arm" | "retire", email?: string, agent_id?: string }
+// Body: { apply?: true, mode?: "arm" | "retire", email?: string, agent_id?: string, owner_email?: string }
 //   * dry-run by DEFAULT — `apply` must be an explicit truthy form (same parse
 //     as POST /admin/agents/deactivate). Dry-run returns the plan + per-field
 //     changes and writes nothing.
@@ -27,8 +27,23 @@
 //     status: isEligibleForRealOrder() requires an owner-confirmed profile, and
 //     a newly created fixture has no owner claim of its own (the legacy row
 //     already carries Daniel's, so there it is a no-op).
+//   * `owner_email` (optional, ONLY with mode "arm"; with "retire" → 400; same
+//     shape check as `email`) — dev-request 2026-10-22-rfb-mine-valg-eierbrytere,
+//     slice S2d-1 (AC21): also sets the fixture's OWNER LOGIN, so a magic link
+//     to that address opens «Mine valg» (/eier/<id>/valg) for the fixture:
+//     agent_knowledge.email=<owner_email> (the address POST
+//     /api/agents/:id/request-magic-link matches) and claimed_at=COALESCE(
+//     claimed_at, now) (verified ownership by customerRuleSql, so
+//     isVerifiedOwner is true; an existing claimed_at is never overwritten).
+//     Planned/audited as the fields `agent_knowledge.email` and `claimed_at`,
+//     pinned to the fixture like every other write. The apply response then
+//     carries `owner_login` { email, verified_owner, allowlisted, valg_path,
+//     magic_link_request }. This endpoint sends NO e-mail — the owner asks for
+//     the link through the normal owner flow. The page also needs
+//     OWNER_FEATURES_ALLOWED_SUBJECTS=rfb:<id> (an env change, not done here).
+//     Without `owner_email` the behaviour and response are unchanged.
 //   * mode "retire" — is_active=0 and the product out_of_stock. A later "arm"
-//     re-arms it (idempotent both ways).
+//     re-arms it (idempotent both ways). Retire leaves the owner login as is.
 //
 // Which row (never more than ONE):
 //   1. `agent_id` given → that row, which MUST already be a fixture
@@ -56,6 +71,8 @@ import { getDb } from "../database/init";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { isEligibleForRealOrder } from "../services/cart-service";
 import { invalidateSitemapCache } from "./seo";
+import { customerRuleSql } from "../services/customer-rule";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 
 const router = Router();
 
@@ -123,6 +140,8 @@ interface FixtureRow {
   has_knowledge: number;
   verification_status: string | null;
   verified_second_line: number | null;
+  claimed_at: string | null;
+  knowledge_email: string | null;
 }
 
 interface Change {
@@ -137,7 +156,8 @@ function readRow(db: ReturnType<typeof getDb>, id: string): FixtureRow | undefin
       `SELECT a.id, a.name, a.origin, a.catalog_hidden, a.is_active, a.is_verified, a.umbrella_type,
               a.order_notifications_opt_in, a.order_notification_email,
               CASE WHEN k.agent_id IS NULL THEN 0 ELSE 1 END AS has_knowledge,
-              k.verification_status, k.verified_second_line
+              k.verification_status, k.verified_second_line,
+              a.claimed_at, k.email AS knowledge_email
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE a.id = ?`,
@@ -206,6 +226,8 @@ function planChanges(
   row: FixtureRow | undefined,
   product: { availability: string } | undefined,
   email: string | null,
+  ownerEmail: string | null = null,
+  nowIso: string = new Date().toISOString(),
 ): Change[] {
   const changes: Change[] = [];
   const push = (field: string, oldV: unknown, newV: unknown) => {
@@ -224,6 +246,10 @@ function planChanges(
     push("verification_status", row?.verification_status ?? null, "verified");
     push("verified_second_line", row?.verified_second_line ?? null, 0);
     push(`product_availability:${TEST_FIXTURE_PRODUCT_NAME}`, product?.availability ?? null, "in_stock");
+    if (ownerEmail !== null) {
+      push("agent_knowledge.email", row?.knowledge_email ?? null, ownerEmail);
+      push("claimed_at", row?.claimed_at ?? null, row?.claimed_at ?? nowIso);
+    }
   } else {
     push("is_active", row?.is_active ?? null, 0);
     if (product) push(`product_availability:${TEST_FIXTURE_PRODUCT_NAME}`, product.availability, "out_of_stock");
@@ -245,11 +271,13 @@ function applyPlan(
   mode: Mode,
   existingId: string | undefined,
   email: string | null,
+  ownerEmail: string | null = null,
 ): { id: string; changes: Change[] } {
   const tx = db.transaction((): { id: string; changes: Change[] } => {
     const fresh = existingId ? readRow(db, existingId) : undefined;
     if (target === "existing" && !isTestFixtureRow(fresh)) throw new FixtureGuardError("row is no longer a test fixture");
-    const changes = planChanges(target, mode, fresh, fresh ? readProduct(db, fresh.id) : undefined, email);
+    const nowIso = new Date().toISOString();
+    const changes = planChanges(target, mode, fresh, fresh ? readProduct(db, fresh.id) : undefined, email, ownerEmail, nowIso);
     let id = existingId ?? "";
     if (target === "create") {
       id = randomUUID();
@@ -291,6 +319,17 @@ function applyPlan(
         `UPDATE agent_knowledge SET verification_status = 'verified', verified_second_line = 0
           WHERE agent_id = ? AND agent_id IN (SELECT id FROM agents WHERE ${FIXTURE_PIN})`,
       ).run(id);
+      if (ownerEmail !== null) {
+        // S2d-1 (AC21): the owner login — same fixture pin as every write here.
+        const k1 = db
+          .prepare(`UPDATE agent_knowledge SET email = ? WHERE agent_id = ? AND agent_id IN (SELECT id FROM agents WHERE ${FIXTURE_PIN})`)
+          .run(ownerEmail, id);
+        if (k1.changes !== 1) throw new FixtureGuardError("fixture pin matched no agent_knowledge row");
+        const c1 = db
+          .prepare(`UPDATE agents SET claimed_at = COALESCE(claimed_at, ?) WHERE id = ? AND ${FIXTURE_PIN}`)
+          .run(nowIso, id);
+        if (c1.changes !== 1) throw new FixtureGuardError("fixture pin matched no row");
+      }
       // Keep the product listed in agent_knowledge too, so lokal_info (by id)
       // shows it with its catalog product_id.
       const k = db.prepare(`SELECT products FROM agent_knowledge WHERE agent_id = ?`).get(id) as { products: string | null } | undefined;
@@ -338,6 +377,26 @@ function applyPlan(
   return tx();
 }
 
+function isValidEmailShape(v: string): boolean {
+  return !!v && v.length <= 254 && EMAIL_SHAPE_RE.test(v) && !/[\x00-\x1f\x7f]/.test(v);
+}
+
+/**
+ * S2d-1 (AC21): read-only view of the fixture's owner login after apply. The
+ * verified_owner check is the isVerifiedOwner rule (customerRuleSql) against
+ * the row; no session is involved and no e-mail is sent.
+ */
+function ownerLogin(db: ReturnType<typeof getDb>, id: string, email: string) {
+  const r = db.prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`).get(id) as { owned?: number } | undefined;
+  return {
+    email,
+    verified_owner: !!r && r.owned === 1,
+    allowlisted: isSubjectAllowedForOwnerFeatures("rfb", id),
+    valg_path: `/eier/${id}/valg`,
+    magic_link_request: `POST /api/agents/${id}/request-magic-link`,
+  };
+}
+
 function parseApply(req: Request): boolean {
   const v = (req.body ?? {}).apply;
   return (
@@ -348,7 +407,7 @@ function parseApply(req: Request): boolean {
 
 router.post("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
-  const body = (req.body ?? {}) as { mode?: unknown; email?: unknown; agent_id?: unknown };
+  const body = (req.body ?? {}) as { mode?: unknown; email?: unknown; agent_id?: unknown; owner_email?: unknown };
   const apply = parseApply(req);
 
   const mode: Mode | null = body.mode === undefined || body.mode === "arm" ? "arm" : body.mode === "retire" ? "retire" : null;
@@ -374,8 +433,21 @@ router.post("/", (req: Request, res: Response) => {
   let email: string | null = null;
   if (mode === "arm") {
     email = typeof body.email === "string" ? body.email.trim() : "";
-    if (!email || email.length > 254 || !EMAIL_SHAPE_RE.test(email) || /[\x00-\x1f\x7f]/.test(email)) {
+    if (!isValidEmailShape(email)) {
       res.status(400).json({ error: "mode 'arm' krever en gyldig { email } (mottaker for ordrevarselet)" });
+      return;
+    }
+  }
+
+  let ownerEmail: string | null = null;
+  if (body.owner_email !== undefined) {
+    if (mode !== "arm") {
+      res.status(400).json({ error: "owner_email er bare gyldig med mode 'arm'" });
+      return;
+    }
+    ownerEmail = typeof body.owner_email === "string" ? body.owner_email.trim() : "";
+    if (!isValidEmailShape(ownerEmail)) {
+      res.status(400).json({ error: "owner_email må være en gyldig e-postadresse (eier-innloggingen for «Mine valg»)" });
       return;
     }
   }
@@ -383,7 +455,7 @@ router.post("/", (req: Request, res: Response) => {
   const { target, row } = resolved;
 
   if (!apply) {
-    const changes = planChanges(target, mode, row, row ? readProduct(db, row.id) : undefined, email);
+    const changes = planChanges(target, mode, row, row ? readProduct(db, row.id) : undefined, email, ownerEmail);
     res.json({ success: true, dry_run: true, mode, target, agent_id: row?.id ?? null, changes });
     return;
   }
@@ -391,7 +463,7 @@ router.post("/", (req: Request, res: Response) => {
   let id: string;
   let changes: Change[];
   try {
-    ({ id, changes } = applyPlan(db, target, mode, row?.id, email));
+    ({ id, changes } = applyPlan(db, target, mode, row?.id, email, ownerEmail));
   } catch (e: any) {
     const guard = e instanceof FixtureGuardError;
     res.status(guard ? 409 : 500).json({ success: false, dry_run: false, error: guard ? "fixture_guard_refused" : "write_failed", detail: e?.message ?? String(e) });
@@ -418,6 +490,7 @@ router.post("/", (req: Request, res: Response) => {
     // Read-only evaluation of the UNCHANGED strict gate against the new state.
     can_order: isEligibleForRealOrder(id, db),
     products_url: `/api/marketplace/catalog/agents/${id}/products`,
+    ...(ownerEmail !== null ? { owner_login: ownerLogin(db, id, ownerEmail) } : {}),
   });
 });
 
