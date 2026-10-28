@@ -223,7 +223,10 @@ function parseNonPublicBy(json: unknown, np: number): { range: Record<string, nu
   };
   const range = part(v.range, (k) => (NON_PUBLIC_RANGE_CODES as readonly string[]).includes(k));
   const route = part(v.route, (k) => (ROUTES as readonly string[]).includes(k));
-  const ua = part(v.ua, (k) => UA_CLASS.test(k));
+  // "__proto__"/"constructor" match UA_CLASS but are Object.prototype's own
+  // names: out["__proto__"] = n stores nothing, so the row would pass with
+  // its ua count silently lost. uaFamily never makes them; reject the row.
+  const ua = part(v.ua, (k) => UA_CLASS.test(k) && !Object.prototype.hasOwnProperty.call(Object.prototype, k));
   return range && route && ua ? { range, route, ua } : null;
 }
 

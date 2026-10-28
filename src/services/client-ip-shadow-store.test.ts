@@ -1730,6 +1730,24 @@ export async function runClientIpShadowStoreTests(opts: { log?: boolean } = {}):
       db.close();
     }
     {
+      // J3b: a ua key that is one of Object.prototype's own names ("__proto__", "constructor") matches the UA
+      // class pattern, but out["__proto__"] = n stores nothing: the row must read as unknown, not pass with its
+      // ua count lost (review finding on trinn 1e).
+      const db = freshDb();
+      const s = storeOn(db);
+      for (let i = 0; i < 3; i++) s.store.enqueue(rec(T0 + i * W, 1));
+      s.store.flush();
+      const good = JSON.parse((db.prepare("SELECT non_public_by_json AS j FROM client_ip_shadow_windows WHERE window_start = ?").get(iso(T0)) as any).j);
+      const withUa = (key: string) => JSON.stringify({ range: good.range, route: good.route }).slice(0, -1) + `,"ua":{"${key}":3}}`;
+      const set = db.prepare("UPDATE client_ip_shadow_windows SET non_public_by_json = ? WHERE window_start = ?");
+      set.run(withUa("__proto__"), iso(T0));
+      set.run(withUa("constructor"), iso(T0 + W));
+      const t = s.store.totals("shadow");
+      assertEq(t.counters.non_public_by, stored(counters(1), 6, 2).non_public_by, "J3b: rows with a __proto__ / constructor ua key are unknown (2 × 3), only the good row is split");
+      assertEq(splits(t.counters), [9, 9, 9, 9], "J3b: … and each split still sums to fallback.non_public");
+      db.close();
+    }
+    {
       // J4: codes and counts only, in the column and in cumulative: no IP-like string, hash or host name.
       const db = freshDb();
       const s = storeOn(db);
