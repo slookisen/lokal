@@ -315,10 +315,10 @@ export async function runOwnerVisibilityS1aTests(opts: { log?: boolean } = {}): 
     {
       const read = (rel: string) => readFileSync(join(__dirname, "..", rel), "utf8");
       const needs: Array<[string, string, string[]]> = [
-        ["lokal_info + MCP resource", "routes/mcp.ts", ['isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true })', 'isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated" })']],
+        ["lokal_info + MCP resource", "routes/mcp.ts", ['isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true, audience: "ai" })', 'isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", audience: "ai" })']],
         ["/metrics", "routes/a2a.ts", ['isAgentIdPubliclyVisible(getDb(), req.params.id as string, { surface: "ungated" })']],
         ["ACP feeds", "routes/marketplace-catalog.ts", ['publiclyVisibleSql("a")']],
-        ["card/info/vcard/trust/stats (registry)", "services/marketplace-registry.ts", ['isAgentPubliclyVisible(row, { surface: "gated" })', "activeVettedListableSql()"]],
+        ["card/info/vcard/trust/stats (registry)", "services/marketplace-registry.ts", ['isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice })', "activeVettedListableSql()"]],
       ];
       for (const [name, file, snippets] of needs) {
         const src = read(file);

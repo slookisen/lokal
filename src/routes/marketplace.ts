@@ -13,7 +13,7 @@ import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { normalizeBmEventTime } from "../utils/bm-event-time";
-import { publicListableSql, hasProducerPage, failsProducerRoleGate, ownerPauseEnabled } from "../services/agent-visibility";
+import { publicListableSql, hasProducerPage, failsProducerRoleGate, ownerPauseEnabled, ownerVisibilityEnforced } from "../services/agent-visibility";
 import {
   SALGSKANAL_CATEGORY_SLUGS,
   SALGSKANAL_CATEGORY_NAMES,
@@ -614,7 +614,7 @@ router.post("/discover", (req: Request, res: Response) => {
     // filter (step 4 of discover()) went unreported here, unlike every other
     // discover() caller. See DiscoverMeta for why the drop happens.
     const discoverMeta: DiscoverMeta = {};
-    const results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable });
+    const results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, audience: "ai" });
     const tagsDropped = !!discoverMeta.tagsRelaxed;
 
     if (countable) {
@@ -805,7 +805,10 @@ router.get("/search", async (req: Request, res: Response) => {
   // discovery counter and stay off the interactions feed (searchCountable),
   // as POST /a2a already did with its `countable`.
   const countable = searchCountable({ meta: buildRequestMeta(req), text: q });
-  let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable });
+  // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): this REST API
+  // is what AI agents call (openapi.json, GPT actions), so a profile hidden
+  // from AI assistants is left out, as on MCP. The /sok web page is not this.
+  let results = marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, audience: "ai" });
 
   // ── Auto-expanding radius ──
   // If geo-filtered and too few results, widen the search automatically.
@@ -881,7 +884,7 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
       const expandedMeta: DiscoverMeta = {};
-      results = marketplaceRegistry.discover(expandedQuery, expandedMeta, { trackDiscovery: countable });
+      results = marketplaceRegistry.discover(expandedQuery, expandedMeta, { trackDiscovery: countable, audience: "ai" });
       appliedRadiusKm = expandedRadius;
       tagsDropped = !!expandedMeta.tagsRelaxed;
     }
@@ -897,7 +900,7 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
       const noGeoMeta: DiscoverMeta = {};
-      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta, { trackDiscovery: countable });
+      results = marketplaceRegistry.discover(noGeoQuery, noGeoMeta, { trackDiscovery: countable, audience: "ai" });
       tagsDropped = !!noGeoMeta.tagsRelaxed;
       geoDropped = true;
       appliedRadiusKm = undefined;
@@ -1606,7 +1609,8 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
     // agent skips the pause check only (is_active / catalog_hidden / vetting
     // still apply). Flag off = never reached differently.
     const claimToken = (req.headers["x-claim-token"] as string) || "";
-    const ownerRead = ownerPauseEnabled() && !!claimToken &&
+    // S2c-2: the same holds for the owner's visibility.profile choice.
+    const ownerRead = (ownerPauseEnabled() || ownerVisibilityEnforced()) && !!claimToken &&
       knowledgeService.getClaimByToken(claimToken)?.agentId === agentId &&
       !marketplaceRegistry.isQuarantinedFromPublicView(agentId, { ignoreOwnerPause: true });
     if (!ownerRead) {

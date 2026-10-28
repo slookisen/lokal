@@ -39,7 +39,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: the ONE shared
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (zero
 // imports), same isolation rule as geo-distance.ts above.
-import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, ownerPauseEnabled, readOwnerPauseRow } from "./agent-visibility";
+import { publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
 // name search. PURE (type-only import), same isolation rule as above.
 import {
@@ -135,6 +135,14 @@ export interface DiscoverOptions {
    * marked as no matches.
    */
   countUnmatched?: boolean;
+  /**
+   * S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): "ai" = the
+   * caller is an AI-facing surface (MCP, A2A, the REST search/discover API):
+   * profiles whose owner switched off «Synlig for AI-assistenter» are left
+   * out. Default "all" (the /sok web search). No effect, and no query, unless
+   * OWNER_FEATURES_ENFORCE is on (agent-visibility.ts).
+   */
+  audience?: OwnerVisibilityAudience;
 }
 
 class MarketplaceRegistry {
@@ -260,6 +268,8 @@ class MarketplaceRegistry {
   discover(query: DiscoveryQuery, meta?: DiscoverMeta, opts: DiscoverOptions = {}): DiscoveryResult[] {
     const db = getDb();
     const trackDiscovery = opts.trackDiscovery !== false;
+    // S2c-2: one id list per call ("" unless enforced and someone is hidden).
+    const ownerAiSql = opts.audience === "ai" ? notOwnerHiddenSql("ai_assistants") : "";
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
     // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
@@ -274,7 +284,7 @@ class MarketplaceRegistry {
       // on any public discovery surface, including this name-match path.
       // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: nor may
       // a catalog_hidden fixture or a non-RFB-vertical row (agent-visibility.ts).
-      const publicNameSql = `is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`;
+      const publicNameSql = `is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}${ownerAiSql}`;
       // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: the full scan used
       // to have no ORDER BY; its plan (SCAN … USING INDEX idx_agents_geo) returned
       // rows in (lat, lng, rowid) order, and the stable sorts below keep that order
@@ -396,7 +406,7 @@ class MarketplaceRegistry {
     // self-registered, not-yet-vetted rows from this public discovery path.
     // dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt: plus the
     // shared public-listability predicate (catalog_hidden + RFB vertical).
-    let sql = `SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}`;
+    let sql = `SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL AND is_vetted = 1 AND ${publicListableSql()}${ownerAiSql}`;
     const params: any[] = [];
 
     // 1. Filter by role
@@ -1670,7 +1680,10 @@ class MarketplaceRegistry {
   // public by-id lookups (card/info/vcard/trust, /api/agents/:id/stats, the
   // marketing lane). The order flow never goes through here — it uses
   // /catalog/agents/:id/products, the cart routes and lokal_info by id.
-  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean } = {}): boolean {
+  // S2c-2: the owner's visibility choice applies here too (visibility.profile;
+  // with audience "ai" also visibility.ai_assistants). ignoreOwnerPause skips
+  // it like the pause — the owner's own read is not a public view.
+  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean; audience?: OwnerVisibilityAudience } = {}): boolean {
     const db = getDb();
     const found = db.prepare("SELECT origin, is_vetted, is_active, catalog_hidden, vertical_id FROM agents WHERE id = ?").get(agentId) as
       { origin: string | null; is_vetted: number | null; is_active: number | null; catalog_hidden: number | null; vertical_id: string | null } | undefined;
@@ -1682,7 +1695,8 @@ class MarketplaceRegistry {
     // The rule itself lives in agent-visibility.ts (isAgentPubliclyVisible):
     // flag off = the quarantine rule this method has always applied; flag
     // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.
-    return !isAgentPubliclyVisible(row, { surface: "gated" });
+    const ownerChoice = ownerVisibilityEnforced() && !opts.ignoreOwnerPause ? { agentId, audience: opts.audience } : {};
+    return !isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice });
   }
 
   getAgentByApiKey(apiKey: string): RegisteredAgent | undefined {

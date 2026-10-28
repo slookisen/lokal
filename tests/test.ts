@@ -50471,6 +50471,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-2: the six visibility.*
+// keys through the shared predicate (agent-visibility.ts), gated by
+// OWNER_FEATURES_ENFORCE + the allowlist; byte-identical and no query while
+// off; matrix per key × declared surface. Swaps getDb() and env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-2: synlighetsvalg på flatene ──");
+  try {
+    const { runOwnerFeaturesS2c2Tests } = require("../src/routes/owner-features-s2c2.test") as
+      typeof import("../src/routes/owner-features-s2c2.test");
+    const r = await runOwnerFeaturesS2c2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-s2c2: " + f);
+    console.log(`  owner-features-s2c2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-s2c2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring

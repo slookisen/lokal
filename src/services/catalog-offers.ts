@@ -83,7 +83,7 @@ import { computeEffectiveAvailability } from "./supply-graph";
 import { haversineDistanceKm, KM_PER_DEG_LAT, kmPerDegLng } from "./geo-distance";
 import { isValidLatLng } from "../utils/geo-query";
 import { slugify } from "../utils/slug";
-import { publicListableSql } from "./agent-visibility";
+import { publicListableSql, notOwnerHiddenSql, type OwnerVisibilityAudience } from "./agent-visibility";
 import { isCategoryLabel } from "../utils/category-label";
 import { productNameMatch, COMPOUND_HEAD_MIN_LENGTH, type ProductNameMatch } from "../utils/product-name-match";
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
@@ -116,6 +116,12 @@ export interface FindOffersParams {
   lng?: number | null;
   radiusKm?: unknown;
   limit?: unknown;
+  /**
+   * S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): "ai" for the
+   * MCP tool — producers hidden from AI assistants are left out. Default
+   * "all" (the /handleliste page and its REST route).
+   */
+  audience?: OwnerVisibilityAudience;
 }
 
 export interface OfferProducer {
@@ -433,7 +439,7 @@ export async function findOffers(params: FindOffersParams, deps: FindOffersDeps 
       AND a.lat IS NOT NULL AND a.lng IS NOT NULL
       AND k.verification_status = 'verified'
       AND (k.verified_second_line IS NULL OR k.verified_second_line = 0)
-      AND ${publicListableSql("a")}
+      AND ${publicListableSql("a")}${params.audience === "ai" ? notOwnerHiddenSql("ai_assistants", "a") : ""}
       AND a.lat BETWEEN ? AND ? AND a.lng BETWEEN ? AND ?
       AND (LOWER(p.name) LIKE ? ESCAPE '\\' OR LOWER(p.name) LIKE ? ESCAPE '\\')
   `).all(

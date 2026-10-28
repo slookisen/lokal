@@ -8,6 +8,7 @@ import { formatAddressLine } from "../utils/address-format";
 import { openingHoursText } from "../utils/opening-hours";
 import { trustScoreService } from "./trust-score-service";
 import { isInternalTraffic, type RequestMeta } from "./internal-traffic";
+import { notOwnerHiddenSql } from "./agent-visibility";
 import {
   COUNTABLE_CONV_SQL,
   countableConvSql,
@@ -906,13 +907,17 @@ class ConversationService {
   }
 
   // ─── Leaderboard (social proof) ──────────────────────────
+  // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): without the
+  // profiles whose owner switched off «Vis meg på topplister»
+  // (visibility.leaderboard, or visibility.profile). "" — the query as
+  // before — unless OWNER_FEATURES_ENFORCE is on and someone is hidden.
   getLeaderboard(limit = 10): any[] {
     const db = getDb();
     const rows = db.prepare(`
       SELECT m.*, a.name, a.city, a.categories, a.trust_score
       FROM agent_metrics m
       JOIN agents a ON m.agent_id = a.id
-      WHERE a.is_active = 1
+      WHERE a.is_active = 1${notOwnerHiddenSql("leaderboard", "a")}
       ORDER BY m.times_chosen DESC, m.times_contacted DESC
       LIMIT ?
     `).all(limit) as any[];

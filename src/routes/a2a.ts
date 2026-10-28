@@ -17,7 +17,7 @@ import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications, productEntries } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
-import { isAgentIdPubliclyVisible } from "../services/agent-visibility";
+import { isAgentIdPubliclyVisible, ownerHidesAgent } from "../services/agent-visibility";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
@@ -488,7 +488,7 @@ async function handleMessageSend(params: any, id: any, req: Request, res: Respon
     // the producers there are no matches, nor counted as discovered.
     const discoverMeta: DiscoverMeta = {};
     const found = hasIntent && !outsideNorway
-      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false })
+      ? marketplaceRegistry.discover(query, discoverMeta, { trackDiscovery: countable, countUnmatched: false, audience: "ai" })
       : [];
     const unmatchedTerms = discoverMeta.unmatchedTerms;
     const results = unmatchedTerms ? [] : found;
@@ -742,7 +742,11 @@ function handleAgentInfo(params: any, id: any, req: Request, res: Response) {
   }
 
   const info = knowledgeService.getAgentInfo(agentId);
-  if (!info) {
+  // S2c-2 (dev-request 2026-10-22-rfb-mine-valg-eierbrytere): a profile whose
+  // owner hid it (visibility.profile) or hid it from AI assistants
+  // (visibility.ai_assistants) reads like an unknown id. No query unless
+  // OWNER_FEATURES_ENFORCE is on and the id is allowlisted.
+  if (!info || ownerHidesAgent(String(agentId), "ai_assistants")) {
     res.json({
       jsonrpc: "2.0",
       error: { code: -32602, message: `Agent not found: ${agentId}` },
@@ -849,7 +853,8 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   // 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt): 404 like an unknown id
   // for the hidden test fixture, a non-RFB-vertical row, or an unvetted
   // self-registered agent — see isQuarantinedFromPublicView.
-  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string)) {
+  // S2c-2: audience "ai" — an A2A card is for AI agents (visibility.ai_assistants).
+  if (marketplaceRegistry.isQuarantinedFromPublicView(req.params.id as string, { audience: "ai" })) {
     res.status(404).json({ error: "Agent not found" });
     return;
   }
@@ -1219,6 +1224,8 @@ router.get("/api/agents/:id/metrics", (req: Request, res: Response) => {
 // GET /api/leaderboard — Top sellers (social proof)
 router.get("/api/leaderboard", (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 10;
+  // S2c-2: getLeaderboard leaves out profiles whose owner switched off
+  // «Vis meg på topplister» (visibility.leaderboard) or the profile.
   const leaderboard = conversationService.getLeaderboard(limit);
   res.json({ success: true, data: leaderboard });
 });
