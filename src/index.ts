@@ -87,6 +87,12 @@ import {
 } from "./services/rfb-enrichment-nightly";
 import adminRunVerifierRoutes, { runVerifierTick, isVerifierWindowHour } from "./routes/admin-run-verifier";
 import adminRunDentalVerifierRoutes from "./routes/admin-run-dental-verifier";
+import { runDentalVerifierBatch } from "./services/dental-verifier";
+import {
+  shouldRunDentalVerifierScheduler,
+  resolveDentalVerifierSchedulerBatchSize,
+  DENTAL_VERIFIER_SCHEDULER_INTERVAL_MS,
+} from "./services/dental-verifier-scheduler";
 import adminSecondLineJudgePreviewRoutes from "./routes/admin-second-line-judge-preview";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminLoopDispatchRoutes, { parseRoutines, runDispatchTick } from "./routes/admin-loop-dispatch";
@@ -1917,6 +1923,43 @@ if (process.env.VERIFIER_SCHEDULER_ENABLED === "1") {
       verifierTickRunning = false;
     }
   }), 60 * 60_000); // hourly check, self-gated on the 22-06 UTC window
+}
+
+// ─── dev-request 2026-09-02-dental-verifier-website-ownership: internal ──
+// hourly dental-verifier scheduler ─────────────────────────────────────
+//
+// Drives runDentalVerifierBatch (src/services/dental-verifier.ts) on an
+// hourly cadence — the SAME library call admin-run-dental-verifier.ts's
+// POST / handler makes, not an HTTP self-call and not a re-implementation.
+//
+// Gated OFF by default — only runs when DENTAL_VERIFIER_SCHEDULER_ENABLED=1
+// AND ENABLE_DENTAL=1 (the dental.db handle is only open when the dental
+// vertical is enabled). The flag is turned on only by Daniel; nothing in
+// this repo (fly.toml included) sets it. Batch size comes from
+// DENTAL_VERIFIER_BATCH_SIZE (default 30, capped at 200).
+let dentalVerifierTickRunning = false;
+if (shouldRunDentalVerifierScheduler()) {
+  const dentalVerifierBatchSize = resolveDentalVerifierSchedulerBatchSize();
+  setInterval(trackJob("dental-verifier-scheduler", async () => {
+    if (dentalVerifierTickRunning) {
+      console.warn("[dental-verifier-scheduler] tick skipped — a previous tick is still running");
+      return;
+    }
+    dentalVerifierTickRunning = true;
+    try {
+      const r = await runDentalVerifierBatch({ batchSize: dentalVerifierBatchSize });
+      const verified = r.results.filter((x) => x.new_verification_status === "verified").length;
+      const inactive = r.results.filter((x) => x.new_is_inactive === true).length;
+      console.log(
+        `[dental-verifier-scheduler] run_id=${r.run_id} processed=${r.results.length} ` +
+        `verified=${verified} newly_inactive=${inactive} batch_size=${dentalVerifierBatchSize}`
+      );
+    } catch (err) {
+      console.error("[dental-verifier-scheduler] tick failed:", err);
+    } finally {
+      dentalVerifierTickRunning = false;
+    }
+  }), DENTAL_VERIFIER_SCHEDULER_INTERVAL_MS); // hourly
 }
 
 // ─── dev-request 2026-09-02-flerspraklige-profiler-rfb-og-opplevagent, Daniel

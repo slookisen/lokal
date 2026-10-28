@@ -553,10 +553,22 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
     assertTrue(verifier.DENTAL_VERIFIER_NACE_ALLOWLIST.length > 0 && /naceMismatch[\s\S]{0,200}needs_review/.test(verifierSrc),
       "b13: an industry code that does not fit takes the badge (needs_review)");
     const indexSrc = read("src/index.ts");
-    assertTrue(indexSrc.includes('app.use("/admin/run-dental-verifier"') && !indexSrc.includes("runDentalVerifierBatch") &&
+    // The in-process hourly scheduler (index.ts) exists but is gated OFF by
+    // default: it only starts behind shouldRunDentalVerifierScheduler()
+    // (both DENTAL_VERIFIER_SCHEDULER_ENABLED and ENABLE_DENTAL exactly "1"),
+    // and no fly config sets the flag. While that holds, the text's
+    // «manuelt, i små partier» stays true; turning the flag on (Daniel only)
+    // must come with a text change, and this assertion will need updating.
+    const schedGate = require("../services/dental-verifier-scheduler") as typeof import("../services/dental-verifier-scheduler");
+    const flyConfigs = fs.readdirSync(ROOT).filter((f: string) => /^fly.*\.toml$/.test(f)).map((f: string) => read(f)).join("\n");
+    assertTrue(indexSrc.includes('app.use("/admin/run-dental-verifier"') &&
+      (indexSrc.match(/runDentalVerifierBatch\(/g) || []).length === 1 &&
+      /if \(shouldRunDentalVerifierScheduler\(\)\) \{[\s\S]{0,1500}runDentalVerifierBatch\(/.test(indexSrc) &&
+      !schedGate.shouldRunDentalVerifierScheduler({ ENABLE_DENTAL: "1" }) &&
+      !/DENTAL_VERIFIER_SCHEDULER_ENABLED\s*=\s*["']?1/.test(flyConfigs) &&
       read("src/scripts/run-dental-verifier.ts").includes('process.env.DENTAL_VERIFIER_SCHEDULER_ENABLED !== "1"') &&
       read("src/routes/admin-run-dental-verifier.ts").includes("|| 20, 1), 50);"),
-      "b14: «manuelt, i små partier»: only the admin route (at most 50 a call) runs the verifier; the runner is off by default");
+      "b14: «manuelt, i små partier»: by default only the admin route (at most 50 a call) runs the verifier; the runner and the in-process scheduler are off by default");
     // F2-S8: each condition the text names is one the read-time claim reads,
     // and the badge goes when it fails.
     {
