@@ -256,23 +256,23 @@ export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch } = {}
   const fetchImpl = opts.fetchImpl ?? fetch;
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), DEBIO_REGISTER_TIMEOUT_MS);
-  let res: Response;
+  // The timeout covers the body read too (a body that hangs is aborted).
+  let data: unknown;
   try {
-    res = await fetchImpl(DEBIO_REGISTER_URL, {
+    const res = await fetchImpl(DEBIO_REGISTER_URL, {
       method: "POST",
       headers: { "User-Agent": FINNOKO_USER_AGENT, "Accept": "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({ searchText: "" }),
       signal: ctl.signal,
     });
+    if (!res.ok) throw new Error(`debio register HTTP ${res.status}`);
+    try {
+      data = await res.json();
+    } catch (e) {
+      throw new Error(`debio register JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   } finally {
     clearTimeout(t);
-  }
-  if (!res.ok) throw new Error(`debio register HTTP ${res.status}`);
-  let data: unknown;
-  try {
-    data = await res.json();
-  } catch (e) {
-    throw new Error(`debio register JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
   }
   return normalizeRegisterResponse(data);
 }

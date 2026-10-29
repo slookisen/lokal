@@ -25,7 +25,13 @@
 //        c. name + postal code, token overlap ≥ 0.67 after dropping generic
 //           words and place names                   (name_postal)
 //        d. street + house no. + postal code        (street_postal), or a
-//           differing postal code with the same city (street_city)
+//           differing postal code with the same city (street_city) — only
+//           when no other active producer of ours has that street + house
+//           no. in the same postal code / city; gnr/bnr and P.O. box lines
+//           are never streets (review-only signals)
+//      If one register entity is the c/d match of more than one producer
+//      (or shares a sure match with another producer), those c/d matches go
+//      to review instead.
 //      A human-approved review row comes first. Everything weaker — name in
 //      the same city, another house number, the farm name inside a company
 //      name, the farm name as the owner's surname, the owner's first name in
@@ -112,6 +118,8 @@ interface Entity {
   cities: string[];
   /** Normalized street keys "<street>|<no>" (in memory only). */
   streets: Array<{ street: string; no: string }>;
+  /** gnr/bnr and P.O. box lines — review-only signals (in memory only). */
+  nonStreets: NonStreetAddress[];
 }
 
 /** One entity per org.nr. (or sid); expired okologisk certificates do not count. */
@@ -133,7 +141,12 @@ export function buildEntities(rows: readonly DebioRegisterRow[], now: Date): Ent
     const productGroups: string[] = [];
     for (const r of basis) for (const g of r.productGroups) if (!productGroups.includes(g)) productGroups.push(g);
     const streets: Entity["streets"] = [];
-    for (const r of list) { const s = parseStreet(r.street); if (s) streets.push(s); }
+    const nonStreets: NonStreetAddress[] = [];
+    for (const r of list) {
+      const s = parseStreet(r.street);
+      if (s) streets.push(s);
+      else { const n = parseNonStreet(r.street); if (n) nonStreets.push(n); }
+    }
     out.push({
       key,
       sid: (basis[0] ?? list[0]).sid,
@@ -145,6 +158,7 @@ export function buildEntities(rows: readonly DebioRegisterRow[], now: Date): Ent
       postalCodes: [...new Set(list.map((r) => r.postalCode).filter((p): p is string => !!p))],
       cities: [...new Set(list.map((r) => normCity(r.city)).filter((c): c is string => !!c))],
       streets,
+      nonStreets,
     });
   }
   return out;
@@ -198,10 +212,38 @@ export function streetKey(name: string): string {
   return s;
 }
 
+/**
+ * Cadastral (gnr/bnr) and P.O. box forms are not street addresses: «Gnr 12
+ * Bnr 5» would read as street «gnr» no. 12 (and match the neighbour «Gnr 12
+ * Bnr 3»), «Postboks 12» would match the same box number at another post
+ * office. Such lines never give a street key (parseStreet → null); they only
+ * feed review-only signals (parseNonStreet).
+ */
+const NON_STREET_RE = /(?:^|[^a-zæøå])(?:g\s*\.?\s*nr|b\s*\.?\s*nr|gbnr|g\s*\/\s*bnr|gards\s*nr|gårds\s*nr|bruks\s*nr|matr(?:ikkel)?|postboks|postb|post\s*box|p\s*\.?\s*o\s*\.?\s*box|pob|boks|box|pb|p\s*\.\s*b)(?:[^a-zæøå]|$)/;
+
+function firstSegment(address: string): string {
+  return address.split(",")[0].trim();
+}
+
+export type NonStreetAddress = { kind: "gnr"; gnr: string; bnr: string | null } | { kind: "po_box"; no: string };
+
+/** «Gnr 12 Bnr 5», «gnr. 12/5», «Postboks 12», «Pb 12» → review-only key. */
+export function parseNonStreet(address: unknown): NonStreetAddress | null {
+  if (typeof address !== "string") return null;
+  const first = firstSegment(address).normalize("NFC").toLowerCase();
+  if (!NON_STREET_RE.test(first)) return null;
+  const g = /(?:g\s*\.?\s*nr|gards\s*nr|gårds\s*nr)\.?\s*(\d+)(?:\s*[\/,-]?\s*(?:(?:b\s*\.?\s*nr|bruks\s*nr)\.?\s*)?(\d+))?/.exec(first);
+  if (g) return { kind: "gnr", gnr: g[1], bnr: g[2] ?? null };
+  const pb = /(?:postboks|postb|post\s*box|p\s*\.?\s*o\s*\.?\s*box|pob|boks|box|pb|p\s*\.\s*b)\.?\s*(\d+)/.exec(first);
+  if (pb) return { kind: "po_box", no: pb[1] };
+  return null;
+}
+
 /** «Børsumvn. 51», «Hillevågsveien 99 B, 4016 Stavanger» → street key + house no. */
 export function parseStreet(address: unknown): { street: string; no: string } | null {
   if (typeof address !== "string") return null;
-  const first = address.split(",")[0].trim();
+  const first = firstSegment(address);
+  if (NON_STREET_RE.test(first.normalize("NFC").toLowerCase())) return null;
   const m = /^(.*?[^\d\s])\s*(\d+)\s*([a-zA-Z])?(?:\s|$)/.exec(first);
   if (!m) return null;
   const street = streetKey(m[1]);
@@ -227,6 +269,7 @@ interface Producer {
   postal: string | null;
   city: string | null;
   street: { street: string; no: string } | null;
+  nonStreet: NonStreetAddress | null;
   /** Lower-cased profile text + e-mail local parts, for support signals only. */
   text: string;
   old: { status: string | null; verified: number; sid: string | null; method: string | null; validTo: string | null };
@@ -277,6 +320,7 @@ function loadProducers(db: Database.Database): Producer[] {
       postal: postalCodeOf(r.postal_code) ?? fromAddr.postal,
       city: normCity(r.city) ?? fromAddr.city,
       street: parseStreet(r.address),
+      nonStreet: parseNonStreet(r.address),
       text: normaliseForMatch([r.description, r.about, ...mailLocals].filter((x) => typeof x === "string").join(" ")),
       old: {
         status: r.debio_status ?? null,
@@ -337,11 +381,34 @@ function entityAt(e: Entity, p: Producer): { postal: boolean; city: boolean } {
   return { postal: !!p.postal && e.postalCodes.includes(p.postal), city: !!p.city && e.cities.includes(p.city) };
 }
 
+/** Our producers by street key + house no. — for the uniqueness check on street matches. */
+type StreetPeers = Map<string, Producer[]>;
+
+function buildStreetPeers(producers: readonly Producer[]): StreetPeers {
+  const m: StreetPeers = new Map();
+  for (const p of producers) if (p.street) push(m, `${p.street.street}|${p.street.no}`, p);
+  return m;
+}
+
+/**
+ * A street match is only "sikker" when the producer is the only active
+ * producer of ours at that street + house no. in the same postal code or city
+ * (a mathall, Bondens marked or business building houses several).
+ */
+function streetUnique(p: Producer, peers: StreetPeers | undefined): boolean {
+  if (!p.street) return false;
+  if (!peers) return false;
+  const list = peers.get(`${p.street.street}|${p.street.no}`) ?? [];
+  const local = list.filter((q) => q === p || (!!p.postal && q.postal === p.postal) || (!!p.city && q.city === p.city));
+  return local.length === 1 && local[0] === p;
+}
+
 export function matchProducer(
   p: Producer,
   ix: Index,
   finnokoByDomain: Map<string, Entity>,
   rejected: Set<string>,
+  streetPeers?: StreetPeers,
 ): MatchOutcome {
   const ok = (e: Entity | undefined | null): e is Entity => !!e && !rejected.has(`${p.id}|${e.key}`);
   // a. org.nr.
@@ -391,13 +458,30 @@ export function matchProducer(
     const same = (ix.byStreet.get(`${p.street.street}|${p.street.no}`) ?? []).filter(ok);
     const byPostal = same.filter((e) => entityAt(e, p).postal);
     const byCity = same.filter((e) => !entityAt(e, p).postal && entityAt(e, p).city);
-    if (byPostal.length === 1) return { sikker: { entity: byPostal[0], method: "street_postal" }, review: [] };
-    if (byPostal.length === 0 && byCity.length === 1) return { sikker: { entity: byCity[0], method: "street_city" }, review: [] };
-    for (const e of [...byPostal, ...byCity]) addReview(e, "street", 0.8, "street_ambiguous");
+    const unique = streetUnique(p, streetPeers);
+    if (unique && byPostal.length === 1) return { sikker: { entity: byPostal[0], method: "street_postal" }, review: [] };
+    if (unique && byPostal.length === 0 && byCity.length === 1) return { sikker: { entity: byCity[0], method: "street_city" }, review: [] };
+    const sureShape = byPostal.length === 1 || (byPostal.length === 0 && byCity.length === 1);
+    for (const e of [...byPostal, ...byCity]) addReview(e, "street", 0.8, sureShape && !unique ? "street_shared_address" : "street_ambiguous");
     for (const e of same) if (!byPostal.includes(e) && !byCity.includes(e)) addReview(e, "street", 0.5, "street_other_place");
     // Same street, another house number, near the producer.
     for (const e of near) {
       if (e.streets.some((s) => s.street === p.street!.street && s.no !== p.street!.no)) addReview(e, "street", 0.5, "street_other_house_no");
+    }
+  }
+
+  // gnr/bnr and P.O. box — review only, never a status.
+  if (p.nonStreet) {
+    const ns = p.nonStreet;
+    for (const e of near) {
+      for (const n of e.nonStreets) {
+        if (ns.kind === "gnr" && n.kind === "gnr" && n.gnr === ns.gnr) {
+          const sameBnr = !!ns.bnr && n.bnr === ns.bnr;
+          addReview(e, "address", sameBnr ? 0.6 : 0.3, sameBnr ? "gnr_bnr_same" : "gnr_other_bnr");
+        } else if (ns.kind === "po_box" && n.kind === "po_box" && n.no === ns.no) {
+          addReview(e, "address", 0.3, "po_box_same_no");
+        }
+      }
     }
   }
 
@@ -588,8 +672,9 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
   const approved = new Map<string, { org_nr: string | null; debio_sid: string | null }>();
   for (const r of reviewRows) if (r.state === "approved") approved.set(r.agent_id, r);
 
-  type Planned = { p: Producer; d: Decision; review: Candidate[] };
-  const planned: Planned[] = [];
+  const streetPeers = buildStreetPeers(producers);
+  type Matched = { p: Producer; entity: Entity | null; method: SikkerMethod | null; review: Candidate[] };
+  const matchedList: Matched[] = [];
   for (const p of producers) {
     let entity: Entity | null = null;
     let method: SikkerMethod | null = null;
@@ -601,7 +686,7 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
     }
     if (!entity) {
       try {
-        const m = matchProducer(p, ix, finnokoByDomain, rejectedPairs);
+        const m = matchProducer(p, ix, finnokoByDomain, rejectedPairs, streetPeers);
         if (m.sikker) { entity = m.sikker.entity; method = m.sikker.method; }
         review = m.review;
       } catch (e) {
@@ -609,6 +694,27 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
         continue;
       }
     }
+    matchedList.push({ p, entity, method, review });
+  }
+
+  // One register entity, several of our producers: a weak "sikker" method
+  // (name / street) is then not sure for any of them → all to review.
+  // org_nr, tag_org_nr, finnoko_domain and approved review matches stay.
+  const WEAK: ReadonlySet<SikkerMethod> = new Set<SikkerMethod>(["name_postal", "street_postal", "street_city"]);
+  const perEntity = new Map<string, number>();
+  for (const m of matchedList) if (m.entity && m.method) perEntity.set(m.entity.key, (perEntity.get(m.entity.key) ?? 0) + 1);
+  for (const m of matchedList) {
+    if (!m.entity || !m.method || !WEAK.has(m.method) || (perEntity.get(m.entity.key) ?? 0) < 2) continue;
+    const kind = m.method === "name_postal" ? "name" : "street";
+    m.review = [{ entity: m.entity, method: kind, score: 0.8, reasons: [`${m.method}_shared_entity`] },
+      ...m.review.filter((c) => c.entity.key !== m.entity!.key)];
+    m.entity = null;
+    m.method = null;
+  }
+
+  type Planned = { p: Producer; d: Decision; review: Candidate[] };
+  const planned: Planned[] = [];
+  for (const { p, entity, method, review } of matchedList) {
     const d = decide(entity, method, switchOff.has(p.id), now);
     if (switchOff.has(p.id)) result.owner_switch_off++;
     if (method) result.matched[method]++;
