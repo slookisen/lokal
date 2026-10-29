@@ -50598,6 +50598,27 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-3: the switch probe
+// («bryterprobe») — POST /admin/owner-features/switch-probe behind
+// OWNER_FEATURES_SWITCH_PROBE_ENABLED: dry run by default, only the allowlisted
+// test fixture, every live key × surface off/on with its effect, change log,
+// exact restore, no mail. Swaps getDb() and env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-3: bryterproben ──");
+  try {
+    const { runAdminOwnerFeaturesSwitchProbeTests } = require("../src/routes/admin-owner-features-switch-probe.test") as
+      typeof import("../src/routes/admin-owner-features-switch-probe.test");
+    const r = await runAdminOwnerFeaturesSwitchProbeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-owner-features-switch-probe: " + f);
+    console.log(`  admin-owner-features-switch-probe: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-owner-features-switch-probe: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting,
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
