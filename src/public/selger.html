@@ -1562,6 +1562,12 @@
       hide('viewClaim');
       show('viewDashboard');
       show('btnLogout');
+      // «Se all statistikk» on «Mine valg» links here with #statistikk (S2f):
+      // open the Statistikk tab once the dashboard is shown.
+      if (window.location.hash === '#statistikk') {
+        var statsTabBtn = document.querySelector('#dashTabs .tab[data-tab="stats"]');
+        if (statsTabBtn) statsTabBtn.click();
+      }
 
       // Load agent info
       try {

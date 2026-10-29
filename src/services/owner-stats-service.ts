@@ -462,3 +462,16 @@ export function getOwnerStats(db: Database.Database, agentId: string, path: stri
     year: computeProfileYear(db, agentId, { rawFrom, humanViews: humanYearRaw, aiViews: aiYearRaw }, nowMs),
   };
 }
+
+/**
+ * «Sett» over 12 months exactly as the owner sees it (getOwnerStats().year.
+ * humanViews.value): the same raw floor, the same raw read of the profile
+ * path and the same stored daily sums, without the other groups. Used by the
+ * public-tile threshold (services/public-stats-threshold.ts, «Mine valg» S2f)
+ * so the public tiles and the owner's own number come from one source.
+ */
+export function getOwnerHumanViewsYear(db: Database.Database, agentId: string, path: string, nowMs: number = Date.now()): number {
+  const rawFrom = profileYearRawFrom(db, nowMs);
+  const { humanYearRaw, aiYearRaw } = getPathViews(db, path, ownerStatsWindowDays(), nowMs, `${rawFrom} 00:00:00`);
+  return computeProfileYear(db, agentId, { rawFrom, humanViews: humanYearRaw, aiViews: aiYearRaw }, nowMs).humanViews.value;
+}

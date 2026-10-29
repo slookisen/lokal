@@ -105,6 +105,7 @@ export const SWITCH_PROBE_ENV_FLAGS = [
   "OUTREACH_UNSUBSCRIBE_ENABLED",
   "OWNER_ORDER_EMAIL_ENABLED",
   "RFB_DISABLE_ORDER_FOLLOWUPS",
+  "PUBLIC_STATS_MIN_VIEWS",
 ] as const;
 
 /**
@@ -919,6 +920,7 @@ const PLANNED_CHECKS = [
   "level:<nivå> — nivået gir samme effekt som enkeltbryterne",
   "undo:level:<nivå> / undo:single:<key> — «Angre» gjenoppretter effekten",
   "no_surface:<key> — live-nøkkel uten flater: skriving + endringslogg",
+  "public_stats_threshold — «Vis som offentlig»: statistikkflisene på profilsiden vises bare med minst PUBLIC_STATS_MIN_VIEWS sidevisninger fra mennesker siste 12 mnd (eierens «Sett»), prøvd på begge sider av terskelen",
   "restore — alt tilbake til startpunktet (eksakt)",
 ];
 
@@ -1433,6 +1435,60 @@ async function checkUndoSingle(c: Ctx, baseline: ResolvedOwnerFeatures): Promise
   }
 }
 
+/**
+ * S2f («Bryterproben dekker terskelen med «vis som offentlig»»): the public
+ * stats tiles on /produsent/<slug>, rendered as-public, follow the threshold
+ * (services/public-stats-threshold.ts). The fixture's own 12-month «Sett» is
+ * read, then the page is rendered with the threshold at that count (tiles
+ * expected), one above it (no tiles expected) and at the environment's value
+ * (PUBLIC_STATS_MIN_VIEWS). The two forced values only live in the probe's
+ * async context, so nothing else sees them. With stats.public_counts off
+ * no side may show tiles (the check then cannot discriminate and says so).
+ */
+async function checkPublicStatsThreshold(c: Ctx): Promise<void> {
+  const check = "public_stats_threshold";
+  try {
+    const th = require("../services/public-stats-threshold") as typeof import("../services/public-stats-threshold");
+    const { publicFieldChoices } = require("./enforce") as typeof import("./enforce");
+    const { runAsPublicView } = require("../services/agent-visibility") as typeof import("../services/agent-visibility");
+    const { slugify } = require("../utils/slug") as typeof import("../utils/slug");
+    const f = c.readerCtx.fixture;
+    // The same inputs the page uses (seo.ts: process env, the shared DB handle).
+    const views = th.publicStatsHumanViews(c.db, f.id, `/produsent/${slugify(f.name)}`);
+    const choices = publicFieldChoices(f.id, { db: c.db });
+    const countsOn = !choices || choices.publicCounts;
+    const envMin = th.publicStatsMinViews();
+    const kit = visKit(c.readerCtx);
+    const tiles = (): Promise<boolean | string> => runAsPublicView(async () => {
+      const r = await invokeHandler(c.readerCtx, kit.handlers.produsent, probeReq(c.readerCtx, `/produsent/${f.slug}`, { params: { slug: f.slug } }));
+      const h = typeof r.body === "string" ? r.body : "";
+      if (r.status !== 200 || !h) return `HTTP ${r.status}`;
+      return h.includes('class="pf-stat" data-stat="human"');
+    });
+    const cases: Array<{ min: number; label: string; forced: boolean }> = [
+      { min: views, label: `terskel ${views}`, forced: true },
+      { min: views + 1, label: `terskel ${views + 1}`, forced: true },
+      { min: envMin, label: `PUBLIC_STATS_MIN_VIEWS=${envMin}`, forced: false },
+    ];
+    const parts: string[] = [];
+    let ok = true;
+    for (const k of cases) {
+      const expected = countsOn && (k.min <= 0 || views >= k.min);
+      const seen = k.forced ? await th.runWithPublicStatsMinViews(k.min, tiles) : await tiles();
+      const pass = seen === expected;
+      ok = ok && pass;
+      parts.push(`${k.label}: fliser ${seen === true ? "vises" : seen === false ? "vises ikke" : `feil (${seen})`} (forventet ${expected ? "vises" : "vises ikke"})`);
+    }
+    addCheck(c, {
+      check, key: "stats.public_counts", pass: ok,
+      observed: `«Sett» siste 12 mnd: ${views}; stats.public_counts ${countsOn ? "på" : "av"}; ${parts.join("; ")}`,
+      ...(!ok ? { reason: "profilsiden følger ikke terskelen" } : !countsOn ? { reason: "stats.public_counts er av: ingen side viser fliser, så kontrollen skiller ikke" } : {}),
+    });
+  } catch (err: any) {
+    addCheck(c, { check, key: "stats.public_counts", pass: false, observed: "—", reason: `kontrollen feilet: ${String(err?.message || err)}` });
+  }
+}
+
 /** A live switch without surfaces (comms.news): the write path and the change log only. */
 function checkNoSurface(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureValue): void {
   const dirs = directionsFor("switch", baseline);
@@ -1521,6 +1577,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     checkRequirements(c);
     checkLevels(c, baseline);
     await checkUndoSingle(c, baseline);
+    await checkPublicStatsThreshold(c);
   } catch (e: any) {
     error = String(e?.message || e);
   } finally {

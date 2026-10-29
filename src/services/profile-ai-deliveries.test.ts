@@ -76,6 +76,11 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
   // «Med i AI-søk» (S1): counting starts on a configured day; a year back here
   // so the rows written today count whatever the clock says.
   const prevCountingSince = process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
+  // «Mine valg» S2f: this suite checks the tiles' numbers and labels on a fixture
+  // below the public threshold (PUBLIC_STATS_MIN_VIEWS, 20): it runs with the
+  // threshold off (0); mine-valg-s2f.test.ts covers the threshold itself.
+  const prevMinViews = process.env.PUBLIC_STATS_MIN_VIEWS;
+  process.env.PUBLIC_STATS_MIN_VIEWS = "0";
   const yearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = yearAgo;
 
@@ -446,6 +451,7 @@ export async function runProfileAiDeliveriesTests(opts: { log?: boolean } = {}):
     failures.push(`unexpected error: ${String(err?.stack || err)}`);
   } finally {
     console.log = prevLog;
+    if (prevMinViews === undefined) delete process.env.PUBLIC_STATS_MIN_VIEWS; else process.env.PUBLIC_STATS_MIN_VIEWS = prevMinViews;
     if (prevCountingSince === undefined) delete process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE; else process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = prevCountingSince;
     (require("./profile-ai-deliveries") as typeof import("./profile-ai-deliveries")).__resetAiDeliveriesForTesting();
     const regMod = require("./marketplace-registry");

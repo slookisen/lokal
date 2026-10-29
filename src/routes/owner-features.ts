@@ -29,7 +29,10 @@ import {
   readOwnerIntro,
   undoOwnerChange,
 } from "../owner-features/changes";
-import { formatOwnerFeatureValue, renderOwnerFeaturesPageBody, type OwnerPageNotice } from "../owner-features/page";
+import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import { getOwnerStats } from "../services/owner-stats-service";
+import { publicStatsMinViews } from "../services/public-stats-threshold";
+import { slugify } from "../utils/slug";
 import { findOwnerFeature } from "../owner-features/registry";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
 import { isRowOrderableForRealOrder } from "../services/cart-service";
@@ -349,6 +352,28 @@ function itemsHref(agentId: string): string {
  */
 export const ORDERS_FAQ_URL: string | null = null;
 
+/** «Se all statistikk»: the Statistikk tab in /selger (selger.html opens it on #statistikk). */
+export function ownerStatsHref(agentId: string): string {
+  return `/selger?agent=${encodeURIComponent(agentId)}#statistikk`;
+}
+
+/**
+ * S2f: the statistics block's numbers — the /selger Statistikk tab's own
+ * payload (getOwnerStats, same path derivation as GET /api/agents/:id/
+ * owner-stats) plus the profile fields the tip looks at. null = the read
+ * failed (the block says so).
+ */
+export function ownerPageStats(agentId: string, agentName: string, db: any = getDb()): OwnerPageStats | null {
+  try {
+    const s = getOwnerStats(db, agentId, `/produsent/${slugify(agentName)}`);
+    const profile = db.prepare(`SELECT opening_hours, products, about, phone, website FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
+    return ownerPageStatsFrom(s, { minPublicViews: publicStatsMinViews(), profile: profile ?? null });
+  } catch (e) {
+    console.error("[owner-features] statistics block read failed:", e);
+    return null;
+  }
+}
+
 function currentPauseUntil(agentId: string): string | null {
   try {
     const row = getDb().prepare(`SELECT pause_until FROM ${OWNER_PAUSE_TABLE} WHERE agent_id = ?`).get(agentId) as { pause_until?: string | null } | undefined;
@@ -453,6 +478,8 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       pauseUntil: resolvedKey("visibility.profile")?.value === false ? currentPauseUntil(agentId) : null,
       ordersReadMoreUrl: ORDERS_FAQ_URL,
       orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours() },
+      stats: ownerPageStats(agent.id, String(agent.name || ""), db),
+      statsHref: ownerStatsHref(agent.id),
     });
     res.setHeader("Cache-Control", "no-store");
     return res.send(portalShell(`Mine valg · ${agent.name}`, body));

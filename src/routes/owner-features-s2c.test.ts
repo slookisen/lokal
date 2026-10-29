@@ -86,7 +86,10 @@ function seedProducer(db: Database.Database, id: string): void {
   const pv = db.prepare(
     `INSERT INTO analytics_page_views (path, session_id, is_owner, created_at) VALUES (?, ?, 0, datetime('now', '-2 days'))`,
   );
-  for (let i = 0; i < 4; i++) pv.run(`/produsent/${slugify(NAMES[id])}`, `iphash${id}${i}:Mozilla/5.0 (Macintosh) Chrome/120`);
+  // 20 people's page views: the public tiles need PUBLIC_STATS_MIN_VIEWS (20) over 12 months («Mine valg» S2f).
+  // The raw floor of analytics_agent_views (profileYearRawFrom) before those views, as in production.
+  db.prepare("INSERT INTO analytics_agent_views (agent_id, agent_name, created_at, traffic_category, is_owner) VALUES (?, ?, datetime('now', '-30 days'), 'human', 0)").run(id, NAMES[id]);
+  for (let i = 0; i < 20; i++) pv.run(`/produsent/${slugify(NAMES[id])}`, `iphash${id}${i}:Mozilla/5.0 (Macintosh) Chrome/120`);
 }
 
 /** One probe: the markers of the key's field on a surface for the producer right now. */
