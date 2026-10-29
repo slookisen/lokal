@@ -180,3 +180,82 @@ export function formatPriceText(price: number | null, currency: string | null, i
   if (price === null) return "";
   return `${isFrom ? "fra " : ""}${price} ${currency || "NOK"}`.trim();
 }
+
+// ─── Accuracy fixes (prod measurement 2026-10-29, 70.6 %) ───────────────────
+// reports/2026-10-29-produktimport-maaling.md (A2A): pack weight read as a
+// unit price, size variants without price_is_from. PURE helpers used by the
+// LLM grounding and the candidate rules (./rules.ts).
+
+/** Every number token in a text with its position (see NUMBER_TOKEN_RE). PURE. */
+export function numberTokensInText(text: string): Array<{ value: number; index: number; length: number }> {
+  const out: Array<{ value: number; index: number; length: number }> = [];
+  for (const m of text.matchAll(NUMBER_TOKEN_RE)) {
+    const n = parseNorwegianNumber(m[1]!);
+    if (n !== null) out.push({ value: n, index: m.index!, length: m[0].length });
+  }
+  return out;
+}
+
+const NUM = "(\\d{1,3}(?:[  .]\\d{3})+(?:,\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)";
+
+/**
+ * Every NOK price written in a price text, in order, de-duplicated: numbers
+ * with a currency marker («kr 585», «985,-», «200.-», «250 kr») and both ends
+ * of a range («150–250 kr»). PURE. Sizes and counts («8-10 porsjoner»,
+ * «500 g») carry no marker and are not prices. A non-NOK currency → [].
+ */
+export function nokPriceValues(text: string | null | undefined): number[] {
+  const raw = (text ?? "").replace(/\s+/g, " ").trim();
+  if (!raw || /(€|\$|£|\beur\b|\busd\b|\bsek\b|\bdkk\b)/i.test(raw)) return [];
+  const found: Array<{ index: number; value: number }> = [];
+  const add = (index: number, token: string) => {
+    const v = parseNorwegianNumber(token);
+    if (v !== null) found.push({ index, value: v });
+  };
+  const range = new RegExp(`${NUM}\\s*[-–]\\s*${NUM}\\s*(?:,-|\\.-|kr\\b|kr\\.|nok\\b|kroner\\b)`, "gi");
+  for (const m of raw.matchAll(range)) {
+    add(m.index!, m[1]!);
+    add(m.index! + m[0].indexOf(m[2]!, m[1]!.length), m[2]!);
+  }
+  for (const m of raw.matchAll(new RegExp(`(?:\\bkr\\.?|\\bnok)\\s*${NUM}`, "gi"))) add(m.index!, m[1]!);
+  for (const m of raw.matchAll(new RegExp(`${NUM}\\s*(?:,-|\\.-(?!\\d)|kr\\b|kr\\.|nok\\b|kroner\\b)`, "gi"))) add(m.index!, m[1]!);
+  const seen = new Set<number>();
+  return found
+    .sort((a, b) => a.index - b.index)
+    .map((f) => f.value)
+    .filter((v) => (seen.has(v) ? false : (seen.add(v), true)));
+}
+
+/** Units that state a weight/volume — a price "per" one of these is a unit price. */
+export type MeasureUnit = "kg" | "g" | "l";
+
+/**
+ * True when `text` says the price is PER kg / g / l: «kr/kg», «/kg», «pr. kg»,
+ * «per kilo», «kiloen», «kilopris», «pr. liter», «literpris», «kr/hg»,
+ * «pr 100 g». PURE. A weight that only describes the pack («10 kg 160,-»,
+ * «à 500 g», «5kg. 1.200,-») is NOT a unit price.
+ */
+export function statesUnitPrice(text: string | null | undefined, unit: MeasureUnit): boolean {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  const per = "(?:\\/|\\bpr\\.?\\s*|\\bper\\s+|\\bpris\\s+pr\\.?\\s*)";
+  if (unit === "kg") return new RegExp(`${per}(?:kg|kilo|kilogram)(?![a-zæøå])|\\bkiloen\\b|\\bkilopris|\\bkg-pris`, "i").test(t);
+  if (unit === "l") return new RegExp(`${per}(?:l|liter|litre|ltr)(?![a-zæøå])|\\bliteren\\b|\\bliterpris`, "i").test(t);
+  return new RegExp(`${per}(?:\\d+\\s*)?(?:g|gr|gram|hg|hekto)(?![a-zæøå])|\\bhektoen\\b|\\bhektopris`, "i").test(t);
+}
+
+/** A weight/volume written in a text («10 kg», «5kg.», «250g», «1,5 l») → «10 kg». PURE. */
+export function packSizeIn(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const m = text.match(/(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(kg|kilo|gram|gr|g|liter|ltr|l|dl|cl|ml)(?![a-zæøå])/i);
+  if (!m) return null;
+  const u = m[2]!.toLowerCase();
+  const unit = u === "kilo" ? "kg" : u === "gram" || u === "gr" ? "g" : u === "liter" || u === "ltr" ? "l" : u;
+  return `${m[1]} ${unit}`;
+}
+
+/** «kommer høsten», «kommer snart», «coming soon», «pris kommer»: a placeholder, not a price. PURE. */
+export function isComingSoonPlaceholder(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return /(^|[^a-zæøå])kommer([^a-zæøå]|$)|coming soon|\bsnart tilgjengelig\b|\bpris ikke satt\b/i.test(text);
+}

@@ -38,6 +38,7 @@ import {
   parseWooStoreProducts,
   type ProductCandidate,
   type ProductImportTier,
+  type WooExcluded,
 } from "./structured";
 import {
   buildProductImportPrompt,
@@ -50,8 +51,10 @@ import {
   type ProductImportLlm,
 } from "./llm";
 import { PRODUCT_IMPORT_MAX_PRODUCTS, productNameKey } from "./normalize";
+import { applyCandidateRules, type ExcludedCandidate } from "./rules";
 
 export type { ProductCandidate, ProductImportTier } from "./structured";
+export type { ExcludedCandidate } from "./rules";
 
 export const PRODUCT_IMPORT_USER_AGENT = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 /** Requests per profile, robots.txt excluded (spec: "maks ~8 sider"). */
@@ -77,6 +80,8 @@ export interface ProductImportResult {
   outcome: ProductImportOutcome;
   tier: ProductImportTier | null;
   products: ProductCandidate[];
+  /** Candidates dropped by a rule (service/event, password-protected), with the reason. */
+  excluded: ExcludedCandidate[];
   pages_fetched: number;
   fetched_urls: string[];
   rejected_urls: Array<{ url: string; reason: string }>;
@@ -249,6 +254,7 @@ export async function extractProductsFromWebsite(
     outcome: "no_products_found",
     tier: null,
     products: [],
+    excluded: [],
     pages_fetched: 0,
     fetched_urls: [],
     rejected_urls: [],
@@ -343,9 +349,17 @@ export async function extractProductsFromWebsite(
     return finish("robots_blocked");
   }
 
+  // The candidate rules (./rules.ts) run before dedupe/cap. A tier that
+  // FOUND candidates but excluded every one (a shop selling only events) is
+  // the answer: no_products_found, with the exclusions recorded. It never
+  // falls through to the HTML/LLM tiers, which only see names and would
+  // bring the same events back (and spend an LLM call).
   const done = (tier: ProductImportTier, items: ProductCandidate[]): ProductImportResult => {
+    const { kept, excluded } = applyCandidateRules(items);
+    result.excluded.push(...excluded);
+    if (kept.length === 0) return finish("no_products_found");
     result.tier = tier;
-    result.products = dedupeCap(items);
+    result.products = dedupeCap(kept);
     return finish("ok");
   };
 
@@ -364,8 +378,10 @@ export async function extractProductsFromWebsite(
   if (allowedByRobots(wooUrl)) {
     const r = await doFetch(wooUrl, "json", true);
     if (r.ok) {
-      const items = parseWooStoreProducts(r.html, origin, allowed);
-      if (items.length > 0) return done("woocommerce", items);
+      const wooExcluded: WooExcluded[] = [];
+      const items = parseWooStoreProducts(r.html, origin, allowed, wooExcluded);
+      result.excluded.push(...wooExcluded);
+      if (items.length > 0 || wooExcluded.length > 0) return done("woocommerce", items);
     }
   }
 
