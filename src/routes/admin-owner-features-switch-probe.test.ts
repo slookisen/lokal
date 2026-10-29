@@ -20,7 +20,12 @@
  *             cannot see the fixture in the visible starting state (no
  *             agent_metrics row, no in-stock product, an injected blind
  *             reader) → NOT_OBSERVABLE both ways with a reason, not ready,
- *             reported apart (PASS / FAIL / IKKE OBSERVERBAR)
+ *             reported apart (PASS / FAIL / IKKE OBSERVERBAR); P1 finding on a
+ *             single-object surface, P2 on a list surface; the feed reader
+ *             pages past 500 newer items in the fixture's city, the CSV match
+ *             ignores a producer whose slug starts with the fixture's, the CSV
+ *             alone keeps acp_feed observable; a reader that throws at the
+ *             baseline re-check → FAIL «leser feilet»
  *   failure   an effect reader that throws → that row FAIL, still restored;
  *             a throw mid-run (after a flip) → ok:false, still restored
  *   busy      a second concurrent run → 409 already_running
@@ -369,6 +374,72 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(/\| visibility\.profile \| leaderboard \| (on|off) \| IKKE OBSERVERBAR \|/.test(md), "obs-10: the row table says IKKE OBSERVERBAR");
       assertTrue(/- \[FUNN\] bryterprobe-visibility-profile-acp-feed-(on|off) · P2 · .*ikke observerbar/.test(md) && !md.includes("- [FUNN] ingen"), "obs-11: the not-observable rows land in the findings block (P2)");
       assertEq(rawState(FIX), before, "obs-12: restored byte-identical");
+      assertTrue(/- \[FUNN\] bryterprobe-visibility-profile-vcard-(on|off) · P1 · .*ikke observerbar/.test(md) && !/bryterprobe-visibility-profile-vcard-(on|off) · P2/.test(md),
+        "obs-13: a single-object surface (vcard) not observable → finding at P1, list surfaces stay P2");
+
+      const dropProducer = (id: string) => {
+        for (const t of ["agent_metrics", "products", "agent_knowledge"]) db.prepare(`DELETE FROM ${t} WHERE agent_id = ?`).run(id);
+        db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+      };
+      const acpRows = (r: Awaited<ReturnType<typeof probe.runSwitchProbe>>) => r.rows.filter((x) => x.key === "visibility.profile" && x.surface === "acp_feed");
+      const fmt = (rs: Array<{ direction: string; result: string; observed: string }>) => rs.map((x) => `${x.direction}:${x.result}:${x.observed}`).join(" | ");
+
+      // (d) >500 newer in-stock products ahead of the fixture's, in its city and elsewhere,
+      // plus a visible producer whose slug starts with the fixture's slug.
+      const feedCrowd = Array.from({ length: 6 }, (_, i) => `sp-feed-${i}`);
+      const NORD = "sp-nord";
+      const addProducts = (id: string, n: number) => {
+        const ins = db.prepare(
+          `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, availability, category, image_url, availability_source, availability_updated_at, updated_at)
+           VALUES (?, ?, ?, ?, 'kg', 40, 'in_stock', 'vegetables', 'https://img.example.no/c.jpg', 'admin_producer_confirmed', ?, '2099-01-01 00:00:00')`);
+        for (let k = 0; k < n; k++) ins.run(`p-${id}-${k}`, id, `Feedvare ${k}`, `feedvare ${k}`, new Date().toISOString());
+      };
+      let d: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        feedCrowd.forEach((id, i) => {
+          seed(id, `Feedgard ${i2s(id)}`, { origin: "discovery", hidden: 0, email: `post@${id}.example.no` });
+          if (i >= 4) db.prepare(`UPDATE agents SET city = 'Bergen' WHERE id = ?`).run(id);
+          addProducts(id, i >= 4 ? 30 : 130);
+        });
+        seed(NORD, `${FIX_NAME} Nord`, { origin: "discovery", hidden: 0, email: "post@sp-nord.example.no" });
+        const ahead = count(`SELECT COUNT(*) AS n FROM products p JOIN agents a ON a.id = p.agent_id WHERE p.availability = 'in_stock' AND a.city = 'Ålesund' AND p.agent_id <> ?
+          AND p.updated_at > (SELECT MAX(updated_at) FROM products WHERE agent_id = ?)`, FIX, FIX);
+        assertTrue(ahead > 500, `obs-14: more than one 500-item feed page ahead of the fixture in its own city (${ahead})`);
+        d = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      } finally {
+        for (const id of [...feedCrowd, NORD]) dropProducer(id);
+      }
+      const ad = acpRows(d!);
+      assertTrue(ad.length === 2 && ad.every((x) => x.result === "PASS"), `obs-15: acp_feed PASS both ways with the fixture past the first feed page (${fmt(ad)})`);
+      assertTrue(ad.some((x) => x.direction === "on" && /feed=ja/.test(x.observed) && /acp_csv=ja/.test(x.observed)), `obs-16: «on»: the paged, city-filtered feed and the CSV both see the fixture (${fmt(ad)})`);
+      assertTrue(ad.some((x) => x.direction === "off" && /feed=nei/.test(x.observed) && /acp_csv=nei/.test(x.observed)),
+        `obs-17: «off»: a visible producer whose slug starts with the fixture's does not count as the fixture in the CSV (${fmt(ad)})`);
+      assertEq(rawState(FIX), before, "obs-18: restored byte-identical");
+
+      // (e) only the CSV can see the fixture (the feed's city filter misses it) → still observable, PASS.
+      db.prepare(`UPDATE agents SET city = 'Ålesund ' WHERE id = ?`).run(FIX);
+      let e2: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        e2 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      } finally {
+        db.prepare(`UPDATE agents SET city = 'Ålesund' WHERE id = ?`).run(FIX);
+      }
+      const ae = acpRows(e2!);
+      assertTrue(ae.length === 2 && ae.every((x) => x.result === "PASS") && ae.some((x) => x.direction === "on" && /feed=nei/.test(x.observed) && /acp_csv=ja/.test(x.observed)),
+        `obs-19: only the ACP CSV sees the fixture → acp_feed still observable and PASS both ways (${fmt(ae)})`);
+
+      // (f) the baseline re-check reader throws → FAIL «leser feilet», never NOT_OBSERVABLE.
+      let calls = 0;
+      const flaky: import("../owner-features/switch-probe").SurfaceReaderDef = {
+        observe: "flaky",
+        read: () => { if (calls++ === 0) return { endpoints: { api_leaderboard: false } }; throw new Error("injected baseline reader failure"); },
+      };
+      const f2 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, readers: { "visibility.profile × leaderboard": flaky } });
+      const lf = f2.rows.filter((x) => x.key === "visibility.profile" && x.surface === "leaderboard");
+      assertTrue(lf.length === 2 && lf.every((x) => x.result === "FAIL" && /leser feilet i grunntilstanden: injected baseline reader failure/.test(x.reason || "")),
+        `obs-20: a reader that throws at the baseline re-check → FAIL «leser feilet», not NOT_OBSERVABLE (${lf.map((x) => `${x.direction}:${x.result}:${x.reason}`).join(" | ")})`);
+      assertEq([f2.not_observable, f2.ready_for_daniel_test, f2.restored], [0, false, true], "obs-21: 0 not observable, not ready, restored");
+      assertEq(rawState(FIX), before, "obs-22: restored byte-identical");
     }
 
     // ═══ Flags off: the rows that depend on them FAIL ═════════════════════

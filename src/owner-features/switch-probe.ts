@@ -853,7 +853,7 @@ function visibilityUnobservableHint(ctx: ProbeReaderContext, surface: string): s
   switch (surface) {
     case "leaderboard": {
       if (!one(`SELECT 1 AS x FROM agent_metrics WHERE agent_id = ?`)) return "testprodusenten har ingen rad i agent_metrics, så den kan ikke stå på /api/leaderboard";
-      return `testprodusenten er ikke i topp ${SWITCH_PROBE_LEADERBOARD_LIMIT} på /api/leaderboard i grunntilstanden`;
+      return `testprodusenten står ikke på /api/leaderboard i grunntilstanden (limit ${SWITCH_PROBE_LEADERBOARD_LIMIT}; mulig is_active=0 eller visibility.leaderboard av)`;
     }
     case "acp_feed": {
       const n = Number(one(`SELECT COUNT(*) AS n FROM products WHERE agent_id = ? AND availability = 'in_stock'`)?.n ?? 0);
@@ -1188,6 +1188,8 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
   const refs = new Map<string, SurfaceObservation | null>();
   /** Visibility surfaces that cannot see the fixture in the visible starting state → reason. */
   const unobservable = new Map<string, string>();
+  /** Visibility surfaces whose reader threw during that baseline re-check → error (FAIL, not NOT_OBSERVABLE). */
+  const baselineReadError = new Map<string, string>();
   // Reference observation at the starting point (an "on" baseline names the endpoints that must show it again).
   if (baseline === true) {
     for (const s of surfaces) {
@@ -1197,7 +1199,10 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
         // Not seen at the first read: give it the normal wait before calling it unobservable.
         const again = await awaitEffect(c, def, true, null, Date.now());
         if (again.obs) ref = again.obs;
-        if (!again.pass) unobservable.set(s, unobservableReason(s, again.obs ?? ref));
+        if (!again.pass) {
+          if (again.error) baselineReadError.set(s, again.error);
+          else unobservable.set(s, unobservableReason(s, again.obs ?? ref));
+        }
       }
       refs.set(s, ref);
     }
@@ -1213,6 +1218,17 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
     for (const s of surfaces) {
       const def = c.readers[caseId(e.key, s)];
       const writeOk0 = w.kind === "ok" && logged !== false;
+      const readErr = baselineReadError.get(s);
+      if (readErr !== undefined) {
+        // A reader that throws proves nothing either way: FAIL, never NOT_OBSERVABLE.
+        pushRow(c, {
+          key: e.key, surface: s, direction: d, pass: false,
+          observed: `leser feilet: ${readErr}`, expected: value ? "effekt til stede" : "effekt borte",
+          ms_to_effect: null, write_status: status, change_logged: logged, discriminating: true,
+          reason: `leser feilet i grunntilstanden: ${readErr}`,
+        });
+        continue;
+      }
       const why = unobservable.get(s);
       if (why && writeOk0) {
         // The surface cannot show the fixture even where it should: no evidence either way.
@@ -1788,7 +1804,10 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
   const fails: Array<{ id: string; text: string; prio: string }> = [
     ...r.rows.filter((x) => x.result === "FAIL").map((x) => ({ id: `${x.key}-${x.surface}-${x.direction}`, text: `${x.key} × ${x.surface} (${x.direction}): ${x.reason ?? "FAIL"}`, prio: "P1" })),
     ...r.checks.filter((x) => x.result === "FAIL").map((x) => ({ id: x.check, text: `${x.check}: ${x.reason ?? "FAIL"}`, prio: "P1" })),
-    ...r.rows.filter((x) => x.result === "NOT_OBSERVABLE").map((x) => ({ id: `${x.key}-${x.surface}-${x.direction}`, text: `${x.key} × ${x.surface} (${x.direction}): ikke observerbar — ${x.reason ?? ""}`, prio: "P2" })),
+    ...r.rows.filter((x) => x.result === "NOT_OBSERVABLE").map((x) => ({ id: `${x.key}-${x.surface}-${x.direction}`, text: `${x.key} × ${x.surface} (${x.direction}): ikke observerbar — ${x.reason ?? ""}`,
+      // A list surface (ranking / sampling) missing the fixture is a probe blind spot (P2); a
+      // single-object surface (profile page, card, vCard …) missing it is more likely a real defect (P1).
+      prio: LIST_SURFACES.has(x.surface) ? "P2" : "P1" })),
   ];
   if (r.error) fails.unshift({ id: "run-aborted", text: `kjøringen ble avbrutt: ${r.error}`, prio: "P1" });
   if (fails.length === 0) lines.push("- [FUNN] ingen");
