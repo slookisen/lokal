@@ -48,7 +48,19 @@ const SELLER_ACTIONS: Record<string, OrderAction> = Object.assign(Object.create(
   no_show: "no_show",
   buyer_cancelled: "buyer_cancelled",
   cannot_deliver: "cannot_deliver",
+  // B3: «Hentet» — the same shared-layer action as the producer page's button.
+  complete: "complete",
 });
+
+/**
+ * The PRG error code of a refused action. B3: «Hentet» on an order that is
+ * already completed (a second click, another tab, the automatic close) is
+ * harmless and gets its own clear message instead of «ugyldig».
+ */
+function actionErrorCode(action: OrderAction, httpStatus: number, currentStatus: string | null | undefined): string {
+  if (action === "complete" && currentStatus === "completed") return "allerede-hentet";
+  return httpStatus === 400 ? "hentetid" : "ugyldig";
+}
 
 function paymentsClientFor(req: Request): PaymentsStripeClient | null {
   return isPaymentsLifecycleActive()
@@ -158,7 +170,7 @@ router.post("/eier/:agentId/ordrer/:orderId", ownerOrdersLimiter, express.urlenc
     );
     if (!result.success) {
       const cur = getOwnerOrder(agentId, orderId);
-      return res.redirect(303, back(tabForStatus(cur?.status ?? order.status), `&error=${result.status === 400 ? "hentetid" : "ugyldig"}`));
+      return res.redirect(303, back(tabForStatus(cur?.status ?? order.status), `&error=${actionErrorCode(action, result.status, cur?.status)}`));
     }
     return res.redirect(303, back(tabForStatus(result.status), `&done=${encodeURIComponent(result.status)}`));
   } catch (err) {
@@ -234,7 +246,10 @@ router.post("/produsent/ordre/:token/kompakt", ownerOrdersLimiter, express.urlen
       { role: "seller", channel: "producer_page", ref: `token:${order.id.slice(0, 8)}` },
       { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action) },
     );
-    if (!result.success) return res.redirect(303, `${back}?error=${result.status === 400 ? "hentetid" : "ugyldig"}`);
+    if (!result.success) {
+      const cur = getOwnerOrderByToken(token);
+      return res.redirect(303, `${back}?error=${actionErrorCode(action, result.status, cur?.status)}`);
+    }
     return res.redirect(303, `${back}?done=${encodeURIComponent(result.status)}`);
   } catch (err) {
     console.error("[owner-orders] POST token action failed:", err instanceof Error ? err.message : "error");

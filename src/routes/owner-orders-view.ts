@@ -211,6 +211,10 @@ const ACTION_LABEL = {
   no_show: "Kunden kom ikke",
   buyer_cancelled: "Kunden avbestilte",
   cannot_deliver: "Kan ikke levere",
+  // B3 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the same «Hentet» as the producer's order page — the shared layer's
+  // `complete` (confirmed/ready → completed, completion_source 'seller').
+  complete: "Hentet",
 } as const;
 
 function actionForm(ctx: RowContext, action: keyof typeof ACTION_LABEL, cls: string, extra = ""): string {
@@ -237,7 +241,10 @@ function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
     }
     const hint = isOrderAutocompleteEnabled()
       ? `<p class="mo-hint">Du trenger ikke gjøre mer. Ordren avsluttes av seg selv etter henting.</p>` : "";
-    return `${hint}<details class="mo-menu"><summary>Flere valg</summary>${parts.join("")}</details>`;
+    // B3: «Hentet» is optional (the automatic close stays the main path) and
+    // offered only for confirmed/ready — the layer re-validates on POST.
+    const pickedUp = `<div class="mo-actions">${actionForm(ctx, "complete", "mo-primary")}</div>`;
+    return `${hint}${pickedUp}<details class="mo-menu"><summary>Flere valg</summary>${parts.join("")}</details>`;
   }
   return "";
 }
@@ -407,10 +414,11 @@ export function bannerHtml(done: string, error: string): string {
     if (m) return m;
   }
   if (error === "hentetid") return `<div class="mo-banner warn" role="alert">Hentetiden er ikke gyldig. Velg et tidspunkt fra i dag og fram i tid, eller la feltet stå tomt.</div>`;
+  if (error === "allerede-hentet") return `<div class="mo-banner ok" role="status">Ordren er allerede registrert som hentet. Ingenting ble endret.</div>`;
   if (error === "ugyldig") return `<div class="mo-banner warn" role="alert">Handlingen er ikke gyldig for ordrens status akkurat nå.</div>`;
   if (error) return `<div class="mo-banner warn" role="alert">Kunne ikke oppdatere ordren. Prøv igjen.</div>`;
   const labels: Record<string, string> = {
-    confirmed: "Ordren er bekreftet.", declined: "Ordren er avslått.", cancelled: "Ordren er kansellert.", completed: "Ordren er avsluttet.", ready: "Ordren er oppdatert.",
+    confirmed: "Ordren er bekreftet.", declined: "Ordren er avslått.", cancelled: "Ordren er kansellert.", completed: "Ordren er registrert som hentet.", ready: "Ordren er oppdatert.",
   };
   return labels[done] ? `<div class="mo-banner ok" role="status">${esc(labels[done])}</div>` : "";
 }

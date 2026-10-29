@@ -37212,6 +37212,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-orders-fase-a2: unexpected error: " + String(err?.message || err));
   }
+  // B3 («Hentet» i «Mine ordrer», dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier) — own in-memory DB.
+  try {
+    const { runOwnerOrdersB3HentetTests } = require("../src/routes/owner-orders-b3-hentet.test") as
+      typeof import("../src/routes/owner-orders-b3-hentet.test");
+    const b3h = await runOwnerOrdersB3HentetTests({ log: false });
+    passed += b3h.passed;
+    failed += b3h.failed;
+    for (const f of b3h.failures) failures.push("owner-orders-b3-hentet: " + f);
+    console.log(`  owner-orders-b3-hentet: ${b3h.passed} passed, ${b3h.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-orders-b3-hentet: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
