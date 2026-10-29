@@ -641,7 +641,7 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
   const env = opts.env ?? process.env;
   result.extra_ca = registerExtraCaInUse({ fetchImpl: opts.fetchImpl, env });
   try {
-    fetched = await fetchDebioRegister({ fetchImpl: opts.fetchImpl, env });
+    fetched = await fetchDebioRegister({ fetchImpl: opts.fetchImpl, env, now });
   } catch (e) {
     return reject(`fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }

@@ -7,10 +7,30 @@
 //   POST https://portal.debio.no/ACM/api/certsearch/getcertificates
 //   body {"searchText":""}   → every approved business (~3 065 rows, 2026-10)
 //
-// The endpoint is undocumented and we could not take a sample from the build
-// sandbox, so the raw field names are NOT known. Everything that depends on
-// the raw shape lives in ONE place — normalizeRegisterRow() below — and every
-// caller works on the normalized `DebioRegisterRow` only.
+// Everything that depends on the raw shape lives in ONE place —
+// normalizeRegisterRow() below — and every caller works on the normalized
+// `DebioRegisterRow` only.
+//
+// REAL shape (økologi S1c, captured live 2026-10-29; the response is a bare
+// array of these):
+//
+//   { sid, name, street, houseNr, zipCode, city, dispCertificate,
+//     companyNumber, producerCode, clientCode,
+//     certificates: [{ sid, from, to, enquiryOrigSid }]   (epoch ms),
+//     mainProductGroups: [{ sid, name: "FIO – Foredling, …", caption, … }],
+//     productGroupSids: [...], regionSid, resultSids: [509, …], … }
+//
+//   org.nr.  = clientCode (9 digits only). `companyNumber` is Debio's own
+//              customer number and `producerCode` a producer id — NEVER org.nr.
+//   sid      = the register entity `sid`.
+//   validity = certificates[]: valid_to = max `to` of the certificates valid
+//              now (from ≤ now ≤ to); none valid → the latest `to` (expired).
+//   status   = resultSids[].
+//   groups   = mainProductGroups[]: code = text before « – » in `name`
+//              (productGroups), label = `caption` (productGroupLabels).
+//   street   = street (+ houseNr when the street has no trailing number).
+//
+// Earlier guessed shapes (kept, none of them can read companyNumber):
 //
 // Assumed raw shapes (any of these; keys are looked up case- and
 // separator-insensitively, so `clientCode`, `ClientCode` and `client_code`
@@ -72,6 +92,8 @@ export interface DebioRegisterRow {
   validTo: string | null;
   /** Upper-cased product-group codes / names, de-duplicated, in order. */
   productGroups: string[];
+  /** Human product-group labels (`caption`, e.g. «Foredling, import og omsetning»), in order. */
+  productGroupLabels: string[];
 }
 
 export interface DebioRegisterFetchResult {
@@ -157,12 +179,27 @@ function codesFrom(v: unknown, out: number[]): void {
   }
 }
 
-function groupsFrom(v: unknown, out: string[]): void {
+/** «FIO – Foredling, import og omsetning» → { code: "FIO", label: "Foredling, …" }; else null. */
+function codedName(v: unknown): { code: string; label: string } | null {
+  const s = text(v);
+  if (!s) return null;
+  const m = /^([A-Za-zÆØÅæøå0-9]{2,6})\s+[–—-]\s+(.+)$/.exec(s);
+  return m ? { code: m[1].toUpperCase(), label: m[2].trim() } : null;
+}
+
+function groupsFrom(v: unknown, out: string[], labels: string[] = []): void {
   if (v === undefined || v === null) return;
-  if (Array.isArray(v)) { for (const x of v) groupsFrom(x, out); return; }
+  if (Array.isArray(v)) { for (const x of v) groupsFrom(x, out, labels); return; }
   if (typeof v === "object") {
     const m = lookupMap(v as Record<string, unknown>);
-    groupsFrom(pick(m, ["code", "shortname", "productgroupcode", "name", "productgroupname", "sid", "id"]), out);
+    // Real shape: { name: "FIO – Foredling, …", caption: "Foredling, …" }.
+    const coded = codedName(m.get("name")) ?? codedName(m.get("productgroupname"));
+    const explicit = text(pick(m, ["code", "shortname", "productgroupcode"]));
+    const caption = text(m.get("caption")) ?? coded?.label ?? null;
+    if (caption && !labels.includes(caption)) labels.push(caption);
+    const code = explicit ? explicit.toUpperCase() : coded?.code;
+    if (code) { if (!out.includes(code)) out.push(code); return; }
+    groupsFrom(pick(m, ["name", "productgroupname", "sid", "id"]), out);
     return;
   }
   for (const part of String(v).split(/[,;|]/)) {
@@ -184,24 +221,76 @@ export function statusFromCodes(codes: readonly number[]): DebioRegisterStatus {
   return "annet";
 }
 
+/** Epoch ms from epoch ms / an ISO / dd.mm.yyyy / /Date()/ value; else null. */
+function instantOf(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v) && v > 1e11) return v;
+  const iso = registerDate(v);
+  if (!iso) return null;
+  const ms = Date.parse(`${iso}T00:00:00Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Validity from the real `certificates: [{from, to}]` array: the certificates
+ * valid now (from ≤ now ≤ to) give validFrom = min from, validTo = max to;
+ * when none is valid now, the latest `to` (and its `from`) so expiry sees it
+ * as expired. Null when the array carries no usable `to`.
+ */
+export function certificateValidity(certs: unknown, now: Date): { validFrom: string | null; validTo: string | null } | null {
+  if (!Array.isArray(certs)) return null;
+  const list: Array<{ from: number | null; to: number }> = [];
+  for (const c of certs) {
+    if (!c || typeof c !== "object" || Array.isArray(c)) continue;
+    const m = lookupMap(c as Record<string, unknown>);
+    const to = instantOf(pick(m, ["to", "validto", "todate", "dateto"]));
+    if (to === null) continue;
+    list.push({ from: instantOf(pick(m, ["from", "validfrom", "fromdate", "datefrom"])), to });
+  }
+  if (list.length === 0) return null;
+  const t = now.getTime();
+  const current = list.filter((c) => (c.from === null || c.from <= t) && t <= c.to);
+  const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOString().slice(0, 10));
+  if (current.length) {
+    const froms = current.map((c) => c.from).filter((f): f is number => f !== null);
+    return { validFrom: iso(froms.length ? Math.min(...froms) : null), validTo: iso(Math.max(...current.map((c) => c.to))) };
+  }
+  const latest = list.reduce((a, b) => (b.to > a.to ? b : a));
+  return { validFrom: iso(latest.from), validTo: iso(latest.to) };
+}
+
+/** street + houseNr, appending the house number only when the street has no trailing number. */
+function streetWithHouseNr(street: unknown, houseNr: unknown): string | null {
+  const s = text(street);
+  const h = text(houseNr);
+  if (!s) return null;
+  if (!h || /\d+\s*[A-Za-zÆØÅæøå]?$/.test(s)) return s;
+  return `${s} ${h}`;
+}
+
+// Org.nr. keys. Deliberately NOT here: companyNumber / number (Debio's own
+// customer number), producerCode, customerNumber — they are never an org.nr.
+export const ORG_NR_KEYS: readonly string[] = ["clientcode", "orgnr", "organizationnumber", "orgnumber", "organisationnumber", "orgno"];
+
 /**
  * ONE raw register row → the normalized row, or null when it cannot be
  * interpreted (no name, or neither an org.nr. nor a sid to identify it).
+ * `now` decides which certificate of a real-shape row is the current one.
  */
-export function normalizeRegisterRow(raw: unknown): DebioRegisterRow | null {
+export function normalizeRegisterRow(raw: unknown, now: Date = new Date()): DebioRegisterRow | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const m = lookupMap(raw as Record<string, unknown>);
   const name = text(pick(m, ["name", "clientname", "companyname", "displayname", "businessname", "virksomhet"]));
   if (!name) return null;
-  const orgNr = normalizeOrgNr(pick(m, ["clientcode", "orgnr", "organizationnumber", "orgnumber", "organisationnumber", "orgno"]));
+  const orgNr = normalizeOrgNr(pick(m, [...ORG_NR_KEYS]));
   const sid = text(pick(m, ["certsid", "certificatesid", "enquiryorigsid", "enquirysid", "sid", "id"]));
   if (!orgNr && !sid) return null;
   let street = pick(m, ["street", "streetaddress", "addressline1", "adresse", "address"]);
   if (street && typeof street === "object") street = undefined; // a nested address object, not a street
   const postal = text(pick(m, ["postalcode", "postcode", "zip", "zipcode", "postnr", "postnumber", "postnummer"]));
   const statusCodes: number[] = [];
-  codesFrom(pick(m, ["statuscodes", "statuscode", "statuses", "status", "certstatuses", "certstatus", "statussids", "statussid"]), statusCodes);
-  const productGroupsRaw = pick(m, ["mainproductgroups", "productgroups", "mainproductgroup", "productgroupcodes", "productgroupsids", "productgroup"]);
+  codesFrom(pick(m, ["resultsids", "resultsid", "resultcodes", "statuscodes", "statuscode", "statuses", "status", "certstatuses", "certstatus", "statussids", "statussid"]), statusCodes);
+  // productGroupSids (sub-group sids) are not group codes — not read.
+  const productGroupsRaw = pick(m, ["mainproductgroups", "productgroups", "mainproductgroup", "productgroupcodes", "productgroup"]);
   // Status codes may also sit on the product-group objects.
   if (Array.isArray(productGroupsRaw)) {
     for (const g of productGroupsRaw) {
@@ -212,20 +301,23 @@ export function normalizeRegisterRow(raw: unknown): DebioRegisterRow | null {
     }
   }
   const productGroups: string[] = [];
-  groupsFrom(productGroupsRaw, productGroups);
+  const productGroupLabels: string[] = [];
+  groupsFrom(productGroupsRaw, productGroups, productGroupLabels);
   const codes = [...new Set(statusCodes)];
+  const fromCerts = certificateValidity(m.get("certificates"), now);
   return {
     sid,
     name,
-    street: text(street),
+    street: streetWithHouseNr(street, pick(m, ["housenr", "housenumber", "husnr"])),
     postalCode: postalCodeOf(postal),
     city: text(pick(m, ["city", "postalplace", "postplace", "poststed", "town", "place", "municipality", "kommune"])),
     orgNr,
     statusCodes: codes,
     status: statusFromCodes(codes),
-    validFrom: registerDate(pick(m, ["validfrom", "certvalidfrom", "fromdate", "datefrom", "validfromdate", "startdate"])),
-    validTo: registerDate(pick(m, ["validto", "certvalidto", "todate", "dateto", "validtodate", "expirydate", "enddate", "validuntil"])),
+    validFrom: fromCerts ? fromCerts.validFrom : registerDate(pick(m, ["validfrom", "certvalidfrom", "fromdate", "datefrom", "validfromdate", "startdate"])),
+    validTo: fromCerts ? fromCerts.validTo : registerDate(pick(m, ["validto", "certvalidto", "todate", "dateto", "validtodate", "expirydate", "enddate", "validuntil"])),
     productGroups,
+    productGroupLabels,
   };
 }
 
@@ -243,12 +335,12 @@ export function parseRegisterResponse(data: unknown): unknown[] {
 }
 
 /** Normalizes a whole response: rows + how many raw rows were rejected. */
-export function normalizeRegisterResponse(data: unknown): DebioRegisterFetchResult {
+export function normalizeRegisterResponse(data: unknown, now: Date = new Date()): DebioRegisterFetchResult {
   const raw = parseRegisterResponse(data);
   const rows: DebioRegisterRow[] = [];
   let rejected = 0;
   for (const r of raw) {
-    const n = normalizeRegisterRow(r);
+    const n = normalizeRegisterRow(r, now);
     if (n) rows.push(n); else rejected++;
   }
   return { raw: raw.length, rows, rejected };
@@ -427,7 +519,8 @@ function parseJson(t: string): unknown {
  * HTTP/JSON/network errors; a network error's message is the full cause chain
  * (describeFetchError), our own timeout reads «timeout after 60000 ms».
  */
-export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}): Promise<DebioRegisterFetchResult> {
+export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch; env?: NodeJS.ProcessEnv; timeoutMs?: number; now?: Date } = {}): Promise<DebioRegisterFetchResult> {
+  const now = opts.now ?? new Date();
   const transport = selectRegisterTransport(opts);
   if (transport.kind === "invalid") throw new Error(transport.error);
   const timeoutMs = opts.timeoutMs ?? DEBIO_REGISTER_TIMEOUT_MS;
@@ -442,7 +535,7 @@ export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch; env?:
       throw new Error(`${describeFetchError(e)} (extra CA)`);
     }
     if (res.status < 200 || res.status > 299) throw httpError(res.status, res.text);
-    return normalizeRegisterResponse(parseJson(res.text));
+    return normalizeRegisterResponse(parseJson(res.text), now);
   }
 
   const ctl = new AbortController();
@@ -471,5 +564,5 @@ export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch; env?:
   } finally {
     clearTimeout(t);
   }
-  return normalizeRegisterResponse(data);
+  return normalizeRegisterResponse(data, now);
 }

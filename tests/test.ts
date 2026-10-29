@@ -50775,6 +50775,25 @@ runSerial(async () => {
   }
 });
 
+// økologi S1c: Debio register field mapping against the REAL row shape
+// (clientCode, certificates[] epoch ms, resultSids, mainProductGroups caption;
+// companyNumber never an org.nr.). runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S1c: Debio-register feltkobling mot ekte registerform ──");
+  try {
+    const { runDebioRegisterS1cTests } = require("../src/services/debio-register-s1c.test") as
+      typeof import("../src/services/debio-register-s1c.test");
+    const r = await runDebioRegisterS1cTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("debio-register-s1c: " + f);
+    console.log(`  debio-register-s1c: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("debio-register-s1c: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
 // product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
 // robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
