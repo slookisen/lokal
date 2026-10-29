@@ -186,6 +186,7 @@ import {
   EXPERIENCES_GEOCODE_BOOT_DELAY_MS,
 } from "./services/boot-job-gate";
 import { syncDebioVerifications } from "./services/debio-verification-service";
+import { syncDebioRegister, debioRegisterSyncEnabled, enforceDebioRegisterFreshness } from "./services/debio-register-sync";
 import { runSalgskanalSweep } from "./services/salgskanal-matcher";
 
 // Seed-knowledge loaded dynamically — only used if DB is empty
@@ -1792,8 +1793,33 @@ let lastDebioSyncAt: Date | null = null;
 if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
   setInterval(trackJob("debio-sync", async () => {
     const now = new Date();
+    // Økologi S1 (AC1.6): every hour — > 7 days without a successful register
+    // sync clears register-checked statuses. No-op when the register sync
+    // never ran or RFB_DEBIO_REGISTER_SYNC is off (rollback to finnoko).
+    try {
+      const f = enforceDebioRegisterFreshness(getDb(), now);
+      if (f.warning) console.warn(`[debio-register] ${f.warning} (cleared=${f.cleared})`);
+    } catch (err) {
+      console.error("[debio-register] freshness check failed:", err);
+    }
     if (now.getUTCHours() !== 4) return; // fire only during 04:00 UTC window
     if (lastDebioSyncAt && (now.getTime() - lastDebioSyncAt.getTime()) < 23 * 3600_000) return;
+    // Økologi S1: with RFB_DEBIO_REGISTER_SYNC on, Debio's full register is the
+    // status source (finnoko only as a helper key inside it).
+    if (debioRegisterSyncEnabled()) {
+      try {
+        const r = await syncDebioRegister(getDb(), { dryRun: false });
+        console.log(
+          `[debio-register] accepted=${r.accepted} rows=${r.normalized} verified=${r.verified} ` +
+          `review=${r.review_candidates} reset=${r.would_reset} changes=${r.changes} errors=${r.errors.length}`,
+        );
+        for (const w of r.warnings) console.warn(`[debio-register] ${w}`);
+        lastDebioSyncAt = now;
+      } catch (err) {
+        console.error("[debio-register] failed:", err);
+      }
+      return;
+    }
     try {
       const result = await syncDebioVerifications();
       console.log(

@@ -17162,16 +17162,16 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
     "pr95: relabel drops Debio-sertifisert when debio_verified=0, no organic label (økologi S0)");
 
   const r2 = relabelCertifications(["Debio-sertifisert", "Nyt Norge"], true);
-  assertEq(JSON.stringify(r2), JSON.stringify(["✓ Debio-verifisert", "Nyt Norge"]),
-    "pr95: relabel replaces Debio-sertifisert with ✓ Debio-verifisert when debio_verified=1");
+  assertEq(JSON.stringify(r2), JSON.stringify(["Debio-godkjent", "Nyt Norge"]),
+    "pr95: relabel replaces Debio-sertifisert with Debio-godkjent when debio_verified=1");
 
   const r3 = relabelCertifications(["Nyt Norge"], false);
   assertEq(JSON.stringify(r3), JSON.stringify(["Nyt Norge"]),
     "pr95: relabel leaves non-Debio certs untouched when no organic seed present");
 
   const r4 = relabelCertifications(["Nyt Norge"], true);
-  assertEq(JSON.stringify(r4), JSON.stringify(["✓ Debio-verifisert", "Nyt Norge"]),
-    "pr95: relabel prepends ✓ Debio-verifisert even when no Debio-sertifisert in source");
+  assertEq(JSON.stringify(r4), JSON.stringify(["Debio-godkjent", "Nyt Norge"]),
+    "pr95: relabel prepends Debio-godkjent even when no Debio-sertifisert in source");
 
   const r5 = relabelCertifications([], false);
   assertEq(JSON.stringify(r5), JSON.stringify([]),
@@ -50729,6 +50729,28 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("organic-claims-s0: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S1: status from Debio's full register — normalizer, < 2500
+// rows rejected, the match methods, support signals → review only, review
+// approve/reject, AC1.4 reset, > 7 days stale, profile wording (AC1.5), flag
+// off unchanged, no Debio person names stored. Fake fetch, in-memory DB;
+// swaps the getDb() singleton and env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S1: Debio-registeret som statuskilde ──");
+  try {
+    const { runDebioRegisterS1Tests } = require("../src/services/debio-register-s1.test") as
+      typeof import("../src/services/debio-register-s1.test");
+    const r = await runDebioRegisterS1Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("debio-register-s1: " + f);
+    console.log(`  debio-register-s1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("debio-register-s1: unexpected error: " + String(err?.message || err));
   }
 });
 

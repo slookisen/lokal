@@ -41,6 +41,7 @@ import {
   FinnokoCompany,
 } from "./debio-finnoko-client";
 import { normaliseForMatch, nameSimilarity } from "./name-matcher";
+import { debioRegisterSyncEnabled } from "./debio-approval";
 
 const NAME_MATCH_THRESHOLD = 0.85;
 
@@ -63,6 +64,8 @@ export type SyncDebioVerificationsResult = {
   still_verified: number;   // rows where debio_verified was already 1 (timestamp refreshed)
   by_method: { domain: number; name: number };
   unmatched_finnoko_ids: string[]; // partner_sids that didn't match any agent
+  /** Matched agents skipped because the Debio register sync owns their status (row in agent_debio_status). */
+  skipped_register_owned: number;
   errors: string[];
 };
 
@@ -208,6 +211,7 @@ export async function syncDebioVerifications(
     still_verified: 0,
     by_method: { domain: 0, name: 0 },
     unmatched_finnoko_ids: [],
+    skipped_register_owned: 0,
     errors: [],
   };
 
@@ -226,6 +230,20 @@ export async function syncDebioVerifications(
   result.fetched = companies.length;
 
   const index = buildAgentIndex(db);
+
+  // Agents with a register status (økologi S1) are owned by the register
+  // sync: this finnoko sync must not set debio_verified = 1 for them (the
+  // register may have said karens / annet / ingen). Only while
+  // RFB_DEBIO_REGISTER_SYNC is on: flag off = rollback, finnoko owns every
+  // agent again as before S1.
+  let registerOwned = new Set<string>();
+  if (debioRegisterSyncEnabled()) try {
+    registerOwned = new Set(
+      (db.prepare("SELECT agent_id FROM agent_debio_status").all() as Array<{ agent_id: string }>).map((r) => r.agent_id),
+    );
+  } catch {
+    // Older schema without agent_debio_status: nothing is register-owned.
+  }
 
   // Track which agent ids we've already matched in THIS run — a finnoko
   // record with both a website and a name that aliases another farm
@@ -258,6 +276,10 @@ export async function syncDebioVerifications(
       continue;
     }
     matchedAgentIds.add(match.agent.id);
+    if (registerOwned.has(match.agent.id)) {
+      result.skipped_register_owned++;
+      continue;
+    }
 
     try {
       const wasVerified = match.agent.debio_verified === 1;

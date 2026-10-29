@@ -3926,6 +3926,93 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_debio_verified ON agents(debio_verified) WHERE debio_verified = 1`);
   } catch { /* partial index unsupported or already created */ }
 
+  // ─── Økologi S1 (A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-
+  // register-og-tekstrevisjon): status from Debio's full register ─────────
+  // Written by syncDebioRegister() (services/debio-register-sync.ts), daily
+  // behind RFB_DEBIO_REGISTER_SYNC or via POST /admin/debio/register-sync.
+  // No row = never checked against the register (finnoko-only, as before).
+  // agents.debio_verified stays the column every reader uses; the register
+  // sync derives it (= 1 iff debio_status 'okologisk' and the certificate
+  // valid). No Debio person names or streets are stored (S1.6): the review
+  // table keeps only sid / org.nr. / status / validity / product groups /
+  // postal code / city / method / score.
+  //
+  // One row per agent in a side table, NOT six new columns on `agents`: any
+  // wider `agents` row flips SQLite's index choice for the unordered public
+  // scans (idx_agents_geo → idx_agents_role), which reorders discover /
+  // find-match / lokal_discover answers (dyre-oppslag-tak,
+  // strukturerte-lister-tak, name-search-fts pin that order).
+  //   debio_status         : okologisk | karens | annet | ingen
+  //   debio_cert_valid_to  : YYYY-MM-DD of the certificate behind the status
+  //   debio_product_groups : JSON array of product-group codes (LBP, FIO …)
+  //   debio_sid            : Debio certificate sid
+  //   debio_checked_at     : ISO-8601 of the register run that set the row
+  //   debio_match_method   : org_nr | tag_org_nr | finnoko_domain | name_postal |
+  //                          street_postal | street_city | review (NULL = no match)
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_debio_status (
+        agent_id TEXT PRIMARY KEY,
+        debio_status TEXT NOT NULL CHECK (debio_status IN ('okologisk','karens','annet','ingen')),
+        debio_cert_valid_to TEXT,
+        debio_product_groups TEXT,
+        debio_sid TEXT,
+        debio_checked_at TEXT NOT NULL,
+        debio_match_method TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration agent_debio_status (økologi S1) failed:", err);
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS debio_register_sync_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_attempt_at TEXT,
+        last_success_at TEXT,
+        last_success_rows INTEGER,
+        last_reject_at TEXT,
+        last_reject_reason TEXT
+      );
+      CREATE TABLE IF NOT EXISTS debio_match_review (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        debio_sid TEXT,
+        org_nr TEXT,
+        status TEXT NOT NULL,
+        cert_valid_to TEXT,
+        product_groups TEXT,
+        postal_code TEXT,
+        city TEXT,
+        match_method TEXT NOT NULL,
+        score REAL,
+        reasons TEXT,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','approved','rejected')),
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        decided_at TEXT,
+        UNIQUE (agent_id, entity_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_debio_match_review_state ON debio_match_review(state);
+      CREATE TABLE IF NOT EXISTS debio_status_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        old_status TEXT,
+        new_status TEXT,
+        old_verified INTEGER,
+        new_verified INTEGER,
+        reason TEXT NOT NULL,
+        debio_sid TEXT,
+        source TEXT NOT NULL,
+        changed_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_debio_status_changes_agent ON debio_status_changes(agent_id);
+    `);
+  } catch (err) {
+    console.error("Migration debio register (økologi S1) failed:", err);
+  }
+
 
   // ─── Phase 0 (orch-pr-20260614-5): products catalog table ────────────────
   // Queryable product catalog seeded from agent_knowledge.products via
