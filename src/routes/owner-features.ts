@@ -35,7 +35,8 @@ import { publicStatsMinViews } from "../services/public-stats-threshold";
 import { slugify } from "../utils/slug";
 import { findOwnerFeature } from "../owner-features/registry";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
-import { isRowOrderableForRealOrder } from "../services/cart-service";
+import { countOrderableProducts } from "../services/cart-service";
+import { ownerOrderabilityPortalEnabled } from "../services/owner-orderability";
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
 import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
@@ -308,21 +309,15 @@ class OrderableRollback extends Error {
 /**
  * S2e (v2 principle 4, AC28): how many of the producer's items can be ordered
  * — rows that pass cart-service isRowOrderableForRealOrder() (the same check
- * the order flow uses). The check stands above the orders switch, so while
+ * the order flow uses), counted by cart-service countOrderableProducts().
+ * The check stands above the orders switch, so while
  * orders are off it is evaluated as if they were on: the opt-in column is set
  * inside a transaction that is always rolled back (nothing is kept, the same
  * pattern as the level preview). isEligibleForRealOrder() is not changed.
  */
 export function countOwnerOrderableItems(agentId: string, db: any = getDb(), now: Date = new Date()): number {
-  const count = (): number => {
-    const rows = db
-      .prepare(
-        `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
-           FROM products WHERE agent_id = ?`,
-      )
-      .all(agentId) as Array<Parameters<typeof isRowOrderableForRealOrder>[1]>;
-    return rows.filter((r) => isRowOrderableForRealOrder(db, r, now)).length;
-  };
+  // B1: the one count (cart-service countOrderableProducts = rows the gate accepts).
+  const count = (): number => countOrderableProducts(agentId, db, now);
   const optIn = readOrderNotificationsOptIn(db, agentId);
   if (optIn === null) return 0;
   if (optIn) return count();
@@ -342,6 +337,8 @@ export function countOwnerOrderableItems(agentId: string, db: any = getDb(), now
 /** Where the owner edits the items (the unified session's portal card, else /selger). */
 function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
+  // B1: with the orderability card on, it is the place to make items orderable.
+  if (ownerOrderabilityPortalEnabled()) return `/eier/${id}/portal#bestillbare-varer`;
   return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
 }
 

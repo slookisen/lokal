@@ -20,7 +20,7 @@ import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
-import { computeEffectiveAvailability } from "./supply-graph";
+import { computeEffectiveAvailability, producerStockExpiresAt } from "./supply-graph";
 import { knowledgeService } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { isBlocked } from "./blocklist-service";
@@ -384,6 +384,159 @@ function unconfirmedItemError(
   }
 }
 
+/** The product row fields the orderability check reads. */
+export interface OrderabilityRow {
+  agent_id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  price_nok: number | null;
+  availability: string;
+  availability_updated_at: string | null;
+  availability_source: string | null;
+}
+
+// ─── Orderability reasons (dev-request rfb-bestillinger, slice B1) ──────────
+// One shared core, evaluateOrderability(), behind BOTH the real-order gate
+// isRowOrderableForRealOrder() (stops at the first failing check, exactly the
+// checks and order it always had) and orderabilityReasons() (runs every check
+// and says why), so the owner portal and the gate cannot drift. No new rule:
+// the profile-level boolean is always isEligibleForRealOrder() itself; the
+// detailed profile reasons only explain a «no» it already gave.
+
+/** Stable reason codes. `level` tells whether the product or the whole profile blocks. */
+export type OrderabilityReasonCode =
+  | "category_label"          // a category name, not a product (I-S2)
+  | "alcohol"                 // F9
+  | "service"                 // F9 (services / experiences)
+  | "ban_check_failed"        // F9 classifier error (fail-closed)
+  | "stock_status_expired"    // producer-set «in stock» older than the staleness window
+  | "not_in_stock"            // effective availability is not 'in_stock'
+  | "not_confirmed_by_owner"  // availability_source is not producer-stated (skive 4)
+  | "orders_off"              // agents.order_notifications_opt_in != 1
+  | "owner_not_verified"      // agents.is_verified != 1
+  | "order_email_missing"     // no order / contact e-mail
+  | "order_email_suppressed"  // the recipient e-mail is blocklisted
+  | "producer_not_eligible";  // any other isEligibleForRealOrder() «no» (cross-check, umbrella, inactive, read error)
+
+export interface OrderabilityReason {
+  code: OrderabilityReasonCode;
+  level: "product" | "profile";
+  /** stock_status_expired: when the producer-set status stopped counting (ISO), null when never set. */
+  expired_at?: string | null;
+  /** not_in_stock: the effective availability. */
+  availability?: string;
+}
+
+export interface OrderabilityResult {
+  orderable: boolean;
+  reasons: OrderabilityReason[];
+  /** A producer_dashboard row: when its stock status expires / expired (ISO); else null. */
+  stock_expires_at: string | null;
+}
+
+/** Profile-level part: isEligibleForRealOrder() plus, when asked, why not. */
+export interface ProducerOrderability {
+  eligible: boolean;
+  reasons: OrderabilityReason[];
+}
+
+/** Explains a «no» from isEligibleForRealOrder(); never decides it. Never throws. */
+function explainNotEligible(db: any, agentId: string): OrderabilityReason[] {
+  const out: OrderabilityReason[] = [];
+  const profile = (code: OrderabilityReasonCode) => out.push({ code, level: "profile" });
+  try {
+    const row = db.prepare(`
+      SELECT a.is_verified AS is_verified, a.order_notifications_opt_in AS opt_in,
+             a.order_notification_email AS override_email, a.contact_email AS contact_email
+      FROM agents a WHERE a.id = ?
+    `).get(agentId) as { is_verified: number | null; opt_in: number | null; override_email: string | null; contact_email: string | null } | undefined;
+    if (row) {
+      if (row.opt_in !== 1) profile("orders_off");
+      if (row.is_verified !== 1) profile("owner_not_verified");
+      const email = (row.override_email || "").trim() || (row.contact_email || "").trim();
+      if (!email) profile("order_email_missing");
+      else if (isBlocked({ email }).blocked) profile("order_email_suppressed");
+    }
+  } catch { /* fall through to the generic reason */ }
+  if (out.length === 0) profile("producer_not_eligible");
+  return out;
+}
+
+/**
+ * The profile-level verdict, computed once per producer. `eligible` is
+ * isEligibleForRealOrder() (a gate that cannot be evaluated counts as «no»,
+ * as in the gate); with `explain` the reasons say why not.
+ */
+export function producerOrderability(db: any, agentId: string, explain = true): ProducerOrderability {
+  let eligible = false;
+  try {
+    eligible = isEligibleForRealOrder(agentId, db);
+  } catch {
+    eligible = false;
+  }
+  return { eligible, reasons: eligible || !explain ? [] : explainNotEligible(db, agentId) };
+}
+
+/**
+ * The shared core. Checks in the gate's order; `firstOnly` stops at the first
+ * failing check (the gate), otherwise every check runs (the reasons).
+ */
+function evaluateOrderability(
+  db: any,
+  row: OrderabilityRow,
+  now: Date,
+  firstOnly: boolean,
+  producer?: ProducerOrderability,
+): OrderabilityReason[] {
+  const reasons: OrderabilityReason[] = [];
+  if (isCategoryLabelRow(row)) {
+    reasons.push({ code: "category_label", level: "product" });
+    if (firstOnly) return reasons;
+  }
+  const banned = bannedItemError(db, row);
+  if (banned) {
+    reasons.push({ code: banned.kind === "check_failed" ? "ban_check_failed" : banned.kind, level: "product" });
+    if (firstOnly) return reasons;
+  }
+  const effective = computeEffectiveAvailability(row.availability, row.availability_updated_at, row.availability_source ?? "", now);
+  if (effective !== "in_stock") {
+    if (row.availability === "in_stock") {
+      // Only a producer_dashboard row can degrade (supply-graph.ts).
+      const exp = producerStockExpiresAt(row.availability_updated_at);
+      reasons.push({ code: "stock_status_expired", level: "product", expired_at: exp ? exp.toISOString() : null });
+    } else {
+      reasons.push({ code: "not_in_stock", level: "product", availability: effective });
+    }
+    if (firstOnly) return reasons;
+  }
+  if (!isProducerStatedSource(row.availability_source)) {
+    reasons.push({ code: "not_confirmed_by_owner", level: "product" });
+    if (firstOnly) return reasons;
+  }
+  const p = producer ?? producerOrderability(db, row.agent_id, !firstOnly);
+  if (!p.eligible) reasons.push(...(p.reasons.length ? p.reasons : [{ code: "producer_not_eligible" as const, level: "profile" as const }]));
+  return reasons;
+}
+
+/**
+ * Why a product row can or cannot become a line of a REAL order now — the
+ * owner portal's view of isRowOrderableForRealOrder(). `orderable` is always
+ * exactly what the gate answers for the same (row, now) (tested over one
+ * fixture row per reason). Pass `producer` (producerOrderability()) to
+ * evaluate many rows of one producer with one profile read.
+ */
+export function orderabilityReasons(
+  db: any,
+  row: OrderabilityRow,
+  now: Date = new Date(),
+  producer?: ProducerOrderability,
+): OrderabilityResult {
+  const reasons = evaluateOrderability(db, row, now, false, producer);
+  const exp = row.availability_source === "producer_dashboard" ? producerStockExpiresAt(row.availability_updated_at) : null;
+  return { orderable: reasons.length === 0, reasons, stock_expires_at: exp ? exp.toISOString() : null };
+}
+
 /**
  * Skive 3 (bestillingsknapp, dev-request
  * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): whether a product
@@ -396,30 +549,29 @@ function unconfirmedItemError(
  *   - a producer-stated row (skive 4) of a producer who passes
  *     isEligibleForRealOrder() (skive 2; a gate that cannot be evaluated
  *     counts as «no», as in catalog-offers.ts compareOffersForProducer).
+ * B1: the checks live in evaluateOrderability(), shared with
+ * orderabilityReasons(); this stops at the first failing one, as before.
  */
 export function isRowOrderableForRealOrder(
   db: any,
-  row: {
-    agent_id: string;
-    name: string;
-    description?: string | null;
-    category?: string | null;
-    price_nok: number | null;
-    availability: string;
-    availability_updated_at: string | null;
-    availability_source: string | null;
-  },
+  row: OrderabilityRow,
   now: Date = new Date(),
 ): boolean {
-  if (isCategoryLabelRow(row)) return false;
-  if (bannedItemError(db, row)) return false;
-  if (computeEffectiveAvailability(row.availability, row.availability_updated_at, row.availability_source ?? "", now) !== "in_stock") return false;
-  if (!isProducerStatedSource(row.availability_source)) return false;
-  try {
-    return isEligibleForRealOrder(row.agent_id, db);
-  } catch {
-    return false;
-  }
+  return evaluateOrderability(db, row, now, true).length === 0;
+}
+
+/**
+ * B1 (AC2): how many of the producer's product rows isRowOrderableForRealOrder()
+ * accepts right now — the number «Mine valg» and the owner portal show.
+ */
+export function countOrderableProducts(agentId: string, db: any = _cartTestDb ?? getDb(), now: Date = new Date()): number {
+  const rows = db
+    .prepare(
+      `SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
+         FROM products WHERE agent_id = ?`,
+    )
+    .all(agentId) as OrderabilityRow[];
+  return rows.filter((r) => isRowOrderableForRealOrder(db, r, now)).length;
 }
 
 // ─── Add / upsert item ───────────────────────────────────────────────────────

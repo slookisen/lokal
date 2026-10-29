@@ -16,6 +16,7 @@ import crypto from "crypto";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
+import { getSupplyGraphStaleDays } from "../services/supply-graph";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
@@ -23,6 +24,11 @@ import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
+import {
+  ownerOrderabilityPortalEnabled, listOwnerProductOrderability, confirmOwnerProductInStock,
+  confirmAllOwnerProductsInStock, addOwnerProduct, orderabilityReasonTextNb, formatOwnerDate,
+  OWNER_PRODUCT_FIELD_TEXT_NB, type OwnerOrderabilityOverview, type OwnerProductField,
+} from "../services/owner-orderability";
 
 const router = Router();
 
@@ -1680,6 +1686,11 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = oa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(oa.text)}</div>`;
+    } else if (ownerOrderabilityPortalEnabled() && ownerOrderabilityAlert(status, req.query.felt)) {
+      const va = ownerOrderabilityAlert(status, req.query.felt)!;
+      alert = va.ok
+        ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(va.text)}</div>`
+        : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(va.text)}</div>`;
     } else if (paymentPortalAlert(status)) {
       const pa = paymentPortalAlert(status)!;
       alert = pa.ok
@@ -1725,6 +1736,20 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
           orderEmailHtml = ownerOrderEmailSectionHtml(agentId, currentOrderRecipient(agentId), pendingOrderEmailChange(agentId)?.new_email ?? null);
         }
       } catch { orderEmailHtml = ""; }
+    }
+
+    // B1: «Varer som kan bestilles» — only with OWNER_ORDERABILITY_PORTAL_ENABLED
+    // on and a verified owner (flag off = the portal is byte-identical to before).
+    let orderabilityCardHtml = "";
+    if (ownerOrderabilityPortalEnabled()) {
+      try {
+        if (isVerifiedOwner(agentId, session)) {
+          orderabilityCardHtml = ownerOrderabilityCardHtml(agentId, listOwnerProductOrderability(agentId, db));
+        }
+      } catch (e) {
+        console.error("[owner-portal] orderability card failed:", e instanceof Error ? e.message : "error");
+        orderabilityCardHtml = "";
+      }
     }
 
     const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
@@ -1821,7 +1846,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
+      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -2304,6 +2329,172 @@ export function ownerSelgerCardHtml(agentId: string): string {
         </form>
       </div>`;
 }
+
+// ─────────────────────────────────────────────────────────────────
+// B1 (dev-request «RFB bestillinger fra start til slutt for eier»):
+// «Varer som kan bestilles» card + three form POSTs, behind
+// OWNER_ORDERABILITY_PORTAL_ENABLED (default off; off → no card, routes 404).
+//   POST /eier/:agentId/varer/:productId/bekreft  — «Bekreft at varen er på lager»
+//   POST /eier/:agentId/varer/bekreft-alle        — «Bekreft alle på lager»
+//   POST /eier/:agentId/varer/ny                  — «Legg til vare»
+// Owner checks as POST /eier/:id/selger (it also hands out product editing):
+// valid owner session (none → login), Origin check (cross-site → 403),
+// always the strict isVerifiedOwner predicate. Writes: services/owner-orderability.ts
+// (stock through supply-graph setProducerAvailabilityByProductId, the
+// existing write path; parameterized SQL; agent_knowledge_audit row).
+// ─────────────────────────────────────────────────────────────────
+
+const ORDERABILITY_ANCHOR = "bestillbare-varer";
+
+/** status=… after a B1 POST → the portal alert. null = not a B1 status. */
+export function ownerOrderabilityAlert(status: string, rawFields: unknown): { ok: boolean; text: string } | null {
+  switch (status) {
+    case "vare_bekreftet": return { ok: true, text: "Varen er bekreftet på lager." };
+    case "varer_bekreftet": return { ok: true, text: "Varene er bekreftet på lager." };
+    case "ingen_varer_bekreftet": return { ok: true, text: "Ingen varer å bekrefte." };
+    case "vare_lagt_til": return { ok: true, text: "Varen er lagt til og bekreftet på lager." };
+    case "vare_finnes": return { ok: false, text: "Du har allerede en vare med det navnet. Bekreft den i listen i stedet." };
+    case "vare_kan_ikke_bekreftes": return { ok: false, text: "Denne varen kan ikke bestilles her, så den kan ikke bekreftes." };
+    case "vare_feil": return { ok: false, text: "Klarte ikke å lagre. Prøv igjen." };
+    case "vare_ugyldig": {
+      const fields = String(typeof rawFields === "string" ? rawFields : "")
+        .split(",")
+        .filter((f): f is OwnerProductField => Object.prototype.hasOwnProperty.call(OWNER_PRODUCT_FIELD_TEXT_NB, f));
+      const detail = fields.map((f) => OWNER_PRODUCT_FIELD_TEXT_NB[f]).join(" ");
+      return { ok: false, text: `Varen ble ikke lagt til. ${detail || "Sjekk feltene og prøv igjen."}` };
+    }
+    default: return null;
+  }
+}
+
+function formatOwnerPrice(price: number | null, unit: string | null): string {
+  if (price == null) return "Ingen pris";
+  const p = Number.isInteger(price) ? String(price) : price.toFixed(2).replace(".", ",");
+  return `kr ${p}${unit ? ` / ${unit}` : ""}`;
+}
+
+/** The B1 card. Pure rendering of listOwnerProductOrderability(). */
+export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview): string {
+  const id = encodeURIComponent(agentId);
+  const total = o.products.length;
+  const profileHtml = o.profile_reasons.length
+    ? `<div class="ep-alert ep-alert-error" role="note" data-orderability-profile="blocked">Ingen varer kan bestilles før dette er ordnet:<ul>${o.profile_reasons.map((r) => `<li>${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul></div>`
+    : "";
+  const rows = o.products.map((p) => {
+    const status = p.orderable
+      ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${p.stock_expires_at ? ` <span class="ep-audit-meta">Lagerstatus gjelder til ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>` : ""}`
+      : `<strong class="ep-orderable-no">Kan ikke bestilles</strong><ul class="ep-orderable-reasons">${p.reasons.map((r) => `<li data-reason="${escapeHtml(r.code)}">${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul>`;
+    const confirm = p.confirmable
+      ? `<form method="post" action="/eier/${id}/varer/${encodeURIComponent(p.id)}/bekreft" style="margin:6px 0 0;">
+            <button type="submit" class="ep-btn ep-btn-secondary">Bekreft at varen er på lager</button>
+          </form>`
+      : "";
+    return `<li class="ep-audit-item" data-product-id="${escapeHtml(p.id)}" data-orderable="${p.orderable ? "1" : "0"}">
+          <div><strong>${escapeHtml(p.name)}</strong> <span class="ep-audit-meta">${escapeHtml(formatOwnerPrice(p.price_nok, p.unit))}</span></div>
+          <div>${status}</div>
+          ${confirm}
+        </li>`;
+  }).join("");
+  const list = total
+    ? `<ul class="ep-audit-list">${rows}</ul>
+        <form method="post" action="/eier/${id}/varer/bekreft-alle" style="margin:12px 0 0;">
+          <button type="submit" class="ep-btn ep-btn-primary">Bekreft alle på lager</button>
+        </form>`
+    : `<p>Du har ingen varer ennå. Legg til en vare under.</p>`;
+  const field = (name: string, label: string, type = "text", extra = "") =>
+    `<div class="ep-field"><label for="ny_${name}">${escapeHtml(label)}</label><input id="ny_${name}" name="${name}" type="${type}" ${extra}></div>`;
+  return `<div class="ep-card" id="${ORDERABILITY_ANCHOR}">
+        <h2>Varer som kan bestilles</h2>
+        <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. En bekreftelse på lager gjelder i ${getSupplyGraphStaleDays()} dager.</p>
+        ${profileHtml}
+        ${list}
+        <h3 style="margin-top:20px;">Legg til vare</h3>
+        <form method="post" action="/eier/${id}/varer/ny">
+          ${field("name", "Navn", "text", 'required maxlength="120"')}
+          ${field("price", "Pris (kr)", "text", 'required inputmode="decimal"')}
+          ${field("unit", "Enhet (f.eks. kg, stk)", "text", 'maxlength="30"')}
+          <div class="ep-field"><label for="ny_ingredients">Ingredienser (valgfritt)</label><textarea id="ny_ingredients" name="ingredients" maxlength="1500"></textarea></div>
+          ${field("allergens", "Allergener (valgfritt, skill med komma)", "text")}
+          ${field("net_weight", "Nettovekt (valgfritt, f.eks. 250 g)", "text", 'maxlength="20"')}
+          <div class="ep-form-actions"><button type="submit" class="ep-btn ep-btn-primary">Legg til vare</button></div>
+        </form>
+      </div>`;
+}
+
+type OwnerOrderabilityAuth = { ok: true; agentId: string; email: string | null } | { ok: false };
+
+/** Flag, session, Origin and strict ownership for the B1 POSTs; answers itself on failure. */
+function ownerOrderabilityAuth(req: Request, res: Response): OwnerOrderabilityAuth {
+  const agentId = String((req.params as any).agentId || "");
+  if (!ownerOrderabilityPortalEnabled()) {
+    res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
+    return { ok: false };
+  }
+  const session = verifyOwnerSession(req);
+  if (!session.valid) {
+    res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    return { ok: false };
+  }
+  if (crossSiteRequest(req)) {
+    res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+    return { ok: false };
+  }
+  if (!isVerifiedOwner(agentId, session)) {
+    if (session.agentId === agentId) res.status(403).send(ownerNotVerifiedPage(agentId));
+    else res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    return { ok: false };
+  }
+  return { ok: true, agentId, email: ownerSessionEmail(session.token) };
+}
+
+function orderabilityBack(agentId: string, status: string, extra = ""): string {
+  return `/eier/${encodeURIComponent(agentId)}/portal?status=${status}${extra}#${ORDERABILITY_ANCHOR}`;
+}
+
+router.post("/eier/:agentId/varer/bekreft-alle", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const auth = ownerOrderabilityAuth(req, res);
+  if (!auth.ok) return;
+  try {
+    const r = confirmAllOwnerProductsInStock(auth.agentId, { actorEmail: auth.email });
+    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed > 0 ? "varer_bekreftet" : "ingen_varer_bekreftet"));
+  } catch (err) {
+    console.error("[owner-portal] POST varer/bekreft-alle error:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+  }
+});
+
+router.post("/eier/:agentId/varer/ny", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const auth = ownerOrderabilityAuth(req, res);
+  if (!auth.ok) return;
+  try {
+    const b = (req.body || {}) as Record<string, unknown>;
+    const r = addOwnerProduct(auth.agentId, {
+      name: b.name, price: b.price, unit: b.unit, ingredients: b.ingredients, allergens: b.allergens, net_weight: b.net_weight,
+    }, { actorEmail: auth.email });
+    if (r.ok) return res.redirect(303, orderabilityBack(auth.agentId, "vare_lagt_til"));
+    if (r.error === "exists") return res.redirect(303, orderabilityBack(auth.agentId, "vare_finnes"));
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_ugyldig", `&felt=${encodeURIComponent(r.fields.join(","))}`));
+  } catch (err) {
+    console.error("[owner-portal] POST varer/ny error:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+  }
+});
+
+router.post("/eier/:agentId/varer/:productId/bekreft", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const auth = ownerOrderabilityAuth(req, res);
+  if (!auth.ok) return;
+  try {
+    const r = confirmOwnerProductInStock(auth.agentId, String((req.params as any).productId || ""), { actorEmail: auth.email });
+    if (r.ok) return res.redirect(303, orderabilityBack(auth.agentId, "vare_bekreftet"));
+    if (r.error === "not_found") {
+      return res.status(404).send(portalShell("Fant ikke varen", `<div class="ep-card"><h1>Fant ikke varen</h1><p><a href="/eier/${encodeURIComponent(auth.agentId)}/portal#${ORDERABILITY_ANCHOR}">Tilbake til varene</a></p></div>`));
+    }
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_kan_ikke_bekreftes"));
+  } catch (err) {
+    console.error("[owner-portal] POST varer/:productId/bekreft error:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
