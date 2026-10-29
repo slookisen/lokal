@@ -37,6 +37,7 @@ import Database from "better-sqlite3";
 import * as initMod from "../database/init";
 import { hasInternalNote, stripInternalNotes, isJunkDescription } from "../services/description-quality";
 import { setEnrichmentWritePause } from "../services/enrichment-write-pause";
+import { runProductCatalogSync } from "../services/product-catalog-sync";
 
 export interface TestSummary {
   passed: number;
@@ -450,6 +451,20 @@ export function runAdminAgentsContentQualityTests(opts: { log?: boolean } = {}):
         insertKnowledge.run("p-noorganic", JSON.stringify([EGG]), "[]", "[]", "{}");
         insertAgent.run("p-badjson", "Ødelagt JSON AS", NORMAL_DESC, "k-p-bad", null, "[]");
         insertKnowledge.run("p-badjson", "{not json", "[]", "[]", "{}");
+        // Catalog cases (reviewer fix-up): rename in place, merge-retire
+        // (delete), merge-retire with a cart reference (out_of_stock).
+        insertAgent.run("p-cat", "Katalog AS", NORMAL_DESC, "k-p-cat", null, "[]");
+        insertKnowledge.run("p-cat", JSON.stringify([{ name: "Økologisk honning", price: "120" }, { name: "Egg", price: "60" }]), "[]", "[]", "{}");
+        insertAgent.run("p-cat-m", "Katalog Flett AS", NORMAL_DESC, "k-p-catm", null, "[]");
+        insertKnowledge.run("p-cat-m", JSON.stringify([{ name: "Økologisk lam", price: "300" }, { name: "Lam", price: "280" }]), "[]", "[]", "{}");
+        insertAgent.run("p-cat-r", "Katalog Kurv AS", NORMAL_DESC, "k-p-catr", null, "[]");
+        insertKnowledge.run("p-cat-r", JSON.stringify([{ name: "Økologisk ost", price: "90" }, { name: "Gårdsost", price: "95" }]), "[]", "[]", "{}");
+        insertAgent.run("p-lamlist", "Lammeliste AS", NORMAL_DESC, "k-p-laml", null, "[]");
+        insertKnowledge.run("p-lamlist", "[]", JSON.stringify(["Lam", "Lammekjøtt"]), "[]", "{}");
+        assertTrue(runProductCatalogSync(db as any).success, "p-cat-00: initial catalog sync ok");
+        const catRows = (id: string) =>
+          db.prepare(`SELECT id, name, name_norm, availability FROM products WHERE agent_id = ? ORDER BY name_norm`).all(id) as any[];
+        const catRow = (id: string, norm: string) => catRows(id).find((x: any) => x.name_norm === norm);
 
         delete require.cache[require.resolve("./admin-agents-content-correction")];
         const routeMod = require("./admin-agents-content-correction");
@@ -469,7 +484,8 @@ export function runAdminAgentsContentQualityTests(opts: { log?: boolean } = {}):
           (body?.results ?? []).find((r: any) => r.agent_id === id && (!field || r.field === field));
         const REASON = "S2w test: produktnavn/lister";
         const snapshot = () => JSON.stringify(db.prepare(`SELECT agent_id, products, specialties, certifications FROM agent_knowledge ORDER BY agent_id`).all()) +
-          JSON.stringify(db.prepare(`SELECT id, tags FROM agents ORDER BY id`).all());
+          JSON.stringify(db.prepare(`SELECT id, tags FROM agents ORDER BY id`).all()) +
+          JSON.stringify(db.prepare(`SELECT * FROM products ORDER BY id`).all());
 
         // ── Validation ──
         let r = await post({
@@ -521,8 +537,13 @@ export function runAdminAgentsContentQualityTests(opts: { log?: boolean } = {}):
             { agent_id: "p-twin", field: "product_name", old_name: "Honning", text: "Lynghonning" },
             { agent_id: "p-main", field: "product_name", old_name: "Finnes ikke", text: "X" },
             { agent_id: "p-badjson", field: "products_organic_flag" },
+            { agent_id: "p-cat", field: "product_name", old_name: "Økologisk honning", text: "Honning" },
+            { agent_id: "p-cat-m", field: "product_name", old_name: "Økologisk lam", text: "Lam" },
           ],
         });
+        assertEq(res(r.body, "p-cat")?.catalog?.action, "rename_in_place", "p-cat-01: dry-run reports the catalog rename it would make");
+        assertEq(res(r.body, "p-cat")?.catalog?.applied, undefined, "p-cat-02: dry-run catalog effect is not marked applied");
+        assertEq(res(r.body, "p-cat-m")?.catalog?.action, "retire_delete", "p-cat-03: dry-run merge reports the old catalog row would be retired");
         assertEq(r.body?.dry_run, true, "p-07: dry-run by default");
         assertEq(res(r.body, "p-main", "product_name")?.outcome, "would_write", "p-08: dry-run rename would_write");
         assertEq(res(r.body, "p-main", "product_name")?.old_value_preview, "Lammekjøt", "p-09: dry-run previews old_name");
@@ -582,6 +603,58 @@ export function runAdminAgentsContentQualityTests(opts: { log?: boolean } = {}):
         assertEq(res(r.body, "p-merge-b")?.merge?.kept, "existing_row", "p-40: tie -> the row already named `text` is kept");
         assertEq(productsOf("p-merge-b"), [{ name: "Lammekjøt", category: "meat" }], "p-41: tie merge leaves one product");
 
+        // ── Catalog: rename in place ──
+        const honId = catRow("p-cat", "økologisk honning")?.id;
+        assertTrue(!!honId, "p-cat-10: fixture has a catalog row for the old name");
+        r = await post({ reason: REASON, items: [{ agent_id: "p-cat", field: "product_name", old_name: "Økologisk honning", text: "Honning" }] }, apply);
+        assertEq(res(r.body, "p-cat")?.outcome, "written", "p-cat-11: rename written");
+        assertEq(res(r.body, "p-cat")?.catalog?.action, "rename_in_place", "p-cat-12: catalog row renamed in place");
+        assertEq(res(r.body, "p-cat")?.catalog?.applied, true, "p-cat-13: catalog effect applied");
+        assertEq(catRow("p-cat", "honning")?.id, honId, "p-cat-14: same products.id, new name_norm");
+        assertEq(catRow("p-cat", "honning")?.name, "Honning", "p-cat-15: catalog name updated");
+        assertEq(catRow("p-cat", "økologisk honning"), undefined, "p-cat-16: no catalog row left under the old name");
+        assertTrue((auditFor("p-cat")[0]?.notes ?? "").includes("[catalog: ") && (auditFor("p-cat")[0]?.notes ?? "").includes("Økologisk honning"),
+          "p-cat-17: audit notes carry the catalog effect incl. the old row (rollback)");
+        assertTrue(runProductCatalogSync(db as any).success, "p-cat-18: re-sync ok");
+        assertEq(catRows("p-cat").map((x: any) => [x.name, x.availability]), [["Egg", "in_stock"], ["Honning", "in_stock"]],
+          "p-cat-19: after re-sync the old name is not re-created; exactly one listable honning row");
+        assertEq(catRow("p-cat", "honning")?.id, honId, "p-cat-20: re-sync updated the same row");
+
+        // ── Catalog: merge retires the old row (no references -> delete) ──
+        const lamId = catRow("p-cat-m", "lam")?.id;
+        r = await post({ reason: REASON, items: [{ agent_id: "p-cat-m", field: "product_name", old_name: "Økologisk lam", text: "Lam" }] }, apply);
+        assertEq(res(r.body, "p-cat-m")?.outcome, "merged", "p-cat-21: merge applied");
+        assertEq(res(r.body, "p-cat-m")?.catalog?.action, "retire_delete", "p-cat-22: unreferenced old catalog row deleted");
+        assertEq(res(r.body, "p-cat-m")?.catalog?.existing_product_id, lamId, "p-cat-23: reports the surviving catalog row");
+        runProductCatalogSync(db as any);
+        assertEq(catRows("p-cat-m").map((x: any) => [x.id, x.name, x.availability]), [[lamId, "Lam", "in_stock"]],
+          "p-cat-24: after merge + re-sync exactly one listable row, the surviving one");
+
+        // ── Catalog: merge with a cart reference -> out_of_stock, row kept ──
+        const oldOstId = catRow("p-cat-r", "økologisk ost")?.id;
+        db.prepare(`INSERT INTO carts (id, buyer_ref) VALUES ('cart-cat', 'buyer-cat')`).run();
+        db.prepare(`INSERT INTO cart_items (id, cart_id, product_id, agent_id, qty) VALUES ('ci-cat', 'cart-cat', ?, 'p-cat-r', 1)`).run(oldOstId);
+        // Lower-case target: equal to "Gårdsost" under the catalog normalisation -> merge.
+        r = await post({ reason: REASON, items: [{ agent_id: "p-cat-r", field: "product_name", old_name: "Økologisk ost", text: "gårdsost" }] }, apply);
+        assertEq(res(r.body, "p-cat-r")?.outcome, "merged", "p-cat-25: case-insensitive duplicate name is a merge");
+        assertEq(productsOf("p-cat-r").map((x: any) => x.name), ["gårdsost"], "p-cat-26: one product left, named `text`");
+        assertEq(res(r.body, "p-cat-r")?.catalog?.action, "retire_out_of_stock", "p-cat-27: referenced old catalog row is retired as out_of_stock");
+        assertEq(res(r.body, "p-cat-r")?.catalog?.references?.cart_items, 1, "p-cat-28: reports the cart reference");
+        runProductCatalogSync(db as any);
+        assertEq(catRow("p-cat-r", "økologisk ost")?.availability, "out_of_stock", "p-cat-29: re-sync leaves the retired row out_of_stock");
+        assertEq(catRows("p-cat-r").filter((x: any) => x.availability === "in_stock").map((x: any) => x.name_norm), ["gårdsost"],
+          "p-cat-30: exactly one listable row after merge + re-sync");
+
+        // ── Agent without catalog rows ──
+        // Inserted after every sync above -> this agent has no catalog rows at all.
+        insertAgent.run("p-nocat", "Uten Katalog AS", NORMAL_DESC, "k-p-nocat", null, "[]");
+        insertKnowledge.run("p-nocat", JSON.stringify([{ name: "Økologisk mel", price: "40" }]), "[]", "[]", "{}");
+        assertEq(catRows("p-nocat").length, 0, "p-cat-30b: fixture has no catalog rows");
+        r = await post({ reason: REASON, items: [{ agent_id: "p-nocat", field: "product_name", old_name: "Økologisk mel", text: "Mel" }] }, apply);
+        assertEq(res(r.body, "p-nocat")?.outcome, "written", "p-cat-31: rename works without catalog rows");
+        assertEq(res(r.body, "p-nocat")?.catalog?.action, "none", "p-cat-32: catalog effect none");
+        assertEq(productsOf("p-nocat")[0]?.name, "Mel", "p-cat-33: knowledge renamed");
+
         // ── products_organic_flag ──
         r = await post({ reason: REASON, items: [{ agent_id: "p-main", field: "products_organic_flag" }] }, apply);
         assertEq(res(r.body, "p-main")?.outcome, "written", "p-42: organic flag written");
@@ -615,6 +688,11 @@ export function runAdminAgentsContentQualityTests(opts: { log?: boolean } = {}):
         assertEq(res(r.body, "p-main")?.outcome, "skipped_unchanged", "p-55: nothing to remove -> skipped_unchanged");
         assertEq(res(r.body, "p-main")?.not_found_elements, ["økologisk", "nope"], "p-56: …with every element listed as not found");
         assertEq(auditFor("p-main").length, auditN, "p-57: …and no audit row");
+
+        // ── Exact-equality list removal: "Lam" must not take "Lammekjøtt" ──
+        r = await post({ reason: REASON, items: [{ agent_id: "p-lamlist", field: "specialties", remove: ["Lam"] }] }, apply);
+        assertEq(res(r.body, "p-lamlist")?.removed, ["Lam"], "p-59: exact element removed");
+        assertEq(kRow("p-lamlist").specialties, JSON.stringify(["Lammekjøtt"]), "p-60: \"Lammekjøtt\" kept (exact match, not substring)");
 
         // ── Enrichment write-pause gate fails closed for new fields too ──
         setEnrichmentWritePause(db as any, { vertical: "rfb", enabled: true, reason: "test-pause" }, "test-actor");

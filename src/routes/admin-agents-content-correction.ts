@@ -41,7 +41,8 @@
 //   { agent_id, field: "product_name", old_name, text }  — renames the ONE
 //       agent_knowledge.products entry whose name === old_name (0 or >1
 //       matches -> invalid_item); every other product field kept. If `text`
-//       already names another product: would_merge / merged — the entry with
+//       already names another product (exact, or equal after the catalog's
+//       case/whitespace normalisation): would_merge / merged — the entry with
 //       more populated fields is kept (tie: the one already named `text`),
 //       named `text`, the other dropped; reported in `merge` + audit notes.
 //   { agent_id, field: "products_organic_flag" }  — organic=false on every
@@ -53,15 +54,39 @@
 // Same locks for all: owner lock -> skipped_claimed; curated_fields key
 // (products / the list name) -> skipped_curated; nothing to change ->
 // skipped_unchanged (no audit). One audit row per applied change, field_name
-// = the stored column, full old/new JSON value. The `products` catalog table
-// is NOT touched here: the catalog sync upserts the new name from
-// agent_knowledge.products but never deletes the old-name catalog row.
+// = the stored column, full old/new JSON value.
+//
+// ── product_name and the `products` catalog table ───────────────────────
+// The catalog (`products`, UNIQUE(agent_id, name_norm)) is filled from
+// agent_knowledge.products by product-catalog-sync.ts, which only upserts.
+// Left alone, a renamed product's old-name row would stay listed forever
+// next to the new one (the false «økologisk» name in /catalog/feed, offers,
+// lokal_search, cart add). So a rename also fixes the catalog, in the same
+// per-row transaction, located by the sync's own key
+// (normalizeName(parseProductPrice(entry).cleanName)):
+//   - no row for the old key            -> catalog.action "none";
+//   - no row for the new key yet        -> "rename_in_place": the old row's
+//       name/name_norm become the new one; products.id is kept, so
+//       cart_items.product_id / cart_wishes.chosen_product_id still point
+//       at it, and the next sync updates that same row;
+//   - a row for the new key exists (merge, or a stale catalog row), or the
+//     new name has no catalog key       -> the old row is retired:
+//       "retire_delete" when nothing references its id (no FK points at
+//       products; order_items carry name snapshots), else
+//       "retire_out_of_stock" (availability='out_of_stock', which the feeds
+//       and cart/orderability already exclude; kept so a cart reference
+//       does not dangle).
+// The effect is reported per item (`catalog`, also on dry-run, which writes
+// nothing) and appended to the audit notes with the full old catalog row, so
+// it can be rolled back.
 // Max 50 items per call — this is a targeted lever, not a sweep.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { hasInternalNote, looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
+import { isProductHeader, isProductNoise, parseProductPrice } from "../services/knowledge-service";
+import { normalizeName } from "../services/product-catalog-sync";
 import {
   enrichmentWritePauseBlockForAgents,
   ENRICHMENT_WRITE_PAUSE_HTTP_STATUS,
@@ -133,6 +158,23 @@ interface MergeInfo {
   dropped_product: unknown;
 }
 
+/** What a product_name item does (or would do) to the `products` catalog. */
+interface CatalogEffect {
+  action: "none" | "rename_in_place" | "retire_delete" | "retire_out_of_stock";
+  applied?: boolean;
+  product_id?: string;
+  old_name?: string;
+  new_name?: string;
+  old_name_norm?: string;
+  new_name_norm?: string;
+  /** The catalog row already carrying the new name (retire cases). */
+  existing_product_id?: string;
+  references?: { cart_items: number; cart_wishes: number };
+  /** Full old catalog row — for rollback (retire / rename). */
+  old_row?: Record<string, unknown>;
+  detail?: string;
+}
+
 interface ResultItem {
   agent_id: string;
   field?: Field;
@@ -145,6 +187,7 @@ interface ResultItem {
   removed?: string[];
   not_found_elements?: string[];
   changed_count?: number;
+  catalog?: CatalogEffect;
 }
 
 interface LockSnapshot {
@@ -325,6 +368,65 @@ interface Plan {
   removed?: string[];
   not_found_elements?: string[];
   changed_count?: number;
+  /** product_name: the stored entry being renamed (before the rename). */
+  renamedEntry?: Record<string, unknown>;
+}
+
+/**
+ * The catalog key the sync gives one product entry — the same steps as
+ * runProductCatalogSync (header/noise skipped, parseProductPrice cleanName,
+ * normalizeName). "" when the sync would not list it.
+ */
+function catalogKeyOf(entry: Record<string, unknown>): { key: string; cleanName: string } {
+  const raw = typeof entry.name === "string" ? entry.name.trim() : "";
+  if (!raw || isProductHeader(raw) || isProductNoise(raw)) return { key: "", cleanName: "" };
+  const { cleanName } = parseProductPrice(entry as any);
+  if (!cleanName) return { key: "", cleanName: "" };
+  return { key: normalizeName(cleanName), cleanName };
+}
+
+/** Read-only: what renaming `entry` to `newName` does to the catalog. */
+function planCatalog(db: ReturnType<typeof getDb>, agentId: string, entry: Record<string, unknown>, newName: string): CatalogEffect {
+  const oldK = catalogKeyOf(entry);
+  if (!oldK.key) return { action: "none", detail: "old product name has no catalog key" };
+  const oldRow = db.prepare(`SELECT * FROM products WHERE agent_id = ? AND name_norm = ?`).get(agentId, oldK.key) as
+    | Record<string, unknown>
+    | undefined;
+  if (!oldRow) return { action: "none", old_name_norm: oldK.key, detail: "no catalog row for the old name" };
+  const newK = catalogKeyOf({ ...entry, name: newName });
+  const base: CatalogEffect = {
+    action: "none",
+    product_id: oldRow.id as string,
+    old_name: oldRow.name as string,
+    new_name: newK.cleanName || undefined,
+    old_name_norm: oldK.key,
+    new_name_norm: newK.key || undefined,
+    old_row: oldRow,
+  };
+  const existing = newK.key && newK.key !== oldK.key
+    ? (db.prepare(`SELECT id FROM products WHERE agent_id = ? AND name_norm = ?`).get(agentId, newK.key) as { id: string } | undefined)
+    : undefined;
+  if (newK.key && !existing) {
+    if (newK.key === oldK.key && oldRow.name === newK.cleanName) return { ...base, detail: "catalog row already carries the new name" };
+    return { ...base, action: "rename_in_place" };
+  }
+  const refs = {
+    cart_items: (db.prepare(`SELECT COUNT(*) AS n FROM cart_items WHERE product_id = ?`).get(oldRow.id) as { n: number }).n,
+    cart_wishes: (db.prepare(`SELECT COUNT(*) AS n FROM cart_wishes WHERE chosen_product_id = ?`).get(oldRow.id) as { n: number }).n,
+  };
+  const retired: CatalogEffect = { ...base, existing_product_id: existing?.id, references: refs };
+  if (!newK.key) retired.detail = "new name has no catalog key (the sync would not list it)";
+  return { ...retired, action: refs.cart_items + refs.cart_wishes > 0 ? "retire_out_of_stock" : "retire_delete" };
+}
+
+function applyCatalog(db: ReturnType<typeof getDb>, c: CatalogEffect): void {
+  if (c.action === "rename_in_place") {
+    db.prepare(`UPDATE products SET name = ?, name_norm = ?, updated_at = datetime('now') WHERE id = ?`).run(c.new_name, c.new_name_norm, c.product_id);
+  } else if (c.action === "retire_delete") {
+    db.prepare(`DELETE FROM products WHERE id = ?`).run(c.product_id);
+  } else if (c.action === "retire_out_of_stock") {
+    db.prepare(`UPDATE products SET availability = 'out_of_stock', updated_at = datetime('now') WHERE id = ?`).run(c.product_id);
+  }
 }
 
 function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
@@ -348,18 +450,24 @@ function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
   if (!arr) return { ...base, outcome: "skipped_malformed_json", detail: `stored ${column} is not a JSON array` };
 
   if (item.field === "product_name") {
-    const sel = { ...base, oldPreview: item.old_name, newPreview: item.text };
+    const sel: Plan = { ...base, oldPreview: item.old_name, newPreview: item.text };
     const matches = arr.map((p, i) => (isProductObj(p) && p.name === item.old_name ? i : -1)).filter((i) => i >= 0);
     if (matches.length !== 1) {
       return { ...sel, outcome: "invalid_item", detail: `old_name matches ${matches.length} products (need exactly 1)` };
     }
     const idx = matches[0];
     if (item.old_name === item.text) return { ...sel, outcome: "skipped_unchanged" };
-    const dupes = arr.map((p, i) => (i !== idx && isProductObj(p) && p.name === item.text ? i : -1)).filter((i) => i >= 0);
+    // A duplicate is a product already named `text` — exactly, or equal under
+    // the catalog's case/whitespace normalisation (same catalog row).
+    const textNorm = normalizeName(item.text);
+    const dupes = arr
+      .map((p, i) => (i !== idx && isProductObj(p) && typeof p.name === "string" && (p.name === item.text || normalizeName(p.name) === textNorm) ? i : -1))
+      .filter((i) => i >= 0);
     if (dupes.length > 1) {
       return { ...sel, outcome: "invalid_item", detail: `text already names ${dupes.length} products — ambiguous merge` };
     }
     const renamed = arr[idx] as Record<string, unknown>;
+    sel.renamedEntry = renamed;
     if (dupes.length === 0) {
       // Spread keeps key order and every other field; only `name` changes.
       const next = arr.slice();
@@ -372,7 +480,7 @@ function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
     const dupIdx = dupes[0];
     const existing = arr[dupIdx] as Record<string, unknown>;
     const keepRenamed = populatedFieldCount(renamed) > populatedFieldCount(existing);
-    const keptProduct = keepRenamed ? { ...renamed, name: item.text } : existing;
+    const keptProduct = { ...(keepRenamed ? renamed : existing), name: item.text };
     const droppedIdx = keepRenamed ? dupIdx : idx;
     const keptIdx = keepRenamed ? idx : dupIdx;
     const next: unknown[] = [];
@@ -417,7 +525,13 @@ function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
   return { ...out, outcome: "would_write", newValue: JSON.stringify(next) };
 }
 
-type ApplyResult = Plan & { name?: string };
+type ApplyResult = Plan & { name?: string; catalog?: CatalogEffect };
+
+function catalogFor(db: ReturnType<typeof getDb>, item: ValidItem, p: Plan): CatalogEffect | undefined {
+  if (item.field !== "product_name" || !p.renamedEntry) return undefined;
+  if (p.outcome !== "would_write" && p.outcome !== "would_merge") return undefined;
+  return planCatalog(db, item.agent_id, p.renamedEntry, item.text);
+}
 
 /** Write ONE correction — fresh lock re-read inside its own transaction. */
 function applyCorrection(item: ValidItem, reason: string, batchTag: string): ApplyResult {
@@ -442,16 +556,22 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
         // only ever planned against an existing row (no row -> [] -> nothing to change).
         db.prepare(`UPDATE agent_knowledge SET ${col} = ?, updated_at = ? WHERE agent_id = ?`).run(newValue, nowIso, item.agent_id);
       }
+      const catalog = catalogFor(db, item, p);
+      if (catalog) {
+        applyCatalog(db, catalog);
+        catalog.applied = catalog.action !== "none";
+      }
       let notes = `${batchTag}: ${reason}`;
       if (p.merge) {
         notes += ` [merge: kept ${p.merge.kept} ${JSON.stringify(p.merge.kept_product)}; dropped ${JSON.stringify(p.merge.dropped_product)}]`;
       }
+      if (catalog) notes += ` [catalog: ${JSON.stringify(catalog)}]`;
       db.prepare(
         `INSERT INTO agent_knowledge_audit
            (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
          VALUES (?, ?, ?, ?, ?, 'admin', NULL, datetime('now'), ?)`,
       ).run(randomUUID(), item.agent_id, col, p.oldValue ?? null, newValue, notes);
-      return { ...p, outcome: p.outcome === "would_merge" ? "merged" : "written", name: cur!.name };
+      return { ...p, outcome: p.outcome === "would_merge" ? "merged" : "written", name: cur!.name, catalog };
     });
     return tx();
   } catch (e: any) {
@@ -475,6 +595,7 @@ function toResult(item: ValidItem, p: ApplyResult): ResultItem {
   if (p.removed) r.removed = p.removed;
   if (p.not_found_elements) r.not_found_elements = p.not_found_elements;
   if (p.changed_count !== undefined) r.changed_count = p.changed_count;
+  if (p.catalog) r.catalog = p.catalog;
   return r;
 }
 
@@ -526,7 +647,8 @@ router.post("/", (req: Request, res: Response) => {
       // Dry-run reports the lock state too, so the caller sees what WOULD be
       // refused before spending an apply on it.
       const cur = db.prepare(LOCK_SNAPSHOT_SQL).get(item.agent_id) as LockSnapshot | undefined;
-      results.push(toResult(item, { ...plan(cur, item), name: cur?.name }));
+      const p = plan(cur, item);
+      results.push(toResult(item, { ...p, name: cur?.name, catalog: catalogFor(db, item, p) }));
     } else {
       results.push(toResult(item, applyCorrection(item, reason, batchTag)));
     }
