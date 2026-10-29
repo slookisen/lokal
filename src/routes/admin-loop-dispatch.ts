@@ -39,6 +39,7 @@ import {
   fireTextFor,
   resolveActiveWindowHour,
   resolveWindowMin,
+  resolveFinishedLookbackMin,
   DEFAULT_ALLOWLIST,
   type DispatchPlan,
 } from "../services/loop-dispatch";
@@ -206,8 +207,7 @@ async function fireRoutine(
   }
 }
 
-function planNow(): DispatchPlan {
-  const runs = listRecentRuns({ sinceHours: 1, limit: 500 });
+export function planNow(): DispatchPlan {
   // dev-requests/2026-07-08-spine-24-7-active-window.md: default 0/24 (24/7) so the
   // spine fires whenever there's fresh next_suggested work, day or night. computeWakeList's
   // own internal defaults (5/21) stay untouched for other callers/tests; only this route's
@@ -220,6 +220,15 @@ function planNow(): DispatchPlan {
   // budget. Same env-knob pattern as the active window: pure default stays 12,
   // DISPATCH_WINDOW_MIN restores the old behavior without a code revert.
   const windowMin = resolveWindowMin(process.env.DISPATCH_WINDOW_MIN);
+  // computeWakeList's freshness is finished_at-based, but listRecentRuns filters on
+  // started_at: a run that started >1h ago and finished recently was invisible, so its
+  // next_suggested never fired. finishedSinceMinutes adds `OR finished_at >= now-N`.
+  // DISPATCH_PLAN_FINISHED_LOOKBACK_MIN=0 turns it off (rollback without deploy).
+  const finishedSinceMinutes = resolveFinishedLookbackMin(
+    process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN,
+    windowMin,
+  );
+  const runs = listRecentRuns({ sinceHours: 1, finishedSinceMinutes, limit: 500 });
   const { map: routines } = parseRoutines();
   return computeWakeList(
     runs.map((r) => ({
