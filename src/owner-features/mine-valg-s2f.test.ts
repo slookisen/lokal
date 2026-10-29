@@ -212,9 +212,14 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
     setEnv("OWNER_FEATURES_ALLOWED_SUBJECTS", `rfb:${P_ID},rfb:${E_ID}`);
 
     const now = Date.now();
-    // The raw floor of analytics_agent_views (rollupBoundaryDateOn): 30 days back, so the raw part covers the views below.
+    // The raw floor of analytics_agent_views (rollupBoundaryDateOn): 10 days back, so the raw part covers the views below.
     db.prepare("INSERT INTO analytics_agent_views (agent_id, agent_name, created_at, traffic_category, is_owner) VALUES (?, ?, ?, 'human', 0)")
-      .run(P_ID, P_NAME, sqlTs(now - 30 * D));
+      .run(P_ID, P_NAME, sqlTs(now - 10 * D));
+    // Stored daily sums for a day before the raw floor: in the 12-month numbers only, never in the 60-day ones,
+    // so a block that read the 60-day fields (funnel.viewed / aiPlatforms.total) would show 16 / 3, not 19 / 7.
+    const storedDay = new Date(now - 20 * D).toISOString().slice(0, 10);
+    db.prepare("INSERT INTO agent_view_daily (day, agent_id, view_source, city, view_count) VALUES (?, ?, 'direct', '', 3)").run(storedDay, P_ID);
+    db.prepare("INSERT INTO agent_ai_view_daily (day, agent_id, view_count) VALUES (?, ?, 4)").run(storedDay, P_ID);
     const pPath = `/produsent/${slugify(P_NAME)}`;
     const pv = db.prepare(
       `INSERT INTO analytics_page_views (path, source, user_agent_hash, session_id, is_owner, status_code, vertical_id, created_at)
@@ -222,7 +227,7 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
     );
     let ip = 0;
     const addHumanViews = (n: number) => { for (let i = 0; i < n; i++) { ip++; pv.run(pPath, `${hashIP(`61.0.${Math.floor(ip / 250)}.${ip % 250}`)}:${CHROME_UA}`, sqlTs(now - (2 + (ip % 5)) * D)); } };
-    addHumanViews(19);
+    addHumanViews(16); // + 3 stored = 19 over 12 months
     pv.run(pPath, `${hashIP("62.0.0.1")}:${CLAUDE_USER}`, sqlTs(now - 3 * D));
     pv.run(pPath, `${hashIP("62.0.0.2")}:${CLAUDE_USER}`, sqlTs(now - 4 * D));
     pv.run(pPath, `${hashIP("62.0.0.3")}:${CHATGPT_USER}`, sqlTs(now - 5 * D));
@@ -259,7 +264,8 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       const tabOther = num(tab.statsAiPlatforms || "", /<div class="stat-number">(\d+)<\/div><div class="stat-label">Andre AI \(/);
       const tabPhone = num(tab.statsContactClicks || "", /Telefon<\/span><span class="product-meta">(\d+)</);
       const tabWeb = num(tab.statsContactClicks || "", /Nettside<\/span><span class="product-meta">(\d+)</);
-      assertEq([tabSeen, tabAi, tabGpt, tabClaude, tabOther, tabPhone, tabWeb], [19, 3, 1, 2, 0, 2, 1], "AC31 fixture: the tab shows 19 views, 3 AI search (1 ChatGPT, 2 Claude), 2 phone and 1 website click");
+      assertEq([tabSeen, tabAi, tabGpt, tabClaude, tabOther, tabPhone, tabWeb], [19, 7, 1, 2, 0, 2, 1], "AC31 fixture: the tab shows 19 views and 7 AI search over 12 months (60 days: 1 ChatGPT, 2 Claude), 2 phone and 1 website click");
+      assertEq([o.funnel.viewed, o.aiPlatforms.total], [16, 3], "AC31 fixture: the 60-day numbers differ (16 views, 3 AI search), so 12 months vs 60 days is told apart");
 
       const st = featuresMod.ownerPageStats(P_ID, P_NAME, db);
       assertTrue(!!st, "AC31: the route's stats read succeeds");
@@ -315,7 +321,7 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       assertTrue(card.length > 0, "AC31 card: the portal has the «Statistikk» card");
       const views = num(card, /<div class="ep-stat-num">(\d+)<\/div><div class="ep-stat-label">Sidevisninger fra mennesker \(/);
       const ai = num(card, /<div class="ep-stat-num">(\d+)<\/div><div class="ep-stat-label">AI-søk \(/);
-      assertEq([views, ai], [19, 3], "AC31 card: page views and AI search show the tab's numbers, not «—»");
+      assertEq([views, ai], [19, 7], "AC31 card: page views and AI search show the tab's numbers, not «—»");
       const portalSrc = fs.readFileSync(path.join(__dirname, "../routes/owner-portal.ts"), "utf8");
       assertTrue(!/knowledge\.views_count|knowledge\.ai_conversations_count/.test(portalSrc), "AC31 card: the card no longer reads the fields that do not exist");
     }
@@ -347,7 +353,10 @@ export async function runMineValgS2fTests(opts: { log?: boolean } = {}): Promise
       const s19 = await statsJson(P_ID);
       assertTrue(s19.publicCounts === false && statsMod.PUBLIC_STATS_COUNT_FIELDS.every((f) => !(f in s19)), "AC32 19: GET /api/agents/:id/stats leaves the counts out (publicCounts:false)");
       assertTrue(Array.isArray(s19.lastConversations) && typeof s19.conversationCount === "number", "AC32 19: the rest of the stats payload stays");
-      assertTrue(!/"(humanViews|aiViews|aiDeliveries)"/.test(h19.replace(/<script>[\s\S]*?<\/script>/g, (m) => (m.includes("ld+json") ? m : ""))), "AC32 19: no count in the JSON-LD");
+      const ld = [...h19.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+      const ldParsed = ld.map((t) => { try { return JSON.parse(t); } catch { return null; } });
+      assertTrue(ld.length > 0 && ldParsed.every((x) => x !== null), "AC32 19: the page's JSON-LD blocks parse");
+      assertTrue(!/interactionStatistic|InteractionCounter|userInteractionCount|"(humanViews|aiViews|aiDeliveries)"/.test(JSON.stringify(ldParsed)), "AC32 19: no view or AI count in the JSON-LD");
       const own19 = block(await valgHtml(P_ID));
       assertEq(blockNum(own19, "Sidevisninger fra mennesker"), 19, "AC32 19: the owner sees the own numbers");
 

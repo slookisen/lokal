@@ -43,7 +43,7 @@ import { slugify } from "../utils/slug";
 import { readAgentStats, __resetAgentStatsReaderForTesting } from "../services/agent-stats-reader";
 import { getDb } from "../database/init";
 import { publicFieldChoices } from "../owner-features/enforce";
-import { publicCountsShown } from "../services/public-stats-threshold";
+import { publicCountsShown, publicStatsMinViews } from "../services/public-stats-threshold";
 
 const router = Router();
 
@@ -78,7 +78,14 @@ export const PUBLIC_STATS_COUNT_FIELDS = ["humanViews", "aiViews", "aiBreakdown"
 function publicStatsPayload(payload: any, agentId: string, path: string): any {
   if (!payload || typeof payload !== "object") return payload;
   const choices = publicFieldChoices(agentId);
-  if (publicCountsShown(getDb(), agentId, path, choices ? choices.publicCounts : null)) return payload;
+  // The gate counts the owner's «Sett» (no scraper/velocity filter); this
+  // payload's own 12-month number has that filter, so it can be lower. The
+  // tiles the page hydrates from here are also held back when that number
+  // is below the threshold, so a public tile never shows fewer than it.
+  const min = publicStatsMinViews();
+  const ownYear = payload.year && payload.year.humanViews ? Number(payload.year.humanViews.value) : NaN;
+  const belowOwn = min > 0 && !(ownYear >= min);
+  if (!belowOwn && publicCountsShown(getDb(), agentId, path, choices ? choices.publicCounts : null)) return payload;
   const out: any = { ...payload, publicCounts: false };
   for (const f of PUBLIC_STATS_COUNT_FIELDS) delete out[f];
   return out;

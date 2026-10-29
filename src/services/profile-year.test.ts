@@ -59,6 +59,11 @@ export async function runProfileYearTests(opts: { log?: boolean } = {}): Promise
   const prevDb = (() => { try { return initMod.getDb(); } catch { return undefined; } })();
   const prevSince = process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
   const prevRollup = process.env.ANALYTICS_ROLLUP_READ;
+  // «Mine valg» S2f: this suite checks the tiles' numbers and labels on a fixture
+  // below the public threshold (PUBLIC_STATS_MIN_VIEWS, 20): it runs with the
+  // threshold off (0); mine-valg-s2f.test.ts covers the threshold itself.
+  const prevMinViews = process.env.PUBLIC_STATS_MIN_VIEWS;
+  process.env.PUBLIC_STATS_MIN_VIEWS = "0";
   const db = new Database(":memory:");
   db.pragma("foreign_keys = OFF");
 
@@ -249,6 +254,7 @@ export async function runProfileYearTests(opts: { log?: boolean } = {}): Promise
     failed++;
     failures.push(`unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   } finally {
+    if (prevMinViews === undefined) delete process.env.PUBLIC_STATS_MIN_VIEWS; else process.env.PUBLIC_STATS_MIN_VIEWS = prevMinViews;
     if (prevSince === undefined) delete process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE;
     else process.env.PROFILE_AI_DELIVERIES_COUNTING_SINCE = prevSince;
     if (prevRollup === undefined) delete process.env.ANALYTICS_ROLLUP_READ;
