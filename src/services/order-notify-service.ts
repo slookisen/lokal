@@ -48,6 +48,7 @@ import { isBlocked } from "./blocklist-service";
 import { emailService, EmailOptions } from "./email-service";
 import { isOrderAutocompleteEnabled } from "./order-lifecycle";
 import { PRICE_BY_AGREEMENT, PARTIAL_SUM_LABEL } from "./order-pricing";
+import { formatOsloDayLabel } from "./order-cap-notice";
 
 const APP_URL = process.env.APP_URL || "https://rettfrabonden.com";
 
@@ -641,6 +642,65 @@ export async function sendProducerOrderMessageNotice(orderId: string, messageTex
     return "failed";
   } catch (err) {
     console.error(`[order-notify] message notice FAILED order=${orderId}:`, (err as any)?.message ?? "error");
+    return "failed";
+  }
+}
+
+/**
+ * B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+ * the producer's daily digest of submits the daily cap turned into contact
+ * requests. FIRST VERSION — Daniel approves this text (recorded in
+ * daniel-responses/) before ORDER_CAP_NOTICE_ENABLED is turned on (AC8).
+ * No buyer data in it.
+ */
+export function renderOrderCapNoticeEmail(input: { agent_id: string; count: number; cap: number; oslo_day: string }): {
+  subject: string; textContent: string; htmlContent: string;
+} {
+  const day = formatOsloDayLabel(input.oslo_day);
+  const n = Math.max(0, Math.floor(input.count));
+  const what = n === 1 ? "1 bestilling kom" : `${n} bestillinger kom`;
+  const mineUrl = `${APP_URL}/eier/${encodeURIComponent(input.agent_id)}/ordrer`;
+  const lead = `${what} etter grensen din på ${input.cap} bestillinger per døgn i går (${day}) og ble sendt som kontaktforespørsel.`;
+  const explain = "Kundene fikk kontaktinformasjonen din i stedet for å sende bestillingen, så de kan ta kontakt med deg direkte.";
+  const subject = `${what} etter grensen din i går`;
+  const textContent =
+    `Hei,\n\n${lead}\n\n${explain}\n\n` +
+    `Se bestillingene du har fått i Mine ordrer (krever innlogging): ${mineUrl}\n\n` +
+    `Du får høyst én slik e-post per dag.\n\nHilsen\nRett fra Bonden`;
+  const htmlContent =
+    `<p>Hei,</p>\n<p>${escHtml(lead)}</p>\n<p>${escHtml(explain)}</p>\n` +
+    `<p><a href="${escHtml(mineUrl)}">Se bestillingene i Mine ordrer</a> (krever innlogging)</p>\n` +
+    `<p>Du får høyst én slik e-post per dag.</p>\n<p>Hilsen<br>Rett fra Bonden</p>`;
+  return { subject, textContent, htmlContent };
+}
+
+/** B4: sends the daily digest (same gated recipient as the order e-mail). Never throws. */
+export async function sendProducerOrderCapNotice(input: { agent_id: string; count: number; cap: number; oslo_day: string }): Promise<OrderNotifyOutcome> {
+  try {
+    const recipient = resolveOrderNotificationRecipient(input.agent_id);
+    if (!recipient.eligible) {
+      console.log(`[order-notify] cap notice skipped agent=${input.agent_id} day=${input.oslo_day} reason=${recipient.reason}`);
+      return "skipped";
+    }
+    const rendered = renderOrderCapNoticeEmail(input);
+    const send: SendFn = _sendOverride ?? ((opts) => emailService.sendEmail(opts));
+    const res = await send({
+      to: recipient.email,
+      subject: rendered.subject,
+      htmlContent: rendered.htmlContent,
+      textContent: rendered.textContent,
+      replyTo: DEFAULT_ORDER_NOTIFY_REPLY_TO,
+      // F8: transactional, not outreach.
+      omitAgentHeader: true,
+    });
+    if (res && res.success) {
+      console.log(`[order-notify] cap notice sent agent=${input.agent_id} day=${input.oslo_day} count=${input.count}`);
+      return "sent";
+    }
+    console.error(`[order-notify] cap notice FAILED agent=${input.agent_id} day=${input.oslo_day}: ${res?.error || "unknown error"}`);
+    return "failed";
+  } catch (err) {
+    console.error(`[order-notify] cap notice FAILED agent=${input.agent_id}:`, (err as any)?.message ?? "error");
     return "failed";
   }
 }

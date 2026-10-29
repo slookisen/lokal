@@ -37,6 +37,7 @@ import { KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
 import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { serializeJsonForScript } from "../services/safe-script-json";
+import { isOrderCapNoticeEnabled, orderCapBuyerNotice } from "../services/order-cap-notice";
 import type { Offer } from "../services/catalog-offers";
 
 export function isHandelisteEnabled(): boolean {
@@ -600,6 +601,9 @@ const CLIENT_SCRIPT = `
       box.appendChild(mk('p', { cls: 'hl-hint', text: C.contact_p }));
       res.handoffs.forEach(function(h){
         var card = mk('div', { cls: 'hl-handoff' }, [mk('strong', { text: String(h.name || '') })]);
+        // B4: a spam cap turned this producer's order into a contact request (flag on only).
+        var capT = h.cap_reason === 'producer_daily_cap' ? C.__cap_daily : (h.cap_reason === 'buyer_open_cap' ? C.__cap_open : null);
+        if (capT && h.cap_reached === true) card.appendChild(mk('div', { cls: 'hl-msg', text: String(capT).split('{cap}').join(String(Number(h.cap) || '')) }));
         var links = mk('div', { cls: 'hl-meta' });
         var tel = telHref(h.phone);
         if (tel) links.appendChild(mk('a', { href: tel, text: C.call + ' ' + String(h.phone) }));
@@ -719,7 +723,12 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
   const pre = preselect && preselect.offers.length > 0
     ? { __preselect: { producer_name: preselect.producer_name, offers: preselect.offers.slice(0, HANDELISTE_MAX_ITEMS) }, __preselect_note: PRESELECT_NOTE[lang === "en" ? "en" : "no"] }
     : {};
-  const copy = { ...c, ...payHow, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
+  // B4: the buyer's daily-cap text (the same function as the API's cap_notice),
+  // only with ORDER_CAP_NOTICE_ENABLED on — off, the copy is unchanged.
+  const capCopy = isOrderCapNoticeEnabled()
+    ? { __cap_daily: orderCapBuyerNotice("producer_daily_cap", "{cap}", lang === "en" ? "en" : "no"), __cap_open: orderCapBuyerNotice("buyer_open_cap", "{cap}", lang === "en" ? "en" : "no") }
+    : {};
+  const copy = { ...c, ...payHow, ...capCopy, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">

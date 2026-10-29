@@ -2529,6 +2529,26 @@ if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
     void orderFollowupsTick();
   }, 5 * 60_000);
   setInterval(orderFollowupsTick, 60 * 60_000);
+
+  // B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the producer's daily-cap digest — one e-mail per producer per Oslo day
+  // for yesterday's over-cap submits, from 07:00 Oslo time. A no-op while
+  // ORDER_CAP_NOTICE_ENABLED is off (default). Idempotent: the
+  // order_cap_notices primary key is the sent marker
+  // (services/order-cap-notice.ts).
+  const orderCapNoticeTick = trackJob("order-cap-notice", async () => {
+    try {
+      const { processOrderCapNotices } = await import("./services/order-cap-notice");
+      const r = await processOrderCapNotices();
+      if (r.sent || r.skipped || r.failed) {
+        console.log(`[order-cap] tick day=${r.day} candidates=${r.candidates} sent=${r.sent} skipped=${r.skipped} failed=${r.failed}`);
+      }
+    } catch (err) {
+      console.error("[order-cap] tick failed:", err);
+    }
+  });
+  setTimeout(() => { void orderCapNoticeTick(); }, 6 * 60_000);
+  setInterval(orderCapNoticeTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───

@@ -5320,6 +5320,42 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_order_messages_order_id ON order_messages(order_id, created_at)`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_messages_idem ON order_messages(order_id, idempotency_key) WHERE idempotency_key IS NOT NULL`);
 
+  // B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the daily-cap notice (services/order-cap-notice.ts). Additive; no existing
+  // table changes, no buyer data.
+  //   order_cap_events  : one row per (submit, producer) the F8 spam cap turned
+  //     into a contact handoff. reason 'producer_daily_cap' |
+  //     'buyer_open_cap'; cap = the limit in force; oslo_day = the
+  //     Europe/Oslo calendar day (YYYY-MM-DD) of the submit.
+  //   order_cap_notices : the sent marker of the producer's daily digest. The
+  //     primary key (agent_id, oslo_day) is what guarantees ONE e-mail per
+  //     producer per day across overlapping runs and restarts. status
+  //     'claimed' | 'sent' | 'skipped' | 'failed'.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_cap_events (
+      id          TEXT PRIMARY KEY,
+      agent_id    TEXT NOT NULL,
+      cart_id     TEXT,
+      reason      TEXT NOT NULL CHECK(reason IN ('producer_daily_cap','buyer_open_cap')),
+      cap         INTEGER NOT NULL,
+      oslo_day    TEXT NOT NULL,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_order_cap_events_day ON order_cap_events(oslo_day, agent_id)`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_cap_notices (
+      agent_id        TEXT NOT NULL,
+      oslo_day        TEXT NOT NULL,
+      over_cap_count  INTEGER NOT NULL,
+      cap             INTEGER NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'claimed',
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      sent_at         TEXT,
+      PRIMARY KEY (agent_id, oslo_day)
+    )
+  `);
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.

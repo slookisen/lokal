@@ -172,7 +172,7 @@ export interface OwnerPageModel {
   /** FAQ anchor for «Les mer» — only when that page is published (else null: inline text only). */
   ordersReadMoreUrl?: string | null;
   /** Real follow-up timings for the explanation (ORDER_REMINDER_HOURS / ORDER_AUTOCANCEL_HOURS). */
-  orderTimings?: { reminderHours: number; autocancelHours: number };
+  orderTimings?: { reminderHours: number; autocancelHours: number; dailyCap?: number; capNotice?: boolean };
   /**
    * S2f statistics block at the top (v2 principle 1). undefined = no block;
    * null = the read failed (the block says so and keeps the link).
@@ -527,6 +527,11 @@ function ordersCheckHtml(m: OwnerPageModel): string {
 /** v2 principle 4: the fold-out explanation, from the flow as it is built. */
 function ordersExplainHtml(m: OwnerPageModel): string {
   const t = m.orderTimings ?? { reminderHours: 24, autocancelHours: 72 };
+  // B4: the daily cap, from the configuration the route passes in
+  // (ORDER_CAP_NEW_PER_PRODUCER_PER_DAY); no line when it is not given.
+  const capLine = t.dailyCap && t.dailyCap > 0
+    ? `<li data-order-cap="${esc(t.dailyCap)}">Du kan få inntil ${esc(t.dailyCap)} bestillinger per døgn. Kommer det flere, blir de gjort om til en kontaktforespørsel: kunden får kontaktinformasjonen din i stedet${t.capNotice ? ", og du får én samlet e-post om det dagen etter" : ""}.</li>`
+    : "";
   const readMore = m.ordersReadMoreUrl
     ? `<p><a href="${esc(m.ordersReadMoreUrl)}">Les mer</a></p>` : "";
   return `<details class="mv-explain-box">
@@ -537,6 +542,7 @@ function ordersExplainHtml(m: OwnerPageModel): string {
               <li>Du får en e-post med emnet «Ny henteordre» til adressen under «Bestillinger sendes til».</li>
               <li>I e-posten bekrefter eller avslår du bestillingen med ett klikk. Du trenger ikke logge inn.</li>
               <li>Kunden henter varene hos deg og betaler når varene hentes. Rett fra Bonden tar ikke betalt.</li>
+              ${capLine}
             </ul>
             <h3>Dette må du gjøre</h3>
             <ul>
