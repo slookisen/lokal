@@ -72,21 +72,46 @@ export function parseRobotsTxt(text: string, uaToken: string = PRODUCT_IMPORT_UA
   return { rules: [], matched: "none" };
 }
 
+/** Rules and paths longer than this are not evaluated (bounds matcher work). */
+export const ROBOTS_MAX_PATTERN_LENGTH = 500;
+
+/**
+ * Linear-time robots pattern match (no RegExp — a rule like `/*a*a*a*b` must not
+ * be able to backtrack the event loop). Consecutive `*` are collapsed; the
+ * literal segments between them are matched greedily left-to-right with
+ * indexOf, the first segment anchored at the path start, and a trailing `$`
+ * pins the last segment to the path end (as Google's robots matcher does).
+ */
 function ruleMatches(rulePath: string, path: string): boolean {
-  if (!rulePath) return false;
+  if (!rulePath || rulePath.length > ROBOTS_MAX_PATTERN_LENGTH) return false;
   const anchored = rulePath.endsWith("$");
-  const body = anchored ? rulePath.slice(0, -1) : rulePath;
-  const re = new RegExp(
-    "^" + body.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + (anchored ? "$" : ""),
-  );
-  return re.test(path);
+  const body = (anchored ? rulePath.slice(0, -1) : rulePath).replace(/\*{2,}/g, "*");
+  const segs = body.split("*");
+  const first = segs[0]!;
+  if (!path.startsWith(first)) return false;
+  if (segs.length === 1) return anchored ? path.length === first.length : true;
+  let pos = first.length;
+  const last = segs.length - 1;
+  for (let i = 1; i < last; i++) {
+    const seg = segs[i]!;
+    if (!seg) continue;
+    const at = path.indexOf(seg, pos);
+    if (at < 0) return false;
+    pos = at + seg.length;
+  }
+  const tail = segs[last]!;
+  if (!anchored) return tail === "" || path.indexOf(tail, pos) >= 0;
+  // `$`: the tail must end the path, without overlapping what was consumed.
+  return path.length - tail.length >= pos && path.endsWith(tail);
 }
 
 /** Whether `pathWithQuery` (e.g. "/products.json?limit=250") may be fetched. PURE. */
 export function isPathAllowed(policy: RobotsPolicy, pathWithQuery: string): boolean {
+  // Cap the evaluated path so per-rule work stays bounded on absurd URLs.
+  const path = pathWithQuery.length > 2048 ? pathWithQuery.slice(0, 2048) : pathWithQuery;
   let best: RobotsRule | null = null;
   for (const r of policy.rules) {
-    if (!ruleMatches(r.path, pathWithQuery)) continue;
+    if (!ruleMatches(r.path, path)) continue;
     if (
       !best ||
       r.path.length > best.path.length ||

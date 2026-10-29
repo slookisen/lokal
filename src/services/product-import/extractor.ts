@@ -56,6 +56,8 @@ export type { ProductCandidate, ProductImportTier } from "./structured";
 export const PRODUCT_IMPORT_USER_AGENT = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 /** Requests per profile, robots.txt excluded (spec: "maks ~8 sider"). */
 export const PRODUCT_IMPORT_MAX_FETCHES = 8;
+/** Bodies longer than this (chars, ~2 MB) are truncated before extraction. */
+export const PRODUCT_IMPORT_MAX_BODY_CHARS = 2_000_000;
 /** Below this many visible characters across all fetched pages (on a script-built page) → js_unreadable. */
 export const JS_UNREADABLE_MIN_CHARS = 150;
 export const PRODUCT_IMPORT_FETCH_TIMEOUT_MS = 10_000;
@@ -311,6 +313,10 @@ export async function extractProductsFromWebsite(
       return { ok: false, reason: "offhost", detail: "redirected to other host" };
     }
     if (!r.ok && r.reason === "ssrf_blocked") result.rejected_urls.push({ url, reason: "ssrf_blocked" });
+    // Bound the text every downstream regex/parser sees.
+    if (r.ok && r.html.length > PRODUCT_IMPORT_MAX_BODY_CHARS) {
+      return { ...r, html: r.html.slice(0, PRODUCT_IMPORT_MAX_BODY_CHARS) };
+    }
     return r;
   };
 

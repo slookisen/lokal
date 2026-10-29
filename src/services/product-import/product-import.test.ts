@@ -161,6 +161,18 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
     assertEq(robots.isPathAllowed(mixed, "/products.json?limit=250"), true, "robots: $ anchor does not match with query");
     assertEq(robots.isPathAllowed(robots.parseRobotsTxt("User-agent: *\nDisallow:\n"), "/"), true, "robots: empty Disallow allows all");
     assertEq(robots.isPathAllowed(robots.parseRobotsTxt("User-agent: Googlebot\nDisallow: /\n"), "/"), true, "robots: other bot's group does not apply");
+    assertEq(robots.isPathAllowed(robots.parseRobotsTxt("User-agent: *\nDisallow: /a**b$\n"), "/axxb"), false, "robots: collapsed ** + $ matches");
+    assertEq(robots.isPathAllowed(robots.parseRobotsTxt("User-agent: *\nDisallow: /ab*b$\n"), "/ab"), true, "robots: $ tail may not overlap consumed prefix");
+    assertEq(robots.isPathAllowed(robots.parseRobotsTxt("User-agent: *\nDisallow: /*x*y\n"), "/qqxzzyrr"), false, "robots: multi-wildcard unanchored match");
+    assertEq(robots.isPathAllowed(robots.parseRobotsTxt(`User-agent: *\nDisallow: /${"a".repeat(600)}\n`), `/${"a".repeat(700)}`), true, "robots: overlong rule ignored");
+    {
+      // ReDoS guard: these patterns took minutes with the old RegExp matcher.
+      const evil = robots.parseRobotsTxt("User-agent: *\nDisallow: /****************z\nDisallow: /*a*a*a*a*a*a*a*a*a*a*a*a*b\nDisallow: /*a*a*a*a*a*a*a*a*b$\n");
+      const t0 = Date.now();
+      const ok = robots.isPathAllowed(evil, "/" + "a".repeat(5000));
+      const ms = Date.now() - t0;
+      assertTrue(ok === true && ms < 50, `robots: many-star rules on a long path finish fast (${ms} ms)`);
+    }
 
     // ── AC2: robots Disallow: / → robots_blocked, nothing else fetched ─────
     robots.__clearRobotsCacheForTesting();
@@ -413,10 +425,20 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       assertEq(ex.isAllowedHost("https://gard.no.evil.com/x", allowed), false, "AC5: suffix trick rejected");
       assertEq(ex.isAllowedHost("https://shop.gard.no/x", allowed), false, "AC5: other subdomain rejected");
     }
-    for (const bad of ["http://192.168.1.10/", "http://169.254.169.254/latest/meta-data", "http://127.0.0.1:8080", "http://localhost/"]) {
+    for (const bad of [
+      "http://192.168.1.10/", "http://169.254.169.254/latest/meta-data", "http://127.0.0.1:8080", "http://localhost/",
+      "http://[::ffff:127.0.0.1]/", "http://[::ffff:169.254.169.254]/", "http://[::ffff:0:10.0.0.1]/", "http://[::ffff:7f00:1]/",
+      "http://[::]/", "http://[::1]/", "http://[64:ff9b::192.168.1.1]/", "http://[fc00::1]/", "http://[fd12::1]/", "http://[fe80::1]/",
+    ]) {
       const f = makeFetch({});
       const r = await ex.extractProductsFromWebsite(bad, { fetchImpl: f.impl, llm: noLlm });
       assertEq([r.outcome, f.calls.length], ["fetch_failed:ssrf_blocked", 0], `AC5: private target rejected before any request (${bad})`);
+    }
+    {
+      const { isSafeFetchUrl } = require("../fetch-page") as typeof import("../fetch-page");
+      for (const pub of ["http://[2001:4860:4860::8888]/", "http://[2a00:1450:400f:80d::200e]/", "http://[::ffff:8.8.8.8]/", "https://gard.no/"]) {
+        assertEq(isSafeFetchUrl(pub), true, `AC5: public address still allowed (${pub})`);
+      }
     }
     robots.__clearRobotsCacheForTesting();
     {
