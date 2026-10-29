@@ -49482,6 +49482,27 @@ runSerial(async () => {
   }
 });
 
+// Claim rule slice 1b, shared address ("delt adresse"): no code on any path
+// (rule 1, P1, P2) to an address that is the known e-mail of more than one
+// RFB profile → pending_review shared_address. Pins getDb() to its own
+// in-memory DB, stubs the e-mail transporter and the HTTPS probe (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── claim rule slice 1b: RFB claim shared address (delt adresse) ──");
+  try {
+    const { runRfbClaimDeltAdresseTests } = require("../src/routes/rfb-claim-delt-adresse.test") as
+      typeof import("../src/routes/rfb-claim-delt-adresse.test");
+    const da = await runRfbClaimDeltAdresseTests({ log: false });
+    passed += da.passed;
+    failed += da.failed;
+    for (const f of da.failures) failures.push("rfb-claim-delt-adresse: " + f);
+    console.log(`  rfb-claim-delt-adresse: ${da.passed} passed, ${da.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-delt-adresse: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {

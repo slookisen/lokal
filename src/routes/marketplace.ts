@@ -1798,6 +1798,7 @@ const CLAIM_QUEUED_MESSAGES: Record<ClaimReviewReason, string> = {
   no_known_email: "Profilen har ingen kjent e-postadresse vi kan sende koden til. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
   listed_email_wrong: "Takk for beskjeden om e-postadressen. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
   has_owner: "Profilen har allerede en eier. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
+  shared_address: "E-postadressen er knyttet til flere gårder hos oss, så vi sender ikke kode dit. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
 };
 
 // The claimId of a sent code lives only in the requester's browser, so the
@@ -1813,6 +1814,7 @@ const CLAIM_REVIEW_REASON_LABELS: Record<ClaimReviewReason, string> = {
   no_known_email: "profilen har ingen kjent e-postadresse",
   listed_email_wrong: "den som krever, sier at e-postadressen på profilen er feil",
   has_owner: "profilen har allerede en eier",
+  shared_address: "delt adresse: e-postadressen koden ville gått til, er kjent e-post på flere RFB-profiler",
 };
 
 /** Caps on what the public claim form may store — an unauthenticated write,
