@@ -620,6 +620,9 @@ export async function runAdminEnrichmentWritePauseTests(
         // — plus its own test file, which sets up pause state directly via
         // the service to prove the wiring.
         "routes/admin-agents-content-correction.ts",
+        // S2w: the content-correction tests set pause state via the service
+        // to prove the list/product fields are gated too.
+        "routes/admin-agents-content-quality.test.ts",
       "routes/admin-agents-description-code-artifact-sweep.test.ts",
         "routes/admin-agents-description-code-artifact-sweep.ts",
       "routes/admin-agents-internal-note-sweep.ts",
