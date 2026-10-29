@@ -43,6 +43,9 @@
 // (enkeltpersonforetak). They exist on the normalized row for matching in
 // memory only — the sync never persists or logs them.
 
+import * as crypto from "node:crypto";
+import * as https from "node:https";
+import * as tls from "node:tls";
 import { FINNOKO_USER_AGENT } from "./debio-finnoko-client";
 
 export const DEBIO_REGISTER_URL = "https://portal.debio.no/ACM/api/certsearch/getcertificates";
@@ -251,24 +254,218 @@ export function normalizeRegisterResponse(data: unknown): DebioRegisterFetchResu
   return { raw: raw.length, rows, rejected };
 }
 
-/** One POST to the register (60 s timeout, finnoko User-Agent). Throws on HTTP/JSON errors. */
-export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch } = {}): Promise<DebioRegisterFetchResult> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
+// ─── fetch diagnostics + optional extra CA (økologi S1b) ────────────────────
+// In prod the register fetch failed with only «fetch failed»: undici hides the
+// real cause (TLS chain, ECONNREFUSED, connect timeout …) in `error.cause`.
+// describeFetchError() walks the cause chain so reject_reason says why.
+//
+// DEBIO_REGISTER_EXTRA_CA_PEM (one or more PEM certificates, real newlines or
+// `\n`-escaped on one line): when set, the register request — and only that
+// request — goes through node:https with ca = [...tls.rootCertificates,
+// ...extra]. TLS verification is never turned off; an unparsable value is an
+// error (`extra_ca_invalid`), never silently ignored.
+
+export const DEBIO_REGISTER_EXTRA_CA_ENV = "DEBIO_REGISTER_EXTRA_CA_PEM";
+const DESCRIBE_MAX_CHARS = 500;
+const DESCRIBE_MAX_DEPTH = 4;
+const HTTP_BODY_SNIPPET_CHARS = 200;
+const HTTPS_MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function errAttrs(e: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const k of ["code", "errno", "syscall"]) {
+    const v = e[k];
+    if (typeof v === "string" || typeof v === "number") parts.push(`${k}=${v}`);
+  }
+  const host = e.hostname ?? e.host ?? e.address;
+  if (typeof host === "string" && host) parts.push(`host=${host}`);
+  if (typeof e.port === "string" || typeof e.port === "number") parts.push(`port=${e.port}`);
+  return parts.join(" ");
+}
+
+/**
+ * One bounded line from an error and its cause chain (max depth 4):
+ * `TypeError fetch failed ← cause code=UNABLE_TO_VERIFY_LEAF_SIGNATURE: unable
+ * to verify the first certificate`. Only name / message / code / errno /
+ * syscall / host / port are read — never headers or env values.
+ */
+export function describeFetchError(err: unknown): string {
+  if (!(err && typeof err === "object")) return oneLine(String(err)).slice(0, DESCRIBE_MAX_CHARS);
+  const top = err as Record<string, unknown>;
+  const name = typeof top.name === "string" && top.name ? top.name : "Error";
+  const topAttrs = errAttrs(top);
+  let out = oneLine(`${name} ${typeof top.message === "string" ? top.message : ""}${topAttrs ? ` [${topAttrs}]` : ""}`);
+  const seen = new Set<unknown>([err]);
+  let cur: unknown = top.cause ?? (Array.isArray(top.errors) ? top.errors[0] : undefined);
+  for (let depth = 0; depth < DESCRIBE_MAX_DEPTH && cur !== undefined && cur !== null && !seen.has(cur); depth++) {
+    seen.add(cur);
+    if (typeof cur !== "object") { out += ` ← cause: ${oneLine(String(cur))}`; break; }
+    const c = cur as Record<string, unknown>;
+    const cname = typeof c.name === "string" && c.name && c.name !== "Error" ? ` ${c.name}` : "";
+    const attrs = errAttrs(c);
+    const msg = typeof c.message === "string" ? oneLine(c.message) : "";
+    out += ` ← cause${cname}${attrs ? ` ${attrs}` : ""}${msg ? `: ${msg}` : ""}`;
+    cur = c.cause ?? (Array.isArray(c.errors) ? c.errors[0] : undefined);
+  }
+  return out.length > DESCRIBE_MAX_CHARS ? out.slice(0, DESCRIBE_MAX_CHARS - 1) + "…" : out;
+}
+
+export type ExtraCaParse =
+  | { state: "unset" }
+  | { state: "ok"; certs: string[] }
+  | { state: "invalid"; error: string };
+
+/** Parses DEBIO_REGISTER_EXTRA_CA_PEM. Every PEM block must be a parsable X.509 certificate. */
+export function parseExtraCaPem(raw: string | undefined): ExtraCaParse {
+  if (raw === undefined || raw.trim() === "") return { state: "unset" };
+  const text = raw.replace(/\\r/g, "").replace(/\\n/g, "\n").replace(/\r/g, "");
+  const blocks = text.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+  if (blocks.length === 0) return { state: "invalid", error: "extra_ca_invalid: no PEM certificate block found" };
+  // Anything left besides the blocks (and whitespace) is a malformed value.
+  if (text.replace(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g, "").trim() !== "") {
+    return { state: "invalid", error: "extra_ca_invalid: unexpected text outside the PEM certificate blocks" };
+  }
+  const certs: string[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const pem = blocks[i] + "\n";
+    try {
+      new crypto.X509Certificate(pem);
+    } catch (e) {
+      return { state: "invalid", error: `extra_ca_invalid: certificate ${i + 1} of ${blocks.length} unparsable (${oneLine(e instanceof Error ? e.message : String(e)).slice(0, 120)})` };
+    }
+    certs.push(pem);
+  }
+  return { state: "ok", certs };
+}
+
+export type RegisterTransport =
+  | { kind: "fetch"; fetchImpl: typeof fetch }
+  | { kind: "https_extra_ca"; ca: string[] }
+  | { kind: "invalid"; error: string };
+
+/**
+ * Which client makes the register request: an injected fetchImpl (tests) wins,
+ * then node:https with the extra CA when DEBIO_REGISTER_EXTRA_CA_PEM is set,
+ * else the global fetch. An invalid PEM is reported whichever path is chosen.
+ */
+export function selectRegisterTransport(opts: { fetchImpl?: typeof fetch; env?: NodeJS.ProcessEnv } = {}): RegisterTransport {
+  const env = opts.env ?? process.env;
+  const extra = parseExtraCaPem(env[DEBIO_REGISTER_EXTRA_CA_ENV]);
+  if (extra.state === "invalid") return { kind: "invalid", error: extra.error };
+  if (opts.fetchImpl) return { kind: "fetch", fetchImpl: opts.fetchImpl };
+  if (extra.state === "ok") return { kind: "https_extra_ca", ca: [...tls.rootCertificates, ...extra.certs] };
+  return { kind: "fetch", fetchImpl: fetch };
+}
+
+/** True when the register request would use the extra-CA https client (boolean only). */
+export function registerExtraCaInUse(opts: { fetchImpl?: typeof fetch; env?: NodeJS.ProcessEnv } = {}): boolean {
+  return selectRegisterTransport(opts).kind === "https_extra_ca";
+}
+
+/**
+ * POST with node:https trusting exactly `ca` (TLS verification on). Resolves
+ * with status + body text; the timeout covers connect, TLS and the body.
+ */
+export function httpsPostText(
+  url: string,
+  body: string,
+  headers: Record<string, string>,
+  ca: string[],
+  timeoutMs: number,
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn: () => void) => { if (!done) { done = true; clearTimeout(timer); fn(); } };
+    const req = https.request(url, {
+      method: "POST",
+      headers: { ...headers, "Content-Length": String(Buffer.byteLength(body)) },
+      ca,
+      agent: false,
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      res.on("data", (c: Buffer) => {
+        size += c.length;
+        if (size > HTTPS_MAX_BODY_BYTES) {
+          finish(() => reject(new Error(`response body exceeds ${HTTPS_MAX_BODY_BYTES} bytes`)));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      res.on("end", () => finish(() => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") })));
+      res.on("error", (e) => finish(() => reject(e)));
+    });
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error(`timeout after ${timeoutMs} ms`)));
+      req.destroy();
+    }, timeoutMs);
+    req.on("error", (e) => finish(() => reject(e)));
+    req.end(body);
+  });
+}
+
+function httpError(status: number, bodyText: string): Error {
+  const snippet = oneLine(bodyText).slice(0, HTTP_BODY_SNIPPET_CHARS);
+  return new Error(`debio register HTTP ${status}${snippet ? `: ${snippet}` : ""}`);
+}
+
+function parseJson(t: string): unknown {
+  try {
+    return JSON.parse(t);
+  } catch (e) {
+    throw new Error(`debio register JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * One POST to the register (60 s timeout, finnoko User-Agent). Throws on
+ * HTTP/JSON/network errors; a network error's message is the full cause chain
+ * (describeFetchError), our own timeout reads «timeout after 60000 ms».
+ */
+export async function fetchDebioRegister(opts: { fetchImpl?: typeof fetch; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}): Promise<DebioRegisterFetchResult> {
+  const transport = selectRegisterTransport(opts);
+  if (transport.kind === "invalid") throw new Error(transport.error);
+  const timeoutMs = opts.timeoutMs ?? DEBIO_REGISTER_TIMEOUT_MS;
+  const headers = { "User-Agent": FINNOKO_USER_AGENT, "Accept": "application/json", "Content-Type": "application/json" };
+  const body = JSON.stringify({ searchText: "" });
+
+  if (transport.kind === "https_extra_ca") {
+    let res: { status: number; text: string };
+    try {
+      res = await httpsPostText(DEBIO_REGISTER_URL, body, headers, transport.ca, timeoutMs);
+    } catch (e) {
+      throw new Error(`${describeFetchError(e)} (extra CA)`);
+    }
+    if (res.status < 200 || res.status > 299) throw httpError(res.status, res.text);
+    return normalizeRegisterResponse(parseJson(res.text));
+  }
+
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), DEBIO_REGISTER_TIMEOUT_MS);
+  let timedOut = false;
+  const t = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutMs);
   // The timeout covers the body read too (a body that hangs is aborted).
   let data: unknown;
   try {
-    const res = await fetchImpl(DEBIO_REGISTER_URL, {
-      method: "POST",
-      headers: { "User-Agent": FINNOKO_USER_AGENT, "Accept": "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ searchText: "" }),
-      signal: ctl.signal,
-    });
-    if (!res.ok) throw new Error(`debio register HTTP ${res.status}`);
+    let res: Response;
+    try {
+      res = await transport.fetchImpl(DEBIO_REGISTER_URL, { method: "POST", headers, body, signal: ctl.signal });
+    } catch (e) {
+      throw new Error(timedOut ? `timeout after ${timeoutMs} ms` : describeFetchError(e));
+    }
+    if (!res.ok) {
+      let bodyText = "";
+      try { bodyText = typeof res.text === "function" ? await res.text() : ""; } catch { /* body unreadable */ }
+      throw httpError(res.status, bodyText);
+    }
     try {
       data = await res.json();
     } catch (e) {
+      if (timedOut) throw new Error(`timeout after ${timeoutMs} ms (reading body)`);
       throw new Error(`debio register JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   } finally {

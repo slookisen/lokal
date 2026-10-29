@@ -50754,6 +50754,27 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S1b: register fetch failures report the full cause chain
+// (TLS code, ECONNREFUSED, own timeout, HTTP status + body snippet) and the
+// optional DEBIO_REGISTER_EXTRA_CA_PEM node:https client (invalid PEM →
+// extra_ca_invalid; local self-signed https server on 127.0.0.1). runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S1b: fetch-feildiagnose + ekstra CA ──");
+  try {
+    const { runDebioRegisterS1bTests } = require("../src/services/debio-register-s1b.test") as
+      typeof import("../src/services/debio-register-s1b.test");
+    const r = await runDebioRegisterS1bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("debio-register-s1b: " + f);
+    console.log(`  debio-register-s1b: ${r.passed} passed, ${r.failed} failed${r.skipped.length ? `, skipped: ${r.skipped.join("; ")}` : ""}`);
+  } catch (err: any) {
+    failed++;
+    failures.push("debio-register-s1b: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
 // product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
 // robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
