@@ -251,6 +251,10 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
       assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 0 }).length, 1, "d7.4: finishedSinceMinutes=0 == unset");
       assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 60 }).length, 2, "d7.4: with option, run started 2h ago finished 1 min ago is included (90-min-old finish still excluded)");
       assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 60, agent: "nobody" }).length, 0, "d7.4: agent filter ANDs with the OR-part");
+      // started_at-fresh rows stay in even when finished_at is old or NULL (pins the OR, not finished_at-only)
+      clear();
+      put("platform-orchestrator", 30, null, null);
+      assertEq(listRecentRuns({ sinceHours: 1, finishedSinceMinutes: 5 }).length, 1, "d7.4: in-flight run started 30 min ago is still listed with the option");
 
       // knob parsing
       assertEq(resolveFinishedLookbackMin(undefined, 45), 60, "d7: default lookback = windowMin + 15");
@@ -259,6 +263,10 @@ export function runAdminLoopDispatchTests(opts: { log?: boolean } = {}): TestSum
       assertEq(resolveFinishedLookbackMin("-5", 45), 60, "d7: negative -> default");
       assertEq(resolveFinishedLookbackMin("abc", 45), 60, "d7: garbage -> default");
       assertEq(resolveFinishedLookbackMin("1.5", 45), 60, "d7: non-integer -> default");
+      assertEq(resolveFinishedLookbackMin("999999999999", 45), 1440, "d7: huge value clamped to 1440");
+      process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN = "999999999999";
+      assertEq(Array.isArray(planNow().wake), true, "d7: planNow does not throw on a huge knob value");
+      delete process.env.DISPATCH_PLAN_FINISHED_LOOKBACK_MIN;
     } finally {
       for (const k of envKeys) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
       restoreDb();
