@@ -19,7 +19,7 @@ import {
   roundNok,
   type ProductUnit,
 } from "./normalize";
-import { dropPrice, gateVerdict } from "./rules";
+import { dropPrice, gateVerdict, isEventShopCategory } from "./rules";
 
 export type ProductImportTier = "shopify" | "woocommerce" | "jsonld" | "llm";
 
@@ -48,7 +48,7 @@ export interface WooExcluded {
   name: string;
   source_url: string;
   tier: "woocommerce";
-  reason: "excluded_service" | "excluded_password_protected" | "excluded_check_failed";
+  reason: "excluded_service" | "excluded_event_category" | "excluded_password_protected" | "excluded_check_failed";
   raw_price_text: string | null;
 }
 
@@ -163,6 +163,10 @@ export function parseWooStoreProducts(
     const categories = Array.isArray(p.categories)
       ? p.categories.map((c: any) => (typeof c?.name === "string" ? decodeHtmlEntities(c.name) : "")).filter(Boolean).join(" ")
       : "";
+    if (isEventShopCategory(categories)) {
+      excluded?.push({ name, source_url, tier: "woocommerce", reason: "excluded_event_category", raw_price_text });
+      continue;
+    }
     const verdict = gateVerdict(name, categories);
     if (verdict === "service" || verdict === "check_failed") {
       excluded?.push({

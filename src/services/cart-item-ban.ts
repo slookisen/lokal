@@ -212,9 +212,6 @@ const SERVICE_CATEGORIES = new Set([
   "experience", "experiences", "opplevelse", "opplevelser", "service", "services", "tjeneste", "tjenester",
   "accommodation", "overnatting", "activity", "aktivitet", "aktiviteter", "tour", "tours", "event", "events",
   "booking", "dining", "restaurant", "kurs",
-  // Product import (2026-10-29): WooCommerce shops file events under their
-  // own category «Arrangement(er)»; «arrangement» is already a service WORD.
-  "arrangement", "arrangementer",
 ]);
 const ALCOHOL_CATEGORIES = new Set([
   "alcohol", "alkohol", "spirits", "brennevin", "beer", "ol", "wine", "vin", "cider", "sider", "mead", "mjod",

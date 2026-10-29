@@ -255,7 +255,6 @@ export async function runOrderBestillingerSkive1Tests(opts: { log?: boolean } = 
       assertEq(c("Spesialdrikk", "beverages", [], "En sterk drikk med alkohol"), "alcohol", "ban-cat: beverages + an alcohol word in the description");
       assertEq(c("Spesialdrikk", "dairy", [], "En sterk drikk med alkohol"), null, "ban-cat: an alcohol word in the description alone is not enough outside beverages");
       assertEq(c("Opplevelse for to", "experience"), "service", "ban-cat: a service category");
-      assertEq(c("Operapub fredag 18. desember", "Arrangement"), "service", "ban-cat: a shop's own «Arrangement» category is a service");
       assertEq(c("Whisky", "alcohol"), "alcohol", "ban-cat: an alcohol category");
       assertEq(c(null as any), null, "ban-edge: null name never throws");
     }

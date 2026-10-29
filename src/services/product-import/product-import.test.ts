@@ -449,6 +449,7 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
         wooItem({ name: "Veterinærtreff (91) på Kringler Gjestegård 3.april 2027", type: "variable", is_password_protected: true, permalink: "https://gardwoo2.no/nettbutikk/veterinaertreff/", prices: { price: "285000", price_range: { min_amount: "285000", max_amount: "465000" } } }),
         wooItem({ name: "Operapub på gården fredag 18. desember", permalink: "https://gardwoo2.no/nettbutikk/operapub/", categories: [{ name: "Arrangement" }], prices: { price: "37500" } }),
         wooItem({ name: "Ostesmaking for grupper", permalink: "https://gardwoo2.no/nettbutikk/ostesmaking/", prices: { price: "45000" } }),
+        wooItem({ name: "Gavekort hos partner", type: "external", is_purchasable: false, permalink: "https://gardwoo2.no/produkt/gavekort/", prices: { price: "50000" } }),
       ];
       const f = makeFetch({
         "https://gardwoo2.no/robots.txt": ROBOTS_OPEN,
@@ -464,6 +465,7 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
           ["Julepølser 500 g", 115, false, []],
           ["Gammel stabbur-pris", null, false, ["price_not_purchasable"]],
           ["Kjøttpakke", 1200, true, []],
+          ["Gavekort hos partner", 500, false, []],
         ],
         "rules woo: not purchasable / price 0 → no price; normal item unchanged; variation range → lowest + from",
       );
@@ -473,28 +475,32 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
         r.excluded.map((x) => [x.name, x.reason]),
         [
           ["Veterinærtreff (91) på Kringler Gjestegård 3.april 2027", "excluded_password_protected"],
-          ["Operapub på gården fredag 18. desember", "excluded_service"],
+          ["Operapub på gården fredag 18. desember", "excluded_event_category"],
           ["Ostesmaking for grupper", "excluded_service"],
         ],
-        "rules woo: password-protected and service/event (gate classifier, incl. the shop's «Arrangement» category) excluded with reason",
+        "rules woo: password-protected, the shop's «Arrangement» category (import-only) and service (gate classifier) excluded with reason",
       );
     }
-    // A Woo shop with only events: nothing kept → the next tier is tried.
-    robots.__clearRobotsCacheForTesting();
-    {
-      const woo = [wooItem({ name: "Ostesmaking for grupper", permalink: "https://bare-event.no/x/", prices: { price: "45000" } })];
+    // A Woo shop selling only events: the tier found candidates and excluded
+    // them all → no_products_found, NO fall-through to HTML/LLM, no duplicates.
+    for (const [host, items] of [
+      ["bare-event.no", [wooItem({ name: "Operapub fredag 18. desember", permalink: "https://bare-event.no/x/", categories: [{ name: "Arrangement" }], prices: { price: "37500" } })]],
+      ["bare-smaking.no", [wooItem({ name: "Ostesmaking for grupper", permalink: "https://bare-smaking.no/x/", prices: { price: "45000" } })]],
+    ] as Array<[string, any[]]>) {
+      robots.__clearRobotsCacheForTesting();
       const f = makeFetch({
-        "https://bare-event.no/robots.txt": ROBOTS_OPEN,
-        "https://bare-event.no/wp-json/wc/store/v1/products?per_page=100": { body: JSON.stringify(woo), contentType: "application/json" },
-        "https://bare-event.no/": { body: HTML("<p>Velkommen</p>") },
+        [`https://${host}/robots.txt`]: ROBOTS_OPEN,
+        [`https://${host}/wp-json/wc/store/v1/products?per_page=100`]: { body: JSON.stringify(items), contentType: "application/json" },
+        [`https://${host}/`]: { body: HTML('<a href="/priser">Priser</a><p>Operapub fredag 18. desember 375 kr. Ostesmaking for grupper 450 kr.</p>') },
       });
-      const r = await ex.extractProductsFromWebsite("https://bare-event.no", {
-        fetchImpl: f.impl,
-        llm: async () => ({ text: "INGEN_PRODUKTER_FUNNET" }),
-      });
-      assertEq([r.outcome, r.tier, r.excluded.length], ["no_products_found", null, 1], "rules woo: all excluded → falls through, exclusion still recorded");
+      const r = await ex.extractProductsFromWebsite(`https://${host}`, { fetchImpl: f.impl, llm: noLlm });
+      assertEq(
+        [r.outcome, r.tier, r.products.length, r.llm_calls, r.excluded.length],
+        ["no_products_found", null, 0, 0, 1],
+        `rules woo ${host}: events-only shop → no_products_found, no LLM call, one exclusion`,
+      );
+      assertTrue(!f.calls.includes(`https://${host}/`), `rules woo ${host}: no fall-through to the homepage`);
     }
-
     // Shopify variants at different prices → lowest + from (unchanged rule, pinned).
     robots.__clearRobotsCacheForTesting();
     {
@@ -534,6 +540,7 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
           "<li>Sommerhonning fra Lillestrøm, 250g 0 NOK – kommer høsten</li>" +
           "<li>Høsthonning 150 kr – kommer høsten</li>" +
           "<li>Lammelår 299 kr</li>" +
+          "<li>Juleribbe – kommer i desember 349 kr</li>" +
           "<li>Gårdsomvisning 250 kr</li>" +
           "</ul>",
       );
@@ -553,6 +560,7 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
             { name: "Sommerhonning fra Lillestrøm, 250g", price: "0 NOK", unit: "g" },
             { name: "Høsthonning", price: "150 kr – kommer høsten", unit: null },
             { name: "Lammelår", price: "299 kr", unit: "kg" },
+            { name: "Juleribbe – kommer i desember", price: "349 kr", unit: null },
             { name: "Gårdsomvisning", price: "250 kr", unit: null },
           ]),
         }),
@@ -568,6 +576,7 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
           ["Sommerhonning fra Lillestrøm, 250g", null, null, null, false, ["price_zero_dropped"]],
           ["Høsthonning", null, null, null, false, ["price_placeholder_dropped"]],
           ["Lammelår", 299, null, null, false, ["unit_unstated_dropped"]],
+          ["Juleribbe – kommer i desember", 349, null, null, false, []],
         ],
         "rules llm: pack weight → pakke (name keeps «10 kg»); explicit kr/kg → kg; 585/985 → 585 + from; 0 NOK and «kommer høsten» → no price",
       );
@@ -585,6 +594,12 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
     assertEq(norm.nokPriceValues("1.200,-"), [1200], "nokPriceValues: thousands");
     assertEq(norm.nokPriceValues("150–250 kr"), [150, 250], "nokPriceValues: range");
     assertEq(norm.packSizeIn("5kg. 1.200,-"), "5 kg", "packSizeIn: 5kg.");
+    const rulesMod = require("./rules") as typeof import("./rules");
+    assertEq(
+      [rulesMod.isEventShopCategory("Gårdsmat Arrangement"), rulesMod.isEventShopCategory("Arrangementer"), rulesMod.isEventShopCategory("Arrangementsmat"), rulesMod.isEventShopCategory("Gårdsmat")],
+      [true, true, false, false],
+      "isEventShopCategory: whole token only",
+    );
     assertTrue(llmMod.buildProductImportPrompt("x").includes("pakkestørrelsen"), "prompt: pack-weight rule stated");
 
     // ── AC5: host + SSRF ───────────────────────────────────────────────────

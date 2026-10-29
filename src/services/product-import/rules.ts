@@ -34,7 +34,11 @@ export type CandidateRule =
   | "unit_unstated_dropped"
   | "flag_alcohol";
 
-export type ExclusionReason = "excluded_service" | "excluded_password_protected" | "excluded_check_failed";
+export type ExclusionReason =
+  | "excluded_service"
+  | "excluded_event_category"
+  | "excluded_password_protected"
+  | "excluded_check_failed";
 
 export interface ExcludedCandidate {
   name: string;
@@ -72,6 +76,20 @@ export function gateVerdict(name: string, category?: string | null): "service" |
   }
 }
 
+/**
+ * Import-only: the shop's own category says event («Arrangement»,
+ * «Arrangementer»), as a whole token. Kept here, not in cart-item-ban.ts, so
+ * this import slice never changes the real order gate. PURE.
+ */
+export function isEventShopCategory(category: string | null | undefined): boolean {
+  return String(category ?? "")
+    .toLowerCase()
+    .replace(/å/g, "a").replace(/ø/g, "o").replace(/æ/g, "ae")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z0-9%]+/)
+    .some((t) => t === "arrangement" || t === "arrangementer");
+}
+
 /** Apply the rules to one tier's candidates. Mutates the kept candidates' price fields. PURE otherwise. */
 export function applyCandidateRules(items: ProductCandidate[]): { kept: ProductCandidate[]; excluded: ExcludedCandidate[] } {
   const kept: ProductCandidate[] = [];
@@ -87,7 +105,8 @@ export function applyCandidateRules(items: ProductCandidate[]): { kept: ProductC
       continue;
     }
     if (verdict === "alcohol" && !c.rules.includes("flag_alcohol")) c.rules.push("flag_alcohol");
-    if (c.price_nok !== null && (isComingSoonPlaceholder(c.raw_price_text) || isComingSoonPlaceholder(c.name))) {
+    // The PRICE text only: «Juleribbe – kommer i desember» with a real price keeps it.
+    if (c.price_nok !== null && isComingSoonPlaceholder(c.raw_price_text)) {
       dropPrice(c, "price_placeholder_dropped");
     }
     if (c.price_nok === 0) dropPrice(c, "price_zero_dropped");

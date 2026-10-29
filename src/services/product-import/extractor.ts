@@ -349,13 +349,15 @@ export async function extractProductsFromWebsite(
     return finish("robots_blocked");
   }
 
-  // The candidate rules (./rules.ts) run before dedupe/cap. A tier whose
-  // every candidate is excluded (a shop selling only events) yields nothing,
-  // so the next tier is tried — exactly as for a tier that found nothing.
-  const done = (tier: ProductImportTier, items: ProductCandidate[]): ProductImportResult | null => {
+  // The candidate rules (./rules.ts) run before dedupe/cap. A tier that
+  // FOUND candidates but excluded every one (a shop selling only events) is
+  // the answer: no_products_found, with the exclusions recorded. It never
+  // falls through to the HTML/LLM tiers, which only see names and would
+  // bring the same events back (and spend an LLM call).
+  const done = (tier: ProductImportTier, items: ProductCandidate[]): ProductImportResult => {
     const { kept, excluded } = applyCandidateRules(items);
     result.excluded.push(...excluded);
-    if (kept.length === 0) return null;
+    if (kept.length === 0) return finish("no_products_found");
     result.tier = tier;
     result.products = dedupeCap(kept);
     return finish("ok");
@@ -367,8 +369,7 @@ export async function extractProductsFromWebsite(
     const r = await doFetch(shopifyUrl, "json", true);
     if (r.ok) {
       const items = parseShopifyProductsJson(r.html, origin, allowed);
-      const r1 = items.length > 0 ? done("shopify", items) : null;
-      if (r1) return r1;
+      if (items.length > 0) return done("shopify", items);
     }
   }
 
@@ -380,8 +381,7 @@ export async function extractProductsFromWebsite(
       const wooExcluded: WooExcluded[] = [];
       const items = parseWooStoreProducts(r.html, origin, allowed, wooExcluded);
       result.excluded.push(...wooExcluded);
-      const r2 = items.length > 0 ? done("woocommerce", items) : null;
-      if (r2) return r2;
+      if (items.length > 0 || wooExcluded.length > 0) return done("woocommerce", items);
     }
   }
 
@@ -410,8 +410,7 @@ export async function extractProductsFromWebsite(
   // ── Tier 3: JSON-LD ───────────────────────────────────────────────────────
   const ld: ProductCandidate[] = [];
   for (const p of pages) ld.push(...parseJsonLdProducts(p.html, p.url, allowed));
-  const r3 = ld.length > 0 ? done("jsonld", ld) : null;
-  if (r3) return r3;
+  if (ld.length > 0) return done("jsonld", ld);
 
   // js_unreadable: almost no visible text AND the page is a script shell —
   // a short but plain static page still goes to the LLM tier.
@@ -454,5 +453,5 @@ export async function extractProductsFromWebsite(
     const page = ordered.find((p) => groundingHaystack(p.text).includes(key)) ?? ordered[0]!;
     return { ...g, source_url: page.url, tier: "llm" as const };
   });
-  return done("llm", items) ?? finish("no_products_found");
+  return done("llm", items);
 }
