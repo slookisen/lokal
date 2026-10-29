@@ -50816,3 +50816,25 @@ runSerial(async () => {
     failures.push("product-import: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request «RFB bestillinger fra start til slutt for eier», slice B1: the
+// shared orderability core (gate unchanged over one fixture row per reason,
+// against a verbatim copy of the pre-B1 gate), countOrderableProducts and
+// «Mine valg», and the /eier «Varer som kan bestilles» card + confirm/add
+// POSTs behind OWNER_ORDERABILITY_PORTAL_ENABLED (off = unchanged). Swaps the
+// getDb() singleton and env vars (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── RFB bestillinger B1: bestillbare varer for eier ──");
+  try {
+    const { runOwnerOrderabilityB1Tests } = require("../src/services/owner-orderability-b1.test") as
+      typeof import("../src/services/owner-orderability-b1.test");
+    const r = await runOwnerOrderabilityB1Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-orderability-b1: " + f);
+    console.log(`  owner-orderability-b1: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-orderability-b1: unexpected error: " + String(err?.message || err));
+  }
+});

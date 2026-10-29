@@ -85,6 +85,19 @@ export function computeEffectiveAvailability(
   return availability;
 }
 
+/**
+ * When a producer_dashboard-sourced availability stops being trusted by
+ * computeEffectiveAvailability(): `availabilityUpdatedAt` + the staleness
+ * window. null when there is no (parseable) timestamp. Pure; read-only helper
+ * for the owner portal (dev-request rfb-bestillinger B1), never used by a gate.
+ */
+export function producerStockExpiresAt(availabilityUpdatedAt: string | null): Date | null {
+  if (!availabilityUpdatedAt) return null;
+  const updatedAt = parseTimestamp(availabilityUpdatedAt);
+  if (Number.isNaN(updatedAt.getTime())) return null;
+  return new Date(updatedAt.getTime() + getSupplyGraphStaleDays() * MS_PER_DAY);
+}
+
 // Skive 4b (S9): a row the admin confirmed with the producer
 // ('admin_producer_confirmed') keeps that source when the producer changes the
 // stock status in the portal. The write path only updates availability and its
