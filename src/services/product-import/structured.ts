@@ -19,6 +19,7 @@ import {
   roundNok,
   type ProductUnit,
 } from "./normalize";
+import { dropPrice, gateVerdict } from "./rules";
 
 export type ProductImportTier = "shopify" | "woocommerce" | "jsonld" | "llm";
 
@@ -30,6 +31,25 @@ export interface ProductCandidate {
   price_is_from: boolean;
   source_url: string;
   tier: ProductImportTier;
+  /**
+   * The price exactly as the source had it, before any rule (Shopify variant
+   * prices, the Store API's minor-unit price fields, JSON-LD offer prices,
+   * the model's price string). null when the source had none. For audit.
+   */
+  raw_price_text: string | null;
+  /** The pack weight/volume when the unit was a pack size («10 kg»), else null. */
+  pack_size: string | null;
+  /** The rules (./rules.ts) that changed this candidate, e.g. price_zero_dropped. */
+  rules: string[];
+}
+
+/** A Store API product excluded before it became a candidate. */
+export interface WooExcluded {
+  name: string;
+  source_url: string;
+  tier: "woocommerce";
+  reason: "excluded_service" | "excluded_password_protected" | "excluded_check_failed";
+  raw_price_text: string | null;
 }
 
 function safeJsonParse(body: string): unknown {
@@ -88,6 +108,7 @@ export function parseShopifyProductsJson(
     } else {
       unit = detectPriceUnit(name);
     }
+    const rawPrices = variants.map((v) => v?.price).filter((v) => v !== undefined && v !== null).map(String);
     const handle = typeof p.handle === "string" && /^[\w-]+$/.test(p.handle) ? p.handle : null;
     const source_url = handle ? `${origin}/products/${handle}` : `${origin}/products.json`;
     out.push({
@@ -98,6 +119,9 @@ export function parseShopifyProductsJson(
       price_is_from: isFrom,
       source_url: sameHostUrl(source_url, origin, allowedHosts) ?? `${origin}/products.json`,
       tier: "shopify",
+      raw_price_text: rawPrices.length ? rawPrices.join(" | ") : null,
+      pack_size: null,
+      rules: [],
     });
   }
   return out;
@@ -109,6 +133,8 @@ export function parseWooStoreProducts(
   body: string,
   origin: string,
   allowedHosts: ReadonlySet<string>,
+  /** Receives the products dropped here (password-protected, service/event). */
+  excluded?: WooExcluded[],
 ): ProductCandidate[] {
   const parsed = safeJsonParse(body);
   if (!Array.isArray(parsed)) return [];
@@ -118,28 +144,67 @@ export function parseWooStoreProducts(
     if (!p || typeof p !== "object") continue;
     const name = normalizeProductName(decodeHtmlEntities(String(p.name ?? "")));
     if (!name) continue;
+    const source_url = sameHostUrl(p.permalink, origin, allowedHosts) ?? apiUrl;
     const prices = p.prices && typeof p.prices === "object" ? p.prices : null;
+    const range = prices?.price_range && typeof prices.price_range === "object" ? prices.price_range : null;
+    const raw_price_text = prices
+      ? `price=${String(prices.price ?? "")}` +
+        (range ? ` range=${String(range.min_amount ?? "")}-${String(range.max_amount ?? "")}` : "") +
+        ` minor=${String(prices.currency_minor_unit ?? "")} ${String(prices.currency_code ?? "")}`.trimEnd()
+      : null;
+    // A password-protected product is not on public sale (prod 2026-10-29:
+    // a professional meeting behind a password).
+    if (p.is_password_protected === true) {
+      excluded?.push({ name, source_url, tier: "woocommerce", reason: "excluded_password_protected", raw_price_text });
+      continue;
+    }
+    // Services / events by the cart gate's own classifier, with the shop's
+    // own category names (e.g. «Arrangement») as the category.
+    const categories = Array.isArray(p.categories)
+      ? p.categories.map((c: any) => (typeof c?.name === "string" ? decodeHtmlEntities(c.name) : "")).filter(Boolean).join(" ")
+      : "";
+    const verdict = gateVerdict(name, categories);
+    if (verdict === "service" || verdict === "check_failed") {
+      excluded?.push({
+        name,
+        source_url,
+        tier: "woocommerce",
+        reason: verdict === "service" ? "excluded_service" : "excluded_check_failed",
+        raw_price_text,
+      });
+      continue;
+    }
     let price: number | null = null;
     let isFrom = false;
     if (prices && isNok(prices.currency_code)) {
       const minor = Number.isInteger(prices.currency_minor_unit) ? prices.currency_minor_unit : 2;
       const scale = Math.pow(10, Math.max(0, Math.min(4, minor)));
-      const range = prices.price_range && typeof prices.price_range === "object" ? prices.price_range : null;
       const rawMin = range ? parseMachinePrice(range.min_amount) : null;
       const rawMax = range ? parseMachinePrice(range.max_amount) : null;
       const rawPrice = rawMin ?? parseMachinePrice(prices.price);
       if (rawPrice !== null) price = roundNok(rawPrice / scale);
+      // Several variations at different prices → lowest, «fra».
       isFrom = rawMin !== null && rawMax !== null && rawMin !== rawMax;
     }
-    out.push({
+    const c: ProductCandidate = {
       name,
       price_nok: price,
       price_text: formatPriceText(price, "NOK", isFrom),
       unit: detectPriceUnit(name),
       price_is_from: isFrom,
-      source_url: sameHostUrl(p.permalink, origin, allowedHosts) ?? apiUrl,
+      source_url,
       tier: "woocommerce",
-    });
+      raw_price_text,
+      pack_size: null,
+      rules: [],
+    };
+    if (verdict === "alcohol") c.rules.push("flag_alcohol");
+    // Not purchasable («Les mer», «kontakt oss», no buy button): the Store
+    // API reports price "0" or a stale price that is not on sale. An
+    // external/affiliate product is never purchasable here but shows a real
+    // price, so it keeps it.
+    if (p.is_purchasable === false && p.type !== "external" && c.price_nok !== null) dropPrice(c, "price_not_purchasable");
+    out.push(c);
   }
   return out;
 }
@@ -207,12 +272,15 @@ export function parseJsonLdProducts(
       let isFrom = false;
       let unit: ProductUnit | null = null;
       const values: number[] = [];
+      const rawPrices: string[] = [];
       for (const offer of offers) {
         if (!offer || typeof offer !== "object") continue;
         const spec = Array.isArray(offer.priceSpecification) ? offer.priceSpecification[0] : offer.priceSpecification;
         const currency = offer.priceCurrency ?? spec?.priceCurrency;
         if (!isNok(currency)) continue;
         if (hasType(offer, "AggregateOffer")) {
+          if (offer.lowPrice !== undefined) rawPrices.push(`low=${String(offer.lowPrice)}`);
+          if (offer.highPrice !== undefined) rawPrices.push(`high=${String(offer.highPrice)}`);
           const low = parseMachinePrice(offer.lowPrice);
           const high = parseMachinePrice(offer.highPrice);
           if (low !== null) {
@@ -220,7 +288,9 @@ export function parseJsonLdProducts(
             if (high === null || high !== low) isFrom = true;
           }
         } else {
-          const p = parseMachinePrice(offer.price ?? spec?.price);
+          const rawP = offer.price ?? spec?.price;
+          if (rawP !== undefined && rawP !== null) rawPrices.push(String(rawP));
+          const p = parseMachinePrice(rawP);
           if (p !== null) values.push(p);
         }
         unit = unit ?? offerUnit(offer);
@@ -239,6 +309,9 @@ export function parseJsonLdProducts(
         price_is_from: isFrom,
         source_url: sameHostUrl(node.url, pageUrl, allowedHosts) ?? pageUrl,
         tier: "jsonld",
+        raw_price_text: rawPrices.length ? rawPrices.join(" | ") : null,
+        pack_size: null,
+        rules: [],
       });
     }
   }

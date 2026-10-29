@@ -160,6 +160,19 @@ export function summarizeDryRun(rows: DryRunResultRow[]) {
     share_with_priced_product: share(count(priced), rows.length),
     products_total: allProducts.length,
     products_priced: allProducts.filter((p) => p.price_nok !== null).length,
+    // Audit of the candidate rules (./rules.ts): how often each fired, and
+    // what was excluded and why. Older stored results have neither field.
+    rule_counts: (() => {
+      const o: Record<string, number> = {};
+      for (const p of allProducts) for (const rule of p.rules ?? []) o[rule] = (o[rule] ?? 0) + 1;
+      return o;
+    })(),
+    excluded_total: rows.reduce((n, r) => n + (r.result.excluded?.length ?? 0), 0),
+    excluded_reasons: (() => {
+      const o: Record<string, number> = {};
+      for (const r of rows) for (const e of r.result.excluded ?? []) o[e.reason] = (o[e.reason] ?? 0) + 1;
+      return o;
+    })(),
     products_per_profile: {
       mean_all: rows.length ? Math.round((allProducts.length / rows.length) * 100) / 100 : 0,
       mean_with_products: withProducts.length
@@ -345,6 +358,7 @@ export function getDryRun(runId: string, opts: { includeCandidates?: boolean } =
       fetched_urls: parsed.fetched_urls,
       rejected_urls: parsed.rejected_urls,
       robots_skipped: parsed.robots_skipped,
+      excluded: parsed.excluded ?? [],
       ...(opts.includeCandidates === false ? {} : { candidates: parsed.products ?? [] }),
     };
   });

@@ -418,6 +418,175 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       assertEq([r.outcome, r.llm_status, r.llm_calls, budget.used], ["no_products_found", "budget_exhausted", 0, 1], "LLM cap: no call past the cap");
     }
 
+    // ── Accuracy rules (prod measurement 2026-10-29, 70.6 %) ──────────────
+    // A2A reports/2026-10-29-produktimport-maaling.md, error types 1–4.
+    const wooItem = (o: Record<string, any>) => ({
+      id: 1,
+      type: "simple",
+      is_purchasable: true,
+      is_in_stock: true,
+      is_password_protected: false,
+      categories: [],
+      add_to_cart: { text: "Legg i handlekurv" },
+      ...o,
+      prices: {
+        currency_code: "NOK",
+        currency_minor_unit: 2,
+        price_range: null,
+        ...(o.prices ?? {}),
+      },
+    });
+    robots.__clearRobotsCacheForTesting();
+    {
+      // Shapes copied from real Store API responses (bjerkemat.no,
+      // ergagardsutsalg.no, torresvangen.no, kringler.no — 2026-10-29).
+      const woo = [
+        wooItem({ name: "Brie de Paris", permalink: "https://gardwoo2.no/produkt/brie-de-paris/", is_purchasable: false, add_to_cart: { text: "Les mer" }, prices: { price: "0", regular_price: "0" } }),
+        wooItem({ name: "Kvitlin", permalink: "https://gardwoo2.no/produkt/kvitlin/", add_to_cart: { text: "Skriv inn sum" }, prices: { price: "0", regular_price: "0" } }),
+        wooItem({ name: "Julepølser 500 g", permalink: "https://gardwoo2.no/produkt/julepolser-500-g/", categories: [{ name: "Gårdsmat" }], prices: { price: "11500" } }),
+        wooItem({ name: "Gammel stabbur-pris", permalink: "https://gardwoo2.no/produkt/gammel/", is_purchasable: false, prices: { price: "9900" } }),
+        wooItem({ name: "Kjøttpakke", type: "variable", permalink: "https://gardwoo2.no/produkt/kjottpakke/", prices: { price: "120000", price_range: { min_amount: "120000", max_amount: "180000" } } }),
+        wooItem({ name: "Veterinærtreff (91) på Kringler Gjestegård 3.april 2027", type: "variable", is_password_protected: true, permalink: "https://gardwoo2.no/nettbutikk/veterinaertreff/", prices: { price: "285000", price_range: { min_amount: "285000", max_amount: "465000" } } }),
+        wooItem({ name: "Operapub på gården fredag 18. desember", permalink: "https://gardwoo2.no/nettbutikk/operapub/", categories: [{ name: "Arrangement" }], prices: { price: "37500" } }),
+        wooItem({ name: "Ostesmaking for grupper", permalink: "https://gardwoo2.no/nettbutikk/ostesmaking/", prices: { price: "45000" } }),
+      ];
+      const f = makeFetch({
+        "https://gardwoo2.no/robots.txt": ROBOTS_OPEN,
+        "https://gardwoo2.no/wp-json/wc/store/v1/products?per_page=100": { body: JSON.stringify(woo), contentType: "application/json" },
+      });
+      const r = await ex.extractProductsFromWebsite("https://gardwoo2.no", { fetchImpl: f.impl, llm: noLlm });
+      assertEq(r.tier, "woocommerce", "rules woo: tier");
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.price_is_from, x.rules]),
+        [
+          ["Brie de Paris", null, false, ["price_not_purchasable"]],
+          ["Kvitlin", null, false, ["price_zero_dropped"]],
+          ["Julepølser 500 g", 115, false, []],
+          ["Gammel stabbur-pris", null, false, ["price_not_purchasable"]],
+          ["Kjøttpakke", 1200, true, []],
+        ],
+        "rules woo: not purchasable / price 0 → no price; normal item unchanged; variation range → lowest + from",
+      );
+      assertEq(r.products[0]!.raw_price_text, "price=0 minor=2 NOK", "rules woo: raw Store API price kept for audit");
+      assertEq(r.products[2]!.price_text, "115 NOK", "rules woo: normal item price text unchanged");
+      assertEq(
+        r.excluded.map((x) => [x.name, x.reason]),
+        [
+          ["Veterinærtreff (91) på Kringler Gjestegård 3.april 2027", "excluded_password_protected"],
+          ["Operapub på gården fredag 18. desember", "excluded_service"],
+          ["Ostesmaking for grupper", "excluded_service"],
+        ],
+        "rules woo: password-protected and service/event (gate classifier, incl. the shop's «Arrangement» category) excluded with reason",
+      );
+    }
+    // A Woo shop with only events: nothing kept → the next tier is tried.
+    robots.__clearRobotsCacheForTesting();
+    {
+      const woo = [wooItem({ name: "Ostesmaking for grupper", permalink: "https://bare-event.no/x/", prices: { price: "45000" } })];
+      const f = makeFetch({
+        "https://bare-event.no/robots.txt": ROBOTS_OPEN,
+        "https://bare-event.no/wp-json/wc/store/v1/products?per_page=100": { body: JSON.stringify(woo), contentType: "application/json" },
+        "https://bare-event.no/": { body: HTML("<p>Velkommen</p>") },
+      });
+      const r = await ex.extractProductsFromWebsite("https://bare-event.no", {
+        fetchImpl: f.impl,
+        llm: async () => ({ text: "INGEN_PRODUKTER_FUNNET" }),
+      });
+      assertEq([r.outcome, r.tier, r.excluded.length], ["no_products_found", null, 1], "rules woo: all excluded → falls through, exclusion still recorded");
+    }
+
+    // Shopify variants at different prices → lowest + from (unchanged rule, pinned).
+    robots.__clearRobotsCacheForTesting();
+    {
+      const shopify = {
+        products: [
+          { title: "Spekeskinke", handle: "spekeskinke", variants: [{ title: "Hel", price: "1890.00" }, { title: "Halv", price: "990.00" }, { title: "Skiver 100 g", price: "179.00" }] },
+          { title: "Gratisprøve", handle: "prove", variants: [{ title: "Default Title", price: "0.00" }] },
+          { title: "Ostesmaking", handle: "ostesmaking", variants: [{ title: "Default Title", price: "450.00" }] },
+        ],
+      };
+      const f = makeFetch({
+        "https://shopvar.no/robots.txt": ROBOTS_OPEN,
+        "https://shopvar.no/products.json?limit=250": { body: JSON.stringify(shopify), contentType: "application/json" },
+      });
+      const r = await ex.extractProductsFromWebsite("https://shopvar.no", { fetchImpl: f.impl, llm: noLlm });
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.price_is_from, x.raw_price_text, x.rules]),
+        [
+          ["Spekeskinke", 179, true, "1890.00 | 990.00 | 179.00", []],
+          ["Gratisprøve", null, false, "0.00", ["price_zero_dropped"]],
+        ],
+        "rules shopify: variants at different prices → lowest + from; price 0 → no price",
+      );
+      assertEq(r.excluded.map((x) => [x.name, x.reason, x.tier]), [["Ostesmaking", "excluded_service", "shopify"]], "rules shopify: service excluded by the gate classifier");
+    }
+
+    // LLM tier: pack weight, unit price, several prices, placeholder.
+    robots.__clearRobotsCacheForTesting();
+    {
+      const host = "pakke.no";
+      const page = HTML(
+        "<h1>Prisliste</h1><ul>" +
+          "<li>Poteter 10 kg 160,-</li>" +
+          "<li>Lam, 189 kr/kg</li>" +
+          "<li>Kjøttdeigspakken</li><li>5kg. 1.200,-</li>" +
+          "<li>Kokos, mango &amp; pasjonsfrukt 585,- 8-10 porsjoner / 985,- 16-20 porsjoner</li>" +
+          "<li>Sommerhonning fra Lillestrøm, 250g 0 NOK – kommer høsten</li>" +
+          "<li>Høsthonning 150 kr – kommer høsten</li>" +
+          "<li>Lammelår 299 kr</li>" +
+          "<li>Gårdsomvisning 250 kr</li>" +
+          "</ul>",
+      );
+      const f = makeFetch({
+        [`https://${host}/robots.txt`]: ROBOTS_OPEN,
+        [`https://${host}/`]: { body: HTML('<a href="/priser">Priser</a><p>Velkommen til gården.</p>') },
+        [`https://${host}/priser`]: { body: page },
+      });
+      const r = await ex.extractProductsFromWebsite(`https://${host}`, {
+        fetchImpl: f.impl,
+        llm: async () => ({
+          text: JSON.stringify([
+            { name: "Poteter 10 kg", price: "160,-", unit: "kg" },
+            { name: "Lam", price: "189 kr", unit: "kg" },
+            { name: "Kjøttdeigspakken", price: "1.200,-", unit: "kg" },
+            { name: "Kokos, mango & pasjonsfrukt", price: "585,- / 985,-", unit: null },
+            { name: "Sommerhonning fra Lillestrøm, 250g", price: "0 NOK", unit: "g" },
+            { name: "Høsthonning", price: "150 kr – kommer høsten", unit: null },
+            { name: "Lammelår", price: "299 kr", unit: "kg" },
+            { name: "Gårdsomvisning", price: "250 kr", unit: null },
+          ]),
+        }),
+      });
+      assertEq(r.tier, "llm", "rules llm: tier");
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.unit, x.pack_size, x.price_is_from, x.rules]),
+        [
+          ["Poteter 10 kg", 160, "pakke", "10 kg", false, ["unit_pack_weight"]],
+          ["Lam", 189, "kg", null, false, []],
+          ["Kjøttdeigspakken", 1200, "pakke", "5 kg", false, ["unit_pack_weight"]],
+          ["Kokos, mango & pasjonsfrukt", 585, null, null, true, ["price_multiple_lowest"]],
+          ["Sommerhonning fra Lillestrøm, 250g", null, null, null, false, ["price_zero_dropped"]],
+          ["Høsthonning", null, null, null, false, ["price_placeholder_dropped"]],
+          ["Lammelår", 299, null, null, false, ["unit_unstated_dropped"]],
+        ],
+        "rules llm: pack weight → pakke (name keeps «10 kg»); explicit kr/kg → kg; 585/985 → 585 + from; 0 NOK and «kommer høsten» → no price",
+      );
+      assertEq(r.products[0]!.raw_price_text, "160,-", "rules llm: the model's raw price kept for audit");
+      assertEq(r.excluded.map((x) => [x.name, x.reason, x.tier]), [["Gårdsomvisning", "excluded_service", "llm"]], "rules llm: service excluded by the gate classifier");
+    }
+    // Pure helpers.
+    assertEq(norm.statesUnitPrice("Lam, 189 kr/kg", "kg"), true, "statesUnitPrice: kr/kg");
+    assertEq(norm.statesUnitPrice("155,- kiloen inkl. mva", "kg"), true, "statesUnitPrice: kiloen");
+    assertEq(norm.statesUnitPrice("45 kr pr. liter", "l"), true, "statesUnitPrice: pr. liter");
+    assertEq(norm.statesUnitPrice("Poteter 10 kg 160,-", "kg"), false, "statesUnitPrice: pack weight is not a unit price");
+    assertEq(norm.statesUnitPrice("à 500 g", "g"), false, "statesUnitPrice: «à 500 g» is a pack");
+    assertEq(norm.nokPriceValues("kr 585,- / 985,-"), [585, 985], "nokPriceValues: two variants");
+    assertEq(norm.nokPriceValues("585,- 8-10 porsjoner / 985,- 16-20 porsjoner"), [585, 985], "nokPriceValues: portion counts are not prices");
+    assertEq(norm.nokPriceValues("1.200,-"), [1200], "nokPriceValues: thousands");
+    assertEq(norm.nokPriceValues("150–250 kr"), [150, 250], "nokPriceValues: range");
+    assertEq(norm.packSizeIn("5kg. 1.200,-"), "5 kg", "packSizeIn: 5kg.");
+    assertTrue(llmMod.buildProductImportPrompt("x").includes("pakkestørrelsen"), "prompt: pack-weight rule stated");
+
     // ── AC5: host + SSRF ───────────────────────────────────────────────────
     {
       const allowed = ex.allowedHostsFor("gard.no");
@@ -609,7 +778,9 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       assertEq(byId["pi-own-1"]?.candidates?.[0], {
         name: "Lammelår", price_nok: 289, price_text: "289 NOK", unit: "kg", price_is_from: false,
         source_url: "https://eier1.no/products/lam", tier: "shopify",
-      }, "candidate carries source_url and tier");
+        raw_price_text: "289.00", pack_size: null, rules: [],
+      }, "candidate carries source_url, tier and the audit fields (raw price, pack size, rules)");
+      assertEq(byId["pi-own-1"]?.excluded, [], "result carries the excluded list");
       const s = got.body.summary;
       assertEq(sortKeys(s.outcome_counts), sortKeys({ ok: 2, robots_blocked: 1, "fetch_failed:http_5xx": 1 }), "summary: per-outcome counts");
       assertEq(sortKeys(s.tier_counts), sortKeys({ shopify: 1, llm: 1, none: 2 }), "summary: tier distribution");
@@ -619,6 +790,7 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       assertTrue(typeof s.duration_ms?.mean_per_profile === "number", "summary: time per profile");
       assertTrue(typeof s.products_per_profile?.mean_with_products === "number", "summary: products per profile");
       assertEq(s.by_ownership.owned.profiles, 2, "summary: by ownership");
+      assertEq([s.excluded_total, s.excluded_reasons, typeof s.rule_counts], [0, {}, "object"], "summary: rule audit fields");
       const noCand = await callRoute(router, { method: "GET", path: `/dry-run/${runId}`, headers: { "x-admin-key": key } });
       assertTrue(Array.isArray(noCand.body.results), "GET results list");
       const list = await callRoute(router, { method: "GET", path: "/dry-run", headers: { "x-admin-key": key } });

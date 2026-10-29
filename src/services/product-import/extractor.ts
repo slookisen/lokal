@@ -38,6 +38,7 @@ import {
   parseWooStoreProducts,
   type ProductCandidate,
   type ProductImportTier,
+  type WooExcluded,
 } from "./structured";
 import {
   buildProductImportPrompt,
@@ -50,8 +51,10 @@ import {
   type ProductImportLlm,
 } from "./llm";
 import { PRODUCT_IMPORT_MAX_PRODUCTS, productNameKey } from "./normalize";
+import { applyCandidateRules, type ExcludedCandidate } from "./rules";
 
 export type { ProductCandidate, ProductImportTier } from "./structured";
+export type { ExcludedCandidate } from "./rules";
 
 export const PRODUCT_IMPORT_USER_AGENT = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 /** Requests per profile, robots.txt excluded (spec: "maks ~8 sider"). */
@@ -77,6 +80,8 @@ export interface ProductImportResult {
   outcome: ProductImportOutcome;
   tier: ProductImportTier | null;
   products: ProductCandidate[];
+  /** Candidates dropped by a rule (service/event, password-protected), with the reason. */
+  excluded: ExcludedCandidate[];
   pages_fetched: number;
   fetched_urls: string[];
   rejected_urls: Array<{ url: string; reason: string }>;
@@ -249,6 +254,7 @@ export async function extractProductsFromWebsite(
     outcome: "no_products_found",
     tier: null,
     products: [],
+    excluded: [],
     pages_fetched: 0,
     fetched_urls: [],
     rejected_urls: [],
@@ -343,9 +349,15 @@ export async function extractProductsFromWebsite(
     return finish("robots_blocked");
   }
 
-  const done = (tier: ProductImportTier, items: ProductCandidate[]): ProductImportResult => {
+  // The candidate rules (./rules.ts) run before dedupe/cap. A tier whose
+  // every candidate is excluded (a shop selling only events) yields nothing,
+  // so the next tier is tried — exactly as for a tier that found nothing.
+  const done = (tier: ProductImportTier, items: ProductCandidate[]): ProductImportResult | null => {
+    const { kept, excluded } = applyCandidateRules(items);
+    result.excluded.push(...excluded);
+    if (kept.length === 0) return null;
     result.tier = tier;
-    result.products = dedupeCap(items);
+    result.products = dedupeCap(kept);
     return finish("ok");
   };
 
@@ -355,7 +367,8 @@ export async function extractProductsFromWebsite(
     const r = await doFetch(shopifyUrl, "json", true);
     if (r.ok) {
       const items = parseShopifyProductsJson(r.html, origin, allowed);
-      if (items.length > 0) return done("shopify", items);
+      const r1 = items.length > 0 ? done("shopify", items) : null;
+      if (r1) return r1;
     }
   }
 
@@ -364,8 +377,11 @@ export async function extractProductsFromWebsite(
   if (allowedByRobots(wooUrl)) {
     const r = await doFetch(wooUrl, "json", true);
     if (r.ok) {
-      const items = parseWooStoreProducts(r.html, origin, allowed);
-      if (items.length > 0) return done("woocommerce", items);
+      const wooExcluded: WooExcluded[] = [];
+      const items = parseWooStoreProducts(r.html, origin, allowed, wooExcluded);
+      result.excluded.push(...wooExcluded);
+      const r2 = items.length > 0 ? done("woocommerce", items) : null;
+      if (r2) return r2;
     }
   }
 
@@ -394,7 +410,8 @@ export async function extractProductsFromWebsite(
   // ── Tier 3: JSON-LD ───────────────────────────────────────────────────────
   const ld: ProductCandidate[] = [];
   for (const p of pages) ld.push(...parseJsonLdProducts(p.html, p.url, allowed));
-  if (ld.length > 0) return done("jsonld", ld);
+  const r3 = ld.length > 0 ? done("jsonld", ld) : null;
+  if (r3) return r3;
 
   // js_unreadable: almost no visible text AND the page is a script shell —
   // a short but plain static page still goes to the LLM tier.
@@ -437,5 +454,5 @@ export async function extractProductsFromWebsite(
     const page = ordered.find((p) => groundingHaystack(p.text).includes(key)) ?? ordered[0]!;
     return { ...g, source_url: page.url, tier: "llm" as const };
   });
-  return done("llm", items);
+  return done("llm", items) ?? finish("no_products_found");
 }
