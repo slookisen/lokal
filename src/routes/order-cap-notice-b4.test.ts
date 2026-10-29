@@ -10,7 +10,10 @@
  *            cap text; exactly ONE aggregated producer e-mail for that day
  *            (N = 3), sent the next morning; never a second one.
  *   day-*    the next Oslo day counts on its own (reset); nothing before 07:00.
- *   safe-*   restart / overlapping runs: the order_cap_notices marker holds.
+ *   safe-*   restart / overlapping runs (one and two producers): the
+ *            order_cap_notices marker holds; a failed send is not retried.
+ *   skip-*   opted-out or blocklisted producer: skipped, no e-mail.
+ *   write-*  a failing event write never fails the submit.
  *   open-*   the per-buyer open cap: buyer text, no producer digest.
  *   chan-*   the same text over REST (the web cart's endpoint), MCP
  *            (cartResultText) and the web cart copy.
@@ -192,6 +195,47 @@ export async function runOrderCapNoticeB4Tests(opts: { log?: boolean } = {}): Pr
       capSvc.processOrderCapNotices({ now: morningOf(dayAfter), send: slow }),
     ]);
     assertEq([o1.sent + o2.sent, slowSends], [1, 1], "safe-04: two overlapping runs send one digest between them");
+    // safe-05: two producers, overlapping runs. Run 1 selects [A, B], claims A
+    // and waits on A's slow send; run 2 starts meanwhile, claims B and sends
+    // it; run 1 then reaches B, whose claim fails — it must skip B.
+    const OV_DAY = "2030-01-10";
+    for (const a of ["ag-ov-a", "ag-ov-b"]) capSvc.recordOrderCapEvent({ agent_id: a, cart_id: null, reason: "producer_daily_cap", cap: 10, now: new Date(`${OV_DAY}T10:00:00Z`) });
+    const ovSent: string[] = [];
+    const ovSlow: import("../services/order-cap-notice").OrderCapNoticeSender = async (input) => { ovSent.push(input.agent_id); await settle(); return "sent"; };
+    const [v1, v2] = await Promise.all([
+      capSvc.processOrderCapNotices({ now: morningOf("2030-01-11"), send: ovSlow }),
+      capSvc.processOrderCapNotices({ now: morningOf("2030-01-11"), send: ovSlow }),
+    ]);
+    assertEq(v1.candidates, 2, "safe-05a: setup: run 1 selected both producers");
+    assertEq([ovSent.filter((a) => a === "ag-ov-a").length, ovSent.filter((a) => a === "ag-ov-b").length, v1.sent + v2.sent], [1, 1, 2],
+      "safe-05b: overlapping runs that both see a producer send exactly one e-mail per producer");
+
+    // safe-06: a failed send is not retried; the status stays 'failed'.
+    const FAIL_DAY = "2030-02-01";
+    capSvc.recordOrderCapEvent({ agent_id: "ag-fail", cart_id: null, reason: "producer_daily_cap", cap: 10, now: new Date(`${FAIL_DAY}T10:00:00Z`) });
+    const f1 = await capSvc.processOrderCapNotices({ now: morningOf("2030-02-02"), send: async () => "failed" });
+    let retrySends = 0;
+    const f2 = await capSvc.processOrderCapNotices({ now: morningOf("2030-02-02"), send: async () => { retrySends++; return "sent"; } });
+    const failStatus = (db.prepare("SELECT status FROM order_cap_notices WHERE agent_id = 'ag-fail' AND oslo_day = ?").get(FAIL_DAY) as any)?.status;
+    assertEq([f1.failed, f2.candidates, retrySends, failStatus], [1, 0, 0, "failed"], "safe-06: a failed digest is not retried and stays 'failed'");
+
+    // skip-01/02: the producer's real send path (no injected sender) skips a
+    // producer who is no longer opted in, or whose address is blocklisted.
+    const skipCase = async (day: string, label: string) => {
+      capSvc.recordOrderCapEvent({ agent_id: "ag-eple", cart_id: null, reason: "producer_daily_cap", cap: 10, now: new Date(`${day}T10:00:00Z`) });
+      const before = sent.length;
+      const next = new Date(Date.parse(`${day}T12:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+      const r = await capSvc.processOrderCapNotices({ now: morningOf(next) });
+      const st = (db.prepare("SELECT status, sent_at FROM order_cap_notices WHERE agent_id = 'ag-eple' AND oslo_day = ?").get(day) as any);
+      assertEq([r.skipped, r.sent, sent.length - before, st?.status, st?.sent_at], [1, 0, 0, "skipped", null], label);
+    };
+    db.prepare("UPDATE agents SET order_notifications_opt_in = 0 WHERE id = 'ag-eple'").run();
+    await skipCase("2030-03-01", "skip-01: opted out → outcome skipped, no e-mail, status 'skipped'");
+    db.prepare("UPDATE agents SET order_notifications_opt_in = 1 WHERE id = 'ag-eple'").run();
+    const blMod = require("../services/blocklist-service") as typeof import("../services/blocklist-service");
+    blMod.add({ email: "eple@example.no", reason: "b4-test" });
+    await skipCase("2030-03-05", "skip-02: blocklisted address → outcome skipped, no e-mail, status 'skipped'");
+    blMod.remove({ identifierType: "email", identifierValue: "eple@example.no" });
 
     // ════════════════════════════════════════════════════════════════════════
     // day — the next day counts on its own; nothing before 07:00 Oslo
@@ -281,6 +325,16 @@ export async function runOrderCapNoticeB4Tests(opts: { log?: boolean } = {}): Pr
     assertEq([stats.status, stats.body?.notice_enabled, stats.body?.caps?.new_per_producer_per_day, todayRow?.producer_daily_cap, todayRow?.name, todayRow?.notice_status],
       [200, true, 10, 6, "Bonde Gård", "sent"], "admin-02: the count per producer per day, with the producer name and the digest status");
     assertTrue(!JSON.stringify(stats.body).includes("@example.com"), "admin-03: no buyer data in the admin answer");
+    const wide = await req("GET", "/admin/orders/cap-stats?days=100000", undefined, { "X-Admin-Key": ADMIN_KEY });
+    assertEq([wide.status, wide.body?.window_days], [200, 365], "admin-04: ?days=100000 is clamped to 365");
+
+    // write-01: a broken event table never fails the submit.
+    db.exec("ALTER TABLE order_cap_events RENAME TO order_cap_events_broken");
+    let broken: any = null;
+    try { broken = cartSvc.submitCart(cartWith("p-potet").cart_id, buyer("broken")); } catch (e) { broken = { thrown: String(e) }; }
+    db.exec("ALTER TABLE order_cap_events_broken RENAME TO order_cap_events");
+    assertEq([broken?.success, broken?.orders?.length, broken?.contact_handoffs?.[0]?.agent_id, broken?.contact_handoffs?.[0]?.cap_reached], [true, 0, "ag-bonde", true],
+      "write-01: the event write fails → the capped submit still succeeds with the contact handoff");
 
     // ════════════════════════════════════════════════════════════════════════
     // flag — ORDER_CAP_NOTICE_ENABLED off (AC8)
