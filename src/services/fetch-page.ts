@@ -499,6 +499,19 @@ export type FetchPageOptions = {
    * the standing bug for exactly that class of cross-test bleed).
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Optional `Accept` header. Absent = the HTML default every existing caller
+   * gets. Added for the product-import extractor (dev-request
+   * 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1), which reads
+   * robots.txt and JSON store APIs through this same SSRF-guarded fetcher.
+   */
+  accept?: string;
+  /**
+   * true = skip the isUnusableBody() markup sniff, so a plain-text robots.txt
+   * or a JSON API answer comes back as `ok` with its body. Absent/false = the
+   * exact existing behaviour (non-markup 200s are classified as failures).
+   */
+  allowNonHtmlBody?: boolean;
 };
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -543,7 +556,7 @@ export async function fetchPage(url: string, opts: FetchPageOptions): Promise<Fe
     try {
       resp = await doFetch(fetchUrl, {
         redirect: "follow",
-        headers: { "User-Agent": opts.userAgent, Accept: "text/html,application/xhtml+xml" },
+        headers: { "User-Agent": opts.userAgent, Accept: opts.accept ?? "text/html,application/xhtml+xml" },
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
@@ -600,7 +613,7 @@ export async function fetchPage(url: string, opts: FetchPageOptions): Promise<Fe
     const bytes = new Uint8Array(buf);
     const contentType = resp.headers.get("content-type");
     const html = decodeHtmlBytes(bytes, contentType);
-    const unusable = isUnusableBody(html, contentType);
+    const unusable = opts.allowNonHtmlBody ? null : isUnusableBody(html, contentType);
     if (unusable) {
       // Not retried: an error stub or a non-HTML document answers identically
       // on a second try, and `blocked` persistence already tells the caller
