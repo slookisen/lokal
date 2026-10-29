@@ -41,6 +41,9 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { slugify } from "../utils/slug";
 import { readAgentStats, __resetAgentStatsReaderForTesting } from "../services/agent-stats-reader";
+import { getDb } from "../database/init";
+import { publicFieldChoices } from "../owner-features/enforce";
+import { publicCountsShown } from "../services/public-stats-threshold";
 
 const router = Router();
 
@@ -60,6 +63,25 @@ const router = Router();
 /** Test-only seam: clear the caches and/or pin the cache clock (null restores Date.now). */
 export function __resetAgentStatsCacheForTesting(clock?: (() => number) | null): void {
   __resetAgentStatsReaderForTesting(clock);
+}
+
+/** The count fields a profile below the public threshold leaves out (no zeros either). */
+export const PUBLIC_STATS_COUNT_FIELDS = ["humanViews", "aiViews", "aiBreakdown", "aiDeliveries", "year"] as const;
+
+/**
+ * «Mine valg» S2f: the payload's view and AI counts follow the profile
+ * tiles — shown only with at least PUBLIC_STATS_MIN_VIEWS (20) page views from
+ * people over 12 months (the owner's own «Sett», services/public-stats-
+ * threshold.ts) and stats.public_counts not off. Otherwise the count fields
+ * are left out and `publicCounts: false` says why; conversations stay.
+ */
+function publicStatsPayload(payload: any, agentId: string, path: string): any {
+  if (!payload || typeof payload !== "object") return payload;
+  const choices = publicFieldChoices(agentId);
+  if (publicCountsShown(getDb(), agentId, path, choices ? choices.publicCounts : null)) return payload;
+  const out: any = { ...payload, publicCounts: false };
+  for (const f of PUBLIC_STATS_COUNT_FIELDS) delete out[f];
+  return out;
 }
 
 // ─── GET /api/agents/:id/stats ─────────────────────────────────────────
@@ -104,7 +126,7 @@ router.get("/api/agents/:id/stats", async (req: Request, res: Response) => {
     // most of the load from AI bot crawls (which hit /produsent/<slug>
     // and trigger the hydration script) without sacrificing freshness.
     res.setHeader("Cache-Control", "public, max-age=300");
-    res.json(result.payload);
+    res.json(publicStatsPayload(result.payload, agentId, path));
   } catch (err) {
     console.error("[agent-stats] failed:", err);
     res.status(500).json({ error: "internal error" });

@@ -671,8 +671,12 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // ── Statistikk og offentlige tall ───────────────────────────────────────
   entry({
     key: "stats.public_counts", group: "stats", type: "switch",
-    label: t("Vis besøkstall og «Med i AI-svar» på profilen", "Show visit counts and “In AI answers” on the profile"),
-    description: t("Profilen viser hvor mange som har sett den.", "Your profile shows how many have seen it."),
+    label: t("Vis besøkstall og «Med i AI-søk» på profilen", "Show visit counts and “In AI search” on the profile"),
+    // S2f: the public threshold (PUBLIC_STATS_MIN_VIEWS, default 20; services/public-stats-threshold.ts).
+    description: t(
+      "Profilen viser hvor mange som har sett den, fra 20 sidevisninger fra mennesker siste 12 måneder. Du ser alltid dine egne tall.",
+      "Your profile shows how many have seen it, from 20 page views by people in the last 12 months. You always see your own numbers.",
+    ),
     default: { owner: true, unclaimed: true },
     surfaces: ["profile_html"],
   }),

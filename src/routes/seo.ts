@@ -24,6 +24,7 @@ import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
 import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
+import { publicCountsShown } from "../services/public-stats-threshold";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
 import { textEntries } from "../utils/text-entries";
@@ -5369,6 +5370,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's
     // contact / price / stats choices (null = not enforced, page as before).
     const ownerChoices = publicFieldChoices(agent.id);
+    // «Mine valg» S2f (Daniel 2026-10-28): the public counts (the tiles below
+    // and the «Aktivitet» numbers) need at least PUBLIC_STATS_MIN_VIEWS (20)
+    // page views from people over 12 months, the owner's own «Sett» (same
+    // path as owner-stats: slugify(name)); stats.public_counts off always hides.
+    const publicCountsOn = publicCountsShown(getDb(), agent.id, `/produsent/${slugify(String(agent.name || ""))}`, ownerChoices ? ownerChoices.publicCounts : null);
     const k = withoutHiddenFields((info?.knowledge || {}) as any, ownerChoices);
     const meta = (info?.meta || {}) as any;
 
@@ -6457,7 +6463,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     let activityHtml = "";
     try {
       const activity = getProfileActivity(getDb(), agent.id, `/produsent/${slug}`);
-      const showCounts = !ownerChoices || ownerChoices.publicCounts;
+      const showCounts = publicCountsOn;
       const { views30, platforms } = activity;
       // Økologi S0b: without a valid Debio status, no visitor search term
       // carrying an organic word («økologisk kjøtt») — organic-claims.ts. With
@@ -6558,7 +6564,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${lang !== "no" && (descriptionIsNb || aboutIsNb) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
           ${profileRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${escapeHtml(profileRating.score)} / 5</strong><small>${escapeHtml(profileRating.attribution)}</small></div></div>` : ""}
-          ${ownerChoices && !ownerChoices.publicCounts ? "" : `<div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans" : "Sidevisninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans" : "mennesker"}</span></small></div></div>
+          ${!publicCountsOn ? "" : `<div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans" : "Sidevisninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans" : "mennesker"}</span></small></div></div>
           <div class="pf-stat" data-stat="ai" title="${lang === "en" ? `Every profile has this statistic. It shows that your information is being found by people searching via ChatGPT, Claude and similar AI services` : `Alle profiler har denne statistikken. Den viser at informasjonen din blir funnet av mennesker som søker via ChatGPT, Claude og lignende AI-tjenester`}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents" : "AI-agenter"}</span></small></div></div>
           <div class="pf-stat" data-stat="aiDeliveries" title="${lang === "en" ? `Number of times this profile was among the results an AI assistant such as ChatGPT or Claude fetched for someone who asked (a search, a place, a category, the profile page, MCP or A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "en"))}. It does not show how many people saw it.` : `Antall ganger profilen var blant treffene en AI-assistent som ChatGPT eller Claude hentet for noen som spurte (søk, sted, kategori, profilsiden, MCP eller A2A), ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), "nb"))}. Tallet viser ikke hvor mange som så den.`}"><div class="pf-stat-icon a">&#128228;</div><div><strong data-fill="aiDeliveries">0</strong><small>${lang === "en" ? AI_DELIVERIES_LABEL.en : AI_DELIVERIES_LABEL.nb}<br><span class="pf-stat-meta">${lang === "en" ? AI_DELIVERIES_SUBTITLE.en : AI_DELIVERIES_SUBTITLE.nb} &middot; ${escapeHtml(aiDeliveriesYearPeriodLabel(aiDeliveriesCountingSince(), Date.now(), lang === "en" ? "en" : "nb"))}</span></small></div></div>`}
         </div>

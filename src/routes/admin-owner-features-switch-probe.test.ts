@@ -283,6 +283,12 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(["orders.enabled", "visibility.profile", "comms.news"].every((k) => checks.some((c) => c.check === `undo:single:${k}` && c.result === "PASS")), "run-16: «Angre» on each live switch restores the effect");
       assertTrue(checks.some((c) => c.check === "no_surface:comms.news" && c.result === "PASS"), "run-17: comms.news (no surface): write + change log");
       assertTrue(checks.some((c) => c.check === "restore" && c.result === "PASS"), "run-18: restore check PASS");
+      // S2f: «Bryterproben dekker terskelen med «vis som offentlig»» — the fixture has 0 views:
+      // threshold 0 → tiles, threshold 1 → none, the environment's 20 → none.
+      const thr = checks.find((c) => c.check === "public_stats_threshold");
+      assertTrue(!!thr && thr.result === "PASS" && /terskel 0: fliser vises \(forventet vises\)/.test(thr.observed)
+        && /terskel 1: fliser vises ikke \(forventet vises ikke\)/.test(thr.observed) && /PUBLIC_STATS_MIN_VIEWS=20: fliser vises ikke/.test(thr.observed),
+        `run-18b: the probe covers the public-stats threshold as-public, both sides (${thr?.observed ?? "missing"})`);
       assertEq(rawState(FIX), before, "run-19: the fixture's stored choices byte-identical to the snapshot afterwards");
       realUntouched("run-19b");
       assertEq(grown(t0, tableCounts()).filter((x) => !/^owner_feature_(audit|change_batch):/.test(x)), [], "run-19c: no table grows except the change log (the readers' own rows are removed)");

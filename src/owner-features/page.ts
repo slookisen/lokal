@@ -41,6 +41,7 @@ import {
   type OwnerLevelKey,
   type OwnerLevelPreview,
 } from "./changes";
+import type { OwnerStats } from "../services/owner-stats-service";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -110,6 +111,104 @@ export interface OwnerPageModel {
   ordersReadMoreUrl?: string | null;
   /** Real follow-up timings for the explanation (ORDER_REMINDER_HOURS / ORDER_AUTOCANCEL_HOURS). */
   orderTimings?: { reminderHours: number; autocancelHours: number };
+  /**
+   * S2f statistics block at the top (v2 principle 1). undefined = no block;
+   * null = the read failed (the block says so and keeps the link).
+   */
+  stats?: OwnerPageStats | null;
+  /** «Se all statistikk» (the Statistikk tab in /selger). */
+  statsHref?: string;
+}
+
+// ── S2f: «Dette har profilen gjort for deg» ─────────────────────────────────
+// The numbers are the /selger Statistikk tab's own: the same getOwnerStats()
+// payload (GET /api/agents/:id/owner-stats), the same fields and the same
+// windows and labels as selger.html renderOwnerStats() — no new counting and
+// no new definition. People's page views, all AI search and «Med i AI-søk»
+// are over 12 months («siste 12 måneder» / «siden <dato>»); the ChatGPT /
+// Claude / other split and the contact clicks exist only for the raw window
+// (windowDays, 60), as in the tab, and say so. Clicks to the map are not
+// counted anywhere yet, so the block says that instead of showing a number.
+
+/** The statistics block's numbers, read off one getOwnerStats() payload. */
+export interface OwnerPageStats {
+  humanViews: { value: number; label: string };
+  aiViews: { value: number; label: string };
+  aiSplit: { chatgpt: number; claude: number; other: number; days: number };
+  aiDeliveries: { value: number; label: string };
+  clicks: { phone: number; website: number; days: number };
+  /** The public threshold (PUBLIC_STATS_MIN_VIEWS) at render time. */
+  minPublicViews: number;
+  /** One concrete tip from what the profile is missing (shown with low numbers). */
+  tip: string;
+}
+
+/** What the tip looks at (agent_knowledge columns). */
+export interface OwnerProfileGaps {
+  opening_hours?: unknown;
+  products?: unknown;
+  about?: unknown;
+  phone?: unknown;
+  website?: unknown;
+}
+
+function blankJson(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === "object") return Object.keys(v as object).length === 0;
+  const t = String(v).trim();
+  if (t === "" || t === "[]" || t === "{}" || t === "null") return true;
+  try {
+    const p = JSON.parse(t);
+    if (Array.isArray(p)) return p.length === 0;
+    if (p && typeof p === "object") return Object.keys(p).length === 0;
+  } catch { /* free text: not blank */ }
+  return false;
+}
+
+/** ONE tip, from the first thing the profile is missing (else: share the link). */
+export function ownerProfileTip(k: OwnerProfileGaps | null | undefined): string {
+  const g = k || {};
+  if (blankJson(g.opening_hours)) return "Legg til åpningstider, så vet folk når de kan komme.";
+  if (blankJson(g.products)) return "Legg inn varene dine, så har folk og AI-assistenter noe konkret å finne.";
+  if (blankJson(g.about)) return "Skriv noen setninger om gården og det du lager.";
+  if (blankJson(g.phone)) return "Legg til telefonnummeret ditt, så kan folk ringe deg direkte.";
+  if (blankJson(g.website)) return "Legg til nettsiden din, så kan folk lese mer om deg.";
+  return "Del lenken til profilen din i egne kanaler, for eksempel Facebook eller nyhetsbrevet ditt.";
+}
+
+/**
+ * The block's numbers from the tab's payload — exactly the fields and labels
+ * selger.html shows: year.humanViews, year.aiViews, aiPlatforms, aiDeliveries.
+ * window.total with year.labels.nb.aiDeliveries, contactClicksByKind.
+ */
+export function ownerPageStatsFrom(s: OwnerStats, opts: { minPublicViews: number; profile?: OwnerProfileGaps | null }): OwnerPageStats {
+  const wd = s.windowDays || 60;
+  const nb = (s.year && s.year.labels && s.year.labels.nb) || ({} as Record<string, string>);
+  const clicks = (kind: string) => (s.contactClicksByKind || []).filter((c) => c.kind === kind).reduce((n, c) => n + (c.count || 0), 0);
+  return {
+    humanViews: { value: s.year?.humanViews?.value ?? 0, label: nb.humanViews || `${wd}d` },
+    aiViews: { value: s.year?.aiViews?.value ?? 0, label: nb.aiViews || `${wd}d` },
+    aiSplit: { chatgpt: s.aiPlatforms?.chatgpt ?? 0, claude: s.aiPlatforms?.claude ?? 0, other: s.aiPlatforms?.other ?? 0, days: wd },
+    aiDeliveries: { value: s.aiDeliveries?.window?.total ?? 0, label: nb.aiDeliveries || "siste 12 måneder" },
+    clicks: { phone: clicks("phone"), website: clicks("website"), days: wd },
+    minPublicViews: opts.minPublicViews,
+    tip: ownerProfileTip(opts.profile),
+  };
+}
+
+/** Used when PUBLIC_STATS_MIN_VIEWS is 0 (no public threshold): what still counts as low. */
+export const OWNER_PAGE_LOW_VIEWS_FALLBACK = 20;
+
+/**
+ * «Low» numbers: fewer people's page views over 12 months than the public
+ * threshold (PUBLIC_STATS_MIN_VIEWS, default 20) — the same point at which
+ * the public tiles appear on the profile. With the threshold switched off
+ * (0) the default 20 is used, so a new profile still gets the tip.
+ */
+export function ownerStatsAreLow(st: OwnerPageStats): boolean {
+  const min = st.minPublicViews > 0 ? st.minPublicViews : OWNER_PAGE_LOW_VIEWS_FALLBACK;
+  return st.humanViews.value < min;
 }
 
 const esc = (v: unknown): string => escapeHtml(String(v ?? ""));
@@ -531,9 +630,44 @@ function noticeHtml(m: OwnerPageModel): string {
   return `<div class="mv-toast ${n.ok ? "mv-toast-ok" : "mv-toast-error"}" role="${n.ok ? "status" : "alert"}"><span>${esc(n.text)}</span>${undo}</div>`;
 }
 
+const nbNum = (n: number) => n.toLocaleString("nb-NO");
+
+/** S2f: the statistics block (v2 principle 1: proof first). */
+function statsHtml(m: OwnerPageModel): string {
+  if (m.stats === undefined) return "";
+  const link = m.statsHref ? `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(m.statsHref)}">Se all statistikk</a></div>` : "";
+  const st = m.stats;
+  if (st === null) {
+    return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h"><h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <p class="mv-note">Statistikken kunne ikke lastes akkurat nå. Prøv igjen senere.</p>${link}</section>`;
+  }
+  const tile = (value: number, label: string, period: string, extra = "") =>
+    `<li class="mv-stat"><strong>${esc(nbNum(value))}</strong><span>${esc(label)}</span><small>${esc(period)}</small>${extra}</li>`;
+  const split = `<small>${esc(`ChatGPT ${nbNum(st.aiSplit.chatgpt)} · Claude ${nbNum(st.aiSplit.claude)} · Andre ${nbNum(st.aiSplit.other)} (siste ${st.aiSplit.days} dager)`)}</small>`;
+  const low = ownerStatsAreLow(st);
+  const lowHtml = !low ? "" : st.minPublicViews > 0
+    ? `<p class="mv-note">Tallene er lave ennå, og de vises ikke offentlig på profilen før den har ${esc(st.minPublicViews)} sidevisninger fra mennesker siste 12 måneder (her ser du dem alltid).</p>
+      <p class="mv-check">Tips: ${esc(st.tip)}</p>`
+    : `<p class="mv-note">Tallene er lave ennå, og det er vanlig for en profil som er ny eller lite kjent.</p>
+      <p class="mv-check">Tips: ${esc(st.tip)}</p>`;
+  return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h">
+      <h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <ul class="mv-stats">
+        ${tile(st.humanViews.value, "Sidevisninger fra mennesker", st.humanViews.label)}
+        ${tile(st.aiViews.value, "AI-søk", st.aiViews.label, split)}
+        ${tile(st.aiDeliveries.value, "Med i AI-søk", st.aiDeliveries.label)}
+        ${tile(st.clicks.phone, "Klikk til telefon", `siste ${st.clicks.days} dager`)}
+        ${tile(st.clicks.website, "Klikk til nettside", `siste ${st.clicks.days} dager`)}
+      </ul>
+      <p class="mv-note">Klikk til kart telles ikke ennå.</p>
+      ${lowHtml}
+      ${link}
+    </section>`;
+}
+
 /** v2 principle 9: jump links (shown on narrow screens). */
 function jumpNavHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
-  const links: Array<[string, string]> = [["niva", "Nivå"]];
+  const links: Array<[string, string]> = m.stats !== undefined ? [["statistikk", "Statistikk"], ["niva", "Nivå"]] : [["niva", "Nivå"]];
   for (const g of OWNER_FEATURE_GROUPS) {
     const { shown, hidden } = groupEntries(m, registry, g.key);
     if (shown.length || hidden.length) links.push([`gruppe-${g.key}`, g.label.no]);
@@ -638,6 +772,12 @@ export const OWNER_PAGE_CSS = `
   .mv-toast-ok { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
   .mv-toast-error { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
   .mv-pager { align-items: center; }
+  .mv-stats { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  @media (min-width: 640px) { .mv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  .mv-stat { border: 1px solid #e5e5e5; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .mv-stat strong { font-size: 1.4rem; color: #2D5016; }
+  .mv-stat span { font-size: 0.88rem; font-weight: 600; }
+  .mv-stat small { font-size: 0.78rem; color: #595959; }
   @media (prefers-color-scheme: dark) {
     body { background: #12150e; color: #ebe8dc; }
     a, .ep-logo { color: #b9d99a; }
@@ -655,7 +795,9 @@ export const OWNER_PAGE_CSS = `
     .mv-reason, .mv-check-missing { color: #f5c27a; }
     .mv-badge { background: #2a3022; color: #d8d4c4; }
     .mv-badge-new { background: #2f4a1c; color: #cfe6b8; }
-    .mv-level, .mv-jump a { border-color: #313b27; }
+    .mv-level, .mv-jump a, .mv-stat { border-color: #313b27; }
+    .mv-stat strong { color: #b9d99a; }
+    .mv-stat small { color: #b5b0a0; }
     .mv-level[aria-current="true"] { border-color: #8fb86e; box-shadow: inset 0 0 0 1px #8fb86e; }
     .mv-ctl-form select, .mv-ctl-form input:not([type=hidden]), .mv-confirm-form input:not([type=hidden]) { background: #12150e; color: #ebe8dc; border-color: #4a5640; }
     .mv-toast-ok { background: #15301d; color: #bbf7d0; border-color: #24543a; }
@@ -676,6 +818,7 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
         <div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(back)}">Tilbake til eierportalen</a></div>
         ${jumpNavHtml(m, registry)}
       </div>
+      ${statsHtml(m)}
       ${introHtml(m)}
       ${confirmHtml(m)}
       ${levelPreviewHtml(m)}

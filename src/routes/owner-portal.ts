@@ -1780,12 +1780,19 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       const v = val == null || val === "" ? "—" : String(val);
       return `<div class="ep-stat"><div class="ep-stat-num">${escapeHtml(v)}</div><div class="ep-stat-label">${escapeHtml(label)}</div></div>`;
     };
+    // «Mine valg» S2f: the card read a views count and an AI-conversations
+    // count off the knowledge object, fields no table has, so it always
+    // showed «—». It now shows the Statistikk tab's own numbers (GET
+    // /api/agents/:id/owner-stats → getOwnerStats().year): people's page
+    // views and AI search over 12 months / «siden <dato>». «—» only when the
+    // read fails.
+    const ownerYear = ownerPortalYearStats(db, agent.id, String(agent.name || ""));
     const statsHtml = `
       ${stat("Google-vurdering", knowledge.google_rating)}
       ${stat("Google-anmeldelser", knowledge.google_review_count)}
       ${stat("TripAdvisor", knowledge.tripadvisor_rating)}
-      ${stat("Sidevisninger", knowledge.views_count)}
-      ${stat("AI-samtaler", knowledge.ai_conversations_count)}
+      ${stat(ownerYear ? `Sidevisninger fra mennesker (${ownerYear.labels.nb.humanViews})` : "Sidevisninger fra mennesker", ownerYear ? ownerYear.humanViews.value : null)}
+      ${stat(ownerYear ? `AI-søk (${ownerYear.labels.nb.aiViews})` : "AI-søk", ownerYear ? ownerYear.aiViews.value : null)}
     `;
 
     const slug = agent.slug || "";
@@ -2348,6 +2355,20 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * The portal card «Statistikk»'s 12-month numbers: the same getOwnerStats()
+ * read as the Statistikk tab (same path derivation as the owner-stats route
+ * below). null on a failed read (the card then shows «—»).
+ */
+export function ownerPortalYearStats(db: any, agentId: string, agentName: string): ReturnType<typeof getOwnerStats>["year"] | null {
+  try {
+    return getOwnerStats(db, agentId, `/produsent/${slugify(agentName)}`).year;
+  } catch (err) {
+    console.error("[owner-portal] portal stats card read failed:", err);
+    return null;
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:id/owner-stats — full "Statistikk" tab data (session-gated)
