@@ -655,8 +655,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         ${alert}
         ${locked ? `<div class="gc-alert gc-alert-error" role="alert">Teksten i denne profilen er låst av Opplevagent-support. Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre den. Booking kan du fortsatt slå av og på selv.</div>` : ""}
       </div>
-      ${mineValgCardHtml(slug, provider.id)}
-      <div class="gc-card">
+      ${mineValgCardHtml(slug, provider.id)}<div class="gc-card">
         <h2>Profilinformasjon</h2>
         <form id="gc-profile-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/save" novalidate>
           <div class="gc-field">

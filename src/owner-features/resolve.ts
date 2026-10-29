@@ -592,6 +592,7 @@ export function setOwnerFeatureValue(
     return exists ? { kind: "blocked", block: "confirm_by_email", reason: REASON_CONFIRM_BY_EMAIL } : { kind: "not_found" };
   }
 
+  try {
   return db.transaction((): SetOwnerFeatureResult => {
     const r = makeResolver(vertical, subjectId, ropts);
     if (!r.subject.exists) return { kind: "not_found" };
@@ -613,8 +614,25 @@ export function setOwnerFeatureValue(
     if (sameValue(current, v.value)) return { kind: "ok", changed: false, feature: before };
 
     const now = new Date().toISOString();
+    // Order (O1a review): the lokal.db rows first — the audit row, and the
+    // settings row for a stored entry — and an adapter's column LAST. A
+    // gårdssalg adapter writes experiences.db, which this transaction does
+    // not cover: written last, a failed log insert can never leave the
+    // column changed without its «Mine valg» log row. An adapter that does
+    // not write rolls the lokal.db rows back (AdapterRefusal below).
+    db.prepare(
+      `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(vertical, subjectId, key, JSON.stringify(current ?? null), JSON.stringify(v.value), actor.actor, actor.detail ?? null, now);
     if (e.storage) {
-      if (!e.storage.write(db, subjectId, v.value)) return { kind: "not_found" };
+      const w = e.storage.write(db, subjectId, v.value);
+      if (w !== true) {
+        throw new AdapterRefusal(
+          w && typeof w === "object"
+            ? { kind: "blocked", block: "requirement_not_met", reason: w.blocked }
+            : { kind: "not_found" },
+        );
+      }
     } else {
       db.prepare(
         `INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at)
@@ -623,14 +641,19 @@ export function setOwnerFeatureValue(
            value_json = excluded.value_json, set_by = excluded.set_by, set_at = excluded.set_at`,
       ).run(vertical, subjectId, key, JSON.stringify(v.value), actor.actor, now);
     }
-    db.prepare(
-      `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(vertical, subjectId, key, JSON.stringify(current ?? null), JSON.stringify(v.value), actor.actor, actor.detail ?? null, now);
 
     const after = makeResolver(vertical, subjectId, ropts).resolve(key);
     return { kind: "ok", changed: true, feature: after };
   })();
+  } catch (err) {
+    if (err instanceof AdapterRefusal) return err.out;
+    throw err;
+  }
+}
+
+/** An adapter did not write: roll the lokal.db rows back and answer with `out`. */
+class AdapterRefusal extends Error {
+  constructor(readonly out: SetOwnerFeatureResult) { super("owner feature adapter refused"); }
 }
 
 export { UnknownOwnerFeatureError };

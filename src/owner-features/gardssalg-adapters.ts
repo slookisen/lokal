@@ -48,7 +48,20 @@ export const GARDSSALG_BOOKING_ENABLED_ADAPTER: OwnerFeatureStorageAdapter = {
   },
   write: (_db, subjectId, value) => {
     const out = claimService().updateClaimedProviderProfile(subjectId, { booking_live: value === true ? 1 : 0 });
-    return out.ok === true;
+    if (out.ok === true) return true;
+    // The portal writer's own gate (admin brake / request address) refused:
+    // a 409 with its Norwegian reason, never a 404.
+    if (out.error === "booking_blocked") {
+      return {
+        blocked: {
+          no: out.block.note ? `${out.block.message} Grunn: ${out.block.note}.` : out.block.message,
+          en: out.block.reason === "admin_brake"
+            ? "Booking was stopped by Opplevagent. You cannot switch it back on yourself. Contact kontakt@opplevagent.no."
+            : "Booking cannot be switched on until the profile has an e-mail address the requests can be sent to. Contact kontakt@opplevagent.no.",
+        },
+      };
+    }
+    return false;
   },
 };
 

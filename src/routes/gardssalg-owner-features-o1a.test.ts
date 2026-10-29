@@ -95,6 +95,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       require.resolve("./gardssalg-owner-features"),
       require.resolve("./opplevelser"),
       require.resolve("./experiences-mcp"),
+      require.resolve("./experiences-seo"),
     ]);
     const servers: any[] = [];
     let prevRfbDb: any = null;
@@ -110,6 +111,9 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       initMod.__setDbForTesting(rfbDb as any);
       initMod.__initSchemaForTesting(rfbDb as any);
 
+      try {
+        (require("../config/vertical-config") as typeof import("../config/vertical-config")).loadConfigsAtBoot();
+      } catch { /* already loaded by an earlier suite in the same process */ }
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expDb = dbFactory.getDb("experiences");
@@ -187,9 +191,13 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       const expressMod = require("express") as typeof import("express");
       const claimRouter = (require("./gardssalg-claim") as typeof import("./gardssalg-claim")).default;
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+      const seoRouter = (require("./experiences-seo") as typeof import("./experiences-seo")).default as any;
+      const ownerFeaturesRoutes = require("./gardssalg-owner-features") as typeof import("./gardssalg-owner-features");
+      ownerFeaturesRoutes.__resetGardssalgOwnerFeaturesRateLimitForTesting();
       const app = expressMod();
       app.use("/api/opplevelser", expressMod.json(), opplevelserRouter);
       app.use("/", claimRouter);
+      app.use("/", seoRouter);
       const httpMod = require("http") as typeof import("http");
       const server = httpMod.createServer(app);
       servers.push(server);
@@ -220,6 +228,9 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertEq(portalOff.status, 200, "f1: portal opens with the flag off");
       assertTrue(!portalOff.body.includes("data-mine-valg"), "f2: flag off → no «Mine valg» card in the portal");
       assertTrue(portalOff.body.includes('id="f-booking"'), "f3: flag off → the portal booking checkbox is still there (O1b removes it)");
+      // Byte-identical with the flag off: the card slot adds no line and no
+      // whitespace — the profile card follows the header card exactly as on main.
+      assertTrue(/\n      <\/div>\n      <div class="gc-card">\n        <h2>Profilinformasjon<\/h2>/.test(portalOff.body), "f3b: flag off → the portal markup around the card slot is exactly as before (no extra line)");
       assertEq((await req("GET", page("testgard"), cookie("tok-test"))).status, 404, "f4: flag off → the tab is 404");
       assertEq((await req("GET", api("o1-test"), cookie("tok-test"))).status, 404, "f5: flag off → the API is 404");
       assertEq((await req("PUT", api("o1-test", "/booking.enabled"), { ...json, ...cookie("tok-test") }, JSON.stringify({ value: true }))).status, 404, "f6: flag off → PUT is 404");
@@ -236,6 +247,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertEq(bookingLive("o1-test"), 0, "f15: refused calls wrote nothing");
       const portalOn = await req("GET", "/kategori/gardssalg/eier/testgard/portal", cookie("tok-test"));
       assertTrue(portalOn.body.includes('data-mine-valg="1"') && portalOn.body.includes('href="/kategori/gardssalg/eier/testgard/valg"'), "f16: tab open → the portal links to «Mine valg»");
+      assertEq(portalOn.body.replace(/<div class="gc-card" data-mine-valg="1">[\s\S]*?<\/div>\s*<\/div>/, ""), portalOff.body, "f16b: the only portal difference with the tab open is the «Mine valg» card");
       const portalReal = await req("GET", "/kategori/gardssalg/eier/ektegard/portal", cookie("tok-real"));
       assertTrue(portalReal.status === 200 && !portalReal.body.includes("data-mine-valg"), "f17: a real producer's portal gets no link");
 
@@ -282,6 +294,16 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertEq(settingsRows(), 0, "w6: … and no effect (no stored choice)");
       const unknownKey = await req("PUT", api("o1-test", "/orders.enabled"), { ...json, ...cookie("tok-test") }, JSON.stringify({ value: true }));
       assertEq(unknownKey.status, 404, "w7: an RFB-only key is unknown for gårdssalg");
+
+      // Origin check: a cross-site write is refused and writes nothing.
+      const auditCount = () => (rfbDb.prepare(`SELECT COUNT(*) AS n FROM owner_feature_audit WHERE vertical = 'gardssalg'`).get() as any).n;
+      const audit0 = auditCount();
+      const evil = { Origin: "https://evil.example" };
+      const xsPost = await req("POST", page("testgard", "/sett"), { ...form, ...evil, ...cookie("tok-test") }, "key=booking.enabled&value=true&confirmed=1");
+      assertEq(xsPost.status, 403, "o1: page POST with a foreign Origin → 403");
+      const xsPut = await req("PUT", api("o1-test", "/booking.enabled"), { ...json, ...evil, ...cookie("tok-test") }, JSON.stringify({ value: true }));
+      assertEq(xsPut.status, 403, "o2: API PUT with a foreign Origin → 403");
+      assertEq([bookingLive("o1-test"), auditCount()], [0, audit0], "o3: cross-site writes changed neither booking_live nor owner_feature_audit");
 
       const ask = await req("POST", page("testgard", "/sett"), { ...form, ...cookie("tok-test") }, "key=booking.enabled&value=true");
       assertTrue(ask.status === 303 && String(ask.headers.location).includes("bekreft=booking.enabled"), "w8: switching visits on asks for confirmation first");
@@ -369,11 +391,39 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertTrue(/tar ikke imot forespørsler nå/.test(mcp1.message || ""), "s11: book_gardssalg: «tar ikke imot forespørsler nå»");
       assertEq(bookingRows(), rows0, "s12: no booking row via MCP");
 
+      // The no-JS web booking form (experiences-seo.ts).
+      const formBody = `slot_at=${encodeURIComponent(slot)}&party_size=2&guest_name=Kari+Nordmann&guest_email=kari%40example.no`;
+      const formGet = await req("GET", "/kategori/gardssalg/book/testgard");
+      assertTrue(formGet.status === 200 && formGet.body.includes('data-owner-paused="1"') && formGet.body.includes("tar ikke imot forespørsler nå"), "w-1: booking form shows the owner's pause up front");
+      const formPost = await req("POST", "/kategori/gardssalg/book/testgard", form, formBody);
+      assertTrue(formPost.status === 303 && String(formPost.headers.location).includes("error=not_taking"), "w-2: form POST while paused → 303 ?error=not_taking");
+      assertEq(bookingRows(), rows0, "w-3: no booking row via the form");
+      const formErr = await req("GET", "/kategori/gardssalg/book/testgard?error=not_taking");
+      assertTrue(formErr.body.includes("Produsenten tar ikke imot forespørsler nå."), "w-4: the form's error banner says «tar ikke imot forespørsler nå»");
+
+      // Allowlist in the pause reader: a stored pause for a producer that is
+      // not allowlisted is never applied, even with the flag on.
+      expDb.prepare(`UPDATE experience_providers SET booking_live = 1 WHERE id = 'o1-other'`).run();
+      rfbDb.prepare(
+        `INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at)
+         VALUES ('gardssalg', 'o1-other', 'booking.pause', 'true', 'owner', 0, ?)`,
+      ).run(new Date().toISOString());
+      assertTrue(rs.gardssalgFeatureOn("o1-other", "booking.pause"), "a-1: the seeded pause resolves on (so only the allowlist stops it)");
+      assertTrue(!gs.gardssalgOwnerBookingPaused("o1-other"), "a-2: not allowlisted → the pause reader returns false");
+      const otherBook = JSON.parse((await req("POST", "/api/opplevelser/book", json,
+        JSON.stringify({ provider_id: "o1-other", slot_at: slot, party_size: 2, guest_name: "Kari Nordmann", guest_email: "kari@example.no" }))).body);
+      assertEq(otherBook.success, true, "a-3: not allowlisted → REST accepts the request");
+
       // Flag off → today's behaviour: the pause is not read.
       delete process.env.OA_OWNER_FEATURES_ENABLED;
       assertTrue(!gs.gardssalgOwnerBookingPaused("o1-test"), "s13: flag off → the stored pause is not applied");
       const bookOff = JSON.parse((await req("POST", "/api/opplevelser/book", json, bookBody)).body);
       assertEq(bookOff.success, true, "s14: flag off → REST request accepted as today");
+      const rowsFlagOff = bookingRows();
+      const formOff = await req("POST", "/kategori/gardssalg/book/testgard", form, formBody);
+      assertTrue(formOff.status === 303 && !String(formOff.headers.location).includes("error="), "s14b: flag off → the form accepts as today");
+      assertEq(bookingRows(), rowsFlagOff + 1, "s14c: … and writes the booking row");
+      assertTrue(!(await req("GET", "/kategori/gardssalg/book/testgard")).body.includes("data-owner-paused"), "s14d: flag off → no pause notice on the form");
       process.env.OA_OWNER_FEATURES_ENABLED = "true";
 
       const offPause = await req("PUT", api("o1-test", "/booking.pause"), { ...json, ...cookie("tok-test") }, JSON.stringify({ value: false }));
@@ -382,6 +432,10 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertEq(book2.success, true, "s16: pause off → requests are taken again");
       const mcp2 = await callTool("book_gardssalg", { provider_id: "o1-test", slot_at: slot, party_size: 2, guest_name: "Kari Nordmann", guest_email: "kari@example.no" });
       assertEq(mcp2.success, true, "s17: pause off → book_gardssalg accepted again");
+      const rowsPauseOff = bookingRows();
+      const formOn = await req("POST", "/kategori/gardssalg/book/testgard", form, formBody);
+      assertTrue(formOn.status === 303 && !String(formOn.headers.location).includes("error="), "s18: pause off → the form accepts again");
+      assertEq(bookingRows(), rowsPauseOff + 1, "s19: … and writes the booking row");
 
       // Level: «Bare synlig» switches visits off; marked only after the owner's choice.
       const lvl = await req("POST", page("testgard", "/niva"), { ...form, ...cookie("tok-test") }, "level=bare_synlig&confirmed=1");
@@ -394,6 +448,43 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       const undo = await req("POST", page("testgard", "/angre"), { ...form, ...cookie("tok-test") }, `batch=${undoId}`);
       assertEq(undo.status, 303, "l4: «Angre» answers 303");
       assertEq(bookingLive("o1-test"), 1, "l5: undo switched booking_live back on");
+
+      // Late admin-brake refusal from the adapter (the brake landed after the
+      // resolver's check): 409-class «blocked», never not_found, nothing kept.
+      const noEnableGate = R.map((e) => (e.key === "booking.enabled" ? { ...e, enableRequires: [] } : e));
+      const brakeAudit0 = (rfbDb.prepare(`SELECT COUNT(*) AS n FROM owner_feature_audit WHERE subject_id = 'o1-brake'`).get() as any).n;
+      const late = rs.setOwnerFeatureValue("gardssalg", "o1-brake", "booking.enabled", true, { actor: "owner" }, { registry: noEnableGate });
+      assertEq([late.kind, (late as any).block], ["blocked", "requirement_not_met"], "x1: the adapter's own brake refusal is a block (409), not not_found");
+      assertTrue(late.kind === "blocked" && /stanset av Opplevagent/.test(late.reason.no) && /klage fra gjest/.test(late.reason.no), "x2: … with the Norwegian reason and the operator's note");
+      assertEq(bookingLive("o1-brake"), 0, "x3: booking_live untouched");
+      assertEq((rfbDb.prepare(`SELECT COUNT(*) AS n FROM owner_feature_audit WHERE subject_id = 'o1-brake'`).get() as any).n, brakeAudit0, "x4: the «Mine valg» log row was rolled back");
+
+      // A failed log insert leaves the experiences.db column unchanged (log first, adapter last).
+      const hidden = () => (expDb.prepare(`SELECT catalog_hidden FROM experience_providers WHERE id = 'o1-test'`).get() as any).catalog_hidden;
+      const hidden0 = hidden();
+      rfbDb.exec(`ALTER TABLE owner_feature_audit RENAME TO owner_feature_audit_away`);
+      let threw = false;
+      try {
+        rs.setOwnerFeatureValue("gardssalg", "o1-test", "visibility.profile", false, { actor: "owner" });
+      } catch { threw = true; }
+      rfbDb.exec(`ALTER TABLE owner_feature_audit_away RENAME TO owner_feature_audit`);
+      assertTrue(threw, "x5: the write fails when the log insert fails");
+      assertEq(hidden(), hidden0, "x6: … and the profile was not paused (adapter never ran)");
+
+      // 30 writes per minute per session.
+      ownerFeaturesRoutes.__resetGardssalgOwnerFeaturesRateLimitForTesting();
+      const limited: number[] = [];
+      for (let n = 0; n < 30; n++) {
+        limited.push((await req("POST", page("utenepost", "/interesse"), { ...form, ...cookie("tok-ne") }, "key=nope")).status);
+      }
+      assertTrue(limited.every((st) => st === 303), "r1: 30 writes in a minute are served");
+      const over = await req("POST", page("utenepost", "/interesse"), { ...form, ...cookie("tok-ne") }, "key=contact.address");
+      assertEq(over.status, 429, "r2: the 31st write in a minute → 429");
+      assertEq((rfbDb.prepare(`SELECT COUNT(*) AS n FROM owner_feature_interest WHERE subject_id = 'o1-noemail'`).get() as any).n, 0, "r3: the refused write stored nothing");
+      const overPut = await req("PUT", api("o1-noemail", "/booking.enabled"), { ...json, ...cookie("tok-ne") }, JSON.stringify({ value: false }));
+      assertEq(overPut.status, 429, "r4: the API shares the per-session limit");
+      assertEq((await req("POST", page("testgard", "/interesse"), { ...form, ...cookie("tok-test") }, "key=nope")).status, 303, "r5: another session is not limited");
+      ownerFeaturesRoutes.__resetGardssalgOwnerFeaturesRateLimitForTesting();
     } catch (err: any) {
       failed++;
       failures.push("unexpected error: " + String(err?.stack || err));

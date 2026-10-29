@@ -196,8 +196,13 @@ export interface OwnerFeatureStorageAdapter {
   column: string;
   /** Current value; null = the subject row does not exist. */
   read(db: any, subjectId: string): OwnerFeatureValue;
-  /** Returns false when no row was written. */
-  write(db: any, subjectId: string, value: OwnerFeatureValue): boolean;
+  /**
+   * Returns true when written, false when no row was written, or
+   * { blocked } when the column's own gate refused the value (gårdssalg
+   * booking_live: an admin brake set after the resolver checked — answered
+   * as a 409 like any other block).
+   */
+  write(db: any, subjectId: string, value: OwnerFeatureValue): boolean | { blocked: LocalizedText };
 }
 
 export interface OwnerFeatureEntry {
