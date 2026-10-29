@@ -363,6 +363,63 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(!probe.isSwitchProbeRunning(), "fail-8: the run lock is released");
     }
 
+    // ═══ Side-effect cleanup deletes only the probe's own rows ════════════
+    {
+      let seq = 0;
+      const foreignTasks: string[] = [];
+      const foreignViews: number[] = [];
+      const addForeign = (tag: string) => {
+        const id = `foreign-task-${tag}-${++seq}`;
+        db.prepare(`INSERT INTO tasks (id, consumer_agent_id, method, params, status) VALUES (?, NULL, 'message/send', ?, 'submitted')`).run(id, JSON.stringify({ foreign: tag, n: seq }));
+        foreignTasks.push(id);
+        for (const agent of [FIX, REAL]) {
+          const info = db.prepare(`INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source) VALUES (?, ?, 'Ålesund', ?)`).run(agent, `foreign ${tag}`, `foreign-${tag}-${seq}`);
+          foreignViews.push(Number(info.lastInsertRowid));
+        }
+      };
+      for (let i = 0; i < 3; i++) addForeign("seed");
+      // Other traffic while the probe runs: a timer, and a reader that writes after an await.
+      const timer = setInterval(() => addForeign("timer"), 2);
+      const defaults = probe.defaultSwitchProbeReaders();
+      const wrap = (id: string): import("../owner-features/switch-probe").SurfaceReaderDef => ({
+        ...defaults[id],
+        read: async (ctx) => {
+          const o = await defaults[id].read(ctx);
+          await new Promise((r) => setImmediate(r));
+          addForeign("after-await");
+          return o;
+        },
+      });
+      let r: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        r = await probe.runSwitchProbe(FIX, {
+          db, maxWaitMs: 0,
+          readers: { "visibility.profile × a2a": wrap("visibility.profile × a2a"), "visibility.profile × profile_html": wrap("visibility.profile × profile_html") },
+        });
+      } finally {
+        clearInterval(timer);
+      }
+      assertTrue(foreignTasks.some((t) => t.includes("timer")) && foreignTasks.some((t) => t.includes("after-await")), "se-1: foreign rows were written during the run (timer + after an await)");
+      const tasksLeft = new Set((db.prepare(`SELECT id FROM tasks`).all() as Array<{ id: string }>).map((x) => x.id));
+      assertEq(foreignTasks.filter((t) => !tasksLeft.has(t)), [], "se-2: every foreign tasks row survives (by id)");
+      const viewRows = db.prepare(`SELECT id, agent_id, view_source FROM analytics_agent_views`).all() as Array<{ id: number; agent_id: string; view_source: string }>;
+      const viewsById = new Map(viewRows.map((v) => [v.id, v]));
+      assertEq(foreignViews.filter((id) => !viewsById.get(id)?.view_source?.startsWith("foreign-")), [], "se-3: every foreign view row survives (by id and content), the fixture's own pre-existing ones too");
+      const probeTasks = (db.prepare(`SELECT id FROM tasks WHERE params NOT LIKE '%"foreign"%'`).all() as Array<{ id: string }>);
+      assertEq(probeTasks, [], "se-4: the probe's own tasks rows are gone");
+      const fixtureViews = viewRows.filter((v) => v.agent_id === FIX && !v.view_source.startsWith("foreign-"));
+      assertEq(fixtureViews, [], "se-5: the probe's own fixture view rows are gone");
+      const seTasks = r!.side_effects.find((x) => x.table === "tasks");
+      const seViews = r!.side_effects.find((x) => x.table === "analytics_agent_views");
+      assertTrue(!!seTasks && seTasks.created > 0 && seTasks.removed === seTasks.created && seTasks.left_after_run === 0, "se-6: tasks: created = removed, nothing left");
+      assertTrue(!!seViews && seViews.created > 0 && seViews.removed === seViews.created, "se-7: views: created = removed");
+      assertTrue(!!seViews && (seViews.left_after_run ?? 0) > 0, "se-8: the leak indicator counts fixture rows from the run window that stayed (the foreign ones here)");
+      assertEq(r!.restored, true, "se-9: restored");
+      // Clean up the foreign rows for the next blocks.
+      for (const id of foreignTasks) db.prepare(`DELETE FROM tasks WHERE id = ?`).run(id);
+      for (const id of foreignViews) db.prepare(`DELETE FROM analytics_agent_views WHERE id = ?`).run(id);
+    }
+
     // ═══ Vacuous-PASS guards: the checks FAIL when the write path is broken ═══
     {
       const rs = require("../owner-features/resolve") as typeof import("../owner-features/resolve");

@@ -44,10 +44,15 @@
 // DELETE this file issues on owner state (restore, the rolled-back checks)
 // repeats the fixture pin in its own WHERE clause. The one other kind of
 // write: the public read paths the readers run log their own rows (A2A
-// `tasks`, `analytics_agent_views`); the probe captures exactly the rowids
-// created while one of its own handler calls ran synchronously (Node runs
-// nothing else in between) and deletes those rowids — and only those — at the
-// end. The counts are in the result (`side_effects`) and the report.
+// `tasks`, `analytics_agent_views`). The probe captures only the rows written
+// in the SYNCHRONOUS part of one of its own handler / tool calls (Node runs
+// nothing else in between): `tasks` by rowid + id, views by rowid + agent_id
+// (= the fixture). At the end it deletes exactly those rows, each by
+// `rowid = ? AND id = ?` / `rowid = ? AND agent_id = <fixture>`, never a range
+// or a whole table. A row a read path writes after an `await` is not captured:
+// it stays (a leak, never an over-delete). `side_effects.left_after_run`
+// counts the fixture's rows from the run window that are still there (an
+// indicator: it can include another admin's as-public views of the fixture).
 
 import { getDb } from "../database/init";
 import {
@@ -179,7 +184,7 @@ export interface SwitchProbeResult {
   restored: boolean;
   restore_diff: Array<{ table: string; before: unknown; after: unknown }>;
   /** Rows the readers' public read paths logged (captured by rowid) and how many the probe removed again. */
-  side_effects: Array<{ table: string; created: number; removed: number }>;
+  side_effects: SideEffectCount[];
   ready_for_daniel_test: boolean;
   error?: string;
   markdown: string;
@@ -438,9 +443,15 @@ export interface ProbeReaderContext {
   fixture: ProbeFixture;
   env: NodeJS.ProcessEnv;
   adminKey: string;
-  /** Rowids the readers' read paths created, per side-effect table (removed at the end). */
-  created: Map<string, Set<number>>;
+  /** Rows the readers' read paths created, per side-effect table: rowid → its pin (tasks.id / views.agent_id). */
+  created: Map<string, Map<number, string>>;
 }
+
+/** Per side-effect table: the column that pins a captured row besides its rowid. */
+const SIDE_EFFECT_PIN: Record<(typeof SWITCH_PROBE_SIDE_EFFECT_TABLES)[number], string> = {
+  tasks: "id",
+  analytics_agent_views: "agent_id",
+};
 
 function maxRowid(db: any, table: string): number {
   try { return Number((db.prepare(`SELECT COALESCE(MAX(rowid), 0) AS m FROM ${table}`).get() as { m: number }).m) || 0; } catch { return -1; }
@@ -458,26 +469,60 @@ function captureSync<T>(ctx: ProbeReaderContext, fn: () => T): T {
   } finally {
     SWITCH_PROBE_SIDE_EFFECT_TABLES.forEach((t, i) => {
       if (before[i] < 0) return;
-      const ids = ctx.db.prepare(`SELECT rowid AS r FROM ${t} WHERE rowid > ?`).all(before[i]) as Array<{ r: number }>;
+      const pin = SIDE_EFFECT_PIN[t];
+      const ids = ctx.db.prepare(`SELECT rowid AS r, ${pin} AS p FROM ${t} WHERE rowid > ?`).all(before[i]) as Array<{ r: number; p: unknown }>;
       if (ids.length === 0) return;
-      let set = ctx.created.get(t);
-      if (!set) { set = new Set(); ctx.created.set(t, set); }
-      for (const x of ids) set.add(Number(x.r));
+      let m = ctx.created.get(t);
+      if (!m) { m = new Map(); ctx.created.set(t, m); }
+      for (const x of ids) m.set(Number(x.r), String(x.p));
     });
   }
 }
 
-/** Deletes exactly the captured rowids (never anything else). */
-function removeSideEffects(ctx: ProbeReaderContext): Array<{ table: string; created: number; removed: number }> {
-  const out: Array<{ table: string; created: number; removed: number }> = [];
+export interface SideEffectCount {
+  table: string;
+  /** Rows captured as the probe's own. */
+  created: number;
+  removed: number;
+  /** The fixture's rows from the run window still there after the cleanup (leak indicator). */
+  left_after_run: number | null;
+}
+
+/** Max rowid per side-effect table at the start of the run (-1 = no table). */
+function sideEffectStart(db: any): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const t of SWITCH_PROBE_SIDE_EFFECT_TABLES) out[t] = maxRowid(db, t);
+  return out;
+}
+
+/**
+ * Deletes exactly the captured rows: one DELETE per row, by rowid AND its pin
+ * (tasks.id — a tasks rowid can be reused, the table has no AUTOINCREMENT —
+ * or views.agent_id = the fixture). Never a range, never a whole table.
+ */
+function removeSideEffects(ctx: ProbeReaderContext, start: Record<string, number>): SideEffectCount[] {
+  const out: SideEffectCount[] = [];
+  const fixtureId = ctx.fixture?.id ?? null;
   for (const t of SWITCH_PROBE_SIDE_EFFECT_TABLES) {
-    const ids = [...(ctx.created.get(t) ?? [])];
+    const rows = [...(ctx.created.get(t) ?? new Map<number, string>())];
     let removed = 0;
-    if (ids.length) {
-      const del = ctx.db.prepare(`DELETE FROM ${t} WHERE rowid = ?`);
-      ctx.db.transaction(() => { for (const id of ids) removed += del.run(id).changes; })();
+    if (t === "tasks") {
+      const del = ctx.db.prepare(`DELETE FROM tasks WHERE rowid = ? AND id = ?`);
+      ctx.db.transaction(() => { for (const [r, id] of rows) removed += del.run(r, id).changes; })();
+    } else if (fixtureId) {
+      const del = ctx.db.prepare(`DELETE FROM analytics_agent_views WHERE rowid = ? AND agent_id = ?`);
+      ctx.db.transaction(() => { for (const [r] of rows) removed += del.run(r, fixtureId).changes; })();
     }
-    out.push({ table: t, created: ids.length, removed });
+    let left: number | null = null;
+    if (fixtureId && (start[t] ?? -1) >= 0) {
+      try {
+        left = t === "tasks"
+          ? Number((ctx.db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE rowid > ? AND (params LIKE ? OR params LIKE ?)`)
+              .get(start[t], `%${fixtureId}%`, `%${ctx.fixture.name || fixtureId}%`) as { n: number }).n)
+          : Number((ctx.db.prepare(`SELECT COUNT(*) AS n FROM analytics_agent_views WHERE rowid > ? AND agent_id = ?`).get(start[t], fixtureId) as { n: number }).n);
+      } catch { left = null; }
+    }
+    out.push({ table: t, created: rows.length, removed, left_after_run: left });
   }
   return out;
 }
@@ -1438,7 +1483,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     db, env, agentId,
     readers: {},
     // Set inside the try (loadFixture reads the DB), so the run lock is always released.
-    readerCtx: { db, env, fixture: null as unknown as ProbeFixture, adminKey: "", created: new Map() },
+    readerCtx: { db, env, fixture: null as unknown as ProbeFixture, adminKey: "", created: new Map<string, Map<number, string>>() },
     maxWaitMs: Math.min(Math.max(0, Math.floor(opts.maxWaitMs ?? SWITCH_PROBE_DEFAULT_MAX_WAIT_MS)), SWITCH_PROBE_MAX_WAIT_CAP_MS),
     rows: [], checks: [], afterFlip: opts.afterFlip, write: opts.write ?? setOwnerFeatureValue,
   };
@@ -1446,7 +1491,8 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
   let error: string | undefined;
   let restored = false;
   let restoreDiff: Array<{ table: string; before: unknown; after: unknown }> = [];
-  let sideEffects: Array<{ table: string; created: number; removed: number }> = [];
+  let sideEffects: SideEffectCount[] = [];
+  const seStart = sideEffectStart(db);
   try {
     c.readers = { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) };
     c.readerCtx = readerContext(db, agentId, env);
@@ -1489,7 +1535,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
       error = error ? `${error}; restore: ${String(e?.message || e)}` : `restore: ${String(e?.message || e)}`;
     }
     try {
-      sideEffects = removeSideEffects(c.readerCtx);
+      sideEffects = removeSideEffects(c.readerCtx, seStart);
     } catch (e: any) {
       error = error ? `${error}; side effects: ${String(e?.message || e)}` : `side effects: ${String(e?.message || e)}`;
     }
@@ -1563,8 +1609,8 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
   }
   lines.push("", "## Ekstra kontroller", "", "| Kontroll | Resultat | Observert | Merknad |", "|---|---|---|---|");
   for (const ch of r.checks) lines.push(`| ${cell(ch.check)} | ${ch.result} | ${cell(ch.observed)} | ${cell(ch.reason ?? "")} |`);
-  lines.push("", "## Sideeffekter av lesingene", "", "Offentlige lesestier logger egne rader. Proben fanger radene den selv lagde (rowid) og sletter bare dem.", "", "| Tabell | Laget av proben | Slettet igjen |", "|---|---|---|");
-  for (const x of r.side_effects) lines.push(`| ${x.table} | ${x.created} | ${x.removed} |`);
+  lines.push("", "## Sideeffekter av lesingene", "", "Offentlige lesestier logger egne rader. Proben fanger bare radene som skrives i den synkrone delen av sine egne kall (rowid + id / agent_id) og sletter bare dem, én og én. En rad skrevet etter en `await` fanges ikke og blir liggende (lekkasje, aldri for mye slettet). «Igjen etter kjøringen» teller testprodusentens rader fra kjøringsvinduet som fortsatt finnes (kan også være andre admin-visninger).", "", "| Tabell | Laget av proben | Slettet igjen | Igjen etter kjøringen |", "|---|---|---|---|");
+  for (const x of r.side_effects) lines.push(`| ${x.table} | ${x.created} | ${x.removed} | ${x.left_after_run ?? "—"} |`);
   if (r.restore_diff.length) {
     lines.push("", "## Avvik etter gjenoppretting", "");
     for (const d of r.restore_diff) lines.push(`- ${d.table}: før ${cell(JSON.stringify(d.before))} · etter ${cell(JSON.stringify(d.after))}`);
