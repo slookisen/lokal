@@ -50373,6 +50373,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b: the price
+// message on /slik-fungerer-det and the attendance page, and «Én bryter, ett
+// sted» in the gårdssalg owner portal. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O1b: prisbudskap + én bryter ──");
+  try {
+    const { runGardssalgOwnerFeaturesO1bTests } = require("../src/routes/gardssalg-owner-features-o1b.test") as
+      typeof import("../src/routes/gardssalg-owner-features-o1b.test");
+    const r = await runGardssalgOwnerFeaturesO1bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-features-o1b: " + f);
+    console.log(`  gardssalg-owner-features-o1b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-features-o1b: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.
