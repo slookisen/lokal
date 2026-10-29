@@ -50668,3 +50668,26 @@ runSerial(async () => {
     failures.push("organic-claims-s0: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1:
+// product extractor (Shopify / WooCommerce / JSON-LD / grounded LLM tiers,
+// robots.txt, same-host + SSRF) and the flag-gated dry-run measurement
+// endpoint, which writes nothing to agent_knowledge or products. Fake fetch
+// and LLM are injected (no network); pins the getDb() singleton and sets
+// ADMIN_KEY / PRODUCT_IMPORT_DRYRUN_ENABLED (restored in finally) — runSerial,
+// tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-21-rfb-produktimport S1: uthenter + målekjøring (ingen skrivevei) ──");
+  try {
+    const { runProductImportTests } = require("../src/services/product-import/product-import.test") as
+      typeof import("../src/services/product-import/product-import.test");
+    const r = await runProductImportTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("product-import: " + f);
+    console.log(`  product-import: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("product-import: unexpected error: " + String(err?.message || err));
+  }
+});

@@ -323,22 +323,60 @@ export function isSafeFetchUrl(raw: string): boolean {
     host.endsWith(".local")
   )
     return false;
-  if (host.includes(":")) {
-    // IPv6 literal: block loopback (::1), unique-local (fc00::/7), link-local (fe80::/10)
-    if (host === "::1" || /^f[cd]/.test(host) || /^fe[89ab]/.test(host)) return false;
-    return true;
-  }
+  if (host.includes(":")) return isSafeIpv6Literal(host);
   const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const o = m.slice(1, 5).map(Number);
-    if (o.some((x) => x > 255)) return false;
-    const [a, b] = o;
-    if (a === 0 || a === 10 || a === 127) return false;
-    if (a === 169 && b === 254) return false; // link-local incl. cloud metadata
-    if (a === 172 && b! >= 16 && b! <= 31) return false;
-    if (a === 192 && b === 168) return false;
-    if (a === 100 && b! >= 64 && b! <= 127) return false; // CGNAT
+  if (m) return isSafePublicIpv4(m.slice(1, 5).map(Number));
+  return true;
+}
+
+function isSafePublicIpv4(o: number[]): boolean {
+  if (o.length !== 4 || o.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return false;
+  const [a, b] = o;
+  if (a === 0 || a === 10 || a === 127) return false;
+  if (a === 169 && b === 254) return false; // link-local incl. cloud metadata
+  if (a === 172 && b! >= 16 && b! <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 100 && b! >= 64 && b! <= 127) return false; // CGNAT
+  return true;
+}
+
+/** Expand an IPv6 literal (as WHATWG URL normalises it, possibly with an
+ * embedded dotted IPv4 tail) to its 8 16-bit groups; null if malformed. */
+function expandIpv6(host: string): number[] | null {
+  let h = host.replace(/%.*$/, "");
+  const v4 = h.match(/^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const o = v4.slice(2, 6).map(Number);
+    if (o.some((x) => x > 255)) return null;
+    h = `${v4[1]}${((o[0]! << 8) | o[1]!).toString(16)}:${((o[2]! << 8) | o[3]!).toString(16)}`;
   }
+  const halves = h.split("::");
+  if (halves.length > 2) return null;
+  const parse = (part: string) => (part === "" ? [] : part.split(":"));
+  const head = parse(halves[0]!);
+  const tail = halves.length === 2 ? parse(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? fill !== 0 : fill < 1) return null;
+  const groups = [...head, ...Array(halves.length === 2 ? fill : 0).fill("0"), ...tail];
+  if (groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16));
+}
+
+/** IPv6 literal guard: block unspecified (::), loopback (::1), unique-local
+ * (fc00::/7), link-local (fe80::/10), and every form that embeds an IPv4
+ * address (IPv4-mapped ::ffff:0:0/96, IPv4-translated ::ffff:0:0:0/96,
+ * IPv4-compatible ::/96, NAT64 64:ff9b::/96) unless that IPv4 is public. */
+function isSafeIpv6Literal(host: string): boolean {
+  const g = expandIpv6(host);
+  if (!g) return false;
+  if ((g[0]! & 0xfe00) === 0xfc00) return false; // fc00::/7
+  if ((g[0]! & 0xffc0) === 0xfe80) return false; // fe80::/10
+  const v4 = [g[6]! >> 8, g[6]! & 0xff, g[7]! >> 8, g[7]! & 0xff];
+  const zeroTo = (n: number) => g.slice(0, n).every((x) => x === 0);
+  if (zeroTo(6)) return isSafePublicIpv4(v4); // ::, ::1, ::a.b.c.d (all land in 0/8 or 127/8 when tiny)
+  if (zeroTo(5) && g[5] === 0xffff) return isSafePublicIpv4(v4); // ::ffff:a.b.c.d
+  if (zeroTo(4) && g[4] === 0xffff && g[5] === 0) return isSafePublicIpv4(v4); // ::ffff:0:a.b.c.d
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) return isSafePublicIpv4(v4); // NAT64
   return true;
 }
 
@@ -499,6 +537,19 @@ export type FetchPageOptions = {
    * the standing bug for exactly that class of cross-test bleed).
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Optional `Accept` header. Absent = the HTML default every existing caller
+   * gets. Added for the product-import extractor (dev-request
+   * 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1), which reads
+   * robots.txt and JSON store APIs through this same SSRF-guarded fetcher.
+   */
+  accept?: string;
+  /**
+   * true = skip the isUnusableBody() markup sniff, so a plain-text robots.txt
+   * or a JSON API answer comes back as `ok` with its body. Absent/false = the
+   * exact existing behaviour (non-markup 200s are classified as failures).
+   */
+  allowNonHtmlBody?: boolean;
 };
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -543,7 +594,7 @@ export async function fetchPage(url: string, opts: FetchPageOptions): Promise<Fe
     try {
       resp = await doFetch(fetchUrl, {
         redirect: "follow",
-        headers: { "User-Agent": opts.userAgent, Accept: "text/html,application/xhtml+xml" },
+        headers: { "User-Agent": opts.userAgent, Accept: opts.accept ?? "text/html,application/xhtml+xml" },
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
@@ -600,7 +651,7 @@ export async function fetchPage(url: string, opts: FetchPageOptions): Promise<Fe
     const bytes = new Uint8Array(buf);
     const contentType = resp.headers.get("content-type");
     const html = decodeHtmlBytes(bytes, contentType);
-    const unusable = isUnusableBody(html, contentType);
+    const unusable = opts.allowNonHtmlBody ? null : isUnusableBody(html, contentType);
     if (unusable) {
       // Not retried: an error stub or a non-HTML document answers identically
       // on a second try, and `blocked` persistence already tells the caller

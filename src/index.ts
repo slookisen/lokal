@@ -165,6 +165,7 @@ import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/ad
 import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
+import adminProductImportRoutes from "./routes/admin-product-import";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
@@ -1204,6 +1205,10 @@ app.use("/api/marketplace/hanen", publicHanenRoutes);
 app.use("/admin/debio", adminLimiter, adminDebioCrossCheckRoutes);
 // dev-request 2026-07-06-rfb-salgskanal-kategorier: salgskanal auto-matcher sweep — POST /admin/salgskanal/sync
 app.use("/admin/salgskanal", adminLimiter, adminSalgskanalRoutes);
+// dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1: dry-run measurement of the
+// product extractor — POST/GET /admin/product-import/dry-run[/:id]. Flag PRODUCT_IMPORT_DRYRUN_ENABLED
+// (default off → 404); writes only product_import_runs/_results, never agent_knowledge/products.
+app.use("/admin/product-import", adminLimiter, adminProductImportRoutes);
 // PR-65 (2026-05-17): in-memory job tracker for ?async=1 admin endpoints — GET /admin/jobs[/:id]
 app.use("/admin", adminLimiter, adminJobsRoutes);
 // Phase 0: admin product backfill endpoint

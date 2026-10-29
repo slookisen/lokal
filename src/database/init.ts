@@ -6091,6 +6091,51 @@ function initSchema(db: Database.Database): void {
     console.error("Migration order_activation_links failed:", err);
   }
 
+  // ─── product_import_runs / product_import_run_results (dev-request
+  // 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 1) ──────────────
+  // The dry-run measurement (POST /admin/product-import/dry-run, flag
+  // PRODUCT_IMPORT_DRYRUN_ENABLED) stores its run and one row per measured
+  // profile here — and NOWHERE else: no write to agent_knowledge or products.
+  // `mode` is 'dry_run' for every Skive 1 row. Additive; brand-new tables.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_runs (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL DEFAULT 'dry_run',
+        status TEXT NOT NULL DEFAULT 'running',
+        params_json TEXT NOT NULL DEFAULT '{}',
+        profiles_total INTEGER NOT NULL DEFAULT 0,
+        profiles_done INTEGER NOT NULL DEFAULT 0,
+        llm_call_cap INTEGER NOT NULL DEFAULT 0,
+        llm_calls INTEGER NOT NULL DEFAULT 0,
+        summary_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_run_results (
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        agent_name TEXT,
+        website TEXT,
+        is_owned INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL,
+        tier TEXT,
+        product_count INTEGER NOT NULL DEFAULT 0,
+        priced_count INTEGER NOT NULL DEFAULT 0,
+        llm_calls INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (run_id, agent_id)
+      )
+    `);
+  } catch (err) {
+    console.error("Migration product_import_runs failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …
