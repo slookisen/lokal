@@ -54,17 +54,13 @@ import { fetchFinnokoCompanies, type FinnokoCompany } from "./debio-finnoko-clie
 import { canonicaliseDomain } from "./debio-verification-service";
 import { emailDomain, isFreeMailDomain } from "./claim-domain-rule";
 import { nameSimilarity, normaliseForMatch } from "./name-matcher";
-import { certValidOn, debioRegisterStale, readDebioRegisterState, DEBIO_REGISTER_STALE_DAYS } from "./debio-approval";
+import { certValidOn, debioRegisterStale, readDebioRegisterState, DEBIO_REGISTER_STALE_DAYS, DEBIO_REGISTER_SYNC_ENV, debioRegisterSyncEnabled } from "./debio-approval";
 import { debioSwitchOffAgentIds } from "../owner-features/enforce";
 
-export const DEBIO_REGISTER_SYNC_ENV = "RFB_DEBIO_REGISTER_SYNC";
+// The flag lives in debio-approval (read side, no import cycle); re-exported here.
+export { DEBIO_REGISTER_SYNC_ENV, debioRegisterSyncEnabled };
 export const DEBIO_REGISTER_MIN_ROWS = 2500;
 export const NAME_TOKEN_OVERLAP_MIN = 0.67;
-
-export function debioRegisterSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = env[DEBIO_REGISTER_SYNC_ENV];
-  return v === "1" || v === "true";
-}
 
 export type DebioStatus = "okologisk" | "karens" | "annet" | "ingen";
 export type SikkerMethod = "org_nr" | "tag_org_nr" | "finnoko_domain" | "name_postal" | "street_postal" | "street_city" | "review";
@@ -217,9 +213,11 @@ export function streetKey(name: string): string {
  * Bnr 5» would read as street «gnr» no. 12 (and match the neighbour «Gnr 12
  * Bnr 3»), «Postboks 12» would match the same box number at another post
  * office. Such lines never give a street key (parseStreet → null); they only
- * feed review-only signals (parseNonStreet).
+ * feed review-only signals (parseNonStreet). «Pboks», «P.boks», «Postboksnr.»
+ * and «Boksnr.» count too: the letter boundary would otherwise let «pboks»
+ * through as a street name.
  */
-const NON_STREET_RE = /(?:^|[^a-zæøå])(?:g\s*\.?\s*nr|b\s*\.?\s*nr|gbnr|g\s*\/\s*bnr|gards\s*nr|gårds\s*nr|bruks\s*nr|matr(?:ikkel)?|postboks|postb|post\s*box|p\s*\.?\s*o\s*\.?\s*box|pob|boks|box|pb|p\s*\.\s*b)(?:[^a-zæøå]|$)/;
+const NON_STREET_RE = /(?:^|[^a-zæøå])(?:g\s*\.?\s*nr|b\s*\.?\s*nr|gbnr|g\s*\/\s*bnr|gards\s*nr|gårds\s*nr|bruks\s*nr|matr(?:ikkel)?|postboks\s*\.?\s*nr|postboks|postb|post\s*box|p\s*\.?\s*o\s*\.?\s*box|pob|p\s*\.?\s*boks\s*\.?\s*nr|p\s*\.?\s*boks|boks\s*\.?\s*nr|boks|box|pb|p\s*\.\s*b)(?:[^a-zæøå]|$)/;
 
 function firstSegment(address: string): string {
   return address.split(",")[0].trim();
@@ -233,8 +231,12 @@ export function parseNonStreet(address: unknown): NonStreetAddress | null {
   const first = firstSegment(address).normalize("NFC").toLowerCase();
   if (!NON_STREET_RE.test(first)) return null;
   const g = /(?:g\s*\.?\s*nr|gards\s*nr|gårds\s*nr)\.?\s*(\d+)(?:\s*[\/,-]?\s*(?:(?:b\s*\.?\s*nr|bruks\s*nr)\.?\s*)?(\d+))?/.exec(first);
-  if (g) return { kind: "gnr", gnr: g[1], bnr: g[2] ?? null };
-  const pb = /(?:postboks|postb|post\s*box|p\s*\.?\s*o\s*\.?\s*box|pob|boks|box|pb|p\s*\.\s*b)\.?\s*(\d+)/.exec(first);
+  if (g) {
+    // «Gnr. 14, bnr. 5»: the bnr sits in the next comma segment.
+    const next = g[2] ? null : /^(?:b\s*\.?\s*nr|bruks\s*nr)\.?\s*(\d+)/.exec((address.split(",")[1] ?? "").trim().normalize("NFC").toLowerCase());
+    return { kind: "gnr", gnr: g[1], bnr: g[2] ?? next?.[1] ?? null };
+  }
+  const pb = /(?:postboks|postb|post\s*box|p\s*\.?\s*o\s*\.?\s*box|pob|p\s*\.?\s*boks|boks|box|pb|p\s*\.\s*b)(?:\s*\.?\s*nr)?\.?\s*(\d+)/.exec(first);
   if (pb) return { kind: "po_box", no: pb[1] };
   return null;
 }
@@ -569,9 +571,15 @@ function updateState(db: Database.Database, patch: Partial<Record<"last_attempt_
  * > DEBIO_REGISTER_STALE_DAYS since the last successful register sync →
  * register-checked producers lose `debio_verified` (every reader of the column
  * then shows no organic status); a warning is returned. No-op when the
- * register sync never ran.
+ * register sync never ran, and with RFB_DEBIO_REGISTER_SYNC off (rollback: the
+ * finnoko sync owns debio_verified again). `enabled` overrides the flag.
  */
-export function enforceDebioRegisterFreshness(db: Database.Database, now: Date = new Date()): { stale: boolean; cleared: number; warning: string | null } {
+export function enforceDebioRegisterFreshness(
+  db: Database.Database,
+  now: Date = new Date(),
+  opts: { enabled?: boolean } = {},
+): { stale: boolean; cleared: number; warning: string | null } {
+  if (!(opts.enabled ?? debioRegisterSyncEnabled())) return { stale: false, cleared: 0, warning: null };
   const state = readDebioRegisterState(db);
   if (!state) return { stale: false, cleared: 0, warning: null };
   if (!debioRegisterStale(state, now)) return { stale: false, cleared: 0, warning: null };
@@ -615,7 +623,8 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
     result.errors.push(reason);
     if (!dryRun) {
       updateState(db, { last_attempt_at: nowIso, last_reject_at: nowIso, last_reject_reason: reason });
-      const f = enforceDebioRegisterFreshness(db, now);
+      // A write run is the register sync at work: enforce regardless of the flag.
+      const f = enforceDebioRegisterFreshness(db, now, { enabled: true });
       result.stale = f.stale;
       if (f.warning) result.warnings.push(f.warning);
     } else {

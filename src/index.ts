@@ -1795,7 +1795,7 @@ if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
     const now = new Date();
     // Økologi S1 (AC1.6): every hour — > 7 days without a successful register
     // sync clears register-checked statuses. No-op when the register sync
-    // never ran (flag off: unchanged).
+    // never ran or RFB_DEBIO_REGISTER_SYNC is off (rollback to finnoko).
     try {
       const f = enforceDebioRegisterFreshness(getDb(), now);
       if (f.warning) console.warn(`[debio-register] ${f.warning} (cleared=${f.cleared})`);

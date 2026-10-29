@@ -3,8 +3,9 @@
 // tekstrevisjon, S1.5 / AC1.5–AC1.6. What a public surface may show from the
 // register status the sync (debio-register-sync.ts) writes on `agents`:
 //
-//   - no agent_debio_status row (never checked against the register): the S0
-//     rule as before — `debio_verified = 1` from the finnoko sync.
+//   - RFB_DEBIO_REGISTER_SYNC off, or no agent_debio_status row (never checked
+//     against the register): the S0 rule as before — `debio_verified = 1` from
+//     the finnoko sync.
 //   - register-checked: shown only for `okologisk` with a certificate valid
 //     today, and only while the last successful register sync is at most
 //     DEBIO_REGISTER_STALE_DAYS old. karens / annet / ingen show nothing.
@@ -17,6 +18,16 @@ import type Database from "better-sqlite3";
 import { isDebioVerifiedValue } from "./organic-claims";
 
 export const DEBIO_REGISTER_STALE_DAYS = 7;
+export const DEBIO_REGISTER_SYNC_ENV = "RFB_DEBIO_REGISTER_SYNC";
+
+/**
+ * Is the register sync (økologi S1) on? Off = rollback: the finnoko sync owns
+ * debio_verified for every agent and register rows are ignored on read.
+ */
+export function debioRegisterSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env[DEBIO_REGISTER_SYNC_ENV];
+  return v === "1" || v === "true";
+}
 export const FINNOKO_SEARCH_URL = "https://finnoko.debio.no/?search=";
 
 export interface DebioRegisterSyncState {
@@ -77,9 +88,11 @@ export function certValidOn(validTo: unknown, now: Date = new Date()): boolean {
 export function debioStatusShown(
   agent: { id?: unknown; debio_verified?: unknown } | null | undefined,
   db: Database.Database,
-  opts: { now?: Date; statusRow?: DebioStatusRow | null; state?: DebioRegisterSyncState | null } = {},
+  opts: { now?: Date; statusRow?: DebioStatusRow | null; state?: DebioRegisterSyncState | null; enabled?: boolean } = {},
 ): boolean {
   if (!agent || !isDebioVerifiedValue(agent.debio_verified)) return false;
+  // Flag off (rollback): the S0 rule for everyone, register rows ignored.
+  if (!(opts.enabled ?? debioRegisterSyncEnabled())) return true;
   const row = opts.statusRow !== undefined ? opts.statusRow : readDebioStatusRow(db, String(agent.id ?? ""));
   if (!row) return true; // never checked against the register: finnoko-only, as before
   if (row.debio_status !== "okologisk") return false;

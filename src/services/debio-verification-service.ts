@@ -41,6 +41,7 @@ import {
   FinnokoCompany,
 } from "./debio-finnoko-client";
 import { normaliseForMatch, nameSimilarity } from "./name-matcher";
+import { debioRegisterSyncEnabled } from "./debio-approval";
 
 const NAME_MATCH_THRESHOLD = 0.85;
 
@@ -232,9 +233,11 @@ export async function syncDebioVerifications(
 
   // Agents with a register status (økologi S1) are owned by the register
   // sync: this finnoko sync must not set debio_verified = 1 for them (the
-  // register may have said karens / annet / ingen).
+  // register may have said karens / annet / ingen). Only while
+  // RFB_DEBIO_REGISTER_SYNC is on: flag off = rollback, finnoko owns every
+  // agent again as before S1.
   let registerOwned = new Set<string>();
-  try {
+  if (debioRegisterSyncEnabled()) try {
     registerOwned = new Set(
       (db.prepare("SELECT agent_id FROM agent_debio_status").all() as Array<{ agent_id: string }>).map((r) => r.agent_id),
     );

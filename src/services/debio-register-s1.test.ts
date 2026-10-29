@@ -94,6 +94,8 @@ function fixtureRows(over: { expire?: boolean; dropOrg?: boolean; karensOrg?: bo
     { name: "Zqx Nabosen", clientCode: "917171717", certSid: 5015, postalCode: "2950", city: "Skammestein", street: "Gnr 12 Bnr 3", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
     // P.O. box: «Postboks 12, 2601» vs ours «Postboks 12, 2602», same city
     { name: "Zqx Boksesen", clientCode: "918181818", certSid: 5016, postalCode: "2601", city: "Lillehammer", street: "Postboks 12", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
+    // P.O. box written «Pboks»: «Pboks 15, 2305» vs ours «Pboks 15, 2306», same city
+    { name: "Zqx Pboksen", clientCode: "918282828", certSid: 5026, postalCode: "2305", city: "Hamar", street: "Pboks 15", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
     // street_city with two of ours at the same street + no. in the same city
     { name: "Zqx Kaisen", clientCode: "919191919", certSid: 5017, postalCode: "6001", city: "Kaiby", street: "Kaigata 3", statusCodes: [509], validTo: FUTURE, mainProductGroups: ["LBP"] },
     // one entity, name_postal for two of ours
@@ -146,6 +148,7 @@ const AGENTS: Seed[] = [
   { id: "s1-shared-b", name: "Ostebutikken", city: "Oslo", address: "Vulkan 5, 0178 Oslo", postal: "0178" },
   { id: "s1-gnr", name: "Nabotun Gård", city: "Skammestein", address: "Gnr 12 Bnr 5", postal: "2950" },
   { id: "s1-pobox", name: "Ysteriet Lillehammer", city: "Lillehammer", address: "Postboks 12, 2602 Lillehammer", postal: "2602" },
+  { id: "s1-pboks", name: "Hamar Honningbu", city: "Hamar", address: "Pboks 15, 2306 Hamar", postal: "2306" },
   { id: "s1-kai-a", name: "Kaikafeen", city: "Kaiby", address: "Kaigata 3", postal: "6002" },
   { id: "s1-kai-b", name: "Røkeriet på kaia", city: "Kaiby", address: "Kaigata 3", postal: "6003" },
   { id: "s1-bjork-a", name: "Bjørkely Gård", city: "Bjørkby", postal: "5555" },
@@ -212,13 +215,19 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
   assertEq(sync.parseStreet("Fjordallé 3"), sync.parseStreet("Fjord Alle 3"), "street-4: Allé = alle");
   assertEq(sync.parseStreet("Hillevågsveien 99 B")?.no, "99b", "street-5: house letter kept");
   assertTrue(JSON.stringify(sync.parseStreet("Homme 10")) !== JSON.stringify(sync.parseStreet("Homme 8")), "street-6: another house no. differs");
-  for (const a of ["Gnr 12 Bnr 5", "gnr. 12/5", "G.nr 12 B.nr 5, 2950 Skammestein", "Postboks 12", "Postboks 12, 2602 Lillehammer", "Pb. 12", "PB 12", "Boks 3", "P.O. Box 7"]) {
+  for (const a of ["Gnr 12 Bnr 5", "gnr. 12/5", "G.nr 12 B.nr 5, 2950 Skammestein", "Postboks 12", "Postboks 12, 2602 Lillehammer", "Pb. 12", "PB 12", "Boks 3", "P.O. Box 7",
+    "Pboks 15", "PBoks 15", "P.boks 15", "P. boks 15", "Pboks. 15", "Pboksnr. 15", "Postboksnr. 15", "Postboks nr. 15", "Postb. 15", "Boksnr 15", "Pboks 15, 2305 Hamar"]) {
     assertEq(sync.parseStreet(a), null, `street-nonstreet: «${a}» is not a street`);
   }
-  assertTrue(sync.parseStreet("Boksveien 3") !== null && sync.parseStreet("Gnrudvegen 4") !== null, "street-7: streets merely starting with boks/gnr still parse");
+  assertTrue(sync.parseStreet("Boksveien 3") !== null && sync.parseStreet("Gnrudvegen 4") !== null && sync.parseStreet("Pbveien 2") !== null && sync.parseStreet("Boksåsen 8") !== null, "street-7: streets merely starting with boks/gnr still parse");
   assertEq(sync.parseNonStreet("Gnr 12 Bnr 5"), { kind: "gnr", gnr: "12", bnr: "5" }, "nonstreet-1: gnr + bnr pair");
   assertEq(sync.parseNonStreet("gnr. 12/5"), { kind: "gnr", gnr: "12", bnr: "5" }, "nonstreet-2: «gnr. 12/5»");
   assertEq(sync.parseNonStreet("Postboks 12, 2602 Lillehammer"), { kind: "po_box", no: "12" }, "nonstreet-3: P.O. box");
+  assertEq(sync.parseNonStreet("Pboks 15, 2305 Hamar"), { kind: "po_box", no: "15" }, "nonstreet-5: «Pboks 15»");
+  assertEq(sync.parseNonStreet("Postboksnr. 15"), { kind: "po_box", no: "15" }, "nonstreet-6: «Postboksnr. 15»");
+  assertEq(sync.parseNonStreet("P.boks 15"), { kind: "po_box", no: "15" }, "nonstreet-7: «P.boks 15»");
+  assertEq(sync.parseNonStreet("Gnr. 14, bnr. 5, 2950 Skammestein"), { kind: "gnr", gnr: "14", bnr: "5" }, "nonstreet-8: bnr after a comma");
+  assertEq(sync.parseNonStreet("Gnr. 14, 2950 Skammestein"), { kind: "gnr", gnr: "14", bnr: null }, "nonstreet-9: gnr alone, postal segment is not a bnr");
   assertEq(sync.parseNonStreet("Storgata 5"), null, "nonstreet-4: a street is not a non-street");
   assertEq(sync.coreTokens("Fyllby Andelslandbruk Gård", ["fyllby"]), ["andelslandbruk"], "tokens-1: place and generic words dropped");
   assertEq(sync.tokenOverlap(["bakken"], ["bakken", "ola"]), 0.5, "tokens-2: overlap uses the larger side");
@@ -258,7 +267,9 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
     // auto.debio off for s1-off: admin lock under the enforce gate.
     process.env.OWNER_FEATURES_ENFORCE = "1";
     process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "rfb:s1-off,rfb:s1-org";
-    delete process.env.RFB_DEBIO_REGISTER_SYNC;
+    // The register flow below runs with the flag on; the flag-off section at the
+    // end turns it off again.
+    process.env.RFB_DEBIO_REGISTER_SYNC = "1";
     db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', 's1-off', 'auto.debio', 'false', 'admin', 1, ?)`).run(NOW.toISOString());
 
     const row = (id: string) => db.prepare(`SELECT a.id, s.debio_status, a.debio_verified, s.debio_match_method, s.debio_sid, s.debio_cert_valid_to, s.debio_product_groups, s.debio_checked_at
@@ -289,7 +300,7 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
 
     // ── write run ───────────────────────────────────────────────────────────
     const r1 = await sync.syncDebioRegister(db, { fetchImpl: fakeFetch(FULL()), dryRun: false, now: NOW, skipCache: true });
-    assertEq([r1.accepted, r1.fetched_raw, r1.normalized], [true, 2521, 2519], "run-1: accepted with all rows counted");
+    assertEq([r1.accepted, r1.fetched_raw, r1.normalized], [true, 2522, 2520], "run-1: accepted with all rows counted");
     const sure: Array<[string, string]> = [
       ["s1-org", "org_nr"], ["s1-tag", "tag_org_nr"], ["s1-dom", "finnoko_domain"], ["s1-name", "name_postal"],
       ["s1-street", "street_postal"], ["s1-street-city", "street_city"],
@@ -318,6 +329,7 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
       ["s1-shared-b", "street_shared_address", "fp-shared: one register row at a shared address"],
       ["s1-gnr", "gnr_other_bnr", "fp-gnr: «Gnr 12 Bnr 5» vs neighbour «Gnr 12 Bnr 3»"],
       ["s1-pobox", "po_box_same_no", "fp-pobox: «Postboks 12, 2602» vs «Postboks 12, 2601»"],
+      ["s1-pboks", "po_box_same_no", "fp-pboks: «Pboks 15, 2306» vs «Pboks 15, 2305»"],
       ["s1-kai-a", "street_shared_address", "fp-unique-b: street_city, two of ours at the same street + no."],
       ["s1-kai-b", "street_shared_address", "fp-unique-b: street_city, two of ours at the same street + no."],
       ["s1-bjork-a", "name_postal_shared_entity", "fp-entity-c: one entity, name_postal for two producers"],
@@ -457,6 +469,7 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
     assertEq(certs[0], "Debio-godkjent", "certs-1: certifications lead with «Debio-godkjent»");
 
     // ── flag off: the finnoko sync path is unchanged ────────────────────────
+    delete process.env.RFB_DEBIO_REGISTER_SYNC;
     const db2 = new Database(":memory:");
     initMod.__setDbForTesting(db2 as any);
     initMod.__initSchemaForTesting(db2 as any);
@@ -470,17 +483,32 @@ export async function runDebioRegisterS1Tests(opts: { log?: boolean } = {}): Pro
     assertEq(sync.enforceDebioRegisterFreshness(db2 as any, later), { stale: false, cleared: 0, warning: null }, "flagoff-3: freshness check is a no-op without a register run");
     const info2 = (require("./knowledge-service") as typeof import("./knowledge-service")).knowledgeService.getAgentInfo("s1-flagoff");
     assertEq(info2?.agent.debioVerified, true, "flagoff-4: finnoko-verified producer still shown");
-    // Note 1: the manual finnoko sync never sets debio_verified for a producer
-    // the register owns (row in agent_debio_status).
+    // Note 1: with the flag on, the finnoko sync never sets debio_verified for
+    // a producer the register owns (row in agent_debio_status).
     seed(db2, { id: "s1-register-owned", name: "Registereid Frukt", city: "Fruktby", website: "https://registereidfrukt.no" });
     db2.prepare("INSERT INTO agent_debio_status (agent_id, debio_status, debio_checked_at) VALUES ('s1-register-owned', 'ingen', ?)").run(NOW.toISOString());
-    const fin2 = await syncDebioVerifications({
-      db: db2 as any, skipCache: true, nowIso: NOW.toISOString(),
-      fetchImpl: fakeFetch([], [...FINNOKO, { partner_sid: 78, display_name: "Registereid Frukt", website: "registereidfrukt.no", contact_mail: null, attachments: [], sales_channels: [] }]),
-    });
-    const owned = db2.prepare("SELECT debio_verified FROM agents WHERE id = 's1-register-owned'").get() as any;
-    assertEq([owned.debio_verified, fin2.skipped_register_owned], [0, 1], "finnoko-owned-1: register-owned agent not verified by the finnoko sync");
+    const FINNOKO_OWNED = [...FINNOKO, { partner_sid: 78, display_name: "Registereid Frukt", website: "registereidfrukt.no", contact_mail: null, attachments: [], sales_channels: [] }];
+    const ownedRow = () => db2.prepare("SELECT debio_verified FROM agents WHERE id = 's1-register-owned'").get() as any;
+    process.env.RFB_DEBIO_REGISTER_SYNC = "1";
+    const fin2 = await syncDebioVerifications({ db: db2 as any, skipCache: true, nowIso: NOW.toISOString(), fetchImpl: fakeFetch([], FINNOKO_OWNED) });
+    assertEq([ownedRow().debio_verified, fin2.skipped_register_owned], [0, 1], "finnoko-owned-1: flag on → register-owned agent not verified by the finnoko sync");
     assertEq((db2.prepare("SELECT debio_verified FROM agents WHERE id = 's1-flagoff'").get() as any).debio_verified, 1, "finnoko-owned-2: other agents still verified");
+    // Flag off = rollback: finnoko owns every agent again, register rows and a
+    // stale register state change nothing.
+    delete process.env.RFB_DEBIO_REGISTER_SYNC;
+    const fin3 = await syncDebioVerifications({ db: db2 as any, skipCache: true, nowIso: NOW.toISOString(), fetchImpl: fakeFetch([], FINNOKO_OWNED) });
+    assertEq([ownedRow().debio_verified, fin3.skipped_register_owned], [1, 0], "rollback-1: flag off → finnoko verifies the register-owned agent as before S1");
+    db2.prepare("INSERT OR REPLACE INTO debio_register_sync_state (id, last_success_at) VALUES (1, ?)").run(NOW.toISOString());
+    assertEq(sync.enforceDebioRegisterFreshness(db2 as any, later), { stale: false, cleared: 0, warning: null }, "rollback-2: flag off → stale register clears nothing");
+    assertEq(ownedRow().debio_verified, 1, "rollback-3: debio_verified kept");
+    assertEq(approval.debioStatusShown({ id: "s1-register-owned", debio_verified: 1 }, db2 as any, { now: later }), true, "rollback-4: flag off → S0 rule on read (register row ignored)");
+    const info3 = (require("./knowledge-service") as typeof import("./knowledge-service")).knowledgeService.getAgentInfo("s1-register-owned");
+    assertEq(info3?.agent.debioVerified, true, "rollback-5: flag off → shown on the public surface");
+    process.env.RFB_DEBIO_REGISTER_SYNC = "1";
+    assertEq(approval.debioStatusShown({ id: "s1-register-owned", debio_verified: 1 }, db2 as any, { now: later }), false, "flagon-1: flag on → register row «ingen» hides it");
+    const fOn = sync.enforceDebioRegisterFreshness(db2 as any, later);
+    assertEq([fOn.stale, fOn.cleared, ownedRow().debio_verified], [true, 1, 0], "flagon-2: flag on → stale register clears debio_verified");
+    delete process.env.RFB_DEBIO_REGISTER_SYNC;
     try { db2.close(); } catch { /* closed */ }
   } catch (err: any) {
     failed++;

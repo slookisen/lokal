@@ -24,7 +24,7 @@ import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
 import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
-import { debioApprovalText, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
+import { debioApprovalText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
@@ -5874,7 +5874,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     let debioApprovalHtml = "";
     if (info?.agent.debioVerified === true) {
       badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
-      const dr = readDebioStatusRow(getDb(), agent.id);
+      // Flag off (rollback): no register line, the S0 badge only.
+      const dr = debioRegisterSyncEnabled() ? readDebioStatusRow(getDb(), agent.id) : null;
       if (dr?.debio_status === "okologisk") {
         debioApprovalHtml = `<p class="pf-debio"><a href="${escapeHtml(finnokoSearchUrl(String(agent.name || "")))}" target="_blank" rel="noopener">${escapeHtml(debioApprovalText(lang, dr.debio_product_groups, dr.debio_checked_at))}</a></p>`;
       }
