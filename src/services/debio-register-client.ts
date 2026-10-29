@@ -232,9 +232,11 @@ function instantOf(v: unknown): number | null {
 
 /**
  * Validity from the real `certificates: [{from, to}]` array: the certificates
- * valid now (from ≤ now ≤ to) give validFrom = min from, validTo = max to;
- * when none is valid now, the latest `to` (and its `from`) so expiry sees it
- * as expired. Null when the array carries no usable `to`.
+ * valid now (from ≤ now ≤ to; a missing `from` counts as started) give
+ * validFrom = min from, validTo = max to; when none is valid now, the latest
+ * `to` among the expired ones (to < now) so expiry sees it as expired; when
+ * only not-yet-started ones exist, validTo = null (never verified) and
+ * validFrom = the earliest start. Null when the array carries no usable `to`.
  */
 export function certificateValidity(certs: unknown, now: Date): { validFrom: string | null; validTo: string | null } | null {
   if (!Array.isArray(certs)) return null;
@@ -254,8 +256,17 @@ export function certificateValidity(certs: unknown, now: Date): { validFrom: str
     const froms = current.map((c) => c.from).filter((f): f is number => f !== null);
     return { validFrom: iso(froms.length ? Math.min(...froms) : null), validTo: iso(Math.max(...current.map((c) => c.to))) };
   }
-  const latest = list.reduce((a, b) => (b.to > a.to ? b : a));
-  return { validFrom: iso(latest.from), validTo: iso(latest.to) };
+  // None valid now: the latest EXPIRED one (to < now), so expiry sees it as
+  // expired. A certificate that has not started (from > now) never counts.
+  const expired = list.filter((c) => c.to < t);
+  if (expired.length) {
+    const latest = expired.reduce((a, b) => (b.to > a.to ? b : a));
+    return { validFrom: iso(latest.from), validTo: iso(latest.to) };
+  }
+  // Only not-yet-started certificates: no valid_to (not verified); validFrom
+  // is the earliest future start, for information only.
+  const starts = list.map((c) => c.from).filter((f): f is number => f !== null);
+  return { validFrom: iso(starts.length ? Math.min(...starts) : null), validTo: null };
 }
 
 /** street + houseNr, appending the house number only when the street has no trailing number. */

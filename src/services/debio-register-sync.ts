@@ -120,7 +120,7 @@ interface Entity {
   nonStreets: NonStreetAddress[];
 }
 
-/** One entity per org.nr. (or sid); expired okologisk certificates do not count. */
+/** One entity per org.nr. (or sid); expired or not-yet-started okologisk certificates do not count. */
 export function buildEntities(rows: readonly DebioRegisterRow[], now: Date): Entity[] {
   const groups = new Map<string, DebioRegisterRow[]>();
   for (const r of rows) {
@@ -130,7 +130,9 @@ export function buildEntities(rows: readonly DebioRegisterRow[], now: Date): Ent
   }
   const out: Entity[] = [];
   for (const [key, list] of groups) {
-    const live = list.filter((r) => r.status !== "okologisk" || !r.validTo || certValidOn(r.validTo, now));
+    const today = now.toISOString().slice(0, 10);
+    const started = (r: DebioRegisterRow) => !r.validFrom || r.validFrom.slice(0, 10) <= today;
+    const live = list.filter((r) => r.status !== "okologisk" || (started(r) && (!r.validTo || certValidOn(r.validTo, now))));
     const oko = live.filter((r) => r.status === "okologisk");
     const karens = live.filter((r) => r.status === "karens");
     const basis = oko.length ? oko : karens.length ? karens : live;

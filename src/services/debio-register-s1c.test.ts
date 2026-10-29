@@ -49,6 +49,13 @@ function fixtureRows(): Raw[] {
 const VALID_CERT = [{ sid: 1, from: 1782079200000, to: 1830207600000, enquiryOrigSid: 2 }];
 const EXPIRED_CERT = [{ sid: 1, from: 1735772400000, to: 1790805600000, enquiryOrigSid: 2 }];
 
+// Oslo-midnight instants, like Debio's (stored as the previous UTC date): from 2026-12-01 / to 2028-12-01 (not yet
+// started on NOW), and an expired one ending 2026-09-01.
+const FUTURE_CERT = { sid: 3, from: Date.UTC(2026, 10, 30, 23), to: Date.UTC(2028, 10, 30, 23), enquiryOrigSid: 4 };
+const GAP_EXPIRED_CERT = { sid: 5, from: Date.UTC(2025, 7, 31, 22), to: Date.UTC(2026, 7, 31, 22), enquiryOrigSid: 6 };
+const FUTURE_ROW: Raw = { ...CAPTURED, sid: 920001, name: "Framtid Gard AS", street: "Framtidsvegen 1", clientCode: "931000011", companyNumber: "70001", certificates: [FUTURE_CERT] };
+const GAP_ROW: Raw = { ...CAPTURED, sid: 920002, name: "Hullet Gard AS", street: "Hullvegen 2", clientCode: "931000012", companyNumber: "70002", certificates: [GAP_EXPIRED_CERT, FUTURE_CERT] };
+
 /** n synthetic rows in the real shape; status mix by index. */
 function fillerRows(n: number): Raw[] {
   const out: Raw[] = [];
@@ -88,6 +95,8 @@ const AGENTS: Seed[] = [
   { id: "c-multi", name: "Nyhagen Grønt", city: "Eby", org_nr: "931000005" },
   { id: "c-company", name: "Torvbu Handel", city: "Effby", org_nr: "931999999" },
   { id: "c-house", name: "Løvbakken Gård", city: "Geby", org_nr: "931000007" },
+  { id: "c-future", name: "Ospetun Gård", city: "Hby", org_nr: "931000011" },
+  { id: "c-gap", name: "Rognlia Gård", city: "Iby", org_nr: "931000012" },
 ];
 
 function seed(db: Database.Database, a: Seed): void {
@@ -150,6 +159,12 @@ export async function runDebioRegisterS1cTests(opts: { log?: boolean } = {}): Pr
   assertEq(client.normalizeRegisterRow({ ...CAPTURED, clientCode: "12345678901" }, NOW)?.orgNr, null, "orgnr-2: an 11-digit clientCode is not an org.nr.");
   assertEq(client.normalizeRegisterRow({ ...CAPTURED, houseNr: "7" }, NOW)?.street, "Strynevegen 3196", "street-1: houseNr not appended when the street has a number");
   assertEq(client.normalizeRegisterRow({ ...CAPTURED, certificates: [] }, NOW)?.validTo, null, "valid-1: no certificates → no valid_to");
+  const fut = client.normalizeRegisterRow(FUTURE_ROW, NOW);
+  assertEq([fut?.validFrom, fut?.validTo, approval.certValidOn(fut?.validTo, NOW)], ["2026-11-30", null, false], "valid-2: only a not-yet-started certificate → no valid_to");
+  const gap = client.normalizeRegisterRow(GAP_ROW, NOW);
+  assertEq([gap?.validFrom, gap?.validTo, approval.certValidOn(gap?.validTo, NOW)], ["2025-08-31", "2026-08-31", false], "valid-3: expired + not-yet-started → the expired one");
+  assertEq(client.certificateValidity([{ from: Date.UTC(2026, 0, 1), to: Date.UTC(2027, 0, 1) }, FUTURE_CERT], NOW)?.validTo, "2027-01-01", "valid-4: current + future → max to among the current only");
+  assertEq(sync.buildEntities([{ ...client.normalizeRegisterRow(CAPTURED, NOW)!, validFrom: "2026-12-01" }], NOW)[0]?.status, "ingen", "valid-5: a future validFrom never counts as okologisk, even with a valid_to");
   assertEq(approval.debioApprovalText("no", n[0]!.productGroups, "2026-10-29"), "Godkjent av Debio for foredling, import og omsetning — sjekket 29.10.2026", "text-1: FIO code feeds the label map");
 
   // ── sync over the real shape ──────────────────────────────────────────────
@@ -174,13 +189,13 @@ export async function runDebioRegisterS1cTests(opts: { log?: boolean } = {}): Pr
     clearRegistryCaches();
     for (const a of AGENTS) seed(db, a);
     process.env.RFB_DEBIO_REGISTER_SYNC = "1";
-    const rows = [...fillerRows(2600), ...fx];
+    const rows = [...fillerRows(2600), ...fx, FUTURE_ROW, GAP_ROW];
 
     const dry = await sync.syncDebioRegister(db, { fetchImpl: fakeFetch(rows), now: NOW, skipCache: true });
-    assertEq([dry.accepted, dry.fetched_raw, dry.normalized, dry.rejected_rows, dry.rows_without_valid_to], [true, 2608, 2608, 0, 0],
-      "sync-dry-1: ≥ 2500 real-shape rows accepted, all with valid_to");
-    assertEq(dry.status_counts, { okologisk: 3, karens: 1, annet: 1, ingen: 2 }, "sync-dry-2: status_counts from resultSids + certificates");
-    assertEq([dry.matched.org_nr, dry.verified], [6, 3], "sync-dry-3: six org.nr. matches, three would be verified");
+    assertEq([dry.accepted, dry.fetched_raw, dry.normalized, dry.rejected_rows, dry.rows_without_valid_to], [true, 2610, 2610, 0, 1],
+      "sync-dry-1: ≥ 2500 real-shape rows accepted, all but the not-yet-started one with valid_to");
+    assertEq(dry.status_counts, { okologisk: 3, karens: 1, annet: 1, ingen: 4 }, "sync-dry-2: status_counts from resultSids + certificates");
+    assertEq([dry.matched.org_nr, dry.verified], [8, 3], "sync-dry-3: eight org.nr. matches, three would be verified");
 
     const wet = await sync.syncDebioRegister(db, { fetchImpl: fakeFetch(rows), dryRun: false, now: NOW, skipCache: true });
     assertEq(wet.accepted, true, "sync-wet-0: write run accepted");
@@ -194,6 +209,8 @@ export async function runDebioRegisterS1cTests(opts: { log?: boolean } = {}): Pr
     assertEq([row("c-multi").st, row("c-multi").v, row("c-multi").vt], ["okologisk", 1, "2027-06-30"], "sync-wet-5: current of two certificates → verified");
     assertEq([row("c-company").st, row("c-company").v, row("c-company").m], ["ingen", 0, null], "sync-wet-6: companyNumber = our org.nr. → no match");
     assertEq([row("c-house").st, row("c-house").v], ["okologisk", 1], "sync-wet-7: houseNr row verified by org.nr.");
+    assertEq([row("c-future").st, row("c-future").v], ["ingen", 0], "sync-wet-8: only a not-yet-started certificate → debio_verified = 0");
+    assertEq([row("c-gap").st, row("c-gap").v], ["ingen", 0], "sync-wet-9: expired + not-yet-started (gap) → debio_verified = 0");
     // privacy: no register name / street persisted
     const dump = JSON.stringify([db.prepare("SELECT * FROM agent_debio_status").all(), db.prepare("SELECT * FROM debio_match_review").all(), db.prepare("SELECT * FROM agents").all()]);
     assertEq(["Fjelltun Foredling", "Fjelltunvegen", "Bakkevegen", "Torget 2"].filter((s) => dump.includes(s)), [], "privacy-1: no register name / street persisted");
