@@ -213,6 +213,24 @@ export async function runRfbClaimDeltAdresseTests(opts: { log?: boolean } = {}):
       // Three profiles.
       for (const id of ["sa-t1", "sa-t2", "sa-t3"]) agent(id, { listed: "tre@delt.example.test" });
       sharedQueued(await claim("sa-t3", { name: "X", email: "x@x.example.test" }), "r1: address on 3 profiles");
+      // The second profile stores the address with a tab / no-break space:
+      // SQLite's plain TRIM() would miss it, resolveFarmContactEmail does not.
+      agent("sa-w1", { listed: "ws@delt.example.test" });
+      agent("sa-w2", { listed: "\tws@delt.example.test \n" });
+      eq(knowledgeService.resolveFarmContactEmail("sa-w2"), "ws@delt.example.test", "r1: precondition: the padded address resolves to the plain one");
+      sharedQueued(await claim("sa-w1", { name: "X", email: "x@x.example.test" }), "r1: shared address stored with tab/no-break space on the other profile");
+      // More stale outreach rows than the candidate cap must not crowd out the
+      // claimed profile and the one real second holder.
+      for (let i = 0; i < 30; i++) {
+        agent(`sa-s${i}`, { listed: `egen${i}@stale.example.test` });
+        outreach(`sa-s${i}`, "paraply@stale.example.test");
+      }
+      agent("sa-c1", { listed: "paraply@stale.example.test" });
+      agent("sa-c2", {});
+      outreach("sa-c2", "paraply@stale.example.test");
+      eq(knowledgeService.resolveFarmContactEmail("sa-c2"), "paraply@stale.example.test", "r1: precondition: sa-c2 knows the address via outreach");
+      sharedQueued(await claim("sa-c2", { name: "X", email: "x@x.example.test" }), "r1: 30 stale outreach rows do not hide the shared address");
+      eq(mails.length, m0, "r1: … no mail for these either");
     }
 
     // ══ (one) exactly one profile → unchanged ═════════════════════════════

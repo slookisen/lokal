@@ -488,6 +488,10 @@ export type ClaimReviewReason = "no_known_email" | "listed_email_wrong" | "has_o
  *  profiles per source are re-checked by isSharedKnownEmail. Two confirmed
  *  hits already decide it, so the cap only bounds the work. */
 const SHARED_EMAIL_CANDIDATES_MAX = 25;
+/** SQL counterpart of normalizeEmail's trim for the shared-address lookup:
+ *  SQLite's TRIM() strips only spaces, JS trim() also strips tab, LF, CR and
+ *  no-break space. A constant SQL expression, never user input. */
+const EMAIL_TRIM_CHARS = "char(32, 9, 10, 13, 160)";
 
 /** Which limit refused a request: a code send (rule 4 / the platform cap) or
  *  a new admin-queue entry (per profile / the platform cap). */
@@ -965,15 +969,18 @@ class KnowledgeService {
    * failure of the listed-address query throws, and requestClaim's caller
    * answers 500 — never a code.
    */
-  isSharedKnownEmail(address: string): boolean {
+  isSharedKnownEmail(address: string, knownHolderId?: string): boolean {
     const target = normalizeEmail(address);
     if (!isSingleEmailAddress(target)) return false;
     const db = getDb();
-    const candidates = new Set<string>();
+    // The claimed profile itself, when its known e-mail is the address (rule 1):
+    // a candidate regardless of the LIMIT below, so stale outreach rows cannot
+    // crowd it out of the set.
+    const candidates = new Set<string>(knownHolderId ? [knownHolderId] : []);
     const listed = db.prepare(
       `SELECT k.agent_id AS id
          FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-        WHERE LOWER(TRIM(k.email)) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+        WHERE LOWER(TRIM(k.email, ${EMAIL_TRIM_CHARS})) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
         LIMIT ?`
     ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
     for (const r of listed) candidates.add(r.id);
@@ -981,7 +988,7 @@ class KnowledgeService {
       const delivered = db.prepare(
         `SELECT DISTINCT o.agent_id AS id
            FROM outreach_sent_log o JOIN agents a ON a.id = o.agent_id
-          WHERE LOWER(TRIM(o.recipient_email)) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          WHERE LOWER(TRIM(o.recipient_email, ${EMAIL_TRIM_CHARS})) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
           LIMIT ?`
       ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
       for (const r of delivered) candidates.add(r.id);
@@ -1183,7 +1190,7 @@ class KnowledgeService {
       // the address it would go to must not be the known e-mail of more than
       // one RFB profile — also when the claimant typed that address.
       const queueByRule = !domainRoute && (hasOwner || !farmEmail || !!opts.listedEmailWrong);
-      const sharedAddress = !queueByRule && this.isSharedKnownEmail(domainRoute ? claimantEmail : farmEmail!);
+      const sharedAddress = !queueByRule && (domainRoute ? this.isSharedKnownEmail(claimantEmail) : this.isSharedKnownEmail(farmEmail!, agentId));
 
       if (queueByRule || sharedAddress) {
         const reason: ClaimReviewReason = sharedAddress ? "shared_address"
