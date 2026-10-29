@@ -5356,6 +5356,31 @@ function initSchema(db: Database.Database): void {
     )
   `);
 
+  // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the stock-check reminder (services/stock-check-reminder.ts). Additive.
+  //   stock_check_notices : one row per reserved reminder e-mail. The job
+  //     inserts it inside BEGIN IMMEDIATE only when the producer has no row
+  //     newer than 14 days (created_at, ISO) — the restart- and overlap-safe
+  //     «at most one e-mail per 14 days» marker. id = sha256 of the confirm
+  //     link's nonce (the link is valid only while its row exists);
+  //     product_ids = JSON array of the rows the e-mail lists. status
+  //     'claimed' | 'sent' | 'skipped' | 'failed'.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stock_check_notices (
+      id               TEXT PRIMARY KEY,
+      agent_id         TEXT NOT NULL,
+      product_ids      TEXT NOT NULL DEFAULT '[]',
+      item_count       INTEGER NOT NULL DEFAULT 0,
+      status           TEXT NOT NULL DEFAULT 'claimed',
+      created_at       TEXT NOT NULL,
+      sent_at          TEXT,
+      link_expires_at  TEXT NOT NULL,
+      confirmed_at     TEXT,
+      confirmed_count  INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_stock_check_notices_agent ON stock_check_notices(agent_id, created_at)`);
+
   // producer_terms_acceptances (prerequisites 4 + 5): a producer accepted
   //   /produsentvilkar (terms_version) and declared whether they sell as a
   //   trader (angrerettloven § 9 a) — required before connecting Stripe.

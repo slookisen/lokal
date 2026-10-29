@@ -44,9 +44,26 @@ function b64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function sign(payload: string, secret: string): string {
-  const key = crypto.createHmac("sha256", secret).update(KEY_PURPOSE).digest();
+function signWithPurpose(purpose: string, payload: string, secret: string): string {
+  const key = crypto.createHmac("sha256", secret).update(purpose).digest();
   return b64url(crypto.createHmac("sha256", key).update(payload).digest());
+}
+
+function sign(payload: string, secret: string): string {
+  return signWithPurpose(KEY_PURPOSE, payload, secret);
+}
+
+/**
+ * The same keyed signature for another link purpose (dev-request
+ * rfb-bestillinger B2, the stock-check confirm link): the server secret is
+ * never used raw — a per-purpose key is derived from it, so a signature for
+ * one purpose never verifies for another. null when no server secret is set
+ * (callers fail closed) or when `purpose` is the unsubscribe purpose itself.
+ */
+export function serverSignatureFor(purpose: string, payload: string): string | null {
+  const secret = serverSecret();
+  if (!secret || !purpose || purpose === KEY_PURPOSE) return null;
+  return signWithPurpose(purpose, payload, secret);
 }
 
 export function normalizeRecipient(email: string): string {

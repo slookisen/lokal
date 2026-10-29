@@ -29,6 +29,9 @@ import {
   confirmAllOwnerProductsInStock, addOwnerProduct, orderabilityReasonTextNb, formatOwnerDate,
   OWNER_PRODUCT_FIELD_TEXT_NB, type OwnerOrderabilityOverview, type OwnerProductField,
 } from "../services/owner-orderability";
+import {
+  stockCheckOn, soonExpiringItems, confirmStockCheckItems, formatStockCheckDate, type StockCheckItem,
+} from "../services/stock-check-reminder";
 
 const router = Router();
 
@@ -1744,7 +1747,16 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     if (ownerOrderabilityPortalEnabled()) {
       try {
         if (isVerifiedOwner(agentId, session)) {
-          orderabilityCardHtml = ownerOrderabilityCardHtml(agentId, listOwnerProductOrderability(agentId, db));
+          // B2: the stock-check banner (products.stock_check on, an orderable
+          // item expiring within 3 days) goes at the top of the card.
+          let banner = "";
+          try {
+            if (stockCheckOn(agentId, { db })) banner = stockCheckBannerHtml(agentId, soonExpiringItems(agentId, { db }));
+          } catch (e) {
+            console.error("[owner-portal] stock-check banner failed:", e instanceof Error ? e.message : "error");
+            banner = "";
+          }
+          orderabilityCardHtml = ownerOrderabilityCardHtml(agentId, listOwnerProductOrderability(agentId, db), banner);
         }
       } catch (e) {
         console.error("[owner-portal] orderability card failed:", e instanceof Error ? e.message : "error");
@@ -2354,6 +2366,7 @@ export function ownerOrderabilityAlert(status: string, rawFields: unknown, rawNo
     : "";
   switch (status) {
     case "vare_bekreftet": return { ok: true, text: "Varen er bekreftet på lager." };
+    case "lager_bekreftet": return { ok: true, text: "Takk! Varene er bekreftet på lager." };
     case "varer_bekreftet": return { ok: true, text: `Varene er bekreftet på lager.${noPrice}` };
     case "ingen_varer_bekreftet": return { ok: true, text: `Ingen varer å bekrefte.${noPrice}` };
     case "vare_mangler_pris": return { ok: false, text: "Varen mangler pris, så den kan ikke bekreftes her. Legg inn pris først." };
@@ -2379,7 +2392,7 @@ function formatOwnerPrice(price: number | null, unit: string | null): string {
 }
 
 /** The B1 card. Pure rendering of listOwnerProductOrderability(). */
-export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview): string {
+export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityOverview, bannerHtml = ""): string {
   const id = encodeURIComponent(agentId);
   const total = o.products.length;
   const profileHtml = o.profile_reasons.length
@@ -2414,6 +2427,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
     `<div class="ep-field"><label for="ny_${name}">${escapeHtml(label)}</label><input id="ny_${name}" name="${name}" type="${type}" ${extra}></div>`;
   return `<div class="ep-card" id="${ORDERABILITY_ANCHOR}">
         <h2>Varer som kan bestilles</h2>
+        ${bannerHtml}
         <p data-orderable-count="${o.orderable_count}">${o.orderable_count} av ${total} ${total === 1 ? "vare" : "varer"} kan bestilles nå. En bekreftelse på lager gjelder i ${getSupplyGraphStaleDays()} dager.</p>
         ${profileHtml}
         ${list}
@@ -2459,6 +2473,43 @@ function ownerOrderabilityAuth(req: Request, res: Response): OwnerOrderabilityAu
 function orderabilityBack(agentId: string, status: string, extra = ""): string {
   return `/eier/${encodeURIComponent(agentId)}/portal?status=${status}${extra}#${ORDERABILITY_ANCHOR}`;
 }
+
+// B2 (products.stock_check): the banner above the list and its one POST.
+//   POST /eier/:agentId/varer/bekreft-lagerpaminnelse — «Bekreft at varene
+//   fortsatt er på lager» for the listed ids (hidden fields); the service
+//   writes only the rows still orderable apart from the expiry and
+//   confirmable under the B1 rule. Same owner checks as the B1 POSTs.
+
+/** The B2 banner: the orderable items whose stock status expires within 3 days. "" when none. */
+export function stockCheckBannerHtml(agentId: string, items: StockCheckItem[]): string {
+  if (items.length === 0) return "";
+  const id = encodeURIComponent(agentId);
+  const lis = items.map((i) => `<li data-product-id="${escapeHtml(i.id)}">${escapeHtml(i.name)} <span class="ep-audit-meta">gjelder til ${escapeHtml(formatStockCheckDate(i.expires_at))}</span></li>`).join("");
+  const hidden = items.map((i) => `<input type="hidden" name="id" value="${escapeHtml(i.id)}">`).join("");
+  return `<div class="ep-alert ep-alert-error" role="note" data-stock-check-banner="1">
+          <strong>Lagerstatusen går snart ut</strong>
+          <p style="margin:6px 0;">Når den har gått ut, kan kundene ikke bestille ${items.length === 1 ? "varen" : "varene"} før du har bekreftet ${items.length === 1 ? "den" : "dem"} igjen.</p>
+          <ul>${lis}</ul>
+          <form method="post" action="/eier/${id}/varer/bekreft-lagerpaminnelse" style="margin:8px 0 0;">
+            ${hidden}
+            <button type="submit" class="ep-btn ep-btn-primary">Bekreft at varene fortsatt er på lager</button>
+          </form>
+        </div>`;
+}
+
+router.post("/eier/:agentId/varer/bekreft-lagerpaminnelse", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const auth = ownerOrderabilityAuth(req, res);
+  if (!auth.ok) return;
+  try {
+    const raw = (req.body || {}).id;
+    const ids = (Array.isArray(raw) ? raw : [raw]).filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 200).slice(0, 200);
+    const r = confirmStockCheckItems(auth.agentId, ids, { actorEmail: auth.email, via: "portal" });
+    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed.length > 0 ? "lager_bekreftet" : "ingen_varer_bekreftet"));
+  } catch (err) {
+    console.error("[owner-portal] POST varer/bekreft-lagerpaminnelse error:", err instanceof Error ? err.message : "error");
+    return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
+  }
+});
 
 router.post("/eier/:agentId/varer/bekreft-alle", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const auth = ownerOrderabilityAuth(req, res);

@@ -65,7 +65,9 @@ const VEDLEGG_A_KEYS = [
 // S2e (side v2) adds visibility.profile (the /eier pause card), orders.email
 // (the confirmed order address) and comms.news (the first-login consent).
 const S2A_LIVE = ["orders.enabled", "orders.reminder", "auto.guarantee", "notify.order_email", "comms.unsubscribe",
-  "visibility.profile", "orders.email", "comms.news"];
+  "visibility.profile", "orders.email", "comms.news",
+  // B2 (rfb-bestillinger): the stock-check reminder.
+  "products.stock_check"];
 
 function seedProducer(db: Database.Database, id: string, o: { claimed: boolean; isVerified: boolean }): void {
   db.prepare(
@@ -202,7 +204,7 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
       assertTrue(reg.OWNER_FEATURE_GROUPS.every((g) => !!g.label.no && !!g.label.en), "registry: every group has NO+EN label");
       const types = ["switch", "choice", "number", "date", "email", "action", "guarantee", "locked"];
       const surfaceOk = (s: string) =>
-        /^(profile_html|json_ld|listing_html|mcp_search|mcp_info|rest_card|vcard|acp_feed|sitemap|llms|a2a|leaderboard|order_gate)$/.test(s) || /^(email|job):[a-z_]+$/.test(s);
+        /^(profile_html|json_ld|listing_html|mcp_search|mcp_info|rest_card|vcard|acp_feed|sitemap|llms|a2a|leaderboard|order_gate|owner_portal)$/.test(s) || /^(email|job):[a-z_]+$/.test(s);
       for (const e of reg.OWNER_FEATURE_REGISTRY) {
         const ok =
           !!e.label?.no && !!e.label?.en && !!e.description?.no && !!e.description?.en &&
@@ -232,7 +234,7 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
         if (e.consent) assertEq([e.default.owner, e.default.unclaimed].filter((d) => d === true).length, 0, `registry: consent entry ${e.key} defaults off`);
       }
       assertEq(reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live").map((e) => e.key).sort(), [...S2A_LIVE].sort(),
-        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news");
+        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news + B2 products.stock_check");
       const g = (k: string) => reg.getOwnerFeature(k);
       assertEq(g("orders.enabled").storage?.column, "agents.order_notifications_opt_in", "registry: orders.enabled adapter column");
       assertEq([g("orders.enabled").type, g("orders.enabled").default], ["switch", { owner: false, unclaimed: false }], "registry: orders.enabled switch, off for both segments");

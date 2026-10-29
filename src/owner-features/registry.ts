@@ -180,11 +180,14 @@ export type OwnerFeatureRequirement = OwnerFeatureKey | OwnerFeatureCondition;
  * Surfaces an entry affects («Testkrav og utrulling»): the CI matrix and the
  * prod switch probe are generated from this list. listing_html = list pages
  * that carry a profile's fields (front-page cards, city/fylke JSON-LD).
+ * owner_portal = something shown to the owner in the /eier portal (B2: the
+ * stock-check banner).
  */
 export type OwnerFeatureSurface =
   | "profile_html" | "json_ld" | "listing_html" | "mcp_search" | "mcp_info" | "rest_card" | "vcard"
   | "acp_feed" | "sitemap" | "llms" | "a2a" | "leaderboard" | "order_gate"
   | "booking_gate"
+  | "owner_portal"
   | `email:${string}` | `job:${string}`;
 
 /**
@@ -448,14 +451,26 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: true, unclaimed: true },
     surfaces: ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "a2a"],
   }),
+  // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // live. Default «på» for owners; `requires` orders.enabled, so it has no
+  // effect (and reads off) while orders are off. Read by
+  // services/stock-check-reminder.ts stockCheckOn() — the e-mail job
+  // (behind STOCK_CHECK_EMAIL_ENABLED) and the /eier portal banner (behind
+  // OWNER_ORDERABILITY_PORTAL_ENABLED).
   entry({
     key: "products.stock_check", group: "products", type: "switch",
     label: t("Minn meg på å bekrefte lagerstatus", "Remind me to confirm stock"),
-    description: t("Vi minner deg på å bekrefte hva du har på lager hver 14. dag.", "We remind you to confirm what you have in stock every 14 days."),
+    description: t(
+      "Vi sier fra før lagerstatusen på en vare går ut, slik at kundene fortsatt kan bestille den. Du får høyst én e-post hver 14. dag.",
+      "We let you know before the stock status of an item expires, so customers can still order it. You get at most one e-mail every 14 days.",
+    ),
     default: { owner: true, unclaimed: null },
     requires: ["orders.enabled"],
     outward: true,
-    surfaces: ["email:stock_check_reminder"],
+    status: "live",
+    since: "2026-10-29",
+    devRequest: "2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier",
+    surfaces: ["email:stock_check", "job:stock_check", "owner_portal"],
   }),
 
   // ── Bestillinger ────────────────────────────────────────────────────────

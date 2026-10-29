@@ -47,6 +47,13 @@
  *                             confirmation click the order mail still goes to
  *                             the old address, after it to the new one; a
  *                             direct PUT is refused (409 confirm_by_email)
+ *   B2 (rfb-bestillinger):
+ *   products.stock_check × email:stock_check / job:stock_check / owner_portal
+ *                             an orderable producer-stated item expiring in
+ *                             2 days: processStockCheckReminders() (flag on,
+ *                             mail captured at the order-notify seam) and the
+ *                             /eier portal banner (B1 card flag on) follow the
+ *                             switch; with orders.enabled off a PUT on → 409
  * Kinds:
  *   switch     default → on → off → on again; the effect follows each step;
  *              plus an unmet requirement → 409, nothing written, no effect.
@@ -125,6 +132,13 @@ export const OWNER_FEATURE_MATRIX_CASES: readonly OwnerFeatureMatrixCase[] = [
   // S2e: the order address (orders.email).
   { key: "orders.email", surface: "email:order_notification", kind: "switch",
     observe: "producer order mail recipient: profile e-mail → new address only after the confirmation click → back → new" },
+  // B2 (rfb-bestillinger): the stock-check reminder (products.stock_check).
+  { key: "products.stock_check", surface: "email:stock_check", kind: "switch",
+    observe: "processStockCheckReminders(): «Bekreft at varene fortsatt er på lager» mail to the producer captured vs none" },
+  { key: "products.stock_check", surface: "job:stock_check", kind: "switch",
+    observe: "processStockCheckReminders() result: sent + a stock_check_notices row vs feature_off and no row" },
+  { key: "products.stock_check", surface: "owner_portal", kind: "switch",
+    observe: "GET /eier/:id/portal: the stock-check banner in «Varer som kan bestilles» vs none" },
 ];
 
 export const MATRIX_STEPS = ["default", "on", "off", "on_again"] as const;
@@ -146,6 +160,7 @@ const SAVED_ENV = [
   "PAYMENTS_ENABLED", "ORDER_NOTIFY_EMAIL_VERSION", "OWNER_LOCK_ENFORCE_WRITES", "OUTREACH_UNSUBSCRIBE_ENABLED",
   "OUTREACH_PAUSED", "ORDER_AUTOCOMPLETE_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "LANG_COOKIE_REDIRECT_ENABLED",
+  "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "SUPPLY_GRAPH_STALE_DAYS",
 ];
 
 /** S2e: the visibility.profile producer — the same rich profile shape as owner-features-s2c2.test.ts. */
@@ -309,6 +324,7 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
       gate: "mx-gate", mail: "mx-mail", unbadged: "mx-unbadged", reminderMail: "mx-rem-mail", reminderJob: "mx-rem-job",
       notifyLocked: "mx-notify", nightly: "mx-nightly", nightlyControl: "mx-nightly-ctl", knowledge: "mx-knowledge", outreach: "mx-outreach",
       orderEmail: "mx-order-email",
+      stockMail: "mx-stock-mail", stockJob: "mx-stock-job", stockPortal: "mx-stock-portal",
     };
     const tokens: Record<string, string> = {};
     for (const id of Object.values(ids)) {
@@ -882,6 +898,99 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
         delete process.env.OWNER_ORDER_EMAIL_ENABLED;
       }
     };
+
+    // ── B2: products.stock_check ───────────────────────────────────────────
+    // Each stock producer has one producer-stated row whose status expires in
+    // 2 days (T = today 10:00Z; the job runs at T, the portal reads the real
+    // clock, which is within ±14 h of T, so the row is soon-expiring for both).
+    {
+      const stockSvc = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
+      const TS = new Date(`${new Date().toISOString().slice(0, 10)}T10:00:00Z`);
+      for (const id of [ids.stockMail, ids.stockJob, ids.stockPortal]) {
+        // Another category than the visibility producer's, so these rows do not
+        // crowd it out of the category-ranked list surfaces (lokal_discover).
+        db.prepare(`UPDATE agents SET categories = '["eggs"]' WHERE id = ?`).run(id);
+        db.prepare(`UPDATE products SET category = 'eggs', name = 'Egg', name_norm = 'egg' WHERE agent_id = ?`).run(id);
+        db.prepare(
+          `INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, category, description, availability_source, availability_updated_at)
+           VALUES (?, ?, 'Andeegg', 'andeegg', 25, 'stk', 'in_stock', 'eggs', NULL, 'producer_dashboard', ?)`,
+        ).run(`sc-${id}`, id, SQL(new Date(TS.getTime() - 12 * 86_400_000)));
+      }
+      const notices = (id: string) => (db.prepare("SELECT COUNT(*) AS n FROM stock_check_notices WHERE agent_id = ?").get(id) as { n: number }).n;
+      const clearNotices = (id: string) => db.prepare("DELETE FROM stock_check_notices WHERE agent_id = ?").run(id);
+      const runJob = async (id: string) => {
+        clearNotices(id); // each step is its own 14-day window
+        process.env.STOCK_CHECK_EMAIL_ENABLED = "1";
+        try {
+          return await mailsDuring(id, () => stockSvc.processStockCheckReminders({ now: TS, db }));
+        } finally {
+          delete process.env.STOCK_CHECK_EMAIL_ENABLED;
+        }
+      };
+      /** orders.enabled off → PUT stock_check on is refused, nothing stored, no effect. */
+      const requiresCheck = async (id: string, L: string, effect: () => Promise<boolean>) => {
+        await switchTo(id, "orders.enabled", false, `${L} [requires] orders off`);
+        assertEq(resolved(id, "products.stock_check").value, false, `${L} [requires]: with orders off the switch reads off`);
+        featuresMod.__resetOwnerFeaturesRateLimitForTesting();
+        const a0 = auditRows(id, "products.stock_check");
+        const s0 = settingsRows(id, "products.stock_check");
+        const r = await put(id, "products.stock_check", true);
+        assertEq([r.status, r.body?.error], [409, "requirement_not_met"], `${L} [requires]: PUT on without orders.enabled → 409 requirement_not_met`);
+        assertEq([settingsRows(id, "products.stock_check") - s0, auditRows(id, "products.stock_check") - a0], [0, 0], `${L} [requires]: nothing written`);
+        assertEq(await effect(), false, `${L} [requires]: no effect`);
+      };
+      const stockSteps = async (c: OwnerFeatureMatrixCase, id: string, effect: () => Promise<boolean>) => {
+        const L = matrixCaseId(c);
+        await switchTo(id, "orders.enabled", true, `${L} [setup] orders on`);
+        const f0 = resolved(id, c.key);
+        assertEq([f0.value, f0.source], [true, "default"], `${L} [default]: «på» by default when orders are on`);
+        assertEq(await effect(), true, `${L} [default]: effect present`); step(c, "default");
+        await switchTo(id, c.key, true, `${L} [on]`);
+        assertEq(await effect(), true, `${L} [on]: effect present`); step(c, "on");
+        await switchTo(id, c.key, false, `${L} [off]`);
+        assertEq(await effect(), false, `${L} [off]: effect gone`); step(c, "off");
+        await switchTo(id, c.key, true, `${L} [on_again]`);
+        assertEq(await effect(), true, `${L} [on_again]: effect present`); step(c, "on_again");
+        await requiresCheck(id, L, effect);
+      };
+      runners["products.stock_check × email:stock_check"] = async (c) => {
+        const id = ids.stockMail;
+        await stockSteps(c, id, async () => {
+          const { mails } = await runJob(id);
+          const reminders = mails.filter((m) => m.subject === "Bekreft at varene fortsatt er på lager");
+          if (reminders.length > 0 && !reminders[0]!.textContent.includes("/lagerstatus/")) {
+            assertTrue(false, `${matrixCaseId(c)}: the reminder carries the confirm link`);
+          }
+          return reminders.length === 1 && mails.length === 1;
+        });
+      };
+      runners["products.stock_check × job:stock_check"] = async (c) => {
+        const id = ids.stockJob;
+        await stockSteps(c, id, async () => {
+          const { out } = await runJob(id);
+          const r = out as Awaited<ReturnType<typeof stockSvc.processStockCheckReminders>>;
+          const ran = r.sent === 1 && r.feature_off === 0 && notices(id) === 1;
+          const skipped = r.sent === 0 && notices(id) === 0;
+          if (!ran && !skipped) assertTrue(false, `${matrixCaseId(c)}: job result is either «ran» or «skipped» (${JSON.stringify(r)})`);
+          return ran;
+        });
+      };
+      runners["products.stock_check × owner_portal"] = async (c) => {
+        const id = ids.stockPortal;
+        const portalMod = require("../routes/owner-portal") as typeof import("../routes/owner-portal");
+        const portalH = findRouteHandler(portalMod.default, "/eier/:agentId/portal", "get");
+        process.env.OWNER_ORDERABILITY_PORTAL_ENABLED = "1";
+        try {
+          await stockSteps(c, id, async () => {
+            const html = String((await invoke(portalH, makeReq({ params: { agentId: id }, token: tokens[id] }))).body ?? "");
+            if (!html.includes("Varer som kan bestilles")) assertTrue(false, `${matrixCaseId(c)}: the B1 card renders`);
+            return html.includes('data-stock-check-banner="1"') && html.includes("Bekreft at varene fortsatt er på lager");
+          });
+        } finally {
+          delete process.env.OWNER_ORDERABILITY_PORTAL_ENABLED;
+        }
+      };
+    }
 
     // ── Run the matrix ─────────────────────────────────────────────────────
     const liveKeys = new Set(reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live").map((e) => e.key));

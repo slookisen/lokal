@@ -45,7 +45,7 @@ export interface TestSummary {
 const SAVED_ENV = [
   "OWNER_FEATURES_SWITCH_PROBE_ENABLED", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "OWNER_FEATURES_ALLOWED_SUBJECTS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_VISIBILITY_ENFORCE_BY_ID", "OWNER_LOCK_ENFORCE_WRITES",
-  "OUTREACH_UNSUBSCRIBE_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS", "UNSUBSCRIBE_TOKEN_SECRET",
+  "OUTREACH_UNSUBSCRIBE_ENABLED", "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS", "UNSUBSCRIBE_TOKEN_SECRET",
 ];
 const KEY = "switch-probe-admin-key-for-tests";
 const FIX = "sp-fixture";
@@ -156,6 +156,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       process.env.OWNER_FEATURES_ENFORCE = "1";
       process.env.OWNER_LOCK_ENFORCE_WRITES = "1";
       process.env.OUTREACH_UNSUBSCRIBE_ENABLED = "1";
+      process.env.STOCK_CHECK_EMAIL_ENABLED = "1";
+      process.env.OWNER_ORDERABILITY_PORTAL_ENABLED = "1";
     };
     setBaseEnv();
 
@@ -456,6 +458,14 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertEq([r.ready_for_daniel_test, r.restored], [false, true], "flags-4: not ready, restored");
       assertTrue(/- \[FUNN\] bryterprobe-auto-guarantee-job-knowledge-write-off · P1 · /.test(r.markdown), "flags-5: the FAIL rows land in the findings block");
       assertEq(rawState(FIX), before, "flags-6: restored byte-identical");
+      setBaseEnv();
+      // B2: products.stock_check without its flags → its rows FAIL «flag off».
+      delete process.env.STOCK_CHECK_EMAIL_ENABLED;
+      delete process.env.OWNER_ORDERABILITY_PORTAL_ENABLED;
+      const sc = (await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 })).rows.filter((x) => x.key === "products.stock_check");
+      assertTrue(sc.length === 6 && sc.every((x) => x.result === "FAIL" && /flag off in this environment \((STOCK_CHECK_EMAIL_ENABLED|OWNER_ORDERABILITY_PORTAL_ENABLED)=unset\)/.test(x.reason || "")),
+        `flags-6b: stock_check rows FAIL «flag off» without STOCK_CHECK_EMAIL_ENABLED / OWNER_ORDERABILITY_PORTAL_ENABLED (${sc.map((x) => `${x.surface}:${x.direction}:${x.result}`).join(",")})`);
+      assertEq(rawState(FIX), before, "flags-6c: restored byte-identical");
       setBaseEnv();
       // Without OWNER_FEATURES_ENFORCE (and the pause flag) visibility.profile has no
       // effect: the probe must see the fixture still shown and FAIL the «off» rows.
