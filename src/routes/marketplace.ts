@@ -4,7 +4,8 @@ import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope } from "../services/knowledge-service";
-import { isDebioVerifiedValue, isOrganicClaimUmbrella } from "../services/organic-claims";
+import { isDebioVerifiedValue, isOrganicClaimUmbrella, stripOrganicCategories } from "../services/organic-claims";
+import { textEntries } from "../utils/text-entries";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
@@ -4461,7 +4462,7 @@ router.get("/find-match", (req: Request, res: Response) => {
   // Fetch all active agents
   const allAgents = db.prepare(`
     SELECT a.id, a.name, a.city, a.categories, a.trust_score, a.is_verified,
-           a.description,
+           a.description, a.debio_verified,
            CASE WHEN ac.status = 'verified' THEN 1 ELSE 0 END as is_claimed
     FROM agents a
     LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
@@ -4543,7 +4544,10 @@ router.get("/find-match", (req: Request, res: Response) => {
         name: agent.name,
         city: agent.city,
         description: matchDescription.substring(0, 120),
-        categories: JSON.parse(agent.categories || "[]"),
+        // Økologi S0b: an organic category only with a valid Debio status.
+        categories: isDebioVerifiedValue(agent.debio_verified)
+          ? JSON.parse(agent.categories || "[]")
+          : stripOrganicCategories(textEntries(JSON.parse(agent.categories || "[]"))),
         trustScore: agent.trust_score,
         isVerified: !!agent.is_verified,
         isClaimed: !!agent.is_claimed,

@@ -9,6 +9,8 @@ import { openingHoursText } from "../utils/opening-hours";
 import { trustScoreService } from "./trust-score-service";
 import { isInternalTraffic, type RequestMeta } from "./internal-traffic";
 import { notOwnerHiddenSql } from "./agent-visibility";
+import { isDebioVerifiedValue, stripOrganicCategories } from "./organic-claims";
+import { textEntries } from "../utils/text-entries";
 import {
   COUNTABLE_CONV_SQL,
   countableConvSql,
@@ -118,6 +120,16 @@ export function openingHoursReplyText(openingHours: unknown): string {
   return openingHoursText(openingHours, 7);
 }
 
+/**
+ * Økologi S0b: a seller's categories as public A2A text/JSON shows them — an
+ * organic category («organic») only with a valid Debio status
+ * (organic-claims.ts). Read-side only: agents.categories is unchanged.
+ */
+function publicCategories(row: { categories?: string | null; debio_verified?: unknown } | undefined): string[] {
+  const stored = row?.categories ? JSON.parse(row.categories) : [];
+  return isDebioVerifiedValue(row?.debio_verified) ? stored : stripOrganicCategories(textEntries(stored));
+}
+
 class ConversationService {
   // ─── Start a conversation ────────────────────────────────
   // Called when a buyer agent wants to connect with a seller.
@@ -168,10 +180,10 @@ class ConversationService {
     let sellerCity = "";
     let sellerCategories = "";
     if (opts.sellerAgentId) {
-      const seller = db.prepare("SELECT name, categories, city FROM agents WHERE id = ?").get(opts.sellerAgentId) as any;
+      const seller = db.prepare("SELECT name, categories, city, debio_verified FROM agents WHERE id = ?").get(opts.sellerAgentId) as any;
       sellerName = seller?.name || sellerName;
       sellerCity = seller?.city || "";
-      sellerCategories = seller?.categories ? JSON.parse(seller.categories).join(", ") : "";
+      sellerCategories = publicCategories(seller).join(", ");
     }
 
     // System message introducing the match
@@ -887,13 +899,13 @@ class ConversationService {
     `).run(agentId);
 
     const metrics = db.prepare("SELECT * FROM agent_metrics WHERE agent_id = ?").get(agentId) as any;
-    const agent = db.prepare("SELECT name, city, categories FROM agents WHERE id = ?").get(agentId) as any;
+    const agent = db.prepare("SELECT name, city, categories, debio_verified FROM agents WHERE id = ?").get(agentId) as any;
 
     return {
       agentId,
       agentName: agent?.name,
       city: agent?.city,
-      categories: agent?.categories ? JSON.parse(agent.categories) : [],
+      categories: publicCategories(agent),
       timesDiscovered: metrics.times_discovered,
       timesContacted: metrics.times_contacted,
       timesChosen: metrics.times_chosen,
@@ -914,7 +926,7 @@ class ConversationService {
   getLeaderboard(limit = 10): any[] {
     const db = getDb();
     const rows = db.prepare(`
-      SELECT m.*, a.name, a.city, a.categories, a.trust_score
+      SELECT m.*, a.name, a.city, a.categories, a.trust_score, a.debio_verified
       FROM agent_metrics m
       JOIN agents a ON m.agent_id = a.id
       WHERE a.is_active = 1${notOwnerHiddenSql("leaderboard", "a")}
@@ -926,7 +938,7 @@ class ConversationService {
       agentId: r.agent_id,
       agentName: r.name,
       city: r.city,
-      categories: r.categories ? JSON.parse(r.categories) : [],
+      categories: publicCategories(r),
       trustScore: r.trust_score,
       timesDiscovered: r.times_discovered,
       timesContacted: r.times_contacted,

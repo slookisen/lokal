@@ -40,7 +40,7 @@ import { classifyDrinkSubcategoryFromText, type DrinkSubcategory } from "./drink
 // public-listability predicate (catalog_hidden + RFB vertical). PURE (no
 // project imports; only node:async_hooks for the S2d-2 as-public view), same
 // isolation rule as geo-distance.ts above.
-import { isDebioVerifiedValue, stripOrganicTags } from "./organic-claims";
+import { isDebioVerifiedValue, stripOrganicCategories, stripOrganicTags } from "./organic-claims";
 import { textEntries } from "../utils/text-entries";
 import { isDelistedAgentId, publicListableSql, isAgentPubliclyVisible, activeVettedListableSql, isAsPublicView, ownerPauseEnabled, readOwnerPauseRow, notOwnerHiddenSql, ownerVisibilityEnforced, type OwnerVisibilityAudience } from "./agent-visibility";
 // S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok: FTS5 prefilter for the
@@ -2216,6 +2216,7 @@ class MarketplaceRegistry {
     const organicAllowed = isDebioVerifiedValue(row.debio_verified);
     const rawTags = row.tags ? JSON.parse(row.tags) : [];
     const rawSkills = row.skills ? JSON.parse(row.skills) : [];
+    const rawCategories = row.categories ? JSON.parse(row.categories) : [];
 
     return {
       id: row.id,
@@ -2243,7 +2244,12 @@ class MarketplaceRegistry {
       // none, like getAgentInfo's lists) and filtered; a skill's tags likewise.
       skills: organicAllowed ? rawSkills : (Array.isArray(rawSkills) ? rawSkills : []).map((sk: any) =>
         sk && typeof sk === "object" && sk.tags !== undefined ? { ...sk, tags: stripOrganicTags(textEntries(sk.tags)) } : sk),
-      categories: row.categories ? JSON.parse(row.categories) : [],
+      // Økologi S0b: an organic category value («organic», «økologisk» …) is
+      // not shown either, so discover()'s category filter/ranking and every
+      // category list (profile chips, JSON-LD additionalType, answer-first
+      // opening, FAQ, /agents, card, MCP, A2A) only carry it for verified
+      // producers. Read-side only: agents.categories is unchanged.
+      categories: organicAllowed ? rawCategories : stripOrganicCategories(textEntries(rawCategories)),
       tags: organicAllowed ? rawTags : stripOrganicTags(textEntries(rawTags)),
       languages: row.languages ? JSON.parse(row.languages) : ["no"],
       location: row.lat != null && row.lng != null ? {

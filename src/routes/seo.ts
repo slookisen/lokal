@@ -22,7 +22,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
-import { isOrganicClaimUmbrella } from "../services/organic-claims";
+import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
@@ -4697,6 +4697,8 @@ export function getRelatedBySameCategory(
   // LIKE '%"<cat>"%' is the cheapest way to match a single token without
   // false positives (e.g. "egg" vs "eggs"). The quotes are essential.
   const needle = `%"${primaryCategory}"%`;
+  // Økologi S0b: an organic category («organic») only links producers with a
+  // valid Debio status (debio_verified = 1), like discover()'s category match.
   // We try to avoid duplicating the same-city block. If excludeCity is set,
   // prefer producers from OTHER cities — surfaces the "in Norway" framing
   // and adds geographic diversity to internal links. If we run out of
@@ -4714,7 +4716,7 @@ export function getRelatedBySameCategory(
       AND a.role = 'producer'
       AND a.is_vetted = 1
       AND ${publicListableSql("a")}
-      AND a.categories LIKE ?
+      AND a.categories LIKE ?${containsOrganicClaim(primaryCategory) ? "\n      AND a.debio_verified = 1" : ""}
     ORDER BY
       CASE WHEN ? IS NOT NULL AND a.city = ? THEN 1 ELSE 0 END,
       CASE WHEN k.verification_status = 'verified' THEN 0 ELSE 1 END,
@@ -6457,7 +6459,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       const activity = getProfileActivity(getDb(), agent.id, `/produsent/${slug}`);
       const showCounts = !ownerChoices || ownerChoices.publicCounts;
       const { views30, platforms } = activity;
-      const topQueryTerms = !ownerChoices || ownerChoices.publicSearchTerms ? activity.topQueryTerms : [];
+      // Økologi S0b: without a valid Debio status, no visitor search term
+      // carrying an organic word («økologisk kjøtt») — organic-claims.ts. With
+      // every term gone the panel renders as with no search data.
+      const organicTermsShown = info?.agent.debioVerified === true;
+      const topQueryTerms = (!ownerChoices || ownerChoices.publicSearchTerms ? activity.topQueryTerms : [])
+        .filter((q) => organicTermsShown || !containsOrganicClaim(q.term));
       const hasAnyActivity = (showCounts && (views30.human > 0 || views30.ai > 0)) || topQueryTerms.length > 0 || platforms.length > 0;
 
       if (hasAnyActivity) {
