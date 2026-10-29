@@ -49,7 +49,7 @@
 
 import type Database from "better-sqlite3";
 import { getDb } from "../database/init";
-import { fetchDebioRegister, normalizeOrgNr, postalCodeOf, type DebioRegisterFetchResult, type DebioRegisterRow } from "./debio-register-client";
+import { fetchDebioRegister, registerExtraCaInUse, normalizeOrgNr, postalCodeOf, type DebioRegisterFetchResult, type DebioRegisterRow } from "./debio-register-client";
 import { fetchFinnokoCompanies, type FinnokoCompany } from "./debio-finnoko-client";
 import { canonicaliseDomain } from "./debio-verification-service";
 import { emailDomain, isFreeMailDomain } from "./claim-domain-rule";
@@ -80,6 +80,8 @@ export interface SyncDebioRegisterResult {
   dry_run: boolean;
   accepted: boolean;
   reject_reason: string | null;
+  /** True when the register request used DEBIO_REGISTER_EXTRA_CA_PEM (boolean only, never the PEM). */
+  extra_ca: boolean;
   fetched_raw: number;
   normalized: number;
   rejected_rows: number;
@@ -601,7 +603,7 @@ export function enforceDebioRegisterFreshness(
 
 function emptyResult(dryRun: boolean): SyncDebioRegisterResult {
   return {
-    dry_run: dryRun, accepted: false, reject_reason: null,
+    dry_run: dryRun, accepted: false, reject_reason: null, extra_ca: false,
     fetched_raw: 0, normalized: 0, rejected_rows: 0, rows_without_valid_to: 0, entities: 0, producers_checked: 0,
     matched: { org_nr: 0, tag_org_nr: 0, finnoko_domain: 0, name_postal: 0, street_postal: 0, street_city: 0, review: 0 },
     status_counts: { okologisk: 0, karens: 0, annet: 0, ingen: 0 },
@@ -636,8 +638,10 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
   };
 
   let fetched: DebioRegisterFetchResult;
+  const env = opts.env ?? process.env;
+  result.extra_ca = registerExtraCaInUse({ fetchImpl: opts.fetchImpl, env });
   try {
-    fetched = await fetchDebioRegister({ fetchImpl: opts.fetchImpl });
+    fetched = await fetchDebioRegister({ fetchImpl: opts.fetchImpl, env });
   } catch (e) {
     return reject(`fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
