@@ -26,6 +26,7 @@ import { getGardssalgOwnerStats } from "../services/gardssalg-owner-stats-servic
 import { emailService } from "../services/email-service";
 import { generalLimiter } from "../middleware/security";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "../services/gardssalg-booking-gate";
+import { createGardssalgOwnerFeaturesRouter, gardssalgOwnerFeaturesTabOpen } from "./gardssalg-owner-features";
 
 // ─────────────────────────────────────────────────────────────────
 // GÅRDSSALG PRODUCER OWNER-CLAIM — dev-request 2026-07-21-opplevagent-
@@ -654,7 +655,7 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
         ${alert}
         ${locked ? `<div class="gc-alert gc-alert-error" role="alert">Teksten i denne profilen er låst av Opplevagent-support. Kontakt ${CLAIM_MANUAL_FALLBACK_EMAIL} for å endre den. Booking kan du fortsatt slå av og på selv.</div>` : ""}
       </div>
-      <div class="gc-card">
+      ${mineValgCardHtml(slug, provider.id)}<div class="gc-card">
         <h2>Profilinformasjon</h2>
         <form id="gc-profile-form" method="post" action="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/save" novalidate>
           <div class="gc-field">
@@ -790,6 +791,19 @@ router.get("/kategori/gardssalg/eier/:providerSlug/portal", generalLimiter, (req
     return res.status(500).send(shell("Feil", `<div class="gc-card"><h1>Noe gikk galt</h1><p>Prøv igjen senere.</p></div>`));
   }
 });
+
+// «Mine valg» tab (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg,
+// O1a): a link card, only while the tab is open for this producer
+// (OA_OWNER_FEATURES_ENABLED + allowlist + test producer). Otherwise nothing
+// is added and the portal is exactly as before.
+function mineValgCardHtml(slug: string, providerId: string): string {
+  if (!gardssalgOwnerFeaturesTabOpen(providerId)) return "";
+  return `<div class="gc-card" data-mine-valg="1">
+        <h2>Mine valg</h2>
+        <p>Bestem hvem som finner deg og om du tar imot besøk, og se hva profilen har gjort for deg.</p>
+        <div class="gc-form-actions"><a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}/valg" class="gc-btn gc-btn-primary">Åpne «Mine valg»</a></div>
+      </div>`;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // POST /kategori/gardssalg/eier/:providerSlug/save — no-JS fallback for the
@@ -1083,6 +1097,10 @@ router.get("/api/opplevelser/gardssalg-claim/:providerId/session-status", genera
     return res.json({ isOwner: false });
   }
 });
+
+// «Mine valg» for gårdssalg owners (O1a): the tab and its JSON API, behind
+// OA_OWNER_FEATURES_ENABLED + the allowlist; the same shell and session.
+router.use(createGardssalgOwnerFeaturesRouter({ shell, sessionFromRequest }));
 
 export default router;
 export type { ClaimProviderRow };

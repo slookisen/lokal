@@ -26,6 +26,7 @@
 
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
+import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -89,15 +90,68 @@ export const OWNER_FEATURE_KEYS = [
   "connect.own_ai",
 ] as const;
 
-export type OwnerFeatureKey = (typeof OWNER_FEATURE_KEYS)[number];
+/**
+ * Opplevagent gårdssalg (drink producers), dev-request 2026-10-22-opplevagent-
+ * mine-valg-gardssalg «Vedlegg A — katalog for gårdssalg» (34 entries, same
+ * groups and order). Keys shared with RFB keep the RFB name; the entry itself
+ * is the gårdssalg one (own texts, defaults, adapters and surfaces).
+ */
+export const GARDSSALG_OWNER_FEATURE_KEYS = [
+  // Hvem kan finne deg
+  "visibility.profile",
+  "visibility.ai_assistants",
+  "visibility.search_engines",
+  "visibility.english",
+  "visibility.exact_location",
+  // Kontaktinformasjon
+  "contact.phone",
+  "contact.email_mode",
+  "contact.address",
+  "contact.booking_email",
+  // Besøk og booking
+  "booking.enabled",
+  "booking.pause",
+  "booking.ai_booking",
+  "booking.within_hours",
+  "booking.reminder",
+  "booking.attendance",
+  "visit.tasting",
+  "booking.expiry",
+  "booking.lead_time",
+  "booking.party_size",
+  // Innhold og oppdatering
+  "content.guarantee",
+  "content.auto_updates",
+  "content.photos",
+  // Varsler til deg
+  "notify.booking_email",
+  "notify.booking_sms",
+  "notify.report",
+  "notify.milestones",
+  "notify.changes",
+  // Statistikk og offentlige tall
+  "stats.public_counts",
+  "stats.share_partner",
+  // Kontakt fra Opplevagent
+  "comms.unsubscribe",
+  "comms.news",
+  "comms.beta",
+  "comms.featured",
+  "tools.badge",
+] as const;
+
+export type RfbOwnerFeatureKey = (typeof OWNER_FEATURE_KEYS)[number];
+export type GardssalgOwnerFeatureKey = (typeof GARDSSALG_OWNER_FEATURE_KEYS)[number];
+export type OwnerFeatureKey = RfbOwnerFeatureKey | GardssalgOwnerFeatureKey;
 
 export type OwnerFeatureGroup =
   | "visibility" | "contact" | "products" | "orders" | "payments"
-  | "notify" | "auto" | "stats" | "comms" | "connect";
+  | "notify" | "auto" | "stats" | "comms" | "connect"
+  | "booking" | "content";
 
 export type OwnerFeatureType = "switch" | "choice" | "number" | "date" | "email" | "action" | "guarantee" | "locked";
 export type OwnerFeatureStatus = "live" | "beta" | "coming_soon";
-export type OwnerFeatureVertical = "rfb";
+export type OwnerFeatureVertical = "rfb" | "gardssalg";
 export type OwnerFeatureValue = boolean | string | number | null;
 
 export interface LocalizedText {
@@ -110,8 +164,16 @@ export interface LocalizedText {
  * verified agent_claims row); isVerifiedBadge = agents.is_verified = 1 (the
  * strict real-order gate). stripeActive / drinkProducer are not wired in S2a
  * and evaluate as unmet — only coming_soon entries use them.
+ * Gårdssalg (O1a): the subject loader (gardssalg-adapters.ts) fills these per
+ * row — bookingRequestEmail = the row has an address booking requests can be
+ * sent to (hasBookingRequestEmail, the admin lever's rule);
+ * noBookingAdminBrake = Opplevagent has not stopped booking for the row;
+ * visibilityOwnerControlled = the row is visible or on the owner's own pause
+ * (not «fjern», not an admin quality hide).
  */
-export type OwnerFeatureCondition = "verifiedOwner" | "isVerifiedBadge" | "stripeActive" | "drinkProducer";
+export type OwnerFeatureCondition =
+  | "verifiedOwner" | "isVerifiedBadge" | "stripeActive" | "drinkProducer"
+  | "bookingRequestEmail" | "noBookingAdminBrake" | "visibilityOwnerControlled";
 export type OwnerFeatureRequirement = OwnerFeatureKey | OwnerFeatureCondition;
 
 /**
@@ -122,6 +184,7 @@ export type OwnerFeatureRequirement = OwnerFeatureKey | OwnerFeatureCondition;
 export type OwnerFeatureSurface =
   | "profile_html" | "json_ld" | "listing_html" | "mcp_search" | "mcp_info" | "rest_card" | "vcard"
   | "acp_feed" | "sitemap" | "llms" | "a2a" | "leaderboard" | "order_gate"
+  | "booking_gate"
   | `email:${string}` | `job:${string}`;
 
 /**
@@ -133,8 +196,13 @@ export interface OwnerFeatureStorageAdapter {
   column: string;
   /** Current value; null = the subject row does not exist. */
   read(db: any, subjectId: string): OwnerFeatureValue;
-  /** Returns false when no row was written. */
-  write(db: any, subjectId: string, value: OwnerFeatureValue): boolean;
+  /**
+   * Returns true when written, false when no row was written, or
+   * { blocked } when the column's own gate refused the value (gårdssalg
+   * booking_live: an admin brake set after the resolver checked — answered
+   * as a 409 like any other block).
+   */
+  write(db: any, subjectId: string, value: OwnerFeatureValue): boolean | { blocked: LocalizedText };
 }
 
 export interface OwnerFeatureEntry {
@@ -154,6 +222,13 @@ export interface OwnerFeatureEntry {
   default: { owner: OwnerFeatureValue; unclaimed: OwnerFeatureValue };
   /** All must hold before the entry can take a non-off value. */
   requires: OwnerFeatureRequirement[];
+  /**
+   * Conditions checked only when the owner switches the entry ON (a stored
+   * on value is still shown as on). Gårdssalg booking.enabled: the admin
+   * brake and the booking-request address — the same gate the portal and
+   * the admin lever use, so an attempt is refused (409) with its reason.
+   */
+  enableRequires?: OwnerFeatureCondition[];
   /** `locked` type: locked ON while this key is on, otherwise off. */
   lockedWhen?: OwnerFeatureKey;
   /** Locked ON unless this key is on; when it is on, the owner chooses. */
@@ -764,6 +839,454 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     surfaces: ["order_gate"],
   }),
 ];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Opplevagent gårdssalg — dev-request 2026-10-22-opplevagent-mine-valg-
+// gardssalg, «v2 for Opplevagent», slice O1a («Vedlegg A — katalog for
+// gårdssalg», 34 entries). Same shape, same resolver, same page component as
+// RFB; `verticals: ["gardssalg"]`. No text names Rett fra Bonden (principle 9).
+//
+// Status in O1a — `live` only where this slice enforces the value:
+//   visibility.profile  adapter ↔ the owner pause (G1 pkt 4) — every public
+//                       surface already hides a paused row (gardssalg-
+//                       visibility.ts), the claim lookup keeps it reachable;
+//   booking.enabled     adapter ↔ experience_providers.booking_live (existing
+//                       audit log + admin brake);
+//   booking.pause       read by the booking gate (owner-features/gardssalg.ts
+//                       gardssalgOwnerBookingPaused, featureOn): a new request
+//                       via web, REST and book_gardssalg is refused, the AI
+//                       discover note says «tar ikke imot forespørsler nå»,
+//                       the profile stays visible;
+//   booking.reminder, booking.attendance, notify.booking_email — locked on
+//                       while booking.enabled is on (the reminder after N h,
+//                       the attendance link and the request e-mail all exist
+//                       in booking-store.ts);
+//   content.guarantee, comms.unsubscribe — promises (G1 pkt 1 and 6).
+// Every other entry is `coming_soon` (the «Planlagt» box, no value) until a
+// slice enforces it: visibility.ai_assistants / search_engines / english /
+// exact_location and contact.* need per-surface readers; booking.ai_booking
+// and booking.within_hours need the booking channels to read them;
+// visit.tasting has no public reader (tasting_available is not shown
+// anywhere) and no bevilling check; stats.public_counts waits for the public
+// threshold on the gårdssalg profile; comms.news/beta/featured have no
+// first-login card and nothing that reads the consent; notify.changes /
+// report / milestones until the e-mails exist.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GS_DR = "2026-10-22-opplevagent-mine-valg-gardssalg";
+const GS_SINCE = "2026-10-29";
+const GARDSSALG: OwnerFeatureVertical[] = ["gardssalg"];
+
+export const GARDSSALG_OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: LocalizedText }> = [
+  { key: "visibility", label: { no: "Hvem kan finne deg", en: "Who can find you" } },
+  { key: "contact", label: { no: "Kontaktinformasjon", en: "Contact information" } },
+  { key: "booking", label: { no: "Besøk og booking", en: "Visits and booking" } },
+  { key: "content", label: { no: "Innhold og oppdatering", en: "Content and updates" } },
+  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
+  { key: "stats", label: { no: "Statistikk og offentlige tall", en: "Statistics and public numbers" } },
+  { key: "comms", label: { no: "Kontakt fra Opplevagent", en: "Contact from Opplevagent" } },
+];
+
+/** A gårdssalg entry: same defaults as `entry`, gårdssalg vertical and dev-request. */
+function gsEntry(
+  e: Parameters<typeof entry>[0],
+): OwnerFeatureEntry {
+  return entry({ verticals: GARDSSALG, since: GS_SINCE, devRequest: GS_DR, ...e });
+}
+
+/** Public gårdssalg read surfaces of a profile field (G1 pkt 5 flates). */
+const GS_PROFILE_FIELD_SURFACES: OwnerFeatureSurface[] = ["profile_html", "json_ld", "mcp_search", "mcp_info", "rest_card", "a2a"];
+
+export const GARDSSALG_OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
+  // ── Hvem kan finne deg ──────────────────────────────────────────────────
+  gsEntry({
+    key: "visibility.profile", group: "visibility", type: "switch",
+    label: t("Profilen er synlig", "Profile is visible"),
+    description: t(
+      "Når denne er av, er profilen på pause: borte fra søk, lister, kart og AI-assistenter. Du kan slå den på igjen når som helst.",
+      "When off, the profile is paused: removed from search, lists, maps and AI assistants. You can switch it back on at any time.",
+    ),
+    default: { owner: true, unclaimed: true },
+    requires: ["visibilityOwnerControlled"],
+    confirmOff: t(
+      "Profilen blir borte fra søk, kart og AI-assistenter til du slår den på igjen.",
+      "Your profile disappears from search, maps and AI assistants until you switch it back on.",
+    ),
+    surfaces: ["profile_html", "listing_html", "mcp_search", "mcp_info", "rest_card", "sitemap", "a2a"],
+    storage: GARDSSALG_PROFILE_VISIBLE_ADAPTER,
+    status: "live",
+  }),
+  gsEntry({
+    key: "visibility.ai_assistants", group: "visibility", type: "switch",
+    label: t("Synlig for AI-assistenter", "Visible to AI assistants"),
+    description: t("AI-assistenter som ChatGPT og Claude kan finne og anbefale stedet ditt.", "AI assistants such as ChatGPT and Claude can find and recommend your place."),
+    default: { owner: true, unclaimed: true },
+    requires: ["visibility.profile"],
+    confirmOff: t("AI-assistenter vil ikke lenger kunne anbefale deg.", "AI assistants will no longer be able to recommend you."),
+    surfaces: ["mcp_search", "mcp_info", "a2a"],
+  }),
+  gsEntry({
+    key: "visibility.search_engines", group: "visibility", type: "switch",
+    label: t("Synlig i Google og Bing", "Visible in Google and Bing"),
+    description: t("Søkemotorer kan vise profilsiden din i søkeresultater.", "Search engines can show your profile page in search results."),
+    default: { owner: true, unclaimed: true },
+    requires: ["visibility.profile"],
+    surfaces: ["profile_html", "sitemap"],
+  }),
+  gsEntry({
+    key: "visibility.english", group: "visibility", type: "switch",
+    label: t("Profil på engelsk", "Profile in English"),
+    description: t("Profilen vises også på engelsk (maskinoversatt). Du kan rette teksten selv.", "Your profile is also shown in English (machine-translated). You can correct the text yourself."),
+    default: { owner: true, unclaimed: true },
+    requires: ["visibility.profile"],
+    surfaces: ["profile_html", "sitemap"],
+  }),
+  gsEntry({
+    key: "visibility.exact_location", group: "visibility", type: "switch",
+    label: t("Vis eksakt kartpunkt", "Show the exact map point"),
+    description: t("Kartet viser nøyaktig hvor du er. Når den er av, vises bare kommunen.", "The map shows exactly where you are. When off, only the municipality is shown."),
+    default: { owner: true, unclaimed: true },
+    advanced: true,
+    surfaces: ["profile_html", "listing_html", "mcp_search"],
+  }),
+
+  // ── Kontaktinformasjon ──────────────────────────────────────────────────
+  gsEntry({
+    key: "contact.phone", group: "contact", type: "switch",
+    label: t("Vis telefonnummer", "Show phone number"),
+    description: t("Telefonnummeret ditt vises på profilen og for AI-assistenter.", "Your phone number is shown on your profile and to AI assistants."),
+    default: { owner: true, unclaimed: true },
+    surfaces: GS_PROFILE_FIELD_SURFACES,
+  }),
+  gsEntry({
+    key: "contact.email_mode", group: "contact", type: "choice",
+    label: t("E-postadressen din", "Your e-mail address"),
+    description: t("Hvordan e-postadressen din vises for besøkende og AI-assistenter.", "How your e-mail address is shown to visitors and AI assistants."),
+    options: [
+      { value: "show", label: t("Vis e-post", "Show e-mail") },
+      { value: "protected", label: t("Skjermet mot innhøsting", "Protected against harvesting") },
+      { value: "hidden", label: t("Ikke vis e-post", "Do not show e-mail") },
+    ],
+    default: { owner: "show", unclaimed: "show" },
+    devRequest: "2026-09-09-epost-eksponering-skjerming-mot-masseinnhosting",
+    surfaces: GS_PROFILE_FIELD_SURFACES,
+  }),
+  gsEntry({
+    key: "contact.address", group: "contact", type: "choice",
+    label: t("Adresse", "Address"),
+    description: t("Hvor mye av adressen din som vises.", "How much of your address is shown."),
+    options: [
+      { value: "full", label: t("Full adresse og kartnål", "Full address and map pin") },
+      { value: "place", label: t("Bare sted", "Place only") },
+    ],
+    default: { owner: "full", unclaimed: "full" },
+    surfaces: GS_PROFILE_FIELD_SURFACES,
+  }),
+  gsEntry({
+    key: "contact.booking_email", group: "contact", type: "email",
+    label: t("Besøksforespørsler sendes til", "Visit requests are sent to"),
+    description: t(
+      "E-postadressen besøksforespørslene går til. En ny adresse gjelder når du har bekreftet den.",
+      "The e-mail address visit requests go to. A new address applies once you have confirmed it.",
+    ),
+    nullable: true,
+    default: { owner: null, unclaimed: null },
+    outward: true,
+    surfaces: ["email:booking_request"],
+  }),
+
+  // ── Besøk og booking ────────────────────────────────────────────────────
+  gsEntry({
+    key: "booking.enabled", group: "booking", type: "switch",
+    label: t("Ta imot besøk", "Accept visits"),
+    description: t(
+      "Gjester og AI-assistenter kan be om å komme på besøk. Uten denne får gjesten kontaktinformasjonen din i stedet.",
+      "Guests and AI assistants can ask to visit you. Without it, the guest gets your contact details instead.",
+    ),
+    default: { owner: false, unclaimed: false },
+    requires: ["verifiedOwner"],
+    enableRequires: ["noBookingAdminBrake", "bookingRequestEmail"],
+    confirmOn: t(
+      "Du får besøksforespørsler på e-post og må svare gjesten. Du kan slå det av når som helst.",
+      "You will receive visit requests by e-mail and must answer the guest. You can switch it off at any time.",
+    ),
+    status: "live",
+    devRequest: "2026-08-08-booking-aktivering-per-produsent",
+    surfaces: ["booking_gate", "profile_html", "mcp_search", "a2a", "rest_card", "email:booking_request"],
+    storage: GARDSSALG_BOOKING_ENABLED_ADAPTER,
+  }),
+  gsEntry({
+    key: "booking.pause", group: "booking", type: "switch",
+    label: t("Sesongpause: ta ikke imot nye forespørsler", "Seasonal pause: do not accept new requests"),
+    description: t(
+      "Nye besøksforespørsler stoppes, og gjester og AI-assistenter får beskjed om at du ikke tar imot forespørsler nå. Profilen er fortsatt synlig.",
+      "New visit requests are stopped, and guests and AI assistants are told you are not taking requests right now. Your profile stays visible.",
+    ),
+    default: { owner: false, unclaimed: null },
+    requires: ["booking.enabled"],
+    confirmOn: t(
+      "Nye forespørsler stoppes til du slår pausen av. Forespørsler du allerede har fått, må du fortsatt svare på.",
+      "New requests are stopped until you switch the pause off. Requests you already have must still be answered.",
+    ),
+    status: "live",
+    surfaces: ["booking_gate", "mcp_search", "a2a", "rest_card"],
+  }),
+  gsEntry({
+    key: "booking.ai_booking", group: "booking", type: "switch",
+    label: t("AI-assistenter kan sende forespørsler", "AI assistants can send requests"),
+    description: t("En AI-assistent kan sende en besøksforespørsel for en gjest.", "An AI assistant can send a visit request on behalf of a guest."),
+    default: { owner: true, unclaimed: null },
+    requires: ["booking.enabled"],
+    surfaces: ["booking_gate", "mcp_search"],
+  }),
+  gsEntry({
+    key: "booking.within_hours", group: "booking", type: "switch",
+    label: t("Bare forespørsler innenfor åpningstidene", "Only requests within opening hours"),
+    description: t("Forespørsler utenfor åpningstidene dine blir ikke tatt imot.", "Requests outside your opening hours are not accepted."),
+    default: { owner: false, unclaimed: null },
+    requires: ["booking.enabled"],
+    surfaces: ["booking_gate"],
+  }),
+  gsEntry({
+    key: "booking.reminder", group: "booking", type: "locked",
+    label: t("Påminnelse om ubesvarte forespørsler", "Reminder about unanswered requests"),
+    description: t("Du får en påminnelse når en forespørsel ikke er besvart.", "You get a reminder when a request has not been answered."),
+    default: { owner: false, unclaimed: null },
+    lockedWhen: "booking.enabled",
+    status: "live",
+    outward: true,
+    devRequest: "2026-07-14-booking-flyt-v1",
+    surfaces: ["email:booking_reminder", "job:booking_previsit"],
+  }),
+  gsEntry({
+    key: "booking.attendance", group: "booking", type: "locked",
+    label: t("Bekreft oppmøte etter besøket", "Confirm attendance after the visit"),
+    description: t("Etter besøket bekrefter du med lenken i e-posten om gjesten kom.", "After the visit you confirm with the link in the e-mail whether the guest came."),
+    default: { owner: false, unclaimed: null },
+    lockedWhen: "booking.enabled",
+    status: "live",
+    devRequest: "2026-07-14-booking-flyt-v1",
+    surfaces: ["email:booking_request"],
+  }),
+  gsEntry({
+    key: "visit.tasting", group: "booking", type: "choice",
+    label: t("Smaking ved besøk", "Tasting during the visit"),
+    description: t(
+      "Om gjestene kan smake ved besøket. Smaking krever gyldig bevilling. Opplevagent selger ikke drikke, og reglene for salg på gården er foreløpig bare et forslag.",
+      "Whether guests can taste during the visit. Tasting requires a valid licence. Opplevagent does not sell drinks, and the rules for selling at the farm are only a proposal so far.",
+    ),
+    options: [
+      { value: "none", label: t("Ingen smaking", "No tasting") },
+      { value: "licensed", label: t("Smaking (med bevilling)", "Tasting (with licence)") },
+    ],
+    default: { owner: "none", unclaimed: "none" },
+    surfaces: ["profile_html", "mcp_info"],
+  }),
+  gsEntry({
+    key: "booking.expiry", group: "booking", type: "choice",
+    label: t("Svarfrist før forespørselen utløper", "Answer deadline before the request expires"),
+    description: t("Hvor lenge en forespørsel venter på svar før den utløper.", "How long a request waits for an answer before it expires."),
+    options: [
+      { value: "48", label: t("48 timer", "48 hours") },
+      { value: "60", label: t("60 timer", "60 hours") },
+      { value: "72", label: t("72 timer", "72 hours") },
+    ],
+    default: { owner: "60", unclaimed: null },
+    requires: ["booking.enabled"],
+    advanced: true,
+    surfaces: ["booking_gate", "job:booking_previsit"],
+  }),
+  gsEntry({
+    key: "booking.lead_time", group: "booking", type: "choice",
+    label: t("Varsel før besøk", "Notice before a visit"),
+    description: t("Hvor tidlig gjesten må be om besøket.", "How early the guest must ask for the visit."),
+    options: [
+      { value: "same_day", label: t("Samme dag", "Same day") },
+      { value: "one_day", label: t("Dagen før", "The day before") },
+      { value: "two_days", label: t("To dager før", "Two days before") },
+    ],
+    default: { owner: "same_day", unclaimed: null },
+    requires: ["booking.enabled"],
+    advanced: true,
+    surfaces: ["booking_gate"],
+  }),
+  gsEntry({
+    key: "booking.party_size", group: "booking", type: "number",
+    label: t("Største gruppe", "Largest group"),
+    description: t("Det største antallet personer en forespørsel kan gjelde.", "The largest number of people a request can be for."),
+    min: 1, max: 50,
+    default: { owner: 50, unclaimed: null },
+    requires: ["booking.enabled"],
+    advanced: true,
+    surfaces: ["booking_gate"],
+  }),
+
+  // ── Innhold og oppdatering ──────────────────────────────────────────────
+  gsEntry({
+    key: "content.guarantee", group: "content", type: "guarantee",
+    label: t("Det du skriver selv, overskrives aldri", "What you write yourself is never overwritten"),
+    description: t(
+      "Opplevagent skriver aldri over tekst du har skrevet selv. Du kan gi et felt tilbake i eierportalen.",
+      "Opplevagent never overwrites text you have written yourself. You can give a field back in the owner portal.",
+    ),
+    default: { owner: true, unclaimed: null },
+    status: "live",
+    surfaces: ["job:gardssalg_content_refresh", "job:rfb_knowledge_enrich"],
+  }),
+  gsEntry({
+    key: "content.auto_updates", group: "content", type: "choice",
+    label: t("Oppdatering fra nettsiden din", "Updates from your website"),
+    description: t("Hva som skjer når vi finner ny informasjon om deg på nettsiden din.", "What happens when we find new information about you on your website."),
+    options: [
+      { value: "suggest", label: t("Foreslå til meg", "Suggest to me") },
+      { value: "never", label: t("Aldri", "Never") },
+    ],
+    default: { owner: "suggest", unclaimed: null },
+    surfaces: ["job:gardssalg_content_refresh"],
+  }),
+  gsEntry({
+    key: "content.photos", group: "content", type: "switch",
+    label: t("Hent bilder fra nettsiden min", "Fetch photos from my website"),
+    description: t("Bilder fra nettsiden din kan brukes på profilen.", "Photos from your website can be used on your profile."),
+    default: { owner: false, unclaimed: false },
+    consent: true,
+    devRequest: "2026-07-03-gardssalg-rike-profiler-bilder-agentbooking",
+    surfaces: ["job:photo_import", "profile_html"],
+  }),
+
+  // ── Varsler til deg ─────────────────────────────────────────────────────
+  gsEntry({
+    key: "notify.booking_email", group: "notify", type: "locked",
+    label: t("Forespørsler på e-post", "Requests by e-mail"),
+    description: t("Hver ny besøksforespørsel sendes til deg på e-post.", "Every new visit request is sent to you by e-mail."),
+    default: { owner: false, unclaimed: null },
+    lockedWhen: "booking.enabled",
+    status: "live",
+    outward: true,
+    surfaces: ["email:booking_request"],
+  }),
+  gsEntry({
+    key: "notify.booking_sms", group: "notify", type: "switch",
+    label: t("SMS ved ny forespørsel", "Text message on a new request"),
+    description: t("Du får en SMS når en ny besøksforespørsel kommer.", "You get a text message when a new visit request arrives."),
+    default: { owner: false, unclaimed: null },
+    requires: ["booking.enabled"],
+    outward: true,
+    surfaces: ["job:booking_sms"],
+  }),
+  gsEntry({
+    key: "notify.report", group: "notify", type: "choice",
+    label: t("Rapport om profilen din", "Report about your profile"),
+    description: t("Visninger og «Med i AI-søk», sendt på e-post.", "Views and “In AI search”, sent by e-mail."),
+    options: [
+      { value: "monthly", label: t("Månedlig", "Monthly") },
+      { value: "quarterly", label: t("Hvert kvartal", "Quarterly") },
+      { value: "off", label: t("Aldri", "Never") },
+    ],
+    default: { owner: "monthly", unclaimed: "monthly" },
+    outward: true,
+    surfaces: ["email:owner_monthly_report"],
+  }),
+  gsEntry({
+    key: "notify.milestones", group: "notify", type: "switch",
+    label: t("Milepæler", "Milestones"),
+    description: t("En e-post når profilen når 100, 500 og 1000 visninger.", "An e-mail when your profile reaches 100, 500 and 1000 views."),
+    default: { owner: true, unclaimed: true },
+    outward: true,
+    surfaces: ["email:owner_milestone"],
+  }),
+  gsEntry({
+    key: "notify.changes", group: "notify", type: "switch",
+    label: t("Si fra når noe endres på profilen min", "Tell me when something changes on my profile"),
+    description: t("En samlet e-post per dag når noe på profilen er endret av andre enn deg.", "One daily e-mail when something on your profile was changed by someone other than you."),
+    default: { owner: true, unclaimed: true },
+    outward: true,
+    surfaces: ["email:owner_changes"],
+  }),
+
+  // ── Statistikk og offentlige tall ───────────────────────────────────────
+  gsEntry({
+    key: "stats.public_counts", group: "stats", type: "switch",
+    label: t("Vis «Med i AI-søk» på profilen", "Show “In AI search” on the profile"),
+    description: t(
+      "Profilen viser hvor ofte den var med i AI-søk. Du ser alltid dine egne tall.",
+      "Your profile shows how often it was in AI search. You always see your own numbers.",
+    ),
+    default: { owner: true, unclaimed: true },
+    surfaces: ["profile_html"],
+  }),
+  gsEntry({
+    key: "stats.share_partner", group: "stats", type: "switch",
+    label: t("Del statistikken min med samarbeidspartnere", "Share my statistics with partners"),
+    description: t("Partnere du er tilknyttet kan se statistikken din i sine rapporter.", "Partners you are affiliated with can see your statistics in their reports."),
+    default: { owner: false, unclaimed: false },
+    consent: true,
+    outward: true,
+    surfaces: ["email:partner_report"],
+  }),
+
+  // ── Kontakt fra Opplevagent ─────────────────────────────────────────────
+  gsEntry({
+    key: "comms.unsubscribe", group: "comms", type: "guarantee",
+    label: t("Avmelding uten å slette profilen", "Unsubscribe without deleting the profile"),
+    description: t(
+      "Du kan alltid melde deg av e-post fra Opplevagent uten at profilen slettes.",
+      "You can always unsubscribe from Opplevagent e-mails without your profile being deleted.",
+    ),
+    default: { owner: true, unclaimed: true },
+    status: "live",
+    surfaces: ["email:outreach"],
+  }),
+  gsEntry({
+    key: "comms.news", group: "comms", type: "switch",
+    label: t("Nyheter og tips", "News and tips"),
+    description: t("Om du vil ha nyheter og tips fra Opplevagent på e-post.", "Whether you want news and tips from Opplevagent by e-mail."),
+    default: { owner: false, unclaimed: false },
+    consent: true,
+    outward: true,
+    surfaces: [],
+  }),
+  gsEntry({
+    key: "comms.beta", group: "comms", type: "switch",
+    label: t("Prøv nye funksjoner først", "Try new features first"),
+    description: t("Du får tilbud om å prøve nye funksjoner før andre.", "You are offered new features before others."),
+    default: { owner: false, unclaimed: false },
+    outward: true,
+    surfaces: ["email:beta_invite"],
+  }),
+  gsEntry({
+    key: "comms.featured", group: "comms", type: "switch",
+    label: t("Opplevagent kan vise fram stedet mitt", "Opplevagent may feature my place"),
+    description: t("Vi kan omtale stedet ditt i sosiale medier og nyhetsbrev.", "We may feature your place on social media and in newsletters."),
+    default: { owner: false, unclaimed: false },
+    consent: true,
+    outward: true,
+    surfaces: ["job:social_media"],
+  }),
+  gsEntry({
+    key: "tools.badge", group: "comms", type: "action",
+    label: t("Hent «Finn oss på Opplevagent»-merke", "Get a “Find us on Opplevagent” badge"),
+    description: t("Et merke du kan legge på nettsiden din, med lenke til profilen.", "A badge you can put on your website, linking to your profile."),
+    default: { owner: null, unclaimed: null },
+    devRequest: "2026-07-12-opplevagent-lenkeplan",
+    surfaces: ["profile_html"],
+  }),
+];
+
+/** The registry for a vertical (the resolver, page and API default to it). */
+export function ownerFeatureRegistryFor(vertical: OwnerFeatureVertical): OwnerFeatureEntry[] {
+  return vertical === "gardssalg" ? GARDSSALG_OWNER_FEATURE_REGISTRY : OWNER_FEATURE_REGISTRY;
+}
+
+/** The groups (order and labels) for a vertical. */
+export function ownerFeatureGroupsFor(vertical: OwnerFeatureVertical): Array<{ key: OwnerFeatureGroup; label: LocalizedText }> {
+  return vertical === "gardssalg" ? GARDSSALG_OWNER_FEATURE_GROUPS : OWNER_FEATURE_GROUPS;
+}
+
+/** The registry keys for a vertical (governance: registry keys == this list). */
+export function ownerFeatureKeysFor(vertical: OwnerFeatureVertical): readonly string[] {
+  return vertical === "gardssalg" ? GARDSSALG_OWNER_FEATURE_KEYS : OWNER_FEATURE_KEYS;
+}
 
 /** Thrown for a key that is not in the registry — never a silent false. */
 export class UnknownOwnerFeatureError extends Error {

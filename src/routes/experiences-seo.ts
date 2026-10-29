@@ -229,6 +229,8 @@ import {
 // — the SAME shared choke point POST /api/opplevelser/book and the
 // book_gardssalg MCP tool use, never re-derived here.
 import { checkBookingSlotAllowed } from "../services/gardssalg-opening-hours";
+// «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O1a).
+import { gardssalgBookingPausedByOwner, GARDSSALG_NOT_TAKING_REQUESTS_TEXT } from "../services/gardssalg-booking-gate";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { safeHonestCatalogCount } from "../services/honest-count";
@@ -6644,6 +6646,9 @@ function bookingErrorMessage(code: string): string {
     // booking): plain "not activated" fact, no "coming soon" promise.
     case "paused":
       return BOOKING_NOT_ACTIVATED_INTEREST_MSG;
+    // «Mine valg» booking.pause (O1a): the owner is not taking requests now.
+    case "not_taking":
+      return GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no;
     // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstids-
     // validering"). The no-JS fallback has no natural place for a "resend
     // with confirmation" step (see the POST handler below for why this path
@@ -6719,9 +6724,14 @@ router.get(
     const panelClaimCta = provider.claimed_at == null
       ? ` Er dette din bedrift? <a href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}">Ta over profilen og aktiver booking</a>.`
       : "";
+    // «Mine valg» booking.pause (O1a): said up front, so the guest does not
+    // fill in a request that the POST below refuses.
+    const ownerPaused = !notLive && gardssalgBookingPausedByOwner(provider.id);
     const pausedNotice = notLive
       ? `<div class="notice-paused" role="status"><strong>Booking ikke aktivert</strong>${BOOKING_NOT_ACTIVATED_INTEREST_MSG}${panelClaimCta}</div>`
-      : "";
+      : ownerPaused
+        ? `<div class="notice-paused" role="status" data-owner-paused="1"><strong>Tar ikke imot forespørsler nå</strong>${escapeHtml(GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no)}</div>`
+        : "";
 
     const html = `<!doctype html>
 <html lang="nb">
@@ -6890,6 +6900,13 @@ router.post(
     // producer notification when paused, full stop.
     if (isBookingPaused(provider.booking_live, provider.catalog_hidden, provider.is_test_provider)) {
       res.redirect(303, `${backTo}?error=paused`);
+      return;
+    }
+    // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-
+    // gardssalg O1a): the owner's seasonal pause refuses the request with the
+    // not-taking line; the profile stays visible.
+    if (gardssalgBookingPausedByOwner(provider.id)) {
+      res.redirect(303, `${backTo}?error=not_taking`);
       return;
     }
 

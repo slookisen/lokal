@@ -30,13 +30,17 @@ import {
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_REGISTRY,
   findOwnerFeature,
+  type LocalizedText,
   type OwnerFeatureEntry,
+  type OwnerFeatureGroup,
   type OwnerFeatureValue,
+  type OwnerFeatureVertical,
 } from "./registry";
 import type { ResolvedOwnerFeature, ResolvedOwnerFeatures } from "./resolve";
 import {
   OWNER_LEVELS,
   OWNER_LEVEL_CUSTOM_LABEL,
+  type OwnerLevel,
   type OwnerChangeLogRow,
   type OwnerLevelKey,
   type OwnerLevelPreview,
@@ -62,6 +66,64 @@ export const OWNER_PAGE_ORDER_EMAIL_KEY = "orders.email";
 export const OWNER_PAGE_PLANNED_TITLE = "Planlagt — si fra hvis du vil ha dette";
 
 const CS_EMAIL = "kontakt@rettfrabonden.com";
+
+/**
+ * What differs between the verticals that share this page (dev-request
+ * 2026-10-22-opplevagent-mine-valg-gardssalg O1a: the gårdssalg tab is the
+ * SAME component). Omitted = Rett fra Bonden, rendered exactly as before.
+ */
+export interface OwnerPageVariant {
+  vertical: OwnerFeatureVertical;
+  /** Who promises / locks («Alltid» explanation, the change log's admin actor). */
+  platformName: string;
+  /** Customer service address (deletion request on the pause row). */
+  csEmail: string;
+  /** The page's own path + tail (forms, links). */
+  pagePath: (tail: string) => string;
+  /** «Tilbake til eierportalen». */
+  backHref: string;
+  groups: Array<{ key: OwnerFeatureGroup; label: LocalizedText }>;
+  levels: readonly OwnerLevel[];
+  /** «Slik er du nå» keys (only the built ones show). */
+  statusKeys: readonly string[];
+  /** Entries that need this key on are shown only when it is on. */
+  revealKey: string;
+  /** The pause confirm panel offers the RFB resume date (owner_profile_pause.pause_until). */
+  pauseResumeDate: boolean;
+}
+
+/** Gårdssalg booking row (booking.enabled): the prerequisite check and the explanation. */
+export interface OwnerPageBooking {
+  /** The address booking requests go to now (experience_providers.epost), or null. */
+  requestEmail: string | null;
+  /** Opplevagent stopped booking (admin brake); note = the operator's reason. */
+  adminBrake: { note: string | null } | null;
+  /** Where a missing or wrong address is fixed. */
+  fixHref: string;
+  /** Real timings from booking-store (previsitReminderHours / previsitExpireHours). */
+  reminderHours: number;
+  expireHours: number;
+  /** Largest group a request can be for (BookingInputSchema party_size max). */
+  maxPartySize: number;
+  /** «Les mer» (/for-tilbydere#besok) — only when that page is published. */
+  readMoreUrl: string | null;
+}
+
+/** Gårdssalg statistics block (the portal's own GET …/stats numbers). */
+export interface OwnerPageGardssalgStats {
+  humanViews: number;
+  aiSearchViews: number;
+  /** The page-view window of the source (ownerStatsWindowDays, raw retention). */
+  windowDays: number;
+  aiDeliveries: { value: number; label: string } | null;
+  tip: string;
+}
+
+/** Daniel 29.10, verbatim (O1 «Prisbudskapet»): used at «Ta imot besøk». */
+export const OWNER_PAGE_PRICE_MESSAGE =
+  "Det koster ingenting i dag. Innfører vi provisjon på besøk, får du beskjed minst 30 dager før, og du kan slå av besøk når som helst.";
+/** The gårdssalg row that carries the visit explanation, the price message and the prerequisite check. */
+export const OWNER_PAGE_BOOKING_KEY = "booking.enabled";
 
 export interface OwnerPageNotice {
   ok: boolean;
@@ -116,6 +178,12 @@ export interface OwnerPageModel {
    * null = the read failed (the block says so and keeps the link).
    */
   stats?: OwnerPageStats | null;
+  /** The vertical's differences; omitted = Rett fra Bonden. */
+  variant?: OwnerPageVariant;
+  /** Gårdssalg: the booking.enabled row's check and explanation. */
+  booking?: OwnerPageBooking | null;
+  /** Gårdssalg: the statistics block (instead of `stats`). undefined = none, null = read failed. */
+  gardssalgStats?: OwnerPageGardssalgStats | null;
   /** «Se all statistikk» (the Statistikk tab in /selger). */
   statsHref?: string;
 }
@@ -274,8 +342,17 @@ function isNew(e: OwnerFeatureEntry, now: Date): boolean {
   return age >= 0 && age < OWNER_PAGE_NEW_DAYS * 86_400_000;
 }
 
-function actionPath(agentId: string, tail: string): string {
-  return `/eier/${encodeURIComponent(agentId)}/valg${tail}`;
+function actionPath(m: OwnerPageModel, tail: string): string {
+  if (m.variant) return m.variant.pagePath(tail);
+  return `/eier/${encodeURIComponent(m.agent.id)}/valg${tail}`;
+}
+
+function platformName(m: OwnerPageModel): string {
+  return m.variant ? m.variant.platformName : "Rett fra Bonden";
+}
+
+function pageGroups(m: OwnerPageModel): Array<{ key: OwnerFeatureGroup; label: LocalizedText }> {
+  return m.variant ? m.variant.groups : OWNER_FEATURE_GROUPS;
 }
 
 /** Per-render state: «Alltid» / «Låst på» are explained the first time only. */
@@ -287,19 +364,18 @@ interface RenderCtx {
 }
 
 /** `data-mv-row` names the element the enhancement script swaps after a save. */
-function rowForm(agentId: string, tail: string, swap: string, inner: string): string {
-  return `<form method="post" action="${esc(actionPath(agentId, tail))}" class="mv-ctl-form" data-mv-row="${esc(swap)}">${inner}</form>`;
+function rowForm(m: OwnerPageModel, tail: string, swap: string, inner: string): string {
+  return `<form method="post" action="${esc(actionPath(m, tail))}" class="mv-ctl-form" data-mv-row="${esc(swap)}">${inner}</form>`;
 }
 
 /** The control for one row. */
 function controlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, swap: string): string {
-  const agentId = ctx.m.agent.id;
   const valueText = ownerFeatureRowValue(e, r) ?? "";
   if (e.type === "guarantee") return `<span class="mv-state mv-always">Alltid</span>`;
   if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) return orderEmailControlHtml(ctx, e, r, swap);
   const state = `<span class="mv-state">${esc(valueText)}</span>`;
   if (!r.changeable || e.type === "locked" || e.type === "action") return state;
-  const form = (inner: string) => rowForm(agentId, "/sett", swap, `<input type="hidden" name="key" value="${esc(e.key)}">${inner}`);
+  const form = (inner: string) => rowForm(ctx.m, "/sett", swap, `<input type="hidden" name="key" value="${esc(e.key)}">${inner}`);
   const fieldId = `mv-f-${e.key.replace(/[^a-z0-9]/gi, "-")}`;
   switch (e.type) {
     case "switch": {
@@ -345,7 +421,7 @@ function orderEmailControlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: Resolved
   if (!oe || !oe.enabled) return state;
   const fieldId = "mv-f-orders-email";
   return state + rowForm(
-    ctx.m.agent.id, "/ordre-epost", swap,
+    ctx.m, "/ordre-epost", swap,
     `<label class="mv-sr" for="${fieldId}">Ny adresse for bestillinger</label>` +
     `<input id="${fieldId}" name="email" type="email" required autocomplete="email" placeholder="Ny adresse">` +
     `<button type="submit" class="ep-btn ep-btn-secondary">Send bekreftelse</button>`,
@@ -355,15 +431,19 @@ function orderEmailControlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: Resolved
 /** Text under the label for the special rows (prerequisite check, explanation, pause, order address). */
 function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature): string {
   const m = ctx.m;
-  if (e.key === OWNER_PAGE_ORDERS_KEY) return ordersCheckHtml(m) + ordersExplainHtml(m);
+  if (!m.variant && e.key === OWNER_PAGE_ORDERS_KEY) return ordersCheckHtml(m) + ordersExplainHtml(m);
+  if (m.variant?.vertical === "gardssalg" && e.key === OWNER_PAGE_BOOKING_KEY) return bookingCheckHtml(m) + bookingExplainHtml(m);
   if (e.key === OWNER_PAGE_PAUSE_KEY) {
     const paused = r.value === false;
+    const cs = m.variant ? m.variant.csEmail : CS_EMAIL;
     const subject = encodeURIComponent(`Be om sletting av profil: ${m.agent.name || m.agent.id} (${m.agent.id})`);
-    const body = encodeURIComponent(`Hei,\n\nJeg ber om at profilen ${m.agent.name || ""} (${m.agent.id}) slettes fra Rett fra Bonden.\n\nHilsen`);
-    return (paused
+    const body = encodeURIComponent(`Hei,\n\nJeg ber om at profilen ${m.agent.name || ""} (${m.agent.id}) slettes fra ${platformName(m)}.\n\nHilsen`);
+    // A row hidden by «fjern» / an admin quality hide is not the owner's pause
+    // (gårdssalg: requirement visibilityOwnerControlled) — its reason says so.
+    return (paused && r.block !== "requirement_not_met"
       ? `<p class="mv-check" role="status">Profilen er på midlertidig pause${m.pauseUntil ? ` til ${esc(formatDay(m.pauseUntil))}` : ""}. Den vises ikke i søk, lister, AI-tjenester eller kart.</p>`
       : "") +
-      `<p class="mv-desc">Vil du heller at profilen slettes for godt? <a href="mailto:${CS_EMAIL}?subject=${subject}&amp;body=${body}">Be om sletting</a> — kundeservice hjelper deg.</p>`;
+      `<p class="mv-desc">Vil du heller at profilen slettes for godt? <a href="mailto:${cs}?subject=${subject}&amp;body=${body}">Be om sletting</a> — kundeservice hjelper deg.</p>`;
   }
   if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) {
     const oe = m.orderEmail;
@@ -374,6 +454,62 @@ function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeat
       (oe.enabled ? `<p class="mv-desc">Vi sender en lenke til den nye adressen. Bestillinger går til den gamle adressen til lenken er brukt.</p>` : "");
   }
   return "";
+}
+
+/**
+ * Gårdssalg (O1 principle 4): the prerequisite check right at the «Ta imot
+ * besøk» switch — the admin brake first (it wins over the owner), then the
+ * address booking requests go to (the same rule the portal and the admin
+ * lever use), with where it is fixed — and the price message, verbatim.
+ */
+function bookingCheckHtml(m: OwnerPageModel): string {
+  const b = m.booking;
+  const price = `<p class="mv-check mv-price" data-price-message="1">${esc(OWNER_PAGE_PRICE_MESSAGE)}</p>`;
+  if (!b) return price;
+  const cs = m.variant ? m.variant.csEmail : CS_EMAIL;
+  let check: string;
+  if (b.adminBrake) {
+    check = `<p class="mv-check mv-check-missing" data-booking-check="admin_brake">Booking er stanset av ${esc(platformName(m))}.${b.adminBrake.note ? ` Grunn: ${esc(b.adminBrake.note)}.` : ""} Du kan ikke slå den på igjen selv. Ta kontakt med <a href="mailto:${esc(cs)}">${esc(cs)}</a>.</p>`;
+  } else if (!b.requestEmail) {
+    check = `<p class="mv-check mv-check-missing" data-booking-check="no_email">Profilen mangler en e-postadresse som forespørslene kan sendes til, så besøk kan ikke slås på ennå. <a href="${esc(b.fixHref)}">Be oss legge inn adressen</a>.</p>`;
+  } else {
+    check = `<p class="mv-check" data-booking-check="ok">Forespørsler sendes til <strong>${esc(b.requestEmail)}</strong>. Er adressen feil? <a href="${esc(b.fixHref)}">Si fra</a>.</p>`;
+  }
+  return check + price;
+}
+
+/** Gårdssalg (O1 principle 4): «Slik fungerer det», read from booking-store as built. */
+function bookingExplainHtml(m: OwnerPageModel): string {
+  const b = m.booking;
+  if (!b) return "";
+  const name = esc(platformName(m));
+  const readMore = b.readMoreUrl ? `<p><a href="${esc(b.readMoreUrl)}">Les mer</a></p>` : "";
+  return `<details class="mv-explain-box">
+            <summary>Slik fungerer besøk</summary>
+            <h3>Slik fungerer det</h3>
+            <ul>
+              <li>Gjesten ber om dato, tidspunkt og antall personer (opptil ${esc(b.maxPartySize)}) på profilen din eller via en AI-assistent.</li>
+              <li>Du får en e-post med lenke til en svarside der du bekrefter, avslår eller foreslår et annet tidspunkt. Du trenger ikke logge inn.</li>
+              <li>Besøket skjer hos dere. ${name} selger ingenting og håndterer ikke betaling.</li>
+              <li>Etter besøket bekrefter du med lenken i den samme e-posten om gjesten kom.</li>
+            </ul>
+            <h3>Dette må du gjøre</h3>
+            <ul>
+              <li>Svar på hver forespørsel: bekreft, avslå eller foreslå et annet tidspunkt.</li>
+              <li>Svarer du ikke, får du en påminnelse etter ${esc(b.reminderHours)} timer.</li>
+              <li>Er forespørselen fortsatt ubesvart etter ${esc(b.expireHours)} timer, utløper den, og gjesten får beskjed.</li>
+              <li>Bekreft oppmøte etter besøket.</li>
+            </ul>
+            <h3>Hva koster det?</h3>
+            <p>${esc(OWNER_PAGE_PRICE_MESSAGE)}</p>
+            <h3>Slik slår du av</h3>
+            <ul>
+              <li>Trykk «Slå av» på denne raden. Da får gjesten kontaktinformasjonen din i stedet, og profilen er fortsatt synlig.</li>
+              <li>Vil du bare ta en pause, bruk «Sesongpause». Den vises når besøk er slått på.</li>
+              <li>Forespørsler du allerede har fått, må du fortsatt svare på.</li>
+            </ul>
+            ${readMore}
+          </details>`;
 }
 
 /** v2 principle 4: the prerequisite check stands above the orders switch. */
@@ -427,7 +563,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
   let explain = "";
   if (e.type === "guarantee" && !ctx.explainedAlways) {
     ctx.explainedAlways = true;
-    explain = `<p class="mv-explain">«Alltid» betyr et løfte fra Rett fra Bonden. Det gjelder hele tiden og kan ikke slås av.</p>`;
+    explain = `<p class="mv-explain">«Alltid» betyr et løfte fra ${esc(platformName(ctx.m))}. Det gjelder hele tiden og kan ikke slås av.</p>`;
   } else if (e.type === "locked" && r.value === true && !ctx.explainedLocked) {
     ctx.explainedLocked = true;
     explain = `<p class="mv-explain">«Låst på» betyr at dette hører til noe du har slått på. Det følger det valget og kan ikke slås av alene.</p>`;
@@ -440,7 +576,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
 
 /** The built entries of one group, split as the page shows them. */
 function groupEntries(m: OwnerPageModel, registry: OwnerFeatureEntry[], group: string) {
-  const reveal = findOwnerFeature(OWNER_PAGE_REVEAL_KEY, registry);
+  const reveal = findOwnerFeature(m.variant ? m.variant.revealKey : OWNER_PAGE_REVEAL_KEY, registry);
   const revealOn = !!reveal && m.resolved.byKey[reveal.key]?.value === true;
   const entries = registry.filter((e) => e.group === group && isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key]);
   const hidden = entries.filter((e) => !!reveal && !revealOn && e.requires.includes(reveal.key as any));
@@ -450,7 +586,7 @@ function groupEntries(m: OwnerPageModel, registry: OwnerFeatureEntry[], group: s
 
 function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
   const m = ctx.m;
-  return OWNER_FEATURE_GROUPS.map((g) => {
+  return pageGroups(m).map((g) => {
     const { reveal, shown, hidden } = groupEntries(m, registry, g.key);
     if (shown.length === 0 && hidden.length === 0) return "";
     const swap = `gruppe-${g.key}`;
@@ -474,13 +610,13 @@ function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
 function plannedHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
   const planned = registry.filter((e) => !isOwnerFeatureBuilt(e) && m.resolved.byKey[e.key]);
   if (planned.length === 0) return "";
-  const groupLabel = new Map(OWNER_FEATURE_GROUPS.map((g) => [g.key as string, g.label.no] as const));
+  const groupLabel = new Map(pageGroups(m).map((g) => [g.key as string, g.label.no] as const));
   const interest = m.interest ?? new Set<string>();
   const rows = planned.map((e) => {
     const asked = interest.has(e.key);
     const ctl = asked
       ? `<span class="mv-state mv-asked">Du har sagt fra</span>`
-      : rowForm(m.agent.id, "/interesse", "planlagt",
+      : rowForm(m, "/interesse", "planlagt",
           `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
     return `<li class="mv-item mv-item-planned" id="planlagt-${esc(e.key)}" data-planned-key="${esc(e.key)}">
           <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(e.description.no)}</p></div>
@@ -495,14 +631,14 @@ function plannedHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
 }
 
 function levelsHtml(m: OwnerPageModel): string {
-  const cards = OWNER_LEVELS.map((l) => {
+  const cards = (m.variant ? m.variant.levels : OWNER_LEVELS).map((l) => {
     const current = m.level === l.key;
     return `<li class="mv-level"${current ? ` aria-current="true"` : ""} data-level="${esc(l.key)}">
           <strong>${esc(l.label.no)}</strong>${l.recommended ? ` <span class="mv-badge mv-badge-new">Anbefalt</span>` : ""}${l.key === "bare_synlig" ? ` <span class="mv-badge">Standard</span>` : ""}
           <p class="mv-desc">${esc(l.description.no)}</p>
           ${current
             ? `<span class="mv-state">Valgt</span>`
-            : `<form method="get" action="${esc(actionPath(m.agent.id, ""))}" class="mv-ctl-form"><input type="hidden" name="niva" value="${esc(l.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Velg «${esc(l.label.no)}»</button></form>`}
+            : `<form method="get" action="${esc(actionPath(m, ""))}" class="mv-ctl-form"><input type="hidden" name="niva" value="${esc(l.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Velg «${esc(l.label.no)}»</button></form>`}
         </li>`;
   }).join("");
   const note = m.level === "custom"
@@ -520,7 +656,7 @@ function levelsHtml(m: OwnerPageModel): string {
 
 function statusLineHtml(m: OwnerPageModel): string {
   const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
-  const items = OWNER_PAGE_STATUS_KEYS.map((k) => {
+  const items = (m.variant ? m.variant.statusKeys : OWNER_PAGE_STATUS_KEYS).map((k) => {
     const e = findOwnerFeature(k, registry);
     const r = m.resolved.byKey[k];
     const v = e ? ownerFeatureRowValue(e, r) : null;
@@ -541,8 +677,8 @@ function levelPreviewHtml(m: OwnerPageModel): string {
     return `<li><strong>${esc(label(c.key))}</strong>: ${esc(formatOwnerFeatureValue(e, c.from))} → ${esc(formatOwnerFeatureValue(e, c.to))}${confirm ? `<p class="mv-desc">${esc(confirm.no)}</p>` : ""}</li>`;
   }).join("");
   const skipped = p.skipped.map((s) => `<li><strong>${esc(label(s.key))}</strong> endres ikke: ${esc(s.reason.no)}</li>`).join("");
-  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, "#niva"))}">Avbryt</a>`;
-  const confirmForm = `<form method="post" action="${esc(actionPath(m.agent.id, "/niva"))}" class="mv-ctl-form">
+  const cancel = `<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, "#niva"))}">Avbryt</a>`;
+  const confirmForm = `<form method="post" action="${esc(actionPath(m, "/niva"))}" class="mv-ctl-form">
             <input type="hidden" name="level" value="${esc(p.level.key)}">
             <input type="hidden" name="confirmed" value="1">
             <button type="submit" class="ep-btn ep-btn-primary">Bekreft «${esc(p.level.label.no)}»</button>
@@ -569,20 +705,20 @@ function confirmHtml(m: OwnerPageModel): string {
   const text = e ? (c.value ? e.confirmOn : e.confirmOff) : undefined;
   if (!e || !text) return "";
   // The pause keeps the optional resume date the /eier pause card had.
-  const until = e.key === OWNER_PAGE_PAUSE_KEY && !c.value
+  const until = e.key === OWNER_PAGE_PAUSE_KEY && !c.value && (!m.variant || m.variant.pauseResumeDate)
     ? `<div class="ep-field"><label for="mv-pause-until">Kommer tilbake (valgfritt)</label><input id="mv-pause-until" name="until" type="date" aria-label="Dato profilen kommer tilbake"></div>`
     : "";
   return `<section class="ep-card mv-confirm" id="bekreft" role="region" aria-labelledby="mv-h-bekreft">
         <h2 id="mv-h-bekreft">${esc(c.value ? "Slå på" : "Slå av")} «${esc(e.label.no)}»?</h2>
         <p>${esc(text.no)}</p>
-        <form method="post" action="${esc(actionPath(m.agent.id, "/sett"))}" class="mv-confirm-form">
+        <form method="post" action="${esc(actionPath(m, "/sett"))}" class="mv-confirm-form">
           <input type="hidden" name="key" value="${esc(e.key)}">
           <input type="hidden" name="value" value="${c.value ? "true" : "false"}">
           <input type="hidden" name="confirmed" value="1">
           ${until}
           <div class="ep-form-actions">
             <button type="submit" class="ep-btn ep-btn-primary">Ja, ${esc(c.value ? "slå på" : "slå av")}</button>
-            <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `#valg-${e.key}`))}">Avbryt</a>
+            <a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `#valg-${e.key}`))}">Avbryt</a>
           </div>
         </form>
       </section>`;
@@ -591,7 +727,7 @@ function confirmHtml(m: OwnerPageModel): string {
 function introHtml(m: OwnerPageModel): string {
   if (!m.showIntro) return "";
   const form = (answer: "yes" | "no", label: string, cls: string) =>
-    `<form method="post" action="${esc(actionPath(m.agent.id, "/intro"))}" class="mv-ctl-form"><input type="hidden" name="answer" value="${answer}"><button type="submit" class="ep-btn ${cls}">${label}</button></form>`;
+    `<form method="post" action="${esc(actionPath(m, "/intro"))}" class="mv-ctl-form"><input type="hidden" name="answer" value="${answer}"><button type="submit" class="ep-btn ${cls}">${label}</button></form>`;
   return `<section class="ep-card mv-intro" id="velkommen" aria-labelledby="mv-h-intro">
         <h2 id="mv-h-intro">Nyheter og tips</h2>
         <p>Vil du ha nyheter og tips fra Rett fra Bonden på e-post? Det er frivillig. Svaret ditt blir valget «Nyheter og tips» under «Kontakt fra Rett fra Bonden», og der kan du endre det når som helst.</p>
@@ -604,13 +740,13 @@ function logHtml(m: OwnerPageModel): string {
   const items = m.log.rows.map((r) => {
     const e = findOwnerFeature(r.key, registry);
     const label = e ? e.label.no : r.key;
-    const who = ACTOR_LABELS[r.actor] ?? "Systemet";
+    const who = r.actor === "admin" ? platformName(m) : (ACTOR_LABELS[r.actor] ?? "Systemet");
     return `<li class="ep-audit-item"><strong>${esc(label)}</strong>: ${esc(formatOwnerFeatureValue(e, r.old_value))} → ${esc(formatOwnerFeatureValue(e, r.new_value))}${r.undo ? ` <span class="mv-badge">Angret</span>` : ""}
           <div class="ep-audit-meta">${esc(formatWhen(r.at))} · ${esc(who)}</div></li>`;
   }).join("");
   const nav: string[] = [];
-  if (m.log.page > 1) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `?side=${m.log.page - 1}#endringslogg`))}">Nyere</a>`);
-  if (m.log.page < m.log.pages) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m.agent.id, `?side=${m.log.page + 1}#endringslogg`))}">Eldre</a>`);
+  if (m.log.page > 1) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page - 1}#endringslogg`))}">Nyere</a>`);
+  if (m.log.page < m.log.pages) nav.push(`<a class="ep-btn ep-btn-secondary" href="${esc(actionPath(m, `?side=${m.log.page + 1}#endringslogg`))}">Eldre</a>`);
   return `<section class="ep-card" id="endringslogg" aria-labelledby="mv-h-logg">
         <details class="mv-fold" open>
           <summary class="mv-fold-summary"><h2 id="mv-h-logg">Endringslogg</h2></summary>
@@ -625,15 +761,46 @@ function noticeHtml(m: OwnerPageModel): string {
   const n = m.notice;
   if (!n) return "";
   const undo = n.undoBatchId
-    ? `<form method="post" action="${esc(actionPath(m.agent.id, "/angre"))}" class="mv-ctl-form"><input type="hidden" name="batch" value="${esc(n.undoBatchId)}"><button type="submit" class="ep-btn ep-btn-secondary">Angre</button></form>`
+    ? `<form method="post" action="${esc(actionPath(m, "/angre"))}" class="mv-ctl-form"><input type="hidden" name="batch" value="${esc(n.undoBatchId)}"><button type="submit" class="ep-btn ep-btn-secondary">Angre</button></form>`
     : "";
   return `<div class="mv-toast ${n.ok ? "mv-toast-ok" : "mv-toast-error"}" role="${n.ok ? "status" : "alert"}"><span>${esc(n.text)}</span>${undo}</div>`;
 }
 
 const nbNum = (n: number) => n.toLocaleString("nb-NO");
 
+/**
+ * Gårdssalg (O1 principle 1, proof first): the portal's own Statistikk
+ * numbers (getGardssalgOwnerStats — the same source as GET
+ * /api/opplevelser/gardssalg-claim/:id/stats, no new counting), each with the
+ * period its source covers. Low numbers get one sentence and one tip.
+ */
+function gardssalgStatsHtml(m: OwnerPageModel): string {
+  const st = m.gardssalgStats;
+  if (st === undefined) return "";
+  const link = m.statsHref ? `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(m.statsHref)}">Se all statistikk</a></div>` : "";
+  if (st === null) {
+    return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h"><h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <p class="mv-note">Statistikken kunne ikke lastes akkurat nå. Prøv igjen senere.</p>${link}</section>`;
+  }
+  const tile = (value: number, label: string, period: string) =>
+    `<li class="mv-stat"><strong>${esc(nbNum(value))}</strong><span>${esc(label)}</span><small>${esc(period)}</small></li>`;
+  const low = st.humanViews < OWNER_PAGE_LOW_VIEWS_FALLBACK;
+  return `<section class="ep-card" id="statistikk" aria-labelledby="statistikk-h">
+      <h2 id="statistikk-h">Dette har profilen gjort for deg</h2>
+      <ul class="mv-stats">
+        ${tile(st.humanViews, "Personer som så profilen", `siste ${st.windowDays} dager`)}
+        ${tile(st.aiSearchViews, "Funnet via AI-assistenter", `siste ${st.windowDays} dager`)}
+        ${st.aiDeliveries ? tile(st.aiDeliveries.value, "Med i AI-søk", st.aiDeliveries.label) : ""}
+      </ul>
+      ${low ? `<p class="mv-note">Tallene er lave ennå, og det er vanlig for en profil som er ny eller lite kjent.</p>
+      <p class="mv-check">Tips: ${esc(st.tip)}</p>` : ""}
+      ${link}
+    </section>`;
+}
+
 /** S2f: the statistics block (v2 principle 1: proof first). */
 function statsHtml(m: OwnerPageModel): string {
+  if (m.gardssalgStats !== undefined) return gardssalgStatsHtml(m);
   if (m.stats === undefined) return "";
   const link = m.statsHref ? `<div class="ep-form-actions"><a class="ep-btn ep-btn-secondary" href="${esc(m.statsHref)}">Se all statistikk</a></div>` : "";
   const st = m.stats;
@@ -667,8 +834,9 @@ function statsHtml(m: OwnerPageModel): string {
 
 /** v2 principle 9: jump links (shown on narrow screens). */
 function jumpNavHtml(m: OwnerPageModel, registry: OwnerFeatureEntry[]): string {
-  const links: Array<[string, string]> = m.stats !== undefined ? [["statistikk", "Statistikk"], ["niva", "Nivå"]] : [["niva", "Nivå"]];
-  for (const g of OWNER_FEATURE_GROUPS) {
+  const hasStats = m.stats !== undefined || m.gardssalgStats !== undefined;
+  const links: Array<[string, string]> = hasStats ? [["statistikk", "Statistikk"], ["niva", "Nivå"]] : [["niva", "Nivå"]];
+  for (const g of pageGroups(m)) {
     const { shown, hidden } = groupEntries(m, registry, g.key);
     if (shown.length || hidden.length) links.push([`gruppe-${g.key}`, g.label.no]);
   }
@@ -809,7 +977,7 @@ export const OWNER_PAGE_CSS = `
 export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
   const registry = m.registry ?? OWNER_FEATURE_REGISTRY;
   const ctx: RenderCtx = { m, now: m.now ?? new Date(), explainedAlways: false, explainedLocked: false };
-  const back = `/eier/${encodeURIComponent(m.agent.id)}/portal`;
+  const back = m.variant ? m.variant.backHref : `/eier/${encodeURIComponent(m.agent.id)}/portal`;
   return `<style>${OWNER_PAGE_CSS}</style>
     <div class="mv-page">
       <div class="ep-card">
