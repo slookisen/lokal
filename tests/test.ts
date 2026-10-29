@@ -49676,6 +49676,19 @@ runSerial(async () => {
     failed++;
     failures.push("avmeld-fixup: unexpected error: " + String(err?.message || err));
   }
+  // avmeld token format (fixed vectors) + separation from the B2 stock-check link.
+  try {
+    const { runAvmeldTokenVectorTests } = require("../src/services/avmeld-token-vector.test") as
+      typeof import("../src/services/avmeld-token-vector.test");
+    const tv = await runAvmeldTokenVectorTests({ log: false });
+    passed += tv.passed;
+    failed += tv.failed;
+    for (const f of tv.failures) failures.push("avmeld-token-vector: " + f);
+    console.log(`  avmeld-token-vector: ${tv.passed} passed, ${tv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("avmeld-token-vector: unexpected error: " + String(err?.message || err));
+  }
 });
 
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 point 6 / AC 6: owned

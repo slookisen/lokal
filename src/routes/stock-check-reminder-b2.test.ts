@@ -189,7 +189,7 @@ export async function runStockCheckReminderB2Tests(opts: { log?: boolean } = {})
     seedProduct(A, "a-fresh", { name: "Kål", updated: ago(1) });                        // expires T + 13 d
     seedProduct(A, "a-admin", { name: "Poteter", source: "admin_producer_confirmed", updated: null });
     seedProduct(A, "a-noprice", { name: "Rødbeter", price: null });                    // orderable, not confirmable
-    seedProduct(A, "a-label", { name: "Honning", price: null, category: null });       // category label
+    seedProduct(A, "a-label", { name: "Honning", price: null, category: null, source: "enrichment" }); // category label (scraped, unpriced, generic name)
     seedProduct(A, "a-alcohol", { name: "Eplesider" });                                // alcohol
     seedProduct(A, "a-stale", { name: "Løk", updated: ago(20) });                       // expired 6 days ago
     seedProduct(A, "a-out", { name: "Spinat", availability: "out_of_stock" });          // the owner said «not in stock»
@@ -357,6 +357,12 @@ export async function runStockCheckReminderB2Tests(opts: { log?: boolean } = {})
       const changed = Object.keys(after).filter((k) => after[k] !== before[k]).sort();
       assertEq(changed, ["a-stale"], "link-17: only the expired, priced, producer-stated row is confirmed — not unpriced, label, alcohol, «not in stock», fresh or admin rows");
       assertEq((db.prepare("SELECT availability AS a FROM products WHERE id = 'a-out'").get() as any).a, "out_of_stock", "link-17b: an «out of stock» row stays out of stock");
+      {
+        const lab = db.prepare("SELECT * FROM products WHERE id = 'a-label'").get() as any;
+        const codes = cartSvc!.orderabilityReasons(db, lab).reasons.map((x) => x.code);
+        assertTrue(codes.includes("category_label"), "link-17d: the fixture «a-label» really is a category label");
+        assertEq([lab.availability_source, lab.availability_updated_at], ["enrichment", ago(12)], "link-17e: … and it was not confirmed (source and timestamp unchanged)");
+      }
       // A token signed for another producer with A's notice → invalid, nothing written.
       const cross = sc.makeStockCheckToken(B, res!.nonce, new Date(Date.now() + DAY))!;
       const snapB2 = JSON.stringify(productsOf(B));
