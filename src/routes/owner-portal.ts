@@ -1686,8 +1686,8 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = oa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(oa.text)}</div>`;
-    } else if (ownerOrderabilityPortalEnabled() && ownerOrderabilityAlert(status, req.query.felt)) {
-      const va = ownerOrderabilityAlert(status, req.query.felt)!;
+    } else if (ownerOrderabilityPortalEnabled() && ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)) {
+      const va = ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)!;
       alert = va.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(va.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(va.text)}</div>`;
@@ -2347,11 +2347,16 @@ export function ownerSelgerCardHtml(agentId: string): string {
 const ORDERABILITY_ANCHOR = "bestillbare-varer";
 
 /** status=… after a B1 POST → the portal alert. null = not a B1 status. */
-export function ownerOrderabilityAlert(status: string, rawFields: unknown): { ok: boolean; text: string } | null {
+export function ownerOrderabilityAlert(status: string, rawFields: unknown, rawNoPrice?: unknown): { ok: boolean; text: string } | null {
+  const noPriceN = typeof rawNoPrice === "string" && /^\d{1,5}$/.test(rawNoPrice) ? Number(rawNoPrice) : 0;
+  const noPrice = noPriceN > 0
+    ? ` ${noPriceN} ${noPriceN === 1 ? "vare" : "varer"} uten pris ble ikke bekreftet — legg inn pris først.`
+    : "";
   switch (status) {
     case "vare_bekreftet": return { ok: true, text: "Varen er bekreftet på lager." };
-    case "varer_bekreftet": return { ok: true, text: "Varene er bekreftet på lager." };
-    case "ingen_varer_bekreftet": return { ok: true, text: "Ingen varer å bekrefte." };
+    case "varer_bekreftet": return { ok: true, text: `Varene er bekreftet på lager.${noPrice}` };
+    case "ingen_varer_bekreftet": return { ok: true, text: `Ingen varer å bekrefte.${noPrice}` };
+    case "vare_mangler_pris": return { ok: false, text: "Varen mangler pris, så den kan ikke bekreftes her. Legg inn pris først." };
     case "vare_lagt_til": return { ok: true, text: "Varen er lagt til og bekreftet på lager." };
     case "vare_finnes": return { ok: false, text: "Du har allerede en vare med det navnet. Bekreft den i listen i stedet." };
     case "vare_kan_ikke_bekreftes": return { ok: false, text: "Denne varen kan ikke bestilles her, så den kan ikke bekreftes." };
@@ -2384,6 +2389,9 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
     const status = p.orderable
       ? `<strong class="ep-orderable-yes">Kan bestilles</strong>${p.stock_expires_at ? ` <span class="ep-audit-meta">Lagerstatus gjelder til ${escapeHtml(formatOwnerDate(p.stock_expires_at))}</span>` : ""}`
       : `<strong class="ep-orderable-no">Kan ikke bestilles</strong><ul class="ep-orderable-reasons">${p.reasons.map((r) => `<li data-reason="${escapeHtml(r.code)}">${escapeHtml(orderabilityReasonTextNb(r))}</li>`).join("")}</ul>`;
+    const noPrice = p.missing_price
+      ? `<div class="ep-audit-meta" data-missing-price="1">Mangler pris — legg inn pris før du bekrefter at varen er på lager.</div>`
+      : "";
     const confirm = p.confirmable
       ? `<form method="post" action="/eier/${id}/varer/${encodeURIComponent(p.id)}/bekreft" style="margin:6px 0 0;">
             <button type="submit" class="ep-btn ep-btn-secondary">Bekreft at varen er på lager</button>
@@ -2392,6 +2400,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
     return `<li class="ep-audit-item" data-product-id="${escapeHtml(p.id)}" data-orderable="${p.orderable ? "1" : "0"}">
           <div><strong>${escapeHtml(p.name)}</strong> <span class="ep-audit-meta">${escapeHtml(formatOwnerPrice(p.price_nok, p.unit))}</span></div>
           <div>${status}</div>
+          ${noPrice}
           ${confirm}
         </li>`;
   }).join("");
@@ -2456,7 +2465,8 @@ router.post("/eier/:agentId/varer/bekreft-alle", express.urlencoded({ extended: 
   if (!auth.ok) return;
   try {
     const r = confirmAllOwnerProductsInStock(auth.agentId, { actorEmail: auth.email });
-    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed > 0 ? "varer_bekreftet" : "ingen_varer_bekreftet"));
+    const extra = r.skipped_missing_price > 0 ? `&uten_pris=${r.skipped_missing_price}` : "";
+    return res.redirect(303, orderabilityBack(auth.agentId, r.confirmed > 0 ? "varer_bekreftet" : "ingen_varer_bekreftet", extra));
   } catch (err) {
     console.error("[owner-portal] POST varer/bekreft-alle error:", err instanceof Error ? err.message : "error");
     return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
@@ -2486,6 +2496,7 @@ router.post("/eier/:agentId/varer/:productId/bekreft", express.urlencoded({ exte
   try {
     const r = confirmOwnerProductInStock(auth.agentId, String((req.params as any).productId || ""), { actorEmail: auth.email });
     if (r.ok) return res.redirect(303, orderabilityBack(auth.agentId, "vare_bekreftet"));
+    if (r.error === "missing_price") return res.redirect(303, orderabilityBack(auth.agentId, "vare_mangler_pris"));
     if (r.error === "not_found") {
       return res.status(404).send(portalShell("Fant ikke varen", `<div class="ep-card"><h1>Fant ikke varen</h1><p><a href="/eier/${encodeURIComponent(auth.agentId)}/portal#${ORDERABILITY_ANCHOR}">Tilbake til varene</a></p></div>`));
     }

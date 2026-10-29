@@ -197,6 +197,8 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
     add(A, "b1-expired-null", { name: "Kål", availability: "in_stock", source: "producer_dashboard", updated: null }, ["stock_status_expired"]);
     add(A, "b1-out", { name: "Purre", availability: "out_of_stock", source: "producer_dashboard", updated: fresh }, ["not_in_stock"]);
     add(A, "b1-unconfirmed", { name: "Rødbeter", availability: "in_stock", source: "enrichment" }, ["not_confirmed_by_owner"]);
+    // Follow-up: an unpriced scraped row (no gate reason for the missing price; the portal refuses to confirm it).
+    add(A, "b1-noprice", { name: "Hjemmelaget pesto", price: null, availability: "in_stock", source: "enrichment" }, ["not_confirmed_by_owner"]);
     add(A, "b1-out-unconfirmed", { name: "Squash", availability: "out_of_stock", source: "enrichment" }, ["not_in_stock", "not_confirmed_by_owner"]);
     add(OFF, "b1-off", { name: "Egg", availability: "in_stock", source: "admin_producer_confirmed" }, ["orders_off"]);
     add(UNVER, "b1-unver", { name: "Egg", availability: "in_stock", source: "admin_producer_confirmed" }, ["owner_not_verified"]);
@@ -270,6 +272,16 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
       const broken = { prepare() { throw new Error("db down"); }, transaction: db.transaction.bind(db) };
       const okRow = rowOf("b1-ok-admin");
       assertEq([cart.isRowOrderableForRealOrder(broken, okRow, now), cart.orderabilityReasons(broken, okRow, now).orderable], [false, false], "gate: a profile read error is «no» in both");
+      // A throwing ban classifier (String(description) throws inside classifyCartItemBan) is fail-closed.
+      const throwing = { ...rowOf("b1-ok-admin"), description: { toString() { throw new Error("classifier boom"); } } as any };
+      assertEq(cart.isRowOrderableForRealOrder(db, throwing, now), false, "gate: a throwing ban classifier → not orderable");
+      assertEq(legacyGate(throwing, now), false, "gate: the pre-B1 gate also refused it");
+      const tr = cart.orderabilityReasons(db, throwing, now);
+      assertEq([tr.orderable, tr.reasons.map((x) => x.code)], [false, ["ban_check_failed"]], "reasons: a throwing ban classifier → ban_check_failed");
+      // The missing-price rule is portal-only: the gate still accepts an unpriced producer-stated row.
+      const unpriced = { ...rowOf("b1-ok-dash"), price_nok: null };
+      assertEq([cart.isRowOrderableForRealOrder(db, unpriced, now), legacyGate(unpriced, now), cart.orderabilityReasons(db, unpriced, now).orderable], [true, true, true],
+        "gate: an unpriced producer-stated row is unchanged by the portal's price rule");
     }
 
     // ═══ AC1 — portal = gate; confirm → orderable; +15 days → expired ═════════
@@ -278,7 +290,9 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
       const byGate = ov.products.map((p) => [p.id, cart.isRowOrderableForRealOrder(db, rowOf(p.id), now)]);
       assertEq(ov.products.map((p) => [p.id, p.orderable]), byGate, "AC1: the portal's orderability per row equals isRowOrderableForRealOrder");
       assertEq(ov.orderable_count, 2, "AC1: 2 of A's rows can be ordered");
-      assertEq(ov.products.filter((p) => !p.confirmable).map((p) => p.id).sort(), ["b1-alcohol", "b1-label", "b1-service"], "AC1: category labels and alcohol/services get no confirm button");
+      assertEq(ov.products.filter((p) => !p.confirmable).map((p) => p.id).sort(), ["b1-alcohol", "b1-label", "b1-noprice", "b1-service"], "AC1: category labels, alcohol/services and unpriced rows get no confirm button");
+      const np = ov.products.find((p) => p.id === "b1-noprice")!;
+      assertEq([np.missing_price, np.confirmable, np.reasons.map((x) => x.code)], [true, false, ["not_confirmed_by_owner"]], "AC1: an unpriced row is flagged missing_price in the portal only");
       const offOv = oo.listOwnerProductOrderability(OFF, db, now);
       assertEq(offOv.profile_reasons.map((r) => r.code), ["orders_off"], "AC1: profile-level reasons are listed once for the card");
 
@@ -359,6 +373,7 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
         assertTrue(html.includes(t), `card: reason text «${t}»`);
       }
       assertTrue(html.includes(`action="/eier/${A}/varer/b1-out/bekreft"`) && !html.includes(`action="/eier/${A}/varer/b1-label/bekreft"`), "card: confirm button per confirmable row only");
+      assertTrue(!html.includes(`action="/eier/${A}/varer/b1-noprice/bekreft"`) && html.includes(`data-missing-price="1"`) && html.includes("Mangler pris"), "card: an unpriced row gets «Mangler pris» and no confirm button");
       assertTrue(html.includes("Bekreft at varen er på lager") && html.includes("Bekreft alle på lager") && html.includes(`action="/eier/${A}/varer/ny"`), "card: the buttons and the add form");
       const offHtml = await portal(OFF);
       assertTrue(offHtml.includes(`data-orderability-profile="blocked"`) && offHtml.includes("Bestillinger er slått av"), "card: profile-level reason shown");
@@ -372,6 +387,15 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
     // ═══ owner-only ═══════════════════════════════════════════════════════
     {
       const before = src("b1-out");
+      // XSS: hostile product name and unit are escaped in the card.
+      db.prepare(`INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_source) VALUES ('b1-xss', ?, ?, ?, 10, ?, 'in_stock', 'enrichment')`)
+        .run(OTHER, "<script>alert(1)</script>", "<script>alert(1)</script>", `"><img src=x>`);
+      const xh = await portal(OTHER);
+      assertTrue(xh.includes(`id="bestillbare-varer"`), "xss: the card renders for the hostile row's owner");
+      assertTrue(!xh.includes("<script>alert(1)</script>") && !xh.includes("<img src=x>"), "xss: no raw tags from the product name or unit");
+      assertTrue(xh.includes("&lt;script&gt;alert(1)&lt;/script&gt;") && xh.includes("&quot;&gt;&lt;img src=x&gt;"), "xss: the name and unit are shown escaped");
+      db.prepare("DELETE FROM products WHERE id = 'b1-xss'").run();
+
       const anon = await post(H.one, { agentId: A, productId: "b1-out" }, undefined);
       assertEq([anon.status, loc(anon)], [303, `/eier/${A}`], "auth: no session → login");
       const other = await post(H.one, { agentId: A, productId: "b1-out" }, tokens[OTHER]);
@@ -397,11 +421,19 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
       assertEq([row.availability, row.availability_source], ["in_stock", "producer_dashboard"], "confirm one: in_stock, source producer_dashboard");
       assertTrue(cart.isRowOrderableForRealOrder(db, row), "confirm one: now orderable");
       assertEq((db.prepare("SELECT COUNT(*) AS n FROM agent_knowledge_audit WHERE agent_id = ?").get(A) as any).n, audits0 + 1, "confirm one: an audit row");
+      const npr = await post(H.one, { agentId: A, productId: "b1-noprice" }, tokens[A]);
+      assertEq([loc(npr), src("b1-noprice")], [`/eier/${A}/portal?status=vare_mangler_pris#bestillbare-varer`, "enrichment"], "confirm one: an unpriced row is refused, nothing written");
+      assertTrue((await portal(A, { status: "vare_mangler_pris" })).includes("Varen mangler pris, så den kan ikke bekreftes her. Legg inn pris først."), "confirm one: the refusal message");
       const lab = await post(H.one, { agentId: A, productId: "b1-label" }, tokens[A]);
       assertEq([loc(lab), src("b1-label")], [`/eier/${A}/portal?status=vare_kan_ikke_bekreftes#bestillbare-varer`, "enrichment"], "confirm one: a category label is not confirmed");
 
       const all = await post(H.all, { agentId: A }, tokens[A]);
-      assertEq(loc(all), `/eier/${A}/portal?status=varer_bekreftet#bestillbare-varer`, "confirm all: 303 back");
+      assertEq(loc(all), `/eier/${A}/portal?status=varer_bekreftet&uten_pris=1#bestillbare-varer`, "confirm all: 303 back, with the number of unpriced rows skipped");
+      assertEq(src("b1-noprice"), "enrichment", "confirm all: an unpriced row is not confirmed");
+      const msg = await portal(A, { status: "varer_bekreftet", uten_pris: "1" });
+      assertTrue(msg.includes("Varene er bekreftet på lager. 1 vare uten pris ble ikke bekreftet — legg inn pris først."), "confirm all: the owner is told the unpriced rows were skipped");
+      const msgBad = await portal(A, { status: "varer_bekreftet", uten_pris: "<b>" });
+      assertTrue(msgBad.includes("Varene er bekreftet på lager.") && !msgBad.includes("uten pris ble ikke"), "confirm all: a non-numeric uten_pris is ignored");
       const after = db.prepare("SELECT id, availability, availability_source FROM products WHERE agent_id = ? ORDER BY id").all(A) as any[];
       const by = Object.fromEntries(after.map((x) => [x.id, [x.availability, x.availability_source]]));
       for (const pid of ["b1-ok-dash", "b1-expired", "b1-expired-null", "b1-out", "b1-unconfirmed", "b1-out-unconfirmed"]) {

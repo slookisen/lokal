@@ -22,7 +22,10 @@
 //
 // Category labels and alcohol / services are never confirmed by these writes
 // (their reason is not something a stock confirmation can fix, and confirming
-// a label would make it count as a producer-set product).
+// a label would make it count as a producer-set product). Rows without a
+// price (price_nok NULL) are not confirmed either: one click must not turn an
+// unpriced scraped row into an orderable one. That is a portal-side rule only;
+// the real-order gate (cart-service) is unchanged.
 
 import crypto from "crypto";
 import { getDb } from "../database/init";
@@ -54,6 +57,8 @@ export interface OwnerProductOrderability extends OrderabilityResult {
   unit: string | null;
   availability: string;
   availability_source: string | null;
+  /** Portal-only: the row has no price, so it cannot be confirmed here (not a gate reason). */
+  missing_price: boolean;
   /** «Bekreft at varen er på lager» can be used on this row. */
   confirmable: boolean;
 }
@@ -76,8 +81,8 @@ function readRows(db: any, agentId: string): ProductRow[] {
     .all(agentId) as ProductRow[];
 }
 
-function isConfirmable(r: OrderabilityResult): boolean {
-  return !r.reasons.some((x) => NOT_CONFIRMABLE.has(x.code));
+function isConfirmable(r: OrderabilityResult, priceNok: number | null): boolean {
+  return priceNok != null && !r.reasons.some((x) => NOT_CONFIRMABLE.has(x.code));
 }
 
 export function listOwnerProductOrderability(agentId: string, db: any = getDb(), now: Date = new Date()): OwnerOrderabilityOverview {
@@ -92,7 +97,8 @@ export function listOwnerProductOrderability(agentId: string, db: any = getDb(),
       availability: row.availability,
       availability_source: row.availability_source,
       ...r,
-      confirmable: isConfirmable(r),
+      missing_price: row.price_nok == null,
+      confirmable: isConfirmable(r, row.price_nok),
     };
   });
   return {
@@ -112,7 +118,7 @@ function audit(db: any, agentId: string, field: string, oldValue: string | null,
 
 export type ConfirmResult =
   | { ok: true; confirmed: number }
-  | { ok: false; error: "not_found" | "not_confirmable" };
+  | { ok: false; error: "not_found" | "not_confirmable" | "missing_price" };
 
 /** «Bekreft at varen er på lager» for one row of this producer. */
 export function confirmOwnerProductInStock(
@@ -123,9 +129,9 @@ export function confirmOwnerProductInStock(
   const db = opts.db ?? getDb();
   const row = readRows(db, agentId).find((r) => r.id === productId);
   if (!row) return { ok: false, error: "not_found" };
-  if (!isConfirmable(orderabilityReasons(db, row, opts.now ?? new Date(), { eligible: true, reasons: [] }))) {
-    return { ok: false, error: "not_confirmable" };
-  }
+  const reasons = orderabilityReasons(db, row, opts.now ?? new Date(), { eligible: true, reasons: [] }).reasons;
+  if (reasons.some((x) => NOT_CONFIRMABLE.has(x.code))) return { ok: false, error: "not_confirmable" };
+  if (row.price_nok == null) return { ok: false, error: "missing_price" };
   let out: ConfirmResult = { ok: false, error: "not_found" };
   db.transaction(() => {
     const w = setProducerAvailabilityByProductId(agentId, productId, "in_stock", db);
@@ -140,10 +146,14 @@ export function confirmOwnerProductInStock(
 export function confirmAllOwnerProductsInStock(
   agentId: string,
   opts: { db?: any; actorEmail?: string | null; now?: Date } = {},
-): { ok: true; confirmed: number } {
+): { ok: true; confirmed: number; skipped_missing_price: number } {
   const db = opts.db ?? getDb();
   const now = opts.now ?? new Date();
-  const rows = readRows(db, agentId).filter((r) => isConfirmable(orderabilityReasons(db, r, now, { eligible: true, reasons: [] })));
+  const all = readRows(db, agentId);
+  // Unpriced rows a confirmation could otherwise fix: counted for the owner's message.
+  const skipped_missing_price = all.filter((r) => r.price_nok == null
+    && !orderabilityReasons(db, r, now, { eligible: true, reasons: [] }).reasons.some((x) => NOT_CONFIRMABLE.has(x.code))).length;
+  const rows = all.filter((r) => isConfirmable(orderabilityReasons(db, r, now, { eligible: true, reasons: [] }), r.price_nok));
   let confirmed = 0;
   db.transaction(() => {
     for (const r of rows) {
@@ -153,7 +163,7 @@ export function confirmAllOwnerProductsInStock(
       audit(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null, `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
     }
   })();
-  return { ok: true, confirmed };
+  return { ok: true, confirmed, skipped_missing_price };
 }
 
 export interface OwnerNewProductInput {
