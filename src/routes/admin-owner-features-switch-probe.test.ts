@@ -15,6 +15,12 @@
  *             transport spied), the Markdown report with the findings block
  *   flags     OWNER_LOCK_ENFORCE_WRITES / OUTREACH_UNSUBSCRIBE_ENABLED off →
  *             those rows FAIL «flag off in this environment», values reported
+ *   observable  the leaderboard reader asks for every row (the fixture outside
+ *             the default top 10 still PASSes both ways); a surface that
+ *             cannot see the fixture in the visible starting state (no
+ *             agent_metrics row, no in-stock product, an injected blind
+ *             reader) → NOT_OBSERVABLE both ways with a reason, not ready,
+ *             reported apart (PASS / FAIL / IKKE OBSERVERBAR)
  *   failure   an effect reader that throws → that row FAIL, still restored;
  *             a throw mid-run (after a flip) → ok:false, still restored
  *   busy      a second concurrent run → 409 already_running
@@ -41,6 +47,7 @@ const FIX = "sp-fixture";
 const REAL = "sp-real-producer";
 const FIX_NAME = "Bryterprobe Gard Fixtur";
 const FIX_EMAIL = "eier@sp-fixture.example.no";
+const i2s = (id: string) => id.replace(/\D+/g, "");
 
 export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
   const log = opts.log ?? false;
@@ -308,6 +315,60 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(/## FUNN TIL OPPFØLGING\n- \[FUNN\] ingen/.test(md), "run-25: report ends with the findings block (ingen)");
       assertTrue(!md.includes(FIX_EMAIL) && !JSON.stringify(b).includes(FIX_EMAIL), "run-26: no e-mail address in the report or response");
       assertTrue(b.env_flags?.OWNER_LOCK_ENFORCE_WRITES === "1" && b.env_flags?.OUTREACH_UNSUBSCRIBE_ENABLED === "1", "run-27: env flags reported");
+      assertTrue(b.not_observable === 0 && md.includes(`**${b.pass} PASS / 0 FAIL / 0 IKKE OBSERVERBAR**`), "run-28: the report counts PASS / FAIL / IKKE OBSERVERBAR");
+    }
+
+    // ═══ Observability: list surfaces that can / cannot see the fixture ═══
+    {
+      const before = rawState(FIX);
+      // (a) 12 producers above the fixture on the leaderboard: the default top 10 misses it.
+      const crowd = Array.from({ length: 12 }, (_, i) => `sp-lb-${i}`);
+      for (const id of crowd) {
+        seed(id, `Toppliste Gard ${i2s(id)}`, { origin: "discovery", hidden: 0, email: `post@${id}.example.no` });
+        db.prepare(`UPDATE agent_metrics SET times_chosen = 100 WHERE agent_id = ?`).run(id);
+      }
+      const { conversationService } = require("../services/conversation-service") as typeof import("../services/conversation-service");
+      assertTrue(!conversationService.getLeaderboard(10).some((x: any) => x.agentId === FIX), "obs-1: the fixture is not in the default top 10");
+      const a = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      const lb = a.rows.filter((x) => x.key === "visibility.profile" && x.surface === "leaderboard");
+      assertTrue(lb.length === 2 && lb.every((x) => x.result === "PASS") && lb.some((x) => x.direction === "on" && /api_leaderboard=ja/.test(x.observed)),
+        `obs-2: leaderboard read with a raised limit → PASS both ways (${lb.map((x) => `${x.direction}:${x.result}`).join(",")})`);
+      assertEq([a.fail, a.not_observable, a.ready_for_daniel_test], [0, 0, true], "obs-3: fail 0, not observable 0, ready");
+      for (const id of crowd) {
+        for (const t of ["agent_metrics", "products", "agent_knowledge"]) db.prepare(`DELETE FROM ${t} WHERE agent_id = ?`).run(id);
+        db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+      }
+
+      // (b) the fixture structurally absent: no agent_metrics row, no in-stock product.
+      const metrics = db.prepare(`SELECT * FROM agent_metrics WHERE agent_id = ?`).get(FIX) as Record<string, unknown>;
+      db.prepare(`DELETE FROM agent_metrics WHERE agent_id = ?`).run(FIX);
+      db.prepare(`UPDATE products SET availability = 'out_of_stock' WHERE agent_id = ?`).run(FIX);
+      const blind: import("../owner-features/switch-probe").SurfaceReaderDef = { observe: "blind", read: () => ({ endpoints: { vcard: false }, requireAll: true }) };
+      let n: Awaited<ReturnType<typeof probe.runSwitchProbe>>;
+      try {
+        n = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, readers: { "visibility.profile × vcard": blind } });
+      } finally {
+        const cols = Object.keys(metrics);
+        db.prepare(`INSERT INTO agent_metrics (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`).run(...cols.map((k) => metrics[k]));
+        db.prepare(`UPDATE products SET availability = 'in_stock' WHERE agent_id = ?`).run(FIX);
+      }
+      const rowsOf = (s: string) => n!.rows.filter((x) => x.key === "visibility.profile" && x.surface === s);
+      const nob = (s: string, re: RegExp, label: string) => {
+        const rs = rowsOf(s);
+        assertTrue(rs.length === 2 && rs.every((x) => x.result === "NOT_OBSERVABLE" && re.test(x.reason || "") && x.discriminating === false && x.ms_to_effect === null)
+          && rs.map((x) => x.direction).sort().join(",") === "off,on",
+          `${label} (${rs.map((x) => `${x.direction}:${x.result}:${x.reason}`).join(" | ")})`);
+      };
+      nob("leaderboard", /ingen rad i agent_metrics/, "obs-4: leaderboard without an agent_metrics row → NOT_OBSERVABLE both ways, with the reason");
+      nob("acp_feed", /ingen vare på lager i feeden/, "obs-5: acp_feed without an in-stock product → NOT_OBSERVABLE both ways, with the reason");
+      nob("vcard", /vises ikke på vcard i grunntilstanden/, "obs-6: any visibility surface blind in the visible state (injected reader) → NOT_OBSERVABLE, generic reason");
+      assertTrue(n!.rows.every((x) => x.result !== "PASS" || !["leaderboard", "acp_feed", "vcard"].includes(x.surface) || x.key !== "visibility.profile"), "obs-7: never PASS on an unobservable surface");
+      assertEq([n!.not_observable, n!.fail, n!.ready_for_daniel_test, n!.restored], [6, 0, false, true], "obs-8: 6 not observable, 0 fail, NOT ready, restored");
+      const md = n!.markdown;
+      assertTrue(md.includes(`**${n!.pass} PASS / 0 FAIL / 6 IKKE OBSERVERBAR**`) && md.includes("«ikke observerbar» teller ikke som PASS"), "obs-9: the report shows the three counts and why it is not ready");
+      assertTrue(/\| visibility\.profile \| leaderboard \| (on|off) \| IKKE OBSERVERBAR \|/.test(md), "obs-10: the row table says IKKE OBSERVERBAR");
+      assertTrue(/- \[FUNN\] bryterprobe-visibility-profile-acp-feed-(on|off) · P2 · .*ikke observerbar/.test(md) && !md.includes("- [FUNN] ingen"), "obs-11: the not-observable rows land in the findings block (P2)");
+      assertEq(rawState(FIX), before, "obs-12: restored byte-identical");
     }
 
     // ═══ Flags off: the rows that depend on them FAIL ═════════════════════

@@ -11,6 +11,13 @@
 // effect over 60 min is FAIL. 100 % PASS is required before
 // ready_for_daniel_test.
 //
+// NOT_OBSERVABLE («ikke observerbar»): a visibility surface whose reader
+// cannot see the fixture in the starting state where the fixture should be
+// visible (e.g. not in the leaderboard at all, no in-stock product in the
+// feed). Then neither direction proves anything («off» would pass with no
+// evidence), so both rows are NOT_OBSERVABLE with the reason — never PASS. They
+// are counted apart from FAIL, and block ready_for_daniel_test like a FAIL.
+//
 // The routine that runs it cannot log in as an owner (the magic link goes to
 // e-mail), so the probe runs in-process behind an admin route
 // (routes/admin-owner-features-switch-probe.ts):
@@ -94,6 +101,14 @@ const LIST_SURFACES = new Set(["listing_html", "mcp_search", "acp_feed", "leader
 /** Tables the public read paths write to (A2A task log, profile views). */
 export const SWITCH_PROBE_SIDE_EFFECT_TABLES = ["tasks", "analytics_agent_views"] as const;
 const HANDLER_TIMEOUT_MS = 20_000;
+/**
+ * /api/leaderboard has no cap on `limit` (getLeaderboard: LIMIT ?), so the
+ * probe asks for every row instead of the default top 10.
+ */
+export const SWITCH_PROBE_LEADERBOARD_LIMIT = 100_000;
+/** /api/marketplace/catalog/feed pages: the route caps `limit` at 500. */
+const FEED_PAGE_LIMIT = 500;
+const FEED_MAX_PAGES = 40;
 const FIXTURE_PIN = `origin = '${SWITCH_PROBE_FIXTURE_ORIGIN}' AND catalog_hidden = 1`;
 
 /** Env flags the probe reports (a `live` key's effect depends on some of them). */
@@ -120,13 +135,21 @@ export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = 
 const FLAG_OFF_REASON = "flag off in this environment";
 
 export type ProbeVerdict = "PASS" | "FAIL";
+/** A row's result: NOT_OBSERVABLE = the surface cannot see the fixture even where it should (never PASS). */
+export type ProbeRowResult = ProbeVerdict | "NOT_OBSERVABLE";
+/** Norwegian label of a row result in the report. */
+export const PROBE_RESULT_LABEL: Readonly<Record<ProbeRowResult, string>> = {
+  PASS: "PASS",
+  FAIL: "FAIL",
+  NOT_OBSERVABLE: "IKKE OBSERVERBAR",
+};
 export type ProbeDirection = "off" | "on" | "parent_off" | "parent_on";
 
 export interface SwitchProbeRow {
   key: string;
   surface: string;
   direction: ProbeDirection;
-  result: ProbeVerdict;
+  result: ProbeRowResult;
   /** What the surface showed (no e-mail addresses). */
   observed: string;
   expected: string;
@@ -182,6 +205,8 @@ export interface SwitchProbeResult {
   checks: SwitchProbeCheck[];
   pass: number;
   fail: number;
+  /** Rows whose surface could not see the fixture in the visible starting state (not PASS, block readiness). */
+  not_observable: number;
   restored: boolean;
   restore_diff: Array<{ table: string; before: unknown; after: unknown }>;
   /** Rows the readers' public read paths logged (captured by rowid) and how many the probe removed again. */
@@ -423,12 +448,19 @@ export interface SurfaceObservation {
   detail?: string;
   /** «on» needs every endpoint (single-object surfaces); unset = at least one (list surfaces). */
   requireAll?: boolean;
+  /**
+   * The reader's own explanation for why the fixture cannot appear on this
+   * surface (no leaderboard row, no in-stock product …). Used as the
+   * NOT_OBSERVABLE reason when the fixture is missing in the visible state.
+   */
+  unobservableHint?: string;
 }
 
 export interface ProbeFixture {
   id: string;
   name: string;
   slug: string;
+  city: string;
   citySlug: string;
   categories: string[];
   productName: string | null;
@@ -552,6 +584,7 @@ function loadFixture(db: any, agentId: string): ProbeFixture {
     id: agentId,
     name,
     slug: slugify(name),
+    city: String(a?.city || ""),
     citySlug: slugify(String(a?.city || "")),
     categories,
     productName: p?.name ?? null,
@@ -768,8 +801,21 @@ function visibilityReader(surface: string): SurfaceReader {
           eps.vcard = async () => text(await call("vcard", `/api/marketplace/agents/${f.id}/vcard`, { params: { id: f.id } })).includes("BEGIN:VCARD");
           break;
         case "acp_feed":
-          eps.feed = async () => ((await call("feed", "/api/marketplace/catalog/feed")).body?.items ?? []).some((i: any) => i?.seller?.agent_id === f.id);
-          if (f.productId) eps.acp_csv = async () => text(await call("acp", "/api/marketplace/catalog/acp-feed.csv")).includes(f.productId!);
+          // The feed has no seller filter: narrow by the fixture's city (?city=)
+          // and page through it (?limit=500&offset=) instead of the first 100.
+          eps.feed = async () => {
+            for (let page = 0, offset = 0; page < FEED_MAX_PAGES; page++, offset += FEED_PAGE_LIMIT) {
+              const q: Record<string, string> = { limit: String(FEED_PAGE_LIMIT), offset: String(offset) };
+              if (f.city) q.city = f.city;
+              const b = (await call("feed", "/api/marketplace/catalog/feed", { query: q })).body;
+              const items: any[] = b?.items ?? [];
+              if (items.some((i: any) => i?.seller?.agent_id === f.id)) return true;
+              if (items.length < FEED_PAGE_LIMIT || offset + items.length >= Number(b?.total ?? 0)) return false;
+            }
+            return false;
+          };
+          // The CSV is the whole feed; a fixture row carries its profile URL (any in-stock product).
+          eps.acp_csv = async () => text(await call("acp", "/api/marketplace/catalog/acp-feed.csv")).includes(`/produsent/${f.slug},`);
           break;
         case "sitemap":
           eps.sitemap_xml = async () => kit.buildSitemapXml().includes(`/produsent/${f.slug}</loc>`);
@@ -783,16 +829,42 @@ function visibilityReader(surface: string): SurfaceReader {
           eps.a2a_search = async () => JSON.stringify((await a2a({ method: "message/send", params: { message: { role: "user", parts: [{ kind: "text", text: f.name }] } } })).body ?? "").includes(f.id);
           break;
         case "leaderboard":
-          eps.api_leaderboard = async () => ((await call("leaderboard", "/api/leaderboard")).body?.data ?? []).some((r: any) => r?.agentId === f.id);
+          // The default limit is 10 (top 10 only): ask for every row.
+          eps.api_leaderboard = async () => ((await call("leaderboard", "/api/leaderboard", { query: { limit: String(SWITCH_PROBE_LEADERBOARD_LIMIT) } })).body?.data ?? []).some((r: any) => r?.agentId === f.id);
           break;
         default:
           throw new Error(`no visibility reader for ${surface}`);
       }
       const endpoints: Record<string, boolean> = {};
       for (const [name, fn] of Object.entries(eps)) endpoints[name] = await fn();
-      return { endpoints, requireAll: !LIST_SURFACES.has(surface) };
+      const hint = Object.values(endpoints).some((v) => v) ? undefined : visibilityUnobservableHint(ctx, surface);
+      return { endpoints, requireAll: !LIST_SURFACES.has(surface), ...(hint ? { unobservableHint: hint } : {}) };
     });
   };
+}
+
+/**
+ * Why the fixture structurally cannot show on a list surface (read-only; only
+ * asked when no endpoint saw it). undefined = no known structural reason.
+ */
+function visibilityUnobservableHint(ctx: ProbeReaderContext, surface: string): string | undefined {
+  const id = ctx.fixture.id;
+  const one = (sql: string) => { try { return ctx.db.prepare(sql).get(id) as any; } catch { return undefined; } };
+  switch (surface) {
+    case "leaderboard": {
+      if (!one(`SELECT 1 AS x FROM agent_metrics WHERE agent_id = ?`)) return "testprodusenten har ingen rad i agent_metrics, så den kan ikke stå på /api/leaderboard";
+      return `testprodusenten er ikke i topp ${SWITCH_PROBE_LEADERBOARD_LIMIT} på /api/leaderboard i grunntilstanden`;
+    }
+    case "acp_feed": {
+      const n = Number(one(`SELECT COUNT(*) AS n FROM products WHERE agent_id = ? AND availability = 'in_stock'`)?.n ?? 0);
+      if (n === 0) return "testprodusenten har ingen vare på lager i feeden";
+      const k = one(`SELECT verification_status AS v FROM agent_knowledge WHERE agent_id = ?`);
+      if (k?.v !== "verified") return `testprodusentens varer er ikke i feeden (agent_knowledge.verification_status=${k?.v ?? "mangler"}, feeden krever verified)`;
+      return `testprodusentens ${n} vare(r) på lager er ikke i feeden i grunntilstanden`;
+    }
+    default:
+      return undefined;
+  }
 }
 
 function recipientDecision(ctx: ProbeReaderContext): { eligible: boolean; detail: string } {
@@ -1070,10 +1142,23 @@ async function awaitEffect(c: Ctx, def: SurfaceReaderDef, expected: boolean, ref
   }
 }
 
-function pushRow(c: Ctx, r: Omit<SwitchProbeRow, "result"> & { pass: boolean }): void {
-  const { pass, ...rest } = r;
-  let result: ProbeVerdict = pass ? "PASS" : "FAIL";
-  let reason = rest.reason;
+function isVisibilitySurface(s: string): boolean {
+  return VISIBILITY_SURFACES.includes(s);
+}
+
+function anyEndpoint(obs: SurfaceObservation): boolean {
+  return Object.values(obs.endpoints).some((v) => v);
+}
+
+function unobservableReason(surface: string, obs: SurfaceObservation | null): string {
+  return obs?.unobservableHint
+    ?? `testprodusenten vises ikke på ${surface} i grunntilstanden, der den skal være synlig${obs ? ` (${describe(obs)})` : ""}`;
+}
+
+function pushRow(c: Ctx, r: Omit<SwitchProbeRow, "result"> & { pass: boolean; notObservable?: string }): void {
+  const { pass, notObservable, ...rest } = r;
+  let result: ProbeRowResult = pass ? "PASS" : notObservable ? "NOT_OBSERVABLE" : "FAIL";
+  let reason = notObservable ?? rest.reason;
   if (result === "PASS" && rest.ms_to_effect !== null && rest.ms_to_effect > SWITCH_PROBE_EFFECT_MAX_MS) {
     result = "FAIL";
     reason = "tid til effekt over 60 min (cache)";
@@ -1101,9 +1186,21 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
   const surfaces = e.surfaces.filter((s) => c.readers[caseId(e.key, s)]);
   for (const s of e.surfaces) if (!c.readers[caseId(e.key, s)]) missingReaderRows(c, e, s, dirs);
   const refs = new Map<string, SurfaceObservation | null>();
+  /** Visibility surfaces that cannot see the fixture in the visible starting state → reason. */
+  const unobservable = new Map<string, string>();
   // Reference observation at the starting point (an "on" baseline names the endpoints that must show it again).
   if (baseline === true) {
-    for (const s of surfaces) refs.set(s, (await readSafe(c.readers[caseId(e.key, s)], c.readerCtx)).obs);
+    for (const s of surfaces) {
+      const def = c.readers[caseId(e.key, s)];
+      let ref = (await readSafe(def, c.readerCtx)).obs;
+      if (isVisibilitySurface(s) && ref && !anyEndpoint(ref)) {
+        // Not seen at the first read: give it the normal wait before calling it unobservable.
+        const again = await awaitEffect(c, def, true, null, Date.now());
+        if (again.obs) ref = again.obs;
+        if (!again.pass) unobservable.set(s, unobservableReason(s, again.obs ?? ref));
+      }
+      refs.set(s, ref);
+    }
   }
   for (const d of dirs) {
     const value = d === "on";
@@ -1115,6 +1212,17 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
     c.afterFlip?.(e.key, d);
     for (const s of surfaces) {
       const def = c.readers[caseId(e.key, s)];
+      const writeOk0 = w.kind === "ok" && logged !== false;
+      const why = unobservable.get(s);
+      if (why && writeOk0) {
+        // The surface cannot show the fixture even where it should: no evidence either way.
+        pushRow(c, {
+          key: e.key, surface: s, direction: d, pass: false, notObservable: why,
+          observed: `ikke observerbar: ${describe(refs.get(s)!)}`, expected: value ? "effekt til stede" : "effekt borte",
+          ms_to_effect: null, write_status: status, change_logged: logged, discriminating: false, reason: why,
+        });
+        continue;
+      }
       const ref = value ? refs.get(s) ?? null : null;
       const r = await awaitEffect(c, def, value, ref, t0);
       if (value && r.obs && !refs.get(s)) refs.set(s, r.obs);
@@ -1518,7 +1626,7 @@ export function dryRunSwitchProbe(agentId: string, opts: SwitchProbeOptions = {}
   const plan = planSwitchProbe(db, agentId, env, { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) });
   const result: SwitchProbeResult & { plan: SwitchProbePlan } = {
     ok: true, dry_run: true, agent_id: agentId, started_at: started, finished_at: new Date().toISOString(),
-    env_flags: plan.env_flags, rows: [], checks: [], pass: 0, fail: 0, restored: true, restore_diff: [], side_effects: [],
+    env_flags: plan.env_flags, rows: [], checks: [], pass: 0, fail: 0, not_observable: 0, restored: true, restore_diff: [], side_effects: [],
     ready_for_daniel_test: false, markdown: renderSwitchProbePlanMarkdown(plan, started), plan,
   };
   return result;
@@ -1605,6 +1713,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
   });
   const pass = c.rows.filter((r) => r.result === "PASS").length + c.checks.filter((x) => x.result === "PASS").length;
   const fail = c.rows.filter((r) => r.result === "FAIL").length + c.checks.filter((x) => x.result === "FAIL").length;
+  const notObservable = c.rows.filter((r) => r.result === "NOT_OBSERVABLE").length;
   const result: SwitchProbeResult = {
     ok: !error,
     dry_run: false,
@@ -1616,10 +1725,12 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     checks: c.checks,
     pass,
     fail,
+    not_observable: notObservable,
     restored,
     restore_diff: restoreDiff,
     side_effects: sideEffects,
-    ready_for_daniel_test: !error && fail === 0 && restored && c.rows.length > 0,
+    // NOT_OBSERVABLE is not PASS: it blocks readiness like a FAIL (reported apart).
+    ready_for_daniel_test: !error && fail === 0 && notObservable === 0 && restored && c.rows.length > 0,
     ...(error ? { error } : {}),
     markdown: "",
   };
@@ -1653,16 +1764,17 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
   lines.push(`# Mine valg — bryterprobe ${date}`, "");
   lines.push(`- Testprodusent: \`${r.agent_id}\``);
   lines.push(`- Start: ${r.started_at} · slutt: ${r.finished_at}`);
-  lines.push(`- Resultat: **${r.pass} PASS / ${r.fail} FAIL** — ${r.ready_for_daniel_test ? "100 % PASS: klar for `ready_for_daniel_test`" : "IKKE klar for `ready_for_daniel_test` (krever 100 % PASS)"}`);
+  lines.push(`- Resultat: **${r.pass} PASS / ${r.fail} FAIL / ${r.not_observable} IKKE OBSERVERBAR** — ${r.ready_for_daniel_test ? "100 % PASS: klar for `ready_for_daniel_test`" : "IKKE klar for `ready_for_daniel_test` (krever 100 % PASS; «ikke observerbar» teller ikke som PASS)"}`);
   lines.push(`- Gjenopprettet til startpunktet: ${r.restored ? "ja (eksakt)" : "NEI"}`);
   if (r.error) lines.push(`- Kjøringen ble avbrutt: ${cell(r.error)}`);
   lines.push("", "## Miljøflagg", "", "| Flagg | Verdi |", "|---|---|");
   for (const [k, v] of Object.entries(r.env_flags)) lines.push(`| ${k} | ${v === null ? "(ikke satt)" : cell(v)} |`);
   lines.push("", "## Bryter × flate × retning", "");
+  lines.push("«IKKE OBSERVERBAR»: flaten viser ikke testprodusenten selv i grunntilstanden der den skal være synlig, så ingen av retningene kan bevises (en «av»-rad ville bestått uten bevis). Raden er ikke PASS og stopper `ready_for_daniel_test` som en FAIL, men telles for seg: feilen ligger i hva proben kan se, ikke nødvendigvis i produktet.", "");
   lines.push("«Skiller» = nei: en avvist skriving (låst valg / løfte / bekreftelse på e-post) der flaten skal vise det samme før og etter. En leser som aldri endrer seg ville også bestått, så raden viser bare at skrivingen ble avvist, ikke at flaten reagerer på bryteren.", "");
   lines.push("| Nøkkel | Flate | Retning | Resultat | Skiller | Observert | Tid til effekt (ms) | Merknad |", "|---|---|---|---|---|---|---|---|");
   for (const row of r.rows) {
-    lines.push(`| ${row.key} | ${row.surface} | ${row.direction} | ${row.result} | ${row.discriminating ? "ja" : "nei"} | ${cell(row.observed)} | ${row.ms_to_effect ?? "—"} | ${cell(row.reason ?? "")} |`);
+    lines.push(`| ${row.key} | ${row.surface} | ${row.direction} | ${PROBE_RESULT_LABEL[row.result]} | ${row.discriminating ? "ja" : "nei"} | ${cell(row.observed)} | ${row.ms_to_effect ?? "—"} | ${cell(row.reason ?? "")} |`);
   }
   lines.push("", "## Ekstra kontroller", "", "| Kontroll | Resultat | Observert | Merknad |", "|---|---|---|---|");
   for (const ch of r.checks) lines.push(`| ${cell(ch.check)} | ${ch.result} | ${cell(ch.observed)} | ${cell(ch.reason ?? "")} |`);
@@ -1673,12 +1785,15 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
     for (const d of r.restore_diff) lines.push(`- ${d.table}: før ${cell(JSON.stringify(d.before))} · etter ${cell(JSON.stringify(d.after))}`);
   }
   lines.push("", "## FUNN TIL OPPFØLGING");
-  const fails = [...r.rows.filter((x) => x.result === "FAIL").map((x) => ({ id: `${x.key}-${x.surface}-${x.direction}`, text: `${x.key} × ${x.surface} (${x.direction}): ${x.reason ?? "FAIL"}` })),
-    ...r.checks.filter((x) => x.result === "FAIL").map((x) => ({ id: x.check, text: `${x.check}: ${x.reason ?? "FAIL"}` }))];
-  if (r.error) fails.unshift({ id: "run-aborted", text: `kjøringen ble avbrutt: ${r.error}` });
+  const fails: Array<{ id: string; text: string; prio: string }> = [
+    ...r.rows.filter((x) => x.result === "FAIL").map((x) => ({ id: `${x.key}-${x.surface}-${x.direction}`, text: `${x.key} × ${x.surface} (${x.direction}): ${x.reason ?? "FAIL"}`, prio: "P1" })),
+    ...r.checks.filter((x) => x.result === "FAIL").map((x) => ({ id: x.check, text: `${x.check}: ${x.reason ?? "FAIL"}`, prio: "P1" })),
+    ...r.rows.filter((x) => x.result === "NOT_OBSERVABLE").map((x) => ({ id: `${x.key}-${x.surface}-${x.direction}`, text: `${x.key} × ${x.surface} (${x.direction}): ikke observerbar — ${x.reason ?? ""}`, prio: "P2" })),
+  ];
+  if (r.error) fails.unshift({ id: "run-aborted", text: `kjøringen ble avbrutt: ${r.error}`, prio: "P1" });
   if (fails.length === 0) lines.push("- [FUNN] ingen");
   const slug = (s: string) => `bryterprobe-${s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`.slice(0, 80);
-  for (const f of fails) lines.push(`- [FUNN] ${slug(f.id)} · P1 · ${cell(f.text)} · første-sett: ${date} · gjentakelser: 1`);
+  for (const f of fails) lines.push(`- [FUNN] ${slug(f.id)} · ${f.prio} · ${cell(f.text)} · første-sett: ${date} · gjentakelser: 1`);
   lines.push("");
   return lines.join("\n");
 }
