@@ -919,6 +919,8 @@ import {
   hasBookingRequestEmail,
   setGardssalgBookingAdminBrake,
   gardssalgBookingStatus,
+  gardssalgBookingPausedByOwner,
+  GARDSSALG_NOT_TAKING_REQUESTS_TEXT,
 } from "../services/gardssalg-booking-gate";
 // dev-request 2026-09-16-opplevagent-en-setning-booking-via-ai: name →
 // provider resolution + requested-weekday guard + the shared honest-outcome
@@ -31704,6 +31706,21 @@ router.post("/book", async (req: Request, res: Response) => {
       paused: true,
       provider: providerInfo,
       message: BOOKING_NOT_ACTIVATED_MSG,
+    });
+    return;
+  }
+  // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-valg-
+  // gardssalg O1a): the owner's seasonal pause refuses a new request with the
+  // G1 item 7 line; the profile stays visible. Off unless
+  // OA_OWNER_FEATURES_ENABLED and the producer is allowlisted.
+  if (gardssalgBookingPausedByOwner(parsed.data.provider_id)) {
+    res.status(200).json({
+      success: false,
+      paused: true,
+      reason: "owner_paused",
+      provider: providerInfo,
+      message: GARDSSALG_NOT_TAKING_REQUESTS_TEXT.no,
+      message_en: GARDSSALG_NOT_TAKING_REQUESTS_TEXT.en,
     });
     return;
   }

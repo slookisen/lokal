@@ -9,7 +9,7 @@
 // the pilot.
 
 import { getDb } from "../database/init";
-import { OWNER_FEATURE_REGISTRY, findOwnerFeature, type OwnerFeatureEntry, type OwnerFeatureVertical } from "./registry";
+import { findOwnerFeature, ownerFeatureRegistryFor, type OwnerFeatureEntry, type OwnerFeatureVertical } from "./registry";
 
 export type RecordInterestResult =
   | { kind: "ok"; created: boolean }
@@ -24,7 +24,7 @@ export function recordOwnerFeatureInterest(
   actorDetail: string | null,
   opts: { db?: any; registry?: OwnerFeatureEntry[]; now?: Date } = {},
 ): RecordInterestResult {
-  const e = findOwnerFeature(key, opts.registry ?? OWNER_FEATURE_REGISTRY);
+  const e = findOwnerFeature(key, opts.registry ?? ownerFeatureRegistryFor(vertical));
   if (!e || e.status !== "coming_soon") return { kind: "not_planned" };
   const db = opts.db ?? getDb();
   const info = db
@@ -68,7 +68,8 @@ export function ownerFeatureInterestCounts(
   opts: { db?: any; registry?: OwnerFeatureEntry[] } = {},
 ): OwnerFeatureInterestCount[] {
   const db = opts.db ?? getDb();
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  // Per vertical (gårdssalg has its own registry); an unknown vertical reads as rfb.
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical === "gardssalg" ? "gardssalg" : "rfb");
   const rows = db
     .prepare(
       `SELECT key, COUNT(*) AS n, MIN(registered_at) AS first_at, MAX(registered_at) AS last_at

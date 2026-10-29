@@ -45,6 +45,18 @@
  * Every live entry that passes only via (d) or (e) is printed in the log so
  * the exemption stays visible.
  *
+ * GÅRDSSALG (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1a):
+ * the same rules 1–3 run over GARDSSALG_OWNER_FEATURE_REGISTRY, with a
+ * stricter reader rule — the gårdssalg keys reuse RFB key names, so a bare
+ * literal proves nothing. A live gårdssalg entry is read only by
+ *   (a') a key-taking lookup with the vertical "gardssalg" (featureOn("gardssalg",
+ *        …), gardssalgFeatureOn(…)) and the key as a string literal, or
+ *   (c)  its storage adapter,
+ * or structurally (d)/(e) as above. Rule 4 (the CI matrix) is RFB-only; the
+ * gårdssalg live surfaces are covered by the O1a suite and get their probe in
+ * O2. Every gårdssalg entry has verticals ["gardssalg"], and no gårdssalg
+ * text names Rett fra Bonden (O1 principle 9).
+ *
  * Pure static check: no DB, no env, no globals (importing the matrix suite
  * only reads its coverage map; the suite itself runs separately). Exported
  * runRegistryGovernanceS4Tests({log}) -> TestSummary; wired into tests/test.ts.
@@ -55,6 +67,9 @@ import * as fs from "fs";
 import * as path from "path";
 import * as ts from "typescript";
 import {
+  GARDSSALG_OWNER_FEATURE_GROUPS,
+  GARDSSALG_OWNER_FEATURE_KEYS,
+  GARDSSALG_OWNER_FEATURE_REGISTRY,
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_KEYS,
   OWNER_FEATURE_REGISTRY,
@@ -91,6 +106,7 @@ export const KEY_LOOKUPS: Record<string, number> = {
   resolveOwnerFeature: 2,
   setOwnerFeatureValue: 2,
   rfbFeatureOn: 1,
+  gardssalgFeatureOn: 1,
   getOwnerFeature: 0,
   findOwnerFeature: 0,
 };
@@ -100,7 +116,13 @@ export interface LookupCall {
   line: number;
   fn: string;
   key: string;
+  /** The vertical the lookup names (string-literal first argument, or the wrapper's own); null = unknown. */
+  vertical: string | null;
 }
+
+/** Lookups whose first argument is the vertical. */
+const VERTICAL_ARG_LOOKUPS = new Set(["featureOn", "featureValue", "resolveOwnerFeature", "setOwnerFeatureValue"]);
+const WRAPPER_VERTICAL: Record<string, string> = { rfbFeatureOn: "rfb", gardssalgFeatureOn: "gardssalg" };
 
 export interface SourceScan {
   /** String literals per file (relative to src/). */
@@ -145,7 +167,10 @@ export function scanSourceText(file: string, text: string, scan: SourceScan): vo
         const key = arg ? literalText(arg) : null;
         if (key !== null) {
           const line = sf.getLineAndCharacterOfPosition(arg!.getStart(sf)).line + 1;
-          scan.calls.push({ file, line, fn, key });
+          const vertical = VERTICAL_ARG_LOOKUPS.has(fn)
+            ? (node.arguments[0] ? literalText(node.arguments[0]) : null)
+            : (WRAPPER_VERTICAL[fn] ?? null);
+          scan.calls.push({ file, line, fn, key, vertical });
         }
       }
     }
@@ -270,6 +295,46 @@ export function checkLiveReaders(
       continue;
     }
     problems.push(`${e.key}: live entry has no reader in src/ (no lookup call, no key literal outside ${NON_READER_FILES.join(", ")}, no storage adapter)`);
+  }
+  return { problems, structural };
+}
+
+/**
+ * Rule 2 for a vertical whose keys reuse other verticals' names (gårdssalg):
+ * a live entry needs a lookup naming THIS vertical with the key literal, or a
+ * storage adapter; (d)/(e) as in checkLiveReaders. Bare literals do not count.
+ */
+export function checkLiveReadersForVertical(
+  registry: readonly OwnerFeatureEntry[],
+  scan: SourceScan,
+  vertical: string,
+): ReaderReport {
+  const byKey = new Map(registry.map((e) => [e.key, e] as const));
+  const callKeys = new Set(scan.calls.filter((c) => c.vertical === vertical).map((c) => c.key));
+  const directReader = (key: string): boolean => callKeys.has(key) || !!byKey.get(key)?.storage;
+  const problems: string[] = [];
+  const structural: string[] = [];
+  for (const e of registry) {
+    if (e.status !== "live") continue;
+    if (directReader(e.key)) continue;
+    if (e.type === "locked" && e.lockedWhen) {
+      const parent = byKey.get(e.lockedWhen);
+      if (parent && parent.status === "live" && directReader(parent.key)) {
+        structural.push(`${e.key} (locked, derived from ${parent.key})`);
+        continue;
+      }
+      problems.push(`${vertical}:${e.key}: live locked entry, but its parent ${e.lockedWhen} is not live or has no ${vertical} reader`);
+      continue;
+    }
+    if (e.type === "guarantee") {
+      if (e.default.owner === true) {
+        structural.push(`${e.key} (guarantee, fixed on)`);
+        continue;
+      }
+      problems.push(`${vertical}:${e.key}: live guarantee must default to ON for owners`);
+      continue;
+    }
+    problems.push(`${vertical}:${e.key}: live entry has no ${vertical} reader in src/ (no featureOn("${vertical}", …"${e.key}") / ${vertical}FeatureOn lookup, no storage adapter)`);
   }
   return { problems, structural };
 }
@@ -416,13 +481,53 @@ export async function runRegistryGovernanceS4Tests(opts: { log?: boolean } = {})
       console.info(`  note: live entries read only structurally (d/e): ${readers.structural.join(", ")}`);
     }
 
-    const unknown = checkUnknownLookupKeys(scan.calls, keys);
+    // Gårdssalg lookups are checked against their own keys below.
+    const unknown = checkUnknownLookupKeys(scan.calls.filter((c) => c.vertical !== "gardssalg"), keys);
     assertTrue(unknown.length === 0, `rule 3: no lookup with an unknown string-literal key (${scan.calls.length} literal-key calls checked)`, unknown);
 
     // ── Rule 4: CI matrix per live key × surface.
     const liveSurfaces = live.reduce((n, e) => n + e.surfaces.length, 0);
     const matrix = checkMatrixCoverage(OWNER_FEATURE_REGISTRY, OWNER_FEATURE_MATRIX_CASES);
     assertTrue(matrix.length === 0, `rule 4: every live surface (${liveSurfaces}) has a matrix case, no stale case (${OWNER_FEATURE_MATRIX_CASES.length} cases)`, matrix);
+
+    // ── Gårdssalg (O1a): rules 1–3 over the gårdssalg registry. ─────────────
+    const gsKeys = GARDSSALG_OWNER_FEATURE_KEYS as readonly string[];
+    const gsGroups = GARDSSALG_OWNER_FEATURE_GROUPS.map((g) => g.key as string);
+    const gsShape = checkEntryShape(GARDSSALG_OWNER_FEATURE_REGISTRY, gsKeys, gsGroups);
+    assertTrue(GARDSSALG_OWNER_FEATURE_REGISTRY.length === 34, `gardssalg: the registry has the 34 Vedlegg A entries (${GARDSSALG_OWNER_FEATURE_REGISTRY.length})`);
+    assertTrue(gsShape.length === 0, `gardssalg rule 1: all ${GARDSSALG_OWNER_FEATURE_REGISTRY.length} entries have NO+EN texts, group, default per segment, valid status`, gsShape);
+    const gsVertical = GARDSSALG_OWNER_FEATURE_REGISTRY.filter((e) => e.verticals.length !== 1 || e.verticals[0] !== "gardssalg").map((e) => e.key);
+    assertTrue(gsVertical.length === 0, "gardssalg: every entry has verticals [\"gardssalg\"]", gsVertical);
+    const rfbNamed = GARDSSALG_OWNER_FEATURE_REGISTRY
+      .filter((e) => /rett fra bonden/i.test(JSON.stringify([e.label, e.description, e.confirmOn ?? null, e.confirmOff ?? null, e.options ?? null])))
+      .map((e) => e.key);
+    assertTrue(rfbNamed.length === 0, "gardssalg: no entry text names Rett fra Bonden (principle 9)", rfbNamed);
+    const gsReaders = checkLiveReadersForVertical(GARDSSALG_OWNER_FEATURE_REGISTRY, scan, "gardssalg");
+    const gsLive = GARDSSALG_OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
+    assertTrue(gsReaders.problems.length === 0, `gardssalg rule 2: every live entry (${gsLive.length}) has a gardssalg reader in src/`, gsReaders.problems);
+    if (gsReaders.structural.length) console.info(`  note: gardssalg live entries read only structurally (d/e): ${gsReaders.structural.join(", ")}`);
+    // Self-check: a bare literal of a shared key name does not count for gårdssalg.
+    const gsFxScan: SourceScan = { literals: new Map(), calls: [] };
+    scanSourceText("fixture/gs.ts", [
+      `export const a = rfbFeatureOn(id, "fx.gs_rfb_only");`,
+      `export const b = gardssalgFeatureOn(id, "fx.gs_read");`,
+      `export const c = featureOn("gardssalg", id, "fx.gs_read2");`,
+      `export const d = ["fx.gs_literal"];`,
+    ].join("\n"), gsFxScan);
+    const gsFx = checkLiveReadersForVertical([
+      fx({ key: "fx.gs_rfb_only", status: "live" }), fx({ key: "fx.gs_read", status: "live" }),
+      fx({ key: "fx.gs_read2", status: "live" }), fx({ key: "fx.gs_literal", status: "live" }),
+    ], gsFxScan, "gardssalg");
+    assertTrue(
+      gsFx.problems.length === 2 && gsFx.problems.some((p) => p.startsWith("gardssalg:fx.gs_rfb_only:")) && gsFx.problems.some((p) => p.startsWith("gardssalg:fx.gs_literal:")),
+      "gardssalg self-check: an rfb lookup or a bare literal is not a gardssalg reader; gardssalgFeatureOn / featureOn(\"gardssalg\") are",
+      gsFx.problems,
+    );
+    const allKeys = [...new Set([...keys, ...gsKeys])];
+    const unknownAll = checkUnknownLookupKeys(scan.calls, allKeys);
+    assertTrue(unknownAll.length === 0, "gardssalg rule 3: no lookup with a key outside both registries", unknownAll);
+    const gsCallsWrongKey = scan.calls.filter((c) => c.vertical === "gardssalg" && !gsKeys.includes(c.key)).map((c) => `${c.file}:${c.line}: ${c.key}`);
+    assertTrue(gsCallsWrongKey.length === 0, "gardssalg rule 3: every gardssalg lookup names a gardssalg key", gsCallsWrongKey);
   } catch (err: any) {
     failed++;
     failures.push("unexpected error: " + String(err?.stack || err));

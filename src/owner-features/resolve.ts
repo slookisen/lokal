@@ -19,6 +19,7 @@ import { getDb } from "../database/init";
 import { customerRuleSql } from "../services/customer-rule";
 import {
   OWNER_FEATURE_REGISTRY,
+  ownerFeatureRegistryFor,
   UnknownOwnerFeatureError,
   getOwnerFeature,
   findOwnerFeature,
@@ -29,6 +30,7 @@ import {
   type OwnerFeatureValue,
   type OwnerFeatureVertical,
 } from "./registry";
+import { loadGardssalgSubjectFacts } from "./gardssalg-adapters";
 
 export type OwnerFeatureSource = "default" | "owner" | "admin" | "locked" | "killswitch";
 
@@ -54,6 +56,13 @@ export interface OwnerFeatureSubject {
   verifiedOwner: boolean;
   isVerifiedBadge: boolean;
   segment: "owner" | "unclaimed";
+  /**
+   * Per-subject condition state filled by the vertical's loader (gårdssalg:
+   * the booking address, the admin brake, who controls visibility). A
+   * condition listed here wins over the built-in evaluation; its reason
+   * (when given) is the one shown.
+   */
+  conditions?: Partial<Record<OwnerFeatureCondition, { met: boolean; reason?: LocalizedText }>>;
 }
 
 export interface OwnerFeatureOptions {
@@ -69,7 +78,7 @@ export interface ResolvedOwnerFeatures {
   byKey: Record<string, ResolvedOwnerFeature>;
 }
 
-export const OWNER_FEATURE_VERTICALS: readonly OwnerFeatureVertical[] = ["rfb"];
+export const OWNER_FEATURE_VERTICALS: readonly OwnerFeatureVertical[] = ["rfb", "gardssalg"];
 
 // ── Texts ──────────────────────────────────────────────────────────────────
 
@@ -85,6 +94,15 @@ const REASON_COMING_SOON: LocalizedText = { no: "Kommer snart.", en: "Coming soo
 const REASON_GUARANTEE: LocalizedText = {
   no: "Dette er et løfte fra Rett fra Bonden og kan ikke slås av.",
   en: "This is a promise from Rett fra Bonden and cannot be switched off.",
+};
+// Gårdssalg (Opplevagent): no text names Rett fra Bonden (O1 principle 9).
+const REASON_ADMIN_GARDSSALG: LocalizedText = {
+  no: "Låst av Opplevagent. Kontakt kontakt@opplevagent.no hvis du vil endre dette.",
+  en: "Locked by Opplevagent. Contact kontakt@opplevagent.no if you want to change this.",
+};
+const REASON_GUARANTEE_GARDSSALG: LocalizedText = {
+  no: "Dette er et løfte fra Opplevagent og kan ikke slås av.",
+  en: "This is a promise from Opplevagent and cannot be switched off.",
 };
 const REASON_NOT_APPLICABLE: LocalizedText = {
   no: "Gjelder bare profiler med bekreftet eier.",
@@ -110,6 +128,20 @@ const CONDITION_REASONS: Record<OwnerFeatureCondition, LocalizedText> = {
   drinkProducer: {
     no: "Gjelder bare drikkeprodusenter med gårdssalg.",
     en: "Only applies to drink producers with farm sales.",
+  },
+  // Gårdssalg: the loader normally supplies the exact reason (with the admin
+  // brake's note); these are the fallbacks.
+  bookingRequestEmail: {
+    no: "Krever en e-postadresse som besøksforespørslene kan sendes til. Ta kontakt med kontakt@opplevagent.no.",
+    en: "Requires an e-mail address the visit requests can be sent to. Contact kontakt@opplevagent.no.",
+  },
+  noBookingAdminBrake: {
+    no: "Booking er stanset av Opplevagent. Ta kontakt med kontakt@opplevagent.no.",
+    en: "Booking was stopped by Opplevagent. Contact kontakt@opplevagent.no.",
+  },
+  visibilityOwnerControlled: {
+    no: "Synligheten kan ikke endres herfra. Kontakt kontakt@opplevagent.no.",
+    en: "Visibility cannot be changed from here. Contact kontakt@opplevagent.no.",
   },
 };
 const CONDITIONS = new Set<string>(Object.keys(CONDITION_REASONS));
@@ -156,6 +188,19 @@ function assertVertical(vertical: string): asserts vertical is OwnerFeatureVerti
 
 export function loadOwnerFeatureSubject(vertical: OwnerFeatureVertical, subjectId: string, db: any): OwnerFeatureSubject {
   assertVertical(vertical);
+  if (vertical === "gardssalg") {
+    // experience_providers.id in experiences.db; owner = a live verified claim.
+    const f = loadGardssalgSubjectFacts(subjectId);
+    return {
+      vertical,
+      subjectId,
+      exists: f.exists,
+      verifiedOwner: f.verifiedOwner,
+      isVerifiedBadge: false,
+      segment: f.verifiedOwner ? "owner" : "unclaimed",
+      conditions: f.conditions,
+    };
+  }
   const row = db
     .prepare(`SELECT a.is_verified AS is_verified, ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
     .get(subjectId) as { is_verified: number | null; owned: number } | undefined;
@@ -204,6 +249,33 @@ class Resolver {
     private db: any,
   ) {}
 
+  reasonAdmin(): LocalizedText {
+    return this.subject.vertical === "gardssalg" ? REASON_ADMIN_GARDSSALG : REASON_ADMIN;
+  }
+
+  reasonGuarantee(): LocalizedText {
+    return this.subject.vertical === "gardssalg" ? REASON_GUARANTEE_GARDSSALG : REASON_GUARANTEE;
+  }
+
+  /** Is a non-key condition met for this subject? (loader state first) */
+  conditionState(c: OwnerFeatureCondition): { met: boolean; reason: LocalizedText } {
+    const given = this.subject.conditions?.[c];
+    if (given) return { met: given.met, reason: given.reason ?? CONDITION_REASONS[c] };
+    const met = c === "verifiedOwner" ? this.subject.verifiedOwner
+      : c === "isVerifiedBadge" ? this.subject.isVerifiedBadge
+      : false; // stripeActive / drinkProducer / gårdssalg conditions without loader state
+    return { met, reason: CONDITION_REASONS[c] };
+  }
+
+  /** First unmet `enableRequires` condition's reason (checked only when switching on), or null. */
+  unmetEnableRequirement(e: OwnerFeatureEntry): LocalizedText | null {
+    for (const c of e.enableRequires ?? []) {
+      const st = this.conditionState(c);
+      if (!st.met) return st.reason;
+    }
+    return null;
+  }
+
   segmentDefault(e: OwnerFeatureEntry): OwnerFeatureValue {
     return this.subject.segment === "owner" ? e.default.owner : e.default.unclaimed;
   }
@@ -225,11 +297,8 @@ class Resolver {
   unmetRequirement(e: OwnerFeatureEntry): LocalizedText | null {
     for (const r of e.requires) {
       if (CONDITIONS.has(r)) {
-        const c = r as OwnerFeatureCondition;
-        const met = c === "verifiedOwner" ? this.subject.verifiedOwner
-          : c === "isVerifiedBadge" ? this.subject.isVerifiedBadge
-          : false; // stripeActive / drinkProducer: wired by their own slices
-        if (!met) return CONDITION_REASONS[c];
+        const st = this.conditionState(r as OwnerFeatureCondition);
+        if (!st.met) return st.reason;
       } else if (this.resolve(r).value !== true) {
         return requiresKeyReason(getOwnerFeature(r, this.registry).label);
       }
@@ -261,13 +330,13 @@ class Resolver {
     if (envOn(this.env, e.killSwitch)) return fixed(offValue(e, d), "killswitch", "killswitch", REASON_KILLSWITCH);
     // 2. admin lock
     const s = this.stored.get(e.key);
-    if (s && s.admin_locked) return fixed(s.value, "admin", "admin_locked", REASON_ADMIN);
+    if (s && s.admin_locked) return fixed(s.value, "admin", "admin_locked", this.reasonAdmin());
     // 3. not changeable / requirements
     if (e.status === "coming_soon") return fixed(d, "default", "coming_soon", REASON_COMING_SOON);
     if (this.subject.segment === "unclaimed" && e.default.unclaimed === null) {
       return fixed(null, "locked", "not_applicable", REASON_NOT_APPLICABLE);
     }
-    if (e.type === "guarantee") return fixed(d, "locked", "guarantee", REASON_GUARANTEE);
+    if (e.type === "guarantee") return fixed(d, "locked", "guarantee", this.reasonGuarantee());
     if (e.type === "locked" && e.lockedWhen) {
       const label = getOwnerFeature(e.lockedWhen, this.registry).label;
       return this.resolve(e.lockedWhen).value === true
@@ -297,7 +366,7 @@ function makeResolver(vertical: OwnerFeatureVertical, subjectId: string, opts: O
   return new Resolver(
     subject,
     loadStoredSettings(vertical, subjectId, db),
-    opts.registry ?? OWNER_FEATURE_REGISTRY,
+    opts.registry ?? ownerFeatureRegistryFor(vertical),
     opts.env ?? process.env,
     db,
   );
@@ -310,7 +379,7 @@ export function resolveOwnerFeatures(
   opts: OwnerFeatureOptions = {},
 ): ResolvedOwnerFeatures {
   const r = makeResolver(vertical, subjectId, opts);
-  const features = (opts.registry ?? OWNER_FEATURE_REGISTRY).map((e) => r.resolve(e.key));
+  const features = (opts.registry ?? ownerFeatureRegistryFor(vertical)).map((e) => r.resolve(e.key));
   const byKey: Record<string, ResolvedOwnerFeature> = {};
   for (const f of features) byKey[f.key] = f;
   return { subject: r.subject, features, byKey };
@@ -329,11 +398,22 @@ export function resolveOwnerFeatureKeysForSubjects(
   opts: OwnerFeatureOptions = {},
 ): Map<string, Record<string, ResolvedOwnerFeature>> {
   assertVertical(vertical);
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   for (const key of keys) getOwnerFeature(key, registry);
   const ids = [...new Set(subjectIds)].filter((id) => typeof id === "string" && id.length > 0);
   const out = new Map<string, Record<string, ResolvedOwnerFeature>>();
   if (ids.length === 0) return out;
+  if (vertical !== "rfb") {
+    // Gårdssalg: one resolver per subject (the rows live in experiences.db).
+    for (const id of ids) {
+      const r = makeResolver(vertical, id, { ...opts, registry });
+      if (!r.subject.exists) continue;
+      const byKey: Record<string, ResolvedOwnerFeature> = {};
+      for (const key of keys) byKey[key] = r.resolve(key);
+      out.set(id, byKey);
+    }
+    return out;
+  }
   const db = opts.db ?? getDb();
   const rows = db
     .prepare(
@@ -383,7 +463,7 @@ export function resolveOwnerFeature(
   key: OwnerFeatureKey,
   opts: OwnerFeatureOptions = {},
 ): ResolvedOwnerFeature {
-  getOwnerFeature(key, opts.registry ?? OWNER_FEATURE_REGISTRY);
+  getOwnerFeature(key, opts.registry ?? ownerFeatureRegistryFor(vertical));
   return makeResolver(vertical, subjectId, opts).resolve(key);
 }
 
@@ -408,7 +488,7 @@ export function featureOn(
   key: OwnerFeatureKey,
   opts: OwnerFeatureOptions = {},
 ): boolean {
-  const e = getOwnerFeature(key, opts.registry ?? OWNER_FEATURE_REGISTRY);
+  const e = getOwnerFeature(key, opts.registry ?? ownerFeatureRegistryFor(vertical));
   if (!isBooleanType(e)) throw new TypeError(`featureOn(${key}): ${e.type} entry has no on/off value — use featureValue`);
   return makeResolver(vertical, subjectId, opts).resolve(key).value === true;
 }
@@ -419,6 +499,14 @@ export function rfbFeatureOn(agentId: string, key: OwnerFeatureKey, opts: OwnerF
 }
 export function resolveRfbOwnerFeatures(agentId: string, opts: OwnerFeatureOptions = {}): ResolvedOwnerFeatures {
   return resolveOwnerFeatures("rfb", agentId, opts);
+}
+
+/** Opplevagent gårdssalg convenience wrappers (subject = experience_providers.id). */
+export function gardssalgFeatureOn(providerId: string, key: OwnerFeatureKey, opts: OwnerFeatureOptions = {}): boolean {
+  return featureOn("gardssalg", providerId, key, opts);
+}
+export function resolveGardssalgOwnerFeatures(providerId: string, opts: OwnerFeatureOptions = {}): ResolvedOwnerFeatures {
+  return resolveOwnerFeatures("gardssalg", providerId, opts);
 }
 
 // ── Value validation ───────────────────────────────────────────────────────
@@ -492,7 +580,7 @@ export function setOwnerFeatureValue(
   actor: { actor: "owner" | "admin" | "cs" | "system"; detail?: string | null },
   opts: OwnerFeatureOptions = {},
 ): SetOwnerFeatureResult {
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const e = findOwnerFeature(key, registry);
   if (!e) return { kind: "unknown_key" };
   const db = opts.db ?? getDb();
@@ -500,7 +588,7 @@ export function setOwnerFeatureValue(
   // S2e: never a direct write, not even to the off value (the confirmation
   // flow owns the column).
   if (e.confirmByEmail) {
-    const exists = !!db.prepare("SELECT 1 AS x FROM agents WHERE id = ?").get(subjectId);
+    const exists = loadOwnerFeatureSubject(vertical, subjectId, db).exists;
     return exists ? { kind: "blocked", block: "confirm_by_email", reason: REASON_CONFIRM_BY_EMAIL } : { kind: "not_found" };
   }
 
@@ -515,7 +603,7 @@ export function setOwnerFeatureValue(
     if (!v.ok) return { kind: "invalid_value", reason: v.reason };
     const d = r.segmentDefault(e);
     if (!sameValue(v.value, offValue(e, d))) {
-      const unmet = r.unmetRequirement(e);
+      const unmet = r.unmetRequirement(e) ?? r.unmetEnableRequirement(e);
       if (unmet) return { kind: "blocked", block: "requirement_not_met", reason: unmet };
     }
 

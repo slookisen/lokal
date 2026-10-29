@@ -121,7 +121,12 @@ import {
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, G1 item 7: one
 // source for the booking note (discover_gardssalg) and the "not taking
 // requests now" line (book_gardssalg) for owned profiles that are off.
-import { gardssalgBookingStatus, gardssalgNotTakingRequestsText } from "../services/gardssalg-booking-gate";
+import {
+  gardssalgBookingStatus,
+  gardssalgNotTakingRequestsText,
+  gardssalgBookingPausedByOwner,
+  GARDSSALG_NOT_TAKING_REQUESTS_TEXT,
+} from "../services/gardssalg-booking-gate";
 // dev-request 2026-07-14-booking-flyt-v1, slice 1 ("myk åpningstidsvalidering")
 // — the SAME shared choke point POST /api/opplevelser/book and the no-JS SSR
 // fallback use, never re-derived here.
@@ -1479,6 +1484,31 @@ export function registerExperienceTools(
                   (notTaking ? notTaking.no : BOOKING_NOT_ACTIVATED_MSG) +
                   (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
                   (notTaking ? ` / ${notTaking.en}` : " / Booking is not activated for this producer yet.") +
+                  (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
+              }, null, 2),
+            }],
+          };
+        }
+
+        // «Mine valg» booking.pause (dev-request 2026-10-22-opplevagent-mine-
+        // valg-gardssalg O1a): the owner's seasonal pause — same not-taking
+        // line as above (G1 item 7). Off unless OA_OWNER_FEATURES_ENABLED and
+        // the producer is allowlisted.
+        if (gardssalgBookingPausedByOwner(parsed.data.provider_id)) {
+          const t = GARDSSALG_NOT_TAKING_REQUESTS_TEXT;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                pending: false,
+                rejected: true,
+                reason: "owner_paused",
+                provider: providerInfo,
+                message:
+                  (providerInfo?.navn ? `${providerInfo.navn}: ` : "") + t.no +
+                  (providerInfo?.profile_url ? ` Gjesten kan ta kontakt via profilsiden: ${providerInfo.profile_url}.` : "") +
+                  ` / ${t.en}` +
                   (providerInfo?.profile_url ? ` The guest can get in touch via the profile page: ${providerInfo.profile_url}.` : ""),
               }, null, 2),
             }],

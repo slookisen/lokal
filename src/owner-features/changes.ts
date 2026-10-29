@@ -10,7 +10,7 @@
 
 import { getDb } from "../database/init";
 import {
-  OWNER_FEATURE_REGISTRY,
+  ownerFeatureRegistryFor,
   findOwnerFeature,
   type LocalizedText,
   type OwnerFeatureEntry,
@@ -37,7 +37,7 @@ export type OwnerActor = { actor: "owner" | "admin" | "cs" | "system"; detail?: 
 // owner_feature_change_batch.level) read as «Ta imot bestillinger»; nothing
 // is rewritten and no switch changes because of the new model.
 
-export type OwnerLevelKey = "bare_synlig" | "ta_imot_bestillinger";
+export type OwnerLevelKey = "bare_synlig" | "ta_imot_bestillinger" | "ta_imot_besok";
 
 export interface OwnerLevel {
   key: OwnerLevelKey;
@@ -74,6 +74,44 @@ export const OWNER_LEVELS: OwnerLevel[] = [
     ],
   },
 ];
+
+/**
+ * Opplevagent gårdssalg (dev-request 2026-10-22-opplevagent-mine-valg-
+ * gardssalg, v2 principle 3): the same two honest levels, «Bare synlig» and
+ * «Ta imot besøk». «Full fart» does not exist here. A preset over live keys
+ * only (booking.enabled ↔ booking_live).
+ */
+export const GARDSSALG_OWNER_LEVELS: OwnerLevel[] = [
+  {
+    key: "bare_synlig",
+    label: { no: "Bare synlig", en: "Just visible" },
+    description: {
+      no: "Gjester og AI-assistenter finner deg og får kontaktinformasjonen din. Ingen forespørsler å svare på.",
+      en: "Guests and AI assistants find you and get your contact details. No requests to answer.",
+    },
+    recommended: false,
+    values: [
+      ["booking.enabled", false],
+    ],
+  },
+  {
+    key: "ta_imot_besok",
+    label: { no: "Ta imot besøk", en: "Accept visits" },
+    description: {
+      no: "Gjester og AI-assistenter kan be om å komme på besøk. Du svarer på e-post, og besøket skjer hos dere.",
+      en: "Guests and AI assistants can ask to visit you. You answer by e-mail, and the visit takes place at your premises.",
+    },
+    recommended: false,
+    values: [
+      ["booking.enabled", true],
+    ],
+  },
+];
+
+/** The levels for a vertical. */
+export function ownerLevelsFor(vertical: OwnerFeatureVertical): OwnerLevel[] {
+  return vertical === "gardssalg" ? GARDSSALG_OWNER_LEVELS : OWNER_LEVELS;
+}
 
 /** S2b level keys that are stored in owner_feature_change_batch.level → the v2 level they mean. */
 export const LEGACY_OWNER_LEVEL_ALIASES: Readonly<Record<string, OwnerLevelKey>> = {
@@ -131,9 +169,9 @@ export function previewOwnerLevel(
   levelKey: string,
   opts: OwnerLevelOptions = {},
 ): OwnerLevelPreview | null {
-  const level = findOwnerLevel(levelKey, opts.levels);
+  const level = findOwnerLevel(levelKey, opts.levels ?? ownerLevelsFor(vertical));
   if (!level) return null;
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   const before = resolveOwnerFeatures(vertical, subjectId, o);
@@ -188,7 +226,7 @@ export function currentOwnerLevel(
   resolved: ResolvedOwnerFeatures,
   opts: OwnerLevelOptions = {},
 ): OwnerLevelKey | "custom" | null {
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const matches = (l: OwnerLevel) => {
     const live = liveLevelValues(l, registry);
     return live.length > 0 && live.every(([e, v]) => sameValue(resolved.byKey[e.key]?.value, v));
@@ -212,7 +250,7 @@ export function currentOwnerLevel(
       levelKey = undefined; /* table missing → no owner choice known */
     }
   }
-  const chosen = levelKey ? findOwnerLevel(levelKey, opts.levels) : undefined;
+  const chosen = levelKey ? findOwnerLevel(levelKey, opts.levels ?? ownerLevelsFor(vertical)) : undefined;
   if (!chosen) return null;
   return matches(chosen) ? chosen.key : "custom";
 }
@@ -360,9 +398,9 @@ export function applyOwnerLevel(
   actor: OwnerActor,
   opts: OwnerLevelOptions = {},
 ): ApplyOwnerLevelResult {
-  const level = findOwnerLevel(levelKey, opts.levels);
+  const level = findOwnerLevel(levelKey, opts.levels ?? ownerLevelsFor(vertical));
   if (!level) return { kind: "unknown_level" };
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   return db.transaction((): ApplyOwnerLevelResult => {
@@ -430,7 +468,7 @@ export function undoOwnerChange(
   actor: OwnerActor,
   opts: OwnerFeatureOptions = {},
 ): UndoOwnerChangeResult {
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   try {
@@ -585,7 +623,7 @@ export function answerOwnerIntro(
   actor: OwnerActor,
   opts: OwnerFeatureOptions = {},
 ): { kind: "ok"; stored: boolean; applied: boolean; batchId: number | null } {
-  const registry = opts.registry ?? OWNER_FEATURE_REGISTRY;
+  const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const db = opts.db ?? getDb();
   const o = { ...opts, db, registry };
   return db.transaction(() => {
