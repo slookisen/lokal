@@ -43,6 +43,22 @@ export function resolveWindowMin(raw: string | undefined): number {
 }
 
 /**
+ * Extra lookback (minutes) for the dispatcher's run query on `finished_at`, so a run that
+ * STARTED more than an hour ago but FINISHED inside the freshness window is still seen
+ * (otherwise its next_suggested is never read and the self-continue chain dies after every
+ * run longer than ~60 min). Default = windowMin + 15. `DISPATCH_PLAN_FINISHED_LOOKBACK_MIN`
+ * (valid non-negative integer) overrides it; 0 disables the finished_at OR-part entirely
+ * (rollback without a deploy). Invalid input falls back to the default.
+ */
+export function resolveFinishedLookbackMin(raw: string | undefined, windowMin: number): number {
+  const def = windowMin + 15;
+  if (raw === undefined || raw.trim() === "") return def;
+  const t = raw.trim();
+  if (!/^\d+$/.test(t)) return def;
+  return Number(t);
+}
+
+/**
  * Parse `DISPATCH_TICK_INTERVAL_MIN` (dev-requests/2026-07-09-loop-dispatch-self-tick.md)
  * for the in-process dispatcher self-tick in src/index.ts. Missing / empty-string /
  * non-numeric input falls back to 10 (the design cadence from admin-loop-dispatch.ts's

@@ -118,6 +118,14 @@ export function listRecentRuns(opts: {
   vertical?: string;
   agent?: string;
   sinceHours?: number;
+  /**
+   * When > 0, also return runs that STARTED before the sinceHours cutoff but FINISHED
+   * within the last N minutes (`started_at >= ? OR finished_at >= ?`). Used by the
+   * loop-dispatcher, whose freshness is finished_at-based: a long run (started >1h ago)
+   * that just finished carries the next_suggested that keeps the chain alive.
+   * Unset/0 = original behaviour (started_at only).
+   */
+  finishedSinceMinutes?: number;
   limit?: number;
   db?: Database.Database;
 } = {}): RunRecord[] {
@@ -128,6 +136,11 @@ export function listRecentRuns(opts: {
 
   const where: string[] = ["started_at >= ?"];
   const params: unknown[] = [sinceISO];
+  if (opts.finishedSinceMinutes && opts.finishedSinceMinutes > 0) {
+    const finishedISO = new Date(Date.now() - opts.finishedSinceMinutes * 60_000).toISOString();
+    where[0] = "(started_at >= ? OR finished_at >= ?)";
+    params.push(finishedISO);
+  }
   if (opts.vertical) {
     where.push("vertical = ?");
     params.push(opts.vertical);
