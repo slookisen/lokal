@@ -18,7 +18,7 @@
 //   values, env flags), zero writes. Only an explicit `false` runs it.
 // A second run while one is going → 409 already_running.
 // Response: { ok, dry_run, agent_id, started_at, finished_at, rows, checks,
-// pass, fail, restored, restore_diff, env_flags, ready_for_daniel_test,
+// pass, fail, not_observable, restored, restore_diff, env_flags, ready_for_daniel_test,
 // markdown } (+ plan on a dry run). No e-mail is ever sent.
 
 import { Router, Request, Response } from "express";
@@ -82,7 +82,7 @@ router.post("/", async (req: Request, res: Response) => {
     if (dryRun) return res.json(dryRunSwitchProbe(sel.agentId, { db }));
     if (isSwitchProbeRunning()) return res.status(409).json({ ok: false, dry_run: false, error: "already_running" });
     const out = await runSwitchProbe(sel.agentId, { db, maxWaitMs: body.max_wait_ms as number | undefined });
-    console.log(`[switch-probe] agent=${sel.agentId} pass=${out.pass} fail=${out.fail} restored=${out.restored}${out.error ? " aborted" : ""}`);
+    console.log(`[switch-probe] agent=${sel.agentId} pass=${out.pass} fail=${out.fail} not_observable=${out.not_observable} restored=${out.restored}${out.error ? " aborted" : ""}`);
     return res.status(out.ok ? 200 : 500).json(out);
   } catch (e: any) {
     if (e instanceof SwitchProbeBusyError) return res.status(409).json({ ok: false, dry_run: false, error: "already_running" });
