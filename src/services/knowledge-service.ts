@@ -482,7 +482,12 @@ export function claimLimits(env: NodeJS.ProcessEnv = process.env): ClaimLimits {
 }
 
 /** Why a claim waits in the admin queue (agent_claims.review_reason). */
-export type ClaimReviewReason = "no_known_email" | "listed_email_wrong" | "has_owner";
+export type ClaimReviewReason = "no_known_email" | "listed_email_wrong" | "has_owner" | "shared_address";
+
+/** Slice 1b (shared address, "delt adresse"): at most this many candidate
+ *  profiles per source are re-checked by isSharedKnownEmail. Two confirmed
+ *  hits already decide it, so the cap only bounds the work. */
+const SHARED_EMAIL_CANDIDATES_MAX = 25;
 
 /** Which limit refused a request: a code send (rule 4 / the platform cap) or
  *  a new admin-queue entry (per profile / the platform cap). */
@@ -945,6 +950,53 @@ class KnowledgeService {
   }
 
   /**
+   * Slice 1b, shared address ("delt adresse"): is `address` (normalized like
+   * the claim code's recipient) the known farm e-mail — exactly what
+   * resolveFarmContactEmail returns — of MORE THAN ONE RFB profile? Then a
+   * code sent there would prove only that mailbox, not which farm, so the
+   * claim goes to the admin queue instead (requestClaim).
+   * Two parameterized queries find the candidates — profiles listing the
+   * address (agent_knowledge.email) and profiles RFB outreach was delivered
+   * to at it (outreach_sent_log.recipient_email) — and each candidate is
+   * confirmed with resolveFarmContactEmail itself, so "known e-mail" means
+   * the same here as in rule 1. RFB only: agents.vertical_id 'rfb' (dental
+   * and experiences live in their own databases). The outreach query fails
+   * soft like resolveFarmContactEmail's own (no table → no candidates); a
+   * failure of the listed-address query throws, and requestClaim's caller
+   * answers 500 — never a code.
+   */
+  isSharedKnownEmail(address: string): boolean {
+    const target = normalizeEmail(address);
+    if (!isSingleEmailAddress(target)) return false;
+    const db = getDb();
+    const candidates = new Set<string>();
+    const listed = db.prepare(
+      `SELECT k.agent_id AS id
+         FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+        WHERE LOWER(TRIM(k.email)) = ? AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+        LIMIT ?`
+    ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
+    for (const r of listed) candidates.add(r.id);
+    try {
+      const delivered = db.prepare(
+        `SELECT DISTINCT o.agent_id AS id
+           FROM outreach_sent_log o JOIN agents a ON a.id = o.agent_id
+          WHERE LOWER(TRIM(o.recipient_email)) = ? AND o.vertical_id = 'rfb' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
+          LIMIT ?`
+      ).all(target, SHARED_EMAIL_CANDIDATES_MAX) as Array<{ id: string }>;
+      for (const r of delivered) candidates.add(r.id);
+    } catch (err) {
+      console.warn(`[claim] shared-address outreach lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (candidates.size < 2) return false;
+    let hits = 0;
+    for (const id of candidates) {
+      if (this.resolveFarmContactEmail(id) === target && ++hits > 1) return true;
+    }
+    return false;
+  }
+
+  /**
    * The host of the profile's website when it comes from an INDEPENDENT
    * source — the only website the domain rule's P1 trusts (dev-request
    * 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste). agent_knowledge has
@@ -1127,9 +1179,16 @@ class KnowledgeService {
         else if (assessment.route === "p2_candidate" && opts.domainRule.httpsAnswered === true) domainRoute = "domain_code_sent";
       }
 
-      if (!domainRoute && (hasOwner || !farmEmail || opts.listedEmailWrong)) {
-        const reason: ClaimReviewReason = hasOwner ? "has_owner" : !farmEmail ? "no_known_email" : "listed_email_wrong";
-        const recommendation: ClaimRecommendation = assessment.recommendation;
+      // Slice 1b, shared address: before ANY code is sent (rule 1, P1, P2),
+      // the address it would go to must not be the known e-mail of more than
+      // one RFB profile — also when the claimant typed that address.
+      const queueByRule = !domainRoute && (hasOwner || !farmEmail || !!opts.listedEmailWrong);
+      const sharedAddress = !queueByRule && this.isSharedKnownEmail(domainRoute ? claimantEmail : farmEmail!);
+
+      if (queueByRule || sharedAddress) {
+        const reason: ClaimReviewReason = sharedAddress ? "shared_address"
+          : hasOwner ? "has_owner" : !farmEmail ? "no_known_email" : "listed_email_wrong";
+        const recommendation: ClaimRecommendation = sharedAddress ? "shared_address" : assessment.recommendation;
         const open = db.prepare(
           "SELECT id, review_reason FROM agent_claims WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'pending_review' LIMIT 1"
         ).get(agentId, claimantEmail) as { id: string; review_reason: ClaimReviewReason } | undefined;

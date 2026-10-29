@@ -41,7 +41,10 @@ export type ClaimRecommendation =
   | "domain_code_sent"
   | "free_mail_needs_extra"
   | "has_owner"
-  | "needs_review";
+  | "needs_review"
+  /** Slice 1b: the address the code would go to is the known e-mail of more
+   *  than one RFB profile (KnowledgeService.isSharedKnownEmail) → no code. */
+  | "shared_address";
 
 /** Norwegian text for the admin notice and the queue: the rule, and what
  *  Daniel can do about it. */
@@ -56,6 +59,8 @@ export const CLAIM_RECOMMENDATION_LABELS: Record<ClaimRecommendation, string> = 
     "P4: profilen har allerede en eier. Vurder manuelt; eieren beholder tilgangen.",
   needs_review:
     "Ingen regel slo til. Vurder manuelt mot uavhengige kilder (nettside, Brreg, Bondens marked, telefon).",
+  shared_address:
+    "Delt adresse: e-postadressen koden ville gått til, er kjent e-post på flere RFB-profiler. Ingen kode er sendt. Bekreft hvilken gård kravet gjelder (telefon, egen nettside, Brreg) før du godkjenner.",
 };
 
 /**

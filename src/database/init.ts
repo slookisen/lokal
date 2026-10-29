@@ -585,9 +585,9 @@ function initSchema(db: Database.Database): void {
       expires_at TEXT,                            -- Code expiry: 24 h (rows from before 2026-10-17: 7 days)
       code_sent_to TEXT,                          -- The farm's own address the code went to (NULL: no code sent)
       failed_attempts INTEGER DEFAULT 0,          -- Wrong codes entered; the 5th expires the claim
-      review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner'
+      review_reason TEXT,                         -- Admin queue: 'no_known_email' | 'listed_email_wrong' | 'has_owner' | 'shared_address'
       claimant_email_typed TEXT,                  -- Audit: the address the claimant typed, kept when claimant_email becomes the owner's address
-      recommendation TEXT                         -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review'
+      recommendation TEXT                         -- Claim domain rule (2026-10-27): 'domain_match_independent' | 'domain_code_sent' | 'free_mail_needs_extra' | 'has_owner' | 'needs_review' | 'shared_address' (2026-10-29: the code's address is the known e-mail of >1 RFB profile)
     );
 
     -- ════════════════════════════════════════════════════════════
