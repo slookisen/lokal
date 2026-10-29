@@ -431,7 +431,7 @@ export async function runOrganicClaimsS0Tests(opts: { log?: boolean } = {}): Pro
     assertTrue(vHtml.includes('class="badge badge-o"'), "verified-1: badge-o kept with debio_verified=1");
     assertTrue(vHtml.includes('class="prod-org"'), "verified-2: «🌱 Øko» product marker kept");
     const vInfo = (await restInfo(VERIFIED_ID)).body?.data;
-    assertEq(vInfo?.knowledge?.certifications?.[0], "✓ Debio-verifisert", "verified-3: «✓ Debio-verifisert» kept");
+    assertEq(vInfo?.knowledge?.certifications?.[0], "Debio-godkjent", "verified-3: «Debio-godkjent» kept (økologi S1: never «✓ Debio-verifisert»)");
     assertEq(vInfo?.knowledge?.products?.[0]?.organic, true, "verified-4: organic:true kept");
     assertTrue((vInfo?.knowledge?.specialties ?? []).includes("Økologiske grønnsaker"), "verified-5: specialties untouched");
     assertTrue(affChips(vHtml).includes("Demeter Norge"), "verified-6: certification-umbrella chip kept with Debio status");

@@ -23,7 +23,8 @@ import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText } from "../services/knowledge-service";
 import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
-import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices } from "../owner-features/enforce";
+import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
+import { debioApprovalText, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
@@ -4401,6 +4402,7 @@ const PROFILE_CSS = `
   .pf-header { max-width: 1100px; margin: 0 auto; padding: 20px 24px 0; display: grid; grid-template-columns: 1fr 340px; gap: 28px; align-items: start; }
   .pf-hero { padding: 28px 0; }
   .pf-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .pf-debio { margin: -4px 0 10px; font-size: .85rem; }
   .pf-name { font-size: 2.2rem; font-weight: 800; letter-spacing: -1px; line-height: 1.15; margin-bottom: 6px; }
   .pf-loc { display: flex; align-items: center; gap: 6px; font-size: 0.95rem; color: var(--g500); margin-bottom: 14px; }
   .pf-answer { font-size: 1.05rem; font-weight: 600; color: var(--charcoal); line-height: 1.6; max-width: 580px; margin-bottom: 6px; }
@@ -5366,7 +5368,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     // withGoogleRating: the profile stat reads it, RATING_DISPLAY_MODE decides (S4-A1a).
-    const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true });
+    // Økologi S1.7: the owner's auto.debio switch off → no organic display at
+    // all (getAgentInfo then filters as for a producer without status).
+    const debioSwitchOff = debioSwitchOffAgentIds([agent.id]).has(agent.id);
+    const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true, debioSwitchOff });
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's
     // contact / price / stats choices (null = not enforced, page as before).
     const ownerChoices = publicFieldChoices(agent.id);
@@ -5862,7 +5867,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // register-og-tekstrevisjon): «🌱 Økologisk» only for a valid Debio
     // status (until S1: agents.debio_verified = 1) — never from a substring
     // of the certification texts, which made «Hevder økologisk» show it.
-    if (info?.agent.debioVerified === true) badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
+    // Økologi S1 (AC1.5): the badge reads «Debio-godkjent»; a register-checked
+    // producer also gets «Godkjent av Debio for {hovedproduktgruppe(r)} —
+    // sjekket {dato}» linking to Debio's own search. Never «✓ Debio-
+    // verifisert», never the Ø-mark or the EU logo.
+    let debioApprovalHtml = "";
+    if (info?.agent.debioVerified === true) {
+      badges.push(`<span class="badge badge-o">&#127793; ${escapeHtml(t(lang, "producer.badge_organic"))}</span>`);
+      const dr = readDebioStatusRow(getDb(), agent.id);
+      if (dr?.debio_status === "okologisk") {
+        debioApprovalHtml = `<p class="pf-debio"><a href="${escapeHtml(finnokoSearchUrl(String(agent.name || "")))}" target="_blank" rel="noopener">${escapeHtml(debioApprovalText(lang, dr.debio_product_groups, dr.debio_checked_at))}</a></p>`;
+      }
+    }
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(catLabel(c, lang))}</span>`));
 
     // Contact items
@@ -6532,6 +6548,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     <div class="pf-header">
       <div class="pf-hero">
         <div class="pf-badges">${badges.join("")}</div>
+        ${debioApprovalHtml}
         ${updatedAtDate ? `<p class="profile-meta"><time datetime="${updatedAtDate.toISOString()}" class="updated-at">${escapeHtml(t(lang, "producer.updated_prefix"))} ${escapeHtml(formatUpdatedPretty(updatedAtDate, lang))}</time></p>` : ""}
         <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(formatAddressLine(k.address || cityName, k.postalCode, k.address ? cityName : undefined))}</div>` : ""}

@@ -4,7 +4,8 @@ import { getDb } from "../database/init";
 import { isDisplayablePhone, validatePhoneForWrite, stripTrailingContactLabel, stripLeadingContactLabel } from "./contact-normalizer";
 import { isJunkDescription, normalizeProse } from "./description-quality";
 import { textEntries } from "../utils/text-entries";
-import { isDebioVerifiedValue, productsWithoutOrganicFlag, stripOrganicEntries } from "./organic-claims";
+import { productsWithoutOrganicFlag, stripOrganicEntries } from "./organic-claims";
+import { debioStatusShown } from "./debio-approval";
 import { normalizeEmail } from "./blocklist-service";
 import { customerRuleSql } from "./customer-rule";
 import {
@@ -27,8 +28,9 @@ import {
 // the deploy.
 //
 // This helper rewrites the OUTGOING API representation so:
-//   - debio_verified=1 → ensure "✓ Debio-verifisert" appears in the list
-//                        (drop any stale "Debio-sertifisert" / "Debio")
+//   - debio_verified=1 → ensure "Debio-godkjent" appears in the list
+//                        (drop any stale "Debio-sertifisert" / "Debio").
+//                        Økologi S1 (AC1.5): never «✓ Debio-verifisert».
 //   - debio_verified=0 → no organic label at all. Økologi S0 (A2A
 //                        dev-request 2026-10-28-rfb-okologisk-merking-debio-
 //                        register-og-tekstrevisjon): «økologisk» is a legally
@@ -56,7 +58,7 @@ export function relabelCertifications(
     if (isDebioClaim(item) || isOrganicClaim(item)) continue; // re-emitted below
     out.push(item);
   }
-  out.unshift("✓ Debio-verifisert");
+  out.unshift("Debio-godkjent");
   return out;
 }
 
@@ -592,7 +594,7 @@ class KnowledgeService {
   // 2026-10-17.md §4.2). Only the site's own pages ask for it with
   // withGoogleRating, and RATING_DISPLAY_MODE (structured-data-policy.ts)
   // decides whether they show it.
-  getAgentInfo(agentId: string, opts: { withGoogleRating?: boolean; ownerView?: boolean } = {}): AgentInfoResponse | null {
+  getAgentInfo(agentId: string, opts: { withGoogleRating?: boolean; ownerView?: boolean; debioSwitchOff?: boolean } = {}): AgentInfoResponse | null {
     const db = getDb();
     const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as any;
     if (!agent) return null;
@@ -606,7 +608,11 @@ class KnowledgeService {
     // PR-95: debio_verified is set by the daily finnoko.debio.no sync
     // service. Older databases pre-migration may not have the column —
     // treat absence/NULL as 0.
-    const debioVerified = isDebioVerifiedValue(agent.debio_verified);
+    // Økologi S1: a register-checked status counts only for «okologisk» with
+    // a valid certificate while the register sync is fresh (≤ 7 days).
+    // `debioSwitchOff`: the owner's auto.debio is off (profile page) — no
+    // organic display at all, own claims included.
+    const debioVerified = !opts.debioSwitchOff && debioStatusShown(agent, db);
     // Økologi S0: without a valid Debio status no organic claim reaches a
     // public reader — organic words out of certifications/specialties,
     // products[].organic read as false (organic-claims.ts). Read-side only;

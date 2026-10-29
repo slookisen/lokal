@@ -330,7 +330,7 @@ export async function runKnowledgeServiceTypeGuardsTests(opts: { log?: boolean }
     assertEq(relabelCertifications([7, null, { x: 1 }, ["Debio"], " Nyt Norge ", "", "Debio-sertifisert"], false),
       ["Nyt Norge"],
       "relabelCertifications: numbers, null, objects and lists are skipped (used to throw on `.trim()`)");
-    assertEq(relabelCertifications([7, " Nyt Norge "], true), ["✓ Debio-verifisert", "Nyt Norge"],
+    assertEq(relabelCertifications([7, " Nyt Norge "], true), ["Debio-godkjent", "Nyt Norge"],
       "relabelCertifications: the verified label is still prepended");
     assertEq(relabelCertifications("Debio-sertifisert", false), [],
       "relabelCertifications: a list stored as one string is one entry (it used to be dropped)");
