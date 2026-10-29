@@ -46,6 +46,7 @@ import {
   type OwnerLevelPreview,
 } from "./changes";
 import type { OwnerStats } from "../services/owner-stats-service";
+import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -120,8 +121,7 @@ export interface OwnerPageGardssalgStats {
 }
 
 /** Daniel 29.10, verbatim (O1 «Prisbudskapet»): used at «Ta imot besøk». */
-export const OWNER_PAGE_PRICE_MESSAGE =
-  "Det koster ingenting i dag. Innfører vi provisjon på besøk, får du beskjed minst 30 dager før, og du kan slå av besøk når som helst.";
+export const OWNER_PAGE_PRICE_MESSAGE = OPPLEVAGENT_PRICE_MESSAGE;
 /** The gårdssalg row that carries the visit explanation, the price message and the prerequisite check. */
 export const OWNER_PAGE_BOOKING_KEY = "booking.enabled";
 

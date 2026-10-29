@@ -274,6 +274,7 @@ import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-p
 // of re-implementing it here.
 import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
 import { capFreeText, capName } from "../utils/free-text";
+import { OPPLEVAGENT_PRICE_MESSAGE } from "../owner-features/price-message";
 
 const router = Router();
 
@@ -7093,7 +7094,8 @@ ${BROWSE_CSS}
 // time-guarded via visitTimeReached() — "bekreft oppmøte" only after the
 // visit — while "angre" (undo, back to reserved) is always available so a
 // mis-click on «Ikke møtt» is never permanent (billable/commission hangs on
-// this). Confirmed attendance counts toward the commission base.
+// this). The page itself only says that attendance is registered, plus the
+// price message (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b).
 const BEKREFT_STATUS_LABEL: Record<string, string> = {
   reserved: "Reservert — oppmøte ikke registrert ennå",
   confirmed_attended: "Oppmøte bekreftet",
@@ -7206,7 +7208,8 @@ ${BROWSE_CSS}
       ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
     ${actionsHtml}
-    <p class="hint">Denne siden er for produsenten. Bekreftet oppmøte regnes med i provisjonsgrunnlaget; «Ikke møtt» holdes utenfor. Lenken er personlig for denne reservasjonen.</p>
+    <p class="hint">Denne siden er for produsenten. Oppmøtet blir registrert. Lenken er personlig for denne reservasjonen.</p>
+    <p class="hint" data-price-message="1">${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)}</p>
   </div>
 </main>
 </body>
@@ -10177,7 +10180,7 @@ router.get("/slik-fungerer-det", (_req: Request, res: Response) => {
       <li><b>2. Dere får forespørselen</b><span>På e-posten deres, med navn, tidspunkt og antall.</span></li>
       <li><b>3. Dere bekrefter selv</b><span>Ingenting er avtalt før dere har sagt ja. Dere kan foreslå et annet tidspunkt eller avslå.</span></li>
     </ol>
-    <div class="sf-note"><b>Det koster ingenting.</b> Verken profilen, overtakelsen eller påmeldingene. Vi tar ikke betalt fra gjesten og tar ingen andel av et salg — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
+    <div class="sf-note" data-price-message="1"><b>Hva koster det?</b> ${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)} Vi tar ikke betalt fra gjesten — Opplevagent håndterer ikke betaling i det hele tatt, og selger ikke alkohol. Systemet avtaler et besøk; alt annet skjer hos dere.</div>
   </section>
 
   <section class="ft-section" aria-labelledby="sf-lov-h">

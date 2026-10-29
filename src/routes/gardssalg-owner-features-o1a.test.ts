@@ -227,7 +227,7 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       const portalOff = await req("GET", "/kategori/gardssalg/eier/testgard/portal", cookie("tok-test"));
       assertEq(portalOff.status, 200, "f1: portal opens with the flag off");
       assertTrue(!portalOff.body.includes("data-mine-valg"), "f2: flag off → no «Mine valg» card in the portal");
-      assertTrue(portalOff.body.includes('id="f-booking"'), "f3: flag off → the portal booking checkbox is still there (O1b removes it)");
+      assertTrue(portalOff.body.includes('id="f-booking"'), "f3: flag off → the portal booking checkbox is still there (O1b removes it only while the tab is open)");
       // Byte-identical with the flag off: the card slot adds no line and no
       // whitespace — the profile card follows the header card exactly as on main.
       assertTrue(/\n      <\/div>\n      <div class="gc-card">\n        <h2>Profilinformasjon<\/h2>/.test(portalOff.body), "f3b: flag off → the portal markup around the card slot is exactly as before (no extra line)");
@@ -247,7 +247,16 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       assertEq(bookingLive("o1-test"), 0, "f15: refused calls wrote nothing");
       const portalOn = await req("GET", "/kategori/gardssalg/eier/testgard/portal", cookie("tok-test"));
       assertTrue(portalOn.body.includes('data-mine-valg="1"') && portalOn.body.includes('href="/kategori/gardssalg/eier/testgard/valg"'), "f16: tab open → the portal links to «Mine valg»");
-      assertEq(portalOn.body.replace(/<div class="gc-card" data-mine-valg="1">[\s\S]*?<\/div>\s*<\/div>/, ""), portalOff.body, "f16b: the only portal difference with the tab open is the «Mine valg» card");
+      // O1b (principle 7) changed this: with the tab open the portal also
+      // drops the booking checkbox and the pause card for a pointer to «Mine
+      // valg» (covered in gardssalg-owner-features-o1b.test.ts). What stays
+      // from O1a: the card is added and the profile text form is unchanged.
+      const profileForm = (body: string) => {
+        const start = body.indexOf('<form id="gc-profile-form"');
+        return start < 0 ? "" : body.slice(start, body.indexOf("</div>", body.indexOf('id="f-website"', start)));
+      };
+      assertTrue(profileForm(portalOn.body).length > 0, "f16a: the profile form is there with the tab open");
+      assertEq(profileForm(portalOn.body), profileForm(portalOff.body), "f16b: with the tab open the profile text fields are exactly as with the flag off (O1b: booking checkbox and pause card moved to «Mine valg»)");
       const portalReal = await req("GET", "/kategori/gardssalg/eier/ektegard/portal", cookie("tok-real"));
       assertTrue(portalReal.status === 200 && !portalReal.body.includes("data-mine-valg"), "f17: a real producer's portal gets no link");
 
