@@ -50,7 +50,7 @@ const ALLOW_ENV = "OWNER_FEATURES_ALLOWED_SUBJECTS";
 const SAVED_ENV = [
   ALLOW_ENV, "OWNER_VERIFIED_OWNER_GATE_ENABLED", "OWNER_UNIFIED_SESSION_ENABLED", "OWNER_PAUSE_ENABLED",
   "OWNER_ORDER_EMAIL_ENABLED", "OWNER_FEATURES_ENFORCE", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY",
-  "ORDER_REMINDER_HOURS", "ORDER_AUTOCANCEL_HOURS",
+  "ORDER_REMINDER_HOURS", "ORDER_AUTOCANCEL_HOURS", "ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", "ORDER_CAP_NOTICE_ENABLED",
 ];
 const OWNED_ID = "s2e-owned";
 const EMPTY_ID = "s2e-empty";
@@ -442,6 +442,19 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       assertTrue(r2.includes("påminnelse etter 12 timer") && r2.includes("etter 48 timer"), "AC28: the timings come from the real follow-up config");
       setEnv("ORDER_REMINDER_HOURS", null);
       setEnv("ORDER_AUTOCANCEL_HOURS", null);
+      // B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+      // the explanation names the daily cap, read from the configuration.
+      setEnv("ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", null);
+      const c10 = row(await pageHtml(OWNED_ID), "orders.enabled");
+      assertTrue(c10.includes("Du kan få inntil 10 bestillinger per døgn.") && c10.includes(`data-order-cap="10"`), "B4: the explanation names the default daily cap (10)");
+      assertTrue(!c10.includes("én samlet e-post"), "B4: no digest promise while ORDER_CAP_NOTICE_ENABLED is off");
+      setEnv("ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", "7");
+      setEnv("ORDER_CAP_NOTICE_ENABLED", "1");
+      const c7 = row(await pageHtml(OWNED_ID), "orders.enabled");
+      assertTrue(c7.includes("Du kan få inntil 7 bestillinger per døgn.") && !c7.includes("inntil 10"), "B4: cap 7 in the configuration → the text says 7");
+      assertTrue(c7.includes("kunden får kontaktinformasjonen din i stedet, og du får én samlet e-post om det dagen etter."), "B4: with the notice on, the text names the daily digest");
+      setEnv("ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", null);
+      setEnv("ORDER_CAP_NOTICE_ENABLED", null);
       const withFaq = pg.renderOwnerFeaturesPageBody({
         agent: { id: OWNED_ID, name: "Gard" }, resolved: rs.resolveOwnerFeatures("rfb", OWNED_ID, { db }), level: null, showIntro: false,
         notice: null, confirm: null, levelPreview: null, log: { rows: [], page: 1, pages: 1, total: 0 },

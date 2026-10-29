@@ -21,8 +21,9 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { isEligibleForRealOrder } from "../services/cart-service";
+import { isEligibleForRealOrder, orderCapNewPerDay, orderCapOpenPerBuyer } from "../services/cart-service";
 import { orderReminderHours, listAutoCompleteDue } from "../services/order-followups";
+import { isOrderCapNoticeEnabled, listOrderCapStats } from "../services/order-cap-notice";
 import { isOrderAutocompleteEnabled, orderAutocompleteSinceMs } from "../services/order-lifecycle";
 
 const router = Router();
@@ -223,6 +224,33 @@ router.get("/pilot-status", (req: Request, res: Response) => {
         order_ids: dueNow.slice(0, 50),
       },
       unanswered: { over_hours: hours, count: unanswered.length, orders: unanswered },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+// ─── GET /cap-stats ─────────────────────────────────────────────────────────
+// B4 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+// how many submits the F8 spam caps turned into contact handoffs, per
+// producer per Europe/Oslo day (?days=1..365, default 30), and whether that
+// day's producer digest was sent. Counts and producer names only — no buyer
+// data. Same 401 convention as /pilot-status.
+router.get("/cap-stats", (req: Request, res: Response) => {
+  if (!requirePilotAdmin(req, res)) return;
+  try {
+    const db = _adminOrdersTestDb ?? getDb();
+    const days = Number(req.query.days) || 30;
+    const rows = listOrderCapStats({ days, db });
+    res.json({
+      success: true,
+      notice_enabled: isOrderCapNoticeEnabled(),
+      caps: { new_per_producer_per_day: orderCapNewPerDay(), open_pending_per_buyer: orderCapOpenPerBuyer() },
+      window_days: Math.min(Math.max(Math.floor(days), 1), 365),
+      total_producer_daily_cap: rows.reduce((n, r) => n + r.producer_daily_cap, 0),
+      total_buyer_open_cap: rows.reduce((n, r) => n + r.buyer_open_cap, 0),
+      days: rows,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

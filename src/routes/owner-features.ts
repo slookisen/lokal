@@ -35,11 +35,12 @@ import { publicStatsMinViews } from "../services/public-stats-threshold";
 import { slugify } from "../utils/slug";
 import { findOwnerFeature } from "../owner-features/registry";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
-import { countOrderableProducts } from "../services/cart-service";
+import { countOrderableProducts, orderCapNewPerDay } from "../services/cart-service";
 import { ownerOrderabilityPortalEnabled } from "../services/owner-orderability";
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
 import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
+import { isOrderCapNoticeEnabled } from "../services/order-cap-notice";
 
 // ─────────────────────────────────────────────────────────────────
 // «Mine valg» owner API — dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2a
@@ -474,7 +475,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       orderEmail,
       pauseUntil: resolvedKey("visibility.profile")?.value === false ? currentPauseUntil(agentId) : null,
       ordersReadMoreUrl: ORDERS_FAQ_URL,
-      orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours() },
+      orderTimings: { reminderHours: orderReminderHours(), autocancelHours: orderAutocancelHours(), dailyCap: orderCapNewPerDay(), capNotice: isOrderCapNoticeEnabled() },
       stats: ownerPageStats(agent.id, String(agent.name || ""), db),
       statsHref: ownerStatsHref(agent.id),
     });

@@ -37225,6 +37225,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("owner-orders-b3-hentet: unexpected error: " + String(err?.message || err));
   }
+  // B4 (dagsgrense-varsel, dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier) — own in-memory DB.
+  try {
+    const { runOrderCapNoticeB4Tests } = require("../src/routes/order-cap-notice-b4.test") as
+      typeof import("../src/routes/order-cap-notice-b4.test");
+    const b4 = await runOrderCapNoticeB4Tests({ log: false });
+    passed += b4.passed;
+    failed += b4.failed;
+    for (const f of b4.failures) failures.push("order-cap-notice-b4: " + f);
+    console.log(`  order-cap-notice-b4: ${b4.passed} passed, ${b4.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("order-cap-notice-b4: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as

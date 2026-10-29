@@ -27,6 +27,7 @@ import { isBlocked } from "./blocklist-service";
 import { isCategoryLabel } from "../utils/category-label";
 import { classifyCartItemBan, banErrorText, BAN_CHECK_FAILED_ERROR, type BannedItemKind } from "./cart-item-ban";
 import { summarizePricing } from "./order-pricing";
+import { isOrderCapNoticeEnabled, orderCapHandoffFields, recordOrderCapEvent, type OrderCapReason } from "./order-cap-notice";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -1123,6 +1124,15 @@ export interface ContactHandoff {
   email: string | null;
   profile_url: string;
   message: string;
+  /**
+   * B4 (ORDER_CAP_NOTICE_ENABLED only): present when a spam cap (F8) turned
+   * this producer's order into a handoff. cap_notice is the buyer text
+   * (order-cap-notice.ts orderCapBuyerNotice, Norwegian).
+   */
+  cap_reached?: true;
+  cap_reason?: OrderCapReason;
+  cap?: number;
+  cap_notice?: string;
 }
 
 export type SubmitResult =
@@ -1213,29 +1223,34 @@ function envPositiveInt(name: string, dflt: number): number {
 export function orderCapOpenPerBuyer(): number { return envPositiveInt("ORDER_CAP_OPEN_PENDING_PER_BUYER", 3); }
 export function orderCapNewPerDay(): number { return envPositiveInt("ORDER_CAP_NEW_PER_PRODUCER_PER_DAY", 10); }
 
-function orderCapReached(db: any, agentId: string, contact?: SubmitContactInput): boolean {
+/**
+ * Which cap (if any) turns this producer's order into a handoff (B4: the
+ * reason and the limit are reported to the buyer and counted for the
+ * producer's daily digest, see order-cap-notice.ts). null = no cap reached.
+ */
+function orderCapReached(db: any, agentId: string, contact?: SubmitContactInput): { reason: OrderCapReason; cap: number } | null {
   try {
     const perDay = db.prepare(
       "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND created_at >= datetime('now', '-1 day')"
     ).get(agentId) as { n: number };
-    if (perDay.n >= orderCapNewPerDay()) return true;
+    if (perDay.n >= orderCapNewPerDay()) return { reason: "producer_daily_cap", cap: orderCapNewPerDay() };
     const email = (contact?.buyer_email || "").trim().toLowerCase();
     const phone = (contact?.buyer_phone || "").replace(/\s+/g, "");
     if (email) {
       const open = db.prepare(
         "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending' AND lower(buyer_email) = ?"
       ).get(agentId, email) as { n: number };
-      if (open.n >= orderCapOpenPerBuyer()) return true;
+      if (open.n >= orderCapOpenPerBuyer()) return { reason: "buyer_open_cap", cap: orderCapOpenPerBuyer() };
     } else if (phone) {
       const open = db.prepare(
         "SELECT COUNT(*) AS n FROM orders WHERE agent_id = ? AND status = 'pending' AND replace(buyer_phone, ' ', '') = ?"
       ).get(agentId, phone) as { n: number };
-      if (open.n >= orderCapOpenPerBuyer()) return true;
+      if (open.n >= orderCapOpenPerBuyer()) return { reason: "buyer_open_cap", cap: orderCapOpenPerBuyer() };
     }
-    return false;
+    return null;
   } catch {
     // A cap that cannot be read must not block a real buyer.
-    return false;
+    return null;
   }
 }
 
@@ -1440,10 +1455,16 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
 
   // F8: per-producer spam cap. A producer over the cap gets a contact handoff
   // instead of one more order (no order row, no e-mail).
+  // B4: the cap and its reason are kept per producer — recorded for the
+  // producer's daily digest and admin count, and (ORDER_CAP_NOTICE_ENABLED)
+  // told to the buyer on the handoff.
+  const cappedAgents = new Map<string, { reason: OrderCapReason; cap: number }>();
   for (const agent_id of Array.from(eligibleAgentIds)) {
-    if (orderCapReached(db, agent_id, contact)) {
+    const capHit = orderCapReached(db, agent_id, contact);
+    if (capHit) {
       eligibleAgentIds.delete(agent_id);
       ineligibleAgentIds.add(agent_id);
+      cappedAgents.set(agent_id, capHit);
     }
   }
 
@@ -1666,9 +1687,17 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
 
   // Built AFTER the transaction committed (cart_handoffs rows already
   // written inside it) — this only reads agent contact info, no writes.
-  const contact_handoffs: ContactHandoff[] = Array.from(handoffByAgent.entries()).map(([agent_id, v]) =>
-    buildContactHandoff(agent_id, v.name, v.lines)
-  );
+  // B4: every cap hit is counted (no buyer data); the buyer is told only
+  // with ORDER_CAP_NOTICE_ENABLED on — off, the response is unchanged.
+  for (const [agent_id, hit] of cappedAgents) {
+    recordOrderCapEvent({ agent_id, cart_id: cartId, reason: hit.reason, cap: hit.cap }, db);
+  }
+  const capNoticeOn = isOrderCapNoticeEnabled();
+  const contact_handoffs: ContactHandoff[] = Array.from(handoffByAgent.entries()).map(([agent_id, v]) => {
+    const h = buildContactHandoff(agent_id, v.name, v.lines);
+    const hit = cappedAgents.get(agent_id);
+    return capNoticeOn && hit ? { ...h, ...orderCapHandoffFields(hit.reason, hit.cap) } : h;
+  });
 
   const orders = orderSummaries.map((o) => ({ ...o, producer_contact: producerContact(o.agent_id, o.producer_name) }));
   return { success: true, orders, contact_handoffs, terms_url: TERMS_OF_PURCHASE_URL };
