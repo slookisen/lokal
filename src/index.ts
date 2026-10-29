@@ -134,6 +134,7 @@ import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
+import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
@@ -935,6 +936,9 @@ app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRout
 app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: «Gi meg beskjed» counts per planned key (read-only).
 app.use("/admin/owner-features/interest", adminLimiter, adminOwnerFeaturesInterestRoutes);
+// S2d-3: the switch probe («bryterprobe») on the hidden test producer — behind
+// OWNER_FEATURES_SWITCH_PROBE_ENABLED=1 (default off → 404), dry-run by default.
+app.use("/admin/owner-features/switch-probe", adminLimiter, adminOwnerFeaturesSwitchProbeRoutes);
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);

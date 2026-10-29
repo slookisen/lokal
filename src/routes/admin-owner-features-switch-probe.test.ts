@@ -1,0 +1,384 @@
+/**
+ * admin-owner-features-switch-probe.test.ts — dev-request
+ * 2026-10-22-rfb-mine-valg-eierbrytere, slice S2d-3: the switch probe
+ * («bryterprobe»), POST /admin/owner-features/switch-probe.
+ *
+ *   gate      flag off → 404; no / wrong admin key → 403
+ *   target    a real producer, an unknown id, a fixture outside the allowlist
+ *             → refused, zero writes
+ *   dry run   the default: the plan, zero DB writes (total_changes, audit,
+ *             settings counted before/after)
+ *   run       on the fixture: every row and check PASS, every live key ×
+ *             surface covered, the change log written (actor_detail
+ *             switch-probe), the fixture's stored choices byte-identical to
+ *             the snapshot afterwards, no mail sent (mailer + order-notify
+ *             transport spied), the Markdown report with the findings block
+ *   flags     OWNER_LOCK_ENFORCE_WRITES / OUTREACH_UNSUBSCRIBE_ENABLED off →
+ *             those rows FAIL «flag off in this environment», values reported
+ *   failure   an effect reader that throws → that row FAIL, still restored;
+ *             a throw mid-run (after a flip) → ok:false, still restored
+ *   busy      a second concurrent run → 409 already_running
+ *
+ * Real router + services on the production schema in an in-memory DB.
+ * Exported runAdminOwnerFeaturesSwitchProbeTests({log}) -> TestSummary;
+ * wired into tests/test.ts. Standalone:
+ *   npx tsx src/routes/admin-owner-features-switch-probe.test.ts
+ */
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+const SAVED_ENV = [
+  "OWNER_FEATURES_SWITCH_PROBE_ENABLED", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "OWNER_FEATURES_ALLOWED_SUBJECTS",
+  "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_VISIBILITY_ENFORCE_BY_ID", "OWNER_LOCK_ENFORCE_WRITES",
+  "OUTREACH_UNSUBSCRIBE_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS", "UNSUBSCRIBE_TOKEN_SECRET",
+];
+const KEY = "switch-probe-admin-key-for-tests";
+const FIX = "sp-fixture";
+const REAL = "sp-real-producer";
+const FIX_NAME = "Bryterprobe Gard Fixtur";
+const FIX_EMAIL = "eier@sp-fixture.example.no";
+
+export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+  const assertEq = (actual: unknown, expected: unknown, label: string) => {
+    if (JSON.stringify(actual) === JSON.stringify(expected)) { passed++; if (log) console.info(`  ok ${label}`); }
+    else {
+      failed++;
+      const msg = `✗ ${label}\n    expected: ${JSON.stringify(expected)?.slice(0, 600)}\n    actual:   ${JSON.stringify(actual)?.slice(0, 600)}`;
+      failures.push(msg);
+      if (log) console.info("  " + msg);
+    }
+  };
+  const assertTrue = (cond: boolean, label: string) => {
+    if (cond) { passed++; if (log) console.info(`  ok ${label}`); }
+    else { failed++; failures.push(`✗ ${label}`); if (log) console.info(`  ✗ ${label}`); }
+  };
+
+  const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+  const initMod = require("../database/init") as typeof import("../database/init");
+  const prevDb = initMod.__peekDbForTesting();
+  const prevEnv: Record<string, string | undefined> = {};
+  for (const k of SAVED_ENV) prevEnv[k] = process.env[k];
+
+  const db = new Database(":memory:");
+  db.pragma("journal_mode = DELETE");
+  db.pragma("foreign_keys = OFF");
+  const prevLog = console.log;
+  const prevErr = console.error;
+  if (!log) { console.log = () => { /* silence */ }; console.error = () => { /* silence */ }; }
+
+  let notifySvc: typeof import("../services/order-notify-service") | null = null;
+  let es: any = null;
+  let prevSendEmail: any = null;
+
+  try {
+    initMod.__setDbForTesting(db as any);
+    initMod.__initSchemaForTesting(db as any);
+    const { loadConfigsAtBoot } = require("../config/vertical-config") as typeof import("../config/vertical-config");
+    try { loadConfigsAtBoot(); } catch { /* already loaded by another suite */ }
+    for (const k of SAVED_ENV) delete process.env[k];
+    for (const m of ["../routes/marketplace", "../routes/marketplace-catalog", "../routes/seo", "../routes/mcp", "../routes/a2a", "../routes/discovery"]) {
+      try { delete require.cache[require.resolve(m)]; } catch { /* not loaded yet */ }
+    }
+
+    // Mail spies: nothing in the probe may reach a mail transport.
+    let mailCalls = 0;
+    notifySvc = require("../services/order-notify-service") as typeof import("../services/order-notify-service");
+    notifySvc.__setOrderNotifyTestDb(db as any);
+    notifySvc.__setOrderNotifySendForTesting(async () => { mailCalls++; return { success: true, messageId: "spy" }; });
+    es = (require("../services/email-service") as typeof import("../services/email-service")).emailService as any;
+    prevSendEmail = es.sendEmail;
+    es.sendEmail = async () => { mailCalls++; return { success: true, messageId: "spy" }; };
+    const cartSvc = require("../services/cart-service") as typeof import("../services/cart-service");
+    cartSvc.__setCartTestDb(db as any);
+
+    // ── Fixtures ─────────────────────────────────────────────────────────
+    const seed = (id: string, name: string, o: { origin: string; hidden: 0 | 1; email: string }) => {
+      db.prepare(
+        `INSERT INTO agents
+           (id, name, description, provider, contact_email, url, role, api_key, lat, lng, city,
+            categories, tags, trust_score, is_active, is_verified, is_vetted, origin, vertical_id, catalog_hidden, claimed_at,
+            order_notifications_opt_in, created_at)
+         VALUES (?, ?, ?, 'test', ?, ?, 'producer', ?, 62.4722, 6.1495, 'Ålesund', '["vegetables"]', '[]', 0.7, 1, 1, 1, ?, 'rfb', ?, '2026-10-01T00:00:00.000Z', 1, '2026-10-01T00:00:00.000Z')`,
+      ).run(id, name, "Lokal produsent av poteter og grønnsaker, med gårdsutsalg hver lørdag.", o.email, `https://${id}.example.no`, `key-${id}`, o.origin, o.hidden);
+      db.prepare(
+        `INSERT INTO agent_knowledge
+           (agent_id, email, website, phone, address, postal_code, about, products, verification_status, verified_second_line,
+            enrichment_status, url_last_status, url_last_probed, last_verified_at)
+         VALUES (?, ?, ?, '+47 912 34 567', 'Gardsvegen 12', '6002', ?, ?, 'verified', 0, 'rich', 200, datetime('now'), '2026-01-01T00:00:00.000Z')`,
+      ).run(id, o.email, `https://${id}.example.no`,
+        "Vi er en liten familiegård som dyrker poteter, gulrøtter og kål, og selger direkte fra gården hele året.",
+        JSON.stringify([{ name: "Probepoteter", price: "30 kr/kg", category: "vegetables" }]));
+      db.prepare(
+        `INSERT INTO products (id, agent_id, name, name_norm, unit, price_nok, availability, category, image_url, availability_source, availability_updated_at)
+         VALUES (?, ?, 'Probepoteter', 'probepoteter', 'kg', 30, 'in_stock', 'vegetables', 'https://img.example.no/p.jpg', 'admin_producer_confirmed', ?)`,
+      ).run(`prod-${id}`, id, new Date().toISOString());
+      db.prepare(`INSERT OR REPLACE INTO agent_metrics (agent_id, times_discovered, times_contacted, times_chosen) VALUES (?, 10, 5, 3)`).run(id);
+    };
+    seed(FIX, FIX_NAME, { origin: "test_fixture", hidden: 1, email: FIX_EMAIL });
+    seed(REAL, "Bryterprobe Ekte Gard", { origin: "discovery", hidden: 0, email: "post@sp-real.example.no" });
+    // Starting state with explicit choices, so the restore has something to put back.
+    db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, 'comms.news', 'true', 'owner', 0, '2026-10-20T10:00:00.000Z')`).run(FIX);
+    db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'yes', '2026-10-20T10:00:00.000Z', ?)`).run(FIX, FIX_EMAIL);
+
+    const setBaseEnv = () => {
+      for (const k of SAVED_ENV) delete process.env[k];
+      process.env.OWNER_FEATURES_SWITCH_PROBE_ENABLED = "1";
+      process.env.ADMIN_KEY = KEY;
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = `rfb:${FIX},rfb:${REAL}`;
+      process.env.OWNER_FEATURES_ENFORCE = "1";
+      process.env.OWNER_LOCK_ENFORCE_WRITES = "1";
+      process.env.OUTREACH_UNSUBSCRIBE_ENABLED = "1";
+    };
+    setBaseEnv();
+
+    const routeMod = require("./admin-owner-features-switch-probe") as typeof import("./admin-owner-features-switch-probe");
+    const probe = require("../owner-features/switch-probe") as typeof import("../owner-features/switch-probe");
+    const reg = require("../owner-features/registry") as typeof import("../owner-features/registry");
+    const router = routeMod.default as any;
+    const layer = (router.stack as any[]).find((l: any) => l.route && l.route.path === "/" && l.route.methods?.post);
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle as Function;
+    const call = (body: any, key: string | null = KEY): Promise<{ status: number; body: any }> =>
+      new Promise((resolve) => {
+        let status = 200;
+        const res: any = {
+          status(c: number) { status = c; return res; },
+          json(p: any) { resolve({ status, body: p }); return res; },
+          send(p: any) { resolve({ status, body: p }); return res; },
+          setHeader() { return res; },
+        };
+        const headers: Record<string, string> = key === null ? {} : { "x-admin-key": key };
+        Promise.resolve(handler({ method: "POST", url: "/", path: "/", body, query: {}, headers, get: (n: string) => headers[n.toLowerCase()] }, res, () => resolve({ status: 599, body: null })))
+          .catch((e: any) => resolve({ status: 598, body: String(e) }));
+      });
+
+    const count = (sql: string, ...p: unknown[]) => (db.prepare(sql).get(...p) as { n: number }).n;
+    const totalChanges = () => count("SELECT total_changes() AS n");
+    const auditRows = () => count("SELECT COUNT(*) AS n FROM owner_feature_audit");
+    const settingsRows = () => count("SELECT COUNT(*) AS n FROM owner_feature_settings");
+    const rawState = (id: string) => JSON.stringify({
+      settings: db.prepare("SELECT * FROM owner_feature_settings WHERE subject_id = ? ORDER BY key").all(id),
+      agent: db.prepare("SELECT order_notifications_opt_in, order_notification_email, is_verified, claimed_at, is_active, catalog_hidden, origin FROM agents WHERE id = ?").get(id),
+      pause: db.prepare("SELECT * FROM owner_profile_pause WHERE agent_id = ?").all(id),
+      level: db.prepare("SELECT * FROM owner_feature_level_choice WHERE subject_id = ?").all(id),
+      intro: db.prepare("SELECT * FROM owner_feature_intro WHERE subject_id = ?").all(id),
+      knowledge: db.prepare("SELECT about, curated_fields, email FROM agent_knowledge WHERE agent_id = ?").get(id),
+    });
+
+    // ═══ Gate ═════════════════════════════════════════════════════════════
+    delete process.env.OWNER_FEATURES_SWITCH_PROBE_ENABLED;
+    {
+      const r = await call({ dry_run: false });
+      assertEq([r.status, r.body?.error], [404, "not_found"], "gate-1: flag unset → 404");
+      process.env.OWNER_FEATURES_SWITCH_PROBE_ENABLED = "true";
+      assertEq((await call({})).status, 404, "gate-2: only the exact value \"1\" turns it on");
+      process.env.OWNER_FEATURES_SWITCH_PROBE_ENABLED = "1";
+    }
+    {
+      const c0 = totalChanges();
+      assertEq((await call({ dry_run: false }, null)).status, 403, "gate-3: no X-Admin-Key → 403");
+      assertEq((await call({ dry_run: false }, KEY + "-wrong")).status, 403, "gate-4: wrong X-Admin-Key → 403");
+      assertEq(totalChanges(), c0, "gate-5: refused calls write nothing");
+      assertEq((await call({ dry_run: "no" })).status, 400, "gate-6: dry_run must be a boolean");
+    }
+
+    // ═══ Target ═══════════════════════════════════════════════════════════
+    {
+      const c0 = totalChanges();
+      const a0 = auditRows();
+      const r = await call({ dry_run: false, agent_id: REAL });
+      assertEq([r.status, r.body?.error], [409, "not_a_test_fixture"], "target-1: a real (allowlisted) producer → 409 not_a_test_fixture");
+      assertEq((await call({ dry_run: false, agent_id: "sp-nobody" })).status, 404, "target-2: unknown agent_id → 404");
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = `rfb:${REAL}`;
+      const r3 = await call({ dry_run: false });
+      assertEq([r3.status, r3.body?.error], [409, "not_allowlisted"], "target-3: the fixture outside the allowlist → 409 not_allowlisted");
+      process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = `rfb:${FIX},rfb:${REAL}`;
+      assertEq([totalChanges() - c0, auditRows() - a0], [0, 0], "target-4: refused targets → zero writes");
+    }
+
+    // ═══ Dry run (default) ════════════════════════════════════════════════
+    {
+      const before = rawState(FIX);
+      const c0 = totalChanges();
+      const a0 = auditRows();
+      const s0 = settingsRows();
+      const r = await call({});
+      assertEq([r.status, r.body?.dry_run, r.body?.agent_id], [200, true, FIX], "dry-1: no body → dry run on the single fixture");
+      assertTrue(Array.isArray(r.body?.plan?.rows) && r.body.plan.rows.length > 0, "dry-2: the plan lists key × surface × direction rows");
+      assertTrue((r.body?.plan?.rows ?? []).every((x: any) => x.reader === true), "dry-3: every planned row has an effect reader");
+      assertTrue((r.body?.plan?.baseline ?? []).some((b: any) => b.key === "orders.enabled" && b.value === true), "dry-4: baseline values (orders.enabled on)");
+      assertTrue(Array.isArray(r.body?.rows) && r.body.rows.length === 0 && r.body?.pass === 0, "dry-5: no rows run");
+      assertEq([totalChanges() - c0, auditRows() - a0, settingsRows() - s0], [0, 0, 0], "dry-6: zero DB writes (total_changes, audit, settings)");
+      assertEq(rawState(FIX), before, "dry-7: fixture state byte-identical");
+      assertTrue(typeof r.body?.markdown === "string" && r.body.markdown.includes("tørrkjøring"), "dry-8: the plan as Markdown");
+      const r2 = await call({ dry_run: true, agent_id: FIX });
+      assertEq([r2.status, r2.body?.dry_run, totalChanges() - c0], [200, true, 0], "dry-9: explicit dry_run:true is a dry run too");
+    }
+
+    // ═══ Full run ═════════════════════════════════════════════════════════
+    {
+      const before = rawState(FIX);
+      const a0 = auditRows();
+      const m0 = mailCalls;
+      const r = await call({ dry_run: false, max_wait_ms: 500 });
+      const b = r.body ?? {};
+      assertEq([r.status, b.ok, b.dry_run, b.agent_id], [200, true, false, FIX], "run-1: 200 ok on the fixture");
+      const failing = [...(b.rows ?? []), ...(b.checks ?? [])].filter((x: any) => x.result !== "PASS");
+      assertEq(failing.map((x: any) => `${x.key ?? x.check} ${x.surface ?? ""} ${x.direction ?? ""}: ${x.reason ?? ""} | ${x.observed ?? ""}`), [], "run-2: every row and check PASS");
+      assertEq([b.fail, b.restored, b.ready_for_daniel_test], [0, true, true], "run-3: fail 0, restored, ready_for_daniel_test");
+      assertTrue(b.pass === (b.rows?.length ?? 0) + (b.checks?.length ?? 0), "run-4: pass counts rows + checks");
+      // Coverage: every live key × declared surface has rows in both directions.
+      const live = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
+      for (const e of live) {
+        for (const s of e.surfaces) {
+          const dirs = (b.rows ?? []).filter((x: any) => x.key === e.key && x.surface === s).map((x: any) => x.direction).sort();
+          assertTrue(dirs.includes("off") && dirs.includes("on"), `run-5: ${e.key} × ${s} probed off and on (${dirs.join(",")})`);
+        }
+      }
+      assertTrue((b.rows ?? []).filter((x: any) => x.key === "visibility.profile").length === 24, "run-6: visibility.profile: 12 surfaces × 2 directions");
+      assertTrue((b.rows ?? []).filter((x: any) => x.direction === "parent_off" || x.direction === "parent_on").length === 6, "run-7: the locked keys follow orders.enabled off and on (3 surfaces × 2)");
+      const vis = (b.rows ?? []).filter((x: any) => x.key === "visibility.profile");
+      assertTrue(vis.every((x: any) => typeof x.ms_to_effect === "number" && x.change_logged === true && x.write_status === 200), "run-8: switch rows carry time to effect, 200 and the change-log hit");
+      const refusedRows = (b.rows ?? []).filter((x: any) => ["orders.reminder", "notify.order_email"].includes(x.key) && x.direction === "off");
+      assertTrue(refusedRows.length === 3 && refusedRows.every((x: any) => x.write_status === 409 && /locked/.test(x.observed)), "run-9: locked choices cannot be turned off (409 locked)");
+      const guarantee = (b.rows ?? []).filter((x: any) => x.key === "auto.guarantee" || x.key === "comms.unsubscribe");
+      assertTrue(guarantee.length === 6 && guarantee.every((x: any) => x.write_status === 409), "run-10: guarantees refuse every write (409)");
+      const email = (b.rows ?? []).filter((x: any) => x.key === "orders.email");
+      assertTrue(email.length === 2 && email.every((x: any) => x.write_status === 409 && /confirm_by_email/.test(x.observed)), "run-11: orders.email refuses a direct write (409 confirm_by_email)");
+      const checks: any[] = b.checks ?? [];
+      const comingSoon = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "coming_soon").map((e) => `coming_soon:${e.key}`);
+      assertEq(comingSoon.filter((n) => !checks.some((c) => c.check === n && c.result === "PASS" && /→ 409 coming_soon/.test(c.observed))), [], "run-12: every coming_soon key → 409 coming_soon, no effect");
+      assertTrue(checks.some((c) => c.check === "requirement_unmet:orders.enabled" && c.result === "PASS" && /409 requirement_not_met/.test(c.observed)), "run-13: unmet requirement → 409, no effect");
+      assertTrue(checks.some((c) => c.check === "level:bare_synlig" && c.result === "PASS") && checks.some((c) => c.check === "level:ta_imot_bestillinger" && c.result === "PASS"), "run-14: both levels = the single switches");
+      assertTrue(checks.some((c) => c.check === "undo:level:bare_synlig" && c.result === "PASS"), "run-15: «Angre» on a level restores the effect");
+      assertTrue(["orders.enabled", "visibility.profile", "comms.news"].every((k) => checks.some((c) => c.check === `undo:single:${k}` && c.result === "PASS")), "run-16: «Angre» on each live switch restores the effect");
+      assertTrue(checks.some((c) => c.check === "no_surface:comms.news" && c.result === "PASS"), "run-17: comms.news (no surface): write + change log");
+      assertTrue(checks.some((c) => c.check === "restore" && c.result === "PASS"), "run-18: restore check PASS");
+      assertEq(rawState(FIX), before, "run-19: the fixture's stored choices byte-identical to the snapshot afterwards");
+      assertTrue(auditRows() > a0, "run-20: the probe's writes are in the change log");
+      assertEq(count("SELECT COUNT(*) AS n FROM owner_feature_audit WHERE subject_id = ? AND id > ? AND NOT (actor = 'admin' AND actor_detail IN ('switch-probe', 'switch-probe:restore'))", FIX, a0), 0, "run-21: every audit row is the probe's (actor admin, switch-probe)");
+      assertEq(count("SELECT COUNT(*) AS n FROM owner_feature_audit WHERE subject_id <> ? AND id > ?", FIX, a0), 0, "run-22: nothing written for any other subject");
+      assertEq(mailCalls - m0, 0, "run-23: e-mail surfaces never call a mailer (spied)");
+      const md = String(b.markdown || "");
+      assertTrue(md.includes("| Nøkkel | Flate | Retning | Resultat | Observert | Tid til effekt (ms) | Merknad |"), "run-24: Markdown report table");
+      assertTrue(/## FUNN TIL OPPFØLGING\n- \[FUNN\] ingen/.test(md), "run-25: report ends with the findings block (ingen)");
+      assertTrue(!md.includes(FIX_EMAIL) && !JSON.stringify(b).includes(FIX_EMAIL), "run-26: no e-mail address in the report or response");
+      assertTrue(b.env_flags?.OWNER_LOCK_ENFORCE_WRITES === "1" && b.env_flags?.OUTREACH_UNSUBSCRIBE_ENABLED === "1", "run-27: env flags reported");
+    }
+
+    // ═══ Flags off: the rows that depend on them FAIL ═════════════════════
+    {
+      delete process.env.OWNER_LOCK_ENFORCE_WRITES;
+      delete process.env.OUTREACH_UNSUBSCRIBE_ENABLED;
+      const before = rawState(FIX);
+      const r = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      const kw = r.rows.filter((x) => x.key === "auto.guarantee" && x.surface === "job:knowledge_write");
+      const ou = r.rows.filter((x) => x.key === "comms.unsubscribe" && x.surface === "email:outreach");
+      assertTrue(kw.length === 2 && kw.every((x) => x.result === "FAIL" && /flag off in this environment \(OWNER_LOCK_ENFORCE_WRITES=unset\)/.test(x.reason || "")), "flags-1: knowledge_write rows FAIL «flag off in this environment»");
+      assertTrue(ou.length === 2 && ou.every((x) => x.result === "FAIL" && /flag off in this environment \(OUTREACH_UNSUBSCRIBE_ENABLED=unset\)/.test(x.reason || "")), "flags-2: outreach rows FAIL «flag off in this environment»");
+      assertEq([r.env_flags.OWNER_LOCK_ENFORCE_WRITES, r.env_flags.OUTREACH_UNSUBSCRIBE_ENABLED], [null, null], "flags-3: the flag values are reported");
+      assertEq([r.ready_for_daniel_test, r.restored], [false, true], "flags-4: not ready, restored");
+      assertTrue(/- \[FUNN\] bryterprobe-auto-guarantee-job-knowledge-write-off · P1 · /.test(r.markdown), "flags-5: the FAIL rows land in the findings block");
+      assertEq(rawState(FIX), before, "flags-6: restored byte-identical");
+      setBaseEnv();
+      // Without OWNER_FEATURES_ENFORCE (and the pause flag) visibility.profile has no
+      // effect: the probe must see the fixture still shown and FAIL the «off» rows.
+      delete process.env.OWNER_FEATURES_ENFORCE;
+      const v = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      const off = v.rows.filter((x) => x.key === "visibility.profile" && x.direction === "off");
+      assertTrue(off.length === 12 && off.every((x) => x.result === "FAIL" && /OWNER_FEATURES_ENFORCE og OWNER_PAUSE_ENABLED er av/.test(x.reason || "")), "flags-7: enforce off → visibility.profile «off» rows FAIL (the probe discriminates)");
+      assertTrue(v.rows.filter((x) => x.key === "visibility.profile" && x.direction === "on").every((x) => x.result === "PASS"), "flags-8: … while «on» still PASSes");
+      assertEq([v.restored, rawState(FIX)], [true, before], "flags-9: restored byte-identical");
+      setBaseEnv();
+    }
+
+    // ═══ Forced failures still restore ════════════════════════════════════
+    {
+      const before = rawState(FIX);
+      const r = await probe.runSwitchProbe(FIX, {
+        db, maxWaitMs: 0,
+        readers: { "orders.enabled × order_gate": { observe: "throws", read: () => { throw new Error("injected reader failure"); } } },
+      });
+      const gate = r.rows.filter((x) => x.key === "orders.enabled" && x.surface === "order_gate");
+      assertTrue(gate.length === 2 && gate.every((x) => x.result === "FAIL" && /injected reader failure/.test(x.reason || "")), "fail-1: a throwing reader → its rows FAIL with the error");
+      assertEq([r.ok, r.restored], [true, true], "fail-2: the run completes and restores");
+      assertEq(rawState(FIX), before, "fail-3: byte-identical after a reader failure");
+    }
+    {
+      const before = rawState(FIX);
+      let flipped = false;
+      const r = await probe.runSwitchProbe(FIX, {
+        db, maxWaitMs: 0,
+        afterFlip: (key, dir) => {
+          if (key === "visibility.profile" && dir === "off") {
+            flipped = !!db.prepare("SELECT 1 FROM owner_profile_pause WHERE agent_id = ?").get(FIX);
+            throw new Error("injected mid-run failure");
+          }
+        },
+      });
+      assertTrue(flipped, "fail-4: the abort happened with the profile switched off");
+      assertEq([r.ok, r.restored, r.ready_for_daniel_test], [false, true, false], "fail-5: ok:false, restored:true");
+      assertTrue(/injected mid-run failure/.test(r.error || "") && /kjøringen ble avbrutt/.test(r.markdown), "fail-6: the error is reported");
+      assertEq(rawState(FIX), before, "fail-7: byte-identical after the abort (pause row gone)");
+      assertTrue(!probe.isSwitchProbeRunning(), "fail-8: the run lock is released");
+    }
+
+    // ═══ Concurrency ══════════════════════════════════════════════════════
+    {
+      const first = call({ dry_run: false, max_wait_ms: 0 });
+      const second = await call({ dry_run: false, max_wait_ms: 0 });
+      assertEq([second.status, second.body?.error], [409, "already_running"], "busy-1: a second concurrent run → 409");
+      const f = await first;
+      assertEq([f.status, f.body?.restored], [200, true], "busy-2: the first run completes");
+      let threw = false;
+      const p = probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      try { await probe.runSwitchProbe(FIX, { db }); } catch (e) { threw = e instanceof probe.SwitchProbeBusyError; }
+      await p;
+      assertTrue(threw, "busy-3: runSwitchProbe itself refuses a second run");
+    }
+
+    // ═══ Helpers ══════════════════════════════════════════════════════════
+    {
+      const readers = probe.defaultSwitchProbeReaders();
+      const missing: string[] = [];
+      for (const e of reg.OWNER_FEATURE_REGISTRY.filter((x) => x.status === "live")) {
+        for (const s of e.surfaces) if (!readers[`${e.key} × ${s}`]) missing.push(`${e.key} × ${s}`);
+      }
+      assertEq(missing, [], "gov-1: every live key × surface has a switch-probe effect reader (a new live surface needs one)");
+      assertEq(probe.maskEmail("daniel@example.com"), "d***@example.com", "help-1: maskEmail");
+      assertEq([
+        probe.putStatusFor({ kind: "blocked", block: "locked", reason: { no: "", en: "" } }),
+        probe.putStatusFor({ kind: "invalid_value", reason: { no: "", en: "" } }),
+        probe.putStatusFor({ kind: "unknown_key" }),
+      ], [409, 400, 404], "help-2: write result → PUT status");
+    }
+  } catch (err: any) {
+    failed++;
+    failures.push("unexpected error: " + String(err?.stack || err));
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    try { notifySvc?.__setOrderNotifySendForTesting(null); notifySvc?.__setOrderNotifyTestDb(null); } catch { /* ignore */ }
+    try { (require("../services/cart-service") as typeof import("../services/cart-service")).__setCartTestDb(null); } catch { /* ignore */ }
+    if (es && prevSendEmail) es.sendEmail = prevSendEmail;
+    for (const k of SAVED_ENV) { if (prevEnv[k] === undefined) delete process.env[k]; else process.env[k] = prevEnv[k]; }
+    if (prevDb) initMod.__setDbForTesting(prevDb);
+    try { db.close(); } catch { /* ignore */ }
+  }
+  return { passed, failed, failures };
+}
+
+if (require.main === module) {
+  runAdminOwnerFeaturesSwitchProbeTests({ log: process.argv.includes("--log") }).then((r) => {
+    console.info(`\nadmin-owner-features-switch-probe: ${r.passed} passed, ${r.failed} failed`);
+    for (const f of r.failures) console.info(f);
+    process.exit(r.failed ? 1 : 0);
+  });
+}
