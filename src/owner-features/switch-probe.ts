@@ -39,8 +39,15 @@
 //            answer) are snapshotted first and restored exactly in `finally`;
 //            the result says `restored` and lists any difference.
 // Only the hidden fixture (origin='test_fixture' AND catalog_hidden=1) in the
-// OWNER_FEATURES_ALLOWED_SUBJECTS allowlist is ever touched; every SQL write
-// here repeats that pin in its own WHERE clause.
+// OWNER_FEATURES_ALLOWED_SUBJECTS allowlist is ever written: the owner writes
+// go through setOwnerFeatureValue for that subject id, and every UPDATE /
+// DELETE this file issues on owner state (restore, the rolled-back checks)
+// repeats the fixture pin in its own WHERE clause. The one other kind of
+// write: the public read paths the readers run log their own rows (A2A
+// `tasks`, `analytics_agent_views`); the probe captures exactly the rowids
+// created while one of its own handler calls ran synchronously (Node runs
+// nothing else in between) and deletes those rowids — and only those — at the
+// end. The counts are in the result (`side_effects`) and the report.
 
 import { getDb } from "../database/init";
 import {
@@ -72,8 +79,15 @@ export const SWITCH_PROBE_FIXTURE_ORIGIN = "test_fixture";
 /** Spec: time to effect over 60 min is FAIL (caches). */
 export const SWITCH_PROBE_EFFECT_MAX_MS = 60 * 60 * 1000;
 export const SWITCH_PROBE_DEFAULT_MAX_WAIT_MS = 2000;
-export const SWITCH_PROBE_MAX_WAIT_CAP_MS = 120_000;
+export const SWITCH_PROBE_MAX_WAIT_CAP_MS = 30_000;
 const POLL_MS = 100;
+/** Surfaces that rebuild a whole catalogue view per read: polled at most every 2 s. */
+const HEAVY_POLL_MS = 2000;
+const HEAVY_SURFACES = new Set(["listing_html", "sitemap", "llms", "acp_feed"]);
+/** List surfaces (ranking / sampling): «on» needs at least one endpoint. Every other surface needs all. */
+const LIST_SURFACES = new Set(["listing_html", "mcp_search", "acp_feed", "leaderboard"]);
+/** Tables the public read paths write to (A2A task log, profile views). */
+export const SWITCH_PROBE_SIDE_EFFECT_TABLES = ["tasks", "analytics_agent_views"] as const;
 const HANDLER_TIMEOUT_MS = 20_000;
 const FIXTURE_PIN = `origin = '${SWITCH_PROBE_FIXTURE_ORIGIN}' AND catalog_hidden = 1`;
 
@@ -116,6 +130,12 @@ export interface SwitchProbeRow {
   write_status: number | null;
   /** The write is in owner_feature_audit and the owner's change log (null = no write expected). */
   change_logged: boolean | null;
+  /**
+   * false = the reader is expected to show the same thing before and after
+   * (a refused write): a reader that never changes would also pass, so the
+   * row is not proof that the surface reacts to the switch.
+   */
+  discriminating: boolean;
   reason?: string;
 }
 
@@ -158,6 +178,8 @@ export interface SwitchProbeResult {
   fail: number;
   restored: boolean;
   restore_diff: Array<{ table: string; before: unknown; after: unknown }>;
+  /** Rows the readers' public read paths logged (captured by rowid) and how many the probe removed again. */
+  side_effects: Array<{ table: string; created: number; removed: number }>;
   ready_for_daniel_test: boolean;
   error?: string;
   markdown: string;
@@ -226,6 +248,11 @@ export function maskEmail(v: unknown): string {
   if (typeof v !== "string" || !v.includes("@")) return String(v);
   const [local, domain] = v.split("@");
   return `${(local || "").slice(0, 1)}***@${domain || ""}`;
+}
+
+/** A copy with every string that holds an e-mail address masked. */
+export function maskDeep<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v ?? null), (_k, x) => (typeof x === "string" && /[^\s@]+@[^\s@]+/.test(x) ? maskEmail(x) : x));
 }
 
 function displayValue(e: OwnerFeatureEntry | undefined, v: OwnerFeatureValue): OwnerFeatureValue | string {
@@ -347,8 +374,8 @@ function restoreSnapshot(db: any, agentId: string, snap: FixtureSnapshot): void 
     db.prepare(`DELETE FROM owner_feature_settings WHERE vertical = ? AND subject_id IN (${pinned})`).run(VERTICAL, agentId);
     insertRows(db, "owner_feature_settings", snap.owner_feature_settings);
     if (snap.agents) {
-      db.prepare(`UPDATE agents SET order_notifications_opt_in = ?, order_notification_email = ?, is_verified = ? WHERE id = ? AND ${FIXTURE_PIN}`)
-        .run(snap.agents.order_notifications_opt_in, snap.agents.order_notification_email, snap.agents.is_verified, agentId);
+      db.prepare(`UPDATE agents SET order_notifications_opt_in = ?, order_notification_email = ?, is_verified = ?, claimed_at = ? WHERE id = ? AND ${FIXTURE_PIN}`)
+        .run(snap.agents.order_notifications_opt_in, snap.agents.order_notification_email, snap.agents.is_verified, snap.agents.claimed_at, agentId);
     }
     if (tableExists(db, "owner_profile_pause")) {
       db.prepare(`DELETE FROM owner_profile_pause WHERE agent_id IN (${pinned})`).run(agentId);
@@ -388,6 +415,8 @@ function restoreSnapshot(db: any, agentId: string, snap: FixtureSnapshot): void 
 export interface SurfaceObservation {
   endpoints: Record<string, boolean>;
   detail?: string;
+  /** «on» needs every endpoint (single-object surfaces); unset = at least one (list surfaces). */
+  requireAll?: boolean;
 }
 
 export interface ProbeFixture {
@@ -409,6 +438,48 @@ export interface ProbeReaderContext {
   fixture: ProbeFixture;
   env: NodeJS.ProcessEnv;
   adminKey: string;
+  /** Rowids the readers' read paths created, per side-effect table (removed at the end). */
+  created: Map<string, Set<number>>;
+}
+
+function maxRowid(db: any, table: string): number {
+  try { return Number((db.prepare(`SELECT COALESCE(MAX(rowid), 0) AS m FROM ${table}`).get() as { m: number }).m) || 0; } catch { return -1; }
+}
+
+/**
+ * Runs the synchronous part of one handler / tool call and records the rowids
+ * it created in the side-effect tables. Nothing else runs in between (one
+ * thread, better-sqlite3 is synchronous), so these rows are the probe's own.
+ */
+function captureSync<T>(ctx: ProbeReaderContext, fn: () => T): T {
+  const before = SWITCH_PROBE_SIDE_EFFECT_TABLES.map((t) => maxRowid(ctx.db, t));
+  try {
+    return fn();
+  } finally {
+    SWITCH_PROBE_SIDE_EFFECT_TABLES.forEach((t, i) => {
+      if (before[i] < 0) return;
+      const ids = ctx.db.prepare(`SELECT rowid AS r FROM ${t} WHERE rowid > ?`).all(before[i]) as Array<{ r: number }>;
+      if (ids.length === 0) return;
+      let set = ctx.created.get(t);
+      if (!set) { set = new Set(); ctx.created.set(t, set); }
+      for (const x of ids) set.add(Number(x.r));
+    });
+  }
+}
+
+/** Deletes exactly the captured rowids (never anything else). */
+function removeSideEffects(ctx: ProbeReaderContext): Array<{ table: string; created: number; removed: number }> {
+  const out: Array<{ table: string; created: number; removed: number }> = [];
+  for (const t of SWITCH_PROBE_SIDE_EFFECT_TABLES) {
+    const ids = [...(ctx.created.get(t) ?? [])];
+    let removed = 0;
+    if (ids.length) {
+      const del = ctx.db.prepare(`DELETE FROM ${t} WHERE rowid = ?`);
+      ctx.db.transaction(() => { for (const id of ids) removed += del.run(id).changes; })();
+    }
+    out.push({ table: t, created: ids.length, removed });
+  }
+  return out;
 }
 
 export type SurfaceReader = (ctx: ProbeReaderContext) => Promise<SurfaceObservation> | SurfaceObservation;
@@ -418,6 +489,8 @@ export interface SurfaceReaderDef {
   /** Synchronous variant (usable inside a rolled-back transaction). */
   sync?: (ctx: ProbeReaderContext) => SurfaceObservation;
   observe: string;
+  /** Poll interval while waiting for an effect (default 100 ms). */
+  pollMs?: number;
 }
 
 function loadFixture(db: any, agentId: string): ProbeFixture {
@@ -471,7 +544,7 @@ function probeReq(ctx: ProbeReaderContext, path: string, o: { method?: "GET" | "
 }
 
 /** Runs one route handler in-process with a capturing response (nothing goes on the wire). */
-function invokeHandler(handler: Function, req: any): Promise<HandlerResult> {
+function invokeHandler(ctx: ProbeReaderContext, handler: Function, req: any): Promise<HandlerResult> {
   return new Promise((resolve) => {
     let settled = false;
     const headers: Record<string, string> = {};
@@ -509,7 +582,7 @@ function invokeHandler(handler: Function, req: any): Promise<HandlerResult> {
     };
     timer = setTimeout(() => settle({ __error: "handler timeout" }), HANDLER_TIMEOUT_MS);
     try {
-      const p = handler(req, res, (err?: any) => settle({ __next: true, err: err ? String(err) : undefined }));
+      const p = captureSync(ctx, () => handler(req, res, (err?: any) => settle({ __next: true, err: err ? String(err) : undefined })));
       if (p && typeof p.catch === "function") p.catch((err: any) => settle({ __error: String(err) }));
     } catch (err) {
       settle({ __error: String(err) });
@@ -570,12 +643,12 @@ function visKit(ctx: ProbeReaderContext): VisKit {
     tool: async (name, args) => {
       const h = tools.get(name);
       if (!h) throw new Error(`MCP tool not registered: ${name}`);
-      return String((await h(args, extra()))?.content?.[0]?.text ?? "");
+      return String((await captureSync(ctx, () => h(args, extra())))?.content?.[0]?.text ?? "");
     },
     resource: async (name, uri) => {
       const h = resources.get(name);
       if (!h) throw new Error(`MCP resource not registered: ${name}`);
-      return h(uri, extra());
+      return captureSync(ctx, () => h(uri, extra()));
     },
     buildSitemapXml: () => seoMod.buildSitemapXml(),
   };
@@ -594,7 +667,7 @@ function visibilityReader(surface: string): SurfaceReader {
     return runAsPublicView(async () => {
       const kit = visKit(ctx);
       const f = ctx.fixture;
-      const call = (h: string, path: string, o: Parameters<typeof probeReq>[2] = {}) => invokeHandler(kit.handlers[h], probeReq(ctx, path, o));
+      const call = (h: string, path: string, o: Parameters<typeof probeReq>[2] = {}) => invokeHandler(ctx, kit.handlers[h], probeReq(ctx, path, o));
       const text = (r: HandlerResult) => (typeof r.body === "string" ? r.body : JSON.stringify(r.body ?? ""));
       const page = async () => call("produsent", `/produsent/${f.slug}`, { params: { slug: f.slug } });
       const hasName = (s: string) => s.includes(f.name) || s.includes(htmlEscape(f.name));
@@ -671,7 +744,7 @@ function visibilityReader(surface: string): SurfaceReader {
       }
       const endpoints: Record<string, boolean> = {};
       for (const [name, fn] of Object.entries(eps)) endpoints[name] = await fn();
-      return { endpoints };
+      return { endpoints, requireAll: !LIST_SURFACES.has(surface) };
     });
   };
 }
@@ -720,7 +793,7 @@ const knowledgeWriteSync = (ctx: ProbeReaderContext): SurfaceObservation => {
       let locks: Record<string, any> = {};
       try { const p = JSON.parse(row.curated_fields || "{}"); if (p && typeof p === "object") locks = p; } catch { locks = {}; }
       const ownerText = row.about && locks.about?.by === "owner" ? row.about : "Eierens egen tekst (bryterprobe, rulles tilbake).";
-      db.prepare(`UPDATE agent_knowledge SET about = ?, curated_fields = ? WHERE agent_id = ?`)
+      db.prepare(`UPDATE agent_knowledge SET about = ?, curated_fields = ? WHERE agent_id = ? AND agent_id IN (SELECT id FROM agents WHERE ${FIXTURE_PIN})`)
         .run(ownerText, JSON.stringify({ ...locks, about: { by: "owner", locked_at: new Date().toISOString() } }), ctx.fixture.id);
       const r = knowledgeService.upsertKnowledge(ctx.fixture.id, { about: "Bryterprobe prøver å overskrive (rulles tilbake).", dataSource: "auto" } as any);
       const after = (db.prepare(`SELECT about FROM agent_knowledge WHERE agent_id = ?`).get(ctx.fixture.id) as { about: string | null }).about;
@@ -781,7 +854,10 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
     "comms.unsubscribe × email:outreach": syncReader(outreachSync, "unsubscribeHeaderValues(): kald e-post får List-Unsubscribe"),
   };
   for (const s of VISIBILITY_SURFACES) {
-    out[caseId("visibility.profile", s)] = { read: visibilityReader(s), observe: `${s} som offentlig: testprodusenten vist / borte` };
+    out[caseId("visibility.profile", s)] = {
+      read: visibilityReader(s), observe: `${s} som offentlig: testprodusenten vist / borte`,
+      ...(HEAVY_SURFACES.has(s) ? { pollMs: HEAVY_POLL_MS } : {}),
+    };
   }
   return out;
 }
@@ -838,7 +914,11 @@ export interface SwitchProbeOptions {
   readers?: Record<string, SurfaceReaderDef>;
   /** Test seam: called after every switch flip; a throw aborts the run (restore still runs). */
   afterFlip?: (key: string, direction: ProbeDirection) => void;
+  /** Test seam: the owner write the probe makes (default setOwnerFeatureValue). */
+  write?: ProbeWriteFn;
 }
+
+export type ProbeWriteFn = typeof setOwnerFeatureValue;
 
 let running = false;
 
@@ -863,16 +943,16 @@ function describe(obs: SurfaceObservation): string {
  * reference observation shows it again (list surfaces with ranking/sampling
  * may never show the fixture; those endpoints are named, not counted).
  */
-function evaluate(obs: SurfaceObservation, expected: boolean, ref: SurfaceObservation | null): Evaluated {
+export function evaluateObservation(obs: SurfaceObservation, expected: boolean, ref: SurfaceObservation | null): Evaluated {
   const vals = Object.entries(obs.endpoints);
   let pass: boolean;
   if (!expected) pass = vals.length > 0 && vals.every(([, v]) => !v);
   else {
-    pass = vals.some(([, v]) => v);
+    pass = obs.requireAll ? vals.length > 0 && vals.every(([, v]) => v) : vals.some(([, v]) => v);
     if (pass && ref) pass = Object.entries(ref.endpoints).every(([k, v]) => !v || obs.endpoints[k] === true);
   }
   const silent = expected ? vals.filter(([, v]) => !v).map(([k]) => k) : [];
-  return { pass, observed: describe(obs) + (expected && silent.length && pass ? ` (uten utslag her: ${silent.join(", ")})` : "") };
+  return { pass, observed: describe(obs) + (expected && silent.length && pass ? ` (listeflate, uten utslag her: ${silent.join(", ")})` : "") };
 }
 
 interface Ctx {
@@ -885,6 +965,12 @@ interface Ctx {
   rows: SwitchProbeRow[];
   checks: SwitchProbeCheck[];
   afterFlip?: SwitchProbeOptions["afterFlip"];
+  write: ProbeWriteFn;
+}
+
+/** One owner write of the probe (actor admin / switch-probe) through the write seam. */
+function probeWrite(c: Ctx, key: string, value: OwnerFeatureValue): SetOwnerFeatureResult {
+  return c.write(VERTICAL, c.agentId, key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
 }
 
 function maxAuditId(db: any, agentId: string): number {
@@ -927,13 +1013,13 @@ async function awaitEffect(c: Ctx, def: SurfaceReaderDef, expected: boolean, ref
     last = await readSafe(def, c.readerCtx);
     const ms = Date.now() - t0;
     if (last.obs) {
-      const ev = evaluate(last.obs, expected, ref);
+      const ev = evaluateObservation(last.obs, expected, ref);
       if (ev.pass) return { ...ev, obs: last.obs, ms, error: null };
       if (ms >= c.maxWaitMs) return { ...ev, obs: last.obs, ms: null as number | null, error: null };
     } else if (ms >= c.maxWaitMs) {
       return { pass: false, observed: `leser feilet: ${last.error}`, obs: null, ms: null as number | null, error: last.error };
     }
-    await sleep(POLL_MS);
+    await sleep(Math.max(POLL_MS, def.pollMs ?? POLL_MS));
   }
 }
 
@@ -957,7 +1043,7 @@ function missingReaderRows(c: Ctx, e: OwnerFeatureEntry, surface: string, dirs: 
   for (const d of dirs) {
     pushRow(c, {
       key: e.key, surface, direction: d, pass: false, observed: "—", expected: "—",
-      ms_to_effect: null, write_status: null, change_logged: null, reason: "mangler effektleser for flaten",
+      ms_to_effect: null, write_status: null, change_logged: null, discriminating: false, reason: "mangler effektleser for flaten",
     });
   }
 }
@@ -975,7 +1061,7 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
   for (const d of dirs) {
     const value = d === "on";
     const before = maxAuditId(c.db, c.agentId);
-    const w = setOwnerFeatureValue(VERTICAL, c.agentId, e.key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+    const w = probeWrite(c, e.key, value);
     const t0 = Date.now();
     const status = putStatusFor(w);
     const logged = w.kind === "ok" && w.changed ? changeLogged(c, e.key, value, before) : w.kind === "ok" ? null : false;
@@ -990,7 +1076,7 @@ async function probeSwitch(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureV
         key: e.key, surface: s, direction: d,
         pass: writeOk && logged !== false && r.pass,
         observed: r.observed, expected: value ? "effekt til stede" : "effekt borte",
-        ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: logged,
+        ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: logged, discriminating: true,
         ...(!writeOk ? { reason: `skrivingen ble avvist (${status}${w.kind === "blocked" ? ` ${w.block}` : ""})` }
           : logged === false ? { reason: "endringen mangler i endringsloggen" }
           : !r.pass ? { reason: r.error ? `leser feilet: ${r.error}` : `ingen riktig effekt innen ${c.maxWaitMs} ms${visibilityFlagHint(c, e.key)}` } : {}),
@@ -1013,7 +1099,7 @@ async function probeRefused(
 ): Promise<void> {
   const fp0 = settingsFingerprint(c.db, c.agentId);
   const before = maxAuditId(c.db, c.agentId);
-  const w = setOwnerFeatureValue(VERTICAL, c.agentId, e.key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+  const w = probeWrite(c, e.key, value);
   const t0 = Date.now();
   const status = putStatusFor(w);
   const unchanged = settingsFingerprint(c.db, c.agentId) === fp0 && maxAuditId(c.db, c.agentId) === before;
@@ -1029,7 +1115,7 @@ async function probeRefused(
       pass: refused && unchanged && r.pass,
       observed: `PUT ${JSON.stringify(displayValue(e, value))} → ${status}${w.kind === "blocked" ? ` ${w.block}` : ""}; ${r.observed}`,
       expected: `409 ${block}, ingenting lagret, effekt ${exp ? "til stede" : "borte"} som før`,
-      ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: null,
+      ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: null, discriminating: false,
       ...(!refused ? { reason: `ventet 409 ${block}, fikk ${status}${w.kind === "blocked" ? ` ${w.block}` : ""}` }
         : !unchanged ? { reason: "en avvist skriving endret lagret tilstand eller skrev en logglinje" }
         : !r.pass ? { reason: r.error ? `leser feilet: ${r.error}` : "effekten fulgte ikke forventningen" } : {}),
@@ -1046,7 +1132,7 @@ async function probeLocked(c: Ctx, e: OwnerFeatureEntry): Promise<void> {
   if (!parent) {
     for (const s of e.surfaces) {
       for (const d of ["parent_off", "parent_on"] as ProbeDirection[]) {
-        pushRow(c, { key: e.key, surface: s, direction: d, pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, reason: "låst nøkkel uten lockedWhen" });
+        pushRow(c, { key: e.key, surface: s, direction: d, pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, discriminating: false, reason: "låst nøkkel uten lockedWhen" });
       }
     }
     return;
@@ -1056,7 +1142,7 @@ async function probeLocked(c: Ctx, e: OwnerFeatureEntry): Promise<void> {
   for (const d of order) {
     const value = d === "parent_on";
     const before = maxAuditId(c.db, c.agentId);
-    const w = setOwnerFeatureValue(VERTICAL, c.agentId, parent.key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+    const w = probeWrite(c, parent.key, value);
     const t0 = Date.now();
     const status = putStatusFor(w);
     const logged = w.kind === "ok" && w.changed ? changeLogged(c, parent.key, value, before) : w.kind === "ok" ? null : false;
@@ -1072,7 +1158,7 @@ async function probeLocked(c: Ctx, e: OwnerFeatureEntry): Promise<void> {
         pass: w.kind === "ok" && logged !== false && followsParent && r.pass,
         observed: `${parent.key}=${value} → ${status}; ${e.key}=${lockedValue?.value} (låst); ${r.observed}`,
         expected: `${e.key} følger ${parent.key}: effekt ${value ? "til stede" : "borte"}`,
-        ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: logged,
+        ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: logged, discriminating: true,
         ...(w.kind !== "ok" ? { reason: `skrivingen av ${parent.key} ble avvist (${status})` }
           : logged === false ? { reason: "endringen mangler i endringsloggen" }
           : !followsParent ? { reason: "den låste nøkkelen fulgte ikke forelderen" }
@@ -1091,7 +1177,7 @@ async function probeConfirmByEmail(c: Ctx, e: OwnerFeatureEntry): Promise<void> 
     const fp0 = settingsFingerprint(c.db, c.agentId);
     const rec0 = fingerprint();
     const before = maxAuditId(c.db, c.agentId);
-    const w = setOwnerFeatureValue(VERTICAL, c.agentId, e.key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+    const w = probeWrite(c, e.key, value);
     const status = putStatusFor(w);
     const unchanged = settingsFingerprint(c.db, c.agentId) === fp0 && maxAuditId(c.db, c.agentId) === before;
     const refused = w.kind === "blocked" && w.block === "confirm_by_email";
@@ -1104,7 +1190,7 @@ async function probeConfirmByEmail(c: Ctx, e: OwnerFeatureEntry): Promise<void> 
         pass: refused && unchanged && same,
         observed: `PUT ${JSON.stringify(displayValue(e, value))} → ${status}${w.kind === "blocked" ? ` ${w.block}` : ""}; ordrevarsel ${rec1}`,
         expected: "409 confirm_by_email, ingenting lagret, mottakeren uendret (endres bare med bekreftelseslenken)",
-        ms_to_effect: null, write_status: status, change_logged: null,
+        ms_to_effect: null, write_status: status, change_logged: null, discriminating: false,
         ...(!refused ? { reason: `ventet 409 confirm_by_email, fikk ${status}` }
           : !unchanged ? { reason: "en avvist skriving endret lagret tilstand" }
           : !same ? { reason: "mottakeren endret seg" } : {}),
@@ -1167,7 +1253,7 @@ function checkComingSoon(c: Ctx): void {
     const fp0 = settingsFingerprint(c.db, c.agentId);
     const sig0 = effectSignature(c);
     const before = maxAuditId(c.db, c.agentId);
-    const w = setOwnerFeatureValue(VERTICAL, c.agentId, e.key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+    const w = probeWrite(c, e.key, value);
     const status = putStatusFor(w);
     const after = resolvedNow(c).byKey[e.key];
     const noEffect = settingsFingerprint(c.db, c.agentId) === fp0 && maxAuditId(c.db, c.agentId) === before
@@ -1206,17 +1292,17 @@ function checkRequirements(c: Ctx): void {
       c.db.transaction(() => {
         // The key off first (an owner may always turn it off), so an accepted
         // «on» would be visible; then the requirement made unmet.
-        setOwnerFeatureValue(VERTICAL, c.agentId, e.key, false, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+        probeWrite(c, e.key, false);
         if (req === "isVerifiedBadge") {
           c.db.prepare(`UPDATE agents SET is_verified = 0 WHERE id = ? AND ${FIXTURE_PIN}`).run(c.agentId);
         } else {
-          setOwnerFeatureValue(VERTICAL, c.agentId, req, false, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+          probeWrite(c, req, false);
         }
         const stored = () => JSON.stringify(snapshotFixture(c.db, c.agentId));
         const before = maxAuditId(c.db, c.agentId);
         const fp0 = stored();
         const effects0 = JSON.stringify(syncDefs.map(([s, f]) => [s, f!(c.readerCtx).endpoints]));
-        const w = setOwnerFeatureValue(VERTICAL, c.agentId, e.key, true, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+        const w = probeWrite(c, e.key, true);
         const status = putStatusFor(w);
         const nothing = maxAuditId(c.db, c.agentId) === before && stored() === fp0;
         const effects = syncDefs.map(([s, f]) => [s, f!(c.readerCtx)] as const);
@@ -1244,7 +1330,7 @@ function checkLevels(c: Ctx, baseline: ResolvedOwnerFeatures): void {
     const keys = level.values.map(([k]) => k).filter((k) => findOwnerFeature(k)?.status === "live");
     restoreValues(c, baseline, keys);
     for (const [k, v] of level.values) {
-      if (findOwnerFeature(k)?.status === "live") setOwnerFeatureValue(VERTICAL, c.agentId, k, v, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+      if (findOwnerFeature(k)?.status === "live") probeWrite(c, k, v);
     }
     const single = effectSignature(c);
     restoreValues(c, baseline, keys);
@@ -1310,7 +1396,7 @@ function checkNoSurface(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureValu
   for (const d of dirs) {
     const value = d === "on";
     const before = maxAuditId(c.db, c.agentId);
-    const w = setOwnerFeatureValue(VERTICAL, c.agentId, e.key, value, SWITCH_PROBE_ACTOR, { db: c.db, env: c.env });
+    const w = probeWrite(c, e.key, value);
     const logged = w.kind === "ok" && w.changed && changeLogged(c, e.key, value, before);
     const val = resolvedNow(c).byKey[e.key]?.value;
     ok = ok && w.kind === "ok" && logged && val === value;
@@ -1320,7 +1406,7 @@ function checkNoSurface(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureValu
 }
 
 function readerContext(db: any, agentId: string, env: NodeJS.ProcessEnv): ProbeReaderContext {
-  return { db, env, fixture: loadFixture(db, agentId), adminKey: env.ADMIN_KEY || env.ANALYTICS_ADMIN_KEY || "" };
+  return { db, env, fixture: loadFixture(db, agentId), adminKey: env.ADMIN_KEY || env.ANALYTICS_ADMIN_KEY || "", created: new Map() };
 }
 
 /** Dry run: the plan and the starting values. Reads only. */
@@ -1331,7 +1417,7 @@ export function dryRunSwitchProbe(agentId: string, opts: SwitchProbeOptions = {}
   const plan = planSwitchProbe(db, agentId, env, { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) });
   const result: SwitchProbeResult & { plan: SwitchProbePlan } = {
     ok: true, dry_run: true, agent_id: agentId, started_at: started, finished_at: new Date().toISOString(),
-    env_flags: plan.env_flags, rows: [], checks: [], pass: 0, fail: 0, restored: true, restore_diff: [],
+    env_flags: plan.env_flags, rows: [], checks: [], pass: 0, fail: 0, restored: true, restore_diff: [], side_effects: [],
     ready_for_daniel_test: false, markdown: renderSwitchProbePlanMarkdown(plan, started), plan,
   };
   return result;
@@ -1350,16 +1436,20 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
   const started = new Date().toISOString();
   const c: Ctx = {
     db, env, agentId,
-    readers: { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) },
-    readerCtx: readerContext(db, agentId, env),
+    readers: {},
+    // Set inside the try (loadFixture reads the DB), so the run lock is always released.
+    readerCtx: { db, env, fixture: null as unknown as ProbeFixture, adminKey: "", created: new Map() },
     maxWaitMs: Math.min(Math.max(0, Math.floor(opts.maxWaitMs ?? SWITCH_PROBE_DEFAULT_MAX_WAIT_MS)), SWITCH_PROBE_MAX_WAIT_CAP_MS),
-    rows: [], checks: [], afterFlip: opts.afterFlip,
+    rows: [], checks: [], afterFlip: opts.afterFlip, write: opts.write ?? setOwnerFeatureValue,
   };
   let snap: FixtureSnapshot | null = null;
   let error: string | undefined;
   let restored = false;
   let restoreDiff: Array<{ table: string; before: unknown; after: unknown }> = [];
+  let sideEffects: Array<{ table: string; created: number; removed: number }> = [];
   try {
+    c.readers = { ...defaultSwitchProbeReaders(), ...(opts.readers || {}) };
+    c.readerCtx = readerContext(db, agentId, env);
     snap = snapshotFixture(db, agentId);
     const baseline = resolvedNow(c);
     for (const e of liveEntries()) {
@@ -1376,7 +1466,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
       else if (kind === "confirm_by_email") await probeConfirmByEmail(c, e);
       else {
         for (const s of e.surfaces) {
-          pushRow(c, { key: e.key, surface: s, direction: "on", pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, reason: `typen ${e.type} støttes ikke av proben` });
+          pushRow(c, { key: e.key, surface: s, direction: "on", pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, discriminating: false, reason: `typen ${e.type} støttes ikke av proben` });
         }
       }
       restoreValues(c, baseline, liveEntries().map((x) => x.key));
@@ -1391,12 +1481,17 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     try {
       if (snap) {
         restoreSnapshot(db, agentId, snap);
-        restoreDiff = diffSnapshots(snap, snapshotFixture(db, agentId));
+        restoreDiff = maskDeep(diffSnapshots(snap, snapshotFixture(db, agentId)));
         restored = restoreDiff.length === 0;
       }
     } catch (e: any) {
       restored = false;
       error = error ? `${error}; restore: ${String(e?.message || e)}` : `restore: ${String(e?.message || e)}`;
+    }
+    try {
+      sideEffects = removeSideEffects(c.readerCtx);
+    } catch (e: any) {
+      error = error ? `${error}; side effects: ${String(e?.message || e)}` : `side effects: ${String(e?.message || e)}`;
     }
     running = false;
   }
@@ -1420,6 +1515,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     fail,
     restored,
     restore_diff: restoreDiff,
+    side_effects: sideEffects,
     ready_for_daniel_test: !error && fail === 0 && restored && c.rows.length > 0,
     ...(error ? { error } : {}),
     markdown: "",
@@ -1459,12 +1555,16 @@ export function renderSwitchProbeMarkdown(r: SwitchProbeResult): string {
   if (r.error) lines.push(`- Kjøringen ble avbrutt: ${cell(r.error)}`);
   lines.push("", "## Miljøflagg", "", "| Flagg | Verdi |", "|---|---|");
   for (const [k, v] of Object.entries(r.env_flags)) lines.push(`| ${k} | ${v === null ? "(ikke satt)" : cell(v)} |`);
-  lines.push("", "## Bryter × flate × retning", "", "| Nøkkel | Flate | Retning | Resultat | Observert | Tid til effekt (ms) | Merknad |", "|---|---|---|---|---|---|---|");
+  lines.push("", "## Bryter × flate × retning", "");
+  lines.push("«Skiller» = nei: en avvist skriving (låst valg / løfte / bekreftelse på e-post) der flaten skal vise det samme før og etter. En leser som aldri endrer seg ville også bestått, så raden viser bare at skrivingen ble avvist, ikke at flaten reagerer på bryteren.", "");
+  lines.push("| Nøkkel | Flate | Retning | Resultat | Skiller | Observert | Tid til effekt (ms) | Merknad |", "|---|---|---|---|---|---|---|---|");
   for (const row of r.rows) {
-    lines.push(`| ${row.key} | ${row.surface} | ${row.direction} | ${row.result} | ${cell(row.observed)} | ${row.ms_to_effect ?? "—"} | ${cell(row.reason ?? "")} |`);
+    lines.push(`| ${row.key} | ${row.surface} | ${row.direction} | ${row.result} | ${row.discriminating ? "ja" : "nei"} | ${cell(row.observed)} | ${row.ms_to_effect ?? "—"} | ${cell(row.reason ?? "")} |`);
   }
   lines.push("", "## Ekstra kontroller", "", "| Kontroll | Resultat | Observert | Merknad |", "|---|---|---|---|");
   for (const ch of r.checks) lines.push(`| ${cell(ch.check)} | ${ch.result} | ${cell(ch.observed)} | ${cell(ch.reason ?? "")} |`);
+  lines.push("", "## Sideeffekter av lesingene", "", "Offentlige lesestier logger egne rader. Proben fanger radene den selv lagde (rowid) og sletter bare dem.", "", "| Tabell | Laget av proben | Slettet igjen |", "|---|---|---|");
+  for (const x of r.side_effects) lines.push(`| ${x.table} | ${x.created} | ${x.removed} |`);
   if (r.restore_diff.length) {
     lines.push("", "## Avvik etter gjenoppretting", "");
     for (const d of r.restore_diff) lines.push(`- ${d.table}: før ${cell(JSON.stringify(d.before))} · etter ${cell(JSON.stringify(d.after))}`);

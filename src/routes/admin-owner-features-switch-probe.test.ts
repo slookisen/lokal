@@ -127,6 +127,14 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
     // Starting state with explicit choices, so the restore has something to put back.
     db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, 'comms.news', 'true', 'owner', 0, '2026-10-20T10:00:00.000Z')`).run(FIX);
     db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'yes', '2026-10-20T10:00:00.000Z', ?)`).run(FIX, FIX_EMAIL);
+    // A real owner's stored state next to the fixture: the probe must never touch it.
+    for (const [k, v] of [["comms.news", "false"], ["visibility.english", "false"]]) {
+      db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, ?, ?, 'owner', 0, '2026-10-19T09:00:00.000Z')`).run(REAL, k, v);
+    }
+    db.prepare(`INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until, set_by) VALUES (?, '2026-10-19T09:00:00.000Z', '2099-01-01', 'owner')`).run(REAL);
+    db.prepare(`INSERT INTO owner_feature_level_choice (vertical, subject_id, level, chosen_at, actor_detail, batch_id) VALUES ('rfb', ?, 'bare_synlig', '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no', NULL)`).run(REAL);
+    db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'no', '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no')`).run(REAL);
+    db.prepare(`UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?`).run(JSON.stringify({ about: { by: "owner", locked_at: "2026-10-19T09:00:00.000Z" } }), REAL);
 
     const setBaseEnv = () => {
       for (const k of SAVED_ENV) delete process.env[k];
@@ -159,6 +167,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
           .catch((e: any) => resolve({ status: 598, body: String(e) }));
       });
 
+    const vis0 = (b: any) => (b.rows ?? []).filter((x: any) => x.key === "visibility.profile");
     const count = (sql: string, ...p: unknown[]) => (db.prepare(sql).get(...p) as { n: number }).n;
     const totalChanges = () => count("SELECT total_changes() AS n");
     const auditRows = () => count("SELECT COUNT(*) AS n FROM owner_feature_audit");
@@ -171,6 +180,18 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       intro: db.prepare("SELECT * FROM owner_feature_intro WHERE subject_id = ?").all(id),
       knowledge: db.prepare("SELECT about, curated_fields, email FROM agent_knowledge WHERE agent_id = ?").get(id),
     });
+
+    const realBefore = rawState(REAL);
+    const realUntouched = (label: string) => assertEq(rawState(REAL), realBefore, `${label}: the real owner's stored state (settings, pause, level, intro, curated_fields) byte-identical`);
+    const tableCounts = (): Record<string, number> => {
+      const out: Record<string, number> = {};
+      for (const t of db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).all() as Array<{ name: string }>) {
+        try { out[t.name] = count(`SELECT COUNT(*) AS n FROM "${t.name}"`); } catch { /* virtual table */ }
+      }
+      return out;
+    };
+    const grown = (a: Record<string, number>, b: Record<string, number>) =>
+      Object.keys(b).filter((k) => b[k] !== a[k]).map((k) => `${k}: ${a[k]} → ${b[k]}`);
 
     // ═══ Gate ═════════════════════════════════════════════════════════════
     delete process.env.OWNER_FEATURES_SWITCH_PROBE_ENABLED;
@@ -227,6 +248,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       const before = rawState(FIX);
       const a0 = auditRows();
       const m0 = mailCalls;
+      const t0 = tableCounts();
       const r = await call({ dry_run: false, max_wait_ms: 500 });
       const b = r.body ?? {};
       assertEq([r.status, b.ok, b.dry_run, b.agent_id], [200, true, false, FIX], "run-1: 200 ok on the fixture");
@@ -262,12 +284,21 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(checks.some((c) => c.check === "no_surface:comms.news" && c.result === "PASS"), "run-17: comms.news (no surface): write + change log");
       assertTrue(checks.some((c) => c.check === "restore" && c.result === "PASS"), "run-18: restore check PASS");
       assertEq(rawState(FIX), before, "run-19: the fixture's stored choices byte-identical to the snapshot afterwards");
+      realUntouched("run-19b");
+      assertEq(grown(t0, tableCounts()).filter((x) => !/^owner_feature_(audit|change_batch):/.test(x)), [], "run-19c: no table grows except the change log (the readers' own rows are removed)");
+      const se: any[] = b.side_effects ?? [];
+      assertTrue(se.some((x) => x.table === "tasks" && x.created > 0) && se.every((x) => x.removed === x.created), "run-19d: side effects reported (A2A tasks created by the probe) and removed exactly");
+      assertTrue(/## Sideeffekter av lesingene/.test(String(b.markdown)), "run-19e: side effects in the report");
+      const refusedAll = (b.rows ?? []).filter((x: any) => x.write_status === 409);
+      assertTrue(refusedAll.length > 0 && refusedAll.every((x: any) => x.discriminating === false), "run-19f: refused-write rows are marked non-discriminating");
+      assertTrue(vis0(b).every((x: any) => x.discriminating === true), "run-19g: switch rows are discriminating");
+      assertTrue(String(b.markdown).includes("| Skiller |") && String(b.markdown).includes("«Skiller» = nei"), "run-19h: the report explains the non-discriminating rows");
       assertTrue(auditRows() > a0, "run-20: the probe's writes are in the change log");
       assertEq(count("SELECT COUNT(*) AS n FROM owner_feature_audit WHERE subject_id = ? AND id > ? AND NOT (actor = 'admin' AND actor_detail IN ('switch-probe', 'switch-probe:restore'))", FIX, a0), 0, "run-21: every audit row is the probe's (actor admin, switch-probe)");
       assertEq(count("SELECT COUNT(*) AS n FROM owner_feature_audit WHERE subject_id <> ? AND id > ?", FIX, a0), 0, "run-22: nothing written for any other subject");
       assertEq(mailCalls - m0, 0, "run-23: e-mail surfaces never call a mailer (spied)");
       const md = String(b.markdown || "");
-      assertTrue(md.includes("| Nøkkel | Flate | Retning | Resultat | Observert | Tid til effekt (ms) | Merknad |"), "run-24: Markdown report table");
+      assertTrue(md.includes("| Nøkkel | Flate | Retning | Resultat | Skiller | Observert | Tid til effekt (ms) | Merknad |"), "run-24: Markdown report table");
       assertTrue(/## FUNN TIL OPPFØLGING\n- \[FUNN\] ingen/.test(md), "run-25: report ends with the findings block (ingen)");
       assertTrue(!md.includes(FIX_EMAIL) && !JSON.stringify(b).includes(FIX_EMAIL), "run-26: no e-mail address in the report or response");
       assertTrue(b.env_flags?.OWNER_LOCK_ENFORCE_WRITES === "1" && b.env_flags?.OUTREACH_UNSUBSCRIBE_ENABLED === "1", "run-27: env flags reported");
@@ -310,6 +341,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(gate.length === 2 && gate.every((x) => x.result === "FAIL" && /injected reader failure/.test(x.reason || "")), "fail-1: a throwing reader → its rows FAIL with the error");
       assertEq([r.ok, r.restored], [true, true], "fail-2: the run completes and restores");
       assertEq(rawState(FIX), before, "fail-3: byte-identical after a reader failure");
+      realUntouched("fail-3b");
     }
     {
       const before = rawState(FIX);
@@ -327,7 +359,60 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertEq([r.ok, r.restored, r.ready_for_daniel_test], [false, true, false], "fail-5: ok:false, restored:true");
       assertTrue(/injected mid-run failure/.test(r.error || "") && /kjøringen ble avbrutt/.test(r.markdown), "fail-6: the error is reported");
       assertEq(rawState(FIX), before, "fail-7: byte-identical after the abort (pause row gone)");
+      realUntouched("fail-7b");
       assertTrue(!probe.isSwitchProbeRunning(), "fail-8: the run lock is released");
+    }
+
+    // ═══ Vacuous-PASS guards: the checks FAIL when the write path is broken ═══
+    {
+      const rs = require("../owner-features/resolve") as typeof import("../owner-features/resolve");
+      const before = rawState(FIX);
+      // (a) the write is accepted but its audit row is missing → «not in the change log».
+      const dropAudit: import("../owner-features/switch-probe").ProbeWriteFn = (v, id, key, val, actor, o) => {
+        const out = rs.setOwnerFeatureValue(v, id, key, val, actor, o);
+        if (out.kind === "ok" && out.changed) db.prepare(`DELETE FROM owner_feature_audit WHERE id = (SELECT MAX(id) FROM owner_feature_audit WHERE subject_id = ? AND key = ?)`).run(FIX, key);
+        return out;
+      };
+      const a = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, write: dropAudit });
+      const flips = a.rows.filter((x) => x.key === "visibility.profile" || (x.key === "orders.enabled"));
+      assertTrue(flips.length > 0 && flips.every((x) => x.result === "FAIL" && x.change_logged === false && /endringsloggen/.test(x.reason || "")), "vac-1: an accepted write without its audit row → the switch rows FAIL");
+      assertTrue(a.checks.some((x) => x.check === "no_surface:comms.news" && x.result === "FAIL"), "vac-2: … and the no-surface check FAILs");
+      assertEq([a.restored, rawState(FIX)], [true, before], "vac-3: restored");
+      // (b) a coming_soon key whose write is accepted → its check FAILs.
+      const csKey = "visibility.ai_assistants";
+      const regCs = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === csKey ? { ...e, status: "live" as const } : e));
+      const acceptCs: import("../owner-features/switch-probe").ProbeWriteFn = (v, id, key, val, actor, o) =>
+        rs.setOwnerFeatureValue(v, id, key, val, actor, key === csKey ? { ...o, registry: regCs } : o);
+      const b2 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, write: acceptCs });
+      const cs = b2.checks.find((x) => x.check === `coming_soon:${csKey}`);
+      assertTrue(!!cs && cs.result === "FAIL", `vac-4: an accepted write on coming_soon ${csKey} → its check FAILs`);
+      assertTrue(b2.checks.filter((x) => x.check.startsWith("coming_soon:") && x.check !== `coming_soon:${csKey}`).every((x) => x.result === "PASS"), "vac-5: … the other coming_soon checks still PASS");
+      assertEq([b2.restored, rawState(FIX)], [true, before], "vac-6: restored");
+      // (c) the requirement not enforced → the requirement check FAILs.
+      const regReq = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "orders.enabled" ? { ...e, requires: [] } : e));
+      const noReq: import("../owner-features/switch-probe").ProbeWriteFn = (v, id, key, val, actor, o) =>
+        rs.setOwnerFeatureValue(v, id, key, val, actor, key === "orders.enabled" ? { ...o, registry: regReq } : o);
+      const c3 = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0, write: noReq });
+      const rq = c3.checks.find((x) => x.check === "requirement_unmet:orders.enabled");
+      assertTrue(!!rq && rq.result === "FAIL", "vac-7: requirement not enforced → requirement_unmet check FAILs");
+      assertEq([c3.restored, rawState(FIX)], [true, before], "vac-8: restored");
+      realUntouched("vac-9");
+    }
+
+    // ═══ Run lock is released when the setup throws ═══════════════════════
+    {
+      const badDb = new Proxy(db as any, {
+        get(t, p) {
+          if (p === "prepare") return (sql: string) => { if (sql.includes("SELECT id, name, city, categories")) throw new Error("injected setup failure"); return t.prepare(sql); };
+          const v = t[p];
+          return typeof v === "function" ? v.bind(t) : v;
+        },
+      });
+      const r = await probe.runSwitchProbe(FIX, { db: badDb, maxWaitMs: 0 });
+      assertTrue(r.ok === false && /injected setup failure/.test(r.error || ""), "lock-1: a failing setup → ok:false with the error");
+      assertTrue(!probe.isSwitchProbeRunning(), "lock-2: the run lock is released");
+      const again = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      assertTrue(again.ok === true, "lock-3: the next run starts");
     }
 
     // ═══ Concurrency ══════════════════════════════════════════════════════
@@ -353,6 +438,15 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       }
       assertEq(missing, [], "gov-1: every live key × surface has a switch-probe effect reader (a new live surface needs one)");
       assertEq(probe.maskEmail("daniel@example.com"), "d***@example.com", "help-1: maskEmail");
+      assertEq(probe.maskDeep([{ table: "agents", before: { order_notification_email: "daniel@example.com", n: 1 }, after: { actor_detail: "x@y.no" } }]),
+        [{ table: "agents", before: { order_notification_email: "d***@example.com", n: 1 }, after: { actor_detail: "x***@y.no" } }], "help-1b: restore_diff e-mails masked");
+      const ev = probe.evaluateObservation;
+      assertEq([
+        ev({ endpoints: { card: true, info: false }, requireAll: true }, true, null).pass,
+        ev({ endpoints: { card: true, info: true }, requireAll: true }, true, null).pass,
+        ev({ endpoints: { home: true, city: false } }, true, null).pass,
+        ev({ endpoints: { home: false, city: true } }, false, null).pass,
+      ], [false, true, true, false], "help-3: single-object surfaces need every endpoint for «on»; list surfaces one; «off» needs none");
       assertEq([
         probe.putStatusFor({ kind: "blocked", block: "locked", reason: { no: "", en: "" } }),
         probe.putStatusFor({ kind: "invalid_value", reason: { no: "", en: "" } }),
