@@ -35,6 +35,10 @@ import {
 import {
   stockCheckOn, soonExpiringItems, confirmStockCheckItems, formatStockCheckDate, type StockCheckItem,
 } from "../services/stock-check-reminder";
+import {
+  getOwnerImportOverview, productImportEnabled, profileWebsite, OWNER_FETCH_BUSY_MESSAGE, OWNER_FETCH_DAILY_LIMIT_MESSAGE,
+  OWNER_FETCH_RUNNING_MESSAGE, OWNER_IMPORT_NO_WEBSITE_MESSAGE,
+} from "../services/product-import/owner-import";
 
 const router = Router();
 
@@ -935,7 +939,7 @@ export function portalWriteRefusedPage(backHref: string, backLabel = "Tilbake ti
   return portalShell(WRITE_GUARD_REFUSED_TITLE, `<div class="ep-card">${writeGuardRefusedBody({ contact: WRITE_GUARD_CONTACT_RFB, backHref, backLabel })}</div>`);
 }
 
-export function portalShell(title: string, body: string): string {
+export function portalShell(title: string, body: string, opts: { headHtml?: string } = {}): string {
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
@@ -949,7 +953,7 @@ export function portalShell(title: string, body: string): string {
   <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
   <script defer src="/install-prompt.js"></script>
   <title>${escapeHtml(title)} — Rett fra Bonden</title>
-  <style>${PORTAL_PALETTE_CSS}</style>
+  <style>${PORTAL_PALETTE_CSS}</style>${opts.headHtml ? `\n  ${opts.headHtml}` : ""}
 </head>
 <body>
   <div class="ep-shell">
@@ -1781,6 +1785,23 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       }
     }
 
+    // Produktimport skive 3-2: «Hent produkter fra nettsiden min» — only with
+    // PRODUCT_IMPORT_ENABLED on, a verified owner, agents.is_verified = 1 and a
+    // website (flag off = the portal is byte-identical to before).
+    let productImportCard = "";
+    try {
+      if (productImportCardVisible(agentId, session, agent.is_verified)) {
+        const ia = productImportPortalAlert(status, req.query as any, productImportStockHintHtml(agentId));
+        const iaHtml = ia
+          ? `<div class="ep-alert ${ia.ok ? "ep-alert-ok" : "ep-alert-error"}" role="${ia.ok ? "status" : "alert"}" data-import-alert="${escapeHtml(status)}">${ia.html}</div>`
+          : "";
+        productImportCard = productImportCardHtml(agentId, getOwnerImportOverview(agentId), iaHtml);
+      }
+    } catch (e) {
+      console.error("[owner-portal] product import card failed:", e instanceof Error ? e.message : "error");
+      productImportCard = "";
+    }
+
     const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
     // S2e: with «Mine valg», the «Bestillinger» card (and its order-address
     // section) is replaced by a link there; otherwise unchanged.
@@ -1875,7 +1896,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
+      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -2399,7 +2420,7 @@ export function ownerSelgerCardHtml(agentId: string): string {
 // existing write path; parameterized SQL; agent_knowledge_audit row).
 // ─────────────────────────────────────────────────────────────────
 
-const ORDERABILITY_ANCHOR = "bestillbare-varer";
+export const ORDERABILITY_ANCHOR = "bestillbare-varer";
 
 /** status=… after a B1 POST → the portal alert. null = not a B1 status. */
 export function ownerOrderabilityAlert(status: string, rawFields: unknown, rawNoPrice?: unknown): { ok: boolean; text: string } | null {
@@ -2620,6 +2641,143 @@ router.post("/eier/:agentId/varer/:productId/bekreft", express.urlencoded({ exte
     return res.redirect(303, orderabilityBack(auth.agentId, "vare_feil"));
   }
 });
+
+// ─────────────────────────────────────────────────────────────────
+// Produktimport skive 3-2 (dev-request 2026-10-21-rfb-produktimport-fra-
+// egen-nettside): portal card «Hent produkter fra nettsiden min». Rendered
+// only with PRODUCT_IMPORT_ENABLED on, for a verified owner (isVerifiedOwner)
+// of a profile with agents.is_verified = 1 and a stored website. Hiding the
+// card is not the protection: the form routes (routes/owner-product-import.ts)
+// run the same checks as the JSON API on every call.
+// ─────────────────────────────────────────────────────────────────
+
+export const PRODUCT_IMPORT_ANCHOR = "produktimport";
+
+/** The UTC "YYYY-MM-DD HH:MM:SS" run timestamp as an owner-readable date + time (Europe/Oslo). "" when unreadable. */
+export function formatImportRunTime(sqlTs: string | null | undefined): string {
+  if (!sqlTs) return "";
+  const d = new Date(/T/.test(sqlTs) ? sqlTs : `${sqlTs.replace(" ", "T")}Z`);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * A fetch outcome in plain Norwegian, for the zero-result screen and the
+ * card. Covers the extractor's outcome codes (ok, no_products_found,
+ * robots_blocked, fetch_failed:*, js_unreadable, grounding_rejected_all) and
+ * the run-level ones (timeout, failed, interrupted). null for ok / unknown.
+ */
+export function productImportOutcomeTextNb(outcome: string | null | undefined): string | null {
+  if (!outcome || outcome === "ok") return null;
+  if (outcome === "no_products_found") return "Vi leste nettsiden, men fant ingen varer med pris der.";
+  if (outcome === "robots_blocked") return "Nettsiden ber roboter om ikke å lese sidene (robots.txt), så vi hentet ingenting.";
+  if (outcome === "js_unreadable") return "Nettsiden bygges med JavaScript i nettleseren, så vi kunne ikke lese produktene.";
+  if (outcome === "grounding_rejected_all") return "Det vi fant, sto ikke ordrett på nettsiden, så vi tok det ikke med.";
+  if (outcome.startsWith("fetch_failed")) return "Vi fikk ikke kontakt med nettsiden. Sjekk at adressen i profilen er riktig.";
+  if (outcome === "timeout") return "Hentingen tok for lang tid og ble stoppet.";
+  if (outcome === "interrupted") return "Hentingen ble avbrutt før den var ferdig.";
+  if (outcome === "failed") return "Noe gikk galt under hentingen.";
+  return null;
+}
+
+/** status=produktimport_… after a form POST → the card's alert. null = not ours. */
+export function productImportPortalAlert(
+  status: string,
+  query: { publisert?: unknown; fjernet?: unknown; avvist?: unknown },
+  stockHint: string,
+): { ok: boolean; html: string } | null {
+  const num = (v: unknown) => (typeof v === "string" && /^\d{1,4}$/.test(v) ? Number(v) : 0);
+  const varer = (n: number) => `${n} ${n === 1 ? "vare" : "varer"}`;
+  switch (status) {
+    case "produktimport_publisert": {
+      const pub = num(query.publisert);
+      const rem = num(query.fjernet);
+      const rej = num(query.avvist);
+      const parts: string[] = [];
+      parts.push(`${varer(pub)} publisert`);
+      if (rem > 0) parts.push(`${varer(rem)} fjernet`);
+      let text = `${parts.join(" og ")}.`;
+      if (rej > 0) text += ` ${varer(rej)} kunne ikke legges inn (kategorinavn, alkohol eller tjeneste).`;
+      return {
+        ok: true,
+        html: `<span data-import-published="${pub}" data-import-removed="${rem}">${escapeHtml(text)}</span>${pub > 0 ? ` ${stockHint}` : ""}`,
+      };
+    }
+    case "produktimport_grense": return { ok: false, html: escapeHtml(OWNER_FETCH_DAILY_LIMIT_MESSAGE) };
+    case "produktimport_opptatt": return { ok: false, html: escapeHtml(OWNER_FETCH_BUSY_MESSAGE) };
+    case "produktimport_pagar": return { ok: false, html: escapeHtml(`${OWNER_FETCH_RUNNING_MESSAGE} Prøv igjen om litt.`) };
+    case "produktimport_ingen_nettside": return { ok: false, html: escapeHtml(OWNER_IMPORT_NO_WEBSITE_MESSAGE) };
+    case "produktimport_feil": return { ok: false, html: "Noe gikk galt. Prøv igjen om litt." };
+    default: return null;
+  }
+}
+
+/** Where imported products are made orderable: the B1 card when it is on for this profile, else a plain sentence. */
+export function productImportStockHintHtml(agentId: string): string {
+  let b1 = false;
+  try { b1 = ownerOrderabilityPortalEnabledFor(agentId); } catch { b1 = false; }
+  const text = "Importerte varer kan ikke bestilles før du har bekreftet at de er på lager";
+  return b1
+    ? `<span data-stock-hint="b1">${text} under <a href="/eier/${encodeURIComponent(agentId)}/portal#${ORDERABILITY_ANCHOR}">«Varer som kan bestilles»</a>.</span>`
+    : `<span data-stock-hint="text">${text}.</span>`;
+}
+
+/** Card visibility: flag on, verified owner of this profile, agents.is_verified = 1, a stored website. */
+export function productImportCardVisible(agentId: string, session: { valid: boolean; agentId?: string }, agentIsVerified: number): boolean {
+  if (!productImportEnabled()) return false;
+  if (agentIsVerified !== 1) return false;
+  if (!isVerifiedOwner(agentId, session)) return false;
+  return !!profileWebsite(agentId);
+}
+
+type ImportOverview = ReturnType<typeof getOwnerImportOverview>;
+
+/** One run's status line for the card. */
+function importRunStatusText(run: ImportOverview["runs"][number]): string {
+  const when = formatImportRunTime(run.created_at);
+  const at = when ? ` (${when})` : "";
+  if (run.status === "running") return `Henter produkter nå${at}. Siden med forslag oppdaterer seg selv.`;
+  if (run.status === "completed") {
+    const l = run.log;
+    if (l.published_by_owner) return `Siste henting${at}: ${l.count_published} publisert, ${l.count_removed} fjernet.`;
+    const found = l.count_new + l.count_changed;
+    if (found === 0 && run.outcome !== "ok") {
+      return `Siste henting${at}: Fant ingen produkter med pris. ${productImportOutcomeTextNb(run.outcome) ?? ""}`.trim();
+    }
+    return `Siste henting${at}: ${l.count_new} nye, ${l.count_changed} med endret pris eller enhet, ${l.count_not_found} ikke funnet. Ikke publisert ennå.`;
+  }
+  return `Siste henting${at} ble ikke fullført. ${productImportOutcomeTextNb(run.outcome) ?? ""}`.trim();
+}
+
+/** The card. Pure rendering of getOwnerImportOverview() (+ an optional alert). */
+export function productImportCardHtml(agentId: string, o: ImportOverview, alertHtml = ""): string {
+  const id = encodeURIComponent(agentId);
+  const website = o.website ?? "";
+  const websiteHtml = /^https?:\/\//i.test(website)
+    ? `<a href="${escapeHtml(website)}" rel="noopener nofollow" target="_blank">${escapeHtml(website)}</a>`
+    : escapeHtml(website);
+  const latest = o.runs[0] ?? null;
+  const running = latest?.status === "running";
+  const latestHtml = latest
+    ? `<p data-import-latest-status="${escapeHtml(latest.status)}"${latest.outcome ? ` data-import-latest-outcome="${escapeHtml(latest.outcome)}"` : ""}>${escapeHtml(importRunStatusText(latest))}
+          <a href="/eier/${id}/produktimport/${encodeURIComponent(latest.run_id)}">${running ? "Følg hentingen" : "Se forslagene"}</a></p>`
+    : `<p class="ep-audit-meta">Du har ikke hentet produkter fra nettsiden ennå.</p>`;
+  const action = running
+    ? ""
+    : o.fetches_left_today <= 0
+      ? `<p class="ep-audit-meta" data-import-limit="1">${escapeHtml(OWNER_FETCH_DAILY_LIMIT_MESSAGE)}</p>`
+      : `<form method="post" action="/eier/${id}/produktimport/hent" style="margin:8px 0 0;">
+            <button type="submit" class="ep-btn ep-btn-primary">Hent produkter fra nettsiden min</button>
+          </form>`;
+  return `<div class="ep-card" id="${PRODUCT_IMPORT_ANCHOR}" data-product-import-card="1">
+        <h2>Hent produkter fra nettsiden min</h2>
+        ${alertHtml}
+        <p>Vi leser produktene og prisene på <strong>${websiteHtml}</strong> og viser deg forslagene før noe blir lagt inn. Ingenting publiseres før du har valgt varene og trykket «Publiser valgte».</p>
+        <p class="ep-audit-meta" data-fetches-left="${o.fetches_left_today}">Du kan hente ${o.fetches_left_today} ${o.fetches_left_today === 1 ? "gang" : "ganger"} til i dag (høyst ${o.daily_limit} per døgn).</p>
+        ${latestHtml}
+        ${action}
+      </div>`;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
