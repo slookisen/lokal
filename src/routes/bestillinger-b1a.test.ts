@@ -164,6 +164,11 @@ export async function runBestillingerB1aTests(opts: { log?: boolean } = {}): Pro
       tokens[id] = `tok-${id}`;
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${id}`, emailOf(id), tokens[id], id, new Date().toISOString(), new Date(Date.now() + DAY).toISOString());
+      // B1b-1: the portal write POSTs need a session opened by the verified claimant's own e-mail.
+      db.prepare(
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, verified_at)
+         VALUES (?, ?, 'Eier', ?, 'verified', '2026-10-01T00:00:00.000Z')`,
+      ).run(`claim-${id}`, id, emailOf(id));
       for (const [suffix, name, avail] of [["soon", "Gulrøtter", "in_stock"], ["out", "Purre", "out_of_stock"]] as const) {
         db.prepare(
           `INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, category, availability_source, availability_updated_at)
