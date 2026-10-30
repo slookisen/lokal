@@ -436,7 +436,7 @@ router.get("/stats", (req: Request, res: Response) => {
           dist.zero++;
         } else if (validRecords.length === 1) {
           dist.one++;
-          dist.one_source_tier[tierForSource(validRecords[0]!.source_type)]++;
+          dist.one_source_tier[tierForSource(validRecords[0]!.source_type, field)]++;
         } else {
           dist.two_plus++;
         }

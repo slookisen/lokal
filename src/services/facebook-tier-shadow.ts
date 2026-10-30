@@ -1,14 +1,19 @@
 // ─── Facebook-tier shadow measurement (enrichment-kadens S1a) ────────────────
 //
-// Read-only "what if" for a later rule change (S1b): `facebook_official_page`
+// Read-only "what if" for the rule change (S1b, now implemented in
+// crossSourceAgreement via countsForField): `facebook_official_page`
 // should only count as evidence that the producer EXISTS, never as
 // corroboration for `address` or `phone`. Before that change is built, this
 // computes — for one profile's parsed field_provenance — the cross-source
 // result as production computes it today, and the result with every
 // `facebook_official_page` record removed from that field.
 //
-// Pure: no DB, no I/O, no change to TIER_B / tierForSource() or to any
-// production verdict. "now" is the exact call the verifier makes
+// NOTE (S1b): production crossSourceAgreement now drops facebook_official_page
+// for address/phone itself, so "now" equals "shadow" and would_lose is always
+// false for those fields. That is expected; this module stays as a regression
+// reference (tests assert production === shadow).
+//
+// Pure: no DB, no I/O. "now" is the exact call the verifier makes
 // (lokal-agent-verifier.ts runVerifierBatch: crossSourceAgreement(fieldProv,
 // field, { ownName: agent.name }) for address/phone/business_status, then
 // aggregateVerdict over those). "shadow" is the same call on a copy of the

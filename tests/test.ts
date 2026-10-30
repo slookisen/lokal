@@ -8499,7 +8499,8 @@ console.log("\n── PR-23: field_provenance backfill ──");
   assertTrue(Array.isArray(aFB.address) && aFB.address.length === 2, "pr23: a-fb → 2 sources on address");
   const fbSrcSet = new Set(aFB.address.map((x: any) => x.source_type));
   assertTrue(fbSrcSet.has("homepage") && fbSrcSet.has("facebook_official_page"), "pr23: a-fb → homepage+facebook_official_page");
-  assertEq(crossSourceAgreement(aFB, "address").verdict, "pool_eligible", "pr23: a-fb → pool_eligible (Tier-A + Tier-B agree)");
+  // S1b: facebook_official_page no longer corroborates address -> homepage alone.
+  assertEq(crossSourceAgreement(aFB, "address").verdict, "review_required", "pr23: a-fb → review_required (facebook is existence-only for address, S1b)");
 
   // ── Unit Test 5: a-verified is skipped (excluded by WHERE clause) ──
   const aV = (bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-verified'").get() as any).field_provenance;
@@ -50921,5 +50922,23 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("facebook-tier-shadow: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Enrichment-kadens S1b: facebook_official_page is existence-only (never
+// corroborates address/phone). Pure function tests, no DB.
+runSerial(async () => {
+  console.log("\n── enrichment-kadens S1b: facebook_official_page kun eksistens ──");
+  try {
+    const { runCrossSourceFacebookS1bTests } = require("../src/services/cross-source-facebook-s1b.test") as
+      typeof import("../src/services/cross-source-facebook-s1b.test");
+    const r = await runCrossSourceFacebookS1bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("cross-source-facebook-s1b: " + f);
+    console.log(`  cross-source-facebook-s1b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("cross-source-facebook-s1b: unexpected error: " + String(err?.message || err));
   }
 });

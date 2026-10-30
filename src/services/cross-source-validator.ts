@@ -70,7 +70,27 @@ const TIER_A: readonly string[] = ["homepage", "website_homepage", "google_place
 // agreement gate.
 const TIER_B: readonly string[] = ["brreg", "facebook_official_page", "directory_listing"];
 
-export function tierForSource(sourceType: string): SourceTier {
+// ─── Existence-only sources (enrichment-kadens S1b) ──────────────────────────
+// `facebook_official_page` is set merely because a Facebook link exists in
+// external_links — no Facebook content is ever read. It still counts as Tier-B
+// evidence that the producer EXISTS, but must never corroborate `address` or
+// `phone`: for those fields it is treated as if the record did not exist.
+export const EXISTENCE_ONLY_SOURCES: readonly string[] = ["facebook_official_page"];
+export const CONTACT_FIELDS: readonly FieldName[] = ["address", "phone"];
+
+/** False when `sourceType` is existence-only and `field` is address/phone. */
+export function countsForField(sourceType: string, field?: FieldName): boolean {
+  if (!field) return true;
+  return !(EXISTENCE_ONLY_SOURCES.includes(sourceType) && CONTACT_FIELDS.includes(field));
+}
+
+/**
+ * Tier of a source. Without `field` (existence semantics) behaviour is
+ * unchanged. With a contact field, existence-only sources do not corroborate
+ * and are reported as "C" (no evidential weight).
+ */
+export function tierForSource(sourceType: string, field?: FieldName): SourceTier {
+  if (!countsForField(sourceType, field)) return "C";
   if (TIER_S.includes(sourceType)) return "S";
   if (TIER_A.includes(sourceType)) return "A";
   if (TIER_B.includes(sourceType)) return "B";
@@ -261,7 +281,14 @@ export function crossSourceAgreement(
   }
 
   // Filter out records without a usable value
-  const allValid = records.filter((r) => typeof r.value === "string" && r.value.trim() !== "");
+  // S1b: existence-only sources (facebook_official_page) are dropped for
+  // address/phone as if the record did not exist (also from sources_used).
+  const allValid = records.filter(
+    (r) =>
+      typeof r.value === "string" &&
+      r.value.trim() !== "" &&
+      countsForField(r.source_type, fieldName),
+  );
 
   // Guard #2 (orchestrator-pr-16): inference source_types (category_inference,
   // seasonal_knowledge, name_analysis, web_search, …) are NOT real evidence.

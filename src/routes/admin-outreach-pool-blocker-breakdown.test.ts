@@ -357,8 +357,8 @@ export function runAdminOutreachPoolBlockerBreakdownTests(
 
       // ── address_phone_cross_tab (must reconcile to cohort_total) ────────
       assertEq(bb.address_phone_cross_tab,
-        { blocked_address_only: 1, blocked_phone_only: 1, blocked_both: 4, blocked_neither: 1, total: 7 },
-        "bb-09: cross-tab — address_only: c-4; phone_only: c-3; both: c-1,c-2,c-6,c-7; neither: c-5");
+        { blocked_address_only: 0, blocked_phone_only: 2, blocked_both: 5, blocked_neither: 0, total: 7 },
+        "bb-09: cross-tab (S1b: facebook no longer corroborates phone) — address_only: none; phone_only: c-3,c-5; both: c-1,c-2,c-4,c-6,c-7; neither: none");
       assertEq(
         bb.address_phone_cross_tab.blocked_address_only + bb.address_phone_cross_tab.blocked_phone_only +
         bb.address_phone_cross_tab.blocked_both + bb.address_phone_cross_tab.blocked_neither,
