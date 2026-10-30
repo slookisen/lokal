@@ -17,7 +17,8 @@
 //   - the producer confirms an order → its producer_dashboard 'in_stock'
 //     items get a fresh confirmation time (availability_updated_at);
 //     'admin_producer_confirmed' rows are untouched;
-//   - «Avslå – utsolgt» → the chosen items of the order (default all) are
+//   - «Avslå – utsolgt» → the ticked items of the order (all ticked by
+//     default in the form; none ticked = a plain decline) are
 //     set to 'out_of_stock' through the existing producer write path
 //     (supply-graph setProducerAvailabilityByProductId).
 // Each written row gets an agent_knowledge_audit row (changed_by 'owner'),
@@ -131,12 +132,19 @@ export function refreshStockConfirmationForOrder(db: any, orderId: string, agent
 }
 
 /**
- * «Avslå – utsolgt»: the chosen items of `orderId` (`productIds`; null/empty =
- * every product of the order) → 'out_of_stock' through the existing producer
- * write path (source 'producer_dashboard'; an 'admin_producer_confirmed' row
- * keeps its source, as that path does). Ids that are not in the order are
+ * «Avslå – utsolgt»: the chosen items of `orderId` (`productIds`) →
+ * 'out_of_stock' through the existing producer write path. Only the ids
+ * listed are written: an empty list writes nothing (the form ticks every item
+ * by default, so un-ticking all of them means «none sold out», a plain
+ * decline). Ids that are not a product of this producer in this order are
  * ignored. Returns the written product ids. The caller checks
  * stockSoftExpiryActiveFor().
+ *
+ * Source: a 'producer_dashboard' (or other non-admin) row ends as
+ * 'producer_dashboard'. An 'admin_producer_confirmed' row becomes
+ * 'out_of_stock' but KEEPS its source — the Skive 4b (S9) rule of
+ * setProducerAvailabilityByProductId(), which protects the admin-confirmed
+ * price and category from the catalog sync.
  */
 export function markOrderItemsSoldOut(
   db: any,
@@ -145,11 +153,12 @@ export function markOrderItemsSoldOut(
   productIds: readonly string[] | null | undefined,
   now: Date = new Date(),
 ): string[] {
-  const wanted = productIds && productIds.length ? new Set(productIds) : null;
+  const wanted = new Set(productIds ?? []);
   const written: string[] = [];
+  if (wanted.size === 0) return written;
   db.transaction(() => {
     for (const r of orderProducts(db, orderId, agentId)) {
-      if (wanted && !wanted.has(r.product_id)) continue;
+      if (!wanted.has(r.product_id)) continue;
       if (!setProducerAvailabilityByProductId(agentId, r.product_id, "out_of_stock", db).success) continue;
       written.push(r.product_id);
       audit(db, agentId, "products.availability", r.availability, "out_of_stock",

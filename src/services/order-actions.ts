@@ -93,7 +93,7 @@ export interface OrderActionOptions {
   reason?: string | null;
   /**
    * B2b-1 «Utsolgt», decline by the seller only: the order's products to set
-   * 'out_of_stock' (null/empty = all of them). Ignored unless the soft-expiry
+   * 'out_of_stock' (empty = none, a plain decline). Ignored unless the soft-expiry
    * rule is active for the producer (stock-soft-expiry.ts).
    */
   soldOut?: { productIds?: readonly string[] | null } | null;

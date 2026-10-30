@@ -15,9 +15,14 @@
  *   confirm-*  the producer confirms an order → its producer_dashboard in_stock
  *              items get a fresh confirmation time (audit row);
  *              admin_producer_confirmed rows are untouched.
- *   soldout-*  «Avslå – utsolgt» → the chosen items (default all) are
- *              out_of_stock / producer_dashboard, audit rows; plain «Avslå»
- *              unchanged; rule off → no option, the post is refused as before.
+ *   search-*   the /handleliste search (findOffers) carries the same fields,
+ *              and the page shows the text after a pick; flag off → identical.
+ *   soldout-*  «Avslå – utsolgt» → the ticked items (all ticked by default;
+ *              none ticked = plain decline) are out_of_stock /
+ *              producer_dashboard, audit rows; plain «Avslå» unchanged; rule
+ *              off → no option, the post is refused as before.
+ *   scope-*    another producer's product in an order is never written.
+ *   admin-*    an admin (non-seller) confirm / decline never touches stock.
  *
  * Fresh in-memory SQLite with the production schema, e-mail stubbed, an
  * in-process server with the real routers («Mine ordrer», the compact token
@@ -225,6 +230,12 @@ export async function runBestillingerB2b1Tests(opts: { log?: boolean } = {}): Pr
         "rule-7b: just under 60 days → still in stock");
       assertEq(supply.evaluateStockFreshness("out_of_stock", ago(20), "producer_dashboard", T, true),
         { availability: "unknown", stock_confirmed_at: null, needs_producer_confirmation: false }, "rule-7c: only an in_stock row is kept (out_of_stock expires as today)");
+      // Exact boundaries (the clock is whole seconds): 14 days → unchanged, 14 days + 1 s → soft; 60 days → soft, 60 days + 1 s → expired.
+      const at = (ms: number) => supply.evaluateStockFreshness("in_stock", sqlTs(new Date(T.getTime() - ms)), "producer_dashboard", T, true);
+      assertEq([at(14 * DAY).availability, at(14 * DAY).needs_producer_confirmation], ["in_stock", false], "rule-9: exactly 14 days → in stock, no mark (as today)");
+      assertEq([at(14 * DAY + 1000).availability, at(14 * DAY + 1000).needs_producer_confirmation], ["in_stock", true], "rule-9b: 14 days + 1 s → in stock, marked");
+      assertEq([at(60 * DAY).availability, at(60 * DAY).needs_producer_confirmation], ["in_stock", true], "rule-9c: exactly 60 days → still in stock, marked");
+      assertEq([at(60 * DAY + 1000).availability, at(60 * DAY + 1000).needs_producer_confirmation], ["unknown", false], "rule-9d: 60 days + 1 s → unknown, no mark");
       process.env.SUPPLY_GRAPH_HARD_STALE_DAYS = "30";
       assertEq([supply.getSupplyGraphHardStaleDays(), reasonsOf("tp-20").orderable], [30, true], "rule-8: SUPPLY_GRAPH_HARD_STALE_DAYS overrides the hard window");
       process.env.SUPPLY_GRAPH_HARD_STALE_DAYS = "5";
@@ -321,7 +332,36 @@ export async function runBestillingerB2b1Tests(opts: { log?: boolean } = {}): Pr
       const sumTexts = texts(box);
       assertEq(sumTexts.filter((t) => BUYER_TEXT_RE.test(t)), [want], "page-8: in the summary (checkout) the text with the date appears once, for the 20-day item");
 
+      // The search flow of the page: GET /api/marketplace/catalog/offers (findOffers) → pick → summary.
+      const search = async () => offersSvc.findOffers({ q: "Poteter", lat: 59.91, lng: 10.75, radiusKm: 50, limit: 5 }, { db, now: T });
+      const found = await search();
+      const sOffer = (agentId: string) => found.offers.find((o) => o.producer.agent_id === agentId);
+      const tpHit = sOffer(TP);
+      assertEq([tpHit?.product_id, tpHit?.availability, tpHit?.needs_producer_confirmation, tpHit?.stock_confirmed_at], ["tp-20", "in_stock", true, isoOf(ago(20))],
+        "search-1: findOffers (the /handleliste search) gives the 20-day row as in_stock with needs_producer_confirmation + stock_confirmed_at");
+      assertEq([sOffer(REAL)?.availability, sOffer(REAL) ? "needs_producer_confirmation" in sOffer(REAL)! : null], ["unknown", false],
+        "search-2: the same row of a producer off the list is unknown with no mark, as today");
+      assertTrue(foodNodes(tpHit).some((n) => n.text === want), "search-3: the searched offer shows the buyer text with the date next to the item");
+      const box2: any = { tag: "div", children: [] };
+      const state2 = { items: [{ term: "Poteter", qty: 1 }], offers: [[tpHit]], picks: [0], hasOrders: false };
+      (new Function(
+        "mk", "C", "state", "el", "clear", "msg", "show",
+        `${orderableSrc}\n${foodSrc}\n${chosenSrc}\n${sumSrc}\nreturn toSummary;`,
+      )(mk, C, state2, () => ({ appendChild: (n: any) => box2.children.push(n) }), () => { box2.children.length = 0; }, () => {}, () => {}) as () => void)();
+      assertEq(texts(box2).filter((t) => BUYER_TEXT_RE.test(t)), [want], "search-4: picked from the search, the summary (checkout) shows the text with the date");
+      // Flag-off identity: flag off = flag on with nobody on the list = today's answer (unknown, no fields).
+      setAllow([]);
+      const noneListed = JSON.stringify(await search());
+      setAllow([TP]);
       delete process.env.STOCK_SOFT_EXPIRY_ENABLED;
+      const offSearch = await search();
+      assertEq(JSON.stringify(offSearch), noneListed, "off-search-1: flag off → findOffers output byte-identical to the rule being active for nobody");
+      const offTp = offSearch.offers.find((o) => o.producer.agent_id === TP);
+      assertEq([offTp?.availability, offTp ? "needs_producer_confirmation" in offTp : null, offTp ? "stock_confirmed_at" in offTp : null], ["unknown", false, false],
+        "off-search-2: flag off → the 20-day row is unknown with no fields, as today");
+      assertEq(JSON.stringify(offSearch.offers.find((o) => o.producer.agent_id === REAL)), JSON.stringify(sOffer(REAL)),
+        "off-search-3: the off-list producer's offer is identical with the flag on and off");
+
       const offPage = page.buildHandelistePage("no", { producer_name: pre.producer.name, offers: pre.offers });
       const offCopy = JSON.parse(/<script type="application\/json" id="hl-copy">([\s\S]*?)<\/script>/.exec(offPage.content)?.[1] ?? "{}");
       assertTrue(!("__stock_soft" in offCopy), "off-8: flag off → the page copy has no buyer text template");
@@ -456,13 +496,18 @@ export async function runBestillingerB2b1Tests(opts: { log?: boolean } = {}): Pr
         [["products.availability", "in_stock", "out_of_stock", "owner"]], "soldout-7: one audit row for the item set out of stock");
       assertEq(reasonsOf("tp-20").reasons.map((x) => x.code), ["not_in_stock"], "soldout-8: the item is no longer orderable (not_in_stock)");
 
-      // Default all (producer order page, no sold_out field) and two values via «Mine ordrer».
+      // Nothing ticked (producer order page, no sold_out field) → «none sold out»: a plain decline. Two values via «Mine ordrer».
       resetProducts();
       const o5 = seedOrder(TP, ["tp-20", "tp-20b"]);
+      const a5 = auditRows(TP).length;
       await req("POST", `/produsent/ordre/ctok_${o5}`, { form: form([["action", "decline_sold_out"]]) });
       await settle();
-      assertEq([orderRow(o5).status, prod("tp-20").availability, prod("tp-20b").availability], ["declined", "out_of_stock", "out_of_stock"],
-        "soldout-9: no item chosen in the post → every item of the order is set out of stock (the default)");
+      assertEq([orderRow(o5).status, prod("tp-20").availability, prod("tp-20b").availability, auditRows(TP).length], ["declined", "in_stock", "in_stock", a5],
+        "soldout-9: nothing ticked → the order is declined, no item is set out of stock, no audit row");
+      const o5b = seedOrder(TP, ["tp-20"]);
+      await req("POST", `/produsent/ordre/ctok_${o5b}/kompakt`, { form: form([["action", "decline_sold_out"], ["sold_out", ""]]) });
+      await settle();
+      assertEq([orderRow(o5b).status, prod("tp-20").availability], ["declined", "in_stock"], "soldout-9b: an empty sold_out value → none sold out (compact page)");
       resetProducts();
       const o6 = seedOrder(TP, ["tp-20", "tp-20b", "tp-10"]);
       const ownerPost = await req("POST", `/eier/${TP}/ordrer/${o6}`, {
@@ -477,6 +522,35 @@ export async function runBestillingerB2b1Tests(opts: { log?: boolean } = {}): Pr
       await req("POST", `/produsent/ordre/ctok_${o7}/kompakt`, { form: form([["action", "decline_sold_out"], ["sold_out", "real-20"], ["sold_out", "tp-20b"]]) });
       await settle();
       assertEq([prod("real-20").availability, prod("tp-20b").availability], ["in_stock", "out_of_stock"], "soldout-11: an id outside the order (another producer's) is never written");
+
+      // Order scoping: an order line that is ANOTHER producer's product is never offered, refreshed or written.
+      resetProducts();
+      const oX = seedOrder(TP, ["tp-20b", "real-20"]);
+      assertEq(soft.soldOutChoices(db, oX, TP).map((c) => c.product_id), ["tp-20b"], "scope-1: the «Utsolgt» choices are this producer's products of the order only");
+      const xPage = await req("GET", `/produsent/ordre/ctok_${oX}/kompakt`);
+      assertTrue(!xPage.text.includes('value="real-20"'), "scope-2: … the other producer's product has no checkbox");
+      await req("POST", `/produsent/ordre/ctok_${oX}/kompakt`, { form: form([["action", "decline_sold_out"], ["sold_out", "real-20"], ["sold_out", "tp-20b"]]) });
+      await settle();
+      assertEq([prod("real-20").availability, prod("real-20").availability_updated_at, prod("tp-20b").availability, auditRows(REAL).length],
+        ["in_stock", ago(20), "out_of_stock", 0], "scope-3: sold_out naming another producer's product in the order → that product is untouched");
+      resetProducts();
+      const oY = seedOrder(TP, ["tp-20b", "real-20"]);
+      await actionsSvc.applyOrderAction(oY, "confirm", { role: "seller", channel: "owner_portal" }, { now: T });
+      assertEq([prod("real-20").availability_updated_at, prod("tp-20b").availability_updated_at, auditRows(REAL).length], [ago(20), sqlTs(T), 0],
+        "scope-4: confirming refreshes only this producer's products, never another producer's line");
+      assertEq(soft.markOrderItemsSoldOut(db, oY, TP, ["real-20"], T), [], "scope-5: markOrderItemsSoldOut(… another producer's id) writes nothing");
+
+      // A non-seller (admin) confirm / decline never touches stock.
+      resetProducts();
+      const oA = seedOrder(TP, ["tp-20"]);
+      const aA = auditRows(TP).length;
+      const rA = await actionsSvc.applyOrderAction(oA, "confirm", { role: "admin", channel: "admin" }, { now: T });
+      assertEq([rA.success, orderRow(oA).status, prod("tp-20").availability_updated_at, auditRows(TP).length], [true, "confirmed", ago(20), aA],
+        "admin-1: an admin confirm → confirmed, the product's confirmation time is not refreshed");
+      const oB = seedOrder(TP, ["tp-20"]);
+      const rB = await actionsSvc.applyOrderAction(oB, "decline", { role: "admin", channel: "admin" }, { soldOut: { productIds: ["tp-20"] } });
+      assertEq([rB.success, orderRow(oB).status, prod("tp-20").availability, auditRows(TP).length], [true, "declined", "in_stock", aA],
+        "admin-2: an admin decline with soldOut → declined, the item is not set out of stock");
 
       // Plain «Avslå» is unchanged: declined, no product or audit change.
       resetProducts();
