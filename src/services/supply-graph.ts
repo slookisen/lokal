@@ -98,6 +98,67 @@ export function producerStockExpiresAt(availabilityUpdatedAt: string | null): Da
   return new Date(updatedAt.getTime() + getSupplyGraphStaleDays() * MS_PER_DAY);
 }
 
+// ─── B2b-1: soft expiry (dev-request 2026-10-28-rfb-bestillinger-fra-start-
+// til-slutt-for-eier, «B2b — myk utløp») ─────────────────────────────────
+// With the soft-expiry rule active for a profile (STOCK_SOFT_EXPIRY_ENABLED
+// AND the profile on the owner-features allowlist, see
+// services/stock-soft-expiry.ts), a producer_dashboard 'in_stock' row older
+// than getSupplyGraphStaleDays() stays 'in_stock' until
+// getSupplyGraphHardStaleDays() (default 60, env SUPPLY_GRAPH_HARD_STALE_DAYS),
+// but carries the date it was last confirmed and needs the producer's
+// confirmation of the order. Past the hard window it expires as today.
+// Rule off → evaluateStockFreshness() is computeEffectiveAvailability().
+const DEFAULT_SUPPLY_GRAPH_HARD_STALE_DAYS = 60;
+
+/** The hard window in days (never shorter than the staleness window). */
+export function getSupplyGraphHardStaleDays(): number {
+  const raw = process.env.SUPPLY_GRAPH_HARD_STALE_DAYS;
+  const n = raw != null ? parseInt(raw, 10) : NaN;
+  const hard = Number.isFinite(n) && n > 0 ? n : DEFAULT_SUPPLY_GRAPH_HARD_STALE_DAYS;
+  return Math.max(hard, getSupplyGraphStaleDays());
+}
+
+export interface StockFreshness {
+  /** The effective availability (as computeEffectiveAvailability, or 'in_stock' in the soft window). */
+  availability: string;
+  /** Soft window only: when the producer last confirmed or changed the row (ISO); else null. */
+  stock_confirmed_at: string | null;
+  /** Soft window only: the order holds only once the producer confirms the item is in stock. */
+  needs_producer_confirmation: boolean;
+}
+
+/**
+ * computeEffectiveAvailability() plus the B2b-1 soft window. `softExpiry`
+ * false → exactly computeEffectiveAvailability() with no flags.
+ */
+export function evaluateStockFreshness(
+  availability: string,
+  availabilityUpdatedAt: string | null,
+  source: string,
+  now: Date,
+  softExpiry: boolean,
+): StockFreshness {
+  const effective = computeEffectiveAvailability(availability, availabilityUpdatedAt, source, now);
+  if (softExpiry && effective !== availability && source === "producer_dashboard" && availability === "in_stock" && availabilityUpdatedAt) {
+    const updatedAt = parseTimestamp(availabilityUpdatedAt);
+    if (!Number.isNaN(updatedAt.getTime())) {
+      const ageDays = (now.getTime() - updatedAt.getTime()) / MS_PER_DAY;
+      if (ageDays > getSupplyGraphStaleDays() && ageDays <= getSupplyGraphHardStaleDays()) {
+        return { availability: "in_stock", stock_confirmed_at: updatedAt.toISOString(), needs_producer_confirmation: true };
+      }
+    }
+  }
+  return { availability: effective, stock_confirmed_at: null, needs_producer_confirmation: false };
+}
+
+/** B2b-1: when a producer_dashboard status stops counting under the soft rule (`availabilityUpdatedAt` + the hard window). */
+export function producerStockHardExpiresAt(availabilityUpdatedAt: string | null): Date | null {
+  if (!availabilityUpdatedAt) return null;
+  const updatedAt = parseTimestamp(availabilityUpdatedAt);
+  if (Number.isNaN(updatedAt.getTime())) return null;
+  return new Date(updatedAt.getTime() + getSupplyGraphHardStaleDays() * MS_PER_DAY);
+}
+
 // Skive 4b (S9): a row the admin confirmed with the producer
 // ('admin_producer_confirmed') keeps that source when the producer changes the
 // stock status in the portal. The write path only updates availability and its

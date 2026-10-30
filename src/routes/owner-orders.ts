@@ -22,6 +22,7 @@ import { getDb } from "../database/init";
 import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
 import { applyOrderAction, type OrderAction } from "../services/order-actions";
 import { isOrderMessagesEnabled, postOrderMessage } from "../services/order-messages";
+import { soldOutIdsFromBody, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isPaymentsLifecycleActive, resolvePaymentsStripeClient } from "../services/payment-service";
 import type { PaymentsStripeClient } from "../services/payment-provider";
 import {
@@ -51,6 +52,21 @@ const SELLER_ACTIONS: Record<string, OrderAction> = Object.assign(Object.create(
   // B3: «Hentet» — the same shared-layer action as the producer page's button.
   complete: "complete",
 });
+
+/**
+ * The posted action. B2b-1: «Avslå – utsolgt» (`decline_sold_out`, with the
+ * chosen `sold_out` product ids) is the shared layer's decline plus the
+ * sold-out write — only while the soft-expiry rule is active for the producer;
+ * otherwise it is an unknown action, as before.
+ */
+function sellerActionFrom(body: Record<string, unknown>, agentId: string): { action: OrderAction; soldOut: { productIds: string[] } | null } | null {
+  const raw = String(body["action"] || "");
+  if (raw === "decline_sold_out" && stockSoftExpiryActiveFor(agentId)) {
+    return { action: "decline", soldOut: { productIds: soldOutIdsFromBody(body["sold_out"]) } };
+  }
+  const action = SELLER_ACTIONS[raw];
+  return action ? { action, soldOut: null } : null;
+}
 
 /**
  * The PRG error code of a refused action. B3: «Hentet» on an order that is
@@ -159,14 +175,15 @@ router.post("/eier/:agentId/ordrer/:orderId", ownerOrdersLimiter, express.urlenc
     if (!order) return notFoundPage(res);
 
     const body = (req.body || {}) as Record<string, unknown>;
-    const action = SELLER_ACTIONS[String(body["action"] || "")];
+    const chosen = sellerActionFrom(body, order.agent_id);
     const back = (tab: string, extra: string) => `${base}?tab=${tab}&o=${encodeURIComponent(orderId)}${extra}#${ROW_ANCHOR(orderId)}`;
-    if (!action) return res.redirect(303, back(tabForStatus(order.status), "&error=ugyldig"));
+    if (!chosen) return res.redirect(303, back(tabForStatus(order.status), "&error=ugyldig"));
+    const action = chosen.action;
 
     const result = await applyOrderAction(
       orderId, action,
       { role: "seller", channel: "owner_portal", ref: `owner:${agentId.slice(0, 8)}` },
-      { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action) },
+      { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action), soldOut: chosen.soldOut },
     );
     if (!result.success) {
       const cur = getOwnerOrder(agentId, orderId);
@@ -238,13 +255,14 @@ router.post("/produsent/ordre/:token/kompakt", ownerOrdersLimiter, express.urlen
     if (crossSite(req)) { noStore(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
 
     const body = (req.body || {}) as Record<string, unknown>;
-    const action = SELLER_ACTIONS[String(body["action"] || "")];
-    if (!action) return res.redirect(303, `${back}?error=ugyldig`);
+    const chosen = sellerActionFrom(body, order.agent_id);
+    if (!chosen) return res.redirect(303, `${back}?error=ugyldig`);
+    const action = chosen.action;
 
     const result = await applyOrderAction(
       order.id, action,
       { role: "seller", channel: "producer_page", ref: `token:${order.id.slice(0, 8)}` },
-      { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action) },
+      { payments: paymentsClientFor(req), idempotencyKey: idemFrom(body), pickupTime: pickupFrom(body, action), soldOut: chosen.soldOut },
     );
     if (!result.success) {
       const cur = getOwnerOrderByToken(token);

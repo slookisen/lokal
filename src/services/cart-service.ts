@@ -20,7 +20,8 @@ import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
-import { computeEffectiveAvailability, producerStockExpiresAt } from "./supply-graph";
+import { evaluateStockFreshness, producerStockExpiresAt, producerStockHardExpiresAt, type StockFreshness } from "./supply-graph";
+import { stockSoftExpiryActiveFor, stockSoftExpiryBuyerTextNb } from "./stock-soft-expiry";
 import { knowledgeService } from "./knowledge-service";
 import { slugify } from "../utils/slug";
 import { isBlocked } from "./blocklist-service";
@@ -79,6 +80,12 @@ export interface CartGroup {
     producer_confirmed: boolean;
     /** Skive 4: ingredients / allergens / net weight where stated (pre-packaged food); null otherwise. */
     food_info: FoodInfo | null;
+    /** B2b-1 (soft expiry, only when the rule is active and the row is in the soft window): last confirmed by the producer (ISO). */
+    stock_confirmed_at?: string;
+    /** B2b-1: present (true) with stock_confirmed_at — the producer confirms the item is in stock before the order holds. */
+    needs_producer_confirmation?: true;
+    /** B2b-1: the buyer's text for such a line (bokmål). */
+    stock_note?: string;
   }>;
   subtotal_nok: number;
 }
@@ -434,6 +441,29 @@ export interface OrderabilityResult {
   reasons: OrderabilityReason[];
   /** A producer_dashboard row: when its stock status expires / expired (ISO); else null. */
   stock_expires_at: string | null;
+  /** B2b-1 (soft expiry active, row in the soft window): last confirmed by the producer (ISO). Absent otherwise. */
+  stock_confirmed_at?: string;
+  /** B2b-1: present (true) with stock_confirmed_at. Absent otherwise. */
+  needs_producer_confirmation?: true;
+}
+
+/**
+ * B2b-1: a row's effective stock state for the order path — the soft-expiry
+ * rule when it is active for the row's producer (stock-soft-expiry.ts), else
+ * exactly computeEffectiveAvailability().
+ */
+export function orderPathStockFreshness(
+  row: { agent_id: string; availability: string; availability_updated_at: string | null; availability_source: string | null },
+  now: Date,
+): StockFreshness {
+  return evaluateStockFreshness(row.availability, row.availability_updated_at, row.availability_source ?? "", now, stockSoftExpiryActiveFor(row.agent_id));
+}
+
+/** B2b-1: the soft-window fields of a freshness result ({} outside the soft window). */
+export function softExpiryFields(f: StockFreshness): { stock_confirmed_at?: string; needs_producer_confirmation?: true } {
+  return f.needs_producer_confirmation && f.stock_confirmed_at
+    ? { stock_confirmed_at: f.stock_confirmed_at, needs_producer_confirmation: true }
+    : {};
 }
 
 /** Profile-level part: isEligibleForRealOrder() plus, when asked, why not. */
@@ -500,11 +530,13 @@ function evaluateOrderability(
     reasons.push({ code: banned.kind === "check_failed" ? "ban_check_failed" : banned.kind, level: "product" });
     if (firstOnly) return reasons;
   }
-  const effective = computeEffectiveAvailability(row.availability, row.availability_updated_at, row.availability_source ?? "", now);
+  // B2b-1: with the soft-expiry rule active for the producer, the soft window counts as in stock.
+  const soft = stockSoftExpiryActiveFor(row.agent_id);
+  const effective = evaluateStockFreshness(row.availability, row.availability_updated_at, row.availability_source ?? "", now, soft).availability;
   if (effective !== "in_stock") {
     if (row.availability === "in_stock") {
       // Only a producer_dashboard row can degrade (supply-graph.ts).
-      const exp = producerStockExpiresAt(row.availability_updated_at);
+      const exp = soft ? producerStockHardExpiresAt(row.availability_updated_at) : producerStockExpiresAt(row.availability_updated_at);
       reasons.push({ code: "stock_status_expired", level: "product", expired_at: exp ? exp.toISOString() : null });
     } else {
       reasons.push({ code: "not_in_stock", level: "product", availability: effective });
@@ -535,7 +567,10 @@ export function orderabilityReasons(
 ): OrderabilityResult {
   const reasons = evaluateOrderability(db, row, now, false, producer);
   const exp = row.availability_source === "producer_dashboard" ? producerStockExpiresAt(row.availability_updated_at) : null;
-  return { orderable: reasons.length === 0, reasons, stock_expires_at: exp ? exp.toISOString() : null };
+  return {
+    orderable: reasons.length === 0, reasons, stock_expires_at: exp ? exp.toISOString() : null,
+    ...softExpiryFields(orderPathStockFreshness(row, now)),
+  };
 }
 
 /**
@@ -633,12 +668,8 @@ export function addCartItem(
   // producer_dashboard-sourced value that's gone stale (>14 days, see
   // supply-graph.ts) must degrade to 'unknown' and be rejected here, not
   // silently trusted forever. Enrichment-sourced rows are unaffected.
-  const effectiveAvailability = computeEffectiveAvailability(
-    product.availability,
-    product.availability_updated_at,
-    product.availability_source,
-    new Date()
-  );
+  // B2b-1: the soft-expiry rule when it is active for the producer (else unchanged).
+  const effectiveAvailability = orderPathStockFreshness(product, new Date()).availability;
   if (effectiveAvailability !== "in_stock") {
     return { success: false, status: 409, error: `Product is not in stock (availability: ${effectiveAvailability})` };
   }
@@ -1010,6 +1041,8 @@ export function viewCart(cartId: string): CartView | null {
       p.name   AS product_name,
       p.unit   AS unit,
       p.availability_source AS availability_source,
+      p.availability AS availability,
+      p.availability_updated_at AS availability_updated_at,
       p.ingredients AS ingredients,
       p.allergens   AS allergens,
       p.net_weight  AS net_weight,
@@ -1030,6 +1063,8 @@ export function viewCart(cartId: string): CartView | null {
     product_name: string;
     unit: string | null;
     availability_source: string | null;
+    availability: string;
+    availability_updated_at: string | null;
     ingredients: string | null;
     allergens: string | null;
     net_weight: string | null;
@@ -1037,6 +1072,7 @@ export function viewCart(cartId: string): CartView | null {
   }>;
 
   // Group by producer
+  const now = new Date();
   const groupMap = new Map<string, CartGroup>();
   for (const r of rows) {
     if (!groupMap.has(r.agent_id)) {
@@ -1061,6 +1097,7 @@ export function viewCart(cartId: string): CartView | null {
       line_note: r.line_note,
       producer_confirmed: isProducerStatedSource(r.availability_source),
       food_info: foodInfoOf(r),
+      ...cartLineSoftExpiry(orderPathStockFreshness(r, now)),
     });
     if (line_total != null) group.subtotal_nok += line_total;
   }
@@ -1073,6 +1110,12 @@ export function viewCart(cartId: string): CartView | null {
   ).is_partial;
 
   return { success: true, cart_id: cartId, status: cart.status, groups, total_nok, total_is_partial, item_count };
+}
+
+/** B2b-1: a cart line's soft-expiry fields and buyer text ({} outside the soft window). */
+function cartLineSoftExpiry(f: StockFreshness): { stock_confirmed_at?: string; needs_producer_confirmation?: true; stock_note?: string } {
+  const x = softExpiryFields(f);
+  return x.stock_confirmed_at ? { ...x, stock_note: stockSoftExpiryBuyerTextNb(x.stock_confirmed_at) } : {};
 }
 
 // ─── Submit cart ─────────────────────────────────────────────────────────────
@@ -1369,12 +1412,8 @@ export function submitCart(cartId: string, contact?: SubmitContactInput, opts?: 
   const now = new Date();
   const withEffective = items.map(i => ({
     ...i,
-    effectiveAvailability: computeEffectiveAvailability(
-      i.availability,
-      i.availability_updated_at,
-      i.availability_source,
-      now
-    ),
+    // B2b-1: the soft-expiry rule when it is active for the producer (else unchanged).
+    effectiveAvailability: orderPathStockFreshness(i, now).availability,
   }));
   const unavailable = withEffective.filter(i => i.effectiveAvailability !== "in_stock");
   if (unavailable.length > 0) {

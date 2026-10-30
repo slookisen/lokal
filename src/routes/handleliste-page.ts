@@ -38,6 +38,7 @@ import { BETALING_PATH } from "./rfb-betaling";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { serializeJsonForScript } from "../services/safe-script-json";
 import { isOrderCapNoticeEnabled, orderCapBuyerNotice } from "../services/order-cap-notice";
+import { stockSoftExpiryBuyerTemplate, stockSoftExpiryEnabled } from "../services/stock-soft-expiry";
 import type { Offer } from "../services/catalog-offers";
 
 export function isHandelisteEnabled(): boolean {
@@ -378,6 +379,11 @@ const CLIENT_SCRIPT = `
   // mark, shown before submit. Text only (textContent), whatever the data holds.
   function foodNodes(o){
     var out = [];
+    // B2b-1 (soft stock expiry): the date the producer last confirmed the row, and that the producer confirms the order.
+    if (o.needs_producer_confirmation === true && C.__stock_soft && typeof o.stock_confirmed_at === 'string') {
+      var sd = new Date(o.stock_confirmed_at);
+      if (!isNaN(sd.getTime())) out.push(mk('div', { cls: 'hl-meta hl-stock-soft', text: String(C.__stock_soft).replace('{date}', sd.toLocaleDateString('nb-NO', { timeZone: 'Europe/Oslo', day: '2-digit', month: '2-digit', year: 'numeric' })) }));
+    }
     if (o.producer_confirmed === true) out.push(mk('div', { cls: 'hl-meta', text: C.producer_confirmed }));
     var f = o.food_info;
     if (f && typeof f === 'object') {
@@ -728,7 +734,9 @@ export function buildHandelistePage(lang: Lang, preselect?: HandelistePreselect 
   const capCopy = isOrderCapNoticeEnabled()
     ? { __cap_daily: orderCapBuyerNotice("producer_daily_cap", "{cap}", lang === "en" ? "en" : "no"), __cap_open: orderCapBuyerNotice("buyer_open_cap", "{cap}", lang === "en" ? "en" : "no") }
     : {};
-  const copy = { ...c, ...payHow, ...capCopy, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
+  // B2b-1: the soft-expiry buyer text, only with STOCK_SOFT_EXPIRY_ENABLED on — off, the copy is unchanged.
+  const softCopy = stockSoftExpiryEnabled() ? { __stock_soft: stockSoftExpiryBuyerTemplate(lang === "en" ? "en" : "no") } : {};
+  const copy = { ...c, ...payHow, ...capCopy, ...softCopy, __lang: lang, __max_items: HANDELISTE_MAX_ITEMS, __initial: HANDELISTE_OFFERS_INITIAL, ...pre };
   const e = escapeText;
   const content = `
   <main class="hl-wrap">
