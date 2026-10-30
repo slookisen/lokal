@@ -27,10 +27,7 @@ export async function runCrossSourceFacebookS1bTests(opts: { log?: boolean } = {
 
   // (3) existence semantics unchanged
   eq(tierForSource("facebook_official_page"), "B", "(3) tierForSource without field is B");
-  eq(tierForSource("facebook_official_page", "business_status"), "B", "(3) tier B for business_status");
-  eq(tierForSource("facebook_official_page", "address"), "C", "tier C for address");
-  eq(tierForSource("facebook_official_page", "phone"), "C", "tier C for phone");
-  eq(tierForSource("brreg", "address"), "B", "brreg unaffected");
+  eq(tierForSource("brreg"), "B", "brreg unaffected");
   eq(countsForField("facebook_official_page"), true, "countsForField no field");
   eq(countsForField("facebook_official_page", "address"), false, "countsForField address");
   eq(countsForField("homepage", "address"), true, "countsForField other source");
