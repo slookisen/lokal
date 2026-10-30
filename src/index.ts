@@ -137,6 +137,7 @@ import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
 import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
+import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-probe";
 import adminAgentsClaimBackfillRoutes from "./routes/admin-agents-claim-backfill";
 import adminAgentsTerminalReparkRoutes from "./routes/admin-agents-terminal-repark";
 import adminAgentsDuplicateSlugsRoutes from "./routes/admin-agents-duplicate-slugs";
@@ -951,6 +952,9 @@ app.use("/admin/owner-features/interest", adminLimiter, adminOwnerFeaturesIntere
 // S2d-3: the switch probe («bryterprobe») on the hidden test producer — behind
 // OWNER_FEATURES_SWITCH_PROBE_ENABLED=1 (default off → 404), dry-run by default.
 app.use("/admin/owner-features/switch-probe", adminLimiter, adminOwnerFeaturesSwitchProbeRoutes);
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O2b: the Opplevagent «Mine valg» switch probe
+// on the hidden gårdssalg test producer — behind OA_OWNER_FEATURES_SWITCH_PROBE_ENABLED=1 (default off → 404).
+app.use("/admin/gardssalg/owner-features/switch-probe", adminLimiter, adminGardssalgSwitchProbeRoutes);
 // POST /admin/agents/claim-backfill — one-shot claimed_at backfill for verified
 // claims (dev-request 2026-10-01-rfb-eierkrav-utelates-fra-outreach). Mount BEFORE /admin/agents.
 app.use("/admin/agents/claim-backfill", adminLimiter, adminAgentsClaimBackfillRoutes);

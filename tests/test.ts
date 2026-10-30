@@ -50818,6 +50818,28 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O2b: the Opplevagent
+// switch probe («bryterprobe») — POST /admin/gardssalg/owner-features/switch-probe
+// behind OA_OWNER_FEATURES_SWITCH_PROBE_ENABLED: dry run by default, only the
+// allowlisted gårdssalg test producer, every live key × surface off/on (as-public
+// reads, booking channels with a past slot), change log, exact restore, no mail,
+// no booking. Swaps getDb(), the experiences DB and env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O2b: bryterproben for Opplevagent ──");
+  try {
+    const { runAdminGardssalgSwitchProbeTests } = require("../src/routes/admin-gardssalg-switch-probe.test") as
+      typeof import("../src/routes/admin-gardssalg-switch-probe.test");
+    const r = await runAdminGardssalgSwitchProbeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-gardssalg-switch-probe: " + f);
+    console.log(`  admin-gardssalg-switch-probe: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-gardssalg-switch-probe: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2f: the statistics block
 // on «Mine valg» (same numbers as the /selger Statistikk tab), the portal card
 // «Statistikk» fix, «Med i AI-søk» in the registry and the public-tile
