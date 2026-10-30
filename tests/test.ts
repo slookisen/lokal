@@ -51098,6 +51098,28 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 3-1: owner fetch «Hent produkter fra nettsiden min» —
+// flag-gated JSON routes, is_verified=1 ownership on every call, candidates
+// staged only in product_import_candidates (not on profile / offers / feed),
+// read-only preview diff, merge-publish as owner_import with owner lock and
+// catalog sync (not orderable alone), 3 fetches per UTC day, concurrency cap.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 3-1: eierhenting fra egen nettside ──");
+  try {
+    const { runOwnerImportTests } = require("../src/services/product-import/owner-import.test") as
+      typeof import("../src/services/product-import/owner-import.test");
+    const r = await runOwnerImportTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-import: " + f);
+    console.log(`  owner-import: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-import: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
 // pages promise no organic / Debio coverage beyond Debio's public register;

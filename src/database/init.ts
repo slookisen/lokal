@@ -6310,6 +6310,67 @@ function initSchema(db: Database.Database): void {
     console.error("Migration product_import_runs failed:", err);
   }
 
+  // ─── product_import_runs (owner fetch) / product_import_candidates
+  // (dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 3) ──
+  // The owner button «Hent produkter fra nettsiden min» (flag
+  // PRODUCT_IMPORT_ENABLED) logs one product_import_runs row per fetch with
+  // mode 'owner_fetch' and the columns below (the profile, the outcome, the
+  // new/changed/not-found counts at fetch time and, after «Publiser valgte»,
+  // what was published/removed). Its candidates are staged in
+  // product_import_candidates and NOWHERE else until the owner publishes:
+  // never in agent_knowledge.products or products. Additive, idempotent.
+  try {
+    const ownerRunCols: Array<[string, string]> = [
+      ["agent_id", "TEXT"],
+      ["outcome", "TEXT"],
+      ["tier", "TEXT"],
+      ["count_new", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_changed", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_not_found", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_published", "INTEGER NOT NULL DEFAULT 0"],
+      ["count_removed", "INTEGER NOT NULL DEFAULT 0"],
+      ["published_by_owner", "INTEGER NOT NULL DEFAULT 0"],
+      ["published_at", "TEXT"],
+    ];
+    const have = new Set(
+      (db.prepare(`PRAGMA table_info(product_import_runs)`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    for (const [col, type] of ownerRunCols) {
+      if (!have.has(col)) db.exec(`ALTER TABLE product_import_runs ADD COLUMN ${col} ${type}`);
+    }
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_product_import_runs_agent_mode ON product_import_runs(agent_id, mode, created_at)`,
+    );
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_candidates (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        name TEXT NOT NULL,
+        name_norm TEXT NOT NULL,
+        price_nok REAL,
+        price_text TEXT NOT NULL DEFAULT '',
+        unit TEXT,
+        price_is_from INTEGER NOT NULL DEFAULT 0,
+        price_excl_vat INTEGER NOT NULL DEFAULT 0,
+        pack_size TEXT,
+        tier TEXT NOT NULL,
+        source_url TEXT,
+        rules_json TEXT NOT NULL DEFAULT '[]',
+        fetched_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        reject_reason TEXT,
+        published_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_candidates_run ON product_import_candidates(run_id, position)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_candidates_agent ON product_import_candidates(agent_id)`);
+  } catch (err) {
+    console.error("Migration product_import_candidates failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

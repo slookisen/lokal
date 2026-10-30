@@ -133,15 +133,19 @@ export type ProductCatalogSyncResult =
  * or the unattended scheduler tick in src/index.ts) can each decide how to
  * report it without a try/catch of their own.
  */
-export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
+export function runProductCatalogSync(db?: any, opts: { agentId?: string } = {}): ProductCatalogSyncResult {
   const conn = db ?? getDb();
 
+  // Produktimport skive 3: `agentId` syncs that one profile only (the owner
+  // import publish), with the same per-row logic as the full sync.
+  const onlyAgent = typeof opts.agentId === "string" && opts.agentId ? opts.agentId : null;
   const rows = conn.prepare(`
     SELECT k.agent_id, k.products
     FROM agent_knowledge k
     INNER JOIN agents a ON a.id = k.agent_id
     WHERE k.products IS NOT NULL AND k.products != '[]' AND k.products != ''
-  `).all() as Array<{ agent_id: string; products: string }>;
+    ${onlyAgent ? "AND k.agent_id = ?" : ""}
+  `).all(...(onlyAgent ? [onlyAgent] : [])) as Array<{ agent_id: string; products: string }>;
 
   // Every SET expression reads the row as it was, so updated_at compares the
   // new price/category (same expressions) with the stored ones.

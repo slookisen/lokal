@@ -166,6 +166,15 @@ export interface UpsertKnowledgeResult {
 export interface UpsertKnowledgeOptions {
   /** True only on the owner path (ownerUpdate()); it may change owner-locked fields. */
   ownerPath?: boolean;
+  /**
+   * Produktimport skive 3: with `ownerPath`, store each product's own
+   * source/sourceUrl/fetchedAt/confirmedAt as given instead of stamping the
+   * whole list owner_manual. Only the owner import publish uses it: it merges
+   * the owner's selected owner_import products into the stored list, and the
+   * products it did not touch must keep their provenance (an enrichment
+   * product must not become owner_manual). Ignored off the owner path.
+   */
+  preStampedProducts?: boolean;
 }
 
 export interface SeasonalProduct {
@@ -816,7 +825,9 @@ class KnowledgeService {
     if (data.products?.length) {
       data = { ...data, products: this.normalizeProducts(data.products) };
       // Skive 2: owner_manual on the owner path; no owner claim from any other.
-      data = { ...data, products: stampProductSources(data.products!, !!opts.ownerPath, now) };
+      if (!(opts.ownerPath && opts.preStampedProducts)) {
+        data = { ...data, products: stampProductSources(data.products!, !!opts.ownerPath, now) };
+      }
     }
 
     if (!existing) {
