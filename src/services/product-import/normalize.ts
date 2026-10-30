@@ -264,8 +264,18 @@ export function isComingSoonPlaceholder(text: string | null | undefined): boolea
 // reports/2026-10-30-produktimport-maaling-2.md (A2A): a price marked
 // «ekskl. mva.» (Bjerke Spekemat) is not a consumer price.
 
-const EXCL_VAT_RE =
-  /(?<![a-zæøå])(?:ekskl|eksl|exkl|ekskludert|excl|excluding|ex|eks)\.?\s*(?:mva|moms|vat)(?![a-zæøå])|\+\s*mva(?![a-zæøå])|(?<![a-zæøå])uten\s+(?:mva|moms)(?![a-zæøå])/i;
+// «ekskl. mva.», «eks. mva», «eksklusiv(e) moms», «excl. VAT», «ekskl. 15 % mva»,
+// «u/mva», «+ mva», «+ 15% mva», «uten mva». Never «inkl. mva».
+const VAT_RATE = "(?:\\d+(?:[.,]\\d+)?\\s*%\\s*)?";
+const EXCL_VAT_RE = new RegExp(
+  [
+    `(?<![a-zæøå])(?:ekskl|eksl|exkl|ekskludert|eksklusive|eksklusiv|excl|excluding|ex|eks)\\.?\\s*${VAT_RATE}(?:mva|moms|vat)(?![a-zæøå])`,
+    `(?<![a-zæøå])u\\s*\\/\\s*(?:mva|moms)(?![a-zæøå])`,
+    `\\+\\s*${VAT_RATE}(?:mva|moms)(?![a-zæøå])`,
+    `(?<![a-zæøå])uten\\s+(?:mva|moms)(?![a-zæøå])`,
+  ].join("|"),
+  "i",
+);
 
 /** True when a price text says the price is EXCLUDING VAT («ekskl. mva.», «eks. mva», «+ mva», «excl. VAT»). PURE. */
 export function statesExclVat(text: string | null | undefined): boolean {
@@ -273,9 +283,9 @@ export function statesExclVat(text: string | null | undefined): boolean {
   return EXCL_VAT_RE.test(text.replace(/\s+/g, " "));
 }
 
-/** A page-wide statement that its prices exclude VAT («Alle priser er ekskl. mva.»). PURE. */
+/** A page-wide statement that its prices exclude VAT («Alle priser er ekskl. mva.», a «Pris eks. mva.» table header). PURE. */
 export function statesPagePricesExclVat(text: string | null | undefined): boolean {
   if (!text) return false;
-  const m = text.replace(/\s+/g, " ").match(/(?<![a-zæøå])pris(?:er|ene|ane)(?![a-zæøå]).{0,40}/gi);
+  const m = text.replace(/\s+/g, " ").match(/(?<![a-zæøå])pris(?:er|ene|ane)?(?![a-zæøå]).{0,40}/gi);
   return (m ?? []).some((s) => statesExclVat(s));
 }

@@ -97,36 +97,50 @@ export function parsePageBlocks(html: string): PageBlocks {
   const nodes: BlockNode[] = [{ tag: "#root", parent: -1, start: 0, end: 0 }];
   const runs: PageBlocks["runs"] = [];
   const stack: number[] = [0];
-  let text = "";
+  // Built as parts with the length and last character tracked in variables:
+  // reading the tail of one ever-growing string re-flattens it in V8 and
+  // made a 2 MB page take tens of seconds (review of 76bf1b5).
+  const parts: string[] = [];
+  let len = 0;
+  let lastCh = "";
   const sep = (ch: " " | "\n") => {
-    if (!text) return;
-    if (text.endsWith("\n")) return;
-    if (text.endsWith(" ")) {
-      if (ch === "\n") text = text.slice(0, -1) + "\n";
+    if (len === 0 || lastCh === "\n") return;
+    if (lastCh === " ") {
+      if (ch === "\n") {
+        const i = parts.length - 1;
+        parts[i] = parts[i]!.slice(0, -1) + "\n";
+        lastCh = "\n";
+      }
       return;
     }
-    text += ch;
+    parts.push(ch);
+    len += 1;
+    lastCh = ch;
   };
   const addText = (raw: string) => {
-    let t = decodeHtmlEntities(raw).replace(/[\s ]+/g, " ");
+    let t = decodeHtmlEntities(raw).replace(/[\s\u00a0]+/g, " ");
     if (!t.trim()) {
       if (t) sep(" ");
       return;
     }
-    if (!text || /\s$/.test(text)) t = t.replace(/^ /, "");
-    const start = text.length;
-    text += t;
+    if (len === 0 || lastCh === " " || lastCh === "\n") t = t.replace(/^ /, "");
+    const start = len;
+    parts.push(t);
+    len += t.length;
+    lastCh = t[t.length - 1]!;
     const lead = t.length - t.trimStart().length;
     const trail = t.length - t.trimEnd().length;
-    runs.push({ start: start + lead, end: text.length - trail, node: stack[stack.length - 1]! });
+    runs.push({ start: start + lead, end: len - trail, node: stack[stack.length - 1]! });
   };
   const closeTo = (idx: number) => {
     while (stack.length - 1 >= idx && stack.length > 1) {
       const id = stack.pop()!;
-      nodes[id]!.end = text.length;
+      nodes[id]!.end = len;
     }
   };
-  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*?(\/?)>/g;
+  // `[^<>]` keeps a failed match (an unclosed «<time class="») from scanning
+  // the rest of the page: linear on adversarial input.
+  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*?(\/?)>/g;
   let last = 0;
   for (const m of cleaned.matchAll(tagRe)) {
     addText(cleaned.slice(last, m.index));
@@ -135,7 +149,8 @@ export function parsePageBlocks(html: string): PageBlocks {
     const tag = m[2]!.toLowerCase();
     sep(BLOCK_TAGS.has(tag) ? "\n" : " ");
     if (closing) {
-      for (let i = stack.length - 1; i >= 1; i--) {
+      // Bounded search: a page of unclosed tags must not make this quadratic.
+      for (let i = stack.length - 1; i >= 1 && i >= stack.length - 256; i--) {
         if (nodes[stack[i]!]!.tag === tag) {
           closeTo(i);
           break;
@@ -147,11 +162,12 @@ export function parsePageBlocks(html: string): PageBlocks {
     if (SELF_NESTING_CLOSES.has(tag) && stack.length > 1 && nodes[stack[stack.length - 1]!]!.tag === tag) {
       closeTo(stack.length - 1);
     }
-    nodes.push({ tag, parent: stack[stack.length - 1]!, start: text.length, end: text.length });
+    nodes.push({ tag, parent: stack[stack.length - 1]!, start: len, end: len });
     stack.push(nodes.length - 1);
   }
   addText(cleaned.slice(last));
   closeTo(1);
+  const text = parts.join("");
   nodes[0]!.end = text.length;
   return { text, nodes, runs };
 }
@@ -199,10 +215,18 @@ export function findNameOccurrences(text: string, names: string[]): NameOccurren
     const re = new RegExp(`(?<![\\p{L}\\p{N}])${body}(?![\\p{L}\\p{N}])`, "giu");
     for (const m of text.matchAll(re)) all.push({ key, start: m.index!, end: m.index! + m[0].length });
   }
+  // Sort by start, longer first on ties, then sweep: an occurrence is inside
+  // a longer one exactly when an earlier occurrence reaches at least as far
+  // (the furthest-reaching one is such a container). O(n log n).
   all.sort((a, b) => a.start - b.start || b.end - b.start - (a.end - a.start));
-  return all.filter(
-    (o) => !all.some((p) => p !== o && p.key !== o.key && p.start <= o.start && p.end >= o.end && p.end - p.start > o.end - o.start),
-  );
+  const out: NameOccurrence[] = [];
+  let maxEnd = -1;
+  for (const o of all) {
+    if (o.end <= maxEnd) continue;
+    out.push(o);
+    maxEnd = o.end;
+  }
+  return out;
 }
 
 function lineStartOf(text: string, index: number): number {
@@ -310,7 +334,7 @@ export function ownBlockPrice(
 /** Same as the other `<meta …>` readers: attribute order does not matter. */
 function metaContent(html: string, prop: string): string[] {
   const out: string[] = [];
-  for (const m of html.matchAll(/<meta\b[^>]*>/gi)) {
+  for (const m of html.matchAll(/<meta\b[^>]{0,2000}>/gi)) {
     const tag = m[0];
     const name = tag.match(/\b(?:property|name)\s*=\s*["']([^"']*)["']/i)?.[1];
     if (!name || name.toLowerCase() !== prop) continue;
@@ -319,14 +343,39 @@ function metaContent(html: string, prop: string): string[] {
   return out;
 }
 
-const BLOG_LD_TYPES = ["BlogPosting", "Article", "NewsArticle"];
+/** JSON-LD types that by themselves say «this page is a post». */
+const POST_LD_TYPES = ["BlogPosting", "NewsArticle"];
+
+/** The bodies of the page's ld+json scripts. Linear scan (no backtracking on unclosed input). */
+function ldJsonBodies(html: string): string[] {
+  const out: string[] = [];
+  const lower = html.toLowerCase();
+  let from = 0;
+  for (;;) {
+    const open = lower.indexOf("<script", from);
+    if (open < 0) break;
+    const gt = lower.indexOf(">", open);
+    if (gt < 0 || gt - open > 2000) {
+      from = open + 7;
+      continue;
+    }
+    const close = lower.indexOf("</script", gt);
+    if (close < 0) break;
+    if (/type\s*=\s*["']?application\/ld\+json/.test(lower.slice(open, gt))) out.push(html.slice(gt + 1, close));
+    from = close + 8;
+  }
+  return out;
+}
 
 /**
- * True when the page is a blog post / article, so its prices may be old:
- * a date in the URL path (/2022/06/…), `article:published_time`,
- * BlogPosting / Article / NewsArticle JSON-LD, or article markup
- * (`<article>` or og:type=article) WITH a publish date. A shop page that
- * only uses `<article>` for product cards has no publish date. PURE.
+ * True when the page is a blog post, so its prices may be old. A POST
+ * signal is required: a date in the URL path (/2022/06/…), BlogPosting /
+ * NewsArticle JSON-LD, or WordPress post classes (`type-post`,
+ * `single-post`) together with a publish date (itemprop datePublished,
+ * <time class="published|entry-date|post-date">, article:published_time,
+ * an Article JSON-LD node). `article:published_time`, og:type=article or a
+ * Yoast @graph `Article` alone are not enough: SEO plugins emit them on
+ * ordinary shop pages. PURE; linear on adversarial input.
  */
 export function isBlogPostPage(url: string, html: string): boolean {
   let path = "";
@@ -337,24 +386,34 @@ export function isBlogPostPage(url: string, html: string): boolean {
   }
   if (/\/(?:19|20)\d{2}\/(?:0?[1-9]|1[0-2])(?:\/|$)/.test(path)) return true;
   const h = html || "";
-  if (metaContent(h, "article:published_time").some((v) => v !== "")) return true;
-  const re = /<script\b[^>]*type\s*=\s*["']?application\/ld\+json["']?[^>]*>([\s\S]*?)<\/script>/gi;
-  for (const m of h.matchAll(re)) {
+  let articleNode = false;
+  for (const body of ldJsonBodies(h)) {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(m[1]!.trim());
+      parsed = JSON.parse(body.trim());
     } catch {
       continue;
     }
     const nodes: any[] = [];
     collectNodes(parsed, nodes);
-    if (nodes.some((node) => BLOG_LD_TYPES.some((t) => hasType(node, t)))) return true;
+    if (nodes.some((node) => POST_LD_TYPES.some((t) => hasType(node, t)))) return true;
+    if (nodes.some((node) => hasType(node, "Article"))) articleNode = true;
   }
-  const dated =
+  const postClass = /\bclass\s*=\s*["'][^"'>]{0,1000}\b(?:type-post|single-post)\b/i.test(h);
+  if (!postClass) return false;
+  let timePublished = false;
+  for (const m of h.matchAll(/<time\b[^>]{0,500}>/gi)) {
+    if (/\bclass\s*=\s*["'][^"']{0,500}\b(?:published|entry-date|post-date)\b/i.test(m[0])) {
+      timePublished = true;
+      break;
+    }
+  }
+  return (
+    timePublished ||
+    articleNode ||
     /\bitemprop\s*=\s*["']datePublished["']/i.test(h) ||
-    /<time\b[^>]*\bclass\s*=\s*["'][^"']*\b(?:published|entry-date|post-date)\b/i.test(h);
-  if (!dated) return false;
-  return /<article\b/i.test(h) || metaContent(h, "og:type").includes("article");
+    metaContent(h, "article:published_time").some((v) => v !== "")
+  );
 }
 
 export interface AnchorPage {

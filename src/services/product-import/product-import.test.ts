@@ -859,6 +859,98 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
     );
     assertEq([norm.statesPagePricesExclVat("Alle priser er ekskl. mva."), norm.statesPagePricesExclVat("Prisene er inkl. mva.")], [true, false], "R2-4 page-wide «Alle priser er ekskl. mva.»");
 
+    // ── Round 2 review fix-ups (B1/B2/N1–N3) ──────────────────────────────
+    for (const [text, want] of [
+      ["Pris eksklusiv mva", true],
+      ["190 kr eksklusive moms", true],
+      ["Pris ekskl. 15 % mva", true],
+      ["190 kr + 15% mva", true],
+      ["190 kr u/mva", true],
+      ["190 kr inkl. mva", false],
+      ["190 kr inkl. 15 % mva", false],
+    ] as const) {
+      assertEq(norm.statesExclVat(text), want, `B2 statesExclVat(«${text}») = ${want}`);
+    }
+    for (const [text, want] of [
+      ["Pris ekskl. mva", true],
+      ["Produkt | Pris eks. mva. | Enhet", true],
+      ["Pris inkl. mva", false],
+    ] as const) {
+      assertEq(norm.statesPagePricesExclVat(text), want, `B2 statesPagePricesExclVat(«${text}») = ${want} (singular «Pris» table header)`);
+    }
+    {
+      // B1: a ~2 MB catalog page parses in well under a second or two.
+      const card = (i: number) => `<div class="product"><h3>Vare nummer ${i}</h3><p class="price">kr ${100 + (i % 900)},-</p><p>Beskrivelse av varen fra gården.</p></div>`;
+      const cards: string[] = [];
+      let size = 0;
+      for (let i = 0; size < 2_000_000; i++) {
+        const c = card(i);
+        cards.push(c);
+        size += c.length;
+      }
+      const grid = HTML(`<section class="grid">${cards.join("")}</section>`);
+      let t0 = Date.now();
+      const parsedGrid = assoc.parsePageBlocks(grid);
+      let ms = Date.now() - t0;
+      assertTrue(parsedGrid.text.length > 500_000 && ms < 1500, `B1 parsePageBlocks: 2 MB product grid in ${ms} ms (< 1500)`);
+      const brs = "<p>" + "<br>x".repeat(200_000) + "</p>";
+      t0 = Date.now();
+      assoc.parsePageBlocks(brs);
+      ms = Date.now() - t0;
+      assertTrue(ms < 1500, `B1 parsePageBlocks: <br>x × 200k in ${ms} ms (< 1500)`);
+      const paras = "<p>Litt tekst om gården og varene våre.</p>".repeat(45_000);
+      t0 = Date.now();
+      assoc.parsePageBlocks(paras);
+      ms = Date.now() - t0;
+      assertTrue(ms < 1500, `B1 parsePageBlocks: ${(paras.length / 1e6).toFixed(1)} MB of <p> in ${ms} ms (< 1500)`);
+    }
+    {
+      // N2: unclosed tags / scripts from a third-party page stay linear.
+      const evilTime = '<time class="'.repeat(80_000);
+      let t0 = Date.now();
+      const blog = assoc.isBlogPostPage("https://gard.no/x", '<article class="type-post">' + evilTime);
+      let ms = Date.now() - t0;
+      assertTrue(blog === false && ms < 1000, `N2 isBlogPostPage: unclosed <time class=" × 80k in ${ms} ms (< 1000)`);
+      const evilScript = '<script type="application/ld+json">{"@type":"BlogPosting"'.repeat(40_000);
+      t0 = Date.now();
+      assoc.isBlogPostPage("https://gard.no/x", evilScript);
+      ms = Date.now() - t0;
+      assertTrue(ms < 1000, `N2 isBlogPostPage: unclosed ld+json scripts × 40k in ${ms} ms (< 1000)`);
+      t0 = Date.now();
+      assoc.parsePageBlocks(evilTime);
+      ms = Date.now() - t0;
+      assertTrue(ms < 1000, `N2 parsePageBlocks: unclosed <time class=" × 80k in ${ms} ms (< 1000)`);
+    }
+    {
+      // N3: many occurrences — sort-and-sweep, still drops names inside longer names.
+      const text = "Egg fra gården, ".repeat(20_000);
+      const t0 = Date.now();
+      const occs = assoc.findNameOccurrences(text, ["Egg", "Egg fra gården", "gården"]);
+      const ms = Date.now() - t0;
+      assertTrue(occs.length === 20_000 && occs.every((o) => o.key === "egg fra gården") && ms < 1000, `N3 findNameOccurrences: 60k raw occurrences in ${ms} ms, nested ones dropped`);
+    }
+    {
+      // N1: SEO-plugin markup on ordinary shop pages is not a blog post.
+      const rankMathShop =
+        '<html><head><meta property="og:type" content="product" /><meta property="article:published_time" content="2021-03-02T09:00:00+00:00" />' +
+        '<meta property="article:modified_time" content="2026-10-01T09:00:00+00:00" /></head>' +
+        '<body class="product-template-default single single-product"><article class="product"><h1>Lammelår</h1><p>kr 299,-</p></article></body></html>';
+      const yoastShop =
+        '<html><head><meta property="og:type" content="article" /><script type="application/ld+json">' +
+        JSON.stringify({ "@context": "https://schema.org", "@graph": [{ "@type": "WebPage", name: "Nettbutikk" }, { "@type": "Article", headline: "Nettbutikk", datePublished: "2020-05-01" }, { "@type": "Organization", name: "Gård" }] }) +
+        '</script></head><body class="page-template-default page"><article class="page type-page"><h1>Nettbutikk</h1><time class="entry-date published" datetime="2020-05-01">1. mai 2020</time><p>Lammelår kr 299,-</p></article></body></html>';
+      const yoastPost = yoastShop.replace("page-template-default page", "post-template-default single single-post").replace("page type-page", "post type-post");
+      assertEq(
+        [
+          assoc.isBlogPostPage("https://gard.no/produkt/lammelar/", rankMathShop),
+          assoc.isBlogPostPage("https://gard.no/nettbutikk/", yoastShop),
+          assoc.isBlogPostPage("https://gard.no/ny-sesong/", yoastPost),
+        ],
+        [false, false, true],
+        "N1 isBlogPostPage: Rank Math article:published_time / Yoast @graph Article alone → not a blog; with post classes → blog",
+      );
+    }
+
     // ── AC5: host + SSRF ───────────────────────────────────────────────────
     {
       const allowed = ex.allowedHostsFor("gard.no");
