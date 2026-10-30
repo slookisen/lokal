@@ -17,12 +17,26 @@
 //   price_placeholder_dropped  «kommer høsten» / «coming soon» → no price.
 //   price_zero_dropped     a price of 0 is never a real price → no price.
 //
+// Round 2 (prod measurement 2026-10-30, A2A reports/2026-10-30-produktimport-
+// maaling-2.md), set where the price is read (./association.ts, the parsers):
+//   price_not_at_name      the LLM price is not at the name: not in its own
+//                          element/line nor right after it in its product
+//                          block (or it sits in another product's block, or
+//                          is a shared «X eller Y … kr N» price for others).
+//   price_reanchored       the model's price was not at the name, but the
+//                          name's own product block shows exactly one price:
+//                          that one is used, verbatim from the page.
+//   price_blog_source_dropped  the price only stands on a blog post (date in
+//                          the URL, article/blog markup) → no price.
+//   price_excl_vat         the price is marked «ekskl. mva.»: kept, with
+//                          `price_excl_vat: true` and the mark in price_text.
+//
 // Every rule that fires is recorded in the candidate's `rules`, and every
 // excluded candidate in the result's `excluded`, so the dry run can be
 // audited candidate by candidate.
 
 import { classifyCartItemBan } from "../cart-item-ban";
-import { isComingSoonPlaceholder } from "./normalize";
+import { isComingSoonPlaceholder, statesExclVat } from "./normalize";
 import type { ProductCandidate, ProductImportTier } from "./structured";
 
 export type CandidateRule =
@@ -32,7 +46,11 @@ export type CandidateRule =
   | "price_multiple_lowest"
   | "unit_pack_weight"
   | "unit_unstated_dropped"
-  | "flag_alcohol";
+  | "flag_alcohol"
+  | "price_not_at_name"
+  | "price_reanchored"
+  | "price_blog_source_dropped"
+  | "price_excl_vat";
 
 export type ExclusionReason =
   | "excluded_service"
@@ -55,7 +73,24 @@ export function dropPrice(c: ProductCandidate, rule: CandidateRule): void {
   c.price_text = "";
   c.price_is_from = false;
   c.unit = null;
+  // The VAT mark belongs to the price that is gone.
+  if (c.price_excl_vat) {
+    delete c.price_excl_vat;
+    c.rules = c.rules.filter((r) => r !== "price_excl_vat");
+  }
   if (!c.rules.includes(rule)) c.rules.push(rule);
+}
+
+/**
+ * The candidate's price excludes VAT: flag it, record the rule and make sure
+ * the price text carries the mark, so it is never shown as a consumer price
+ * without it. No-op without a price.
+ */
+export function markExclVat(c: ProductCandidate): void {
+  if (c.price_nok === null) return;
+  c.price_excl_vat = true;
+  if (!statesExclVat(c.price_text)) c.price_text = `${c.price_text} ekskl. mva.`.trim();
+  if (!c.rules.includes("price_excl_vat")) c.rules.push("price_excl_vat");
 }
 
 export function excludedOf(c: ProductCandidate, reason: ExclusionReason): ExcludedCandidate {

@@ -17,9 +17,10 @@ import {
   normalizeProductName,
   parseMachinePrice,
   roundNok,
+  statesExclVat,
   type ProductUnit,
 } from "./normalize";
-import { dropPrice, gateVerdict, isEventShopCategory } from "./rules";
+import { dropPrice, gateVerdict, isEventShopCategory, markExclVat } from "./rules";
 
 export type ProductImportTier = "shopify" | "woocommerce" | "jsonld" | "llm";
 
@@ -41,6 +42,12 @@ export interface ProductCandidate {
   pack_size: string | null;
   /** The rules (./rules.ts) that changed this candidate, e.g. price_zero_dropped. */
   rules: string[];
+  /**
+   * Set (true) only when the source marks the price as EXCLUDING VAT
+   * («ekskl. mva.»); absent otherwise. Such a price is never a consumer
+   * price without the mark (price_text carries it too).
+   */
+  price_excl_vat?: true;
 }
 
 /** A Store API product excluded before it became a candidate. */
@@ -208,6 +215,9 @@ export function parseWooStoreProducts(
     // external/affiliate product is never purchasable here but shows a real
     // price, so it keeps it.
     if (p.is_purchasable === false && p.type !== "external" && c.price_nok !== null) dropPrice(c, "price_not_purchasable");
+    // The shop's own price display carries the VAT suffix
+    // («<small class="woocommerce-price-suffix">ekskl. mva.</small>»).
+    if (c.price_nok !== null && typeof p.price_html === "string" && statesExclVat(htmlToText(p.price_html))) markExclVat(c);
     out.push(c);
   }
   return out;
@@ -225,14 +235,18 @@ const UNIT_CODES: Record<string, ProductUnit> = {
   PK: "pakke",
 };
 
-function hasType(node: any, type: string): boolean {
+function htmlToText(html: string): string {
+  return decodeHtmlEntities(html.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+export function hasType(node: any, type: string): boolean {
   const t = node?.["@type"];
   if (typeof t === "string") return t === type || t === `schema:${type}` || t.endsWith(`/${type}`);
   if (Array.isArray(t)) return t.some((x) => typeof x === "string" && (x === type || x.endsWith(`/${type}`)));
   return false;
 }
 
-function collectNodes(v: unknown, out: any[], depth = 0): void {
+export function collectNodes(v: unknown, out: any[], depth = 0): void {
   if (depth > 8 || v === null || typeof v !== "object") return;
   if (Array.isArray(v)) {
     for (const x of v) collectNodes(x, out, depth + 1);
@@ -277,11 +291,14 @@ export function parseJsonLdProducts(
       let unit: ProductUnit | null = null;
       const values: number[] = [];
       const rawPrices: string[] = [];
+      let exclVat = false;
       for (const offer of offers) {
         if (!offer || typeof offer !== "object") continue;
         const spec = Array.isArray(offer.priceSpecification) ? offer.priceSpecification[0] : offer.priceSpecification;
         const currency = offer.priceCurrency ?? spec?.priceCurrency;
         if (!isNok(currency)) continue;
+        const vatIncl = spec?.valueAddedTaxIncluded ?? offer.valueAddedTaxIncluded;
+        if (vatIncl === false || vatIncl === "false" || vatIncl === "False") exclVat = true;
         if (hasType(offer, "AggregateOffer")) {
           if (offer.lowPrice !== undefined) rawPrices.push(`low=${String(offer.lowPrice)}`);
           if (offer.highPrice !== undefined) rawPrices.push(`high=${String(offer.highPrice)}`);
@@ -305,7 +322,7 @@ export function parseJsonLdProducts(
         if (values.some((v) => v !== min)) isFrom = true;
       }
       unit = unit ?? detectPriceUnit(name);
-      out.push({
+      const c: ProductCandidate = {
         name,
         price_nok: price,
         price_text: formatPriceText(price, "NOK", isFrom),
@@ -316,7 +333,9 @@ export function parseJsonLdProducts(
         raw_price_text: rawPrices.length ? rawPrices.join(" | ") : null,
         pack_size: null,
         rules: [],
-      });
+      };
+      if (exclVat) markExclVat(c);
+      out.push(c);
     }
   }
   return out;

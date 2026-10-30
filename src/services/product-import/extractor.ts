@@ -51,7 +51,8 @@ import {
   type ProductImportLlm,
 } from "./llm";
 import { PRODUCT_IMPORT_MAX_PRODUCTS, productNameKey } from "./normalize";
-import { applyCandidateRules, type ExcludedCandidate } from "./rules";
+import { applyCandidateRules, dropPrice, type ExcludedCandidate } from "./rules";
+import { anchorLlmCandidates, isBlogPostPage } from "./association";
 
 export type { ProductCandidate, ProductImportTier } from "./structured";
 export type { ExcludedCandidate } from "./rules";
@@ -409,7 +410,14 @@ export async function extractProductsFromWebsite(
 
   // ── Tier 3: JSON-LD ───────────────────────────────────────────────────────
   const ld: ProductCandidate[] = [];
-  for (const p of pages) ld.push(...parseJsonLdProducts(p.html, p.url, allowed));
+  for (const p of pages) {
+    const found = parseJsonLdProducts(p.html, p.url, allowed);
+    // A blog post is never a price source (its prices may be years old).
+    if (found.length > 0 && isBlogPostPage(p.url, p.html)) {
+      for (const c of found) if (c.price_nok !== null) dropPrice(c, "price_blog_source_dropped");
+    }
+    ld.push(...found);
+  }
   if (ld.length > 0) return done("jsonld", ld);
 
   // js_unreadable: almost no visible text AND the page is a script shell —
@@ -453,5 +461,8 @@ export async function extractProductsFromWebsite(
     const page = ordered.find((p) => groundingHaystack(p.text).includes(key)) ?? ordered[0]!;
     return { ...g, source_url: page.url, tier: "llm" as const };
   });
+  // Round 2: a price is kept only where the page puts it at the name, never
+  // from a blog post; «ekskl. mva.» is flagged (./association.ts).
+  anchorLlmCandidates(items, ordered.map((p) => ({ url: p.url, html: p.html })));
   return done("llm", items);
 }
