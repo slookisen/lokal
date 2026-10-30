@@ -25,7 +25,7 @@ import { rateLimit } from "express-rate-limit";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 import {
-  ownerOrderabilityPortalEnabled, listOwnerProductOrderability, confirmOwnerProductInStock,
+  ownerOrderabilityPortalEnabledFor, listOwnerProductOrderability, confirmOwnerProductInStock,
   confirmAllOwnerProductsInStock, addOwnerProduct, orderabilityReasonTextNb, formatOwnerDate,
   OWNER_PRODUCT_FIELD_TEXT_NB, type OwnerOrderabilityOverview, type OwnerProductField,
 } from "../services/owner-orderability";
@@ -1689,7 +1689,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       alert = oa.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(oa.text)}</div>`
         : `<div class="ep-alert ep-alert-error" role="alert">${escapeHtml(oa.text)}</div>`;
-    } else if (ownerOrderabilityPortalEnabled() && ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)) {
+    } else if (ownerOrderabilityPortalEnabledFor(agentId) && ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)) {
       const va = ownerOrderabilityAlert(status, req.query.felt, req.query.uten_pris)!;
       alert = va.ok
         ? `<div class="ep-alert ep-alert-ok" role="status">${escapeHtml(va.text)}</div>`
@@ -1743,8 +1743,10 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
 
     // B1: «Varer som kan bestilles» — only with OWNER_ORDERABILITY_PORTAL_ENABLED
     // on and a verified owner (flag off = the portal is byte-identical to before).
+    // B1a: and only for a subject in OWNER_FEATURES_ALLOWED_SUBJECTS (off the
+    // list = byte-identical to flag off; the banner lives inside the card).
     let orderabilityCardHtml = "";
-    if (ownerOrderabilityPortalEnabled()) {
+    if (ownerOrderabilityPortalEnabledFor(agentId)) {
       try {
         if (isVerifiedOwner(agentId, session)) {
           // B2: the stock-check banner (products.stock_check on, an orderable
@@ -2345,7 +2347,9 @@ export function ownerSelgerCardHtml(agentId: string): string {
 // ─────────────────────────────────────────────────────────────────
 // B1 (dev-request «RFB bestillinger fra start til slutt for eier»):
 // «Varer som kan bestilles» card + three form POSTs, behind
-// OWNER_ORDERABILITY_PORTAL_ENABLED (default off; off → no card, routes 404).
+// OWNER_ORDERABILITY_PORTAL_ENABLED (default off; off → no card, routes 404)
+// and, B1a, the owner-features allowlist (OWNER_FEATURES_ALLOWED_SUBJECTS,
+// `rfb:<id>`; off the list → the same 404, as if the flag were off).
 //   POST /eier/:agentId/varer/:productId/bekreft  — «Bekreft at varen er på lager»
 //   POST /eier/:agentId/varer/bekreft-alle        — «Bekreft alle på lager»
 //   POST /eier/:agentId/varer/ny                  — «Legg til vare»
@@ -2446,10 +2450,10 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
 
 type OwnerOrderabilityAuth = { ok: true; agentId: string; email: string | null } | { ok: false };
 
-/** Flag, session, Origin and strict ownership for the B1 POSTs; answers itself on failure. */
+/** Flag + allowlist, session, Origin and strict ownership for the B1 POSTs; answers itself on failure. */
 function ownerOrderabilityAuth(req: Request, res: Response): OwnerOrderabilityAuth {
   const agentId = String((req.params as any).agentId || "");
-  if (!ownerOrderabilityPortalEnabled()) {
+  if (!ownerOrderabilityPortalEnabledFor(agentId)) {
     res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
     return { ok: false };
   }

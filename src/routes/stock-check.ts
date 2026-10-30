@@ -2,7 +2,8 @@
 // dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier, B2.
 // Logic: services/stock-check-reminder.ts. Behind STOCK_CHECK_EMAIL_ENABLED
 // (default OFF → 404, as if the route did not exist) — the links only exist
-// in e-mails that flag sends.
+// in e-mails that flag sends. B1a: a valid token for a producer off the
+// owner-features allowlist (OWNER_FEATURES_ALLOWED_SUBJECTS) is the same 404.
 //
 //   GET  /lagerstatus/:token  shows which items would be confirmed. Changes
 //                             NOTHING (mail scanners and link prefetchers GET
@@ -21,6 +22,7 @@ import express, { Router, Request, Response } from "express";
 import rateLimit from "express-rate-limit";
 import {
   isStockCheckEmailEnabled,
+  stockCheckAllowlisted,
   verifyStockCheckToken,
   stockCheckConfirmableItems,
   confirmStockCheckItems,
@@ -75,6 +77,7 @@ router.get(`${STOCK_CHECK_PATH}/:token`, stockCheckLimiter, (req: Request, res: 
   const v = verifyStockCheckToken(String(req.params.token || ""));
   if (v.state === "invalid") return res.status(400).send(portalShell("Ugyldig lenke", INVALID_HTML));
   if (v.state === "expired") return res.status(410).send(portalShell("Lenken har gått ut", EXPIRED_HTML));
+  if (!stockCheckAllowlisted(v.agent_id)) return res.status(404).send("Not found");
   // Read-only: lists what a POST would write, writes nothing.
   const now = new Date();
   const items = stockCheckConfirmableItems(v.agent_id, v.product_ids, { now });
@@ -101,6 +104,7 @@ router.post(`${STOCK_CHECK_PATH}/:token`, stockCheckLimiter, express.urlencoded(
   const v = verifyStockCheckToken(String(req.params.token || ""));
   if (v.state === "invalid") return res.status(400).send(portalShell("Ugyldig lenke", INVALID_HTML));
   if (v.state === "expired") return res.status(410).send(portalShell("Lenken har gått ut", EXPIRED_HTML));
+  if (!stockCheckAllowlisted(v.agent_id)) return res.status(404).send("Not found");
   try {
     const now = new Date();
     const r = confirmStockCheckItems(v.agent_id, v.product_ids, { now, via: "link" });

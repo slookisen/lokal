@@ -556,7 +556,8 @@ app.use("/", ownerFeaturesRoutes);
 app.use("/", ownerOrdersRoutes);
 // B2 (rfb-bestillinger): /lagerstatus/:token — the stock-check reminder's
 // confirm link (GET shows, POST confirms). 404 while STOCK_CHECK_EMAIL_ENABLED
-// is off. See routes/stock-check.ts.
+// is off, and (B1a) for a producer off OWNER_FEATURES_ALLOWED_SUBJECTS. See
+// routes/stock-check.ts.
 app.use("/", stockCheckRoutes);
 // Fase B1: the buyer's order card (/ordre/:id?ref=<buyer_ref>), linked from the buyer receipts.
 app.use("/", buyerOrderCardRoutes);

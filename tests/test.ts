@@ -37252,6 +37252,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("stock-check-reminder-b2: unexpected error: " + String(err?.message || err));
   }
+  // B1a (bestillinger: B1 card/routes, B2 banner/job/link behind the owner-features allowlist) — own in-memory DB.
+  try {
+    const { runBestillingerB1aTests } = require("../src/routes/bestillinger-b1a.test") as
+      typeof import("../src/routes/bestillinger-b1a.test");
+    const b1a = await runBestillingerB1aTests({ log: false });
+    passed += b1a.passed;
+    failed += b1a.failed;
+    for (const f of b1a.failures) failures.push("bestillinger-b1a: " + f);
+    console.log(`  bestillinger-b1a: ${b1a.passed} passed, ${b1a.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b1a: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as

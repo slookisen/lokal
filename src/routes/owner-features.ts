@@ -36,7 +36,7 @@ import { slugify } from "../utils/slug";
 import { findOwnerFeature } from "../owner-features/registry";
 import { readOwnerFeatureInterest, recordOwnerFeatureInterest } from "../owner-features/interest";
 import { countOrderableProducts, orderCapNewPerDay } from "../services/cart-service";
-import { ownerOrderabilityPortalEnabled } from "../services/owner-orderability";
+import { ownerOrderabilityPortalEnabledFor } from "../services/owner-orderability";
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn } from "../services/order-opt-in";
 import { OWNER_PAUSE_TABLE } from "../services/agent-visibility";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
@@ -339,7 +339,7 @@ export function countOwnerOrderableItems(agentId: string, db: any = getDb(), now
 function itemsHref(agentId: string): string {
   const id = encodeURIComponent(agentId);
   // B1: with the orderability card on, it is the place to make items orderable.
-  if (ownerOrderabilityPortalEnabled()) return `/eier/${id}/portal#bestillbare-varer`;
+  if (ownerOrderabilityPortalEnabledFor(agentId)) return `/eier/${id}/portal#bestillbare-varer`;
   return ownerUnifiedSessionEnabled() ? `/eier/${id}/portal#produkter` : `/selger?agent=${id}`;
 }
 
