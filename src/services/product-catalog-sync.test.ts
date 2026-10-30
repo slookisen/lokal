@@ -144,7 +144,8 @@ export async function runProductCatalogSyncTests(opts: { log?: boolean } = {}): 
     "SELECT price_nok, availability, availability_source, availability_updated_at FROM products WHERE id = ?"
   ).get(beforeGuardRow.id) as { price_nok: number; availability: string; availability_source: string; availability_updated_at: string };
 
-  assertEq(afterSync.price_nok, 45, "guard: price_nok WAS updated by the sync (conflict path definitely ran)");
+  // B1b-2: the row is now owner-controlled (producer_dashboard), so its price is kept.
+  assertEq(afterSync.price_nok, 30, "guard: owner-controlled price_nok is kept (B1b-2) — conflict path ran, price untouched");
   assertEq(afterSync.availability, "out_of_stock",
     "guard: producer_dashboard-sourced availability is UNCHANGED after the sync re-run — the core safety guarantee");
   assertEq(afterSync.availability_source, "producer_dashboard",
@@ -155,6 +156,52 @@ export async function runProductCatalogSyncTests(opts: { log?: boolean } = {}): 
   // Row count stays 1 for pcs-guard — this was an update, not a duplicate insert.
   const guardCount = (db.prepare("SELECT COUNT(*) AS c FROM products WHERE agent_id = 'pcs-guard'").get() as { c: number }).c;
   assertEq(guardCount, 1, `guard: still exactly 1 product row for pcs-guard (got ${guardCount})`);
+
+  // ══════════════════════════════════════════════════════════════════════
+  // B1b-2: the sync never overwrites price_nok / category of owner-controlled
+  // rows, and updated_at does not move; a plain scraped row still updates.
+  // ══════════════════════════════════════════════════════════════════════
+  db.prepare(`
+    INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city)
+    VALUES ('pcs-own', 'Eier Gård', 'test', 'test', 'eier@example.com', 'https://example.com', 'producer', 'key-pcs-own', 'Oslo')
+  `).run();
+  const OLD = "2020-01-01 00:00:00";
+  const ownerRow = (id: string, name: string, source: string, avSource: string) =>
+    db.prepare(`
+      INSERT INTO products (id, agent_id, name, name_norm, category, price_nok, currency, availability, source,
+                            availability_source, created_at, updated_at)
+      VALUES (?, 'pcs-own', ?, ?, 'cat-old', 10, 'NOK', 'in_stock', ?, ?, ?, ?)
+    `).run(id, name, name.toLowerCase(), source, avSource, OLD, OLD);
+  ownerRow("own-dash", "Honning", "enrichment", "producer_dashboard");
+  ownerRow("own-added", "Syltetøy", "owner", "producer_dashboard");
+  ownerRow("own-added-nodash", "Saft", "owner", "enrichment");
+  ownerRow("own-admin", "Ost", "enrichment", "admin_producer_confirmed");
+  ownerRow("own-plain", "Brød", "enrichment", "enrichment");
+  db.prepare(`INSERT INTO agent_knowledge (agent_id, products, verification_status) VALUES ('pcs-own', ?, 'verified')`).run(
+    JSON.stringify([
+      { name: "Honning", category: "new-cat", price: "99 kr" },
+      { name: "Syltetøy", category: "new-cat", price: "99 kr" },
+      { name: "Saft", category: "new-cat", price: "99 kr" },
+      { name: "Ost", category: "new-cat", price: "99 kr" },
+      { name: "Brød", category: "new-cat", price: "99 kr" },
+    ]));
+  const r4 = runProductCatalogSync(db);
+  assertTrue(r4.success, "B1b-2: sync succeeded");
+  const getRow = (id: string) => db.prepare("SELECT price_nok, category, source, updated_at FROM products WHERE id = ?").get(id) as
+    { price_nok: number; category: string; source: string; updated_at: string };
+  for (const [id, label] of [["own-dash", "producer_dashboard row"], ["own-added", "owner-added row"],
+                             ["own-added-nodash", "owner-added row without producer_dashboard"],
+                             ["own-admin", "admin_producer_confirmed row"]] as const) {
+    const row = getRow(id);
+    assertEq(row.price_nok, 10, `B1b-2: ${label}: price_nok unchanged`);
+    assertEq(row.category, "cat-old", `B1b-2: ${label}: category unchanged`);
+    assertEq(row.updated_at, OLD, `B1b-2: ${label}: updated_at did not move`);
+  }
+  assertEq(getRow("own-added").source, "owner", "B1b-2: owner-added row keeps source 'owner'");
+  const plain = getRow("own-plain");
+  assertEq(plain.price_nok, 99, "B1b-2: plain scraped row: price still updated");
+  assertEq(plain.category, "new-cat", "B1b-2: plain scraped row: category still updated");
+  assertTrue(plain.updated_at !== OLD, "B1b-2: plain scraped row: updated_at moved");
 
   return { passed, failed, failures };
 }

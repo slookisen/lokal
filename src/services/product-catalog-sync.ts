@@ -43,6 +43,13 @@
 // unit, so a unit cannot change here.) None of this touches availability or
 // availability_source — the orderability gate's only source input — so an
 // owner_import product is no more orderable than before.
+//
+// B1b-2 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// the skive-4 protection is widened to every row the owner controls: a row with
+// availability_source 'producer_dashboard' (owner confirmed stock in the portal)
+// or source 'owner' (added by the owner via B1 «Legg til vare») also keeps its
+// price_nok and category (provenance unchanged). One shared predicate (ownerProtected)
+// drives both; updated_at follows automatically. Availability stays untouched.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
@@ -145,10 +152,23 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
 
   // Every SET expression reads the row as it was, so updated_at compares the
   // new price/category (same expressions) with the stored ones.
-  const newPrice = `CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.price_nok
+  // B1b-2: one predicate for «the owner (or the admin, for the owner) controls
+  // this row». The sync never takes price_nok or category from a scrape for such
+  // a row. 'producer_dashboard' = the owner confirmed stock in the owner portal;
+  // source 'owner' = the owner added the product themselves via B1 «Legg til
+  // vare» (owner-orderability.ts writes exactly source 'owner').
+  const ownerProtected = `(products.availability_source IN ('admin_producer_confirmed', 'producer_dashboard')
+                        OR products.source = 'owner')`;
+  const newPrice = `CASE WHEN ${ownerProtected} THEN products.price_nok
                         WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END`;
-  const newCategory = `CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.category
+  const newCategory = `CASE WHEN ${ownerProtected} THEN products.category
                         WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END`;
+  // Provenance is NOT widened to producer_dashboard: produktimport skive 2 has a
+  // contract that an owner-imported product on a B1 «på lager» row stamps its
+  // producer-stated source/date (test produktimport-s2), and that provenance is
+  // about where the product text came from, not about price. Owner-added rows
+  // (source 'owner') already keep provenance via the NOT IN clause, and
+  // admin_producer_confirmed keeps it as before — so provenance is unchanged.
   const keepProvenance = `products.availability_source = 'admin_producer_confirmed'
                         OR products.source NOT IN (${PRODUCT_SOURCES.map((s) => `'${s}'`).join(", ")})`;
   const provenance = (col: string) =>
