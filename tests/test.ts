@@ -37265,6 +37265,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("bestillinger-b1a: unexpected error: " + String(err?.message || err));
   }
+  // B1b-1 (bestillinger: product-write POSTs need the verified claimant's own e-mail, as /selger) — own in-memory DB.
+  try {
+    const { runBestillingerB1bTests } = require("../src/routes/bestillinger-b1b.test") as
+      typeof import("../src/routes/bestillinger-b1b.test");
+    const b1b = await runBestillingerB1bTests({ log: false });
+    passed += b1b.passed;
+    failed += b1b.failed;
+    for (const f of b1b.failures) failures.push("bestillinger-b1b: " + f);
+    console.log(`  bestillinger-b1b: ${b1b.passed} passed, ${b1b.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b1b: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as

@@ -2282,6 +2282,35 @@ export function crossSiteRequest(req: Request): boolean {
   try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }
 }
 
+/**
+ * The verified claimant's e-mail when this session was opened by that
+ * claimant's own address, else null. Rule: the session's magic-link e-mail
+ * (magic_links.email for session.token, trimmed + lowercased) equals the
+ * claimant_email of a status='verified' agent_claims row for this agent
+ * (case/whitespace-insensitive). Stricter than isVerifiedOwner (an e-mail-match
+ * session on a claimed profile is a verified owner but not the claimant).
+ * Used by POST /eier/:id/selger and the B1/B2 product-write POSTs. Callers
+ * check isVerifiedOwner first.
+ */
+export function sessionClaimantOwnerEmail(
+  agentId: string,
+  session: { token?: string } | null | undefined,
+): string | null {
+  if (!agentId || !session || !session.token) return null;
+  const db = getDb();
+  const link = db
+    .prepare(`SELECT email FROM magic_links WHERE token = ?`)
+    .get(session.token) as { email?: string } | undefined;
+  const sessionEmail = String(link?.email || "").trim().toLowerCase();
+  if (!sessionEmail) return null;
+  const claim = db.prepare(
+    `SELECT claimant_email FROM agent_claims
+     WHERE agent_id = ? AND status = 'verified' AND LOWER(TRIM(claimant_email)) = ?
+     ORDER BY verified_at DESC LIMIT 1`
+  ).get(agentId, sessionEmail) as { claimant_email?: string } | undefined;
+  return claim?.claimant_email ? claim.claimant_email : null;
+}
+
 router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
   const agentId = String((req.params as any).agentId || "");
   if (!ownerUnifiedSessionEnabled()) {
@@ -2298,29 +2327,19 @@ router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
         ? res.status(403).send(ownerNotVerifiedPage(agentId))
         : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
     }
-    const db = getDb();
-    const link = db
-      .prepare(`SELECT email FROM magic_links WHERE token = ?`)
-      .get(session.token) as { email?: string } | undefined;
-    const sessionEmail = String(link?.email || "").trim().toLowerCase();
-    const claim = sessionEmail
-      ? (db.prepare(
-          `SELECT claimant_email FROM agent_claims
-           WHERE agent_id = ? AND status = 'verified' AND LOWER(TRIM(claimant_email)) = ?
-           ORDER BY verified_at DESC LIMIT 1`
-        ).get(agentId, sessionEmail) as { claimant_email?: string } | undefined)
-      : undefined;
-    if (!claim || !claim.claimant_email) {
+    const claimantEmail = sessionClaimantOwnerEmail(agentId, session);
+    if (!claimantEmail) {
       // Verified owner, but this session was not opened by the claimant's
       // own address: the /selger editor needs its own login.
       return res.redirect(303, `/selger?agent=${encodeURIComponent(agentId)}`);
     }
+    const db = getDb();
     const token = crypto.randomBytes(32).toString("hex");
     const now = new Date();
     db.prepare(
       `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
        VALUES (?, ?, ?, ?, 0, ?, ?)`
-    ).run(`${OWNER_BRIDGE_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, claim.claimant_email, token, agentId,
+    ).run(`${OWNER_BRIDGE_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, claimantEmail, token, agentId,
       now.toISOString(), new Date(now.getTime() + OWNER_BRIDGE_VALID_MS).toISOString());
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Referrer-Policy", "no-referrer");
@@ -2355,7 +2374,10 @@ export function ownerSelgerCardHtml(agentId: string): string {
 //   POST /eier/:agentId/varer/ny                  — «Legg til vare»
 // Owner checks as POST /eier/:id/selger (it also hands out product editing):
 // valid owner session (none → login), Origin check (cross-site → 403),
-// always the strict isVerifiedOwner predicate. Writes: services/owner-orderability.ts
+// always the strict isVerifiedOwner predicate, and (B1b-1) the session's
+// magic-link e-mail must be the verified claimant's (sessionClaimantOwnerEmail,
+// else 403 «logg inn med eierens e-post»). Reads (the card) stay on
+// isVerifiedOwner. Writes: services/owner-orderability.ts
 // (stock through supply-graph setProducerAvailabilityByProductId, the
 // existing write path; parameterized SQL; agent_knowledge_audit row).
 // ─────────────────────────────────────────────────────────────────
@@ -2448,6 +2470,19 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
       </div>`;
 }
 
+/** 403 page: verified owner, but this session was not opened by the claimant's own e-mail. */
+export function ownerProductsNeedClaimantLoginPage(agentId: string): string {
+  const id = encodeURIComponent(agentId);
+  return portalShell(
+    "Ingen tilgang",
+    `<div class="ep-card" data-claimant-login-required="1">
+          <h1>Logg inn med eierens e-postadresse</h1>
+          <p>For å endre varene må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen. Du kan fortsatt se varene i portalen.</p>
+          <a class="ep-btn ep-btn-primary" href="/selger?agent=${id}">Logg inn med eierens e-post</a>
+        </div>`
+  );
+}
+
 type OwnerOrderabilityAuth = { ok: true; agentId: string; email: string | null } | { ok: false };
 
 /** Flag + allowlist, session, Origin and strict ownership for the B1 POSTs; answers itself on failure. */
@@ -2469,6 +2504,13 @@ function ownerOrderabilityAuth(req: Request, res: Response): OwnerOrderabilityAu
   if (!isVerifiedOwner(agentId, session)) {
     if (session.agentId === agentId) res.status(403).send(ownerNotVerifiedPage(agentId));
     else res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    return { ok: false };
+  }
+  // B1b-1: these POSTs make products orderable (real orders), so — as for
+  // /selger — only a session opened by the verified claimant's own address may
+  // write. A verified owner on another address still sees the card (GET).
+  if (!sessionClaimantOwnerEmail(agentId, session)) {
+    res.status(403).send(ownerProductsNeedClaimantLoginPage(agentId));
     return { ok: false };
   }
   return { ok: true, agentId, email: ownerSessionEmail(session.token) };
