@@ -2317,7 +2317,7 @@ router.post("/claim-review-reject", (req: Request, res: Response) => {
 //
 // ── source_type MUST be the literal string "brreg" ──────────────────────────
 // tierForSource() (cross-source-validator.ts) does an EXACT string match
-// against TIER_B = ["brreg", "facebook_official_page"] — no `:`-splitting.
+// against TIER_B = ["brreg", "facebook_official_page", "directory_listing"] — no `:`-splitting.
 // Any other spelling (e.g. "brreg_fallback") silently falls to Tier-C and
 // contributes NOTHING to the gate, with no visible error. Never prefix it.
 //

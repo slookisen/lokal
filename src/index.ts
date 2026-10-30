@@ -920,7 +920,7 @@ app.use(
 app.use("/admin/agents/fylke-contradiction-audit", adminLimiter, adminAgentsFylkeContradictionAuditRoutes);
 // GET /admin/agents/facebook-tier-shadow (enrichment-kadens S1a): read-only shadow count of
 // RFB profiles that would lose address/phone agreement if facebook_official_page stopped
-// corroborating those fields. Mount BEFORE /admin/agents like the siblings above.
+// corroborating those fields. After S1b that rule is live, so it always reports would_lose=0. Mount BEFORE /admin/agents like the siblings above.
 app.use("/admin/agents/facebook-tier-shadow", adminLimiter, adminAgentsFacebookTierShadowRoutes);
 app.use("/admin/agents/drink-coverage", adminLimiter, adminDrinkCoverageRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-

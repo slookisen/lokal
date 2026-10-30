@@ -70,6 +70,20 @@ const TIER_A: readonly string[] = ["homepage", "website_homepage", "google_place
 // agreement gate.
 const TIER_B: readonly string[] = ["brreg", "facebook_official_page", "directory_listing"];
 
+// ─── Existence-only sources (enrichment-kadens S1b) ──────────────────────────
+// `facebook_official_page` is set merely because a Facebook link exists in
+// external_links — no Facebook content is ever read. It still counts as Tier-B
+// evidence that the producer EXISTS, but must never corroborate `address` or
+// `phone`: for those fields it is treated as if the record did not exist.
+export const EXISTENCE_ONLY_SOURCES: readonly string[] = ["facebook_official_page"];
+export const CONTACT_FIELDS: readonly FieldName[] = ["address", "phone"];
+
+/** False when `sourceType` is existence-only and `field` is address/phone. */
+export function countsForField(sourceType: string, field?: FieldName): boolean {
+  if (!field) return true;
+  return !(EXISTENCE_ONLY_SOURCES.includes(sourceType) && CONTACT_FIELDS.includes(field));
+}
+
 export function tierForSource(sourceType: string): SourceTier {
   if (TIER_S.includes(sourceType)) return "S";
   if (TIER_A.includes(sourceType)) return "A";
@@ -226,6 +240,39 @@ function normalizeValue(fieldName: FieldName, value: string): string {
 // ─── Main cross-source agreement logic ─────────────────────────────────────
 
 /**
+ * Records of `fieldName` with a usable value, after S1b: existence-only sources
+ * (facebook_official_page) are dropped for address/phone as if absent. Inference
+ * sources are still included here (they show up in sources_used). Shared by
+ * crossSourceAgreement and admin-outreach-pool so their counts cannot drift.
+ */
+export function usableFieldRecords(
+  fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>,
+  fieldName: FieldName,
+): ProvenanceRecord[] {
+  const raw = fieldProvenance[fieldName];
+  let records: ProvenanceRecord[];
+  if (!raw) records = [];
+  else if (Array.isArray(raw)) records = raw as ProvenanceRecord[];
+  else if (typeof raw === "object") records = [raw as ProvenanceRecord];
+  else records = [];
+  return records.filter(
+    (r) =>
+      !!r &&
+      typeof r.value === "string" &&
+      r.value.trim() !== "" &&
+      countsForField(r.source_type, fieldName),
+  );
+}
+
+/** usableFieldRecords minus inference sources: the real evidence records. */
+export function validEvidenceRecords(
+  fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>,
+  fieldName: FieldName,
+): ProvenanceRecord[] {
+  return usableFieldRecords(fieldProvenance, fieldName).filter((r) => !isInferenceSource(r.source_type));
+}
+
+/**
  * Given the field_provenance for an agent (keyed by field name, value is an
  * array of ProvenanceRecord), decide whether the named field has sufficient
  * cross-source agreement to be considered trustworthy.
@@ -247,21 +294,7 @@ export function crossSourceAgreement(
 ): CrossSourceResult {
   const raw = fieldProvenance[fieldName];
 
-  // Coerce single-object (legacy) or missing to array
-  let records: ProvenanceRecord[];
-  if (!raw) {
-    records = [];
-  } else if (Array.isArray(raw)) {
-    records = raw as ProvenanceRecord[];
-  } else if (typeof raw === "object" && raw !== null) {
-    // Legacy single-record shape: { value, source_type, ... }
-    records = [raw as ProvenanceRecord];
-  } else {
-    records = [];
-  }
-
-  // Filter out records without a usable value
-  const allValid = records.filter((r) => typeof r.value === "string" && r.value.trim() !== "");
+  const allValid = usableFieldRecords(fieldProvenance, fieldName);
 
   // Guard #2 (orchestrator-pr-16): inference source_types (category_inference,
   // seasonal_knowledge, name_analysis, web_search, …) are NOT real evidence.

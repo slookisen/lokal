@@ -1,10 +1,11 @@
 // ─── Admin: GET /admin/agents/facebook-tier-shadow ──────────────────────────
 //
-// Enrichment-kadens S1a (read-only shadow measurement). Planned rule change
-// (S1b, not built here): `facebook_official_page` counts only as evidence that
+// Enrichment-kadens S1a (read-only shadow measurement). Rule change
+// (S1b, now live in crossSourceAgreement): `facebook_official_page` counts only as evidence that
 // the producer exists, never as corroboration for `address` or `phone`. This
 // report says how many RFB profiles would lose today's agreed result on each
-// field, and on the aggregate verdict, if those records were ignored.
+// field, and on the aggregate verdict, if those records were ignored. After S1b
+// "now" already ignores them, so would_lose is expected to be 0.
 //
 // The per-profile math is computeFacebookTierShadow (services/facebook-tier-
 // shadow.ts), which calls the production crossSourceAgreement/aggregateVerdict

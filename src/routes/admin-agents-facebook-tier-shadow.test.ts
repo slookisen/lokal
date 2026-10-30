@@ -50,12 +50,12 @@ export async function runAdminAgentsFacebookTierShadowTests(
       address: [rec("facebook_official_page", "Storgata 1, 0150 Oslo"), rec("homepage", "Storgata 1, 0150 Oslo")],
     };
     const s1 = computeFacebookTierShadow(fbHome, { ownName: "Test Gard" });
-    eq(s1.fields.address.now.verdict, "pool_eligible", "(1) now: facebook+homepage address is pool_eligible");
+    eq(s1.fields.address.now.verdict, "review_required", "(1) now (post-S1b): facebook+homepage address is review_required");
     eq(s1.fields.address.shadow.verdict, "review_required", "(1) shadow: homepage alone is review_required");
     eq(s1.fields.address.has_facebook_record, true, "(1) has_facebook_record");
-    eq(s1.fields.address.would_lose, true, "(1) facebook+website address agreement counted as would_lose");
-    eq([s1.aggregate_now, s1.aggregate_shadow, s1.aggregate_would_lose], ["pool_eligible", "review_required", true],
-      "(1) aggregate: pool_eligible -> review_required");
+    eq(s1.fields.address.would_lose, false, "(1) post-S1b: now already ignores facebook, nothing left to lose");
+    eq([s1.aggregate_now, s1.aggregate_shadow, s1.aggregate_would_lose], ["review_required", "review_required", false],
+      "(1) aggregate: review_required both (post-S1b)");
     // "now" must be exactly what production computes.
     eq(s1.fields.address.now, crossSourceAgreement(fbHome, "address", { ownName: "Test Gard" }),
       "(1) now result equals production crossSourceAgreement");
@@ -64,7 +64,7 @@ export async function runAdminAgentsFacebookTierShadowTests(
     const s1p = computeFacebookTierShadow({
       phone: [rec("facebook_official_page", "+47 912 34 567"), rec("google_places", "91234567")],
     });
-    eq([s1p.fields.phone.now.agree, s1p.fields.phone.would_lose], [true, true], "(1b) phone facebook+google_places -> would_lose");
+    eq([s1p.fields.phone.now.agree, s1p.fields.phone.would_lose], [false, false], "(1b) phone facebook+google_places -> no longer agrees (post-S1b)");
     eq(s1p.aggregate_would_lose, false, "(1b) phone does not gate the aggregate");
 
     // (2) facebook + brreg + google_places all agree → still agrees without facebook.
@@ -100,7 +100,7 @@ export async function runAdminAgentsFacebookTierShadowTests(
     const sLegacy = computeFacebookTierShadow({ address: rec("facebook_official_page", "Storgata 1") });
     eq([sLegacy.fields.address.has_facebook_record, sLegacy.fields.address.now.verdict,
         sLegacy.fields.address.shadow.verdict, sLegacy.fields.address.would_lose],
-      [true, "review_required", "data_insufficient", false], "legacy single-record facebook: not counted");
+      [true, "data_insufficient", "data_insufficient", false], "legacy single-record facebook: not counted");
     // The input object is not mutated.
     eq(fbHome.address.length, 2, "input provenance is not mutated");
 
@@ -161,20 +161,17 @@ export async function runAdminAgentsFacebookTierShadowTests(
     eq(b.scanned_count, 4, "(4) scope: '{}', opt_out and umbrella rows excluded");
     eq(b.unparseable_provenance, 1, "(4) unparseable provenance counted, not thrown");
     const a = b.rfb.fields.address;
-    eq([a.evaluated, a.with_records, a.has_facebook_record, a.agree_now, a.agree_shadow, a.would_lose], [3, 3, 2, 3, 2, 1],
+    eq([a.evaluated, a.with_records, a.has_facebook_record, a.agree_now, a.agree_shadow, a.would_lose], [3, 3, 2, 2, 2, 0],
       "(4) address counts");
-    eq(a.examples, [{
-      agent_id: "fb-home", name: "Fjellgård Øst", slug: "fjellgard-ost",
-      sources_used_now: ["facebook_official_page", "homepage"], shadow_verdict: "review_required",
-    }], "(4) address example shape");
+    eq(a.examples, [], "(4) address examples empty post-S1b");
     const p = b.rfb.fields.phone;
-    eq([p.evaluated, p.with_records, p.has_facebook_record, p.agree_now, p.agree_shadow, p.would_lose], [3, 2, 1, 1, 0, 1],
+    eq([p.evaluated, p.with_records, p.has_facebook_record, p.agree_now, p.agree_shadow, p.would_lose], [3, 2, 1, 0, 0, 0],
       "(4) phone counts");
-    eq(p.examples[0].agent_id, "fb-three", "(4) phone example");
+    eq(p.examples, [], "(4) phone examples empty post-S1b");
     const g = b.rfb.aggregate;
     eq([g.gating_fields, g.pool_eligible_now, g.pool_eligible_shadow, g.would_lose, g.would_lose_to],
-      [["address"], 3, 2, 1, { review_required: 1 }], "(4) aggregate counts");
-    eq(g.examples[0].agent_id, "fb-home", "(4) aggregate example");
+      [["address"], 2, 2, 0, {}], "(4) aggregate counts (post-S1b: now == shadow)");
+    eq(g.examples, [], "(4) aggregate examples empty post-S1b");
     eq(b.rfb.uses_validator, true, "(4) rfb uses_validator");
     eq([b.gardssalg.uses_validator, b.dental.uses_validator], [false, false], "(4) gardssalg/dental uses_validator false");
     eq(typeof b.gardssalg.reason === "string" && typeof b.dental.reason === "string", true, "(4) reasons present");
