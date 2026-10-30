@@ -176,6 +176,11 @@ export async function runStockCheckReminderB2Tests(opts: { log?: boolean } = {})
       tokens[id] = `tok-${id}`;
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${id}`, emailOf(id), tokens[id], id, new Date().toISOString(), new Date(Date.now() + DAY).toISOString());
+      // B1b-1: the portal write POSTs need a session opened by the verified claimant's own e-mail.
+      db.prepare(
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, verified_at)
+         VALUES (?, ?, 'Eier', ?, 'verified', '2026-10-01T00:00:00.000Z')`,
+      ).run(`claim-${id}`, id, emailOf(id));
     };
     const seedProduct = (agent: string, pid: string, p: { name: string; price?: number | null; source?: string; updated?: string | null; category?: string | null; availability?: string }) => {
       db.prepare(
