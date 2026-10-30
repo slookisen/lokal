@@ -100,6 +100,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import ownerProductImportRoutes from "./routes/owner-product-import";
 import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
@@ -553,6 +554,10 @@ app.use("/", ownerPortalRoutes);
 // (GET/PUT /api/owner/:id/features). Same owner session + isVerifiedOwner;
 // 404 for every subject not in OWNER_FEATURES_ALLOWED_SUBJECTS (default empty).
 app.use("/", ownerFeaturesRoutes);
+// dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, Skive 3-1: owner product import
+// from the profile's own website (/api/agents/:id/product-import[/fetch|/runs/:runId[/publish]]).
+// Flag PRODUCT_IMPORT_ENABLED (default off → 404); same owner session + isVerifiedOwner + is_verified=1.
+app.use("/", ownerProductImportRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
