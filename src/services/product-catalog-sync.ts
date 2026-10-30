@@ -15,7 +15,8 @@
 //
 // ─── Availability-preservation guarantee (critical safety constraint) ─────
 // The ON CONFLICT ... DO UPDATE SET clause below updates ONLY price_nok,
-// category, and updated_at — it does not mention `availability`,
+// category, updated_at and (skive 2, below) the provenance columns source,
+// source_url, fetched_at and owner_confirmed_at — it does not mention `availability`,
 // `availability_source`, or `availability_updated_at` at all. That is the
 // exact same clause the original admin route always used, so this sync
 // (automatic or manual) has NEVER been able to touch a product row's
@@ -30,10 +31,22 @@
 // price_nok and category of a row whose availability_source is
 // 'admin_producer_confirmed' are likewise left alone, so a producer-confirmed
 // price entered by the admin is never overwritten by scraped enrichment data.
+//
+// Produktimport skive 2 (dev-request 2026-10-21-rfb-produktimport-fra-egen-
+// nettside): `source` is the product's own ProductInfo.source (owner_manual,
+// owner_import, owner_auto_sync; else 'enrichment') instead of always
+// 'enrichment', with source_url / fetched_at / owner_confirmed_at beside it.
+// A row another writer created ('owner' via the B1 portal, 'admin' via the
+// producer list) or an admin_producer_confirmed row keeps its provenance.
+// updated_at now moves only when price_nok or category actually changes, so
+// it dates the last real change instead of the last sync. (The sync writes no
+// unit, so a unit cannot change here.) None of this touches availability or
+// availability_source — the orderability gate's only source input — so an
+// owner_import product is no more orderable than before.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { parseProductPrice, productPriceText, isProductHeader, isProductNoise } from "./knowledge-service";
+import { parseProductPrice, productPriceText, isProductHeader, isProductNoise, PRODUCT_SOURCES, OWNER_PRODUCT_SOURCES, type ProductSource } from "./knowledge-service";
 
 // ─── Price string → numeric NOK ──────────────────────────────────────────
 // Parses "kr 275/kg", "kr 275", "275" → 275.0; null if unparseable.
@@ -93,13 +106,28 @@ export function normalizeName(name: string): string {
   return name.toLowerCase().trim().replace(/\s+/g, " ");
 }
 
+// ─── Provenance columns from one ProductInfo (skive 2) ──────────────────
+// The entry is DB JSON (see I-G below): only a known source and text values
+// count. owner_confirmed_at is kept only with an owner source.
+function productProvenance(p: any): { source: ProductSource; source_url: string | null; fetched_at: string | null; owner_confirmed_at: string | null } {
+  const source: ProductSource = PRODUCT_SOURCES.includes(p?.source) ? p.source : "enrichment";
+  const text = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : null);
+  return {
+    source,
+    source_url: text(p?.sourceUrl),
+    fetched_at: text(p?.fetchedAt),
+    owner_confirmed_at: OWNER_PRODUCT_SOURCES.includes(source) ? text(p?.confirmedAt) : null,
+  };
+}
+
 export type ProductCatalogSyncResult =
   | { success: true; agents_processed: number; inserted: number; updated: number; skipped: number }
   | { success: false; error: string };
 
 /**
  * Upserts every agent_knowledge.products row into `products`. Idempotent:
- * inserts new rows, updates price/category/updated_at on conflict — NEVER
+ * inserts new rows, updates price/category/provenance on conflict (updated_at
+ * only when price or category changed) — NEVER
  * touches `availability` (see module doc comment above). Never throws;
  * failures come back as `{success:false, error}` so callers (an HTTP route,
  * or the unattended scheduler tick in src/index.ts) can each decide how to
@@ -115,19 +143,32 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
     WHERE k.products IS NOT NULL AND k.products != '[]' AND k.products != ''
   `).all() as Array<{ agent_id: string; products: string }>;
 
+  // Every SET expression reads the row as it was, so updated_at compares the
+  // new price/category (same expressions) with the stored ones.
+  const newPrice = `CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.price_nok
+                        WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END`;
+  const newCategory = `CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.category
+                        WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END`;
+  const keepProvenance = `products.availability_source = 'admin_producer_confirmed'
+                        OR products.source NOT IN (${PRODUCT_SOURCES.map((s) => `'${s}'`).join(", ")})`;
+  const provenance = (col: string) =>
+    `${col} = CASE WHEN ${keepProvenance} THEN products.${col} ELSE excluded.${col} END`;
   const insert = conn.prepare(`
     INSERT INTO products
       (id, agent_id, name, name_norm, category, price_nok, currency,
-       availability, source, created_at, updated_at)
+       availability, source, source_url, fetched_at, owner_confirmed_at, created_at, updated_at)
     VALUES
       (@id, @agent_id, @name, @name_norm, @category, @price_nok, 'NOK',
-       'in_stock', 'enrichment', datetime('now'), datetime('now'))
+       'in_stock', @source, @source_url, @fetched_at, @owner_confirmed_at, datetime('now'), datetime('now'))
     ON CONFLICT(agent_id, name_norm) DO UPDATE SET
-      price_nok  = CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.price_nok
-                        WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END,
-      category   = CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.category
-                        WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END,
-      updated_at = datetime('now')
+      price_nok  = ${newPrice},
+      category   = ${newCategory},
+      ${provenance("source")},
+      ${provenance("source_url")},
+      ${provenance("fetched_at")},
+      ${provenance("owner_confirmed_at")},
+      updated_at = CASE WHEN (${newPrice}) IS NOT products.price_nok OR (${newCategory}) IS NOT products.category
+                        THEN datetime('now') ELSE products.updated_at END
   `);
 
   let agents_processed = 0;
@@ -183,6 +224,7 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
           name_norm,
           category,
           price_nok,
+          ...productProvenance(p),
         });
 
         if (existed) updated++;

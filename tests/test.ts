@@ -25947,6 +25947,9 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       category TEXT,
       image_url TEXT,
       source TEXT NOT NULL DEFAULT 'enrichment',
+      source_url TEXT,
+      fetched_at TEXT,
+      owner_confirmed_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(agent_id, name_norm)
@@ -26240,6 +26243,9 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
       category TEXT,
       image_url TEXT,
       source TEXT NOT NULL DEFAULT 'enrichment',
+      source_url TEXT,
+      fetched_at TEXT,
+      owner_confirmed_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(agent_id, name_norm)
@@ -51034,6 +51040,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("cross-source-facebook-s1b: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Produktimport skive 2: kilde og datoer som stemmer — owner_manual stamping on
+// PUT /knowledge, catalog-sync provenance + updated_at only on a real change,
+// owner_import alone not orderable, and the profile date line (NO/EN). Swaps
+// the getDb() singleton (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 2: kilde og datoer ──");
+  try {
+    const { runProduktimportS2Tests } = require("../src/services/produktimport-s2.test") as
+      typeof import("../src/services/produktimport-s2.test");
+    const r = await runProduktimportS2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("produktimport-s2: " + f);
+    console.log(`  produktimport-s2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("produktimport-s2: unexpected error: " + String(err?.message || err));
   }
 });
 

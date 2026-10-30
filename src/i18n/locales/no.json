@@ -167,7 +167,12 @@
     "season_note_nb": "Notat på norsk",
     "rating_on_source": "på {source}",
     "rating_count_on_source": "{count} anmeldelser på {source}",
-    "rating_count_on_source_one": "{count} anmeldelse på {source}"
+    "rating_count_on_source_one": "{count} anmeldelse på {source}",
+    "products_prices_fetched": "Priser hentet fra {host} {date}",
+    "products_confirmed_by_owner": "bekreftet av eier",
+    "products_updated_by_owner": "Oppdatert av eier {date}",
+    "products_price_caveat": "Prisene kan ha endret seg, sjekk med produsenten.",
+    "updated_by_owner": "Oppdatert av eier"
   },
   "common": {
     "see_profile": "Se profil →",

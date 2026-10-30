@@ -168,7 +168,12 @@
     "season_note_nb": "Anteckning på norska",
     "rating_on_source": "på {source}",
     "rating_count_on_source": "{count} recensioner på {source}",
-    "rating_count_on_source_one": "{count} recension på {source}"
+    "rating_count_on_source_one": "{count} recension på {source}",
+    "products_prices_fetched": "Priser hämtade från {host} {date}",
+    "products_confirmed_by_owner": "bekräftat av ägaren",
+    "products_updated_by_owner": "Uppdaterat av ägaren {date}",
+    "products_price_caveat": "Priserna kan ha ändrats, kontrollera med producenten.",
+    "updated_by_owner": "Uppdaterat av ägaren"
   },
   "common": {
     "see_profile": "Visa profil →",
