@@ -176,6 +176,11 @@ export async function runStockCheckReminderB2Tests(opts: { log?: boolean } = {})
       tokens[id] = `tok-${id}`;
       db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)")
         .run(`mlsess_${id}`, emailOf(id), tokens[id], id, new Date().toISOString(), new Date(Date.now() + DAY).toISOString());
+      // B1b-1: the portal write POSTs need a session opened by the verified claimant's own e-mail.
+      db.prepare(
+        `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, verified_at)
+         VALUES (?, ?, 'Eier', ?, 'verified', '2026-10-01T00:00:00.000Z')`,
+      ).run(`claim-${id}`, id, emailOf(id));
     };
     const seedProduct = (agent: string, pid: string, p: { name: string; price?: number | null; source?: string; updated?: string | null; category?: string | null; availability?: string }) => {
       db.prepare(
@@ -204,6 +209,9 @@ export async function runStockCheckReminderB2Tests(opts: { log?: boolean } = {})
     seedProducer(BLK, { email: "sperret@sc-blocked.example.no" });
     seedProduct(BLK, "blk-soon", { name: "Pastinakk" });
     db.prepare(`INSERT INTO agent_blocklist (identifier_type, identifier_value, reason) VALUES ('email', 'sperret@sc-blocked.example.no', 'test')`).run();
+
+    // B1a: the job, the link and the banner are only for allowlisted subjects.
+    process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = [A, B, OFF, OPT, BLK, FAIL].map((id) => `rfb:${id}`).join(",");
 
     const mailsTo = (id: string) => sent.filter((m) => m.to === emailOf(id) && m.subject === "Bekreft at varene fortsatt er på lager");
     const allReminders = () => sent.filter((m) => m.subject === "Bekreft at varene fortsatt er på lager");

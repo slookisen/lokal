@@ -456,7 +456,8 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   // effect (and reads off) while orders are off. Read by
   // services/stock-check-reminder.ts stockCheckOn() — the e-mail job
   // (behind STOCK_CHECK_EMAIL_ENABLED) and the /eier portal banner (behind
-  // OWNER_ORDERABILITY_PORTAL_ENABLED).
+  // OWNER_ORDERABILITY_PORTAL_ENABLED). B1a: all three surfaces are also only
+  // for a subject in OWNER_FEATURES_ALLOWED_SUBJECTS until Daniel's rollout GO.
   entry({
     key: "products.stock_check", group: "products", type: "switch",
     label: t("Minn meg på å bekrefte lagerstatus", "Remind me to confirm stock"),

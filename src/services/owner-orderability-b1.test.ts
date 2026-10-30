@@ -168,6 +168,14 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
         `INSERT INTO agent_knowledge (agent_id, email, website, about, verification_status, verified_second_line)
          VALUES (?, ?, ?, 'Liten gård.', ?, 0)`,
       ).run(id, `post@${id}.example.no`, `https://${id}.example.no`, o.xcheck ?? "verified");
+      // B1b-1: the product-write POSTs need a session opened by the verified
+      // claimant's own e-mail; the claimed producers' sessions are.
+      if (o.claimed !== false) {
+        db.prepare(
+          `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, verified_at)
+           VALUES (?, ?, 'Eier', ?, 'verified', '2026-10-01T00:00:00.000Z')`,
+        ).run(`claim-${id}`, id, `post@${id}.example.no`);
+      }
     }
     function seedProduct(agentId: string, pid: string, p: { name: string; price?: number | null; availability: string; source: string; updated?: string | null; category?: string | null }): void {
       db.prepare(
@@ -361,6 +369,9 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
     }
 
     setEnv(FLAG, "1");
+    // B1a: the card and the routes are only for allowlisted subjects; the
+    // producers whose card is exercised below are put on the list.
+    setEnv("OWNER_FEATURES_ALLOWED_SUBJECTS", [A, OFF, OTHER, EMATCH].map((id) => `rfb:${id}`).join(","));
 
     // ═══ the card ═════════════════════════════════════════════════════════
     {

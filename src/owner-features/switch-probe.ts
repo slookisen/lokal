@@ -959,9 +959,12 @@ const outreachSync = (ctx: ProbeReaderContext): SurfaceObservation => {
 // B2 (products.stock_check): the reminder's own decision — stockCheckOn()
 // (orders.enabled + the owner's choice), the same call the job and the portal
 // banner make. Decision only: nothing is reserved or sent, no banner rendered.
+// B1a: the job, the link and the banner also require the owner-features
+// allowlist (stockCheckAllowlisted); the probe's fixture is always on it
+// (resolveFixture refuses otherwise), so this only keeps the reader honest.
 function stockCheckDecision(ctx: ProbeReaderContext): boolean {
-  const { stockCheckOn } = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
-  return stockCheckOn(ctx.fixture.id, { db: ctx.db, env: ctx.env });
+  const { stockCheckOn, stockCheckAllowlisted } = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
+  return stockCheckAllowlisted(ctx.fixture.id, ctx.env) && stockCheckOn(ctx.fixture.id, { db: ctx.db, env: ctx.env });
 }
 const stockCheckMailSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   const on = stockCheckDecision(ctx);
@@ -1000,9 +1003,9 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
     "auto.guarantee × job:rfb_enrichment_nightly": { read: enrichmentNightlyReader, observe: "loadRfbEnrichmentCohort(): testprodusenten velges aldri" },
     "auto.guarantee × job:knowledge_write": syncReader(knowledgeWriteSync, "upsertKnowledge() ikke-eier på eierlåst felt (rulles tilbake): owner_locked, verdi beholdt"),
     "comms.unsubscribe × email:outreach": syncReader(outreachSync, "unsubscribeHeaderValues(): kald e-post får List-Unsubscribe"),
-    "products.stock_check × email:stock_check": syncReader(stockCheckMailSync, "stockCheckOn() + resolveOrderNotificationRecipient(): lagerpåminnelse sendes / sendes ikke"),
-    "products.stock_check × job:stock_check": syncReader(stockCheckJobSync, "stockCheckOn(): jobben tar med / hopper over produsenten"),
-    "products.stock_check × owner_portal": syncReader(stockCheckPortalSync, "stockCheckOn(): banneret i eierportalen kan vises / vises ikke"),
+    "products.stock_check × email:stock_check": syncReader(stockCheckMailSync, "allowlist + stockCheckOn() + resolveOrderNotificationRecipient(): lagerpåminnelse sendes / sendes ikke"),
+    "products.stock_check × job:stock_check": syncReader(stockCheckJobSync, "allowlist + stockCheckOn(): jobben tar med / hopper over produsenten"),
+    "products.stock_check × owner_portal": syncReader(stockCheckPortalSync, "allowlist + stockCheckOn(): banneret i eierportalen kan vises / vises ikke"),
   };
   for (const s of VISIBILITY_SURFACES) {
     out[caseId("visibility.profile", s)] = {

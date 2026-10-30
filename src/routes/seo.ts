@@ -24,7 +24,7 @@ import { resolveRouteIntent } from "../services/route-intent";
 import { knowledgeService, productPriceText, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
 import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
-import { debioApprovalText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
+import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
 import { publicCountsShown } from "../services/public-stats-threshold";
 // dev-request 2026-10-17-integrasjonstest-oppfolging, I-G: knowledge list
 // fields read by type (see "knowledge fields read by type" below).
@@ -2505,7 +2505,7 @@ router.get("/teknologi", (req: Request, res: Response) => {
         <div class="setup-step"><span class="step-n">1</span><div>Go to <a href="https://chatgpt.com" target="_blank">chatgpt.com</a> and open a new conversation</div></div>
         <div class="setup-step"><span class="step-n">2</span><div>Click the tools icon (&#128295;) in the message field and choose <strong>"Add an MCP Server"</strong></div></div>
         <div class="setup-step"><span class="step-n">3</span><div>Paste this URL: <code>https://rettfrabonden.com/mcp</code></div></div>
-        <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find organic honey in <span translate="no">Bergen</span>"</em></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find honey in <span translate="no">Bergen</span>"</em></div></div>
       </div>
     </div>
 
@@ -2516,7 +2516,7 @@ router.get("/teknologi", (req: Request, res: Response) => {
         <div class="setup-step"><span class="step-n">1</span><div>Open Claude Desktop &rarr; <strong>Settings</strong> &rarr; <strong>Integrations</strong></div></div>
         <div class="setup-step"><span class="step-n">2</span><div>Click <strong>"Add custom connector"</strong></div></div>
         <div class="setup-step"><span class="step-n">3</span><div>Paste: <code>https://rettfrabonden.com/mcp</code></div></div>
-        <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find organic meat in <span translate="no">Trondheim</span>"</em></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find lamb in <span translate="no">Trondheim</span>"</em></div></div>
       </div>
       <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Method 2 \u2014 Local npm package</strong> (for developers, Claude Code, or Claude Desktop without Pro):</p>
       <div class="setup-steps">
@@ -3015,7 +3015,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>The tools, exactly as registered</h2>
     <p class="gma-group-label">Search &amp; discovery</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "organic honey Trondheim"). Returns contact info and the listed products for specific matches, with a price where the producer has stated one.</p></div>
+      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "honey Trondheim"). Returns contact info and the listed products for specific matches, with a price where the producer has stated one.</p></div>
       <div class="gma-tool"><code>lokal_discover</code><p>Structured search filtered by category, tags, and geographic distance.</p></div>
       <div class="gma-tool"><code>lokal_geocode</code><p>Resolves a Norwegian place name (city, kommune, fylke) to lat/lng coordinates for use with <code>lokal_discover</code>'s distance filter.</p></div>
       <div class="gma-tool"><code>lokal_stats</code><p>Platform statistics — total producers and cities covered.</p></div>
@@ -3026,8 +3026,8 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
     <p class="gma-group-label">Markets, venues &amp; certifications</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_list_umbrellas</code><p>All umbrella organizations — market networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), and certifiers (Debio).</p></div>
-      <div class="gma-tool"><code>lokal_get_umbrella_members</code><p>Producers that belong to a given umbrella — e.g. every Debio-certified producer, or everyone selling at a named market.</p></div>
+      <div class="gma-tool"><code>lokal_list_umbrellas</code><p>All umbrella organizations — market networks (Bondens marked, REKO), venues (Mathallen) and industry orgs (Hanen).</p></div>
+      <div class="gma-tool"><code>lokal_get_umbrella_members</code><p>Producers that belong to a given umbrella — e.g. everyone selling at a named market, or every Mathallen tenant. Debio approval is not an umbrella: it comes from Debio's public register and shows on the producer's profile.</p></div>
       <div class="gma-tool"><code>lokal_get_producer_affiliations</code><p>Which umbrellas a specific producer belongs to (which markets they sell at, which certifications they hold).</p></div>
       <div class="gma-tool"><code>lokal_bm_next_markets</code><p>Upcoming Bondens marked market days for a region or venue, refreshed daily.</p></div>
     </div>
@@ -3039,10 +3039,10 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>Try asking your assistant</h2>
     <div class="gma-examples">
       <ul>
-        <li>"Find organic vegetables near Bergen"</li>
+        <li>"Find vegetables near Bergen"</li>
         <li>"What does Bjørndal Gård sell, and how much does it cost?"</li>
         <li>"Which farmers sell at Bondens marked in Oslo, and when is the next market day?"</li>
-        <li>"Show me all Debio-certified producers near Trondheim"</li>
+        <li>"Where can I buy honey near Trondheim?"</li>
         <li>"Add two jars of honey from that producer to my cart"</li>
       </ul>
     </div>
@@ -3073,7 +3073,7 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>Verktøyene, slik de faktisk er registrert</h2>
     <p class="gma-group-label">Søk og oppdagelse</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «økologisk honning Trondheim»). Returnerer kontaktinfo og produktene for spesifikke treff, med pris der produsenten har oppgitt den.</p></div>
+      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «honning Trondheim»). Returnerer kontaktinfo og produktene for spesifikke treff, med pris der produsenten har oppgitt den.</p></div>
       <div class="gma-tool"><code>lokal_discover</code><p>Strukturert søk filtrert på kategori, tags og geografisk avstand.</p></div>
       <div class="gma-tool"><code>lokal_geocode</code><p>Slår opp et norsk stedsnavn (by, kommune, fylke) som lat/lng-koordinater for bruk med avstandsfilteret i <code>lokal_discover</code>.</p></div>
       <div class="gma-tool"><code>lokal_stats</code><p>Plattformstatistikk — totalt antall produsenter og byer dekket.</p></div>
@@ -3084,8 +3084,8 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     </div>
     <p class="gma-group-label">Markeder, salgssteder og sertifiseringer</p>
     <div class="gma-tools">
-      <div class="gma-tool"><code>lokal_list_umbrellas</code><p>Alle paraplyorganisasjoner — marked-nettverk (Bondens marked, REKO), salgssteder (Mathallen), bransjeorganisasjoner (Hanen) og sertifiserere (Debio).</p></div>
-      <div class="gma-tool"><code>lokal_get_umbrella_members</code><p>Produsenter som tilhører en gitt paraply — f.eks. alle Debio-sertifiserte produsenter, eller alle som selger på et navngitt marked.</p></div>
+      <div class="gma-tool"><code>lokal_list_umbrellas</code><p>Alle paraplyorganisasjoner — marked-nettverk (Bondens marked, REKO), salgssteder (Mathallen) og bransjeorganisasjoner (Hanen).</p></div>
+      <div class="gma-tool"><code>lokal_get_umbrella_members</code><p>Produsenter som tilhører en gitt paraply — f.eks. alle som selger på et navngitt marked, eller alle leietakerne i Mathallen. Debio-godkjenning er ikke en paraply: den hentes fra Debios offentlige register og vises på produsentens profil.</p></div>
       <div class="gma-tool"><code>lokal_get_producer_affiliations</code><p>Hvilke paraplyer en spesifikk produsent tilhører (hvilke markeder de selger på, hvilke sertifiseringer de har).</p></div>
       <div class="gma-tool"><code>lokal_bm_next_markets</code><p>Kommende Bondens marked-dager for en region eller et salgssted, oppdatert daglig.</p></div>
     </div>
@@ -3097,10 +3097,10 @@ router.get("/guide-mat-ai", (req: Request, res: Response) => {
     <h2>Prøv å spørre assistenten din</h2>
     <div class="gma-examples">
       <ul>
-        <li>«Finn økologiske grønnsaker nær Bergen»</li>
+        <li>«Finn grønnsaker nær Bergen»</li>
         <li>«Hva selger Bjørndal Gård, og hva koster det?»</li>
         <li>«Hvilke bønder selger på Bondens marked i Oslo, og når er neste markedsdag?»</li>
-        <li>«Vis meg alle Debio-sertifiserte produsenter nær Trondheim»</li>
+        <li>«Hvor kan jeg kjøpe honning nær Trondheim?»</li>
         <li>«Legg to glass honning fra den produsenten i handlekurven min»</li>
       </ul>
     </div>
@@ -3635,7 +3635,7 @@ router.get("/proveniens", (req: Request, res: Response) => {
       <div class="prov-card">
         <span class="prov-card-icon">&#127793;</span>
         <h3>Debio</h3>
-        <p>Norway's organic-certification registry (finnoko.debio.no) — checked for producers associated with an organic certification claim.</p>
+        <p>Norway's control body for organic production. ${escapeHtml(debioProcessText("en"))}</p>
       </div>
       <div class="prov-card">
         <span class="prov-card-icon">&#128205;</span>
@@ -3687,7 +3687,7 @@ router.get("/proveniens", (req: Request, res: Response) => {
       <div class="prov-card">
         <span class="prov-card-icon">&#127793;</span>
         <h3>Debio</h3>
-        <p>Norges register for økologisk sertifisering (finnoko.debio.no) &mdash; sjekkes for produsenter som oppgir økologisk sertifisering.</p>
+        <p>Norges kontrollorgan for økologisk produksjon. ${escapeHtml(debioProcessText("no"))}</p>
       </div>
       <div class="prov-card">
         <span class="prov-card-icon">&#128205;</span>

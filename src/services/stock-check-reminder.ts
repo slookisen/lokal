@@ -48,6 +48,12 @@
  * on): off = no e-mail, no reservation row, no link page (404). The template
  * needs Daniel's approval (recorded in daniel-responses/) before the flag is
  * turned on (AC8).
+ *
+ * B1a: the job, the link page and the portal banner are also only for a
+ * producer in OWNER_FEATURES_ALLOWED_SUBJECTS (`rfb:<id>`, the «Mine valg»
+ * allowlist). The job never selects a producer off the list (empty/unset =
+ * nobody), and the link page answers 404 for one — off the list = as if the
+ * feature did not exist. Opening it to every owner is Daniel's rollout GO.
  */
 
 import crypto from "crypto";
@@ -62,6 +68,7 @@ import {
 } from "./owner-orderability";
 import { serverSignatureFor } from "./avmeld-service";
 import { rfbFeatureOn } from "../owner-features/resolve";
+import { isSubjectAllowedForOwnerFeatures, ownerFeaturesAllowedSubjects } from "../owner-features/allowlist";
 import { osloHour } from "./order-cap-notice";
 
 export const STOCK_CHECK_EMAIL_FLAG = "STOCK_CHECK_EMAIL_ENABLED";
@@ -105,6 +112,19 @@ export function stockCheckOn(agentId: string, opts: { db?: any; env?: NodeJS.Pro
     console.error(`[stock-check] feature lookup failed agent=${agentId}:`, (err as any)?.message ?? "error");
     return false;
   }
+}
+
+/** B1a: the producer is on the owner-features allowlist (`rfb:<id>`). */
+export function stockCheckAllowlisted(agentId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  return isSubjectAllowedForOwnerFeatures("rfb", agentId, env);
+}
+
+/** B1a: the allowlisted rfb producer ids (the job selects only these). */
+function allowlistedRfbIds(env: NodeJS.ProcessEnv): string[] {
+  return ownerFeaturesAllowedSubjects(env)
+    .filter((s) => s.startsWith("rfb:"))
+    .map((s) => s.slice("rfb:".length))
+    .filter(Boolean);
 }
 
 // ─── Which rows ─────────────────────────────────────────────────────────────
@@ -331,7 +351,8 @@ export interface StockCheckRunResult {
 /**
  * One run: every producer that could have a soon-expiring producer-stated
  * row (orders on, verified badge, at least one producer_dashboard in-stock
- * row, no notice inside the window) is evaluated with the shared core; the
+ * row, no notice inside the window, B1a: on the owner-features allowlist) is
+ * evaluated with the shared core; the
  * ones with the feature on and at least one trigger row get the e-mail,
  * reserved first. `now`, `db`, `env` and `send` are injectable for the tests.
  */
@@ -350,6 +371,9 @@ export async function processStockCheckReminders(
     return sendProducerStockCheckReminder(input);
   });
   const windowStart = new Date(now.getTime() - STOCK_CHECK_EMAIL_WINDOW_DAYS * DAY_MS).toISOString();
+  // B1a: only producers on the owner-features allowlist; none listed = no run.
+  const allowed = allowlistedRfbIds(env);
+  if (allowed.length === 0) return out;
   const rows = db.prepare(`
     SELECT DISTINCT p.agent_id AS agent_id
       FROM products p
@@ -357,8 +381,9 @@ export async function processStockCheckReminders(
      WHERE p.availability_source = 'producer_dashboard' AND p.availability = 'in_stock'
        AND a.order_notifications_opt_in = 1 AND a.is_verified = 1
        AND NOT EXISTS (SELECT 1 FROM stock_check_notices n WHERE n.agent_id = p.agent_id AND n.created_at > ?)
+       AND p.agent_id IN (${allowed.map(() => "?").join(", ")})
      ORDER BY p.agent_id
-  `).all(windowStart) as Array<{ agent_id: string }>;
+  `).all(windowStart, ...allowed) as Array<{ agent_id: string }>;
 
   for (const { agent_id } of rows) {
     let items: StockCheckItem[];

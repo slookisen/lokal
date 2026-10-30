@@ -19,6 +19,11 @@
 // Behind OWNER_ORDERABILITY_PORTAL_ENABLED (read at call time, "1"/"true" =
 // on, default OFF): off = no card, the routes answer 404 — the portal is
 // unchanged. The callers (routes/owner-portal.ts) do the owner checks.
+// B1a: with the flag on, the card, the routes and the B2 banner are still
+// only for a subject in OWNER_FEATURES_ALLOWED_SUBJECTS (the «Mine valg»
+// allowlist, owner-features/allowlist.ts) — off the list = as if the flag
+// were off, so turning the flag on to test with the test producer is not a
+// rollout. ownerOrderabilityPortalEnabledFor() is that combined check.
 //
 // Category labels and alcohol / services are never confirmed by these writes
 // (their reason is not something a stock confirmation can fix, and confirming
@@ -39,12 +44,18 @@ import {
 import { setProducerAvailabilityByProductId } from "./supply-graph";
 import { validateProducerList } from "../routes/marketplace-catalog";
 import { normalizeName } from "./product-catalog-sync";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 
 export const OWNER_ORDERABILITY_PORTAL_FLAG = "OWNER_ORDERABILITY_PORTAL_ENABLED";
 
-export function ownerOrderabilityPortalEnabled(): boolean {
-  const v = process.env[OWNER_ORDERABILITY_PORTAL_FLAG];
+export function ownerOrderabilityPortalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env[OWNER_ORDERABILITY_PORTAL_FLAG];
   return v === "1" || v === "true";
+}
+
+/** B1a: the flag AND this producer on the owner-features allowlist (`rfb:<id>`). */
+export function ownerOrderabilityPortalEnabledFor(agentId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  return ownerOrderabilityPortalEnabled(env) && isSubjectAllowedForOwnerFeatures("rfb", agentId, env);
 }
 
 /** Reasons a stock confirmation cannot fix: such rows get no confirm button and are skipped by «Bekreft alle». */

@@ -196,7 +196,7 @@ function agentSkillsIndex() {
         id: "search-compare-food",
         name: "Search & Compare Local Food",
         description:
-          "Natural-language search across producers. Compare prices, delivery options, organic certifications, availability.",
+          "Natural-language search across producers. Compare prices, delivery options, availability.",
         url: `${BASE_URL}/.well-known/agent-skills/search-compare-food`,
         tags: ["search", "compare", "price", "delivery"],
         inputModes: ["text/plain", "application/json"],

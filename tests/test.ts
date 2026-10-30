@@ -37258,6 +37258,32 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("stock-check-reminder-b2: unexpected error: " + String(err?.message || err));
   }
+  // B1a (bestillinger: B1 card/routes, B2 banner/job/link behind the owner-features allowlist) — own in-memory DB.
+  try {
+    const { runBestillingerB1aTests } = require("../src/routes/bestillinger-b1a.test") as
+      typeof import("../src/routes/bestillinger-b1a.test");
+    const b1a = await runBestillingerB1aTests({ log: false });
+    passed += b1a.passed;
+    failed += b1a.failed;
+    for (const f of b1a.failures) failures.push("bestillinger-b1a: " + f);
+    console.log(`  bestillinger-b1a: ${b1a.passed} passed, ${b1a.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b1a: unexpected error: " + String(err?.message || err));
+  }
+  // B1b-1 (bestillinger: product-write POSTs need the verified claimant's own e-mail, as /selger) — own in-memory DB.
+  try {
+    const { runBestillingerB1bTests } = require("../src/routes/bestillinger-b1b.test") as
+      typeof import("../src/routes/bestillinger-b1b.test");
+    const b1b = await runBestillingerB1bTests({ log: false });
+    passed += b1b.passed;
+    failed += b1b.failed;
+    for (const f of b1b.failures) failures.push("bestillinger-b1b: " + f);
+    console.log(`  bestillinger-b1b: ${b1b.passed} passed, ${b1b.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b1b: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
@@ -51012,5 +51038,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("produktimport-s2: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
+// pages promise no organic / Debio coverage beyond Debio's public register;
+// /proveniens + llms.txt describe the register flow (flag on) or the finnoko
+// fallback (flag off). Toggles RFB_DEBIO_REGISTER_SYNC (restored in finally)
+// — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── økologi S3a: plattformtekster lover ikke mer enn Debios register ──");
+  try {
+    const { runOrganicTextsS3aTests } = require("../src/routes/organic-texts-s3a.test") as
+      typeof import("../src/routes/organic-texts-s3a.test");
+    const r = await runOrganicTextsS3aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-texts-s3a: " + f);
+    console.log(`  organic-texts-s3a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-texts-s3a: unexpected error: " + String(err?.message || err));
   }
 });
