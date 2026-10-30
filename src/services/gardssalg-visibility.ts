@@ -32,7 +32,8 @@
  *   a2a      | gardssalg_discover / opplevelser_info                  | yes   | yes    | yes
  *   rest     | /api/opplevelser/discover, POST /book                  | yes   | yes    | yes
  *   claim    | «Er dette din bedrift?» entry + portal slug lookup     | NO    | yes*   | yes
- *            | (* except catalog_hidden_reason='owner_pause', lokal#1235)
+ *            | (* except catalog_hidden_reason='owner_pause', lokal#1235,
+ *            |  and the test fixture, O2a — see below)
  *
  * The one deliberate difference: `claim` never required the gårdssalg group
  * (getClaimProviderBySlug has always looked up any provider by slug — see
@@ -41,6 +42,19 @@
  * `includeHidden` (ADMIN-ONLY) skips the `hidden` clause only; `merged` still
  * applies. Only the admin-key-gated booking test-send route uses it.
  *
+ * The test fixture (slice O2a of the same dev-request): the one test producer
+ * (is_test_provider = 1) is hidden with catalog_hidden_reason='test_fixture'
+ * (POST /admin/gardssalg/test-provider). Every public surface keeps hiding it.
+ * Two places read it as not hidden, and only for is_test_provider = 1:
+ *   - `claim`, always — so its owner reaches the portal and «Mine valg», as
+ *     with the owner's own pause;
+ *   - the public surfaces inside an admin's «Vis som offentlig» request
+ *     (isAsPublicView(), middleware/as-public-view.ts: X-Admin-Key +
+ *     ?as_public=1 on a covered Opplevagent read path). Outside that request
+ *     context the SQL is byte-identical to before.
+ * Any other hidden row (reason NULL, remove_request, quality, owner_pause on
+ * the public surfaces) is never affected.
+ *
  * Not covered here, on purpose: the EXPERIENCE publish gate
  * (PUBLISH_GATE_SQL in experience-store.ts — verification_status /
  * needs_review quarantine, brreg_active, canonical_id) governs `experiences`
@@ -48,6 +62,8 @@
  * Admin/cohort sweeps that filter on catalog_hidden for their own reasons
  * also stay as they are.
  */
+
+import { isAsPublicView } from "./agent-visibility";
 
 export type GardssalgSurface = "web" | "map" | "search" | "sitemap" | "mcp" | "a2a" | "rest" | "claim";
 
@@ -63,7 +79,13 @@ export interface GardssalgSurfaceRule {
    *  on the surface (claim: the owner's own pause, lokal#1235 — the owner must
    *  still reach the portal to resume). */
   hiddenExceptReason?: string;
+  /** The test fixture (catalog_hidden_reason='test_fixture' AND
+   *  is_test_provider = 1) stays visible on the surface (claim, O2a). */
+  hiddenExceptTestFixture?: boolean;
 }
+
+/** catalog_hidden_reason of the hidden gårdssalg test producer (O2a). */
+export const GARDSSALG_TEST_FIXTURE_REASON = "test_fixture";
 
 const PUBLIC_RULE = (): GardssalgSurfaceRule => ({ requireGroup: true, hideCatalogHidden: true, hideMerged: true });
 
@@ -77,7 +99,7 @@ export const GARDSSALG_SURFACE_RULES: Record<GardssalgSurface, GardssalgSurfaceR
   mcp: PUBLIC_RULE(),
   a2a: PUBLIC_RULE(),
   rest: PUBLIC_RULE(),
-  claim: { requireGroup: false, hideCatalogHidden: true, hideMerged: true, hiddenExceptReason: "owner_pause" },
+  claim: { requireGroup: false, hideCatalogHidden: true, hideMerged: true, hiddenExceptReason: "owner_pause", hiddenExceptTestFixture: true },
 };
 
 export interface GardssalgVisibilityOpts {
@@ -90,12 +112,24 @@ export interface GardssalgVisibilityRow {
   rfb_seed_source?: string | null;
   catalog_hidden?: number | null;
   catalog_hidden_reason?: string | null;
+  is_test_provider?: number | null;
   merged_into?: string | null;
 }
 
 const SQL_GROUP = "(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')";
 const SQL_HIDDEN = "(catalog_hidden IS NULL OR catalog_hidden != 1)";
 const SQL_MERGED = "(merged_into IS NULL OR merged_into = '')";
+const SQL_TEST_FIXTURE = `(catalog_hidden_reason = '${GARDSSALG_TEST_FIXTURE_REASON}' AND is_test_provider = 1)`;
+
+/** The test fixture reads as not hidden: always on `claim`, and on every
+ *  surface inside an admin's as-public request (O2a). */
+function testFixtureVisible(rule: GardssalgSurfaceRule): boolean {
+  return rule.hiddenExceptTestFixture === true || isAsPublicView();
+}
+
+function isTestFixtureRow(row: GardssalgVisibilityRow): boolean {
+  return row.catalog_hidden_reason === GARDSSALG_TEST_FIXTURE_REASON && Number(row.is_test_provider) === 1;
+}
 
 /**
  * SQL WHERE fragment (no leading WHERE/AND, no bound parameters, unqualified
@@ -107,8 +141,11 @@ export function gardssalgVisibleSql(surface: GardssalgSurface, opts: GardssalgVi
   const parts: string[] = [];
   if (rule.requireGroup) parts.push(SQL_GROUP);
   if (rule.hideCatalogHidden && opts.includeHidden !== true) {
-    parts.push(rule.hiddenExceptReason
-      ? `(catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = '${rule.hiddenExceptReason}')`
+    const except: string[] = [];
+    if (rule.hiddenExceptReason) except.push(`catalog_hidden_reason = '${rule.hiddenExceptReason}'`);
+    if (testFixtureVisible(rule)) except.push(SQL_TEST_FIXTURE);
+    parts.push(except.length > 0
+      ? `(catalog_hidden IS NULL OR catalog_hidden != 1 OR ${except.join(" OR ")})`
       : SQL_HIDDEN);
   }
   if (rule.hideMerged) parts.push(SQL_MERGED);
@@ -126,7 +163,8 @@ export function isGardssalgVisibleOnSurface(
   const rule = GARDSSALG_SURFACE_RULES[surface];
   if (rule.requireGroup && !(row.producer_type != null || row.rfb_seed_source === "rfb-seed")) return false;
   if (rule.hideCatalogHidden && opts.includeHidden !== true && row.catalog_hidden != null && Number(row.catalog_hidden) === 1
-      && !(rule.hiddenExceptReason && row.catalog_hidden_reason === rule.hiddenExceptReason)) return false;
+      && !(rule.hiddenExceptReason && row.catalog_hidden_reason === rule.hiddenExceptReason)
+      && !(testFixtureVisible(rule) && isTestFixtureRow(row))) return false;
   if (rule.hideMerged && !(row.merged_into == null || row.merged_into === "")) return false;
   return true;
 }

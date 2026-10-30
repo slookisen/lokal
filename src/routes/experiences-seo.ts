@@ -25,6 +25,7 @@
 
 import express, { Router, Request, Response, NextFunction } from "express";
 import { createSitemapCache, resolveSitemapCacheTtlMs, logSlowSitemap } from "./sitemap-cache-util";
+import { isAsPublicView } from "../services/agent-visibility";
 import * as QRCode from "qrcode";
 // dev-request 2026-07-19-opplevagent-kart-fylke-gardssalg, slice 1: reads the
 // vendored Leaflet assets (src/public/leaflet/) off disk for the
@@ -2932,7 +2933,9 @@ export function __resetExperiencesSitemapCacheForTesting(): void {
 router.get("/sitemap.xml", (_req: Request, res: Response) => {
   const startedAt = Date.now();
   try {
-    const xml = getExperiencesSitemapXml();
+    // «Vis som offentlig» (O2a): an admin's as-public view neither reads nor
+    // fills the cache (it may list the hidden test producer).
+    const xml = isAsPublicView() ? buildExperiencesSitemapXml() : getExperiencesSitemapXml();
     res.setHeader("Content-Type", "application/xml; charset=utf-8");
     res.setHeader("Cache-Control", `public, max-age=${Math.floor(resolveSitemapCacheTtlMs() / 1000)}`);
     res.send(xml);

@@ -21,6 +21,16 @@
 // Anything missing (no key, a wrong key, no opt-in, another path/method) →
 // next() untouched: byte-identical behaviour, no DB query. The fast path is
 // one substring test on req.url.
+//
+// Opplevagent (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, slice
+// O2a): the same view for the hidden gårdssalg test producer
+// (is_test_provider = 1, catalog_hidden_reason = 'test_fixture'). Same opt-in,
+// key, headers and request context; the gårdssalg predicate
+// (services/gardssalg-visibility.ts) reads the fixture as not hidden inside it.
+// The Opplevagent pages are served on their own host (index.ts host gate), so
+// those paths are matched only when req.hostname is opplevagent.no; the REST
+// discover path sits under /api/opplevelser, which every host passes through.
+// The RFB list above is unchanged and still matched on any host.
 
 import type { NextFunction, Request, Response } from "express";
 import { buildRequestMeta } from "../services/internal-traffic";
@@ -50,9 +60,42 @@ const AS_PUBLIC_PATHS: ReadonlyArray<{ re: RegExp; post?: boolean }> = [
   { re: /^\/agents\/[^/]+\/agent\.json$/ },
 ];
 
-function coveredPath(method: string, path: string): boolean {
+/** The Opplevagent hosts (same set as the experiences host gate in index.ts). */
+export const OPPLEVAGENT_HOSTS: ReadonlySet<string> = new Set(["opplevagent.no", "www.opplevagent.no"]);
+
+/**
+ * The public gårdssalg read surfaces (O2a). `host: true` = only on the
+ * Opplevagent host. /mcp (discover_gardssalg, get_experience) and /a2a are
+ * JSON-RPC POSTs; book_gardssalg refuses inside the view (read-only).
+ */
+const GARDSSALG_AS_PUBLIC_PATHS: ReadonlyArray<{ re: RegExp; post?: boolean; host?: boolean }> = [
+  { re: /^\/$/, host: true }, // landing: gårdssalg counts per drink type
+  { re: /^\/kategori\/gardssalg$/, host: true }, // grid + map points
+  { re: /^\/kategori\/gardssalg\/[^/]+$/, host: true }, // drink-type pages
+  { re: /^\/kategori\/gardssalg\/produsent\/[^/]+$/, host: true }, // profile HTML + JSON-LD
+  { re: /^\/sok$/, host: true },
+  { re: /^\/reise$/, host: true }, // route corridor (map surface)
+  { re: /^\/sitemap\.xml$/, host: true },
+  { re: /^\/mcp$/, post: true, host: true },
+  { re: /^\/a2a$/, post: true, host: true },
+  { re: /^\/api\/opplevelser\/discover$/ },
+];
+
+function matches(
+  list: ReadonlyArray<{ re: RegExp; post?: boolean; host?: boolean }>,
+  method: string,
+  path: string,
+  opplevagentHost: boolean,
+): boolean {
   const isRead = method === "GET" || method === "HEAD";
-  return AS_PUBLIC_PATHS.some((p) => p.re.test(path) && (isRead || (p.post === true && method === "POST")));
+  return list.some(
+    (p) => p.re.test(path) && (p.host !== true || opplevagentHost) && (isRead || (p.post === true && method === "POST")),
+  );
+}
+
+function coveredPath(method: string, path: string, hostname?: string): boolean {
+  if (matches(AS_PUBLIC_PATHS, method, path, false)) return true;
+  return matches(GARDSSALG_AS_PUBLIC_PATHS, method, path, !!hostname && OPPLEVAGENT_HOSTS.has(hostname));
 }
 
 /** Does this request ask for (and may it have) the as-public view? */
@@ -60,7 +103,7 @@ export function wantsAsPublicView(req: Request): boolean {
   if (!req.url || !req.url.includes(`${AS_PUBLIC_QUERY_PARAM}=`)) return false;
   const q = (req.query as Record<string, unknown> | undefined)?.[AS_PUBLIC_QUERY_PARAM];
   if (q !== "1") return false;
-  if (!coveredPath(req.method, req.path)) return false;
+  if (!coveredPath(req.method, req.path, req.hostname)) return false;
   return buildRequestMeta(req as any).hasValidAdminKey === true;
 }
 

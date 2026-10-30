@@ -381,7 +381,7 @@ import { fetchPage, discoverContentLinks } from "./fetch-page";
 import { extractEmails } from "./search-enrich";
 import { isAcceptableHomepageEmail, hostFromUrlLike, registrableDomain } from "./cross-source-validator";
 import { ownerBookingEnableBlock, type OwnerBookingBlock } from "./gardssalg-booking-gate";
-import { gardssalgVisibleSql } from "./gardssalg-visibility";
+import { gardssalgVisibleSql, GARDSSALG_TEST_FIXTURE_REASON } from "./gardssalg-visibility";
 
 const VERTICAL = "experiences";
 
@@ -2342,11 +2342,27 @@ export function updateClaimedProviderProfile(
 //                   cannot resume
 //   quality_hidden  catalog_hidden=1, reason 'quality' — admin hide, the
 //                   owner cannot resume
+//
+// The test producer (slice O2a): catalog_hidden=1 with reason 'test_fixture'
+// (POST /admin/gardssalg/test-provider) on a row with is_test_provider = 1
+// reads as `visible` to its owner — the row is hidden from the public because
+// it is a test fixture, not because anyone removed or paused it, so the owner
+// pause works on it as on a public row («Vis som offentlig» shows the effect).
+// Every public surface still hides it (gardssalg-visibility.ts). Resuming a
+// paused test producer puts it back to the fixture state, never to public.
+// The reason on any other row (or a row read without is_test_provider) falls
+// through to `removed`, like a legacy NULL reason (fail closed).
 export const CATALOG_HIDDEN_REASON_OWNER_PAUSE = "owner_pause";
+export const CATALOG_HIDDEN_REASON_TEST_FIXTURE = GARDSSALG_TEST_FIXTURE_REASON;
 export type OwnedVisibilityState = "visible" | "owner_pause" | "removed" | "quality_hidden";
 
-export function getOwnedVisibilityState(row: { catalog_hidden: number | null; catalog_hidden_reason: string | null }): OwnedVisibilityState {
+export function getOwnedVisibilityState(row: {
+  catalog_hidden: number | null;
+  catalog_hidden_reason: string | null;
+  is_test_provider?: number | null;
+}): OwnedVisibilityState {
   if (Number(row.catalog_hidden) !== 1) return "visible";
+  if (row.catalog_hidden_reason === CATALOG_HIDDEN_REASON_TEST_FIXTURE && Number(row.is_test_provider) === 1) return "visible";
   if (row.catalog_hidden_reason === CATALOG_HIDDEN_REASON_OWNER_PAUSE) return "owner_pause";
   if (row.catalog_hidden_reason === "quality") return "quality_hidden";
   return "removed";
@@ -2355,8 +2371,8 @@ export function getOwnedVisibilityState(row: { catalog_hidden: number | null; ca
 /** Current visibility state of a provider row (null when the row is missing). */
 export function getOwnedVisibilityStateById(providerId: string): OwnedVisibilityState | null {
   const row = getDb(VERTICAL)
-    .prepare(`SELECT catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?`)
-    .get(providerId) as { catalog_hidden: number | null; catalog_hidden_reason: string | null } | undefined;
+    .prepare(`SELECT catalog_hidden, catalog_hidden_reason, is_test_provider FROM experience_providers WHERE id = ?`)
+    .get(providerId) as { catalog_hidden: number | null; catalog_hidden_reason: string | null; is_test_provider: number | null } | undefined;
   return row ? getOwnedVisibilityState(row) : null;
 }
 
@@ -2367,8 +2383,10 @@ export type OwnerVisibilityOutcome =
 function setOwnerPauseState(providerId: string, pause: boolean): OwnerVisibilityOutcome {
   const db = getDb(VERTICAL);
   const row = db
-    .prepare(`SELECT id, catalog_hidden, catalog_hidden_reason FROM experience_providers WHERE id = ?`)
-    .get(providerId) as { id: string; catalog_hidden: number | null; catalog_hidden_reason: string | null } | undefined;
+    .prepare(`SELECT id, catalog_hidden, catalog_hidden_reason, is_test_provider FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; catalog_hidden: number | null; catalog_hidden_reason: string | null; is_test_provider: number | null }
+    | undefined;
   if (!row) return { ok: false, error: "provider_not_found" };
   // Defence in depth: the routes already require an owner session, but the
   // state change itself also requires a live verified claim for the row.
@@ -2378,9 +2396,14 @@ function setOwnerPauseState(providerId: string, pause: boolean): OwnerVisibility
   if (current === "quality_hidden") return { ok: false, error: "quality_hidden" };
   const target: OwnedVisibilityState = pause ? "owner_pause" : "visible";
   if (current === target) return { ok: true, state: current, changed: false };
+  // O2a: the test producer is never made public by a resume — it goes back
+  // to the fixture state (hidden, reason 'test_fixture', read as visible).
+  const testFixture = Number(row.is_test_provider) === 1;
+  const hiddenValue = pause || testFixture ? 1 : null;
+  const reasonValue = pause ? CATALOG_HIDDEN_REASON_OWNER_PAUSE : testFixture ? CATALOG_HIDDEN_REASON_TEST_FIXTURE : null;
   db.transaction(() => {
     db.prepare(`UPDATE experience_providers SET catalog_hidden = ?, catalog_hidden_reason = ?, updated_at = datetime('now') WHERE id = ?`)
-      .run(pause ? 1 : null, pause ? CATALOG_HIDDEN_REASON_OWNER_PAUSE : null, providerId);
+      .run(hiddenValue, reasonValue, providerId);
     db.prepare(
       `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
        VALUES (?, ?, 'catalog_hidden', ?, ?, NULL, ?, 'owner', datetime('now'))`,

@@ -154,6 +154,7 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
 import { MCP_MAX_TOOL_INPUT_ELEMENTS } from "../services/mcp-input-limits";
@@ -1380,6 +1381,12 @@ export function registerExperienceTools(
       },
     },
     async ({ provider_id, provider_query, requested_weekday, experience_id, slot_at, party_size, guest_name, guest_email, guest_phone, notes, confirm_outside_hours }) => {
+      // «Vis som offentlig» (dev-request 2026-10-22-opplevagent-mine-valg-
+      // gardssalg, O2a) is a read-only admin view of the public surfaces: no
+      // visit request is ever created inside it.
+      if (isAsPublicView()) {
+        return jsonToolResult({ success: false, reason: "as_public_read_only", message: "The as-public view is read-only; no visit request was sent." }, true);
+      }
       try {
         // ─── Step 0 (dev-request 2026-09-16-opplevagent-en-setning-booking-
         // via-ai): «hos X» → provider_id. provider_id, when given, wins
