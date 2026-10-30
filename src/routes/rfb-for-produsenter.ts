@@ -26,7 +26,15 @@
 //     pickup only and pay at pickup, daily cap ORDER_CAP_NEW_PER_PRODUCER_PER_DAY
 //     (10) → contact details instead, «Hentet» on the order page (B3),
 //     producer-stated stock expires after SUPPLY_GRAPH_STALE_DAYS (14).
-//   - The automatic close is mentioned only while ORDER_AUTOCOMPLETE_ENABLED.
+//   - Flag-dependent promises follow the flag (ForProdusenterFacts): the
+//     automatic close only while ORDER_AUTOCOMPLETE_ENABLED; «kunden får
+//     beskjed» on cancellation only while ORDER_BUYER_RECEIPTS_ENABLED; stock
+//     and products «i eierportalen» only while OWNER_ORDERABILITY_PORTAL_ENABLED
+//     (else the /selger «Produkter» tab, «Tilgjengelighet»); the stock-check
+//     reminder is listed as available only while STOCK_CHECK_EMAIL_ENABLED.
+//   - Every real order needs buyer contact + consent (CONTACT_REQUIRED_ERROR).
+//   - «Verifisert av eier» is the only badge that shows owner confirmation
+//     (profiles also carry Brreg / Debio badges).
 //   - Prepayment via Stripe is «planlagt» (KJOPSVILKAR_PREPAYMENT_LIVE false).
 //   - Price: no fee today; at least 30 days' notice and it applies only if the
 //     producer accepts (rfb-produsentvilkar.ts §6 «Gebyr»).
@@ -45,6 +53,9 @@ import { orderCapNewPerDay } from "../services/cart-service";
 import { isOrderAutocompleteEnabled } from "../services/order-lifecycle";
 import { publicStatsMinViews } from "../services/public-stats-threshold";
 import { getSupplyGraphStaleDays } from "../services/supply-graph";
+import { isBuyerReceiptsEnabled } from "../services/order-receipt-service";
+import { ownerOrderabilityPortalEnabled } from "../services/owner-orderability";
+import { isStockCheckEmailEnabled } from "../services/stock-check-reminder";
 
 export const FOR_PRODUSENTER_PATH = "/for-produsenter";
 
@@ -79,6 +90,12 @@ export interface ForProdusenterFacts {
   autocompleteOn: boolean;
   publicStatsMinViews: number;
   stockValidDays: number;
+  /** ORDER_BUYER_RECEIPTS_ENABLED: the buyer is told when an order is cancelled. */
+  buyerReceiptsOn: boolean;
+  /** OWNER_ORDERABILITY_PORTAL_ENABLED: the /eier portal's «Varer som kan bestilles» card (B1). */
+  orderabilityPortalOn: boolean;
+  /** STOCK_CHECK_EMAIL_ENABLED: the stock-check reminder e-mail (B2). */
+  stockCheckEmailOn: boolean;
 }
 
 export function currentForProdusenterFacts(): ForProdusenterFacts {
@@ -89,6 +106,9 @@ export function currentForProdusenterFacts(): ForProdusenterFacts {
     autocompleteOn: isOrderAutocompleteEnabled(),
     publicStatsMinViews: publicStatsMinViews(),
     stockValidDays: getSupplyGraphStaleDays(),
+    buyerReceiptsOn: isBuyerReceiptsEnabled(),
+    orderabilityPortalOn: ownerOrderabilityPortalEnabled(),
+    stockCheckEmailOn: isStockCheckEmailEnabled(),
   };
 }
 
@@ -115,9 +135,18 @@ function esc(text: string | number): string {
     .replace(/'/g, "&#39;");
 }
 
-/** The «Mine valg» entries an RFB owner can use today (live/beta), in registry order. */
-export function liveRfbOwnerChoices(registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): OwnerFeatureEntry[] {
-  return registry.filter((e) => e.verticals.includes("rfb") && e.status !== "coming_soon");
+/** Live entries whose effect also needs an env flag that is not on (listed as planned instead). */
+function flagGatedOff(e: OwnerFeatureEntry, f: ForProdusenterFacts): boolean {
+  return e.key === "products.stock_check" && !f.stockCheckEmailOn;
+}
+
+/**
+ * The «Mine valg» entries an RFB owner can use today (live/beta), in registry
+ * order — minus a live entry whose effect is still behind an env flag that is
+ * off (products.stock_check without STOCK_CHECK_EMAIL_ENABLED).
+ */
+export function liveRfbOwnerChoices(facts?: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): OwnerFeatureEntry[] {
+  return registry.filter((e) => e.verticals.includes("rfb") && e.status !== "coming_soon" && !(facts && flagGatedOff(e, facts)));
 }
 
 function levelsAnswer(lang: "no" | "en"): string {
@@ -132,7 +161,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
   const owners = localizedPath("/verifisert-av-eier", "no");
   const privacy = localizedPath("/personvern", "no");
   const contact = localizedPath("/kontakt", "no");
-  const choices = liveRfbOwnerChoices()
+  const choices = liveRfbOwnerChoices(f)
     .map((e) => `<li><strong>${esc(e.label.no)}</strong>: ${esc(e.description.no)}</li>`).join("");
   return [
     {
@@ -170,10 +199,10 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       intro: `
       <p>Når du tar over profilen, bekrefter du at det er din bedrift. Da kan du rette opplysningene, og profilen får merket «Verifisert av eier». Se <a href="${owners}">produsenter som er verifisert av eier</a>.</p>`,
       qa: [
-        { q: "Hvordan tar jeg over profilen?", a: "Trykk «Finn profilen din og ta den over», søk opp bedriften din og bekreft at det er din butikk. Vi sender en 6-sifret kode til e-postadressen som står på profilen. Koden gjelder i 24 timer. Skriv den inn, så er du inne." },
+        { q: "Hvordan tar jeg over profilen?", a: "Trykk «Finn profilen din og ta den over», søk opp bedriften din og bekreft at det er din butikk. Normalt sender vi en 6-sifret kode til e-postadressen som står på profilen. Koden gjelder i 24 timer. Skriv den inn, så er du inne. Har profilen ingen e-postadresse, eller har noen allerede tatt den over, går kravet til manuell godkjenning." },
         { q: "Hva om e-postadressen på profilen er feil?", a: "Kryss av for at e-postadressen er feil eller utdatert når du ber om å ta over profilen. Da går kravet til manuell godkjenning, og vi kontakter deg på adressen du oppgir." },
         { q: "Hvordan logger jeg inn senere?", a: "Skriv inn e-postadressen din under «Logg inn», så sender vi deg en innloggingslenke. Du trenger ikke passord." },
-        { q: "Hva betyr «Verifisert av eier»?", a: "Merket viser at eieren selv har tatt over og bekreftet profilen. Det er det eneste merket vi viser på profilene." },
+        { q: "Hva betyr «Verifisert av eier»?", a: "Det betyr at eieren selv har tatt over profilen. Det er det eneste merket som viser at eieren selv har bekreftet profilen." },
         { q: "Hva skjer med det jeg skriver selv?", a: "Det du skriver selv, overskrives aldri. Finner vi ny informasjon om deg, blir den et forslag." },
       ],
     },
@@ -183,7 +212,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       <p>Når du har tatt over profilen, finner du «Mine valg» i eierportalen. Der velger du hvor aktiv du vil være, og slår enkeltvalg av og på.</p>
       <p>Dette kan du velge i dag:</p>
       <ul class="fp-list">${choices}</ul>
-      <p>Andre valg er planlagt. De står i boksen «Planlagt» i «Mine valg».</p>`,
+      <p>Andre valg er planlagt. De står i boksen «Planlagt» i «Mine valg».${f.stockCheckEmailOn ? "" : " Påminnelse på e-post om å bekrefte lagerstatus er også planlagt."}</p>`,
       qa: [
         { q: "Hvilke nivåer kan jeg velge?", a: levelsAnswer("no") },
         { q: "Kan jeg ombestemme meg?", a: "Ja. Du kan bytte nivå og slå valg av og på når du vil. Bestillinger du allerede har fått, må du likevel svare på." },
@@ -199,7 +228,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       <ul class="fp-list">
         <li>Kunder kan bestille på nettsiden eller gjennom en AI-assistent. De kan bare bestille varer du har merket som på lager.</li>
         <li>Du får en e-post med emnet «Ny henteordre». I e-posten bekrefter eller avslår du bestillingen. Du trenger ikke logge inn.</li>
-        <li>Har kunden sagt ja til å dele kontaktinformasjonen sin, står den i e-posten.</li>
+        <li>Kunden må oppgi e-post eller telefon og godta at du får den. Kontaktinformasjonen står i e-posten.</li>
         <li>Kunden henter varene hos deg og betaler når varene hentes. Rett fra Bonden tar ikke betalt.</li>
         <li>Du kan få inntil ${esc(f.dailyCap)} bestillinger per døgn. Kommer det flere, får kunden kontaktinformasjonen din i stedet.</li>
       </ul>
@@ -207,11 +236,11 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       <ul class="fp-list">
         <li>Ta over profilen.</li>
         <li>Slå på «Ta imot bestillinger» i «Mine valg».</li>
-        <li>Merk varene som på lager i eierportalen. Lagerstatusen gjelder i ${esc(f.stockValidDays)} dager. Bekreft den igjen, så kan kundene fortsatt bestille varene.</li>
+        <li>Merk varene som på lager ${f.orderabilityPortalOn ? "i eierportalen" : "under «Tilgjengelighet» i fanen «Produkter» når du er logget inn"}. Lagerstatusen gjelder i ${esc(f.stockValidDays)} dager. Bekreft den igjen, så kan kundene fortsatt bestille varene.</li>
         <li>Svar på hver bestilling: bekreft eller avslå.</li>
       </ul>`,
       qa: [
-        { q: "Hva skjer hvis jeg ikke svarer?", a: `Du får en påminnelse etter ${f.reminderHours} timer. Er bestillingen fortsatt ubesvart etter ${f.autocancelHours} timer, blir den kansellert, og kunden får beskjed.` },
+        { q: "Hva skjer hvis jeg ikke svarer?", a: `Du får en påminnelse etter ${f.reminderHours} timer. Er bestillingen fortsatt ubesvart etter ${f.autocancelHours} timer, blir den kansellert${f.buyerReceiptsOn ? ", og kunden får beskjed" : ""}.` },
         { q: "Hvem kan sende meg bestillinger?", a: "Kunder på nettsiden og AI-assistenter som bestiller for en kunde. Bestillinger går bare til produsenter som har tatt over profilen og slått på bestillinger. Andre produsenter vises med kontaktinformasjon, og kunden tar kontakt selv." },
         { q: "Hvordan avtales hentetiden?", a: "Kunden kan skrive et ønske i bestillingen. Du kan sette en hentetid når du bekrefter, eller avtale den med kunden. Faste hentetider er planlagt." },
         { q: "Kan jeg ta ferie fra bestillinger?", a: "Du kan slå av «Ta imot bestillinger» mens du er borte. Da får kunden kontaktinformasjonen din i stedet. Du kan også sette hele profilen på pause. En egen ferieknapp for bestillinger er planlagt." },
@@ -236,7 +265,9 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
       intro: `
       <p>Profilen bygger på offentlige kilder og det du skriver selv. Det du skriver selv, overskrives aldri.</p>`,
       qa: [
-        { q: "Hvordan legger jeg inn varene mine?", a: "Logg inn og legg inn varene i eierportalen. Der merker du dem også som på lager, så kundene kan bestille dem." },
+        { q: "Hvordan legger jeg inn varene mine?", a: f.orderabilityPortalOn
+          ? "Logg inn og legg inn varene i eierportalen. Der merker du dem også som på lager, så kundene kan bestille dem."
+          : "Logg inn og legg inn varene i fanen «Produkter». Under «Tilgjengelighet» på samme side merker du varene som er på lager. Finner du ikke en vare der, si fra til oss, så hjelper vi deg." },
         { q: "Kan dere hente produktene fra nettsiden min?", a: "Profilen kan allerede vise produkter vi har funnet på nettsiden din. At du selv kan hente produktene fra nettsiden som forslag du godkjenner, er planlagt." },
         { q: "Oppdaterer dere profilen min automatisk?", a: "Vi sjekker jevnlig offentlige kilder for å holde profilen riktig. Det du har skrevet selv, overskrives aldri. Et valg for hvordan oppdateringene skal skje, er planlagt." },
       ],
@@ -286,7 +317,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
   const owners = localizedPath("/verifisert-av-eier", "en");
   const privacy = localizedPath("/personvern", "en");
   const contact = localizedPath("/kontakt", "en");
-  const choices = liveRfbOwnerChoices()
+  const choices = liveRfbOwnerChoices(f)
     .map((e) => `<li><strong>${esc(e.label.en)}</strong>: ${esc(e.description.en)}</li>`).join("");
   return [
     {
@@ -324,10 +355,10 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       intro: `
       <p>When you take over your profile, you confirm that it is your business. You can then correct the information, and the profile gets the «Verified by owner» badge. See <a href="${owners}">producers verified by their owner</a>.</p>`,
       qa: [
-        { q: "How do I take over my profile?", a: "Press «Find your profile and take it over», look up your business and confirm that it is yours. We send a 6-digit code to the e-mail address on the profile. The code is valid for 24 hours. Enter it, and you are in." },
+        { q: "How do I take over my profile?", a: "Press «Find your profile and take it over», look up your business and confirm that it is yours. Normally we send a 6-digit code to the e-mail address on the profile. The code is valid for 24 hours. Enter it, and you are in. If the profile has no e-mail address, or someone has already taken it over, the request goes to manual approval." },
         { q: "What if the e-mail address on the profile is wrong?", a: "Tick the box saying the e-mail address is wrong or out of date when you ask to take over the profile. The request then goes to manual approval, and we contact you at the address you give." },
         { q: "How do I log in later?", a: "Enter your e-mail address under «Log in», and we send you a login link. You do not need a password." },
-        { q: "What does «Verified by owner» mean?", a: "The badge shows that the owner has taken over and confirmed the profile. It is the only badge we show on profiles." },
+        { q: "What does «Verified by owner» mean?", a: "It means the owner has taken over the profile. It is the only badge that shows the owner has confirmed the profile." },
         { q: "What happens to what I write myself?", a: "What you write yourself is never overwritten. If we find new information about you, it becomes a suggestion." },
       ],
     },
@@ -337,7 +368,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       <p>Once you have taken over your profile, you find «Mine valg» (My choices) in the owner portal. There you choose how active you want to be, and switch individual choices on and off.</p>
       <p>Available today:</p>
       <ul class="fp-list">${choices}</ul>
-      <p>Other choices are planned. They are listed in the «Planlagt» (Planned) box in «Mine valg».</p>`,
+      <p>Other choices are planned. They are listed in the «Planlagt» (Planned) box in «Mine valg».${f.stockCheckEmailOn ? "" : " An e-mail reminder to confirm your stock status is planned too."}</p>`,
       qa: [
         { q: "Which levels can I choose?", a: levelsAnswer("en") },
         { q: "Can I change my mind?", a: "Yes. You can change level and switch choices on and off whenever you like. Orders you have already received must still be answered." },
@@ -353,7 +384,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       <ul class="fp-list">
         <li>Customers can order on the website or through an AI assistant. They can only order goods you have marked as in stock.</li>
         <li>You get an e-mail with the subject «Ny henteordre» (new pickup order). In the e-mail you confirm or decline the order. You do not need to log in.</li>
-        <li>If the customer has agreed to share their contact details, they are in the e-mail.</li>
+        <li>The customer must give an e-mail address or phone number and agree that you get it. The contact details are in the e-mail.</li>
         <li>The customer picks up the goods from you and pays at pickup. Rett fra Bonden does not take payment.</li>
         <li>You can receive up to ${esc(f.dailyCap)} orders per day. If more come in, the customer gets your contact details instead.</li>
       </ul>
@@ -361,11 +392,11 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       <ul class="fp-list">
         <li>Take over your profile.</li>
         <li>Switch on «Accept orders» in «Mine valg».</li>
-        <li>Mark your goods as in stock in the owner portal. The stock status is valid for ${esc(f.stockValidDays)} days. Confirm it again, and customers can keep ordering the goods.</li>
+        <li>Mark your goods as in stock ${f.orderabilityPortalOn ? "in the owner portal" : "under «Tilgjengelighet» (availability) in the «Produkter» (products) tab when you are logged in"}. The stock status is valid for ${esc(f.stockValidDays)} days. Confirm it again, and customers can keep ordering the goods.</li>
         <li>Answer every order: confirm or decline.</li>
       </ul>`,
       qa: [
-        { q: "What happens if I do not answer?", a: `You get a reminder after ${f.reminderHours} hours. If the order is still unanswered after ${f.autocancelHours} hours, it is cancelled, and the customer is told.` },
+        { q: "What happens if I do not answer?", a: `You get a reminder after ${f.reminderHours} hours. If the order is still unanswered after ${f.autocancelHours} hours, it is cancelled${f.buyerReceiptsOn ? ", and the customer is told" : ""}.` },
         { q: "Who can send me orders?", a: "Customers on the website and AI assistants ordering for a customer. Orders only go to producers who have taken over their profile and switched orders on. Other producers are shown with contact details, and the customer gets in touch directly." },
         { q: "How is the pickup time agreed?", a: "The customer can write a wish in the order. You can set a pickup time when you confirm, or agree it with the customer. Fixed pickup times are planned." },
         { q: "Can I take a holiday from orders?", a: "You can switch off «Accept orders» while you are away. The customer then gets your contact details instead. You can also pause your whole profile. A separate holiday switch for orders is planned." },
@@ -390,7 +421,9 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
       intro: `
       <p>Your profile is built from public sources and what you write yourself. What you write yourself is never overwritten.</p>`,
       qa: [
-        { q: "How do I add my goods?", a: "Log in and add your goods in the owner portal. There you also mark them as in stock, so customers can order them." },
+        { q: "How do I add my goods?", a: f.orderabilityPortalOn
+          ? "Log in and add your goods in the owner portal. There you also mark them as in stock, so customers can order them."
+          : "Log in and add your goods in the «Produkter» (products) tab. Under «Tilgjengelighet» (availability) on the same page you mark which goods are in stock. If a product is missing there, tell us and we will help." },
         { q: "Can you fetch the products from my website?", a: "Your profile may already show products we found on your website. Fetching the products from your website yourself, as suggestions you approve, is planned." },
         { q: "Do you update my profile automatically?", a: "We regularly check public sources to keep your profile correct. What you have written yourself is never overwritten. A choice of how updates should happen is planned." },
       ],
@@ -456,7 +489,8 @@ export function buildForProdusenterFaqLd(lang: Lang, canonicalUrl: string, facts
   };
 }
 
-function qaHtml(pairs: FaqPair[]): string {
+/** Visible Q/A for one section; every question and answer is escaped. Exported for the escaping test. */
+export function renderForProdusenterQa(pairs: FaqPair[]): string {
   if (pairs.length === 0) return "";
   return `<div class="fp-faq">${pairs.map((p) =>
     `<details class="fp-qa"><summary>${esc(p.q)}</summary><p>${esc(p.a)}</p></details>`).join("")}</div>`;
@@ -549,7 +583,7 @@ export function renderForProdusenterPage(lang: Lang, canonicalUrl: string, facts
     return `
     <section class="fp-sec" id="${s.id}" aria-labelledby="fp-h-${s.id}">
       <h2 id="fp-h-${s.id}">${esc(s.title)}</h2>${s.intro}
-      ${qaHtml(pairs)}
+      ${renderForProdusenterQa(pairs)}
     </section>`;
   }).join("");
   const menu = `

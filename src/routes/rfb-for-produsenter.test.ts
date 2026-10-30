@@ -187,8 +187,16 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     for (const k of ["orders.enabled", "visibility.profile", "products.stock_check", "orders.reminder", "notify.order_email", "auto.guarantee", "comms.unsubscribe"]) {
       assertTrue(status(k) === "live", `truth: ${k} is live (page describes it as available)`);
     }
-    for (const e of mod.liveRfbOwnerChoices()) {
+    const factsNow = mod.currentForProdusenterFacts();
+    for (const e of mod.liveRfbOwnerChoices(factsNow)) {
       assertTrue(no.body.includes(`<strong>${e.label.no}</strong>`), `#mine-valg lists live choice «${e.label.no}»`);
+    }
+    // No coming_soon label in the «Dette kan du velge i dag» list.
+    const todayList = (no.body.match(/Dette kan du velge i dag:<\/p>\s*<ul class="fp-list">([\s\S]*?)<\/ul>/) || ["", ""])[1];
+    const todayLabels = [...todayList.matchAll(/<strong>([\s\S]*?)<\/strong>/g)].map((m) => decode(m[1]));
+    assertTrue(todayLabels.length > 0, "#mine-valg: the «i dag» list is present");
+    for (const e of OWNER_FEATURE_REGISTRY.filter((x) => x.verticals.includes("rfb") && x.status === "coming_soon")) {
+      assertTrue(!todayLabels.includes(e.label.no), `#mine-valg «i dag» list does not contain coming_soon «${e.label.no}»`);
     }
     const { OWNER_LEVELS } = require("../owner-features/changes") as typeof import("../owner-features/changes");
     assertTrue(OWNER_LEVELS.length === 2 && OWNER_LEVELS.every((l) => no.body.includes(`«${l.label.no}»`)), "#mine-valg: exactly the two levels from OWNER_LEVELS");
@@ -209,6 +217,54 @@ export async function runRfbForProdusenterTests(opts: { log?: boolean } = {}): P
     assertTrue(no.body.includes("«Med i AI-søk»") && !no.body.includes("Med i AI-svar"), "#statistikk: «Med i AI-søk», not «Med i AI-svar»");
     assertTrue(no.body.includes(`minst ${facts.publicStatsMinViews} sidevisninger fra mennesker de siste 12 månedene`) && no.body.includes("Du ser alltid dine egne tall"), "#statistikk: public threshold from publicStatsMinViews(); owner always sees own numbers");
     assertTrue(no.body.includes("En rapport på e-post er planlagt") && !/månedsrapport/i.test(no.body), "#statistikk: no monthly report promised");
+    // ── 6. Flag-dependent promises: both states ───────────────────────────
+    const base = { ...facts, autocompleteOn: false, buyerReceiptsOn: false, orderabilityPortalOn: false, stockCheckEmailOn: false };
+    const offAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", base).content;
+    const onAll = mod.renderForProdusenterPage("no", "https://x/for-produsenter", { ...base, buyerReceiptsOn: true, orderabilityPortalOn: true, stockCheckEmailOn: true }).content;
+    const offAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", base).content;
+    const onAllEn = mod.renderForProdusenterPage("en", "https://x/en/for-produsenter", { ...base, buyerReceiptsOn: true, orderabilityPortalOn: true, stockCheckEmailOn: true }).content;
+    // a. buyer told on cancellation only with ORDER_BUYER_RECEIPTS_ENABLED
+    assertTrue(!offAll.includes("kunden får beskjed") && onAll.includes("blir den kansellert, og kunden får beskjed"), "receipts flag: NO promises the buyer notice only when on");
+    assertTrue(!offAllEn.includes("customer is told") && onAllEn.includes("and the customer is told"), "receipts flag: EN mirrors it");
+    const { isBuyerReceiptsEnabled } = require("../services/order-receipt-service") as typeof import("../services/order-receipt-service");
+    assertTrue(facts.buyerReceiptsOn === isBuyerReceiptsEnabled(), "facts.buyerReceiptsOn reads isBuyerReceiptsEnabled()");
+    // b. «eierportalen» for stock/products only with OWNER_ORDERABILITY_PORTAL_ENABLED
+    assertTrue(!offAll.includes("på lager i eierportalen") && !offAll.includes("legg inn varene i eierportalen") && offAll.includes("under «Tilgjengelighet» i fanen «Produkter»"), "portal flag off: stock/products not claimed for the owner portal (NO)");
+    assertTrue(onAll.includes("Merk varene som på lager i eierportalen") && onAll.includes("legg inn varene i eierportalen"), "portal flag on: owner-portal wording (NO)");
+    assertTrue(!offAllEn.includes("in the owner portal. The stock") && !offAllEn.includes("add your goods in the owner portal") && onAllEn.includes("add your goods in the owner portal"), "portal flag: EN mirrors it");
+    const { ownerOrderabilityPortalEnabled } = require("../services/owner-orderability") as typeof import("../services/owner-orderability");
+    assertTrue(facts.orderabilityPortalOn === ownerOrderabilityPortalEnabled(), "facts.orderabilityPortalOn reads ownerOrderabilityPortalEnabled()");
+    // c. stock-check reminder listed «i dag» only with STOCK_CHECK_EMAIL_ENABLED
+    const stockLabel = OWNER_FEATURE_REGISTRY.find((e) => e.key === "products.stock_check")!.label.no;
+    assertTrue(!offAll.includes(`<strong>${stockLabel}</strong>`) && offAll.includes("Påminnelse på e-post om å bekrefte lagerstatus er også planlagt"), "stock-check flag off: not in the «i dag» list, called planned");
+    assertTrue(onAll.includes(`<strong>${stockLabel}</strong>`) && !onAll.includes("lagerstatus er også planlagt"), "stock-check flag on: listed as available");
+    assertTrue(!mod.liveRfbOwnerChoices(base).some((e) => e.key === "products.stock_check") && mod.liveRfbOwnerChoices({ ...base, stockCheckEmailOn: true }).some((e) => e.key === "products.stock_check"), "liveRfbOwnerChoices honours the stock-check flag");
+    const { isStockCheckEmailEnabled } = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
+    assertTrue(facts.stockCheckEmailOn === isStockCheckEmailEnabled(), "facts.stockCheckEmailOn reads isStockCheckEmailEnabled()");
+    // Consent + contact is required for every real order (cart-service F2).
+    assertTrue(/CONTACT_REQUIRED_ERROR/.test(cartSvc) && no.body.includes("Kunden må oppgi e-post eller telefon og godta at du får den"), "#bestillinger: buyer contact + consent is always required (CONTACT_REQUIRED_ERROR)");
+    // Badge claim
+    assertTrue(!/eneste merket vi viser|only badge we show/.test(text) && no.body.includes("eneste merket som viser at eieren selv har bekreftet profilen"), "#eierskap: no «only badge» claim (profiles also show Brreg/Debio badges)");
+
+    // ── 7. Structure pins: questions per section (dropping a pair fails) ──
+    const expectedCounts: Record<string, number> = { oversikt: 3, synlighet: 3, eierskap: 5, "mine-valg": 4, bestillinger: 6, betaling: 3, oppdatering: 3, statistikk: 4, personvern: 5, pris: 2, kontakt: 0 };
+    const firstQ: Record<string, string> = { oversikt: "Har jeg allerede en profil?", bestillinger: "Hva skjer hvis jeg ikke svarer?", pris: "Hva koster det?", statistikk: "Hvilke tall ser jeg?" };
+    for (const [l, b] of [["NO", no.body], ["EN", en.body]] as const) {
+      for (const id of expected) {
+        const sec = (b.match(new RegExp(`<section class="fp-sec" id="${id}"[\\s\\S]*?</section>`)) || [""])[0];
+        const qs = [...sec.matchAll(/<summary>([\s\S]*?)<\/summary>/g)].map((m) => decode(m[1]));
+        assertTrue(qs.length === expectedCounts[id], `${l} #${id}: ${expectedCounts[id]} questions (got ${qs.length})`);
+        if (l === "NO" && firstQ[id]) assertTrue(qs[0] === firstQ[id], `NO #${id}: first question «${firstQ[id]}»`);
+      }
+      // menu links are real, focusable links
+      const menu = (b.match(/<nav class="fp-menu"[\s\S]*?<\/nav>/) || [""])[0];
+      assertTrue(!/tabindex/.test(menu) && (menu.match(/<a href="#/g) || []).length === 11, `${l}: menu links are plain focusable links (no tabindex)`);
+    }
+
+    // ── 8. Escaping ───────────────────────────────────────────────────────
+    const hostile = mod.renderForProdusenterQa([{ q: `<script>alert(1)</script> "q" & 'x'`, a: `<img src=x onerror=alert(1)> «a»` }]);
+    assertTrue(!hostile.includes("<script>") && !hostile.includes("<img") && hostile.includes("&lt;script&gt;alert(1)&lt;/script&gt; &quot;q&quot; &amp; &#39;x&#39;") && hostile.includes("&lt;img src=x onerror=alert(1)&gt; «a»"), "escaping: questions and answers are HTML-escaped");
+
     // Not in F1
     assertTrue(!/sellerFaq|faqAnchor/.test(fs.readFileSync(path.join(SRC, "owner-features/registry.ts"), "utf8")), "scope: registry has no sellerFaq/faqAnchor fields yet (later slice)");
   } finally {
