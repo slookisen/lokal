@@ -80,6 +80,26 @@ export interface PageBlocks {
   nodes: BlockNode[];
   /** Text runs and the innermost element each lies in, in text order. */
   runs: Array<{ start: number; end: number; node: number }>;
+  /** Number tokens of `text`, computed once on first use (pageNumberTokens). */
+  numberTokens?: Array<{ value: number; index: number; length: number }>;
+}
+
+function pageNumberTokens(page: PageBlocks): Array<{ value: number; index: number; length: number }> {
+  if (!page.numberTokens) page.numberTokens = numberTokensInText(page.text);
+  return page.numberTokens;
+}
+
+/** Longest attribute section read for one tag (srcset/data-* JSON fit well inside). */
+const TAG_ATTR_SCAN_CAP = 8000;
+/** How far down the open-element stack a closing tag looks for its opener. */
+const CLOSE_SEARCH_DEPTH = 256;
+
+function isAsciiLetter(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+function isTagNameChar(c: number): boolean {
+  return isAsciiLetter(c) || (c >= 48 && c <= 57) || c === 45; // letters, digits, «-»
 }
 
 /**
@@ -138,19 +158,60 @@ export function parsePageBlocks(html: string): PageBlocks {
       nodes[id]!.end = len;
     }
   };
-  // `[^<>]` keeps a failed match (an unclosed «<time class="») from scanning
-  // the rest of the page: linear on adversarial input.
-  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*?(\/?)>/g;
+  // Tags are read by a small linear scanner, not a regex: an attribute value
+  // may hold a raw «<» or «>» (`x-show="i < 3"`, `:disabled="qty <= 1"`),
+  // so quotes after «=» are tracked until an unquoted «>». A «<» whose tag
+  // never closes is text. Linear on adversarial input: one attribute walk
+  // is capped, the walks share a budget, and a walk that reaches the end of
+  // the input ends tag recognition (the rest of the page is text).
+  const L = cleaned.length;
+  let budget = L * 4 + 1_000_000;
   let last = 0;
-  for (const m of cleaned.matchAll(tagRe)) {
-    addText(cleaned.slice(last, m.index));
-    last = m.index! + m[0].length;
-    const closing = m[1] === "/";
-    const tag = m[2]!.toLowerCase();
+  let pos = 0;
+  while (pos < L) {
+    const lt = cleaned.indexOf("<", pos);
+    if (lt < 0) break;
+    let j = lt + 1;
+    const closing = cleaned.charCodeAt(j) === 47; // «/»
+    if (closing) j++;
+    if (!isAsciiLetter(cleaned.charCodeAt(j))) {
+      pos = lt + 1;
+      continue;
+    }
+    let k = j + 1;
+    while (k < L && isTagNameChar(cleaned.charCodeAt(k))) k++;
+    const tag = cleaned.slice(j, k).toLowerCase();
+    let quote = "";
+    let prev = "";
+    let end = -1;
+    let m = k;
+    const cap = Math.min(L, k + TAG_ATTR_SCAN_CAP);
+    for (; m < cap; m++) {
+      const ch = cleaned[m]!;
+      if (quote) {
+        if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === ">") {
+        end = m;
+        break;
+      }
+      if ((ch === '"' || ch === "'") && prev === "=") quote = ch;
+      if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r" && ch !== "\f") prev = ch;
+    }
+    budget -= m - k + 1;
+    if (end < 0) {
+      if (m >= L || budget < 0) break; // no closing «>» anywhere ahead: the rest is text
+      pos = lt + 1;
+      continue;
+    }
+    addText(cleaned.slice(last, lt));
+    last = end + 1;
+    pos = end + 1;
     sep(BLOCK_TAGS.has(tag) ? "\n" : " ");
     if (closing) {
       // Bounded search: a page of unclosed tags must not make this quadratic.
-      for (let i = stack.length - 1; i >= 1 && i >= stack.length - 256; i--) {
+      for (let i = stack.length - 1; i >= 1 && i >= stack.length - CLOSE_SEARCH_DEPTH; i--) {
         if (nodes[stack[i]!]!.tag === tag) {
           closeTo(i);
           break;
@@ -158,7 +219,7 @@ export function parsePageBlocks(html: string): PageBlocks {
       }
       continue;
     }
-    if (VOID_TAGS.has(tag) || m[3] === "/") continue;
+    if (VOID_TAGS.has(tag) || cleaned[end - 1] === "/") continue;
     if (SELF_NESTING_CLOSES.has(tag) && stack.length > 1 && nodes[stack[stack.length - 1]!]!.tag === tag) {
       closeTo(stack.length - 1);
     }
@@ -241,7 +302,7 @@ function lineStartOf(text: string, index: number): number {
 export function findPriceAtName(page: PageBlocks, occs: NameOccurrence[], key: string, value: number): number {
   if (!occs.some((o) => o.key === key)) return -1;
   const target = roundNok(value);
-  for (const tok of numberTokensInText(page.text)) {
+  for (const tok of pageNumberTokens(page)) {
     if (roundNok(tok.value) !== target) continue;
     // A number inside a name («Poteter 10 kg») is not a price.
     if (occs.some((o) => tok.index >= o.start && tok.index < o.end)) continue;

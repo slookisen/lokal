@@ -929,6 +929,68 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       const ms = Date.now() - t0;
       assertTrue(occs.length === 20_000 && occs.every((o) => o.key === "egg fra gården") && ms < 1000, `N3 findNameOccurrences: 60k raw occurrences in ${ms} ms, nested ones dropped`);
     }
+    // R1 (re-review): a raw «<»/«>» inside a quoted attribute (Alpine/Vue)
+    // must not break the element tree — ovrejorde columns with x-show.
+    robots.__clearRobotsCacheForTesting();
+    {
+      const alpinePage = ovrePage
+        .split('class="Preview_column__1KeVx col isExpandable"').join(`x-show="i < 3" class="Preview_column__1KeVx col isExpandable"`)
+        .split('class="Preview_float__1PmYU float"').join(`x-show="i < 3" :class="qty <= 1 ? 'tom' : 'full'" @click="n > 0 && open()" class="Preview_float__1PmYU float"`);
+      assertTrue(alpinePage.includes('x-show="i < 3"') && alpinePage.includes('@click="n > 0'), "R1 fixture: attributes with raw < and > on columns and price wrappers");
+      const f = makeFetch({ ...ovreRoutes("ovrejorde.no"), "https://ovrejorde.no/nettbutikk": { body: alpinePage } });
+      const r = await ex.extractProductsFromWebsite("https://ovrejorde.no", {
+        fetchImpl: f.impl,
+        llm: async () => ({
+          text: JSON.stringify([
+            { name: "Sadel", price: "269,- kr/kg", unit: "kg" },
+            { name: "Bog", price: "150,- kr/kg", unit: "kg" },
+            { name: "Kje Kjøttdeig", price: "299,- kr/kg", unit: "kg" },
+            { name: "Lår", price: "299,- kr/kg", unit: "kg" },
+          ]),
+        }),
+      });
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.rules]),
+        [
+          ["Sadel", 269, []],
+          ["Bog", 269, ["price_reanchored"]],
+          ["Kje Kjøttdeig", 150, ["price_reanchored"]],
+          ["Lår", 299, []],
+        ],
+        "R1 ovrejorde with x-show=\"i < 3\": «Bog» = 269, «Kje Kjøttdeig» = 150 — the next column's price is never accepted",
+      );
+      const blocks = assoc.parsePageBlocks(alpinePage);
+      assertTrue(!blocks.text.includes("x-show") && !blocks.text.includes("open()"), "R1 attribute text never leaks into the visible text");
+    }
+    {
+      // R1 timings: the hand-written tag scanner stays linear.
+      const cases: Array<[string, string]> = [
+        ['<a "', '<a "'.repeat(200_000)],
+        ["<a x=\"", '<a x="'.repeat(200_000)],
+        ['<time class="', '<time class="'.repeat(80_000)],
+        ["<div>×200k + </span>×200k", "<div>".repeat(200_000) + "</span>".repeat(200_000)],
+        ["<p x=\"<\">", '<p x="<">t</p>'.repeat(150_000)],
+      ];
+      for (const [label, input] of cases) {
+        const t0 = Date.now();
+        assoc.parsePageBlocks(input);
+        const ms = Date.now() - t0;
+        assertTrue(ms < 1500, `R1 parsePageBlocks: ${label} (${(input.length / 1e6).toFixed(1)} MB) in ${ms} ms (< 1500)`);
+      }
+    }
+    {
+      // R1 (non-blocking): number tokens are computed once per page.
+      const card = (i: number) => `<div class="product"><h3>Vare ${i}</h3><p>kr ${100 + i},-</p></div>`;
+      const html = HTML(Array.from({ length: 20_000 }, (_, i) => card(i)).join(""));
+      const page = assoc.parsePageBlocks(html);
+      const names = Array.from({ length: 100 }, (_, i) => `Vare ${i}`);
+      const occs = assoc.findNameOccurrences(page.text, names);
+      const t0 = Date.now();
+      let hits = 0;
+      for (let i = 0; i < 100; i++) if (assoc.findPriceAtName(page, occs, `vare ${i}`, 100 + i) >= 0) hits++;
+      const ms = Date.now() - t0;
+      assertTrue(hits === 100 && ms < 1500, `R1 findPriceAtName: 100 candidates on a ${(html.length / 1e6).toFixed(1)} MB page in ${ms} ms, all at their names`);
+    }
     {
       // N1: SEO-plugin markup on ordinary shop pages is not a blog post.
       const rankMathShop =
