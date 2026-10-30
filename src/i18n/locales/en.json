@@ -168,7 +168,12 @@
     "season_note_nb": "Note in Norwegian",
     "rating_on_source": "on {source}",
     "rating_count_on_source": "{count} reviews on {source}",
-    "rating_count_on_source_one": "{count} review on {source}"
+    "rating_count_on_source_one": "{count} review on {source}",
+    "products_prices_fetched": "Prices fetched from {host} on {date}",
+    "products_confirmed_by_owner": "confirmed by owner",
+    "products_updated_by_owner": "Updated by owner on {date}",
+    "products_price_caveat": "Prices may have changed, check with the producer.",
+    "updated_by_owner": "Updated by owner"
   },
   "common": {
     "see_profile": "View profile →",

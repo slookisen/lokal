@@ -190,6 +190,46 @@ export interface ProductInfo {
   note?: string;
   price?: string;       // "275/kg", "150", "200 pr.sekk"
   priceUnit?: string;   // "kr"
+  // Produktimport skive 2 (dev-request 2026-10-21-rfb-produktimport-fra-egen-
+  // nettside): where the product came from and when. Optional; a product
+  // without `source` is enrichment data, as every stored product was before.
+  // Stamped by upsertKnowledge (owner path → owner_manual) and carried into
+  // `products` by product-catalog-sync. None of it makes a product orderable:
+  // that is products.availability_source alone (cart-service).
+  source?: ProductSource;
+  sourceUrl?: string;   // page the price was read from (import / auto-sync)
+  fetchedAt?: string;   // ISO time the price was read from sourceUrl
+  confirmedAt?: string; // ISO time the owner last saved/confirmed the product
+}
+
+/** Who stated a product: the owner (by hand, by import, by weekly sync) or enrichment. */
+export type ProductSource = "owner_manual" | "owner_import" | "owner_auto_sync" | "enrichment";
+export const PRODUCT_SOURCES: readonly ProductSource[] = ["owner_manual", "owner_import", "owner_auto_sync", "enrichment"];
+/** The owner-stated sources: a profile shows a date line for these. */
+export const OWNER_PRODUCT_SOURCES: readonly ProductSource[] = ["owner_manual", "owner_import", "owner_auto_sync"];
+
+/**
+ * Stamps the provenance of a products list before it is stored (skive 2).
+ * Owner path (PUT /agents/:id/knowledge with claim token or API key): every
+ * product is `owner_manual` and confirmed now, unless it already carries
+ * `owner_import`/`owner_auto_sync` (an imported product the owner sends back
+ * keeps its source, URL and fetch date). Any other path cannot claim an owner
+ * source or an owner confirmation: such a value becomes `enrichment` and
+ * `confirmedAt` is dropped. A product with none of these fields is returned
+ * as is, so enrichment writes store byte for byte what they did.
+ */
+export function stampProductSources(products: ProductInfo[], ownerPath: boolean, nowIso: string): ProductInfo[] {
+  return products.map((p) => {
+    if (!p || typeof p !== "object") return p;
+    if (ownerPath) {
+      if (p.source === "owner_import" || p.source === "owner_auto_sync") return { ...p, confirmedAt: nowIso };
+      const { sourceUrl: _u, fetchedAt: _f, ...rest } = p;
+      return { ...rest, source: "owner_manual", confirmedAt: nowIso };
+    }
+    if (p.source === undefined && p.confirmedAt === undefined) return p;
+    const { confirmedAt: _c, source, ...rest } = p;
+    return source === undefined ? rest : { ...rest, source: "enrichment" };
+  });
 }
 
 // ─── Shared product parsing utilities ─────────────────────
@@ -775,6 +815,8 @@ class KnowledgeService {
     // Normalize products: extract prices from name field before storage
     if (data.products?.length) {
       data = { ...data, products: this.normalizeProducts(data.products) };
+      // Skive 2: owner_manual on the owner path; no owner claim from any other.
+      data = { ...data, products: stampProductSources(data.products!, !!opts.ownerPath, now) };
     }
 
     if (!existing) {

@@ -21,7 +21,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService, productPriceText } from "../services/knowledge-service";
+import { knowledgeService, productPriceText, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
 import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
@@ -944,6 +944,51 @@ function productNameText(p: unknown): string {
   if (typeof p === "string") return p;
   const name = p !== null && typeof p === "object" ? (p as { name?: unknown }).name : undefined;
   return typeof name === "string" ? name : "";
+}
+
+// ─── Produktimport skive 2: the products card's date line ───────────────
+// dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside. Above the
+// products: «Priser hentet fra hommelstad.no 21. okt. 2026 · bekreftet av
+// eier» (imported / auto-synced) or «Oppdatert av eier 21. okt. 2026» (typed
+// by the owner), from the newest dated owner product with a shown price, plus
+// the price caveat. Only owner-stated products (ProductInfo.source) are dated;
+// a list without one gives "" and the card is exactly as before.
+
+/** A date as «21. okt. 2026» / «21 Oct 2026», Norwegian time; "" if not a date. */
+function productDateText(iso: unknown, lang: Lang): string {
+  const at = typeof iso === "string" ? Date.parse(iso) : NaN;
+  if (!Number.isFinite(at)) return "";
+  const locale = lang === "en" ? "en-GB" : lang === "sv" ? "sv-SE" : "nb-NO";
+  return new Date(at).toLocaleDateString(locale, { timeZone: "Europe/Oslo", day: "numeric", month: "short", year: "numeric" });
+}
+
+/** The products card's date line + price caveat as HTML, or "" when no owner product has a date. */
+export function productDateLineHtml(products: unknown[], lang: Lang): string {
+  let newest: { at: number; iso: string; host: string; confirmed: boolean } | null = null;
+  for (const p of products) {
+    if (!p || typeof p !== "object") continue;
+    const { source, sourceUrl, fetchedAt, confirmedAt } = p as Record<string, unknown>;
+    // Only a product that shows a price is dated: the line is about prices
+    // (an owner who hides prices gets no line).
+    if (!OWNER_PRODUCT_SOURCES.includes(source as any) || !productPriceText((p as { price?: unknown }).price)) continue;
+    let host = "";
+    if (source !== "owner_manual" && typeof sourceUrl === "string") {
+      try { host = new URL(sourceUrl).hostname.replace(/^www\./, ""); } catch { host = ""; }
+    }
+    // Imported: the fetch date (owner confirmation as a suffix); typed: the owner's date.
+    const iso = host && typeof fetchedAt === "string" ? fetchedAt : confirmedAt;
+    const at = typeof iso === "string" ? Date.parse(iso) : NaN;
+    if (!Number.isFinite(at) || (newest && at <= newest.at)) continue;
+    newest = { at, iso: iso as string, host: iso === fetchedAt ? host : "", confirmed: typeof confirmedAt === "string" && !!confirmedAt };
+  }
+  if (!newest) return "";
+  const date = productDateText(newest.iso, lang);
+  if (!date) return "";
+  const line = newest.host
+    ? t(lang, "producer.products_prices_fetched", { host: newest.host, date }) +
+      (newest.confirmed ? ` \u00b7 ${t(lang, "producer.products_confirmed_by_owner")}` : "")
+    : t(lang, "producer.products_updated_by_owner", { date });
+  return `<p class="prod-dates" style="margin:0 0 10px;font-size:0.8rem;color:var(--g500);">${escapeHtml(line)}<br>${escapeHtml(t(lang, "producer.products_price_caveat"))}</p>`;
 }
 
 /**
@@ -5914,6 +5959,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     // Products — guard against string data (some agents have free-text or plain string arrays)
     const productsList = Array.isArray(k.products) ? k.products : [];
+    // Skive 2: the footer's date is the newer of the owner's and enrichment's,
+    // labelled by which it is. getAgentInfo's knowledge carries neither date,
+    // so the footer used to show none (its k.lastEnrichedAt was always unset);
+    // both are read here.
+    const kDates = getDb().prepare(
+      "SELECT owner_updated_at, last_enriched_at FROM agent_knowledge WHERE agent_id = ?",
+    ).get(agent.id) as { owner_updated_at: string | null; last_enriched_at: string | null } | undefined;
+    const ownerAt = kDates?.owner_updated_at ? Date.parse(kDates.owner_updated_at) : NaN;
+    const enrichedAt = kDates?.last_enriched_at ? Date.parse(kDates.last_enriched_at) : NaN;
+    const footerDate: { iso: string; byOwner: boolean } | null =
+      Number.isFinite(ownerAt) && !(enrichedAt >= ownerAt) ? { iso: kDates!.owner_updated_at as string, byOwner: true }
+      : Number.isFinite(enrichedAt) ? { iso: kDates!.last_enriched_at as string, byOwner: false } : null;
     const productsHtml = productsList.length
       ? productsList.map((p: any) => {
           // Handle both object products ({name, category, price}) and plain strings ("brød").
@@ -6617,7 +6674,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${productsHtml ? `
         <div class="card">
           <div class="card-head"><span>&#127813;</span><h3>${escapeHtml(t(lang, "producer.products"))} (${productsList.length})</h3></div>
-          <div class="card-body"><div class="prod-grid">${productsHtml}</div></div>
+          <div class="card-body">${productDateLineHtml(productsList, lang)}<div class="prod-grid">${productsHtml}</div></div>
         </div>` : ""}
 
         ${affiliationsHtml ? `
@@ -6681,7 +6738,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           ${lang === "en"
             ? ((!k.dataSource || k.dataSource === "auto") ? "Auto-collected data" : k.dataSource === "hybrid" ? "Verified by owner" : "Owner-managed")
             : ((!k.dataSource || k.dataSource === "auto") ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt")
-          }${k.lastEnrichedAt ? ` \u2014 ${lang === "en" ? "Last updated" : "Sist oppdatert"} ${new Date(k.lastEnrichedAt).toLocaleDateString(lang === "en" ? "en-US" : "nb-NO")}` : ""}
+          }${footerDate ? ` \u2014 ${footerDate.byOwner ? t(lang, "producer.updated_by_owner") : lang === "en" ? "Last updated" : "Sist oppdatert"} ${new Date(footerDate.iso).toLocaleDateString(lang === "en" ? "en-US" : "nb-NO")}` : ""}
         </div>
 
         ${meta.disclaimer ? `<p style="margin-top:8px;font-size:0.75rem;color:var(--g500);">${escapeHtml(t(lang, meta.dataSource === "owner" ? "producer.disclaimer_owner" : "producer.disclaimer_public"))}</p>` : ""}

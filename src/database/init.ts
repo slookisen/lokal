@@ -4080,6 +4080,21 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, skive 2: the
+  // provenance product-catalog-sync carries over from agent_knowledge.products
+  // (ProductInfo.sourceUrl / fetchedAt / confirmedAt). source_url = the page a
+  // price was read from, fetched_at = when, owner_confirmed_at = when the owner
+  // last saved/confirmed it. Additive nullable columns; NULL = unknown. None of
+  // them is read by the orderability gate. Same try/catch-duplicate-column
+  // guard as above.
+  for (const col of ["source_url TEXT", "fetched_at TEXT", "owner_confirmed_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE products ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists
+    }
+  }
+
   // ─── Phase 1 (orch-pr-20260614-6): cart + orders tables ─────────────────
   // Cart MVP ("handleliste"). No payment, no seller notification (Phase 1).
   // Anonymous buyer: capability-token model (buyer_ref). Pickup only.
