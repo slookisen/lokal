@@ -195,7 +195,14 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
     addAgent("pi-c1", { verified: 1 });
     addAgent("pi-c2", { verified: 1 });
     addAgent("pi-c3", { verified: 1 });
-    for (const id of [OWN, "pi-n7", "pi-unver", "pi-ematch", "pi-nosite", "pi-other", "pi-robots", "pi-down", "pi-c1", "pi-c2", "pi-c3"]) session(id);
+    addAgent("pi-n1", { verified: 1, products: [
+      { name: "Lammelår", category: "meat", seasonal: false, price: "kr 250/kg", priceUnit: "kr", source: "owner_manual" },
+      { name: "Pølse", category: "meat", seasonal: false, price: "kr 89/kg", priceUnit: "kr", source: "owner_manual" },
+    ] });
+    addAgent("pi-v1noowner", { verified: 1, claimed: false }); // is_verified = 1, but no verified owner (no claim, claimed_at NULL)
+    addAgent("pi-jsurl", { verified: 1, website: "javascript:alert(1)" });
+    for (const id of [OWN, "pi-n7", "pi-unver", "pi-ematch", "pi-nosite", "pi-other", "pi-robots", "pi-down", "pi-c1", "pi-c2", "pi-c3",
+      "pi-n1", "pi-v1noowner", "pi-jsurl"]) session(id);
     session(OWN, "kollega@pi-own.example.no", "own-colleague"); // verified owner session, not the claimant's address
 
     const routes: Record<string, FakeRoute> = {
@@ -211,6 +218,10 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
         { title: "Rømme", handle: "romme" },                         // new, no price on the site
       ]),
       "https://pi-robots.no/robots.txt": ROBOTS_CLOSED,
+      ...shopifySite("pi-n1.no", [
+        { title: "Lammelår", handle: "lammelar", price: "289.00" }, // changed, no unit on the site → stored kg
+        { title: "Pølse", handle: "polse", price: "89.00" },        // same price, no unit on the site → unchanged, stored kg kept
+      ]),
       ...shopifySite("pi-c1.no", [{ title: "Gulrøtter", handle: "gulrotter", price: "25.00" }]),
       ...shopifySite("pi-c2.no", [{ title: "Poteter", handle: "poteter", price: "30.00" }]),
       ...shopifySite("pi-c3.no", [{ title: "Løk", handle: "lok", price: "20.00" }]),
@@ -264,6 +275,12 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
         assertEq((await publishFor(id, "pio-x", { velg: "x" })).status, 403, `AC9: ${id} → publish 403`);
       }
       assertTrue(!hasCard(await portalFor("pi-nosite")), "AC9: verified owner without a website → no card");
+      const noOwner = await portalFor("pi-v1noowner");
+      assertTrue(noOwner.status === 200 && !hasCard(noOwner), "AC9: is_verified = 1 but the session is not a verified owner → no card");
+      assertEq((await hentFor("pi-v1noowner")).status, 403, "AC9: is_verified = 1 without a verified owner → POST hent 403");
+      const js = html(await portalFor("pi-jsurl"));
+      assertTrue(js.includes('data-product-import-card="1"') && !/href="javascript:/i.test(js) && js.includes("javascript:alert(1)"),
+        "card: a javascript: website is shown as text, never as a clickable href");
       const anon = await hentFor(OWN, "");
       assertEq([anon.status, anon.location], [303, `/eier/${OWN}`], "AC9: no session → login page");
       assertEq((await hentFor("pi-other", tokens[OWN])).status, 403, "AC9: a session for another profile → 403");
@@ -435,6 +452,30 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
       assertTrue(!prods.some((p) => p.name === "Rømme"), "N7: the unticked new row is not published");
     }
 
+    // ─── Review N1/N2: a matched row keeps its name; «Uendret» shows the kept unit
+    {
+      const f = await hentFor("pi-n1");
+      const rid = runIdFrom(f, "pi-n1");
+      await oi.__awaitOwnerFetchForTesting(rid);
+      const h = html(await pageFor("pi-n1", rid));
+      const idL = candId(rid, "Lammelår");
+      const row = h.slice(h.indexOf(`data-candidate-id="${idL}"`), h.indexOf("</li>", h.indexOf(`data-candidate-id="${idL}"`)));
+      assertTrue(row.includes('data-kind="changed"') && row.includes('data-name-locked="1"') && !row.includes(`name="navn_${idL}"`),
+        "N1: a changed row (matches an existing product) has no editable name field");
+      assertTrue(/Uendret \(1\)[\s\S]*Pølse <span class="ep-audit-meta">kr 89 \/ kg<\/span>/.test(h) && !/Pølse <span class="ep-audit-meta">[^<]*uten enhet/.test(h),
+        "N2: «Uendret» shows the stored unit that is kept, not «(uten enhet)»");
+      // A forged form post that renames the changed row anyway.
+      const r = await publishFor("pi-n1", rid, {
+        velg: [idL],
+        [`navn_${idL}`]: "Lammelår ekstra", [`pris_${idL}`]: "289", [`enhet_${idL}`]: "kg",
+      });
+      assertEq(r.status, 303, "N1: publish with a renamed changed row → 303 (name ignored)");
+      const prods = productsOf("pi-n1");
+      assertEq(prods.filter((p) => /lammelår/i.test(String(p.name))).map((p) => [p.name, p.price]), [["Lammelår", "kr 289/kg"]],
+        "N1: no duplicate product; the existing product is replaced and keeps the stored unit");
+      assertEq(prods.length, 2, "N1: the profile still has exactly two products");
+    }
+
     // ─── Zero results: outcome explained ────────────────────────────────────
     {
       const f = await hentFor("pi-robots");
@@ -494,6 +535,10 @@ export async function runOwnerProductImportPortalTests(opts: { log?: boolean } =
       assertEq(importMod.selectionFromForm(c, { unit: "kg" }, { name: "Lammelår", price: "289", unit: "kg" }), { id: "pic-1" }, "selection: untouched row sends only the id");
       assertEq(importMod.selectionFromForm(c, { unit: "kg" }, { name: " Lammelår ", price: "300", unit: "" }), { id: "pic-1", price: "300", unit: "" },
         "selection: only changed fields are sent; clearing the unit is explicit");
+      assertEq(importMod.selectionFromForm(c, { unit: "kg" }, { name: "Annet navn", price: "289", unit: "kg" }), { id: "pic-1" },
+        "selection: a row matching an existing product never sends a name (N1)");
+      assertEq(importMod.selectionFromForm(c, null, { name: "Annet navn", price: "289", unit: "" }), { id: "pic-1", name: "Annet navn" },
+        "selection: a new row may be renamed");
     }
   } catch (err) {
     failed++;

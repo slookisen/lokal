@@ -288,6 +288,10 @@ export function candidatePrefill(c: PreviewCandidate, old: { unit: string | null
  * The publish selection for one ticked row: only the fields the owner actually
  * changed from the prefill are sent, so an untouched row publishes exactly
  * what the preview showed (stored price / unit kept where the site has none).
+ * A row that matches an existing product (`old` set) never sends a name: the
+ * service matches on the name, so a renamed «changed» row would be added next
+ * to the old product instead of replacing it and would lose the stored unit.
+ * The page shows that name read-only; this ignores a submitted one anyway.
  */
 export function selectionFromForm(
   c: PreviewCandidate,
@@ -297,7 +301,7 @@ export function selectionFromForm(
   const pre = candidatePrefill(c, old);
   const sel: PublishSelection = { id: c.id };
   const val = (v: unknown) => (typeof v === "string" ? v.trim() : undefined);
-  const name = val(submitted.name);
+  const name = old ? undefined : val(submitted.name);
   if (name !== undefined && name !== pre.name) sel.name = name;
   const price = val(submitted.price);
   if (price !== undefined && price !== pre.price) sel.price = price;
@@ -357,7 +361,9 @@ function candidateRowHtml(
   return `<li class="ep-audit-item" data-candidate-id="${fid}" data-kind="${kind}">
           <label><input type="checkbox" name="velg" value="${fid}"${checked ? " checked" : ""}> <strong>${escapeHtml(c.name)}</strong></label>${source}
           ${oldNew}
-          ${field("navn", "Navn", name, 'maxlength="120"', "name")}
+          ${kind === "changed"
+            ? `<div class="ep-field" data-name-locked="1"><span>Navn</span> <strong>${escapeHtml(c.name)}</strong> <span class="ep-audit-meta">Navnet kan ikke endres her, fordi varen allerede finnes i profilen din.</span></div>`
+            : field("navn", "Navn", name, 'maxlength="120"', "name")}
           ${field("pris", "Pris (kr)", price, `inputmode="decimal"${keepStored && old?.price ? ` placeholder="${escapeHtml(old.price)}"` : ""}`, "price")}
           ${field("enhet", "Enhet (f.eks. kg, stk)", unit, 'maxlength="30"', "unit")}
           <div class="ep-audit-meta" data-publish-unit="${escapeHtml(pre.unit)}">${escapeHtml(publishes)}</div>
@@ -385,8 +391,7 @@ export function renderImportPreviewPage(
       <div class="ep-card" data-import-status="running">
         <p role="status" aria-live="polite">Vi henter produkter fra nettsiden din. Det tar vanligvis under ett minutt. Siden oppdateres av seg selv.</p>
         <p><a class="ep-btn ep-btn-secondary" href="${self}">Oppdater nå</a> <a class="ep-btn ep-btn-ghost" href="${back}">Tilbake til portalen</a></p>
-      </div>
-      <script>setTimeout(function () { window.location.reload(); }, 4000);</script>`;
+      </div>`;
   }
   const totalCandidates = p.counts.new + p.counts.changed + p.counts.unchanged + p.counts.published + p.counts.rejected;
   const addYourself = ownerOrderabilityPortalEnabledFor(agentId)
@@ -429,7 +434,7 @@ export function renderImportPreviewPage(
         .map((c) => `<li class="ep-audit-item">${escapeHtml(c.name)} <span class="ep-audit-meta">${escapeHtml(
           c.price_missing_on_site
             ? "pris mangler på nettsiden, prisen du har i dag beholdes"
-            : publishedPriceText(c.price_nok, c.unit ?? "", c.price_is_from, c.price_excl_vat),
+            : publishedPriceText(c.price_nok, c.unit ?? c.old.unit ?? "", c.price_is_from, c.price_excl_vat),
         )}</span></li>`)
         .join("")}</ul></details>`
     : "";
