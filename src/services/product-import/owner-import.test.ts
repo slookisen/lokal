@@ -182,7 +182,13 @@ export async function runOwnerImportTests(opts: { log?: boolean } = {}): Promise
     addAgent("imp-c1", { verified: 1 });
     addAgent("imp-c2", { verified: 1 });
     addAgent("imp-c3", { verified: 1 });
-    for (const id of [OWN, "imp-unver", "imp-ematch", "imp-other", "imp-nosite", "imp-llm", "imp-robots", "imp-c1", "imp-c2", "imp-c3"]) session(id);
+    addAgent("imp-keep", { verified: 1, products: [
+      { name: "Lammelår", category: "meat", seasonal: false, price: "kr 289/kg", priceUnit: "kr", source: "owner_manual", confirmedAt: "2026-10-01T10:00:00.000Z" },
+      { name: "Pølse", category: "meat", seasonal: false, price: "kr 89/kg", priceUnit: "kr", source: "owner_manual" },
+      { name: "Surdeigsbrød", category: "bakery", seasonal: false, price: "kr 50", priceUnit: "kr", source: "owner_manual" },
+      { name: "Bacon", category: "meat", seasonal: false, price: "kr 99/stk", priceUnit: "kr", source: "owner_manual" },
+    ] });
+    for (const id of [OWN, "imp-unver", "imp-ematch", "imp-other", "imp-nosite", "imp-llm", "imp-robots", "imp-c1", "imp-c2", "imp-c3", "imp-keep"]) session(id);
     session(OWN, "kollega@imp-own.example.no", "own-colleague"); // verified owner, not the claimant's address
 
     // Fake network: per-host fixtures, plus hold-able hosts for the cap test.
@@ -198,6 +204,21 @@ export async function runOwnerImportTests(opts: { log?: boolean } = {}): Promise
       "https://imp-llm.no/": { body: HTML(`<a href="/priser">Priser</a><p>Velkommen til en liten gård med sau og høner langs elva.</p>`) },
       "https://imp-llm.no/priser": { body: HTML("<h1>Prisliste</h1><ul><li>Lammelår 250 kr/kg</li><li>Egg, 12 stk: 60,-</li></ul><p>Henting på gården lørdager.</p>") },
       "https://imp-robots.no/robots.txt": ROBOTS_CLOSED,
+      "https://imp-keep.no/robots.txt": ROBOTS_OPEN,
+      "https://imp-keep.no/products.json?limit=250": {
+        contentType: "application/json",
+        body: JSON.stringify({ products: [
+          { title: "Lammelår", handle: "lammelar", variants: [] },
+          { title: "Pølse", handle: "polse", variants: [{ title: "Default Title", price: "89.00" }] },
+          { title: "Surdeigsbrød", handle: "brod", variants: [{ title: "Default Title", price: "60.00" }] },
+          { title: "Bacon", handle: "bacon", variants: [{ title: "1 kg", price: "99.00" }] },
+          { title: "Saft", handle: "saft", variants: [{ title: "0,5 l", price: "50.00" }, { title: "1 l", price: "90.00" }] },
+          { title: "Syltetøy", handle: "syltetoy", variants: [{ title: "250 g", price: "45.00" }, { title: "500 g", price: "80.00" }] },
+          { title: "Ost", handle: "ost", variants: [{ title: "Default Title", price: "70.00" }] },
+          { title: "Smør", handle: "smor", variants: [{ title: "Default Title", price: "40.00" }] },
+          { title: "Fløte", handle: "flote", variants: [{ title: "Default Title", price: "30.00" }] },
+        ] }),
+      },
       ...shopifySite("imp-c3.no", [{ title: "Gulrøtter", handle: "gulrotter", price: "25.00" }]),
     };
     const fetchCalls: string[] = [];
@@ -416,6 +437,57 @@ export async function runOwnerImportTests(opts: { log?: boolean } = {}): Promise
       assertEq(next.status, 202, "AC12: the next UTC day → 202 again");
       await oi.__awaitOwnerFetchForTesting(next.body.run_id);
       clock = T0 + 120_000;
+    }
+
+    // ─── Review fix-up: kept price/unit, edit resets, guards ────────────────
+    {
+      const K = "imp-keep";
+      const f = await fetchFor(K);
+      await oi.__awaitOwnerFetchForTesting(f.body.run_id);
+      const rid = f.body.run_id as string;
+      const p = (await runFor(K, rid)).body;
+      const all = [...p.new, ...p.changed, ...p.unchanged];
+      const kid = (name: string) => all.find((c: any) => c.name === name)!.id as string;
+      const lamC = all.find((c: any) => c.name === "Lammelår");
+      assertEq([lamC.price_nok, lamC.price_missing_on_site, p.unchanged.some((c: any) => c.name === "Lammelår")], [null, true, true],
+        "diff: a candidate without a price is «unchanged» and flagged price_missing_on_site");
+      assertEq(p.changed.filter((c: any) => c.name === "Bacon").map((c: any) => [c.old.unit, c.unit, c.old.price_nok, c.price_nok]), [["stk", "kg", 99, 99]],
+        "diff: same price, different unit → changed (unitChanged)");
+      assertTrue(p.unchanged.some((c: any) => c.name === "Pølse"), "diff: same price, no unit on the website → unchanged");
+
+      // IDOR: this profile's own session + another profile's run id.
+      assertEq((await runFor(K, run1)).status, 404, "IDOR: GET another profile's run id with an own session → 404");
+      const idor = await publishFor(K, run1, { candidates: [idOf("Rabarbrasaft")] });
+      assertEq([idor.status, idor.body.error], [404, "run_not_found"], "IDOR: publish another profile's run id with an own session → 404 (readRun agent filter)");
+
+      const before = totalChanges();
+      const tooHigh = await publishFor(K, rid, { candidates: [{ id: kid("Ost"), price: "100001" }] });
+      assertEq([tooHigh.status, tooHigh.body.fields], [400, [{ id: kid("Ost"), field: "price" }]], "publish: a price above OWNER_IMPORT_MAX_PRICE_NOK → 400");
+      const dup = await publishFor(K, rid, { candidates: [{ id: kid("Smør"), name: "Meieri-mix" }, { id: kid("Fløte"), name: "meieri-mix" }] });
+      assertEq([dup.status, dup.body.fields], [400, [{ id: kid("Fløte"), field: "name" }]], "publish: two selected rows renamed to the same name → 400");
+      assertEq(totalChanges(), before, "publish: those 400s write nothing");
+
+      db.prepare("UPDATE product_import_candidates SET price_excl_vat = 1 WHERE id IN (?, ?)").run(kid("Saft"), kid("Syltetøy"));
+      const r = await publishFor(K, rid, {
+        candidates: [{ id: kid("Lammelår") }, { id: kid("Pølse") }, { id: kid("Surdeigsbrød"), price: null }, { id: kid("Bacon") },
+          { id: kid("Saft"), price: "70" }, { id: kid("Syltetøy") }, { id: kid("Ost"), price: "100000" }],
+        remove: ["Bacon"],
+      });
+      assertEq(r.status, 200, "publish (keep): 200");
+      const list = ks.knowledgeService.getKnowledge(K)!.products as any[];
+      const by = (n: string) => list.find((x) => x.name === n);
+      assertEq([by("Lammelår").price, by("Lammelår").priceUnit, by("Lammelår").source], ["kr 289/kg", "kr", "owner_import"],
+        "B1: a candidate without a price keeps the owner's price and unit");
+      assertEq((db.prepare("SELECT price_nok FROM products WHERE agent_id = ? AND name = 'Lammelår'").get(K) as any)?.price_nok ?? 289, 289,
+        "B1: the catalog price stays consistent with the profile");
+      assertEq(by("Pølse").price, "kr 89/kg", "B1: a candidate without a unit keeps the owner's unit");
+      assertEq(by("Surdeigsbrød").price, undefined, "publish: an explicit price: null clears the price");
+      assertTrue(!!by("Bacon") && r.body.not_removed.includes("Bacon") && by("Bacon").price === "kr 99/kg",
+        "publish: a product both published and listed for removal is published, not removed");
+      assertEq(by("Saft").price, "kr 70/l", "publish: an edited price drops «fra» and «ekskl. mva.»");
+      assertTrue(by("Syltetøy").price.startsWith("fra kr 45") && by("Syltetøy").price.endsWith("ekskl. mva."),
+        "publish: an unedited price keeps «fra» and «ekskl. mva.»");
+      assertEq(by("Ost").price, "kr 100000", "publish: OWNER_IMPORT_MAX_PRICE_NOK itself is accepted");
     }
 
     // ─── LLM tier allowed in the owner preview, and marked ──────────────────

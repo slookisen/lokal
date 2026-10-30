@@ -469,6 +469,8 @@ function candidateJson(c: CandidateRow, block: PublishBlockReason | null) {
     source_url: c.source_url,
     rules,
     status: c.status,
+    price_missing_on_site: c.price_nok === null,
+    price_missing_text: c.price_nok === null ? "Pris mangler på nettsiden. Prisen du har i dag beholdes hvis du ikke endrer den." : null,
     publish_blocked: block,
     publish_blocked_text: block ? PUBLISH_BLOCK_TEXT_NB[block] : null,
   };
@@ -664,8 +666,12 @@ export function publishOwnerImport(
 
   // Resolve every selected row's final values (edits validated) first.
   const fieldErrors: Array<{ id: string; field: string }> = [];
-  const finals: Array<{ row: CandidateRow; name: string; price: number | null; unit: string | null; priceEdited: boolean }> = [];
+  const finals: Array<{
+    row: CandidateRow; name: string; price: number | null; unit: string | null; priceEdited: boolean;
+    priceExplicit: boolean; unitExplicit: boolean;
+  }> = [];
   const seenSel = new Set<string>();
+  const seenNames = new Set<string>();
   for (const s of selection) {
     if (seenSel.has(s.id)) continue;
     seenSel.add(s.id);
@@ -695,7 +701,11 @@ export function publishOwnerImport(
         else unit = u;
       }
     }
-    finals.push({ row, name, price, unit, priceEdited });
+    // Two selected rows that end up with the same name would both be added.
+    const nameKey = normalizeName(name);
+    if (seenNames.has(nameKey)) fieldErrors.push({ id: s.id, field: "name" });
+    seenNames.add(nameKey);
+    finals.push({ row, name, price, unit, priceEdited, priceExplicit: s.price !== undefined, unitExplicit: s.unit !== undefined });
   }
   if (fieldErrors.length) {
     return { ok: false, status: 400, error: "invalid", message: "Noen av feltene er ugyldige. Sjekk navn, pris og enhet.", fields: fieldErrors };
@@ -713,17 +723,23 @@ export function publishOwnerImport(
   const rejected: Array<{ id: string; name: string; reason: PublishBlockReason; message: string }> = [];
   const toPublish: Array<{ id: string; entry: ProductInfo; replaceIndex: number | null; key: string }> = [];
   for (const f of finals) {
-    const block = publishBlockReason(f.name, f.price, types);
+    const key = normalizeName(f.name);
+    const cur = byKey.get(key) ?? null;
+    // A candidate without a price (the website shows none, or the rules
+    // dropped it) never erases the owner's stored price; only an explicit
+    // price: null / "" from the owner clears it. Same for the unit.
+    const keepBasePrice = cur !== null && f.price === null && !f.priceExplicit;
+    const unit = f.unit === null && !f.unitExplicit && cur ? cur.unit : f.unit;
+    const effectivePrice = keepBasePrice ? cur!.price_nok : f.price;
+    const block = publishBlockReason(f.name, effectivePrice, types);
     if (block) {
       rejected.push({ id: f.row.id, name: f.name, reason: block, message: PUBLISH_BLOCK_TEXT_NB[block] });
       continue;
     }
-    const key = normalizeName(f.name);
-    const cur = byKey.get(key) ?? null;
     const base: ProductInfo = cur ? { ...list[cur.index]! } : { name: f.name, category: "other", seasonal: false };
     const exclVat = f.row.price_excl_vat === 1 && !f.priceEdited;
     const isFrom = f.row.price_is_from === 1 && !f.priceEdited;
-    const price = formatPrice(f.price, f.unit, isFrom, exclVat);
+    const price = keepBasePrice ? undefined : formatPrice(f.price, unit, isFrom, exclVat);
     const entry: ProductInfo = {
       ...base,
       name: f.name,
@@ -733,7 +749,9 @@ export function publishOwnerImport(
     };
     if (f.row.source_url) entry.sourceUrl = f.row.source_url;
     else delete entry.sourceUrl;
-    if (price !== undefined) {
+    if (keepBasePrice) {
+      // base.price / base.priceUnit stay as the owner had them.
+    } else if (price !== undefined) {
       entry.price = price;
       entry.priceUnit = "kr";
     } else {
