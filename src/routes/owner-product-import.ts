@@ -18,7 +18,7 @@
 // done). Owner checks on EVERY call, server-side, with the existing helpers
 // (no new auth mechanism):
 //   - verifyOwnerSession (rfb_owner_session cookie or Bearer) — none → 401;
-//   - POSTs: crossSiteRequest (Origin ≠ Host) → 403;
+//   - POSTs: isCrossSiteWrite (src/middleware/same-origin-write.ts) → 403;
 //   - isVerifiedOwner: the session belongs to exactly this agent and the
 //     profile has a verified owner — else 403 (foreign agent id included);
 //   - agents.is_verified = 1 — an e-mail-match session or a self-registered
@@ -30,8 +30,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import {
-  crossSiteRequest,
   isVerifiedOwner,
   OWNER_NOT_VERIFIED_MESSAGE,
   sessionClaimantOwnerEmail,
@@ -64,7 +64,7 @@ function ownerImportAuth(req: Request, res: Response, opts: { write: boolean }):
     res.status(401).json({ success: false, error: "not_logged_in", message: "Du må logge inn som eier først." });
     return { ok: false };
   }
-  if (opts.write && crossSiteRequest(req)) {
+  if (opts.write && isCrossSiteWrite(req)) {
     res.status(403).json({ success: false, error: "forbidden", message: "Ingen tilgang." });
     return { ok: false };
   }

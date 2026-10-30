@@ -20,6 +20,9 @@ import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { getDb } from "../database/init";
 import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
+import {
+  isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
+} from "../middleware/same-origin-write";
 import { applyOrderAction, type OrderAction } from "../services/order-actions";
 import { isOrderMessagesEnabled, postOrderMessage } from "../services/order-messages";
 import { soldOutIdsFromBody, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
@@ -94,11 +97,18 @@ function q(req: Request, name: string): string {
   return Array.isArray(v) ? String(v[0] ?? "") : typeof v === "string" ? v : "";
 }
 
-/** A browser form post from another site is refused (Origin present and not our host). */
-function crossSite(req: Request): boolean {
-  const origin = req.headers.origin;
-  if (!origin || typeof origin !== "string") return false;
-  try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }
+/**
+ * A browser form post from another site is refused — the shared check in
+ * src/middleware/same-origin-write.ts. Refused: 403 «Kunne ikke lagre» with a
+ * link back to the order.
+ */
+function refuseCrossSite(req: Request, res: Response, route: string, backHref: string): boolean {
+  if (!isCrossSiteWrite(req, route)) return false;
+  noStore(res);
+  res.status(403).send(ordersShell(WRITE_GUARD_REFUSED_TITLE, writeGuardRefusedBody({
+    contact: WRITE_GUARD_CONTACT_RFB, backHref, backLabel: "Tilbake til ordren",
+  })));
+  return true;
 }
 
 function noStore(res: Response): void {
@@ -169,7 +179,7 @@ router.post("/eier/:agentId/ordrer/:orderId", ownerOrdersLimiter, express.urlenc
     const session = verifyOwnerSession(req);
     if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
     if (!ownerSessionAllows(agentId, session)) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`, session.agentId === agentId);
-    if (crossSite(req)) { noStore(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
+    if (refuseCrossSite(req, res, "/eier/:agentId/ordrer/:orderId", `${base}?o=${encodeURIComponent(orderId)}#${ROW_ANCHOR(orderId)}`)) return;
 
     const order = getOwnerOrder(agentId, orderId);
     if (!order) return notFoundPage(res);
@@ -213,7 +223,7 @@ router.post("/eier/:agentId/ordrer/:orderId/melding", messagesGate, ownerOrdersL
     const session = verifyOwnerSession(req);
     if (!session.valid) return res.redirect(302, `/eier/${encodeURIComponent(agentId)}`);
     if (!ownerSessionAllows(agentId, session)) return forbiddenPage(res, `/eier/${encodeURIComponent(agentId)}`, session.agentId === agentId);
-    if (crossSite(req)) { noStore(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
+    if (refuseCrossSite(req, res, "/eier/:agentId/ordrer/:orderId/melding", `${base}?o=${encodeURIComponent(orderId)}#${ROW_ANCHOR(orderId)}`)) return;
 
     const order = getOwnerOrder(agentId, orderId);
     if (!order) return notFoundPage(res);
@@ -252,7 +262,7 @@ router.post("/produsent/ordre/:token/kompakt", ownerOrdersLimiter, express.urlen
   try {
     const order = getOwnerOrderByToken(token);
     if (!order) return notFoundPage(res);
-    if (crossSite(req)) { noStore(res); return res.status(403).send(ordersShell("Ikke tillatt", `<h1>Ikke tillatt</h1>`)); }
+    if (refuseCrossSite(req, res, "/produsent/ordre/:token/kompakt", back)) return;
 
     const body = (req.body || {}) as Record<string, unknown>;
     const chosen = sellerActionFrom(body, order.agent_id);

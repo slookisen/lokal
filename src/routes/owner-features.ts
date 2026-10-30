@@ -2,11 +2,12 @@ import express, { Router, Request, Response } from "express";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import {
-  verifyOwnerSession, isVerifiedOwner, crossSiteRequest, OWNER_NOT_VERIFIED_MESSAGE,
+  verifyOwnerSession, isVerifiedOwner, OWNER_NOT_VERIFIED_MESSAGE, portalWriteRefusedPage,
   portalShell, ownerNotVerifiedPage,
   ownerOrderEmailEnabled, currentOrderRecipient, pendingOrderEmailChange, requestOwnerOrderEmailChange,
   parseResumeDate, ownerUnifiedSessionEnabled,
 } from "./owner-portal";
+import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, type OwnerFeatureEntry } from "../owner-features/registry";
 import {
@@ -157,7 +158,7 @@ router.put("/api/owner/:id/features/:key", (req: Request, res: Response) => {
   try {
     const g = gate(req);
     if (!g.ok) return g.send(res);
-    if (crossSiteRequest(req)) return res.status(403).json({ success: false, error: "cross_site" });
+    if (isCrossSiteWrite(req, "/api/owner/:id/features/:key")) return res.status(403).json({ success: false, error: "cross_site" });
     const capKey = crypto.createHash("sha256").update(g.token).digest("hex");
     if (writeCap.isOver(capKey)) {
       return res.status(429).json({ success: false, error: "rate_limited", message: "For mange endringer. Prøv igjen om litt." });
@@ -238,7 +239,10 @@ function pageGate(req: Request): Gate {
 
 /** Origin check + per-session write limit for the page's POSTs. */
 function pageWriteGuard(req: Request, token: string): ((res: Response) => Response) | null {
-  if (crossSiteRequest(req)) return simplePage(403, "Ingen tilgang", `<h1>Ingen tilgang</h1><p>Forespørselen kom fra en annen side.</p>`);
+  if (isCrossSiteWrite(req)) {
+    const agentId = String((req.params as any).agentId || "");
+    return (res: Response) => res.status(403).send(portalWriteRefusedPage(pagePath(agentId), "Tilbake til Mine valg"));
+  }
   const capKey = crypto.createHash("sha256").update(token).digest("hex");
   if (writeCap.isOver(capKey)) {
     return simplePage(429, "For mange endringer", `<h1>For mange endringer</h1><p>Prøv igjen om litt.</p>`);

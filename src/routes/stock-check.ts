@@ -32,7 +32,8 @@ import {
   type StockCheckItem,
 } from "../services/stock-check-reminder";
 import { getSupplyGraphStaleDays } from "../services/supply-graph";
-import { portalShell, escapeHtml, crossSiteRequest } from "./owner-portal";
+import { portalShell, escapeHtml, portalWriteRefusedPage } from "./owner-portal";
+import { isCrossSiteWrite } from "../middleware/same-origin-write";
 
 const router = Router();
 
@@ -100,7 +101,10 @@ ${portalLink(v.agent_id)}`,
 router.post(`${STOCK_CHECK_PATH}/:token`, stockCheckLimiter, express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   if (!isStockCheckEmailEnabled()) return res.status(404).send("Not found");
   noStore(res);
-  if (crossSiteRequest(req)) return res.status(403).send(portalShell("Ingen tilgang", card(`<h1>Ingen tilgang</h1>`)));
+  if (isCrossSiteWrite(req, `${STOCK_CHECK_PATH}/:token`)) {
+    // Back to the link's own page (GET — writes nothing), which the token holder came from.
+    return res.status(403).send(portalWriteRefusedPage(`${STOCK_CHECK_PATH}/${encodeURIComponent(String(req.params.token || ""))}`));
+  }
   const v = verifyStockCheckToken(String(req.params.token || ""));
   if (v.state === "invalid") return res.status(400).send(portalShell("Ugyldig lenke", INVALID_HTML));
   if (v.state === "expired") return res.status(410).send(portalShell("Lenken har gått ut", EXPIRED_HTML));

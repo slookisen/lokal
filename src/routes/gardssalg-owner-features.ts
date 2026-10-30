@@ -2,7 +2,9 @@ import express, { Router, Request, Response } from "express";
 import crypto from "crypto";
 import { getDb as getRfbDb } from "../database/init";
 import { generalLimiter } from "../middleware/security";
-import { crossSiteRequest } from "./owner-portal";
+import {
+  isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_OPPLEVAGENT,
+} from "../middleware/same-origin-write";
 import { SlidingWindowCap } from "../services/a2a-traffic-classifier";
 import {
   getClaimProviderBySlug,
@@ -275,7 +277,12 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
   }
 
   function writeGuard(req: Request, token: string): ((res: Response) => Response) | null {
-    if (crossSiteRequest(req)) return simplePage(403, "Ingen tilgang", `<h1>Ingen tilgang</h1><p>Forespørselen kom fra en annen side.</p>`);
+    if (isCrossSiteWrite(req)) {
+      const slug = String((req.params as any).providerSlug || "");
+      return simplePage(403, WRITE_GUARD_REFUSED_TITLE, writeGuardRefusedBody({
+        contact: WRITE_GUARD_CONTACT_OPPLEVAGENT, backHref: PAGE_PATH(slug), backLabel: "Tilbake til Mine valg",
+      }));
+    }
     const capKey = crypto.createHash("sha256").update(token).digest("hex");
     if (writeCap.isOver(capKey)) return simplePage(429, "For mange endringer", `<h1>For mange endringer</h1><p>Prøv igjen om litt.</p>`);
     writeCap.record(capKey);
@@ -569,7 +576,7 @@ export function createGardssalgOwnerFeaturesRouter(deps: GardssalgOwnerFeaturesD
     try {
       const g = apiGate(req);
       if (!g.ok) return res.status(g.status).json(g.body);
-      if (crossSiteRequest(req)) return res.status(403).json({ success: false, error: "cross_site" });
+      if (isCrossSiteWrite(req, "/api/opplevelser/gardssalg-claim/:providerId/features/:key")) return res.status(403).json({ success: false, error: "cross_site" });
       const capKey = crypto.createHash("sha256").update(g.token).digest("hex");
       if (writeCap.isOver(capKey)) return res.status(429).json({ success: false, error: "rate_limited", message: "For mange endringer. Prøv igjen om litt." });
       writeCap.record(capKey);
