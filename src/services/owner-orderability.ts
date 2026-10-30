@@ -48,7 +48,7 @@ export function ownerOrderabilityPortalEnabled(): boolean {
 }
 
 /** Reasons a stock confirmation cannot fix: such rows get no confirm button and are skipped by «Bekreft alle». */
-const NOT_CONFIRMABLE: ReadonlySet<string> = new Set(["category_label", "alcohol", "service", "ban_check_failed"]);
+export const NOT_CONFIRMABLE: ReadonlySet<string> = new Set(["category_label", "alcohol", "service", "ban_check_failed"]);
 
 export interface OwnerProductOrderability extends OrderabilityResult {
   id: string;
@@ -70,7 +70,13 @@ export interface OwnerOrderabilityOverview {
   profile_reasons: OrderabilityReason[];
 }
 
-type ProductRow = OrderabilityRow & { id: string; unit: string | null };
+export type OwnerProductRow = OrderabilityRow & { id: string; unit: string | null };
+type ProductRow = OwnerProductRow;
+
+/** Every product row of the producer, in the card's order (B2 reads the same rows). */
+export function readOwnerProductRows(db: any, agentId: string): ProductRow[] {
+  return readRows(db, agentId);
+}
 
 function readRows(db: any, agentId: string): ProductRow[] {
   return db
@@ -81,7 +87,8 @@ function readRows(db: any, agentId: string): ProductRow[] {
     .all(agentId) as ProductRow[];
 }
 
-function isConfirmable(r: OrderabilityResult, priceNok: number | null): boolean {
+/** «Bekreft at varen er på lager» may be used on the row (B1 rule; B2 reuses it). */
+export function isConfirmable(r: OrderabilityResult, priceNok: number | null): boolean {
   return priceNok != null && !r.reasons.some((x) => NOT_CONFIRMABLE.has(x.code));
 }
 
@@ -108,7 +115,7 @@ export function listOwnerProductOrderability(agentId: string, db: any = getDb(),
   };
 }
 
-function audit(db: any, agentId: string, field: string, oldValue: string | null, newValue: string | null, email: string | null, notes: string): void {
+export function auditOwnerProductChange(db: any, agentId: string, field: string, oldValue: string | null, newValue: string | null, email: string | null, notes: string): void {
   db.prepare(
     `INSERT INTO agent_knowledge_audit
      (id, agent_id, field_name, old_value, new_value, changed_by, changed_by_email, changed_at, notes)
@@ -136,7 +143,7 @@ export function confirmOwnerProductInStock(
   db.transaction(() => {
     const w = setProducerAvailabilityByProductId(agentId, productId, "in_stock", db);
     if (!w.success) return;
-    audit(db, agentId, "products.availability", row.availability, "in_stock", opts.actorEmail ?? null, `owner confirmed in stock: ${row.name} (B1)`);
+    auditOwnerProductChange(db, agentId, "products.availability", row.availability, "in_stock", opts.actorEmail ?? null, `owner confirmed in stock: ${row.name} (B1)`);
     out = { ok: true, confirmed: 1 };
   })();
   return out;
@@ -160,7 +167,7 @@ export function confirmAllOwnerProductsInStock(
       if (setProducerAvailabilityByProductId(agentId, r.id, "in_stock", db).success) confirmed++;
     }
     if (confirmed > 0) {
-      audit(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null, `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
+      auditOwnerProductChange(db, agentId, "products.availability", null, "in_stock", opts.actorEmail ?? null, `owner confirmed all in stock: ${confirmed} item(s) (B1)`);
     }
   })();
   return { ok: true, confirmed, skipped_missing_price };
@@ -232,7 +239,7 @@ export function addOwnerProduct(
           availability_updated_at, availability_source, ingredients, allergens, net_weight, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'NOK', 'in_stock', 'owner', datetime('now'), 'producer_dashboard', ?, ?, ?, datetime('now'), datetime('now'))`,
     ).run(id, agentId, p.name, nameNorm, p.unit, p.price_nok, p.ingredients, allergensJson, p.net_weight);
-    audit(db, agentId, "products.added", null, p.name, opts.actorEmail ?? null, "owner added a product (B1)");
+    auditOwnerProductChange(db, agentId, "products.added", null, p.name, opts.actorEmail ?? null, "owner added a product (B1)");
   })();
   return { ok: true, product_id: id };
 }

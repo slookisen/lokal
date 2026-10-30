@@ -121,6 +121,8 @@ export const SWITCH_PROBE_ENV_FLAGS = [
   "OWNER_ORDER_EMAIL_ENABLED",
   "RFB_DISABLE_ORDER_FOLLOWUPS",
   "PUBLIC_STATS_MIN_VIEWS",
+  "STOCK_CHECK_EMAIL_ENABLED",
+  "OWNER_ORDERABILITY_PORTAL_ENABLED",
 ] as const;
 
 /**
@@ -131,6 +133,11 @@ export const SWITCH_PROBE_ENV_FLAGS = [
 export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = {
   "auto.guarantee × job:knowledge_write": "OWNER_LOCK_ENFORCE_WRITES",
   "comms.unsubscribe × email:outreach": "OUTREACH_UNSUBSCRIBE_ENABLED",
+  // B2: the reminder e-mail and its job only run with their flag; the banner
+  // lives in B1's card.
+  "products.stock_check × email:stock_check": "STOCK_CHECK_EMAIL_ENABLED",
+  "products.stock_check × job:stock_check": "STOCK_CHECK_EMAIL_ENABLED",
+  "products.stock_check × owner_portal": "OWNER_ORDERABILITY_PORTAL_ENABLED",
 };
 const FLAG_OFF_REASON = "flag off in this environment";
 
@@ -949,6 +956,29 @@ const outreachSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   };
 };
 
+// B2 (products.stock_check): the reminder's own decision — stockCheckOn()
+// (orders.enabled + the owner's choice), the same call the job and the portal
+// banner make. Decision only: nothing is reserved or sent, no banner rendered.
+function stockCheckDecision(ctx: ProbeReaderContext): boolean {
+  const { stockCheckOn } = require("../services/stock-check-reminder") as typeof import("../services/stock-check-reminder");
+  return stockCheckOn(ctx.fixture.id, { db: ctx.db, env: ctx.env });
+}
+const stockCheckMailSync = (ctx: ProbeReaderContext): SurfaceObservation => {
+  const on = stockCheckDecision(ctx);
+  const d = recipientDecision(ctx);
+  const flag = flagOn(ctx.env, "STOCK_CHECK_EMAIL_ENABLED") ? "" : " (STOCK_CHECK_EMAIL_ENABLED er av: ingen e-post sendes i dette miljøet)";
+  return { endpoints: { stock_check_email: on && d.eligible }, detail: `lagerpåminnelse ${on ? d.detail : "sendes ikke (valget er av)"}${flag}` };
+};
+const stockCheckJobSync = (ctx: ProbeReaderContext): SurfaceObservation => {
+  const on = stockCheckDecision(ctx);
+  return { endpoints: { stock_check_job: on }, detail: `jobben ${on ? "tar med produsenten" : "hopper over produsenten"}` };
+};
+const stockCheckPortalSync = (ctx: ProbeReaderContext): SurfaceObservation => {
+  const on = stockCheckDecision(ctx);
+  const flag = flagOn(ctx.env, "OWNER_ORDERABILITY_PORTAL_ENABLED") ? "" : " (OWNER_ORDERABILITY_PORTAL_ENABLED er av: kortet vises ikke i dette miljøet)";
+  return { endpoints: { stock_check_banner: on }, detail: `banneret ${on ? "kan vises" : "vises ikke"}${flag}` };
+};
+
 const syncReader = (fn: (ctx: ProbeReaderContext) => SurfaceObservation, observe: string): SurfaceReaderDef => ({ read: fn, sync: fn, observe });
 
 const VISIBILITY_SURFACES = ["profile_html", "json_ld", "listing_html", "mcp_search", "mcp_info", "rest_card", "vcard", "acp_feed", "sitemap", "llms", "a2a", "leaderboard"];
@@ -970,6 +1000,9 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
     "auto.guarantee × job:rfb_enrichment_nightly": { read: enrichmentNightlyReader, observe: "loadRfbEnrichmentCohort(): testprodusenten velges aldri" },
     "auto.guarantee × job:knowledge_write": syncReader(knowledgeWriteSync, "upsertKnowledge() ikke-eier på eierlåst felt (rulles tilbake): owner_locked, verdi beholdt"),
     "comms.unsubscribe × email:outreach": syncReader(outreachSync, "unsubscribeHeaderValues(): kald e-post får List-Unsubscribe"),
+    "products.stock_check × email:stock_check": syncReader(stockCheckMailSync, "stockCheckOn() + resolveOrderNotificationRecipient(): lagerpåminnelse sendes / sendes ikke"),
+    "products.stock_check × job:stock_check": syncReader(stockCheckJobSync, "stockCheckOn(): jobben tar med / hopper over produsenten"),
+    "products.stock_check × owner_portal": syncReader(stockCheckPortalSync, "stockCheckOn(): banneret i eierportalen kan vises / vises ikke"),
   };
   for (const s of VISIBILITY_SURFACES) {
     out[caseId("visibility.profile", s)] = {

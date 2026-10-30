@@ -104,6 +104,7 @@ import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
 import avmeldRoutes from "./routes/avmeld";
+import stockCheckRoutes from "./routes/stock-check";
 import gardssalgClaimRoutes, { GARDSSALG_CLAIM_PATH_PREFIXES, gardssalgClaimHostGate } from "./routes/gardssalg-claim";
 import resendWebhookRoutes from "./routes/resend-webhook";
 import { createAgentplatformHostGate } from "./routes/agentplatform-site";
@@ -553,6 +554,10 @@ app.use("/", ownerFeaturesRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
+// B2 (rfb-bestillinger): /lagerstatus/:token — the stock-check reminder's
+// confirm link (GET shows, POST confirms). 404 while STOCK_CHECK_EMAIL_ENABLED
+// is off. See routes/stock-check.ts.
+app.use("/", stockCheckRoutes);
 // Fase B1: the buyer's order card (/ordre/:id?ref=<buyer_ref>), linked from the buyer receipts.
 app.use("/", buyerOrderCardRoutes);
 // dev-request 2026-10-21 live-go handlevogn-pilot, skive 2: one-time activation
@@ -2554,6 +2559,26 @@ if (process.env.RFB_DISABLE_ORDER_FOLLOWUPS !== "1") {
   });
   setTimeout(() => { void orderCapNoticeTick(); }, 6 * 60_000);
   setInterval(orderCapNoticeTick, 60 * 60_000);
+
+  // B2 (dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier):
+  // the stock-check reminder (owner feature products.stock_check) — at most
+  // one e-mail per producer per 14 days when an orderable producer-stated
+  // item expires within 3 days, 07–21 Oslo time. A no-op while
+  // STOCK_CHECK_EMAIL_ENABLED is off (default). The send is reserved in
+  // stock_check_notices before it is made (services/stock-check-reminder.ts).
+  const stockCheckTick = trackJob("stock-check", async () => {
+    try {
+      const { processStockCheckReminders } = await import("./services/stock-check-reminder");
+      const r = await processStockCheckReminders();
+      if (r.sent || r.skipped || r.failed) {
+        console.log(`[stock-check] tick candidates=${r.candidates} sent=${r.sent} skipped=${r.skipped} failed=${r.failed} held=${r.held} off=${r.feature_off}`);
+      }
+    } catch (err) {
+      console.error("[stock-check] tick failed:", err);
+    }
+  });
+  setTimeout(() => { void stockCheckTick(); }, 7 * 60_000);
+  setInterval(stockCheckTick, 60 * 60_000);
 }
 
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───

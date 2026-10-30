@@ -37238,6 +37238,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("order-cap-notice-b4: unexpected error: " + String(err?.message || err));
   }
+  // B2 (lagerpåminnelse, products.stock_check, dev-request 2026-10-28-rfb-bestillinger-fra-start-til-slutt-for-eier) — own in-memory DB.
+  try {
+    const { runStockCheckReminderB2Tests } = require("../src/routes/stock-check-reminder-b2.test") as
+      typeof import("../src/routes/stock-check-reminder-b2.test");
+    const b2 = await runStockCheckReminderB2Tests({ log: false });
+    passed += b2.passed;
+    failed += b2.failed;
+    for (const f of b2.failures) failures.push("stock-check-reminder-b2: " + f);
+    console.log(`  stock-check-reminder-b2: ${b2.passed} passed, ${b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("stock-check-reminder-b2: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
@@ -49662,6 +49675,19 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("avmeld-fixup: unexpected error: " + String(err?.message || err));
+  }
+  // avmeld token format (fixed vectors) + separation from the B2 stock-check link.
+  try {
+    const { runAvmeldTokenVectorTests } = require("../src/services/avmeld-token-vector.test") as
+      typeof import("../src/services/avmeld-token-vector.test");
+    const tv = await runAvmeldTokenVectorTests({ log: false });
+    passed += tv.passed;
+    failed += tv.failed;
+    for (const f of tv.failures) failures.push("avmeld-token-vector: " + f);
+    console.log(`  avmeld-token-vector: ${tv.passed} passed, ${tv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("avmeld-token-vector: unexpected error: " + String(err?.message || err));
   }
 });
 
