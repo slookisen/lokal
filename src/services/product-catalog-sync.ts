@@ -43,6 +43,17 @@
 // unit, so a unit cannot change here.) None of this touches availability or
 // availability_source — the orderability gate's only source input — so an
 // owner_import product is no more orderable than before.
+//
+// B1b-2 (dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel):
+// the skive-4 protection is widened to every row the owner controls, but only
+// against SCRAPED input: a row with availability_source 'producer_dashboard'
+// (owner confirmed stock in the portal) or source 'owner' (added via B1 «Legg
+// til vare») keeps its price_nok and category (and provenance) when the
+// incoming product is scraped (source not owner_manual/owner_import/
+// owner_auto_sync). An owner-supplied incoming price updates price, category and
+// provenance together as before. admin_producer_confirmed rows are protected
+// against any incoming source. One predicate (keepOwnerPrice) drives price,
+// category, provenance and updated_at. Availability stays untouched.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
@@ -145,11 +156,29 @@ export function runProductCatalogSync(db?: any): ProductCatalogSyncResult {
 
   // Every SET expression reads the row as it was, so updated_at compares the
   // new price/category (same expressions) with the stored ones.
-  const newPrice = `CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.price_nok
+  // B1b-2: a SCRAPED product (incoming source not an owner source) never takes
+  // price_nok or category from a row the owner controls. 'producer_dashboard' =
+  // the owner confirmed stock in the owner portal; source 'owner' = the owner
+  // added the product via B1 «Legg til vare». 'admin_producer_confirmed' is
+  // protected regardless of where the incoming price comes from. A price the
+  // owner supplied themselves (owner_manual / owner_import / owner_auto_sync) is
+  // the owner's only route to change price_nok, so it updates as before.
+  const ownerSourceList = OWNER_PRODUCT_SOURCES.map((s) => `'${s}'`).join(", ");
+  const scrapedIncoming = `(excluded.source IS NULL OR excluded.source NOT IN (${ownerSourceList}))`;
+  const keepOwnerPrice = `(products.availability_source = 'admin_producer_confirmed'
+                        OR (${scrapedIncoming}
+                            AND (products.availability_source = 'producer_dashboard' OR products.source = 'owner')))`;
+  const newPrice = `CASE WHEN ${keepOwnerPrice} THEN products.price_nok
                         WHEN excluded.price_nok IS NOT NULL THEN excluded.price_nok ELSE products.price_nok END`;
-  const newCategory = `CASE WHEN products.availability_source = 'admin_producer_confirmed' THEN products.category
+  const newCategory = `CASE WHEN ${keepOwnerPrice} THEN products.category
                         WHEN excluded.category  IS NOT NULL THEN excluded.category  ELSE products.category  END`;
-  const keepProvenance = `products.availability_source = 'admin_producer_confirmed'
+  // Provenance follows the price: it is kept whenever the price was kept (so a
+  // blocked scrape never stamps 'enrichment' / a scrape URL on an owner's price),
+  // and, as before, for admin_producer_confirmed rows and rows another writer
+  // created ('owner', 'admin' - not in PRODUCT_SOURCES). An owner-sourced update
+  // of a producer_dashboard row stamps provenance together with its price
+  // (test produktimport-s2).
+  const keepProvenance = `${keepOwnerPrice}
                         OR products.source NOT IN (${PRODUCT_SOURCES.map((s) => `'${s}'`).join(", ")})`;
   const provenance = (col: string) =>
     `${col} = CASE WHEN ${keepProvenance} THEN products.${col} ELSE excluded.${col} END`;
