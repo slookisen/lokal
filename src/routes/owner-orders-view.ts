@@ -15,6 +15,7 @@ import { cancelActionsEnabled } from "../services/order-actions";
 import { formatPickupTimeOslo, noShowEarliestMs, isOrderAutocompleteEnabled } from "../services/order-lifecycle";
 import { PRICE_BY_AGREEMENT } from "../services/order-pricing";
 import { randomUUID } from "crypto";
+import { soldOutChoices, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { isOrderMessagesEnabled, listOrderMessages, orderTakesMessages, ORDER_MESSAGE_MAX_CHARS, type OrderMessageRow } from "../services/order-messages";
 
 export type OwnerOrdersTab = "venter" | "kommende" | "avsluttet";
@@ -221,11 +222,29 @@ function actionForm(ctx: RowContext, action: keyof typeof ACTION_LABEL, cls: str
   return `<form method="post" action="${esc(ctx.postTo)}" class="mo-form"><input type="hidden" name="action" value="${action}"><input type="hidden" name="idem" value="${randomUUID()}">${extra}<button type="submit" class="mo-btn ${cls}">${ACTION_LABEL[action]}</button></form>`;
 }
 
+/**
+ * B2b-1 «Utsolgt»: a second decline button that also sets the ticked items
+ * (all ticked by default) to out of stock. Only while the soft-expiry rule is
+ * active for the producer, and only when the order has products of it; ""
+ * otherwise, so the page is unchanged with the rule off.
+ */
+function soldOutDeclineForm(o: OwnerOrder, ctx: RowContext): string {
+  if (!stockSoftExpiryActiveFor(o.agent_id)) return "";
+  const choices = soldOutChoices(cartServiceDb(), o.id, o.agent_id);
+  if (!choices.length) return "";
+  const boxes = choices.map((c) =>
+    `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${esc(c.product_id)}" checked> ${esc(c.name)}</label>`,
+  ).join("");
+  return `<form method="post" action="${esc(ctx.postTo)}" class="mo-form" data-sold-out-form="1"><input type="hidden" name="action" value="decline_sold_out"><input type="hidden" name="idem" value="${randomUUID()}">` +
+    `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:0 0 6px;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>${boxes}</fieldset>` +
+    `<button type="submit" class="mo-btn mo-secondary">Avslå – utsolgt</button></form>`;
+}
+
 function actionsHtml(o: OwnerOrder, ctx: RowContext): string {
   const now = ctx.now ?? new Date();
   if (o.status === "pending") {
     const pickup = `<label class="mo-pick">Hentetid (valgfritt)<input type="datetime-local" name="pickup_time" min="${nowOsloLocalMin(now)}"></label>`;
-    return `<div class="mo-actions">${actionForm(ctx, "confirm", "mo-primary", pickup)}${actionForm(ctx, "decline", "mo-secondary")}</div>`;
+    return `<div class="mo-actions">${actionForm(ctx, "confirm", "mo-primary", pickup)}${actionForm(ctx, "decline", "mo-secondary")}${soldOutDeclineForm(o, ctx)}</div>`;
   }
   if (o.status === "confirmed" || o.status === "ready") {
     const confirmedAt = o.timeline.find((e) => e.to_status === "confirmed")?.created_at ?? null;

@@ -44,7 +44,9 @@ import {
   addCartWish,
   chooseCartWishOffer,
   deleteCartWish,
+  cartServiceDb,
 } from "../services/cart-service";
+import { soldOutChoices, soldOutIdsFromBody, stockSoftExpiryActiveFor } from "../services/stock-soft-expiry";
 import { cartWishesLimiter } from "../middleware/security";
 import {
   submitCartWithPayments,
@@ -729,13 +731,23 @@ producerOrderRouter.get("/:token", (req: Request, res: Response) => {
   const confirmedAtForNoShow = order.timeline.find((e) => e.to_status === "confirmed")?.created_at ?? null;
   const noShowFrom = noShowEarliestMs({ pickup_time: order.pickup_time, confirmed_at: confirmedAtForNoShow });
   const noShowLocked = noShowFrom !== null && Date.now() < noShowFrom;
+  // B2b-1 «Utsolgt»: a second decline button that also sets the ticked items
+  // (all by default) to out of stock — only while the soft-expiry rule is
+  // active for the producer; "" otherwise (page unchanged).
+  const soldOut = order.status === "pending" && stockSoftExpiryActiveFor(order.agent_id) ? soldOutChoices(cartServiceDb(), order.order_id, order.agent_id) : [];
+  const soldOutHtml = soldOut.length
+    ? `\n    <form method="POST" action="${postTo}" data-sold-out-form="1"><input type="hidden" name="action" value="decline_sold_out">${idemField()}` +
+      `<fieldset style="border:1px solid #e4e2da;border-radius:8px;margin:12px 0 0;padding:6px 10px"><legend style="font-size:.9rem">Utsolgt (settes til «ikke på lager»):</legend>` +
+      soldOut.map((c) => `<label style="display:block;padding:4px 0"><input type="checkbox" name="sold_out" value="${escapePageHtml(c.product_id)}" checked> ${escapePageHtml(c.name)}</label>`).join("") +
+      `</fieldset><button type="submit" class="act-btn act-secondary">Avslå – utsolgt</button></form>`
+    : "";
   const actionsHtml = (ACTIONS_FOR_STATUS[order.status] || [])
     .filter((a) => !(a.action === "no_show" && noShowLocked))
     .map(
       (a) =>
         `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}">${idemField()}${a.action === "confirm" ? pickupField : ""}<button type="submit" class="act-btn ${a.cls}">${a.label}</button></form>`
     )
-    .join("\n    ") + (cancelActions.length
+    .join("\n    ") + soldOutHtml + (cancelActions.length
       ? `\n    <details class="cancel-box"><summary>Kanseller ordren …</summary>\n      <p class="hint">${escapePageHtml(cancelHint(paymentRow))}</p>\n      ${cancelActions
           .map((a) => `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}">${idemField()}<button type="submit" class="act-btn act-secondary">${a.label}</button></form>`)
           .join("\n      ")}\n    </details>`
@@ -854,7 +866,9 @@ producerOrderRouter.post(
     const backTo = `/produsent/ordre/${encodeURIComponent(token)}`;
     const body = (req.body || {}) as Record<string, unknown>;
     const action = String(body["action"] || "");
-    const mapped = PRODUCER_ACTIONS[action];
+    // B2b-1 «Utsolgt»: decline + sold-out write, only while the soft-expiry rule is active (else unknown, as before).
+    const soldOutPost = action === "decline_sold_out" && stockSoftExpiryActiveFor(order.agent_id);
+    const mapped: OrderAction | undefined = soldOutPost ? "decline" : PRODUCER_ACTIONS[action];
     if (!mapped || (action.startsWith("cancel_") && !cancelActionsEnabled(order.payment_mode))) {
       res.redirect(303, `${backTo}?error=ugyldig`);
       return;
@@ -871,6 +885,7 @@ producerOrderRouter.post(
         payments: paymentsClientFor(req),
         idempotencyKey: idem,
         pickupTime: mapped === "confirm" && typeof body["pickup_time"] === "string" ? (body["pickup_time"] as string) : null,
+        ...(soldOutPost ? { soldOut: { productIds: soldOutIdsFromBody(body["sold_out"]) } } : {}),
       },
     );
     if (!result.success) {

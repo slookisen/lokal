@@ -53,6 +53,7 @@ import {
 } from "./cart-service";
 import { isPaymentsLifecycleActive, onOrderTransitioned, type OrderPaymentEffect } from "./payment-service";
 import type { PaymentsStripeClient } from "./payment-provider";
+import { markOrderItemsSoldOut, refreshStockConfirmationForOrder, stockSoftExpiryActiveFor } from "./stock-soft-expiry";
 import { sendBuyerOrderReceipt, type ReceiptEvent } from "./order-receipt-service";
 import { sendAdminOrderAlert, sendProducerBuyerCancelNotice } from "./order-notify-service";
 import {
@@ -90,6 +91,12 @@ export interface OrderActionOptions {
   pickupTime?: string | null;
   /** Free-text reason for logs; the stored cancel_reason comes from the action. */
   reason?: string | null;
+  /**
+   * B2b-1 «Utsolgt», decline by the seller only: the order's products to set
+   * 'out_of_stock' (null/empty = all of them). Ignored unless the soft-expiry
+   * rule is active for the producer (stock-soft-expiry.ts).
+   */
+  soldOut?: { productIds?: readonly string[] | null } | null;
   /** The payment step's Stripe client; null/absent = no payment step (payments off, system jobs). */
   payments?: PaymentsStripeClient | null;
   /** Injectable clock and env (tests). */
@@ -315,6 +322,19 @@ export async function applyOrderAction(
     `[order-actions] order=${orderId} action=${action} role=${actor.role} channel=${actor.channel}` +
     `${actor.ref ? ` ref=${actor.ref}` : ""} ${order.status}→${spec.to}`,
   );
+
+  // B2b-1 (soft stock expiry): the producer's confirmation of the order
+  // confirms the stock of its producer_dashboard items; «Utsolgt» on a decline
+  // sets the chosen items to out of stock. Only with the rule active for the
+  // producer; never fails the action.
+  if (actor.role === "seller" && (action === "confirm" || (action === "decline" && opts.soldOut)) && stockSoftExpiryActiveFor(order.agent_id, env)) {
+    try {
+      if (action === "confirm") refreshStockConfirmationForOrder(db, orderId, order.agent_id, now);
+      else markOrderItemsSoldOut(db, orderId, order.agent_id, opts.soldOut?.productIds ?? null, now);
+    } catch (err) {
+      console.error(`[order-actions] B2b-1 stock write failed order=${orderId} action=${action}:`, err instanceof Error ? err.message : "error");
+    }
+  }
 
   // Payment step (unchanged rules). The automatic close moves no money.
   let payment_effect: OrderPaymentEffect = "none";
