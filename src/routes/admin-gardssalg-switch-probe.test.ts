@@ -79,6 +79,8 @@ export function runAdminGardssalgSwitchProbeTests(opts: { log?: boolean } = {}):
       require.resolve("../services/experience-store"),
       require.resolve("../services/booking-store"),
       require.resolve("../services/blocklist-service"),
+      require.resolve("../services/gardssalg-booking-resolve"),
+      require.resolve("../services/route-corridor-service"),
       require.resolve("./opplevelser"),
       require.resolve("./experiences-mcp"),
       require.resolve("./experiences-a2a"),
