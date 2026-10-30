@@ -12,6 +12,14 @@
 // a small worker pool, per-host pacing and ONE shared LLM-call cap for the
 // whole run (≤ PRODUCT_IMPORT_DRYRUN_LLM_CAP_MAX), so it can never eat the
 // nightly enrichment's budget.
+//
+// Round 2 (measurement 2026-10-30 was cut twice by a deploy): the run keeps
+// its profile list (product_import_runs.sample_json), and on boot
+// resumeProductImportDryRunOnBoot() continues a run left `running` /
+// `interrupted` with the profiles that have no result row yet — one row per
+// (run_id, agent_id) by the table's PRIMARY KEY, written INSERT OR IGNORE, so
+// a resumed run never duplicates a profile. Same flag; off at boot = no
+// resume. The LLM cap stays the run's: the calls already reserved count.
 
 import { randomUUID } from "crypto";
 import { getDb } from "../../database/init";
@@ -30,6 +38,10 @@ export const PRODUCT_IMPORT_DRYRUN_MAX_SAMPLE = 200;
 export const PRODUCT_IMPORT_DRYRUN_LLM_CAP_MAX = 150;
 export const PRODUCT_IMPORT_DRYRUN_HOST_INTERVAL_MS = 1500;
 export const PRODUCT_IMPORT_DRYRUN_CONCURRENCY = 3;
+/** A run is resumed on boot at most this many times (a crash loop must not spin forever). */
+export const PRODUCT_IMPORT_DRYRUN_MAX_RESUMES = 5;
+/** Only runs started within this many hours are resumed; an older one stays interrupted. */
+export const PRODUCT_IMPORT_DRYRUN_RESUME_MAX_AGE_HOURS = 24;
 
 /** Flag: "1" turns the dry-run endpoints on. Anything else = off (404). */
 export function productImportDryRunEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -160,6 +172,8 @@ export function summarizeDryRun(rows: DryRunResultRow[]) {
     share_with_priced_product: share(count(priced), rows.length),
     products_total: allProducts.length,
     products_priced: allProducts.filter((p) => p.price_nok !== null).length,
+    // Round 2: prices marked «ekskl. mva.» (not consumer prices; flagged, kept).
+    products_price_excl_vat: allProducts.filter((p) => p.price_excl_vat === true).length,
     // Audit of the candidate rules (./rules.ts): how often each fired, and
     // what was excluded and why. Older stored results have neither field.
     rule_counts: (() => {
@@ -221,6 +235,14 @@ export function activeDryRunId(): string | null {
   return null;
 }
 
+/**
+ * Test-only: forget every in-process job, as a fresh process after a
+ * restart would (the old job's promise is simply no longer tracked).
+ */
+export function __forgetDryRunJobsForTesting(): void {
+  jobs.clear();
+}
+
 /** Test-only: resolves when the background job for `runId` has finished. */
 export function __awaitDryRunForTesting(runId: string): Promise<void> {
   return jobs.get(runId) ?? Promise.resolve();
@@ -238,8 +260,8 @@ export function startProductImportDryRun(params: DryRunParams, deps: DryRunDeps 
   const runId = `pir-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}-${randomUUID().slice(0, 8)}`;
   const llmCap = clampLlmCap(params.llmCallCap);
   db.prepare(
-    `INSERT INTO product_import_runs (id, mode, status, params_json, profiles_total, llm_call_cap)
-     VALUES (?, 'dry_run', 'running', ?, ?, ?)`,
+    `INSERT INTO product_import_runs (id, mode, status, params_json, profiles_total, llm_call_cap, sample_json)
+     VALUES (?, 'dry_run', 'running', ?, ?, ?, ?)`,
   ).run(
     runId,
     JSON.stringify({
@@ -249,20 +271,136 @@ export function startProductImportDryRun(params: DryRunParams, deps: DryRunDeps 
     }),
     sample.length,
     llmCap,
+    JSON.stringify(sample.map((r) => r.agent_id)),
   );
 
-  const job = runJob(runId, sample, llmCap, deps).finally(() => jobs.delete(runId));
-  jobs.set(runId, job);
+  launchJob(runId, sample, llmCap, deps, { llmUsed: 0, resumed: 0 });
   return { run_id: runId, profiles_total: sample.length, llm_call_cap: llmCap };
 }
 
-async function runJob(runId: string, sample: DryRunSampleRow[], llmCap: number, deps: DryRunDeps): Promise<void> {
+function launchJob(
+  runId: string,
+  sample: DryRunSampleRow[],
+  llmCap: number,
+  deps: DryRunDeps,
+  from: { llmUsed: number; resumed: number },
+): void {
+  const job = runJob(runId, sample, llmCap, deps, from).finally(() => jobs.delete(runId));
+  jobs.set(runId, job);
+}
+
+export interface ResumedDryRun {
+  run_id: string;
+  profiles_total: number;
+  profiles_done: number;
+  profiles_remaining: number;
+  resume_count: number;
+}
+
+/**
+ * Boot hook: continue the newest dry run that a restart/deploy left
+ * `running` or `interrupted` (started ≤ 24 h ago, with a stored profile
+ * list), with the profiles that have no result row yet. Returns what was
+ * resumed, or null (flag off, a run already active here, nothing to
+ * resume). Never throws.
+ */
+export function resumeProductImportDryRunOnBoot(deps: DryRunDeps = testDeps ?? {}): ResumedDryRun | null {
+  try {
+    if (!productImportDryRunEnabled()) return null;
+    if (activeDryRunId()) return null;
+    const db = getDb();
+    const run = db
+      .prepare(
+        `SELECT id, llm_call_cap, llm_calls, profiles_total, sample_json, resume_count, status
+           FROM product_import_runs
+          WHERE mode = 'dry_run' AND status IN ('running', 'interrupted')
+            AND sample_json IS NOT NULL
+            AND created_at >= datetime('now', ?)
+          ORDER BY created_at DESC, id DESC LIMIT 1`,
+      )
+      .get(`-${PRODUCT_IMPORT_DRYRUN_RESUME_MAX_AGE_HOURS} hours`) as
+      | { id: string; llm_call_cap: number; llm_calls: number; profiles_total: number; sample_json: string; resume_count: number; status: string }
+      | undefined;
+    if (!run) return null;
+    if (run.resume_count >= PRODUCT_IMPORT_DRYRUN_MAX_RESUMES) {
+      db.prepare(
+        `UPDATE product_import_runs
+            SET status = 'interrupted', error = 'resume limit reached', finished_at = COALESCE(finished_at, datetime('now'))
+          WHERE id = ?`,
+      ).run(run.id);
+      return null;
+    }
+    let ids: string[] = [];
+    try {
+      const parsed = JSON.parse(run.sample_json);
+      if (Array.isArray(parsed)) ids = parsed.map(String);
+    } catch {
+      /* unreadable list → nothing to resume with */
+    }
+    const done = new Set(
+      (db.prepare(`SELECT agent_id FROM product_import_run_results WHERE run_id = ?`).all(run.id) as Array<{ agent_id: string }>).map(
+        (r) => r.agent_id,
+      ),
+    );
+    const remainingIds = ids.filter((id) => !done.has(id));
+    // Same filters as the original selection, in the original order.
+    const byId = new Map(
+      (remainingIds.length > 0 ? selectDryRunSample({ agentIds: remainingIds }) : []).map((r) => [r.agent_id, r]),
+    );
+    const remaining = remainingIds.map((id) => byId.get(id)).filter((r): r is DryRunSampleRow => r !== undefined);
+    const resumeCount = run.resume_count + 1;
+    db.prepare(
+      `UPDATE product_import_runs
+          SET status = 'running', resume_count = ?, error = NULL, finished_at = NULL
+        WHERE id = ?`,
+    ).run(resumeCount, run.id);
+    launchJob(run.id, remaining, run.llm_call_cap, deps, { llmUsed: run.llm_calls, resumed: resumeCount });
+    return {
+      run_id: run.id,
+      profiles_total: run.profiles_total,
+      profiles_done: done.size,
+      profiles_remaining: remaining.length,
+      resume_count: resumeCount,
+    };
+  } catch (err) {
+    console.error("[product-import] dry-run resume failed:", err);
+    return null;
+  }
+}
+
+function storedResultRows(runId: string): DryRunResultRow[] {
+  return (
+    getDb()
+      .prepare(
+        `SELECT agent_id, agent_name, website, is_owned, result_json
+           FROM product_import_run_results WHERE run_id = ? ORDER BY agent_id`,
+      )
+      .all(runId) as Array<{ agent_id: string; agent_name: string; website: string; is_owned: number; result_json: string }>
+  ).map((r) => ({
+    agent_id: r.agent_id,
+    agent_name: r.agent_name,
+    website: r.website,
+    is_owned: r.is_owned,
+    result: JSON.parse(r.result_json || "{}") as ProductImportResult,
+  }));
+}
+
+async function runJob(
+  runId: string,
+  sample: DryRunSampleRow[],
+  llmCap: number,
+  deps: DryRunDeps,
+  from: { llmUsed: number; resumed: number },
+): Promise<void> {
   const db = getDb();
-  const budget: LlmBudget = { cap: llmCap, used: 0 };
+  const budget: LlmBudget = { cap: llmCap, used: Math.min(llmCap, Math.max(0, from.llmUsed)) };
   const pacer = new HostPacer(deps.hostIntervalMs ?? PRODUCT_IMPORT_DRYRUN_HOST_INTERVAL_MS, deps.now, deps.sleep);
-  const rows: DryRunResultRow[] = [];
+  const countDone = db.prepare(`SELECT COUNT(*) AS n FROM product_import_run_results WHERE run_id = ?`);
+  const doneCount = () => (countDone.get(runId) as { n: number }).n;
+  // One row per (run_id, agent_id) — the table's PRIMARY KEY; a profile that
+  // already has a row (a resumed run) is never written twice.
   const insert = db.prepare(
-    `INSERT OR REPLACE INTO product_import_run_results
+    `INSERT OR IGNORE INTO product_import_run_results
        (run_id, agent_id, agent_name, website, is_owned, outcome, tier, product_count, priced_count,
         llm_calls, duration_ms, result_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -284,7 +422,6 @@ async function runJob(runId: string, sample: DryRunSampleRow[], llmCap: number, 
             llmBudget: budget,
             pacer,
           });
-          rows.push({ ...row, result });
           insert.run(
             runId,
             row.agent_id,
@@ -299,13 +436,21 @@ async function runJob(runId: string, sample: DryRunSampleRow[], llmCap: number, 
             result.duration_ms,
             JSON.stringify(result),
           );
-          progress.run(rows.length, budget.used, runId);
+          progress.run(doneCount(), budget.used, runId);
         }
       };
       const n = Math.max(1, Math.min(deps.concurrency ?? PRODUCT_IMPORT_DRYRUN_CONCURRENCY, sample.length || 1));
       await Promise.all(Array.from({ length: n }, worker));
     });
-    const summary = { ...summarizeDryRun(rows), llm_call_cap: llmCap, llm_calls_metered: meter.calls };
+    // The summary covers every stored row, also those from before a resume.
+    const rows = storedResultRows(runId);
+    const summary = {
+      ...summarizeDryRun(rows),
+      llm_call_cap: llmCap,
+      // Metered in this process only: before a resume, see llm_calls.
+      llm_calls_metered: meter.calls,
+      resume_count: from.resumed,
+    };
     db.prepare(
       `UPDATE product_import_runs
           SET status = 'completed', profiles_done = ?, llm_calls = ?, summary_json = ?, finished_at = datetime('now')
@@ -374,6 +519,7 @@ export function getDryRun(runId: string, opts: { includeCandidates?: boolean } =
     created_at: run.created_at,
     finished_at: run.finished_at,
     error: run.error,
+    resume_count: run.resume_count ?? 0,
     summary: run.summary_json ? JSON.parse(run.summary_json) : null,
     results,
   };

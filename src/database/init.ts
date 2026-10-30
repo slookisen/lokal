@@ -6274,9 +6274,20 @@ function initSchema(db: Database.Database): void {
         summary_json TEXT,
         error TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        finished_at TEXT
+        finished_at TEXT,
+        sample_json TEXT,
+        resume_count INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // Round 2 (resume after a deploy): the run's profile list in processing
+    // order, and how often it was resumed on boot. Additive, idempotent.
+    const pirCols = db.prepare(`PRAGMA table_info(product_import_runs)`).all() as Array<{ name: string }>;
+    if (!pirCols.some((c) => c.name === "sample_json")) {
+      db.exec(`ALTER TABLE product_import_runs ADD COLUMN sample_json TEXT`);
+    }
+    if (!pirCols.some((c) => c.name === "resume_count")) {
+      db.exec(`ALTER TABLE product_import_runs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0`);
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS product_import_run_results (
         run_id TEXT NOT NULL,

@@ -259,3 +259,23 @@ export function isComingSoonPlaceholder(text: string | null | undefined): boolea
   if (!text) return false;
   return /(^|[^a-zæøå])kommer([^a-zæøå]|$)|coming soon|\bsnart tilgjengelig\b|\bpris ikke satt\b/i.test(text);
 }
+
+// ─── Accuracy fixes, round 2 (prod measurement 2026-10-30, 91.2 %) ──────────
+// reports/2026-10-30-produktimport-maaling-2.md (A2A): a price marked
+// «ekskl. mva.» (Bjerke Spekemat) is not a consumer price.
+
+const EXCL_VAT_RE =
+  /(?<![a-zæøå])(?:ekskl|eksl|exkl|ekskludert|excl|excluding|ex|eks)\.?\s*(?:mva|moms|vat)(?![a-zæøå])|\+\s*mva(?![a-zæøå])|(?<![a-zæøå])uten\s+(?:mva|moms)(?![a-zæøå])/i;
+
+/** True when a price text says the price is EXCLUDING VAT («ekskl. mva.», «eks. mva», «+ mva», «excl. VAT»). PURE. */
+export function statesExclVat(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return EXCL_VAT_RE.test(text.replace(/\s+/g, " "));
+}
+
+/** A page-wide statement that its prices exclude VAT («Alle priser er ekskl. mva.»). PURE. */
+export function statesPagePricesExclVat(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const m = text.replace(/\s+/g, " ").match(/(?<![a-zæøå])pris(?:er|ene|ane)(?![a-zæøå]).{0,40}/gi);
+  return (m ?? []).some((s) => statesExclVat(s));
+}

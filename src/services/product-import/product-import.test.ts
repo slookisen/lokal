@@ -14,6 +14,12 @@
  *        rejected by fetchPage()'s SSRF guard before any request.
  *   + normalisation cases, robots parsing, js_unreadable, fetch failures,
  *     LLM budget cap, stratified sample.
+ *   Round 2 (measurement 2026-10-30, «Rettinger i uthenteren, runde 2»):
+ *   R2-1 price at the right name (ovrejorde.no: price above the name, «Bog»
+ *        = 269 not 150); R2-2 «X eller Y … kr N» only for X and Y (not
+ *        «Byhonning»); R2-3 a blog post is no price source; R2-4 «ekskl.
+ *        mva.» → price_excl_vat; R2-5 a run cut by a restart resumes and
+ *        completes with no duplicate rows.
  *
  * No network: every request goes to an injected fake fetch; the LLM is an
  * injected function. The DB is a pinned in-memory instance (restored in
@@ -602,6 +608,257 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
     );
     assertTrue(llmMod.buildProductImportPrompt("x").includes("pakkestørrelsen"), "prompt: pack-weight rule stated");
 
+    // ── Round 2 (prod measurement 2026-10-30, 91.2 %) ─────────────────────
+    // A2A reports/2026-10-30-produktimport-maaling-2.md: the three wrong hits
+    // and the «ekskl. mva.» prices. Fixtures copy the real pages' layout.
+    const assoc = require("./association") as typeof import("./association");
+
+    // R2-1 Price at the right name — ovrejorde.no/nettbutikk: each product is
+    // a column with the price button ABOVE the name (markup as on the page).
+    const ovreCol = (price: string, name: string) =>
+      `<div class="Preview_column__1KeVx col isExpandable" style="min-height:214px;width:157px;float:left">` +
+      `<div class="Preview_float__1PmYU float" style="top:164px;left:27px;z-index:1015"><div data-kind="BUTTON" style="width:130px;height:50px" class="Preview_componentWrapper__2i4QI"><div data-in-template="false" data-kind="Component" data-specific-kind="BUTTON" class="Preview_component__SbiKo align-center"><div class="ButtonPreview_container__22hQi ButtonPreview_buttonTransition__CKIAx button1"><div class="ButtonPreview_buttonComponent__17NP0"><a class="ButtonPreview_textContainer__t8q7_" data-testid="button"><span>${price}</span></a></div></div></div></div></div>` +
+      `<div data-kind="BUTTON" style="width:130px;height:119px;margin-top:95px;margin-left:27px;z-index:1017" class="Preview_componentWrapper__2i4QI"><div data-in-template="false" data-kind="Component" data-specific-kind="BUTTON" class="Preview_component__SbiKo align-center"><div class="ButtonPreview_container__22hQi ButtonPreview_buttonTransition__CKIAx button1"><div class="ButtonPreview_buttonComponent__17NP0"><a class="ButtonPreview_textContainer__t8q7_" data-testid="button"><span>${name}</span></a></div></div></div></div>` +
+      `<div style="clear:both"></div></div>`;
+    const ovreRow = (...cols: string[]) => `<div class="Preview_row__3Fkye row" style="min-height:158px;width:946px">${cols.join("")}<div style="clear:both"></div></div>`;
+    const ovrePage = HTML(
+      "<h1>Nettbutikk</h1><p>Kjøtt fra egne geiter. Bestill på e-post, hentes på gården.</p>" +
+        ovreRow(ovreCol("269,- kr/kg", "Sadel"), ovreCol("269,- kr/kg", "Bog")) +
+        ovreRow(ovreCol("150,- kr/kg", "Kje Kjøttdeig "), ovreCol("299,- kr/kg", "Lår")),
+    );
+    const ovreRoutes = (host: string) => ({
+      [`https://${host}/robots.txt`]: ROBOTS_OPEN,
+      [`https://${host}/`]: { body: HTML('<a href="/nettbutikk">Nettbutikk</a><p>Øvrejorde Geitegård — geitekjøtt fra Hardanger.</p>') },
+      [`https://${host}/nettbutikk`]: { body: ovrePage },
+    });
+    for (const [label, bogPrice] of [["the model's wrong 150", "150,- kr/kg"], ["the model's right 269", "269,- kr/kg"]] as const) {
+      robots.__clearRobotsCacheForTesting();
+      const f = makeFetch(ovreRoutes("ovrejorde.no"));
+      const r = await ex.extractProductsFromWebsite("https://ovrejorde.no", {
+        fetchImpl: f.impl,
+        llm: async () => ({
+          text: JSON.stringify([
+            { name: "Sadel", price: "269,- kr/kg", unit: "kg" },
+            { name: "Bog", price: bogPrice, unit: "kg" },
+            { name: "Kje Kjøttdeig", price: "150,- kr/kg", unit: "kg" },
+            { name: "Lår", price: "299,- kr/kg", unit: "kg" },
+          ]),
+        }),
+      });
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.unit, x.source_url]),
+        [
+          ["Sadel", 269, "kg", "https://ovrejorde.no/nettbutikk"],
+          ["Bog", 269, "kg", "https://ovrejorde.no/nettbutikk"],
+          ["Kje Kjøttdeig", 150, "kg", "https://ovrejorde.no/nettbutikk"],
+          ["Lår", 299, "kg", "https://ovrejorde.no/nettbutikk"],
+        ],
+        `R2-1 ovrejorde (${label}): price button above the name → «Bog» = 269, never the next column's 150`,
+      );
+      const bog = r.products.find((x) => x.name === "Bog")!;
+      assertEq(bog.rules, bogPrice.startsWith("150") ? ["price_reanchored"] : [], `R2-1 ovrejorde (${label}): rule recorded only when the price was re-read from the name's own column`);
+      if (bogPrice.startsWith("150")) assertEq(bog.raw_price_text, "150,- kr/kg", "R2-1 ovrejorde: the model's string kept for audit");
+    }
+    {
+      // Pure: a price in ANOTHER product's block is never accepted; in a plain
+      // list the price belongs to the nearest name before it.
+      const page = assoc.parsePageBlocks(ovrePage);
+      const occs = assoc.findNameOccurrences(page.text, ["Sadel", "Bog", "Kje Kjøttdeig", "Lår"]);
+      assertEq(
+        [assoc.findPriceAtName(page, occs, "bog", 150) >= 0, assoc.findPriceAtName(page, occs, "bog", 269) >= 0, assoc.findPriceAtName(page, occs, "kje kjøttdeig", 150) >= 0],
+        [false, true, true],
+        "R2-1 findPriceAtName: 150 belongs to Kje Kjøttdeig's column, 269 to Bog's",
+      );
+      const list = assoc.parsePageBlocks(HTML("<ul><li>Bog</li><li>269,- kr/kg</li><li>Kje Kjøttdeig</li><li>150,- kr/kg</li></ul>"));
+      const lo = assoc.findNameOccurrences(list.text, ["Bog", "Kje Kjøttdeig"]);
+      assertEq(
+        [assoc.findPriceAtName(list, lo, "bog", 269) >= 0, assoc.findPriceAtName(list, lo, "bog", 150) >= 0],
+        [true, false],
+        "R2-1 findPriceAtName: plain list — the price right after the name is its own, the next product's is not",
+      );
+      assertEq(assoc.findNameOccurrences("Lammelår og Lam, 189 kr/kg", ["Lam", "Lammelår"]).map((o) => o.key), ["lammelår", "lam"], "R2-1 names match as whole words («Lam» is not inside «Lammelår»)");
+    }
+
+    // R2-2 Shared price — henrikshonning.no: «Sommerhonning eller Høsthonning /
+    // 500 grams glass kr 130,-» (paragraph layout as on the page, but on a
+    // non-blog URL so only the shared-price rule is in play).
+    robots.__clearRobotsCacheForTesting();
+    {
+      const para = (t: string) => `<p class="wp-block-paragraph">${t}</p>\n\n`;
+      const honningPage = HTML(
+        `<div class="entry-content" itemprop="text">` +
+          para("Jeg har følgende honning:") +
+          para("🐝🍯") +
+          para("Jeg har Byhonning som er sanket av mine bier i Skien by, denne er veldig rund og fin i smaken og har en litt karamell smak.") +
+          para("Også har jeg Sommerhonning som er veldig frisk og fin i smaken og høsthonning som smaker litt mer typisk &laquo;honning&raquo;.") +
+          para("Jeg har også laget en veldig ren og god leppepomade, den heter Henriks Lucky lips.") +
+          para("Jeg har følgende priser:") +
+          para("🍯🐝") +
+          para("Sommerhonning eller Høsthonning") +
+          para("500 grams glass kr 130,-") +
+          para("1 kilos glass kr 230,-") +
+          para("2 kilos spann kr 450,-") +
+          para("Leppepomade:") +
+          para("Henriks Lucky lips kr 60,-") +
+          `</div>`,
+      );
+      const f = makeFetch({
+        "https://henrikshonning.no/robots.txt": ROBOTS_OPEN,
+        "https://henrikshonning.no/": { body: HTML('<a href="/kjope-honning/">Kjøp honning</a><p>Lokal honning fra Skien.</p>') },
+        "https://henrikshonning.no/kjope-honning/": { body: honningPage },
+      });
+      const r = await ex.extractProductsFromWebsite("https://henrikshonning.no", {
+        fetchImpl: f.impl,
+        llm: async () => ({
+          text: JSON.stringify([
+            { name: "Byhonning", price: "kr 130,-", unit: null },
+            { name: "Sommerhonning", price: "kr 130,-", unit: null },
+            { name: "Høsthonning", price: "kr 130,-", unit: null },
+            { name: "Henriks Lucky lips", price: "kr 60,-", unit: null },
+          ]),
+        }),
+      });
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.rules]),
+        [
+          ["Byhonning", null, ["price_not_at_name"]],
+          ["Sommerhonning", 130, []],
+          ["Høsthonning", 130, []],
+          ["Henriks Lucky lips", 60, []],
+        ],
+        "R2-2 «X eller Y … kr 130» applies to Sommerhonning and Høsthonning only; Byhonning gets no price from it",
+      );
+    }
+
+    // R2-3 Old sources — henrikshonning.no's 2022 blog post with an old price
+    // list (WordPress post markup as on the site).
+    const blogPost = (title: string, body: string) =>
+      `<!doctype html><html><head><title>${title}</title><meta property="og:type" content="article" />` +
+      `<meta property="article:published_time" content="2022-06-14T10:02:11+00:00" /></head><body>` +
+      `<article id="post-512" class="post-512 post type-post status-publish format-standard hentry category-honning" itemtype="https://schema.org/CreativeWork" itemscope>` +
+      `<div class="inside-article"><header class="entry-header"><h1 class="entry-title" itemprop="headline">${title}</h1>` +
+      `<div class="entry-meta"><span class="posted-on"><time class="entry-date published" datetime="2022-06-14T12:02:11+02:00" itemprop="datePublished">14. juni 2022</time></span></div></header>` +
+      `<div class="entry-content" itemprop="text">${body}</div></div></article></body></html>`;
+    robots.__clearRobotsCacheForTesting();
+    {
+      const f = makeFetch({
+        "https://www.henrikshonning.no/robots.txt": ROBOTS_OPEN,
+        "https://www.henrikshonning.no/": {
+          body: HTML('<a href="/2022/06/skien-venstre-mijopris/">Skien Venstre miljøpris – priser</a><a href="/produkter/">Produkter</a><p>Henriks Honning og Bier, Rosenvold.</p>'),
+        },
+        "https://www.henrikshonning.no/2022/06/skien-venstre-mijopris/": {
+          body: blogPost("Skien Venstre miljøpris", '<p class="wp-block-paragraph">Høsthonning ½ kg kr 130,-</p><p class="wp-block-paragraph">Lynghonning ½ kg kr 160,-</p>'),
+        },
+        "https://www.henrikshonning.no/produkter/": { body: HTML("<h1>Honning</h1><ul><li>Høsthonning ½ kg kr 150,-</li><li>Sommerhonning</li></ul>") },
+      });
+      const r = await ex.extractProductsFromWebsite("https://www.henrikshonning.no", {
+        fetchImpl: f.impl,
+        llm: async () => ({
+          text: JSON.stringify([
+            { name: "Høsthonning", price: "kr 130,-", unit: null },
+            { name: "Lynghonning", price: "kr 160,-", unit: null },
+            { name: "Sommerhonning", price: null, unit: null },
+          ]),
+        }),
+      });
+      assertTrue(f.calls.includes("https://www.henrikshonning.no/2022/06/skien-venstre-mijopris/"), "R2-3 the blog post was fetched (and shown to the model)");
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.rules, x.source_url]),
+        [
+          ["Høsthonning", null, ["price_blog_source_dropped"], "https://www.henrikshonning.no/produkter/"],
+          ["Lynghonning", null, ["price_blog_source_dropped"], "https://www.henrikshonning.no/2022/06/skien-venstre-mijopris/"],
+          ["Sommerhonning", null, [], "https://www.henrikshonning.no/produkter/"],
+        ],
+        "R2-3 a price only on a dated blog post is not used: products kept without price, rule recorded",
+      );
+    }
+    assertEq(
+      [
+        assoc.isBlogPostPage("https://www.henrikshonning.no/2022/06/skien-venstre-mijopris/", HTML("<p>x</p>")),
+        assoc.isBlogPostPage("https://gard.no/nyheter/honningpris", blogPost("Ny pris", "<p>x</p>").replace(/\/2022/g, "")),
+        assoc.isBlogPostPage("https://gard.no/innlegg", `<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"BlogPosting","headline":"Ny sesong"}</script></head><body></body></html>`),
+        assoc.isBlogPostPage("https://gard.no/butikk", HTML('<article class="product"><h2>Lam</h2><p>250 kr</p></article>')),
+        assoc.isBlogPostPage("https://gard.no/produkt/lam", '<html><head><meta property="og:type" content="article" /></head><body><p>Lam 250 kr</p></body></html>'),
+        assoc.isBlogPostPage("https://gard.no/2024-priser", HTML("<p>x</p>")),
+      ],
+      [true, true, true, false, false, false],
+      "R2-3 isBlogPostPage: dated URL, post markup, BlogPosting JSON-LD → blog; product cards in <article> or og:type=article without a date → not",
+    );
+
+    // R2-4 «ekskl. mva.» — bjerkemat.no: the Store API's price_html carries
+    // the shop's suffix (shape copied from the live response).
+    robots.__clearRobotsCacheForTesting();
+    {
+      const woo = [
+        wooItem({
+          name: "Dessertkonfekt",
+          permalink: "https://bjerkemat.no/produkt/dessertkonfekt/",
+          prices: { price: "19000", regular_price: "19000", currency_symbol: "kr", currency_prefix: "kr " },
+          price_html: '<span class="woocommerce-Price-amount amount"><span class="woocommerce-Price-currencySymbol" dir="auto">&#107;&#114;</span>&nbsp;190,00</span> <small class="woocommerce-price-suffix">ekskl. mva.</small>',
+        }),
+        wooItem({
+          name: "Juleribbe",
+          permalink: "https://bjerkemat.no/produkt/juleribbe/",
+          prices: { price: "34900" },
+          price_html: '<span class="woocommerce-Price-amount amount"><span class="woocommerce-Price-currencySymbol">kr</span>&nbsp;349,00</span>',
+        }),
+      ];
+      const f = makeFetch({
+        "https://bjerkemat.no/robots.txt": ROBOTS_OPEN,
+        "https://bjerkemat.no/wp-json/wc/store/v1/products?per_page=100": { body: JSON.stringify(woo), contentType: "application/json" },
+      });
+      const r = await ex.extractProductsFromWebsite("https://bjerkemat.no", { fetchImpl: f.impl, llm: noLlm });
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.price_text, x.price_excl_vat ?? null, x.rules]),
+        [
+          ["Dessertkonfekt", 190, "190 NOK ekskl. mva.", true, ["price_excl_vat"]],
+          ["Juleribbe", 349, "349 NOK", null, []],
+        ],
+        "R2-4 woo: «ekskl. mva.» suffix → price_excl_vat and the mark in price_text; a normal price has no flag",
+      );
+      const sum = (require("./dry-run") as typeof import("./dry-run")).summarizeDryRun([
+        { agent_id: "a", agent_name: "Bjerke", website: "https://bjerkemat.no", is_owned: 1, result: r },
+      ]);
+      assertEq([sum.products_price_excl_vat, sum.rule_counts.price_excl_vat], [1, 1], "R2-4 summary: excl. VAT prices counted (count + rule_counts)");
+    }
+    robots.__clearRobotsCacheForTesting();
+    {
+      const f = makeFetch({
+        "https://spekemat.no/robots.txt": ROBOTS_OPEN,
+        "https://spekemat.no/": { body: HTML('<a href="/prisliste">Prisliste</a><p>Spekemat fra Bjerke, for restauranter og butikker.</p>') },
+        "https://spekemat.no/prisliste": {
+          body: HTML("<h1>Prisliste</h1><ul><li>Tradisjonell medium kr 1 150,00 ekskl. mva.</li><li>Fenalår kr 690,00</li></ul>"),
+        },
+      });
+      const r = await ex.extractProductsFromWebsite("https://spekemat.no", {
+        fetchImpl: f.impl,
+        llm: async () => ({ text: '[{"name":"Tradisjonell medium","price":"kr 1 150,00","unit":null},{"name":"Fenalår","price":"kr 690,00","unit":null}]' }),
+      });
+      assertEq(
+        r.products.map((x) => [x.name, x.price_nok, x.price_text, x.price_excl_vat ?? null]),
+        [
+          ["Tradisjonell medium", 1150, "kr 1 150,00 ekskl. mva.", true],
+          ["Fenalår", 690, "kr 690,00", null],
+        ],
+        "R2-4 llm: «ekskl. mva.» right after the price on the page → flagged even when the model left the mark out",
+      );
+    }
+    {
+      const ld = { "@type": "Product", name: "Pinnekjøtt", offers: { "@type": "Offer", price: "450", priceCurrency: "NOK", priceSpecification: { "@type": "PriceSpecification", price: "450", priceCurrency: "NOK", valueAddedTaxIncluded: false } } };
+      const items = (require("./structured") as typeof import("./structured")).parseJsonLdProducts(
+        `<script type="application/ld+json">${JSON.stringify(ld)}</script>`,
+        "https://gard.no/p",
+        ex.allowedHostsFor("gard.no"),
+      );
+      assertEq([items[0]?.price_nok, items[0]?.price_excl_vat, items[0]?.rules], [450, true, ["price_excl_vat"]], "R2-4 jsonld: valueAddedTaxIncluded=false → price_excl_vat");
+    }
+    assertEq(
+      [norm.statesExclVat("kr 190,00 ekskl. mva."), norm.statesExclVat("250 kr eks. mva"), norm.statesExclVat("NOK 99 excl. VAT"), norm.statesExclVat("1200,- + mva"), norm.statesExclVat("2500,- inkl. Mva"), norm.statesExclVat("Mvaregistrert")],
+      [true, true, true, true, false, false],
+      "R2-4 statesExclVat: ekskl./eks./excl./+ mva yes; inkl. mva no",
+    );
+    assertEq([norm.statesPagePricesExclVat("Alle priser er ekskl. mva."), norm.statesPagePricesExclVat("Prisene er inkl. mva.")], [true, false], "R2-4 page-wide «Alle priser er ekskl. mva.»");
+
     // ── AC5: host + SSRF ───────────────────────────────────────────────────
     {
       const allowed = ex.allowedHostsFor("gard.no");
@@ -825,6 +1082,85 @@ export function runProductImportTests(opts: { log?: boolean } = {}): Promise<Tes
       assertEq([cappedRun.results[0]?.outcome, cappedRun.results[0]?.llm_status, cappedRun.llm_calls], ["no_products_found", "budget_exhausted", 0], "LLM cap 0: no model call");
       assertEq(dry.getDryRun("pir-missing"), null, "unknown run → null");
       assertEq(snapshot(), before, "AC1: still unchanged after the second run");
+
+      // ── R2-5 The measurement survives a deploy ──────────────────────────
+      // A run is cut mid-way (the process "dies" while the 3rd profile waits
+      // on the model), a fresh process boots and resumes it with the profiles
+      // that remained: completed, every profile once, no duplicate rows.
+      {
+        for (const id of ["pr5-a1", "pr5-a2", "pr5-a3", "pr5-a4"]) addAgent(id, { verified: 1, website: `https://${id}.no` });
+        const r5: Record<string, FakeRoute> = {};
+        for (const id of ["pr5-a1", "pr5-a2", "pr5-a4"]) {
+          r5[`https://${id}.no/robots.txt`] = ROBOTS_OPEN;
+          r5[`https://${id}.no/products.json?limit=250`] = {
+            body: JSON.stringify({ products: [{ title: `Egg ${id}`, handle: "egg", variants: [{ title: "Default Title", price: "60.00" }] }] }),
+            contentType: "application/json",
+          };
+        }
+        Object.assign(r5, llmSite("pr5-a3.no"));
+        const f5 = makeFetch(r5);
+        let hung = false;
+        robots.__clearRobotsCacheForTesting();
+        dry.__setDryRunDepsForTesting({
+          fetchImpl: f5.impl,
+          // The deploy hits while the 3rd profile waits on the model: it never answers.
+          llm: () => {
+            hung = true;
+            return new Promise<{ text: string | null }>(() => {});
+          },
+          sleep: async () => {},
+          hostIntervalMs: 0,
+          concurrency: 1,
+        });
+        const ids5 = ["pr5-a1", "pr5-a2", "pr5-a3", "pr5-a4"];
+        const run5 = dry.startProductImportDryRun({ agentIds: ids5, llmCallCap: 5 });
+        for (let i = 0; i < 2000 && !hung; i++) await new Promise((res) => setImmediate(res));
+        const rows5 = () => db.prepare(`SELECT agent_id FROM product_import_run_results WHERE run_id = ? ORDER BY agent_id`).all(run5.run_id).map((x: any) => x.agent_id);
+        assertEq([hung, rows5()], [true, ["pr5-a1", "pr5-a2"]], "R2-5: cut mid-way — two profiles stored, the third in flight");
+
+        // Restart: the new process has no job in memory → the run reads as interrupted.
+        dry.__forgetDryRunJobsForTesting();
+        assertEq(dry.getDryRun(run5.run_id)!.status, "interrupted", "R2-5: after the restart the run reads as interrupted");
+
+        // Flag off at boot → no resume.
+        delete process.env.PRODUCT_IMPORT_DRYRUN_ENABLED;
+        assertEq(dry.resumeProductImportDryRunOnBoot(), null, "R2-5: flag off at boot → not resumed");
+        assertEq(dry.getDryRun(run5.run_id)!.status, "interrupted", "R2-5: flag off → still interrupted");
+        process.env.PRODUCT_IMPORT_DRYRUN_ENABLED = "1";
+
+        const callsBefore = f5.calls.length;
+        dry.__setDryRunDepsForTesting({
+          fetchImpl: f5.impl,
+          llm: async () => ({ text: '[{"name":"Lammelår","price":"250 kr/kg","unit":"kg"}]' }),
+          sleep: async () => {},
+          hostIntervalMs: 0,
+          concurrency: 1,
+        });
+        const resumed = dry.resumeProductImportDryRunOnBoot();
+        assertEq(
+          resumed && [resumed.run_id, resumed.profiles_done, resumed.profiles_remaining, resumed.resume_count],
+          [run5.run_id, 2, 2, 1],
+          "R2-5: boot resumes the run with the two profiles that remained",
+        );
+        assertEq(dry.activeDryRunId(), run5.run_id, "R2-5: the resumed run is the active one (a new POST gets 409)");
+        await dry.__awaitDryRunForTesting(run5.run_id);
+        const after = dry.getDryRun(run5.run_id)!;
+        assertEq([after.status, after.profiles_done, after.resume_count], ["completed", 4, 1], "R2-5: resumed run completes with every profile");
+        assertEq(rows5(), ids5, "R2-5: one result row per profile");
+        const dup = db
+          .prepare(`SELECT COUNT(*) AS n, COUNT(DISTINCT agent_id) AS d FROM product_import_run_results WHERE run_id = ?`)
+          .get(run5.run_id) as { n: number; d: number };
+        assertEq([dup.n, dup.d], [4, 4], "R2-5: no duplicate rows");
+        const resumedCalls = f5.calls.slice(callsBefore);
+        assertTrue(!resumedCalls.some((u) => u.includes("pr5-a1.no") || u.includes("pr5-a2.no")), "R2-5: finished profiles are not fetched again");
+        assertEq([after.summary?.profiles_total, after.summary?.outcome_counts?.ok, after.summary?.resume_count], [4, 4, 1], "R2-5: the summary covers the rows from before and after the restart");
+        assertEq(dry.resumeProductImportDryRunOnBoot(), null, "R2-5: nothing left to resume");
+        // A second write for a stored profile is ignored, not duplicated.
+        db.prepare(
+          `INSERT OR IGNORE INTO product_import_run_results (run_id, agent_id, outcome, result_json) VALUES (?, 'pr5-a1', 'ok', '{}')`,
+        ).run(run5.run_id);
+        assertEq((db.prepare(`SELECT COUNT(*) AS n FROM product_import_run_results WHERE run_id = ?`).get(run5.run_id) as any).n, 4, "R2-5: the (run_id, agent_id) key keeps one row");
+      }
     } finally {
       dry.__setDryRunDepsForTesting(null);
       robots.__clearRobotsCacheForTesting();

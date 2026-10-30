@@ -169,6 +169,7 @@ import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
 import adminProductImportRoutes from "./routes/admin-product-import";
+import { productImportDryRunEnabled, resumeProductImportDryRunOnBoot } from "./services/product-import/dry-run";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { mountBillingRoutes } from "./routes/admin-billing";
@@ -2250,6 +2251,24 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   });
   setTimeout(() => { void gardssalgCrDailyTick(); }, 7 * 60_000);
   setInterval(() => { void gardssalgCrDailyTick(); }, 10 * 60_000);
+}
+
+// ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
+// (punkt 5): the product-import dry-run measurement survives a deploy. Once,
+// 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the
+// previous process left `running`/`interrupted` continues with the profiles
+// that have no result row yet (no duplicates: PRIMARY KEY + INSERT OR IGNORE).
+// Writes only product_import_runs/_results. Flag off at boot → no resume.
+if (productImportDryRunEnabled()) {
+  setTimeout(() => {
+    const r = resumeProductImportDryRunOnBoot();
+    if (r) {
+      console.log(
+        `[product-import] resumed dry run ${r.run_id}: ${r.profiles_done}/${r.profiles_total} done, ` +
+          `${r.profiles_remaining} remaining (resume #${r.resume_count})`,
+      );
+    }
+  }, 45_000);
 }
 
 // ─── dev-request 2026-09-03-opplevagent-sending-uten-llm-i-sendestien
