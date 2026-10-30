@@ -203,6 +203,60 @@ export async function runProductCatalogSyncTests(opts: { log?: boolean } = {}): 
   assertEq(plain.category, "new-cat", "B1b-2: plain scraped row: category still updated");
   assertTrue(plain.updated_at !== OLD, "B1b-2: plain scraped row: updated_at moved");
 
+  assertTrue(r4.success && r4.updated >= 5, "B1b-2: conflict path ran for the guarded rows (updated counter)");
+
+  // ── B1b-2 review fix: owner-SUPPLIED incoming prices still update owner rows ──
+  db.prepare(`
+    INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city)
+    VALUES ('pcs-own2', 'Eier Gård 2', 'test', 'test', 'eier2@example.com', 'https://example.com', 'producer', 'key-pcs-own2', 'Oslo')
+  `).run();
+  const ownerRow2 = (id: string, name: string, source: string, avSource: string, srcUrl: string | null) =>
+    db.prepare(`
+      INSERT INTO products (id, agent_id, name, name_norm, category, price_nok, currency, availability, source, source_url,
+                            availability_source, created_at, updated_at)
+      VALUES (?, 'pcs-own2', ?, ?, 'cat-old', 10, 'NOK', 'in_stock', ?, ?, ?, ?, ?)
+    `).run(id, name, name.toLowerCase(), source, srcUrl, avSource, OLD, OLD);
+  ownerRow2("o2-dash-imp", "Epler", "owner_import", "producer_dashboard", "https://old.example/a");
+  ownerRow2("o2-dash-scr", "Pærer", "owner_import", "producer_dashboard", "https://old.example/b");
+  ownerRow2("o2-owner", "Plommer", "owner", "enrichment", null);
+  ownerRow2("o2-admin", "Kirsebær", "enrichment", "admin_producer_confirmed", null);
+  ownerRow2("o2-admin-imp", "Bringebær", "enrichment", "admin_producer_confirmed", null);
+  db.prepare(`INSERT INTO agent_knowledge (agent_id, products, verification_status) VALUES ('pcs-own2', ?, 'verified')`).run(
+    JSON.stringify([
+      // (a) owner_import incoming on a producer_dashboard row
+      { name: "Epler", category: "new-cat", price: "77 kr", source: "owner_import", sourceUrl: "https://new.example/a", fetchedAt: "2026-10-30" },
+      // (e) scraped incoming on a producer_dashboard row
+      { name: "Pærer", category: "new-cat", price: "99 kr", source: "enrichment", sourceUrl: "https://scrape.example/b", fetchedAt: "2026-10-30" },
+      // (b) owner-sourced incoming on a source='owner' row
+      { name: "Plommer", category: "new-cat", price: "55 kr", source: "owner_manual" },
+      // (d) admin_producer_confirmed blocks scraped and owner-sourced incoming
+      { name: "Kirsebær", category: "new-cat", price: "99 kr", source: "enrichment" },
+      { name: "Bringebær", category: "new-cat", price: "99 kr", source: "owner_import", sourceUrl: "https://new.example/c" },
+    ]));
+  const r5 = runProductCatalogSync(db);
+  assertTrue(r5.success && r5.inserted === 0 && r5.updated >= 5, "B1b-2 fix: conflict path ran (no inserts, updated counter covers the five rows)");
+  const getRow2 = (id: string) => db.prepare("SELECT price_nok, category, source, source_url, fetched_at, updated_at FROM products WHERE id = ?").get(id) as
+    { price_nok: number; category: string; source: string; source_url: string | null; fetched_at: string | null; updated_at: string };
+  const a = getRow2("o2-dash-imp");
+  assertEq(a.price_nok, 77, "B1b-2 fix (a): owner_import price updates a producer_dashboard row");
+  assertEq(a.category, "new-cat", "B1b-2 fix (a): owner_import category updates");
+  assertEq([a.source, a.source_url, a.fetched_at], ["owner_import", "https://new.example/a", "2026-10-30"], "B1b-2 fix (a): provenance comes from the import");
+  assertTrue(a.updated_at !== OLD, "B1b-2 fix (a): updated_at moved");
+  const b = getRow2("o2-owner");
+  assertEq(b.price_nok, 55, "B1b-2 fix (b): owner-sourced price updates a source='owner' row");
+  assertEq(b.category, "new-cat", "B1b-2 fix (b): category updates");
+  assertEq(b.source, "owner", "B1b-2 fix (b): row keeps source 'owner' (written by another writer)");
+  assertTrue(b.updated_at !== OLD, "B1b-2 fix (b): updated_at moved");
+  const e = getRow2("o2-dash-scr");
+  assertEq([e.price_nok, e.category, e.updated_at], [10, "cat-old", OLD], "B1b-2 fix (c): scraped incoming blocked on producer_dashboard row");
+  assertEq([e.source, e.source_url, e.fetched_at], ["owner_import", "https://old.example/b", null],
+    "B1b-2 fix (e): blocked scrape leaves provenance unchanged (no false price origin)");
+  for (const id of ["o2-admin", "o2-admin-imp"]) {
+    const d = getRow2(id);
+    assertEq([d.price_nok, d.category, d.updated_at, d.source, d.source_url], [10, "cat-old", OLD, "enrichment", null],
+      `B1b-2 fix (d): admin_producer_confirmed row ${id} fully protected (price, category, provenance)`);
+  }
+
   return { passed, failed, failures };
 }
 
