@@ -139,6 +139,7 @@ export async function runProduktimportS2Tests(opts: { log?: boolean } = {}): Pro
       { name: "Admin-ost", category: "dairy", price: "kr 70", source: "owner_manual", confirmedAt: "2026-10-21T00:00:00Z" },
       { name: "Bekreftet lam", category: "meat", price: "kr 250", source: "owner_import", sourceUrl: "https://hommelstad.no/lam", fetchedAt: "2026-10-21T09:00:00Z", confirmedAt: "2026-10-21T10:00:00Z" },
       { name: "Bad source", category: "meat", price: "kr 5", source: "scraped", confirmedAt: "2026-10-21T00:00:00Z" },
+      { name: "Bekreftet honning", category: "sweets", price: "kr 99", source: "owner_import", sourceUrl: "https://hommelstad.no/honning", fetchedAt: "2026-10-21T09:00:00Z", confirmedAt: "2026-10-21T10:00:00Z" },
     ];
     const setKnowledge = (list: unknown[]) => db.prepare(
       `INSERT INTO agent_knowledge (agent_id, products, data_source) VALUES (?, ?, 'hybrid')
@@ -162,6 +163,13 @@ export async function runProduktimportS2Tests(opts: { log?: boolean } = {}): Pro
        VALUES ('p-b1', ?, 'Bekreftet lam', 'bekreftet lam', 250, 'meat', 'NOK', 'in_stock', 'enrichment', ?, 'producer_dashboard', ?, ?)`,
     ).run(SYNC, confirmedAt, OLD, OLD);
 
+    // An enrichment-created row the admin later confirmed through POST
+    // /admin/products/producer-list's UPDATE (source stays 'enrichment',
+    // availability_source becomes admin_producer_confirmed).
+    db.prepare(
+      `INSERT INTO products (id, agent_id, name, name_norm, price_nok, category, currency, availability, source, availability_updated_at, availability_source, created_at, updated_at)
+       VALUES ('p-admin-enr', ?, 'Bekreftet honning', 'bekreftet honning', 130, 'honey', 'NOK', 'in_stock', 'enrichment', ?, 'admin_producer_confirmed', ?, ?)`,
+    ).run(SYNC, confirmedAt, OLD, OLD);
     const r1 = runProductCatalogSync(db);
     assertTrue(r1.success, "AC7: sync 1 succeeds");
     const lam = productRow(SYNC, "Lammelaar");
@@ -180,6 +188,12 @@ export async function runProduktimportS2Tests(opts: { log?: boolean } = {}): Pro
       "AC7: a B1 owner-portal row ('owner') keeps its provenance");
     assertEq([productRow(SYNC, "Admin-ost")?.source, productRow(SYNC, "Admin-ost")?.price_nok, productRow(SYNC, "Admin-ost")?.owner_confirmed_at, productRow(SYNC, "Admin-ost")?.updated_at],
       ["admin", 75, null, OLD], "AC7: an admin_producer_confirmed row keeps provenance, price and updated_at");
+    {
+      const r = productRow(SYNC, "Bekreftet honning");
+      assertEq([r?.source, r?.source_url, r?.fetched_at, r?.owner_confirmed_at, r?.price_nok, r?.category, r?.updated_at],
+        ["enrichment", null, null, null, 130, "honey", OLD],
+        "AC7: an admin_producer_confirmed row with source 'enrichment' keeps its provenance, price, category and updated_at");
+    }
     assertEq(productRow(SYNC, "Eierlagt")?.updated_at, OLD, "AC7: a row whose price/category did not change keeps updated_at (sync 1)");
     assertEq(productRow(SYNC, "Bekreftet lam")?.updated_at, OLD, "AC7: the B1 row's price/category are unchanged → updated_at kept (sync 1)");
 
@@ -243,11 +257,11 @@ export async function runProduktimportS2Tests(opts: { log?: boolean } = {}): Pro
         handler({ params: { slug }, lang, ip: "10.9.9.9", headers: { "user-agent": CHROME_UA }, method: "GET" }, res, () => undefined);
         return body;
       };
-      const profile = (id: string, name: string, products: unknown[], ownerAt: string | null, enrichedAt: string | null) => {
+      const profile = (id: string, name: string, products: unknown[], ownerAt: string | null, enrichedAt: string | null, dataSource?: string) => {
         addAgent(id, name);
         db.prepare(
           `INSERT INTO agent_knowledge (agent_id, products, data_source, owner_updated_at, last_enriched_at) VALUES (?, ?, ?, ?, ?)`,
-        ).run(id, JSON.stringify(products), ownerAt ? "hybrid" : "auto", ownerAt, enrichedAt);
+        ).run(id, JSON.stringify(products), dataSource ?? (ownerAt ? "hybrid" : "auto"), ownerAt, enrichedAt);
       };
       profile("s2-imp", "Importgard Test", [
         { name: "Lammelaar", category: "meat", price: "kr 300", source: "owner_import", sourceUrl: "https://www.hommelstad.no/butikk", fetchedAt: "2026-10-21T09:00:00Z", confirmedAt: "2026-10-21T10:00:00Z" },
@@ -256,7 +270,7 @@ export async function runProduktimportS2Tests(opts: { log?: boolean } = {}): Pro
       ], "2026-10-21T10:00:00Z", "2026-09-01T10:00:00Z");
       profile("s2-man", "Eiergard Test", [
         { name: "Honning", category: "honey", price: "kr 120", source: "owner_manual", confirmedAt: "2026-10-21T10:00:00Z" },
-      ], "2026-10-21T10:00:00Z", "2026-10-25T10:00:00Z");
+      ], "2026-10-21T10:00:00Z", "2026-10-25T10:00:00Z", "owner");
       profile("s2-auto", "Autogard Test", [{ name: "Egg", category: "eggs", price: "kr 55" }], null, "2026-09-01T10:00:00Z");
       profile("s2-none", "Tomgard Test", [], null, "2026-09-01T10:00:00Z");
       profile("s2-noprice", "Prisfri Test", [
@@ -276,6 +290,21 @@ export async function runProduktimportS2Tests(opts: { log?: boolean } = {}): Pro
 
       const man = render("eiergard-test", "no");
       const manEn = render("eiergard-test", "en");
+      // The footer's source label reads meta.dataSource (getAgentInfo's
+      // knowledge has none): owner profiles must not say «Automatisk».
+      const footer = (body: string) => { const i = body.indexOf('<div class="data-src">'); return i < 0 ? "" : body.slice(i, body.indexOf("</div>", i)); };
+      assertTrue(footer(no).includes('data-dot owner') && footer(no).includes("Verifisert av eier — Oppdatert av eier") && !footer(no).includes("Automatisk"),
+        "AC8 footer NO: hybrid profile → owner dot, «Verifisert av eier — Oppdatert av eier …», no «Automatisk»");
+      assertTrue(footer(en).includes("Verified by owner — Updated by owner") && !footer(en).includes("Auto-collected"),
+        "AC8 footer EN: hybrid profile → «Verified by owner — Updated by owner …»");
+      assertTrue(footer(man).includes('data-dot owner') && footer(man).includes("Eierstyrt") && !footer(man).includes("Automatisk"),
+        "AC8 footer NO: owner profile → «Eierstyrt», no «Automatisk»");
+      assertTrue(footer(manEn).includes("Owner-managed") && !footer(manEn).includes("Auto-collected"), "AC8 footer EN: owner profile → «Owner-managed»");
+      for (const lang of ["no", "en"]) {
+        const f = footer(render("autogard-test", lang));
+        assertTrue(f.includes('data-dot auto') && f.includes(lang === "en" ? "Auto-collected data" : "Automatisk innhentet data"),
+          `AC8 footer ${lang}: enrichment-only profile keeps the auto dot and label`);
+      }
       assertTrue(man.includes("Oppdatert av eier 21. okt. 2026") && man.includes("Prisene kan ha endret seg"), "AC8 NO: owner-typed products → «Oppdatert av eier 21. okt. 2026» + caveat");
       assertTrue(manEn.includes("Updated by owner on 21 Oct 2026"), "AC8 EN: owner-typed products → «Updated by owner on 21 Oct 2026»");
       assertTrue(man.includes("Sist oppdatert 25.10.2026") && !man.includes("Oppdatert av eier 21.10.2026"),

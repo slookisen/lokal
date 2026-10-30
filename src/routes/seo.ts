@@ -6734,10 +6734,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         </div>` : ""}
 
         <div class="data-src">
-          <span class="data-dot ${(!k.dataSource || k.dataSource === "auto") ? "auto" : "owner"}"></span>
+          <span class="data-dot ${(!meta.dataSource || meta.dataSource === "auto") ? "auto" : "owner"}"></span>
           ${lang === "en"
-            ? ((!k.dataSource || k.dataSource === "auto") ? "Auto-collected data" : k.dataSource === "hybrid" ? "Verified by owner" : "Owner-managed")
-            : ((!k.dataSource || k.dataSource === "auto") ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt")
+            ? ((!meta.dataSource || meta.dataSource === "auto") ? "Auto-collected data" : meta.dataSource === "hybrid" ? "Verified by owner" : "Owner-managed")
+            : ((!meta.dataSource || meta.dataSource === "auto") ? "Automatisk innhentet data" : meta.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt")
           }${footerDate ? ` \u2014 ${footerDate.byOwner ? t(lang, "producer.updated_by_owner") : lang === "en" ? "Last updated" : "Sist oppdatert"} ${new Date(footerDate.iso).toLocaleDateString(lang === "en" ? "en-US" : "nb-NO")}` : ""}
         </div>
 
