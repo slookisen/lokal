@@ -12,6 +12,7 @@
  *   GET /produsent/:slug      → Individual producer profile page
  *   GET /personvern            → Privacy policy (GDPR)
  *   GET /kjopsvilkar           → Terms of purchase + refund rules (rfb-kjopsvilkar.ts)
+ *   GET /for-produsenter       → «Slik fungerer … for produsenter» FAQ (rfb-for-produsenter.ts; FOR_PRODUSENTER_PAGE_ENABLED)
  *   GET /sitemap.xml          → Dynamic sitemap for Google
  *   GET /robots.txt           → Crawl instructions
  */
@@ -38,6 +39,7 @@ import { textEntries } from "../utils/text-entries";
 import { serializeJsonForScript } from "../services/safe-script-json";
 import { getConfig } from "../config/vertical-config";
 import { renderKjopsvilkarContent, KJOPSVILKAR_PATH } from "./rfb-kjopsvilkar";
+import { renderForProdusenterPage, FOR_PRODUSENTER_PATH, FOR_PRODUSENTER_CSS, isForProdusenterPageEnabled, forProdusenterSitemapPaths, forProducersNavHref } from "./rfb-for-produsenter";
 import { renderProdusentvilkarContent } from "./rfb-produsentvilkar";
 import { PRODUSENTVILKAR_PATH } from "../config/producer-terms";
 import { generalLimiter } from "../middleware/security";
@@ -843,7 +845,7 @@ export function shell(
       <a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "nav.how_it_works"))}</a>
       <a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "nav.about"))}</a>
       ${langSwitcher}
-      <a href="/selger" class="nav-cta">${escapeHtml(t(lang, "nav.for_producers"))}</a>
+      <a href="${forProducersNavHref(lang)}" class="nav-cta">${escapeHtml(t(lang, "nav.for_producers"))}</a>
     </div>
   </nav>
   ${content}
@@ -859,7 +861,7 @@ export function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
-        <a href="/selger">${escapeHtml(t(lang, "footer.register"))}</a><a href="/selger">${escapeHtml(t(lang, "footer.login"))}</a>
+        ${isForProdusenterPageEnabled() ? `<a href="${localizedPath(FOR_PRODUSENTER_PATH, lang)}">${lang === "en" ? "How it works for producers" : "Slik fungerer det"}</a>` : ""}<a href="/selger">${escapeHtml(t(lang, "footer.register"))}</a><a href="/selger">${escapeHtml(t(lang, "footer.login"))}</a>
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_developers"))}</h4>
@@ -3515,6 +3517,22 @@ router.get(BETALING_PATH, (req: Request, res: Response, next: any) => {
   ));
 });
 
+// GET /for-produsenter (+ /en/for-produsenter via the language prefix
+// middleware) — «Slik fungerer Rett fra Bonden for produsenter» (A2A
+// dev-request 2026-10-22-rfb-for-produsenter-faq-side, F1). Behind
+// FOR_PRODUSENTER_PAGE_ENABLED (default off => next(), i.e. the normal 404
+// through the reserved slug in /:city; not in the sitemap; the header
+// «For produsenter» keeps pointing at /selger). Content and the facts it must
+// stay true to live in rfb-for-produsenter.ts.
+router.get(FOR_PRODUSENTER_PATH, (req: Request, res: Response, next: any) => {
+  if (!isForProdusenterPageEnabled()) return next();
+  const lang = req.lang;
+  const canonical = `${BASE_URL}${localizedPath(FOR_PRODUSENTER_PATH, lang)}`;
+  const page = renderForProdusenterPage(lang, canonical);
+  res.send(shell(page.title, page.description, page.content,
+    { canonical, jsonLd: page.jsonLd, extraCss: FOR_PRODUSENTER_CSS, lang, pathForAlternate: FOR_PRODUSENTER_PATH }));
+});
+
 router.get(KJOPSVILKAR_PATH, (req: Request, res: Response) => {
   const lang = req.lang;
   res.send(shell(
@@ -4197,6 +4215,9 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
       || citySlug === "personvern" || citySlug === "privacy" || citySlug === "privacy-policy"
       || citySlug === "kjopsvilkar"
+      // /for-produsenter: registered above behind FOR_PRODUSENTER_PAGE_ENABLED;
+      // reserved regardless of the flag so a city slug never shadows it.
+      || citySlug === "for-produsenter"
       || citySlug === "produsentvilkar"
       || citySlug === "betaling"
       || citySlug === "proveniens"
@@ -6945,6 +6966,8 @@ export function buildSitemapXml(): string {
     }
 
     for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]!, today);
+    // /for-produsenter (NO + EN), only while FOR_PRODUSENTER_PAGE_ENABLED is on.
+    for (const p of forProdusenterSitemapPaths()) addEntry(p, "monthly", "0.7", today);
 
     // dev-request 2026-07-06-rfb-salgskanal-kategorier (public slice): the
     // sales-channel index + one page per category that currently has live
