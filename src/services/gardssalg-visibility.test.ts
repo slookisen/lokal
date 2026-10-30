@@ -75,7 +75,8 @@ export function runGardssalgVisibilityTests(opts: { log?: boolean } = {}): Promi
       const LEGACY_GROUP = "(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')";
       const LEGACY_HIDDEN = "(catalog_hidden IS NULL OR catalog_hidden != 1)";
       // claim: lokal#1235 lets the owner's own pause (reason 'owner_pause') through.
-      const LEGACY_HIDDEN_CLAIM = "(catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = 'owner_pause')";
+      // O2a: and the test fixture (reason 'test_fixture' on is_test_provider = 1 only).
+      const LEGACY_HIDDEN_CLAIM = "(catalog_hidden IS NULL OR catalog_hidden != 1 OR catalog_hidden_reason = 'owner_pause' OR (catalog_hidden_reason = 'test_fixture' AND is_test_provider = 1))";
       const LEGACY_MERGED = "(merged_into IS NULL OR merged_into = '')";
       const legacySql = (surface: string, includeHidden = false): string =>
         surface === "claim"

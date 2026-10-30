@@ -795,7 +795,12 @@ import {
   maskEmail,
   isGardssalgProviderClaimed,
   getOwnedVisibilityState,
+  // O2a (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg) — the
+  // owner login of POST /admin/gardssalg/test-provider below.
+  deriveOrgLinkedEmailCandidates,
+  CATALOG_HIDDEN_REASON_TEST_FIXTURE,
 } from "../services/gardssalg-claim";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import {
   emailService,
   // dev-request 2026-08-09-outreach-send-uten-crm-spor: the pilot-send route
@@ -16551,6 +16556,50 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
 // catalog_hidden=1 row to stay publicly slug-reachable (e.g. a
 // admin-authenticated preview path, or a distinct non-catalog_hidden test
 // marker the public routes explicitly special-case).
+//
+// ── O2a (dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, «v2 for
+// Opplevagent», slice O2a): the fixture state and `owner_email` ─────────────
+// Fixture state: every call now also writes catalog_hidden_reason =
+// 'test_fixture' next to catalog_hidden=1. Before, the reason stayed NULL,
+// which getOwnedVisibilityState() reads as `removed` (owner «fjernet» card,
+// no pause in «Mine valg»). With the reason the row is still hidden on every
+// public surface, reads as «not removed, not paused» to its owner, stays
+// reachable on the claim/portal lookup (gardssalg-visibility.ts, `claim`),
+// and shows in an admin's «Vis som offentlig» view. Re-running the endpoint
+// resets an owner pause on the test row to that fixture state.
+//
+// `owner_email` (optional; mirrors POST /admin/test-producer's S2d-1
+// `owner_email` for RFB): sets the test row's OWNER LOGIN so Daniel can ask
+// for a magic link through the normal owner flow and reach «Mine valg»
+// (/kategori/gardssalg/eier/<slug>/valg) as a verified owner:
+//   * DRY-RUN by default when `owner_email` is given — `apply` must be an
+//     explicit truthy form (same parse as POST /admin/gardssalg-claim-grant);
+//     the dry-run returns the planned per-field changes and writes nothing,
+//     not even the base upsert. Without `owner_email` the endpoint behaves
+//     exactly as before (it writes; no dry-run).
+//   * apply → after the base upsert, ONE more UPDATE pinned in its own WHERE
+//     to `org_nr = TEST000000 AND is_test_provider = 1` sets what the
+//     self-serve claim tier (c) stored_epost_verified needs (the same fields
+//     `claimable` sets): epost = owner_email, brreg_verified = 1,
+//     content_source = 'manual'. The magic link is then requested at
+//     GET /kategori/gardssalg/eier/<slug> (POST .../<id>/request) and sent
+//     to owner_email only; clicking it is the verified claim
+//     (verifyClaimToken: gardssalg_claims.used = 1, claimed_at only if NULL).
+//     This endpoint sends NO e-mail and never touches gardssalg_claims or
+//     claimed_at — an existing claim and its timestamp stay as they are.
+//     content_source='manual' locks the portal's text fields (as with
+//     `claimable`); the «Mine valg» switches (booking_live, the owner pause)
+//     are not locked by it.
+//   * one gardssalg_content_audit row per changed owner-login field
+//     (changed_by 'admin', batch 'admin-test-provider-owner-login').
+//   * the response carries `owner_login` { email, verified_owner (a live
+//     verified claim, isGardssalgProviderClaimed), claim_ready (owner_email
+//     is a self-serve candidate), allowlisted (`gardssalg:<id>` in
+//     OWNER_FEATURES_ALLOWED_SUBJECTS), valg_path, claim_url,
+//     magic_link_request }. The tab also needs OA_OWNER_FEATURES_ENABLED
+//     and the allowlist entry (env changes, not done here).
+//   * mutually exclusive with `claimable`, `claimableEditable` and
+//     `claimEmail` (they write the same columns) → 400, nothing written.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
@@ -16647,6 +16696,30 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     claimEmail = candidate;
   }
 
+  // O2a `owner_email` (see the doc comment above TEST_PROVIDER_ORG_NR).
+  let ownerEmail: string | null = null;
+  if (req.body?.owner_email !== undefined) {
+    if (claimVariant || (typeof req.body?.claimEmail === "string" && req.body.claimEmail.trim())) {
+      res.status(400).json({
+        error: "'owner_email' kan ikke kombineres med 'claimable', 'claimableEditable' eller 'claimEmail' — velg én",
+      });
+      return;
+    }
+    const candidate = typeof req.body.owner_email === "string" ? req.body.owner_email.trim().toLowerCase() : "";
+    if (!candidate || candidate.length > 254 || !EMAIL_SHAPE_RE.test(candidate) || /[\x00-\x1f\x7f]/.test(candidate)) {
+      res.status(400).json({ error: "'owner_email' må være en gyldig e-postadresse (eier-innloggingen for «Mine valg»)" });
+      return;
+    }
+    ownerEmail = candidate;
+  }
+  const ownerApply =
+    req.body?.apply === true ||
+    req.body?.apply === 1 ||
+    req.body?.apply === "1" ||
+    req.body?.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+
   const expDb = getExpDb("experiences");
 
   try {
@@ -16689,6 +16762,38 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       return;
     }
 
+    // O2a: with `owner_email` and no explicit apply → the plan only, no write.
+    if (ownerEmail !== null && !ownerApply) {
+      const current = existing
+        ? (expDb
+            .prepare(
+              `SELECT navn, slug, epost, producer_type, catalog_hidden, catalog_hidden_reason, is_test_provider, booking_live,
+                      brreg_verified, content_source, claimed_at
+                 FROM experience_providers WHERE id = ?`,
+            )
+            .get(existing.id) as Record<string, unknown>)
+        : null;
+      const target: Record<string, unknown> = {
+        navn: name, slug, producer_type: "test-gardssalg", catalog_hidden: 1,
+        catalog_hidden_reason: CATALOG_HIDDEN_REASON_TEST_FIXTURE, is_test_provider: 1, booking_live: 1,
+        epost: ownerEmail, brreg_verified: 1, content_source: "manual",
+      };
+      const changes = Object.entries(target)
+        .filter(([k, v]) => String(current?.[k] ?? null) !== String(v))
+        .map(([k, v]) => ({ field: k, old: current?.[k] ?? null, new: v }));
+      res.json({
+        success: true,
+        dry_run: true,
+        target: existing ? "existing" : "create",
+        provider_id: existing?.id ?? null,
+        slug,
+        changes,
+        // Never written by this endpoint (only a clicked magic link sets it).
+        claimed_at: current?.claimed_at ?? null,
+      });
+      return;
+    }
+
     // createProvider() covers the ProviderSchema-known fields (navn/org_nr/epost/
     // verification_status); the raw UPDATE below sets the columns the schema
     // doesn't (producer_type/booking_live/catalog_hidden/is_test_provider/rfb_seed_source) plus
@@ -16703,16 +16808,66 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
           verification_status: "verified",
         });
 
+    // O2a: the owner-login fields as they were before this call (for the audit).
+    const before = ownerEmail !== null
+      ? (expDb
+          .prepare(`SELECT epost, brreg_verified, content_source FROM experience_providers WHERE id = ?`)
+          .get(providerId) as { epost: string | null; brreg_verified: number | null; content_source: string | null } | undefined)
+      : undefined;
+
     expDb
       .prepare(
         `UPDATE experience_providers
             SET navn = @navn, epost = @email, slug = @slug,
                 producer_type = 'test-gardssalg', rfb_seed_source = NULL,
-                catalog_hidden = 1, is_test_provider = 1, booking_live = 1, commission_rate = 0,
+                catalog_hidden = 1, catalog_hidden_reason = @fixtureReason, is_test_provider = 1, booking_live = 1, commission_rate = 0,
                 verification_status = 'verified', updated_at = datetime('now')
           WHERE id = @id`
       )
-      .run({ id: providerId, navn: name, email, slug });
+      .run({ id: providerId, navn: name, email, slug, fixtureReason: CATALOG_HIDDEN_REASON_TEST_FIXTURE });
+
+    // ── O2a owner login (owner_email + apply) ──
+    let ownerLogin: Record<string, unknown> | null = null;
+    if (ownerEmail !== null) {
+      const ownerTx = expDb.transaction(() => {
+        // Pinned to the test row in its own WHERE: org_nr AND is_test_provider.
+        const r = expDb
+          .prepare(
+            `UPDATE experience_providers
+                SET epost = @ownerEmail, brreg_verified = 1, content_source = 'manual', updated_at = datetime('now')
+              WHERE id = @id AND org_nr = @testOrgNr AND is_test_provider = 1`
+          )
+          .run({ id: providerId, ownerEmail, testOrgNr: TEST_PROVIDER_ORG_NR });
+        if (r.changes !== 1) return false;
+        const audit = expDb.prepare(
+          `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+           VALUES (?, ?, ?, ?, ?, NULL, 'admin-test-provider-owner-login', 'admin', datetime('now'), 'POST /admin/gardssalg/test-provider owner_email')`,
+        );
+        const after: Record<string, string> = { epost: ownerEmail as string, brreg_verified: "1", content_source: "manual" };
+        for (const [field, next] of Object.entries(after)) {
+          const prev = before ? (before as Record<string, unknown>)[field] : null;
+          if (String(prev ?? "") !== next) audit.run(crypto.randomUUID(), providerId, field, prev == null ? null : String(prev), next);
+        }
+        return true;
+      });
+      if (!ownerTx()) {
+        res.status(409).json({
+          error: `Nekter owner_email-skriv: raden er ikke testprodusenten (org_nr != ${TEST_PROVIDER_ORG_NR} eller is_test_provider != 1).`,
+          provider_id: providerId,
+        });
+        return;
+      }
+      const row = getClaimProviderById(providerId);
+      ownerLogin = {
+        email: ownerEmail,
+        verified_owner: isGardssalgProviderClaimed(providerId),
+        claim_ready: !!row && deriveOrgLinkedEmailCandidates(row).some((c) => c.email === ownerEmail),
+        allowlisted: isSubjectAllowedForOwnerFeatures("gardssalg", providerId),
+        valg_path: `/kategori/gardssalg/eier/${encodeURIComponent(slug)}/valg`,
+        claim_url: `${APP_URL}/kategori/gardssalg/eier/${encodeURIComponent(slug)}`,
+        magic_link_request: `POST /kategori/gardssalg/eier/${providerId}/request`,
+      };
+    }
 
     // ── claimable / claimableEditable opt-in (see this route's doc comment) ──
     // Sets exactly the two fields tier (c) stored_epost_verified needs:
@@ -16762,7 +16917,7 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     // claimableEditable overwrote it, the general `email` otherwise (see
     // this route's doc comment's "JUDGMENT CALL" note on why these can
     // differ).
-    const currentEpost = claimReady ? claimEmail : email;
+    const currentEpost = claimReady ? claimEmail : ownerEmail !== null ? ownerEmail : email;
 
     console.log(
       `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${currentEpost} ` +
@@ -16775,8 +16930,10 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
       epost: currentEpost,
+      catalog_hidden_reason: CATALOG_HIDDEN_REASON_TEST_FIXTURE,
       claimable,
       claimableEditable,
+      ...(ownerLogin ? { dry_run: false, owner_login: ownerLogin } : {}),
       ...(claimReady
         ? {
             claim_url: `${APP_URL}/kategori/gardssalg/eier/${slug}`,
@@ -31339,11 +31496,11 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source, terminal_status FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, is_test_provider, content_source, terminal_status FROM experience_providers
         WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, content_source, terminal_status FROM experience_providers
+      `SELECT id, navn, org_nr, hjemmeside, epost, catalog_hidden, catalog_hidden_reason, is_test_provider, content_source, terminal_status FROM experience_providers
         WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     type PvRow = {
@@ -31354,6 +31511,8 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
       epost: string | null;
       catalog_hidden: number | null;
       catalog_hidden_reason: string | null;
+      // O2a: getOwnedVisibilityState() reads the test fixture's reason only with it.
+      is_test_provider: number | null;
       content_source: string | null;
       terminal_status: string | null;
     };

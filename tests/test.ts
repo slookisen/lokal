@@ -50444,6 +50444,26 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O2a: owner login on
+// the gårdssalg test producer (POST /admin/gardssalg/test-provider
+// owner_email), its fixture hidden state (catalog_hidden_reason='test_fixture')
+// and «Vis som offentlig» on the Opplevagent host. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O2a: testoppsett for testprodusenten ──");
+  try {
+    const { runGardssalgOwnerFeaturesO2aTests } = require("../src/routes/gardssalg-owner-features-o2a.test") as
+      typeof import("../src/routes/gardssalg-owner-features-o2a.test");
+    const r = await runGardssalgOwnerFeaturesO2aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-owner-features-o2a: " + f);
+    console.log(`  gardssalg-owner-features-o2a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-features-o2a: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.

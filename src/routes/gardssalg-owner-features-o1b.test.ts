@@ -237,12 +237,15 @@ export function runGardssalgOwnerFeaturesO1bTests(opts: { log?: boolean } = {}):
       const apiOnJ = JSON.parse(apiOn.body);
       assertTrue(apiOn.status === 200 && apiOnJ.success && JSON.stringify(apiOnJ.ignored_fields) === JSON.stringify(["booking_live"]), "y12: update-profile reports booking_live as ignored");
       assertEq([row("o1b-test").booking_live, row("o1b-test").about_text], [1, "Via API"], "y13: … booking_live unchanged, text saved");
+      // O2a: n17's resume put this test producer back to the fixture state
+      // (catalog_hidden=1, reason 'test_fixture', never public), so «not
+      // paused» is read from the reason.
       const pauseOn = await req("POST", "/kategori/gardssalg/eier/testgard/pause", cookie("tok-test"));
       assertTrue(pauseOn.status === 303 && String(pauseOn.headers.location).includes("status=managed_in_mine_valg"), "y14: no-JS pause → refused, pointing to «Mine valg»");
-      assertEq(row("o1b-test").catalog_hidden ?? 0, 0, "y15: … the profile was not paused");
+      assertTrue(row("o1b-test").catalog_hidden_reason !== "owner_pause", "y15: … the profile was not paused");
       const pauseOnJ = await req("POST", "/api/opplevelser/gardssalg-claim/o1b-test/pause", cookie("tok-test"));
       assertEq([pauseOnJ.status, JSON.parse(pauseOnJ.body).error], [409, "managed_in_mine_valg"], "y16: JSON pause → 409 managed_in_mine_valg");
-      assertEq(row("o1b-test").catalog_hidden ?? 0, 0, "y17: … the profile was not paused");
+      assertTrue(row("o1b-test").catalog_hidden_reason !== "owner_pause", "y17: … the profile was not paused");
       expDb.prepare(`UPDATE experience_providers SET catalog_hidden = 1, catalog_hidden_reason = 'owner_pause' WHERE id = 'o1b-test'`).run();
       const resumeOn = await req("POST", "/kategori/gardssalg/eier/testgard/resume", cookie("tok-test"));
       assertTrue(String(resumeOn.headers.location).includes("status=managed_in_mine_valg"), "y18: no-JS resume → refused too");
