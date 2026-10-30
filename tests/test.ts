@@ -49074,6 +49074,28 @@ runSerial(async () => {
   }
 });
 
+// «Slik fungerer Rett fra Bonden for produsenter» (A2A dev-request
+// 2026-10-22-rfb-for-produsenter-faq-side, F1): flag off = 404 + nav/sitemap
+// unchanged; flag on = NO/EN page, canonical/hreflang, nav + sitemap; the 11
+// anchors; FAQPage JSON-LD == visible Q/A; truth pins (price, prepayment,
+// registry statuses, order timings). Router.handle() directly on seo.ts, no
+// DB; restores FOR_PRODUSENTER_PAGE_ENABLED in finally — tail position.
+runSerial(async () => {
+  console.log("\n── for produsenter (rettfrabonden.com /for-produsenter) ──");
+  try {
+    const { runRfbForProdusenterTests } = require("../src/routes/rfb-for-produsenter.test") as
+      typeof import("../src/routes/rfb-for-produsenter.test");
+    const fp = await runRfbForProdusenterTests({ log: false });
+    passed += fp.passed;
+    failed += fp.failed;
+    for (const f of fp.failures) failures.push("rfb-for-produsenter: " + f);
+    console.log(`  rfb-for-produsenter: ${fp.passed} passed, ${fp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-for-produsenter: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-09-24-mcp-rate-limit-og-personvern-sannhet, track C3:
 // checkCartToken() enforces carts.expires_at (the "valid for 7 days" promise
 // is now literally true). Own in-memory DB — tail position, not load-bearing.
