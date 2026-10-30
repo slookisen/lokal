@@ -22,6 +22,7 @@ import { isJunkDescription } from "../services/description-quality";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { registeredMcpTools } from "../services/mcp-tool-manifest";
 import { companyFooterLineHtml, companyOperatorSentence } from "../services/company-legal";
+import { debioProcessText } from "../services/debio-approval";
 
 /** ONE catalog number for every RFB discovery document (services/honest-count.ts); falls back to the list the handler already holds. */
 function rfbCatalogCount(fallback: number): number {
@@ -213,8 +214,9 @@ filtre når en AI-agent vil anbefale en bestemt kvalitetsstandard eller sertifis
   Hanen-medlemmer driver alt fra gårdshotell til serveringssteder med egen råvareproduksjon.
 - **Bondens Marked** — nasjonalt nettverk av bondensmarkeder. Produsentene selger direkte
   til forbruker på faste markedsdager, og må selv produsere det de selger.
-- **Debio** — den offisielle kontrollorganisasjonen for økologisk mat i Norge (Ø-merket).
-  Debio-godkjente produsenter er sertifisert økologiske etter EU/EØS-regelverket.
+- **Debio** — den offisielle kontrollorganisasjonen for økologisk produksjon i Norge. Debio er
+  ikke en paraply her: hvilke produsenter som er Debio-godkjente, hentes fra Debios offentlige
+  register (se «Datakvalitet og verifisering» under), og bare treff vises som «Debio-godkjent».
 - **Norsk Gardsmat** _(planlagt — venter på epost-svar)_ — kvalitetsmerke for tradisjonell norsk gårdsmat. Strengere krav til
   norske råvarer og håndverksmessig produksjon enn økologi-sertifisering alene.
 
@@ -231,7 +233,7 @@ Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
-Eksempel — finn produsenter i Oslo som selger økologisk honning (korrekt MCP JSON-RPC 2.0):
+Eksempel — finn produsenter i Oslo som selger honning (korrekt MCP JSON-RPC 2.0):
 
 \`\`\`
 POST ${BASE_URL}/mcp
@@ -244,7 +246,7 @@ Content-Type: application/json
   "params": {
     "name": "lokal_search",
     "arguments": {
-      "query": "økologisk honning Oslo",
+      "query": "honning Oslo",
       "limit": 10
     }
   }
@@ -318,8 +320,8 @@ Hvert felt i en produsentprofil (adresse, telefon, produkter, m.m.) lagres med h
 som ga oss verdien og når den sist ble bekreftet — ikke bare ett samlet «verifisert»-flagg for
 hele profilen. Adresse og telefon regnes som bekreftet først når minst to uavhengige kilder
 (Brønnøysundregistrene, Google Places, produsentens egen nettside, offisiell Facebook-side,
-eller produsenten selv) er enige, eller når produsenten har bekreftet direkte. Produsenter som
-oppgir økologisk sertifisering kryssjekkes i tillegg mot Debio (finnoko.debio.no). Rene
+eller produsenten selv) er enige, eller når produsenten har bekreftet direkte.
+${debioProcessText("no")} Rene
 AI-gjetninger (kategoriinferens, sesongantakelser, generiske søketreff) telles aldri som bevis
 alene. Produsenter som ennå ikke er bekreftet forblir synlige i katalogen — de skjules ikke.
 Kryssjekkingen i seg selv gir ikke noe merke på profilen — det eneste merket vi viser fram er
@@ -330,8 +332,8 @@ Every field in a producer profile (address, phone, products, etc.) is stored wit
 supplied that value and when it was last confirmed — not one combined "verified" flag for the
 whole profile. Address and phone are treated as confirmed only once at least two independent
 sources (Brønnøysundregistrene, Google Places, the producer's own website, an official Facebook
-page, or the producer directly) agree. Producers claiming organic certification are additionally
-cross-checked against Debio (finnoko.debio.no). Plain AI guesses (category inference, seasonal
+page, or the producer directly) agree. ${debioProcessText("en")}
+Plain AI guesses (category inference, seasonal
 assumptions, generic search hits) never count as evidence on their own. Producers not yet
 confirmed remain listed — they are not hidden. Cross-checking on its own does not add a badge
 to the profile — the only badge we show is "Verified by owner," set only when the owner
@@ -668,7 +670,7 @@ API-base: ${BASE_URL}/api/marketplace
 Name: ${getConfig().display_name}
 Description: Local food marketplace with ${rfbCatalogCount(agents.length)}+ producers in Norway
 Languages: no, en
-Categories: food, marketplace, local-commerce, organic, farm-direct
+Categories: food, marketplace, local-commerce, farm-direct
 Region: NO
 
 # Rate limits
