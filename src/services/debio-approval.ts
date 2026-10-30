@@ -168,3 +168,23 @@ export function debioApprovalText(lang: string, groups: unknown, checkedAt: unkn
 export function finnokoSearchUrl(name: string): string {
   return FINNOKO_SEARCH_URL + encodeURIComponent(name);
 }
+
+/**
+ * Økologi S3a (AC3.3): how Debio status is actually established, for the
+ * public process descriptions (/proveniens, /llms.txt). Register sync on: the
+ * whole public register, daily (the 04:00 UTC debio-sync tick in index.ts),
+ * only sure matches with a valid certificate shown, cleared when the register
+ * is stale. Off (rollback): the daily finnoko list sync, as it then runs.
+ * Never «sertifisert» / «certified» (the /proveniens compliance-phrase guard).
+ */
+export function debioProcessText(lang: string, registerOn: boolean = debioRegisterSyncEnabled()): string {
+  const en = langOf(lang) === "en";
+  if (registerOn) {
+    return en
+      ? `Debio status comes from Debio's public register of approved organic businesses: the whole register is fetched daily and matched against the producers in our catalogue (organisation number, website or e-mail domain, name and address). Only producers with a sure match and a valid certificate are shown as "Debio-approved"; other producers get no organic label. If the register has not been fetched successfully for more than ${DEBIO_REGISTER_STALE_DAYS} days, the label is removed until the next successful fetch.`
+      : `Debio-status hentes fra Debios offentlige register over godkjente økologiske virksomheter: hele registeret hentes daglig og sammenlignes med produsentene i katalogen (organisasjonsnummer, nettsted- eller e-postdomene, navn og adresse). Bare produsenter med et sikkert treff og et gyldig sertifikat vises som «Debio-godkjent»; andre produsenter får ingen økologi-merking. Er registeret ikke hentet på over ${DEBIO_REGISTER_STALE_DAYS} dager, fjernes merkingen til neste vellykkede henting.`;
+  }
+  return en
+    ? `Debio status comes from Debio's company list on finnoko.debio.no: the list is fetched daily and matched against the producers in our catalogue (website domain and name). Only matched producers are shown as "Debio-approved"; other producers get no organic label.`
+    : `Debio-status hentes fra Debios virksomhetsliste på finnoko.debio.no: listen hentes daglig og sammenlignes med produsentene i katalogen (nettstedsdomene og navn). Bare produsenter med treff vises som «Debio-godkjent»; andre produsenter får ingen økologi-merking.`;
+}

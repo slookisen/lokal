@@ -51014,3 +51014,25 @@ runSerial(async () => {
     failures.push("cross-source-facebook-s1b: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
+// pages promise no organic / Debio coverage beyond Debio's public register;
+// /proveniens + llms.txt describe the register flow (flag on) or the finnoko
+// fallback (flag off). Toggles RFB_DEBIO_REGISTER_SYNC (restored in finally)
+// — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── økologi S3a: plattformtekster lover ikke mer enn Debios register ──");
+  try {
+    const { runOrganicTextsS3aTests } = require("../src/routes/organic-texts-s3a.test") as
+      typeof import("../src/routes/organic-texts-s3a.test");
+    const r = await runOrganicTextsS3aTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-texts-s3a: " + f);
+    console.log(`  organic-texts-s3a: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-texts-s3a: unexpected error: " + String(err?.message || err));
+  }
+});
