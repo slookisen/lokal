@@ -205,6 +205,9 @@ export async function runStockCheckReminderB2Tests(opts: { log?: boolean } = {})
     seedProduct(BLK, "blk-soon", { name: "Pastinakk" });
     db.prepare(`INSERT INTO agent_blocklist (identifier_type, identifier_value, reason) VALUES ('email', 'sperret@sc-blocked.example.no', 'test')`).run();
 
+    // B1a: the job, the link and the banner are only for allowlisted subjects.
+    process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = [A, B, OFF, OPT, BLK, FAIL].map((id) => `rfb:${id}`).join(",");
+
     const mailsTo = (id: string) => sent.filter((m) => m.to === emailOf(id) && m.subject === "Bekreft at varene fortsatt er på lager");
     const allReminders = () => sent.filter((m) => m.subject === "Bekreft at varene fortsatt er på lager");
     const noticeRows = (id?: string) => (id

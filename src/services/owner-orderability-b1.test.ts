@@ -361,6 +361,9 @@ export async function runOwnerOrderabilityB1Tests(opts: { log?: boolean } = {}):
     }
 
     setEnv(FLAG, "1");
+    // B1a: the card and the routes are only for allowlisted subjects; the
+    // producers whose card is exercised below are put on the list.
+    setEnv("OWNER_FEATURES_ALLOWED_SUBJECTS", [A, OFF, OTHER, EMATCH].map((id) => `rfb:${id}`).join(","));
 
     // ═══ the card ═════════════════════════════════════════════════════════
     {
