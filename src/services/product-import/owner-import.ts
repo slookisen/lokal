@@ -536,7 +536,7 @@ export function getOwnerImportPreview(agentId: string, runId: string) {
     counts: { new: 0, changed: 0, unchanged: 0, not_found: diff.notFound.length, published: 0, rejected: 0 },
     new: [] as ReturnType<typeof candidateJson>[],
     changed: [] as Array<ReturnType<typeof candidateJson> & { old: { price_nok: number | null; unit: string | null; price: string | null } }>,
-    unchanged: [] as ReturnType<typeof candidateJson>[],
+    unchanged: [] as Array<ReturnType<typeof candidateJson> & { old: { price_nok: number | null; unit: string | null; price: string | null } }>,
     not_found: diff.notFound.map((c) => ({ name: c.name, price: c.price, price_nok: c.price_nok, unit: c.unit, source: c.source })),
     published: [] as ReturnType<typeof candidateJson>[],
     rejected: [] as Array<ReturnType<typeof candidateJson> & { reject_reason: string | null }>,
@@ -546,7 +546,7 @@ export function getOwnerImportPreview(agentId: string, runId: string) {
     const k = diff.kinds[i]!;
     if (k.kind === "new") out.new.push(c);
     else if (k.kind === "changed") out.changed.push({ ...c, old: { price_nok: k.current!.price_nok, unit: k.current!.unit, price: k.current!.price } });
-    else out.unchanged.push(c);
+    else out.unchanged.push({ ...c, old: { price_nok: k.current!.price_nok, unit: k.current!.unit, price: k.current!.price } });
   });
   for (const r of rows) {
     if (r.status === "published") out.published.push(candidateJson(r, null));

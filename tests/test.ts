@@ -51120,6 +51120,27 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 3-2: the owner portal side — card in /eier/:id/portal
+// (flag + verified owner + is_verified=1 + website), form POST fetch, read-only
+// preview page (new / changed / not found, N7 unit, XSS-escaped), «Publiser
+// valgte» merge, 429 / 409 / 503 messages on the card, zero-result outcomes.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 3-2: eierportal-knapp og forhåndsvisning ──");
+  try {
+    const { runOwnerProductImportPortalTests } = require("../src/routes/owner-product-import-portal.test") as
+      typeof import("../src/routes/owner-product-import-portal.test");
+    const r = await runOwnerProductImportPortalTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-product-import-portal: " + f);
+    console.log(`  owner-product-import-portal: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-product-import-portal: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
 // pages promise no organic / Debio coverage beyond Debio's public register;
