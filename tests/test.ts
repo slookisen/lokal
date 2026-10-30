@@ -50902,3 +50902,24 @@ runSerial(async () => {
     failures.push("owner-orderability-b1: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Enrichment-kadens S1a: read-only shadow of how many RFB profiles would lose
+// address/phone agreement (and the aggregate verdict) if facebook_official_page
+// stopped corroborating those fields. Pure shadow + the GET route on an
+// in-memory DB (read-only asserted via total_changes()). Swaps the getDb()
+// singleton and ADMIN_KEY (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── enrichment-kadens S1a: facebook-tier skyggemåling (kun lesing) ──");
+  try {
+    const { runAdminAgentsFacebookTierShadowTests } = require("../src/routes/admin-agents-facebook-tier-shadow.test") as
+      typeof import("../src/routes/admin-agents-facebook-tier-shadow.test");
+    const r = await runAdminAgentsFacebookTierShadowTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("facebook-tier-shadow: " + f);
+    console.log(`  facebook-tier-shadow: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("facebook-tier-shadow: unexpected error: " + String(err?.message || err));
+  }
+});
