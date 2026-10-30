@@ -313,12 +313,21 @@ export function runGardssalgOwnerFeaturesO1aTests(opts: { log?: boolean } = {}):
       const xsPut = await req("PUT", api("o1-test", "/booking.enabled"), { ...json, ...evil, ...cookie("tok-test") }, JSON.stringify({ value: true }));
       assertEq(xsPut.status, 403, "o2: API PUT with a foreign Origin → 403");
       assertEq([bookingLive("o1-test"), auditCount()], [0, audit0], "o3: cross-site writes changed neither booking_live nor owner_feature_audit");
+      // T0a (same-origin-write.ts): Fetch Metadata «cross-site» without an Origin is refused too, with the friendly page.
+      const xsMeta = await req("POST", page("testgard", "/sett"), { ...form, "Sec-Fetch-Site": "cross-site", ...cookie("tok-test") }, "key=booking.enabled&value=true&confirmed=1");
+      assertEq(xsMeta.status, 403, "t0a-g1: page POST with Sec-Fetch-Site: cross-site → 403");
+      assertTrue(xsMeta.body.includes("<title>Kunne ikke lagre") || xsMeta.body.includes("Kunne ikke lagre"), "t0a-g2: refused page title «Kunne ikke lagre»");
+      assertTrue(xsMeta.body.includes("Endringen ble ikke lagret") && xsMeta.body.includes("kontakt@opplevagent.no")
+        && !xsMeta.body.includes("kontakt@rettfrabonden.com") && !/Rett fra Bonden/i.test(xsMeta.body), "t0a-g3: gårdssalg refusal names kontakt@opplevagent.no and never Rett fra Bonden");
+      assertTrue(xsMeta.body.includes(`href="/kategori/gardssalg/eier/testgard/valg">Tilbake til Mine valg</a>`), "t0a-g4: back link «Tilbake til Mine valg»");
+      assertEq([bookingLive("o1-test"), auditCount()], [0, audit0], "t0a-g5: the refused write changed nothing");
 
       const ask = await req("POST", page("testgard", "/sett"), { ...form, ...cookie("tok-test") }, "key=booking.enabled&value=true");
       assertTrue(ask.status === 303 && String(ask.headers.location).includes("bekreft=booking.enabled"), "w8: switching visits on asks for confirmation first");
       assertEq(bookingLive("o1-test"), 0, "w9: nothing written before the confirmation");
-      const on = await req("POST", page("testgard", "/sett"), { ...form, ...cookie("tok-test") }, "key=booking.enabled&value=true&confirmed=1");
-      assertTrue(on.status === 303 && /\?endret=\d+/.test(String(on.headers.location)), "w10: confirmed → saved");
+      // T0a: a plain form POST under Referrer-Policy: no-referrer carries «Origin: null» — accepted.
+      const on = await req("POST", page("testgard", "/sett"), { ...form, Origin: "null", "Sec-Fetch-Site": "same-origin", ...cookie("tok-test") }, "key=booking.enabled&value=true&confirmed=1");
+      assertTrue(on.status === 303 && /\?endret=\d+/.test(String(on.headers.location)), "w10: confirmed → saved (form POST with Origin: null)");
       assertEq(bookingLive("o1-test"), 1, "w11: the switch wrote experience_providers.booking_live");
       const contentAudit = expDb.prepare(`SELECT field_name, new_value, changed_by, batch_id FROM gardssalg_content_audit WHERE provider_id = 'o1-test' AND field_name = 'booking_live'`).all() as any[];
       assertEq(contentAudit.map((r) => [r.new_value, r.changed_by, r.batch_id]), [["1", "owner", "owner-portal"]], "w12: the existing booking_live log got its row");

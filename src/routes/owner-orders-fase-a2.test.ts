@@ -320,6 +320,17 @@ export async function runOwnerOrdersFaseA2Tests(opts: { log?: boolean } = {}): P
       assertTrue(tokenOnList.status === 302 && row(t2).status === "pending", "ac4-13: the token cannot act on other orders through the portal route");
       const csx = await req("POST", K(t2), { headers: { Origin: "https://evil.example" }, form: { action: "decline" } });
       assertTrue(csx.status === 403 && row(t2).status === "pending", "ac4-14: cross-site post to the token view → 403");
+      assertTrue(csx.text.includes("Kunne ikke lagre") && csx.text.includes(`href="${K(t2)}">Tilbake til ordren</a>`) && csx.text.includes("kontakt@rettfrabonden.com"), "t0a-o1: refused → «Kunne ikke lagre» with «Tilbake til ordren»");
+      const csMeta = await req("POST", K(t2), { headers: { "Sec-Fetch-Site": "cross-site" }, form: { action: "decline" } });
+      assertTrue(csMeta.status === 403 && row(t2).status === "pending" && events(t2).length === 0, "t0a-o2: Sec-Fetch-Site: cross-site without Origin → 403, zero writes");
+      const nullTok = seedOrder({ status: "pending", buyerName: "Null Origin Kunde" });
+      const nullAct = await req("POST", K(nullTok), { headers: { Origin: "null", "Sec-Fetch-Site": "same-origin" }, form: { action: "confirm", pickup_time: futureLocal(3) } });
+      await settle();
+      assertTrue(nullAct.status === 303 && row(nullTok).status === "confirmed", "t0a-o3: «Ny henteordre» button (plain form POST, Origin: null) → accepted");
+      const nullSess = seedOrder({ status: "pending", buyerName: "Null Origin Sesjon" });
+      const nullSessAct = await req("POST", A(`/${nullSess}`), { headers: { Cookie: COOKIE_A, Origin: "null" }, form: { action: "confirm", pickup_time: futureLocal(3) } });
+      await settle();
+      assertTrue(nullSessAct.status === 303 && row(nullSess).status === "confirmed", "t0a-o4: owner-session order action with Origin: null → accepted");
       // Not a mutation on GET (mail scanners prefetch links).
       await req("GET", `${K(t2)}?action=confirm`);
       assertEq(row(t2).status, "pending", "ac4-15: GET never changes an order");

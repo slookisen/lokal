@@ -23,7 +23,7 @@
 // done). Owner checks on EVERY call, server-side, with the existing helpers
 // (no new auth mechanism):
 //   - verifyOwnerSession (rfb_owner_session cookie or Bearer) — none → 401;
-//   - POSTs: crossSiteRequest (Origin ≠ Host) → 403;
+//   - POSTs: the shared same-origin write guard (src/middleware/same-origin-write.ts) → 403;
 //   - isVerifiedOwner: the session belongs to exactly this agent and the
 //     profile has a verified owner — else 403 (foreign agent id included);
 //   - agents.is_verified = 1 — an e-mail-match session or a self-registered
@@ -35,8 +35,8 @@
 
 import express, { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import {
-  crossSiteRequest,
   formatImportRunTime,
   ORDERABILITY_ANCHOR,
   isVerifiedOwner,
@@ -45,6 +45,7 @@ import {
   ownerProductsNeedClaimantLoginPage,
   escapeHtml,
   portalShell,
+  portalWriteRefusedPage,
   PRODUCT_IMPORT_ANCHOR,
   productImportOutcomeTextNb,
   sessionClaimantOwnerEmail,
@@ -79,7 +80,7 @@ function checkOwnerImportAccess(req: Request, agentId: string, opts: { write: bo
   if (!productImportEnabled()) return { ok: false, reason: "flag_off", agentId, session: null };
   const session = verifyOwnerSession(req);
   if (!session.valid) return { ok: false, reason: "not_logged_in", agentId, session };
-  if (opts.write && crossSiteRequest(req)) return { ok: false, reason: "cross_site", agentId, session };
+  if (opts.write && isCrossSiteWrite(req)) return { ok: false, reason: "cross_site", agentId, session };
   if (!isVerifiedOwner(agentId, session)) {
     return { ok: false, reason: session.agentId === agentId ? "not_verified" : "foreign", agentId, session };
   }
@@ -234,6 +235,8 @@ function ownerImportPageAuth(req: Request, res: Response, opts: { write: boolean
     res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
   } else if (c.reason === "not_verified") {
     res.status(403).send(ownerNotVerifiedPage(agentId));
+  } else if (c.reason === "cross_site") {
+    res.status(403).send(portalWriteRefusedPage(`/eier/${encodeURIComponent(agentId)}/portal#${PRODUCT_IMPORT_ANCHOR}`));
   } else {
     res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1><p>Du har ikke tilgang til denne profilen.</p></div>`));
   }

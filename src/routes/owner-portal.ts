@@ -22,6 +22,9 @@ import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
+import {
+  isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
+} from "../middleware/same-origin-write";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 import {
@@ -553,6 +556,13 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
       return res.status(403).json(ownerForbiddenJson(id, sessionData));
     }
 
+    // T0a: same-origin write guard (before this only SameSite=Lax protected
+    // it). The portal's fetch() save sends our own Origin; the /eier/:id/save
+    // fallback's server-side fetch sends none — both pass.
+    if (isCrossSiteWrite(req, "/api/agents/:id/update-profile")) {
+      return res.status(403).json({ success: false, error: "cross_site" });
+    }
+
     const db = getDb();
 
     // 2. Whitelist fields from request body
@@ -923,6 +933,11 @@ const PORTAL_PALETTE_CSS = `
     .ep-card h1 { font-size: 1.25rem; }
   }
 `;
+
+/** T0a: the 403 page for a refused owner-portal write (same-origin-write.ts). */
+export function portalWriteRefusedPage(backHref: string, backLabel = "Tilbake til eierportalen"): string {
+  return portalShell(WRITE_GUARD_REFUSED_TITLE, `<div class="ep-card">${writeGuardRefusedBody({ contact: WRITE_GUARD_CONTACT_RFB, backHref, backLabel })}</div>`);
+}
 
 export function portalShell(title: string, body: string, opts: { headHtml?: string } = {}): string {
   return `<!DOCTYPE html>
@@ -2067,8 +2082,8 @@ router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (re
   const agentId = String(req.params.agentId || "");
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
   // Same Origin check as POST /eier/:id/selger: no cross-site trigger.
-  if (crossSiteRequest(req)) {
-    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  if (isCrossSiteWrite(req, "/eier/:agentId/pause")) {
+    return res.status(403).send(portalWriteRefusedPage(base));
   }
   try {
     const out = applyOwnerPause(req, agentId, req.body?.paused, req.body?.until);
@@ -2132,8 +2147,8 @@ router.post("/eier/:agentId/order-email", express.urlencoded({ extended: false }
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   // Same Origin check as POST /eier/:id/pause and /selger: no cross-site trigger.
-  if (crossSiteRequest(req)) {
-    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  if (isCrossSiteWrite(req, "/eier/:agentId/order-email")) {
+    return res.status(403).send(portalWriteRefusedPage(base));
   }
   try {
     const out = await requestOwnerOrderEmailChange(req, agentId, req.body?.email);
@@ -2203,8 +2218,9 @@ router.post(`${ORDER_EMAIL_CONFIRM_PATH}/:token`, orderEmailConfirmLimiter, expr
     return res.status(404).send(portalShell("Fant ikke siden", `<div class="ep-card"><h1>Fant ikke siden</h1></div>`));
   }
   orderEmailNoStore(res);
-  if (crossSiteRequest(req)) {
-    return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  if (isCrossSiteWrite(req, `${ORDER_EMAIL_CONFIRM_PATH}/:token`)) {
+    // Back to the confirmation form this POST came from (the token holder's own link).
+    return res.status(403).send(portalWriteRefusedPage(`${ORDER_EMAIL_CONFIRM_PATH}/${encodeURIComponent(String(req.params.token || ""))}`));
   }
   try {
     const state = confirmOwnerOrderEmailChange(String(req.params.token || ""));
@@ -2236,6 +2252,10 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
     return session.agentId === agentId
       ? res.status(403).send(ownerNotVerifiedPage(agentId))
       : res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+  }
+  // T0a: same-origin write guard (before this only SameSite=Lax protected it).
+  if (isCrossSiteWrite(req, "/eier/:agentId/save")) {
+    return res.status(403).send(portalWriteRefusedPage(base));
   }
   try {
     // Build whitelisted JSON payload from form fields
@@ -2297,11 +2317,8 @@ router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
 // e-mail opened this session — an e-mail-match session never receives a
 // claim token. POST + SameSite=Lax cookie + Origin check: no cross-site
 // trigger.
-export function crossSiteRequest(req: Request): boolean {
-  const origin = req.headers.origin;
-  if (!origin || typeof origin !== "string") return false;
-  try { return new URL(origin).host !== String(req.headers.host || ""); } catch { return true; }
-}
+// The Origin check itself lives in src/middleware/same-origin-write.ts
+// (isCrossSiteWrite); refusals render portalWriteRefusedPage().
 
 /**
  * The verified claimant's e-mail when this session was opened by that
@@ -2340,7 +2357,7 @@ router.post("/eier/:agentId/selger", (req: Request, res: Response) => {
   try {
     const session = verifyOwnerSession(req);
     if (!session.valid) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
-    if (crossSiteRequest(req)) return res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+    if (isCrossSiteWrite(req, "/eier/:agentId/selger")) return res.status(403).send(portalWriteRefusedPage(`/eier/${encodeURIComponent(agentId)}/portal`));
     // Always the strict predicate here (independent of the gate flag): this
     // hands out the products editor.
     if (!isVerifiedOwner(agentId, session)) {
@@ -2518,8 +2535,8 @@ function ownerOrderabilityAuth(req: Request, res: Response): OwnerOrderabilityAu
     res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
     return { ok: false };
   }
-  if (crossSiteRequest(req)) {
-    res.status(403).send(portalShell("Ingen tilgang", `<div class="ep-card"><h1>Ingen tilgang</h1></div>`));
+  if (isCrossSiteWrite(req)) {
+    res.status(403).send(portalWriteRefusedPage(`/eier/${encodeURIComponent(agentId)}/portal`));
     return { ok: false };
   }
   if (!isVerifiedOwner(agentId, session)) {

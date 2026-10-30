@@ -50695,6 +50695,30 @@ runSerial(async () => {
   }
 });
 
+// Slice T0a (owner-portal write guard): the ONE shared same-origin check
+// (src/middleware/same-origin-write.ts) — predicate matrix, flag=0 oracle,
+// log line, source scan; then the real «Mine valg» level / profile-save
+// handlers behind it. Swaps the getDb() singleton, console.log and env vars
+// (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── T0a: felles skrivevakt (same-origin-write) ──");
+  for (const [name, load] of [
+    ["same-origin-write", () => (require("../src/middleware/same-origin-write.test") as typeof import("../src/middleware/same-origin-write.test")).runSameOriginWriteTests({ log: false })],
+    ["write-guard-t0a", () => (require("../src/routes/write-guard-t0a.test") as typeof import("../src/routes/write-guard-t0a.test")).runWriteGuardT0aTests({ log: false })],
+  ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
+    try {
+      const r = await load();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${name}: ` + f);
+      console.log(`  ${name}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${name}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
 // «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
 // (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,
