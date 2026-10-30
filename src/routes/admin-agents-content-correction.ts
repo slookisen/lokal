@@ -40,11 +40,17 @@
 //   { agent_id, field: "description"|"about", text }
 //   { agent_id, field: "product_name", old_name, text }  — renames the ONE
 //       agent_knowledge.products entry whose name === old_name (0 or >1
-//       matches -> invalid_item); every other product field kept. If `text`
-//       already names another product (exact, or equal after the catalog's
+//       matches -> invalid_item); every other product field kept. Entries
+//       come in two kinds and both are matched: objects ({ name, ... }, name
+//       compared) and plain strings (some producers store `products` as
+//       ["Poteter", "Gulrot"], or a mix; the string itself is compared). A
+//       renamed string entry is replaced by the string `text` — it stays a
+//       string, never becomes an object. If `text` already names another
+//       product of either kind (exact, or equal after the catalog's
 //       case/whitespace normalisation): would_merge / merged — the entry with
-//       more populated fields is kept (tie: the one already named `text`),
-//       named `text`, the other dropped; reported in `merge` + audit notes.
+//       more populated fields is kept (a string has none; tie: the one already
+//       named `text`), named `text` and kept in its own kind, the other
+//       dropped; reported in `merge` + audit notes.
 //   { agent_id, field: "products_organic_flag" }  — organic=false on every
 //       product with a truthy organic.
 //   { agent_id, field: "specialties"|"certifications"|"tags", remove: string[] }
@@ -79,6 +85,12 @@
 // The effect is reported per item (`catalog`, also on dry-run, which writes
 // nothing) and appended to the audit notes with the full old catalog row, so
 // it can be rolled back.
+// Plain-string product entries are never in the catalog (the sync only lists
+// object entries with a string `name`), so renaming one is always catalog
+// action "none" and never touches `products` — also when it merges into an
+// object duplicate (that object's catalog row already carries `text`'s key).
+// An object entry merged into a string duplicate keeps the object behaviour
+// above (planned from the renamed object's old key to the new name).
 // Max 50 items per call — this is a targeted lever, not a sweep.
 
 import { Router, Request, Response } from "express";
@@ -338,6 +350,26 @@ function isProductObj(p: unknown): p is Record<string, unknown> {
   return !!p && typeof p === "object" && !Array.isArray(p);
 }
 
+/**
+ * The name of one stored products entry: a plain string entry is its own
+ * name, an object entry its string `name`. undefined for anything else.
+ */
+function productEntryName(p: unknown): string | undefined {
+  if (typeof p === "string") return p;
+  if (isProductObj(p) && typeof p.name === "string") return p.name;
+  return undefined;
+}
+
+/** `entry` renamed to `name`, kept in its own kind (string stays string). */
+function withProductName(entry: unknown, name: string): unknown {
+  return typeof entry === "string" ? name : { ...(entry as Record<string, unknown>), name };
+}
+
+/** Populated non-name fields of an entry; a plain string entry has none. */
+function entryFieldCount(entry: unknown): number {
+  return isProductObj(entry) ? populatedFieldCount(entry) : 0;
+}
+
 /** How many fields besides `name` carry a value — the merge tie-breaker. */
 function populatedFieldCount(p: Record<string, unknown>): number {
   let n = 0;
@@ -368,8 +400,13 @@ interface Plan {
   removed?: string[];
   not_found_elements?: string[];
   changed_count?: number;
-  /** product_name: the stored entry being renamed (before the rename). */
+  /**
+   * product_name: the stored OBJECT entry being renamed (before the rename).
+   * Unset for a plain-string entry — those never reach planCatalog.
+   */
   renamedEntry?: Record<string, unknown>;
+  /** product_name: the renamed entry is a plain string (not in the catalog). */
+  renamedStringEntry?: boolean;
 }
 
 /**
@@ -451,36 +488,43 @@ function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
 
   if (item.field === "product_name") {
     const sel: Plan = { ...base, oldPreview: item.old_name, newPreview: item.text };
-    const matches = arr.map((p, i) => (isProductObj(p) && p.name === item.old_name ? i : -1)).filter((i) => i >= 0);
+    // Exact equality against both kinds: object `name`, or the string itself.
+    const matches = arr.map((p, i) => (productEntryName(p) === item.old_name ? i : -1)).filter((i) => i >= 0);
     if (matches.length !== 1) {
       return { ...sel, outcome: "invalid_item", detail: `old_name matches ${matches.length} products (need exactly 1)` };
     }
     const idx = matches[0];
     if (item.old_name === item.text) return { ...sel, outcome: "skipped_unchanged" };
-    // A duplicate is a product already named `text` — exactly, or equal under
-    // the catalog's case/whitespace normalisation (same catalog row).
+    // A duplicate is a product (string or object) already named `text` —
+    // exactly, or equal under the catalog's case/whitespace normalisation.
     const textNorm = normalizeName(item.text);
     const dupes = arr
-      .map((p, i) => (i !== idx && isProductObj(p) && typeof p.name === "string" && (p.name === item.text || normalizeName(p.name) === textNorm) ? i : -1))
+      .map((p, i) => {
+        if (i === idx) return -1;
+        const n = productEntryName(p);
+        return n !== undefined && (n === item.text || normalizeName(n) === textNorm) ? i : -1;
+      })
       .filter((i) => i >= 0);
     if (dupes.length > 1) {
       return { ...sel, outcome: "invalid_item", detail: `text already names ${dupes.length} products — ambiguous merge` };
     }
-    const renamed = arr[idx] as Record<string, unknown>;
-    sel.renamedEntry = renamed;
+    const renamed = arr[idx];
+    if (typeof renamed === "string") sel.renamedStringEntry = true;
+    else sel.renamedEntry = renamed as Record<string, unknown>;
     if (dupes.length === 0) {
-      // Spread keeps key order and every other field; only `name` changes.
+      // Object: spread keeps key order and every other field; only `name`
+      // changes. String: replaced by the string `text`.
       const next = arr.slice();
-      next[idx] = { ...renamed, name: item.text };
+      next[idx] = withProductName(renamed, item.text);
       return { ...sel, outcome: "would_write", newValue: JSON.stringify(next) };
     }
     // Merge: keep the row with the most populated fields; tie -> the row
-    // that already carries `text`. Kept row ends up named `text`, the other
-    // is dropped; the kept row stays at its own position.
+    // that already carries `text`. Kept row ends up named `text` (in its own
+    // kind), the other is dropped; the kept row stays at its own position.
     const dupIdx = dupes[0];
-    const existing = arr[dupIdx] as Record<string, unknown>;
-    const keepRenamed = populatedFieldCount(renamed) > populatedFieldCount(existing);
-    const keptProduct = { ...(keepRenamed ? renamed : existing), name: item.text };
+    const existing = arr[dupIdx];
+    const keepRenamed = entryFieldCount(renamed) > entryFieldCount(existing);
+    const keptProduct = withProductName(keepRenamed ? renamed : existing, item.text);
     const droppedIdx = keepRenamed ? dupIdx : idx;
     const keptIdx = keepRenamed ? idx : dupIdx;
     const next: unknown[] = [];
@@ -528,8 +572,11 @@ function plan(cur: LockSnapshot | undefined, item: ValidItem): Plan {
 type ApplyResult = Plan & { name?: string; catalog?: CatalogEffect };
 
 function catalogFor(db: ReturnType<typeof getDb>, item: ValidItem, p: Plan): CatalogEffect | undefined {
-  if (item.field !== "product_name" || !p.renamedEntry) return undefined;
+  if (item.field !== "product_name") return undefined;
   if (p.outcome !== "would_write" && p.outcome !== "would_merge") return undefined;
+  // A plain-string entry is never in the catalog — never touch `products`.
+  if (p.renamedStringEntry) return { action: "none", detail: "string product entry is not in the catalog" };
+  if (!p.renamedEntry) return undefined;
   return planCatalog(db, item.agent_id, p.renamedEntry, item.text);
 }
 

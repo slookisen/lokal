@@ -26,6 +26,11 @@
  *      merged keeping the richer row), products_organic_flag, specialties /
  *      certifications / tags removal incl. not-found elements; owner and
  *      curated locks, dry-run writes nothing, max 50, write-pause gate.
+ *   Q. content-correction product_name on plain-string product entries
+ *      (S2w-b, Meen Gård): string-only and mixed arrays; string stays a
+ *      string; exactly-1 rule across both kinds; merges string<->string,
+ *      string->object and object->string; catalog `products` never touched
+ *      for a string entry; owner lock.
  *
  * Setup mirrors admin-agents-description-code-artifact-sweep.test.ts exactly
  * (better-sqlite3 ":memory:" + __initSchemaForTesting, route pointed at that
@@ -699,6 +704,159 @@ export function runAdminAgentsContentQualityTests(opts: { log?: boolean } = {}):
         r = await post({ reason: REASON, items: [{ agent_id: "p-noorganic", field: "tags", remove: ["x"] }] });
         assertTrue(r.status >= 400, "p-58: write-pause blocks a dry-run of a list item");
         setEnrichmentWritePause(db as any, { vertical: "rfb", enabled: false, cleared_by: "test-actor" }, "test-actor");
+      } finally {
+        try { require("./admin-agents-content-correction").__setContentCorrectionDbForTesting(null); } catch { /* ignore */ }
+        try { db.close(); } catch { /* ignore */ }
+      }
+    }
+
+    // ─── Section Q: product_name on plain-string product entries (S2w-b) ──
+    {
+      const db = new Database(":memory:");
+      try {
+        initMod.__initSchemaForTesting(db as any);
+        const insertAgent = db.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, claimed_at)
+           VALUES (?, ?, ?, 'test', 'post@example.no', 'https://example.no', 'producer', ?, 'rfb', ?)`,
+        );
+        const insertKnowledge = db.prepare(`INSERT INTO agent_knowledge (agent_id, products, curated_fields) VALUES (?, ?, '{}')`);
+
+        // The real case: Meen Gård stores products as plain strings.
+        const MEEN_OLD = "Poteter (fleire sortar, inkl. økologisk)";
+        const MEEN_NEW = "Poteter (fleire sortar)";
+        const MEEN_PRODUCTS = JSON.stringify([MEEN_OLD, "Gulrot"]);
+        insertAgent.run("q-str", "Meen Gård", NORMAL_DESC, "k-q-str", null);
+        insertKnowledge.run("q-str", MEEN_PRODUCTS);
+        // Mixed: objects and a string.
+        const MIX = JSON.stringify([{ name: "Egg", price: "60" }, "Økologiske poteter", { name: "Honning", price: "100" }]);
+        insertAgent.run("q-mix", "Blanda Gård AS", NORMAL_DESC, "k-q-mix", null);
+        insertKnowledge.run("q-mix", MIX);
+        // Two identical strings -> ambiguous old_name.
+        insertAgent.run("q-twin", "Tvilling Streng AS", NORMAL_DESC, "k-q-twin", null);
+        insertKnowledge.run("q-twin", JSON.stringify(["Gulrot", "Gulrot", "Kål"]));
+        // A string and an object with the same name -> also ambiguous (both kinds count).
+        insertAgent.run("q-twin-mix", "Tvilling Blanda AS", NORMAL_DESC, "k-q-twinm", null);
+        insertKnowledge.run("q-twin-mix", JSON.stringify(["Kål", { name: "Kål", price: "30" }]));
+        // Merge string -> existing string dupe (normalised equality).
+        insertAgent.run("q-merge-ss", "Flett Streng AS", NORMAL_DESC, "k-q-mss", null);
+        insertKnowledge.run("q-merge-ss", JSON.stringify(["Økologiske poteter", "Gulrot", "poteter"]));
+        // Merge string -> existing object dupe (object richer, kept).
+        insertAgent.run("q-merge-so", "Flett Objekt AS", NORMAL_DESC, "k-q-mso", null);
+        insertKnowledge.run("q-merge-so", JSON.stringify(["Økologisk lam", { name: "Lam", price: "280", category: "meat" }]));
+        // Merge object -> existing string dupe (object richer, kept; catalog planned from the object).
+        insertAgent.run("q-merge-os", "Flett Omvendt AS", NORMAL_DESC, "k-q-mos", null);
+        insertKnowledge.run("q-merge-os", JSON.stringify([{ name: "Økologisk ost", price: "90" }, "Ost"]));
+        // Owner-locked agent with string products.
+        insertAgent.run("q-claimed", "Eid Streng AS", NORMAL_DESC, "k-q-claimed", "2026-01-01T00:00:00.000Z");
+        insertKnowledge.run("q-claimed", MEEN_PRODUCTS);
+
+        assertTrue(runProductCatalogSync(db as any).success, "q-00: initial catalog sync ok");
+        const catAll = () => JSON.stringify(db.prepare(`SELECT * FROM products ORDER BY id`).all());
+        const catRows = (id: string) =>
+          db.prepare(`SELECT id, name, name_norm, availability FROM products WHERE agent_id = ? ORDER BY name_norm`).all(id) as any[];
+
+        delete require.cache[require.resolve("./admin-agents-content-correction")];
+        const routeMod = require("./admin-agents-content-correction");
+        const router = routeMod.default;
+        routeMod.__setContentCorrectionDbForTesting(db as any);
+
+        const post = (body: any, query?: Record<string, string>) =>
+          callRoute(router, { method: "POST", url: "/", headers: { "x-admin-key": testKey }, body, query });
+        const apply = { apply: "1" };
+        const productsRaw = (id: string) => (db.prepare(`SELECT products FROM agent_knowledge WHERE agent_id = ?`).get(id) as any).products;
+        const productsOf = (id: string) => JSON.parse(productsRaw(id));
+        const auditFor = (id: string) =>
+          db.prepare(`SELECT field_name, old_value, new_value, changed_by, notes FROM agent_knowledge_audit WHERE agent_id = ? ORDER BY changed_at, rowid`).all(id) as any[];
+        const res = (body: any, id: string) => (body?.results ?? []).find((r: any) => r.agent_id === id);
+        const REASON = "S2w-b test: Debio-klage, «økologisk» i strengprodukt";
+        const MEEN_ITEM = { agent_id: "q-str", field: "product_name", old_name: MEEN_OLD, text: MEEN_NEW };
+
+        assertEq(catRows("q-str").length, 0, "q-01: fixture: string entries are never in the catalog");
+        const catBefore = catAll();
+
+        // ── String-only: dry-run ──
+        let r = await post({ reason: REASON, items: [MEEN_ITEM] });
+        assertEq(r.body?.dry_run, true, "q-02: dry-run by default");
+        assertEq(res(r.body, "q-str")?.outcome, "would_write", "q-03: string entry matched -> would_write (was invalid_item before S2w-b)");
+        assertEq(res(r.body, "q-str")?.catalog?.action, "none", "q-04: dry-run catalog effect none for a string entry");
+        assertEq(res(r.body, "q-str")?.catalog?.detail, "string product entry is not in the catalog", "q-05: …with the reason");
+        assertEq(productsRaw("q-str"), MEEN_PRODUCTS, "q-06: dry-run wrote nothing");
+        assertEq(auditFor("q-str").length, 0, "q-07: dry-run audited nothing");
+
+        // ── String-only: apply ──
+        r = await post({ reason: REASON, items: [MEEN_ITEM] }, apply);
+        assertEq(res(r.body, "q-str")?.outcome, "written", "q-08: string rename written");
+        assertEq(productsRaw("q-str"), JSON.stringify([MEEN_NEW, "Gulrot"]), "q-09: stored JSON stays an array of strings, renamed in place");
+        let a = auditFor("q-str");
+        assertEq(a.length, 1, "q-10: one audit row");
+        assertEq(a[0]?.field_name, "products", "q-11: audit field_name = products");
+        assertEq(a[0]?.old_value, MEEN_PRODUCTS, "q-12: audit old_value = full old products JSON");
+        assertEq(a[0]?.new_value, JSON.stringify([MEEN_NEW, "Gulrot"]), "q-13: audit new_value = full new products JSON");
+        assertEq(res(r.body, "q-str")?.catalog?.applied, false, "q-14: catalog effect not applied");
+        assertEq(catAll(), catBefore, "q-15: catalog `products` table untouched");
+        r = await post({ reason: REASON, items: [MEEN_ITEM] }, apply);
+        assertEq(res(r.body, "q-str")?.outcome, "invalid_item", "q-16: re-apply: old string no longer present -> 0 matches");
+
+        // ── Mixed array: rename the string ──
+        r = await post({ reason: REASON, items: [{ agent_id: "q-mix", field: "product_name", old_name: "Økologiske poteter", text: "Poteter" }] }, apply);
+        assertEq(res(r.body, "q-mix")?.outcome, "written", "q-17: string in a mixed array renamed");
+        assertEq(productsOf("q-mix"), [{ name: "Egg", price: "60" }, "Poteter", { name: "Honning", price: "100" }],
+          "q-18: string stays a string at its position; objects untouched");
+        // …and an object in the same mixed array still renames as an object.
+        r = await post({ reason: REASON, items: [{ agent_id: "q-mix", field: "product_name", old_name: "Honning", text: "Lynghonning" }] }, apply);
+        assertEq(res(r.body, "q-mix")?.outcome, "written", "q-19: object in a mixed array renamed");
+        assertEq(productsOf("q-mix")[2], { name: "Lynghonning", price: "100" }, "q-20: object keeps its other fields");
+
+        // ── Exactly-1 rule across both kinds ──
+        r = await post({
+          reason: REASON,
+          items: [
+            { agent_id: "q-twin", field: "product_name", old_name: "Gulrot", text: "Gulrøtter" },
+            { agent_id: "q-twin-mix", field: "product_name", old_name: "Kål", text: "Hodekål" },
+            { agent_id: "q-mix", field: "product_name", old_name: "Finnes ikke", text: "X" },
+            { agent_id: "q-twin", field: "product_name", old_name: "gulrot", text: "Gulrøtter" },
+          ],
+        }, apply);
+        const outs = (r.body?.results ?? []).map((x: any) => x.outcome);
+        assertEq(outs, ["invalid_item", "invalid_item", "invalid_item", "invalid_item"],
+          "q-21: two identical strings, string+object same name, 0 matches, case-different old_name -> all invalid_item");
+        assertTrue((r.body?.results?.[0]?.detail ?? "").includes("matches 2 products"), "q-22: detail names the match count");
+        assertEq(productsOf("q-twin"), ["Gulrot", "Gulrot", "Kål"], "q-23: ambiguous row untouched");
+
+        // ── Merge string -> existing string dupe (normalised) ──
+        r = await post({ reason: REASON, items: [{ agent_id: "q-merge-ss", field: "product_name", old_name: "Økologiske poteter", text: "Poteter" }] });
+        assertEq(res(r.body, "q-merge-ss")?.outcome, "would_merge", "q-24: string->string normalised duplicate -> would_merge");
+        assertEq(res(r.body, "q-merge-ss")?.catalog?.action, "none", "q-25: merge of a string entry: catalog none");
+        r = await post({ reason: REASON, items: [{ agent_id: "q-merge-ss", field: "product_name", old_name: "Økologiske poteter", text: "Poteter" }] }, apply);
+        assertEq(res(r.body, "q-merge-ss")?.outcome, "merged", "q-26: merged on apply");
+        assertEq(res(r.body, "q-merge-ss")?.merge?.kept, "existing_row", "q-27: tie (0 fields each) -> existing kept");
+        assertEq(productsOf("q-merge-ss"), ["Gulrot", "Poteter"], "q-28: one entry dropped, kept string at its own position named `text`");
+        assertTrue((auditFor("q-merge-ss")[0]?.notes ?? "").includes("merge: kept existing_row"), "q-29: audit notes record the merge");
+
+        // ── Merge string -> existing object dupe ──
+        const lamCatBefore = JSON.stringify(catRows("q-merge-so"));
+        r = await post({ reason: REASON, items: [{ agent_id: "q-merge-so", field: "product_name", old_name: "Økologisk lam", text: "Lam" }] }, apply);
+        assertEq(res(r.body, "q-merge-so")?.outcome, "merged", "q-30: string merged into object dupe");
+        assertEq(res(r.body, "q-merge-so")?.merge?.kept, "existing_row", "q-31: richer object kept");
+        assertEq(productsOf("q-merge-so"), [{ name: "Lam", price: "280", category: "meat" }], "q-32: object kept (all fields), named `text`, string dropped");
+        assertEq(res(r.body, "q-merge-so")?.catalog?.action, "none", "q-33: catalog none (renamed entry was a string)");
+        assertEq(JSON.stringify(catRows("q-merge-so")), lamCatBefore, "q-34: the object's catalog row is untouched");
+
+        // ── Merge object -> existing string dupe ──
+        const ostId = catRows("q-merge-os").find((x: any) => x.name_norm === "økologisk ost")?.id;
+        assertTrue(!!ostId, "q-35: fixture: object entry has a catalog row");
+        r = await post({ reason: REASON, items: [{ agent_id: "q-merge-os", field: "product_name", old_name: "Økologisk ost", text: "Ost" }] }, apply);
+        assertEq(res(r.body, "q-merge-os")?.outcome, "merged", "q-36: object merged with string dupe");
+        assertEq(res(r.body, "q-merge-os")?.merge?.kept, "renamed_row", "q-37: richer renamed object kept");
+        assertEq(productsOf("q-merge-os"), [{ name: "Ost", price: "90" }], "q-38: object kept as object named `text`, string dropped");
+        assertEq(res(r.body, "q-merge-os")?.catalog?.action, "rename_in_place", "q-39: catalog planned from the object's old key (existing behaviour)");
+        assertEq(catRows("q-merge-os").map((x: any) => [x.id, x.name]), [[ostId, "Ost"]], "q-40: same catalog row now carries the new name");
+
+        // ── Owner lock holds for string entries ──
+        r = await post({ reason: REASON, items: [{ ...MEEN_ITEM, agent_id: "q-claimed" }] }, apply);
+        assertEq(res(r.body, "q-claimed")?.outcome, "skipped_claimed", "q-41: owner-locked agent -> skipped_claimed for a string entry");
+        assertEq(productsRaw("q-claimed"), MEEN_PRODUCTS, "q-42: locked row untouched");
+        assertEq(auditFor("q-claimed").length, 0, "q-43: no audit on locked row");
       } finally {
         try { require("./admin-agents-content-correction").__setContentCorrectionDbForTesting(null); } catch { /* ignore */ }
         try { db.close(); } catch { /* ignore */ }
