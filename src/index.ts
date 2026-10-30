@@ -127,6 +127,7 @@ import adminAgentsContentCorrectionRoutes from "./routes/admin-agents-content-co
 import adminAgentsThemeSpamSweepRoutes from "./routes/admin-agents-theme-spam-sweep";
 import adminAgentsCategoryDescriptionProvenanceAuditRoutes from "./routes/admin-agents-category-description-provenance-audit";
 import adminAgentsFylkeContradictionAuditRoutes from "./routes/admin-agents-fylke-contradiction-audit";
+import adminAgentsFacebookTierShadowRoutes from "./routes/admin-agents-facebook-tier-shadow";
 import adminDrinkCoverageRoutes from "./routes/admin-drink-coverage";
 import adminEnrichmentWritePauseRoutes from "./routes/admin-enrichment-write-pause";
 import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-merge";
@@ -912,6 +913,10 @@ app.use(
 // feil-adresse, Mål 1): read-only list of RFB producers whose name suffix and city point to
 // different fylker. Mount BEFORE /admin/agents like the siblings above.
 app.use("/admin/agents/fylke-contradiction-audit", adminLimiter, adminAgentsFylkeContradictionAuditRoutes);
+// GET /admin/agents/facebook-tier-shadow (enrichment-kadens S1a): read-only shadow count of
+// RFB profiles that would lose address/phone agreement if facebook_official_page stopped
+// corroborating those fields. Mount BEFORE /admin/agents like the siblings above.
+app.use("/admin/agents/facebook-tier-shadow", adminLimiter, adminAgentsFacebookTierShadowRoutes);
 app.use("/admin/agents/drink-coverage", adminLimiter, adminDrinkCoverageRoutes);
 // GET/POST /admin/enrichment-write-pause (dev-request 2026-08-20-enrichment-
 // write-pause-mekanisk-gjerde, P1) — the per-vertical enrichment write-pause
