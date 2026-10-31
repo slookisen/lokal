@@ -3145,10 +3145,20 @@ export async function refreshHomepageContent(
 /** Default time budget (ms) for one POST /admin/homepage-content-refresh call. */
 export const HCR_ROUTE_TIME_BUDGET_MS = 40_000;
 
-/** HCR_ROUTE_TIME_BUDGET_MS, overridable by the env var of the same name (positive integer, else the default). */
+/** Upper bound (ms) for the HCR_ROUTE_TIME_BUDGET_MS env override. */
+export const HCR_ROUTE_TIME_BUDGET_MAX_MS = 300_000;
+
+/**
+ * HCR_ROUTE_TIME_BUDGET_MS, overridable by the env var of the same name: the
+ * trimmed value must be all digits and positive (else the default), and is
+ * clamped to HCR_ROUTE_TIME_BUDGET_MAX_MS.
+ */
 export function resolveHcrRouteTimeBudgetMs(env: Record<string, string | undefined> = process.env): number {
-  const n = parseInt(String(env.HCR_ROUTE_TIME_BUDGET_MS ?? ""), 10);
-  return Number.isInteger(n) && n > 0 ? n : HCR_ROUTE_TIME_BUDGET_MS;
+  const raw = String(env.HCR_ROUTE_TIME_BUDGET_MS ?? "").trim();
+  if (!/^\d+$/.test(raw)) return HCR_ROUTE_TIME_BUDGET_MS;
+  const n = Number(raw);
+  if (n <= 0) return HCR_ROUTE_TIME_BUDGET_MS;
+  return Math.min(n, HCR_ROUTE_TIME_BUDGET_MAX_MS);
 }
 
 /** The route's `limit`: body first, then ?limit=N; default 25, hard cap 100. */

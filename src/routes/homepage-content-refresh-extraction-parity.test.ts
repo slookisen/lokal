@@ -346,33 +346,52 @@ export async function runHomepageContentRefreshExtractionParityTests(opts: { log
         });
       }) as unknown as typeof fetch;
       (globalThis as any).fetch = slowFetch;
-      const keepAlive = setTimeout(() => undefined, 10_000);
+      // Hard 5 s guard: if the route's deadline ever goes missing, the hanging
+      // fetches never settle — the race then records an explicit failure
+      // instead of the run exiting 0 once nothing keeps the event loop alive.
+      // The ref'd guard timer also holds the loop open while AbortSignal's
+      // unref'd timer is pending, and is cleared as soon as the race settles.
+      const R1_TIMED_OUT = Symbol("r1-timed-out");
+      let r1Guard: ReturnType<typeof setTimeout> | undefined;
       const t0 = Date.now();
-      const r = await callRoute(router, { body: { agentIds: ids, apply: true }, headers });
+      const raced = await Promise.race([
+        callRoute(router, { body: { agentIds: ids, apply: true }, headers }),
+        new Promise<typeof R1_TIMED_OUT>((resolve) => {
+          r1Guard = setTimeout(() => resolve(R1_TIMED_OUT), 5000);
+        }),
+      ]);
       const ms = Date.now() - t0;
-      clearTimeout(keepAlive);
+      clearTimeout(r1Guard);
       (globalThis as any).fetch = stubFetch;
       if (prevBudget === undefined) delete process.env.HCR_ROUTE_TIME_BUDGET_MS;
       else process.env.HCR_ROUTE_TIME_BUDGET_MS = prevBudget;
-      const unreached = db2
-        .prepare(
-          `SELECT agent_id, homepage_fetch_attempts, homepage_unreachable_since, homepage_content_checked_at
-             FROM agent_knowledge WHERE agent_id IN ('hp-dead','hp-slow','hp-spam','hp-curated') ORDER BY agent_id`,
-        )
-        .all();
-      assertEq(
-        [
-          r.status,
-          ms < 3000,
-          r.body.truncated,
-          r.body.not_reached,
-          r.body.changed.map((c: any) => c.agent_id),
-          r.body.parked_now,
-          unreached.every((u: any) => u.homepage_fetch_attempts === 0 && u.homepage_unreachable_since === null && u.homepage_content_checked_at === null),
-        ],
-        [200, true, true, 4, ["hp-google"], [], true],
-        "R1: slow sites → answer within the budget, truncated:true, not_reached:4, no strike/parking/stamp on unreached targets",
-      );
+      if (raced === R1_TIMED_OUT) {
+        failed++;
+        const msg = "✗ R1: the route did not answer within 5 s — its time budget/deadline is not enforced";
+        failures.push(msg);
+        if (log) console.log("  " + msg);
+      } else {
+        const r = raced;
+        const unreached = db2
+          .prepare(
+            `SELECT agent_id, homepage_fetch_attempts, homepage_unreachable_since, homepage_content_checked_at
+               FROM agent_knowledge WHERE agent_id IN ('hp-dead','hp-slow','hp-spam','hp-curated') ORDER BY agent_id`,
+          )
+          .all();
+        assertEq(
+          [
+            r.status,
+            ms < 3000,
+            r.body.truncated,
+            r.body.not_reached,
+            r.body.changed.map((c: any) => c.agent_id),
+            r.body.parked_now,
+            unreached.every((u: any) => u.homepage_fetch_attempts === 0 && u.homepage_unreachable_since === null && u.homepage_content_checked_at === null),
+          ],
+          [200, true, true, 4, ["hp-google"], [], true],
+          "R1: slow sites → answer within the budget, truncated:true, not_reached:4, no strike/parking/stamp on unreached targets",
+        );
+      }
     }
     // R2: ?limit=5 → 5 targets; the body's limit wins over the query's.
     {
@@ -411,9 +430,15 @@ export async function runHomepageContentRefreshExtractionParityTests(opts: { log
           (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "1500" }),
           (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "-4" }),
           (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "x" }),
+          (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: " 2000 " }),
+          (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "1500ms" }),
+          (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "1.5" }),
+          (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "0" }),
+          (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "999999" }),
+          (mod as any).resolveHcrRouteTimeBudgetMs({ HCR_ROUTE_TIME_BUDGET_MS: "99999999999999999999" }),
         ],
-        [25, 5, 3, 100, 25, 40000, 1500, 40000, 40000],
-        "R3: limit (body > query, default 25, cap 100) and budget (env positive integer, else 40000) resolution",
+        [25, 5, 3, 100, 25, 40000, 1500, 40000, 40000, 2000, 40000, 40000, 40000, 300000, 300000],
+        "R3: limit (body > query, default 25, cap 100) and budget (env all-digit positive integer, clamped to 300000, else 40000) resolution",
       );
     }
   } catch (err: any) {
