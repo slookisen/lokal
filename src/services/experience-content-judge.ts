@@ -480,20 +480,46 @@ export async function judgeExperienceEvidencePage(
     };
   }
 
-  const parkedByRequestedUrl = classifyHjemmeside(trimmed).reason === "parked";
-  const parkedByFinalUrl = classifyHjemmeside(fetchResult.finalUrl).reason === "parked";
+  return judgeFetchedEvidencePage(row, trimmed, fetchResult.html, fetchResult.finalUrl);
+}
+
+/**
+ * The post-fetch half of judgeExperienceEvidencePage() above, factored out
+ * (dev-request 2026-08-14-fetch-vegg-headless-fallback, slice R1) so a caller
+ * that already HAS the page content from a different fetch path — POST
+ * /admin/experiences-rejected-rejudge renders the evidence page headless via
+ * the render-worker instead of fetchPage() — runs the EXACT same parked-
+ * domain classification and LLM judge, never a second copy of either.
+ * judgeExperienceEvidencePage() itself delegates here unchanged, so its
+ * behaviour is byte-for-byte what it was before the split.
+ *
+ * Contract: `html`/`finalUrl` come from a SUCCESSFUL fetch — the caller owns
+ * the dead-page (fetch failure / HTTP >= 400) classification, since only the
+ * caller knows its own fetch mechanism's failure shape. `requestedUrl` is the
+ * (already trimmed) URL that was asked for; BOTH it and `finalUrl` are
+ * checked against classifyHjemmeside()'s parking-host list, same as before.
+ * Never throws (judgeExperienceContentMatch is never-throw).
+ */
+export async function judgeFetchedEvidencePage(
+  row: HoldoutExperienceRow,
+  requestedUrl: string,
+  html: string,
+  finalUrl: string,
+): Promise<EvidenceJudgeOutcome> {
+  const parkedByRequestedUrl = classifyHjemmeside(requestedUrl).reason === "parked";
+  const parkedByFinalUrl = classifyHjemmeside(finalUrl).reason === "parked";
   if (parkedByRequestedUrl || parkedByFinalUrl) {
     return {
       verdict: "unresolved",
-      reason: `evidenssiden er en parkert domeneside (${fetchResult.finalUrl})`,
+      reason: `evidenssiden er en parkert domeneside (${finalUrl})`,
       unresolvedReason: "evidence_page_parked",
       pageText: null,
       currentSummary: null,
     };
   }
 
-  const pageText = visibleTextOf(fetchResult.html);
-  const currentSummary = summarizeAbout(fetchResult.html);
+  const pageText = visibleTextOf(html);
+  const currentSummary = summarizeAbout(html);
   const judged = await judgeExperienceContentMatch(row, pageText);
   if (!judged.ok) {
     return { verdict: "unresolved", reason: judged.reasoning, unresolvedReason: "judge_failed", pageText, currentSummary };

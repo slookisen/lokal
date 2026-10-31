@@ -708,9 +708,18 @@ import {
   // call entirely, so no caller can reintroduce the parked-page-goes-to-LLM
   // bug by fetching+judging inline again.
   judgeExperienceEvidencePage,
+  // dev-request 2026-08-14-fetch-vegg-headless-fallback, slice R1: the
+  // post-fetch half of the same judge (parked check + LLM), for POST
+  // /admin/experiences-rejected-rejudge's headless-rendered pages.
+  judgeFetchedEvidencePage,
   type EvidenceJudgeOutcome,
   type EvidencePageUnresolvedReason,
 } from "../services/experience-content-judge";
+// dev-request 2026-08-14-fetch-vegg-headless-fallback, slice R1: the raw
+// render-worker client (NOT render-page.ts's escalation wrapper above, which
+// can fall back to a local browser) — POST /admin/experiences-rejected-
+// rejudge wants exactly one headless render per row and nothing else.
+import { renderPage as renderPageViaWorker } from "../services/render-client";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request: providers stuck at brreg_active IS NULL forever (classifyProvider
 // only ever classifies a name ONCE, at bulk-load insert time) can never clear
@@ -30259,6 +30268,293 @@ router.post("/admin/experiences-requarantine-rejudge", requireAdmin, async (req:
   } catch (err) {
     if (sendEnrichmentWritePausedIfPaused(err, res)) return;
     console.error("[opplevelser] admin/experiences-requarantine-rejudge failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/experiences-rejected-rejudge ───────────────
+//
+// dev-request 2026-08-14-fetch-vegg-headless-fallback, slice R1: some
+// `rejected` rows were rejected on an evidence page the plain fetchPage()
+// path could not actually read (JS-rendered SPA shells, bot walls that only
+// serve real content to a browser) — the judge was shown an empty or
+// placeholder page and, per its own "ved minste tvil, svar MISMATCH" rule,
+// said MISMATCH. This route re-checks an EXPLICIT, caller-chosen list of
+// such rows with a HEADLESS render (render-client.ts renderPage → the
+// lokal-render-worker), re-runs the EXISTING evidence judge on the rendered
+// page (judgeFetchedEvidencePage — the same parked-domain check + LLM call
+// judgeExperienceEvidencePage uses, not a second copy), and — only on MATCH,
+// only with an explicit apply — moves the row `rejected` -> `needs_review`
+// (NOT straight to verified: a human/other gate still decides publishing;
+// this route only undoes a rejection made on an unreadable page).
+//
+// Body: { ids: string[] (1–20 non-empty strings; trimmed, de-duplicated,
+// order kept), dry_run?: boolean }. Anything else for `ids` -> 400. There is
+// deliberately no "scan all rejected rows" mode — every render costs a
+// worker call and every judge call costs LLM spend, so the caller names the
+// rows.
+//
+// STRICT `dry_run` (default true; only the literal JSON boolean `false`
+// applies — same idiom as the sibling routes above). Apply mode checks
+// experiencesWritePauseBlock() FIRST and returns its status/body unchanged.
+// Dry-run does the same render+judge work (a trustworthy preview) and
+// writes NOTHING — not even an admission_verdict stamp.
+//
+// Per id, in order:
+//   - not found                         -> skipped, reason not_found
+//   - verification_status !== rejected  -> skipped, reason not_rejected
+//                                          (no render call at all)
+//   - evidence_url missing/blank        -> unresolved, evidence_page_dead
+//   - render throws (worker down, RENDER_WORKER_KEY unset, timeout, ...)
+//                                       -> unresolved, judge_failed (the
+//                                          page's state is UNKNOWN — never a
+//                                          dead-page claim, and never a silent
+//                                          fallback to plain fetchPage()
+//                                          presented as a headless verdict)
+//   - rendered status_code 404/410      -> unresolved, evidence_page_dead
+//   - rendered status_code other >= 400 -> unresolved, judge_failed
+//   - otherwise judgeFetchedEvidencePage() (parked -> evidence_page_parked,
+//     judge failure -> judge_failed, else MATCH/MISMATCH).
+//
+// Writes (apply + MATCH only), in ONE db transaction:
+//   UPDATE ... SET verification_status='needs_review' WHERE id=? AND
+//   verification_status='rejected' — if that changes 0 rows (the row moved
+//   while the render/judge was in flight) nothing else is written and the
+//   result says `skipped_changed_concurrently`; otherwise admission_verdict
+//   is stamped `rejudged_headless: MATCH: <reasoning>` via
+//   stampExperienceAdmissionVerdict and ONE experience_admission_promotion_
+//   audit row is inserted (from_status 'rejected', to_status 'needs_review',
+//   reason 'rejudge_headless_match', batch_id = this call's batch_id) — so
+//   the batch is visible to, and revertible by, the same audit-table tooling
+//   the other promotion/triage routes use. MISMATCH / unresolved / skipped
+//   write nothing at all.
+//
+// Response: { success, dry_run, batch_id, counts:{total, match, mismatch,
+// unresolved, skipped, restored}, results:[{ id, previous_status,
+// new_verdict, reason, unresolved_reason?, action_taken|would_be_action }] }.
+// `counts.restored` is rows actually moved in apply mode, and rows that WOULD
+// be moved (every MATCH) in dry-run — same preview discipline as
+// requarantine-rejudge's `restored`.
+const REJECTED_REJUDGE_MAX_IDS = 20;
+const REJECTED_REJUDGE_RENDER_TIMEOUT_MS = 30_000;
+
+/**
+ * Test seam (same pattern as __setGardssalgRenderPageImplForTesting above):
+ * lets the route test inject a fake headless renderer instead of calling the
+ * render-worker. Never call from production code.
+ */
+let rejectedRejudgeRenderImplForTesting: typeof renderPageViaWorker | null = null;
+export function __setRejectedRejudgeRenderImplForTesting(impl?: typeof renderPageViaWorker | null): void {
+  rejectedRejudgeRenderImplForTesting = impl ?? null;
+}
+
+type RejectedRejudgeRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  price_band: string | null;
+  price_from: number | null;
+  evidence_url: string | null;
+  content_field_evidence: string | null;
+  verification_status: string | null;
+};
+
+router.post("/admin/experiences-rejected-rejudge", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { ids?: unknown; dry_run?: unknown };
+
+    // STRICT: only an EXPLICIT `dry_run: false` applies anything.
+    const applyMode = body.dry_run === false;
+    const dryRun = !applyMode;
+
+    if (applyMode) {
+      const pauseBlock = experiencesWritePauseBlock();
+      if (pauseBlock) {
+        res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
+        return;
+      }
+    }
+
+    const rawIds = body.ids;
+    if (
+      !Array.isArray(rawIds) ||
+      rawIds.length === 0 ||
+      rawIds.length > REJECTED_REJUDGE_MAX_IDS ||
+      !rawIds.every((v) => typeof v === "string" && v.trim().length > 0)
+    ) {
+      res.status(400).json({
+        error: `Body field 'ids' must be an array of 1–${REJECTED_REJUDGE_MAX_IDS} non-empty strings`,
+      });
+      return;
+    }
+    const ids = [...new Set((rawIds as string[]).map((v) => v.trim()))];
+
+    const expDb = getExpDb("experiences");
+    const selectRow = expDb.prepare(
+      `SELECT id, title, description, category, price_band, price_from, evidence_url,
+              content_field_evidence, verification_status
+         FROM experiences WHERE id = ?`,
+    );
+    const restoreStmt = expDb.prepare(
+      `UPDATE experiences SET verification_status = 'needs_review' WHERE id = ? AND verification_status = 'rejected'`,
+    );
+    const insertAudit = expDb.prepare(
+      `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'rejected', 'needs_review', 'rejudge_headless_match', datetime('now'))`,
+    );
+
+    const batchId = `rejected-rejudge-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+    const render = rejectedRejudgeRenderImplForTesting ?? renderPageViaWorker;
+
+    const counts = { total: ids.length, match: 0, mismatch: 0, unresolved: 0, skipped: 0, restored: 0 };
+    const results: Array<{
+      id: string;
+      previous_status: string | null;
+      new_verdict: "MATCH" | "MISMATCH" | "unresolved" | "skipped";
+      reason: string;
+      unresolved_reason?: EvidencePageUnresolvedReason;
+      would_be_action?: string;
+      action_taken?: string;
+    }> = [];
+
+    const pushResult = (
+      id: string,
+      previousStatus: string | null,
+      newVerdict: "MATCH" | "MISMATCH" | "unresolved" | "skipped",
+      reason: string,
+      action: string,
+      unresolvedReason?: EvidencePageUnresolvedReason,
+    ) => {
+      results.push({
+        id,
+        previous_status: previousStatus,
+        new_verdict: newVerdict,
+        reason,
+        ...(unresolvedReason ? { unresolved_reason: unresolvedReason } : {}),
+        ...(dryRun ? { would_be_action: `[dry-run] ${action}` } : { action_taken: action }),
+      });
+    };
+    const NO_WRITE = "ingen endring";
+
+    for (const id of ids) {
+      const row = selectRow.get(id) as RejectedRejudgeRow | undefined;
+      if (!row) {
+        counts.skipped++;
+        pushResult(id, null, "skipped", "not_found", NO_WRITE);
+        continue;
+      }
+      if (row.verification_status !== "rejected") {
+        counts.skipped++;
+        pushResult(id, row.verification_status, "skipped", "not_rejected", NO_WRITE);
+        continue;
+      }
+
+      const evidenceUrl = (row.evidence_url ?? "").trim();
+      let outcome: { verdict: "MATCH" | "MISMATCH"; reason: string } | {
+        verdict: "unresolved";
+        reason: string;
+        unresolvedReason: EvidencePageUnresolvedReason;
+      };
+      if (!evidenceUrl) {
+        outcome = {
+          verdict: "unresolved",
+          reason: "evidence_url mangler — ingenting å rendre, avvist fail-closed",
+          unresolvedReason: "evidence_page_dead",
+        };
+      } else {
+        let rendered: Awaited<ReturnType<typeof renderPageViaWorker>> | null = null;
+        let renderError: string | null = null;
+        try {
+          rendered = await render(evidenceUrl, { timeout_ms: REJECTED_REJUDGE_RENDER_TIMEOUT_MS, wait_for: "networkidle" });
+        } catch (err) {
+          renderError = String((err as Error)?.message ?? err).slice(0, 300);
+        }
+
+        if (!rendered) {
+          outcome = {
+            verdict: "unresolved",
+            reason: `headless-rendring feilet: ${renderError ?? "ukjent feil"} — sidens tilstand ukjent, ingen fallback til vanlig henting`,
+            unresolvedReason: "judge_failed",
+          };
+        } else if (rendered.status_code === 404 || rendered.status_code === 410) {
+          outcome = {
+            verdict: "unresolved",
+            reason: `evidenssiden svarte HTTP ${rendered.status_code} ved headless-rendring`,
+            unresolvedReason: "evidence_page_dead",
+          };
+        } else if (rendered.status_code >= 400) {
+          outcome = {
+            verdict: "unresolved",
+            reason: `evidenssiden svarte HTTP ${rendered.status_code} ved headless-rendring — avvist fail-closed`,
+            unresolvedReason: "judge_failed",
+          };
+        } else {
+          const judgeRow: HoldoutExperienceRow = {
+            id: row.id,
+            title: row.title,
+            description: row.description,
+            category: row.category,
+            price_band: row.price_band,
+            price_from: row.price_from,
+            evidence_url: row.evidence_url,
+            content_field_evidence: row.content_field_evidence,
+          };
+          const judged: EvidenceJudgeOutcome = await judgeFetchedEvidencePage(
+            judgeRow,
+            evidenceUrl,
+            rendered.html ?? "",
+            rendered.final_url || evidenceUrl,
+          );
+          outcome =
+            judged.verdict === "unresolved"
+              ? { verdict: "unresolved", reason: judged.reason, unresolvedReason: judged.unresolvedReason }
+              : { verdict: judged.verdict, reason: judged.reason };
+        }
+      }
+
+      if (outcome.verdict === "unresolved") {
+        counts.unresolved++;
+        pushResult(row.id, row.verification_status, "unresolved", outcome.reason, NO_WRITE, outcome.unresolvedReason);
+        continue;
+      }
+      if (outcome.verdict === "MISMATCH") {
+        counts.mismatch++;
+        pushResult(row.id, row.verification_status, "MISMATCH", outcome.reason, NO_WRITE);
+        continue;
+      }
+
+      counts.match++;
+      const restoreAction =
+        "verification_status rejected -> needs_review (rejudge_headless_match); admission_verdict stemplet (rejudged_headless: MATCH)";
+      if (dryRun) {
+        counts.restored++;
+        pushResult(row.id, row.verification_status, "MATCH", outcome.reason, restoreAction);
+        continue;
+      }
+
+      const matchReason = outcome.reason;
+      let restored = false;
+      expDb.transaction(() => {
+        const info = restoreStmt.run(row.id);
+        if (info.changes === 0) return;
+        stampExperienceAdmissionVerdict(row.id, `rejudged_headless: MATCH: ${matchReason}`);
+        insertAudit.run(crypto.randomUUID(), row.id, batchId);
+        restored = true;
+      })();
+      if (restored) {
+        counts.restored++;
+        pushResult(row.id, row.verification_status, "MATCH", matchReason, restoreAction);
+      } else {
+        pushResult(row.id, row.verification_status, "MATCH", matchReason, "skipped_changed_concurrently");
+      }
+    }
+
+    res.json({ success: true, dry_run: dryRun, batch_id: batchId, counts, results });
+  } catch (err) {
+    if (sendEnrichmentWritePausedIfPaused(err, res)) return;
+    console.error("[opplevelser] admin/experiences-rejected-rejudge failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

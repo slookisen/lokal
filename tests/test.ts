@@ -51186,3 +51186,25 @@ runSerial(async () => {
     failures.push("organic-texts-s3a: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-08-14-fetch-vegg-headless-fallback, slice R1: POST
+// /admin/experiences-rejected-rejudge — id-based headless re-render + re-judge
+// of `rejected` rows; MATCH + explicit apply moves rejected -> needs_review
+// with one stamp + one audit row. Own in-memory-db harness (mirrors the
+// requarantine-rejudge block); swaps env, globalThis.fetch and the route's
+// render seam (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── fetch-vegg R1: rejected-rejudge (headless) ──");
+  try {
+    const { runOpplevelserRejectedRejudgeTests } = require("../src/routes/opplevelser-rejected-rejudge.test") as
+      typeof import("../src/routes/opplevelser-rejected-rejudge.test");
+    const r = await runOpplevelserRejectedRejudgeTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("opplevelser-rejected-rejudge: " + f);
+    console.log(`  opplevelser-rejected-rejudge: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-rejected-rejudge: unexpected error: " + String(err?.message || err));
+  }
+});
