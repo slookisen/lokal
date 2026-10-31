@@ -18,6 +18,13 @@
 //   POST /admin/product-import/prepare   body {agentIds[], campaign} → 202 {prepare_id, …}
 //   GET  /admin/product-import/prepare/:campaign[?format=md] → read-only report
 // Stages candidates in product_import_candidates only; never publishes, never sends e-mail.
+//
+// Skive 3b-2 (same flag, same X-Admin-Key check; both read-only):
+//   GET  /admin/product-import/prepare/:campaign/links → one signed landing link per
+//        recipient with ≥ 1 eligible candidate (for POST /admin/crm/compose to merge);
+//        recipients with 0 candidates are listed under without_link, with no link
+//   GET  /admin/product-import/prepare/:campaign/log   → per recipient: extracted,
+//        opened, confirmed (count), «på lager» chosen (yes/no)
 
 import { Router, Request, Response } from "express";
 import {
@@ -36,6 +43,7 @@ import {
   startOutreachPrepare,
   validatePrepareInput,
 } from "../services/product-import/outreach-prepare";
+import { getOutreachLinks, getOutreachLog } from "../services/product-import/outreach-landing";
 
 const router = Router();
 
@@ -146,6 +154,29 @@ router.get("/prepare/:campaign", (req: Request, res: Response) => {
     return res.type("text/markdown; charset=utf-8").send(renderOutreachReportMd(report));
   }
   return res.json(report);
+});
+
+router.get("/prepare/:campaign/links", (req: Request, res: Response) => {
+  if (!requireOutreachFlag(res) || !requireAdmin(req, res)) return;
+  const campaign = String(req.params.campaign ?? "");
+  if (!OUTREACH_CAMPAIGN_RE.test(campaign)) return res.status(400).json({ error: "invalid_campaign" });
+  res.setHeader("Cache-Control", "no-store");
+  const r = getOutreachLinks(campaign);
+  if (!r.ok) {
+    if (r.error === "secret_missing") return res.status(503).json({ error: "Lenkesignering er ikke satt opp" });
+    return res.status(404).json({ error: "Fant ingen forhåndsuttrekk for kampanjen" });
+  }
+  const { ok: _ok, ...rest } = r;
+  return res.json(rest);
+});
+
+router.get("/prepare/:campaign/log", (req: Request, res: Response) => {
+  if (!requireOutreachFlag(res) || !requireAdmin(req, res)) return;
+  const campaign = String(req.params.campaign ?? "");
+  if (!OUTREACH_CAMPAIGN_RE.test(campaign)) return res.status(400).json({ error: "invalid_campaign" });
+  const log = getOutreachLog(campaign);
+  if (!log) return res.status(404).json({ error: "Fant ingen forhåndsuttrekk for kampanjen" });
+  return res.json(log);
 });
 
 export default router;

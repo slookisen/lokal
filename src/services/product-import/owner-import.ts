@@ -92,6 +92,10 @@ const jobs = new Map<string, { agentId: string; promise: Promise<void> }>();
 export function __awaitOwnerFetchForTesting(runId: string): Promise<void> {
   return jobs.get(runId)?.promise ?? Promise.resolve();
 }
+/** Whether this process is still running the owner fetch `runId` (else a 'running' row reads as interrupted). */
+export function isOwnerFetchJobRunning(runId: string): boolean {
+  return jobs.has(runId);
+}
 /** Test-only: forget in-process jobs (as after a restart). */
 export function __forgetOwnerFetchJobsForTesting(): void {
   jobs.clear();
@@ -440,10 +444,20 @@ interface RunRow {
 const RUN_COLUMNS = `id, mode, status, agent_id, outcome, tier, error, params_json, summary_json, created_at, finished_at,
   count_new, count_changed, count_not_found, count_published, count_removed, published_by_owner, published_at`;
 
-function readRun(agentId: string, runId: string): RunRow | null {
+/**
+ * The run modes whose candidates the owner preview / publish can read.
+ * 'owner_fetch' (Skive 3) stages candidates as 'pending'; 'outreach_prepare'
+ * (Skive 3b-1) stages the ones that passed its controls as 'eligible'. The
+ * outreach mode is used only by the signed outreach landing page (Skive 3b-2),
+ * always for the run of the agent the page is for.
+ */
+export type ImportRunMode = "owner_fetch" | "outreach_prepare";
+const OPEN_STATUS: Record<ImportRunMode, string> = { owner_fetch: "pending", outreach_prepare: "eligible" };
+
+function readRun(agentId: string, runId: string, mode: ImportRunMode = "owner_fetch"): RunRow | null {
   const row = getDb()
-    .prepare(`SELECT ${RUN_COLUMNS} FROM product_import_runs WHERE id = ? AND mode = 'owner_fetch' AND agent_id = ?`)
-    .get(runId, agentId) as RunRow | undefined;
+    .prepare(`SELECT ${RUN_COLUMNS} FROM product_import_runs WHERE id = ? AND mode = ? AND agent_id = ?`)
+    .get(runId, mode, agentId) as RunRow | undefined;
   return row ?? null;
 }
 
@@ -467,6 +481,7 @@ function candidateJson(c: CandidateRow, block: PublishBlockReason | null) {
     tier: c.tier,
     llm: c.tier === "llm",
     source_url: c.source_url,
+    fetched_at: c.fetched_at,
     rules,
     status: c.status,
     price_missing_on_site: c.price_nok === null,
@@ -512,9 +527,15 @@ function runStatusJson(run: RunRow) {
   };
 }
 
-/** GET: the run and the diff against the profile's current list. Never writes. */
-export function getOwnerImportPreview(agentId: string, runId: string) {
-  const run = readRun(agentId, runId);
+/**
+ * GET: the run and the diff against the profile's current list. Never writes.
+ * `mode` 'outreach_prepare' reads a Skive 3b-1 run: its 'eligible' candidates
+ * take the place of 'pending' ones, and its control-rejected rows are left out
+ * (they were never shown as suggestions).
+ */
+export function getOwnerImportPreview(agentId: string, runId: string, opts: { mode?: ImportRunMode } = {}) {
+  const mode = opts.mode ?? "owner_fetch";
+  const run = readRun(agentId, runId, mode);
   if (!run) return null;
   const head = runStatusJson(run);
   const rows = getDb()
@@ -525,7 +546,7 @@ export function getOwnerImportPreview(agentId: string, runId: string) {
     )
     .all(runId, agentId) as CandidateRow[];
   const current = currentProductsOf(readCurrentList(agentId));
-  const pending = rows.filter((r) => r.status === "pending");
+  const pending = rows.filter((r) => r.status === OPEN_STATUS[mode]);
   const diff = diffAgainst(pending.map((r) => ({ key: r.name_norm, price_nok: r.price_nok, unit: r.unit })), current);
   const types = producerTypesOf(agentId);
   const out = {
@@ -550,7 +571,7 @@ export function getOwnerImportPreview(agentId: string, runId: string) {
   });
   for (const r of rows) {
     if (r.status === "published") out.published.push(candidateJson(r, null));
-    else if (r.status === "rejected") out.rejected.push({ ...candidateJson(r, null), reject_reason: r.reject_reason });
+    else if (r.status === "rejected" && mode === "owner_fetch") out.rejected.push({ ...candidateJson(r, null), reject_reason: r.reject_reason });
   }
   out.counts.new = out.new.length;
   out.counts.changed = out.changed.length;
@@ -628,14 +649,19 @@ export function publishOwnerImport(
   runId: string,
   selection: PublishSelection[],
   remove: string[],
-  opts: { actorEmail: string | null; now?: () => number } = { actorEmail: null },
+  opts: { actorEmail: string | null; now?: () => number; mode?: ImportRunMode } = { actorEmail: null },
 ): PublishResult {
   const db = getDb();
   const now = opts.now ?? testDeps?.now ?? Date.now;
-  const run = readRun(agentId, runId);
+  const mode = opts.mode ?? "owner_fetch";
+  const run = readRun(agentId, runId, mode);
   if (!run) return { ok: false, status: 404, error: "run_not_found", message: "Fant ikke hentingen." };
   if (run.status !== "completed") {
     return { ok: false, status: 409, error: "run_not_completed", message: "Hentingen er ikke ferdig. Vent til den er ferdig, eller hent på nytt." };
+  }
+  if (mode === "outreach_prepare" && remove.length > 0) {
+    // The outreach landing page only adds / updates; it never removes products.
+    return { ok: false, status: 400, error: "remove_not_allowed", message: "Varer kan ikke fjernes herfra." };
   }
   if (selection.length === 0 && remove.length === 0) {
     return { ok: false, status: 400, error: "nothing_selected", message: "Velg minst én vare å publisere eller fjerne." };
@@ -659,7 +685,7 @@ export function publishOwnerImport(
   if (missing.length) {
     return { ok: false, status: 404, error: "candidate_not_found", message: "Fant ikke en av de valgte varene i denne hentingen.", fields: missing.map((id) => ({ id, field: "id" })) };
   }
-  const notPending = rows.filter((r) => r.status !== "pending");
+  const notPending = rows.filter((r) => r.status !== OPEN_STATUS[mode]);
   if (notPending.length) {
     return { ok: false, status: 409, error: "candidate_not_pending", message: "En av de valgte varene er allerede behandlet.", fields: notPending.map((r) => ({ id: r.id, field: "id" })) };
   }

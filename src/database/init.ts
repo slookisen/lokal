@@ -6429,6 +6429,35 @@ function initSchema(db: Database.Database): void {
     console.error("Migration product_import outreach columns failed:", err);
   }
 
+  // ─── product_import_outreach_events (Skive 3b-2) ────────────────────────
+  // Append-only log per outreach recipient (flag PRODUCT_IMPORT_OUTREACH_ENABLED):
+  // 'opened' (the signed landing link was opened; detail = the session state),
+  // 'refetch_started' (the list was older than 7 days and an owner fetch was
+  // started; run_id = that owner_fetch run) and 'confirmed' (count = products
+  // published, in_stock = whether «på lager» was chosen). «Extracted» is the
+  // 3b-1 product_import_runs row itself. Never read by products / profiles.
+  // Additive, brand-new table, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS product_import_outreach_events (
+        id TEXT PRIMARY KEY,
+        campaign TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        run_id TEXT,
+        count INTEGER,
+        in_stock INTEGER,
+        detail TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_product_import_outreach_events_campaign ON product_import_outreach_events(campaign, agent_id, created_at)`,
+    );
+  } catch (err) {
+    console.error("Migration product_import_outreach_events failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …
