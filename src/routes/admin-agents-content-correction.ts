@@ -103,7 +103,9 @@
 // in dry-run too, and re-read FRESH inside the apply's per-row transaction,
 // like the lock itself — only when the row IS owner-locked. Consent is valid
 // only if the crm_messages row exists, is direction='in', its thread's
-// contact has crm_contacts.agent_id = the item's agent_id, and the same
+// contact has crm_contacts.agent_id = the item's agent_id, it was sent FROM
+// that contact (lower(trim(from_email)) = lower(trim(crm_contacts.email)) —
+// a CC'd third party replying on the thread is not the owner), and the same
 // thread holds an earlier direction='out' message that was actually sent
 // (delivery_status='sent'; a queued/drafted/failed row never reached the
 // owner). «Earlier» compares julianday(COALESCE(sent_at, received_at)) on
@@ -122,6 +124,12 @@
 // owner-locked, owner_consent is ignored (not checked) and the outcome is the
 // normal one — consent is never claimed where it was not what let it through.
 // Without owner_consent behaviour is unchanged (skipped_claimed).
+// Residual risk: the route is admin-key only and every consent write is
+// audited (audit notes + crm_actions), but the check proves «the contact
+// replied after we wrote», not WHAT they agreed to — the admin caller is
+// trusted to cite a reply that really is a «ja» to this fix. One consent
+// message can also be reused across fields/items/calls for the same agent;
+// the crm_actions trail makes such reuse visible, it does not prevent it.
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -321,19 +329,22 @@ function checkOwnerConsent(db: ReturnType<typeof getDb>, agentId: string, crmMes
   const m = db.prepare(
     `SELECT m.direction AS direction, m.thread_id AS thread_id, t.contact_id AS contact_id,
             c.agent_id AS contact_agent_id,
+            (lower(trim(m.from_email)) = lower(trim(c.email))) AS from_contact,
             julianday(COALESCE(m.sent_at, m.received_at)) AS ts
        FROM crm_messages m
        JOIN crm_threads t ON t.id = m.thread_id
        LEFT JOIN crm_contacts c ON c.id = t.contact_id
       WHERE m.id = ?`,
   ).get(crmMessageId) as
-    | { direction: string; thread_id: string; contact_id: string; contact_agent_id: string | null; ts: number | null }
+    | { direction: string; thread_id: string; contact_id: string; contact_agent_id: string | null; from_contact: number | null; ts: number | null }
     | undefined;
   if (!m) return bad("owner_consent: crm message not found");
   if (m.direction !== "in") return bad("owner_consent: crm message is not inbound");
   if (!m.contact_agent_id || m.contact_agent_id !== agentId) {
     return bad("owner_consent: crm message's contact does not belong to this agent");
   }
+  // The reply must come FROM the contact (not a CC'd third party on the thread).
+  if (!m.from_contact) return bad("owner_consent: sender is not the profile's contact");
   if (m.ts == null) return bad("owner_consent: crm message has no usable timestamp");
   const earlierOut = db.prepare(
     `SELECT COUNT(*) AS n FROM crm_messages o

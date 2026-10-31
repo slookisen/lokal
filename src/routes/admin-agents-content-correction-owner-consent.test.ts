@@ -9,9 +9,13 @@
  * that ONE item past the owner lock (and only the owner lock).
  *
  * Covers: no consent -> skipped_claimed (unchanged); malformed consent shape
- * -> invalid_item; consent from another agent's contact, an outbound message,
- * an inbound with no earlier sent outbound (incl. only a failed outbound),
- * a nonexistent id -> invalid_consent with nothing written; valid consent in
+ * -> invalid_item; consent from another agent's contact, an outbound message
+ * (that itself follows a sent outbound, so only the direction check rejects
+ * it), an inbound with no earlier sent outbound (incl. only a failed
+ * outbound, only an earlier INBOUND, or an outbound at exactly the same
+ * timestamp), an inbound on the right thread from a third-party address, a
+ * nonexistent id -> invalid_consent with nothing written; a sender matching
+ * the contact's email up to case/whitespace is accepted; valid consent in
  * dry-run -> would_write_with_owner_consent, nothing written / audited / no
  * crm_actions; valid consent + apply -> written_with_owner_consent, audit
  * notes carry ` · owner_consent=<id>`, crm_actions owner_consent_applied row;
@@ -126,44 +130,71 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       const insertThread = db.prepare(`INSERT INTO crm_threads (id, contact_id, subject) VALUES (?, ?, 'Retting av tekst')`);
       const insertMsg = db.prepare(
         `INSERT INTO crm_messages (id, thread_id, direction, from_email, sent_at, received_at, delivery_status)
-         VALUES (?, ?, ?, 'x@example.no', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       );
+      // Outbound from us; inbound from the contact's own address unless given.
+      const CONTACT_EMAIL: Record<string, string> = {};
+      const THREAD_CONTACT: Record<string, string> = {};
+      const msg = (id: string, thread: string, dir: "in" | "out", sentAt: string | null, receivedAt: string, status: string, from?: string) =>
+        insertMsg.run(id, thread, dir, from ?? (dir === "out" ? "post@rettfrabonden.com" : CONTACT_EMAIL[THREAD_CONTACT[thread]]), sentAt, receivedAt, status);
+      const contact = (id: string, agentId: string, email: string) => {
+        CONTACT_EMAIL[id] = email;
+        insertContact.run(id, agentId, email);
+      };
+      const thread = (id: string, contactId: string) => {
+        THREAD_CONTACT[id] = contactId;
+        insertThread.run(id, contactId);
+      };
       const CLAIMED = "2026-01-01T00:00:00.000Z";
 
       // Owner-locked producer with a proper notice -> reply thread.
       insertAgent.run("oc-a", "Gård A", OLD_DESC, "k-oc-a", CLAIMED);
       insertKnowledge.run("oc-a", null, "{}");
-      insertContact.run("cc-a", "oc-a", "a@example.no");
-      insertThread.run("th-a", "cc-a");
-      insertMsg.run("m-a-out", "th-a", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
+      contact("cc-a", "oc-a", "a@example.no");
+      thread("th-a", "cc-a");
+      msg("m-a-out", "th-a", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
       // Inbound with sent_at NULL: falls back to received_at (datetime('now') format).
-      insertMsg.run("m-a-in", "th-a", "in", null, "2026-10-29 10:00:00", "sent");
+      // Sender differs from crm_contacts.email only in case/padding — still the contact.
+      msg("m-a-in", "th-a", "in", null, "2026-10-29 10:00:00", "sent", "  A@Example.NO ");
       // Our confirmation reply AFTER the «ja» — must not void the consent.
-      insertMsg.run("m-a-out2", "th-a", "out", "2026-10-29T11:00:00.000Z", "2026-10-29 11:00:00", "sent");
+      msg("m-a-out2", "th-a", "out", "2026-10-29T11:00:00.000Z", "2026-10-29 11:00:00", "sent");
       // Inbound that came BEFORE any outbound in its own thread.
-      insertThread.run("th-a2", "cc-a");
-      insertMsg.run("m-a2-in", "th-a2", "in", "2026-10-28T09:00:00.000Z", "2026-10-28 09:00:00", "sent");
-      insertMsg.run("m-a2-out", "th-a2", "out", "2026-10-28T12:00:00.000Z", "2026-10-28 12:00:00", "sent");
+      thread("th-a2", "cc-a");
+      msg("m-a2-in", "th-a2", "in", "2026-10-28T09:00:00.000Z", "2026-10-28 09:00:00", "sent");
+      msg("m-a2-out", "th-a2", "out", "2026-10-28T12:00:00.000Z", "2026-10-28 12:00:00", "sent");
       // Inbound whose only earlier outbound was never delivered (failed).
-      insertThread.run("th-a3", "cc-a");
-      insertMsg.run("m-a3-out", "th-a3", "out", null, "2026-10-27 08:00:00", "failed");
-      insertMsg.run("m-a3-in", "th-a3", "in", "2026-10-27T09:00:00.000Z", "2026-10-27 09:00:00", "sent");
+      thread("th-a3", "cc-a");
+      msg("m-a3-out", "th-a3", "out", null, "2026-10-27 08:00:00", "failed");
+      msg("m-a3-in", "th-a3", "in", "2026-10-27T09:00:00.000Z", "2026-10-27 09:00:00", "sent");
+
+      // Only message before the inbound reply is another INBOUND (no outbound).
+      thread("th-a4", "cc-a");
+      msg("m-a4-in1", "th-a4", "in", "2026-10-26T08:00:00.000Z", "2026-10-26 08:00:00", "sent");
+      msg("m-a4-in2", "th-a4", "in", "2026-10-26T09:00:00.000Z", "2026-10-26 09:00:00", "sent");
+      // Right thread, after our notice, but from a CC'd third party.
+      thread("th-a5", "cc-a");
+      msg("m-a5-out", "th-a5", "out", "2026-10-25T08:00:00.000Z", "2026-10-25 08:00:00", "sent");
+      msg("m-a5-in", "th-a5", "in", "2026-10-25T09:00:00.000Z", "2026-10-25 09:00:00", "sent", "naboen@example.no");
+      // Inbound with EXACTLY the same timestamp as the only sent outbound.
+      thread("th-a6", "cc-a");
+      msg("m-a6-out", "th-a6", "out", "2026-10-24T08:00:00.000Z", "2026-10-24 08:00:00", "sent");
+      msg("m-a6-in", "th-a6", "in", "2026-10-24T08:00:00.000Z", "2026-10-24 08:00:00", "sent");
 
       // Another owner-locked producer, with its own valid reply.
       insertAgent.run("oc-b", "Gård B", OLD_DESC, "k-oc-b", CLAIMED);
       insertKnowledge.run("oc-b", null, "{}");
-      insertContact.run("cc-b", "oc-b", "b@example.no");
-      insertThread.run("th-b", "cc-b");
-      insertMsg.run("m-b-out", "th-b", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
-      insertMsg.run("m-b-in", "th-b", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
+      contact("cc-b", "oc-b", "b@example.no");
+      thread("th-b", "cc-b");
+      msg("m-b-out", "th-b", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
+      msg("m-b-in", "th-b", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
 
       // Owner-locked producer whose description is curated by the owner.
       insertAgent.run("oc-cur", "Gård Kuratert", OLD_DESC, "k-oc-cur", CLAIMED);
       insertKnowledge.run("oc-cur", null, JSON.stringify({ description: { by: "owner" } }));
-      insertContact.run("cc-cur", "oc-cur", "cur@example.no");
-      insertThread.run("th-cur", "cc-cur");
-      insertMsg.run("m-cur-out", "th-cur", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
-      insertMsg.run("m-cur-in", "th-cur", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
+      contact("cc-cur", "oc-cur", "cur@example.no");
+      thread("th-cur", "cc-cur");
+      msg("m-cur-out", "th-cur", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
+      msg("m-cur-in", "th-cur", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
 
       // NOT owner-locked producer.
       insertAgent.run("oc-open", "Gård Åpen", OLD_DESC, "k-oc-open", null);
@@ -210,17 +241,28 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       assertEq(descOf("oc-a"), OLD_DESC, "oc-06: nothing written");
 
       // ── Invalid consent cases (apply) ──
-      const invalidCases: Array<[string, string, string]> = [
-        ["m-b-in", "oc-07", "message from another agent's contact"],
-        ["m-a-out", "oc-08", "an outbound message"],
-        ["m-a2-in", "oc-09", "inbound with no earlier outbound in its thread"],
-        ["m-a3-in", "oc-10", "inbound whose only earlier outbound failed to send"],
-        ["does-not-exist", "oc-11", "nonexistent message id"],
+      // Each case pins WHICH check rejects it (exact detail), so removing any
+      // one check is caught even when a later check would also reject.
+      const NOT_FOUND = "owner_consent: crm message not found";
+      const NOT_IN = "owner_consent: crm message is not inbound";
+      const OTHER_AGENT = "owner_consent: crm message's contact does not belong to this agent";
+      const NOT_SENDER = "owner_consent: sender is not the profile's contact";
+      const NO_EARLIER = "owner_consent: no earlier sent outbound message in the thread — not a reply to our notice";
+      const invalidCases: Array<[string, string, string, string]> = [
+        ["m-b-in", "oc-07", "message from another agent's contact", OTHER_AGENT],
+        // m-a-out2 HAS an earlier sent outbound in th-a — the direction check is what rejects it.
+        ["m-a-out2", "oc-08", "an outbound message", NOT_IN],
+        ["m-a2-in", "oc-09", "inbound with no earlier outbound in its thread", NO_EARLIER],
+        ["m-a3-in", "oc-10", "inbound whose only earlier outbound failed to send", NO_EARLIER],
+        ["does-not-exist", "oc-11", "nonexistent message id", NOT_FOUND],
+        ["m-a4-in2", "oc-11x", "inbound whose only earlier message is another inbound", NO_EARLIER],
+        ["m-a5-in", "oc-11y", "inbound on the right thread from a different address (CC'd third party)", NOT_SENDER],
+        ["m-a6-in", "oc-11z", "inbound with exactly the same timestamp as the only sent outbound (strictly earlier required)", NO_EARLIER],
       ];
-      for (const [msgId, label, what] of invalidCases) {
+      for (const [msgId, label, what, detail] of invalidCases) {
         r = await post([item("oc-a", msgId)], true);
         assertEq(first(r)?.outcome, "invalid_consent", `${label}: ${what} -> invalid_consent`);
-        assertTrue(/^owner_consent: /.test(first(r)?.detail ?? ""), `${label}b: invalid_consent carries a detail`);
+        assertEq(first(r)?.detail, detail, `${label}b: rejected by the right check`);
       }
       assertEq(descOf("oc-a"), OLD_DESC, "oc-12: no invalid consent wrote anything");
       assertEq(auditFor("oc-a").length, 0, "oc-13: no audit rows");
