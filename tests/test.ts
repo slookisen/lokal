@@ -50983,6 +50983,26 @@ runSerial(async () => {
   }
 });
 
+// Slice T0d (dev-request 2026-10-30-rfb-eierportal-bolge-0-ingen-tilgang):
+// the portal stores «Åpningstider» as JSON text; raw-text rows read as text in
+// both modes, so non-owner knowledge writes stop throwing. Swaps the getDb()
+// singleton, env vars and fetch (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── T0d: åpningstider lagres som JSON ──");
+  try {
+    const { runOwnerOpeningHoursJsonT0dTests } = require("../src/routes/owner-opening-hours-json-t0d.test") as
+      typeof import("../src/routes/owner-opening-hours-json-t0d.test");
+    const r = await runOwnerOpeningHoursJsonT0dTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-opening-hours-json-t0d: " + f);
+    console.log(`  owner-opening-hours-json-t0d: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-opening-hours-json-t0d: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
 // «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
 // (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,

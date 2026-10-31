@@ -141,12 +141,13 @@ const SEED: Seed[] = [
   },
   {
     // Every JSON column but products is broken, and so is agents.languages.
+    // opening_hours is left out: since T0d text that does not parse there is
+    // read as the text variant (owner-opening-hours-json-t0d.test.ts).
     id: MANY_BAD_COLUMNS, name: "Alna Grønt Fixture", lat: 59.9300, lng: 10.8500, city: "Oslo",
     categories: ["vegetables"],
     languages: `${LEAK} no`,
     knowledge: {
       products: JSON.stringify([{ name: "Poteter", category: "vegetables", price: 30 }]),
-      opening_hours: `${LEAK} man-fre`,
       specialties: `${LEAK} [`,
       certifications: `${LEAK} {`,
       payment_methods: `${LEAK} Vipps`,
@@ -173,7 +174,7 @@ const SEED: Seed[] = [
 ];
 
 const KNOWN_COLUMNS = [
-  "opening_hours", "specialties", "certifications", "payment_methods", "delivery_options", "images",
+  "specialties", "certifications", "payment_methods", "delivery_options", "images",
   "seasonality", "auto_sources", "external_reviews", "external_links", "preferences", "curated_fields",
 ];
 
