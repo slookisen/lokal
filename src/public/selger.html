@@ -1420,11 +1420,12 @@
     });
 
     // ── Magic link: handle ?magic= URL parameter on page load ──
-    (async function checkMagicLink() {
-      var params = new URLSearchParams(window.location.search);
-      var magicToken = params.get('magic');
-      if (!magicToken) return;
-
+    // T0e: the login runs as `magicLogin` (resolves true when the link logged
+    // in; null without ?magic=). Init waits for it instead of restoring the
+    // stored session alongside it — the old session's 401 used to land after
+    // the new login and wipe it.
+    var magicToken = new URLSearchParams(window.location.search).get('magic');
+    var magicLogin = !magicToken ? null : (async function checkMagicLink() {
       // Clean URL so token isn't visible / bookmarkable
       window.history.replaceState({}, '', '/selger');
 
@@ -1436,12 +1437,14 @@
           state.agentId = data.data.agentId;
           saveSession();
           loadDashboard();
+          return true;
         } else {
           showAlert('magicLinkAlert', escHtml(data.error) || 'Innloggingslenken er ugyldig eller utløpt. Be om en ny.', 'error');
         }
       } catch (err) {
         showAlert('magicLinkAlert', 'Noe gikk galt. Prøv å be om en ny lenke.', 'error');
       }
+      return false;
     })();
 
     // ── Logout ──
@@ -1517,6 +1520,11 @@
         return;
       }
 
+      // T0e: a newer login (the magic link, a saved-store button) can replace
+      // the token while a request is out. An answer for the old token is then
+      // stale: it must not clear or show anything — the newer call does that.
+      var checkedToken = state.claimToken;
+
       // Validate claim token against backend BEFORE showing dashboard
       if (state.claimToken) {
         try {
@@ -1524,6 +1532,7 @@
             method: 'POST',
             body: JSON.stringify({ token: state.claimToken })
           });
+          if (state.claimToken !== checkedToken) return;
           // S1b punkt 6 (OWNER_PAUSE_ENABLED): «Meld nedlagt» is replaced by
           // pause + «be om sletting» in the owner portal. Absent flag = unchanged.
           if (authCheck && authCheck.success && authCheck.data && authCheck.data.ownerPauseEnabled === true) {
@@ -1536,15 +1545,15 @@
           }
           if (!authCheck.success || authCheck.data.agentId !== state.agentId) {
             // Token expired, invalid, or belongs to a different agent
-            var staleToken = state.claimToken;
-            var staleAgentId = state.agentId;
-            clearSession();
+            var staleToken = checkedToken;
+            clearSession(staleToken);
             state.claimToken = null;
             state.agentId = null;
-            // Also remove from saved agents list
+            // Also remove from saved agents list — only entries holding the
+            // token that failed; another (newer) token for the same agent stays (T0e)
             try {
               var saved = getSavedAgents().filter(function(a) {
-                return a.token !== staleToken && a.agentId !== staleAgentId;
+                return a.token !== staleToken;
               });
               localStorage.setItem('lokal_agents', JSON.stringify(saved));
             } catch(e) {}
@@ -1572,6 +1581,7 @@
       // Load agent info
       try {
         var info = await api('/agents/' + state.agentId + '/info');
+        if (state.claimToken !== checkedToken) return;
         if (info.success) {
           state.agent = info.data.agent;
           state.knowledge = info.data.knowledge;
@@ -1579,7 +1589,7 @@
           renderDashboard();
         } else if (info.error && info.error.toLowerCase().includes('unauthorized')) {
           // Token expired or invalid — clear session and go back to login
-          clearSession();
+          clearSession(checkedToken);
           state.claimToken = null;
           state.agentId = null;
           hide('viewDashboard');
@@ -3119,11 +3129,12 @@
             });
             localStorage.setItem('lokal_agents', JSON.stringify(agents));
           } else {
-            // Update name if we have it now
+            // Keep the token current (a new login replaces the old one, T0e);
+            // update name if we have it now
             agents = agents.map(function(a) {
-              if (a.agentId === state.agentId && state.agent) {
-                a.name = state.agent.name;
+              if (a.agentId === state.agentId) {
                 a.token = state.claimToken;
+                if (state.agent) a.name = state.agent.name;
               }
               return a;
             });
@@ -3133,8 +3144,14 @@
       } catch(e) { /* localStorage not available */ }
     }
 
-    function clearSession() {
+    // With a token, lokal_session is removed only while it still holds that
+    // token: a failed old token never logs out a newer session (T0e).
+    function clearSession(token) {
       try {
+        if (token) {
+          var session = JSON.parse(localStorage.getItem('lokal_session') || 'null');
+          if (!session || session.token !== token) return;
+        }
         localStorage.removeItem('lokal_session');
       } catch(e) {}
     }
@@ -3200,31 +3217,40 @@
         return;
       }
 
-      // Auto-login from localStorage
-      if (restoreSession()) {
-        loadDashboard();
+      // Auto-login from localStorage. With ?magic= the link logs in first; the
+      // stored session is only tried when the link did not log in (T0e).
+      if (magicLogin) {
+        magicLogin.then(function(loggedIn) { if (!loggedIn) autoLogin(); });
       } else {
-        // Show saved agents as quick-login buttons
-        var saved = getSavedAgents();
-        if (saved.length > 0) {
-          var loginCard = document.querySelector('#loginToken').closest('.card');
-          if (loginCard) {
-            var quickDiv = document.createElement('div');
-            quickDiv.style.cssText = 'margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--gray-200);';
-            quickDiv.innerHTML = '<p style="font-size: 0.85rem; color: var(--gray-500); margin-bottom: 0.5rem;">Dine lagrede butikker:</p>';
-            saved.forEach(function(ag) {
-              var btn = document.createElement('button');
-              btn.className = 'btn btn-secondary btn-small';
-              btn.style.cssText = 'margin: 0 4px 4px 0;';
-              btn.textContent = ag.name || ag.agentId;
-              btn.addEventListener('click', function() {
-                state.claimToken = ag.token;
-                state.agentId = ag.agentId;
-                loadDashboard();
+        autoLogin();
+      }
+
+      function autoLogin() {
+        if (restoreSession()) {
+          loadDashboard();
+        } else {
+          // Show saved agents as quick-login buttons
+          var saved = getSavedAgents();
+          if (saved.length > 0) {
+            var loginCard = document.querySelector('#loginToken').closest('.card');
+            if (loginCard) {
+              var quickDiv = document.createElement('div');
+              quickDiv.style.cssText = 'margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--gray-200);';
+              quickDiv.innerHTML = '<p style="font-size: 0.85rem; color: var(--gray-500); margin-bottom: 0.5rem;">Dine lagrede butikker:</p>';
+              saved.forEach(function(ag) {
+                var btn = document.createElement('button');
+                btn.className = 'btn btn-secondary btn-small';
+                btn.style.cssText = 'margin: 0 4px 4px 0;';
+                btn.textContent = ag.name || ag.agentId;
+                btn.addEventListener('click', function() {
+                  state.claimToken = ag.token;
+                  state.agentId = ag.agentId;
+                  loadDashboard();
+                });
+                quickDiv.appendChild(btn);
               });
-              quickDiv.appendChild(btn);
-            });
-            loginCard.appendChild(quickDiv);
+              loginCard.appendChild(quickDiv);
+            }
           }
         }
       }
