@@ -50,6 +50,7 @@ export async function runAiAgentRollupTests(opts: { log?: boolean } = {}): Promi
   assertEq(sqlToken("x:ChatGPT-User/1.0"), "ChatGPT-User", "case: ChatGPT-User");
   assertEq(sqlToken("x:OAI-SearchBot/1.0"), "OAI-SearchBot", "case: OAI-SearchBot separate from ChatGPT-User");
   assertEq(sqlToken("x:Mozilla GPTBot/1.2"), "GPTBot", "case: GPTBot");
+  assertEq(sqlToken("x:gptbot/1.0 chatgpt-user"), null, "case: matching is case-sensitive like String.includes");
   assertEq(sqlToken("x:meta-externalagent/1.1"), "meta-externalagent", "case: longer token listed first wins");
   assertEq(aiAgentEntryByToken("OAI-SearchBot")?.purpose, "search_index", "entryByToken: purpose");
   assertEq(aiAgentEntryByToken("nope"), null, "entryByToken: unknown -> null");
@@ -121,6 +122,22 @@ export async function runAiAgentRollupTests(opts: { log?: boolean } = {}): Promi
     const narrow = computeAiAgentBreakdown(testDb as any, 1, 400, undefined, now);
     assertEq(narrow.raw.length, 0, "breakdown: raw window in hours (1-day-old rows outside 1 h)");
     assertEq(AI_AGENT_RAW_MAX_HOURS, 168, "breakdown: raw cap 168 h");
+    // raw side: owner rows and other verticals excluded
+    ins.run("/new", "h11:Mozilla/5.0 GPTBot/1.2", ago(1), 1, "rfb");
+    ins.run("/new", "h12:Mozilla/5.0 GPTBot/1.2", ago(1), 0, "dental");
+    const rawRfb = computeAiAgentBreakdown(testDb as any, 72, 400, "rfb", now).raw.map((x) => x.agent);
+    assertEq(rawRfb, ["ChatGPT-User", "OAI-SearchBot"], "breakdown raw: owner row and other vertical excluded");
+    // rollup side only counts days strictly before the oldest raw day
+    testDb.prepare("INSERT INTO page_view_ai_agent_daily (day, agent, vertical_id, view_count, session_count) VALUES (?, 'GPTBot', 'rfb', 9, 9)")
+      .run(ago(1).slice(0, 10));
+    const g = computeAiAgentBreakdown(testDb as any, 72, 400, undefined, now).rollup.find((x) => x.agent === "GPTBot");
+    assertEq(g?.views, 1, "breakdown rollup: days not yet pruned (>= oldest raw day) are not counted");
+    // upsert adds, never replaces: a second rollup of the same day adds to the row
+    const oldDay = ago(200);
+    ins.run("/c", "h13:Mozilla/5.0 (compatible; GPTBot/1.2)", oldDay, 0, "rfb");
+    rollupAndPrunePageViews(90, 7, false);
+    const gp = testDb.prepare("SELECT view_count FROM page_view_ai_agent_daily WHERE agent='GPTBot' AND day=?").get(oldDay.slice(0, 10)) as any;
+    assertEq(gp?.view_count, 2, "rollup: a late row for an already rolled-up day is added, not replaced");
     testDb.prepare("INSERT INTO page_view_ai_agent_daily (day, agent, vertical_id, view_count, session_count) VALUES (?, 'RetiredBot', 'rfb', 3, 1)")
       .run(ago(100).slice(0, 10));
     const unk = computeAiAgentBreakdown(testDb as any, 24, 400, undefined, now).rollup.find((x) => x.agent === "RetiredBot");
