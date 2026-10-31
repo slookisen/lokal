@@ -395,7 +395,7 @@ export async function runClientIpTests(opts: { log?: boolean } = {}): Promise<Te
   {
     const errs: string[] = [];
     const r = (env: Record<string, string | undefined>) => resolveClientIpConfig(env, (l) => errs.push(l));
-    assertEq(CLIENT_IP_MODE_DEFAULT, "shadow", "T9: trinn 1 default is shadow (trinn 2 flips exactly this)");
+    assertEq(CLIENT_IP_MODE_DEFAULT, "enforce", "T9: trinn 2 default is enforce (rollback: CLIENT_IP_MODE=shadow or legacy)");
     assertEq(r({}), { mode: "legacy", onFly: false, reason: "not_on_fly" }, "T9: {} (local dev, CI, npm test) → legacy");
     assertEq(r({ FLY_APP_NAME: "" }), { mode: "legacy", onFly: false, reason: "not_on_fly" }, "T9: empty FLY_APP_NAME → legacy");
     assertEq(r({ FLY_APP_NAME: "   " }), { mode: "legacy", onFly: false, reason: "not_on_fly" }, "T9: blank FLY_APP_NAME → legacy");
