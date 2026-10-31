@@ -20,7 +20,10 @@
  * 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S8): «Verifisert»
  * and the A2A verification_status follow the read-time claim
  * (dental-verified-claim.ts), so a stored 'verified' without a basis shows no
- * badge and answers 'pending_verify'. No key is added or removed.
+ * badge and answers 'pending_verify'. F2-S6 (same dev-request): the Helfo
+ * badge and helfo_agreement follow the Helfo claim (dental-helfo-claim.ts),
+ * so a stored 'true' without a source shows no badge and answers 'unknown'.
+ * No key is added or removed.
  *
  * Pure: no DB access (the detail card gets its specialists from the caller).
  */
@@ -28,6 +31,7 @@
 import { DentalAgentSchema, withoutDentalSideColumns, type DentalAgent, type DentalAgentRow, type DentalPerson } from "./dental-store";
 import { resolveVerifiedClaim, shownVerificationStatus } from "./dental-verified-claim";
 import { resolveAcuteClaim, ACUTE_ACCEPTS_LABEL, type AcuteClaim } from "./dental-acute-claim";
+import { resolveHelfoClaim, shownHelfoAgreement } from "./dental-helfo-claim";
 import { isDisplayablePhone } from "./contact-normalizer";
 import { shownPostnummer } from "./norway-postnummer";
 import { officialPlaceSpelling } from "./search-intent/norwegian-query";
@@ -126,7 +130,7 @@ export function toDentalClinicCard(
       mobil: displayablePhone(agent.mobil),
       epost: agent.epost,
       hjemmeside: agent.hjemmeside,
-      helfo_agreement: agent.helfo_agreement,
+      helfo_agreement: shownHelfoAgreement(agent),
       acute_vakt: publicAcuteVakt(agent),
       chain_brand: agent.chain_brand,
       is_chain_member: agent.is_chain_member,
@@ -160,7 +164,7 @@ export function toDentalClinicCard(
     hjemmeside: agent.hjemmeside,
     ...(agent.online_booking_url ? { online_booking_url: agent.online_booking_url } : {}),
     ...(apningstider.length ? { apningstider } : {}),
-    helfo_agreement: agent.helfo_agreement,
+    helfo_agreement: shownHelfoAgreement(agent),
     akutt: resolveAcuteClaim(agent),
     ...(spesialiteter.length ? { spesialiteter } : {}),
     ...(chainBrand ? { chain_brand: chainBrand } : {}),
@@ -176,7 +180,8 @@ export function toDentalClinicCard(
  * phone and mobile only when displayable, acute_vakt only with «Akuttvakt»,
  * the Places-only values null as on the cards (A4-D; also the row's own
  * opening_hours and hjemmeside), verification_status as the badge says it
- * (F2-S8: 'pending_verify' where the claim hides a stored 'verified') — the
+ * (F2-S8: 'pending_verify' where the claim hides a stored 'verified'),
+ * helfo_agreement from the card (F2-S6: 'unknown' without a source) — the
  * Google rating fields, the internal field_provenance and the read-only side
  * values (Stage V's pending map, the claim's inputs) left out, and the search
  * card's fields added with the card's values.
@@ -226,7 +231,7 @@ function publicAcuteVakt(agent: ClinicRow): 1 | null {
  */
 function clinicBadges(agent: ClinicRow, specialist: boolean): string[] {
   const badges: string[] = [];
-  if (agent.helfo_agreement === "true") badges.push("Helfo-avtale");
+  if (resolveHelfoClaim(agent)) badges.push("Helfo-avtale");
   const acute = resolveAcuteClaim(agent);
   if (acute === "vakt") badges.push("Akuttvakt");
   else if (acute === "accepts") badges.push(ACUTE_ACCEPTS_LABEL);

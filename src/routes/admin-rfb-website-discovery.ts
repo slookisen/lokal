@@ -84,6 +84,7 @@ import {
 import {
   classifyContactCandidateDefect,
   judgeContactCandidate,
+  type ContactCandidateJudgeVerdict,
 } from "../services/contact-candidate-judge";
 
 // ─── agents_website_review_queue (lazy, ensureXTable pattern) ──────────────
@@ -869,6 +870,12 @@ function rfbWdConfidence(evidence: RfbWdEvidence): number {
 // else in this route or elsewhere reads this table yet (a future
 // approve/apply slice would), and `DELETE FROM agents_website_review_queue`
 // undoes every effect of every call.
+// A row the judge closed as 'rejected' stays rejected (verdict kept in
+// `reason`) when discovery re-proposes the SAME candidate_url — otherwise
+// every re-discovery would reopen it and the judge would re-judge it daily.
+// A different candidate_url is new evidence and reopens the row as 'pending'.
+// (In SQLite every SET expression sees the row's OLD values, so the
+// candidate_url comparison is against the stored URL.)
 function upsertRfbWebsiteReviewQueue(
   db: ReturnType<typeof getDb>,
   entry: {
@@ -896,10 +903,18 @@ function upsertRfbWebsiteReviewQueue(
        final_url = excluded.final_url,
        evidence = excluded.evidence,
        confidence = excluded.confidence,
-       reason = excluded.reason,
+       reason = CASE
+         WHEN agents_website_review_queue.status = 'rejected'
+              AND agents_website_review_queue.candidate_url = excluded.candidate_url
+         THEN agents_website_review_queue.reason
+         ELSE excluded.reason END,
        existing_url = excluded.existing_url,
        batch_id = excluded.batch_id,
-       status = 'pending',
+       status = CASE
+         WHEN agents_website_review_queue.status = 'rejected'
+              AND agents_website_review_queue.candidate_url = excluded.candidate_url
+         THEN 'rejected'
+         ELSE 'pending' END,
        updated_at = datetime('now')`,
   ).run({
     id: uuid(),
@@ -1932,13 +1947,19 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
 // tests, e.g. "aa10: qualifying queue row flipped to applied") — a
 // judge-approved row lands in that identical state, not a parallel one.
 //
-// On AVVIS / any fail-closed outcome: the row's `status` column is left
-// UNTOUCHED ('pending') — only `reason` is updated (a plain SQL UPDATE) so
-// the judge's verdict is visible on the row without ever silently
-// resolving it. A rejected row stays eligible for a human reviewer, or for
-// re-judging on a later run (there is no "already judged, don't ask again"
-// marker — a future slice could add one; out of scope here, since nothing
-// in this slice makes re-judging incorrect, only potentially redundant).
+// On a real AVVIS (the structural backstop, or an actual model answer from
+// the LLM judge — an explicit AVVIS or an ambiguous answer): the row is
+// CLOSED — `status = 'rejected'`
+// with the verdict in `reason`; the row is never deleted (dev-request
+// 2026-10-31 S2: while it stayed `pending`, the same rows were re-judged
+// every day and counted as stale forever). `still_pending` and GET
+// /rfb-website-review-queue-staleness count only `pending`, so a rejected
+// row drops out of both. A judge-call infrastructure failure (verdict
+// `infraFailure`: missing API key, network error, timeout, non-2xx, bad
+// JSON, or a thrown error) is NOT a verdict: the row stays 'pending' and
+// only `reason` is updated, so it is judged again on a later run.
+// "GODKJENN but write blocked/threw" is not a judge rejection:
+// applyRfbAgentWebsite decides the status there, as before.
 export const RFB_WD_JUDGE_MIN_CONFIDENCE = 0.9;
 export const RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
 
@@ -2006,6 +2027,13 @@ function rfbWdJudgeAppendReason(db: ReturnType<typeof getDb>, rowId: string, not
   ).run(note, rowId);
 }
 
+/** The judge's AVVIS: close a still-pending row as 'rejected', keeping the verdict in `reason`. */
+function rfbWdJudgeReject(db: ReturnType<typeof getDb>, rowId: string, note: string): void {
+  db.prepare(
+    `UPDATE agents_website_review_queue SET status = 'rejected', reason = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`,
+  ).run(note, rowId);
+}
+
 router.post("/rfb-website-review-judge", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -2068,13 +2096,13 @@ router.post("/rfb-website-review-judge", async (req: Request, res: Response) => 
     const defect = classifyContactCandidateDefect("website", q.candidate_url);
     if (defect.defective) {
       const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
-      rfbWdJudgeAppendReason(db, q.id, note);
+      rfbWdJudgeReject(db, q.id, note);
       rejected++;
       results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
       continue;
     }
 
-    let verdict: { approved: boolean; reason?: string };
+    let verdict: ContactCandidateJudgeVerdict;
     try {
       verdict = await judgeContactCandidate({
         fieldType: "website",
@@ -2085,13 +2113,25 @@ router.post("/rfb-website-review-judge", async (req: Request, res: Response) => 
     } catch (err: any) {
       // judgeContactCandidate's own contract never throws, but this loop
       // must fail-closed even if that contract is ever violated — never let
-      // one row's unexpected error crash the rest of the batch.
-      verdict = { approved: false, reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}` };
+      // one row's unexpected error crash the rest of the batch. No verdict
+      // was obtained, so this is an infrastructure failure, not an AVVIS.
+      verdict = {
+        approved: false,
+        reason: `uventet dommerfeil — avvist fail-closed: ${err?.message ?? String(err)}`,
+        infraFailure: true,
+      };
     }
 
     if (!verdict.approved) {
       const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
-      rfbWdJudgeAppendReason(db, q.id, note);
+      if (verdict.infraFailure) {
+        // No model verdict (missing key, network, timeout, non-2xx, bad
+        // JSON, thrown error): keep the row 'pending' so a later run can
+        // judge it — only the reason is recorded.
+        rfbWdJudgeAppendReason(db, q.id, note);
+      } else {
+        rfbWdJudgeReject(db, q.id, note);
+      }
       rejected++;
       results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
       continue;

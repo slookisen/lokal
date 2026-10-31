@@ -275,8 +275,10 @@ export async function runDentalAkuttTeksterTests(opts: { log?: boolean } = {}): 
     add("Stempel Akutt Tannklinikk AS", "918780102", { acute_vakt: 1, field_provenance: STAMP });
     add("Fokus Akutt Tannklinikk AS", "918780103", { acute_vakt: 0, patient_focus: ["Akuttpasienter"] });
     // Helfo on two clinics without a claim: /sted and /fylke then have two facts and show their FAQ (E).
-    add("Flagg Uten Kilde Tannklinikk AS", "918780104", { acute_vakt: 1, helfo_agreement: "true" });
-    add("Vanlig Tannklinikk AS", "918780105", { helfo_agreement: "true" });
+    // F2-S6: with a Helfo source, which the Helfo claim needs (no akutt source).
+    const HELFO_PROV = { helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] };
+    add("Flagg Uten Kilde Tannklinikk AS", "918780104", { acute_vakt: 1, helfo_agreement: "true", field_provenance: HELFO_PROV });
+    add("Vanlig Tannklinikk AS", "918780105", { helfo_agreement: "true", field_provenance: HELFO_PROV });
     // In org_nr order, the order the fixture adds them (forslag S5, review of lokal#1207).
     const rows = db.prepare("SELECT navn, acute_vakt, field_provenance, patient_focus FROM dental_agents ORDER BY org_nr").all() as Array<Record<string, any>>;
     const claimOf = (r: Record<string, any>) => resolveAcuteClaim({

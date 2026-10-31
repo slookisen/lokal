@@ -246,7 +246,12 @@ function enterFixtures(): Fixtures {
     const dentalStore = require("../services/dental-store") as typeof import("../services/dental-store");
     const addClinic = (row: Record<string, unknown>) => dentalStore.createDentalAgent({ telefon: "22000000", ...row } as any);
     const osloClinicId = addClinic({ navn: "Oslo Sentrum Tann", poststed: "OSLO", fylke: "Oslo", postnummer: "0150", org_nr: DENTAL_ORGNR });
-    addClinic({ navn: "Majorstua Tann", poststed: "OSLO", fylke: "Oslo", postnummer: "0151", helfo_agreement: "true" });
+    const helfoClinicId = addClinic({ navn: "Majorstua Tann", poststed: "OSLO", fylke: "Oslo", postnummer: "0151", helfo_agreement: "true" });
+    // F2-S6: the Helfo claim needs a stored source (resolveHelfoClaim); the answers leave field_provenance out.
+    dbFactory.getDb("dental").prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?").run(
+      JSON.stringify({ helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] }),
+      helfoClinicId
+    );
     addClinic({ navn: "Bergen Tann", poststed: "BERGEN", fylke: "Vestland", postnummer: "5003", org_nr: "923456789" });
     addClinic({ navn: "Stavanger Tann", poststed: "STAVANGER", fylke: "Rogaland", postnummer: "4006" });
 

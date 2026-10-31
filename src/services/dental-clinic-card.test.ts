@@ -81,7 +81,12 @@ const A2A_REMOVED = ["rating", "rating_count", "rating_source", "field_provenanc
 const VERIFIED_BASIS = { brreg_status: "active", website_ownership: "verified", social_media: { facebook: "https://example.test" }, treatment_tech: ["digital røntgen"] };
 
 // F1-S4c: «Akuttvakt» needs the quote from the source; STAMP is the same source without it.
-const PROVENANCE = { acute_vakt: [{ source_type: "homepage", value: 1, quote: "Akuttvakt hver kveld og i helgene." }], telefon: [{ source_type: "brreg" }] };
+// helfo_agreement: the source the Helfo claim needs (F2-S6, resolveHelfoClaim).
+const PROVENANCE = {
+  acute_vakt: [{ source_type: "homepage", value: 1, quote: "Akuttvakt hver kveld og i helgene." }],
+  telefon: [{ source_type: "brreg" }],
+  helfo_agreement: [{ source_type: "homepage", value: "true" }],
+};
 const STAMP = { acute_vakt: [{ value: "1", source_type: "homepage", source_url: "https://example.no/akutt", fetched_at: "2026-05-01T10:00:00Z" }] };
 const UNDISPLAYABLE_PHONE = "+47 19 09 49";
 const WEEKDAYS_8_16 = ["mon", "tue", "wed", "thu", "fri"].map((day) => ({ day, open: "08:00", close: "16:00" }));

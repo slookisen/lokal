@@ -132,8 +132,12 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
     const legacySql = { clinicClass: DENTAL_CLINIC_CLASS_SQL, notProbe: DENTAL_NOT_SYNTHETIC_PROBE_SQL };
 
     // ── Fixture ───────────────────────────────────────────────────────────
-    const add = (row: Record<string, unknown>, extra: Record<string, unknown> = {}): string => {
+    // F2-S6: a Helfo row gets the source its claim needs (resolveHelfoClaim),
+    // so the public Helfo filter lists the same rows as the old WHERE.
+    const HELFO_PROV = JSON.stringify({ helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] });
+    const add = (row: Record<string, unknown>, given: Record<string, unknown> = {}): string => {
       const id = store.createDentalAgent(row as any);
+      const extra = row.helfo_agreement === "true" && given.field_provenance === undefined ? { ...given, field_provenance: HELFO_PROV } : given;
       const cols = Object.keys(extra);
       if (cols.length) db.prepare(`UPDATE dental_agents SET ${cols.map((c) => `${c} = @${c}`).join(", ")} WHERE id = @id`).run({ ...extra, id });
       return id;

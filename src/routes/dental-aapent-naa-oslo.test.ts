@@ -253,12 +253,14 @@ export async function runDentalAapentNaaOsloTests(opts: { log?: boolean } = {}):
     //    F1-S4c; the facet pages share the card. ──
     let orgSeq = 928990000;
     const KJEVE = '["kjeveortopedi"]';
+    // F2-S6: the Helfo fact needs a stored source (resolveHelfoClaim).
+    const HELFO_PROV = JSON.stringify({ helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] });
     const mk = (navn: string, hours: Hours | null, helfo = false): string => {
       const id = store.createDentalAgent({ navn, org_nr: String(++orgSeq), poststed: "OSLO", fylke: "Oslo", adresse: "Storgata 1", telefon: "22110099" } as any);
       db.prepare(
         "UPDATE dental_agents SET catalog_class = 'klinikk', is_inactive = 0, verification_status = 'unverified', helfo_agreement = ?," +
-        " available_specialties = ?, opening_hours = ? WHERE id = ?"
-      ).run(helfo ? "true" : "unknown", KJEVE, hours === null ? null : JSON.stringify(hours), id);
+        " field_provenance = ?, available_specialties = ?, opening_hours = ? WHERE id = ?"
+      ).run(helfo ? "true" : "unknown", helfo ? HELFO_PROV : null, KJEVE, hours === null ? null : JSON.stringify(hours), id);
       return id;
     };
     const KVELD = "Oslo Kveld Tann AS";
