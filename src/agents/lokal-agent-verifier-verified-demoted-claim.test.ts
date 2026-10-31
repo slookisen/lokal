@@ -196,6 +196,7 @@ export function runLokalAgentVerifierVerifiedDemotedClaimTests(
     // those that reached verified. ──────────────────────────────────────────
     const rrResults: VerifierResult[] = [
       makeResult({ agent_id: "rr-up", prior_verification_status: "review_required", new_verification_status: "verified" }),
+      makeResult({ agent_id: "rr-up-2", prior_verification_status: "review_required", new_verification_status: "verified" }),
       makeResult({ agent_id: "rr-stay", prior_verification_status: "review_required", new_verification_status: "review_required" }),
       makeResult({ agent_id: "rr-down", prior_verification_status: "review_required", new_verification_status: "data_insufficient" }),
       // not review_required-origin: reaches verified, must count in neither
@@ -213,8 +214,8 @@ export function runLokalAgentVerifierVerifiedDemotedClaimTests(
     const rrPro = findClaim(rrEnvelope, "review_required_promoted");
     assertTrue(!!rrRe, "rr-01: buildRunEnvelope includes the review_required_reevaluated claim");
     assertTrue(!!rrPro, "rr-02: buildRunEnvelope includes the review_required_promoted claim");
-    assertEq(rrRe?.value, 3, `rr-03: three review_required-origin rows re-evaluated (got ${rrRe?.value})`);
-    assertEq(rrPro?.value, 1, `rr-04: one review_required-origin row promoted to verified (got ${rrPro?.value})`);
+    assertEq(rrRe?.value, 4, `rr-03: four review_required-origin rows re-evaluated (got ${rrRe?.value})`);
+    assertEq(rrPro?.value, 2, `rr-04: two review_required-origin rows promoted to verified (got ${rrPro?.value})`);
     assertEq((rrEnvelope as any).claims.filter((c: any) => c.meta?.kind === "review_required_reevaluated").length, 1,
       "rr-05: review_required_reevaluated emitted exactly once");
 
