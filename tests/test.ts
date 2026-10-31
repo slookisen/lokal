@@ -51515,3 +51515,25 @@ runSerial(async () => {
     failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Slice T0c (owner portal): every inline <script> on the owner-facing pages
+// (RFB portal, login, Mine valg, Mine ordrer, order link + compact view,
+// gårdssalg login/portal/valg) is valid JavaScript as rendered, and the
+// portal's change log + fetch save work in a fake DOM. Swaps the getDb()
+// singleton, the cart DB, the experiences DB module cache, env vars and the
+// claim-harvest fetch (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── T0c: eiersidenes inline-skript er gyldig JavaScript ──");
+  try {
+    const { runOwnerPagesInlineScriptSyntaxT0cTests } = require("../src/routes/owner-pages-inline-script-syntax-t0c.test") as
+      typeof import("../src/routes/owner-pages-inline-script-syntax-t0c.test");
+    const r = await runOwnerPagesInlineScriptSyntaxT0cTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-pages-inline-script-syntax-t0c: " + f);
+    console.log(`  owner-pages-inline-script-syntax-t0c: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-pages-inline-script-syntax-t0c: unexpected error: " + String(err?.message || err));
+  }
+});
