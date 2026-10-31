@@ -1932,13 +1932,14 @@ router.post("/rfb-website-review-approve", (req: Request, res: Response) => {
 // tests, e.g. "aa10: qualifying queue row flipped to applied") — a
 // judge-approved row lands in that identical state, not a parallel one.
 //
-// On AVVIS / any fail-closed outcome: the row's `status` column is left
-// UNTOUCHED ('pending') — only `reason` is updated (a plain SQL UPDATE) so
-// the judge's verdict is visible on the row without ever silently
-// resolving it. A rejected row stays eligible for a human reviewer, or for
-// re-judging on a later run (there is no "already judged, don't ask again"
-// marker — a future slice could add one; out of scope here, since nothing
-// in this slice makes re-judging incorrect, only potentially redundant).
+// On AVVIS (the structural backstop or the LLM judge, fail-closed outcomes
+// of the judge call included): the row is CLOSED — `status = 'rejected'`
+// with the verdict in `reason`; the row is never deleted (dev-request
+// 2026-10-31 S2: while it stayed `pending`, the same rows were re-judged
+// every day and counted as stale forever). `still_pending` and GET
+// /rfb-website-review-queue-staleness count only `pending`, so a rejected
+// row drops out of both. "GODKJENN but write blocked/threw" is not a judge
+// rejection: applyRfbAgentWebsite decides the status there, as before.
 export const RFB_WD_JUDGE_MIN_CONFIDENCE = 0.9;
 export const RFB_WD_JUDGE_MAX_CONFIDENCE_EXCLUSIVE = 0.95;
 
@@ -2006,6 +2007,13 @@ function rfbWdJudgeAppendReason(db: ReturnType<typeof getDb>, rowId: string, not
   ).run(note, rowId);
 }
 
+/** The judge's AVVIS: close a still-pending row as 'rejected', keeping the verdict in `reason`. */
+function rfbWdJudgeReject(db: ReturnType<typeof getDb>, rowId: string, note: string): void {
+  db.prepare(
+    `UPDATE agents_website_review_queue SET status = 'rejected', reason = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`,
+  ).run(note, rowId);
+}
+
 router.post("/rfb-website-review-judge", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -2068,7 +2076,7 @@ router.post("/rfb-website-review-judge", async (req: Request, res: Response) => 
     const defect = classifyContactCandidateDefect("website", q.candidate_url);
     if (defect.defective) {
       const note = `judge backstop AVVIS: ${defect.reason ?? "flagged defective"}`;
-      rfbWdJudgeAppendReason(db, q.id, note);
+      rfbWdJudgeReject(db, q.id, note);
       rejected++;
       results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
       continue;
@@ -2091,7 +2099,7 @@ router.post("/rfb-website-review-judge", async (req: Request, res: Response) => 
 
     if (!verdict.approved) {
       const note = `LLM judge AVVIS: ${verdict.reason ?? "avvist"}`;
-      rfbWdJudgeAppendReason(db, q.id, note);
+      rfbWdJudgeReject(db, q.id, note);
       rejected++;
       results.push({ agent_id: q.agent_id, verdict: "AVVIS", reason: note });
       continue;

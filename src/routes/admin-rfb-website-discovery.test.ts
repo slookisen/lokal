@@ -2007,18 +2007,27 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const q = testDb
         .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-rej'")
         .get() as any;
-      assertEq(q.status, "pending", "jg-b5: status column untouched — still 'pending'");
+      // dev-request 2026-10-31 S2: the judge's AVVIS closes the row (was left 'pending').
+      assertEq(q.status, "rejected", "jg-b5: AVVIS closes the row — status 'rejected'");
       assertTrue(
         typeof q.reason === "string" && q.reason.includes("LLM judge AVVIS"),
         "jg-b6: reason column carries the judge's verdict",
       );
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-rej'").get() as any;
       assertTrue(!k.website, "jg-b7: website column still blank — no write");
+      assertEq(r.body.still_pending, 0, "jg-b8: a rejected row no longer counts in still_pending");
+      const again = await callJudge({});
+      assertEq(again.body.processed, 0, "jg-b9: a rejected row is not re-judged on the next run");
+      assertEq(
+        (testDb.prepare("SELECT COUNT(*) AS c FROM agents_website_review_queue WHERE agent_id = 'wd-jg-rej'").get() as any).c,
+        1,
+        "jg-b10: the rejected row is kept, not deleted",
+      );
     }
 
     // ── (jg-c) fail-closed path: a judge-side failure (simulated network
-    //     throw) resolves EXACTLY like a reject — no write, status
-    //     untouched, reason appended ──
+    //     throw) resolves EXACTLY like a reject — no write, row closed
+    //     as 'rejected', reason appended ──
     {
       testDb.prepare("DELETE FROM agents_website_review_queue").run();
       insertAgent({ id: "wd-jg-fail", name: "Steinbru Gardsmat AS" });
@@ -2043,7 +2052,7 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
       const q = testDb
         .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-fail'")
         .get() as any;
-      assertEq(q.status, "pending", "jg-c4: status untouched on fail-closed, same as a plain reject");
+      assertEq(q.status, "rejected", "jg-c4: fail-closed closes the row as 'rejected', same as a plain reject");
       assertTrue(typeof q.reason === "string" && q.reason.length > 0, "jg-c5: reason column carries the fail-closed note");
       const k = testDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'wd-jg-fail'").get() as any;
       assertTrue(!k.website, "jg-c6: website column still blank — no write");
@@ -2076,9 +2085,10 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         "jg-d3: reason attributes the rejection to the backstop classifier, not the LLM",
       );
       const q = testDb
-        .prepare("SELECT status FROM agents_website_review_queue WHERE agent_id = 'wd-jg-backstop'")
+        .prepare("SELECT status, reason FROM agents_website_review_queue WHERE agent_id = 'wd-jg-backstop'")
         .get() as any;
-      assertEq(q.status, "pending", "jg-d4: status untouched");
+      assertEq(q.status, "rejected", "jg-d4: backstop AVVIS closes the row — status 'rejected'");
+      assertTrue(typeof q.reason === "string" && q.reason.includes("judge backstop AVVIS"), "jg-d5: reason kept on the closed row");
 
       globalThis.fetch = stubFetch();
     }
@@ -2177,9 +2187,15 @@ export async function runAdminRfbWebsiteDiscoveryTests(opts: { log?: boolean } =
         `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
          VALUES ('q-st-applied', 'wd-st-applied', 'Alt Behandlet Gard AS', 'https://altbehandletgard.no', 'applied', ?, ?)`,
       ).run(daysAgoSqlite(10), daysAgoSqlite(10));
+      // A judge-rejected row (dev-request 2026-10-31 S2) is closed: excluded too.
+      insertAgent({ id: "wd-st-rejected", name: "Avvist Gard AS" });
+      testDb.prepare(
+        `INSERT INTO agents_website_review_queue (id, agent_id, agent_name, candidate_url, status, created_at, updated_at)
+         VALUES ('q-st-rejected', 'wd-st-rejected', 'Avvist Gard AS', 'https://avvistgard.no', 'rejected', ?, ?)`,
+      ).run(daysAgoSqlite(12), daysAgoSqlite(12));
 
       const r = await callStaleness();
-      assertEq(r.body.count, 3, "st-b1: count 3 — the applied row is excluded");
+      assertEq(r.body.count, 3, "st-b1: count 3 — the applied and the rejected rows are excluded");
       // threshold is 2 days: the 1-day row is fresh, the 3- and 5-day rows
       // are stale.
       assertEq(r.body.stale_count, 2, "st-b2: stale_count 2 (3-day and 5-day rows)");
