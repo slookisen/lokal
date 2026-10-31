@@ -25,7 +25,9 @@
 // POST needs, in this order: a valid token for this agent, the owner session,
 // the shared same-origin write guard, isVerifiedOwner + agents.is_verified = 1,
 // the verified claimant's own e-mail (as «Publiser valgte»), and a run id
-// that belongs to THIS agent's campaign (outreachRunsFor). It publishes the
+// that is the run the page would show right now for THIS agent's campaign
+// (resolveOutreachView without starting a fetch; an old tab of a list that a
+// newer re-fetch replaced is refused). It publishes the
 // ticked candidates with the owner's edits through publishOwnerImport (merge,
 // source 'owner_import', owner lock; never removes products) and, only when
 // «Varene er på lager» is ticked, marks the published rows in stock through
@@ -56,7 +58,6 @@ import {
   OUTREACH_LANDING_SUFFIX,
   OUTREACH_RETURN_COOKIE,
   outreachLandingPath,
-  outreachRunsFor,
   resolveOutreachView,
   verifyOutreachToken,
   type OutreachNotice,
@@ -160,10 +161,29 @@ function variantFor(agentId: string, token: string, runId: string, notice: Outre
  * it. The POST publishes only ids that are still in the filtered lists.
  */
 export function outreachVisiblePreview(p: Preview, llmAllowed: boolean = outreachLlmAllowed()): Preview {
-  const ok = (c: { publish_blocked: unknown; llm: boolean }) => !c.publish_blocked && (llmAllowed || !c.llm);
+  // price_nok null = no price, or one the extractor's rules dropped (not anchored): 3b-1 rejects
+  // those as no_price / price_not_anchored (AC17), so a re-fetch row without a price is never offered.
+  const ok = (c: { publish_blocked: unknown; llm: boolean; price_nok: number | null; price_missing_on_site: boolean }) =>
+    !c.publish_blocked && (llmAllowed || !c.llm) && c.price_nok !== null && !c.price_missing_on_site;
   const out: Preview = { ...p, new: p.new.filter(ok), changed: p.changed.filter(ok), unchanged: p.unchanged.filter(ok) };
   out.counts = { ...p.counts, new: out.new.length, changed: out.changed.length, unchanged: out.unchanged.length };
   return out;
+}
+
+/** Whether `runId` is any product-import run of this agent (to tell «old tab» from «unknown run»). */
+function outreachRunKnown(agentId: string, runId: string): boolean {
+  return !!getDb().prepare(`SELECT 1 FROM product_import_runs WHERE id = ? AND agent_id = ?`).get(runId, agentId);
+}
+
+function listReplacedPage(agentId: string, token: string): string {
+  return portalShell(
+    TITLE,
+    `<div class="ep-card" data-outreach-replaced="1">
+        <h1>Listen er oppdatert</h1>
+        <p>Vi har hentet varene fra nettsiden din på nytt. Ingenting er lagt inn. Åpne listen igjen og bekreft på nytt.</p>
+        <p><a class="ep-btn ep-btn-primary" href="${escapeHtml(outreachLandingPath(agentId, token))}">Åpne listen</a></p>
+      </div>`,
+  );
 }
 
 function ownerIsVerified(agentId: string, session: ReturnType<typeof verifyOwnerSession>): boolean {
@@ -262,8 +282,13 @@ router.post(PATH, express.urlencoded({ extended: false, parameterLimit: 5000 }),
     if (!claimantEmail) return res.status(403).send(ownerProductsNeedClaimantLoginPage(agentId));
 
     const runId = typeof body.run === "string" && RUN_ID_RE.test(body.run) ? body.run : "";
-    // Only a run of THIS agent's campaign: the token's agent + campaign pick the set.
-    const mode = runId ? outreachRunsFor(agentId, tok.campaign).get(runId) : undefined;
+    // Only the run the page shows now for THIS agent's campaign (token agent + campaign);
+    // never starts a fetch from a POST.
+    const view = resolveOutreachView(agentId, tok.campaign, { allowRefetch: false, isJobRunning: isOwnerFetchJobRunning });
+    if (view.kind === "list" && runId && view.run_id !== runId && outreachRunKnown(agentId, runId)) {
+      return res.status(409).send(listReplacedPage(agentId, token));
+    }
+    const mode = view.kind === "list" && view.run_id === runId ? view.mode : undefined;
     const raw = mode ? getOwnerImportPreview(agentId, runId, { mode }) : null;
     if (!mode || !raw) return res.status(404).send(linkUnusablePage());
     const preview = outreachVisiblePreview(raw);

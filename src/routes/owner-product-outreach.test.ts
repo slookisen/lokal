@@ -192,7 +192,9 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
     addAgent(LLMA, { verified: 1 });
     addAgent(NOTVER, { verified: 0 });
     addAgent(RUNNING, { verified: 1 });
-    for (const id of [OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA, NOTVER, RUNNING]) session(id);
+    const STUCK = "po-stuck";
+    addAgent(STUCK, { verified: 1 });
+    for (const id of [OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA, NOTVER, RUNNING, STUCK]) session(id);
     session(OWN, "kollega@po-own.example.no", "own-colleague");
 
     const shop = (host: string, products: Array<{ title: string; handle: string; price: string }>): Record<string, FakeRoute> => ({
@@ -215,6 +217,7 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       ...shop("po-stale.no", [{ title: "Blåbærsyltetøy", handle: "syltetoy", price: "80.00" }]),
       ...shop("po-limit.no", [{ title: "Brød", handle: "brod", price: "60.00" }]),
       ...shop("po-llm.no", [{ title: "Surdeigsbrød", handle: "surdeig", price: "65.00" }]),
+      ...shop("po-stuck.no", [{ title: "Rips", handle: "rips", price: "40.00" }]),
     };
     const fetchImpl = (async (input: any) => {
       const url = String(typeof input === "string" ? input : input?.url ?? input);
@@ -233,7 +236,7 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
     ol.__setOutreachLandingClockForTesting(now);
 
     // The 3b-1 pre-extraction at T0 (flag only matters for the routes).
-    const started = op.startOutreachPrepare([OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA], CAMPAIGN);
+    const started = op.startOutreachPrepare([OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA, STUCK], CAMPAIGN);
     await op.__awaitOutreachPrepareForTesting(started.prepare_id);
     const prepRun = (id: string) => (db.prepare(
       "SELECT id FROM product_import_runs WHERE mode = 'outreach_prepare' AND agent_id = ? AND campaign = ?").get(id, CAMPAIGN) as { id: string }).id;
@@ -415,6 +418,17 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       const rows = db.prepare(`SELECT agent_id, name, description, category, price_nok, availability, availability_updated_at, availability_source
         FROM products WHERE agent_id = ? AND name IN ('Skogshonning', 'Lammelår')`).all(OWN) as any[];
       assertEq(rows.length, 2, "AC20: catalog rows exist for the published products");
+      // M7: a skive 3 owner fetch started from the portal (no refetch_started event) is not this page's run.
+      db.prepare(`INSERT INTO product_import_runs (id, mode, status, agent_id, params_json, created_at)
+        VALUES ('pio-portal-1', 'owner_fetch', 'completed', ?, '{"website":"https://po-own.no"}', ?)`).run(OWN, new Date(clock).toISOString().slice(0, 19).replace("T", " "));
+      db.prepare(`INSERT INTO product_import_candidates
+         (id, run_id, agent_id, position, name, name_norm, price_nok, price_text, unit, price_is_from, price_excl_vat,
+          pack_size, tier, source_url, rules_json, fetched_at, status, created_at)
+       VALUES ('pic-portal-1', 'pio-portal-1', ?, 0, 'Portalhonning', 'portalhonning', 99, 'kr 99', NULL, 0, 0, NULL, 'shopify', NULL, '[]', '2026-10-21T09:00:00.000Z', 'pending', '2026-10-21 09:00:00')`).run(OWN);
+      const m7Before = totalChanges();
+      const m7 = await postPage(OWN, { t: tOwn, run: "pio-portal-1", velg: ["pic-portal-1"] }, tokens[OWN]);
+      assertTrue((m7.status === 404 || m7.status === 409 || m7.status === 400) && totalChanges() === m7Before && !productsOf(OWN).some((p) => p.name === "Portalhonning"),
+        "M7: a portal owner-fetch run (no refetch_started) is refused by the 3b POST, nothing written");
       assertTrue(rows.every((x) => !isRowOrderableForRealOrder(db, x, new Date())), "AC20: without «på lager» none is orderable");
       const again = await postPage(OWN, { t: tOwn, run: runOwn, velg: [idHon] }, tokens[OWN]);
       assertEq(again.status, 400, "AC20: an already published candidate cannot be published twice (ignored → 400)");
@@ -502,6 +516,24 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       assertTrue(!hidden.includes("Kjøtt") && !hidden.includes("pic-cat-1"), "B1: a category-label row of the re-fetch is not shown");
       const pl = await postPage(STALE, { t: tS, run: newRun, velg: ["pic-llm-1", "pic-cat-1"] }, tokens[STALE]);
       assertTrue(pl.status === 400 && !productsOf(STALE).some((x) => x.name === "Rabarbrasaft" || x.name === "Kjøtt"), "B1: POSTing hidden LLM / category ids publishes nothing");
+      // B2: a re-fetch row without a (kept) price is never offered (3b-1 rejects no_price / price_not_anchored).
+      ins.run("pic-noprice-1", newRun, STALE, 92, "Lynghonning", "lynghonning", null, "", "shopify");
+      const np = html(await getPage(STALE, tS, tokens[STALE]));
+      assertTrue(!np.includes("Lynghonning") && !np.includes("pic-noprice-1"), "B2: a re-fetch row without a price is not shown");
+      const npPost = await postPage(STALE, { t: tS, run: newRun, velg: ["pic-noprice-1"], [`navn_pic-noprice-1`]: "Lynghonning", [`pris_pic-noprice-1`]: "" }, tokens[STALE]);
+      assertTrue(npPost.status === 400 && !productsOf(STALE).some((x) => x.name === "Lynghonning"), "B2: POSTing a no-price row's id publishes nothing");
+      // (3) An old tab of the 3b-1 list cannot publish after the newer re-fetch replaced it.
+      const oldBefore = totalChanges();
+      const oldTab = await postPage(STALE, { t: tS, run: prepRun(STALE), velg: [candId(prepRun(STALE), "Blåbærsyltetøy")] }, tokens[STALE]);
+      assertTrue(oldTab.status === 409 && html(oldTab).includes('data-outreach-replaced="1"') && totalChanges() === oldBefore,
+        "(3) POST of the replaced 3b-1 run after a re-fetch → 409, nothing written");
+      // M15: a re-fetch run stuck in 'running' with no job in this process (restart) → the previous list, no self-refresh.
+      db.prepare(`INSERT INTO product_import_runs (id, mode, status, agent_id, params_json, created_at)
+        VALUES ('pio-stuck-1', 'owner_fetch', 'running', ?, '{"website":"https://po-stuck.no"}', ?)`).run(STUCK, new Date(clock).toISOString().slice(0, 19).replace("T", " "));
+      ol!.logOutreachEvent({ campaign: CAMPAIGN, agentId: STUCK, event: "refetch_started", runId: "pio-stuck-1", nowMs: clock });
+      const stuck = await getPage(STUCK, tokenFor(STUCK), tokens[STUCK]);
+      assertTrue(html(stuck).includes("Rips") && html(stuck).includes('data-outreach-notice="refetch_failed"') && !html(stuck).includes('http-equiv="refresh"')
+        && ownerRuns(STUCK) === 1, "M15: a re-fetch stuck in running without a job → previous list with notice, no meta refresh, no new fetch");
       // LLM-only website at re-fetch time, accuracy unset → the re-fetch never calls the LLM.
       delete routes["https://po-llm.no/products.json?limit=250"];
       routes["https://po-llm.no/"] = { body: HTML(`<a href="/priser">Priser</a><p>Velkommen til en liten gård med sau og høner langs elva.</p>`) };

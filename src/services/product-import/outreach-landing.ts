@@ -192,19 +192,6 @@ function candidateCount(runId: string): number {
     .get(runId) as { n: number }).n;
 }
 
-/**
- * The runs the landing page for (agent, campaign) may publish from: the
- * campaign's latest 3b-1 run and the owner fetches started from this page.
- * The POST accepts only a run id from this set.
- */
-export function outreachRunsFor(agentId: string, campaign: string): Map<string, "outreach_prepare" | "owner_fetch"> {
-  const out = new Map<string, "outreach_prepare" | "owner_fetch">();
-  const prep = latestPrepareRun(agentId, campaign);
-  if (prep) out.set(prep.id, "outreach_prepare");
-  for (const e of refetchEvents(agentId, campaign)) if (ownerRun(agentId, e.run_id)) out.set(e.run_id, "owner_fetch");
-  return out;
-}
-
 // ── Freshness ───────────────────────────────────────────────────────────────
 
 export type OutreachNotice = "refetch_failed" | "refetch_unavailable" | "stale";
