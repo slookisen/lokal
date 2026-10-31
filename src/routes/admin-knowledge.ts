@@ -1885,7 +1885,8 @@ const HCR_CONTENT_PATHS: readonly string[] = ["/om-oss", "/about", "/produkter"]
  */
 /**
  * Optional caller bounds for one refresh (refreshHomepageContent's
- * deadlineAt/fetchImpl). Absent — always, for the route — every fetch below
+ * deadlineAt/fetchImpl). Absent (the route always sets deadlineAt since
+ * dev-request 2026-10-31 S1) — every fetch below
  * is the exact pre-extraction call.
  */
 type HcrFetchIo = { deadlineAt?: number; fetchImpl?: typeof fetch };
@@ -1957,7 +1958,7 @@ async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Pr
     const discovered = discoverContentLinks(primaryHtml, u.toString(), HCR_CONTENT_PATHS.length);
     const targets = discovered.length > 0 ? discovered : HCR_CONTENT_PATHS.map((p) => `${base}${p}`);
     for (const target of targets) {
-      // No sub-page is started after a caller's deadline (never set by the route).
+      // No sub-page is started after a caller's deadline.
       if (io?.deadlineAt !== undefined && Date.now() >= io.deadlineAt) break;
       const sub = await hcrFetchHtml(target, io);
       if (sub) combinedHtml += "\n" + sub;
@@ -2048,9 +2049,10 @@ export interface HomepageContentRefreshOptions {
   /** true = the route's dry run: every candidate computed and reported, nothing written. */
   dryRun: boolean;
   /**
-   * Absolute Date.now() deadline in ms. NEVER set by the route (unset = no
-   * deadline, byte-identical behaviour). Set by the platform-side RFB send so
-   * a slow producer site cannot hold the morning run: every fetch is aborted
+   * Absolute Date.now() deadline in ms (unset = no deadline). Set by the
+   * route (now + HCR_ROUTE_TIME_BUDGET_MS, dev-request 2026-10-31 S1) and by
+   * the platform-side RFB send, so a slow producer site cannot hold the run
+   * past its caller's timeout: every fetch is aborted
    * at the deadline (its own 10s timeout still applies below it), no sub-page
    * is started after it, and an agent whose fetch returns after it writes
    * nothing (error `refresh_deadline_exceeded`). A deadline abort classifies
@@ -2651,7 +2653,7 @@ export async function refreshHomepageContent(
       errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
       return;
     }
-    // Caller-set deadline (never set by the route): a fetch that came back
+    // Caller-set deadline: a fetch that came back
     // after it — or was cut short by it — writes NOTHING, not even the
     // parking bookkeeping. Everything below this line up to the write
     // transaction is synchronous, so a caller that stopped waiting at the
@@ -3140,6 +3142,35 @@ export async function refreshHomepageContent(
   };
 }
 
+/** Default time budget (ms) for one POST /admin/homepage-content-refresh call. */
+export const HCR_ROUTE_TIME_BUDGET_MS = 40_000;
+
+/** HCR_ROUTE_TIME_BUDGET_MS, overridable by the env var of the same name (positive integer, else the default). */
+export function resolveHcrRouteTimeBudgetMs(env: Record<string, string | undefined> = process.env): number {
+  const n = parseInt(String(env.HCR_ROUTE_TIME_BUDGET_MS ?? ""), 10);
+  return Number.isInteger(n) && n > 0 ? n : HCR_ROUTE_TIME_BUDGET_MS;
+}
+
+/** The route's `limit`: body first, then ?limit=N; default 25, hard cap 100. */
+export function resolveHomepageContentRefreshLimit(bodyLimit: unknown, queryLimit: unknown): number {
+  const parse = (v: unknown): number | null => {
+    if (typeof v === "number") return Number.isFinite(v) && v > 0 ? Math.floor(v) : null;
+    if (typeof v === "string" && /^\s*\d+\s*$/.test(v)) {
+      const n = parseInt(v, 10);
+      return n > 0 ? n : null;
+    }
+    return null;
+  };
+  return Math.min(parse(bodyLimit) ?? parse(queryLimit) ?? 25, 100);
+}
+
+/** Number of targets a deadline-bounded refresh did not reach (refresh_deadline_exceeded). */
+export function homepageContentRefreshNotReached(result: HomepageContentRefreshResult): number {
+  return new Set(
+    result.errors.filter((e) => e.error.startsWith(HCR_DEADLINE_EXCEEDED)).map((e) => e.agent_id),
+  ).size;
+}
+
 homepageContentRefreshRouter.post(
   "/homepage-content-refresh",
   async (req: Request, res: Response) => {
@@ -3161,11 +3192,9 @@ homepageContentRefreshRouter.post(
       req.query?.apply === "true";
     const dryRun = !apply;
 
-    // limit: default 25, hard cap 100.
-    const limit = Math.min(
-      typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : 25,
-      100,
-    );
+    // limit: default 25, hard cap 100. Read from the body or from ?limit=N
+    // (dev-request 2026-10-31 S1); the body wins when both are set.
+    const limit = resolveHomepageContentRefreshLimit(body.limit, req.query?.limit);
 
     const db = getDb();
 
@@ -3246,16 +3275,28 @@ homepageContentRefreshRouter.post(
     // lock) keep the replacing behaviour, byte for byte. Deviation from R2
     // (2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter), which
     // had the auto-select replace them.
+    //
+    // Time budget (dev-request 2026-10-31 S1): the route now passes a
+    // deadline, as the platform-side RFB send already does, so a run of slow
+    // producer sites cannot outlive the caller's HTTP timeout. A target not
+    // reached by the deadline writes nothing — no fetch strike, no parking,
+    // no rotation stamp (the deadline is `transient`, see hcrFetchPage) — and
+    // is counted in `not_reached`; `truncated` says whether any were.
+    const deadlineAt = Date.now() + resolveHcrRouteTimeBudgetMs();
     const result = await refreshHomepageContent(db, targets, {
       dryRun,
+      deadlineAt,
       ...(autoSelected ? { categoriesCorroborateOnly: true } : {}),
     });
+    const notReached = homepageContentRefreshNotReached(result);
     res.json({
       dry_run: dryRun,
       ...result,
-      // Auto-select only (last key; the explicit-ids response is unchanged):
+      // Auto-select only (the explicit-ids response is unchanged):
       // the corroboration tally, keyed like R6's extra.categories_corroboration.
       ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
+      truncated: notReached > 0,
+      not_reached: notReached,
     });
   },
 );
