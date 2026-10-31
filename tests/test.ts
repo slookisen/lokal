@@ -51557,3 +51557,24 @@ runSerial(async () => {
     failures.push("owner-pages-inline-script-syntax-t0c: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Opplevagent «For tilbydere» with sections and FAQ (dev-request O4 = G4,
+// slice O4a): flag off = old page unchanged; flag on = ten section ids + top
+// menu, FAQPage JSON-LD == visible accordion, price text from price-message.ts,
+// no Rett fra Bonden wording, escaping. Calls the GET handler directly, no DB;
+// restores FOR_TILBYDERE_FAQ_ENABLED in finally — tail position.
+runSerial(async () => {
+  console.log("\n── O4a: «For tilbydere» med deler og FAQ (opplevagent.no /for-tilbydere) ──");
+  try {
+    const { runExperiencesForTilbydereFaqTests } = require("../src/routes/experiences-for-tilbydere-faq.test") as
+      typeof import("../src/routes/experiences-for-tilbydere-faq.test");
+    const r = await runExperiencesForTilbydereFaqTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("experiences-for-tilbydere-faq: " + f);
+    console.log(`  experiences-for-tilbydere-faq: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-for-tilbydere-faq: unexpected error: " + String(err?.message || err));
+  }
+});
