@@ -22,7 +22,8 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { safeHonestCatalogCount } from "../services/honest-count";
 import { resolveRouteIntent } from "../services/route-intent";
-import { knowledgeService, productPriceText, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
+import { knowledgeService, productPriceText, parseProductPrice, OWNER_PRODUCT_SOURCES } from "../services/knowledge-service";
+import { catalogNameNorm, softStockByNameNorm, stockSoftExpiryBuyerText, type SoftStockFields } from "../services/stock-soft-expiry";
 import { containsOrganicClaim, isOrganicClaimUmbrella } from "../services/organic-claims";
 import { publicFieldChoices, publicFieldChoicesForMany, withoutHiddenFields, hidesAddress, hidesPrices, debioSwitchOffAgentIds } from "../owner-features/enforce";
 import { debioApprovalText, debioProcessText, debioRegisterSyncEnabled, finnokoSearchUrl, readDebioStatusRow } from "../services/debio-approval";
@@ -5992,6 +5993,17 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const footerDate: { iso: string; byOwner: boolean } | null =
       Number.isFinite(ownerAt) && !(enrichedAt >= ownerAt) ? { iso: kDates!.owner_updated_at as string, byOwner: true }
       : Number.isFinite(enrichedAt) ? { iso: kDates!.last_enriched_at as string, byOwner: false } : null;
+    // B2b-2 (bestillinger, «myk utløp»): the producer's catalog rows in the
+    // soft window, by name. Empty unless STOCK_SOFT_EXPIRY_ENABLED is on and
+    // the producer is on the owner-features allowlist — then nothing below
+    // changes. A product whose row is in the window shows the date it was
+    // last confirmed and that the producer confirms the order (HTML text with
+    // data-stock-confirmed-at / data-needs-producer-confirmation, and the same
+    // text as the JSON-LD node's description).
+    const softStock = softStockByNameNorm(getDb(), agent.id);
+    const softStockOf = (p: any, name: string): SoftStockFields | undefined =>
+      softStock.size ? softStock.get(catalogNameNorm(typeof p === "object" ? parseProductPrice(p).cleanName : name)) : undefined;
+    const softLang: "no" | "en" = lang === "en" ? "en" : "no";
     const productsHtml = productsList.length
       ? productsList.map((p: any) => {
           // Handle both object products ({name, category, price}) and plain strings ("brød").
@@ -6012,6 +6024,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           const priceText = isObject ? productPriceText(p.price) : "";
           const priceUnit = isObject && typeof p.priceUnit === "string" ? p.priceUnit : "";
           const price = priceText ? `<span class="prod-price">${escapeHtml(priceText)}${priceUnit && priceUnit !== 'kr' ? ' ' + escapeHtml(priceUnit) : ''}</span>` : "";
+          const soft = softStockOf(p, name);
+          if (soft) {
+            const note = `<div class="prod-stock" data-stock-confirmed-at="${escapeHtml(soft.stock_confirmed_at)}" data-needs-producer-confirmation="true" style="flex-basis:100%;font-size:0.72rem;color:var(--g500);margin-top:4px">${escapeHtml(stockSoftExpiryBuyerText(soft.stock_confirmed_at, softLang))}</div>`;
+            return `<div class="prod-item" style="flex-wrap:wrap"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div>${note}</div>`;
+          }
           return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).filter(Boolean).join("") : "";
 
@@ -6303,8 +6320,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         // rejects Offer without price, so unpriced products are NOT emitted
         // as Offer/Product; they go to a non-validating OfferCatalog of
         // name-only Things (keeps AI visibility from 2026-09-24 B1, no fake price).
+        // B2b-2: a product whose catalog row is in the soft window states the
+        // confirmation date in the node's description (schema.org Thing/Offer
+        // `description`); `availability` stays a schema.org value. {} otherwise.
+        const soft = softStockOf(p, rawName);
+        const softLd = soft ? { "description": stockSoftExpiryBuyerText(soft.stock_confirmed_at, softLang) } : {};
         if (priceNum === null) {
-          unpricedItems.push({ "@type": "Thing", "name": productName });
+          unpricedItems.push({ "@type": "Thing", "name": productName, ...softLd });
           return null;
         }
 
@@ -6312,9 +6334,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         // (S6 del B): no Product node on a producer page (policy rule 7). The
         // Offer sits in the farm's own makesOffer, so it needs no seller; it
         // claims no stock status (no product data holds one), brand or
-        // description.
+        // description — except B2b-2's confirmation-date description above.
         if (!producerPageProductNodes()) {
-          return { "@type": "Offer", "name": productName, "price": priceNum, "priceCurrency": "NOK" };
+          return { "@type": "Offer", "name": productName, "price": priceNum, "priceCurrency": "NOK", ...softLd };
         }
 
         // Rollback mode only (PRODUCER_PAGE_PRODUCT_NODES = true): the Product

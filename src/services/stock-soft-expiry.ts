@@ -26,7 +26,7 @@
 
 import crypto from "crypto";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
-import { setProducerAvailabilityByProductId } from "./supply-graph";
+import { evaluateStockFreshness, setProducerAvailabilityByProductId } from "./supply-graph";
 
 export const STOCK_SOFT_EXPIRY_FLAG = "STOCK_SOFT_EXPIRY_ENABLED";
 
@@ -61,6 +61,55 @@ export function stockSoftExpiryBuyerTemplate(lang: "no" | "en"): string {
 /** The buyer's text next to the item and in the checkout for a row that needs the producer's confirmation. */
 export function stockSoftExpiryBuyerTextNb(stockConfirmedAt: string): string {
   return BUYER_TEMPLATE.no.replace("{date}", formatStockConfirmedDate(stockConfirmedAt));
+}
+
+/** The buyer's text in `lang` for a row that needs the producer's confirmation. */
+export function stockSoftExpiryBuyerText(stockConfirmedAt: string, lang: "no" | "en"): string {
+  return BUYER_TEMPLATE[lang].replace("{date}", formatStockConfirmedDate(stockConfirmedAt));
+}
+
+// ─── B2b-2: the surfaces (producer page / JSON-LD, MCP, REST, A2A, feeds) ──
+// The read side of the rule for surfaces that list a producer's products by
+// name (the knowledge product list), not by catalog row: which of the
+// producer's catalog rows are in the soft window, keyed by name_norm. Empty
+// unless the rule is active for the producer (flag AND allowlist), so a
+// surface that only adds something for a key in this map is byte-identical
+// with the rule off.
+
+/** B2b-2: the two soft-window fields a surface adds for a row. */
+export interface SoftStockFields {
+  stock_confirmed_at: string;
+  needs_producer_confirmation: true;
+}
+
+/** products.name_norm of a product name (the rule mcp.ts normalizeProductName uses). */
+export function catalogNameNorm(name: string): string {
+  return name.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+/**
+ * B2b-2: the producer's catalog rows in the soft window (name_norm → fields).
+ * Empty when the rule is not active for `agentId` or the catalog cannot be read.
+ */
+export function softStockByNameNorm(db: any, agentId: string, now: Date = new Date()): Map<string, SoftStockFields> {
+  const out = new Map<string, SoftStockFields>();
+  if (!stockSoftExpiryActiveFor(agentId)) return out;
+  try {
+    const rows = db.prepare(
+      `SELECT name_norm, availability, availability_updated_at, availability_source
+         FROM products
+        WHERE agent_id = ? AND availability = 'in_stock' AND availability_source = 'producer_dashboard'`,
+    ).all(agentId) as Array<{ name_norm: string; availability: string; availability_updated_at: string | null; availability_source: string }>;
+    for (const r of rows) {
+      const f = evaluateStockFreshness(r.availability, r.availability_updated_at, r.availability_source, now, true);
+      if (f.needs_producer_confirmation && f.stock_confirmed_at && !out.has(r.name_norm)) {
+        out.set(r.name_norm, { stock_confirmed_at: f.stock_confirmed_at, needs_producer_confirmation: true });
+      }
+    }
+  } catch {
+    // Never let the lookup break a surface: no soft-window rows.
+  }
+  return out;
 }
 
 function sqlTs(d: Date): string {
