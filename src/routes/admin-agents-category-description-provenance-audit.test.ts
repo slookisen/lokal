@@ -452,6 +452,54 @@ export async function runAdminAgentsCategoryDescriptionProvenanceAuditTests(
       "AC3: apply=1 never touches a row that isJunkDescription did not flag (clean-control untouched)",
     );
 
+    // ── S3 (dev-request 2026-10-31): claimed / curated-locked boilerplate
+    //    rows are not routing candidates — applyRfbRetroScanNull refuses
+    //    them, so they are listed in skipped_claimed / skipped_curated ──────
+    insertAgent({ id: "claimed-boiler", name: "Kravd Gård", description: DALPRO_SHAPED_BOILERPLATE, categories: ["vegetables"] });
+    db.prepare("UPDATE agents SET claimed_at = '2026-10-01T00:00:00.000Z' WHERE id = 'claimed-boiler'").run();
+    insertKnowledge("claimed-boiler");
+    insertAgent({ id: "curated-boiler", name: "Låst Gård", description: DALPRO_SHAPED_BOILERPLATE, categories: ["vegetables"] });
+    insertKnowledge("curated-boiler");
+    db.prepare(`UPDATE agent_knowledge SET curated_fields = '{"description":true}' WHERE agent_id = 'curated-boiler'`).run();
+    insertAgent({ id: "plain-boiler", name: "Vanlig Gård", description: DALPRO_SHAPED_BOILERPLATE, categories: ["vegetables"] });
+    insertKnowledge("plain-boiler");
+
+    const s3Dry = callRouteSync(auditRouter, {
+      method: "POST",
+      path: "/route-boilerplate-to-reenrichment",
+      headers: { "x-admin-key": testKey },
+    });
+    const s3Ids = (s3Dry.body?.candidates ?? []).map((c: any) => c.id);
+    assertTrue(!s3Ids.includes("claimed-boiler"), "S3: a claimed row with boilerplate is NOT a candidate");
+    assertEq(s3Dry.body?.skipped_claimed, [{ id: "claimed-boiler", field: "description" }], "S3: the claimed row is listed in skipped_claimed");
+    assertTrue(!s3Ids.includes("curated-boiler"), "S3: a curated-locked boilerplate field is NOT a candidate");
+    assertEq(s3Dry.body?.skipped_curated, [{ id: "curated-boiler", field: "description" }], "S3: the curated-locked field is listed in skipped_curated");
+    assertEq(s3Ids, ["plain-boiler"], "S3: candidates = only rows the write can touch");
+    assertEq(s3Dry.body?.candidate_count, 1, "S3: candidate_count counts only writable rows");
+
+    const s3Report = callRouteSync(auditRouter, { headers: { "x-admin-key": testKey } });
+    const s3Ex = (s3Report.body?.boilerplate_description?.examples ?? []) as any[];
+    assertEq(
+      s3Ex.filter((e) => e.id.endsWith("-boiler")).map((e) => [e.id, e.claimed, e.curated_locked]),
+      [["claimed-boiler", true, false], ["curated-boiler", false, true], ["plain-boiler", false, false]],
+      "S3: GET / still shows every boilerplate hit, claimed / curated-locked rows marked",
+    );
+    assertEq(
+      [s3Report.body?.boilerplate_description?.count, s3Report.body?.boilerplate_description?.claimed_count, s3Report.body?.boilerplate_description?.curated_locked_count],
+      [3, 1, 1],
+      "S3: GET / count covers all hits; claimed_count / curated_locked_count reported",
+    );
+
+    const s3Apply = callRouteSync(auditRouter, {
+      method: "POST",
+      path: "/route-boilerplate-to-reenrichment",
+      query: { apply: "1" },
+      headers: { "x-admin-key": testKey },
+    });
+    assertEq(s3Apply.body?.routed_to_reenrichment, [{ agent_id: "plain-boiler", field: "description" }], "S3: apply routes only the writable row");
+    const claimedAfter = db.prepare("SELECT description FROM agents WHERE id = 'claimed-boiler'").get() as { description: string };
+    assertEq(claimedAfter.description, DALPRO_SHAPED_BOILERPLATE, "S3: the claimed row is untouched by apply");
+
     // Auth gate on the POST route too.
     const postNoKey = callRouteSync(auditRouter, { method: "POST", path: "/route-boilerplate-to-reenrichment" });
     assertEq(postNoKey.status, 403, "auth: POST route-boilerplate-to-reenrichment without X-Admin-Key -> 403");

@@ -3303,7 +3303,7 @@ interface RfbRetroScanTarget {
  * portal-style `{locked_at, by}` object both count as locked). Tolerates
  * malformed/missing JSON (treated as "not locked"), matching the defensive-
  * parse convention used throughout this file and admin-knowledge.ts. */
-function isRfbFieldCurated(curatedFieldsJson: string | null | undefined, field: "description" | "about"): boolean {
+export function isRfbFieldCurated(curatedFieldsJson: string | null | undefined, field: "description" | "about"): boolean {
   if (!curatedFieldsJson) return false;
   try {
     const parsed = JSON.parse(curatedFieldsJson);
