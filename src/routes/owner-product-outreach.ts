@@ -44,7 +44,7 @@ import {
   verifyOwnerSession,
 } from "./owner-portal";
 import { publishSelectionFromForm, renderImportPreviewPage, type FormState, type Preview, type PreviewVariant } from "./owner-product-import";
-import { productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
+import { outreachLlmAllowed, productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
 import {
   getOwnerImportPreview,
   isOwnerFetchJobRunning,
@@ -152,6 +152,20 @@ function variantFor(agentId: string, token: string, runId: string, notice: Outre
   };
 }
 
+/**
+ * The 3b controls on what the page may show and publish, whatever run it
+ * reads (a re-fetch is a Skive 3 owner fetch, which stages every row as
+ * pending): no row the order gate blocks (category label, alcohol, service,
+ * failed check) and no LLM-tier row unless the measured LLM accuracy allows
+ * it. The POST publishes only ids that are still in the filtered lists.
+ */
+export function outreachVisiblePreview(p: Preview, llmAllowed: boolean = outreachLlmAllowed()): Preview {
+  const ok = (c: { publish_blocked: unknown; llm: boolean }) => !c.publish_blocked && (llmAllowed || !c.llm);
+  const out: Preview = { ...p, new: p.new.filter(ok), changed: p.changed.filter(ok), unchanged: p.unchanged.filter(ok) };
+  out.counts = { ...p.counts, new: out.new.length, changed: out.changed.length, unchanged: out.unchanged.length };
+  return out;
+}
+
 function ownerIsVerified(agentId: string, session: ReturnType<typeof verifyOwnerSession>): boolean {
   if (!isVerifiedOwner(agentId, session)) return false;
   const row = getDb().prepare(`SELECT is_verified FROM agents WHERE id = ?`).get(agentId) as { is_verified?: number } | undefined;
@@ -198,8 +212,9 @@ router.get(PATH, (req: Request, res: Response) => {
     if (view.kind === "none") return res.send(noListPage(agentId));
     const runId = view.run_id;
     const mode = view.kind === "list" ? view.mode : "owner_fetch";
-    const preview = getOwnerImportPreview(agentId, runId, { mode });
-    if (!preview) return res.send(noListPage(agentId));
+    const raw = getOwnerImportPreview(agentId, runId, { mode });
+    if (!raw) return res.send(noListPage(agentId));
+    const preview = outreachVisiblePreview(raw);
     const claimant = !!sessionClaimantOwnerEmail(agentId, session);
     const variant = variantFor(agentId, token, runId, view.kind === "list" ? view.notice : null, view.kind === "list" ? view.extracted_at : preview.created_at, false);
     const html = renderImportPreviewPage(agentId, preview, { claimant, variant });
@@ -249,11 +264,15 @@ router.post(PATH, express.urlencoded({ extended: false, parameterLimit: 5000 }),
     const runId = typeof body.run === "string" && RUN_ID_RE.test(body.run) ? body.run : "";
     // Only a run of THIS agent's campaign: the token's agent + campaign pick the set.
     const mode = runId ? outreachRunsFor(agentId, tok.campaign).get(runId) : undefined;
-    const preview: Preview | null = mode ? getOwnerImportPreview(agentId, runId, { mode }) : null;
-    if (!mode || !preview) return res.status(404).send(linkUnusablePage());
+    const raw = mode ? getOwnerImportPreview(agentId, runId, { mode }) : null;
+    if (!mode || !raw) return res.status(404).send(linkUnusablePage());
+    const preview = outreachVisiblePreview(raw);
 
     const inStock = body.paa_lager === "1";
-    const { selection, form } = publishSelectionFromForm(preview, body);
+    const { selection: ticked, form } = publishSelectionFromForm(preview, body);
+    // Only ids the page shows: a hidden (LLM / blocked) or foreign id is ignored.
+    const shown = new Set([...preview.new, ...preview.changed].map((c) => c.id));
+    const selection = ticked.filter((s) => shown.has(s.id));
     const r = publishOwnerImport(agentId, runId, selection, [], { actorEmail: claimantEmail, mode });
     if (!r.ok) {
       const formState: FormState = { ...form, remove: new Set() };

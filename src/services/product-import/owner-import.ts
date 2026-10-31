@@ -243,7 +243,13 @@ export type StartFetchResult =
   | { ok: true; run_id: string; status: "running" }
   | { ok: false; status: 409 | 422 | 429 | 503; error: string; message: string };
 
-export function startOwnerFetch(agentId: string, deps: OwnerImportDeps = testDeps ?? {}): StartFetchResult {
+/**
+ * `opts.llmCap` (default 1, the Skive 3 portal path): how many LLM calls the
+ * fetch may make. The Skive 3b outreach re-fetch passes 0 unless the measured
+ * LLM accuracy allows the LLM tier there (outreachLlmAllowed).
+ */
+export function startOwnerFetch(agentId: string, deps: OwnerImportDeps = testDeps ?? {}, opts: { llmCap?: 0 | 1 } = {}): StartFetchResult {
+  const llmCap = opts.llmCap ?? 1;
   const db = getDb();
   const now = deps.now ?? Date.now;
   const website = profileWebsite(agentId);
@@ -263,14 +269,14 @@ export function startOwnerFetch(agentId: string, deps: OwnerImportDeps = testDep
   // slip between the count and the row that it counts.
   db.prepare(
     `INSERT INTO product_import_runs (id, mode, status, params_json, profiles_total, llm_call_cap, agent_id, created_at)
-     VALUES (?, 'owner_fetch', 'running', ?, 1, 1, ?, ?)`,
-  ).run(runId, JSON.stringify({ website }), agentId, sqlTs(startedMs));
-  const promise = runOwnerFetch(runId, agentId, website, deps).finally(() => jobs.delete(runId));
+     VALUES (?, 'owner_fetch', 'running', ?, 1, ?, ?, ?)`,
+  ).run(runId, JSON.stringify({ website }), llmCap, agentId, sqlTs(startedMs));
+  const promise = runOwnerFetch(runId, agentId, website, deps, llmCap).finally(() => jobs.delete(runId));
   jobs.set(runId, { agentId, promise });
   return { ok: true, run_id: runId, status: "running" };
 }
 
-async function runOwnerFetch(runId: string, agentId: string, website: string, deps: OwnerImportDeps): Promise<void> {
+async function runOwnerFetch(runId: string, agentId: string, website: string, deps: OwnerImportDeps, llmCap: number): Promise<void> {
   const now = deps.now ?? Date.now;
   const fail = (outcome: string, error: string) => {
     try {
@@ -296,7 +302,7 @@ async function runOwnerFetch(runId: string, agentId: string, website: string, de
       sleep: deps.sleep,
       now: deps.now,
       timeoutMs: deps.timeoutMs,
-      llmBudget: { cap: 1, used: 0 },
+      llmBudget: { cap: llmCap, used: 0 },
       pacer: new HostPacer(deps.hostIntervalMs ?? OWNER_FETCH_HOST_INTERVAL_MS, deps.now, deps.sleep),
     });
     const result = await Promise.race([extraction, timeout]);

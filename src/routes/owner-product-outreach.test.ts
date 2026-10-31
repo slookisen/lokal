@@ -186,7 +186,13 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
     addAgent(ZERO, { verified: 1 });
     addAgent(STALE, { verified: 1 });
     addAgent(LIMIT, { verified: 1 });
-    for (const id of [OWN, B, OTHER, ZERO, STALE, LIMIT]) session(id);
+    const LLMA = "po-llm";
+    const NOTVER = "po-notver"; // verified claim (isVerifiedOwner), but agents.is_verified = 0
+    const RUNNING = "po-run";
+    addAgent(LLMA, { verified: 1 });
+    addAgent(NOTVER, { verified: 0 });
+    addAgent(RUNNING, { verified: 1 });
+    for (const id of [OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA, NOTVER, RUNNING]) session(id);
     session(OWN, "kollega@po-own.example.no", "own-colleague");
 
     const shop = (host: string, products: Array<{ title: string; handle: string; price: string }>): Record<string, FakeRoute> => ({
@@ -208,6 +214,7 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       ...shop("po-zero.no", [{ title: "Eplecider", handle: "eplecider", price: "149.00" }]),
       ...shop("po-stale.no", [{ title: "Blåbærsyltetøy", handle: "syltetoy", price: "80.00" }]),
       ...shop("po-limit.no", [{ title: "Brød", handle: "brod", price: "60.00" }]),
+      ...shop("po-llm.no", [{ title: "Surdeigsbrød", handle: "surdeig", price: "65.00" }]),
     };
     const fetchImpl = (async (input: any) => {
       const url = String(typeof input === "string" ? input : input?.url ?? input);
@@ -217,11 +224,16 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
     let clock = T0;
     const now = () => clock;
     op.__setOutreachDepsForTesting({ fetchImpl, llm: async () => ({ text: "[]" }), now, sleep: async () => undefined, hostIntervalMs: 0 });
-    oi.__setOwnerImportDepsForTesting({ fetchImpl, llm: async () => ({ text: "[]" }), now, sleep: async () => undefined, hostIntervalMs: 0 });
+    let ownerLlmCalls = 0;
+    const ownerLlm = async () => {
+      ownerLlmCalls++;
+      return { text: JSON.stringify([{ name: "Kjøtt", price: null }, { name: "Rabarbrasaft", price: "59 kr" }]) };
+    };
+    oi.__setOwnerImportDepsForTesting({ fetchImpl, llm: ownerLlm, now, sleep: async () => undefined, hostIntervalMs: 0 });
     ol.__setOutreachLandingClockForTesting(now);
 
     // The 3b-1 pre-extraction at T0 (flag only matters for the routes).
-    const started = op.startOutreachPrepare([OWN, B, OTHER, ZERO, STALE, LIMIT], CAMPAIGN);
+    const started = op.startOutreachPrepare([OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA], CAMPAIGN);
     await op.__awaitOutreachPrepareForTesting(started.prepare_id);
     const prepRun = (id: string) => (db.prepare(
       "SELECT id FROM product_import_runs WHERE mode = 'outreach_prepare' AND agent_id = ? AND campaign = ?").get(id, CAMPAIGN) as { id: string }).id;
@@ -372,7 +384,7 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       const c = await postPage(OWN, { t: tOther, run: runOwn, velg: idHon }, tokens[OWN]);
       assertEq(c.status, 404, "cross: agent B's token on agent A's page → 404");
       const d = await postPage(OWN, { t: tOwn, run: runOwn, velg: idLok }, tokens[OWN]);
-      assertEq(d.status, 404, "cross: agent B's candidate id in agent A's run → 404 (not found in this run)");
+      assertEq(d.status, 400, "cross: agent B's candidate id in agent A's run is ignored (nothing selected → 400)");
       assertEq((await postPage(OWN, { t: tOwn, run: runOwn, velg: idHon })).status, 401, "POST: no session → 401");
       assertEq((await postPage(OWN, { t: tOwn, run: runOwn, velg: idHon }, tokens[OTHER])).status, 401, "POST: another profile's session → 401");
       assertEq((await postPage(OWN, { t: tOwn, run: runOwn, velg: idHon }, tokens[OWN], { origin: "https://evil.example" })).status, 403, "POST: cross-site → 403");
@@ -405,7 +417,35 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       assertEq(rows.length, 2, "AC20: catalog rows exist for the published products");
       assertTrue(rows.every((x) => !isRowOrderableForRealOrder(db, x, new Date())), "AC20: without «på lager» none is orderable");
       const again = await postPage(OWN, { t: tOwn, run: runOwn, velg: [idHon] }, tokens[OWN]);
-      assertEq(again.status, 409, "AC20: an already published candidate cannot be published twice");
+      assertEq(again.status, 400, "AC20: an already published candidate cannot be published twice (ignored → 400)");
+      const rm = oi.publishOwnerImport(OWN, runOwn, [{ id: idRab }], ["Egg"], { actorEmail: `post@${OWN}.example.no`, mode: "outreach_prepare" });
+      assertTrue(!rm.ok && rm.status === 400 && rm.error === "remove_not_allowed" && !productsOf(OWN).some((p) => p.name === "Rabarbrasaft")
+        && productsOf(OWN).some((p) => p.name === "Egg"), "publish: outreach mode refuses a non-empty remove list and writes nothing");
+    }
+    // isVerifiedOwner passes, but agents.is_verified = 0 → no list, POST 403.
+    {
+      const tN = tokenFor(NOTVER);
+      const g = await getPage(NOTVER, tN, tokens[NOTVER]);
+      assertTrue(g.status === 200 && html(g).includes('data-outreach-claim="1"') && !html(g).includes('name="velg"'), "is_verified=0 with a verified claim → no list");
+      assertEq((await postPage(NOTVER, { t: tN, run: "pio-x", velg: "x" }, tokens[NOTVER])).status, 403, "is_verified=0 with a verified claim → POST 403");
+    }
+    // A prepare run still marked running (e.g. cut off by a restart) → neutral page, no self-refresh.
+    {
+      db.prepare(`INSERT INTO product_import_runs (id, mode, status, agent_id, campaign, prepare_id, created_at)
+        VALUES ('pio-running-1', 'outreach_prepare', 'running', ?, ?, 'pop-gone', ?)`).run(RUNNING, CAMPAIGN, new Date(clock - DAY).toISOString().slice(0, 19).replace("T", " "));
+      const r = await getPage(RUNNING, tokenFor(RUNNING), tokens[RUNNING]);
+      assertTrue(r.status === 200 && html(r).includes('data-outreach-none="1"') && !html(r).includes('http-equiv="refresh"'),
+        "running prepare run without a job → neutral page, no meta refresh");
+    }
+    // A source URL with markup is escaped in the row.
+    {
+      db.prepare(`INSERT INTO product_import_candidates
+         (id, run_id, agent_id, position, name, name_norm, price_nok, price_text, unit, price_is_from, price_excl_vat,
+          pack_size, tier, source_url, rules_json, fetched_at, status, diff_kind, created_at)
+       VALUES ('pic-src-xss', ?, ?, 50, 'Kålrot', 'kalrot', 30, 'kr 30', NULL, 0, 0, NULL, 'shopify', ?, '[]', '2026-10-20T09:00:00.000Z', 'eligible', 'new', '2026-10-20 09:00:00')`,
+      ).run(prepRun(OTHER), OTHER, 'https://x" onmouseover=alert(1)');
+      const h = html(await getPage(OTHER, tokenFor(OTHER), tokens[OTHER]));
+      assertTrue(h.includes("Kålrot") && !h.includes('" onmouseover') && h.includes("&quot; onmouseover"), "XSS: a source URL with a quote is escaped");
     }
     // Segment B completes the claim → the list, then «på lager».
     {
@@ -450,6 +490,34 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       const ty = candId(newRun, "Tyttebær");
       const p = await postPage(STALE, { t: tS, run: newRun, velg: [ty] }, tokens[STALE]);
       assertTrue(p.status === 200 && productsOf(STALE).some((x) => x.name === "Tyttebær" && x.source === "owner_import"), "AC21: confirming from the re-extracted list publishes");
+      // A re-fetch run with an LLM-tier row and a category-label row: neither is shown nor publishable.
+      const ins = db.prepare(`INSERT INTO product_import_candidates
+         (id, run_id, agent_id, position, name, name_norm, price_nok, price_text, unit, price_is_from, price_excl_vat,
+          pack_size, tier, source_url, rules_json, fetched_at, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, NULL, ?, NULL, '[]', '2026-10-28T09:00:00.000Z', 'pending', '2026-10-28 09:00:00')`);
+      ins.run("pic-llm-1", newRun, STALE, 90, "Rabarbrasaft", "rabarbrasaft", 59, "59 kr", "llm");
+      ins.run("pic-cat-1", newRun, STALE, 91, "Kjøtt", "kjott", null, "", "shopify");
+      const hidden = html(await getPage(STALE, tS, tokens[STALE]));
+      assertTrue(!hidden.includes("Rabarbrasaft") && !hidden.includes("pic-llm-1"), "B1: accuracy unset → an LLM-tier row of the re-fetch is not shown");
+      assertTrue(!hidden.includes("Kjøtt") && !hidden.includes("pic-cat-1"), "B1: a category-label row of the re-fetch is not shown");
+      const pl = await postPage(STALE, { t: tS, run: newRun, velg: ["pic-llm-1", "pic-cat-1"] }, tokens[STALE]);
+      assertTrue(pl.status === 400 && !productsOf(STALE).some((x) => x.name === "Rabarbrasaft" || x.name === "Kjøtt"), "B1: POSTing hidden LLM / category ids publishes nothing");
+      // LLM-only website at re-fetch time, accuracy unset → the re-fetch never calls the LLM.
+      delete routes["https://po-llm.no/products.json?limit=250"];
+      routes["https://po-llm.no/"] = { body: HTML(`<a href="/priser">Priser</a><p>Velkommen til en liten gård med sau og høner langs elva.</p>`) };
+      routes["https://po-llm.no/priser"] = { body: HTML("<h1>Prisliste</h1><ul><li>Kjøtt</li><li>Rabarbrasaft 59 kr</li></ul><p>Henting på gården lørdager.</p>") };
+      const tLl = tokenFor(LLMA);
+      await getPage(LLMA, tLl, tokens[LLMA]);
+      const llmRun = (db.prepare("SELECT id, llm_call_cap FROM product_import_runs WHERE mode = 'owner_fetch' AND agent_id = ?").get(LLMA) as { id: string; llm_call_cap: number } | undefined);
+      assertTrue(!!llmRun && llmRun.llm_call_cap === 0, "B1: the outreach re-fetch is started with an LLM cap of 0");
+      await oi.__awaitOwnerFetchForTesting(llmRun?.id ?? "");
+      assertEq(ownerLlmCalls, 0, "B1: accuracy unset → the re-fetch never calls the LLM");
+      assertEq(db.prepare("SELECT COUNT(*) AS n FROM product_import_candidates WHERE run_id = ? AND tier = 'llm'").get(llmRun?.id ?? ""), { n: 0 }, "B1: no LLM candidate staged by the re-fetch");
+      const fallback = html(await getPage(LLMA, tLl, tokens[LLMA]));
+      assertTrue(fallback.includes("Surdeigsbrød") && fallback.includes('data-outreach-notice="refetch_failed"') && !fallback.includes("Rabarbrasaft"),
+        "B1: an empty re-fetch → the previous list with its date");
+      await getPage(LLMA, tLl, tokens[LLMA]);
+      assertEq(ownerRuns(LLMA), 1, "recentlyTried: a failed re-fetch does not start a new fetch on every GET");
       // Limit reached → previous list with its date.
       const tL = tokenFor(LIMIT);
       for (let i = 0; i < 3; i++) {
@@ -493,6 +561,9 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       ml("mlx-2");
       const r2 = await invoke(H.verify, { query: { token: "mlx-2" }, cookies: { [ol.OUTREACH_RETURN_COOKIE]: `/eier/${OTHER}/varer/forslag?t=x` } });
       assertEq(r2.location, `/eier/${OWN}/portal`, "login: a return path for another agent is ignored");
+      ml("mlx-2b");
+      const r2b = await invoke(H.verify, { query: { token: "mlx-2b" }, cookies: { [ol.OUTREACH_RETURN_COOKIE]: `/eier/po-abc/varer/forslag?t=${encodeURIComponent(tOwn)}` } });
+      assertEq(r2b.location, `/eier/${OWN}/portal`, "login: another agent id of the same length is ignored");
       ml("mlx-3");
       const r3 = await invoke(H.verify, { query: { token: "mlx-3" }, cookies: { [ol.OUTREACH_RETURN_COOKIE]: "https://evil.example/" } });
       assertEq(r3.location, `/eier/${OWN}/portal`, "login: a foreign URL is ignored (no open redirect)");

@@ -40,7 +40,7 @@
 import crypto, { randomUUID } from "crypto";
 import { getDb } from "../../database/init";
 import { serverSignatureFor } from "../avmeld-service";
-import { OUTREACH_CAMPAIGN_RE } from "./outreach-prepare";
+import { OUTREACH_CAMPAIGN_RE, outreachLlmAllowed } from "./outreach-prepare";
 import { startOwnerFetch, type StartFetchResult } from "./owner-import";
 
 export const OUTREACH_LINK_VALID_DAYS = 30;
@@ -228,7 +228,9 @@ export function resolveOutreachView(
 ): OutreachView {
   const nowMs = opts.nowMs ?? outreachNowMs();
   const prep = latestPrepareRun(agentId, campaign);
-  if (!prep) return { kind: "none" };
+  // No run, or one still marked running (in progress or cut off by a restart):
+  // nothing to show yet — never a page that refreshes itself forever.
+  if (!prep || prep.status === "running") return { kind: "none" };
   const events = refetchEvents(agentId, campaign);
   const latest = events.length ? ownerRun(agentId, events[0]!.run_id) : null;
   let current: { mode: "outreach_prepare" | "owner_fetch"; run_id: string; extracted_at: string } = {
@@ -247,7 +249,9 @@ export function resolveOutreachView(
   const lastRefetchMs = events.length ? parseTs(events[0]!.created_at) : NaN;
   const recentlyTried = Number.isFinite(lastRefetchMs) && nowMs - lastRefetchMs < OUTREACH_FRESH_DAYS * DAY_MS;
   if (!opts.allowRefetch || recentlyTried) return { kind: "list", ...current, notice: notice ?? "stale" };
-  const r = (opts.startFetch ?? startOwnerFetch)(agentId);
+  // The 3b rule for the LLM tier holds for the re-fetch too: no LLM call unless
+  // the measured accuracy allows it (the page also filters LLM rows out).
+  const r = opts.startFetch ? opts.startFetch(agentId) : startOwnerFetch(agentId, undefined, { llmCap: outreachLlmAllowed() ? 1 : 0 });
   if (!r.ok) return { kind: "list", ...current, notice: "refetch_unavailable", refetch_error: r.error };
   logOutreachEvent({ campaign, agentId, event: "refetch_started", runId: r.run_id, nowMs });
   return { kind: "running", run_id: r.run_id };
