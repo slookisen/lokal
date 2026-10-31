@@ -163,6 +163,8 @@
 //     branch (out of scope here: that trigger is shared production
 //     infrastructure several other verticals depend on; a change to it
 //     belongs in its own reviewed dev-request, not folded into this one).
+//     The Opplevagent lane's OWN send log is read by a separate tier instead
+//     — see "─── outreach_delivered (OA-01)" at the end of this doc.
 //
 //   (c-epost) Manually entered/approved by Daniel. REUSES
 //     content_source==='manual' exactly as isHjemmesideOwnershipVerified()
@@ -370,6 +372,36 @@
 // producers on one page, not just this one), which is why it needs its own,
 // stricter, name-matched gate rather than reusing pickHarvestCandidatesByTier
 // as-is.
+//
+// ─── outreach_delivered (OA-01) — dev-request 2026-07-30-opplevagent-claim-
+// epost-og-perfelt-laas (Daniel: "Dersom kunde har fått epost fra min
+// outreach [...] burde det være mulig å ta over den"), 2026-10-31 ──────────
+// Measured 31.10: of 49 producers Opplevagent had e-mailed, 20 got the manual
+// fallback on the claim page the outreach mail itself links to. (b-epost)
+// above reads the RFB outreach_sent_log, which the Opplevagent lane never
+// writes; the lane's own log is experience_outreach_sent_log (experiences db,
+// routes/opplevelser.ts sendGardssalgOutreachToEligibleProvider). This tier
+// reads that log — the gårdssalg twin of knowledgeService.resolveFarmContact
+// Email()'s (b) "delivered without a bounce" — via
+// findOpplevagentOutreachClaimEmail() below:
+//   - only REAL deliveries for the SAME provider_id: is_test = 0, a confirmed
+//     reservation (not still notes='reserved' — a send whose outcome is
+//     unknown), and a transport message id that is not the dry-run 'DRY_RUN'.
+//     A failed send leaves no row at all (the reservation is deleted);
+//   - no email_bounces row except 'unsubscribe' (same predicate as
+//     wasEpostDeliveredOutreachNoBounce and the RFB twin);
+//   - listed address first, like RFB: when the provider has a stored epost,
+//     only THAT address can qualify, and only if it was itself delivered to.
+//     An older outreach address the listing has since moved away from
+//     (owner/admin edit, wrong-entity correction) is never a login target.
+//     Without a stored epost, the most recent delivery wins;
+//   - shared mailbox: if the address also had a real delivery for ANOTHER
+//     provider, a link there proves only the mailbox, not which producer —
+//     no candidate (mirrors RFB's isSharedKnownEmail; manual fallback).
+// Ranked LAST, after stored_epost_verified, and deduped by address, so it
+// never displaces or reorders an existing tier; it only adds a candidate.
+// Fails closed (no candidate) on any lookup error. The address is shown only
+// masked, like every other tier.
 
 import crypto from "crypto";
 import { v4 as uuid } from "uuid";
@@ -542,7 +574,8 @@ export type OrgLinkedEmailResult =
         | "found_same_domain"
         | "found_contact_page"
         | "found_site_other"
-        | "found_umbrella_member";
+        | "found_umbrella_member"
+        | "outreach_delivered";
     }
   | { eligible: false; reason: "not_brreg_verified" | "no_org_linked_email" };
 
@@ -555,7 +588,8 @@ export type OrgLinkedEmailCandidate = {
     | "found_same_domain"
     | "found_contact_page"
     | "found_site_other"
-    | "found_umbrella_member";
+    | "found_umbrella_member"
+    | "outreach_delivered"; // OA-01, see module doc
 };
 
 // Minimal shape check for a stored `epost` candidate — good enough to catch
@@ -616,9 +650,90 @@ export function wasEpostDeliveredOutreachNoBounce(email: string | null | undefin
     .get(normalized);
   if (!sentRow) return false;
 
-  const bouncedRow = db.prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND (bounce_type IS NULL OR bounce_type <> 'unsubscribe') LIMIT 1`).get(normalized);
-  return !bouncedRow;
+  return !hasClaimBlockingBounce(db, normalized);
 }
+
+// email_bounces (RFB db) holds a bounce/complaint for this normalized address.
+// 'unsubscribe' is not a bounce — the mailbox still exists and is still the
+// producer's (same predicate as knowledgeService.resolveFarmContactEmail).
+function hasClaimBlockingBounce(db: ReturnType<typeof getRfbDb>, normalized: string): boolean {
+  return !!db
+    .prepare(`SELECT 1 FROM email_bounces WHERE LOWER(TRIM(email)) = ? AND (bounce_type IS NULL OR bounce_type <> 'unsubscribe') LIMIT 1`)
+    .get(normalized);
+}
+
+// A REAL delivery in experience_outreach_sent_log: not a test send, a
+// confirmed reservation ('reserved' = GARDSSALG_OUTREACH_SENT_LOG_RESERVED_NOTE
+// in routes/opplevelser.ts — not imported: that is the 20k-line route module),
+// and a transport message id that is not email-service's dry-run 'DRY_RUN'.
+const OA_OUTREACH_DELIVERED_SQL = `is_test = 0
+  AND message_id IS NOT NULL AND TRIM(message_id) <> '' AND message_id <> 'DRY_RUN'
+  AND (notes IS NULL OR notes <> 'reserved')`;
+
+/**
+ * OA-01 — see the module doc's "outreach_delivered" section. The address
+ * Opplevagent's own outreach demonstrably reached for THIS provider, or null:
+ *   - provider has a stored epost: that address, iff a real delivery for this
+ *     provider went to it and it has no blocking bounce;
+ *   - no stored epost: the most recent real delivery for this provider whose
+ *     address has no blocking bounce;
+ *   - null when that address also had a real delivery for another provider
+ *     (shared mailbox), when there is no provider id, or on any lookup error
+ *     (fails closed, like the RFB twin).
+ * Returned normalized (trim + lower case). Lazy on the RFB db: email_bounces
+ * is read only when the provider has a qualifying delivery at all.
+ */
+export function findOpplevagentOutreachClaimEmail(provider: { id?: string; epost?: string | null }): string | null {
+  const providerId = typeof provider.id === "string" ? provider.id : "";
+  if (!providerId) return null;
+  try {
+    const expDb = getDb(VERTICAL);
+    const rows = expDb
+      .prepare(
+        `SELECT recipient_email FROM experience_outreach_sent_log
+          WHERE provider_id = ? AND ${OA_OUTREACH_DELIVERED_SQL}
+          ORDER BY replace(substr(sent_at, 1, 19), 'T', ' ') DESC, id DESC`,
+      )
+      .all(providerId) as Array<{ recipient_email: string | null }>;
+    if (rows.length === 0) return null;
+
+    const delivered: string[] = [];
+    for (const r of rows) {
+      const email = normalizeEmail(r.recipient_email);
+      if (email && isPlausibleEmailShape(email) && !delivered.includes(email)) delivered.push(email);
+    }
+    const listed = normalizeEmail(provider.epost);
+    const pool = listed && isPlausibleEmailShape(listed) ? delivered.filter((e) => e === listed) : delivered;
+    if (pool.length === 0) return null;
+
+    const rfbDb = _rfbDbOverrideForTesting ?? getRfbDb();
+    const chosen = pool.find((e) => !hasClaimBlockingBounce(rfbDb, e));
+    if (!chosen) return null;
+
+    const shared = expDb
+      .prepare(
+        `SELECT 1 FROM experience_outreach_sent_log
+          WHERE LOWER(TRIM(recipient_email)) = ? AND provider_id <> ? AND ${OA_OUTREACH_DELIVERED_SQL}
+          LIMIT 1`,
+      )
+      .get(chosen, providerId);
+    return shared ? null : chosen;
+  } catch (err) {
+    console.warn(
+      `[gardssalg-claim] Opplevagent outreach lookup failed for ${providerId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+// DB-lookup results the callers pass into the pure derivation below:
+// epostOutreachDeliveredNoBounce = wasEpostDeliveredOutreachNoBounce(epost)
+// (b-epost); opplevagentOutreachEmail = findOpplevagentOutreachClaimEmail()
+// (OA-01, outreach_delivered).
+export type DeriveOrgLinkedEmailOpts = {
+  epostOutreachDeliveredNoBounce?: boolean;
+  opplevagentOutreachEmail?: string | null;
+};
 
 /**
  * Derive the ONE email address a claim magic-link may be sent to, or
@@ -661,7 +776,7 @@ export function deriveOrgLinkedEmailCandidates(
     epost?: string | null;
   },
   brregContactEmail?: string | null,
-  opts: { epostOutreachDeliveredNoBounce?: boolean } = {},
+  opts: DeriveOrgLinkedEmailOpts = {},
 ): OrgLinkedEmailCandidate[] {
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return [];
@@ -698,6 +813,15 @@ export function deriveOrgLinkedEmailCandidates(
     }
   }
 
+  // (d) outreach_delivered (OA-01) — the address the caller's
+  // findOpplevagentOutreachClaimEmail() lookup proved Opplevagent's own
+  // outreach reached for this provider. Last, and never a second copy of an
+  // address a stronger tier already offers.
+  const outreachCandidate = normalizeEmail(opts.opplevagentOutreachEmail);
+  if (outreachCandidate && isPlausibleEmailShape(outreachCandidate) && !candidates.some((c) => c.email === outreachCandidate)) {
+    candidates.push({ email: outreachCandidate, source: "outreach_delivered" });
+  }
+
   return candidates;
 }
 
@@ -713,7 +837,7 @@ export function deriveOrgLinkedEmail(
     epost?: string | null;
   },
   brregContactEmail?: string | null,
-  opts: { epostOutreachDeliveredNoBounce?: boolean } = {},
+  opts: DeriveOrgLinkedEmailOpts = {},
 ): OrgLinkedEmailResult {
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return { eligible: false, reason: "not_brreg_verified" };
@@ -747,21 +871,29 @@ export function deriveOrgLinkedEmail(
  * The DB lookup now runs ONLY when: the provider is Brreg-verified (else
  * nothing could rescue it anyway), no stronger tier already resolved it, and
  * there IS an epost value to check at all.
+ *
+ * OA-01: when that still leaves the provider ineligible, the Opplevagent
+ * outreach lookup (findOpplevagentOutreachClaimEmail) runs last — only for a
+ * provider row with an `id` (optional here, same convention as `epost`).
  */
 export function deriveOrgLinkedEmailWithOutreachLookup(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    id?: string;
     epost?: string | null;
   },
   brregContactEmail?: string | null,
 ): OrgLinkedEmailResult {
   const preliminary = deriveOrgLinkedEmail(provider, brregContactEmail);
   if (preliminary.eligible) return preliminary;
-  if (preliminary.reason !== "no_org_linked_email" || !provider.epost) return preliminary;
+  if (preliminary.reason !== "no_org_linked_email") return preliminary;
 
-  const epostOutreachDeliveredNoBounce = wasEpostDeliveredOutreachNoBounce(provider.epost);
-  if (!epostOutreachDeliveredNoBounce) return preliminary;
+  if (provider.epost && wasEpostDeliveredOutreachNoBounce(provider.epost)) {
+    return deriveOrgLinkedEmail(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
+  }
 
-  return deriveOrgLinkedEmail(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
+  const opplevagentOutreachEmail = findOpplevagentOutreachClaimEmail(provider);
+  if (!opplevagentOutreachEmail) return preliminary;
+  return deriveOrgLinkedEmail(provider, brregContactEmail, { opplevagentOutreachEmail });
 }
 
 /**
@@ -770,24 +902,27 @@ export function deriveOrgLinkedEmailWithOutreachLookup(
  * when it could actually add a candidate that isn't there already), used by
  * the entry page (to render the choice) and issueClaimMagicLink() (to
  * validate a producer's choice) so both always see the exact same list.
+ * OA-01: also runs findOpplevagentOutreachClaimEmail() for a Brreg-verified
+ * provider row with an `id`, so outreach_delivered can join that list.
  */
 export function deriveOrgLinkedEmailCandidatesWithOutreachLookup(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    id?: string;
     epost?: string | null;
   },
   brregContactEmail?: string | null,
 ): OrgLinkedEmailCandidate[] {
   const withoutOutreach = deriveOrgLinkedEmailCandidates(provider, brregContactEmail);
-  const alreadyHasEpostCandidate = withoutOutreach.some((c) => c.source === "stored_epost_verified");
-  if (alreadyHasEpostCandidate || !provider.epost) return withoutOutreach;
-
   const brregOk = !!provider.org_nr && provider.brreg_verified === 1;
   if (!brregOk) return withoutOutreach;
 
-  const epostOutreachDeliveredNoBounce = wasEpostDeliveredOutreachNoBounce(provider.epost);
-  if (!epostOutreachDeliveredNoBounce) return withoutOutreach;
+  const alreadyHasEpostCandidate = withoutOutreach.some((c) => c.source === "stored_epost_verified");
+  const epostOutreachDeliveredNoBounce =
+    !alreadyHasEpostCandidate && !!provider.epost && wasEpostDeliveredOutreachNoBounce(provider.epost);
+  const opplevagentOutreachEmail = findOpplevagentOutreachClaimEmail(provider);
+  if (!epostOutreachDeliveredNoBounce && !opplevagentOutreachEmail) return withoutOutreach;
 
-  return deriveOrgLinkedEmailCandidates(provider, brregContactEmail, { epostOutreachDeliveredNoBounce: true });
+  return deriveOrgLinkedEmailCandidates(provider, brregContactEmail, { epostOutreachDeliveredNoBounce, opplevagentOutreachEmail });
 }
 
 // ─── Found-address harvest (SLICE 2) ─────────────────────────────────────
@@ -1508,6 +1643,7 @@ export async function harvestUmbrellaMemberEmail(
  */
 export async function deriveOrgLinkedEmailCandidatesWithHarvest(
   provider: Pick<ClaimProviderRow, "org_nr" | "brreg_verified" | "hjemmeside" | "content_source" | "field_provenance"> & {
+    id?: string;
     epost?: string | null;
     navn?: string;
   },
@@ -1524,15 +1660,16 @@ export async function deriveOrgLinkedEmailCandidatesWithHarvest(
 
   // Merge in the documented priority order — (a) brreg_contact, then the
   // three own-site found-tiers, then (SLICE 4) found_umbrella_member, then
-  // (c) stored_epost_verified — deduping by normalized email so the SAME
-  // address is never offered twice under two different source tags (e.g. a
-  // harvested same-domain address that happens to equal the stored,
-  // provenance-backed epost).
+  // (c) stored_epost_verified, then (OA-01) outreach_delivered — deduping by
+  // normalized email so the SAME address is never offered twice under two
+  // different source tags (e.g. a harvested same-domain address that happens
+  // to equal the stored, provenance-backed epost).
   const brregContactCandidates = baseCandidates.filter((c) => c.source === "brreg_contact");
   const storedEpostCandidates = baseCandidates.filter((c) => c.source === "stored_epost_verified");
+  const outreachDeliveredCandidates = baseCandidates.filter((c) => c.source === "outreach_delivered");
   const merged: OrgLinkedEmailCandidate[] = [];
   const seen = new Set<string>();
-  for (const candidate of [...brregContactCandidates, ...foundCandidates, ...storedEpostCandidates]) {
+  for (const candidate of [...brregContactCandidates, ...foundCandidates, ...storedEpostCandidates, ...outreachDeliveredCandidates]) {
     const key = candidate.email.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -1752,6 +1889,7 @@ export type ClaimEmailSource =
   | "found_contact_page"
   | "found_site_other"
   | "found_umbrella_member"
+  | "outreach_delivered"
   | "manual";
 
 export interface IssuedClaim {

@@ -10066,7 +10066,8 @@ router.post("/admin/booking-test-send", requireAdmin, async (req: Request, res: 
 // deriveOrgLinkedEmailCandidatesWithHarvest(), so an admin running the claim
 // E2E against a producer whose address came off their own website must be
 // able to name that tier here too. Still its own copy, not an import, for the
-// coupling reason stated above.
+// coupling reason stated above. "outreach_delivered" added with OA-01
+// (2026-10-31), same reason.
 const ADMIN_CLAIM_TEST_SEND_SOURCES = [
   "brreg_contact",
   "verified_domain_address",
@@ -10075,6 +10076,7 @@ const ADMIN_CLAIM_TEST_SEND_SOURCES = [
   "found_contact_page",
   "found_site_other",
   "found_umbrella_member",
+  "outreach_delivered",
 ] as const;
 function parseAdminSelectedSource(value: unknown): (typeof ADMIN_CLAIM_TEST_SEND_SOURCES)[number] | undefined {
   return typeof value === "string" && (ADMIN_CLAIM_TEST_SEND_SOURCES as readonly string[]).includes(value)
