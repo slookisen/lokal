@@ -390,14 +390,33 @@
 //     A failed send leaves no row at all (the reservation is deleted);
 //   - no email_bounces row except 'unsubscribe' (same predicate as
 //     wasEpostDeliveredOutreachNoBounce and the RFB twin);
-//   - listed address first, like RFB: when the provider has a stored epost,
-//     only THAT address can qualify, and only if it was itself delivered to.
-//     An older outreach address the listing has since moved away from
-//     (owner/admin edit, wrong-entity correction) is never a login target.
-//     Without a stored epost, the most recent delivery wins;
-//   - shared mailbox: if the address also had a real delivery for ANOTHER
-//     provider, a link there proves only the mailbox, not which producer —
-//     no candidate (mirrors RFB's isSharedKnownEmail; manual fallback).
+//   - the listing is authoritative: when the provider has ANY stored epost,
+//     only that address can qualify, and only if it was itself delivered to;
+//     a stored epost that is not one plausible address (malformed, several
+//     addresses) gives no candidate rather than a fallback to old deliveries;
+//   - an address the listing moved away from is never a login target. Outreach
+//     always goes to the then-listed epost, so an empty epost after a delivery
+//     means someone cleared it. Without a stored epost the most recent delivery
+//     wins, but never an address the provider's own trail shows was removed or
+//     replaced from epost: gardssalg_content_audit / experience_provider_field_
+//     write_audit rows for field 'epost' whose old_value is that address and
+//     whose new_value is another or NULL (content rollback, admin/owner edit),
+//     or field_provenance.epost_synthesis_removal.removed_value (unproven
+//     post@<domain> removal);
+//   - owned profile (content_source 'claim', claimed_at set, or a used +
+//     non-revoked claim — isGardssalgOwnedForOutreach's definition): the
+//     claim page doubles as the owner re-login page, so only an address that
+//     has itself completed a claim for this provider qualifies (used = 1, not a
+//     test claim, not revoked by the admin lever). An owner who claimed via
+//     this tier can log in again; pre-claim cold outreach opens no new way in;
+//   - shared mailbox (mirrors RFB's isSharedKnownEmail; manual fallback): no
+//     candidate when another non-merged provider lists the address as epost,
+//     or another provider has ANY non-test sent-log row to it (also a
+//     reservation or a row with no message id: for "is this mailbox tied to
+//     another producer" the send needs no confirmation). A duplicate merged
+//     into this provider is the same producer and does not count. Those two
+//     queries compare with SQL LOWER/TRIM, which folds ASCII case only — a
+//     case variant with non-ASCII letters (ØL@ vs øl@) is not matched.
 // Ranked LAST, after stored_epost_verified, and deduped by address, so it
 // never displaces or reorders an existing tier; it only adds a candidate.
 // Fails closed (no candidate) on any lookup error. The address is shown only
@@ -670,16 +689,101 @@ const OA_OUTREACH_DELIVERED_SQL = `is_test = 0
   AND message_id IS NOT NULL AND TRIM(message_id) <> '' AND message_id <> 'DRY_RUN'
   AND (notes IS NULL OR notes <> 'reserved')`;
 
+// Whitespace the shared-mailbox queries trim: space, tab, LF, CR, NBSP — the
+// same set as knowledgeService's EMAIL_TRIM_CHARS (not exported there).
+const EMAIL_TRIM_CHARS_SQL = "char(32, 9, 10, 13, 160)";
+
+/**
+ * Addresses this provider's own trail shows were removed or replaced from
+ * epost (module doc, "outreach_delivered"): an audit row for field 'epost'
+ * whose old_value is the address and whose new_value is another address or
+ * NULL, in either audit table, plus field_provenance.epost_synthesis_removal.
+ * Compared after normalizeEmail, so a case/whitespace-only edit is not a
+ * removal. Malformed field_provenance throws: the caller fails closed.
+ */
+function epostAddressesRemovedFromListing(
+  expDb: ReturnType<typeof getDb>,
+  providerId: string,
+  fieldProvenance: string | null,
+): Set<string> {
+  const removed = new Set<string>();
+  for (const table of ["gardssalg_content_audit", "experience_provider_field_write_audit"]) {
+    const rows = expDb
+      .prepare(`SELECT old_value, new_value FROM ${table} WHERE provider_id = ? AND field_name = 'epost'`)
+      .all(providerId) as Array<{ old_value: string | null; new_value: string | null }>;
+    for (const r of rows) {
+      const from = normalizeEmail(r.old_value);
+      if (from && from !== normalizeEmail(r.new_value)) removed.add(from);
+    }
+  }
+  if (fieldProvenance) {
+    const parsed = JSON.parse(fieldProvenance);
+    const removal = parsed && typeof parsed === "object" ? parsed.epost_synthesis_removal : null;
+    const removedValue = removal && typeof removal === "object" ? normalizeEmail(removal.removed_value) : "";
+    if (removedValue) removed.add(removedValue);
+  }
+  return removed;
+}
+
+/**
+ * Addresses that have themselves completed a claim for this provider: used,
+ * not a test claim, and not revoked by POST /admin/gardssalg-claim-revoke
+ * (which audits each revoke as field 'gardssalg_claim_revoked', old_value the
+ * claim id). A claim the owner revoked by logging out still counts — that is
+ * the re-login case. Normalized.
+ */
+function addressesWithCompletedClaim(expDb: ReturnType<typeof getDb>, providerId: string): Set<string> {
+  const rows = expDb
+    .prepare(
+      `SELECT c.email FROM gardssalg_claims c
+        WHERE c.provider_id = ? AND c.used = 1 AND c.is_test = 0
+          AND NOT EXISTS (SELECT 1 FROM gardssalg_content_audit a
+                           WHERE a.provider_id = c.provider_id AND a.field_name = 'gardssalg_claim_revoked' AND a.old_value = c.id)`,
+    )
+    .all(providerId) as Array<{ email: string | null }>;
+  return new Set(rows.map((r) => normalizeEmail(r.email)).filter((e) => e));
+}
+
+/**
+ * Shared mailbox (module doc, "outreach_delivered"): another non-merged
+ * provider lists `address` as epost, or another provider has any non-test
+ * sent-log row to it — reserved and message-id-less rows included. A duplicate
+ * merged into this provider is the same producer and is skipped.
+ */
+function isSharedOutreachMailbox(expDb: ReturnType<typeof getDb>, address: string, providerId: string): boolean {
+  const listedElsewhere = expDb
+    .prepare(
+      `SELECT 1 FROM experience_providers
+        WHERE id <> ? AND (merged_into IS NULL OR merged_into = '')
+          AND LOWER(TRIM(epost, ${EMAIL_TRIM_CHARS_SQL})) = ?
+        LIMIT 1`,
+    )
+    .get(providerId, address);
+  if (listedElsewhere) return true;
+  const sentElsewhere = expDb
+    .prepare(
+      `SELECT 1 FROM experience_outreach_sent_log s
+        WHERE LOWER(TRIM(s.recipient_email, ${EMAIL_TRIM_CHARS_SQL})) = ? AND s.provider_id <> ? AND s.is_test = 0
+          AND NOT EXISTS (SELECT 1 FROM experience_providers d WHERE d.id = s.provider_id AND d.merged_into = ?)
+        LIMIT 1`,
+    )
+    .get(address, providerId, providerId);
+  return !!sentElsewhere;
+}
+
 /**
  * OA-01 — see the module doc's "outreach_delivered" section. The address
  * Opplevagent's own outreach demonstrably reached for THIS provider, or null:
- *   - provider has a stored epost: that address, iff a real delivery for this
- *     provider went to it and it has no blocking bounce;
+ *   - provider has a stored epost: that address, iff it is one plausible
+ *     address, a real delivery for this provider went to it, and it has no
+ *     blocking bounce;
  *   - no stored epost: the most recent real delivery for this provider whose
- *     address has no blocking bounce;
- *   - null when that address also had a real delivery for another provider
- *     (shared mailbox), when there is no provider id, or on any lookup error
- *     (fails closed, like the RFB twin).
+ *     address has no blocking bounce and was never removed or replaced from
+ *     the listing (epostAddressesRemovedFromListing);
+ *   - owned provider: only among addresses that completed a claim for it;
+ *   - null when that address is a shared mailbox (isSharedOutreachMailbox),
+ *     when there is no provider id, or on any lookup error (fails closed,
+ *     like the RFB twin).
  * Returned normalized (trim + lower case). Lazy on the RFB db: email_bounces
  * is read only when the provider has a qualifying delivery at all.
  */
@@ -702,22 +806,37 @@ export function findOpplevagentOutreachClaimEmail(provider: { id?: string; epost
       const email = normalizeEmail(r.recipient_email);
       if (email && isPlausibleEmailShape(email) && !delivered.includes(email)) delivered.push(email);
     }
+
+    const current = expDb
+      .prepare(`SELECT content_source, claimed_at, field_provenance FROM experience_providers WHERE id = ?`)
+      .get(providerId) as { content_source: string | null; claimed_at: string | null; field_provenance: string | null } | undefined;
+    if (!current) return null;
+
+    // Any stored epost is authoritative; without one, drop every address the
+    // listing moved away from.
     const listed = normalizeEmail(provider.epost);
-    const pool = listed && isPlausibleEmailShape(listed) ? delivered.filter((e) => e === listed) : delivered;
+    let pool: string[];
+    if (listed) {
+      if (!isPlausibleEmailShape(listed)) return null;
+      pool = delivered.filter((e) => e === listed);
+    } else {
+      const removed = epostAddressesRemovedFromListing(expDb, providerId, current.field_provenance);
+      pool = delivered.filter((e) => !removed.has(e));
+    }
+
+    // Owned profile: no new way in — only an address that already claimed it.
+    const owned = current.content_source === "claim" || current.claimed_at != null || hasActiveNonRevokedClaim(providerId);
+    if (owned && pool.length > 0) {
+      const claimedBy = addressesWithCompletedClaim(expDb, providerId);
+      pool = pool.filter((e) => claimedBy.has(e));
+    }
     if (pool.length === 0) return null;
 
     const rfbDb = _rfbDbOverrideForTesting ?? getRfbDb();
     const chosen = pool.find((e) => !hasClaimBlockingBounce(rfbDb, e));
     if (!chosen) return null;
 
-    const shared = expDb
-      .prepare(
-        `SELECT 1 FROM experience_outreach_sent_log
-          WHERE LOWER(TRIM(recipient_email)) = ? AND provider_id <> ? AND ${OA_OUTREACH_DELIVERED_SQL}
-          LIMIT 1`,
-      )
-      .get(chosen, providerId);
-    return shared ? null : chosen;
+    return isSharedOutreachMailbox(expDb, chosen, providerId) ? null : chosen;
   } catch (err) {
     console.warn(
       `[gardssalg-claim] Opplevagent outreach lookup failed for ${providerId}: ${err instanceof Error ? err.message : String(err)}`,

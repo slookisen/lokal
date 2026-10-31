@@ -20,6 +20,15 @@
  *      two-candidate page lets the producer pick it; bounced -> fallback.
  *   x  unchanged: stronger tiers keep priority, Brreg gate, rate limit,
  *      admin grant's already-claimed guard.
+ * Review fix-up:
+ *   t  an address the listing moved away from (content rollback, field-write
+ *      audit, epost synthesis removal) is never a target; trail errors fail
+ *      closed.
+ *   l  a stored epost is authoritative even when it is not one address.
+ *   s  shared mailbox: another provider LISTS it, or has a reserved/dry-run
+ *      row to it -> not; a duplicate merged into this provider does not count.
+ *   w  owned profile: only an address that completed a claim for it (not a
+ *      test claim, not admin-revoked); r15-r23 pin the same through the routes.
  *
  * Real router + claim service on the production schema (in-memory
  * experiences db via db-factory, in-memory RFB db via __setRfbDbForTesting),
@@ -105,17 +114,21 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
     const insertProvider = expDb.prepare(`
       INSERT INTO experience_providers
         (id, navn, slug, vertical, org_nr, brreg_verified, hjemmeside, content_source, field_provenance, epost,
-         enrichment_state, verification_status, source, confidence)
+         claimed_at, merged_into, enrichment_state, verification_status, source, confidence)
       VALUES
         (@id, @navn, @slug, 'experiences', @org_nr, @brreg_verified, @hjemmeside, @content_source, @field_provenance, @epost,
-         'raw', 'pending_verify', 'test-fixture', 'medium')
+         @claimed_at, @merged_into, 'raw', 'pending_verify', 'test-fixture', 'medium')
     `);
     let orgSeq = 913000000;
-    function provider(id: string, o: { epost?: string | null; brreg_verified?: number; content_source?: string | null; hjemmeside?: string | null; field_provenance?: string | null } = {}): void {
+    function provider(
+      id: string,
+      o: { epost?: string | null; brreg_verified?: number; content_source?: string | null; hjemmeside?: string | null; field_provenance?: string | null; claimed_at?: string | null; merged_into?: string | null } = {},
+    ): void {
       insertProvider.run({
         id, navn: `Gård ${id}`, slug: id, org_nr: String(orgSeq++), brreg_verified: o.brreg_verified ?? 1,
         hjemmeside: o.hjemmeside ?? null, content_source: o.content_source === undefined ? "provider_site" : o.content_source,
         field_provenance: o.field_provenance ?? null, epost: o.epost ?? null,
+        claimed_at: o.claimed_at ?? null, merged_into: o.merged_into ?? null,
       });
     }
     const insertSent = expDb.prepare(`
@@ -193,6 +206,97 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
        VALUES ('gsc_oa01claimed', 'oa-claimed', 'eier@claimed-gard.no', 'manual', 'oa01-claimed-token', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', '2026-10-08T00:00:00.000Z', 0)`,
     ).run();
 
+    // Review fix-up fixtures. Trail of an epost the listing moved away from.
+    const insertContentAudit = expDb.prepare(
+      `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, changed_by)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, NULL, 'system')`,
+    );
+    let auditSeq = 0;
+    function contentAudit(providerId: string, field: string, oldValue: string | null, newValue: string | null): void {
+      insertContentAudit.run({ id: `oa01-aud-${++auditSeq}`, provider_id: providerId, field_name: field, old_value: oldValue, new_value: newValue });
+    }
+    provider("oa-rolledback");
+    sent("oa-rolledback", "feil@annen-gard.no");
+    contentAudit("oa-rolledback", "epost", " FEIL@Annen-Gard.no ", null); // content rollback cleared a wrong enrichment
+    provider("oa-replaced");
+    sent("oa-replaced", "gammel@replaced-gard.no", { sent_at: "2026-09-01 10:00:00" });
+    sent("oa-replaced", "ny@replaced-gard.no", { sent_at: "2026-10-20 10:00:00" });
+    contentAudit("oa-replaced", "epost", "gammel@replaced-gard.no", "ny@replaced-gard.no");
+    contentAudit("oa-replaced", "epost", "ny@replaced-gard.no", null);
+    provider("oa-synth", {
+      field_provenance: JSON.stringify({ epost_synthesis_removal: { removed_value: "Post@Synth-Gard.no", reason: "post@<own-domain>", removed_at: "2026-10-02T00:00:00.000Z" } }),
+    });
+    sent("oa-synth", "post@synth-gard.no");
+    provider("oa-fieldwrite");
+    sent("oa-fieldwrite", "post@fw-gard.no");
+    expDb.prepare(
+      `INSERT INTO experience_provider_field_write_audit (id, provider_id, field_name, old_value, new_value, batch_id)
+       VALUES ('oa01-fw-1', 'oa-fieldwrite', 'epost', 'post@fw-gard.no', NULL, 'gardssalg-epost-synthesis-remediation')`,
+    ).run();
+    provider("oa-trail-other");
+    sent("oa-trail-other", "eier@trailother-gard.no");
+    contentAudit("oa-trail-other", "epost", "annen@trailother-gard.no", null);
+    contentAudit("oa-trail-other", "epost", "Eier@TrailOther-Gard.no", "eier@trailother-gard.no"); // case-only edit
+    contentAudit("oa-trail-other", "telefon", "eier@trailother-gard.no", null); // another field
+    provider("oa-badprov", { field_provenance: "{not json" });
+    sent("oa-badprov", "eier@badprov-gard.no");
+    // Listing that is not one plausible address.
+    provider("oa-listed-malformed", { epost: "post at e6 dot no" });
+    sent("oa-listed-malformed", "gammel@malformed-gard.no");
+    provider("oa-listed-multi", { epost: "a@multi-gard.no, b@multi-gard.no" });
+    sent("oa-listed-multi", "a@multi-gard.no");
+    // Shared mailbox beyond a second confirmed delivery.
+    provider("oa-listshared-a");
+    provider("oa-listshared-b", { epost: " FELLES@Coop-Gard.no " });
+    sent("oa-listshared-a", "felles@coop-gard.no");
+    provider("oa-nbsp-a");
+    provider("oa-nbsp-b", { epost: "nbsp@nbsp-gard.no " });
+    sent("oa-nbsp-a", "nbsp@nbsp-gard.no");
+    provider("oa-resshared-a");
+    provider("oa-resshared-b");
+    sent("oa-resshared-a", "res@resshared-gard.no");
+    sent("oa-resshared-b", "res@resshared-gard.no", { message_id: null, notes: "reserved" });
+    provider("oa-dryshared-a");
+    provider("oa-dryshared-b");
+    sent("oa-dryshared-a", "dry@dryshared-gard.no");
+    sent("oa-dryshared-b", "dry@dryshared-gard.no", { message_id: "DRY_RUN" });
+    provider("oa-merge-main");
+    provider("oa-merge-dup", { merged_into: "oa-merge-main", epost: "main@merge-gard.no" });
+    sent("oa-merge-main", "main@merge-gard.no");
+    sent("oa-merge-dup", "main@merge-gard.no", { sent_at: "2026-08-01 09:00:00" });
+    // Owned profiles: the claim page is also the owner re-login page.
+    const insertClaim = expDb.prepare(
+      `INSERT INTO gardssalg_claims (id, provider_id, email, email_source, token, used, used_at, revoked_at, created_at, expires_at, is_test)
+       VALUES (@id, @provider_id, @email, 'manual', @token, 1, '2026-10-01T00:00:00.000Z', @revoked_at, '2026-10-01T00:00:00.000Z', '2026-10-08T00:00:00.000Z', @is_test)`,
+    );
+    function usedClaim(id: string, providerId: string, email: string, o: { revoked_at?: string | null; is_test?: number } = {}): void {
+      insertClaim.run({ id, provider_id: providerId, email, token: `${id}-token`, revoked_at: o.revoked_at ?? null, is_test: o.is_test ?? 0 });
+    }
+    provider("oa-owned-precl", { content_source: "claim", claimed_at: "2026-10-01 00:00:00" });
+    sent("oa-owned-precl", "gammel@e5-gard.no", { sent_at: "2026-09-01 10:00:00" });
+    usedClaim("gsc_oa01precl", "oa-owned-precl", "eier@e5-gard-annen.no");
+    provider("oa-owned-cs", { content_source: "claim" });
+    sent("oa-owned-cs", "x@cs-owned.no");
+    provider("oa-owned-ca", { claimed_at: "2026-10-01 00:00:00" });
+    sent("oa-owned-ca", "x@ca-owned.no");
+    provider("oa-owned-ac");
+    sent("oa-owned-ac", "x@ac-owned.no");
+    usedClaim("gsc_oa01ac", "oa-owned-ac", "annen@ac-owned.no");
+    provider("oa-owned-self", { content_source: "claim", claimed_at: "2026-10-01 00:00:00" });
+    sent("oa-owned-self", "eier@self-owned.no");
+    usedClaim("gsc_oa01self", "oa-owned-self", " Eier@Self-Owned.no ", { revoked_at: "2026-10-02 00:00:00" }); // owner logged out
+    provider("oa-owned-adminrevoked", { content_source: "claim" });
+    sent("oa-owned-adminrevoked", "eier@ar-owned.no");
+    usedClaim("gsc_oa01ar", "oa-owned-adminrevoked", "eier@ar-owned.no", { revoked_at: "2026-10-02 00:00:00" });
+    contentAudit("oa-owned-adminrevoked", "gardssalg_claim_revoked", "gsc_oa01ar", "revoked");
+    provider("oa-owned-testclaim", { content_source: "claim", claimed_at: "2026-10-01 00:00:00" });
+    sent("oa-owned-testclaim", "eier@tc-owned.no");
+    usedClaim("gsc_oa01tc", "oa-owned-testclaim", "eier@tc-owned.no", { is_test: 1 });
+    provider("oa-owned-pick", { content_source: "claim", claimed_at: "2026-10-01 00:00:00" });
+    sent("oa-owned-pick", "ny@pick-owned.no", { sent_at: "2026-10-20 10:00:00" });
+    sent("oa-owned-pick", "gammel@pick-owned.no", { sent_at: "2026-09-01 10:00:00" });
+    usedClaim("gsc_oa01pick", "oa-owned-pick", "gammel@pick-owned.no");
+
     const row = (id: string) => claimSvc.getClaimProviderById(id)!;
     const oaEmail = (id: string) => claimSvc.findOpplevagentOutreachClaimEmail(row(id));
     const candidates = (id: string) => claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(row(id), undefined, { cacheKey: id });
@@ -259,6 +363,51 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
     assertTrue(warnLog.some((l) => l.includes("Opplevagent outreach lookup failed for oa-nolisted")), "o22: ... with a [gardssalg-claim] warning");
     claimSvc.__setRfbDbForTesting(rfbDb as any);
     console.warn = prevWarn;
+
+    // ── t: an address the listing moved away from (review fix-up) ─────────
+    assertEq(oaEmail("oa-rolledback"), null, "t1: epost cleared by a content rollback (audit old_value = the address, new NULL) -> not a login target");
+    assertEq(oaEmail("oa-replaced"), null, "t2: replaced, then cleared -> neither the old nor the newer address");
+    assertEq(oaEmail("oa-synth"), null, "t3: field_provenance.epost_synthesis_removal.removed_value -> not");
+    assertEq(oaEmail("oa-fieldwrite"), null, "t4: experience_provider_field_write_audit removal row -> not");
+    assertEq(oaEmail("oa-trail-other"), "eier@trailother-gard.no", "t5: removal of ANOTHER address, a case-only edit and another field's row do not block");
+    warnLog.length = 0;
+    console.warn = (...a: unknown[]) => { warnLog.push(a.map(String).join(" ")); };
+    assertEq(oaEmail("oa-badprov"), null, "t6: unreadable field_provenance -> fails closed");
+    expDb.exec(`ALTER TABLE experience_provider_field_write_audit RENAME TO oa01_fw_audit_away`);
+    try {
+      assertEq(oaEmail("oa-nolisted"), null, "t7: trail lookup error -> fails closed");
+      assertEq(oaEmail("oa-listed-match"), "post@listed-gard.no", "t8: a listed epost does not read the trail");
+    } finally {
+      expDb.exec(`ALTER TABLE oa01_fw_audit_away RENAME TO experience_provider_field_write_audit`);
+    }
+    console.warn = prevWarn;
+    assertTrue(warnLog.some((l) => l.includes("lookup failed for oa-badprov")) && warnLog.some((l) => l.includes("lookup failed for oa-nolisted")), "t9: ... both with a warning");
+    assertEq(oaEmail("oa-nolisted"), "eier@nolisted-gard.no", "t10: restored trail -> the plain case qualifies again");
+    assertEq(await candidates("oa-rolledback"), [], "t11: rolled-back producer -> zero candidates (manual fallback)");
+    assertEq(await candidates("oa-synth"), [], "t12: synthesis-removed producer -> zero candidates");
+
+    // ── l: a stored epost is authoritative even when malformed ─────────────
+    assertEq(oaEmail("oa-listed-malformed"), null, "l1: listed epost that is not an address -> no fallback to an old delivery");
+    assertEq(oaEmail("oa-listed-multi"), null, "l2: listed epost with several addresses -> no fallback either");
+
+    // ── s: shared mailbox (review fix-up) ─────────────────────────────────
+    assertEq(oaEmail("oa-listshared-a"), null, "s1: another provider LISTS the address (case/space variant), only A was mailed -> not");
+    assertEq(oaEmail("oa-nbsp-a"), null, "s2: ... also with a trailing NBSP in the other listing");
+    assertEq(oaEmail("oa-resshared-a"), null, "s3: another provider has a kept 'reserved' row to it -> not");
+    assertEq(oaEmail("oa-dryshared-a"), null, "s4: another provider has a dry-run row to it -> not");
+    assertEq(oaEmail("oa-merge-main"), "main@merge-gard.no", "s5: a duplicate merged INTO this provider (listing + delivery) is the same producer -> still qualifies");
+
+    // ── w: owned profiles (review fix-up) ─────────────────────────────────
+    assertEq(oaEmail("oa-owned-precl"), null, "w1: claimed profile + pre-claim delivery to an address that never claimed it -> not");
+    assertEq(oaEmail("oa-owned-cs"), null, "w2: owned by content_source='claim' alone -> not");
+    assertEq(oaEmail("oa-owned-ca"), null, "w3: owned by claimed_at alone -> not");
+    assertEq(oaEmail("oa-owned-ac"), null, "w4: owned by another address's active claim alone -> not");
+    assertEq(oaEmail("oa-owned-self"), "eier@self-owned.no", "w5: the address that completed the claim (since logged out) can log in again");
+    assertEq(oaEmail("oa-claimed"), "eier@claimed-gard.no", "w6: ... also when its claim is still active");
+    assertEq(oaEmail("oa-owned-adminrevoked"), null, "w7: a claim revoked by the admin lever does not count");
+    assertEq(oaEmail("oa-owned-testclaim"), null, "w8: a test claim does not count");
+    assertEq(oaEmail("oa-owned-pick"), "gammel@pick-owned.no", "w9: owned -> the latest delivery among addresses that claimed it");
+    assertEq(await candidates("oa-owned-precl"), [], "w10: claimed profile, pre-claim outreach only -> zero candidates");
 
     // ── Through the shared derivation the page and the POST use ─────────────
     assertEq(await candidates("oa-nolisted"), [{ email: "eier@nolisted-gard.no", source: "outreach_delivered" }], "o23: deriveOrgLinkedEmailCandidatesWithHarvest offers it");
@@ -349,6 +498,27 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
       .prepare(`SELECT email, email_source FROM gardssalg_claims WHERE provider_id = 'oa-two' ORDER BY created_at DESC LIMIT 1`)
       .get() as { email: string; email_source: string } | undefined;
     assertEq(twoRow, { email: "eier@two-gard-post.no", email_source: "outreach_delivered" }, "r14: ... and the claim goes to the outreach address");
+
+    // Review fix-up: removed listing, owned profiles — through the real routes.
+    const FALLBACK = "Vi kan ikke bekrefte automatisk";
+    const isFallbackOnly = (body: string) => !body.includes("Send meg tilgangslenke") && body.includes(FALLBACK);
+    assertTrue(isFallbackOnly((await req("GET", "/kategori/gardssalg/eier/oa-rolledback")).body), "r15: rolled-back epost -> manual fallback");
+    const rbPost = await req("POST", "/kategori/gardssalg/eier/oa-rolledback/request", {});
+    assertEq([rbPost.status, JSON.parse(rbPost.body).error], [403, "no_org_linked_email"], "r16: ... and the POST refuses");
+    assertTrue(isFallbackOnly((await req("GET", "/kategori/gardssalg/eier/oa-synth")).body), "r17: synthesis-removed epost -> manual fallback");
+    assertTrue(isFallbackOnly((await req("GET", "/kategori/gardssalg/eier/oa-owned-precl")).body), "r18: claimed profile with only pre-claim outreach -> manual fallback");
+    const ownedPost = await req("POST", "/kategori/gardssalg/eier/oa-owned-precl/request", {});
+    assertEq([ownedPost.status, JSON.parse(ownedPost.body).error], [403, "no_org_linked_email"], "r19: ... and the POST mints no login link");
+    const countClaims = (id: string) => (expDb.prepare(`SELECT COUNT(*) AS n FROM gardssalg_claims WHERE provider_id = ?`).get(id) as { n: number }).n;
+    assertEq(countClaims("oa-owned-precl"), 1, "r20: ... no new claim row (only the owner's existing one)");
+    const selfPage = await req("GET", "/kategori/gardssalg/eier/oa-owned-self");
+    assertTrue(selfPage.body.includes("Send meg tilgangslenke") && selfPage.body.includes(claimSvc.maskEmail("eier@self-owned.no")), "r21: the owner's own claimed address -> re-login offered");
+    const selfPost = await req("POST", "/kategori/gardssalg/eier/oa-owned-self/request", {});
+    assertEq(selfPost.status, 200, "r22: ... POST succeeds");
+    const selfRow = expDb
+      .prepare(`SELECT email, email_source FROM gardssalg_claims WHERE provider_id = 'oa-owned-self' AND used = 0 ORDER BY created_at DESC LIMIT 1`)
+      .get() as { email: string; email_source: string } | undefined;
+    assertEq(selfRow, { email: "eier@self-owned.no", email_source: "outreach_delivered" }, "r23: ... and the link goes to that address");
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-claim-outreach-delivered-oa01: unexpected error: " + String(err?.stack || err?.message || err));

@@ -12,9 +12,10 @@
  * deriveOrgLinkedEmailCandidatesWithHarvest() returns for this provider — the
  * exact list issueClaimMagicLink() validates a claim against (Brreg-verified
  * provider required, then Brreg contact / provenance-backed stored epost /
- * addresses found on the producer's own site). An address on the same domain
- * that is not on that list is rejected: the claim flow would not send a login
- * link there either.
+ * addresses found on the producer's own site / since OA-01 (2026-10-31)
+ * outreach_delivered, the address Opplevagent's own outreach was delivered to
+ * for this producer). An address on the same domain that is not on that list
+ * is rejected: the claim flow would not send a login link there either.
  *
  * Field locks: confirmed fields are locked with the existing admin field lock
  * (applyGardssalgFieldLock), so enrichment cannot change a confirmed value
