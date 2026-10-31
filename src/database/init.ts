@@ -4577,6 +4577,23 @@ function initSchema(db: Database.Database): void {
     )
   `);
 
+  // ai-sok B5: per-AI-agent rollup (search indexer vs user fetch vs training
+  // crawler survive the nightly prune). page_view_daily's coarse bot_type
+  // ('chatgpt' = GPTBot + ChatGPT-User + OAI-SearchBot) is left untouched, so
+  // every existing reader keeps its numbers. One row per day x registry token
+  // x vertical; vendor/purpose are looked up from AI_AGENT_REGISTRY when read.
+  // Written by retention-service.ts in the same transaction as page_view_daily.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS page_view_ai_agent_daily (
+      day           TEXT NOT NULL,
+      agent         TEXT NOT NULL,
+      vertical_id   TEXT NOT NULL DEFAULT 'rfb',
+      view_count    INTEGER NOT NULL DEFAULT 0,
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent, vertical_id)
+    )
+  `);
+
   // ─── Measure 2 of dev-request 2026-07-03-places-api-cost-reduction ──────
   // (SKU field-splitting, RFB google-rating-batch): Places API (New) Text
   // Search bills the whole call at Enterprise-tier pricing (1k free calls/mo)
