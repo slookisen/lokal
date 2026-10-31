@@ -37987,4 +37987,30 @@ router.post("/admin/gardssalg-content-refresh-job-run", requireAdmin, async (req
   res.json({ success: true, ...report });
 });
 
+// ─── Server-side experiences org.nr job, step 3n (A2A dev-request
+// 2026-10-06-experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// «Innsnevring 2026-10-28») — read-only status + manual run ────────────────
+import {
+  getExperienceOrgnrJobStatus,
+  runExperienceOrgnrDaily,
+} from "../services/experience-orgnr-job";
+
+router.get("/admin/experience-orgnr-job-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceOrgnrJobStatus() });
+});
+
+// Manual run, same code path as the daily tick. Dry-run unless `apply` is
+// exactly the JSON boolean true. The write-pause is checked inside the run
+// (apply only); a dry-run reads the shared cursor but never advances it.
+router.post("/admin/experience-orgnr-job-run", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { apply?: unknown };
+    const report = await runExperienceOrgnrDaily({ apply: body.apply === true, trigger: "manual" });
+    res.json({ success: true, ...report });
+  } catch (err) {
+    console.error("[opplevelser] admin/experience-orgnr-job-run failed", err);
+    res.status(500).json({ success: false, error: "Internal error" });
+  }
+});
+
 export default router;

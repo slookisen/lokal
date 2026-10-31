@@ -2262,6 +2262,45 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void gardssalgCrDailyTick(); }, 10 * 60_000);
 }
 
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28» step 3n: the two org.nr
+// paths (Trinn A website, Trinn B name+kommune) run by the platform once a
+// day, plus punkt a (admission_checked_at reset for needs_review rows of a
+// provider just resolved brreg_active=1) ─────────────────────────────────
+//
+// Same pattern as gardssalg-content-refresh-daily above: checks every 10
+// minutes, fires once inside EXPERIENCE_ORGNR_JOB_WINDOW_HOUR_UTC (default
+// 04), stamp persisted in boot_job_state. OFF by default:
+// EXPERIENCE_ORGNR_JOB_ENABLED=true turns it on; flipping it back is the
+// rollback. No LLM. Manual/dry runs: POST /api/opplevelser/admin/experience-orgnr-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastExperienceOrgnrRunAt: Date | null = null;
+  let experienceOrgnrRunning = false;
+  const experienceOrgnrDailyTick = trackJob("experience-orgnr-daily", async () => {
+    if (experienceOrgnrRunning) return;
+    experienceOrgnrRunning = true;
+    const now = new Date();
+    try {
+      const { tickExperienceOrgnrDaily } = await import("./services/experience-orgnr-job");
+      const t = await tickExperienceOrgnrDaily({ now, lastRunAt: lastExperienceOrgnrRunAt });
+      lastExperienceOrgnrRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[experience-orgnr-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `processed=${r.totals.processed} active=${r.totals.resolved_active} inactive=${r.totals.resolved_inactive} ` +
+          `admission_reset=${r.totals.admission_reset_rows} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-orgnr-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceOrgnrRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceOrgnrDailyTick(); }, 8 * 60_000);
+  setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
 // (punkt 5): the product-import dry-run measurement survives a deploy. Once,
 // 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the

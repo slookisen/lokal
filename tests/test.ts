@@ -46242,6 +46242,26 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, «Innsnevring 2026-10-28» step 3n: the org.nr paths run by a
+// server-side daily job, plus punkt a (admission_checked_at reset for
+// needs_review rows of a provider resolved brreg_active=1). Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3n: experience-orgnr-job (server-side, punkt a) ──");
+  try {
+    const { runExperienceOrgnrJobTests } = require("../src/services/experience-orgnr-job.test") as
+      typeof import("../src/services/experience-orgnr-job.test");
+    const oj = await runExperienceOrgnrJobTests({ log: false });
+    passed += oj.passed;
+    failed += oj.failed;
+    for (const f of oj.failures) failures.push("experience-orgnr-job: " + f);
+    console.log(`  experience-orgnr-job: ${oj.passed} passed, ${oj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-orgnr-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Tillegg 2026-10-15 «4b-forslag»: gårdssalg visit-text proposals — the
 // candidates GET, the shared apply function behind POST /admin/gardssalg-
 // visit-proposals-write (server re-fetch + verbatim evidence + overlap) and
