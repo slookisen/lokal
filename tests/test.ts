@@ -51314,6 +51314,28 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 3b-1: outreach pre-extraction (admin only) — flag-gated
+// POST /admin/product-import/prepare + GET report (JSON / Norwegian md);
+// controls (category label, alcohol, duplicate/unchanged, unanchored price,
+// LLM tier only at measured accuracy ≥ 0.95); nothing public, no e-mail,
+// not counted in the owner's daily fetch limit.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 3b-1: forhåndsuttrekk før utsendelse ──");
+  try {
+    const { runOutreachPrepareTests } = require("../src/services/product-import/outreach-prepare.test") as
+      typeof import("../src/services/product-import/outreach-prepare.test");
+    const r = await runOutreachPrepareTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("outreach-prepare: " + f);
+    console.log(`  outreach-prepare: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("outreach-prepare: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
 // pages promise no organic / Debio coverage beyond Debio's public register;

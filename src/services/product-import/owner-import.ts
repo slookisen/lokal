@@ -130,7 +130,7 @@ export function ownerFetchesToday(agentId: string, nowMs: number): number {
 }
 
 /** A current product of the profile, read the way the catalog sync reads it. */
-interface CurrentProduct {
+export interface CurrentProduct {
   index: number;
   name: string;
   key: string;
@@ -140,7 +140,7 @@ interface CurrentProduct {
   source: string | null;
 }
 
-function currentProductsOf(list: ProductInfo[]): CurrentProduct[] {
+export function currentProductsOf(list: ProductInfo[]): CurrentProduct[] {
   const out: CurrentProduct[] = [];
   list.forEach((p, index) => {
     const rawName = p && typeof p.name === "string" ? p.name.trim() : "";
@@ -162,13 +162,13 @@ function currentProductsOf(list: ProductInfo[]): CurrentProduct[] {
   return out;
 }
 
-function readCurrentList(agentId: string): ProductInfo[] {
+export function readCurrentList(agentId: string): ProductInfo[] {
   const k = knowledgeService.getKnowledge(agentId);
   return Array.isArray(k?.products) ? (k!.products as ProductInfo[]) : [];
 }
 
 /** The producer's own types (agents.categories / tags), as the cart gate reads them. */
-function producerTypesOf(agentId: string): string[] {
+export function producerTypesOf(agentId: string): string[] {
   try {
     const row = getDb().prepare(`SELECT categories, tags FROM agents WHERE id = ?`).get(agentId) as
       | { categories: string | null; tags: string | null }
@@ -364,7 +364,7 @@ interface DiffInput {
 }
 
 /** new / changed / unchanged per candidate (by index), and the current products no candidate matched. PURE. */
-function diffAgainst(cands: DiffInput[], current: CurrentProduct[]) {
+export function diffAgainst(cands: DiffInput[], current: CurrentProduct[]) {
   const byKey = new Map<string, CurrentProduct>();
   for (const c of current) if (!byKey.has(c.key)) byKey.set(c.key, c);
   const matched = new Set<string>();
