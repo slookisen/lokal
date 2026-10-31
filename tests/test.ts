@@ -35838,6 +35838,19 @@ const _utmCapturePromise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("utm-capture: unexpected error: " + String(err?.message || err));
+  }
+  // ai-sok B5: per-AI-agent rollup. Same serial slot as B4 (swaps the DB singleton).
+  try {
+    const { runAiAgentRollupTests } = require("../src/services/ai-agent-rollup.test") as
+      typeof import("../src/services/ai-agent-rollup.test");
+    const ar = await runAiAgentRollupTests({ log: false });
+    passed += ar.passed;
+    failed += ar.failed;
+    for (const f of ar.failures) failures.push("ai-agent-rollup: " + f);
+    console.log(`  ai-agent-rollup: ${ar.passed} passed, ${ar.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ai-agent-rollup: unexpected error: " + String(err?.message || err));
   } finally {
     _utmCaptureResolve();
   }
