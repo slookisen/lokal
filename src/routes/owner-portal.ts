@@ -2512,7 +2512,7 @@ export function ownerOrderabilityCardHtml(agentId: string, o: OwnerOrderabilityO
 export function ownerProductsNeedClaimantLoginPage(agentId: string): string {
   const id = encodeURIComponent(agentId);
   return portalShell(
-    "Ingen tilgang",
+    "Logg inn med eierens e-post",
     `<div class="ep-card" data-claimant-login-required="1">
           <h1>Logg inn med eierens e-postadresse</h1>
           <p>For å endre varene må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen. Du kan fortsatt se varene i portalen.</p>
