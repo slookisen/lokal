@@ -46569,6 +46569,32 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-06-25-platform-contact-surface, slice CSP: the one CSP in
+// security.ts (script-src 'self' 'unsafe-inline', frame-src 'none') blocked
+// Cloudflare Turnstile on /kontakt for all three sites, so /api/contact
+// answered 403 captcha_failed to every visitor. Proves script-src and
+// frame-src now carry https://challenges.cloudflare.com, every other
+// directive is byte-identical, and GET /kontakt + /en/kontakt on each host
+// (real routers behind securityHeaders) serve a page whose Turnstile script
+// and iframe the header allows. Swaps the getDb() singleton, module cache and
+// DB env vars (restored in finally) — runSerial, next to the other
+// security.ts suites.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-06-25-platform-contact-surface, CSP: Turnstile allowed on /kontakt ──");
+  try {
+    const { runSecurityCspTurnstileTests } = require("../src/middleware/security-csp-turnstile.test") as
+      typeof import("../src/middleware/security-csp-turnstile.test");
+    const csp = await runSecurityCspTurnstileTests({ log: false });
+    passed += csp.passed;
+    failed += csp.failed;
+    for (const f of csp.failures) failures.push("security-csp-turnstile: " + f);
+    console.log(`  security-csp-turnstile: ${csp.passed} passed, ${csp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("security-csp-turnstile: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-08-08-opplevagent-slik-fungerer-det: the producer-facing
 // explainer page the gårdssalg outreach email points at ("hva er dette, og
 // hvordan havner vi i ChatGPT?"). Beyond the render/SEO/cross-link checks,
