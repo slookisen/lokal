@@ -527,6 +527,30 @@ function presentedOwnerTokens(req: Request): string[] {
   return out;
 }
 
+// ── T3: lock / audit / write only the fields the owner actually changed ──
+// The portal form posts all seven fields on every save, so before this a
+// save that changed one field stamped curated_fields by:"owner" (and wrote an
+// agent_knowledge_audit row) for all seven — freezing untouched fields
+// against enrichment. Same notion of "changed" as the gårdssalg claim
+// (services/gardssalg-claim.ts, G1 pkt 2): compare after CRLF→LF + trim, and
+// null / "" / whitespace-only are the same "empty". opening_hours has the DB
+// default '[]' (database/init.ts), which is also "empty" — never shown to the
+// owner as "[]", never "changed" into "", never locked.
+function normalizeOwnerProfileValue(dbField: string, value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).replace(/\r\n?/g, "\n").trim();
+  if (s === "") return null;
+  if (dbField === "opening_hours" && s === "[]") return null;
+  return s;
+}
+
+/** The stored value as the portal input shows it ('[]' opening hours → ""). */
+function ownerProfileDisplayValue(dbField: string, stored: unknown): string {
+  if (stored == null) return "";
+  if (dbField === "opening_hours" && normalizeOwnerProfileValue(dbField, stored) === null) return "";
+  return String(stored);
+}
+
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/update-profile
 // ─────────────────────────────────────────────────────────────────
@@ -612,6 +636,7 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
     const updatedFields: Record<string, any> = {};
     const skippedFields: Array<{ field: string; reason: string }> = [];
     const auditInserts: Array<any> = [];
+    let curatedChanged = false;
 
     for (const field of EDITABLE_FIELDS) {
       if (!(field in bodyFields)) continue; // Skip if not in request
@@ -655,14 +680,24 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
         continue;
       }
 
+      // T3: an unchanged field is a no-op — no write, no audit row, no lock;
+      // its existing curated_fields entry (if any) stays exactly as it is.
+      if (normalizeOwnerProfileValue(dbField, newValue) === normalizeOwnerProfileValue(dbField, (knowledge as any)[dbField])) {
+        continue;
+      }
+
       const oldValue = (knowledge as any)[dbField] || null;
       updatedFields[dbField] = newValue;
 
-      // Update curated_fields
-      curatedFields[dbField] = {
-        locked_at: new Date().toISOString(),
-        by: "owner",
-      };
+      // Update curated_fields — never for empty opening hours ('' / '[]'):
+      // the field goes back to "no hours" and an existing lock is left as is.
+      if (!(dbField === "opening_hours" && normalizeOwnerProfileValue(dbField, newValue) === null)) {
+        curatedFields[dbField] = {
+          locked_at: new Date().toISOString(),
+          by: "owner",
+        };
+        curatedChanged = true;
+      }
 
       // Queue audit record
       auditInserts.push({
@@ -691,10 +726,13 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
         ).run(...updateValues, new Date().toISOString(), id);
       }
 
-      // Update curated_fields JSON
-      db.prepare(
-        `UPDATE agent_knowledge SET curated_fields = ?, updated_at = ? WHERE agent_id = ?`
-      ).run(JSON.stringify(curatedFields), new Date().toISOString(), id);
+      // Update curated_fields JSON — only when a lock was added (T3: a save
+      // with nothing changed does not touch the row at all).
+      if (curatedChanged) {
+        db.prepare(
+          `UPDATE agent_knowledge SET curated_fields = ?, updated_at = ? WHERE agent_id = ?`
+        ).run(JSON.stringify(curatedFields), new Date().toISOString(), id);
+      }
 
       // Insert audit records
       const auditIds: string[] = [];
@@ -1829,7 +1867,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     ];
 
     const fieldHtml = fieldDefs.map((fd) => {
-      const value = (knowledge as any)[fd.dbField] != null ? String((knowledge as any)[fd.dbField]) : "";
+      const value = ownerProfileDisplayValue(fd.dbField, (knowledge as any)[fd.dbField]);
       const lockInfo = curatedFields[fd.dbField] || {};
       const csOverride = isOverridableCsLock(lockInfo);
       const lockedByOther = lockInfo.by && lockInfo.by !== "owner" && lockInfo.by !== null && !csOverride;
