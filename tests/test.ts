@@ -37297,6 +37297,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
     failed++;
     failures.push("bestillinger-b2b1: unexpected error: " + String(err?.message || err));
   }
+  // B2b-2 (bestillinger: the soft-expiry date on every surface — producer page/JSON-LD, MCP, REST, A2A, feeds) — own in-memory DB.
+  try {
+    const { runBestillingerB2b2Tests } = require("../src/routes/bestillinger-b2b2.test") as
+      typeof import("../src/routes/bestillinger-b2b2.test");
+    const b2b2 = await runBestillingerB2b2Tests({ log: false });
+    passed += b2b2.passed;
+    failed += b2b2.failed;
+    for (const f of b2b2.failures) failures.push("bestillinger-b2b2: " + f);
+    console.log(`  bestillinger-b2b2: ${b2b2.passed} passed, ${b2b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b2b2: unexpected error: " + String(err?.message || err));
+  }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
     const { runBuyerOrderActionsFaseB1Tests } = require("../src/routes/buyer-order-actions-fase-b1.test") as
