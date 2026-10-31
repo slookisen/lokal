@@ -1,0 +1,295 @@
+/**
+ * admin-agents-content-correction-owner-consent.test.ts — A2A dev-request
+ * 2026-10-28-rfb-okologisk-merking-debio-register-og-tekstrevisjon, S2e.
+ *
+ * POST /admin/agents/content-correction used to answer skipped_claimed for
+ * every owner-locked profile. An item may now carry
+ * `owner_consent: { crm_message_id }`: an inbound CRM reply from the agent's
+ * own contact, after an outbound message we sent in the same thread, lets
+ * that ONE item past the owner lock (and only the owner lock).
+ *
+ * Covers: no consent -> skipped_claimed (unchanged); malformed consent shape
+ * -> invalid_item; consent from another agent's contact, an outbound message,
+ * an inbound with no earlier sent outbound (incl. only a failed outbound),
+ * a nonexistent id -> invalid_consent with nothing written; valid consent in
+ * dry-run -> would_write_with_owner_consent, nothing written / audited / no
+ * crm_actions; valid consent + apply -> written_with_owner_consent, audit
+ * notes carry ` · owner_consent=<id>`, crm_actions owner_consent_applied row;
+ * valid consent on a curated field -> skipped_curated, nothing written;
+ * consent on a NOT owner-locked row is ignored (plain `written`, no
+ * crm_actions); a later outbound (our confirmation) does not void consent.
+ *
+ * Same harness as admin-agents-content-quality.test.ts (better-sqlite3
+ * ":memory:" + __initSchemaForTesting, the route's own DB seam,
+ * router.handle() with a fake req/res — no HTTP). Mutates no shared global.
+ */
+
+import Database from "better-sqlite3";
+import * as initMod from "../database/init";
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+interface RouteResult {
+  status: number;
+  body: any;
+}
+
+function callRoute(
+  router: any,
+  opts: { headers?: Record<string, string>; body?: any; query?: Record<string, string> },
+): Promise<RouteResult> {
+  return new Promise((resolve) => {
+    const headers = opts.headers || {};
+    const req: any = {
+      method: "POST",
+      url: "/",
+      originalUrl: "/",
+      query: opts.query || {},
+      headers,
+      body: opts.body,
+      ip: "127.0.0.1",
+      get(name: string) {
+        return headers[name.toLowerCase()];
+      },
+    };
+    const res: any = {
+      statusCode: 200,
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload: any) {
+        resolve({ status: this.statusCode, body: payload });
+        return this;
+      },
+      end() {
+        resolve({ status: this.statusCode, body: undefined });
+        return this;
+      },
+    };
+    router.handle(req, res, (err?: any) => {
+      resolve({ status: err ? 500 : 0, body: err ? { error: String(err) } : undefined });
+    });
+  });
+}
+
+const OLD_DESC = "Vi selger økologiske grønnsaker direkte fra gården hver lørdag.";
+const NEW_DESC = "Vi selger grønnsaker direkte fra gården hver lørdag.";
+
+export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertEq(actual: unknown, expected: unknown, label: string): void {
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      const msg = `✗ ${label}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`;
+      failures.push(msg);
+      if (log) console.log("  " + msg);
+    }
+  }
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+
+  return (async () => {
+    const ambientKey = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+    const setKeyOurselves = ambientKey === "";
+    if (setKeyOurselves) process.env.ADMIN_KEY = "content-correction-consent-standalone-key";
+    const testKey = process.env.ADMIN_KEY as string;
+
+    const db = new Database(":memory:");
+    try {
+      initMod.__initSchemaForTesting(db as any);
+      const insertAgent = db.prepare(
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, vertical_id, claimed_at)
+         VALUES (?, ?, ?, 'test', 'post@example.no', 'https://example.no', 'producer', ?, 'rfb', ?)`,
+      );
+      const insertKnowledge = db.prepare(`INSERT INTO agent_knowledge (agent_id, about, curated_fields) VALUES (?, ?, ?)`);
+      const insertContact = db.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email) VALUES (?, 'producer', ?, ?)`);
+      const insertThread = db.prepare(`INSERT INTO crm_threads (id, contact_id, subject) VALUES (?, ?, 'Retting av tekst')`);
+      const insertMsg = db.prepare(
+        `INSERT INTO crm_messages (id, thread_id, direction, from_email, sent_at, received_at, delivery_status)
+         VALUES (?, ?, ?, 'x@example.no', ?, ?, ?)`,
+      );
+      const CLAIMED = "2026-01-01T00:00:00.000Z";
+
+      // Owner-locked producer with a proper notice -> reply thread.
+      insertAgent.run("oc-a", "Gård A", OLD_DESC, "k-oc-a", CLAIMED);
+      insertKnowledge.run("oc-a", null, "{}");
+      insertContact.run("cc-a", "oc-a", "a@example.no");
+      insertThread.run("th-a", "cc-a");
+      insertMsg.run("m-a-out", "th-a", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
+      // Inbound with sent_at NULL: falls back to received_at (datetime('now') format).
+      insertMsg.run("m-a-in", "th-a", "in", null, "2026-10-29 10:00:00", "sent");
+      // Our confirmation reply AFTER the «ja» — must not void the consent.
+      insertMsg.run("m-a-out2", "th-a", "out", "2026-10-29T11:00:00.000Z", "2026-10-29 11:00:00", "sent");
+      // Inbound that came BEFORE any outbound in its own thread.
+      insertThread.run("th-a2", "cc-a");
+      insertMsg.run("m-a2-in", "th-a2", "in", "2026-10-28T09:00:00.000Z", "2026-10-28 09:00:00", "sent");
+      insertMsg.run("m-a2-out", "th-a2", "out", "2026-10-28T12:00:00.000Z", "2026-10-28 12:00:00", "sent");
+      // Inbound whose only earlier outbound was never delivered (failed).
+      insertThread.run("th-a3", "cc-a");
+      insertMsg.run("m-a3-out", "th-a3", "out", null, "2026-10-27 08:00:00", "failed");
+      insertMsg.run("m-a3-in", "th-a3", "in", "2026-10-27T09:00:00.000Z", "2026-10-27 09:00:00", "sent");
+
+      // Another owner-locked producer, with its own valid reply.
+      insertAgent.run("oc-b", "Gård B", OLD_DESC, "k-oc-b", CLAIMED);
+      insertKnowledge.run("oc-b", null, "{}");
+      insertContact.run("cc-b", "oc-b", "b@example.no");
+      insertThread.run("th-b", "cc-b");
+      insertMsg.run("m-b-out", "th-b", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
+      insertMsg.run("m-b-in", "th-b", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
+
+      // Owner-locked producer whose description is curated by the owner.
+      insertAgent.run("oc-cur", "Gård Kuratert", OLD_DESC, "k-oc-cur", CLAIMED);
+      insertKnowledge.run("oc-cur", null, JSON.stringify({ description: { by: "owner" } }));
+      insertContact.run("cc-cur", "oc-cur", "cur@example.no");
+      insertThread.run("th-cur", "cc-cur");
+      insertMsg.run("m-cur-out", "th-cur", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
+      insertMsg.run("m-cur-in", "th-cur", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
+
+      // NOT owner-locked producer.
+      insertAgent.run("oc-open", "Gård Åpen", OLD_DESC, "k-oc-open", null);
+      insertKnowledge.run("oc-open", null, "{}");
+
+      delete require.cache[require.resolve("./admin-agents-content-correction")];
+      const routeMod = require("./admin-agents-content-correction");
+      const router = routeMod.default;
+      routeMod.__setContentCorrectionDbForTesting(db as any);
+
+      const REASON = "Fjerner udokumentert «økologisk» etter eiers «ja» (okologi S2e)";
+      const post = (items: any[], apply = false) =>
+        callRoute(router, { headers: { "x-admin-key": testKey }, body: { reason: REASON, items }, query: apply ? { apply: "1" } : {} });
+      const item = (agent_id: string, crm_message_id?: unknown, extra: Record<string, unknown> = {}) => ({
+        agent_id,
+        field: "description",
+        text: NEW_DESC,
+        ...(crm_message_id === undefined ? {} : { owner_consent: { crm_message_id } }),
+        ...extra,
+      });
+      const descOf = (id: string) => (db.prepare(`SELECT description FROM agents WHERE id = ?`).get(id) as any)?.description ?? null;
+      const auditFor = (id: string) =>
+        db.prepare(`SELECT field_name, old_value, new_value, changed_by, notes FROM agent_knowledge_audit WHERE agent_id = ?`).all(id) as any[];
+      const consentActions = () =>
+        db.prepare(`SELECT thread_id, contact_id, type, actor, payload FROM crm_actions WHERE type = 'owner_consent_applied'`).all() as any[];
+      const first = (r: RouteResult) => r.body?.results?.[0];
+
+      // ── No consent: unchanged behaviour ──
+      let r = await post([item("oc-a")], true);
+      assertEq(first(r)?.outcome, "skipped_claimed", "oc-01: owner-locked without owner_consent -> skipped_claimed");
+      assertEq(descOf("oc-a"), OLD_DESC, "oc-02: nothing written");
+      assertEq(first(r)?.detail, undefined, "oc-03: no detail added to the plain skipped_claimed result");
+
+      // ── Malformed consent shape -> invalid_item at parse time ──
+      r = await post([
+        item("oc-a", ""),
+        item("oc-a", 42),
+        item("oc-a", "x".repeat(201)),
+        { agent_id: "oc-a", field: "description", text: NEW_DESC, owner_consent: "m-a-in" },
+        { agent_id: "oc-a", field: "description", text: NEW_DESC, owner_consent: ["m-a-in"] },
+      ], true);
+      assertEq(r.status, 200, "oc-04: malformed consent reported per-item");
+      assertEq(r.body?.counts?.invalid_item, 5, "oc-05: empty / non-string / over-long id and non-object shapes are invalid_item");
+      assertEq(descOf("oc-a"), OLD_DESC, "oc-06: nothing written");
+
+      // ── Invalid consent cases (apply) ──
+      const invalidCases: Array<[string, string, string]> = [
+        ["m-b-in", "oc-07", "message from another agent's contact"],
+        ["m-a-out", "oc-08", "an outbound message"],
+        ["m-a2-in", "oc-09", "inbound with no earlier outbound in its thread"],
+        ["m-a3-in", "oc-10", "inbound whose only earlier outbound failed to send"],
+        ["does-not-exist", "oc-11", "nonexistent message id"],
+      ];
+      for (const [msgId, label, what] of invalidCases) {
+        r = await post([item("oc-a", msgId)], true);
+        assertEq(first(r)?.outcome, "invalid_consent", `${label}: ${what} -> invalid_consent`);
+        assertTrue(/^owner_consent: /.test(first(r)?.detail ?? ""), `${label}b: invalid_consent carries a detail`);
+      }
+      assertEq(descOf("oc-a"), OLD_DESC, "oc-12: no invalid consent wrote anything");
+      assertEq(auditFor("oc-a").length, 0, "oc-13: no audit rows");
+      assertEq(consentActions().length, 0, "oc-14: no crm_actions rows");
+
+      // Invalid consent shows in dry-run too.
+      r = await post([item("oc-a", "m-b-in")]);
+      assertEq(first(r)?.outcome, "invalid_consent", "oc-15: dry-run reports invalid_consent");
+
+      // ── Valid consent, dry-run: reported, nothing written ──
+      r = await post([item("oc-a", "m-a-in")]);
+      assertEq(r.body?.dry_run, true, "oc-16: dry-run by default");
+      assertEq(first(r)?.outcome, "would_write_with_owner_consent", "oc-17: dry-run -> would_write_with_owner_consent");
+      assertEq(r.body?.counts?.would_write_with_owner_consent, 1, "oc-18: counted under its own key");
+      assertEq(descOf("oc-a"), OLD_DESC, "oc-19: dry-run wrote nothing");
+      assertEq(auditFor("oc-a").length, 0, "oc-20: dry-run audited nothing");
+      assertEq(consentActions().length, 0, "oc-21: dry-run inserted no crm_actions row");
+
+      // ── Valid consent on a curated field -> skipped_curated ──
+      r = await post([item("oc-cur", "m-cur-in")], true);
+      assertEq(first(r)?.outcome, "skipped_curated", "oc-22: consent bypasses the owner lock only — curated field still skipped_curated");
+      assertEq(descOf("oc-cur"), OLD_DESC, "oc-23: curated row untouched");
+      assertEq(auditFor("oc-cur").length, 0, "oc-24: no audit on curated row");
+      assertEq(consentActions().length, 0, "oc-25: no crm_actions on curated row");
+
+      // ── Junk guard still applies with consent ──
+      r = await post([{ ...item("oc-a", "m-a-in"), text: "Importert fra Hanen-medlemslisten — venter på verifisering" }], true);
+      assertEq(first(r)?.outcome, "refused_junk_text", "oc-26: junk gate still applies with consent");
+
+      // ── Valid consent + apply ──
+      r = await post([item("oc-a", "m-a-in")], true);
+      assertEq(r.body?.dry_run, false, "oc-27: apply=1");
+      assertEq(first(r)?.outcome, "written_with_owner_consent", "oc-28: apply -> written_with_owner_consent (later confirmation outbound does not void it)");
+      assertEq(r.body?.counts?.written_with_owner_consent, 1, "oc-29: counted under its own key");
+      assertEq(descOf("oc-a"), NEW_DESC, "oc-30: field written");
+      const audit = auditFor("oc-a");
+      assertEq(audit.length, 1, "oc-31: one audit row");
+      assertEq(audit[0]?.changed_by, "admin", "oc-32: changed_by=admin");
+      assertEq(audit[0]?.old_value, OLD_DESC, "oc-33: full old value kept");
+      assertTrue(
+        new RegExp(`^content-correction-\\d{8}-\\d{6}: ${REASON.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} · owner_consent=m-a-in$`).test(audit[0]?.notes ?? ""),
+        "oc-34: audit notes = `${batchTag}: ${reason} · owner_consent=<id>`",
+      );
+      const acts = consentActions();
+      assertEq(acts.length, 1, "oc-35: one crm_actions row");
+      assertEq([acts[0]?.thread_id, acts[0]?.contact_id, acts[0]?.actor], ["th-a", "cc-a", "system"], "oc-36: crm_actions on the message's thread/contact, actor=system");
+      const payload = JSON.parse(acts[0]?.payload ?? "{}");
+      assertEq(
+        [payload.agent_id, payload.field, payload.crm_message_id, payload.batch_tag],
+        ["oc-a", "description", "m-a-in", r.body?.batch_tag],
+        "oc-37: crm_actions payload {agent_id, field, crm_message_id, batch_tag}",
+      );
+
+      // Re-apply: unchanged, nothing new.
+      r = await post([item("oc-a", "m-a-in")], true);
+      assertEq(first(r)?.outcome, "skipped_unchanged", "oc-38: re-apply -> skipped_unchanged");
+      assertEq(consentActions().length, 1, "oc-39: no second crm_actions row");
+
+      // ── Not owner-locked: consent ignored, normal outcome ──
+      r = await post([item("oc-open", "m-b-in")], true);
+      assertEq(first(r)?.outcome, "written", "oc-40: unlocked row with (even foreign) consent -> plain written, consent not checked or claimed");
+      assertEq(descOf("oc-open"), NEW_DESC, "oc-41: written");
+      assertTrue(!/owner_consent/.test(auditFor("oc-open")[0]?.notes ?? ""), "oc-42: no owner_consent suffix in audit");
+      assertEq(consentActions().length, 1, "oc-43: no crm_actions row for the unlocked write");
+    } finally {
+      try { require("./admin-agents-content-correction").__setContentCorrectionDbForTesting(null); } catch { /* ignore */ }
+      try { db.close(); } catch { /* ignore */ }
+      if (setKeyOurselves) delete process.env.ADMIN_KEY;
+    }
+    return { passed, failed, failures };
+  })();
+}
