@@ -58,6 +58,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, stripInternalNotes, normalizeProse } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { searchTrafficClass } from "../services/search-tracking";
 import {
   AI_DELIVERIES_LABEL, AI_DELIVERIES_SUBTITLE, aiDeliveriesCountingSince,
@@ -6926,6 +6927,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const pageMetaDescription = buildProducerMetaDescription(agent.name, cityName, lang, safeDescription, primaryCategory, productsList.length);
 
     recordAiPageDelivery(req, res, "ai_page_profile", [agent.id]);
+    recordAiProfileClick(req, res, agent.id);
     res.send(shell(
       pageTitle,
       pageMetaDescription,

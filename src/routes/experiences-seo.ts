@@ -36,6 +36,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { analyticsService } from "../services/analytics-service";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { TRAFFIC_YEAR_KEYS, trafficYearCell, trafficYearLangOf, type TrafficYear, type TrafficYearKey } from "../services/traffic-year-compute";
 import { filterQueryText } from "../services/search-tracking";
@@ -6611,6 +6612,7 @@ ${switcherOn ? oaSiteFooter({ lang }) : oaSiteFooter({})}
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=300");
     recordAiPageDelivery(req, res, "ai_page_profile", [String(provider.id)], "experiences");
+    recordAiProfileClick(req, res, String(provider.id), "experiences");
     res.send(html);
   },
 );
@@ -9466,6 +9468,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
   res.setHeader("Cache-Control", "public, max-age=300");
   if (noindex) res.setHeader("X-Robots-Tag", NOINDEX_FOLLOW);
   recordAiPageDelivery(req, res, "ai_page_profile", [exp.id], "experiences");
+  recordAiProfileClick(req, res, exp.id, "experiences");
   res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang, noindex));
 });
 

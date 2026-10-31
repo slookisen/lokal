@@ -6217,6 +6217,27 @@ function initSchema(db: Database.Database): void {
     console.error("Migration profile_ai_deliveries failed:", err);
   }
 
+  // ─── profile_ai_clicks (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 2) ───
+  // «Klikk fra AI-svar»: how many people came to each profile page from an AI
+  // assistant's answer, per UTC day x AI (chatgpt | claude | perplexity |
+  // gemini | copilot | other). Daily sums only, no IP, session, user agent or
+  // URL; written in batches by profile-ai-clicks.ts. Additive.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS profile_ai_clicks (
+        vertical_id TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        day TEXT NOT NULL,
+        ai_vendor TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (vertical_id, profile_id, day, ai_vendor)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_profile_ai_clicks_vertical_day ON profile_ai_clicks(vertical_id, day)`);
+  } catch (err) {
+    console.error("Migration profile_ai_clicks failed:", err);
+  }
+
   // ─── search_console_weekly (A2A dev-request 2026-10-16-gsc-bing-ai-rapporter, S6c) ───
   // Weekly numbers from Google Search Console and Bing Webmaster Tools per
   // domain (source gsc | bing; week = Monday YYYY-MM-DD; metric e.g. clicks,
