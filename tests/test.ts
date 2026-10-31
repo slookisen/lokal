@@ -51357,3 +51357,24 @@ runSerial(async () => {
     failures.push("organic-texts-s3a: unexpected error: " + String(err?.message || err));
   }
 });
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S2e: POST /admin/agents/content-correction owner-consent
+// path — an inbound CRM reply after our notice lets ONE item past the owner
+// lock (only), audited + crm_actions owner_consent_applied. Own ":memory:" DB
+// via the route's seam; sets ADMIN_KEY only if unset (restored) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S2e: content-correction med eiersamtykke ──");
+  try {
+    const { runAdminAgentsContentCorrectionOwnerConsentTests } = require("../src/routes/admin-agents-content-correction-owner-consent.test") as
+      typeof import("../src/routes/admin-agents-content-correction-owner-consent.test");
+    const r = await runAdminAgentsContentCorrectionOwnerConsentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("content-correction-owner-consent: " + f);
+    console.log(`  content-correction-owner-consent: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-correction-owner-consent: unexpected error: " + String(err?.message || err));
+  }
+});
