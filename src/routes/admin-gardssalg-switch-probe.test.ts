@@ -18,6 +18,8 @@
  *   blind     a surface that cannot see the test row → IKKE OBSERVERBAR (both
  *             ways), not ready; the real A2A surface for a fixture without
  *             coordinates or kommune → IKKE OBSERVERBAR with the reason
+ *   o2c       the place set via POST /admin/gardssalg/test-provider → every
+ *             a2a row PASS; the row stays out of a plain public A2A request
  *   flags     OUTREACH_UNSUBSCRIBE_ENABLED off → that row FAIL «flag off»
  *   failure   a throw mid-run (after a flip) → ok:false, still restored exactly
  *   busy      a second concurrent run → 409 already_running / BusyError
@@ -365,7 +367,41 @@ export function runAdminGardssalgSwitchProbeTests(opts: { log?: boolean } = {}):
         assertTrue(a2a.length === 2 && a2a.every((x) => x.result === "NOT_OBSERVABLE" && /verken koordinater eller kommune/.test(x.reason || "")), "blind-5: real A2A without a place → IKKE OBSERVERBAR with the reason", a2a);
         assertTrue(r2.rows.filter((x) => x.surface === "a2a").every((x) => x.result !== "PASS"), "blind-6: no a2a row is PASS");
         assertTrue(r2.ready_for_daniel_test === false && r2.restored, "blind-7: not ready, restored");
-        expDb.prepare(`UPDATE experience_providers SET lat = 60.3201, lon = 6.6502, kommune = 'Ullensvang', fylke = 'Vestland', poststed = 'Lofthus' WHERE id = ?`).run(FIX);
+        assertTrue(a2a.every((x) => /admin\/gardssalg\/test-provider/.test(x.reason || "")), "blind-8: the reason points the operator at the test-provider route", a2a.map((x) => x.reason));
+
+        // O2c: the place set through POST /admin/gardssalg/test-provider (not a raw
+        // UPDATE) makes the real A2A surface observable — the 20 other producers
+        // (~9 km away) stay outside the probe's 5 km radius.
+        const oppRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
+        const tp = await new Promise<{ status: number; body: any }>((resolve) => {
+          const url = "/admin/gardssalg/test-provider";
+          const req: any = {
+            method: "POST", url, originalUrl: url, path: url, query: {}, headers: { "x-admin-key": KEY },
+            body: { email: OWNER, name: FIX_NAME, slug: FIX_SLUG, kommune: "Ullensvang", lat: 60.3201, lon: 6.6502 },
+            get(n: string) { return (this.headers as Record<string, string>)[n.toLowerCase()]; },
+          };
+          const res: any = {
+            statusCode: 200,
+            status(c: number) { this.statusCode = c; return this; },
+            json(b: any) { resolve({ status: this.statusCode, body: b }); return this; },
+          };
+          oppRouter.handle(req, res, (err?: any) => resolve({ status: 500, body: { error: String(err) } }));
+        });
+        assertEq([tp.status, tp.body?.provider_id, tp.body?.location], [200, FIX, { kommune: "Ullensvang", lat: 60.3201, lon: 6.6502 }], "o2c-1: location set on the fixture via the test-provider route", tp.body);
+        expDb.prepare(`UPDATE experience_providers SET fylke = 'Vestland', poststed = 'Lofthus' WHERE id = ?`).run(FIX);
+        const r3 = await probe.runGardssalgSwitchProbe(FIX, { db, expDb, maxWaitMs: 0 });
+        const a2a3 = r3.rows.filter((x) => x.surface === "a2a");
+        assertTrue(a2a3.length === 6 && a2a3.every((x) => x.result === "PASS"), "o2c-2: with a place, every a2a row (visibility.profile, booking.enabled, booking.pause) is PASS — observed, not IKKE OBSERVERBAR", a2a3.map((x) => [x.key, x.direction, x.result, x.reason]));
+        assertTrue(r3.not_observable === 0 && r3.restored, "o2c-3: nothing IKKE OBSERVERBAR, restored", { no: r3.not_observable });
+        // The same A2A message the probe sends: reached only inside the as-public view.
+        const a2aMod = require("./experiences-a2a") as typeof import("./experiences-a2a");
+        const vis = require("../services/agent-visibility") as typeof import("../services/agent-visibility");
+        const msg = { message: { role: "user", parts: [{ kind: "text", text: "gårdssalg" }, { kind: "data", data: { lat: 60.3201, lng: 6.6502, radius_km: 5 } }] } };
+        const ids = (out: any): string[] => (out?.result?.artifacts ?? []).flatMap((a: any) => (a?.parts ?? []).flatMap((p: any) => (p?.data?.producers ?? []).map((x: any) => x?.id)));
+        assertTrue(!ids(a2aMod.handleExperiencesMessageSend(msg, "pub")).includes(FIX), "o2c-4: a normal public A2A request does not return the hidden test row");
+        assertTrue(!ids(a2aMod.handleExperiencesMessageSend({ message: { role: "user", parts: [{ kind: "text", text: "gårdssalg i Ullensvang" }] } }, "pub2")).includes(FIX), "o2c-5: … nor a public kommune query");
+        assertTrue(ids(vis.runAsPublicView(() => a2aMod.handleExperiencesMessageSend(msg, "asp"))).includes(FIX), "o2c-6: the as-public view (the probe's context) reaches it");
+        assertTrue(!store.searchGardssalgProviders({ lat: 60.3201, lng: 6.6502, radius_km: 5 }, 20, { surface: "a2a" }).some((p: any) => p.id === FIX), "o2c-7: still hidden from the plain a2a search after the probe run");
         expDb.prepare(`DELETE FROM experience_providers WHERE id LIKE 'gs-many%'`).run();
       }
 

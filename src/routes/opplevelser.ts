@@ -16600,6 +16600,26 @@ router.post("/admin/gardssalg-nace-agent-bridge", requireAdmin, (req: Request, r
 //     and the allowlist entry (env changes, not done here).
 //   * mutually exclusive with `claimable`, `claimableEditable` and
 //     `claimEmail` (they write the same columns) → 400, nothing written.
+//
+// ── O2c: optional location (`kommune`, `lat` + `lon`) ───────────────────────
+// The «Mine valg» switch probe reaches the test row on the A2A gårdssalg
+// search only by place (that skill returns at most 20 hits and takes no free
+// text), so a row without coordinates or kommune reads as not observable on
+// `a2a`. These optional fields set the row's existing `kommune`, `lat` and
+// `lon` columns:
+//   * `lat` and `lon` together or not at all, finite JSON numbers, lat in
+//     [-90, 90], lon in [-180, 180]; `kommune` a non-empty trimmed string of
+//     at most 100 characters. Anything else → 400, nothing written.
+//   * Omitted → the stored location is left as it is (never cleared).
+//   * The write is one UPDATE pinned in its own WHERE to the test row
+//     (`org_nr = TEST000000 AND is_test_provider = 1`), with one
+//     gardssalg_content_audit row per changed field (changed_by 'admin',
+//     batch 'admin-test-provider-location').
+//   * With `owner_email` and no apply, the location changes are part of the
+//     dry-run plan and nothing is written.
+//   * The response always carries the stored `location` { kommune, lat, lon }.
+// The row stays catalog_hidden=1 / test_fixture: a location does not make it
+// public; only an admin's as-public request («Vis som offentlig») sees it.
 const TEST_PROVIDER_ORG_NR = "TEST000000";
 const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
 const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
@@ -16720,6 +16740,37 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
     req.query?.apply === "1" ||
     req.query?.apply === "true";
 
+  // O2c location (see the doc comment above TEST_PROVIDER_ORG_NR).
+  const location: { kommune?: string; lat?: number; lon?: number } = {};
+  {
+    const b = req.body ?? {};
+    const hasLat = b.lat !== undefined;
+    const hasLon = b.lon !== undefined;
+    if (hasLat !== hasLon) {
+      res.status(400).json({ error: "'lat' og 'lon' må oppgis sammen (eller ingen av dem). Ingenting er skrevet." });
+      return;
+    }
+    if (hasLat) {
+      const okLat = typeof b.lat === "number" && Number.isFinite(b.lat) && b.lat >= -90 && b.lat <= 90;
+      const okLon = typeof b.lon === "number" && Number.isFinite(b.lon) && b.lon >= -180 && b.lon <= 180;
+      if (!okLat || !okLon) {
+        res.status(400).json({ error: "'lat' må være et tall i [-90, 90] og 'lon' et tall i [-180, 180]. Ingenting er skrevet." });
+        return;
+      }
+      location.lat = b.lat;
+      location.lon = b.lon;
+    }
+    if (b.kommune !== undefined) {
+      const k = typeof b.kommune === "string" ? b.kommune.trim() : "";
+      if (!k || k.length > 100 || /[\x00-\x1f\x7f]/.test(k)) {
+        res.status(400).json({ error: "'kommune' må være en ikke-tom tekst på høyst 100 tegn. Ingenting er skrevet." });
+        return;
+      }
+      location.kommune = k;
+    }
+  }
+  const hasLocation = Object.keys(location).length > 0;
+
   const expDb = getExpDb("experiences");
 
   try {
@@ -16768,7 +16819,7 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
         ? (expDb
             .prepare(
               `SELECT navn, slug, epost, producer_type, catalog_hidden, catalog_hidden_reason, is_test_provider, booking_live,
-                      brreg_verified, content_source, claimed_at
+                      brreg_verified, content_source, claimed_at, kommune, lat, lon
                  FROM experience_providers WHERE id = ?`,
             )
             .get(existing.id) as Record<string, unknown>)
@@ -16777,6 +16828,7 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
         navn: name, slug, producer_type: "test-gardssalg", catalog_hidden: 1,
         catalog_hidden_reason: CATALOG_HIDDEN_REASON_TEST_FIXTURE, is_test_provider: 1, booking_live: 1,
         epost: ownerEmail, brreg_verified: 1, content_source: "manual",
+        ...location,
       };
       const changes = Object.entries(target)
         .filter(([k, v]) => String(current?.[k] ?? null) !== String(v))
@@ -16825,6 +16877,41 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
           WHERE id = @id`
       )
       .run({ id: providerId, navn: name, email, slug, fixtureReason: CATALOG_HIDDEN_REASON_TEST_FIXTURE });
+
+    // ── O2c location (kommune / lat + lon) ──
+    if (hasLocation) {
+      const locTx = expDb.transaction(() => {
+        const prev = expDb
+          .prepare(`SELECT kommune, lat, lon FROM experience_providers WHERE id = ? AND org_nr = ? AND is_test_provider = 1`)
+          .get(providerId, TEST_PROVIDER_ORG_NR) as Record<string, unknown> | undefined;
+        if (!prev) return false;
+        const sets = Object.keys(location).map((k) => `${k} = @${k}`);
+        // Pinned to the test row in its own WHERE: org_nr AND is_test_provider.
+        const r = expDb
+          .prepare(
+            `UPDATE experience_providers SET ${sets.join(", ")}, updated_at = datetime('now')
+              WHERE id = @id AND org_nr = @testOrgNr AND is_test_provider = 1`,
+          )
+          .run({ ...location, id: providerId, testOrgNr: TEST_PROVIDER_ORG_NR });
+        if (r.changes !== 1) return false;
+        const audit = expDb.prepare(
+          `INSERT INTO gardssalg_content_audit (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes)
+           VALUES (?, ?, ?, ?, ?, NULL, 'admin-test-provider-location', 'admin', datetime('now'), 'POST /admin/gardssalg/test-provider location')`,
+        );
+        for (const [field, next] of Object.entries(location)) {
+          const old = prev[field];
+          if (String(old ?? "") !== String(next)) audit.run(crypto.randomUUID(), providerId, field, old == null ? null : String(old), String(next));
+        }
+        return true;
+      });
+      if (!locTx()) {
+        res.status(409).json({
+          error: `Nekter stedsskriv: raden er ikke testprodusenten (org_nr != ${TEST_PROVIDER_ORG_NR} eller is_test_provider != 1).`,
+          provider_id: providerId,
+        });
+        return;
+      }
+    }
 
     // ── O2a owner login (owner_email + apply) ──
     let ownerLogin: Record<string, unknown> | null = null;
@@ -16924,12 +17011,21 @@ router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: 
         `(catalog_hidden=1, is_test_provider=1, booking_live=1, claimable=${claimable}, claimableEditable=${claimableEditable})`
     );
 
+    const storedLocation = expDb
+      .prepare(`SELECT kommune, lat, lon FROM experience_providers WHERE id = ?`)
+      .get(providerId) as { kommune: string | null; lat: number | null; lon: number | null } | undefined;
+
     res.json({
       success: true,
       provider_id: providerId,
       slug,
       booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
       epost: currentEpost,
+      location: {
+        kommune: storedLocation?.kommune ?? null,
+        lat: storedLocation?.lat ?? null,
+        lon: storedLocation?.lon ?? null,
+      },
       catalog_hidden_reason: CATALOG_HIDDEN_REASON_TEST_FIXTURE,
       claimable,
       claimableEditable,
