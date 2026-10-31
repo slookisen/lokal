@@ -350,6 +350,7 @@ function applyPlan(
          SELECT ?, a.id, ?, ?, 'kg', 30, 'NOK', 'in_stock', 'Grønnsaker', 'enrichment', ?, 'admin_producer_confirmed', datetime('now'), datetime('now')
            FROM agents a WHERE a.id = ? AND ${fixturePin("a")}
          ON CONFLICT(agent_id, name_norm) DO UPDATE SET
+           unit = COALESCE(products.unit, 'kg'),
            availability = 'in_stock',
            availability_updated_at = excluded.availability_updated_at,
            availability_source = 'admin_producer_confirmed',
