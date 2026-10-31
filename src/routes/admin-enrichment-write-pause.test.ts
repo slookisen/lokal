@@ -678,6 +678,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // the experiences pause before fetching/applying; its test file sets
         // the pause via the service to prove that.
         "services/experience-description-proposals-job.test.ts",
+        // A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+        // felles-serverjobbramme, step 3n: the org.nr daily job checks the
+        // experiences pause before every apply tick (the services it drives do
+        // not check it themselves).
+        "services/experience-orgnr-job.ts",
         // The description proposals job itself no longer imports the guard:
         // its mechanics moved VERBATIM into services/proposal-file-queue.ts
         // (tillegg 2026-10-15 «4b-forslag»), which checks the experiences

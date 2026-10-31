@@ -71,7 +71,7 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
             evidence_url, verification_status, confidence, canonical_id, content_source,
             enrichment_state, admission_verdict, admission_checked_at)
          VALUES (@id, @provider_id, @title, @slug, 'd', @category, 'low', 100,
-            'https://x.example/', @status, 0.5, @canonical_id, 'scrape', 'enriched',
+            @evidence_url, @status, 0.5, @canonical_id, 'scrape', 'enriched',
             @verdict, @checked)`,
       );
       // P1: in scope via cohort (producer_type set)
@@ -80,9 +80,10 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
       insProvider.run("p2", "Aktivitet To", "https://p2.example", null);
       // P3: in scope only via a mat_drikke experience row
       insProvider.run("p3", "Mat Tre", "https://p3.example", null);
-      const exp = (id: string, provider: string, status: string, checked: string | null, extra: Partial<{ category: string; canonical_id: string | null }> = {}) =>
+      const exp = (id: string, provider: string, status: string, checked: string | null, extra: Partial<{ category: string; canonical_id: string | null; evidence_url: string | null }> = {}) =>
         insExp.run({
           id, provider_id: provider, title: id, slug: id, category: extra.category ?? "aktivitet", status,
+          evidence_url: extra.evidence_url === undefined ? "https://x.example/" : extra.evidence_url,
           canonical_id: extra.canonical_id ?? null, verdict: checked ? "mismatch: x" : null, checked,
         });
       exp("e1a", "p1", "needs_review", "2026-10-01 10:00:00"); // reset
@@ -90,6 +91,10 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
       exp("e1c", "p1", "verified", "2026-10-03 10:00:00"); // not needs_review -> untouched
       exp("e1d", "p1", "needs_review", null); // never checked -> untouched (already first)
       exp("e1e", "p1", "needs_review", "2026-10-04 10:00:00", { canonical_id: "e1a" }); // duplicate -> untouched
+      exp("e1f", "p1", "needs_review", "2026-10-04 11:00:00", { evidence_url: null }); // sweep never picks it -> untouched
+      // P4: in scope, resolved INACTIVE -> never reset
+      insProvider.run("p4", "Bryggeri Fire", "https://p4.example", "bryggeri");
+      exp("e4a", "p4", "needs_review", "2026-10-07 10:00:00");
       exp("e2a", "p2", "needs_review", "2026-10-05 10:00:00"); // out of scope -> untouched
       exp("e3a", "p3", "needs_review", "2026-10-06 10:00:00", { category: "mat_drikke" }); // in scope via category
       const checkedAt = (id: string) => (expDbRaw.prepare(`SELECT admission_checked_at AS c FROM experiences WHERE id = ?`).get(id) as any).c;
@@ -168,7 +173,7 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
           { apply: true, trigger: "cron", now },
           {
             website: fake("w", [
-              { processed: 3, resolved_active: 1, resolved_inactive: 1, planned: [{ provider_id: "p1", outcome: "resolved_active", org_nr: "1" }, { provider_id: "p2", outcome: "resolved_inactive", org_nr: "2" }, { provider_id: "pX", outcome: "no_orgnr_found", org_nr: null }], next_after: "c5" },
+              { processed: 3, resolved_active: 1, resolved_inactive: 1, planned: [{ provider_id: "p1", outcome: "resolved_active", org_nr: "1" }, { provider_id: "p2", outcome: "resolved_inactive", org_nr: "2" }, { provider_id: "p4", outcome: "resolved_inactive", org_nr: "5" }, { provider_id: "pX", outcome: "no_orgnr_found", org_nr: null }], next_after: "c5" },
               { processed: 2, resolved_active: 1, planned: [{ provider_id: "p2", outcome: "resolved_active", org_nr: "3" }], next_after: "c9" },
               { processed: 9 }, // never reached: calls_per_lane default 2
             ], calls),
@@ -183,9 +188,10 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
         assertEq(sweep.getExperienceOrgnrSweepAfter(expDbRaw, "orgnr_from_website"), "c9", "4-5: website cursor advanced to last next_after");
         assertEq(sweep.getExperienceOrgnrSweepAfter(expDbRaw, "orgnr_from_name_kommune"), undefined, "4-6: name cursor persisted as NULL at backlog end");
         assertEq([checkedAt("e1a"), checkedAt("e1b")], [null, null], "4-7: punkt a cleared admission_checked_at for p1's in-scope needs_review rows");
-        assertEq([checkedAt("e1c"), checkedAt("e1e")], ["2026-10-03 10:00:00", "2026-10-04 10:00:00"], "4-8: verified row and duplicate untouched");
+        assertEq([checkedAt("e1c"), checkedAt("e1e"), checkedAt("e1f")], ["2026-10-03 10:00:00", "2026-10-04 10:00:00", "2026-10-04 11:00:00"], "4-8: verified row, duplicate and row without evidence_url untouched");
         assertEq(checkedAt("e2a"), "2026-10-05 10:00:00", "4-9: out-of-scope provider untouched even when resolved active");
         assertEq(checkedAt("e3a"), null, "4-10: provider in scope via mat_drikke row reset");
+        assertEq(checkedAt("e4a"), "2026-10-07 10:00:00", "4-10b: in-scope provider resolved INACTIVE is never reset");
         assertEq(verdictOf("e1a"), "mismatch: x", "4-11: admission_verdict left as-is");
         const audits = auditRows();
         assertEq(audits.map((a) => a.provider_id), ["p1", "p3"], "4-12: one audit row per provider with resets (p1 counted once though resolved twice)");
@@ -225,6 +231,13 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
         const calls2: Call[] = [];
         const r2 = await job.runExperienceOrgnrDaily({ apply: true, trigger: "cron", now: new Date("2026-11-02T04:03:00Z") }, { website: fake("w", [{ processed: 1, next_after: "z1" }, { processed: 1 }], calls2), nameKommune: fake("n", [{}], calls2), pauseBlock: () => (n++ >= 2 ? { error: "paused" } : null), env: envOn, mainDb, expDb });
         assertEq([r2.skipped_reason, calls2.length], ["paused", 1], "6-2: pause between ticks stops the run after the first tick");
+        const lastRow = runsFor().slice(-1)[0];
+        assertEq([r2.envelope_recorded, lastRow.status, String(lastRow.notes).includes("skrivepause")], [true, "partial", true], "6-3: writes made before a mid-run pause still go on the ledger as partial");
+        // tick: a paused run leaves the daily stamp alone
+        const tp = await job.tickExperienceOrgnrDaily({ now: new Date("2026-11-06T04:05:00Z"), lastRunAt: null }, { website: fake("w", [{}], []), nameKommune: fake("n", [{}], []), pauseBlock: () => ({ error: "paused" }), env: envOn, mainDb, expDb });
+        assertEq([tp.report?.skipped_reason, tp.lastRunAt], ["paused", null], "6-4: paused tick returns paused and keeps lastRunAt");
+        const tp2 = await job.tickExperienceOrgnrDaily({ now: new Date("2026-11-06T04:15:00Z"), lastRunAt: null }, { website: fake("w", [{ processed: 1 }], []), nameKommune: fake("n", [{}], []), pauseBlock: noPause, env: envOn, mainDb, expDb });
+        assertTrue(tp2.report !== null && tp2.report.skipped_reason === null, "6-5: after the pause lifts, the next tick in the window runs (stamp was not written)");
       }
 
       // (7) a throwing tick -> lane stops with error, other lane still runs, status partial / failed

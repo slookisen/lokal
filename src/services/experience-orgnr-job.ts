@@ -192,6 +192,7 @@ const RESET_SELECT_SQL =
     WHERE e.provider_id = ?
       AND e.verification_status = 'needs_review'
       AND e.canonical_id IS NULL
+      AND e.evidence_url IS NOT NULL
       AND e.admission_checked_at IS NOT NULL
       AND ${experienceInScopeSql("e.category", "e.provider_id")}
     ORDER BY e.id ASC`;
@@ -314,8 +315,10 @@ export async function runExperienceOrgnrDaily(
   const ticks = deps.website && deps.nameKommune ? { website: deps.website, nameKommune: deps.nameKommune } : await defaultTicks();
   const callsPerLane = resolveExperienceOrgnrJobCallsPerLane(env);
   const seenReset = new Set<string>();
+  let pausedMidRun = false;
 
   for (const lane of ["website", "name_kommune"] as const) {
+    if (pausedMidRun) break;
     const rep = emptyLane(lane);
     lanes.push(rep);
     const tick = lane === "website" ? deps.website ?? ticks.website : deps.nameKommune ?? ticks.nameKommune;
@@ -324,8 +327,8 @@ export async function runExperienceOrgnrDaily(
     while (rep.calls < callsPerLane) {
       if (opts.apply && pauseBlock()) {
         rep.stop_reason = "paused";
-        rep.cursor_end = cursor ?? null;
-        return finish("paused", false);
+        pausedMidRun = true;
+        break;
       }
       let out: ExperienceOrgnrTickResult;
       rep.calls++;
@@ -376,12 +379,17 @@ export async function runExperienceOrgnrDaily(
 
   if (!opts.apply) return finish(null, false);
 
+  // A pause after at least one tick: the writes already made still go on the
+  // ledger (status partial); the run reports `paused` so the daily stamp is
+  // left alone and the next tick in the window resumes from the cursor.
+  const skipped: ExperienceOrgnrSkipReason | null = pausedMidRun ? "paused" : null;
+  if (pausedMidRun && lanes.every((l) => l.calls === 0)) return finish("paused", false);
   const web = lanes[0];
-  const nk = lanes[1];
-  const report = finish(null, false);
+  const nk = lanes[1] ?? emptyLane("name_kommune");
+  const report = finish(skipped, false);
   const callErrors = lanes.flatMap((l) => l.call_errors.map((e) => ({ message: `${l.lane} call ${e.call}: ${e.message}`, meta: { lane: l.lane, call: e.call } })));
   const nothingRan = lanes.every((l) => l.processed === 0 && l.call_errors.length > 0);
-  const status: "completed" | "partial" | "failed" = nothingRan ? "failed" : callErrors.length > 0 ? "partial" : "completed";
+  const status: "completed" | "partial" | "failed" = nothingRan ? "failed" : callErrors.length > 0 || pausedMidRun ? "partial" : "completed";
   const unresolved = Math.max(0, report.totals.processed - report.totals.resolved_active - report.totals.resolved_inactive);
   const claims = [
     { type: "db_state_change" as const, value: report.totals.resolved_active, meta: { kind: "experience_orgnr_resolved_active", website: web.resolved_active, name_kommune: nk.resolved_active, source: "platform_job" } },
@@ -393,7 +401,8 @@ export async function runExperienceOrgnrDaily(
   const notes =
     `3n (orgnr, ingen LLM): nettside ${web.resolved_active} aktive/${web.resolved_inactive} inaktive av ${web.processed} i ${web.calls} kall (stopp: ${web.stop_reason}); ` +
     `navn+kommune ${nk.resolved_active}/${nk.resolved_inactive} av ${nk.processed} i ${nk.calls} kall (stopp: ${nk.stop_reason}); ` +
-    `admission_checked_at nullstilt for ${report.totals.admission_reset_rows} needs_review-rader hos ${resets.length} leverandører; feil ${report.totals.errors}`;
+    `admission_checked_at nullstilt for ${report.totals.admission_reset_rows} needs_review-rader hos ${resets.length} leverandører; feil ${report.totals.errors}` +
+    (pausedMidRun ? "; stanset av skrivepause midt i kjøringen" : "");
   let envelopeRecorded = false;
   try {
     recordRun(
