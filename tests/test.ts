@@ -51464,3 +51464,25 @@ runSerial(async () => {
     failures.push("content-correction-owner-consent: unexpected error: " + String(err?.message || err));
   }
 });
+
+// POST /admin/rfb-website-discovery + the review queue, approve and judge
+// routes (incl. dev-request 2026-10-31 S2: a real judge AVVIS closes the row
+// as 'rejected', an infrastructure failure keeps it 'pending', and a rejection
+// is sticky for the same candidate_url). Own in-memory DB, global fetch stub,
+// admin key and ANTHROPIC_API_KEY, all restored in finally — runSerial, tail
+// position.
+runSerial(async () => {
+  console.log("\n── RFB website discovery + review queue/judge ──");
+  try {
+    const { runAdminRfbWebsiteDiscoveryTests } = require("../src/routes/admin-rfb-website-discovery.test") as
+      typeof import("../src/routes/admin-rfb-website-discovery.test");
+    const r = await runAdminRfbWebsiteDiscoveryTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-rfb-website-discovery: " + f);
+    console.log(`  admin-rfb-website-discovery: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-rfb-website-discovery: unexpected error: " + String(err?.message || err));
+  }
+});
