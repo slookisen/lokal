@@ -28863,15 +28863,18 @@ router.post("/admin/experiences-wrong-content-rate", requireAdmin, async (req: R
 //     advancement reason. Dry-run: reported only.
 //
 // Boilerplate-description nulling: a SEPARATE, independently-counted check —
-// not the judge verdict — for rows whose `description` is a byte-identical
-// copy of the evidence_url page's own visible text (a verbatim harvest-time
-// dump, not the "own summary" the schema's own comment requires — see
-// init-experiences.ts). Evaluated whenever the evidence_url fetch itself
-// succeeded (there must be real page text to compare against), independent of
+// not the judge verdict — for rows whose `description` is a full copy of the
+// evidence_url page's own visible text (`pageText`, compared whitespace-
+// normalized; a verbatim harvest-time dump, not the "own summary" the
+// schema's own comment requires — see init-experiences.ts). A description
+// equal to the page's og:/meta description or a ~300-char summary is the
+// owner's own genuine text and is NEVER nulled. Evaluated whenever the
+// evidence_url fetch itself succeeded (pageText non-null), independent of
 // what the judge verdict on that same row was — a MATCH row's description can
 // still be boilerplate. Apply mode: description is set to NULL (a blank field
 // is honest; a future content-writer can refill it later — this endpoint
-// never fabricates a replacement). Dry-run: reported only, zero writes.
+// never fabricates a replacement). Dry-run: reported only (per-row
+// description_nulled shows the decision), zero writes.
 //
 // `apply` must be exactly boolean `true` to write anything; anything else
 // (absent, false, or any other value) is a dry-run. Response:
@@ -29206,24 +29209,20 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       };
       const pageText: string | null = evidenceOutcome.pageText;
 
-      // Boilerplate-description check: SEPARATE from the judge verdict above,
-      // only meaningful when a real fetch actually happened (currentSummary
-      // !== null) — a fetch failure leaves nothing to compare the stored
-      // description against, so it is never counted as boilerplate on doubt.
-      //
-      // Compares against `evidenceOutcome.currentSummary` — the SAME
-      // extractive summary (meta-description-first, capped ~300 chars) the
-      // content-refresh writer would produce for this page today — NOT
-      // `pageText` (the full, uncapped visible page body). `row.description`
-      // is always meta-derived-or-capped-paragraph, so it can never equal
-      // the full body text; comparing it against `pageText` made this check
-      // dead code (see dev-request diagnosis). `currentSummary` is the
-      // apples-to-apples comparison: "is the stored description still
-      // exactly what this page would currently produce?"
-      const isBoilerplate =
-        row.description !== null &&
-        evidenceOutcome.currentSummary !== null &&
-        row.description === evidenceOutcome.currentSummary;
+      // Boilerplate-description check: SEPARATE from the judge verdict above.
+      // Nulls ONLY a description that is a full copy of the evidence page's
+      // visible text (`pageText`, whitespace-normalized on both sides) — a
+      // verbatim harvest-time body dump. It must NEVER match the page's
+      // og:/meta description or a ~300-char summary of a longer page
+      // (`currentSummary`): that is exactly what a legitimate content-writer
+      // stores, so comparing against it nulled a producer's OWN genuine
+      // description (prod dry-run, row eb215876). `pageText` is null on
+      // fetch failure / dead / parked / empty url, so nothing is ever nulled
+      // on doubt.
+      const normWs = (t: string): string => t.replace(/\s+/g, " ").trim();
+      const normDescription = row.description !== null ? normWs(row.description) : "";
+      const normPageText = pageText !== null ? normWs(pageText) : "";
+      const isBoilerplate = normDescription !== "" && normPageText !== "" && normDescription === normPageText;
       if (isBoilerplate) counts.description_nulled++;
 
       const verdictKey: "match" | "mismatch" | "unresolved" =
@@ -29257,7 +29256,6 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       if (!confidenceOk) missingPromotionReqs.push("confidence");
       const eligibleForPromotion = wasNeedsReview && missingPromotionReqs.length === 0;
 
-      let descriptionNulled = false;
       let promoted = false;
       if (applyMode) {
         if (outcome.verdict === "MISMATCH") {
@@ -29275,9 +29273,11 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         stampExperienceAdmissionVerdict(row.id, promoted ? `promoted: ${outcome.reason}` : `${verdictKey}: ${outcome.reason}`);
         if (isBoilerplate) {
           expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
-          descriptionNulled = true;
         }
       }
+      // Per-row flag mirrors the boilerplate decision in BOTH modes (in apply
+      // mode the UPDATE above ran under exactly this condition).
+      const descriptionNulled = isBoilerplate;
 
       const actionText = promoted
         ? "verification_status -> verified (promoted fra needs_review); admission_verdict stemplet (promoted)"

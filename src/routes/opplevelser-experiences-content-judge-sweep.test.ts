@@ -348,7 +348,9 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
         assertEq(byId.get("cjs-mismatch")?.verdict, "MISMATCH", "cjs-2i: cjs-mismatch verdict MISMATCH");
         assertEq(byId.get("cjs-judgefail")?.verdict, "unresolved", "cjs-2j: judge-failure row is unresolved");
         assertEq(byId.get("cjs-fetchfail")?.verdict, "unresolved", "cjs-2k: fetch-failure row is unresolved");
-        assertEq(byId.get("cjs-boilerplate")?.description_nulled, false, "cjs-2l: dry-run never actually nulls the description");
+        // Per-row description_nulled now reflects the boilerplate DECISION in dry-run too
+        // (previously always false in dry-run; counts/would_be_action said otherwise).
+        assertEq(byId.get("cjs-boilerplate")?.description_nulled, true, "cjs-2l: dry-run per-row description_nulled reflects the decision (full page-text copy); DB write absence is asserted in cjs-2o");
         assertTrue(
           !!byId.get("cjs-boilerplate")?.would_be_action?.includes("boilerplate"),
           "cjs-2m: boilerplate row's would_be_action mentions the description nulling it would do",
@@ -692,84 +694,83 @@ export function runOpplevelserExperiencesContentJudgeSweepTests(
           globalThis.fetch = prevFetchScope;
         }
       }
-      // ── (l) description_nulled bug fix: realistic meta-boilerplate page ──
-      // A production-shaped page: real nav/header/multiple prose paragraphs
-      // UNRELATED to the description, plus a <meta name="description"> tag
-      // whose content is byte-identical to the row's stored `description`
-      // (the short meta-sourced description was never updated as the page
-      // grew other content around it). The OLD `pageText` comparison could
-      // never flag this (pageText is the whole body, nav+paragraphs+footer
-      // included, never equal to the short meta string) — the fix compares
-      // against `currentSummary` (same extractive logic — summarizeAbout()
-      // — that produced `row.description` in the first place).
+      // ── (l) nulling rule: ONLY a full copy of the visible page text ──────
+      // Replaces the earlier currentSummary-based test (cjs-l1..l4), which
+      // asserted that a description equal to the page's <meta name=
+      // "description"> was nulled. That rule nulled producers' OWN genuine
+      // meta-derived descriptions (prod row eb215876), so the owner changed
+      // it: only a verbatim (whitespace-insensitive) copy of the full
+      // visible page body (pageText) is boilerplate.
       {
         const metaDescText = "Hagevandring for hele familien i vakker natur.";
-        const realisticHtml =
+        const richHtml =
           `<html><head><meta name="description" content="${metaDescText}"></head>` +
           `<body><header><nav><a href="/">Hjem</a><a href="/om">Om oss</a></nav></header>` +
           `<main><h1>Gårdsbesøk hos Nordgården</h1>` +
           `<p>Velkommen til oss! Vi tilbyr mange aktiviteter for hele familien gjennom hele året.</p>` +
           `<p>Book din tur i dag og opplev gården på nært hold med dyr og natur.</p></main>` +
           `<footer>Kontakt oss for mer info.</footer></body></html>`;
+        const dumpHtml =
+          `<html><body><h1>Ostehuset</h1><p>Vi lager ost  av\n  lokal melk.</p><p>Besøk oss på gården.</p></body></html>`;
+        // Verbatim dump of the visible body, but with DIFFERENT whitespace.
+        const dumpDescription = "Ostehuset   Vi lager ost av lokal melk.\n\nBesøk oss på gården.";
+        const wsPages: Record<string, string> = {
+          "https://good.no/nordgaarden": richHtml,
+          "https://good.no/ostehuset": dumpHtml,
+        };
         insertExperience.run({
-          id: "cjs-metaboilerplate", title: "Nordgården aktivitetsdag", slug: "cjs-metaboilerplate",
+          id: "cjs-metaown", title: "Nordgården aktivitetsdag", slug: "cjs-metaown",
           description: metaDescText, category: "mat_drikke", price_band: "standard", price_from: 400,
           evidence_url: "https://good.no/nordgaarden", verification_status: "verified", confidence: "high", canonical_id: null,
         });
+        insertExperience.run({
+          id: "cjs-fulldump", title: "Ostehuset", slug: "cjs-fulldump",
+          description: dumpDescription, category: "mat_drikke", price_band: "standard", price_from: 400,
+          evidence_url: "https://good.no/ostehuset", verification_status: "verified", confidence: "high", canonical_id: null,
+        });
 
-        const prevFetchMeta = globalThis.fetch;
-        globalThis.fetch = (async (url: any, init: any) => {
+        const prevFetchWs = globalThis.fetch;
+        globalThis.fetch = (async (url: any) => {
           const urlStr = String(url);
-          if (urlStr === "https://good.no/nordgaarden") {
-            return mkPageResponse(realisticHtml, urlStr);
-          }
-          if (urlStr === "https://api.anthropic.com/v1/messages") {
-            return mkAnthropicResponse("MATCH\nStemmer med kilden.");
-          }
-          throw new Error("meta-boilerplate test: unexpected fetch URL: " + urlStr);
+          if (wsPages[urlStr]) return mkPageResponse(wsPages[urlStr], urlStr);
+          if (urlStr === "https://api.anthropic.com/v1/messages") return mkAnthropicResponse("MATCH\nStemmer med kilden.");
+          throw new Error("nulling-rule test: unexpected fetch URL: " + urlStr);
         }) as unknown as typeof fetch;
 
         try {
-          // cjs-metaboilerplate is the sole never-checked row left at this
-          // point (every earlier row in this file has already been swept at
-          // least once) — never-checked-first ordering + limit:1 guarantees
-          // this call scans EXACTLY it, so no other fetch URLs are needed.
-          const beforeMeta = snapshot("cjs-metaboilerplate")!;
+          // Each row is the sole never-checked row at its turn (earlier rows
+          // are stamped by earlier applies), so limit:1 scans exactly it.
+          // 1) description == meta description of a longer page -> NOT nulled.
+          const beforeMeta = snapshot("cjs-metaown")!;
           const rDry = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { limit: 1 } });
-          const byIdDry = new Map<string, any>((rDry.body.results as any[]).map((x) => [x.id, x]));
-          // Same convention as cjs-2l/cjs-2m above (the pre-existing
-          // cjs-boilerplate fixture): a dry-run row's per-row
-          // `description_nulled` field reflects a WRITE that happened
-          // (always false in dry-run, for every row, boilerplate or not —
-          // see `descriptionNulled` only ever being set inside the
-          // `applyMode` branch), so the boilerplate DETECTION itself in
-          // dry-run is asserted via `counts.description_nulled` (incremented
-          // unconditionally, before the apply gate) and `would_be_action`
-          // naming it — not the per-row write-outcome field.
-          assertEq(
-            rDry.body.counts.description_nulled,
-            1,
-            "cjs-l1: realistic meta-boilerplate page (nav/header/paragraphs + matching <meta name=\"description\">) -> counts.description_nulled:1 in dry-run (boilerplate detected even though nothing is written yet)",
-          );
-          assertEq(
-            byIdDry.get("cjs-metaboilerplate")?.description_nulled,
-            false,
-            "cjs-l1b: dry-run's per-row description_nulled stays false (no write happened), same convention as cjs-boilerplate's cjs-2l",
-          );
-          assertTrue(
-            !!byIdDry.get("cjs-metaboilerplate")?.would_be_action?.includes("boilerplate"),
-            "cjs-l1c: would_be_action mentions the description nulling it would do, same convention as cjs-boilerplate's cjs-2m",
-          );
-          const afterDryMeta = snapshot("cjs-metaboilerplate")!;
-          assertEq(afterDryMeta, beforeMeta, "cjs-l2: dry-run leaves the row's description column (and everything else) untouched");
-
+          const dryMeta = (rDry.body.results as any[]).find((x) => x.id === "cjs-metaown");
+          assertEq(rDry.body.counts.description_nulled, 0, "cjs-l1: dry-run counts.description_nulled 0 for a description equal to the page's meta description");
+          assertEq(dryMeta?.description_nulled, false, "cjs-l1b: dry-run per-row description_nulled false for the owner's own meta description");
+          assertTrue(!String(dryMeta?.would_be_action ?? "").includes("boilerplate"), "cjs-l1c: would_be_action does not mention description nulling");
+          assertEq(snapshot("cjs-metaown")!, beforeMeta, "cjs-l2: dry-run leaves the row untouched");
           const rApply = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true, limit: 1 } });
-          const byIdApply = new Map<string, any>((rApply.body.results as any[]).map((x) => [x.id, x]));
-          assertEq(byIdApply.get("cjs-metaboilerplate")?.description_nulled, true, "cjs-l3: apply-mode response reports description_nulled:true");
-          const afterApplyMeta = snapshot("cjs-metaboilerplate")!;
-          assertEq(afterApplyMeta.description, null, "cjs-l4: apply-mode actually NULLs the description column for the realistic meta-boilerplate row");
+          const applyMeta = (rApply.body.results as any[]).find((x) => x.id === "cjs-metaown");
+          assertEq(applyMeta?.description_nulled, false, "cjs-l3: apply reports description_nulled:false for the meta-description row");
+          assertEq(snapshot("cjs-metaown")!.description, metaDescText, "cjs-l4: apply leaves the owner's meta-derived description unchanged in DB");
+
+          // 2) description == full visible text (different whitespace) -> nulled.
+          const beforeDump = snapshot("cjs-fulldump")!;
+          const rDry2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { limit: 1 } });
+          const dryDump = (rDry2.body.results as any[]).find((x) => x.id === "cjs-fulldump");
+          assertEq(rDry2.body.counts.description_nulled, 1, "cjs-l5: dry-run counts.description_nulled 1 for a full page-text copy");
+          assertEq(dryDump?.description_nulled, true, "cjs-l6: dry-run per-row description_nulled true (decision reported without a write)");
+          assertTrue(String(dryDump?.would_be_action ?? "").includes("boilerplate"), "cjs-l7: would_be_action mentions the nulling");
+          assertEq(snapshot("cjs-fulldump")!, beforeDump, "cjs-l8: dry-run performed zero DB writes");
+          const rApply2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { apply: true, limit: 1 } });
+          const applyDump = (rApply2.body.results as any[]).find((x) => x.id === "cjs-fulldump");
+          assertEq(applyDump?.description_nulled, true, "cjs-l9: apply reports description_nulled:true");
+          assertEq(snapshot("cjs-fulldump")!.description, null, "cjs-l10: apply NULLs the full-page-copy description in DB");
+
+          // 3) failed/unresolved fetch -> pageText null -> never nulled.
+          assertEq((dryRunBody1.results as any[]).find((x) => x.id === "cjs-fetchfail")?.description_nulled, false, "cjs-l11: fetch-failure row never reported as description_nulled");
+          assertEq(snapshot("cjs-fetchfail")!.description, "En fisketur.", "cjs-l12: fetch-failure row's description untouched after apply");
         } finally {
-          globalThis.fetch = prevFetchMeta;
+          globalThis.fetch = prevFetchWs;
         }
       }
     } catch (err: any) {
