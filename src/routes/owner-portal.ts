@@ -544,11 +544,35 @@ function normalizeOwnerProfileValue(dbField: string, value: unknown): string | n
   return s;
 }
 
+// T0d: agent_knowledge.opening_hours is a JSON column — knowledge-service
+// reads it with JSON.parse, and the strict read of its write path threw on
+// the raw «Åpningstider» text this portal used to store. The portal now
+// stores the owner's text as a JSON string (JSON.stringify(text)), the text
+// variant knowledge-service already reads. Older rows hold the raw text;
+// both read back as the same text here.
+function ownerProfileStoredText(dbField: string, stored: unknown): unknown {
+  if (dbField !== "opening_hours" || typeof stored !== "string") return stored;
+  try {
+    const parsed = JSON.parse(stored);
+    return typeof parsed === "string" ? parsed : stored;
+  } catch {
+    return stored; // a raw-text row from before T0d
+  }
+}
+
+/** The value the owner wrote, as the column stores it (opening hours as JSON text). */
+function ownerProfileStoredValue(dbField: string, value: unknown): unknown {
+  if (dbField !== "opening_hours") return value;
+  const text = normalizeOwnerProfileValue(dbField, value);
+  // Empty stays as it was posted (never locked, never shown as "[]").
+  return text === null ? value : JSON.stringify(text);
+}
+
 /** The stored value as the portal input shows it ('[]' opening hours → ""). */
 function ownerProfileDisplayValue(dbField: string, stored: unknown): string {
   if (stored == null) return "";
   if (dbField === "opening_hours" && normalizeOwnerProfileValue(dbField, stored) === null) return "";
-  return String(stored);
+  return String(ownerProfileStoredText(dbField, stored));
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -682,12 +706,14 @@ router.post("/api/agents/:id/update-profile", (req: Request, res: Response) => {
 
       // T3: an unchanged field is a no-op — no write, no audit row, no lock;
       // its existing curated_fields entry (if any) stays exactly as it is.
-      if (normalizeOwnerProfileValue(dbField, newValue) === normalizeOwnerProfileValue(dbField, (knowledge as any)[dbField])) {
+      // T0d: opening hours compare as text, whether stored as JSON or raw.
+      const storedText = ownerProfileStoredText(dbField, (knowledge as any)[dbField]);
+      if (normalizeOwnerProfileValue(dbField, newValue) === normalizeOwnerProfileValue(dbField, storedText)) {
         continue;
       }
 
-      const oldValue = (knowledge as any)[dbField] || null;
-      updatedFields[dbField] = newValue;
+      const oldValue = storedText || null;
+      updatedFields[dbField] = ownerProfileStoredValue(dbField, newValue);
 
       // Update curated_fields — never for empty opening hours ('' / '[]'):
       // the field goes back to "no hours" and an existing lock is left as is.
@@ -845,7 +871,7 @@ router.get("/api/agents/:id/profile", (req: Request, res: Response) => {
 
     for (const field of EDITABLE_FIELDS) {
       const dbField = field === "description" ? "about" : field;
-      const value = (knowledge as any)[dbField] || null;
+      const value = ownerProfileStoredText(dbField, (knowledge as any)[dbField]) || null;
       const curatedInfo = curatedFields[dbField] || {};
 
       const csOverride = isOverridableCsLock(curatedInfo);

@@ -1723,6 +1723,24 @@ class KnowledgeService {
     }
   }
 
+  /**
+   * agent_knowledge.opening_hours, in both modes (slice T0d). The owner
+   * portal stored the «Åpningstider» text as it was typed (e.g.
+   * "Lørdag 10–14"), not as JSON, so the strict read of the write path threw
+   * on every non-owner write for that profile, and lenient readers dropped
+   * the owner's hours. Text that does not parse is read as the text variant
+   * openingHoursField already knows — the same value JSON.stringify(text)
+   * reads as. Only this column: every other column parses as jsonColumn says.
+   */
+  private openingHoursColumn(text: unknown): OpeningHour[] {
+    if (!text) return [];
+    try {
+      return JSON.parse(text as string);
+    } catch {
+      return String(text) as unknown as OpeningHour[];
+    }
+  }
+
   private rowToKnowledge(row: any, mode: "strict" | "lenient"): AgentKnowledge {
     const json = <T>(column: string, fallback: T): T =>
       this.jsonColumn(row.agent_id, `agent_knowledge.${column}`, row[column], fallback, mode);
@@ -1733,7 +1751,7 @@ class KnowledgeService {
       website: row.website,
       phone: row.phone,
       email: row.email,
-      openingHours: json("opening_hours", []),
+      openingHours: this.openingHoursColumn(row.opening_hours),
       products: json("products", []),
       about: row.about,
       specialties: json("specialties", []),
