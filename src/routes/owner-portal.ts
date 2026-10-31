@@ -1953,7 +1953,12 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
 
       <script>
       (function () {
+        // T0c: this script sits inside a TS template literal, which drops the
+        // backslash of an escaped double quote. JS strings that hold HTML
+        // attributes therefore use single quotes, so the emitted script stays
+        // valid (owner-pages-inline-script-syntax-t0c.test.ts compiles it).
         // Load my-audit feed
+        function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
         if (window.fetch) {
           fetch("/api/agents/${encodeURIComponent(agent.id)}/my-audit?limit=20", { credentials: "same-origin" })
             .then(function (r) { return r.json(); })
@@ -1961,25 +1966,28 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
               var ul = document.getElementById("ep-audit");
               if (!ul) return;
               if (!j || !j.success || !j.audits || j.audits.length === 0) {
-                ul.innerHTML = "<li class=\"ep-audit-item ep-audit-meta\">Ingen endringer ennå.</li>";
+                ul.innerHTML = '<li class="ep-audit-item ep-audit-meta">Ingen endringer ennå.</li>';
                 return;
               }
               ul.innerHTML = j.audits.map(function (a) {
                 var when = new Date(a.changed_at).toLocaleString("nb-NO");
                 var who = a.changed_by === "owner" ? "Du" : (a.changed_by === "admin" ? "Support" : "System");
-                var oldV = a.old_value == null ? "(tomt)" : a.old_value;
-                var newV = a.new_value == null ? "(tomt)" : a.new_value;
-                function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
-                return "<li class=\"ep-audit-item\"><strong>" + esc(a.field_name) + "</strong> endret av " + esc(who) + "<div class=\"ep-audit-meta\">" + esc(when) + " · \"" + esc(oldV).slice(0, 80) + "\" → \"" + esc(newV).slice(0, 80) + "\"</div></li>";
+                var oldV = a.old_value == null ? "(tomt)" : String(a.old_value);
+                var newV = a.new_value == null ? "(tomt)" : String(a.new_value);
+                return '<li class="ep-audit-item"><strong>' + esc(a.field_name) + '</strong> endret av ' + esc(who) +
+                  '<div class="ep-audit-meta">' + esc(when) + ' · «' + esc(oldV.slice(0, 80)) + '» → «' + esc(newV.slice(0, 80)) + '»</div></li>';
               }).join("");
             })
             .catch(function () {
               var ul = document.getElementById("ep-audit");
-              if (ul) ul.innerHTML = "<li class=\"ep-audit-item ep-audit-meta\">Kunne ikke laste endringslogg.</li>";
+              if (ul) ul.innerHTML = '<li class="ep-audit-item ep-audit-meta">Kunne ikke laste endringslogg.</li>';
             });
         }
 
-        // Progressive enhancement for save
+        // Progressive enhancement for save. Same server logic either way:
+        // POST /eier/:id/save (no JS) forwards to update-profile. If the fetch
+        // itself fails (offline, non-JSON answer), fall back to the plain form
+        // POST; form.submit() does not fire this handler again.
         var form = document.getElementById("ep-profile-form");
         if (form && window.fetch) {
           form.addEventListener("submit", function (ev) {
@@ -2006,7 +2014,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
                   window.location.href = base + "?status=error";
                 }
               }).catch(function () {
-                if (btn) { btn.disabled = false; btn.textContent = "Lagre alle endringer"; }
+                form.submit();
               });
           });
         }
