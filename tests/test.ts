@@ -44689,6 +44689,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 2: «Klikk fra
+  // AI-svar», people who come to a profile page from an AI answer, stored as
+  // daily sums per profile x AI. Swaps getDb() and the dental / experiences db
+  // handles (restored in finally), so serial.
+  console.log("\n── Klikk fra AI-svar S2: clicks from AI answers per profile ──");
+  try {
+    const { runProfileAiClicksTests } = require("../src/services/profile-ai-clicks.test") as
+      typeof import("../src/services/profile-ai-clicks.test");
+    const r = await runProfileAiClicksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-ai-clicks: " + f);
+    console.log(`  profile-ai-clicks: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
   // logged from /sok on all three sites, the public search API, and counted
   // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and

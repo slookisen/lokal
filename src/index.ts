@@ -4,6 +4,7 @@ import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
+import { flushAiClicks, startAiClicksFlusher } from "./services/profile-ai-clicks";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
@@ -1599,6 +1600,9 @@ app.listen(Number(PORT), HOST, async () => {
   // in-memory delivery counts are written as daily sums every minute and on
   // shutdown (below).
   startAiDeliveriesFlusher();
+  // «Klikk fra AI-svar» (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil,
+  // slice 2): the same minute flush + shutdown flush for clicks from AI answers.
+  startAiClicksFlusher();
 
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
@@ -2675,7 +2679,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !dispatchRoutinesConfigured) {
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
-process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
+process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
+process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
 
 export default app;
