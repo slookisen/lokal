@@ -13,6 +13,7 @@ import {
   type TranslationTargetLang,
 } from "../services/profile-translations";
 import crypto from "crypto";
+import { tokenLogLabel, emailLogLabel } from "../utils/log-label";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
@@ -122,7 +123,7 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     const { id } = req.params;
     const { email } = req.body;
 
-    console.log(`[owner-portal] POST request-magic-link for agent ${id}, email: ${email}`);
+    console.log(`[owner-portal] POST request-magic-link for agent ${id}, email: ${emailLogLabel(email)}`);
 
     // Validate input
     if (!email || typeof email !== "string" || !email.includes("@")) {
@@ -149,7 +150,7 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
       agentKnowledge.email.toLowerCase() !== email.toLowerCase()
     ) {
       console.log(
-        `[owner-portal] Email mismatch for ${id}: provided=${email}, registered=${agentKnowledge?.email || "none"}`
+        `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
       );
       return res.status(404).json({
         success: false,
@@ -217,7 +218,7 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     });
 
     if (!emailResult.success) {
-      console.error(`[owner-portal] Failed to send magic link email to ${email}`);
+      console.error(`[owner-portal] Failed to send magic link email to ${emailLogLabel(email)}`);
       return res.status(500).json({
         success: false,
         error: "email_send_failed",
@@ -226,7 +227,7 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
     }
 
     // 6. Success
-    console.log(`[owner-portal] Magic link sent to ${email}`);
+    console.log(`[owner-portal] Magic link sent to ${emailLogLabel(email)}`);
     return res.json({
       success: true,
       message: "Sjekk e-posten din for innloggings-link.",
@@ -253,7 +254,9 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
   try {
     const { token } = req.query;
 
-    console.log(`[owner-portal] GET magic-link-verify, token=${token}`);
+    // Never log the token itself: it becomes the 7-day rfb_owner_session
+    // cookie and is accepted as a Bearer token (T1, eierportal bølge 0).
+    console.log(`[owner-portal] GET magic-link-verify, token=${tokenLogLabel(token)}`);
 
     if (!token || typeof token !== "string") {
       // FIX 2026-05-10: /min-profil/feil does not exist. Send user to a usable page.
@@ -271,7 +274,7 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
       .get(token) as any;
 
     if (!magicLink) {
-      console.log(`[owner-portal] Invalid or expired token: ${token}`);
+      console.log(`[owner-portal] Invalid or expired token: ${tokenLogLabel(token)}`);
       // FIX 2026-05-10: /min-profil/feil does not exist; send user to a usable page.
       return res.redirect(302, "/?error=invalid_token");
     }

@@ -6453,6 +6453,116 @@ const _m2Promise = (async function runOwnerPortalTests() {
       }
     }
 
+    // ── T1 (dev-request "eierportal bølge 0"): magic-link tokens and owner
+    //    e-mail addresses must never reach the logs in clear text. The verify
+    //    token becomes the 7-day rfb_owner_session cookie and is accepted as
+    //    a Bearer token, so a logged token = a stolen owner session. ────────
+    {
+      const crypto = require("crypto") as typeof import("crypto");
+      const logLabelMod = require("../src/utils/log-label") as typeof import("../src/utils/log-label");
+      // Capture console output (still forwarded, so concurrent suites keep
+      // their own output) for the duration of fn().
+      async function captureLogs(fn: () => Promise<void>): Promise<string> {
+        const lines: string[] = [];
+        const orig = { log: console.log, warn: console.warn, error: console.error, info: console.info };
+        const wrap = (k: keyof typeof orig) => (...args: unknown[]) => {
+          lines.push(args.map((a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })())).join(" "));
+          (orig[k] as (...a: unknown[]) => void).apply(console, args);
+        };
+        console.log = wrap("log"); console.warn = wrap("warn"); console.error = wrap("error"); console.info = wrap("info");
+        try { await fn(); } finally {
+          console.log = orig.log; console.warn = orig.warn; console.error = orig.error; console.info = orig.info;
+        }
+        return lines.join("\n");
+      }
+
+      const T1_AGENT_ID = "m2-t1-logredact-agent";
+      const T1_EMAIL = "Eier.T1@Logredact-Gard.example.no";
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agents (id, name, slug, description, provider, contact_email, url, role, api_key) VALUES (?, ?, ?, 'test', 'test', ?, 'https://example.no', 'producer', 'k-t1')"
+      ).run(T1_AGENT_ID, "M2 T1 Gård", "m2-t1-gaard", T1_EMAIL);
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agent_knowledge (agent_id, email, field_provenance, verification_status, enrichment_status) VALUES (?, ?, '{}', 'unverified', 'partial')"
+      ).run(T1_AGENT_ID, T1_EMAIL);
+
+      // t1-1/2: valid token → redirected to the portal, logs carry only the hash label.
+      const validToken = crypto.randomBytes(32).toString("hex");
+      portalDb.prepare(
+        `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+         VALUES (?, ?, ?, ?, 0, ?, datetime('now', '+1 day'))`
+      ).run("ml_t1_valid", T1_EMAIL, validToken, T1_AGENT_ID, new Date().toISOString());
+      let validResp: { status: number; headers: any; body: string } = { status: 0, headers: {}, body: "" };
+      const validLogs = await captureLogs(async () => {
+        validResp = await req("GET", `/magic-link-verify?token=${validToken}`);
+      });
+      assertEq(validResp.status, 302, "m2-t1-1: valid magic-link token still redirects (behaviour unchanged)");
+      assertTrue(
+        String(validResp.headers.location || "") === `/eier/${T1_AGENT_ID}/portal`,
+        "m2-t1-1: valid token redirects to the owner portal"
+      );
+      assertTrue(!validLogs.includes(validToken), "m2-t1-2: valid magic-link token never appears in logs");
+      assertTrue(
+        validLogs.includes(logLabelMod.tokenLogLabel(validToken)),
+        "m2-t1-2: logs carry the token's hash label instead"
+      );
+
+      // t1-3: invalid/unknown token → same, on the 'Invalid or expired' path.
+      const invalidToken = crypto.randomBytes(32).toString("hex");
+      let invalidResp: { status: number; headers: any; body: string } = { status: 0, headers: {}, body: "" };
+      const invalidLogs = await captureLogs(async () => {
+        invalidResp = await req("GET", `/magic-link-verify?token=${invalidToken}`);
+      });
+      assertEq(invalidResp.status, 302, "m2-t1-3: invalid token still redirects to /?error=invalid_token");
+      assertTrue(!invalidLogs.includes(invalidToken), "m2-t1-3: invalid magic-link token never appears in logs");
+      assertTrue(
+        invalidLogs.includes(`Invalid or expired token: ${logLabelMod.tokenLogLabel(invalidToken)}`),
+        "m2-t1-3: invalid-token log line carries the hash label"
+      );
+
+      // t1-4/5/6: request-magic-link (success, mismatch, failed send) never logs the address.
+      const emailSvcT1 = require("../src/services/email-service") as typeof import("../src/services/email-service");
+      const origSendT1 = emailSvcT1.emailService.sendEmail.bind(emailSvcT1.emailService);
+      let sendOk = true;
+      (emailSvcT1.emailService as any).sendEmail = async () => (sendOk ? { success: true, messageId: "mock-t1" } : { success: false, error: "mock-fail" });
+      const statuses: number[] = [];
+      const wrongEmail = "someone.else@other-t1.example.no";
+      let emailLogs = "";
+      try {
+        const hdrs = { "Content-Type": "application/json" };
+        emailLogs = await captureLogs(async () => {
+          statuses.push((await req("POST", `/api/agents/${T1_AGENT_ID}/request-magic-link`, { headers: hdrs, body: JSON.stringify({ email: T1_EMAIL }), expectOk: true })).status);
+          statuses.push((await req("POST", `/api/agents/${T1_AGENT_ID}/request-magic-link`, { headers: hdrs, body: JSON.stringify({ email: wrongEmail }) })).status);
+          sendOk = false;
+          statuses.push((await req("POST", `/api/agents/${T1_AGENT_ID}/request-magic-link`, { headers: hdrs, body: JSON.stringify({ email: T1_EMAIL }) })).status);
+        });
+      } finally {
+        (emailSvcT1.emailService as any).sendEmail = origSendT1;
+      }
+      assertEq(statuses.join(","), "200,404,500", "m2-t1-4: request-magic-link success/mismatch/send-fail statuses unchanged");
+      const lowerLogs = emailLogs.toLowerCase();
+      assertTrue(
+        !lowerLogs.includes(T1_EMAIL.toLowerCase()) && !lowerLogs.includes(wrongEmail.toLowerCase()),
+        "m2-t1-5: owner e-mail address (any casing) never appears in request-magic-link logs"
+      );
+      assertTrue(
+        emailLogs.includes(logLabelMod.emailLogLabel(T1_EMAIL)) && emailLogs.includes(logLabelMod.emailLogLabel(wrongEmail)),
+        "m2-t1-6: request-magic-link logs carry the e-mail hash label instead"
+      );
+      assertEq(
+        logLabelMod.emailLogLabel(T1_EMAIL), logLabelMod.emailLogLabel(T1_EMAIL.toLowerCase()),
+        "m2-t1-6: e-mail label is case-insensitive"
+      );
+
+      // t1-7: cheap source scan — owner-portal must not interpolate a raw
+      // token/e-mail straight into a console.* template literal again.
+      const opSrc = fs2.readFileSync("src/routes/owner-portal.ts", "utf8");
+      // Matches the template literal even when the call spans several lines.
+      const rawLogHits = opSrc.match(/console\.(log|warn|error|info|debug)\(\s*`[^`]*\$\{\s*(token|email)\s*\}[^`]*`/g) || [];
+      assertEq(rawLogHits.length, 0, "m2-t1-7: owner-portal.ts has no console.* line logging ${token} / ${email} directly");
+      const activationMod = require("../src/services/order-activation-link") as typeof import("../src/services/order-activation-link");
+      assertEq(activationMod.tokenLogLabel("abc"), logLabelMod.tokenLogLabel("abc"), "m2-t1-8: order-activation-link still re-exports the shared tokenLogLabel");
+    }
+
     // E1.4 — Magic-link email body template contains agent name + 7-day expiry.
     // Tested directly against the email-service helper (avoids HTTP rate-limit + SMTP).
     {
