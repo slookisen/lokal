@@ -6371,6 +6371,26 @@ function initSchema(db: Database.Database): void {
     console.error("Migration product_import_candidates failed:", err);
   }
 
+  // ─── product_import outreach pre-extraction (Skive 3b-1) ────────────────
+  // POST /admin/product-import/prepare (flag PRODUCT_IMPORT_OUTREACH_ENABLED)
+  // logs one product_import_runs row per recipient with mode
+  // 'outreach_prepare', the campaign slug and the prepare batch id; its
+  // candidates carry the diff kind (new / changed / unchanged) and the old
+  // price. Status 'eligible' / 'unchanged' / 'rejected' — never 'pending',
+  // so the owner preview/publish (mode 'owner_fetch') never sees them.
+  // Additive, nullable, idempotent.
+  try {
+    const addCols = (table: string, cols: Array<[string, string]>) => {
+      const have = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
+      for (const [col, type] of cols) if (!have.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    };
+    addCols("product_import_runs", [["campaign", "TEXT"], ["prepare_id", "TEXT"]]);
+    addCols("product_import_candidates", [["diff_kind", "TEXT"], ["old_price_nok", "REAL"]]);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_import_runs_campaign ON product_import_runs(campaign, mode, created_at)`);
+  } catch (err) {
+    console.error("Migration product_import outreach columns failed:", err);
+  }
+
   // ─── S3 of 2026-10-09-rfb-grunnmur-wal-backup-fts-spillbok ──────────────
   // agents_name_fts (FTS5 trigram over agents.name) + its three sync triggers,
   // populated here only when empty or out of step with agents (one INSERT …

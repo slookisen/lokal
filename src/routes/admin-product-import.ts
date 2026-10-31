@@ -12,6 +12,12 @@
 // route did not exist) and the X-Admin-Key check every admin route uses.
 // Writes only product_import_runs / product_import_run_results — never
 // agent_knowledge or products. Nothing is published.
+//
+// Skive 3b-1 (outreach pre-extraction, flag PRODUCT_IMPORT_OUTREACH_ENABLED,
+// own 404 when off; same X-Admin-Key check):
+//   POST /admin/product-import/prepare   body {agentIds[], campaign} → 202 {prepare_id, …}
+//   GET  /admin/product-import/prepare/:campaign[?format=md] → read-only report
+// Stages candidates in product_import_candidates only; never publishes, never sends e-mail.
 
 import { Router, Request, Response } from "express";
 import {
@@ -21,6 +27,15 @@ import {
   productImportDryRunEnabled,
   startProductImportDryRun,
 } from "../services/product-import/dry-run";
+import {
+  activeOutreachPrepareId,
+  getOutreachReport,
+  OUTREACH_CAMPAIGN_RE,
+  productImportOutreachEnabled,
+  renderOutreachReportMd,
+  startOutreachPrepare,
+  validatePrepareInput,
+} from "../services/product-import/outreach-prepare";
 
 const router = Router();
 
@@ -98,6 +113,39 @@ router.get("/dry-run/:id", (req: Request, res: Response) => {
   const run = getDryRun(String(req.params.id), { includeCandidates: String(req.query?.candidates ?? "1") !== "0" });
   if (!run) return res.status(404).json({ error: "Fant ikke kjøringen" });
   return res.json(run);
+});
+
+function requireOutreachFlag(res: Response): boolean {
+  if (productImportOutreachEnabled()) return true;
+  res.status(404).json({ error: "Not found" });
+  return false;
+}
+
+router.post("/prepare", (req: Request, res: Response) => {
+  if (!requireOutreachFlag(res) || !requireAdmin(req, res)) return;
+  const input = validatePrepareInput(req.body);
+  if (!input.ok) return res.status(400).json({ error: input.error, message: input.message });
+  const active = activeOutreachPrepareId();
+  if (active) return res.status(409).json({ error: "Et forhåndsuttrekk pågår allerede", prepare_id: active });
+  const started = startOutreachPrepare(input.agentIds, input.campaign);
+  return res.status(202).json({
+    ...started,
+    mode: "outreach_prepare",
+    status: "running",
+    poll: `/admin/product-import/prepare/${started.campaign}`,
+  });
+});
+
+router.get("/prepare/:campaign", (req: Request, res: Response) => {
+  if (!requireOutreachFlag(res) || !requireAdmin(req, res)) return;
+  const campaign = String(req.params.campaign ?? "");
+  if (!OUTREACH_CAMPAIGN_RE.test(campaign)) return res.status(400).json({ error: "invalid_campaign" });
+  const report = getOutreachReport(campaign);
+  if (!report) return res.status(404).json({ error: "Fant ingen forhåndsuttrekk for kampanjen" });
+  if (String(req.query?.format ?? "") === "md") {
+    return res.type("text/markdown; charset=utf-8").send(renderOutreachReportMd(report));
+  }
+  return res.json(report);
 });
 
 export default router;
