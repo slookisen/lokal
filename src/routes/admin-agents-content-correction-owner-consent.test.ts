@@ -23,6 +23,13 @@
  * consent on a NOT owner-locked row is ignored (plain `written`, no
  * crm_actions); a later outbound (our confirmation) does not void consent.
  *
+ * S2e-2: the earlier sent outbound may be in ANY thread with the same
+ * contact (replies are often imported as a new thread), at most 30 days
+ * before the reply; crm_actions stays on the reply's thread and records
+ * basis_outbound_message_id. Outbound only to another contact of the agent,
+ * older than 30 days, after the reply, or none at all -> invalid_consent;
+ * exactly 30 days with mixed ISO/SQLite timestamp formats -> valid.
+ *
  * Same harness as admin-agents-content-quality.test.ts (better-sqlite3
  * ":memory:" + __initSchemaForTesting, the route's own DB seam,
  * router.handle() with a fake req/res — no HTTP). Mutates no shared global.
@@ -158,17 +165,23 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       msg("m-a-in", "th-a", "in", null, "2026-10-29 10:00:00", "sent", "  A@Example.NO ");
       // Our confirmation reply AFTER the «ja» — must not void the consent.
       msg("m-a-out2", "th-a", "out", "2026-10-29T11:00:00.000Z", "2026-10-29 11:00:00", "sent");
-      // Inbound that came BEFORE any outbound in its own thread.
-      thread("th-a2", "cc-a");
+      // The no-earlier-outbound cases below each get their OWN contact of oc-a:
+      // since S2e-2 any sent outbound to the same contact (in any thread)
+      // counts, so sharing cc-a would let th-a/th-a5's outbound validate them.
+      // Inbound that came BEFORE any outbound to its contact.
+      contact("cc-a2", "oc-a", "a2@example.no");
+      thread("th-a2", "cc-a2");
       msg("m-a2-in", "th-a2", "in", "2026-10-28T09:00:00.000Z", "2026-10-28 09:00:00", "sent");
       msg("m-a2-out", "th-a2", "out", "2026-10-28T12:00:00.000Z", "2026-10-28 12:00:00", "sent");
       // Inbound whose only earlier outbound was never delivered (failed).
-      thread("th-a3", "cc-a");
+      contact("cc-a3", "oc-a", "a3@example.no");
+      thread("th-a3", "cc-a3");
       msg("m-a3-out", "th-a3", "out", null, "2026-10-27 08:00:00", "failed");
       msg("m-a3-in", "th-a3", "in", "2026-10-27T09:00:00.000Z", "2026-10-27 09:00:00", "sent");
 
       // Only message before the inbound reply is another INBOUND (no outbound).
-      thread("th-a4", "cc-a");
+      contact("cc-a4", "oc-a", "a4@example.no");
+      thread("th-a4", "cc-a4");
       msg("m-a4-in1", "th-a4", "in", "2026-10-26T08:00:00.000Z", "2026-10-26 08:00:00", "sent");
       msg("m-a4-in2", "th-a4", "in", "2026-10-26T09:00:00.000Z", "2026-10-26 09:00:00", "sent");
       // Right thread, after our notice, but from a CC'd third party.
@@ -176,7 +189,8 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       msg("m-a5-out", "th-a5", "out", "2026-10-25T08:00:00.000Z", "2026-10-25 08:00:00", "sent");
       msg("m-a5-in", "th-a5", "in", "2026-10-25T09:00:00.000Z", "2026-10-25 09:00:00", "sent", "naboen@example.no");
       // Inbound with EXACTLY the same timestamp as the only sent outbound.
-      thread("th-a6", "cc-a");
+      contact("cc-a6", "oc-a", "a6@example.no");
+      thread("th-a6", "cc-a6");
       msg("m-a6-out", "th-a6", "out", "2026-10-24T08:00:00.000Z", "2026-10-24 08:00:00", "sent");
       msg("m-a6-in", "th-a6", "in", "2026-10-24T08:00:00.000Z", "2026-10-24 08:00:00", "sent");
 
@@ -195,6 +209,47 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       thread("th-cur", "cc-cur");
       msg("m-cur-out", "th-cur", "out", "2026-10-29T08:00:00.000Z", "2026-10-29 08:00:00", "sent");
       msg("m-cur-in", "th-cur", "in", "2026-10-29T09:00:00.000Z", "2026-10-29 09:00:00", "sent");
+
+      // ── S2e-2 fixtures: owner-locked oc-c, consent across threads per contact ──
+      insertAgent.run("oc-c", "Gård C", OLD_DESC, "k-oc-c", CLAIMED);
+      insertKnowledge.run("oc-c", null, "{}");
+      contact("cc-c", "oc-c", "c@example.no");
+      // Our notice in one thread (ISO sent_at) ...
+      thread("th-c1", "cc-c");
+      msg("m-c-out", "th-c1", "out", "2026-10-20T08:00:00.000Z", "2026-10-20 08:00:00", "sent");
+      // ... a failed outbound later (must not be picked as the basis) ...
+      msg("m-c-out-failed", "th-c1", "out", null, "2026-10-21 07:00:00", "failed");
+      // ... and the reply imported as a NEW thread, sent_at NULL (SQLite format).
+      thread("th-c2", "cc-c");
+      msg("m-c-in", "th-c2", "in", null, "2026-10-21 09:00:00", "sent");
+      // Another contact of the SAME agent, never written to: our outbound to cc-c does not count.
+      contact("cc-d", "oc-c", "d@example.no");
+      thread("th-d", "cc-d");
+      msg("m-d-in", "th-d", "in", "2026-10-21T10:00:00.000Z", "2026-10-21 10:00:00", "sent");
+      // Outbound older than 30 days (SQLite format) vs reply in ISO «Z» format.
+      contact("cc-e", "oc-c", "e@example.no");
+      thread("th-e1", "cc-e");
+      msg("m-e-out", "th-e1", "out", null, "2026-09-01 08:00:00", "sent");
+      thread("th-e2", "cc-e");
+      msg("m-e-in", "th-e2", "in", "2026-10-01T08:00:01Z", "2026-10-01 08:00:01", "sent");
+      // Exactly 30 days, mixed formats (ISO outbound, SQLite-format reply) -> still valid.
+      contact("cc-f", "oc-c", "f@example.no");
+      thread("th-f1", "cc-f");
+      msg("m-f-out", "th-f1", "out", "2026-09-01T08:00:00.000Z", "2026-09-01 08:00:00", "sent");
+      thread("th-f2", "cc-f");
+      msg("m-f-in", "th-f2", "in", null, "2026-10-01 08:00:00", "sent");
+      // Our only outbound to the contact was sent AFTER the reply (other thread).
+      contact("cc-g", "oc-c", "g@example.no");
+      thread("th-g1", "cc-g");
+      msg("m-g-in", "th-g1", "in", "2026-10-21T09:00:00.000Z", "2026-10-21 09:00:00", "sent");
+      thread("th-g2", "cc-g");
+      msg("m-g-out", "th-g2", "out", "2026-10-22T09:00:00.000Z", "2026-10-22 09:00:00", "sent");
+      // Owner-locked producer with no outbound at all to anyone.
+      insertAgent.run("oc-h", "Gård H", OLD_DESC, "k-oc-h", CLAIMED);
+      insertKnowledge.run("oc-h", null, "{}");
+      contact("cc-h", "oc-h", "h@example.no");
+      thread("th-h", "cc-h");
+      msg("m-h-in", "th-h", "in", "2026-10-21T09:00:00.000Z", "2026-10-21 09:00:00", "sent");
 
       // NOT owner-locked producer.
       insertAgent.run("oc-open", "Gård Åpen", OLD_DESC, "k-oc-open", null);
@@ -247,12 +302,12 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       const NOT_IN = "owner_consent: crm message is not inbound";
       const OTHER_AGENT = "owner_consent: crm message's contact does not belong to this agent";
       const NOT_SENDER = "owner_consent: sender is not the profile's contact";
-      const NO_EARLIER = "owner_consent: no earlier sent outbound message in the thread — not a reply to our notice";
+      const NO_EARLIER = "owner_consent: no sent outbound message to this contact in the 30 days before the reply — not a reply to our notice";
       const invalidCases: Array<[string, string, string, string]> = [
         ["m-b-in", "oc-07", "message from another agent's contact", OTHER_AGENT],
         // m-a-out2 HAS an earlier sent outbound in th-a — the direction check is what rejects it.
         ["m-a-out2", "oc-08", "an outbound message", NOT_IN],
-        ["m-a2-in", "oc-09", "inbound with no earlier outbound in its thread", NO_EARLIER],
+        ["m-a2-in", "oc-09", "inbound with no earlier outbound to its contact", NO_EARLIER],
         ["m-a3-in", "oc-10", "inbound whose only earlier outbound failed to send", NO_EARLIER],
         ["does-not-exist", "oc-11", "nonexistent message id", NOT_FOUND],
         ["m-a4-in2", "oc-11x", "inbound whose only earlier message is another inbound", NO_EARLIER],
@@ -311,9 +366,9 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       assertEq([acts[0]?.thread_id, acts[0]?.contact_id, acts[0]?.actor], ["th-a", "cc-a", "system"], "oc-36: crm_actions on the message's thread/contact, actor=system");
       const payload = JSON.parse(acts[0]?.payload ?? "{}");
       assertEq(
-        [payload.agent_id, payload.field, payload.crm_message_id, payload.batch_tag],
-        ["oc-a", "description", "m-a-in", r.body?.batch_tag],
-        "oc-37: crm_actions payload {agent_id, field, crm_message_id, batch_tag}",
+        [payload.agent_id, payload.field, payload.crm_message_id, payload.basis_outbound_message_id, payload.batch_tag],
+        ["oc-a", "description", "m-a-in", "m-a-out", r.body?.batch_tag],
+        "oc-37: crm_actions payload {agent_id, field, crm_message_id, basis_outbound_message_id (latest earlier sent outbound), batch_tag}",
       );
 
       // Re-apply: unchanged, nothing new.
@@ -327,6 +382,42 @@ export function runAdminAgentsContentCorrectionOwnerConsentTests(opts: { log?: b
       assertEq(descOf("oc-open"), NEW_DESC, "oc-41: written");
       assertTrue(!/owner_consent/.test(auditFor("oc-open")[0]?.notes ?? ""), "oc-42: no owner_consent suffix in audit");
       assertEq(consentActions().length, 1, "oc-43: no crm_actions row for the unlocked write");
+
+      // ── S2e-2: consent across threads with the same contact ──
+      const s2Invalid: Array<[string, string, string, string]> = [
+        ["oc-c", "m-d-in", "oc-50", "outbound only to ANOTHER contact of the same agent"],
+        ["oc-c", "m-e-in", "oc-51", "only outbound to the contact is older than 30 days (mixed formats)"],
+        ["oc-c", "m-g-in", "oc-52", "only outbound to the contact was sent AFTER the reply (other thread)"],
+        ["oc-h", "m-h-in", "oc-53", "no outbound at all"],
+      ];
+      for (const [agentId, msgId, label, what] of s2Invalid) {
+        r = await post([item(agentId, msgId)], true);
+        assertEq(first(r)?.outcome, "invalid_consent", `${label}: ${what} -> invalid_consent`);
+        assertEq(first(r)?.detail, NO_EARLIER, `${label}b: rejected by the outbound-to-contact check`);
+      }
+      assertEq([descOf("oc-c"), descOf("oc-h")], [OLD_DESC, OLD_DESC], "oc-54: no S2e-2 invalid consent wrote anything");
+      assertEq(consentActions().length, 1, "oc-55: no crm_actions rows from invalid S2e-2 consents");
+
+      // Exactly 30 days (inclusive), ISO outbound vs SQLite-format reply -> valid (dry-run).
+      r = await post([item("oc-c", "m-f-in")]);
+      assertEq(first(r)?.outcome, "would_write_with_owner_consent", "oc-56: outbound exactly 30 days before the reply, mixed formats -> valid");
+
+      // Reply imported as a NEW thread with the same contact -> valid; apply.
+      r = await post([item("oc-c", "m-c-in")]);
+      assertEq(first(r)?.outcome, "would_write_with_owner_consent", "oc-57: reply in a new thread after our notice to the same contact -> valid (dry-run)");
+      assertEq(descOf("oc-c"), OLD_DESC, "oc-58: dry-run wrote nothing");
+      r = await post([item("oc-c", "m-c-in")], true);
+      assertEq(first(r)?.outcome, "written_with_owner_consent", "oc-59: apply -> written_with_owner_consent");
+      assertEq(descOf("oc-c"), NEW_DESC, "oc-60: field written");
+      const actsC = consentActions().filter((a) => JSON.parse(a.payload ?? "{}").agent_id === "oc-c");
+      assertEq(actsC.length, 1, "oc-61: one crm_actions row for oc-c");
+      assertEq([actsC[0]?.thread_id, actsC[0]?.contact_id], ["th-c2", "cc-c"], "oc-62: crm_actions on the REPLY's thread (not the notice's)");
+      const payloadC = JSON.parse(actsC[0]?.payload ?? "{}");
+      assertEq(
+        [payloadC.crm_message_id, payloadC.basis_outbound_message_id],
+        ["m-c-in", "m-c-out"],
+        "oc-63: basis_outbound_message_id = the sent notice in the other thread (failed outbound ignored)",
+      );
     } finally {
       try { require("./admin-agents-content-correction").__setContentCorrectionDbForTesting(null); } catch { /* ignore */ }
       try { db.close(); } catch { /* ignore */ }
