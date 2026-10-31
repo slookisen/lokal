@@ -50642,6 +50642,25 @@ runSerial(async () => {
   }
 });
 
+// Eierportal bølge 0, T2: the «Mine valg» level preview (GET …/valg?niva=)
+// never writes — on gårdssalg (experiences.db booking_live, gardssalg_content_audit)
+// nor RFB; the preview equals the confirmed apply. Swaps getDb() + env — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal bølge 0 T2: nivå-forhåndsvisning skriver aldri ──");
+  try {
+    const { runOwnerLevelPreviewT2Tests } = require("../src/routes/owner-features-level-preview-t2.test") as
+      typeof import("../src/routes/owner-features-level-preview-t2.test");
+    const r = await runOwnerLevelPreviewT2Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-level-preview-t2: " + f);
+    console.log(`  owner-features-level-preview-t2: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-level-preview-t2: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.
