@@ -238,6 +238,14 @@ export function runExperienceOrgnrJobTests(opts: { log?: boolean } = {}): Promis
         assertEq([tp.report?.skipped_reason, tp.lastRunAt], ["paused", null], "6-4: paused tick returns paused and keeps lastRunAt");
         const tp2 = await job.tickExperienceOrgnrDaily({ now: new Date("2026-11-06T04:15:00Z"), lastRunAt: null }, { website: fake("w", [{ processed: 1 }], []), nameKommune: fake("n", [{}], []), pauseBlock: noPause, env: envOn, mainDb, expDb });
         assertTrue(tp2.report !== null && tp2.report.skipped_reason === null, "6-5: after the pause lifts, the next tick in the window runs (stamp was not written)");
+        // cron paused after tick 1, then resumed in the same window: two ledger rows, both recorded
+        let k = 0;
+        const beforeC = runsFor().length;
+        const c1 = await job.runExperienceOrgnrDaily({ apply: true, trigger: "cron", now: new Date("2026-11-07T04:02:00Z") }, { website: fake("w", [{ processed: 1, next_after: "q1" }, {}], []), nameKommune: fake("n", [{}], []), pauseBlock: () => (k++ >= 2 ? { error: "paused" } : null), env: envOn, mainDb, expDb });
+        const c2 = await job.runExperienceOrgnrDaily({ apply: true, trigger: "cron", now: new Date("2026-11-07T04:12:00Z") }, { website: fake("w", [{ processed: 1, next_after: null }], []), nameKommune: fake("n", [{}], []), pauseBlock: noPause, env: envOn, mainDb, expDb });
+        assertEq([c1.skipped_reason, c1.envelope_recorded, c2.envelope_recorded, runsFor().length - beforeC], ["paused", true, true, 2], "6-6: resumed cron run after a mid-run pause gets its own ledger row");
+        assertTrue(c1.run_id !== c2.run_id && c2.run_id.includes("-r041200-"), "6-7: resumed cron run_id carries an -r<HHMMSS> suffix");
+        assertTrue(String(runsFor().find((x) => x.run_id === c1.run_id)?.notes).startsWith("STANSET"), "6-8: pause marker leads the notes (survives truncation)");
       }
 
       // (7) a throwing tick -> lane stops with error, other lane still runs, status partial / failed

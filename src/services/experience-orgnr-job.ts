@@ -279,9 +279,22 @@ export async function runExperienceOrgnrDaily(
   const now = deps.now ?? opts.now ?? new Date();
   const startedAt = now.toISOString();
   const day = startedAt.slice(0, 10);
+  // Cron: fixed per UTC day. A cron run that resumes after a mid-run pause
+  // (its partial envelope already holds the day's id) gets its own id, or
+  // recordRun's ON CONFLICT DO NOTHING would drop its envelope.
+  const cronBaseId = `run-${day}-${EXPERIENCE_ORGNR_JOB_AGENT}-experiences`;
+  const cronIdTaken = (): boolean => {
+    try {
+      return !!(deps.mainDb ?? getDb)().prepare(`SELECT 1 FROM runs WHERE run_id = ?`).get(cronBaseId);
+    } catch {
+      return false;
+    }
+  };
   const runId =
     opts.trigger === "cron"
-      ? `run-${day}-${EXPERIENCE_ORGNR_JOB_AGENT}-experiences`
+      ? cronIdTaken()
+        ? `run-${day}-${EXPERIENCE_ORGNR_JOB_AGENT}-r${startedAt.slice(11, 19).replace(/:/g, "")}-experiences`
+        : cronBaseId
       : `run-${day}-${EXPERIENCE_ORGNR_JOB_AGENT}-manual-${startedAt.slice(11, 23).replace(/[:.]/g, "")}-${Math.random().toString(16).slice(2, 6)}-experiences`;
   const lanes: ExperienceOrgnrLaneReport[] = [];
   const resets: ExperienceOrgnrAdmissionReset[] = [];
@@ -399,10 +412,10 @@ export async function runExperienceOrgnrDaily(
     { type: "db_state_change" as const, value: report.totals.admission_reset_rows, meta: { kind: "needs_review_admission_reset", providers: resets.length } },
   ];
   const notes =
+    (pausedMidRun ? "STANSET av skrivepause midt i kjøringen; " : "") +
     `3n (orgnr, ingen LLM): nettside ${web.resolved_active} aktive/${web.resolved_inactive} inaktive av ${web.processed} i ${web.calls} kall (stopp: ${web.stop_reason}); ` +
     `navn+kommune ${nk.resolved_active}/${nk.resolved_inactive} av ${nk.processed} i ${nk.calls} kall (stopp: ${nk.stop_reason}); ` +
-    `admission_checked_at nullstilt for ${report.totals.admission_reset_rows} needs_review-rader hos ${resets.length} leverandører; feil ${report.totals.errors}` +
-    (pausedMidRun ? "; stanset av skrivepause midt i kjøringen" : "");
+    `admission_checked_at nullstilt for ${report.totals.admission_reset_rows} needs_review-rader hos ${resets.length} leverandører; feil ${report.totals.errors}`;
   let envelopeRecorded = false;
   try {
     recordRun(
