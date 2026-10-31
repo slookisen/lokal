@@ -35838,6 +35838,19 @@ const _utmCapturePromise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("utm-capture: unexpected error: " + String(err?.message || err));
+  }
+  // ai-sok B5: per-AI-agent rollup. Same serial slot as B4 (swaps the DB singleton).
+  try {
+    const { runAiAgentRollupTests } = require("../src/services/ai-agent-rollup.test") as
+      typeof import("../src/services/ai-agent-rollup.test");
+    const ar = await runAiAgentRollupTests({ log: false });
+    passed += ar.passed;
+    failed += ar.failed;
+    for (const f of ar.failures) failures.push("ai-agent-rollup: " + f);
+    console.log(`  ai-agent-rollup: ${ar.passed} passed, ${ar.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("ai-agent-rollup: unexpected error: " + String(err?.message || err));
   } finally {
     _utmCaptureResolve();
   }
@@ -37406,6 +37419,19 @@ const _orderActionsA1Promise: Promise<void> = new Promise<void>(r => {
   } catch (err: any) {
     failed++;
     failures.push("bestillinger-b2b1: unexpected error: " + String(err?.message || err));
+  }
+  // B2b-2 (bestillinger: the soft-expiry date on every surface — producer page/JSON-LD, MCP, REST, A2A, feeds) — own in-memory DB.
+  try {
+    const { runBestillingerB2b2Tests } = require("../src/routes/bestillinger-b2b2.test") as
+      typeof import("../src/routes/bestillinger-b2b2.test");
+    const b2b2 = await runBestillingerB2b2Tests({ log: false });
+    passed += b2b2.passed;
+    failed += b2b2.failed;
+    for (const f of b2b2.failures) failures.push("bestillinger-b2b2: " + f);
+    console.log(`  bestillinger-b2b2: ${b2b2.passed} passed, ${b2b2.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bestillinger-b2b2: unexpected error: " + String(err?.message || err));
   }
   // Fase B1 (kjøperens handlinger via MCP + ordrekortet /ordre/:id) runs strictly after A2 (own in-memory DB).
   try {
@@ -44799,6 +44825,27 @@ runSerial(async () => {
 });
 
 runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 2: «Klikk fra
+  // AI-svar», people who come to a profile page from an AI answer, stored as
+  // daily sums per profile x AI. Swaps getDb() and the dental / experiences db
+  // handles (restored in finally), so serial.
+  console.log("\n── Klikk fra AI-svar S2: clicks from AI answers per profile ──");
+  try {
+    const { runProfileAiClicksTests } = require("../src/services/profile-ai-clicks.test") as
+      typeof import("../src/services/profile-ai-clicks.test");
+    const r = await runProfileAiClicksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("profile-ai-clicks: " + f);
+    console.log(`  profile-ai-clicks: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
   // dev-request 2026-10-13-statistikk-riktig-for-investorer, S2: searches
   // logged from /sok on all three sites, the public search API, and counted
   // per channel (AI assistants from analytics_mcp_calls). Swaps getDb() and
@@ -46239,6 +46286,26 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-content-refresh-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, «Innsnevring 2026-10-28» step 3n: the org.nr paths run by a
+// server-side daily job, plus punkt a (admission_checked_at reset for
+// needs_review rows of a provider resolved brreg_active=1). Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3n: experience-orgnr-job (server-side, punkt a) ──");
+  try {
+    const { runExperienceOrgnrJobTests } = require("../src/services/experience-orgnr-job.test") as
+      typeof import("../src/services/experience-orgnr-job.test");
+    const oj = await runExperienceOrgnrJobTests({ log: false });
+    passed += oj.passed;
+    failed += oj.failed;
+    for (const f of oj.failures) failures.push("experience-orgnr-job: " + f);
+    console.log(`  experience-orgnr-job: ${oj.passed} passed, ${oj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-orgnr-job: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -50603,6 +50670,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O3: «Mine besøk» as
+// a pure render function (upcoming/past split, per-state actions on the same
+// endpoints as the e-mail links, escaping, empty states). No DB, no env.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O3: «Mine besøk» (render) ──");
+  try {
+    const { runGardssalgMineBesokTests } = require("../src/owner-features/gardssalg-mine-besok.test") as
+      typeof import("../src/owner-features/gardssalg-mine-besok.test");
+    const r = await runGardssalgMineBesokTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-mine-besok: " + f);
+    console.log(`  gardssalg-mine-besok: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-mine-besok: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b: the price
 // message on /slik-fungerer-det and the attendance page, and «Én bryter, ett
 // sted» in the gårdssalg owner portal. Swaps getDb() + env — runSerial.
@@ -51355,6 +51441,27 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("organic-texts-s3a: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S2e: POST /admin/agents/content-correction owner-consent
+// path — an inbound CRM reply after our notice lets ONE item past the owner
+// lock (only), audited + crm_actions owner_consent_applied. Own ":memory:" DB
+// via the route's seam; sets ADMIN_KEY only if unset (restored) — runSerial.
+runSerial(async () => {
+  console.log("\n── økologi S2e: content-correction med eiersamtykke ──");
+  try {
+    const { runAdminAgentsContentCorrectionOwnerConsentTests } = require("../src/routes/admin-agents-content-correction-owner-consent.test") as
+      typeof import("../src/routes/admin-agents-content-correction-owner-consent.test");
+    const r = await runAdminAgentsContentCorrectionOwnerConsentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("content-correction-owner-consent: " + f);
+    console.log(`  content-correction-owner-consent: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-correction-owner-consent: unexpected error: " + String(err?.message || err));
   }
 });
 

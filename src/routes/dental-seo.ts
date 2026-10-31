@@ -38,6 +38,7 @@ import { coerceProvenanceToArrayShape } from "../services/cross-source-validator
 // the rule the badge text describes.
 import { resolveVerifiedClaim } from "../services/dental-verified-claim";
 import { recordAiPageDelivery } from "../services/profile-ai-deliveries";
+import { recordAiProfileClick } from "../services/profile-ai-clicks";
 import { aiDeliveriesTileFor } from "../services/profile-ai-deliveries-tile";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 // dev-request 2026-10-17-jsonld-script-escaping-felles-serialiserer: the
@@ -2212,6 +2213,7 @@ function renderClinicProfile(
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   recordAiPageDelivery(req, res, "ai_page_profile", [agent.id], "dental");
+  recordAiProfileClick(req, res, agent.id, "dental");
   res.send(dentalShell(html, {
     title: `${profileTitleCore} | Finn-tannlege.com`,
     description: metaDesc,

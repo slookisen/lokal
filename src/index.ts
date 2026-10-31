@@ -4,6 +4,7 @@ import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
+import { flushAiClicks, startAiClicksFlusher } from "./services/profile-ai-clicks";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
 import { createOffsiteBackupTick, getOffsiteBackupHealth, OFFSITE_TICK_MS } from "./services/offsite-backup";
@@ -1599,6 +1600,9 @@ app.listen(Number(PORT), HOST, async () => {
   // in-memory delivery counts are written as daily sums every minute and on
   // shutdown (below).
   startAiDeliveriesFlusher();
+  // «Klikk fra AI-svar» (dev-request 2026-10-14-klikk-fra-ai-svar-per-profil,
+  // slice 2): the same minute flush + shutdown flush for clicks from AI answers.
+  startAiClicksFlusher();
 
   // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
   // Keeps the DB from growing unbounded (analytics_page_views adds
@@ -2262,6 +2266,45 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
   setInterval(() => { void gardssalgCrDailyTick(); }, 10 * 60_000);
 }
 
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28» step 3n: the two org.nr
+// paths (Trinn A website, Trinn B name+kommune) run by the platform once a
+// day, plus punkt a (admission_checked_at reset for needs_review rows of a
+// provider just resolved brreg_active=1) ─────────────────────────────────
+//
+// Same pattern as gardssalg-content-refresh-daily above: checks every 10
+// minutes, fires once inside EXPERIENCE_ORGNR_JOB_WINDOW_HOUR_UTC (default
+// 04), stamp persisted in boot_job_state. OFF by default:
+// EXPERIENCE_ORGNR_JOB_ENABLED=true turns it on; flipping it back is the
+// rollback. No LLM. Manual/dry runs: POST /api/opplevelser/admin/experience-orgnr-job-run.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let lastExperienceOrgnrRunAt: Date | null = null;
+  let experienceOrgnrRunning = false;
+  const experienceOrgnrDailyTick = trackJob("experience-orgnr-daily", async () => {
+    if (experienceOrgnrRunning) return;
+    experienceOrgnrRunning = true;
+    const now = new Date();
+    try {
+      const { tickExperienceOrgnrDaily } = await import("./services/experience-orgnr-job");
+      const t = await tickExperienceOrgnrDaily({ now, lastRunAt: lastExperienceOrgnrRunAt });
+      lastExperienceOrgnrRunAt = t.lastRunAt;
+      const r = t.report;
+      if (!r) return;
+      console.log(
+        `[experience-orgnr-daily] run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `processed=${r.totals.processed} active=${r.totals.resolved_active} inactive=${r.totals.resolved_inactive} ` +
+          `admission_reset=${r.totals.admission_reset_rows} errors=${r.totals.errors} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-orgnr-daily] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceOrgnrRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceOrgnrDailyTick(); }, 8 * 60_000);
+  setInterval(() => { void experienceOrgnrDailyTick(); }, 10 * 60_000);
+}
+
 // ─── dev-request 2026-10-21-rfb-produktimport-fra-egen-nettside, runde 2
 // (punkt 5): the product-import dry-run measurement survives a deploy. Once,
 // 45 s after boot and only with PRODUCT_IMPORT_DRYRUN_ENABLED=1, a run the
@@ -2675,7 +2718,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !dispatchRoutinesConfigured) {
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
-process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); closeDb(); process.exit(0); });
+process.on("SIGTERM", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
+process.on("SIGINT", () => { discoveryService.shutdown(); flushAiDeliveries(); flushAiClicks(); closeDb(); process.exit(0); });
 
 export default app;
