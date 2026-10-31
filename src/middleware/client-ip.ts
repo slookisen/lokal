@@ -28,9 +28,9 @@
  *   shadow   headers untouched (today's behaviour); measures what enforce
  *            would do and logs one `client_ip_stats` JSON line per process
  *            per 5-min window (written lazily, see windowAt).
- *            CLIENT_IP_MODE_DEFAULT in trinn 1.
- *   enforce  rewrites X-Forwarded-For as above. Trinn 2 flips the default,
- *            only once the shadow gate (AC2 in the dev-request) is met.
+ *            CLIENT_IP_MODE_DEFAULT in trinn 1 (now the rollback).
+ *   enforce  rewrites X-Forwarded-For as above. CLIENT_IP_MODE_DEFAULT since
+ *            trinn 2 (AC2 + AC1e-3 met, 2026-10-31).
  *
  * Read-out for AC2 (trinn 1b): the `client_ip_stats` log line, and the same
  * counters plus mode, breaker state and since-boot sums as `clientIp` in the
@@ -91,8 +91,8 @@ import {
 
 export type ClientIpMode = "legacy" | "shadow" | "enforce";
 
-/** Trinn 1: shadow (measure only). Trinn 2 changes this one line to "enforce". */
-export const CLIENT_IP_MODE_DEFAULT: ClientIpMode = "shadow";
+/** Trinn 2: enforce (AC2 + AC1e-3 written into the dev-request 2026-10-31). Rollback: `fly secrets set CLIENT_IP_MODE=shadow` (or legacy). */
+export const CLIENT_IP_MODE_DEFAULT: ClientIpMode = "enforce";
 
 const MODES: readonly string[] = ["legacy", "shadow", "enforce"];
 
