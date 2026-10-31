@@ -14,6 +14,8 @@ import {
 } from "../services/profile-translations";
 import crypto from "crypto";
 import { tokenLogLabel, emailLogLabel } from "../utils/log-label";
+import { productImportOutreachEnabled } from "../services/product-import/outreach-prepare";
+import { OUTREACH_RETURN_COOKIE, outreachReturnPathFor } from "../services/product-import/outreach-landing";
 import { getProducerPaymentStatus } from "../services/payment-service";
 import { isOverridableCsLock, csLockNote } from "../services/owner-cs-lock";
 import { customerRuleSql } from "../services/customer-rule";
@@ -294,6 +296,18 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
       secure: true,
       sameSite: "lax",
     });
+
+    // Skive 3b-2 (PRODUCT_IMPORT_OUTREACH_ENABLED): back to the outreach
+    // landing page the owner came from (rfb_owner_return cookie), only when it
+    // is exactly that page for THIS agent.
+    const outreachBack = productImportOutreachEnabled()
+      ? outreachReturnPathFor(req.headers.cookie as string | undefined, (req as any).cookies, String(agentId))
+      : null;
+    if (outreachBack) {
+      res.clearCookie(OUTREACH_RETURN_COOKIE, { path: "/" });
+      console.log(`[owner-portal] Magic link verified for ${agentId}, returning to the product suggestions page`);
+      return res.redirect(302, outreachBack);
+    }
 
     // 4. Redirect to authenticated portal page (per Phase 5.4a M2 spec B3)
     console.log(`[owner-portal] Magic link verified for ${agentId}, redirecting to /eier/${agentId}/portal`);

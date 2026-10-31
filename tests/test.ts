@@ -51471,6 +51471,29 @@ runSerial(async () => {
   }
 });
 
+// Produktimport skive 3b-2: owner side of the outreach pre-extraction — signed
+// link per recipient (admin links endpoint omits 0-candidate recipients),
+// landing page /eier/:id/varer/forslag (token + owner session + verified
+// owner; GET writes only the 'opened' log row), «Bekreft og legg inn» via
+// publishOwnerImport (+ «på lager» via B1), 7-day freshness re-extraction,
+// per-recipient log, magic-link return path.
+// Swaps the getDb() singleton and env (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── produktimport skive 3b-2: lenke, landingsside og bekreftelse ──");
+  try {
+    const { runOwnerProductOutreachTests } = require("../src/routes/owner-product-outreach.test") as
+      typeof import("../src/routes/owner-product-outreach.test");
+    const r = await runOwnerProductOutreachTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-product-outreach: " + f);
+    console.log(`  owner-product-outreach: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-product-outreach: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S3a (AC3.3): MCP descriptions, llms.txt, A2A card and SEO
 // pages promise no organic / Debio coverage beyond Debio's public register;

@@ -102,6 +102,7 @@ import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
 import ownerProductImportRoutes from "./routes/owner-product-import";
+import ownerProductOutreachRoutes from "./routes/owner-product-outreach";
 import ownerFeaturesRoutes from "./routes/owner-features";
 import ownerOrdersRoutes from "./routes/owner-orders";
 import buyerOrderCardRoutes from "./routes/buyer-order-card";
@@ -559,6 +560,9 @@ app.use("/", ownerFeaturesRoutes);
 // from the profile's own website (/api/agents/:id/product-import[/fetch|/runs/:runId[/publish]]).
 // Flag PRODUCT_IMPORT_ENABLED (default off → 404); same owner session + isVerifiedOwner + is_verified=1.
 app.use("/", ownerProductImportRoutes);
+// Skive 3b-2: the signed outreach landing page /eier/:id/varer/forslag?t=… (GET list / POST «Bekreft og legg inn»).
+// Flag PRODUCT_IMPORT_OUTREACH_ENABLED (default off → 404); token + owner session + isVerifiedOwner + is_verified=1.
+app.use("/", ownerProductOutreachRoutes);
 // dev-request 2026-10-21-rfb-mine-ordrer (Fase A2): «Mine ordrer» for owners
 // (/eier/:id/ordrer, session) and the per-order e-mail view (/produsent/ordre/:token/kompakt).
 app.use("/", ownerOrdersRoutes);
