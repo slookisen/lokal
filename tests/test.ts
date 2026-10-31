@@ -50719,6 +50719,26 @@ runSerial(async () => {
   }
 });
 
+// Slice T3 (owner-portal profile save): a save locks / audits / writes only
+// the fields that actually change; empty opening hours ('[]') are never shown
+// as "[]" and never locked. Swaps the getDb() singleton, console.log, fetch
+// and env vars (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── T3: profillagring låser bare endrede felt ──");
+  try {
+    const { runOwnerProfileLockChangedFieldsT3Tests } = require("../src/routes/owner-profile-lock-changed-fields-t3.test") as
+      typeof import("../src/routes/owner-profile-lock-changed-fields-t3.test");
+    const r = await runOwnerProfileLockChangedFieldsT3Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-profile-lock-changed-fields-t3: " + f);
+    console.log(`  owner-profile-lock-changed-fields-t3: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-profile-lock-changed-fields-t3: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e (side v2, AC25–30):
 // «Planlagt» box + «Gi meg beskjed» (interest rows, admin counts), two levels
 // (stored «aktiv»/«full_fart» read as «Ta imot bestillinger»), no fake values,
