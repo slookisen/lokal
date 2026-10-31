@@ -267,7 +267,7 @@ router.post("/eier/:agentId/produktimport/hent", express.urlencoded({ extended: 
   }
 });
 
-type Preview = NonNullable<ReturnType<typeof getOwnerImportPreview>>;
+export type Preview = NonNullable<ReturnType<typeof getOwnerImportPreview>>;
 type PreviewCandidate = Preview["new"][number];
 type PreviewChanged = Preview["changed"][number];
 
@@ -319,10 +319,35 @@ function publishedPriceText(price: number | null, unit: string, isFrom: boolean,
   return `${isFrom ? "fra " : ""}kr ${formatNok(price)}${unit ? ` / ${unit}` : " (uten enhet)"}${exclVat ? " ekskl. mva." : ""}`;
 }
 
-interface FormState {
+export interface FormState {
   selected: Set<string>;
   remove: Set<string>;
   values: Record<string, { name?: string; price?: string; unit?: string }>;
+}
+
+/**
+ * The page variant the Skive 3b-2 outreach landing page renders the same
+ * preview with: its own title / form target / button, hidden fields (token,
+ * run), a notice (freshness), the «på lager» choice in place of the stock
+ * note, no «Ikke funnet» section (that page never removes products) and the
+ * fetch date on every row. Absent = the Skive 3-2 preview page, unchanged.
+ */
+export interface PreviewVariant {
+  title: string;
+  selfHref: string;
+  actionHref: string;
+  submitLabel: string;
+  hiddenFields: Record<string, string>;
+  noticeHtml?: string;
+  stockChoiceHtml: string;
+}
+
+/** «31.10.2026» from an ISO / SQL timestamp (Europe/Oslo); "" when unreadable. */
+function fetchedDateText(ts: string | null | undefined): string {
+  if (!ts) return "";
+  const d = new Date(/T/.test(ts) ? ts : `${ts.replace(" ", "T")}Z`);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric" });
 }
 
 function candidateRowHtml(
@@ -331,6 +356,7 @@ function candidateRowHtml(
   old: PreviewChanged["old"] | null,
   form: FormState | null,
   badFields: Map<string, Set<string>>,
+  showFetchedAt = false,
 ): string {
   const pre = candidatePrefill(c, old);
   const v = form?.values[c.id] ?? {};
@@ -358,6 +384,9 @@ function candidateRowHtml(
   if (c.price_is_from) notes.push(`<div class="ep-audit-meta" data-from-price="1">Nettsiden oppgir en «fra»-pris.</div>`);
   if (c.llm) notes.push(`<div class="ep-audit-meta" data-llm="1">Funnet ved å lese teksten på siden. Sjekk navn og pris ekstra nøye.</div>`);
   if (c.publish_blocked_text) notes.push(`<div class="ep-alert ep-alert-error" role="note" data-blocked="${escapeHtml(String(c.publish_blocked))}">${escapeHtml(c.publish_blocked_text)}</div>`);
+  if (showFetchedAt && fetchedDateText(c.fetched_at)) {
+    notes.push(`<div class="ep-audit-meta" data-fetched-at="${escapeHtml(c.fetched_at)}">Hentet ${escapeHtml(fetchedDateText(c.fetched_at))}</div>`);
+  }
   const source = c.source_url && /^https?:\/\//i.test(c.source_url)
     ? ` <a class="ep-audit-meta" href="${escapeHtml(c.source_url)}" rel="noopener nofollow" target="_blank">Se på nettsiden</a>`
     : "";
@@ -377,16 +406,24 @@ function candidateRowHtml(
 export function renderImportPreviewPage(
   agentId: string,
   p: Preview,
-  opts: { claimant: boolean; errorText?: string | null; form?: FormState | null; fields?: Array<{ id: string; field: string }> } = { claimant: true },
+  opts: {
+    claimant: boolean;
+    errorText?: string | null;
+    form?: FormState | null;
+    fields?: Array<{ id: string; field: string }>;
+    variant?: PreviewVariant;
+  } = { claimant: true },
 ): string {
   const id = encodeURIComponent(agentId);
-  const self = `/eier/${id}/produktimport/${encodeURIComponent(p.run_id)}`;
-  const back = `/eier/${id}/portal#${PRODUCT_IMPORT_ANCHOR}`;
+  const v = opts.variant ?? null;
+  const self = v ? v.selfHref : `/eier/${id}/produktimport/${encodeURIComponent(p.run_id)}`;
+  const back = v ? `/eier/${id}/portal` : `/eier/${id}/portal#${PRODUCT_IMPORT_ANCHOR}`;
   const when = formatImportRunTime(p.created_at);
   const website = p.website ?? "";
   const head = `<div class="ep-card">
-        <h1>Produkter fra nettsiden din</h1>
+        <h1>${escapeHtml(v ? v.title : "Produkter fra nettsiden din")}</h1>
         <p>Hentet fra <strong>${escapeHtml(website)}</strong>${when ? ` ${escapeHtml(when)}` : ""}.</p>
+        ${v?.noticeHtml ?? ""}
         ${opts.errorText ? `<div class="ep-alert ep-alert-error" role="alert" data-publish-error="1">${escapeHtml(opts.errorText)}</div>` : ""}
       </div>`;
   if (p.status === "running") {
@@ -423,8 +460,8 @@ export function renderImportPreviewPage(
         <h2 ${attr}>${escapeHtml(title)} (${rows.length})</h2>
         ${intro ? `<p class="ep-audit-meta">${escapeHtml(intro)}</p>` : ""}
         ${rows.length ? `<ul class="ep-audit-list">${rows.join("")}</ul>` : `<p class="ep-audit-meta">${escapeHtml(empty)}</p>`}`;
-  const newRows = p.new.map((c) => candidateRowHtml(c, "new", null, form, badFields));
-  const changedRows = p.changed.map((c) => candidateRowHtml(c, "changed", c.old, form, badFields));
+  const newRows = p.new.map((c) => candidateRowHtml(c, "new", null, form, badFields, !!v));
+  const changedRows = p.changed.map((c) => candidateRowHtml(c, "changed", c.old, form, badFields, !!v));
   const notFoundRows = p.not_found.map((c) => {
     const checked = form ? form.remove.has(c.name) : false; // never preselected
     return `<li class="ep-audit-item" data-not-found="${escapeHtml(c.name)}">
@@ -450,6 +487,28 @@ export function renderImportPreviewPage(
   const claimantNote = opts.claimant
     ? ""
     : `<div class="ep-alert ep-alert-error" role="note" data-claimant-login-required="1">For å publisere må du logge inn med e-postadressen til den som har bekreftet eierskapet til profilen. <a href="/selger?agent=${id}">Logg inn med eierens e-post</a></div>`;
+  if (v) {
+    const hidden = Object.entries(v.hiddenFields)
+      .map(([k, val]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(val)}">`)
+      .join("");
+    return `${head}
+      <div class="ep-card" data-import-status="completed" data-outreach-list="1">
+        <p>Vi fant disse varene på nettsiden din. Alle er krysset av. Rett navn, pris eller enhet om noe er feil, og fjern krysset for varer du ikke vil ha med. Varene du har i profilen i dag, beholdes.</p>
+        <form method="post" action="${escapeHtml(v.actionHref)}">
+          ${hidden}
+          ${section("Nye produkter", 'data-section="new"', "", newRows, "Ingen nye produkter.")}
+          ${section("Endret pris eller enhet", 'data-section="changed"', "Gammel pris → ny pris fra nettsiden.", changedRows, "Ingen endringer i pris eller enhet.")}
+          ${unchanged}
+          ${done}
+          ${v.stockChoiceHtml}
+          ${claimantNote}
+          <div class="ep-form-actions">
+            <button type="submit" class="ep-btn ep-btn-primary">${escapeHtml(v.submitLabel)}</button>
+            <a href="${back}" class="ep-btn ep-btn-secondary">Avbryt</a>
+          </div>
+        </form>
+      </div>`;
+  }
   return `${head}
       <div class="ep-card" data-import-status="completed">
         <p>Kryss av for varene du vil legge inn, og rett navn, pris eller enhet om noe er feil. Varene du har i dag, beholdes med mindre du krysser av for å fjerne dem.</p>
@@ -492,6 +551,36 @@ router.get("/eier/:agentId/produktimport/:runId", (req: Request, res: Response) 
 
 const asList = (v: unknown): string[] => (Array.isArray(v) ? v : v === undefined ? [] : [v]).filter((x): x is string => typeof x === "string");
 
+/**
+ * The publish selection and the re-render state from a submitted preview
+ * form (`velg` ticks, `navn_/pris_/enhet_<id>` values, `fjern`). Shared by
+ * «Publiser valgte» and the outreach page's «Bekreft og legg inn». PURE.
+ */
+export function publishSelectionFromForm(preview: Preview, body: Record<string, unknown>): { selection: PublishSelection[]; remove: string[]; form: FormState } {
+  const rows = new Map<string, { c: PreviewCandidate; old: { unit: string | null } | null }>();
+  for (const c of preview.new) rows.set(c.id, { c, old: null });
+  for (const c of preview.changed) rows.set(c.id, { c, old: c.old });
+  const ticked = [...new Set(asList(body.velg).filter((x) => CANDIDATE_ID_RE.test(x)))].slice(0, 500);
+  const remove = [...new Set(asList(body.fjern).filter((x) => x.length > 0 && x.length <= 200))].slice(0, 500);
+  const selection: PublishSelection[] = [];
+  const form: FormState = { selected: new Set(ticked), remove: new Set(remove), values: {} };
+  for (const c of rows.values()) {
+    const v = { name: body[`navn_${c.c.id}`], price: body[`pris_${c.c.id}`], unit: body[`enhet_${c.c.id}`] };
+    form.values[c.c.id] = {
+      name: typeof v.name === "string" ? v.name : undefined,
+      price: typeof v.price === "string" ? v.price : undefined,
+      unit: typeof v.unit === "string" ? v.unit : undefined,
+    };
+  }
+  for (const tid of ticked) {
+    const row = rows.get(tid);
+    // A ticked id that is not an open new/changed row of this run goes
+    // through as-is: publishOwnerImport answers 404 / 409 for it.
+    selection.push(row ? selectionFromForm(row.c, row.old, form.values[tid]!) : { id: tid });
+  }
+  return { selection, remove, form };
+}
+
 router.post("/eier/:agentId/produktimport/:runId/publiser", express.urlencoded({ extended: false, parameterLimit: 5000 }), (req: Request, res: Response) => {
   const auth = ownerImportPageAuth(req, res, { write: true });
   if (!auth.ok) return;
@@ -502,27 +591,7 @@ router.post("/eier/:agentId/produktimport/:runId/publiser", express.urlencoded({
     const preview = RUN_ID_RE.test(runId) ? getOwnerImportPreview(auth.agentId, runId) : null;
     if (!preview) return res.status(404).send(PAGE_404());
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
-    const rows = new Map<string, { c: PreviewCandidate; old: { unit: string | null } | null }>();
-    for (const c of preview.new) rows.set(c.id, { c, old: null });
-    for (const c of preview.changed) rows.set(c.id, { c, old: c.old });
-    const ticked = [...new Set(asList(body.velg).filter((x) => CANDIDATE_ID_RE.test(x)))].slice(0, 500);
-    const remove = [...new Set(asList(body.fjern).filter((x) => x.length > 0 && x.length <= 200))].slice(0, 500);
-    const selection: PublishSelection[] = [];
-    const form: FormState = { selected: new Set(ticked), remove: new Set(remove), values: {} };
-    for (const c of rows.values()) {
-      const v = { name: body[`navn_${c.c.id}`], price: body[`pris_${c.c.id}`], unit: body[`enhet_${c.c.id}`] };
-      form.values[c.c.id] = {
-        name: typeof v.name === "string" ? v.name : undefined,
-        price: typeof v.price === "string" ? v.price : undefined,
-        unit: typeof v.unit === "string" ? v.unit : undefined,
-      };
-    }
-    for (const tid of ticked) {
-      const row = rows.get(tid);
-      // A ticked id that is not a pending new/changed row of this run goes
-      // through as-is: publishOwnerImport answers 404 / 409 for it.
-      selection.push(row ? selectionFromForm(row.c, row.old, form.values[tid]!) : { id: tid });
-    }
+    const { selection, remove, form } = publishSelectionFromForm(preview, body);
     const r = publishOwnerImport(auth.agentId, runId, selection, remove, { actorEmail: claimantEmail });
     if (r.ok) {
       return res.redirect(303, importCardBack(
