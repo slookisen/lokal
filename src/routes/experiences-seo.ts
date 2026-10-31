@@ -277,6 +277,16 @@ import { CATEGORY_COLORS, CATEGORY_COLOR_FALLBACK } from "../services/category-p
 import { parseNameLocationSuffix, normaliseHint } from "../services/location-suffix-parser";
 import { capFreeText, capName } from "../utils/free-text";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "../owner-features/price-message";
+// dev-request O4 (= G4), slice O4a: «For tilbydere» with sections and FAQ,
+// behind FOR_TILBYDERE_FAQ_ENABLED. The text is data in its own module.
+import {
+  isForTilbydereFaqEnabled,
+  buildForTilbydereFaqLd,
+  FOR_TILBYDERE_SECTIONS,
+  FOR_TILBYDERE_FAQ_META,
+  type ForTilbydereSection,
+} from "./experiences-for-tilbydere-faq";
+import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
 
 const router = Router();
 
@@ -9965,8 +9975,34 @@ function forTilbydereSearchForm(currentQ: string): string {
   </div>`;
 }
 
+// The three ownership steps and the e-mail-verification note under them.
+// Shared by the old /for-tilbydere page and the sectioned page behind
+// FOR_TILBYDERE_FAQ_ENABLED (#ta-over), so the strings live in one place.
+// Interpolated at the same indentation as before, so the old page's HTML is
+// byte-identical.
+const FOR_TILBYDERE_STEPS_HTML = `<div class="ft-steps">
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">1</span>
+        <h3>Finn profilen din</h3>
+        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">2</span>
+        <h3>Klikk «Er dette din bedrift?»</h3>
+        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
+      </div>
+      <div class="ft-step">
+        <span class="n" aria-hidden="true">3</span>
+        <h3>Bekreft via e-post</h3>
+        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
+      </div>
+    </div>`;
+const FOR_TILBYDERE_STEPS_NOTE_HTML = `<p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>`;
+
 // Shared head/body shell for the two pages — S1 chrome composition, same
 // BROWSE_CSS-then-OA_CHROME_CSS order as renderGardssalgCatalogPage().
+// `extraCss` is appended right after FOR_TILBYDERE_CSS with no separator, so
+// a caller that omits it gets byte-identical HTML.
 function forTilbyderePage(opts: {
   title: string;
   metaDesc: string;
@@ -9974,6 +10010,7 @@ function forTilbyderePage(opts: {
   canonical: string;  // full <link rel="canonical" …> tag, or "" for none
   jsonLd: string;
   main: string;
+  extraCss?: string;
 }): string {
   return `<!doctype html>
 <html lang="no">
@@ -9990,7 +10027,7 @@ ${opts.jsonLd}
 <style>
 ${BROWSE_CSS}
 ${OA_CHROME_CSS}
-${FOR_TILBYDERE_CSS}
+${FOR_TILBYDERE_CSS}${opts.extraCss || ""}
 </style>
 </head>
 <body>
@@ -10004,7 +10041,117 @@ ${oaSiteFooter({})}
 </html>`;
 }
 
+// ─── «For tilbydere» with sections and FAQ (dev-request O4 = G4, slice O4a) ──
+// Served by GET /for-tilbydere only while FOR_TILBYDERE_FAQ_ENABLED is on
+// (default off: the page above is served unchanged). All the text is data in
+// experiences-for-tilbydere-faq.ts (one file for Daniel's text review); this
+// renderer escapes every string. The visible FAQ is read back out of the same
+// FAQPage object the JSON-LD serialises (faqPairsFromJsonLd), so markup and
+// text cannot drift. Accordion = <details>/<summary>, no JS, no inline
+// handlers. The clickable «Mine valg» demo is slice O4b.
+
+const FOR_TILBYDERE_FAQ_CSS = `
+  .ftf-menu{margin:18px 0 6px}
+  .ftf-menu ul{list-style:none;display:flex;flex-wrap:wrap;gap:8px;padding:0;margin:0}
+  .ftf-menu a{display:inline-block;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-pill);padding:6px 14px;font-size:.86rem;font-weight:600;color:var(--fjord-900)}
+  .ftf-menu a:hover{border-color:var(--fjord-800);text-decoration:none}
+  .ftf-sec{scroll-margin-top:80px}
+  .ftf-faq{margin:12px 0 0;max-width:64ch}
+  .ftf-qa{border-bottom:1px solid var(--line);padding:10px 0}
+  .ftf-qa summary{cursor:pointer;font-weight:700;color:var(--fjord-900)}
+  .ftf-qa p{margin-top:6px;font-size:.93rem;color:var(--ink-soft)}
+  .ftf-price{font-weight:600;color:var(--fjord-900)}
+`;
+
+/** Visible FAQ accordion; every question and answer is escaped. Exported for the escaping test. */
+export function renderForTilbydereFaqAccordion(pairs: readonly FaqPair[]): string {
+  if (pairs.length === 0) return "";
+  return `<div class="ftf-faq">${pairs
+    .map((p) => `<details class="ftf-qa"><summary>${escapeHtml(p.q)}</summary><p>${escapeHtml(p.a)}</p></details>`)
+    .join("")}</div>`;
+}
+
+function forTilbydereFaqSectionHtml(s: ForTilbydereSection, faqLd: object): string {
+  const h = `ftf-${s.id}-h`;
+  const paras = s.paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join("\n    ");
+  const bullets = s.bullets && s.bullets.length
+    ? `<ul class="ft-edit-list">${s.bullets.map((b) => `<li>${escapeHtml(b)}</li>`).join("")}</ul>`
+    : "";
+  const links = (s.links || [])
+    .map((l) => `<p><a href="${escapeHtml(l.href)}">${escapeHtml(l.label)}</a></p>`)
+    .join("");
+  let extra = "";
+  if (s.id === "ta-over") {
+    extra = `${forTilbydereSearchForm("")}
+    ${FOR_TILBYDERE_STEPS_HTML}
+    ${FOR_TILBYDERE_STEPS_NOTE_HTML}`;
+  } else if (s.id === "sporsmal") {
+    extra = renderForTilbydereFaqAccordion(faqPairsFromJsonLd(faqLd));
+  }
+  // Daniel's «Prisbudskapet», verbatim from owner-features/price-message.ts.
+  const price = s.id === "pris" ? `<p class="ftf-price" data-price-message="1">${escapeHtml(OPPLEVAGENT_PRICE_MESSAGE)}</p>` : "";
+  const body = [price, paras, bullets, extra, links].filter((x) => x !== "").join("\n    ");
+  return `<section class="ft-section ftf-sec" id="${escapeHtml(s.id)}" aria-labelledby="${escapeHtml(h)}">
+    <h2 id="${escapeHtml(h)}">${escapeHtml(s.title)}</h2>
+    ${body}
+  </section>`;
+}
+
+/** The whole sectioned page (flag on). Exported for tests. */
+export function renderForTilbydereFaqPage(): string {
+  const url = baseUrl();
+  const canonical = `${url}/for-tilbydere`;
+  const M = FOR_TILBYDERE_FAQ_META;
+  const faqLd = buildForTilbydereFaqLd(canonical);
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      name: M.webPageName,
+      description: M.metaDesc,
+      url: canonical,
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Forsiden", item: `${url}/` },
+        { "@type": "ListItem", position: 2, name: "For tilbydere", item: canonical },
+      ],
+    },
+    faqLd,
+  ]
+    .map((o) => jsonLdScriptTag(o))
+    .join("\n");
+  const menu = `<nav class="ftf-menu" aria-label="${escapeHtml(M.menuLabel)}"><ul>${FOR_TILBYDERE_SECTIONS
+    .map((s) => `<li><a href="#${escapeHtml(s.id)}">${escapeHtml(s.menu)}</a></li>`)
+    .join("")}</ul></nav>`;
+  const main = `
+  <nav class="breadcrumb" aria-label="Brødsmulesti"><a href="/">Forsiden</a> · For tilbydere</nav>
+  <header class="head ft-hero">
+    <h1>${escapeHtml(M.h1)}</h1>
+    <p class="lede">${escapeHtml(M.lede)}</p>
+  </header>
+  ${menu}
+  ${FOR_TILBYDERE_SECTIONS.map((s) => forTilbydereFaqSectionHtml(s, faqLd)).join("\n  ")}`;
+  return forTilbyderePage({
+    title: M.title,
+    metaDesc: M.metaDesc,
+    robotsMeta: `<meta name="robots" content="index, follow">`,
+    canonical: `<link rel="canonical" href="${canonical}">`,
+    jsonLd,
+    main,
+    extraCss: FOR_TILBYDERE_FAQ_CSS,
+  });
+}
+
 router.get("/for-tilbydere", (_req: Request, res: Response) => {
+  if (isForTilbydereFaqEnabled()) {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(renderForTilbydereFaqPage());
+    return;
+  }
   const url = baseUrl();
   const canonical = `${url}/for-tilbydere`;
   const jsonLd = [
@@ -10042,24 +10189,8 @@ router.get("/for-tilbydere", (_req: Request, res: Response) => {
 
   <section class="ft-section" aria-labelledby="ft-steg-h">
     <h2 id="ft-steg-h">Slik tar du eierskap — tre steg</h2>
-    <div class="ft-steps">
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">1</span>
-        <h3>Finn profilen din</h3>
-        <p>Søk over, eller finn bedriften i katalogen. Hver produsent har en egen profilside på Opplevagent.</p>
-      </div>
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">2</span>
-        <h3>Klikk «Er dette din bedrift?»</h3>
-        <p>På profilsiden finner du knappen «Er dette din bedrift?». Den starter overtakelsen — ingen registrering eller passord.</p>
-      </div>
-      <div class="ft-step">
-        <span class="n" aria-hidden="true">3</span>
-        <h3>Bekreft via e-post</h3>
-        <p>Vi sender en magisk innloggingslenke til adressen som er registrert for bedriften hos Brønnøysundregistrene eller på bedriftens egen nettside. Klikk lenken — ferdig verifisert.</p>
-      </div>
-    </div>
-    <p style="font-size:.86rem;color:var(--mist);max-width:64ch">E-postverifiseringen er hele sikkerheten: bare den som har tilgang til bedriftens registrerte adresse kan ta eierskap. Har du ikke tilgang til den adressen, hjelper vi deg manuelt på <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+    ${FOR_TILBYDERE_STEPS_HTML}
+    ${FOR_TILBYDERE_STEPS_NOTE_HTML}
   </section>
 
   <section class="ft-section" aria-labelledby="ft-rediger-h">
