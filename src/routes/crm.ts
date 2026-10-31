@@ -17,7 +17,7 @@ import {
   countOpenUntriaged,
   isAutoDismissedSender,
 } from "../services/crm-triage";
-import { emailService } from "../services/email-service";
+import { emailService, GARDSSALG_OUTREACH_FROM_NAME } from "../services/email-service";
 import { plainTextToEmailHtml } from "../utils/plain-text-to-html";
 import { getDb } from "../database/init";
 import { isOutreachPaused } from "./admin-outreach-candidates";
@@ -167,6 +167,17 @@ function checkMaxTouchVern(db: ReturnType<typeof getDb>, toEmail: string): Recor
   };
 }
 
+// ─── From display-name override on POST /threads/:id/send ───────────────────
+// A reply (e.g. a thank-you) on a thread that STARTED with a cold outreach mail
+// must carry the same sender name as that outreach, or the producer sees the
+// conversation switch from "Daniel Fredriksen" to "Opplevagent" mid-thread.
+// Allow-listed, exact match: only the name(s) the cold outreach is actually
+// sent as (GARDSSALG_OUTREACH_FROM_NAME is used by both the gårdssalg and the
+// RFB outreach lanes). Anything else — including the empty string — is a 400,
+// so this cannot be used to send as an arbitrary display name. Only the
+// display name changes; the address and reply-to stay the thread platform's.
+const SEND_FROM_DISPLAY_NAME_ALLOW_LIST: readonly string[] = [GARDSSALG_OUTREACH_FROM_NAME];
+
 const sendSchema = z
   .object({
     intent: z.enum(["gmail_draft", "resend_send"]),
@@ -177,8 +188,19 @@ const sendSchema = z
     bodyHtml: z.string().optional(),
     replyToMessageId: z.string().nullable().optional(),
     createdBy: z.enum(["claude", "daniel"]),
+    fromDisplayName: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    if (data.fromDisplayName !== undefined && !SEND_FROM_DISPLAY_NAME_ALLOW_LIST.includes(data.fromDisplayName)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["fromDisplayName"],
+        message:
+          `fromDisplayName ${JSON.stringify(data.fromDisplayName)} is not allowed — only the outreach sender ` +
+          `name(s) ${JSON.stringify(SEND_FROM_DISPLAY_NAME_ALLOW_LIST)} may be used (exact match; omit the field ` +
+          `to send with the thread platform's own display name).`,
+      });
+    }
     const trimmed = data.subject.trim();
     if (trimmed.length === 0 || REPLY_PREFIX_ONLY_SUBJECT.test(trimmed)) {
       ctx.addIssue({
@@ -344,10 +366,12 @@ router.post("/threads/:id/notes", (req, res) => {
 // ─── POST /admin/crm/threads/:id/send ────────────────────────
 // intent='resend_send' → sends immediately via SMTP
 // intent='gmail_draft' → enqueues outbox; CS-agent picks up and creates Gmail draft
+// fromDisplayName (optional, allow-listed) only affects resend_send: crm_outbox has no
+// From column, so the override is not carried to a gmail_draft (no schema change here).
 router.post("/threads/:id/send", async (req, res) => {
   const parsed = sendSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { intent, toEmails, ccEmails, subject, bodyText, bodyHtml, replyToMessageId, createdBy } = parsed.data;
+  const { intent, toEmails, ccEmails, subject, bodyText, bodyHtml, replyToMessageId, createdBy, fromDisplayName } = parsed.data;
   const threadId = req.params.id;
 
   // Look up contact for logging
@@ -489,7 +513,9 @@ router.post("/threads/:id/send", async (req, res) => {
         textContent: bodyText,
         htmlContent: bodyHtml ?? plainTextToEmailHtml(bodyText),
         inReplyToMessageId: replyToMessageId ?? undefined,
-        from: crmFromHeader(thread.vertical_id),
+        // fromDisplayName is already allow-listed by sendSchema; undefined
+        // keeps the platform display name. Address + reply-to unchanged.
+        from: crmFromHeader(thread.vertical_id, fromDisplayName),
         replyTo: identity.replyTo,
       });
       if (result.success) {
@@ -508,7 +534,10 @@ router.post("/threads/:id/send", async (req, res) => {
           contactId: thread.contact_id,
           type: "sent",
           actor: createdBy,
-          payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: reserved.messageId },
+          payload: {
+            outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", internalMessageId: reserved.messageId,
+            ...(fromDisplayName !== undefined ? { fromDisplayName } : {}),
+          },
         });
         return res.json({ success: true, outboxId: queued.id, messageId: result.messageId, internalMessageId: reserved.messageId, channel: "resend_smtp" });
       } else {
