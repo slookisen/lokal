@@ -50623,6 +50623,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O3: «Mine besøk» as
+// a pure render function (upcoming/past split, per-state actions on the same
+// endpoints as the e-mail links, escaping, empty states). No DB, no env.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-22-opplevagent-mine-valg-gardssalg O3: «Mine besøk» (render) ──");
+  try {
+    const { runGardssalgMineBesokTests } = require("../src/owner-features/gardssalg-mine-besok.test") as
+      typeof import("../src/owner-features/gardssalg-mine-besok.test");
+    const r = await runGardssalgMineBesokTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("gardssalg-mine-besok: " + f);
+    console.log(`  gardssalg-mine-besok: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-mine-besok: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-opplevagent-mine-valg-gardssalg, O1b: the price
 // message on /slik-fungerer-det and the attendance page, and «Én bryter, ett
 // sted» in the gårdssalg owner portal. Swaps getDb() + env — runSerial.
