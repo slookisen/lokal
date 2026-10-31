@@ -29,6 +29,12 @@
  *      row to it -> not; a duplicate merged into this provider does not count.
  *   w  owned profile: only an address that completed a claim for it (not a
  *      test claim, not admin-revoked); r15-r23 pin the same through the routes.
+ * Second review fix-up:
+ *   h  a row the claim page cannot show (delisted, merged) is never a target,
+ *      also through issueClaimMagicLink's by-id lookup and the POST (r24-r28);
+ *      the owner's own pause still is; the stored epost is read from the row,
+ *      never from the caller.
+ *   s6 a duplicate merged into a THIRD provider listing the address -> shared.
  *
  * Real router + claim service on the production schema (in-memory
  * experiences db via db-factory, in-memory RFB db via __setRfbDbForTesting),
@@ -296,8 +302,24 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
     sent("oa-owned-pick", "ny@pick-owned.no", { sent_at: "2026-10-20 10:00:00" });
     sent("oa-owned-pick", "gammel@pick-owned.no", { sent_at: "2026-09-01 10:00:00" });
     usedClaim("gsc_oa01pick", "oa-owned-pick", "gammel@pick-owned.no");
+    // Second review fix-up: rows the claim page cannot show, and a duplicate
+    // merged into a THIRD provider that lists the address.
+    const setHidden = expDb.prepare(`UPDATE experience_providers SET catalog_hidden = 1, catalog_hidden_reason = ? WHERE id = ?`);
+    provider("oa-delisted");
+    sent("oa-delisted", "eier@delisted-gard.no");
+    setHidden.run("remove_request", "oa-delisted");
+    provider("oa-merged-away", { merged_into: "oa-merge-main" });
+    sent("oa-merged-away", "eier@mergedaway-gard.no");
+    provider("oa-paused", { content_source: "claim", claimed_at: "2026-10-01 00:00:00" });
+    sent("oa-paused", "eier@paused-gard.no");
+    usedClaim("gsc_oa01paused", "oa-paused", "eier@paused-gard.no");
+    setHidden.run("owner_pause", "oa-paused");
+    provider("oa-third-a");
+    sent("oa-third-a", "felles@third-gard.no");
+    provider("oa-third-keep", { epost: "annen@third-gard.no" });
+    provider("oa-third-dup", { merged_into: "oa-third-keep", epost: " Felles@Third-Gard.no " });
 
-    const row = (id: string) => claimSvc.getClaimProviderById(id)!;
+    const row =(id: string) => claimSvc.getClaimProviderById(id)!;
     const oaEmail = (id: string) => claimSvc.findOpplevagentOutreachClaimEmail(row(id));
     const candidates = (id: string) => claimSvc.deriveOrgLinkedEmailCandidatesWithHarvest(row(id), undefined, { cacheKey: id });
 
@@ -352,7 +374,7 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
     assertEq(oaEmail("oa-shared-a"), null, "o15: address also delivered to for another provider (shared mailbox) -> not, provider A");
     assertEq(oaEmail("oa-shared-b"), null, "o16: ... nor provider B");
     assertEq(oaEmail("oa-solo"), "solo@solo-gard.no", "o17: another provider's TEST send to the address does not make it shared");
-    assertEq(claimSvc.findOpplevagentOutreachClaimEmail({ epost: null }), null, "o18: no provider id -> no lookup, null");
+    assertEq(claimSvc.findOpplevagentOutreachClaimEmail({}), null, "o18: no provider id -> no lookup, null");
 
     // Lazy + fail-closed on the RFB db.
     console.warn = (...a: unknown[]) => { warnLog.push(a.map(String).join(" ")); };
@@ -396,6 +418,21 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
     assertEq(oaEmail("oa-resshared-a"), null, "s3: another provider has a kept 'reserved' row to it -> not");
     assertEq(oaEmail("oa-dryshared-a"), null, "s4: another provider has a dry-run row to it -> not");
     assertEq(oaEmail("oa-merge-main"), "main@merge-gard.no", "s5: a duplicate merged INTO this provider (listing + delivery) is the same producer -> still qualifies");
+    assertEq(oaEmail("oa-third-a"), null, "s6: a duplicate merged into a THIRD provider lists the address -> shared, not");
+
+    // ── h: what the claim page cannot show; the row, not the caller ────────
+    assertEq(oaEmail("oa-delisted"), null, "h1: delisted provider (catalog_hidden) + a real delivery -> not a target");
+    assertEq(oaEmail("oa-merged-away"), null, "h2: merged provider + a real delivery -> not a target");
+    assertEq(oaEmail("oa-paused"), "eier@paused-gard.no", "h3: the owner's own pause stays visible on the claim surface -> the owner can still log in");
+    assertEq(await claimSvc.issueClaimMagicLink("oa-delisted"), { ok: false, error: "no_org_linked_email" }, "h4: issueClaimMagicLink (by id, unfiltered) mints nothing for a delisted row");
+    assertEq(await claimSvc.issueClaimMagicLink("oa-merged-away"), { ok: false, error: "no_org_linked_email" }, "h5: ... nor for a merged row");
+    assertEq(claimSvc.findOpplevagentOutreachClaimEmail({ id: "oa-listed-moved" }), null, "h6: caller passes no epost -> the stored epost is still authoritative");
+    assertEq(claimSvc.findOpplevagentOutreachClaimEmail({ id: "oa-listed-match" }), "post@listed-gard.no", "h7: ... and still qualifies when it was delivered to");
+    assertEq(
+      claimSvc.findOpplevagentOutreachClaimEmail({ id: "oa-listed-moved", epost: "gammel@moved-gard.no" } as { id: string }),
+      null,
+      "h8: a caller-supplied epost is ignored (cannot steer the lookup to an old delivery)",
+    );
 
     // ── w: owned profiles (review fix-up) ─────────────────────────────────
     assertEq(oaEmail("oa-owned-precl"), null, "w1: claimed profile + pre-claim delivery to an address that never claimed it -> not");
@@ -519,6 +556,21 @@ export async function runGardssalgClaimOutreachDeliveredOa01Tests(opts: { log?: 
       .prepare(`SELECT email, email_source FROM gardssalg_claims WHERE provider_id = 'oa-owned-self' AND used = 0 ORDER BY created_at DESC LIMIT 1`)
       .get() as { email: string; email_source: string } | undefined;
     assertEq(selfRow, { email: "eier@self-owned.no", email_source: "outreach_delivered" }, "r23: ... and the link goes to that address");
+
+    // Second review fix-up: the POST takes a raw provider id — a delisted row
+    // must not get a link mailed to its delivered address.
+    assertEq((await req("GET", "/kategori/gardssalg/eier/oa-delisted")).status, 404, "r24: delisted provider -> claim page 404 (unchanged)");
+    const delistedPost = await req("POST", "/kategori/gardssalg/eier/oa-delisted/request", {});
+    assertEq([delistedPost.status, JSON.parse(delistedPost.body).error], [403, "no_org_linked_email"], "r25: POST naming the delisted provider's id -> refused");
+    const mergedPost = await req("POST", "/kategori/gardssalg/eier/oa-merged-away/request", {});
+    assertEq([mergedPost.status, JSON.parse(mergedPost.body).error], [403, "no_org_linked_email"], "r26: ... and the merged one's");
+    await new Promise((resolve) => setImmediate(resolve));
+    assertEq([countClaims("oa-delisted"), countClaims("oa-merged-away")], [0, 0], "r27: no claim row for either");
+    assertEq(
+      sentClaimLinks.filter((t) => t === "eier@delisted-gard.no" || t === "eier@mergedaway-gard.no").length,
+      0,
+      "r28: no link mailed to either delivered address",
+    );
   } catch (err: any) {
     failed++;
     failures.push("gardssalg-claim-outreach-delivered-oa01: unexpected error: " + String(err?.stack || err?.message || err));

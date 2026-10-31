@@ -390,10 +390,17 @@
 //     A failed send leaves no row at all (the reservation is deleted);
 //   - no email_bounces row except 'unsubscribe' (same predicate as
 //     wasEpostDeliveredOutreachNoBounce and the RFB twin);
-//   - the listing is authoritative: when the provider has ANY stored epost,
-//     only that address can qualify, and only if it was itself delivered to;
-//     a stored epost that is not one plausible address (malformed, several
-//     addresses) gives no candidate rather than a fallback to old deliveries;
+//   - only a provider row the claim page itself can show
+//     (gardssalgVisibleSql("claim"): not delisted via catalog_hidden — the
+//     owner's own pause and the test fixture excepted — and not merged).
+//     issueClaimMagicLink() looks the provider up by id WITHOUT that filter,
+//     so a POST naming a delisted or merged row's id must not find a target
+//     here (the existing tiers are unchanged by this);
+//   - the listing is authoritative: when the provider has ANY stored epost
+//     (read from the row, never from the caller), only that address can
+//     qualify, and only if it was itself delivered to; a stored epost that is
+//     not one plausible address (malformed, several addresses) gives no
+//     candidate rather than a fallback to old deliveries;
 //   - an address the listing moved away from is never a login target. Outreach
 //     always goes to the then-listed epost, so an empty epost after a delivery
 //     means someone cleared it. Without a stored epost the most recent delivery
@@ -408,13 +415,19 @@
 //     claim page doubles as the owner re-login page, so only an address that
 //     has itself completed a claim for this provider qualifies (used = 1, not a
 //     test claim, not revoked by the admin lever). An owner who claimed via
-//     this tier can log in again; pre-claim cold outreach opens no new way in;
+//     this tier can log in again; pre-claim cold outreach opens no new way in.
+//     A used TEST claim (admin E2E) does mark the profile owned — through
+//     hasActiveNonRevokedClaim and the content_source/claimed_at stamp
+//     verifyClaimToken writes — so it hides this tier for that producer:
+//     conservative, and the same as isGardssalgOwnedForOutreach;
 //   - shared mailbox (mirrors RFB's isSharedKnownEmail; manual fallback): no
-//     candidate when another non-merged provider lists the address as epost,
-//     or another provider has ANY non-test sent-log row to it (also a
-//     reservation or a row with no message id: for "is this mailbox tied to
-//     another producer" the send needs no confirmation). A duplicate merged
-//     into this provider is the same producer and does not count. Those two
+//     candidate when another provider lists the address as epost (a delisted
+//     one, or a duplicate merged into a THIRD provider, included: either
+//     still ties the mailbox to another producer), or another provider has
+//     ANY non-test sent-log row to it (also a reservation or a row with no
+//     message id: for "is this mailbox tied to another producer" the send
+//     needs no confirmation). In both checks only a duplicate merged into
+//     THIS provider is skipped — it is the same producer. Those two
 //     queries compare with SQL LOWER/TRIM, which folds ASCII case only — a
 //     case variant with non-ASCII letters (ØL@ vs øl@) is not matched.
 // Ranked LAST, after stored_epost_verified, and deduped by address, so it
@@ -745,20 +758,23 @@ function addressesWithCompletedClaim(expDb: ReturnType<typeof getDb>, providerId
 }
 
 /**
- * Shared mailbox (module doc, "outreach_delivered"): another non-merged
- * provider lists `address` as epost, or another provider has any non-test
- * sent-log row to it — reserved and message-id-less rows included. A duplicate
- * merged into this provider is the same producer and is skipped.
+ * Shared mailbox (module doc, "outreach_delivered"): another provider lists
+ * `address` as epost, or another provider has any non-test sent-log row to it
+ * — reserved and message-id-less rows included. In both checks only a
+ * duplicate merged into THIS provider is skipped: it is the same producer.
  */
 function isSharedOutreachMailbox(expDb: ReturnType<typeof getDb>, address: string, providerId: string): boolean {
+  // Shared-mailbox filter, not a catalog-visibility rule, so
+  // gardssalgVisibleSql does not apply: a delisted provider, or one merged
+  // into a third provider, still ties the mailbox to another producer.
   const listedElsewhere = expDb
     .prepare(
       `SELECT 1 FROM experience_providers
-        WHERE id <> ? AND (merged_into IS NULL OR merged_into = '')
+        WHERE id <> ? AND COALESCE(merged_into, '') <> ?
           AND LOWER(TRIM(epost, ${EMAIL_TRIM_CHARS_SQL})) = ?
         LIMIT 1`,
     )
-    .get(providerId, address);
+    .get(providerId, providerId, address);
   if (listedElsewhere) return true;
   const sentElsewhere = expDb
     .prepare(
@@ -774,9 +790,11 @@ function isSharedOutreachMailbox(expDb: ReturnType<typeof getDb>, address: strin
 /**
  * OA-01 — see the module doc's "outreach_delivered" section. The address
  * Opplevagent's own outreach demonstrably reached for THIS provider, or null:
- *   - provider has a stored epost: that address, iff it is one plausible
- *     address, a real delivery for this provider went to it, and it has no
- *     blocking bounce;
+ *   - provider row not visible on the claim surface (gardssalgVisibleSql
+ *     ("claim"): delisted or merged): null;
+ *   - provider has a stored epost (read from the row, not from the caller):
+ *     that address, iff it is one plausible address, a real delivery for this
+ *     provider went to it, and it has no blocking bounce;
  *   - no stored epost: the most recent real delivery for this provider whose
  *     address has no blocking bounce and was never removed or replaced from
  *     the listing (epostAddressesRemovedFromListing);
@@ -784,10 +802,12 @@ function isSharedOutreachMailbox(expDb: ReturnType<typeof getDb>, address: strin
  *   - null when that address is a shared mailbox (isSharedOutreachMailbox),
  *     when there is no provider id, or on any lookup error (fails closed,
  *     like the RFB twin).
- * Returned normalized (trim + lower case). Lazy on the RFB db: email_bounces
- * is read only when the provider has a qualifying delivery at all.
+ * Only `id` is read from the argument, so any ClaimProviderRow-shaped caller
+ * gets the same answer. Returned normalized (trim + lower case). Lazy on the
+ * RFB db: email_bounces is read only when the provider has a qualifying
+ * delivery at all.
  */
-export function findOpplevagentOutreachClaimEmail(provider: { id?: string; epost?: string | null }): string | null {
+export function findOpplevagentOutreachClaimEmail(provider: { id?: string }): string | null {
   const providerId = typeof provider.id === "string" ? provider.id : "";
   if (!providerId) return null;
   try {
@@ -807,14 +827,21 @@ export function findOpplevagentOutreachClaimEmail(provider: { id?: string; epost
       if (email && isPlausibleEmailShape(email) && !delivered.includes(email)) delivered.push(email);
     }
 
+    // Same visibility filter as getClaimProviderBySlug(): a delisted or merged
+    // row gets no outreach target, whoever names its id.
     const current = expDb
-      .prepare(`SELECT content_source, claimed_at, field_provenance FROM experience_providers WHERE id = ?`)
-      .get(providerId) as { content_source: string | null; claimed_at: string | null; field_provenance: string | null } | undefined;
+      .prepare(
+        `SELECT epost, content_source, claimed_at, field_provenance FROM experience_providers
+          WHERE id = ? AND ${gardssalgVisibleSql("claim")}`,
+      )
+      .get(providerId) as
+      | { epost: string | null; content_source: string | null; claimed_at: string | null; field_provenance: string | null }
+      | undefined;
     if (!current) return null;
 
     // Any stored epost is authoritative; without one, drop every address the
     // listing moved away from.
-    const listed = normalizeEmail(provider.epost);
+    const listed = normalizeEmail(current.epost);
     let pool: string[];
     if (listed) {
       if (!isPlausibleEmailShape(listed)) return null;
