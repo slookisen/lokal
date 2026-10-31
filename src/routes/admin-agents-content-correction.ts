@@ -105,22 +105,27 @@
 // only if the crm_messages row exists, is direction='in', its thread's
 // contact has crm_contacts.agent_id = the item's agent_id, it was sent FROM
 // that contact (lower(trim(from_email)) = lower(trim(crm_contacts.email)) —
-// a CC'd third party replying on the thread is not the owner), and the same
-// thread holds an earlier direction='out' message that was actually sent
-// (delivery_status='sent'; a queued/drafted/failed row never reached the
-// owner). «Earlier» compares julianday(COALESCE(sent_at, received_at)) on
-// both sides, strictly. The spec reads «received after the last outbound
-// message with the owner notice»; we cannot identify the notice message
-// generically, and requiring the reply to postdate the very LAST outbound
-// would void the consent as soon as we reply to confirm it — so the rule is
-// «a reply after some outbound we sent in that thread». Otherwise
+// a CC'd third party replying on the thread is not the owner), and some
+// thread with the SAME contact_id (any thread — S2e-2: a reply to our notice
+// is often imported as a new thread) holds an earlier direction='out' message
+// that was actually sent (delivery_status='sent'; a queued/drafted/failed row
+// never reached the owner), at most 30 days before the reply. «Earlier»
+// compares julianday(COALESCE(sent_at, received_at)) on both sides, strictly
+// (julianday() normalises ISO «T…Z» and SQLite «YYYY-MM-DD HH:MM:SS» alike).
+// Outbound to other contacts of the same agent does not count. The spec
+// reads «received after the last outbound message with the owner notice»; we
+// cannot identify the notice message generically, and requiring the reply to
+// postdate the very LAST outbound would void the consent as soon as we reply
+// to confirm it — so the rule is «a reply after some outbound we sent to that
+// contact». The latest qualifying outbound is recorded as
+// basis_outbound_message_id in the crm_actions payload. Otherwise
 // invalid_consent and nothing is written. Valid consent bypasses the OWNER
 // LOCK ONLY: curated_fields, junk gates, unchanged, dry-run default and the
 // per-row transaction all still apply. Outcomes: would_write_with_owner_consent
 // / written_with_owner_consent (would_merge_… / merged_… for a product_name
 // merge). The audit notes get ` · owner_consent=<id>` after the reason, and
 // the same transaction inserts a crm_actions row (type owner_consent_applied,
-// actor system) on the message's thread/contact. On a row that is NOT
+// actor system) on the reply message's thread/contact. On a row that is NOT
 // owner-locked, owner_consent is ignored (not checked) and the outcome is the
 // normal one — consent is never claimed where it was not what let it through.
 // Without owner_consent behaviour is unchanged (skipped_claimed).
@@ -314,9 +319,12 @@ type ValidItem = (
   | { agent_id: string; field: ListField; remove: string[] }
 ) & { owner_consent?: OwnerConsent };
 
+/** S2e-2: how old (days before the reply) our outbound notice may be. */
+const CONSENT_OUTBOUND_MAX_AGE_DAYS = 30;
+
 /** Result of the (fresh) owner-consent check for one item. */
 type ConsentCheck =
-  | { ok: true; crm_message_id: string; thread_id: string; contact_id: string }
+  | { ok: true; crm_message_id: string; thread_id: string; contact_id: string; basis_outbound_id: string }
   | { ok: false; crm_message_id: string; detail: string };
 
 /**
@@ -346,13 +354,25 @@ function checkOwnerConsent(db: ReturnType<typeof getDb>, agentId: string, crmMes
   // The reply must come FROM the contact (not a CC'd third party on the thread).
   if (!m.from_contact) return bad("owner_consent: sender is not the profile's contact");
   if (m.ts == null) return bad("owner_consent: crm message has no usable timestamp");
-  const earlierOut = db.prepare(
-    `SELECT COUNT(*) AS n FROM crm_messages o
-      WHERE o.thread_id = ? AND o.direction = 'out' AND o.delivery_status = 'sent'
-        AND julianday(COALESCE(o.sent_at, o.received_at)) < ?`,
-  ).get(m.thread_id, m.ts) as { n: number };
-  if (!earlierOut.n) return bad("owner_consent: no earlier sent outbound message in the thread — not a reply to our notice");
-  return { ok: true, crm_message_id: crmMessageId, thread_id: m.thread_id, contact_id: m.contact_id };
+  // S2e-2: our notice may sit in ANY thread with the same contact (a reply is
+  // often imported as a new thread), but must be sent strictly before the
+  // reply and at most CONSENT_OUTBOUND_MAX_AGE_DAYS before it. The latest such
+  // outbound is recorded as the basis in crm_actions.
+  const basis = db.prepare(
+    `SELECT o.id AS id FROM crm_messages o
+       JOIN crm_threads ot ON ot.id = o.thread_id
+      WHERE ot.contact_id = ? AND o.direction = 'out' AND o.delivery_status = 'sent'
+        AND julianday(COALESCE(o.sent_at, o.received_at)) < ?
+        AND julianday(COALESCE(o.sent_at, o.received_at)) >= ? - ?
+      ORDER BY julianday(COALESCE(o.sent_at, o.received_at)) DESC, o.id DESC
+      LIMIT 1`,
+  ).get(m.contact_id, m.ts, m.ts, CONSENT_OUTBOUND_MAX_AGE_DAYS) as { id: string } | undefined;
+  if (!basis) {
+    return bad(
+      `owner_consent: no sent outbound message to this contact in the ${CONSENT_OUTBOUND_MAX_AGE_DAYS} days before the reply — not a reply to our notice`,
+    );
+  }
+  return { ok: true, crm_message_id: crmMessageId, thread_id: m.thread_id, contact_id: m.contact_id, basis_outbound_id: basis.id };
 }
 
 /** Outcome as reported: *_with_owner_consent when consent is what let it through. */
@@ -529,7 +549,7 @@ interface Plan {
   /** product_name: the renamed entry is a plain string (not in the catalog). */
   renamedStringEntry?: boolean;
   /** S2e: the owner lock was passed on valid owner consent (thread/contact for crm_actions). */
-  viaOwnerConsent?: { crm_message_id: string; thread_id: string; contact_id: string };
+  viaOwnerConsent?: { crm_message_id: string; thread_id: string; contact_id: string; basis_outbound_id: string };
 }
 
 /**
@@ -543,7 +563,14 @@ function ownerLockGate(
   if (!isOwnerLocked(cur)) return null;
   if (!consent) return { stop: "skipped_claimed" };
   if (!consent.ok) return { stop: "invalid_consent", detail: consent.detail };
-  return { consent: { crm_message_id: consent.crm_message_id, thread_id: consent.thread_id, contact_id: consent.contact_id } };
+  return {
+    consent: {
+      crm_message_id: consent.crm_message_id,
+      thread_id: consent.thread_id,
+      contact_id: consent.contact_id,
+      basis_outbound_id: consent.basis_outbound_id,
+    },
+  };
 }
 
 /**
@@ -779,7 +806,13 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
           randomUUID(),
           consent.thread_id,
           consent.contact_id,
-          JSON.stringify({ agent_id: item.agent_id, field: item.field, crm_message_id: consent.crm_message_id, batch_tag: batchTag }),
+          JSON.stringify({
+            agent_id: item.agent_id,
+            field: item.field,
+            crm_message_id: consent.crm_message_id,
+            basis_outbound_message_id: consent.basis_outbound_id,
+            batch_tag: batchTag,
+          }),
         );
       }
       const written: ItemOutcome = p.outcome === "would_merge" ? "merged" : "written";
