@@ -3292,11 +3292,11 @@ homepageContentRefreshRouter.post(
     res.json({
       dry_run: dryRun,
       ...result,
-      // Auto-select only (the explicit-ids response is unchanged):
-      // the corroboration tally, keyed like R6's extra.categories_corroboration.
-      ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
       truncated: notReached > 0,
       not_reached: notReached,
+      // Auto-select only (last key; the explicit-ids response is unchanged):
+      // the corroboration tally, keyed like R6's extra.categories_corroboration.
+      ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
     });
   },
 );
