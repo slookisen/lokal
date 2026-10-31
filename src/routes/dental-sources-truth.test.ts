@@ -56,8 +56,8 @@
  *   (l) F2-S2, /proveniens is the method page: title and h1 «Metode og
  *       kilder»; Daniel named as responsible editor (Daniel 2026-10-18,
  *       question 14); the Helfo, akutt and specialty texts, each checked
- *       against the code that shows the badge (and no claim that Helfo needs
- *       a source before F2-S6 builds that rule); needs_review, «sist
+ *       against the code that shows the badge (Helfo needs a stored source
+ *       since F2-S6, and the text says so); needs_review, «sist
  *       kontrollert» and «sist oppdatert»; how to report an error; the live
  *       numbers from the caches only (no query per request, «minst» when a
  *       clinic has no fylke); the repeat-park rule only while
@@ -819,20 +819,22 @@ export async function runDentalSourcesTruthTests(opts: { log?: boolean } = {}): 
         "l3: the page names Daniel as responsible editor, nb and en");
       assertEq((main.match(/Ansvarlig redaktør|Responsible editor/g) || []).length, 2, "l3b: … and names no other");
 
-      // Helfo: read from the clinic's website; the badge is shown from
-      // helfo_agreement alone until F2-S6 (resolveHelfoClaim) adds the source rule.
+      // Helfo: read from the clinic's website; since F2-S6 the badge needs a
+      // stored source (resolveHelfoClaim), and the text says so.
       const seoSrc = read("src/routes/dental-seo.ts");
       const helfoNb = paragraphStarting(nbPart, "Helfo-direkteoppgjør");
       const helfoEn = paragraphStarting(enPart, "Helfo direct billing");
       assertTrue(helfoNb.includes("er tolket automatisk fra klinikkens nettside") && helfoNb.includes("ikke en bekreftelse fra Helfo") &&
         helfoEn.includes("is read automatically from the clinic's website") && helfoEn.includes("not a confirmation from Helfo"),
         "l4: Helfo is read automatically from the clinic's website, and is no confirmation from Helfo");
-      assertTrue(seoSrc.includes('if (!inactive && agent.helfo_agreement === "true")'), "l4b control: the profile shows the Helfo badge from helfo_agreement alone");
-      assertTrue(!fs.existsSync(path.join(ROOT, "src/services/dental-helfo-claim.ts")) && !seoSrc.includes("resolveHelfoClaim("),
-        "l4c control: F2-S6's resolveHelfoClaim is not built yet (when it lands, the Helfo text and l4d change with it)");
-      assertTrue(!/\bbare\b|\bonly\b/.test(helfoNb + helfoEn) && helfoNb.includes("merket vises når uttrekket har registrert det") &&
-        helfoEn.includes("the badge is shown when the extraction has recorded that"),
-        "l4d: the Helfo text claims no source rule yet, only what shows the badge today", helfoNb);
+      const helfoClaim = require("../services/dental-helfo-claim") as typeof import("../services/dental-helfo-claim");
+      assertTrue(seoSrc.includes("if (!inactive && resolveHelfoClaim(agent))") && helfoClaim.HELFO_CLAIM_REQUIRES_SOURCE,
+        "l4b control: the profile shows the Helfo badge from resolveHelfoClaim, with the source rule on");
+      assertTrue(!/if \((!inactive && )?agent\.helfo_agreement === "true"\)/.test(seoSrc),
+        "l4c control: no Helfo badge or sentence is read from helfo_agreement alone");
+      assertTrue(helfoNb.includes("merket vises bare når uttrekket har lagret kilden sammen med opplysningen") && helfoNb.includes("Uten lagret kilde viser vi ingen Helfo-opplysning") &&
+        helfoEn.includes("the badge is shown only when the extraction has stored its source with the detail") && helfoEn.includes("Without a stored source we show no Helfo detail"),
+        "l4d: the Helfo text states the source rule the badge follows (F2-S6)", helfoNb);
 
       // Akutt: as resolveAcuteClaim decides.
       const acute = require("../services/dental-acute-claim") as typeof import("../services/dental-acute-claim");

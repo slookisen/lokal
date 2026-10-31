@@ -214,8 +214,11 @@ export async function runDentalSearchKommuneUnionTests(opts: { log?: boolean } =
     const store = require("../services/dental-store") as typeof import("../services/dental-store");
     const gaz = require("../services/dental-search-gazetteer") as typeof import("../services/dental-search-gazetteer");
     gaz.__resetDentalSearchGazetteerForTesting();
-    const add = (row: Record<string, unknown>, extra: Record<string, unknown> = {}): string => {
+    // F2-S6: a Helfo row gets the source its claim needs (resolveHelfoClaim).
+    const HELFO_PROV = JSON.stringify({ helfo_agreement: [{ value: "true", source_type: "homepage", source_url: "https://example.test/helfo", fetched_at: "2026-05-01T10:00:00Z" }] });
+    const add = (row: Record<string, unknown>, given: Record<string, unknown> = {}): string => {
       const id = store.createDentalAgent({ telefon: "22000000", ...row } as any);
+      const extra = row.helfo_agreement === "true" && given.field_provenance === undefined ? { ...given, field_provenance: HELFO_PROV } : given;
       const cols = Object.keys(extra);
       if (cols.length) db.prepare(`UPDATE dental_agents SET ${cols.map((c) => `${c} = @${c}`).join(", ")} WHERE id = @id`).run({ ...extra, id });
       return id;
