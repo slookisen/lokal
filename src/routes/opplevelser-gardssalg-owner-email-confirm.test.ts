@@ -16,6 +16,9 @@
  *      (existing owner-lock check); manual/claim locks are never downgraded.
  * AC4  "fjern" clears the confirmation together with the profile; an admin
  *      can reset it.
+ * OA-01 (2026-10-31): a reply from the address Opplevagent's own outreach was
+ *      delivered to is accepted through the claim flow's outreach_delivered
+ *      tier (c9-c11).
  *
  * Same in-memory-DB + synthetic router.handle() harness as the claim-revoke
  * and claimed-badge suites. No network: the provider fixtures have no
@@ -158,6 +161,12 @@ export function runOpplevelserGardssalgOwnerEmailConfirmTests(opts: { log?: bool
       mk({ id: "oec-claimed", navn: "Overtatt Gard", slug: "overtatt-gard", lat: 59.35, lon: 9.75, claimed_at: "2026-07-15T09:00:00.000Z", content_source: "claim", org_nr: "955555555", brreg_verified: 1, epost: "eier@overtattgard.no" });
       mk({ id: "oec-plain", navn: "Vanlig Gard", slug: "vanlig-gard", lat: 59.36, lon: 9.76 });
       mk({ id: "oec-remove", navn: "Fjern Gard", slug: "fjern-gard", lat: 59.37, lon: 9.77, org_nr: "966666666", brreg_verified: 1, epost: "eier@okgard.no" });
+      // OA-01: no stored epost, but a real Opplevagent outreach delivery.
+      mk({ id: "oec-oa", navn: "Utsendt Gard", slug: "utsendt-gard", lat: 59.38, lon: 9.78, org_nr: "977777777", brreg_verified: 1 });
+      db.prepare(
+        `INSERT INTO experience_outreach_sent_log (provider_id, recipient_email, sent_at, channel, message_id, notes, is_test)
+         VALUES ('oec-oa', 'eier@utsendtgard.no', datetime('now', '-3 days'), 'email', '<oec-oa-1@opplevagent.no>', NULL, 0)`,
+      ).run();
 
       const auth = { "x-admin-key": testKey };
       const URL_ = "/admin/gardssalg-owner-email-confirm";
@@ -207,6 +216,14 @@ export function runOpplevelserGardssalgOwnerEmailConfirmTests(opts: { log?: bool
       assertEq(dry.body.fields, [{ field: "about_text", action: "lock" }], "c5: dry-run plans the field lock");
       assertEq(row("oec-ok").owner_email_confirmed_at, null, "c6: dry-run writes nothing");
       assertTrue(!(row("oec-ok").field_provenance || "").includes("owner_locks"), "c7: dry-run locks nothing");
+
+      // OA-01: the claim flow's outreach_delivered tier counts here too — a
+      // reply from the address Opplevagent's outreach reached is accepted.
+      const oaDry = await callPost(opplevelserRouter, URL_, auth, { provider_id: "oec-oa", sender_email: "Eier@UtsendtGard.no", thread_id: "thr-oa" });
+      assertEq([oaDry.status, oaDry.body.accepted_source], [200, "outreach_delivered"], "c9: the outreach-delivered address is accepted as outreach_delivered");
+      assertEq(row("oec-oa").owner_email_confirmed_at, null, "c10: ...dry-run, nothing written");
+      const oaOther = await callPost(opplevelserRouter, URL_, auth, { provider_id: "oec-oa", sender_email: "annen@utsendtgard.no", thread_id: "thr-oa" });
+      assertEq(oaOther.body.error, "sender_not_accepted", "c11: another address on that domain is still rejected");
 
       const strictApply = await callPost(opplevelserRouter, URL_, auth, { provider_id: "oec-ok", sender_email: "eier@okgard.no", thread_id: "thr-1", apply: "true" });
       assertEq(strictApply.body.dry_run, true, "c8: apply must be the literal boolean true");

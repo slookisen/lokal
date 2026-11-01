@@ -43182,6 +43182,27 @@ runSerial(async () => {
   }
 });
 
+// ── OA-01 (dev-request 2026-07-30-opplevagent-claim-epost-og-perfelt-laas):
+// the claim page now sees Opplevagent's own outreach — tier outreach_delivered
+// reads experience_outreach_sent_log (real, delivered, same provider, no
+// bounce, not shared). Own in-memory experiences + RFB dbs and a real
+// http.Server, restored in its own finally — runSerial like the suites above.
+runSerial(async () => {
+  console.log("\n── OA-01: gardssalg-claim outreach_delivered (Opplevagent outreach log) ──");
+  try {
+    const { runGardssalgClaimOutreachDeliveredOa01Tests } = require("../src/routes/gardssalg-claim-outreach-delivered-oa01.test") as
+      typeof import("../src/routes/gardssalg-claim-outreach-delivered-oa01.test");
+    const oa01 = await runGardssalgClaimOutreachDeliveredOa01Tests({ log: false });
+    passed += oa01.passed;
+    failed += oa01.failed;
+    for (const f of oa01.failures) failures.push("gardssalg-claim-outreach-delivered-oa01: " + f);
+    console.log(`  gardssalg-claim-outreach-delivered-oa01: ${oa01.passed} passed, ${oa01.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim-outreach-delivered-oa01: unexpected error: " + String(err?.message || err));
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-08-06-eier-ser-reserver-knapp-paa-egen-profil: owner-CTA swap (decideOwnerCtaSwap + cache-safety regression) ──");
   try {

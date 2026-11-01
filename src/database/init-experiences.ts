@@ -1251,6 +1251,9 @@ export function initExperiencesSchema(db: Database.Database): void {
         -- (2026-08-07) live-wired the harvest into issueClaimMagicLink() and
         -- the public claim-entry route; they are reachable from a live INSERT
         -- into this table from that slice onwards.
+        -- 'outreach_delivered' added OA-01 (2026-10-31): the address
+        -- Opplevagent's own outreach (experience_outreach_sent_log) was
+        -- delivered to for this provider -- see findOpplevagentOutreachClaimEmail().
         -- Column stays untyped TEXT; every change here has been comment-only,
         -- no migration needed.
         token TEXT NOT NULL UNIQUE,
