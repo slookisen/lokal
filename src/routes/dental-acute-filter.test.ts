@@ -53,6 +53,8 @@
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
+import { stripAiUtm } from "../../tests/helpers/ai-utm";
+
 function callRoute(router: any, path: string, query: Record<string, string> = {}): Promise<{ status: number; text: string; body: any }> {
   return new Promise((resolve) => {
     const req: any = { method: "GET", url: path, originalUrl: path, path, params: {}, query, headers: {}, ip: "127.0.0.1", get() { return undefined; } };
@@ -404,8 +406,9 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
       const { parseDentalQuery } = require("../services/dental-query-parser") as typeof import("../services/dental-query-parser");
       const { buildNorwegianGazetteer } = require("../services/search-intent/norwegian-query") as typeof import("../services/search-intent/norwegian-query");
       const { NORWEGIAN_SEARCH_AREAS } = require("../config/norway-search-areas") as typeof import("../config/norway-search-areas");
+      // klikk-fra-ai-svar S3: profil_url carries the AI mark over MCP; main's answer is compared without it.
       const akuttText = async (args: Record<string, unknown>) =>
-        String(((await client.callTool({ name: "tannlege_akutt", arguments: args })) as any).content[0].text);
+        stripAiUtm(String(((await client.callTool({ name: "tannlege_akutt", arguments: args })) as any).content[0].text));
       // The answer as main 61ebb322 built it, before S8: `fylke` as a county filter and no `tolkning`.
       const before = (fylke?: string): string => {
         const filter: Record<string, unknown> = { acute_vakt: 1 };

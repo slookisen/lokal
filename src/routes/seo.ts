@@ -82,7 +82,7 @@ import {
   SALGSKANAL_CATEGORY_NAMES,
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
-import { addUtmParams } from "../utils/url-utm";
+import { addUtmParams, withRequestQuery } from "../utils/url-utm";
 import {
   normalizeOpeningHours,
   parseOpeningHoursText,
@@ -5324,7 +5324,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           // 301 tells crawlers to update their index — same rationale as
           // the fuzzy-match redirect below, but backed by an exact
           // historical record instead of a similarity guess.
-          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+          return res.redirect(301, withRequestQuery(localizedPath("/produsent/" + canonical, lang), req.originalUrl));
         }
       }
 
@@ -5339,7 +5339,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (canonical && canonical !== slug) {
           // 301 tells crawlers to update their index — preserves SEO juice
           // and teaches Perplexity/ChatGPT/Claude the canonical URL.
-          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
+          return res.redirect(301, withRequestQuery(localizedPath("/produsent/" + canonical, lang), req.originalUrl));
         }
       }
 

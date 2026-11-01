@@ -4,6 +4,7 @@ import path from "path";
 import { getDb, closeDb } from "./database/init";
 import { runTrafficHistoryJob, startTrafficHistoryScheduler } from "./services/traffic-history";
 import { flushAiDeliveries, startAiDeliveriesFlusher } from "./services/profile-ai-deliveries";
+import { aiProfileLinksForAiSearch } from "./middleware/ai-profile-links";
 import { flushAiClicks, startAiClicksFlusher } from "./services/profile-ai-clicks";
 import { runWalCheckpoints, getWalSizes } from "./services/wal-maintenance";
 import { isNameFtsEnabled, syncAgentsNameFts } from "./services/name-search-fts";
@@ -624,6 +625,11 @@ app.post("/admin/analytics/prune", adminLimiter);
 app.use("/api/tannlege", dentalLimiter);
 // Everything else gets the general limiter
 app.use("/api", generalLimiter);
+// dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 3: JSON answers
+// of the three public APIs to an ai_search client (ChatGPT-User / custom GPT
+// actions, Claude-User, Perplexity-User) get AI-tagged profile links
+// (utm_medium=api). Everyone else gets the answer unchanged.
+app.use(["/api/marketplace", "/api/tannlege", "/api/opplevelser"], aiProfileLinksForAiSearch);
 // dev-request 2026-07-03-agent-profile-conversations-stats slice 1:
 // /ut/:agentId/:kind lives outside /api (it's a bare redirect URL meant to
 // be pasted into profile pages), so it doesn't inherit the "/api" limiter

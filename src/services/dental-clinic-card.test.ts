@@ -82,6 +82,8 @@ const VERIFIED_BASIS = { brreg_status: "active", website_ownership: "verified", 
 
 // F1-S4c: «Akuttvakt» needs the quote from the source; STAMP is the same source without it.
 // helfo_agreement: the source the Helfo claim needs (F2-S6, resolveHelfoClaim).
+import { stripAiUtm } from "../../tests/helpers/ai-utm";
+
 const PROVENANCE = {
   acute_vakt: [{ source_type: "homepage", value: 1, quote: "Akuttvakt hver kveld og i helgene." }],
   telefon: [{ source_type: "brreg" }],
@@ -315,17 +317,18 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       const detail = JSON.parse(await callText("tannlege_info", { org_nr: "918750001" }));
       eq(Object.keys(detail), DETAIL_KEYS, "D1: tannlege_info keeps exactly its keys");
       eq([detail.epost, detail.acute_vakt, detail.mobil], ["post@tannlegenordmann.no", 1, null], "D2: e-mail shown, sourced acute_vakt, undisplayable mobil null");
-      ok(!detail.badges.includes("Spesialist") && detail.profil_url === seo.clinicProfileUrl(row(full)), "D3: no «Spesialist» badge (as before), profile URL from clinicProfileUrl");
+      ok(!detail.badges.includes("Spesialist") && stripAiUtm(detail.profil_url) === seo.clinicProfileUrl(row(full)) && detail.profil_url !== seo.clinicProfileUrl(row(full)), "D3: no «Spesialist» badge (as before), profile URL from clinicProfileUrl (AI-tagged over MCP, klikk-fra-ai-svar S3)");
       ok(!("epost" in search(full)), "D4: the search card has no e-mail");
     }
     {
       const text = await callText("tannlege_search", { fylke: "Vestland", limit: 25 });
-      const res = JSON.parse(text);
+      // klikk-fra-ai-svar S3: profil_url carries the AI mark over MCP only; the cards are compared without it.
+      const res = stripAiUtm(JSON.parse(text));
       const c = res.klinikker.find((k: any) => k.org_nr === "918750001");
       ok(!!c && !!c.adresse && !!c.postnummer && !!c.online_booking_url && Array.isArray(c.apningstider), "M1: a live search card for the enriched clinic has address, postcode, booking link and opening hours");
       ok(!/rating/i.test(text), "M2: no «rating» anywhere in the tannlege_search answer");
       eq(res.count, 5, "M3: count is unchanged (the five Vestland fixture clinics)");
-      const akutt = JSON.parse(await callText("tannlege_akutt", { fylke: "Vestland" }));
+      const akutt = stripAiUtm(JSON.parse(await callText("tannlege_akutt", { fylke: "Vestland" })));
       const a = akutt.klinikker.find((k: any) => k.org_nr === "918750001");
       ok(a?.akutt === "vakt" && akutt.rad_om_kommunal_tannlegevakt === DENTAL_EMERGENCY_NOTICE.text, "M4: tannlege_akutt gives the same card, akutt «vakt», and the emergency notice as its tannlegevakt advice");
       // The same clinic over MCP and A2A message/send: one card, the same values.
@@ -334,7 +337,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       eq([Object.keys(c ?? {}), differingKeys(c ?? {}, a2aWire)], [ALL_KEYS, []], "M6: the tannlege_search card (every key) has the same values as the A2A clinic with the same id");
       eq(differingKeys(a ?? { missing: true }, a2aWire), [], "M7: the tannlege_akutt card has the same values as the A2A clinic with the same id");
       // A clinic flagged acute_vakt = 1 without a source: not «vakt» on either surface.
-      const oslo = JSON.parse(await callText("tannlege_search", { fylke: "Oslo", limit: 25 }));
+      const oslo = stripAiUtm(JSON.parse(await callText("tannlege_search", { fylke: "Oslo", limit: 25 })));
       const b = oslo.klinikker.find((k: any) => k.navn === "Tann Uten Data AS");
       eq([b?.akutt, differingKeys(b ?? { missing: true }, a2aWireOf(bare))], [null, []], "M8: the unsourced acute_vakt clinic has akutt null and the same values over MCP and A2A");
     }
@@ -356,7 +359,7 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
         eq([a2aStamped?.acute_vakt, a2aStamped?.akutt, a2aStamped?.badges], [null, "accepts", ["Tar imot akuttpasienter"]], "Q3: A2A message/send gives acute_vakt null and akutt «accepts»");
         const info = JSON.parse(await callText("tannlege_info", { org_nr: "918750201" }));
         eq([info.acute_vakt, info.badges.includes("Akuttvakt"), info.badges.includes("Tar imot akuttpasienter")], [null, false, true], "Q4: tannlege_info: acute_vakt null, «Tar imot akuttpasienter»");
-        const akutt = JSON.parse(await callText("tannlege_akutt", { fylke: "Møre og Romsdal" }));
+        const akutt = stripAiUtm(JSON.parse(await callText("tannlege_akutt", { fylke: "Møre og Romsdal" })));
         const k = akutt.klinikker.find((x: any) => x.org_nr === "918750201");
         eq([akutt.count, k?.akutt, k?.badges, akutt.rad_om_kommunal_tannlegevakt], [1, "accepts", ["Tar imot akuttpasienter"], DENTAL_EMERGENCY_NOTICE.text],
           "Q5: tannlege_akutt still lists it (the akutt rows are unchanged), as «accepts», with the emergency notice as advice");
@@ -554,7 +557,11 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       for (const [fylke, limitBytes, label] of [["Rogaland", 12 * 1024, "a live-like mix"], ["Agder", 16 * 1024, "every optional field on every clinic"]] as const) {
         const searchText = await callText("tannlege_search", { query: "tannlege", fylke, limit: 25 });
         const akuttText = await callText("tannlege_akutt", { fylke });
-        const sizes = [Buffer.byteLength(searchText), Buffer.byteLength(akuttText)];
+        // klikk-fra-ai-svar S3: the budget is for the cards; the AI mark on each profil_url
+        // (at most 64 B, utm_source=ai_assistant) is measured on its own (Z1b).
+        const sizes = [Buffer.byteLength(stripAiUtm(searchText)), Buffer.byteLength(stripAiUtm(akuttText))];
+        const markBytes = [Buffer.byteLength(searchText) - sizes[0], Buffer.byteLength(akuttText) - sizes[1]];
+        ok(markBytes.every((n) => n > 0 && n <= 25 * 64), `Z1b ${fylke}: the AI mark on the 25 profile links adds at most 64 B per clinic`);
         if (log) console.log(`    ${fylke}: tannlege_search ${sizes[0]} B, tannlege_akutt ${sizes[1]} B`);
         eq([JSON.parse(searchText).klinikker.length, JSON.parse(akuttText).klinikker.length], [25, 25], `Z0 ${fylke}: (both answers carry 25 clinics)`);
         eq(

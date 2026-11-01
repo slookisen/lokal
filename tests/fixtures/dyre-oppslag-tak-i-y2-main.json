@@ -84,24 +84,24 @@
     },
     "rfb mcp lokal_find_offers": {
       "{\"items\":[\"honning\"],\"near\":\"Trondheim\"}": {
-        "sha256": "53941bf0283a963e50f6ce22ddf0ef6d03266da77c68d0e10e7a2142b6457f35",
-        "chars": 902
+        "sha256": "3ab8d27c990c619f81a17d05d34d31333c36a8aa37834de4a2c27e3554c64c38",
+        "chars": 964
       },
       "{\"items\":[\"honning\",\"egg\",\"kransekake\"],\"near\":\"Bærum\"}": {
-        "sha256": "a0e4a2d0841ae9433feb239a745229f24fb9d41970f736a01c1c112c72a51ab8",
-        "chars": 1823
+        "sha256": "9f9be1977cb8b138b00722e5442247241d6e5f5ea2b524f2ac6cad4669deca9d",
+        "chars": 1947
       },
       "{\"items\":[\"honning\",\"egg\",\"kransekake\",\"lynghonning\",\"grovbrød\",\"surdeigsbrød\",\"lammekjøtt\",\"spekepølse\",\"reinsdyrkjøtt\",\"tørrfisk\"],\"lat\":63.4305,\"lng\":10.3951}": {
-        "sha256": "53a2711cfde914066f88b13c9ef7a5c13bbe449ea2ff4edc609cc709d0bf5c9c",
-        "chars": 3077
+        "sha256": "b4c74857eace4ff4f18a6e1d82bfd79b8a7ff50bda9bef364e658011c93d7af0",
+        "chars": 3263
       },
       "{\"items\":[\"honning\",\"egg\",\"kransekake\",\"lynghonning\",\"grovbrød\",\"surdeigsbrød\",\"lammekjøtt\",\"spekepølse\",\"reinsdyrkjøtt\",\"tørrfisk\",\"fanaost\",\"syltetøy\",\"bringebærsyltetøy\",\"poteter\",\"gulrøtter\",\"løk\",\"melk\",\"smør\",\"laks\",\"ost\"],\"lat\":63.4305,\"lng\":10.3951,\"radius_km\":500}": {
-        "sha256": "f74f51aba4b9bb0713429c99a8f9bfba86cdd7b83971a12b61b9026f17708d20",
-        "chars": 10966
+        "sha256": "150d9f6c324bb2db2ee508ba8745bd92df8ccac9d084db7886afaf1fee2ddf14",
+        "chars": 11710
       },
       "{\"items\":[\"honning\",\"egg\",\"kransekake\",\"lynghonning\",\"grovbrød\",\"surdeigsbrød\",\"lammekjøtt\",\"spekepølse\",\"reinsdyrkjøtt\",\"tørrfisk\",\"fanaost\",\"syltetøy\",\"bringebærsyltetøy\",\"poteter\",\"gulrøtter\",\"løk\",\"melk\",\"smør\",\"laks\",\"ost\"],\"near\":\"Oslo\"}": {
-        "sha256": "bacbeea67f66d06cbd10eaaf98abb54492b33ea149fbf6c1d6bf1c1c351a20ea",
-        "chars": 3663
+        "sha256": "c9f97494f2ca9c47d5b518c1229192d0b120a5f34ead49fbe33c41d41554868f",
+        "chars": 3849
       }
     },
     "rfb geocoder lookups (extractAndGeocode)": {
@@ -348,42 +348,42 @@
     },
     "oa mcp discover_experiences": {
       "{\"fylke\":\"Troms\"}": {
-        "sha256": "8ce21c889175dde695c27abc5be405ba2f83550d3c2a679f49f18fb60d3f8ca0",
-        "chars": 3385
+        "sha256": "014fdd9d026aa14b48e064fbeb78deca7a82008d372eb2fc26664490227d35dd",
+        "chars": 3633
       },
       "{\"kommune\":\"Tromsø\"}": {
-        "sha256": "78c82938ea285de39def7acfb2d4deb8f190fba82447be797ca8c90a9d66bcf5",
-        "chars": 3391
+        "sha256": "710e502ea501e1ab6860aab39e612fe9bc3bc64072182f3bd35d1533561a0b7f",
+        "chars": 3639
       },
       "{\"fylke\":\"Troms\",\"season\":\"winter\"}": {
-        "sha256": "aae6df8769faded8063ed9238c48781108c90fb37389140f85a1efea965d791c",
-        "chars": 3432
+        "sha256": "4b5adeedc915b77931ee1e89bed09bb9661899b099d7e6e2bdfc5b4dd97dcd8c",
+        "chars": 3680
       },
       "{\"kommune\":\"Bergen\"}": {
-        "sha256": "561bbcc78f56c8689f50390b10008a3b537d1f34ba839c6b9fb2b38dc78ee4a4",
-        "chars": 1887
+        "sha256": "86cf4240e753a5dcf85571b70d1acf42feb05c8ab8d68b9c5d02fb33b2c832ce",
+        "chars": 2011
       },
       "{\"fylke\":\"Vestland\",\"query\":\"nordlys\"}": {
-        "sha256": "ea2bf60f840de44e6419297be5c5b8720c002a24e0d5d01b28e70577de2a2e2a",
-        "chars": 1887
+        "sha256": "cc3626d996973a8c4f820b0b3f058687c34de898c14570dbe04b2ba90b9e6681",
+        "chars": 2011
       }
     },
     "oa mcp discover_gardssalg": {
       "{\"fylke\":\"Vestland\"}": {
-        "sha256": "415b30966c67c685e6b2737d2d4a583cd9b243f8df3e5d90efa5b239bd67ccb7",
-        "chars": 1601
+        "sha256": "50cc1cc3b57049f2ca7d9a87152573a48245b996a61166ef5d0da7cb980e228a",
+        "chars": 1725
       },
       "{\"kommune\":\"Ullensvang\"}": {
-        "sha256": "2d1c5398dd62ae3933352b9f9b2f2993f76b61e8039982d58259018b77d07372",
-        "chars": 1605
+        "sha256": "a991fe3791c345f8d6e7af0a06639d840362061b115edba7e1412568e9d56bfa",
+        "chars": 1729
       },
       "{\"fylke\":\"Buskerud\"}": {
-        "sha256": "860b20c5226ddd3aaf5913321b1ff27591aa2ae47b709eb2e42d31a03569a05f",
-        "chars": 995
+        "sha256": "283dd0b00ab1a49d5d8a21eaea25428977df16671ff43b1c20035aee5f58829f",
+        "chars": 1057
       },
       "{\"kommune\":\"Lier\",\"query\":\"Egge\"}": {
-        "sha256": "3ab388382fbd626498ac9596a878d36de368b0c1967e1f56b1843c893c38cd04",
-        "chars": 1015
+        "sha256": "4cbe2568b1dd04385cb8b93e16ad765256015a3d69e9ca58627273dd3ac5458c",
+        "chars": 1077
       }
     },
     "oa GET /sok": {
@@ -402,16 +402,16 @@
     },
     "dental mcp tannlege_search": {
       "{\"fylke\":\"Oslo\"}": {
-        "sha256": "4812103d00d3b1cd7fb8e1ec788c20362729e06a6fefd5b457c5474f9467e62b",
-        "chars": 672
+        "sha256": "9a56d40e279cf4731db75f362c7abdb44bcec32b9b83abdc3de2eb2a439f94e2",
+        "chars": 796
       },
       "{\"fylke\":\"Vestland\"}": {
-        "sha256": "de703b268b72decbdf7d5b0fa9017aa08ba72f2c110b4749547e6d55aac37315",
-        "chars": 690
+        "sha256": "7dec91cf389089af5f9a32716b5cac20dfe6523e6470869a568926d5e5ba2277",
+        "chars": 814
       },
       "{\"fylke\":\"Oslo\",\"query\":\"tannlege\"}": {
-        "sha256": "760f51f4a0962869c238fe9f9cd12284608229ac59502c3bde09505d736d9e8d",
-        "chars": 907
+        "sha256": "9efb00b940c4f1af819528a18a64f6ff6cf6b530ba8b5fe1b1ea2f83d71f003b",
+        "chars": 1031
       }
     },
     "dental mcp tannlege_akutt": {
@@ -426,16 +426,16 @@
     },
     "dental a2a data": {
       "{\"fylke\":\"Oslo\"}": {
-        "sha256": "f9f9c89339fcd2da8903df92480ca1eb583982259a0266e1fae850d1c7c06fff",
-        "chars": 2591
+        "sha256": "08b9532dbd95f79cb84a4c968bf500a864f5a7542c6e680701d48949bfbf677d",
+        "chars": 2715
       },
       "{\"specialty\":\"kjeveortopedi\"}": {
-        "sha256": "756888ef7c29024e1eb34abbe59a765824b29177365d4547d502b9fdc9aaef3e",
-        "chars": 1617
+        "sha256": "5c678ad8aeda396bf6c9b3af719c69116506ae0797c35ef05125eaf92e4a16ee",
+        "chars": 1679
       },
       "{\"q\":\"Bergen\"}": {
-        "sha256": "35b1f88f38335673bcce0b643167f04ba817df7c93f2ee98739252067f299ec7",
-        "chars": 2620
+        "sha256": "3ed60a37a9f0f620da0fa3ec63805cd608cc02319db13bc7aae6c11db1babc0d",
+        "chars": 2744
       },
       "{\"fylke\":\"Vestland\",\"helfo_agreement\":\"true\"}": {
         "sha256": "6443d7359578daaa82515b298dfbbe8694fc7eb84694bea339ea8d77b939a8d1",
@@ -461,5 +461,5 @@
       }
     }
   },
-  "captured_on": "undefined Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders."
+  "captured_on": "undefined Slice 4c (2026-10-22, dev-request 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel F3): the offers answers (REST + lokal_find_offers) re-captured on purpose: producer_confirmed is now sent for every offer of a producer who takes orders. Slice 3 of dev-request 2026-10-14-klikk-fra-ai-svar-per-profil (2026-11-01): the answers whose profile links are now AI-tagged at the transport (utm_source=<client>&utm_medium=mcp|a2a|api&utm_campaign=ai_search) re-captured on purpose, only those; with the tagging switched off every answer is main's."
 }

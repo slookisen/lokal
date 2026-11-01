@@ -2736,7 +2736,7 @@ console.log("── human-visits strip: referral classification + aggregation �
     assertEq(classifyAiClickSource({ referrer: "https://claude.ai/" }), "claude", "aiClick: claude.ai referrer");
     assertEq(classifyAiClickSource({ utm_source: "claude", utm_campaign: "ai_search" }), "claude", "aiClick: utm_source=claude without referrer");
     assertEq(classifyAiClickSource({ utm_source: "chatgpt.com" }), "chatgpt", "aiClick: utm_source=chatgpt.com");
-    assertEq(classifyAiClickSource({ utm_source: ["chatgpt.com", "claude"] }), "chatgpt", "aiClick: array, first whitelist hit");
+    assertEq(classifyAiClickSource({ utm_source: ["chatgpt.com", "claude"] }), "claude", "aiClick: array, our own mark (claude) wins over ChatGPT's chatgpt.com (klikk-fra-ai-svar S3)");
     assertEq(classifyAiClickSource({ utm_source: ["claude", "chatgpt.com"] }), "claude", "aiClick: array, reversed order is still AI");
     assertEq(classifyAiClickSource({ utm_source: "claudes-gard" }), null, "aiClick: producer campaign containing claude is not AI");
     assertEq(classifyAiClickSource({ utm_source: "chatgpt", utm_campaign: "ai_search" }), "chatgpt", "aiClick: utm_source=chatgpt without referrer");
@@ -44912,6 +44912,27 @@ runSerial(async () => {
     failed++;
     failures.push(`profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
     console.log(`  ✗ profile-ai-clicks: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
+runSerial(async () => {
+  // dev-request 2026-10-14-klikk-fra-ai-svar-per-profil, slice 3 («Merking»):
+  // profile links handed to AI clients over MCP, A2A and REST (ai_search) carry
+  // utm_*=ai_search, at the transport boundary only; 301s keep the query.
+  // Swaps getDb() and the dental / experiences db handles, so serial.
+  console.log("\n── Klikk fra AI-svar S3: AI-tagged profile links ──");
+  try {
+    const { runAiProfileLinksTests } = require("../src/middleware/ai-profile-links.test") as
+      typeof import("../src/middleware/ai-profile-links.test");
+    const r = await runAiProfileLinksTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("ai-profile-links: " + f);
+    console.log(`  ai-profile-links: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push(`ai-profile-links: unexpected error: ${String(err?.message || err)}`);
+    console.log(`  ✗ ai-profile-links: unexpected error: ${String(err?.message || err)}`);
   }
 });
 

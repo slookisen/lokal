@@ -183,7 +183,7 @@ export async function runProfileAiClicksTests(opts: { log?: boolean } = {}): Pro
       clear();
       visit("/produsent/aker-gaard-en?utm_source=chatgpt.com&utm_source=claude", HUMAN);
       flush();
-      assertEq(JSON.stringify(rows()), JSON.stringify([{ vertical_id: "rfb", profile_id: "p-1", ai_vendor: "chatgpt", n: 1 }]), "(b) utm_source array [chatgpt.com, claude] → counted once as AI");
+      assertEq(JSON.stringify(rows()), JSON.stringify([{ vertical_id: "rfb", profile_id: "p-1", ai_vendor: "claude", n: 1 }]), "(b) utm_source array [chatgpt.com, claude] → counted once as AI, under our own mark (claude; klikk-fra-ai-svar S3)");
 
       visit("/produsent/aker-gaard-en?utm_source=perplexity.ai", HUMAN, { profileId: "p-2" });
       visit("/produsent/aker-gaard-en?utm_campaign=ai_search", HUMAN, { profileId: "p-3" });

@@ -25,7 +25,8 @@ import { slugify } from "../utils/slug";
 import { textEntries } from "../utils/text-entries";
 import { areGenericCategoryNames, isGenericCategoryName, isCategoryLabel } from "../utils/category-label";
 import { openingHoursText } from "../utils/opening-hours";
-import { addAiUtmParams } from "../utils/url-utm";
+import { addAiUtmParams, detectAiClient } from "../utils/url-utm";
+import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription, normalizeProse } from "../services/description-quality";
@@ -753,6 +754,11 @@ export function registerTools(
   // lokal_order_status say (in its description) that messages[] is quoted
   // data; with ORDER_AGENT_ACTIONS_ENABLED alone its definition is unchanged.
   const orderMessagesOn = agentActionsOn && isOrderMessagesEnabled();
+
+  // «Klikk fra AI-svar» slice 3: every profile link in a tool result is tagged
+  // for AI (utm_medium=mcp), including lokal_find_offers, lokal_cart_submit and
+  // lokal_order_status, at this transport boundary only.
+  tagMcpToolResults(server, () => getClientIdentity?.());
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil): the
   // producers a data tool hands the caller, counted per profile with the
@@ -2160,20 +2166,7 @@ interface McpSession {
 // ─── MCP client identity detection ─────────────────────────
 // Identifies the AI platform from request headers.
 function detectMcpClient(req: Request): string | undefined {
-  const ua = (req.headers["user-agent"] || "").toLowerCase();
-  const origin = (req.headers["origin"] || "").toLowerCase();
-  const referer = (req.headers["referer"] || "").toLowerCase();
-
-  if (ua.includes("chatgpt") || ua.includes("openai") || origin.includes("openai") || origin.includes("chatgpt")) return "ChatGPT";
-  if (ua.includes("claude") || origin.includes("claude.ai") || origin.includes("anthropic")) return "Claude";
-  if (ua.includes("cursor")) return "Cursor";
-  if (ua.includes("copilot") || origin.includes("github.com")) return "GitHub Copilot";
-  if (ua.includes("windsurf")) return "Windsurf";
-  if (ua.includes("cline")) return "Cline";
-  if (ua.includes("continue")) return "Continue";
-  if (ua.includes("python")) return "Python SDK";
-  if (ua.includes("node")) return "Node SDK";
-  return undefined;
+  return detectAiClient(req.headers["user-agent"], req.headers["origin"]);
 }
 
 

@@ -24,6 +24,7 @@ import express from "express";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import Database from "better-sqlite3";
+import { stripAiUtm } from "../../tests/helpers/ai-utm";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 
 export interface TestSummary {
@@ -442,7 +443,9 @@ export async function runDentalProfileVerificationLineTests(
         console.log("SNAPSHOT_MCP=" + JSON.stringify(mcpText));
       }
       assertTrue(restBefore.text === SNAPSHOT_REST, "H6: GET /api/tannlege/agents/:id is byte-identical to the snapshot from main", restBefore.text);
-      assertTrue(mcpText === SNAPSHOT_MCP, "H7: MCP tannlege_info is byte-identical to the snapshot from main", mcpText);
+      // klikk-fra-ai-svar S3: profil_url carries the AI mark over MCP; the rest is main's.
+      assertTrue(stripAiUtm(mcpText) === SNAPSHOT_MCP && /\?utm_source=[a-z_]+&utm_medium=mcp&utm_campaign=ai_search"/.test(mcpText),
+        "H7: MCP tannlege_info is byte-identical to the snapshot from main, profil_url AI-tagged", mcpText);
       const newWords = /Kontroll og kilder|Ikke kontrollert ennå|Sist kontrollert|Brønnøysundregistrene kontrollert|Nettstedet bekreftet|tolket automatisk/;
       assertTrue(!newWords.test(restBefore.text) && !newWords.test(mcpText), "H8: no page text of this slice in the JSON answers");
       assertTrue(!/"(brreg_checked_at|website_ownership_checked_at|last_enriched_at|brreg_status|website_ownership)"/.test(restBefore.text + mcpText),
