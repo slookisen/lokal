@@ -498,6 +498,14 @@ export type ContentLinkRankOptions = {
    * stays a contact page).
    */
   reserveAboutSlotWithin?: number;
+  /**
+   * With reserveAboutSlotWithin: only an about link this returns true for
+   * can take the reserved slot (e.g. one inside the homepage's own section —
+   * a deep-path homepage on a shared host must not hand the slot to the
+   * host's root «Om oss», which the caller would then drop or misread).
+   * Ineligible about links keep their ordinary rank. Unset = any about link.
+   */
+  aboutEligible?: (url: string) => boolean;
 };
 
 /**
@@ -562,10 +570,12 @@ export function rankContentLinks(
   const cap = Math.max(0, max);
   const within = Math.min(opts?.reserveAboutSlotWithin ?? 0, cap);
   if (within >= 2) {
-    const aboutIdx = ranked.findIndex((l) => l.score === CONTENT_LINK_SCORE_ABOUT);
+    const eligible = opts?.aboutEligible;
+    const aboutIdx = ranked.findIndex((l) => l.score === CONTENT_LINK_SCORE_ABOUT && (!eligible || eligible(l.url)));
     if (aboutIdx >= within) {
-      // Sorted by score, so everything ahead of the first about link is a
-      // contact link: the about link takes the last reserved position.
+      // Nothing eligible within the first `within` places: the best eligible
+      // about link takes the last reserved position and the links from there
+      // on move one place down.
       const [about] = ranked.splice(aboutIdx, 1);
       ranked.splice(within - 1, 0, about!);
     }

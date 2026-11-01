@@ -4013,11 +4013,14 @@ async function crFetchGardssalgContent(
             gardssalgOrderContentPathsForNeed(needsDrivenOrdering).map((p) => ({ url: `${base}${p}`, label: p }));
     } else {
       // About-page run: the same discovery and section filter, with the best
-      // about link guaranteed a place among the first GARDSSALG_MAX_PAGES - 1
-      // targets (the sub-page slots); filtering only removes entries, so it
-      // can only move that link forward.
+      // IN-SECTION about link guaranteed a place among the first
+      // GARDSSALG_MAX_PAGES - 1 targets (the sub-page slots). An eligible
+      // link (urlIsInSection) always passes the `base` prefix filter below, so
+      // the reserved link is never one the filter then drops; the filter only
+      // removes other entries, which can only move the reserved link forward.
       const discovered = rankContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES, {
         reserveAboutSlotWithin: GARDSSALG_MAX_PAGES - 1,
+        aboutEligible: (url) => urlIsInSection(url, base),
       }).filter((l) => l.url.startsWith(base));
       targets =
         discovered.length > 0
@@ -4087,7 +4090,9 @@ async function crFetchGardssalgContent(
         fetchedPaths.push(t.label);
         // Only the producer's own section counts as its about page — the
         // final URL after a redirect must still be inside `base`.
-        if (aboutPage && t.about && subRes.ok && urlIsInSection(subRes.finalUrl || t.url, base)) {
+        // A page identical to the homepage (a soft 404, or a redirect back to
+        // the front page) is not an about page of its own.
+        if (aboutPage && t.about && subRes.ok && sub !== primaryHtml && urlIsInSection(subRes.finalUrl || t.url, base)) {
           aboutPagesOut.push({ url: subRes.finalUrl || t.url, html: sub });
         }
       }
@@ -4518,8 +4523,9 @@ export type GardssalgContentRefreshOutcome = { status: number; body: any };
  *   - homepage_candidate: summarizeAbout(homepage) and its source_url;
  *   - about_pages: every fetched about page with its candidate and verdict
  *     ("not_evaluated" for a row that does not need a description);
- *   - about_page_in_content_text: an about page's text is in the contentText
- *     the LLM rewrite/fill read this run;
+ *   - about_page_in_content_text: an about page's prose is within the first
+ *     GARDSSALG_REWRITE_SOURCE_CHAR_CAP chars of contentText — the part the
+ *     LLM rewrite/fill actually read this run;
  *   - deterministic_choice: the raw candidate handed to the judge;
  *     candidate_source: the judge-approved candidate's source (null = none);
  *   - about_text_action / about_text_after / about_text_source_url: what the
@@ -5576,8 +5582,11 @@ export async function runGardssalgContentRefresh(
         (isBlank(t.opening_hours_text) && !isBlank(hoursTrigger) && !jsonLdHours));
     if (judgeRequiredThisRow) judgeRequiredRows++;
     if (aboutPageMode) {
-      const aboutAction = wouldWriteActions.about_text ?? null;
+      const reportAboutAction = wouldWriteActions.about_text ?? null;
       const aboutTextOwnerLocked = isGardssalgFieldOwnerLocked(t, "about_text");
+      // What the LLM rewrite/fill actually read: the first
+      // GARDSSALG_REWRITE_SOURCE_CHAR_CAP chars of contentText.
+      const llmSourceText = contentText.slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
       aboutPageCandidates.push({
         provider_id: providerId,
         homepage_url: fetched.fetchUrl,
@@ -5587,12 +5596,12 @@ export async function runGardssalgContentRefresh(
         about_pages: aboutPick
           ? aboutPick.evaluated
           : (fetched.aboutPages ?? []).map((p) => ({ url: p.url, candidate: "", verdict: "not_evaluated" as const })),
-        about_page_in_content_text: (fetched.aboutPages ?? []).some((p) => aboutPageTextIncluded(p.html, contentText)),
+        about_page_in_content_text: (fetched.aboutPages ?? []).some((p) => aboutPageTextIncluded(p.html, llmSourceText)),
         deterministic_choice: aboutPageChosen ? "about_page" : "homepage",
         candidate_source: candidateAbout ? candidateAboutSource : null,
-        about_text_action: aboutAction as GardssalgAboutCandidateReport["about_text_action"],
-        about_text_after: aboutAction ? (rewriteAbout ?? candidateAbout ?? generatedAbout ?? null) : null,
-        about_text_source_url: aboutAction ? (provenance.about_text?.source_url ?? fetched.fetchUrl) : null,
+        about_text_action: reportAboutAction as GardssalgAboutCandidateReport["about_text_action"],
+        about_text_after: reportAboutAction ? (rewriteAbout ?? candidateAbout ?? generatedAbout ?? null) : null,
+        about_text_source_url: reportAboutAction ? (provenance.about_text?.source_url ?? fetched.fetchUrl) : null,
         owner_locked: aboutTextOwnerLocked,
         subpages_fetched: fetched.pagesFetchedPaths ?? [],
       });
@@ -5820,7 +5829,9 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     llm: true,
     ...(aboutPagePreview && !apply ? { aboutPagePreview: true } : {}),
   });
-  if (aboutPagePreview && apply && out.status === 200 && out.body && typeof out.body === "object") {
+  // Only when the preview really changed nothing: with the env flag on the
+  // logic runs anyway (about_page_mode: "env_flag").
+  if (aboutPagePreview && apply && out.status === 200 && out.body && typeof out.body === "object" && !out.body.about_page_mode) {
     out.body.about_page_preview_ignored = "apply";
   }
   res.status(out.status).json(out.body);

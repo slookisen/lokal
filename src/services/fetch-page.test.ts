@@ -309,6 +309,30 @@ export async function runFetchPageTests(opts: { log?: boolean } = {}): Promise<T
         5,
         "about-slot-10: … and the list length is unchanged",
       );
+      // Review finding 1: a deep-path homepage on a shared host. The host's
+      // root /about must not take the reserved slot from the producer's own
+      // «Om oss» inside its section.
+      const deep =
+        `<a href="/medlem/gard-x/kontakt">Kontakt</a><a href="/medlem/gard-x/kontakt-oss">Kontakt oss</a>` +
+        `<a href="/medlem/gard-x/contact">Contact</a><a href="/medlem/gard-x/kontaktinfo">Kontaktinfo</a>` +
+        `<a href="/about">About</a><a href="/medlem/gard-x/om-oss">Om oss</a>`;
+      const inSection = (u: string) => new URL(u).pathname.startsWith("/medlem/gard-x/");
+      const noPredicate = discoverContentLinks(deep, "https://hanen.no/medlem/gard-x", 3, { reserveAboutSlotWithin: 3 });
+      assertEq(noPredicate[2], "https://hanen.no/about", "about-slot-11: (the bug) without a predicate the root /about takes the slot");
+      const withPredicate = discoverContentLinks(deep, "https://hanen.no/medlem/gard-x", 3, {
+        reserveAboutSlotWithin: 3,
+        aboutEligible: inSection,
+      });
+      assertEq(withPredicate[2], "https://hanen.no/medlem/gard-x/om-oss", "about-slot-12: with aboutEligible the in-section «Om oss» takes it");
+      assertTrue(!withPredicate.includes("https://hanen.no/about"), "about-slot-13: … and the root /about is not fetched");
+      const g5 = discoverContentLinks(deep, "https://hanen.no/medlem/gard-x", 5, { reserveAboutSlotWithin: 4, aboutEligible: inSection });
+      assertEq(g5.indexOf("https://hanen.no/medlem/gard-x/om-oss"), 3, "about-slot-14: gårdssalg shape: the in-section «Om oss» takes slot 4");
+      const onlyRoot = `<a href="/medlem/gard-x/kontakt">K</a><a href="/medlem/gard-x/kontakt-oss">K</a><a href="/medlem/gard-x/contact">C</a><a href="/about">About</a>`;
+      assertEq(
+        discoverContentLinks(onlyRoot, "https://hanen.no/medlem/gard-x", 3, { reserveAboutSlotWithin: 3, aboutEligible: inSection }),
+        discoverContentLinks(onlyRoot, "https://hanen.no/medlem/gard-x", 3),
+        "about-slot-15: no eligible about link -> today's ranking",
+      );
     }
 
     // ── 8. fetchPage end-to-end against a mocked network ───────────────────

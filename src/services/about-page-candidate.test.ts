@@ -25,6 +25,9 @@ import {
   urlIsInSection,
   homepageSectionBase,
   aboutPageTextIncluded,
+  producerNameTokens,
+  aboutPageNamesProducer,
+  ABOUT_PAGE_NOT_ABOUT_PRODUCER,
 } from "./about-page-candidate";
 import {
   summarizeAboutPageProse,
@@ -244,6 +247,7 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
           { url, html: good },
           { url: "https://tveras.no/om-garden", html: good },
         ],
+        producerName: "Tverås Gårdsmat",
       });
       assertEq(pick.chosen?.url, url, "pick-17: the first page that passes every guard is chosen");
       assertEq(pick.evaluated.map((e) => e.verdict), ["no_prose", "chosen", "not_evaluated"], "pick-18: verdict per page, in order");
@@ -253,6 +257,42 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
       const home = `<html><head><meta name="description" content="${HOME_SHORT_META}"></head><body><p>Velkommen!</p></body></html>`;
       assertEq(summarizeAbout(home), HOME_SHORT_META, "pick-19: fixture homepage candidate is its short meta");
       assertTrue(!meetsAboutQualityBar(HOME_SHORT_META), "pick-20: … which is below the quality bar on its own");
+    }
+
+    // ── 7b. Is the page about THIS producer? ───────────────────────────────
+    {
+      assertEq(producerNameTokens("Tverås Gårdsmat"), ["tveras"], "name-1: generic words dropped, accents folded");
+      assertEq(producerNameTokens("Tverås Gårdsmat — Gol"), ["tveras"], "name-2: the place suffix after « — » is dropped");
+      assertEq(producerNameTokens("Hjortehagen Gård AS (Stokke)"), ["hjortehagen"], "name-3: AS and a parenthesised place dropped");
+      assertEq(producerNameTokens("Gården AS"), [], "name-4: only generic words -> no distinctive token");
+      assertEq(producerNameTokens("Voss Fellesbryggeri"), ["voss", "fellesbryggeri"], "name-5: every distinctive word kept");
+      assertEq(producerNameTokens(null), [], "name-6: no name -> none");
+      const village = aboutPageHtml([
+        "Gol er en bygd i Hallingdal med lange tradisjoner for jordbruk og husdyrhold. Stavkirken herfra står i dag på Bygdøy i Oslo.",
+        "Bygda vokste fram rundt jernbanen på begynnelsen av nittenhundretallet, og mange gamle gardsbygninger står fortsatt på hver side av elva.",
+      ]).replace("<title>Om oss – Tverås Gårdsmat</title>", "<title>Historie</title>").replace("<h1>Om oss</h1>", "<h1>Historien om Gol</h1>");
+      const vPick = pickAboutPageCandidate({
+        homepageCandidate: HOME_SHORT_META,
+        aboutPages: [{ url: "https://tveras.no/historie", html: village }],
+        producerName: "Tverås Gårdsmat",
+      });
+      assertEq(vPick.chosen, null, "name-7: a «Historie» page about the village -> homepage candidate kept");
+      assertEq(vPick.evaluated[0]?.verdict, "not_about_producer", "name-8: verdict not_about_producer");
+      assertEq(vPick.refused, ABOUT_PAGE_NOT_ABOUT_PRODUCER, "name-9: reported as about_page_not_about_producer");
+      // Named only in <h1>/<title>, not in the prose ("Vi …"): still about the producer.
+      const weOnly = aboutPageHtml([
+        "Vi er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite i fjellet om sommeren.",
+        LONG_PROSE_2,
+      ]);
+      const hPick = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: weOnly }], producerName: "Tverås Gårdsmat" });
+      assertEq(hPick.chosen?.url, url, "name-10: the producer named in the page title -> about candidate");
+      assertTrue(aboutPageNamesProducer("", "<html><body><h1>Om Tveråsgarden</h1></body></html>", ["tveras"]), "name-11: a compound in <h1> counts");
+      assertTrue(!aboutPageNamesProducer("Gol og Hallingdal", "<html><body><h1>Om bygda</h1></body></html>", ["tveras"]), "name-12: absent -> false");
+      assertTrue(!aboutPageNamesProducer("btveras", "<html></html>", ["tveras"]), "name-13: must start a word");
+      const noToken = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: weOnly }], producerName: "Gården AS" });
+      assertEq(noToken.chosen, null, "name-14: a name with no distinctive word cannot be checked -> fail closed");
+      assertTrue(String(noToken.refused).startsWith(ABOUT_PAGE_NOT_ABOUT_PRODUCER), "name-15: … refused as about_page_not_about_producer");
+      assertEq(noToken.evaluated.map((e) => e.verdict), ["not_evaluated"], "name-16: … nothing evaluated");
     }
 
     // ── 8. Section scope ───────────────────────────────────────────────────

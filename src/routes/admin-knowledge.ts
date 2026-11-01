@@ -2008,17 +2008,21 @@ async function hcrFetchHomepageContent(
         if (sub) combinedHtml += "\n" + sub;
       }
     } else {
+      // Only the producer's own section counts as its about page — and only
+      // such a link may take the reserved slot (a deep-path homepage on a
+      // shared host must not give it to the host's root «Om oss»).
+      const section = homepageSectionBase(primary.finalUrl || fetchUrl);
+      const inSection = (url: string): boolean => !!section && urlIsInSection(url, section);
       // Spec 1: an about link gets one of the HCR_CONTENT_PATHS.length slots
       // even when three contact links outrank it — same number of fetches.
       const ranked = rankContentLinks(primaryHtml, u.toString(), HCR_CONTENT_PATHS.length, {
         reserveAboutSlotWithin: HCR_CONTENT_PATHS.length,
+        aboutEligible: inSection,
       });
       const targets: Array<{ url: string; about: boolean }> =
         ranked.length > 0
           ? ranked.map((l) => ({ url: l.url, about: l.score === CONTENT_LINK_SCORE_ABOUT }))
           : HCR_CONTENT_PATHS.map((p) => ({ url: `${base}${p}`, about: isAboutFallbackPath(p) }));
-      // Only the producer's own section counts as its about page.
-      const section = homepageSectionBase(primary.finalUrl || fetchUrl);
       for (const target of targets) {
         // No sub-page is started after a caller's deadline.
         if (io?.deadlineAt !== undefined && Date.now() >= io.deadlineAt) break;
@@ -2026,9 +2030,11 @@ async function hcrFetchHomepageContent(
         const subRes = await hcrFetchPage(target.url, io);
         const sub = subRes.ok ? subRes.html : null;
         if (sub) combinedHtml += "\n" + sub;
-        if (sub && subRes.ok && target.about) {
+        // A page identical to the homepage (a soft 404, or a redirect back to
+        // the front page) is not an about page of its own.
+        if (sub && subRes.ok && target.about && sub !== primaryHtml) {
           const finalSubUrl = subRes.finalUrl || target.url;
-          if (section && urlIsInSection(finalSubUrl, section)) aboutPages.push({ url: finalSubUrl, html: sub });
+          if (inSection(finalSubUrl)) aboutPages.push({ url: finalSubUrl, html: sub });
         }
       }
     }
@@ -2139,7 +2145,9 @@ export interface HomepageContentRefreshResult {
  *   - stored_about: agent_knowledge.about before the run;
  *   - homepage_candidate: summarizeAbout(homepage) and its source_url;
  *   - about_pages: every fetched about page with its candidate and verdict
- *     (AboutPageVerdict), about_page_refusal when none was considered;
+ *     (AboutPageVerdict); about_page_refusal: why no about page was used
+ *     when that was a source/entity reason (host or ownership refusal, or
+ *     about_page_not_about_producer — the page does not name the producer);
  *   - chosen: which candidate went to the write gate ("about_page",
  *     "homepage", or "none" when neither cleared its guards), with
  *     chosen_text / chosen_source_url (the about page URL when chosen);
@@ -3526,8 +3534,9 @@ homepageContentRefreshRouter.post(
       // Auto-select only (last key; the explicit-ids response is unchanged):
       // the corroboration tally, keyed like R6's extra.categories_corroboration.
       ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
-      // Only when a caller sent about_page_preview with apply.
-      ...(aboutPagePreview && !dryRun ? { about_page_preview_ignored: "apply" } : {}),
+      // Only when a caller sent about_page_preview with apply and the env flag
+      // is off (with the flag on the logic runs anyway: about_page_mode).
+      ...(aboutPagePreview && !dryRun && !result.about_page_mode ? { about_page_preview_ignored: "apply" } : {}),
     });
   },
 );

@@ -31,6 +31,8 @@ import {
   meetsAboutQualityBar,
   extractVisibleText,
   extractProseParagraphs,
+  extractTitle,
+  decodeHtmlEntities,
   pageLooksLikeThemeSpam,
   stripNorwegianAccents,
 } from "./search-enrich";
@@ -114,6 +116,62 @@ export function aboutPageCandidateIsMoreSubstantial(
   return n >= ABOUT_PAGE_MIN_CONTENT_WORDS;
 }
 
+// Words of a producer name that say what kind of business it is, not which
+// one (folded: lower-case, æ/ø/å stripped). A name made only of these (and
+// words shorter than 3 letters) has nothing to recognise the producer by.
+const PRODUCER_NAME_GENERIC_WORDS: ReadonlySet<string> = new Set(
+  [
+    "as", "sa", "da", "ans", "enk", "nuf", "ba", "ltd",
+    "og", "and", "the", "med", "fra", "til", "ved", "hos", "paa", "for",
+    "gård", "gard", "gården", "garden", "gårds", "gards", "gårdene", "gardene",
+    "gårdsmat", "gardsmat", "gårdsbruk", "gårdsbruket", "gårdsbutikk", "gårdsbutikken",
+    "gårdsutsalg", "gårdsutsalget", "gårdsysteri", "gårdsbakeri", "gårdsmeieri",
+    "bruk", "bruket", "farm", "farms", "mat", "matforedling", "foredling", "produkter",
+    "bakeri", "bakeriet", "ysteri", "ysteriet", "meieri", "meieriet", "bryggeri", "bryggeriet",
+    "bryggerhus", "brygghus", "sideri", "sideriet", "cideri", "ciderhus", "mosteri", "mosteriet",
+    "brenneri", "brenneriet", "destilleri", "destilleriet", "vingård", "vingard",
+    "gartneri", "gartneriet", "planteskole", "slakteri", "slakteriet", "pølsemakeri", "røkeri",
+    "honning", "birøkt", "birøkteri", "økologisk", "kjøtt", "fisk", "sjømat", "bær", "frukt",
+    "grønt", "grønnsaker", "butikk", "butikken", "utsalg", "handel", "kafe", "kafé", "cafe",
+    "restaurant", "landhandel", "mølle", "mølla", "smie", "verksted",
+  ].map((w) => stripNorwegianAccents(w.toLowerCase())),
+);
+
+/**
+ * The words that identify THIS producer in its name (folded, >= 3 letters,
+ * not PRODUCER_NAME_GENERIC_WORDS, not a number), from the part before a
+ * place suffix («Tverås Gårdsmat — Gol», «… (Gol)»). PURE.
+ */
+export function producerNameTokens(name: string | null | undefined): string[] {
+  const head = String(name ?? "").split(/\s+[—–-]\s+|\s*\(/)[0] ?? "";
+  const out: string[] = [];
+  for (const w of stripNorwegianAccents(head.toLowerCase()).split(/[^a-z0-9]+/)) {
+    if (w.length < 3 || /^\d+$/.test(w) || PRODUCER_NAME_GENERIC_WORDS.has(w) || out.includes(w)) continue;
+    out.push(w);
+  }
+  return out;
+}
+
+/**
+ * True when the about page is about THIS producer: one of its
+ * producerNameTokens starts a word (compounds allowed: «Tveråsgarden») in the
+ * candidate text, the page title (og:title / <title>) or its first <h1>.
+ * A «Historie» page about the village, or a blog post, on the producer's own
+ * host does not name the producer and fails. PURE.
+ */
+export function aboutPageNamesProducer(candidate: string, html: string, tokens: readonly string[]): boolean {
+  if (tokens.length === 0) return false;
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? "";
+  const h1 = /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] ?? "";
+  const hay = stripNorwegianAccents(
+    decodeHtmlEntities([candidate, extractTitle(html), title, h1].join(" ").replace(/<[^>]+>/g, " ")).toLowerCase(),
+  );
+  return tokens.some((t) => new RegExp(`(?:^|[^a-z0-9])${t}`).test(hay));
+}
+
+/** pickAboutPageCandidate's refusal when no about page was chosen because none named the producer. */
+export const ABOUT_PAGE_NOT_ABOUT_PRODUCER = "about_page_not_about_producer";
+
 /** Why one fetched about page did not become the candidate ("chosen" when it did). */
 export type AboutPageVerdict =
   | "chosen"
@@ -123,6 +181,7 @@ export type AboutPageVerdict =
   | "not_substantiated"
   | "code_artifact"
   | "theme_spam"
+  | "not_about_producer"
   | "not_more_substantial"
   | "not_evaluated";
 
@@ -139,7 +198,13 @@ export type AboutPagePick = {
   chosen: { url: string; text: string } | null;
   /** Every fetched about page, in fetch order, with its verdict. */
   evaluated: AboutPageEvaluation[];
-  /** Set when no about page was considered at all (the caller's refusal, or the homepage candidate reads as spam). */
+  /**
+   * Why no about page was used, when that was a source/entity reason: the
+   * caller's refusal, a homepage candidate that reads as spam, or a producer
+   * name with no distinctive word (nothing considered at all); or
+   * ABOUT_PAGE_NOT_ABOUT_PRODUCER when a fetched page was rejected for not
+   * naming the producer and none was chosen.
+   */
   refused?: string;
 };
 
@@ -154,13 +219,16 @@ export type AboutPagePick = {
  *   4. checkAboutCandidateSubstantiatedBySource against THIS page's raw HTML
  *      plus its visible text (the homepage candidate's own source form);
  *   5. not looksLikeCodeArtifact, not looksLikeThemeSpam;
- *   6. aboutPageCandidateIsMoreSubstantial than the homepage candidate.
+ *   6. the page is about THIS producer (aboutPageNamesProducer: a
+ *      distinctive word of its name in the text, title or <h1>);
+ *   7. aboutPageCandidateIsMoreSubstantial than the homepage candidate.
  * Pages after the chosen one are reported as not_evaluated.
  *
  * Nothing is considered when `refusal` is set (the caller's own source
- * refusal: directory/social host, wrong-entity website, …) or when the
+ * refusal: directory/social host, wrong-entity website, …), when the
  * homepage candidate itself reads as theme spam (a domain that may be
- * hijacked is not a source for any page on it).
+ * hijacked is not a source for any page on it), or when the producer name
+ * has no distinctive word to check step 6 with (fail closed).
  */
 export function pickAboutPageCandidate(input: {
   homepageCandidate: string | null | undefined;
@@ -169,8 +237,13 @@ export function pickAboutPageCandidate(input: {
   refusal?: string | null;
 }): AboutPagePick {
   const evaluated: AboutPageEvaluation[] = [];
+  const nameTokens = producerNameTokens(input.producerName);
   const refused =
-    input.refusal ?? (looksLikeThemeSpam(input.homepageCandidate) ? "homepage candidate reads as theme spam" : null);
+    input.refusal ??
+    (looksLikeThemeSpam(input.homepageCandidate) ? "homepage candidate reads as theme spam" : null) ??
+    (input.aboutPages.length > 0 && nameTokens.length === 0
+      ? `${ABOUT_PAGE_NOT_ABOUT_PRODUCER} (no distinctive word in the producer name)`
+      : null);
   if (refused) {
     for (const p of input.aboutPages) evaluated.push({ url: p.url, candidate: "", verdict: "not_evaluated" });
     return { chosen: null, evaluated, refused };
@@ -207,12 +280,19 @@ export function pickAboutPageCandidate(input: {
       evaluated.push({ url: page.url, candidate: text, verdict: "theme_spam" });
       continue;
     }
+    if (!aboutPageNamesProducer(text, page.html, nameTokens)) {
+      evaluated.push({ url: page.url, candidate: text, verdict: "not_about_producer" });
+      continue;
+    }
     if (!aboutPageCandidateIsMoreSubstantial(text, input.homepageCandidate, input.producerName)) {
       evaluated.push({ url: page.url, candidate: text, verdict: "not_more_substantial" });
       continue;
     }
     evaluated.push({ url: page.url, candidate: text, verdict: "chosen" });
     chosen = { url: page.url, text };
+  }
+  if (!chosen && evaluated.some((e) => e.verdict === "not_about_producer")) {
+    return { chosen, evaluated, refused: ABOUT_PAGE_NOT_ABOUT_PRODUCER };
   }
   return { chosen, evaluated };
 }

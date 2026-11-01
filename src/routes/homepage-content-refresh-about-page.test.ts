@@ -33,7 +33,7 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
-import { ENRICHMENT_ABOUT_PAGE_FLAG } from "../services/about-page-candidate";
+import { ENRICHMENT_ABOUT_PAGE_FLAG, ABOUT_PAGE_NOT_ABOUT_PRODUCER } from "../services/about-page-candidate";
 
 export interface TestSummary {
   passed: number;
@@ -58,8 +58,8 @@ const NAV_3_CONTACT_1_ABOUT =
 function homepage(nav: string, meta: string = HOME_META): string {
   return `<html><head><title>Gård</title><meta name="description" content="${meta}"></head><body>${nav}<p>Velkommen!</p></body></html>`;
 }
-function aboutPage(paragraphs: string[]): string {
-  return `<html><head><title>Om oss</title><meta name="description" content="${HOME_META}"></head><body>
+function aboutPage(paragraphs: string[], name?: string): string {
+  return `<html><head><title>Om oss${name ? ` – ${name}` : ""}</title><meta name="description" content="${HOME_META}"></head><body>
 <header><nav><a href="/">Hjem</a><a href="/om-oss">Om oss</a></nav></header>
 <main><h1>Om oss</h1>${paragraphs.map((p) => `<p>${p}</p>`).join("\n")}</main>
 <footer><p>Alle rettigheter reservert.</p></footer></body></html>`;
@@ -90,13 +90,16 @@ const SITES: Record<string, Record<string, string>> = {
   "kodegard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": `<html><body><main><p>${HELIOS_CODE}</p></main></body></html>` },
   "spamgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": SPAM_ABOUT },
   "medlemsgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": UMBRELLA_ABOUT },
-  "laastgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": aboutPage([P1, P2, P3]) },
+  "laastgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": aboutPage([P1, P2, P3], "Låstgard") },
   "utenomgard.no": {
     "/": homepage(`<nav><a href="/kontakt">Kontakt</a><a href="/produkter">Produkter</a></nav>`),
     "/kontakt": CONTACT_PAGE,
     "/produkter": "<html><body><p>Lammekjøtt, pølser og spekemat.</p></body></html>",
   },
-  "hanen.no": {
+  // A deep-path homepage on a shared host whose root «Om oss» describes the
+  // host organisation (the hanen.no shape — hanen.no itself is a refused
+  // directory host, so an unlisted host is used).
+  "fellesportal.no": {
     "/medlem/gard-x": homepage(`<nav><a href="/om-oss">Om oss</a><a href="/medlem/gard-x/kontakt">Kontakt</a></nav>`),
     "/om-oss": aboutPage([
       "Hanen er en landsdekkende organisasjon for bygdeturisme og gardsmat, med flere hundre bedrifter over hele landet.",
@@ -112,15 +115,53 @@ const SITES: Record<string, Record<string, string>> = {
   // No links at all on the homepage: the fixed fallback paths are tried.
   "fallbackgard.no": {
     "/": homepage(""),
-    "/om-oss": aboutPage([P1, P2, P3]),
+    "/om-oss": aboutPage([P1, P2, P3], "Fallbackgard"),
+  },
+  // Review finding 1, the repro: four contact links inside the producer's
+  // section, the host's root /about and /om-oss, and the producer's own
+  // /medlem/gard-x/om-oss.
+  "fellesside.no": {
+    "/medlem/gard-x": homepage(
+      `<nav><a href="/medlem/gard-x/kontakt">Kontakt</a><a href="/medlem/gard-x/kontakt-oss">Kontakt oss</a>` +
+        `<a href="/medlem/gard-x/contact">Contact</a><a href="/medlem/gard-x/kontaktinfo">Kontaktinfo</a>` +
+        `<a href="/about">About</a><a href="/om-oss">Om oss</a><a href="/medlem/gard-x/om-oss">Om oss</a></nav>`,
+    ),
+    "/medlem/gard-x/kontakt": CONTACT_PAGE,
+    "/medlem/gard-x/kontakt-oss": CONTACT_PAGE,
+    "/medlem/gard-x/contact": CONTACT_PAGE,
+    "/medlem/gard-x/kontaktinfo": CONTACT_PAGE,
+    "/about": aboutPage([
+      "Fellessiden er en portal for lokale matprodusenter i hele landet, med over tusen medlemsbedrifter og egne sider for hver av dem.",
+      "Portalen drives av en ideell stiftelse og finansieres av medlemskontingenter og annonser fra samarbeidspartnere i bransjen.",
+    ], "Fellessiden"),
+    "/medlem/gard-x/om-oss": aboutPage([
+      "Fjellgard ligger øverst i dalen og har vært drevet av samme familie i fem generasjoner. Vi holder sau og geit på fjellbeite hele sommeren.",
+      P2,
+    ], "Fjellgard"),
+  },
+  // A village «Historie» page on the producer's own host (review finding 3).
+  "historiegard.no": {
+    "/": homepage(`<nav><a href="/historie">Historie</a></nav>`),
+    "/historie": aboutPage([
+      "Gol er en bygd i Hallingdal med lange tradisjoner for jordbruk og husdyrhold. Stavkirken herfra står i dag på Bygdøy i Oslo.",
+      "Bygda vokste fram rundt jernbanen på begynnelsen av nittenhundretallet, og mange gamle gardsbygninger står fortsatt på hver side av elva.",
+    ]).replace("<h1>Om oss</h1>", "<h1>Historien om Gol</h1>").replace("<title>Om oss</title>", "<title>Historie</title>"),
   },
 };
+
+// A site that answers every path with its front page (a soft 404): its
+// fallback /om-oss is the homepage again, prose and all.
+const SOFT_404_HOME =
+  `<html><head><meta name="description" content="${HOME_META}"></head><body><main>` +
+  `<p>Softgard er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite i fjellet om sommeren.</p>` +
+  `<p>${P2}</p></main></body></html>`;
 
 function makeFetch(log: string[]): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0]) => {
     const url = new URL(String(input instanceof Request ? input.url : input));
     log.push(url.toString());
     const host = url.host.replace(/^www\./, "");
+    if (host === "softgard.no") return new Response(SOFT_404_HOME, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
     const html = SITES[host]?.[url.pathname === "" ? "/" : url.pathname];
     if (html === undefined) return new Response("<html><body>Not found</body></html>", { status: 404, headers: { "content-type": "text/html" } });
     return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
@@ -131,14 +172,14 @@ interface RouteResult {
   status: number;
   body: any;
 }
-function callRoute(router: any, body: any): Promise<RouteResult> {
+function callRoute(router: any, body: any, query: Record<string, string> = {}): Promise<RouteResult> {
   return new Promise((resolve) => {
     const headers: Record<string, string> = { "x-admin-key": process.env.ADMIN_KEY ?? "", "content-type": "application/json" };
     const req: any = {
       method: "POST",
       url: "/homepage-content-refresh",
       originalUrl: "/homepage-content-refresh",
-      query: {},
+      query,
       headers,
       body,
       ip: "127.0.0.1",
@@ -212,8 +253,11 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         { id: "laastgard", name: "Låstgard", url: "https://laastgard.no/", curated: '{"about":true}', about: "Eierens egen tekst." },
         { id: "utenomgard", name: "Utenomgard", url: "https://utenomgard.no/" },
         { id: "fbgard", name: "Fbgard", url: "https://www.facebook.com/fbgard" },
-        { id: "hanengard", name: "Gard X", url: "https://hanen.no/medlem/gard-x" },
+        { id: "hanengard", name: "Gard X", url: "https://fellesportal.no/medlem/gard-x" },
         { id: "fallbackgard", name: "Fallbackgard", url: "https://fallbackgard.no/" },
+        { id: "fjellgard", name: "Fjellgard", url: "https://fellesside.no/medlem/gard-x" },
+        { id: "historiegard", name: "Tverås Gårdsmat", url: "https://historiegard.no/" },
+        { id: "softgard", name: "Softgard", url: "https://softgard.no/" },
       ];
 
       function freshDb(): Database.Database {
@@ -393,9 +437,48 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         assertEq(fb?.about_page_refusal, "directory/social host", "h-2: … with the refusal reported");
         assertEq(fb?.about_pages?.map((e: any) => e.verdict), ["not_evaluated"], "h-2b: … and its about page not evaluated");
         const hn = h.result.about_candidates?.find((x) => x.agent_id === "hanengard");
-        assertTrue(h.fetchLog.includes("https://hanen.no/om-oss"), "h-3: the host-root «Om oss» was fetched as before (fetch list unchanged)");
+        assertTrue(h.fetchLog.includes("https://fellesportal.no/om-oss"), "h-3: the host-root «Om oss» was fetched as before (fetch list unchanged)");
         assertEq(hn?.about_pages, [], "h-4: … but outside the homepage's section it is not the producer's about page");
         assertTrue(hn?.chosen !== "about_page", "h-5: … so it never becomes the candidate");
+      }
+
+      // ── (j) review finding 1: deep-path homepage, root /about vs own «Om oss» ─
+      {
+        const jOff = await run("fjellgard", { dryRun: true });
+        const j = await run("fjellgard", { dryRun: true, aboutPagePreview: true });
+        const home = "https://fellesside.no/medlem/gard-x";
+        assertEq(
+          jOff.fetchLog,
+          [home, `${home}/contact`, `${home}/kontakt`, `${home}/kontakt-oss`],
+          "j-1: flag off -> three of the four in-section contact links (today)",
+        );
+        assertEq(
+          j.fetchLog,
+          [home, `${home}/contact`, `${home}/kontakt`, `${home}/om-oss`],
+          "j-2: preview -> the producer's own «Om oss» takes the slot, still three sub-pages",
+        );
+        assertTrue(!j.fetchLog.includes("https://fellesside.no/about"), "j-3: the host's root /about is not fetched (its HTML never reaches combinedHtml)");
+        const x = j.result.about_candidates?.[0];
+        assertEq([x?.chosen, x?.chosen_source_url], ["about_page", `${home}/om-oss`], "j-4: the in-section «Om oss» is the candidate");
+      }
+
+      // ── (k) review finding 3: a village «Historie» page on the own host ───
+      {
+        const k = await run("historiegard", { dryRun: true, aboutPagePreview: true });
+        const x = k.result.about_candidates?.[0];
+        assertTrue(k.fetchLog.includes("https://historiegard.no/historie"), "k-1: the «Historie» page was fetched");
+        assertEq(x?.about_pages?.[0]?.verdict, "not_about_producer", "k-2: it does not name the producer -> not_about_producer");
+        assertEq(x?.about_page_refusal, ABOUT_PAGE_NOT_ABOUT_PRODUCER, "k-3: about_page_refusal = about_page_not_about_producer");
+        assertEq([x?.chosen, x?.chosen_text], ["homepage", HOME_META], "k-4: the homepage candidate is kept");
+      }
+
+      // ── (l) soft 404: a fallback /om-oss that is the homepage again ───────
+      {
+        const l = await run("softgard", { dryRun: true, aboutPagePreview: true });
+        const x = l.result.about_candidates?.[0];
+        assertTrue(l.fetchLog.includes("https://softgard.no/om-oss"), "l-1: the fallback /om-oss was fetched");
+        assertEq(x?.about_pages, [], "l-2: a page identical to the homepage is not an about page");
+        assertEq([x?.chosen, x?.chosen_source_url], ["homepage", "https://softgard.no/"], "l-3: so nothing is attributed to /om-oss");
       }
 
       // ── (i) route: about_page_preview is honoured only in a dry run ───────
@@ -416,6 +499,20 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         assertEq(ap.body?.about_page_preview_ignored, "apply", "i-7: the preview is ignored with apply, and said so");
         assertTrue(!("about_candidates" in (ap.body ?? {})), "i-8: no about candidates in the apply response");
         assertEq((db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'tveras'").get() as any).about, HOME_META, "i-9: apply wrote the homepage candidate, not the about page");
+        // apply in the QUERY (?apply=1), preview in the body.
+        const qdb = freshDb();
+        const q = await callRoute(homepageContentRefreshRouter, { agentIds: ["tveras"], about_page_preview: true }, { apply: "1" });
+        assertEq([q.status, q.body?.dry_run], [200, false], "i-10: ?apply=1 + preview in the body -> an apply run");
+        assertEq(q.body?.about_page_preview_ignored, "apply", "i-11: … the preview is ignored and said so");
+        assertTrue(!("about_page_mode" in (q.body ?? {})) && !("about_candidates" in (q.body ?? {})), "i-12: … no preview logic ran");
+        assertEq((qdb.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'tveras'").get() as any).about, HOME_META, "i-13: … the homepage candidate was written");
+        // Env flag on + apply + preview: the logic runs on the flag; nothing is "ignored".
+        freshDb();
+        process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = "1";
+        const fl = await callRoute(homepageContentRefreshRouter, { agentIds: ["tveras"], apply: true, about_page_preview: true });
+        delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
+        assertEq(fl.body?.about_page_mode, "env_flag", "i-14: flag on + apply -> about_page_mode env_flag");
+        assertTrue(!("about_page_preview_ignored" in (fl.body ?? {})), "i-15: … and no contradictory about_page_preview_ignored");
       }
     } catch (err: any) {
       failed++;
