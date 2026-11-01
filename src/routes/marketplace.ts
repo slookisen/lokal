@@ -3,7 +3,7 @@ import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise, productPriceText, productsWriteError, isSingleEmailAddress, CLAIM_CODE_VALID_HOURS, EMAIL_ADDRESS_MAX_LENGTH, formatClaimTime, type ClaimReviewReason, type SkippedKnowledgeField, type ClaimRateLimitScope, type ClaimCodeRoute, type ClaimResendRefusal } from "../services/knowledge-service";
 import { isDebioVerifiedValue, isOrganicClaimUmbrella, stripOrganicCategories } from "../services/organic-claims";
 import { textEntries } from "../utils/text-entries";
 import { geocodingService } from "../services/geocoding-service";
@@ -1778,6 +1778,9 @@ router.get("/knowledge/stats", (_req: Request, res: Response) => {
 // kjent-kontakt; the rule is documented in knowledge-service.ts):
 //   1. POST /agents/:id/claim         → code to the FARM's own e-mail, or the
 //                                        claim waits in the admin queue
+//      (the same claimant asking again while the code is valid gets the same
+//      claim back, status code_already_sent — K1)
+//   1b. POST /agents/:id/claim/resend → the same code once more, same address
 //   2. POST /agents/:id/claim/verify  → Submit code → get claim token
 //   3. PUT  /agents/:id/knowledge     → Update info (with claim token)
 // A queued claim gets its token only through POST /admin/agents/claim-review-
@@ -1801,13 +1804,58 @@ const CLAIM_QUEUED_MESSAGES: Record<ClaimReviewReason, string> = {
   shared_address: "E-postadressen er knyttet til flere gårder hos oss, så vi sender ikke kode dit. Kravet er sendt til manuell godkjenning, og vi kontakter deg på e-postadressen du oppga.",
 };
 
-// The claimId of a sent code lives only in the requester's browser, so the
-// per-profile answer points to the queue, never to "use the code".
-const CLAIM_RATE_LIMITED_MESSAGES: Record<ClaimRateLimitScope, string> = {
-  profile: "Det er nylig sendt en kode til gårdens e-post, og en ny kode kan ikke sendes ennå. Har du ikke tilgang til den e-posten, eller er adressen på profilen feil? Kryss av for «E-postadressen som står på profilen er feil eller utdatert», så går kravet til manuell godkjenning.",
+const CLAIM_LISTED_EMAIL_WRONG_HINT = "Har du ikke tilgang til gårdens e-post, eller er adressen på profilen feil? Kryss av for «E-postadressen som står på profilen er feil eller utdatert», så går kravet til manuell godkjenning.";
+
+const CLAIM_RATE_LIMITED_MESSAGES: Record<Exclude<ClaimRateLimitScope, "profile">, string> = {
   platform: "Det er sendt mange koder akkurat nå. Prøv igjen om en time.",
   review_profile: "Det ligger allerede flere krav på denne profilen til manuell godkjenning. Vi går gjennom dem og tar kontakt. Prøv igjen senere.",
   review_platform: "Det har kommet mange krav til manuell godkjenning akkurat nå. Prøv igjen om en time.",
+};
+
+/** Where a code went, for a message: the farm's own e-mail (rule 1) or the
+ *  claimant's own address (domain rule P1/P2). */
+function claimCodeDestination(via: ClaimCodeRoute | undefined, sentTo?: string): string {
+  if (via && via !== "farm_email") return sentTo ? sentTo : "e-postadressen som ble godkjent for profilen";
+  return sentTo ? `gårdens e-post ${sentTo}` : "gårdens e-post";
+}
+
+/**
+ * Rule 4's answer to someone who is NOT the claimant with the open code (the
+ * same claimant gets that claim back, K1): what has happened, when a new code
+ * can be sent, and the way to manual approval for someone without access to
+ * the farm's e-mail. It never says "use the code": the asker may not be the
+ * one it went to. While that code is still open, the one who asked for it is
+ * told that the same e-mail brings the code field back.
+ */
+function claimProfileRateLimitedMessage(retryAt: string | undefined, via: ClaimCodeRoute | undefined, codeOpen: boolean): string {
+  const at = retryAt ? Date.parse(retryAt) : NaN;
+  const when = Number.isFinite(at) ? `En ny kode kan sendes ${formatClaimTime(new Date(at))}.` : "En ny kode kan ikke sendes ennå.";
+  return `Det er alt sendt en kode til ${claimCodeDestination(via)}. ${when} ` +
+    (codeOpen ? "Var det du som ba om koden, skriv inn samme e-postadresse som da, så får du opp kodefeltet igjen. " : "") +
+    CLAIM_LISTED_EMAIL_WRONG_HINT;
+}
+
+/** K1 «Send koden på nytt» refusals: what happened and what to do next. */
+function claimResendRefusedMessage(reason: ClaimResendRefusal, retryAt?: string): string {
+  switch (reason) {
+    case "not_found": return "Vi finner ikke dette kravet. Start på nytt fra butikksiden med «Dette er min butikk».";
+    case "verified": return "Kravet er allerede bekreftet, og profilen er tatt over. Logg inn med e-post under «Allerede registrert?», så sender vi deg en innloggingslenke.";
+    case "pending_review": return "Kravet venter på manuell godkjenning, så det sendes ingen kode.";
+    case "closed":
+    case "expired": return "Koden er ikke lenger gyldig. Be om en ny kode fra butikksiden.";
+    case "already_resent": return `Koden er alt sendt på nytt én gang. Sjekk søppelpost og uønsket e-post. ${CLAIM_LISTED_EMAIL_WRONG_HINT}`;
+    case "too_early": {
+      const at = retryAt ? Date.parse(retryAt) : NaN;
+      return `Koden er nettopp sendt, og e-posten kan bruke noen minutter. Du kan be om å få den sendt på nytt ${Number.isFinite(at) ? formatClaimTime(new Date(at)) : "om litt"}.`;
+    }
+    case "platform": return CLAIM_RATE_LIMITED_MESSAGES.platform;
+    case "not_allowed": return `Vi kan ikke sende koden på nytt til denne profilen nå. ${CLAIM_LISTED_EMAIL_WRONG_HINT}`;
+  }
+}
+
+const CLAIM_RESEND_REFUSED_STATUS: Record<ClaimResendRefusal, number> = {
+  not_found: 400, verified: 400, pending_review: 409, closed: 400, expired: 400,
+  already_resent: 429, too_early: 429, platform: 429, not_allowed: 409,
 };
 
 const CLAIM_REVIEW_REASON_LABELS: Record<ClaimReviewReason, string> = {
@@ -1899,7 +1947,24 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
       return;
     }
     if (result.kind === "rate_limited") {
-      res.status(429).json({ success: false, error: CLAIM_RATE_LIMITED_MESSAGES[result.scope] });
+      const error = result.scope === "profile"
+        ? claimProfileRateLimitedMessage(result.retryAt, result.via, result.codeOpen === true)
+        : CLAIM_RATE_LIMITED_MESSAGES[result.scope];
+      res.status(429).json({ success: false, error, ...(result.retryAt ? { data: { retryAt: result.retryAt } } : {}) });
+      return;
+    }
+    if (result.kind === "code_already_sent") {
+      // K1: the same claimant's code is still valid — that claim, masked
+      // recipient, the code field again. Nothing is sent and nothing written.
+      const sentTo = maskEmail(result.recipient);
+      res.json({
+        success: true,
+        message: `Koden er alt sendt til ${claimCodeDestination(result.via, sentTo)}. Skriv den inn her.`,
+        data: {
+          claimId: result.claimId, status: "code_already_sent", sentTo, via: result.via,
+          expiresAt: result.expiresAt, resendAvailableAt: result.resendAvailableAt,
+        },
+      });
       return;
     }
     if (result.kind === "queued") {
@@ -1940,7 +2005,11 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
 
     // The recipient is shown masked, never in full.
     const sentTo = maskEmail(result.recipient);
-    const responseData: any = { claimId: result.claimId, status: "code_sent", sentTo, expiresInHours: CLAIM_CODE_VALID_HOURS };
+    // expiresAt and resendAvailableAt let selger.html keep the open claim (K1).
+    const responseData: any = {
+      claimId: result.claimId, status: "code_sent", sentTo, via: result.via, expiresInHours: CLAIM_CODE_VALID_HOURS,
+      expiresAt: result.expiresAt, resendAvailableAt: result.resendAvailableAt,
+    };
     if (returnDevCode) {
       // SMTP not configured off production — return code in response so dev/testing still works
       responseData.verificationCode = result.verificationCode;
@@ -1964,13 +2033,65 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
   }
 });
 
+// ─── POST /agents/:id/claim/resend — the same code once more (K1) ─────────
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post: «Send koden på
+// nytt» sends the SAME code to the SAME address it went to (decision 11=A:
+// never to anything typed here), once, no sooner than 10 minutes after the
+// first send and only while it is valid; it counts in the platform cap. The
+// rules live in knowledgeService.resendClaimCode. Same per-IP limiter as the
+// claim request.
+
+router.post("/agents/:id/claim/resend", rfbClaimRequestLimiter, async (req: Request, res: Response) => {
+  const { claimId } = req.body ?? {};
+  const agentId = req.params.id as string;
+  if (!claimId || typeof claimId !== "string") {
+    res.status(400).json({ success: false, error: claimResendRefusedMessage("not_found") });
+    return;
+  }
+  try {
+    const result = knowledgeService.resendClaimCode(claimId, agentId);
+    if (result.kind === "refused") {
+      res.status(CLAIM_RESEND_REFUSED_STATUS[result.reason]).json({
+        success: false,
+        error: claimResendRefusedMessage(result.reason, result.retryAt),
+        data: { claimId, reason: result.reason, ...(result.retryAt ? { retryAt: result.retryAt } : {}) },
+      });
+      return;
+    }
+
+    // Same bookkeeping lookup as the claim request above.
+    const agent = marketplaceRegistry.getActiveAgents({ includeUnvetted: true }).find((a: any) => a.id === agentId);
+    const emailResult = await emailService.sendVerificationCode(result.recipient, result.verificationCode, agent?.name || "Ukjent produsent");
+    const dryRun = emailResult.success && emailResult.messageId === "DRY_RUN";
+    const returnDevCode = dryRun && mayReturnDevClaimCode();
+    if (!emailResult.success || (dryRun && !returnDevCode)) {
+      // Nothing reached the address: the resend is given back.
+      knowledgeService.markClaimResendUnsent(claimId);
+      res.status(502).json({ success: false, error: "Vi fikk ikke sendt koden på nytt nå. Prøv igjen senere, eller kontakt oss." });
+      return;
+    }
+    const sentTo = maskEmail(result.recipient);
+    const data: Record<string, unknown> = { claimId, status: "code_sent", sentTo, via: result.via, expiresAt: result.expiresAt, resendAvailableAt: null };
+    if (returnDevCode) data.verificationCode = result.verificationCode;
+    res.json({ success: true, message: `Koden er sendt på nytt til ${claimCodeDestination(result.via, sentTo)}. Den er den samme som i den første e-posten.`, data });
+  } catch (err: any) {
+    console.error(`[claim] resend for agent ${agentId} failed:`, err?.message ?? err);
+    res.status(500).json({ success: false, error: "Noe gikk galt. Prøv igjen senere, eller kontakt oss." });
+  }
+});
+
 // ─── POST /agents/:id/claim/verify — Verify claim ──────────
 
 router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
   const { claimId, code } = req.body ?? {};
   const agentId = req.params.id as string;
-  if (!claimId || !code || typeof claimId !== "string") {
-    res.status(400).json({ success: false, error: "claimId og code er påkrevd" });
+  // K3: Norwegian, with what to do next.
+  if (!claimId || typeof claimId !== "string") {
+    res.status(400).json({ success: false, error: "Vi finner ikke dette kravet. Start på nytt fra butikksiden med «Dette er min butikk».", data: { status: "not_found" } });
+    return;
+  }
+  if (!code) {
+    res.status(400).json({ success: false, error: "Skriv inn den 6-sifrede koden fra e-posten." });
     return;
   }
 
@@ -1982,7 +2103,12 @@ router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
       res.status(409).json({ success: false, error: result.error, data: { claimId, status: "pending_review" } });
       return;
     }
-    res.status(400).json({ success: false, error: result.error });
+    // `status` (and the tries left on a wrong code) tell selger.html whether
+    // to keep the code field and the stored open claim (K1/K3).
+    res.status(400).json({
+      success: false, error: result.error,
+      data: { claimId, status: result.status, ...(result.attemptsLeft !== undefined ? { attemptsLeft: result.attemptsLeft } : {}) },
+    });
     return;
   }
 

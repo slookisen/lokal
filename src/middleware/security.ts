@@ -334,7 +334,8 @@ export const consumerKeyIssuanceLimiter = rateLimit({
 // RFB claim-request limiter — decision 11=A (dev-request
 // 2026-10-17-rfb-claim-verifisering-mot-kjent-kontakt): per IP on
 // POST /api/marketplace/agents/:id/claim, mounted on that route
-// (routes/marketplace.ts). Every request counts — a code send and an
+// (routes/marketplace.ts) and on …/claim/resend (K1, dev-request
+// 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post). Every request counts — a code send and an
 // admin-queue entry alike — so one IP can neither mail many producers nor
 // flood the queue. The limits that must hold also while this IP key can be
 // chosen by the client (see sharedValidate above) live in knowledge-service.ts

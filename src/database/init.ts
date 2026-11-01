@@ -1535,6 +1535,17 @@ function initSchema(db: Database.Database): void {
   } catch {
     // Column already exists — expected after first migration
   }
+  // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (K1): «Send
+  // koden på nytt» — how often the same code was sent again, and when (the
+  // platform cap counts resends). Additive and idempotent; existing rows
+  // start at 0/NULL. A rollback leaves them in place.
+  for (const col of ["resend_count INTEGER DEFAULT 0", "resent_at TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE agent_claims ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
   // SQLite cannot ALTER a CHECK, so widening the status list rebuilds the
   // table (same pattern as crm_threads above). The new table is the stored
   // CREATE text with only the CHECK clause swapped, so every column — also
