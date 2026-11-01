@@ -99,7 +99,7 @@ import {
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, isSvLocaleEnabled, type Lang, isLangCookieRedirectEnabled } from "../i18n/t";
 import { rfbLangSessionMiddleware } from "../i18n/middleware";
-import { translateProductName, translateDeliveryTerm } from "../i18n/product-glossary";
+import { translateProductName, translateDeliveryTerm, type TranslateProductNameOptions } from "../i18n/product-glossary";
 import { getPublishedProfileTranslationsBulk } from "../services/profile-translations";
 import { fieldHasOnlyInferenceSources } from "../services/cross-source-validator";
 import { getPublishedProfileTranslations } from "../services/profile-translations";
@@ -546,15 +546,22 @@ export function buildBmEventJsonLd(
  * Grønnsaker, Frukt". A product name that is exactly a known category word
  * is the same product under its category label; everything else is the
  * producer's own wording and is returned unchanged. Norwegian: unchanged.
+ *
+ * Økologi S3e: `opts.organicAllowed` (default false) is passed to the
+ * glossary — an organic word is translated only for a producer with a valid
+ * Debio status (`info.agent.debioVerified`); without it a name with an
+ * organic claim stays the producer's own Norwegian text. The category
+ * shortcut is checked the same way (no CATEGORY_MAP word is organic today;
+ * the guard keeps it so if one is added).
  */
-export function productLabel(name: string, lang: Lang): string {
+export function productLabel(name: string, lang: Lang, opts: TranslateProductNameOptions = {}): string {
   if (!name || lang === "no") return name;
   const key = CATEGORY_NAME_TO_KEY[name.trim().toLowerCase()];
-  if (key) return catLabel(key, lang);
+  if (key && (opts.organicAllowed === true || !containsOrganicClaim(name))) return catLabel(key, lang);
   // Daniel 2026-09-03: «ja kjør ordlisten for produktene også» — everything
   // that is not a bare category word goes through the curated glossary,
   // which returns the name unchanged unless every word of it is known.
-  return translateProductName(name, lang);
+  return translateProductName(name, lang, opts);
 }
 
 /** True iff a product name is exactly a known category word (any case). */
@@ -585,8 +592,8 @@ export function isCategoryWord(name: string): boolean {
  *   the number.
  * Without a price: the whole name (through productLabel) and null.
  */
-export function splitNamePrice(rawName: string, lang: Lang): { name: string; price: number | null } {
-  const whole = { name: productLabel(rawName, lang), price: null };
+export function splitNamePrice(rawName: string, lang: Lang, opts: TranslateProductNameOptions = {}): { name: string; price: number | null } {
+  const whole = { name: productLabel(rawName, lang, opts), price: null };
   const m = rawName.match(/^(.+?)\s*[–\-—]\s*(kr\.?\s*\d.*)$/i)
     || rawName.match(/^(.+?)\s+(kr\.?\s*\d.*)$/i);
   if (!m) return whole;
@@ -597,7 +604,7 @@ export function splitNamePrice(rawName: string, lang: Lang): { name: string; pri
   if (price === null) return whole;
   const depth = (s: string): number => (s.match(/\(/g) || []).length - (s.match(/\)/g) || []).length;
   const closes = Math.max(0, Math.min(depth(head), -depth(m[2])));
-  return { name: productLabel(head + ")".repeat(closes), lang), price };
+  return { name: productLabel(head + ")".repeat(closes), lang, opts), price };
 }
 
 function catEmoji(cat: string): string {
@@ -1047,7 +1054,7 @@ export function isOpenNow(openingHours: unknown, at: Date = new Date()): { isOpe
 
 // ─── PR-84: Ultra-rich card for positions 1-3 (claimed top producers) ───
 
-function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): string {
+function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no", organicAllowed = false): string {
   const postal = knowledge?.postalCode ? ` ${escapeHtml(knowledge.postalCode)}` : "";
   const cityText = cardLocationText(a, postal);
   const slug = slugify(a.name);
@@ -1075,7 +1082,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   let productLine = "";
   if (products.length) {
     // I-G: a text entry is its own name (it used to show as the emoji alone).
-    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(productNameText(p), lang))}`).join(", ");
+    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(productLabel(productNameText(p), lang, { organicAllowed }))}`).join(", ");
     const more = products.length > 3 ? ` <span class="pc-more">+${products.length - 3} ${escapeHtml(lang === "en" ? "products" : "produkter")}</span>` : "";
     productLine = `<div class="pc-products">${top}${more}</div>`;
   }
@@ -1511,16 +1518,21 @@ router.get("/", (req: Request, res: Response) => {
     // (description on the row, about on the knowledge object). The rich cards
     // read the stored rating; whether it shows is RATING_DISPLAY_MODE's (S4-A1a).
     const featuredKnowledge = new Map<string, any>();
+    // Økologi S3e: whose product names may carry a translated organic word.
+    const featuredOrganicAllowed = new Set<string>();
+    const featuredDebioOff = debioSwitchOffAgentIds(featured.slice(0, 3).filter((a: any) => a.isClaimed).map((a: any) => a.id));
     // S2c-1: the owners' contact / price choices, one lookup for the page.
     const featuredChoices = publicFieldChoicesForMany(featured.slice(0, 11).filter((a: any) => a.isClaimed).map((a: any) => a.id));
     featured.forEach((a: any, i: number) => {
       if (i < 11 && a.isClaimed) {
-        featuredKnowledge.set(a.id, withoutHiddenFields(knowledgeService.getAgentInfo(a.id, { withGoogleRating: true })?.knowledge || {}, featuredChoices.get(a.id)));
+        const featuredInfo = knowledgeService.getAgentInfo(a.id, { withGoogleRating: true });
+        featuredKnowledge.set(a.id, withoutHiddenFields(featuredInfo?.knowledge || {}, featuredChoices.get(a.id)));
+        if (featuredInfo?.agent.debioVerified === true && !featuredDebioOff.has(a.id)) featuredOrganicAllowed.add(a.id);
       }
     });
     applyPublishedTranslations(featured, lang, featuredKnowledge);
     const featuredCards = featured.map((a: any, i: number) => {
-      if (i < 3 && a.isClaimed) return producerCardUltraRich(a, featuredKnowledge.get(a.id) || {}, lang);
+      if (i < 3 && a.isClaimed) return producerCardUltraRich(a, featuredKnowledge.get(a.id) || {}, lang, featuredOrganicAllowed.has(a.id));
       if (i < 11 && a.isClaimed) return producerCardMediumRich(a, featuredKnowledge.get(a.id) || {}, lang);
       return producerCard(a, undefined, lang);
     }).join("");
@@ -5052,6 +5064,8 @@ export function buildProducerAnswerFirstOpening(params: {
   productsAreSourced?: boolean;
   /** Confirmed direct-sale-channel signal (agent_salgskanal membership, etc). */
   hasDirectSaleSignal?: boolean;
+  /** Økologi S3e: the producer has a valid Debio status (info.agent.debioVerified) — organic words may be translated. Default false. */
+  organicAllowed?: boolean;
 }): string | null {
   const lang: Lang = params.lang || "no";
   const productsAreSourced = params.productsAreSourced ?? false;
@@ -5059,7 +5073,7 @@ export function buildProducerAnswerFirstOpening(params: {
   const productNames = (params.productsList || [])
     .map((p: unknown) => productNameText(p))
     .filter(Boolean)
-    .map((n: string) => productLabel(n, lang))
+    .map((n: string) => productLabel(n, lang, { organicAllowed: params.organicAllowed === true }))
     .slice(0, 4);
   const catLabels = (params.categories || []).map((c: string) => catLabel(c, lang)).filter(Boolean).slice(0, 3);
   const usingRealProducts = productNames.length > 0 && productsAreSourced;
@@ -5517,6 +5531,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // all (getAgentInfo then filters as for a producer without status).
     const debioSwitchOff = debioSwitchOffAgentIds([agent.id]).has(agent.id);
     const info = knowledgeService.getAgentInfo(agent.id, { withGoogleRating: true, debioSwitchOff });
+    // Økologi S3e: product names on /en and /sv translate an organic word only
+    // for a producer with a valid Debio status (same signal as the badge).
+    const productOrganicOpts = { organicAllowed: info?.agent.debioVerified === true };
     // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2c-1: the owner's
     // contact / price / stats choices (null = not enforced, page as before).
     const ownerChoices = publicFieldChoices(agent.id);
@@ -6105,9 +6122,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           const soft = softStockOf(p, name);
           if (soft) {
             const note = `<div class="prod-stock" data-stock-confirmed-at="${escapeHtml(soft.stock_confirmed_at)}" data-needs-producer-confirmation="true" style="flex-basis:100%;font-size:0.72rem;color:var(--g500);margin-top:4px">${escapeHtml(stockSoftExpiryBuyerText(soft.stock_confirmed_at, softLang))}</div>`;
-            return `<div class="prod-item" style="flex-wrap:wrap"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div>${note}</div>`;
+            return `<div class="prod-item" style="flex-wrap:wrap"><span class="prod-name">${escapeHtml(productLabel(name, lang, productOrganicOpts))}</span>${price}<div class="prod-meta">${seasonal}${org}</div>${note}</div>`;
           }
-          return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
+          return `<div class="prod-item"><span class="prod-name">${escapeHtml(productLabel(name, lang, productOrganicOpts))}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).filter(Boolean).join("") : "";
 
     // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
@@ -6172,7 +6189,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             return `<span class="${cls}" title="${monthAbbr(m, lang)}">${monthAbbr(m, lang).charAt(0)}</span>`;
           }).join("");
           return `<div class="season-row">
-            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(product, lang))}</div>
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(productLabel(product, lang, productOrganicOpts))}</div>
             <div class="season-bar">${monthDots}</div>
             ${note ? `<div class="season-note"${lang !== "no" ? ' lang="nb"' : ""}>${escapeHtml(note)}</div>` : ""}
           </div>`;
@@ -6381,7 +6398,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (!rawName) return null;
 
         // Parse price from name if not in price field (e.g. "Lammelår – kr 275/kg")
-        let productName = productLabel(rawName, lang);
+        let productName = productLabel(rawName, lang, productOrganicOpts);
         let priceValue = typeof p === "object" ? (p.price || "") : "";
 
         // Extract numeric price from various formats (strict parser, see parseNokPrice)
@@ -6389,7 +6406,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (priceNum === null) {
           // S6 del A: only a "kr" price the name shows, and the name is cut
           // only when it has one (splitNamePrice).
-          const fromName = splitNamePrice(rawName, lang);
+          const fromName = splitNamePrice(rawName, lang, productOrganicOpts);
           productName = fromName.name;
           priceNum = hidesPrices(ownerChoices) ? null : fromName.price;
         }
@@ -6578,6 +6595,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         productsAreSourced,
         hasDirectSaleSignal,
         lang,
+        organicAllowed: productOrganicOpts.organicAllowed,
       });
       if (!answerFirstOpening) {
         console.log(`[seo] /produsent/${slug}: answer-first opening skipped (insufficient real facts) — falling back to existing description block`);
