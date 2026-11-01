@@ -25,6 +25,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
 
 const router = Router();
 
@@ -68,7 +69,12 @@ router.get("/", (req: Request, res: Response) => {
   // "re-derive locally, don't couple admin routes together" convention (see
   // admin-pool-blocker-explain.ts's own header comment). Any future change to
   // the batch selector's predicate must be mirrored here by hand; a test in
-  // this file's own suite exists specifically to catch drift.
+  // this file's own suite exists specifically to catch drift. Exception
+  // (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring,
+  // skive C1): the field_provenance leg — "no homepage source on
+  // address/phone/email" — is the shared HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL
+  // fragment (services/homepage-contact-provenance.ts), the same constant the
+  // batch selector uses, since it is a JSON expression too easy to copy wrong.
   const parkingExclusion = process.env.HOMEPAGE_PARKING_DISABLED === "true"
     ? ""
     : `AND (k.homepage_unreachable_since IS NULL OR k.homepage_unreachable_since <= datetime('now','-30 days'))`;
@@ -88,11 +94,7 @@ router.get("/", (req: Request, res: Response) => {
     WHERE k.verification_status IN ('data_insufficient', 'review_required', 'pending_verify')
       AND (k.website IS NOT NULL AND k.website != '' OR a.url IS NOT NULL AND a.url != '')
       AND k.about IS NOT NULL AND k.about != ''
-      AND (
-        k.field_provenance IS NULL
-        OR k.field_provenance = '{}'
-        OR k.field_provenance NOT LIKE '%"homepage"%'
-      )
+      ${HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL}
       ${parkingExclusion}
       ${backoffExclusion}
   `;
