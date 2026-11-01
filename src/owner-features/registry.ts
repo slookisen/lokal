@@ -259,7 +259,13 @@ export interface OwnerFeatureEntry {
    * options, since), used while the flag is off so the resolver and the
    * owner API answer exactly as before (ownerFeatureEntryForEnv).
    */
-  whileFlagOff?: Partial<Pick<OwnerFeatureEntry, "default" | "options" | "since">>;
+  whileFlagOff?: Partial<Pick<OwnerFeatureEntry, "default" | "options" | "since" | "description">>;
+  /**
+   * The flag whileFlagOff follows, for an entry that is live either way but
+   * whose text depends on another entry's flag (auto.guarantee follows
+   * OWNER_AUTO_UPDATES_ENABLED). Unset = liveFlag.
+   */
+  whileFlagOffFlag?: string;
   /** Sharing / marketing mention — off until the owner says yes. */
   consent: boolean;
   /** Triggers e-mail or other outbound contact (L4 / outreach rules apply). */
@@ -747,7 +753,15 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "auto.guarantee", group: "auto", type: "guarantee",
     label: t("Det du skriver selv, overskrives aldri", "What you write yourself is never overwritten"),
-    description: t("Plattformen skriver aldri over det du har skrevet. Ny informasjon blir forslag.", "The platform never overwrites what you have written. New information becomes a suggestion."),
+    // dev-request 2026-11-01-rfb-hold-profilen-oppdatert (Daniel approved
+    // 2026-11-01): with OWNER_AUTO_UPDATES_ENABLED on, new information may be
+    // written into empty fields (or our own text), so «Ny informasjon blir
+    // forslag» goes; flag off = the text as before (whileFlagOff).
+    description: t("Plattformen skriver aldri over det du har skrevet.", "The platform never overwrites what you have written."),
+    whileFlagOffFlag: OWNER_AUTO_UPDATES_FLAG,
+    whileFlagOff: {
+      description: t("Plattformen skriver aldri over det du har skrevet. Ny informasjon blir forslag.", "The platform never overwrites what you have written. New information becomes a suggestion."),
+    },
     default: { owner: true, unclaimed: null },
     status: "live",
     surfaces: ["job:rfb_enrichment_nightly", "job:knowledge_write"],
@@ -1397,12 +1411,14 @@ export function ownerFeatureStatus(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv 
 }
 
 /**
- * The entry as it applies now: while its liveFlag is off, with the pre-live
- * default / options / since (whileFlagOff), so a flag-off answer is the one
- * from before the entry went live. Otherwise the entry itself.
+ * The entry as it applies now: while its flag (whileFlagOffFlag, else
+ * liveFlag) is off, with the pre-live default / options / since /
+ * description (whileFlagOff), so a flag-off answer is the one from before.
+ * Otherwise the entry itself.
  */
 export function ownerFeatureEntryForEnv(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): OwnerFeatureEntry {
-  return e.liveFlag && e.whileFlagOff && !envFlagOn(env, e.liveFlag) ? { ...e, ...e.whileFlagOff } : e;
+  const flag = e.whileFlagOffFlag ?? e.liveFlag;
+  return flag && e.whileFlagOff && !envFlagOn(env, flag) ? { ...e, ...e.whileFlagOff } : e;
 }
 
 /** A `choice` entry's options an owner may pick (hidden ones left out), in registry order. */

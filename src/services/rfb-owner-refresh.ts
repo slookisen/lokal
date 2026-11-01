@@ -64,9 +64,11 @@
 //
 // Failures: a dead / blocked site, a hijacked page, a failed write or any
 // other non-fetch failure is a real outcome (stamped; due again after the
-// fill_empty retry window, whatever the choice). Only a transient fetch
-// failure, the deadline and an unavailable about judge (API outage) are
-// transient: not stamped, tried again the next night.
+// fill_empty retry window, whatever the choice). A transient fetch failure
+// and the deadline are not stamped (tried again the next night). An
+// unavailable about judge (API outage) is stamped judge_unavailable_<n>:
+// due again the next night, and after OWNER_REFRESH_JUDGE_UNAVAILABLE_STREAK
+// nights in a row it waits the fill_empty window like a real outcome.
 //
 // Not reused for owned profiles (they cannot be limited to the allowed
 // fields): the Brreg / Bondens Marked / contact-extraction steps write e-mail
@@ -116,6 +118,8 @@ export const OWNER_REFRESH_AUTOMATIC_RETRY_MS = 20 * 3600_000;
 export const OWNER_REFRESH_FILL_EMPTY_RETRY_MS_DEFAULT = 14 * 86_400_000;
 /** The about judges' calls for one judged candidate: quality, facts, comparison. */
 export const OWNER_REFRESH_JUDGE_CALLS_PER_PASS = 3;
+/** That many nights in a row with an unavailable about judge → the profile waits the fill_empty window. */
+export const OWNER_REFRESH_JUDGE_UNAVAILABLE_STREAK = 3;
 /** llm-call-meter source of the about judges this refresh calls. */
 export const OWNER_REFRESH_JUDGE_SOURCE = "owner-refresh-about-judge";
 
@@ -362,29 +366,67 @@ export function plannedOwnerRefreshFields(s: OwnerRefreshSnapshot, mode: OwnerAu
 // prices. Checked on every about / description text before it is written
 // (owned profiles only — the nightly's unowned steps are unchanged).
 
-/** Organic words the shared list (containsOrganicClaim) leaves out: bio / eco / ecological(ly) as words, also «bio-…» / «eco-…»; not «biologi», «biografi». */
-const EXTRA_ORGANIC_RE = /(?:^|[^\p{L}\p{N}])(?:bio|eco|ecological|ecologically)(?=$|[^\p{L}\p{N}])/iu;
-/** Certification marks: Nyt Norge, Spesialitet (the mark, capitalised), the protected designations. */
+/**
+ * Organic claims the shared list (containsOrganicClaim) leaves out:
+ *   - bio / eco / ecological(ly) as whole words, also «bio-…» / «eco-…» —
+ *     but not «biologi», «biografi», «Ecuador», and not the hyphenated farm
+ *     inputs «bio-gjødsel», «bio-gass», «bio-brensel» … (fertiliser / energy,
+ *     no product claim);
+ *   - «biologisk dyrket / produsert / landbruk …» — not «biologisk mangfold».
+ */
+const EXTRA_ORGANIC_RES: readonly RegExp[] = [
+  /(?:^|[^\p{L}\p{N}])(?:bio|eco|ecological|ecologically)(?![\p{L}\p{N}])(?!-(?:gjødsel|gjodsel|gass|brensel|diesel|drivstoff|avfall|kull|energi|varme|rest)(?![\p{L}]))/iu,
+  /biologisk[-\s]+(?:dyrket|dyrka|dyrkede|produsert|produserte|landbruk|jordbruk|drift)/iu,
+];
+/**
+ * Certification marks, only as the mark — never an ordinary word:
+ *   - «Nyt Norge» capitalised inside a sentence or next to «merke/merket/
+ *     godkjent» (not the verb «nyt» — «Kom og nyt Norge», «Nyt Norge fra …»
+ *     opening a sentence);
+ *   - «Spesialitet» with mark context («Spesialitet-merket», «merket /
+ *     godkjent som / fått Spesialitet», spesialitetsmerke) — not «Spesialitet:»
+ *     opening a sentence, not «spesialiteten vår»;
+ *   - the protected designations; «KRAV-godkjent»; «Inn på tunet-» / «Beint
+ *     fra gården-merket / -godkjent» (the bare phrase «beint fra gården» is
+ *     ordinary Norwegian).
+ */
 const CERTIFICATION_MARK_RES: readonly RegExp[] = [
-  /nyt\s+norge/iu,
-  /(?:^|[^\p{L}])Spesialitet(?=$|[^\p{L}])/u,
+  /nyt\s+norge[-\s]?(?:merke|merket|godkjent)/iu,
+  /(?<!(?:^|[.!?:;])\s*)Nyt Norge/u,
+  /Spesialitet[-\s]?(?:merke|merket|godkjent)/u,
   /spesialitetsmerke/iu,
+  /(?:[Mm]erket|[Mm]erke|[Gg]odkjent|[Ss]ertifisert|[Ff]ått|[Tt]ildelt)(?:\s+som|\s+med)?\s+«?Spesialitet(?![\p{L}])/u,
   /beskyttet\s+(?:geografisk\s+betegnelse|opprinnelsesbetegnelse|tradisjonelt\s+særpreg)/iu,
   /protected\s+(?:geographical\s+indication|designation\s+of\s+origin)/iu,
+  /KRAV[-\s]?(?:godkjent|merket|merke|sertifisert)/u,
+  /(?:Inn på tunet|Beint fra gården)[-\s]?(?:godkjent|merket|merke|sertifisert)/iu,
 ];
-const EMAIL_RE = /[^\s@<>()"']+@[^\s@<>()"']+\.\p{L}{2,}/u;
-/** «kr 120», «kr. 120», «NOK 120», «120 kr», «1 200 kroner», «120,50 NOK», «120,-». */
+/** An e-mail address, also written «post [at] gard.no» / «post(at)gard.no». */
+const EMAIL_RES: readonly RegExp[] = [
+  /[^\s@<>()"']+@[^\s@<>()"']+\.\p{L}{2,}/u,
+  /[^\s@<>()"'[\]]+\s*(?:\[at\]|\(at\)|\{at\})\s*[^\s@<>()"'[\]]+\.\p{L}{2,}/iu,
+];
+/**
+ * A price — the currency next to a number, in a price shape:
+ *   «kr 120», «kr. 120», «kroner 120», «120 kroner», «NOK 120» / «120 NOK»
+ *   (uppercase only: «nok» is also the word «enough»), «120,-», «€ 12» / «12 €»;
+ *   «120 kr» only with a unit or a sentence end after it («25 kr kiloen»,
+ *   «40 kr.», «120 kr per glass») — not «3 kr og 5 kyr».
+ */
 const PRICE_RES: readonly RegExp[] = [
-  /(?:^|[^\p{L}])(?:kr|nok)\.?\s*\d/iu,
-  /\d\s*(?:kr|kroner|nok)(?=$|[^\p{L}])/iu,
+  /(?:^|[^\p{L}])(?:kr|kroner)\.?\s*\d/iu,
+  /NOK\s*\d|\d\s*NOK(?![\p{L}])/u,
+  /\d\s*kroner(?![\p{L}])/iu,
+  /\d(?:[.,]\d{1,2})?\s*kr\.?(?:\s*(?:per|pr\.?|\/|for|kiloen|kilo|kg|hg|gram|stk\.?|stykket|stykk|glasset|glass|liter|literen|l|brett|brettet|pakke|pakken|boks|boksen|flaske|flasken|nøste|nøstet|kasse|kassen|sekk|sekken|bunt|bunten)(?![\p{L}])|\s*[,.;:)!?]|\s*$)/iu,
   /\d\s*,-/u,
+  /€\s*\d|\d\s*€|EUR\s*\d|\d\s*EUR(?![\p{L}])/u,
 ];
 
 /** Why an about / description text may not be written for an owner (null = it may). */
 export function ownerRefreshProseRefusal(text: string): "organic_claim" | "certification_claim" | "email_address" | "price" | null {
-  if (containsOrganicClaim(text) || EXTRA_ORGANIC_RE.test(text)) return "organic_claim";
+  if (containsOrganicClaim(text) || EXTRA_ORGANIC_RES.some((re) => re.test(text))) return "organic_claim";
   if (CERTIFICATION_MARK_RES.some((re) => re.test(text))) return "certification_claim";
-  if (EMAIL_RE.test(text)) return "email_address";
+  if (EMAIL_RES.some((re) => re.test(text))) return "email_address";
   if (PRICE_RES.some((re) => re.test(text))) return "price";
   return null;
 }
@@ -403,6 +445,8 @@ export interface OwnerRefreshRow {
   homepage: string;
   mode: OwnerAutoUpdatesMode;
   fields: OwnerRefreshField[];
+  /** The rotation memory's last outcome for this profile (null = never attempted). */
+  last_outcome?: string | null;
 }
 
 export interface OwnerRefreshCohort {
@@ -430,6 +474,17 @@ function homepageHostExcluded(url: string): boolean {
 
 /** Outcomes after which an «automatic» profile is due again the next night; any other stamped outcome waits the fill_empty window. */
 const OWNER_REFRESH_NIGHTLY_OUTCOMES: ReadonlySet<string> = new Set(["written", "unchanged"]);
+
+/** n of a judge_unavailable_<n> stamp, else 0. */
+function judgeUnavailableStreak(outcome: string | null | undefined): number {
+  const m = /^judge_unavailable_(\d+)$/.exec(outcome ?? "");
+  return m ? Number(m[1]) : 0;
+}
+
+/** The stamp for one more night in a row with an unavailable about judge. */
+export function judgeUnavailableStamp(previousOutcome: string | null | undefined): string {
+  return `judge_unavailable_${judgeUnavailableStreak(previousOutcome) + 1}`;
+}
 
 /** The rotation memory (step owner_refresh): agent_id → last attempt (ms) and its outcome. No table → empty. */
 export function readOwnerRefreshAttempts(db: Db): Map<string, { at: number; outcome: string | null }> {
@@ -461,8 +516,12 @@ export async function loadOwnerRefreshCohort(db: Db, opts: OwnerRefreshCohortOpt
   const fillEmptyRetryMs = opts.fillEmptyRetryMs ?? OWNER_REFRESH_FILL_EMPTY_RETRY_MS_DEFAULT;
   // automatic is due every night after a real refresh; after a failure
   // (dead site, failed write …) every choice waits the fill_empty window.
-  const retryMs = (mode: OwnerAutoUpdatesMode, outcome: string | null) =>
-    mode === "automatic" && OWNER_REFRESH_NIGHTLY_OUTCOMES.has(outcome ?? "") ? OWNER_REFRESH_AUTOMATIC_RETRY_MS : fillEmptyRetryMs;
+  // An unavailable about judge: due the next night until the streak is full.
+  const retryMs = (mode: OwnerAutoUpdatesMode, outcome: string | null) => {
+    const streak = judgeUnavailableStreak(outcome);
+    if (streak > 0) return streak < OWNER_REFRESH_JUDGE_UNAVAILABLE_STREAK ? OWNER_REFRESH_AUTOMATIC_RETRY_MS : fillEmptyRetryMs;
+    return mode === "automatic" && OWNER_REFRESH_NIGHTLY_OUTCOMES.has(outcome ?? "") ? OWNER_REFRESH_AUTOMATIC_RETRY_MS : fillEmptyRetryMs;
+  };
   const picked: Array<{ row: OwnerRefreshRow; attemptMs: number }> = [];
   for (let i = 0; i < snaps.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
@@ -479,7 +538,7 @@ export async function loadOwnerRefreshCohort(db: Db, opts: OwnerRefreshCohortOpt
     const prev = last.get(s.id) ?? null;
     const attemptMs = prev ? prev.at : null;
     if (prev && prev.at > opts.nowMs - retryMs(mode, prev.outcome)) { skip("retry_window"); continue; }
-    picked.push({ row: { id: s.id, name: s.name ?? "", homepage, mode, fields }, attemptMs: attemptMs ?? 0 });
+    picked.push({ row: { id: s.id, name: s.name ?? "", homepage, mode, fields, last_outcome: prev ? prev.outcome : null }, attemptMs: attemptMs ?? 0 });
   }
   // Stable sort: creation order breaks the ties.
   picked.sort((a, b) => a.attemptMs - b.attemptMs);
@@ -493,6 +552,8 @@ export interface OwnerRefreshDeps {
   aboutJudges?: HcrAboutJudges;
   /** fetch seam for the homepage fetch (the SSRF guard runs before it). */
   fetchImpl?: typeof fetch;
+  /** The extractor itself (tests: a stub for its failure paths); default refreshHomepageContent. */
+  refresh?: typeof refreshHomepageContent;
 }
 
 export interface OwnerRefreshWriteResult {
@@ -505,8 +566,10 @@ export interface OwnerRefreshRowOutcome {
   outcome: string;
   written: OwnerRefreshField[];
   refused: Array<{ field: string; reason: string }>;
-  /** Says nothing about the profile (deadline, a transient fetch failure, an unavailable about judge): not stamped, tried again next night. */
+  /** Says nothing about the profile (deadline, a transient fetch failure, an unavailable about judge): not stamped as such, tried again next night. */
   transient?: boolean;
+  /** An about judge could not answer: the caller stamps judge_unavailable_<n> (the streak). */
+  judge_unavailable?: boolean;
   detail?: string;
 }
 
@@ -538,7 +601,7 @@ export async function refreshOwnedProfile(
   let raced: Awaited<ReturnType<typeof refreshHomepageContent>> | "timed_out";
   try {
     raced = await Promise.race([
-    refreshHomepageContent(db, targets, {
+    (opts.deps?.refresh ?? refreshHomepageContent)(db, targets, {
       dryRun: true,
       deadlineAt: opts.deadlineAt,
       planOnlyFields: row.fields,
@@ -572,7 +635,7 @@ export async function refreshOwnedProfile(
   // An about judge that could not answer (API outage, missing key): the
   // about is undecided, so the profile is tried again next night.
   const judgeUnavailable = raced.skipped_unsubstantiated.some((x) => x.agent_id === row.id && x.reason === HCR_ABOUT_REASON_JUDGE_UNAVAILABLE);
-  const undecided = judgeUnavailable ? { transient: true, detail: HCR_ABOUT_REASON_JUDGE_UNAVAILABLE } : {};
+  const undecided = judgeUnavailable ? { transient: true, judge_unavailable: true, detail: HCR_ABOUT_REASON_JUDGE_UNAVAILABLE } : {};
   const planned = (raced.planned_writes ?? []).filter((p) => p.agent_id === row.id);
   if (planned.length === 0) return { outcome: judgeUnavailable ? "judge_unavailable" : "unchanged", written: [], refused: [], ...undecided };
   let r: OwnerRefreshWriteResult;

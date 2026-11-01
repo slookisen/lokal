@@ -55,6 +55,14 @@
  *       reads 100 % with the flag off; the card follows the vertical rule;
  *       planOnlyFields without dryRun throws; the per-row deadline / 08Z stop
  *       and a timed-out row's reservation inside step 6 (M24, M25, M33)
+ *   Follow-up (round 2): the auto.guarantee text follows the flag (Daniel
+ *       2026-11-01) in «Mine valg», the portal card, the owner API and
+ *       /for-produsenter; the owner API's flag-off shape (route level); the
+ *       reviewer's prose probe (false positives fixed: «nok», «nyt Norge»,
+ *       «Spesialitet:», «3 kr og 5 kyr», «bio-gjødsel»; new: KRAV, «biologisk
+ *       dyrket», «kroner 120», «€», «[at]»); provably-ours text + hybrid /
+ *       owner_updated_at through the cohort SQL; non-fetch failures and the
+ *       extractor throw stamped; the judge-unavailable streak
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-owner-refresh.test.ts
@@ -461,35 +469,84 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       assertEq([p2.outcome, p2.written, ag("w-p2").description], ["written", ["about"], "Eierens egen beskrivelse skrevet via PUT /agents/:id/description."],
         "w12 (P2): the empty about is filled, the owner's description is kept");
 
+      // w12b (review N30 / N6) — text provably ours, but the owner wrote the profile:
+      // automatic must not overwrite it, read through the cohort SQL itself.
+      const proofProv = (id: string) => JSON.stringify({ about: [{ source_type: "google_places", value: `Katalogtekst ${id}.` }], description: [{ source_type: "google_places", value: `Katalogbeskrivelse ${id}.` }] });
+      for (const [id, k] of [["w-n30", { data_source: "hybrid" }], ["w-n6", { data_source: "auto" }], ["w-proof", { data_source: "auto" }]] as const) {
+        seed(id, { owned: true, url: `https://${id}.example.no`, description: `Katalogbeskrivelse ${id}.`, categories: '["meat"]',
+          k: { website: `https://${id}.example.no`, about: `Katalogtekst ${id}.`, field_provenance: proofProv(id), ...k } });
+        choose(id, "automatic");
+      }
+      db.prepare(`UPDATE agent_knowledge SET owner_updated_at = '2026-10-30T10:00:00.000Z' WHERE agent_id = 'w-n6'`).run();
+      const n30 = (await orf.loadOwnerRefreshCohort(db, { nowMs: Date.now() })).eligible;
+      const fieldsOf = (id: string) => n30.find((r) => r.id === id)?.fields ?? null;
+      assertEq(fieldsOf("w-proof"), ["about", "description"], "w12b: control — provably ours, no owner write → automatic plans about + description");
+      assertEq(fieldsOf("w-n30"), null, "w12b (N30): provably ours but data_source hybrid (the owner wrote in /selger) → not taken");
+      assertEq(fieldsOf("w-n6"), null, "w12b (N6): provably ours but owner_updated_at set (read by the cohort SQL) → not taken");
+
       // w13 — prose claims: organic variants, certification marks, e-mail, prices.
+      // The reviewer's prose probe (round 2) and the earlier cases: every sentence, refused or not.
+      // A phone number is no claim (phone is a descriptive field the refresh may fill).
       const pr = orf.ownerRefreshProseRefusal;
-      for (const [text, want] of [
+      const PROSE_CASES: Array<[string, string | null]> = [
+        ["Vi har nok 200 høner og selger egg fra gården.", null],
+        ["Det er nok 3 generasjoner som har drevet gården.", null],
+        ["Kom og nyt Norge fra sin beste side på gården vår.", null],
+        ["Nyt Norge fra sin beste side.", null],
+        ["Spesialiteten vår er spekemat.", null],
+        ["Spesialitet: røkt laks fra egen røykeri.", null],
+        ["Biogass fra gjødsla driver gården.", null],
+        ["Vi bruker bio-gjødsel fra egne dyr.", null],
+        ["Bioteknologi og biologisk mangfold er viktig for oss.", null],
+        ["Ecuador-kaffe brennes her.", null],
+        ["Gården ligger 12 km fra Lillehammer.", null],
+        ["Følg oss på Instagram @gardsbutikken for nyheter.", null],
+        ["Åpent lørdag 10-14, ellers etter avtale.", null],
+        ["Vi har 3 kr og 5 kyr.", null],
+        ["Kr. Sand er nærmeste by.", null],
+        ["Ring 99 99 99 99 for bestilling.", null],
+        ["Vi har 120 sauer, 3 krukker og studerte biologi og biografi.", null],
+        ["Vår spesialitet er spekemat fra egen gård siden 1952.", null],
+        ["Vi selger beint fra gården hver lørdag.", null],
+        ["Spekepølsa har fått Spesialitet.", "certification_claim"],
+        ["Vi er KRAV-godkjent.", "certification_claim"],
+        ["Biologisk dyrket grønnsaker.", "organic_claim"],
+        ["Økologiske grønnsaker uten sprøytemidler.", "organic_claim"],
+        ["Demeter-sertifisert biodynamisk gård.", "organic_claim"],
+        ["Lammekjøtt 150,- pr kg.", "price"],
+        ["Pris 120 NOK.", "price"],
+        ["Kjøttdeig kroner 120 per kilo.", "price"],
+        ["Egg 5 € stykket.", "price"],
+        ["Kontakt: post [at] gard.no", "email_address"],
+        ["Skriv til post(at)gard.no.", "email_address"],
+        ["Merket med Spesialitet-merket fra Matmerk.", "certification_claim"],
+        ["Inn på tunet-godkjent gård.", "certification_claim"],
+        ["Vi har Beint fra gården-merket.", "certification_claim"],
+        ["Ost med Nyt Norge merke.", "certification_claim"],
+        ["Ost med Nyt Norge-merket.", "certification_claim"],
+        ["Spekepølsa er godkjent som Spesialitet.", "certification_claim"],
+        ["Fenalår merket Spesialitet.", "certification_claim"],
+        ["Fenalår med beskyttet geografisk betegnelse.", "certification_claim"],
+        ["Beskyttet opprinnelsesbetegnelse for osten.", "certification_claim"],
         ["Vi selger bio-honning og lammekjøtt.", "organic_claim"],
         ["Eco-friendly gård i Valdres.", "organic_claim"],
         ["We practise ecological farming.", "organic_claim"],
         ["Ecologically grown vegetables.", "organic_claim"],
-        ["Vi driver økologisk landbruk.", "organic_claim"],
-        ["Kortreist og Debio-godkjent.", "organic_claim"],
-        ["Ost med Nyt Norge-merket.", "certification_claim"],
-        ["Spekepølsa har fått Spesialitet.", "certification_claim"],
-        ["Fenalår med beskyttet geografisk betegnelse.", "certification_claim"],
-        ["Beskyttet opprinnelsesbetegnelse for osten.", "certification_claim"],
         ["Skriv til post@gard.example.no for bestilling.", "email_address"],
         ["Lammekjøtt kr 120 per kilo.", "price"],
         ["Honning 120,- per glass.", "price"],
         ["Egg NOK 60 per brett.", "price"],
         ["Poteter 25 kr kiloen.", "price"],
         ["Ull Kr. 89 per nøste.", "price"],
-      ] as const) {
-        assertEq(pr(text), want, `w13: «${text}» → ${want}`);
-      }
-      for (const text of [
-        "Vi har 120 sauer, 3 krukker og studerte biologi og biografi.",
-        "Vår spesialitet er spekemat fra egen gård siden 1952.",
-        ABOUT_TEXT,
-        "Økonomien på gården og økosystemet rundt.",
-      ]) {
-        assertEq(pr(text), null, `w13: «${text}» is not a claim`);
+        ["Egg koster 40 kr.", "price"],
+        ["Egg koster 40 kroner brettet.", "price"],
+        ["Honning € 12 per glass.", "price"],
+        ["Kortreist og Debio-godkjent.", "organic_claim"],
+        ["Økonomien på gården og økosystemet rundt.", null],
+        [ABOUT_TEXT, null],
+      ];
+      for (const [text, want] of PROSE_CASES) {
+        assertEq(pr(text), want, `w13: «${text}» → ${want ?? "no claim"}`);
       }
       seed("w-claim", { owned: true, description: "", categories: "[]", k: { about: "" } });
       const r13 = orf.applyOwnerRefreshWrites(db, "w-claim", [
@@ -689,6 +746,20 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       seed("e-outage2", { owned: true, url: "https://e-outage2.example.no", categories: '["meat"]', k: { website: "https://e-outage2.example.no", about: "" } });
       const ou2 = await orf.refreshOwnedProfile(db, row("e-outage2", ["about", "description"]), { ...opts(pageFetch), deps: { aboutJudges: outageJudges, fetchImpl: pageFetch } });
       assertEq([ou2.outcome, ou2.transient], ["judge_unavailable", true], "e6: … with nothing else to write: judge_unavailable, transient (not «unchanged»)");
+      // Review N10 / N11: a non-fetch failure and an extractor throw are real outcomes (not transient).
+      const result = (errors: Array<{ agent_id: string; error: string }>) => ({
+        scanned: 1, by_field: {}, changed: [], skipped_curated: [], skipped_unsubstantiated: [], errors, parked_now: [],
+        about_reviews: [], about_judge_rejected: 0, about_not_supported: 0, about_not_better: 0, about_judge_unavailable: 0, planned_writes: [],
+      });
+      const viaRefresh = (refresh: any) => orf.refreshOwnedProfile(db, row("e-cat", ["categories"]), { deadlineAt: Date.now() + 30_000, runId: "run-e", deps: { aboutJudges: approveJudges, refresh } });
+      const nf = await viaRefresh(async () => result([{ agent_id: "e-cat", error: "unexpected: provenance column unreadable" }]));
+      assertEq([nf.outcome, nf.transient ?? false], ["failed", false], "e7 (N10): a non-fetch error → failed, a real outcome (stamped)");
+      const tf = await viaRefresh(async () => result([{ agent_id: "e-cat", error: "fetch_failed:timeout (transient) for https://e-cat.example.no" }]));
+      assertEq([tf.outcome, tf.transient], ["fetch_failed", true], "e7: a transient fetch failure stays transient");
+      const pf = await viaRefresh(async () => result([{ agent_id: "e-cat", error: "fetch_failed:http_404 (permanent) for https://e-cat.example.no" }]));
+      assertEq([pf.outcome, pf.transient ?? false], ["fetch_failed", false], "e7: a permanent fetch failure is a real outcome");
+      const th = await viaRefresh(async () => { throw new Error("extractor blew up"); });
+      assertEq([th.outcome, th.transient ?? false, /extractor blew up/.test(th.detail ?? "")], ["failed", false, true], "e7 (N11): an extractor throw → failed, a real outcome (stamped)");
     });
 
     // ── (x) failures are stamped, transient outcomes are not (review M19, probe 2) ──
@@ -714,6 +785,33 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       assertEq(seen[0].stamped, { "x-bad": "write_failed", "x-bad-auto": "write_failed" }, "x1 (M19): the failed writes are stamped; the transient fetch failure is not");
       assertEq([seen[1].rows, seen[2].rows], [["x-flaky:fetch_failed"], ["x-flaky:fetch_failed"]], "x2: nights 2–3 — the failed writes wait (fill_empty window, also for automatic); only the transient one is tried again");
       assertEq([seen[1].judges, seen[2].judges], [0, 0], "x2: no judge call is spent on them again");
+    });
+
+    // ── (z) the step loop's catch-all is stamped (review N12); the judge-unavailable streak ──
+    await withDb("z", async () => {
+      setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", ...ON });
+      seed("z-throw", { owned: true, url: "https://z-throw.example.no", description: "", categories: "[]", k: { website: "https://z-throw.example.no", about: "" } });
+      // A malformed extractor answer makes refreshOwnedProfile itself throw: the nightly's catch-all.
+      const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: NIGHT, deps: { executors: stubExecutors([]), ownerRefresh: { aboutJudges: approveJudges, refresh: (async () => ({})) as any } } });
+      assertEq(r.owner_refresh!.rows.map((x) => x.outcome), ["error"], "z1: an unexpected throw in the owner step → outcome error");
+      assertEq((db.prepare(`SELECT last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'owner_refresh' AND agent_id = 'z-throw'`).get() as any)?.last_outcome, "error",
+        "z1 (N12): … stamped (a real outcome, not retried every night)");
+    });
+    await withDb("z-streak", async () => {
+      setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", ...ON });
+      // fill_empty, only the about is due; the about judges are down every night.
+      seed("z-outage", { owned: true, url: "https://z-outage.example.no", description: "Beskrivelse.", categories: '["meat"]', k: { website: "https://z-outage.example.no", about: "" } });
+      const outageJudges = { ...approveJudges, facts: async () => ({ ok: false, failure: "error", reason: "stub outage" }) } as any;
+      const nightsOut: string[] = [];
+      for (const day of ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15"]) {
+        const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: new Date(`${day}T00:10:00Z`), deps: { executors: stubExecutors([]), ownerRefresh: { aboutJudges: outageJudges, fetchImpl: pageFetch } } });
+        const st = db.prepare(`SELECT last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'owner_refresh' AND agent_id = 'z-outage'`).get() as any;
+        nightsOut.push(`${r.owner_refresh!.rows.map((x) => x.outcome).join(",") || "-"}|${st?.last_outcome ?? "-"}|${r.owner_refresh!.skipped_before_selection.retry_window ?? 0}`);
+      }
+      assertEq(nightsOut, [
+        "judge_unavailable|judge_unavailable_1|0", "judge_unavailable|judge_unavailable_2|0", "judge_unavailable|judge_unavailable_3|0", "-|judge_unavailable_3|1",
+      ], "z2 (item 4): an unavailable judge is retried the next night, and after three nights in a row it waits the fill_empty window");
+      assertEq(orf.judgeUnavailableStamp("written"), "judge_unavailable_1", "z2: a success breaks the streak");
     });
 
     // ── (y) step 6's own per-row stops and reservation (review M24, M25, M33) ──
@@ -835,6 +933,20 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       assertEq([offPost.status, settings().length, featureAudits().length], [404, 0, 0], "c1 (AC4): flag off — the POST answers 404 and nothing is written");
       const offPage = String((await invoke(H.page, makeReq({ params: { agentId: "c-pilot" }, token: tokens["c-pilot"] }))).body ?? "");
       assertTrue(offPage.includes('data-planned-key="auto.updates"') && !offPage.includes('id="mv-f-auto-updates"'), "c1: flag off — «Mine valg» shows it in «Planlagt», with no control (as today)");
+      const OLD_G = "Plattformen skriver aldri over det du har skrevet. Ny informasjon blir forslag.";
+      const NEW_G = "Plattformen skriver aldri over det du har skrevet.";
+      assertTrue(offPage.includes(`<p class="mv-desc">${OLD_G}</p>`), "c1 (guarantee): flag off — «Mine valg» shows the guarantee text as before");
+      const apiGet = findRouteHandler(featuresMod.default, "/api/owner/:id/features", "get");
+      const api = async () => {
+        const r = await invoke(apiGet, makeReq({ params: { id: "c-pilot" }, token: tokens["c-pilot"] }));
+        const byKey = Object.fromEntries((r.body?.features ?? []).map((f: any) => [f.key, f]));
+        return { status: r.status, au: byKey["auto.updates"], g: byKey["auto.guarantee"] };
+      };
+      const apiOff = await api();
+      assertEq([apiOff.status, apiOff.au?.status, apiOff.au?.value, apiOff.au?.default, (apiOff.au?.options ?? []).map((o: any) => o.value), apiOff.au?.since, apiOff.au?.source],
+        [200, "coming_soon", "suggest", "suggest", ["suggest", "fill_empty", "never", "automatic"], "2026-10-27", "default"],
+        "c1 (N23): flag off — GET /api/owner/:id/features answers auto.updates exactly as before the PR (status, value, default, four options, since)");
+      assertEq(apiOff.g?.description?.no, OLD_G, "c1 (guarantee): flag off — the owner API's guarantee text as before");
 
       // Flag on: the card for a verified owner NOT on the allowlist.
       process.env.OWNER_AUTO_UPDATES_ENABLED = "1";
@@ -845,6 +957,13 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
         assertTrue(card.includes(text), `c2: the card carries the catalog text «${text}»`);
       }
       assertTrue(!card.includes("Foreslå til meg"), "c2: «Foreslå til meg» is not offered");
+      assertTrue(card.includes(`Det du skriver selv, overskrives aldri<br>${NEW_G}</p>`) && !card.includes("Ny informasjon blir forslag"), "c2 (guarantee): the card shows the guarantee with the flag-on text");
+      const apiOn = await api();
+      assertEq([apiOn.au?.status, apiOn.au?.value, apiOn.au?.default, (apiOn.au?.options ?? []).map((o: any) => o.value), apiOn.au?.since],
+        ["live", "fill_empty", "fill_empty", ["fill_empty", "automatic", "never"], "2026-11-01"], "c2 (N23): flag on — the owner API answers the live entry");
+      assertEq(apiOn.g?.description, { no: NEW_G, en: "The platform never overwrites what you have written." }, "c2 (guarantee): flag on — the owner API's guarantee text (NO + EN)");
+      const onPage = String((await invoke(H.page, makeReq({ params: { agentId: "c-pilot" }, token: tokens["c-pilot"] }))).body ?? "");
+      assertTrue(onPage.includes(`<p class="mv-desc">${NEW_G}</p>`) && !onPage.includes(OLD_G), "c2 (guarantee): flag on — «Mine valg» shows the new guarantee text");
       assertEq([...card.matchAll(/name="value" value="([a-z_]+)"/g)].map((m) => m[1]), ["fill_empty", "automatic", "never"], "c2: three options, in order");
       assertEq(checked(card), "fill_empty", "c2: the default (fill_empty) is selected");
       assertTrue(!(await portal("c-free")).includes('id="hold-oppdatert"'), "c2: no card for a session on a profile without a verified owner");
@@ -919,6 +1038,12 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       assertTrue(onNo.faq.includes("Det du skriver selv, overskrives aldri.") && onNo.faq.includes("Det du har skrevet selv, overskrives aldri."), "t2: … the guarantee sentences stay");
       assertTrue(!onEn.faq.includes("A choice of how updates should happen") && !onEn.faq.includes("becomes a suggestion"), "t2: EN too");
       assertTrue(onNo.live.includes("auto.updates"), "t2: flag on — auto.updates is listed among today's choices (catalog text)");
+      const guaranteeText = (on: boolean) => {
+        setEnv(on ? ON : {});
+        return fp.liveRfbOwnerChoices(fp.currentForProdusenterFacts()).find((e) => e.key === "auto.guarantee")?.description.no;
+      };
+      assertEq([guaranteeText(false), guaranteeText(true)], ["Plattformen skriver aldri over det du har skrevet. Ny informasjon blir forslag.", "Plattformen skriver aldri over det du har skrevet."],
+        "t3 (guarantee): /for-produsenter lists the guarantee with the text for the flag's state");
       setEnv({});
     }
 
