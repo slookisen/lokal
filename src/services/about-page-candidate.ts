@@ -137,41 +137,63 @@ export const ABOUT_PAGE_SCAN_CAP = MAX_PROSE_SCAN_LEN;
  */
 export const ABOUT_PAGE_RAW_SCAN_CAP = 2_000_000;
 
-// The next block aboutPageContentWindow drops: an element whose content is
-// never the page's own prose (code, styles, the <head>, inline icons, form
-// controls with their help text — a hidden «forgot password» popup measured
-// on a real «Om oss» page — and dialogs), or an HTML comment. The lookahead
-// keeps «<header», «<scripts» and the like out. Group 1 is the element name;
-// no group 1 = «<!--».
+// The next block the about-page cleaning pass drops: an element whose
+// content is never the page's own prose (code, styles, the <head>, inline
+// icons, form controls with their help text — a hidden «forgot password»
+// popup measured on a real «Om oss» page — and dialogs), or an HTML comment.
+// The lookahead keeps «<header», «<scripts» and the like out. Group 1 is the
+// element name; no group 1 = «<!--».
 const ABOUT_PAGE_DROP_OPEN_RE = /<(?:(script|style|noscript|template|svg|head|fieldset|dialog)(?=[\s>/])|!--)/gi;
 
+// Blocks whose content is code or markup the browser never shows: when one is
+// never closed, the rest of the page is that block (an unterminated <script>
+// must not become text). An unclosed <head>, <fieldset> or <dialog> holds
+// nothing like that by itself, so only its start tag is dropped.
+const ABOUT_PAGE_CUT_IF_UNCLOSED: ReadonlySet<string> = new Set(["script", "style", "noscript", "template", "svg"]);
+
+/** The two bounded windows of an about page's text (aboutPageWindows). */
+export type AboutPageWindows = {
+  /** From the first <body> (else the start): the page's visible part — theme-spam text and <h1>. */
+  body: string;
+  /** From the first <main> after <body> (else = body): where the prose is read first. */
+  main: string;
+};
+
 /**
- * The part of an about page that holds its text, for the bounded scans in
- * this module (dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-
- * beskrivelse, AC2 preview 2026-11-01).
+ * The text-bearing part of an about page, for the bounded scans in this module
+ * (dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, AC2
+ * preview 2026-11-01).
  *
- * Reading the first ABOUT_PAGE_SCAN_CAP chars of the RAW page, as the
- * scans did before, sees only <head> on most CMS sites: of 8 real «Om oss»
- * pages <body> started at 26–377 kB, behind inline CSS and scripts, so 7 of 9
- * pages in the preview gave no prose at all. And where a <script> crossed the
- * cut, its unterminated text was read as prose («(function () { 'use
- * strict'; var path = …»).
+ * Reading the first ABOUT_PAGE_SCAN_CAP chars of the RAW page, as the scans
+ * did before, sees only <head> on most CMS sites: of 8 real «Om oss» pages
+ * <body> started at 26–377 kB, behind inline CSS and scripts, so 7 of 9 pages
+ * in the preview gave no prose at all. And where a <script> crossed the cut,
+ * its unterminated text was read as prose («(function () { 'use strict'; var
+ * path = …»).
  *
  * One forward pass over the first ABOUT_PAGE_RAW_SCAN_CAP chars drops every
  * <head>, <script>, <style>, <noscript>, <template>, <svg>, <fieldset> and
- * <dialog> element and every HTML comment, whole (each search only moves forward, so the pass is
- * linear in the input, whatever the markup). A block that is never closed
- * ends the page there — an unterminated <script> must not become text; an
- * unclosed <head> instead ends at <body> when there is one. What is left is
- * read from its first <main> (else <body>, else the start) for
- * ABOUT_PAGE_SCAN_CAP chars. PURE.
+ * <dialog> element and every HTML comment, whole:
+ *   - a comment ends at «-->» («<!-->» and «<!--->» are complete, empty);
+ *   - an element ends at its end tag (attributes allowed: «</script x>»);
+ *     a self-closing «<svg … />» is just that tag;
+ *   - a block that is never closed: see ABOUT_PAGE_CUT_IF_UNCLOSED (an
+ *     unterminated comment, too, ends the page).
+ * Linear in the input whatever the markup: every search starts where the last
+ * one stopped or further on, and a tag whose end tag was once not found is
+ * never searched for again (none can follow).
+ *
+ * The windows are ABOUT_PAGE_SCAN_CAP chars of what is left, from its first
+ * <body> (`body`; else from the start) and from the first <main> after that
+ * (`main`; = `body` when there is none). PURE.
  */
-export function aboutPageContentWindow(html: string): string {
-  if (!html) return "";
+export function aboutPageWindows(html: string): AboutPageWindows {
+  if (!html) return { body: "", main: "" };
   const raw = html.slice(0, ABOUT_PAGE_RAW_SCAN_CAP);
   const kept: string[] = [];
-  let pos = 0;
+  const noEndTag = new Set<string>();
   const open = new RegExp(ABOUT_PAGE_DROP_OPEN_RE.source, "gi");
+  let pos = 0;
   for (;;) {
     open.lastIndex = pos;
     const m = open.exec(raw);
@@ -180,40 +202,82 @@ export function aboutPageContentWindow(html: string): string {
       break;
     }
     kept.push(raw.slice(pos, m.index), " ");
+    const afterOpen = m.index + m[0].length;
     const tag = m[1]?.toLowerCase();
-    const close = tag ? new RegExp(`</${tag}\\s*>`, "gi") : /-->/g;
-    close.lastIndex = m.index + m[0].length;
-    const c = close.exec(raw);
-    if (c) {
-      pos = c.index + c[0].length;
-      continue;
-    }
-    if (tag === "head") {
-      const body = /<body(?=[\s>])/gi;
-      body.lastIndex = m.index + m[0].length;
-      const b = body.exec(raw);
-      if (b) {
-        pos = b.index;
+    if (!tag) {
+      if (raw.startsWith(">", afterOpen)) {
+        pos = afterOpen + 1;
         continue;
       }
+      if (raw.startsWith("->", afterOpen)) {
+        pos = afterOpen + 2;
+        continue;
+      }
+      const end = raw.indexOf("-->", afterOpen);
+      if (end < 0) break;
+      pos = end + 3;
+      continue;
     }
-    break;
+    const tagEnd = raw.indexOf(">", afterOpen);
+    if (tagEnd < 0) break;
+    if (tag === "svg" && raw[tagEnd - 1] === "/") {
+      pos = tagEnd + 1;
+      continue;
+    }
+    let endTagGt = -1;
+    if (!noEndTag.has(tag)) {
+      const close = new RegExp(`</${tag}(?=[\\s>/])`, "gi");
+      close.lastIndex = tagEnd + 1;
+      const c = close.exec(raw);
+      if (c) {
+        endTagGt = raw.indexOf(">", c.index);
+        if (endTagGt < 0) break;
+      } else {
+        noEndTag.add(tag);
+      }
+    }
+    if (endTagGt >= 0) {
+      pos = endTagGt + 1;
+      continue;
+    }
+    if (ABOUT_PAGE_CUT_IF_UNCLOSED.has(tag)) break;
+    pos = tagEnd + 1;
   }
   const cleaned = kept.join("");
-  const start = /<main(?=[\s>])/i.exec(cleaned)?.index ?? /<body(?=[\s>])/i.exec(cleaned)?.index ?? 0;
-  return cleaned.slice(start, start + ABOUT_PAGE_SCAN_CAP);
+  const bodyRe = /<body(?=[\s>])/gi;
+  const bodyAt = bodyRe.exec(cleaned)?.index ?? 0;
+  const mainRe = /<main(?=[\s>])/gi;
+  mainRe.lastIndex = bodyAt;
+  const mainAt = mainRe.exec(cleaned)?.index ?? -1;
+  const body = cleaned.slice(bodyAt, bodyAt + ABOUT_PAGE_SCAN_CAP);
+  return { body, main: mainAt >= 0 ? cleaned.slice(mainAt, mainAt + ABOUT_PAGE_SCAN_CAP) : body };
+}
+
+/** aboutPageWindows(html).main: where an about page's prose is read first. PURE. */
+export function aboutPageContentWindow(html: string): string {
+  return aboutPageWindows(html).main;
 }
 
 // Script text that reads as a sentence to the prose extractor: a function
-// expression, a variable declaration, a strict-mode directive, a browser
-// global's member, an arrow function body. None of these occur in a
-// producer's own description.
-const ABOUT_PAGE_SCRIPT_TEXT_RE =
-  /\bfunction\s*\(|\b(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=|["']use strict["']|\b(?:window|document)\.[A-Za-z_$]|=>\s*\{/;
+// expression or declaration with its body, a variable declaration, a
+// strict-mode directive, a browser global's member, an arrow function, a
+// tracking call (gtag/fbq/_paq/dataLayer.push), JSON-LD keys. None of these
+// occur in a producer's own description.
+const ABOUT_PAGE_SCRIPT_TEXT_RE = new RegExp(
+  [
+    String.raw`\bfunction(?:\s+[\w$]+)?\s*\([^()]{0,200}\)\s*\{`,
+    String.raw`\b(?:var|let|const)\s+[A-Za-z_$][\w$]*\s*=`,
+    String.raw`["']use strict["']`,
+    String.raw`\b(?:window|document)\.(?:location|querySelector|getElement|addEventListener|cookie|write|body|head|createElement|readyState|documentElement|dataLayer)\b`,
+    String.raw`=>\s*[{(]`,
+    String.raw`\b(?:gtag|fbq|_paq|dataLayer)\s*(?:\.\s*push\s*)?\(`,
+    String.raw`"@(?:context|type)"\s*:`,
+  ].join("|"),
+);
 
 /**
- * Defence in depth behind aboutPageContentWindow: true when an about-page
- * candidate reads as JavaScript (ABOUT_PAGE_SCRIPT_TEXT_RE) — the shape
+ * Defence in depth behind aboutPageWindows: true when an about-page candidate
+ * reads as JavaScript or JSON-LD (ABOUT_PAGE_SCRIPT_TEXT_RE) — the shape
  * looksLikeCodeArtifact does not catch. Applied to about-page candidates
  * only, so the homepage path is unchanged. PURE.
  */
@@ -335,24 +399,25 @@ function nameWordOccurs(word: string, lowerText: string, foldedText: string): bo
  * title (og:title / <title>) or its first <h1>. A «Historie» page about the
  * village, or a blog post, on the producer's own host does not name the
  * producer and fails. Reads the title from the first ABOUT_PAGE_SCAN_CAP
- * chars of `html` and the <h1> from `contentWindow` (the caller's
- * aboutPageContentWindow(html); computed here when not given). PURE.
+ * chars of `html` and the <h1> from `bodyWindow` (the caller's
+ * aboutPageWindows(html).body; computed here when not given). PURE.
  */
 export function aboutPageNamesProducer(
   candidate: string,
   html: string,
   tokens: readonly string[],
-  contentWindow?: string,
+  bodyWindow?: string,
 ): boolean {
   if (tokens.length === 0) return false;
   const head = html.slice(0, ABOUT_PAGE_SCAN_CAP);
-  const body = contentWindow ?? aboutPageContentWindow(html);
+  const body = bodyWindow ?? aboutPageWindows(html).body;
   const tags = headTagsOf(head);
   // og:title or <title> (extractTitle on the bounded tags), the <title>
-  // itself, and the first <h1> of the page's text (aboutPageContentWindow —
-  // on most CMS sites <body> starts beyond the first ABOUT_PAGE_SCAN_CAP
-  // chars), its content read to at most 500 chars, so an unclosed <h1>
-  // costs a bounded scan per occurrence.
+  // itself, and the first <h1> of the page's visible part (aboutPageWindows
+  // .body — on most CMS sites <body> starts beyond the first
+  // ABOUT_PAGE_SCAN_CAP chars, and the <h1> often sits in a <header> before
+  // <main>), its content read to at most 500 chars, so an unclosed <h1> costs
+  // a bounded scan per occurrence.
   const title = /<title\b[^<>]*>([^<]{0,300})<\/title>/i.exec(head)?.[1] ?? "";
   const h1 = /<h1\b[^<>]*>([\s\S]{0,500}?)<\/h1>/i.exec(body)?.[1] ?? "";
   const lower = decodeHtmlEntities([candidate, extractTitle(tags), title, h1].join(" ").replace(/<[^>]+>/g, " ")).toLowerCase();
@@ -448,18 +513,22 @@ export function pickAboutPageCandidate(input: {
     }
     // Bounded scans only: the page's head tags are read from its first
     // ABOUT_PAGE_SCAN_CAP chars (headTagsOf), everything else from
-    // aboutPageContentWindow (its text, scripts/styles/head dropped, at most
-    // ABOUT_PAGE_SCAN_CAP chars — extractProseText's own cap).
-    const page = {
-      url: fetchedPage.url,
-      head: fetchedPage.html.slice(0, ABOUT_PAGE_SCAN_CAP),
-      body: aboutPageContentWindow(fetchedPage.html),
-    };
+    // aboutPageWindows (its text, scripts/styles/head dropped, at most
+    // ABOUT_PAGE_SCAN_CAP chars each — extractProseText's own cap). The
+    // theme-spam text and the <h1> come from the whole visible window
+    // (`body`); the prose from <main> first, else from `body`.
+    const windows = aboutPageWindows(fetchedPage.html);
+    const page = { url: fetchedPage.url, head: fetchedPage.html.slice(0, ABOUT_PAGE_SCAN_CAP), body: windows.body };
     if (aboutPageLooksLikeThemeSpam(page.head, page.body)) {
       evaluated.push({ url: page.url, candidate: "", verdict: "theme_spam_page" });
       continue;
     }
-    const text = summarizeAboutPageProse(page.body);
+    let proseSource = windows.main;
+    let text = summarizeAboutPageProse(proseSource);
+    if (!text && windows.main !== windows.body) {
+      proseSource = windows.body;
+      text = summarizeAboutPageProse(proseSource);
+    }
     if (!text) {
       evaluated.push({ url: page.url, candidate: "", verdict: "no_prose" });
       continue;
@@ -468,7 +537,7 @@ export function pickAboutPageCandidate(input: {
       evaluated.push({ url: page.url, candidate: text, verdict: "below_quality_bar" });
       continue;
     }
-    const sub = checkAboutCandidateSubstantiatedBySource(text, `${page.body}\n${extractVisibleText(page.body)}`);
+    const sub = checkAboutCandidateSubstantiatedBySource(text, `${proseSource}\n${extractVisibleText(proseSource)}`);
     if (!sub.substantiated) {
       evaluated.push({ url: page.url, candidate: text, verdict: "not_substantiated", detail: sub.reason });
       continue;
@@ -547,13 +616,16 @@ export function homepageSectionBase(homepageUrl: string): string | null {
  * capped visible text of every fetched page that the gårdssalg LLM
  * rewrite/fill reads). Checks the first 120 chars of the page's first prose
  * paragraph of at least 40 chars (extractProseParagraphs — not the nav/header
- * text the homepage shares), else of its visible text — both read from
- * aboutPageContentWindow. PURE.
+ * text the homepage shares) — in <main> first, else in the whole visible
+ * part — else of its visible text, all read from aboutPageWindows. PURE.
  */
 export function aboutPageTextIncluded(aboutHtml: string, contentText: string): boolean {
   if (!aboutHtml || !contentText) return false;
-  const body = aboutPageContentWindow(aboutHtml);
-  const para = extractProseParagraphs(body).find((p) => p.length >= 40) ?? extractVisibleText(body);
+  const w = aboutPageWindows(aboutHtml);
+  const para =
+    extractProseParagraphs(w.main).find((p) => p.length >= 40) ??
+    extractProseParagraphs(w.body).find((p) => p.length >= 40) ??
+    extractVisibleText(w.main);
   const probe = para.slice(0, 120).trim();
   return probe.length > 0 && contentText.includes(probe);
 }
