@@ -38,7 +38,9 @@
 //            job:knowledge_write  knowledgeService.upsertKnowledge() as a
 //                                 non-owner write on an owner-locked field,
 //                                 inside a transaction that is always rolled back
-//            job:rfb_enrichment_nightly  loadRfbEnrichmentCohort() (read-only)
+//            job:rfb_enrichment_nightly  loadRfbEnrichmentCohort() (read-only);
+//                                 auto.updates: ownerRefreshModes() — the
+//                                 owner refresh's own decision (read-only)
 //            email:outreach       avmeld unsubscribeHeaderValues() — the header
 //                                 decision a cold send uses; nothing is sent
 //   restore  the fixture's stored choices (owner_feature_settings rows, the
@@ -65,6 +67,7 @@ import { getDb } from "../database/init";
 import {
   OWNER_FEATURE_REGISTRY,
   findOwnerFeature,
+  visibleOwnerFeatureOptions,
   type OwnerFeatureEntry,
   type OwnerFeatureValue,
 } from "./registry";
@@ -123,6 +126,7 @@ export const SWITCH_PROBE_ENV_FLAGS = [
   "PUBLIC_STATS_MIN_VIEWS",
   "STOCK_CHECK_EMAIL_ENABLED",
   "OWNER_ORDERABILITY_PORTAL_ENABLED",
+  "OWNER_AUTO_UPDATES_ENABLED",
 ] as const;
 
 /**
@@ -138,6 +142,9 @@ export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = 
   "products.stock_check × email:stock_check": "STOCK_CHECK_EMAIL_ENABLED",
   "products.stock_check × job:stock_check": "STOCK_CHECK_EMAIL_ENABLED",
   "products.stock_check × owner_portal": "OWNER_ORDERABILITY_PORTAL_ENABLED",
+  // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh
+  // (and the choice itself, liveFlag) only exist with the flag on.
+  "auto.updates × job:rfb_enrichment_nightly": "OWNER_AUTO_UPDATES_ENABLED",
 };
 const FLAG_OFF_REASON = "flag off in this environment";
 
@@ -150,7 +157,8 @@ export const PROBE_RESULT_LABEL: Readonly<Record<ProbeRowResult, string>> = {
   FAIL: "FAIL",
   NOT_OBSERVABLE: "IKKE OBSERVERBAR",
 };
-export type ProbeDirection = "off" | "on" | "parent_off" | "parent_on";
+/** `value:<v>`: a choice entry written to option v (probeChoice). */
+export type ProbeDirection = "off" | "on" | "parent_off" | "parent_on" | `value:${string}`;
 
 export interface SwitchProbeRow {
   key: string;
@@ -187,7 +195,7 @@ export interface SwitchProbePlanRow {
   key: string;
   surface: string;
   direction: ProbeDirection;
-  kind: "switch" | "locked" | "guarantee" | "confirm_by_email";
+  kind: "switch" | "locked" | "guarantee" | "confirm_by_email" | "choice";
   reader: boolean;
 }
 
@@ -323,10 +331,23 @@ function entryKind(e: OwnerFeatureEntry): EntryKind | null {
   if (e.type === "switch") return "switch";
   if (e.type === "locked") return "locked";
   if (e.type === "guarantee") return "guarantee";
+  if (e.type === "choice") return "choice";
   return null;
 }
 
-function directionsFor(kind: EntryKind, baseline: OwnerFeatureValue): ProbeDirection[] {
+/**
+ * A choice's directions: every offered option other than the start, then
+ * the start again (the run ends where it began). Hidden options are not
+ * offered, so they are not probed.
+ */
+function choiceDirections(e: OwnerFeatureEntry, baseline: OwnerFeatureValue): ProbeDirection[] {
+  const values = visibleOwnerFeatureOptions(e).map((o) => o.value);
+  if (values.length === 0) return [];
+  const start = typeof baseline === "string" && values.includes(baseline) ? baseline : values[0]!;
+  return [...values.filter((v) => v !== start), start].map((v) => `value:${v}` as ProbeDirection);
+}
+
+function directionsFor(kind: Exclude<EntryKind, "choice">, baseline: OwnerFeatureValue): ProbeDirection[] {
   switch (kind) {
     case "switch":
       // Away from the starting point first, then back: the run ends where it began.
@@ -943,6 +964,21 @@ const enrichmentNightlyReader: SurfaceReader = async (ctx) => {
   return { endpoints: { not_in_cohort: !picked }, detail: picked ? "valgt i nattkohorten" : "ikke valgt i nattkohorten" };
 };
 
+// auto.updates (dev-request 2026-11-01-rfb-hold-profilen-oppdatert): the
+// owner refresh's own decision for the fixture — ownerRefreshModes(), the
+// call its cohort and its write path make. One endpoint per offered option:
+// fill_empty / automatic = taken with that choice, never = skipped. Nothing is
+// fetched or written.
+const autoUpdatesJobSync = (ctx: ProbeReaderContext): SurfaceObservation => {
+  const { ownerRefreshModes } = require("../services/rfb-owner-refresh") as typeof import("../services/rfb-owner-refresh");
+  const mode = ownerRefreshModes(ctx.db, [ctx.fixture.id], ctx.env).get(ctx.fixture.id) ?? null;
+  const flag = flagOn(ctx.env, "OWNER_AUTO_UPDATES_ENABLED") ? "" : " (OWNER_AUTO_UPDATES_ENABLED er av: eier-oppfriskningen kjører ikke i dette miljøet)";
+  return {
+    endpoints: { fill_empty: mode === "fill_empty", automatic: mode === "automatic", never: mode === null },
+    detail: `eier-oppfriskningen ${mode ? `tar med profilen som ${mode}` : "hopper over profilen"}${flag}`,
+  };
+};
+
 const outreachSync = (ctx: ProbeReaderContext): SurfaceObservation => {
   const av = require("../services/avmeld-service") as typeof import("../services/avmeld-service");
   const to = ctx.fixture.outreachEmail;
@@ -1002,6 +1038,7 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
     "orders.reminder × job:order_followups": syncReader(followupsJobSync, "processOrderFollowups' påminnelsessteg: kjører / hopper over"),
     "auto.guarantee × job:rfb_enrichment_nightly": { read: enrichmentNightlyReader, observe: "loadRfbEnrichmentCohort(): testprodusenten velges aldri" },
     "auto.guarantee × job:knowledge_write": syncReader(knowledgeWriteSync, "upsertKnowledge() ikke-eier på eierlåst felt (rulles tilbake): owner_locked, verdi beholdt"),
+    "auto.updates × job:rfb_enrichment_nightly": syncReader(autoUpdatesJobSync, "ownerRefreshModes(): eier-oppfriskningen tar med profilen som fill_empty / automatic, eller hopper over (never)"),
     "comms.unsubscribe × email:outreach": syncReader(outreachSync, "unsubscribeHeaderValues(): kald e-post får List-Unsubscribe"),
     "products.stock_check × email:stock_check": syncReader(stockCheckMailSync, "allowlist + stockCheckOn() + resolveOrderNotificationRecipient(): lagerpåminnelse sendes / sendes ikke"),
     "products.stock_check × job:stock_check": syncReader(stockCheckJobSync, "allowlist + stockCheckOn(): jobben tar med / hopper over produsenten"),
@@ -1028,6 +1065,7 @@ const PLANNED_CHECKS = [
   "level:<nivå> — nivået gir samme effekt som enkeltbryterne",
   "undo:level:<nivå> / undo:single:<key> — «Angre» gjenoppretter effekten",
   "no_surface:<key> — live-nøkkel uten flater: skriving + endringslogg",
+  "choice:<key> — hvert valg som tilbys skrives (og tilbake); flaten viser effekten av akkurat det valget",
   "public_stats_threshold — «Vis som offentlig»: statistikkflisene på profilsiden vises bare med minst PUBLIC_STATS_MIN_VIEWS sidevisninger fra mennesker siste 12 mnd (eierens «Sett»), prøvd på begge sider av terskelen",
   "restore — alt tilbake til startpunktet (eksakt)",
 ];
@@ -1038,8 +1076,9 @@ export function planSwitchProbe(db: any, agentId: string, env: NodeJS.ProcessEnv
   for (const e of liveEntries()) {
     const kind = entryKind(e);
     if (!kind) continue;
+    const base = resolved.byKey[e.key]?.value ?? null;
     for (const s of e.surfaces) {
-      for (const d of directionsFor(kind, resolved.byKey[e.key]?.value ?? null)) {
+      for (const d of kind === "choice" ? choiceDirections(e, base) : directionsFor(kind, base)) {
         rows.push({ key: e.key, surface: s, direction: d, kind, reader: !!readers[caseId(e.key, s)] });
       }
     }
@@ -1297,6 +1336,62 @@ function visibilityFlagHint(c: Ctx, key: string): string {
   return flagOn(c.env, "OWNER_FEATURES_ENFORCE") || flagOn(c.env, "OWNER_PAUSE_ENABLED")
     ? ""
     : ` — ${FLAG_OFF_REASON} (OWNER_FEATURES_ENFORCE og OWNER_PAUSE_ENABLED er av)`;
+}
+
+/** choice: exactly the endpoint named after the written option shows its effect (one endpoint per option). */
+export function evaluateChoiceObservation(obs: SurfaceObservation, value: string): Evaluated {
+  const vals = Object.entries(obs.endpoints);
+  const pass = obs.endpoints[value] === true && vals.every(([k, v]) => k === value || !v);
+  return { pass, observed: describe(obs) };
+}
+
+/** Polls a choice reader until the written option's effect shows or the wait is over. */
+async function awaitChoiceEffect(c: Ctx, def: SurfaceReaderDef, value: string, t0: number) {
+  for (;;) {
+    const last = await readSafe(def, c.readerCtx);
+    const ms = Date.now() - t0;
+    if (last.obs) {
+      const ev = evaluateChoiceObservation(last.obs, value);
+      if (ev.pass) return { ...ev, ms, error: null as string | null };
+      if (ms >= c.maxWaitMs) return { ...ev, ms: null as number | null, error: null as string | null };
+    } else if (ms >= c.maxWaitMs) {
+      return { pass: false, observed: `leser feilet: ${last.error}`, ms: null as number | null, error: last.error };
+    }
+    await sleep(Math.max(POLL_MS, def.pollMs ?? POLL_MS));
+  }
+}
+
+/**
+ * choice (auto.updates): through the owner write path, every offered option
+ * and back to the start; each surface must show exactly that option's effect
+ * after each write, and each write must be in the change log.
+ */
+async function probeChoice(c: Ctx, e: OwnerFeatureEntry, baseline: OwnerFeatureValue): Promise<void> {
+  const dirs = choiceDirections(e, baseline);
+  const surfaces = e.surfaces.filter((s) => c.readers[caseId(e.key, s)]);
+  for (const s of e.surfaces) if (!c.readers[caseId(e.key, s)]) missingReaderRows(c, e, s, dirs);
+  for (const d of dirs) {
+    const value = d.slice("value:".length);
+    const before = maxAuditId(c.db, c.agentId);
+    const w = probeWrite(c, e.key, value);
+    const t0 = Date.now();
+    const status = putStatusFor(w);
+    const logged = w.kind === "ok" && w.changed ? changeLogged(c, e.key, value, before) : w.kind === "ok" ? null : false;
+    c.afterFlip?.(e.key, d);
+    for (const s of surfaces) {
+      const r = await awaitChoiceEffect(c, c.readers[caseId(e.key, s)], value, t0);
+      const writeOk = w.kind === "ok";
+      pushRow(c, {
+        key: e.key, surface: s, direction: d,
+        pass: writeOk && logged !== false && r.pass,
+        observed: r.observed, expected: `effekten av «${value}»`,
+        ms_to_effect: r.pass ? r.ms : null, write_status: status, change_logged: logged, discriminating: true,
+        ...(!writeOk ? { reason: `skrivingen ble avvist (${status}${w.kind === "blocked" ? ` ${w.block}` : ""})` }
+          : logged === false ? { reason: "endringen mangler i endringsloggen" }
+          : !r.pass ? { reason: r.error ? `leser feilet: ${r.error}` : `ingen riktig effekt innen ${c.maxWaitMs} ms` } : {}),
+      });
+    }
+  }
 }
 
 /** A write the owner may not make: 409 `block`, nothing stored, the effect as before. */
@@ -1726,6 +1821,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
       else if (kind === "locked") await probeLocked(c, e);
       else if (kind === "guarantee") await probeGuarantee(c, e);
       else if (kind === "confirm_by_email") await probeConfirmByEmail(c, e);
+      else if (kind === "choice") await probeChoice(c, e, b);
       else {
         for (const s of e.surfaces) {
           pushRow(c, { key: e.key, surface: s, direction: "on", pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, discriminating: false, reason: `typen ${e.type} støttes ikke av proben` });

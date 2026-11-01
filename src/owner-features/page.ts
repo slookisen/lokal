@@ -30,6 +30,8 @@ import {
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_REGISTRY,
   findOwnerFeature,
+  ownerFeatureStatus,
+  visibleOwnerFeatureOptions,
   type LocalizedText,
   type OwnerFeatureEntry,
   type OwnerFeatureGroup,
@@ -297,9 +299,9 @@ export function ownerStatsAreLow(st: OwnerPageStats): boolean {
 
 const esc = (v: unknown): string => escapeHtml(String(v ?? ""));
 
-/** Is the entry built (shown in the main view with its value)? */
+/** Is the entry built (shown in the main view with its value)? A liveFlag entry with its flag off is not. */
 export function isOwnerFeatureBuilt(e: OwnerFeatureEntry): boolean {
-  return e.status !== "coming_soon";
+  return ownerFeatureStatus(e) !== "coming_soon";
 }
 
 /**
@@ -351,7 +353,7 @@ const ACTOR_LABELS: Record<string, string> = {
 };
 
 function isNew(e: OwnerFeatureEntry, now: Date): boolean {
-  if (e.status !== "live") return false;
+  if (ownerFeatureStatus(e) !== "live") return false;
   const since = new Date(`${e.since}T00:00:00Z`).getTime();
   if (Number.isNaN(since)) return false;
   const age = now.getTime() - since;
@@ -419,7 +421,7 @@ function controlHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeatu
       );
     }
     case "choice": {
-      const opts = (e.options || []).map((o) =>
+      const opts = visibleOwnerFeatureOptions(e).map((o) =>
         `<option value="${esc(o.value)}"${o.value === r.value ? " selected" : ""}>${esc(o.label.no)}</option>`).join("");
       return form(
         `<label class="mv-sr" for="${esc(fieldId)}">${esc(e.label.no)}</label>` +

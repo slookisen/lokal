@@ -2245,6 +2245,8 @@ export interface HomepageContentRefreshResult {
   about_not_better: number;
   /** A judge could not answer (missing key, timeout, non-200, ambiguous reply). */
   about_judge_unavailable: number;
+  /** Only with opts.planOnlyFields in a dry run: the gate-approved writes, not written. */
+  planned_writes?: HcrPlannedWrite[];
 }
 
 /**
@@ -2309,6 +2311,15 @@ export function __setHcrAboutJudgesForTesting(judges: HcrAboutJudges | null): vo
 }
 function hcrAboutJudgesOverride(): HcrAboutJudges | null {
   return ((globalThis as Record<symbol, unknown>)[HCR_ABOUT_JUDGES_OVERRIDE] as HcrAboutJudges | undefined) ?? null;
+}
+
+/**
+ * The judges a caller without its own gets: the test override, else the real
+ * ones. For a caller that wraps them (the owner refresh counts each call on
+ * its run's LLM meter) and still honours the same test seam.
+ */
+export function currentHcrAboutJudges(): HcrAboutJudges {
+  return hcrAboutJudgesOverride() ?? HCR_DEFAULT_ABOUT_JUDGES;
 }
 
 /** skipped_unsubstantiated reasons for an about candidate the judges stopped (exact strings, skive B). */
@@ -2512,6 +2523,34 @@ export interface HomepageContentRefreshOptions {
    * (HCR_DEFAULT_ABOUT_JUDGES), or the test override.
    */
   aboutJudges?: HcrAboutJudges;
+  /**
+   * NEVER set by the route, the morning send or R6's content_refresh (unset =
+   * byte-identical behaviour). Set only by the owner auto-updates refresh
+   * (services/rfb-owner-refresh.ts, dev-request 2026-11-01-rfb-hold-
+   * profilen-oppdatert), and honoured ONLY together with dryRun: the
+   * extractors, guards, judges and write gate run as always, but
+   *   - a candidate whose field is not in this list is dropped before the
+   *     about judges and the gate (no judge call for a field the owner's
+   *     choice does not want), and `description` only goes with `about`
+   *     (they share one judged value);
+   *   - every write the gate approves is returned in `planned_writes` (with
+   *     its value and website_homepage provenance record) instead of being
+   *     written — the caller writes it through the owner lock itself.
+   * Provenance-only candidates (categories corroboration) are not returned.
+   */
+  planOnlyFields?: readonly string[];
+}
+
+/** A write the gate approved in a planOnlyFields dry run (returned, never written here). */
+export interface HcrPlannedWrite {
+  agent_id: string;
+  /** about | description | categories (products never: no product-name call in a dry run). */
+  field: string;
+  table: "agent_knowledge" | "agents";
+  /** What the column would hold (categories: the JSON array text). */
+  column_value: unknown;
+  /** The provenance record the refresh would have merged for this field. */
+  provenance: { source_type: string; value: string; fetched_at: string; source_url: string };
 }
 
 /** What a product-name extractor made of a page (R6: the gårdssalg LLM helper). */
@@ -2952,6 +2991,10 @@ export async function refreshHomepageContent(
   const aboutTally = { rejected: 0, not_supported: 0, not_better: 0, unavailable: 0 };
   const aboutJudges = opts.aboutJudges ?? hcrAboutJudgesOverride() ?? HCR_DEFAULT_ABOUT_JUDGES;
   const aboutJudgeTimeoutMs = aboutJudges.timeoutMs ?? HCR_ABOUT_JUDGE_TIMEOUT_MS;
+  // planOnlyFields (owner auto-updates refresh only, dry runs only): see
+  // HomepageContentRefreshOptions. null = every caller today, unchanged.
+  const planFields = dryRun && opts.planOnlyFields ? new Set(opts.planOnlyFields) : null;
+  const plannedWrites: HcrPlannedWrite[] = [];
 
   // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
   const HCR_CONCURRENCY = 3;
@@ -3118,6 +3161,15 @@ export async function refreshHomepageContent(
 
     // Build candidate content fields.
     const candidates: HcrFieldWrite[] = [];
+    // planOnlyFields: drop the candidates the caller does not want, before the
+    // judges and the gate; `description` only goes with `about` (one judged value).
+    const keepPlanFields = (): void => {
+      if (!planFields) return;
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const f = candidates[i].field;
+        if (!planFields.has(f) || (f === "description" && !planFields.has("about"))) candidates.splice(i, 1);
+      }
+    };
 
     // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse (only
     // when aboutPageMode is set; null = this block does nothing): the
@@ -3617,6 +3669,7 @@ export async function refreshHomepageContent(
     };
     // `source` only when an about-page text is judged: without one, an
     // about-page run's about_reviews are exactly those of a run without it.
+    keepPlanFields();
     const firstPass = await judgeAboutCandidates({
       ...(aboutPageChosen ? { source: "about_page" as const } : {}),
       fallbackOnReject: !!aboutPageChosen && homepageAboutFallback?.ok === true,
@@ -3625,6 +3678,7 @@ export async function refreshHomepageContent(
     if (fallbackRejection !== null && homepageAboutFallback?.ok === true) {
       deferAboutReason(agentId, fallbackRejection);
       applyHomepageAbout(homepageAboutFallback);
+      keepPlanFields();
       if (aboutReport) {
         aboutReport.chosen = "homepage";
         aboutReport.chosen_text = aboutSummary;
@@ -3729,6 +3783,7 @@ export async function refreshHomepageContent(
       });
     }
 
+    keepPlanFields();
     scanned++;
     if (candidates.length === 0) {
       if (productsCuratedLocked) skippedCurated.push({ agent_id: agentId, fields: ["products"] });
@@ -3843,7 +3898,18 @@ export async function refreshHomepageContent(
     changed.push({ agent_id: agentId, fields: writtenFields });
     if (aboutReport) aboutReport.would_write_about = writtenFields.includes("about");
 
-    if (dryRun) return; // dry-run: report only, write nothing.
+    if (dryRun) {
+      // planOnlyFields: hand the gate-approved writes back (never a
+      // provenance-only one); the caller writes them through the owner lock.
+      if (planFields) {
+        for (const f of fieldsToWrite) {
+          const p = incomingProvForMerge[f.field]?.sources[0];
+          if (f.provenanceOnly || !p) continue;
+          plannedWrites.push({ agent_id: agentId, field: f.field, table: f.onAgents ? "agents" : "agent_knowledge", column_value: f.columnVal, provenance: { ...p } });
+        }
+      }
+      return; // dry-run: report only, write nothing.
+    }
 
     // ── Apply: column writes + provenance merge in one transaction ───────────
     let mergedProv: Record<string, unknown>;
@@ -3938,6 +4004,8 @@ export async function refreshHomepageContent(
     about_judge_unavailable: aboutTally.unavailable,
     // Absent unless the about-page logic ran (flag off = unchanged response).
     ...(aboutPageMode ? { about_page_mode: aboutPageMode, about_candidates: aboutCandidates } : {}),
+    // Absent unless planOnlyFields applied (every caller today: unchanged response).
+    ...(planFields ? { planned_writes: plannedWrites } : {}),
   };
 }
 

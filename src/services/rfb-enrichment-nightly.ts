@@ -73,6 +73,21 @@
 //                           1–4 changed tonight first, then cohort rows whose
 //                           homepage has been unreachable >= 14 days (so a
 //                           Brreg konkurs/inactive verdict lands as today).
+//   6  owner_refresh        ONLY with OWNER_AUTO_UPDATES_ENABLED (dev-request
+//                           2026-11-01-rfb-hold-profilen-oppdatert; off = no
+//                           step, no report key, no envelope claim): verified-
+//                           owner profiles whose auto.updates is fill_empty /
+//                           automatic — NOT the cohort below, which still
+//                           leaves every owned profile out. Runs after step 5,
+//                           so steps 1–5 select, write and spend exactly as
+//                           before; it gets what is left of the run deadline
+//                           and of tonight's LLM budget (reserved per profile
+//                           like every LLM row), honours the write-pause and
+//                           the 08Z ban, and stamps its rotation memory as
+//                           step `owner_refresh`. What it may write and how:
+//                           services/rfb-owner-refresh.ts. Its rows are not
+//                           re-verified (an owned profile is no outreach
+//                           candidate) and its numbers stay out of `totals`.
 //
 // Cohort (who the steps may pick): RFB producers that are not contacted —
 // neither `already_sent` nor `already_contacted` exactly as GET /admin/pool-
@@ -188,6 +203,22 @@ import contactExtractionRouter, {
   RFB_CX_HARD_CAP,
 } from "../routes/admin-rfb-contact-extraction";
 import bmProducerHarvestRouter from "../routes/admin-bm-producer-harvest";
+import {
+  OWNER_REFRESH_PER_ROW_MS,
+  OWNER_REFRESH_STEP,
+  buildOwnerRefreshPreview,
+  loadOwnerRefreshCohort,
+  newOwnerRefreshStepReport,
+  ownerRefreshRowLlmCallsMax,
+  refreshOwnedProfile,
+  resolveOwnerRefreshCap,
+  tallyOwnerRefreshRow,
+  type OwnerRefreshDeps,
+  type OwnerRefreshPreview,
+  type OwnerRefreshRowOutcome,
+  type OwnerRefreshStepReport,
+} from "./rfb-owner-refresh";
+import { ownerAutoUpdatesEnabled } from "../owner-features/registry";
 import {
   runVerifierBatch,
   resolveBrregLookup,
@@ -783,7 +814,7 @@ export function readRfbEnrichmentAttempts(db: Db): Map<string, Map<string, numbe
   return out;
 }
 
-function stampAttempt(db: Db, agentId: string, step: RfbEnrichmentStep, at: Date, outcome: string, runId: string): void {
+function stampAttempt(db: Db, agentId: string, step: RfbEnrichmentStep | typeof OWNER_REFRESH_STEP, at: Date, outcome: string, runId: string): void {
   try {
     db.prepare(
       `INSERT INTO rfb_enrichment_nightly_attempts (agent_id, step, last_attempted_at, last_outcome, last_run_id)
@@ -1787,6 +1818,8 @@ export interface RfbEnrichmentPreview {
     note?: string;
     bm?: { offset: number; limit: number; last_total: number | null; cursor_updated_at: string | null };
   }>;
+  /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED (absent otherwise). */
+  owner_refresh?: OwnerRefreshPreview;
 }
 
 export interface RfbEnrichmentNightlyReport {
@@ -1821,6 +1854,8 @@ export interface RfbEnrichmentNightlyReport {
   steps: RfbEnrichmentStepReport[];
   totals: { attempted: number; written: number; changed_agents: number; re_verified: number; new_verified: number; new_in_pool: number };
   preview?: RfbEnrichmentPreview;
+  /** Step 6 — only with OWNER_AUTO_UPDATES_ENABLED, in an apply run that reached the steps (absent otherwise). */
+  owner_refresh?: OwnerRefreshStepReport;
   envelope_recorded: boolean;
   errors: string[];
 }
@@ -1832,6 +1867,8 @@ export interface RfbEnrichmentNightlyDeps {
   productNameExtractor?: HcrProductNamesExtractor;
   /** The run's clock (tests); default: `now` plus real elapsed time. */
   clock?: () => Date;
+  /** Step 6's about judges / fetch seam (tests: stubs — never a real model call or fetch). */
+  ownerRefresh?: OwnerRefreshDeps;
 }
 
 function roundUsd(n: number): number {
@@ -1928,6 +1965,15 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
     });
   }
   const last = getJobLastCompletedAt(db, RFB_ENRICHMENT_NIGHTLY_JOB_STATE_KEY);
+  // Step 6 (OWNER_AUTO_UPDATES_ENABLED only — the preview is unchanged without it).
+  const ownerRefresh = ownerAutoUpdatesEnabled()
+    ? await buildOwnerRefreshPreview(db, {
+        nowMs: now.getTime(),
+        attempts: readRfbEnrichmentAttempts(db),
+        fillEmptyRetryMs: resolveRfbEnrichmentRetryDays() * 86_400_000,
+        cap: resolveOwnerRefreshCap(),
+      })
+    : null;
   return {
     generated_at: now.toISOString(),
     enabled_by_env: isRfbEnrichmentNightlyEnabled(),
@@ -1944,6 +1990,7 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
     retry_days: resolveRfbEnrichmentRetryDays(),
     cohort: { considered: cohort.considered, eligible: cohort.rows.length, excluded: cohort.excluded, by_tier: cohort.by_tier },
     steps,
+    ...(ownerRefresh ? { owner_refresh: ownerRefresh } : {}),
   };
 }
 
@@ -2563,6 +2610,77 @@ async function runSteps(rc: RunContext): Promise<void> {
     finishStep(sr, t0, llmBefore);
   }
 
+  // 6 — owner refresh (OWNER_AUTO_UPDATES_ENABLED only; header step 6). After
+  // step 5 on purpose: steps 1–5 above ran exactly as without it. It may use
+  // the time up to the run deadline (step 5's reserve is spent) and what is
+  // left of tonight's LLM budget; its outcomes stay out of report.steps,
+  // `totals` and the run's stopped_reason (its own report has them).
+  if (ownerAutoUpdatesEnabled()) {
+    const t0 = Date.now();
+    const llmBefore = meter.calls;
+    const orr = newOwnerRefreshStepReport(resolveOwnerRefreshCap());
+    report.owner_refresh = orr;
+    const skip = globalStop ?? (orr.cap <= 0 ? "cap_zero" : writesPaused ? "enrichment_write_paused" : null);
+    if (skip) {
+      orr.skipped_reason = skip;
+    } else {
+      try {
+        const cohort = await loadOwnerRefreshCohort(db, {
+          nowMs: now.getTime(),
+          attempts: readRfbEnrichmentAttempts(db),
+          fillEmptyRetryMs: resolveRfbEnrichmentRetryDays() * 86_400_000,
+        });
+        const take = cohort.eligible.slice(0, orr.cap);
+        orr.considered = cohort.considered;
+        orr.eligible = cohort.eligible.length;
+        orr.selected = take.length;
+        orr.skipped_before_selection = cohort.skipped;
+        for (const row of take) {
+          await yieldToEventLoop();
+          const t = clock();
+          if (isRfbEnrichmentForbiddenHour(t)) { orr.stopped_reason = "forbidden_hour"; break; }
+          if (t.getTime() >= rc.deadline.getTime()) { orr.stopped_reason = "time_budget"; break; }
+          if (writePauseActive()) { orr.stopped_reason = "enrichment_write_paused"; break; }
+          const perRowLlm = ownerRefreshRowLlmCallsMax(row);
+          if (perRowLlm > 0 && (llmCapReached || meter.calls + perRowLlm > llmCap)) {
+            // Tonight's LLM budget is spent: a profile that needs the about
+            // judges waits (not attempted, not stamped); the others go on.
+            llmCapReached = true;
+            orr.outcomes.skipped_llm_cap = (orr.outcomes.skipped_llm_cap ?? 0) + 1;
+            continue;
+          }
+          const reserved = reserveLlm(perRowLlm);
+          if (reserved === null) {
+            orr.outcomes.skipped_llm_counter_unwritable = (orr.outcomes.skipped_llm_counter_unwritable ?? 0) + 1;
+            continue;
+          }
+          const callsBefore = meter.calls;
+          let out: OwnerRefreshRowOutcome;
+          try {
+            out = await refreshOwnedProfile(db, row, {
+              deadlineAt: Date.now() + Math.min(OWNER_REFRESH_PER_ROW_MS, rc.deadline.getTime() - clock().getTime()),
+              runId: report.run_id,
+              deps: rc.deps?.ownerRefresh,
+            });
+          } catch (err) {
+            out = { outcome: "error", written: [], refused: [], transient: true, detail: errMessage(err) };
+          }
+          // A refresh we stopped waiting for may still make its judge calls.
+          const actual = meter.calls - callsBefore;
+          settleLlm(reserved, out.outcome === "timeout" ? Math.max(reserved, actual) : actual);
+          tallyOwnerRefreshRow(orr, row, out);
+          if (!out.transient) stampAttempt(db, row.id, OWNER_REFRESH_STEP, clock(), out.outcome, report.run_id);
+        }
+      } catch (err) {
+        orr.errors.push(`owner refresh aborted: ${errMessage(err)}`);
+      }
+    }
+    orr.llm_calls = meter.calls - llmBefore;
+    orr.est_cost_usd = roundUsd(orr.llm_calls * usdPerCall);
+    orr.duration_ms = Date.now() - t0;
+    orr.rows = orr.rows.slice(0, 100);
+  }
+
   report.llm.cap_reached = llmCapReached;
   if (globalStop && !report.stopped_reason) report.stopped_reason = globalStop;
   const t = report.totals;
@@ -2686,6 +2804,34 @@ function recordEnvelope(
             stopped_reason: report.stopped_reason,
           },
         },
+        // Step 6 (OWNER_AUTO_UPDATES_ENABLED only): its own claim, so the
+        // claims above read exactly as without it. Its errors are here, not
+        // in the run's status.
+        ...(report.owner_refresh
+          ? [{
+              type: "custom" as const,
+              value: report.owner_refresh.written,
+              meta: {
+                kind: "rfb_enrichment_owner_refresh",
+                cap: report.owner_refresh.cap,
+                considered: report.owner_refresh.considered,
+                eligible: report.owner_refresh.eligible,
+                selected: report.owner_refresh.selected,
+                attempted: report.owner_refresh.attempted,
+                written: report.owner_refresh.written,
+                fields_written: report.owner_refresh.fields_written,
+                refused: report.owner_refresh.refused,
+                outcomes: report.owner_refresh.outcomes,
+                skipped_before_selection: report.owner_refresh.skipped_before_selection,
+                skipped_reason: report.owner_refresh.skipped_reason,
+                stopped_reason: report.owner_refresh.stopped_reason,
+                llm_calls: report.owner_refresh.llm_calls,
+                est_cost_usd: report.owner_refresh.est_cost_usd,
+                agent_ids: report.owner_refresh.changed_agent_ids.slice(0, 100),
+                errors: report.owner_refresh.errors,
+              },
+            }]
+          : []),
       ],
       evidence:
         reverifyIdx >= 0

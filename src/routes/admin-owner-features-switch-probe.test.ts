@@ -46,6 +46,7 @@ const SAVED_ENV = [
   "OWNER_FEATURES_SWITCH_PROBE_ENABLED", "ADMIN_KEY", "ANALYTICS_ADMIN_KEY", "OWNER_FEATURES_ALLOWED_SUBJECTS",
   "OWNER_FEATURES_ENFORCE", "OWNER_PAUSE_ENABLED", "OWNER_VISIBILITY_ENFORCE_BY_ID", "OWNER_LOCK_ENFORCE_WRITES",
   "OUTREACH_UNSUBSCRIBE_ENABLED", "STOCK_CHECK_EMAIL_ENABLED", "OWNER_ORDERABILITY_PORTAL_ENABLED", "OWNER_ORDER_EMAIL_ENABLED", "RFB_DISABLE_ORDER_FOLLOWUPS", "UNSUBSCRIBE_TOKEN_SECRET",
+  "OWNER_AUTO_UPDATES_ENABLED",
 ];
 const KEY = "switch-probe-admin-key-for-tests";
 const FIX = "sp-fixture";
@@ -158,6 +159,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       process.env.OUTREACH_UNSUBSCRIBE_ENABLED = "1";
       process.env.STOCK_CHECK_EMAIL_ENABLED = "1";
       process.env.OWNER_ORDERABILITY_PORTAL_ENABLED = "1";
+      // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: auto.updates (liveFlag) and the owner refresh.
+      process.env.OWNER_AUTO_UPDATES_ENABLED = "1";
     };
     setBaseEnv();
 
@@ -270,14 +273,25 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertEq(failing.map((x: any) => `${x.key ?? x.check} ${x.surface ?? ""} ${x.direction ?? ""}: ${x.reason ?? ""} | ${x.observed ?? ""}`), [], "run-2: every row and check PASS");
       assertEq([b.fail, b.restored, b.ready_for_daniel_test], [0, true, true], "run-3: fail 0, restored, ready_for_daniel_test");
       assertTrue(b.pass === (b.rows?.length ?? 0) + (b.checks?.length ?? 0), "run-4: pass counts rows + checks");
-      // Coverage: every live key × declared surface has rows in both directions.
+      // Coverage: every live key × declared surface has rows in both directions
+      // (a choice: one row per offered option).
       const live = reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
       for (const e of live) {
         for (const s of e.surfaces) {
           const dirs = (b.rows ?? []).filter((x: any) => x.key === e.key && x.surface === s).map((x: any) => x.direction).sort();
-          assertTrue(dirs.includes("off") && dirs.includes("on"), `run-5: ${e.key} × ${s} probed off and on (${dirs.join(",")})`);
+          if (e.type === "choice") {
+            const want = reg.visibleOwnerFeatureOptions(e).map((o) => `value:${o.value}`).sort();
+            assertEq(dirs, want, `run-5: ${e.key} × ${s} probed with every offered option`);
+          } else {
+            assertTrue(dirs.includes("off") && dirs.includes("on"), `run-5: ${e.key} × ${s} probed off and on (${dirs.join(",")})`);
+          }
         }
       }
+      // auto.updates × job:rfb_enrichment_nightly: away from fill_empty and back, each through the write path.
+      const au = (b.rows ?? []).filter((x: any) => x.key === "auto.updates");
+      assertEq(au.map((x: any) => [x.direction, x.result, x.write_status, x.change_logged, x.discriminating]), [
+        ["value:automatic", "PASS", 200, true, true], ["value:never", "PASS", 200, true, true], ["value:fill_empty", "PASS", 200, true, true],
+      ], "run-5b: auto.updates — automatic, never, then back to fill_empty: each written (200, logged) and the owner refresh follows it");
       assertTrue((b.rows ?? []).filter((x: any) => x.key === "visibility.profile").length === 24, "run-6: visibility.profile: 12 surfaces × 2 directions");
       assertTrue((b.rows ?? []).filter((x: any) => x.direction === "parent_off" || x.direction === "parent_on").length === 6, "run-7: the locked keys follow orders.enabled off and on (3 surfaces × 2)");
       const vis = (b.rows ?? []).filter((x: any) => x.key === "visibility.profile");
@@ -475,6 +489,13 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(off.length === 12 && off.every((x) => x.result === "FAIL" && /OWNER_FEATURES_ENFORCE og OWNER_PAUSE_ENABLED er av/.test(x.reason || "")), "flags-7: enforce off → visibility.profile «off» rows FAIL (the probe discriminates)");
       assertTrue(v.rows.filter((x) => x.key === "visibility.profile" && x.direction === "on").every((x) => x.result === "PASS"), "flags-8: … while «on» still PASSes");
       assertEq([v.restored, rawState(FIX)], [true, before], "flags-9: restored byte-identical");
+      setBaseEnv();
+      // auto.updates without OWNER_AUTO_UPDATES_ENABLED: its rows FAIL «flag off» (the choice is coming_soon there).
+      delete process.env.OWNER_AUTO_UPDATES_ENABLED;
+      const au = (await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 })).rows.filter((x) => x.key === "auto.updates");
+      assertTrue(au.length === 3 && au.every((x) => x.result === "FAIL" && /flag off in this environment \(OWNER_AUTO_UPDATES_ENABLED=unset\)/.test(x.reason || "")),
+        `flags-10: auto.updates rows FAIL «flag off» without OWNER_AUTO_UPDATES_ENABLED (${au.map((x) => `${x.direction}:${x.result}`).join(",")})`);
+      assertEq(rawState(FIX), before, "flags-11: restored byte-identical");
       setBaseEnv();
     }
 
