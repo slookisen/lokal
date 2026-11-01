@@ -19,6 +19,7 @@
 import express, { Router, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { getDb } from "../database/init";
+import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import { verifyOwnerSession, ownerSessionAllows } from "./owner-portal";
 import {
   isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
@@ -141,6 +142,12 @@ function pickupFrom(body: Record<string, unknown>, action: OrderAction): string 
   return action === "confirm" && typeof body["pickup_time"] === "string" ? (body["pickup_time"] as string) : null;
 }
 
+// T6: the shared owner theme only for a subject on OWNER_FEATURES_ALLOWED_SUBJECTS
+// (off the list = the page is byte-identical to before).
+function ownerThemeFor(agentId: string): boolean {
+  try { return isSubjectAllowedForOwnerFeatures("rfb", agentId); } catch { return false; }
+}
+
 // ── Owner session: the list ────────────────────────────────────────────────
 
 router.get("/eier/:agentId/ordrer", ownerOrdersLimiter, (req: Request, res: Response) => {
@@ -161,6 +168,7 @@ router.get("/eier/:agentId/ordrer", ownerOrdersLimiter, (req: Request, res: Resp
     return res.send(renderOrdersPage({
       agentId, producerName: agent.name, tab, counts, orders,
       openId: q(req, "o") || null, done: q(req, "done"), error: q(req, "error"),
+      ownerTheme: ownerThemeFor(agentId),
     }));
   } catch (err) {
     console.error("[owner-orders] GET list failed:", err instanceof Error ? err.message : "error");
