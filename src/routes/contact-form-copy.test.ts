@@ -15,6 +15,9 @@
  *      thrown, no unhandled rejection, no visitor address/message in the logs.
  *   f  honeypot and invalid input send no e-mail and write nothing.
  *   g  each platform (given or inferred from the host) gets its own label.
+ *   h  through the real sendEmail (stub transporter): the mail keeps the
+ *      visitor's subject minus bidi marks, but no log line carries that
+ *      subject text or any address — only «[Kontaktskjema · <label>]».
  *
  * Real contact router on the production schema in an in-memory DB; the POST
  * handler is pulled off the router stack and driven with fake req/res (same
@@ -180,7 +183,8 @@ export async function runContactFormCopyTests(opts: { log?: boolean } = {}): Pro
       ].join("\n"), "a-10: body = Plattform/Navn/E-post/Emne, the message as given, the CRM thread id and the reply note");
       assertTrue(["Kari Nordmann", "kari@example.no", MSG, String(t?.id)].every((s) => String(m.textContent).includes(s)),
         "a-11: the body carries name, e-mail, message and thread id");
-      assertEq([m.omitAgentHeader, m.redactRecipientInLogs], [true, true], "a-12: no outreach header; addresses kept out of the send log");
+      assertEq([m.omitAgentHeader, m.redactRecipientInLogs, m.logSubjectAs], [true, true, "[Kontaktskjema · Rett fra Bonden]"],
+        "a-12: no outreach header; addresses and the visitor's subject kept out of the send log");
     }
 
     // ── b: CR/LF and other controls never reach the header; subject capped ──
@@ -319,6 +323,40 @@ export async function runContactFormCopyTests(opts: { log?: boolean } = {}): Pro
         assertEq([r.status, t?.vertical_id, sent[0]?.subject, String(sent[0]?.textContent ?? "").split("\n")[0]],
           [200, vertical, `[Kontaktskjema · ${label}] Plattformtest`, `Plattform: ${label}`],
           `g-01 (${tag}): ${vertical} → «${label}» in subject and body`);
+      }
+    }
+
+    // ── h: through the real sendEmail, no log line repeats the visitor's subject or address ──
+    {
+      const prevConfigured = svc.isConfigured;
+      const prevTransporter = svc.transporter;
+      const logs: string[] = [];
+      const wire: any[] = [];
+      const RLO = String.fromCharCode(0x202e);
+      const VISITOR_SUBJECT = "Ring meg, kari.privat@example.no, tlf 99887766";
+      try {
+        // The real sendEmail reads the vertical config (sender identity).
+        const { loadConfigsAtBoot } = require("../config/vertical-config") as typeof import("../config/vertical-config");
+        try { loadConfigsAtBoot(); } catch { /* already loaded by another suite */ }
+        svc.sendEmail = prevSend;
+        svc.isConfigured = true;
+        svc.transporter = { sendMail: async (m: any) => { wire.push(m); return { messageId: "<h@test>" }; } };
+        console.log = (...a: unknown[]) => { logs.push(a.map(String).join(" ")); };
+        errorLog.length = 0;
+        const r = await submit({ name: "Kari", email: "kari.visitor@example.no", subject: `${VISITOR_SUBJECT}${RLO}gnp.exe`, message: "Hei", platform: "rfb" });
+        const all = [...logs, ...errorLog].join("\n");
+        assertEq([r.status, wire.length], [200, 1], "h-01: the real sendEmail hands exactly one mail to the transporter");
+        assertEq(wire[0]?.subject, `[Kontaktskjema · Rett fra Bonden] ${VISITOR_SUBJECT}gnp.exe`,
+          "h-02: the mail keeps the visitor's subject; bidi override marks are dropped");
+        assertTrue(logs.some((l) => l.includes("Email sent successfully") && l.includes('"subject":"[Kontaktskjema · Rett fra Bonden]"')),
+          "h-03: the send log shows only the fixed [Kontaktskjema · label] prefix");
+        assertTrue(["Ring meg", "99887766", "kari.privat@", "kari.visitor@"].every((s) => !all.includes(s)),
+          "h-04: no log line carries the visitor's subject text or an address");
+      } finally {
+        console.log = () => { /* silence route/service logging */ };
+        svc.isConfigured = prevConfigured;
+        svc.transporter = prevTransporter;
+        svc.sendEmail = (o: any) => { sent.push(o); return sendImpl(o); };
       }
     }
   } catch (err: any) {

@@ -35,10 +35,12 @@ const CONTACT_FORM_PLATFORM_LABELS: Record<"rfb" | "experiences" | "dental", str
 const CONTACT_FORM_COPY_SUBJECT_MAX = 150;
 // C0 + DEL + C1 controls (CR/LF among them) and the Unicode line/paragraph separators.
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+// Bidi embedding/override/isolate marks: they can make a subject display reversed.
+const BIDI_CHARS_RE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
-/** Visitor text for a header or a one-line field: controls → space, runs collapsed. */
+/** Visitor text for a header or a one-line field: controls → space, bidi marks dropped, runs collapsed. */
 function toOneLine(s: string): string {
-  return String(s ?? "").replace(CONTROL_CHARS_RE, " ").replace(/\s+/g, " ").trim();
+  return String(s ?? "").replace(CONTROL_CHARS_RE, " ").replace(BIDI_CHARS_RE, "").replace(/\s+/g, " ").trim();
 }
 
 /** Caps at `max` code points (never splits a surrogate pair), ending in "…" when cut. */
@@ -81,6 +83,13 @@ export interface EmailOptions {
    * Omitted/false leaves the logging unchanged.
    */
   redactRecipientInLogs?: boolean;
+  /**
+   * Contact-form copy (2026-11-01): the subject carries free text a visitor
+   * wrote, so the send log must not repeat it. When set, every log line in
+   * sendEmail shows this value instead of the subject; the mail itself still
+   * carries the real subject. Omitted leaves the logging unchanged.
+   */
+  logSubjectAs?: string;
   /**
    * Full RFC 5322 From header, e.g. `"Opplevagent" <kontakt@rettfrabonden.com>`.
    *
@@ -349,6 +358,7 @@ export class EmailService {
     const redact = options.redactRecipientInLogs === true;
     const logTo = (to: string) => (redact ? "[redacted]" : to);
     const logErr = (msg: string) => (redact ? maskEmails(msg) : msg);
+    const logSubject = (subject: string) => options.logSubjectAs ?? subject;
     // ── Test-send guard (dev-request 2026-07-26-booking-test-send-guard) ──
     // Applied FIRST, ahead of the dry-run short-circuit and every other
     // branch below, so there is no code path on which a test-flagged email
@@ -366,7 +376,7 @@ export class EmailService {
         logger.warn('Test-send redirect applied', {
           intendedRecipient: logTo(options.to),
           redirectedTo: logTo(redirected.to),
-          subject: redirected.subject,
+          subject: logSubject(redirected.subject),
         });
         options = { ...options, ...redirected };
       } catch (err) {
@@ -378,7 +388,7 @@ export class EmailService {
               : 'test_send_redirect_failed';
         logger.error('Test-send BLOCKED — nothing sent', {
           intendedRecipient: logTo(options.to),
-          subject: options.subject,
+          subject: logSubject(options.subject),
           error,
         });
         return { success: false, error };
@@ -391,7 +401,7 @@ export class EmailService {
     if (!this.isConfigured || (this.transporter === this.envTransporter && isEmailForceDryRun())) {
       logger.info('DRY RUN: Would send email', {
         to: logTo(options.to),
-        subject: options.subject,
+        subject: logSubject(options.subject),
       });
       return { success: true, messageId: 'DRY_RUN' };
     }
@@ -437,7 +447,7 @@ export class EmailService {
 
       logger.info('Email sent successfully', {
         to: logTo(options.to),
-        subject: options.subject,
+        subject: logSubject(options.subject),
         messageId: info.messageId as string,
       });
 
@@ -1258,9 +1268,10 @@ ${this.brand} | ${getConfig().domain}`;
         textContent,
         replyTo: opts.email.replace(CONTROL_CHARS_RE, ''),
         // Not outreach (see EmailOptions.omitAgentHeader), and the mail carries
-        // a consumer's address, so keep addresses out of the send log too.
+        // a consumer's address and free text, so keep both out of the send log.
         omitAgentHeader: true,
         redactRecipientInLogs: true,
+        logSubjectAs: `[Kontaktskjema · ${label}]`,
       });
     } catch (error) {
       logger.error('Error sending admin contact-form copy', {
