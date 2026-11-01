@@ -7789,27 +7789,154 @@ export async function gateRfbContactCandidates(params: {
   return result;
 }
 
+/** Country names that some pages print after the poststed ("3915 Porsgrunn
+ *  Norway") — never part of the poststed. Case-insensitive. */
+const ADDRESS_TRAILING_COUNTRY_WORDS = new Set(["norge", "norway"]);
+
+/** Block-level tags whose open/close (and `<br>`/`<hr>`) mark a visual line
+ *  break on the page. Everything else is flattened to a space. */
+const ADDRESS_BLOCK_TAG_RE =
+  /<\/?(?:br|hr|p|div|li|ul|ol|h[1-6]|td|th|tr|table|tbody|thead|tfoot|address|section|article|header|footer|nav|aside|main|dl|dt|dd|figure|figcaption|blockquote|form|fieldset)\b[^>]*>/gi;
+
+/** Lower-case standalone street-type words ("Blybergs vei", "Kong Oscars
+ *  gate") — the street NAME is then the word(s) in front of it. */
+const ADDRESS_STREET_TYPE_WORDS = new Set([
+  "vei", "veien", "veg", "vegen", "vn", "gate", "gata", "gaten", "gt",
+  "plass", "plassen", "allé", "alle", "alléen", "alleen", "torg", "torget",
+  "bakke", "bakken", "brygge", "brygga", "sti", "stien", "tun", "tunet", "hagen",
+]);
+
+/**
+ * Flatten HTML to text for address extraction, keeping block boundaries as
+ * "\n" (one line per visual line). Source whitespace (incl. raw newlines in
+ * the HTML source) is collapsed to a space first, since it is not a visual
+ * break; runs of blank lines collapse to a single "\n".
+ */
+function htmlToAddressText(html: string): string {
+  return html
+    .replace(/\s+/g, " ")
+    .replace(ADDRESS_BLOCK_TAG_RE, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n[\n ]*/g, "\n");
+}
+
+/** Already-loaded Bring postnummerregister (postnummer -> poststed), or null.
+ *  Never fetches — extractAddress is sync and runs inside batch requests. */
+function cachedPostalRegistryForAddress(): Map<string, string> | null {
+  try {
+    const { getCachedPostalRegistry } =
+      require("../services/agents-city-backfill") as typeof import("../services/agents-city-backfill");
+    return getCachedPostalRegistry();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the poststed against the registry name for its postcode. `lineRest`
+ * is the page text from the poststed's first letter to the end of its line.
+ * Returns the page's own spelling of the registry name (case-insensitive,
+ * hyphen ≡ space), or — when the page carries only the registry name's first
+ * word (e.g. "Kristiansand" for "KRISTIANSAND S") — that word; null when the
+ * page's poststed does not match the registry name at all.
+ */
+function matchRegistryPoststed(lineRest: string, captured: string, registryName: string): string | null {
+  const regWords = registryName.trim().split(/[\s-]+/).filter(Boolean);
+  if (regWords.length === 0) return null;
+  const escaped = regWords.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const re = new RegExp(`^(${escaped.join("[ -]+")})(?![\\p{L}])`, "iu");
+  const full = lineRest.match(re);
+  if (full) return full[1];
+  const firstCaptured = captured.split(" ")[0];
+  if (firstCaptured.toLowerCase() === regWords[0].toLowerCase()) return firstCaptured;
+  return null;
+}
+
+/**
+ * Name-prefix guard (dev-request "uttrekk-adresse" Skive A). `streetName` is
+ * the street text in front of the house number, on one line, after the
+ * leading contact-label strip. Returns true when a producer/person name is
+ * evidently glued in front of the street name, i.e.:
+ *   (a) the last word is a lower-case standalone street type
+ *       (ADDRESS_STREET_TYPE_WORDS, e.g. "vei"/"gate") and the words before it
+ *       contain 2+ capitalised words — EXCEPT exactly two words whose second
+ *       ends in a genitive "s" ("Kong Oscars gate", "Olav Kyrres gate"),
+ *       which is a normal Norwegian street name; or
+ *   (b) otherwise (compound street word, e.g. "Storgata", "Jordeshagen"),
+ *       there are 2+ capitalised words in front of that last word
+ *       ("Joel Simpson Storgata"). One leading capitalised word is allowed
+ *       ("Øvre Slottsgate", "Nedre Storgata").
+ * "Blybergs vei" (1 capitalised word + "vei") passes.
+ */
+function hasNamePrefixBeforeStreet(streetName: string): boolean {
+  const tokens = streetName.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return false;
+  const isCap = (w: string): boolean => /^[A-ZÆØÅ]/.test(w);
+  const last = tokens[tokens.length - 1];
+  const before = tokens.slice(0, -1);
+  const capCount = before.filter(isCap).length;
+  if (ADDRESS_STREET_TYPE_WORDS.has(last.toLowerCase()) && !isCap(last)) {
+    if (capCount <= 1) return false;
+    const genitivePair = before.length === 2 && capCount === 2 && /s$/.test(before[1]);
+    return !genitivePair;
+  }
+  return capCount >= 2;
+}
+
+/**
+ * Skive A (2026-11-01): only the clean «street nr, postnummer poststed» or
+ * null. The HTML is flattened with block boundaries kept as line breaks
+ * (htmlToAddressText):
+ *   - the street cannot cross a line break (so a heading / company / person
+ *     name on its own line above the street is never swallowed);
+ *   - between house number and postcode: optional comma plus spaces or AT
+ *     MOST ONE line break ("Storgata 120<br>3915 Porsgrunn");
+ *   - the poststed cannot cross a line break; a trailing contact label or
+ *     country word (Norge/Norway) is dropped;
+ *   - if the Bring postnummerregister is ALREADY loaded in this process and
+ *     knows the postcode, the poststed must match its registry name (an
+ *     extra trailing word is dropped; a mismatch skips the candidate). The
+ *     registry is never fetched from here;
+ *   - a name prefix still in front of the street (hasNamePrefixBeforeStreet)
+ *     ⇒ null — write nothing rather than a polluted address.
+ */
 export function extractAddress(html: string): string | null {
-  const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
-  // Pattern: <words> <number> <optional comma/space> <4 digits> <CAPS/title word>
+  const text = htmlToAddressText(html);
+  // Pattern: <words> <number> [,] <spaces | one line break> <4 digits> <Title word(s)>
   const re =
-    /([A-ZÆØÅ][a-zæøåA-ZÆØÅ\s]{2,40}?\s+\d+[A-Za-z]?),?\s+(\d{4})\s+([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)?)/g;
+    /([A-ZÆØÅ][a-zæøåA-ZÆØÅ ]{2,40}? +\d+[A-Za-z]?),?(?: *\n *| +)(\d{4}) +([A-ZÆØÅ][a-zæøå]+(?: +[A-ZÆØÅ][a-zæøå]+)?)/g;
+  const registry = cachedPostalRegistryForAddress();
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const words = m[3].trim().split(/\s+/);
     if (words.length > 1 && ADDRESS_CONTACT_LABELS.has(words[words.length - 1].toLowerCase())) {
       words.pop();
     }
-    const poststed = words.join(" ");
+    if (words.length > 1 && ADDRESS_TRAILING_COUNTRY_WORDS.has(words[words.length - 1].toLowerCase())) {
+      words.pop();
+    }
+    if (ADDRESS_TRAILING_COUNTRY_WORDS.has(words[0].toLowerCase())) continue;
+    let poststed = words.join(" ");
+    const registryName = registry?.get(m[2]);
+    if (registryName) {
+      const poststedStart = m.index + m[0].length - m[3].length;
+      const lineRest = text.slice(poststedStart).split("\n")[0];
+      const resolved = matchRegistryPoststed(lineRest, poststed, registryName);
+      if (!resolved) continue;
+      poststed = resolved;
+    }
     const rawStreet = m[1].trim();
     // dev-request 2026-10-01-rfb-adressenormalisering-c1: a date such as
     // "September 17, 2025 Sesongavslutning" fits the pattern (the year reads as a
     // postcode) — reject when the pre-postcode text is a month+day date.
     if (looksLikeDateText(rawStreet)) continue;
     const street = (stripLeadingContactLabel(rawStreet) ?? rawStreet).trim();
-    const candidate = `${street}, ${m[2]} ${poststed}`;
     // Sanity: skip obviously bad matches (< 10 chars of street part).
-    if (street.length >= 6) return candidate;
+    if (street.length < 6) continue;
+    const streetName = street.replace(/\s+\d+[A-Za-z]?$/, "");
+    if (hasNamePrefixBeforeStreet(streetName)) return null;
+    return `${street}, ${m[2]} ${poststed}`;
   }
   return null;
 }
