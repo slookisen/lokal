@@ -50878,6 +50878,26 @@ runSerial(async () => {
   }
 });
 
+// Eierportal testrunde 1, T5 («lagres der du står», steg 1): every «Mine valg»
+// POST outcome (RFB and gårdssalg) answers 303 with the contracted anchor; the
+// level preview sits inside #niva, the confirm panel inside li#valg-<key>, the
+// message in its card or row. Swaps getDb() + env + module cache — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T5: ankerkontrakt for «Mine valg» ──");
+  try {
+    const { runOwnerFeaturesT5AnchorsTests } = require("../src/routes/owner-features-t5-anchors.test") as
+      typeof import("../src/routes/owner-features-t5-anchors.test");
+    const r = await runOwnerFeaturesT5AnchorsTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-t5-anchors: " + f);
+    console.log(`  owner-features-t5-anchors: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-t5-anchors: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.
