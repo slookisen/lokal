@@ -50920,6 +50920,27 @@ runSerial(async () => {
   }
 });
 
+// Eierportal testrunde 1, T6 («felles drakt, lys og mørk»): shared colour
+// tokens on «Mine valg», the portal and the owner's «Mine ordrer» list —
+// contrast ≥ 4.5:1 / 3:1 in both themes, no colour inline styles for an
+// allowlisted subject, byte-identical off the list, buyer card untouched.
+// Swaps getDb() + the cart DB + env (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T6: felles drakt, lys og mørk ──");
+  try {
+    const { runOwnerUiTokensT6Tests } = require("../src/routes/owner-ui-tokens-t6.test") as
+      typeof import("../src/routes/owner-ui-tokens-t6.test");
+    const r = await runOwnerUiTokensT6Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-ui-tokens-t6: " + f);
+    console.log(`  owner-ui-tokens-t6: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-ui-tokens-t6: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.

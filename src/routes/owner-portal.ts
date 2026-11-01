@@ -22,6 +22,7 @@ import { customerRuleSql } from "../services/customer-rule";
 import { getSupplyGraphStaleDays } from "../services/supply-graph";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
 import { rateLimit } from "express-rate-limit";
@@ -2062,7 +2063,15 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       </script>
     `;
 
-    return res.send(portalShell(`Eierportal · ${agent.name}`, body));
+    // T6 (eierportal testrunde 1): the shared owner theme, light and dark —
+    // token CSS in the body and colour inline styles as token classes — only
+    // for a subject on OWNER_FEATURES_ALLOWED_SUBJECTS (off the list = the
+    // portal is byte-identical to before).
+    let ownerTheme = false;
+    try { ownerTheme = isSubjectAllowedForOwnerFeatures("rfb", agentId); } catch { ownerTheme = false; }
+    const pageBody = ownerTheme ? `<style>${OWNER_PORTAL_THEME_CSS}</style>${ownerThemeHtml(body)}` : body;
+
+    return res.send(portalShell(`Eierportal · ${agent.name}`, pageBody));
   } catch (err) {
     console.error("[owner-portal] GET /eier/:agentId/portal error:", err);
     return res.status(500).send(portalShell(
