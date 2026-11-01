@@ -11,9 +11,12 @@
  * and /api/contact (fail-closed) answered 403 captcha_failed to everyone.
  *
  *   a  middleware: the header is the same for every host; script-src and
- *      frame-src now carry https://challenges.cloudflare.com; every other
- *      directive is byte-identical to the pre-fix header (BEFORE_CSP, as
- *      served by prod on 2026-10-31); no wildcard, no new 'unsafe-*', no
+ *      frame-src now carry https://challenges.cloudflare.com, and so does
+ *      connect-src (the Turnstile script's error report when a challenge
+ *      fails — prod's console showed connect-src blocking
+ *      …/cdn-cgi/challenge-platform/h/g/fr); every other directive is
+ *      byte-identical to the pre-fix header (BEFORE_CSP, as served by prod
+ *      on 2026-10-31); no wildcard, no new 'unsafe-*', no
  *      nonce / hash / 'strict-dynamic' (either would disable the
  *      'unsafe-inline' the pages' inline scripts rely on, and
  *      'strict-dynamic' would also void the host allowlist).
@@ -22,7 +25,8 @@
  *      is the one from (a), the page's Turnstile <script src> is allowed by
  *      the new script-src and was blocked by the old one, every external
  *      script on the page is allowed, the widget iframe origin is allowed by
- *      frame-src (and was not), and the submit fetch('/api/contact') is
+ *      frame-src (and was not), the widget's error report is allowed by
+ *      connect-src (and was not), and the submit fetch('/api/contact') is
  *      same-origin, covered by connect-src 'self'.
  *   c  scan: security.ts is the only non-test file under src/ that sets a
  *      CSP, so no route overrides it for one host.
@@ -52,6 +56,11 @@ const TURNSTILE_SCRIPT = `${TURNSTILE}/turnstile/v0/api.js`;
 // The widget iframe's path is Cloudflare's to change; frame-src allows the
 // origin, so any path on it must pass.
 const TURNSTILE_FRAME = `${TURNSTILE}/cdn-cgi/challenge-platform/h/g/turnstile/if/ov2/av0/rcv0/0/x/0x4AAAAAADr56qDaUM0XWoTF/light/normal`;
+// The error report the Turnstile script fetches when a challenge fails — the
+// URL prod's console showed connect-src blocking. The path is Cloudflare's to
+// change too; connect-src allows the origin.
+const TURNSTILE_REPORT = `${TURNSTILE}/cdn-cgi/challenge-platform/h/g/fr`;
+const TURNSTILE_REPORT_DEEP = `${TURNSTILE_REPORT}/8c1a2b3c4d5e6f70/1762070400000/AbCdEf0123`;
 
 /** The header prod served on all three /kontakt pages on 2026-10-31, before this slice. */
 const BEFORE_CSP =
@@ -60,9 +69,10 @@ const BEFORE_CSP =
   "frame-src 'none';object-src 'none';base-uri 'self';form-action 'self';frame-ancestors 'self';script-src-attr 'none';" +
   "upgrade-insecure-requests";
 
-/** BEFORE_CSP with exactly the two directives this slice changes replaced. */
+/** BEFORE_CSP with exactly the three directives that carry Turnstile replaced. */
 const AFTER_CSP = BEFORE_CSP
   .replace("script-src 'self' 'unsafe-inline';", `script-src 'self' 'unsafe-inline' ${TURNSTILE};`)
+  .replace("connect-src 'self' https://rettfrabonden.com;", `connect-src 'self' https://rettfrabonden.com ${TURNSTILE};`)
   .replace("frame-src 'none';", `frame-src ${TURNSTILE};`);
 
 /** "a b;c d" -> [["a", "a b"], ["c", "c d"]] — directive name and its raw text, in order. */
@@ -152,23 +162,24 @@ export async function runSecurityCspTurnstileTests(opts: { log?: boolean } = {})
   assertEq(sourcesOf(csp, "frame-src"), [TURNSTILE], "a3: frame-src = the Turnstile origin only ('none' replaced, nothing else)");
   assertEq(directives(csp).map(([n]) => n), directives(BEFORE_CSP).map(([n]) => n), "a4: same directives in the same order — none added, none removed");
   for (const [name, raw] of directives(BEFORE_CSP)) {
-    if (name === "script-src" || name === "frame-src") continue;
+    if (name === "script-src" || name === "frame-src" || name === "connect-src") continue;
     assertEq(directives(csp).find(([n]) => n === name)?.[1], raw, `a5: ${name} byte-identical to before`);
   }
-  assertEq(csp, AFTER_CSP, "a6: whole header = the old one with only script-src and frame-src changed");
+  assertEq(csp, AFTER_CSP, "a6: whole header = the old one with only script-src, connect-src and frame-src changed");
   {
     const added: string[] = [];
     for (const [name] of directives(csp)) {
       const before = new Set(sourcesOf(BEFORE_CSP, name));
       for (const s of sourcesOf(csp, name)) if (!before.has(s)) added.push(`${name} ${s}`);
     }
-    assertEq(added, [`script-src ${TURNSTILE}`, `frame-src ${TURNSTILE}`], "a7: the Turnstile origin is the only source added anywhere");
+    assertEq(added, [`script-src ${TURNSTILE}`, `connect-src ${TURNSTILE}`, `frame-src ${TURNSTILE}`], "a7: the Turnstile origin is the only source added anywhere");
   }
   assertTrue(!csp.split(/[\s;]+/).some((t) => t.includes("*")), "a8: no wildcard source");
   assertEq((csp.match(/'unsafe-/g) || []).length, (BEFORE_CSP.match(/'unsafe-/g) || []).length, "a9: no new 'unsafe-*' keyword");
   assertTrue(!sourcesOf(csp, "script-src").some((s) => /^'(strict-dynamic|nonce-|sha(256|384|512)-)/.test(s)),
     "a10: script-src has no nonce / hash / 'strict-dynamic' (they would void 'unsafe-inline' for the inline submit script)");
-  assertEq(sourcesOf(csp, "connect-src"), ["'self'", "https://rettfrabonden.com"], "a11: connect-src unchanged (Cloudflare lists it only for pre-clearance, as 'self')");
+  assertEq(sourcesOf(csp, "connect-src"), ["'self'", "https://rettfrabonden.com", TURNSTILE],
+    "a11: connect-src = the old 'self' https://rettfrabonden.com + the Turnstile origin, nothing else");
   // The matcher itself: exact origin only.
   assertTrue(allows(sourcesOf(csp, "script-src"), TURNSTILE_SCRIPT, `https://${RFB}`), "a12: the Turnstile script URL is allowed by script-src");
   assertTrue(!allows(sourcesOf(BEFORE_CSP, "script-src"), TURNSTILE_SCRIPT, `https://${RFB}`), "a13: … and was blocked by the old script-src");
@@ -177,6 +188,21 @@ export async function runSecurityCspTurnstileTests(opts: { log?: boolean } = {})
   assertTrue(allows(sourcesOf(csp, "frame-src"), TURNSTILE_FRAME, `https://${RFB}`), "a16: the widget iframe (any path on the origin) is allowed by frame-src");
   assertTrue(!allows(sourcesOf(BEFORE_CSP, "frame-src"), TURNSTILE_FRAME, `https://${RFB}`), "a17: … and was blocked by frame-src 'none'");
   assertTrue(!allows(sourcesOf(csp, "frame-src"), `https://${RFB}/kontakt`, `https://${RFB}`), "a18: frame-src still allows no other frame (not even same-origin)");
+  for (const url of [TURNSTILE_REPORT, TURNSTILE_REPORT_DEEP]) {
+    assertTrue(allows(sourcesOf(csp, "connect-src"), url, `https://${RFB}`), `a19: the Turnstile error report is allowed by connect-src (${url.slice(TURNSTILE.length)})`);
+    assertTrue(!allows(sourcesOf(BEFORE_CSP, "connect-src"), url, `https://${RFB}`), `a20: … and was blocked by the old connect-src (${url.slice(TURNSTILE.length)})`);
+  }
+  assertTrue(!allows(sourcesOf(csp, "connect-src"), "https://challenges.cloudflare.com.evil.example/cdn-cgi/challenge-platform/h/g/fr", `https://${RFB}`),
+    "a21: connect-src allows no look-alike host");
+  assertTrue(!allows(sourcesOf(csp, "connect-src"), "https://cdn.cloudflare.com/cdn-cgi/challenge-platform/h/g/fr", `https://${RFB}`),
+    "a22: … nor another cloudflare.com host");
+  assertTrue(!allows(sourcesOf(csp, "connect-src"), "http://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/fr", `https://${RFB}`),
+    "a23: … nor the origin over plain http");
+  for (const host of [RFB, OA, FT]) {
+    assertTrue(allows(sourcesOf(csp, "connect-src"), `https://${host}/api/contact`, `https://${host}`), `a24: same-origin fetches on ${host} are still allowed ('self')`);
+  }
+  assertTrue(allows(sourcesOf(csp, "connect-src"), "https://rettfrabonden.com/api/marketplace/search", `https://${OA}`),
+    "a25: https://rettfrabonden.com is still allowed from the other hosts");
 
   // ══════════════════════════════════════════════════════════════
   // (b) end to end: /kontakt on each host behind securityHeaders
@@ -278,6 +304,8 @@ export async function runSecurityCspTurnstileTests(opts: { log?: boolean } = {})
         assertEq(blocked, [], `${tag}: every external script on the page is allowed`);
 
         assertTrue(allows(sourcesOf(r.csp, "frame-src"), TURNSTILE_FRAME, origin), `${tag}: the widget iframe origin is allowed by frame-src`);
+        assertTrue(allows(sourcesOf(r.csp, "connect-src"), TURNSTILE_REPORT, origin), `${tag}: the widget's error report is allowed by connect-src`);
+        assertTrue(!allows(sourcesOf(BEFORE_CSP, "connect-src"), TURNSTILE_REPORT, origin), `${tag}: … which the old connect-src blocked`);
         assertTrue(r.body.includes("fetch('/api/contact'") && allows(sourcesOf(r.csp, "connect-src"), `${origin}/api/contact`, origin),
           `${tag}: the submit fetch('/api/contact') is same-origin, allowed by connect-src`);
       }

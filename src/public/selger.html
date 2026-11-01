@@ -1452,6 +1452,10 @@
           }
 
           // Fallback: show code and manual verify step
+          // A code was sent or handed back: an earlier answer on the form
+          // (rule 4 for another e-mail, a missing field) is done with. It is
+          // persistent, so it would otherwise be back after «Gå tilbake».
+          document.getElementById('claimAlert').innerHTML = '';
           hide('claimStep2');
           show('claimStep2b');
           // K1: keep the open claim for a reload or another tab; the server
@@ -1538,11 +1542,13 @@
     // Without it the kept open claim brought only the code field back for 24 h,
     // even when the code went to an outdated farm address. Back on the form the
     // owner can tick «E-postadressen som står på profilen er feil …», which
-    // sends the claim to manual approval. The kept claim is forgotten here.
+    // sends the claim to manual approval. The kept claim is forgotten here, and
+    // so is any old answer on the form (claim-form alerts are persistent).
     document.getElementById('btnClaimBack').addEventListener('click', function() {
       clearOpenClaim(claimId);
       claimId = null;
       document.getElementById('verifyAlert').innerHTML = '';
+      document.getElementById('claimAlert').innerHTML = '';
       hide('claimStep2b');
       show('claimStep2');
       document.getElementById('claimStep2').scrollIntoView({ behavior: 'smooth', block: 'start' });
