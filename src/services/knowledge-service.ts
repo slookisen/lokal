@@ -540,6 +540,10 @@ export const CLAIM_REVIEW_QUEUE_LIST_MAX = 200;
  *  first send and only while the code is valid. Counted in the platform cap. */
 export const CLAIM_CODE_MAX_RESENDS = 1;
 export const CLAIM_CODE_RESEND_MIN_MINUTES = 10;
+/** The magic_links id prefix of a claim-approval /eier login link (K5) — the
+ *  same as OWNER_CLAIM_LINK_ID_PREFIX in routes/owner-portal.ts.
+ *  verifyMagicLink ignores these rows. */
+const CLAIM_APPROVAL_LINK_ID_PREFIX = "mlclaim_";
 
 export interface ClaimLimits {
   maxFailedAttempts: number;
@@ -1903,7 +1907,12 @@ class KnowledgeService {
        WHERE ml.token = ? AND ml.used = 0`
     ).get(token) as any;
 
-    if (!link) {
+    // A claim-approval link (owner-portal.ts createOwnerLoginLink,
+    // "claim_approval") is only for /magic-link-verify, which burns it and
+    // opens a fresh /eier session. Here it is no link at all: logging in to
+    // /selger with it, and marking it used, would leave a used, unexpired row
+    // that acted as an /eier session for the rest of its 15 minutes.
+    if (!link || String(link.id || "").startsWith(CLAIM_APPROVAL_LINK_ID_PREFIX)) {
       return { success: false, error: "Ugyldig eller brukt lenke" };
     }
 

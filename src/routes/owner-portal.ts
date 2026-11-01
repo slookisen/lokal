@@ -377,6 +377,18 @@ function readSessionCookie(req: Request): string | undefined {
   return parsed.rfb_owner_session;
 }
 
+/**
+ * A claim-approval link ("mlclaim_") is never a session, used or not. Only
+ * /magic-link-verify redeems it, and that burns it and opens a fresh
+ * "mlsess_" row. Without this check a claim link that something else had
+ * marked used (the /selger verifier, knowledge-service verifyMagicLink, did
+ * so before it learnt to ignore them) would act as a cookie / Bearer session
+ * for the rest of its 15 minutes.
+ */
+function isClaimApprovalLinkId(id: unknown): boolean {
+  return String(id || "").startsWith(OWNER_CLAIM_LINK_ID_PREFIX);
+}
+
 export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: string; token?: string } {
   // Try cookie first
   const cookieToken = readSessionCookie(req);
@@ -384,11 +396,11 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT agent_id FROM magic_links
+        `SELECT id, agent_id FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(cookieToken) as any;
-    if (link) {
+    if (link && !isClaimApprovalLinkId(link.id)) {
       return { valid: true, agentId: link.agent_id, token: cookieToken };
     }
   }
@@ -400,11 +412,11 @@ export function verifyOwnerSession(req: Request): { valid: boolean; agentId?: st
     const db = getDb();
     const link = db
       .prepare(
-        `SELECT agent_id FROM magic_links
+        `SELECT id, agent_id FROM magic_links
          WHERE token = ? AND used = 1 AND ${OWNER_TOKEN_NOT_EXPIRED_SQL}`
       )
       .get(token) as any;
-    if (link) {
+    if (link && !isClaimApprovalLinkId(link.id)) {
       return { valid: true, agentId: link.agent_id, token };
     }
   }
@@ -565,6 +577,9 @@ export function issueOwnerSessionForSelgerLogin(
 //                     row, 15 minutes (the mail says so), one-time:
 //                     /magic-link-verify burns it and opens a fresh 7-day
 //                     session row, so the mailed token is never a session.
+//                     Only /magic-link-verify takes it: verifyOwnerSession
+//                     never accepts an "mlclaim_" row, and the /selger
+//                     verifier (knowledge-service verifyMagicLink) ignores it.
 // No rate limit in here. request-magic-link checks its visitor limit before
 // calling; Daniel's approval is not held by it. An "mlclaim_" row is an
 // e-mail, so it still counts toward that limit — a visitor gets fewer mails
