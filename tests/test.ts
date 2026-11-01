@@ -44514,6 +44514,26 @@ runSerial(async () => {
   }
 });
 
+// Slice E1 (dev-request 2026-10-31-rfb-utgaende-eposter-design-og-lesbarhet):
+// the five owner-mail buttons are bulletproof (bgcolor cell, inline white
+// text, white <span>), href/label unchanged, white-on-green ≥ 4.5:1. Swaps
+// APP_URL (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── E1: lesbar knapp i eier-e-postene ──");
+  try {
+    const { runEmailCtaButtonE1Tests } = require("../src/services/email-cta-button-e1.test") as
+      typeof import("../src/services/email-cta-button-e1.test");
+    const e1 = await runEmailCtaButtonE1Tests({ log: false });
+    passed += e1.passed;
+    failed += e1.failed;
+    for (const f of e1.failures) failures.push("email-cta-button-e1: " + f);
+    console.log(`  email-cta-button-e1: ${e1.passed} passed, ${e1.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("email-cta-button-e1: unexpected error: " + String(err?.message || err));
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-09-16-crm-utgaaende-html-body-kollapser-linjeskift ──");
   try {

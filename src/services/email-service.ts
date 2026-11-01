@@ -730,20 +730,6 @@ https://rettfrabonden.com`;
       margin: 20px 0;
       border-radius: 4px;
     }
-    .cta-button {
-      display: inline-block;
-      background: #2d5f2e;
-      color: white;
-      padding: 14px 32px;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      margin: 20px 0;
-      text-align: center;
-    }
-    .cta-button:hover {
-      background: #1e4620;
-    }
     .agent-link {
       color: #2d5f2e;
       text-decoration: none;
@@ -785,7 +771,7 @@ https://rettfrabonden.com`;
 
     <p style="font-weight: bold; margin-top: 20px;">Det tar mindre enn 5 minutter. Klikk her:</p>
 
-    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på ${this.brand}</a>
+    ${ctaButtonHtml({ href: this.escapeHtml(claimUrl), label: `Krav din agent på ${this.brand}`, color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
 
     <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:${this.supportEmail}" class="footer-link">${this.supportEmail}</a>.</p>
 
@@ -956,16 +942,6 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       margin: 20px 0;
       border-radius: 4px;
     }
-    .cta-button {
-      display: inline-block;
-      background: #2d5f2e;
-      color: white;
-      padding: 14px 32px;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      margin: 20px 0;
-    }
     .logo {
       font-size: 20px;
       font-weight: bold;
@@ -987,7 +963,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       <li>Se hvor dine produkter blir funnet av kundene</li>
       <li>Følge med på interaksjoner og preferanser</li>
     </ul>
-    <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">Gå til dashboarden din</a>
+    ${ctaButtonHtml({ href: this.escapeHtml(dashboardUrl), label: "Gå til dashboarden din", color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
     <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl, agentId))}">dashboarden din</a>.</p>
     <p>Lykke til!</p>
   </div>
@@ -1047,17 +1023,6 @@ Lykke til!
       color: #2d5f2e;
       margin-bottom: 20px;
     }
-    .cta-button {
-      display: inline-block;
-      background: #2d5f2e;
-      color: white;
-      padding: 14px 32px;
-      text-decoration: none;
-      border-radius: 6px;
-      font-weight: bold;
-      margin: 25px 0;
-      text-align: center;
-    }
     .footer {
       margin-top: 30px;
       padding-top: 15px;
@@ -1073,7 +1038,7 @@ Lykke til!
     <h1 style="font-size: 20px;">Logg inn</h1>
     <p>Du ba om å logge inn for å administrere <strong>${this.escapeHtml(agentName)}</strong>.</p>
     <p>Klikk knappen under for å logge inn. Lenken er gyldig i 15 minutter.</p>
-    <a href="${this.escapeHtml(magicUrl)}" class="cta-button">Logg inn n\u00e5</a>
+    ${ctaButtonHtml({ href: this.escapeHtml(magicUrl), label: "Logg inn n\u00e5", color: "#2d5f2e", radius: "6px", margin: "25px 0" })}
     <p style="font-size: 13px; color: #666;">Eller kopier denne lenken:</p>
     <p style="font-size: 12px; color: #999; word-break: break-all;">${this.escapeHtml(magicUrl)}</p>
     <div class="footer">
@@ -1250,6 +1215,37 @@ function epEscape(s: string): string {
   } as Record<string, string>)[c]!);
 }
 
+/**
+ * dev-request 2026-10-31-rfb-utgaende-eposter-design-og-lesbarhet, E1: a
+ * "bulletproof" button for the owner mails (claim invitation, claim
+ * confirmation, both magic links, gårdssalg claim). Those buttons used to get
+ * their colours only from a `.cta-button` rule in <style>; Gmail and other
+ * clients drop or override it and paint the link text in their own blue,
+ * about 1.15:1 on the dark green. Every colour is now inline: the cell has
+ * `bgcolor` (Outlook ignores CSS backgrounds) plus an inline background, the
+ * <a> has background, white text, padding and radius, and the label sits in
+ * a white <span> for clients that recolour the <a> itself. `href` and `label`
+ * go in as given — callers pass them escaped, as they did into the old <a>.
+ */
+function ctaButtonHtml(opts: {
+  href: string;
+  label: string;
+  /** The template's own green; white on it must stay ≥ 4.5:1 (WCAG AA). */
+  color: string;
+  radius: string;
+  margin: string;
+  center?: boolean;
+}): string {
+  const { href, label, color, radius, margin, center } = opts;
+  return `<table role="presentation" border="0" cellspacing="0" cellpadding="0"${center ? ' align="center"' : ""} style="margin:${margin};border-collapse:separate;">
+      <tr>
+        <td align="center" bgcolor="${color}" style="background:${color};border-radius:${radius};">
+          <a href="${href}" style="display:inline-block;background:${color};color:#ffffff;padding:14px 32px;text-decoration:none;border-radius:${radius};font-weight:bold;"><span style="color:#ffffff;">${label}</span></a>
+        </td>
+      </tr>
+    </table>`;
+}
+
 function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
   const safeName = epEscape(agentName);
   const safeUrl = epEscape(verifyUrl);
@@ -1266,8 +1262,6 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
     .logo span { color: #D4A373; }
     h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
     p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
-    .cta-button { display: inline-block; background: #2D5016; color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; margin: 18px 0; }
-    .cta-button:hover { background: #3a6b1e; }
     .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
     code { word-break: break-all; background: #f5f5f5; padding: 4px 6px; display: inline-block; border-radius: 4px; }
   </style>
@@ -1282,9 +1276,7 @@ function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
 
     <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong>.</p>
 
-    <p style="text-align:center;">
-      <a href="${safeUrl}" class="cta-button">Logg inn på eierportalen</a>
-    </p>
+    ${ctaButtonHtml({ href: safeUrl, label: "Logg inn på eierportalen", color: "#2D5016", radius: "8px", margin: "18px auto", center: true })}
 
     <p style="font-size: 14px; color: #666;">
       Eller kopier og lim inn denne lenken i nettleseren:
@@ -1342,8 +1334,6 @@ function buildGardssalgClaimMagicLinkHtml(providerName: string, verifyUrl: strin
     .logo { font-size: 22px; font-weight: 700; color: #0f5a50; }
     h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
     p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
-    .cta-button { display: inline-block; background: #0f5a50; color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; margin: 18px 0; }
-    .cta-button:hover { background: #0e3c36; }
     .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
     code { word-break: break-all; background: #f5f5f5; padding: 4px 6px; display: inline-block; border-radius: 4px; }
   </style>
@@ -1358,9 +1348,7 @@ function buildGardssalgClaimMagicLinkHtml(providerName: string, verifyUrl: strin
 
     <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong> på Opplevagent.</p>
 
-    <p style="text-align:center;">
-      <a href="${safeUrl}" class="cta-button">Logg inn på eierportalen</a>
-    </p>
+    ${ctaButtonHtml({ href: safeUrl, label: "Logg inn på eierportalen", color: "#0f5a50", radius: "8px", margin: "18px auto", center: true })}
 
     <p style="font-size: 14px; color: #666;">
       Eller kopier og lim inn denne lenken i nettleseren:
