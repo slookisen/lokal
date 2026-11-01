@@ -79,7 +79,11 @@ export function rfbOutreachProducerCountLabel(producerCountTotal: number): strin
   return formatProducerCount(rounded);
 }
 
-/** `{eier_url}` — the link behind «Ta eierskap her» on the profile page. */
+/**
+ * `{eier_url}` — the link behind «Ta eierskap her» on the profile page. Texts H
+ * and J no longer carry it (Daniel 2026-11-01): the producer is asked to reply
+ * instead, until the claim flow behind it holds for owners from an e-mail.
+ */
 export function rfbOwnerUrl(agentId: string): string {
   return `https://rettfrabonden.com/selger?agent=${agentId}`;
 }
@@ -92,7 +96,7 @@ export function isValidRfbProfileUrl(url: string): boolean {
 }
 
 export interface RfbOutreachRenderInput {
-  /** Drives the A/B subject split and {eier_url}. */
+  /** Drives the A/B subject split. */
   agentId: string;
   producerName: string;
   /** Canonical profile URL (already validated — see isValidRfbProfileUrl). */
@@ -157,7 +161,6 @@ export function renderRfbOutreachEmail(input: RfbOutreachRenderInput): RfbOutrea
   }
   const firstName = typeof input.contactFirstName === "string" ? input.contactFirstName.trim() : "";
   const variant = rfbOutreachSubjectVariant(input.agentId);
-  const eierUrl = rfbOwnerUrl(input.agentId);
 
   const paragraphs = [
     firstName ? `Hei ${firstName},` : "Hei,",
@@ -165,7 +168,7 @@ export function renderRfbOutreachEmail(input: RfbOutreachRenderInput): RfbOutrea
     input.profileUrl,
     `Varene er det vi oftest tar feil av, så et kort svar hjelper mye. Er noe annet feil, kan dere bare svare på denne e-posten, så retter jeg det.`,
     `Grunnen til at jeg gjør dette, er at mange nå spør ChatGPT og lignende tjenester om hvor de kan kjøpe lokal mat. Små produsenter kommer ofte ikke med i svarene, fordi informasjonen om dem er spredt eller gammel. Rett fra Bonden samler den og setter den opp slik at disse tjenestene kan lese den. Det erstatter ikke nettsiden deres, men gjør at dere blir funnet der folk nå spør.`,
-    `Det koster ingenting å stå der, og dere binder dere ikke til noe. Vil dere styre siden selv, kan dere ta den over her, uten passord: ${eierUrl}`,
+    `Det koster ingenting å stå der, og dere binder dere ikke til noe. Vil dere styre siden selv, svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over.`,
     `Vil dere ikke være med, svarer dere bare «fjern», så tar jeg siden ned innen et døgn.`,
     `Vennlig hilsen\nDaniel Fredriksen\nRett fra Bonden\n${RFB_OUTREACH_SIGNATURE_PHONE}`,
     RFB_OUTREACH_PRIVACY_LINE,
@@ -230,7 +233,7 @@ export function renderRfbThankYouV4(input: {
   return [
     `Hei ${input.firstName},`,
     first,
-    `Endrer noe seg, kan dere svare på denne e-posten når som helst. Vil dere heller endre siden selv, kan dere ta den over her, uten passord: ${rfbOwnerUrl(input.agentId)}`,
+    `Endrer noe seg, kan dere svare på denne e-posten når som helst. Vil dere heller styre siden selv, svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over.`,
     `Vennlig hilsen\nDaniel Fredriksen`,
   ].join("\n\n");
 }

@@ -39,7 +39,7 @@ export interface TestSummary {
 // approved draft (A2A marketing-drafts/2026-10-22-utsendingstekster-v4-rfb.md,
 // texts H, I and J) with its fields filled for the fixtures below. Every line
 // is one source line of the draft; blank lines between paragraphs.
-function expectedH(opts: { navn: string; N: string; url: string; eier: string; hei: string }): string {
+function expectedH(opts: { navn: string; N: string; url: string; hei: string }): string {
   return [
     opts.hei,
     "",
@@ -51,7 +51,7 @@ function expectedH(opts: { navn: string; N: string; url: string; eier: string; h
     "",
     "Grunnen til at jeg gjør dette, er at mange nå spør ChatGPT og lignende tjenester om hvor de kan kjøpe lokal mat. Små produsenter kommer ofte ikke med i svarene, fordi informasjonen om dem er spredt eller gammel. Rett fra Bonden samler den og setter den opp slik at disse tjenestene kan lese den. Det erstatter ikke nettsiden deres, men gjør at dere blir funnet der folk nå spør.",
     "",
-    `Det koster ingenting å stå der, og dere binder dere ikke til noe. Vil dere styre siden selv, kan dere ta den over her, uten passord: ${opts.eier}`,
+    "Det koster ingenting å stå der, og dere binder dere ikke til noe. Vil dere styre siden selv, svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over.",
     "",
     "Vil dere ikke være med, svarer dere bare «fjern», så tar jeg siden ned innen et døgn.",
     "",
@@ -127,7 +127,7 @@ export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestS
     const hA = renderRfbOutreachEmail(exA);
     assertEq(
       hA.text,
-      expectedH({ navn: "Inderøy Mosteri", N: "1 700", url: exA.profileUrl, eier: `https://rettfrabonden.com/selger?agent=${exA.agentId}`, hei: "Hei," }),
+      expectedH({ navn: "Inderøy Mosteri", N: "1 700", url: exA.profileUrl, hei: "Hei," }),
       "t1: H arm A, no first name, equals the draft byte for byte",
     );
     assertEq(hA.subject, "Har vi riktig info om Inderøy Mosteri?", "t1: subject A, washed name (cut at « — »)");
@@ -136,7 +136,7 @@ export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestS
     const hB = renderRfbOutreachEmail({ ...exB, contactFirstName: "Vidar" });
     assertEq(
       hB.text,
-      expectedH({ navn: "Strandkaien Fisk", N: "12 300", url: exB.profileUrl, eier: `https://rettfrabonden.com/selger?agent=${exB.agentId}`, hei: "Hei Vidar," }),
+      expectedH({ navn: "Strandkaien Fisk", N: "12 300", url: exB.profileUrl, hei: "Hei Vidar," }),
       "t1: H arm B, with first name, name washed (« AS» after «, » cut), equals the draft byte for byte",
     );
     assertEq(hB.subject, "Spørsmål om varene til Strandkaien Fisk", "t1: subject B");
@@ -162,11 +162,12 @@ export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestS
       assertTrue(!t.includes("\n\n\n"), `t2: ${label} no double blank line`);
       assertTrue(!/\{[a-zæøå_]+\}/i.test(t), `t2: ${label} no unfilled placeholder`);
     }
-    assertTrue(hA.text.includes(`uten passord: https://rettfrabonden.com/selger?agent=${exA.agentId}`), "t2: H carries {eier_url} with the right agent id (A)");
-    assertTrue(hB.text.includes(`uten passord: https://rettfrabonden.com/selger?agent=${exB.agentId}`), "t2: H carries {eier_url} with the right agent id (B)");
+    // Daniel 2026-11-01: H and J ask the producer to reply instead of linking the claim flow.
+    assertTrue(!hA.text.includes("selger?agent") && !hB.text.includes("selger?agent"), "t2: H carries no {eier_url} (A and B)");
+    assertTrue(!hA.text.includes("uten passord") && hA.text.includes("svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over."), "t2: H asks for a reply to take the page over");
     assertEq(rfbOwnerUrl("abc"), "https://rettfrabonden.com/selger?agent=abc", "t2: rfbOwnerUrl");
     const links = hA.text.match(/https?:\/\/\S+/g) || [];
-    assertEq(links, [exA.profileUrl, `https://rettfrabonden.com/selger?agent=${exA.agentId}`, "https://rettfrabonden.com/personvern"], "t2: exactly three links, all on rettfrabonden.com");
+    assertEq(links, [exA.profileUrl, "https://rettfrabonden.com/personvern"], "t2: exactly two links (profile, privacy), both on rettfrabonden.com");
     assertEq(hA.text.includes("da.fredriksen@gmail.com"), false, "t2: private e-mail never in outbound text");
 
     // ── t3: text I byte for byte, threaded and unthreaded (AC1, AC4) ───────
@@ -193,12 +194,12 @@ export function runRfbOutreachTemplateTests(opts: { log?: boolean } = {}): TestS
         "",
         `Takk for svaret. Jeg har rettet siden, og den ser nå slik ut: ${exA.profileUrl}`,
         "",
-        `Endrer noe seg, kan dere svare på denne e-posten når som helst. Vil dere heller endre siden selv, kan dere ta den over her, uten passord: https://rettfrabonden.com/selger?agent=${exA.agentId}`,
+        "Endrer noe seg, kan dere svare på denne e-posten når som helst. Vil dere heller styre siden selv, svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over.",
         "",
         "Vennlig hilsen",
         "Daniel Fredriksen",
       ].join("\n"),
-      "t4: J (corrected) equals the draft byte for byte, with the right {eier_url}",
+      "t4: J (corrected) equals the draft byte for byte, no {eier_url}",
     );
     const jConfirmed = renderRfbThankYouV4({ agentId: exA.agentId, profileUrl: exA.profileUrl, firstName: "Vidar", corrected: false });
     assertTrue(jConfirmed.includes(`Takk for svaret. Da står siden slik den er: ${exA.profileUrl}\n\n`), "t4: J (confirmed only) uses the draft's alternative first sentence");

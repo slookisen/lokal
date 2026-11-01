@@ -579,7 +579,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
       assertEq(e2.inReplyToMessageId, undefined, "e28: AC4 …and no In-Reply-To/References");
       assertTrue(String(e2.textContent).startsWith("Hei igjen,\n\nJeg skrev til dere "), "e29: the second touch is text I, not the first text again");
       assertTrue(!String(e2.textContent).includes("katalog") && !String(e0.textContent).toLowerCase().includes("katalog"), "e30: no «katalog» in any sent text");
-      assertTrue(String(e0.textContent).includes("https://rettfrabonden.com/selger?agent=f-0000-000a"), "e31: H carries {eier_url} with the agent id");
+      assertTrue(!String(e0.textContent).includes("selger?agent=") && String(e0.textContent).includes("svarer dere bare på denne e-posten, så hjelper jeg dere med å ta den over."), "e31: H asks for a reply instead of carrying {eier_url} (Daniel 2026-11-01)");
       assertEq(
         r_e_rows().map((x) => [x.agent_id, x.template, x.subject_variant]),
         [["f-0000-000a", "rfb-outreach-v4", "A"], ["f-0000-000b", "rfb-outreach-v4", "B"], ["s-0000-0001", "rfb-outreach-v4-followup", "B"]],
