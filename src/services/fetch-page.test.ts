@@ -23,6 +23,9 @@ import {
   classifyFetchError,
   classifyHttpStatus,
   discoverContentLinks,
+  rankContentLinks,
+  CONTENT_LINK_SCORE_ABOUT,
+  CONTENT_LINK_SCORE_CONTACT,
   fetchPage,
   isRetryable,
   isUnusableBody,
@@ -243,6 +246,70 @@ export async function runFetchPageTests(opts: { log?: boolean } = {}): Promise<T
       "links: duplicates collapse to one fetch",
     );
     assertEq(discoverContentLinks("<a href='/kontakt'>K</a>", "::::not a url", 3), [], "links: unparseable base returns nothing (no throw)");
+
+    // ── 7b. «Om oss» slot (dev-request 2026-10-27-rfb-berikelse-om-oss-
+    // sider-til-beskrivelse, spec 1/5; behind ENRICHMENT_ABOUT_PAGE_ENABLED
+    // in the callers) ───────────────────────────────────────────────────────
+    {
+      const html =
+        `<a href="/kontakt">Kontakt</a><a href="/kontakt-oss">Kontakt oss</a><a href="/contact">Contact</a>` +
+        `<a href="/om-oss">Om oss</a><a href="/produkter">Produkter</a>`;
+      assertEq(
+        discoverContentLinks(html, "https://x.no/", 3),
+        ["https://x.no/contact", "https://x.no/kontakt", "https://x.no/kontakt-oss"],
+        "about-slot-1: without the option, three contact links still crowd out «Om oss» (unchanged)",
+      );
+      assertEq(
+        discoverContentLinks(html, "https://x.no/", 3, { reserveAboutSlotWithin: 3 }),
+        ["https://x.no/contact", "https://x.no/kontakt", "https://x.no/om-oss"],
+        "about-slot-2: with the slot, «Om oss» is among the three — same count, last contact link drops",
+      );
+      assertEq(
+        rankContentLinks(html, "https://x.no/", 3, { reserveAboutSlotWithin: 3 }).map((l) => l.score),
+        [CONTENT_LINK_SCORE_CONTACT, CONTENT_LINK_SCORE_CONTACT, CONTENT_LINK_SCORE_ABOUT],
+        "about-slot-3: rankContentLinks reports which one is the about page",
+      );
+      assertEq(
+        rankContentLinks(html, "https://x.no/", 3).map((l) => l.url),
+        discoverContentLinks(html, "https://x.no/", 3),
+        "about-slot-4: discoverContentLinks is rankContentLinks' URLs",
+      );
+      assertEq(
+        discoverContentLinks(html, "https://x.no/", 5, { reserveAboutSlotWithin: 2 }),
+        ["https://x.no/contact", "https://x.no/om-oss", "https://x.no/kontakt", "https://x.no/kontakt-oss", "https://x.no/produkter"],
+        "about-slot-5: a slot within the first N of a longer list moves the about link up, the rest keep their order",
+      );
+      assertEq(
+        discoverContentLinks(html, "https://x.no/", 3, { reserveAboutSlotWithin: 1 }),
+        discoverContentLinks(html, "https://x.no/", 3),
+        "about-slot-6: a single slot is never given away (the only slot stays a contact page)",
+      );
+      const ranked = `<a href="/produkter">Produkter</a><a href="/om-oss">Om oss</a><a href="/kontakt-oss">Kontakt oss</a>`;
+      assertEq(
+        discoverContentLinks(ranked, "https://x.no/", 3, { reserveAboutSlotWithin: 3 }),
+        discoverContentLinks(ranked, "https://x.no/", 3),
+        "about-slot-7: an about link already inside the slots -> order unchanged",
+      );
+      const noAbout = `<a href="/kontakt">Kontakt</a><a href="/kontakt-oss">Kontakt oss</a><a href="/contact">Contact</a><a href="/produkter">P</a>`;
+      assertEq(
+        discoverContentLinks(noAbout, "https://x.no/", 3, { reserveAboutSlotWithin: 3 }),
+        discoverContentLinks(noAbout, "https://x.no/", 3),
+        "about-slot-8: no about link -> identical to today",
+      );
+      // (A bare "/om" link is not an about link for discovery — only the
+      // gårdssalg fallback list carries "/om" — so it is not promoted.)
+      const five = `<a href="/kontakt">K</a><a href="/kontakt-oss">K</a><a href="/contact">C</a><a href="/kontakt-skjema">K</a><a href="/kontakt-oss-her">K</a><a href="/om">Om</a><a href="/om-oss">Om oss</a>`;
+      assertEq(
+        discoverContentLinks(five, "https://x.no/", 5, { reserveAboutSlotWithin: 4 }).indexOf("https://x.no/om-oss"),
+        3,
+        "about-slot-9: gårdssalg shape (max 5, 4 sub-page slots): the best about link takes slot 4",
+      );
+      assertEq(
+        discoverContentLinks(five, "https://x.no/", 5, { reserveAboutSlotWithin: 4 }).length,
+        5,
+        "about-slot-10: … and the list length is unchanged",
+      );
+    }
 
     // ── 8. fetchPage end-to-end against a mocked network ───────────────────
     {

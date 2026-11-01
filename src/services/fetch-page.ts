@@ -466,7 +466,50 @@ export function decodeHtmlBytes(
  * content is already in the primary HTML the caller holds, so fetching them
  * would re-download the same page.
  */
-export function discoverContentLinks(html: string, baseUrl: string, max = 3): string[] {
+export function discoverContentLinks(
+  html: string,
+  baseUrl: string,
+  max = 3,
+  opts?: ContentLinkRankOptions,
+): string[] {
+  return rankContentLinks(html, baseUrl, max, opts).map((l) => l.url);
+}
+
+/** discoverContentLinks' score for a contact page (fetched first). */
+export const CONTENT_LINK_SCORE_CONTACT = 3;
+/** discoverContentLinks' score for an «Om oss»/«Om gården»/«Historie»/«About» page. */
+export const CONTENT_LINK_SCORE_ABOUT = 2;
+/** discoverContentLinks' score for a product/shop page. */
+export const CONTENT_LINK_SCORE_PRODUCT = 1;
+
+export type RankedContentLink = { url: string; score: number };
+
+export type ContentLinkRankOptions = {
+  /**
+   * dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse, spec 1
+   * and 5 (behind ENRICHMENT_ABOUT_PAGE_ENABLED; unset = the exact ranking
+   * every caller has always had). When set to N (>= 2) and the page links to
+   * an about page (CONTENT_LINK_SCORE_ABOUT), the best-ranked about link is
+   * placed within the first N results even when N or more contact links
+   * outrank it: it takes position N-1 and everything from there moves one
+   * place down. The result length is still capped at `max`, so the caller
+   * fetches no more pages than before — with max === N the last contact link
+   * is the one that drops out. Below 2 nothing is reserved (the only slot
+   * stays a contact page).
+   */
+  reserveAboutSlotWithin?: number;
+};
+
+/**
+ * discoverContentLinks with each link's score (CONTENT_LINK_SCORE_*), in the
+ * same order. PURE. discoverContentLinks is this function's URLs.
+ */
+export function rankContentLinks(
+  html: string,
+  baseUrl: string,
+  max = 3,
+  opts?: ContentLinkRankOptions,
+): RankedContentLink[] {
   let base: URL;
   try {
     base = new URL(/^https?:\/\//i.test(baseUrl) ? baseUrl : `https://${baseUrl}`);
@@ -477,9 +520,9 @@ export function discoverContentLinks(html: string, baseUrl: string, max = 3): st
   // Higher score = fetch first. Contact pages outrank about pages because a
   // verified email/phone unblocks outreach, which is the pipeline's north-star.
   const PATTERNS: ReadonlyArray<{ re: RegExp; score: number }> = [
-    { re: /kontakt|contact/i, score: 3 },
-    { re: /om-?oss|om-?garden|om-?gården|about|historie/i, score: 2 },
-    { re: /produkt|product|vare|nettbutikk|butikk|meny/i, score: 1 },
+    { re: /kontakt|contact/i, score: CONTENT_LINK_SCORE_CONTACT },
+    { re: /om-?oss|om-?garden|om-?gården|about|historie/i, score: CONTENT_LINK_SCORE_ABOUT },
+    { re: /produkt|product|vare|nettbutikk|butikk|meny/i, score: CONTENT_LINK_SCORE_PRODUCT },
   ];
 
   const scored = new Map<string, number>();
@@ -513,10 +556,21 @@ export function discoverContentLinks(html: string, baseUrl: string, max = 3): st
     scored.set(key, Math.max(scored.get(key) ?? 0, best));
   }
 
-  return [...scored.entries()]
+  const ranked = [...scored.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, Math.max(0, max))
-    .map(([url]) => url);
+    .map(([url, score]): RankedContentLink => ({ url, score }));
+  const cap = Math.max(0, max);
+  const within = Math.min(opts?.reserveAboutSlotWithin ?? 0, cap);
+  if (within >= 2) {
+    const aboutIdx = ranked.findIndex((l) => l.score === CONTENT_LINK_SCORE_ABOUT);
+    if (aboutIdx >= within) {
+      // Sorted by score, so everything ahead of the first about link is a
+      // contact link: the about link takes the last reserved position.
+      const [about] = ranked.splice(aboutIdx, 1);
+      ranked.splice(within - 1, 0, about!);
+    }
+  }
+  return ranked.slice(0, cap);
 }
 
 // ── The fetcher ─────────────────────────────────────────────────────────────

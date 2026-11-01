@@ -51805,3 +51805,47 @@ runSerial(async () => {
     failures.push("experiences-for-tilbydere-faq: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse (RFB +
+// gårdssalg): the producer description from the «Om oss» page, behind
+// ENRICHMENT_ABOUT_PAGE_ENABLED (default OFF) with a dry-run-only
+// about_page_preview. Three suites: the pure switch/extractor/choice; the RFB
+// homepage-content-refresh wiring (swaps the getDb() singleton and, for the
+// route cases, globalThis.fetch); the gårdssalg content-refresh wiring (swaps
+// the experiences DB module cache, env vars and globalThis.fetch). Everything
+// is restored in finally — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── about-page-candidate: «Om oss» til produsentbeskrivelsen (RFB + gårdssalg) ──");
+  const suites: Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]> = [
+    [
+      "about-page-candidate",
+      async () =>
+        (require("../src/services/about-page-candidate.test") as typeof import("../src/services/about-page-candidate.test"))
+          .runAboutPageCandidateTests({ log: false }),
+    ],
+    [
+      "homepage-content-refresh-about-page",
+      () =>
+        (require("../src/routes/homepage-content-refresh-about-page.test") as typeof import("../src/routes/homepage-content-refresh-about-page.test"))
+          .runHomepageContentRefreshAboutPageTests({ log: false }),
+    ],
+    [
+      "opplevelser-gardssalg-about-page-candidate",
+      () =>
+        (require("../src/routes/opplevelser-gardssalg-about-page-candidate.test") as typeof import("../src/routes/opplevelser-gardssalg-about-page-candidate.test"))
+          .runOpplevelserGardssalgAboutPageCandidateTests({ log: false }),
+    ],
+  ];
+  for (const [label, runSuite] of suites) {
+    try {
+      const r = await runSuite();
+      passed += r.passed;
+      failed += r.failed;
+      for (const f of r.failures) failures.push(`${label}: ` + f);
+      console.log(`  ${label}: ${r.passed} passed, ${r.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push(`${label}: unexpected error: ` + String(err?.message || err));
+    }
+  }
+});

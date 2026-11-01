@@ -5302,7 +5302,14 @@ export function applyGardssalgProviderContent(
   contaminatedFields?: Array<"about_text" | "visit_text">,
   // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
   // see this function's own doc comment above for the full rationale.
-  forceFields?: Array<"about_text" | "visit_text" | "opening_hours_text">
+  forceFields?: Array<"about_text" | "visit_text" | "opening_hours_text">,
+  // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse —
+  // OPTIONAL, omitted by every pre-existing call site (byte-identical when
+  // not passed): a per-field source URL for a written field whose text came
+  // from a different page than `evidenceUrl` (the about page). Used for that
+  // field's field_provenance.source_url and its audit row's source_url;
+  // content_evidence_url stays `evidenceUrl`.
+  fieldSourceUrls?: Partial<Record<"about_text" | "visit_text" | "opening_hours_text" | "products", string>>
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -5471,8 +5478,10 @@ export function applyGardssalgProviderContent(
     }
   }
   const fetchedAt = new Date().toISOString();
+  const sourceUrlFor = (f: string): string =>
+    (fieldSourceUrls as Record<string, string | undefined> | undefined)?.[f] ?? evidenceUrl;
   for (const f of written) {
-    provenance[f] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+    provenance[f] = { source_url: sourceUrlFor(f), fetched_at: fetchedAt };
   }
   sets.push("field_provenance = @field_provenance");
   params.field_provenance = JSON.stringify(provenance);
@@ -5491,7 +5500,7 @@ export function applyGardssalgProviderContent(
         field_name: f,
         old_value: oldValues[f] ?? null,
         new_value: (params[f] as string | undefined) ?? null,
-        source_url: evidenceUrl,
+        source_url: sourceUrlFor(f),
         batch_id: batchId ?? null,
       });
     }

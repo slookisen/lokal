@@ -1,0 +1,451 @@
+/**
+ * homepage-content-refresh-about-page.test.ts — RFB half of dev-request
+ * 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse (AC1): the producer
+ * description may come from the producer's «Om oss» page instead of the
+ * homepage, behind ENRICHMENT_ABOUT_PAGE_ENABLED (default OFF), with a
+ * dry-run-only `about_page_preview` for Daniel's preview (spec 6).
+ *
+ * Drives refreshHomepageContent (the route's per-agent body) with an
+ * injected fetchImpl — no global fetch swap — against a fresh in-memory DB
+ * per case (better-sqlite3 ":memory:" + __setDbForTesting/
+ * __initSchemaForTesting, as admin-knowledge-about-substantiation.test.ts).
+ * The route's own `about_page_preview` parsing is exercised once through
+ * homepageContentRefreshRouter with a stubbed globalThis.fetch, restored in
+ * finally (runSerial in tests/test.ts).
+ *
+ * Covers:
+ *   (a) flag OFF: the three contact links are fetched (not «Om oss»), the
+ *       homepage candidate is written, and the result has no about_* keys —
+ *       today's behaviour;
+ *   (b) dry-run preview: «Om oss» takes one of the three sub-page slots, the
+ *       about-page candidate is chosen with the about page as source_url,
+ *       the homepage candidate is reported next to it, nothing is written;
+ *   (c) preview with apply: ignored — identical to (a);
+ *   (d) flag ON + apply: about/description written from the about page,
+ *       field_provenance source_url = the about page;
+ *   (e) about page with code / theme spam / another business -> homepage
+ *       candidate;
+ *   (f) curated (locked) about: not touched; reported curated_locked;
+ *   (g) no about page: flag ON is identical to flag OFF (result, DB, fetches);
+ *   (h) directory/social host and a deep-path section: no about page used;
+ *   (i) route: about_page_preview honoured in a dry run, ignored with apply.
+ */
+
+import Database from "better-sqlite3";
+import * as initMod from "../database/init";
+import { ENRICHMENT_ABOUT_PAGE_FLAG } from "../services/about-page-candidate";
+
+export interface TestSummary {
+  passed: number;
+  failed: number;
+  failures: string[];
+}
+
+const HOME_META =
+  "Tverås Gårdsmat er en liten gård i Hallingdal som selger lammekjøtt og spekemat direkte fra gården.";
+const P1 =
+  "Tverås er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite i fjellet om sommeren.";
+const P2 =
+  "Kjøttet foredler vi selv i vårt eget slakteri og pølsemakeri på gården, og vi selger spekemat, pølser og ferskt lammekjøtt direkte til kundene våre.";
+const P3 =
+  "Du finner oss på REKO-ringen i Gol og på bondens marked i Oslo, og vi tar gjerne imot bestillinger til selskap og høytider.";
+const ABOUT_TEXT = `${P1} ${P2} ${P3}`;
+
+const NAV_3_CONTACT_1_ABOUT =
+  `<nav><a href="/kontakt">Kontakt</a><a href="/kontakt-oss">Kontakt oss</a><a href="/contact">Contact</a>` +
+  `<a href="/om-oss">Om oss</a></nav>`;
+
+function homepage(nav: string, meta: string = HOME_META): string {
+  return `<html><head><title>Gård</title><meta name="description" content="${meta}"></head><body>${nav}<p>Velkommen!</p></body></html>`;
+}
+function aboutPage(paragraphs: string[]): string {
+  return `<html><head><title>Om oss</title><meta name="description" content="${HOME_META}"></head><body>
+<header><nav><a href="/">Hjem</a><a href="/om-oss">Om oss</a></nav></header>
+<main><h1>Om oss</h1>${paragraphs.map((p) => `<p>${p}</p>`).join("\n")}</main>
+<footer><p>Alle rettigheter reservert.</p></footer></body></html>`;
+}
+const CONTACT_PAGE = "<html><body><p>Ring oss på 900 00 000.</p></body></html>";
+
+const HELIOS_CODE =
+  'Grønn Guide Trondheim Static = window.Static || {}; Static.SQUARESPACE_CONTEXT = {"betaFeatureFlags":["supports_versioned_template_assets",' +
+  '"campaigns_merch_state","marketing_landing_page","enable_form_submission_trigger","campaigns_table_v2","contacts_and_campaigns_redesign",' +
+  '"marketing_automations"]}; Vi er en gård i Trondheim.';
+const SPAM_ABOUT =
+  "<html><head><title>Beste casino på nett i 2026</title></head><body><main><p>Spill på nettcasino med gratisspinn og velkomstbonus hos de beste norske casinoene. Vi har testet alle casino uten innskudd.</p><p>" +
+  P1 + "</p><p>" + P2 + "</p></main></body></html>";
+const UMBRELLA_ABOUT = aboutPage([
+  "Hallingdal Matforum er et samarbeid mellom lokale produsenter i regionen. Våre medlemmer leverer kjøtt, ost og grønnsaker til butikker og restauranter.",
+  "Vi arrangerer markeder og kurs for medlemmene våre gjennom hele året, og hjelper nye produsenter i gang med salg.",
+]);
+
+/** host -> path -> html. Anything else is a 404. */
+const SITES: Record<string, Record<string, string>> = {
+  "tveras.no": {
+    "/": homepage(NAV_3_CONTACT_1_ABOUT),
+    "/kontakt": CONTACT_PAGE,
+    "/kontakt-oss": CONTACT_PAGE,
+    "/contact": CONTACT_PAGE,
+    "/om-oss": aboutPage([P1, P2, P3]),
+  },
+  "kodegard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": `<html><body><main><p>${HELIOS_CODE}</p></main></body></html>` },
+  "spamgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": SPAM_ABOUT },
+  "medlemsgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": UMBRELLA_ABOUT },
+  "laastgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": aboutPage([P1, P2, P3]) },
+  "utenomgard.no": {
+    "/": homepage(`<nav><a href="/kontakt">Kontakt</a><a href="/produkter">Produkter</a></nav>`),
+    "/kontakt": CONTACT_PAGE,
+    "/produkter": "<html><body><p>Lammekjøtt, pølser og spekemat.</p></body></html>",
+  },
+  "hanen.no": {
+    "/medlem/gard-x": homepage(`<nav><a href="/om-oss">Om oss</a><a href="/medlem/gard-x/kontakt">Kontakt</a></nav>`),
+    "/om-oss": aboutPage([
+      "Hanen er en landsdekkende organisasjon for bygdeturisme og gardsmat, med flere hundre bedrifter over hele landet.",
+      "Organisasjonen jobber for bedre rammevilkår for små bedrifter på bygda og driver markedsføring av hele næringen.",
+    ]),
+  },
+  // A social-media "homepage" with an about page inside its own section:
+  // only the host refusal stops it.
+  "facebook.com": {
+    "/fbgard": homepage(`<nav><a href="/fbgard/om-oss">Om oss</a></nav>`),
+    "/fbgard/om-oss": aboutPage([P1, P2, P3]),
+  },
+  // No links at all on the homepage: the fixed fallback paths are tried.
+  "fallbackgard.no": {
+    "/": homepage(""),
+    "/om-oss": aboutPage([P1, P2, P3]),
+  },
+};
+
+function makeFetch(log: string[]): typeof fetch {
+  return (async (input: Parameters<typeof fetch>[0]) => {
+    const url = new URL(String(input instanceof Request ? input.url : input));
+    log.push(url.toString());
+    const host = url.host.replace(/^www\./, "");
+    const html = SITES[host]?.[url.pathname === "" ? "/" : url.pathname];
+    if (html === undefined) return new Response("<html><body>Not found</body></html>", { status: 404, headers: { "content-type": "text/html" } });
+    return new Response(html, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+  }) as typeof fetch;
+}
+
+interface RouteResult {
+  status: number;
+  body: any;
+}
+function callRoute(router: any, body: any): Promise<RouteResult> {
+  return new Promise((resolve) => {
+    const headers: Record<string, string> = { "x-admin-key": process.env.ADMIN_KEY ?? "", "content-type": "application/json" };
+    const req: any = {
+      method: "POST",
+      url: "/homepage-content-refresh",
+      originalUrl: "/homepage-content-refresh",
+      query: {},
+      headers,
+      body,
+      ip: "127.0.0.1",
+      get(name: string) {
+        return headers[name.toLowerCase()];
+      },
+    };
+    const res: any = {
+      statusCode: 200,
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload: any) {
+        resolve({ status: this.statusCode, body: payload });
+        return this;
+      },
+      end() {
+        resolve({ status: this.statusCode, body: undefined });
+        return this;
+      },
+    };
+    router.handle(req, res, (err?: any) => resolve({ status: err ? 500 : 0, body: err ? { error: String(err) } : undefined }));
+  });
+}
+
+export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } = {}): Promise<TestSummary> {
+  const log = opts.log ?? false;
+  let passed = 0;
+  let failed = 0;
+  const failures: string[] = [];
+
+  function assertEq(actual: unknown, expected: unknown, label: string): void {
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      const msg = `✗ ${label}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`;
+      failures.push(msg);
+      if (log) console.log("  " + msg);
+    }
+  }
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+
+  return (async () => {
+    const prevDb = initMod.getDb();
+    const prevFlag = process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
+    const prevAdminKey = process.env.ADMIN_KEY;
+    const prevFetch = globalThis.fetch;
+    process.env.ADMIN_KEY = prevAdminKey || "hcr-about-page-test-key";
+    const opened: Database.Database[] = [];
+    try {
+      const { refreshHomepageContent, homepageContentRefreshRouter } =
+        require("./admin-knowledge") as typeof import("./admin-knowledge");
+
+      const AGENTS: Array<{ id: string; name: string; url: string; curated?: string; about?: string | null }> = [
+        { id: "tveras", name: "Tverås Gårdsmat", url: "https://tveras.no/" },
+        { id: "kodegard", name: "Kodegard", url: "https://kodegard.no/" },
+        { id: "spamgard", name: "Spamgard", url: "https://spamgard.no/" },
+        { id: "medlemsgard", name: "Medlemsgard", url: "https://medlemsgard.no/" },
+        { id: "laastgard", name: "Låstgard", url: "https://laastgard.no/", curated: '{"about":true}', about: "Eierens egen tekst." },
+        { id: "utenomgard", name: "Utenomgard", url: "https://utenomgard.no/" },
+        { id: "fbgard", name: "Fbgard", url: "https://www.facebook.com/fbgard" },
+        { id: "hanengard", name: "Gard X", url: "https://hanen.no/medlem/gard-x" },
+        { id: "fallbackgard", name: "Fallbackgard", url: "https://fallbackgard.no/" },
+      ];
+
+      function freshDb(): Database.Database {
+        const db = new Database(":memory:");
+        opened.push(db);
+        initMod.__setDbForTesting(db as any);
+        initMod.__initSchemaForTesting(db as any);
+        const insertAgent = db.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
+           VALUES (?, ?, 'test agent', 'test', 'post@example.no', ?, 'producer', ?)`,
+        );
+        const insertKnowledge = db.prepare(
+          `INSERT INTO agent_knowledge (agent_id, website, about, products, field_provenance, curated_fields, updated_at)
+           VALUES (?, ?, ?, '[]', '{}', ?, '2020-01-01T00:00:00.000Z')`,
+        );
+        for (const a of AGENTS) {
+          insertAgent.run(a.id, a.name, a.url, `key-${a.id}`);
+          insertKnowledge.run(a.id, a.url, a.about ?? null, a.curated ?? "{}");
+        }
+        return db;
+      }
+      function target(id: string) {
+        const a = AGENTS.find((x) => x.id === id)!;
+        return { agent_id: a.id, name: a.name, homepage_url: a.url };
+      }
+      function row(db: Database.Database, id: string) {
+        return db
+          .prepare(
+            `SELECT k.about AS about, k.field_provenance AS field_provenance, a.description AS description, a.categories AS categories
+               FROM agents a JOIN agent_knowledge k ON k.agent_id = a.id WHERE a.id = ?`,
+          )
+          .get(id) as { about: string | null; field_provenance: string; description: string | null; categories: string | null };
+      }
+      async function run(id: string | string[], o: { dryRun: boolean; aboutPagePreview?: boolean; flag?: boolean }) {
+        if (o.flag) process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = "1";
+        else delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
+        const db = freshDb();
+        const fetchLog: string[] = [];
+        const ids = Array.isArray(id) ? id : [id];
+        const result = await refreshHomepageContent(db as any, ids.map(target), {
+          dryRun: o.dryRun,
+          fetchImpl: makeFetch(fetchLog),
+          ...(o.aboutPagePreview ? { aboutPagePreview: true } : {}),
+        });
+        return { db, result, fetchLog };
+      }
+      const LEGACY_KEYS = ["scanned", "by_field", "changed", "skipped_curated", "skipped_unsubstantiated", "errors", "parked_now"];
+
+      // ── (a) flag OFF — today's behaviour ──────────────────────────────────
+      const off = await run("tveras", { dryRun: false });
+      {
+        assertEq(Object.keys(off.result), LEGACY_KEYS, "a-1: flag off -> the result carries exactly today's keys (no about_page_mode/about_candidates)");
+        assertEq(
+          off.fetchLog,
+          ["https://tveras.no/", "https://tveras.no/contact", "https://tveras.no/kontakt", "https://tveras.no/kontakt-oss"],
+          "a-2: flag off -> the three contact links are fetched, «Om oss» is not (unchanged ranking)",
+        );
+        const r = row(off.db, "tveras");
+        assertEq(r.about, HOME_META, "a-3: flag off -> about written from the homepage meta, as today");
+        assertEq(r.description, HOME_META, "a-4: … and description too");
+        assertEq(JSON.parse(r.field_provenance).about[0].source_url, "https://tveras.no/", "a-5: … with the homepage as source_url");
+      }
+
+      // ── (b) dry-run preview ───────────────────────────────────────────────
+      {
+        const p = await run("tveras", { dryRun: true, aboutPagePreview: true });
+        assertEq(p.result.about_page_mode, "dry_run_preview", "b-1: preview -> about_page_mode dry_run_preview");
+        assertEq(
+          p.fetchLog,
+          ["https://tveras.no/", "https://tveras.no/contact", "https://tveras.no/kontakt", "https://tveras.no/om-oss"],
+          "b-2: «Om oss» takes one of the three sub-page slots — still three sub-pages",
+        );
+        const e = p.result.about_candidates?.[0];
+        assertTrue(!!e && e.agent_id === "tveras", "b-3: one about_candidates entry for the agent");
+        assertEq(e?.chosen, "about_page", "b-4: chosen = about_page");
+        assertEq(e?.chosen_text, ABOUT_TEXT, "b-5: chosen_text = the about page's first three prose paragraphs");
+        assertEq(e?.chosen_source_url, "https://tveras.no/om-oss", "b-6: chosen_source_url = the about page URL");
+        assertEq(e?.homepage_candidate, { text: HOME_META, source_url: "https://tveras.no/" }, "b-7: the homepage candidate is reported next to it");
+        assertEq(e?.stored_about, null, "b-8: stored_about = the value before the run");
+        assertEq(e?.would_write_about, true, "b-9: would_write_about (about is in changed[].fields)");
+        assertEq(e?.about_pages.map((x: any) => [x.url, x.verdict]), [["https://tveras.no/om-oss", "chosen"]], "b-10: per-page verdict");
+        assertEq(e?.subpages_fetched, ["https://tveras.no/contact", "https://tveras.no/kontakt", "https://tveras.no/om-oss"], "b-11: subpages_fetched");
+        assertTrue(p.result.changed.some((c) => c.agent_id === "tveras" && c.fields.includes("about") && c.fields.includes("description")), "b-12: changed reports about + description");
+        const r = row(p.db, "tveras");
+        assertEq([r.about, r.description], [null, "test agent"], "b-13: dry run -> nothing written");
+      }
+
+      // ── (c) preview with apply: ignored ───────────────────────────────────
+      {
+        const c = await run("tveras", { dryRun: false, aboutPagePreview: true });
+        assertEq(Object.keys(c.result), LEGACY_KEYS, "c-1: preview + apply -> no about-page keys (the preview never writes)");
+        assertEq(c.fetchLog, off.fetchLog, "c-2: … same fetches as flag off");
+        assertEq(row(c.db, "tveras").about, HOME_META, "c-3: … and the homepage candidate is written, as today");
+      }
+
+      // ── (d) flag ON + apply ───────────────────────────────────────────────
+      {
+        const d = await run("tveras", { dryRun: false, flag: true });
+        assertEq(d.result.about_page_mode, "env_flag", "d-1: flag on -> about_page_mode env_flag");
+        const r = row(d.db, "tveras");
+        assertEq(r.about, ABOUT_TEXT, "d-2: about written from the about page");
+        assertEq(r.description, ABOUT_TEXT, "d-3: description written from the about page");
+        const prov = JSON.parse(r.field_provenance);
+        assertEq(prov.about[0].source_url, "https://tveras.no/om-oss", "d-4: about provenance source_url = the about page");
+        assertEq(prov.description[0].source_url, "https://tveras.no/om-oss", "d-5: description provenance source_url = the about page");
+        assertEq(prov.about[0].source_type, "website_homepage", "d-6: same source_type as the homepage candidate (same precedence)");
+        assertEq(d.result.about_candidates?.[0]?.would_write_about, true, "d-7: would_write_about true");
+      }
+
+      // ── (e) code / theme spam / another business -> homepage candidate ────
+      {
+        const e = await run(["kodegard", "spamgard", "medlemsgard"], { dryRun: true, aboutPagePreview: true });
+        const byId = (id: string) => e.result.about_candidates?.find((x) => x.agent_id === id);
+        for (const [id, verdict] of [["kodegard", "code_artifact"], ["spamgard", "theme_spam_page"], ["medlemsgard", "below_quality_bar"]] as const) {
+          const x = byId(id);
+          assertEq(x?.chosen, "homepage", `e-1 ${id}: about page rejected -> homepage candidate`);
+          assertEq(x?.chosen_text, HOME_META, `e-2 ${id}: chosen_text = the homepage meta`);
+          assertEq(x?.chosen_source_url, `https://${id}.no/`, `e-3 ${id}: source_url = the homepage`);
+          assertEq(x?.about_pages?.[0]?.verdict, verdict, `e-4 ${id}: verdict ${verdict}`);
+          assertTrue(!!x?.about_pages?.[0]?.url.endsWith("/om-oss"), `e-5 ${id}: the about page was fetched and evaluated`);
+        }
+      }
+
+      // ── (f) curated (locked) about ────────────────────────────────────────
+      {
+        const f = await run("laastgard", { dryRun: false, flag: true });
+        const r = row(f.db, "laastgard");
+        assertEq(r.about, "Eierens egen tekst.", "f-1: a curated about is not touched");
+        assertTrue(f.result.skipped_curated.some((s) => s.agent_id === "laastgard" && s.fields.includes("about")), "f-2: reported in skipped_curated");
+        const x = f.result.about_candidates?.[0];
+        assertEq(x?.chosen, "about_page", "f-3: the about page is still the candidate (the lock is the gate's decision)");
+        assertEq(x?.about_gate_reason, "curated_locked", "f-4: about_gate_reason curated_locked");
+        assertEq(x?.would_write_about, false, "f-5: would_write_about false");
+        assertEq(x?.stored_about, "Eierens egen tekst.", "f-6: stored_about reported");
+        const fd = await run("laastgard", { dryRun: true, aboutPagePreview: true });
+        assertEq(fd.result.about_candidates?.[0]?.would_write_about, false, "f-7: the dry-run preview predicts the same (no write)");
+      }
+
+      // ── (g) no about page: flag ON identical to flag OFF ──────────────────
+      {
+        const gOff = await run("utenomgard", { dryRun: false });
+        const gOn = await run("utenomgard", { dryRun: false, flag: true });
+        const { about_page_mode: m, about_candidates: ac, ...rest } = gOn.result;
+        assertEq(m, "env_flag", "g-1: flag on reported");
+        assertEq(rest, gOff.result, "g-2: without an about page the result is identical to flag off");
+        assertEq(gOn.fetchLog, gOff.fetchLog, "g-3: … the same pages are fetched");
+        const strip = (x: ReturnType<typeof row>) => ({
+          ...x,
+          field_provenance: JSON.stringify(JSON.parse(x.field_provenance), (k, v) => (k === "fetched_at" ? "<t>" : v)),
+        });
+        assertEq(strip(row(gOn.db, "utenomgard")), strip(row(gOff.db, "utenomgard")), "g-4: … and the same values are written");
+        assertEq(ac?.[0]?.chosen, "homepage", "g-5: report says homepage");
+        assertEq(ac?.[0]?.about_pages, [], "g-6: no about page fetched");
+      }
+
+      // ── (g2) fallback paths (no links on the homepage) ────────────────────
+      {
+        const fOff = await run("fallbackgard", { dryRun: true });
+        const fOn = await run("fallbackgard", { dryRun: true, aboutPagePreview: true });
+        assertEq(
+          fOff.fetchLog,
+          ["https://fallbackgard.no/", "https://fallbackgard.no/om-oss", "https://fallbackgard.no/about", "https://fallbackgard.no/produkter"],
+          "g2-1: flag off -> the fixed fallback paths, as today",
+        );
+        assertEq(fOn.fetchLog, fOff.fetchLog, "g2-2: preview -> the same fallback paths (RFB's list is unchanged)");
+        const x = fOn.result.about_candidates?.[0];
+        assertEq([x?.chosen, x?.chosen_source_url], ["about_page", "https://fallbackgard.no/om-oss"], "g2-3: the fallback /om-oss page supplies the candidate");
+        assertEq(x?.about_pages?.map((e: any) => e.url), ["https://fallbackgard.no/om-oss"], "g2-4: only fetched about paths are evaluated (/about was a 404)");
+      }
+
+      // ── (h) directory/social host; deep-path section ──────────────────────
+      {
+        const h = await run(["fbgard", "hanengard"], { dryRun: true, aboutPagePreview: true });
+        const fb = h.result.about_candidates?.find((x) => x.agent_id === "fbgard");
+        assertTrue(h.fetchLog.includes("https://www.facebook.com/fbgard/om-oss"), "h-0: the social page's own «Om oss» was fetched");
+        assertTrue(!!fb && fb.chosen !== "about_page", "h-1: a social/directory homepage never supplies an about page");
+        assertEq(fb?.about_page_refusal, "directory/social host", "h-2: … with the refusal reported");
+        assertEq(fb?.about_pages?.map((e: any) => e.verdict), ["not_evaluated"], "h-2b: … and its about page not evaluated");
+        const hn = h.result.about_candidates?.find((x) => x.agent_id === "hanengard");
+        assertTrue(h.fetchLog.includes("https://hanen.no/om-oss"), "h-3: the host-root «Om oss» was fetched as before (fetch list unchanged)");
+        assertEq(hn?.about_pages, [], "h-4: … but outside the homepage's section it is not the producer's about page");
+        assertTrue(hn?.chosen !== "about_page", "h-5: … so it never becomes the candidate");
+      }
+
+      // ── (i) route: about_page_preview is honoured only in a dry run ───────
+      {
+        delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
+        freshDb();
+        globalThis.fetch = makeFetch([]);
+        const dry = await callRoute(homepageContentRefreshRouter, { agentIds: ["tveras"], about_page_preview: true });
+        assertEq(dry.status, 200, "i-1: dry-run preview -> 200");
+        assertEq(dry.body?.about_page_mode, "dry_run_preview", "i-2: the route passes the preview through in a dry run");
+        assertEq(dry.body?.about_candidates?.[0]?.chosen_source_url, "https://tveras.no/om-oss", "i-3: … and the response carries the about candidate");
+        assertTrue(!("about_page_preview_ignored" in (dry.body ?? {})), "i-4: … not flagged as ignored");
+        const plain = await callRoute(homepageContentRefreshRouter, { agentIds: ["tveras"] });
+        assertTrue(!("about_page_mode" in (plain.body ?? {})) && !("about_candidates" in (plain.body ?? {})), "i-5: no preview -> no about keys");
+        const db = freshDb();
+        const ap = await callRoute(homepageContentRefreshRouter, { agentIds: ["tveras"], apply: true, about_page_preview: true });
+        assertEq(ap.status, 200, "i-6: apply + preview -> 200");
+        assertEq(ap.body?.about_page_preview_ignored, "apply", "i-7: the preview is ignored with apply, and said so");
+        assertTrue(!("about_candidates" in (ap.body ?? {})), "i-8: no about candidates in the apply response");
+        assertEq((db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'tveras'").get() as any).about, HOME_META, "i-9: apply wrote the homepage candidate, not the about page");
+      }
+    } catch (err: any) {
+      failed++;
+      failures.push("homepage-content-refresh-about-page: unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      globalThis.fetch = prevFetch;
+      if (prevFlag === undefined) delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
+      else process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = prevFlag;
+      if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+      else process.env.ADMIN_KEY = prevAdminKey;
+      initMod.__setDbForTesting(prevDb as any);
+      for (const db of opened) {
+        try {
+          db.close();
+        } catch {
+          /* already closed */
+        }
+      }
+    }
+    return { passed, failed, failures };
+  })();
+}
+
+if (require.main === module) {
+  runHomepageContentRefreshAboutPageTests({ log: true }).then((r) => {
+    console.log(`\nhomepage-content-refresh-about-page: ${r.passed} passed, ${r.failed} failed`);
+    if (r.failed > 0) {
+      console.log(r.failures.join("\n"));
+      process.exit(1);
+    }
+    process.exit(0);
+  });
+}
