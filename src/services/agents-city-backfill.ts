@@ -175,6 +175,21 @@ export function __clearCityPostalRegistryCacheForTesting(): void {
   registryCachePromise = null;
 }
 
+/**
+ * Synchronous, fetch-free read of the per-process postal-registry cache:
+ * returns the already-loaded postnummer -> poststed Map, or null when it has
+ * not been loaded (yet) in this process. Never triggers a fetch — used by
+ * sync callers (marketplace.ts extractAddress) that must not do network I/O.
+ */
+export function getCachedPostalRegistry(): Map<string, string> | null {
+  return registryCache;
+}
+
+/** Test-only: seed (or clear, with null) the per-process registry cache. */
+export function __setCityPostalRegistryCacheForTesting(map: Map<string, string> | null): void {
+  registryCache = map;
+}
+
 async function getPostalRegistry(fetchImpl: typeof fetch): Promise<Map<string, string> | null> {
   if (registryCache) return registryCache;
   if (!registryCachePromise) {

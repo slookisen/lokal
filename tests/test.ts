@@ -1197,6 +1197,20 @@ console.log("\n── rfb-address-normalization-c1 ──");
   console.log(`  rfb-address-normalization-c1: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── extractAddress «Skive A» (2026-11-01): only the clean «street nr,
+// postnummer poststed» or null — block boundaries as line breaks, trailing
+// Norge/Norway dropped, in-memory postnummerregister check, name-prefix guard. ──
+console.log("\n── rfb-extract-address-skive-a ──");
+{
+  const { runRfbExtractAddressSkiveATests } = require("../src/routes/rfb-extract-address-skive-a.test") as
+    typeof import("../src/routes/rfb-extract-address-skive-a.test");
+  const r = runRfbExtractAddressSkiveATests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-extract-address-skive-a: " + f);
+  console.log(`  rfb-extract-address-skive-a: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon
 // (slice 1): write-time contact guard — validatePhoneForWrite /
 // stripTrailingContactLabel (contact-normalizer.ts), wired into
