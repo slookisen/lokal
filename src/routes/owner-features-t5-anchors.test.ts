@@ -444,6 +444,13 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       require.resolve("./gardssalg-owner-features"),
     ]);
     const servers: any[] = [];
+    // The claim routes sit behind the shared generalLimiter (300 per client per
+    // 15 min, keyed "127.0.0.1" here). This section sends a few hundred
+    // requests from loopback, so it clears that key before and after itself;
+    // otherwise later suites in the same process (T0c) get 429.
+    const { generalLimiter } = require("../middleware/security") as typeof import("../middleware/security");
+    const LOOPBACK_KEY = "127.0.0.1";
+    await generalLimiter.resetKey(LOOPBACK_KEY);
     const initMod = require("../database/init") as typeof import("../database/init");
     const prevRfbDb = initMod.__peekDbForTesting();
     const prevLog = console.log;
@@ -546,12 +553,14 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       assertTrue(toastIn(await getPage(L(ip)), `planlagt-${planned}`), "g19: …message in the planned row");
 
       ownerFeaturesRoutes.__resetGardssalgOwnerFeaturesRateLimitForTesting();
+      await generalLimiter.resetKey(LOOPBACK_KEY);
       for (let i = 0; i < ownerFeaturesRoutes.GARDSSALG_OWNER_FEATURES_WRITES_PER_MINUTE; i++) await post("sett", { key: "nope.key", value: "x" }, false);
       const rl = await post("sett", { key: KEY, value: "false", confirmed: "1" }, false);
       assertEq([rl.status, L(rl)], [303, P(`?melding=for_mange&ved=valg-${KEY}#valg-${KEY}`)], "g20: rate-limited → 303 at the row");
       ownerFeaturesRoutes.__resetGardssalgOwnerFeaturesRateLimitForTesting();
 
       // Every form in .mv-page lands on an anchor.
+      await generalLimiter.resetKey(LOOPBACK_KEY);
       const bad: string[] = [];
       let formsSeen = 0;
       for (const location of [P(), P(`?bekreft=${KEY}&verdi=1`), P(`?niva=${lvlKey}`)]) {
@@ -575,6 +584,7 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       for (const s of servers) await new Promise<void>((resolve) => s.close(() => resolve()));
       initMod.__setDbForTesting(prevRfbDb);
       try { (require("./gardssalg-owner-features") as typeof import("./gardssalg-owner-features")).__resetGardssalgOwnerFeaturesRateLimitForTesting(); } catch { /* ignore */ }
+      try { await generalLimiter.resetKey(LOOPBACK_KEY); } catch { /* ignore */ }
       restoreModuleCache();
       for (const k of ENV_KEYS) { if (prevEnv[k] === undefined) delete process.env[k]; else process.env[k] = prevEnv[k]; }
     }
