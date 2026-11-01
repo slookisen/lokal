@@ -115,6 +115,7 @@ import { knowledgeService } from "../services/knowledge-service";
 import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { maskEmail } from "../services/gardssalg-claim";
+import { createOwnerLoginLink } from "./owner-portal";
 
 import { deleteAgentProfileTranslations } from "../services/profile-translations";
 const router = Router();
@@ -2221,9 +2222,9 @@ router.get("/claim-review-queue", (req: Request, res: Response) => {
 // proven_email; else the address the claimant gave), the badge follows the
 // quarantine gate (self_registered rows still get none), claimed_at/
 // claimed_via are stamped 'admin_approval' (fill-only), and the owner gets
-// "X er nå ditt" with a one-time login link to that address — the claim token
-// itself is never mailed. An existing owner keeps its claim and token and is
-// not mailed. Body: { claimId, email? }.
+// «Profilen til X er nå din» with a one-time owner-portal login link to that
+// address — the claim token itself is never mailed. An existing owner keeps
+// its claim and token and is not mailed. Body: { claimId, email? }.
 router.post("/claim-review-approve", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const body = (req.body ?? {}) as { claimId?: unknown; email?: unknown };
@@ -2241,13 +2242,21 @@ router.post("/claim-review-approve", async (req: Request, res: Response) => {
   }
   trustScoreService.update(approved.agentId);
 
-  // Same one-time login link as POST /api/marketplace/auth/magic-link.
+  // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): a one-time,
+  // 15-minute login straight into the owner portal (/eier) for the approved
+  // address and this agent — no longer the /selger marketplace link. The
+  // portal login (request-magic-link) also accepts this address from now on.
+  // Not held by request-magic-link's visitor rate limit (createOwnerLoginLink
+  // checks none). The approval is already stored, so a failure here only
+  // means no mail (loginLinkSent false), never a 500 to retry into a 409.
   let loginLinkSent = false;
-  const link = knowledgeService.createMagicLink(approved.email);
-  if (link.success && link.token) {
-    const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
-    const sent = await emailService.sendClaimConfirmation(approved.email, link.agentName || "din agent", `${baseUrl}/api/marketplace/auth/m/${link.token}`, approved.agentId);
+  try {
+    const nameRow = getDb().prepare("SELECT name FROM agents WHERE id = ?").get(approved.agentId) as { name?: string } | undefined;
+    const link = createOwnerLoginLink(approved.agentId, approved.email, "claim_approval");
+    const sent = await emailService.sendClaimConfirmation(approved.email, nameRow?.name || "din gård", link.verifyUrl, approved.agentId);
     loginLinkSent = sent.success && sent.messageId !== "DRY_RUN";
+  } catch (err) {
+    console.error("[admin-agents] claim-review-approve: login link not sent:", err instanceof Error ? err.message : "error");
   }
 
   res.json({
