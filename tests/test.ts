@@ -51329,6 +51329,31 @@ runSerial(async () => {
 });
 
 // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3b (S3 punkt 1, automatic doors): RFB_ORGANIC_CLAIM_GATE —
+// the automated/admin content writes (PUT /admin/knowledge, homepage refresh,
+// content-correction, admin-agents register / Brreg fallback / tynne-profiler,
+// the marketplace admin lanes, bulk-enrich, /admin/register) strip organic
+// list entries and refuse organic free text for a producer without a valid
+// Debio status; flag off / verified / no organic words unchanged; owner lanes
+// untouched (S3c). Swaps the getDb() singleton, env vars, fetch and
+// console.log (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S3b: skrivevakt for økologi-påstander (automatiske dører) ──");
+  try {
+    const { runOrganicClaimGateS3bTests } = require("../src/routes/organic-claim-gate-s3b.test") as
+      typeof import("../src/routes/organic-claim-gate-s3b.test");
+    const r = await runOrganicClaimGateS3bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-claim-gate-s3b: " + f);
+    console.log(`  organic-claim-gate-s3b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-claim-gate-s3b: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
 // tekstrevisjon, S1: status from Debio's full register — normalizer, < 2500
 // rows rejected, the match methods, support signals → review only, review
 // approve/reject, AC1.4 reset, > 7 days stale, profile wording (AC1.5), flag

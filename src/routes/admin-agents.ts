@@ -109,7 +109,13 @@ import { gateContactCandidates } from "../services/contact-candidate-judge";
 // the call site's own comment for why this is safe to add here (candidate
 // text is LLM-generated, not raw scraped markup, so this is defense-in-depth
 // rather than the primary gate for this write path).
-import { looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
+import {
+  looksLikeCodeArtifact, looksLikeThemeSpam,
+  organicClaimGateEnabled, organicClaimGateApplies, hasUnverifiedOrganicClaim,
+  stripOrganicListForWrite, stripOrganicCategoriesForWrite, logOrganicClaimGate,
+  REFUSED_ORGANIC_CLAIM_UNVERIFIED, STRIPPED_ORGANIC_CLAIM_UNVERIFIED,
+} from "../services/description-quality";
+import { readDebioVerified } from "../services/debio-approval";
 // The claim admin queue (decision 11=A) — see GET /claim-review-queue below.
 import { knowledgeService } from "../services/knowledge-service";
 import { emailService } from "../services/email-service";
@@ -413,6 +419,9 @@ router.get("/", (req: Request, res: Response) => {
 // backed contact — distinct from the A2A-protocol-required placeholder)
 // ALSO becomes agents.contact_email when given, replacing the
 // "kontakt@rettfrabonden.com" placeholder that column otherwise gets.
+/** Økologi S3b: a net-new agent's Debio status (debio_verified defaults to 0). */
+const REGISTER_NEW_AGENT_DEBIO = { debio_verified: 0 } as const;
+
 router.post("/register", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
@@ -519,6 +528,24 @@ router.post("/register", async (req: Request, res: Response) => {
     });
     return;
   }
+  // Økologi S3b (RFB_ORGANIC_CLAIM_GATE, A2A dev-request 2026-10-28-rfb-
+  // okologisk-merking-debio-register-og-tekstrevisjon, S3 punkt 1): this is
+  // the harvest door, and a net-new agent never has a valid Debio status
+  // (debio_verified starts at 0; only the register sync sets it). So with the
+  // flag on, a description with an organic claim is refused (same shape as
+  // the gates above, plus the outcome code), and tags/categories lose their
+  // organic entries below. Flag off: unchanged.
+  const organicGateOn = organicClaimGateApplies(REGISTER_NEW_AGENT_DEBIO);
+  if (organicGateOn && typeof description === "string" && description.trim() && hasUnverifiedOrganicClaim(description, REGISTER_NEW_AGENT_DEBIO)) {
+    logOrganicClaimGate("POST /admin/agents/register", REFUSED_ORGANIC_CLAIM_UNVERIFIED, `new:${String(name)}`, "description");
+    res.status(400).json({
+      error: "description contains an organic claim for a producer without Debio status — rejected",
+      detail: "description contains an organic claim for a producer without Debio status — rejected",
+      outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+      field: "description",
+    });
+    return;
+  }
 
   const VALID_VERTICALS = ["rfb", "dental", "experiences"] as const;
   if (!VALID_VERTICALS.includes(vertical_id as typeof VALID_VERTICALS[number])) {
@@ -580,7 +607,18 @@ router.post("/register", async (req: Request, res: Response) => {
     if (org_nr) builtTags.push(`org_nr:${org_nr}`);
     if (source) builtTags.push(`source:${source}`);
     if (nace_code) builtTags.push(`nace:${nace_code}`);
-    if (extraTags && Array.isArray(extraTags)) builtTags.push(...extraTags);
+    const organicStripped: string[] = [];
+    if (extraTags && Array.isArray(extraTags)) {
+      // Økologi S3b: organic tags stripped for the (always unverified) new agent.
+      const tg = organicGateOn ? stripOrganicListForWrite(extraTags) : { list: extraTags, changed: false };
+      if (tg.changed) organicStripped.push("tags");
+      builtTags.push(...tg.list);
+    }
+    let registerCategories: unknown[] = categories && Array.isArray(categories) ? categories : [];
+    if (organicGateOn) {
+      const cg = stripOrganicCategoriesForWrite(registerCategories);
+      if (cg.changed) { registerCategories = cg.list; organicStripped.push("categories"); }
+    }
 
     // ── Slice 2 of dev-request 2026-06-30-brreg-verification-gate ────
     // rfb + experiences only — dental stays Legelisten-primary, brreg_*
@@ -647,7 +685,7 @@ router.post("/register", async (req: Request, res: Response) => {
       city,
       lat ?? null,
       lng ?? null,
-      JSON.stringify(categories && Array.isArray(categories) ? categories : []),
+      JSON.stringify(registerCategories),
       JSON.stringify(builtTags),
       vertical_id,
       org_nr ?? null,
@@ -655,6 +693,9 @@ router.post("/register", async (req: Request, res: Response) => {
       brreg_flag,
       brreg_checked_at,
     );
+    for (const f of organicStripped) {
+      logOrganicClaimGate("POST /admin/agents/register", STRIPPED_ORGANIC_CLAIM_UNVERIFIED, id, f);
+    }
 
     // ── Contact-field enrichment: agent_knowledge.email/.phone + provenance ──
     // Only runs when at least one of email/phone was actually supplied —
@@ -1135,6 +1176,19 @@ router.post("/brreg-catalog-sweep", async (req: Request, res: Response) => {
 // idempotent (a previously-filled agent is never re-selected — the SQL
 // WHERE clause excludes it — and never re-written even if somehow re-
 // selected, thanks to the atomic WHERE on the UPDATE itself).
+/**
+ * Økologi S3b (RFB_ORGANIC_CLAIM_GATE): Brreg's activity text («Drift av
+ * økologisk gårdsbruk») is prose, so for a producer without a valid Debio
+ * status it is not written at all (skipped, reason
+ * refused_organic_claim_unverified) — never cut. Flag off: false.
+ */
+function brregFallbackRefusesOrganic(db: ReturnType<typeof getDb>, agentId: string, text: string): boolean {
+  if (!organicClaimGateEnabled()) return false;
+  if (!hasUnverifiedOrganicClaim(text, readDebioVerified(db, agentId))) return false;
+  logOrganicClaimGate("brreg-description-fallback", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "description");
+  return true;
+}
+
 const BRREG_DESCRIPTION_FALLBACK_DEFAULT_LIMIT = 25;
 const BRREG_DESCRIPTION_FALLBACK_MAX_LIMIT = 100;
 const BRREG_DESCRIPTION_FALLBACK_CONCURRENCY = 3;
@@ -1237,6 +1291,10 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
           skipped.push({ agent_id: row.agent_id, reason: "no_brreg_description" });
           return;
         }
+        if (brregFallbackRefusesOrganic(db, row.agent_id, text)) {
+          skipped.push({ agent_id: row.agent_id, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
+          return;
+        }
         wouldWrite.push({ agent_id: row.agent_id, name: row.name, org_nr: row.org_nr, description_preview: text });
       }
 
@@ -1273,6 +1331,10 @@ router.post("/brreg-description-fallback", async (req: Request, res: Response) =
       }
       if (!text) {
         skipped.push({ agent_id: row.agent_id, reason: "no_brreg_description" });
+        return;
+      }
+      if (brregFallbackRefusesOrganic(db, row.agent_id, text)) {
+        skipped.push({ agent_id: row.agent_id, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
         return;
       }
 
@@ -4111,6 +4173,7 @@ type TynneProfilerFieldOutcome =
   | "generation_failed_cheap_bar" // candidate generated, but classifyAboutCheapBar rejected it (mangled/boilerplate/foreign) BEFORE the judge ever saw it — see the cheap-bar prefilter call in processTynneProfilerRow below
   | "judge_rejected"
   | "judge_infra_failure"
+  | "refused_organic_claim_unverified" // økologi S3b: generated text carries an organic claim, producer has no valid Debio status (RFB_ORGANIC_CLAIM_GATE)
   | "write_lock_race"; // approved, but the immediate-before-write re-check found the row/field newly locked
 
 interface TynneProfilerFieldAttempt {
@@ -4138,6 +4201,7 @@ const TYNNE_PROFILER_ROW_CAUSE_PRIORITY: readonly TynneProfilerFieldOutcome[] = 
   "judge_infra_failure",
   "generation_failed",
   "generation_failed_cheap_bar",
+  "refused_organic_claim_unverified",
   "judge_rejected",
 ];
 
@@ -4609,6 +4673,19 @@ async function processTynneProfilerRow(
                 field: f,
                 outcome: "generation_failed_cheap_bar",
                 reasoning: "fails the cheap bar (gambling/theme spam)",
+              };
+              continue;
+            }
+            // Økologi S3b (RFB_ORGANIC_CLAIM_GATE, A2A dev-request 2026-10-28-
+            // rfb-okologisk-merking-…, S3 punkt 1): generated prose with an
+            // organic claim is never written for a producer without a valid
+            // Debio status — refused whole, before the judge (saves the call).
+            if (organicClaimGateEnabled() && hasUnverifiedOrganicClaim(candidate, readDebioVerified(db, queueRow.agent_id))) {
+              logOrganicClaimGate("tynne-profiler-improve", REFUSED_ORGANIC_CLAIM_UNVERIFIED, queueRow.agent_id, f);
+              fieldResults[f] = {
+                field: f,
+                outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+                reasoning: "generated text contains an organic claim; the producer has no valid Debio status",
               };
               continue;
             }
