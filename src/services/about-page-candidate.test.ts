@@ -261,8 +261,8 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
 
     // ── 7b. Is the page about THIS producer? ───────────────────────────────
     {
-      assertEq(producerNameTokens("Tverås Gårdsmat"), ["tveras"], "name-1: generic words dropped, accents folded");
-      assertEq(producerNameTokens("Tverås Gårdsmat — Gol"), ["tveras"], "name-2: the place suffix after « — » is dropped");
+      assertEq(producerNameTokens("Tverås Gårdsmat"), ["tverås"], "name-1: generic words dropped, the word kept as written (lower-case)");
+      assertEq(producerNameTokens("Tverås Gårdsmat — Gol"), ["tverås"], "name-2: the place suffix after « — » is dropped");
       assertEq(producerNameTokens("Hjortehagen Gård AS (Stokke)"), ["hjortehagen"], "name-3: AS and a parenthesised place dropped");
       assertEq(producerNameTokens("Gården AS"), [], "name-4: only generic words -> no distinctive token");
       assertEq(producerNameTokens("Voss Fellesbryggeri"), ["voss", "fellesbryggeri"], "name-5: every distinctive word kept");
@@ -286,13 +286,85 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
       ]);
       const hPick = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: weOnly }], producerName: "Tverås Gårdsmat" });
       assertEq(hPick.chosen?.url, url, "name-10: the producer named in the page title -> about candidate");
-      assertTrue(aboutPageNamesProducer("", "<html><body><h1>Om Tveråsgarden</h1></body></html>", ["tveras"]), "name-11: a compound in <h1> counts");
-      assertTrue(!aboutPageNamesProducer("Gol og Hallingdal", "<html><body><h1>Om bygda</h1></body></html>", ["tveras"]), "name-12: absent -> false");
-      assertTrue(!aboutPageNamesProducer("btveras", "<html></html>", ["tveras"]), "name-13: must start a word");
+      assertTrue(aboutPageNamesProducer("", "<html><body><h1>Om Tveråsgarden</h1></body></html>", ["tverås"]), "name-11: a compound in <h1> counts");
+      assertTrue(!aboutPageNamesProducer("Gol og Hallingdal", "<html><body><h1>Om bygda</h1></body></html>", ["tverås"]), "name-12: absent -> false");
+      assertTrue(!aboutPageNamesProducer("btveras", "<html></html>", ["tverås"]), "name-13: must start a word");
       const noToken = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: weOnly }], producerName: "Gården AS" });
       assertEq(noToken.chosen, null, "name-14: a name with no distinctive word cannot be checked -> fail closed");
       assertTrue(String(noToken.refused).startsWith(ABOUT_PAGE_NOT_ABOUT_PRODUCER), "name-15: … refused as about_page_not_about_producer");
       assertEq(noToken.evaluated.map((e) => e.verdict), ["not_evaluated"], "name-16: … nothing evaluated");
+    }
+
+    // ── 7c. Round-2 review: short words, fallback, 2 letters, genitive ─────
+    {
+      const names = (name: string, text: string, html = "<html></html>") => aboutPageNamesProducer(text, html, producerNameTokens(name));
+      // Finding 2: a word shorter than 5 letters must be a whole word.
+      assertTrue(!names("Nes Gård", "Vi sees neste uke på markedet, og nesten alle varene er klare."), "short-1: «Nes» does not match «neste»/«nesten»");
+      assertTrue(names("Nes Gård", "Nes gård ligger ved fjorden og har sau og geit."), "short-2: «Nes gård ligger …» matches");
+      assertTrue(names("Nes Gård", "Velkommen til Nes' egen gårdsbutikk og til Ness gamle låve."), "short-3: whole word with a genitive «s»");
+      assertTrue(!names("Vik Gård", "Det er viktig for oss å drive økologisk."), "short-4: «Vik» does not match «viktig»");
+      assertTrue(!names("Hov Gård", "Vi driver hovedsakelig med sau."), "short-5: «Hov» does not match «hovedsakelig»");
+      assertTrue(names("Tverås Gårdsmat", "Om Tveråsgarden og folka her."), "short-6: 5+ letters still match the start of a compound");
+      // Finding 3: fallback to the whole name when the head has no distinctive word.
+      assertEq(producerNameTokens("Gården AS — Hovland"), ["hovland"], "fallback-1: nothing before « — » -> the whole name's words");
+      assertEq(producerNameTokens("Gårdsbutikken (Hovland)"), ["hovland"], "fallback-2: … also for a bracketed suffix");
+      assertEq(producerNameTokens("Gården AS"), [], "fallback-3: still none when the whole name is generic");
+      // Finding 3: 2-letter words, whole-word only.
+      assertEq(producerNameTokens("Ås Gård"), ["ås"], "two-1: «Ås» is a word (only the company form «AS» is generic)");
+      assertEq(producerNameTokens("Bø Gardsbutikk"), ["bø"], "two-2: «Bø»");
+      assertEq(producerNameTokens("Li Gård — Vinje"), ["li"], "two-3: «Li» (place suffix still dropped)");
+      assertTrue(names("Ås Gård", "Ås gård ligger like ved Ås sentrum."), "two-4: «Ås» matches «Ås gård»");
+      assertTrue(!names("Ås Gård", "Fellessiden AS er en portal for matprodusenter."), "two-5: «Ås» does not match the company form «AS»");
+      assertTrue(names("Bø Gardsbutikk", "Butikken vår i Bø er åpen for alle."), "two-6: «Bø» matches as a whole word");
+      assertTrue(names("Li Gård — Vinje", "Li gård ligger i Vinje i Telemark."), "two-7: «Li» matches «Li gård»");
+      assertTrue(!names("Li Gård — Vinje", "Gården ligger fint til i lia over vatnet, og vi liker det."), "two-8: … but not «ligger»/«lia»/«liker»");
+      // Finding 3: genitive «s».
+      assertTrue(names("Hovlands Gårdsbutikk", "Hovland gård har drevet med frukt i fire generasjoner."), "gen-1: «Hovlands» matches «Hovland gård»");
+      assertTrue(!names("Grans Gård", "Skogen her er full av gran og furu."), "gen-2: a short word is not stripped («Grans» never becomes «gran»)");
+      // The village page for «Nes Gård» (finding 2's repro) is refused.
+      const nesVillage = aboutPageHtml([
+        "Bygda har lange tradisjoner for jordbruk, og neste uke er det marked på torget. Nesten alle gårdene i dalen er med.",
+        "Kirken ble bygd på slutten av attenhundretallet og er fortsatt i bruk, og bygdetunet er åpent for besøkende hele sommeren.",
+      ]).replace("<title>Om oss – Tverås Gårdsmat</title>", "<title>Historie</title>").replace("<h1>Om oss</h1>", "<h1>Historien</h1>");
+      const nesPick = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url: "https://nes.no/historie", html: nesVillage }], producerName: "Nes Gård" });
+      assertEq([nesPick.chosen, nesPick.evaluated[0]?.verdict, nesPick.refused], [null, "not_about_producer", ABOUT_PAGE_NOT_ABOUT_PRODUCER], "short-7: «Nes Gård» vs a page saying «neste uke» -> refused");
+      const nesOwn = aboutPageHtml([
+        "Nes gård ligger ved fjorden og har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite om sommeren.",
+        LONG_PROSE_2,
+      ]).replace("<title>Om oss – Tverås Gårdsmat</title>", "<title>Om oss</title>");
+      const nesOk = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url: "https://nes.no/om-oss", html: nesOwn }], producerName: "Nes Gård" });
+      assertEq(nesOk.evaluated[0]?.verdict, "chosen", "short-8: «Nes gård ligger …» -> accepted");
+    }
+
+    // ── 7d. Round-2 review finding 1: bounded scans on a pathological page ─
+    {
+      pickAboutPageCandidate({ homepageCandidate: "kort", aboutPages: [{ url, html: "<p>x</p>" }], producerName: "Tverås" }); // warm-up
+      const prose = `<p>${LONG_PROSE_1}</p><p>${LONG_PROSE_2}</p>`;
+      const time = (html: string): number => {
+        const t0 = performance.now();
+        pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html }], producerName: "Tverås Gårdsmat" });
+        aboutPageTextIncluded(html, "x");
+        return performance.now() - t0;
+      };
+      const titles = `<html><body>${prose}${"<title>x ".repeat(50_000)}</body></html>`;
+      const h1s = `<html><body>${prose}${"<h1>x ".repeat(50_000)}</body></html>`;
+      const metas = `<html><head>${"<meta content='x' ".repeat(50_000)}</head><body>${prose}</body></html>`;
+      assertTrue(titles.length > 450_000, "patho-0: the unclosed-<title> page is ~450 kB");
+      const tTitle = time(titles);
+      assertTrue(tTitle < 200, `patho-1: 50k unclosed <title> (450 kB) evaluated in < 200 ms (got ${tTitle.toFixed(0)} ms; was ~39 s)`);
+      const tH1 = time(h1s);
+      assertTrue(tH1 < 200, `patho-2: 50k unclosed <h1> evaluated in < 200 ms (got ${tH1.toFixed(0)} ms; was ~5 s)`);
+      const tMeta = time(metas);
+      assertTrue(tMeta < 2000, `patho-3: 50k unclosed <meta> (900 kB) evaluated in < 2 s (got ${tMeta.toFixed(0)} ms; was ~47 s)`);
+      // Bounded, but the guards still work on a normal page.
+      const spam =
+        "<html><head><title>Beste casino på nett i 2026</title></head><body><main><p>" + LONG_PROSE_1 + "</p><p>" + LONG_PROSE_2 + "</p></main></body></html>";
+      assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: spam }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "theme_spam_page", "patho-4: a spam <title> is still caught");
+      const ogSpam =
+        `<html><head><meta property="og:description" content="Beste casino på nett 2026 — gratisspinn og velkomstbonus uten innskudd."></head><body><main><p>${LONG_PROSE_1}</p><p>${LONG_PROSE_2}</p></main></body></html>`;
+      assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: ogSpam }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "theme_spam_page", "patho-5: a spam meta description is still caught");
+      const ogTitle = `<html><head><meta property="og:title" content="Tverås Gårdsmat"><title>Om oss</title></head><body><main><p>Vi er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite i fjellet om sommeren.</p><p>${LONG_PROSE_2}</p></main></body></html>`;
+      assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: ogTitle }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "chosen", "patho-6: og:title still names the producer");
     }
 
     // ── 8. Section scope ───────────────────────────────────────────────────

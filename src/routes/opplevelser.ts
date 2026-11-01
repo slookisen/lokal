@@ -4014,13 +4014,15 @@ async function crFetchGardssalgContent(
     } else {
       // About-page run: the same discovery and section filter, with the best
       // IN-SECTION about link guaranteed a place among the first
-      // GARDSSALG_MAX_PAGES - 1 targets (the sub-page slots). An eligible
-      // link (urlIsInSection) always passes the `base` prefix filter below, so
-      // the reserved link is never one the filter then drops; the filter only
+      // GARDSSALG_MAX_PAGES - 1 targets (the sub-page slots). Eligible means
+      // it passes the very `base` prefix filter below (which also pins the
+      // protocol — an absolute http:// link on an https site does not) AND
+      // urlIsInSection (no sibling section sharing the prefix), so the
+      // reserved link is never one the filter then drops; the filter only
       // removes other entries, which can only move the reserved link forward.
       const discovered = rankContentLinks(primaryHtml, primaryUrl, GARDSSALG_MAX_PAGES, {
         reserveAboutSlotWithin: GARDSSALG_MAX_PAGES - 1,
-        aboutEligible: (url) => urlIsInSection(url, base),
+        aboutEligible: (url) => url.startsWith(base) && urlIsInSection(url, base),
       }).filter((l) => l.url.startsWith(base));
       targets =
         discovered.length > 0

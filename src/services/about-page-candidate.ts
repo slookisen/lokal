@@ -35,9 +35,12 @@ import {
   decodeHtmlEntities,
   pageLooksLikeThemeSpam,
   stripNorwegianAccents,
+  MAX_PROSE_SCAN_LEN,
+  THEME_SPAM_PAGE_TEXT_CHARS,
+  THEME_SPAM_PAGE_MIN_STRONG_HITS,
 } from "./search-enrich";
 import { checkAboutCandidateSubstantiatedBySource } from "./about-source-substantiation";
-import { looksLikeCodeArtifact, looksLikeThemeSpam } from "./description-quality";
+import { looksLikeCodeArtifact, looksLikeThemeSpam, countThemeSpamStrongHits } from "./description-quality";
 
 /** The env switch. Only the literal "1" or "true" enables; read at call time. */
 export const ENRICHMENT_ABOUT_PAGE_FLAG = "ENRICHMENT_ABOUT_PAGE_ENABLED";
@@ -116,13 +119,57 @@ export function aboutPageCandidateIsMoreSubstantial(
   return n >= ABOUT_PAGE_MIN_CONTENT_WORDS;
 }
 
+/**
+ * Every regex this module runs on an about page's HTML runs on at most its
+ * first ABOUT_PAGE_SCAN_CAP chars — the cap extractProseText already uses
+ * (MAX_PROSE_SCAN_LEN), so the prose candidate always comes from inside it.
+ * fetchPage does not cap the body, and a page full of unclosed <title>/<h1>
+ * tags makes those lazy scans quadratic (measured: 450 kB -> ~39 s, all of
+ * it synchronous on the event loop).
+ */
+export const ABOUT_PAGE_SCAN_CAP = MAX_PROSE_SCAN_LEN;
+
+/**
+ * The page's complete <meta …> tags and its <title> element (content of at
+ * most 300 chars), and nothing else. Both patterns stop at the next `<`/`>`
+ * or a fixed length, so this is linear in `head` — unlike running
+ * extractTitle/extractMetaDescriptions on raw HTML, whose `[^>]+` scans
+ * backtrack badly on unclosed tags (a page of unclosed `<meta content='x' `
+ * takes seconds per few kB). Feeding these tags to the existing extractors
+ * gives the same title and meta descriptions for any well-formed page.
+ */
+function headTagsOf(head: string): string {
+  const metas = head.match(/<meta\b[^<>]*>/gi) ?? [];
+  const title = /<title\b[^<>]*>[^<]{0,300}<\/title>/i.exec(head)?.[0] ?? "";
+  return `<html><head>${title}${metas.join("")}</head><body></body></html>`;
+}
+
+/**
+ * pageLooksLikeThemeSpam's rule for an about page, on bounded input: its
+ * title or a meta description reads as theme spam (pageLooksLikeThemeSpam on
+ * headTagsOf), or the opening THEME_SPAM_PAGE_TEXT_CHARS of its visible text
+ * carry THEME_SPAM_PAGE_MIN_STRONG_HITS strong gambling phrases. `head` is
+ * already capped at ABOUT_PAGE_SCAN_CAP. PURE.
+ */
+function aboutPageLooksLikeThemeSpam(head: string): boolean {
+  if (pageLooksLikeThemeSpam(headTagsOf(head))) return true;
+  return countThemeSpamStrongHits(extractVisibleText(head).slice(0, THEME_SPAM_PAGE_TEXT_CHARS)) >= THEME_SPAM_PAGE_MIN_STRONG_HITS;
+}
+
+// Company forms and function words in a producer name, compared on the word
+// as written (lower-case, NOT accent-folded: «AS» is generic, the place «Ås»
+// is not, although both fold to "as").
+const PRODUCER_NAME_GENERIC_FORMS: ReadonlySet<string> = new Set([
+  "as", "sa", "da", "ans", "enk", "nuf", "ba", "ltd",
+  "og", "and", "the", "med", "fra", "til", "ved", "hos", "paa", "på", "for",
+]);
+
 // Words of a producer name that say what kind of business it is, not which
-// one (folded: lower-case, æ/ø/å stripped). A name made only of these (and
-// words shorter than 3 letters) has nothing to recognise the producer by.
+// one, compared accent-folded (lower-case, æ/ø/å stripped). A name made only
+// of these and PRODUCER_NAME_GENERIC_FORMS has nothing to recognise the
+// producer by.
 const PRODUCER_NAME_GENERIC_WORDS: ReadonlySet<string> = new Set(
   [
-    "as", "sa", "da", "ans", "enk", "nuf", "ba", "ltd",
-    "og", "and", "the", "med", "fra", "til", "ved", "hos", "paa", "for",
     "gård", "gard", "gården", "garden", "gårds", "gards", "gårdene", "gardene",
     "gårdsmat", "gardsmat", "gårdsbruk", "gårdsbruket", "gårdsbutikk", "gårdsbutikken",
     "gårdsutsalg", "gårdsutsalget", "gårdsysteri", "gårdsbakeri", "gårdsmeieri",
@@ -137,36 +184,78 @@ const PRODUCER_NAME_GENERIC_WORDS: ReadonlySet<string> = new Set(
   ].map((w) => stripNorwegianAccents(w.toLowerCase())),
 );
 
-/**
- * The words that identify THIS producer in its name (folded, >= 3 letters,
- * not PRODUCER_NAME_GENERIC_WORDS, not a number), from the part before a
- * place suffix («Tverås Gårdsmat — Gol», «… (Gol)»). PURE.
- */
-export function producerNameTokens(name: string | null | undefined): string[] {
-  const head = String(name ?? "").split(/\s+[—–-]\s+|\s*\(/)[0] ?? "";
+function distinctiveNameWords(part: string): string[] {
   const out: string[] = [];
-  for (const w of stripNorwegianAccents(head.toLowerCase()).split(/[^a-z0-9]+/)) {
-    if (w.length < 3 || /^\d+$/.test(w) || PRODUCER_NAME_GENERIC_WORDS.has(w) || out.includes(w)) continue;
+  for (const w of part.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    if (w.length < 2 || /^\d+$/.test(w) || out.includes(w)) continue;
+    if (PRODUCER_NAME_GENERIC_FORMS.has(w) || PRODUCER_NAME_GENERIC_WORDS.has(stripNorwegianAccents(w))) continue;
     out.push(w);
   }
   return out;
 }
 
 /**
+ * The words that identify THIS producer in its name, lower-case as written
+ * (>= 2 letters, not a company form/function word, not a business-type word,
+ * not a number). Taken from the part before a place suffix («Tverås Gårdsmat
+ * — Gol», «… (Gol)»); when that part has none («Gården AS — Hovland»), from
+ * the whole name. PURE.
+ */
+export function producerNameTokens(name: string | null | undefined): string[] {
+  const full = String(name ?? "");
+  const head = full.split(/\s+[—–-]\s+|\s*\(/)[0] ?? "";
+  const fromHead = distinctiveNameWords(head);
+  return fromHead.length > 0 ? fromHead : distinctiveNameWords(full);
+}
+
+/** A name word shorter than this must match a whole word; longer ones may start a compound. */
+export const PRODUCER_NAME_PREFIX_MIN_LETTERS = 5;
+
+/**
+ * Does one name word occur in the page text? `lowerText` is the text
+ * lower-cased; `foldedText` the same accent-folded.
+ *   - a word of PRODUCER_NAME_PREFIX_MIN_LETTERS or more letters may start a
+ *     word, compounds included («Tverås» in «Tveråsgarden»), compared
+ *     accent-folded;
+ *   - a shorter word must BE a whole word, optionally with a genitive «s»,
+ *     compared as written («Nes» matches «Nes gård» / «Nes' » but not
+ *     «neste»; «Ås» does not match the company form «AS»);
+ *   - a word of more than PRODUCER_NAME_PREFIX_MIN_LETTERS letters ending in
+ *     «s» is also tried without it (the name «Hovlands Gårdsbutikk», the page
+ *     «Hovland gård»); a shorter one is not («Grans» must not become the
+ *     common noun «gran»).
+ */
+function nameWordOccurs(word: string, lowerText: string, foldedText: string): boolean {
+  const forms =
+    word.length > PRODUCER_NAME_PREFIX_MIN_LETTERS && word.endsWith("s") ? [word, word.slice(0, -1)] : [word];
+  return forms.some((f) => {
+    if (f.length >= PRODUCER_NAME_PREFIX_MIN_LETTERS) {
+      return new RegExp(`(?:^|[^a-z0-9])${stripNorwegianAccents(f)}`).test(foldedText);
+    }
+    return new RegExp(`(?:^|[^\\p{L}\\p{N}])${f}s?(?![\\p{L}\\p{N}])`, "u").test(lowerText);
+  });
+}
+
+/**
  * True when the about page is about THIS producer: one of its
- * producerNameTokens starts a word (compounds allowed: «Tveråsgarden») in the
- * candidate text, the page title (og:title / <title>) or its first <h1>.
- * A «Historie» page about the village, or a blog post, on the producer's own
- * host does not name the producer and fails. PURE.
+ * producerNameTokens occurs (nameWordOccurs) in the candidate text, the page
+ * title (og:title / <title>) or its first <h1>. A «Historie» page about the
+ * village, or a blog post, on the producer's own host does not name the
+ * producer and fails. Reads at most ABOUT_PAGE_SCAN_CAP chars of `html`.
+ * PURE.
  */
 export function aboutPageNamesProducer(candidate: string, html: string, tokens: readonly string[]): boolean {
   if (tokens.length === 0) return false;
-  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? "";
-  const h1 = /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] ?? "";
-  const hay = stripNorwegianAccents(
-    decodeHtmlEntities([candidate, extractTitle(html), title, h1].join(" ").replace(/<[^>]+>/g, " ")).toLowerCase(),
-  );
-  return tokens.some((t) => new RegExp(`(?:^|[^a-z0-9])${t}`).test(hay));
+  const head = html.slice(0, ABOUT_PAGE_SCAN_CAP);
+  const tags = headTagsOf(head);
+  // og:title or <title> (extractTitle on the bounded tags), the <title>
+  // itself, and the first <h1> — its content read to at most 500 chars, so
+  // an unclosed <h1> costs a bounded scan per occurrence.
+  const title = /<title\b[^<>]*>([^<]{0,300})<\/title>/i.exec(head)?.[1] ?? "";
+  const h1 = /<h1\b[^<>]*>([\s\S]{0,500}?)<\/h1>/i.exec(head)?.[1] ?? "";
+  const lower = decodeHtmlEntities([candidate, extractTitle(tags), title, h1].join(" ").replace(/<[^>]+>/g, " ")).toLowerCase();
+  const folded = stripNorwegianAccents(lower);
+  return tokens.some((t) => nameWordOccurs(t, lower, folded));
 }
 
 /** pickAboutPageCandidate's refusal when no about page was chosen because none named the producer. */
@@ -212,7 +301,8 @@ export type AboutPagePick = {
  * Pick the about-page candidate, or keep the homepage one (spec 3). PURE.
  *
  * Each fetched about page, in order, until one is chosen:
- *   1. the page as a whole must not read as theme spam (pageLooksLikeThemeSpam);
+ *   1. the page as a whole must not read as theme spam (pageLooksLikeThemeSpam's
+ *      rule on bounded input: aboutPageLooksLikeThemeSpam);
  *   2. summarizeAboutPageProse(html) must yield text;
  *   3. meetsAboutQualityBar (the RFB homepage candidate's own bar: length,
  *      boilerplate, Norwegian, nav-menu leakage, umbrella «våre medlemmer»);
@@ -249,12 +339,15 @@ export function pickAboutPageCandidate(input: {
     return { chosen: null, evaluated, refused };
   }
   let chosen: { url: string; text: string } | null = null;
-  for (const page of input.aboutPages) {
+  for (const fetchedPage of input.aboutPages) {
+    // Bounded scans only (ABOUT_PAGE_SCAN_CAP); the prose candidate is read
+    // from inside this same window (extractProseText's cap).
+    const page = { url: fetchedPage.url, html: fetchedPage.html.slice(0, ABOUT_PAGE_SCAN_CAP) };
     if (chosen) {
       evaluated.push({ url: page.url, candidate: "", verdict: "not_evaluated" });
       continue;
     }
-    if (pageLooksLikeThemeSpam(page.html)) {
+    if (aboutPageLooksLikeThemeSpam(page.html)) {
       evaluated.push({ url: page.url, candidate: "", verdict: "theme_spam_page" });
       continue;
     }
@@ -350,7 +443,8 @@ export function homepageSectionBase(homepageUrl: string): string | null {
  */
 export function aboutPageTextIncluded(aboutHtml: string, contentText: string): boolean {
   if (!aboutHtml || !contentText) return false;
-  const para = extractProseParagraphs(aboutHtml).find((p) => p.length >= 40) ?? extractVisibleText(aboutHtml);
+  const head = aboutHtml.slice(0, ABOUT_PAGE_SCAN_CAP);
+  const para = extractProseParagraphs(head).find((p) => p.length >= 40) ?? extractVisibleText(head);
   const probe = para.slice(0, 120).trim();
   return probe.length > 0 && contentText.includes(probe);
 }

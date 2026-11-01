@@ -40,7 +40,8 @@
  *       from the producer's own in-section «Om oss»;
  *   (N) a village «Historie» page: not about the producer -> never judged;
  *   (O) about_page_in_content_text reflects the LLM's 6000-char window;
- *   (P) flag ON without an about page: same response and DB row as flag OFF.
+ *   (P) flag ON without an about page: same response and DB row as flag OFF;
+ *   (Q) an absolute http:// about link on an https site never takes the slot.
  */
 
 import { ENRICHMENT_ABOUT_PAGE_FLAG } from "../services/about-page-candidate";
@@ -132,6 +133,21 @@ function siteFor(host: string): Record<string, string> {
     return {
       "/": homepage(`<nav><a href="/om-oss">Om oss</a></nav><div>${BIG_FILLER}</div>`),
       "/om-oss": aboutPage(`<p>${P1}</p><p>${P2}</p><p>${P3}</p>`),
+    };
+  }
+  if (host.startsWith("gs-proto")) {
+    // Round-2 review finding 4: an absolute http:// «Om oss» link on an https
+    // site (dropped by the section filter) next to the real https «Om gården».
+    const nav =
+      `<nav><a href="/kontakt">Kontakt</a><a href="/kontakt-oss">Kontakt oss</a><a href="/contact">Contact</a>` +
+      `<a href="/kontaktinfo">Kontaktinfo</a><a href="http://${host}/om-oss">Om oss</a><a href="/om-garden">Om gården</a></nav>`;
+    return {
+      "/": homepage(nav),
+      "/kontakt": CONTACT_PAGE,
+      "/kontakt-oss": CONTACT_PAGE,
+      "/contact": CONTACT_PAGE,
+      "/kontaktinfo": CONTACT_PAGE,
+      "/om-garden": aboutPage(`<p>${P1}</p><p>${P2}</p><p>${P3}</p>`),
     };
   }
   if (host.startsWith("gs-none")) {
@@ -267,7 +283,7 @@ export function runOpplevelserGardssalgAboutPageCandidateTests(opts: { log?: boo
       add("gs-om-lock", { content_source: "claim", prov: prov({ owner_locks: { about_text: { locked_at: "2026-08-01T00:00:00.000Z" } } }) });
       add("gs-deep-off", { path: "/medlem/gard-x" });
       add("gs-deep-on", { path: "/medlem/gard-x" });
-      for (const id of ["gs-hist", "gs-big", "gs-none-dry", "gs-none-a", "gs-none-b", "gs-om-l4", "gs-om-l5"]) add(id);
+      for (const id of ["gs-hist", "gs-big", "gs-none-dry", "gs-none-a", "gs-none-b", "gs-om-l4", "gs-om-l5", "gs-proto"]) add(id);
 
       // ── fetch stub: producer sites + the judge ────────────────────────────
       const fetchLog: string[] = [];
@@ -512,6 +528,17 @@ export function runOpplevelserGardssalgAboutPageCandidateTests(opts: { log?: boo
         };
         assertEq(rowNorm("gs-none-b"), rowNorm("gs-none-a"), "P-5: … and the same DB row");
         assertEq(fetchedFor("gs-none-b"), fetchedFor("gs-none-a"), "P-6: … and the same pages fetched");
+      }
+
+      // ── (Q) round-2 finding 4: http:// about link on an https site ────────
+      {
+        const r = await run(["gs-proto"], { preview: true });
+        const got = fetchLog.filter((u) => u.includes("gs-proto.example.no")).map((u) => `${new URL(u).protocol}${new URL(u).pathname}`);
+        assertTrue(got.includes("https:/om-garden"), "Q-1: the https «Om gården» takes the reserved slot and is fetched");
+        assertTrue(!got.includes("http:/om-oss"), "Q-2: the http:// «Om oss» (outside the https section filter) never takes it");
+        assertEq(got.length - 1, 4, "Q-3: still four sub-pages");
+        const e = r.body.about_page_candidates?.[0];
+        assertEq(e?.about_pages?.map((x: any) => [x.url, x.verdict]), [["https://gs-proto.example.no/om-garden", "chosen"]], "Q-4: it is evaluated and chosen");
       }
 
       // ── (K) pure helpers ──────────────────────────────────────────────────

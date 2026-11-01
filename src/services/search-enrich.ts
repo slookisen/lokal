@@ -932,7 +932,7 @@ function isHighLinkDensityBlock(blockHtml: string): boolean {
 // upstream. Bounding the slice BEFORE any tag-stripping/link-density scan
 // keeps worst-case scan cost flat regardless of how large/broken the input
 // HTML is.
-const MAX_PROSE_SCAN_LEN = 25_000;
+export const MAX_PROSE_SCAN_LEN = 25_000;
 
 export function extractProseText(html: string): string {
   if (!html) return "";
