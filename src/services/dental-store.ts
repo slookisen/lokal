@@ -688,11 +688,19 @@ function pushFreeTextClause(
 //                     'verified' means the «Verifisert» claim (F2-S8, below),
 //                     acute_vakt 1 means the akutt claim (S2b, below) and
 //                     helfo_agreement 'true' the Helfo claim (F2-S6, below).
+//   sourcedClaims     GET /agents without the admin key (F2-S7): the
+//                     acute_vakt and helfo_agreement filters list only rows
+//                     whose answer has the value asked for
+//                     (dental-rest-claims.ts): acute_vakt 1 is «Akuttvakt»
+//                     (DENTAL_ACUTE_VAKT_SQL, publicAcuteVakt), helfo as for
+//                     publicOnly. Rows are otherwise as without it (no
+//                     rejected/closed/non-clinic exclusion).
 //   excludeParked     GET /agents?exclude_parked=1 (enrichment candidates).
 //   excludeNonClinic  GET /discover's opt-in catalog_class filter.
 // The synthetic probe row is skipped for every caller.
 export interface DentalWhereOptions {
   publicOnly?: boolean;
+  sourcedClaims?: boolean;
   excludeParked?: boolean;
   excludeNonClinic?: boolean;
 }
@@ -812,9 +820,10 @@ function pushFieldClauses(
     // F2-S6: on a public surface the filter lists the clinics whose card
     // gives the value asked for (shownHelfoAgreement): «true» is the Helfo
     // claim (a stored 'true' with a source), and a 'true' without a source
-    // answers 'unknown'. GET /agents (admin, enrichment) keeps the column,
-    // as does every surface with the switch off.
-    const sourced = opts.publicOnly && HELFO_CLAIM_REQUIRES_SOURCE;
+    // answers 'unknown'. GET /agents without the admin key gives the card's
+    // value too (F2-S7, sourcedClaims). GET /agents with the key (admin,
+    // enrichment) keeps the column, as does every surface with the switch off.
+    const sourced = (opts.publicOnly || opts.sourcedClaims) && HELFO_CLAIM_REQUIRES_SOURCE;
     if (sourced && f.helfo_agreement === "true") {
       where.push(DENTAL_HELFO_CLAIM_SQL);
     } else if (sourced && f.helfo_agreement === "unknown") {
@@ -833,6 +842,13 @@ function pushFieldClauses(
     // keyword reading and message.data) gets it. GET /agents (admin,
     // enrichment) keeps the raw column, as does acute_vakt 0.
     where.push(DENTAL_ACUTE_CLAIM_SQL);
+  } else if (f.acute_vakt === 1 && opts.sourcedClaims) {
+    // F2-S7: GET /agents without the admin key answers acute_vakt 1 only
+    // where the card says «Akuttvakt» (publicAcuteVakt), so its filter lists
+    // just those rows: the vakt twin, not the whole claim (a clinic with akutt
+    // only in patient_focus answers acute_vakt null). acute_vakt 0 is
+    // answered as stored, so it keeps the column below.
+    where.push(DENTAL_ACUTE_VAKT_SQL);
   } else if (f.acute_vakt !== undefined) {
     where.push(`acute_vakt = @${p}acute_vakt`);
     params[`${p}acute_vakt`] = f.acute_vakt;
@@ -1566,7 +1582,9 @@ export function listDentalAgents(
   // function so the OTHER caller of listDentalAgents (GET /api/tannlege/
   // agents, an admin/enrichment listing, not one of slice 1b's named public
   // surfaces) stays byte-identical.
-  opts: { excludeParked?: boolean; excludeNonClinic?: boolean } = {}
+  // F2-S7: sourcedClaims (GET /agents without the admin key) makes the
+  // acute_vakt and helfo_agreement filters follow the answer's values.
+  opts: { excludeParked?: boolean; excludeNonClinic?: boolean; sourcedClaims?: boolean } = {}
 ): DentalAgentRow[] {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");

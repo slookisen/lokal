@@ -50,6 +50,9 @@ import { shownDentalAgent, shownDentalFieldProvenance, isPrivateEnkAddress } fro
 // GET /discover gives verification_status as the badge says it.
 import { shownVerificationStatus } from "../services/dental-verified-claim";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S7):
+// the raw REST answers give acute_vakt and helfo_agreement as the card does.
+import { restClaimsRequireSource, withRestClaims } from "../services/dental-rest-claims";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS, isDentalSyntheticProbeId } from "../services/dental-contamination";
@@ -168,9 +171,13 @@ function withoutGoogleRating<T extends { rating?: unknown; rating_count?: unknow
 // the side values the «Verifisert» claim reads are left out of both as well,
 // and verification_status stays the stored value here (the raw REST answer
 // is F2-S7's), so both answers are as before.
+// F2-S7 (same dev-request): without the admin key, acute_vakt and
+// helfo_agreement are the card's (withRestClaims: «Akuttvakt» and the Helfo
+// claim only with a source); switch REST_CLAIMS_REQUIRE_SOURCE.
 function restDentalAgent(agent: DentalAgentRow, adminView: boolean) {
-  const row = withoutDentalSideColumns(withoutGoogleRating(adminView ? agent : shownDentalAgent(agent)));
-  if (adminView) return row;
+  const base = withoutDentalSideColumns(withoutGoogleRating(adminView ? agent : shownDentalAgent(agent)));
+  if (adminView) return base;
+  const row = restClaimsRequireSource() ? withRestClaims(base, agent) : base;
   if (!placesDisplayPolicyEnabled()) return { ...row, field_provenance: shownDentalFieldProvenance(agent) };
   const { field_provenance: _provenance, ...shown } = row;
   return shown;
@@ -192,8 +199,10 @@ function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
 // layer). With the rule off every caller gets the same answer and the
 // headers are as before, unless the answer has a clinic whose private
 // address is hidden (dev-request 2026-10-18-dental-privat-adresse-skjules).
+// F2-S7: while REST_CLAIMS_REQUIRE_SOURCE is on, acute_vakt, helfo_agreement
+// and their filters depend on the key too, so the same two headers are set.
 function restAdminView(req: Request, res: Response, agents: readonly DentalAgentRow[]): boolean {
-  if (placesDisplayPolicyEnabled() || agents.some((agent) => isPrivateEnkAddress(agent))) {
+  if (placesDisplayPolicyEnabled() || restClaimsRequireSource() || agents.some((agent) => isPrivateEnkAddress(agent))) {
     res.vary("X-Admin-Key");
     res.set("Cache-Control", "private");
   }
@@ -307,7 +316,12 @@ router.get("/agents", (req: Request, res: Response) => {
     // consecutive homepage-fetch failures (30d backoff) — the enrichment
     // routine's candidate listing. Absent param = unchanged behavior.
     const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
-    const rows = listDentalAgents(filter, limit, offset, { excludeParked });
+    // F2-S7: the key is read before the query, because without it the
+    // acute_vakt and helfo_agreement filters list only rows whose answer has
+    // the value asked for (sourcedClaims). With the switch off, or with the
+    // key, the options are as before.
+    const sourcedClaims = restClaimsRequireSource() && !hasAdminKey(req);
+    const rows = listDentalAgents(filter, limit, offset, sourcedClaims ? { excludeParked, sourcedClaims } : { excludeParked });
     const adminView = restAdminView(req, res, rows);
     const shownRows = rows.map((stored) => restDentalAgent(stored, adminView));
     const emailWithheld = restEmailWithheld(req, res, shownRows, adminView);

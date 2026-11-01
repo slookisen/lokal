@@ -42,8 +42,10 @@
  *   W   /sok?akutt=1 and a parsed /sok query, and the same number as stats;
  *   A   A2A message/send: parsed text, the old keyword reading (switch-off
  *       path) and structured message.data; «statistikk» gives the same number;
- *   R   GET /api/tannlege/agents and the admin list/count keep the raw flag,
- *       and acute_vakt 0 stays the raw column; no row is written;
+ *   R   GET /api/tannlege/agents with the admin key and the admin list/count
+ *       keep the raw flag (without the key it lists «Akuttvakt» only, F2-S7,
+ *       dental-rest-claims.test.ts), and acute_vakt 0 stays the raw column;
+ *       no row is written;
  *   T   timing on a 10,000-row fixture with live-like provenance sizes, for the
  *       filter, the vakt filter and getDentalStats().
  *
@@ -53,9 +55,9 @@
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
-function callRoute(router: any, path: string, query: Record<string, string> = {}): Promise<{ status: number; text: string; body: any }> {
+function callRoute(router: any, path: string, query: Record<string, string> = {}, headers: Record<string, string> = {}): Promise<{ status: number; text: string; body: any }> {
   return new Promise((resolve) => {
-    const req: any = { method: "GET", url: path, originalUrl: path, path, params: {}, query, headers: {}, ip: "127.0.0.1", get() { return undefined; } };
+    const req: any = { method: "GET", url: path, originalUrl: path, path, params: {}, query, headers, ip: "127.0.0.1", get() { return undefined; } };
     const res: any = {
       statusCode: 200,
       locals: {},
@@ -569,8 +571,20 @@ export async function runDentalAcuteFilterTests(opts: { log?: boolean } = {}): P
     // ── R: the raw flag stays for admin and enrichment ────────────────────
     {
       const route = (require("./dental") as typeof import("./dental")).default as any;
-      const r = await callRoute(route, "/agents", { acute_vakt: "1", limit: "500" });
-      eq(sorted(r.body.agents.map((a: any) => a.id)), sorted(rawFlag), "R1: GET /api/tannlege/agents?acute_vakt=1 still lists every row with the raw flag");
+      const prevAdminKey = process.env.ADMIN_KEY;
+      process.env.ADMIN_KEY = "dental-acute-filter-test-key";
+      try {
+        const r = await callRoute(route, "/agents", { acute_vakt: "1", limit: "500" }, { "x-admin-key": "dental-acute-filter-test-key" });
+        eq(sorted(r.body.agents.map((a: any) => a.id)), sorted(rawFlag), "R1: GET /api/tannlege/agents?acute_vakt=1 with the admin key still lists every row with the raw flag");
+        // F2-S7: without the key, only the rows whose card says «Akuttvakt».
+        const pub = await callRoute(route, "/agents", { acute_vakt: "1", limit: "500" });
+        const vaktRows = (db.prepare(`SELECT id FROM dental_agents WHERE ${DENTAL_ACUTE_VAKT_SQL}`).all() as Array<{ id: string }>).map((x) => x.id);
+        ok(vaktRows.length > 0 && vaktRows.length < rawFlag.length, "R1b: (the fixture has both «Akuttvakt» rows and flagged rows without a quote)");
+        eq(sorted(pub.body.agents.map((a: any) => a.id)), sorted(vaktRows), "R1c: ... without the key it lists only the «Akuttvakt» rows (F2-S7)");
+      } finally {
+        if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKey;
+      }
       eq(sorted(store.listDentalAgents({ acute_vakt: 1 }, 500, 0).map((a) => a.id)), sorted(rawFlag), "R2: listDentalAgents (admin) keeps the raw flag");
       eq(store.countDentalAgents({ acute_vakt: 1 }), rawFlag.length, "R3: countDentalAgents (admin) keeps the raw flag");
       eq(sorted(store.listPublicDentalAgents({ acute_vakt: 0 }, 500, 0).map((a) => a.id)), sorted([fokusUtenFlagg, kildeFlagg0]),

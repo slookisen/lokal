@@ -49,13 +49,15 @@ export function getDentalOpenapi(): object {
           summary: "List dental clinics (raw list)",
           description:
             "Returns a raw, paginated list of stored dental clinic records, with no public-catalog filtering. " +
-            "For searching, use /api/tannlege/discover. All parameters are optional and combinable.",
+            "For searching, use /api/tannlege/discover. All parameters are optional and combinable. " +
+            "helfo_agreement and acute_vakt claim a Helfo agreement or an emergency duty only with a stored source, " +
+            "as the clinic card does, and their filters match the values in the answer.",
           parameters: [
             { name: "q", in: "query", description: "Free-text search (name or city)", schema: { type: "string" }, example: "Oslo tannklinikk" },
             { name: "fylke", in: "query", description: "County name (e.g. «Oslo», «Vestland»)", schema: { type: "string" }, example: "Vestland" },
             { name: "specialty", in: "query", description: "Specialty slug (e.g. «kjeveortopedi», «endodonti»)", schema: { type: "string" }, example: "kjeveortopedi" },
-            { name: "helfo_agreement", in: "query", description: "\"true\" to include only Helfo-agreement clinics", schema: { type: "string", enum: ["true", "false", "unknown"] } },
-            { name: "acute_vakt", in: "query", description: "1 to include only emergency-duty clinics", schema: { type: "integer", enum: [0, 1] } },
+            { name: "helfo_agreement", in: "query", description: "Lists only clinics whose helfo_agreement in this answer has the value given. \"true\" matches only a Helfo agreement with a stored source; a stored \"true\" without a source is answered and matched as \"unknown\"", schema: { type: "string", enum: ["true", "false", "unknown"] } },
+            { name: "acute_vakt", in: "query", description: "Lists only clinics whose acute_vakt in this answer has the value given. 1 matches only an emergency duty (akuttvakt) with a stored source quote; a stored 1 without one is answered as null and not matched", schema: { type: "integer", enum: [0, 1] } },
             { name: "enrichment_state", in: "query", description: "Filter by enrichment state", schema: { type: "string", enum: ["raw", "enriched", "thin_site"] } },
             { name: "limit", in: "query", description: "Max results (default 50, max 500)", schema: { type: "integer", default: 50, minimum: 1, maximum: 500 } },
             { name: "offset", in: "query", description: "Pagination offset", schema: { type: "integer", default: 0, minimum: 0 } },
@@ -310,8 +312,8 @@ export function getDentalOpenapi(): object {
             adresse: { type: "string", nullable: true },
             telefon: { type: "string", nullable: true },
             hjemmeside: { type: "string", nullable: true },
-            helfo_agreement: { type: "string", enum: ["true", "false", "unknown"] },
-            acute_vakt: { type: "integer", nullable: true },
+            helfo_agreement: { type: "string", enum: ["true", "false", "unknown"], description: "Helfo direct-settlement agreement. \"true\" only with a stored source; a stored \"true\" without one is \"unknown\"" },
+            acute_vakt: { type: "integer", nullable: true, description: "1 only for an emergency duty (akuttvakt) with a stored source quote; a stored 1 without one is null. 0 and null as stored" },
             available_specialties: { type: "array", items: { type: "string" } },
             chain_brand: { type: "string", nullable: true },
             is_chain_member: { type: "integer" },

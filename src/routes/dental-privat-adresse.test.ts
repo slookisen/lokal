@@ -161,6 +161,9 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
   ];
   const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
   const policy = require("../services/places-display-policy") as typeof import("../services/places-display-policy");
+  // F2-S7: the raw REST answers' Helfo/akutt rule has its own switch; the
+  // "as on main" checks below turn it off together with the Places rule.
+  const restClaims = require("../services/dental-rest-claims") as typeof import("../services/dental-rest-claims");
   const { analyticsService } = require("../services/analytics-service") as typeof import("../services/analytics-service");
   const realLogWebSearch = analyticsService.logWebSearch;
   (analyticsService as any).logWebSearch = () => {};
@@ -598,6 +601,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
 
     // ── K: the Places switch off ──────────────────────────────────────────
     policy.__setPlacesDisplayPolicyForTesting(false);
+    restClaims.__setRestClaimsRequireSourceForTesting(false);
     try {
       for (const c of hiddenClinics) {
         const h = await page(c);
@@ -632,6 +636,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
       }
     } finally {
       policy.__setPlacesDisplayPolicyForTesting(null);
+      restClaims.__setRestClaimsRequireSourceForTesting(null);
     }
 
     // ── N: no DB write ────────────────────────────────────────────────────
@@ -641,6 +646,7 @@ export async function runDentalPrivatAdresseTests(opts: { log?: boolean } = {}):
     failures.push("dental privat adresse: unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     policy.__setPlacesDisplayPolicyForTesting(null);
+    restClaims.__setRestClaimsRequireSourceForTesting(null);
     (analyticsService as any).logWebSearch = realLogWebSearch;
     if (closeMcp) await closeMcp().catch(() => {});
     if (closeHttp) await closeHttp().catch(() => {});
