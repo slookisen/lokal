@@ -62,6 +62,7 @@ import { servePublicFile } from "./public-file";
 import { DENTAL_NAME_WORDS, isPublicDentalServiceHost, DENTAL_CLINIC_CLASSES } from "../services/dental-catalog-class";
 import { normalizeHostname } from "../services/dental-hjemmeside-classifier";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { isHiddenImportRow } from "../services/dental-import-display";
 import { shownDentalAgent } from "../services/dental-places-display";
 import { placesDisplayPolicyEnabled } from "../services/places-display-policy";
 import { planDentalSearch, MAX_POSTSTED_IN, MAX_TERM_CHARS, type DentalSearchPlan, type DentalSearchTolkning } from "../services/dental-query-parser";
@@ -1815,7 +1816,11 @@ function renderClinicProfile(
   // dev-request 2026-10-01-dental-testrad-ut-av-offentlig-visning: the
   // synthetic schema-probe row 404s exactly like a rejected clinic, on both
   // /klinikk/id/:id and /klinikk/:slug (both render through here).
-  if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id)) {
+  // A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+  // (F2-S10): so does a row the May 2026 directory import added on its own
+  // (no org.nr., no Brreg fields): its name came from the import too, and a
+  // noindex page would still show it (switch IMPORT_VALUES_HIDDEN).
+  if (agent.verification_status === "rejected" || isDentalSyntheticProbeId(agent.id) || isHiddenImportRow(stored)) {
     sendDentalNotFound(res,
       `<div class="container"><div class="empty-state" style="padding:80px 0"><h3>Klinikk ikke funnet</h3><p>Siden du leter etter finnes ikke.</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div>`,
       { title: "Ikke funnet — Finn-tannlege.com" }

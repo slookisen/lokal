@@ -46,6 +46,16 @@ import conversationUiRouter, {
   renderTranscriptBody,
 } from "../src/routes/conversation-ui";
 import { swapOutModules, swappedOutModuleIds, withModulesSwappedOut } from "./module-cache";
+import { __setImportValuesHiddenForTesting } from "../src/services/dental-import-display";
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon
+// (F2-S10): with IMPORT_VALUES_HIDDEN on, a dental row without an org.nr.,
+// organisasjonsform and naeringskode is not public. Most dental fixtures in
+// this file and the suites it runs are such rows (they predate F2-S10), so
+// the run starts with the switch off, which gives the answers as before
+// F2-S10. src/services/dental-import-display.test.ts runs on the default
+// (on) and puts this back when it is done.
+__setImportValuesHiddenForTesting(false);
 
 // ─────────────────────────────────────────────────────────────────────────
 // SHARED GLOBAL STATE — read this before adding a new test block.
@@ -39831,6 +39841,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("dental-verified-claim: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S10,
+// Daniel's choice B on question 32): no public surface shows a value only the
+// May 2026 directory import gave (dental-import-display.ts): the rows without
+// an org.nr. are not public, and its addresses and websites on rows with one
+// are hidden until a real source confirms them. Swaps DENTAL_DB_PATH
+// (:memory:), ADMIN_KEY and the dental modules (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dental-import-display: verdier fra katalogimporten vises ikke (F2-S10) ──");
+  try {
+    const { runDentalImportDisplayTests } = require("../src/services/dental-import-display.test") as
+      typeof import("../src/services/dental-import-display.test");
+    const did = await runDentalImportDisplayTests({ log: false });
+    passed += did.passed;
+    failed += did.failed;
+    for (const f of did.failures) failures.push("dental-import-display: " + f);
+    console.log(`  dental-import-display: ${did.passed} passed, ${did.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-import-display: unexpected error: " + String(err?.message || err));
   }
 });
 

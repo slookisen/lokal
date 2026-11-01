@@ -56,6 +56,7 @@ import { restClaimsRequireSource, withRestClaims } from "../services/dental-rest
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS, isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { importValuesHidden, isHiddenImportRow } from "../services/dental-import-display";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import {
   placesPeriodsToOpeningHours,
@@ -201,8 +202,10 @@ function restSummaryProvenance(agent: DentalAgentRow, adminView: boolean) {
 // address is hidden (dev-request 2026-10-18-dental-privat-adresse-skjules).
 // F2-S7: while REST_CLAIMS_REQUIRE_SOURCE is on, acute_vakt, helfo_agreement
 // and their filters depend on the key too, so the same two headers are set.
+// F2-S10 (same dev-request): while IMPORT_VALUES_HIDDEN is on, so do the rows
+// listed and the import's address and website.
 function restAdminView(req: Request, res: Response, agents: readonly DentalAgentRow[]): boolean {
-  if (placesDisplayPolicyEnabled() || restClaimsRequireSource() || agents.some((agent) => isPrivateEnkAddress(agent))) {
+  if (placesDisplayPolicyEnabled() || restClaimsRequireSource() || importValuesHidden() || agents.some((agent) => isPrivateEnkAddress(agent))) {
     res.vary("X-Admin-Key");
     res.set("Cache-Control", "private");
   }
@@ -321,7 +324,16 @@ router.get("/agents", (req: Request, res: Response) => {
     // the value asked for (sourcedClaims). With the switch off, or with the
     // key, the options are as before.
     const sourcedClaims = restClaimsRequireSource() && !hasAdminKey(req);
-    const rows = listDentalAgents(filter, limit, offset, sourcedClaims ? { excludeParked, sourcedClaims } : { excludeParked });
+    // F2-S10 (same dev-request, Daniel's choice B on question 32): without
+    // the key, the rows the May 2026 directory import added on its own are
+    // not listed (and `count` follows); with it, or with IMPORT_VALUES_HIDDEN
+    // off, the options are as before.
+    const excludeImportOnly = importValuesHidden() && !hasAdminKey(req);
+    const rows = listDentalAgents(filter, limit, offset, {
+      excludeParked,
+      ...(sourcedClaims ? { sourcedClaims } : {}),
+      ...(excludeImportOnly ? { excludeImportOnly } : {}),
+    });
     const adminView = restAdminView(req, res, rows);
     const shownRows = rows.map((stored) => restDentalAgent(stored, adminView));
     const emailWithheld = restEmailWithheld(req, res, shownRows, adminView);
@@ -372,6 +384,13 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
     .get(agent.id) as { last_verified_at: string | null } | undefined;
   const adminView = restAdminView(req, res, [agent]);
+  // F2-S10: without the key a row the May 2026 directory import added on its
+  // own is not found; with it the answer is as stored (the enrichment and
+  // admin read-back). The headers restAdminView set stay on the 404.
+  if (!adminView && isHiddenImportRow(agent)) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
   const stored = restDentalAgent(agent, adminView);
   const emailWithheld = restEmailWithheld(req, res, [stored], adminView)?.has(stored.id) === true;
   const summaryProvenance = restSummaryProvenance(agent, adminView);
