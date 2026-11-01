@@ -1686,7 +1686,11 @@ class MarketplaceRegistry {
   // S2c-2: the owner's visibility choice applies here too (visibility.profile;
   // with audience "ai" also visibility.ai_assistants). ignoreOwnerPause skips
   // it like the pause — the owner's own read is not a public view.
-  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean; audience?: OwnerVisibilityAudience } = {}): boolean {
+  // claimTestFixtureInfo: GET /agents/:id/info ONLY (dev-request
+  // 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6, option A) — the armed
+  // claim-test fixture is not quarantined there (agent-visibility.ts,
+  // isArmedClaimTestFixtureRow). Every other caller leaves it unset.
+  isQuarantinedFromPublicView(agentId: string, opts: { ignoreOwnerPause?: boolean; audience?: OwnerVisibilityAudience; claimTestFixtureInfo?: boolean } = {}): boolean {
     const db = getDb();
     // Økologi S0: a delisted id (agent-visibility.ts) is never a public view.
     if (isDelistedAgentId(agentId)) return true;
@@ -1701,7 +1705,8 @@ class MarketplaceRegistry {
     // flag off = the quarantine rule this method has always applied; flag
     // OWNER_VISIBILITY_ENFORCE_BY_ID on = also is_active.
     const ownerChoice = ownerVisibilityEnforced() && !opts.ignoreOwnerPause ? { agentId, audience: opts.audience } : {};
-    return !isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice });
+    const claimFixture = opts.claimTestFixtureInfo === true ? { claimTestFixtureInfo: true } : {};
+    return !isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice, ...claimFixture });
   }
 
   getAgentByApiKey(apiKey: string): RegisteredAgent | undefined {

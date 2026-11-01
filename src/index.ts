@@ -138,6 +138,7 @@ import adminAgentsDuplicateMergeRoutes from "./routes/admin-agents-duplicate-mer
 import adminAgentsDeactivateRoutes from "./routes/admin-agents-deactivate";
 import adminAgentsBusinessTypeRoutes from "./routes/admin-agents-business-type";
 import adminTestProducerRoutes from "./routes/admin-test-producer";
+import adminTestClaimFixtureRoutes from "./routes/admin-test-claim-fixture";
 import adminOwnerFeaturesInterestRoutes from "./routes/admin-owner-features-interest";
 import adminOwnerFeaturesSwitchProbeRoutes from "./routes/admin-owner-features-switch-probe";
 import adminGardssalgSwitchProbeRoutes from "./routes/admin-gardssalg-switch-probe";
@@ -958,6 +959,10 @@ app.use("/admin/agents/business-type", adminLimiter, adminAgentsBusinessTypeRout
 // orders (dev-request 2026-10-01-rfb-skjult-testprodusent-for-ordreflyt):
 // dry-run default, arm/retire, refuses every non-fixture row.
 app.use("/admin/test-producer", adminLimiter, adminTestProducerRoutes);
+// POST /admin/test-claim-fixture — the ONE hidden, UNCLAIMED claim-test profile
+// (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6): dry-run
+// default, arm (create/reset) / retire, refuses every other row.
+app.use("/admin/test-claim-fixture", adminLimiter, adminTestClaimFixtureRoutes);
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2e: «Gi meg beskjed» counts per planned key (read-only).
 app.use("/admin/owner-features/interest", adminLimiter, adminOwnerFeaturesInterestRoutes);
 // S2d-3: the switch probe («bryterprobe») on the hidden test producer — behind

@@ -36,6 +36,7 @@ import {
   normalizeEnrichmentVertical,
 } from "../services/enrichment-write-pause";
 import { slugify } from "../utils/slug";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 // POST /:id/slug-alias below (dev-request 2026-09-03-rfb-korrigering-navn-
 // sted-kategorier, Mål 1): reuses the SAME insertAgentSlugAlias helper that
 // updateAgent()'s rename hook writes through internally — no duplicated SQL
@@ -1576,35 +1577,39 @@ export interface AgentOrgNrReviewQueueEntry {
 // Exported (2026-08-22-rfb-website-email-selvforsyning) so the sibling
 // selvforsyning route's own org_nr-missing cohort selector reuses this EXACT
 // predicate instead of drifting from it.
-export function agentsOrgNrBackfillCandidateWhereSql(): string {
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the
+// catalog_hidden test rows (the order fixture and the unclaimed claim-test
+// fixture) are never candidates — catalogHiddenIdExclusionSql, the
+// verifier's own exclusion; "" (the exact SQL as before) when no row is hidden.
+export function agentsOrgNrBackfillCandidateWhereSql(db: ReturnType<typeof getDb>): string {
   return `
     a.role = 'producer'
     AND a.is_active = 1
     AND a.umbrella_type IS NULL
     AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
     AND (a.org_nr IS NULL OR TRIM(a.org_nr) = '')
-    AND a.claimed_at IS NULL
+    AND a.claimed_at IS NULL${catalogHiddenIdExclusionSql(db, "a")}
   `;
 }
 
-function agentsOrgNrBackfillSelectSql(): string {
+function agentsOrgNrBackfillSelectSql(db: ReturnType<typeof getDb>): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.claimed_at AS claimed_at,
            k.postal_code AS postal_code, a.city AS city
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-     WHERE ${agentsOrgNrBackfillCandidateWhereSql()}
+     WHERE ${agentsOrgNrBackfillCandidateWhereSql(db)}
   `;
 }
 
 function countAgentsOrgNrBackfillCandidates(db: ReturnType<typeof getDb>): number {
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${agentsOrgNrBackfillSelectSql()})`).get() as { n: number };
+  const row = db.prepare(`SELECT COUNT(*) AS n FROM (${agentsOrgNrBackfillSelectSql(db)})`).get() as { n: number };
   return row?.n ?? 0;
 }
 
 function fetchAgentsOrgNrBackfillBatch(db: ReturnType<typeof getDb>, cap: number): AgentOrgNrBackfillTargetRow[] {
   return db
-    .prepare(`${agentsOrgNrBackfillSelectSql()} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${agentsOrgNrBackfillSelectSql(db)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(cap) as AgentOrgNrBackfillTargetRow[];
 }
 
@@ -1613,7 +1618,9 @@ function fetchAgentsOrgNrBackfillBatch(db: ReturnType<typeof getDb>, cap: number
 // getGardssalgProviderOrgnrTarget's override semantics: an admin can force a
 // lookup attempt on any RFB producer agent; eligibility (lock/already-filled)
 // is still enforced at write time, just reported as a specific `unresolved`
-// reason rather than silently omitted from the target list.
+// reason rather than silently omitted from the target list. The
+// catalog_hidden test rows are the one exception (AC6 above): never a target,
+// not even by id.
 function getAgentOrgNrBackfillTarget(db: ReturnType<typeof getDb>, agentId: string): AgentOrgNrBackfillTargetRow | null {
   const row = db
     .prepare(
@@ -1621,7 +1628,7 @@ function getAgentOrgNrBackfillTarget(db: ReturnType<typeof getDb>, agentId: stri
               k.postal_code AS postal_code, a.city AS city
          FROM agents a
          LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'`,
+        WHERE a.id = ? AND a.role = 'producer' AND COALESCE(a.vertical_id, 'rfb') = 'rfb'${catalogHiddenIdExclusionSql(db, "a")}`,
     )
     .get(agentId) as AgentOrgNrBackfillTargetRow | undefined;
   return row ?? null;

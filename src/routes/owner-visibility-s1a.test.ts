@@ -318,7 +318,8 @@ export async function runOwnerVisibilityS1aTests(opts: { log?: boolean } = {}): 
         ["lokal_info + MCP resource", "routes/mcp.ts", ['isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", allowCatalogHidden: true, audience: "ai" })', 'isAgentIdPubliclyVisible(getDb(), agentId, { surface: "ungated", audience: "ai" })']],
         ["/metrics", "routes/a2a.ts", ['isAgentIdPubliclyVisible(getDb(), req.params.id as string, { surface: "ungated" })']],
         ["ACP feeds", "routes/marketplace-catalog.ts", ['publiclyVisibleSql("a")']],
-        ["card/info/vcard/trust/stats (registry)", "services/marketplace-registry.ts", ['isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice })', "activeVettedListableSql()"]],
+        // AC6 of 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post: + the claim-test fixture's /info-only option.
+        ["card/info/vcard/trust/stats (registry)", "services/marketplace-registry.ts", ['isAgentPubliclyVisible(row, { surface: "gated", ...ownerChoice, ...claimFixture })', "activeVettedListableSql()"]],
       ];
       for (const [name, file, snippets] of needs) {
         const src = read(file);
@@ -328,7 +329,9 @@ export async function runOwnerVisibilityS1aTests(opts: { log?: boolean } = {}): 
       const mp = read("routes/marketplace.ts");
       for (const route of ["vcard", "card", "info", "trust"]) {
         const at = mp.indexOf(`router.get("/agents/:id/${route}"`);
-        assertTrue(at > 0 && mp.slice(at, at + 1800).includes("marketplaceRegistry.isQuarantinedFromPublicView(agentId)"), `src-3: /agents/:id/${route} gates through the registry predicate`);
+        // /info passes the claim-test fixture's one exception (INFO_VIEW); the others pass nothing.
+        const gate = route === "info" ? "marketplaceRegistry.isQuarantinedFromPublicView(agentId, INFO_VIEW)" : "marketplaceRegistry.isQuarantinedFromPublicView(agentId)";
+        assertTrue(at > 0 && mp.slice(at, at + 1800).includes(gate), `src-3: /agents/:id/${route} gates through the registry predicate`);
       }
       const disc = read("routes/discovery.ts");
       const seo = read("routes/seo.ts");
