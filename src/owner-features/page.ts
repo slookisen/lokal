@@ -30,6 +30,7 @@ import {
   OWNER_FEATURE_GROUPS,
   OWNER_FEATURE_REGISTRY,
   findOwnerFeature,
+  ownerFeatureEntryForEnv,
   ownerFeatureStatus,
   visibleOwnerFeatureOptions,
   type LocalizedText,
@@ -616,7 +617,7 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
     if (confirm) ctx.confirmPlaced = true;
   }
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(e.description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }
@@ -671,7 +672,7 @@ function plannedHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
       : rowForm(m, "/interesse", "planlagt",
           `<input type="hidden" name="key" value="${esc(e.key)}"><button type="submit" class="ep-btn ep-btn-secondary">Gi meg beskjed</button>`);
     return `<li class="mv-item mv-item-planned" id="${esc(ownerPlannedAnchor(e.key))}" data-planned-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(e.description.no)}</p></div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong> <span class="mv-badge">${esc(groupLabel.get(e.group) ?? "")}</span><p class="mv-desc">${esc(ownerFeatureEntryForEnv(e).description.no)}</p></div>
           <div class="mv-item-ctl">${ctl}</div>${noticeAtHtml(ctx, ownerPlannedAnchor(e.key))}
         </li>`;
   }).join("");

@@ -213,6 +213,7 @@ import {
   refreshOwnedProfile,
   resolveOwnerRefreshCap,
   tallyOwnerRefreshRow,
+  judgeUnavailableStamp,
   type OwnerRefreshDeps,
   type OwnerRefreshPreview,
   type OwnerRefreshRowOutcome,
@@ -2670,6 +2671,8 @@ async function runSteps(rc: RunContext): Promise<void> {
           settleLlm(reserved, out.outcome === "timeout" ? Math.max(reserved, actual) : actual);
           tallyOwnerRefreshRow(orr, row, out);
           if (!out.transient) stampAttempt(db, row.id, OWNER_REFRESH_STEP, clock(), out.outcome, report.run_id);
+          // An unavailable about judge: the streak (due again next night until it is full).
+          else if (out.judge_unavailable) stampAttempt(db, row.id, OWNER_REFRESH_STEP, clock(), judgeUnavailableStamp(row.last_outcome), report.run_id);
         }
       } catch (err) {
         orr.errors.push(`owner refresh aborted: ${errMessage(err)}`);
