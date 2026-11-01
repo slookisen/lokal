@@ -49748,6 +49748,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring, skive B
+// (AC2): refreshHomepageContent's about judges (quality → facts → better than
+// stored, stubbed; the real judges against a stubbed Messages API for the
+// infra failures), the deadline rule, and the never-replace rule for a
+// non-empty stored category list — function, route with explicit agentIds,
+// and the morning send's refreshRfbCandidateHomepage. Pins its own in-memory
+// DB + global fetch stub (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring (skive B): homepage-content-refresh about judges ──");
+  try {
+    const { runHomepageContentRefreshAboutJudgesTests } =
+      require("../src/routes/homepage-content-refresh-about-judges.test") as
+        typeof import("../src/routes/homepage-content-refresh-about-judges.test");
+    const haj = await runHomepageContentRefreshAboutJudgesTests({ log: false });
+    passed += haj.passed;
+    failed += haj.failed;
+    for (const f of haj.failures) failures.push("homepage-content-refresh-about-judges: " + f);
+    console.log(`  homepage-content-refresh-about-judges: ${haj.passed} passed, ${haj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-content-refresh-about-judges: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter: the
 // refresh writes categories only, category-name products are known-bad, the
 // auto-select takes uncorroborated rows, the gate names the stopped rows.

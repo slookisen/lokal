@@ -86,6 +86,9 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
+// skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+// LLM judges approve everything here — this suite tests other guards.
+import { useApproveAllAboutJudges } from "../../tests/helpers/hcr-about-judges";
 
 export interface TestSummary {
   passed: number;
@@ -155,6 +158,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  const restoreAboutJudges = useApproveAllAboutJudges();
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -2039,6 +2043,7 @@ export async function runRfbMarketingDailyTests(opts: { log?: boolean } = {}): P
     failed++;
     failures.push(`rfb-marketing-daily: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
+    restoreAboutJudges();
     daily.__setRfbMarketingHealthProbeForTesting(null);
     daily.__setRfbMarketingRefreshFetchForTesting(null);
     emailSvc.isConfigured = origConfigured;

@@ -140,6 +140,16 @@ import { fetchPage, discoverContentLinks, type FetchPageResult, type FetchPersis
 // down, which DOES have real source-page text on hand).
 import { classifyContactCandidateDefect } from "../services/contact-candidate-judge";
 import { checkAboutCandidateSubstantiatedBySource } from "../services/about-source-substantiation";
+// dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring (skive B):
+// the three LLM judges refreshHomepageContent runs on an about candidate.
+import { judgeRfbAboutCandidate, isRfbJudgeInfraFailure, type RfbJudgeVerdict } from "../services/rfb-about-judge";
+import {
+  judgeAboutAgainstPages,
+  judgePageTextFromHtml,
+  type AboutJudgePage,
+  type AboutJudgeVerdict,
+} from "../services/about-spot-check-judge";
+import { judgeAboutBetterThanStored, type AboutComparisonVerdict } from "../services/about-comparison-judge";
 // dev-request 2026-08-24-produsentbeskrivelser-skrapt-js-opprydding (round-2
 // review finding): THIS is the endpoint lokal-agent-enrichment PUTs into —
 // the exact write path the "Helios Trondheim" defect class targets — and it
@@ -2011,7 +2021,15 @@ async function hcrFetchHtml(url: string, io?: HcrFetchIo): Promise<string | null
  * null only if the primary homepage cannot be fetched.
  */
 type HcrFetchOutcome =
-  | { ok: true; primaryHtml: string; combinedHtml: string; fetchUrl: string; finalUrl: string }
+  | {
+      ok: true;
+      primaryHtml: string;
+      combinedHtml: string;
+      fetchUrl: string;
+      finalUrl: string;
+      /** Every page fetched (homepage first, then the sub-pages that answered) — the facts judge's input. */
+      pages: Array<{ url: string; html: string }>;
+    }
   | { ok: false; reason: string; persistence: FetchPersistence; status: number | null };
 
 async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Promise<HcrFetchOutcome> {
@@ -2022,6 +2040,7 @@ async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Pr
   }
   const primaryHtml = primary.html;
   let combinedHtml = primaryHtml;
+  const pages: Array<{ url: string; html: string }> = [{ url: primary.finalUrl || fetchUrl, html: primaryHtml }];
   // Link-driven sub-page crawl with the legacy fixed paths as fallback — see
   // buildPageEvidence in services/search-enrich.ts for the measurement that
   // motivated it (12/12 404s on the fixed guesses across three live sites),
@@ -2035,12 +2054,15 @@ async function hcrFetchHomepageContent(homepageUrl: string, io?: HcrFetchIo): Pr
       // No sub-page is started after a caller's deadline.
       if (io?.deadlineAt !== undefined && Date.now() >= io.deadlineAt) break;
       const sub = await hcrFetchHtml(target, io);
-      if (sub) combinedHtml += "\n" + sub;
+      if (sub) {
+        combinedHtml += "\n" + sub;
+        pages.push({ url: target, html: sub });
+      }
     }
   } catch {
     /* malformed URL — primary homepage content still stands */
   }
-  return { ok: true, primaryHtml, combinedHtml, fetchUrl, finalUrl: primary.finalUrl || fetchUrl };
+  return { ok: true, primaryHtml, combinedHtml, fetchUrl, finalUrl: primary.finalUrl || fetchUrl, pages };
 }
 
 type HcrTargetRow = {
@@ -2117,6 +2139,127 @@ export interface HomepageContentRefreshResult {
   skipped_unsubstantiated: Array<{ agent_id: string; reason: string }>;
   errors: Array<{ agent_id: string; error: string }>;
   parked_now: string[];
+  /** One entry per profile whose about candidate went to the LLM judges (skive B). */
+  about_reviews: Array<{ agent_id: string; about_review: HcrAboutReview }>;
+  /** Quality judge said AVVIS. */
+  about_judge_rejected: number;
+  /** Facts judge: the page does not support the candidate. */
+  about_not_supported: number;
+  /** Comparison judge: not better than the stored text. */
+  about_not_better: number;
+  /** A judge could not answer (missing key, timeout, non-200, ambiguous reply). */
+  about_judge_unavailable: number;
+}
+
+/**
+ * What the about judges made of one profile's candidate (skive B). `facts` /
+ * `comparison` are null when that judge was not called (an earlier judge said
+ * no, the stored about is empty, or the deadline was too close).
+ */
+export interface HcrAboutReview {
+  candidate: string;
+  quality: { approved: boolean; reasoning: string };
+  facts: { supported: boolean; unsupported_claims: string[] } | null;
+  comparison: { verdict: string; reasoning: string } | null;
+  decision: "write" | "skip";
+  /** Set when a judge could not answer: which one, and why (missing key, timeout, …). */
+  unavailable?: string;
+}
+
+/** The three about judges refreshHomepageContent calls — injectable for tests. Never expected to throw. */
+export interface HcrAboutJudges {
+  quality: (candidate: string, producerName: string, io: { signal?: AbortSignal }) => Promise<RfbJudgeVerdict>;
+  facts: (params: { about: string; pages: AboutJudgePage[] }, io: { signal?: AbortSignal }) => Promise<AboutJudgeVerdict>;
+  comparison: (
+    params: { stored: string; candidate: string; producerName: string },
+    io: { signal?: AbortSignal },
+  ) => Promise<AboutComparisonVerdict>;
+  /** Per-call timeout (ms); a judge is not started with less than this left before deadlineAt. */
+  timeoutMs?: number;
+}
+
+/**
+ * Per-call timeout (ms) of each about judge inside refreshHomepageContent. A
+ * judge call is not STARTED with less than this left before deadlineAt (the
+ * route's budget is 40 s, the morning send's 20 s per candidate).
+ */
+export const HCR_ABOUT_JUDGE_TIMEOUT_MS = 8_000;
+
+/** Production judges: the real LLM calls. */
+export const HCR_DEFAULT_ABOUT_JUDGES: HcrAboutJudges = {
+  quality: (candidate, producerName, io) => judgeRfbAboutCandidate(candidate, producerName, "about", io),
+  facts: (params, io) => judgeAboutAgainstPages(params, io),
+  comparison: (params, io) => judgeAboutBetterThanStored(params, io),
+  timeoutMs: HCR_ABOUT_JUDGE_TIMEOUT_MS,
+};
+
+/**
+ * Test seam for the callers that cannot pass HomepageContentRefreshOptions.aboutJudges
+ * themselves (the route, the morning send's refreshRfbCandidateHomepage).
+ * null restores the real judges. Kept on globalThis (Symbol.for) rather than
+ * in module state because several suites delete this module from
+ * require.cache and load a fresh copy; the override must reach that copy too.
+ */
+const HCR_ABOUT_JUDGES_OVERRIDE = Symbol.for("lokal.admin-knowledge.hcrAboutJudgesOverride");
+export function __setHcrAboutJudgesForTesting(judges: HcrAboutJudges | null): void {
+  (globalThis as Record<symbol, unknown>)[HCR_ABOUT_JUDGES_OVERRIDE] = judges ?? undefined;
+}
+function hcrAboutJudgesOverride(): HcrAboutJudges | null {
+  return ((globalThis as Record<symbol, unknown>)[HCR_ABOUT_JUDGES_OVERRIDE] as HcrAboutJudges | undefined) ?? null;
+}
+
+/** skipped_unsubstantiated reasons for an about candidate the judges stopped (exact strings, skive B). */
+export const HCR_ABOUT_REASON_QUALITY_REJECTED = "about: kvalitetsdommer AVVIS";
+export const HCR_ABOUT_REASON_NOT_SUPPORTED = "about: ikke støttet av siden";
+export const HCR_ABOUT_REASON_NOT_BETTER = "about: ikke bedre enn lagret";
+export const HCR_ABOUT_REASON_JUDGE_UNAVAILABLE = "about: dommer utilgjengelig";
+/** The stored about changed while the judges were running: the verdict no longer applies, nothing written. */
+export const HCR_ABOUT_REASON_STORED_CHANGED = "about: lagret tekst endret under oppfriskningen";
+
+/**
+ * Would canCorrectFactualField let the homepage about candidate be written to
+ * `about` OR `description`? Same inputs as the write gate below (provenance,
+ * website_ownership, curated lock); used only to skip judge calls whose
+ * verdict could not change anything. Junk JSON reads as {} — as below.
+ */
+function hcrAboutGateMayWrite(
+  fieldProvenanceJson: string | null | undefined,
+  curatedFieldsJson: string | null | undefined,
+  value: string,
+  sourceUrl: string,
+): boolean {
+  const parse = (j: string | null | undefined): Record<string, unknown> => {
+    if (!j) return {};
+    try {
+      const v = JSON.parse(j);
+      return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+  const prov = parse(fieldProvenanceJson);
+  const curated = parse(curatedFieldsJson);
+  const woUnverified =
+    !!prov.website_ownership &&
+    typeof prov.website_ownership === "object" &&
+    (prov.website_ownership as Record<string, unknown>).status === "unverified";
+  return ["about", "description"].some(
+    (field) =>
+      canCorrectFactualField({
+        field,
+        existingFieldProvenance: prov[field],
+        websiteOwnershipUnverified: woUnverified,
+        incomingFieldProvenance: [
+          { source_type: "website_homepage", value, fetched_at: new Date().toISOString(), source_url: sourceUrl },
+        ],
+        isCurated: !!curated[field],
+      }).allowed,
+  );
+}
+
+/** Whitespace-collapsed, lower-cased — "is the candidate the stored text?" */
+function hcrNormalizeAbout(s: string | null | undefined): string {
+  return String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 export interface HomepageContentRefreshOptions {
@@ -2139,6 +2282,13 @@ export interface HomepageContentRefreshOptions {
    */
   fetchImpl?: typeof fetch;
   /**
+   * NOTE (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-
+   * forverring, skive B): the rule below now applies to EVERY call, set or
+   * not — a non-empty stored category list is never replaced, whoever calls
+   * (an already corroborated list is left exactly as stored). The flag is
+   * kept so existing callers compile and read the same; it no longer changes
+   * anything. Historical description follows.
+   *
    * NEVER set by the morning send or for the route's explicit agentIds (unset =
    * byte-identical behaviour). Set by the nightly RFB enrichment job (R6,
    * services/rfb-enrichment-nightly.ts) through refreshRfbCandidateHomepage,
@@ -2205,6 +2355,12 @@ export interface HomepageContentRefreshOptions {
    * fetch.
    */
   extractProductNames?: HcrProductNamesExtractor;
+  /**
+   * The about judges (dev-request 2026-10-28-rfb-uttrekk-adresse-og-
+   * hjemmeside-forverring, skive B). Unset = the real LLM judges
+   * (HCR_DEFAULT_ABOUT_JUDGES), or the test override.
+   */
+  aboutJudges?: HcrAboutJudges;
 }
 
 /** What a product-name extractor made of a page (R6: the gårdssalg LLM helper). */
@@ -2616,6 +2772,11 @@ export async function refreshHomepageContent(
   // dropped because summarizeAbout()'s output could not be substantiated
   // against the fetched page's own text — see the write-set loop below.
   const skippedUnsubstantiated: Array<{ agent_id: string; reason: string }> = [];
+  // dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring (skive B).
+  const aboutReviews: Array<{ agent_id: string; about_review: HcrAboutReview }> = [];
+  const aboutTally = { rejected: 0, not_supported: 0, not_better: 0, unavailable: 0 };
+  const aboutJudges = opts.aboutJudges ?? hcrAboutJudgesOverride() ?? HCR_DEFAULT_ABOUT_JUDGES;
+  const aboutJudgeTimeoutMs = aboutJudges.timeoutMs ?? HCR_ABOUT_JUDGE_TIMEOUT_MS;
 
   // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
   const HCR_CONCURRENCY = 3;
@@ -2754,7 +2915,7 @@ export async function refreshHomepageContent(
       return;
     }
     if (!dryRun) recordHcrFetchSuccess(agentId);
-    const { primaryHtml, combinedHtml, fetchUrl, finalUrl } = fetched;
+    const { primaryHtml, combinedHtml, fetchUrl, finalUrl, pages: fetchedPages } = fetched;
     // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
     // beskrivelser: THIS loop is the path that wrote the live casino copy
     // (provenance last_verified 2026-09-11..16 on all four hijacked
@@ -2964,6 +3125,164 @@ export async function refreshHomepageContent(
       }
     }
 
+    // ── About judges (dev-request 2026-10-28-rfb-uttrekk-adresse-og-
+    // hjemmeside-forverring, skive B) ─────────────────────────────────────
+    // The deterministic guards above only say the candidate is real prose
+    // FROM this page; they never compared it with what is stored, so a
+    // specific stored text could be replaced by a generic one (Sjøvold
+    // 2026-10-28: 193 → 113 chars about retail formats). Before an
+    // about/description candidate may be written, in this order and each
+    // only when the previous approved:
+    //   1. quality  — judgeRfbAboutCandidate must say GODKJENN;
+    //   2. facts    — judgeAboutAgainstPages against the pages fetched above
+    //                 (no new fetch) must say SUPPORTED;
+    //   3. better   — when a non-empty stored about differs from the
+    //                 candidate, the comparison judge must say BEDRE.
+    // Anything else (a "no", or a judge that could not answer) drops BOTH
+    // candidates (they share one value) with a reason in
+    // skipped_unsubstantiated. A candidate equal to the stored text is
+    // dropped without any judge call. Judges are only asked when
+    // canCorrectFactualField would let at least one of the two fields be
+    // written (cost; a refused write needs no verdict). A judge is never
+    // STARTED with less than its timeout left before deadlineAt: the profile
+    // is then not reached (refresh_deadline_exceeded, transient — no strike,
+    // no parking, no rotation stamp), exactly like a late fetch.
+    let aboutReview: HcrAboutReview | null = null;
+    let judgedStoredAbout: string | null = null;
+    const aboutCandidate = candidates.find((c) => c.field === "about");
+    if (aboutCandidate) {
+      const candidateText = String(aboutCandidate.value);
+      const dropAboutCandidates = () => {
+        for (let i = candidates.length - 1; i >= 0; i--) {
+          if (candidates[i].field === "about" || candidates[i].field === "description") candidates.splice(i, 1);
+        }
+      };
+      const pre = db
+        .prepare(
+          `SELECT a.name AS name, k.about AS about, k.field_provenance AS field_provenance, k.curated_fields AS curated_fields
+             FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id = ?`,
+        )
+        .get(agentId) as
+        | { name: string | null; about: string | null; field_provenance: string | null; curated_fields: string | null }
+        | undefined;
+      const storedAbout = pre?.about ?? "";
+      const storedNorm = hcrNormalizeAbout(storedAbout);
+      if (storedNorm !== "" && storedNorm === hcrNormalizeAbout(candidateText)) {
+        dropAboutCandidates(); // the stored text already: no judge, no write
+      } else if (hcrAboutGateMayWrite(pre?.field_provenance, pre?.curated_fields, candidateText, aboutCandidate.sourceUrl ?? fetchUrl)) {
+        const producerName = (t.name ?? pre?.name ?? "").trim();
+        const review: HcrAboutReview = {
+          candidate: candidateText,
+          quality: { approved: false, reasoning: "" },
+          facts: null,
+          comparison: null,
+          decision: "skip",
+        };
+        aboutReview = review;
+        aboutReviews.push({ agent_id: agentId, about_review: review });
+        const tooCloseToDeadline = () =>
+          opts.deadlineAt !== undefined && opts.deadlineAt - Date.now() < aboutJudgeTimeoutMs;
+        const pastDeadline = () =>
+          opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt - HCR_DEADLINE_SLACK_MS;
+        const notReached = (detail: string) => {
+          errors.push({ agent_id: agentId, error: `${HCR_DEADLINE_EXCEEDED} for ${t.homepage_url} (${detail})` });
+        };
+        const reject = (reason: string, counter: keyof typeof aboutTally, detail: string) => {
+          aboutTally[counter] += 1;
+          dropAboutCandidates();
+          skippedUnsubstantiated.push({ agent_id: agentId, reason });
+          console.log(`[homepage-content-refresh] ${agentId} about/description candidate REJECTED — ${reason}: ${detail}`);
+        };
+        const unavailable = (judge: string, detail: string) => {
+          review.unavailable = `${judge}: ${detail}`;
+          reject(HCR_ABOUT_REASON_JUDGE_UNAVAILABLE, "unavailable", `${judge}: ${detail}`);
+        };
+        const io = () => ({ signal: AbortSignal.timeout(aboutJudgeTimeoutMs) });
+
+        // 1. quality
+        if (tooCloseToDeadline()) {
+          review.quality = { approved: false, reasoning: "ikke startet: for lite tid igjen før fristen" };
+          notReached("about quality judge not started");
+          return;
+        }
+        let quality: RfbJudgeVerdict;
+        try {
+          quality = await aboutJudges.quality(candidateText, producerName, io());
+        } catch (e: any) {
+          quality = { approved: false, reasoning: `dommer kastet: ${e?.message ?? String(e)} — avvist fail-closed` };
+        }
+        if (pastDeadline()) {
+          notReached("about quality judge answered after the deadline");
+          return;
+        }
+        review.quality = { approved: quality.approved, reasoning: quality.reasoning };
+        let approved = false;
+        if (!quality.approved) {
+          if (isRfbJudgeInfraFailure(quality)) unavailable("quality", quality.reasoning);
+          else reject(HCR_ABOUT_REASON_QUALITY_REJECTED, "rejected", quality.reasoning);
+        } else {
+          // 2. facts against the pages fetched above
+          if (tooCloseToDeadline()) {
+            notReached("about facts judge not started");
+            return;
+          }
+          let facts: AboutJudgeVerdict;
+          try {
+            facts = await aboutJudges.facts(
+              { about: candidateText, pages: fetchedPages.map((p) => ({ url: p.url, text: judgePageTextFromHtml(p.html) })) },
+              io(),
+            );
+          } catch (e: any) {
+            facts = { ok: false, failure: "error", reason: `dommer kastet: ${e?.message ?? String(e)}` };
+          }
+          if (pastDeadline()) {
+            notReached("about facts judge answered after the deadline");
+            return;
+          }
+          if (!facts.ok) {
+            unavailable("facts", facts.reason);
+          } else {
+            review.facts = { supported: facts.supported, unsupported_claims: facts.unsupportedClaims };
+            if (!facts.supported) {
+              reject(
+                HCR_ABOUT_REASON_NOT_SUPPORTED,
+                "not_supported",
+                facts.unsupportedClaims.join("; ") || facts.reason,
+              );
+            } else if (storedNorm === "") {
+              approved = true; // nothing stored to compare with
+            } else {
+              // 3. better than the stored text
+              if (tooCloseToDeadline()) {
+                notReached("about comparison judge not started");
+                return;
+              }
+              let cmp: AboutComparisonVerdict;
+              try {
+                cmp = await aboutJudges.comparison({ stored: storedAbout, candidate: candidateText, producerName }, io());
+              } catch (e: any) {
+                cmp = { ok: false, reasoning: `dommer kastet: ${e?.message ?? String(e)}` };
+              }
+              if (pastDeadline()) {
+                notReached("about comparison judge answered after the deadline");
+                return;
+              }
+              if (!cmp.ok) {
+                unavailable("comparison", cmp.reasoning);
+              } else {
+                review.comparison = { verdict: cmp.verdict, reasoning: cmp.reasoning };
+                // Only the exact BEDRE token approves.
+                if (cmp.better && cmp.verdict === "BEDRE") approved = true;
+                else reject(HCR_ABOUT_REASON_NOT_BETTER, "not_better", cmp.reasoning);
+              }
+            }
+          }
+        }
+        if (approved) judgedStoredAbout = storedAbout;
+      }
+    }
+
     // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
     // the detected platform categories are written as `categories` ONLY. They
     // used to be turned into products [{name:"Frukt"}, …] as well — a list of
@@ -2976,9 +3295,17 @@ export async function refreshHomepageContent(
     // a non-empty, uncorroborated stored list is never replaced. Read here,
     // after the fetch, so this read and the write below stay in one
     // synchronous stretch (nothing can change the column in between).
+    //
+    // Since dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-
+    // forverring (skive B) this rule applies to EVERY caller, option or not
+    // (Ild og Bønner [coffee] → [vegetables] from «bønner», Bear House
+    // [bakery, cafe] → [bakery], measured 2026-10-28 with explicit agentIds):
+    // a non-empty stored list is corroborated or left alone, never replaced.
+    // An already corroborated non-empty list is left exactly as stored.
     let corroborateStored: unknown[] | null = null;
     let corroborateRefusal: string | null = null;
-    if (opts.categoriesCorroborateOnly) {
+    let storedCategoriesKept = false;
+    {
       const cur = db
         .prepare(
           `SELECT a.categories AS categories, k.field_provenance AS field_provenance
@@ -2987,7 +3314,9 @@ export async function refreshHomepageContent(
         )
         .get(agentId) as { categories: string | null; field_provenance: string | null } | undefined;
       const stored = hcrStoredCategoryList(cur?.categories);
-      if (stored && categoriesLackWebsiteCorroboration(cur?.categories, cur?.field_provenance)) {
+      if (stored && !categoriesLackWebsiteCorroboration(cur?.categories, cur?.field_provenance)) {
+        storedCategoriesKept = true; // already corroborated: never replaced
+      } else if (stored) {
         corroborateStored = stored;
         // Only the producer's OWN site may corroborate (requested URL and the
         // final one after redirects), never a wrong-entity or unreadable
@@ -3039,8 +3368,9 @@ export async function refreshHomepageContent(
           })`,
         });
       }
-    } else if (platformCategories.length > 0) {
+    } else if (!storedCategoriesKept && platformCategories.length > 0) {
       // categories (agents table) — JSON array of platform category keys.
+      // Only reached for an empty (or unreadable) stored list.
       candidates.push({
         field: "categories",
         value: platformCategories.join(","),
@@ -3092,6 +3422,16 @@ export async function refreshHomepageContent(
       }
     }
 
+    // The judges compared the candidate with the stored about read before
+    // their awaits; this read and the write below are one synchronous
+    // stretch, so a stored text that changed meanwhile was never judged.
+    if (judgedStoredAbout !== null && hcrNormalizeAbout(kRow?.about) !== hcrNormalizeAbout(judgedStoredAbout)) {
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (candidates[i].field === "about" || candidates[i].field === "description") candidates.splice(i, 1);
+      }
+      skippedUnsubstantiated.push({ agent_id: agentId, reason: HCR_ABOUT_REASON_STORED_CHANGED });
+    }
+
     // Decide each field through the gate. Build the write set + provenance.
     const fieldsToWrite: HcrFieldWrite[] = [];
     const incomingProvForMerge: Record<
@@ -3135,6 +3475,9 @@ export async function refreshHomepageContent(
       // skipped — we never overwrite a non-google_places content value.
     }
 
+    if (aboutReview) {
+      aboutReview.decision = fieldsToWrite.some((f) => f.field === "about" || f.field === "description") ? "write" : "skip";
+    }
     if (curatedSkipped.length > 0) {
       skippedCurated.push({ agent_id: agentId, fields: Array.from(new Set(curatedSkipped)) });
     }
@@ -3234,6 +3577,12 @@ export async function refreshHomepageContent(
     skipped_unsubstantiated: skippedUnsubstantiated,
     errors,
     parked_now: parkedNow,
+    // dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring (skive B).
+    about_reviews: aboutReviews,
+    about_judge_rejected: aboutTally.rejected,
+    about_not_supported: aboutTally.not_supported,
+    about_not_better: aboutTally.not_better,
+    about_judge_unavailable: aboutTally.unavailable,
   };
 }
 
@@ -3305,8 +3654,9 @@ homepageContentRefreshRouter.post(
 
     // ── Target selection ─────────────────────────────────────────────────────
     let targets: HcrTargetRow[];
-    // Auto-selected targets corroborate stored categories, never replace them
-    // (see the refresh call below); explicit agentIds keep today's behaviour.
+    // Auto-selected targets are flagged categoriesCorroborateOnly (see the
+    // refresh call below); since skive B the rule applies to explicit
+    // agentIds as well (refreshHomepageContent applies it to every caller).
     let autoSelected = false;
     if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
       targets = selectHomepageContentRefreshTargetsByIds(db, body.agentIds as unknown[], limit);
@@ -3375,11 +3725,13 @@ homepageContentRefreshRouter.post(
     // fish, herbs]); it only gains a website_homepage source when the
     // producer's own page supports every stored category, else nothing is
     // written for categories. Dry run and apply alike. Empty stored categories
-    // and every other field: unchanged. Explicit agentIds (a deliberate
-    // operator action, already behind canCorrectFactualField and the curated
-    // lock) keep the replacing behaviour, byte for byte. Deviation from R2
+    // and every other field: unchanged. Deviation from R2
     // (2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter), which
-    // had the auto-select replace them.
+    // had the auto-select replace them. Since dev-request 2026-10-28-rfb-
+    // uttrekk-adresse-og-hjemmeside-forverring (skive B) explicit agentIds
+    // and the morning send follow the same rule (refreshHomepageContent
+    // applies it whatever the option says), and every about candidate goes
+    // through the LLM judges first (about_reviews in the answer).
     //
     // Time budget (dev-request 2026-10-31 S1): the route now passes a
     // deadline, as the platform-side RFB send already does, so a run of slow
@@ -3399,9 +3751,11 @@ homepageContentRefreshRouter.post(
       ...result,
       truncated: notReached > 0,
       not_reached: notReached,
-      // Auto-select only (last key; the explicit-ids response is unchanged):
-      // the corroboration tally, keyed like R6's extra.categories_corroboration.
-      ...(autoSelected ? { categories_corroboration: homepageContentRefreshCorroborationTally(result) } : {}),
+      // Last key: the corroboration tally, keyed like R6's
+      // extra.categories_corroboration. Since skive B (dev-request
+      // 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring) every
+      // target follows the corroborate-only rule, so explicit agentIds get it too.
+      categories_corroboration: homepageContentRefreshCorroborationTally(result),
     });
   },
 );
