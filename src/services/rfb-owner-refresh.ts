@@ -409,15 +409,16 @@ const EMAIL_RES: readonly RegExp[] = [
 /**
  * A price — the currency next to a number, in a price shape:
  *   «kr 120», «kr. 120», «kroner 120», «120 kroner», «NOK 120» / «120 NOK»
- *   (uppercase only: «nok» is also the word «enough»), «120,-», «€ 12» / «12 €»;
- *   «120 kr» only with a unit or a sentence end after it («25 kr kiloen»,
- *   «40 kr.», «120 kr per glass») — not «3 kr og 5 kyr».
+ *   (uppercase only: «nok» is also the word «enough»), «120,-», «€ 12» / «12 €»,
+ *   and «120 kr» whenever no letter follows «kr» («150 kr/kg», «1500 kr inkl.
+ *   mva.», «25 kr kiloen»). A sentence like «3 kr og 5 kyr» is refused too: a
+ *   lost refresh is cheaper than a price written on an owner's profile.
  */
 const PRICE_RES: readonly RegExp[] = [
   /(?:^|[^\p{L}])(?:kr|kroner)\.?\s*\d/iu,
   /NOK\s*\d|\d\s*NOK(?![\p{L}])/u,
   /\d\s*kroner(?![\p{L}])/iu,
-  /\d(?:[.,]\d{1,2})?\s*kr\.?(?:\s*(?:per|pr\.?|\/|for|kiloen|kilo|kg|hg|gram|stk\.?|stykket|stykk|glasset|glass|liter|literen|l|brett|brettet|pakke|pakken|boks|boksen|flaske|flasken|nøste|nøstet|kasse|kassen|sekk|sekken|bunt|bunten)(?![\p{L}])|\s*[,.;:)!?]|\s*$)/iu,
+  /\d\s*kr(?![\p{L}])/iu,
   /\d\s*,-/u,
   /€\s*\d|\d\s*€|EUR\s*\d|\d\s*EUR(?![\p{L}])/u,
 ];

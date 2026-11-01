@@ -59,8 +59,9 @@
  *       2026-11-01) in «Mine valg», the portal card, the owner API and
  *       /for-produsenter; the owner API's flag-off shape (route level); the
  *       reviewer's prose probe (false positives fixed: «nok», «nyt Norge»,
- *       «Spesialitet:», «3 kr og 5 kyr», «bio-gjødsel»; new: KRAV, «biologisk
- *       dyrket», «kroner 120», «€», «[at]»); provably-ours text + hybrid /
+ *       «Spesialitet:», «bio-gjødsel»; new: KRAV, «biologisk dyrket», «kroner
+ *       120», «€», «[at]»; «N kr» stays refused whenever no letter follows, so
+ *       «150 kr/kg» and «1500 kr inkl. mva.» are caught); provably-ours text + hybrid /
  *       owner_updated_at through the cohort SQL; non-fetch failures and the
  *       extractor throw stamped; the judge-unavailable streak
  *
@@ -502,7 +503,15 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
         ["Gården ligger 12 km fra Lillehammer.", null],
         ["Følg oss på Instagram @gardsbutikken for nyheter.", null],
         ["Åpent lørdag 10-14, ellers etter avtale.", null],
-        ["Vi har 3 kr og 5 kyr.", null],
+        ["Vi har 3 kr og 5 kyr.", "price"],
+        ["Lammekjøtt 150 kr/kg.", "price"],
+        ["150kr/kg", "price"],
+        ["Ost 189,50 kr/kg.", "price"],
+        ["Egg 60 kr/brett.", "price"],
+        ["Kasser med lam koster 1500 kr inkl. mva.", "price"],
+        ["Lam fra 150 kr hos oss.", "price"],
+        ["Overnatting 900 kr natta.", "price"],
+        ["Vi har 3 krukker med honning.", null],
         ["Kr. Sand er nærmeste by.", null],
         ["Ring 99 99 99 99 for bestilling.", null],
         ["Vi har 120 sauer, 3 krukker og studerte biologi og biografi.", null],
