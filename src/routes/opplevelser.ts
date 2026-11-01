@@ -29032,6 +29032,11 @@ const SWEEP_ELIGIBLE_WHERE = "evidence_url IS NOT NULL AND canonical_id IS NULL"
 // prefixes passed explicitly below) and the unaliased COUNT(*) queries.
 const SWEEP_IN_SCOPE_WHERE = experienceInScopeSql("category", "provider_id");
 const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provider_id");
+// The queue ordering (never-checked first, then oldest-checked) as ONE
+// constant, shared verbatim by the sweep below and the read-only candidate
+// GET of the content-judgement job (step 3k, further down) so the two can
+// never serve the rows in a different order.
+const SWEEP_QUEUE_ORDER_BY = "admission_checked_at IS NULL DESC, admission_checked_at ASC";
 
 // ─── Quarantine-exit promotion (dev-request 2026-09-02-experiences-
 // karantene-utgang-match-til-verified) ──────────────────────────────────────
@@ -29087,6 +29092,82 @@ const SWEEP_IN_SCOPE_WHERE_ALIASED = experienceInScopeSql("e.category", "e.provi
 // batch_id = this SAME sweep call's batchId, additive/reversible via POST
 // /admin/experiences-admission-promotion-rollback below.
 const PROMOTION_ELIGIBLE_CONFIDENCE = new Set(["high", "medium"]);
+
+// ─── Shared per-row decision + write (A2A dev-request 2026-10-06-
+// experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
+// «Innsnevring 2026-10-28», skive 3k med punkt b) ─────────────────────────
+// Extracted VERBATIM from the sweep handler below when the server-side
+// content-judgement job (services/experience-content-judgement-job.ts, via
+// applyExperienceContentJudgements() further down) became the second caller
+// — same pattern as applyPrewrittenExperienceDescriptions(): the sweep and
+// the job decide promotion and write a verdict through exactly this code, so
+// the two paths cannot drift. Neither function calls an LLM or fetches.
+
+export type ContentJudgeSweepVerdict = "MATCH" | "MISMATCH" | "unresolved";
+
+/** The four promotion requirements (see the block comment above), each
+ *  evaluated separately. `row` is the state going INTO this write. */
+export type ContentJudgePromotionDecision = {
+  wasNeedsReview: boolean;
+  judgeOk: boolean;
+  brregActiveOk: boolean;
+  sourceVerified: boolean;
+  confidenceOk: boolean;
+  missing: string[];
+  eligible: boolean;
+};
+
+export function evaluateContentJudgePromotion(
+  row: Pick<ContentJudgeSweepRow, "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance">,
+  verdict: ContentJudgeSweepVerdict,
+): ContentJudgePromotionDecision {
+  const wasNeedsReview = row.verification_status === "needs_review";
+  const judgeOk = verdict === "MATCH";
+  const brregActiveOk = row.p_brreg_active === 1;
+  const sourceVerified =
+    isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
+  const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
+  const missing: string[] = [];
+  if (!judgeOk) missing.push("judge");
+  if (!brregActiveOk) missing.push("brreg_active");
+  if (!sourceVerified) missing.push("source_verified");
+  if (!confidenceOk) missing.push("confidence");
+  return { wasNeedsReview, judgeOk, brregActiveOk, sourceVerified, confidenceOk, missing, eligible: wasNeedsReview && missing.length === 0 };
+}
+
+const CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL = `INSERT INTO experience_admission_promotion_audit
+         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
+       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`;
+
+/** The apply-mode write for ONE row: MISMATCH -> needs_review; an eligible
+ *  row -> verified + one promotion-audit row under `batchId`; then exactly
+ *  one admission_verdict stamp (`promoted:` in place of `match:` on a
+ *  promotion). Touches no other column. */
+export function writeContentJudgeVerdict(
+  expDb: ReturnType<typeof getExpDb>,
+  rowId: string,
+  verdict: ContentJudgeSweepVerdict,
+  reason: string,
+  eligibleForPromotion: boolean,
+  batchId: string,
+): { promoted: boolean } {
+  let promoted = false;
+  if (verdict === "MISMATCH") {
+    expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(rowId);
+  } else if (eligibleForPromotion) {
+    expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(rowId);
+    promoted = true;
+    expDb.prepare(CONTENT_JUDGE_PROMOTION_AUDIT_INSERT_SQL).run(crypto.randomUUID(), rowId, batchId, reason);
+  }
+  const verdictKey: "match" | "mismatch" | "unresolved" =
+    verdict === "MATCH" ? "match" : verdict === "MISMATCH" ? "mismatch" : "unresolved";
+  // MATCH and unresolved are stamped too (see block comment above) — never
+  // skipped just because there's no status change to make. A promoted row's
+  // stamp gets the `promoted:` prefix IN PLACE OF the normal `match:` stamp —
+  // one admission_verdict write per row per call, never two.
+  stampExperienceAdmissionVerdict(rowId, promoted ? `promoted: ${reason}` : `${verdictKey}: ${reason}`, expDb);
+  return { promoted };
+}
 
 type ContentJudgeSweepRow = {
   id: string;
@@ -29194,8 +29275,7 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
         .get() as { n: number }
     ).n;
 
-    const sweepOrderBy =
-      sampleMode === "random" ? "RANDOM()" : "admission_checked_at IS NULL DESC, admission_checked_at ASC";
+    const sweepOrderBy = sampleMode === "random" ? "RANDOM()" : SWEEP_QUEUE_ORDER_BY;
 
     const rows = expDb
       .prepare(
@@ -29268,12 +29348,6 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     );
     const needsReviewBefore = (needsReviewCountStmt.get() as { n: number }).n;
 
-    const insertPromotionAudit = expDb.prepare(
-      `INSERT INTO experience_admission_promotion_audit
-         (id, experience_id, batch_id, from_status, to_status, reason, promoted_at)
-       VALUES (?, ?, ?, 'needs_review', 'verified', ?, datetime('now'))`,
-    );
-
     for (const row of rows) {
       const evidenceUrl = (row.evidence_url ?? "").trim();
 
@@ -29341,34 +29415,21 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
       // verification_status`, which was read by the SELECT BEFORE this loop
       // ran and is never mutated in place — the authoritative "status going
       // INTO this iteration" value.
-      const wasNeedsReview = row.verification_status === "needs_review";
-      const judgeOk = outcome.verdict === "MATCH";
-      const brregActiveOk = row.p_brreg_active === 1;
-      const sourceVerified =
-        isHjemmesideVerified(row.p_field_provenance) || isEvidenceUrlVerified(row.evidence_url_verification);
-      const confidenceOk = row.confidence !== null && PROMOTION_ELIGIBLE_CONFIDENCE.has(row.confidence);
-      const missingPromotionReqs: string[] = [];
-      if (!judgeOk) missingPromotionReqs.push("judge");
-      if (!brregActiveOk) missingPromotionReqs.push("brreg_active");
-      if (!sourceVerified) missingPromotionReqs.push("source_verified");
-      if (!confidenceOk) missingPromotionReqs.push("confidence");
-      const eligibleForPromotion = wasNeedsReview && missingPromotionReqs.length === 0;
+      // The four requirements + the write live in the shared
+      // evaluateContentJudgePromotion()/writeContentJudgeVerdict() above
+      // (skive 3k) — the content-judgement job uses the same two.
+      const {
+        wasNeedsReview,
+        brregActiveOk,
+        sourceVerified,
+        confidenceOk,
+        missing: missingPromotionReqs,
+        eligible: eligibleForPromotion,
+      } = evaluateContentJudgePromotion(row, outcome.verdict);
 
       let promoted = false;
       if (applyMode) {
-        if (outcome.verdict === "MISMATCH") {
-          expDb.prepare(`UPDATE experiences SET verification_status = 'needs_review' WHERE id = ?`).run(row.id);
-        } else if (eligibleForPromotion) {
-          expDb.prepare(`UPDATE experiences SET verification_status = 'verified' WHERE id = ?`).run(row.id);
-          promoted = true;
-          insertPromotionAudit.run(crypto.randomUUID(), row.id, batchId, outcome.reason);
-        }
-        // MATCH and unresolved are stamped too (see block comment above) —
-        // never skipped just because there's no status change to make. A
-        // promoted row's stamp gets the `promoted:` prefix IN PLACE OF the
-        // normal `match:` stamp — one admission_verdict write per row per
-        // call, never two.
-        stampExperienceAdmissionVerdict(row.id, promoted ? `promoted: ${outcome.reason}` : `${verdictKey}: ${outcome.reason}`);
+        promoted = writeContentJudgeVerdict(expDb, row.id, outcome.verdict, outcome.reason, eligibleForPromotion, batchId).promoted;
         if (isBoilerplate) {
           expDb.prepare(`UPDATE experiences SET description = NULL WHERE id = ?`).run(row.id);
         }
@@ -29456,6 +29517,291 @@ router.post("/admin/experiences-content-judge-sweep", requireAdmin, async (req: 
     console.error("[opplevelser] admin/experiences-content-judge-sweep failed", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── Content-judgement queue (A2A dev-request 2026-10-06-experiences-
+// enrichment-plattformjobb-og-felles-serverjobbramme, «Innsnevring
+// 2026-10-28», skive 3k med punkt b) ───────────────────────────────────────
+//
+// The sweep above calls an LLM judge from this server. Daniel's rule
+// (Endring 2026-10-08): a platform job never calls an LLM — Claude Code on
+// his subscription (a read-only Cloud Routine) judges, commits the verdicts
+// as a file to A2A, and a job here stores them without an LLM, re-checking
+// everything deterministically. Three pieces:
+//
+//   GET /admin/experiences-content-judge-candidates   read-only: the rows the
+//       sweep would select (SAME SWEEP_ELIGIBLE_WHERE + SWEEP_IN_SCOPE_WHERE,
+//       SAME SWEEP_QUEUE_ORDER_BY), public catalog fields only. Punkt b: it
+//       does NOT stop at queue_exhausted — `batches` (1..4, default 1) lets
+//       one call return up to 4 × SWEEP_MAX_LIMIT rows, running on into the
+//       oldest-checked re-pass rows by the same ordering. No writes, no fetch.
+//   applyExperienceContentJudgements()   the no-LLM store step the job
+//       (services/experience-content-judgement-job.ts) calls per file; every
+//       write goes through the shared evaluateContentJudgePromotion() /
+//       writeContentJudgeVerdict() the sweep uses.
+//   GET /admin/experiences-content-judgements-status   read-only job status.
+//
+// The boilerplate-description nulling stays sweep-only (it needs the fetched
+// page text; this lane never fetches) — see the job module's header.
+import { EnrichmentWritePausedError } from "../services/enrichment-write-pause";
+import {
+  EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
+  EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS,
+  EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+  getExperienceContentJudgementsStatus,
+} from "../services/experience-content-judgement-job";
+
+export const CONTENT_JUDGE_CANDIDATES_MAX_BATCHES = 4;
+/** A created_at further ahead of the server clock than this is rejected —
+ *  a future timestamp would defeat the stale-verdict check. */
+const CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS = 10 * 60_000;
+
+export type ContentJudgeCandidate = {
+  id: string;
+  provider_id: string | null;
+  title: string;
+  description: string | null;
+  category: string | null;
+  evidence_url: string | null;
+  verification_status: string;
+  confidence: string | null;
+  admission_checked_at: string | null;
+};
+
+/** The read-only core of GET /admin/experiences-content-judge-candidates.
+ *  `limit`/`batches` take the raw query values. */
+export function selectContentJudgeCandidates(
+  expDb: ReturnType<typeof getExpDb>,
+  raw: { limit?: unknown; batches?: unknown } = {},
+): {
+  batch_size: number;
+  batches: number;
+  scanned: number;
+  rows: ContentJudgeCandidate[];
+  remaining: number;
+  never_checked_remaining: number;
+  queue_exhausted: boolean;
+  skipped_out_of_scope: number;
+  judgement_schema: string;
+  max_items_per_file: number;
+} {
+  // Same parse as the sweep's query `limit`: non-numeric -> default, <=0 ->
+  // default, clamped to SWEEP_MAX_LIMIT.
+  let requestedLimit = SWEEP_DEFAULT_LIMIT;
+  if (typeof raw.limit === "string") {
+    const n = parseInt(raw.limit, 10);
+    requestedLimit = Number.isFinite(n) ? n : SWEEP_DEFAULT_LIMIT;
+  }
+  if (requestedLimit <= 0) requestedLimit = SWEEP_DEFAULT_LIMIT;
+  const batchSize = Math.min(SWEEP_MAX_LIMIT, requestedLimit);
+  let batches = 1;
+  if (typeof raw.batches === "string") {
+    const n = parseInt(raw.batches, 10);
+    if (Number.isFinite(n) && n >= 1) batches = Math.min(CONTENT_JUDGE_CANDIDATES_MAX_BATCHES, n);
+  }
+
+  // Counts measured exactly like the sweep's (same predicates, same tables).
+  const totalEligible = (
+    expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE}`).get() as { n: number }
+  ).n;
+  const skippedOutOfScope = (
+    expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND NOT (${SWEEP_IN_SCOPE_WHERE})`).get() as { n: number }
+  ).n;
+  const neverCheckedRemaining = (
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND admission_checked_at IS NULL`)
+      .get() as { n: number }
+  ).n;
+  // Same FROM/JOIN/WHERE/ORDER BY as the sweep's row SELECT; only the
+  // public catalog columns are returned.
+  const rows = expDb
+    .prepare(
+      `SELECT e.id, e.provider_id, e.title, e.description, e.category, e.evidence_url,
+              e.verification_status, e.confidence, e.admission_checked_at
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE_ALIASED}
+        ORDER BY ${SWEEP_QUEUE_ORDER_BY}
+        LIMIT ?`,
+    )
+    .all(batchSize * batches) as ContentJudgeCandidate[];
+
+  return {
+    batch_size: batchSize,
+    batches,
+    scanned: rows.length,
+    rows,
+    remaining: Math.max(0, totalEligible - rows.length),
+    never_checked_remaining: neverCheckedRemaining,
+    queue_exhausted: neverCheckedRemaining === 0,
+    skipped_out_of_scope: skippedOutOfScope,
+    judgement_schema: EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+    max_items_per_file: EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
+  };
+}
+
+router.get("/admin/experiences-content-judge-candidates", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const out = selectContentJudgeCandidates(getExpDb("experiences"), { limit: req.query?.limit, batches: req.query?.batches });
+    res.json({ success: true, ...out });
+  } catch (err) {
+    console.error("[opplevelser] admin/experiences-content-judge-candidates failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+type ContentJudgementItem = { id: string; evidence_url: unknown; verdict: unknown; reasoning: unknown };
+
+export type ContentJudgementItemResult = {
+  id: string;
+  result: "written" | "rejected";
+  reason?: string;
+  verdict?: "match" | "mismatch";
+  promoted?: boolean;
+  promotion?: { applicable: boolean; status: "not_applicable" | "held" | "promoted"; missing?: string[] };
+};
+
+export type ExperienceContentJudgementsResult =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      batch_id: string;
+      totals: { written: number; rejected: number; match: number; mismatch: number; promoted: number };
+      results: ContentJudgementItemResult[];
+    };
+
+/** SQLite `datetime('now')` ("YYYY-MM-DD HH:MM:SS", UTC) or ISO -> ms. */
+function contentJudgementTsMs(ts: string): number {
+  const t = ts.trim();
+  const iso = t.includes("T") ? t : t.replace(" ", "T");
+  return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(iso) ? iso : `${iso}Z`);
+}
+
+/**
+ * Stores one judgement file's items (the content-judgement job's apply
+ * step). NEVER calls an LLM, never fetches. Structural problems that make
+ * the file untrustworthy as a whole (not 1..50 objects with string ids,
+ * duplicate ids, bad/future created_at) -> {ok:false}; a malformed verdict
+ * / evidence_url / reasoning rejects only that item. Each item is then
+ * re-checked and written in ITS OWN transaction (see the job's header for
+ * the full list of re-checks); the write-pause is asserted inside every
+ * transaction, and a pause throws (the queue counts it as a per-file
+ * failure and retries — already-written items are then `stale_verdict`).
+ */
+export async function applyExperienceContentJudgements(
+  db: ReturnType<typeof getExpDb>,
+  rawItems: unknown,
+  opts: { createdAt: unknown; runId?: unknown; now?: Date; logTag?: string },
+): Promise<ExperienceContentJudgementsResult> {
+  if (!Array.isArray(rawItems) || rawItems.length < 1 || rawItems.length > EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS) {
+    return { ok: false, error: `items must be an array of 1..${EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS} items` };
+  }
+  if (typeof opts.createdAt !== "string" || !Number.isFinite(Date.parse(opts.createdAt))) {
+    return { ok: false, error: "created_at must be a valid timestamp" };
+  }
+  const createdAtMs = Date.parse(opts.createdAt);
+  const nowMs = (opts.now ?? new Date()).getTime();
+  if (createdAtMs > nowMs + CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS) {
+    return { ok: false, error: "created_at is in the future" };
+  }
+  const items: ContentJudgementItem[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < rawItems.length; i++) {
+    const r = rawItems[i];
+    if (!r || typeof r !== "object" || Array.isArray(r)) return { ok: false, error: `items[${i}] must be an object` };
+    const o = r as Record<string, unknown>;
+    if (typeof o.id !== "string" || o.id.trim() === "") return { ok: false, error: `items[${i}].id must be a non-empty string` };
+    const id = o.id.trim();
+    if (seen.has(id)) return { ok: false, error: `duplicate id in items: ${id}` };
+    seen.add(id);
+    items.push({ id, evidence_url: o.evidence_url, verdict: o.verdict, reasoning: o.reasoning });
+  }
+
+  const batchId = `content-judgement-job-${new Date(nowMs).toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
+  const eligibleStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_ELIGIBLE_WHERE}`);
+  const inScopeStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_IN_SCOPE_WHERE}`);
+  const rowStmt = db.prepare(
+    `SELECT e.id, e.evidence_url, e.admission_checked_at, e.updated_at, e.verification_status,
+            e.confidence, e.evidence_url_verification,
+            p.brreg_active AS p_brreg_active, p.field_provenance AS p_field_provenance
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+      WHERE e.id = ?`,
+  );
+  type Row = Pick<
+    ContentJudgeSweepRow,
+    "id" | "evidence_url" | "admission_checked_at" | "verification_status" | "confidence" | "evidence_url_verification" | "p_brreg_active" | "p_field_provenance"
+  > & { updated_at: string | null };
+  /** A non-null timestamp newer than the file (or unparseable: fail closed). */
+  const newerThanFile = (ts: string | null): boolean => {
+    if (ts === null || ts.trim() === "") return false;
+    const ms = contentJudgementTsMs(ts);
+    return !Number.isFinite(ms) || ms > createdAtMs;
+  };
+
+  const applyOne = db.transaction((it: ContentJudgementItem, verdict: "MATCH" | "MISMATCH", reasoning: string): ContentJudgementItemResult => {
+    // The SAME shared experiences pause helper every apply:true route in
+    // this file uses; thrown so the transaction rolls back.
+    const pauseBlock = experiencesWritePauseBlock();
+    if (pauseBlock) throw new EnrichmentWritePausedError(pauseBlock);
+    const row = rowStmt.get(it.id) as Row | undefined;
+    if (!row) return { id: it.id, result: "rejected", reason: "not_found" };
+    if (!eligibleStmt.get(it.id)) return { id: it.id, result: "rejected", reason: "not_eligible" };
+    if (!inScopeStmt.get(it.id)) return { id: it.id, result: "rejected", reason: "out_of_scope" };
+    if ((row.evidence_url ?? "").trim() !== String(it.evidence_url).trim()) return { id: it.id, result: "rejected", reason: "evidence_changed" };
+    if (newerThanFile(row.admission_checked_at)) return { id: it.id, result: "rejected", reason: "stale_verdict" };
+    if (newerThanFile(row.updated_at)) return { id: it.id, result: "rejected", reason: "content_changed" };
+    // The client verdict is the "judge" requirement only; the other three
+    // are read from the row as it stands now, inside this transaction.
+    const decision = evaluateContentJudgePromotion(row, verdict);
+    const { promoted } = writeContentJudgeVerdict(db, row.id, verdict, reasoning, decision.eligible, batchId);
+    return {
+      id: it.id,
+      result: "written",
+      verdict: verdict === "MATCH" ? "match" : "mismatch",
+      promoted,
+      promotion: {
+        applicable: decision.wasNeedsReview,
+        status: !decision.wasNeedsReview ? "not_applicable" : promoted ? "promoted" : "held",
+        ...(decision.wasNeedsReview && !promoted ? { missing: decision.missing } : {}),
+      },
+    };
+  });
+
+  const results: ContentJudgementItemResult[] = [];
+  for (const it of items) {
+    if (it.verdict !== "match" && it.verdict !== "mismatch") {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_verdict" });
+      continue;
+    }
+    if (typeof it.evidence_url !== "string" || it.evidence_url.trim() === "") {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_evidence_url" });
+      continue;
+    }
+    const reasoning = typeof it.reasoning === "string" ? it.reasoning.replace(/\s+/g, " ").trim() : "";
+    if (reasoning === "" || reasoning.length > EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS) {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_reasoning" });
+      continue;
+    }
+    results.push(applyOne(it, it.verdict === "match" ? "MATCH" : "MISMATCH", reasoning));
+  }
+
+  const totals = { written: 0, rejected: 0, match: 0, mismatch: 0, promoted: 0 };
+  for (const r of results) {
+    totals[r.result]++;
+    if (r.verdict) totals[r.verdict]++;
+    if (r.promoted) totals.promoted++;
+  }
+  console.log(
+    `[${opts.logTag ?? "experience-content-judgements"}] run_id=${String(opts.runId ?? "-").replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, 80)} ` +
+      `batch_id=${batchId} ` +
+      results.map((r) => `${r.id}=${r.result}${r.reason ? ":" + r.reason : ""}${r.verdict ? ":" + r.verdict : ""}${r.promoted ? ":promoted" : ""}`).join(" "),
+  );
+  return { ok: true, batch_id: batchId, totals, results };
+}
+
+router.get("/admin/experiences-content-judgements-status", requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, ...getExperienceContentJudgementsStatus(getExpDb("experiences") as any) });
 });
 
 // ─── POST /api/opplevelser/admin/experiences-admission-promotion-rollback ──

@@ -2229,6 +2229,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b:
+// needs_review content judgements — same file-queue mechanics as the two
+// proposal jobs above (services/proposal-file-queue.ts), reading
+// `experiences-content-judgements/` in slookisen/A2A (verdicts a Cloud
+// Routine rendered on Daniel's subscription) and storing them through
+// applyExperienceContentJudgements(), which re-checks every item and writes
+// through the same shared code as POST /admin/experiences-content-judge-
+// sweep. Never calls an LLM. OFF by default:
+// EXPERIENCE_CONTENT_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping
+// it back is the rollback. First tick 9 minutes after boot, hourly after
+// that; an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let experienceContentJudgementsRunning = false;
+  const experienceContentJudgementsTick = trackJob("experience-content-judgements", async () => {
+    if (experienceContentJudgementsRunning) return;
+    experienceContentJudgementsRunning = true;
+    try {
+      const { tickExperienceContentJudgements } = await import("./services/experience-content-judgement-job");
+      const r = await tickExperienceContentJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[experience-content-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[experience-content-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      experienceContentJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void experienceContentJudgementsTick(); }, 9 * 60_000);
+  setInterval(() => { void experienceContentJudgementsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────

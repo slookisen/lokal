@@ -46379,6 +46379,28 @@ runSerial(async () => {
   }
 });
 
+// A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-felles-
+// serverjobbramme, «Innsnevring 2026-10-28», skive 3k med punkt b: the
+// needs_review content judge without an LLM — candidate GET (batches 1..4),
+// the shared apply function with its deterministic re-checks and the hourly
+// job on the shared proposal file queue. api.anthropic.com, global fetch and
+// the judge module are counted and asserted zero. Serial: in-memory DBs.
+runSerial(async () => {
+  console.log("\n── 3k: experience-content-judgement-job (candidates, apply, job) ──");
+  try {
+    const { runExperienceContentJudgementJobTests } = require("../src/services/experience-content-judgement-job.test") as
+      typeof import("../src/services/experience-content-judgement-job.test");
+    const cj = await runExperienceContentJudgementJobTests({ log: false });
+    passed += cj.passed;
+    failed += cj.failed;
+    for (const f of cj.failures) failures.push("experience-content-judgement-job: " + f);
+    console.log(`  experience-content-judgement-job: ${cj.passed} passed, ${cj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-content-judgement-job: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Tillegg 2026-10-15 «4b-forslag»: gårdssalg visit-text proposals — the
 // candidates GET, the shared apply function behind POST /admin/gardssalg-
 // visit-proposals-write (server re-fetch + verbatim evidence + overlap) and
