@@ -45,26 +45,53 @@ type HcrAboutJudges = import("./admin-knowledge").HcrAboutJudges;
  * except where a case says otherwise. `factsPages` records the URLs the facts
  * judge was shown, `candidates` the texts it judged.
  */
-function stubJudges(o: { quality?: "GODKJENN" | "AVVIS" } = {}): HcrAboutJudges & { factsPages: string[]; candidates: string[] } {
+function stubJudges(
+  o: {
+    quality?: "GODKJENN" | "AVVIS";
+    /** Per-text verdicts: a candidate containing this marker gets the "no" (or "unavailable"). */
+    avvisIf?: string;
+    notSupportedIf?: string;
+    factsUnavailableIf?: string;
+    notBetterIf?: string;
+    /** The quality judge answers a candidate containing `delay.marker` only at `delay.until` (ms). */
+    delay?: { marker: string; until: number };
+    timeoutMs?: number;
+  } = {},
+): HcrAboutJudges & { factsPages: string[]; candidates: string[] } {
   const factsPages: string[] = [];
   const candidates: string[] = [];
   return {
     factsPages,
     candidates,
-    timeoutMs: 1,
+    timeoutMs: o.timeoutMs ?? 1,
     quality: async (candidate) => {
       candidates.push(candidate);
-      return o.quality === "AVVIS"
+      if (o.delay && candidate.includes(o.delay.marker)) {
+        await new Promise((r) => setTimeout(r, Math.max(0, o.delay!.until - Date.now())));
+      }
+      return o.quality === "AVVIS" || (o.avvisIf !== undefined && candidate.includes(o.avvisIf))
         ? { approved: false, reasoning: "generisk tekst" }
         : { approved: true, reasoning: "konkret om produsenten" };
     },
     facts: async (params) => {
       factsPages.push(...params.pages.map((p) => p.url));
+      if (o.factsUnavailableIf !== undefined && params.about.includes(o.factsUnavailableIf)) {
+        return { ok: false, failure: "timeout", reason: "dommeren svarte ikke i tide" };
+      }
+      if (o.notSupportedIf !== undefined && params.about.includes(o.notSupportedIf)) {
+        return { ok: true, supported: false, unsupportedClaims: ["siden 1850"], bestPage: null, reason: "ikke støttet" };
+      }
       return { ok: true, supported: true, unsupportedClaims: [], bestPage: 0, reason: "støttet" };
     },
-    comparison: async () => ({ ok: true, better: true, verdict: "BEDRE", reasoning: "mer konkret" }),
+    comparison: async (params) =>
+      o.notBetterIf !== undefined && params.candidate.includes(o.notBetterIf)
+        ? { ok: true, better: false, verdict: "IKKE_BEDRE", reasoning: "ikke bedre enn lagret" }
+        : { ok: true, better: true, verdict: "BEDRE", reasoning: "mer konkret" },
   };
 }
+
+/** Only in the about-page text of tveras.no / okohjem.no (P1), never in HOME_META. */
+const ABOUT_MARKER = "Tverås er en familiegård";
 
 export interface TestSummary {
   passed: number;
@@ -120,6 +147,14 @@ const SITES: Record<string, Record<string, string>> = {
   },
   // Økologi S3b: an «Om oss» that claims «økologisk» for a producer without a
   // Debio status must be refused like the homepage summary would be.
+  // Homepage meta with an organic claim; the about page without one.
+  "okohjem.no": {
+    "/": homepage(
+      NAV_3_CONTACT_1_ABOUT,
+      "Økologisk gårdsbruk i Hallingdal som selger lammekjøtt og spekemat fra egne dyr rett fra gården vår.",
+    ),
+    "/om-oss": aboutPage([P1, P2, P3], "Tverås Økohjem"),
+  },
   "okogard.no": {
     "/": homepage(NAV_3_CONTACT_1_ABOUT),
     "/om-oss": aboutPage(
@@ -303,6 +338,8 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         { id: "historiegard", name: "Tverås Gårdsmat", url: "https://historiegard.no/" },
         { id: "softgard", name: "Softgard", url: "https://softgard.no/" },
         { id: "okogard", name: "Okogard", url: "https://okogard.no/" },
+        { id: "tveras2", name: "Tverås Gårdsmat", url: "https://tveras.no/", about: "Gammel kort tekst om gården vår." },
+        { id: "okohjem", name: "Tverås Økohjem", url: "https://okohjem.no/" },
       ];
 
       function freshDb(): Database.Database {
@@ -338,7 +375,7 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
       }
       async function run(
         id: string | string[],
-        o: { dryRun: boolean; aboutPagePreview?: boolean; flag?: boolean; judges?: HcrAboutJudges },
+        o: { dryRun: boolean; aboutPagePreview?: boolean; flag?: boolean; judges?: HcrAboutJudges; deadlineAt?: number },
       ) {
         if (o.flag) process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = "1";
         else delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
@@ -350,6 +387,7 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
           fetchImpl: makeFetch(fetchLog),
           aboutJudges: o.judges ?? stubJudges(),
           ...(o.aboutPagePreview ? { aboutPagePreview: true } : {}),
+          ...(o.deadlineAt !== undefined ? { deadlineAt: o.deadlineAt } : {}),
         });
         return { db, result, fetchLog };
       }
@@ -554,8 +592,12 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         const rj = stubJudges({ quality: "AVVIS" });
         const mr = await run("tveras", { dryRun: false, flag: true, judges: rj });
         const x = mr.result.about_candidates?.[0];
-        assertEq(x?.chosen, "about_page", "m-4: the about page was chosen …");
-        assertEq([x?.would_write_about, x?.about_gate_reason], [false, "about: kvalitetsdommer AVVIS"], "m-5: … but the quality judge said AVVIS: not written, and the report says why");
+        assertEq(
+          [x?.about_page_judge_rejected, x?.chosen, rj.candidates.length],
+          ["about: kvalitetsdommer AVVIS", "homepage", 2],
+          "m-4: AVVIS on the about page -> the homepage candidate is judged next",
+        );
+        assertEq([x?.would_write_about, x?.about_gate_reason], [false, "about: kvalitetsdommer AVVIS"], "m-5: … also AVVIS: not written, and the report says why");
         assertEq(row(mr.db, "tveras").about, null, "m-6: nothing written to about");
       }
 
@@ -568,17 +610,113 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
           const x = n.result.about_candidates?.[0];
           assertEq(x?.about_page_refusal, REFUSED_ORGANIC_CLAIM_UNVERIFIED, "n-1: an «økologisk» about page without Debio status is refused");
           assertEq([x?.chosen, x?.chosen_source_url], ["homepage", "https://okogard.no/"], "n-2: … the homepage candidate is used instead");
+          assertEq(row(n.db, "okogard").about, HOME_META, "n-3a: … and written");
           assertTrue(
-            n.result.skipped_unsubstantiated.some((s: any) => s.agent_id === "okogard" && s.reason === REFUSED_ORGANIC_CLAIM_UNVERIFIED),
-            "n-3: … and the refusal is reported in skipped_unsubstantiated",
+            !n.result.skipped_unsubstantiated.some((s: any) => s.agent_id === "okogard"),
+            "n-3: the homepage text was written, so the about-page refusal is NOT in skipped_unsubstantiated (the morning send's `rejected`)",
           );
           assertTrue(!String(row(n.db, "okogard").about ?? "").toLowerCase().includes("økologisk"), "n-4: no organic claim was written");
+          // Nothing about/description written at all: the refusal is reported after the agent's own reasons.
+          const nNone = await run("okogard", { dryRun: false, flag: true, judges: stubJudges({ quality: "AVVIS" }) });
+          const reasons = nNone.result.skipped_unsubstantiated.filter((s: any) => s.agent_id === "okogard").map((s: any) => s.reason);
+          assertEq(reasons, ["about: kvalitetsdommer AVVIS", REFUSED_ORGANIC_CLAIM_UNVERIFIED], "n-6: nothing written -> the homepage's reason first, then the about-page refusal");
+          // The morning send's own reading of it (rfb-marketing-daily: first reason = `rejected`).
+          const { refreshRfbCandidateHomepage } = require("../services/rfb-marketing-daily") as typeof import("../services/rfb-marketing-daily");
+          process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = "1";
+          const ms = freshDb();
+          const prevJ = (globalThis as any)[Symbol.for("lokal.admin-knowledge.hcrAboutJudgesOverride")];
+          (require("./admin-knowledge") as typeof import("./admin-knowledge")).__setHcrAboutJudgesForTesting(stubJudges());
+          try {
+            const sendRow = await refreshRfbCandidateHomepage(ms as any, "okogard", { deadlineAt: Date.now() + 30_000, fetchImpl: makeFetch([]) });
+            assertEq([sendRow.outcome, sendRow.rejected], ["refreshed", undefined], "n-7: morning send: homepage text written -> `rejected` is not the about-page refusal");
+          } finally {
+            (require("./admin-knowledge") as typeof import("./admin-knowledge")).__setHcrAboutJudgesForTesting(prevJ ?? null);
+            delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
+          }
         } finally {
           if (prevGate === undefined) delete process.env[ORGANIC_CLAIM_GATE_ENV];
           else process.env[ORGANIC_CLAIM_GATE_ENV] = prevGate;
         }
         const nOff = await run("okogard", { dryRun: true, aboutPagePreview: true });
         assertEq(nOff.result.about_candidates?.[0]?.chosen, "about_page", "n-5: gate off -> the about page is chosen as before");
+      }
+
+      // ── (o) review: a judge's "no" on the about-page text -> homepage fallback ─
+      {
+        const { HCR_ABOUT_REASON_QUALITY_REJECTED: AVVIS_R, HCR_ABOUT_REASON_NOT_SUPPORTED: NS_R, HCR_ABOUT_REASON_NOT_BETTER: NB_R, HCR_ABOUT_REASON_JUDGE_UNAVAILABLE: UN_R } =
+          require("./admin-knowledge") as typeof import("./admin-knowledge");
+        // Quality AVVIS, dry-run preview: reported.
+        const j1 = stubJudges({ avvisIf: ABOUT_MARKER });
+        const o1 = await run("tveras", { dryRun: true, aboutPagePreview: true, judges: j1 });
+        const x1 = o1.result.about_candidates?.[0];
+        assertEq(j1.candidates, [ABOUT_TEXT, HOME_META], "o-1: the about-page text is judged first, then the homepage candidate");
+        assertEq(
+          [x1?.about_page_judge_rejected, x1?.chosen, x1?.chosen_text, x1?.chosen_source_url, x1?.would_write_about],
+          [AVVIS_R, "homepage", HOME_META, "https://tveras.no/", true],
+          "o-2: preview reports the AVVIS and that the homepage text would be written",
+        );
+        assertEq(
+          o1.result.about_reviews.map((r: any) => [r.about_review.source, r.about_review.decision, r.about_review.candidate]),
+          [["about_page", "skip", ABOUT_TEXT], ["homepage", "write", HOME_META]],
+          "o-3: one about_reviews entry per judged candidate",
+        );
+        assertTrue(!o1.result.skipped_unsubstantiated.some((s: any) => s.agent_id === "tveras"), "o-4: the about-page AVVIS is not a skip reason when the homepage text is written");
+        // Quality AVVIS, apply: HOME_META written with the homepage as source.
+        const o2 = await run("tveras", { dryRun: false, flag: true, judges: stubJudges({ avvisIf: ABOUT_MARKER }) });
+        const r2 = row(o2.db, "tveras");
+        assertEq([r2.about, r2.description], [HOME_META, HOME_META], "o-5: apply writes the homepage text");
+        assertEq(JSON.parse(r2.field_provenance).about[0].source_url, "https://tveras.no/", "o-6: … with the homepage as source_url");
+        // Facts NOT_SUPPORTED, apply.
+        const o3 = await run("tveras", { dryRun: false, flag: true, judges: stubJudges({ notSupportedIf: ABOUT_MARKER }) });
+        assertEq(row(o3.db, "tveras").about, HOME_META, "o-7: NOT_SUPPORTED on the about page -> homepage text written");
+        assertEq(o3.result.about_candidates?.[0]?.about_page_judge_rejected, NS_R, "o-8: … reported as not supported");
+        // Comparison IKKE_BEDRE (stored about present), apply.
+        const o4 = await run("tveras2", { dryRun: false, flag: true, judges: stubJudges({ notBetterIf: ABOUT_MARKER }) });
+        assertEq(row(o4.db, "tveras2").about, HOME_META, "o-9: IKKE_BEDRE on the about page -> homepage text judged and written");
+        assertEq(o4.result.about_candidates?.[0]?.about_page_judge_rejected, NB_R, "o-10: … reported as not better");
+        // A judge that could not answer: no fallback.
+        const j5 = stubJudges({ factsUnavailableIf: ABOUT_MARKER });
+        const o5 = await run("tveras", { dryRun: false, flag: true, judges: j5 });
+        assertEq(row(o5.db, "tveras").about, null, "o-11: unavailable judge on the about page -> no fallback, nothing written");
+        assertEq(j5.candidates, [ABOUT_TEXT], "o-12: … the homepage candidate is never judged");
+        assertEq(
+          [o5.result.about_candidates?.[0]?.chosen, o5.result.about_candidates?.[0]?.about_gate_reason],
+          ["about_page", UN_R],
+          "o-13: … the report keeps the about page and says the judge was unavailable",
+        );
+        assertTrue(o5.result.skipped_unsubstantiated.some((s: any) => s.agent_id === "tveras" && s.reason === UN_R), "o-14: … and skipped_unsubstantiated says so");
+        // Deadline: the about-page judge answers too late to start the homepage judge.
+        const deadlineAt = Date.now() + 1500;
+        const j6 = stubJudges({ avvisIf: ABOUT_MARKER, timeoutMs: 500, delay: { marker: ABOUT_MARKER, until: deadlineAt - 250 } });
+        const o6 = await run("tveras", { dryRun: false, flag: true, judges: j6, deadlineAt });
+        assertEq(j6.candidates, [ABOUT_TEXT], "o-15: no time left for another judge -> the homepage candidate is not judged");
+        assertTrue(o6.result.errors.some((e: any) => e.agent_id === "tveras" && e.error.startsWith("refresh_deadline_exceeded")), "o-16: … the profile is not reached");
+        assertEq(row(o6.db, "tveras").about, null, "o-17: … and nothing is written");
+        // The homepage candidate failed one of its own guards (S3b): no fallback, and its reason is not emitted.
+        const prevGate = process.env[ORGANIC_CLAIM_GATE_ENV];
+        process.env[ORGANIC_CLAIM_GATE_ENV] = "1";
+        try {
+          const j7 = stubJudges({ avvisIf: ABOUT_MARKER });
+          const o7 = await run("okohjem", { dryRun: false, flag: true, judges: j7 });
+          assertEq(j7.candidates, [ABOUT_TEXT], "o-18: homepage text refused by its own guard -> not judged");
+          assertEq(
+            o7.result.skipped_unsubstantiated.filter((s: any) => s.agent_id === "okohjem").map((s: any) => s.reason),
+            [AVVIS_R],
+            "o-19: only the about-page AVVIS is reported — not the homepage's own reason, since no fallback was attempted",
+          );
+          assertEq(row(o7.db, "okohjem").about, null, "o-20: nothing written");
+        } finally {
+          if (prevGate === undefined) delete process.env[ORGANIC_CLAIM_GATE_ENV];
+          else process.env[ORGANIC_CLAIM_GATE_ENV] = prevGate;
+        }
+      }
+
+      // ── (p) review: a judge not started before the deadline is in the report ─
+      {
+        const p1 = await run("tveras", { dryRun: true, aboutPagePreview: true, judges: stubJudges({ timeoutMs: 10_000 }), deadlineAt: Date.now() + 5_000 });
+        const x = p1.result.about_candidates?.[0];
+        assertTrue(p1.result.errors.some((e: any) => e.agent_id === "tveras" && e.error.startsWith("refresh_deadline_exceeded")), "p-1: quality judge not started (less than its timeout left)");
+        assertEq([x?.about_gate_reason, x?.would_write_about], ["refresh_deadline_exceeded", false], "p-2: about_gate_reason says refresh_deadline_exceeded");
       }
 
       // ── (i) route: about_page_preview is honoured only in a dry run ───────

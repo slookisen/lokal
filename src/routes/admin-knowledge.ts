@@ -2231,7 +2231,11 @@ export interface HomepageContentRefreshResult {
    * and not skipped as a theme-spam page (the before/after report).
    */
   about_candidates?: HcrAboutCandidateReport[];
-  /** One entry per profile whose about candidate went to the LLM judges (skive B). */
+  /**
+   * One entry per profile whose about candidate went to the LLM judges (skive
+   * B) — in an about-page run, one per judged candidate (about_review.source),
+   * so up to two for a profile whose about-page text was turned down.
+   */
   about_reviews: Array<{ agent_id: string; about_review: HcrAboutReview }>;
   /** Quality judge said AVVIS. */
   about_judge_rejected: number;
@@ -2256,6 +2260,13 @@ export interface HcrAboutReview {
   decision: "write" | "skip";
   /** Set when a judge could not answer: which one, and why (missing key, timeout, …). */
   unavailable?: string;
+  /**
+   * Only when an about-page candidate was judged (dev-request 2026-10-27-
+   * rfb-berikelse-om-oss-sider-til-beskrivelse; absent otherwise): which
+   * candidate this entry judged — "about_page", and "homepage" for the
+   * homepage candidate judged after a judge turned the about-page text down.
+   */
+  source?: "about_page" | "homepage";
 }
 
 /** The three about judges refreshHomepageContent calls — injectable for tests. Never expected to throw. */
@@ -2367,9 +2378,15 @@ function hcrNormalizeAbout(s: string | null | undefined): string {
  *     "homepage", or "none" when neither cleared its guards), with
  *     chosen_text / chosen_source_url (the about page URL when chosen);
  *   - would_write_about: `about` is in this agent's changed[].fields (dry
- *     run: would be written; apply: was written); about_gate_reason: the
- *     write gate's (canCorrectFactualField) reason for the about candidate,
- *     e.g. curated_locked or new_not_two_tierA_or_owner;
+ *     run: would be written; apply: was written); about_gate_reason: why the
+ *     final about candidate was or was not written — the write gate's
+ *     (canCorrectFactualField) reason (e.g. curated_locked,
+ *     new_not_two_tierA_or_owner), an about judge's rejection reason, or
+ *     refresh_deadline_exceeded when a judge could not be started in time;
+ *   - about_page_judge_rejected: an about judge's reason for turning the
+ *     about-page text down (quality, facts, comparison or unavailable). For
+ *     the first three the homepage candidate is then judged instead, when it
+ *     passed its own deterministic guards — `chosen` becomes "homepage";
  *   - subpages_fetched: the sub-page URLs requested.
  */
 export type HcrAboutCandidateReport = {
@@ -2384,6 +2401,7 @@ export type HcrAboutCandidateReport = {
   chosen_source_url: string | null;
   would_write_about: boolean;
   about_gate_reason: string | null;
+  about_page_judge_rejected: string | null;
   subpages_fetched: string[];
 };
 
@@ -2898,6 +2916,26 @@ export async function refreshHomepageContent(
   // env flag, or a DRY run's explicit preview — never a preview that writes.
   const aboutPageMode = resolveAboutPageMode({ dryRun, previewRequested: opts.aboutPagePreview === true });
   const aboutCandidates: HcrAboutCandidateReport[] = [];
+  // About-page run only: reasons that concern the about-page text alone (the
+  // Økologi S3b refusal of it, a judge rejection the homepage fallback
+  // followed). Moved into skipped_unsubstantiated after the agent is done
+  // ONLY when no about/description was written for it — the morning send
+  // takes an agent's first skipped_unsubstantiated reason as `rejected`.
+  const deferredAboutReasons = new Map<string, string[]>();
+  const deferAboutReason = (agentId: string, reason: string): void => {
+    const list = deferredAboutReasons.get(agentId) ?? [];
+    list.push(reason);
+    deferredAboutReasons.set(agentId, list);
+  };
+  const flushDeferredAboutReasons = (agentId: string): void => {
+    const list = deferredAboutReasons.get(agentId);
+    if (!list) return;
+    deferredAboutReasons.delete(agentId);
+    const aboutWritten = changed.some(
+      (c) => c.agent_id === agentId && (c.fields.includes("about") || c.fields.includes("description")),
+    );
+    if (!aboutWritten) for (const reason of list) skippedUnsubstantiated.push({ agent_id: agentId, reason });
+  };
   // ── Per-agent processing (moved verbatim from the route handler) ────────
   const nowIso = new Date().toISOString();
   let scanned = 0;
@@ -2985,6 +3023,7 @@ export async function refreshHomepageContent(
     try {
       await processOneInner(t);
     } finally {
+      flushDeferredAboutReasons(t.agent_id);
       if (!dryRun) {
         const deadlineHit = errors.some(
           (e) => e.agent_id === t.agent_id && e.error.startsWith(HCR_DEADLINE_EXCEEDED),
@@ -3117,7 +3156,12 @@ export async function refreshHomepageContent(
         organicClaimGateEnabled() &&
         hasUnverifiedOrganicClaim(aboutPageChosen.text, readDebioVerified(db, agentId))
       ) {
-        skippedUnsubstantiated.push({ agent_id: agentId, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
+        // Reported in the about-page report; in skipped_unsubstantiated only
+        // when no about/description is written for the agent in the end
+        // (deferAboutReason) — the morning send reads the FIRST reason there
+        // as its `rejected`, which must not name a text that was never used
+        // while the homepage text is written.
+        deferAboutReason(agentId, REFUSED_ORGANIC_CLAIM_UNVERIFIED);
         logOrganicClaimGate("homepage-content-refresh", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "about-page about/description");
         aboutPageChosen = null;
         aboutPageRefusal = REFUSED_ORGANIC_CLAIM_UNVERIFIED;
@@ -3134,6 +3178,7 @@ export async function refreshHomepageContent(
         chosen_source_url: null,
         would_write_about: false,
         about_gate_reason: null,
+        about_page_judge_rejected: null,
         subpages_fetched: fetched.subpageUrls ?? [],
       };
       aboutCandidates.push(aboutReport);
@@ -3174,8 +3219,15 @@ export async function refreshHomepageContent(
     // reads as contiguous text). Fail-closed: any candidate this cannot
     // verify is dropped, exactly like summarizeAbout had returned nothing —
     // never written, never silently trusted.
-    // (Skipped only when the about-page candidate above replaced it.)
-    if (!aboutPageChosen && meetsAboutQualityBar(aboutSummary)) {
+    //
+    // Evaluated into a verdict first and applied right away — except in an
+    // about-page run whose about page was chosen: there the verdict is held
+    // (homepageAboutFallback) and applied only if a judge below turns the
+    // about-page text down, so none of its reasons is reported unless that
+    // fallback is actually attempted.
+    type HomepageAboutVerdict = { ok: true } | { ok: false; reason: string; log: () => void };
+    const evaluateHomepageAbout = (): HomepageAboutVerdict | null => {
+      if (!meetsAboutQualityBar(aboutSummary)) return null;
       const substantiation = checkAboutCandidateSubstantiatedBySource(
         aboutSummary,
         `${primaryHtml}\n${contentText}`,
@@ -3190,25 +3242,27 @@ export async function refreshHomepageContent(
         // the `about` nor the `description` candidate, same as if
         // summarizeAbout had returned nothing at all.
         if (looksLikeCodeArtifact(aboutSummary)) {
-          skippedUnsubstantiated.push({
-            agent_id: agentId,
+          return {
+            ok: false,
             reason: "about/description candidate looks like a scraped code/script artifact",
-          });
-          console.log(
-            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like scraped code/script artifact (${fetchUrl})`,
-          );
+            log: () =>
+              console.log(
+                `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like scraped code/script artifact (${fetchUrl})`,
+              ),
+          };
         } else if (looksLikeThemeSpam(aboutSummary)) {
           // dev-request 2026-09-16-kaprede-produsentdomener-kasino-spam-i-
           // beskrivelser: belt-and-braces behind the page-level skip above —
           // a summary that reads like gambling copy never becomes a
           // candidate, whatever the page looked like as a whole.
-          skippedUnsubstantiated.push({
-            agent_id: agentId,
+          return {
+            ok: false,
             reason: HCR_THEME_SPAM_CANDIDATE_REASON,
-          });
-          console.log(
-            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,
-          );
+            log: () =>
+              console.log(
+                `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,
+              ),
+          };
         } else if (
           organicClaimGateEnabled() &&
           hasUnverifiedOrganicClaim(aboutSummary, readDebioVerified(db, agentId))
@@ -3216,19 +3270,35 @@ export async function refreshHomepageContent(
           // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): a homepage summary with an
           // organic claim is never written for a producer without a valid
           // Debio status — prose is refused whole, never cut.
-          skippedUnsubstantiated.push({ agent_id: agentId, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
-          logOrganicClaimGate("homepage-content-refresh", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "about/description");
-        } else {
-          candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
-          candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+          return {
+            ok: false,
+            reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+            log: () => logOrganicClaimGate("homepage-content-refresh", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "about/description"),
+          };
         }
-      } else {
-        skippedUnsubstantiated.push({ agent_id: agentId, reason: substantiation.reason });
-        console.log(
-          `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — not substantiated by fetched page (${fetchUrl}): ${substantiation.reason}`,
-        );
+        return { ok: true };
       }
-    }
+      return {
+        ok: false,
+        reason: substantiation.reason,
+        log: () =>
+          console.log(
+            `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — not substantiated by fetched page (${fetchUrl}): ${substantiation.reason}`,
+          ),
+      };
+    };
+    const applyHomepageAbout = (verdict: HomepageAboutVerdict | null): void => {
+      if (!verdict) return;
+      if (verdict.ok) {
+        candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
+        candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+      } else {
+        skippedUnsubstantiated.push({ agent_id: agentId, reason: verdict.reason });
+        verdict.log();
+      }
+    };
+    const homepageAboutFallback = aboutPageChosen ? evaluateHomepageAbout() : null;
+    if (!aboutPageChosen) applyHomepageAbout(evaluateHomepageAbout());
     if (aboutReport) {
       if (aboutPageChosen) {
         aboutReport.chosen = "about_page";
@@ -3374,142 +3444,193 @@ export async function refreshHomepageContent(
     // STARTED with less than its timeout left before deadlineAt: the profile
     // is then not reached (refresh_deadline_exceeded, transient — no strike,
     // no parking, no rotation stamp), exactly like a late fetch.
-    let aboutReview: HcrAboutReview | null = null;
-    let judgedStoredAbout: string | null = null;
-    const aboutCandidate = candidates.find((c) => c.field === "about");
-    if (aboutCandidate) {
-      const candidateText = String(aboutCandidate.value);
-      const dropAboutCandidates = () => {
-        for (let i = candidates.length - 1; i >= 0; i--) {
-          if (candidates[i].field === "about" || candidates[i].field === "description") candidates.splice(i, 1);
-        }
-      };
-      const pre = db
-        .prepare(
-          `SELECT a.name AS name, k.about AS about, k.field_provenance AS field_provenance, k.curated_fields AS curated_fields
-             FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
-            WHERE a.id = ?`,
-        )
-        .get(agentId) as
-        | { name: string | null; about: string | null; field_provenance: string | null; curated_fields: string | null }
-        | undefined;
-      const storedAbout = pre?.about ?? "";
-      const storedNorm = hcrNormalizeAbout(storedAbout);
-      if (storedNorm !== "" && storedNorm === hcrNormalizeAbout(candidateText)) {
-        dropAboutCandidates(); // the stored text already: no judge, no write
-      } else if (hcrAboutGateMayWrite(pre?.field_provenance, pre?.curated_fields, candidateText, aboutCandidate.sourceUrl ?? fetchUrl)) {
-        const producerName = (t.name ?? pre?.name ?? "").trim();
-        const review: HcrAboutReview = {
-          candidate: candidateText,
-          quality: { approved: false, reasoning: "" },
-          facts: null,
-          comparison: null,
-          decision: "skip",
-        };
-        aboutReview = review;
-        aboutReviews.push({ agent_id: agentId, about_review: review });
-        const tooCloseToDeadline = () =>
-          opts.deadlineAt !== undefined && opts.deadlineAt - Date.now() < aboutJudgeTimeoutMs;
-        const pastDeadline = () =>
-          opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt - HCR_DEADLINE_SLACK_MS;
-        const notReached = (detail: string) => {
-          errors.push({ agent_id: agentId, error: `${HCR_DEADLINE_EXCEEDED} for ${t.homepage_url} (${detail})` });
-        };
-        const reject = (reason: string, counter: keyof typeof aboutTally, detail: string) => {
-          aboutTally[counter] += 1;
-          dropAboutCandidates();
-          // About-page preview: say in the per-agent report why nothing is written.
-          if (aboutReport) aboutReport.about_gate_reason = reason;
-          skippedUnsubstantiated.push({ agent_id: agentId, reason });
-          console.log(`[homepage-content-refresh] ${agentId} about/description candidate REJECTED — ${reason}: ${detail}`);
-        };
-        const unavailable = (judge: string, detail: string) => {
-          review.unavailable = `${judge}: ${detail}`;
-          reject(HCR_ABOUT_REASON_JUDGE_UNAVAILABLE, "unavailable", `${judge}: ${detail}`);
-        };
-        const io = () => ({ signal: AbortSignal.timeout(aboutJudgeTimeoutMs) });
-
-        // 1. quality
-        if (tooCloseToDeadline()) {
-          review.quality = { approved: false, reasoning: "ikke startet: for lite tid igjen før fristen" };
-          notReached("about quality judge not started");
-          return;
-        }
-        let quality: RfbJudgeVerdict;
-        try {
-          quality = await aboutJudges.quality(candidateText, producerName, io());
-        } catch (e: any) {
-          quality = { approved: false, reasoning: `dommer kastet: ${e?.message ?? String(e)} — avvist fail-closed` };
-        }
-        if (pastDeadline()) {
-          notReached("about quality judge answered after the deadline");
-          return;
-        }
-        review.quality = { approved: quality.approved, reasoning: quality.reasoning };
-        let approved = false;
-        if (!quality.approved) {
-          if (isRfbJudgeInfraFailure(quality)) unavailable("quality", quality.reasoning);
-          else reject(HCR_ABOUT_REASON_QUALITY_REJECTED, "rejected", quality.reasoning);
-        } else {
-          // 2. facts against the pages fetched above
-          if (tooCloseToDeadline()) {
-            notReached("about facts judge not started");
-            return;
+    // Assigned inside judgeAboutCandidates below (a closure), so declared
+    // without the initializer narrowing them to null.
+    let aboutReview = null as HcrAboutReview | null;
+    let judgedStoredAbout = null as string | null;
+    // About-page run (dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-
+    // beskrivelse): the judges run as passes. The first pass judges whatever
+    // `about` candidate is in `candidates` — the about-page text when one was
+    // chosen. When a judge says no to that text (quality AVVIS, facts
+    // NOT_SUPPORTED, comparison IKKE_BEDRE — never on an unavailable judge or
+    // the deadline), the homepage candidate is judged in a second pass, but
+    // only if it passed every deterministic guard of its own (spec 3:
+    // "otherwise the homepage candidate is used as today"). Each pass has its
+    // own about_reviews entry (`source`: "about_page", then "homepage"), and
+    // the about_* counters count verdicts, so such a profile can count twice.
+    // Without an about-page candidate there is exactly one pass, untagged,
+    // and nothing here differs from a run without the about-page logic.
+    let fallbackRejection = null as string | null;
+    const judgeAboutCandidates = async (pass: {
+      source?: "about_page" | "homepage";
+      fallbackOnReject: boolean;
+    }): Promise<"done" | "not_reached"> => {
+      const aboutCandidate = candidates.find((c) => c.field === "about");
+      if (aboutCandidate) {
+        const candidateText = String(aboutCandidate.value);
+        const dropAboutCandidates = () => {
+          for (let i = candidates.length - 1; i >= 0; i--) {
+            if (candidates[i].field === "about" || candidates[i].field === "description") candidates.splice(i, 1);
           }
-          let facts: AboutJudgeVerdict;
+        };
+        const pre = db
+          .prepare(
+            `SELECT a.name AS name, k.about AS about, k.field_provenance AS field_provenance, k.curated_fields AS curated_fields
+               FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+              WHERE a.id = ?`,
+          )
+          .get(agentId) as
+          | { name: string | null; about: string | null; field_provenance: string | null; curated_fields: string | null }
+          | undefined;
+        const storedAbout = pre?.about ?? "";
+        const storedNorm = hcrNormalizeAbout(storedAbout);
+        if (storedNorm !== "" && storedNorm === hcrNormalizeAbout(candidateText)) {
+          dropAboutCandidates(); // the stored text already: no judge, no write
+        } else if (hcrAboutGateMayWrite(pre?.field_provenance, pre?.curated_fields, candidateText, aboutCandidate.sourceUrl ?? fetchUrl)) {
+          const producerName = (t.name ?? pre?.name ?? "").trim();
+          const review: HcrAboutReview = {
+            candidate: candidateText,
+            quality: { approved: false, reasoning: "" },
+            facts: null,
+            comparison: null,
+            decision: "skip",
+            // About-page run only (absent otherwise): which candidate this pass judged.
+            ...(pass.source ? { source: pass.source } : {}),
+          };
+          aboutReview = review;
+          aboutReviews.push({ agent_id: agentId, about_review: review });
+          const tooCloseToDeadline = () =>
+            opts.deadlineAt !== undefined && opts.deadlineAt - Date.now() < aboutJudgeTimeoutMs;
+          const pastDeadline = () =>
+            opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt - HCR_DEADLINE_SLACK_MS;
+          const notReached = (detail: string) => {
+            errors.push({ agent_id: agentId, error: `${HCR_DEADLINE_EXCEEDED} for ${t.homepage_url} (${detail})` });
+            // About-page report: nothing is written because the judge could not be started/answered in time.
+            if (aboutReport) aboutReport.about_gate_reason = HCR_DEADLINE_EXCEEDED;
+          };
+          const reject = (reason: string, counter: keyof typeof aboutTally, detail: string) => {
+            aboutTally[counter] += 1;
+            dropAboutCandidates();
+            if (aboutReport && pass.source === "about_page") aboutReport.about_page_judge_rejected = reason;
+            if (pass.fallbackOnReject && counter !== "unavailable") {
+              // A judge's "no" on the about-page text: the homepage candidate is
+              // judged next (below). This reason is kept out of
+              // skipped_unsubstantiated unless nothing is written in the end.
+              fallbackRejection = reason;
+              console.log(`[homepage-content-refresh] ${agentId} about-page about/description candidate REJECTED — ${reason}: ${detail}; judging the homepage candidate instead`);
+              return;
+            }
+            // About-page preview: say in the per-agent report why nothing is written.
+            if (aboutReport) aboutReport.about_gate_reason = reason;
+            skippedUnsubstantiated.push({ agent_id: agentId, reason });
+            console.log(`[homepage-content-refresh] ${agentId} about/description candidate REJECTED — ${reason}: ${detail}`);
+          };
+          const unavailable = (judge: string, detail: string) => {
+            review.unavailable = `${judge}: ${detail}`;
+            reject(HCR_ABOUT_REASON_JUDGE_UNAVAILABLE, "unavailable", `${judge}: ${detail}`);
+          };
+          const io = () => ({ signal: AbortSignal.timeout(aboutJudgeTimeoutMs) });
+
+          // 1. quality
+          if (tooCloseToDeadline()) {
+            review.quality = { approved: false, reasoning: "ikke startet: for lite tid igjen før fristen" };
+            notReached("about quality judge not started");
+            return "not_reached";
+          }
+          let quality: RfbJudgeVerdict;
           try {
-            facts = await aboutJudges.facts(
-              { about: candidateText, pages: fetchedPages.map((p) => ({ url: p.url, text: judgePageTextFromHtml(p.html) })) },
-              io(),
-            );
+            quality = await aboutJudges.quality(candidateText, producerName, io());
           } catch (e: any) {
-            facts = { ok: false, failure: "error", reason: `dommer kastet: ${e?.message ?? String(e)}` };
+            quality = { approved: false, reasoning: `dommer kastet: ${e?.message ?? String(e)} — avvist fail-closed` };
           }
           if (pastDeadline()) {
-            notReached("about facts judge answered after the deadline");
-            return;
+            notReached("about quality judge answered after the deadline");
+            return "not_reached";
           }
-          if (!facts.ok) {
-            unavailable("facts", facts.reason);
+          review.quality = { approved: quality.approved, reasoning: quality.reasoning };
+          let approved = false;
+          if (!quality.approved) {
+            if (isRfbJudgeInfraFailure(quality)) unavailable("quality", quality.reasoning);
+            else reject(HCR_ABOUT_REASON_QUALITY_REJECTED, "rejected", quality.reasoning);
           } else {
-            review.facts = { supported: facts.supported, unsupported_claims: facts.unsupportedClaims };
-            if (!facts.supported) {
-              reject(
-                HCR_ABOUT_REASON_NOT_SUPPORTED,
-                "not_supported",
-                facts.unsupportedClaims.join("; ") || facts.reason,
+            // 2. facts against the pages fetched above
+            if (tooCloseToDeadline()) {
+              notReached("about facts judge not started");
+              return "not_reached";
+            }
+            let facts: AboutJudgeVerdict;
+            try {
+              facts = await aboutJudges.facts(
+                { about: candidateText, pages: fetchedPages.map((p) => ({ url: p.url, text: judgePageTextFromHtml(p.html) })) },
+                io(),
               );
-            } else if (storedNorm === "") {
-              approved = true; // nothing stored to compare with
+            } catch (e: any) {
+              facts = { ok: false, failure: "error", reason: `dommer kastet: ${e?.message ?? String(e)}` };
+            }
+            if (pastDeadline()) {
+              notReached("about facts judge answered after the deadline");
+              return "not_reached";
+            }
+            if (!facts.ok) {
+              unavailable("facts", facts.reason);
             } else {
-              // 3. better than the stored text
-              if (tooCloseToDeadline()) {
-                notReached("about comparison judge not started");
-                return;
-              }
-              let cmp: AboutComparisonVerdict;
-              try {
-                cmp = await aboutJudges.comparison({ stored: storedAbout, candidate: candidateText, producerName }, io());
-              } catch (e: any) {
-                cmp = { ok: false, reasoning: `dommer kastet: ${e?.message ?? String(e)}` };
-              }
-              if (pastDeadline()) {
-                notReached("about comparison judge answered after the deadline");
-                return;
-              }
-              if (!cmp.ok) {
-                unavailable("comparison", cmp.reasoning);
+              review.facts = { supported: facts.supported, unsupported_claims: facts.unsupportedClaims };
+              if (!facts.supported) {
+                reject(
+                  HCR_ABOUT_REASON_NOT_SUPPORTED,
+                  "not_supported",
+                  facts.unsupportedClaims.join("; ") || facts.reason,
+                );
+              } else if (storedNorm === "") {
+                approved = true; // nothing stored to compare with
               } else {
-                review.comparison = { verdict: cmp.verdict, reasoning: cmp.reasoning };
-                // Only the exact BEDRE token approves.
-                if (cmp.better && cmp.verdict === "BEDRE") approved = true;
-                else reject(HCR_ABOUT_REASON_NOT_BETTER, "not_better", cmp.reasoning);
+                // 3. better than the stored text
+                if (tooCloseToDeadline()) {
+                  notReached("about comparison judge not started");
+                  return "not_reached";
+                }
+                let cmp: AboutComparisonVerdict;
+                try {
+                  cmp = await aboutJudges.comparison({ stored: storedAbout, candidate: candidateText, producerName }, io());
+                } catch (e: any) {
+                  cmp = { ok: false, reasoning: `dommer kastet: ${e?.message ?? String(e)}` };
+                }
+                if (pastDeadline()) {
+                  notReached("about comparison judge answered after the deadline");
+                  return "not_reached";
+                }
+                if (!cmp.ok) {
+                  unavailable("comparison", cmp.reasoning);
+                } else {
+                  review.comparison = { verdict: cmp.verdict, reasoning: cmp.reasoning };
+                  // Only the exact BEDRE token approves.
+                  if (cmp.better && cmp.verdict === "BEDRE") approved = true;
+                  else reject(HCR_ABOUT_REASON_NOT_BETTER, "not_better", cmp.reasoning);
+                }
               }
             }
           }
+          if (approved) judgedStoredAbout = storedAbout;
         }
-        if (approved) judgedStoredAbout = storedAbout;
       }
+      return "done";
+    };
+    // `source` only when an about-page text is judged: without one, an
+    // about-page run's about_reviews are exactly those of a run without it.
+    const firstPass = await judgeAboutCandidates({
+      ...(aboutPageChosen ? { source: "about_page" as const } : {}),
+      fallbackOnReject: !!aboutPageChosen && homepageAboutFallback?.ok === true,
+    });
+    if (firstPass === "not_reached") return;
+    if (fallbackRejection !== null && homepageAboutFallback?.ok === true) {
+      deferAboutReason(agentId, fallbackRejection);
+      applyHomepageAbout(homepageAboutFallback);
+      if (aboutReport) {
+        aboutReport.chosen = "homepage";
+        aboutReport.chosen_text = aboutSummary;
+        aboutReport.chosen_source_url = fetchUrl;
+      }
+      if ((await judgeAboutCandidates({ source: "homepage", fallbackOnReject: false })) === "not_reached") return;
     }
 
     // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter:
