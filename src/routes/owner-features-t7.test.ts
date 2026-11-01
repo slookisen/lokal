@@ -64,6 +64,7 @@ const IDS = {
   legacyYes: "t7-legacy-yes",
   row: "t7-row",
   old: "t7-old-form",
+  placement: "t7-placement",
   outside: "t7-outside",
 } as const;
 
@@ -73,6 +74,12 @@ const IDS = {
  * OWNER_NEWS_CONSENT_VERSION and a new line here — never an edit of an
  * existing line.
  */
+/** comms.news registry description on origin/main — public pages read it, so T7 must not change it. */
+const MAIN_NEWS_DESCRIPTION = {
+  no: "Om du vil ha nyheter og tips fra Rett fra Bonden på e-post. Vi lagrer svaret ditt med tidspunkt. Vi sender ingen nyhetsbrev automatisk.",
+  en: "Whether you want news and tips from Rett fra Bonden by e-mail. We store your answer with the time. We send no newsletter automatically.",
+};
+
 const PINNED_CONSENT_HASHES: Record<string, string> = {
   "2026-11-01": "7f26084be8b36e9e5aae30575f9857858ff9d3e2b936f2328b856717e3d8adfa",
 };
@@ -316,8 +323,9 @@ export async function runOwnerFeaturesT7Tests(opts: { log?: boolean } = {}): Pro
       assertTrue(comms.includes("Dette er frivillig, og du kan endre det når som helst."), "texts: the subtitle under «Kontakt fra Rett fra Bonden»");
       assertTrue(elementById(b, "gruppe-notify").includes("Beskjeder som hører til noe du har slått på, for eksempel nye bestillinger. Du får dem så lenge det er på."), "texts: the subtitle under «Varsler til deg»");
       assertTrue(newsRow(b).includes("Nyheter om ting du kan bruke, og tips om hvordan flere kunder finner deg. Vi har ikke begynt å sende nyheter ennå. Du kan melde deg av når som helst."), "texts: the row text");
-      const e = reg.findOwnerFeature("comms.news")!;
-      assertTrue(!!e.description.en && e.description.en !== e.description.no && e.description.en.includes("not started sending news yet"), "texts: the row text has an English equivalent");
+      const en = nc.OWNER_NEWS_CONSENT_TEXT.row.en;
+      assertTrue(!!en && en !== nc.OWNER_NEWS_CONSENT_TEXT.row.no && en.includes("not started sending news yet"), "texts: the row text has an English equivalent");
+      assertTrue(!newsRow(b).includes(MAIN_NEWS_DESCRIPTION.no), "texts: the allowlisted row shows the consent text, not the registry description");
       assertTrue(!/hver (uke|måned)|ukentlig|månedlig|en gang i/i.test(q + newsRow(b)), "texts: no promise of frequency");
 
       // Buttons.
@@ -426,7 +434,7 @@ export async function runOwnerFeaturesT7Tests(opts: { log?: boolean } = {}): Pro
       assertTrue(r.status === 303 && /^\/eier\/t7-yes\/valg\?endret=\d+&melding=intro_ja#gruppe-comms$/.test(loc(r)), `yes: 303 …?endret=<n>&melding=intro_ja#gruppe-comms (${loc(r)})`);
       assertEq(rs.resolveOwnerFeature("rfb", id, "comms.news", { db }).value, true, "yes: comms.news is on");
       const a = db.prepare("SELECT key, old_json, new_json, actor, actor_detail, text_version, placement FROM owner_feature_audit WHERE subject_id = ? ORDER BY id").all(id) as any[];
-      assertEq(a, [{ key: "comms.news", old_json: "false", new_json: "true", actor: "owner", actor_detail: `post@${id}.example.no`, text_version: nc.OWNER_NEWS_CONSENT_VERSION, placement: "mine_valg_question" }],
+      assertEq(a, [{ key: "comms.news", old_json: "false", new_json: "true", actor: "owner", actor_detail: `post@${id}.example.no`, text_version: nc.OWNER_NEWS_CONSENT_VERSION, placement: nc.OWNER_NEWS_PLACEMENT_QUESTION }],
         "yes: one audit row with text_version and placement");
       const batchId = Number((/endret=(\d+)/.exec(loc(r)) || [])[1]);
       const batch = db.prepare("SELECT kind FROM owner_feature_change_batch WHERE id = ? AND subject_id = ?").get(batchId, id) as any;
@@ -441,6 +449,7 @@ export async function runOwnerFeaturesT7Tests(opts: { log?: boolean } = {}): Pro
       // «Angre».
       const u = await post(H.angre, id, { batch: String(batchId) });
       assertTrue(u.status === 303 && /#valg-comms\.news$/.test(loc(u)), `yes: «Angre» → 303 to the row (${loc(u)})`);
+      const undoBatchId = Number((/endret=(\d+)/.exec(loc(u)) || [])[1] || 0);
       assertEq(rs.resolveOwnerFeature("rfb", id, "comms.news", { db }).value, false, "yes: after «Angre» comms.news is off");
       assertEq(settingsRows(id), 0, "yes: «Angre» removes the row the answer created");
       assertEq(auditRows(id), 2, "yes: «Angre» is itself audited");
@@ -450,16 +459,42 @@ export async function runOwnerFeaturesT7Tests(opts: { log?: boolean } = {}): Pro
       resetCap();
       await post(H.sett, IDS.row, { key: "comms.news", value: "true", confirmed: "1" });
       const ra = db.prepare("SELECT new_json, text_version, placement FROM owner_feature_audit WHERE subject_id = ? ORDER BY id DESC LIMIT 1").get(IDS.row) as any;
-      assertEq(ra, { new_json: "true", text_version: nc.OWNER_NEWS_CONSENT_VERSION, placement: "mine_valg_row" }, "yes: switched on in the row → text_version + placement mine_valg_row");
+      assertEq(ra, { new_json: "true", text_version: nc.OWNER_NEWS_CONSENT_VERSION, placement: nc.OWNER_NEWS_PLACEMENT_ROW }, "yes: switched on in the row → text_version + placement mine_valg_row");
       assertTrue(!question(await page(IDS.row)), "yes: set in the row → no question");
       await post(H.sett, IDS.row, { key: "orders.enabled", value: "false", confirmed: "1" });
       const nonConsent = db.prepare("SELECT text_version, placement FROM owner_feature_audit WHERE subject_id = ? AND key <> 'comms.news'").all(IDS.row) as any[];
       assertTrue(nonConsent.every((x) => x.text_version === null && x.placement === null), "yes: a non-consent key's audit row carries no consent stamp");
       // A form from a page cached before T7 («Nei takk», answer=no) is an explicit no.
+      // A bogus placement falls back to the question's place.
+      resetCap();
+      await post(H.intro, IDS.placement, { answer: "yes", placement: "oversikt\"><x" });
+      const pa = db.prepare("SELECT placement, text_version FROM owner_feature_audit WHERE subject_id = ? AND key = 'comms.news'").get(IDS.placement) as any;
+      assertEq(pa, { placement: nc.OWNER_NEWS_PLACEMENT_QUESTION, text_version: nc.OWNER_NEWS_CONSENT_VERSION }, "yes: a bogus placement value falls back to mine_valg_question");
+      // ?melding=intro_ja on a batch that is not the «Ja takk» change (here: the undo of it) → the normal message.
+      const nb = await page(IDS.yes, { endret: String(undoBatchId), melding: "intro_ja" });
+      assertTrue(undoBatchId > 0 && nb.includes("Angret. «Nyheter og tips» er Av.") && !nb.includes(nc.OWNER_NEWS_ANSWER_TEXT.yes),
+        "yes: melding=intro_ja with a batch that is not the comms.news «Ja» change shows the normal message");
       const old = await post(H.intro, IDS.old, { answer: "no" });
       assertTrue(loc(old).includes("melding=intro_nei") && prompt(IDS.old)?.state === "never", "yes: an old cached «no» answer = an explicit no");
       assertTrue(loc(await post(H.intro, IDS.order, { answer: "kanskje" })).includes("melding=ugyldig&ved=gruppe-comms#gruppe-comms") && !prompt(IDS.order),
         "yes: a junk answer → «ugyldig» at #gruppe-comms, nothing written");
+    }
+
+    // ── The gårdssalg variant shows neither the group notes nor the question ─
+    {
+      const resolved = rs.resolveOwnerFeatures("rfb", IDS.order, { db });
+      const variant = {
+        vertical: "gardssalg" as const, platformName: "Opplevagent", csEmail: "kontakt@opplevagent.no",
+        pagePath: (tail: string) => `/gardssalg/x/valg${tail}`, backHref: "/gardssalg/x",
+        groups: reg.OWNER_FEATURE_GROUPS, levels: ch.GARDSSALG_OWNER_LEVELS, statusKeys: [], revealKey: "orders.enabled", pauseResumeDate: false,
+      };
+      const body = pg.renderOwnerFeaturesPageBody({
+        agent: { id: IDS.order, name: "Gard" }, resolved, level: null, showIntro: true, newsAnswer: { answer: "yes", at: "2026-10-20T10:00:00.000Z" },
+        notice: null, confirm: null, levelPreview: null, log: { rows: [], page: 1, pages: 1, total: 0 }, variant,
+      });
+      assertTrue(!body.includes(`data-news-question="1"`) && !body.includes("/valg/intro"), "gårdssalg: no news question, even with showIntro");
+      assertTrue(!body.includes(nc.OWNER_COMMS_GROUP_NOTE) && !body.includes(nc.OWNER_NOTIFY_GROUP_NOTE) && !body.includes(`class="mv-desc mv-group-note"`), "gårdssalg: no T7 group notes");
+      assertTrue(!body.includes(nc.OWNER_NEWS_CONSENT_TEXT.row.no) && !body.includes("Du sa ja"), "gårdssalg: the news row keeps its registry text, no «Du sa ja»");
     }
 
     // ── Legacy owner_feature_intro rows count as answered ───────────────────
@@ -506,7 +541,25 @@ export async function runOwnerFeaturesT7Tests(opts: { log?: boolean } = {}): Pro
       assertEq(h, PINNED_CONSENT_HASHES[v], `text: the consent text matches the hash pinned for version ${v} (changed text ⇒ new version)`);
       const changed = { ...nc.OWNER_NEWS_CONSENT_TEXT, body: nc.OWNER_NEWS_CONSENT_TEXT.body + " " };
       assertTrue(nc.ownerNewsConsentHash(changed) !== h, "text: any change to the text changes the hash");
-      assertEq(reg.findOwnerFeature("comms.news")!.description, { no: nc.OWNER_NEWS_CONSENT_TEXT.row.no, en: nc.OWNER_NEWS_CONSENT_TEXT.row.en }, "text: the row text is the versioned consent text");
+      assertEq(reg.findOwnerFeature("comms.news")!.description, MAIN_NEWS_DESCRIPTION, "text: the registry description of comms.news is unchanged from main (public pages read it)");
+      const shown = await page(IDS.order);
+      assertTrue(newsRow(shown).includes(nc.OWNER_NEWS_CONSENT_TEXT.row.no), "text: the versioned row text is what the allowlisted «Mine valg» row shows");
+    }
+
+    // ── B1: the public «For produsenter» page is unchanged (no T7 text before approval) ─
+    {
+      const fp = require("./rfb-for-produsenter") as typeof import("./rfb-for-produsenter");
+      const facts = fp.currentForProdusenterFacts();
+      const no = fp.renderForProdusenterPage("no", "https://rettfrabonden.com/for-produsenter", facts);
+      const en = fp.renderForProdusenterPage("en", "https://rettfrabonden.com/en/for-produsenter", facts);
+      const pageText = (x: { content: string; jsonLd: object }) => x.content + JSON.stringify(x.jsonLd);
+      assertTrue(no.content.includes(`<li><strong>Nyheter og tips</strong>: ${MAIN_NEWS_DESCRIPTION.no}</li>`), "for-produsenter (NO): the comms.news line is exactly as on main");
+      assertTrue(en.content.includes(`<li><strong>News and tips</strong>: ${MAIN_NEWS_DESCRIPTION.en}</li>`), "for-produsenter (EN): the comms.news line is exactly as on main");
+      for (const [lang, x] of [["NO", no], ["EN", en]] as const) {
+        const t = pageText(x);
+        assertTrue(![nc.OWNER_NEWS_CONSENT_TEXT.row.no, nc.OWNER_NEWS_CONSENT_TEXT.row.en, nc.OWNER_NEWS_CONSENT_TEXT.question, nc.OWNER_COMMS_GROUP_NOTE, nc.OWNER_NOTIFY_GROUP_NOTE].some((s) => t.includes(s)),
+          `for-produsenter (${lang}): no T7 text on the public page`);
+      }
     }
 
     // ── Schema ──────────────────────────────────────────────────────────────

@@ -4,7 +4,10 @@
 // row text of comms.news, are the consent text. Every «Ja takk» stores the
 // text version in owner_feature_audit.text_version (with the place it was
 // answered in `placement`), so a stored yes can be read against the exact
-// words the owner saw. Changing any of these strings requires a NEW
+// words the owner saw. The row text is shown only on the allowlisted «Mine
+// valg» page (page.ts); the registry description of comms.news is unchanged,
+// because the public «For produsenter» page reads it. Changing any of these
+// strings requires a NEW
 // version: news-consent's hash is pinned per version in
 // src/routes/owner-features-t7.test.ts, which fails when the text changes
 // under the same version.
@@ -19,7 +22,7 @@ export interface OwnerNewsConsentText {
   later: string;
   laterNote: string;
   never: string;
-  /** The comms.news row description (NO / EN) — the same consent. */
+  /** The comms.news row text on «Mine valg» (NO; EN kept with it) — the same consent. */
   row: { no: string; en: string };
 }
 
@@ -72,3 +75,7 @@ export const OWNER_NEWS_MAX_ROUNDS = 3;
  */
 export const OWNER_NEWS_PLACEMENTS = ["mine_valg_question", "mine_valg_row"] as const;
 export type OwnerNewsPlacement = (typeof OWNER_NEWS_PLACEMENTS)[number];
+/** The question in «Kontakt fra Rett fra Bonden» on «Mine valg». */
+export const OWNER_NEWS_PLACEMENT_QUESTION: OwnerNewsPlacement = OWNER_NEWS_PLACEMENTS[0];
+/** The comms.news row (its switch) on «Mine valg». */
+export const OWNER_NEWS_PLACEMENT_ROW: OwnerNewsPlacement = OWNER_NEWS_PLACEMENTS[1];

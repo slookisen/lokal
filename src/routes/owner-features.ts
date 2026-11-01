@@ -21,6 +21,7 @@ import {
   applyOwnerLevel,
   applyOwnerSingleChange,
   answerOwnerNewsQuestion,
+  batchKeys,
   currentOwnerLevel,
   findOwnerLevel,
   getOwnerChangeBatch,
@@ -31,7 +32,10 @@ import {
   undoOwnerChange,
   type OwnerNewsAnswer,
 } from "../owner-features/changes";
-import { OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, type OwnerNewsPlacement } from "../owner-features/news-consent";
+import {
+  OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
+  type OwnerNewsPlacement,
+} from "../owner-features/news-consent";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
@@ -438,6 +442,14 @@ function batchNotice(agentId: string, batchId: number): OwnerPageNotice | null {
   return { ok: true, text, undoBatchId: undoable && undoable.id === batch.id ? batch.id : null };
 }
 
+/** T7: is batch `batchId` a single comms.news change (not an undo, not a level)? */
+function isNewsBatch(agentId: string, batchId: number): boolean {
+  const batch = getOwnerChangeBatch(VERTICAL, agentId, batchId);
+  if (!batch || batch.kind !== "single") return false;
+  const keys = batchKeys(batch);
+  return keys.length === 1 && keys[0] === "comms.news";
+}
+
 router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
   try {
     const g = pageGate(req);
@@ -461,8 +473,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     if (Number.isFinite(changedId) && changedId > 0) {
       notice = batchNotice(agentId, changedId);
       if (notice && !noticeAt) noticeAt = ownerBatchAnchor(VERTICAL, agentId, changedId, db);
-      // T7: «Ja takk» says so in its own words; «Angre» stays on the message.
-      if (notice && qs("melding") === "intro_ja") notice = { ...notice, text: OWNER_NEWS_ANSWER_TEXT.yes };
+      // T7: «Ja takk» says so in its own words («Angre» stays on the message) —
+      // only when that batch is the comms.news change; else the normal message.
+      if (notice && qs("melding") === "intro_ja" && isNewsBatch(agentId, changedId)) notice = { ...notice, text: OWNER_NEWS_ANSWER_TEXT.yes };
     }
     const msg = own(PAGE_MESSAGES, qs("melding"));
     if (!notice && msg) notice = { ok: msg.ok, text: msg.text };
@@ -557,7 +570,7 @@ router.post("/eier/:agentId/valg/sett", express.urlencoded({ extended: false }),
     // T7: a consent key changed in its row records the place (and, for
     // comms.news, the consent text version) on its audit row.
     const consent = e.consent
-      ? { textVersion: e.key === "comms.news" ? OWNER_NEWS_CONSENT_VERSION : null, placement: "mine_valg_row" }
+      ? { textVersion: e.key === "comms.news" ? OWNER_NEWS_CONSENT_VERSION : null, placement: OWNER_NEWS_PLACEMENT_ROW }
       : null;
     const out = db.transaction(() => {
       const o = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token), consent });
@@ -665,7 +678,7 @@ router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false })
     if (!answer) return backTo(res, agentId, "melding=ugyldig", anchor);
     const placement: OwnerNewsPlacement = (OWNER_NEWS_PLACEMENTS as readonly string[]).includes(String(body.placement))
       ? (body.placement as OwnerNewsPlacement)
-      : "mine_valg_question";
+      : OWNER_NEWS_PLACEMENT_QUESTION;
     const out = answerOwnerNewsQuestion(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) }, { placement });
     if (out.kind !== "ok") return backTo(res, agentId, "melding=ingen_endring", anchor);
     console.log(`[owner-features] owner answered the news question (${answer}) for agent ${agentId}`);

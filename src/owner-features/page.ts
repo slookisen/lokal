@@ -60,7 +60,7 @@ import {
 } from "./anchors";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
 import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
-import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
+import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -638,8 +638,11 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
     confirm = confirmHtml(ctx.m, swap);
     if (confirm) ctx.confirmPlaced = true;
   }
+  // T7: the news row shows the versioned consent text — only here, on the
+  // allowlisted RFB page (the registry description feeds public pages).
+  const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : e.description.no;
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(e.description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }
@@ -823,7 +826,7 @@ function newsQuestionHtml(m: OwnerPageModel, swap: string): string {
   const t = OWNER_NEWS_CONSENT_TEXT;
   const form = (answer: "yes" | "later" | "never", label: string, cls: string) =>
     rowForm(m, "/intro", swap,
-      `<input type="hidden" name="answer" value="${answer}"><input type="hidden" name="placement" value="mine_valg_question">` +
+      `<input type="hidden" name="answer" value="${answer}"><input type="hidden" name="placement" value="${esc(OWNER_NEWS_PLACEMENT_QUESTION)}">` +
       `<button type="submit" class="${cls}">${esc(label)}</button>`);
   return `<div class="mv-question" data-news-question="1" role="group" aria-labelledby="mv-h-intro">
           <h3 id="mv-h-intro">${esc(t.question)}</h3>

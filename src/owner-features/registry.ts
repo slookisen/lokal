@@ -27,7 +27,6 @@
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
 import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
-import { OWNER_NEWS_CONSENT_TEXT } from "./news-consent";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -813,8 +812,13 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "comms.news", group: "comms", type: "switch",
     label: t("Nyheter og tips", "News and tips"),
-    // T7: the row text is part of the versioned consent text (news-consent.ts).
-    description: t(OWNER_NEWS_CONSENT_TEXT.row.no, OWNER_NEWS_CONSENT_TEXT.row.en),
+    // T7: the allowlisted «Mine valg» page shows the versioned consent text
+    // (news-consent.ts) in this row instead; this description stays as it is
+    // because the public «For produsenter» page reads it (not allowlisted).
+    description: t(
+      "Om du vil ha nyheter og tips fra Rett fra Bonden på e-post. Vi lagrer svaret ditt med tidspunkt. Vi sender ingen nyhetsbrev automatisk.",
+      "Whether you want news and tips from Rett fra Bonden by e-mail. We store your answer with the time. We send no newsletter automatically.",
+    ),
     default: { owner: false, unclaimed: false },
     consent: true,
     outward: true,

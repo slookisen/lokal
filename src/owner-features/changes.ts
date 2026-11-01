@@ -28,6 +28,7 @@ import {
 import {
   OWNER_NEWS_CONSENT_VERSION,
   OWNER_NEWS_MAX_ROUNDS,
+  OWNER_NEWS_PLACEMENT_QUESTION,
   OWNER_NEWS_SNOOZE_DAYS,
   type OwnerNewsPlacement,
 } from "./news-consent";
@@ -821,7 +822,7 @@ export function answerOwnerNewsQuestion(
     const prior = explicitRowKeys(db, vertical, subjectId);
     const stamped: OwnerActor = {
       ...actor,
-      consent: { textVersion: OWNER_NEWS_CONSENT_VERSION, placement: opts.placement ?? "mine_valg_question" },
+      consent: { textVersion: OWNER_NEWS_CONSENT_VERSION, placement: opts.placement ?? OWNER_NEWS_PLACEMENT_QUESTION },
     };
     const out = setOwnerFeatureValue(vertical, subjectId, OWNER_INTRO_KEY, true, stamped, o);
     // Refused after all (a lock appeared): keep nothing, not even the «yes» row.
