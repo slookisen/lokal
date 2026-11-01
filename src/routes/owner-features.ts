@@ -31,6 +31,10 @@ import {
   undoOwnerChange,
 } from "../owner-features/changes";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
+import {
+  OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
+  isOwnerPageAnchor, ownerBatchAnchor, ownerPageTail, ownerPlannedAnchor, ownerRowAnchor, ownerUndoAnchor,
+} from "../owner-features/anchors";
 import { getOwnerStats } from "../services/owner-stats-service";
 import { publicStatsMinViews } from "../services/public-stats-threshold";
 import { slugify } from "../utils/slug";
@@ -207,8 +211,14 @@ router.put("/api/owner/:id/features/:key", (req: Request, res: Response) => {
 //   POST /eier/:agentId/valg/intro      { answer: yes|no } first-login card
 // Same order of checks as the API: allowlist (404) → owner session (401) →
 // isVerifiedOwner (403) → [POST] Origin check (403) → per-session write limit
-// (429, shared with PUT). Every write goes through setOwnerFeatureValue.
+// (shared with PUT: the PUT answers 429, a page POST 303 «For mange
+// endringer», T5). Every write goes through setOwnerFeatureValue.
 // POSTs answer 303 back to the page; nothing is e-mailed.
+// T5 (anchor contract, owner-features/anchors.ts): every outcome after the
+// session checks — saved, no change, refused, invalid, rate-limited, failed —
+// is a 303 with the anchor of the card or row the form sits in, and a message
+// carries `ved=<id>` so it is shown there. Only the gate (404/401/403) and the
+// cross-site refusal (403) answer with their own page.
 
 function pagePath(agentId: string, tail = ""): string {
   return `/eier/${encodeURIComponent(agentId)}/valg${tail}`;
@@ -237,15 +247,26 @@ function pageGate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
-/** Origin check + per-session write limit for the page's POSTs. */
-function pageWriteGuard(req: Request, token: string): ((res: Response) => Response) | null {
+/** T5: 303 back to the page — `query` with the message placed at `anchor`, and `#anchor`. */
+function backTo(res: Response, agentId: string, query: string, anchor: string, opts: { place?: boolean } = {}): Response {
+  res.redirect(303, pagePath(agentId, ownerPageTail(query, anchor, opts)));
+  return res;
+}
+
+/**
+ * Origin check + per-session write limit for the page's POSTs. Over the
+ * limit (T5): 303 back to `anchor` with «For mange endringer».
+ */
+function pageWriteGuard(req: Request, token: string, anchor: string | (() => string)): ((res: Response) => Response) | null {
   if (isCrossSiteWrite(req)) {
     const agentId = String((req.params as any).agentId || "");
     return (res: Response) => res.status(403).send(portalWriteRefusedPage(pagePath(agentId), "Tilbake til Mine valg"));
   }
   const capKey = crypto.createHash("sha256").update(token).digest("hex");
   if (writeCap.isOver(capKey)) {
-    return simplePage(429, "For mange endringer", `<h1>For mange endringer</h1><p>Prøv igjen om litt.</p>`);
+    const agentId = String((req.params as any).agentId || "");
+    const at = typeof anchor === "function" ? anchor() : anchor;
+    return (res: Response) => backTo(res, agentId, "melding=for_mange", at);
   }
   writeCap.record(capKey);
   return null;
@@ -284,6 +305,7 @@ const PAGE_MESSAGES: Record<string, { ok: boolean; text: string }> = {
   intro_nei: { ok: true, text: "Takk! Svaret ditt er lagret: ingen nyheter og tips." },
   ugyldig: { ok: false, text: "Verdien er ikke gyldig." },
   feil: { ok: false, text: "Klarte ikke å lagre. Prøv igjen." },
+  for_mange: { ok: false, text: "For mange endringer. Prøv igjen om litt." },
   // S2e
   niva_valgt: { ok: true, text: "Nivået er valgt. Valgene dine var allerede slik, så ingenting annet er endret." },
   interesse: { ok: true, text: "Takk! Vi har notert at du vil ha dette. Ingenting er endret, og vi sender ingen e-post nå." },
@@ -428,8 +450,13 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     const resolvedKey = (k: string) => own(resolved.byKey, k);
 
     let notice: OwnerPageNotice | null = null;
+    // T5: the card or row the message stands in (`ved=`, or the saved batch's own row/card).
+    let noticeAt: string | null = isOwnerPageAnchor(qs("ved")) ? qs("ved") : null;
     const changedId = Number.parseInt(qs("endret"), 10);
-    if (Number.isFinite(changedId) && changedId > 0) notice = batchNotice(agentId, changedId);
+    if (Number.isFinite(changedId) && changedId > 0) {
+      notice = batchNotice(agentId, changedId);
+      if (notice && !noticeAt) noticeAt = ownerBatchAnchor(VERTICAL, agentId, changedId, db);
+    }
     const msg = own(PAGE_MESSAGES, qs("melding"));
     if (!notice && msg) notice = { ok: msg.ok, text: msg.text };
     if (!notice && qs("melding") === "sperret") {
@@ -471,6 +498,7 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
       showIntro: !readOwnerIntro(VERTICAL, agentId) && !newsAnswered,
       notice,
+      noticeAt,
       confirm,
       levelPreview,
       log,
@@ -492,28 +520,30 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
 });
 
 router.post("/eier/:agentId/valg/sett", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  let anchor = OWNER_ANCHOR_FALLBACK;
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
-    const guard = pageWriteGuard(req, g.token);
-    if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const key = typeof body.key === "string" ? body.key : "";
     const e = findOwnerFeature(key);
-    if (!e) return res.redirect(303, pagePath(agentId, "?melding=ugyldig"));
+    if (e) anchor = ownerRowAnchor(e.key);
+    const guard = pageWriteGuard(req, g.token, anchor);
+    if (guard) return guard(res);
+    if (!e) return backTo(res, agentId, "melding=ugyldig", anchor);
     const value = formValue(e, body.value);
-    // In-page confirm panel first for entries with confirmOn / confirmOff.
+    // In-page confirm panel first for entries with confirmOn / confirmOff (T5: inside the row).
     if (body.confirmed !== "1" && typeof value === "boolean" && (value ? e.confirmOn : e.confirmOff)
         && canAttempt(resolveOwnerFeatures(VERTICAL, agentId).byKey[key])) {
-      return res.redirect(303, pagePath(agentId, `?bekreft=${encodeURIComponent(key)}&verdi=${value ? "1" : "0"}#bekreft`));
+      return backTo(res, agentId, `bekreft=${encodeURIComponent(key)}&verdi=${value ? "1" : "0"}`, anchor, { place: false });
     }
     // S2e: the pause keeps the /eier card's optional resume date.
     let until: string | null = null;
     const rawUntil = typeof body.until === "string" ? body.until.trim() : "";
     if (e.key === "visibility.profile" && value === false && rawUntil !== "") {
       until = parseResumeDate(rawUntil);
-      if (!until) return res.redirect(303, pagePath(agentId, "?melding=ugyldig_dato"));
+      if (!until) return backTo(res, agentId, "melding=ugyldig_dato", anchor);
     }
     const db = getDb();
     const out = db.transaction(() => {
@@ -525,86 +555,100 @@ router.post("/eier/:agentId/valg/sett", express.urlencoded({ extended: false }),
     })();
     const r = out.result;
     if (r.kind === "ok") {
-      if (!r.changed) return res.redirect(303, pagePath(agentId, "?melding=ingen_endring"));
+      if (!r.changed) return backTo(res, agentId, "melding=ingen_endring", anchor);
       console.log(`[owner-features] owner set ${key} for agent ${agentId} (page)`);
-      return res.redirect(303, pagePath(agentId, `?endret=${out.batchId}#valg-${encodeURIComponent(key)}`));
+      return backTo(res, agentId, `endret=${out.batchId}`, anchor, { place: false });
     }
-    if (r.kind === "blocked") return res.redirect(303, pagePath(agentId, `?melding=sperret&nokkel=${encodeURIComponent(key)}`));
-    if (r.kind === "invalid_value") return res.redirect(303, pagePath(agentId, "?melding=ugyldig"));
-    return res.redirect(303, pagePath(agentId, "?melding=feil"));
+    if (r.kind === "blocked") return backTo(res, agentId, `melding=sperret&nokkel=${encodeURIComponent(key)}`, anchor);
+    if (r.kind === "invalid_value") return backTo(res, agentId, "melding=ugyldig", anchor);
+    return backTo(res, agentId, "melding=feil", anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/sett failed:", e);
-    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+    return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
 
 router.post("/eier/:agentId/valg/niva", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const anchor = OWNER_ANCHOR_LEVEL;
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
-    const guard = pageWriteGuard(req, g.token);
+    const guard = pageWriteGuard(req, g.token, anchor);
     if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const level = findOwnerLevel(body.level);
-    if (!level) return res.redirect(303, pagePath(agentId, "?melding=ugyldig"));
-    if (body.confirmed !== "1") return res.redirect(303, pagePath(agentId, `?niva=${encodeURIComponent(level.key)}#bekreft`));
+    if (!level) return backTo(res, agentId, "melding=ugyldig", anchor);
+    // T5: the preview stands inside the level card.
+    if (body.confirmed !== "1") return backTo(res, agentId, `niva=${encodeURIComponent(level.key)}`, OWNER_ANCHOR_LEVEL_PREVIEW, { place: false });
     const out = applyOwnerLevel(VERTICAL, agentId, level.key, { actor: "owner", detail: sessionEmail(g.token) });
-    if (out.kind !== "ok") return res.redirect(303, pagePath(agentId, "?melding=feil"));
+    if (out.kind !== "ok") return backTo(res, agentId, "melding=feil", anchor);
     if (out.batchId) {
       console.log(`[owner-features] owner chose level ${level.key} for agent ${agentId}: ${out.changed.join(",")}`);
-      return res.redirect(303, pagePath(agentId, `?endret=${out.batchId}#niva`));
+      return backTo(res, agentId, `endret=${out.batchId}`, anchor, { place: false });
     }
     if (out.skipped.length) {
-      return res.redirect(303, pagePath(agentId, `?melding=hoppet&nokkel=${encodeURIComponent(out.skipped.map((s) => s.key).join(","))}#niva`));
+      return backTo(res, agentId, `melding=hoppet&nokkel=${encodeURIComponent(out.skipped.map((s) => s.key).join(","))}`, anchor);
     }
-    return res.redirect(303, pagePath(agentId, "?melding=niva_valgt#niva"));
+    return backTo(res, agentId, "melding=niva_valgt", anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/niva failed:", e);
-    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+    return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
 
 router.post("/eier/:agentId/valg/angre", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  let anchor = OWNER_ANCHOR_FALLBACK;
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
-    const guard = pageWriteGuard(req, g.token);
-    if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const batchId = Number.parseInt(String(body.batch ?? ""), 10);
-    if (!Number.isFinite(batchId) || batchId <= 0) return res.redirect(303, pagePath(agentId, "?melding=angre_umulig"));
+    // T5: «Angre» returns to the row or card that was undone (read after the Origin check).
+    let placed = false;
+    const undoAnchor = () => {
+      if (!placed) { anchor = ownerUndoAnchor(VERTICAL, agentId, batchId); placed = true; }
+      return anchor;
+    };
+    const guard = pageWriteGuard(req, g.token, undoAnchor);
+    if (guard) return guard(res);
+    undoAnchor();
+    if (!Number.isFinite(batchId) || batchId <= 0) return backTo(res, agentId, "melding=angre_umulig", anchor);
     const out = undoOwnerChange(VERTICAL, agentId, batchId, { actor: "owner", detail: sessionEmail(g.token) });
     if (out.kind === "ok") {
       console.log(`[owner-features] owner undid batch ${batchId} for agent ${agentId}`);
-      return res.redirect(303, pagePath(agentId, out.batchId ? `?endret=${out.batchId}` : "?melding=angret"));
+      return out.batchId
+        ? backTo(res, agentId, `endret=${out.batchId}`, anchor, { place: false })
+        : backTo(res, agentId, "melding=angret", anchor);
     }
-    if (out.kind === "changed_since") return res.redirect(303, pagePath(agentId, "?melding=angre_endret"));
-    if (out.kind === "blocked") return res.redirect(303, pagePath(agentId, `?melding=sperret&nokkel=${encodeURIComponent(out.key)}`));
-    return res.redirect(303, pagePath(agentId, "?melding=angre_umulig"));
+    if (out.kind === "changed_since") return backTo(res, agentId, "melding=angre_endret", anchor);
+    if (out.kind === "blocked") return backTo(res, agentId, `melding=sperret&nokkel=${encodeURIComponent(out.key)}`, anchor);
+    return backTo(res, agentId, "melding=angre_umulig", anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/angre failed:", e);
-    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+    return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
 
 router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  // T5: the news question's answer lands on its group (the row: #valg-comms.news).
+  const anchor = OWNER_ANCHOR_NEWS_QUESTION;
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
-    const guard = pageWriteGuard(req, g.token);
+    const guard = pageWriteGuard(req, g.token, anchor);
     if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const answer = body.answer === "yes" ? "yes" : body.answer === "no" ? "no" : null;
-    if (!answer) return res.redirect(303, pagePath(agentId, "?melding=ugyldig"));
+    if (!answer) return backTo(res, agentId, "melding=ugyldig", anchor);
     const out = answerOwnerIntro(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) });
-    if (out.batchId) return res.redirect(303, pagePath(agentId, `?endret=${out.batchId}`));
-    return res.redirect(303, pagePath(agentId, `?melding=${answer === "yes" ? "intro_ja" : "intro_nei"}`));
+    if (out.batchId) return backTo(res, agentId, `endret=${out.batchId}`, anchor, { place: false });
+    return backTo(res, agentId, `melding=${answer === "yes" ? "intro_ja" : "intro_nei"}`, anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/intro failed:", e);
-    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+    return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
 
@@ -622,33 +666,37 @@ router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false })
 // → Origin → per-session write limit.
 
 router.post("/eier/:agentId/valg/interesse", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  let anchor = OWNER_ANCHOR_PLANNED;
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
-    const guard = pageWriteGuard(req, g.token);
-    if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const key = typeof body.key === "string" ? body.key : "";
+    const planned = findOwnerFeature(key);
+    if (planned && planned.status === "coming_soon") anchor = ownerPlannedAnchor(planned.key);
+    const guard = pageWriteGuard(req, g.token, anchor);
+    if (guard) return guard(res);
     const out = recordOwnerFeatureInterest(VERTICAL, agentId, key, sessionEmail(g.token));
-    if (out.kind !== "ok") return res.redirect(303, pagePath(agentId, "?melding=ugyldig#planlagt"));
+    if (out.kind !== "ok") return backTo(res, agentId, "melding=ugyldig", OWNER_ANCHOR_PLANNED);
     if (out.created) console.log(`[owner-features] owner interest in ${key} for agent ${agentId}`);
-    return res.redirect(303, pagePath(agentId, `?melding=${out.created ? "interesse" : "interesse_finnes"}#planlagt-${encodeURIComponent(key)}`));
+    return backTo(res, agentId, `melding=${out.created ? "interesse" : "interesse_finnes"}`, ownerPlannedAnchor(key));
   } catch (e: any) {
     console.error("[owner-features] POST valg/interesse failed:", e);
-    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+    return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);
   }
 });
 
 router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+  const anchor = ownerRowAnchor("orders.email");
   try {
     const g = pageGate(req);
     if (!g.ok) return g.send(res);
-    const guard = pageWriteGuard(req, g.token);
+    const guard = pageWriteGuard(req, g.token, anchor);
     if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
-    const back = (melding: string) => res.redirect(303, pagePath(agentId, `?melding=${melding}#valg-orders.email`));
+    const back = (melding: string) => backTo(res, agentId, `melding=${melding}`, anchor);
     const out = await requestOwnerOrderEmailChange(req, agentId, body.email);
     if (out.status === 200) {
       console.log(`[owner-features] owner requested a new order address for agent ${agentId} (page)`);
@@ -659,7 +707,7 @@ router.post("/eier/:agentId/valg/ordre-epost", express.urlencoded({ extended: fa
     return back("ordre_epost_feil");
   } catch (e: any) {
     console.error("[owner-features] POST valg/ordre-epost failed:", e);
-    return simplePage(500, "Feil", `<h1>Noe gikk galt</h1><p>Prøv igjen senere.</p>`)(res);
+    return backTo(res, String(req.params.agentId || ""), "melding=ordre_epost_feil", anchor);
   }
 });
 
