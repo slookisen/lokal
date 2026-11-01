@@ -2014,11 +2014,11 @@ function captureFromInvitation(): { subject: string; html: string; text: string 
     captured = { subject: opts.subject };
     return { success: true, messageId: "test" };
   };
-  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/admin");
+  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/magic-link-verify?token=abc", "agent-1");
   assertEq(
     captured ? captured.subject : "",
-    "Gratulerer! Test Gård er nå ditt på Rett fra Bonden",
-    "email: confirmation subject byte-identical",
+    "Profilen til Test Gård er nå din på Rett fra Bonden",
+    "email: confirmation subject byte-identical (K5 text)",
   );
 }
 
@@ -6202,6 +6202,20 @@ const _m2Promise = (async function runOwnerPortalTests() {
         used_at TEXT,
         created_at TEXT DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL
+      );
+      -- K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post):
+      -- request-magic-link also accepts a verified claimant's address, so it
+      -- reads agent_claims for any address that is not agent_knowledge.email.
+      CREATE TABLE agent_claims (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        claimant_name TEXT NOT NULL,
+        claimant_email TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        claim_token TEXT,
+        claim_token_expires_at TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        verified_at TEXT
       );
       CREATE TABLE agent_knowledge_audit (
         id TEXT PRIMARY KEY,
@@ -49976,6 +49990,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-claim-kravflyt: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K5: Daniel's
+// approval mails «Profilen til X er nå din» with a one-time 15-minute login
+// straight into /eier (a fresh 7-day session, not the mailed token), and the
+// /eier login also accepts this agent's verified owner's confirmed address.
+// Pins getDb() to its own in-memory DB, stubs the e-mail transporter, runs an
+// in-process server, sets APP_URL/ADMIN_KEY (all restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt K5: approval mail + owner-portal login for the confirmed address ──");
+  try {
+    const { runRfbClaimK5GratulererTests } = require("../src/routes/rfb-claim-k5-gratulerer.test") as
+      typeof import("../src/routes/rfb-claim-k5-gratulerer.test");
+    const k5 = await runRfbClaimK5GratulererTests({ log: false });
+    passed += k5.passed;
+    failed += k5.failed;
+    for (const f of k5.failures) failures.push("rfb-claim-k5-gratulerer: " + f);
+    console.log(`  rfb-claim-k5-gratulerer: ${k5.passed} passed, ${k5.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-k5-gratulerer: unexpected error: " + String(err?.message || err));
   }
 });
 

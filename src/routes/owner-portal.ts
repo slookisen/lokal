@@ -113,7 +113,8 @@ interface SessionData {
 // ─────────────────────────────────────────────────────────────────
 // POST /api/agents/:id/request-magic-link
 // ─────────────────────────────────────────────────────────────────
-// 1. Validate email matches agent's registered email (case-insensitive)
+// 1. Validate email matches agent's registered email (case-insensitive), or
+//    the confirmed address of this agent's verified owner (K5, below)
 // 2. Rate-limit: max 3 requests per hour
 // 3. Generate secure token
 // 4. Store in magic_links table
@@ -146,11 +147,20 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
       .prepare("SELECT name FROM agents WHERE id = ?")
       .get(id) as any;
 
-    if (
-      !agentKnowledge ||
-      !agentKnowledge.email ||
-      agentKnowledge.email.toLowerCase() !== email.toLowerCase()
-    ) {
+    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): an owner
+    // Daniel approved by hand is bound to the address he approved
+    // (agent_claims.claimant_email, status 'verified'), often because the one
+    // on the profile was wrong — and approval never touches
+    // agent_knowledge.email. That confirmed address logs in too, for THIS
+    // agent only. Any other address gets the same 404 as before. The link goes
+    // to the confirmed address (normalized), not to the typed variant of it.
+    const knowledgeMatch =
+      !!agentKnowledge &&
+      !!agentKnowledge.email &&
+      agentKnowledge.email.toLowerCase() === email.toLowerCase();
+    const claimantEmail = knowledgeMatch ? null : verifiedClaimantEmailFor(String(id), email);
+
+    if (!knowledgeMatch && !claimantEmail) {
       console.log(
         `[owner-portal] Email mismatch for ${id}: provided=${emailLogLabel(email)}, registered=${emailLogLabel(agentKnowledge?.email)}`
       );
@@ -197,24 +207,15 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
       });
     }
 
-    // 3. Generate secure token
-    const token = crypto.randomBytes(32).toString("hex");
-    const now = new Date();
-    const expiresAt = new Date(now.getTime() + MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000);
-
-    // 4. Insert into magic_links
-    const linkId = `ml_${crypto.randomBytes(8).toString("hex")}`;
-    db.prepare(
-      `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
-       VALUES (?, ?, ?, ?, 0, ?, ?)`
-    ).run(linkId, email, token, id, now.toISOString(), expiresAt.toISOString());
+    // 3 + 4. Generate secure token, insert into magic_links (shared helper)
+    const recipient = claimantEmail ?? email;
+    const { linkId, verifyUrl } = createOwnerLoginLink(String(id), recipient, "request");
 
     console.log(`[owner-portal] Created magic link ${linkId} for ${id}`);
 
     // 5. Send email — agent-name aware template per Phase 5.4a M2 spec B2
-    const verifyUrl = `https://rettfrabonden.com/magic-link-verify?token=${token}`;
     const emailResult = await emailService.sendOwnerMagicLink({
-      to: email,
+      to: recipient,
       agentName,
       verifyUrl,
     });
@@ -251,6 +252,8 @@ router.post("/api/agents/:id/request-magic-link", async (req: Request, res: Resp
 // 2. Mark token as used
 // 3. Set HttpOnly session cookie
 // 4. Redirect to edit page
+// (A claim-approval link, "mlclaim_", is one-time and opens a fresh session
+// row instead — see createOwnerLoginLink.)
 
 router.get("/magic-link-verify", (req: Request, res: Response) => {
   try {
@@ -283,19 +286,34 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
 
     const agentId = magicLink.agent_id;
 
-    // 2. Mark as used
-    db.prepare(
-      `UPDATE magic_links SET used = 1, used_at = datetime('now') WHERE token = ?`
-    ).run(token);
+    if (String(magicLink.id || "").startsWith(OWNER_CLAIM_LINK_ID_PREFIX)) {
+      // K5: the claim-approval link is one-time. Burn it (used = 1 AND
+      // expired, so the mailed token is no session either; `used = 0` in the
+      // WHERE makes a second click — or a race — lose) and open a fresh 7-day
+      // session row, so the 15-minute link life is not the session's life.
+      const burned = db.prepare(
+        `UPDATE magic_links SET used = 1, used_at = datetime('now'), expires_at = ? WHERE token = ? AND used = 0`
+      ).run(new Date(Date.now() - 1000).toISOString(), token);
+      if (burned.changes === 0) {
+        console.log(`[owner-portal] Claim login link already used: ${tokenLogLabel(token)}`);
+        return res.redirect(302, "/?error=invalid_token");
+      }
+      openOwnerSession(res, agentId, String(magicLink.email || ""));
+    } else {
+      // 2. Mark as used
+      db.prepare(
+        `UPDATE magic_links SET used = 1, used_at = datetime('now') WHERE token = ?`
+      ).run(token);
 
-    // 3. Set HttpOnly cookie
-    res.cookie("rfb_owner_session", token, {
-      path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-      httpOnly: true,
-      secure: true,
-      sameSite: "lax",
-    });
+      // 3. Set HttpOnly cookie
+      res.cookie("rfb_owner_session", token, {
+        path: "/",
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+      });
+    }
 
     // Skive 3b-2 (PRODUCT_IMPORT_OUTREACH_ENABLED): back to the outreach
     // landing page the owner came from (rfb_owner_return cookie), only when it
@@ -498,6 +516,19 @@ function setOwnerSessionCookie(res: Response, token: string): void {
   });
 }
 
+/** A fresh /eier session (magic_links row, used = 1, ISO timestamps, 7 days) + its cookie. */
+function openOwnerSession(res: Response, agentId: string, email: string): void {
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
+  getDb().prepare(
+    `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+  ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
+    now.toISOString(), now.toISOString(), expiresAt.toISOString());
+  setOwnerSessionCookie(res, token);
+}
+
 /**
  * OWNER_UNIFIED_SESSION_ENABLED: called by the /selger login after a verified
  * claimant redeemed their magic link. Opens the /eier session (a fresh
@@ -515,17 +546,67 @@ export function issueOwnerSessionForSelgerLogin(
   if (!ownerUnifiedSessionEnabled() || !agentId || !email) return false;
   const existing = verifyOwnerSession(req);
   if (existing.valid && existing.agentId === agentId) return false;
-  const token = crypto.randomBytes(32).toString("hex");
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + OWNER_SESSION_VALID_MS);
-  getDb().prepare(
-    `INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at)
-     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
-  ).run(`${OWNER_SESSION_ID_PREFIX}${crypto.randomBytes(8).toString("hex")}`, email, token, agentId,
-    now.toISOString(), now.toISOString(), expiresAt.toISOString());
-  setOwnerSessionCookie(res, token);
+  openOwnerSession(res, agentId, email);
   console.log(`[owner-portal] unified session opened for ${agentId} from /selger login`);
   return true;
+}
+
+// ── E-mailed /eier login links (K5, dev-request
+//    2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post) ──────────────────
+// One insert for both mails that carry a /magic-link-verify link:
+//   "request"         POST /api/agents/:id/request-magic-link — "ml_" row,
+//                     7 days, the token itself becomes the session (as before);
+//   "claim_approval"  POST /admin/agents/claim-review-approve — "mlclaim_"
+//                     row, 15 minutes (the mail says so), one-time:
+//                     /magic-link-verify burns it and opens a fresh 7-day
+//                     session row, so the mailed token is never a session.
+// No rate limit in here. request-magic-link checks its visitor limit before
+// calling; Daniel's approval is not held by it. An "mlclaim_" row is an
+// e-mail, so it still counts toward that limit — a visitor gets fewer mails
+// in that hour, never more.
+// The link base is APP_URL (default https://rettfrabonden.com), as the other
+// RFB owner mails build theirs (the old request-magic-link URL was the same
+// host hard-coded).
+const OWNER_CLAIM_LINK_ID_PREFIX = "mlclaim_";
+const OWNER_CLAIM_LINK_VALID_MS = 15 * 60 * 1000;
+
+/** APP_URL (default https://rettfrabonden.com) without a trailing slash. */
+function ownerLinkBaseUrl(): string {
+  return (process.env.APP_URL || "https://rettfrabonden.com").replace(/\/+$/, "");
+}
+
+/** Writes one e-mailed /eier login link (magic_links, used = 0) and returns its verify URL. */
+export function createOwnerLoginLink(
+  agentId: string,
+  email: string,
+  kind: "request" | "claim_approval",
+): { linkId: string; token: string; verifyUrl: string } {
+  const token = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const validMs = kind === "claim_approval" ? OWNER_CLAIM_LINK_VALID_MS : MAGIC_LINK_VALID_HOURS * 60 * 60 * 1000;
+  const prefix = kind === "claim_approval" ? OWNER_CLAIM_LINK_ID_PREFIX : "ml_";
+  const linkId = `${prefix}${crypto.randomBytes(8).toString("hex")}`;
+  getDb().prepare(
+    `INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?)`
+  ).run(linkId, email, token, agentId, now.toISOString(), new Date(now.getTime() + validMs).toISOString());
+  return { linkId, token, verifyUrl: `${ownerLinkBaseUrl()}/magic-link-verify?token=${token}` };
+}
+
+/**
+ * `email` normalized (trim + lower case — normalizeEmail, as the claim flow
+ * stores claimant_email) when it is the confirmed address of THIS agent's
+ * verified owner (agent_claims.status = 'verified'); else null. Pending,
+ * rejected or superseded claims, and verified owners of other agents, never
+ * match.
+ */
+function verifiedClaimantEmailFor(agentId: string, email: string): string | null {
+  const wanted = normalizeEmail(email);
+  if (!agentId || !wanted) return null;
+  const rows = getDb()
+    .prepare(`SELECT claimant_email FROM agent_claims WHERE agent_id = ? AND status = 'verified'`)
+    .all(agentId) as Array<{ claimant_email: string | null }>;
+  return rows.some((r) => normalizeEmail(r.claimant_email) === wanted) ? wanted : null;
 }
 
 /**

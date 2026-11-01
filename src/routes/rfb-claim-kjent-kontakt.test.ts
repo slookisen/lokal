@@ -479,8 +479,13 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       eq(a.status, 200, "ac6: approve → 200");
       eq([a.body?.isVerified, a.body?.loginLinkSent, a.body?.sentTo], [true, true, maskEmail("kari@gmail.example.test")], "ac6: badge (discovery origin), login link sent, masked");
       eq([mails.length, mails[mails.length - 1]?.to], [before + 1, "kari@gmail.example.test"], "ac6: one mail, to the approved address");
-      ok(/\/api\/marketplace\/auth\/m\/[0-9a-f]{64}/.test(mails[mails.length - 1]?.text ?? ""), "ac6: the mail carries a one-time login link");
-      ok(!(mails[mails.length - 1]?.text ?? "").includes("claim_"), "ac6: the claim token itself is never mailed");
+      // K5: the one-time link is an owner-portal login (/magic-link-verify) for the approved address and this agent.
+      const ac6Token = ((mails[mails.length - 1]?.text ?? "").match(/\/magic-link-verify\?token=([0-9a-f]{64})/) ?? [])[1] ?? "";
+      const ac6Link = db.prepare("SELECT id, email, agent_id, used FROM magic_links WHERE token = ?").get(ac6Token) as any;
+      ok(!!ac6Link && ac6Link.id.startsWith("mlclaim_") && [ac6Link.email, ac6Link.agent_id, ac6Link.used].join("|") === "kari@gmail.example.test|ac2|0",
+        "ac6: the mail carries a one-time owner-portal login link for the approved address and this profile");
+      ok(!/\/api\/marketplace\/auth\/m\//.test(mails[mails.length - 1]?.text ?? ""), "ac6: … no longer the /selger marketplace link");
+      ok(!(mails[mails.length - 1]?.text ?? "").includes("claim_") && !(mails[mails.length - 1]?.html ?? "").includes("claim_"), "ac6: the claim token itself is never mailed");
       const row = claimRow(queuedNoEmail);
       eq([row.status, row.verification_method, row.claimant_email], ["verified", "manual", "kari@gmail.example.test"], "ac6: the claim is verified, manual, bound to the approved address");
       ok(!!row.claim_token && knowledgeService.getClaimByToken(row.claim_token)?.agentId === "ac2", "ac6: the token authorizes the profile");
@@ -498,7 +503,7 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       ok(["annen@ac3.example.test", "kopi@ac3.example.test"].includes(hasOwnerEntry.claimant_email) && claimRow(hasOwnerEntry.id).claimant_email_typed === hasOwnerEntry.claimant_email,
         "ac6: … the address the claimant typed is kept for audit");
       eq(knowledgeService.getClaimByToken(ownerToken)?.agentId, "ac3", "ac6: the existing owner's token still works after a second owner is approved");
-      ok(!mails.some((m) => m.to === "post@ac3.example.test" && m.subject.startsWith("Gratulerer")), "ac6: the existing owner gets no mail");
+      ok(!mails.some((m) => m.to === "post@ac3.example.test" && m.subject.startsWith("Profilen til")), "ac6: the existing owner gets no mail");
       eq((await invoke(approveH, makeReq({ headers: admin, body: { claimId: claimsOf("ac3").find((c) => c.status === "pending_review").id, email: "ikke en adresse" } }))).status, 400,
         "ac6: an invalid approved address → 400");
 
