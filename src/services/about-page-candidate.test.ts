@@ -28,6 +28,9 @@ import {
   producerNameTokens,
   aboutPageNamesProducer,
   ABOUT_PAGE_NOT_ABOUT_PRODUCER,
+  aboutPageContentWindow,
+  aboutPageTextLooksLikeScript,
+  ABOUT_PAGE_SCAN_CAP,
 } from "./about-page-candidate";
 import {
   summarizeAboutPageProse,
@@ -385,6 +388,99 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
       assertTrue(aboutPageTextIncluded(html, extractVisibleText(`${home}\n${html}`)), "incl-1: about prose present in the combined text");
       assertTrue(!aboutPageTextIncluded(html, extractVisibleText(home)), "incl-2: only the shared nav present -> false");
       assertTrue(!aboutPageTextIncluded("", "x"), "incl-3: empty page -> false");
+    }
+    // ── 10. The content window (AC2 preview 2026-11-01) ─────────────────────
+    // Measured on 8 real «Om oss» pages: <body> started at 26–377 kB, behind
+    // inline CSS and scripts, so a scan of the first ABOUT_PAGE_SCAN_CAP chars
+    // of the RAW page saw only <head> (7 of 9 pages: no_prose), and a
+    // <script> crossing that cut leaked into the candidate as «prose».
+    {
+      const url = "https://tveras.no/om-oss";
+      const bigHead = (n: number): string =>
+        `<head><title>Om oss – Tverås Gårdsmat</title><style>${".a{color:red}\n".repeat(Math.ceil(n / 13))}</style></head>`;
+      const page = (head: string, body: string): string => `<!doctype html><html>${head}<body>${body}</body></html>`;
+      const main = `<main><h1>Om oss</h1><p>${LONG_PROSE_1}</p><p>${LONG_PROSE_2}</p></main>`;
+
+      // A real CMS shape: 60 kB of inline CSS in <head>, the prose in <main>.
+      const cms = page(bigHead(60_000), `<header><nav><a href="/">Hjem</a></nav></header>${main}`);
+      assertTrue(cms.indexOf("<body") > ABOUT_PAGE_SCAN_CAP, "win-0: fixture's <body> starts beyond ABOUT_PAGE_SCAN_CAP");
+      const cmsPick = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: cms }], producerName: "Tverås Gårdsmat" });
+      assertEq(cmsPick.evaluated[0]?.verdict, "chosen", "win-1: prose behind a 60 kB <head> is read (was no_prose)");
+      assertTrue((cmsPick.chosen?.text ?? "").startsWith("Tverås er en familiegård"), "win-2: the candidate is the page's own first paragraph");
+      assertTrue(aboutPageTextIncluded(cms, `x ${LONG_PROSE_1} y`), "win-3: aboutPageTextIncluded reads the same window");
+
+      // The Granum shape: a <script> that starts inside the first 25 000
+      // chars and ends after them, then the prose.
+      const js = "(function () { 'use strict'; var path = window.location.pathname; var seoMap = { '/': { title: 'Om oss', description: 'Håndbakte brød og kaker fra bakeriet vårt siden 1991.' } }; })();";
+      const crossing = page(
+        `<head><title>Om oss – Tverås Gårdsmat</title><style>${"x".repeat(22_000)}</style><script>${js}${" ".repeat(8_000)}</script></head>`,
+        main,
+      );
+      const crossPick = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: crossing }], producerName: "Tverås Gårdsmat" });
+      assertEq(crossPick.evaluated[0]?.verdict, "chosen", "win-4: a <script> crossing the old cut is dropped whole; the prose after it is chosen");
+      assertTrue(!/function|use strict|window\./.test(crossPick.chosen?.text ?? ""), "win-5: no script text in the candidate");
+
+      // An unterminated <script> ends the page there: never read as text.
+      const unterminated = page(bigHead(100), `<main><p>${LONG_PROSE_1}</p><script>${js} var a = 1; var b = 2;`);
+      const w6 = aboutPageContentWindow(unterminated);
+      assertTrue(w6.includes(LONG_PROSE_1) && !w6.includes("use strict"), "win-6: prose before an unterminated <script> kept, the script text dropped");
+      // An HTML comment hiding markup is dropped whole, its <script> too.
+      const commented = page(bigHead(100), `<!-- <script>${js}</script> <p>gammel tekst</p> --><main><p>${LONG_PROSE_1}</p></main>`);
+      const w7 = aboutPageContentWindow(commented);
+      assertTrue(!w7.includes("gammel tekst") && !w7.includes("use strict") && w7.includes(LONG_PROSE_1), "win-7: commented-out markup is dropped");
+      // <header> is not <head>; a missing </head> ends at <body>.
+      const header = `<html><body><header><p>${LONG_PROSE_3}</p></header><main><p>${LONG_PROSE_1}</p></main></body></html>`;
+      assertTrue(aboutPageContentWindow(header).includes(LONG_PROSE_1), "win-8: <header> is not dropped as <head> (the window starts at <main>)");
+      const noHeadClose = `<html><head><title>Om oss</title><style>.a{}</style><body><main><p>${LONG_PROSE_1}</p></main></body></html>`;
+      assertTrue(aboutPageContentWindow(noHeadClose).includes(LONG_PROSE_1), "win-9: an unclosed <head> ends at <body>");
+      // Start at <main> when there is one, else <body>; at most ABOUT_PAGE_SCAN_CAP chars.
+      const longNav = page(bigHead(100), `<div>${"<span>meny</span>".repeat(3_000)}</div>${main}`);
+      assertTrue(aboutPageContentWindow(longNav).startsWith("<main"), "win-10: the window starts at <main>");
+      assertTrue(aboutPageContentWindow(page(bigHead(100), `<p>${"a".repeat(60_000)}</p>`)).length <= ABOUT_PAGE_SCAN_CAP, "win-11: the window is capped at ABOUT_PAGE_SCAN_CAP");
+      assertEq(aboutPageContentWindow(""), "", "win-12: empty in, empty out");
+
+      // A hidden login/«forgot password» popup in a <fieldset> before the
+      // prose (measured on a real page) is not the about text.
+      const popup = page(
+        bigHead(100),
+        `<form class="mfp-hide"><h2>Logg inn</h2><fieldset><p>Skriv inn epostadressen din (må være den som er registrert hos leverandøren), og trykk på «Send meg passord» for å bli tilsendt nytt passord på epost.</p><input type="text"></fieldset></form>${main}`,
+      );
+      const popupPick = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: popup }], producerName: "Tverås Gårdsmat" });
+      assertTrue((popupPick.chosen?.text ?? "").startsWith("Tverås er en familiegård"), "win-13: popup text in a <fieldset> is skipped");
+
+      // The <h1> naming the producer counts even when it sits beyond the
+      // first ABOUT_PAGE_SCAN_CAP chars of the raw page.
+      const anon = "Vi er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite i fjellet om sommeren.";
+      const h1Far = page(`<head><title>Om oss</title><style>${"x".repeat(40_000)}</style></head>`, `<main><h1>Tverås Gårdsmat</h1><p>${anon}</p><p>${LONG_PROSE_2}</p></main>`);
+      assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: h1Far }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "chosen", "win-14: an <h1> beyond the raw cap names the producer");
+      assertTrue(aboutPageNamesProducer(anon, h1Far, producerNameTokens("Tverås Gårdsmat")), "win-15: aboutPageNamesProducer computes the window itself when not given");
+
+      // Script-shaped text is a code artifact for an about-page candidate.
+      assertTrue(aboutPageTextLooksLikeScript(js), "js-1: the measured Granum script text reads as script");
+      for (const t of [LONG_PROSE_1, LONG_PROSE_2, LONG_PROSE_3, "Vi bruker råvarer fra egen gård; alt lages for hånd.", "Les mer om oss på nettsiden – vi har åpent alle dager."]) {
+        assertTrue(!aboutPageTextLooksLikeScript(t), `js-2: prose is not script: ${t.slice(0, 30)}`);
+      }
+      const jsProse = `<main><p>${LONG_PROSE_1} var a = window.x;</p><p>${LONG_PROSE_2}</p></main>`;
+      assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: page(bigHead(100), jsProse) }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "code_artifact", "js-3: a script-shaped candidate is refused as code_artifact");
+
+      // Linear on hostile markup.
+      const t = (html: string): number => {
+        const t0 = performance.now();
+        aboutPageContentWindow(html);
+        pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html }], producerName: "Tverås Gårdsmat" });
+        return performance.now() - t0;
+      };
+      for (const [label, html] of [
+        ["100k unclosed <script", "<script ".repeat(100_000)],
+        ["100k unclosed <!--", `<p>${LONG_PROSE_1}</p>` + "<!-- x ".repeat(100_000)],
+        ["100k closed <script>", "<script>x</script>".repeat(100_000) + `<main><p>${LONG_PROSE_1}</p></main>`],
+        ["100k unclosed <head", "<head ".repeat(100_000)],
+        ["100k unclosed <fieldset", "<fieldset>".repeat(100_000)],
+        ["2.5 MB of prose", `<main>${`<p>${LONG_PROSE_1}</p>`.repeat(17_000)}</main>`],
+      ] as const) {
+        const ms = t(html);
+        assertTrue(ms < 500, `win-patho: ${label} (${(html.length / 1000).toFixed(0)} kB) in < 500 ms (got ${ms.toFixed(0)} ms)`);
+      }
     }
   } catch (err: unknown) {
     failed++;
