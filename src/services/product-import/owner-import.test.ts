@@ -420,11 +420,42 @@ export async function runOwnerImportTests(opts: { log?: boolean } = {}): Promise
         "log: removal counted on the run row");
     }
 
+    // ─── Name lock (JSON API): matched candidates keep their name ───────────
+    {
+      const p = (await runFor(OWN, f2.body.run_id)).body;
+      const sid = (name: string) => [...p.new, ...p.changed, ...p.unchanged].find((c: any) => c.name === name)!.id as string;
+      const listOf = () => (ks.knowledgeService.getKnowledge(OWN)!.products as any[]);
+      const namesBefore = listOf().map((x) => x.name);
+      const lamBefore = listOf().find((x) => x.name === "Lammelår");
+      const before = totalChanges();
+      const bad = await publishFor(OWN, f2.body.run_id, { candidates: [{ id: sid("Lammelår"), name: "Lam, hel" }] });
+      assertEq([bad.status, bad.body.error, bad.body.fields], [400, "invalid", [{ id: sid("Lammelår"), field: "name" }]],
+        "name lock: a new name for a matched candidate → 400 invalid on field name");
+      assertEq(totalChanges(), before, "name lock: the 400 writes nothing");
+      assertEq(listOf().map((x) => x.name), namesBefore, "name lock: no duplicate product added");
+      assertEq(listOf().find((x) => x.name === "Lammelår")?.price, lamBefore.price, "name lock: the stored product (unit) is unchanged");
+
+      const ok = await publishFor(OWN, f2.body.run_id, { candidates: [{ id: sid("Lammelår"), name: "  LAMMELÅR " }] });
+      assertEq(ok.status, 200, "name lock: same name modulo case/whitespace → 200");
+      assertEq(ok.body.published.map((x: any) => [x.name, x.action]), [["Lammelår", "updated"]], "name lock: still an update under the original name");
+      assertEq(listOf().map((x) => x.name), namesBefore, "name lock: no duplicate after a case-variant name");
+      assertTrue(String(listOf().find((x) => x.name === "Lammelår")?.price || "").includes("/kg"), "name lock: unit kept on the matched product");
+    }
+
     // ─── AC12: daily limit from the run table ───────────────────────────────
     {
       const f3 = await fetchFor(OWN);
       assertEq(f3.status, 202, "AC12: 3rd fetch the same day → 202");
       await oi.__awaitOwnerFetchForTesting(f3.body.run_id);
+      {
+        // Name lock does not apply to a new (unmatched) candidate: it may be renamed.
+        const p3 = (await runFor(OWN, f3.body.run_id)).body;
+        const fresh = (p3.new as any[]).find((c) => c.name === "Rabarbrasaft");
+        assertTrue(!!fresh, "name lock: an unmatched candidate is available in fetch #3");
+        const nn = await publishFor(OWN, f3.body.run_id, { candidates: [{ id: fresh.id, name: "Rabarbra saft hjemmelaget", price: "10" }] });
+        assertEq([nn.status, nn.body.published?.map((x: any) => [x.name, x.action])], [200, [["Rabarbra saft hjemmelaget", "added"]]],
+          "name lock: an unmatched (new) candidate may still be renamed");
+      }
       const f4 = await fetchFor(OWN);
       assertEq([f4.status, f4.body.error], [429, "daily_limit"], "AC12: 4th fetch the same UTC day → 429");
       assertTrue(typeof f4.body.message === "string" && f4.body.message.includes("høyst 3 ganger per døgn"), "AC12: 429 has a clear Norwegian message");

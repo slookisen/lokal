@@ -704,15 +704,28 @@ export function publishOwnerImport(
   }> = [];
   const seenSel = new Set<string>();
   const seenNames = new Set<string>();
+  // Single read of the profile's current list: used for the name lock below
+  // and for the merge further down.
+  const types = producerTypesOf(agentId);
+  const list = readCurrentList(agentId).slice();
+  const current = currentProductsOf(list);
+  const byKey = new Map<string, CurrentProduct>();
+  for (const c of current) if (!byKey.has(c.key)) byKey.set(c.key, c);
   for (const s of selection) {
     if (seenSel.has(s.id)) continue;
     seenSel.add(s.id);
     const row = byId.get(s.id)!;
     let name = row.name;
+    // Name lock: a candidate matching an existing product keeps its name, so
+    // the merge updates that product instead of adding a duplicate. Only a
+    // submitted name that normalises to the same key is tolerated (ignored).
+    const matched = byKey.has(normalizeName(row.name));
     if (s.name !== undefined) {
-      const n = normalizeProductName(s.name);
+      const n = typeof s.name === "string" ? normalizeProductName(s.name) : null;
       if (!n) fieldErrors.push({ id: s.id, field: "name" });
-      else name = n;
+      else if (matched) {
+        if (normalizeName(n) !== normalizeName(row.name)) fieldErrors.push({ id: s.id, field: "name" });
+      } else name = n;
     }
     let price = row.price_nok;
     let priceEdited = false;
@@ -743,13 +756,8 @@ export function publishOwnerImport(
     return { ok: false, status: 400, error: "invalid", message: "Noen av feltene er ugyldige. Sjekk navn, pris og enhet.", fields: fieldErrors };
   }
 
-  const types = producerTypesOf(agentId);
   const nowIso = isoTs(now());
   const nowSql = sqlTs(now());
-  const list = readCurrentList(agentId).slice();
-  const current = currentProductsOf(list);
-  const byKey = new Map<string, CurrentProduct>();
-  for (const c of current) if (!byKey.has(c.key)) byKey.set(c.key, c);
 
   const published: Array<{ id: string; name: string; action: "added" | "updated" }> = [];
   const rejected: Array<{ id: string; name: string; reason: PublishBlockReason; message: string }> = [];
