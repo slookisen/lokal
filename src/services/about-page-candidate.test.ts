@@ -457,13 +457,16 @@ export function runAboutPageCandidateTests(opts: { log?: boolean } = {}): TestSu
       );
       assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: hiddenSpam }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "theme_spam_page", "win-16: spam text before <main> still makes a theme_spam_page");
       const anonProse = "Vi er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver med sau og storfe på utmarksbeite i fjellet om sommeren.";
-      const h1InHeader = page(bigHead(100), `<header><h1>Tverås Gårdsmat</h1></header><main><p>${anonProse}</p><p>${LONG_PROSE_2}</p></main>`);
+      const h1InHeader = page("<head><title>Om oss</title></head>", `<header><h1>Tverås Gårdsmat</h1></header><main><p>${anonProse}</p><p>${LONG_PROSE_2}</p></main>`);
       assertEq(pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: h1InHeader }], producerName: "Tverås Gårdsmat" }).evaluated[0]?.verdict, "chosen", "win-17: an <h1> in a <header> before <main> names the producer");
       const proseBeforeMain = page(bigHead(100), `<section><p>${LONG_PROSE_1}</p><p>${LONG_PROSE_2}</p></section><main><p>Kontakt oss.</p></main>`);
       const pbm = pickAboutPageCandidate({ homepageCandidate: HOME_SHORT_META, aboutPages: [{ url, html: proseBeforeMain }], producerName: "Tverås Gårdsmat" });
       assertTrue(pbm.evaluated[0]?.verdict === "chosen" && (pbm.chosen?.text ?? "").startsWith("Tverås er en familiegård"), "win-18: prose before a <main> without prose is read from <body>");
       const w19 = aboutPageWindows(page(bigHead(100), `<div><p>${LONG_PROSE_3}</p></div>${main}`));
       assertTrue(w19.body.includes(LONG_PROSE_3) && !w19.main.includes(LONG_PROSE_3) && w19.main.startsWith("<main"), "win-19: two windows — body from <body>, main from <main>");
+      const w25 = aboutPageWindows(`<html><title>Sidetittel som ikke er tekst</title><body><main><p>${LONG_PROSE_1}</p></main></body></html>`);
+      assertTrue(w25.body.startsWith("<body") && !w25.body.includes("Sidetittel"), "win-25: the body window starts at <body>, not at the page start");
+      assertTrue(aboutPageTextIncluded(proseBeforeMain, `x ${LONG_PROSE_1} y`), "win-26: aboutPageTextIncluded falls back to <body> when <main> has no prose");
 
       // Shapes that must not drop the rest of the page.
       const sprite = page(bigHead(100), `<svg class="sprite"/><main><p>${LONG_PROSE_1}</p></main><svg><path d="M0"/></svg>`);
