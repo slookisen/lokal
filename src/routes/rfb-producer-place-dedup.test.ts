@@ -9,8 +9,11 @@
  *   - buildProducerMetaDescription / buildProducerAnswerFirstOpening /
  *     buildProducerPageTitle / buildProducerFaqJsonLd («holder til i»)
  *     no longer render «{Sted} i {Sted}»;
- *   - control cases («— Agder» in Arendal, «— Gårdsis», «— Kafé og Bakeri,
- *     Telemark», a name with no suffix) are byte-identical to before.
+ *   - control cases («— Agder» in Arendal, «— Gårdsis», «Akerhaugen Gård —
+ *     Kafé og Bakeri, Telemark» in Sauherad, «— Fisketorget Bergen», a name
+ *     with no suffix) are byte-identical to before;
+ *   - when only the tail after the last «,» / «/» / « i » is the place, just
+ *     that tail is dropped («— Svelvik, Drammen» → «— Svelvik»).
  *
  * Run standalone: npx tsx src/routes/rfb-producer-place-dedup.test.ts
  * Wired into the gate: tests/test.ts imports runRfbProducerPlaceDedupTests().
@@ -97,6 +100,42 @@ export function runRfbProducerPlaceDedupTests(opts: { log?: boolean } = {}): Tes
     "Gård – Sannidal",
     "P7f original en-dash separator preserved when the tail is dropped",
   );
+  assertEq(
+    nameForPlaceSentence("Akerhaugen Gård — Kafé og Bakeri, Telemark", "Sauherad"),
+    "Akerhaugen Gård — Kafé og Bakeri, Telemark",
+    "P7g spec control (real producer, city Sauherad) → unchanged",
+  );
+  assertEq(
+    nameForPlaceSentence("Kapczynska Bakeri — Husøy i Senja", "Senja"),
+    "Kapczynska Bakeri — Husøy",
+    "P7h «Husøy i Senja» in Senja → «— Husøy» (sentence: «… — Husøy i Senja»)",
+  );
+  assertEq(
+    nameForPlaceSentence("Kapczynska Bakeri — Husøy i Senja", "Husøy"),
+    "Kapczynska Bakeri",
+    "P7i first « i » segment = city → stripped",
+  );
+  assertEq(
+    nameForPlaceSentence("Judiths Urtehage — Kabelvåg/Lofoten", "Lofoten"),
+    "Judiths Urtehage — Kabelvåg",
+    "P7j last «/» segment = city → only «/Lofoten» dropped",
+  );
+  assertEq(
+    nameForPlaceSentence("Fjellgård — Herøy (Nordland)", "Herøy (Møre og Romsdal)"),
+    "Fjellgård — Herøy (Nordland)",
+    "P7k both sides qualified differently → not the same place, unchanged",
+  );
+  assertEq(
+    nameForPlaceSentence("Fjellgård — Herøy (Nordland)", "Herøy (Nordland)"),
+    "Fjellgård",
+    "P7l both sides qualified identically → stripped",
+  );
+  assertEq(nameForPlaceSentence("Tverås Gårdsmat — Malm", "   "), "Tverås Gårdsmat — Malm", "P7m whitespace-only city → unchanged");
+  assertEq(
+    nameForPlaceSentence("Tverås Gårdsmat\u00a0—\u00a0Malm", "Malm"),
+    "Tverås Gårdsmat",
+    "P7n non-breaking spaces around the dash still recognised",
+  );
   assertEq(nameForPlaceSentence("Nordfjord Bakeri", "Ålesund"), "Nordfjord Bakeri", "P8 no suffix → unchanged");
   assertEq(nameForPlaceSentence("Tverås Gårdsmat — Malm", ""), "Tverås Gårdsmat — Malm", "P9 no city → unchanged");
   assertEq(nameForPlaceSentence("Ola-Gården", "Gården"), "Ola-Gården", "P10 unspaced hyphen is not a suffix separator");
@@ -117,6 +156,16 @@ export function runRfbProducerPlaceDedupTests(opts: { log?: boolean } = {}): Tes
     buildProducerMetaDescription("Nordfjord Bakeri", "", "no", "", "bakery", 0),
     "Nordfjord Bakeri. Lokalprodusert mat i Norge.",
     "M4 NB no city → unchanged",
+  );
+  assertEq(
+    buildProducerMetaDescription("Tverås Gårdsmat — Malm", "", "no", "", "dairy", 0),
+    "Tverås Gårdsmat — Malm. Lokalprodusert mat i Norge.",
+    "M4b NB suffixed name without city → full name, unchanged",
+  );
+  assertEq(
+    buildProducerMetaDescription("Akerhaugen Gård — Kafé og Bakeri, Telemark", "Sauherad", "no", desc, "bakery", 0),
+    `Akerhaugen Gård — Kafé og Bakeri, Telemark i Sauherad. ${safeMetaDescription(desc)}`,
+    "M4c NB spec control through the meta builder → unchanged",
   );
   const enMeta = buildProducerMetaDescription("Tverås Gårdsmat — Malm", "Malm", "en", desc, "dairy", 2);
   assertTrue(enMeta.startsWith("Tverås Gårdsmat is a local food producer in Malm, Norway."), "M5 EN meta dedups the place");
@@ -150,6 +199,14 @@ export function runRfbProducerPlaceDedupTests(opts: { log?: boolean } = {}): Tes
     categories: ["bakery"],
   });
   assertTrue(!!openingCtl && openingCtl.startsWith("Bageri Vanilje — Agder i Arendal tilbyr "), "O4 control unchanged");
+  const openingCtlEn = buildProducerAnswerFirstOpening({
+    name: "Bamsrudlåven — Gårdsis",
+    cityName: "Askim",
+    productsList: [],
+    categories: ["dairy"],
+    lang: "en",
+  });
+  assertTrue(!!openingCtlEn && openingCtlEn.startsWith("Bamsrudlåven — Gårdsis in Askim offers "), "O5 EN control unchanged");
 
   // ── page title (AC1) ────────────────────────────────────────────────────
   assertEq(

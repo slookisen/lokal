@@ -4869,43 +4869,60 @@ export const RELATED_PRODUCERS_CSS = `
 // «Tverås Gårdsmat — Malm i Malm» (~600 pages, 2026-10-27). This helper drops
 // the place only where the sentence is about to add it again:
 //   - the suffix after the LAST « — » / « – » (spaced dash) is compared,
-//     normalised (NFKC, lower-case, inner whitespace collapsed, a trailing
-//     «(…)» qualifier ignored: «Drøbak (Akershus)» counts as «Drøbak»);
+//     normalised (NFKC, lower-case, inner whitespace collapsed);
+//   - a trailing «(…)» qualifier is ignored only when one side lacks it
+//     («Drøbak (Akershus)» matches «Drøbak»); when both sides carry one, the
+//     qualifiers must be equal («Herøy (Nordland)» ≠ «Herøy (Møre og
+//     Romsdal)»);
 //   - the whole suffix is dropped when it equals cityName, or when its FIRST
-//     «,» / «/» segment does («Nes, Hedmark», «Kabelvåg/Lofoten»);
-//   - when only its LAST comma segment equals cityName, just that «, {city}»
-//     tail is dropped and the rest is kept («Berles Gårdsbutikk — Svelvik,
-//     Drammen» → «Berles Gårdsbutikk — Svelvik», so the sentence reads
-//     «… — Svelvik i Drammen»);
+//     «,» / «/» / « i » segment does («Nes, Hedmark», «Kabelvåg/Lofoten» in
+//     Kabelvåg, «Husøy i Senja» in Husøy);
+//   - otherwise, when the part after its LAST «,» / «/» / « i » separator
+//     equals cityName, only that «{sep}{city}» tail is dropped and the rest is
+//     kept, mirroring how the geocoder reads these suffixes
+//     (agents-geocode-worker.ts placeSuffixCandidates): «— Svelvik, Drammen»
+//     → «— Svelvik», «— Husøy i Senja» → «— Husøy», so the sentence reads
+//     «… — Husøy i Senja»;
 //   - anything else is left alone («— Gårdsis», «— Agder» in Arendal,
-//     «— Fisketorget Bergen»): the name is returned unchanged, so a name
-//     without a place suffix renders byte-identically to before.
+//     «— Fisketorget Bergen», «— Kafé og Bakeri, Telemark» in Sauherad): the
+//     name is returned unchanged, so a name without a place suffix renders
+//     byte-identically to before.
+// The helper can only shorten the name; it never adds text.
 // Used only where a sentence or title suffix adds the place; h1, JSON-LD
 // `name`, slug and sitemap keep the full name.
-function normPlaceToken(s: string): string {
-  return s
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/\s*\([^()]*\)\s*$/, "")
-    .replace(/\s+/g, " ")
-    .trim();
+function splitPlaceToken(s: string): { base: string; qualifier: string | null } {
+  const norm = s.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+  const q = /^(.*?)\s*\(([^()]*)\)$/.exec(norm);
+  if (q && q[1]) return { base: q[1].trim(), qualifier: q[2].trim() };
+  return { base: norm, qualifier: null };
+}
+
+function samePlace(a: string, b: string): boolean {
+  const x = splitPlaceToken(a);
+  const y = splitPlaceToken(b);
+  if (!x.base || x.base !== y.base) return false;
+  return x.qualifier === null || y.qualifier === null || x.qualifier === y.qualifier;
 }
 
 export function nameForPlaceSentence(name: string, cityName: string): string {
-  if (!name || !cityName) return name;
+  if (!name || !cityName || !cityName.trim()) return name;
   const m = /^(.*\S)(\s+[—–]\s+)(\S.*)$/.exec(name);
   if (!m) return name;
   const base = m[1];
   const separator = m[2];
   const rawSuffix = m[3];
-  const city = normPlaceToken(cityName);
-  if (!city) return name;
-  const suffix = normPlaceToken(rawSuffix);
-  const firstSegment = normPlaceToken(suffix.split(/[,/]/)[0]);
-  if (suffix === city || firstSegment === city) return base;
-  const lastComma = rawSuffix.lastIndexOf(",");
-  if (lastComma > 0 && normPlaceToken(rawSuffix.slice(lastComma + 1)) === city) {
-    const kept = rawSuffix.slice(0, lastComma).trim();
+  if (samePlace(rawSuffix, cityName)) return base;
+  const firstSegment = rawSuffix.split(/[,/]|\s+i\s+/)[0];
+  if (firstSegment !== rawSuffix && samePlace(firstSegment, cityName)) return base;
+  // Tail rule: try the separators right-to-left; drop «{sep}{city}» only.
+  const seps = [...rawSuffix.matchAll(/\s*[,/]\s*|\s+i\s+/g)];
+  for (let i = seps.length - 1; i >= 0; i--) {
+    const sep = seps[i];
+    const at = sep.index ?? -1;
+    if (at <= 0) continue;
+    const tail = rawSuffix.slice(at + sep[0].length);
+    if (!samePlace(tail, cityName)) continue;
+    const kept = rawSuffix.slice(0, at).trim();
     if (kept) return `${base}${separator}${kept}`;
   }
   return name;
