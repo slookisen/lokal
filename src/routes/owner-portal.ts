@@ -23,7 +23,7 @@ import { getSupplyGraphStaleDays } from "../services/supply-graph";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
 import {
-  OWNER_FEATURE_GROUPS, getOwnerFeature, ownerAutoUpdatesEnabled, visibleOwnerFeatureOptions, type OwnerFeatureValue,
+  OWNER_FEATURE_GROUPS, getOwnerFeature, ownerAutoUpdatesEnabled, ownerFeatureEntryForEnv, visibleOwnerFeatureOptions, type OwnerFeatureValue,
 } from "../owner-features/registry";
 import { resolveOwnerFeature, setOwnerFeatureValue } from "../owner-features/resolve";
 import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
@@ -1816,7 +1816,7 @@ export function ownerAutoUpdatesAppliesTo(agentId: string): boolean {
 export function ownerAutoUpdatesCardHtml(agentId: string, value: OwnerFeatureValue): string {
   const e = getOwnerFeature(OWNER_AUTO_UPDATES_KEY);
   const group = OWNER_FEATURE_GROUPS.find((g) => g.key === e.group);
-  const guarantee = getOwnerFeature("auto.guarantee");
+  const guarantee = ownerFeatureEntryForEnv(getOwnerFeature("auto.guarantee"));
   const options = visibleOwnerFeatureOptions(e).map((o) =>
     `<label style="display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer;"><input type="radio" name="value" value="${escapeHtml(o.value)}"${o.value === value ? " checked" : ""}> ${escapeHtml(o.label.no)}</label>`,
   ).join("\n            ");
@@ -1828,7 +1828,7 @@ export function ownerAutoUpdatesCardHtml(agentId: string, value: OwnerFeatureVal
             <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">${escapeHtml(e.description.no)}</p>
             ${options}
           </fieldset>
-          <p class="ep-audit-meta" data-guarantee="auto.guarantee" style="margin-bottom:12px;">${escapeHtml(guarantee.label.no)}</p>
+          <p class="ep-audit-meta" data-guarantee="auto.guarantee" style="margin-bottom:12px;">${escapeHtml(guarantee.label.no)}<br>${escapeHtml(guarantee.description.no)}</p>
           <button type="submit" class="ep-btn ep-btn-primary">Lagre</button>
         </form>
       </div>`;

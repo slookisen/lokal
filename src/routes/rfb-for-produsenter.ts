@@ -50,7 +50,7 @@
 
 import { localizedPath, type Lang } from "../i18n/t";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
-import { OWNER_FEATURE_REGISTRY, ownerAutoUpdatesEnabled, ownerFeatureStatus, type OwnerFeatureEntry } from "../owner-features/registry";
+import { OWNER_FEATURE_REGISTRY, ownerAutoUpdatesEnabled, ownerFeatureEntryForEnv, ownerFeatureStatus, type OwnerFeatureEntry } from "../owner-features/registry";
 import { OWNER_LEVELS } from "../owner-features/changes";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
 import { orderCapNewPerDay } from "../services/cart-service";
@@ -153,7 +153,10 @@ function flagGatedOff(e: OwnerFeatureEntry, f: ForProdusenterFacts): boolean {
  * off (products.stock_check without STOCK_CHECK_EMAIL_ENABLED).
  */
 export function liveRfbOwnerChoices(facts?: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): OwnerFeatureEntry[] {
-  return registry.filter((e) => e.verticals.includes("rfb") && ownerFeatureStatus(e) !== "coming_soon" && !(facts && flagGatedOff(e, facts)));
+  return registry
+    .filter((e) => e.verticals.includes("rfb") && ownerFeatureStatus(e) !== "coming_soon" && !(facts && flagGatedOff(e, facts)))
+    // The text as it applies now (auto.guarantee follows OWNER_AUTO_UPDATES_ENABLED).
+    .map((e) => ownerFeatureEntryForEnv(e));
 }
 
 function levelsAnswer(lang: "no" | "en"): string {
