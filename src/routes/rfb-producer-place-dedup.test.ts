@@ -130,6 +130,21 @@ export function runRfbProducerPlaceDedupTests(opts: { log?: boolean } = {}): Tes
     "Fjellgård",
     "P7l both sides qualified identically → stripped",
   );
+  assertEq(
+    nameForPlaceSentence("Fjellbakeriet — Mo i Rana, Nordland", "Mo i Rana"),
+    "Fjellbakeriet",
+    "P7o city containing « i » as the head before «,» → stripped",
+  );
+  assertEq(
+    nameForPlaceSentence("Fjellbakeriet — Mo i Rana/Nordland", "Mo i Rana"),
+    "Fjellbakeriet",
+    "P7p city containing « i » as the head before «/» → stripped",
+  );
+  assertEq(
+    nameForPlaceSentence("Fjellbakeriet — Svelvik, Mo i Rana", "Mo i Rana"),
+    "Fjellbakeriet — Svelvik",
+    "P7q city containing « i » as the tail → only the tail dropped",
+  );
   assertEq(nameForPlaceSentence("Tverås Gårdsmat — Malm", "   "), "Tverås Gårdsmat — Malm", "P7m whitespace-only city → unchanged");
   assertEq(
     nameForPlaceSentence("Tverås Gårdsmat\u00a0—\u00a0Malm", "Malm"),

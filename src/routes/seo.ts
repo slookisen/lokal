@@ -4874,9 +4874,10 @@ export const RELATED_PRODUCERS_CSS = `
 //     («Drøbak (Akershus)» matches «Drøbak»); when both sides carry one, the
 //     qualifiers must be equal («Herøy (Nordland)» ≠ «Herøy (Møre og
 //     Romsdal)»);
-//   - the whole suffix is dropped when it equals cityName, or when its FIRST
-//     «,» / «/» / « i » segment does («Nes, Hedmark», «Kabelvåg/Lofoten» in
-//     Kabelvåg, «Husøy i Senja» in Husøy);
+//   - the whole suffix is dropped when it equals cityName, or when the part
+//     before one of its «,» / «/» / « i » separators does («Nes, Hedmark»,
+//     «Kabelvåg/Lofoten» in Kabelvåg, «Husøy i Senja» in Husøy, «Mo i Rana,
+//     Nordland» in Mo i Rana);
 //   - otherwise, when the part after its LAST «,» / «/» / « i » separator
 //     equals cityName, only that «{sep}{city}» tail is dropped and the rest is
 //     kept, mirroring how the geocoder reads these suffixes
@@ -4912,10 +4913,15 @@ export function nameForPlaceSentence(name: string, cityName: string): string {
   const separator = m[2];
   const rawSuffix = m[3];
   if (samePlace(rawSuffix, cityName)) return base;
-  const firstSegment = rawSuffix.split(/[,/]|\s+i\s+/)[0];
-  if (firstSegment !== rawSuffix && samePlace(firstSegment, cityName)) return base;
-  // Tail rule: try the separators right-to-left; drop «{sep}{city}» only.
   const seps = [...rawSuffix.matchAll(/\s*[,/]\s*|\s+i\s+/g)];
+  // Head rule: try the separators left-to-right; when everything before one
+  // of them is the city («Mo i Rana, Nordland» in Mo i Rana, «Husøy i Senja»
+  // in Husøy), the whole suffix goes.
+  for (const sep of seps) {
+    const at = sep.index ?? -1;
+    if (at > 0 && samePlace(rawSuffix.slice(0, at), cityName)) return base;
+  }
+  // Tail rule: try the separators right-to-left; drop «{sep}{city}» only.
   for (let i = seps.length - 1; i >= 0; i--) {
     const sep = seps[i];
     const at = sep.index ?? -1;
