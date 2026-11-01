@@ -22,7 +22,9 @@
 // cards move into «Mine valg», so visibility.profile (the owner pause),
 // orders.email (the confirmed order address) and comms.news (the first-login
 // consent, shown in its row) are `live` too. A `coming_soon` entry is shown
-// only in the page's «Planlagt» box, with no value.
+// only in the page's «Planlagt» box, with no value. An entry with a liveFlag
+// (auto.updates) is `coming_soon` at run time while its flag is off
+// (ownerFeatureStatus).
 
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
@@ -214,8 +216,13 @@ export interface OwnerFeatureEntry {
   label: LocalizedText;
   description: LocalizedText;
   type: OwnerFeatureType;
-  /** `choice` only. */
-  options?: Array<{ value: string; label: LocalizedText }>;
+  /**
+   * `choice` only. A `hidden` option stays in the catalog but is never
+   * offered (page, portal, owner API) and cannot be stored
+   * (validateOwnerFeatureValue) — auto.updates «Foreslå til meg» until a
+   * suggestion page exists.
+   */
+  options?: Array<{ value: string; label: LocalizedText; hidden?: boolean }>;
   /** `number` only. */
   min?: number;
   max?: number;
@@ -239,6 +246,20 @@ export interface OwnerFeatureEntry {
   /** Global emergency brake: env name; "1"/"true" forces the entry off for everyone. */
   killSwitch?: string;
   status: OwnerFeatureStatus;
+  /**
+   * Env flag a `live` entry needs: while it is not "1"/"true" the entry
+   * behaves exactly as `coming_soon` at run time (resolver, «Mine valg»,
+   * owner API, «Gi meg beskjed», /for-produsenter) — ownerFeatureStatus().
+   * The CI matrix, the governance rules and the switch probe read `status`
+   * (the probe FAILs the row with the flag off, SWITCH_PROBE_FLAG_DEPENDENCIES).
+   */
+  liveFlag?: string;
+  /**
+   * With a liveFlag: what the entry was before it went live (default,
+   * options, since), used while the flag is off so the resolver and the
+   * owner API answer exactly as before (ownerFeatureEntryForEnv).
+   */
+  whileFlagOff?: Partial<Pick<OwnerFeatureEntry, "default" | "options" | "since">>;
   /** Sharing / marketing mention — off until the owner says yes. */
   consent: boolean;
   /** Triggers e-mail or other outbound contact (L4 / outreach rules apply). */
@@ -279,6 +300,22 @@ export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: Locali
 const DR = "2026-10-22-rfb-mine-valg-eierbrytere";
 const SINCE = "2026-10-27";
 const RFB: OwnerFeatureVertical[] = ["rfb"];
+
+/**
+ * auto.updates' liveFlag (dev-request 2026-11-01-rfb-hold-profilen-oppdatert):
+ * the owner refresh, the owner-portal card and the choice itself. Default off.
+ */
+export const OWNER_AUTO_UPDATES_FLAG = "OWNER_AUTO_UPDATES_ENABLED";
+
+/** OWNER_AUTO_UPDATES_ENABLED is on ("1" or "true"). */
+export function ownerAutoUpdatesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlagOn(env, OWNER_AUTO_UPDATES_FLAG);
+}
+
+function envFlagOn(env: NodeJS.ProcessEnv, name: string): boolean {
+  const v = env[name];
+  return v === "1" || v === "true";
+}
 
 /** Shared fields every entry gets unless it says otherwise. */
 function entry(
@@ -715,17 +752,40 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     status: "live",
     surfaces: ["job:rfb_enrichment_nightly", "job:knowledge_write"],
   }),
+  // dev-request 2026-11-01-rfb-hold-profilen-oppdatert (Daniel live
+  // 2026-11-01): live behind OWNER_AUTO_UPDATES_ENABLED (liveFlag; off =
+  // coming_soon, today's behaviour). Default for owners «Fyll tomme felt
+  // selv» (was «Foreslå til meg», decided 2026-10-22). Read by the owner
+  // refresh at the end of the nightly run (services/rfb-owner-refresh.ts)
+  // and chosen in the regular owner portal card for every verified owner
+  // (routes/owner-portal.ts) as well as in «Mine valg» — one stored value.
+  // «Foreslå til meg» is hidden until a suggestion page exists.
   entry({
     key: "auto.updates", group: "auto", type: "choice",
     label: t("Oppdatering fra nettsiden din og offentlige kilder", "Updates from your website and public sources"),
     description: t("Hva som skjer når vi finner ny informasjon om deg.", "What happens when we find new information about you."),
     options: [
-      { value: "suggest", label: t("Foreslå til meg", "Suggest to me") },
+      { value: "suggest", label: t("Foreslå til meg", "Suggest to me"), hidden: true },
       { value: "fill_empty", label: t("Fyll tomme felt selv", "Fill empty fields yourself") },
-      { value: "never", label: t("Aldri", "Never") },
       { value: "automatic", label: t("Oppdateres automatisk hver natt", "Updated automatically every night") },
+      { value: "never", label: t("Aldri", "Never") },
     ],
-    default: { owner: "suggest", unclaimed: "automatic" },
+    default: { owner: "fill_empty", unclaimed: "automatic" },
+    status: "live",
+    liveFlag: OWNER_AUTO_UPDATES_FLAG,
+    // Flag off: the pre-live catalog row (default «Foreslå til meg», all four options).
+    whileFlagOff: {
+      default: { owner: "suggest", unclaimed: "automatic" },
+      options: [
+        { value: "suggest", label: t("Foreslå til meg", "Suggest to me") },
+        { value: "fill_empty", label: t("Fyll tomme felt selv", "Fill empty fields yourself") },
+        { value: "never", label: t("Aldri", "Never") },
+        { value: "automatic", label: t("Oppdateres automatisk hver natt", "Updated automatically every night") },
+      ],
+      since: SINCE,
+    },
+    since: "2026-11-01",
+    devRequest: "2026-11-01-rfb-hold-profilen-oppdatert",
     surfaces: ["job:rfb_enrichment_nightly"],
   }),
   entry({
@@ -1324,4 +1384,28 @@ export function getOwnerFeature(key: string, registry: OwnerFeatureEntry[] = OWN
   const e = findOwnerFeature(key, registry);
   if (!e) throw new UnknownOwnerFeatureError(key);
   return e;
+}
+
+/**
+ * The status an entry has at run time: `coming_soon` while its liveFlag is
+ * not on ("1"/"true"), otherwise `status`. Every run-time reader (resolver,
+ * page, owner API, interest, /for-produsenter) asks this, never `status`.
+ */
+export function ownerFeatureStatus(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): OwnerFeatureStatus {
+  if (e.liveFlag && !envFlagOn(env, e.liveFlag)) return "coming_soon";
+  return e.status;
+}
+
+/**
+ * The entry as it applies now: while its liveFlag is off, with the pre-live
+ * default / options / since (whileFlagOff), so a flag-off answer is the one
+ * from before the entry went live. Otherwise the entry itself.
+ */
+export function ownerFeatureEntryForEnv(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): OwnerFeatureEntry {
+  return e.liveFlag && e.whileFlagOff && !envFlagOn(env, e.liveFlag) ? { ...e, ...e.whileFlagOff } : e;
+}
+
+/** A `choice` entry's options an owner may pick (hidden ones left out), in registry order. */
+export function visibleOwnerFeatureOptions(e: OwnerFeatureEntry): Array<{ value: string; label: LocalizedText }> {
+  return (e.options || []).filter((o) => !o.hidden).map((o) => ({ value: o.value, label: o.label }));
 }

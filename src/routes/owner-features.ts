@@ -9,7 +9,7 @@ import {
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
-import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, type OwnerFeatureEntry } from "../owner-features/registry";
+import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, visibleOwnerFeatureOptions, type OwnerFeatureEntry } from "../owner-features/registry";
 import {
   resolveOwnerFeatures,
   setOwnerFeatureValue,
@@ -100,18 +100,21 @@ function gate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
-function featureJson(e: OwnerFeatureEntry, r: ResolvedOwnerFeature, subject: OwnerFeatureSubject) {
+function featureJson(entry: OwnerFeatureEntry, r: ResolvedOwnerFeature, subject: OwnerFeatureSubject) {
+  // A liveFlag entry with its flag off: the pre-live default / options / since.
+  const e = ownerFeatureEntryForEnv(entry);
   return {
     key: e.key,
     group: e.group,
     type: e.type,
-    ...(e.options ? { options: e.options } : {}),
+    // A hidden option (auto.updates «Foreslå til meg») is never offered.
+    ...(e.options ? { options: visibleOwnerFeatureOptions(e) } : {}),
     ...(e.min !== undefined ? { min: e.min } : {}),
     ...(e.max !== undefined ? { max: e.max } : {}),
     ...(e.nullable ? { nullable: true } : {}),
     label: e.label,
     description: e.description,
-    status: e.status,
+    status: ownerFeatureStatus(e),
     advanced: e.advanced,
     consent: e.consent,
     outward: e.outward,
@@ -674,7 +677,7 @@ router.post("/eier/:agentId/valg/interesse", express.urlencoded({ extended: fals
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
     const key = typeof body.key === "string" ? body.key : "";
     const planned = findOwnerFeature(key);
-    if (planned && planned.status === "coming_soon") anchor = ownerPlannedAnchor(planned.key);
+    if (planned && ownerFeatureStatus(planned) === "coming_soon") anchor = ownerPlannedAnchor(planned.key);
     const guard = pageWriteGuard(req, g.token, anchor);
     if (guard) return guard(res);
     const out = recordOwnerFeatureInterest(VERTICAL, agentId, key, sessionEmail(g.token));

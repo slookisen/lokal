@@ -67,7 +67,9 @@ const VEDLEGG_A_KEYS = [
 const S2A_LIVE = ["orders.enabled", "orders.reminder", "auto.guarantee", "notify.order_email", "comms.unsubscribe",
   "visibility.profile", "orders.email", "comms.news",
   // B2 (rfb-bestillinger): the stock-check reminder.
-  "products.stock_check"];
+  "products.stock_check",
+  // dev-request 2026-11-01-rfb-hold-profilen-oppdatert (coming_soon at run time until OWNER_AUTO_UPDATES_ENABLED).
+  "auto.updates"];
 
 function seedProducer(db: Database.Database, id: string, o: { claimed: boolean; isVerified: boolean }): void {
   db.prepare(
@@ -234,7 +236,7 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
         if (e.consent) assertEq([e.default.owner, e.default.unclaimed].filter((d) => d === true).length, 0, `registry: consent entry ${e.key} defaults off`);
       }
       assertEq(reg.OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live").map((e) => e.key).sort(), [...S2A_LIVE].sort(),
-        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news + B2 products.stock_check");
+        "registry: live set is exactly the S2a five + S2e visibility.profile, orders.email, comms.news + B2 products.stock_check + auto.updates (behind its flag)");
       const g = (k: string) => reg.getOwnerFeature(k);
       assertEq(g("orders.enabled").storage?.column, "agents.order_notifications_opt_in", "registry: orders.enabled adapter column");
       assertEq([g("orders.enabled").type, g("orders.enabled").default], ["switch", { owner: false, unclaimed: false }], "registry: orders.enabled switch, off for both segments");
@@ -264,6 +266,8 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
     assertEq(rs.featureOn("rfb", OWNED_ID, "auto.guarantee"), true, "featureOn: guarantee on");
     assertEq(rs.rfbFeatureOn(OWNED_ID, "comms.unsubscribe"), true, "rfbFeatureOn wrapper");
     assertEq(rs.resolveOwnerFeature("rfb", EMAILMATCH_ID, "auto.updates").value, "automatic", "segment: unclaimed profile gets the unclaimed default");
+    // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: with OWNER_AUTO_UPDATES_ENABLED off (here) the
+    // pre-live answer («Foreslå til meg»); with it on the owner default is «Fyll tomme felt selv».
     assertEq(rs.resolveOwnerFeature("rfb", OWNED_ID, "auto.updates").value, "suggest", "segment: verified owner gets the owner default");
 
     // ── Resolution order (fixture registry) ────────────────────────────────

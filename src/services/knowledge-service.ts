@@ -175,6 +175,35 @@ export interface UpsertKnowledgeOptions {
    * product must not become owner_manual). Ignored off the owner path.
    */
   preStampedProducts?: boolean;
+  /**
+   * Apply the owner lock to this (non-owner) write even when
+   * OWNER_LOCK_ENFORCE_WRITES is off — the owner auto-updates refresh
+   * (dev-request 2026-11-01-rfb-hold-profilen-oppdatert: every write it makes
+   * goes through the owner lock). Ignored on the owner path.
+   */
+  enforceOwnerLock?: boolean;
+}
+
+/**
+ * The curated_fields keys (DB column names) an owner save has locked
+ * (`by: "owner"`) — the same rule as upsertKnowledge's owner lock, for
+ * columns it does not write (agents.description / agents.categories).
+ * Unreadable text reads as "no locks", as upsertKnowledge does; a caller that
+ * must fail closed checks the text itself.
+ */
+export function ownerLockedFieldKeys(curatedFieldsJson: string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!curatedFieldsJson) return out;
+  try {
+    const parsed = JSON.parse(curatedFieldsJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return out;
+    for (const [key, meta] of Object.entries(parsed as Record<string, unknown>)) {
+      if (meta && typeof meta === "object" && (meta as { by?: unknown }).by === "owner") out.add(key);
+    }
+  } catch {
+    // unreadable → no locks (same as parseCuratedFields)
+  }
+  return out;
 }
 
 export interface SeasonalProduct {
@@ -863,9 +892,10 @@ class KnowledgeService {
     const existing = existingRow ? this.rowToKnowledge(existingRow, "strict") : null;
     const now = new Date().toISOString();
 
-    // Owner lock (OWNER_LOCK_ENFORCE_WRITES, default off): drop owner-locked
-    // fields from a non-owner write before anything below sees them.
-    if (existingRow && !opts.ownerPath && ownerLockEnforcedForWrites()) {
+    // Owner lock (OWNER_LOCK_ENFORCE_WRITES, default off — or forced for this
+    // write by opts.enforceOwnerLock): drop owner-locked fields from a
+    // non-owner write before anything below sees them.
+    if (existingRow && !opts.ownerPath && (opts.enforceOwnerLock || ownerLockEnforcedForWrites())) {
       const locks = this.parseCuratedFields((existingRow as { curated_fields?: string | null }).curated_fields);
       const kept: Partial<AgentKnowledge> = { ...data };
       for (const [prop, key] of Object.entries(LOCKABLE_FIELD_KEYS)) {

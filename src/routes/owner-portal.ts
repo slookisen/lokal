@@ -22,6 +22,10 @@ import { customerRuleSql } from "../services/customer-rule";
 import { getSupplyGraphStaleDays } from "../services/supply-graph";
 import { writeOrderNotificationsOptInWithAudit } from "../services/order-opt-in";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
+import {
+  OWNER_FEATURE_GROUPS, getOwnerFeature, ownerAutoUpdatesEnabled, visibleOwnerFeatureOptions, type OwnerFeatureValue,
+} from "../owner-features/registry";
+import { resolveOwnerFeature, setOwnerFeatureValue } from "../owner-features/resolve";
 import { OWNER_PORTAL_THEME_CSS, ownerThemeHtml } from "../owner-ui/tokens";
 import { ownerPauseEnabled, isOwnerPaused, readOwnerPauseRow } from "../services/agent-visibility";
 import { isBlocked, normalizeEmail } from "../services/blocklist-service";
@@ -1782,6 +1786,54 @@ export function ownerFeaturesEntryCardHtml(agentId: string): string {
       </div>`;
 }
 
+// ── H2: «Hjelp med å holde profilen oppdatert» ──────────────────────────
+// dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the auto.updates choice
+// for EVERY verified owner in this portal — not only the «Mine valg»
+// allowlist — behind OWNER_AUTO_UPDATES_ENABLED (off = no card, and the POST
+// answers 404 and writes nothing). Every text is the catalog's own: the
+// group label, the entry's label and description, the visible option labels
+// and the auto.guarantee line. The value is stored by setOwnerFeatureValue
+// in owner_feature_settings (keyed by vertical and profile id) — the storage
+// «Mine valg» reads, so both show the same value — and logged in its change
+// log; the save goes through the portal's write guard (session, verified
+// owner, same Origin).
+export const OWNER_AUTO_UPDATES_ANCHOR = "hold-oppdatert";
+export const OWNER_AUTO_UPDATES_KEY = "auto.updates";
+
+/**
+ * auto.updates is a Rett fra Bonden choice: the card and its POST follow the
+ * owner refresh's own vertical rule (services/rfb-owner-refresh.ts,
+ * COALESCE(vertical_id, 'rfb') = 'rfb').
+ */
+export function ownerAutoUpdatesAppliesTo(agentId: string): boolean {
+  try {
+    return !!getDb().prepare(`SELECT 1 AS x FROM agents WHERE id = ? AND COALESCE(vertical_id, 'rfb') = 'rfb'`).get(agentId);
+  } catch {
+    return false;
+  }
+}
+
+export function ownerAutoUpdatesCardHtml(agentId: string, value: OwnerFeatureValue): string {
+  const e = getOwnerFeature(OWNER_AUTO_UPDATES_KEY);
+  const group = OWNER_FEATURE_GROUPS.find((g) => g.key === e.group);
+  const guarantee = getOwnerFeature("auto.guarantee");
+  const options = visibleOwnerFeatureOptions(e).map((o) =>
+    `<label style="display:flex;align-items:center;gap:10px;min-height:44px;cursor:pointer;"><input type="radio" name="value" value="${escapeHtml(o.value)}"${o.value === value ? " checked" : ""}> ${escapeHtml(o.label.no)}</label>`,
+  ).join("\n            ");
+  return `<div class="ep-card" id="${OWNER_AUTO_UPDATES_ANCHOR}">
+        <h2>${escapeHtml(group ? group.label.no : e.label.no)}</h2>
+        <form method="post" action="/eier/${encodeURIComponent(agentId)}/hold-oppdatert" data-auto-updates="1">
+          <fieldset style="border:none;padding:0;margin:0 0 12px;">
+            <legend style="font-weight:600;margin-bottom:4px;">${escapeHtml(e.label.no)}</legend>
+            <p style="margin-bottom:12px;color:#737373;font-size:0.88rem;">${escapeHtml(e.description.no)}</p>
+            ${options}
+          </fieldset>
+          <p class="ep-audit-meta" data-guarantee="auto.guarantee" style="margin-bottom:12px;">${escapeHtml(guarantee.label.no)}</p>
+          <button type="submit" class="ep-btn ep-btn-primary">Lagre</button>
+        </form>
+      </div>`;
+}
+
 export function ownerNotVerifiedPage(agentId: string): string {
   const id = encodeURIComponent(agentId);
   return portalShell(
@@ -1977,6 +2029,21 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     }
 
     const ownerFeaturesCardHtml = hasOwnerFeatures ? ownerFeaturesEntryCardHtml(agentId) : "";
+
+    // H2 (dev-request 2026-11-01-rfb-hold-profilen-oppdatert): the auto.updates
+    // card for every verified owner, allowlist or not — only with
+    // OWNER_AUTO_UPDATES_ENABLED on (flag off = the portal is byte-identical to before).
+    let autoUpdatesCardHtml = "";
+    if (ownerAutoUpdatesEnabled() && ownerAutoUpdatesAppliesTo(agentId)) {
+      try {
+        if (isVerifiedOwner(agentId, session)) {
+          autoUpdatesCardHtml = ownerAutoUpdatesCardHtml(agentId, resolveOwnerFeature("rfb", agentId, OWNER_AUTO_UPDATES_KEY, { db }).value);
+        }
+      } catch (e) {
+        console.error("[owner-portal] auto-updates card failed:", e instanceof Error ? e.message : "error");
+        autoUpdatesCardHtml = "";
+      }
+    }
     // S2e: with «Mine valg», the «Bestillinger» card (and its order-address
     // section) is replaced by a link there; otherwise unchanged.
     const ordersOrMovedCardHtml = hasOwnerFeatures ? ownerFeaturesMovedCardHtml(agentId) : ordersCardHtml(agent, orderEmailHtml);
@@ -2070,7 +2137,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
         </form>
       </div>
 
-      ${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
+      ${autoUpdatesCardHtml}${ownerFeaturesCardHtml}${ownerSelgerCardHtml(agent.id)}${productImportCard}${orderabilityCardHtml}${ownerOrdersEntryCardHtml(agent.id, pendingOrderCount)}${ordersOrMovedCardHtml}${paymentCardHtml}${pauseCardHtml}
 
       <div class="ep-card">
         <h2>Statistikk</h2>
@@ -2284,6 +2351,38 @@ router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (re
   } catch (e: any) {
     console.error("[owner-portal] POST /eier pause failed:", e);
     return res.redirect(303, `${base}?status=pause_error#pause`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// POST /eier/:agentId/hold-oppdatert   (form) — H2, see ownerAutoUpdatesCardHtml.
+// Flag off or not an RFB profile → 404, nothing written. Origin → session → verified owner, then
+// setOwnerFeatureValue (owner_feature_settings + its change-log row). A
+// hidden or unknown value is refused (invalid_value) and stores nothing.
+// ─────────────────────────────────────────────────────────────────
+router.post("/eier/:agentId/hold-oppdatert", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+  const agentId = String(req.params.agentId || "");
+  const base = `/eier/${encodeURIComponent(agentId)}/portal`;
+  if (!ownerAutoUpdatesEnabled() || !ownerAutoUpdatesAppliesTo(agentId)) return res.status(404).json({ success: false, error: "not_found" });
+  if (isCrossSiteWrite(req, "/eier/:agentId/hold-oppdatert")) {
+    return res.status(403).send(portalWriteRefusedPage(base));
+  }
+  try {
+    const session = verifyOwnerSession(req);
+    if (!session.valid) return res.redirect(303, `/eier/${encodeURIComponent(agentId)}`);
+    if (!isVerifiedOwner(agentId, session)) {
+      return session.agentId === agentId
+        ? res.status(403).send(ownerNotVerifiedPage(agentId))
+        : res.status(403).json(ownerForbiddenJson(agentId, session));
+    }
+    const value = typeof req.body?.value === "string" ? req.body.value : "";
+    const out = setOwnerFeatureValue("rfb", agentId, OWNER_AUTO_UPDATES_KEY, value, { actor: "owner", detail: ownerSessionEmail(session.token) });
+    if (out.kind !== "ok") return res.redirect(303, `${base}?status=error#${OWNER_AUTO_UPDATES_ANCHOR}`);
+    if (out.changed) console.log(`[owner-portal] owner set ${OWNER_AUTO_UPDATES_KEY} for agent ${agentId}`);
+    return res.redirect(303, `${base}?status=saved#${OWNER_AUTO_UPDATES_ANCHOR}`);
+  } catch (e: any) {
+    console.error("[owner-portal] POST /eier hold-oppdatert failed:", e);
+    return res.redirect(303, `${base}?status=error#${OWNER_AUTO_UPDATES_ANCHOR}`);
   }
 });
 

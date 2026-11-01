@@ -50538,6 +50538,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-rfb-hold-profilen-oppdatert («Hold profilen
+// oppdatert»): the owner refresh as the nightly run's last step behind
+// OWNER_AUTO_UPDATES_ENABLED — AC1/AC2 (fill_empty / never / automatic, the
+// never list, owner-saved and CS-locked fields), AC3 (the unowned cohort and
+// writes identical flag off vs on), AC4 (the owner-portal card for every
+// verified owner, «Mine valg» shows the same value, flag off = no card, no
+// write), AC5 (change-log rows with source), guards, preview, the probe's
+// choice rows. Fresh in-memory DB per block (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-hold-profilen-oppdatert: rfb-owner-refresh ──");
+  try {
+    const { runRfbOwnerRefreshTests } = require("../src/services/rfb-owner-refresh.test") as
+      typeof import("../src/services/rfb-owner-refresh.test");
+    const ror = await runRfbOwnerRefreshTests({ log: false });
+    passed += ror.passed;
+    failed += ror.failed;
+    for (const f of ror.failures) failures.push("rfb-owner-refresh: " + f);
+    console.log(`  rfb-owner-refresh: ${ror.passed} passed, ${ror.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-owner-refresh: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-berikelse-nattjobb (prod incident 2026-10-11: a
 // manual apply run replaced 7 stored contact_email values and 2 phones):
 // GET /admin/bm-producer-harvest `fill_only` + `scope_agent_ids`; the default

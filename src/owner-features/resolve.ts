@@ -23,6 +23,9 @@ import {
   UnknownOwnerFeatureError,
   getOwnerFeature,
   findOwnerFeature,
+  ownerFeatureEntryForEnv,
+  ownerFeatureStatus,
+  visibleOwnerFeatureOptions,
   type LocalizedText,
   type OwnerFeatureCondition,
   type OwnerFeatureEntry,
@@ -277,7 +280,9 @@ class Resolver {
   }
 
   segmentDefault(e: OwnerFeatureEntry): OwnerFeatureValue {
-    return this.subject.segment === "owner" ? e.default.owner : e.default.unclaimed;
+    // A liveFlag entry with its flag off answers with its pre-live default (whileFlagOff).
+    const x = ownerFeatureEntryForEnv(e, this.env);
+    return this.subject.segment === "owner" ? x.default.owner : x.default.unclaimed;
   }
 
   /** The owner's explicit value: adapter column or stored row. undefined = none. */
@@ -331,8 +336,8 @@ class Resolver {
     // 2. admin lock
     const s = this.stored.get(e.key);
     if (s && s.admin_locked) return fixed(s.value, "admin", "admin_locked", this.reasonAdmin());
-    // 3. not changeable / requirements
-    if (e.status === "coming_soon") return fixed(d, "default", "coming_soon", REASON_COMING_SOON);
+    // 3. not changeable / requirements (a liveFlag entry with its flag off is coming_soon)
+    if (ownerFeatureStatus(e, this.env) === "coming_soon") return fixed(d, "default", "coming_soon", REASON_COMING_SOON);
     if (this.subject.segment === "unclaimed" && e.default.unclaimed === null) {
       return fixed(null, "locked", "not_applicable", REASON_NOT_APPLICABLE);
     }
@@ -526,7 +531,8 @@ export function validateOwnerFeatureValue(
     case "switch":
       return typeof raw === "boolean" ? { ok: true, value: raw } : bad("Verdien må være true eller false.", "The value must be true or false.");
     case "choice": {
-      const opts = (e.options || []).map((o) => o.value);
+      // A hidden option (auto.updates «Foreslå til meg») cannot be stored.
+      const opts = visibleOwnerFeatureOptions(e).map((o) => o.value);
       return typeof raw === "string" && opts.includes(raw)
         ? { ok: true, value: raw }
         : bad(`Verdien må være en av: ${opts.join(", ")}.`, `The value must be one of: ${opts.join(", ")}.`);

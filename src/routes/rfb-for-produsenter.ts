@@ -31,7 +31,11 @@
 //     beskjed» on cancellation only while ORDER_BUYER_RECEIPTS_ENABLED; stock
 //     and products «i eierportalen» only while OWNER_ORDERABILITY_PORTAL_ENABLED
 //     (else the /selger «Produkter» tab, «Tilgjengelighet»); the stock-check
-//     reminder is listed as available only while STOCK_CHECK_EMAIL_ENABLED.
+//     reminder is listed as available only while STOCK_CHECK_EMAIL_ENABLED;
+//     with OWNER_AUTO_UPDATES_ENABLED (auto.updates live, dev-request
+//     2026-11-01-rfb-hold-profilen-oppdatert) the sentences that call the
+//     update choice planned, or new information «a suggestion», are left out
+//     (no replacement text without Daniel's approval).
 //   - Every real order needs buyer contact + consent (CONTACT_REQUIRED_ERROR).
 //   - «Verifisert av eier» is the only badge that shows owner confirmation
 //     (profiles also carry Brreg / Debio badges).
@@ -46,7 +50,7 @@
 
 import { localizedPath, type Lang } from "../i18n/t";
 import { faqPairsFromJsonLd, type FaqPair } from "../services/faq-section";
-import { OWNER_FEATURE_REGISTRY, type OwnerFeatureEntry } from "../owner-features/registry";
+import { OWNER_FEATURE_REGISTRY, ownerAutoUpdatesEnabled, ownerFeatureStatus, type OwnerFeatureEntry } from "../owner-features/registry";
 import { OWNER_LEVELS } from "../owner-features/changes";
 import { orderReminderHours, orderAutocancelHours } from "../services/order-followups";
 import { orderCapNewPerDay } from "../services/cart-service";
@@ -96,6 +100,8 @@ export interface ForProdusenterFacts {
   orderabilityPortalOn: boolean;
   /** STOCK_CHECK_EMAIL_ENABLED: the stock-check reminder e-mail (B2). */
   stockCheckEmailOn: boolean;
+  /** OWNER_AUTO_UPDATES_ENABLED: auto.updates is a live choice (dev-request 2026-11-01-rfb-hold-profilen-oppdatert). */
+  autoUpdatesOn?: boolean;
 }
 
 export function currentForProdusenterFacts(): ForProdusenterFacts {
@@ -109,6 +115,7 @@ export function currentForProdusenterFacts(): ForProdusenterFacts {
     buyerReceiptsOn: isBuyerReceiptsEnabled(),
     orderabilityPortalOn: ownerOrderabilityPortalEnabled(),
     stockCheckEmailOn: isStockCheckEmailEnabled(),
+    autoUpdatesOn: ownerAutoUpdatesEnabled(),
   };
 }
 
@@ -146,7 +153,7 @@ function flagGatedOff(e: OwnerFeatureEntry, f: ForProdusenterFacts): boolean {
  * off (products.stock_check without STOCK_CHECK_EMAIL_ENABLED).
  */
 export function liveRfbOwnerChoices(facts?: ForProdusenterFacts, registry: OwnerFeatureEntry[] = OWNER_FEATURE_REGISTRY): OwnerFeatureEntry[] {
-  return registry.filter((e) => e.verticals.includes("rfb") && e.status !== "coming_soon" && !(facts && flagGatedOff(e, facts)));
+  return registry.filter((e) => e.verticals.includes("rfb") && ownerFeatureStatus(e) !== "coming_soon" && !(facts && flagGatedOff(e, facts)));
 }
 
 function levelsAnswer(lang: "no" | "en"): string {
@@ -203,7 +210,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
         { q: "Hva om e-postadressen på profilen er feil?", a: "Kryss av for at e-postadressen er feil eller utdatert når du ber om å ta over profilen. Da går kravet til manuell godkjenning, og vi kontakter deg på adressen du oppgir." },
         { q: "Hvordan logger jeg inn senere?", a: "Skriv inn e-postadressen din under «Logg inn», så sender vi deg en innloggingslenke. Du trenger ikke passord." },
         { q: "Hva betyr «Verifisert av eier»?", a: "Det betyr at eieren selv har tatt over profilen. Det er det eneste merket som viser at eieren selv har bekreftet profilen." },
-        { q: "Hva skjer med det jeg skriver selv?", a: "Det du skriver selv, overskrives aldri. Finner vi ny informasjon om deg, blir den et forslag." },
+        { q: "Hva skjer med det jeg skriver selv?", a: `Det du skriver selv, overskrives aldri.${f.autoUpdatesOn ? "" : " Finner vi ny informasjon om deg, blir den et forslag."}` },
       ],
     },
     {
@@ -269,7 +276,7 @@ function sectionsNo(f: ForProdusenterFacts): Section[] {
           ? "Logg inn og legg inn varene i eierportalen. Der merker du dem også som på lager, så kundene kan bestille dem."
           : "Logg inn og legg inn varene i fanen «Produkter». Under «Tilgjengelighet» på samme side merker du varene som er på lager. Finner du ikke en vare der, si fra til oss, så hjelper vi deg." },
         { q: "Kan dere hente produktene fra nettsiden min?", a: "Profilen kan allerede vise produkter vi har funnet på nettsiden din. At du selv kan hente produktene fra nettsiden som forslag du godkjenner, er planlagt." },
-        { q: "Oppdaterer dere profilen min automatisk?", a: "Vi sjekker jevnlig offentlige kilder for å holde profilen riktig. Det du har skrevet selv, overskrives aldri. Et valg for hvordan oppdateringene skal skje, er planlagt." },
+        { q: "Oppdaterer dere profilen min automatisk?", a: `Vi sjekker jevnlig offentlige kilder for å holde profilen riktig. Det du har skrevet selv, overskrives aldri.${f.autoUpdatesOn ? "" : " Et valg for hvordan oppdateringene skal skje, er planlagt."}` },
       ],
     },
     {
@@ -359,7 +366,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
         { q: "What if the e-mail address on the profile is wrong?", a: "Tick the box saying the e-mail address is wrong or out of date when you ask to take over the profile. The request then goes to manual approval, and we contact you at the address you give." },
         { q: "How do I log in later?", a: "Enter your e-mail address under «Log in», and we send you a login link. You do not need a password." },
         { q: "What does «Verified by owner» mean?", a: "It means the owner has taken over the profile. It is the only badge that shows the owner has confirmed the profile." },
-        { q: "What happens to what I write myself?", a: "What you write yourself is never overwritten. If we find new information about you, it becomes a suggestion." },
+        { q: "What happens to what I write myself?", a: `What you write yourself is never overwritten.${f.autoUpdatesOn ? "" : " If we find new information about you, it becomes a suggestion."}` },
       ],
     },
     {
@@ -425,7 +432,7 @@ function sectionsEn(f: ForProdusenterFacts): Section[] {
           ? "Log in and add your goods in the owner portal. There you also mark them as in stock, so customers can order them."
           : "Log in and add your goods in the «Produkter» (products) tab. Under «Tilgjengelighet» (availability) on the same page you mark which goods are in stock. If a product is missing there, tell us and we will help." },
         { q: "Can you fetch the products from my website?", a: "Your profile may already show products we found on your website. Fetching the products from your website yourself, as suggestions you approve, is planned." },
-        { q: "Do you update my profile automatically?", a: "We regularly check public sources to keep your profile correct. What you have written yourself is never overwritten. A choice of how updates should happen is planned." },
+        { q: "Do you update my profile automatically?", a: `We regularly check public sources to keep your profile correct. What you have written yourself is never overwritten.${f.autoUpdatesOn ? "" : " A choice of how updates should happen is planned."}` },
       ],
     },
     {
