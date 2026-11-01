@@ -16,7 +16,9 @@
  *   undo       reverts the newest change (a level as one unit) with audit rows;
  *              refuses an older batch, a second undo, and a key changed since.
  *   log        newest first, who/when, «Angret», pagination.
- *   intro      first-login card shown until answered; answer stored once;
+ *   intro      (T7) the «Nyheter og tips» question shown until answered;
+ *              answer stored once (owner_feature_prompt); full T7 cases in
+ *              owner-features-t7.test.ts;
  *              coming_soon comms.news writes no setting; live fixture applies.
  *   N1         the old Bestillinger routes write the orders.enabled audit row.
  *   escaping   agent name, registry text and query parameters are escaped.
@@ -227,6 +229,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertEq([optInCol(OWNED_ID), audits(OWNED_ID).length, batches(OWNED_ID).length, settingsRows(OWNED_ID)], [0, 0, 0, 0],
       "allowlist off: nothing written");
     assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_intro").get() as any).n, 0, "allowlist off: no intro row");
+    assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_prompt").get() as any).n, 0, "allowlist off (T7): no prompt row");
 
     // ── Check order ──────────────────────────────────────────────────────────
     assertEq((await page(OWNED_ID, {}, "")).status, 404, "order: allowlist before session (no session, not listed → 404)");
@@ -271,9 +274,15 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(groupPos.every((p) => p > 0) && groupPos.every((p, i) => i === 0 || p > groupPos[i - 1]), "page: every group with a built entry rendered, in Vedlegg A order");
     assertTrue(reg.OWNER_FEATURE_GROUPS.filter((g) => !builtGroups.includes(g)).every((g) => !b0.includes(`data-group="${g.key}"`)),
       "page (S2e): a group with only planned entries has no card");
-    const shownKeys = reg.OWNER_FEATURE_REGISTRY.filter((e) => !e.advanced).map((e) => e.key).filter((k) => b0.includes(`data-key="${k}"`));
+    // T7: groups in OWNER_FEATURE_GROUPS order, rows in registry order within their group.
+    const groupIdx = (g: string) => reg.OWNER_FEATURE_GROUPS.findIndex((x) => x.key === g);
+    const shownKeys = reg.OWNER_FEATURE_REGISTRY.filter((e) => !e.advanced)
+      .map((e, i) => ({ k: e.key, g: groupIdx(e.group), i }))
+      .sort((a, b) => a.g - b.g || a.i - b.i)
+      .map((x) => x.k)
+      .filter((k) => b0.includes(`data-key="${k}"`));
     const keyPos = shownKeys.map((k) => b0.indexOf(`data-key="${k}"`));
-    assertTrue(keyPos.every((p, i) => i === 0 || p > keyPos[i - 1]), "page: rows in registry order (advanced ones under «Flere valg»)");
+    assertTrue(keyPos.every((p, i) => i === 0 || p > keyPos[i - 1]), "page: rows in registry order within their group (advanced ones under «Flere valg»)");
     // One row: from its <li> to the end of its control column (rows may hold nested lists).
     const row = (b: string, key: string) => {
       const i = b.indexOf(`data-key="${key}"`);
@@ -292,7 +301,8 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
     assertTrue(!b0.includes("Flere valg"), "page (S2e): no «Flere valg» while no advanced entry is built");
     assertTrue(b0.includes("Slik er du nå") && b0.includes("Hvor aktiv vil du være?"), "page: levels + status line");
     assertTrue(!b0.includes(`aria-current="true" data-level=`), "page (S2e): no level marked before the owner chose one");
-    assertTrue(b0.includes(`id="velkommen"`), "page: first-login card shown");
+    // T7: no first-login card; the unanswered question stands in #gruppe-comms.
+    assertTrue(!b0.includes(`id="velkommen"`) && b0.includes(`data-news-question="1"`), "page (T7): no first-login card; the news question is shown");
     assertTrue(b0.includes("Ingen endringer ennå."), "page: empty change log");
     const unb = html(await page(UNBADGED_ID));
     assertTrue(row(unb, "orders.enabled").includes("Krever at profilen er verifisert av Rett fra Bonden"), "page: requirement reason (is_verified) shown");
@@ -512,24 +522,28 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       assertEq((html(await page(LOG_ID, { side: "99" })).match(/Side 2 av 2/g) || []).length, 1, "log: page out of range clamps to the last");
     }
 
-    // ── First-login card ─────────────────────────────────────────────────────
+    // ── «Nyheter og tips» question (T7; the S2b first-login card is gone) ───
     {
       const i1 = await post(H.intro, OWNED_ID, { answer: "yes" });
-      const row1 = db.prepare("SELECT answer, answered_at, actor_detail FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any;
-      assertEq([loc(i1).startsWith(`/eier/${OWNED_ID}/valg?endret=`), row1?.answer, row1?.actor_detail], [true, "yes", `post@${OWNED_ID}.example.no`], "intro: «Ja» stored with the session e-mail (S2e: applied to comms.news, with a batch)");
-      assertTrue(/^\d{4}-\d{2}-\d{2}T/.test(String(row1?.answered_at)), "intro: answer time stored (ISO)");
-      assertEq((db.prepare("SELECT value_json, set_by FROM owner_feature_settings WHERE key = 'comms.news' AND subject_id = ?").get(OWNED_ID) as any), { value_json: "true", set_by: "owner" }, "intro (S2e): live comms.news gets the owner's explicit row");
+      const p1 = db.prepare("SELECT state, answered_at, actor_detail FROM owner_feature_prompt WHERE subject_id = ? AND key = 'comms.news'").get(OWNED_ID) as any;
+      assertEq([loc(i1).startsWith(`/eier/${OWNED_ID}/valg?endret=`), p1?.state, p1?.actor_detail], [true, "yes", `post@${OWNED_ID}.example.no`], "intro (T7): «Ja takk» stored with the session e-mail, applied to comms.news with a batch");
+      assertTrue(/^\d{4}-\d{2}-\d{2}T/.test(String(p1?.answered_at)), "intro: answer time stored (ISO)");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_intro").get() as any).n, 0, "intro (T7): no owner_feature_intro row is written any more");
+      assertEq((db.prepare("SELECT value_json, set_by FROM owner_feature_settings WHERE key = 'comms.news' AND subject_id = ?").get(OWNED_ID) as any), { value_json: "true", set_by: "owner" }, "intro: live comms.news gets the owner's explicit row");
       const after = html(await page(OWNED_ID));
-      assertTrue(!after.includes(`id="velkommen"`), "intro: card not shown again");
-      await post(H.intro, OWNED_ID, { answer: "no" });
-      assertEq((db.prepare("SELECT answer FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any).answer, "yes", "intro: a second answer does not overwrite the first");
+      assertTrue(!after.includes(`data-news-question="1"`), "intro: question not shown again");
+      const second = await post(H.intro, OWNED_ID, { answer: "never" });
+      assertTrue(loc(second).includes("melding=ingen_endring"), "intro (T7): an answer while the question is closed changes nothing");
+      assertEq((db.prepare("SELECT state FROM owner_feature_prompt WHERE subject_id = ?").get(OWNED_ID) as any).state, "yes", "intro: a second answer does not overwrite the first");
       assertEq(loc(await post(H.intro, OTHER_ID, { answer: "kanskje" })).includes("melding=ugyldig"), true, "intro: junk answer refused");
-      assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_intro WHERE subject_id = ?").get(OTHER_ID) as any).n, 0, "intro: junk answer stores nothing");
-      const R = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "comms.news" ? { ...e, status: "live" as const } : e));
-      const out = ch.answerOwnerIntro("rfb", OTHER_ID, "yes", { actor: "owner", detail: "t" }, { registry: R, db });
-      assertEq([out.stored, out.applied, !!out.batchId], [true, true, true], "intro (live comms.news): «Ja» applied as the explicit choice with a batch");
-      assertEq(rs.resolveOwnerFeature("rfb", OTHER_ID, "comms.news", { registry: R, db }).value, true, "intro (live comms.news): value on");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM owner_feature_prompt WHERE subject_id = ?").get(OTHER_ID) as any).n, 0, "intro: junk answer stores nothing");
+      const out = ch.answerOwnerNewsQuestion("rfb", OTHER_ID, "yes", { actor: "owner", detail: "t" }, { db });
+      assertEq(out.kind === "ok" && [out.changed, !!out.batchId], [true, true], "intro (live comms.news): «Ja takk» applied as the explicit choice with a batch");
+      assertEq(rs.resolveOwnerFeature("rfb", OTHER_ID, "comms.news", { db }).value, true, "intro (live comms.news): value on");
       assertEq(audits(OTHER_ID).map((a) => a.key), ["comms.news"], "intro (live comms.news): one audit row");
+      const R = reg.OWNER_FEATURE_REGISTRY.map((e) => (e.key === "comms.news" ? { ...e, status: "coming_soon" as const } : e));
+      const cs = ch.answerOwnerNewsQuestion("rfb", LOG_ID, "yes", { actor: "owner", detail: "t" }, { registry: R, db });
+      assertEq(cs.kind, "not_open", "intro: coming_soon comms.news → no question, nothing written");
     }
 
     // ── Escaping ─────────────────────────────────────────────────────────────
@@ -581,7 +595,7 @@ export async function runOwnerFeaturesS2bTests(opts: { log?: boolean } = {}): Pr
       try {
         db.prepare("INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at) VALUES ('rfb', 'z', 'maybe', 'x')").run();
       } catch { threw = true; }
-      assertTrue(threw, "schema: intro answer CHECK");
+      assertTrue(threw, "schema: intro answer CHECK (the S2b table is kept)");
       threw = false;
       try {
         db.prepare("INSERT INTO owner_feature_change_batch (vertical, subject_id, kind, first_audit_id, last_audit_id, created_at) VALUES ('rfb', 'z', 'bogus', 1, 1, 'x')").run();

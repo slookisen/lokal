@@ -5640,7 +5640,9 @@ function initSchema(db: Database.Database): void {
         new_json TEXT,
         actor TEXT NOT NULL,
         actor_detail TEXT,
-        at TEXT NOT NULL
+        at TEXT NOT NULL,
+        text_version TEXT,
+        placement TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_owner_feature_audit_subject
         ON owner_feature_audit(vertical, subject_id, at);
@@ -5736,6 +5738,42 @@ function initSchema(db: Database.Database): void {
     `);
   } catch (err) {
     console.error("Migration owner_feature_level_choice failed:", err);
+  }
+
+  // ─── eierportal testrunde 1, T7 — «Nyheter og tips» nederst ─────────────
+  // owner_feature_audit.text_version / placement: nullable, written only for
+  // consent keys (comms.news): which version of the consent text the owner
+  // saw (owner-features/news-consent.ts) and where it was answered
+  // ('mine_valg_question' / 'mine_valg_row'; T15 adds the Oversikt place).
+  // Added to the CREATE TABLE above for new databases; idempotent ALTER for
+  // existing ones. owner_feature_prompt: one row per (subject, question key)
+  // — state 'later' (rounds = how many times «Ikke nå», snoozed_until = when
+  // the question may come back), 'yes' or 'never' (answered_at = the time of
+  // the explicit answer). «Ikke nå» writes no owner_feature_settings and no
+  // audit row. A subject with an owner_feature_intro row (S2b first-login
+  // card) counts as answered. No CHECK on state, so a later slice can add a
+  // state without a table rebuild; the code validates it. Times are ISO-8601.
+  // Additive only.
+  try {
+    const have = new Set((db.prepare(`PRAGMA table_info(owner_feature_audit)`).all() as Array<{ name: string }>).map((c) => c.name));
+    for (const col of ["text_version", "placement"]) {
+      if (!have.has(col)) db.exec(`ALTER TABLE owner_feature_audit ADD COLUMN ${col} TEXT`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS owner_feature_prompt (
+        vertical TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        state TEXT NOT NULL,
+        rounds INTEGER NOT NULL DEFAULT 0,
+        snoozed_until TEXT,
+        answered_at TEXT,
+        actor_detail TEXT,
+        PRIMARY KEY (vertical, subject_id, key)
+      );
+    `);
+  } catch (err) {
+    console.error("Migration owner_feature_prompt / owner_feature_audit consent columns failed:", err);
   }
 
   // ─── dev-request 2026-07-31-rfb-poolgate-uten-telefon-og-batchkapasitet

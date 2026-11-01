@@ -27,6 +27,7 @@
 import { readOrderNotificationsOptIn, writeOrderNotificationsOptIn, readOrderNotificationEmailOverride } from "../services/order-opt-in";
 import { readOwnerProfileVisible, writeOwnerProfileVisible } from "../services/owner-pause-store";
 import { GARDSSALG_BOOKING_ENABLED_ADAPTER, GARDSSALG_PROFILE_VISIBLE_ADAPTER } from "./gardssalg-adapters";
+import { OWNER_NEWS_CONSENT_TEXT } from "./news-consent";
 
 export const OWNER_FEATURE_KEYS = [
   // Hvem kan finne deg
@@ -269,11 +270,13 @@ export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: Locali
   { key: "products", label: { no: "Produkter og priser", en: "Products and prices" } },
   { key: "orders", label: { no: "Bestillinger", en: "Orders" } },
   { key: "payments", label: { no: "Betaling", en: "Payment" } },
-  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
   { key: "auto", label: { no: "Hjelp med å holde profilen oppdatert", en: "Help keeping your profile up to date" } },
   { key: "stats", label: { no: "Statistikk og offentlige tall", en: "Statistics and public numbers" } },
-  { key: "comms", label: { no: "Kontakt fra Rett fra Bonden", en: "Contact from Rett fra Bonden" } },
   { key: "connect", label: { no: "Koblinger", en: "Connections" } },
+  // T7 (punkt 1): notifications, then «Kontakt fra Rett fra Bonden» as the
+  // last group — the «Nyheter og tips» question stands at its top.
+  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
+  { key: "comms", label: { no: "Kontakt fra Rett fra Bonden", en: "Contact from Rett fra Bonden" } },
 ];
 
 const DR = "2026-10-22-rfb-mine-valg-eierbrytere";
@@ -810,10 +813,8 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "comms.news", group: "comms", type: "switch",
     label: t("Nyheter og tips", "News and tips"),
-    description: t(
-      "Om du vil ha nyheter og tips fra Rett fra Bonden på e-post. Vi lagrer svaret ditt med tidspunkt. Vi sender ingen nyhetsbrev automatisk.",
-      "Whether you want news and tips from Rett fra Bonden by e-mail. We store your answer with the time. We send no newsletter automatically.",
-    ),
+    // T7: the row text is part of the versioned consent text (news-consent.ts).
+    description: t(OWNER_NEWS_CONSENT_TEXT.row.no, OWNER_NEWS_CONSENT_TEXT.row.en),
     default: { owner: false, unclaimed: false },
     consent: true,
     outward: true,
