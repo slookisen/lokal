@@ -28,6 +28,7 @@
  */
 
 import Database from "better-sqlite3";
+import { stripAiUtm } from "../../tests/helpers/ai-utm";
 import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import { __setGeocodingFetchForTesting, __clearGeocodeCacheForTesting } from "../services/geocoding-service";
 
@@ -336,9 +337,9 @@ export async function runRfbKategorietiketterIkkeTilbudTests(opts: { log?: boole
         assertEq(r.body, searches[key], `GET /catalog/offers «${q}» near ${near}: findOffers' filtered result`);
       }
       const r = await tools.get("lokal_find_offers")!.handler({ items: ["honning", "egg"], near: "Trondheim" });
-      assertEq(JSON.parse(textOf(r)), [searches.honningT, searches.eggT], "lokal_find_offers: one filtered findOffers result per item, same JSON");
+      assertEq(stripAiUtm(JSON.parse(textOf(r))), [searches.honningT, searches.eggT], "lokal_find_offers: one filtered findOffers result per item, same JSON");
       const b = await tools.get("lokal_find_offers")!.handler({ items: ["honning", "egg"], lat: B.lat, lng: B.lng });
-      assertEq(JSON.parse(textOf(b)), [searches.honningB, searches.eggB], "lokal_find_offers with lat/lng: the same filtered results");
+      assertEq(stripAiUtm(JSON.parse(textOf(b))), [searches.honningB, searches.eggB], "lokal_find_offers with lat/lng: the same filtered results");
     }
 
     // ══════════════════════════════════════════════════════════════

@@ -247,7 +247,7 @@ export function runExperiencesSeoVisningMcpTilbyderTests(opts: { log?: boolean }
       for (let i = 0; i < expIds.length; i++) {
         const res = await mcpCall("get_experience", { id: expIds[i] });
         const sc = res.structuredContent;
-        if (sc && sc.provider && sc.provider.name && typeof sc.profile_url === "string" && sc.profile_url.endsWith(`/opplevelse/vm-exp-${i}`)) okCount++;
+        if (sc && sc.provider && sc.provider.name && typeof sc.profile_url === "string" && new RegExp(`/opplevelse/vm-exp-${i}\\?utm_source=[a-z_]+&utm_medium=mcp&utm_campaign=ai_search$`).test(sc.profile_url)) okCount++;
         if (sc && sc.provider) {
           for (const k of ["name", "org_nr", "website", "phone"]) if (!(k in sc.provider) || sc.provider[k] === "") nullClean = false;
         }

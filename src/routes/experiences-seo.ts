@@ -49,7 +49,7 @@ import { isJunkDescription, looksTruncatedMidWord } from "../services/descriptio
 // dev-request 2026-10-16-utgaende-lenker-utm-eller-referrer-policy (S1): links
 // to the provider's own website carry UTM; booking_url, «Kilde:» and JSON-LD
 // url/sameAs stay as stored.
-import { addUtmParams, OUTBOUND_UTM } from "../utils/url-utm";
+import { addUtmParams, OUTBOUND_UTM, withRequestQuery } from "../utils/url-utm";
 const PROVIDER_SITE_UTM = OUTBOUND_UTM.opplevagent.provider_profile;
 const GARDSSALG_SITE_UTM = OUTBOUND_UTM.opplevagent.gardssalg_profile;
 // dev-request 2026-10-16-opplevagent-indekserbarhet-og-strukturdata, E1-S1:
@@ -8732,7 +8732,7 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     try { provider = getPublishedProviderById(param); } catch { provider = null; }
     if (!provider) return next();
     const slug = provider.slug as string | null;
-    if (slug) { res.redirect(301, `/tilbyder/${encodeURIComponent(slug)}`); return; }
+    if (slug) { res.redirect(301, withRequestQuery(`/tilbyder/${encodeURIComponent(slug)}`, req.originalUrl)); return; }
     // No slug yet (backfill race) — serve by ID temporarily
   } else {
     // Normal slug-based lookup
@@ -9451,7 +9451,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
       canonicalSlug = null;
     }
     if (canonicalSlug && canonicalSlug !== slug) {
-      res.redirect(301, `/opplevelse/${encodeURIComponent(canonicalSlug)}`);
+      res.redirect(301, withRequestQuery(`/opplevelse/${encodeURIComponent(canonicalSlug)}`, req.originalUrl));
       return;
     }
     return next(); // → Norwegian 404 catch-all (no rfb/dental leak)

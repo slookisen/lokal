@@ -154,6 +154,7 @@ import { createMcpRateLimiters, MCP_RATE_LIMIT_PROFILES } from "../middleware/mc
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 import { companyFooterLineHtml } from "../services/company-legal";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { isAsPublicView } from "../services/agent-visibility";
 import { capName } from "../utils/free-text";
 import { mcpInternalErrorText, mcpToolInternalErrorResult } from "../utils/internal-error";
@@ -658,6 +659,13 @@ export function registerExperienceTools(
   getClientIdentity?: () => string | undefined,
   getRequestMeta?: () => RequestMeta | undefined,
 ): void {
+  // «Klikk fra AI-svar» slice 3: experience, provider and gårdssalg profile
+  // links in every tool result (text and structuredContent) are tagged for AI
+  // (utm_medium=mcp). The ChatGPT widget does NOT use the tagged link yet: its
+  // pageUrl() still builds the link from `slug`, because the widget template
+  // is hash-frozen while OpenAI reviews the app (spec item 10 deferred).
+  tagMcpToolResults(server, () => getClientIdentity?.());
+
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil, S2): the
   // experiences / gårdssalg producers a data tool hands the caller, counted
   // with the same rules as rfb (profile-ai-deliveries.ts recordMcpDelivery).

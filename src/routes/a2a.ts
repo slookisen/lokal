@@ -26,6 +26,7 @@ import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 import { recordA2aDelivery } from "../services/profile-ai-deliveries";
+import { aiProfileLinksJson } from "../middleware/ai-profile-links";
 import { agentCardProvider } from "../services/company-legal";
 import { isPaymentsEnabled } from "../services/payment-service";
 import { a2aMessageData, capA2aData } from "../utils/a2a-message";
@@ -199,7 +200,8 @@ router.get("/a2a", (_req: Request, res: Response) => {
   }
 });
 
-router.post("/a2a", (req: Request, res: Response) => {
+// «Klikk fra AI-svar» slice 3: profile links in the answer are tagged for AI (utm_medium=a2a).
+router.post("/a2a", aiProfileLinksJson("a2a"), (req: Request, res: Response) => {
   // Defensive: a request without Content-Type: application/json (or with a malformed
   // body) leaves req.body as undefined, and destructuring it throws — Express then
   // emits a default HTML 500 to a JSON-RPC client. Return a clean parse error instead.

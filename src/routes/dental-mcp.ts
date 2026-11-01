@@ -42,6 +42,7 @@ import type { PlaceGazetteer } from "../services/search-intent/norwegian-query";
 import { capFreeText, capName } from "../utils/free-text";
 import { getDentalSearchGazetteer } from "../services/dental-search-gazetteer";
 import { recordMcpDelivery } from "../services/profile-ai-deliveries";
+import { tagMcpToolResults } from "../middleware/ai-profile-links";
 import { toDentalClinicCard, type DentalSearchCard } from "../services/dental-clinic-card";
 import { DENTAL_EMERGENCY_NOTICE } from "../config/dental-landing";
 
@@ -262,6 +263,10 @@ function toolInternalError(tool: string, err: unknown) {
 // ─── Tool registrations ──────────────────────────────────────
 
 export function registerDentalTools(server: McpServer): void {
+  // «Klikk fra AI-svar» slice 3: clinic profile links in every tool result
+  // are tagged for AI (utm_medium=mcp) here, never in clinicProfileUrl.
+  tagMcpToolResults(server);
+
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil, S2): the
   // clinics a data tool hands the caller, counted with the same rules as rfb
   // (profile-ai-deliveries.ts recordMcpDelivery).

@@ -1,9 +1,9 @@
 {
-  "captured_on": "main 58d5974e, before I-X (dev-request 2026-10-17-integrasjonstest-oppfolging); the two RFB texts «honning i Oslo» captured again for I-AA (A2A reads the text's place as lokal_search does: the fixture's producers have no position, so none is in the Oslo area)",
+  "captured_on": "main 58d5974e, before I-X (dev-request 2026-10-17-integrasjonstest-oppfolging); the two RFB texts «honning i Oslo» captured again for I-AA (A2A reads the text's place as lokal_search does: the fixture's producers have no position, so none is in the Oslo area) Slice 3 of dev-request 2026-10-14-klikk-fra-ai-svar-per-profil (2026-11-01): the answers whose profile links are now AI-tagged at the transport (utm_source=<client>&utm_medium=mcp|a2a|api&utm_campaign=ai_search) re-captured on purpose, only those; with the tagging switched off every answer is main's.",
   "how": "b1Answers() in src/routes/a2a-datapart-alle-plattformer.test.ts: sha256 of each answer with ids, timestamps and origins masked (stable()), plus a summary",
   "answers": {
     "dental {\"message\":\"tannlege i Oslo\"}": {
-      "sha256": "e7dc640ed11a642d738dfa10b24bf0dbf790ece392cc620b85cd0ad64dcb8f22",
+      "sha256": "64fc8b9cd7244ec137b8d0c3373c739df1aa556acee13e3f8b212b55f1cc8448",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -23,7 +23,7 @@
       }
     },
     "dental {\"message\":{\"text\":\"tannlege i Oslo\"}}": {
-      "sha256": "e7dc640ed11a642d738dfa10b24bf0dbf790ece392cc620b85cd0ad64dcb8f22",
+      "sha256": "64fc8b9cd7244ec137b8d0c3373c739df1aa556acee13e3f8b212b55f1cc8448",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -43,7 +43,7 @@
       }
     },
     "dental {\"message\":{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"tannlege i Bergen\"}]}}": {
-      "sha256": "0ba7da91c59107a36426791e1a078663d4135330024b2dec0149d0694925a4d9",
+      "sha256": "778b576008f88074562ca024ebc79e13efaf7f19ee29e75828862520f4e3eb85",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -220,7 +220,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"Finn klinikk 912345678\"}]}}": {
-      "sha256": "d3d64cfbd20693b53a2050bad49585d23e99af0f00c07296f26234d159d349bb",
+      "sha256": "ab28c6270d2509b99eb9fb57f2c0112652cbeb8ce9bb06e05fdee8e2eeb0d012",
       "summary": {
         "skill": "tannlege_info",
         "filter": null,
@@ -229,7 +229,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"Finn klinikk 912345678 eller 923 456 789\"}]}}": {
-      "sha256": "d3d64cfbd20693b53a2050bad49585d23e99af0f00c07296f26234d159d349bb",
+      "sha256": "ab28c6270d2509b99eb9fb57f2c0112652cbeb8ce9bb06e05fdee8e2eeb0d012",
       "summary": {
         "skill": "tannlege_info",
         "filter": null,
@@ -283,7 +283,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"tannlege 0150 Oslo\"}]}}": {
-      "sha256": "a033b2b07eb68ea80a4e4c3718bc5f2beb8deb3c8e6ad7658ec6530b736cf349",
+      "sha256": "ec69c20273d3006ed92b7ee802e172bf64bad27e1f0868d5c47425e9a7064349",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -306,7 +306,7 @@
       }
     },
     "dental {\"message\":{\"data\":{\"fylke\":\"Oslo\"}}}": {
-      "sha256": "a4ab4f5ec565b1189aa188a189b1d3a5860f888188b24a6d8bdc62f2ba0e143c",
+      "sha256": "3a6611b7a3bbdb1b2bccbd69f447bd77381df9fd749a47bda3ab7769ce8f6f59",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -317,7 +317,7 @@
       }
     },
     "dental {\"message\":{\"data\":{\"helfo_agreement\":\"true\"}}}": {
-      "sha256": "0a3d29f180409a1f9bfff8da3889d22f9c48afaa7c433ac7f7908481ee94e58f",
+      "sha256": "2f58d4a3288faa4a8106b025dd460b195d6b0d4c0529e59aecf514624a383214",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -328,7 +328,7 @@
       }
     },
     "dental {\"message\":{\"data\":{}}}": {
-      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "sha256": "6ab96f93ef1bae692975bd937e96746643ac6e4cf547e085931b802f5bfb5f12",
       "summary": {
         "skill": "tannlege_search",
         "filter": {},
@@ -337,7 +337,7 @@
       }
     },
     "dental {\"message\":{\"data\":null}}": {
-      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "sha256": "6ab96f93ef1bae692975bd937e96746643ac6e4cf547e085931b802f5bfb5f12",
       "summary": {
         "skill": "tannlege_search",
         "filter": {},
@@ -346,7 +346,7 @@
       }
     },
     "dental {\"message\":{\"role\":\"user\"}}": {
-      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "sha256": "6ab96f93ef1bae692975bd937e96746643ac6e4cf547e085931b802f5bfb5f12",
       "summary": {
         "skill": "tannlege_search",
         "filter": {},
@@ -355,7 +355,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[]}}": {
-      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "sha256": "6ab96f93ef1bae692975bd937e96746643ac6e4cf547e085931b802f5bfb5f12",
       "summary": {
         "skill": "tannlege_search",
         "filter": {},
@@ -364,7 +364,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"tannlege i Bergen\"},{\"kind\":\"data\",\"data\":{\"fylke\":\"Oslo\"}}]}}": {
-      "sha256": "0ba7da91c59107a36426791e1a078663d4135330024b2dec0149d0694925a4d9",
+      "sha256": "778b576008f88074562ca024ebc79e13efaf7f19ee29e75828862520f4e3eb85",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -532,7 +532,7 @@
       }
     },
     "dental {\"message\":{\"data\":{\"fylke\":\"Vestland\"},\"parts\":[{\"kind\":\"data\",\"data\":{\"fylke\":\"Oslo\"}}]}}": {
-      "sha256": "aa60887b61adfdf94bce45d43a25e25c952f892a4f16479f63ed7b30081f7d1e",
+      "sha256": "eb982bd07e3d9546ed4e7dbf875b19e2dfebf2dfae6f6bc6e7cb2fce513f44d5",
       "summary": {
         "skill": "tannlege_search",
         "filter": {
@@ -543,7 +543,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[{\"kind\":\"data\",\"data\":\"Oslo\"}]}}": {
-      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "sha256": "6ab96f93ef1bae692975bd937e96746643ac6e4cf547e085931b802f5bfb5f12",
       "summary": {
         "skill": "tannlege_search",
         "filter": {},
@@ -552,7 +552,7 @@
       }
     },
     "dental {\"message\":{\"parts\":[{\"kind\":\"data\",\"data\":[\"Oslo\"]}]}}": {
-      "sha256": "cf8d86c7da09fcfb8aa06553b7fecf758822e12465dc1273f9d803cf2200275c",
+      "sha256": "6ab96f93ef1bae692975bd937e96746643ac6e4cf547e085931b802f5bfb5f12",
       "summary": {
         "skill": "tannlege_search",
         "filter": {},
@@ -599,7 +599,7 @@
       }
     },
     "experiences {\"message\":{\"parts\":[{\"kind\":\"text\",\"text\":\"sidersmaking i Bergen\"}]}}": {
-      "sha256": "1ba50712527fbf76bf7aba3478829d7384731d8f83c693389fe60d89af60a21b",
+      "sha256": "856a70939590a85e4f9f833fc6c41179d3aa7c040e5cca1c4fa0dd595ec58696",
       "summary": {
         "skill": "gardssalg_discover",
         "filter": {
@@ -611,7 +611,7 @@
       }
     },
     "experiences {\"message\":{\"text\":\"sidersmaking i Bergen\",\"data\":{\"lat\":60.39,\"lng\":5.32}}}": {
-      "sha256": "cc29a3f818e0f9ad5d3913e640c0ff280c96da97e5309b4126d44cd07dfde6ba",
+      "sha256": "0fe3837ecbbac7c14d54c525a303752a214b72c1ca59659ff9449bfaebd8fa88",
       "summary": {
         "skill": "gardssalg_discover",
         "filter": {
