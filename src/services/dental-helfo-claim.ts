@@ -19,8 +19,9 @@
  *
  * Switch: HELFO_CLAIM_REQUIRES_SOURCE. Off (false) gives the claim from
  * helfo_agreement = 'true' alone, as before F2-S6: rollback is a one-line
- * change here. GET /api/tannlege/agents and /agents/:id keep the stored
- * value (F2-S7 is its own PR).
+ * change here. GET /api/tannlege/agents and /agents/:id give the public
+ * value without the admin key and the stored one with it (F2-S7,
+ * dental-rest-claims.ts).
  *
  * Pure functions plus their SQL twin (DENTAL_HELFO_CLAIM_SQL), no DB access,
  * no data changes.
@@ -91,8 +92,8 @@ export function resolveHelfoClaim(
 
 /**
  * The helfo_agreement a public answer gives (the MCP and A2A cards,
- * GET /api/tannlege/discover): "unknown" where the stored 'true' has no
- * source, otherwise the stored value. GET /api/tannlege/agents keeps the
+ * GET /api/tannlege/discover, and GET /api/tannlege/agents without the admin
+ * key, F2-S7): "unknown" where the stored 'true' has no source, otherwise the
  * stored value.
  */
 export function shownHelfoAgreement<T extends string | null | undefined>(

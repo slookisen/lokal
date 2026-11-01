@@ -2683,8 +2683,12 @@ Filterparametre (query string):
 - q             fritekst — matcher navn eller poststed
 - fylke         fylkesnavn (f.eks. "Oslo", "Vestland")
 - specialty     spesialitet (f.eks. "endodonti", "kjeveortopedi")
-- helfo         "true" — kun klinikker med Helfo-direkteoppgjørsavtale
-- acute_vakt    1 — kun klinikker med akuttvakt-tilbud
+- helfo         "true" — kun klinikker med Helfo-direkteoppgjørsavtale med kilde
+- acute_vakt    1 — kun klinikker som oppgir akuttvakt med kilde
+
+Feltene helfo_agreement og acute_vakt i svaret påstår Helfo-avtale og akuttvakt
+bare med kilde, som klinikkortet: "true" uten kilde gis som "unknown", og 1 uten
+kilde som null. Filtrene gir bare klinikker der feltet i svaret har verdien.
 - enrichment_state  "raw" | "enriched"
 - limit         maks antall resultater (standard 50, maks 500)
 - offset        sidebladering

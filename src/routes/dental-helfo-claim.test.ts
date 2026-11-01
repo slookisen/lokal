@@ -13,16 +13,17 @@
  *       /sok card, /sok?helfo=1 and the front-page count;
  *   C   helfo_count, the area facts' helfo_true, the MCP search and detail
  *       cards, A2A, /api/tannlege/discover; GET /api/tannlege/agents and
- *       /agents/:id keep the stored value (F2-S7 is its own PR).
+ *       /agents/:id keep the stored value with the admin key (F2-S7, which
+ *       gives the card's value without it: dental-rest-claims.test.ts).
  *
  * Standalone: npx tsx src/routes/dental-helfo-claim.test.ts
  */
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
-function callRoute(router: any, path: string, query: Record<string, string> = {}): Promise<{ status: number; text: string; body: any }> {
+function callRoute(router: any, path: string, query: Record<string, string> = {}, headers: Record<string, string> = {}): Promise<{ status: number; text: string; body: any }> {
   return new Promise((resolve) => {
-    const req: any = { method: "GET", url: path, originalUrl: path, path, params: {}, query, headers: {}, get() { return undefined; } };
+    const req: any = { method: "GET", url: path, originalUrl: path, path, params: {}, query, headers, get() { return undefined; } };
     const res: any = {
       statusCode: 200,
       status(c: number) { this.statusCode = c; return this; },
@@ -274,27 +275,36 @@ export async function runDentalHelfoClaimTests(opts: { log?: boolean } = {}): Pr
     ok(discoverOf(A.id)?.helfo_agreement === "true" && discoverOf(U.id)?.helfo_agreement === "unknown" && !discoverOf(U.id)?.badges.includes("Helfo-avtale"),
       "C15: /api/tannlege/discover gives 'unknown' and no badge without a source");
 
-    // GET /api/tannlege/agents and /agents/:id keep the stored value (F2-S7).
-    const rawList = await callRoute(dentalRouter, "/agents", { helfo_agreement: "true" });
-    const rawAgents: any[] = rawList.body?.agents ?? rawList.body?.results ?? (Array.isArray(rawList.body) ? rawList.body : []);
-    const rawIds = rawAgents.map((a: any) => a.id);
-    ok(rawList.status === 200 && [...sourced, ...unsourced].every((c) => rawIds.includes(c.id)),
-      `C16: GET /api/tannlege/agents?helfo_agreement=true still lists every stored 'true' (${rawList.status})`);
-    ok(rawAgents.filter((a: any) => unsourced.some((c) => c.id === a.id)).every((a: any) => a.helfo_agreement === "true"),
-      "C17: ... with the stored helfo_agreement");
-    const rawOne = await new Promise<{ status: number; body: any }>((resolve) => {
-      const req: any = { method: "GET", url: `/agents/${U.id}`, originalUrl: `/agents/${U.id}`, path: `/agents/${U.id}`, params: {}, query: {}, headers: {}, get() { return undefined; } };
-      const res: any = {
-        statusCode: 200,
-        status(c: number) { this.statusCode = c; return this; },
-        setHeader() { return this; }, set() { return this; }, vary() { return this; },
-        send(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
-        json(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
-      };
-      dentalRouter.handle(req, res, () => resolve({ status: 404, body: null }));
-    });
-    const rawOneAgent = rawOne.body?.agent ?? rawOne.body;
-    ok(rawOne.status === 200 && rawOneAgent?.helfo_agreement === "true", `C18: GET /api/tannlege/agents/:id keeps the stored 'true' (${rawOne.status})`);
+    // GET /api/tannlege/agents and /agents/:id keep the stored value with the
+    // admin key (F2-S7 gives the card's value without it).
+    const prevAdminKey = process.env.ADMIN_KEY;
+    process.env.ADMIN_KEY = "dental-helfo-claim-test-key";
+    const keyHeaders = { "x-admin-key": "dental-helfo-claim-test-key" };
+    try {
+      const rawList = await callRoute(dentalRouter, "/agents", { helfo_agreement: "true" }, keyHeaders);
+      const rawAgents: any[] = rawList.body?.agents ?? rawList.body?.results ?? (Array.isArray(rawList.body) ? rawList.body : []);
+      const rawIds = rawAgents.map((a: any) => a.id);
+      ok(rawList.status === 200 && [...sourced, ...unsourced].every((c) => rawIds.includes(c.id)),
+        `C16: GET /api/tannlege/agents?helfo_agreement=true with the admin key still lists every stored 'true' (${rawList.status})`);
+      ok(rawAgents.filter((a: any) => unsourced.some((c) => c.id === a.id)).every((a: any) => a.helfo_agreement === "true"),
+        "C17: ... with the stored helfo_agreement");
+      const rawOne = await new Promise<{ status: number; body: any }>((resolve) => {
+        const req: any = { method: "GET", url: `/agents/${U.id}`, originalUrl: `/agents/${U.id}`, path: `/agents/${U.id}`, params: {}, query: {}, headers: keyHeaders, get() { return undefined; } };
+        const res: any = {
+          statusCode: 200,
+          status(c: number) { this.statusCode = c; return this; },
+          setHeader() { return this; }, set() { return this; }, vary() { return this; },
+          send(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
+          json(p: any) { resolve({ status: this.statusCode, body: p }); return this; },
+        };
+        dentalRouter.handle(req, res, () => resolve({ status: 404, body: null }));
+      });
+      const rawOneAgent = rawOne.body?.agent ?? rawOne.body;
+      ok(rawOne.status === 200 && rawOneAgent?.helfo_agreement === "true", `C18: GET /api/tannlege/agents/:id with the admin key keeps the stored 'true' (${rawOne.status})`);
+    } finally {
+      if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+      else process.env.ADMIN_KEY = prevAdminKey;
+    }
   } catch (err: any) {
     failed++;
     failures.push("dental helfo claim: unexpected error: " + String(err?.stack || err?.message || err));

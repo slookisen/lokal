@@ -219,8 +219,10 @@ function displayablePhone(phone: string | null | undefined): string | null {
  * (resolveAcuteClaim "vakt": a stored quote from the source, A2A dev-request
  * 2026-10-16-finn-tannlege-fasettsider F1-S4c), so no answer says
  * acute_vakt: 1 for a clinic whose card says «Tar imot akuttpasienter».
+ * Also the acute_vakt of GET /api/tannlege/agents and /agents/:id without the
+ * admin key (F2-S7, dental-rest-claims.ts).
  */
-function publicAcuteVakt(agent: ClinicRow): 1 | null {
+export function publicAcuteVakt(agent: Parameters<typeof resolveAcuteClaim>[0]): 1 | null {
   return resolveAcuteClaim(agent) === "vakt" ? 1 : null;
 }
 

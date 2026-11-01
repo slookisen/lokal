@@ -207,6 +207,8 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
       assertEq(Object.keys(r.body), ["count", "agents"], "R6: response shape {count, agents}");
       assertEq(r.body.agents.map((a: any) => a.id), ids, "R7: same rows in the same order as the old query");
       const { isDisplayablePhone } = require("./contact-normalizer") as typeof import("./contact-normalizer");
+      const { resolveAcuteClaim } = require("./dental-acute-claim") as typeof import("./dental-acute-claim");
+      const { shownHelfoAgreement } = require("./dental-helfo-claim") as typeof import("./dental-helfo-claim");
       // dev-request 2026-10-16-rfb-strukturerte-data-tredjepartsrating-og-
       // places-treffvakt, S4-A1b: the route leaves the stored Google rating
       // (rating, rating_count, rating_source) out, so the snapshot does too.
@@ -227,9 +229,18 @@ export async function runDentalStoreSearchTests(opts: { log?: boolean } = {}): P
           rich_field_count: _rich,
           ...a
         } = store.getDentalAgentById(id)!;
-        return { ...a, telefon: isDisplayablePhone(a.telefon) ? a.telefon : null, mobil: isDisplayablePhone(a.mobil) ? a.mobil : null };
+        // F2-S7: without the admin key, acute_vakt 1 only with «Akuttvakt»
+        // and helfo_agreement 'true' only with a source, as on the card.
+        const stored = store.getDentalAgentById(id)!;
+        return {
+          ...a,
+          acute_vakt: a.acute_vakt === 1 && resolveAcuteClaim(stored) !== "vakt" ? null : a.acute_vakt,
+          helfo_agreement: shownHelfoAgreement(stored),
+          telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
+          mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
+        };
       });
-      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot, less the three Google rating keys, field_provenance, the pending map (A4-D) and the claim's side values (F2-S8)");
+      assertEq(JSON.stringify(r.body), JSON.stringify({ count: snapshot.length, agents: snapshot }), "R8: response JSON equals the per-row snapshot, less the three Google rating keys, field_provenance, the pending map (A4-D) and the claim's side values (F2-S8), with acute_vakt and helfo_agreement as on the card (F2-S7)");
       assertTrue(r.body.agents.some((a: any) => a.id === bergenUpper && a.verification_status === "verified") &&
         r.body.agents.every((a: any) => !("brreg_status" in a) && !("website_ownership" in a) && !("rich_field_count" in a)),
         "R8b: (the verified clinic is in it, with its stored status, and no answer has a side value)");

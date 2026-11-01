@@ -162,6 +162,9 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
   ];
   const restoreModuleCache = (require("../../tests/module-cache") as typeof import("../../tests/module-cache")).swapOutModules(cachePaths);
   const policy = require("../services/places-display-policy") as typeof import("../services/places-display-policy");
+  // F2-S7: the raw REST answers' Helfo/akutt rule has its own switch; the
+  // "as on main" checks below turn it off together with the Places rule.
+  const restClaims = require("../services/dental-rest-claims") as typeof import("../services/dental-rest-claims");
   const { analyticsService } = require("../services/analytics-service") as typeof import("../services/analytics-service");
   const realLogWebSearch = analyticsService.logWebSearch;
   (analyticsService as any).logWebSearch = () => {};
@@ -517,6 +520,7 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
 
     // ── B: B1 — corroborated values exactly as with the rule off ──────────
     policy.__setPlacesDisplayPolicyForTesting(false);
+    restClaims.__setRestClaimsRequireSourceForTesting(false);
     const offC = await page(C);
     const offM = await mcpSurfaces();
     const offA2a = a2aSurfaces();
@@ -530,6 +534,7 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
     const offProv = (await callRoute(seoRouter, "/proveniens")).text;
     const offCard = getDentalAgentCard() as any;
     policy.__setPlacesDisplayPolicyForTesting(null);
+    restClaims.__setRestClaimsRequireSourceForTesting(null);
     {
       // Up to its «Flere tannleger i Oslo» list, which shows A, B and D.
       eq(maskClock(ownPart(htmlC)), maskClock(ownPart(offC)), "B1: C's page is byte for byte the page with the rule off");
@@ -625,6 +630,7 @@ export async function runDentalPlacesVisningTests(opts: { log?: boolean } = {}):
     failures.push("dental places visning (A4-D): unexpected error: " + String(err?.stack || err?.message || err));
   } finally {
     policy.__setPlacesDisplayPolicyForTesting(null);
+    restClaims.__setRestClaimsRequireSourceForTesting(null);
     (analyticsService as any).logWebSearch = realLogWebSearch;
     if (closeMcp) await closeMcp().catch(() => {});
     if (closeHttp) await closeHttp().catch(() => {});

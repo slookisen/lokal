@@ -36893,6 +36893,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental helfo claim: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S7): Helfo og akutt bare med kilde i det rå REST-API-et ──");
+  try {
+    const { runDentalRestClaimsTests } = require("../src/routes/dental-rest-claims.test") as
+      typeof import("../src/routes/dental-rest-claims.test");
+    const drc = await runDentalRestClaimsTests({ log: false });
+    passed += drc.passed;
+    failed += drc.failed;
+    for (const f of drc.failures) failures.push("dental rest claims: " + f);
+    console.log(`  dental rest claims: ${drc.passed} passed, ${drc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental rest claims: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-metode-ikon (F2-S3): profilen viser hva som er kontrollert og når ──");
   try {
     const { runDentalProfileVerificationLineTests } = require("../src/routes/dental-profile-verification-line.test") as
