@@ -38,9 +38,19 @@
 // depend on the Places switch, and an address the Places rule hides stays
 // hidden.
 //
-// PURE: no DB access (the caller passes the hydrated row).
+// Import values (A2A dev-request 2026-10-16-finn-tannlege-tillit-kilder-
+// metode-ikon, F2-S10, Daniel's choice B on question 32): an address or
+// website on a clinic with an org.nr. that only the directory import of May
+// 2026 gave, and nothing has confirmed since, is hidden as well
+// (importOnlyColumns, dental-import-display.ts). This rule has its own switch
+// (IMPORT_VALUES_HIDDEN), does not depend on the Places switch, and a column
+// another rule hides stays hidden.
+//
+// PURE: no DB access (the caller passes the hydrated row; the import map is a
+// file read once).
 
 import type { DentalAgent } from "./dental-store";
+import { importOnlyColumns } from "./dental-import-display";
 import {
   fieldProvenanceRecords,
   placesFieldVerdict,
@@ -73,6 +83,10 @@ export type PrivateAddressRow = Pick<DentalAgent, "adresse"> & { organisasjonsfo
 export type DentalPlacesRow = Pick<DentalAgent, DentalPlacesColumn | "field_provenance"> &
   PrivateAddressRow & {
     stage_v_pending_correction?: unknown;
+    /** The import rule (F2-S10) looks the org.nr. up in the import map. */
+    org_nr?: string | null;
+    /** 'verified' shows a website the import gave (F2-S10). */
+    website_ownership?: string | null;
   };
 
 /** «Bruksenhetsnummer», a dwelling's unit number; any case. */
@@ -166,12 +180,16 @@ export function dentalPlacesVerdicts(
 
 /**
  * The columns (with their provenance keys) hidden on this clinic: those the
- * Places rule hides while `enabled`, and the address when it is a private one.
+ * Places rule hides while `enabled`, the address when it is a private one,
+ * and the address and website only the import gave (F2-S10, its own switch).
  */
 function hiddenColumns(agent: DentalPlacesRow, enabled: boolean): typeof DENTAL_PLACES_COLUMNS {
   const verdicts = dentalPlacesVerdicts(agent, enabled);
   const privateAddress = isPrivateEnkAddress(agent);
-  return DENTAL_PLACES_COLUMNS.filter(({ column }) => verdicts[column] !== "shown" || (column === "adresse" && privateAddress));
+  const importOnly: ReadonlySet<DentalPlacesColumn> = new Set(importOnlyColumns(agent));
+  return DENTAL_PLACES_COLUMNS.filter(
+    ({ column }) => verdicts[column] !== "shown" || (column === "adresse" && privateAddress) || importOnly.has(column)
+  );
 }
 
 /**

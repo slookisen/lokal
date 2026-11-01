@@ -177,11 +177,20 @@ export function placesFieldVerdict(input: PlacesFieldInput, enabled: boolean = p
     (r) => sourceHead(r.source_type) === PLACES_SOURCE_TYPE && isStoredValue(input.field, input.value, r.value)
   );
   if (!placesEvidence || input.ownerConfirmed) return "shown";
-  const corroborated = input.records.some(
-    (r) =>
-      sourceHead(r.source_type) !== PLACES_SOURCE_TYPE &&
-      !isInferenceSource(r.source_type) &&
-      isSameValue(input.field, input.value, r.value)
-  );
+  const corroborated = input.records.some((r) => isCorroboratingRecord(input.field, input.value, r));
   return corroborated ? "shown" : "places_only";
+}
+
+/**
+ * Corroboration (above) by one record: it comes from a real source (not
+ * Places, not an inference source) and holds the stored value once both are
+ * normalised. Also read by dental-import-display.ts (F2-S10), whose import
+ * values are shown once a real source confirms them.
+ */
+export function isCorroboratingRecord(field: PlacesDisplayField, stored: unknown, record: PlacesProvenanceRecord): boolean {
+  return (
+    sourceHead(record.source_type) !== PLACES_SOURCE_TYPE &&
+    !isInferenceSource(record.source_type) &&
+    isSameValue(field, stored, record.value)
+  );
 }

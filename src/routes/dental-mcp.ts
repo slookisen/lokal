@@ -28,6 +28,7 @@ import {
   listSpecialistsForClinic,
 } from "../services/dental-store";
 import { isDentalSyntheticProbeId } from "../services/dental-contamination";
+import { isHiddenImportRow } from "../services/dental-import-display";
 import {
   isDentalQueryParserDisabled,
   parseDentalQuery,
@@ -383,7 +384,9 @@ export function registerDentalTools(server: McpServer): void {
           : null;
 
         // The synthetic schema-probe row (org_nr 999999999) is not a clinic.
-        if (!agent || isDentalSyntheticProbeId(agent.id)) {
+        // F2-S10: nor is a row the May 2026 directory import added on its own
+        // public (no org.nr., so only an id lookup can reach it).
+        if (!agent || isDentalSyntheticProbeId(agent.id) || isHiddenImportRow(agent)) {
           return {
             content: [{ type: "text" as const, text: "Klinikk ikke funnet." }],
             isError: true,
