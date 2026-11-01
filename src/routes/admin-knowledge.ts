@@ -146,7 +146,13 @@ import { checkAboutCandidateSubstantiatedBySource } from "../services/about-sour
 // had zero content validation on `description` before this. Same detector,
 // same rejection message shape as marketplace.ts's three gates; see the
 // write site below (agentColumnUpdates) for the call.
-import { looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
+import {
+  looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam,
+  organicClaimGateEnabled, organicClaimGateApplies, hasUnverifiedOrganicClaim, hasValidDebioStatus, gateOrganicProductsForWrite,
+  stripOrganicCategoriesForWrite, stripOrganicListForWrite, logOrganicClaimGate,
+  REFUSED_ORGANIC_CLAIM_UNVERIFIED, STRIPPED_ORGANIC_CLAIM_UNVERIFIED,
+} from "../services/description-quality";
+import { readDebioVerified } from "../services/debio-approval";
 // W40 RFB spot-check write guards: road-designation precedence for address
 // corrections + the phone-must-be-on-its-source-page gate for the PUT below.
 import { parseStoredStreetAddress, streetAddressBeatsRoadDesignation } from "../services/street-address-parse";
@@ -918,6 +924,72 @@ router.put("/", async (req: Request, res: Response) => {
     return;
   }
 
+  // ── Økologi S3b: organic-claim write gate (RFB_ORGANIC_CLAIM_GATE) ───────
+  // A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+  // tekstrevisjon, S3 punkt 1. This is the enrichment door, so for a producer
+  // WITHOUT a valid Debio status (debio_verified, the S0 rule): free text
+  // (about, description, a product note) with an organic claim is refused
+  // BEFORE any write, same shape as the junk gates below plus the outcome
+  // code; product names and categories lose their organic entries
+  // (deterministic list rule) and the rest of the write goes ahead. Flag off,
+  // a verified producer, or no organic words: nothing here runs or changes.
+  const organicGateOutcomes: Array<{ field: string; outcome: string }> = [];
+  {
+    // The agents row is read only with the flag on (flag off: no extra query).
+    const debioAgent = organicClaimGateEnabled() ? readDebioVerified(db, agentId) : null;
+    if (debioAgent && organicClaimGateApplies(debioAgent)) {
+      for (const f of ["about", "description"] as const) {
+        if (typeof body[f] === "string" && hasUnverifiedOrganicClaim(body[f], debioAgent)) {
+          logOrganicClaimGate("PUT /admin/knowledge", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, f);
+          res.status(400).json({
+            error: `${f} contains an organic claim for a producer without Debio status — rejected`,
+            outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+            field: f,
+            agent_id: agentId,
+          });
+          return;
+        }
+      }
+      if (Array.isArray(body.products)) {
+        const pg = gateOrganicProductsForWrite(body.products as unknown[]);
+        if (!pg.ok) {
+          logOrganicClaimGate("PUT /admin/knowledge", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, pg.field);
+          res.status(400).json({
+            error: `${pg.field} contains an organic claim for a producer without Debio status — rejected`,
+            outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+            field: pg.field,
+            agent_id: agentId,
+          });
+          return;
+        }
+        if (pg.changed) {
+          body.products = pg.products;
+          organicGateOutcomes.push({ field: "products", outcome: STRIPPED_ORGANIC_CLAIM_UNVERIFIED });
+          logOrganicClaimGate("PUT /admin/knowledge", STRIPPED_ORGANIC_CLAIM_UNVERIFIED, agentId, "products");
+        }
+      }
+      if (body.categories !== undefined) {
+        let cats: unknown = body.categories;
+        if (typeof cats === "string") {
+          const t = cats.trim();
+          if (t.startsWith("[")) {
+            try { cats = JSON.parse(t); } catch { cats = null; /* left to the write path as before */ }
+          } else {
+            cats = [t];
+          }
+        }
+        if (Array.isArray(cats)) {
+          const cg = stripOrganicCategoriesForWrite(cats);
+          if (cg.changed) {
+            body.categories = cg.list;
+            organicGateOutcomes.push({ field: "categories", outcome: STRIPPED_ORGANIC_CLAIM_UNVERIFIED });
+            logOrganicClaimGate("PUT /admin/knowledge", STRIPPED_ORGANIC_CLAIM_UNVERIFIED, agentId, "categories");
+          }
+        }
+      }
+    }
+  }
+
   // orch-pr-17: opt-in "correct-not-just-add" flag. Default OFF — when off, the
   // factual-column overwrite gating below is skipped entirely and the endpoint's
   // write behaviour is unchanged. Accepts ?allow_correct=1|true or body flag.
@@ -1570,6 +1642,8 @@ router.put("/", async (req: Request, res: Response) => {
     // rejected_not_on_source_page / fetch_failed / cooldown_skipped).
     ...(phoneWrite ? { phone_write: phoneWrite } : {}),
     ...(phoneWrite && !phoneWrite.allowed ? { phone_rejected_reason: phoneWrite.outcome } : {}),
+    // Økologi S3b: present only when the organic-claim gate stripped a list.
+    ...(organicGateOutcomes.length ? { organic_claim_gate: organicGateOutcomes } : {}),
   });
 });
 
@@ -2758,6 +2832,15 @@ export async function refreshHomepageContent(
           console.log(
             `[homepage-content-refresh] ${agentId} about/description candidate REJECTED — looks like gambling/theme spam (${fetchUrl})`,
           );
+        } else if (
+          organicClaimGateEnabled() &&
+          hasUnverifiedOrganicClaim(aboutSummary, readDebioVerified(db, agentId))
+        ) {
+          // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): a homepage summary with an
+          // organic claim is never written for a producer without a valid
+          // Debio status — prose is refused whole, never cut.
+          skippedUnsubstantiated.push({ agent_id: agentId, reason: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
+          logOrganicClaimGate("homepage-content-refresh", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "about/description");
         } else {
           candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
           candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
@@ -2829,10 +2912,22 @@ export async function refreshHomepageContent(
               reason: `${HCR_PRODUCTS_EXTRACTION_FAILED}${extraction.detail ? ` (${extraction.detail})` : ""}`,
             });
           } else {
-            const { kept, dropped, rejected } =
+            const onPage =
               extraction.outcome === "names"
                 ? hcrProductNamesOnPage(extraction.names, productSource)
                 : { kept: [], dropped: [], rejected: [] };
+            const { dropped, rejected } = onPage;
+            let kept = onPage.kept;
+            // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): product names lose their
+            // organic words for a producer without a valid Debio status (a
+            // name left empty is dropped) — the deterministic list rule.
+            if (kept.length > 0 && organicClaimGateEnabled() && !hasValidDebioStatus(readDebioVerified(db, agentId))) {
+              const sg = stripOrganicListForWrite(kept);
+              if (sg.changed) {
+                kept = sg.list;
+                logOrganicClaimGate("homepage-content-refresh", STRIPPED_ORGANIC_CLAIM_UNVERIFIED, agentId, "products");
+              }
+            }
             const infos = hcrProductInfosFor(kept, cur.products);
             const infosJson = JSON.stringify(infos);
             if (kept.length === 0) {

@@ -139,7 +139,12 @@
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
-import { hasInternalNote, looksLikeCodeArtifact, looksLikeThemeSpam } from "../services/description-quality";
+import {
+  hasInternalNote, looksLikeCodeArtifact, looksLikeThemeSpam,
+  organicClaimGateEnabled, hasUnverifiedOrganicClaim, logOrganicClaimGate,
+  REFUSED_ORGANIC_CLAIM_UNVERIFIED, type OrganicGateAgent,
+} from "../services/description-quality";
+import { readDebioVerified } from "../services/debio-approval";
 import { isProductHeader, isProductNoise, parseProductPrice } from "../services/knowledge-service";
 import { normalizeName } from "../services/product-catalog-sync";
 import {
@@ -208,6 +213,7 @@ type ItemOutcome =
   | "skipped_unchanged"
   | "skipped_malformed_json"
   | "refused_junk_text"
+  | "refused_organic_claim_unverified"
   | "invalid_item"
   | "not_found"
   | "error";
@@ -634,8 +640,36 @@ function applyCatalog(db: ReturnType<typeof getDb>, c: CatalogEffect): void {
  * `consentFor` is called (lazily) only when the row is owner-locked and the
  * item carries owner_consent — an unlocked row never checks or claims consent.
  */
-function plan(cur: LockSnapshot | undefined, item: ValidItem, consentFor?: () => ConsentCheck): Plan {
+/**
+ * Økologi S3b (RFB_ORGANIC_CLAIM_GATE, dev-request 2026-10-28-rfb-okologisk-
+ * merking-…, S3 punkt 1): the agents row's debio_verified for an item that
+ * writes text (description / about / product_name) — null when the flag is
+ * off or the item writes no text (list removals and products_organic_flag
+ * only ever take organic claims away), so plan() is unchanged then.
+ */
+function organicGateAgentFor(db: ReturnType<typeof getDb>, item: ValidItem): OrganicGateAgent | null {
+  if (!("text" in item) || !organicClaimGateEnabled()) return null;
+  return readDebioVerified(db, item.agent_id);
+}
+
+function plan(
+  cur: LockSnapshot | undefined,
+  item: ValidItem,
+  consentFor?: () => ConsentCheck,
+  organicAgent?: OrganicGateAgent | null,
+): Plan {
   if (!cur) return { outcome: "not_found" };
+  // Økologi S3b: a correction never writes a new organic claim for a producer
+  // without a valid Debio status. Text is refused whole (a product name too:
+  // the caller named the exact new value, so it is not rewritten for them),
+  // checked first like the junk gate — before the locks. No audit row.
+  if (organicAgent && "text" in item && hasUnverifiedOrganicClaim(item.text, organicAgent)) {
+    return {
+      outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+      column: storageColumn(item.field),
+      detail: "text contains an organic claim and the producer has no valid Debio status",
+    };
+  }
   const column = storageColumn(item.field);
   const gate = ownerLockGate(cur, isOwnerLocked(cur) && item.owner_consent && consentFor ? consentFor() : undefined);
   const viaOwnerConsent = gate && "consent" in gate ? gate.consent : undefined;
@@ -764,7 +798,7 @@ function applyCorrection(item: ValidItem, reason: string, batchTag: string): App
     const tx = db.transaction((): ApplyResult => {
       const cur = db.prepare(LOCK_SNAPSHOT_SQL).get(item.agent_id) as LockSnapshot | undefined;
       // Owner consent is re-checked here, fresh, inside this row's transaction.
-      const p = plan(cur, item, consentChecker(db, item));
+      const p = plan(cur, item, consentChecker(db, item), organicGateAgentFor(db, item));
       if (p.outcome !== "would_write" && p.outcome !== "would_merge") return { ...p, name: cur?.name };
 
       const nowIso = new Date().toISOString();
@@ -892,11 +926,17 @@ router.post("/", (req: Request, res: Response) => {
       // Dry-run reports the lock state too, so the caller sees what WOULD be
       // refused before spending an apply on it.
       const cur = db.prepare(LOCK_SNAPSHOT_SQL).get(item.agent_id) as LockSnapshot | undefined;
-      const p = plan(cur, item, consentChecker(db, item));
+      const p = plan(cur, item, consentChecker(db, item), organicGateAgentFor(db, item));
       const catalog = catalogFor(db, item, p);
       results.push(toResult(item, { ...p, outcome: reportedOutcome(p.outcome, !!p.viaOwnerConsent), name: cur?.name, catalog }));
     } else {
       results.push(toResult(item, applyCorrection(item, reason, batchTag)));
+    }
+  }
+
+  for (const r of results) {
+    if (r.outcome === REFUSED_ORGANIC_CLAIM_UNVERIFIED) {
+      logOrganicClaimGate("POST /admin/agents/content-correction", r.outcome, r.agent_id, String(r.field ?? ""));
     }
   }
 

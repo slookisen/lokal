@@ -43,7 +43,12 @@ import {
   canCorrectRoadOnlyAddress,
 } from "../services/street-address-parse";
 import { randomUUID } from "crypto";
-import { isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam } from "../services/description-quality";
+import {
+  isJunkDescription, looksLikeCodeArtifact, hasInternalNote, looksLikeThemeSpam,
+  organicClaimGateEnabled, hasValidDebioStatus, gateOrganicFieldsForWrite, logOrganicClaimGate,
+  REFUSED_ORGANIC_CLAIM_UNVERIFIED, STRIPPED_ORGANIC_CLAIM_UNVERIFIED, type OrganicFieldsGate,
+} from "../services/description-quality";
+import { readDebioVerified } from "../services/debio-approval";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 // Decision 11=A: the claim response shows the farm address masked, the same
 // helper the Opplevagent claim page uses; per-IP limit on claim requests.
@@ -1359,6 +1364,36 @@ function descriptionWriteGuardError(description: unknown): { status: number; bod
   return null;
 }
 
+// ─── Økologi S3b: organic-claim write gate for the ADMIN lanes ──────────────
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3 punkt 1 (automatic doors). RFB_ORGANIC_CLAIM_GATE on and
+// the producer has no valid Debio status (agents.debio_verified, the S0
+// rule): the gate result for this body, else null (flag off, verified
+// producer → the caller writes the body exactly as before). Only ever called
+// from the X-Admin-Key lane of a route: the owner's own lanes (claim token /
+// agent API key) are a later slice (S3c) and are not gated here.
+// `agentId` null = a net-new agent (registration), which never has a status.
+function adminOrganicGate(agentId: string | null, body: Record<string, unknown>): OrganicFieldsGate | null {
+  if (!organicClaimGateEnabled()) return null;
+  if (agentId !== null && hasValidDebioStatus(readDebioVerified(getDb(), agentId))) return null;
+  return gateOrganicFieldsForWrite(body);
+}
+
+/** The 400 body of a refused free-text write (route's own {success, error} shape + outcome code). */
+function organicRefusalBody(field: string, agentId: string | null): Record<string, unknown> {
+  return {
+    success: false,
+    error: `${field} contains an organic claim for a producer without Debio status — rejected`,
+    outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED,
+    field,
+    ...(agentId ? { agent_id: agentId } : {}),
+  };
+}
+
+function logOrganicStripped(door: string, agentId: string, stripped: readonly string[]): void {
+  for (const f of stripped) logOrganicClaimGate(door, STRIPPED_ORGANIC_CLAIM_UNVERIFIED, agentId, f);
+}
+
 // ─── PUT /agents/:id — Update agent (authenticated) ──────────
 // Agents can update their own info using their API key
 
@@ -1412,7 +1447,8 @@ router.patch("/agents/:id", (req: Request, res: Response) => {
 
   // Accept either admin key or the agent's own API key
   let authorized = false;
-  if (expectedKey && adminKey && adminKey === expectedKey) authorized = true;
+  let adminLane = false;
+  if (expectedKey && adminKey && adminKey === expectedKey) { authorized = true; adminLane = true; }
   if (!authorized && apiKey) {
     const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
     if (agent && agent.id === agentId) authorized = true;
@@ -1442,7 +1478,22 @@ router.patch("/agents/:id", (req: Request, res: Response) => {
     }
   }
 
-  const updated = marketplaceRegistry.updateAgent(agentId, req.body);
+  // Økologi S3b: admin lane only (the agent's own API key is S3c).
+  let patchBody = req.body;
+  if (adminLane && req.body && typeof req.body === "object") {
+    const og = adminOrganicGate(agentId, req.body as Record<string, unknown>);
+    if (og && og.refused.length > 0) {
+      logOrganicClaimGate("PATCH /agents/:id", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, og.refused[0].field);
+      res.status(400).json(organicRefusalBody(og.refused[0].field, agentId));
+      return;
+    }
+    if (og && og.stripped.length > 0) {
+      patchBody = og.data;
+      logOrganicStripped("PATCH /agents/:id", agentId, og.stripped);
+    }
+  }
+
+  const updated = marketplaceRegistry.updateAgent(agentId, patchBody);
   if (!updated) {
     res.status(404).json({ error: "Agent ikke funnet" });
     return;
@@ -2451,6 +2502,23 @@ router.put("/agents/:id/knowledge", async (req: Request, res: Response) => {
   // (HTTP 200 + `phone_write` + `phone_rejected_reason`); when the phone was
   // the only field in the body the call is a 422 with the same fields.
   let body: Record<string, unknown> = (req.body ?? {}) as Record<string, unknown>;
+  // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): ADMIN lane only — the enrichment
+  // routine's most-used write. Free text (about, a product note) with an
+  // organic claim is refused before anything is written; specialties,
+  // certifications and product names lose their organic entries. The claim-
+  // token / API-key lanes (the producer's own edit, S3c) are not gated.
+  if (isAdmin) {
+    const og = adminOrganicGate(agentId, body);
+    if (og && og.refused.length > 0) {
+      logOrganicClaimGate("PUT /agents/:id/knowledge", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, og.refused[0].field);
+      res.status(400).json(organicRefusalBody(og.refused[0].field, agentId));
+      return;
+    }
+    if (og && og.stripped.length > 0) {
+      body = og.data;
+      logOrganicStripped("PUT /agents/:id/knowledge", agentId, og.stripped);
+    }
+  }
   let phoneWrite: PhoneWriteVerdict | undefined;
   let phoneBefore: string | null = null;
   if (isAdmin && typeof body.phone === "string") {
@@ -2579,9 +2647,11 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
 
   let authorized = false;
+  let adminLane = false;
 
   if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
     authorized = true;
+    adminLane = true;
   }
   if (!authorized && claimToken) {
     const claim = knowledgeService.getClaimByToken(claimToken);
@@ -2649,6 +2719,16 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
     if (hasInternalNote(trimmed)) {
       res.status(400).json({ success: false, error: "description contains an internal pipeline note — rejected" });
       return;
+    }
+    // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): admin lane only (claim token /
+    // API key = the producer's own edit, S3c).
+    if (adminLane) {
+      const og = adminOrganicGate(agentId, { description: trimmed });
+      if (og && og.refused.length > 0) {
+        logOrganicClaimGate("PUT /agents/:id/description", REFUSED_ORGANIC_CLAIM_UNVERIFIED, agentId, "description");
+        res.status(400).json(organicRefusalBody("description", agentId));
+        return;
+      }
     }
     updates.description = trimmed;
   } else if (body.description !== undefined) {
@@ -2809,6 +2889,23 @@ router.post("/admin/register", (req: Request, res: Response) => {
       res.status(400).json({ success: false, error: "description looks like gambling/theme spam (hijacked domain) — rejected" });
       return;
     }
+    // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): the enrichment routine's
+    // registration door. A net-new agent never has a valid Debio status, so
+    // with the flag on a description with an organic claim is refused and
+    // tags / categories / skill tags lose their organic entries.
+    let organicStrippedOnRegister: string[] = [];
+    {
+      const og = adminOrganicGate(null, registration as unknown as Record<string, unknown>);
+      if (og && og.refused.length > 0) {
+        logOrganicClaimGate("POST /admin/register", REFUSED_ORGANIC_CLAIM_UNVERIFIED, `new:${registration.name}`, og.refused[0].field);
+        res.status(400).json(organicRefusalBody(og.refused[0].field, null));
+        return;
+      }
+      if (og && og.stripped.length > 0) {
+        Object.assign(registration, { tags: og.data.tags, categories: og.data.categories, skills: og.data.skills });
+        organicStrippedOnRegister = og.stripped;
+      }
+    }
 
     // Blocklist gate — discovery agent should never re-insert a producer who opted out.
     const blocked = isBlocked({
@@ -2826,6 +2923,7 @@ router.post("/admin/register", (req: Request, res: Response) => {
     // Cast needed: AdminRegistration has optional contactEmail and flexible capabilities,
     // but after Zod parsing all defaults are filled. The DB insert handles both shapes.
     const agent = marketplaceRegistry.register(registration as any);
+    logOrganicStripped("POST /admin/register", agent.id, organicStrippedOnRegister);
 
     interactionLogger.log("register", {
       agentId: agent.id,
@@ -2930,6 +3028,29 @@ router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
       }
     }
 
+    // Økologi S3b (RFB_ORGANIC_CLAIM_GATE): per entry, for a producer without
+    // a valid Debio status — free text with an organic claim (about, a
+    // product note → the whole products list) is dropped from THAT entry
+    // only (this route's own per-field discipline, as for the code-artifact
+    // about above); list fields lose their organic entries. Flag off: no-op.
+    const organicGateResults: Array<{ agentId: string; field: string; outcome: string }> = [];
+    for (const e of enrichments) {
+      if (!e.data || typeof e.data !== "object" || typeof e.agentId !== "string") continue;
+      const og = adminOrganicGate(e.agentId, e.data as Record<string, unknown>);
+      if (!og || (og.refused.length === 0 && og.stripped.length === 0)) continue;
+      const next: Record<string, unknown> = { ...og.data };
+      for (const r of og.refused) {
+        next[r.key] = undefined;
+        organicGateResults.push({ agentId: e.agentId, field: r.field, outcome: REFUSED_ORGANIC_CLAIM_UNVERIFIED });
+        logOrganicClaimGate("POST /admin/bulk-enrich", REFUSED_ORGANIC_CLAIM_UNVERIFIED, e.agentId, r.field);
+      }
+      for (const f of og.stripped) {
+        organicGateResults.push({ agentId: e.agentId, field: f, outcome: STRIPPED_ORGANIC_CLAIM_UNVERIFIED });
+      }
+      logOrganicStripped("POST /admin/bulk-enrich", e.agentId, og.stripped);
+      e.data = next;
+    }
+
     // W40 write guards: same phone gate as PUT /agents/:id/knowledge's admin
     // lane (this route is its batch sibling, always dataSource auto). Per
     // entry: a phone needs `phone_source_url` (or a field_provenance.phone
@@ -2983,6 +3104,8 @@ router.post("/admin/bulk-enrich", async (req: Request, res: Response) => {
         aboutCodeArtifactRejected: aboutRejected,
         phoneRejected: phoneRejections.length,
         phoneRejections,
+        // Økologi S3b: present only when the organic-claim gate acted.
+        ...(organicGateResults.length ? { organicClaimGate: organicGateResults } : {}),
       },
     });
   } catch (err: any) {
