@@ -40,6 +40,9 @@ import {
   stripOrganicListForWrite, stripOrganicCategoriesForWrite, gateOrganicProductsForWrite,
   gateOrganicFieldsForWrite, REFUSED_ORGANIC_CLAIM_UNVERIFIED, ORGANIC_CLAIM_GATE_ENV,
 } from "../services/description-quality";
+// skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+// LLM judges approve everything here — this suite tests other guards.
+import { useApproveAllAboutJudges } from "../../tests/helpers/hcr-about-judges";
 
 export interface TestSummary {
   passed: number;
@@ -61,6 +64,7 @@ export async function runOrganicClaimGateS3bTests(opts: { log?: boolean } = {}):
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  const restoreAboutJudges = useApproveAllAboutJudges();
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -617,6 +621,7 @@ export async function runOrganicClaimGateS3bTests(opts: { log?: boolean } = {}):
     failed++;
     failures.push(`✗ unexpected error: ${err?.stack || err?.message || String(err)}`);
   } finally {
+    restoreAboutJudges();
     console.log = prevLog;
     globalThis.fetch = prevFetch;
     const restore = (k: string, v: string | undefined) => { if (v === undefined) delete process.env[k]; else process.env[k] = v; };
