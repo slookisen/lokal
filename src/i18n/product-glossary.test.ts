@@ -7,6 +7,7 @@
  */
 import { translateProductName, glossaryCoverage } from "./product-glossary";
 import { productLabel, isCategoryWord } from "../routes/seo";
+import { containsOrganicClaim } from "../services/organic-claims";
 
 export interface TestSummary { passed: number; failed: number; failures: string[] }
 
@@ -29,7 +30,7 @@ export function runProductGlossaryTests(opts: { log?: boolean } = {}): TestSumma
   eq(en("kjøtt og egg"), "meat and eggs", "g3: phrase before word-by-word");
   eq(en("Egg fra frittgående høner"), "Free-range eggs", "g4: fixed expression as a phrase");
   eq(en("Bringebær (selvplukk)"), "Raspberries (pick-your-own)", "g5: parenthesised group");
-  eq(en("Økologisk storfekjøtt"), "Organic beef", "g6: word by word when every word is known");
+  eq(translateProductName("Økologisk storfekjøtt", "en", { organicAllowed: true }), "Organic beef", "g6: word by word when every word is known (organic allowed: Debio status)");
   eq(en("Varmrøkt peppermakrell"), "Hot-smoked peppered mackerel", "g7: qualifier + noun");
   eq(en("Kvit geitost med trøffel"), "White goat cheese with truffle", "g8: connector 'med'");
   eq(en("Ukjent spesialitet"), "Ukjent spesialitet", "g9: unknown name unchanged");
@@ -41,6 +42,24 @@ export function runProductGlossaryTests(opts: { log?: boolean } = {}): TestSumma
   eq(no("Eplemost"), "Eplemost", "g15: Norwegian is always the producer's own text");
   eq(sv("Eplemost"), "Äppelmust", "g16: Swedish where known");
   eq(sv("Ukjent spesialitet"), "Ukjent spesialitet", "g17: Swedish falls back to the NORWEGIAN original, never English");
+
+  // ── økologi S3e: organic words translate only with organicAllowed ──
+  const enOk = (s: string) => translateProductName(s, "en", { organicAllowed: true });
+  const svOk = (s: string) => translateProductName(s, "sv", { organicAllowed: true });
+  eq(en("Økologisk storfekjøtt"), "Økologisk storfekjøtt", "s3e1: en without permission (default) -> unchanged, no generated «Organic»");
+  eq(sv("Økologisk storfekjøtt"), "Økologisk storfekjøtt", "s3e2: sv without permission -> unchanged");
+  eq(translateProductName("Økologisk storfekjøtt", "en", { organicAllowed: false }), "Økologisk storfekjøtt", "s3e3: explicit false -> unchanged");
+  eq(enOk("Økologisk storfekjøtt"), "Organic beef", "s3e4: en with permission -> today's translation");
+  eq(svOk("Økologisk storfekjøtt"), "Ekologisk nötkött", "s3e5: sv with permission -> today's translation");
+  eq([en("Økologisk"), en("økologiske"), sv("Økologisk"), en("Økologiske egg")], ["Økologisk", "økologiske", "Økologisk", "Økologiske egg"], "s3e6: bare organic words / phrases unchanged without permission");
+  eq([enOk("Økologisk"), enOk("økologiske egg")], ["Organic", "organic eggs"], "s3e7: …and translated with permission");
+  eq([en("Eplemost"), en("Lammekjøtt"), sv("Eplemost")], ["Apple juice", "Lamb", "Äppelmust"], "s3e8: a non-organic name still translates without permission");
+  eq(no("Økologisk storfekjøtt"), "Økologisk storfekjøtt", "s3e9: Norwegian unchanged");
+  // «økologisk mangfold» is not a claim (organic-claims.ts other-meaning rule);
+  // the glossary does not know «mangfold», so it stays unchanged either way.
+  eq([containsOrganicClaim("Økologisk mangfold"), en("Økologisk mangfold"), enOk("Økologisk mangfold")], [false, "Økologisk mangfold", "Økologisk mangfold"], "s3e10: other-meaning phrase consistent with organic-claims.ts");
+  eq([productLabel("Økologisk storfekjøtt", "en"), productLabel("Økologisk storfekjøtt", "en", { organicAllowed: true }), productLabel("Økologisk storfekjøtt", "no")], ["Økologisk storfekjøtt", "Organic beef", "Økologisk storfekjøtt"], "s3e11: productLabel passes the option through");
+  eq(productLabel("Kjøtt", "en"), "Meat", "s3e12: category shortcut unaffected for a non-organic category word");
 
   // ── productLabel: category word first, then glossary ──
   eq(productLabel("Kjøtt", "en"), "Meat", "p1: bare category word -> category label");
