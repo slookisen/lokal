@@ -4861,6 +4861,56 @@ export const RELATED_PRODUCERS_CSS = `
   }
 `;
 
+// ─── dev-request 2026-10-27-produsentside-sted-dobbelt-i-navn-og-tekst ─────
+// Producer names deliberately carry a « — Sted» suffix to tell same-named
+// producers apart (dev-request 2026-09-03-rfb-korrigering-navn-sted-
+// kategorier; the geocoder also reads it), so the NAME must not change. The
+// sentence builders below, however, append « i {sted}» themselves, which gave
+// «Tverås Gårdsmat — Malm i Malm» (~600 pages, 2026-10-27). This helper drops
+// the place only where the sentence is about to add it again:
+//   - the suffix after the LAST « — » / « – » (spaced dash) is compared,
+//     normalised (NFKC, lower-case, inner whitespace collapsed, a trailing
+//     «(…)» qualifier ignored: «Drøbak (Akershus)» counts as «Drøbak»);
+//   - the whole suffix is dropped when it equals cityName, or when its FIRST
+//     «,» / «/» segment does («Nes, Hedmark», «Kabelvåg/Lofoten»);
+//   - when only its LAST comma segment equals cityName, just that «, {city}»
+//     tail is dropped and the rest is kept («Berles Gårdsbutikk — Svelvik,
+//     Drammen» → «Berles Gårdsbutikk — Svelvik», so the sentence reads
+//     «… — Svelvik i Drammen»);
+//   - anything else is left alone («— Gårdsis», «— Agder» in Arendal,
+//     «— Fisketorget Bergen»): the name is returned unchanged, so a name
+//     without a place suffix renders byte-identically to before.
+// Used only where a sentence or title suffix adds the place; h1, JSON-LD
+// `name`, slug and sitemap keep the full name.
+function normPlaceToken(s: string): string {
+  return s
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s*\([^()]*\)\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function nameForPlaceSentence(name: string, cityName: string): string {
+  if (!name || !cityName) return name;
+  const m = /^(.*\S)(\s+[—–]\s+)(\S.*)$/.exec(name);
+  if (!m) return name;
+  const base = m[1];
+  const separator = m[2];
+  const rawSuffix = m[3];
+  const city = normPlaceToken(cityName);
+  if (!city) return name;
+  const suffix = normPlaceToken(rawSuffix);
+  const firstSegment = normPlaceToken(suffix.split(/[,/]/)[0]);
+  if (suffix === city || firstSegment === city) return base;
+  const lastComma = rawSuffix.lastIndexOf(",");
+  if (lastComma > 0 && normPlaceToken(rawSuffix.slice(lastComma + 1)) === city) {
+    const kept = rawSuffix.slice(0, lastComma).trim();
+    if (kept) return `${base}${separator}${kept}`;
+  }
+  return name;
+}
+
 // GEO: FAQPage JSON-LD for producer pages (dev-request 2026-06-30-geo-content-structured-data).
 // Answers are built strictly from catalog fields already on the profile — never fabricated.
 // Quality-gated: returns null unless at least 2 questions have real, catalog-backed answers,
@@ -4898,7 +4948,7 @@ export function buildProducerFaqJsonLd(params: {
     const addressPart = params.address ? `${params.address}, ` : "";
     qas.push({
       q: `Hvor ligger ${params.name}?`,
-      a: `${params.name} holder til i ${addressPart}${params.cityName}.`,
+      a: `${nameForPlaceSentence(params.name, params.cityName)} holder til i ${addressPart}${params.cityName}.`,
     });
   }
 
@@ -5012,10 +5062,10 @@ export function buildProducerAnswerFirstOpening(params: {
 
   if (lang === "en") {
     const whatPartEn = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " and more" : "");
-    return `${params.name} in ${params.cityName} ${verbEn} ${whatPartEn} — ${closingEn}.`;
+    return `${nameForPlaceSentence(params.name, params.cityName)} in ${params.cityName} ${verbEn} ${whatPartEn} — ${closingEn}.`;
   }
   const whatPart = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " med mer" : "");
-  return `${params.name} i ${params.cityName} ${verbNo} ${whatPart} — ${closingNo}.`;
+  return `${nameForPlaceSentence(params.name, params.cityName)} i ${params.cityName} ${verbNo} ${whatPart} — ${closingNo}.`;
 }
 
 // GEO: FAQPage JSON-LD for city pages (dev-request 2026-06-30-geo-content-structured-data,
@@ -5128,7 +5178,11 @@ export function buildProducerPageTitle(
   } else {
     suffix = "";
   }
-  return `${agentName}${suffix}${titleFreshnessSuffix(updatedAtDate)}`;
+  // dev-request 2026-10-27-produsentside-sted-dobbelt: «Tverås Gårdsmat — Malm
+  // — Lokal matprodusent i Malm» → «Tverås Gårdsmat — Lokal matprodusent i
+  // Malm». Only when the city suffix is actually added; otherwise unchanged.
+  const titleName = cityName ? nameForPlaceSentence(agentName, cityName) : agentName;
+  return `${titleName}${suffix}${titleFreshnessSuffix(updatedAtDate)}`;
 }
 
 /**
@@ -5148,10 +5202,10 @@ export function buildProducerMetaDescription(
   productCount: number
 ): string {
   if (lang !== "en") {
-    return `${agentName}${cityName ? ` i ${cityName}` : ""}. ${safeMetaDescription(safeDescription) || "Lokalprodusert mat i Norge."}`;
+    return `${cityName ? `${nameForPlaceSentence(agentName, cityName)} i ${cityName}` : agentName}. ${safeMetaDescription(safeDescription) || "Lokalprodusert mat i Norge."}`;
   }
   let desc = cityName
-    ? `${agentName} is a local food producer in ${cityName}, Norway.`
+    ? `${nameForPlaceSentence(agentName, cityName)} is a local food producer in ${cityName}, Norway.`
     : `${agentName} is a local food producer in Norway.`;
   if (primaryCategory) desc += ` ${formatCatEn(primaryCategory)}.`;
   if (productCount > 0) desc += ` ${productCount} product${productCount === 1 ? "" : "s"} listed.`;
