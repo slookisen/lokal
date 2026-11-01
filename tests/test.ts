@@ -1197,6 +1197,20 @@ console.log("\n── rfb-address-normalization-c1 ──");
   console.log(`  rfb-address-normalization-c1: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── extractAddress «Skive A» (2026-11-01): only the clean «street nr,
+// postnummer poststed» or null — block boundaries as line breaks, trailing
+// Norge/Norway dropped, in-memory postnummerregister check, name-prefix guard. ──
+console.log("\n── rfb-extract-address-skive-a ──");
+{
+  const { runRfbExtractAddressSkiveATests } = require("../src/routes/rfb-extract-address-skive-a.test") as
+    typeof import("../src/routes/rfb-extract-address-skive-a.test");
+  const r = runRfbExtractAddressSkiveATests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-extract-address-skive-a: " + f);
+  console.log(`  rfb-extract-address-skive-a: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-28-rfb-kontaktekstraksjon-orgnr-som-telefon
 // (slice 1): write-time contact guard — validatePhoneForWrite /
 // stripTrailingContactLabel (contact-normalizer.ts), wired into
@@ -2014,11 +2028,11 @@ function captureFromInvitation(): { subject: string; html: string; text: string 
     captured = { subject: opts.subject };
     return { success: true, messageId: "test" };
   };
-  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/admin");
+  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/magic-link-verify?token=abc", "agent-1");
   assertEq(
     captured ? captured.subject : "",
-    "Gratulerer! Test Gård er nå ditt på Rett fra Bonden",
-    "email: confirmation subject byte-identical",
+    "Profilen til Test Gård er nå din på Rett fra Bonden",
+    "email: confirmation subject byte-identical (K5 text)",
   );
 }
 
@@ -6202,6 +6216,20 @@ const _m2Promise = (async function runOwnerPortalTests() {
         used_at TEXT,
         created_at TEXT DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL
+      );
+      -- K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post):
+      -- request-magic-link also accepts a verified claimant's address, so it
+      -- reads agent_claims for any address that is not agent_knowledge.email.
+      CREATE TABLE agent_claims (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        claimant_name TEXT NOT NULL,
+        claimant_email TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        claim_token TEXT,
+        claim_token_expires_at TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        verified_at TEXT
       );
       CREATE TABLE agent_knowledge_audit (
         id TEXT PRIMARY KEY,
@@ -49720,6 +49748,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring, skive B
+// (AC2): refreshHomepageContent's about judges (quality → facts → better than
+// stored, stubbed; the real judges against a stubbed Messages API for the
+// infra failures), the deadline rule, and the never-replace rule for a
+// non-empty stored category list — function, route with explicit agentIds,
+// and the morning send's refreshRfbCandidateHomepage. Pins its own in-memory
+// DB + global fetch stub (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring (skive B): homepage-content-refresh about judges ──");
+  try {
+    const { runHomepageContentRefreshAboutJudgesTests } =
+      require("../src/routes/homepage-content-refresh-about-judges.test") as
+        typeof import("../src/routes/homepage-content-refresh-about-judges.test");
+    const haj = await runHomepageContentRefreshAboutJudgesTests({ log: false });
+    passed += haj.passed;
+    failed += haj.failed;
+    for (const f of haj.failures) failures.push("homepage-content-refresh-about-judges: " + f);
+    console.log(`  homepage-content-refresh-about-judges: ${haj.passed} passed, ${haj.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-content-refresh-about-judges: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-10-rfb-homepage-refresh-kategorinavn-som-produkter: the
 // refresh writes categories only, category-name products are known-bad, the
 // auto-select takes uncorroborated rows, the gate names the stopped rows.
@@ -49976,6 +50028,29 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("rfb-claim-kravflyt: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K5: Daniel's
+// approval mails «Profilen til X er nå din» with a one-time 15-minute login
+// straight into /eier (a fresh 7-day session, not the mailed token), and the
+// /eier login also accepts this agent's verified owner's confirmed address.
+// Pins getDb() to its own in-memory DB, stubs the e-mail transporter, runs an
+// in-process server, sets APP_URL/ADMIN_KEY (all restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt K5: approval mail + owner-portal login for the confirmed address ──");
+  try {
+    const { runRfbClaimK5GratulererTests } = require("../src/routes/rfb-claim-k5-gratulerer.test") as
+      typeof import("../src/routes/rfb-claim-k5-gratulerer.test");
+    const k5 = await runRfbClaimK5GratulererTests({ log: false });
+    passed += k5.passed;
+    failed += k5.failed;
+    for (const f of k5.failures) failures.push("rfb-claim-k5-gratulerer: " + f);
+    console.log(`  rfb-claim-k5-gratulerer: ${k5.passed} passed, ${k5.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-k5-gratulerer: unexpected error: " + String(err?.message || err));
   }
 });
 
@@ -51441,6 +51516,31 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("organic-claims-s0: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// A2A dev-request 2026-10-28-rfb-okologisk-merking-debio-register-og-
+// tekstrevisjon, S3b (S3 punkt 1, automatic doors): RFB_ORGANIC_CLAIM_GATE —
+// the automated/admin content writes (PUT /admin/knowledge, homepage refresh,
+// content-correction, admin-agents register / Brreg fallback / tynne-profiler,
+// the marketplace admin lanes, bulk-enrich, /admin/register) strip organic
+// list entries and refuse organic free text for a producer without a valid
+// Debio status; flag off / verified / no organic words unchanged; owner lanes
+// untouched (S3c). Swaps the getDb() singleton, env vars, fetch and
+// console.log (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-28-rfb-okologisk-merking S3b: skrivevakt for økologi-påstander (automatiske dører) ──");
+  try {
+    const { runOrganicClaimGateS3bTests } = require("../src/routes/organic-claim-gate-s3b.test") as
+      typeof import("../src/routes/organic-claim-gate-s3b.test");
+    const r = await runOrganicClaimGateS3bTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("organic-claim-gate-s3b: " + f);
+    console.log(`  organic-claim-gate-s3b: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("organic-claim-gate-s3b: unexpected error: " + String(err?.message || err));
   }
 });
 

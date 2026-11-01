@@ -39,14 +39,19 @@
  *   AC6  (dev-request 2026-10-15-homepage-refresh-autoutvalg-erstatter-ikke-
  *        ubekreftede-kategorier) POST /admin/homepage-content-refresh refreshes
  *        its AUTO-selected targets with categoriesCorroborateOnly (dry run and
- *        apply) and answers with a categories_corroboration tally; explicit
- *        agentIds still replace.
+ *        apply) and answers with a categories_corroboration tally. Since skive B
+ *        (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring)
+ *        explicit agentIds and callers without the option follow the same
+ *        rule (never replace a non-empty stored list).
  *
  * Standalone: npx tsx src/routes/homepage-refresh-kategorinavn.test.ts
  */
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+// skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring): the about
+// LLM judges approve everything here — this suite tests other guards.
+import { useApproveAllAboutJudges } from "../../tests/helpers/hcr-about-judges";
 
 export interface TestSummary {
   passed: number;
@@ -77,6 +82,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
   let passed = 0;
   let failed = 0;
   const failures: string[] = [];
+  const restoreAboutJudges = useApproveAllAboutJudges();
 
   function assertEq(actual: unknown, expected: unknown, label: string): void {
     if (JSON.stringify(actual) === JSON.stringify(expected)) {
@@ -279,10 +285,17 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     assertEq(seen[0], ["rot-a", "rot-b"], "AC3b: round 1 takes the front of the queue (no-write rows)");
     assertEq(seen[1], ["rot-c", "rot-e"], "AC3b: round 2 takes the transient-failure row and the theme-spam row (stamped rows moved back)");
     assertEq(seen[2].includes("rot-d"), true, "AC3b: round 3 reaches the fixable row, after all stuck kinds were attempted once");
+    // Skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-
+    // forverring): a non-empty stored list is never replaced, whoever calls —
+    // stored [fish] on a honey/meat page stays [fish] (it used to be replaced
+    // by the page's categories here). The row is still reached and attempted.
     assertEq(
-      JSON.parse((db.prepare(`SELECT categories FROM agents WHERE id = 'rot-d'`).get() as any).categories).includes("honey"),
-      true,
-      "AC3b: the fixable row got corroborated categories written",
+      [
+        JSON.parse((db.prepare(`SELECT categories FROM agents WHERE id = 'rot-d'`).get() as any).categories),
+        !!(db.prepare(`SELECT homepage_content_checked_at AS c FROM agent_knowledge WHERE agent_id = 'rot-d'`).get() as any).c,
+      ],
+      [["fish"], true],
+      "AC3b: the fixable row is reached; its stored [fish] is not replaced by the page's categories (skive B)",
     );
     const stuckAfter = Object.fromEntries(
       ["rot-a", "rot-b", "rot-c", "rot-e"].map((id) => [id, (db.prepare(`SELECT updated_at, homepage_content_checked_at AS c FROM agent_knowledge WHERE agent_id = ?`).get(id) as any)]),
@@ -560,9 +573,16 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
       "AC5 kategori-ae: stored [beverages, fruit] on a drinks-only page is still refused (every stored category must be on the page)",
     );
 
-    // without the option (route / morning send): replacement exactly as before
-    assertEq(JSON.parse(catsOf("c-noopt")), ["meat", "vegetables", "honey"], "AC5 regression: WITHOUT the option the stored categories are still replaced");
-    assertEq(changedOf(noopt, "c-noopt").includes("categories"), true, "AC5 regression: reported as a categories write");
+    // without the option (route / morning send): since skive B (dev-request
+    // 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring) the same rule —
+    // stored [vegetables] on a [meat, vegetables, honey] page is corroborated,
+    // never replaced (it used to become [meat, vegetables, honey]).
+    assertEq(JSON.parse(catsOf("c-noopt")), ["vegetables"], "AC5 skive B: WITHOUT the option the stored categories are no longer replaced");
+    assertEq(
+      [changedOf(noopt, "c-noopt").includes("categories"), changedOf(noopt, "c-noopt").includes(mod.HCR_CATEGORIES_CORROBORATED)],
+      [false, true],
+      "AC5 skive B: reported as categories_corroborated, not a categories write",
+    );
     assertEq(
       noopt.skipped_unsubstantiated.some((s) => s.reason.startsWith(mod.HCR_CATEGORIES_NOT_SUPPORTED)),
       false,
@@ -572,8 +592,8 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     assertEq([aboutOf("c-veg"), aboutOf("c-noopt")], [PAGE_ABOUT, PAGE_ABOUT], "AC5: about is written the same with and without the option");
     assertEq(
       [corr.by_field.categories, noopt.by_field.categories],
-      [1, 1],
-      "AC5: by_field.categories counts only real column writes (c-empty / c-noopt)",
+      [1, 0],
+      "AC5: by_field.categories counts only real column writes (c-empty; c-noopt is corroborated since skive B)",
     );
     db.prepare(`DELETE FROM agent_knowledge`).run();
     db.prepare(`DELETE FROM agents`).run();
@@ -665,13 +685,21 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
           "AC6 apply: the tally is in the response, as its last key",
         );
 
-        // explicit agentIds: replacement exactly as before, no tally key
+        // explicit agentIds: since skive B (dev-request 2026-10-28-rfb-uttrekk-
+        // adresse-og-hjemmeside-forverring) the same rule as the auto-select —
+        // corroborated, never replaced — and the tally is in the answer too
+        // (it used to replace [vegetables] with the page's list, no tally key).
         seed("ex-veg", { cats: ["vegetables"], products: REAL, prov: gpProvA });
         const explicit = await callRoute({ agentIds: ["ex-veg"], apply: true });
         assertEq(
-          [JSON.parse(catsOf("ex-veg")), changedOf(explicit.body, "ex-veg").includes("categories"), "categories_corroboration" in explicit.body],
-          [["meat", "vegetables", "honey"], true, false],
-          "AC6 explicit agentIds: stored [vegetables] is REPLACED by the page's categories as before; no tally key",
+          [
+            JSON.parse(catsOf("ex-veg")),
+            changedOf(explicit.body, "ex-veg").includes("categories"),
+            changedOf(explicit.body, "ex-veg").includes(mod.HCR_CATEGORIES_CORROBORATED),
+            explicit.body.categories_corroboration,
+          ],
+          [["vegetables"], false, true, { corroborated: 1, categories_not_supported_by_homepage: 0 }],
+          "AC6 explicit agentIds (skive B): stored [vegetables] is corroborated, NOT replaced; the tally is in the answer",
         );
       } finally {
         (globalThis as any).fetch = prevFetch;
@@ -925,6 +953,7 @@ export async function runHomepageRefreshKategorinavnTests(opts: { log?: boolean 
     failed++;
     failures.push(`homepage-refresh-kategorinavn: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
+    restoreAboutJudges();
     if (prevParking === undefined) delete process.env.HOMEPAGE_PARKING_DISABLED;
     else process.env.HOMEPAGE_PARKING_DISABLED = prevParking;
     if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

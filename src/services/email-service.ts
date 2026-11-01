@@ -322,17 +322,25 @@ export class EmailService {
     }
   }
 
+  /**
+   * «Profilen til X er nå din» — sent when Daniel approves a claim by hand
+   * (POST /admin/agents/claim-review-approve). K5 (dev-request
+   * 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, text approved by Daniel):
+   * `loginUrl` is a one-time, 15-minute /magic-link-verify link straight into
+   * the owner portal (/eier), and the mail names the portal address
+   * (<host>/eier/<agentId>) the owner logs in on later with this address.
+   */
   async sendClaimConfirmation(
     email: string,
     agentName: string,
-    dashboardUrl: string,
-    agentId?: string
+    loginUrl: string,
+    agentId: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Gratulerer! ${agentName} er nå ditt på ${this.brand}`;
+      const subject = `Profilen til ${agentName} er nå din på ${this.brand}`;
 
-      const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl, agentId);
-      const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl, agentId);
+      const htmlContent = this.generateClaimConfirmationHtml(agentName, loginUrl, agentId);
+      const textContent = this.generateClaimConfirmationText(agentName, loginUrl, agentId);
 
       return await this.sendEmail({
         to: email,
@@ -932,24 +940,20 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
   }
 
   /**
-   * The «slå på bestillinger» link in the claim confirmation. F7 (dev-request
-   * 2026-10-21-rfb-bestillinger-klar-for-forste-ekte-handel): with the agent
-   * id it points at the portal card, /eier/<id>/portal#bestillinger, where
-   * the switch is. The login link (dashboardUrl) goes through /selger, a page
-   * with no such switch, so appending #bestillinger to it led nowhere. The
-   * portal sends a not-yet-logged-in owner to the login page for that agent.
-   * Without an agent id the old behaviour stays (callers that only have a
-   * dashboard URL).
+   * Where the owner logs in later: <APP_URL>/eier/<agentId>. `text` is the
+   * same address without the scheme (default «rettfrabonden.com/eier/<id>»),
+   * as the claim confirmation shows it; `url` is what it links to. K5
+   * replaced F7's order-toggle link (/eier/<id>/portal#bestillinger): the
+   * login link now lands in the portal itself, where that switch is.
    */
-  private orderToggleUrl(dashboardUrl: string, agentId?: string): string {
-    if (agentId) {
-      const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
-      return `${base}/eier/${encodeURIComponent(agentId)}/portal#bestillinger`;
-    }
-    return dashboardUrl.includes('#') ? dashboardUrl : `${dashboardUrl}#bestillinger`;
+  private ownerPortalAddress(agentId: string): { url: string; text: string } {
+    const base = (process.env.APP_URL || 'https://rettfrabonden.com').replace(/\/+$/, '');
+    const url = `${base}/eier/${encodeURIComponent(agentId)}`;
+    return { url, text: url.replace(/^https?:\/\//i, '') };
   }
 
-  private generateClaimConfirmationHtml(agentName: string, dashboardUrl: string, agentId?: string): string {
+  private generateClaimConfirmationHtml(agentName: string, loginUrl: string, agentId: string): string {
+    const portal = this.ownerPortalAddress(agentId);
     return `
 <!DOCTYPE html>
 <html lang="no">
@@ -966,13 +970,6 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
       background: #ffffff;
       padding: 40px 20px;
     }
-    .success-box {
-      background: #e8f5e9;
-      border-left: 4px solid #2d5f2e;
-      padding: 20px;
-      margin: 20px 0;
-      border-radius: 4px;
-    }
     .logo {
       font-size: 20px;
       font-weight: bold;
@@ -983,44 +980,45 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 ${this.brand}</div>
-    <h1>Gratulerer!</h1>
-    <div class="success-box">
-      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på ${this.brand}.</p>
-    </div>
-    <p>Din agent er klar. Du kan nå:</p>
+    <div class="logo">🌾 ${this.escapeHtml(this.brand)}</div>
+    <h1>Hei!</h1>
+    <p>Profilen til <strong>${this.escapeHtml(agentName)}</strong> er nå koblet til deg, og du kan endre den selv når du vil.</p>
+    <p>I eierportalen kan du:</p>
     <ul>
-      <li>Oppdatere informasjon om produkter og åpningstider</li>
-      <li>Se hvor dine produkter blir funnet av kundene</li>
-      <li>Følge med på interaksjoner og preferanser</li>
+      <li>rette varer, åpningstider og kontaktinfo</li>
+      <li>se hvor ofte profilen blir vist og besøkt</li>
+      <li>velge om du vil få bestillinger fra kunder på e-post</li>
     </ul>
-    ${ctaButtonHtml({ href: this.escapeHtml(dashboardUrl), label: "Gå til dashboarden din", color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
-    <p>Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk i <a href="${this.escapeHtml(this.orderToggleUrl(dashboardUrl, agentId))}">dashboarden din</a>.</p>
-    <p>Lykke til!</p>
+    ${ctaButtonHtml({ href: this.escapeHtml(loginUrl), label: "Logg inn i eierportalen", color: "#2d5f2e", radius: "6px", margin: "20px 0" })}
+    <p>Lenken virker i 15 minutter. Senere logger du inn på <a href="${this.escapeHtml(portal.url)}">${this.escapeHtml(portal.text)}</a> med denne e-postadressen.</p>
+    <p>Har du spørsmål, svarer du bare på denne e-posten.</p>
+    <p>Hilsen Daniel, ${this.escapeHtml(this.brand)}</p>
   </div>
 </body>
 </html>
     `;
   }
 
-  private generateClaimConfirmationText(agentName: string, dashboardUrl: string, agentId?: string): string {
+  private generateClaimConfirmationText(agentName: string, loginUrl: string, agentId: string): string {
+    const portal = this.ownerPortalAddress(agentId);
     return `
-Gratulerer!
+Hei!
 
-${agentName} er nå ditt på ${this.brand}.
+Profilen til ${agentName} er nå koblet til deg, og du kan endre den selv når du vil.
 
-Din agent er klar. Du kan nå:
-- Oppdatere informasjon om produkter og åpningstider
-- Se hvor dine produkter blir funnet av kundene
-- Følge med på interaksjoner og preferanser
+I eierportalen kan du:
+- rette varer, åpningstider og kontaktinfo
+- se hvor ofte profilen blir vist og besøkt
+- velge om du vil få bestillinger fra kunder på e-post
 
-Gå til dashboarden din:
-${dashboardUrl}
+Logg inn i eierportalen:
+${loginUrl}
 
-Vil du motta bestillinger fra kunder på e-post? Du kan slå det på (og av igjen) med ett klikk her:
-${this.orderToggleUrl(dashboardUrl, agentId)}
+Lenken virker i 15 minutter. Senere logger du inn på ${portal.text} med denne e-postadressen.
 
-Lykke til!
+Har du spørsmål, svarer du bare på denne e-posten.
+
+Hilsen Daniel, ${this.brand}
     `;
   }
 

@@ -4,7 +4,8 @@
  *   (a) owner self-service opt-in toggle (AC6): 401 without session, 403 for
  *       another agent's session, 200 + DB write with the owner session, form
  *       fallback, portal renders the toggle, default stays 0.
- *   (b) claim-confirmation e-mail carries the toggle sentence + link.
+ *   (b) claim-confirmation e-mail names the orders choice (K5: no separate
+ *       toggle paragraph / link any more).
  *   (c) GET /admin/orders/handoff-stats (AC8): admin-key gated, per-producer
  *       30-day counts, no personal data.
  * Standalone: npx tsx src/routes/owner-order-optin-handoff-stats.test.ts
@@ -158,18 +159,22 @@ export async function runOwnerOrderOptinHandoffStatsTests(opts: { log?: boolean 
     // ── (b) claim confirmation e-mail ───────────────────────────────────────
     const vc = require("../config/vertical-config") as typeof import("../config/vertical-config");
     try { vc.getConfig("rfb"); } catch { vc.loadConfigsAtBoot(); }
-    const txt: string = (emailService as any).generateClaimConfirmationText("Gard A", "https://x.no/eier/s4-a/portal");
-    const html: string = (emailService as any).generateClaimConfirmationHtml("Gard A", "https://x.no/eier/s4-a/portal");
-    ok(txt.includes("bestillinger") && txt.includes("https://x.no/eier/s4-a/portal#bestillinger"), "mail-01: text mentions orders toggle + link");
-    ok(html.includes("bestillinger") && html.includes("portal#bestillinger"), "mail-02: html mentions orders toggle + link");
-    ok(txt.includes("Gratulerer!") && txt.includes("Lykke til!"), "mail-03: existing text unchanged");
-    // F7: with the agent id the order link goes to the portal card, not to the login link + #bestillinger.
-    const login = "https://rettfrabonden.com/api/marketplace/auth/m/tok123";
-    const txt7: string = (emailService as any).generateClaimConfirmationText("Gard A", login, "s4-a");
-    const html7: string = (emailService as any).generateClaimConfirmationHtml("Gard A", login, "s4-a");
-    ok(txt7.includes("https://rettfrabonden.com/eier/s4-a/portal#bestillinger") && !txt7.includes("tok123#bestillinger"), "f7-01: text order link is /eier/<id>/portal#bestillinger");
-    ok(html7.includes("/eier/s4-a/portal#bestillinger") && !html7.includes("tok123#bestillinger"), "f7-02: html order link is /eier/<id>/portal#bestillinger");
-    ok(txt7.includes(login), "f7-03: the login (dashboard) link is still in the mail");
+    // K5 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): the
+    // separate order-toggle paragraph and its #bestillinger link (F7) are gone.
+    // The login link lands in the portal itself, and orders are one of the
+    // three things the mail says the owner can do there.
+    const login = "https://rettfrabonden.com/magic-link-verify?token=tok123";
+    const txt: string = (emailService as any).generateClaimConfirmationText("Gard A", login, "s4-a");
+    const html: string = (emailService as any).generateClaimConfirmationHtml("Gard A", login, "s4-a");
+    ok(txt.includes("- velge om du vil få bestillinger fra kunder på e-post") && html.includes("<li>velge om du vil få bestillinger fra kunder på e-post</li>"),
+      "mail-01: orders are named among the portal's three tasks (text + html)");
+    ok(!txt.includes("#bestillinger") && !html.includes("#bestillinger") && !txt.includes("Vil du motta bestillinger") && !html.includes("Vil du motta bestillinger"),
+      "mail-02: no separate order-toggle paragraph or #bestillinger link");
+    ok(!/Gratulerer|Lykke til|dashboarden/.test(txt) && !/Gratulerer|Lykke til|dashboarden/.test(html), "mail-03: the old greeting, dashboard wording and sign-off are gone");
+    ok(txt.includes(login) && html.includes(`href="${login}"`), "f7-01: the login link is in both parts");
+    ok(/\/eier\/s4-a med denne e-postadressen/.test(txt) && /\/eier\/s4-a">[^<]*\/eier\/s4-a<\/a> med denne e-postadressen/.test(html),
+      "f7-02: the later login address is /eier/<id>, the login page");
+    ok(!txt.includes("/portal") && !html.includes("/portal"), "f7-03: no /eier/<id>/portal link left in the mail");
 
     // ── (c) handoff-stats ───────────────────────────────────────────────────
     const h = db.prepare("INSERT INTO cart_handoffs (id, agent_id, cart_id, item_count, created_at) VALUES (?, ?, ?, ?, ?)");

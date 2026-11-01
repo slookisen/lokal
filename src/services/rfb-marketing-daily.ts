@@ -794,10 +794,12 @@ export interface RfbHomepageRefreshRow {
   rejected?: string;
   error?: string;
   /**
-   * Only with opts.categoriesCorroborateOnly (the nightly R6 job; never the
-   * morning send): the stored categories were corroborated by the homepage
+   * Every caller (the morning send too, since dev-request 2026-10-28-rfb-
+   * uttrekk-adresse-og-hjemmeside-forverring, skive B): the stored
+   * non-empty categories were corroborated by the homepage
    * (provenance added, list unchanged), or not supported by it (nothing
-   * written for categories). Absent when the option did not apply.
+   * written for categories). Absent when the stored list was empty or
+   * already corroborated.
    */
   categories_corroboration?: "corroborated" | "categories_not_supported_by_homepage";
   /**
@@ -869,10 +871,10 @@ export const refreshRfbCandidateHomepage: RfbHomepageRefreshFn = async (db, agen
     const rejected = raced.skipped_unsubstantiated.find((c) => c.agent_id === agentId)?.reason;
     const err = raced.errors.find((e) => e.agent_id === agentId)?.error;
     const changed = raced.changed.find((c) => c.agent_id === agentId);
-    // categoriesCorroborateOnly only (never set by the morning send).
-    const corroboration: RfbHomepageRefreshRow["categories_corroboration"] = !opts.categoriesCorroborateOnly
-      ? undefined
-      : changed?.fields.includes(HCR_CATEGORIES_CORROBORATED)
+    // Every caller since skive B (dev-request 2026-10-28-rfb-uttrekk-adresse-
+    // og-hjemmeside-forverring): refreshHomepageContent never replaces a
+    // non-empty stored category list, morning send included.
+    const corroboration: RfbHomepageRefreshRow["categories_corroboration"] = changed?.fields.includes(HCR_CATEGORIES_CORROBORATED)
         ? "corroborated"
         : raced.skipped_unsubstantiated.some(
               (c) => c.agent_id === agentId && c.reason.startsWith(HCR_CATEGORIES_NOT_SUPPORTED),

@@ -34,6 +34,37 @@
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
 import { ENRICHMENT_ABOUT_PAGE_FLAG, ABOUT_PAGE_NOT_ABOUT_PRODUCER } from "../services/about-page-candidate";
+import { ORGANIC_CLAIM_GATE_ENV, REFUSED_ORGANIC_CLAIM_UNVERIFIED } from "../services/description-quality";
+
+type HcrAboutJudges = import("./admin-knowledge").HcrAboutJudges;
+
+/**
+ * Since skive B (lokal#1370) every about/description candidate goes through
+ * the LLM about judges before it is written. These suites test the about-page
+ * selection, not the judges, so they run with stub judges that approve —
+ * except where a case says otherwise. `factsPages` records the URLs the facts
+ * judge was shown, `candidates` the texts it judged.
+ */
+function stubJudges(o: { quality?: "GODKJENN" | "AVVIS" } = {}): HcrAboutJudges & { factsPages: string[]; candidates: string[] } {
+  const factsPages: string[] = [];
+  const candidates: string[] = [];
+  return {
+    factsPages,
+    candidates,
+    timeoutMs: 1,
+    quality: async (candidate) => {
+      candidates.push(candidate);
+      return o.quality === "AVVIS"
+        ? { approved: false, reasoning: "generisk tekst" }
+        : { approved: true, reasoning: "konkret om produsenten" };
+    },
+    facts: async (params) => {
+      factsPages.push(...params.pages.map((p) => p.url));
+      return { ok: true, supported: true, unsupportedClaims: [], bestPage: 0, reason: "støttet" };
+    },
+    comparison: async () => ({ ok: true, better: true, verdict: "BEDRE", reasoning: "mer konkret" }),
+  };
+}
 
 export interface TestSummary {
   passed: number;
@@ -86,6 +117,19 @@ const SITES: Record<string, Record<string, string>> = {
     "/kontakt-oss": CONTACT_PAGE,
     "/contact": CONTACT_PAGE,
     "/om-oss": aboutPage([P1, P2, P3]),
+  },
+  // Økologi S3b: an «Om oss» that claims «økologisk» for a producer without a
+  // Debio status must be refused like the homepage summary would be.
+  "okogard.no": {
+    "/": homepage(NAV_3_CONTACT_1_ABOUT),
+    "/om-oss": aboutPage(
+      [
+        "Okogard er en familiegård som har vært drevet av samme slekt siden 1850. Vi driver økologisk med sau og storfe på utmarksbeite i fjellet om sommeren.",
+        P2,
+        P3,
+      ],
+      "Okogard",
+    ),
   },
   "kodegard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": `<html><body><main><p>${HELIOS_CODE}</p></main></body></html>` },
   "spamgard.no": { "/": homepage(NAV_3_CONTACT_1_ABOUT), "/om-oss": SPAM_ABOUT },
@@ -258,6 +302,7 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         { id: "fjellgard", name: "Fjellgard", url: "https://fellesside.no/medlem/gard-x" },
         { id: "historiegard", name: "Tverås Gårdsmat", url: "https://historiegard.no/" },
         { id: "softgard", name: "Softgard", url: "https://softgard.no/" },
+        { id: "okogard", name: "Okogard", url: "https://okogard.no/" },
       ];
 
       function freshDb(): Database.Database {
@@ -291,7 +336,10 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
           )
           .get(id) as { about: string | null; field_provenance: string; description: string | null; categories: string | null };
       }
-      async function run(id: string | string[], o: { dryRun: boolean; aboutPagePreview?: boolean; flag?: boolean }) {
+      async function run(
+        id: string | string[],
+        o: { dryRun: boolean; aboutPagePreview?: boolean; flag?: boolean; judges?: HcrAboutJudges },
+      ) {
         if (o.flag) process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = "1";
         else delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
         const db = freshDb();
@@ -300,11 +348,26 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         const result = await refreshHomepageContent(db as any, ids.map(target), {
           dryRun: o.dryRun,
           fetchImpl: makeFetch(fetchLog),
+          aboutJudges: o.judges ?? stubJudges(),
           ...(o.aboutPagePreview ? { aboutPagePreview: true } : {}),
         });
         return { db, result, fetchLog };
       }
-      const LEGACY_KEYS = ["scanned", "by_field", "changed", "skipped_curated", "skipped_unsubstantiated", "errors", "parked_now"];
+      // Today's keys = main's keys since skive B (lokal#1370), without any about-page key.
+      const LEGACY_KEYS = [
+        "scanned",
+        "by_field",
+        "changed",
+        "skipped_curated",
+        "skipped_unsubstantiated",
+        "errors",
+        "parked_now",
+        "about_reviews",
+        "about_judge_rejected",
+        "about_not_supported",
+        "about_not_better",
+        "about_judge_unavailable",
+      ];
 
       // ── (a) flag OFF — today's behaviour ──────────────────────────────────
       const off = await run("tveras", { dryRun: false });
@@ -481,7 +544,46 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
         assertEq([x?.chosen, x?.chosen_source_url], ["homepage", "https://softgard.no/"], "l-3: so nothing is attributed to /om-oss");
       }
 
+      // ── (m) the about judges (skive B) judge the about-page candidate ──────
+      {
+        const j = stubJudges();
+        const m = await run("tveras", { dryRun: true, aboutPagePreview: true, judges: j });
+        assertEq(j.candidates, [m.result.about_candidates?.[0]?.chosen_text], "m-1: the quality judge is shown the about-page text");
+        assertTrue(j.factsPages.includes("https://tveras.no/om-oss"), "m-2: the facts judge is shown the about page itself");
+        assertEq(m.result.about_reviews?.length, 1, "m-3: one about review in the answer");
+        const rj = stubJudges({ quality: "AVVIS" });
+        const mr = await run("tveras", { dryRun: false, flag: true, judges: rj });
+        const x = mr.result.about_candidates?.[0];
+        assertEq(x?.chosen, "about_page", "m-4: the about page was chosen …");
+        assertEq([x?.would_write_about, x?.about_gate_reason], [false, "about: kvalitetsdommer AVVIS"], "m-5: … but the quality judge said AVVIS: not written, and the report says why");
+        assertEq(row(mr.db, "tveras").about, null, "m-6: nothing written to about");
+      }
+
+      // ── (n) Økologi S3b gate applies to the about-page text ──────────────
+      {
+        const prevGate = process.env[ORGANIC_CLAIM_GATE_ENV];
+        process.env[ORGANIC_CLAIM_GATE_ENV] = "1";
+        try {
+          const n = await run("okogard", { dryRun: false, flag: true });
+          const x = n.result.about_candidates?.[0];
+          assertEq(x?.about_page_refusal, REFUSED_ORGANIC_CLAIM_UNVERIFIED, "n-1: an «økologisk» about page without Debio status is refused");
+          assertEq([x?.chosen, x?.chosen_source_url], ["homepage", "https://okogard.no/"], "n-2: … the homepage candidate is used instead");
+          assertTrue(
+            n.result.skipped_unsubstantiated.some((s: any) => s.agent_id === "okogard" && s.reason === REFUSED_ORGANIC_CLAIM_UNVERIFIED),
+            "n-3: … and the refusal is reported in skipped_unsubstantiated",
+          );
+          assertTrue(!String(row(n.db, "okogard").about ?? "").toLowerCase().includes("økologisk"), "n-4: no organic claim was written");
+        } finally {
+          if (prevGate === undefined) delete process.env[ORGANIC_CLAIM_GATE_ENV];
+          else process.env[ORGANIC_CLAIM_GATE_ENV] = prevGate;
+        }
+        const nOff = await run("okogard", { dryRun: true, aboutPagePreview: true });
+        assertEq(nOff.result.about_candidates?.[0]?.chosen, "about_page", "n-5: gate off -> the about page is chosen as before");
+      }
+
       // ── (i) route: about_page_preview is honoured only in a dry run ───────
+      const { __setHcrAboutJudgesForTesting } = require("./admin-knowledge") as typeof import("./admin-knowledge");
+      __setHcrAboutJudgesForTesting(stubJudges());
       {
         delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
         freshDb();
@@ -518,6 +620,11 @@ export function runHomepageContentRefreshAboutPageTests(opts: { log?: boolean } 
       failed++;
       failures.push("homepage-content-refresh-about-page: unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
+      try {
+        (require("./admin-knowledge") as typeof import("./admin-knowledge")).__setHcrAboutJudgesForTesting(null);
+      } catch {
+        /* module not loaded */
+      }
       globalThis.fetch = prevFetch;
       if (prevFlag === undefined) delete process.env[ENRICHMENT_ABOUT_PAGE_FLAG];
       else process.env[ENRICHMENT_ABOUT_PAGE_FLAG] = prevFlag;
