@@ -26,6 +26,7 @@
  */
 
 import Database from "better-sqlite3";
+import { jsonLdBlocks, offersWithoutPrice, forbiddenNodes } from "../../tests/helpers/jsonld-invariants";
 
 export interface TestSummary {
   passed: number;
@@ -167,6 +168,8 @@ export async function runRfbMatLandingTests(opts: { log?: boolean } = {}): Promi
     seed(db, { id: "mat-d", name: "Inaktiv Meieri Test", categories: ["dairy"], isActive: 0 });
     seed(db, { id: "mat-e", name: "Logistikk Meieri Test", categories: ["dairy"], role: "logistics" });
     seed(db, { id: "mat-f", name: "Uvettet Meieri Test", categories: ["dairy"], isVetted: 0 });
+    // Slug on SITEMAP_EXCLUDED_PRODUCER_SLUGS (its /produsent page 404s): not counted, not listed.
+    seed(db, { id: "mat-x", name: "Debio Sertifisering", categories: ["dairy"] });
     // Kjøtt i Bergen: 1 visible (mat-b above) + 1 unvetted → 404.
     seed(db, { id: "mat-g", name: "Uvettet Kjott Test", categories: ["meat"], isVetted: 0 });
     // Fisk i Bergen: 1 visible + 1 hidden → 404 (would be 2 if hidden counted).
@@ -203,6 +206,44 @@ export async function runRfbMatLandingTests(opts: { log?: boolean } = {}): Promi
     }
     check(new Set(svc.MAT_CATEGORIES.map((c) => c.slug)).size === svc.MAT_CATEGORIES.length, "category slugs unique");
 
+    // ── Norwegian: adjective agreement and V2 word order ──
+    const NO_CH = { gardsbutikk: 0, rekoRing: 0, selvplukk: 0, hjemlevering: 0 };
+    const firstQ = (slug: string) => {
+      const ld = svc.buildMatLandingFaqJsonLd({
+        category: svc.matCategoryBySlug(slug)!, placeName: "Bergen", url: "u", producerNames: ["A", "B"], verifiedCount: 0, channels: NO_CH,
+      });
+      return ld?.mainEntity?.[0]?.name;
+    };
+    check(firstQ("kjott") === "Hvor kan jeg kjøpe lokalt kjøtt i Bergen?", `kjøtt question: ${firstQ("kjott")}`);
+    check(firstQ("fisk") === "Hvor kan jeg kjøpe lokal fisk i Bergen?", `fisk question: ${firstQ("fisk")}`);
+    check(firstQ("gronnsaker") === "Hvor kan jeg kjøpe lokale grønnsaker i Bergen?", `grønnsaker question: ${firstQ("gronnsaker")}`);
+    check(firstQ("frukt") === "Hvor kan jeg kjøpe lokal frukt i Bergen?", `frukt question: ${firstQ("frukt")}`);
+    for (const c of svc.MAT_CATEGORIES) {
+      check(/^lokal[et]? /.test(c.localNoun) && c.localNoun.endsWith(" " + c.noun), `${c.slug}: localNoun «${c.localNoun}» is lokal/lokale/lokalt + noun`);
+    }
+    const opening = (ch: typeof NO_CH, n = 3) => svc.buildMatLandingAnswerFirst({
+      category: svc.matCategoryBySlug("kjott")!, placeName: "Bergen", producerNames: ["A", "B", "C", "D"].slice(0, n), channels: ch,
+    });
+    const o1 = opening({ ...NO_CH, gardsbutikk: 1, rekoRing: 2 });
+    check(!!o1 && o1.includes(" 1 av dem har gårdsbutikk eller gårdsutsalg og 2 selger via REKO-ring. "), `V2 opening, counts 1 and 2: ${o1}`);
+    const o2 = opening({ ...NO_CH, gardsbutikk: 2, selvplukk: 1, hjemlevering: 1 });
+    check(!!o2 && o2.includes(" 2 av dem har gårdsbutikk eller gårdsutsalg, 1 har selvplukk og 1 leverer hjem. "), `V2 opening, three channels: ${o2}`);
+    check(opening(NO_CH)!.startsWith("Kjøtt i Bergen: 3 lokale produsenter på Rett fra Bonden — A, B og C. Du handler direkte"), `opening without channels: ${opening(NO_CH)}`);
+    const faq = svc.buildMatLandingFaqJsonLd({
+      category: svc.matCategoryBySlug("gronnsaker")!, placeName: "Bergen", url: "u", producerNames: ["A", "B"], verifiedCount: 0,
+      channels: { gardsbutikk: 1, rekoRing: 1, selvplukk: 2, hjemlevering: 0 },
+    });
+    const qa = new Map<string, string>((faq?.mainEntity || []).map((e: any) => [e.name, e.acceptedAnswer.text]));
+    const pickupA = qa.get("Kan jeg hente grønnsaker selv hos produsenten i Bergen?");
+    check(pickupA === "1 av de 2 produsentene har gårdsbutikk eller gårdsutsalg og 2 har selvplukk. Se profilsiden til hver produsent for adresse og hvordan du handler.", `pickup answer V2, no REKO: ${pickupA}`);
+    const rekoA = qa.get("Kan jeg kjøpe grønnsaker via REKO-ring i Bergen?");
+    check(!!rekoA && rekoA.startsWith("1 av de 2 produsentene selger via REKO-ring"), `REKO in its own question: ${rekoA}`);
+    const onlyReko = svc.buildMatLandingFaqJsonLd({
+      category: svc.matCategoryBySlug("gronnsaker")!, placeName: "Bergen", url: "u", producerNames: ["A", "B"], verifiedCount: 0,
+      channels: { ...NO_CH, rekoRing: 2 },
+    });
+    check(!(onlyReko?.mainEntity || []).some((e: any) => /hente .* selv hos produsenten/.test(e.name)), "REKO alone does not produce the «hente selv hos produsenten» question");
+
     // ── (a) flag off ──
     delete process.env.RFB_MAT_LANDING_ENABLED;
     check(svc.isRfbMatLandingEnabled() === false, "flag default off");
@@ -223,7 +264,18 @@ export async function runRfbMatLandingTests(opts: { log?: boolean } = {}): Promi
     check(body.includes(`<link rel="canonical" href="https://rettfrabonden.com/mat/meieri/bergen">`), "self canonical");
     check(body.includes(`id="faq"`), "visible FAQ section");
     check(/Meieriprodukter i Bergen: 2 lokale produsenter på Rett fra Bonden/.test(body), "answer-first opening states product, place and count 2");
-    check(body.includes("1 har gårdsbutikk eller gårdsutsalg"), "pickup channel from agent_salgskanal (hidden producer's row not counted)");
+    check(body.includes("1 av dem har gårdsbutikk eller gårdsutsalg."), "pickup channel from agent_salgskanal, V2 order (hidden producer's row not counted)");
+    check(!/Av dem \d|Av de \d+ produsentene \d/.test(body), "no «Av dem 1 har …» word order");
+    check(body.includes("kontaktinformasjonen produsenten har gjort offentlig, står på profilsiden"), "opening hedges contact info");
+    check(body.includes("Hvor kan jeg kjøpe lokale meieriprodukter i Bergen?"), "FAQ question rendered on the page");
+    try {
+      const blocks = jsonLdBlocks(body);
+      check(blocks.length === 3, `3 JSON-LD blocks parse (got ${blocks.length})`);
+      check(forbiddenNodes(blocks).length === 0, `jsonld-invariants: no forbidden nodes (${forbiddenNodes(blocks).join(", ")})`);
+      check(offersWithoutPrice(blocks) === 0, "jsonld-invariants: no Offer without price");
+    } catch (e: any) {
+      check(false, `jsonld-invariants: ${e?.message || e}`);
+    }
     check(body.includes(`href="/produsent/fjellost-gard"`), "producer A linked to /produsent/");
     check(body.includes(`href="/produsent/melkebu-script-alert-1-script-co"`), "producer B linked to /produsent/");
     check(body.includes(`href="/bergen"`), "links the place page");
@@ -231,7 +283,7 @@ export async function runRfbMatLandingTests(opts: { log?: boolean } = {}): Promi
     check(!/aggregateRating|ratingValue/.test(body), "no rating markup");
 
     // ── (c) hidden producers do not appear ──
-    for (const n of ["Skjult Meieri Test", "Inaktiv Meieri Test", "Logistikk Meieri Test", "Uvettet Meieri Test"]) {
+    for (const n of ["Skjult Meieri Test", "Inaktiv Meieri Test", "Logistikk Meieri Test", "Uvettet Meieri Test", "Debio Sertifisering"]) {
       check(!body.includes(n), `${n} does not appear`);
     }
 
@@ -259,6 +311,48 @@ export async function runRfbMatLandingTests(opts: { log?: boolean } = {}): Promi
     check(upper.status === 301 && upper.location === "/mat/meieri/bergen", `upper-case → 301 canonical (got ${upper.status} ${upper.location})`);
     const en = await callRoute(router, "/mat/meieri/bergen", { lang: "en" });
     check(!en.handled, "/en variant is not served");
+
+    // ── owner visibility choices (OWNER_FEATURES_ENFORCE on) ──
+    {
+      const vis = require("../owner-features/visibility") as typeof import("../owner-features/visibility");
+      const reg = require("../owner-features/registry") as typeof import("../owner-features/registry");
+      const rs = require("../owner-features/resolve") as typeof import("../owner-features/resolve");
+      const prevEnforce = process.env.OWNER_FEATURES_ENFORCE;
+      const prevAllow = process.env.OWNER_FEATURES_ALLOWED_SUBJECTS;
+      const LIVE = reg.OWNER_FEATURE_REGISTRY.map((e: any) =>
+        e.key.startsWith("visibility.") ? { ...e, status: "live" as const } : e);
+      try {
+        vis.__setVisibilityRegistryForTesting(LIVE as any);
+        process.env.OWNER_FEATURES_ENFORCE = "1";
+        process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = "rfb:mat-l,rfb:mat-m";
+        const setChoice = (id: string, key: string, value: boolean) => {
+          const r = rs.setOwnerFeatureValue("rfb", id, key as any, value, { actor: "owner" } as any, { db, registry: LIVE as any });
+          if ((r as any).kind !== "ok") throw new Error(`setOwnerFeatureValue(${key}) → ${(r as any).kind}`);
+          clearRegistryCaches();
+        };
+        setChoice("mat-l", "visibility.profile", false);
+        const hiddenOne = await callRoute(router, "/mat/egg/oslo");
+        check(hiddenOne.handled && hiddenOne.status === 200, `owner-hidden: /mat/egg/oslo still 200 with 2 (status ${hiddenOne.status})`);
+        check(hiddenOne.body.includes("Egg i Oslo: 2 lokale produsenter"), "owner-hidden: profile-hidden producer not counted");
+        check(!hiddenOne.body.includes("Eggegarden Oslo"), "owner-hidden: profile-hidden producer not listed");
+        setChoice("mat-m", "visibility.search_engines", false);
+        const below = await callRoute(router, "/mat/egg/oslo");
+        check(!below.handled, "owner-hidden: search_engines-hidden producer not counted → below the gate → 404");
+        seoMod.__resetSitemapCacheForTesting();
+        check(!seoMod.buildSitemapXml().includes("/mat/egg/oslo"), "owner-hidden: below the gate → not in sitemap");
+      } catch (e: any) {
+        check(false, `owner-hidden: ${e?.stack || e}`);
+      } finally {
+        try { db.prepare("DELETE FROM owner_feature_settings WHERE subject_id IN ('mat-l','mat-m')").run(); } catch { /* ignore */ }
+        try { db.prepare("DELETE FROM owner_profile_pause WHERE agent_id IN ('mat-l','mat-m')").run(); } catch { /* ignore */ }
+        vis.__setVisibilityRegistryForTesting(null);
+        if (prevEnforce === undefined) delete process.env.OWNER_FEATURES_ENFORCE; else process.env.OWNER_FEATURES_ENFORCE = prevEnforce;
+        if (prevAllow === undefined) delete process.env.OWNER_FEATURES_ALLOWED_SUBJECTS; else process.env.OWNER_FEATURES_ALLOWED_SUBJECTS = prevAllow;
+        clearRegistryCaches();
+      }
+      const restored = await callRoute(router, "/mat/egg/oslo");
+      check(restored.handled && restored.body.includes("Egg i Oslo: 3 lokale produsenter"), "owner-hidden: choices cleared → back to 3");
+    }
 
     // ── (f) sitemap ──
     seoMod.__resetSitemapCacheForTesting();

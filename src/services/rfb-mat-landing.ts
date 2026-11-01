@@ -61,21 +61,23 @@ export interface MatCategory {
   label: string;
   /** In-sentence form, e.g. "kjøtt". */
   noun: string;
+  /** «lokal(e/t) X» with the adjective in agreement: "lokalt kjøtt", "lokal fisk", "lokale grønnsaker". */
+  localNoun: string;
 }
 
 /** The categories with a landing page, in display order. */
 export const MAT_CATEGORIES: readonly MatCategory[] = [
-  { key: "vegetables", slug: "gronnsaker", label: "Grønnsaker", noun: "grønnsaker" },
-  { key: "fruit", slug: "frukt", label: "Frukt", noun: "frukt" },
-  { key: "berries", slug: "baer", label: "Bær", noun: "bær" },
-  { key: "dairy", slug: "meieri", label: "Meieriprodukter", noun: "meieriprodukter" },
-  { key: "eggs", slug: "egg", label: "Egg", noun: "egg" },
-  { key: "meat", slug: "kjott", label: "Kjøtt", noun: "kjøtt" },
-  { key: "fish", slug: "fisk", label: "Fisk", noun: "fisk" },
-  { key: "bakery", slug: "bakeri", label: "Bakervarer", noun: "bakervarer" },
-  { key: "honey", slug: "honning", label: "Honning", noun: "honning" },
-  { key: "herbs", slug: "urter", label: "Urter", noun: "urter" },
-  { key: "beverages", slug: "drikke", label: "Drikke", noun: "drikke" },
+  { key: "vegetables", slug: "gronnsaker", label: "Grønnsaker", noun: "grønnsaker", localNoun: "lokale grønnsaker" },
+  { key: "fruit", slug: "frukt", label: "Frukt", noun: "frukt", localNoun: "lokal frukt" },
+  { key: "berries", slug: "baer", label: "Bær", noun: "bær", localNoun: "lokale bær" },
+  { key: "dairy", slug: "meieri", label: "Meieriprodukter", noun: "meieriprodukter", localNoun: "lokale meieriprodukter" },
+  { key: "eggs", slug: "egg", label: "Egg", noun: "egg", localNoun: "lokale egg" },
+  { key: "meat", slug: "kjott", label: "Kjøtt", noun: "kjøtt", localNoun: "lokalt kjøtt" },
+  { key: "fish", slug: "fisk", label: "Fisk", noun: "fisk", localNoun: "lokal fisk" },
+  { key: "bakery", slug: "bakeri", label: "Bakervarer", noun: "bakervarer", localNoun: "lokale bakervarer" },
+  { key: "honey", slug: "honning", label: "Honning", noun: "honning", localNoun: "lokal honning" },
+  { key: "herbs", slug: "urter", label: "Urter", noun: "urter", localNoun: "lokale urter" },
+  { key: "beverages", slug: "drikke", label: "Drikke", noun: "drikke", localNoun: "lokal drikke" },
 ];
 
 const BY_SLUG = new Map(MAT_CATEGORIES.map((c) => [c.slug, c]));
@@ -161,17 +163,33 @@ function names(list: readonly string[]): string {
   return `${list.slice(0, -1).join(", ")} og ${list[list.length - 1]}`;
 }
 
-function producerWord(n: number): string {
-  return n === 1 ? "produsent" : "produsenter";
+
+/** "1 lokal produsent" / "3 lokale produsenter". */
+function localProducers(n: number): string {
+  return n === 1 ? "1 lokal produsent" : `${n} lokale produsenter`;
 }
 
-function channelSentences(ch: MatLandingChannels): string[] {
-  const out: string[] = [];
-  if (ch.gardsbutikk > 0) out.push(`${ch.gardsbutikk} har gårdsbutikk eller gårdsutsalg`);
-  if (ch.rekoRing > 0) out.push(`${ch.rekoRing} selger via REKO-ring`);
-  if (ch.selvplukk > 0) out.push(`${ch.selvplukk} har selvplukk`);
-  if (ch.hjemlevering > 0) out.push(`${ch.hjemlevering} leverer hjem`);
-  return out;
+/**
+ * Subject-first clauses, so the sentence keeps V2 word order whatever the
+ * counts are: the first names the group («1 av dem har …», «2 av de 3
+ * produsentene selger …»), the rest are «N <verb> …». Norwegian verbs do not
+ * inflect for number, so 1 and >1 read the same. `group` is "dem" or e.g.
+ * "de 3 produsentene".
+ */
+function channelClauses(items: Array<{ count: number; predicate: string }>, group: string): string {
+  const clauses = items
+    .filter((i) => i.count > 0)
+    .map((i, idx) => (idx === 0 ? `${i.count} av ${group} ${i.predicate}` : `${i.count} ${i.predicate}`));
+  return names(clauses);
+}
+
+function allChannelItems(ch: MatLandingChannels): Array<{ count: number; predicate: string }> {
+  return [
+    { count: ch.gardsbutikk, predicate: "har gårdsbutikk eller gårdsutsalg" },
+    { count: ch.selvplukk, predicate: "har selvplukk" },
+    { count: ch.rekoRing, predicate: "selger via REKO-ring" },
+    { count: ch.hjemlevering, predicate: "leverer hjem" },
+  ];
 }
 
 /**
@@ -189,9 +207,9 @@ export function buildMatLandingAnswerFirst(params: {
   const shown = params.producerNames.slice(0, 3);
   const rest = n - shown.length;
   const list = rest > 0 ? `${shown.join(", ")} og ${rest} til` : names(shown);
-  const ch = channelSentences(params.channels);
-  const howTo = ch.length > 0 ? ` Av dem ${names(ch)}.` : "";
-  return `${params.category.label} i ${params.placeName}: ${n} lokale ${producerWord(n)} på Rett fra Bonden — ${list}.${howTo} Du handler direkte med produsenten; kontaktinformasjon står på hver profilside.`;
+  const ch = channelClauses(allChannelItems(params.channels), "dem");
+  const howTo = ch ? ` ${ch}.` : "";
+  return `${params.category.label} i ${params.placeName}: ${localProducers(n)} på Rett fra Bonden — ${list}.${howTo} Du handler direkte med produsenten; kontaktinformasjonen produsenten har gjort offentlig, står på profilsiden.`;
 }
 
 /**
@@ -215,18 +233,26 @@ export function buildMatLandingFaqJsonLd(params: {
   const qas: Array<{ q: string; a: string }> = [];
 
   qas.push({
-    q: `Hvor kan jeg kjøpe lokale ${noun} i ${place}?`,
-    a: `Rett fra Bonden har ${n} lokale ${producerWord(n)} av ${noun} i ${place}: ${rest > 0 ? `${shown.join(", ")} og ${rest} til` : names(shown)}.`,
+    q: `Hvor kan jeg kjøpe ${params.category.localNoun} i ${place}?`,
+    a: `Rett fra Bonden har ${localProducers(n)} av ${noun} i ${place}: ${rest > 0 ? `${shown.join(", ")} og ${rest} til` : names(shown)}.`,
   });
 
-  const pickup: string[] = [];
-  if (params.channels.gardsbutikk > 0) pickup.push(`${params.channels.gardsbutikk} har gårdsbutikk eller gårdsutsalg`);
-  if (params.channels.rekoRing > 0) pickup.push(`${params.channels.rekoRing} selger via REKO-ring`);
-  if (params.channels.selvplukk > 0) pickup.push(`${params.channels.selvplukk} har selvplukk`);
-  if (pickup.length > 0) {
+  // Pickup at the farm: farm shop and self-picking only. REKO-ring pickup is
+  // at the ring's meeting point, not at the producer, so it has its own question.
+  const atFarm = channelClauses([
+    { count: params.channels.gardsbutikk, predicate: "har gårdsbutikk eller gårdsutsalg" },
+    { count: params.channels.selvplukk, predicate: "har selvplukk" },
+  ], `de ${n} produsentene`);
+  if (atFarm) {
     qas.push({
       q: `Kan jeg hente ${noun} selv hos produsenten i ${place}?`,
-      a: `Av de ${n} produsentene ${names(pickup)}. Se profilsiden til hver produsent for adresse og hvordan du handler.`,
+      a: `${atFarm}. Se profilsiden til hver produsent for adresse og hvordan du handler.`,
+    });
+  }
+  if (params.channels.rekoRing > 0) {
+    qas.push({
+      q: `Kan jeg kjøpe ${noun} via REKO-ring i ${place}?`,
+      a: `${params.channels.rekoRing} av de ${n} produsentene selger via REKO-ring, med fast henteordning på ringens utleveringssted. Bestilling og henting avtaler du med produsenten.`,
     });
   }
   if (params.channels.hjemlevering > 0) {
