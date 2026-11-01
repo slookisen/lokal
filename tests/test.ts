@@ -1139,6 +1139,21 @@ console.log("\n── rfb-producer-en-seo (buildProducerPageTitle / buildProduce
   console.log(`  rfb-producer-en-seo: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-10-27-produsentside-sted-dobbelt-i-navn-og-tekst («Malm i
+// Malm»): sentence/title builders must not append « i {sted}» to a name that
+// already ends with « — {sted}»; non-place suffixes and suffix-less names are
+// byte-identical to before.
+console.log("\n── rfb-producer-place-dedup (nameForPlaceSentence) ──");
+{
+  const { runRfbProducerPlaceDedupTests } = require("../src/routes/rfb-producer-place-dedup.test") as
+    typeof import("../src/routes/rfb-producer-place-dedup.test");
+  const r = runRfbProducerPlaceDedupTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-producer-place-dedup: " + f);
+  console.log(`  rfb-producer-place-dedup: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // dev-request 2026-09-09-rfb-profil-intro-setning-selger-bestill-direkte:
 // the producer-page opening sentence must not claim "selger ... bestill
 // direkte" unless there's a real sourced product list AND a confirmed
