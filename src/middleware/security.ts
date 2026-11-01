@@ -39,16 +39,29 @@ export const corsOptions = {
 
 // ─── Security headers (Helmet) ───────────────────────────────
 // Fix #9: Enable CSP with sensible defaults
+//
+// dev-request 2026-06-25-platform-contact-surface, slice CSP: the /kontakt
+// form on all three sites (rettfrabonden.com, opplevagent.no,
+// finn-tannlege.com — one policy, set here for every host) loads Cloudflare
+// Turnstile from https://challenges.cloudflare.com/turnstile/v0/api.js, and
+// the widget runs in an iframe from that same origin. With script-src
+// 'self' 'unsafe-inline' and frame-src 'none' the browser blocked both, no
+// token was ever produced, and /api/contact (fail-closed) answered 403
+// captcha_failed to every visitor. Cloudflare's CSP reference for Turnstile
+// lists exactly this origin in script-src and frame-src. connect-src is only
+// needed for pre-clearance, and then only 'self', so it stays as it was.
+const TURNSTILE_ORIGIN = "https://challenges.cloudflare.com";
+
 export const securityHeaders = helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],  // needed for SEO inline scripts
+      scriptSrc: ["'self'", "'unsafe-inline'", TURNSTILE_ORIGIN],  // inline: SEO scripts; Turnstile: /kontakt
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       fontSrc: ["'self'", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "data:", "https:"],
       connectSrc: ["'self'", "https://rettfrabonden.com"],
-      frameSrc: ["'none'"],
+      frameSrc: [TURNSTILE_ORIGIN],  // the Turnstile widget iframe; no other frame is allowed
       objectSrc: ["'none'"],
     },
   },
