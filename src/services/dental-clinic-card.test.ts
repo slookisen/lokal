@@ -44,8 +44,11 @@
  *       but not for Brreg; a closed clinic has no badge; MCP and A2A say the
  *       same for every clinic, as resolveVerifiedClaim does;
  *   Z   size: 25 clinics per call stay under 12 KB for a live-like mix, and
- *       under 16 KB when every clinic has every optional field, specialist
- *       titles included; a kommune search (Bergen, whose tolkning names 144
+ *       under 18 KB when every clinic has every optional field, specialist
+ *       titles included (was 16 KB; klikk-fra-ai-svar S3 adds the AI mark,
+ *       ?utm_source=…&utm_medium=mcp&utm_campaign=ai_search, at most 64 B on
+ *       each clinic's one profil_url: live worst case ~13.4 KB + 25 × 64 B
+ *       ≈ 15 KB; the synthetic all-fields Agder fixture sends ~17 KB); a kommune search (Bergen, whose tolkning names 144
  *       postnumre) stays under 12 KB too.
  *
  * Standalone: npx tsx src/services/dental-clinic-card.test.ts
@@ -554,13 +557,13 @@ export async function runDentalClinicCardTests(opts: { log?: boolean } = {}): Pr
       });
       seed("Rogaland", "9187610", false);
       seed("Agder", "9187620", true);
-      for (const [fylke, limitBytes, label] of [["Rogaland", 12 * 1024, "a live-like mix"], ["Agder", 16 * 1024, "every optional field on every clinic"]] as const) {
+      for (const [fylke, limitBytes, label] of [["Rogaland", 12 * 1024, "a live-like mix"], ["Agder", 18 * 1024, "every optional field on every clinic"]] as const) {
         const searchText = await callText("tannlege_search", { query: "tannlege", fylke, limit: 25 });
         const akuttText = await callText("tannlege_akutt", { fylke });
-        // klikk-fra-ai-svar S3: the budget is for the cards; the AI mark on each profil_url
-        // (at most 64 B, utm_source=ai_assistant) is measured on its own (Z1b).
-        const sizes = [Buffer.byteLength(stripAiUtm(searchText)), Buffer.byteLength(stripAiUtm(akuttText))];
-        const markBytes = [Buffer.byteLength(searchText) - sizes[0], Buffer.byteLength(akuttText) - sizes[1]];
+        // The bytes actually sent, AI mark included (klikk-fra-ai-svar S3). Z1b keeps the mark
+        // to one profil_url per clinic: at most 64 B each, never a duplicated URL.
+        const sizes = [Buffer.byteLength(searchText), Buffer.byteLength(akuttText)];
+        const markBytes = [sizes[0] - Buffer.byteLength(stripAiUtm(searchText)), sizes[1] - Buffer.byteLength(stripAiUtm(akuttText))];
         ok(markBytes.every((n) => n > 0 && n <= 25 * 64), `Z1b ${fylke}: the AI mark on the 25 profile links adds at most 64 B per clinic`);
         if (log) console.log(`    ${fylke}: tannlege_search ${sizes[0]} B, tannlege_akutt ${sizes[1]} B`);
         eq([JSON.parse(searchText).klinikker.length, JSON.parse(akuttText).klinikker.length], [25, 25], `Z0 ${fylke}: (both answers carry 25 clinics)`);

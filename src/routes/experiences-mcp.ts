@@ -660,8 +660,10 @@ export function registerExperienceTools(
   getRequestMeta?: () => RequestMeta | undefined,
 ): void {
   // «Klikk fra AI-svar» slice 3: experience, provider and gårdssalg profile
-  // links in every tool result (text and structuredContent, which the
-  // ChatGPT widget reads) are tagged for AI (utm_medium=mcp).
+  // links in every tool result (text and structuredContent) are tagged for AI
+  // (utm_medium=mcp). The ChatGPT widget does NOT use the tagged link yet: its
+  // pageUrl() still builds the link from `slug`, because the widget template
+  // is hash-frozen while OpenAI reviews the app (spec item 10 deferred).
   tagMcpToolResults(server, () => getClientIdentity?.());
 
   // «Med i AI-svar» (dev-request 2026-10-14-med-i-ai-svar-per-profil, S2): the

@@ -134,6 +134,16 @@ export async function runAiProfileLinksTests(opts: { log?: boolean } = {}): Prom
     assertEq(out.jsonLd.url, "https://rettfrabonden.com/produsent/a", "(b) JSON-LD (@context) is never tagged");
     assertEq(out["@id"], "https://rettfrabonden.com/produsent/a", "(b) @id is never tagged");
     assertEq(JSON.stringify(input), before, "(b) the input object is not changed");
+    // A branching cycle (a.b = a, a.c = [a, a]) used to cost 2^40 calls; now linear.
+    const cyc: any = { profile_url: "https://rettfrabonden.com/produsent/a" };
+    cyc.b = cyc;
+    cyc.c = [cyc, cyc];
+    const t0 = Date.now();
+    const cOut = tag(cyc) as any;
+    assertTrue(Date.now() - t0 < 1000, "(b) a branching cycle is walked in linear time");
+    assertTrue(cOut.profile_url === `https://rettfrabonden.com/produsent/a?${t}` && cOut.b === cOut && cOut.c[0] === cOut && cOut.c[1] === cOut,
+      "(b) the cycle is kept in the copy, profile_url tagged");
+    assertEq(cyc.profile_url, "https://rettfrabonden.com/produsent/a", "(b) the cyclic input is not changed");
   }
 
   // ── (c) withRequestQuery ──────────────────────────────────────────────

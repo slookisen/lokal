@@ -218,13 +218,23 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  */
 export function tagAiProfileLinks<T>(value: T, clientIdentity: string | undefined, medium: AiUtmMedium): T {
   const hosts = ownProfileHosts();
+  // Each object/array is copied once (memo): shared references and cycles cost
+  // linear time, and a cycle in the input becomes the same cycle in the copy.
+  const copies = new Map<object, unknown>();
   const walk = (v: unknown, depth: number): unknown => {
     if (typeof v === "string") return tagProfileLinksInString(v, clientIdentity, medium, hosts);
-    if (depth > 40) return v;
-    if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1));
+    if (depth > 40 || v === null || typeof v !== "object") return v;
+    if (copies.has(v)) return copies.get(v);
+    if (Array.isArray(v)) {
+      const out: unknown[] = [];
+      copies.set(v, out);
+      for (const x of v) out.push(walk(x, depth + 1));
+      return out;
+    }
     if (isPlainObject(v)) {
       if ("@context" in v) return v;
       const out: Record<string, unknown> = {};
+      copies.set(v, out);
       for (const [k, x] of Object.entries(v)) {
         out[k] = /canonical/i.test(k) || k === "@id" ? x : walk(x, depth + 1);
       }
