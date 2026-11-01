@@ -96,6 +96,10 @@ export interface ProposalQueueConfig {
   extraEvidence?: Array<{ claimIdx: number; id: (result: Record<string, unknown>) => string | null }>;
   maxAgeDays?: number;
   filesPerTick?: number;
+  /** Optional per-UTC-day cap on recorded files (rows of `filesTable`
+   *  whose processed_at falls on the tick's UTC day, errors included).
+   *  Unset = no daily cap (the original behaviour). */
+  maxFilesPerDay?: number;
   maxAttemptsPerTick?: number;
   maxFileBytes?: number;
   maxFailures?: number;
@@ -135,6 +139,9 @@ export interface ProposalQueueTickReport {
    *  apply) — not recorded as processed unless fail_count reached the cap. */
   failures: Array<{ path: string; fail_count: number; error: string }>;
   written: number;
+  /** True when `maxFilesPerDay` stopped this tick from evaluating further
+   *  files (the rest wait for the next UTC day). Always false without a cap. */
+  daily_cap_reached: boolean;
   envelope_recorded: boolean;
 }
 
@@ -287,6 +294,7 @@ export async function runProposalFileQueueTick(
     processed: [],
     failures: [],
     written: 0,
+    daily_cap_reached: false,
     envelope_recorded: false,
   };
 
@@ -333,6 +341,11 @@ export async function runProposalFileQueueTick(
      ON CONFLICT(path) DO UPDATE SET
        fail_count = fail_count + 1, last_error = excluded.last_error, last_failed_at = excluded.last_failed_at`,
   );
+  const maxFilesPerDay = config.maxFilesPerDay;
+  // processed_at is SQLite datetime('now') ("YYYY-MM-DD HH:MM:SS", UTC);
+  // the day compared is the tick's own UTC day.
+  const filesRecordedToday = (): number =>
+    (expDb.prepare(`SELECT COUNT(*) AS n FROM ${config.filesTable} WHERE substr(processed_at, 1, 10) = ?`).get(today) as { n: number }).n;
   const failCountOf = (path: string): number =>
     (expDb.prepare(`SELECT fail_count FROM ${config.failuresTable} WHERE path = ?`).get(path) as { fail_count: number } | undefined)?.fail_count ?? 0;
   const writtenIds: string[] = [];
@@ -444,6 +457,11 @@ export async function runProposalFileQueueTick(
     let attempts = 0;
     for (const f of candidates) {
       if (evaluated >= filesPerTick || attempts >= maxAttemptsPerTick) break;
+      if (maxFilesPerDay !== undefined && filesRecordedToday() >= maxFilesPerDay) {
+        report.daily_cap_reached = true;
+        console.log(`[${tag}] daily cap of ${maxFilesPerDay} file(s) reached for ${today} — remaining files left for the next UTC day`);
+        break;
+      }
       if (enrichmentWritePauseBlock(mainDb, "experiences")) {
         console.log(`[${tag}] write-pause became active mid-tick — remaining files left for a later tick`);
         break;

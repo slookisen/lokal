@@ -29548,10 +29548,27 @@ import {
   EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS,
   EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS,
   EXPERIENCE_CONTENT_JUDGEMENTS_SCHEMA,
+  EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS,
   getExperienceContentJudgementsStatus,
 } from "../services/experience-content-judgement-job";
 
 export const CONTENT_JUDGE_CANDIDATES_MAX_BATCHES = 4;
+/** Per-file circuit breaker: at most this many `mismatch` demotions of rows
+ *  that were `verified` going in. Items past it are rejected `demotion_cap`
+ *  (nothing written, so they can be judged again by a later file). */
+export const CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE = 25;
+/** Only public catalog rows go through the subscription lane: a row hidden
+ *  itself (experiences.catalog_hidden) or via its provider
+ *  (experience_providers.catalog_hidden) is neither served by the candidate
+ *  GET nor written by the apply step. The sweep's own selection is
+ *  unchanged. */
+const CONTENT_JUDGEMENT_PUBLIC_WHERE =
+  "COALESCE(catalog_hidden, 0) = 0 AND NOT EXISTS (SELECT 1 FROM experience_providers hp WHERE hp.id = experiences.provider_id AND COALESCE(hp.catalog_hidden, 0) = 1)";
+const CONTENT_JUDGEMENT_PUBLIC_WHERE_ALIASED = "COALESCE(e.catalog_hidden, 0) = 0 AND COALESCE(p.catalog_hidden, 0) = 0";
+/** Log-safe form of a file-supplied identifier. */
+function contentJudgementLogSafe(v: unknown, max: number): string {
+  return String(v ?? "-").replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, max);
+}
 /** A created_at further ahead of the server clock than this is rejected —
  *  a future timestamp would defeat the stale-verdict check. */
 const CONTENT_JUDGEMENT_MAX_CLOCK_SKEW_MS = 10 * 60_000;
@@ -29602,14 +29619,20 @@ export function selectContentJudgeCandidates(
 
   // Counts measured exactly like the sweep's (same predicates, same tables).
   const totalEligible = (
-    expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE}`).get() as { n: number }
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`)
+      .get() as { n: number }
   ).n;
   const skippedOutOfScope = (
-    expDb.prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND NOT (${SWEEP_IN_SCOPE_WHERE})`).get() as { n: number }
+    expDb
+      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND NOT (${SWEEP_IN_SCOPE_WHERE}) AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`)
+      .get() as { n: number }
   ).n;
   const neverCheckedRemaining = (
     expDb
-      .prepare(`SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND admission_checked_at IS NULL`)
+      .prepare(
+        `SELECT COUNT(*) AS n FROM experiences WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE} AND admission_checked_at IS NULL`,
+      )
       .get() as { n: number }
   ).n;
   // Same FROM/JOIN/WHERE/ORDER BY as the sweep's row SELECT; only the
@@ -29620,7 +29643,7 @@ export function selectContentJudgeCandidates(
               e.verification_status, e.confidence, e.admission_checked_at
          FROM experiences e
          LEFT JOIN experience_providers p ON p.id = e.provider_id
-        WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE_ALIASED}
+        WHERE ${SWEEP_ELIGIBLE_WHERE} AND ${SWEEP_IN_SCOPE_WHERE_ALIASED} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE_ALIASED}
         ORDER BY ${SWEEP_QUEUE_ORDER_BY}
         LIMIT ?`,
     )
@@ -29650,7 +29673,7 @@ router.get("/admin/experiences-content-judge-candidates", requireAdmin, (req: Re
   }
 });
 
-type ContentJudgementItem = { id: string; evidence_url: unknown; verdict: unknown; reasoning: unknown };
+type ContentJudgementItem = { id: string; evidence_url: unknown; verdict: unknown; reasoning: unknown; invalidId?: boolean };
 
 export type ContentJudgementItemResult = {
   id: string;
@@ -29712,13 +29735,20 @@ export async function applyExperienceContentJudgements(
     const o = r as Record<string, unknown>;
     if (typeof o.id !== "string" || o.id.trim() === "") return { ok: false, error: `items[${i}].id must be a non-empty string` };
     const id = o.id.trim();
-    if (seen.has(id)) return { ok: false, error: `duplicate id in items: ${id}` };
+    if (id.length > EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS) {
+      // Item-level: rejected as `invalid_id`, reported under a bounded,
+      // log-safe form of the id; never looked up.
+      items.push({ id: contentJudgementLogSafe(id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS), evidence_url: null, verdict: null, reasoning: null, invalidId: true });
+      continue;
+    }
+    if (seen.has(id)) return { ok: false, error: `duplicate id in items: ${contentJudgementLogSafe(id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS)}` };
     seen.add(id);
     items.push({ id, evidence_url: o.evidence_url, verdict: o.verdict, reasoning: o.reasoning });
   }
 
   const batchId = `content-judgement-job-${new Date(nowMs).toISOString().slice(0, 19).replace(/[:T]/g, "")}-${crypto.randomUUID()}`;
-  const eligibleStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_ELIGIBLE_WHERE}`);
+  const eligibleStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_ELIGIBLE_WHERE} AND ${CONTENT_JUDGEMENT_PUBLIC_WHERE}`);
+  let demotions = 0;
   const inScopeStmt = db.prepare(`SELECT 1 FROM experiences WHERE id = ? AND ${SWEEP_IN_SCOPE_WHERE}`);
   const rowStmt = db.prepare(
     `SELECT e.id, e.evidence_url, e.admission_checked_at, e.updated_at, e.verification_status,
@@ -29751,10 +29781,16 @@ export async function applyExperienceContentJudgements(
     if ((row.evidence_url ?? "").trim() !== String(it.evidence_url).trim()) return { id: it.id, result: "rejected", reason: "evidence_changed" };
     if (newerThanFile(row.admission_checked_at)) return { id: it.id, result: "rejected", reason: "stale_verdict" };
     if (newerThanFile(row.updated_at)) return { id: it.id, result: "rejected", reason: "content_changed" };
+    // Circuit breaker: a verified row demoted by a mismatch cannot be rolled
+    // back by the promotion-rollback route, so a file may demote at most
+    // CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE of them.
+    const demotes = verdict === "MISMATCH" && row.verification_status === "verified";
+    if (demotes && demotions >= CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE) return { id: it.id, result: "rejected", reason: "demotion_cap" };
     // The client verdict is the "judge" requirement only; the other three
     // are read from the row as it stands now, inside this transaction.
     const decision = evaluateContentJudgePromotion(row, verdict);
     const { promoted } = writeContentJudgeVerdict(db, row.id, verdict, reasoning, decision.eligible, batchId);
+    if (demotes) demotions++;
     return {
       id: it.id,
       result: "written",
@@ -29770,6 +29806,10 @@ export async function applyExperienceContentJudgements(
 
   const results: ContentJudgementItemResult[] = [];
   for (const it of items) {
+    if (it.invalidId) {
+      results.push({ id: it.id, result: "rejected", reason: "invalid_id" });
+      continue;
+    }
     if (it.verdict !== "match" && it.verdict !== "mismatch") {
       results.push({ id: it.id, result: "rejected", reason: "invalid_verdict" });
       continue;
@@ -29793,9 +29833,9 @@ export async function applyExperienceContentJudgements(
     if (r.promoted) totals.promoted++;
   }
   console.log(
-    `[${opts.logTag ?? "experience-content-judgements"}] run_id=${String(opts.runId ?? "-").replace(/[^A-Za-z0-9._:\-]/g, "").slice(0, 80)} ` +
+    `[${opts.logTag ?? "experience-content-judgements"}] run_id=${contentJudgementLogSafe(opts.runId, 80)} ` +
       `batch_id=${batchId} ` +
-      results.map((r) => `${r.id}=${r.result}${r.reason ? ":" + r.reason : ""}${r.verdict ? ":" + r.verdict : ""}${r.promoted ? ":promoted" : ""}`).join(" "),
+      results.map((r) => `${contentJudgementLogSafe(r.id, EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS)}=${r.result}${r.reason ? ":" + r.reason : ""}${r.verdict ? ":" + r.verdict : ""}${r.promoted ? ":promoted" : ""}`).join(" "),
   );
   return { ok: true, batch_id: batchId, totals, results };
 }

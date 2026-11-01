@@ -492,6 +492,136 @@ export function runExperienceContentJudgementJobTests(opts: { log?: boolean } = 
         assertTrue(gh.urls.every((u) => u.startsWith("https://api.github.com/")), "cj-8r: every job request went to api.github.com");
       }
 
+      // ── cj-10: files-per-UTC-day cap on the 3k job (B1). ─────────────
+      {
+        const f = (items: unknown[]) => ({ schema: SCHEMA, run_id: "run-cap", created_at: CREATED, items });
+        const countToday = (): number =>
+          (expDb.prepare(`SELECT COUNT(*) AS n FROM ${job.EXPERIENCE_CONTENT_JUDGEMENT_FILES_TABLE} WHERE substr(processed_at, 1, 10) = ?`).get(TODAY) as any).n;
+        const used = countToday();
+        const cap = job.EXPERIENCE_CONTENT_JUDGEMENT_MAX_FILES_PER_DAY;
+        assertEq(cap, 8, "cj-10a: the job's daily cap is 8 files (≤400 rows)");
+        assertTrue(used < cap && cap - used <= 3, `cj-10b: test precondition (used ${used} of ${cap} today)`);
+        const left = cap - used;
+        const capPaths: string[] = [];
+        for (let i = 0; i <= left; i++) {
+          seed(`cap-${i}`);
+          capPaths.push(putFile(TODAY, `cap-${i}.json`, f([item(`cap-${i}`)])));
+        }
+        const c1 = await tick();
+        assertEq(c1.processed.map((p) => p.path), capPaths.slice(0, left), "cj-10c: only the files left under today's cap are evaluated");
+        assertEq([c1.daily_cap_reached, countToday()], [true, cap], "cj-10d: report says the daily cap was reached; exactly cap files recorded today");
+        assertEq(row(`cap-${left}`).admission_checked_at, OLD, "cj-10e: the file past the cap wrote nothing");
+        const c2 = await tick();
+        assertEq([c2.processed.length, c2.daily_cap_reached], [0, true], "cj-10f: a further tick the same UTC day evaluates nothing");
+        const tomorrow = new Date(nowMs + 86_400_000);
+        const c3 = await tick({ now: tomorrow });
+        assertEq([c3.processed.map((p) => p.path), c3.daily_cap_reached], [[capPaths[left]], false], "cj-10g: the next UTC day the waiting file is evaluated");
+      }
+
+      // ── cj-11: no cap when maxFilesPerDay is unset (existing callers). ─
+      {
+        const q = require("./proposal-file-queue") as typeof import("./proposal-file-queue");
+        expDb.exec(`CREATE TABLE IF NOT EXISTS cap_test_files (path TEXT PRIMARY KEY, sha TEXT NOT NULL, processed_at TEXT NOT NULL, result_json TEXT);
+                    CREATE TABLE IF NOT EXISTS cap_test_failures (path TEXT PRIMARY KEY, fail_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, last_failed_at TEXT)`);
+        const ins = expDb.prepare(`INSERT INTO cap_test_files (path, sha, processed_at, result_json) VALUES (?, 'x', datetime('now'), '{}')`);
+        for (let i = 0; i < 20; i++) ins.run(`cap-test/${TODAY}/old-${i}.json`);
+        const CT = "cap-test";
+        const putCt = (name: string): string => {
+          const path = `${CT}/${TODAY}/${name}`;
+          const text = JSON.stringify({ items: [1] });
+          gh.files.set(path, { sha: `sha-${name}`, text });
+          gh.dirs.set(CT, [{ name: TODAY, path: `${CT}/${TODAY}`, type: "dir", sha: "d" }]);
+          gh.dirs.set(`${CT}/${TODAY}`, [...(gh.dirs.get(`${CT}/${TODAY}`) ?? []), { name, path, type: "file", sha: `sha-${name}`, size: Buffer.byteLength(text) }]);
+          return path;
+        };
+        const cfg = (over: Record<string, unknown> = {}): any => ({
+          dir: CT, agent: "cap-test-agent", logTag: "cap-test", filesTable: "cap_test_files", failuresTable: "cap_test_failures",
+          enabled: () => true, validate: (p: any) => ({ items: p.items }),
+          apply: async () => ({ ok: true, totals: { written: 0 }, results: [] }),
+          writtenId: () => null, claims: () => [], filesPerTick: 4, ...over,
+        });
+        const deps = { fetchImpl: ghFetch, now: NOW, env, expDb, mainDb: () => init.getDb() } as any;
+        const ctPaths = ["n-1.json", "n-2.json", "n-3.json"].map(putCt);
+        const u1 = await q.runProposalFileQueueTick(cfg(), deps);
+        assertEq([u1.processed.map((p) => p.path), u1.daily_cap_reached], [ctPaths, false], "cj-11a: no maxFilesPerDay -> no daily cap (20 files already today, 3 more evaluated)");
+        putCt("n-4.json");
+        const u2 = await q.runProposalFileQueueTick(cfg({ maxFilesPerDay: 23 }), deps);
+        assertEq([u2.processed.length, u2.daily_cap_reached], [0, true], "cj-11b: the same queue with maxFilesPerDay set stops at the cap");
+        const fs = require("fs") as typeof import("fs");
+        const pathMod = require("path") as typeof import("path");
+        for (const other of ["experience-description-proposals-job.ts", "gardssalg-visit-proposals-job.ts"]) {
+          const src = fs.readFileSync(pathMod.join(__dirname, other), "utf8");
+          assertTrue(src.includes("runProposalFileQueueTick") && !src.includes("maxFilesPerDay"), `cj-11c: ${other} sets no daily cap (behaviour unchanged)`);
+        }
+      }
+
+      // ── cj-12: per-file demotion circuit breaker. ────────────────────
+      {
+        const CAPN = opp.CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE;
+        assertEq(CAPN, 25, "cj-12a: breaker is 25 demotions per file");
+        const ids: string[] = [];
+        for (let i = 0; i < CAPN; i++) ids.push(seed(`d-${String(i).padStart(2, "0")}`));
+        seed("d-nr", { verification_status: "needs_review" });
+        seed("d-over");
+        seed("d-match");
+        const out: any = await apply([
+          ...ids.map((id) => item(id, { verdict: "mismatch" })),
+          item("d-nr", { verdict: "mismatch" }),
+          item("d-over", { verdict: "mismatch" }),
+          item("d-match"),
+        ]);
+        const by = new Map(out.results.map((r: any) => [r.id, r]));
+        assertTrue(ids.every((id) => (by.get(id) as any).result === "written" && row(id).verification_status === "needs_review"), "cj-12b: the first 25 demotions are written");
+        assertEq([(by.get("d-nr") as any).result, (by.get("d-match") as any).result], ["written", "written"], "cj-12c: a mismatch on a needs_review row and a match are not demotions, still written");
+        assertEq((by.get("d-over") as any).reason, "demotion_cap", "cj-12d: the 26th demotion is rejected demotion_cap");
+        assertEq([row("d-over").verification_status, row("d-over").admission_checked_at], ["verified", OLD], "cj-12e: the capped row is untouched");
+        const later: any = await apply([item("d-over", { verdict: "mismatch" })]);
+        assertEq([later.results[0].result, row("d-over").verification_status], ["written", "needs_review"], "cj-12f: the capped row can be judged again by a later file");
+      }
+
+      // ── cj-13: hidden rows are excluded from the candidate GET + apply. ─
+      {
+        const provHidden = expStore.createProvider({ navn: "Skjult AS", kommune: "Voss", fylke: "Vestland", brreg_verified: 1, brreg_active: 1, verification_status: "verified" } as any);
+        expDb.prepare("UPDATE experience_providers SET field_provenance = ?, catalog_hidden = 1 WHERE id = ?").run(VERIFIED_FP, provHidden);
+        seed("h-self", { admission_checked_at: null });
+        expDb.prepare("UPDATE experiences SET catalog_hidden = 1 WHERE id = 'h-self'").run();
+        seed("h-prov", { admission_checked_at: null, provider_id: provHidden });
+        seed("h-pub", { admission_checked_at: null });
+        const c = opp.selectContentJudgeCandidates(expDb, { limit: "50", batches: "4" });
+        const cids = c.rows.map((x) => x.id);
+        assertTrue(cids.includes("h-pub") && !cids.includes("h-self") && !cids.includes("h-prov"), "cj-13a: candidate GET serves only public rows (row- and provider-hidden excluded)");
+        assertEq(c.never_checked_remaining, 1, "cj-13b: counts exclude hidden rows too");
+        const out: any = await apply([item("h-self", { verdict: "mismatch" }), item("h-prov", { verdict: "mismatch" }), item("h-pub")]);
+        assertEq(out.results.map((r: any) => r.reason ?? r.result), ["not_eligible", "not_eligible", "written"], "cj-13c: apply treats hidden rows as not_eligible");
+        assertEq([row("h-self").verification_status, row("h-prov").verification_status, row("h-self").admission_checked_at, row("h-prov").admission_checked_at], ["verified", "verified", null, null], "cj-13d: hidden rows untouched");
+      }
+
+      // ── cj-14: id length bound + log-safe ids. ───────────────────────
+      {
+        seed("l-ok");
+        const longId = "l".repeat(65);
+        const evilId = "l-ok\n[fake] injected line $(rm)";
+        const lines: string[] = [];
+        const origLog = console.log;
+        console.log = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+        let out: any;
+        try {
+          out = await apply([item(longId), item(evilId), item("l-ok")]);
+        } finally {
+          console.log = origLog;
+        }
+        assertEq(out.ok, true, "cj-14a: an over-long id does not reject the file");
+        assertEq([out.results[0].result, out.results[0].reason, out.results[0].id.length <= 64], ["rejected", "invalid_id", true], "cj-14b: >64-char id rejected invalid_id (reported id bounded)");
+        assertEq(out.results[1].reason, "not_found", "cj-14c: a 64-or-shorter odd id is looked up normally");
+        assertEq(out.results[2].result, "written", "cj-14d: the valid item is written");
+        const logLine = lines.find((l) => l.includes("run_id=cj-test")) ?? "";
+        assertTrue(logLine !== "" && !logLine.includes("\n") && !logLine.includes("[fake]") && !logLine.includes("$(") && !logLine.includes(longId), "cj-14e: item ids are sanitized + bounded in the log line");
+        assertEq(item("x".repeat(64)).id.length, 64, "cj-14f: (sanity) 64 chars is the bound");
+        seed("l".repeat(64));
+        const at64: any = await apply([item("l".repeat(64))]);
+        assertEq(at64.results[0].result, "written", "cj-14g: a 64-char id is accepted");
+      }
+
       // ── cj-9: no LLM anywhere. ───────────────────────────────────────
       assertEq([llmCalls, globalFetchCalls, judgeCalls], [0, 0, 0], "cj-9: ZERO api.anthropic.com requests, zero global fetch, zero judge calls");
 

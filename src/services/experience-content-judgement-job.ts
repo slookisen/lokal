@@ -27,12 +27,14 @@
 // not an object, wrong schema, missing run_id, created_at not an ISO-8601
 // timestamp with a zone or in the future, items not an array of 1..50
 // objects each with a non-empty string id, duplicate ids. Item-level
-// (that item rejected, the rest applied): unknown verdict, missing
-// evidence_url, missing/over-long (>500 chars) reasoning.
+// (that item rejected, the rest applied): an id over 64 chars
+// (`invalid_id`), unknown verdict, missing evidence_url, missing/over-long
+// (>500 chars) reasoning. Item ids are sanitized + bounded in log lines.
 //
 // SERVER RE-CHECKS per item, inside that item's own transaction, before any
 // write: the experiences write-pause; the row exists; it is still eligible
-// (SWEEP_ELIGIBLE_WHERE) and in scope (SWEEP_IN_SCOPE_WHERE); the item's
+// (SWEEP_ELIGIBLE_WHERE, and public: neither the row nor its provider
+// catalog_hidden — else `not_eligible`) and in scope (SWEEP_IN_SCOPE_WHERE); the item's
 // evidence_url equals the row's current evidence_url (else
 // `evidence_changed`); the row's admission_checked_at is not newer than the
 // file's created_at (else `stale_verdict` — a newer judgement already
@@ -60,7 +62,12 @@
 // BUDGET (punkt b). The candidate GET may serve up to 4 batches of 50 rows,
 // so a routine run can produce up to 4 files; this queue therefore takes up
 // to 4 files per tick (8 fetch attempts, twice the default, keeping the
-// same failures-per-file headroom). Each file is ≤50 items with no network
+// same failures-per-file headroom), but at most
+// EXPERIENCE_CONTENT_JUDGEMENT_MAX_FILES_PER_DAY (8) files per UTC day
+// (≤400 status writes a day). Inside a file, at most
+// CONTENT_JUDGEMENT_MAX_DEMOTIONS_PER_FILE mismatch demotions of rows that
+// were verified going in; items past that breaker are rejected
+// `demotion_cap` (unwritten, judgeable again later). Each file is ≤50 items with no network
 // call per item, so a tick stays well inside the default time budget.
 
 import type Database from "better-sqlite3";
@@ -85,6 +92,10 @@ export const EXPERIENCE_CONTENT_JUDGEMENTS_MAX_ITEMS = 50;
 export const EXPERIENCE_CONTENT_JUDGEMENTS_MAX_REASONING_CHARS = 500;
 export const EXPERIENCE_CONTENT_JUDGEMENT_FILES_PER_TICK = 4;
 export const EXPERIENCE_CONTENT_JUDGEMENT_MAX_ATTEMPTS_PER_TICK = 8;
+/** Per-UTC-day cap on recorded files (≤ 8 × 50 = 400 status writes a day). */
+export const EXPERIENCE_CONTENT_JUDGEMENT_MAX_FILES_PER_DAY = 8;
+/** Longest accepted item id; a longer one is rejected as `invalid_id`. */
+export const EXPERIENCE_CONTENT_JUDGEMENT_MAX_ID_CHARS = 64;
 /** 50 items × (≤500-char reasoning, up to 2 bytes/char in Norwegian, + id
  *  and url) stays under this; the default 64 KB could reject a full file. */
 export const EXPERIENCE_CONTENT_JUDGEMENT_MAX_FILE_BYTES = 128 * 1024;
@@ -154,6 +165,7 @@ function configFor(apply: ApplyFn): ProposalQueueConfig {
     validate: validateExperienceContentJudgementFile,
     apply: queueApply,
     filesPerTick: EXPERIENCE_CONTENT_JUDGEMENT_FILES_PER_TICK,
+    maxFilesPerDay: EXPERIENCE_CONTENT_JUDGEMENT_MAX_FILES_PER_DAY,
     maxAttemptsPerTick: EXPERIENCE_CONTENT_JUDGEMENT_MAX_ATTEMPTS_PER_TICK,
     maxFileBytes: EXPERIENCE_CONTENT_JUDGEMENT_MAX_FILE_BYTES,
     maxAgeDays: PROPOSAL_QUEUE_MAX_AGE_DAYS,
