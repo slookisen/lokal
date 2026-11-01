@@ -44671,6 +44671,28 @@ runSerial(async () => {
   }
 });
 
+// Daniel, 2026-11-01: e-mail copy of every POST /api/contact submission to
+// ADMIN_NOTIFICATION_EMAIL (text-only, Reply-To = visitor, fire-and-forget).
+// Next to crm-vertical/crm-triage, the other blocks that drive the real
+// contact router. It pins its own in-memory getDb() DB, so it sits here,
+// after _adHocFamilyBarrier, not beside the ad-hoc contact-tracking block.
+runSerial(async () => {
+  console.log("\n── contact-form-copy: e-post-kopi av kontaktskjemaet til admin ──");
+  try {
+    const { runContactFormCopyTests } = require("../src/routes/contact-form-copy.test") as
+      typeof import("../src/routes/contact-form-copy.test");
+    const r = await runContactFormCopyTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("contact-form-copy: " + f);
+    console.log(`  contact-form-copy: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-form-copy: unexpected error: " + String(err?.message || err));
+    console.log(`  ✗ contact-form-copy: unexpected error: ${String(err?.message || err)}`);
+  }
+});
+
 runSerial(async () => {
   console.log("\n── dev-request 2026-08-02-crm-summary-401-auth: crm admin auth (ADMIN_KEY primary / ANALYTICS_ADMIN_KEY fallback) ──");
   try {

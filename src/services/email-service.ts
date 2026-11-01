@@ -26,6 +26,27 @@ export function maskEmails(s: string): string {
   return s.replace(/[^\s<>"'(),;:]+@[^\s<>"'(),;:]+/g, "[email]");
 }
 
+// ─── Contact-form copy (sendAdminContactFormCopy) ─────────────────
+const CONTACT_FORM_PLATFORM_LABELS: Record<"rfb" | "experiences" | "dental", string> = {
+  rfb: "Rett fra Bonden",
+  experiences: "Opplevagent",
+  dental: "Finn-tannlege",
+};
+const CONTACT_FORM_COPY_SUBJECT_MAX = 150;
+// C0 + DEL + C1 controls (CR/LF among them) and the Unicode line/paragraph separators.
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+/** Visitor text for a header or a one-line field: controls → space, runs collapsed. */
+function toOneLine(s: string): string {
+  return String(s ?? "").replace(CONTROL_CHARS_RE, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Caps at `max` code points (never splits a surrogate pair), ending in "…" when cut. */
+function capChars(s: string, max: number): string {
+  const chars = Array.from(s);
+  return chars.length <= max ? s : chars.slice(0, max - 1).join("").trimEnd() + "…";
+}
+
 export interface EmailOptions {
   to: string;
   subject: string;
@@ -1185,6 +1206,69 @@ ${this.brand} | ${getConfig().domain}`;
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Copy of a public contact-form submission (POST /api/contact) to the admin
+   * — Daniel asked for it 2026-11-01; until then the form only wrote a CRM
+   * thread and nothing reached an inbox. Same recipient and skip rule as
+   * sendAdminClaimNotification above.
+   *
+   * Text-only on purpose (no htmlContent): every field is visitor input, so
+   * nothing in it can ever be rendered as HTML. Reply-To is the visitor, so
+   * «Svar» goes straight to them; the visitor's subject is flattened to one
+   * line (no CR/LF or other control characters reach the header) and the
+   * whole subject is capped. Never throws; logs carry neither the message
+   * nor the visitor's address.
+   */
+  async sendAdminContactFormCopy(opts: {
+    platform: "rfb" | "experiences" | "dental";
+    name: string;
+    email: string;
+    subject: string;
+    message: string;
+    threadId: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping contact-form copy');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const label = CONTACT_FORM_PLATFORM_LABELS[opts.platform] ?? String(opts.platform);
+      const visitorSubject = toOneLine(opts.subject);
+      const subject = capChars(`[Kontaktskjema · ${label}] ${visitorSubject || 'Ny melding'}`, CONTACT_FORM_COPY_SUBJECT_MAX);
+      const textContent = [
+        `Plattform: ${label}`,
+        `Navn: ${toOneLine(opts.name)}`,
+        `E-post: ${toOneLine(opts.email)}`,
+        `Emne: ${visitorSubject || '(ikke oppgitt)'}`,
+        '',
+        opts.message,
+        '',
+        `CRM-tråd: ${opts.threadId}`,
+        'Svar på denne e-posten går rett til avsenderen. Svaret havner ikke av seg selv i CRM-tråden.',
+      ].join('\n');
+
+      return await this.sendEmail({
+        to: adminEmail,
+        subject,
+        textContent,
+        replyTo: opts.email.replace(CONTROL_CHARS_RE, ''),
+        // Not outreach (see EmailOptions.omitAgentHeader), and the mail carries
+        // a consumer's address, so keep addresses out of the send log too.
+        omitAgentHeader: true,
+        redactRecipientInLogs: true,
+      });
+    } catch (error) {
+      logger.error('Error sending admin contact-form copy', {
+        platform: opts.platform,
+        threadId: opts.threadId,
+        error: maskEmails(error instanceof Error ? error.message : String(error)),
+      });
+      return { success: false, error: maskEmails(error instanceof Error ? error.message : 'Unknown error') };
     }
   }
 
