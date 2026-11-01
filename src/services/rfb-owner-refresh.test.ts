@@ -46,6 +46,15 @@
  *       / no session / not owner refused; flag off → no card, POST 404,
  *       nothing written, «Mine valg» keeps it in «Planlagt»
  *   (s) the switch probe's choice evaluation and its auto.updates reader
+ *   Fix-up round 1 (review of 99d63d6): automatic never overwrites text the
+ *       owner wrote by a path without a per-field trace (P1 /selger + a later
+ *       CS write, P2 PUT /agents/:id/description) — only text provably ours;
+ *       a failed write / non-fetch failure is stamped (no nightly retry loop,
+ *       M19), an unavailable about judge is transient; prose claims (organic
+ *       variants, certification marks, e-mail, prices) refused; the probe
+ *       reads 100 % with the flag off; the card follows the vertical rule;
+ *       planOnlyFields without dryRun throws; the per-row deadline / 08Z stop
+ *       and a timed-out row's reservation inside step 6 (M24, M25, M33)
  *
  * Two ways to run:
  *   1. Standalone:  npx tsx src/services/rfb-owner-refresh.test.ts
@@ -237,7 +246,11 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       seed("r-owned", { owned: true, k: {} });
       seed("r-free", { owned: false, k: {} });
       const off = rs.resolveOwnerFeature("rfb", "r-owned", "auto.updates", { db });
-      assertEq([off.value, off.block, off.changeable], ["fill_empty", "coming_soon", false], "r3: flag off — the owner default shows as coming_soon (today's behaviour)");
+      assertEq([off.value, off.block, off.changeable], ["suggest", "coming_soon", false], "r3: flag off — the pre-live answer: «Foreslå til meg», coming_soon (today's behaviour)");
+      const pre = reg.ownerFeatureEntryForEnv(e, {});
+      assertEq([pre.default.owner, reg.visibleOwnerFeatureOptions(pre).map((o) => o.value), pre.since], ["suggest", ["suggest", "fill_empty", "never", "automatic"], "2026-10-27"],
+        "r3: flag off — the owner API's entry is the pre-live one (default, all four options in their old order, since)");
+      assertEq(reg.ownerFeatureEntryForEnv(e, { OWNER_AUTO_UPDATES_ENABLED: "1" }), e, "r3: flag on — the entry itself");
       assertEq(rs.setOwnerFeatureValue("rfb", "r-owned", "auto.updates", "automatic", { actor: "owner" }, { db }).kind, "blocked", "r3: flag off — an owner write is refused (coming_soon)");
       assertEq((db.prepare(`SELECT COUNT(*) AS n FROM owner_feature_settings`).get() as any).n, 0, "r3: flag off — nothing stored");
       setEnv(ON);
@@ -259,7 +272,18 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       assertEq(p(snap({ about: "Tekst", description: "" }), "fill_empty"), ["categories"], "f2: fill_empty, about filled → no about, and no description without it");
       assertEq(p(snap({ description: "Beskrivelse" }), "fill_empty"), ["about", "categories"], "f3: fill_empty, description filled → about only");
       assertEq(p(snap({ categories: '["fruit"]' }), "fill_empty"), ["about", "description"], "f4: fill_empty, categories filled → not categories");
-      assertEq(p(snap({ about: "A", description: "B", categories: '["fruit"]' }), "automatic"), ["about", "description"], "f5: automatic, enrichment fields filled → about + description (categories only when empty)");
+      const ours = (about: string, description: string, st = "google_places") => JSON.stringify({
+        about: [{ source_type: st, value: about }], description: { sources: [{ source_type: "website_homepage", value: description }] } });
+      assertEq(p(snap({ about: "A", description: "B", categories: '["fruit"]', field_provenance: ours("A", "B") }), "automatic"), ["about", "description"],
+        "f5: automatic, filled about/description whose text a non-owner source recorded (provably ours) → about + description (categories only when empty)");
+      assertEq(p(snap({ about: "A  text", description: "B", field_provenance: ours("A text", "B") }), "automatic"), ["about", "description", "categories"], "f5: … whitespace differences do not matter");
+      assertEq(p(snap({ about: "A", description: "B", categories: '["fruit"]' }), "automatic"), [], "f5b: automatic, filled fields without a provenance record → nothing (exactly fill_empty)");
+      assertEq(p(snap({ about: "A", description: "B", categories: '["fruit"]', field_provenance: ours("A gammel", "B gammel") }), "automatic"), [], "f5c: a record whose value is not the current text → not ours, nothing");
+      assertEq(p(snap({ about: "A", description: "B", categories: '["fruit"]', field_provenance: ours("A", "B", "owner_relay") }), "automatic"), ["description"].filter(() => false),
+        "f5d: an owner-ish record (owner_relay) never proves the text ours → about stays (and description with it)");
+      assertEq(p(snap({ about: "", description: "B", field_provenance: JSON.stringify({}) }), "automatic"), ["about", "categories"], "f5e: an empty about is filled; a filled description without proof is not");
+      assertEq(p(snap({ about: "A", description: "B", owner_updated_at: "2026-10-30T10:00:00.000Z", field_provenance: ours("A", "B") }), "automatic"), ["categories"],
+        "f6b: owner_updated_at set (the owner wrote through /selger, data_source later reset) → only empty fields, even with proof");
       assertEq(p(snap({ about: "A", description: "B", data_source: "hybrid" }), "automatic"), ["categories"], "f6: automatic on a profile the owner wrote through /selger (hybrid) → only empty fields");
       assertEq(p(snap({ about: "A", data_source: "owner" }), "automatic"), ["categories"], "f6: … same for data_source owner");
       assertEq(p(snap({ curated_fields: own("about") }), "fill_empty"), ["categories"], "f7: about saved by the owner → neither about nor description");
@@ -345,7 +369,9 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
 
       // w4 — automatic: filled enrichment fields are updated.
       seed("w-auto", { owned: true, description: "Gammel beskrivelse fra en katalog.", categories: '["fruit"]',
-        k: { about: "Gammel tekst fra en katalog.", field_provenance: JSON.stringify({ about: [{ source_type: "google_places", value: "Gammel tekst fra en katalog." }] }) } });
+        k: { about: "Gammel tekst fra en katalog.", field_provenance: JSON.stringify({
+          about: [{ source_type: "google_places", value: "Gammel tekst fra en katalog." }],
+          description: [{ source_type: "google_places", value: "Gammel beskrivelse fra en katalog." }] }) } });
       choose("w-auto", "automatic");
       const r4 = orf.applyOwnerRefreshWrites(db, "w-auto", [
         homepageWrite("w-auto", "about", "agent_knowledge", ABOUT_TEXT),
@@ -406,6 +432,74 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       const r9 = orf.applyOwnerRefreshWrites(db, "w-off", [homepageWrite("w-off", "about", "agent_knowledge", ABOUT_TEXT)] as any, { runId: RUN });
       assertEq([r9.written.length, kn("w-off").about], [0, ""], "w9: flag off → nothing written");
       setEnv(ON);
+
+      // w11 (review P1) — the owner writes about in /selger, then a CS / admin
+      // knowledge write resets data_source to auto: automatic must still keep it.
+      seed("w-p1", { owned: true, url: "https://w-p1.example.no", description: "Kort katalogtekst.", categories: '["meat"]',
+        k: { website: "https://w-p1.example.no", about: "Gammel tekst.", data_source: "auto",
+             field_provenance: JSON.stringify({ about: [{ source_type: "google_places", value: "Gammel tekst." }], description: [{ source_type: "google_places", value: "Kort katalogtekst." }] }) } });
+      ks.knowledgeService.ownerUpdate("w-p1", { about: "Dette har eieren selv skrevet i /selger om gården sin." });
+      ks.knowledgeService.upsertKnowledge("w-p1", { address: "Gardsvegen 1", dataSource: "auto" } as any);
+      const p1state = db.prepare(`SELECT data_source, owner_updated_at FROM agent_knowledge WHERE agent_id = 'w-p1'`).get() as any;
+      assertEq([p1state.data_source, !!p1state.owner_updated_at], ["auto", true], "w11 (P1): setup — the CS write reset data_source to auto; owner_updated_at is still set");
+      choose("w-p1", "automatic");
+      const p1row = (await orf.loadOwnerRefreshCohort(db, { nowMs: Date.now() })).eligible.find((r) => r.id === "w-p1");
+      assertEq(p1row ? p1row.fields : null, null, "w11 (P1): automatic does not plan the owner's about (owner_updated_at) — nothing to do");
+      const r11 = orf.applyOwnerRefreshWrites(db, "w-p1", [homepageWrite("w-p1", "about", "agent_knowledge", ABOUT_TEXT), homepageWrite("w-p1", "description", "agents", ABOUT_TEXT)] as any, { runId: RUN });
+      assertEq([r11.written.length, kn("w-p1").about, ag("w-p1").description], [0, "Dette har eieren selv skrevet i /selger om gården sin.", "Kort katalogtekst."],
+        "w11 (P1): even a planned write is refused — the owner's text and the description stay");
+
+      // w12 (review P2) — the owner wrote agents.description through PUT /agents/:id/description (no trace).
+      seed("w-p2", { owned: true, url: "https://w-p2.example.no", description: "Eierens egen beskrivelse.", categories: '["meat"]', k: { website: "https://w-p2.example.no", about: null as any } });
+      const mreg = require("./marketplace-registry") as typeof import("./marketplace-registry");
+      mreg.marketplaceRegistry.updateAgent("w-p2", { description: "Eierens egen beskrivelse skrevet via PUT /agents/:id/description." } as any);
+      choose("w-p2", "automatic");
+      const p2row = (await orf.loadOwnerRefreshCohort(db, { nowMs: Date.now() })).eligible.find((r) => r.id === "w-p2");
+      assertEq(p2row?.fields, ["about"], "w12 (P2): automatic plans only the empty about, not the owner's description");
+      judgeCalls = 0;
+      const p2 = await orf.refreshOwnedProfile(db, p2row!, { deadlineAt: Date.now() + 30_000, runId: RUN, deps: { aboutJudges: approveJudges, fetchImpl: pageFetch } });
+      assertEq([p2.outcome, p2.written, ag("w-p2").description], ["written", ["about"], "Eierens egen beskrivelse skrevet via PUT /agents/:id/description."],
+        "w12 (P2): the empty about is filled, the owner's description is kept");
+
+      // w13 — prose claims: organic variants, certification marks, e-mail, prices.
+      const pr = orf.ownerRefreshProseRefusal;
+      for (const [text, want] of [
+        ["Vi selger bio-honning og lammekjøtt.", "organic_claim"],
+        ["Eco-friendly gård i Valdres.", "organic_claim"],
+        ["We practise ecological farming.", "organic_claim"],
+        ["Ecologically grown vegetables.", "organic_claim"],
+        ["Vi driver økologisk landbruk.", "organic_claim"],
+        ["Kortreist og Debio-godkjent.", "organic_claim"],
+        ["Ost med Nyt Norge-merket.", "certification_claim"],
+        ["Spekepølsa har fått Spesialitet.", "certification_claim"],
+        ["Fenalår med beskyttet geografisk betegnelse.", "certification_claim"],
+        ["Beskyttet opprinnelsesbetegnelse for osten.", "certification_claim"],
+        ["Skriv til post@gard.example.no for bestilling.", "email_address"],
+        ["Lammekjøtt kr 120 per kilo.", "price"],
+        ["Honning 120,- per glass.", "price"],
+        ["Egg NOK 60 per brett.", "price"],
+        ["Poteter 25 kr kiloen.", "price"],
+        ["Ull Kr. 89 per nøste.", "price"],
+      ] as const) {
+        assertEq(pr(text), want, `w13: «${text}» → ${want}`);
+      }
+      for (const text of [
+        "Vi har 120 sauer, 3 krukker og studerte biologi og biografi.",
+        "Vår spesialitet er spekemat fra egen gård siden 1952.",
+        ABOUT_TEXT,
+        "Økonomien på gården og økosystemet rundt.",
+      ]) {
+        assertEq(pr(text), null, `w13: «${text}» is not a claim`);
+      }
+      seed("w-claim", { owned: true, description: "", categories: "[]", k: { about: "" } });
+      const r13 = orf.applyOwnerRefreshWrites(db, "w-claim", [
+        homepageWrite("w-claim", "about", "agent_knowledge", "Bestill på post@w-claim.example.no, lammekjøtt kr 120 per kilo."),
+      ] as any, { runId: RUN });
+      assertEq([r13.refused, kn("w-claim").about], [[{ field: "about", reason: "email_address" }], ""], "w13: a text with an e-mail address is never written");
+      const r13b = orf.applyOwnerRefreshWrites(db, "w-claim", [homepageWrite("w-claim", "about", "agent_knowledge", "Vi selger Nyt Norge-merket ost fra gården vår.")] as any, { runId: RUN });
+      assertEq(r13b.refused, [{ field: "about", reason: "certification_claim" }], "w13: a certification mark is never written");
+      const r13c = orf.applyOwnerRefreshWrites(db, "w-claim", [homepageWrite("w-claim", "about", "agent_knowledge", "   ")] as any, { runId: RUN });
+      assertEq(r13c.refused, [{ field: "about", reason: "empty_value" }], "w13: an empty value is never written");
 
       // w10 — the owner lock in upsertKnowledge, forced on for this job.
       seed("w-lock", { owned: true, k: { about: "Eierens tekst.", curated_fields: JSON.stringify({ about: { by: "owner", locked_at: "2026-10-30T00:00:00.000Z" } }) } });
@@ -481,6 +575,7 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
     let offView: any = null;
     await withDb("n-off", async () => {
       setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1" });
+      fetched.length = 0;
       seedNight();
       const owned0 = dumpOwned();
       const calls: Call[] = [];
@@ -556,8 +651,15 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       const ak = require("../routes/admin-knowledge") as typeof import("../routes/admin-knowledge");
       const plain = await ak.refreshHomepageContent(db, ak.selectHomepageContentRefreshTargetsByIds(db, ["e-cat"], 1), { dryRun: true, fetchImpl: pageFetch, aboutJudges: approveJudges });
       assertTrue(!("planned_writes" in plain), "e2: without planOnlyFields the result has no planned_writes (every caller today unchanged)");
-      const ignored = await ak.refreshHomepageContent(db, ak.selectHomepageContentRefreshTargetsByIds(db, ["e-cat"], 1), { dryRun: false, planOnlyFields: ["categories"], fetchImpl: pageFetch, aboutJudges: approveJudges } as any);
-      assertTrue(!("planned_writes" in ignored), "e2: planOnlyFields is ignored outside a dry run");
+      const fetchedBefore = fetched.length;
+      let thrown: unknown = null;
+      try {
+        await ak.refreshHomepageContent(db, ak.selectHomepageContentRefreshTargetsByIds(db, ["e-cat"], 1), { dryRun: false, planOnlyFields: ["categories"], fetchImpl: pageFetch, aboutJudges: approveJudges } as any);
+      } catch (err) {
+        thrown = err;
+      }
+      assertTrue(thrown instanceof Error && /only allowed in a dry run/.test((thrown as Error).message), "e2: planOnlyFields without dryRun throws (never a silent apply run)");
+      assertEq(fetched.length, fetchedBefore, "e2: … before anything is fetched");
       // A dead site: fetch_failed, stamped by the caller, no parking bookkeeping.
       seed("e-dead", { owned: true, url: "https://e-dead.example.no", categories: "[]", k: { website: "https://e-dead.example.no", about: "" } });
       const dead = (async () => new Response("gone", { status: 404 })) as unknown as typeof fetch;
@@ -574,6 +676,77 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       const spam = (async () => new Response(SPAM, { status: 200, headers: { "content-type": "text/html" } })) as unknown as typeof fetch;
       const sp = await orf.refreshOwnedProfile(db, row("e-spam", ["about", "description", "categories"]), opts(spam));
       assertEq([sp.outcome, sp.written, kn("e-spam").about, ag("e-spam").categories], ["hijacked", [], "", "[]"], "e4: a gambling / theme-spam page → hijacked, nothing written (not even categories)");
+      // A write that fails (an unreadable JSON column makes upsertKnowledge's strict read throw): rolled back, a real outcome.
+      seed("e-bad", { owned: true, url: "https://e-bad.example.no", categories: "[]", k: { website: "https://e-bad.example.no", about: "", products: "{not json" } });
+      const bad = await orf.refreshOwnedProfile(db, row("e-bad", ["about", "description", "categories"]), opts(pageFetch));
+      assertEq([bad.outcome, bad.transient ?? false, bad.written, ag("e-bad").categories, ag("e-bad").description], ["write_failed", false, [], "[]", ""],
+        "e5: a failed write → write_failed (a real outcome, not transient), the transaction rolled back (categories untouched too)");
+      // An about judge that cannot answer (API outage): undecided → transient; the categories are still written.
+      seed("e-outage", { owned: true, url: "https://e-outage.example.no", categories: "[]", k: { website: "https://e-outage.example.no", about: "" } });
+      const outageJudges = { ...approveJudges, facts: async () => ({ ok: false, failure: "error", reason: "stub outage" }) } as any;
+      const ou = await orf.refreshOwnedProfile(db, row("e-outage", ["about", "description", "categories"]), { ...opts(pageFetch), deps: { aboutJudges: outageJudges, fetchImpl: pageFetch } });
+      assertEq([ou.outcome, ou.transient, ou.written, kn("e-outage").about], ["written", true, ["categories"], ""], "e6: judge unavailable → about undecided (transient: tried again next night), categories written");
+      seed("e-outage2", { owned: true, url: "https://e-outage2.example.no", categories: '["meat"]', k: { website: "https://e-outage2.example.no", about: "" } });
+      const ou2 = await orf.refreshOwnedProfile(db, row("e-outage2", ["about", "description"]), { ...opts(pageFetch), deps: { aboutJudges: outageJudges, fetchImpl: pageFetch } });
+      assertEq([ou2.outcome, ou2.transient], ["judge_unavailable", true], "e6: … with nothing else to write: judge_unavailable, transient (not «unchanged»)");
+    });
+
+    // ── (x) failures are stamped, transient outcomes are not (review M19, probe 2) ──
+    await withDb("x", async () => {
+      setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", ...ON });
+      // A fill_empty and an automatic owner whose writes always fail (unreadable JSON column).
+      for (const id of ["x-bad", "x-bad-auto"]) {
+        seed(id, { owned: true, url: `https://${id}.example.no`, description: "", categories: "[]", k: { website: `https://${id}.example.no`, about: "", products: "{not json" } });
+      }
+      choose("x-bad-auto", "automatic");
+      // A transiently failing homepage (503).
+      seed("x-flaky", { owned: true, url: "https://x-flaky.example.no", description: "", categories: "[]", k: { website: "https://x-flaky.example.no", about: "" } });
+      const fetchX = (async (url: any) => (String(url).includes("x-flaky") ? new Response("busy", { status: 503 }) : pageFetch(url))) as typeof fetch;
+      const nights = ["2026-10-12", "2026-10-13", "2026-10-14"];
+      const seen: Array<{ rows: string[]; judges: number; stamped: Record<string, string> }> = [];
+      for (const day of nights) {
+        judgeCalls = 0;
+        const r = await job.runRfbEnrichmentNightly({ apply: true, trigger: "manual", now: new Date(`${day}T00:10:00Z`), deps: { ...deps([]), ownerRefresh: { aboutJudges: approveJudges, fetchImpl: fetchX } } });
+        const stamped = Object.fromEntries((db.prepare(`SELECT agent_id, last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = 'owner_refresh'`).all() as any[]).map((x) => [x.agent_id, x.last_outcome]));
+        seen.push({ rows: r.owner_refresh!.rows.map((x) => `${x.agent_id}:${x.outcome}`), judges: judgeCalls, stamped });
+      }
+      assertEq(seen[0].rows, ["x-bad:write_failed", "x-bad-auto:write_failed", "x-flaky:fetch_failed"], "x1: night 1 — two failed writes, one transient fetch failure");
+      assertEq(seen[0].stamped, { "x-bad": "write_failed", "x-bad-auto": "write_failed" }, "x1 (M19): the failed writes are stamped; the transient fetch failure is not");
+      assertEq([seen[1].rows, seen[2].rows], [["x-flaky:fetch_failed"], ["x-flaky:fetch_failed"]], "x2: nights 2–3 — the failed writes wait (fill_empty window, also for automatic); only the transient one is tried again");
+      assertEq([seen[1].judges, seen[2].judges], [0, 0], "x2: no judge call is spent on them again");
+    });
+
+    // ── (y) step 6's own per-row stops and reservation (review M24, M25, M33) ──
+    const stepSixStops = async (label: string, jumpTo: Date, want: string) => {
+      await withDb(label, async () => {
+        setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", ...ON });
+        seedNight();
+        let clockNow = new Date(NIGHT.getTime());
+        const jumping = (async (url: any) => { clockNow = jumpTo; return pageFetch(url); }) as typeof fetch;
+        const r = await job.runRfbEnrichmentNightly({
+          apply: true, trigger: "manual", now: NIGHT,
+          deps: { executors: stubExecutors([]), clock: () => clockNow, ownerRefresh: { aboutJudges: approveJudges, fetchImpl: jumping } },
+        });
+        const o = r.owner_refresh!;
+        assertEq([o.selected, o.attempted, o.stopped_reason], [3, 1, want], `${label}: the clock passes ${want === "forbidden_hour" ? "08:00Z" : "the run deadline"} during the first owner row → step 6 stops before the next (${want})`);
+      });
+    };
+    await stepSixStops("y1 (M24)", new Date("2026-10-12T00:45:00Z"), "time_budget");
+    await stepSixStops("y2 (M25)", new Date("2026-10-12T08:01:00Z"), "forbidden_hour");
+    await withDb("y3 (M33)", async () => {
+      setEnv({ RFB_ENRICHMENT_NIGHTLY_ENABLED: "1", ...ON, RFB_ENRICHMENT_CAP_OWNER_REFRESH: "1" });
+      seedNight();
+      // 2.5 s left of the run: the owner row's refresh is cut off by its deadline while the page hangs.
+      const nearEnd = new Date(NIGHT.getTime() + 20 * 60_000 - 2_500);
+      const hanging = (async () => new Promise<Response>((res) => setTimeout(() => res(new Response(PAGE, { status: 200, headers: { "content-type": "text/html" } })), 4_000))) as unknown as typeof fetch;
+      const r = await job.runRfbEnrichmentNightly({
+        apply: true, trigger: "manual", now: NIGHT,
+        deps: { executors: stubExecutors([]), clock: () => nearEnd, ownerRefresh: { aboutJudges: approveJudges, fetchImpl: hanging } },
+      });
+      const o = r.owner_refresh!;
+      assertEq([o.rows.map((x) => [x.agent_id, x.outcome])], [[["n-fill", "timeout"]]], "y3: the owner row times out");
+      assertEq(job.readRfbEnrichmentNightLlmCounter(db, NIGHT), 3, "y3 (M33): the timed-out row keeps its reservation (3 judge calls) on the night's counter — they may still land");
+      assertEq((db.prepare(`SELECT COUNT(*) AS n FROM rfb_enrichment_nightly_attempts WHERE step = 'owner_refresh'`).get() as any).n, 0, "y3: a timeout is not stamped");
     });
 
     // ── (g) guards ─────────────────────────────────────────────────────────
@@ -712,6 +885,19 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       const other = await save("c-owner", "never", { token: tokens["c-pilot"] });
       assertEq(other.status, 403, "c5: another profile's session → 403");
       assertEq(JSON.stringify([settings(), featureAudits()]), before, "c5: none of them wrote anything");
+
+      // c6 — the card and the POST follow the refresh's vertical rule (COALESCE(vertical_id, 'rfb') = 'rfb').
+      seed("c-other-vertical", { owned: true, k: { website: "https://c-other-vertical.example.no", about: "Liten gård.", email: "post@c-other-vertical.example.no" } });
+      db.prepare(`UPDATE agents SET vertical_id = 'opplevagent' WHERE id = 'c-other-vertical'`).run();
+      tokens["c-other-vertical"] = "tok-c-other-vertical";
+      db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES ('ml-c-ov', 'post@c-other-vertical.example.no', 'tok-c-other-vertical', 'c-other-vertical', 1, ?, ?)")
+        .run(new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
+      const ovHtml = await portal("c-other-vertical");
+      assertTrue(ovHtml.includes("Profilinformasjon") && !ovHtml.includes('id="hold-oppdatert"'), "c6: no card for a verified owner of a profile outside the RFB vertical");
+      const ovPost = await save("c-other-vertical", "automatic");
+      assertEq([ovPost.status, settings().some((x) => x.subject_id === "c-other-vertical")], [404, false], "c6: … and the POST answers 404 and writes nothing");
+      db.prepare(`UPDATE agents SET vertical_id = 'rfb' WHERE id = 'c-other-vertical'`).run();
+      assertTrue((await portal("c-other-vertical")).includes('id="hold-oppdatert"'), "c6: the same profile in the rfb vertical gets the card (the gate discriminates)");
     });
 
     // ── (t) /for-produsenter follows the flag (sentences left out, no new text) ──
@@ -753,7 +939,8 @@ export async function runRfbOwnerRefreshTests(opts: { log?: boolean } = {}): Pro
       setEnv({});
       choose("s-fx", "automatic");
       assertEq(reader!.sync!({ ...rc, env: {} }).endpoints, { fill_empty: false, automatic: false, never: true }, "s2: flag off → the owner refresh does not run (never)");
-      assertEq(probe.SWITCH_PROBE_FLAG_DEPENDENCIES["auto.updates × job:rfb_enrichment_nightly"], "OWNER_AUTO_UPDATES_ENABLED", "s3: with the flag off the probe FAILs the row (flag dependency)");
+      assertEq(probe.SWITCH_PROBE_FLAG_DEPENDENCIES["auto.updates × job:rfb_enrichment_nightly"], undefined,
+        "s3: no flag dependency — with the flag off the probe checks auto.updates as a planned entry (admin-owner-features-switch-probe flags-10/11)");
     });
   } finally {
     console.log = prevLog;

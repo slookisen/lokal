@@ -266,8 +266,9 @@ export async function runOwnerFeaturesS2aTests(opts: { log?: boolean } = {}): Pr
     assertEq(rs.featureOn("rfb", OWNED_ID, "auto.guarantee"), true, "featureOn: guarantee on");
     assertEq(rs.rfbFeatureOn(OWNED_ID, "comms.unsubscribe"), true, "rfbFeatureOn wrapper");
     assertEq(rs.resolveOwnerFeature("rfb", EMAILMATCH_ID, "auto.updates").value, "automatic", "segment: unclaimed profile gets the unclaimed default");
-    // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner default is «Fyll tomme felt selv».
-    assertEq(rs.resolveOwnerFeature("rfb", OWNED_ID, "auto.updates").value, "fill_empty", "segment: verified owner gets the owner default");
+    // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: with OWNER_AUTO_UPDATES_ENABLED off (here) the
+    // pre-live answer («Foreslå til meg»); with it on the owner default is «Fyll tomme felt selv».
+    assertEq(rs.resolveOwnerFeature("rfb", OWNED_ID, "auto.updates").value, "suggest", "segment: verified owner gets the owner default");
 
     // ── Resolution order (fixture registry) ────────────────────────────────
     {

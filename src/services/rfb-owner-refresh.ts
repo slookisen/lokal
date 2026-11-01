@@ -31,13 +31,19 @@
 //   • only fields in OWNER_REFRESH_FIELDS and never one in
 //     OWNER_REFRESH_NEVER_FIELDS (products and prices, stock, organic /
 //     certification claims, e-mail, order settings);
-//   • fill_empty: only a field that is empty now; automatic: also a non-empty
-//     one — never one the owner saved (curated_fields by owner, an `owner`
-//     provenance record, or any field of a profile the owner wrote through the
-//     /selger editor: data_source owner/hybrid) and never one customer service
-//     locked (any curated_fields entry); about and description go together
-//     and are left alone when either is locked;
-//   • no prose with an organic claim word, no organic category (whatever the
+//   • fill_empty: only a field that is empty now. automatic: also a filled
+//     about / description, but ONLY when field_provenance[field] holds a
+//     non-owner record whose value is the column's current text (the stored
+//     text is provably ours) and the owner never wrote the profile
+//     (data_source owner/hybrid, owner_updated_at set); otherwise automatic
+//     is exactly fill_empty. Never a field the owner saved (curated_fields
+//     by owner, an `owner` provenance record) or customer service locked (any
+//     curated_fields entry); about and description go together and are left
+//     alone when either is locked. NB fill_empty refills an about the owner
+//     emptied in /selger: that editor leaves no per-field trace, and the
+//     spec's «fyll tomme felt» covers every empty field (per spec);
+//   • no prose with an organic or certification claim, an e-mail address or
+//     a price (ownerRefreshProseRefusal), no organic category (whatever the
 //     Debio status — the owner states those, we do not);
 //   • `about` through knowledgeService.upsertKnowledge with the owner lock
 //     forced on (enforceOwnerLock, also with OWNER_LOCK_ENFORCE_WRITES off);
@@ -47,8 +53,20 @@
 //     notes with the choice, the source and its URL, the run id): the owner
 //     sees it in the portal's «Endringslogg» (GET /api/agents/:id/my-audit);
 //   • the website_homepage provenance record merged as the extractor would.
-// Nothing else is written for an owned profile: no fetch bookkeeping, no
-// parking, no rotation stamp on agent_knowledge, no review-queue proposal.
+// What else changes on an owned profile when something is written: the
+// `about` write goes through upsertKnowledge, which rewrites the whole
+// agent_knowledge row as it always does — last_enriched_at and updated_at
+// are set, agents.agent_version is bumped, and the JSON columns are
+// re-serialised from their parsed values (normalised, same content); the
+// merged provenance sets field_provenance and updated_at. Nothing else: no
+// fetch bookkeeping, no parking, no rotation stamp on agent_knowledge, no
+// review-queue proposal.
+//
+// Failures: a dead / blocked site, a hijacked page, a failed write or any
+// other non-fetch failure is a real outcome (stamped; due again after the
+// fill_empty retry window, whatever the choice). Only a transient fetch
+// failure, the deadline and an unavailable about judge (API outage) are
+// transient: not stamped, tried again the next night.
 //
 // Not reused for owned profiles (they cannot be limited to the allowed
 // fields): the Brreg / Bondens Marked / contact-extraction steps write e-mail
@@ -67,6 +85,7 @@ import {
   mergeFieldProvenance,
   refreshHomepageContent,
   selectHomepageContentRefreshTargetsByIds,
+  HCR_ABOUT_REASON_JUDGE_UNAVAILABLE,
   HCR_DEADLINE_EXCEEDED,
   HCR_THEME_SPAM_CANDIDATE_REASON,
   HCR_THEME_SPAM_PAGE_ERROR,
@@ -151,6 +170,8 @@ export interface OwnerRefreshSnapshot {
   curated_fields: string | null;
   field_provenance: string | null;
   data_source: string | null;
+  /** Set by every owner write through /selger or the knowledge PUT (ownerUpdate); kept by later non-owner writes. */
+  owner_updated_at?: string | null;
   homepage_unreachable_since: string | null;
 }
 
@@ -166,7 +187,7 @@ function snapshotSql(extraWhere = ""): string {
     SELECT a.id AS id, a.name AS name, a.url AS a_url, a.description AS description, a.categories AS categories,
            k.agent_id AS k_agent_id, k.website AS k_website, k.about AS about, k.curated_fields AS curated_fields,
            k.field_provenance AS field_provenance, k.data_source AS data_source,
-           k.homepage_unreachable_since AS homepage_unreachable_since
+           k.owner_updated_at AS owner_updated_at, k.homepage_unreachable_since AS homepage_unreachable_since
       FROM agents a
       LEFT JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE a.role = 'producer'
@@ -192,6 +213,7 @@ function toSnapshot(r: any): OwnerRefreshSnapshot {
     curated_fields: r.curated_fields ?? null,
     field_provenance: r.field_provenance ?? null,
     data_source: r.data_source ?? null,
+    owner_updated_at: r.owner_updated_at ?? null,
     homepage_unreachable_since: r.homepage_unreachable_since ?? null,
   };
 }
@@ -262,13 +284,40 @@ function parseObject(raw: string | null | undefined): Record<string, unknown> | 
   }
 }
 
+/** The records of field_provenance[field], whatever the stored shape (list, {sources}, a single record). */
+function provenanceRecords(prov: Record<string, unknown>, field: string): unknown[] {
+  const v = prov[field];
+  return Array.isArray(v) ? v : v && typeof v === "object" && Array.isArray((v as { sources?: unknown }).sources) ? (v as { sources: unknown[] }).sources : v ? [v] : [];
+}
+
+function sourceTypeOf(r: unknown): string {
+  const st = r && typeof r === "object" ? (r as { source_type?: unknown }).source_type : null;
+  return typeof st === "string" ? st.trim().toLowerCase() : "";
+}
+
 /** field_provenance[field] carries an owner-attested record (source_type «owner», the gate's Tier S). */
 function ownerAttested(prov: Record<string, unknown>, field: string): boolean {
-  const v = prov[field];
-  const list = Array.isArray(v) ? v : v && typeof v === "object" && Array.isArray((v as { sources?: unknown }).sources) ? (v as { sources: unknown[] }).sources : v ? [v] : [];
-  return list.some((r) => {
-    const st = r && typeof r === "object" ? (r as { source_type?: unknown }).source_type : null;
-    return typeof st === "string" && st.trim().toLowerCase().split(":")[0] === "owner";
+  return provenanceRecords(prov, field).some((r) => sourceTypeOf(r).split(":")[0] === "owner");
+}
+
+/** Whitespace-collapsed and trimmed: «is the stored text the text a source gave?» */
+function normText(v: unknown): string {
+  return String(v ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The column's current text is provably ours: field_provenance[field] holds
+ * a record from a non-owner source (not «owner…») whose value IS that text.
+ * A text the owner wrote by any path that leaves no record (PUT
+ * /agents/:id/description, /register, a CS correction) never matches.
+ */
+function storedTextIsOurs(prov: Record<string, unknown>, field: string, current: string | null): boolean {
+  const cur = normText(current);
+  if (cur === "") return false;
+  return provenanceRecords(prov, field).some((r) => {
+    const st = sourceTypeOf(r);
+    const value = r && typeof r === "object" ? (r as { value?: unknown }).value : null;
+    return st !== "" && !st.startsWith("owner") && typeof value === "string" && normText(value) === cur;
   });
 }
 
@@ -278,10 +327,13 @@ function ownerAttested(prov: Record<string, unknown>, field: string): boolean {
  *   locked   any curated_fields entry (an owner save stamps by:"owner",
  *            customer service its own name) or an owner provenance record;
  *            unreadable curated_fields / field_provenance → nothing (fail closed)
- *   empty    fill_empty writes only an empty field; automatic also a filled
- *            one, except on a profile the owner wrote through /selger
- *            (data_source owner/hybrid, no per-field trace) — there too only
- *            an empty field
+ *   empty    fill_empty writes only an empty field (also one the owner
+ *            emptied in /selger — no per-field trace; per spec). automatic
+ *            also a filled about / description, but only when its text is
+ *            provably ours (storedTextIsOurs) and the owner never wrote the
+ *            profile (data_source owner/hybrid or owner_updated_at set: the
+ *            /selger editor and the knowledge PUT leave no per-field trace);
+ *            otherwise automatic is exactly fill_empty
  *   pair     about and description share one judged value: neither when
  *            either is locked, description only together with about
  *   categories  only an empty list, in both modes: the extractor never
@@ -293,15 +345,48 @@ export function plannedOwnerRefreshFields(s: OwnerRefreshSnapshot, mode: OwnerAu
   const prov = parseObject(s.field_provenance);
   if (locks === null || prov === null) return [];
   const locked = (f: string) => Object.prototype.hasOwnProperty.call(locks, f) || ownerAttested(prov, f);
-  const ownerWroteProfile = s.data_source === "owner" || s.data_source === "hybrid";
-  const may = (f: OwnerRefreshField, empty: boolean) => !locked(f) && (empty || (mode === "automatic" && !ownerWroteProfile));
+  const ownerWroteProfile = s.data_source === "owner" || s.data_source === "hybrid" || !!s.owner_updated_at;
+  const may = (f: "about" | "description", current: string | null) =>
+    !locked(f) && (blankText(current) || (mode === "automatic" && !ownerWroteProfile && storedTextIsOurs(prov, f, current)));
   const out: OwnerRefreshField[] = [];
-  if (!locked("about") && !locked("description") && may("about", blankText(s.about))) {
+  if (!locked("about") && !locked("description") && may("about", s.about)) {
     out.push("about");
-    if (may("description", blankText(s.description))) out.push("description");
+    if (may("description", s.description)) out.push("description");
   }
   if (!locked("categories") && blankList(s.categories)) out.push("categories");
   return out;
+}
+
+// ─── Claims an owner states, never us ──────────────────────────────────────
+// Spec «Skriver aldri»: organic / certification claims, e-mail addresses,
+// prices. Checked on every about / description text before it is written
+// (owned profiles only — the nightly's unowned steps are unchanged).
+
+/** Organic words the shared list (containsOrganicClaim) leaves out: bio / eco / ecological(ly) as words, also «bio-…» / «eco-…»; not «biologi», «biografi». */
+const EXTRA_ORGANIC_RE = /(?:^|[^\p{L}\p{N}])(?:bio|eco|ecological|ecologically)(?=$|[^\p{L}\p{N}])/iu;
+/** Certification marks: Nyt Norge, Spesialitet (the mark, capitalised), the protected designations. */
+const CERTIFICATION_MARK_RES: readonly RegExp[] = [
+  /nyt\s+norge/iu,
+  /(?:^|[^\p{L}])Spesialitet(?=$|[^\p{L}])/u,
+  /spesialitetsmerke/iu,
+  /beskyttet\s+(?:geografisk\s+betegnelse|opprinnelsesbetegnelse|tradisjonelt\s+særpreg)/iu,
+  /protected\s+(?:geographical\s+indication|designation\s+of\s+origin)/iu,
+];
+const EMAIL_RE = /[^\s@<>()"']+@[^\s@<>()"']+\.\p{L}{2,}/u;
+/** «kr 120», «kr. 120», «NOK 120», «120 kr», «1 200 kroner», «120,50 NOK», «120,-». */
+const PRICE_RES: readonly RegExp[] = [
+  /(?:^|[^\p{L}])(?:kr|nok)\.?\s*\d/iu,
+  /\d\s*(?:kr|kroner|nok)(?=$|[^\p{L}])/iu,
+  /\d\s*,-/u,
+];
+
+/** Why an about / description text may not be written for an owner (null = it may). */
+export function ownerRefreshProseRefusal(text: string): "organic_claim" | "certification_claim" | "email_address" | "price" | null {
+  if (containsOrganicClaim(text) || EXTRA_ORGANIC_RE.test(text)) return "organic_claim";
+  if (CERTIFICATION_MARK_RES.some((re) => re.test(text))) return "certification_claim";
+  if (EMAIL_RE.test(text)) return "email_address";
+  if (PRICE_RES.some((re) => re.test(text))) return "price";
+  return null;
 }
 
 /** Worst-case model calls for one profile (its LLM reservation): the about judges, two passes in about-page mode. */
@@ -331,8 +416,6 @@ export interface OwnerRefreshCohort {
 
 export interface OwnerRefreshCohortOptions {
   nowMs: number;
-  /** step → agent_id → last attempt (readRfbEnrichmentAttempts). */
-  attempts?: Map<string, Map<string, number>>;
   /** fill_empty retry window after a real outcome (the nightly passes RFB_ENRICHMENT_RETRY_DAYS). */
   fillEmptyRetryMs?: number;
   env?: NodeJS.ProcessEnv;
@@ -345,6 +428,27 @@ function homepageHostExcluded(url: string): boolean {
   return !!rfbWebsiteHostExclusionReason(host) || isDirectoryOrAggregatorHost(host);
 }
 
+/** Outcomes after which an «automatic» profile is due again the next night; any other stamped outcome waits the fill_empty window. */
+const OWNER_REFRESH_NIGHTLY_OUTCOMES: ReadonlySet<string> = new Set(["written", "unchanged"]);
+
+/** The rotation memory (step owner_refresh): agent_id → last attempt (ms) and its outcome. No table → empty. */
+export function readOwnerRefreshAttempts(db: Db): Map<string, { at: number; outcome: string | null }> {
+  const out = new Map<string, { at: number; outcome: string | null }>();
+  let rows: Array<{ agent_id: string; last_attempted_at: string; last_outcome: string | null }> = [];
+  try {
+    rows = db
+      .prepare(`SELECT agent_id, last_attempted_at, last_outcome FROM rfb_enrichment_nightly_attempts WHERE step = ?`)
+      .all(OWNER_REFRESH_STEP) as typeof rows;
+  } catch {
+    return out;
+  }
+  for (const r of rows) {
+    const at = Date.parse(r.last_attempted_at);
+    if (!Number.isNaN(at)) out.set(r.agent_id, { at, outcome: r.last_outcome ?? null });
+  }
+  return out;
+}
+
 /** Owned profiles the refresh would take now. Read-only; yields every 200 rows. */
 export async function loadOwnerRefreshCohort(db: Db, opts: OwnerRefreshCohortOptions): Promise<OwnerRefreshCohort> {
   const env = opts.env ?? process.env;
@@ -353,11 +457,12 @@ export async function loadOwnerRefreshCohort(db: Db, opts: OwnerRefreshCohortOpt
   const skipped: Record<string, number> = {};
   const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
   const modes = ownerAutoUpdatesEnabled(env) ? resolveModes(db, snaps.map((s) => s.id), env) : new Map<string, OwnerAutoUpdatesMode | null>();
-  const last = opts.attempts?.get(OWNER_REFRESH_STEP) ?? new Map<string, number>();
-  const retry: Record<OwnerAutoUpdatesMode, number> = {
-    automatic: OWNER_REFRESH_AUTOMATIC_RETRY_MS,
-    fill_empty: opts.fillEmptyRetryMs ?? OWNER_REFRESH_FILL_EMPTY_RETRY_MS_DEFAULT,
-  };
+  const last = readOwnerRefreshAttempts(db);
+  const fillEmptyRetryMs = opts.fillEmptyRetryMs ?? OWNER_REFRESH_FILL_EMPTY_RETRY_MS_DEFAULT;
+  // automatic is due every night after a real refresh; after a failure
+  // (dead site, failed write …) every choice waits the fill_empty window.
+  const retryMs = (mode: OwnerAutoUpdatesMode, outcome: string | null) =>
+    mode === "automatic" && OWNER_REFRESH_NIGHTLY_OUTCOMES.has(outcome ?? "") ? OWNER_REFRESH_AUTOMATIC_RETRY_MS : fillEmptyRetryMs;
   const picked: Array<{ row: OwnerRefreshRow; attemptMs: number }> = [];
   for (let i = 0; i < snaps.length; i++) {
     if (i > 0 && i % 200 === 0) await yieldToEventLoop();
@@ -371,8 +476,9 @@ export async function loadOwnerRefreshCohort(db: Db, opts: OwnerRefreshCohortOpt
     if (s.homepage_unreachable_since) { skip("homepage_unreachable"); continue; }
     const fields = plannedOwnerRefreshFields(s, mode);
     if (fields.length === 0) { skip("nothing_to_fill"); continue; }
-    const attemptMs = last.get(s.id) ?? null;
-    if (attemptMs !== null && attemptMs > opts.nowMs - retry[mode]) { skip("retry_window"); continue; }
+    const prev = last.get(s.id) ?? null;
+    const attemptMs = prev ? prev.at : null;
+    if (prev && prev.at > opts.nowMs - retryMs(mode, prev.outcome)) { skip("retry_window"); continue; }
     picked.push({ row: { id: s.id, name: s.name ?? "", homepage, mode, fields }, attemptMs: attemptMs ?? 0 });
   }
   // Stable sort: creation order breaks the ties.
@@ -395,11 +501,11 @@ export interface OwnerRefreshWriteResult {
 }
 
 export interface OwnerRefreshRowOutcome {
-  /** written | unchanged | hijacked | fetch_failed | failed | timeout | no_homepage */
+  /** written | unchanged | judge_unavailable | hijacked | fetch_failed | write_failed | failed | timeout | no_homepage */
   outcome: string;
   written: OwnerRefreshField[];
   refused: Array<{ field: string; reason: string }>;
-  /** Says nothing about the profile (deadline, a transient fetch failure): not stamped, tried again next night. */
+  /** Says nothing about the profile (deadline, a transient fetch failure, an unavailable about judge): not stamped, tried again next night. */
   transient?: boolean;
   detail?: string;
 }
@@ -429,7 +535,9 @@ export async function refreshOwnedProfile(
   const timedOut = new Promise<"timed_out">((resolve) => {
     timer = setTimeout(() => resolve("timed_out"), Math.max(0, opts.deadlineAt - Date.now()) + 250);
   });
-  const raced = await Promise.race([
+  let raced: Awaited<ReturnType<typeof refreshHomepageContent>> | "timed_out";
+  try {
+    raced = await Promise.race([
     refreshHomepageContent(db, targets, {
       dryRun: true,
       deadlineAt: opts.deadlineAt,
@@ -439,6 +547,10 @@ export async function refreshOwnedProfile(
     }),
     timedOut,
   ]).finally(() => clearTimeout(timer));
+  } catch (err) {
+    // An unexpected throw in the extractor: a real outcome (stamped), not retried every night.
+    return { outcome: "failed", written: [], refused: [], detail: `refresh threw: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) };
+  }
   if (raced === "timed_out") return { outcome: "timeout", written: [], refused: [], transient: true, detail: HCR_DEADLINE_EXCEEDED };
   const err = raced.errors.find((e) => e.agent_id === row.id)?.error;
   if (err?.startsWith(HCR_DEADLINE_EXCEEDED)) return { outcome: "timeout", written: [], refused: [], transient: true, detail: HCR_DEADLINE_EXCEEDED };
@@ -447,22 +559,34 @@ export async function refreshOwnedProfile(
   if (err?.startsWith(HCR_THEME_SPAM_PAGE_ERROR) || spamCandidate) {
     return { outcome: "hijacked", written: [], refused: [], detail: HCR_THEME_SPAM_PAGE_ERROR };
   }
-  // A dead or blocked site is a real outcome (stamped: the retry window
-  // applies); a transient one (timeout, 5xx, 429 …) is tried again next night.
+  // A dead or blocked site and any other failure are real outcomes (stamped:
+  // the retry window applies); only a transient fetch failure (timeout, 5xx,
+  // 429 …) is tried again next night.
   if (err) {
     const fetchFailed = err.startsWith("fetch_failed");
     return {
       outcome: fetchFailed ? "fetch_failed" : "failed", written: [], refused: [], detail: err.slice(0, 200),
-      ...(!fetchFailed || err.includes("(transient)") ? { transient: true } : {}),
+      ...(fetchFailed && err.includes("(transient)") ? { transient: true } : {}),
     };
   }
+  // An about judge that could not answer (API outage, missing key): the
+  // about is undecided, so the profile is tried again next night.
+  const judgeUnavailable = raced.skipped_unsubstantiated.some((x) => x.agent_id === row.id && x.reason === HCR_ABOUT_REASON_JUDGE_UNAVAILABLE);
+  const undecided = judgeUnavailable ? { transient: true, detail: HCR_ABOUT_REASON_JUDGE_UNAVAILABLE } : {};
   const planned = (raced.planned_writes ?? []).filter((p) => p.agent_id === row.id);
-  if (planned.length === 0) return { outcome: "unchanged", written: [], refused: [] };
-  const r = applyOwnerRefreshWrites(db, row.id, planned, { runId: opts.runId, env: opts.env });
+  if (planned.length === 0) return { outcome: judgeUnavailable ? "judge_unavailable" : "unchanged", written: [], refused: [], ...undecided };
+  let r: OwnerRefreshWriteResult;
+  try {
+    r = applyOwnerRefreshWrites(db, row.id, planned, { runId: opts.runId, env: opts.env });
+  } catch (e) {
+    // The transaction rolled back. A real outcome: stamped, not retried (with its judge calls) every night.
+    return { outcome: "write_failed", written: [], refused: [], detail: (e instanceof Error ? e.message : String(e)).slice(0, 200) };
+  }
   return {
-    outcome: r.written.length > 0 ? "written" : "unchanged",
+    outcome: r.written.length > 0 ? "written" : judgeUnavailable ? "judge_unavailable" : "unchanged",
     written: r.written.map((w) => w.field),
     refused: r.refused,
+    ...undecided,
   };
 }
 
@@ -479,7 +603,8 @@ function writeRefusal(
   if (p.field === "description" && !aboutWritten) return "description_without_about";
   if (p.field !== "categories") {
     if (typeof p.column_value !== "string" || p.column_value.trim() === "") return "empty_value";
-    if (containsOrganicClaim(p.column_value)) return "organic_claim";
+    const prose = ownerRefreshProseRefusal(p.column_value);
+    if (prose) return prose;
   }
   return null;
 }

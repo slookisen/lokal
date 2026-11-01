@@ -1800,6 +1800,19 @@ export function ownerFeaturesEntryCardHtml(agentId: string): string {
 export const OWNER_AUTO_UPDATES_ANCHOR = "hold-oppdatert";
 export const OWNER_AUTO_UPDATES_KEY = "auto.updates";
 
+/**
+ * auto.updates is a Rett fra Bonden choice: the card and its POST follow the
+ * owner refresh's own vertical rule (services/rfb-owner-refresh.ts,
+ * COALESCE(vertical_id, 'rfb') = 'rfb').
+ */
+export function ownerAutoUpdatesAppliesTo(agentId: string): boolean {
+  try {
+    return !!getDb().prepare(`SELECT 1 AS x FROM agents WHERE id = ? AND COALESCE(vertical_id, 'rfb') = 'rfb'`).get(agentId);
+  } catch {
+    return false;
+  }
+}
+
 export function ownerAutoUpdatesCardHtml(agentId: string, value: OwnerFeatureValue): string {
   const e = getOwnerFeature(OWNER_AUTO_UPDATES_KEY);
   const group = OWNER_FEATURE_GROUPS.find((g) => g.key === e.group);
@@ -2021,7 +2034,7 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
     // card for every verified owner, allowlist or not — only with
     // OWNER_AUTO_UPDATES_ENABLED on (flag off = the portal is byte-identical to before).
     let autoUpdatesCardHtml = "";
-    if (ownerAutoUpdatesEnabled()) {
+    if (ownerAutoUpdatesEnabled() && ownerAutoUpdatesAppliesTo(agentId)) {
       try {
         if (isVerifiedOwner(agentId, session)) {
           autoUpdatesCardHtml = ownerAutoUpdatesCardHtml(agentId, resolveOwnerFeature("rfb", agentId, OWNER_AUTO_UPDATES_KEY, { db }).value);
@@ -2343,14 +2356,14 @@ router.post("/eier/:agentId/pause", express.urlencoded({ extended: false }), (re
 
 // ─────────────────────────────────────────────────────────────────
 // POST /eier/:agentId/hold-oppdatert   (form) — H2, see ownerAutoUpdatesCardHtml.
-// Flag off → 404, nothing written. Origin → session → verified owner, then
+// Flag off or not an RFB profile → 404, nothing written. Origin → session → verified owner, then
 // setOwnerFeatureValue (owner_feature_settings + its change-log row). A
 // hidden or unknown value is refused (invalid_value) and stores nothing.
 // ─────────────────────────────────────────────────────────────────
 router.post("/eier/:agentId/hold-oppdatert", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
   const agentId = String(req.params.agentId || "");
   const base = `/eier/${encodeURIComponent(agentId)}/portal`;
-  if (!ownerAutoUpdatesEnabled()) return res.status(404).json({ success: false, error: "not_found" });
+  if (!ownerAutoUpdatesEnabled() || !ownerAutoUpdatesAppliesTo(agentId)) return res.status(404).json({ success: false, error: "not_found" });
   if (isCrossSiteWrite(req, "/eier/:agentId/hold-oppdatert")) {
     return res.status(403).send(portalWriteRefusedPage(base));
   }

@@ -254,6 +254,12 @@ export interface OwnerFeatureEntry {
    * (the probe FAILs the row with the flag off, SWITCH_PROBE_FLAG_DEPENDENCIES).
    */
   liveFlag?: string;
+  /**
+   * With a liveFlag: what the entry was before it went live (default,
+   * options, since), used while the flag is off so the resolver and the
+   * owner API answer exactly as before (ownerFeatureEntryForEnv).
+   */
+  whileFlagOff?: Partial<Pick<OwnerFeatureEntry, "default" | "options" | "since">>;
   /** Sharing / marketing mention — off until the owner says yes. */
   consent: boolean;
   /** Triggers e-mail or other outbound contact (L4 / outreach rules apply). */
@@ -767,6 +773,17 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
     default: { owner: "fill_empty", unclaimed: "automatic" },
     status: "live",
     liveFlag: OWNER_AUTO_UPDATES_FLAG,
+    // Flag off: the pre-live catalog row (default «Foreslå til meg», all four options).
+    whileFlagOff: {
+      default: { owner: "suggest", unclaimed: "automatic" },
+      options: [
+        { value: "suggest", label: t("Foreslå til meg", "Suggest to me") },
+        { value: "fill_empty", label: t("Fyll tomme felt selv", "Fill empty fields yourself") },
+        { value: "never", label: t("Aldri", "Never") },
+        { value: "automatic", label: t("Oppdateres automatisk hver natt", "Updated automatically every night") },
+      ],
+      since: SINCE,
+    },
     since: "2026-11-01",
     devRequest: "2026-11-01-rfb-hold-profilen-oppdatert",
     surfaces: ["job:rfb_enrichment_nightly"],
@@ -1377,6 +1394,15 @@ export function getOwnerFeature(key: string, registry: OwnerFeatureEntry[] = OWN
 export function ownerFeatureStatus(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): OwnerFeatureStatus {
   if (e.liveFlag && !envFlagOn(env, e.liveFlag)) return "coming_soon";
   return e.status;
+}
+
+/**
+ * The entry as it applies now: while its liveFlag is off, with the pre-live
+ * default / options / since (whileFlagOff), so a flag-off answer is the one
+ * from before the entry went live. Otherwise the entry itself.
+ */
+export function ownerFeatureEntryForEnv(e: OwnerFeatureEntry, env: NodeJS.ProcessEnv = process.env): OwnerFeatureEntry {
+  return e.liveFlag && e.whileFlagOff && !envFlagOn(env, e.liveFlag) ? { ...e, ...e.whileFlagOff } : e;
 }
 
 /** A `choice` entry's options an owner may pick (hidden ones left out), in registry order. */

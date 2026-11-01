@@ -2527,8 +2527,9 @@ export interface HomepageContentRefreshOptions {
    * NEVER set by the route, the morning send or R6's content_refresh (unset =
    * byte-identical behaviour). Set only by the owner auto-updates refresh
    * (services/rfb-owner-refresh.ts, dev-request 2026-11-01-rfb-hold-
-   * profilen-oppdatert), and honoured ONLY together with dryRun: the
-   * extractors, guards, judges and write gate run as always, but
+   * profilen-oppdatert), and ONLY together with dryRun (set without it, the
+   * call throws before anything is fetched or written): the extractors,
+   * guards, judges and write gate run as always, but
    *   - a candidate whose field is not in this list is dropped before the
    *     about judges and the gate (no judge call for a field the owner's
    *     choice does not want), and `description` only goes with `about`
@@ -2949,6 +2950,11 @@ export async function refreshHomepageContent(
   opts: HomepageContentRefreshOptions,
 ): Promise<HomepageContentRefreshResult> {
   const dryRun = opts.dryRun;
+  // planOnlyFields hands the writes back to a caller that writes them itself:
+  // never a silent apply run with it.
+  if (opts.planOnlyFields && !dryRun) {
+    throw new Error("refreshHomepageContent: planOnlyFields is only allowed in a dry run");
+  }
   const fetchIo: HcrFetchIo | undefined =
     opts.deadlineAt !== undefined || opts.fetchImpl ? { deadlineAt: opts.deadlineAt, fetchImpl: opts.fetchImpl } : undefined;
   // dev-request 2026-10-27-rfb-berikelse-om-oss-sider-til-beskrivelse: the
@@ -2991,9 +2997,9 @@ export async function refreshHomepageContent(
   const aboutTally = { rejected: 0, not_supported: 0, not_better: 0, unavailable: 0 };
   const aboutJudges = opts.aboutJudges ?? hcrAboutJudgesOverride() ?? HCR_DEFAULT_ABOUT_JUDGES;
   const aboutJudgeTimeoutMs = aboutJudges.timeoutMs ?? HCR_ABOUT_JUDGE_TIMEOUT_MS;
-  // planOnlyFields (owner auto-updates refresh only, dry runs only): see
-  // HomepageContentRefreshOptions. null = every caller today, unchanged.
-  const planFields = dryRun && opts.planOnlyFields ? new Set(opts.planOnlyFields) : null;
+  // planOnlyFields (owner auto-updates refresh only, dry runs only — checked
+  // above): see HomepageContentRefreshOptions. null = every caller today, unchanged.
+  const planFields = opts.planOnlyFields ? new Set(opts.planOnlyFields) : null;
   const plannedWrites: HcrPlannedWrite[] = [];
 
   // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).

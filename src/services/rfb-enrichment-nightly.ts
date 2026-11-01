@@ -1969,7 +1969,6 @@ export async function buildRfbEnrichmentPreview(db: Db, now: Date): Promise<RfbE
   const ownerRefresh = ownerAutoUpdatesEnabled()
     ? await buildOwnerRefreshPreview(db, {
         nowMs: now.getTime(),
-        attempts: readRfbEnrichmentAttempts(db),
         fillEmptyRetryMs: resolveRfbEnrichmentRetryDays() * 86_400_000,
         cap: resolveOwnerRefreshCap(),
       })
@@ -2627,7 +2626,6 @@ async function runSteps(rc: RunContext): Promise<void> {
       try {
         const cohort = await loadOwnerRefreshCohort(db, {
           nowMs: now.getTime(),
-          attempts: readRfbEnrichmentAttempts(db),
           fillEmptyRetryMs: resolveRfbEnrichmentRetryDays() * 86_400_000,
         });
         const take = cohort.eligible.slice(0, orr.cap);
@@ -2663,7 +2661,9 @@ async function runSteps(rc: RunContext): Promise<void> {
               deps: rc.deps?.ownerRefresh,
             });
           } catch (err) {
-            out = { outcome: "error", written: [], refused: [], transient: true, detail: errMessage(err) };
+            // refreshOwnedProfile catches its own failures; anything that still
+            // throws is a real outcome too (stamped), never retried every night.
+            out = { outcome: "error", written: [], refused: [], detail: errMessage(err) };
           }
           // A refresh we stopped waiting for may still make its judge calls.
           const actual = meter.calls - callsBefore;

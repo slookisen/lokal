@@ -23,6 +23,7 @@ import {
   UnknownOwnerFeatureError,
   getOwnerFeature,
   findOwnerFeature,
+  ownerFeatureEntryForEnv,
   ownerFeatureStatus,
   visibleOwnerFeatureOptions,
   type LocalizedText,
@@ -279,7 +280,9 @@ class Resolver {
   }
 
   segmentDefault(e: OwnerFeatureEntry): OwnerFeatureValue {
-    return this.subject.segment === "owner" ? e.default.owner : e.default.unclaimed;
+    // A liveFlag entry with its flag off answers with its pre-live default (whileFlagOff).
+    const x = ownerFeatureEntryForEnv(e, this.env);
+    return this.subject.segment === "owner" ? x.default.owner : x.default.unclaimed;
   }
 
   /** The owner's explicit value: adapter column or stored row. undefined = none. */

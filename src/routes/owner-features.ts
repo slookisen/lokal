@@ -9,7 +9,7 @@ import {
 } from "./owner-portal";
 import { isCrossSiteWrite } from "../middleware/same-origin-write";
 import { isSubjectAllowedForOwnerFeatures } from "../owner-features/allowlist";
-import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, ownerFeatureStatus, visibleOwnerFeatureOptions, type OwnerFeatureEntry } from "../owner-features/registry";
+import { OWNER_FEATURE_GROUPS, OWNER_FEATURE_REGISTRY, ownerFeatureEntryForEnv, ownerFeatureStatus, visibleOwnerFeatureOptions, type OwnerFeatureEntry } from "../owner-features/registry";
 import {
   resolveOwnerFeatures,
   setOwnerFeatureValue,
@@ -100,7 +100,9 @@ function gate(req: Request): Gate {
   return { ok: true, agentId, token: session.token };
 }
 
-function featureJson(e: OwnerFeatureEntry, r: ResolvedOwnerFeature, subject: OwnerFeatureSubject) {
+function featureJson(entry: OwnerFeatureEntry, r: ResolvedOwnerFeature, subject: OwnerFeatureSubject) {
+  // A liveFlag entry with its flag off: the pre-live default / options / since.
+  const e = ownerFeatureEntryForEnv(entry);
   return {
     key: e.key,
     group: e.group,

@@ -67,6 +67,7 @@ import { getDb } from "../database/init";
 import {
   OWNER_FEATURE_REGISTRY,
   findOwnerFeature,
+  ownerFeatureStatus,
   visibleOwnerFeatureOptions,
   type OwnerFeatureEntry,
   type OwnerFeatureValue,
@@ -142,9 +143,10 @@ export const SWITCH_PROBE_FLAG_DEPENDENCIES: Readonly<Record<string, string>> = 
   "products.stock_check × email:stock_check": "STOCK_CHECK_EMAIL_ENABLED",
   "products.stock_check × job:stock_check": "STOCK_CHECK_EMAIL_ENABLED",
   "products.stock_check × owner_portal": "OWNER_ORDERABILITY_PORTAL_ENABLED",
-  // dev-request 2026-11-01-rfb-hold-profilen-oppdatert: the owner refresh
-  // (and the choice itself, liveFlag) only exist with the flag on.
-  "auto.updates × job:rfb_enrichment_nightly": "OWNER_AUTO_UPDATES_ENABLED",
+  // auto.updates needs no entry: its liveFlag makes it coming_soon while
+  // OWNER_AUTO_UPDATES_ENABLED is off, so the probe checks it as a planned
+  // entry then (409 coming_soon, no effect) and probes every option only
+  // with the flag on (liveEntries reads the run-time status).
 };
 const FLAG_OFF_REASON = "flag off in this environment";
 
@@ -1055,8 +1057,9 @@ export function defaultSwitchProbeReaders(): Record<string, SurfaceReaderDef> {
 
 // ── Plan ──────────────────────────────────────────────────────────────────
 
-function liveEntries(): OwnerFeatureEntry[] {
-  return OWNER_FEATURE_REGISTRY.filter((e) => e.status === "live");
+/** Entries live in this environment (ownerFeatureStatus: a liveFlag entry with its flag off is coming_soon). */
+function liveEntries(env: NodeJS.ProcessEnv): OwnerFeatureEntry[] {
+  return OWNER_FEATURE_REGISTRY.filter((e) => ownerFeatureStatus(e, env) === "live");
 }
 
 const PLANNED_CHECKS = [
@@ -1073,7 +1076,7 @@ const PLANNED_CHECKS = [
 export function planSwitchProbe(db: any, agentId: string, env: NodeJS.ProcessEnv = process.env, readers = defaultSwitchProbeReaders()): SwitchProbePlan {
   const resolved = resolveOwnerFeatures(VERTICAL, agentId, { db, env });
   const rows: SwitchProbePlanRow[] = [];
-  for (const e of liveEntries()) {
+  for (const e of liveEntries(env)) {
     const kind = entryKind(e);
     if (!kind) continue;
     const base = resolved.byKey[e.key]?.value ?? null;
@@ -1088,7 +1091,7 @@ export function planSwitchProbe(db: any, agentId: string, env: NodeJS.ProcessEnv
     segment: resolved.subject.segment,
     allowlisted: isSubjectAllowedForOwnerFeatures(VERTICAL, agentId, env),
     env_flags: envFlags(env),
-    baseline: liveEntries().map((e) => {
+    baseline: liveEntries(env).map((e) => {
       const r = resolved.byKey[e.key];
       return { key: e.key, status: e.status, type: e.type, value: displayValue(e, r.value), source: r.source, block: r.block };
     }),
@@ -1511,7 +1514,7 @@ async function probeGuarantee(c: Ctx, e: OwnerFeatureEntry): Promise<void> {
 function effectSignature(c: Ctx): string {
   const r = resolvedNow(c);
   const sig: Record<string, unknown> = {};
-  for (const e of liveEntries()) sig[e.key] = r.byKey[e.key]?.value ?? null;
+  for (const e of liveEntries(c.env)) sig[e.key] = r.byKey[e.key]?.value ?? null;
   for (const [id, def] of Object.entries(c.readers)) {
     if (!def.sync) continue;
     try { sig[id] = def.sync(c.readerCtx).endpoints; } catch (err: any) { sig[id] = `error: ${String(err?.message || err)}`; }
@@ -1549,7 +1552,7 @@ function otherValue(e: OwnerFeatureEntry, current: OwnerFeatureValue): OwnerFeat
 
 function checkComingSoon(c: Ctx): void {
   const r0 = resolvedNow(c);
-  for (const e of OWNER_FEATURE_REGISTRY.filter((x) => x.status === "coming_soon")) {
+  for (const e of OWNER_FEATURE_REGISTRY.filter((x) => ownerFeatureStatus(x, c.env) === "coming_soon")) {
     const cur = r0.byKey[e.key];
     const value = otherValue(e, cur?.value ?? null);
     const fp0 = settingsFingerprint(c.db, c.agentId);
@@ -1581,7 +1584,7 @@ class CheckRollback extends Error {
  * fixture's is_verified badge cleared (isVerifiedBadge).
  */
 function checkRequirements(c: Ctx): void {
-  for (const e of liveEntries()) {
+  for (const e of liveEntries(c.env)) {
     if (entryKind(e) !== "switch" || e.requires.length === 0) continue;
     const req = e.requires.find((r) => r === "isVerifiedBadge") ?? e.requires.find((r) => !!findOwnerFeature(r));
     if (!req) {
@@ -1659,7 +1662,7 @@ function checkLevels(c: Ctx, baseline: ResolvedOwnerFeatures): void {
 
 /** «Angre» on one switch restores the effect (every plain live switch). */
 async function checkUndoSingle(c: Ctx, baseline: ResolvedOwnerFeatures): Promise<void> {
-  for (const e of liveEntries()) {
+  for (const e of liveEntries(c.env)) {
     if (entryKind(e) !== "switch") continue;
     const b = baseline.byKey[e.key];
     if (!b || typeof b.value !== "boolean" || !b.changeable) continue;
@@ -1809,7 +1812,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
     c.readerCtx = readerContext(db, agentId, env);
     snap = snapshotFixture(db, agentId);
     const baseline = resolvedNow(c);
-    for (const e of liveEntries()) {
+    for (const e of liveEntries(env)) {
       const kind = entryKind(e);
       const b = baseline.byKey[e.key]?.value ?? null;
       if (e.surfaces.length === 0) {
@@ -1827,7 +1830,7 @@ export async function runSwitchProbe(agentId: string, opts: SwitchProbeOptions =
           pushRow(c, { key: e.key, surface: s, direction: "on", pass: false, observed: "—", expected: "—", ms_to_effect: null, write_status: null, change_logged: null, discriminating: false, reason: `typen ${e.type} støttes ikke av proben` });
         }
       }
-      restoreValues(c, baseline, liveEntries().map((x) => x.key));
+      restoreValues(c, baseline, liveEntries(env).map((x) => x.key));
     }
     checkComingSoon(c);
     checkRequirements(c);

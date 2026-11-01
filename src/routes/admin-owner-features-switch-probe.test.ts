@@ -490,12 +490,15 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       assertTrue(v.rows.filter((x) => x.key === "visibility.profile" && x.direction === "on").every((x) => x.result === "PASS"), "flags-8: … while «on» still PASSes");
       assertEq([v.restored, rawState(FIX)], [true, before], "flags-9: restored byte-identical");
       setBaseEnv();
-      // auto.updates without OWNER_AUTO_UPDATES_ENABLED: its rows FAIL «flag off» (the choice is coming_soon there).
+      // auto.updates without OWNER_AUTO_UPDATES_ENABLED (between deploy and flag-on): a planned
+      // entry like any other — no rows, one coming_soon check that PASSes — so the run reads 100 %.
       delete process.env.OWNER_AUTO_UPDATES_ENABLED;
-      const au = (await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 })).rows.filter((x) => x.key === "auto.updates");
-      assertTrue(au.length === 3 && au.every((x) => x.result === "FAIL" && /flag off in this environment \(OWNER_AUTO_UPDATES_ENABLED=unset\)/.test(x.reason || "")),
-        `flags-10: auto.updates rows FAIL «flag off» without OWNER_AUTO_UPDATES_ENABLED (${au.map((x) => `${x.direction}:${x.result}`).join(",")})`);
-      assertEq(rawState(FIX), before, "flags-11: restored byte-identical");
+      const flagOff = await probe.runSwitchProbe(FIX, { db, maxWaitMs: 0 });
+      const cs = flagOff.checks.find((x) => x.check === "coming_soon:auto.updates");
+      assertEq([flagOff.rows.filter((x) => x.key === "auto.updates").length, cs?.result, /→ 409 coming_soon/.test(cs?.observed ?? "")], [0, "PASS", true],
+        "flags-10: flag off — auto.updates has no rows and its coming_soon check PASSes (409 coming_soon, no effect)");
+      assertEq([flagOff.fail, flagOff.not_observable, flagOff.ready_for_daniel_test, flagOff.restored], [0, 0, true, true], "flags-11: flag off — the probe still reads 100 % (ready), restored");
+      assertEq(rawState(FIX), before, "flags-12: restored byte-identical");
       setBaseEnv();
     }
 

@@ -350,8 +350,14 @@ export async function runOwnerFeatureMatrixTests(opts: { log?: boolean } = {}): 
       });
     }
     // auto.updates: an empty category list (the field fill_empty may fill) —
-    // set here, so the producer is in no category list the other cases read.
+    // set here, so the producer is in no category list the other cases read —
+    // and an about / description an enrichment source recorded verbatim (the
+    // text automatic may replace: provably ours).
     db.prepare(`UPDATE agents SET categories = '[]' WHERE id = ?`).run(ids.autoUpdates);
+    db.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?`).run(JSON.stringify({
+      about: [{ source_type: "google_places", value: "Liten familiegård med grønnsaker og poteter fra egen jord." }],
+      description: [{ source_type: "google_places", value: "Testprodusent for valgmatrisen." }],
+    }), ids.autoUpdates);
     // S2e: the pause producer (rich profile so every list surface shows it today;
     // its own city, so llms.txt's 1–2 samples per city include it).
     const VIS_ID = "mx-vis-pause";
