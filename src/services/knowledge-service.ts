@@ -1110,6 +1110,36 @@ class KnowledgeService {
   isSharedKnownEmail(address: string, knownHolderId?: string): boolean {
     const target = normalizeEmail(address);
     if (!isSingleEmailAddress(target)) return false;
+    const candidates = this.knownEmailCandidates(target, knownHolderId);
+    if (candidates.size < 2) return false;
+    let hits = 0;
+    for (const id of candidates) {
+      if (this.resolveFarmContactEmail(id) === target && ++hits > 1) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The profiles OTHER than `excludeId` whose known farm e-mail
+   * (resolveFarmContactEmail) is `address` — isSharedKnownEmail's own rule
+   * and candidate set, read-only. POST /admin/test-claim-fixture uses it so
+   * the claim-test fixture is never given an address its claims would meet
+   * as `shared_address` (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-
+   * e-post, AC6). [] for an address that is not one valid address.
+   */
+  knownEmailHoldersOtherThan(address: string, excludeId: string): string[] {
+    const target = normalizeEmail(address);
+    if (!isSingleEmailAddress(target)) return [];
+    const holders: string[] = [];
+    for (const id of this.knownEmailCandidates(target)) {
+      if (id !== excludeId && this.resolveFarmContactEmail(id) === target) holders.push(id);
+    }
+    return holders;
+  }
+
+  /** isSharedKnownEmail's candidate profiles for a normalized address (each
+   *  still to be confirmed with resolveFarmContactEmail). */
+  private knownEmailCandidates(target: string, knownHolderId?: string): Set<string> {
     const db = getDb();
     // The claimed profile itself, when its known e-mail is the address (rule 1):
     // a candidate regardless of the LIMIT below, so stale outreach rows cannot
@@ -1133,12 +1163,7 @@ class KnowledgeService {
     } catch (err) {
       console.warn(`[claim] shared-address outreach lookup failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (candidates.size < 2) return false;
-    let hits = 0;
-    for (const id of candidates) {
-      if (this.resolveFarmContactEmail(id) === target && ++hits > 1) return true;
-    }
-    return false;
+    return candidates;
   }
 
   /**

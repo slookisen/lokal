@@ -1268,7 +1268,7 @@ function buildSelectionContext(
     attempts,
     brregCandidateIds: idSet(
       db,
-      `SELECT a.id AS id FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE ${rfbBssCandidateWhereSql()}`,
+      `SELECT a.id AS id FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id WHERE ${rfbBssCandidateWhereSql(db)}`,
     ),
     cxEligibleIds: idSet(db, rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE)),
     pendingQueueAgentIds: idSet(db, `SELECT agent_id AS id FROM agents_website_review_queue WHERE status = 'pending'`),

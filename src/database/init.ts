@@ -5546,11 +5546,17 @@ function initSchema(db: Database.Database): void {
   // direct-id order-flow path (/catalog/agents/:id/products, cart add/submit,
   // /produsent/ordre/:token, admin inbox) keeps working. Same idea as
   // experience_providers.catalog_hidden. DEFAULT 0, so every existing row is a
-  // no-op. The ONE place that reads it is services/agent-visibility.ts. The
-  // only writer is POST /admin/test-producer (routes/admin-test-producer.ts),
-  // which only ever touches the single origin='test_fixture' row.
-  // Rollback: the column is additive and may stay; retire the fixture with the
-  // endpoint (or UPDATE agents SET is_active=0 WHERE origin='test_fixture').
+  // no-op. The ONE place that reads it is services/agent-visibility.ts. There
+  // are exactly two writers, each pinned to its own single fixture row:
+  //   * POST /admin/test-producer (routes/admin-test-producer.ts) — the order
+  //     fixture, origin='test_fixture';
+  //   * POST /admin/test-claim-fixture (routes/admin-test-claim-fixture.ts,
+  //     dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6) — the
+  //     unclaimed claim-test fixture, origin='test_claim_fixture', which GET
+  //     /api/marketplace/agents/:id/info alone serves while it is armed.
+  // Rollback: the column is additive and may stay; retire a fixture with its
+  // endpoint (or UPDATE agents SET is_active=0 WHERE origin IN
+  // ('test_fixture','test_claim_fixture')).
   try {
     db.exec(`ALTER TABLE agents ADD COLUMN catalog_hidden INTEGER NOT NULL DEFAULT 0`);
   } catch { /* already exists — expected */ }

@@ -104,6 +104,7 @@ import {
 // POST /register contact-field write for the closest sibling pattern) —
 // reused here rather than reinvented.
 import { mergeFieldProvenance } from "./admin-knowledge";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 import { extractGardssalgContactEmail, gardssalgContactPageLinks, homepageRegistrableDomain, gardssalgPageText } from "../services/experience-store";
 import { fetchPage, DEFAULT_FETCH_TIMEOUT_MS, MAX_RETRY_AFTER_WAIT_MS } from "../services/fetch-page";
 import { hostFromUrlLike, FREE_MAIL_DOMAINS } from "../services/cross-source-validator";
@@ -266,9 +267,17 @@ export const RFB_CX_ELIGIBLE_WHERE = `
   )
 `;
 
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the four
+// selectors below never pick a catalog_hidden test row (the order fixture, or
+// the unclaimed claim-test fixture, whose agent_knowledge.email is where its
+// claim codes go — an owner may have set a website during a test, and arm
+// does not clear it). catalogHiddenIdExclusionSql, the verifier's own
+// exclusion; "" (the exact SQL as before) when no row is hidden. The exported
+// RFB_CX_ELIGIBLE_WHERE / rfbCxSelectSql are unchanged: the nightly job's own
+// batch is already publicListableSql-filtered.
 function selectRfbCxTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxTargetRow[] {
   return db
-    .prepare(`${rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${rfbCxSelectSql(RFB_CX_ELIGIBLE_WHERE + catalogHiddenIdExclusionSql(db, "a"))} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(limit) as RfbCxTargetRow[];
 }
 
@@ -276,7 +285,7 @@ function selectRfbCxTargetsByIds(db: ReturnType<typeof getDb>, ids: string[]): R
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
-    .prepare(`${rfbCxSelectSql(`${RFB_CX_ELIGIBLE_WHERE} AND a.id IN (${placeholders})`)}`)
+    .prepare(`${rfbCxSelectSql(`${RFB_CX_ELIGIBLE_WHERE}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
     .all(...ids) as RfbCxTargetRow[];
   // Preserve caller order, same convention as the sibling discovery route's
   // agentIds handling.
@@ -310,7 +319,7 @@ const RFB_CX_BACKFILL_ELIGIBLE_WHERE = `
 
 function selectRfbCxBackfillTargets(db: ReturnType<typeof getDb>, limit: number): RfbCxTargetRow[] {
   return db
-    .prepare(`${rfbCxSelectSql(RFB_CX_BACKFILL_ELIGIBLE_WHERE)} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
+    .prepare(`${rfbCxSelectSql(RFB_CX_BACKFILL_ELIGIBLE_WHERE + catalogHiddenIdExclusionSql(db, "a"))} ORDER BY a.created_at ASC, a.id ASC LIMIT ?`)
     .all(limit) as RfbCxTargetRow[];
 }
 
@@ -318,7 +327,7 @@ function selectRfbCxBackfillTargetsByIds(db: ReturnType<typeof getDb>, ids: stri
   if (ids.length === 0) return [];
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
-    .prepare(`${rfbCxSelectSql(`${RFB_CX_BACKFILL_ELIGIBLE_WHERE} AND a.id IN (${placeholders})`)}`)
+    .prepare(`${rfbCxSelectSql(`${RFB_CX_BACKFILL_ELIGIBLE_WHERE}${catalogHiddenIdExclusionSql(db, "a")} AND a.id IN (${placeholders})`)}`)
     .all(...ids) as RfbCxTargetRow[];
   const byId = new Map(rows.map((r) => [r.id, r]));
   return ids.map((id) => byId.get(id)).filter((r): r is RfbCxTargetRow => !!r);

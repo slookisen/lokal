@@ -66,6 +66,7 @@ import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { decodePunycodeLabel, transliterateNorwegian } from "../services/cross-source-validator";
 import { braveSearch, pageLooksLikeThemeSpam, type BraveResult } from "../services/search-enrich";
 import { mergeFieldProvenance } from "./admin-knowledge";
+import { catalogHiddenIdExclusionSql } from "../services/agent-visibility";
 // dev-request 2026-08-20-enrichment-write-pause-mekanisk-gjerde — the
 // mechanical fence. `getDb` is passed as a THUNK (never `getDb()`) so a
 // getDb() that throws fails closed as a 423 instead of escaping as a 500.
@@ -414,7 +415,13 @@ interface RfbWdTargetRow {
 // been a discovery candidate. Measured 2026-08-13
 // (enrichment-reports/2026-08-13-websoek-jakt-wrong-contact-og-wilsgaard.md,
 // Funn A): 64% of the then-current discovery queue (30/47) were such rows.
-function rfbWdSelectSql(extraWhere: string): string {
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post (AC6): the
+// catalog_hidden test rows (the order fixture and the unclaimed claim-test
+// fixture) are never selected — not by the batch modes, not by an agentIds
+// override — so no website (and through it no harvested e-mail) is ever
+// proposed for them. catalogHiddenIdExclusionSql, the verifier's own
+// exclusion; "" (the exact SQL as before) when no row is hidden.
+function rfbWdSelectSql(db: ReturnType<typeof getDb>, extraWhere: string): string {
   return `
     SELECT a.id AS id, a.name AS name, a.org_nr AS org_nr, a.city AS city,
            k.postal_code AS postal_code, k.phone AS phone, k.address AS address,
@@ -423,7 +430,7 @@ function rfbWdSelectSql(extraWhere: string): string {
       JOIN agent_knowledge k ON k.agent_id = a.id
      WHERE a.role = 'producer'
        AND COALESCE(a.vertical_id, 'rfb') = 'rfb'
-       AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
+       AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */${catalogHiddenIdExclusionSql(db, "a")}
        ${extraWhere}
   `;
 }
@@ -441,7 +448,7 @@ function rfbWdSelectSql(extraWhere: string): string {
 function selectRfbWebsiteDiscoveryTargets(db: ReturnType<typeof getDb>, limit: number): RfbWdTargetRow[] {
   return db
     .prepare(
-      `${rfbWdSelectSql(
+      `${rfbWdSelectSql(db,
         `AND k.verification_status IN ('pending_verify','review_required')
          AND (k.website IS NULL OR TRIM(k.website) = '')`,
       )} ORDER BY RANDOM() LIMIT ?`,
@@ -464,7 +471,7 @@ function selectRfbWebsiteDiscoveryTargets(db: ReturnType<typeof getDb>, limit: n
 function selectRfbWebsiteReplacementTargets(db: ReturnType<typeof getDb>, limit: number): RfbWdTargetRow[] {
   const rows = db
     .prepare(
-      `${rfbWdSelectSql(`AND k.website IS NOT NULL AND TRIM(k.website) != ''`)} ORDER BY a.created_at ASC, a.id ASC`,
+      `${rfbWdSelectSql(db, `AND k.website IS NOT NULL AND TRIM(k.website) != ''`)} ORDER BY a.created_at ASC, a.id ASC`,
     )
     .all() as RfbWdTargetRow[];
   const out: RfbWdTargetRow[] = [];
@@ -484,7 +491,7 @@ function selectRfbWebsiteReplacementTargets(db: ReturnType<typeof getDb>, limit:
 // on any RFB producer agent; already-has-a-website is still enforced, just
 // reported as `already_has_website` rather than silently omitted.
 function getRfbWebsiteDiscoveryTarget(db: ReturnType<typeof getDb>, agentId: string): RfbWdTargetRow | null {
-  const row = db.prepare(`${rfbWdSelectSql("AND a.id = @id")}`).get({ id: agentId }) as RfbWdTargetRow | undefined;
+  const row = db.prepare(`${rfbWdSelectSql(db, "AND a.id = @id")}`).get({ id: agentId }) as RfbWdTargetRow | undefined;
   return row ?? null;
 }
 

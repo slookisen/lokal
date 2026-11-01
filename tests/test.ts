@@ -51340,6 +51340,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6 (option A):
+// POST /admin/test-claim-fixture — ONE hidden, unclaimed claim-test profile;
+// GET /agents/:id/info is its only public exception; the claim flow end to end
+// (selger.html in node:vm), reset, retire, the write pins, the pipeline
+// exclusions and POST /admin/test-producer unchanged. Swaps getDb(), env, the
+// mail transport, global fetch and the pipeline seams (restored in finally) —
+// runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post AC6: POST /admin/test-claim-fixture ──");
+  try {
+    const { runAdminTestClaimFixtureTests } = require("../src/routes/admin-test-claim-fixture.test") as
+      typeof import("../src/routes/admin-test-claim-fixture.test");
+    const r = await runAdminTestClaimFixtureTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("admin-test-claim-fixture: " + f);
+    console.log(`  admin-test-claim-fixture: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-test-claim-fixture: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-mine-valg-eierbrytere S2d-2 (AC22): «Vis som
 // offentlig» — X-Admin-Key + ?as_public=1 evaluates the hidden test fixture as
 // public on the covered surfaces (no-store, noindex, no shared cache), owner
