@@ -234,7 +234,9 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       ok(err.includes(BOX_LABEL) && err.includes("manuell godkjenning"), "AC1: … and points to the «feil e-post» box for manual approval");
       ok(Math.abs(Date.parse(other.body?.data?.retryAt) - retryAt) < 1000, "AC1: … data.retryAt is the send time + 24 h");
       ok(!err.includes(masked) && !err.includes("post@gard-k1"), "AC1: … and does not show the farm address to someone else");
-      ok(err.includes("skriv inn samme e-postadresse som da"), "k1: … while the code is open, the one who asked is told the same e-mail brings the code field back");
+      eq(err, `Det er alt sendt en kode til gårdens e-post. En ny kode kan sendes ${formatClaimTime(new Date(retryAt))}. ` +
+        `Har du ikke tilgang til gårdens e-post, eller er adressen på profilen feil? Kryss av for «${BOX_LABEL}», så går kravet til manuell godkjenning.`,
+        "AC1: … exactly the spec's three points — no hint to strangers on how to get the open code back");
       eq([mails.length, claimsOf("k1").length], [mailsBefore, rowsBefore], "AC1: … no mail, no row");
 
       // The queue rules still come first: the box takes the same claimant to manual approval.
@@ -270,7 +272,14 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       const b2 = await claim("k1-burn", { name: "B", email: "b@k1-burn.example.test" });
       eq(b2.status, 429, "k1: the same e-mail after 5 wrong codes → 429 (the expired claim is not resumed)");
       ok(String(b2.body?.error).includes(`En ny kode kan sendes ${opens}.`), "k1: … with the time the slot opens");
-      ok(!String(b2.body?.error).includes("samme e-postadresse"), "k1: … and no «same e-mail» hint, since that code can no longer be taken");
+      // The locked claim, asked again (early «expired» branch): the same time, not «be om en ny kode» into a 429.
+      const again = await verify("k1-burn", b.body.data.claimId, right);
+      eq([again.body?.data?.status, again.body?.error], ["expired", `For mange feil koder. Kravet er utløpt. Du kan be om en ny kode fra butikksiden ${opens}.`],
+        "k3: verifying the locked claim again says it was locked and when a new code can come");
+      const lockedResend = await resend("k1-burn", b.body.data.claimId);
+      eq([lockedResend.status, lockedResend.body?.data?.reason, lockedResend.body?.error],
+        [400, "closed", `Koden er ikke lenger gyldig. Du kan be om en ny kode fra butikksiden ${opens}.`],
+        "rs: resend on the locked claim → closed, with when a new code can come");
 
       // An owner meanwhile: rule 3 (queue) before the resume.
       agent("k1-own", "post@k1-own.example.test");
@@ -348,6 +357,40 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       sentAgo(o1.body.data.claimId, 11 * MIN);
       db.prepare("UPDATE agents SET claimed_at = ?, claimed_via = 'admin' WHERE id = 'rs-owner'").run(new Date().toISOString());
       eq((await resend("rs-owner", o1.body.data.claimId)).body?.data?.reason, "not_allowed", "rs: the profile got an owner meanwhile → refused (rule 3)");
+
+      // A typed address in the resend body is ignored: the mail goes to code_sent_to.
+      agent("rs-typed", "post@rs-typed.example.test");
+      const t1 = await claim("rs-typed", { name: "T", email: "t@x.example.test" });
+      sentAgo(t1.body.data.claimId, 11 * MIN);
+      before = mails.length;
+      const typed = await invoke(resendH, makeReq({ params: { id: "rs-typed" }, body: { claimId: t1.body.data.claimId, email: "angriper@evil.example.test" } }));
+      eq([typed.status, mails.length, mails[mails.length - 1]?.to], [200, before + 1, "post@rs-typed.example.test"],
+        "rs: a typed body.email is ignored — the resend goes to the stored farm address only");
+
+      // The farm address became shared (another RFB profile lists it) since the send.
+      agent("rs-shared", "post@rs-shared.example.test");
+      const s1 = await claim("rs-shared", { name: "S", email: "s@x.example.test" });
+      sentAgo(s1.body.data.claimId, 11 * MIN);
+      agent("rs-shared-twin", "post@rs-shared.example.test");
+      before = mails.length;
+      const shared = await resend("rs-shared", s1.body.data.claimId);
+      eq([shared.status, shared.body?.data?.reason, mails.length], [409, "not_allowed", before], "rs: the farm address became shared since the send → 409 not_allowed, no mail");
+
+      // Neither the handback nor a resend gives wrong-code tries back.
+      agent("rs-tries", "post@rs-tries.example.test");
+      const w1 = await claim("rs-tries", { name: "W", email: "w@x.example.test" });
+      const wId = w1.body.data.claimId;
+      const wWrong = codeIn(mails[mails.length - 1]) === "999999" ? "999998" : "999999";
+      await verify("rs-tries", wId, wWrong);
+      await verify("rs-tries", wId, wWrong);
+      eq(claimRow(wId).failed_attempts, 2, "rs: setup — two wrong codes");
+      const handback = await claim("rs-tries", { name: "W", email: "w@x.example.test" });
+      eq([handback.body?.data?.status, claimRow(wId).failed_attempts], ["code_already_sent", 2], "rs: a code_already_sent handback leaves failed_attempts as it was");
+      sentAgo(wId, 11 * MIN);
+      const triesResend = await resend("rs-tries", wId);
+      eq([triesResend.status, claimRow(wId).failed_attempts], [200, 2], "rs: a resend leaves failed_attempts as it was");
+      eq((await verify("rs-tries", wId, wWrong)).body?.data?.attemptsLeft, 2, "rs: … so the next wrong code leaves 2 tries, not 4");
+      freePlatformCap();
 
       // A failed send gives the resend back.
       agent("rs-fail", "post@rs-fail.example.test");
@@ -450,7 +493,15 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       db.prepare("UPDATE agent_claims SET expires_at = ? WHERE id = ?").run(ago(MIN), e.body.data.claimId);
       const exp = await verify("k3-exp", e.body.data.claimId, codeIn(mails[mails.length - 1]));
       answers.push(["expired", exp]);
-      eq([exp.body?.data?.status, exp.body?.error], ["expired", "Koden er utløpt. Be om en ny kode fra butikksiden."], "k3: an expired code → ask for a new one");
+      // Out of time while rule 4 still holds the slot (sent just now): from when.
+      const eOpens = formatClaimTime(new Date(Date.parse(claimRow(e.body.data.claimId).created_at) + 24 * HOUR));
+      eq([exp.body?.data?.status, exp.body?.error], ["expired", `Koden er utløpt. Du kan be om en ny kode fra butikksiden ${eOpens}.`],
+        "k3: an expired code while the window is open → ask for a new one from when the slot opens");
+      // After the window: just ask (the early «expired» branch, not locked).
+      db.prepare("UPDATE agent_claims SET created_at = ? WHERE id = ?").run(ago(25 * HOUR), e.body.data.claimId);
+      const expLater = await verify("k3-exp", e.body.data.claimId, "123456");
+      answers.push(["expired, window passed", expLater]);
+      eq(expLater.body?.error, "Koden er utløpt. Be om en ny kode fra butikksiden.", "k3: … after the window, ask for a new one");
       db.prepare("UPDATE agent_claims SET status = 'superseded' WHERE id = ?").run(e.body.data.claimId);
       const sup = await verify("k3-exp", e.body.data.claimId, "123456");
       answers.push(["superseded", sup]);
@@ -490,6 +541,16 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       eq(formatClaimTime(new Date("2026-11-01T23:30:00Z"), now), "i morgen kl. 00:30", "fmt: past midnight in Oslo is tomorrow");
       eq(formatClaimTime(new Date("2026-11-03T08:00:00Z"), now), "3. november kl. 09:00", "fmt: a later day by date");
       eq(formatClaimTime(new Date("2026-07-01T10:00:00Z"), new Date("2026-07-01T09:00:00Z")), "i dag kl. 12:00", "fmt: summer time (UTC+2)");
+      // «I morgen» is the next Oslo calendar date, also around a DST change
+      // (2026: spring forward Sun 29 March, fall back Sun 25 October).
+      eq(formatClaimTime(new Date("2026-03-29T20:00:00Z"), new Date("2026-03-28T22:30:00Z")), "i morgen kl. 22:00",
+        "fmt: Sat 23:30 before spring forward → Sun 22:00 (a 23-hour day) is «i morgen»");
+      eq(formatClaimTime(new Date("2026-03-28T22:45:00Z"), new Date("2026-03-28T22:30:00Z")), "i dag kl. 23:45", "fmt: … and 23:45 the same evening is «i dag»");
+      eq(formatClaimTime(new Date("2026-03-29T22:30:00Z"), new Date("2026-03-28T22:30:00Z")), "30. mars kl. 00:30", "fmt: … Monday 00:30 is not «i morgen»");
+      eq(formatClaimTime(new Date("2026-10-25T22:30:00Z"), new Date("2026-10-24T20:00:00Z")), "i morgen kl. 23:30",
+        "fmt: Sat 22:00 before fall back → Sun 23:30 (CET) is «i morgen»");
+      eq(formatClaimTime(new Date("2026-10-25T23:30:00Z"), new Date("2026-10-24T22:30:00Z")), "i morgen kl. 00:30",
+        "fmt: Sun 00:30 CEST on the 25-hour day → Mon 00:30 CET is «i morgen» (now + 24 h would still be Sunday)");
     }
 
     // ══ (ui) selger.html against the real handlers ══════════════════════════
@@ -540,7 +601,10 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
         const step2Hidden = track(page, "claimStep2", true);
         const step2bHidden = track(page, "claimStep2b", true);
         vm.runInContext(script, page.context, { filename: SCRIPT_FILE });
-        return { page, codeStepShown: () => !step2bHidden() && step2Hidden(), formShown: () => !step2Hidden() };
+        return {
+          page, codeStepShown: () => !step2bHidden() && step2Hidden(), formShown: () => !step2Hidden(),
+          formOnly: () => !step2Hidden() && step2bHidden(),
+        };
       }
       async function requestCode(p: ReturnType<typeof open>, agentId: string, email: string) {
         p.page.context.startClaimFlow(agentId, `Gård ${agentId}`);
@@ -639,8 +703,20 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
         "ui: … with the server's message");
       eq(phoneStore.open()?.claimId, id4, "ui: … and the claim is kept on that device too");
 
-      // ── «Send koden på nytt» on the page ──
+      // ── a stranger's rule-4 answer stays on the form (not gone after 5 s) ──
+      const stranger = open(`?agent=${UI4}`, storage());
+      await settle();
+      await requestCode(stranger, UI4, "kari@annen.example.test");
+      stranger.page.runTimers(60_000);
+      const strangerAlert = stranger.page.el("claimAlert").innerHTML;
+      ok(strangerAlert.startsWith('<div class="alert alert-error">Det er alt sendt en kode til gårdens e-post.') && strangerAlert.includes("feil eller utdatert"),
+        "ui: the rule-4 answer in the claim form is still shown after the 5-second timers have run");
+
+      // ── «Send koden på nytt» on the page: disabled until it opens (10 min after the send) ──
+      eq(phone.page.el("btnResendClaimCode").disabled, true, "ui: «Send koden på nytt» is disabled until 10 minutes after the first send");
       sentAgo(id4, 11 * MIN);
+      phone.page.runTimers(10 * 60_000 + 1000);
+      eq(phone.page.el("btnResendClaimCode").disabled, false, "ui: … and enabled when that time comes");
       const resendMails = mails.length;
       phone.page.el("btnResendClaimCode").click();
       await settle();
@@ -650,6 +726,29 @@ export async function runRfbClaimKravflytTests(opts: { log?: boolean } = {}): Pr
       const phone2 = open(`?agent=${UI4}`, phoneStore);
       await settle();
       eq([phone2.codeStepShown(), phone2.page.el("btnResendClaimCode").style.display], [true, "none"], "ui: a reload restores the code field without the used resend");
+
+      // ── the way back: the code went to an address the owner cannot read ──
+      const backStore = storage({ rfb_open_claim: phoneStore.map.get("rfb_open_claim")! });
+      const stuck = open(`?agent=${UI4}`, backStore);
+      await settle();
+      eq(stuck.codeStepShown(), true, "P2: setup — the kept claim opens the code step");
+      stuck.page.el("btnClaimBack").click();
+      eq([stuck.formOnly(), backStore.open(), stuck.page.context.claimId, stuck.page.el("verifyAlert").innerHTML], [true, null, null, ""],
+        "P2: «Har du ikke tilgang til denne e-posten? Gå tilbake» clears rfb_open_claim and shows the form again");
+      const reopened = open(`?agent=${UI4}`, backStore);
+      await settle();
+      eq([reopened.codeStepShown(), reopened.page.el("singleStore").style.display], [false, ""], "P2: … a reload then shows the store card, not the code field");
+      reopened.page.el("btnSingleStoreClaim").click();
+      reopened.page.el("claimName").value = "Ola";
+      reopened.page.el("claimEmail").value = "ola@ui4.example.test";
+      reopened.page.el("claimListedEmailWrong").checked = true;
+      reopened.page.el("btnRequestClaim").click();
+      await settle();
+      eq(claimsOf(UI4).some((c) => c.status === "pending_review" && c.review_reason === "listed_email_wrong"), true,
+        "P2: … and the «feil e-post» box on that form takes the claim to manual approval");
+      const pageHtml = fs.readFileSync(path.join(__dirname, "..", "public", "selger.html"), "utf8");
+      const backAt = pageHtml.search(/id="btnClaimBack"[^>]*>Har du ikke tilgang til denne e-posten\? Gå tilbake<\/button>/);
+      ok(backAt > pageHtml.indexOf('id="claimStep2b"') && backAt < pageHtml.indexOf('id="viewDashboard"'), "P2: the link sits in the code step with the agreed text");
 
       // ── the search path restores too; a store with an owner now drops it ──
       const viaSearch = open("", storage({ rfb_open_claim: phoneStore.map.get("rfb_open_claim")! }));

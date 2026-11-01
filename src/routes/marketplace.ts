@@ -1823,16 +1823,13 @@ function claimCodeDestination(via: ClaimCodeRoute | undefined, sentTo?: string):
  * Rule 4's answer to someone who is NOT the claimant with the open code (the
  * same claimant gets that claim back, K1): what has happened, when a new code
  * can be sent, and the way to manual approval for someone without access to
- * the farm's e-mail. It never says "use the code": the asker may not be the
- * one it went to. While that code is still open, the one who asked for it is
- * told that the same e-mail brings the code field back.
+ * the farm's e-mail. It never says "use the code", nor how to get the open
+ * code back: the asker may not be the one it went to.
  */
-function claimProfileRateLimitedMessage(retryAt: string | undefined, via: ClaimCodeRoute | undefined, codeOpen: boolean): string {
+function claimProfileRateLimitedMessage(retryAt: string | undefined, via: ClaimCodeRoute | undefined): string {
   const at = retryAt ? Date.parse(retryAt) : NaN;
   const when = Number.isFinite(at) ? `En ny kode kan sendes ${formatClaimTime(new Date(at))}.` : "En ny kode kan ikke sendes ennå.";
-  return `Det er alt sendt en kode til ${claimCodeDestination(via)}. ${when} ` +
-    (codeOpen ? "Var det du som ba om koden, skriv inn samme e-postadresse som da, så får du opp kodefeltet igjen. " : "") +
-    CLAIM_LISTED_EMAIL_WRONG_HINT;
+  return `Det er alt sendt en kode til ${claimCodeDestination(via)}. ${when} ${CLAIM_LISTED_EMAIL_WRONG_HINT}`;
 }
 
 /** K1 «Send koden på nytt» refusals: what happened and what to do next. */
@@ -1842,7 +1839,13 @@ function claimResendRefusedMessage(reason: ClaimResendRefusal, retryAt?: string)
     case "verified": return "Kravet er allerede bekreftet, og profilen er tatt over. Logg inn med e-post under «Allerede registrert?», så sender vi deg en innloggingslenke.";
     case "pending_review": return "Kravet venter på manuell godkjenning, så det sendes ingen kode.";
     case "closed":
-    case "expired": return "Koden er ikke lenger gyldig. Be om en ny kode fra butikksiden.";
+    case "expired": {
+      // While rule 4 still holds the profile's slot, say from when (no straight 429).
+      const at = retryAt ? Date.parse(retryAt) : NaN;
+      return Number.isFinite(at)
+        ? `Koden er ikke lenger gyldig. Du kan be om en ny kode fra butikksiden ${formatClaimTime(new Date(at))}.`
+        : "Koden er ikke lenger gyldig. Be om en ny kode fra butikksiden.";
+    }
     case "already_resent": return `Koden er alt sendt på nytt én gang. Sjekk søppelpost og uønsket e-post. ${CLAIM_LISTED_EMAIL_WRONG_HINT}`;
     case "too_early": {
       const at = retryAt ? Date.parse(retryAt) : NaN;
@@ -1948,7 +1951,7 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
     }
     if (result.kind === "rate_limited") {
       const error = result.scope === "profile"
-        ? claimProfileRateLimitedMessage(result.retryAt, result.via, result.codeOpen === true)
+        ? claimProfileRateLimitedMessage(result.retryAt, result.via)
         : CLAIM_RATE_LIMITED_MESSAGES[result.scope];
       res.status(429).json({ success: false, error, ...(result.retryAt ? { data: { retryAt: result.retryAt } } : {}) });
       return;
