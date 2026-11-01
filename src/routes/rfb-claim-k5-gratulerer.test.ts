@@ -19,6 +19,12 @@
  *            opens /eier/:id/portal for an owner whose address differs from
  *            agent_knowledge.email — gate off and on; the link works once; an
  *            unused or expired link is no session.
+ *   (selger) the claim link is only for /magic-link-verify: the /selger
+ *            magic-link verifier (/api/marketplace/auth/magic-verify, behind
+ *            /auth/m/<token> and /selger?magic=) refuses it and leaves it
+ *            unused, so it never becomes a cookie / Bearer session; a claim
+ *            row left used and unexpired is no session either; ml_, mlsess_
+ *            and mlbridge_ rows and the /selger login work as before.
  *   (login)  request-magic-link accepts the verified claimant's address
  *            (normalized) and still agent_knowledge.email; refuses an unrelated
  *            address, a pending_review / code_sent / rejected claim's address
@@ -112,6 +118,7 @@ export async function runRfbClaimK5GratulererTests(opts: { log?: boolean } = {})
       const app = express();
       app.use(express.json());
       app.use("/admin/agents", adminAgentsRouter);
+      app.use("/api/marketplace", (require("./marketplace") as typeof import("./marketplace")).default);
       app.use("/", ownerPortal.default);
       server = http.createServer(app);
       await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", () => resolve()));
@@ -292,8 +299,9 @@ export async function runRfbClaimK5GratulererTests(opts: { log?: boolean } = {})
       eq((await portal("k5-a", mailedToken)).status, 302, "verify: … nor as a cookie");
 
       // The race guard: a link another request marked used a moment ago (used =
-      // 1, not yet expired — a concurrent click, or the /selger magic-link
-      // verifier on the same table) opens no second session.
+      // 1, not yet expired — a concurrent click, or a row the /selger
+      // magic-link verifier marked used before it ignored claim links, see
+      // (selger)) opens no second session.
       const raced = ownerPortal.createOwnerLoginLink("k5-a", APPROVED, "claim_approval");
       db.prepare("UPDATE magic_links SET used = 1 WHERE token = ?").run(raced.token);
       const sessionsBefore = (db.prepare("SELECT COUNT(*) AS n FROM magic_links WHERE id LIKE 'mlsess_%'").get() as { n: number }).n;
@@ -307,6 +315,90 @@ export async function runRfbClaimK5GratulererTests(opts: { log?: boolean } = {})
       const lv = await req("GET", `/magic-link-verify?token=${late.token}`);
       eq([lv.status, lv.location, sessionFrom(lv)], [302, "/?error=invalid_token", ""], "verify: an expired claim link opens nothing");
       db.prepare("DELETE FROM magic_links WHERE token = ?").run(late.token);
+    }
+
+    // ══ (selger) the claim link is no /selger login and never a session ═══
+    // knowledge-service verifyMagicLink (the /selger verifier) took any unused
+    // magic_links row of a verified claimant — the claim link too — and marked
+    // it used without expiring it; verifyOwnerSession then took that row as a
+    // cookie / Bearer session for the rest of its 15 minutes.
+    {
+      process.env.OWNER_UNIFIED_SESSION_ENABLED = "1"; // a /selger login would open an /eier session too
+      const selgerVerify = (token: string, headers: Record<string, string> = {}) =>
+        req("GET", `/api/marketplace/auth/magic-verify?token=${encodeURIComponent(token)}`, { headers });
+      const claimTokenOfA = (): string =>
+        String((db.prepare("SELECT claim_token FROM agent_claims WHERE id = ?").get(claimA) as any)?.claim_token || "");
+      const sessionRows = (): number => (db.prepare("SELECT COUNT(*) AS n FROM magic_links WHERE id LIKE 'mlsess_%'").get() as { n: number }).n;
+      const both = (token: string) => [
+        ownerPortal.verifyOwnerSession({ headers: { cookie: `rfb_owner_session=${token}` } } as any),
+        ownerPortal.verifyOwnerSession({ headers: { authorization: `Bearer ${token}` } } as any),
+      ];
+
+      const link = ownerPortal.createOwnerLoginLink("k5-a", APPROVED, "claim_approval");
+      const m = await req("GET", `/api/marketplace/auth/m/${link.token}`);
+      eq([m.status, m.location], [302, `/selger?magic=${link.token}`], "selger: setup — /auth/m/<token> hands any token on to /selger?magic=");
+      const claimTokenBefore = claimTokenOfA();
+      const sessionsBefore = sessionRows();
+      const r = await selgerVerify(link.token);
+      eq([r.status, r.json], [401, { success: false, error: "Ugyldig eller brukt lenke" }],
+        "selger: an unused claim link does not log in to /selger (401, the unknown-link answer)");
+      eq([sessionFrom(r), sessionRows(), claimTokenOfA()], ["", sessionsBefore, claimTokenBefore],
+        "selger: … no /eier session cookie or row (unified sessions on), the claim token is not refreshed");
+      eq([linkRow(link.token)?.used, isExpired(link.token)], [0, false], "selger: … and the link is left as it was (unused, live)");
+      eq([(await portal("k5-a", link.token)).status, (await portal("k5-a", link.token, "bearer")).status], [302, 302],
+        "selger: after that attempt the claim token is no /eier session, as a cookie or as a Bearer token");
+      eq(both(link.token).map((x) => x.valid), [false, false], "selger: … verifyOwnerSession refuses it both ways");
+
+      // The approval flow itself is unchanged: the same link logs in at /magic-link-verify, once.
+      const v = await req("GET", `/magic-link-verify?token=${link.token}`);
+      eq([v.status, v.location], [302, "/eier/k5-a/portal"], "selger: the same link still logs in at /magic-link-verify");
+      const s = sessionFrom(v);
+      eq([s !== link.token, String(linkRow(s)?.id).slice(0, 7), linkRow(link.token)?.used, isExpired(link.token)], [true, "mlsess_", 1, true],
+        "selger: … into a fresh mlsess_ session; the claim link is burnt");
+      eq((await portal("k5-a", s)).status, 200, "selger: … and the session opens the portal");
+      eq((await selgerVerify(link.token)).status, 401, "selger: the burnt claim link does not log in to /selger either");
+
+      // Second layer: a claim link left used and unexpired (what the /selger
+      // verifier left behind before this fix) is no session on its own.
+      const left = ownerPortal.createOwnerLoginLink("k5-a", APPROVED, "claim_approval");
+      db.prepare("UPDATE magic_links SET used = 1, used_at = datetime('now') WHERE token = ?").run(left.token);
+      eq([(await portal("k5-a", left.token)).status, (await portal("k5-a", left.token, "bearer")).status], [302, 302],
+        "selger: a used, unexpired claim link is no /eier session (cookie, Bearer)");
+      eq(both(left.token).map((x) => x.valid), [false, false], "selger: … verifyOwnerSession refuses it both ways");
+      eq(ownerPortal.verifyOwnerSession({ headers: { cookie: `rfb_owner_session=${left.token}`, authorization: `Bearer ${s}` } } as any),
+        { valid: true, agentId: "k5-a", token: s }, "selger: … a cookie holding it falls through to a real Bearer session");
+      eq((await selgerVerify(left.token)).status, 401, "selger: … and the used claim link does not log in to /selger");
+      db.prepare("DELETE FROM magic_links WHERE token = ?").run(left.token);
+
+      // Every other row behaves as before: a used, live ml_ / mlsess_ /
+      // mlbridge_ row is a session; so is an id that only looks like the
+      // prefix ("_" is literal, not a wildcard).
+      const now = new Date().toISOString();
+      const live = new Date(Date.now() + 15 * 60_000).toISOString();
+      const insLink = db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)");
+      for (const id of ["ml_k5sel", "mlsess_k5sel", "mlbridge_k5sel", "mlclaimx_k5sel", "mlclaim-k5sel"]) {
+        const token = `tok-${id}`;
+        insLink.run(id, APPROVED, token, "k5-a", now, live);
+        eq(both(token).map((x) => [x.valid, x.agentId, x.token]), [[true, "k5-a", token], [true, "k5-a", token]],
+          `selger: a used, live ${id.replace(/k5sel$/, "…")} row is a session as before (cookie, Bearer)`);
+        db.prepare("DELETE FROM magic_links WHERE token = ?").run(token);
+      }
+
+      // The /selger magic login is unchanged: its own link and the /eier bridge link log in.
+      const ks = (require("../services/knowledge-service") as typeof import("../services/knowledge-service")).knowledgeService;
+      const own = ks.createMagicLink(APPROVED);
+      const ownLogin = await selgerVerify(String(own.token));
+      eq([ownLogin.status, ownLogin.json?.data?.agentId, String(ownLogin.json?.data?.claimToken).startsWith("claim_"), linkRow(String(own.token))?.used],
+        [200, "k5-a", true, 1], "selger: the /selger login link logs in as before (claim token, link used)");
+      ok(claimTokenOfA() !== claimTokenBefore && claimTokenOfA() === ownLogin.json?.data?.claimToken, "selger: … and refreshes the claim token");
+      eq(String(linkRow(sessionFrom(ownLogin))?.id).slice(0, 7), "mlsess_", "selger: … with unified sessions on it opens an /eier session, as before");
+      const bridgeToken = "tok-mlbridge-k5sel-unused";
+      db.prepare("INSERT INTO magic_links (id, email, token, agent_id, used, created_at, expires_at) VALUES (?, ?, ?, ?, 0, ?, ?)")
+        .run("mlbridge_k5sel2", APPROVED, bridgeToken, "k5-a", now, live);
+      const bridgeLogin = await selgerVerify(bridgeToken, { Cookie: `rfb_owner_session=${s}` });
+      eq([bridgeLogin.status, bridgeLogin.json?.data?.agentId, linkRow(bridgeToken)?.used, sessionFrom(bridgeLogin)], [200, "k5-a", 1, ""],
+        "selger: an /eier bridge link logs in to /selger as before (the live session is reused)");
+      delete process.env.OWNER_UNIFIED_SESSION_ENABLED;
     }
 
     // ══ (login) the /eier login accepts the confirmed address ═════════════
