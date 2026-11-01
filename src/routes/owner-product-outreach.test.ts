@@ -12,7 +12,13 @@
  *          append-only 'opened' row); no login → no candidates (login page +
  *          return cookie); segment B (session, profile not taken over) → no
  *          list until the claim, then the list.
- *   AC20   «Bekreft og legg inn» publishes only the ticked rows with the
+ *   K4     (2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post) no session on a
+ *          profile without a verified owner (customer rule) → «Ta over
+ *          profilen først» with /selger?agent=, no candidates, nothing but the
+ *          'opened' row; with an owner (also is_verified = 0) → login as
+ *          before; after the claim the same link → login; flag off / bad
+ *          token unchanged.
+ *   AC20  «Bekreft og legg inn» publishes only the ticked rows with the
  *          edited values, manual products kept; without «på lager» none is
  *          orderable (isRowOrderableForRealOrder false), with it they are.
  *   cross  a token for agent A never publishes agent B's run; POST guards
@@ -194,6 +200,10 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
     addAgent(RUNNING, { verified: 1 });
     const STUCK = "po-stuck";
     addAgent(STUCK, { verified: 1 });
+    // K4: not taken over and no listed e-mail (the /eier login has nowhere to send a link).
+    const FREE = "po-free";
+    addAgent(FREE, { verified: 0, claimed: false });
+    db.prepare("UPDATE agent_knowledge SET email = NULL WHERE agent_id = ?").run(FREE);
     for (const id of [OWN, B, OTHER, ZERO, STALE, LIMIT, LLMA, NOTVER, RUNNING, STUCK]) session(id);
     session(OWN, "kollega@po-own.example.no", "own-colleague");
 
@@ -261,6 +271,9 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       const before = totalChanges();
       const r = [await getPage(OWN, tOwn, tokens[OWN]), await postPage(OWN, { t: tOwn, run: prepRun(OWN), velg: "x" }, tokens[OWN]), await links(), await logOf()];
       assertEq(r.map((x) => x.status), [404, 404, 404, 404], "flag off: landing GET/POST, links and log answer 404");
+      const k4 = await getPage(B, tokenFor(B));
+      assertTrue(k4.status === 404 && !html(k4).includes('data-outreach-claim="1"') && Object.keys(k4.cookies).length === 0,
+        "K4: flag off → no session on a profile without an owner still 404, no claim page, no cookie");
       assertEq(totalChanges(), before, "flag off: nothing written");
     }
     process.env.PRODUCT_IMPORT_OUTREACH_ENABLED = "1";
@@ -314,6 +327,20 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       const old = tokenFor(OWN, clock - 31 * DAY);
       const ex = await getPage(OWN, old, tokens[OWN]);
       assertTrue(ex.status === 410 && html(ex).includes('data-outreach-link="unusable"') && !html(ex).includes("Honning"), "token: expired (31 days) → 410 neutral page");
+      // K4: the claim page is only for a valid token; without a session the token check still comes first.
+      const tBad = tokenFor(B);
+      const [bv, bp, bs] = tBad.split(".") as [string, string, string];
+      const k4Cases: Array<[string, string, number]> = [
+        ["tampered", `${bv}.${bp}.${flip(bs)}`, 404],
+        ["another agent's", tOwn, 404],
+        ["expired", tokenFor(B, clock - 31 * DAY), 410],
+      ];
+      for (const [label, t, status] of k4Cases) {
+        const r = await getPage(B, t);
+        assertTrue(r.status === status && html(r).includes('data-outreach-link="unusable"') && !html(r).includes('data-outreach-claim="1"')
+          && !html(r).includes("/selger?agent=") && !html(r).includes("Gulrøtter") && Object.keys(r.cookies).length === 0,
+          `K4: ${label} token, no session, profile without an owner → neutral page as before (no claim page, no cookie)`);
+      }
       assertEq(ol.verifyOutreachToken(tokenFor(OWN, clock - 29 * DAY), OWN).state, "valid", "token: 29 days old is still valid");
       assertEq(db.prepare("SELECT COUNT(*) AS n FROM product_import_outreach_events").get(), { n: 0 }, "token: refused tokens log nothing");
     }
@@ -339,6 +366,37 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
     }
     // Segment B: session (e-mail match), profile not taken over.
     const tB = tokenFor(B);
+    // K4: no session on a profile without a verified owner → the claim flow, not the /eier login.
+    {
+      const runsOfB = () => (db.prepare("SELECT COUNT(*) AS n FROM product_import_runs WHERE agent_id = ?").get(B) as { n: number }).n;
+      const claimsOfB = () => (db.prepare("SELECT COUNT(*) AS n FROM agent_claims WHERE agent_id = ?").get(B) as { n: number }).n;
+      const runsBefore = runsOfB();
+      const before = totalChanges();
+      const r = await getPage(B, tB);
+      const h = html(r);
+      assertTrue(r.status === 200 && h.includes('data-outreach-claim="1"') && h.includes("Ta over profilen først") && h.includes(`href="/selger?agent=${B}"`),
+        "K4: no session, profile without an owner → «Ta over profilen først» with a link to /selger?agent=");
+      assertTrue(!h.includes('data-outreach-login="1"') && !h.includes(`href="/eier/${B}"`), "K4: no session, profile without an owner → no /eier login");
+      assertTrue(!h.includes("Gulrøtter") && !h.includes("Poteter") && !h.includes('name="velg"') && !h.includes('data-outreach-list="1"'),
+        "K4: no session, profile without an owner → no candidates");
+      assertEq(totalChanges() - before, 1, "K4: writes only the 'opened' log row");
+      assertEq((db.prepare("SELECT COUNT(*) AS n FROM product_import_outreach_events WHERE agent_id = ? AND event = 'opened' AND detail = 'no_session'").get(B) as any).n, 1,
+        "K4: the open is logged as no_session");
+      assertEq([runsOfB(), claimsOfB(), productsOf(B).length], [runsBefore, 0, 0], "K4: no run, claim or product written");
+      assertEq(r.cookies[ol.OUTREACH_RETURN_COOKIE], `/eier/${B}/varer/forslag?t=${encodeURIComponent(tB)}`, "K4: the return cookie keeps the same link");
+      const foreign = await getPage(B, tB, tokens[OTHER]);
+      assertTrue(foreign.status === 200 && html(foreign).includes('data-outreach-claim="1"') && !html(foreign).includes("Gulrøtter"),
+        "K4: another profile's session on a profile without an owner → claim page, no candidates");
+      const free = await getPage(FREE, tokenFor(FREE));
+      assertTrue(free.status === 200 && html(free).includes('data-outreach-claim="1"') && html(free).includes(`href="/selger?agent=${FREE}"`)
+        && !html(free).includes('data-outreach-login="1"'), "K4: no listed e-mail and no owner → claim page, not the login dead end");
+      const nv = await getPage(NOTVER, tokenFor(NOTVER));
+      assertTrue(nv.status === 200 && html(nv).includes('data-outreach-login="1"') && !html(nv).includes('data-outreach-claim="1"'),
+        "K4: verified claim with is_verified = 0 (customer rule owner), no session → login as before");
+      const own = await getPage(OWN, tOwn);
+      assertTrue(own.status === 200 && html(own).includes('data-outreach-login="1"') && html(own).includes(`href="/eier/${OWN}"`) && !html(own).includes('data-outreach-claim="1"'),
+        "K4: verified owner, no session → login as before");
+    }
     {
       const r = await getPage(B, tB, tokens[B]);
       assertTrue(r.status === 200 && html(r).includes('data-outreach-claim="1"') && html(r).includes(`href="/selger?agent=${B}"`),
@@ -467,6 +525,9 @@ export async function runOwnerProductOutreachTests(opts: { log?: boolean } = {})
       db.prepare(`INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, verified_at)
         VALUES ('claim-po-b', ?, 'Eier', ?, 'verified', '2026-10-21T00:00:00.000Z')`).run(B, `post@${B}.example.no`);
       const runB = prepRun(B);
+      const anonAfter = await getPage(B, tB);
+      assertTrue(anonAfter.status === 200 && html(anonAfter).includes('data-outreach-login="1"') && !html(anonAfter).includes('data-outreach-claim="1"')
+        && !html(anonAfter).includes("Gulrøtter"), "K4: after the claim the same link without a session → login, no candidates");
       const l = await getPage(B, tB, tokens[B]);
       assertTrue(html(l).includes('data-outreach-list="1"') && html(l).includes("Gulrøtter") && html(l).includes("Poteter"), "AC19: segment B sees the list once ownership is confirmed");
       const gul = candId(runB, "Gulrøtter");

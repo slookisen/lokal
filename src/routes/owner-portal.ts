@@ -439,6 +439,17 @@ export function isVerifiedOwner(
   const agentId = typeof agentIdParam === "string" ? agentIdParam : "";
   if (!session || !session.valid || !session.agentId || !agentId) return false;
   if (session.agentId !== agentId) return false;
+  return agentHasVerifiedOwner(agentId);
+}
+
+/**
+ * The ownership half of isVerifiedOwner, without a session: the agent has a
+ * verified owner by the shared customer rule (claimed_at set OR a verified
+ * agent_claims row). For pages that must choose between «log in» (an owner
+ * exists) and «take over the profile» (none yet) for a visitor with no session.
+ */
+export function agentHasVerifiedOwner(agentId: string): boolean {
+  if (!agentId) return false;
   const row = getDb()
     .prepare(`SELECT ${customerRuleSql("a")} AS owned FROM agents a WHERE a.id = ?`)
     .get(agentId) as { owned?: number } | undefined;
