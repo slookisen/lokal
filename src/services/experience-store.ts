@@ -590,8 +590,14 @@ export function createExperience(input: Experience): string {
  * `admission_verdict = ` / `admission_checked_at = `), so this one change is
  * enough to make the _prev columns correct for every future call site.
  */
-export function stampExperienceAdmissionVerdict(experienceId: string, verdict: string): void {
-  const db = getDb(VERTICAL);
+export function stampExperienceAdmissionVerdict(
+  experienceId: string,
+  verdict: string,
+  // Optional explicit handle (the content-judgement job's per-row
+  // transaction, dev-request 2026-10-06 step 3k) — defaults to the same
+  // singleton every existing caller already used, so they are unchanged.
+  db: ReturnType<typeof getDb> = getDb(VERTICAL),
+): void {
   db.prepare(
     `UPDATE experiences
         SET admission_verdict_prev = admission_verdict,

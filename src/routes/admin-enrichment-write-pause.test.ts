@@ -691,6 +691,11 @@ export async function runAdminEnrichmentWritePauseTests(
         // pause via the service to prove it, same convention as the others.
         "services/proposal-file-queue.ts",
         "services/gardssalg-visit-proposals-job.test.ts",
+        // experience-content-judgement-job (skive 3k, same dev-request): the
+        // job runs on the same queue; its apply step re-checks the pause per
+        // row through opplevelser.ts's shared helper. Its test file sets the
+        // pause via the service to prove both.
+        "services/experience-content-judgement-job.test.ts",
         // gardssalg-content-refresh-job («4b-det», A2A dev-request 2026-10-06-
         // experiences-enrichment-plattformjobb-og-felles-serverjobbramme,
         // tillegg 2026-10-15): the daily job drives the SAME shared core as
