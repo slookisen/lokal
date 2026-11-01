@@ -392,6 +392,9 @@
         <button class="btn btn-primary" id="btnVerifyClaim">Bekreft og gå til dashboardet</button>
         <!-- K1: the same code once more, to the same address (once, ≥ 10 min after the first send). -->
         <button class="btn btn-secondary" id="btnResendClaimCode" style="margin-top: 0.5rem;">Send koden på nytt</button>
+        <!-- K1: the way back to the form (and its «feil e-post» box) for an
+             owner whose code went to an address they cannot read. -->
+        <p style="margin-top: 1rem; font-size: 0.85rem;"><button type="button" id="btnClaimBack" style="background: none; border: none; padding: 0; color: var(--forest); text-decoration: underline; cursor: pointer; font-size: inherit;">Har du ikke tilgang til denne e-posten? Gå tilbake</button></p>
       </div>
     </div>
 
@@ -1373,11 +1376,18 @@
         localStorage.removeItem('rfb_open_claim');
       } catch (e) {}
     }
-    // «Send koden på nytt» is offered until its one resend is used (null).
-    function showResendButton(visible) {
+    // «Send koden på nytt» is offered until its one resend is used
+    // (availableAt null), and stays disabled until it opens (10 min after the
+    // first send). An unknown time ('' / undefined) leaves it enabled; the
+    // server then says when.
+    var resendEnableTimer = null;
+    function showResendButton(availableAt) {
       var btn = document.getElementById('btnResendClaimCode');
-      btn.style.display = visible ? '' : 'none';
-      btn.disabled = false;
+      clearTimeout(resendEnableTimer);
+      btn.style.display = availableAt === null ? 'none' : '';
+      var wait = availableAt ? Date.parse(availableAt) - Date.now() : 0;
+      btn.disabled = wait > 0;
+      if (wait > 0) resendEnableTimer = setTimeout(function() { btn.disabled = false; }, wait);
     }
     // Opens the code step for the open claim kept for this store, if any.
     function resumeOpenClaim(agentId) {
@@ -1387,7 +1397,7 @@
       claimId = open.claimId;
       hide('claimStep2');
       show('claimStep2b');
-      showResendButton(open.resendAvailableAt !== null);
+      showResendButton(open.resendAvailableAt);
       if (open.via && open.via !== 'farm_email') {
         showAlert('verifyAlert', 'Koden er alt sendt til ' + escHtml(open.sentTo) + '. Skriv den inn her.', 'info', true);
       } else {
@@ -1402,7 +1412,7 @@
       var email = document.getElementById('claimEmail').value.trim();
       var phone = document.getElementById('claimPhone').value.trim();
       if (!name || !email) {
-        showAlert('claimAlert', t('your_name') + ' & ' + t('your_email') + ' required', 'error');
+        showAlert('claimAlert', t('your_name') + ' & ' + t('your_email') + ' required', 'error', true);
         return;
       }
       var listedEmailWrong = document.getElementById('claimListedEmailWrong').checked === true;
@@ -1448,7 +1458,7 @@
           // answers code_already_sent (same claimId, no new code) when the
           // same e-mail asks again while the code is valid.
           saveOpenClaim(claimAgentId, res.data);
-          showResendButton(res.data.resendAvailableAt !== null);
+          showResendButton(res.data.resendAvailableAt);
           if (devVerificationCode) {
             showAlert('verifyAlert', 'Koden din er: <strong>' + escHtml(devVerificationCode) + '</strong> (e-post er ikke satt opp ennå)', 'info', true);
             document.getElementById('verifyCode').value = devVerificationCode;
@@ -1459,10 +1469,11 @@
             showAlert('verifyAlert', 'Koden er sendt til gårdens e-post: ' + escHtml(res.data.sentTo), 'info', true);
           }
         } else {
-          showAlert('claimAlert', escHtml(res.error) || t('claim_error'), 'error');
+          // Stays until the next try: rule 4's answer says what to do and when.
+          showAlert('claimAlert', escHtml(res.error) || t('claim_error'), 'error', true);
         }
       } catch (err) {
-        showAlert('claimAlert', escHtml(err.message), 'error');
+        showAlert('claimAlert', escHtml(err.message), 'error', true);
       }
       this.disabled = false;
     });
@@ -1508,19 +1519,33 @@
         });
         if (res.success) {
           // One resend per claim: the button goes, and so does the offer kept for a reload.
-          showResendButton(false);
+          showResendButton(null);
           saveOpenClaim(claimAgentId, res.data);
           showAlert('verifyAlert', escHtml(res.message) || 'Koden er sendt på nytt.', 'success', true);
           return;
         }
         var reason = res.data && res.data.reason;
-        if (reason === 'already_resent') showResendButton(false);
+        if (reason === 'already_resent') showResendButton(null);
         if (reason && ['not_found', 'verified', 'pending_review', 'closed', 'expired'].indexOf(reason) !== -1) clearOpenClaim(claimId);
         showAlert('verifyAlert', escHtml(res.error) || 'Vi fikk ikke sendt koden på nytt nå. Prøv igjen senere.', 'error', true);
       } catch (err) {
         showAlert('verifyAlert', escHtml(err.message), 'error');
       }
       this.disabled = false;
+    });
+
+    // ── K1: the way back from the code step ──
+    // Without it the kept open claim brought only the code field back for 24 h,
+    // even when the code went to an outdated farm address. Back on the form the
+    // owner can tick «E-postadressen som står på profilen er feil …», which
+    // sends the claim to manual approval. The kept claim is forgotten here.
+    document.getElementById('btnClaimBack').addEventListener('click', function() {
+      clearOpenClaim(claimId);
+      claimId = null;
+      document.getElementById('verifyAlert').innerHTML = '';
+      hide('claimStep2b');
+      show('claimStep2');
+      document.getElementById('claimStep2').scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
 
     // ── Magic link: request login link via email ──

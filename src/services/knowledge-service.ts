@@ -578,10 +578,9 @@ export type ClaimRequestResult =
   | { kind: "code_already_sent"; claimId: string; recipient: string; via: ClaimCodeRoute; expiresAt: string; resendAvailableAt: string | null }
   /** `created` is false when the claimant's own open entry is returned. */
   | { kind: "queued"; claimId: string; reason: ClaimReviewReason; created: boolean }
-  /** For scope "profile" (rule 4): when a new code can be sent, which rule
-   *  sent the code that holds the slot, and whether that code is still open
-   *  (its claimant can still get it back). */
-  | { kind: "rate_limited"; scope: ClaimRateLimitScope; retryAt?: string; via?: ClaimCodeRoute; codeOpen?: boolean }
+  /** For scope "profile" (rule 4): when a new code can be sent, and which rule
+   *  sent the code that holds the slot. */
+  | { kind: "rate_limited"; scope: ClaimRateLimitScope; retryAt?: string; via?: ClaimCodeRoute }
   /** The address is this profile's owner's own: log in by e-mail instead. */
   | { kind: "already_owner" };
 
@@ -606,7 +605,9 @@ const NB_MONTHS = ["januar", "februar", "mars", "april", "mai", "juni", "juli", 
 
 /**
  * A time for a Norwegian claim message, on the Oslo clock: «i dag kl. 14:05»,
- * «i morgen kl. 09:30», else «3. november kl. 14:05» (K1/K3).
+ * «i morgen kl. 09:30», else «3. november kl. 14:05» (K1/K3). «I morgen» is
+ * the next Oslo calendar date — not now + 24 h, which lands on the wrong day
+ * around a DST change (a 23- or 25-hour day).
  */
 export function formatClaimTime(at: Date, now: Date = new Date()): string {
   const fmt = new Intl.DateTimeFormat("en-GB", {
@@ -614,12 +615,17 @@ export function formatClaimTime(at: Date, now: Date = new Date()): string {
   });
   const parts = (d: Date) => {
     const p = fmt.formatToParts(d);
-    const get = (type: string): string => p.find((x) => x.type === type)?.value ?? "";
-    return { date: `${get("year")}-${get("month")}-${get("day")}`, day: Number(get("day")), month: Number(get("month")), time: `${get("hour")}:${get("minute")}` };
+    const get = (type: string): number => Number(p.find((x) => x.type === type)?.value ?? NaN);
+    return { year: get("year"), month: get("month"), day: get("day"), time: `${String(get("hour")).padStart(2, "0")}:${String(get("minute")).padStart(2, "0")}` };
   };
+  const dateKey = (y: number, m: number, d: number) => `${y}-${m}-${d}`;
   const a = parts(at);
-  if (a.date === parts(now).date) return `i dag kl. ${a.time}`;
-  if (a.date === parts(new Date(now.getTime() + 86_400_000)).date) return `i morgen kl. ${a.time}`;
+  const n = parts(now);
+  // Calendar arithmetic on the Oslo date itself (UTC only as a calendar).
+  const next = new Date(Date.UTC(n.year, n.month - 1, n.day + 1));
+  const key = dateKey(a.year, a.month, a.day);
+  if (key === dateKey(n.year, n.month, n.day)) return `i dag kl. ${a.time}`;
+  if (key === dateKey(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate())) return `i morgen kl. ${a.time}`;
   return `${a.day}. ${NB_MONTHS[a.month - 1]} kl. ${a.time}`;
 }
 
@@ -1274,6 +1280,25 @@ class KnowledgeService {
     return !!row && claimTimeMs(row.expires_at) > Date.now();
   }
 
+  /** When rule 4 lets this profile have a new code (ms): its latest code send
+   *  plus the window. NaN when it has none. */
+  private claimSlotOpensAt(agentId: string, windowHours: number): number {
+    const row = getDb().prepare(
+      "SELECT MAX(datetime(created_at)) AS at FROM agent_claims WHERE agent_id = ? AND code_sent_to IS NOT NULL"
+    ).get(agentId) as { at: string | null } | undefined;
+    return claimTimeMs(row?.at) + windowHours * 3_600_000;
+  }
+
+  /** What to do after a code that can no longer be used (K3): ask for a new
+   *  one — and, while rule 4 still holds the profile's slot, from when, so the
+   *  owner is not sent straight into a 429. */
+  private claimAskAgainSentence(agentId: string): string {
+    const opensAt = this.claimSlotOpensAt(agentId, claimLimits().profileWindowHours);
+    return opensAt > Date.now()
+      ? `Du kan be om en ny kode fra butikksiden ${formatClaimTime(new Date(opensAt))}.`
+      : "Be om en ny kode fra butikksiden.";
+  }
+
   /** Code e-mails sent platform-wide in the last hour: new codes (rows with
    *  code_sent_to) plus resends (resent_at, K1) — the platform cap counts both.
    *  Both times go through datetime(), as in requestClaim's createdSince. */
@@ -1399,15 +1424,14 @@ class KnowledgeService {
       // platform cap also counts resends). Rule 4 tells when its slot opens.
       if (createdSince("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) >= 1) {
         const last = db.prepare(
-          `SELECT datetime(created_at) AS at, recommendation, status, expires_at FROM agent_claims
+          `SELECT recommendation FROM agent_claims
             WHERE agent_id = ? AND code_sent_to IS NOT NULL ORDER BY datetime(created_at) DESC LIMIT 1`
-        ).get(agentId) as { at: string | null; recommendation: string | null; status: string; expires_at: string | null } | undefined;
-        const lastAt = claimTimeMs(last?.at);
+        ).get(agentId) as { recommendation: string | null } | undefined;
+        const opensAt = this.claimSlotOpensAt(agentId, limits.profileWindowHours);
         return {
           kind: "rate_limited", scope: "profile",
-          retryAt: Number.isFinite(lastAt) ? new Date(lastAt + limits.profileWindowHours * 3_600_000).toISOString() : undefined,
+          retryAt: Number.isFinite(opensAt) ? new Date(opensAt).toISOString() : undefined,
           via: last ? claimCodeRouteOf(last.recommendation) : undefined,
-          codeOpen: !!last && last.status === "code_sent" && claimTimeMs(last.expires_at) > Date.now(),
         };
       }
       if (this.codeSendsLastHour() >= limits.codeSendsPerHourMax) return { kind: "rate_limited", scope: "platform" };
@@ -1456,10 +1480,16 @@ class KnowledgeService {
       if (!claim || claim.agent_id !== agentId) return { kind: "refused", reason: "not_found" };
       if (claim.status === "verified") return { kind: "refused", reason: "verified" };
       if (claim.status === "pending_review") return { kind: "refused", reason: "pending_review" };
-      if (claim.status !== "code_sent" || !claim.code_sent_to) return { kind: "refused", reason: "closed" };
+      // A code that can no longer be used: retryAt says when rule 4 lets the
+      // profile have a new one, while that is still ahead (K3).
+      const slotRetryAt = (): string | undefined => {
+        const opens = this.claimSlotOpensAt(agentId, claimLimits(env).profileWindowHours);
+        return opens > Date.now() ? new Date(opens).toISOString() : undefined;
+      };
+      if (claim.status !== "code_sent" || !claim.code_sent_to) return { kind: "refused", reason: "closed", retryAt: slotRetryAt() };
       if (!(claimTimeMs(claim.expires_at) > Date.now())) {
         db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ? AND status = 'code_sent'").run(claimId);
-        return { kind: "refused", reason: "expired" };
+        return { kind: "refused", reason: "expired", retryAt: slotRetryAt() };
       }
       if (Number(claim.resend_count ?? 0) >= CLAIM_CODE_MAX_RESENDS) return { kind: "refused", reason: "already_resent" };
       const opensAt = claimTimeMs(claim.created_at) + CLAIM_CODE_RESEND_MIN_MINUTES * 60_000;
@@ -1510,7 +1540,9 @@ class KnowledgeService {
   verifyClaim(claimId: string, code: unknown, agentId: string): { success: boolean; claimToken?: string; error?: string; status?: ClaimVerifyStatus; queued?: boolean; attemptsLeft?: number } {
     const db = getDb();
     const claim = db.prepare("SELECT * FROM agent_claims WHERE id = ?").get(claimId) as any;
-    const askAgain = "Be om en ny kode fra butikksiden.";
+    // A code that can no longer be used: ask for a new one — from when, while
+    // rule 4 still holds the profile's slot (no straight 429).
+    const askAgain = (): string => this.claimAskAgainSentence(agentId);
 
     // A claim on another profile is answered exactly like an unknown one.
     if (!claim || claim.agent_id !== agentId) {
@@ -1528,17 +1560,21 @@ class KnowledgeService {
     if (claim.status === "rejected") {
       return { success: false, status: "rejected", error: "Kravet er avvist etter manuell gjennomgang. Mener du at det er feil, ta kontakt med oss." };
     }
-    if (claim.status === "expired") return { success: false, status: "expired", error: `Koden er utløpt. ${askAgain}` };
+    if (claim.status === "expired") {
+      // Locked by the wrong-code limit earlier, or simply out of time.
+      const locked = Number(claim.failed_attempts ?? 0) >= claimLimits().maxFailedAttempts;
+      return { success: false, status: "expired", error: `${locked ? "For mange feil koder. Kravet er utløpt." : "Koden er utløpt."} ${askAgain()}` };
+    }
     // A code from before decision 11=A went to whatever address the claimant
     // typed, so it is not accepted (the row itself is left as it is).
     if (!claim.code_sent_to) {
-      return { success: false, status: "expired", error: `Koden er ikke lenger gyldig. ${askAgain}` };
+      return { success: false, status: "expired", error: `Koden er ikke lenger gyldig. ${askAgain()}` };
     }
 
     // Check expiry
     if (new Date(claim.expires_at) < new Date()) {
       db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ?").run(claimId);
-      return { success: false, status: "expired", error: `Koden er utløpt. ${askAgain}` };
+      return { success: false, status: "expired", error: `Koden er utløpt. ${askAgain()}` };
     }
 
     // Verify code — the last allowed wrong one (claimLimits, 5) expires the
@@ -1555,12 +1591,7 @@ class KnowledgeService {
       const after = db.prepare("SELECT status, failed_attempts FROM agent_claims WHERE id = ?").get(claimId) as
         { status: string; failed_attempts: number | null } | undefined;
       if (after?.status === "expired") {
-        // Rule 4 still holds the profile's slot: say when a new code can come.
-        const opensAt = claimTimeMs(claim.created_at) + limits.profileWindowHours * 3_600_000;
-        const next = opensAt > Date.now()
-          ? `Du kan be om en ny kode fra butikksiden ${formatClaimTime(new Date(opensAt))}.`
-          : askAgain;
-        return { success: false, status: "expired", attemptsLeft: 0, error: `For mange feil koder. Kravet er utløpt. ${next}` };
+        return { success: false, status: "expired", attemptsLeft: 0, error: `For mange feil koder. Kravet er utløpt. ${askAgain()}` };
       }
       const attemptsLeft = Math.max(limits.maxFailedAttempts - Number(after?.failed_attempts ?? 0), 0);
       return {
