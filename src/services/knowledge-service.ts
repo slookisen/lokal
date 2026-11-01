@@ -475,7 +475,11 @@ export function productsWriteError(products: unknown): KnowledgeFieldError | nul
 //   3. The profile already has an owner (customerRuleSql) → always the admin
 //      queue, also when the e-mail matches. The owner keeps token and access;
 //      no claim row is deleted any more.
-//   4. At most ONE code per profile per rolling 24 h, whoever asks.
+//   4. At most ONE code per profile per rolling 24 h, whoever asks. The same
+//      claimant asking again while that code is valid gets the same claim
+//      back (no new code); «Send koden på nytt» sends the same code once more
+//      to the same address (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-
+//      fra-e-post, K1).
 // Hardening A needs, now that guessing the code sent to the farm's inbox is
 // the way in: a crypto code that lives 24 h (was Math.random(), 7 days), 5
 // wrong tries expire the claim, verify is bound to the profile id, and a
@@ -502,6 +506,11 @@ export const CLAIM_REVIEW_OPEN_PER_PROFILE_MAX = 3;
 export const CLAIM_REVIEW_INSERTS_PER_HOUR_MAX = 20;
 /** Most entries GET /admin/agents/claim-review-queue returns (oldest first). */
 export const CLAIM_REVIEW_QUEUE_LIST_MAX = 200;
+/** K1: «Send koden på nytt» — the same code, to the same address, at most this
+ *  many times per claim, no sooner than CLAIM_CODE_RESEND_MIN_MINUTES after the
+ *  first send and only while the code is valid. Counted in the platform cap. */
+export const CLAIM_CODE_MAX_RESENDS = 1;
+export const CLAIM_CODE_RESEND_MIN_MINUTES = 10;
 
 export interface ClaimLimits {
   maxFailedAttempts: number;
@@ -563,12 +572,76 @@ export interface ClaimDomainAssessment {
 }
 
 export type ClaimRequestResult =
-  | { kind: "code_sent"; claimId: string; verificationCode: string; recipient: string; via: ClaimCodeRoute }
+  | { kind: "code_sent"; claimId: string; verificationCode: string; recipient: string; via: ClaimCodeRoute; expiresAt: string; resendAvailableAt: string | null }
+  /** K1: the same claimant's code is still valid — that claim, nothing sent.
+   *  `resendAvailableAt` is null once the one resend is used. */
+  | { kind: "code_already_sent"; claimId: string; recipient: string; via: ClaimCodeRoute; expiresAt: string; resendAvailableAt: string | null }
   /** `created` is false when the claimant's own open entry is returned. */
   | { kind: "queued"; claimId: string; reason: ClaimReviewReason; created: boolean }
-  | { kind: "rate_limited"; scope: ClaimRateLimitScope }
+  /** For scope "profile" (rule 4): when a new code can be sent, which rule
+   *  sent the code that holds the slot, and whether that code is still open
+   *  (its claimant can still get it back). */
+  | { kind: "rate_limited"; scope: ClaimRateLimitScope; retryAt?: string; via?: ClaimCodeRoute; codeOpen?: boolean }
   /** The address is this profile's owner's own: log in by e-mail instead. */
   | { kind: "already_owner" };
+
+/** Why «Send koden på nytt» is refused (K1). `not_allowed`: the address the
+ *  code went to is no longer the one the rules would send to today (the
+ *  profile got an owner, its address changed or is shared), so nothing is
+ *  sent to it. */
+export type ClaimResendRefusal =
+  | "not_found" | "verified" | "pending_review" | "closed" | "expired"
+  | "already_resent" | "too_early" | "platform" | "not_allowed";
+
+export type ClaimResendResult =
+  | { kind: "resend"; claimId: string; verificationCode: string; recipient: string; via: ClaimCodeRoute; expiresAt: string }
+  | { kind: "refused"; reason: ClaimResendRefusal; retryAt?: string };
+
+/** What verifyClaim answers besides success: the claim's state, so the page
+ *  knows whether to keep the code field (K1/K3). */
+export type ClaimVerifyStatus =
+  | "not_found" | "verified" | "pending_review" | "expired" | "rejected" | "superseded" | "invalid_code";
+
+const NB_MONTHS = ["januar", "februar", "mars", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "desember"];
+
+/**
+ * A time for a Norwegian claim message, on the Oslo clock: «i dag kl. 14:05»,
+ * «i morgen kl. 09:30», else «3. november kl. 14:05» (K1/K3).
+ */
+export function formatClaimTime(at: Date, now: Date = new Date()): string {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Oslo", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  });
+  const parts = (d: Date) => {
+    const p = fmt.formatToParts(d);
+    const get = (type: string): string => p.find((x) => x.type === type)?.value ?? "";
+    return { date: `${get("year")}-${get("month")}-${get("day")}`, day: Number(get("day")), month: Number(get("month")), time: `${get("hour")}:${get("minute")}` };
+  };
+  const a = parts(at);
+  if (a.date === parts(now).date) return `i dag kl. ${a.time}`;
+  if (a.date === parts(new Date(now.getTime() + 86_400_000)).date) return `i morgen kl. ${a.time}`;
+  return `${a.day}. ${NB_MONTHS[a.month - 1]} kl. ${a.time}`;
+}
+
+/** An agent_claims time (ISO from JS, or SQLite's "YYYY-MM-DD HH:MM:SS" UTC)
+ *  in ms; NaN when it does not parse. */
+function claimTimeMs(value: unknown): number {
+  const s = typeof value === "string" ? value.trim() : "";
+  return Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s) ? `${s.replace(" ", "T")}Z` : s);
+}
+
+/** Which rule sent a code, from the row's `recommendation` (set only by the
+ *  domain rule's P1/P2; NULL = rule 1, the farm's own address). */
+function claimCodeRouteOf(recommendation: unknown): ClaimCodeRoute {
+  return recommendation === "domain_match_independent" || recommendation === "domain_code_sent" ? recommendation : "farm_email";
+}
+
+/** When «Send koden på nytt» opens for a code row, or null once it is used. */
+function claimResendAvailableAt(row: { created_at: unknown; resend_count?: unknown }): string | null {
+  if (Number(row.resend_count ?? 0) >= CLAIM_CODE_MAX_RESENDS) return null;
+  const sentAt = claimTimeMs(row.created_at);
+  return Number.isFinite(sentAt) ? new Date(sentAt + CLAIM_CODE_RESEND_MIN_MINUTES * 60_000).toISOString() : null;
+}
 
 export interface ClaimReviewEntry {
   claim_id: string;
@@ -1162,7 +1235,9 @@ class KnowledgeService {
     const hasOwner = this.agentHasOwner(agentId);
     if (!hasOwner && !this.resolveFarmContactEmail(agentId)) {
       const pre = this.assessClaimDomain(agentId, opts.claimantEmail, hasOwner);
-      if (pre.route === "p2_candidate" && pre.domain && this.claimCodeSlotFree(agentId)) {
+      // The claimant's own open P2 code also needs the probe's answer: without
+      // it requestClaim would queue the claim instead of handing it back (K1).
+      if (pre.route === "p2_candidate" && pre.domain && (this.claimCodeSlotFree(agentId) || this.claimantHasOpenCode(agentId, opts.claimantEmail))) {
         try {
           httpsAnswered = (await (deps.httpsCheck ?? getDomainHttpsCheck())(pre.domain)) === true;
         } catch (err) {
@@ -1185,7 +1260,30 @@ class KnowledgeService {
         WHERE ${where} AND datetime(created_at) >= datetime('now', '-' || ? || ' hours')`
     ).get(...params, hours) as { n: number }).n;
     return since("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) < 1 &&
-      since("code_sent_to IS NOT NULL", 1) < limits.codeSendsPerHourMax;
+      this.codeSendsLastHour() < limits.codeSendsPerHourMax;
+  }
+
+  /** Does this claimant (address normalized) hold a valid open code on the
+   *  profile — the claim requestClaim hands back (K1)? */
+  private claimantHasOpenCode(agentId: string, claimantEmail: string): boolean {
+    const row = getDb().prepare(
+      `SELECT expires_at FROM agent_claims
+        WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'code_sent' AND code_sent_to IS NOT NULL
+        ORDER BY datetime(created_at) DESC LIMIT 1`
+    ).get(agentId, normalizeEmail(claimantEmail)) as { expires_at: string } | undefined;
+    return !!row && claimTimeMs(row.expires_at) > Date.now();
+  }
+
+  /** Code e-mails sent platform-wide in the last hour: new codes (rows with
+   *  code_sent_to) plus resends (resent_at, K1) — the platform cap counts both.
+   *  Both times go through datetime(), as in requestClaim's createdSince. */
+  private codeSendsLastHour(): number {
+    return (getDb().prepare(
+      `SELECT (SELECT COUNT(*) FROM agent_claims
+                WHERE code_sent_to IS NOT NULL AND datetime(created_at) >= datetime('now', '-1 hours'))
+            + (SELECT COUNT(*) FROM agent_claims
+                WHERE resent_at IS NOT NULL AND datetime(resent_at) >= datetime('now', '-1 hours')) AS n`
+    ).get() as { n: number }).n;
   }
 
   /**
@@ -1194,10 +1292,12 @@ class KnowledgeService {
    *     owner logs in by e-mail instead;
    *   - "queued": the claim waits in the admin queue (rule 2 or 3); one open
    *     entry per claimant and profile, a repeat returns it;
+   *   - "code_already_sent" (K1): the same claimant's code on this profile is
+   *     still valid — that claim is returned, nothing is sent or written;
    *   - "rate_limited": nothing is written — a code went to this profile in
-   *     the window (rule 4) or the platform's hourly code cap is reached, or,
-   *     for a new queue entry, the profile's open entries or the platform's
-   *     hourly entries are at their cap (claimLimits);
+   *     the window (rule 4, with `retryAt`) or the platform's hourly code cap
+   *     is reached, or, for a new queue entry, the profile's open entries or
+   *     the platform's hourly entries are at their cap (claimLimits);
    *   - "code_sent": a new code for `recipient`, the farm's own address. The
    *     caller sends it; if that fails it calls markClaimCodeUnsent().
    */
@@ -1277,11 +1377,40 @@ class KnowledgeService {
         return { kind: "queued", claimId: id, reason, created: true };
       }
 
-      // Rule 4 and the platform cap count code sends (code_sent_to set).
-      if (createdSince("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) >= 1) {
-        return { kind: "rate_limited", scope: "profile" };
+      // K1: the same claimant (same address, normalized) asking again while
+      // their code is still valid — in another tab, or on the phone after the
+      // PC — gets that claim back: no new code, no new row, nothing sent, so
+      // rule 4 and the platform cap are untouched. A new code supersedes every
+      // open one, so there is at most one such row per profile.
+      const openCode = db.prepare(
+        `SELECT id, code_sent_to, expires_at, created_at, recommendation, resend_count FROM agent_claims
+          WHERE agent_id = ? AND LOWER(TRIM(claimant_email)) = ? AND status = 'code_sent' AND code_sent_to IS NOT NULL
+          ORDER BY datetime(created_at) DESC LIMIT 1`
+      ).get(agentId, claimantEmail) as
+        { id: string; code_sent_to: string; expires_at: string; created_at: string; recommendation: string | null; resend_count: number | null } | undefined;
+      if (openCode && claimTimeMs(openCode.expires_at) > Date.now()) {
+        return {
+          kind: "code_already_sent", claimId: openCode.id, recipient: openCode.code_sent_to, via: claimCodeRouteOf(openCode.recommendation),
+          expiresAt: openCode.expires_at, resendAvailableAt: claimResendAvailableAt(openCode),
+        };
       }
-      if (createdSince("code_sent_to IS NOT NULL", 1) >= limits.codeSendsPerHourMax) return { kind: "rate_limited", scope: "platform" };
+
+      // Rule 4 and the platform cap count code sends (code_sent_to set; the
+      // platform cap also counts resends). Rule 4 tells when its slot opens.
+      if (createdSince("agent_id = ? AND code_sent_to IS NOT NULL", limits.profileWindowHours, agentId) >= 1) {
+        const last = db.prepare(
+          `SELECT datetime(created_at) AS at, recommendation, status, expires_at FROM agent_claims
+            WHERE agent_id = ? AND code_sent_to IS NOT NULL ORDER BY datetime(created_at) DESC LIMIT 1`
+        ).get(agentId) as { at: string | null; recommendation: string | null; status: string; expires_at: string | null } | undefined;
+        const lastAt = claimTimeMs(last?.at);
+        return {
+          kind: "rate_limited", scope: "profile",
+          retryAt: Number.isFinite(lastAt) ? new Date(lastAt + limits.profileWindowHours * 3_600_000).toISOString() : undefined,
+          via: last ? claimCodeRouteOf(last.recommendation) : undefined,
+          codeOpen: !!last && last.status === "code_sent" && claimTimeMs(last.expires_at) > Date.now(),
+        };
+      }
+      if (this.codeSendsLastHour() >= limits.codeSendsPerHourMax) return { kind: "rate_limited", scope: "platform" };
 
       // A new code replaces the previous one. Open codes used to be DELETEd
       // here; now they are marked. Rows from before this rule (no
@@ -1301,8 +1430,67 @@ class KnowledgeService {
         INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_method, verification_code, status, source, expires_at, created_at, code_sent_to, failed_attempts, recommendation)
         VALUES (?, ?, ?, ?, ?, 'email', ?, 'code_sent', ?, ?, ?, ?, 0, ?)
       `).run(id, agentId, opts.claimantName, claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now, recipient, domainRoute);
-      return { kind: "code_sent", claimId: id, verificationCode: code, recipient, via: domainRoute ?? "farm_email" };
+      return {
+        kind: "code_sent", claimId: id, verificationCode: code, recipient, via: domainRoute ?? "farm_email",
+        expiresAt, resendAvailableAt: claimResendAvailableAt({ created_at: now, resend_count: 0 }),
+      };
     })();
+  }
+
+  /**
+   * K1 «Send koden på nytt»: the SAME code once more, to the SAME address it
+   * went to, never to anything the visitor typed (decision 11=A). Only for an
+   * open code on this profile (bound to :id like verifyClaim), while it is
+   * valid, at most CLAIM_CODE_MAX_RESENDS times, no sooner than
+   * CLAIM_CODE_RESEND_MIN_MINUTES after the first send, within the platform
+   * cap (a resend counts in it), and only while that address is still the one
+   * the rules would send a new code to (no owner meanwhile, the farm address
+   * unchanged and not shared; a domain-rule address only with the flag on).
+   * "resend": the count is raised; the caller sends the mail, and on failure
+   * calls markClaimResendUnsent() to give the resend back.
+   */
+  resendClaimCode(claimId: string, agentId: string, env: NodeJS.ProcessEnv = process.env): ClaimResendResult {
+    const db = getDb();
+    return db.transaction((): ClaimResendResult => {
+      const claim = db.prepare("SELECT * FROM agent_claims WHERE id = ?").get(claimId) as any;
+      if (!claim || claim.agent_id !== agentId) return { kind: "refused", reason: "not_found" };
+      if (claim.status === "verified") return { kind: "refused", reason: "verified" };
+      if (claim.status === "pending_review") return { kind: "refused", reason: "pending_review" };
+      if (claim.status !== "code_sent" || !claim.code_sent_to) return { kind: "refused", reason: "closed" };
+      if (!(claimTimeMs(claim.expires_at) > Date.now())) {
+        db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ? AND status = 'code_sent'").run(claimId);
+        return { kind: "refused", reason: "expired" };
+      }
+      if (Number(claim.resend_count ?? 0) >= CLAIM_CODE_MAX_RESENDS) return { kind: "refused", reason: "already_resent" };
+      const opensAt = claimTimeMs(claim.created_at) + CLAIM_CODE_RESEND_MIN_MINUTES * 60_000;
+      if (!(Date.now() >= opensAt)) {
+        return { kind: "refused", reason: "too_early", retryAt: Number.isFinite(opensAt) ? new Date(opensAt).toISOString() : undefined };
+      }
+      if (this.codeSendsLastHour() >= claimLimits(env).codeSendsPerHourMax) return { kind: "refused", reason: "platform" };
+
+      const via = claimCodeRouteOf(claim.recommendation);
+      const recipient = String(claim.code_sent_to);
+      const stillTheRecipient = !this.agentHasOwner(agentId) && (via === "farm_email"
+        ? this.resolveFarmContactEmail(agentId) === recipient && !this.isSharedKnownEmail(recipient, agentId)
+        : claimDomainRuleEnabled(env) && !this.resolveFarmContactEmail(agentId) &&
+          normalizeEmail(claim.claimant_email) === recipient && !this.isSharedKnownEmail(recipient));
+      if (!stillTheRecipient) return { kind: "refused", reason: "not_allowed" };
+
+      const raised = db.prepare(
+        `UPDATE agent_claims SET resend_count = COALESCE(resend_count, 0) + 1, resent_at = ?
+          WHERE id = ? AND status = 'code_sent' AND COALESCE(resend_count, 0) < ?`
+      ).run(new Date().toISOString(), claimId, CLAIM_CODE_MAX_RESENDS);
+      if (raised.changes !== 1) return { kind: "refused", reason: "already_resent" };
+      return { kind: "resend", claimId, verificationCode: String(claim.verification_code), recipient, via, expiresAt: claim.expires_at };
+    })();
+  }
+
+  /** The resend e-mail was not sent: the resend is given back (it no longer
+   *  counts in the platform cap and may be tried again). */
+  markClaimResendUnsent(claimId: string): void {
+    getDb().prepare(
+      "UPDATE agent_claims SET resend_count = MAX(COALESCE(resend_count, 1) - 1, 0), resent_at = NULL WHERE id = ?"
+    ).run(claimId);
   }
 
   /** The code e-mail was not sent: the claim is expired and gives its place
@@ -1313,45 +1501,72 @@ class KnowledgeService {
     ).run(claimId);
   }
 
-  verifyClaim(claimId: string, code: unknown, agentId: string): { success: boolean; claimToken?: string; error?: string; status?: string; queued?: boolean } {
+  /**
+   * Checks a claim code. Every refusal is Norwegian and says what the owner
+   * does next (K3, dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post),
+   * and `status` tells the page whether the code field still applies (only
+   * "invalid_code" keeps it). A wrong code says how many tries are left.
+   */
+  verifyClaim(claimId: string, code: unknown, agentId: string): { success: boolean; claimToken?: string; error?: string; status?: ClaimVerifyStatus; queued?: boolean; attemptsLeft?: number } {
     const db = getDb();
     const claim = db.prepare("SELECT * FROM agent_claims WHERE id = ?").get(claimId) as any;
+    const askAgain = "Be om en ny kode fra butikksiden.";
 
     // A claim on another profile is answered exactly like an unknown one.
-    if (!claim || claim.agent_id !== agentId) return { success: false, error: "Claim not found" };
-    if (claim.status === "verified") return { success: false, error: "Already verified" };
+    if (!claim || claim.agent_id !== agentId) {
+      return { success: false, status: "not_found", error: "Vi finner ikke dette kravet. Start på nytt fra butikksiden med «Dette er min butikk»." };
+    }
+    if (claim.status === "verified") {
+      return { success: false, status: "verified", error: "Kravet er allerede bekreftet, og profilen er tatt over. Logg inn med e-post under «Allerede registrert?», så sender vi deg en innloggingslenke." };
+    }
     if (claim.status === "pending_review") {
       return { success: false, status: "pending_review", error: "Kravet venter på manuell godkjenning." };
     }
-    if (claim.status === "expired" || claim.status === "rejected" || claim.status === "superseded") {
-      return { success: false, error: `Claim is ${claim.status}` };
+    if (claim.status === "superseded") {
+      return { success: false, status: "superseded", error: "Denne koden er erstattet av en nyere. Bruk koden i den nyeste e-posten fra oss: be om koden fra butikksiden med samme e-postadresse, så får du opp riktig kodefelt." };
     }
+    if (claim.status === "rejected") {
+      return { success: false, status: "rejected", error: "Kravet er avvist etter manuell gjennomgang. Mener du at det er feil, ta kontakt med oss." };
+    }
+    if (claim.status === "expired") return { success: false, status: "expired", error: `Koden er utløpt. ${askAgain}` };
     // A code from before decision 11=A went to whatever address the claimant
     // typed, so it is not accepted (the row itself is left as it is).
     if (!claim.code_sent_to) {
-      return { success: false, error: "Koden er ikke lenger gyldig. Be om en ny kode." };
+      return { success: false, status: "expired", error: `Koden er ikke lenger gyldig. ${askAgain}` };
     }
 
     // Check expiry
     if (new Date(claim.expires_at) < new Date()) {
       db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ?").run(claimId);
-      return { success: false, error: "Claim has expired" };
+      return { success: false, status: "expired", error: `Koden er utløpt. ${askAgain}` };
     }
 
     // Verify code — the last allowed wrong one (claimLimits, 5) expires the
     // claim, so even the right code no longer works after that. The count is
     // raised in SQL, never from the value read above.
     if (!claimCodeMatches(claim.verification_code, code)) {
+      const limits = claimLimits();
       db.prepare(
         `UPDATE agent_claims
             SET failed_attempts = COALESCE(failed_attempts, 0) + 1,
                 status = CASE WHEN COALESCE(failed_attempts, 0) + 1 >= ? THEN 'expired' ELSE status END
           WHERE id = ? AND status = 'code_sent'`
-      ).run(claimLimits().maxFailedAttempts, claimId);
-      const after = db.prepare("SELECT status FROM agent_claims WHERE id = ?").get(claimId) as { status: string } | undefined;
-      return after?.status === "expired"
-        ? { success: false, error: "For mange feil koder. Kravet er utløpt – be om en ny kode." }
-        : { success: false, error: "Invalid verification code" };
+      ).run(limits.maxFailedAttempts, claimId);
+      const after = db.prepare("SELECT status, failed_attempts FROM agent_claims WHERE id = ?").get(claimId) as
+        { status: string; failed_attempts: number | null } | undefined;
+      if (after?.status === "expired") {
+        // Rule 4 still holds the profile's slot: say when a new code can come.
+        const opensAt = claimTimeMs(claim.created_at) + limits.profileWindowHours * 3_600_000;
+        const next = opensAt > Date.now()
+          ? `Du kan be om en ny kode fra butikksiden ${formatClaimTime(new Date(opensAt))}.`
+          : askAgain;
+        return { success: false, status: "expired", attemptsLeft: 0, error: `For mange feil koder. Kravet er utløpt. ${next}` };
+      }
+      const attemptsLeft = Math.max(limits.maxFailedAttempts - Number(after?.failed_attempts ?? 0), 0);
+      return {
+        success: false, status: "invalid_code", attemptsLeft,
+        error: `Feil kode. Du har ${attemptsLeft} forsøk igjen. Sjekk at du bruker koden i den nyeste e-posten fra oss.`,
+      };
     }
 
     // Rule 3 holds at verify time too: if the profile got an owner after the

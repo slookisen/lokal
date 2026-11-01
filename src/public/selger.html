@@ -211,10 +211,24 @@
   <div class="container">
     <!-- ═══════════ VIEW: CLAIM FLOW ═══════════ -->
     <div id="viewClaim">
+      <!-- K2 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): on
+           /selger?agent=<id> for a producer not taken over, the store with
+           «Dette er min butikk» comes first — above the registration hero and
+           «Allerede registrert?», so it is above the fold on a phone too.
+           Hidden in the markup; showSingleStore() shows it. -->
+      <div class="card" id="singleStore" style="display: none; border: 2px solid var(--forest);">
+        <h2 style="color: var(--forest); font-size: 1.2rem;">Ta over siden til butikken din</h2>
+        <div style="padding: 1rem; background: var(--gray-50); border-radius: 12px; border: 1px solid var(--gray-200); margin-bottom: 1rem;">
+          <strong id="singleStoreName"></strong><br>
+          <span id="singleStoreCity" style="color: var(--gray-500); font-size: 0.9rem;"></span>
+        </div>
+        <button class="btn btn-primary" id="btnSingleStoreClaim" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Dette er min butikk</button>
+      </div>
+
       <!-- Welcome hero -->
       <div class="claim-hero">
         <h1>Gjør butikken din synlig for AI</h1>
-        <p>Registrer deg på Rett fra Bonden, og kunder som spør ChatGPT, Claude eller Siri om lokal mat finner deg automatisk. Det tar under 2 minutter.</p>
+        <p>Registrer deg på Rett fra Bonden. Det tar under 2 minutter.</p>
       </div>
 
       <!-- ══════ LOGIN BANNER — prominent, above everything ══════ -->
@@ -238,14 +252,6 @@
           <div class="step active"><span class="step-num">1</span> <span>Finn butikken</span></div>
           <div class="step"><span class="step-num">2</span> <span>Registrer / ta eierskap</span></div>
           <div class="step"><span class="step-num">3</span> <span>Dashboard</span></div>
-        </div>
-        <div id="singleStore" style="display: none;">
-          <h2 style="color: var(--forest); font-size: 1.2rem;">Ta over siden til butikken din</h2>
-          <div style="padding: 1rem; background: var(--gray-50); border-radius: 12px; border: 1px solid var(--gray-200); margin-bottom: 1rem;">
-            <strong id="singleStoreName"></strong><br>
-            <span id="singleStoreCity" style="color: var(--gray-500); font-size: 0.9rem;"></span>
-          </div>
-          <button class="btn btn-primary" id="btnSingleStoreClaim" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Dette er min butikk</button>
         </div>
         <div id="findDefault">
         <h2 style="color: var(--forest); font-size: 1.2rem;">Finn butikken din</h2>
@@ -384,6 +390,8 @@
           <input type="text" id="verifyCode" maxlength="6" pattern="[0-9]{6}" style="text-align: center; font-size: 1.5rem; letter-spacing: 0.5rem;" />
         </div>
         <button class="btn btn-primary" id="btnVerifyClaim">Bekreft og gå til dashboardet</button>
+        <!-- K1: the same code once more, to the same address (once, ≥ 10 min after the first send). -->
+        <button class="btn btn-secondary" id="btnResendClaimCode" style="margin-top: 0.5rem;">Send koden på nytt</button>
       </div>
     </div>
 
@@ -943,9 +951,15 @@
       var alertEl = document.getElementById('findAlert');
       if (alertEl) alertEl.innerHTML = '';
       document.getElementById('singleStore').style.display = '';
+      // K2: the store card stands first on the page; the search card under the
+      // hero has nothing to show here (its search is hidden above).
+      document.getElementById('findSection').style.display = 'none';
       document.getElementById('btnSingleStoreClaim').addEventListener('click', function() {
         startClaimFlow(agentId, cleanName);
       });
+      // K1: a code already sent for this store (this browser, not yet entered)
+      // brings the code field straight back.
+      if (readOpenClaim(agentId)) startClaimFlow(agentId, cleanName);
     }
 
     (function preselectFromQuery() {
@@ -979,6 +993,10 @@
               showSingleStore(infoAgent.id, resolvedName, infoAgent.city);
               return;
             }
+            // K1: a store that has an owner now takes no code — a claim kept
+            // for it in this browser is done with.
+            var doneClaim = infoAgent.id ? readOpenClaim(infoAgent.id) : null;
+            if (doneClaim) clearOpenClaim(doneClaim.claimId);
             const findNameEl = document.getElementById("findName");
             if (findNameEl) {
               findNameEl.value = resolvedName;
@@ -1312,6 +1330,73 @@
       show('claimStep2');
     }
 
+    // ── K1: the open claim survives a new tab or a reload ──
+    // dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post. A sent code's
+    // claimId used to live only in this page's memory, so a reload or another
+    // tab could not take the code. The open claim (store id, claimId, masked
+    // recipient, expiry) is kept in localStorage under 'rfb_open_claim' and
+    // brings the code field back when the page is opened for the same store.
+    // It is removed when the claim is verified, expired, rejected or replaced.
+    // (On another device the claimant asks again with the same e-mail: the
+    // server returns the same claim, status code_already_sent.)
+    function readOpenClaim(agentId) {
+      try {
+        var open = JSON.parse(localStorage.getItem('rfb_open_claim') || 'null');
+        if (!open || typeof open !== 'object' || !open.claimId || open.agentId !== agentId) return null;
+        if (!(Date.parse(open.expiresAt) > Date.now())) {
+          localStorage.removeItem('rfb_open_claim');
+          return null;
+        }
+        return open;
+      } catch (e) { return null; }
+    }
+    function saveOpenClaim(agentId, data) {
+      try {
+        if (!agentId || !data || !data.claimId || !data.expiresAt) return;
+        localStorage.setItem('rfb_open_claim', JSON.stringify({
+          agentId: agentId,
+          claimId: data.claimId,
+          sentTo: data.sentTo || '',
+          via: data.via || 'farm_email',
+          expiresAt: data.expiresAt,
+          resendAvailableAt: data.resendAvailableAt === undefined ? '' : data.resendAvailableAt
+        }));
+      } catch (e) { /* localStorage not available */ }
+    }
+    // With a claimId, only that claim is forgotten (a newer one stays).
+    function clearOpenClaim(id) {
+      try {
+        if (id) {
+          var open = JSON.parse(localStorage.getItem('rfb_open_claim') || 'null');
+          if (!open || open.claimId !== id) return;
+        }
+        localStorage.removeItem('rfb_open_claim');
+      } catch (e) {}
+    }
+    // «Send koden på nytt» is offered until its one resend is used (null).
+    function showResendButton(visible) {
+      var btn = document.getElementById('btnResendClaimCode');
+      btn.style.display = visible ? '' : 'none';
+      btn.disabled = false;
+    }
+    // Opens the code step for the open claim kept for this store, if any.
+    function resumeOpenClaim(agentId) {
+      var open = readOpenClaim(agentId);
+      if (!open) return false;
+      claimAgentId = agentId;
+      claimId = open.claimId;
+      hide('claimStep2');
+      show('claimStep2b');
+      showResendButton(open.resendAvailableAt !== null);
+      if (open.via && open.via !== 'farm_email') {
+        showAlert('verifyAlert', 'Koden er alt sendt til ' + escHtml(open.sentTo) + '. Skriv den inn her.', 'info', true);
+      } else {
+        showAlert('verifyAlert', 'Koden er alt sendt til gårdens e-post ' + escHtml(open.sentTo) + '. Skriv den inn her.', 'info', true);
+      }
+      document.getElementById('claimStep2b').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return true;
+    }
+
     document.getElementById('btnRequestClaim').addEventListener('click', async function() {
       var name = document.getElementById('claimName').value.trim();
       var email = document.getElementById('claimEmail').value.trim();
@@ -1342,6 +1427,7 @@
                 body: JSON.stringify({ claimId: claimId, code: devVerificationCode })
               });
               if (verifyRes.success) {
+                clearOpenClaim();
                 state.claimToken = verifyRes.data.claimToken;
                 state.agentId = verifyRes.data.agentId || claimAgentId;
                 hide('claimStep2');
@@ -1358,9 +1444,16 @@
           // Fallback: show code and manual verify step
           hide('claimStep2');
           show('claimStep2b');
+          // K1: keep the open claim for a reload or another tab; the server
+          // answers code_already_sent (same claimId, no new code) when the
+          // same e-mail asks again while the code is valid.
+          saveOpenClaim(claimAgentId, res.data);
+          showResendButton(res.data.resendAvailableAt !== null);
           if (devVerificationCode) {
             showAlert('verifyAlert', 'Koden din er: <strong>' + escHtml(devVerificationCode) + '</strong> (e-post er ikke satt opp ennå)', 'info', true);
             document.getElementById('verifyCode').value = devVerificationCode;
+          } else if (res.data.status === 'code_already_sent') {
+            showAlert('verifyAlert', escHtml(res.message) || 'Koden er alt sendt. Skriv den inn her.', 'info', true);
           } else if (res.data.sentTo) {
             // The farm's address, masked by the server (p*****t@g******.no).
             showAlert('verifyAlert', 'Koden er sendt til gårdens e-post: ' + escHtml(res.data.sentTo), 'info', true);
@@ -1384,14 +1477,46 @@
           body: JSON.stringify({ claimId: claimId, code: code })
         });
         if (res.success) {
+          clearOpenClaim();
           state.claimToken = res.data.claimToken;
           state.agentId = res.data.agentId || claimAgentId;
           saveSession();
           showAlert('verifyAlert', t('claim_success'), 'success');
           setTimeout(function() { loadDashboard(); }, 1000);
         } else {
-          showAlert('verifyAlert', escHtml(res.error) || t('verify_error'), 'error');
+          // K3: the server's Norwegian message says what to do next (tries
+          // left on a wrong code), so it stays. Only a wrong code keeps the
+          // open claim; any other state (expired, replaced, rejected,
+          // verified, unknown, waiting for approval) is done with (K1).
+          if (res.data && res.data.status && res.data.status !== 'invalid_code') clearOpenClaim(claimId);
+          showAlert('verifyAlert', escHtml(res.error) || t('verify_error'), 'error', true);
         }
+      } catch (err) {
+        showAlert('verifyAlert', escHtml(err.message), 'error');
+      }
+      this.disabled = false;
+    });
+
+    // ── K1: «Send koden på nytt» — the same code, to the same address ──
+    document.getElementById('btnResendClaimCode').addEventListener('click', async function() {
+      if (!claimAgentId || !claimId) return;
+      this.disabled = true;
+      try {
+        var res = await api('/agents/' + claimAgentId + '/claim/resend', {
+          method: 'POST',
+          body: JSON.stringify({ claimId: claimId })
+        });
+        if (res.success) {
+          // One resend per claim: the button goes, and so does the offer kept for a reload.
+          showResendButton(false);
+          saveOpenClaim(claimAgentId, res.data);
+          showAlert('verifyAlert', escHtml(res.message) || 'Koden er sendt på nytt.', 'success', true);
+          return;
+        }
+        var reason = res.data && res.data.reason;
+        if (reason === 'already_resent') showResendButton(false);
+        if (reason && ['not_found', 'verified', 'pending_review', 'closed', 'expired'].indexOf(reason) !== -1) clearOpenClaim(claimId);
+        showAlert('verifyAlert', escHtml(res.error) || 'Vi fikk ikke sendt koden på nytt nå. Prøv igjen senere.', 'error', true);
       } catch (err) {
         showAlert('verifyAlert', escHtml(err.message), 'error');
       }
@@ -2925,11 +3050,16 @@
     // Start claim flow for a matched agent
     function startClaimFlow(agentId, agentName) {
       document.getElementById('findSection').classList.add('hidden');
+      // K2: the single-store card stands apart at the top now; it goes with
+      // the search card once the claim starts.
+      document.getElementById('singleStore').style.display = 'none';
       document.getElementById('claimStep2').classList.remove('hidden');
       document.getElementById('claimAgentName').textContent = agentName;
       document.getElementById('claimAgentDesc').textContent = 'Bekreft at du eier denne butikken for å ta kontroll over agenten.';
       claimAgentId = agentId;  // Critical: set the module-level var used by btnRequestClaim
       state.agentId = agentId;
+      // K1: a code already sent for this store → straight to the code field.
+      if (resumeOpenClaim(agentId)) return;
       document.getElementById('claimStep2').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 

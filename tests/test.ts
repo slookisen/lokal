@@ -49941,6 +49941,29 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post, K1–K3: the same
+// claimant gets the same claim back (code_already_sent, no new code), «Send
+// koden på nytt» (same code, same farm address, once, ≥ 10 min, platform cap),
+// selger.html keeps the open claim in localStorage, the store card comes
+// before the registration hero (no «Siri»), Norwegian verify errors with the
+// tries left. Pins getDb() to its own in-memory DB, stubs the e-mail
+// transporter (restored in finally) and runs selger.html's script in node:vm.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-11-01-rfb-kravflyt: claim across tabs, resend, store first, Norwegian errors ──");
+  try {
+    const { runRfbClaimKravflytTests } = require("../src/routes/rfb-claim-kravflyt.test") as
+      typeof import("../src/routes/rfb-claim-kravflyt.test");
+    const kf = await runRfbClaimKravflytTests({ log: false });
+    passed += kf.passed;
+    failed += kf.failed;
+    for (const f of kf.failures) failures.push("rfb-claim-kravflyt: " + f);
+    console.log(`  rfb-claim-kravflyt: ${kf.passed} passed, ${kf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-kravflyt: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-22-rfb-utsending-v4, skive 1: /selger?agent=<id> viser
 // bare den ene butikken når produsenten ikke er tatt over.
 runSerial(async () => {

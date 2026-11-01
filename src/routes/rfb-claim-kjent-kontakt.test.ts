@@ -381,7 +381,9 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       eq(claimRow(r1.body.data.claimId).status, "superseded", "ac4: the earlier code gets status 'superseded' (not deleted)");
       eq(claimsOf("ac4").length, rowsBefore + 1, "ac4: all rows are kept");
       const old = await verify("ac4", r1.body.data.claimId, claimRow(r1.body.data.claimId).verification_code);
-      eq([old.status, old.body?.error], [400, "Claim is superseded"], "ac4: a superseded code no longer works");
+      // K3 (dev-request 2026-11-01-rfb-kravflyt-tal-eiere-fra-e-post): Norwegian, says to use the newest e-mail.
+      eq([old.status, old.body?.data?.status, String(old.body?.error).startsWith("Denne koden er erstattet av en nyere")], [400, "superseded", true],
+        "ac4: a superseded code no longer works");
 
       // Platform-wide cap: CLAIM_CODE_SENDS_PER_HOUR_MAX sends in the last hour.
       const capped = db.prepare("SELECT COUNT(*) AS n FROM agent_claims WHERE code_sent_to IS NOT NULL AND datetime(created_at) >= datetime('now', '-1 hours')").get() as { n: number };
@@ -420,12 +422,14 @@ export async function runRfbClaimKjentKontaktTests(opts: { log?: boolean } = {})
       const wrong = code === "999999" ? "999998" : "999999";
 
       const cross = await verify("ac5-other", id, code);
-      eq([cross.status, cross.body?.error], [400, "Claim not found"], "ac5: verify under another profile's :id → not found");
+      eq([cross.status, cross.body?.data?.status, String(cross.body?.error).startsWith("Vi finner ikke dette kravet")], [400, "not_found", true],
+        "ac5: verify under another profile's :id → not found (K3: Norwegian)");
       eq([claimRow(id).status, claimRow(id).failed_attempts], ["code_sent", 0], "ac5: … and it does not touch the claim");
 
       for (let i = 1; i <= 4; i++) {
         const v = await verify("ac5", id, wrong);
-        eq([v.status, v.body?.error], [400, "Invalid verification code"], `ac5: wrong code ${i} → invalid`);
+        eq([v.status, v.body?.data?.status, v.body?.data?.attemptsLeft, String(v.body?.error).includes(`Du har ${5 - i} forsøk igjen`)],
+          [400, "invalid_code", 5 - i, true], `ac5: wrong code ${i} → invalid, ${5 - i} tries left (K3)`);
       }
       eq([claimRow(id).status, claimRow(id).failed_attempts], ["code_sent", 4], "ac5: 4 wrong codes — still open, counted");
       const fifth = await verify("ac5", id, wrong);
