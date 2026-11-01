@@ -349,6 +349,8 @@ interface FixtureSnapshot {
   owner_profile_pause: any[];
   owner_feature_level_choice: any[];
   owner_feature_intro: any[];
+  /** T7: the «Nyheter og tips» question state (owner_feature_prompt). */
+  owner_feature_prompt: any[];
   agent_knowledge: any;
 }
 
@@ -365,6 +367,7 @@ export function snapshotFixture(db: any, agentId: string): FixtureSnapshot {
     owner_profile_pause: rows("owner_profile_pause", "agent_id = ?", agentId),
     owner_feature_level_choice: rows("owner_feature_level_choice", "vertical = ? AND subject_id = ?", VERTICAL, agentId),
     owner_feature_intro: rows("owner_feature_intro", "vertical = ? AND subject_id = ?", VERTICAL, agentId),
+    owner_feature_prompt: rows("owner_feature_prompt", "vertical = ? AND subject_id = ?", VERTICAL, agentId),
     agent_knowledge: tableExists(db, "agent_knowledge")
       ? db.prepare(`SELECT about, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) ?? null
       : null,
@@ -426,6 +429,10 @@ function restoreSnapshot(db: any, agentId: string, snap: FixtureSnapshot): void 
     if (tableExists(db, "owner_feature_intro")) {
       db.prepare(`DELETE FROM owner_feature_intro WHERE vertical = ? AND subject_id IN (${pinned})`).run(VERTICAL, agentId);
       insertRows(db, "owner_feature_intro", snap.owner_feature_intro);
+    }
+    if (tableExists(db, "owner_feature_prompt")) {
+      db.prepare(`DELETE FROM owner_feature_prompt WHERE vertical = ? AND subject_id IN (${pinned})`).run(VERTICAL, agentId);
+      insertRows(db, "owner_feature_prompt", snap.owner_feature_prompt ?? []);
     }
     if (snap.agent_knowledge) {
       db.prepare(`UPDATE agent_knowledge SET about = ?, curated_fields = ? WHERE agent_id IN (${pinned})`)

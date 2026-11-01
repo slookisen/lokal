@@ -269,11 +269,13 @@ export const OWNER_FEATURE_GROUPS: Array<{ key: OwnerFeatureGroup; label: Locali
   { key: "products", label: { no: "Produkter og priser", en: "Products and prices" } },
   { key: "orders", label: { no: "Bestillinger", en: "Orders" } },
   { key: "payments", label: { no: "Betaling", en: "Payment" } },
-  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
   { key: "auto", label: { no: "Hjelp med å holde profilen oppdatert", en: "Help keeping your profile up to date" } },
   { key: "stats", label: { no: "Statistikk og offentlige tall", en: "Statistics and public numbers" } },
-  { key: "comms", label: { no: "Kontakt fra Rett fra Bonden", en: "Contact from Rett fra Bonden" } },
   { key: "connect", label: { no: "Koblinger", en: "Connections" } },
+  // T7 (punkt 1): notifications, then «Kontakt fra Rett fra Bonden» as the
+  // last group — the «Nyheter og tips» question stands at its top.
+  { key: "notify", label: { no: "Varsler til deg", en: "Notifications to you" } },
+  { key: "comms", label: { no: "Kontakt fra Rett fra Bonden", en: "Contact from Rett fra Bonden" } },
 ];
 
 const DR = "2026-10-22-rfb-mine-valg-eierbrytere";
@@ -810,6 +812,9 @@ export const OWNER_FEATURE_REGISTRY: OwnerFeatureEntry[] = [
   entry({
     key: "comms.news", group: "comms", type: "switch",
     label: t("Nyheter og tips", "News and tips"),
+    // T7: the allowlisted «Mine valg» page shows the versioned consent text
+    // (news-consent.ts) in this row instead; this description stays as it is
+    // because the public «For produsenter» page reads it (not allowlisted).
     description: t(
       "Om du vil ha nyheter og tips fra Rett fra Bonden på e-post. Vi lagrer svaret ditt med tidspunkt. Vi sender ingen nyhetsbrev automatisk.",
       "Whether you want news and tips from Rett fra Bonden by e-mail. We store your answer with the time. We send no newsletter automatically.",

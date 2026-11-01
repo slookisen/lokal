@@ -20,16 +20,22 @@ import { SlidingWindowCap } from "../services/a2a-traffic-classifier";
 import {
   applyOwnerLevel,
   applyOwnerSingleChange,
-  answerOwnerIntro,
+  answerOwnerNewsQuestion,
+  batchKeys,
   currentOwnerLevel,
   findOwnerLevel,
   getOwnerChangeBatch,
   latestUndoableBatch,
   ownerFeatureChangeLog,
   previewOwnerLevel,
-  readOwnerIntro,
+  readOwnerNewsState,
   undoOwnerChange,
+  type OwnerNewsAnswer,
 } from "../owner-features/changes";
+import {
+  OWNER_NEWS_ANSWER_TEXT, OWNER_NEWS_CONSENT_VERSION, OWNER_NEWS_PLACEMENTS, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NEWS_PLACEMENT_ROW,
+  type OwnerNewsPlacement,
+} from "../owner-features/news-consent";
 import { formatOwnerFeatureValue, ownerPageStatsFrom, renderOwnerFeaturesPageBody, type OwnerPageNotice, type OwnerPageStats } from "../owner-features/page";
 import {
   OWNER_ANCHOR_FALLBACK, OWNER_ANCHOR_LEVEL, OWNER_ANCHOR_LEVEL_PREVIEW, OWNER_ANCHOR_NEWS_QUESTION, OWNER_ANCHOR_PLANNED,
@@ -208,7 +214,8 @@ router.put("/api/owner/:id/features/:key", (req: Request, res: Response) => {
 //   POST /eier/:agentId/valg/sett       { key, value[, confirmed] } one entry
 //   POST /eier/:agentId/valg/niva       { level, confirmed } apply a level
 //   POST /eier/:agentId/valg/angre      { batch } undo the newest change
-//   POST /eier/:agentId/valg/intro      { answer: yes|no } first-login card
+//   POST /eier/:agentId/valg/intro      { answer: yes|later|never } the
+//                                       «Nyheter og tips» question (T7)
 // Same order of checks as the API: allowlist (404) → owner session (401) →
 // isVerifiedOwner (403) → [POST] Origin check (403) → per-session write limit
 // (shared with PUT: the PUT answers 429, a page POST 303 «For mange
@@ -301,8 +308,10 @@ const PAGE_MESSAGES: Record<string, { ok: boolean; text: string }> = {
   angret: { ok: true, text: "Endringen er angret." },
   angre_umulig: { ok: false, text: "Denne endringen kan ikke angres lenger." },
   angre_endret: { ok: false, text: "Endringen kan ikke angres fordi valget er endret siden." },
-  intro_ja: { ok: true, text: "Takk! Svaret ditt er lagret: du vil ha nyheter og tips." },
-  intro_nei: { ok: true, text: "Takk! Svaret ditt er lagret: ingen nyheter og tips." },
+  // T7: the «Nyheter og tips» answers (shown in the group / the row).
+  intro_ja: { ok: true, text: OWNER_NEWS_ANSWER_TEXT.yes },
+  intro_ikke_na: { ok: true, text: OWNER_NEWS_ANSWER_TEXT.later },
+  intro_nei: { ok: true, text: OWNER_NEWS_ANSWER_TEXT.never },
   ugyldig: { ok: false, text: "Verdien er ikke gyldig." },
   feil: { ok: false, text: "Klarte ikke å lagre. Prøv igjen." },
   for_mange: { ok: false, text: "For mange endringer. Prøv igjen om litt." },
@@ -433,6 +442,14 @@ function batchNotice(agentId: string, batchId: number): OwnerPageNotice | null {
   return { ok: true, text, undoBatchId: undoable && undoable.id === batch.id ? batch.id : null };
 }
 
+/** T7: is batch `batchId` a single comms.news change (not an undo, not a level)? */
+function isNewsBatch(agentId: string, batchId: number): boolean {
+  const batch = getOwnerChangeBatch(VERTICAL, agentId, batchId);
+  if (!batch || batch.kind !== "single") return false;
+  const keys = batchKeys(batch);
+  return keys.length === 1 && keys[0] === "comms.news";
+}
+
 router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
   try {
     const g = pageGate(req);
@@ -456,6 +473,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
     if (Number.isFinite(changedId) && changedId > 0) {
       notice = batchNotice(agentId, changedId);
       if (notice && !noticeAt) noticeAt = ownerBatchAnchor(VERTICAL, agentId, changedId, db);
+      // T7: «Ja takk» says so in its own words («Angre» stays on the message) —
+      // only when that batch is the comms.news change; else the normal message.
+      if (notice && qs("melding") === "intro_ja" && isNewsBatch(agentId, changedId)) notice = { ...notice, text: OWNER_NEWS_ANSWER_TEXT.yes };
     }
     const msg = own(PAGE_MESSAGES, qs("melding"));
     if (!notice && msg) notice = { ok: msg.ok, text: msg.text };
@@ -476,9 +496,9 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
 
     const page = Number.parseInt(qs("side"), 10);
     const log = ownerFeatureChangeLog(VERTICAL, agentId, Number.isFinite(page) ? page : 1);
-    // v2 principle 8: the first-login card asks only while «Nyheter og tips»
-    // has no answer — neither on the card nor set in its row.
-    const newsAnswered = resolvedKey("comms.news")?.source === "owner";
+    // T7: the «Nyheter og tips» question (top of #gruppe-comms) and the row's
+    // «Du sa ja/nei {dato}» — read only, a GET writes nothing.
+    const news = readOwnerNewsState(VERTICAL, agentId, resolved, { db });
     let orderable: { count: number; itemsHref: string } | null = null;
     try { orderable = { count: countOwnerOrderableItems(agentId, db), itemsHref: itemsHref(agentId) }; } catch (e) {
       console.error("[owner-features] orderable count failed:", e);
@@ -496,7 +516,8 @@ router.get("/eier/:agentId/valg", (req: Request, res: Response) => {
       agent: { id: agent.id, name: String(agent.name || "") },
       resolved,
       level: currentOwnerLevel(VERTICAL, agentId, resolved),
-      showIntro: !readOwnerIntro(VERTICAL, agentId) && !newsAnswered,
+      showIntro: news.showQuestion,
+      newsAnswer: news.answer,
       notice,
       noticeAt,
       confirm,
@@ -546,8 +567,13 @@ router.post("/eier/:agentId/valg/sett", express.urlencoded({ extended: false }),
       if (!until) return backTo(res, agentId, "melding=ugyldig_dato", anchor);
     }
     const db = getDb();
+    // T7: a consent key changed in its row records the place (and, for
+    // comms.news, the consent text version) on its audit row.
+    const consent = e.consent
+      ? { textVersion: e.key === "comms.news" ? OWNER_NEWS_CONSENT_VERSION : null, placement: OWNER_NEWS_PLACEMENT_ROW }
+      : null;
     const out = db.transaction(() => {
-      const o = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token) });
+      const o = applyOwnerSingleChange(VERTICAL, agentId, key, value, { actor: "owner", detail: sessionEmail(g.token), consent });
       if (until && o.result.kind === "ok" && o.result.changed) {
         db.prepare(`UPDATE ${OWNER_PAUSE_TABLE} SET pause_until = ? WHERE agent_id = ?`).run(until, agentId);
       }
@@ -631,8 +657,15 @@ router.post("/eier/:agentId/valg/angre", express.urlencoded({ extended: false })
   }
 });
 
+/** The form's answer → yes | later | never ("no" from a page cached before T7 = an explicit no). */
+function newsAnswerOf(raw: unknown): OwnerNewsAnswer | null {
+  if (raw === "yes" || raw === "later" || raw === "never") return raw;
+  if (raw === "no") return "never";
+  return null;
+}
+
 router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-  // T5: the news question's answer lands on its group (the row: #valg-comms.news).
+  // T5/T7: the question stands in #gruppe-comms; «Ja takk» lands on its row (#valg-comms.news).
   const anchor = OWNER_ANCHOR_NEWS_QUESTION;
   try {
     const g = pageGate(req);
@@ -641,11 +674,16 @@ router.post("/eier/:agentId/valg/intro", express.urlencoded({ extended: false })
     if (guard) return guard(res);
     const agentId = g.agentId;
     const body = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
-    const answer = body.answer === "yes" ? "yes" : body.answer === "no" ? "no" : null;
+    const answer = newsAnswerOf(body.answer);
     if (!answer) return backTo(res, agentId, "melding=ugyldig", anchor);
-    const out = answerOwnerIntro(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) });
-    if (out.batchId) return backTo(res, agentId, `endret=${out.batchId}`, anchor, { place: false });
-    return backTo(res, agentId, `melding=${answer === "yes" ? "intro_ja" : "intro_nei"}`, anchor);
+    const placement: OwnerNewsPlacement = (OWNER_NEWS_PLACEMENTS as readonly string[]).includes(String(body.placement))
+      ? (body.placement as OwnerNewsPlacement)
+      : OWNER_NEWS_PLACEMENT_QUESTION;
+    const out = answerOwnerNewsQuestion(VERTICAL, agentId, answer, { actor: "owner", detail: sessionEmail(g.token) }, { placement });
+    if (out.kind !== "ok") return backTo(res, agentId, "melding=ingen_endring", anchor);
+    console.log(`[owner-features] owner answered the news question (${answer}) for agent ${agentId}`);
+    if (out.batchId) return backTo(res, agentId, `endret=${out.batchId}&melding=intro_ja`, anchor, { place: false });
+    return backTo(res, agentId, `melding=${answer === "yes" ? "intro_ja" : answer === "later" ? "intro_ikke_na" : "intro_nei"}`, anchor);
   } catch (e: any) {
     console.error("[owner-features] POST valg/intro failed:", e);
     return backTo(res, String(req.params.agentId || ""), "melding=feil", anchor);

@@ -348,7 +348,8 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       const newsLive = reg.findOwnerFeature("comms.news")?.status === "live";
       const i1 = await post(H.intro, NEWS_ID, { answer: "yes" });
       if (newsLive) {
-        assertTrue(i1.status === 303 && /\?endret=\d+#gruppe-comms$/.test(loc(i1)), `r42: «Ja takk» → 303 …?endret=<n>#gruppe-comms (${loc(i1)})`);
+        // T7: the yes carries its own confirmation (melding=intro_ja) next to the batch.
+        assertTrue(i1.status === 303 && /\?endret=\d+&melding=intro_ja#gruppe-comms$/.test(loc(i1)), `r42: «Ja takk» → 303 …?endret=<n>&melding=intro_ja#gruppe-comms (${loc(i1)})`);
         const pi = await follow(NEWS_ID, loc(i1));
         assertTrue(elementById(pi, "gruppe-comms").includes(`id="valg-comms.news"`) && toastIn(pi, "valg-comms.news"), "r43: the answer's message stands in the row #valg-comms.news inside #gruppe-comms");
         const ui = await post(H.angre, NEWS_ID, { batch: String(endret(loc(i1))) });
@@ -356,8 +357,8 @@ export async function runOwnerFeaturesT5AnchorsTests(opts: { log?: boolean } = {
       } else {
         assertEq(loc(i1), P(NEWS_ID, "?melding=intro_ja&ved=gruppe-comms#gruppe-comms"), "r42: «Ja takk» → #gruppe-comms");
       }
-      const i2 = await post(H.intro, NEWS_NO_ID, { answer: "no" });
-      assertEq(loc(i2), P(NEWS_NO_ID, "?melding=intro_nei&ved=gruppe-comms#gruppe-comms"), "r45: «Nei takk» → #gruppe-comms");
+      const i2 = await post(H.intro, NEWS_NO_ID, { answer: "never" });
+      assertEq(loc(i2), P(NEWS_NO_ID, "?melding=intro_nei&ved=gruppe-comms#gruppe-comms"), "r45: «Nei, ikke spør meg igjen» → #gruppe-comms");
       assertTrue(toastIn(await follow(NEWS_NO_ID, loc(i2)), "gruppe-comms"), "r46: …message in the group card");
       assertEq(loc(await post(H.intro, NEWS_NO_ID, { answer: "kanskje" })), P(NEWS_NO_ID, "?melding=ugyldig&ved=gruppe-comms#gruppe-comms"), "r47: junk answer → #gruppe-comms");
 

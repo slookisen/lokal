@@ -65,6 +65,12 @@ export interface OwnerFeatureSubject {
   conditions?: Partial<Record<OwnerFeatureCondition, { met: boolean; reason?: LocalizedText }>>;
 }
 
+/** T7: consent metadata for a consent key's audit row (text version + where it was answered). */
+export interface OwnerConsentStamp {
+  textVersion: string | null;
+  placement: string | null;
+}
+
 export interface OwnerFeatureOptions {
   db?: any;
   env?: NodeJS.ProcessEnv;
@@ -577,7 +583,7 @@ export function setOwnerFeatureValue(
   subjectId: string,
   key: string,
   rawValue: unknown,
-  actor: { actor: "owner" | "admin" | "cs" | "system"; detail?: string | null },
+  actor: { actor: "owner" | "admin" | "cs" | "system"; detail?: string | null; consent?: OwnerConsentStamp | null },
   opts: OwnerFeatureOptions = {},
 ): SetOwnerFeatureResult {
   const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
@@ -620,10 +626,21 @@ export function setOwnerFeatureValue(
     // not cover: written last, a failed log insert can never leave the
     // column changed without its «Mine valg» log row. An adapter that does
     // not write rolls the lokal.db rows back (AdapterRefusal below).
-    db.prepare(
-      `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(vertical, subjectId, key, JSON.stringify(current ?? null), JSON.stringify(v.value), actor.actor, actor.detail ?? null, now);
+    // T7: a consent key's audit row also says which consent text the owner
+    // saw and where (owner_feature_audit.text_version / placement).
+    const stamp = e.consent && actor.consent ? actor.consent : null;
+    if (stamp) {
+      db.prepare(
+        `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at, text_version, placement)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(vertical, subjectId, key, JSON.stringify(current ?? null), JSON.stringify(v.value), actor.actor, actor.detail ?? null, now,
+        stamp.textVersion ?? null, stamp.placement ?? null);
+    } else {
+      db.prepare(
+        `INSERT INTO owner_feature_audit (vertical, subject_id, key, old_json, new_json, actor, actor_detail, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(vertical, subjectId, key, JSON.stringify(current ?? null), JSON.stringify(v.value), actor.actor, actor.detail ?? null, now);
+    }
     if (e.storage) {
       const w = e.storage.write(db, subjectId, v.value);
       if (w !== true) {

@@ -19,6 +19,10 @@
 //   7. Words: no «Gjelder ikke» for something the owner can get later; «Nytt»
 //      only on live entries; «Alltid» / «Låst på» explained the first time.
 //   8. The first-login answer is the comms.news row's value at once.
+//      T7: no first-login card any more — the «Nyheter og tips» question
+//      stands at the top of «Kontakt fra Rett fra Bonden» (the last group)
+//      while unanswered; «Ja takk» and «Ikke nå» weigh the same, a real no
+//      is a quiet link button; the row says «Du sa ja/nei {dato}.».
 //   9. Foldable cards, jump links on mobile; a save updates only its card
 //      when JavaScript runs (progressive enhancement), and every form works
 //      as a plain POST → 303 without it.
@@ -56,6 +60,7 @@ import {
 } from "./anchors";
 import { OPPLEVAGENT_PRICE_MESSAGE } from "./price-message";
 import { OWNER_TOKEN_CSS } from "../owner-ui/tokens";
+import { OWNER_COMMS_GROUP_NOTE, OWNER_NEWS_CONSENT_TEXT, OWNER_NEWS_PLACEMENT_QUESTION, OWNER_NOTIFY_GROUP_NOTE } from "./news-consent";
 
 /** Entries that need this key on are shown only when it is on (spec «Grensesnitt»). */
 export const OWNER_PAGE_REVEAL_KEY = "orders.enabled";
@@ -72,6 +77,8 @@ export const OWNER_PAGE_ORDERS_KEY = "orders.enabled";
 export const OWNER_PAGE_PAUSE_KEY = "visibility.profile";
 /** The order-address row (the old form inside the /eier «Bestillinger» card). */
 export const OWNER_PAGE_ORDER_EMAIL_KEY = "orders.email";
+/** T7: the consent row whose question stands at the top of its group. */
+export const OWNER_PAGE_NEWS_KEY = "comms.news";
 /** Heading of the planned box; the count is appended as « (N)». */
 export const OWNER_PAGE_PLANNED_TITLE = "Planlagt — si fra hvis du vil ha dette";
 
@@ -163,7 +170,10 @@ export interface OwnerPageModel {
   registry?: OwnerFeatureEntry[];
   /** The owner's own level choice; null = none made (no level marked). */
   level: OwnerLevelKey | "custom" | null;
+  /** T7: the «Nyheter og tips» question stands at the top of #gruppe-comms. */
   showIntro: boolean;
+  /** T7: the comms.news row's «Du sa ja/nei {dato}.» (null/unset = nothing to say). */
+  newsAnswer?: { answer: "yes" | "no"; at: string } | null;
   notice: OwnerPageNotice | null;
   /**
    * T5 (anchor contract, owner-features/anchors.ts): the id of the card or
@@ -338,6 +348,17 @@ function formatWhen(iso: string): string {
   }
 }
 
+/** An ISO time as the Oslo date, dd.mm.yyyy. */
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  try {
+    return new Intl.DateTimeFormat("nb-NO", { timeZone: "Europe/Oslo", day: "2-digit", month: "2-digit", year: "numeric" }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
+}
+
 function formatDay(ymd: string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
   return m ? `${m[3]}.${m[2]}.${m[1]}` : ymd;
@@ -478,6 +499,10 @@ function rowExtraHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeat
       : "") +
       `<p class="mv-desc">Vil du heller at profilen slettes for godt? <a href="mailto:${cs}?subject=${subject}&amp;body=${body}">Be om sletting</a> — kundeservice hjelper deg.</p>`;
   }
+  if (!m.variant && e.key === OWNER_PAGE_NEWS_KEY && m.newsAnswer) {
+    const day = formatDate(m.newsAnswer.at);
+    return `<p class="mv-desc" data-news-answer="${esc(m.newsAnswer.answer)}">${esc(m.newsAnswer.answer === "yes" ? `Du sa ja ${day}.` : `Du sa nei ${day}.`)}</p>`;
+  }
   if (e.key === OWNER_PAGE_ORDER_EMAIL_KEY) {
     const oe = m.orderEmail;
     if (!oe) return "";
@@ -613,8 +638,11 @@ function rowHtml(ctx: RenderCtx, e: OwnerFeatureEntry, r: ResolvedOwnerFeature, 
     confirm = confirmHtml(ctx.m, swap);
     if (confirm) ctx.confirmPlaced = true;
   }
+  // T7: the news row shows the versioned consent text — only here, on the
+  // allowlisted RFB page (the registry description feeds public pages).
+  const desc = !ctx.m.variant && e.key === OWNER_PAGE_NEWS_KEY ? OWNER_NEWS_CONSENT_TEXT.row.no : e.description.no;
   return `<li class="mv-item" id="${esc(ownerRowAnchor(e.key))}" data-key="${esc(e.key)}">
-          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(e.description.no)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
+          <div class="mv-item-text"><strong>${esc(e.label.no)}</strong>${badges}<p class="mv-desc">${esc(desc)}</p>${reason}${explain}${rowExtraHtml(ctx, e, r)}</div>
           <div class="mv-item-ctl">${controlHtml(ctx, e, r, swap)}</div>${noticeAtHtml(ctx, ownerRowAnchor(e.key))}${confirm}
         </li>`;
 }
@@ -643,10 +671,14 @@ function groupsHtml(ctx: RenderCtx, registry: OwnerFeatureEntry[]): string {
     const hiddenNote = hidden.length && reveal
       ? `<p class="mv-note">${hidden.length} valg til vises når du slår på «${esc(reveal.label.no)}».</p>`
       : "";
+    // T7: the group subtitles, and the news question at the top of «comms» (RFB page only).
+    const note = m.variant ? "" : g.key === "comms" ? OWNER_COMMS_GROUP_NOTE : g.key === "notify" ? OWNER_NOTIFY_GROUP_NOTE : "";
     return `<section class="ep-card mv-group" id="${esc(swap)}" data-group="${esc(g.key)}" aria-labelledby="mv-h-${esc(g.key)}">
         <details class="mv-fold" open>
           <summary class="mv-fold-summary"><h2 id="mv-h-${esc(g.key)}">${esc(g.label.no)}</h2></summary>
+          ${note ? `<p class="mv-desc mv-group-note">${esc(note)}</p>` : ""}
           ${noticeAtHtml(ctx, swap)}
+          ${g.key === "comms" ? newsQuestionHtml(m, swap) : ""}
           ${basic ? `<ul class="mv-list">${basic}</ul>` : ""}
           ${adv ? `<details class="mv-more"${advOpen ? " open" : ""}><summary>Flere valg</summary><ul class="mv-list">${adv}</ul></details>` : ""}
           ${hiddenNote}
@@ -782,15 +814,28 @@ function confirmHtml(m: OwnerPageModel, swap: string): string {
       </div>`;
 }
 
-function introHtml(m: OwnerPageModel): string {
-  if (!m.showIntro) return "";
-  const form = (answer: "yes" | "no", label: string, cls: string) =>
-    `<form method="post" action="${esc(actionPath(m, "/intro"))}" class="mv-ctl-form"><input type="hidden" name="answer" value="${answer}"><button type="submit" class="ep-btn ${cls}">${label}</button></form>`;
-  return `<section class="ep-card mv-intro" id="velkommen" aria-labelledby="mv-h-intro">
-        <h2 id="mv-h-intro">Nyheter og tips</h2>
-        <p>Vil du ha nyheter og tips fra Rett fra Bonden på e-post? Det er frivillig. Svaret ditt blir valget «Nyheter og tips» under «Kontakt fra Rett fra Bonden», og der kan du endre det når som helst.</p>
-        <div class="ep-form-actions">${form("yes", "Ja takk", "ep-btn-primary")}${form("no", "Nei takk", "ep-btn-secondary")}</div>
-      </section>`;
+/**
+ * T7: the «Nyheter og tips» question at the top of «Kontakt fra Rett fra
+ * Bonden» — never a pop-up, never at the top of the page, never by e-mail.
+ * «Ja takk» and «Ikke nå» carry the same class (neither is primary); «Nei,
+ * ikke spør meg igjen» is a quiet POST link button. The answer lands in the
+ * group (or, for «Ja takk», in the row #valg-comms.news).
+ */
+function newsQuestionHtml(m: OwnerPageModel, swap: string): string {
+  if (!m.showIntro || m.variant) return "";
+  const t = OWNER_NEWS_CONSENT_TEXT;
+  const form = (answer: "yes" | "later" | "never", label: string, cls: string) =>
+    rowForm(m, "/intro", swap,
+      `<input type="hidden" name="answer" value="${answer}"><input type="hidden" name="placement" value="${esc(OWNER_NEWS_PLACEMENT_QUESTION)}">` +
+      `<button type="submit" class="${cls}">${esc(label)}</button>`);
+  return `<div class="mv-question" data-news-question="1" role="group" aria-labelledby="mv-h-intro">
+          <h3 id="mv-h-intro">${esc(t.question)}</h3>
+          <p>${esc(t.body)}</p>
+          <p class="mv-desc">${esc(t.always)}</p>
+          <div class="ep-form-actions mv-question-actions">${form("yes", t.yes, "ep-btn ep-btn-secondary mv-answer")}${form("later", t.later, "ep-btn ep-btn-secondary mv-answer")}</div>
+          <p class="mv-desc">${esc(t.laterNote)}</p>
+          ${form("never", t.never, "mv-linkbtn")}
+        </div>`;
 }
 
 function logHtml(ctx: RenderCtx): string {
@@ -1021,6 +1066,14 @@ ${OWNER_TOKEN_CSS}  .mv-page, .mv-page * { overflow-wrap: anywhere; }
   .mv-toast-error { background: var(--ow-err-bg); color: var(--ow-err-text); border: 1px solid var(--ow-err-line); }
   .mv-toast.mv-toast-inline { position: static; box-shadow: none; margin-top: 8px; }
   .mv-pager { align-items: center; }
+  .mv-group-note { margin: 0 0 8px; }
+  .mv-question { margin: 4px 0 12px; padding: 12px 14px; border: 1px solid var(--ow-border); border-radius: 10px; }
+  .mv-question h3 { font-size: 1rem; margin: 0 0 6px; }
+  .mv-question p { margin: 6px 0 0; }
+  .mv-question-actions { margin-top: 12px; }
+  .mv-linkbtn { display: inline-flex; align-items: center; min-height: 44px; padding: 0 4px; margin-top: 4px; background: none; border: none; color: var(--ow-accent); font: inherit; font-size: 0.92rem; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+  .mv-linkbtn:hover { text-decoration-thickness: 2px; }
+  .mv-linkbtn:focus-visible { outline: 3px solid var(--ow-accent-line); outline-offset: 2px; border-radius: 4px; }
   .mv-stats { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   @media (min-width: 640px) { .mv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   .mv-stat { border: 1px solid var(--ow-border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -1057,7 +1110,6 @@ export function renderOwnerFeaturesPageBody(m: OwnerPageModel): string {
         ${jumpNavHtml(m, registry)}
       </div>
       ${statsHtml(m)}
-      ${introHtml(m)}
       ${levelsHtml(ctx)}
       ${groupsHtml(ctx, registry)}
       ${plannedHtml(ctx, registry)}

@@ -51076,6 +51076,28 @@ runSerial(async () => {
   }
 });
 
+// Eierportal testrunde 1, T7 («Nyheter og tips» nederst, uten refleks-nei):
+// the question at the top of #gruppe-comms (the last group), equal «Ja takk» /
+// «Ikke nå», a quiet «Nei, ikke spør meg igjen»; «Ikke nå» writes no setting or
+// audit row and rests 90 days (three rounds max); «Ja takk» audited with
+// text_version + placement and undoable; consent text hash pinned per version.
+// Swaps getDb() + env + module cache (restored in finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── eierportal testrunde 1 T7: «Nyheter og tips» nederst ──");
+  try {
+    const { runOwnerFeaturesT7Tests } = require("../src/routes/owner-features-t7.test") as
+      typeof import("../src/routes/owner-features-t7.test");
+    const r = await runOwnerFeaturesT7Tests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-features-t7: " + f);
+    console.log(`  owner-features-t7: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-features-t7: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-21 live-go handlevogn-pilot og første handel, skive 2:
 // one-time order activation link (AC8). Swaps the getDb() singleton and env
 // (restored in finally) — runSerial, tail position.

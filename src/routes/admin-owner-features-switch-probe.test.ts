@@ -139,6 +139,8 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
     // Starting state with explicit choices, so the restore has something to put back.
     db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, 'comms.news', 'true', 'owner', 0, '2026-10-20T10:00:00.000Z')`).run(FIX);
     db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'yes', '2026-10-20T10:00:00.000Z', ?)`).run(FIX, FIX_EMAIL);
+    // T7: the news question's state is part of the snapshot too.
+    db.prepare(`INSERT INTO owner_feature_prompt (vertical, subject_id, key, state, rounds, snoozed_until, answered_at, actor_detail) VALUES ('rfb', ?, 'comms.news', 'later', 1, '2027-01-18T10:00:00.000Z', NULL, ?)`).run(FIX, FIX_EMAIL);
     // A real owner's stored state next to the fixture: the probe must never touch it.
     for (const [k, v] of [["comms.news", "false"], ["visibility.english", "false"]]) {
       db.prepare(`INSERT INTO owner_feature_settings (vertical, subject_id, key, value_json, set_by, admin_locked, set_at) VALUES ('rfb', ?, ?, ?, 'owner', 0, '2026-10-19T09:00:00.000Z')`).run(REAL, k, v);
@@ -146,6 +148,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
     db.prepare(`INSERT INTO owner_profile_pause (agent_id, paused_at, pause_until, set_by) VALUES (?, '2026-10-19T09:00:00.000Z', '2099-01-01', 'owner')`).run(REAL);
     db.prepare(`INSERT INTO owner_feature_level_choice (vertical, subject_id, level, chosen_at, actor_detail, batch_id) VALUES ('rfb', ?, 'bare_synlig', '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no', NULL)`).run(REAL);
     db.prepare(`INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail) VALUES ('rfb', ?, 'no', '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no')`).run(REAL);
+    db.prepare(`INSERT INTO owner_feature_prompt (vertical, subject_id, key, state, rounds, snoozed_until, answered_at, actor_detail) VALUES ('rfb', ?, 'comms.news', 'never', 2, NULL, '2026-10-19T09:00:00.000Z', 'post@sp-real.example.no')`).run(REAL);
     db.prepare(`UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?`).run(JSON.stringify({ about: { by: "owner", locked_at: "2026-10-19T09:00:00.000Z" } }), REAL);
 
     const setBaseEnv = () => {
@@ -192,6 +195,7 @@ export async function runAdminOwnerFeaturesSwitchProbeTests(opts: { log?: boolea
       pause: db.prepare("SELECT * FROM owner_profile_pause WHERE agent_id = ?").all(id),
       level: db.prepare("SELECT * FROM owner_feature_level_choice WHERE subject_id = ?").all(id),
       intro: db.prepare("SELECT * FROM owner_feature_intro WHERE subject_id = ?").all(id),
+      prompt: db.prepare("SELECT * FROM owner_feature_prompt WHERE subject_id = ?").all(id),
       knowledge: db.prepare("SELECT about, curated_fields, email FROM agent_knowledge WHERE agent_id = ?").get(id),
     });
 

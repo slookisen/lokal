@@ -21,11 +21,24 @@ import {
 import {
   resolveOwnerFeatures,
   setOwnerFeatureValue,
+  type OwnerConsentStamp,
   type OwnerFeatureOptions,
   type ResolvedOwnerFeatures,
 } from "./resolve";
+import {
+  OWNER_NEWS_CONSENT_VERSION,
+  OWNER_NEWS_MAX_ROUNDS,
+  OWNER_NEWS_PLACEMENT_QUESTION,
+  OWNER_NEWS_SNOOZE_DAYS,
+  type OwnerNewsPlacement,
+} from "./news-consent";
 
-export type OwnerActor = { actor: "owner" | "admin" | "cs" | "system"; detail?: string | null };
+export type OwnerActor = {
+  actor: "owner" | "admin" | "cs" | "system";
+  detail?: string | null;
+  /** T7: consent keys only — the consent text version and where it was answered. */
+  consent?: OwnerConsentStamp | null;
+};
 
 // ── Levels («Hvor aktiv vil du være?») ─────────────────────────────────────
 // S2e (v2 principle 3, «Ærlige nivåer»): exactly two levels — «Bare synlig»
@@ -648,49 +661,182 @@ export function ownerFeatureChangeLog(
   return { rows, total, page: p, pages };
 }
 
-// ── First-login card («Nyheter og tips») ───────────────────────────────────
+// ── «Nyheter og tips» — the question at the top of «Kontakt fra RFB» ───────
+// T7 (punkt 1): the S2b first-login card is gone. The question stands at the
+// top of the group «Kontakt fra Rett fra Bonden» (the last group) while it
+// has no answer, with three answers:
+//   yes    → comms.news on through setOwnerFeatureValue (one audit row with
+//            text_version + placement, one batch: «Angre» works)
+//   later  → NO owner_feature_settings row and NO audit row; the question
+//            rests OWNER_NEWS_SNOOZE_DAYS days, at most OWNER_NEWS_MAX_ROUNDS
+//            times — after the last «Ikke nå» it is never shown again
+//   never  → an explicit no with its time (owner_feature_prompt)
+// A subject with an S2b owner_feature_intro row has answered already.
 
+/** The S2b first-login answer (owner_feature_intro), or null. */
 export function readOwnerIntro(vertical: string, subjectId: string, db: any = getDb()): { answer: "yes" | "no"; answered_at: string } | null {
-  const row = db
-    .prepare(`SELECT answer, answered_at FROM owner_feature_intro WHERE vertical = ? AND subject_id = ?`)
-    .get(vertical, subjectId) as { answer: "yes" | "no"; answered_at: string } | undefined;
-  return row ?? null;
+  try {
+    const row = db
+      .prepare(`SELECT answer, answered_at FROM owner_feature_intro WHERE vertical = ? AND subject_id = ?`)
+      .get(vertical, subjectId) as { answer: "yes" | "no"; answered_at: string } | undefined;
+    return row ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export const OWNER_INTRO_KEY = "comms.news";
 
+export type OwnerNewsAnswer = "yes" | "later" | "never";
+export const OWNER_NEWS_ANSWERS: readonly OwnerNewsAnswer[] = ["yes", "later", "never"];
+
+export interface OwnerNewsPromptRow {
+  vertical: string;
+  subject_id: string;
+  key: string;
+  state: OwnerNewsAnswer;
+  rounds: number;
+  snoozed_until: string | null;
+  answered_at: string | null;
+  actor_detail: string | null;
+}
+
+/** The question's row (owner_feature_prompt), or null. */
+export function readOwnerNewsPrompt(vertical: string, subjectId: string, db: any = getDb()): OwnerNewsPromptRow | null {
+  try {
+    const row = db
+      .prepare(`SELECT vertical, subject_id, key, state, rounds, snoozed_until, answered_at, actor_detail FROM owner_feature_prompt WHERE vertical = ? AND subject_id = ? AND key = ?`)
+      .get(vertical, subjectId, OWNER_INTRO_KEY) as OwnerNewsPromptRow | undefined;
+    return row ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** What the page shows for «Nyheter og tips»: the question, and «Du sa ja/nei {dato}» in the row. */
+export interface OwnerNewsState {
+  /** The question stands at the top of «Kontakt fra Rett fra Bonden». */
+  showQuestion: boolean;
+  /** The owner's answer as the row tells it (null = none to tell). */
+  answer: { answer: "yes" | "no"; at: string } | null;
+}
+
 /**
- * Stores the first-login answer once (the row = the consent record with its
- * time; the card is not shown again). When comms.news is live, a «ja» is
- * also applied as the owner's explicit choice through setOwnerFeatureValue
- * (audit row + batch, so it can be undone). While comms.news is coming_soon
- * only the answer is stored — nothing is sent either way.
+ * Reads only (a GET never writes). The question is shown while comms.news
+ * is a live, changeable entry the owner has not set (no owner row, not on),
+ * there is no S2b intro row, no «Nei, ikke spør meg igjen», and «Ikke nå»
+ * is neither resting nor used up. After «Angre» on a «Ja takk» the owner's
+ * row is gone again, so the question is back where it was.
  */
-export function answerOwnerIntro(
+export function readOwnerNewsState(
   vertical: OwnerFeatureVertical,
   subjectId: string,
-  answer: "yes" | "no",
+  resolved: ResolvedOwnerFeatures,
+  opts: { db?: any; now?: Date } = {},
+): OwnerNewsState {
+  const db = opts.db ?? getDb();
+  const now = opts.now ?? new Date();
+  const r = resolved.byKey[OWNER_INTRO_KEY];
+  const intro = readOwnerIntro(vertical, subjectId, db);
+  const prompt = readOwnerNewsPrompt(vertical, subjectId, db);
+  const ownerSet = !!r && r.source === "owner";
+  let showQuestion = !!r && r.changeable && !ownerSet && r.value !== true && !intro;
+  if (showQuestion && prompt) {
+    if (prompt.state === "never") showQuestion = false;
+    else if (prompt.state === "later") {
+      const rounds = Number(prompt.rounds) || 0;
+      const until = prompt.snoozed_until ? new Date(prompt.snoozed_until).getTime() : 0;
+      if (rounds >= OWNER_NEWS_MAX_ROUNDS || (Number.isFinite(until) && until > now.getTime())) showQuestion = false;
+    }
+  }
+  // «Du sa ja/nei {dato}»: the newest explicit answer that matches the value now.
+  let answer: OwnerNewsState["answer"] = null;
+  if (r) {
+    const want: "yes" | "no" = r.value === true ? "yes" : "no";
+    const times: string[] = [];
+    if (prompt && prompt.answered_at && ((want === "yes" && prompt.state === "yes") || (want === "no" && prompt.state === "never"))) {
+      times.push(prompt.answered_at);
+    }
+    if (intro && intro.answer === want) times.push(intro.answered_at);
+    if (ownerSet) {
+      try {
+        const a = db
+          .prepare(`SELECT at FROM owner_feature_audit WHERE vertical = ? AND subject_id = ? AND key = ? AND actor = 'owner' AND new_json = ? ORDER BY id DESC LIMIT 1`)
+          .get(vertical, subjectId, OWNER_INTRO_KEY, want === "yes" ? "true" : "false") as { at?: string } | undefined;
+        if (a?.at) times.push(a.at);
+      } catch { /* no audit table → nothing to add */ }
+    }
+    const latest = times.filter((t) => !Number.isNaN(new Date(t).getTime())).sort().pop();
+    if (latest) answer = { answer: want, at: latest };
+  }
+  return { showQuestion, answer };
+}
+
+export type AnswerOwnerNewsResult =
+  | { kind: "ok"; answer: OwnerNewsAnswer; batchId: number | null; changed: boolean }
+  | { kind: "not_open" }
+  | { kind: "not_found" };
+
+/**
+ * One answer to the question. Only while the question is open for this
+ * subject (readOwnerNewsState().showQuestion); otherwise `not_open` and
+ * nothing is written. Runs in one transaction.
+ */
+export function answerOwnerNewsQuestion(
+  vertical: OwnerFeatureVertical,
+  subjectId: string,
+  answer: OwnerNewsAnswer,
   actor: OwnerActor,
-  opts: OwnerFeatureOptions = {},
-): { kind: "ok"; stored: boolean; applied: boolean; batchId: number | null } {
+  opts: OwnerFeatureOptions & { now?: Date; placement?: OwnerNewsPlacement } = {},
+): AnswerOwnerNewsResult {
   const registry = opts.registry ?? ownerFeatureRegistryFor(vertical);
   const db = opts.db ?? getDb();
+  const now = opts.now ?? new Date();
   const o = { ...opts, db, registry };
-  return db.transaction(() => {
-    const info = db
-      .prepare(
-        `INSERT INTO owner_feature_intro (vertical, subject_id, answer, answered_at, actor_detail)
-         VALUES (?, ?, ?, ?, ?) ON CONFLICT(vertical, subject_id) DO NOTHING`,
-      )
-      .run(vertical, subjectId, answer, new Date().toISOString(), actor.detail ?? null);
-    if (info.changes === 0) return { kind: "ok" as const, stored: false, applied: false, batchId: null };
-    const e = findOwnerFeature(OWNER_INTRO_KEY, registry);
-    if (!e || e.status !== "live") return { kind: "ok" as const, stored: true, applied: false, batchId: null };
+  try {
+  return db.transaction((): AnswerOwnerNewsResult => {
+    const resolved = resolveOwnerFeatures(vertical, subjectId, o);
+    if (!resolved.subject.exists) return { kind: "not_found" };
+    if (!readOwnerNewsState(vertical, subjectId, resolved, { db, now }).showQuestion) return { kind: "not_open" };
+    const prompt = readOwnerNewsPrompt(vertical, subjectId, db);
+    const iso = now.toISOString();
+    const upsert = db.prepare(
+      `INSERT INTO owner_feature_prompt (vertical, subject_id, key, state, rounds, snoozed_until, answered_at, actor_detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(vertical, subject_id, key) DO UPDATE SET
+         state = excluded.state, rounds = excluded.rounds, snoozed_until = excluded.snoozed_until,
+         answered_at = excluded.answered_at, actor_detail = excluded.actor_detail`,
+    );
+    const rounds = Number(prompt?.rounds) || 0;
+    if (answer === "later") {
+      const until = new Date(now.getTime() + OWNER_NEWS_SNOOZE_DAYS * 86_400_000).toISOString();
+      upsert.run(vertical, subjectId, OWNER_INTRO_KEY, "later", rounds + 1, until, null, actor.detail ?? null);
+      return { kind: "ok", answer, batchId: null, changed: false };
+    }
+    if (answer === "never") {
+      upsert.run(vertical, subjectId, OWNER_INTRO_KEY, "never", rounds, null, iso, actor.detail ?? null);
+      return { kind: "ok", answer, batchId: null, changed: false };
+    }
+    upsert.run(vertical, subjectId, OWNER_INTRO_KEY, "yes", rounds, null, iso, actor.detail ?? null);
     const before = maxAuditId(db);
     const prior = explicitRowKeys(db, vertical, subjectId);
-    const out = setOwnerFeatureValue(vertical, subjectId, OWNER_INTRO_KEY, answer === "yes", actor, o);
-    const applied = out.kind === "ok" && out.changed;
-    const batchId = applied ? recordBatch(db, vertical, subjectId, before, "single", null, actor, prior) : null;
-    return { kind: "ok" as const, stored: true, applied, batchId };
+    const stamped: OwnerActor = {
+      ...actor,
+      consent: { textVersion: OWNER_NEWS_CONSENT_VERSION, placement: opts.placement ?? OWNER_NEWS_PLACEMENT_QUESTION },
+    };
+    const out = setOwnerFeatureValue(vertical, subjectId, OWNER_INTRO_KEY, true, stamped, o);
+    // Refused after all (a lock appeared): keep nothing, not even the «yes» row.
+    if (out.kind !== "ok") throw new NewsAnswerRollback();
+    const changed = out.changed;
+    const batchId = changed ? recordBatch(db, vertical, subjectId, before, "single", null, actor, prior) : null;
+    return { kind: "ok", answer, batchId, changed };
   })();
+  } catch (e) {
+    if (e instanceof NewsAnswerRollback) return { kind: "not_open" };
+    throw e;
+  }
+}
+
+class NewsAnswerRollback extends Error {
+  constructor() { super("news answer rollback"); }
 }

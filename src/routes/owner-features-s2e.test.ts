@@ -21,8 +21,8 @@
  *         profile with «Mine valg»; both choices (and the order address) are
  *         in «Mine valg» with the same effect (the 12-surface pause matrix and
  *         the order-address case live in owner-feature-matrix.test.ts).
- *   AC30  «Ja takk» on the first-login card → the «Nyheter og tips» row shows
- *         «På» at once.
+ *   AC30  «Ja takk» on the «Nyheter og tips» question (T7: in #gruppe-comms,
+ *         no first-login card) → the row shows «På» at once.
  *   plus  principle 7 wording, principle 9 (foldable cards, jump links,
  *         row-swap forms), escaping of the new parts.
  *
@@ -557,29 +557,31 @@ export async function runOwnerFeaturesS2eTests(opts: { log?: boolean } = {}): Pr
       setEnv("OWNER_PAUSE_ENABLED", null);
     }
 
-    // ═══ AC30 — the first-login answer is the row's value ══════════════════
+    // ═══ AC30 — the answer is the row's value (T7: the question in #gruppe-comms) ═══
     {
       const b0 = await pageHtml(OWNED_ID);
-      assertTrue(b0.includes(`id="velkommen"`) && row(b0, "comms.news").includes(">Av<"), "AC30: before the answer: the card, and the row says «Av»");
+      assertTrue(!b0.includes(`id="velkommen"`) && b0.includes(`data-news-question="1"`) && row(b0, "comms.news").includes(">Av<"),
+        "AC30 (T7): before the answer: the question (no top card), and the row says «Av»");
       const i = await post(H.intro, OWNED_ID, { answer: "yes" });
       const target = loc(i);
-      assertTrue(target.startsWith(`/eier/${OWNED_ID}/valg?endret=`), "AC30: «Ja takk» → 303 with the change");
-      const bid = String(new URLSearchParams(target.split("?")[1]).get("endret"));
-      const b1 = await pageHtml(OWNED_ID, { endret: bid });
-      assertTrue(row(b1, "comms.news").includes(">På<") && !b1.includes(`id="velkommen"`), "AC30: the «Nyheter og tips» row shows «På» at once, the card is gone");
-      assertTrue(b1.includes("Lagret: «Nyheter og tips» er På.") && b1.includes(">Angre<"), "AC30: the message names the row (and can be undone)");
+      assertTrue(target.startsWith(`/eier/${OWNED_ID}/valg?endret=`) && target.endsWith("#gruppe-comms"), "AC30: «Ja takk» → 303 with the change, to #gruppe-comms");
+      const bid = String(new URLSearchParams(target.split("?")[1].split("#")[0]).get("endret"));
+      const b1 = await pageHtml(OWNED_ID, { endret: bid, melding: "intro_ja" });
+      assertTrue(row(b1, "comms.news").includes(">På<") && !b1.includes(`data-news-question="1"`), "AC30: the «Nyheter og tips» row shows «På» at once, the question is gone");
+      assertTrue(b1.includes("Takk! Du får nyheter og tips på e-post. Du kan slå det av her når som helst.") && b1.includes(">Angre<"), "AC30 (T7): the confirmation (and it can be undone)");
       assertEq((db.prepare("SELECT value_json, set_by FROM owner_feature_settings WHERE subject_id = ? AND key = 'comms.news'").get(OWNED_ID) as any), { value_json: "true", set_by: "owner" },
         "AC30: stored as the owner's explicit choice");
-      assertEq((db.prepare("SELECT answer FROM owner_feature_intro WHERE subject_id = ?").get(OWNED_ID) as any)?.answer, "yes", "AC30: the consent record with its time");
-      const n = await post(H.intro, NEWS_NO_ID, { answer: "no" });
-      assertEq(loc(n), `/eier/${NEWS_NO_ID}/valg?melding=intro_nei&ved=gruppe-comms#gruppe-comms`, "AC30: «Nei takk» → message");
-      const bn = await pageHtml(NEWS_NO_ID);
-      assertTrue(row(bn, "comms.news").includes(">Av<") && !bn.includes(`id="velkommen"`), "AC30: «Nei takk» → the row says «Av», no card");
-      // Principle 8: set in the row first → the card does not ask again.
+      assertEq((db.prepare("SELECT state FROM owner_feature_prompt WHERE subject_id = ? AND key = 'comms.news'").get(OWNED_ID) as any)?.state, "yes", "AC30: the consent record with its time");
+      const n = await post(H.intro, NEWS_NO_ID, { answer: "never" });
+      assertEq(loc(n), `/eier/${NEWS_NO_ID}/valg?melding=intro_nei&ved=gruppe-comms#gruppe-comms`, "AC30 (T7): «Nei, ikke spør meg igjen» → message in #gruppe-comms");
+      const bn = await pageHtml(NEWS_NO_ID, { melding: "intro_nei", ved: "gruppe-comms" });
+      assertTrue(row(bn, "comms.news").includes(">Av<") && !bn.includes(`data-news-question="1"`), "AC30: «Nei» → the row says «Av», no question");
+      assertTrue(bn.includes("Greit. Vi spør ikke igjen. Du kan slå det på her hvis du ombestemmer deg."), "AC30 (T7): ?melding=intro_nei shows the «never» confirmation");
+      // Principle 8: set in the row first → the question does not ask again.
       await post(H.sett, NEWS_ROW_ID, { key: "comms.news", value: "true", confirmed: "1" });
       const br = await pageHtml(NEWS_ROW_ID);
-      assertTrue(!br.includes(`id="velkommen"`) && row(br, "comms.news").includes(">På<"), "principle 8: answered in the row → the card is not shown");
-      assertTrue(!br.includes("Kommer snart") && b0.includes("Svaret ditt blir valget «Nyheter og tips»"), "principle 8: the card promises only what the row does");
+      assertTrue(!br.includes(`data-news-question="1"`) && row(br, "comms.news").includes(">På<"), "principle 8: answered in the row → the question is not shown");
+      assertTrue(!br.includes("Kommer snart") && b0.includes("Vil du ha nyheter og tips på e-post?") && !b0.includes("nyhetsbrev hver"), "principle 8: the question promises only what the row does (no frequency)");
     }
 
     // ═══ Principles 7 + 9 ══════════════════════════════════════════════════
