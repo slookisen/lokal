@@ -43412,6 +43412,25 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B6: /mat/<kategori>/<sted>
+// produkt×sted landing pages on RFB — one gate (≥2 visible producers) for the
+// route and the sitemap, behind RFB_MAT_LANDING_ENABLED.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-09-24-ai-sok-bli-svaret-rfb B6: /mat/<kategori>/<sted> landing pages ──");
+  try {
+    const { runRfbMatLandingTests } = require("../src/routes/rfb-mat-landing.test") as
+      typeof import("../src/routes/rfb-mat-landing.test");
+    const rml = await runRfbMatLandingTests({ log: false });
+    passed += rml.passed;
+    failed += rml.failed;
+    for (const f of rml.failures) failures.push("rfb-mat-landing: " + f);
+    console.log(`  rfb-mat-landing: ${rml.passed} passed, ${rml.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-mat-landing: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-16-opplevagent-stedssider-kvalitet, E4-S2: one place
 // helper (getPlaceFaqStats + buildPlaceFaqJsonLd/buildPlaceAnswerFirstOpening)
 // gives /kommune and /fylke their answer-first lede and FAQPage; category,

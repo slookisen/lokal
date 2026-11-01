@@ -83,6 +83,18 @@ import {
   type SalgskanalCategorySlug,
 } from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B6: /mat/<kategori>/<sted>.
+import {
+  isRfbMatLandingEnabled,
+  isMatLandingComboIndexable,
+  matCategoryBySlug,
+  matLandingPath,
+  collectMatLandingCombos,
+  buildMatLandingAnswerFirst,
+  buildMatLandingFaqJsonLd,
+  type MatLandingCombo,
+  type MatLandingChannels,
+} from "../services/rfb-mat-landing";
 import {
   normalizeOpeningHours,
   parseOpeningHoursText,
@@ -4137,6 +4149,199 @@ router.get("/kategori/:slug", (req: Request, res: Response) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// GET /mat/:kategori/:sted — produkt×sted landing pages
+// dev-request 2026-09-24-ai-sok-bli-svaret-rfb, slice B6. The pattern of
+// Opplevagent's /kategori/:category/:kommune (one gate for route + sitemap,
+// answer-first opening, FAQPage) on the RFB catalogue; the taxonomy, the gate
+// and the text builders live in services/rfb-mat-landing.ts. Behind
+// RFB_MAT_LANDING_ENABLED (default off: the route falls through to the normal
+// 404 and the sitemap has no /mat/ entries). `/kategori/<slug>` stays the
+// sales-channel page.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * The producers a /mat page may list and count: the public list surfaces'
+ * set (getActiveAgents(): active, vetted, listable, non-umbrella, not
+ * delisted), minus a non-producer role (the /produsent role gate), the
+ * owner's visibility.profile / visibility.search_engines choices (empty
+ * unless OWNER_FEATURES_ENFORCE is on), and the slugs the sitemap leaves out
+ * because /produsent/<slug> would 404.
+ */
+function matLandingBaseAgents(): any[] {
+  const hidden = new Set<string>([...ownerHiddenAgentIds("profile"), ...ownerHiddenAgentIds("search_engines")]);
+  return marketplaceRegistry.getActiveAgents().filter((a: any) => {
+    if (failsProducerRoleGate(a.role, false)) return false;
+    if (hidden.has(a.id)) return false;
+    const slug = slugify(String(a.name || ""));
+    return slug.length >= 2 && !SITEMAP_EXCLUDED_PRODUCER_SLUGS.has(slug);
+  });
+}
+
+/** Ids among `ids` that have an agent_knowledge row — one query. */
+function matLandingKnowledgeIds(ids: readonly string[]): Set<string> {
+  if (ids.length === 0) return new Set();
+  const rows = getDb()
+    .prepare(`SELECT agent_id FROM agent_knowledge WHERE agent_id IN (${ids.map(() => "?").join(",")})`)
+    .all(...ids) as Array<{ agent_id: string }>;
+  return new Set(rows.map((r) => r.agent_id));
+}
+
+/**
+ * THE gate for /mat/<kategori>/<sted>: the combinations the route serves and
+ * the sitemap lists, each with its listed producers. A producer counts when it
+ * passes matLandingBaseAgents() and would get a producer page in the sitemap
+ * (WO-17: a knowledge row or a claim); a combination is kept when
+ * isMatLandingComboIndexable() holds for that count. One registry pass and one
+ * knowledge lookup per call — no query per combination. `knowledgeIds` lets
+ * the sitemap reuse the knowledge rows it has already read.
+ */
+function matLandingGatedCombos(opts: {
+  only?: { categorySlug: string; placeSlug: string };
+  knowledgeIds?: (ids: readonly string[]) => Set<string>;
+} = {}): MatLandingCombo<any>[] {
+  const combos = collectMatLandingCombos(matLandingBaseAgents(), {
+    categoriesOf: (a: any) => a.categories,
+    placeSlugsOf: (a: any) => placeSlugsForCity(a.city || a.location?.city || "", a.location),
+    only: opts.only,
+  });
+  const candidateIds = new Set<string>();
+  for (const c of combos.values()) for (const a of c.producers) candidateIds.add(a.id);
+  const known = (opts.knowledgeIds ?? matLandingKnowledgeIds)([...candidateIds]);
+  const out: MatLandingCombo<any>[] = [];
+  for (const c of combos.values()) {
+    const producers = c.producers.filter((a: any) => known.has(a.id) || !!(a.claimed_by_user_id ?? a.claimed_by));
+    if (isMatLandingComboIndexable(producers.length)) out.push({ ...c, producers });
+  }
+  return out.sort((x, y) => matLandingPath(x.category.slug, x.placeSlug).localeCompare(matLandingPath(y.category.slug, y.placeSlug)));
+}
+
+/** Pickup/delivery channel counts for the listed producers (agent_salgskanal), one query; zeros on a failed read. */
+function matLandingChannels(ids: readonly string[]): MatLandingChannels {
+  const ch: MatLandingChannels = { gardsbutikk: 0, rekoRing: 0, selvplukk: 0, hjemlevering: 0 };
+  if (ids.length === 0) return ch;
+  try {
+    const rows = getDb()
+      .prepare(`SELECT DISTINCT agent_id, category_slug FROM agent_salgskanal WHERE agent_id IN (${ids.map(() => "?").join(",")})`)
+      .all(...ids) as Array<{ agent_id: string; category_slug: string }>;
+    for (const r of rows) {
+      if (r.category_slug === "gardsbutikk") ch.gardsbutikk++;
+      else if (r.category_slug === "reko-ring") ch.rekoRing++;
+      else if (r.category_slug === "selvplukk") ch.selvplukk++;
+      else if (r.category_slug === "hjemlevering") ch.hjemlevering++;
+    }
+  } catch (e) {
+    console.warn("[seo /mat] salgskanal read failed:", e);
+  }
+  return ch;
+}
+
+const MAT_LANDING_CSS = `
+  .mat-answer { font-size: 1.05rem; color: var(--charcoal); max-width: 760px; line-height: 1.6; margin-top: 8px; }
+  .mat-more { max-width: 1100px; margin: 0 auto; padding: 0 24px 24px; font-size: 0.95rem; }
+  .mat-more a { color: var(--green-700); }
+`;
+
+router.get("/mat/:kategori/:sted", (req: Request, res: Response, next: any) => {
+  if (!isRfbMatLandingEnabled()) return next();
+  // Norwegian only: the text is generated in Norwegian, so /en and /sv fall
+  // through to the 404 and the page announces no EN alternate.
+  const lang: Lang = req.lang || "no";
+  if (lang !== "no") return next();
+  const rawCat = String(req.params.kategori || "");
+  const rawPlace = String(req.params.sted || "");
+  const catSlug = rawCat.toLowerCase();
+  const placeSlug = rawPlace.toLowerCase();
+  const category = matCategoryBySlug(catSlug);
+  if (!category || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(placeSlug)) return next();
+
+  let combo: MatLandingCombo<any> | undefined;
+  try {
+    combo = matLandingGatedCombos({ only: { categorySlug: catSlug, placeSlug } })[0];
+  } catch (e) {
+    console.error(`[seo /mat] ${catSlug}/${placeSlug} gate failed:`, e);
+    return next();
+  }
+  if (!combo) return next(); // unknown or below the gate: 404, never listed
+  const path = matLandingPath(catSlug, placeSlug);
+  // Upper-case variants of a served page: one canonical URL.
+  if (rawCat !== catSlug || rawPlace !== placeSlug) return res.redirect(301, path);
+
+  try {
+    const producers = combo.producers;
+    const n = producers.length;
+    const first = producers[0];
+    const placeName = fylkeForPlaceSlug(placeSlug) ?? String(first.city || first.location?.city || placeSlug);
+    const producerNames = producers.map((a: any) => String(a.name || ""));
+    const verifiedCount = producers.filter((a: any) => a.isVerified).length;
+    const channels = matLandingChannels(producers.map((a: any) => a.id));
+    const url = BASE_URL + path;
+
+    const answerFirst = buildMatLandingAnswerFirst({ category, placeName, producerNames, channels })
+      || `${category.label} i ${placeName}.`;
+    const faqJsonLd = buildMatLandingFaqJsonLd({ category, placeName, url, producerNames, verifiedCount, channels });
+    const faqSectionHtml = rfbFaqSectionHtml(faqJsonLd, lang);
+
+    const collectionJsonLd = {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name: `${category.label} i ${placeName}`,
+      description: answerFirst,
+      url,
+      mainEntity: {
+        "@type": "ItemList",
+        numberOfItems: n,
+        itemListElement: producers.slice(0, 100).map((a: any, i: number) => ({
+          "@type": "ListItem",
+          position: i + 1,
+          url: BASE_URL + "/produsent/" + slugify(a.name),
+          name: a.name,
+        })),
+      },
+    };
+    const placeUrl = BASE_URL + "/" + placeSlug;
+    const breadcrumbJsonLd = buildBreadcrumbJsonLd([
+      { name: t(lang, "nav.home"), url: `${BASE_URL}/` },
+      { name: placeName, url: placeUrl },
+      { name: category.label, url },
+    ]);
+    const jsonLd: object[] = [collectionJsonLd, breadcrumbJsonLd];
+    if (faqJsonLd) jsonLd.push(faqJsonLd);
+
+    const placeHtml = `<span translate="no">${escapeHtml(placeName)}</span>`;
+    const cards = producers.map((a: any) => producerCard(a, undefined, lang)).join("");
+    const content = `
+    <section class="city-hero">
+      <div class="container">
+        <div class="bc" style="padding:0 0 12px;"><a href="/">${escapeHtml(t(lang, "nav.home"))}</a><span>/</span><a href="/${placeSlug}">${escapeHtml(placeName)}</a><span>/</span>${escapeHtml(category.label)}</div>
+        <h1>${escapeHtml(category.label)} fra lokale produsenter i ${placeHtml}</h1>
+        <p class="mat-answer">${escapeHtml(answerFirst)}</p>
+      </div>
+    </section>
+    <section class="sec">
+      <div class="city-grid">${cards}</div>
+    </section>
+    <div class="mat-more"><a href="/${placeSlug}">Alle lokale produsenter i ${placeHtml} →</a></div>${faqSectionHtml ? `\n    ${faqSectionHtml}` : ""}`;
+
+    const shownNames = producerNames.slice(0, 3);
+    const metaDesc = `${n} lokale produsenter av ${category.noun} i ${placeName}: ${shownNames.join(", ")}${n > shownNames.length ? " m.fl." : ""}. Kontakt produsentene direkte.`;
+    const title = `${category.label} i ${placeName} — ${n} lokale produsenter | ${getConfig().display_name}`;
+
+    recordAiPageDelivery(req, res, "ai_page_list", producers.map((a: any) => a.id));
+    res.send(shell(title, metaDesc, content, {
+      canonical: url,
+      jsonLd,
+      extraCss: CITY_CSS + MAT_LANDING_CSS + (faqSectionHtml ? FAQ_SECTION_CSS : ""),
+      lang,
+      pathForAlternate: path,
+      noEnglish: true,
+    }));
+  } catch (err) {
+    console.error(`SEO /mat/${catSlug}/${placeSlug} error:`, err);
+    res.status(500).send("Intern feil");
+  }
+});
+
 // GET /verifisert-av-eier — dev-request
 // 2026-07-30-rettfrabonden-verifisert-av-eier-badge-og-filter: browse-all page
 // for producers with agent.isVerified === true (the owner-claim/manual
@@ -7175,6 +7380,31 @@ export function buildSitemapXml(): string {
       }
     }
     for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", cityLastmod.get(city) || today);
+
+    // dev-request 2026-09-24-ai-sok-bli-svaret-rfb, B6: the /mat/<kategori>/<sted>
+    // pages the route serves — the same matLandingGatedCombos() gate, with the
+    // knowledge rows read above. Norwegian URL only (the page has no EN
+    // version). lastmod = newest update among the listed producers. Nothing
+    // here with RFB_MAT_LANDING_ENABLED off.
+    if (isRfbMatLandingEnabled()) {
+      try {
+        const combos = matLandingGatedCombos({
+          knowledgeIds: (ids) => new Set(ids.filter((id) => knowledgeByAgent.has(id))),
+        });
+        for (const c of combos) {
+          let lm = "";
+          for (const a of c.producers) {
+            const updatedAt = parseIsoOrSqlite(knowledgeByAgent.get(a.id)?.updatedAt);
+            if (!updatedAt) continue;
+            const l = lastmodForDate(updatedAt);
+            if (l > lm) lm = l;
+          }
+          addEntry(matLandingPath(c.category.slug, c.placeSlug), "weekly", "0.6", lm || today, true);
+        }
+      } catch (e) {
+        console.error("[sitemap] /mat entries failed:", e);
+      }
+    }
 
     // PR-30: producer URLs get per-agent <lastmod> + status-driven priority/changefreq
     // WO-17: pre-flight gate filters agents that would 404 in the route handler
