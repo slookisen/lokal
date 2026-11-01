@@ -49834,6 +49834,27 @@ runSerial(async () => {
   }
 });
 
+// Slice T0e (owner portal): /selger?magic= with an old stored session shows
+// the dashboard on the first try — init waits for the magic login instead of
+// restoring the old session alongside it, and a stale 401 never clears a
+// newer token. Runs selger.html's script in node:vm (fake DOM, Map-backed
+// localStorage); listens for unhandledRejection (removed in finally).
+runSerial(async () => {
+  console.log("\n── T0e: /selger?magic= med gammel lagret innlogging ──");
+  try {
+    const { runSelgerMagicLinkOldSessionT0eTests } = require("../src/routes/selger-magic-link-old-session-t0e.test") as
+      typeof import("../src/routes/selger-magic-link-old-session-t0e.test");
+    const r = await runSelgerMagicLinkOldSessionT0eTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("selger-magic-link-old-session-t0e: " + f);
+    console.log(`  selger-magic-link-old-session-t0e: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("selger-magic-link-old-session-t0e: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-10-01-rfb-contact-extraction-laas-henger: run-locks of
 // POST /admin/rfb-contact-extraction and /admin/gardssalg-contact-extraction
 // carry { startedAt, runId } with an upper bound (stale takeover, runId-guarded
