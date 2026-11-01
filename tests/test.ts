@@ -51905,3 +51905,26 @@ runSerial(async () => {
     failures.push("experiences-for-tilbydere-faq: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Skive C1 (dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-
+// forverring, AC4): POST /admin/homepage-provenance-batch's default
+// auto-select excludes only profiles with a homepage source on
+// address/phone/email (a homepage source on website/about no longer
+// excludes); cohort route + pool-blocker-explain mirror agree. Swaps the
+// getDb() singleton, global fetch, ADMIN_KEY and ANTHROPIC_API_KEY (restored
+// in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── C1: homepage-provenance-batch auto-select — kun kontaktfelt-hjemmesidekilde ekskluderer ──");
+  try {
+    const { runHomepageProvenanceContactFieldSelectorTests } = require("../src/routes/homepage-provenance-contact-field-selector.test") as
+      typeof import("../src/routes/homepage-provenance-contact-field-selector.test");
+    const r = await runHomepageProvenanceContactFieldSelectorTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("homepage-provenance-contact-field-selector: " + f);
+    console.log(`  homepage-provenance-contact-field-selector: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-provenance-contact-field-selector: unexpected error: " + String(err?.message || err));
+  }
+});

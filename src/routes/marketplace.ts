@@ -65,6 +65,7 @@ import { setProducerAvailabilityByProductId } from "../services/supply-graph";
 import { renderPage, shouldEscalateToRender } from "../services/render-page";
 import { normalizeOpeningHours, entryDaysLabel } from "../utils/opening-hours";
 import { issueOwnerSessionForSelgerLogin } from "./owner-portal";
+import { HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL } from "../services/homepage-contact-provenance";
 import {
   publicFieldChoices, publicFieldChoicesForMany, withoutHiddenContact, withoutHiddenFields, publicAgentInfo,
   withoutHiddenCoordinates, hidesPrices, hidesTrust, type PublicFieldChoices,
@@ -8197,9 +8198,19 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       .slice(0, limit)
       .map((r) => r.agent_id);
   } else {
-    // Auto-select: agents with a website, some enrichment data, but
-    // field_provenance is empty/{} or lacks a homepage Tier-A source, and
-    // whose verification_status indicates they need more enrichment.
+    // Auto-select: agents with a website, some enrichment data, whose
+    // verification_status indicates they need more enrichment, and whose
+    // homepage has NOT yet been used for a contact field.
+    // dev-request 2026-10-28-rfb-uttrekk-adresse-og-hjemmeside-forverring
+    // (AC4, skive C1): the exclusion used to be `field_provenance NOT LIKE
+    // '%"homepage"%'` — any homepage source on any field. applyRfbAgentWebsite
+    // writes a homepage source on `website` only (and the thin-profile text
+    // writer on `about`/`description`), so a profile that just got its website
+    // was never picked for contact extraction. Only a homepage source on
+    // address/phone/email (the fields this batch extracts) excludes now;
+    // NULL, '{}' and malformed JSON stay selectable. Shared with
+    // GET /admin/homepage-provenance-cohort and pool-blocker-explain via
+    // services/homepage-contact-provenance.ts.
     const rows = db
       .prepare(
         `SELECT k.agent_id, COALESCE(k.website, a.url) AS homepage_url
@@ -8208,11 +8219,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
           WHERE k.verification_status IN ('data_insufficient', 'review_required', 'pending_verify')
             AND (k.website IS NOT NULL AND k.website != '' OR a.url IS NOT NULL AND a.url != '')
             AND k.about IS NOT NULL AND k.about != ''
-            AND (
-              k.field_provenance IS NULL
-              OR k.field_provenance = '{}'
-              OR k.field_provenance NOT LIKE '%"homepage"%'
-            )
+            ${HOMEPAGE_CONTACT_PROVENANCE_EXCLUSION_SQL}
             ${parkingExclusion}
             ${backoffExclusion}
           -- orch-pr-20260625-1 (controller-handoff 2026-06-24-lokal-agent-enrichment-2
