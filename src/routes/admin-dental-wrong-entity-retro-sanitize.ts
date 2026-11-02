@@ -38,6 +38,8 @@ import {
   type WrongEntityRetroCandidateRow,
 } from "../services/dental-wrong-entity-retro";
 import { parkDentalWrongEntity } from "../services/dental-store";
+import { dentalEnrichmentWritePauseBlock } from "../services/dental-enrichment-write-pause";
+import { ENRICHMENT_WRITE_PAUSE_HTTP_STATUS } from "../services/enrichment-write-pause";
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -111,6 +113,14 @@ router.post("/wrong-entity-retro-sanitize", (req: Request, res: Response) => {
           remaining_before: remainingBefore,
         },
       });
+      return;
+    }
+
+    // Enrichment write-pause fence: apply mode only, before the first write.
+    // Dry-run/read paths stay open.
+    const pauseBlock = dentalEnrichmentWritePauseBlock();
+    if (pauseBlock) {
+      res.status(ENRICHMENT_WRITE_PAUSE_HTTP_STATUS).json(pauseBlock);
       return;
     }
 
