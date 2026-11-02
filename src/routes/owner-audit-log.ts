@@ -16,13 +16,14 @@
 //   E2  who: «Du» / «Rett fra Bonden» / «Automatisk fra nettsiden din»
 //       (ownerAuditWho).
 //   E3  each row carries only what the log shows: no notes, no
-//       changed_by_email, no e-mail address anywhere (an e-mail field shows
-//       no values, and an address inside any other value is replaced by «…»),
-//       no hidden rows, no no-op rows.
+//       changed_by_email, no hidden rows, no no-op rows. An e-mail field
+//       shows no values; inside any other value, an address in one of the
+//       forms listed at stripEmailAddresses is replaced by «…».
 //
 // Rollback: revert. The change only reads; nothing stored changes.
 
 import { openingHoursText } from "../utils/opening-hours";
+import { stripInternalNotes } from "../services/description-quality";
 
 /**
  * The portal form's own labels (already approved owner text), by database
@@ -42,6 +43,7 @@ export const OWNER_PORTAL_FORM_LABELS = {
 /** How a field's values are shown. */
 export type OwnerAuditValueKind =
   | "text"        // whitespace collapsed, e-mail addresses removed, cut at OWNER_AUDIT_TEXT_MAX with «…»
+  | "prose"       // text, minus internal pipeline notes (description-quality stripInternalNotes)
   | "email"       // an e-mail address: the row is shown without its values
   | "bool"        // 1/0, true/false → «Ja» / «Nei»
   | "visible"     // visibility.profile (the pause card): on → «Ja», off… → «Nei»
@@ -81,7 +83,7 @@ export const OWNER_AUDIT_FIELDS: Readonly<Record<string, OwnerAuditField>> = {
   postal_code: { label: L.postal_code, kind: "text" },
   website: { label: L.website, kind: "text" },
   opening_hours: { label: L.opening_hours, kind: "hours" },
-  about: { label: L.about, kind: "text" },
+  about: { label: L.about, kind: "prose" },
   // The same facts under the names other writers use.
   "agent_knowledge.email": { label: L.email, kind: "email" },
   contact_email: { label: L.email, kind: "email" },
@@ -91,7 +93,7 @@ export const OWNER_AUDIT_FIELDS: Readonly<Record<string, OwnerAuditField>> = {
   order_notifications_opt_in: { label: "Ta imot bestillinger", kind: "bool" },
   order_notification_email: { label: "Bestillinger sendes til", kind: "email" },
   // New short names.
-  description: { label: "Kort beskrivelse", kind: "text" },
+  description: { label: "Kort beskrivelse", kind: "prose" },
   categories: { label: "Kategorier", kind: "categories" },
   products: { label: "Varer", kind: "products" },
   specialties: { label: "Spesialiteter", kind: "list" },
@@ -119,22 +121,26 @@ export const OWNER_AUDIT_TEXT_MAX = 80;
 export const OWNER_AUDIT_PRODUCT_NAMES_MAX = 3;
 
 /**
- * Whether a system row's notes name the producer's own website as the source:
- *  - the nightly owner refresh («Hold profilen oppdatert»,
- *    rfb-owner-refresh.ts): «auto.updates=<mode>; kilde=website_homepage <url>; …»;
- *  - any note naming a website source type: «kilde=website_…»;
- *  - thin-profile texts from the profile's website (admin-agents.ts): «… — kilde: <url>»;
+ * The notes formats of the writers that take a value from the producer's own
+ * website, each anchored to that writer's own prefix, so a free-text reason
+ * of any other writer that happens to say «kilde: https://…» or
+ * «kilde=website_…» never counts:
+ *  - the nightly owner refresh («Hold profilen oppdatert», rfb-owner-refresh.ts):
+ *    «auto.updates=<mode>; kilde=<source_type> <url>; <run>»;
+ *  - thin-profile texts from the profile's website (admin-agents.ts):
+ *    «tynne_profiler_slice2: godkjent av dommer ("…") — kilde: <url>» (the URL ends the note);
  *  - the contact extraction from the producer's own website
- *    (admin-rfb-contact-extraction.ts): «rfb-contact-extraction <url> batch:…».
+ *    (admin-rfb-contact-extraction.ts): «rfb-contact-extraction <url> batch:<id>».
  * Brreg, Bondens marked, merges and clean-up sweeps are not website sources.
  */
+const WEBSITE_SOURCE_NOTE_RES: readonly RegExp[] = [
+  /^auto\.updates=[a-z_]+; kilde=/,
+  /^tynne_profiler_slice2: godkjent av dommer \(.*\) — kilde: https?:\/\/\S+$/s,
+  /^rfb-contact-extraction https?:\/\/\S+ batch:/,
+];
+
 export function isWebsiteSourcedSystemNote(notes: unknown): boolean {
-  const n = typeof notes === "string" ? notes.trim() : "";
-  if (!n) return false;
-  return /^auto\.updates=/.test(n)
-    || /\bkilde=website_[a-z_]+/i.test(n)
-    || /\bkilde:\s*https?:\/\//i.test(n)
-    || /^rfb-contact-extraction\s+https?:\/\//i.test(n);
+  return typeof notes === "string" && WEBSITE_SOURCE_NOTE_RES.some((re) => re.test(notes));
 }
 
 /**
@@ -151,20 +157,62 @@ export function ownerAuditWho(changedBy: unknown, notes: unknown): string {
   return OWNER_AUDIT_WHO_RFB;
 }
 
-// Any «local@domain» (also without a top-level domain, e.g. a writer's own
-// cut): never sent to the owner's browser.
-const EMAIL_RE = /[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}\-]+(?:\.[\p{L}\p{N}\-]+)*/gu;
+// ── E-mail addresses out of every shown value ──────────────────────────
+// What is caught (each form has a test in owner-audit-log.test.ts):
+//  - local@domain, also with æøå, also without a top-level domain (a
+//    writer's own cut), and an IP-literal domain (ola@[127.0.0.1]);
+//  - a quoted local part ("ola nordmann"@gard.no);
+//  - «at» written out in brackets — [at] (at) {at} <at> «at», also «[at]» —
+//    and a spaced «@» (ola @ gard.no), both only when a dotted domain
+//    follows ((dot) / [punktum] count as a dot after a bracketed «at»);
+//  - a trailing «local@» (a cut address) at the end or before punctuation;
+//  - after normalising: fullwidth ＠ and small ﹫ and a decomposed «å» (NFKC),
+//    invisible format characters (\p{Cf}: zero-width space, soft hyphen, …)
+//    dropped, and &#64; / &#x40; / &commat; / %40 decoded.
+// Not caught: an address spelled out without brackets («ola at gard dot no»)
+// or split by ordinary spaces inside a word — no pattern can tell those from
+// prose. Handles and prices survive: «Følg oss @gardsbutikk», «@ kveld»,
+// «50 kr @ 2 stk».
+const E_LOCAL = "[\\p{L}\\p{N}._%+'\\-]";
+const E_DOM = "[\\p{L}\\p{N}\\-]";
+const E_DOMAIN = `${E_DOM}+(?:\\.${E_DOM}+)*`;
+const E_DOTTED = `${E_DOM}+(?:\\.${E_DOM}+)+`;
+const E_IP = "\\[[0-9a-f.:]+\\]";
+const E_OPEN = "[\\[({<«]{1,2}";
+const E_CLOSE = "[\\])}>»]{1,2}";
+const E_AT_WORD = `\\s*${E_OPEN}\\s*(?:at|alfa|krøllalfa)\\s*${E_CLOSE}\\s*`;
+const E_DOT = `(?:\\.|\\s*${E_OPEN}\\s*(?:dot|punktum|prikk)\\s*${E_CLOSE}\\s*)`;
+const EMAIL_RE = new RegExp([
+  `"[^"\\n]{1,64}"\\s*@\\s*(?:${E_DOTTED}|${E_IP})`,                   // quoted local part
+  `${E_LOCAL}+@(?:${E_IP}|${E_DOMAIN})`,                              // local@domain (no TLD needed)
+  `${E_LOCAL}+\\s*@\\s*${E_DOTTED}`,                                   // spaced @, dotted domain only
+  `${E_LOCAL}+${E_AT_WORD}(?:${E_DOM}+(?:${E_DOT}${E_DOM}+)+|${E_IP})`, // [at] (at) {at} «at» …
+  `${E_LOCAL}+@(?=\\s*$|[,.;:!?)»"\\]])`,                              // a cut «local@»
+].join("|"), "giu");
 
-/** The text with every e-mail address replaced by «…». */
+/**
+ * The text with every e-mail address (in the forms above) replaced by «…».
+ * The text comes back NFKC-normalised, without format characters and with
+ * &#64; / &commat; / %40 decoded.
+ */
 export function stripEmailAddresses(text: string): string {
-  return text.replace(EMAIL_RE, "…");
+  const t = text
+    .normalize("NFKC")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/&#0*64;|&#x0*40;|&commat;|%40/gi, "@");
+  return t.replace(EMAIL_RE, "…");
 }
 
-/** Whitespace collapsed, addresses removed, cut at `max` characters with «…». */
+/**
+ * Whitespace collapsed, addresses removed, then cut at `max` characters
+ * (code points, so an emoji is never split) with «…». Stripping comes first,
+ * so the cut can never leave part of an address behind.
+ */
 function shortText(raw: string, max = OWNER_AUDIT_TEXT_MAX): string {
-  const s = stripEmailAddresses(raw.replace(/\s+/g, " ").trim());
+  const s = stripEmailAddresses(raw.replace(/\s+/g, " ").trim()).replace(/\s+/g, " ").trim();
   if (!s) return OWNER_AUDIT_EMPTY;
-  return s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
+  const cps = Array.from(s);
+  return cps.length > max ? `${cps.slice(0, max - 1).join("").trimEnd()}…` : s;
 }
 
 // SQLite datetime('now') writes «YYYY-MM-DD HH:MM:SS» in UTC without a zone.
@@ -243,7 +291,9 @@ function formatList(s: string, kind: "categories" | "products" | "list"): string
   let items = parsed.value.map(itemText).filter(Boolean);
   if (items.length === 0) return OWNER_AUDIT_EMPTY;
   if (kind === "products" && items.length > OWNER_AUDIT_PRODUCT_NAMES_MAX) return `${items.length} varer`;
-  if (kind === "categories") items = items.map((k) => OWNER_AUDIT_CATEGORY_NAMES[k] || k);
+  if (kind === "categories") {
+    items = items.map((k) => (Object.prototype.hasOwnProperty.call(OWNER_AUDIT_CATEGORY_NAMES, k) ? OWNER_AUDIT_CATEGORY_NAMES[k] : k));
+  }
   return shortText(items.join(", "));
 }
 
@@ -259,7 +309,11 @@ function formatHours(s: string): string {
   return shortText(s);
 }
 
-/** One stored value as the owner reads it. Never contains an e-mail address. */
+/**
+ * One stored value as the owner reads it. Every text goes through shortText,
+ * so no e-mail address in a form stripEmailAddresses catches reaches the
+ * owner; e-mail fields are never formatted (the row carries values_hidden).
+ */
 export function formatOwnerAuditValue(kind: OwnerAuditValueKind, raw: unknown): string {
   const s = raw == null ? "" : String(raw).trim();
   if (!s) return OWNER_AUDIT_EMPTY;
@@ -286,6 +340,10 @@ export function formatOwnerAuditValue(kind: OwnerAuditValueKind, raw: unknown): 
       return formatList(s, kind);
     case "email":
       return ""; // never shown: the row carries values_hidden
+    case "prose": {
+      const cleaned = stripInternalNotes(s);
+      return cleaned ? shortText(cleaned) : OWNER_AUDIT_EMPTY;
+    }
     case "text":
     default:
       return shortText(s);
@@ -351,24 +409,31 @@ export function ownerAuditFeedRows(rows: readonly OwnerAuditDbRow[]): OwnerAudit
 }
 
 /**
- * The newest `limit` log rows of one agent, filtered in SQL to the table's
- * fields and to real changes, so «Siste 20 endringer» counts only rows the
- * owner sees. Sorted by time whatever the stored format (julianday() reads
- * both «YYYY-MM-DD HH:MM:SS» and ISO 8601; a plain text sort put every
- * «YYYY-MM-DD HH:…» row of a day before that day's ISO rows).
+ * The newest `limit` rows the owner sees (fewer only when there are no more).
+ * SQL keeps the table's fields and drops raw no-op rows; rows whose values
+ * still READ the same («1» → «true», a stripped pipeline note) are dropped in
+ * JS afterwards, so the query is read in batches until `limit` shown rows are
+ * found or the rows run out. Sorted by time whatever the stored format
+ * (julianday() reads both «YYYY-MM-DD HH:MM:SS» and ISO 8601; a plain text
+ * sort put every «YYYY-MM-DD HH:…» row of a day before that day's ISO rows).
  */
 export function readOwnerAuditFeed(db: any, agentId: string, limit: number): OwnerAuditFeedRow[] {
   const names = OWNER_AUDIT_FIELD_NAMES;
-  const rows = db
-    .prepare(
-      `SELECT id, field_name, old_value, new_value, changed_by, changed_at, notes
-         FROM agent_knowledge_audit
-        WHERE agent_id = ?
-          AND field_name IN (${names.map(() => "?").join(", ")})
-          AND TRIM(IFNULL(old_value, '')) <> TRIM(IFNULL(new_value, ''))
-        ORDER BY julianday(changed_at) DESC, rowid DESC
-        LIMIT ?`,
-    )
-    .all(agentId, ...names, limit) as OwnerAuditDbRow[];
-  return ownerAuditFeedRows(rows);
+  const stmt = db.prepare(
+    `SELECT id, field_name, old_value, new_value, changed_by, changed_at, notes
+       FROM agent_knowledge_audit
+      WHERE agent_id = ?
+        AND field_name IN (${names.map(() => "?").join(", ")})
+        AND TRIM(IFNULL(old_value, '')) <> TRIM(IFNULL(new_value, ''))
+      ORDER BY julianday(changed_at) DESC, rowid DESC
+      LIMIT ? OFFSET ?`,
+  );
+  const batch = Math.max(limit * 2, 50);
+  const out: OwnerAuditFeedRow[] = [];
+  for (let offset = 0; out.length < limit; offset += batch) {
+    const rows = stmt.all(agentId, ...names, batch, offset) as OwnerAuditDbRow[];
+    out.push(...ownerAuditFeedRows(rows));
+    if (rows.length < batch) break;
+  }
+  return out.slice(0, limit);
 }
