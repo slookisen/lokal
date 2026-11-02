@@ -1993,13 +1993,16 @@ router.post("/agents/:id/claim", rfbClaimRequestLimiter, async (req: Request, re
   try {
     // The claim domain rule (CLAIM_DOMAIN_RULE_ENABLED, default off) may run
     // an HTTPS probe of the claimant's domain first; off = requestClaim as before.
+    // With CLAIM_AUTO_ASSESSMENT_ENABLED === "true" the new claim row also gets
+    // a record-only assessment in the background (the IP is used only for its
+    // in-memory velocity count, never stored).
     const result = await knowledgeService.requestClaimWithDomainRule(agentId, {
       claimantName: name,
       claimantEmail: email,
       claimantPhone: phone,
       source: source || 'organic',
       listedEmailWrong: listedEmailWrong === true,
-    });
+    }, { clientIp: req.ip });
 
     if (result.kind === "already_owner") {
       res.status(400).json({ success: false, error: "Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post." });

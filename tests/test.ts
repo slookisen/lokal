@@ -50010,6 +50010,40 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering-og-ettklikk, slice A
+// (record-only): the owner-claim auto-assessment (claim-assessment.ts) behind
+// CLAIM_AUTO_ASSESSMENT_ENABLED. Unit block: all network/clock stubbed, pure.
+// Route block: pins getDb() to its own in-memory DB and stubs the e-mail
+// transporter, the HTTPS probe and the assessment deps (restored in
+// finally) — runSerial.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-10-30-rfb-eierkrav-automatisk-vurdering: claim auto-assessment (slice A) ──");
+  try {
+    const { runClaimAssessmentTests } = require("../src/services/claim-assessment.test") as
+      typeof import("../src/services/claim-assessment.test");
+    const r = await runClaimAssessmentTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("claim-assessment: " + f);
+    console.log(`  claim-assessment: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("claim-assessment: unexpected error: " + String(err?.message || err));
+  }
+  try {
+    const { runRfbClaimVurderingTests } = require("../src/routes/rfb-claim-vurdering.test") as
+      typeof import("../src/routes/rfb-claim-vurdering.test");
+    const r = await runRfbClaimVurderingTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("rfb-claim-vurdering: " + f);
+    console.log(`  rfb-claim-vurdering: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("rfb-claim-vurdering: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Claim rule slice 1b, shared address ("delt adresse"): no code on any path
 // (rule 1, P1, P2) to an address that is the known e-mail of more than one
 // RFB profile → pending_review shared_address. Pins getDb() to its own

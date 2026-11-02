@@ -2280,7 +2280,9 @@ router.post("/self-registered-review-approve", (req: Request, res: Response) => 
 // and address, the reason and the time — at most CLAIM_REVIEW_QUEUE_LIST_MAX
 // entries (knowledge-service.ts); `count` is how many wait in all. Each entry
 // carries `recommendation`, the claim domain rule's advice (dev-request
-// 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste, claim-domain-rule.ts).
+// 2026-10-27-rfb-eierkrav-domeneregel-og-cs-sjekkliste, claim-domain-rule.ts),
+// and `assessment`, the stored owner-claim auto-assessment (claim-assessment.ts,
+// slice A, record-only; parsed JSON, or null when none was made).
 router.get("/claim-review-queue", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   const { total, entries } = knowledgeService.listClaimReviewQueue();
