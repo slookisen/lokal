@@ -34,6 +34,7 @@ import {
   isCrossSiteWrite, writeGuardRefusedBody, WRITE_GUARD_REFUSED_TITLE, WRITE_GUARD_CONTACT_RFB,
 } from "../middleware/same-origin-write";
 import { ownerOrdersEntryCardHtml } from "./owner-orders-view";
+import { OWNER_PORTAL_FORM_LABELS, readOwnerAuditFeed } from "./owner-audit-log";
 import { paymentPortalAlert, renderPaymentCard, shouldRenderPaymentCard } from "./owner-payment-card";
 import {
   ownerOrderabilityPortalEnabledFor, listOwnerProductOrderability, confirmOwnerProductInStock,
@@ -2055,15 +2056,17 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
       pendingOrderCount = Number(pc?.n) || 0;
     } catch { pendingOrderCount = 0; }
 
-    // Editable fields with display labels (Norwegian Bokmål)
+    // Editable fields with display labels (Norwegian Bokmål). The labels live
+    // in owner-audit-log.ts, so «Endringslogg» names the fields the same way.
+    const FL = OWNER_PORTAL_FORM_LABELS;
     const fieldDefs: Array<{ key: string; dbField: string; label: string; type: "text" | "textarea" | "email" | "url" }> = [
-      { key: "email",        dbField: "email",         label: "E-post",            type: "email" },
-      { key: "phone",        dbField: "phone",         label: "Telefon",           type: "text" },
-      { key: "address",      dbField: "address",       label: "Adresse",           type: "text" },
-      { key: "postal_code",  dbField: "postal_code",   label: "Postnummer",        type: "text" },
-      { key: "website",      dbField: "website",       label: "Nettside",          type: "url" },
-      { key: "opening_hours",dbField: "opening_hours", label: "Åpningstider", type: "text" },
-      { key: "description",  dbField: "about",         label: "Om produsenten",    type: "textarea" },
+      { key: "email",        dbField: "email",         label: FL.email,         type: "email" },
+      { key: "phone",        dbField: "phone",         label: FL.phone,         type: "text" },
+      { key: "address",      dbField: "address",       label: FL.address,       type: "text" },
+      { key: "postal_code",  dbField: "postal_code",   label: FL.postal_code,   type: "text" },
+      { key: "website",      dbField: "website",       label: FL.website,       type: "url" },
+      { key: "opening_hours",dbField: "opening_hours", label: FL.opening_hours, type: "text" },
+      { key: "description",  dbField: "about",         label: FL.about,         type: "textarea" },
     ];
 
     const fieldHtml = fieldDefs.map((fd) => {
@@ -2169,13 +2172,12 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
                 ul.innerHTML = '<li class="ep-audit-item ep-audit-meta">Ingen endringer ennå.</li>';
                 return;
               }
+              // The API sends finished text (owner-audit-log.ts): name, values,
+              // who and time. An e-mail field comes without values.
               ul.innerHTML = j.audits.map(function (a) {
-                var when = new Date(a.changed_at).toLocaleString("nb-NO");
-                var who = a.changed_by === "owner" ? "Du" : (a.changed_by === "admin" ? "Support" : "System");
-                var oldV = a.old_value == null ? "(tomt)" : String(a.old_value);
-                var newV = a.new_value == null ? "(tomt)" : String(a.new_value);
-                return '<li class="ep-audit-item"><strong>' + esc(a.field_name) + '</strong> endret av ' + esc(who) +
-                  '<div class="ep-audit-meta">' + esc(when) + ' · «' + esc(oldV.slice(0, 80)) + '» → «' + esc(newV.slice(0, 80)) + '»</div></li>';
+                var change = a.values_hidden ? ' endret' : ': ' + esc(a.old_value) + ' → ' + esc(a.new_value);
+                return '<li class="ep-audit-item"><strong>' + esc(a.label) + '</strong>' + change +
+                  '<div class="ep-audit-meta">' + esc(a.when) + ' · ' + esc(a.who) + '</div></li>';
               }).join("");
             })
             .catch(function () {
@@ -3071,9 +3073,12 @@ export function productImportCardHtml(agentId: string, o: ImportOverview, alertH
 // ─────────────────────────────────────────────────────────────────
 // GET /api/agents/:agentId/my-audit — owner-side audit feed (session-gated)
 // ─────────────────────────────────────────────────────────────────
-// Same shape as the Daniel-only /admin/agent-audit endpoint, but auth-gated
-// to the owner's session cookie (NOT admin-key). Returns last N audit
-// entries for *this* agent only.
+// Auth-gated to the owner's session cookie (NOT admin-key). Returns the last
+// N log rows for *this* agent only, as the owner reads them (dev-request
+// 2026-11-02-rfb-endringslogg-lettlest, owner-audit-log.ts): only fields in
+// OWNER_AUDIT_FIELDS, Norwegian names and values, «Du» / «Rett fra Bonden» /
+// «Automatisk fra nettsiden din» — no notes, no e-mail addresses, no
+// technical rows. Daniel's /admin/agent-audit keeps the raw rows.
 router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
   try {
     const agentId = String((req.params as any).agentId || "");
@@ -3089,19 +3094,10 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
       return res.status(403).json(ownerForbiddenJson(agentId, session));
     }
 
-    const limitNum = Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200);
+    // 1..200 (a negative LIMIT would mean «no limit» in SQLite).
+    const limitNum = Math.max(1, Math.min(parseInt(String(req.query.limit ?? "20"), 10) || 20, 200));
 
-    const db = getDb();
-    const audits = db
-      .prepare(
-        `SELECT id, agent_id, field_name, old_value, new_value,
-                changed_by, changed_by_email, changed_at, notes
-           FROM agent_knowledge_audit
-          WHERE agent_id = ?
-          ORDER BY changed_at DESC
-          LIMIT ?`
-      )
-      .all(agentId, limitNum) as any[];
+    const audits = readOwnerAuditFeed(getDb(), agentId, limitNum);
 
     return res.json({
       success: true,

@@ -51972,6 +51972,30 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-11-02-rfb-endringslogg-lettlest (E1–E3): the portal's
+// «Endringslogg» / GET my-audit in plain Norwegian — the field table (fail
+// closed), readable values, «Du» / «Rett fra Bonden» / «Automatisk fra
+// nettsiden din», no notes / e-mail addresses / hidden fields in the JSON;
+// real portal save, nightly owner refresh and claim-test fixture rows; the
+// portal script on the real answer; the empty state. Swaps the getDb()
+// singleton, env vars, console.log, fetch, the fixture route's DB override
+// and the registry caches (restored in finally) — runSerial, tail position.
+runSerial(async () => {
+  console.log("\n── Endringslogg lett å lese (my-audit) ──");
+  try {
+    const { runOwnerAuditLogTests } = require("../src/routes/owner-audit-log.test") as
+      typeof import("../src/routes/owner-audit-log.test");
+    const r = await runOwnerAuditLogTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("owner-audit-log: " + f);
+    console.log(`  owner-audit-log: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("owner-audit-log: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // Opplevagent «For tilbydere» with sections and FAQ (dev-request O4 = G4,
 // slice O4a): flag off = old page unchanged; flag on = ten section ids + top
 // menu, FAQPage JSON-LD == visible accordion, price text from price-message.ts,
