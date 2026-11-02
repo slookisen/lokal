@@ -15,6 +15,14 @@
  *   (b) dry-run, same input -> flagged_name_collision:1, no provider row.
  *   (c) non-colliding name -> name_collision stays 0, counter 0.
  *   (d) existing provider re-harvested with a colliding name -> stamped.
+ *   (e) dry-run with an UNSTAMPED existing provider of the colliding name ->
+ *       counted, but the DB column stays 0 (dry-run never writes).
+ *   (f) colliding row WITHOUT evidence_url (unverified-not-evidence-backed
+ *       skip), existing provider of that name -> never counted, never
+ *       stamped, in both dry-run and apply.
+ *   (g) colliding row rejected by the agent_blocklist gate, existing
+ *       provider of that name -> never counted, never stamped, in both
+ *       dry-run and apply.
  */
 
 export interface TestSummary {
@@ -218,6 +226,61 @@ export function runOpplevelserBulkLoadNameCollisionTests(
         const p = providerByName(EXISTING);
         assertEq(p?.id, existingId, "nc-d5: same provider row");
         assertEq(p?.name_collision, 1, "nc-d6: existing provider stamped");
+      }
+
+      // ── (e) dry-run never writes, even for an existing unstamped provider ─
+      {
+        const EXISTING_DRY = "Tvilling Sideri AS";
+        expStore.createProvider({ navn: EXISTING_DRY, kommune: "Voss", source: "seed" });
+        assertEq(providerByName(EXISTING_DRY)?.name_collision, 0, "nc-e1: precondition: not stamped");
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { experiences: [row(EXISTING_DRY, "Sidersmaking i låven")] },
+        });
+        assertEq(r.status, 200, "nc-e2: dry-run -> 200");
+        assertEq(r.body.dry_run, true, "nc-e3: dry_run:true");
+        assertEq(r.body.flagged_name_collision, 1, "nc-e4: dry-run counts it");
+        assertEq(providerByName(EXISTING_DRY)?.name_collision, 0, "nc-e5: dry-run left the existing provider unstamped");
+      }
+
+      // ── (f) skipped (unverified, not evidence-backed) -> never stamped ──
+      {
+        const NO_EVIDENCE = "Tvilling Honningbu AS";
+        expStore.createProvider({ navn: NO_EVIDENCE, kommune: "Voss", source: "seed" });
+        const noEvidenceRow = { ...row(NO_EVIDENCE, "Honningsmaking"), evidence_url: undefined };
+        for (const apply of [false, true]) {
+          const mode = apply ? "apply" : "dry-run";
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { apply, experiences: [noEvidenceRow] },
+          });
+          assertEq(r.status, 200, `nc-f1 (${mode}): -> 200`);
+          assertEq(r.body.flagged_name_collision, 0, `nc-f2 (${mode}): skipped provider not counted`);
+          assertEq(r.body.flagged_name_collision_providers, [], `nc-f3 (${mode}): empty list`);
+          assertEq(providerByName(NO_EVIDENCE)?.name_collision, 0, `nc-f4 (${mode}): skipped provider not stamped`);
+        }
+      }
+
+      // ── (g) blocklisted -> never stamped ───────────────────────────────
+      {
+        const BLOCKED = "Tvilling Røkeri AS";
+        expStore.createProvider({ navn: BLOCKED, kommune: "Voss", source: "seed" });
+        const { normalizeName } = require("../services/blocklist-service") as typeof import("../services/blocklist-service");
+        rfbDb
+          .prepare(`INSERT INTO agent_blocklist (identifier_type, identifier_value, reason) VALUES ('name_normalized', ?, 'test')`)
+          .run(normalizeName(BLOCKED));
+        for (const apply of [false, true]) {
+          const mode = apply ? "apply" : "dry-run";
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { apply, experiences: [row(BLOCKED, "Røkt laks fra røkeriet")] },
+          });
+          assertEq(r.status, 200, `nc-g1 (${mode}): -> 200`);
+          assertEq(r.body.rejected_blocklisted, 1, `nc-g2 (${mode}): rejected by the blocklist gate`);
+          assertEq(r.body.flagged_name_collision, 0, `nc-g3 (${mode}): blocklisted provider not counted`);
+          assertEq(r.body.flagged_name_collision_providers, [], `nc-g4 (${mode}): empty list`);
+          assertEq(providerByName(BLOCKED)?.name_collision, 0, `nc-g5 (${mode}): blocklisted provider not stamped`);
+        }
       }
     } catch (err: any) {
       failed++;
