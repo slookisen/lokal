@@ -33571,6 +33571,18 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of g5h.failures) failures.push("opplevelser-gardssalg-5d-hardening: " + f);
     console.log(`  opplevelser-gardssalg-5d-hardening: ${g5h.passed} passed, ${g5h.failed} failed`);
 
+    // Read-only GET /admin/gardssalg-content-audit: which fields were changed
+    // by which source after time T for one producer (rollback triage). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-content-audit-read: admin read of the content audit ──");
+    const { runOpplevelserGardssalgContentAuditReadTests } = require("../src/routes/opplevelser-gardssalg-content-audit-read.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-content-audit-read.test");
+    const gContentAuditRead = await runOpplevelserGardssalgContentAuditReadTests(false);
+    passed += gContentAuditRead.passed;
+    failed += gContentAuditRead.failed;
+    for (const f of gContentAuditRead.failures) failures.push("opplevelser-gardssalg-content-audit-read: " + f);
+    console.log(`  opplevelser-gardssalg-content-audit-read: ${gContentAuditRead.passed} passed, ${gContentAuditRead.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over

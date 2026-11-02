@@ -10729,6 +10729,88 @@ router.post("/admin/gardssalg-claim-revoke", requireAdmin, (req: Request, res: R
   res.json({ success: true, dry_run: false, provider_id: providerId, revoked, claimed_at_reset: claimedAtReset });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-content-audit (admin, read-only) ──
+//
+// Lists gardssalg_content_audit rows for ONE producer, optionally after a
+// point in time, so an operator can see "which fields were changed by which
+// source after time T" before deciding on a manual rollback. No writes.
+//
+// Query: provider_id (required, ≤200 chars), since (optional ISO 8601 date or
+// datetime; a value without a zone designator is read as UTC), field
+// (optional exact field_name), limit (optional, default 200, clamped 1–1000).
+//
+// changed_at is stored both as SQLite `YYYY-MM-DD HH:MM:SS` (column default)
+// and as ISO `...T...Z` by some writers, so filtering and ordering go through
+// SQLite datetime() (second precision) instead of comparing raw strings.
+function normalizeAuditSince(raw: string): { iso: string; sql: string } | null {
+  let s = raw.trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    s = `${s}T00:00:00Z`;
+  } else {
+    s = s.replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, "$1T$2");
+    if (/T\d/.test(s) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) s = `${s}Z`;
+  }
+  const ms = Date.parse(s);
+  if (Number.isNaN(ms)) return null;
+  const iso = new Date(ms).toISOString();
+  return { iso, sql: iso.slice(0, 19).replace("T", " ") };
+}
+
+router.get("/admin/gardssalg-content-audit", requireAdmin, (req: Request, res: Response) => {
+  const rawProvider = req.query.provider_id;
+  const providerId = typeof rawProvider === "string" ? rawProvider.trim() : "";
+  if (!providerId || providerId.length > 200) {
+    return res.status(400).json({ error: "provider_id_required" });
+  }
+
+  let since: { iso: string; sql: string } | null = null;
+  const rawSince = req.query.since;
+  if (rawSince !== undefined && rawSince !== "") {
+    since = typeof rawSince === "string" ? normalizeAuditSince(rawSince) : null;
+    if (!since) return res.status(400).json({ error: "invalid_since" });
+  }
+
+  const rawField = req.query.field;
+  const field = typeof rawField === "string" && rawField.trim() ? rawField.trim() : null;
+
+  const parsedLimit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) ? Math.min(1000, Math.max(1, parsedLimit)) : 200;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const where: string[] = ["provider_id = @provider_id"];
+    const params: Record<string, string | number> = { provider_id: providerId, fetch_limit: limit + 1 };
+    if (since) { where.push("datetime(changed_at) >= datetime(@since)"); params.since = since.sql; }
+    if (field) { where.push("field_name = @field"); params.field = field; }
+    const fetched = expDb.prepare(
+      `SELECT id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at, notes
+         FROM gardssalg_content_audit
+        WHERE ${where.join(" AND ")}
+        ORDER BY datetime(changed_at) ASC, changed_at ASC, rowid ASC
+        LIMIT @fetch_limit`,
+    ).all(params) as Array<{
+      id: string; field_name: string; old_value: string | null; new_value: string | null;
+      source_url: string | null; batch_id: string | null; changed_by: string; changed_at: string; notes: string | null;
+    }>;
+    const truncated = fetched.length > limit;
+    const rows = truncated ? fetched.slice(0, limit) : fetched;
+    const byChangedBy: Record<string, number> = {};
+    for (const r of rows) byChangedBy[r.changed_by] = (byChangedBy[r.changed_by] ?? 0) + 1;
+    return res.json({
+      provider_id: providerId,
+      since: since ? since.iso : null,
+      count: rows.length,
+      truncated,
+      by_changed_by: byChangedBy,
+      rows,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-content-audit failed", err);
+    return res.status(500).json({ error: "internal_error" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-owner-email-confirm (admin) ─────
 //
 // dev-request 2026-10-22-opplevagent-takksvar-eierlenke-og-bekreftet-av-eier,
