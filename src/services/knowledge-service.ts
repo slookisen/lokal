@@ -1373,6 +1373,8 @@ class KnowledgeService {
       if (!claimId) return;
       const sameIp = recordClaimIp(deps.clientIp);
       const run = (async (): Promise<void> => {
+        // Off the request path: not even the DB reads run before the response.
+        await new Promise<void>((r) => setImmediate(r));
         try {
           const input = this.gatherClaimAssessmentInput(claimId, agentId, opts, sameIp);
           if (!input) return;
@@ -1458,13 +1460,19 @@ class KnowledgeService {
     // Another farm (not this one, not a sibling) with a website or e-mail on the claimant's domain.
     let otherFarmHasDomain = false;
     if (reg && !isFreeMailDomain(reg)) {
+      // No LIMIT before the exact (JS) filter: the LIKE prefilter only narrows
+      // to rows naming the domain, and the scan stops at the first real match.
       const rows = db.prepare(
         `SELECT k.agent_id AS id, k.website, k.email FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
-          WHERE k.agent_id <> ? AND ${rfb} AND (k.website LIKE ? OR LOWER(k.email) LIKE ?) LIMIT 50`
-      ).all(agentId, `%${reg}%`, `%${reg}%`) as Array<{ id: string; website: string | null; email: string | null }>;
+          WHERE k.agent_id <> ? AND ${rfb} AND (LOWER(k.website) LIKE ? OR LOWER(k.email) LIKE ?)`
+      ).iterate(agentId, `%${reg}%`, `%${reg}%`) as IterableIterator<{ id: string; website: string | null; email: string | null }>;
       const regOf = (h: string | null): string | null => (h ? registrableDomain(h.replace(/^www\./, "")) : null);
-      otherFarmHasDomain = rows.some((r) => !siblingIds.has(r.id) &&
-        (regOf(websiteHost(r.website)) === reg || regOf(emailDomain(normalizeEmail(r.email))) === reg));
+      for (const r of rows) {
+        if (!siblingIds.has(r.id) && (regOf(websiteHost(r.website)) === reg || regOf(emailDomain(normalizeEmail(r.email))) === reg)) {
+          otherFarmHasDomain = true;
+          break;
+        }
+      }
     }
 
     // Enrichment provenance with a source_url (never the owner's or a self-registration's word, never inference).

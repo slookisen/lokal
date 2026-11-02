@@ -15,8 +15,8 @@
 
 import {
   type ClaimAssessmentDeps, type ClaimAssessmentInput, BRREG_ROLES_URL, assessClaim, claimAssessmentEnabled,
-  homoglyphSkeleton, isLookalikeDomain, pageHasEmail, pageHasOrgNr, pageHasPhone, personNameMatches, rdapUrl,
-  recordClaimIp, __resetClaimIpWindowForTesting,
+  homoglyphSkeleton, isLookalikeDomain, pageHasAddress, pageHasEmail, pageHasOrgNr, pageHasPhone, personNameMatches, rdapUrl,
+  preparePage, recordClaimIp, __resetClaimIpWindowForTesting,
 } from "./claim-assessment";
 
 export interface TestSummary {
@@ -57,10 +57,10 @@ function baseInput(over: Partial<ClaimAssessmentInput> = {}, profile: Partial<Cl
 }
 
 interface StubOpts {
-  brreg?: "ok" | "nohit" | "down" | "500" | "hang";
-  rdapDays?: number | "down" | "nodate";
+  brreg?: "ok" | "nohit" | "down" | "500" | "hang" | "resigned";
+  rdapDays?: number | "down" | "nodate" | "404";
   mx?: "ok" | "none" | "nxdomain" | "down";
-  site?: Record<string, string | "down">;
+  site?: Record<string, string | "down" | "500">;
 }
 
 function stubDeps(o: StubOpts = {}, calls: string[] = []): ClaimAssessmentDeps {
@@ -74,12 +74,18 @@ function stubDeps(o: StubOpts = {}, calls: string[] = []): ClaimAssessmentDeps {
         if (b === "down") throw new Error("ECONNREFUSED");
         if (b === "hang") return new Promise(() => { /* never */ });
         if (b === "500") return { status: 500, body: "" };
+        if (b === "resigned") {
+          return { status: 200, body: JSON.stringify({ rollegrupper: [{ type: { kode: "DAGL" }, roller: [
+            { type: { kode: "DAGL" }, person: { navn: { fornavn: "Kari", etternavn: "Nordmann" } }, fratraadt: true },
+          ] }] }) };
+        }
         return { status: 200, body: JSON.stringify(b === "nohit" ? { rollegrupper: [] } : BRREG_ROLES) };
       }
       if (url.startsWith("https://rdap.")) {
         const r = o.rdapDays ?? 2000;
         if (r === "down") throw new Error("ETIMEDOUT");
         if (r === "nodate") return { status: 200, body: JSON.stringify({ events: [] }) };
+        if (r === "404") return { status: 404, body: "" };
         return { status: 200, body: JSON.stringify({ events: [{ eventAction: "registration", eventDate: daysAgo(r) }] }) };
       }
       throw new Error(`unexpected url ${url}`);
@@ -88,6 +94,7 @@ function stubDeps(o: StubOpts = {}, calls: string[] = []): ClaimAssessmentDeps {
       calls.push(`site:${host}`);
       const page = o.site?.[host];
       if (page === "down") throw new Error("ECONNRESET");
+      if (page === "500") return { status: 503, body: "" };
       return { status: 200, body: page ?? "<html><body>Velkommen</body></html>" };
     },
     resolveMx: async (d: string) => {
@@ -254,6 +261,15 @@ export async function runClaimAssessmentTests(opts: { log?: boolean } = {}): Pro
       eq([mxDown.result, mxDown.unavailable_sources], ["yellow", ["dns_mx"]], "AC8: DNS SERVFAIL → yellow");
       const siteDown = await assessClaim(baseInput(), stubDeps({ rdapDays: MID, site: { "www.solbakkegard.no": "down" } }));
       eq([siteDown.result, siteDown.unavailable_sources], ["yellow", ["website_farm"]], "AC8: farm website down → yellow");
+      const rd404 = await assessClaim(baseInput(), stubDeps({ rdapDays: "404" }));
+      eq([rd404.result, rd404.supports, rd404.unavailable_sources, rd404.signals.find((x) => x.id === "S3")?.status],
+        ["yellow", ["S1"], ["rdap"], "unavailable"], "AC8: RDAP 404 → rdap unavailable, never green");
+      const site5xx = await assessClaim(baseInput(), stubDeps({ rdapDays: MID, site: { "www.solbakkegard.no": "500" } }));
+      eq([site5xx.result, site5xx.unavailable_sources, site5xx.signals.find((x) => x.id === "A2_website")?.status],
+        ["yellow", ["website_farm"], "unavailable"], "AC8: farm website HTTP 5xx → unavailable, never green");
+      const emailSite5xx = await assessClaim(baseInput({ claimantEmail: "kari@annen-gard.no" }, { independentWebsiteHost: null }),
+        stubDeps({ rdapDays: MID, site: { "annen-gard.no": "500" } }));
+      eq(emailSite5xx.unavailable_sources, ["website_email_domain"], "AC8: e-mail-domain website HTTP 5xx → unavailable");
       const redDown = await assessClaim(baseInput({}, { hasOwner: true }), stubDeps({ brreg: "down" }));
       eq(redDown.result, "red", "AC8: a red flag stays red when a source is down");
     }
@@ -265,6 +281,8 @@ export async function runClaimAssessmentTests(opts: { log?: boolean } = {}): Pro
         "S1: an org.nr from a self-registration is not asked about");
       const noOrg = await assessClaim(baseInput({}, { orgNr: null }), stubDeps({ rdapDays: MID }));
       eq(noOrg.signals.find((s) => s.id === "S1")?.status, "skipped", "S1: no org.nr → skipped, not unavailable");
+      const resigned = await assessClaim(baseInput(), stubDeps({ brreg: "resigned", rdapDays: MID }));
+      eq([resigned.result, resigned.supports], ["yellow", []], "S1: a resigned (fratraadt) daglig leder does not give S1");
       const styremedlem = await assessClaim(baseInput({ claimantName: "Ola Hansen" }), stubDeps({ rdapDays: MID }));
       eq(styremedlem.supports, [], "S1: a plain board member (MEDL) is not an S1 role");
       ok(personNameMatches("kari  nordmann", { fornavn: "Kari Sofie", etternavn: "Nordmann" }), "S1: middle names ignored, case-insensitive");
@@ -285,6 +303,24 @@ export async function runClaimAssessmentTests(opts: { log?: boolean } = {}): Pro
       ok(!pageHasEmail("post@gard.no.evil", "post@gard.no"), "page: no match inside a longer domain");
       ok(pageHasOrgNr("Org.nr: 912 345 678 MVA", ORG), "page: org.nr with spaces");
       ok(pageHasPhone("Tlf +47 912 34 567", "91234567"), "page: phone with +47 and spaces");
+      // ReDoS guard (review B1): 512 KB of `<`, `<script`, `<style` must be handled linearly.
+      const N = 512 * 1024;
+      for (const [name, unit] of [["<", "<"], ["<script", "<script"], ["<style", "<style "], ["<a", "<a"], ["digit-dots", "1. "]] as const) {
+        const html = unit.repeat(Math.ceil(N / unit.length));
+        const t = Date.now();
+        const pg = preparePage(html, Infinity);
+        pageHasEmail(pg, "post@gard.no"); pageHasOrgNr(pg, ORG); pageHasPhone(pg, "91234567"); pageHasAddress(pg, "Gardsvegen 12");
+        pageHasEmail(html, "post@gard.no"); pageHasOrgNr(html, ORG); pageHasPhone(html, "91234567"); pageHasAddress(html, "Gardsvegen 12");
+        const ms = Date.now() - t;
+        ok(ms < 200, `redos: 512 KB of «${name}» prepared and checked in < 200 ms (took ${ms} ms)`);
+      }
+      const closedBlocks = "<style>x</style>".repeat(40_000) + "<p>Org.nr 912 345 678</p>";
+      const tb = Date.now();
+      ok(pageHasOrgNr(preparePage(closedBlocks, Infinity), ORG), "page: text after many closed style blocks is kept");
+      ok(Date.now() - tb < 200, "redos: many closed style blocks without a script stay linear");
+      ok(!pageHasOrgNr("<script>var x = '912345678';</script>", ORG), "page: script content is not page text");
+      ok(!pageHasOrgNr("<p>hei</p><script>912345678", ORG), "page: an unclosed script drops the rest of the page");
+      ok(pageHasEmail("<p>Skriv til post&#64;gard.no</p>", "post@gard.no"), "page: &#64; entity decoded");
       __resetClaimIpWindowForTesting();
       const t0 = NOW.getTime();
       eq([recordClaimIp("10.0.0.1", t0), recordClaimIp("10.0.0.1", t0 + 1000), recordClaimIp("10.0.0.2", t0 + 2000),

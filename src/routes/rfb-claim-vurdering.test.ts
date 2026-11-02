@@ -232,6 +232,30 @@ export async function runRfbClaimVurderingTests(opts: { log?: boolean } = {}): P
       ok(!("claim_assessment" in (eOn ?? {})), "q: the raw column is not exposed");
     }
 
+    // ══ a repeat (queued, created=false) is not re-assessed ═════════════
+    {
+      const before = claimRow(rOn.body.data.claimId);
+      brregDown = true; // a re-assessment would now store yellow
+      const n0 = calls.length;
+      const rep = await claim("va-on", { name: "Kari Nordmann", email: "kari@gard-on.no" });
+      await ca.__waitForClaimAssessmentsForTesting();
+      brregDown = false;
+      eq([rep.status, rep.body?.data?.claimId], [202, rOn.body.data.claimId], "repeat: the claimant's own open entry is returned");
+      const after = claimRow(rOn.body.data.claimId);
+      eq([after.claim_assessment, after.claim_assessment_at], [before.claim_assessment, before.claim_assessment_at],
+        "repeat: the earlier assessment is not overwritten");
+      eq(calls.length, n0, "repeat: no assessment network call");
+    }
+
+    // ══ off the request path: nothing is read before the response ══════
+    {
+      agent("va-async", "https://www.gard-async.no/", "988888888");
+      const r = await claim("va-async", { name: "Kari Nordmann", email: "kari@gard-async.no" });
+      eq(claimRow(r.body.data.claimId).claim_assessment, null, "async: no assessment yet when the response is sent");
+      await ca.__waitForClaimAssessmentsForTesting();
+      ok(typeof claimRow(r.body.data.claimId).claim_assessment === "string", "async: stored afterwards");
+    }
+
     // ══ code_sent path (domain rule P1) ══════════════════════════════════
     {
       process.env.CLAIM_DOMAIN_RULE_ENABLED = "1";

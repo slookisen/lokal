@@ -76,7 +76,10 @@ export const CLAIM_ASSESSMENT_TOTAL_TIMEOUT_MS = 12000;
 export const CLAIM_ASSESSMENT_VELOCITY_MAX = 3;
 export const CLAIM_ASSESSMENT_DOMAIN_MIN_AGE_DAYS = 90;
 export const CLAIM_ASSESSMENT_DOMAIN_SUPPORT_AGE_DAYS = 365;
-const MAX_PAGE_BYTES = 512 * 1024;
+/** Farm / claimant site page cap. The S2 page is claimant-controlled, so it is small and every pass over it is linear. */
+const MAX_PAGE_BYTES = 128 * 1024;
+/** Brreg / RDAP answer cap. */
+const MAX_API_BYTES = 512 * 1024;
 
 export const BRREG_ROLES_URL = (orgNr: string): string =>
   `https://data.brreg.no/enhetsregisteret/api/enheter/${orgNr}/roller`;
@@ -234,44 +237,89 @@ export function normalizeOrgNr(raw: unknown): string | null {
   return /^\d{9}$/.test(d) ? d : null;
 }
 
-/** Page text for matching: tags removed, entities for @ decoded, whitespace collapsed, lower case. */
-function pageText(html: string): string {
-  return html
-    .replace(/&#64;|&#x40;|&commat;/gi, "@")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/\s+/g, " ")
-    .toLowerCase();
+/**
+ * A fetched page, prepared ONCE for every check on it. Every step is linear
+ * in the page size (review: the S2 page is claimant-controlled, and the old
+ * lazy-quantifier / `[^>]+` regexes were quadratic on an unclosed `<` or
+ * `<script`, synchronous CPU that no timeout stops):
+ *   - script/style blocks are cut by an indexOf scan (an unclosed block
+ *     drops everything to the end of the page);
+ *   - tags are removed with `/<[^<>]*>/g`, which can never rescan past the
+ *     next `<`;
+ *   - whitespace is collapsed before the digit-compaction passes.
+ */
+export interface PreparedPage {
+  /** Lower-cased raw HTML with @ entities decoded (mailto: links live here). */
+  raw: string;
+  /** Visible text: blocks and tags removed, whitespace collapsed, lower case. */
+  text: string;
+  /** text with spaces / dots between digits removed (org.nr). */
+  orgDigits: string;
+  /** text with spaces / dots / dashes between digits removed and +47/0047 dropped (phone). */
+  phoneDigits: string;
 }
 
-/** Exact address as a whole token in the raw page (text or mailto:). */
-export function pageHasEmail(html: string, email: string): boolean {
+/** Cuts <script>…</script> and <style>…</style> out of a lower-cased page, linearly. */
+function stripScriptStyle(lower: string): string {
+  const parts: string[] = [];
+  let i = 0;
+  let nextScript = -2;
+  let nextStyle = -2;
+  while (i < lower.length) {
+    // Each "next" position is only searched again once the cursor has passed it.
+    if (nextScript !== -1 && nextScript < i) nextScript = lower.indexOf("<script", i);
+    if (nextStyle !== -1 && nextStyle < i) nextStyle = lower.indexOf("<style", i);
+    const start = nextScript < 0 ? nextStyle : nextStyle < 0 ? nextScript : Math.min(nextScript, nextStyle);
+    if (start < 0) { parts.push(lower.slice(i)); break; }
+    parts.push(lower.slice(i, start), " ");
+    const close = start === nextScript ? "</script" : "</style";
+    const end = lower.indexOf(close, start + 1);
+    if (end < 0) break; // unclosed: the rest of the page is dropped
+    const gt = lower.indexOf(">", end);
+    i = gt < 0 ? lower.length : gt + 1;
+  }
+  return parts.join("");
+}
+
+/** `cap` is the page size cap (tests pass Infinity to prove the passes are linear without it). */
+export function preparePage(html: string, cap: number = MAX_PAGE_BYTES): PreparedPage {
+  const raw = String(html ?? "").slice(0, cap).toLowerCase().replace(/&#64;|&#x40;|&commat;/g, "@");
+  const text = stripScriptStyle(raw)
+    .replace(/<[^<>]*>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ");
+  const orgDigits = text.replace(/(\d)[ .\u00a0]+(?=\d)/g, "$1");
+  const phoneDigits = text.replace(/(\d)[ .\-\u00a0]+(?=\d)/g, "$1").replace(/(\+|00)47(?=\d{8}(\D|$))/g, "");
+  return { raw, text, orgDigits, phoneDigits };
+}
+
+const asPage = (page: string | PreparedPage): PreparedPage => (typeof page === "string" ? preparePage(page) : page);
+
+/** Exact address as a whole token in the page (text or mailto:). */
+export function pageHasEmail(page: string | PreparedPage, email: string): boolean {
   const target = email.trim().toLowerCase();
   if (!target.includes("@")) return false;
-  const hay = `${html.toLowerCase().replace(/&#64;|&#x40;|&commat;/g, "@")} ${pageText(html)}`;
+  const pg = asPage(page);
   const esc = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^a-z0-9._%+-])${esc}($|[^a-z0-9.-]|\\.(?![a-z0-9]))`).test(hay);
+  const re = new RegExp(`(^|[^a-z0-9._%+-])${esc}($|[^a-z0-9.-]|\\.(?![a-z0-9]))`);
+  return re.test(pg.raw) || re.test(pg.text);
 }
 
 /** The page shows this 9-digit org.nr (spaces between groups allowed). */
-export function pageHasOrgNr(html: string, orgNr: string): boolean {
-  const digitsOnly = pageText(html).replace(/(\d)[\s. ]+(?=\d)/g, "$1");
-  return new RegExp(`(^|\\D)${orgNr}(\\D|$)`).test(digitsOnly);
+export function pageHasOrgNr(page: string | PreparedPage, orgNr: string): boolean {
+  return new RegExp(`(^|\\D)${orgNr}(\\D|$)`).test(asPage(page).orgDigits);
 }
 
 /** The page shows this phone (8 national digits, any spacing, optional +47). */
-export function pageHasPhone(html: string, phoneDigits: string): boolean {
-  const compact = pageText(html).replace(/(\d)[\s.\- ]+(?=\d)/g, "$1").replace(/(\+|00)47(?=\d{8}(\D|$))/g, "");
-  return new RegExp(`(^|\\D)${phoneDigits}(\\D|$)`).test(compact);
+export function pageHasPhone(page: string | PreparedPage, phoneDigits: string): boolean {
+  return new RegExp(`(^|\\D)${phoneDigits}(\\D|$)`).test(asPage(page).phoneDigits);
 }
 
 /** The page shows the street core of the address ("Gardsvegen 12"), case-insensitive. */
-export function pageHasAddress(html: string, address: string): boolean {
+export function pageHasAddress(page: string | PreparedPage, address: string): boolean {
   const core = String(address).split(",")[0]!.trim().toLowerCase().replace(/\s+/g, " ");
   if (core.length < 6 || !/\d/.test(core)) return false; // needs a street + number to mean anything
-  return pageText(html).includes(core);
+  return asPage(page).text.includes(core);
 }
 
 function levenshtein(a: string, b: string): number {
@@ -390,13 +438,13 @@ export async function assessClaim(input: ClaimAssessmentInput, deps: ClaimAssess
     ...(siblingSite ? { source_url: `https://${siblingSite}/` } : {}) });
 
   // ── network, in parallel ──
-  type Page = { host: string; html: string } | null;
+  type Page = { host: string; page: PreparedPage } | null;
   const fetchPage = async (host: string, src: NetworkSource): Promise<{ page: Page; note?: string }> => {
     try {
       const r = await withTimeout(deps.fetchSite(host, timeout), timeout);
       if (r.status >= 500) { unavailable.add(src); return { page: null, note: `http_${r.status}` }; }
       if (r.status < 200 || r.status >= 300) return { page: null, note: `http_${r.status}` };
-      return { page: { host, html: String(r.body ?? "").slice(0, MAX_PAGE_BYTES) } };
+      return { page: { host, page: preparePage(String(r.body ?? "")) } };
     } catch {
       unavailable.add(src);
       return { page: null, note: "unavailable" };
@@ -460,7 +508,7 @@ export async function assessClaim(input: ClaimAssessmentInput, deps: ClaimAssess
   const [farmPage, emailPage, brreg, rdap, mx] = await Promise.all([farmPageP, emailPageP, brregP, rdapP, mxP]);
 
   // ── A2 ──
-  const a2Web = !!farmPage.page && pageHasEmail(farmPage.page.html, email);
+  const a2Web = !!farmPage.page && pageHasEmail(farmPage.page.page, email);
   add({ id: "A2_website", hit: a2Web, source: "website", status: farmHost ? (farmPage.page ? "ok" : unavailable.has("website_farm") ? "unavailable" : "ok") : "skipped",
     ...(farmHost ? { source_url: `https://${farmHost}/` } : {}), ...(farmPage.note ? { note: farmPage.note } : {}) });
   const ownRegs = new Set<string>([p.independentWebsiteHost ? registrableDomain(p.independentWebsiteHost.replace(/^www\./, "")) : null].filter((x): x is string => !!x));
@@ -483,7 +531,7 @@ export async function assessClaim(input: ClaimAssessmentInput, deps: ClaimAssess
     ...(orgNr && p.orgNrIndependent ? { source_url: BRREG_ROLES_URL(orgNr) } : {}), ...(brreg.note ? { note: brreg.note } : {}) });
   let s2 = false;
   if (emailPage.page) {
-    const h = emailPage.page.html;
+    const h = emailPage.page.page;
     s2 = (!!orgNr && pageHasOrgNr(h, orgNr)) || (!!profilePhone && pageHasPhone(h, profilePhone)) || (!!p.address && pageHasAddress(h, p.address));
   }
   add({ id: "S2", hit: s2, source: "website", status: !ownDomain ? "skipped" : emailPage.page ? "ok" : unavailable.has(sameSite ? "website_farm" : "website_email_domain") ? "unavailable" : "ok",
@@ -496,7 +544,7 @@ export async function assessClaim(input: ClaimAssessmentInput, deps: ClaimAssess
   if (claimantPhone) {
     const rec = input.enrichment.phones.find((r) => normalizePhoneDigits(r.value) === claimantPhone && !!hostOfUrl(r.sourceUrl));
     if (rec) s4 = { url: rec.sourceUrl, source: "db" };
-    else if (farmPage.page && pageHasPhone(farmPage.page.html, claimantPhone)) s4 = { url: `https://${farmHost}/`, source: "website" };
+    else if (farmPage.page && pageHasPhone(farmPage.page.page, claimantPhone)) s4 = { url: `https://${farmHost}/`, source: "website" };
   }
   add({ id: "S4", hit: !!s4, source: s4?.source ?? "db", status: claimantPhone ? "ok" : "skipped",
     ...(s4 ? { source_url: s4.url } : {}), ...(claimantPhone ? {} : { note: "no_phone" }) });
@@ -546,6 +594,27 @@ export async function assessClaim(input: ClaimAssessmentInput, deps: ClaimAssess
 
 const UA = "Lokal-RFB-ClaimAssessment/1.0 (+https://rettfrabonden.com)";
 
+/** Reads a fetch body up to `cap` bytes and stops (cancels the stream) there. */
+async function readCapped(r: Response, cap: number): Promise<string> {
+  if (!r.body) return "";
+  const reader = r.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const room = cap - size;
+      chunks.push(value.length > room ? value.subarray(0, room) : value);
+      size += Math.min(value.length, room);
+      if (size >= cap) { await reader.cancel().catch(() => undefined); break; }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+}
+
 /** GET a fixed public API URL with global fetch and an abort timeout. */
 async function defaultFetchApi(url: string, timeoutMs: number): Promise<HttpAnswer> {
   const ctrl = new AbortController();
@@ -553,8 +622,7 @@ async function defaultFetchApi(url: string, timeoutMs: number): Promise<HttpAnsw
   (t as any).unref?.();
   try {
     const r = await fetch(url, { signal: ctrl.signal, redirect: "follow", headers: { Accept: "application/json, application/rdap+json", "User-Agent": UA } });
-    const body = (await r.text()).slice(0, MAX_PAGE_BYTES);
-    return { status: r.status, body };
+    return { status: r.status, body: await readCapped(r, MAX_API_BYTES) };
   } finally {
     clearTimeout(t);
   }
