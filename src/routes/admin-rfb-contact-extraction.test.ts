@@ -184,11 +184,13 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
   const fixtures: Map<string, Response> = new Map();
   const fetchCalls: string[] = [];
   const anthropicRejectCandidates = new Set<string>();
+  let anthropicCalls = 0;
 
   function stubFetch(): typeof fetch {
     return (async (url: string | URL | Request, init?: any) => {
       const urlStr = String(url);
       if (urlStr.includes("api.anthropic.com")) {
+        anthropicCalls++;
         const body = init?.body ? JSON.parse(init.body) : {};
         const prompt: string = body?.messages?.[0]?.content ?? "";
         const m = prompt.match(/^Kandidat \([^)]+\): (.+)$/m);
@@ -394,6 +396,57 @@ export async function runAdminRfbContactExtractionTests(opts: { log?: boolean } 
       assertEq(item.email_source, "text_contact_page", "e3: source is text_contact_page");
       assertEq(item.source_url, "https://utsiktengard.no/kontakt", "e4: source_url points at the SUBPAGE, not the front page");
       assertEq(contactEmailOf("cx-freemail"), "gardsbutikk@gmail.com", "e5: written to the DB");
+    }
+
+    // ── (wx) §M2 wrong-entity guard (dev-request 2026-10-31-rfb-enrichment-
+    // kontaktutvinning-cross-domain-kandidat): a foreign-domain candidate is
+    // flagged wrong_entity_suspected and NEVER listed as "written" — in
+    // dry-run (AC1) or apply — and no LLM call is spent on it. Fixture
+    // mirrors the 2026-10-31 case: «Arktis Gelato» on gelato.no, the only
+    // address on its contact page belongs to another firm.
+    {
+      insertAgent({ id: "cx-wx-mailto", name: "Arktis Gelato", website: "https://gelato.no", contactEmail: "post@arkt-is.no",
+        fieldProvenance: deadDnsProvenance("arkt-is.no") });
+      fixtures.set(
+        "https://gelato.no",
+        htmlResponse('<html><body>Is <a href="/kontakt">Kontakt</a></body></html>', { finalUrl: "https://gelato.no" }),
+      );
+      fixtures.set(
+        "https://gelato.no/kontakt",
+        htmlResponse('<html><body><a href="mailto:kontakt@kringlaas.no">Send e-post</a></body></html>', { finalUrl: "https://gelato.no/kontakt" }),
+      );
+      insertAgent({ id: "cx-wx-text", name: "Fjordlys Gard", website: "https://fjordlysgard.no" });
+      fixtures.set(
+        "https://fjordlysgard.no",
+        htmlResponse('<html><body>Velkommen <a href="/kontakt">Kontakt</a></body></html>', { finalUrl: "https://fjordlysgard.no" }),
+      );
+      fixtures.set(
+        "https://fjordlysgard.no/kontakt",
+        htmlResponse("<html><body>Nettside levert av webbyraa – skriv til support@webbyraa-eksempel.no</body></html>", { finalUrl: "https://fjordlysgard.no/kontakt" }),
+      );
+
+      const callsBefore = anthropicCalls;
+      const dry = await callExtraction({ agentIds: ["cx-wx-mailto", "cx-wx-text"] });
+      assertEq(dry.status, 200, "wx1: 200");
+      const m = dry.body.results.find((x: any) => x.agent_id === "cx-wx-mailto");
+      assertEq(m?.outcome, "wrong_entity_suspected", "wx2 (AC1): foreign-domain mailto candidate is flagged wrong_entity_suspected in dry-run, not 'written'");
+      assertEq(m?.email, "kontakt@kringlaas.no", "wx3: the flagged address is still reported for review (never silently dropped)");
+      assertEq(m?.email_source, "mailto_other_domain", "wx4: source names the foreign-domain tier");
+      assertEq(m?.source_url, "https://gelato.no/kontakt", "wx5: source_url points at the page it came from");
+      assertEq(m?.old_value, "post@arkt-is.no", "wx6: old value reported for the reviewer");
+      const t = dry.body.results.find((x: any) => x.agent_id === "cx-wx-text");
+      assertEq(t?.outcome, "wrong_entity_suspected", "wx7: foreign-domain visible-text candidate on a contact page is flagged too");
+      assertEq(t?.email_source, "text_other_domain", "wx8: source is text_other_domain");
+      assertEq(dry.body.counts?.wrong_entity_suspected, 2, "wx9: counts carries wrong_entity_suspected");
+      assertTrue(!dry.body.counts?.written, "wx10: no 'written' row in this dry-run batch");
+      assertEq(anthropicCalls, callsBefore, "wx11: no LLM judge call spent on a row the route will not write");
+
+      const app = await callExtraction({ agentIds: ["cx-wx-mailto", "cx-wx-text"], apply: true });
+      assertEq(app.body.results.find((x: any) => x.agent_id === "cx-wx-mailto")?.outcome, "wrong_entity_suspected", "wx12: apply flags it the same way");
+      assertEq(contactEmailOf("cx-wx-mailto"), "post@arkt-is.no", "wx13: apply never overwrote the producer's address with the foreign one");
+      assertEq(contactEmailOf("cx-wx-text"), "", "wx14: nothing written for the text case");
+      assertEq(auditRowsFor("cx-wx-mailto").length, 0, "wx15: no audit row");
+      assertEq(knowledgeEmailOf("cx-wx-mailto"), null, "wx16: nothing written to agent_knowledge.email");
     }
 
     // ── (f) no contact found anywhere ────────────────────────────────────────
