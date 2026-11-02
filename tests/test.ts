@@ -51555,6 +51555,8 @@ runSerial(async () => {
 // slice 1: the per-IP e-mail limit (services/email-reveal-guard.ts — switch
 // per host, default off; CCBot never; shared counter per host) and its wiring
 // into Finn-tannlege REST (/api/tannlege/agents[/:id]) and A2A message/send.
+// Slice 2 adds the clinic profile pages and the «Vis e-post» endpoint (same
+// counter; switch off = byte-identical pages).
 // Switch off = byte-identical answers; MCP tannlege_info untouched. Sets env
 // flags and swaps the dental db-factory (restored in finally) — runSerial,
 // tail position.
@@ -51563,6 +51565,8 @@ runSerial(async () => {
   for (const [label, load] of [
     ["email reveal guard", () => (require("../src/services/email-reveal-guard.test") as typeof import("../src/services/email-reveal-guard.test")).runEmailRevealGuardTests({ log: false })],
     ["dental email reveal guard", () => (require("../src/routes/dental-email-reveal-guard.test") as typeof import("../src/routes/dental-email-reveal-guard.test")).runDentalEmailRevealGuardTests({ log: false })],
+    // slice 2: the clinic profile pages (/klinikk/:slug, /klinikk/id/:id) and «Vis e-post» (GET /klinikk/id/:id/epost).
+    ["dental profile email reveal", () => (require("../src/routes/dental-profile-email-reveal.test") as typeof import("../src/routes/dental-profile-email-reveal.test")).runDentalProfileEmailRevealTests({ log: false })],
   ] as Array<[string, () => Promise<{ passed: number; failed: number; failures: string[] }>]>) {
     try {
       const r = await load();
