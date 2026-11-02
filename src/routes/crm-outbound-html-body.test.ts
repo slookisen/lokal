@@ -12,6 +12,8 @@
  *
  *   hb1-hb8    plainTextToEmailHtml itself: paragraphs, hard breaks,
  *              escaping, æøå, CRLF, empty input.
+ *   pl1-pl12   per-newline <br>/join rule: lists, quotes, "Label:" lines,
+ *              short lines, wrapped list items (utsending-v4 skive 4).
  *   hb9-hb16   THE ROUTES. Both /threads/:id/send and /compose, asserted on
  *              the options that would reach the transport. This suite's own
  *              crm-platform-identity.test.ts names the failure mode: a helper
@@ -112,6 +114,54 @@ export function runCrmOutboundHtmlBodyTests(opts: { log?: boolean } = {}): Promi
           "hb7: CRLF line endings are normalised — a body that arrived over the wire must not render as one blob just because of \\r");
         assertEq(countP(plainTextToEmailHtml("En.\n\n\n\nTo.")), 2,
           "hb8: several blank lines still separate exactly two paragraphs, not four with empties between");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // pl1-pl12 — each newline decided on its own (dev-request
+      // 2026-10-22-rfb-utsending-v4, skive 4; review lokal#1245
+      // ikke-blokkerende 1). The old whole-paragraph join collapsed lists,
+      // quotes, "Label:" lines and signatures with one long line.
+      // ═══════════════════════════════════════════════════════════════
+      {
+        const intro = "Her er det vi trenger fra dere før vi kan publisere siden"; // > 40, no colon
+        const longA = "Dette er en lang setning som er brutt midt i";
+        const longB = "setningen av kilden og skal gli sammen igjen, helt uten br.";
+
+        assertEq(plainTextToEmailHtml("Hei Ola,\nTakk for sist.\n  Mvh Daniel"),
+          "<p>Hei Ola,<br>Takk for sist.<br>  Mvh Daniel</p>",
+          "pl1: an all-short paragraph is all <br>, lines escaped untrimmed — byte-identical to the old line-block output");
+        assertEq(plainTextToEmailHtml(`  ${longA}\n${longB}  \nog en tredje kildelinje som også er ganske lang`),
+          `<p>${longA} ${longB} og en tredje kildelinje som også er ganske lang</p>`,
+          "pl2: long source-wrapped prose (each prev line > 40, no marker, no colon) is joined with single spaces and trimmed — byte-identical to the old join");
+        assertEq(plainTextToEmailHtml(`${intro}\n- profilbilde\n- åpningstider\n* leveringsområde\n• pris\n– merke\n— annet`),
+          `<p>${intro}<br>- profilbilde<br>- åpningstider<br>* leveringsområde<br>• pris<br>– merke<br>— annet</p>`,
+          "pl3: a bullet list after a long intro line keeps a <br> before every item (-, *, •, –, —)");
+        assertEq(plainTextToEmailHtml(`${intro}\n1. profilbilde\n2) åpningstider\n  10. pris`),
+          `<p>${intro}<br>1. profilbilde<br>2) åpningstider<br>  10. pris</p>`,
+          "pl4: numbered items (1. / 2) / indented 10.) each keep their own line");
+        assertEq(plainTextToEmailHtml(`${longA} skrev du:\n> Vi selger honning og bivoks fra egne kuber i Valdres hele året\n> og leverer til butikker i Oslo hver fredag gjennom sommeren`),
+          `<p>${longA} skrev du:<br>&gt; Vi selger honning og bivoks fra egne kuber i Valdres hele året<br>&gt; og leverer til butikker i Oslo hver fredag gjennom sommeren</p>`,
+          "pl5: quoted lines (>) keep their breaks even when long, and > is still escaped");
+        assertEq(plainTextToEmailHtml("Dette er feltene vi har registrert for gården deres akkurat nå:\nNavn og adresse står riktig i profilen\nÅpningstider mangler fortsatt helt for vinteren"),
+          "<p>Dette er feltene vi har registrert for gården deres akkurat nå:<br>Navn og adresse står riktig i profilen<br>Åpningstider mangler fortsatt helt for vinteren</p>",
+          "pl6: a long \"Label:\" line keeps a <br> before the unmarked items it introduces");
+        assertEq(plainTextToEmailHtml("Daniel Fredriksen\nRett fra Bonden – lokalmat direkte fra produsenter i hele Norge\n905 737 34"),
+          "<p>Daniel Fredriksen<br>Rett fra Bonden – lokalmat direkte fra produsenter i hele Norge 905 737 34</p>",
+          "pl7: signature with one long middle line — <br> after the short name line is kept; ACCEPTED LIMIT: the short line after the long unmarked tagline is joined (indistinguishable from the short tail of a wrapped sentence without knowing the wrap width)");
+        assertEq(plainTextToEmailHtml(`${intro}\n- Vi trenger et profilbilde som viser gården eller produktene\n  deres, gjerne tatt i dagslys\n- åpningstider`),
+          `<p>${intro}<br>- Vi trenger et profilbilde som viser gården eller produktene deres, gjerne tatt i dagslys<br>- åpningstider</p>`,
+          "pl8: a wrapped list-item continuation (indented, no marker, long prev) is joined to its item; the next item still gets its <br>");
+        assertEq(plainTextToEmailHtml(`${intro}\n- Bær & Brygg <post@baer.no>\n${longA} & mer <her>\nslutt`),
+          `<p>${intro}<br>- Bær &amp; Brygg &lt;post@baer.no&gt;<br>${longA} &amp; mer &lt;her&gt; slutt</p>`,
+          "pl9: &, < and > are escaped on every line, both in <br> lines and in joined runs");
+        assertEq(plainTextToEmailHtml(`${intro}\r\n- profilbilde\r\n- åpningstider\r\n\r\n${longA}\r\n${longB}`),
+          `<p>${intro}<br>- profilbilde<br>- åpningstider</p>\n<p>${longA} ${longB}</p>`,
+          "pl10: CRLF input behaves exactly like LF — no stray \\r, same per-newline decisions");
+        assertEq(plainTextToEmailHtml(`${longA}\n2026 blir et godt år for lokalmat i hele landet, tror vi`),
+          `<p>${longA} 2026 blir et godt år for lokalmat i hele landet, tror vi</p>`,
+          "pl11: a wrapped line starting with a bare number (no . or ) after it) is still joined — only real list markers keep a <br>");
+        assertTrue(!plainTextToEmailHtml(`${intro}\n  - innrykket punkt\n${longA}\n${longB}`).includes("&nbsp;"),
+          "pl12: never emits &nbsp; for leading whitespace");
       }
 
       // ═══════════════════════════════════════════════════════════════
