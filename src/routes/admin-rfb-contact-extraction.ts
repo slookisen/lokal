@@ -527,7 +527,15 @@ type ItemOutcome =
   // site (front page + linked contact/about/team pages) was read, but the
   // harvested a.contact_email does not appear on any of those pages — no
   // traceable source, so nothing is written.
-  | "rejected_not_on_site";
+  | "rejected_not_on_site"
+  // scrape mode (dev-request 2026-10-31-rfb-enrichment-kontaktutvinning-
+  // cross-domain-kandidat): the only address the extractor found is on a
+  // FOREIGN domain — neither the website's own domain nor free-mail
+  // (extractGardssalgContactEmail's tier 3, needsReview). The
+  // lokal-agent-enrichment §M2 wrong-entity guard says such a page is not
+  // proven to belong to the producer: flag for review, never write — in
+  // dry-run too, so a preview never lists a row apply must not write.
+  | "wrong_entity_suspected";
 
 interface ResultItem {
   agent_id: string;
@@ -947,6 +955,26 @@ router.post("/rfb-contact-extraction", async (req: Request, res: Response) => {
         results.push({
           agent_id: t.id, agent_name: t.name, outcome: "rejected_platform_domain",
           email: email.email, email_source: email.source, source_url: emailUrl,
+        });
+        continue;
+      }
+
+      // §M2 wrong-entity guard (dev-request 2026-10-31-rfb-enrichment-
+      // kontaktutvinning-cross-domain-kandidat): a foreign-domain candidate
+      // (the extractor's tier 3, needsReview — mailto_other_domain /
+      // text_other_domain) is NOT proven to belong to this producer
+      // (2026-10-31: «Arktis Gelato» would have got kontakt@kringlaas.no from
+      // gelato.no). Reported as wrong_entity_suspected with the address and
+      // page for a human to review, never written — dry-run included, so the
+      // caller's apply list (outcome "written") can never contain it. Checked
+      // BEFORE the LLM judge: no model call is spent on a row this route
+      // will not write anyway.
+      if (email.needsReview) {
+        results.push({
+          agent_id: t.id, agent_name: t.name, outcome: "wrong_entity_suspected",
+          email: email.email, email_source: email.source, source_url: emailUrl,
+          old_value: t.contact_email,
+          detail: "foreign_domain_not_proven_own",
         });
         continue;
       }
