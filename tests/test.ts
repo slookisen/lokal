@@ -922,6 +922,25 @@ runSerial(async () => {
   }
 });
 
+// bulk-load stamps experience_providers.name_collision at first harvest
+// (verdict.name_collision from classifyProvider) — own in-memory DBs,
+// runSerial() like the sibling bulk-load blocks.
+runSerial(async () => {
+  console.log("\n── bulk-load: name_collision stamp at first harvest ──");
+  try {
+    const { runOpplevelserBulkLoadNameCollisionTests } = require("../src/routes/opplevelser-bulk-load-name-collision.test") as
+      typeof import("../src/routes/opplevelser-bulk-load-name-collision.test");
+    const r = await runOpplevelserBulkLoadNameCollisionTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("bulk-load-name-collision: " + f);
+    console.log(`  bulk-load-name-collision: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bulk-load-name-collision: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request rfb-kvalitetsgate-parity: RFB's LLM-judge quality-gate
 // cascade (judgeRfbAboutCandidate/meetsRfbAboutQualityBar/
 // isRfbJudgeInfraFailure, routes/admin-agents.ts) — sentinel/fail-closed
