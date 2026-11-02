@@ -165,6 +165,25 @@ export function normalizeOrgNr(v: unknown): string | null {
   return digits.length === 9 ? digits : null;
 }
 
+/**
+ * Økologi S3c: an org.nr. the owner typed (POST /eier/:agentId/org-nr) —
+ * spaces removed, exactly 9 digits, and the Norwegian MOD11 check digit
+ * (weights 3,2,7,6,5,4,3,2; check = 11 − sum % 11, 11 → 0, 10 → invalid).
+ * The 9 digits, or null when the input is not a valid org.nr.
+ */
+export function validOwnerOrgNr(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/\s+/g, "");
+  if (!/^\d{9}$/.test(s)) return null;
+  const weights = [3, 2, 7, 6, 5, 4, 3, 2];
+  let sum = 0;
+  for (let i = 0; i < 8; i++) sum += Number(s[i]) * weights[i];
+  let check = 11 - (sum % 11);
+  if (check === 11) check = 0;
+  if (check === 10) return null;
+  return check === Number(s[8]) ? s : null;
+}
+
 function codesFrom(v: unknown, out: number[]): void {
   if (v === undefined || v === null) return;
   if (Array.isArray(v)) { for (const x of v) codesFrom(x, out); return; }

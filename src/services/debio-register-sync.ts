@@ -95,6 +95,8 @@ export interface SyncDebioRegisterResult {
   would_reset: number;
   changes: number;
   owner_switch_off: number;
+  /** Økologi S3c: review candidates added from an owner-supplied org.nr. (agent_owner_org_nr). */
+  owner_org_nr_candidates: number;
   finnoko_helper: "ok" | "failed";
   stale: boolean;
   warnings: string[];
@@ -271,6 +273,12 @@ interface Producer {
   name: string;
   orgNr: string | null;
   tagOrgNrs: string[];
+  /**
+   * Økologi S3c: the org.nr. the owner typed in the portal (agent_owner_org_nr)
+   * — a review candidate only, never a safe match. null when absent or equal
+   * to agents.org_nr.
+   */
+  ownerOrgNr: string | null;
   domains: string[];
   postal: string | null;
   city: string | null;
@@ -295,14 +303,25 @@ function tagOrgNrs(tags: unknown): string[] {
   return out;
 }
 
+/** Økologi S3c: does the agent_owner_org_nr side table exist (older schemas: no)? */
+function hasOwnerOrgNrTable(db: Database.Database): boolean {
+  try {
+    return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_owner_org_nr'").get();
+  } catch {
+    return false;
+  }
+}
+
 function loadProducers(db: Database.Database): Producer[] {
+  const ownerOrgNr = hasOwnerOrgNrTable(db);
   const rows = db.prepare(`
-    SELECT a.id, a.name, a.org_nr, a.tags, a.city, a.description, a.contact_email,
+    SELECT a.id, a.name, a.org_nr, a.tags, ${ownerOrgNr ? "o.owner_org_nr" : "NULL AS owner_org_nr"}, a.city, a.description, a.contact_email,
            a.debio_verified, s.debio_status, s.debio_sid, s.debio_match_method, s.debio_cert_valid_to,
            k.website, k.email AS k_email, k.address, k.postal_code, k.about
     FROM agents a
     LEFT JOIN agent_knowledge k ON k.agent_id = a.id
     LEFT JOIN agent_debio_status s ON s.agent_id = a.id
+    ${ownerOrgNr ? "LEFT JOIN agent_owner_org_nr o ON o.agent_id = a.id" : ""}
     WHERE a.is_active = 1
       AND (a.umbrella_type IS NULL OR a.umbrella_type = '')
       AND (a.role IS NULL OR a.role = 'producer')
@@ -317,11 +336,14 @@ function loadProducers(db: Database.Database): Producer[] {
     }
     const fromAddr = postalFromAddress(r.address);
     const mailLocals = [r.contact_email, r.k_email].filter((e) => typeof e === "string").map((e: string) => e.split("@")[0]);
+    const orgNr = normalizeOrgNr(r.org_nr);
+    const owner = normalizeOrgNr(r.owner_org_nr);
     return {
       id: r.id,
       name: String(r.name || ""),
-      orgNr: normalizeOrgNr(r.org_nr),
+      orgNr,
       tagOrgNrs: tagOrgNrs(r.tags),
+      ownerOrgNr: owner && owner !== orgNr ? owner : null,
       domains,
       postal: postalCodeOf(r.postal_code) ?? fromAddr.postal,
       city: normCity(r.city) ?? fromAddr.city,
@@ -610,7 +632,7 @@ function emptyResult(dryRun: boolean): SyncDebioRegisterResult {
     matched: { org_nr: 0, tag_org_nr: 0, finnoko_domain: 0, name_postal: 0, street_postal: 0, street_city: 0, review: 0 },
     status_counts: { okologisk: 0, karens: 0, annet: 0, ingen: 0 },
     verified: 0, review_candidates: 0, would_reset: 0, changes: 0, owner_switch_off: 0,
-    finnoko_helper: "ok", stale: false, warnings: [], errors: [],
+    owner_org_nr_candidates: 0, finnoko_helper: "ok", stale: false, warnings: [], errors: [],
   };
 }
 
@@ -725,6 +747,21 @@ export async function syncDebioRegister(db: Database.Database = getDb(), opts: S
       ...m.review.filter((c) => c.entity.key !== m.entity!.key)];
     m.entity = null;
     m.method = null;
+  }
+
+  // Økologi S3c: no safe match this run, and the owner typed an org.nr. that
+  // the register knows → a review candidate (match_method 'owner_org_nr'),
+  // never a status. A rejected agent|entity pair is not proposed again; an
+  // existing candidate for the same entity is merged into this one.
+  for (const m of matchedList) {
+    if (m.entity || !m.p.ownerOrgNr) continue;
+    const e = ix.byOrgNr.get(m.p.ownerOrgNr);
+    if (!e || rejectedPairs.has(`${m.p.id}|${e.key}`)) continue;
+    const same = m.review.find((c) => c.entity.key === e.key);
+    const reasons = ["owner_supplied_org_nr", ...(same ? same.reasons.filter((r) => r !== "owner_supplied_org_nr") : [])];
+    m.review = [{ entity: e, method: "owner_org_nr", score: Math.max(0.9, same?.score ?? 0), reasons },
+      ...m.review.filter((c) => c.entity.key !== e.key)];
+    result.owner_org_nr_candidates++;
   }
 
   type Planned = { p: Producer; d: Decision; review: Candidate[] };

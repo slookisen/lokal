@@ -217,3 +217,35 @@ export function isOrganicClaimUmbrella(u: { umbrella_type?: unknown; name?: unkn
   if (u.umbrella_type === "certification") return true;
   return containsOrganicClaim(String(u.name ?? "")) || containsOrganicClaim(String(u.labels ?? ""));
 }
+
+/**
+ * Økologi S3c (read step): `text` without the sentences that carry an organic
+ * claim. Sentences end at `.`, `!`, `?` (the mark stays with its sentence) or
+ * a newline. A sentence where containsOrganicClaim() is true is dropped; the
+ * rest are rejoined — sentences on one line with a single space, lines with
+ * the line breaks between them kept (blank lines collapse to one break, a
+ * line left empty is dropped). Nothing left → "". Text without an organic
+ * claim comes back unchanged (same string). Used for owner-written prose on
+ * the public profile of a producer without a valid Debio status.
+ */
+export function dropOrganicSentences(text: unknown): string {
+  if (typeof text !== "string" || !text) return "";
+  if (!containsOrganicClaim(text)) return text;
+  const lines = text.split(/\r?\n/);
+  const keptLines: string[] = [];
+  let lastBlank = false;
+  for (const line of lines) {
+    if (!line.trim()) {
+      // A blank line in the original (paragraph break) — kept once, between kept lines.
+      if (keptLines.length && !lastBlank) { keptLines.push(""); lastBlank = true; }
+      continue;
+    }
+    const sentences = line.match(/[^.!?]+(?:[.!?]+|$)/g) ?? [line];
+    const kept = sentences.map((s) => s.trim()).filter((s) => s && !containsOrganicClaim(s));
+    if (!kept.length) continue;
+    keptLines.push(kept.join(" "));
+    lastBlank = false;
+  }
+  while (keptLines.length && keptLines[keptLines.length - 1] === "") keptLines.pop();
+  return keptLines.join("\n").trim();
+}

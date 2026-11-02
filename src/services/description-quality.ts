@@ -929,6 +929,24 @@ export function hasUnverifiedOrganicClaim(text: unknown, agent: OrganicGateAgent
 }
 
 /**
+ * Økologi S3c: the owner-portal half of the gate (save notice, portal message,
+ * POST /eier/:agentId/org-nr, the read step for owner-written `about`).
+ * Default OFF; every S3c behaviour needs BOTH this and RFB_ORGANIC_CLAIM_GATE.
+ */
+export const ORGANIC_OWNER_GATE_ENV = "RFB_ORGANIC_OWNER_GATE";
+
+/** Is RFB_ORGANIC_OWNER_GATE on ("1"/"true")? Read per call. */
+export function organicOwnerGateEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env[ORGANIC_OWNER_GATE_ENV];
+  return v === "1" || v === "true";
+}
+
+/** S3c is active: RFB_ORGANIC_CLAIM_GATE and RFB_ORGANIC_OWNER_GATE both on. */
+export function organicOwnerGateActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return organicClaimGateEnabled(env) && organicOwnerGateEnabled(env);
+}
+
+/**
  * Should the gate act on a write for this agent right now? Flag on AND no
  * valid status. When false the caller writes exactly what it was given.
  */
