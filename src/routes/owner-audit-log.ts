@@ -162,57 +162,95 @@ export function ownerAuditWho(changedBy: unknown, notes: unknown): string {
 //  - local@domain, also with æøå, also without a top-level domain (a
 //    writer's own cut), and an IP-literal domain (ola@[127.0.0.1]);
 //  - a quoted local part ("ola nordmann"@gard.no);
-//  - «at» written out in brackets — [at] (at) {at} <at> «at», also «[at]» —
-//    and a spaced «@» (ola @ gard.no), both only when a dotted domain
-//    follows ((dot) / [punktum] count as a dot after a bracketed «at»);
+//  - «at» or «@» in brackets — [at] (at) {at} <at> «at» «[at]» [@] (@) —
+//    and a spaced «@» (ola @ gard.no, ola@ gard.no — not «oss @handle»),
+//    both only when a host follows: dotted, with a top-level label that
+//    starts with a letter, so «50 kr @ 2.50» and «kl @ 10.00» stay text
+//    ((dot) / [punktum] count as a dot after a bracketed «at»);
 //  - a trailing «local@» (a cut address) at the end or before punctuation;
 //  - after normalising: fullwidth ＠ and small ﹫ and a decomposed «å» (NFKC),
 //    invisible format characters (\p{Cf}: zero-width space, soft hyphen, …)
-//    dropped, and &#64; / &#x40; / &commat; / %40 decoded.
-// Not caught: an address spelled out without brackets («ola at gard dot no»)
-// or split by ordinary spaces inside a word — no pattern can tell those from
-// prose. Handles and prices survive: «Følg oss @gardsbutikk», «@ kveld»,
-// «50 kr @ 2 stk».
+//    dropped, and &#64; / &#x40; / &commat; / %40 / %2540 decoded — the
+//    encoded forms only when a dotted domain follows, so «40%40» stays text.
+// Not caught: an address spelled out without brackets («ola at gard dot no»),
+// split by ordinary spaces inside a word, or a cut «ola@» followed by more
+// words («ola@ og mer» — «50kr@ 2stk» could not be told apart). Handles and
+// prices survive: «Følg oss @gardsbutikk», «@ kveld», «50 kr @ 2 stk».
+//
+// Cost: a local part may only start where a run of local-part characters
+// starts (E_START), so a long run without an address is scanned once
+// (linear), and shortText strips at most OWNER_AUDIT_STRIP_MAX code points
+// anyway (1000; the log shows 80) — owner-audit-log.test.ts times both.
 const E_LOCAL = "[\\p{L}\\p{N}._%+'\\-]";
+// A local part starts only where a run of local-part characters starts: one
+// attempt per run instead of one per character, so a long run without an
+// address costs linear time, not quadratic (ReDoS, review round 2).
+const E_START = "(?<![\\p{L}\\p{N}._%+'\\-])";
 const E_DOM = "[\\p{L}\\p{N}\\-]";
 const E_DOMAIN = `${E_DOM}+(?:\\.${E_DOM}+)*`;
 const E_DOTTED = `${E_DOM}+(?:\\.${E_DOM}+)+`;
+// A domain with a top-level label that starts with a letter («gard.no»), not
+// a number («2.50», «10.00», «1.2.3 @ 4.5»).
+const E_HOST = `${E_DOM}+(?:\\.${E_DOM}+)*\\.\\p{L}${E_DOM}*`;
 const E_IP = "\\[[0-9a-f.:]+\\]";
 const E_OPEN = "[\\[({<«]{1,2}";
 const E_CLOSE = "[\\])}>»]{1,2}";
-const E_AT_WORD = `\\s*${E_OPEN}\\s*(?:at|alfa|krøllalfa)\\s*${E_CLOSE}\\s*`;
+const E_AT_WORD = `\\s*${E_OPEN}\\s*(?:at|alfa|krøllalfa|@)\\s*${E_CLOSE}\\s*`;
 const E_DOT = `(?:\\.|\\s*${E_OPEN}\\s*(?:dot|punktum|prikk)\\s*${E_CLOSE}\\s*)`;
 const EMAIL_RE = new RegExp([
-  `"[^"\\n]{1,64}"\\s*@\\s*(?:${E_DOTTED}|${E_IP})`,                   // quoted local part
-  `${E_LOCAL}+@(?:${E_IP}|${E_DOMAIN})`,                              // local@domain (no TLD needed)
-  `${E_LOCAL}+\\s*@\\s*${E_DOTTED}`,                                   // spaced @, dotted domain only
-  `${E_LOCAL}+${E_AT_WORD}(?:${E_DOM}+(?:${E_DOT}${E_DOM}+)+|${E_IP})`, // [at] (at) {at} «at» …
-  `${E_LOCAL}+@(?=\\s*$|[,.;:!?)»"\\]])`,                              // a cut «local@»
+  `"[^"\\n]{1,64}"\\s*@\\s*(?:${E_HOST}|${E_IP})`,                     // quoted local part
+  `${E_START}${E_LOCAL}+@(?:${E_IP}|${E_DOMAIN})`,                              // local@domain (no TLD needed)
+  `${E_START}${E_LOCAL}+(?:\\s+@\\s+|@\\s+)${E_HOST}`,                          // spaced @ (not «oss @handle.x»), a host must follow
+  `${E_START}${E_LOCAL}+${E_AT_WORD}(?:${E_DOM}+(?:${E_DOT}${E_DOM}+)*${E_DOT}\\p{L}${E_DOM}*|${E_IP})`, // [at] (at) {at} «at» [@] …
+  `${E_START}${E_LOCAL}+@(?=\\s*$|[,.;:!?)»"\\]])`,                              // a cut «local@»
 ].join("|"), "giu");
+
+// An encoded «@» counts only before a dotted domain.
+const E_ENCODED_AT = /(?:&#0*64;|&#x0*40;|&commat;|%(?:25)?40)(?=[\p{L}\p{N}\-]+\.[\p{L}\p{N}])/giu;
 
 /**
  * The text with every e-mail address (in the forms above) replaced by «…».
- * The text comes back NFKC-normalised, without format characters and with
- * &#64; / &commat; / %40 decoded.
+ * Matching runs on the NFKC-normalised text without format characters and
+ * with encoded «@» decoded; that text is returned only when an address was
+ * replaced — otherwise the input comes back unchanged («m²», «½», ZWJ emoji,
+ * «40%40» stay as written).
  */
 export function stripEmailAddresses(text: string): string {
   const t = text
     .normalize("NFKC")
     .replace(/\p{Cf}/gu, "")
-    .replace(/&#0*64;|&#x0*40;|&commat;|%40/gi, "@");
-  return t.replace(EMAIL_RE, "…");
+    .replace(E_ENCODED_AT, "@");
+  let replaced = false;
+  const out = t.replace(EMAIL_RE, () => { replaced = true; return "…"; });
+  return replaced ? out : text;
 }
 
+/** Most code points shortText strips (the log shows OWNER_AUDIT_TEXT_MAX). */
+export const OWNER_AUDIT_STRIP_MAX = 1000;
+
 /**
- * Whitespace collapsed, addresses removed, then cut at `max` characters
- * (code points, so an emoji is never split) with «…». Stripping comes first,
- * so the cut can never leave part of an address behind.
+ * Whitespace collapsed, cut to OWNER_AUDIT_STRIP_MAX code points (dropping
+ * the word the cut went through, so no half address is left), addresses
+ * removed, then cut at `max` code points (an emoji is never split) with «…».
+ * Stripping comes before the visible cut, so that cut can never leave part
+ * of an address behind; the first cut keeps the regex work bounded whatever
+ * an owner saved (update-profile has no length cap).
  */
 function shortText(raw: string, max = OWNER_AUDIT_TEXT_MAX): string {
-  const s = stripEmailAddresses(raw.replace(/\s+/g, " ").trim()).replace(/\s+/g, " ").trim();
-  if (!s) return OWNER_AUDIT_EMPTY;
+  let s = raw.replace(/\s+/g, " ").trim();
+  let capped = false;
+  if (s.length > OWNER_AUDIT_STRIP_MAX) {
+    const head = Array.from(s.slice(0, OWNER_AUDIT_STRIP_MAX * 2));
+    if (head.length > OWNER_AUDIT_STRIP_MAX || s.length > OWNER_AUDIT_STRIP_MAX * 2) {
+      s = head.slice(0, OWNER_AUDIT_STRIP_MAX).join("").replace(/\S*$/, "").trimEnd();
+      capped = true;
+    }
+  }
+  s = stripEmailAddresses(s).replace(/\s+/g, " ").trim();
+  if (!s) return capped ? "…" : OWNER_AUDIT_EMPTY;
   const cps = Array.from(s);
-  return cps.length > max ? `${cps.slice(0, max - 1).join("").trimEnd()}…` : s;
+  if (cps.length > max) return `${cps.slice(0, max - 1).join("").trimEnd()}…`;
+  return capped ? `${s}…` : s;
 }
 
 // SQLite datetime('now') writes «YYYY-MM-DD HH:MM:SS» in UTC without a zone.
@@ -408,32 +446,51 @@ export function ownerAuditFeedRows(rows: readonly OwnerAuditDbRow[]): OwnerAudit
   return out;
 }
 
+/** Most stored rows one feed read looks at (bounds the refill below). */
+export const OWNER_AUDIT_SCAN_MAX = 1000;
+
 /**
- * The newest `limit` rows the owner sees (fewer only when there are no more).
- * SQL keeps the table's fields and drops raw no-op rows; rows whose values
- * still READ the same («1» → «true», a stripped pipeline note) are dropped in
- * JS afterwards, so the query is read in batches until `limit` shown rows are
- * found or the rows run out. Sorted by time whatever the stored format
- * (julianday() reads both «YYYY-MM-DD HH:MM:SS» and ISO 8601; a plain text
- * sort put every «YYYY-MM-DD HH:…» row of a day before that day's ISO rows).
+ * The newest `limit` rows the owner sees. SQL keeps the table's fields and
+ * drops raw no-op rows; rows whose values still READ the same («1» →
+ * «true», whitespace, a stripped pipeline note) are dropped in JS afterwards,
+ * so the query is read in batches until `limit` shown rows are found, the
+ * rows run out, or OWNER_AUDIT_SCAN_MAX rows were looked at (then the rows
+ * found so far are returned: the newest shown rows within that window).
+ * At most two queries: a first batch of 2×limit (≥ 50), then — only when
+ * rows that read the same were dropped — one more for the rest of the scan
+ * window. The second continues after the last row seen (keyset on time,
+ * rowid), so no row is read twice even if a row is written in between.
+ * Sorted by time whatever the stored format (julianday() reads both
+ * «YYYY-MM-DD HH:MM:SS» and ISO 8601; an unreadable time sorts last, as -1).
  */
 export function readOwnerAuditFeed(db: any, agentId: string, limit: number): OwnerAuditFeedRow[] {
   const names = OWNER_AUDIT_FIELD_NAMES;
-  const stmt = db.prepare(
-    `SELECT id, field_name, old_value, new_value, changed_by, changed_at, notes
+  const select = (after: boolean) => db.prepare(
+    `SELECT id, field_name, old_value, new_value, changed_by, changed_at, notes,
+            COALESCE(julianday(changed_at), -1) AS k_time, rowid AS k_row
        FROM agent_knowledge_audit
       WHERE agent_id = ?
         AND field_name IN (${names.map(() => "?").join(", ")})
         AND TRIM(IFNULL(old_value, '')) <> TRIM(IFNULL(new_value, ''))
-      ORDER BY julianday(changed_at) DESC, rowid DESC
-      LIMIT ? OFFSET ?`,
+        ${after ? "AND (COALESCE(julianday(changed_at), -1) < ? OR (COALESCE(julianday(changed_at), -1) = ? AND rowid < ?))" : ""}
+      ORDER BY k_time DESC, k_row DESC
+      LIMIT ?`,
   );
-  const batch = Math.max(limit * 2, 50);
+  const first = select(false);
+  const next = select(true);
+  const batch = Math.min(Math.max(limit * 2, 50), OWNER_AUDIT_SCAN_MAX);
   const out: OwnerAuditFeedRow[] = [];
-  for (let offset = 0; out.length < limit; offset += batch) {
-    const rows = stmt.all(agentId, ...names, batch, offset) as OwnerAuditDbRow[];
+  let scanned = 0;
+  let cursor: { k_time: number; k_row: number } | null = null;
+  while (out.length < limit && scanned < OWNER_AUDIT_SCAN_MAX) {
+    const take = cursor ? OWNER_AUDIT_SCAN_MAX - scanned : batch;
+    const rows = (cursor
+      ? next.all(agentId, ...names, cursor.k_time, cursor.k_time, cursor.k_row, take)
+      : first.all(agentId, ...names, take)) as Array<OwnerAuditDbRow & { k_time: number; k_row: number }>;
+    scanned += rows.length;
     out.push(...ownerAuditFeedRows(rows));
-    if (rows.length < batch) break;
+    if (rows.length < take) break;
+    cursor = rows[rows.length - 1];
   }
   return out.slice(0, limit);
 }
