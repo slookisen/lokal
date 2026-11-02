@@ -2356,6 +2356,35 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration experience_content_judgement_failures failed:", err);
   }
 
+  // ─── gardssalg_website_judgement_files / _failures (slice 3j, same
+  // dev-request) — once-per-file ledger + per-path failure counter for the
+  // website-judgement job (services/gardssalg-website-judgement-job.ts), same
+  // shape as the content-judgement tables above. Additive, idempotent.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_website_judgement_files (
+        path TEXT PRIMARY KEY,
+        sha TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        result_json TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_website_judgement_files failed:", err);
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_website_judgement_failures (
+        path TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_failed_at TEXT
+      )
+    `);
+  } catch (err) {
+    console.error("Migration gardssalg_website_judgement_failures failed:", err);
+  }
+
   // ─── experience_data_corrections (POST /admin/experiences-data-corrections,
   // routes/opplevelser.ts) ───────────────────────────────────────────────
   // One row per APPLIED, source-backed factual correction of one logical

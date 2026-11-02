@@ -2270,6 +2270,42 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
 }
 
 // ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
+// felles-serverjobbramme, «Innsnevring 2026-10-28», skive 3j: gårdssalg
+// website-discovery judgements — same file-queue mechanics as the content
+// judgements above, reading `gardssalg-website-judgements/` in
+// slookisen/A2A (verdicts a Cloud Routine rendered on Daniel's subscription)
+// and storing them through applyGardssalgWebsiteJudgements(), which re-checks
+// every item and writes via the same approve path as POST /admin/gardssalg-
+// website-review-judge. Never calls an LLM. OFF by default:
+// GARDSSALG_WEBSITE_JUDGEMENT_JOB_ENABLED === "true" turns it on; flipping it
+// back is the rollback. First tick 11 minutes after boot, hourly after that;
+// an overlapping tick is skipped.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  let gardssalgWebsiteJudgementsRunning = false;
+  const gardssalgWebsiteJudgementsTick = trackJob("gardssalg-website-judgements", async () => {
+    if (gardssalgWebsiteJudgementsRunning) return;
+    gardssalgWebsiteJudgementsRunning = true;
+    try {
+      const { tickGardssalgWebsiteJudgements } = await import("./services/gardssalg-website-judgement-job");
+      const r = await tickGardssalgWebsiteJudgements();
+      if (r.skipped_reason === "disabled") return;
+      console.log(
+        `[gardssalg-website-judgements] tick run_id=${r.run_id} skipped=${r.skipped_reason ?? "-"} ` +
+          `listed=${r.files_listed} processed=${r.processed.length} written=${r.written} ` +
+          `daily_cap_reached=${r.daily_cap_reached ? "yes" : "no"} ` +
+          `github_error=${r.github_error ? "yes" : "no"} envelope=${r.envelope_recorded}`,
+      );
+    } catch (err) {
+      console.error("[gardssalg-website-judgements] tick failed (non-fatal, retried next tick):", err);
+    } finally {
+      gardssalgWebsiteJudgementsRunning = false;
+    }
+  });
+  setTimeout(() => { void gardssalgWebsiteJudgementsTick(); }, 11 * 60_000);
+  setInterval(() => { void gardssalgWebsiteJudgementsTick(); }, 60 * 60_000);
+}
+
+// ─── A2A dev-request 2026-10-06-experiences-enrichment-plattformjobb-og-
 // felles-serverjobbramme, tillegg 2026-10-15 «4b-det»: the gårdssalg content
 // queue (drink cohort first, then generic) drained by the platform once a
 // day, exactly like gardssalg-outreach-daily below ───────────────────────
